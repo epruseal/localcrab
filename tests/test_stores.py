@@ -8,9 +8,7 @@ etc.) run without any services.
 
 from __future__ import annotations
 
-import json
 import os
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -263,6 +261,43 @@ class TestSQLStoreUnit:
 
         store = SQLStore("postgresql://invalid:invalid@invalid-host:5432/invalid")
         assert store.ping() is False
+
+
+# ---------------------------------------------------------------------------
+# Billing hooks unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestBillingHooksUnit:
+    def test_billing_emit_records_sqlite_event(self):
+        from opencrab.billing.hooks import BillingHooks
+        from opencrab.stores.sql_store import SQLStore
+
+        store = SQLStore("sqlite:///:memory:")
+        hooks = BillingHooks(store)
+        event = hooks.emit("query", metadata={"question": "hello"})
+
+        usage = hooks.get_usage()
+        events = hooks.list_events()
+
+        assert event["event_type"] == "query"
+        assert usage["total"] == 1
+        assert usage["by_type"] == {"query": 1}
+        assert events[0]["event_id"] == event["event_id"]
+
+    def test_postgres_billing_insert_sql_uses_cast_not_colon_cast(self):
+        from sqlalchemy import text
+        from sqlalchemy.dialects import postgresql
+
+        from opencrab.billing.hooks import _insert_event_sql
+
+        sql = _insert_event_sql(is_sqlite=False)
+        compiled = str(text(sql).compile(dialect=postgresql.dialect()))
+
+        assert "CAST(" in sql
+        assert "::jsonb" not in sql.lower()
+        assert "ON CONFLICT" in sql
+        assert "%(meta)s" in compiled
 
 
 # ---------------------------------------------------------------------------

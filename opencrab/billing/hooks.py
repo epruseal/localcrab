@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,24 @@ _TABLES_PG = [
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+def _insert_event_sql(is_sqlite: bool) -> str:
+    """Return dialect-safe SQL for inserting a billing event."""
+    if is_sqlite:
+        return (
+            "INSERT OR IGNORE INTO billing_events "
+            "(event_id, tenant_id, subject_id, event_type, count, metadata) "
+            "VALUES (:eid, :tid, :sid, :etype, :cnt, :meta)"
+        )
+
+    return (
+        "INSERT INTO billing_events "
+        "(event_id, tenant_id, subject_id, event_type, count, metadata) "
+        "VALUES (:eid, :tid, :sid, :etype, :cnt, CAST(:meta AS JSONB)) "
+        "ON CONFLICT (event_id) DO NOTHING"
+    )
 
 
 class BillingHooks:
@@ -128,19 +145,7 @@ class BillingHooks:
                 meta_str = str(metadata)
 
         try:
-            if self._sql._is_sqlite:
-                sql = (
-                    "INSERT OR IGNORE INTO billing_events "
-                    "(event_id, tenant_id, subject_id, event_type, count, metadata) "
-                    "VALUES (:eid, :tid, :sid, :etype, :cnt, :meta)"
-                )
-            else:
-                sql = (
-                    "INSERT INTO billing_events "
-                    "(event_id, tenant_id, subject_id, event_type, count, metadata) "
-                    "VALUES (:eid, :tid, :sid, :etype, :cnt, :meta::jsonb) "
-                    "ON CONFLICT (event_id) DO NOTHING"
-                )
+            sql = _insert_event_sql(self._sql._is_sqlite)
             with self._sql._engine.begin() as conn:
                 conn.execute(
                     text(sql),
