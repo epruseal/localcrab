@@ -15,6 +15,7 @@ Query pipeline:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,45 @@ _EDGE_WEIGHTS: dict[str, float] = {
     "CONTRADICTS": 0.5,
 }
 _DEFAULT_EDGE_SCORE: float = 0.5
+_BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
+_RELATION_QUERY_CUES = (
+    "why",
+    "reason",
+    "rationale",
+    "change",
+    "revision",
+    "background",
+    "cannot",
+    "applicable",
+    "risk",
+    "law",
+    "regulation",
+    "이유",
+    "변경",
+    "개정",
+    "배경",
+    "불가",
+    "불가능",
+    "위험",
+    "법규",
+    "조합",
+    "관계",
+    "연결",
+)
+_MULTIHOP_QUERY_CUES = (
+    "connect",
+    "relationship",
+    "multi",
+    "chain",
+    "cause",
+    "effect",
+    "연결",
+    "관계",
+    "원인",
+    "영향",
+    "단계",
+    "구분",
+)
 
 # Lazily imported Phase 4 modules to avoid circular deps at module load
 _BM25Index: Any = None
@@ -75,6 +115,82 @@ class QueryResult:
             "metadata": self.metadata,
             "graph_context": self.graph_context,
         }
+
+
+@dataclass(frozen=True)
+class _QueryProfile:
+    """Adaptive retrieval settings for the current question."""
+
+    vector_limit: int
+    bm25_limit: int
+    graph_limit: int
+    graph_depth: int
+    anchor_limit: int
+    rerank_limit: int
+
+
+def _contains_any(text: str, cues: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(cue in lowered for cue in cues)
+
+
+def _profile_for_query(question: str, limit: int, graph_depth: int) -> _QueryProfile:
+    """Use higher recall for relationship and multi-hop questions."""
+    relation_intent = _contains_any(question, _RELATION_QUERY_CUES)
+    multihop_intent = _contains_any(question, _MULTIHOP_QUERY_CUES)
+    depth = graph_depth
+    if relation_intent:
+        depth = max(depth, 2)
+    if multihop_intent:
+        depth = max(depth, 3)
+
+    multiplier = 8 if relation_intent or multihop_intent else 4
+    return _QueryProfile(
+        vector_limit=min(max(limit * multiplier, 24), 80),
+        bm25_limit=min(max(limit * (multiplier + 2), 40), 180),
+        graph_limit=min(max(limit * (multiplier + 2), 50), 220),
+        graph_depth=min(depth, 3),
+        anchor_limit=12 if relation_intent or multihop_intent else 6,
+        rerank_limit=min(max(limit * 4, 20), 80),
+    )
+
+
+def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def _property_text(props: dict[str, Any], relation_type: str = "") -> str:
+    parts = [relation_type.replace("_", " ")]
+    for key in (
+        "text",
+        "name",
+        "title",
+        "label",
+        "summary",
+        "description",
+        "reason",
+        "rationale",
+        "change_reason",
+        "revision_reason",
+        "evidence",
+        "source",
+        "heading_path",
+    ):
+        value = props.get(key)
+        if value:
+            parts.append(str(value))
+    if len(parts) <= 1:
+        parts.append(str(props))
+    return " ".join(parts)[:4000]
 
 
 class HybridQuery:
@@ -131,29 +247,35 @@ class HybridQuery:
         list[QueryResult] sorted by descending score.
         """
         result_lists: list[list[dict[str, Any]]] = []
+        profile = _profile_for_query(question, limit, graph_depth)
 
         # --- Stage 1: Vector similarity search ---
-        vector_hits = self._vector_search(question, spaces, limit)
+        vector_hits = self._vector_search(question, spaces, profile.vector_limit)
         if vector_hits:
             result_lists.append([r.to_dict() for r in vector_hits])
 
         # --- Stage 2: BM25 keyword search ---
+        bm25_hits: list[dict[str, Any]] = []
         if use_bm25 and self._doc_store is not None:
-            bm25_hits = self._bm25_search(question, spaces, limit)
+            bm25_hits = self._bm25_search(question, spaces, profile.bm25_limit)
             if bm25_hits:
                 result_lists.append(bm25_hits)
 
-        # --- Stage 3: Graph expansion from vector anchor nodes ---
-        anchor_ids = [hit.node_id for hit in vector_hits if hit.node_id]
+        # --- Stage 3: Graph expansion from vector and BM25 anchor nodes ---
+        anchor_ids = _ordered_unique(
+            [hit.node_id for hit in vector_hits if hit.node_id]
+            + [hit.get("node_id") for hit in bm25_hits],
+            profile.anchor_limit,
+        )
         if anchor_ids and self._neo4j.available:
-            graph_results = self._graph_expand(anchor_ids, graph_depth, limit)
+            graph_results = self._graph_expand(anchor_ids, profile.graph_depth, profile.graph_limit)
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
 
         # --- Stage 4: Rerank ---
         if use_rerank and result_lists:
             reranker = _get_reranker()()
-            merged = reranker.rerank(question, result_lists, top_k=limit * 2)
+            merged = reranker.rerank(question, result_lists, top_k=profile.rerank_limit)
         else:
             # Flat merge without reranking
             seen: set[str | None] = set()
@@ -191,7 +313,7 @@ class HybridQuery:
         """Run BM25 search against doc store nodes, using a cached index."""
         try:
             if self._bm25_dirty or self._bm25_cache is None:
-                nodes = self._doc_store.list_nodes(limit=5000)
+                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
                 BM25Index = _get_bm25()
                 self._bm25_cache = BM25Index.build(nodes)
                 self._bm25_cache_size = len(nodes)
@@ -312,19 +434,21 @@ class HybridQuery:
                     if nid and nid not in seen:
                         seen.add(nid)
                         rel_type = n.get("relation_type") or n.get("relationship_type") or ""
-                        base_score = _EDGE_WEIGHTS.get(rel_type, _DEFAULT_EDGE_SCORE) * hop_decay
+                        rel_key = str(rel_type).upper()
+                        base_score = _EDGE_WEIGHTS.get(rel_key, _DEFAULT_EDGE_SCORE) * hop_decay
                         expanded.append(
                             QueryResult(
                                 source="graph",
                                 node_id=nid,
                                 score=base_score,
-                                text=props.get("text") or props.get("name"),
+                                text=_property_text(props, rel_type),
                                 metadata=props,
                                 graph_context={
                                     "anchor_id": anchor_id,
                                     "labels": n.get("labels", []),
                                     "relation_type": rel_type,
-                                    "depth": depth,
+                                    "relationship_types": n.get("relationship_types"),
+                                    "depth": n.get("depth") or depth,
                                 },
                             )
                         )

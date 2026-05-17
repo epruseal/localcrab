@@ -24,14 +24,74 @@ _K1 = 1.5
 _B = 0.75
 
 # Properties to include when building the text representation of a node
-_TEXT_FIELDS = ("name", "description", "text", "title", "label", "summary", "content")
+_TEXT_FIELDS = (
+    "name",
+    "description",
+    "text",
+    "title",
+    "label",
+    "summary",
+    "content",
+    "reason",
+    "rationale",
+    "change_reason",
+    "revision_reason",
+    "applicability",
+    "limitation",
+    "limitations",
+    "risk",
+    "law",
+    "standard",
+    "evidence",
+    "source",
+    "heading_path",
+)
+_HANGUL_RE = re.compile(r"[가-힣]")
+_MAX_PROPERTY_TEXT = 1200
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase, strip punctuation, split on whitespace."""
+    """Lowercase, strip punctuation, split on whitespace.
+
+    Korean construction benchmarks contain many compound nouns and short
+    relation cues ("변경 이유", "적용 불가", "개정"). Whitespace tokenisation
+    alone misses those matches, so Hangul tokens also contribute 2- and 3-char
+    n-grams. This keeps exact English behaviour while making Korean recall
+    much less brittle.
+    """
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
-    return [t for t in text.split() if t]
+    tokens: list[str] = []
+    for token in text.split():
+        if not token:
+            continue
+        tokens.append(token)
+        if _HANGUL_RE.search(token) and len(token) >= 3:
+            for n in (2, 3):
+                tokens.extend(token[i : i + n] for i in range(0, len(token) - n + 1))
+    return tokens
+
+
+def _flatten_property_text(value: Any, depth: int = 0) -> list[str]:
+    """Collect searchable scalar text from nested property values."""
+    if value is None or depth > 2:
+        return []
+    if isinstance(value, str):
+        return [value[:_MAX_PROPERTY_TEXT]]
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value[:50]:
+            parts.extend(_flatten_property_text(item, depth + 1))
+        return parts
+    if isinstance(value, dict):
+        parts = []
+        for key, item in list(value.items())[:80]:
+            parts.append(str(key).replace("_", " "))
+            parts.extend(_flatten_property_text(item, depth + 1))
+        return parts
+    return [str(value)[:_MAX_PROPERTY_TEXT]]
 
 
 def _node_text(node: dict[str, Any]) -> str:
@@ -47,6 +107,11 @@ def _node_text(node: dict[str, Any]) -> str:
         val = props.get(field)
         if val:
             parts.append(str(val))
+    for key, val in props.items():
+        if key in _TEXT_FIELDS:
+            continue
+        parts.append(str(key).replace("_", " "))
+        parts.extend(_flatten_property_text(val))
     return " ".join(parts)
 
 

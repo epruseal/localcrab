@@ -74,12 +74,10 @@ def init(force: bool) -> None:
     console.print(
         Panel(
             "[bold]Next steps:[/bold]\n\n"
-            "1. Edit [cyan].env[/cyan] with your credentials.\n"
-            "2. Start services:\n"
-            "   [cyan]docker-compose up -d[/cyan]\n"
-            "3. Add to Claude Code MCP config:\n"
+            "1. Optional: edit [cyan].env[/cyan] to change LOCAL_DATA_DIR.\n"
+            "2. Add to Claude Code MCP config:\n"
             "   [cyan]claude mcp add opencrab -- opencrab serve[/cyan]\n"
-            "4. Seed example data:\n"
+            "3. Seed example data:\n"
             "   [cyan]python scripts/seed_ontology.py[/cyan]",
             title="OpenCrab Setup",
             border_style="green",
@@ -89,14 +87,7 @@ def init(force: bool) -> None:
 
 def _write_default_env(path: Path) -> None:
     content = """\
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=opencrab
-MONGODB_URI=mongodb://root:opencrab@localhost:27017
-MONGODB_DB=opencrab
-POSTGRES_URL=postgresql://opencrab:opencrab@localhost:5432/opencrab
-CHROMA_HOST=localhost
-CHROMA_PORT=8000
+LOCAL_DATA_DIR=./opencrab_data
 CHROMA_COLLECTION=opencrab_vectors
 MCP_SERVER_NAME=opencrab
 MCP_SERVER_VERSION=0.1.0
@@ -138,8 +129,8 @@ def status() -> None:
     )
 
     cfg = get_settings()
-    mode_label = f"[bold cyan]{cfg.storage_mode.upper()} MODE[/bold cyan]"
-    storage_loc = cfg.local_data_dir if cfg.is_local else "Docker services"
+    mode_label = "[bold cyan]LOCAL MODE[/bold cyan]"
+    storage_loc = cfg.local_data_dir
     console.print(f"\n{mode_label} - storage at: {storage_loc}\n")
 
     graph  = make_graph_store(cfg)
@@ -147,20 +138,12 @@ def status() -> None:
     docs   = make_doc_store(cfg)
     sql    = make_sql_store(cfg)
 
-    if cfg.is_local:
-        store_rows: list[tuple[str, str, Any]] = [
-            ("Graph (SQLite)",    cfg.local_data_dir + "/graph.db",    graph),
-            ("Vector (ChromaDB)", cfg.local_data_dir + "/chroma",      vector),
-            ("Docs (JSON files)", cfg.local_data_dir + "/docs",        docs),
-            ("SQL (SQLite)",      cfg.local_data_dir + "/opencrab.db", sql),
-        ]
-    else:
-        store_rows = [
-            ("Graph (Neo4j)",     cfg.neo4j_uri,                      graph),
-            ("Docs (MongoDB)",    cfg.mongodb_uri.split("@")[-1],     docs),
-            ("SQL (PostgreSQL)",  cfg.postgres_url.split("@")[-1],    sql),
-            ("Vector (ChromaDB)", cfg.chroma_url,                     vector),
-        ]
+    store_rows: list[tuple[str, str, Any]] = [
+        ("Graph (SQLite)",    cfg.local_data_dir + "/graph.db",    graph),
+        ("Vector (ChromaDB)", cfg.local_data_dir + "/chroma",      vector),
+        ("Docs (JSON files)", cfg.local_data_dir + "/docs",        docs),
+        ("SQL (SQLite)",      cfg.local_data_dir + "/opencrab.db", sql),
+    ]
 
     table = Table(title="OpenCrab Store Status", show_header=True, header_style="bold cyan")
     table.add_column("Store", style="bold")
@@ -456,6 +439,50 @@ def manifest(json_output: bool) -> None:
             title="ReBAC",
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# export-neo4j-pack
+# ---------------------------------------------------------------------------
+
+
+@main.command("export-neo4j-pack")
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(),
+    help="Output JSONL path, usually neo4j/opencrab_ingest.jsonl.",
+)
+@click.option("--pack-id", default=None, help="Optional pack_id/source filter.")
+@click.option("--node-limit", default=500_000, show_default=True, type=int)
+@click.option("--edge-limit", default=1_000_000, show_default=True, type=int)
+def export_neo4j_pack(
+    output: str,
+    pack_id: str | None,
+    node_limit: int,
+    edge_limit: int,
+) -> None:
+    """Export a verified Neo4j graph snapshot for an OpenCrab pack."""
+    from opencrab.config import get_settings
+    from opencrab.pack import export_neo4j_opencrab_ingest
+    from opencrab.stores.neo4j_store import Neo4jStore
+
+    cfg = get_settings()
+    neo4j = Neo4jStore(
+        uri=cfg.neo4j_uri,
+        user=cfg.neo4j_user,
+        password=cfg.neo4j_password,
+        database=cfg.neo4j_database,
+    )
+    status = export_neo4j_opencrab_ingest(
+        neo4j,
+        output,
+        pack_id=pack_id,
+        node_limit=node_limit,
+        edge_limit=edge_limit,
+    )
+    console.print_json(json.dumps(status, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------

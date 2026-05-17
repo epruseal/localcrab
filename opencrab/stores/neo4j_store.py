@@ -229,20 +229,30 @@ class Neo4jStore:
             raise RuntimeError("Neo4j is not available.")
 
         arrow = {
-            "out": "-[r*1..{depth}]->",
-            "in": "<-[r*1..{depth}]-",
-            "both": "-[r*1..{depth}]-",
-        }.get(direction, "-[r*1..{depth}]-").format(depth=depth)
+            "out": "-[rels*1..{depth}]->",
+            "in": "<-[rels*1..{depth}]-",
+            "both": "-[rels*1..{depth}]-",
+        }.get(direction, "-[rels*1..{depth}]-").format(depth=depth)
 
         cypher = f"""
-            MATCH (start {{id: $id}}){arrow}(neighbor)
-            RETURN DISTINCT properties(neighbor) AS props, labels(neighbor) AS labels
+            MATCH path = (start {{id: $id}}){arrow}(neighbor)
+            WITH neighbor, labels(neighbor) AS labels, properties(neighbor) AS props,
+                 [rel IN relationships(path) | type(rel)] AS relationship_types,
+                 length(path) AS depth
+            RETURN DISTINCT props, labels, relationship_types, depth
             LIMIT $limit
         """
         with self._session() as session:
             result = session.run(cypher, id=node_id, limit=limit)
             return [
-                {"properties": dict(record["props"]), "labels": list(record["labels"])}
+                {
+                    "properties": dict(record["props"]),
+                    "labels": list(record["labels"]),
+                    "relationship_types": list(record["relationship_types"]),
+                    "relation_type": list(record["relationship_types"])[-1]
+                    if record["relationship_types"] else "",
+                    "depth": record["depth"],
+                }
                 for record in result
             ]
 

@@ -4,532 +4,234 @@
 
 # OpenCrab
 
-**MetaOntology OS MCP Server Plugin**
+**LocalCrab builds. OpenCrab SaaS distributes.**
 
-> Carcinization is the evolutionary tendency for crustaceans to converge on a crab-like body plan.
-> OpenCrab applies the same principle to agent environments:
-> all sufficiently advanced AI systems eventually evolve toward ontology-structured forms.
+OpenCrab is the public integration repository for the LocalCrab ontology
+factory and the OpenCrab hosted ecosystem at [opencrab.sh](https://opencrab.sh).
 
-OpenCrab is an MCP (Model Context Protocol) server that exposes the MetaOntology OS grammar
-to any OpenClaw-compatible agent environment — Claude Code, n8n, LangGraph, and beyond.
+This repository contains the local engine: MetaOntology OS grammar, MCP tools,
+CrabHarness evidence collection, local stores, promotion lifecycle, and pack
+export contracts. It does **not** contain the private implementation of the
+hosted `opencrab.sh` SaaS product.
 
-**Companion:** [`crabharness/`](./crabharness/) — a plugin-based mission control plane that plans evidence collection, delegates heavy crawling to Codex workers, validates artifacts through a three-gate pipeline, and emits OpenCrab-ready promotion packages. See [CrabHarness README](./crabharness/README.md).
+Any sample app or API code in this repository is local/demo infrastructure for
+developer testing. It is not the production `opencrab.sh` SaaS code.
 
----
+## What This Repo Is For
 
-## What's New (v1.5.0)
+| Layer | Role | Lives here? |
+| --- | --- | --- |
+| LocalCrab | Local ontology factory for crawling, parsing, evidence indexing, Neo4j validation, and ZIP pack export. | Yes |
+| CrabHarness | Mission-first control plane for crawler planning, worker delegation, evidence validation, and promotion packages. | Yes |
+| MetaOntology OS | Canonical grammar, schemas, ReBAC, identity/canonicalization, promotion lifecycle, and MCP server tools. | Yes |
+| OpenCrab SaaS | Hosted ingestion, marketplace, profiles, MCP access, community, and paid/free pack circulation. | No, linked via [opencrab.sh](https://opencrab.sh) |
 
-### Phase 1 — Core Stabilization
-- **Grammar versioning**: `GRAMMAR_VERSION = "1.0.0"` in every manifest response
-- **Type Schema Registry**: YAML schemas in `schemas/types/` — `required`, `enum` validation on every node write
-- **Receipt IDs**: every `add_node` / `add_edge` returns `receipt_id + receipt_ts` for provenance
+The intended flow:
 
-### Phase 2 — Action / Workflow Runtime
-- **WorkflowEngine**: SQL state machine (`pending → running → approved/rejected → completed/failed`) with full audit log
-- **ApprovalEngine**: three-state approval queue linked to workflow runs
-- **CrabHarness `promotion-apply`**: CLI command + MCP tool to apply PromotionPackages inline
-
-### Phase 3 — Identity / Canonicalization / Promotion
-- **IdentityEngine**: alias table + fuzzy duplicate detection — no auto-merge, human review first
-- **CanonicalizeEngine**: tombstone-based node merge — alias nodes preserved, `resolve_canonical()` for lookups
-- **PromotionEngine**: full extraction lifecycle `candidate → validated → promoted | rejected` with evidence linking
-
-### Phase 4 — Query / Reasoning Upgrade
-- **BM25 Index**: pure Python keyword search over all node properties (no external deps)
-- **RRF Reranker**: Reciprocal Rank Fusion merges vector + BM25 + graph results; BM25 cross-score boosts query-relevant hits
-- **Policy-aware filtering**: pass `subject_id` to `ontology_query` and results are filtered by ReBAC `view` permission
-
-### Phase 5 — Productization
-- **Tenant isolation**: `tenant_id` context stamped on writes; `X-Tenant-Id` header support
-- **Billing hooks**: `billing_events` table tracks node_write / query / ingest / promotion per tenant
-- **Schema packs**: domain bundles (`saas`, `biomedical`, `legal`) installable with one MCP call
-
-**Total MCP tools: 30**
-
----
-
-## Architecture
-
-```
-                        ┌─────────────────────────────────────────────┐
-                        │           OpenCrab MCP Server               │
-                        │              (stdio JSON-RPC)               │
-                        └──────────────────┬──────────────────────────┘
-                                           │
-              ┌────────────────────────────┼────────────────────────────┐
-              │                           │                            │
-      ┌───────▼──────┐           ┌────────▼───────┐          ┌────────▼───────┐
-      │  grammar/    │           │   ontology/    │          │    stores/     │
-      │  manifest.py │           │   builder.py   │          │                │
-      │  validator.py│           │   rebac.py     │          │  neo4j_store   │
-      │  glossary.py │           │   impact.py    │          │  chroma_store  │
-      └──────────────┘           │   query.py     │          │  mongo_store   │
-                                 │   identity.py  │          │  sql_store     │
-      ┌───────────────┐          │   canonicalize │          └───────┬────────┘
-      │  schemas/     │          │   promotion.py │                  │
-      │  types/*.yaml │          │   bm25.py      │   ┌─────────────▼──────────┐
-      │  packs/*.yaml │          │   reranker.py  │   │       billing/         │
-      │  loader.py    │          │   tenant.py    │   │   hooks.py             │
-      │  pack_registry│          └────────────────┘   └────────────────────────┘
-      └───────────────┘
-                                 ┌──────────────────────────────────┐
-                                 │         execution/               │
-                                 │   workflow.py  approvals.py      │
-                                 │   action_registry.py             │
-                                 └──────────────────────────────────┘
+```text
+source material or crawl target
+        |
+        v
+CrabHarness mission planning
+        |
+        v
+evidence collection + OCR/CLIP indexing
+        |
+        v
+MetaOntology grammar extraction
+        |
+        v
+Neo4j/Cypher validation
+        |
+        v
+OpenCrab Pack v1 ZIP
+        |
+        v
+opencrab.sh ingest + marketplace + ecosystem distribution
 ```
 
-### MetaOntology OS — 9 Spaces
+## LocalCrab and OpenCrab SaaS
 
-| Space      | Node Types                                  | Role                              |
-|------------|---------------------------------------------|-----------------------------------|
-| subject    | User, Team, Org, Agent                      | Actors with identity and agency   |
-| resource   | Project, Document, File, Dataset, Tool, API | Artifacts that subjects act upon  |
-| evidence   | TextUnit, LogEntry, Evidence                | Raw empirical observations        |
-| concept    | Entity, Concept, Topic, Class               | Abstract knowledge                |
-| claim      | Claim, Covariate                            | Derived assertions                |
-| community  | Community, CommunityReport                  | Concept clusters                  |
-| outcome    | Outcome, KPI, Risk                          | Measurable results                |
-| lever      | Lever                                       | Tunable control variables         |
-| policy     | Policy, Sensitivity, ApprovalRule           | Governance rules                  |
+LocalCrab is quality-first. It exists to produce ontology packs with strong
+evidence coverage, traceable parsing, OCR/CLIP context, graph validation, and
+promotion receipts.
 
-### MetaEdge Relationship Grammar
+OpenCrab SaaS is ecosystem-first. It exists to ingest packs, make them useful
+to users and agents, distribute them through marketplace/community surfaces,
+and expose hosted MCP access.
 
-```
-subject    ──[owns, manages, can_view, can_edit, can_execute, can_approve]──► resource
-resource   ──[contains, derived_from, logged_as]──────────────────────────► evidence
-evidence   ──[mentions, describes, exemplifies]────────────────────────────► concept
-evidence   ──[supports, contradicts, timestamps]───────────────────────────► claim
-concept    ──[related_to, subclass_of, part_of, influences, depends_on]────► concept
-concept    ──[contributes_to, constrains, predicts, degrades]──────────────► outcome
-lever      ──[raises, lowers, stabilizes, optimizes]───────────────────────► outcome
-lever      ──[affects]─────────────────────────────────────────────────────► concept
-community  ──[clusters, summarizes]────────────────────────────────────────► concept
-policy     ──[protects, classifies, restricts]─────────────────────────────► resource
-policy     ──[permits, denies, requires_approval]──────────────────────────► subject
-```
+Read the full relationship model:
 
----
+- [LocalCrab and OpenCrab SaaS relationship](./docs/localcrab-opencrab-relationship.md)
+- [LocalCrab factory workflow](./docs/localcrab-factory-workflow.md)
+- [OpenCrab Pack v1 ZIP format](./docs/opencrab-pack-v1.md)
 
 ## Quick Start
 
-### 1. Start the data services
-
-```bash
-docker-compose up -d
-```
-
-This starts Neo4j, MongoDB, PostgreSQL, and ChromaDB.
-
-### 2. Install OpenCrab
+### 1. Install LocalCrab
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 3. Configure environment
+### 2. Run LocalCrab
 
 ```bash
-opencrab init          # creates .env from template
-# Edit .env if your credentials differ from defaults
+opencrab serve
 ```
 
-**Local mode (no Docker required):**
+LocalCrab runs locally by default. It uses SQLite, JSON files, and a local
+Chroma persistent store under `./opencrab_data`.
 
-```bash
-STORAGE_MODE=local opencrab serve
-```
-
-Local mode uses SQLite + JSON files — no external services needed.
-
-### 4. Seed example data
-
-```bash
-python scripts/seed_ontology.py
-```
-
-### 5. Verify connectivity
+### 3. Verify the grammar and query path
 
 ```bash
 opencrab status
+opencrab manifest
+opencrab query "system performance and error rates"
 ```
 
-### 6. Add to Claude Code MCP
+### 4. Add LocalCrab as an MCP server
 
 ```bash
 claude mcp add opencrab -- opencrab serve
 ```
 
-Or add to your `.claude/mcp.json` manually (see below).
-
-### 7. Run a query
-
-```bash
-opencrab query "system performance and error rates"
-opencrab manifest    # see the full grammar
-```
-
----
-
-## Claude Code MCP Configuration
-
-Add to `~/.claude/mcp.json` (or project-level `.mcp.json`):
+Or add it manually:
 
 ```json
 {
   "mcpServers": {
     "opencrab": {
       "command": "opencrab",
-      "args": ["serve"],
-      "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "opencrab",
-        "MONGODB_URI": "mongodb://root:opencrab@localhost:27017",
-        "MONGODB_DB": "opencrab",
-        "POSTGRES_URL": "postgresql://opencrab:opencrab@localhost:5432/opencrab",
-        "CHROMA_HOST": "localhost",
-        "CHROMA_PORT": "8000"
-      }
+      "args": ["serve"]
     }
   }
 }
 ```
 
-**Local mode (SQLite + JSON, no Docker):**
+## CrabHarness
 
-```json
-{
-  "mcpServers": {
-    "opencrab": {
-      "command": "opencrab",
-      "args": ["serve"],
-      "env": {
-        "STORAGE_MODE": "local"
-      }
-    }
-  }
-}
+[`crabharness/`](./crabharness/) is the mission-first control plane for
+evidence collection. It plans what to crawl, delegates heavy work to plugin
+workers, validates the collected bundle, and emits OpenCrab-ready promotion
+packages.
+
+Core responsibilities:
+
+- Decide crawl target, scope, depth, volume, rate limits, and success criteria.
+- Store every collected page, document, file, image, and log as evidence.
+- Preserve hashes, source URLs or paths, crawl timestamps, parser status, and
+  missing-context candidates.
+- Promote only after completeness, semantic relevance, and autoresearch gates
+  pass.
+
+See the [CrabHarness README](./crabharness/README.md).
+
+## MetaOntology OS
+
+LocalCrab keeps the existing MetaOntology OS grammar and MCP surface as the
+canonical ontology contract.
+
+### 9 Spaces
+
+| Space | Role |
+| --- | --- |
+| subject | Actors with identity, agency, roles, and permissions. |
+| resource | Documents, datasets, tools, APIs, files, and projects. |
+| evidence | Raw observations, logs, text units, parser/OCR outputs, and empirical records. |
+| concept | Entities, concepts, topics, classes, and domain abstractions. |
+| claim | Derived assertions grounded by evidence. |
+| community | Clusters and summaries of related concepts or actors. |
+| outcome | KPIs, risks, impacts, and measurable results. |
+| lever | Tunable controls that affect outcomes or concepts. |
+| policy | Access, sensitivity, approval, and governance rules. |
+
+### Core MCP Tools
+
+- `ontology_manifest`: return the full grammar.
+- `ontology_add_node`: add or update a grammar-validated node.
+- `ontology_add_edge`: add a grammar-validated edge.
+- `ontology_query`: hybrid vector + BM25 + graph query.
+- `ontology_impact`: I1-I7 impact analysis.
+- `ontology_rebac_check`: relationship-based access check.
+- `ontology_ingest`: ingest text into the local ontology stores.
+- `harness_promotion_apply`: apply a CrabHarness promotion package.
+
+## OpenCrab Pack v1
+
+LocalCrab exports ontology deliveries as an OpenCrab Pack v1 ZIP. The pack is
+designed to be recognized by OpenCrab SaaS while remaining reproducible in a
+local Neo4j environment.
+
+Required high-level layout:
+
+```text
+manifest.json
+graph/nodes.jsonl
+graph/edges.jsonl
+evidence/index.jsonl
+quality/report.json
+neo4j/import.cypher
+neo4j/opencrab_ingest.jsonl
+neo4j/export_status.json
+README.md
+sample_queries.json
+community_reports.json
 ```
 
----
+The packaging pipeline is:
 
-## MCP Tool Reference
-
-### Core Ontology (9 tools)
-
-#### `ontology_manifest`
-Returns the full MetaOntology grammar with version, spaces, meta-edges, impact categories, and ReBAC config.
-
-#### `ontology_add_node`
-```json
-{
-  "space": "subject",
-  "node_type": "User",
-  "node_id": "user-alice",
-  "properties": { "name": "Alice Chen", "role": "analyst" },
-  "tenant_id": "acme",
-  "subject_id": "user-alice"
-}
-```
-Returns `receipt_id + receipt_ts`. Properties validated against type schema if one exists.
-
-#### `ontology_add_edge`
-```json
-{
-  "from_space": "subject", "from_id": "user-alice",
-  "relation": "owns",
-  "to_space": "resource", "to_id": "doc-spec"
-}
-```
-Validates the `(from_space, to_space, relation)` triple against the grammar before write.
-
-#### `ontology_query` — Hybrid Query (v2)
-```json
-{
-  "question": "What factors degrade system performance?",
-  "spaces": ["concept", "outcome"],
-  "limit": 10,
-  "subject_id": "user-alice",
-  "tenant_id": "acme",
-  "use_bm25": true,
-  "use_rerank": true
-}
-```
-Pipeline: vector similarity → BM25 keyword → graph expansion → RRF reranking → policy filter.
-
-#### `query_bm25`
-```json
-{ "question": "machine learning", "spaces": ["concept"], "limit": 10 }
-```
-BM25-only keyword search. Fast and deterministic, no embeddings.
-
-#### `ontology_impact`
-```json
-{ "node_id": "lever-cache-ttl", "change_type": "update" }
-```
-Returns triggered I1–I7 impact categories and affected neighbours.
-
-#### `ontology_rebac_check`
-```json
-{ "subject_id": "user-alice", "permission": "edit", "resource_id": "ds-events" }
-```
-Returns `{ "granted": true/false, "reason": "...", "path": [...] }`.
-
-#### `ontology_lever_simulate`
-```json
-{ "lever_id": "lever-cache-ttl", "direction": "lowers", "magnitude": 0.7 }
+```text
+validate -> Neo4j import/check -> Neo4j graph export -> normalized SaaS export -> ZIP package
 ```
 
-#### `ontology_ingest`
-```json
-{ "text": "...", "source_id": "incident-2026-01", "metadata": { "space": "evidence" } }
-```
-
----
-
-### Identity & Canonicalization (7 tools)
-
-#### `identity_add_alias`
-Register `alias_id` as an alias for `canonical_id`. Types: `name`, `merge`, `external`.
-
-#### `identity_resolve_canonical`
-Resolve a node ID to its canonical form. Returns `is_alias: true` if it was an alias.
-
-#### `identity_propose_duplicate`
-Propose two nodes as potential duplicates for human review.
-
-#### `identity_resolve_duplicate`
-Accept or reject a pending duplicate candidate. On accept, registers alias automatically.
-
-#### `identity_list_pending_duplicates`
-List all pending duplicate candidates sorted by similarity.
-
-#### `canonicalize_merge_nodes`
-Merge `alias_id` into `canonical_id` using tombstone pattern — alias node is preserved.
-
-#### `canonicalize_find_and_propose`
-Find nodes with similar names and auto-propose them as duplicate candidates.
-
----
-
-### Promotion Lifecycle (4 tools)
-
-Tracks extracted entities through: `candidate → validated → promoted | rejected`.
-
-#### `promotion_register_candidate`
-Register an extracted entity as a promotion candidate (not visible in normal queries yet).
-
-#### `promotion_validate_candidate`
-Mark a candidate as validated — ready for final review.
-
-#### `promotion_promote`
-Promote to `promoted` status. Optionally links evidence nodes via `supports` edges.
-
-#### `promotion_reject`
-Mark a candidate as rejected with an optional reason.
-
----
-
-### Workflow & Approvals (3 tools)
-
-#### `workflow_create_run`
-Start an auditable workflow run in `pending` state before executing any sensitive action.
-
-#### `workflow_advance`
-Advance a run to a new status (`pending → running → approved/rejected → completed/failed`).
-
-#### `approval_request`
-Submit an approval request linked to a workflow run.
-
----
-
-### CrabHarness Integration (1 tool)
-
-#### `harness_promotion_apply`
-```json
-{ "package": { ... }, "dry_run": false }
-```
-Apply a CrabHarness PromotionPackage inline. Returns `receipt_id + receipt_ts` per node/edge written. Use `dry_run: true` to validate without writing.
-
----
-
-### Billing & Usage (2 tools)
-
-#### `billing_get_usage`
-```json
-{ "tenant_id": "acme", "event_type": "query", "since": "2026-04-01T00:00:00Z" }
-```
-Aggregated usage counts by event type for a tenant.
-
-#### `billing_list_events`
-Recent raw billing events for a tenant (last N).
-
----
-
-### Schema Packs (3 tools)
-
-Domain-specific schema bundles that extend the type registry without touching core schemas.
-
-#### `schema_pack_list`
-List available packs with install status. Built-in packs: `saas`, `biomedical`, `legal`.
-
-#### `schema_pack_install`
-```json
-{ "name": "biomedical" }
-```
-Generates stub YAML type schemas in `schemas/types/`. Existing user schemas are never overwritten.
-
-#### `schema_pack_uninstall`
-```json
-{ "name": "biomedical", "force": false }
-```
-
----
-
-## CLI Reference
-
-```
-opencrab init              Create .env from template
-opencrab serve             Start MCP server (stdio)
-opencrab status            Check store connections
-opencrab ingest <path>     Ingest files into vector store
-opencrab query <question>  Run a hybrid query
-opencrab manifest          Print MetaOntology grammar
-```
-
-Global flags:
-
-```
-opencrab --version
-opencrab query --json-output <q>
-opencrab manifest --json-output
-opencrab ingest -r <dir>
-opencrab ingest -e .txt,.md <dir>
-```
-
----
-
-## Impact Categories (I1–I7)
-
-| ID | Name                     | Question                                              |
-|----|--------------------------|-------------------------------------------------------|
-| I1 | Data impact              | What data values or records change?                   |
-| I2 | Relation impact          | What graph edges are affected?                        |
-| I3 | Space impact             | Which ontology spaces are touched?                    |
-| I4 | Permission impact        | Which access permissions change?                      |
-| I5 | Logic impact             | Which business rules are invalidated?                 |
-| I6 | Cache/index impact       | Which caches or indexes must be refreshed?            |
-| I7 | Downstream system impact | Which external systems or APIs are affected?          |
-
----
-
-## Active Metadata Layers
-
-Every node and edge can carry orthogonal metadata attributes:
-
-| Layer      | Attributes                         |
-|------------|------------------------------------|
-| existence  | identity, provenance, lineage      |
-| quality    | confidence, freshness, completeness|
-| relational | dependency, sensitivity, maturity  |
-| behavioral | usage, mutation, effect            |
-
----
+See [OpenCrab Pack v1 ZIP format](./docs/opencrab-pack-v1.md).
 
 ## Development
 
 ```bash
-make dev-install    # install with dev extras
-make up             # start docker services
-make seed           # seed example data
-make test           # run test suite
-make coverage       # test + coverage report
-make lint           # ruff linter
-make format         # black + isort
-make status         # check store connections
+make dev-install
+make seed
+make test
+make status
 ```
 
-### Running integration tests
+Run integration tests:
 
 ```bash
 OPENCRAB_INTEGRATION=1 pytest tests/ -v
 ```
 
-### Project structure
+## Project Structure
 
-```
+```text
 opencrab/
-├── grammar/          # MetaOntology grammar (manifest, validator, glossary)
-├── schemas/          # Type schemas (YAML), schema packs, loader
-│   ├── types/        # Per-node-type YAML schemas (required/enum validation)
-│   └── packs/        # Domain packs: saas, biomedical, legal
-├── ontology/         # Core engines
-│   ├── builder.py    # Node/edge write with receipt IDs + schema validation
-│   ├── query.py      # Hybrid query: vector + BM25 + graph + RRF reranker
-│   ├── bm25.py       # Pure Python BM25 index
-│   ├── reranker.py   # RRF + BM25 cross-score fusion
-│   ├── identity.py   # Alias table + duplicate candidate detection
-│   ├── canonicalize.py # Tombstone-based node merge
-│   ├── promotion.py  # Extraction lifecycle (candidate → promoted)
-│   ├── tenant.py     # Tenant isolation context + property stamping
-│   ├── rebac.py      # Relationship-based access control
-│   └── impact.py     # I1–I7 impact analysis
-├── execution/        # Workflow & approvals runtime
-│   ├── workflow.py   # WorkflowEngine state machine
-│   ├── approvals.py  # ApprovalEngine queue
-│   └── action_registry.py # YAML action schemas
-├── billing/          # Usage metering
-│   └── hooks.py      # BillingHooks — billing_events table
-├── stores/           # Store adapters (Neo4j, ChromaDB, MongoDB, PostgreSQL, Local)
-└── mcp/              # MCP server (stdio JSON-RPC) + 30 tool definitions
-tests/                # Test suite
-scripts/              # Seed script
-crabharness/          # Evidence collection pipeline
-docker-compose.yml    # All data services
+  grammar/        MetaOntology grammar, validator, glossary
+  schemas/        YAML type schemas, schema packs, action schemas
+  ontology/       builder, query, identity, canonicalization, promotion, ReBAC
+  execution/      workflow and approval runtime
+  billing/        local usage hooks
+  stores/         Neo4j, Chroma, Mongo, SQL, and local adapters
+  mcp/            MCP server and tool registry
+crabharness/
+  crabharness/    mission planner, runtime, validation, promotion package builder
+  codex_workers/  plugin workers for crawlers and collectors
+  missions/       example missions
+docs/             public integration and pack delivery contracts
 ```
 
----
+## Korean Summary
 
-## CrabHarness — Mission Control Plane
+이 리포지토리는 LocalCrab과 OpenCrab SaaS를 하나의 제품처럼 설명하는 공개 통합
+리포지토리입니다. LocalCrab은 온톨로지 공장입니다. 크롤링, 파싱, OCR, CLIP
+이미지 컨텍스트, evidence 풀 인덱싱, Neo4j 검증, ZIP 팩 생성을 담당합니다.
 
-[`crabharness/`](./crabharness/) is the companion data collection pipeline for OpenCrab. It owns the "how do we *get* the evidence that fills the ontology" layer, while OpenCrab owns the "how is the ontology structured and queried" layer.
-
-### What CrabHarness adds
-
-| Capability | Description |
-|------------|-------------|
-| **Plugin workers** | Drop a `worker.manifest.json` + `adapter.py` into `codex_workers/` and a new collector appears in the catalog — no core changes. |
-| **Mission-first planner** | Declarative `mission.json` picks workers by `target_object` + tag match instead of hardcoded pipelines. |
-| **Three-gate validation** | Every artifact bundle scored on (1) completeness, (2) semantic relevance, (3) autoresearch verdict. |
-| **Harvest dedupe** | `.seen.json` side-index with SHA256 IDs for `harvest` collection mode. |
-| **Promotion packages** | Builds OpenCrab node/edge packages — **never mutates OpenCrab directly**. |
-| **MCP-native apply** | `harness_promotion_apply` MCP tool applies packages inline from Claude without file I/O. |
-
-### Quickstart
-
-```bash
-cd crabharness
-pip install -e .
-crabharness catalog
-crabharness run missions/examples/github-trending-harvest.json
-crabharness promotion-apply artifacts/runs/<mission>/<run>/promotion_package.json
-```
-
-### Integration with OpenCrab
-
-CrabHarness produces promotion packages as pure JSON. Apply them via:
-- **CLI**: `crabharness promotion-apply <package.json>`
-- **MCP**: `harness_promotion_apply { "package": { ... } }`
-
-The `dry_run: true` flag validates grammar and schemas without writing.
-
----
+OpenCrab SaaS는 [opencrab.sh](https://opencrab.sh)의 생태계 허브입니다. 완성된
+팩을 인제스트하고, 마켓플레이스와 커뮤니티에서 배포하며, hosted MCP 접근을
+제공합니다. 단, `opencrab.sh`의 내부 SaaS 코드는 이 공개 리포지토리에 포함하지
+않습니다.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
----
-
-*OpenCrab: resistance is futile. Your agent will become an ontology.*
+MIT.

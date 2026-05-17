@@ -1,4 +1,4 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL || 'https://opencrabback.up.railway.app'
+const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 function headers(apiKey?: string) {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }

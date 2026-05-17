@@ -447,7 +447,7 @@ def get_status(ctx: ApiContext = Depends(get_context)) -> dict[str, Any]:
         "ok": True,
         "service": "opencrab-api",
         "tier": _tier(),
-        "storage_mode": ctx.settings.storage_mode,
+        "storage_mode": "local",
         "stores": {
             "graph": {"available": bool(getattr(ctx.graph, "available", False)), "healthy": bool(_safe_count(ctx.graph.ping, 0))},
             "vector": {"available": bool(getattr(ctx.vector, "available", False)), "healthy": bool(_safe_count(ctx.vector.ping, 0))},

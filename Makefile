@@ -1,4 +1,4 @@
-.PHONY: help install dev-install up down status serve query manifest lint format test coverage seed
+.PHONY: help install dev-install status serve query manifest lint format test coverage seed
 
 PYTHON := python
 PIP    := pip
@@ -10,8 +10,6 @@ help:
 	@echo "Usage:"
 	@echo "  make install       Install package"
 	@echo "  make dev-install   Install with dev extras"
-	@echo "  make up            Start all Docker services"
-	@echo "  make down          Stop all Docker services"
 	@echo "  make status        Check store connections"
 	@echo "  make serve         Start MCP server on stdio"
 	@echo "  make manifest      Print MetaOntology grammar"
@@ -26,13 +24,6 @@ install:
 
 dev-install:
 	$(PIP) install -e ".[dev]"
-
-up:
-	docker-compose up -d
-	@echo "Services starting... run 'make status' to check readiness."
-
-down:
-	docker-compose down
 
 status:
 	$(PYTHON) -m opencrab.cli status

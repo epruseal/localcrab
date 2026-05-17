@@ -1,5 +1,5 @@
 """
-Local document store — JSON-file-backed store for local (no-Docker) mode.
+Local document store — JSON-file-backed store for local-only mode.
 
 Implements the same interface as MongoStore so consumers are agnostic
 of the backend. Each "collection" is a single JSON file on disk.

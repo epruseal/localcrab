@@ -34,7 +34,105 @@ _B = 0.75
 def _tokenize(text: str) -> list[str]:
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
-    return [t for t in text.split() if t]
+    tokens: list[str] = []
+    for token in text.split():
+        if not token:
+            continue
+        tokens.append(token)
+        if re.search(r"[가-힣]", token) and len(token) >= 3:
+            for n in (2, 3):
+                tokens.extend(token[i : i + n] for i in range(0, len(token) - n + 1))
+    return tokens
+
+
+_RELATION_CUES = (
+    "why",
+    "reason",
+    "rationale",
+    "change",
+    "revision",
+    "background",
+    "because",
+    "cannot",
+    "risk",
+    "law",
+    "regulation",
+    "이유",
+    "변경",
+    "개정",
+    "배경",
+    "불가",
+    "불가능",
+    "위험",
+    "법규",
+    "조합",
+    "관계",
+    "연결",
+)
+_SOURCE_WEIGHTS = {
+    "bm25": 1.08,
+    "vector": 1.0,
+    "graph": 0.96,
+    "hybrid": 1.0,
+}
+
+
+def _query_has_relation_intent(query: str) -> bool:
+    q = query.lower()
+    return any(cue in q for cue in _RELATION_CUES)
+
+
+def _item_text(item: dict[str, Any]) -> str:
+    parts = [str(item.get("text") or "")]
+    metadata = item.get("metadata") or {}
+    graph_context = item.get("graph_context") or {}
+    try:
+        parts.append(str(metadata))
+        parts.append(str(graph_context))
+    except Exception:
+        pass
+    return " ".join(parts).lower()
+
+
+def _intent_boost(query: str, item: dict[str, Any]) -> float:
+    if not _query_has_relation_intent(query):
+        return 1.0
+
+    source = str(item.get("source") or "hybrid")
+    sources = set(item.get("sources") or [source])
+    boost = max(_SOURCE_WEIGHTS.get(str(candidate), 1.0) for candidate in sources)
+    haystack = _item_text(item)
+
+    matched_cues = sum(1 for cue in _RELATION_CUES if cue in query.lower() and cue in haystack)
+    if matched_cues:
+        boost += min(0.24, matched_cues * 0.08)
+    if "graph" in sources:
+        boost += 0.12
+
+    return min(boost, 1.35)
+
+
+def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
+    """Merge duplicate node hits so consensus survives reranking."""
+    existing_sources = set(existing.get("sources") or [existing.get("source", "hybrid")])
+    existing_sources.add(item.get("source", "hybrid"))
+    existing["sources"] = sorted(str(s) for s in existing_sources if s)
+    if len(existing["sources"]) > 1:
+        existing["source"] = "hybrid"
+
+    existing["score"] = max(float(existing.get("score") or 0.0), float(item.get("score") or 0.0))
+
+    old_text = existing.get("text") or ""
+    new_text = item.get("text") or ""
+    if new_text and new_text not in old_text:
+        existing["text"] = f"{old_text}\n{new_text}".strip()[:4000]
+
+    metadata = dict(existing.get("metadata") or {})
+    metadata.update(item.get("metadata") or {})
+    existing["metadata"] = metadata
+
+    if not existing.get("graph_context") and item.get("graph_context"):
+        existing["graph_context"] = item["graph_context"]
 
 
 def _bm25_cross_score(query_tokens: list[str], doc_tokens: list[str], avgdl: float) -> float:
@@ -95,8 +193,13 @@ class Reranker:
         for results in result_lists:
             for item in results:
                 nid = item.get("node_id")
-                if nid and nid not in all_results:
-                    all_results[nid] = item
+                if not nid:
+                    continue
+                if nid not in all_results:
+                    all_results[nid] = dict(item)
+                    all_results[nid]["sources"] = [item.get("source", "hybrid")]
+                else:
+                    _merge_duplicate(all_results[nid], item)
 
         if not all_results:
             return []
@@ -142,6 +245,10 @@ class Reranker:
                 score = _ALPHA * rrf + (1 - _ALPHA) * bm25
             else:
                 score = rrf
+            source_count = len(all_results[nid].get("sources") or [])
+            if source_count > 1:
+                score += min(0.1, 0.04 * (source_count - 1))
+            score *= _intent_boost(query, all_results[nid])
             final.append((nid, round(score, 4)))
 
         final.sort(key=lambda x: x[1], reverse=True)
