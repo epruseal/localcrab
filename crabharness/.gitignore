@@ -15,3 +15,6 @@ artifacts/
 *.ndjson
 *.zip
 
+
+# Worker runtime scratch
+_workspace/
