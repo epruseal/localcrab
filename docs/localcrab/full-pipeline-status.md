@@ -147,15 +147,19 @@ Verified counts:
 - Graph nodes: `2,000,001`
 - Graph edges: `2,000,000`
 - `neo4j/opencrab_ingest.jsonl` lines: `5,000,023`
+- Canonical `neo4j/opencrab_ingest.jsonl` lines: `4,000,001`
 - ZIP entries: `23`
-- ZIP SHA-256: `987fac94b6426f86453267eb9da900144689db3390dafb0d763f2e89a9f72a39`
+- ZIP SHA-256: `41d81a6c07563f44be588dd1cc3c06a40ec3b2081aa07c8d23aae7a8d4dd1ac4`
+- Canonical Neo4j export SHA-256: `ea3314d54f1c5912e8bae09c84fe08b8e9a0ab531bf7de1dbf5e03afd5958735`
 
-Integrity checks:
+Neo4j ingest/export checks:
 
-- ZIP `testzip`: pass
+- Neo4j nodes: `Document=1`, `Persona=1,000,000`, `Evidence=1,000,000`
+- Neo4j relationships: `CONTAINS=1,000,000`, `SUPPORTS=1,000,000`
+- Evidence nodes hydrated with text/hash/source metadata: `1,000,000`
+- Unhydrated Evidence nodes: `0`
 - Missing node evidence refs: `0`
 - Missing edge evidence refs: `0`
-- Broken edges: `0`
-- LocalCrab SQLite graph ingest: pass
+- ZIP `testzip`: pass
 
-The pack builder is `scripts/build_nemotron_personas_korea_pack.py`; build dependencies are listed in `requirements/localcrab-pack-build.txt`.
+The pack builder is `scripts/build_nemotron_personas_korea_pack.py`; Neo4j import/export scripts are `scripts/import_pack_graph_to_neo4j.py` and `scripts/export_pack_graph_from_neo4j.py`; build dependencies are listed in `requirements/localcrab-pack-build.txt`.
