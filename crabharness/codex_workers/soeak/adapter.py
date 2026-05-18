@@ -202,3 +202,48 @@ def validate_soeak_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> Valid
         issues=issues,
         next_action=next_action,
     )
+
+
+
+def doctor(root_dir):
+    """Check SOEAK worker runtime prerequisites."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    root = Path(root_dir)
+    runtime = root / "worker_runtime"
+    checks = [
+        {"name": "node", "ok": shutil.which("node") is not None},
+        {"name": "npm", "ok": shutil.which("npm") is not None},
+        {"name": "worker_runtime", "ok": runtime.exists()},
+        {"name": "runtime_package", "ok": (runtime / "package.json").exists()},
+        {"name": "runtime_node_modules", "ok": (runtime / "node_modules").exists()},
+        {"name": "worker_script", "ok": (root / "soeak-detail-crawler.ts").exists()},
+    ]
+    doctor_stdout = ""
+    doctor_stderr = ""
+    doctor_ok = False
+    if checks[1]["ok"] and (runtime / "package.json").exists():
+        completed = subprocess.run(
+            ["npm", "run", "doctor"],
+            cwd=runtime,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        doctor_stdout = completed.stdout.strip()
+        doctor_stderr = completed.stderr.strip()
+        doctor_ok = completed.returncode == 0
+    checks.append({"name": "playwright_module", "ok": doctor_ok})
+    return {
+        "worker_id": "codex.soeak.detail",
+        "root_dir": str(root),
+        "runtime_dir": str(runtime),
+        "checks": checks,
+        "ok": all(check["ok"] for check in checks),
+        "doctor_stdout": doctor_stdout,
+        "doctor_stderr": doctor_stderr,
+    }

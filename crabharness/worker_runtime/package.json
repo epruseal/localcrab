@@ -1,0 +1,15 @@
+{
+  "name": "localcrab-worker-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "worker:soeak": "NODE_PATH=./node_modules tsx ../soeak-detail-crawler.ts",
+    "doctor": "NODE_PATH=./node_modules node -e \"import('playwright').then(() => console.log('playwright ok'))\""
+  },
+  "dependencies": {
+    "playwright": "^1.57.0",
+    "tsx": "^4.21.0"
+  },
+  "devDependencies": {}
+}
