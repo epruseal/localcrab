@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE_ROOT="${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}"
+LOCALCRAB_REPO="${LOCALCRAB_REPO:-$WORKSPACE_ROOT/vendor/localcrab}"
+LOCALCRAB_VENV="${LOCALCRAB_VENV:-$WORKSPACE_ROOT/.venvs/localcrab}"
+
+export LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-$WORKSPACE_ROOT/data/localcrab}"
+export MCP_SERVER_NAME="${MCP_SERVER_NAME:-localcrab}"
+export MCP_SERVER_VERSION="${MCP_SERVER_VERSION:-0.1.0-localcrab}"
+export NEO4J_URI="${NEO4J_URI:-bolt://localhost:7687}"
+export NEO4J_USER="${NEO4J_USER:-neo4j}"
+export NEO4J_PASSWORD="${NEO4J_PASSWORD:-opencrab}"
+
+mkdir -p "$LOCAL_DATA_DIR"
+cd "$LOCALCRAB_REPO"
+exec "$LOCALCRAB_VENV/bin/opencrab" "$@"
