@@ -127,3 +127,35 @@ These are implementation-quality upgrades, not missing command surfaces:
 - Replace image fingerprint fallback with a pinned semantic CLIP backend if semantic image retrieval is required locally.
 - Add a first-class command that runs mission -> promotion apply -> Neo4j export -> pack ZIP in one invocation.
 - Add richer graph/evidence validation against the full Pack v1 schema.
+
+
+## Verified large dataset pack build
+
+Built and ingested a full Pack v1 for `nvidia/Nemotron-Personas-Korea` at revision `d0a9272116a2ebf139b964ca72b8b8f604616689`.
+
+Local paths:
+
+- Dataset snapshot: `~/.openclaw/workspace/data/localcrab/datasets/nvidia-nemotron-personas-korea`
+- Pack stage: `~/.openclaw/workspace/data/localcrab/packs/nvidia-nemotron-personas-korea/stage`
+- Pack ZIP: `~/.openclaw/workspace/data/localcrab/packs/nvidia-nemotron-personas-korea/nvidia-nemotron-personas-korea.opencrab-pack-v1.zip`
+
+Verified counts:
+
+- Rows: `1,000,000`
+- Source-file evidence: `22`
+- Evidence records: `1,000,022`
+- Graph nodes: `2,000,001`
+- Graph edges: `2,000,000`
+- `neo4j/opencrab_ingest.jsonl` lines: `5,000,023`
+- ZIP entries: `23`
+- ZIP SHA-256: `987fac94b6426f86453267eb9da900144689db3390dafb0d763f2e89a9f72a39`
+
+Integrity checks:
+
+- ZIP `testzip`: pass
+- Missing node evidence refs: `0`
+- Missing edge evidence refs: `0`
+- Broken edges: `0`
+- LocalCrab SQLite graph ingest: pass
+
+The pack builder is `scripts/build_nemotron_personas_korea_pack.py`; build dependencies are listed in `requirements/localcrab-pack-build.txt`.

@@ -1,0 +1,3 @@
+# Dataset pack build dependencies used by scripts/build_nemotron_personas_korea_pack.py
+pyarrow>=16
+pandas>=2.2
