@@ -442,6 +442,43 @@ def manifest(json_output: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# media adapters
+# ---------------------------------------------------------------------------
+
+
+@main.command("ocr")
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--output", "output", "-o", default=None, type=click.Path(), help="Optional evidence JSON output path.")
+@click.option("--backend", default="auto", show_default=True, type=click.Choice(["auto", "tesseract", "metadata"]))
+@click.option("--lang", default="eng+kor", show_default=True, help="Tesseract language list.")
+def ocr_command(path: str, output: str | None, backend: str, lang: str) -> None:
+    """Run LocalCrab OCR adapter for one image/document path."""
+    from opencrab.media.ocr import run_ocr, write_ocr_evidence
+
+    result = run_ocr(path, backend=backend, lang=lang)
+    payload = result.to_evidence()
+    if output:
+        payload = write_ocr_evidence(result, output)
+    console.print_json(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@main.command("image-context")
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--output", "output", "-o", default=None, type=click.Path(), help="Optional evidence JSON output path.")
+@click.option("--backend", default="auto", show_default=True, type=click.Choice(["auto", "sentence-transformers", "fingerprint"]))
+@click.option("--model-name", default="clip-ViT-B-32", show_default=True, help="sentence-transformers model name when available.")
+def image_context_command(path: str, output: str | None, backend: str, model_name: str) -> None:
+    """Build image context/CLIP-style evidence for one image path."""
+    from opencrab.media.image_context import build_image_context, write_image_context
+
+    result = build_image_context(path, backend=backend, model_name=model_name)
+    payload = result.to_evidence()
+    if output:
+        payload = write_image_context(result, output)
+    console.print_json(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+# ---------------------------------------------------------------------------
 # export-neo4j-pack
 # ---------------------------------------------------------------------------
 
@@ -483,6 +520,24 @@ def export_neo4j_pack(
         edge_limit=edge_limit,
     )
     console.print_json(json.dumps(status, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# assemble-pack-v1
+# ---------------------------------------------------------------------------
+
+
+@main.command("assemble-pack-v1")
+@click.argument("source_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True))
+@click.option("--output", "output", "-o", required=True, type=click.Path(), help="Output ZIP path.")
+@click.option("--pack-id", required=True, help="OpenCrab Pack id.")
+@click.option("--title", default=None, help="Human-readable pack title.")
+def assemble_pack_v1_command(source_dir: str, output: str, pack_id: str, title: str | None) -> None:
+    """Assemble an OpenCrab Pack v1 ZIP from a staging directory."""
+    from opencrab.pack import assemble_pack_v1
+
+    status = assemble_pack_v1(source_dir, output, pack_id=pack_id, title=title)
+    console.print_json(json.dumps(status, ensure_ascii=False, default=str))
 
 
 # ---------------------------------------------------------------------------
