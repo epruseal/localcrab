@@ -449,8 +449,8 @@ def manifest(json_output: bool) -> None:
 @main.command("ocr")
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--output", "output", "-o", default=None, type=click.Path(), help="Optional evidence JSON output path.")
-@click.option("--backend", default="auto", show_default=True, type=click.Choice(["auto", "tesseract", "metadata"]))
-@click.option("--lang", default="eng+kor", show_default=True, help="Tesseract language list.")
+@click.option("--backend", default="auto", show_default=True, type=click.Choice(["auto", "easyocr", "tesseract", "metadata"]))
+@click.option("--lang", default="eng+kor", show_default=True, help="OCR language list: EasyOCR accepts en/ko, Tesseract accepts eng/kor.")
 def ocr_command(path: str, output: str | None, backend: str, lang: str) -> None:
     """Run LocalCrab OCR adapter for one image/document path."""
     from opencrab.media.ocr import run_ocr, write_ocr_evidence

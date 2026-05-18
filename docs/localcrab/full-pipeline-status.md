@@ -43,11 +43,19 @@ scripts/localcrab ocr PATH --backend auto --output evidence.json
 
 Backends:
 
-- `auto`: try Tesseract via `pytesseract` + Pillow, then fallback.
+- `auto`: try EasyOCR first, then Tesseract, then fallback.
+- `easyocr`: CPU-capable Korean/English OCR via `easyocr.Reader(..., gpu=False)`.
 - `tesseract`: require Tesseract/Pillow path.
 - `metadata`: deterministic metadata-only OCR evidence.
 
-The fallback is intentional. It keeps pack traceability working before a heavier OCR backend is configured.
+Verified local runtime:
+
+- Reproducible requirements file: `requirements/localcrab-media.txt`.
+- `torch==2.5.1+cpu` and `torchvision==0.20.1+cpu` from the PyTorch CPU index.
+- `easyocr==1.7.2` with Korean/English model cache.
+- Synthetic sample extracted `LOCALCRAB OCR TEST 123` at confidence `0.812` and `한글 테스트 456` at confidence `0.724`.
+
+The fallback remains intentional. It keeps pack traceability working if a production OCR backend is unavailable.
 
 ### CLIP/image context adapter
 
@@ -60,10 +68,17 @@ scripts/localcrab image-context PATH --backend auto --output evidence.json
 Backends:
 
 - `auto`: try `sentence-transformers`, then fallback.
-- `sentence-transformers`: require the optional semantic backend.
+- `sentence-transformers`: semantic image embedding with `clip-ViT-B-32`.
 - `fingerprint`: deterministic local image fingerprint based on image/file features.
 
-The default fallback is not semantic CLIP. It is a stable local image-context placeholder that keeps the pack evidence format complete.
+Verified local runtime:
+
+- Reproducible requirements file: `requirements/localcrab-media.txt`.
+- `sentence-transformers==5.5.0` with `clip-ViT-B-32`.
+- Synthetic sample produced a 512-dimensional normalized image embedding.
+- Text/image similarity scores were computed successfully.
+
+The default fallback is not semantic CLIP. It is a stable local image-context placeholder that keeps the pack evidence format complete when the semantic model is unavailable.
 
 ### OpenCrab Pack v1 ZIP assembly
 

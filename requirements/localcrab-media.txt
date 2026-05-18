@@ -1,0 +1,10 @@
+# CPU-only OCR/CLIP runtime verified for LocalCrab on x86_64 Linux.
+# Install into the LocalCrab venv:
+#   python -m pip install -r requirements/localcrab-media.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+Pillow>=10
+easyocr==1.7.2
+sentence-transformers==5.5.0

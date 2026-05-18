@@ -1,9 +1,8 @@
-"""OCR adapter with a deterministic local fallback.
+"""OCR adapter with practical local backends and deterministic fallback.
 
-The default backend is intentionally lightweight: if pytesseract and Pillow are
-installed it extracts text with Tesseract; otherwise it still emits a stable
-OCR evidence record with file metadata and a warning. That lets pack assembly
-preserve traceability before heavyweight OCR is configured.
+`backend=auto` prefers EasyOCR when installed, then Tesseract, then a stable
+metadata-only evidence record. EasyOCR gives LocalCrab a usable CPU-only Korean
+and English OCR path without requiring system Tesseract packages.
 """
 
 from __future__ import annotations
@@ -76,6 +75,66 @@ def _image_metadata(path: Path) -> dict[str, Any]:
     return metadata
 
 
+def _normalise_easyocr_lang(lang: str) -> list[str]:
+    parts = [part.strip().lower() for part in lang.replace("+", ",").split(",") if part.strip()]
+    if not parts:
+        return ["en"]
+    aliases = {"eng": "en", "english": "en", "kor": "ko", "korean": "ko"}
+    result: list[str] = []
+    for part in parts:
+        value = aliases.get(part, part)
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _run_easyocr(path: Path, lang: str) -> OcrResult | None:
+    try:
+        import easyocr  # type: ignore
+    except Exception:
+        return None
+
+    metadata = _image_metadata(path)
+    languages = _normalise_easyocr_lang(lang)
+    try:
+        reader = easyocr.Reader(languages, gpu=False, verbose=False)
+        rows = reader.readtext(str(path), detail=1, paragraph=False)
+        texts: list[str] = []
+        confidences: list[float] = []
+        boxes: list[Any] = []
+        for box, text, confidence in rows:
+            if str(text).strip():
+                texts.append(str(text).strip())
+            try:
+                confidences.append(float(confidence))
+            except Exception:
+                pass
+            boxes.append({"box": box, "text": text, "confidence": confidence})
+        joined = "\n".join(texts).strip()
+        confidence = round(sum(confidences) / len(confidences), 4) if confidences else None
+        metadata["easyocr_languages"] = languages
+        metadata["easyocr_boxes"] = boxes
+        return OcrResult(
+            path=str(path),
+            backend="easyocr",
+            status="ok" if joined else "empty",
+            text=joined,
+            confidence=confidence,
+            warnings=[] if joined else ["easyocr returned no text"],
+            metadata=metadata,
+        )
+    except Exception as exc:
+        return OcrResult(
+            path=str(path),
+            backend="easyocr",
+            status="error",
+            text="",
+            confidence=None,
+            warnings=[str(exc)],
+            metadata=metadata,
+        )
+
+
 def _run_tesseract(path: Path, lang: str) -> OcrResult | None:
     try:
         from PIL import Image  # type: ignore
@@ -121,15 +180,22 @@ def _run_tesseract(path: Path, lang: str) -> OcrResult | None:
 def run_ocr(path: str | Path, *, backend: str = "auto", lang: str = "eng+kor") -> OcrResult:
     """Run OCR for one image/PDF path.
 
-    `backend=auto` tries Tesseract first and falls back to metadata-only
+    `backend=auto` tries EasyOCR first, then Tesseract, then metadata-only
     evidence when OCR dependencies or binaries are unavailable.
     """
     source = Path(path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
 
-    if backend not in {"auto", "tesseract", "metadata"}:
+    if backend not in {"auto", "easyocr", "tesseract", "metadata"}:
         raise ValueError(f"unsupported OCR backend: {backend}")
+
+    if backend in {"auto", "easyocr"}:
+        result = _run_easyocr(source, lang)
+        if result is not None and (backend == "easyocr" or result.status != "error"):
+            return result
+        if backend == "easyocr":
+            raise RuntimeError("easyocr is required for backend=easyocr")
 
     if backend in {"auto", "tesseract"}:
         result = _run_tesseract(source, lang)
