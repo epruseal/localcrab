@@ -81,6 +81,28 @@ class AuthContext:
     tier: str
 
 
+@dataclass(frozen=True)
+class CountResult:
+    """Result of a counter query.
+
+    `status` distinguishes a real 0 from a degraded count:
+      - "ok": value is accurate
+      - "unavailable": underlying store is not connected
+      - "timeout": query exceeded a deadline (mongo timeout, etc.)
+      - "error": unexpected exception; see `detail`
+    """
+
+    value: int = 0
+    status: str = "ok"
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"value": self.value, "status": self.status}
+        if self.detail:
+            out["detail"] = self.detail
+        return out
+
+
 @dataclass
 class ApiContext:
     settings: Any
@@ -109,11 +131,30 @@ def _space_to_default_type(space_id: str) -> str:
     return node_types[0] if node_types else space_id.capitalize()
 
 
-def _safe_count(fn: Any, default: int = 0) -> int:
+def _is_timeout_exc(exc: BaseException) -> bool:
+    """Detect Mongo / generic timeout-shaped exceptions without hard pymongo dep."""
+    name = type(exc).__name__
+    return name in {
+        "ExecutionTimeout",
+        "NetworkTimeout",
+        "ServerSelectionTimeoutError",
+        "WTimeoutError",
+        "TimeoutError",
+    }
+
+
+def _classify_count_exc(exc: BaseException) -> CountResult:
+    if _is_timeout_exc(exc):
+        return CountResult(value=0, status="timeout", detail=str(exc) or None)
+    return CountResult(value=0, status="error", detail=str(exc) or type(exc).__name__)
+
+
+def _safe_count(fn: Any) -> CountResult:
+    """Wrap a zero-arg counter callable into a CountResult."""
     try:
-        return int(fn())
-    except Exception:
-        return default
+        return CountResult(value=int(fn()), status="ok")
+    except Exception as exc:
+        return _classify_count_exc(exc)
 
 
 def _docs_available(docs: Any) -> bool:
@@ -180,68 +221,113 @@ def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, 
     return created or source_id
 
 
-def _count_user_nodes(docs: Any, user_id: str) -> int:
+def _count_user_nodes(docs: Any, user_id: str) -> CountResult:
     if not _docs_available(docs):
-        return 0
+        return CountResult(value=0, status="unavailable")
 
     if hasattr(docs, "_db"):
-        return int(docs._db["nodes"].count_documents({"properties.owner_id": user_id}))
+        # OR across top-level (preferred) and legacy nested `properties.owner_id`.
+        query = {"$or": [{"owner_id": user_id}, {"properties.owner_id": user_id}]}
+        try:
+            value = int(docs._db["nodes"].count_documents(query))
+            return CountResult(value=value, status="ok")
+        except Exception as exc:
+            return _classify_count_exc(exc)
 
     try:
         rows = docs.list_nodes()
-    except Exception:
-        return 0
+    except Exception as exc:
+        return _classify_count_exc(exc)
 
-    return sum(1 for row in rows if (row.get("properties") or {}).get("owner_id") == user_id)
+    matched = sum(
+        1
+        for row in rows
+        if row.get("owner_id") == user_id
+        or (row.get("properties") or {}).get("owner_id") == user_id
+    )
+    return CountResult(value=matched, status="ok")
 
 
-def _count_user_sources(docs: Any, user_id: str) -> int:
+def _count_user_sources(docs: Any, user_id: str) -> CountResult:
     if not _docs_available(docs):
-        return 0
+        return CountResult(value=0, status="unavailable")
 
     if hasattr(docs, "_db"):
-        return int(docs._db["sources"].count_documents({"metadata.user_id": user_id}))
+        query = {"$or": [{"user_id": user_id}, {"metadata.user_id": user_id}]}
+        try:
+            value = int(docs._db["sources"].count_documents(query))
+            return CountResult(value=value, status="ok")
+        except Exception as exc:
+            return _classify_count_exc(exc)
 
     try:
         rows = docs.list_sources()
-    except Exception:
-        return 0
+    except Exception as exc:
+        return _classify_count_exc(exc)
 
-    return sum(1 for row in rows if (row.get("metadata") or {}).get("user_id") == user_id)
+    matched = sum(
+        1
+        for row in rows
+        if row.get("user_id") == user_id
+        or (row.get("metadata") or {}).get("user_id") == user_id
+    )
+    return CountResult(value=matched, status="ok")
 
 
-def _count_user_queries(docs: Any, user_id: str) -> int:
+def _count_user_queries(docs: Any, user_id: str) -> CountResult:
     if not _docs_available(docs):
-        return 0
+        return CountResult(value=0, status="unavailable")
 
     if hasattr(docs, "_db"):
-        return int(docs._db["audit_log"].count_documents({"subject_id": user_id, "event_type": {"$in": list(QUERY_EVENTS)}}))
+        try:
+            value = int(
+                docs._db["audit_log"].count_documents(
+                    {"subject_id": user_id, "event_type": {"$in": list(QUERY_EVENTS)}}
+                )
+            )
+            return CountResult(value=value, status="ok")
+        except Exception as exc:
+            return _classify_count_exc(exc)
 
     try:
         rows = docs.get_audit_log(limit=500)
     except TypeError:
         rows = docs.get_audit_log()
-    except Exception:
-        return 0
+    except Exception as exc:
+        return _classify_count_exc(exc)
 
-    return sum(1 for row in rows if row.get("actor") == user_id and row.get("event_type") in QUERY_EVENTS)
+    matched = sum(
+        1
+        for row in rows
+        if row.get("actor") == user_id and row.get("event_type") in QUERY_EVENTS
+    )
+    return CountResult(value=matched, status="ok")
 
 
-def _count_total_queries(docs: Any) -> int:
+def _count_total_queries(docs: Any) -> CountResult:
     if not _docs_available(docs):
-        return 0
+        return CountResult(value=0, status="unavailable")
 
     if hasattr(docs, "_db"):
-        return int(docs._db["audit_log"].count_documents({"event_type": {"$in": list(QUERY_EVENTS)}}))
+        try:
+            value = int(
+                docs._db["audit_log"].count_documents(
+                    {"event_type": {"$in": list(QUERY_EVENTS)}}
+                )
+            )
+            return CountResult(value=value, status="ok")
+        except Exception as exc:
+            return _classify_count_exc(exc)
 
     try:
         rows = docs.get_audit_log(limit=1000)
     except TypeError:
         rows = docs.get_audit_log()
-    except Exception:
-        return 0
+    except Exception as exc:
+        return _classify_count_exc(exc)
 
-    return sum(1 for row in rows if row.get("event_type") in QUERY_EVENTS)
+    matched = sum(1 for row in rows if row.get("event_type") in QUERY_EVENTS)
+    return CountResult(value=matched, status="ok")
 
 
 def _recent_activity(docs: Any, user_id: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -396,7 +482,7 @@ def _enforce_ingest_limits(ctx: ApiContext, auth: AuthContext, source_id: str) -
     if source_owner:
         return
 
-    current_sources = _count_user_sources(ctx.docs, auth.user_id)
+    current_sources = _count_user_sources(ctx.docs, auth.user_id).value
     if current_sources >= FREE_MAX_SOURCES:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -447,12 +533,12 @@ def get_status(ctx: ApiContext = Depends(get_context)) -> dict[str, Any]:
         "ok": True,
         "service": "opencrab-api",
         "tier": _tier(),
-        "storage_mode": "local",
+        "storage_mode": get_settings().storage_mode,
         "stores": {
-            "graph": {"available": bool(getattr(ctx.graph, "available", False)), "healthy": bool(_safe_count(ctx.graph.ping, 0))},
-            "vector": {"available": bool(getattr(ctx.vector, "available", False)), "healthy": bool(_safe_count(ctx.vector.ping, 0))},
-            "docs": {"available": bool(getattr(ctx.docs, "available", False)), "healthy": bool(_safe_count(ctx.docs.ping, 0))},
-            "sql": {"available": bool(getattr(ctx.sql, "available", False)), "healthy": bool(_safe_count(ctx.sql.ping, 0))},
+            "graph": {"available": bool(getattr(ctx.graph, "available", False)), "healthy": bool(_safe_count(ctx.graph.ping).value)},
+            "vector": {"available": bool(getattr(ctx.vector, "available", False)), "healthy": bool(_safe_count(ctx.vector.ping).value)},
+            "docs": {"available": bool(getattr(ctx.docs, "available", False)), "healthy": bool(_safe_count(ctx.docs.ping).value)},
+            "sql": {"available": bool(getattr(ctx.sql, "available", False)), "healthy": bool(_safe_count(ctx.sql.ping).value)},
         },
     }
 
@@ -499,10 +585,11 @@ def ingest_text(
     )
     _meter_call(ctx, auth, "/api/ingest")
 
+    sources_count = _count_user_sources(ctx.docs, auth.user_id)
     result["tier"] = auth.tier
     result["usage"] = {
-        "user_sources": _count_user_sources(ctx.docs, auth.user_id),
-        "user_vectors": _count_user_sources(ctx.docs, auth.user_id),
+        "user_sources": sources_count.to_dict(),
+        "user_vectors": sources_count.to_dict(),
     }
     return result
 
@@ -728,16 +815,17 @@ def get_usage(
 ) -> dict[str, Any]:
     _meter_call(ctx, auth, "/api/usage")
 
+    sources_count = _count_user_sources(ctx.docs, auth.user_id)
     usage = {
-        "nodes": _count_user_nodes(ctx.docs, auth.user_id),
-        "vectors": _count_user_sources(ctx.docs, auth.user_id),
-        "sources": _count_user_sources(ctx.docs, auth.user_id),
-        "queries": _count_user_queries(ctx.docs, auth.user_id),
+        "nodes": _count_user_nodes(ctx.docs, auth.user_id).to_dict(),
+        "vectors": sources_count.to_dict(),
+        "sources": sources_count.to_dict(),
+        "queries": _count_user_queries(ctx.docs, auth.user_id).to_dict(),
     }
     system = {
-        "nodes": _safe_count(ctx.graph.count_nodes),
-        "vectors": _safe_count(ctx.vector.count),
-        "queries": _count_total_queries(ctx.docs),
+        "nodes": _safe_count(ctx.graph.count_nodes).to_dict(),
+        "vectors": _safe_count(ctx.vector.count).to_dict(),
+        "queries": _count_total_queries(ctx.docs).to_dict(),
     }
     return {
         "user_id": auth.user_id,
