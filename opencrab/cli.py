@@ -87,10 +87,10 @@ def init(force: bool) -> None:
 
 def _write_default_env(path: Path) -> None:
     content = """\
-LOCAL_DATA_DIR=./opencrab_data
+LOCAL_DATA_DIR=/home/asdf/.openclaw/workspace/data/localcrab
 CHROMA_COLLECTION=opencrab_vectors
-MCP_SERVER_NAME=opencrab
-MCP_SERVER_VERSION=0.1.0
+MCP_SERVER_NAME=localcrab
+MCP_SERVER_VERSION=0.1.0-localcrab
 LOG_LEVEL=INFO
 """
     path.write_text(content)
