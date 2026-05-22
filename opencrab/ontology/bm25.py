@@ -17,6 +17,8 @@ import re
 from collections import Counter
 from typing import Any
 
+from opencrab.ontology.pack_provenance import infer_pack_id, matches_pack_filter
+
 logger = logging.getLogger(__name__)
 
 # BM25 hyper-parameters
@@ -130,6 +132,9 @@ class BM25Index:
         self._df: Counter[str] = Counter()           # document frequency
         self._avgdl: float = 0.0                     # average document length
         self._idf: dict[str, float] = {}             # IDF cache
+        # Build-time fingerprint of the source doc set; consumers compare it
+        # against the live store fingerprint to decide whether to rebuild.
+        self._fingerprint: tuple[int, str] = (0, "")
 
     # ------------------------------------------------------------------
     # Build
@@ -161,8 +166,13 @@ class BM25Index:
         for term, df in idx._df.items():
             idx._idf[term] = math.log((n - df + 0.5) / (df + 0.5) + 1)
 
+        idx._fingerprint = compute_fingerprint(nodes)
         logger.debug("BM25Index built: %d nodes, %d unique terms", n, len(idx._idf))
         return idx
+
+    @property
+    def fingerprint(self) -> tuple[int, str]:
+        return self._fingerprint
 
     # ------------------------------------------------------------------
     # Search
@@ -173,6 +183,8 @@ class BM25Index:
         query: str,
         spaces: list[str] | None = None,
         limit: int = 10,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Return top-k nodes ranked by BM25 score.
@@ -185,10 +197,13 @@ class BM25Index:
             Optional space filter.
         limit:
             Maximum results.
-
-        Returns
-        -------
-        list of dicts with keys: node_id, space, node_type, score, properties.
+        pack_ids:
+            Optional pack_id filter. Docs whose inferred pack_id is not in
+            this set are skipped. Docs with no inferable pack_id are dropped
+            unless ``include_unpackaged`` is True.
+        include_unpackaged:
+            When ``pack_ids`` is set, also pass docs that have no detectable
+            pack_id (legacy data).
         """
         q_tokens = _tokenize(query)
         if not q_tokens or not self._docs:
@@ -199,6 +214,9 @@ class BM25Index:
         for i, (doc, toks) in enumerate(zip(self._docs, self._tokens)):
             # Space filter
             if spaces and doc.get("space") not in spaces:
+                continue
+            # Pack filter
+            if pack_ids and not matches_pack_filter(doc, pack_ids, include_unpackaged):
                 continue
 
             dl = len(toks)
@@ -222,6 +240,7 @@ class BM25Index:
         results = []
         for idx, score in scores[:limit]:
             doc = self._docs[idx]
+            pid = infer_pack_id(doc)
             results.append({
                 "node_id": doc.get("node_id"),
                 "space": doc.get("space"),
@@ -229,8 +248,26 @@ class BM25Index:
                 "score": round(score, 4),
                 "properties": doc.get("properties") or {},
                 "text": _node_text(doc),
+                "pack_id": pid,
             })
         return results
 
     def __len__(self) -> int:
         return len(self._docs)
+
+
+def compute_fingerprint(nodes: list[dict[str, Any]]) -> tuple[int, str]:
+    """Return ``(doc_count, max_timestamp)`` used for stale-cache detection.
+
+    ``max_timestamp`` falls back to the empty string when nodes lack
+    ``updated_at`` / ``ingested_at`` keys; the count alone is still a useful
+    signal in that case.
+    """
+    count = len(nodes)
+    latest = ""
+    for node in nodes:
+        for key in ("updated_at", "ingested_at"):
+            value = node.get(key) if isinstance(node, dict) else None
+            if value and isinstance(value, str) and value > latest:
+                latest = value
+    return count, latest
