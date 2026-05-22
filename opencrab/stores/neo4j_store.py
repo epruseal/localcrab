@@ -216,6 +216,8 @@ class Neo4jStore:
         direction: str = "both",
         depth: int = 1,
         limit: int = 50,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Find neighboring nodes up to *depth* hops.
@@ -224,26 +226,31 @@ class Neo4jStore:
         ----------
         direction:
             "out", "in", or "both".
+        pack_ids:
+            Optional pack_id allow-list. When set, neighbours whose
+            ``n.pack_id`` is not in the list (and not NULL, unless
+            ``include_unpackaged`` is True) are filtered out. Relationships
+            whose own ``r.pack_id`` is set to a foreign value are also
+            excluded; relationships with no ``r.pack_id`` are accepted when
+            both endpoints survive the node filter.
+        include_unpackaged:
+            When ``pack_ids`` is set, also allow nodes/edges with no
+            ``pack_id`` property (legacy data).
         """
         if not self._available:
             raise RuntimeError("Neo4j is not available.")
 
-        arrow = {
-            "out": "-[rels*1..{depth}]->",
-            "in": "<-[rels*1..{depth}]-",
-            "both": "-[rels*1..{depth}]-",
-        }.get(direction, "-[rels*1..{depth}]-").format(depth=depth)
+        cypher, params = self._build_neighbors_cypher(
+            node_id=node_id,
+            direction=direction,
+            depth=depth,
+            limit=limit,
+            pack_ids=pack_ids,
+            include_unpackaged=include_unpackaged,
+        )
 
-        cypher = f"""
-            MATCH path = (start {{id: $id}}){arrow}(neighbor)
-            WITH neighbor, labels(neighbor) AS labels, properties(neighbor) AS props,
-                 [rel IN relationships(path) | type(rel)] AS relationship_types,
-                 length(path) AS depth
-            RETURN DISTINCT props, labels, relationship_types, depth
-            LIMIT $limit
-        """
         with self._session() as session:
-            result = session.run(cypher, id=node_id, limit=limit)
+            result = session.run(cypher, **params)
             return [
                 {
                     "properties": dict(record["props"]),
@@ -255,6 +262,59 @@ class Neo4jStore:
                 }
                 for record in result
             ]
+
+    @staticmethod
+    def _build_neighbors_cypher(
+        node_id: str,
+        direction: str,
+        depth: int,
+        limit: int,
+        pack_ids: list[str] | None,
+        include_unpackaged: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Pure helper that builds the Cypher query string and parameters.
+
+        Separated for unit testing — exercising real Neo4j is out of scope
+        for this change; we only verify the generated query structure.
+        """
+        arrow = {
+            "out": "-[rels*1..{depth}]->",
+            "in": "<-[rels*1..{depth}]-",
+            "both": "-[rels*1..{depth}]-",
+        }.get(direction, "-[rels*1..{depth}]-").format(depth=depth)
+
+        where_clauses: list[str] = []
+        params: dict[str, Any] = {"id": node_id, "limit": limit}
+
+        if pack_ids:
+            params["pack_ids"] = list(pack_ids)
+            if include_unpackaged:
+                where_clauses.append(
+                    "(neighbor.pack_id IS NULL OR neighbor.pack_id IN $pack_ids)"
+                )
+                where_clauses.append(
+                    "ALL(r IN relationships(path) "
+                    "WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
+                )
+            else:
+                where_clauses.append("neighbor.pack_id IN $pack_ids")
+                where_clauses.append(
+                    "ALL(r IN relationships(path) "
+                    "WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
+                )
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        cypher = f"""
+            MATCH path = (start {{id: $id}}){arrow}(neighbor)
+            {where_sql}
+            WITH neighbor, labels(neighbor) AS labels, properties(neighbor) AS props,
+                 [rel IN relationships(path) | type(rel)] AS relationship_types,
+                 length(path) AS depth
+            RETURN DISTINCT props, labels, relationship_types, depth
+            LIMIT $limit
+        """
+        return cypher, params
 
     def find_path(
         self, from_id: str, to_id: str, max_depth: int = 4
