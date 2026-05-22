@@ -51,10 +51,17 @@ class MongoStore:
             self._db["nodes"].create_index(
                 [("space", 1), ("node_id", 1)], unique=True
             )
-            # sources collection: unique on source_id
+            # owner_id lookups (top-level + legacy nested path)
+            self._db["nodes"].create_index("owner_id")
+            self._db["nodes"].create_index("properties.owner_id")
+            # sources collection
             self._db["sources"].create_index("source_id", unique=True)
-            # audit_log: sorted by timestamp
+            self._db["sources"].create_index("user_id")
+            self._db["sources"].create_index("metadata.user_id")
+            # audit_log: sorted by timestamp; compound for query counters
             self._db["audit_log"].create_index([("timestamp", -1)])
+            self._db["audit_log"].create_index([("subject_id", 1), ("event_type", 1)])
+            self._db["audit_log"].create_index([("actor", 1), ("event_type", 1)])
         except Exception as exc:
             logger.debug("MongoDB index creation: %s", exc)
 
@@ -90,17 +97,23 @@ class MongoStore:
     ) -> str:
         """
         Upsert a node document. Returns the MongoDB _id as string.
+
+        `properties.owner_id` is mirrored to a top-level `owner_id` column so
+        ownership counters can use an indexed field instead of a nested path.
         """
         if not self._available:
             raise RuntimeError("MongoDB is not available.")
 
-        doc = {
+        doc: dict[str, Any] = {
             "space": space,
             "node_type": node_type,
             "node_id": node_id,
             "properties": properties,
             "updated_at": datetime.now(tz=UTC),
         }
+        owner_id = properties.get("owner_id") if isinstance(properties, dict) else None
+        if owner_id is not None:
+            doc["owner_id"] = owner_id
         result = self._db["nodes"].update_one(
             {"space": space, "node_id": node_id},
             {"$set": doc, "$setOnInsert": {"created_at": datetime.now(tz=UTC)}},
@@ -155,16 +168,23 @@ class MongoStore:
         text: str,
         metadata: dict[str, Any],
     ) -> str:
-        """Store or update a raw ingestion source document."""
+        """Store or update a raw ingestion source document.
+
+        `metadata.user_id` is mirrored to a top-level `user_id` column so
+        ownership counters can use an indexed field instead of a nested path.
+        """
         if not self._available:
             raise RuntimeError("MongoDB is not available.")
 
-        doc = {
+        doc: dict[str, Any] = {
             "source_id": source_id,
             "text": text,
             "metadata": metadata,
             "updated_at": datetime.now(tz=UTC),
         }
+        user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+        if user_id is not None:
+            doc["user_id"] = user_id
         result = self._db["sources"].update_one(
             {"source_id": source_id},
             {"$set": doc, "$setOnInsert": {"created_at": datetime.now(tz=UTC)}},
