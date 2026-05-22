@@ -1,5 +1,5 @@
 """
-Store factory — returns LocalCrab's local-only backends.
+Store factory — returns the right backend based on STORAGE_MODE setting.
 
 Usage:
     from opencrab.stores.factory import make_graph_store, make_vector_store, ...
@@ -19,15 +19,25 @@ if TYPE_CHECKING:
 
 
 def make_graph_store(settings: Settings) -> Any:
-    """Return the local SQLite graph store."""
-    from opencrab.stores.local_graph_store import LocalGraphStore
+    """Return LocalGraphStore (local) or Neo4jStore (docker)."""
+    if settings.is_local:
+        from opencrab.stores.local_graph_store import LocalGraphStore
 
-    db_path = os.path.join(settings.local_data_dir, "graph.db")
-    return LocalGraphStore(db_path=db_path)
+        db_path = os.path.join(settings.local_data_dir, "graph.db")
+        return LocalGraphStore(db_path=db_path)
+    else:
+        from opencrab.stores.neo4j_store import Neo4jStore
+
+        return Neo4jStore(
+            uri=settings.neo4j_uri,
+            user=settings.neo4j_user,
+            password=settings.neo4j_password,
+            database=settings.neo4j_database,
+        )
 
 
 def make_vector_store(settings: Settings) -> Any:
-    """Return the local persistent Chroma store."""
+    """Return ChromaStore in local or docker mode."""
     from opencrab.stores.chroma_store import ChromaStore
 
     chroma_path = os.path.join(settings.local_data_dir, "chroma")
@@ -35,21 +45,27 @@ def make_vector_store(settings: Settings) -> Any:
         host=settings.chroma_host,
         port=settings.chroma_port,
         collection_name=settings.chroma_collection,
-        local_mode=True,
+        local_mode=settings.is_local,
         local_path=chroma_path,
     )
 
 
 def make_doc_store(settings: Settings) -> Any:
-    """Return the local JSON document store."""
-    from opencrab.stores.local_doc_store import LocalDocStore
+    """Return LocalDocStore (local) or MongoStore (docker)."""
+    if settings.is_local:
+        from opencrab.stores.local_doc_store import LocalDocStore
 
-    docs_path = os.path.join(settings.local_data_dir, "docs")
-    return LocalDocStore(data_dir=docs_path)
+        docs_path = os.path.join(settings.local_data_dir, "docs")
+        return LocalDocStore(data_dir=docs_path)
+    else:
+        from opencrab.stores.mongo_store import MongoStore
+
+        return MongoStore(uri=settings.mongodb_uri, db_name=settings.mongodb_db)
 
 
 def make_sql_store(settings: Settings) -> Any:
-    """Return the local SQLite SQL store."""
+    """Return SQLStore with SQLite (local) or PostgreSQL (docker)."""
     from opencrab.stores.sql_store import SQLStore
 
-    return SQLStore(url=settings.sqlite_url)
+    url = settings.sqlite_url if settings.is_local else settings.postgres_url
+    return SQLStore(url=url)

@@ -22,7 +22,6 @@ opencrab_data/
 
 # Env files
 .env
-.env.*
 
 # IDE
 .vscode/
@@ -41,3 +40,23 @@ htmlcov/
 
 # Logs
 *.log
+
+# Local private launch scripts
+startmcp.sh
+
+# Secrets / credentials
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+*secret*
+*secrets*
+*credential*
+*credentials*
+*token*
+*apikey*
+*api-key*
