@@ -120,7 +120,8 @@ def test_t11_neo4j_strict_pack_filter() -> None:
         node_id="x", direction="out", depth=1, limit=5,
         pack_ids=["A", "B"], include_unpackaged=False,
     )
-    assert "neighbor.pack_id IN $pack_ids" in cypher
+    # All nodes in path must satisfy pack filter (not just the final neighbor)
+    assert "ALL(n IN nodes(path) WHERE n.pack_id IN $pack_ids)" in cypher
     assert "ALL(r IN relationships(path)" in cypher
     assert "r.pack_id IS NULL OR r.pack_id IN $pack_ids" in cypher
     assert params["pack_ids"] == ["A", "B"]
@@ -131,4 +132,53 @@ def test_t11_neo4j_include_unpackaged_allows_null_neighbor() -> None:
         node_id="x", direction="both", depth=1, limit=5,
         pack_ids=["A"], include_unpackaged=True,
     )
-    assert "neighbor.pack_id IS NULL OR neighbor.pack_id IN $pack_ids" in cypher
+    # include_unpackaged: NULL or in set, applied to all path nodes
+    assert "ALL(n IN nodes(path) WHERE n.pack_id IS NULL OR n.pack_id IN $pack_ids)" in cypher
+
+
+# ---------------------------------------------------------------------------
+# T6 regression — parallel edges / visited-before-filter bug
+# ---------------------------------------------------------------------------
+
+
+def test_t6_parallel_edges_foreign_first_does_not_block_allowed(tmp_path: Path) -> None:
+    """Foreign-pack edge must not pre-mark the destination visited and block the allowed edge."""
+    store = _make_store(tmp_path)
+    store.upsert_node("Claim", "a", {"pack_id": "A"})
+    store.upsert_node("Claim", "b", {"pack_id": "A"})
+    # Two edges to same destination: one with foreign pack_id (rejected), one allowed
+    store.upsert_edge("Claim", "a", "FOREIGN_REL", "Claim", "b", {"pack_id": "B"})
+    store.upsert_edge("Claim", "a", "ALLOWED_REL", "Claim", "b", {"pack_id": "A"})
+
+    rows = store.find_neighbors("a", direction="out", depth=1, pack_ids=["A"])
+    ids = {r["properties"]["id"] for r in rows}
+    assert ids == {"b"}
+
+
+def test_t6_parallel_edges_foreign_first_depth2_expansion_not_blocked(tmp_path: Path) -> None:
+    """Depth-2 expansion from b must work even if the only depth-1 edge to b was initially foreign."""
+    store = _make_store(tmp_path)
+    store.upsert_node("Claim", "a", {"pack_id": "A"})
+    store.upsert_node("Claim", "b", {"pack_id": "A"})
+    store.upsert_node("Claim", "d", {"pack_id": "A"})
+    store.upsert_edge("Claim", "a", "FOREIGN_REL", "Claim", "b", {"pack_id": "B"})
+    store.upsert_edge("Claim", "a", "ALLOWED_REL", "Claim", "b", {"pack_id": "A"})
+    store.upsert_edge("Claim", "b", "REL", "Claim", "d", {"pack_id": "A"})
+
+    rows = store.find_neighbors("a", direction="out", depth=2, pack_ids=["A"])
+    ids = {r["properties"]["id"] for r in rows}
+    assert "b" in ids
+    assert "d" in ids
+
+
+def test_t6_no_filter_dedup_same_node_via_two_edges(tmp_path: Path) -> None:
+    """Without pack filter, a node reachable via two edges must appear only once."""
+    store = _make_store(tmp_path)
+    store.upsert_node("Claim", "a", {"name": "anchor"})
+    store.upsert_node("Claim", "b", {"name": "target"})
+    store.upsert_edge("Claim", "a", "REL1", "Claim", "b", {})
+    store.upsert_edge("Claim", "a", "REL2", "Claim", "b", {})
+
+    rows = store.find_neighbors("a", direction="out", depth=1)
+    ids = [r["properties"]["id"] for r in rows]
+    assert ids.count("b") == 1

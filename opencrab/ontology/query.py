@@ -463,7 +463,10 @@ class HybridQuery:
                 where = _build_chroma_where(spaces=spaces, pack_ids=pack_ids)
                 effective_pack_filter = None
 
-            n_results = min(limit, 20)
+            if use_post_filter:
+                n_results = max(min(limit, 20) * 4, 20)
+            else:
+                n_results = min(limit, 20)
             try:
                 hits = self._chroma.query(
                     query_text=question,

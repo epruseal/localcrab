@@ -9,7 +9,8 @@ re-implementing the lookup.
 Inference order:
   1. item["metadata"]["pack_id"]
   2. item["properties"]["pack_id"]
-  3. /packs/<id>/ pattern found in any of:
+  3. item["pack_id"]
+  4. /packs/<id>/ pattern found in any of:
         item["metadata"]["source_path"]
         item["properties"]["source_path"]
         item["source_path"]
@@ -73,6 +74,10 @@ def infer_pack_id(item: dict[str, Any] | None) -> str | None:
         pid = properties.get("pack_id")
         if pid:
             return str(pid)
+
+    pid = item.get("pack_id") if isinstance(item, dict) else None
+    if pid:
+        return str(pid)
 
     candidates: list[Any] = []
     if isinstance(metadata, dict):

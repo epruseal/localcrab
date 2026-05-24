@@ -290,17 +290,17 @@ class Neo4jStore:
             params["pack_ids"] = list(pack_ids)
             if include_unpackaged:
                 where_clauses.append(
-                    "(neighbor.pack_id IS NULL OR neighbor.pack_id IN $pack_ids)"
+                    "ALL(n IN nodes(path) WHERE n.pack_id IS NULL OR n.pack_id IN $pack_ids)"
                 )
                 where_clauses.append(
-                    "ALL(r IN relationships(path) "
-                    "WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
+                    "ALL(r IN relationships(path) WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
                 )
             else:
-                where_clauses.append("neighbor.pack_id IN $pack_ids")
                 where_clauses.append(
-                    "ALL(r IN relationships(path) "
-                    "WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
+                    "ALL(n IN nodes(path) WHERE n.pack_id IN $pack_ids)"
+                )
+                where_clauses.append(
+                    "ALL(r IN relationships(path) WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
                 )
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
