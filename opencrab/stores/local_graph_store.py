@@ -17,6 +17,54 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _node_pack_id(props: dict[str, Any]) -> str | None:
+    """Top-level lookup mirroring the unified provenance helper.
+
+    Imported lazily to avoid an import cycle (pack_provenance imports nothing
+    from opencrab.stores, but keep this file dependency-light).
+    """
+    pid = props.get("pack_id") if isinstance(props, dict) else None
+    if pid:
+        return str(pid)
+    return None
+
+
+def _node_passes(
+    props: dict[str, Any],
+    pack_set: set[str] | None,
+    include_unpackaged: bool,
+) -> bool:
+    if not pack_set:
+        return True
+    pid = _node_pack_id(props)
+    if pid is None:
+        return include_unpackaged
+    return pid in pack_set
+
+
+def _edge_passes(
+    edge_props: dict[str, Any],
+    src_passes: bool,
+    dst_passes: bool,
+    pack_set: set[str] | None,
+) -> bool:
+    """Apply the agreed edge filter rules.
+
+    Rules (see plan §4):
+      1. edge.pack_id in pack_set        -> pass (endpoints still must pass)
+      2. edge.pack_id not in pack_set    -> always exclude
+      3. edge has no pack_id             -> only pass when both endpoints pass
+    """
+    if not pack_set:
+        return True
+    edge_pid = _node_pack_id(edge_props) if isinstance(edge_props, dict) else None
+    if edge_pid is not None:
+        if edge_pid not in pack_set:
+            return False
+        return src_passes and dst_passes
+    return src_passes and dst_passes
+
 _DDL = [
     """
     CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -191,15 +239,37 @@ class LocalGraphStore:
         direction: str = "both",
         depth: int = 1,
         limit: int = 50,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
-        """BFS neighbour traversal in Python."""
+        """BFS neighbour traversal in Python.
+
+        ``pack_ids``/``include_unpackaged`` enforce the agreed graph filter:
+          - Nodes outside ``pack_ids`` (or with no pack_id when
+            ``include_unpackaged=False``) are dropped from the result and
+            do not contribute to traversal expansion.
+          - Edges follow the 3-rule policy: an edge whose own ``pack_id`` is
+            foreign is always dropped; an edge without a ``pack_id`` only
+            survives when both endpoints satisfy the node filter.
+          - Anchor must also satisfy the node filter; otherwise the function
+            returns an empty list. Source nodes added during traversal are
+            guaranteed to pass (they were enqueued only after passing), so
+            edge passes reduce to "edge own pack_id ok AND dst passes".
+        """
         if not self._available or not self._conn:
             raise RuntimeError("LocalGraphStore is not available.")
+
+        pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        cur = self._conn.cursor()
+
+        if pack_set is not None:
+            anchor_props = self._fetch_node_props_by_id(cur, node_id)
+            if not _node_passes(anchor_props or {}, pack_set, include_unpackaged):
+                return []
 
         visited: set[str] = {node_id}
         queue: deque[tuple[str, int]] = deque([(node_id, 0)])
         results: list[dict[str, Any]] = []
-        cur = self._conn.cursor()
 
         while queue and len(results) < limit:
             current_id, current_depth = queue.popleft()
@@ -209,46 +279,83 @@ class LocalGraphStore:
             # Outgoing edges
             if direction in ("out", "both"):
                 cur.execute(
-                    "SELECT to_type, to_id, relation FROM graph_edges WHERE from_id=?",
+                    "SELECT to_type, to_id, relation, properties FROM graph_edges WHERE from_id=?",
                     (current_id,),
                 )
                 for row in cur.fetchall():
                     nid = row["to_id"]
-                    if nid not in visited:
-                        visited.add(nid)
-                        node = self._fetch_node_props(cur, row["to_type"], nid)
-                        if node:
-                            results.append({
-                                "properties": node,
-                                "labels": [row["to_type"]],
-                                "relation_type": row["relation"],
-                                "relationship_types": [row["relation"]],
-                                "depth": current_depth + 1,
-                            })
-                        queue.append((nid, current_depth + 1))
+                    if nid in visited:
+                        continue
+                    dst_props = self._fetch_node_props(cur, row["to_type"], nid)
+                    if not dst_props:
+                        continue
+                    if pack_set is not None:
+                        dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
+                        if not dst_pass:
+                            continue
+                        edge_props = self._parse_props(row["properties"])
+                        if not _edge_passes(edge_props, True, dst_pass, pack_set):
+                            continue
+                    visited.add(nid)
+                    results.append({
+                        "properties": dst_props,
+                        "labels": [row["to_type"]],
+                        "relation_type": row["relation"],
+                        "relationship_types": [row["relation"]],
+                        "depth": current_depth + 1,
+                    })
+                    queue.append((nid, current_depth + 1))
 
             # Incoming edges
             if direction in ("in", "both"):
                 cur.execute(
-                    "SELECT from_type, from_id, relation FROM graph_edges WHERE to_id=?",
+                    "SELECT from_type, from_id, relation, properties FROM graph_edges WHERE to_id=?",
                     (current_id,),
                 )
                 for row in cur.fetchall():
                     nid = row["from_id"]
-                    if nid not in visited:
-                        visited.add(nid)
-                        node = self._fetch_node_props(cur, row["from_type"], nid)
-                        if node:
-                            results.append({
-                                "properties": node,
-                                "labels": [row["from_type"]],
-                                "relation_type": row["relation"],
-                                "relationship_types": [row["relation"]],
-                                "depth": current_depth + 1,
-                            })
-                        queue.append((nid, current_depth + 1))
+                    if nid in visited:
+                        continue
+                    src_props = self._fetch_node_props(cur, row["from_type"], nid)
+                    if not src_props:
+                        continue
+                    if pack_set is not None:
+                        src_pass = _node_passes(src_props, pack_set, include_unpackaged)
+                        if not src_pass:
+                            continue
+                        edge_props = self._parse_props(row["properties"])
+                        if not _edge_passes(edge_props, src_pass, True, pack_set):
+                            continue
+                    visited.add(nid)
+                    results.append({
+                        "properties": src_props,
+                        "labels": [row["from_type"]],
+                        "relation_type": row["relation"],
+                        "relationship_types": [row["relation"]],
+                        "depth": current_depth + 1,
+                    })
+                    queue.append((nid, current_depth + 1))
 
         return results[:limit]
+
+    def _parse_props(self, raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def _fetch_node_props_by_id(
+        self, cur: sqlite3.Cursor, node_id: str
+    ) -> dict[str, Any] | None:
+        cur.execute(
+            "SELECT properties FROM graph_nodes WHERE node_id=? LIMIT 1",
+            (node_id,),
+        )
+        row = cur.fetchone()
+        return self._parse_props(row["properties"]) if row else None
 
     def find_path(
         self, from_id: str, to_id: str, max_depth: int = 4

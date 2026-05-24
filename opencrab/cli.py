@@ -173,9 +173,16 @@ def status() -> None:
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--recursive", "-r", is_flag=True, default=False)
 @click.option("--extension", "-e", default=".txt,.md,.py", show_default=True)
-def ingest(path: str, recursive: bool, extension: str) -> None:
+@click.option(
+    "--pack-id",
+    "pack_id",
+    default=None,
+    help="Attach pack_id metadata to ingested docs. Inferred from path when omitted.",
+)
+def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
     from opencrab.config import get_settings
+    from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
     from opencrab.stores.factory import make_doc_store, make_graph_store, make_vector_store
 
@@ -205,13 +212,18 @@ def ingest(path: str, recursive: bool, extension: str) -> None:
             source_id = str(file.resolve())
             meta = {"source_path": str(file), "extension": file.suffix}
 
+            effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
+            if effective_pack:
+                meta["pack_id"] = effective_pack
+
             hybrid.ingest(text=text, source_id=source_id, metadata=meta)
 
             if mongo.available:
                 mongo.upsert_source(source_id, text, meta)
 
             ok_count += 1
-            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars)")
+            tag = f" pack={effective_pack}" if effective_pack else ""
+            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
         except Exception as exc:
             console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 
@@ -331,24 +343,126 @@ def extract(
 @click.argument("question")
 @click.option("--spaces", "-s", default=None, help="Comma-separated space IDs to filter.")
 @click.option("--limit", "-n", default=10, show_default=True)
-@click.option("--json-output", is_flag=True, default=False, help="Output raw JSON.")
-def query(question: str, spaces: str | None, limit: int, json_output: bool) -> None:
+@click.option("--json-output", is_flag=True, default=False, help="Output raw JSON (legacy list format).")
+@click.option(
+    "--pack-id",
+    "pack_ids",
+    multiple=True,
+    help="Restrict the query to one or more pack IDs. May be repeated.",
+)
+@click.option(
+    "--auto-pack",
+    is_flag=True,
+    default=False,
+    help="Pick the most relevant pack from the local registry (deterministic scoring).",
+)
+@click.option(
+    "--include-unpackaged",
+    is_flag=True,
+    default=False,
+    help="Include items with no pack_id (legacy data). Only meaningful with --pack-id.",
+)
+@click.option(
+    "--show-pack/--hide-pack",
+    default=True,
+    help="Show pack provenance in human output.",
+)
+@click.option(
+    "--json-envelope",
+    is_flag=True,
+    default=False,
+    help="Output an envelope JSON {question, selected_packs, pack_filter, results}.",
+)
+def query(
+    question: str,
+    spaces: str | None,
+    limit: int,
+    json_output: bool,
+    pack_ids: tuple[str, ...],
+    auto_pack: bool,
+    include_unpackaged: bool,
+    show_pack: bool,
+    json_envelope: bool,
+) -> None:
     """Run a hybrid query and print results."""
     from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import choose_packs, load_pack_registry
     from opencrab.ontology.query import HybridQuery
-    from opencrab.stores.factory import make_graph_store, make_vector_store
+    from opencrab.stores.factory import make_doc_store, make_graph_store, make_vector_store
 
     cfg = get_settings()
     chroma = make_vector_store(cfg)
     neo4j = make_graph_store(cfg)
+    docs = make_doc_store(cfg)
     hybrid = HybridQuery(chroma, neo4j)
+    if docs.available:
+        hybrid._doc_store = docs  # noqa: SLF001 — same wiring tools.py uses
 
     space_filter = [s.strip() for s in spaces.split(",")] if spaces else None
 
-    results = hybrid.query(question=question, spaces=space_filter, limit=limit)
+    effective_pack_ids: list[str] | None = list(pack_ids) if pack_ids else None
+    selected_packs: list[dict[str, Any]] = []
 
-    if json_output:
+    if effective_pack_ids and auto_pack:
+        click.echo(
+            "warning: --pack-id provided; ignoring --auto-pack.",
+            err=True,
+        )
+        auto_pack = False
+
+    if auto_pack:
+        registry = load_pack_registry(cfg.local_data_dir)
+        candidates = choose_packs(question, registry, limit=1)
+        if candidates:
+            pack, score, matched = candidates[0]
+            effective_pack_ids = [pack.pack_id]
+            selected_packs.append({"pack_id": pack.pack_id, "score": score, "matched": matched})
+            click.echo(
+                f"info: auto-pack selected '{pack.pack_id}' "
+                f"(score={score:.1f}, matched={matched[:6]})",
+                err=True,
+            )
+        else:
+            click.echo(
+                "warning: --auto-pack could not select a pack above the score threshold; "
+                "falling back to a full-store search.",
+                err=True,
+            )
+
+    if include_unpackaged and not effective_pack_ids:
+        click.echo(
+            "warning: --include-unpackaged has no effect without --pack-id or --auto-pack.",
+            err=True,
+        )
+
+    results = hybrid.query(
+        question=question,
+        spaces=space_filter,
+        limit=limit,
+        pack_ids=effective_pack_ids,
+        include_unpackaged=include_unpackaged,
+    )
+
+    # --- Legacy list JSON output (must remain unchanged in shape) ---
+    if json_output and not json_envelope:
         click.echo(json.dumps([r.to_dict() for r in results], indent=2, default=str))
+        return
+
+    # --- New envelope output ---
+    if json_envelope:
+        envelope = {
+            "question": question,
+            "spaces_filter": space_filter,
+            "pack_filter": {
+                "pack_ids": effective_pack_ids,
+                "auto_pack": bool(auto_pack),
+                "include_unpackaged": bool(include_unpackaged),
+            },
+            "selected_packs": selected_packs,
+            "total": len(results),
+            "results": [r.to_dict() for r in results],
+        }
+        click.echo(json.dumps(envelope, indent=2, ensure_ascii=False, default=str))
         return
 
     if not results:
@@ -356,12 +470,22 @@ def query(question: str, spaces: str | None, limit: int, json_output: bool) -> N
         return
 
     console.print(f"\n[bold]Query:[/bold] {question}")
+    if selected_packs:
+        sp = selected_packs[0]
+        console.print(
+            f"[dim]Auto-pack selected pack={sp['pack_id']} score={sp['score']:.1f}[/dim]"
+        )
     console.print(f"[dim]Found {len(results)} result(s)[/dim]\n")
 
     for i, result in enumerate(results, 1):
+        pack_label = ""
+        if show_pack:
+            pid = (result.metadata or {}).get("pack_id") or "?"
+            pack_label = f"pack={pid} "
         console.print(
             f"[bold cyan]{i}.[/bold cyan] "
             f"[{result.source}] "
+            f"{pack_label}"
             f"node={result.node_id or '?'} "
             f"score={result.score:.3f}"
         )
@@ -538,6 +662,231 @@ def assemble_pack_v1_command(source_dir: str, output: str, pack_id: str, title: 
 
     status = assemble_pack_v1(source_dir, output, pack_id=pack_id, title=title)
     console.print_json(json.dumps(status, ensure_ascii=False, default=str))
+
+
+# ---------------------------------------------------------------------------
+# packs group
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def packs() -> None:
+    """Inspect and maintain local OpenCrab packs."""
+
+
+@packs.command("list")
+def packs_list() -> None:
+    """List packs found under <local_data_dir>/packs/."""
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import load_pack_registry
+
+    cfg = get_settings()
+    registry = load_pack_registry(cfg.local_data_dir)
+    if not registry:
+        console.print(f"[yellow]No packs under {cfg.local_data_dir}/packs/[/yellow]")
+        return
+
+    table = Table(title="OpenCrab Packs", show_header=True, header_style="bold cyan")
+    table.add_column("pack_id", style="bold")
+    table.add_column("title")
+    table.add_column("version")
+    table.add_column("nodes", justify="right")
+    table.add_column("edges", justify="right")
+    table.add_column("path")
+
+    for pack in registry:
+        nodes = pack.counts.get("nodes", "?")
+        edges = pack.counts.get("edges", "?")
+        table.add_row(
+            pack.pack_id,
+            (pack.title or "")[:60],
+            pack.version,
+            str(nodes),
+            str(edges),
+            str(pack.path),
+        )
+    console.print(table)
+
+
+@packs.command("show")
+@click.argument("pack_id")
+def packs_show(pack_id: str) -> None:
+    """Show full manifest summary for one pack."""
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import get_pack
+
+    cfg = get_settings()
+    pack = get_pack(cfg.local_data_dir, pack_id)
+    if pack is None:
+        console.print(f"[red]Pack '{pack_id}' not found under {cfg.local_data_dir}/packs/[/red]")
+        raise SystemExit(1)
+
+    info = {
+        "pack_id": pack.pack_id,
+        "title": pack.title,
+        "version": pack.version,
+        "description": pack.description,
+        "source": {
+            "label": pack.source_label,
+            "url": pack.source_url,
+        },
+        "counts": pack.counts,
+        "path": str(pack.path),
+        "manifest_path": str(pack.manifest_path),
+    }
+    console.print_json(json.dumps(info, ensure_ascii=False, default=str))
+
+
+@packs.command("backfill-pack-id")
+@click.option(
+    "--assume-pack-id",
+    "assume_pack_id",
+    default=None,
+    help="Assign this pack_id to every node/edge without one (escape hatch).",
+)
+@click.option(
+    "--dry-run/--no-dry-run",
+    "dry_run",
+    default=None,
+    help="Explicit dry-run toggle. Defaults to true; --apply is required to mutate.",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply changes. Without this flag the command runs in dry-run mode.",
+)
+def packs_backfill_pack_id(
+    assume_pack_id: str | None,
+    dry_run: bool | None,
+    apply_changes: bool,
+) -> None:
+    """Back-fill ``properties.pack_id`` on graph nodes/edges (default dry-run).
+
+    Default mode infers pack_id from any ``/packs/<id>/`` path stored in
+    ``properties.source_path`` / ``source_id`` / ``node_id`` / ``id``.
+    ``--assume-pack-id X`` fills every still-empty entry with X.
+    """
+    import sqlite3 as _sqlite3
+
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_provenance import infer_pack_id_from_path
+
+    cfg = get_settings()
+    db_path = Path(cfg.local_data_dir) / "graph.db"
+    if not db_path.exists():
+        console.print(f"[red]graph.db not found: {db_path}[/red]")
+        raise SystemExit(1)
+
+    effective_dry_run = True
+    if apply_changes and dry_run is True:
+        console.print(
+            "[yellow]warning: both --apply and --dry-run given; honouring --dry-run.[/yellow]"
+        )
+    elif apply_changes and dry_run is None:
+        effective_dry_run = False
+    elif dry_run is False and not apply_changes:
+        console.print(
+            "[yellow]warning: --no-dry-run given without --apply; staying in dry-run.[/yellow]"
+        )
+
+    summary = {
+        "dry_run": effective_dry_run,
+        "nodes_inferred": 0,
+        "nodes_assumed": 0,
+        "nodes_skipped": 0,
+        "edges_inferred": 0,
+        "edges_assumed": 0,
+        "edges_skipped": 0,
+    }
+
+    conn = _sqlite3.connect(db_path)
+    conn.row_factory = _sqlite3.Row
+    cur = conn.cursor()
+
+    def _process(table: str, key_cols: tuple[str, ...]) -> None:
+        cur.execute(f"SELECT {', '.join(key_cols)}, properties FROM {table}")
+        rows = cur.fetchall()
+        for row in rows:
+            try:
+                props = json.loads(row["properties"]) if row["properties"] else {}
+            except (TypeError, ValueError):
+                props = {}
+            if not isinstance(props, dict):
+                summary[f"{table.split('_')[1]}_skipped"] += 1
+                continue
+            if props.get("pack_id"):
+                continue
+            inferred: str | None = None
+            for candidate_key in ("source_path", "source_id", "id"):
+                value = props.get(candidate_key)
+                if value:
+                    inferred = infer_pack_id_from_path(str(value))
+                    if inferred:
+                        break
+            if not inferred:
+                # node_id column from the row itself
+                for key in key_cols:
+                    if key.endswith("_id"):
+                        inferred = infer_pack_id_from_path(str(row[key]))
+                        if inferred:
+                            break
+            if inferred:
+                props["pack_id"] = inferred
+                summary_key = f"{table.split('_')[1]}_inferred"
+                summary[summary_key] += 1
+            elif assume_pack_id:
+                props["pack_id"] = assume_pack_id
+                summary_key = f"{table.split('_')[1]}_assumed"
+                summary[summary_key] += 1
+            else:
+                summary_key = f"{table.split('_')[1]}_skipped"
+                summary[summary_key] += 1
+                continue
+            if not effective_dry_run:
+                set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
+                values = [json.dumps(props)] + [row[c] for c in key_cols]
+                cur.execute(
+                    f"UPDATE {table} SET properties=? WHERE {set_clauses}",
+                    values,
+                )
+
+    _process("graph_nodes", ("node_type", "node_id"))
+    _process("graph_edges", ("from_type", "from_id", "relation", "to_type", "to_id"))
+
+    if not effective_dry_run:
+        conn.commit()
+    conn.close()
+
+    console.print_json(json.dumps(summary, ensure_ascii=False))
+    if effective_dry_run:
+        console.print(
+            "[dim]Dry-run only. Re-run with --apply to persist these changes.[/dim]"
+        )
+
+
+@packs.command("reindex-bm25")
+def packs_reindex_bm25() -> None:
+    """Rebuild the BM25 cache once (escape hatch; lazy rebuild is the default)."""
+    from opencrab.config import get_settings
+    from opencrab.ontology.bm25 import BM25Index
+    from opencrab.stores.factory import make_doc_store
+
+    cfg = get_settings()
+    docs = make_doc_store(cfg)
+    if not docs.available:
+        console.print("[red]Doc store unavailable.[/red]")
+        raise SystemExit(1)
+    nodes = docs.list_nodes(limit=200_000)
+    index = BM25Index.build(nodes)
+    console.print_json(
+        json.dumps(
+            {"rebuilt": True, "node_count": len(nodes), "fingerprint": index.fingerprint},
+            ensure_ascii=False,
+            default=str,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

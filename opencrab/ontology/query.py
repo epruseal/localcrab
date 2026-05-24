@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from opencrab.ontology.pack_provenance import infer_pack_id
 from opencrab.stores.chroma_store import ChromaStore
 from opencrab.stores.neo4j_store import Neo4jStore
 
@@ -168,6 +169,35 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
     return output
 
 
+def _build_chroma_where(
+    spaces: list[str] | None = None,
+    pack_ids: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Compose a ChromaDB ``where`` clause from spaces and pack_ids filters.
+
+    Single-condition queries return a flat ``{field: value-or-$in}`` dict to
+    stay compatible with older Chroma versions; multi-condition queries
+    return ``{"$and": [...]}``. When both inputs are empty/None, returns
+    ``None`` (caller skips the where clause).
+    """
+    clauses: list[dict[str, Any]] = []
+    if spaces:
+        if len(spaces) == 1:
+            clauses.append({"space": spaces[0]})
+        else:
+            clauses.append({"space": {"$in": list(spaces)}})
+    if pack_ids:
+        if len(pack_ids) == 1:
+            clauses.append({"pack_id": pack_ids[0]})
+        else:
+            clauses.append({"pack_id": {"$in": list(pack_ids)}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
 def _property_text(props: dict[str, Any], relation_type: str = "") -> str:
     parts = [relation_type.replace("_", " ")]
     for key in (
@@ -220,6 +250,8 @@ class HybridQuery:
         subject_id: str | None = None,
         use_bm25: bool = True,
         use_rerank: bool = True,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[QueryResult]:
         """
         Execute a hybrid query: vector + BM25 + graph expansion, then rerank.
@@ -250,14 +282,20 @@ class HybridQuery:
         profile = _profile_for_query(question, limit, graph_depth)
 
         # --- Stage 1: Vector similarity search ---
-        vector_hits = self._vector_search(question, spaces, profile.vector_limit)
+        vector_hits = self._vector_search(
+            question, spaces, profile.vector_limit,
+            pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+        )
         if vector_hits:
             result_lists.append([r.to_dict() for r in vector_hits])
 
         # --- Stage 2: BM25 keyword search ---
         bm25_hits: list[dict[str, Any]] = []
         if use_bm25 and self._doc_store is not None:
-            bm25_hits = self._bm25_search(question, spaces, profile.bm25_limit)
+            bm25_hits = self._bm25_search(
+                question, spaces, profile.bm25_limit,
+                pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+            )
             if bm25_hits:
                 result_lists.append(bm25_hits)
 
@@ -268,7 +306,10 @@ class HybridQuery:
             profile.anchor_limit,
         )
         if anchor_ids and self._neo4j.available:
-            graph_results = self._graph_expand(anchor_ids, profile.graph_depth, profile.graph_limit)
+            graph_results = self._graph_expand(
+                anchor_ids, profile.graph_depth, profile.graph_limit,
+                pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+            )
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
 
@@ -294,12 +335,17 @@ class HybridQuery:
         # Convert back to QueryResult
         results = []
         for item in merged[:limit]:
+            metadata = dict(item.get("metadata") or {})
+            if "pack_id" not in metadata:
+                pid = infer_pack_id(item)
+                if pid:
+                    metadata["pack_id"] = pid
             results.append(QueryResult(
                 source=item.get("source", "hybrid"),
                 node_id=item.get("node_id"),
                 score=item.get("rerank_score") or item.get("score", 0.0),
                 text=item.get("text"),
-                metadata=item.get("metadata") or {},
+                metadata=metadata,
                 graph_context=item.get("graph_context"),
             ))
         return results
@@ -309,17 +355,43 @@ class HybridQuery:
         question: str,
         spaces: list[str] | None,
         limit: int,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
-        """Run BM25 search against doc store nodes, using a cached index."""
+        """Run BM25 search against doc store nodes, using a cached index.
+
+        The cache is rebuilt when the doc store's ``(count, max_timestamp)``
+        fingerprint diverges from the indexed snapshot. Callers can also
+        force a rebuild via ``invalidate_bm25_cache()``.
+        """
         try:
-            if self._bm25_dirty or self._bm25_cache is None:
+            BM25Index = _get_bm25()
+            from opencrab.ontology.bm25 import compute_fingerprint
+
+            need_rebuild = self._bm25_dirty or self._bm25_cache is None
+            if not need_rebuild and self._bm25_cache is not None:
                 nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                BM25Index = _get_bm25()
+                if compute_fingerprint(nodes) != self._bm25_cache.fingerprint:
+                    need_rebuild = True
+                if need_rebuild:
+                    self._bm25_cache = BM25Index.build(nodes)
+                    self._bm25_cache_size = len(nodes)
+                    self._bm25_dirty = False
+                    logger.debug("BM25 index rebuilt (fingerprint mismatch, %d nodes)", len(nodes))
+            else:
+                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
                 self._bm25_cache = BM25Index.build(nodes)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False
                 logger.debug("BM25 index rebuilt (%d nodes)", self._bm25_cache_size)
-            hits = self._bm25_cache.search(question, spaces=spaces, limit=limit)
+
+            hits = self._bm25_cache.search(
+                question,
+                spaces=spaces,
+                limit=limit,
+                pack_ids=pack_ids,
+                include_unpackaged=include_unpackaged,
+            )
             for h in hits:
                 h["source"] = "bm25"
             return hits
@@ -362,33 +434,70 @@ class HybridQuery:
         return filtered
 
     def _vector_search(
-        self, question: str, spaces: list[str] | None, limit: int
+        self,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[QueryResult]:
-        """Run ChromaDB semantic similarity search."""
+        """Run ChromaDB semantic similarity search.
+
+        Pack filtering uses Chroma's ``where`` clause when ``include_unpackaged``
+        is False (server-side enforcement). When the server rejects the
+        combined clause (older Chroma builds), we fall back to a wider scan
+        and apply the filter in Python. ``include_unpackaged=True`` always
+        uses the Python post-filter path since Chroma cannot express
+        "in set OR is null" directly in a single clause.
+        """
         if not self._chroma.available:
             logger.debug("ChromaDB unavailable, skipping vector search.")
             return []
 
         try:
-            where: dict[str, Any] | None = None
-            if spaces:
-                if len(spaces) == 1:
-                    where = {"space": spaces[0]}
-                else:
-                    where = {"space": {"$in": spaces}}
+            use_post_filter = bool(pack_ids) and include_unpackaged
+            if use_post_filter:
+                where = _build_chroma_where(spaces=spaces, pack_ids=None)
+                effective_pack_filter: list[str] | None = list(pack_ids) if pack_ids else None
+            else:
+                where = _build_chroma_where(spaces=spaces, pack_ids=pack_ids)
+                effective_pack_filter = None
 
-            hits = self._chroma.query(
-                query_text=question,
-                n_results=min(limit, 20),
-                where=where,
-            )
+            if use_post_filter:
+                n_results = max(min(limit, 20) * 4, 20)
+            else:
+                n_results = min(limit, 20)
+            try:
+                hits = self._chroma.query(
+                    query_text=question,
+                    n_results=n_results,
+                    where=where,
+                )
+            except Exception as exc:
+                # Some Chroma versions error on $and / $in clauses. Fall back
+                # to a wider scan + Python post-filter.
+                logger.warning("Chroma where filter rejected (%s); using post-filter fallback.", exc)
+                fallback_where = _build_chroma_where(spaces=spaces, pack_ids=None)
+                hits = self._chroma.query(
+                    query_text=question,
+                    n_results=max(n_results * 4, 20),
+                    where=fallback_where,
+                )
+                effective_pack_filter = list(pack_ids) if pack_ids else None
 
             results: list[QueryResult] = []
             for hit in hits:
+                meta = hit.get("metadata") or {}
+                if effective_pack_filter is not None:
+                    pid = infer_pack_id({"metadata": meta, **hit})
+                    if pid is None:
+                        if not include_unpackaged:
+                            continue
+                    elif pid not in set(effective_pack_filter):
+                        continue
                 # Convert cosine distance to similarity score (1 - distance)
                 distance = hit.get("distance") or 0.0
                 score = max(0.0, 1.0 - float(distance))
-                meta = hit.get("metadata") or {}
                 results.append(
                     QueryResult(
                         source="vector",
@@ -404,7 +513,12 @@ class HybridQuery:
             return []
 
     def _graph_expand(
-        self, anchor_ids: list[str], depth: int, limit: int
+        self,
+        anchor_ids: list[str],
+        depth: int,
+        limit: int,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[QueryResult]:
         """Expand graph neighbourhood from anchor node IDs.
 
@@ -422,11 +536,18 @@ class HybridQuery:
 
         for anchor_id in anchor_ids[:max_anchors]:
             try:
+                # Only forward pack kwargs when one is active so older graph
+                # store stubs (without the new signature) keep working.
+                extra: dict[str, Any] = {}
+                if pack_ids:
+                    extra["pack_ids"] = pack_ids
+                    extra["include_unpackaged"] = include_unpackaged
                 neighbours = self._neo4j.find_neighbors(
                     node_id=anchor_id,
                     direction="both",
                     depth=depth,
                     limit=limit,
+                    **extra,
                 )
                 for n in neighbours:
                     props = n.get("properties", {})
@@ -500,6 +621,10 @@ class HybridQuery:
             logger.warning("Ingest to ChromaDB failed: %s", exc)
             result["stores"]["chromadb"] = f"error: {exc}"
 
+        # Doc-store mutations happen outside ingest() today, but vector
+        # additions still warrant a BM25 rebuild on the next query because
+        # the doc store may have been written alongside this call.
+        self.invalidate_bm25_cache()
         return result
 
     def keyword_search(
