@@ -227,6 +227,10 @@ def ontology_query(
     tenant_id: str = "default",
     use_bm25: bool = True,
     use_rerank: bool = True,
+    pack_ids: list[str] | None = None,
+    auto_pack: bool = False,
+    include_unpackaged: bool = False,
+    include_pack_provenance: bool = True,
 ) -> dict[str, Any]:
     """
     Run a hybrid vector + BM25 + graph query against the ontology.
@@ -248,8 +252,56 @@ def ontology_query(
         Include BM25 keyword results (default True).
     use_rerank:
         Apply RRF + BM25 cross-score reranking (default True).
+    pack_ids:
+        Optional list of pack_ids to scope retrieval. Takes precedence over
+        auto_pack.
+    auto_pack:
+        When True (and pack_ids is empty), pick the most relevant pack from
+        the local registry using deterministic keyword scoring.
+    include_unpackaged:
+        When pack filtering is active, also surface items with no pack_id
+        (legacy data). Endpoint-failed edges are still suppressed.
+    include_pack_provenance:
+        Embed ``metadata.pack_id`` and ``selected_packs``/``pack_filter`` in
+        the response (default True). Set to False for the bare legacy shape.
     """
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import choose_packs, load_pack_registry
+
     ctx = _get_context()
+    selected_packs: list[dict[str, Any]] = []
+    effective_pack_ids: list[str] | None = list(pack_ids) if pack_ids else None
+    pack_filter_warnings: list[str] = []
+
+    if effective_pack_ids and auto_pack:
+        pack_filter_warnings.append("pack_ids provided; ignoring auto_pack")
+        auto_pack = False
+
+    if auto_pack:
+        try:
+            cfg = get_settings()
+            registry = load_pack_registry(cfg.local_data_dir)
+            candidates = choose_packs(question, registry, limit=1)
+            if candidates:
+                pack, score, matched = candidates[0]
+                effective_pack_ids = [pack.pack_id]
+                selected_packs.append(
+                    {"pack_id": pack.pack_id, "score": score, "matched": matched}
+                )
+            else:
+                pack_filter_warnings.append(
+                    "auto_pack could not select a pack above the score threshold; "
+                    "falling back to full-store search"
+                )
+        except Exception as exc:
+            logger.warning("auto_pack selection failed: %s", exc)
+            pack_filter_warnings.append(f"auto_pack failed: {exc}")
+
+    if include_unpackaged and not effective_pack_ids:
+        pack_filter_warnings.append(
+            "include_unpackaged has no effect without pack_ids/auto_pack"
+        )
+
     try:
         results = ctx["hybrid"].query(
             question=question,
@@ -258,9 +310,11 @@ def ontology_query(
             subject_id=subject_id,
             use_bm25=use_bm25,
             use_rerank=use_rerank,
+            pack_ids=effective_pack_ids,
+            include_unpackaged=include_unpackaged,
         )
         ctx["billing"].on_query(tenant_id, subject_id, question)
-        return {
+        response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
             "subject_id": subject_id,
@@ -269,6 +323,16 @@ def ontology_query(
             "total": len(results),
             "results": [r.to_dict() for r in results],
         }
+        if include_pack_provenance:
+            response["selected_packs"] = selected_packs
+            response["pack_filter"] = {
+                "pack_ids": effective_pack_ids,
+                "auto_pack": bool(auto_pack),
+                "include_unpackaged": bool(include_unpackaged),
+            }
+            if pack_filter_warnings:
+                response["pack_filter"]["warnings"] = pack_filter_warnings
+        return response
     except Exception as exc:
         logger.error("ontology_query failed: %s", exc)
         return {"error": str(exc)}
@@ -1128,6 +1192,26 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "use_rerank": {
                     "type": "boolean",
                     "description": "Apply RRF + BM25 cross-score reranking (default true).",
+                    "default": True,
+                },
+                "pack_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Restrict retrieval to one or more pack_ids. Wins over auto_pack.",
+                },
+                "auto_pack": {
+                    "type": "boolean",
+                    "description": "Pick the most relevant pack from the local registry (deterministic).",
+                    "default": False,
+                },
+                "include_unpackaged": {
+                    "type": "boolean",
+                    "description": "Include items with no pack_id when pack filtering is active.",
+                    "default": False,
+                },
+                "include_pack_provenance": {
+                    "type": "boolean",
+                    "description": "Embed selected_packs / pack_filter / metadata.pack_id in the response.",
                     "default": True,
                 },
             },
