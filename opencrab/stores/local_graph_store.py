@@ -286,7 +286,6 @@ class LocalGraphStore:
                     nid = row["to_id"]
                     if nid in visited:
                         continue
-                    visited.add(nid)
                     dst_props = self._fetch_node_props(cur, row["to_type"], nid)
                     if not dst_props:
                         continue
@@ -297,6 +296,7 @@ class LocalGraphStore:
                         edge_props = self._parse_props(row["properties"])
                         if not _edge_passes(edge_props, True, dst_pass, pack_set):
                             continue
+                    visited.add(nid)
                     results.append({
                         "properties": dst_props,
                         "labels": [row["to_type"]],
@@ -316,7 +316,6 @@ class LocalGraphStore:
                     nid = row["from_id"]
                     if nid in visited:
                         continue
-                    visited.add(nid)
                     src_props = self._fetch_node_props(cur, row["from_type"], nid)
                     if not src_props:
                         continue
@@ -327,6 +326,7 @@ class LocalGraphStore:
                         edge_props = self._parse_props(row["properties"])
                         if not _edge_passes(edge_props, src_pass, True, pack_set):
                             continue
+                    visited.add(nid)
                     results.append({
                         "properties": src_props,
                         "labels": [row["from_type"]],

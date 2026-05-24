@@ -70,3 +70,27 @@ def test_t5_matches_pack_filter_member_passes() -> None:
 def test_t5_matches_pack_filter_foreign_rejected() -> None:
     item = {"metadata": {"pack_id": "Z"}}
     assert matches_pack_filter(item, pack_ids=["A"], include_unpackaged=True) is False
+
+
+def test_t5_infer_pack_id_top_level() -> None:
+    """item['pack_id'] is read after metadata/properties but before path inference."""
+    item = {"pack_id": "from-top-level"}
+    assert infer_pack_id(item) == "from-top-level"
+
+
+def test_t5_metadata_wins_over_top_level_pack_id() -> None:
+    """metadata pack_id takes priority over top-level pack_id."""
+    item = {"metadata": {"pack_id": "from-metadata"}, "pack_id": "from-top-level"}
+    assert infer_pack_id(item) == "from-metadata"
+
+
+def test_t5_properties_wins_over_top_level_pack_id() -> None:
+    """properties pack_id takes priority over top-level pack_id."""
+    item = {"properties": {"pack_id": "from-props"}, "pack_id": "from-top-level"}
+    assert infer_pack_id(item) == "from-props"
+
+
+def test_t5_infer_pack_id_bm25_result_shape() -> None:
+    """BM25 results may carry pack_id at top level without a metadata wrapper."""
+    item = {"node_id": "n1", "text": "some text", "score": 0.5, "pack_id": "bm25-pack"}
+    assert infer_pack_id(item) == "bm25-pack"
