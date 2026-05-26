@@ -97,8 +97,16 @@ META_EDGES: list[dict[str, Any]] = [
     {
         "from_space": "concept",
         "to_space": "outcome",
-        "relations": ["contributes_to", "constrains", "predicts", "degrades"],
+        "relations": ["contributes_to", "constrains", "predicts", "degrades", "can_derive_metric"],
         "description": "Concepts have causal or correlative links to outcomes.",
+    },
+    # Added for opencrab-dump ingestion: source documents (resource) reference concepts
+    # via keyword-extraction (mentions) and structural schema edges (has_column).
+    {
+        "from_space": "resource",
+        "to_space": "concept",
+        "relations": ["mentions", "has_column"],
+        "description": "Resources reference or structure conceptual knowledge.",
     },
     {
         "from_space": "lever",

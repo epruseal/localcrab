@@ -86,10 +86,16 @@ class LLMExtractor:
     ----------
     api_key:
         Anthropic API key. Defaults to ANTHROPIC_API_KEY env var.
+        Unused when backend='cli'.
     model:
-        Claude model to use for extraction.
+        Claude model to use for extraction (API backend only).
     chunk_size:
         Approximate character length per text chunk.
+    backend:
+        'api'  — call Anthropic SDK directly (requires api_key / ANTHROPIC_API_KEY).
+        'cli'  — call the locally-installed `claude -p` CLI (uses existing
+                 subscription auth, no API key needed).
+        'auto' — use 'api' if ANTHROPIC_API_KEY is set, else fall back to 'cli'.
     """
 
     def __init__(
@@ -97,14 +103,22 @@ class LLMExtractor:
         api_key: str | None = None,
         model: str = "claude-haiku-4-5-20251001",
         chunk_size: int = 3000,
+        backend: str = "auto",
     ) -> None:
-        import anthropic
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 
-        self._client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        )
+        if backend == "auto":
+            backend = "api" if resolved_key else "cli"
+
+        self.backend = backend
         self.model = model
         self.chunk_size = chunk_size
+
+        if self.backend == "api":
+            import anthropic
+            self._client = anthropic.Anthropic(api_key=resolved_key)
+        else:
+            self._client = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -166,6 +180,35 @@ class LLMExtractor:
             chunks.append(current.strip())
         return chunks or [text[: self.chunk_size]]
 
+    def _call_llm(self, prompt: str) -> str:
+        """Dispatch prompt to the configured LLM backend and return raw text."""
+        if self.backend == "api":
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text.strip()
+
+        # CLI backend — subprocess call to `claude -p`
+        import subprocess
+        result = subprocess.run(
+            [
+                "claude", "-p",
+                "--output-format", "text",
+                "--no-session-persistence",
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"claude CLI exited {result.returncode}: {result.stderr[:300]}"
+            )
+        return result.stdout.strip()
+
     def _extract_chunk(
         self, chunk: str, source_id: str, chunk_index: int
     ) -> tuple[list[ExtractedNode], list[ExtractedEdge]]:
@@ -203,13 +246,7 @@ class LLMExtractor:
             }}
         """).strip()
 
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        raw = response.content[0].text.strip()
+        raw = self._call_llm(prompt)
 
         # Extract JSON block if wrapped in markdown
         json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)

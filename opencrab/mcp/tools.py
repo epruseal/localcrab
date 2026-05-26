@@ -359,11 +359,12 @@ def query_bm25(
         Maximum results.
     """
     from opencrab.ontology.bm25 import BM25Index
+    from opencrab.ontology.query import _BM25_NODE_LIMIT
 
     ctx = _get_context()
     doc_store = ctx["mongo"]
     try:
-        nodes = doc_store.list_nodes(limit=5000)
+        nodes = doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
         index = BM25Index.build(nodes)
         hits = index.search(question, spaces=spaces, limit=limit)
         return {
@@ -475,6 +476,7 @@ def ontology_extract(
     text: str,
     source_id: str,
     model: str = "claude-haiku-4-5-20251001",
+    backend: str = "auto",
 ) -> dict[str, Any]:
     """
     LLM-extract ontology nodes and edges from text and write to the graph.
@@ -489,31 +491,22 @@ def ontology_extract(
     source_id:
         Stable identifier for this source (e.g. file path or URL).
     model:
-        Claude model to use for extraction.
+        Claude model to use for extraction (API backend only).
+    backend:
+        'auto' (default) — use API if ANTHROPIC_API_KEY is set, else fall back
+        to the locally-installed `claude -p` CLI (subscription auth, no key needed).
+        'api'  — Anthropic SDK (requires ANTHROPIC_API_KEY).
+        'cli'  — `claude -p` subprocess (uses existing Claude Code subscription).
     """
-    import os
-
     from opencrab.ontology.extractor import LLMExtractor
 
     text = _clean_str(text)
     source_id = _clean_str(source_id)
 
-    # API key: prefer env var, fall back to Claude Code session key
-    api_key = (
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("CLAUDE_API_KEY")
-        or ""
-    )
-    if not api_key:
-        return {
-            "error": "No LLM API key available. Set ANTHROPIC_API_KEY in .env, "
-                     "or use ontology_ingest + ontology_add_node/edge instead."
-        }
-
     ctx = _get_context()
 
     try:
-        extractor = LLMExtractor(api_key=api_key, model=model)
+        extractor = LLMExtractor(model=model, backend=backend)
         result = extractor.extract_from_text(text, source_id=source_id)
 
         added_nodes = 0
@@ -949,6 +942,50 @@ def billing_list_events(
     return {"tenant_id": tenant_id, "total": len(events), "events": events}
 
 
+def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
+    """
+    List all content packs loaded into the localcrab ontology stores.
+
+    Returns each pack_id with node count and a representative title
+    derived from node properties (source_package_title / title / name).
+
+    Parameters
+    ----------
+    min_nodes:
+        Only return packs with at least this many nodes (default 1).
+    """
+    ctx = _get_context()
+    graph = ctx["neo4j"]
+    if not graph.available:
+        return {"error": "Neo4j unavailable"}
+
+    cypher = """
+    MATCH (n:OpenCrabNode)
+    WITH n.pack_id AS pack_id, count(n) AS node_count,
+         collect(DISTINCT
+             coalesce(n.source_package_title, n.title, n.name, '')
+         )[0] AS sample_title
+    WHERE node_count >= $min_nodes
+    RETURN pack_id, node_count, sample_title
+    ORDER BY node_count DESC
+    """
+    rows = graph.run_cypher(cypher, {"min_nodes": min_nodes})
+
+    packs = []
+    for r in rows:
+        pid = r["pack_id"] or ""
+        title = r["sample_title"] or ""
+        # trim trailing " ontology pack" boilerplate for readability
+        display = title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
+        packs.append({
+            "pack_id":    pid,
+            "node_count": r["node_count"],
+            "title":      display or pid or "(no pack_id)",
+        })
+
+    return {"total": len(packs), "packs": packs}
+
+
 def schema_pack_list() -> dict[str, Any]:
     """List all available schema packs with install status."""
     from opencrab.schemas.pack_registry import list_packs
@@ -1298,8 +1335,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "source_id": {"type": "string", "description": "Stable source identifier."},
                 "model": {
                     "type": "string",
-                    "description": "Claude model (default: claude-haiku-4-5-20251001).",
+                    "description": "Claude model (default: claude-haiku-4-5-20251001). API backend only.",
                     "default": "claude-haiku-4-5-20251001",
+                },
+                "backend": {
+                    "type": "string",
+                    "description": "'auto' (default): API if ANTHROPIC_API_KEY set, else `claude -p` CLI. 'api': Anthropic SDK. 'cli': local `claude -p` subprocess (uses subscription auth, no API key needed).",
+                    "default": "auto",
                 },
             },
             "required": ["text", "source_id"],
@@ -1578,6 +1620,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": [],
         },
     },
+    "content_pack_list": {
+        "description": "List all content packs currently loaded in the localcrab ontology (Neo4j). Returns pack_id, node count, and display title for each pack.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_nodes": {"type": "integer", "description": "Only return packs with at least this many nodes (default 1).", "default": 1},
+            },
+            "required": [],
+        },
+    },
     "schema_pack_list": {
         "description": "List all available schema packs (saas, biomedical, legal) with install status.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
@@ -1636,6 +1688,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
     # Phase 5
     "billing_get_usage": billing_get_usage,
     "billing_list_events": billing_list_events,
+    "content_pack_list": content_pack_list,
     "schema_pack_list": schema_pack_list,
     "schema_pack_install": schema_pack_install,
     "schema_pack_uninstall": schema_pack_uninstall,

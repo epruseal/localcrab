@@ -83,6 +83,20 @@ opencrab serve
 LocalCrab runs locally by default. It uses SQLite, JSON files, and a local
 Chroma persistent store under `./opencrab_data`.
 
+**Docker backend (recommended for production use):**
+
+Set `STORAGE_MODE=docker` to connect to external Neo4j, Chroma, MongoDB, and
+PostgreSQL instances instead of the local SQLite/file fallbacks.
+
+```bash
+STORAGE_MODE=docker opencrab serve
+```
+
+> Without `STORAGE_MODE=docker`, the graph store falls back to a SQLite-backed
+> `LocalGraphStore` which does not support Cypher queries (`run_cypher` returns
+> `[]`). Tools like `content_pack_list` and `ontology_query` require the Neo4j
+> backend to function correctly.
+
 ### 3. Verify the grammar and query path
 
 ```bash
@@ -109,6 +123,36 @@ Or add it manually:
   }
 }
 ```
+
+### 5. Remote MCP access via supergateway (optional)
+
+LocalCrab exposes a stdio MCP server. To access it from remote devices
+(e.g. over Tailscale), bridge it to streamableHttp using
+[supergateway](https://github.com/supermachineai/supergateway):
+
+```bash
+STORAGE_MODE=docker npx -y supergateway \
+  --outputTransport streamableHttp \
+  --port 8765 \
+  --stdio "python -m opencrab.cli serve"
+```
+
+Then connect from any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "localcrab": {
+      "type": "http",
+      "url": "http://<host>:8765/mcp"
+    }
+  }
+}
+```
+
+> Always set `STORAGE_MODE=docker` when using supergateway. Without it,
+> the server starts in local SQLite mode and Cypher-dependent tools return
+> empty results.
 
 ## CrabHarness
 
@@ -147,6 +191,16 @@ canonical ontology contract.
 | lever | Tunable controls that affect outcomes or concepts. |
 | policy | Access, sensitivity, approval, and governance rules. |
 
+### Grammar Extensions
+
+The following META_EDGES have been added to `opencrab/grammar/manifest.py`
+beyond the original set:
+
+| from_space | to_space | relations added | purpose |
+|---|---|---|---|
+| `resource` | `concept` | `mentions`, `has_column` | Source documents reference or structurally define concepts (keyword extraction, schema columns). |
+| `concept` | `outcome` | `can_derive_metric` | Concepts that can be computed into a measurable KPI or metric. |
+
 ### Core MCP Tools
 
 - `ontology_manifest`: return the full grammar.
@@ -155,7 +209,9 @@ canonical ontology contract.
 - `ontology_query`: hybrid vector + BM25 + graph query.
 - `ontology_impact`: I1-I7 impact analysis.
 - `ontology_rebac_check`: relationship-based access check.
-- `ontology_ingest`: ingest text into the local ontology stores.
+- `ontology_ingest`: ingest text into the local ontology stores (vector + doc only).
+- `ontology_extract`: LLM-extract nodes/edges from text and write to the full graph. Supports `backend="cli"` to use the local `claude -p` CLI (subscription auth, no API key required) or `backend="api"` for direct Anthropic SDK calls.
+- `content_pack_list`: list all content packs loaded in Neo4j (`pack_id`, node count, title). Unlike `schema_pack_list`, this reflects actual ingested content nodes.
 - `harness_promotion_apply`: apply a CrabHarness promotion package.
 
 ## OpenCrab Pack v1
