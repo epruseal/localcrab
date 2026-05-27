@@ -19,14 +19,9 @@ LocalCrab은 `STORAGE_MODE` 환경변수로 두 가지 백엔드를 선택한다
 | 스토어 역할 | local 모드 | docker 모드 |
 | --- | --- | --- |
 | 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `Neo4jStore` (`bolt://localhost:7687`) |
-| 문서 | `LocalDocStore` (`docs/*.json`, JSON 파일) | `MongoStore` (MongoDB) |
+| 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `MongoStore` (MongoDB) |
 | 벡터 | `ChromaStore` (PersistentClient, `chroma/`) | `ChromaStore` (HttpClient) |
 | SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (PostgreSQL) |
-
-> **현재 상태**: `LocalSQLDocStore` (SQLite 기반 문서 스토어)가 구현 완료되어
-> `opencrab/stores/local_sql_doc_store.py`에 존재하지만, `factory.py`의
-> `make_doc_store()`는 아직 `LocalDocStore` (JSON)를 반환한다.
-> factory 연결은 Phase 2 작업 항목이다.
 
 ### 팩토리 (`opencrab/stores/factory.py`)
 
@@ -36,7 +31,7 @@ make_graph_store(settings)
     else     → Neo4jStore(uri=NEO4J_URI, ...)
 
 make_doc_store(settings)
-    is_local → LocalDocStore(data_dir="<LOCAL_DATA_DIR>/docs")   # 현재
+    is_local → LocalSQLDocStore(db_path="<LOCAL_DATA_DIR>/doc_store.db")
     else     → MongoStore(uri=MONGODB_URI, db_name=MONGODB_DB)
 
 make_vector_store(settings)
@@ -189,11 +184,19 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 | `ontology_lever_simulate` | `LocalGraphStore.find_by_relations()` — 1-홉 relation 필터 |
 | `export` | `LocalGraphStore.export_nodes()` / `export_edges()` |
 | `analyse` | `LocalGraphStore.get_node_by_id()` |
+| `ontology_rebac_check` | `find_neighbors(depth=1,2)` — Python BFS direct/transitive |
+| `keyword_search` | `export_nodes() + Python str.lower() 포함 검사` |
+| 엣지 저장 시 노드 타입 조회 | `get_node_by_id()` |
 
 코드베이스 전반에 `isinstance(graph, LocalGraphStore)` 분기가 존재한다. 또한
 `find_neighbors()`는 Cypher 가변 관계 패턴(`*1..N`) 대신 Python BFS로 구현되어 있어,
 허브 노드(차수 수백 이상)에서 성능 열화가 발생한다 (`bench_graph_backends.py`
 실측: 43k 노드 / 최고 차수 615에서 d1 p50 = 11.86ms, 20k 대비 32× 급등).
+
+> **BFS SQL LIMIT 최적화**: `find_neighbors()`는 각 탐색 스텝에서 `remaining = limit - len(results)`를
+> SQL LIMIT에 전달해 fetchall I/O 자체를 줄이고, 내부 루프에서도 limit 도달 시
+> 즉시 break한다. SQL LIMIT만으로는 pack 필터 통과율이 낮을 때 보완이 안 되므로
+> 두 guard를 병용한다.
 
 ### LadybugDB 전환 시 기대 효과
 
@@ -217,9 +220,31 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 
 ## 5. 마이그레이션 절차
 
-### Docker → local 전환
+### Docker → local 전환 (자동)
 
-현재 `scripts/` 디렉토리에 `migrate_to_local.py`는 없다. 수동 전환 절차:
+`scripts/migrate_to_local.py`를 사용하면 Neo4j + MongoDB + HTTP Chroma + PostgreSQL의
+데이터를 로컬 SQLite/Chroma로 원클릭 전환할 수 있다.
+
+```bash
+# Dry-run: 소스 서비스 연결 확인 + 데이터 규모 보고 (쓰기 없음)
+uv run python scripts/migrate_to_local.py --dry-run
+
+# 전체 마이그레이션 (기존 로컬 파일 자동 백업 후 진행)
+uv run python scripts/migrate_to_local.py
+
+# 특정 단계만 실행
+uv run python scripts/migrate_to_local.py --skip-vectors --skip-sql
+```
+
+6단계 파이프라인:
+1. Pre-flight: 소스 서비스 연결 + 데이터 규모 확인 (READ ONLY)
+2. Backup: 기존 로컬 DB 파일 타임스탬프 접미사 백업 (`graph.db.bak.YYYYMMDD_HHMMSS`)
+3. Graph: Neo4j → LocalGraphStore (SKIP/LIMIT 페이징, `upsert_nodes_batch`)
+4. Docs: MongoDB → LocalSQLDocStore (nodes / sources / audit_log)
+5. Vectors: HTTP Chroma → PersistentClient (임베딩 재계산 없이 원본 복사)
+6. SQL: PostgreSQL → SQLite (INSERT OR IGNORE, `result.rowcount` 기반 정확 카운트)
+
+### 수동 전환
 
 **1. 환경변수 전환**
 
@@ -228,31 +253,31 @@ export STORAGE_MODE=local
 export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/localcrab
 ```
 
-**2. 데이터 디렉토리 확인**
+**2. 데이터 디렉토리 구조**
 
 ```
 <LOCAL_DATA_DIR>/
   graph.db          # LocalGraphStore (SQLite)
   graph.db-wal      # WAL 파일 — 백업 시 반드시 포함
   graph.db-shm      # 공유 메모리 파일 — 백업 시 반드시 포함
-  docs/             # LocalDocStore (JSON 파일)
-    nodes.json
-    sources.json
-    audit_log.json
+  doc_store.db      # LocalSQLDocStore (SQLite)
   chroma/           # Chroma PersistentClient
   opencrab.db       # SQLStore (SQLite)
 ```
 
-**3. 백업**
+**3. 수동 백업**
 
-WAL 모드 사용 시 `graph.db`만 복사하면 데이터 손실이 발생할 수 있다. 세 파일을
-함께 복사해야 한다.
+WAL 모드 사용 시 `.db`만 복사하면 체크포인트되지 않은 WAL 데이터가 누락된다.
+세 파일을 함께 복사해야 한다.
 
 ```bash
 cp graph.db graph.db-wal graph.db-shm /backup/path/
+cp doc_store.db /backup/path/
 cp opencrab.db /backup/path/
-cp -r docs/ /backup/path/docs/
+cp -r chroma/ /backup/path/chroma/
 ```
+
+> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일을 자동으로 함께 복사한다.
 
 **4. 검증**
 
@@ -262,7 +287,7 @@ opencrab manifest
 opencrab query "test"
 ```
 
-`status` 출력에서 `LocalGraphStore`, `LocalDocStore`, `ChromaStore (local)` 가
+`status` 출력에서 `LocalGraphStore`, `LocalSQLDocStore`, `ChromaStore (local)` 가
 표시되면 정상이다.
 
 ---
