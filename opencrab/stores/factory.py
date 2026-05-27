@@ -51,12 +51,37 @@ def make_vector_store(settings: Settings) -> Any:
 
 
 def make_doc_store(settings: Settings) -> Any:
-    """Return LocalDocStore (local) or MongoStore (docker)."""
-    if settings.is_local:
-        from opencrab.stores.local_doc_store import LocalDocStore
+    """Return LocalSQLDocStore (local) or MongoStore (docker).
 
-        docs_path = os.path.join(settings.local_data_dir, "docs")
-        return LocalDocStore(data_dir=docs_path)
+    WHY LocalSQLDocStore INSTEAD OF LocalDocStore (JSON):
+        list_nodes(limit=50000) is called on every BM25 cache rebuild (i.e.
+        every query).  LocalDocStore._load() deserialises the entire JSON file
+        on each call — O(N) — so a 10× data growth means a 10× slower hot
+        path with no way to offset it.  LocalSQLDocStore issues a single
+        SELECT … LIMIT query, which SQLite satisfies with an O(k) range scan
+        and never reads rows beyond the limit.
+
+    WHY LocalDocStore IS KEPT (not removed):
+        Legacy callers that instantiate LocalDocStore directly (e.g. migration
+        scripts, unit tests written before this switch) must continue to work.
+        Removing the import here does not delete the class; leaving it avoids
+        a confusing ImportError if someone still references it.
+
+    WHY db_path = LOCAL_DATA_DIR / "doc_store.db":
+        Keeps the SQLite file in the same directory as graph.db and
+        opencrab.db, so a single LOCAL_DATA_DIR backup captures all local
+        state.  A fixed filename ("doc_store.db") makes the path predictable
+        for operators and migration tooling.
+    """
+    if settings.is_local:
+        # LocalDocStore (JSON) → LocalSQLDocStore (SQLite).
+        # See module docstring in local_sql_doc_store.py for full rationale.
+        from pathlib import Path
+
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        db_path = Path(settings.local_data_dir) / "doc_store.db"
+        return LocalSQLDocStore(str(db_path))
     else:
         from opencrab.stores.mongo_store import MongoStore
 
