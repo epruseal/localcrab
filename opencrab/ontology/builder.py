@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
+from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
@@ -206,19 +207,27 @@ class OntologyBuilder:
         if self._neo4j.available:
             # Try to look up real node types
             try:
-                result = self._neo4j.run_cypher(
-                    "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-                    {"id": from_id},
-                )
-                if result and result[0].get("lbl"):
-                    from_type = result[0]["lbl"]
-
-                result = self._neo4j.run_cypher(
-                    "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-                    {"id": to_id},
-                )
-                if result and result[0].get("lbl"):
-                    to_type = result[0]["lbl"]
+                if isinstance(self._neo4j, LocalGraphStore):
+                    # 로컬 모드: get_node_by_id() 사용 (run_cypher no-op 우회)
+                    node_info = self._neo4j.get_node_by_id(from_id)
+                    if node_info and node_info.get("node_type"):
+                        from_type = node_info["node_type"]
+                    node_info = self._neo4j.get_node_by_id(to_id)
+                    if node_info and node_info.get("node_type"):
+                        to_type = node_info["node_type"]
+                else:
+                    result = self._neo4j.run_cypher(
+                        "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
+                        {"id": from_id},
+                    )
+                    if result and result[0].get("lbl"):
+                        from_type = result[0]["lbl"]
+                    result = self._neo4j.run_cypher(
+                        "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
+                        {"id": to_id},
+                    )
+                    if result and result[0].get("lbl"):
+                        to_type = result[0]["lbl"]
             except Exception:
                 pass  # use defaults
 
