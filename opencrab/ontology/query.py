@@ -648,6 +648,31 @@ class HybridQuery:
         if not self._neo4j.available:
             return []
 
+        # --- 로컬 모드: LocalGraphStore는 run_cypher()가 no-op이므로
+        #     export_nodes() + Python-side 키워드 필터로 대체한다.
+        from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
+        if isinstance(self._neo4j, LocalGraphStore):
+            kw_lower = keyword.lower()
+            search_fields = ["name", "description", "text", "title", "label", "summary"]
+            scan_limit = min(limit * 20, 50000)
+            candidate_rows = self._neo4j.export_nodes(limit=scan_limit)
+            results: list[dict[str, Any]] = []
+            for row in candidate_rows:
+                props = row.get("props", {})
+                labels = row.get("labels", [""])
+                # spaces 필터
+                if spaces and props.get("space") not in spaces:
+                    continue
+                for field in search_fields:
+                    val = props.get(field, "")
+                    if val and kw_lower in str(val).lower():
+                        results.append({"node": props, "label": labels[0] if labels else ""})
+                        break
+                if len(results) >= limit:
+                    break
+            return results
+
+        # --- Neo4j(Docker) 모드: 기존 Cypher 경로 유지
         space_filter = ""
         params: dict[str, Any] = {"kw": keyword.lower(), "limit": limit}
         if spaces:
