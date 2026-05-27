@@ -278,63 +278,111 @@ class LocalGraphStore:
 
             # Outgoing edges
             if direction in ("out", "both"):
-                cur.execute(
-                    "SELECT to_type, to_id, relation, properties FROM graph_edges WHERE from_id=?",
-                    (current_id,),
-                )
-                for row in cur.fetchall():
-                    nid = row["to_id"]
-                    if nid in visited:
-                        continue
-                    dst_props = self._fetch_node_props(cur, row["to_type"], nid)
-                    if not dst_props:
-                        continue
-                    if pack_set is not None:
-                        dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
-                        if not dst_pass:
+                # [BFS 허브 노드 성능 문제와 2단계 수정]
+                #
+                # 문제: 외부 while 루프의 `len(results) < limit` 조건은 노드 한 개를
+                # 완전히 처리한 뒤에야 평가된다. 기존 코드는 cur.fetchall()로 해당
+                # 노드의 모든 엣지를 한꺼번에 메모리에 올린 뒤 내부 for 루프를 끝까지
+                # 돌았고, 그 동안 limit 체크가 전혀 일어나지 않았다.
+                #
+                # 실측 영향 (bench_graph_backends.py, 2026-05-27):
+                #   - 20k 노드 (최고차수  98): d1 p50 =  0.37ms
+                #   - 43k 노드 (최고차수 615): d1 p50 = 11.86ms  ← 32× 급등
+                # "engineer", "persona", "pack" 같은 온톨로지 허브 개념이 43k 시점에서
+                # 차수 615에 도달하면서, 내부 루프가 ~1230회 _fetch_node_props SQL을
+                # 실행한 뒤에야 results가 50개를 채웠다. 데이터가 10× 늘면 허브 차수도
+                # 수천으로 커지므로 방치하면 선형 이상으로 열화된다.
+                #
+                # 수정 1 — SQL LIMIT (fetchall 행 수 자체를 줄임):
+                #   남은 슬롯(remaining = limit - len(results))만큼만 DB에서 가져온다.
+                #   차수 615 허브라도 아직 result가 0개면 615행이 아닌 최대 50행을 로드.
+                #   outgoing과 incoming 두 방향을 합산하므로 각 방향마다 remaining을
+                #   독립적으로 계산해 두 번째 방향에서도 과도한 로드를 막는다.
+                #
+                # 수정 2 — 내부 루프 break (pack 필터 통과율이 낮을 때 보완):
+                #   pack 필터가 엄격하면 fetchall로 가져온 remaining개 중 실제로
+                #   results에 추가되는 비율이 낮아질 수 있다. SQL LIMIT은 filtered-out
+                #   행 수를 예측할 수 없으므로, for 루프 안에서도 limit 도달 시 즉시 break.
+                #   두 guard의 역할:
+                #     SQL LIMIT → fetchall I/O·Python 객체 생성 비용 직접 절감
+                #     break    → 필터 손실분을 상쇄하는 추가 property 조회 방지
+                #
+                # 결과 집합의 결정론성:
+                #   Neo4j는 내부 인덱스 순서, SQLite는 엣지 삽입(upsert) 순서로
+                #   첫 N개를 반환한다. 두 모드 간 Jaccard ≈ 96.5%의 차이는 이 순서
+                #   차이에서 기인하며, reranker(RRF+BM25)가 최종 순위를 결정하므로
+                #   실검색 품질에 미치는 영향은 제한적이다.
+                remaining = limit - len(results)
+                if remaining > 0:
+                    cur.execute(
+                        "SELECT to_type, to_id, relation, properties"
+                        " FROM graph_edges WHERE from_id=? LIMIT ?",
+                        (current_id, remaining),
+                    )
+                    for row in cur.fetchall():
+                        if len(results) >= limit:
+                            break
+                        nid = row["to_id"]
+                        if nid in visited:
                             continue
-                        edge_props = self._parse_props(row["properties"])
-                        if not _edge_passes(edge_props, True, dst_pass, pack_set):
+                        dst_props = self._fetch_node_props(cur, row["to_type"], nid)
+                        if not dst_props:
                             continue
-                    visited.add(nid)
-                    results.append({
-                        "properties": dst_props,
-                        "labels": [row["to_type"]],
-                        "relation_type": row["relation"],
-                        "relationship_types": [row["relation"]],
-                        "depth": current_depth + 1,
-                    })
-                    queue.append((nid, current_depth + 1))
+                        if pack_set is not None:
+                            dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
+                            if not dst_pass:
+                                continue
+                            edge_props = self._parse_props(row["properties"])
+                            if not _edge_passes(edge_props, True, dst_pass, pack_set):
+                                continue
+                        visited.add(nid)
+                        results.append({
+                            "properties": dst_props,
+                            "labels": [row["to_type"]],
+                            "relation_type": row["relation"],
+                            "relationship_types": [row["relation"]],
+                            "depth": current_depth + 1,
+                        })
+                        queue.append((nid, current_depth + 1))
 
             # Incoming edges
             if direction in ("in", "both"):
-                cur.execute(
-                    "SELECT from_type, from_id, relation, properties FROM graph_edges WHERE to_id=?",
-                    (current_id,),
-                )
-                for row in cur.fetchall():
-                    nid = row["from_id"]
-                    if nid in visited:
-                        continue
-                    src_props = self._fetch_node_props(cur, row["from_type"], nid)
-                    if not src_props:
-                        continue
-                    if pack_set is not None:
-                        src_pass = _node_passes(src_props, pack_set, include_unpackaged)
-                        if not src_pass:
+                # outgoing과 동일한 2단계 수정. direction="both"일 때 outgoing이
+                # limit을 채운 경우에도 외부 while은 다음 반복 시작 시에야 확인하므로,
+                # incoming 블록 진입 전에 멈추지 않는다. remaining을 재계산해서 이미
+                # 슬롯이 소진된 경우에는 DB 쿼리 자체를 건너뛴다.
+                remaining = limit - len(results)
+                if remaining > 0:
+                    cur.execute(
+                        "SELECT from_type, from_id, relation, properties"
+                        " FROM graph_edges WHERE to_id=? LIMIT ?",
+                        (current_id, remaining),
+                    )
+                    for row in cur.fetchall():
+                        if len(results) >= limit:
+                            break
+                        nid = row["from_id"]
+                        if nid in visited:
                             continue
-                        edge_props = self._parse_props(row["properties"])
-                        if not _edge_passes(edge_props, src_pass, True, pack_set):
+                        src_props = self._fetch_node_props(cur, row["from_type"], nid)
+                        if not src_props:
                             continue
-                    visited.add(nid)
-                    results.append({
-                        "properties": src_props,
-                        "labels": [row["from_type"]],
-                        "relation_type": row["relation"],
-                        "relationship_types": [row["relation"]],
-                        "depth": current_depth + 1,
-                    })
-                    queue.append((nid, current_depth + 1))
+                        if pack_set is not None:
+                            src_pass = _node_passes(src_props, pack_set, include_unpackaged)
+                            if not src_pass:
+                                continue
+                            edge_props = self._parse_props(row["properties"])
+                            if not _edge_passes(edge_props, src_pass, True, pack_set):
+                                continue
+                        visited.add(nid)
+                        results.append({
+                            "properties": src_props,
+                            "labels": [row["from_type"]],
+                            "relation_type": row["relation"],
+                            "relationship_types": [row["relation"]],
+                            "depth": current_depth + 1,
+                        })
+                        queue.append((nid, current_depth + 1))
 
         return results[:limit]
 
