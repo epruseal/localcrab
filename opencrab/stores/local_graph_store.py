@@ -208,45 +208,72 @@ class LocalGraphStore:
 
             # Outgoing edges
             if direction in ("out", "both"):
-                cur.execute(
-                    "SELECT to_type, to_id, relation FROM graph_edges WHERE from_id=?",
-                    (current_id,),
-                )
-                for row in cur.fetchall():
-                    nid = row["to_id"]
-                    if nid not in visited:
-                        visited.add(nid)
-                        node = self._fetch_node_props(cur, row["to_type"], nid)
-                        if node:
-                            results.append({
-                                "properties": node,
-                                "labels": [row["to_type"]],
-                                "relation_type": row["relation"],
-                                "relationship_types": [row["relation"]],
-                                "depth": current_depth + 1,
-                            })
-                        queue.append((nid, current_depth + 1))
+                # [성능 수정] SQL LIMIT + 내부 루프 조기 종료 — 아래 주석 참고
+                remaining = limit - len(results)
+                if remaining > 0:
+                    cur.execute(
+                        "SELECT to_type, to_id, relation FROM graph_edges"
+                        " WHERE from_id=? LIMIT ?",
+                        (current_id, remaining),
+                    )
+                    for row in cur.fetchall():
+                        # 외부 while의 len(results) < limit 조건은 노드 한 개를
+                        # 완전히 처리한 뒤에야 평가된다. 기존 fetchall()은 해당
+                        # 노드의 모든 엣지를 한꺼번에 로드하므로, 차수가 높은 허브
+                        # 노드(예: 수백~수천 개의 엣지를 가진 온톨로지 개념 노드)를
+                        # 처리할 때 limit에 도달한 이후에도 불필요한 _fetch_node_props
+                        # 쿼리가 계속 실행됐다.
+                        #
+                        # 두 단계 수정:
+                        #   1) SQL LIMIT ? — fetchall 자체가 반환하는 행 수를
+                        #      남은 슬롯(remaining)으로 제한해 불필요한 I/O를 줄인다.
+                        #   2) 내부 break — pack 필터 등으로 일부 행이 걸러지면
+                        #      remaining보다 적게 추가될 수 있으므로, 루프 안에서도
+                        #      limit 초과 시 즉시 중단해 추가 property 조회를 막는다.
+                        if len(results) >= limit:
+                            break
+                        nid = row["to_id"]
+                        if nid not in visited:
+                            visited.add(nid)
+                            node = self._fetch_node_props(cur, row["to_type"], nid)
+                            if node:
+                                results.append({
+                                    "properties": node,
+                                    "labels": [row["to_type"]],
+                                    "relation_type": row["relation"],
+                                    "relationship_types": [row["relation"]],
+                                    "depth": current_depth + 1,
+                                })
+                            queue.append((nid, current_depth + 1))
 
             # Incoming edges
             if direction in ("in", "both"):
-                cur.execute(
-                    "SELECT from_type, from_id, relation FROM graph_edges WHERE to_id=?",
-                    (current_id,),
-                )
-                for row in cur.fetchall():
-                    nid = row["from_id"]
-                    if nid not in visited:
-                        visited.add(nid)
-                        node = self._fetch_node_props(cur, row["from_type"], nid)
-                        if node:
-                            results.append({
-                                "properties": node,
-                                "labels": [row["from_type"]],
-                                "relation_type": row["relation"],
-                                "relationship_types": [row["relation"]],
-                                "depth": current_depth + 1,
-                            })
-                        queue.append((nid, current_depth + 1))
+                # direction="both"일 때 outgoing이 limit을 채운 경우에도 외부 while은
+                # 다음 반복 시작 시에야 조건을 확인하므로, incoming 블록 진입 자체를
+                # 막지 못한다. remaining을 재계산해 슬롯 소진 시 DB 쿼리를 건너뛴다.
+                remaining = limit - len(results)
+                if remaining > 0:
+                    cur.execute(
+                        "SELECT from_type, from_id, relation FROM graph_edges"
+                        " WHERE to_id=? LIMIT ?",
+                        (current_id, remaining),
+                    )
+                    for row in cur.fetchall():
+                        if len(results) >= limit:
+                            break
+                        nid = row["from_id"]
+                        if nid not in visited:
+                            visited.add(nid)
+                            node = self._fetch_node_props(cur, row["from_type"], nid)
+                            if node:
+                                results.append({
+                                    "properties": node,
+                                    "labels": [row["from_type"]],
+                                    "relation_type": row["relation"],
+                                    "relationship_types": [row["relation"]],
+                                    "depth": current_depth + 1,
+                                })
+                            queue.append((nid, current_depth + 1))
 
         return results[:limit]
 
