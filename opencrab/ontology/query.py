@@ -654,8 +654,7 @@ class HybridQuery:
         if isinstance(self._neo4j, LocalGraphStore):
             kw_lower = keyword.lower()
             search_fields = ["name", "description", "text", "title", "label", "summary"]
-            scan_limit = min(limit * 20, 50000)
-            candidate_rows = self._neo4j.export_nodes(limit=scan_limit)
+            candidate_rows = self._neo4j.export_nodes(limit=_BM25_NODE_LIMIT)
             results: list[dict[str, Any]] = []
             for row in candidate_rows:
                 props = row.get("props", {})
