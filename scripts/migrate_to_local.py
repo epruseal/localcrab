@@ -216,6 +216,11 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
 
         if kind == "file" and os.path.isfile(src):
             shutil.copy2(src, dst)
+            # WAL 모드에서 생성되는 -wal, -shm 파일도 함께 백업
+            for suffix in ["-wal", "-shm"]:
+                extra_src = src + suffix
+                if os.path.isfile(extra_src):
+                    shutil.copy2(extra_src, dst + suffix)
             console.print(f"  [green]백업[/green] {name} → {bak_name}")
             backed_up[src] = dst
         elif kind == "dir" and os.path.isdir(src):
@@ -588,11 +593,11 @@ def migrate_sql(
                     for row in rows:
                         row_dict = dict(zip(col_names, row))
                         try:
-                            sq_conn.execute(
+                            result = sq_conn.execute(
                                 text(f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"),  # noqa: S608
                                 row_dict,
                             )
-                            count += 1
+                            count += result.rowcount  # 실제 삽입된 행 수(0 또는 1)만 증가
                         except Exception as row_exc:
                             log.warning("행 삽입 실패 (%s): %s", tbl, row_exc)
                         progress.update(task, completed=count)

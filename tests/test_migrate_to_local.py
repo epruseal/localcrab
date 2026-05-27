@@ -217,27 +217,6 @@ class TestMigrateGraph:
 # ---------------------------------------------------------------------------
 
 class TestMigrateDocs:
-    def _make_mongo_db(
-        self,
-        nodes: list[dict],
-        sources: list[dict],
-        audit: list[dict],
-    ) -> MagicMock:
-        """pymongo db mock."""
-        def _cursor(docs: list[dict]) -> MagicMock:
-            c = MagicMock()
-            c.__iter__ = MagicMock(return_value=iter(docs))
-            c.sort = MagicMock(return_value=c)  # .sort() 체이닝
-            return c
-
-        db = MagicMock()
-        db.__getitem__ = MagicMock(side_effect=lambda name: {
-            "nodes":     _make_col(nodes),
-            "sources":   _make_col(sources),
-            "audit_log": _make_col(audit),
-        }[name])
-        return db
-
     def test_migrate_docs_mongo_to_local_doc_store(self, tmp_path: Path) -> None:
         """MongoDB → LocalDocStore 변환 로직 검증."""
         from opencrab.stores.local_doc_store import LocalDocStore
@@ -554,3 +533,90 @@ def _make_mongo_db_mock(
     db = MagicMock()
     db.__getitem__ = MagicMock(side_effect=lambda name: col_map[name])
     return db
+
+
+# ---------------------------------------------------------------------------
+# Test: migrate_sql — PostgreSQL → SQLite
+# ---------------------------------------------------------------------------
+
+class TestMigrateSQL:
+    def _make_src_engine(self, tmp_path: Path) -> Any:
+        """ontology_nodes 테이블 + 테스트 행을 포함한 SQLite in-memory 엔진."""
+        from sqlalchemy import create_engine, text
+
+        src_engine = create_engine("sqlite:///:memory:")
+        with src_engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE ontology_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    space TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    UNIQUE(space, node_id)
+                )
+            """))
+            conn.execute(text(
+                "INSERT INTO ontology_nodes(space, node_type, node_id) VALUES('test','Person','alice')"
+            ))
+        return src_engine
+
+    def test_migrate_sql_inserts_rows(self, tmp_path: Path) -> None:
+        """PostgreSQL 테이블 데이터를 SQLite로 복사한다."""
+        import logging
+        import sqlalchemy
+
+        src_engine = self._make_src_engine(tmp_path)
+        dst_path = str(tmp_path / "opencrab.db")
+
+        real_create_engine = sqlalchemy.create_engine
+
+        def _patched_create_engine(url, **kw):
+            if "postgresql" in str(url):
+                return src_engine
+            return real_create_engine(url, **kw)
+
+        with patch("sqlalchemy.create_engine", side_effect=_patched_create_engine):
+            result = mig.migrate_sql(
+                "postgresql://x/x", dst_path, logging.getLogger()
+            )
+
+        # ontology_nodes 에 최소 1개 이상 삽입됐는지 확인
+        from sqlalchemy import create_engine as ce, text as t
+        eng = ce(f"sqlite:///{dst_path}")
+        with eng.connect() as conn:
+            row = conn.execute(t("SELECT COUNT(*) FROM ontology_nodes")).fetchone()
+        assert row[0] >= 1
+
+        # 반환값 구조 확인
+        assert "tables" in result
+        assert result["tables"].get("ontology_nodes", 0) >= 1
+
+    def test_migrate_sql_duplicate_rows_not_counted(self, tmp_path: Path) -> None:
+        """중복 행은 count에 포함되지 않아야 한다 (INSERT OR IGNORE + rowcount)."""
+        import logging
+        import sqlalchemy
+
+        src_engine = self._make_src_engine(tmp_path)
+        dst_path = str(tmp_path / "dup_test.db")
+
+        real_create_engine = sqlalchemy.create_engine
+
+        def _patched_create_engine(url, **kw):
+            if "postgresql" in str(url):
+                return src_engine
+            return real_create_engine(url, **kw)
+
+        with patch("sqlalchemy.create_engine", side_effect=_patched_create_engine):
+            result1 = mig.migrate_sql(
+                "postgresql://x/x", dst_path, logging.getLogger()
+            )
+            result2 = mig.migrate_sql(
+                "postgresql://x/x", dst_path, logging.getLogger()
+            )
+
+        # 첫 번째 호출: 1개 삽입
+        assert result1["tables"].get("ontology_nodes", 0) >= 1
+        # 두 번째 호출: 중복이므로 INSERT OR IGNORE → rowcount=0 → count=0
+        assert result2["tables"].get("ontology_nodes", 0) == 0
