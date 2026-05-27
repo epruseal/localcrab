@@ -80,8 +80,21 @@ pip install -e ".[dev]"
 opencrab serve
 ```
 
-LocalCrab runs locally by default. It uses SQLite, JSON files, and a local
-Chroma persistent store under `./opencrab_data`.
+LocalCrab runs locally by default. It uses SQLite and a local Chroma
+persistent store under `./opencrab_data`.
+
+**Local mode store backends:**
+
+| Role | Backend | File |
+| --- | --- | --- |
+| Graph | `LocalGraphStore` (SQLite BFS) | `opencrab_data/graph.db` |
+| Document | `LocalSQLDocStore` (SQLite) | `opencrab_data/doc_store.db` |
+| Vector | ChromaStore (local PersistentClient) | `opencrab_data/chroma/` |
+| SQL | SQLStore (SQLite) | `opencrab_data/opencrab.db` |
+
+See [Architecture](./docs/ARCHITECTURE.md) for the design rationale and the
+[Phase 2 roadmap](./docs/ARCHITECTURE.md#phase-2-ladybugdb-graph-store) for
+the planned LadybugDB graph store replacement.
 
 **Docker backend (recommended for production use):**
 
@@ -160,6 +173,25 @@ Then connect from any MCP client:
 > Always set `STORAGE_MODE=docker` when using supergateway. Without it,
 > the server starts in local SQLite mode and Cypher-dependent tools return
 > empty results.
+
+## Migrating from Docker to Local Mode
+
+If you have existing data in the docker backend (Neo4j + MongoDB + PostgreSQL
++ HTTP Chroma) and want to migrate to local mode:
+
+```bash
+# Dry-run: check connections and data counts, no writes
+uv run python scripts/migrate_to_local.py --dry-run
+
+# Full migration (backs up existing local DB files first)
+uv run python scripts/migrate_to_local.py
+
+# Switch to local mode
+# Edit .env: STORAGE_MODE=local
+# Then: opencrab serve
+```
+
+See `scripts/migrate_to_local.py --help` for all options.
 
 ## CrabHarness
 
@@ -275,7 +307,7 @@ opencrab/
   ontology/       builder, query, identity, canonicalization, promotion, ReBAC
   execution/      workflow and approval runtime
   billing/        local usage hooks
-  stores/         Neo4j, Chroma, Mongo, SQL, and local adapters
+  stores/         Neo4j, Chroma, Mongo, SQL, LocalGraphStore, LocalSQLDocStore
   mcp/            MCP server and tool registry
 crabharness/
   crabharness/    mission planner, runtime, validation, promotion package builder
