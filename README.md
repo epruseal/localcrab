@@ -93,9 +93,16 @@ STORAGE_MODE=docker opencrab serve
 ```
 
 > Without `STORAGE_MODE=docker`, the graph store falls back to a SQLite-backed
-> `LocalGraphStore` which does not support Cypher queries (`run_cypher` returns
-> `[]`). Tools like `content_pack_list` and `ontology_query` require the Neo4j
-> backend to function correctly.
+> `LocalGraphStore`. All MCP tools — including `content_pack_list`,
+> `ontology_query`, `ontology_lever_simulate`, and `export` — are fully
+> supported in local mode via native SQLite queries.
+>
+> **SQLite version requirement:** Local mode uses `json_extract()` which
+> requires **SQLite 3.9.0 or later** (released 2015-10-14). The system SQLite
+> version must meet this minimum. Check with `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`.
+>
+> **Note:** `ontology_rebac_check` requires the Neo4j backend for graph-based
+> permission traversal and is not available in local mode.
 
 ### 3. Verify the grammar and query path
 

@@ -37,6 +37,14 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+# Runtime SQLite version note:
+#   LocalGraphStore (STORAGE_MODE=local) uses json_extract() which requires
+#   SQLite >= 3.9.0 (2015-10-14). Python's bundled sqlite3 module version can
+#   be checked with: python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+#   Raspberry Pi OS Bookworm ships SQLite 3.39.2 — well above the minimum.
+#   Python packages cannot express a sqlite3 version constraint directly;
+#   this note serves as the authoritative record of the requirement.
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
