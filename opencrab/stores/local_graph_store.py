@@ -88,6 +88,12 @@ _DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id)",
     "CREATE INDEX IF NOT EXISTS idx_edges_to   ON graph_edges(to_id)",
+    # pack_id 인덱스: content_pack_list의 GROUP BY와 pack 필터 쿼리(find_neighbors의
+    # _node_passes 등)가 properties JSON에서 pack_id를 반복 추출한다. 표현식 인덱스를
+    # 걸어두면 O(N) 전체 스캔이 O(log N)으로 줄어든다.
+    # json_extract는 SQLite 3.9.0+(2015)부터 지원 — pyproject.toml/README 참고.
+    "CREATE INDEX IF NOT EXISTS idx_nodes_pack"
+    " ON graph_nodes(json_extract(properties, '$.pack_id'))",
 ]
 
 
@@ -105,6 +111,25 @@ class LocalGraphStore:
         try:
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+
+            # WAL(Write-Ahead Logging) 모드 활성화:
+            #   기본 DELETE 모드는 쓰기 시 DB 파일 전체에 배타 잠금을 걸어
+            #   MCP 서버처럼 다중 스레드가 동시 접근하는 환경에서 읽기 지연을 유발한다.
+            #   WAL 모드는 reader-writer를 격리시켜 쓰기 중에도 읽기를 허용한다.
+            #
+            # synchronous=NORMAL:
+            #   기본 FULL은 매 트랜잭션마다 fsync를 두 번 호출한다. NORMAL은 WAL
+            #   체크포인트 시에만 fsync를 수행해 쓰기 처리량을 높인다.
+            #   NVMe SSD + 단일 머신 환경에서 전원 장애로 인한 WAL 손상 위험은
+            #   수용 가능한 수준이다 (OS가 WAL 파일을 fsync하지 않더라도 DB 파일
+            #   자체는 손상되지 않는다).
+            #
+            # 주의: WAL 모드 전환은 기존 DB에도 안전하게 적용된다. 단, DB 파일
+            #   옆에 <db>-wal, <db>-shm 파일이 생성되므로 백업 시 세 파일을 함께
+            #   복사해야 한다.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+
             cur = self._conn.cursor()
             for ddl in _DDL:
                 cur.execute(ddl)
@@ -451,6 +476,340 @@ class LocalGraphStore:
             cur.execute("SELECT COUNT(*) FROM graph_nodes")
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
+    # ------------------------------------------------------------------
+    # Extended operations — SQLite-native replacements for Cypher paths
+    #
+    # Neo4j 모드에서는 Cypher 쿼리로 처리하던 기능들이 LocalGraphStore의
+    # run_cypher() no-op 때문에 빈 결과를 반환했다. 아래 메서드들은 각 Cypher
+    # 쿼리에 해당하는 SQLite 등가 구현을 제공한다.
+    # ------------------------------------------------------------------
+
+    def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
+        """팩 목록 집계 — content_pack_list 도구의 SQLite 네이티브 구현.
+
+        Neo4j 모드에서 실행하던 Cypher:
+            MATCH (n:OpenCrabNode)
+            WITH n.pack_id AS pack_id, count(n) AS node_count,
+                 collect(DISTINCT coalesce(n.source_package_title, n.title, n.name, ''))[0]
+            WHERE node_count >= $min_nodes
+            RETURN pack_id, node_count, sample_title ORDER BY node_count DESC
+
+        SQLite 접근:
+            properties 컬럼의 JSON에서 json_extract로 pack_id를 추출해 GROUP BY.
+            sample_title은 세 필드(source_package_title > title > name) 우선순위로
+            COALESCE + MAX로 하나를 선택한다.
+            idx_nodes_pack 인덱스(DDL에서 생성)가 json_extract 추출 결과를 캐싱해
+            전체 스캔 없이 GROUP BY를 수행한다.
+
+        SQLite >= 3.9.0 필요 (json_extract 지원).
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                json_extract(properties, '$.pack_id') AS pack_id,
+                COUNT(*) AS node_count,
+                COALESCE(
+                    MAX(json_extract(properties, '$.source_package_title')),
+                    MAX(json_extract(properties, '$.title')),
+                    MAX(json_extract(properties, '$.name')),
+                    ''
+                ) AS sample_title
+            FROM graph_nodes
+            WHERE json_extract(properties, '$.pack_id') IS NOT NULL
+            GROUP BY json_extract(properties, '$.pack_id')
+            HAVING COUNT(*) >= ?
+            ORDER BY COUNT(*) DESC
+            """,
+            (min_nodes,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def find_by_relations(
+        self,
+        node_id: str,
+        relations: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """relation 타입 필터를 포함한 단순 1-홉 이웃 탐색.
+
+        lever_simulate()의 두 Cypher 쿼리를 대체한다:
+            MATCH (l {id: $lid})-[r:raises|lowers|stabilizes|optimizes]->(o)
+            RETURN properties(o), type(r), labels(o)[0]  LIMIT 20
+
+            MATCH (l {id: $lid})-[:affects]->(c)
+            RETURN properties(c), labels(c)[0]  LIMIT 10
+
+        또한 analyse()의 노드 타입 조회(get_node_by_id)와 달리 "엣지 타입이 특정
+        집합에 속하는 이웃만" 반환하는 용도로 사용한다.
+
+        find_neighbors()와 달리 BFS/깊이 없이 단순 1-홉만 수행하므로,
+        relation 집합이 좁을 때 훨씬 가볍다.
+
+        IN (?, ...) placeholders는 relations 길이에 따라 동적으로 생성한다.
+        SQL 인젝션 위험 없음 — 모두 바인딩 변수(?) 사용.
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        if not relations:
+            return []
+
+        cur = self._conn.cursor()
+        placeholders = ",".join("?" * len(relations))
+        results: list[dict[str, Any]] = []
+
+        if direction in ("out", "both"):
+            cur.execute(
+                f"SELECT to_type, to_id, relation FROM graph_edges"
+                f" WHERE from_id=? AND relation IN ({placeholders}) LIMIT ?",
+                (node_id, *relations, limit),
+            )
+            for row in cur.fetchall():
+                props = self._fetch_node_props(cur, row["to_type"], row["to_id"])
+                if props:
+                    results.append({
+                        "properties": props,
+                        "labels": [row["to_type"]],
+                        "relation_type": row["relation"],
+                    })
+
+        if direction in ("in", "both"):
+            remaining = limit - len(results)
+            if remaining > 0:
+                cur.execute(
+                    f"SELECT from_type, from_id, relation FROM graph_edges"
+                    f" WHERE to_id=? AND relation IN ({placeholders}) LIMIT ?",
+                    (node_id, *relations, remaining),
+                )
+                for row in cur.fetchall():
+                    props = self._fetch_node_props(cur, row["from_type"], row["from_id"])
+                    if props:
+                        results.append({
+                            "properties": props,
+                            "labels": [row["from_type"]],
+                            "relation_type": row["relation"],
+                        })
+
+        return results
+
+    def get_node_by_id(self, node_id: str) -> dict[str, Any] | None:
+        """id 프로퍼티로 노드를 찾는다 (PRIMARY KEY node_id와 동일, type 불문).
+
+        analyse()의 Cypher 노드 조회를 대체한다:
+            MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl, n.space AS space LIMIT 1
+
+        PRIMARY KEY는 (node_type, node_id) 쌍이지만, node_id 컬럼 자체도
+        idx_edges_from/to 인덱스와 관계없이 직접 LIMIT 1 조회가 빠르다.
+        타입을 모르는 상태에서 id만으로 찾아야 할 때 사용한다.
+
+        반환값: properties dict에 'node_type' 키가 추가된 형태
+            {"node_type": "Lever", "space": "...", "id": "...", ...}
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT node_type, properties FROM graph_nodes WHERE node_id=? LIMIT 1",
+            (node_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        props = json.loads(row["properties"])
+        props["node_type"] = row["node_type"]
+        return props
+
+    def export_nodes(
+        self,
+        pack_id: str | None = None,
+        limit: int = 500_000,
+    ) -> list[dict[str, Any]]:
+        """노드 전체를 export_neo4j_opencrab_ingest()가 기대하는 row 형식으로 반환.
+
+        Neo4j 모드에서 실행하던 Cypher:
+            MATCH (n)
+            WHERE $pack_id IS NULL OR n.pack_id = $pack_id OR ...
+            RETURN properties(n) AS props, labels(n) AS labels
+            LIMIT {node_limit}
+
+        SQLite 접근:
+            properties 컬럼(JSON 문자열)을 Python json.loads()로 파싱해 dict로 반환.
+            SQL json()/json_array() 함수(SQLite 3.38+ 필요)를 의도적으로 사용하지
+            않고 Python-side 파싱으로 대체해 버전 요구사항을 3.9.0+로 유지한다.
+
+            pack_id 필터는 json_extract로 처리한다. idx_nodes_pack 인덱스가 있으므로
+            pack_id가 지정된 경우 전체 스캔 없이 처리된다.
+
+        반환 형식: [{"props": dict, "labels": ["NodeType"]}, ...]
+            (_normalise_node()이 소비하는 형식과 동일)
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        cur = self._conn.cursor()
+        if pack_id:
+            cur.execute(
+                """
+                SELECT node_type, properties FROM graph_nodes
+                WHERE json_extract(properties, '$.pack_id') = ?
+                   OR json_extract(properties, '$.source')   = ?
+                   OR json_extract(properties, '$.source_id') = ?
+                LIMIT ?
+                """,
+                (pack_id, pack_id, pack_id, limit),
+            )
+        else:
+            cur.execute("SELECT node_type, properties FROM graph_nodes LIMIT ?", (limit,))
+        return [
+            {"props": json.loads(row["properties"]), "labels": [row["node_type"]]}
+            for row in cur.fetchall()
+        ]
+
+    def export_edges(
+        self,
+        pack_id: str | None = None,
+        limit: int = 1_000_000,
+    ) -> list[dict[str, Any]]:
+        """엣지 전체를 export_neo4j_opencrab_ingest()가 기대하는 row 형식으로 반환.
+
+        Neo4j 모드에서 실행하던 Cypher:
+            MATCH (a)-[r]->(b)
+            WHERE ($pack_id IS NULL OR a.pack_id=... OR b.pack_id=... OR r.pack_id=...)
+            RETURN properties(a), labels(a), properties(b), labels(b), properties(r), type(r)
+            LIMIT {edge_limit}
+
+        SQLite 접근:
+            graph_edges와 graph_nodes를 JOIN해 양 끝점의 properties까지 함께 가져온다.
+            properties 파싱은 Python json.loads()로 수행 — SQL json() 함수 미사용.
+
+            pack_id 필터 조건은 엣지 양쪽 끝점과 엣지 자체를 모두 검사한다(Neo4j
+            Cypher와 동일 의미). OR 연결이 많아 인덱스 활용이 어려울 수 있으므로
+            pack_id가 없는 전체 내보내기는 스캔으로 처리한다.
+
+        반환 형식: [{"source_props": dict, "source_labels": [...], ...}, ...]
+            (_normalise_edge()이 소비하는 형식과 동일)
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        cur = self._conn.cursor()
+        if pack_id:
+            cur.execute(
+                """
+                SELECT
+                    a.node_type AS _from_type, a.properties AS source_props_json,
+                    b.node_type AS _to_type,   b.properties AS target_props_json,
+                    e.properties AS rel_props_json, e.relation
+                FROM graph_edges e
+                JOIN graph_nodes a ON e.from_type=a.node_type AND e.from_id=a.node_id
+                JOIN graph_nodes b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+                WHERE json_extract(a.properties, '$.pack_id') = ?
+                   OR json_extract(a.properties, '$.source')   = ?
+                   OR json_extract(b.properties, '$.pack_id') = ?
+                   OR json_extract(b.properties, '$.source')   = ?
+                   OR json_extract(e.properties, '$.pack_id') = ?
+                LIMIT ?
+                """,
+                (pack_id, pack_id, pack_id, pack_id, pack_id, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    a.node_type AS _from_type, a.properties AS source_props_json,
+                    b.node_type AS _to_type,   b.properties AS target_props_json,
+                    e.properties AS rel_props_json, e.relation
+                FROM graph_edges e
+                JOIN graph_nodes a ON e.from_type=a.node_type AND e.from_id=a.node_id
+                JOIN graph_nodes b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        return [
+            {
+                "source_props":  json.loads(row["source_props_json"]),
+                "source_labels": [row["_from_type"]],
+                "target_props":  json.loads(row["target_props_json"]),
+                "target_labels": [row["_to_type"]],
+                "rel_props":     json.loads(row["rel_props_json"]),
+                "relation":      row["relation"],
+            }
+            for row in cur.fetchall()
+        ]
+
+    def upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> int:
+        """대량 노드 적재 — executemany + 단일 commit으로 per-op 대비 ~3× 빠름.
+
+        per-op upsert_node()는 매 호출마다 commit()을 수행해 NVMe SSD에서도
+        호출 수에 비례하는 fsync 오버헤드가 발생한다. 팩 적재처럼 수천 개를 한번에
+        넣을 때는 이 메서드로 executemany + 단일 commit을 사용한다.
+
+        기존 upsert_node()는 무변경 — 단건 API 호환성 유지.
+
+        각 node dict: {"node_type": str, "node_id": str, "properties": dict,
+                       "space_id": str | None}
+        반환: 처리된 노드 수.
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        params = [
+            (
+                n["node_type"],
+                n["node_id"],
+                n.get("space_id"),
+                json.dumps({**n.get("properties", {}), "id": n["node_id"]}),
+            )
+            for n in nodes
+        ]
+        cur = self._conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(node_type, node_id) DO UPDATE SET
+                space_id   = excluded.space_id,
+                properties = excluded.properties
+            """,
+            params,
+        )
+        self._conn.commit()
+        return len(params)
+
+    def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
+        """대량 엣지 적재 — upsert_nodes_batch()와 동일한 이유로 단일 commit 사용.
+
+        각 edge dict: {"from_type": str, "from_id": str, "relation": str,
+                       "to_type": str, "to_id": str, "properties": dict | None}
+        반환: 처리된 엣지 수.
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalGraphStore is not available.")
+        params = [
+            (
+                e["from_type"],
+                e["from_id"],
+                e["relation"],
+                e["to_type"],
+                e["to_id"],
+                json.dumps(e.get("properties") or {}),
+            )
+            for e in edges
+        ]
+        cur = self._conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
+                properties = excluded.properties
+            """,
+            params,
+        )
+        self._conn.commit()
+        return len(params)
 
     # ------------------------------------------------------------------
     # Internal helpers

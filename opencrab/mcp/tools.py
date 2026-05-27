@@ -957,8 +957,28 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     ctx = _get_context()
     graph = ctx["neo4j"]
     if not graph.available:
-        return {"error": "Neo4j unavailable"}
+        return {"error": "graph store unavailable"}
 
+    # LocalGraphStore는 run_cypher()가 no-op(항상 [])이므로 Cypher를 사용할 수 없다.
+    # 대신 LocalGraphStore.list_packs()가 동등한 SQL GROUP BY 집계를 제공한다.
+    # Neo4j 모드에서는 기존 Cypher 경로를 그대로 유지해 동작 변화를 최소화한다.
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    if isinstance(graph, LocalGraphStore):
+        rows = graph.list_packs(min_nodes)
+        # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
+        packs = []
+        for r in rows:
+            pid = r.get("pack_id") or ""
+            title = r.get("sample_title") or ""
+            display = title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
+            packs.append({
+                "pack_id":    pid,
+                "node_count": r["node_count"],
+                "title":      display or pid or "(no pack_id)",
+            })
+        return {"total": len(packs), "packs": packs}
+
+    # Neo4j 모드: 기존 Cypher 경로
     cypher = """
     MATCH (n:OpenCrabNode)
     WITH n.pack_id AS pack_id, count(n) AS node_count,

@@ -136,10 +136,19 @@ def export_neo4j_opencrab_ingest(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    params = {"pack_id": pack_id}
 
-    node_rows = neo4j_store.run_cypher(_node_query(node_limit), params)
-    edge_rows = neo4j_store.run_cypher(_edge_query(edge_limit), params)
+    # LocalGraphStore는 run_cypher()가 no-op이므로 항상 0 노드/0 엣지를 반환하고
+    # status="ok"로 거짓 성공 보고를 한다. 이를 방지하기 위해 LocalGraphStore 전용
+    # export_nodes() / export_edges() 메서드(SQLite 네이티브 JOIN 쿼리)로 분기한다.
+    # Neo4j 모드에서는 기존 Cypher 경로를 그대로 사용한다.
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    if isinstance(neo4j_store, LocalGraphStore):
+        node_rows = neo4j_store.export_nodes(pack_id, node_limit)
+        edge_rows = neo4j_store.export_edges(pack_id, edge_limit)
+    else:
+        params = {"pack_id": pack_id}
+        node_rows = neo4j_store.run_cypher(_node_query(node_limit), params)
+        edge_rows = neo4j_store.run_cypher(_edge_query(edge_limit), params)
 
     node_count = 0
     edge_count = 0
