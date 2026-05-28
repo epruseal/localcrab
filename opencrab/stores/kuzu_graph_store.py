@@ -406,26 +406,35 @@ class KuzuGraphStore:
         if not self._available:
             raise RuntimeError("KuzuGraphStore is not available.")
         r = self._conn.execute(
-            "MATCH (n:OntologyNode) RETURN n.props"
+            "MATCH (n:OntologyNode) RETURN n.node_id, n.props"
         )
         counts: dict[str, int] = {}
-        titles: dict[str, str] = {}
+        anchor_titles: dict[str, str] = {}
+        pkg_titles: dict[str, str] = {}
         while r.has_next():
-            props = _parse(r.get_next()[0])
+            row = r.get_next()
+            node_id, props = row[0], _parse(row[1])
             pid = props.get("pack_id")
             if not pid:
                 continue
             pid = str(pid)
             counts[pid] = counts.get(pid, 0) + 1
-            if pid not in titles:
-                titles[pid] = (
-                    props.get("source_package_title")
-                    or props.get("title")
-                    or props.get("name")
-                    or ""
-                )
+            # 1순위: pack_create anchor (node_id == "dataset:{pack_id}")
+            if node_id == f"dataset:{pid}":
+                t = props.get("title") or ""
+                if t:
+                    anchor_titles[pid] = t
+            # 2순위: source_package_title (외부 pack 로더)
+            if pid not in pkg_titles:
+                t = props.get("source_package_title") or ""
+                if t:
+                    pkg_titles[pid] = t
         return [
-            {"pack_id": pid, "node_count": cnt, "sample_title": titles.get(pid, "")}
+            {
+                "pack_id": pid,
+                "node_count": cnt,
+                "sample_title": anchor_titles.get(pid) or pkg_titles.get(pid) or "",
+            }
             for pid, cnt in sorted(counts.items(), key=lambda x: -x[1])
             if cnt >= min_nodes
         ]
