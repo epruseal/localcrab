@@ -199,28 +199,13 @@ class OntologyBuilder:
             "stores": {},
         }
 
-        # Resolve node types from Neo4j if available, else use space as type
-        from_type = _space_to_default_type(from_space)
-        to_type = _space_to_default_type(to_space)
-
-        if self._neo4j.available:
-            # Try to look up real node types
-            try:
-                result = self._neo4j.run_cypher(
-                    "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-                    {"id": from_id},
-                )
-                if result and result[0].get("lbl"):
-                    from_type = result[0]["lbl"]
-
-                result = self._neo4j.run_cypher(
-                    "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-                    {"id": to_id},
-                )
-                if result and result[0].get("lbl"):
-                    to_type = result[0]["lbl"]
-            except Exception:
-                pass  # use defaults
+        # Resolve real node types from whichever graph store is available.
+        # Both LocalGraphStore and Neo4jStore expose lookup_node_type(node_id),
+        # so local mode no longer flattens edge labels to a per-space default.
+        # Falls back to space defaults only when the lookup returns None.
+        lookup = getattr(self._neo4j, "lookup_node_type", None)
+        from_type = (lookup(from_id) if lookup else None) or _space_to_default_type(from_space)
+        to_type = (lookup(to_id) if lookup else None) or _space_to_default_type(to_space)
 
         # --- Neo4j write ---
         if self._neo4j.available:

@@ -305,6 +305,72 @@ class TestBillingHooksUnit:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# LocalGraphStore unit tests (uses on-disk SQLite under tmp_path)
+# ---------------------------------------------------------------------------
+
+
+class TestLocalGraphStore:
+    def _store(self, tmp_path):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        return LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+
+    def test_lookup_node_type_returns_actual_type(self, tmp_path):
+        store = self._store(tmp_path)
+        store.upsert_node("ChiefSupervisor", "kim_oo", {"name": "김OO"}, space_id="subject")
+        assert store.lookup_node_type("kim_oo") == "ChiefSupervisor"
+
+    def test_lookup_node_type_returns_none_for_missing(self, tmp_path):
+        store = self._store(tmp_path)
+        assert store.lookup_node_type("does_not_exist") is None
+
+    def test_builder_edge_preserves_real_node_type_in_local_mode(self, tmp_path):
+        """Regression: OntologyBuilder.add_edge used to flatten from_type/to_type
+        to per-space defaults in local mode (no Neo4j), so edges between two
+        Team nodes — or any subject-space pair other than the per-space
+        default — would end up with the default label on both ends and
+        graph traversal could not match the real types.
+
+        With the lookup_node_type method on LocalGraphStore (mirrored on
+        Neo4jStore), the builder now resolves the actual node_type from the
+        store and writes typed edges in either mode.
+        """
+        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.stores.local_doc_store import LocalDocStore
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.sql_store import SQLStore
+
+        graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+        doc = LocalDocStore(data_dir=str(tmp_path / "docs"))
+        sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
+        builder = OntologyBuilder(graph, doc, sql)
+
+        builder.add_node(
+            space="subject", node_type="Team", node_id="team_alpha",
+            properties={"name": "Team Alpha"},
+        )
+        builder.add_node(
+            space="resource", node_type="Document", node_id="doc_42",
+            properties={"title": "Sample Doc"},
+        )
+        builder.add_edge(
+            from_space="subject", from_id="team_alpha", relation="owns",
+            to_space="resource", to_id="doc_42",
+        )
+
+        # The edge should carry the real node_types (Team / Document),
+        # not the per-space defaults (User / Project).
+        import sqlite3
+        conn = sqlite3.connect(str(tmp_path / "graph.db"))
+        row = conn.execute(
+            "SELECT from_type, to_type FROM graph_edges "
+            "WHERE from_id='team_alpha' AND to_id='doc_42' AND relation='owns'"
+        ).fetchone()
+        conn.close()
+        assert row == ("Team", "Document")
+
+
 @INTEGRATION
 class TestNeo4jIntegration:
     @pytest.fixture

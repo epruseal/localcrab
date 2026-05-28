@@ -131,6 +131,23 @@ class LocalGraphStore:
         row = cur.fetchone()
         return json.loads(row["properties"]) if row else None
 
+    def lookup_node_type(self, node_id: str) -> str | None:
+        """Return the node_type for a node_id, or None if not found.
+
+        Used by OntologyBuilder to resolve real node types when writing edges,
+        so that edges preserve typed labels instead of falling back to a single
+        per-space default.
+        """
+        if not self._available or not self._conn:
+            return None
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT node_type FROM graph_nodes WHERE node_id=? LIMIT 1",
+            (node_id,),
+        )
+        row = cur.fetchone()
+        return row["node_type"] if row else None
+
     def delete_node(self, node_type: str, node_id: str) -> bool:
         if not self._available or not self._conn:
             raise RuntimeError("LocalGraphStore is not available.")
