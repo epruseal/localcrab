@@ -963,7 +963,8 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     # 대신 LocalGraphStore.list_packs()가 동등한 SQL GROUP BY 집계를 제공한다.
     # Neo4j 모드에서는 기존 Cypher 경로를 그대로 유지해 동작 변화를 최소화한다.
     from opencrab.stores.local_graph_store import LocalGraphStore
-    if isinstance(graph, LocalGraphStore):
+    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+    if isinstance(graph, (LocalGraphStore, KuzuGraphStore)):
         rows = graph.list_packs(min_nodes)
         # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
         packs = []

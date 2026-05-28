@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Storage mode: "local" (no Docker) or "docker" (full services)
     # ------------------------------------------------------------------
-    storage_mode: Literal["local", "docker"] = Field(
+    storage_mode: Literal["local", "docker", "kuzu"] = Field(
         default="local", alias="STORAGE_MODE"
     )
     local_data_dir: str = Field(default="/home/asdf/.openclaw/workspace/data/localcrab", alias="LOCAL_DATA_DIR")
@@ -86,7 +86,7 @@ class Settings(BaseSettings):
 
     @property
     def is_local(self) -> bool:
-        return self.storage_mode == "local"
+        return self.storage_mode in ("local", "kuzu")
 
     @property
     def sqlite_url(self) -> str:
