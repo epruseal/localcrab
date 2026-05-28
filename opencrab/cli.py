@@ -624,20 +624,18 @@ def export_neo4j_pack(
     node_limit: int,
     edge_limit: int,
 ) -> None:
-    """Export a verified Neo4j graph snapshot for an OpenCrab pack."""
+    """Export graph store snapshot to OpenCrab Pack v1 JSONL.
+
+    Works with all storage modes (local/kuzu/docker) via STORAGE_MODE env var.
+    """
     from opencrab.config import get_settings
     from opencrab.pack import export_neo4j_opencrab_ingest
-    from opencrab.stores.neo4j_store import Neo4jStore
+    from opencrab.stores.factory import make_graph_store
 
     cfg = get_settings()
-    neo4j = Neo4jStore(
-        uri=cfg.neo4j_uri,
-        user=cfg.neo4j_user,
-        password=cfg.neo4j_password,
-        database=cfg.neo4j_database,
-    )
+    graph = make_graph_store(cfg)
     status = export_neo4j_opencrab_ingest(
-        neo4j,
+        graph,
         output,
         pack_id=pack_id,
         node_limit=node_limit,
