@@ -142,7 +142,8 @@ def export_neo4j_opencrab_ingest(
     # export_nodes() / export_edges() 메서드(SQLite 네이티브 JOIN 쿼리)로 분기한다.
     # Neo4j 모드에서는 기존 Cypher 경로를 그대로 사용한다.
     from opencrab.stores.local_graph_store import LocalGraphStore
-    if isinstance(neo4j_store, LocalGraphStore):
+    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+    if isinstance(neo4j_store, (LocalGraphStore, KuzuGraphStore)):
         node_rows = neo4j_store.export_nodes(pack_id, node_limit)
         edge_rows = neo4j_store.export_edges(pack_id, edge_limit)
     else:

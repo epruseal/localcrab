@@ -651,7 +651,8 @@ class HybridQuery:
         # --- 로컬 모드: LocalGraphStore는 run_cypher()가 no-op이므로
         #     export_nodes() + Python-side 키워드 필터로 대체한다.
         from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
-        if isinstance(self._neo4j, LocalGraphStore):
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore  # noqa: PLC0415
+        if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore)):
             kw_lower = keyword.lower()
             search_fields = ["name", "description", "text", "title", "label", "summary"]
             candidate_rows = self._neo4j.export_nodes(limit=_BM25_NODE_LIMIT)
