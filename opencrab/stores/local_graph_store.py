@@ -497,8 +497,11 @@ class LocalGraphStore:
 
         SQLite 접근:
             properties 컬럼의 JSON에서 json_extract로 pack_id를 추출해 GROUP BY.
-            sample_title은 세 필드(source_package_title > title > name) 우선순위로
-            COALESCE + MAX로 하나를 선택한다.
+            sample_title 우선순위:
+              1) pack_create anchor 노드 (node_id = 'dataset:{pack_id}') 의 title
+              2) 외부 pack 로더가 부여한 source_package_title
+              anchor도 source_package_title도 없으면 빈 문자열 — content_pack_list가
+              display or pid 로직으로 pack_id를 표시한다.
             idx_nodes_pack 인덱스(DDL에서 생성)가 json_extract 추출 결과를 캐싱해
             전체 스캔 없이 GROUP BY를 수행한다.
 
@@ -513,9 +516,11 @@ class LocalGraphStore:
                 json_extract(properties, '$.pack_id') AS pack_id,
                 COUNT(*) AS node_count,
                 COALESCE(
+                    MAX(CASE
+                        WHEN node_id = 'dataset:' || json_extract(properties, '$.pack_id')
+                        THEN json_extract(properties, '$.title')
+                    END),
                     MAX(json_extract(properties, '$.source_package_title')),
-                    MAX(json_extract(properties, '$.title')),
-                    MAX(json_extract(properties, '$.name')),
                     ''
                 ) AS sample_title
             FROM graph_nodes
