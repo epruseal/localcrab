@@ -28,7 +28,7 @@ class TestToolDispatch:
     def test_tools_list_not_empty(self):
         from opencrab.mcp.tools import TOOLS
 
-        assert len(TOOLS) == 31  # 31 tools defined in Phase 5
+        assert len(TOOLS) == 33  # 33 tools: 31 Phase 5 + pack_create + pack_ingest
         names = [t["name"] for t in TOOLS]
         assert "ontology_manifest" in names
         assert "ontology_add_node" in names
@@ -306,7 +306,7 @@ class TestMCPServer:
         assert response["id"] == 2
         assert "tools" in response["result"]
         tools = response["result"]["tools"]
-        assert len(tools) == 31
+        assert len(tools) == 33
 
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({
