@@ -19,8 +19,13 @@ if TYPE_CHECKING:
 
 
 def make_graph_store(settings: Settings) -> Any:
-    """Return LocalGraphStore (local) or Neo4jStore (docker)."""
-    if settings.is_local:
+    """Return KuzuGraphStore (kuzu), LocalGraphStore (local), or Neo4jStore (docker)."""
+    if settings.storage_mode == "kuzu":
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+
+        db_path = os.path.join(settings.local_data_dir, "graph.kuzu")
+        return KuzuGraphStore(db_path=db_path)
+    elif settings.is_local:
         from opencrab.stores.local_graph_store import LocalGraphStore
 
         db_path = os.path.join(settings.local_data_dir, "graph.db")

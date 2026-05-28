@@ -120,7 +120,8 @@ class ImpactEngine:
         # LocalGraphStore 모드: run_cypher()가 no-op이므로 get_node_by_id()를 사용한다.
         #   get_node_by_id()는 node_id 컬럼 직접 조회로 Cypher와 동등한 결과를 제공한다.
         from opencrab.stores.local_graph_store import LocalGraphStore
-        _is_local = isinstance(self._neo4j, LocalGraphStore)
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+        _is_local = isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore))
 
         if self._neo4j.available:
             try:
@@ -258,7 +259,8 @@ class ImpactEngine:
         #   껍데기가 된다. find_by_relations()로 동일한 1-홉 + relation 필터 탐색을 수행한다.
         #   (find_neighbors()는 relation 타입 필터 기능이 없으므로 별도 메서드 사용)
         from opencrab.stores.local_graph_store import LocalGraphStore
-        _is_local = isinstance(self._neo4j, LocalGraphStore)
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+        _is_local = isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore))
 
         if self._neo4j.available:
             try:

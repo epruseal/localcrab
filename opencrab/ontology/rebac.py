@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from opencrab.grammar.validator import validate_rebac_permission
-from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
 
@@ -151,105 +150,57 @@ class ReBACEngine:
 
         rel_filter = "|".join(valid_relations)
 
-        # Direct check
-        if isinstance(self._neo4j, LocalGraphStore):
-            try:
-                neighbors = self._neo4j.find_neighbors(
-                    subject_id, direction="out", depth=1, limit=200
+        # Direct check — find_neighbors() is implemented by all store backends
+        try:
+            neighbors = self._neo4j.find_neighbors(
+                subject_id, direction="out", depth=1, limit=200
+            )
+            for nb in neighbors:
+                rel_type = nb.get("relation_type", "")
+                nb_id = nb.get("properties", {}).get("id")
+                if rel_type in valid_relations and nb_id == resource_id:
+                    return AccessDecision(
+                        granted=True,
+                        reason=f"Direct graph relationship [{rel_type}] found.",
+                        subject_id=subject_id,
+                        permission=permission,
+                        resource_id=resource_id,
+                        path=[subject_id, rel_type, resource_id],
+                    )
+        except Exception as exc:
+            logger.debug("ReBAC direct graph check error: %s", exc)
+
+        # Transitive check: subject → (member_of|manages) → group → permission → resource
+        try:
+            group_neighbors = self._neo4j.find_neighbors(
+                subject_id, direction="out", depth=1, limit=100
+            )
+            for gnb in group_neighbors:
+                if gnb.get("relation_type") not in ("member_of", "manages"):
+                    continue
+                group_id = gnb.get("properties", {}).get("id")
+                if not group_id:
+                    continue
+                resource_neighbors = self._neo4j.find_neighbors(
+                    group_id, direction="out", depth=1, limit=100
                 )
-                for nb in neighbors:
-                    rel_type = nb.get("relation_type", "")
-                    nb_id = nb.get("properties", {}).get("id")
-                    if rel_type in valid_relations and nb_id == resource_id:
+                for rnb in resource_neighbors:
+                    rel_type = rnb.get("relation_type", "")
+                    rnb_id = rnb.get("properties", {}).get("id")
+                    if rel_type in valid_relations and rnb_id == resource_id:
                         return AccessDecision(
                             granted=True,
-                            reason=f"Direct graph relationship [{rel_type}] found.",
+                            reason=(
+                                f"Transitive access via group '{group_id}' "
+                                f"with relation [{rel_type}]."
+                            ),
                             subject_id=subject_id,
                             permission=permission,
                             resource_id=resource_id,
-                            path=[subject_id, rel_type, resource_id],
+                            path=[subject_id, "member_of", str(group_id), rel_type, resource_id],
                         )
-            except Exception as exc:
-                logger.debug("ReBAC direct graph check error (local): %s", exc)
-        else:
-            cypher_direct = f"""
-                MATCH (s {{id: $sid}})-[r:{rel_filter}]->(res {{id: $rid}})
-                RETURN type(r) AS rel_type
-                LIMIT 1
-            """
-            try:
-                rows = self._neo4j.run_cypher(
-                    cypher_direct, {"sid": subject_id, "rid": resource_id}
-                )
-                if rows:
-                    return AccessDecision(
-                        granted=True,
-                        reason=f"Direct graph relationship [{rows[0]['rel_type']}] found.",
-                        subject_id=subject_id,
-                        permission=permission,
-                        resource_id=resource_id,
-                        path=[subject_id, rows[0]["rel_type"], resource_id],
-                    )
-            except Exception as exc:
-                logger.debug("ReBAC direct graph check error: %s", exc)
-
-        # Transitive check: subject → (member_of|manages) → group → permission → resource
-        if isinstance(self._neo4j, LocalGraphStore):
-            try:
-                group_neighbors = self._neo4j.find_neighbors(
-                    subject_id, direction="out", depth=1, limit=100
-                )
-                for gnb in group_neighbors:
-                    if gnb.get("relation_type") not in ("member_of", "manages"):
-                        continue
-                    group_id = gnb.get("properties", {}).get("id")
-                    if not group_id:
-                        continue
-                    resource_neighbors = self._neo4j.find_neighbors(
-                        group_id, direction="out", depth=1, limit=100
-                    )
-                    for rnb in resource_neighbors:
-                        rel_type = rnb.get("relation_type", "")
-                        rnb_id = rnb.get("properties", {}).get("id")
-                        if rel_type in valid_relations and rnb_id == resource_id:
-                            return AccessDecision(
-                                granted=True,
-                                reason=(
-                                    f"Transitive access via group '{group_id}' "
-                                    f"with relation [{rel_type}]."
-                                ),
-                                subject_id=subject_id,
-                                permission=permission,
-                                resource_id=resource_id,
-                                path=[subject_id, "member_of", str(group_id), rel_type, resource_id],
-                            )
-            except Exception as exc:
-                logger.debug("ReBAC transitive graph check error (local): %s", exc)
-        else:
-            cypher_transitive = f"""
-                MATCH (s {{id: $sid}})-[:member_of|manages]->(group)-[r:{rel_filter}]->(res {{id: $rid}})
-                RETURN type(r) AS rel_type, properties(group).id AS group_id
-                LIMIT 1
-            """
-            try:
-                rows = self._neo4j.run_cypher(
-                    cypher_transitive, {"sid": subject_id, "rid": resource_id}
-                )
-                if rows:
-                    group_id = rows[0].get("group_id", "group")
-                    return AccessDecision(
-                        granted=True,
-                        reason=(
-                            f"Transitive access via group '{group_id}' "
-                            f"with relation [{rows[0]['rel_type']}]."
-                        ),
-                        subject_id=subject_id,
-                        permission=permission,
-                        resource_id=resource_id,
-                        path=[subject_id, "member_of", str(group_id), rows[0]["rel_type"], resource_id],
-                    )
-            except Exception as exc:
-                logger.debug("ReBAC transitive graph check error: %s", exc)
+        except Exception as exc:
+            logger.debug("ReBAC transitive graph check error: %s", exc)
 
         return None
 
