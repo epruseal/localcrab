@@ -207,8 +207,8 @@ class OntologyBuilder:
         if self._neo4j.available:
             # Try to look up real node types
             try:
-                if isinstance(self._neo4j, LocalGraphStore):
-                    # 로컬 모드: get_node_by_id() 사용 (run_cypher no-op 우회)
+                from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+                if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore)):
                     node_info = self._neo4j.get_node_by_id(from_id)
                     if node_info and node_info.get("node_type"):
                         from_type = node_info["node_type"]
