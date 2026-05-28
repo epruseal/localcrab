@@ -18,7 +18,9 @@ Tools:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -1161,8 +1163,247 @@ def harness_promotion_apply(
 
 
 # ---------------------------------------------------------------------------
+# Pack helpers (no server-side LLM — caller supplies structured nodes/edges)
+# ---------------------------------------------------------------------------
+
+
+def _slugify(text: str) -> str:
+    """Generate a URL-safe pack_id slug from a title string."""
+    text = _clean_str(text).lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = text.strip("-")
+    return text or "pack"
+
+
+def _nine_space_hint() -> str:
+    """Build a concise 9-space grammar summary from manifest.SPACES."""
+    try:
+        from opencrab.grammar.manifest import SPACES
+        lines = [
+            "9-Space MetaOntology grammar (`space` + `node_type` values):",
+        ]
+        for space_id, spec in SPACES.items():
+            types = ", ".join(spec.get("node_types", []))
+            desc = spec.get("description", "")
+            lines.append(f"  {space_id:<10} — {desc}: {types}")
+        lines.append(
+            "For valid edge relations between spaces, call ontology_manifest."
+        )
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _ingest_into_pack(
+    pack_id: str,
+    *,
+    nodes: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    text: str | None = None,
+    source_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM."""
+    ctx = _get_context()
+    added_nodes = 0
+    added_edges = 0
+    node_errors: list[str] = []
+    edge_errors: list[str] = []
+    stores: dict[str, Any] = {}
+
+    for item in nodes or []:
+        try:
+            props = dict(_clean_meta(item.get("properties") or {}))
+            props["pack_id"] = pack_id
+            ctx["builder"].add_node(
+                space=_clean_str(item.get("space", "")),
+                node_type=_clean_str(item.get("node_type", "")),
+                node_id=_clean_str(item.get("node_id", "")),
+                properties=props,
+            )
+            added_nodes += 1
+        except Exception as exc:
+            node_errors.append(f"{item.get('node_id', '?')}: {exc}")
+
+    for item in edges or []:
+        try:
+            props = dict(_clean_meta(item.get("properties") or {}))
+            props["pack_id"] = pack_id
+            ctx["builder"].add_edge(
+                from_space=_clean_str(item.get("from_space", "")),
+                from_id=_clean_str(item.get("from_id", "")),
+                relation=_clean_str(item.get("relation", "")),
+                to_space=_clean_str(item.get("to_space", "")),
+                to_id=_clean_str(item.get("to_id", "")),
+                properties=props,
+            )
+            added_edges += 1
+        except Exception as exc:
+            edge_errors.append(
+                f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
+            )
+
+    text_ingested = False
+    if text and source_id:
+        text = _clean_str(text)
+        meta = _clean_meta(metadata or {})
+        meta["pack_id"] = pack_id
+        try:
+            vector_result = ctx["hybrid"].ingest(
+                text=text, source_id=source_id, metadata=meta
+            )
+            stores.update(vector_result.get("stores", {}))
+        except Exception as exc:
+            stores["chromadb"] = f"error: {exc}"
+        if ctx["mongo"].available:
+            try:
+                ctx["mongo"].upsert_source(source_id, text, meta)
+                stores["mongodb"] = "ok"
+            except Exception as exc:
+                stores["mongodb"] = f"error: {exc}"
+        else:
+            stores["mongodb"] = "unavailable"
+        text_ingested = True
+
+    ctx["hybrid"].invalidate_bm25_cache()
+
+    return {
+        "pack_id": pack_id,
+        "added_nodes": added_nodes,
+        "added_edges": added_edges,
+        "node_errors": node_errors,
+        "edge_errors": edge_errors,
+        "stores": stores,
+        "text_ingested": text_ingested,
+    }
+
+
+def pack_create(
+    title: str,
+    pack_id: str | None = None,
+    description: str | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    text: str | None = None,
+) -> dict[str, Any]:
+    """
+    Create a new localcrab ontology pack and ingest content into it.
+
+    Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
+    pack_id is auto-slugged from title unless explicitly provided.
+    Optional text is embedded locally via ChromaDB (no external API).
+    """
+    slug = _clean_str(pack_id) if pack_id else _slugify(title)
+    if not slug:
+        return {"error": "Could not derive a valid pack_id from title."}
+
+    existing = content_pack_list()
+    existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
+    if slug in existing_ids:
+        return {
+            "error": "pack already exists",
+            "pack_id": slug,
+            "hint": "use pack_ingest to add more content",
+        }
+
+    ctx = _get_context()
+    anchor_node_id = f"dataset:{slug}"
+    try:
+        ctx["builder"].add_node(
+            space="resource",
+            node_type="Dataset",
+            node_id=anchor_node_id,
+            properties={
+                "pack_id": slug,
+                "title": _clean_str(title),
+                "description": _clean_str(description or ""),
+                "created_by": "localcrab-mcp",
+            },
+        )
+    except Exception as exc:
+        return {"error": f"anchor node failed: {exc}"}
+
+    source_id: str | None = None
+    if text:
+        digest = hashlib.sha1(
+            (_clean_str(title) + _clean_str(text)).encode("utf-8", errors="replace")
+        ).hexdigest()[:12]
+        source_id = f"{slug}:doc:{digest}"
+
+    ingest_result = _ingest_into_pack(
+        slug,
+        nodes=nodes,
+        edges=edges,
+        text=text,
+        source_id=source_id,
+        metadata={"title": _clean_str(title), "source": "pack_create"},
+    )
+
+    return {
+        "status": "ok",
+        "pack_id": slug,
+        "title": _clean_str(title),
+        "anchor_node": anchor_node_id,
+        **ingest_result,
+    }
+
+
+def pack_ingest(
+    pack_id: str,
+    nodes: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    text: str | None = None,
+    title: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Add content into an EXISTING localcrab ontology pack.
+
+    Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
+    Optional text is embedded locally via ChromaDB (no external API).
+    Fails if the pack does not exist — use pack_create first.
+    """
+    pack_id = _clean_str(pack_id)
+
+    existing = content_pack_list()
+    existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
+    if pack_id not in existing_ids:
+        return {
+            "error": "pack not found; use pack_create first",
+            "pack_id": pack_id,
+        }
+
+    if not (nodes or edges or text):
+        return {
+            "error": "no content provided: supply at least one of nodes, edges, or text"
+        }
+
+    sid = source_id
+    if text and not sid:
+        digest = hashlib.sha1(
+            (_clean_str(title or "") + _clean_str(text)).encode(
+                "utf-8", errors="replace"
+            )
+        ).hexdigest()[:12]
+        sid = f"{pack_id}:doc:{digest}"
+
+    ingest_result = _ingest_into_pack(
+        pack_id,
+        nodes=nodes,
+        edges=edges,
+        text=text,
+        source_id=sid,
+        metadata={"title": _clean_str(title or ""), "source": "pack_ingest"},
+    )
+
+    return {"status": "ok", "pack_id": pack_id, **ingest_result}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry (used by the MCP server for tools/list)
 # ---------------------------------------------------------------------------
+
+_NINE_SPACE_HINT: str = _nine_space_hint()
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "ontology_manifest": {
@@ -1676,6 +1917,130 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["name"],
         },
     },
+    # ------------------------------------------------------------------
+    # Pack create / pack ingest (no server-side LLM)
+    # ------------------------------------------------------------------
+    "pack_create": {
+        "description": (
+            "Create a new localcrab ontology pack and ingest content into it. "
+            "Caller supplies pre-extracted nodes/edges (same shape as ontology_add_node/ontology_add_edge); "
+            "the server does NOT call any LLM. pack_id is auto-slugged from title unless provided. "
+            "Optional `text` is embedded locally into the vector/doc store (no external API).\n\n"
+            + _NINE_SPACE_HINT
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable pack title (also used to auto-generate pack_id if not provided).",
+                },
+                "pack_id": {
+                    "type": "string",
+                    "description": "Optional explicit pack_id slug. Auto-slugged from title if omitted.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional pack description stored on the anchor node.",
+                },
+                "nodes": {
+                    "type": "array",
+                    "description": "Pre-extracted ontology nodes to add to the pack.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "space": {"type": "string", "description": "MetaOntology space (e.g. 'concept', 'resource')."},
+                            "node_type": {"type": "string", "description": "Node type within the space (e.g. 'Entity', 'Document')."},
+                            "node_id": {"type": "string", "description": "Stable unique identifier."},
+                            "properties": {"type": "object", "description": "Arbitrary key/value node properties."},
+                        },
+                        "required": ["space", "node_type", "node_id"],
+                    },
+                },
+                "edges": {
+                    "type": "array",
+                    "description": "Pre-extracted ontology edges to add to the pack.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from_space": {"type": "string"},
+                            "from_id": {"type": "string"},
+                            "relation": {"type": "string", "description": "Relation label (call ontology_manifest for valid relations per space pair)."},
+                            "to_space": {"type": "string"},
+                            "to_id": {"type": "string"},
+                            "properties": {"type": "object"},
+                        },
+                        "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
+                    },
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Optional raw text to embed locally into the vector/doc store (no LLM, local ONNX embedding).",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    "pack_ingest": {
+        "description": (
+            "Add content into an EXISTING localcrab ontology pack. "
+            "Caller supplies pre-extracted nodes/edges and/or raw text; the server does NOT call any LLM. "
+            "Fails if the pack does not exist — use pack_create first.\n\n"
+            + _NINE_SPACE_HINT
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack_id": {
+                    "type": "string",
+                    "description": "Existing pack_id to add content into.",
+                },
+                "nodes": {
+                    "type": "array",
+                    "description": "Pre-extracted ontology nodes to add.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "space": {"type": "string"},
+                            "node_type": {"type": "string"},
+                            "node_id": {"type": "string"},
+                            "properties": {"type": "object"},
+                        },
+                        "required": ["space", "node_type", "node_id"],
+                    },
+                },
+                "edges": {
+                    "type": "array",
+                    "description": "Pre-extracted ontology edges to add.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from_space": {"type": "string"},
+                            "from_id": {"type": "string"},
+                            "relation": {"type": "string"},
+                            "to_space": {"type": "string"},
+                            "to_id": {"type": "string"},
+                            "properties": {"type": "object"},
+                        },
+                        "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
+                    },
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Optional raw text to embed locally into the vector/doc store (no LLM).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional document title (stored as metadata).",
+                },
+                "source_id": {
+                    "type": "string",
+                    "description": "Optional stable source identifier for the text document. Auto-generated from title+text hash if omitted.",
+                },
+            },
+            "required": ["pack_id"],
+        },
+    },
 }
 
 # Callable map
@@ -1713,6 +2078,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "schema_pack_list": schema_pack_list,
     "schema_pack_install": schema_pack_install,
     "schema_pack_uninstall": schema_pack_uninstall,
+    "pack_create": pack_create,
+    "pack_ingest": pack_ingest,
 }
 
 # Combined tool descriptor list (name + schema)
