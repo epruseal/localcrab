@@ -981,14 +981,20 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
             })
         return {"total": len(packs), "packs": packs}
 
-    # Neo4j 모드: 기존 Cypher 경로
+    # Neo4j 모드: anchor 우선 + source_package_title 폴백
     cypher = """
     MATCH (n:OpenCrabNode)
+    WHERE n.pack_id IS NOT NULL
     WITH n.pack_id AS pack_id, count(n) AS node_count,
-         collect(DISTINCT
-             coalesce(n.source_package_title, n.title, n.name, '')
-         )[0] AS sample_title
+         collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.title ELSE null END) AS anchor_titles,
+         collect(n.source_package_title) AS pkg_titles
     WHERE node_count >= $min_nodes
+    WITH pack_id, node_count,
+         coalesce(
+             [t IN anchor_titles WHERE t IS NOT NULL AND t <> ''][0],
+             [t IN pkg_titles  WHERE t IS NOT NULL AND t <> ''][0],
+             ''
+         ) AS sample_title
     RETURN pack_id, node_count, sample_title
     ORDER BY node_count DESC
     """
