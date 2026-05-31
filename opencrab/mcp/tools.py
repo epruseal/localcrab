@@ -76,7 +76,7 @@ def _get_context() -> dict[str, Any]:
     docs = make_doc_store(cfg)
     sql = make_sql_store(cfg)
 
-    builder = OntologyBuilder(graph, docs, sql)
+    builder = OntologyBuilder(graph, docs, sql, vec=vector)
     rebac = ReBACEngine(graph, sql)
     impact = ImpactEngine(graph, sql)
     hybrid = HybridQuery(vector, graph)
