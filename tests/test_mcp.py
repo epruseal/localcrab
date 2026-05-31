@@ -28,16 +28,36 @@ class TestToolDispatch:
     def test_tools_list_not_empty(self):
         from opencrab.mcp.tools import TOOLS
 
-        assert len(TOOLS) == 33  # 33 tools: 31 Phase 5 + pack_create + pack_ingest
+        # 16 exposed tools after reorder + dedup + 3 new READ tools.
+        # 비노출(주석처리): query_bm25, rebac, workflow×2, approval, billing×2,
+        #   identity×5, canonicalize×2, promotion×4, ontology_extract, ontology_ingest
+        assert len(TOOLS) == 16
         names = [t["name"] for t in TOOLS]
+        # Core exposed
         assert "ontology_manifest" in names
         assert "ontology_add_node" in names
         assert "ontology_add_edge" in names
         assert "ontology_query" in names
         assert "ontology_impact" in names
-        assert "ontology_rebac_check" in names
         assert "ontology_lever_simulate" in names
-        assert "ontology_ingest" in names
+        assert "harness_promotion_apply" in names
+        assert "pack_create" in names
+        assert "pack_ingest" in names
+        assert "content_pack_list" in names
+        # New READ tools
+        assert "ontology_get_node" in names
+        assert "ontology_list_nodes" in names
+        assert "ontology_list_edges" in names
+        # Soft-removed (비노출): functions importable but not dispatched
+        assert "query_bm25" not in names
+        assert "ontology_rebac_check" not in names
+        assert "ontology_ingest" not in names
+        assert "ontology_extract" not in names
+        assert "identity_add_alias" not in names
+        assert "promotion_promote" not in names
+        assert "billing_get_usage" not in names
+        assert "workflow_create_run" not in names
+        assert "approval_request" not in names
 
     def test_tools_have_required_schema_keys(self):
         from opencrab.mcp.tools import TOOLS
@@ -188,27 +208,15 @@ class TestToolDispatch:
             assert result["node_id"] == "n1"
             assert len(result["triggered_impacts"]) == 1
 
-    def test_ontology_rebac_check_granted(self):
-        from opencrab.mcp.tools import dispatch_tool
-        from opencrab.ontology.rebac import AccessDecision
+    def test_ontology_rebac_check_not_exposed_via_mcp(self):
+        """ontology_rebac_check는 MCP 비노출 (현재 워크플로 미사용). 함수 본체는 보존."""
+        from opencrab.mcp.tools import dispatch_tool, ontology_rebac_check  # noqa: F401
 
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            decision = AccessDecision(
-                granted=True, reason="Direct graph relationship",
-                subject_id="u1", permission="view", resource_id="doc1"
-            )
-            rebac = MagicMock()
-            rebac.check.return_value = decision
-            mock_ctx.return_value = {
-                "builder": MagicMock(), "rebac": rebac,
-                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
-            }
-            result = dispatch_tool("ontology_rebac_check", {
+        assert callable(ontology_rebac_check)
+        with pytest.raises(KeyError, match="Unknown tool"):
+            dispatch_tool("ontology_rebac_check", {
                 "subject_id": "u1", "permission": "view", "resource_id": "doc1"
             })
-            assert result["granted"] is True
-            assert "Direct graph" in result["reason"]
 
     def test_ontology_lever_simulate(self):
         from opencrab.mcp.tools import dispatch_tool
@@ -230,32 +238,192 @@ class TestToolDispatch:
             assert result["lever_id"] == "lev1"
             assert result["confidence"] == 0.86
 
-    def test_ontology_ingest_success(self):
+    def test_ontology_ingest_not_exposed_via_mcp(self):
+        """ontology_ingest is no longer dispatched via MCP (pack_ingest로 일원화).
+        Function body is retained in tools.py but removed from _TOOL_FUNCTIONS."""
+        from opencrab.mcp.tools import dispatch_tool, ontology_ingest  # noqa: F401
+
+        # Function body must still be importable (code preserved)
+        assert callable(ontology_ingest)
+
+        # MCP dispatch must raise (not in _TOOL_FUNCTIONS)
+        with pytest.raises(KeyError, match="Unknown tool"):
+            dispatch_tool("ontology_ingest", {"text": "t", "source_id": "s"})
+
+    def test_ontology_extract_not_exposed_via_mcp(self):
+        """ontology_extract is no longer dispatched via MCP.
+        Function body is retained in tools.py but removed from _TOOL_FUNCTIONS."""
+        from opencrab.mcp.tools import dispatch_tool, ontology_extract  # noqa: F401
+
+        assert callable(ontology_extract)
+        with pytest.raises(KeyError, match="Unknown tool"):
+            dispatch_tool("ontology_extract", {"text": "t", "source_id": "s"})
+
+    def test_pack_ingest_text_creates_evidence_node(self):
+        """pack_ingest with text materialises an evidence/TextUnit node via builder.add_node."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            builder = MagicMock()
+            hybrid = MagicMock()
+            hybrid.invalidate_bm25_cache = MagicMock()
+            mongo = MagicMock()
+            mongo.available = False
+            mock_ctx.return_value = {
+                "builder": builder,
+                "hybrid": hybrid,
+                "mongo": mongo,
+                "rebac": MagicMock(),
+                "impact": MagicMock(),
+                "billing": MagicMock(),
+            }
+            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
+
+            result = dispatch_tool("pack_ingest", {
+                "pack_id": "test-pack",
+                "text": "대화 중 발생한 인사이트.",
+                "title": "conv-2026-05-31",
+            })
+
+            assert result["status"] == "ok"
+            assert result["evidence_node"] is not None
+            assert result["added_nodes"] == 1
+
+            # builder.add_node must have been called with evidence/TextUnit
+            call_kwargs = builder.add_node.call_args
+            assert call_kwargs is not None
+            args = call_kwargs[1] if call_kwargs[1] else {}
+            if not args:
+                args = {
+                    "space": call_kwargs[0][0],
+                    "node_type": call_kwargs[0][1],
+                    "node_id": call_kwargs[0][2],
+                }
+            assert builder.add_node.call_args.kwargs.get("space") == "evidence" or \
+                   builder.add_node.call_args[0][0] == "evidence"
+            assert builder.add_node.call_args.kwargs.get("node_type") == "TextUnit" or \
+                   builder.add_node.call_args[0][1] == "TextUnit"
+
+            # hybrid.ingest must NOT have been called (text_as_node=True skips vector-only path)
+            hybrid.ingest.assert_not_called()
+
+    def test_pack_ingest_text_as_node_false_legacy(self):
+        """pack_ingest with text_as_node=False uses legacy vector-only path."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            builder = MagicMock()
+            hybrid = MagicMock()
+            hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
+            hybrid.invalidate_bm25_cache = MagicMock()
+            mongo = MagicMock()
+            mongo.available = False
+            mock_ctx.return_value = {
+                "builder": builder,
+                "hybrid": hybrid,
+                "mongo": mongo,
+                "rebac": MagicMock(),
+                "impact": MagicMock(),
+                "billing": MagicMock(),
+            }
+            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
+
+            result = dispatch_tool("pack_ingest", {
+                "pack_id": "test-pack",
+                "text": "레거시 벡터 경로 테스트.",
+                "text_as_node": False,
+            })
+
+            assert result["status"] == "ok"
+            assert result["evidence_node"] is None
+            # legacy path: hybrid.ingest called, builder.add_node NOT called for text
+            hybrid.ingest.assert_called_once()
+            builder.add_node.assert_not_called()
+
+
+    def test_ontology_get_node_found(self):
+        """ontology_get_node returns found=True when graph store returns a node."""
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            hybrid = MagicMock()
-            hybrid.ingest.return_value = {
-                "source_id": "src1",
-                "stores": {"chromadb": "ok (id=src1)"},
-                "vector_id": "src1",
+            graph = MagicMock()
+            graph.get_node_by_id.return_value = {
+                "node_id": "dataset:test", "node_type": "Dataset",
+                "space": "resource", "pack_id": "test",
             }
-            mongo = MagicMock()
-            mongo.available = True
-            mongo.upsert_source.return_value = "mongo-id-1"
             mock_ctx.return_value = {
-                "builder": MagicMock(), "rebac": MagicMock(),
-                "impact": MagicMock(), "hybrid": hybrid, "mongo": mongo,
-                "billing": MagicMock(),
+                "neo4j": graph, "builder": MagicMock(), "hybrid": MagicMock(),
+                "mongo": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
             }
-            result = dispatch_tool("ontology_ingest", {
-                "text": "This is a test document about ontologies.",
-                "source_id": "src1",
-                "metadata": {"space": "evidence"},
-            })
-            assert result["source_id"] == "src1"
-            assert "chromadb" in result["stores"]
-            assert result["text_length"] > 0
+            result = dispatch_tool("ontology_get_node", {"node_id": "dataset:test"})
+            assert result["found"] is True
+            assert result["node_id"] == "dataset:test"
+            assert "node" in result
+
+    def test_ontology_get_node_not_found(self):
+        """ontology_get_node returns found=False when node does not exist."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            graph.get_node_by_id.return_value = None
+            mock_ctx.return_value = {
+                "neo4j": graph, "builder": MagicMock(), "hybrid": MagicMock(),
+                "mongo": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool("ontology_get_node", {"node_id": "nonexistent"})
+            assert result["found"] is False
+
+    def test_ontology_list_nodes_pack_filter(self):
+        """ontology_list_nodes filters by pack_id in Python."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            # pack_id 있을 때는 graph.export_nodes(pack_id=...) 경로 사용
+            # (limit-before-filter 버그 회피용 인덱스 쿼리)
+            graph = MagicMock()
+            graph.export_nodes.return_value = [
+                {"props": {"node_id": "n1", "pack_id": "pack-a", "space": "evidence"}, "labels": ["TextUnit"]},
+                {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
+            ]
+            mongo = MagicMock()
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": mongo, "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool("ontology_list_nodes", {"pack_id": "pack-a"})
+            assert result["total"] == 2
+            assert result["pack_id_filter"] == "pack-a"
+            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100)
+            mongo.list_nodes.assert_not_called()  # doc store는 pack_id 있을 때 사용 안 함
+
+    def test_ontology_list_edges_local_backend(self):
+        """ontology_list_edges uses export_edges on Local/Kuzu backends."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            graph.export_edges.return_value = [
+                {"from_id": "n1", "relation": "related_to", "to_id": "n2"},
+            ]
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": MagicMock(), "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool("ontology_list_edges", {"pack_id": "test-pack"})
+            assert result["total"] == 1
+            assert result["pack_id_filter"] == "test-pack"
+            graph.export_edges.assert_called_once_with(pack_id="test-pack", limit=200)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +474,7 @@ class TestMCPServer:
         assert response["id"] == 2
         assert "tools" in response["result"]
         tools = response["result"]["tools"]
-        assert len(tools) == 33
+        assert len(tools) == 16  # 재정렬 후 16개 (비노출 주석처리 + READ 3개 신규)
 
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({

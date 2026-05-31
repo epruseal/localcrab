@@ -916,19 +916,22 @@ MCP_TOOLS = [
             "required": ["question"],
         },
     },
-    {
-        "name": "ontology_ingest",
-        "description": "Ingest text into the ontology vector and graph stores",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "source_id": {"type": "string"},
-                "metadata": {"type": "object"},
-            },
-            "required": ["text"],
-        },
-    },
+    # Not advertised — superseded by pack_ingest(text_as_node) for grammar-compliant
+    # evidence/TextUnit node materialisation.  Handler code retained below.
+    # Re-add this dict entry to re-expose. (비노출: pack_ingest로 일원화)
+    # {
+    #     "name": "ontology_ingest",
+    #     "description": "Ingest text into the ontology vector and graph stores",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "text": {"type": "string"},
+    #             "source_id": {"type": "string"},
+    #             "metadata": {"type": "object"},
+    #         },
+    #         "required": ["text"],
+    #     },
+    # },
     {
         "name": "ontology_manifest",
         "description": "Return the full MetaOntology grammar: spaces, relations, impact categories",
@@ -1006,6 +1009,10 @@ async def _mcp_dispatch(tool_name: str, args: dict[str, Any], auth: AuthContext,
         )
         return result if isinstance(result, dict) else {"results": result}
 
+    # Handler retained but tool not advertised in MCP_TOOLS — superseded by
+    # pack_ingest(text_as_node) which materialises text as an evidence/TextUnit
+    # graph node.  Not reachable from tools/call while removed from MCP_TOOLS.
+    # (비노출 사유: 대화 적재는 pack_ingest로 일원화)
     if tool_name == "ontology_ingest":
         source_id = args.get("source_id") or f"mcp-{uuid4().hex[:8]}"
         meta = dict(args.get("metadata") or {})
