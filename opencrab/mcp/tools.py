@@ -1,19 +1,39 @@
 """
-MCP Tool Definitions for OpenCrab.
+MCP Tool Definitions for OpenCrab / LocalCrab.
 
 Each tool is a plain function that accepts keyword arguments and returns
 a JSON-serialisable dict. The TOOLS registry maps tool names to their
 schema (for tools/list) and their implementation function.
 
-Tools:
-  1. ontology_manifest          — full grammar as JSON
-  2. ontology_add_node          — add/update a node
-  3. ontology_add_edge          — add/update an edge (grammar-validated)
-  4. ontology_query             — hybrid vector + graph search
-  5. ontology_impact            — impact analysis (I1–I7)
-  6. ontology_rebac_check       — ReBAC access check
-  7. ontology_lever_simulate    — predict outcome changes from lever movement
-  8. ontology_ingest            — ingest text into vector store
+Exposed tools (16):
+  ── Grammar ────────────────────────────────────────────────────────────
+  1.  ontology_manifest         — full grammar as JSON
+  ── Graph write ────────────────────────────────────────────────────────
+  2.  ontology_add_node         — add/update a node (grammar-validated)
+  3.  ontology_add_edge         — add/update an edge (grammar-validated)
+  ── Retrieval / read ───────────────────────────────────────────────────
+  4.  ontology_query            — hybrid vector + BM25 + graph search
+  5.  ontology_get_node         — fetch a single node by node_id
+  6.  ontology_list_nodes       — list nodes filtered by space / pack_id
+  7.  ontology_list_edges       — list edges filtered by pack_id
+  ── Analysis ───────────────────────────────────────────────────────────
+  8.  ontology_impact           — I1–I7 impact analysis
+  9.  ontology_lever_simulate   — predict outcome changes from lever movement
+  ── Pack management ────────────────────────────────────────────────────
+  10. content_pack_list         — list loaded packs (pack_id, node count, title)
+  11. schema_pack_list          — list available schema packs
+  12. schema_pack_install       — install a domain schema pack
+  13. schema_pack_uninstall     — uninstall a schema pack
+  14. pack_create               — create a new ontology pack
+  15. pack_ingest               — add content to an existing pack
+  ── Execution / harness ────────────────────────────────────────────────
+  16. harness_promotion_apply   — apply a CrabHarness PromotionPackage
+
+비노출(주석 처리, 코드 보존, 주석 해제로 즉시 복원):
+  query_bm25, ontology_rebac_check, workflow_create_run, workflow_advance,
+  approval_request, billing_get_usage, billing_list_events,
+  identity_*(5), canonicalize_*(2), promotion_*(4),
+  ontology_extract, ontology_ingest
 """
 
 from __future__ import annotations
@@ -1208,14 +1228,28 @@ def _ingest_into_pack(
     text: str | None = None,
     source_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    text_as_node: bool = True,
 ) -> dict[str, Any]:
-    """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM."""
+    """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM.
+
+    Parameters
+    ----------
+    text_as_node:
+        When True (default), raw ``text`` is materialised as a 9-space
+        ``evidence/TextUnit`` graph node via ``builder.add_node`` so it
+        becomes a first-class grammar-compliant node (graph + doc + vector,
+        all pack_id-tagged).  ``hybrid.ingest`` and ``mongo.upsert_source``
+        are skipped to avoid duplicate vector writes under the same id.
+        When False, the legacy path is used: vector-only embedding via
+        ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
+    """
     ctx = _get_context()
     added_nodes = 0
     added_edges = 0
     node_errors: list[str] = []
     edge_errors: list[str] = []
     stores: dict[str, Any] = {}
+    evidence_node: str | None = None
 
     for item in nodes or []:
         try:
@@ -1254,21 +1288,52 @@ def _ingest_into_pack(
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
         meta["pack_id"] = pack_id
-        try:
-            vector_result = ctx["hybrid"].ingest(
-                text=text, source_id=source_id, metadata=meta
-            )
-            stores.update(vector_result.get("stores", {}))
-        except Exception as exc:
-            stores["chromadb"] = f"error: {exc}"
-        if ctx["mongo"].available:
+
+        if text_as_node:
+            # Materialise text as a 9-space evidence/TextUnit graph node so it
+            # becomes a grammar-compliant first-class node (graph + doc_nodes +
+            # vector), all tagged with pack_id.  builder.add_node handles vector
+            # embedding internally, so we skip hybrid.ingest / mongo.upsert_source
+            # to avoid duplicate writes under the same source_id.
             try:
-                ctx["mongo"].upsert_source(source_id, text, meta)
-                stores["mongodb"] = "ok"
+                node_props: dict[str, Any] = {
+                    "pack_id": pack_id,
+                    "text": text,
+                }
+                if meta.get("title"):
+                    node_props["title"] = meta["title"]
+                if meta.get("source"):
+                    node_props["source"] = meta["source"]
+                ctx["builder"].add_node(
+                    space="evidence",
+                    node_type="TextUnit",
+                    node_id=source_id,
+                    properties=node_props,
+                )
+                evidence_node = source_id
+                added_nodes += 1
+                stores["evidence_node"] = "ok"
             except Exception as exc:
-                stores["mongodb"] = f"error: {exc}"
+                node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
+                stores["evidence_node"] = f"error: {exc}"
         else:
-            stores["mongodb"] = "unavailable"
+            # Legacy path: vector-only embedding + doc_sources record.
+            try:
+                vector_result = ctx["hybrid"].ingest(
+                    text=text, source_id=source_id, metadata=meta
+                )
+                stores.update(vector_result.get("stores", {}))
+            except Exception as exc:
+                stores["chromadb"] = f"error: {exc}"
+            if ctx["mongo"].available:
+                try:
+                    ctx["mongo"].upsert_source(source_id, text, meta)
+                    stores["mongodb"] = "ok"
+                except Exception as exc:
+                    stores["mongodb"] = f"error: {exc}"
+            else:
+                stores["mongodb"] = "unavailable"
+
         text_ingested = True
 
     ctx["hybrid"].invalidate_bm25_cache()
@@ -1281,6 +1346,7 @@ def _ingest_into_pack(
         "edge_errors": edge_errors,
         "stores": stores,
         "text_ingested": text_ingested,
+        "evidence_node": evidence_node,
     }
 
 
@@ -1291,13 +1357,15 @@ def pack_create(
     nodes: list[dict[str, Any]] | None = None,
     edges: list[dict[str, Any]] | None = None,
     text: str | None = None,
+    text_as_node: bool = True,
 ) -> dict[str, Any]:
     """
     Create a new localcrab ontology pack and ingest content into it.
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
     pack_id is auto-slugged from title unless explicitly provided.
-    Optional text is embedded locally via ChromaDB (no external API).
+    Optional text is materialised as a 9-space evidence/TextUnit graph node
+    (text_as_node=True, default) or embedded as a vector blob only (False).
     """
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
@@ -1343,6 +1411,7 @@ def pack_create(
         text=text,
         source_id=source_id,
         metadata={"title": _clean_str(title), "source": "pack_create"},
+        text_as_node=text_as_node,
     )
 
     return {
@@ -1361,12 +1430,15 @@ def pack_ingest(
     text: str | None = None,
     title: str | None = None,
     source_id: str | None = None,
+    text_as_node: bool = True,
 ) -> dict[str, Any]:
     """
     Add content into an EXISTING localcrab ontology pack.
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
-    Optional text is embedded locally via ChromaDB (no external API).
+    Optional text is materialised as a 9-space evidence/TextUnit graph node
+    (text_as_node=True, default) so it becomes a grammar-compliant first-class
+    node. Set text_as_node=False for legacy vector-only embedding.
     Fails if the pack does not exist — use pack_create first.
     """
     pack_id = _clean_str(pack_id)
@@ -1400,9 +1472,143 @@ def pack_ingest(
         text=text,
         source_id=sid,
         metadata={"title": _clean_str(title or ""), "source": "pack_ingest"},
+        text_as_node=text_as_node,
     )
 
     return {"status": "ok", "pack_id": pack_id, **ingest_result}
+
+
+# ---------------------------------------------------------------------------
+# READ helpers (no grammar validation needed — pure reads)
+# ---------------------------------------------------------------------------
+
+
+def ontology_get_node(node_id: str) -> dict[str, Any]:
+    """Fetch a single node by node_id regardless of type.
+
+    Works across all storage backends:
+    - Local / Kuzu: uses get_node_by_id() (type-agnostic, single SQL/Cypher LIMIT 1)
+    - Neo4j: falls back to type-agnostic Cypher MATCH (n {id: $id})
+    """
+    ctx = _get_context()
+    graph = ctx["neo4j"]
+    node_id = _clean_str(node_id)
+    result: dict[str, Any] | None = None
+
+    # Local / Kuzu backend
+    if hasattr(graph, "get_node_by_id"):
+        result = graph.get_node_by_id(node_id)
+    # Neo4j backend: type-agnostic Cypher
+    elif hasattr(graph, "run_cypher"):
+        rows = graph.run_cypher(
+            "MATCH (n {id: $id}) RETURN properties(n) AS props, labels(n)[0] AS lbl LIMIT 1",
+            {"id": node_id},
+        )
+        if rows:
+            result = {**(rows[0].get("props") or {}), "node_type": rows[0].get("lbl")}
+
+    if result is None:
+        return {"found": False, "node_id": node_id}
+    return {"found": True, "node_id": node_id, "node": result}
+
+
+def ontology_list_nodes(
+    space: str | None = None,
+    pack_id: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List nodes filtered by space and/or pack_id.
+
+    When pack_id is given, queries the graph store's export_nodes(pack_id=...)
+    which uses an indexed SQL filter (idx_nodes_pack) — avoids the limit-before-
+    filter bug that would occur if we fetched N rows then Python-filtered.
+    When pack_id is absent, falls back to the doc store's list_nodes.
+    """
+    ctx = _get_context()
+    pack_id = _clean_str(pack_id) if pack_id else None
+    cleaned_space = _clean_str(space) if space else None
+
+    nodes: list[dict[str, Any]] = []
+
+    if pack_id and hasattr(ctx["neo4j"], "export_nodes"):
+        # Graph store: indexed pack_id filter → correct count before limit
+        raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit)
+        # export_nodes returns [{"props": dict, "labels": [str]}, ...]
+        # normalise to same shape as doc store list_nodes
+        for item in raw:
+            props = item.get("props") or {}
+            labels = item.get("labels") or []
+            node_type = labels[0] if labels else props.get("node_type", "")
+            n_id = props.get("node_id") or props.get("id", "")
+            n_space = props.get("space_id") or props.get("space", "")
+            if cleaned_space and n_space != cleaned_space:
+                continue
+            nodes.append({
+                "node_id": n_id,
+                "node_type": node_type,
+                "space": n_space,
+                "properties": props,
+            })
+    else:
+        # Doc store fallback (no pack_id or no export_nodes on backend)
+        nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
+        if pack_id:
+            nodes = [
+                n for n in nodes
+                if (n.get("properties") or {}).get("pack_id") == pack_id
+            ]
+
+    return {
+        "nodes": nodes,
+        "total": len(nodes),
+        "space_filter": space,
+        "pack_id_filter": pack_id,
+    }
+
+
+def ontology_list_edges(
+    pack_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List edges, optionally filtered by pack_id.
+
+    Local / Kuzu: uses export_edges(pack_id, limit).
+    Neo4j: falls back to pack_id-aware Cypher.
+    """
+    ctx = _get_context()
+    graph = ctx["neo4j"]
+    pack_id = _clean_str(pack_id) if pack_id else None
+
+    # Local / Kuzu backend
+    if hasattr(graph, "export_edges"):
+        try:
+            edges = graph.export_edges(pack_id=pack_id, limit=limit)
+            return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
+        except Exception as exc:
+            logger.warning("export_edges failed: %s", exc)
+
+    # Neo4j backend
+    if hasattr(graph, "run_cypher"):
+        try:
+            if pack_id:
+                cypher = (
+                    "MATCH (a)-[r]->(b) WHERE r.pack_id = $pack_id "
+                    "RETURN a.id AS from_id, type(r) AS relation, b.id AS to_id, "
+                    "properties(r) AS props LIMIT $limit"
+                )
+                rows = graph.run_cypher(cypher, {"pack_id": pack_id, "limit": limit})
+            else:
+                cypher = (
+                    "MATCH (a)-[r]->(b) "
+                    "RETURN a.id AS from_id, type(r) AS relation, b.id AS to_id, "
+                    "properties(r) AS props LIMIT $limit"
+                )
+                rows = graph.run_cypher(cypher, {"limit": limit})
+            return {"edges": rows or [], "total": len(rows or []), "pack_id_filter": pack_id}
+        except Exception as exc:
+            return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
+
+    return {"edges": [], "total": 0, "error": "graph store unavailable", "pack_id_filter": pack_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +1618,7 @@ def pack_ingest(
 _NINE_SPACE_HINT: str = _nine_space_hint()
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    # ── Grammar ──────────────────────────────────────────────────────────────
     "ontology_manifest": {
         "description": (
             "Return the full MetaOntology OS grammar: spaces, meta-edges, "
@@ -1423,6 +1630,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": [],
         },
     },
+    # ── Graph write ──────────────────────────────────────────────────────────
     "ontology_add_node": {
         "description": "Add or update a node in the MetaOntology graph.",
         "inputSchema": {
@@ -1523,26 +1731,60 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["question"],
         },
     },
-    "query_bm25": {
-        "description": "BM25-only keyword search against ontology node properties. Fast and deterministic.",
+    # MCP 비노출: ontology_query(use_bm25=True)의 strict subset — 중복.
+    # 주석 해제하면 즉시 복원됨.
+    # "query_bm25": {
+    #     "description": "BM25-only keyword search against ontology node properties. Fast and deterministic.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "question": {"type": "string", "description": "Search keywords."},
+    #             "spaces": {"type": "array", "items": {"type": "string"}, "description": "Optional space filter."},
+    #             "limit": {"type": "integer", "description": "Maximum results (default 10).", "default": 10},
+    #         },
+    #         "required": ["question"],
+    #     },
+    # },
+    "ontology_get_node": {
+        "description": "Fetch a single node by node_id regardless of type or space.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "question": {"type": "string", "description": "Search keywords."},
-                "spaces": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional space filter.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum results (default 10).",
-                    "default": 10,
-                },
+                "node_id": {"type": "string", "description": "The node_id to look up."},
             },
-            "required": ["question"],
+            "required": ["node_id"],
         },
     },
+    "ontology_list_nodes": {
+        "description": (
+            "List nodes from the doc store, optionally filtered by space and/or pack_id. "
+            "Useful for inspecting a pack's contents after ingest."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "space": {"type": "string", "description": "Optional MetaOntology space filter (e.g. evidence, concept)."},
+                "pack_id": {"type": "string", "description": "Optional pack_id filter."},
+                "limit": {"type": "integer", "description": "Maximum results (default 100).", "default": 100},
+            },
+            "required": [],
+        },
+    },
+    "ontology_list_edges": {
+        "description": (
+            "List edges, optionally filtered by pack_id. "
+            "Useful for inspecting graph relationships after ingest."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack_id": {"type": "string", "description": "Optional pack_id filter."},
+                "limit": {"type": "integer", "description": "Maximum results (default 200).", "default": 200},
+            },
+            "required": [],
+        },
+    },
+    # ── Analysis ─────────────────────────────────────────────────────────────
     "ontology_impact": {
         "description": "Analyse the I1–I7 impact of a change to a node.",
         "inputSchema": {
@@ -1558,21 +1800,19 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["node_id"],
         },
     },
-    "ontology_rebac_check": {
-        "description": "Check whether a subject has a permission over a resource.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "subject_id": {"type": "string", "description": "Subject node ID."},
-                "permission": {
-                    "type": "string",
-                    "description": "Permission: view, edit, execute, simulate, approve, admin.",
-                },
-                "resource_id": {"type": "string", "description": "Resource node ID."},
-            },
-            "required": ["subject_id", "permission", "resource_id"],
-        },
-    },
+    # MCP 비노출: 접근제어·감사·빌링 — 현재 워크플로 미사용. 주석 해제로 복원.
+    # "ontology_rebac_check": {
+    #     "description": "Check whether a subject has a permission over a resource.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "subject_id": {"type": "string", "description": "Subject node ID."},
+    #             "permission": {"type": "string", "description": "Permission: view, edit, execute, simulate, approve, admin."},
+    #             "resource_id": {"type": "string", "description": "Resource node ID."},
+    #         },
+    #         "required": ["subject_id", "permission", "resource_id"],
+    #     },
+    # },
     "ontology_lever_simulate": {
         "description": "Simulate downstream outcome changes from a lever movement.",
         "inputSchema": {
@@ -1591,303 +1831,127 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["lever_id", "direction", "magnitude"],
         },
     },
-    "ontology_extract": {
-        "description": (
-            "LLM-extract ontology nodes and edges from text using Claude, "
-            "then persist them into the knowledge graph."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to extract knowledge from."},
-                "source_id": {"type": "string", "description": "Stable source identifier."},
-                "model": {
-                    "type": "string",
-                    "description": "Claude model (default: claude-haiku-4-5-20251001). API backend only.",
-                    "default": "claude-haiku-4-5-20251001",
-                },
-                "backend": {
-                    "type": "string",
-                    "description": "'auto' (default): API if ANTHROPIC_API_KEY set, else `claude -p` CLI. 'api': Anthropic SDK. 'cli': local `claude -p` subprocess (uses subscription auth, no API key needed).",
-                    "default": "auto",
-                },
-            },
-            "required": ["text", "source_id"],
-        },
-    },
-    "ontology_ingest": {
-        "description": "Ingest a text document into the vector and document stores.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text content to ingest."},
-                "source_id": {"type": "string", "description": "Stable source identifier."},
-                "metadata": {"type": "object", "description": "Optional metadata."},
-            },
-            "required": ["text", "source_id"],
-        },
-    },
-    "workflow_create_run": {
-        "description": (
-            "Create a new workflow run in 'pending' state. "
-            "Use before executing any auditable action to get a run_id and receipt_id."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action_type": {"type": "string", "description": "Action being requested (e.g. add_node, harness_apply)."},
-                "payload": {"type": "object", "description": "Full action payload for audit."},
-                "subject_id": {"type": "string", "description": "Optional actor identifier."},
-            },
-            "required": ["action_type", "payload"],
-        },
-    },
-    "workflow_advance": {
-        "description": (
-            "Advance a workflow run to a new status. "
-            "Valid statuses: pending, running, approved, rejected, completed, failed."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": {"type": "string", "description": "Workflow run to advance."},
-                "new_status": {"type": "string", "description": "Target status."},
-                "output": {"type": "object", "description": "Optional result to log."},
-                "actor": {"type": "string", "description": "Optional actor identifier."},
-            },
-            "required": ["run_id", "new_status"],
-        },
-    },
-    "approval_request": {
-        "description": (
-            "Submit an approval request for a sensitive action. "
-            "Returns approval_id with status='pending'."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action_type": {"type": "string", "description": "Action requiring approval."},
-                "subject_id": {"type": "string", "description": "Subject requesting the action."},
-                "payload": {"type": "object", "description": "Full payload to be reviewed."},
-                "run_id": {"type": "string", "description": "Optional linked workflow run_id."},
-            },
-            "required": ["action_type", "subject_id", "payload"],
-        },
-    },
-    "harness_promotion_apply": {
-        "description": (
-            "Apply a CrabHarness PromotionPackage to the OpenCrab ontology stores. "
-            "Writes each node and edge, returning receipt_id + receipt_ts per operation. "
-            "Use dry_run=true to validate grammar and schema without writing."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "package": {
-                    "type": "object",
-                    "description": "Serialised PromotionPackage (from crabharness promotion-stub or run output).",
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "Validate without writing to stores.",
-                    "default": False,
-                },
-            },
-            "required": ["package"],
-        },
-    },
-    # ------------------------------------------------------------------
-    # Phase 3 — Identity / Canonicalization / Promotion
-    # ------------------------------------------------------------------
-    "identity_add_alias": {
-        "description": "Register an alias_id for a canonical_id in the alias table.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_id": {"type": "string", "description": "Authoritative node ID."},
-                "alias_id": {"type": "string", "description": "Alias to register."},
-                "alias_type": {
-                    "type": "string",
-                    "description": "Type hint: name, merge, external (default: name).",
-                    "default": "name",
-                },
-                "space": {"type": "string", "description": "Optional space of the canonical node."},
-                "created_by": {"type": "string", "description": "Optional actor ID."},
-            },
-            "required": ["canonical_id", "alias_id"],
-        },
-    },
-    "identity_resolve_canonical": {
-        "description": "Resolve a node_id to its canonical ID. Returns is_alias=true if it was an alias.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string", "description": "Node ID to resolve."},
-            },
-            "required": ["node_id"],
-        },
-    },
-    "identity_propose_duplicate": {
-        "description": (
-            "Propose that two nodes may be the same entity. "
-            "Creates a pending duplicate candidate for human review."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_a_id": {"type": "string", "description": "First node ID."},
-                "node_b_id": {"type": "string", "description": "Second node ID."},
-                "space": {"type": "string", "description": "Optional shared space."},
-                "similarity": {"type": "number", "description": "Optional similarity score (0.0–1.0)."},
-                "method": {"type": "string", "description": "Detection method (default: name_fuzzy).", "default": "name_fuzzy"},
-            },
-            "required": ["node_a_id", "node_b_id"],
-        },
-    },
-    "identity_resolve_duplicate": {
-        "description": "Accept or reject a pending duplicate candidate. If accepted, registers alias automatically.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "candidate_id": {"type": "string", "description": "Duplicate candidate ID."},
-                "decision": {"type": "string", "description": "accepted or rejected."},
-                "decided_by": {"type": "string", "description": "Optional reviewer ID."},
-                "note": {"type": "string", "description": "Optional decision note."},
-            },
-            "required": ["candidate_id", "decision"],
-        },
-    },
-    "identity_list_pending_duplicates": {
-        "description": "List all pending duplicate candidates sorted by similarity descending.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "description": "Max results (default 50).", "default": 50},
-            },
-            "required": [],
-        },
-    },
-    "canonicalize_merge_nodes": {
-        "description": (
-            "Merge alias_id into canonical_id using the tombstone pattern. "
-            "Alias node is preserved; use identity_resolve_canonical to normalise IDs."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "canonical_id": {"type": "string", "description": "Surviving canonical node ID."},
-                "alias_id": {"type": "string", "description": "Node being merged in."},
-                "canonical_space": {"type": "string", "description": "Space of the canonical node."},
-                "canonical_type": {"type": "string", "description": "Node type of the canonical node."},
-                "merge_properties": {"type": "boolean", "description": "Copy alias properties to canonical (default true).", "default": True},
-                "merged_by": {"type": "string", "description": "Optional actor ID."},
-            },
-            "required": ["canonical_id", "alias_id", "canonical_space", "canonical_type"],
-        },
-    },
-    "canonicalize_find_and_propose": {
-        "description": "Find nodes with similar names and auto-propose them as duplicate candidates for review.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string", "description": "Source node ID."},
-                "name": {"type": "string", "description": "Name to search for."},
-                "space": {"type": "string", "description": "Optional space to limit search."},
-                "threshold": {"type": "number", "description": "Minimum similarity threshold (default 0.5).", "default": 0.5},
-            },
-            "required": ["node_id", "name"],
-        },
-    },
-    "promotion_register_candidate": {
-        "description": "Register an extracted entity as a promotion candidate (status=candidate). Will not appear in promoted queries until promoted.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "space": {"type": "string", "description": "Target space."},
-                "node_type": {"type": "string", "description": "Node type."},
-                "node_id": {"type": "string", "description": "Node ID."},
-                "properties": {"type": "object", "description": "Node properties."},
-                "confidence": {"type": "number", "description": "Extraction confidence (0.0–1.0)."},
-                "source_id": {"type": "string", "description": "Source document ID."},
-            },
-            "required": ["space", "node_type", "node_id", "properties"],
-        },
-    },
-    "promotion_validate_candidate": {
-        "description": "Mark a candidate as validated (ready for final promotion review). Does not promote yet.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "space": {"type": "string"},
-                "node_type": {"type": "string"},
-                "node_id": {"type": "string"},
-                "existing_properties": {"type": "object", "description": "Current node properties."},
-                "validator_id": {"type": "string", "description": "Optional validator ID."},
-                "note": {"type": "string", "description": "Optional validation note."},
-            },
-            "required": ["space", "node_type", "node_id", "existing_properties"],
-        },
-    },
-    "promotion_promote": {
-        "description": "Promote a validated candidate to promoted status. Optionally links evidence nodes via supports edges.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "space": {"type": "string"},
-                "node_type": {"type": "string"},
-                "node_id": {"type": "string"},
-                "existing_properties": {"type": "object", "description": "Current node properties."},
-                "promoted_by": {"type": "string", "description": "Optional actor ID."},
-                "evidence_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional evidence node IDs to link via supports edges.",
-                },
-            },
-            "required": ["space", "node_type", "node_id", "existing_properties"],
-        },
-    },
-    "promotion_reject": {
-        "description": "Mark a candidate as rejected with an optional reason.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "space": {"type": "string"},
-                "node_type": {"type": "string"},
-                "node_id": {"type": "string"},
-                "existing_properties": {"type": "object", "description": "Current node properties."},
-                "rejected_by": {"type": "string", "description": "Optional actor ID."},
-                "reason": {"type": "string", "description": "Rejection reason."},
-            },
-            "required": ["space", "node_type", "node_id", "existing_properties"],
-        },
-    },
-    # ------------------------------------------------------------------
-    # Phase 5 — Billing / Tenant / Schema Packs
-    # ------------------------------------------------------------------
-    "billing_get_usage": {
-        "description": "Return aggregated usage counts for a tenant (node_write, query, ingest, etc).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tenant_id": {"type": "string", "description": "Tenant to report on (default: 'default').", "default": "default"},
-                "event_type": {"type": "string", "description": "Optional filter: node_write, edge_write, query, ingest, promotion, harness_apply."},
-                "since": {"type": "string", "description": "Optional ISO timestamp — only count events after this time."},
-            },
-            "required": [],
-        },
-    },
-    "billing_list_events": {
-        "description": "Return recent billing events for a tenant.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tenant_id": {"type": "string", "default": "default"},
-                "limit": {"type": "integer", "default": 50},
-            },
-            "required": [],
-        },
-    },
+    # MCP 비노출: 대화 적재는 pack_ingest(text_as_node)로 일원화. 주석 해제로 복원.
+    # "ontology_extract": { ... }  ← server-LLM path
+    # "ontology_ingest": { ... }   ← pack-unaware vector-only path
+    # (전체 스키마는 위 주석 블록 참조 — 이전 세션에서 비노출 처리됨)
+
+    # MCP 비노출: 감사/워크플로/승인 — 현재 워크플로 미사용. 주석 해제로 복원.
+    # "workflow_create_run": {
+    #     "description": "Create a new workflow run in 'pending' state.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "action_type": {"type": "string"}, "payload": {"type": "object"},
+    #         "subject_id": {"type": "string"}}, "required": ["action_type", "payload"]},
+    # },
+    # "workflow_advance": {
+    #     "description": "Advance a workflow run to a new status (pending/running/approved/rejected/completed/failed).",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "run_id": {"type": "string"}, "new_status": {"type": "string"},
+    #         "output": {"type": "object"}, "actor": {"type": "string"}},
+    #         "required": ["run_id", "new_status"]},
+    # },
+    # "approval_request": {
+    #     "description": "Submit an approval request for a sensitive action.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "action_type": {"type": "string"}, "subject_id": {"type": "string"},
+    #         "payload": {"type": "object"}, "run_id": {"type": "string"}},
+    #         "required": ["action_type", "subject_id", "payload"]},
+    # },
+    # MCP 비노출: identity/canonicalize/promotion — 실사용 이력 0. 주석 해제로 복원.
+    # "identity_add_alias": {
+    #     "description": "Register an alias_id for a canonical_id in the alias table.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "canonical_id": {"type": "string"}, "alias_id": {"type": "string"},
+    #         "alias_type": {"type": "string", "default": "name"},
+    #         "space": {"type": "string"}, "created_by": {"type": "string"}},
+    #         "required": ["canonical_id", "alias_id"]},
+    # },
+    # "identity_resolve_canonical": {
+    #     "description": "Resolve a node_id to its canonical ID.",
+    #     "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}}, "required": ["node_id"]},
+    # },
+    # "identity_propose_duplicate": {
+    #     "description": "Propose that two nodes may be the same entity.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "node_a_id": {"type": "string"}, "node_b_id": {"type": "string"},
+    #         "space": {"type": "string"}, "similarity": {"type": "number"},
+    #         "method": {"type": "string", "default": "name_fuzzy"}},
+    #         "required": ["node_a_id", "node_b_id"]},
+    # },
+    # "identity_resolve_duplicate": {
+    #     "description": "Accept or reject a pending duplicate candidate.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "candidate_id": {"type": "string"}, "decision": {"type": "string"},
+    #         "decided_by": {"type": "string"}, "note": {"type": "string"}},
+    #         "required": ["candidate_id", "decision"]},
+    # },
+    # "identity_list_pending_duplicates": {
+    #     "description": "List all pending duplicate candidates sorted by similarity descending.",
+    #     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 50}}, "required": []},
+    # },
+    # "canonicalize_merge_nodes": {
+    #     "description": "Merge alias_id into canonical_id using the tombstone pattern.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "canonical_id": {"type": "string"}, "alias_id": {"type": "string"},
+    #         "canonical_space": {"type": "string"}, "canonical_type": {"type": "string"},
+    #         "merge_properties": {"type": "boolean", "default": True},
+    #         "merged_by": {"type": "string"}},
+    #         "required": ["canonical_id", "alias_id", "canonical_space", "canonical_type"]},
+    # },
+    # "canonicalize_find_and_propose": {
+    #     "description": "Find nodes with similar names and auto-propose as duplicate candidates.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "node_id": {"type": "string"}, "name": {"type": "string"},
+    #         "space": {"type": "string"}, "threshold": {"type": "number", "default": 0.5}},
+    #         "required": ["node_id", "name"]},
+    # },
+    # "promotion_register_candidate": {
+    #     "description": "Register an extracted entity as a promotion candidate.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "space": {"type": "string"}, "node_type": {"type": "string"},
+    #         "node_id": {"type": "string"}, "properties": {"type": "object"},
+    #         "confidence": {"type": "number"}, "source_id": {"type": "string"}},
+    #         "required": ["space", "node_type", "node_id", "properties"]},
+    # },
+    # "promotion_validate_candidate": {
+    #     "description": "Mark a candidate as validated (ready for promotion review).",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "space": {"type": "string"}, "node_type": {"type": "string"},
+    #         "node_id": {"type": "string"}, "existing_properties": {"type": "object"},
+    #         "validator_id": {"type": "string"}, "note": {"type": "string"}},
+    #         "required": ["space", "node_type", "node_id", "existing_properties"]},
+    # },
+    # "promotion_promote": {
+    #     "description": "Promote a validated candidate. Optionally links evidence via supports edges.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "space": {"type": "string"}, "node_type": {"type": "string"},
+    #         "node_id": {"type": "string"}, "existing_properties": {"type": "object"},
+    #         "promoted_by": {"type": "string"},
+    #         "evidence_ids": {"type": "array", "items": {"type": "string"}}},
+    #         "required": ["space", "node_type", "node_id", "existing_properties"]},
+    # },
+    # "promotion_reject": {
+    #     "description": "Mark a candidate as rejected with an optional reason.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "space": {"type": "string"}, "node_type": {"type": "string"},
+    #         "node_id": {"type": "string"}, "existing_properties": {"type": "object"},
+    #         "rejected_by": {"type": "string"}, "reason": {"type": "string"}},
+    #         "required": ["space", "node_type", "node_id", "existing_properties"]},
+    # },
+    # MCP 비노출: billing — 현재 워크플로 미사용. 주석 해제로 복원.
+    # "billing_get_usage": {
+    #     "description": "Return aggregated usage counts for a tenant.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "tenant_id": {"type": "string", "default": "default"},
+    #         "event_type": {"type": "string"}, "since": {"type": "string"}}, "required": []},
+    # },
+    # "billing_list_events": {
+    #     "description": "Return recent billing events for a tenant.",
+    #     "inputSchema": {"type": "object", "properties": {
+    #         "tenant_id": {"type": "string", "default": "default"},
+    #         "limit": {"type": "integer", "default": 50}}, "required": []},
+    # },
+    # ── Pack management ──────────────────────────────────────────────────────
     "content_pack_list": {
         "description": "List all content packs currently loaded in the localcrab ontology (Neo4j). Returns pack_id, node count, and display title for each pack.",
         "inputSchema": {
@@ -1898,6 +1962,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": [],
         },
     },
+    # ── Schema packs ─────────────────────────────────────────────────────────
     "schema_pack_list": {
         "description": "List all available schema packs (saas, biomedical, legal) with install status.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
@@ -1981,7 +2046,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text to embed locally into the vector/doc store (no LLM, local ONNX embedding).",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true).",
+                },
+                "text_as_node": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
                 },
             },
             "required": ["title"],
@@ -2033,7 +2103,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text to embed locally into the vector/doc store (no LLM).",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack.",
+                },
+                "text_as_node": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged, graph+doc+vector). Set false for legacy vector-only embedding.",
                 },
                 "title": {
                     "type": "string",
@@ -2047,45 +2122,79 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["pack_id"],
         },
     },
+    # ── Execution / harness ──────────────────────────────────────────────────
+    "harness_promotion_apply": {
+        "description": (
+            "Apply a CrabHarness PromotionPackage to the OpenCrab ontology stores. "
+            "Writes each node and edge, returning receipt_id + receipt_ts per operation. "
+            "Use dry_run=true to validate grammar and schema without writing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "package": {
+                    "type": "object",
+                    "description": "Serialised PromotionPackage (from crabharness promotion-stub or run output).",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Validate without writing to stores.",
+                    "default": False,
+                },
+            },
+            "required": ["package"],
+        },
+    },
 }
 
 # Callable map
 _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
+    # ── Grammar ──────────────────────────────────────────────────────────────
     "ontology_manifest": ontology_manifest,
+    # ── Graph write ──────────────────────────────────────────────────────────
     "ontology_add_node": ontology_add_node,
     "ontology_add_edge": ontology_add_edge,
+    # ── Retrieval / read ─────────────────────────────────────────────────────
     "ontology_query": ontology_query,
-    "query_bm25": query_bm25,
+    "ontology_get_node": ontology_get_node,
+    "ontology_list_nodes": ontology_list_nodes,
+    "ontology_list_edges": ontology_list_edges,
+    # MCP 비노출: ontology_query의 strict subset — 주석 해제로 복원.
+    # "query_bm25": query_bm25,
+    # ── Analysis ─────────────────────────────────────────────────────────────
     "ontology_impact": ontology_impact,
-    "ontology_rebac_check": ontology_rebac_check,
     "ontology_lever_simulate": ontology_lever_simulate,
-    "ontology_extract": ontology_extract,
-    "ontology_ingest": ontology_ingest,
-    "harness_promotion_apply": harness_promotion_apply,
-    "workflow_create_run": workflow_create_run,
-    "workflow_advance": workflow_advance,
-    "approval_request": approval_request,
-    # Phase 3
-    "identity_add_alias": identity_add_alias,
-    "identity_resolve_canonical": identity_resolve_canonical,
-    "identity_propose_duplicate": identity_propose_duplicate,
-    "identity_resolve_duplicate": identity_resolve_duplicate,
-    "identity_list_pending_duplicates": identity_list_pending_duplicates,
-    "canonicalize_merge_nodes": canonicalize_merge_nodes,
-    "canonicalize_find_and_propose": canonicalize_find_and_propose,
-    "promotion_register_candidate": promotion_register_candidate,
-    "promotion_validate_candidate": promotion_validate_candidate,
-    "promotion_promote": promotion_promote,
-    "promotion_reject": promotion_reject,
-    # Phase 5
-    "billing_get_usage": billing_get_usage,
-    "billing_list_events": billing_list_events,
+    # MCP 비노출: 접근제어·감사·빌링·거버넌스 — 현재 워크플로 미사용. 주석 해제로 복원.
+    # "ontology_rebac_check": ontology_rebac_check,
+    # "workflow_create_run": workflow_create_run,
+    # "workflow_advance": workflow_advance,
+    # "approval_request": approval_request,
+    # "identity_add_alias": identity_add_alias,
+    # "identity_resolve_canonical": identity_resolve_canonical,
+    # "identity_propose_duplicate": identity_propose_duplicate,
+    # "identity_resolve_duplicate": identity_resolve_duplicate,
+    # "identity_list_pending_duplicates": identity_list_pending_duplicates,
+    # "canonicalize_merge_nodes": canonicalize_merge_nodes,
+    # "canonicalize_find_and_propose": canonicalize_find_and_propose,
+    # "promotion_register_candidate": promotion_register_candidate,
+    # "promotion_validate_candidate": promotion_validate_candidate,
+    # "promotion_promote": promotion_promote,
+    # "promotion_reject": promotion_reject,
+    # "billing_get_usage": billing_get_usage,
+    # "billing_list_events": billing_list_events,
+    # MCP 비노출: 이전 세션에서 비노출 처리됨 — 주석 해제로 복원.
+    # "ontology_extract": ontology_extract,
+    # "ontology_ingest": ontology_ingest,
+    # ── Pack management ──────────────────────────────────────────────────────
     "content_pack_list": content_pack_list,
+    "pack_create": pack_create,
+    "pack_ingest": pack_ingest,
+    # ── Schema packs ─────────────────────────────────────────────────────────
     "schema_pack_list": schema_pack_list,
     "schema_pack_install": schema_pack_install,
     "schema_pack_uninstall": schema_pack_uninstall,
-    "pack_create": pack_create,
-    "pack_ingest": pack_ingest,
+    # ── Execution / harness ──────────────────────────────────────────────────
+    "harness_promotion_apply": harness_promotion_apply,
 }
 
 # Combined tool descriptor list (name + schema)
