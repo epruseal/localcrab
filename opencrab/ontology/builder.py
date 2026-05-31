@@ -3,9 +3,9 @@ Ontology Builder.
 
 High-level API for adding nodes and edges to the multi-store ontology.
 Validates against the MetaOntology grammar before writing to any store.
-Writes to Neo4j (graph), MongoDB (document), and PostgreSQL (registry)
-in a best-effort fan-out pattern — individual store failures are logged
-but do not abort the operation.
+Writes to Neo4j (graph), MongoDB (document), PostgreSQL (registry), and
+optionally Chroma (vector) in a best-effort fan-out pattern — individual
+store failures are logged but do not abort the operation.
 """
 
 from __future__ import annotations
@@ -32,10 +32,12 @@ class OntologyBuilder:
         neo4j: Neo4jStore,
         mongo: MongoStore,
         sql: SQLStore,
+        vec: Any = None,
     ) -> None:
         self._neo4j = neo4j
         self._mongo = mongo
         self._sql = sql
+        self._vec = vec  # Optional ChromaStore — if provided, add_node embeds each node
 
     # ------------------------------------------------------------------
     # Nodes
@@ -137,6 +139,27 @@ class OntologyBuilder:
                 output["stores"]["postgres"] = f"error: {exc}"
         else:
             output["stores"]["postgres"] = "unavailable"
+
+        # --- Chroma vector write ---
+        if self._vec is not None and self._vec.available:
+            try:
+                from opencrab.ontology.bm25 import _node_text
+                text = _node_text({"node_id": node_id, "node_type": node_type, "properties": props})
+                if text.strip():
+                    meta = {
+                        "pack_id": str(props.get("pack_id") or ""),
+                        "source": str(props.get("pack") or props.get("pack_id") or ""),
+                        "node_id": node_id,
+                    }
+                    self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
+                    output["stores"]["chroma"] = "ok"
+                else:
+                    output["stores"]["chroma"] = "skipped (no text)"
+            except Exception as exc:
+                logger.warning("Chroma node write failed for %s: %s", node_id, exc)
+                output["stores"]["chroma"] = f"error: {exc}"
+        else:
+            output["stores"]["chroma"] = "unavailable"
 
         logger.info("Node added: %s/%s (%s)", space, node_id, node_type)
         return output
