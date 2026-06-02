@@ -902,97 +902,7 @@ def list_edges(
 
 ## ─── Remote MCP Server (Streamable HTTP, 2025-03-26) ────────────────────────
 
-MCP_TOOLS = [
-    {
-        "name": "ontology_query",
-        "description": "Hybrid vector + graph search across the ontology",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string"},
-                "spaces": {"type": "array", "items": {"type": "string"}},
-                "limit": {"type": "integer", "default": 10},
-            },
-            "required": ["question"],
-        },
-    },
-    # Not advertised — superseded by pack_ingest(text_as_node) for grammar-compliant
-    # evidence/TextUnit node materialisation.  Handler code retained below.
-    # Re-add this dict entry to re-expose. (비노출: pack_ingest로 일원화)
-    # {
-    #     "name": "ontology_ingest",
-    #     "description": "Ingest text into the ontology vector and graph stores",
-    #     "inputSchema": {
-    #         "type": "object",
-    #         "properties": {
-    #             "text": {"type": "string"},
-    #             "source_id": {"type": "string"},
-    #             "metadata": {"type": "object"},
-    #         },
-    #         "required": ["text"],
-    #     },
-    # },
-    {
-        "name": "ontology_manifest",
-        "description": "Return the full MetaOntology grammar: spaces, relations, impact categories",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "ontology_add_node",
-        "description": "Add or update a node in the ontology",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "space": {"type": "string"},
-                "node_type": {"type": "string"},
-                "node_id": {"type": "string"},
-                "properties": {"type": "object"},
-            },
-            "required": ["space", "node_type", "node_id"],
-        },
-    },
-    {
-        "name": "ontology_add_edge",
-        "description": "Add a directed edge between two nodes (grammar-validated)",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "from_space": {"type": "string"},
-                "from_id": {"type": "string"},
-                "relation": {"type": "string"},
-                "to_space": {"type": "string"},
-                "to_id": {"type": "string"},
-            },
-            "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
-        },
-    },
-    {
-        "name": "ontology_impact",
-        "description": "Impact analysis: which I1-I7 categories are triggered by a node change",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string"},
-                "change_type": {"type": "string", "default": "update"},
-                "depth": {"type": "integer", "default": 2},
-            },
-            "required": ["node_id"],
-        },
-    },
-    {
-        "name": "ontology_lever_simulate",
-        "description": "Predict downstream outcome changes from a lever movement",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "lever_id": {"type": "string"},
-                "direction": {"type": "string", "enum": ["raises", "lowers", "stabilizes", "optimizes"]},
-                "magnitude": {"type": "number", "default": 0.5},
-            },
-            "required": ["lever_id", "direction"],
-        },
-    },
-]
+from opencrab.mcp.tools import TOOLS as MCP_TOOLS, dispatch_tool as _mcp_tools_dispatch  # noqa: E402
 
 
 def _mcp_text(data: Any) -> dict[str, Any]:
@@ -1000,63 +910,7 @@ def _mcp_text(data: Any) -> dict[str, Any]:
 
 
 async def _mcp_dispatch(tool_name: str, args: dict[str, Any], auth: AuthContext, ctx: ApiContext) -> Any:
-    if tool_name == "ontology_query":
-        result = ctx.hybrid.query(
-            question=args["question"],
-            spaces=args.get("spaces"),
-            limit=args.get("limit", 10),
-            graph_depth=args.get("graph_depth", 1),
-        )
-        return result if isinstance(result, dict) else {"results": result}
-
-    # Handler retained but tool not advertised in MCP_TOOLS — superseded by
-    # pack_ingest(text_as_node) which materialises text as an evidence/TextUnit
-    # graph node.  Not reachable from tools/call while removed from MCP_TOOLS.
-    # (비노출 사유: 대화 적재는 pack_ingest로 일원화)
-    if tool_name == "ontology_ingest":
-        source_id = args.get("source_id") or f"mcp-{uuid4().hex[:8]}"
-        meta = dict(args.get("metadata") or {})
-        meta.setdefault("user_id", auth.user_id)
-        vec_id = ctx.vector.upsert(source_id, args["text"], meta)
-        _write_source_doc(ctx.docs, source_id, args["text"], meta)
-        return {"source_id": source_id, "vector_id": vec_id, "status": "ok"}
-
-    if tool_name == "ontology_manifest":
-        return describe_grammar()
-
-    if tool_name == "ontology_add_node":
-        space = args["space"]
-        node_type = args.get("node_type", _space_to_default_type(space))
-        node_id = args["node_id"]
-        props = dict(args.get("properties") or {})
-        err = validate_node(space, node_type)
-        if err:
-            return {"error": err}
-        props.update({"id": node_id, "space": space, "node_type": node_type})
-        ctx.graph.upsert_node(space, node_type, node_id, props)
-        return {"node_id": node_id, "space": space, "node_type": node_type, "status": "ok"}
-
-    if tool_name == "ontology_add_edge":
-        err = validate_edge(args["from_space"], args["relation"], args["to_space"])
-        if err:
-            return {"error": err}
-        ctx.graph.upsert_edge(
-            args["from_space"], args["from_id"],
-            args["relation"],
-            args["to_space"], args["to_id"],
-            args.get("properties") or {},
-        )
-        return {"status": "ok", "relation": args["relation"]}
-
-    if tool_name == "ontology_impact":
-        result = ctx.impact.analyze(args["node_id"], args.get("change_type", "update"), args.get("depth", 2))
-        return result if isinstance(result, dict) else {"impact": result}
-
-    if tool_name == "ontology_lever_simulate":
-        result = ctx.impact.simulate_lever(args["lever_id"], args["direction"], args.get("magnitude", 0.5))
-        return result if isinstance(result, dict) else {"simulation": result}
-
-    return {"error": f"Unknown tool: {tool_name}"}
+    return _mcp_tools_dispatch(tool_name, args)
 
 
 @app.get("/mcp")
@@ -1070,10 +924,15 @@ async def mcp_info() -> dict[str, Any]:
     }
 
 
+@app.delete("/mcp")
+async def mcp_session_delete() -> JSONResponse:
+    # Stateless server — acknowledge session termination silently
+    return JSONResponse({}, status_code=200)
+
+
 @app.post("/mcp")
 async def mcp_endpoint(
     request: Request,
-    auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> Any:
     try:
@@ -1084,6 +943,7 @@ async def mcp_endpoint(
     rpc_id = body.get("id")
     method = body.get("method", "")
     params = body.get("params") or {}
+    auth = AuthContext(user_id="tunnel", tier=_tier())
 
     def ok(result: Any) -> JSONResponse:
         return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "result": result})
