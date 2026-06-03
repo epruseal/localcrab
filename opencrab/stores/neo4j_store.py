@@ -149,6 +149,26 @@ class Neo4jStore:
             record = result.single()
             return dict(record["props"]) if record else None
 
+    def lookup_node_type(self, node_id: str) -> str | None:
+        """Return the first label for a node_id, or None if not found.
+
+        Used by OntologyBuilder to resolve real node types when writing edges,
+        so that edges preserve typed labels instead of falling back to a single
+        per-space default.
+        """
+        if not self._available:
+            return None
+        try:
+            with self._session() as session:
+                result = session.run(
+                    "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
+                    id=node_id,
+                )
+                record = result.single()
+                return record["lbl"] if record and record["lbl"] else None
+        except Exception:
+            return None
+
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """Delete a node and all its relationships."""
         if not self._available:
