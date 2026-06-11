@@ -38,13 +38,27 @@ Exposed tools (16):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import logging
+import os
 import re
 from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# chroma PersistentClient는 단일 프로세스 전용.
+# 공유 락(LOCK_SH)을 서버 수명 동안 보유 → load_local_packs.py의 배타 락(LOCK_EX)과 상호 배제.
+_chroma_lock_fh = None
+
+
+def _acquire_chroma_shared_lock() -> None:
+    global _chroma_lock_fh
+    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    lock_path = os.path.join(data_dir, "chroma.lock")
+    _chroma_lock_fh = open(lock_path, "w")
+    fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
 
 
 def _clean_str(s: str) -> str:
@@ -81,6 +95,8 @@ def _get_context() -> dict[str, Any]:
     global _context
     if _context:
         return _context
+
+    _acquire_chroma_shared_lock()
 
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
