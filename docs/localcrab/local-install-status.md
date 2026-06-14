@@ -32,7 +32,7 @@ Core LocalCrab:
 
 - `localcrab status`: OK for local SQLite graph, ChromaDB, JSON docs, SQLite SQL
 - `localcrab manifest`: rendered MetaOntology grammar
-- MCP stdio initialize/list tools: OK, 30 tools
+- MCP stdio initialize/list tools: OK, 16 tools (rebac_check/ingest/extract는 주석처리되어 미노출)
 - pytest: `128 passed, 3 skipped`
 
 CrabHarness:
@@ -53,18 +53,18 @@ Neo4j validation/export:
 
 ## 임베딩 백엔드 (2026-06-14 갱신)
 
-- ✅ KURE-v1 임베딩 도입 완료 (feat/kure-embedding 브랜치)
-- ✅ LM Studio text-embedding-kure-v1 (1024d, Q8_0) — 주력
-- ✅ 로컬 GGUF /home/asdf/models/KURE-v1-Q8_0.gguf (605MB) — 폴백
-- ✅ llama-cpp-python 0.3.29 설치
+- ✅ KURE-v1 임베딩 도입 완료 (`EMBEDDING_BACKEND=openai`)
+- ✅ LM Studio text-embedding-kure-v1 (1024d, Q8_0) — 주력 (예시 환경: 로컬 OpenAI 호환 서버)
+- ✅ 로컬 GGUF `<LOCAL_GGUF_PATH>` (605MB) — 폴백 (환경변수 `LOCAL_GGUF_PATH`로 지정)
+- ✅ llama-cpp-python 설치
 - ✅ backfill_kure.py — 기존 노드 KURE 컬렉션 적재
-- ✅ systemd 유닛 3개(gateway/api/tunnel)에 localcrab-kure.env 적용
+- ✅ systemd 유닛에 `EMBEDDING_BACKEND=openai` 환경 적용
 - ✅ 벡터 일치도: LM Studio↔로컬 cosine 0.999853 확인
-- 기존 minilm 컬렉션(opencrab_vectors) 보존 — EMBEDDING_BACKEND=local 로 즉시 롤백
+- 기존 minilm 컬렉션(opencrab_vectors) 보존 — `EMBEDDING_BACKEND=local`로 즉시 롤백
 
 롤백 방법:
-  /home/asdf/.openclaw/localcrab-kure.env 에서 EMBEDDING_BACKEND=local 후
-  systemctl --user daemon-reload && systemctl --user restart localcrab-gateway
+  환경 설정 파일에서 `EMBEDDING_BACKEND=local`로 변경 후
+  `systemctl --user daemon-reload && systemctl --user restart localcrab-gateway`
 
 ## Current limitations
 
