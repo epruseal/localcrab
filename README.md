@@ -127,10 +127,10 @@ systemctl --user restart localcrab-gateway localcrab-api localcrab-tunnel
 ```
 
 환경변수:
-- `EMBEDDING_BACKEND=kure` — KURE 백엔드 활성화 (기본 `local` = 기존 minilm)
+- `EMBEDDING_BACKEND=openai` — KURE 백엔드 활성화 (기본 `local` = 기존 minilm)
 - `LMSTUDIO_API_BASE` — LM Studio 주소 (기본 `http://100.77.10.49:1234/v1`)
 - `LMSTUDIO_EMBED_MODEL` — 모델 id (기본 `text-embedding-kure-v1`)
-- `KURE_GGUF_PATH` — 로컬 폴백 GGUF 경로 (없으면 자동 다운로드 시도)
+- `LOCAL_GGUF_PATH` — 로컬 폴백 GGUF 경로 (없으면 자동 다운로드 시도)
 
 ### 초기 적재 (KURE 컬렉션 backfill)
 
