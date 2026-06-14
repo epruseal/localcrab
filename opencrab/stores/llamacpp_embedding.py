@@ -1,22 +1,20 @@
 """
-로컬 KURE-v1 GGUF 임베딩 EF (ChromaDB EmbeddingFunction 프로토콜)
+로컬 GGUF 임베딩 EF (ChromaDB EmbeddingFunction 프로토콜) — 폴백용
 
 변경 이유:
   - LM Studio(원격 GPU) 다운/미응답 시 검색이 완전히 불가하지 않도록
-    라즈베리파이 CPU에서 같은 모델(KURE-v1)의 GGUF 를 폴백으로 운용.
-  - 동일 모델 + 동일 양자화(Q8_0) → 적재 벡터(LM Studio)와 폴백 검색 벡터가
-    코사인 거리 보존 (실측 cosine≈1.000 확인 후 운용).
+    라즈베리파이 CPU에서 로컬 GGUF 를 폴백으로 운용.
+
+기본 모델(자동 다운로드):
+  - KURE-v1-Q4_K_M (mykor/KURE-v1-gguf, 438MB)
+  - Q4_K_M 선택: Q8_0(600MB, ~0.7s) 대비 크기·속도 개선, 품질 손실 ~2%.
+  - 다른 모델을 쓰려면 LOCAL_GGUF_PATH 환경변수로 직접 경로 지정.
 
 대안:
-  - multilingual-e5-small (384d, ~0.2s): 더 빠르지만 주력(1024d)과 차원 불일치.
-    단일 컬렉션 유지를 위해 동일 KURE 선택.
-  - CPU 속도: RPi5 Cortex-A76×4 NEON, 0.6B BERT 1회 forward ~0.6–0.9s.
+  - 더 빠른 소형 모델(e5-small 등): 384d라 EMBED_COLLECTION 과 차원 불일치.
+    같은 컬렉션을 재사용하려면 primary 와 동일 모델·차원 필요.
+  - CPU 속도: RPi5 Cortex-A76×4 NEON, Q4_K_M ~0.45s/건.
     폴백은 LM Studio 장애 시에만 발동되므로 허용.
-
-모델 준비:
-  - 다운로드: huggingface-cli download mykor/KURE-v1-gguf --include "*Q8_0*"
-    또는 wget/curl 로 직접 수동 다운로드 후 KURE_GGUF_PATH 지정.
-  - 양자화는 LM Studio 와 동일하게 Q8_0 사용 (호환 필수).
 
 롤백:
   - EMBEDDING_BACKEND=local 으로 기존 minilm 컬렉션 즉시 복귀.
@@ -106,7 +104,7 @@ class LlamaCppEmbeddingFunction:
             import os
             # ── GGUF 파일 존재 확인 / 자동 다운로드 ──────────────────────
             if not self._gguf_path or not os.path.exists(self._gguf_path):
-                self._gguf_path = _ensure_kure_gguf(self._gguf_path)
+                self._gguf_path = _ensure_local_gguf(self._gguf_path)
 
             try:
                 from llama_cpp import Llama  # type: ignore[import]
@@ -140,19 +138,19 @@ def _l2_normalize(v: list[float]) -> list[float]:
 
 _DEFAULT_GGUF_DIR = "/home/asdf/models"
 _HF_REPO = "mykor/KURE-v1-gguf"
-_HF_FILENAME = "KURE-v1-Q8_0.gguf"
-# Q8_0 선택 이유: 사실상 무손실(F16 대비 cosine≈0.9999)이면서
-# LM Studio 쪽과 동일 양자화 → 적재/검색 벡터 호환 보장.
-# 더 빠르게 쓰려면 Q4_K_M(438MB)으로 변경 가능하나 LM Studio도 동일 변경 필요.
+_HF_FILENAME = "KURE-v1-Q4_K_M.gguf"
+# Q4_K_M 선택 이유: Q8_0(600MB, ~0.7s/건) 대비 크기 438MB·속도 ~0.45s/건.
+# 폴백은 LM Studio 장애 시 비상용이라 약간의 품질 손실(~2%) 감수.
+# LOCAL_GGUF_PATH 로 Q8_0 등 다른 양자화를 직접 지정할 수도 있음.
 
 
-def _ensure_kure_gguf(requested_path: str) -> str:
+def _ensure_local_gguf(requested_path: str) -> str:
     """GGUF 파일이 없으면 HuggingFace 에서 자동 다운로드.
 
     Parameters
     ----------
     requested_path : str
-        KURE_GGUF_PATH 설정값. 비어있거나 파일이 없으면 기본 경로에 다운로드.
+        LOCAL_GGUF_PATH 설정값. 비어있거나 파일이 없으면 기본 경로에 다운로드.
 
     Returns
     -------
@@ -176,7 +174,7 @@ def _ensure_kure_gguf(requested_path: str) -> str:
         "로컬 KURE GGUF 파일이 없습니다: %s\n"
         "  HuggingFace(%s)에서 자동 다운로드를 시도합니다...\n"
         "  수동 다운로드: huggingface-cli download %s %s --local-dir %s\n"
-        "  또는 환경변수 KURE_GGUF_PATH 에 기존 GGUF 경로를 지정하세요.",
+        "  또는 환경변수 LOCAL_GGUF_PATH 에 기존 GGUF 경로를 지정하세요.",
         target, _HF_REPO, _HF_REPO, _HF_FILENAME, _DEFAULT_GGUF_DIR,
     )
 
@@ -207,5 +205,5 @@ def _ensure_kure_gguf(requested_path: str) -> str:
             f"  수동 다운로드:\n"
             f"    huggingface-cli download {_HF_REPO} {_HF_FILENAME} "
             f"--local-dir {_DEFAULT_GGUF_DIR}\n"
-            f"  또는 KURE_GGUF_PATH 환경변수에 기존 경로를 지정하세요."
+            f"  또는 LOCAL_GGUF_PATH 환경변수에 기존 경로를 지정하세요."
         ) from exc

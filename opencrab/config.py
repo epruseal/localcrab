@@ -72,10 +72,9 @@ class Settings(BaseSettings):
     #   "local"  — ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d, 영어특화).
     #              기존 동작 그대로. CHROMA_COLLECTION("opencrab_vectors") 사용.
     #              llama-cpp-python / LM Studio 불필요. 롤백 기본값.
-    #   "kure"   — KURE-v1 (한국어 SOTA, 1024d).
-    #              LM Studio GPU(주력) + 로컬 GGUF(폴백) 자동 전환.
-    #              새 컬렉션 CHROMA_COLLECTION_KURE("opencrab_vectors_kure") 사용.
-    #              실측: top-1 5/5, MRR 1.000 vs minilm top-1 0/5, MRR 0.285.
+    #   "openai" — OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백 자동 전환.
+    #              EMBED_COLLECTION("opencrab_vectors_kure") 컬렉션 사용.
+    #              실측(KURE-v1): top-1 5/5, MRR 1.000 vs minilm top-1 0/5, MRR 0.285.
     #
     # 변경 이유: 한국어 검색 품질 개선. minilm 은 한국어 변별 실패 수준.
     # 롤백: EMBEDDING_BACKEND 미설정 또는 "local" 로 되돌리면 기존 컬렉션 그대로.
@@ -83,43 +82,42 @@ class Settings(BaseSettings):
     embedding_backend: str = Field(
         default="local",
         alias="EMBEDDING_BACKEND",
-        # Literal["local", "kure"] — pydantic-settings 호환을 위해 str 사용
+        # Literal["local", "openai"] — pydantic-settings 호환을 위해 str 사용
     )
 
-    # LM Studio 임베딩 서버 설정 (EMBEDDING_BACKEND=kure 시 사용)
+    # OpenAI 호환 임베딩 서버 설정 (EMBEDDING_BACKEND=openai 시 사용)
+    # LM Studio, Ollama, vLLM 등 /v1/embeddings 를 구현한 서버 모두 호환.
     # 대안: openai 패키지 미설치라 httpx 직접 호출 방식 채택.
-    # 기본값은 현재 운용중인 GTX 3090 LM Studio 주소.
     lmstudio_api_base: str = Field(
         default="http://100.77.10.49:1234/v1",
         alias="LMSTUDIO_API_BASE",
     )
-    # LM Studio 에 로드된 KURE 모델 id. /v1/models 로 확인.
-    # 현재 확인된 id: "text-embedding-kure-v1"
+    # 서버에 로드된 임베딩 모델 id. /v1/models 로 확인.
+    # 예: "text-embedding-kure-v1" (KURE-v1), "nomic-embed-text" 등
     lmstudio_embed_model: str = Field(
         default="text-embedding-kure-v1",
         alias="LMSTUDIO_EMBED_MODEL",
     )
-    # KURE 임베딩 차원. KURE-v1 = 1024. 변경 시 컬렉션 재적재 필요.
+    # 임베딩 차원. 사용 모델에 맞게 설정. 변경 시 컬렉션 재적재 필요.
+    # KURE-v1 = 1024, multilingual-e5-small = 384, text-embedding-3-small = 1536.
     embed_dim: int = Field(default=1024, alias="EMBED_DIM")
 
-    # LM Studio HTTP 타임아웃(초). 기본 8s.
-    # 30s로 설정하면 장애 감지가 너무 느림(실측: 폴백까지 32s).
+    # OpenAI 호환 서버 HTTP 타임아웃(초). 기본 8s.
     # 로컬 네트워크 기준 정상 응답은 1-3s이므로 8s면 충분.
     # 느린 원격 네트워크나 대형 배치 요청이라면 LMSTUDIO_TIMEOUT 환경변수로 늘릴 것.
     lmstudio_timeout: float = Field(default=8.0, alias="LMSTUDIO_TIMEOUT")
 
-    # KURE 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
+    # openai 백엔드 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
     # 차원 비호환 문제를 방지한다. 롤백 시 기존 컬렉션은 보존됨.
-    chroma_collection_kure: str = Field(
+    embed_collection: str = Field(
         default="opencrab_vectors_kure",
-        alias="CHROMA_COLLECTION_KURE",
+        alias="EMBED_COLLECTION",
     )
 
-    # 로컬 KURE GGUF 경로 (EMBEDDING_BACKEND=kure, 폴백용).
-    # mykor/KURE-v1-gguf Q8_0 를 다운로드 후 경로 지정.
-    # 비어있으면 폴백 모델 로드 실패 → LM Studio 장애 시 검색 불가.
-    # 예: "/home/asdf/models/KURE-v1-Q8_0.gguf"
-    kure_gguf_path: str = Field(default="", alias="KURE_GGUF_PATH")
+    # 로컬 GGUF 경로 (EMBEDDING_BACKEND=openai 시 폴백용).
+    # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q4_K_M, ~438MB).
+    # 다른 모델을 쓰려면 LOCAL_GGUF_PATH 로 직접 경로 지정.
+    local_gguf_path: str = Field(default="", alias="LOCAL_GGUF_PATH")
 
     # ------------------------------------------------------------------
     # MCP server
