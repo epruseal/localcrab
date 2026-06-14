@@ -4,155 +4,89 @@
 
 # LocalCrab
 
-LocalCrab is a local-first ontology factory: crawl, parse, index evidence, validate against the MetaOntology OS grammar, and export as portable OpenCrab Pack v1 ZIPs.
+LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니다. 문서·데이터를 9-space MetaOntology 그래프로 적재하고, 벡터·BM25·그래프를 결합한 하이브리드 검색을 MCP 인터페이스로 제공합니다. Docker 없이 SQLite + 로컬 Chroma만으로 단일 머신에서 동작합니다.
 
-The hosted SaaS version — **[OpenCrab](https://opencrab.sh)** — ingests packs produced by LocalCrab and distributes them through a marketplace and community ecosystem.
+[AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab)을 기반으로 한 로컬 배포판 fork입니다. 파이썬 패키지명·엔트리포인트는 upstream 머지 충돌을 줄이기 위해 `opencrab`을 유지합니다.
 
-This repository contains:
-- MetaOntology OS grammar, MCP tools, and store backends
-- CrabHarness evidence collection and promotion lifecycle
-- Pack export contracts and schema registry
+호스팅 SaaS인 **[OpenCrab](https://opencrab.sh)**은 별도 서비스입니다. LocalCrab과의 관계는 [관계 문서](./docs/localcrab-opencrab-relationship.md)를 참고하세요.
 
-## What This Repo Is For
+---
 
-| Layer | Role |
-| --- | --- |
-| LocalCrab | Local ontology factory — crawling, parsing, evidence indexing, graph validation, ZIP pack export. |
-| CrabHarness | Mission-first control plane — crawler planning, worker delegation, evidence validation, promotion packages. |
-| MetaOntology OS | Canonical grammar, schemas, ReBAC, identity/canonicalization, promotion lifecycle, MCP server tools. |
+## 핵심 기능
 
-Intended flow:
+- **로컬 우선**: Docker 불필요 — SQLite 그래프·문서 스토어 + 로컬 Chroma 벡터 스토어.
+- **9-space MetaOntology 그래프**: 문법 검증 기반 노드·엣지 적재.
+- **하이브리드 검색**: 벡터(semantic) + BM25(키워드) + 그래프 이웃 탐색을 RRF로 통합.
+- **한국어 검색 품질**: OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백으로 KURE-v1 등 한국어 특화 모델 지원.
+- **MCP 서버**: Claude Code·IDE·원격 클라이언트에 stdio 또는 streamableHTTP로 연결.
+- **팩 내보내기** (선택): 구축한 그래프를 OpenCrab Pack v1 ZIP으로 내보내기 가능.
 
-```text
-source material or crawl target
-        |
-        v
-CrabHarness mission planning
-        |
-        v
-evidence collection + OCR/CLIP indexing
-        |
-        v
-MetaOntology grammar extraction
-        |
-        v
-local graph validation
-        |
-        v
-OpenCrab Pack v1 ZIP
-```
+---
 
-## Quick Start
+## 빠른 시작
 
-### 1. Install
+### 1. 설치
 
 ```bash
 pip install -e ".[dev]"
+# Python 3.11 이상 필요
 ```
 
-### 2. Run
+### 2. 초기화
+
+```bash
+opencrab init
+# 현재 디렉토리에 .env 생성 — LOCAL_DATA_DIR 등 기본 설정 포함
+```
+
+### 3. 실행
 
 ```bash
 opencrab serve
+# STORAGE_MODE=local (기본) — SQLite + 로컬 Chroma
 ```
 
-LocalCrab runs locally by default. It uses SQLite and a local Chroma persistent store under `./opencrab_data`.
+**로컬 모드 스토어 구성:**
 
-**Local mode store backends:**
+| 역할 | 백엔드 | 파일 (`LOCAL_DATA_DIR` 기준) |
+|------|--------|------------------------------|
+| 그래프 | `LocalGraphStore` (SQLite BFS) | `graph.db` |
+| 문서 | `LocalSQLDocStore` (SQLite) | `doc_store.db` |
+| 벡터 | ChromaStore (PersistentClient) | `chroma/` |
+| SQL | SQLStore (SQLite) | `opencrab.db` |
 
-| Role | Backend | File |
-| --- | --- | --- |
-| Graph | `LocalGraphStore` (SQLite BFS) | `opencrab_data/graph.db` |
-| Document | `LocalSQLDocStore` (SQLite) | `opencrab_data/doc_store.db` |
-| Vector | ChromaStore (local PersistentClient) | `opencrab_data/chroma/` |
-| SQL | SQLStore (SQLite) | `opencrab_data/opencrab.db` |
+아키텍처 상세는 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) 참고.
 
-See [Architecture](./docs/ARCHITECTURE.md) for design rationale.
-
-## 임베딩 백엔드
-
-두 가지 임베딩 백엔드를 지원합니다.
-
-**기본 (`local`)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d, 영어 특화.
-설정 없이 동작하며 한국어 검색 품질이 낮습니다.
-
-**권장 (`openai`)**: OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백 자동 전환.
-KURE-v1(1024d) 등 한국어 특화 모델을 사용하면 검색 품질이 크게 향상됩니다.
-
-| 모델 | top-1 | MRR | 정답-무관 마진 | 건당 속도 |
-|------|-------|-----|----------------|-----------|
-| minilm (기본, 384d ONNX) | 0/5 | 0.285 | −0.086 (무관↑) | 0.25s 로컬 |
-| KURE-v1 LM Studio (주력, 1024d) | 5/5 | 1.000 | +0.447 | 0.06s GPU |
-| KURE-v1 로컬 GGUF (폴백, 1024d) | 5/5 | 1.000 | +0.446 | 1.07s CPU |
-
-벡터 일치도(LM Studio↔로컬 GGUF): cosine 평균 0.999853 — 폴백 호환 입증.
-
-### 설정
-
-환경변수:
-
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `EMBEDDING_BACKEND` | `local` | `local` = minilm, `openai` = OpenAI 호환 서버 |
-| `LMSTUDIO_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
-| `LMSTUDIO_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
-| `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 폴백 GGUF 경로 |
-| `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명 |
+### 4. 적재 & 질의
 
 ```bash
-export EMBEDDING_BACKEND=openai
-export LMSTUDIO_API_BASE=http://localhost:1234/v1
-export LMSTUDIO_EMBED_MODEL=text-embedding-kure-v1
-opencrab serve
-```
+# 파일 인제스트 (벡터 + 문서 스토어)
+opencrab ingest ./docs --recursive --extension .md,.txt,.pdf
 
-롤백: `EMBEDDING_BACKEND=local` 또는 미설정 → 기존 minilm 컬렉션 즉시 복귀.
+# 하이브리드 검색
+opencrab query "시스템 성능 지표 및 오류율"
 
-### 초기 적재 (backfill)
-
-`EMBEDDING_BACKEND=openai` 전환 시, 기존 노드를 새 컬렉션으로 재임베딩합니다.
-
-```bash
-export EMBEDDING_BACKEND=openai
-python backfill_kure.py
-```
-
-**Docker backend:**
-
-Set `STORAGE_MODE=docker` to connect to external Neo4j, Chroma, MongoDB, and PostgreSQL instances.
-
-```bash
-STORAGE_MODE=docker opencrab serve
-```
-
-> **SQLite version requirement:** Local mode requires **SQLite 3.9.0+** for `json_extract()`.
-> Check with `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`.
->
-> **`ontology_rebac_check` in local mode:** Graph-based permission traversal uses
-> Python BFS via `find_neighbors()`. Direct and transitive (member_of/manages →
-> permission relation) access paths are fully supported. Complex multi-hop patterns
-> beyond depth 2 are not.
-
-### 3. Verify
-
-```bash
+# 현재 적재된 그래프 상태 확인
 opencrab status
+
+# MetaOntology 전체 문법 출력
 opencrab manifest
-opencrab query "system performance and error rates"
 ```
 
-### 4. Add as MCP server
+### 5. MCP 서버 연결
+
+**stdio (Claude Code 등):**
 
 ```bash
-claude mcp add opencrab -- opencrab serve
+claude mcp add localcrab -- opencrab serve
 ```
 
-Or manually:
+또는 설정 파일에 직접 추가:
 
 ```json
 {
   "mcpServers": {
-    "opencrab": {
+    "localcrab": {
       "command": "opencrab",
       "args": ["serve"]
     }
@@ -160,9 +94,7 @@ Or manually:
 }
 ```
 
-### 5. Remote MCP access via supergateway (optional)
-
-To access LocalCrab from remote devices (e.g. over Tailscale):
+**원격 접근 (supergateway streamableHTTP, Tailscale 등):**
 
 ```bash
 npx -y supergateway \
@@ -170,8 +102,6 @@ npx -y supergateway \
   --port 8765 \
   --stdio "opencrab serve"
 ```
-
-Then connect from any MCP client:
 
 ```json
 {
@@ -184,75 +114,160 @@ Then connect from any MCP client:
 }
 ```
 
-## Migrating from Docker to Local Mode
+---
+
+## CLI 명령어
+
+| 명령어 | 설명 |
+|--------|------|
+| `opencrab init` | `.env` 생성 (기본 설정 템플릿) |
+| `opencrab serve` | MCP 서버 시작 (stdio) |
+| `opencrab status` | 모든 스토어 연결 상태 확인 |
+| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`) |
+| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`) |
+| `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--pack-id`, `--json-output`) |
+| `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
+| `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드) |
+| `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드 |
+| `opencrab export-neo4j-pack` | 그래프 스냅샷을 OpenCrab Pack v1 JSONL로 내보내기 |
+| `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 |
+| `opencrab packs list` | 적재된 팩 목록 |
+| `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
+| `opencrab packs backfill-pack-id` | 노드·엣지에 `pack_id` 역보충 |
+| `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
+
+---
+
+## MCP 툴 (16개)
+
+| 그룹 | 툴 | 설명 |
+|------|----|------|
+| **문법·노드** | `ontology_manifest` | MetaOntology OS 전체 문법 반환 |
+| | `ontology_add_node` | 문법 검증 후 노드 추가/업데이트 |
+| | `ontology_add_edge` | 문법 검증 후 방향 엣지 추가 |
+| **조회** | `ontology_query` | 벡터+BM25+그래프 하이브리드 검색 (RRF 재랭킹, pack 필터, ReBAC 필터) |
+| | `ontology_get_node` | node_id로 단일 노드 조회 |
+| | `ontology_list_nodes` | 노드 목록 (space·pack_id 필터) |
+| | `ontology_list_edges` | 엣지 목록 (pack_id 필터) |
+| **분석** | `ontology_impact` | I1–I7 임팩트 분석 |
+| | `ontology_lever_simulate` | 레버 조정 시 하위 outcome 변화 시뮬레이션 |
+| **콘텐츠 팩** | `content_pack_list` | 적재된 팩 목록 (노드 수·타이틀) |
+| | `pack_create` | 팩 신규 생성 + 노드·엣지·텍스트 인제스트 |
+| | `pack_ingest` | 기존 팩에 노드·엣지·텍스트 추가 |
+| **스키마 팩** | `schema_pack_list` | 사용 가능한 스키마 팩 목록 (설치 여부) |
+| | `schema_pack_install` | 도메인 스키마 팩 설치 |
+| | `schema_pack_uninstall` | 스키마 팩 제거 |
+| **하니스** | `harness_promotion_apply` | CrabHarness PromotionPackage 적용 (`dry_run` 지원) |
+
+> ReBAC/identity/promotion/billing 등 툴은 코드에 있으나 현재 MCP 미노출 상태입니다. `opencrab/mcp/tools.py`에서 해당 툴을 주석 해제하면 복원됩니다.
+
+---
+
+## 임베딩 백엔드
+
+두 가지 임베딩 백엔드를 지원합니다.
+
+**`local` (기본)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮습니다.
+
+**`openai` (권장)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등) + 로컬 GGUF 폴백 자동 전환. KURE-v1 같은 한국어 특화 모델(1024d)을 쓰면 검색 품질이 크게 향상됩니다.
+
+| 모델 | top-1 (5건) | MRR | 정답−무관 마진 | 건당 속도 |
+|------|-------------|-----|----------------|-----------|
+| minilm (기본, 384d ONNX) | 0/5 | 0.285 | −0.086 (무관 문서가 더 가까움) | ~0.25s 로컬 |
+| KURE-v1 LM Studio (주력, 1024d) | **5/5** | **1.000** | **+0.447** | ~0.06s GPU |
+| KURE-v1 로컬 GGUF (폴백, 1024d) | **5/5** | **1.000** | **+0.446** | ~1.07s CPU |
+
+벡터 일치도(LM Studio ↔ 로컬 GGUF): cosine 평균 0.999853 — 폴백 전환 시에도 같은 컬렉션 그대로 사용.
+
+### 설정
+
+| 환경변수 | 기본값 | 설명 |
+|----------|--------|------|
+| `EMBEDDING_BACKEND` | `local` | `local` = minilm, `openai` = OpenAI 호환 서버 |
+| `LMSTUDIO_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
+| `LMSTUDIO_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
+| `EMBED_DIM` | `1024` | 임베딩 차원 (모델에 맞게 설정) |
+| `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 폴백 GGUF 경로 |
+| `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명 |
+| `LMSTUDIO_TIMEOUT` | `8.0` | 서버 응답 타임아웃(초) |
 
 ```bash
-# Dry-run: check connections and data counts, no writes
-uv run python scripts/migrate_to_local.py --dry-run
-
-# Full migration (backs up existing local DB files first)
-uv run python scripts/migrate_to_local.py
+export EMBEDDING_BACKEND=openai
+export LMSTUDIO_API_BASE=http://<lmstudio-host>:1234/v1
+export LMSTUDIO_EMBED_MODEL=text-embedding-kure-v1
+opencrab serve
 ```
 
-See `scripts/migrate_to_local.py --help` for all options.
+**롤백**: `EMBEDDING_BACKEND=local` 또는 미설정 → 기존 minilm 컬렉션으로 즉시 복귀.
 
-## CrabHarness
+### 초기 적재 (backfill)
 
-[`crabharness/`](./crabharness/) is the mission-first control plane for
-evidence collection. It plans what to crawl, delegates heavy work to plugin
-workers, validates the collected bundle, and emits promotion packages.
+`EMBEDDING_BACKEND=openai`로 전환 시, 기존 노드를 새 컬렉션으로 재임베딩합니다.
 
-Core responsibilities:
+```bash
+export EMBEDDING_BACKEND=openai
+python backfill_kure.py
+```
 
-- Decide crawl target, scope, depth, volume, rate limits, and success criteria.
-- Store every collected page, document, file, image, and log as evidence.
-- Preserve hashes, source URLs or paths, crawl timestamps, parser status, and
-  missing-context candidates.
-- Promote only after completeness, semantic relevance, and autoresearch gates pass.
-
-See the [CrabHarness README](./crabharness/README.md).
+---
 
 ## MetaOntology OS
 
 ### 9 Spaces
 
-| Space | Role |
-| --- | --- |
-| subject | Actors with identity, agency, roles, and permissions. |
-| resource | Documents, datasets, tools, APIs, files, and projects. |
-| evidence | Raw observations, logs, text units, parser/OCR outputs, and empirical records. |
-| concept | Entities, concepts, topics, classes, and domain abstractions. |
-| claim | Derived assertions grounded by evidence. |
-| community | Clusters and summaries of related concepts or actors. |
-| outcome | KPIs, risks, impacts, and measurable results. |
-| lever | Tunable controls that affect outcomes or concepts. |
-| policy | Access, sensitivity, approval, and governance rules. |
+| Space | 역할 |
+|-------|------|
+| `subject` | 주체 — identity·agency·역할·권한을 가진 행위자 |
+| `resource` | 자원 — 문서·데이터셋·도구·API·파일·프로젝트 |
+| `evidence` | 증거 — 원시 관측·로그·텍스트 단위·OCR 출력·실증 기록 |
+| `concept` | 개념 — 엔티티·주제·클래스·도메인 추상 |
+| `claim` | 주장 — 증거에 근거한 파생 단언 |
+| `community` | 커뮤니티 — 연관 개념 또는 행위자의 클러스터·요약 |
+| `outcome` | 결과 — KPI·리스크·임팩트·측정 가능한 결과 |
+| `lever` | 레버 — outcome·concept에 영향을 주는 조정 가능한 제어값 |
+| `policy` | 정책 — 접근·민감도·승인·거버넌스 규칙 |
 
-### Grammar Extensions
+### 문법 확장
 
-| from_space | to_space | relations added | purpose |
-|---|---|---|---|
-| `resource` | `concept` | `mentions`, `has_column` | Source documents reference or structurally define concepts. |
-| `concept` | `outcome` | `can_derive_metric` | Concepts that can be computed into a measurable KPI or metric. |
+`opencrab/grammar/manifest.py`의 `META_EDGES`·`SPACES`·`NODE_TYPES`를 수정해 도메인별 엣지 관계와 노드 타입을 추가할 수 있습니다. 기존 공개 문법은 `opencrab manifest`로 확인하세요.
 
-### Core MCP Tools
+---
 
-- `ontology_manifest`: return the full grammar.
-- `ontology_add_node`: add or update a grammar-validated node.
-- `ontology_add_edge`: add a grammar-validated edge.
-- `ontology_query`: hybrid vector + BM25 + graph query.
-- `ontology_impact`: I1–I7 impact analysis.
-- `ontology_rebac_check`: relationship-based access check.
-- `ontology_ingest`: ingest text into the local ontology stores (vector + doc only).
-- `ontology_extract`: LLM-extract nodes/edges from text and write to the full graph.
-- `content_pack_list`: list all content packs by node count and title.
-- `harness_promotion_apply`: apply a CrabHarness promotion package.
+## Docker 모드 (선택)
 
-## OpenCrab Pack v1
+`STORAGE_MODE=docker`로 외부 서비스에 연결합니다.
 
-LocalCrab exports ontology deliveries as OpenCrab Pack v1 ZIPs.
+```bash
+STORAGE_MODE=docker opencrab serve
+```
 
-Required layout:
+| 역할 | 백엔드 |
+|------|--------|
+| 그래프 | Neo4j (`NEO4J_URI`) |
+| 문서 | MongoDB (`MONGODB_URI`) |
+| 벡터 | Chroma HTTP (`CHROMA_HOST:CHROMA_PORT`) |
+| SQL | PostgreSQL (`POSTGRES_URL`) |
+
+> **SQLite 버전 요구사항**: 로컬 모드는 `json_extract()` 사용으로 **SQLite 3.9.0 이상**이 필요합니다.
+> `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"` 로 확인하세요.
+>
+> **로컬 모드 ReBAC 제약**: 그래프 권한 탐색이 Python BFS(`find_neighbors()`)로 동작합니다. 직접 및 전이적(member_of/manages → permission) 경로는 완전 지원. depth 2 초과 복잡한 다중 홉 패턴은 미지원.
+
+### Docker → Local 모드 마이그레이션
+
+```bash
+# Dry-run: 연결 및 데이터 수량 확인 (쓰기 없음)
+uv run python scripts/migrate_to_local.py --dry-run
+
+# 실제 마이그레이션 (기존 로컬 DB 파일 자동 백업)
+uv run python scripts/migrate_to_local.py
+```
+
+---
+
+## 팩 내보내기 (선택 기능)
+
+구축한 그래프를 **OpenCrab Pack v1 ZIP**으로 내보낼 수 있습니다.
 
 ```text
 manifest.json
@@ -268,40 +283,54 @@ sample_queries.json
 community_reports.json
 ```
 
-See [OpenCrab Pack v1 ZIP format](./docs/opencrab-pack-v1.md).
+포맷 상세: [OpenCrab Pack v1 ZIP 형식](./docs/opencrab-pack-v1.md)
 
-## Development
+### CrabHarness
+
+[`crabharness/`](./crabharness/)는 대규모 수집·파싱 작업을 위한 미션 기반 증거 수집 제어판입니다. 크롤 대상·범위·성공 기준을 미션으로 동결하고, 증거 번들을 검증한 뒤 PromotionPackage를 생성합니다. 상세는 [CrabHarness README](./crabharness/README.md) 참고.
+
+---
+
+## 개발
 
 ```bash
-make dev-install
-make seed
-make test
-make status
+make dev-install   # 의존성 설치 (개발 모드)
+make seed          # 샘플 온톨로지 시드 데이터 로드
+make test          # 전체 테스트 실행
+make status        # 스토어 연결 상태 확인
+make manifest      # MetaOntology 문법 출력
+make lint          # ruff 코드 검사
+make format        # black + isort 포매팅
+make coverage      # 커버리지 리포트
 ```
 
-Run integration tests:
+통합 테스트 (Neo4j·MongoDB·Chroma 도커 필요):
 
 ```bash
 OPENCRAB_INTEGRATION=1 pytest tests/ -v
 ```
 
-## Project Structure
+---
+
+## 프로젝트 구조
 
 ```text
 opencrab/
-  grammar/        MetaOntology grammar, validator, glossary
-  schemas/        YAML type schemas, schema packs, action schemas
-  ontology/       builder, query, identity, canonicalization, promotion, ReBAC
-  execution/      workflow and approval runtime
+  grammar/        MetaOntology 문법, 검증기, 용어집
+  schemas/        YAML 타입 스키마, 스키마 팩, 액션 스키마
+  ontology/       빌더, 쿼리, identity, 정규화, 승인, ReBAC
+  execution/      워크플로·승인 런타임
   stores/         Neo4j, Chroma, Mongo, SQL, LocalGraphStore, LocalSQLDocStore
-  mcp/            MCP server and tool registry
+  mcp/            MCP 서버 및 툴 레지스트리
 crabharness/
-  crabharness/    mission planner, runtime, validation, promotion package builder
-  codex_workers/  plugin workers for crawlers and collectors
-  missions/       example missions
-docs/             integration and pack delivery contracts
+  crabharness/    미션 플래너, 런타임, 검증, 프로모션 패키지 빌더
+  codex_workers/  크롤러·수집기 플러그인 워커
+  missions/       예제 미션
+docs/             아키텍처, 팩 형식, 관계 문서
 ```
 
-## License
+---
 
-MIT.
+## 라이선스
+
+MIT. [AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab) 기반 fork.
