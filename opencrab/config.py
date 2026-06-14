@@ -102,8 +102,11 @@ class Settings(BaseSettings):
     # KURE 임베딩 차원. KURE-v1 = 1024. 변경 시 컬렉션 재적재 필요.
     embed_dim: int = Field(default=1024, alias="EMBED_DIM")
 
-    # LM Studio HTTP 타임아웃(초). 기본 30s. 느린 네트워크면 늘릴 것.
-    lmstudio_timeout: float = Field(default=30.0, alias="LMSTUDIO_TIMEOUT")
+    # LM Studio HTTP 타임아웃(초). 기본 8s.
+    # 30s로 설정하면 장애 감지가 너무 느림(실측: 폴백까지 32s).
+    # 로컬 네트워크 기준 정상 응답은 1-3s이므로 8s면 충분.
+    # 느린 원격 네트워크나 대형 배치 요청이라면 LMSTUDIO_TIMEOUT 환경변수로 늘릴 것.
+    lmstudio_timeout: float = Field(default=8.0, alias="LMSTUDIO_TIMEOUT")
 
     # KURE 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
     # 차원 비호환 문제를 방지한다. 롤백 시 기존 컬렉션은 보존됨.
