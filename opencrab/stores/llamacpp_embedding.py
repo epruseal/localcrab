@@ -113,7 +113,7 @@ class LlamaCppEmbeddingFunction:
                     "llama-cpp-python 이 설치되지 않았습니다. "
                     "pip install llama-cpp-python 으로 설치하세요."
                 ) from exc
-            logger.info("로컬 KURE GGUF 로드 중: %s", self._gguf_path)
+            logger.info("로컬 GGUF 로드 중: %s", self._gguf_path)
             self._llm = Llama(
                 model_path=self._gguf_path,
                 embedding=True,
@@ -121,7 +121,7 @@ class LlamaCppEmbeddingFunction:
                 n_threads=self._n_threads,
                 verbose=False,
             )
-            logger.info("로컬 KURE GGUF 로드 완료 (dim=%d)", self._dim)
+            logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
         return self._llm
 
 
