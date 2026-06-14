@@ -6,6 +6,8 @@
 
 LocalCrab is a local-first ontology factory: crawl, parse, index evidence, validate against the MetaOntology OS grammar, and export as portable OpenCrab Pack v1 ZIPs.
 
+The hosted SaaS version — **[OpenCrab](https://opencrab.sh)** — ingests packs produced by LocalCrab and distributes them through a marketplace and community ecosystem.
+
 This repository contains:
 - MetaOntology OS grammar, MCP tools, and store backends
 - CrabHarness evidence collection and promotion lifecycle
