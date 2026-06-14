@@ -1,10 +1,13 @@
 # LocalCrab and OpenCrab SaaS Relationship
 
-OpenCrab is designed as one product with two deployment surfaces.
+LocalCrab은 **[AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab)** 기반
+로컬 배포판 fork입니다. 패키지명·엔트리포인트는 upstream 머지 충돌을 줄이려 `opencrab`을
+유지합니다.
 
-LocalCrab is the local ontology factory. OpenCrab SaaS, available at
-[opencrab.sh](https://opencrab.sh), is the hosted ecosystem where finished
-packs are ingested, distributed, installed, queried, and sold or shared.
+LocalCrab is a standalone local ontology service — it runs on a single machine
+without Docker using SQLite and a local Chroma client. OpenCrab SaaS, available at
+[opencrab.sh](https://opencrab.sh), is a separate hosted ecosystem where packs are
+ingested, distributed, installed, queried, and shared.
 
 The hosted SaaS implementation is private and is intentionally not included in
 this public repository.
@@ -13,7 +16,7 @@ this public repository.
 
 | System | Primary responsibility | Optimized for |
 | --- | --- | --- |
-| LocalCrab | Build high-quality ontology packs from local files, crawled sources, OCR/CLIP outputs, and Neo4j validation. | Quality, evidence coverage, reproducibility. |
+| LocalCrab | Run a local ontology knowledge service — load docs/data into a 9-space MetaOntology graph and serve hybrid search (vector + BM25 + graph) via MCP. Optionally export OpenCrab Pack v1 ZIPs. | Local-first, no Docker, quality, reproducibility. |
 | OpenCrab SaaS | Ingest OpenCrab packs, manage users and profiles, expose hosted MCP access, and distribute packs through marketplace/community surfaces. | Ecosystem growth, distribution, hosted usability. |
 | GitHub repository | Provide public grammar, LocalCrab runtime, CrabHarness, pack format, examples, and developer onboarding. | International developer access and trust. |
 
@@ -79,21 +82,22 @@ developer infrastructure. It must not be described as the production
 
 Use this sentence when explaining the system publicly:
 
-> LocalCrab is the open ontology factory; OpenCrab SaaS is the hosted ecosystem.
+> LocalCrab is an open-source local ontology knowledge service; OpenCrab SaaS is the hosted ecosystem.
 
 For developers:
 
-> Build and validate ontology packs locally, then bring them to opencrab.sh for
-> hosted ingestion, distribution, and agent access.
+> Run LocalCrab locally to build a knowledge graph and serve hybrid search via MCP.
+> Optionally export packs to opencrab.sh for hosted distribution and agent access.
 
 For pack creators:
 
-> LocalCrab gives you quality control before your ontology reaches users.
+> LocalCrab gives you local quality control and evidence traceability before
+> your ontology reaches users.
 
 For SaaS users:
 
 > OpenCrab SaaS lets you install, query, share, and monetize ontology packs
-> without running the local factory.
+> without running the local service.
 
 ## Compatibility Rule
 

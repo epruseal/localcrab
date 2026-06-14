@@ -4,6 +4,11 @@
 **브랜치**: `ladybug/feasibility`  
 **결론**: **조건부 Go** — LD_PRELOAD 워크어라운드 필요
 
+> **후속 (2026-06-14 기준): 채택 완료** — kuzu 0.11.3 설치, `KuzuGraphStore` 구현·검증 완료
+> (469 passed, 0 failed). `STORAGE_MODE=kuzu`로 활성화. `madv_noop.so` LD_PRELOAD 자동 주입
+> (`factory.py:_ensure_madv_noop()`). `lookup_node_type()` duck-typing 인터페이스 추가로
+> `builder.add_edge` local/kuzu/neo4j 3모드 통일. 본 보고서는 의사결정 기록으로 보존.
+
 ---
 
 ## 배경
