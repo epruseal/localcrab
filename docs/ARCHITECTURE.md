@@ -9,6 +9,7 @@
 5. [마이그레이션 절차](#5-마이그레이션-절차)
 6. [BM25 커버리지 경고](#6-bm25-커버리지-경고)
 7. [SQLite 버전 요구사항](#7-sqlite-버전-요구사항)
+8. [임베딩 백엔드 (EMBEDDING_BACKEND)](#8-임베딩-백엔드-embedding_backend)
 
 ---
 
@@ -361,3 +362,42 @@ python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
 `LocalSQLDocStore`는 `json_extract()`를 사용하지 않으므로 (properties 파싱은
 Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지만 추가 제약은
 없다.
+
+---
+
+## 8. 임베딩 백엔드 (EMBEDDING_BACKEND)
+
+`EMBEDDING_BACKEND` 환경변수로 전환:
+- `local` (기본): ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d). 컬렉션: `opencrab_vectors`.
+- `kure` (권장): KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`.
+
+**KURE 아키텍처**:
+```
+make_vector_store(settings)
+  └─ EMBEDDING_BACKEND=kure
+       └─ ChromaStore("opencrab_vectors_kure", ef=ResilientEmbeddingFunction)
+            ├─ primary: LMStudioEmbeddingFunction (GPU, http://100.77.10.49:1234)
+            └─ fallback: LlamaCppEmbeddingFunction (RPi5 CPU, 로컬 GGUF Q8_0)
+```
+
+- **단일 컬렉션**: 적재·검색·폴백 모두 동일 KURE-v1 가중치(Q8_0) → 벡터 완전 호환.
+- **자동 폴백**: LM Studio 장애 시 로컬 GGUF로 15초 TTL 전환, 복구 후 자동 복귀.
+- **GGUF 자동 다운로드**: `KURE_GGUF_PATH` 미설정·파일 없으면 HuggingFace에서 자동 다운로드.
+- **컬렉션 분리**: minilm(384d)과 KURE(1024d)는 차원이 달라 별도 컬렉션 유지. 롤백 즉시 가능.
+
+관련 파일:
+- `opencrab/stores/lmstudio_embedding.py` — LM Studio EF
+- `opencrab/stores/llamacpp_embedding.py` — 로컬 GGUF EF (자동 다운로드 포함)
+- `opencrab/stores/resilient_embedding.py` — 폴백 자동 전환 래퍼
+- `opencrab/stores/factory.py` — `make_vector_store` 백엔드 분기
+- `opencrab/config.py` — `embedding_backend`, `lmstudio_*`, `kure_gguf_path` 등
+
+성능 비교 (실측):
+
+| 모델 | top-1 | MRR | 정답-무관 마진 | 건당 속도 |
+|------|-------|-----|----------------|-----------|
+| minilm (기존, 384d ONNX) | 0/5 | 0.285 | -0.086 (무관↑) | 0.25s 로컬 |
+| KURE-v1 LM Studio (주력, 1024d) | 5/5 | 1.000 | +0.447 | 0.06s GPU |
+| KURE-v1 로컬 GGUF (폴백, 1024d) | 5/5 | 1.000 | +0.446 | 1.07s CPU |
+
+벡터 일치도(LM Studio↔로컬 GGUF): cosine 평균 0.999853 — 폴백 호환 입증.

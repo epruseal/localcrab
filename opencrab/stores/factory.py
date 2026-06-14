@@ -66,10 +66,57 @@ def make_graph_store(settings: Settings) -> Any:
 
 
 def make_vector_store(settings: Settings) -> Any:
-    """Return ChromaStore in local or docker mode."""
+    """임베딩 백엔드에 따라 ChromaStore 반환.
+
+    EMBEDDING_BACKEND 환경변수로 선택:
+      "local" (기본): ChromaDB 기본 EF (all-MiniLM-L6-v2, 384d).
+                      기존 컬렉션("opencrab_vectors") 그대로 사용. 롤백 경로.
+      "kure"        : KURE-v1 (한국어 SOTA, 1024d) 임베딩.
+                      LM Studio GPU(주력) → 장애 시 로컬 GGUF(폴백) 자동 전환.
+                      새 컬렉션("opencrab_vectors_kure") 사용. 차원 비호환 방지.
+
+    변경 이유: 한국어 검색 품질 개선. minilm 실측 MRR 0.285 vs KURE 1.000.
+    """
     from opencrab.stores.chroma_store import ChromaStore
 
     chroma_path = os.path.join(settings.local_data_dir, "chroma")
+
+    if settings.embedding_backend == "kure":
+        # KURE-v1 백엔드: LM Studio GPU 주력 + 로컬 GGUF 폴백
+        from opencrab.stores.lmstudio_embedding import LMStudioEmbeddingFunction
+        from opencrab.stores.llamacpp_embedding import LlamaCppEmbeddingFunction
+        from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
+
+        primary_ef = LMStudioEmbeddingFunction(
+            api_base=settings.lmstudio_api_base,
+            model=settings.lmstudio_embed_model,
+            dim=settings.embed_dim,
+            timeout=settings.lmstudio_timeout,
+        )
+        # kure_gguf_path 가 비어있으면 폴백 없이 primary 만 사용.
+        # LM Studio 장애 시 검색 불가하므로 운용 전 경로 지정 권장.
+        if settings.kure_gguf_path:
+            fallback_ef = LlamaCppEmbeddingFunction(
+                gguf_path=settings.kure_gguf_path,
+                dim=settings.embed_dim,
+            )
+            ef = ResilientEmbeddingFunction(primary=primary_ef, fallback=fallback_ef)
+        else:
+            # 폴백 없이 primary 만 사용 (KURE_GGUF_PATH 미설정).
+            # 이 경우 LM Studio 장애 시 임베딩 오류 발생.
+            ef = primary_ef  # type: ignore[assignment]
+
+        return ChromaStore(
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+            collection_name=settings.chroma_collection_kure,
+            local_mode=settings.is_local,
+            local_path=chroma_path,
+            embedding_function=ef,
+        )
+
+    # 기존 경로: EMBEDDING_BACKEND=local 또는 미설정
+    # ChromaDB 기본 EF (minilm, 384d) 사용. 기존 동작 100% 보존.
     return ChromaStore(
         host=settings.chroma_host,
         port=settings.chroma_port,

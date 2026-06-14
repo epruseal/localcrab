@@ -96,6 +96,50 @@ See [Architecture](./docs/ARCHITECTURE.md) for the design rationale and the
 [Phase 2 roadmap](./docs/ARCHITECTURE.md#phase-2-ladybugdb-graph-store) for
 the planned LadybugDB graph store replacement.
 
+## 임베딩 백엔드
+
+localcrab은 두 가지 임베딩 백엔드를 지원합니다.
+
+**기본 (local)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d, 영어 특화.
+설정 없이 동작하며, 한국어 검색 품질이 낮습니다.
+
+**권장 (kure)**: KURE-v1, 한국어 검색 특화, 1024d.
+LM Studio GPU(주력) + 로컬 GGUF(폴백) 자동 전환.
+
+| 모델 | top-1 | MRR | 정답-무관 마진 | 건당 속도 |
+|------|-------|-----|----------------|-----------|
+| minilm (기존, 384d ONNX) | 0/5 | 0.285 | -0.086 (무관↑) | 0.25s 로컬 |
+| KURE-v1 LM Studio (주력, 1024d) | 5/5 | 1.000 | +0.447 | 0.06s GPU |
+| KURE-v1 로컬 GGUF (폴백, 1024d) | 5/5 | 1.000 | +0.446 | 1.07s CPU |
+
+벡터 일치도(LM Studio↔로컬 GGUF): cosine 평균 0.999853 — 폴백 호환 입증.
+
+### KURE 임베딩 백엔드 설정
+
+```bash
+# 1. LM Studio에 text-embedding-kure-v1 (mykor/KURE-v1-gguf Q8_0) 로드
+# 2. EnvironmentFile 생성 (이미 /home/asdf/.openclaw/localcrab-kure.env 존재)
+# 3. systemd 유닛에 EnvironmentFile 적용 후 재시작
+systemctl --user daemon-reload
+systemctl --user restart localcrab-gateway localcrab-api localcrab-tunnel
+
+# 롤백: localcrab-kure.env 에서 EMBEDDING_BACKEND=local 로 변경 후 재시작
+```
+
+환경변수:
+- `EMBEDDING_BACKEND=kure` — KURE 백엔드 활성화 (기본 `local` = 기존 minilm)
+- `LMSTUDIO_API_BASE` — LM Studio 주소 (기본 `http://100.77.10.49:1234/v1`)
+- `LMSTUDIO_EMBED_MODEL` — 모델 id (기본 `text-embedding-kure-v1`)
+- `KURE_GGUF_PATH` — 로컬 폴백 GGUF 경로 (없으면 자동 다운로드 시도)
+
+### 초기 적재 (KURE 컬렉션 backfill)
+
+```bash
+# KURE 환경변수 적용 후 기존 노드/청크를 KURE 컬렉션으로 재임베딩
+source /home/asdf/.openclaw/localcrab-kure.env
+python /home/asdf/opencrab-dump/backfill_kure.py
+```
+
 **Docker backend (recommended for production use):**
 
 Set `STORAGE_MODE=docker` to connect to external Neo4j, Chroma, MongoDB, and
