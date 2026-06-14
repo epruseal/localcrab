@@ -1,32 +1,27 @@
 <p align="center">
-  <img src="logo.png" alt="OpenCrab Logo" width="260"/>
+  <img src="logo.png" alt="LocalCrab Logo" width="260"/>
 </p>
 
-# OpenCrab
+# LocalCrab
 
-**LocalCrab builds. OpenCrab SaaS distributes.**
+LocalCrab is a local-first ontology factory: crawl, parse, index evidence, validate against the MetaOntology OS grammar, and export as portable OpenCrab Pack v1 ZIPs.
 
-OpenCrab is the public integration repository for the LocalCrab ontology
-factory and the OpenCrab hosted ecosystem at [opencrab.sh](https://opencrab.sh).
+The hosted SaaS version — **[OpenCrab](https://opencrab.sh)** — ingests packs produced by LocalCrab and distributes them through a marketplace and community ecosystem.
 
-This repository contains the local engine: MetaOntology OS grammar, MCP tools,
-CrabHarness evidence collection, local stores, promotion lifecycle, and pack
-export contracts. It does **not** contain the private implementation of the
-hosted `opencrab.sh` SaaS product.
-
-Any sample app or API code in this repository is local/demo infrastructure for
-developer testing. It is not the production `opencrab.sh` SaaS code.
+This repository contains:
+- MetaOntology OS grammar, MCP tools, and store backends
+- CrabHarness evidence collection and promotion lifecycle
+- Pack export contracts and schema registry
 
 ## What This Repo Is For
 
-| Layer | Role | Lives here? |
-| --- | --- | --- |
-| LocalCrab | Local ontology factory for crawling, parsing, evidence indexing, Neo4j validation, and ZIP pack export. | Yes |
-| CrabHarness | Mission-first control plane for crawler planning, worker delegation, evidence validation, and promotion packages. | Yes |
-| MetaOntology OS | Canonical grammar, schemas, ReBAC, identity/canonicalization, promotion lifecycle, and MCP server tools. | Yes |
-| OpenCrab SaaS | Hosted ingestion, marketplace, profiles, MCP access, community, and paid/free pack circulation. | No, linked via [opencrab.sh](https://opencrab.sh) |
+| Layer | Role |
+| --- | --- |
+| LocalCrab | Local ontology factory — crawling, parsing, evidence indexing, graph validation, ZIP pack export. |
+| CrabHarness | Mission-first control plane — crawler planning, worker delegation, evidence validation, promotion packages. |
+| MetaOntology OS | Canonical grammar, schemas, ReBAC, identity/canonicalization, promotion lifecycle, MCP server tools. |
 
-The intended flow:
+Intended flow:
 
 ```text
 source material or crawl target
@@ -41,47 +36,27 @@ evidence collection + OCR/CLIP indexing
 MetaOntology grammar extraction
         |
         v
-Neo4j/Cypher validation
+local graph validation
         |
         v
 OpenCrab Pack v1 ZIP
-        |
-        v
-opencrab.sh ingest + marketplace + ecosystem distribution
 ```
-
-## LocalCrab and OpenCrab SaaS
-
-LocalCrab is quality-first. It exists to produce ontology packs with strong
-evidence coverage, traceable parsing, OCR/CLIP context, graph validation, and
-promotion receipts.
-
-OpenCrab SaaS is ecosystem-first. It exists to ingest packs, make them useful
-to users and agents, distribute them through marketplace/community surfaces,
-and expose hosted MCP access.
-
-Read the full relationship model:
-
-- [LocalCrab and OpenCrab SaaS relationship](./docs/localcrab-opencrab-relationship.md)
-- [LocalCrab factory workflow](./docs/localcrab-factory-workflow.md)
-- [OpenCrab Pack v1 ZIP format](./docs/opencrab-pack-v1.md)
 
 ## Quick Start
 
-### 1. Install LocalCrab
+### 1. Install
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 2. Run LocalCrab
+### 2. Run
 
 ```bash
 opencrab serve
 ```
 
-LocalCrab runs locally by default. It uses SQLite and a local Chroma
-persistent store under `./opencrab_data`.
+LocalCrab runs locally by default. It uses SQLite and a local Chroma persistent store under `./opencrab_data`.
 
 **Local mode store backends:**
 
@@ -92,34 +67,73 @@ persistent store under `./opencrab_data`.
 | Vector | ChromaStore (local PersistentClient) | `opencrab_data/chroma/` |
 | SQL | SQLStore (SQLite) | `opencrab_data/opencrab.db` |
 
-See [Architecture](./docs/ARCHITECTURE.md) for the design rationale and the
-[Phase 2 roadmap](./docs/ARCHITECTURE.md#phase-2-ladybugdb-graph-store) for
-the planned LadybugDB graph store replacement.
+See [Architecture](./docs/ARCHITECTURE.md) for design rationale.
 
-**Docker backend (recommended for production use):**
+## 임베딩 백엔드
 
-Set `STORAGE_MODE=docker` to connect to external Neo4j, Chroma, MongoDB, and
-PostgreSQL instances instead of the local SQLite/file fallbacks.
+두 가지 임베딩 백엔드를 지원합니다.
+
+**기본 (`local`)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d, 영어 특화.
+설정 없이 동작하며 한국어 검색 품질이 낮습니다.
+
+**권장 (`openai`)**: OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백 자동 전환.
+KURE-v1(1024d) 등 한국어 특화 모델을 사용하면 검색 품질이 크게 향상됩니다.
+
+| 모델 | top-1 | MRR | 정답-무관 마진 | 건당 속도 |
+|------|-------|-----|----------------|-----------|
+| minilm (기본, 384d ONNX) | 0/5 | 0.285 | −0.086 (무관↑) | 0.25s 로컬 |
+| KURE-v1 LM Studio (주력, 1024d) | 5/5 | 1.000 | +0.447 | 0.06s GPU |
+| KURE-v1 로컬 GGUF (폴백, 1024d) | 5/5 | 1.000 | +0.446 | 1.07s CPU |
+
+벡터 일치도(LM Studio↔로컬 GGUF): cosine 평균 0.999853 — 폴백 호환 입증.
+
+### 설정
+
+환경변수:
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `EMBEDDING_BACKEND` | `local` | `local` = minilm, `openai` = OpenAI 호환 서버 |
+| `LMSTUDIO_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
+| `LMSTUDIO_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
+| `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 폴백 GGUF 경로 |
+| `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명 |
+
+```bash
+export EMBEDDING_BACKEND=openai
+export LMSTUDIO_API_BASE=http://localhost:1234/v1
+export LMSTUDIO_EMBED_MODEL=text-embedding-kure-v1
+opencrab serve
+```
+
+롤백: `EMBEDDING_BACKEND=local` 또는 미설정 → 기존 minilm 컬렉션 즉시 복귀.
+
+### 초기 적재 (backfill)
+
+`EMBEDDING_BACKEND=openai` 전환 시, 기존 노드를 새 컬렉션으로 재임베딩합니다.
+
+```bash
+export EMBEDDING_BACKEND=openai
+python backfill_kure.py
+```
+
+**Docker backend:**
+
+Set `STORAGE_MODE=docker` to connect to external Neo4j, Chroma, MongoDB, and PostgreSQL instances.
 
 ```bash
 STORAGE_MODE=docker opencrab serve
 ```
 
-> Without `STORAGE_MODE=docker`, the graph store falls back to a SQLite-backed
-> `LocalGraphStore`. All MCP tools — including `content_pack_list`,
-> `ontology_query`, `ontology_lever_simulate`, `ontology_rebac_check`, and
-> `export` — are fully supported in local mode via native SQLite queries.
+> **SQLite version requirement:** Local mode requires **SQLite 3.9.0+** for `json_extract()`.
+> Check with `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`.
 >
-> **SQLite version requirement:** Local mode uses `json_extract()` which
-> requires **SQLite 3.9.0 or later** (released 2015-10-14). The system SQLite
-> version must meet this minimum. Check with `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`.
->
-> **Note on `ontology_rebac_check` in local mode:** Graph-based permission
-> traversal uses Python BFS via `find_neighbors()` instead of Cypher. Direct
-> and transitive (member_of/manages → permission relation) access paths are
-> fully supported. Complex multi-hop patterns beyond depth 2 are not.
+> **`ontology_rebac_check` in local mode:** Graph-based permission traversal uses
+> Python BFS via `find_neighbors()`. Direct and transitive (member_of/manages →
+> permission relation) access paths are fully supported. Complex multi-hop patterns
+> beyond depth 2 are not.
 
-### 3. Verify the grammar and query path
+### 3. Verify
 
 ```bash
 opencrab status
@@ -127,13 +141,13 @@ opencrab manifest
 opencrab query "system performance and error rates"
 ```
 
-### 4. Add LocalCrab as an MCP server
+### 4. Add as MCP server
 
 ```bash
 claude mcp add opencrab -- opencrab serve
 ```
 
-Or add it manually:
+Or manually:
 
 ```json
 {
@@ -148,15 +162,13 @@ Or add it manually:
 
 ### 5. Remote MCP access via supergateway (optional)
 
-LocalCrab exposes a stdio MCP server. To access it from remote devices
-(e.g. over Tailscale), bridge it to streamableHttp using
-[supergateway](https://github.com/supermachineai/supergateway):
+To access LocalCrab from remote devices (e.g. over Tailscale):
 
 ```bash
-STORAGE_MODE=docker npx -y supergateway \
+npx -y supergateway \
   --outputTransport streamableHttp \
   --port 8765 \
-  --stdio "python -m opencrab.cli serve"
+  --stdio "opencrab serve"
 ```
 
 Then connect from any MCP client:
@@ -172,15 +184,7 @@ Then connect from any MCP client:
 }
 ```
 
-> Local mode (`STORAGE_MODE=local`) is suitable for single-machine use.
-> All MCP tools including `ontology_rebac_check` and keyword search work
-> in local mode via SQLite-native implementations. Set `STORAGE_MODE=docker`
-> only when connecting to external Neo4j/MongoDB/PostgreSQL services.
-
 ## Migrating from Docker to Local Mode
-
-If you have existing data in the docker backend (Neo4j + MongoDB + PostgreSQL
-+ HTTP Chroma) and want to migrate to local mode:
 
 ```bash
 # Dry-run: check connections and data counts, no writes
@@ -188,10 +192,6 @@ uv run python scripts/migrate_to_local.py --dry-run
 
 # Full migration (backs up existing local DB files first)
 uv run python scripts/migrate_to_local.py
-
-# Switch to local mode
-# Edit .env: STORAGE_MODE=local
-# Then: opencrab serve
 ```
 
 See `scripts/migrate_to_local.py --help` for all options.
@@ -200,8 +200,7 @@ See `scripts/migrate_to_local.py --help` for all options.
 
 [`crabharness/`](./crabharness/) is the mission-first control plane for
 evidence collection. It plans what to crawl, delegates heavy work to plugin
-workers, validates the collected bundle, and emits OpenCrab-ready promotion
-packages.
+workers, validates the collected bundle, and emits promotion packages.
 
 Core responsibilities:
 
@@ -209,15 +208,11 @@ Core responsibilities:
 - Store every collected page, document, file, image, and log as evidence.
 - Preserve hashes, source URLs or paths, crawl timestamps, parser status, and
   missing-context candidates.
-- Promote only after completeness, semantic relevance, and autoresearch gates
-  pass.
+- Promote only after completeness, semantic relevance, and autoresearch gates pass.
 
 See the [CrabHarness README](./crabharness/README.md).
 
 ## MetaOntology OS
-
-LocalCrab keeps the existing MetaOntology OS grammar and MCP surface as the
-canonical ontology contract.
 
 ### 9 Spaces
 
@@ -235,12 +230,9 @@ canonical ontology contract.
 
 ### Grammar Extensions
 
-The following META_EDGES have been added to `opencrab/grammar/manifest.py`
-beyond the original set:
-
 | from_space | to_space | relations added | purpose |
 |---|---|---|---|
-| `resource` | `concept` | `mentions`, `has_column` | Source documents reference or structurally define concepts (keyword extraction, schema columns). |
+| `resource` | `concept` | `mentions`, `has_column` | Source documents reference or structurally define concepts. |
 | `concept` | `outcome` | `can_derive_metric` | Concepts that can be computed into a measurable KPI or metric. |
 
 ### Core MCP Tools
@@ -249,20 +241,18 @@ beyond the original set:
 - `ontology_add_node`: add or update a grammar-validated node.
 - `ontology_add_edge`: add a grammar-validated edge.
 - `ontology_query`: hybrid vector + BM25 + graph query.
-- `ontology_impact`: I1-I7 impact analysis.
+- `ontology_impact`: I1–I7 impact analysis.
 - `ontology_rebac_check`: relationship-based access check.
 - `ontology_ingest`: ingest text into the local ontology stores (vector + doc only).
-- `ontology_extract`: LLM-extract nodes/edges from text and write to the full graph. Supports `backend="cli"` to use the local `claude -p` CLI (subscription auth, no API key required) or `backend="api"` for direct Anthropic SDK calls.
-- `content_pack_list`: list all content packs loaded in Neo4j (`pack_id`, node count, title). Unlike `schema_pack_list`, this reflects actual ingested content nodes.
+- `ontology_extract`: LLM-extract nodes/edges from text and write to the full graph.
+- `content_pack_list`: list all content packs by node count and title.
 - `harness_promotion_apply`: apply a CrabHarness promotion package.
 
 ## OpenCrab Pack v1
 
-LocalCrab exports ontology deliveries as an OpenCrab Pack v1 ZIP. The pack is
-designed to be recognized by OpenCrab SaaS while remaining reproducible in a
-local Neo4j environment.
+LocalCrab exports ontology deliveries as OpenCrab Pack v1 ZIPs.
 
-Required high-level layout:
+Required layout:
 
 ```text
 manifest.json
@@ -276,12 +266,6 @@ neo4j/export_status.json
 README.md
 sample_queries.json
 community_reports.json
-```
-
-The packaging pipeline is:
-
-```text
-validate -> Neo4j import/check -> Neo4j graph export -> normalized SaaS export -> ZIP package
 ```
 
 See [OpenCrab Pack v1 ZIP format](./docs/opencrab-pack-v1.md).
@@ -309,26 +293,14 @@ opencrab/
   schemas/        YAML type schemas, schema packs, action schemas
   ontology/       builder, query, identity, canonicalization, promotion, ReBAC
   execution/      workflow and approval runtime
-  billing/        local usage hooks
   stores/         Neo4j, Chroma, Mongo, SQL, LocalGraphStore, LocalSQLDocStore
   mcp/            MCP server and tool registry
 crabharness/
   crabharness/    mission planner, runtime, validation, promotion package builder
   codex_workers/  plugin workers for crawlers and collectors
   missions/       example missions
-docs/             public integration and pack delivery contracts
+docs/             integration and pack delivery contracts
 ```
-
-## Korean Summary
-
-이 리포지토리는 LocalCrab과 OpenCrab SaaS를 하나의 제품처럼 설명하는 공개 통합
-리포지토리입니다. LocalCrab은 온톨로지 공장입니다. 크롤링, 파싱, OCR, CLIP
-이미지 컨텍스트, evidence 풀 인덱싱, Neo4j 검증, ZIP 팩 생성을 담당합니다.
-
-OpenCrab SaaS는 [opencrab.sh](https://opencrab.sh)의 생태계 허브입니다. 완성된
-팩을 인제스트하고, 마켓플레이스와 커뮤니티에서 배포하며, hosted MCP 접근을
-제공합니다. 단, `opencrab.sh`의 내부 SaaS 코드는 이 공개 리포지토리에 포함하지
-않습니다.
 
 ## License
 

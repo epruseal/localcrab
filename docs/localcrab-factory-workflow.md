@@ -246,6 +246,34 @@ For every pack, add benchmark steering checks before promotion:
 These gates are designed so OpenCrab does not merely retrieve documents. It
 retrieves the relationship structure that explains why the answer is true.
 
+## make_vector_store 분기 (EMBEDDING_BACKEND)
+
+LocalCrab의 `make_vector_store` 함수는 환경변수 `EMBEDDING_BACKEND`로 분기한다.
+
+### `local` (기본값)
+
+기존 ChromaStore(`opencrab_vectors`, minilm 384d)를 반환한다. 코드 무변경.
+
+### `kure`
+
+ChromaStore(`opencrab_vectors_kure`, 1024d)와 ResilientEmbeddingFunction을 반환한다.
+
+```
+ResilientEF = LMStudioEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운로드)
+```
+
+- **LMStudioEF (primary)**: LM Studio가 로컬에서 서빙 중인 KURE 모델에 요청.
+- **LlamaCppEF (fallback)**: primary 실패 시 lazy load. 모델 파일이 없으면 자동 다운로드 후 llama-cpp-python으로 직접 임베딩.
+
+### 워크플로 호환성
+
+- `run_ingest_workflow.py`는 subprocess 오케스트레이터라 스토어를 직접 다루지 않는다.
+  하위 `load_local_packs.py`가 `EMBEDDING_BACKEND` env를 따라가므로 자동 KURE 사용.
+- **Chroma PersistentClient 단일 프로세스 락**: backfill 중 게이트웨이는 중단 필요.
+  backfill 완료 후 게이트웨이를 재기동하면 `opencrab_vectors_kure` 컬렉션에 연결된다.
+
+---
+
 ## Promotion Rule
 
 LocalCrab should be conservative:
