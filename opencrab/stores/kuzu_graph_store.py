@@ -146,6 +146,11 @@ class KuzuGraphStore:
         props.setdefault("id", node_id)
         return props
 
+    def lookup_node_type(self, node_id: str) -> str | None:
+        """builder.add_edge duck-typing 인터페이스 — LocalGraphStore·Neo4jStore와 동일 시그니처."""
+        info = self.get_node_by_id(node_id)
+        return info.get("node_type") if info else None
+
     def delete_node(self, node_type: str, node_id: str) -> bool:
         if not self._available:
             raise RuntimeError("KuzuGraphStore is not available.")

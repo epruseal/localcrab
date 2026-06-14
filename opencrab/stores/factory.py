@@ -66,10 +66,51 @@ def make_graph_store(settings: Settings) -> Any:
 
 
 def make_vector_store(settings: Settings) -> Any:
-    """Return ChromaStore in local or docker mode."""
+    """임베딩 백엔드에 따라 ChromaStore 반환.
+
+    EMBEDDING_BACKEND 환경변수로 선택:
+      "local"  (기본): ChromaDB 기본 EF (all-MiniLM-L6-v2, 384d).
+                       기존 컬렉션("opencrab_vectors") 그대로 사용. 롤백 경로.
+      "openai"        : OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백.
+                       EMBED_COLLECTION("opencrab_vectors_kure") 사용. 차원 비호환 방지.
+
+    변경 이유: 한국어 검색 품질 개선. minilm 실측 MRR 0.285 vs KURE-v1 1.000.
+    """
     from opencrab.stores.chroma_store import ChromaStore
 
     chroma_path = os.path.join(settings.local_data_dir, "chroma")
+
+    if settings.embedding_backend == "openai":
+        # OpenAI 호환 서버 백엔드: GPU 주력 + 로컬 GGUF 폴백
+        from opencrab.stores.lmstudio_embedding import LMStudioEmbeddingFunction
+        from opencrab.stores.llamacpp_embedding import LlamaCppEmbeddingFunction
+        from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
+
+        primary_ef = LMStudioEmbeddingFunction(
+            api_base=settings.lmstudio_api_base,
+            model=settings.lmstudio_embed_model,
+            dim=settings.embed_dim,
+            timeout=settings.lmstudio_timeout,
+        )
+        # local_gguf_path 가 비어있으면 llamacpp_embedding._ensure_local_gguf() 가
+        # KURE-v1-Q4_K_M 을 자동 다운로드. LM Studio 장애 시 폴백으로 사용됨.
+        fallback_ef = LlamaCppEmbeddingFunction(
+            gguf_path=settings.local_gguf_path,
+            dim=settings.embed_dim,
+        )
+        ef = ResilientEmbeddingFunction(primary=primary_ef, fallback=fallback_ef)
+
+        return ChromaStore(
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+            collection_name=settings.embed_collection,
+            local_mode=settings.is_local,
+            local_path=chroma_path,
+            embedding_function=ef,
+        )
+
+    # 기존 경로: EMBEDDING_BACKEND=local 또는 미설정
+    # ChromaDB 기본 EF (minilm, 384d) 사용. 기존 동작 100% 보존.
     return ChromaStore(
         host=settings.chroma_host,
         port=settings.chroma_port,
