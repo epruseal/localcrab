@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="logo.png" alt="LocalCrab Logo" width="260"/>
-</p>
-
 # LocalCrab
 
 LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니다. 문서·데이터를 9-space MetaOntology 그래프로 적재하고, 벡터·BM25·그래프를 결합한 하이브리드 검색을 MCP 인터페이스로 제공합니다. Docker 없이 SQLite + 로컬 Chroma만으로 단일 머신에서 동작합니다.
