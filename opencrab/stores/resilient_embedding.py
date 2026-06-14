@@ -69,13 +69,13 @@ class ResilientEmbeddingFunction:
                 return result
             except Exception as exc:
                 logger.warning(
-                    "LM Studio 임베딩 실패 (%s) → 로컬 KURE GGUF 폴백 사용",
+                    "LM Studio 임베딩 실패 (%s) → 로컬 GGUF 폴백 사용",
                     exc,
                 )
                 self._mark_unhealthy()
 
         # fallback 경로
-        logger.info("임베딩 폴백: 로컬 KURE GGUF (LM Studio 장애 또는 unhealthy)")
+        logger.info("임베딩 폴백: 로컬 GGUF (LM Studio 장애 또는 unhealthy)")
         return self._fallback(input)
 
     def name(self) -> str:
