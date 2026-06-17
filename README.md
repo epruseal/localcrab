@@ -175,6 +175,21 @@ npx -y supergateway \
 
 벡터 일치도(LM Studio ↔ 로컬 GGUF): cosine 평균 0.999853 — 폴백 전환 시에도 같은 컬렉션 그대로 사용.
 
+> **참고**: `openai`는 *모델*이 아니라 *백엔드(전송 방식)* 입니다. OpenAI 호환 `/v1/embeddings`
+> API면 무엇이든 쓸 수 있습니다 — 실제 OpenAI 클라우드 모델(`text-embedding-3-small`/`-large`)도,
+> 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI)에 올린 모델도 가능. 모델은 `OPENAI_EMBED_MODEL`,
+> 차원은 `EMBED_DIM`으로 맞춥니다. **한국어 검색에는 KURE-v1을 추천**합니다(번들 GGUF 폴백도 KURE라
+> turnkey). 단 **한 컬렉션 = 한 모델** 원칙으로, 모델을 바꾸면 새 `EMBED_COLLECTION` + 전량 재색인이
+> 필요합니다(서로 다른 모델 벡터를 한 컬렉션에 섞지 말 것).
+
+**경량 대안 (CPU 부담 시)**: KURE-v1은 BGE-M3 기반(약 560M, 1024d)이라 CPU만으로는 무겁습니다.
+CPU 자원이 부족하면 한국어 경량 임베딩 [`BM-K/KoSimCSE-roberta`](https://huggingface.co/BM-K/KoSimCSE-roberta)
+(RoBERTa-base, 약 110M, 768d)를 추천합니다. KURE보다 가볍고 빠르지만 한국어 전용이며 검색 품질은
+다소 낮을 수 있습니다. OpenAI 호환 서버(예: HF Text-Embeddings-Inference)에 KoSimCSE를 서빙하고
+`OPENAI_EMBED_MODEL`, `EMBED_DIM=768`, 별도 `EMBED_COLLECTION`만 지정하면 코드 수정 없이 사용
+가능합니다(전량 재색인 필요). 단 로컬 GGUF 폴백은 GGUF 빌드가 있어야 하므로 KoSimCSE에는 기본
+적용되지 않습니다(원격 primary만 사용).
+
 ### 설정
 
 | 환경변수 | 기본값 | 설명 |
