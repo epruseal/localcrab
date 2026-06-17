@@ -82,15 +82,16 @@ def make_vector_store(settings: Settings) -> Any:
 
     if settings.embedding_backend == "openai":
         # OpenAI 호환 서버 백엔드: GPU 주력 + 로컬 GGUF 폴백
-        from opencrab.stores.lmstudio_embedding import LMStudioEmbeddingFunction
+        from opencrab.stores.openai_embedding import OpenAIEmbeddingFunction
         from opencrab.stores.llamacpp_embedding import LlamaCppEmbeddingFunction
         from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
 
-        primary_ef = LMStudioEmbeddingFunction(
-            api_base=settings.lmstudio_api_base,
-            model=settings.lmstudio_embed_model,
+        primary_ef = OpenAIEmbeddingFunction(
+            api_base=settings.openai_api_base,
+            model=settings.openai_embed_model,
             dim=settings.embed_dim,
-            timeout=settings.lmstudio_timeout,
+            timeout=settings.openai_timeout,
+            api_key=settings.openai_api_key,
         )
         # local_gguf_path 가 비어있으면 llamacpp_embedding._ensure_local_gguf() 가
         # KURE-v1-Q4_K_M 을 자동 다운로드. LM Studio 장애 시 폴백으로 사용됨.
