@@ -259,10 +259,10 @@ ChromaStore(`opencrab_vectors_kure`, 1024d)와 ResilientEmbeddingFunction을 반
 KURE-v1(한국어 특화, 1024d)을 기본 모델로 사용한다.
 
 ```
-ResilientEF = LMStudioEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운로드)
+ResilientEF = OpenAIEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운로드)
 ```
 
-- **LMStudioEF (primary)**: OpenAI 호환 임베딩 서버(LM Studio 등)에 요청.
+- **OpenAIEF (primary)**: OpenAI 호환 임베딩 서버(LM Studio 등)에 요청.
 - **LlamaCppEF (fallback)**: primary 실패 시 lazy load. 모델 파일이 없으면 자동 다운로드 후 llama-cpp-python으로 직접 임베딩.
 
 ### 워크플로 호환성

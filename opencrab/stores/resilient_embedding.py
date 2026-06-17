@@ -35,7 +35,7 @@ class ResilientEmbeddingFunction:
     Parameters
     ----------
     primary : Any
-        정상 운용 EF. LMStudioEmbeddingFunction 권장.
+        정상 운용 EF. OpenAIEmbeddingFunction 권장.
     fallback : Any
         primary 장애 시 사용하는 EF. LlamaCppEmbeddingFunction 권장.
     health_ttl : float

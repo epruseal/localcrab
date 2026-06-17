@@ -86,26 +86,29 @@ class Settings(BaseSettings):
     )
 
     # OpenAI 호환 임베딩 서버 설정 (EMBEDDING_BACKEND=openai 시 사용)
-    # LM Studio, Ollama, vLLM 등 /v1/embeddings 를 구현한 서버 모두 호환.
+    # LM Studio, Ollama, vLLM, 실제 OpenAI 등 /v1/embeddings 구현 서버 모두 호환.
     # 대안: openai 패키지 미설치라 httpx 직접 호출 방식 채택.
-    lmstudio_api_base: str = Field(
+    openai_api_base: str = Field(
         default="http://100.77.10.49:1234/v1",
-        alias="LMSTUDIO_API_BASE",
+        alias="OPENAI_API_BASE",
     )
     # 서버에 로드된 임베딩 모델 id. /v1/models 로 확인.
-    # 예: "text-embedding-kure-v1" (KURE-v1), "nomic-embed-text" 등
-    lmstudio_embed_model: str = Field(
+    # 예: "text-embedding-kure-v1" (KURE-v1), "text-embedding-3-small" 등
+    openai_embed_model: str = Field(
         default="text-embedding-kure-v1",
-        alias="LMSTUDIO_EMBED_MODEL",
+        alias="OPENAI_EMBED_MODEL",
     )
+    # OpenAI API key. 실제 OpenAI / 인증 게이트웨이 사용 시 설정.
+    # 미설정(빈 문자열)이면 Authorization 헤더 없이 호출(LM Studio 등 무인증 서버).
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     # 임베딩 차원. 사용 모델에 맞게 설정. 변경 시 컬렉션 재적재 필요.
     # KURE-v1 = 1024, multilingual-e5-small = 384, text-embedding-3-small = 1536.
     embed_dim: int = Field(default=1024, alias="EMBED_DIM")
 
     # OpenAI 호환 서버 HTTP 타임아웃(초). 기본 8s.
     # 로컬 네트워크 기준 정상 응답은 1-3s이므로 8s면 충분.
-    # 느린 원격 네트워크나 대형 배치 요청이라면 LMSTUDIO_TIMEOUT 환경변수로 늘릴 것.
-    lmstudio_timeout: float = Field(default=8.0, alias="LMSTUDIO_TIMEOUT")
+    # 느린 원격 네트워크나 대형 배치 요청이라면 OPENAI_TIMEOUT 환경변수로 늘릴 것.
+    openai_timeout: float = Field(default=8.0, alias="OPENAI_TIMEOUT")
 
     # openai 백엔드 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
     # 차원 비호환 문제를 방지한다. 롤백 시 기존 컬렉션은 보존됨.

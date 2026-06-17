@@ -180,17 +180,18 @@ npx -y supergateway \
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
 | `EMBEDDING_BACKEND` | `local` | `local` = minilm, `openai` = OpenAI 호환 서버 |
-| `LMSTUDIO_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
-| `LMSTUDIO_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
+| `OPENAI_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
+| `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
+| `OPENAI_API_KEY` | _(없음)_ | 인증 필요 서버 사용 시 Bearer 토큰. 무인증 서버는 미설정 |
 | `EMBED_DIM` | `1024` | 임베딩 차원 (모델에 맞게 설정) |
 | `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 폴백 GGUF 경로 |
 | `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명 |
-| `LMSTUDIO_TIMEOUT` | `8.0` | 서버 응답 타임아웃(초) |
+| `OPENAI_TIMEOUT` | `8.0` | 서버 응답 타임아웃(초) |
 
 ```bash
 export EMBEDDING_BACKEND=openai
-export LMSTUDIO_API_BASE=http://<lmstudio-host>:1234/v1
-export LMSTUDIO_EMBED_MODEL=text-embedding-kure-v1
+export OPENAI_API_BASE=http://<server-host>:1234/v1
+export OPENAI_EMBED_MODEL=text-embedding-kure-v1
 opencrab serve
 ```
 

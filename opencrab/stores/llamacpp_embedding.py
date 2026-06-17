@@ -27,7 +27,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _EMBEDDING_FUNCTION_NAME = "kure_v1"
-# LMStudioEmbeddingFunction.name() 과 동일 문자열 유지.
+# OpenAIEmbeddingFunction.name() 과 동일 문자열 유지.
 # ChromaDB 는 컬렉션 메타데이터에 EF name 을 저장하므로, LM Studio ↔ 로컬
 # 전환 시 같은 name 을 반환해야 같은 컬렉션을 재사용할 수 있다.
 
@@ -82,7 +82,7 @@ class LlamaCppEmbeddingFunction:
         return result
 
     def name(self) -> str:
-        """LMStudioEmbeddingFunction 과 동일한 고정 이름 반환."""
+        """OpenAIEmbeddingFunction 과 동일한 고정 이름 반환."""
         return _EMBEDDING_FUNCTION_NAME
 
     def embed_query(self, input: list[str]) -> list[list[float]]:
