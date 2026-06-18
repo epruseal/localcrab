@@ -44,6 +44,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,37 @@ def _acquire_chroma_shared_lock() -> None:
     lock_path = os.path.join(data_dir, "chroma.lock")
     _chroma_lock_fh = open(lock_path, "w")
     fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
+
+
+# Tools that mutate the stores. When several MCP server processes run against the
+# same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
+# writes must be serialised. This is a *per-write* exclusive lock on a dedicated
+# write.lock file — entirely separate from the lifetime-held chroma.lock (LOCK_SH)
+# above, which only guards against the offline batch loader (LOCK_EX). Reads take
+# no lock and stay concurrent across processes.
+WRITE_TOOLS = {
+    "ontology_add_node",
+    "ontology_add_edge",
+    "pack_create",
+    "pack_ingest",
+    "schema_pack_install",
+    "schema_pack_uninstall",
+    "harness_promotion_apply",
+}
+
+
+@contextmanager
+def _write_lock():
+    """Hold an exclusive cross-process lock for the duration of a write tool."""
+    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    lock_path = os.path.join(data_dir, "write.lock")
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)  # blocks until no other instance is writing
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def _clean_str(s: str) -> str:
@@ -2243,4 +2275,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     fn = _TOOL_FUNCTIONS.get(name)
     if fn is None:
         raise KeyError(f"Unknown tool: '{name}'. Available: {list(_TOOL_FUNCTIONS)}")
+    if name in WRITE_TOOLS:
+        with _write_lock():
+            return fn(**arguments)
     return fn(**arguments)
