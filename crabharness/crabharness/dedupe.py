@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 SEEN_INDEX_FILE = ".seen.json"
+
+
+def _now_iso() -> str:
+    """Aware UTC ISO-8601 timestamp, e.g. ``2026-06-18T05:54:43.835470+00:00``.
+
+    Byte-for-byte identical to ``opencrab.common.timefmt.now_iso``. We inline
+    the one-liner rather than import it because ``crabharness`` is an
+    independent package (it must stay importable with opencrab absent).
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _get_seen_index_path(workspace_dir: Path) -> Path:
@@ -50,7 +60,7 @@ def mark_seen(
         index = {}
 
     item_id = _compute_id(source, key)
-    now = datetime.utcnow().isoformat() + "Z"
+    now = _now_iso()
 
     if item_id in index:
         # Update existing entry
@@ -90,7 +100,7 @@ def mark_applied(
     item_id = _compute_id(source, key)
 
     if item_id in index:
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _now_iso()
         index[item_id]["status"] = "applied"
         index[item_id]["applied_at"] = now
         index[item_id]["final_score"] = score
