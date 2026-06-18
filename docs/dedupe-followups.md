@@ -1,6 +1,23 @@
 # 중복코드 정리 — 발견 사항 및 영향 분석 기록
 
-전수검사(2026-06-18, 브랜치 `refactor/dedupe-sweep`)에서 확인된 중복·불일치를 기록한다. 이 문서는 **현상과 "변경하면 어떤 영향이 생기는지"를 기록**하는 것이 목적이며, 처리 방향을 확정하거나 작업을 지시하지 않는다. 각 항목의 현재 동작은 특성화 테스트(`tests/test_common_utils_characterization.py` 36, `tests/test_structural_characterization.py` 44, `tests/test_service_paths_characterization.py` 33 = 총 113개)에 박제되어 있다.
+전수검사(2026-06-18, 브랜치 `refactor/dedupe-sweep`)에서 확인된 중복·불일치를 기록한다. 이 문서는 **현상과 "변경하면 어떤 영향이 생기는지"를 기록**한다. 각 항목의 변경 전 동작은 특성화 테스트(`tests/test_common_utils_characterization.py`, `tests/test_structural_characterization.py`, `tests/test_service_paths_characterization.py` = 총 113개)에 박제되어 있었고, 통합 시 명세가 바뀌는 케이스만 의도적으로 갱신했다.
+
+---
+
+## ✅ 통합 완료 (2026-06-18, 브랜치 `refactor/dedupe-consolidation`)
+
+처음에는 위험이 큰 항목을 "보류"로 닫았으나, 재검토 후 전 항목을 통합했다. 실데이터 실측으로 위험을 정량화한 결과 마이그레이션이 필요한 항목은 없었다(graph.db 81,077 nodes 기준: obsidian 적재 0건·적재 노드는 UUID v5, owner_id 0건, add_node/edge `stores` 응답을 읽는 외부 소비자 0). 각 통합은 항목별 커밋으로 분리했다.
+
+| § | 통합 내용 | 비고 |
+|---|----------|------|
+| §1 | HTTP add_node/edge를 `OntologyBuilder` 경유로 통일(깊은 검증·receipt·역할 기반 stores 키·audit). 검증 실패 500→**422+detail**. query envelope superset(`selected_packs`/`pack_filter` 추가). | web(`api.ts`)는 `r.ok`/`detail`·`results`만 읽어 무영향. 기존 데이터는 소급 거부 안 됨(검증=신규 쓰기). required 누락 기존 노드 ~256건은 데이터 품질 별건. |
+| §1.8 | pack 선택을 `opencrab/services/pack_selection.py:resolve_packs`로 추출. 표준 경고 코드를 MCP/CLI 어댑터가 문구/채널로 매핑. | 문구·채널·예외정책 모두 보존. |
+| §2 | `opencrab/common/ids.py:stable_id` 정규형으로 통일. neo4j_export·export script·obsidian importer 위임. | `dedupe._compute_id`는 의도적 carve-out(로컬 키·crabharness 독립성). obsidian 적재 0건이라 마이그레이션 불요. |
+| §3 | slugify 한글 보존(`allow_hangul=True`)으로 통일. | landscape `_slug`는 crabharness 독립성 유지 위해 인라인 동기화. |
+| §4 | dedupe 타임스탬프 aware `+00:00`로 통일. | crabharness 독립성 위해 로컬 `_now_iso` 인라인(opencrab import 회피). |
+| §5 | Neo4j 정규화를 `neo4j_export`의 단일 파라미터화 구현으로 통일(copy/label_to_space/label_priority/strict/rel_endpoint_fallback). | 본질 차이는 파라미터로 보존, scripts는 누락 fallback 획득(기능 확대). |
+
+원칙: 검증·제약은 강화 방향으로만, 통일은 더 넓은 개념(superset)을 포함, 불명확→명확. crabharness/codex_workers는 독립 패키지이므로 `opencrab.common` 의존을 만들지 않고 로직을 인라인 동기화(특성화 테스트가 drift guard). 아래 각 절은 통합 전 현상/영향 분석 기록을 보존한다.
 
 ---
 
@@ -30,7 +47,7 @@
 ### 1.4 query envelope 키 집합
 - **현재 차이**: MCP query = `question/spaces_filter/subject_id/tenant_id/pipeline/total/results/selected_packs/pack_filter`. HTTP query = `question/spaces_filter/total/results/keyword_fallback`. → `selected_packs/pack_filter/pipeline/tenant_id/subject_id`는 MCP 전용, `keyword_fallback`은 HTTP 전용.
 - **변경 시 영향**:
-  - 공통 envelope로 통일하면 → `apps/web/lib/api.ts:query()`는 응답 JSON을 그대로 반환하고 하위 컴포넌트가 `results`(항목 구조 `node_id/score/text/metadata`)를 소비. envelope 상위 키 추가/제거는 web의 `results` 의존을 깨지 않음. 단 **`results` 항목의 키 구조는 보존 필수**(node_id/score/text/metadata).
+  - 공통 envelope로 통일하면 → `apps/web/lib/api.ts:query()`는 응답 JSON을 그대로 반환하고 하위 컴포넌트가 `results`(항목 구조 `source/node_id/score/text/metadata/graph_context`, `query.py:110-118`의 `QueryResult.to_dict`)를 소비. envelope 상위 키 추가/제거는 web의 `results` 의존을 깨지 않음. 단 **`results` 항목의 키 구조는 보존 필수**(source/node_id/score/text/metadata/graph_context). → 통합 시 envelope superset만 추가하고 항목 구조는 불변으로 유지함.
   - HTTP에 `selected_packs`/`pack_filter`를 추가하면 pack-aware 기능을 web에서도 노출 가능(기능 추가), 제거 방향이 아니면 호환 위험 낮음.
 
 ### 1.5 owner_id 주입 경로
@@ -49,6 +66,8 @@
 
 ### 1.8 pack 선택 로직 (MCP `ontology_query` ↔ CLI `query`) — 통합 보류(결정)
 
+> **갱신**: 아래 보류 결정은 이후 재검토하여 통합했다 — `opencrab/services/pack_selection.py:resolve_packs`로 결정 로직을 추출하고, 표준 경고 코드를 MCP/CLI 어댑터(`mcp_warning_text`/`cli_warning_text`)가 각자의 문구·채널·예외정책으로 매핑한다(특성화 테스트 무변경 통과). 아래는 보류 당시의 분석 기록이다.
+>
 > **결정(Phase 4)**: MCP와 CLI의 auto_pack 선택은 **결정 로직(`choose_packs` + 후보 언팩 + `selected_packs` 구성)은 동일하나 표면이 본질적으로 다르다**: (a) 충돌 경고 문구가 다름(MCP `"pack_ids provided; ignoring auto_pack"` vs CLI `"--pack-id provided; ignoring --auto-pack."`), (b) 경고 전달 채널이 다름(MCP는 `pack_filter.warnings` 리스트 vs CLI는 `click.echo(..., err=True)` stderr 즉시 출력 + 성공 시 `"auto-pack selected ..."` info), (c) 예외 처리가 다름(MCP는 try/except graceful fallback vs CLI는 예외 전파). 실제 공통 로직은 `choose_packs`(이미 공통) 위 ~5줄뿐.
 >
 > 특성화 테스트가 양쪽 동작을 정밀 박제(MCP 7케이스·CLI 4케이스)했고, 억지 통합은 이 동작을 깨거나 복잡한 파라미터화(`on_warning` 콜백, 문구 분기, 예외 정책 플래그)를 요구해 ROI 대비 회귀 위험이 크다. **§1의 MCP/HTTP 응답 통일 보류와 동일한 맥락**이라 함께 보류.
@@ -78,6 +97,8 @@
 
 ## 5. Neo4j 행 정규화 두 구현의 의미 차이 — 통합 보류(결정)
 
+> **갱신**: 아래 보류 결정은 이후 재검토하여 통합했다 — `opencrab/pack/neo4j_export`의 `_clean_props`/`_normalise_node`/`_normalise_edge`를 `copy`/`label_to_space`/`label_priority`/`strict`/`rel_endpoint_fallback` 파라미터로 일반화하고 export 스크립트가 도메인 값을 바인딩한다. opencrab 기본 동작은 100% 불변, scripts는 누락했던 fallback(ontology_space/type/evidence_ids/relation)을 획득(기능 확대), 본질 차이(LABEL_TO_SPACE/LABELS/strict KeyError/rel 엔드포인트 fallback)는 파라미터로 보존. 아래는 보류 당시의 분석 기록이다.
+>
 > **결정(Phase 3)**: `_stable_json`≡`jdump`, `_sha_id`≡`sha_id`(비트단위 동일)와 `sha256_file`은 통합했으나, **`clean_props`/`normalise_node`/`normalise_edge` 정규화 함수는 통합 보류**. 아래의 의미 차이가 6가지 이상이라 단일 함수 파라미터화는 동작 버그 위험이 크다. opencrab 베이스 + `LABEL_TO_SPACE` 등 도메인 매핑 주입 방식의 통합은 별도 과제로 남긴다.
 
 
