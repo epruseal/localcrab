@@ -33,6 +33,22 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 
 ---
 
+## 1.5 적재 경로 인벤토리 / MCP 반영 범위
+
+`~/opencrab-dump` 전수조사 결과 **적재/삭제 경로는 `load_local_packs.py` 하나가 아니다.** "MCP 수정 시 함께 반영" 범위를 분명히 하기 위해 경로를 정리한다.
+
+| # | 경로 | 적재 방식 | 본 계획 범위 |
+|---|---|---|---|
+| ① | `load_local_packs.py` | 로컬 chroma/SQLite **직접** 적재(`make_*_store`+`OntologyBuilder`) + `--fresh` 삭제(`delete_pack`, 라인 313-361) | **MCP 모드 전환 대상** |
+| ② | 대화 reingest hook — `hooks/claude/localcrab-session-end.sh` + `hooks/claude/localcrab-lib.sh` | **이미 MCP `pack_ingest` 경유**(append-only, purge 없음). `lc_call` 이 `initialize`→`tools/call` 핸드셰이크 + 3회 재시도 + outbox 재시도 큐 구현 | **호환성 회귀 검증 대상** (신규 도구가 기존 `pack_ingest` 동작을 깨지 않는지) |
+| ③ | `load_to_localcrab.py` | Neo4j(STORAGE_MODE=docker) 벌크 적재. ①과 노드/엣지/청크 패스 **중복(복붙)** | **비목표**(별도 토폴로지, 영향분석만) |
+| 보조 | `backfill_kure.py`(vector/doc upsert만), `dump_*conversations.py` 3종(jsonl 변환 전단계, 스토어 미접근) | — | **비목표** |
+
+- **재사용 레퍼런스:** ②의 `lc_call`(`localcrab-lib.sh`)은 로더 MCP 클라이언트가 그대로 참고할 수 있는 기존 구현이다 — 특히 재시도·부분실패 처리·outbox 큐 패턴. (MCP HTTP 가 stateless 라 핸드셰이크 자체는 생략 가능하나 기존 hook 과 동작 호환을 유지한다.)
+- **중복 경고:** ①③ 가 적재 로직을 복제하므로 스토어 API 변경 시 두 곳을 각각 손봐야 한다. 본 계획은 **①만 MCP 로 전환**하고, ②는 호환성만 검증하며, ③의 중복 통합은 별건으로 남긴다.
+
+---
+
 ## 2. 목표 / 비목표
 
 **목표**
@@ -56,6 +72,7 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 - 전송: 현재 Streamable HTTP MCP (`opencrab/cli.py serve --transport http`, 엔드포인트 `http://{host}:{port}/mcp`). 기본 포트는 config 의 `mcp_http_port`(:8765).
 - **Stateless 프로토콜**: 이 HTTP 전송은 의도적으로 **무상태**다 (`http_app.py` 모듈 docstring, `mcp_post` 라인 79-98). `initialize`/`notifications/initialized` 핸드셰이크 없이도 각 POST 가 독립적으로 `tools/call` 을 처리한다 (`server.py` `_dispatch` 라인 136-151). 따라서 로더는 세션 관리 없이 httpx 로 `{"jsonrpc":"2.0","method":"tools/call","params":{"name":...,"arguments":...},"id":1}` 를 바로 POST 하면 된다. **JSON-RPC 배열(배치)도 수용**되어 한 요청에 여러 `tools/call` 을 담을 수 있다 (`http_app.py:92-95`).
 - **응답 형식**: 결과는 MCP content wrapper `{"content":[{"type":"text","text":<json 문자열>}]}` 로 감싸진다 (`server.py:209-216`). 또한 도구 내부 예외는 `{"error":...}` 로 감싸져 **HTTP 200 이어도 본문에 error 가 들어올 수 있다** (`server.py:204-207`). `pack_ingest` 류는 `node_errors`/`edge_errors` 리스트를 반환한다. → 로더는 content 를 파싱해 `error`/부분 실패를 검사·재시도해야 한다.
+- **기존 MCP 클라이언트 재사용**: 대화 reingest hook 의 `lc_call`(`hooks/claude/localcrab-lib.sh`)이 MCP 호출 + 3회 재시도 + outbox 재시도 큐를 이미 구현한다(§1.5 ②). 로더 클라이언트는 이 재시도·부분실패·큐 패턴을 참고/공유해 중복 구현을 피한다.
 - 인증: Bearer 토큰. `--auth-token` 또는 `--auth-token-file` 로 주입되며 `_resolve_token()` 으로 해석 (정의는 `opencrab/mcp/http_app.py:34-50`; `cli.py:143` 은 호출 지점). 우선순위: CLI 토큰 > `LOCALCRAB_MCP_TOKEN` env > 토큰 파일. 토큰이 없으면 `OPEN(no-auth)`. 검증은 `hmac.compare_digest` (`http_app.py:65-77`).
   - **인증 경로 선택**: 로더가 **로컬 동일 호스트**에서 돌면 무인증 인스턴스(:8765)로 붙어 Bearer 처리를 생략할 수 있다. 외부/인증 인스턴스(:8766)를 쓸 때만 토큰 파일을 로드해 `Authorization: Bearer <token>` 헤더로 전달한다.
 
@@ -109,6 +126,15 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 - 두 인스턴스(:8765 unauth / :8766 auth)는 **동일 `write.lock` 을 공유**하므로, 로더 쓰기 중에는 양쪽 인스턴스의 모든 write 가 직렬화된다(의도된 동작).
 - **읽기는 락을 잡지 않으므로** 적재 내내 쿼리는 무중단으로 동작한다.
 
+**대량 팩 로드 효율 (적응형 배치)**
+
+로더는 **한 번에 다수 팩(팩당 수천~수만 노드)** 을 적재하므로, 건별 호출은 왕복 지연으로 비현실적이고 효율이 핵심 제약이다. 효율과 무중단 공존을 동시에 잡기 위해 **적응형 배치**를 채택한다.
+
+- **기본은 큰 배치(고처리량):** HTTP 왕복 횟수와 `_write_lock()` 획득/해제 횟수를 줄여 처리량을 높인다.
+- **산발 write 감지 시 배치 축소(무중단 양보):** 적재 중 다른 write 가 지연되는 신호가 보이면 배치 크기를 줄여 락 점유 시간을 짧게 하고 산발 쓰기가 끼어들 틈을 넓힌다.
+- **JSON-RPC 배치 배열로 왕복 절감:** 여러 `tools/call` 을 **한 HTTP 요청의 JSON-RPC 배열**로 묶어 네트워크 왕복을 줄인다(`http_app.py:92-95`). 배열 내 각 항목은 항목별로 `_write_lock()` 을 잡았다 풀므로(`server.handle_request` 가 항목마다 디스패치) **락 점유는 여전히 짧게 유지**된다 — 처리량과 공존을 동시에 얻는다.
+- **상한 주의:** 요청 본문 크기/타임아웃에 코드상 명시 제한이 없으므로(FastAPI/uvicorn 기본), 한 호출/배열이 지나치게 커지지 않도록 상한을 둔다(타임아웃·메모리·장시간 락 점유 회피).
+
 ---
 
 ## 5. 단계별 전환 계획
@@ -125,14 +151,17 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 2. **신규 write 도구 추가 + 신규 테스트**
    - `pack_purge`, `pack_ingest_chunks` 구현(§3.5). 등록 4지점 — 특히 **`WRITE_TOOLS` 등록** 누락 주의.
    - 신규 테스트 **정상**(삭제/적재 성공), **실패**(없는 `pack_id`, `vec.available=False`, 빈 `chunks`), **엣지**(cascade 엣지 삭제, 중복 id upsert, 부분 실패 `node_errors`). `dispatch_tool("pack_purge"/"pack_ingest_chunks", …)` 가 `_write_lock` 직렬화를 받는지 검증.
-3. **로더에 MCP 클라이언트 모드 추가**
-   - `--via-mcp`(가칭) 플래그 도입(로더는 argparse 미사용 → 수동 파싱부 `load_local_packs.py:689-704` 손봄). 켜지면 직접 스토어 생성 대신 MCP HTTP `tools/call` POST.
+3. **로더에 MCP 클라이언트 모드 추가 + hook 호환성**
+   - `--via-mcp`(가칭) 플래그 도입(로더는 argparse 미사용 → 수동 파싱부 `load_local_packs.py:689-704` 손봄). 켜지면 직접 스토어 생성 대신 MCP HTTP `tools/call` POST(§4 적응형 배치 + JSON-RPC 배치 배열, §1.5 ②의 `lc_call` 재시도 패턴 참고).
    - `--fresh` 를 **MCP `pack_purge` 호출 후 ingest** 로 매핑(삭제 절반을 MCP 경로로 수행).
    - 기존 직접 모드는 **기본값으로 보존** (플래그 미지정 시 현행과 동일, `chroma.lock(LOCK_EX)` 유지). MCP 모드에서는 `chroma.lock` 획득을 건너뛰고, 인증 인스턴스 사용 시에만 Bearer 토큰을 로드.
+   - **대화 reingest hook(§1.5 ②) 회귀 검증:** 신규 도구 추가 후에도 `localcrab-session-end.sh`/`lc_call` 경유 `pack_ingest`(append-only) 가 기존대로 동작하는지 확인 — hook 자체는 변경 없음.
 4. **검증** (§7)
-   - 회귀 무결성, 신규 기능 테스트, MCP 가동 중 동시 적재, purge 후 재적재 정합성, 처리량 측정.
+   - 회귀 무결성, 신규 기능 테스트, hook 호환성, MCP 가동 중 동시 적재, purge 후 재적재 정합성, 대량 적재 처리량 측정.
 5. **기본 전환**
    - 검증 통과 후 `--via-mcp` 를 기본 동작으로 승격. 직접 모드는 `--direct` 등으로 잔존(롤백/오프라인 대량 재적재용).
+
+> **범위 밖(영향분석만):** `load_to_localcrab.py`(Neo4j/docker) 는 별도 토폴로지라 본 전환 대상이 아니다. 단 ①과 적재 로직을 복제하므로, 향후 스토어 API 가 바뀌면 **이 파일도 함께 손봐야 하는 중복 지점**임을 기억한다(§1.5 중복 경고). `backfill_kure.py` 도 동일.
 
 ---
 
@@ -142,14 +171,16 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 - 신규 서버 프로세스(chroma 서버 모드)나 전면 재적재가 불필요 — **가장 가벼운 경로**.
 - "적재 시 MCP 중지" 운영 제약 제거, 읽기 무중단. purge-replace 까지 무중단.
 - chroma 다중 프로세스 제약을 구조적으로 회피 (쓰기 프로세스가 MCP 1개).
-- HTTP 가 stateless 라 로더 클라이언트가 단순(initialize 핸드셰이크 불필요).
+- HTTP 가 stateless 라 로더 클라이언트가 단순(initialize 핸드셰이크 불필요). hook 의 `lc_call` 재사용 가능.
 - 로컬 무인증 인스턴스(:8765) 사용 시 **Bearer 토큰 처리를 생략** 가능.
+- 적응형 배치 + JSON-RPC 배치 배열로 **대량 팩 로드 효율 확보**(왕복·락 횟수 절감, 짧은 락 점유 유지).
 
 **단점**
 - 건별/배치 모두 HTTP 왕복 + `_write_lock()` 직렬화 오버헤드 → 오프라인 직접 적재보다 느릴 수 있음.
 - 청크 배치 도구 + **삭제 도구(`pack_purge`)** 신설 등 MCP 도구 추가 작업 필요.
 - 인증 인스턴스(:8766) 사용 시 Bearer 토큰 인증/배포를 로더가 다뤄야 함(로컬 무인증 인스턴스 사용 시 완화).
 - 적재가 MCP 쓰기 락을 공유하므로, 락 점유 정책(배치 단위)을 잘못 잡으면 일반 쓰기 지연 가능.
+- 중복 적재 엔진 `load_to_localcrab.py`(Neo4j) 는 MCP 전환에서 제외되어 **별도 유지보수로 남는다**(§1.5 중복 경고).
 
 ---
 
@@ -157,12 +188,13 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 
 - **회귀 무결성:** §5 단계 1 기준선 테스트가 신규 도구 추가 후에도 전부 통과(`make test` green)함을 확인 — 기존 동작 무회귀.
 - **신규 기능 테스트:** `pack_purge`/`pack_ingest_chunks` 의 정상·실패·엣지 케이스(§5 단계 2)가 전부 통과.
+- **hook 호환성:** 대화 reingest 경로(`localcrab-session-end.sh`/`lc_call` → `pack_ingest`, §1.5 ②)가 신규 도구 추가 후에도 기존대로 정상 적재되는지 확인.
 - **동시 실행:** MCP 서버 가동 상태에서 로더(`--via-mcp`)를 실행한다. 적재 중 별도 클라이언트로 `ontology_query` / `opencrab_search_nodes` 등 **읽기 쿼리가 무중단**인지 확인.
 - **쓰기 공존:** 적재 중 산발적 write 도구(예: `ontology_add_node`)를 호출해 배치 사이에 정상 처리되는지(과도한 블록 없음) 확인. purge 와 읽기(`find_neighbors`/`ontology_query`) 동시 실행 시 데드락·정합성 확인(`tests/test_store_concurrency.py` 패턴).
 - **데이터 정합성:** 동일 팩을 (a) 직접 모드, (b) MCP 모드로 각각 적재 후 노드/엣지/청크 수 및 샘플 내용이 일치하는지 비교. `id_map` 기반 엣지 연결이 누락 없이 재현되는지 확인.
 - **purge 후 재적재 정합성:** 직접 모드 `--fresh` 결과와 MCP `pack_purge`+ingest 결과의 노드/엣지/청크 수·샘플이 일치하는지 비교.
 - **응답 부분실패 검출:** content wrapper(`{"content":[{"text":…}]}`) 파싱 후 `error`/`node_errors`/`edge_errors` 를 로더가 검출·재시도하는지 확인(HTTP 200 이어도 본문 error 가능).
-- **처리량:** 배치 크기별 적재 시간 측정, 직접 모드 대비 회귀 폭 기록.
+- **대량 적재 처리량:** 적응형 배치(큰 배치) vs 고정 256, JSON-RPC 배치 배열 유무별 적재 시간 측정. 다수 팩 동시 로드 시나리오에서 직접 모드 대비 회귀 폭 기록.
 - **락 안전:** MCP 모드 적재 중 `chroma.lock(LOCK_EX)` 를 잡지 않음을 확인(로더가 chroma 미접근).
 - **백업 복구 리허설:** §5 단계 0 백업본으로 복원 시 적재 전 상태로 되돌아가는지 1회 확인.
 
