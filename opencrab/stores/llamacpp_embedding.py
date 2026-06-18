@@ -21,12 +21,12 @@
 """
 
 import logging
-import math
 from typing import Any
+
+from opencrab.stores._embedding_utils import EMBEDDING_FUNCTION_NAME, l2_normalize
 
 logger = logging.getLogger(__name__)
 
-_EMBEDDING_FUNCTION_NAME = "kure_v1"
 # OpenAIEmbeddingFunction.name() 과 동일 문자열 유지.
 # ChromaDB 는 컬렉션 메타데이터에 EF name 을 저장하므로, LM Studio ↔ 로컬
 # 전환 시 같은 name 을 반환해야 같은 컬렉션을 재사용할 수 있다.
@@ -78,12 +78,12 @@ class LlamaCppEmbeddingFunction:
             # KURE 는 쿼리/패시지 프리픽스 불필요 (bge-m3 계열, 대칭 임베딩).
             resp = llm.create_embedding(text)
             vec = resp["data"][0]["embedding"]
-            result.append(_l2_normalize(vec))
+            result.append(l2_normalize(vec))
         return result
 
     def name(self) -> str:
         """OpenAIEmbeddingFunction 과 동일한 고정 이름 반환."""
-        return _EMBEDDING_FUNCTION_NAME
+        return EMBEDDING_FUNCTION_NAME
 
     def embed_query(self, input: list[str]) -> list[list[float]]:
         """ChromaDB 1.5+ 가 query 경로에서 호출하는 메서드.
@@ -123,13 +123,6 @@ class LlamaCppEmbeddingFunction:
             )
             logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
         return self._llm
-
-
-def _l2_normalize(v: list[float]) -> list[float]:
-    norm = math.sqrt(sum(x * x for x in v))
-    if norm < 1e-9:
-        return v
-    return [x / norm for x in v]
 
 
 # ---------------------------------------------------------------------------

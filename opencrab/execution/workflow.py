@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
+
+from opencrab.common.timefmt import now_iso
 
 VALID_STATUSES = frozenset(
     {"pending", "running", "approved", "rejected", "completed", "failed"}
@@ -77,8 +78,6 @@ _TABLES_PG = [
 ]
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class WorkflowEngine:
@@ -158,7 +157,7 @@ class WorkflowEngine:
             "status": "pending",
             "subject_id": subject_id,
             "receipt_id": receipt_id,
-            "created_at": _now_iso(),
+            "created_at": now_iso(),
         }
 
     def advance(
@@ -224,7 +223,7 @@ class WorkflowEngine:
             "run_id": run_id,
             "status": new_status,
             "receipt_id": receipt_id,
-            "updated_at": _now_iso(),
+            "updated_at": now_iso(),
         }
 
     # ------------------------------------------------------------------

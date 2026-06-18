@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import tempfile
@@ -11,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from opencrab.common.hashing import file_sha256
 
 EMPTY_JSONL = ""
 
@@ -35,12 +35,6 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in rows), encoding="utf-8")
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _copy_if_exists(src: Path, dst: Path) -> bool:
@@ -141,10 +135,10 @@ def _manifest(pack_id: str, title: str, nodes: list[dict[str, Any]], edges: list
         "quality": json.loads(quality_path.read_text(encoding="utf-8"))["summary"],
         "retrieval_hints": {"relation_cues": [], "benchmark_focus": ["relationship_questions", "multi_hop", "hallucination_guard"]},
         "hashes": {
-            "nodes_sha256": _sha256(nodes_path),
-            "edges_sha256": _sha256(edges_path),
-            "evidence_sha256": _sha256(evidence_path),
-            "neo4j_opencrab_ingest_sha256": _sha256(neo4j_path),
+            "nodes_sha256": file_sha256(nodes_path),
+            "edges_sha256": file_sha256(edges_path),
+            "evidence_sha256": file_sha256(evidence_path),
+            "neo4j_opencrab_ingest_sha256": file_sha256(neo4j_path),
             "pack_sha256": None,
         },
         "artifacts": {
@@ -223,5 +217,5 @@ def assemble_pack_v1(
                 if path.is_file():
                     archive.write(path, path.relative_to(root).as_posix())
 
-    pack_sha = _sha256(output)
+    pack_sha = file_sha256(output)
     return {"status": "ok", "pack_id": pack_id, "output": str(output), "pack_sha256": pack_sha, "nodes": len(nodes), "edges": len(edges), "evidence": len(evidence)}
