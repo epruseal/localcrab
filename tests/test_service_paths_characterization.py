@@ -493,20 +493,29 @@ class TestQueryResponseHTTP:
         )
         assert resp.status_code == 200
         body = resp.json()
-        # HTTP query envelope 키 집합 — MCP와 다르다: keyword_fallback 있음,
-        # selected_packs/pack_filter/subject_id/tenant_id/pipeline 없음.
+        # §1.4 수렴: HTTP envelope 도 이제 selected_packs/pack_filter 를 포함한다
+        # (superset). keyword_fallback 은 HTTP 고유로 유지, subject_id/tenant_id/
+        # pipeline 은 여전히 MCP 전용.
         assert set(body.keys()) == {
             "question",
             "spaces_filter",
             "total",
             "results",
             "keyword_fallback",
+            "selected_packs",
+            "pack_filter",
         }
         assert body["question"] == "zzz_no_match_keyword_zzz"
         assert body["spaces_filter"] is None
         assert body["total"] == 0
         assert body["results"] == []
         assert body["keyword_fallback"] == []
+        assert body["selected_packs"] == []
+        assert body["pack_filter"] == {
+            "pack_ids": None,
+            "auto_pack": False,
+            "include_unpackaged": False,
+        }
 
     def test_query_requires_auth(self, http_client):
         resp = http_client.post("/api/query", json={"question": "x"})
@@ -552,12 +561,13 @@ class TestNodeEdgeWriteMCP:
         assert result["node_id"] == "u1"
         assert result["space"] == "subject"
         assert result["node_type"] == "User"
-        # builder는 멀티스토어 결과를 neo4j/mongodb/postgres/chroma 키로 보고한다.
-        assert set(result["stores"].keys()) == {"neo4j", "mongodb", "postgres", "chroma"}
-        assert result["stores"]["neo4j"] == "ok"
-        assert result["stores"]["postgres"] == "ok"
-        assert result["stores"]["mongodb"].startswith("ok")
-        assert result["stores"]["chroma"] == "ok"
+        # §1.3 수렴: builder 는 멀티스토어 결과를 역할 기반 키(graph/docs/sql/vector)로
+        # 보고한다(이전의 백엔드 제품명 neo4j/mongodb/postgres/chroma 대신).
+        assert set(result["stores"].keys()) == {"graph", "docs", "sql", "vector"}
+        assert result["stores"]["graph"] == "ok"
+        assert result["stores"]["sql"] == "ok"
+        assert result["stores"]["docs"].startswith("ok")
+        assert result["stores"]["vector"] == "ok"
         # receipt_id/receipt_ts 는 비결정적 — 존재/타입만.
         assert isinstance(result["receipt_id"], str)
         assert isinstance(result["receipt_ts"], str)
@@ -595,7 +605,7 @@ class TestNodeEdgeWriteMCP:
 
         assert first["node_id"] == "u1"
         assert second["node_id"] == "u1"
-        assert second["stores"]["postgres"] == "ok"
+        assert second["stores"]["sql"] == "ok"
         assert second["properties"]["name"] == "Alice2"
 
     def test_add_edge_success_shape(self, mcp_local_ctx):
@@ -610,11 +620,11 @@ class TestNodeEdgeWriteMCP:
         assert result["from"] == {"space": "subject", "id": "u1"}
         assert result["relation"] == "owns"
         assert result["to"] == {"space": "resource", "id": "p1"}
-        # edge builder는 node와 다른 store 키 셋을 보고: neo4j/postgres/mongodb(=audited).
-        assert set(result["stores"].keys()) == {"neo4j", "postgres", "mongodb"}
-        assert result["stores"]["neo4j"] == "ok"
-        assert result["stores"]["postgres"] == "ok"
-        assert result["stores"]["mongodb"] == "audited"
+        # §1.3 수렴: edge builder 도 역할 기반 키(graph/sql/docs). docs 는 audit 표식.
+        assert set(result["stores"].keys()) == {"graph", "sql", "docs"}
+        assert result["stores"]["graph"] == "ok"
+        assert result["stores"]["sql"] == "ok"
+        assert result["stores"]["docs"] == "audited"
         assert isinstance(result["receipt_id"], str)
 
     def test_add_edge_invalid_relation_is_error(self, mcp_local_ctx):
@@ -635,7 +645,8 @@ class TestNodeEdgeWriteHTTP:
                 "space": "subject",
                 "node_type": "User",
                 "node_id": "u1",
-                "properties": {"name": "Alice"},
+                # §1.2 수렴: HTTP 도 이제 builder 경유라 User 필수필드(email/role)를 요구.
+                "properties": {"name": "Alice", "email": "a@ex.com", "role": "admin"},
             },
             headers=HTTP_AUTH,
         )
@@ -644,28 +655,49 @@ class TestNodeEdgeWriteHTTP:
         assert body["node_id"] == "u1"
         assert body["space"] == "subject"
         assert body["node_type"] == "User"
-        # HTTP는 owner_id를 자동 주입 (X-User-Id).
+        # HTTP는 owner_id를 자동 주입 (X-User-Id) — builder 경유 후에도 보존.
         assert body["properties"]["owner_id"] == "tester"
-        # HTTP stores 키는 graph/documents/sql (MCP의 neo4j/mongodb/postgres/chroma와 다름).
-        assert set(body["stores"].keys()) == {"graph", "documents", "sql"}
+        # §1.3 수렴: HTTP/MCP 모두 역할 기반 stores 키(graph/docs/sql/vector).
+        assert set(body["stores"].keys()) == {"graph", "docs", "sql", "vector"}
         assert body["stores"]["graph"] == "ok"
-        assert body["stores"]["documents"].startswith("ok")
+        assert body["stores"]["docs"].startswith("ok")
         assert body["stores"]["sql"] == "ok"
-        # HTTP는 grammar 필수 property(email/role)를 검증하지 않는다 — name만으로 200.
-        # (MCP builder 경로와의 핵심 차이)
+        # §1.6 수렴: HTTP 응답에도 receipt 가 생긴다.
+        assert isinstance(body["receipt_id"], str)
+        assert isinstance(body["receipt_ts"], str)
 
-    def test_add_node_invalid_space_returns_500(self, http_client):
-        """HTTP add_node는 validate_node().raise_if_invalid()의 ValueError를 잡지 않아 500.
+    def test_add_node_invalid_space_returns_422(self, http_client):
+        """§1.1 수렴: grammar 검증 실패는 이제 명시적 422(이전엔 미포착 ValueError→500).
 
-        MCP는 동일 입력에 error dict(valid=False)를 반환한다 — 인터페이스 간 핵심 차이이며
-        리팩토링에서 의도적으로 바꾸지 않는 한 보존되어야 하는 현재 동작.
+        MCP 는 동일 입력에 error dict(valid=False)를 반환한다 — 전송 계층별 표현은
+        다르되(REST 4xx vs MCP dict) 둘 다 '클라이언트 오류'로 명확히 처리한다.
         """
         resp = http_client.post(
             "/api/nodes",
             json={"space": "badspace", "node_type": "User", "node_id": "x"},
             headers=HTTP_AUTH,
         )
-        assert resp.status_code == 500
+        assert resp.status_code == 422
+        assert "badspace" in resp.json()["detail"]
+
+    def test_add_node_missing_grammar_field_returns_422(self, http_client):
+        """§1.2 수렴: HTTP 도 grammar 필수 property(email/role) 누락 시 422.
+
+        이전에는 HTTP 가 필수필드를 검증하지 않아 name 만으로 200 통과했다. builder
+        경유로 통일되어 검증이 강화되었다(제약 강화 — 기존 데이터는 소급 거부되지 않음)."""
+        resp = http_client.post(
+            "/api/nodes",
+            json={
+                "space": "subject",
+                "node_type": "User",
+                "node_id": "u_incomplete",
+                "properties": {"name": "Alice"},
+            },
+            headers=HTTP_AUTH,
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert "email" in detail and "role" in detail
 
     def test_add_node_missing_field_422(self, http_client):
         resp = http_client.post(
@@ -678,12 +710,12 @@ class TestNodeEdgeWriteHTTP:
             "space": "subject",
             "node_type": "User",
             "node_id": "dup1",
-            "properties": {"name": "A"},
+            "properties": {"name": "A", "email": "a@ex.com", "role": "admin"},
         }
         first = http_client.post("/api/nodes", json=payload, headers=HTTP_AUTH)
         second = http_client.post(
             "/api/nodes",
-            json={**payload, "properties": {"name": "B"}},
+            json={**payload, "properties": {**payload["properties"], "name": "B"}},
             headers=HTTP_AUTH,
         )
         assert first.status_code == 200
@@ -693,7 +725,7 @@ class TestNodeEdgeWriteHTTP:
     def test_add_edge_success_shape(self, http_client):
         http_client.post(
             "/api/nodes",
-            json={"space": "subject", "node_type": "User", "node_id": "u1", "properties": {"name": "A"}},
+            json={"space": "subject", "node_type": "User", "node_id": "u1", "properties": {"name": "A", "email": "a@ex.com", "role": "admin"}},
             headers=HTTP_AUTH,
         )
         http_client.post(
@@ -717,13 +749,16 @@ class TestNodeEdgeWriteHTTP:
         assert body["from"] == {"space": "subject", "id": "u1"}
         assert body["relation"] == "owns"
         assert body["to"] == {"space": "resource", "id": "p1"}
-        # HTTP edge stores 키는 graph/sql (documents 없음 — MCP edge의 mongodb=audited와 다름).
-        assert set(body["stores"].keys()) == {"graph", "sql"}
+        # §1.3 수렴: HTTP edge 도 역할 기반 키(graph/sql/docs). docs 는 audit 표식.
+        assert set(body["stores"].keys()) == {"graph", "sql", "docs"}
         assert body["stores"]["graph"] in {"ok", "no match"}
         assert body["stores"]["sql"] == "ok"
+        assert body["stores"]["docs"] == "audited"
+        # §1.6 수렴: edge 응답에도 receipt.
+        assert isinstance(body["receipt_id"], str)
 
-    def test_add_edge_invalid_relation_returns_500(self, http_client):
-        """HTTP add_edge도 validate_edge().raise_if_invalid()의 ValueError를 잡지 않아 500."""
+    def test_add_edge_invalid_relation_returns_422(self, http_client):
+        """§1.1 수렴: 잘못된 relation 은 이제 명시적 422(이전엔 미포착 ValueError→500)."""
         resp = http_client.post(
             "/api/edges",
             json={
@@ -735,7 +770,7 @@ class TestNodeEdgeWriteHTTP:
             },
             headers=HTTP_AUTH,
         )
-        assert resp.status_code == 500
+        assert resp.status_code == 422
 
     def test_node_write_requires_auth(self, http_client):
         resp = http_client.post(
