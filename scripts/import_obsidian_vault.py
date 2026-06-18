@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from opencrab.common.ids import stable_id
 from opencrab.common.text import slugify as _common_slugify
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.stores.local_doc_store import LocalDocStore
@@ -36,8 +37,11 @@ class NoteRecord:
 
 
 def sha_id(prefix: str, value: str) -> str:
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}-{digest}"
+    # Canonical stable-id form (SHA-256, sorted-JSON, ``prefix:digest``), shared
+    # with the rest of the codebase. Previously this used SHA-1 + dash + raw
+    # string; the change only affects newly-derived obsidian ids (no obsidian
+    # data is currently persisted, so no migration is required).
+    return stable_id(prefix, value)
 
 
 def slugify(value: str) -> str:

@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _sha_id(prefix: str, value: Any) -> str:
-    digest = hashlib.sha256(_stable_json(value).encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}:{digest}"
+# Canonical id/serialisation helpers live in opencrab.common.ids now; these
+# aliases keep the historical module-private names (and their importers) working
+# with byte-identical output.
+from opencrab.common.ids import canonical_json as _stable_json, stable_id as _sha_id
 
 
 def _clean_props(value: Any, *, copy: bool = False) -> dict[str, Any]:
