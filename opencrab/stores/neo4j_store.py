@@ -36,8 +36,10 @@ class Neo4jStore:
         try:
             from neo4j import GraphDatabase  # type: ignore[import]
 
-            self._driver = GraphDatabase.driver(
-                self._uri, auth=(self._user, self._password)
+            from opencrab.common.neo4j_driver import make_driver
+
+            self._driver = make_driver(
+                GraphDatabase, self._uri, self._user, self._password
             )
             # Verify connectivity with a lightweight query
             session_kwargs = {"database": self._database} if self._database else {}

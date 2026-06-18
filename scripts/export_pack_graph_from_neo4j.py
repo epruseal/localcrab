@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -12,31 +11,24 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
+from opencrab.common.hashing import file_sha256
+from opencrab.common.neo4j_driver import make_driver
+from opencrab.pack.neo4j_export import _sha_id, _stable_json
+
 PACK_ID = "nvidia-nemotron-personas-korea"
 LABELS = ["Document", "Evidence", "Persona"]
 REL_TYPES = ["CONTAINS", "SUPPORTS"]
 LABEL_TO_SPACE = {"Document": "resource", "Evidence": "evidence", "Persona": "subject"}
 
-
-def jdump(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def sha_id(prefix: str, value: Any) -> str:
-    return f"{prefix}:{hashlib.sha256(jdump(value).encode()).hexdigest()[:16]}"
+# 비트단위 동일한 opencrab 구현을 재사용한다(특성화 테스트가 동일성을 박제).
+jdump = _stable_json
+sha_id = _sha_id
+sha256_file = file_sha256
 
 
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def clean_props(value: Any) -> dict[str, Any]:
@@ -141,7 +133,7 @@ def main() -> int:
         output.unlink()
 
     started = time.time()
-    with GraphDatabase.driver(args.uri, auth=(args.user, args.password), fetch_size=args.fetch_size, max_connection_lifetime=3600) as driver:
+    with make_driver(GraphDatabase, args.uri, args.user, args.password, fetch_size=args.fetch_size, max_connection_lifetime=3600) as driver:
         driver.verify_connectivity()
         with driver.session() as session, output.open("w", encoding="utf-8") as handle:
             node_count = export_nodes(session, handle, args.fetch_size)

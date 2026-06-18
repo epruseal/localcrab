@@ -5,8 +5,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from crabharness.models import ArtifactBundle, ArtifactFile, DelegationJob, MissionSpec, ValidationIssue, ValidationReport
-from crabharness.semantic import score_bundle_semantically, determine_autoresearch_verdict
+from crabharness.models import (
+    ArtifactBundle,
+    ArtifactFile,
+    DelegationJob,
+    MissionSpec,
+    ValidationIssue,
+    ValidationReport,
+)
+
+from codex_workers._base import run_validation
 
 
 def _db_path(root_dir: Path) -> Path:
@@ -124,34 +132,16 @@ def collect_soeak_bundle(
     )
 
 
-def validate_soeak_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationReport:
-    issues: list[ValidationIssue] = []
-    required = mission.success_criteria.required_fields
+def _field_check(bundle: ArtifactBundle, field: str) -> bool:
+    if field == "bidders":
+        return int(bundle.summary.get("bidders_count", 0) or 0) > 0
+    if field == "reserve_prices":
+        return int(bundle.summary.get("reserve_price_count", 0) or 0) > 0
     case = bundle.summary.get("case") or {}
-    bidders_count = int(bundle.summary.get("bidders_count", 0) or 0)
-    reserve_price_count = int(bundle.summary.get("reserve_price_count", 0) or 0)
-    checks_total = max(len(required), 1)
-    passed = 0
+    return case.get(field) not in (None, "", [])
 
-    for field in required:
-        if field == "bidders":
-            ok = bidders_count > 0
-        elif field == "reserve_prices":
-            ok = reserve_price_count > 0
-        else:
-            ok = case.get(field) not in (None, "", [])
 
-        if ok:
-            passed += 1
-        else:
-            issues.append(
-                ValidationIssue(
-                    code=f"missing_{field}",
-                    severity="error",
-                    message=f"Required field `{field}` is missing from the SOEAK artifact bundle.",
-                )
-            )
-
+def _extra_checks(bundle: ArtifactBundle, issues: list[ValidationIssue]) -> None:
     if not bundle.summary.get("db_exists"):
         issues.append(
             ValidationIssue(
@@ -171,36 +161,16 @@ def validate_soeak_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> Valid
             )
         )
 
-    completeness = round(passed / checks_total, 3)
 
-    # Phase 2: Semantic scoring (loopy integration)
-    semantic_result = score_bundle_semantically(bundle, mission)
-    semantic_score = semantic_result.get("semantic_score", 0.0)
-
-    # Phase 3.5: Autoresearch verdict
-    autoresearch_verdict = determine_autoresearch_verdict(
-        completeness_score=completeness,
-        semantic_score=semantic_score,
-        mission=mission,
-    )
-
-    threshold = mission.success_criteria.completeness_threshold
-    status = "pass" if completeness >= threshold and not any(issue.severity == "error" for issue in issues) else "retry"
-    next_action = "promote" if status == "pass" else "retry"
-
-    if passed == 0 and issues:
-        status = "fail"
-        next_action = "reject"
-
-    return ValidationReport(
-        run_id=bundle.run_id,
-        mission_id=mission.mission_id,
-        status=status,
-        completeness_score=completeness,
-        semantic_score=semantic_score,
-        semantic_verdict=autoresearch_verdict,
-        issues=issues,
-        next_action=next_action,
+def validate_soeak_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationReport:
+    return run_validation(
+        bundle,
+        mission,
+        field_check=_field_check,
+        missing_message=lambda field: f"Required field `{field}` is missing from the SOEAK artifact bundle.",
+        default_required_fields=None,
+        extra_checks=_extra_checks,
+        fail_check=lambda _bundle, passed, issues: passed == 0 and bool(issues),
     )
 
 
