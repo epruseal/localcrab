@@ -13,7 +13,13 @@ from neo4j import GraphDatabase
 
 from opencrab.common.hashing import file_sha256
 from opencrab.common.neo4j_driver import make_driver
-from opencrab.pack.neo4j_export import _sha_id, _stable_json
+from opencrab.pack.neo4j_export import (
+    _clean_props,
+    _normalise_edge,
+    _normalise_node,
+    _sha_id,
+    _stable_json,
+)
 
 PACK_ID = "nvidia-nemotron-personas-korea"
 LABELS = ["Document", "Evidence", "Persona"]
@@ -31,48 +37,34 @@ def write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+# 정규화는 opencrab.pack.neo4j_export 의 단일 구현을 도메인 파라미터로 바인딩해
+# 재사용한다(중복 제거). 이 스크립트의 도메인 규칙:
+#   - LABEL_TO_SPACE 로 space 추론, LABELS 우선순위로 node_type 결정
+#   - strict=True: 누락 키에서 KeyError (입력 계약 유지)
+#   - copy=True: 원본 행을 변형하지 않도록 props 얕은 복사
+#   - rel_endpoint_fallback=True: from_id/to_id 가 rel_props 에서 보충 가능
 def clean_props(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
+    return _clean_props(value, copy=True)
 
 
 def normalise_node(record: dict[str, Any]) -> dict[str, Any]:
-    props = clean_props(record["props"])
-    labels = list(record["labels"] or [])
-    node_type = props.get("node_type") or next((label for label in labels if label in LABELS), labels[0] if labels else "")
-    node_id = props.get("id") or sha_id("neo4j-node", props)
-    return {
-        "kind": "node",
-        "payload": {
-            "id": node_id,
-            "label": props.get("label") or props.get("name") or props.get("title") or node_id,
-            "space": props.get("space") or LABEL_TO_SPACE.get(str(node_type), ""),
-            "node_type": node_type,
-            "labels": labels,
-            "properties": props,
-            "evidence_refs": props.get("evidence_refs") or [],
-        },
-    }
+    return _normalise_node(
+        record,
+        label_to_space=LABEL_TO_SPACE,
+        label_priority=LABELS,
+        strict=True,
+        copy=True,
+    )
 
 
 def normalise_edge(record: dict[str, Any]) -> dict[str, Any]:
-    rel_props = clean_props(record["rel_props"])
-    source_props = clean_props(record["source_props"])
-    target_props = clean_props(record["target_props"])
-    relation = str(record["relation"]).lower()
-    payload = {
-        "from_id": source_props.get("id") or rel_props.get("from_id"),
-        "to_id": target_props.get("id") or rel_props.get("to_id"),
-        "from_space": source_props.get("space") or LABEL_TO_SPACE.get((record.get("source_labels") or [""])[0], ""),
-        "to_space": target_props.get("space") or LABEL_TO_SPACE.get((record.get("target_labels") or [""])[0], ""),
-        "relation": relation,
-        "properties": rel_props,
-        "confidence": rel_props.get("confidence"),
-        "evidence_refs": rel_props.get("evidence_refs") or [],
-        "source_labels": record.get("source_labels") or [],
-        "target_labels": record.get("target_labels") or [],
-    }
-    payload["id"] = rel_props.get("id") or sha_id("neo4j-edge", payload)
-    return {"kind": "edge", "payload": payload}
+    return _normalise_edge(
+        record,
+        label_to_space=LABEL_TO_SPACE,
+        strict=True,
+        copy=True,
+        rel_endpoint_fallback=True,
+    )
 
 
 def export_nodes(session, handle, fetch_size: int) -> int:
