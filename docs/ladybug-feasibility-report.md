@@ -88,7 +88,7 @@ LD_PRELOAD=$(pwd)/madv_noop.so python scripts/migrate_graph_to_ladybug.py
 
 ### 검토 5 — 동시성 🔄 (단일 프로세스)
 
-supergateway 구조: 하나의 Python 프로세스 → 내부 다중 스레드. KùzuDB는 다중 스레드 안전. 다중 프로세스 동시 쓰기는 현재 구조에서 발생하지 않음.
+직접 HTTP serve 구조: `opencrab serve --transport http`가 하나의 Python 프로세스(uvicorn 단일 워커) → 단일 이벤트 루프에서 디스패치 직렬화. KùzuDB는 다중 스레드 안전. 다중 인스턴스가 떠도 쓰기는 전용 `write.lock`(LOCK_EX)으로 직렬화되고, 읽기는 동시 진행한다.
 
 ### 검토 6 — BFS 성능 ✅
 

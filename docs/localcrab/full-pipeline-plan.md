@@ -19,7 +19,7 @@ User-facing wrappers and deployment assets should use `localcrab`.
    - local SQLite graph store
    - local Chroma vector store
    - local JSON document store
-   - MCP stdio server exposed as `localcrab`
+   - MCP server exposed as `localcrab` (stdio, or direct Streamable HTTP via `serve --transport http`)
 
 2. CrabHarness control plane
    - mission planning
