@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from typing import Any
 
@@ -41,6 +42,11 @@ class ChromaStore:
         self._client: Any = None
         self._collection: Any = None
         self._available = False
+        # Chroma 자체는 프로세스 내 스레드 안전(공식 System Constraints)이라 add/upsert/
+        # delete 에는 별도 락이 불필요하다. 이 락은 앱 레벨 공유 상태인 self._collection
+        # 핸들 교체(reset_collection)를 원자화하고, 읽기/쓰기가 교체 도중의 핸들을 보지
+        # 않도록 짧게 스냅샷하기 위한 것이다.
+        self._lock = threading.Lock()
         self._connect()
 
     # ------------------------------------------------------------------
@@ -90,6 +96,12 @@ class ChromaStore:
         except Exception:
             return False
 
+    def _collection_handle(self) -> Any:
+        """Return the current collection handle, snapshotted under the lock so a
+        concurrent reset_collection() swap is never observed half-applied."""
+        with self._lock:
+            return self._collection
+
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
@@ -132,7 +144,7 @@ class ChromaStore:
         # Sanitize metadata — ChromaDB requires string/int/float/bool values
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
 
-        self._collection.add(documents=texts, metadatas=clean_meta, ids=ids)
+        self._collection_handle().add(documents=texts, metadatas=clean_meta, ids=ids)
         logger.debug("ChromaDB: added %d documents", len(texts))
         return ids
 
@@ -154,7 +166,7 @@ class ChromaStore:
             metadatas = [{} for _ in texts]
 
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
-        self._collection.upsert(documents=texts, metadatas=clean_meta, ids=ids)
+        self._collection_handle().upsert(documents=texts, metadatas=clean_meta, ids=ids)
         return ids
 
     # ------------------------------------------------------------------
@@ -193,7 +205,7 @@ class ChromaStore:
         if where:
             kwargs["where"] = where
 
-        result = self._collection.query(**kwargs)
+        result = self._collection_handle().query(**kwargs)
 
         hits: list[dict[str, Any]] = []
         if result["ids"]:
@@ -213,7 +225,7 @@ class ChromaStore:
         if not self._available:
             raise RuntimeError("ChromaDB is not available.")
 
-        result = self._collection.get(ids=[doc_id])
+        result = self._collection_handle().get(ids=[doc_id])
         if result["ids"]:
             return {
                 "id": result["ids"][0],
@@ -226,24 +238,28 @@ class ChromaStore:
         """Delete documents by their IDs."""
         if not self._available:
             raise RuntimeError("ChromaDB is not available.")
-        self._collection.delete(ids=ids)
+        self._collection_handle().delete(ids=ids)
 
     def count(self) -> int:
         """Return the number of documents in the collection."""
         if not self._available:
             return 0
-        return self._collection.count()
+        return self._collection_handle().count()
 
     def reset_collection(self) -> None:
         """Delete and recreate the collection (destructive)."""
         if not self._available:
             raise RuntimeError("ChromaDB is not available.")
-        self._client.delete_collection(self._collection_name)
-        self._collection = self._client.get_or_create_collection(
-            name=self._collection_name,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=self._embedding_function,
-        )
+        # delete→재생성으로 self._collection 핸들을 교체하므로 락으로 직렬화한다.
+        # 락이 없으면 동시 reset 시 두 스레드가 같은 컬렉션을 delete 하여 '이미 삭제됨'
+        # 에러가 나거나, 읽기가 삭제된 컬렉션을 가리키는 손상 핸들을 볼 수 있다.
+        with self._lock:
+            self._client.delete_collection(self._collection_name)
+            self._collection = self._client.get_or_create_collection(
+                name=self._collection_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._embedding_function,
+            )
         logger.info("ChromaDB: collection '%s' reset.", self._collection_name)
 
 

@@ -411,6 +411,8 @@ class TestUnavailableStore:
         s = LocalSQLDocStore(str(tmp_path / "ex.db"))
         mock_conn = MagicMock()
         mock_conn.close.side_effect = Exception("forced close error")
-        s._conn = mock_conn
+        # 스레드-로컬 커넥션 구조: close() 는 _all_conns 를 순회하며 각 커넥션을 닫는다.
+        s._all_conns.append(mock_conn)
         # Should NOT raise — exception is swallowed silently.
-        s.close()  # covers lines 168-169
+        s.close()
+        mock_conn.close.assert_called()

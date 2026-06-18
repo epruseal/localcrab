@@ -4,6 +4,12 @@ Local graph store — SQLite-backed graph for local-only mode.
 Implements the same interface as Neo4jStore so store consumers are
 agnostic of the backend. Nodes and edges are stored in SQLite tables;
 BFS traversal is done in Python.
+
+THREAD SAFETY: each thread gets its own sqlite3 connection (threading.local) —
+    sharing one connection across threads corrupts even reads. WAL mode lets
+    those per-thread connections read concurrently while a threading.Lock
+    serialises writers so only one connection writes the file at a time
+    (avoids SQLITE_BUSY). Reads take no lock.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from collections import deque
 from typing import Any
 
@@ -106,36 +113,49 @@ class LocalGraphStore:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self._db_path = db_path
         self._available = False
-        self._conn: sqlite3.Connection | None = None
+        # 쓰기 직렬화 락: 스레드별 커넥션이 같은 WAL 파일에 동시에 쓰면 SQLITE_BUSY가
+        # 나므로, 프로세스 내에서는 한 번에 한 writer만 쓰도록 직렬화한다.
+        self._lock = threading.Lock()
+        # 스레드-로컬 커넥션: 단일 sqlite3 커넥션을 여러 스레드가 공유하면 읽기조차
+        # "API misuse"로 깨진다. 스레드마다 자기 커넥션을 쓰면 WAL이 reader/writer를
+        # 격리해 읽기는 락 없이 동시 진행된다.
+        self._local = threading.local()
+        self._conns_lock = threading.Lock()
+        self._all_conns: list[sqlite3.Connection] = []
         self._init_db()
+
+    def _new_conn(self) -> sqlite3.Connection:
+        """이 스레드 전용 커넥션을 생성한다.
+
+        WAL: reader-writer를 격리해 쓰기 중에도 읽기를 허용. synchronous=NORMAL은
+        WAL 체크포인트 시에만 fsync해 처리량을 높인다(단일 머신/NVMe에서 수용 가능).
+        WAL은 DB 파일에 영속 설정되며 <db>-wal/<db>-shm가 생기므로 백업 시 함께 복사.
+        """
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        with self._conns_lock:
+            self._all_conns.append(conn)
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection | None:
+        """현재 스레드의 커넥션(없으면 생성). 기존 메서드들이 self._conn.X 형태로
+        그대로 쓰도록 property로 노출한다."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._new_conn()
+            self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
         try:
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-
-            # WAL(Write-Ahead Logging) 모드 활성화:
-            #   기본 DELETE 모드는 쓰기 시 DB 파일 전체에 배타 잠금을 걸어
-            #   MCP 서버처럼 다중 스레드가 동시 접근하는 환경에서 읽기 지연을 유발한다.
-            #   WAL 모드는 reader-writer를 격리시켜 쓰기 중에도 읽기를 허용한다.
-            #
-            # synchronous=NORMAL:
-            #   기본 FULL은 매 트랜잭션마다 fsync를 두 번 호출한다. NORMAL은 WAL
-            #   체크포인트 시에만 fsync를 수행해 쓰기 처리량을 높인다.
-            #   NVMe SSD + 단일 머신 환경에서 전원 장애로 인한 WAL 손상 위험은
-            #   수용 가능한 수준이다 (OS가 WAL 파일을 fsync하지 않더라도 DB 파일
-            #   자체는 손상되지 않는다).
-            #
-            # 주의: WAL 모드 전환은 기존 DB에도 안전하게 적용된다. 단, DB 파일
-            #   옆에 <db>-wal, <db>-shm 파일이 생성되므로 백업 시 세 파일을 함께
-            #   복사해야 한다.
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-
-            cur = self._conn.cursor()
+            conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma 적용
+            cur = conn.cursor()
             for ddl in _DDL:
                 cur.execute(ddl)
-            self._conn.commit()
+            conn.commit()
             self._available = True
             logger.info("LocalGraphStore initialised at %s", self._db_path)
         except Exception as exc:
@@ -146,11 +166,13 @@ class LocalGraphStore:
         return self._available
 
     def close(self) -> None:
-        if self._conn:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
+        with self._conns_lock:
+            for conn in self._all_conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
 
     def ping(self) -> bool:
         try:
@@ -181,18 +203,19 @@ class LocalGraphStore:
         if not self._available or not self._conn:
             raise RuntimeError("LocalGraphStore is not available.")
         props = {**properties, "id": node_id}
-        cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(node_type, node_id) DO UPDATE SET
-                space_id   = excluded.space_id,
-                properties = excluded.properties
-            """,
-            (node_type, node_id, space_id, json.dumps(props)),
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(node_type, node_id) DO UPDATE SET
+                    space_id   = excluded.space_id,
+                    properties = excluded.properties
+                """,
+                (node_type, node_id, space_id, json.dumps(props)),
+            )
+            self._conn.commit()
         return props
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
@@ -226,17 +249,18 @@ class LocalGraphStore:
     def delete_node(self, node_type: str, node_id: str) -> bool:
         if not self._available or not self._conn:
             raise RuntimeError("LocalGraphStore is not available.")
-        cur = self._conn.cursor()
-        cur.execute(
-            "DELETE FROM graph_nodes WHERE node_type=? AND node_id=?",
-            (node_type, node_id),
-        )
-        cur.execute(
-            "DELETE FROM graph_edges WHERE (from_type=? AND from_id=?) OR (to_type=? AND to_id=?)",
-            (node_type, node_id, node_type, node_id),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM graph_nodes WHERE node_type=? AND node_id=?",
+                (node_type, node_id),
+            )
+            cur.execute(
+                "DELETE FROM graph_edges WHERE (from_type=? AND from_id=?) OR (to_type=? AND to_id=?)",
+                (node_type, node_id, node_type, node_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -253,17 +277,18 @@ class LocalGraphStore:
     ) -> bool:
         if not self._available or not self._conn:
             raise RuntimeError("LocalGraphStore is not available.")
-        cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
-                properties = excluded.properties
-            """,
-            (from_type, from_id, relation, to_type, to_id, json.dumps(properties or {})),
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
+                    properties = excluded.properties
+                """,
+                (from_type, from_id, relation, to_type, to_id, json.dumps(properties or {})),
+            )
+            self._conn.commit()
         return True
 
     # ------------------------------------------------------------------
@@ -780,18 +805,19 @@ class LocalGraphStore:
             )
             for n in nodes
         ]
-        cur = self._conn.cursor()
-        cur.executemany(
-            """
-            INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(node_type, node_id) DO UPDATE SET
-                space_id   = excluded.space_id,
-                properties = excluded.properties
-            """,
-            params,
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(node_type, node_id) DO UPDATE SET
+                    space_id   = excluded.space_id,
+                    properties = excluded.properties
+                """,
+                params,
+            )
+            self._conn.commit()
         return len(params)
 
     def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
@@ -814,17 +840,18 @@ class LocalGraphStore:
             )
             for e in edges
         ]
-        cur = self._conn.cursor()
-        cur.executemany(
-            """
-            INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
-                properties = excluded.properties
-            """,
-            params,
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
+                    properties = excluded.properties
+                """,
+                params,
+            )
+            self._conn.commit()
         return len(params)
 
     # ------------------------------------------------------------------
