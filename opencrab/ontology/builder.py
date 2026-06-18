@@ -3,9 +3,11 @@ Ontology Builder.
 
 High-level API for adding nodes and edges to the multi-store ontology.
 Validates against the MetaOntology grammar before writing to any store.
-Writes to Neo4j (graph), MongoDB (document), PostgreSQL (registry), and
-optionally Chroma (vector) in a best-effort fan-out pattern — individual
-store failures are logged but do not abort the operation.
+Writes to the graph, document, SQL-registry and (optionally) vector stores in
+a best-effort fan-out pattern — individual store failures are logged but do
+not abort the operation. The ``stores`` map in the response keys results by
+role (``graph``/``docs``/``sql``/``vector``), not by backend product, so the
+status is meaningful regardless of the local/docker backend in use.
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ class OntologyBuilder:
         node_type: str,
         node_id: str,
         properties: dict[str, Any] | None = None,
+        *,
+        subject_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -105,40 +109,40 @@ class OntologyBuilder:
                     properties=props,
                     space_id=space,
                 )
-                output["stores"]["neo4j"] = "ok"
+                output["stores"]["graph"] = "ok"
                 output["node_data"] = node_props
             except Exception as exc:
                 logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
-                output["stores"]["neo4j"] = f"error: {exc}"
+                output["stores"]["graph"] = f"error: {exc}"
         else:
-            output["stores"]["neo4j"] = "unavailable"
+            output["stores"]["graph"] = "unavailable"
 
         # --- MongoDB write ---
         if self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
-                output["stores"]["mongodb"] = f"ok (id={mongo_id})"
+                output["stores"]["docs"] = f"ok (id={mongo_id})"
                 self._mongo.log_event(
                     "node_upsert",
-                    subject_id=None,
+                    subject_id=subject_id,
                     details={"space": space, "node_type": node_type, "node_id": node_id},
                 )
             except Exception as exc:
                 logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
-                output["stores"]["mongodb"] = f"error: {exc}"
+                output["stores"]["docs"] = f"error: {exc}"
         else:
-            output["stores"]["mongodb"] = "unavailable"
+            output["stores"]["docs"] = "unavailable"
 
         # --- PostgreSQL registry write ---
         if self._sql.available:
             try:
                 self._sql.register_node(space, node_type, node_id)
-                output["stores"]["postgres"] = "ok"
+                output["stores"]["sql"] = "ok"
             except Exception as exc:
                 logger.warning("SQL node registry write failed for %s: %s", node_id, exc)
-                output["stores"]["postgres"] = f"error: {exc}"
+                output["stores"]["sql"] = f"error: {exc}"
         else:
-            output["stores"]["postgres"] = "unavailable"
+            output["stores"]["sql"] = "unavailable"
 
         # --- Chroma vector write ---
         if self._vec is not None and self._vec.available:
@@ -152,14 +156,14 @@ class OntologyBuilder:
                         "node_id": node_id,
                     }
                     self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
-                    output["stores"]["chroma"] = "ok"
+                    output["stores"]["vector"] = "ok"
                 else:
-                    output["stores"]["chroma"] = "skipped (no text)"
+                    output["stores"]["vector"] = "skipped (no text)"
             except Exception as exc:
                 logger.warning("Chroma node write failed for %s: %s", node_id, exc)
-                output["stores"]["chroma"] = f"error: {exc}"
+                output["stores"]["vector"] = f"error: {exc}"
         else:
-            output["stores"]["chroma"] = "unavailable"
+            output["stores"]["vector"] = "unavailable"
 
         logger.info("Node added: %s/%s (%s)", space, node_id, node_type)
         return output
@@ -176,6 +180,8 @@ class OntologyBuilder:
         to_space: str,
         to_id: str,
         properties: dict[str, Any] | None = None,
+        *,
+        subject_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -235,29 +241,29 @@ class OntologyBuilder:
         if self._neo4j.available:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
-                output["stores"]["neo4j"] = "ok" if ok else "no match"
+                output["stores"]["graph"] = "ok" if ok else "no match"
             except Exception as exc:
                 logger.warning("Neo4j edge write failed: %s", exc)
-                output["stores"]["neo4j"] = f"error: {exc}"
+                output["stores"]["graph"] = f"error: {exc}"
         else:
-            output["stores"]["neo4j"] = "unavailable"
+            output["stores"]["graph"] = "unavailable"
 
         # --- PostgreSQL registry ---
         if self._sql.available:
             try:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)
-                output["stores"]["postgres"] = "ok"
+                output["stores"]["sql"] = "ok"
             except Exception as exc:
                 logger.warning("SQL edge registry failed: %s", exc)
-                output["stores"]["postgres"] = f"error: {exc}"
+                output["stores"]["sql"] = f"error: {exc}"
         else:
-            output["stores"]["postgres"] = "unavailable"
+            output["stores"]["sql"] = "unavailable"
 
         # --- MongoDB audit ---
         if self._mongo.available:
             self._mongo.log_event(
                 "edge_upsert",
-                subject_id=None,
+                subject_id=subject_id,
                 details={
                     "from_space": from_space,
                     "from_id": from_id,
@@ -266,9 +272,9 @@ class OntologyBuilder:
                     "to_id": to_id,
                 },
             )
-            output["stores"]["mongodb"] = "audited"
+            output["stores"]["docs"] = "audited"
         else:
-            output["stores"]["mongodb"] = "unavailable"
+            output["stores"]["docs"] = "unavailable"
 
         logger.info("Edge added: %s/%s -[%s]-> %s/%s", from_space, from_id, relation, to_space, to_id)
         return output

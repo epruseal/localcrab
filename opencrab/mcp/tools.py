@@ -235,6 +235,7 @@ def ontology_add_node(
             node_type=node_type,
             node_id=node_id,
             properties=props,
+            subject_id=subject_id,
         )
         ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
         ctx["hybrid"].invalidate_bm25_cache()

@@ -560,8 +560,9 @@ class TestOntologyBuilder:
         assert result["space"] == "subject"
         assert result["node_type"] == "User"
         assert "stores" in result
-        # neo4j and mongo are unavailable, but sql should be ok
-        assert result["stores"]["postgres"] == "ok"
+        # neo4j and mongo are unavailable, but the SQL registry should be ok.
+        # stores keys are role-based (graph/docs/sql/vector) since §1.3.
+        assert result["stores"]["sql"] == "ok"
 
     def test_add_node_invalid_space(self, builder):
         with pytest.raises(ValueError, match="badspace"):
@@ -576,7 +577,7 @@ class TestOntologyBuilder:
         builder.add_node("resource", "Project", "p1", {"name": "Project X"})
         result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
         assert result["relation"] == "owns"
-        assert result["stores"]["postgres"] == "ok"
+        assert result["stores"]["sql"] == "ok"
 
     def test_add_edge_invalid_relation(self, builder):
         with pytest.raises(ValueError):

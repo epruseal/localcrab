@@ -21,8 +21,9 @@ load_dotenv(REPO_ROOT / "apps" / ".env", override=False)
 load_dotenv(REPO_ROOT / ".env", override=False)
 
 from opencrab.config import get_settings
-from opencrab.grammar.manifest import SPACES
-from opencrab.grammar.validator import describe_grammar, validate_edge, validate_node
+from opencrab.grammar.validator import describe_grammar
+from opencrab.ontology.builder import OntologyBuilder
+from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
 from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store, make_vector_store
@@ -51,6 +52,9 @@ class QueryRequest(BaseModel):
     spaces: list[str] | None = Field(default=None, description="Optional space filter.")
     limit: int = Field(default=10, ge=1, le=25, description="Maximum result count.")
     graph_depth: int = Field(default=1, ge=1, le=4, description="Neighborhood expansion depth.")
+    pack_ids: list[str] | None = Field(default=None, description="Restrict search to these content packs.")
+    auto_pack: bool = Field(default=False, description="Auto-select the best-matching pack for the question.")
+    include_unpackaged: bool = Field(default=False, description="Also include unpackaged nodes when a pack filter is active.")
 
 
 class ImpactRequest(BaseModel):
@@ -125,12 +129,6 @@ def _limits_for_tier(tier: str) -> dict[str, int | None]:
     return {"max_vectors": None, "max_sources": None}
 
 
-def _space_to_default_type(space_id: str) -> str:
-    spec = SPACES.get(space_id, {})
-    node_types = spec.get("node_types", [])
-    return node_types[0] if node_types else space_id.capitalize()
-
-
 def _is_timeout_exc(exc: BaseException) -> bool:
     """Detect Mongo / generic timeout-shaped exceptions without hard pymongo dep."""
     name = type(exc).__name__
@@ -193,24 +191,6 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         docs.log_event(event_type, payload=details, actor=user_id)
     except Exception as exc:
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
-
-
-def _write_node_doc(
-    docs: Any,
-    *,
-    space: str,
-    node_type: str,
-    node_id: str,
-    properties: dict[str, Any],
-) -> str | None:
-    if not _docs_available(docs):
-        return None
-
-    try:
-        return docs.upsert_node_doc(space, node_type, node_id, properties)
-    except AttributeError:
-        docs.upsert_node(space, node_type, node_id, properties)
-        return f"{space}::{node_id}"
 
 
 def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, Any]) -> str | None:
@@ -497,36 +477,6 @@ def _enforce_ingest_limits(ctx: ApiContext, auth: AuthContext, source_id: str) -
         )
 
 
-def _resolve_node_types(ctx: ApiContext, from_space: str, from_id: str, to_space: str, to_id: str) -> tuple[str, str]:
-    from_type = _space_to_default_type(from_space)
-    to_type = _space_to_default_type(to_space)
-
-    if not getattr(ctx.graph, "available", False):
-        return from_type, to_type
-
-    try:
-        source_rows = ctx.graph.run_cypher(
-            "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-            {"id": from_id},
-        )
-        if source_rows and source_rows[0].get("lbl"):
-            from_type = source_rows[0]["lbl"]
-    except Exception:
-        pass
-
-    try:
-        target_rows = ctx.graph.run_cypher(
-            "MATCH (n {id: $id}) RETURN labels(n)[0] AS lbl LIMIT 1",
-            {"id": to_id},
-        )
-        if target_rows and target_rows[0].get("lbl"):
-            to_type = target_rows[0]["lbl"]
-    except Exception:
-        pass
-
-    return from_type, to_type
-
-
 @app.get("/api/status")
 def get_status(ctx: ApiContext = Depends(get_context)) -> dict[str, Any]:
     return {
@@ -600,11 +550,25 @@ def query_ontology(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # Pack selection shares the MCP/CLI service so the three query surfaces agree
+    # on the resolved filter and warning vocabulary (auto_pack failures degrade
+    # gracefully rather than failing the search).
+    selection = resolve_packs(
+        payload.question,
+        payload.pack_ids,
+        payload.auto_pack,
+        payload.include_unpackaged,
+        ctx.settings.local_data_dir,
+        raise_on_error=False,
+    )
+
     results = ctx.hybrid.query(
         question=payload.question,
         spaces=payload.spaces,
         limit=payload.limit,
         graph_depth=payload.graph_depth,
+        pack_ids=selection.effective_pack_ids,
+        include_unpackaged=payload.include_unpackaged,
     )
 
     keyword_fallback: list[dict[str, Any]] = []
@@ -615,12 +579,22 @@ def query_ontology(
             limit=payload.limit,
         )
 
+    pack_filter: dict[str, Any] = {
+        "pack_ids": selection.effective_pack_ids,
+        "auto_pack": selection.auto_pack_active,
+        "include_unpackaged": bool(payload.include_unpackaged),
+    }
+    if selection.warnings:
+        pack_filter["warnings"] = [mcp_warning_text(w) for w in selection.warnings]
+
     response = {
         "question": payload.question,
         "spaces_filter": payload.spaces,
         "total": len(results),
         "results": [result.to_dict() for result in results],
         "keyword_fallback": keyword_fallback,
+        "selected_packs": selection.selected_packs,
+        "pack_filter": pack_filter,
     }
     _log_event(
         ctx.docs,
@@ -666,71 +640,26 @@ def add_node(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
-    validation = validate_node(payload.space, payload.node_type)
-    validation.raise_if_invalid()
-
+    # Route through the shared OntologyBuilder so HTTP and MCP writes converge:
+    # deep grammar + required-field validation, receipt stamping, role-based
+    # store keys and audit are all produced once. owner_id is stamped before the
+    # write so it stays consistent with backfill_owner_id.py's expectations.
     properties = dict(payload.properties)
     properties.setdefault("owner_id", auth.user_id)
 
-    response: dict[str, Any] = {
-        "node_id": payload.node_id,
-        "space": payload.space,
-        "node_type": payload.node_type,
-        "properties": properties,
-        "stores": {},
-    }
+    builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
+    try:
+        response = builder.add_node(
+            payload.space,
+            payload.node_type,
+            payload.node_id,
+            properties,
+            subject_id=auth.user_id,
+        )
+    except ValueError as exc:
+        # Grammar / required-field validation failure — a client error, not a 500.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if getattr(ctx.graph, "available", False):
-        try:
-            response["node_data"] = ctx.graph.upsert_node(
-                node_type=payload.node_type,
-                node_id=payload.node_id,
-                properties=properties,
-                space_id=payload.space,
-            )
-            response["stores"]["graph"] = "ok"
-        except Exception as exc:
-            logger.warning("Graph node write failed for %s: %s", payload.node_id, exc)
-            response["stores"]["graph"] = f"error: {exc}"
-    else:
-        response["stores"]["graph"] = "unavailable"
-
-    if _docs_available(ctx.docs):
-        try:
-            doc_id = _write_node_doc(
-                ctx.docs,
-                space=payload.space,
-                node_type=payload.node_type,
-                node_id=payload.node_id,
-                properties=properties,
-            )
-            response["stores"]["documents"] = f"ok (id={doc_id})" if doc_id else "ok"
-        except Exception as exc:
-            logger.warning("Document node write failed for %s: %s", payload.node_id, exc)
-            response["stores"]["documents"] = f"error: {exc}"
-    else:
-        response["stores"]["documents"] = "unavailable"
-
-    if getattr(ctx.sql, "available", False):
-        try:
-            ctx.sql.register_node(payload.space, payload.node_type, payload.node_id)
-            response["stores"]["sql"] = "ok"
-        except Exception as exc:
-            logger.warning("SQL node registry failed for %s: %s", payload.node_id, exc)
-            response["stores"]["sql"] = f"error: {exc}"
-    else:
-        response["stores"]["sql"] = "unavailable"
-
-    _log_event(
-        ctx.docs,
-        "node_upsert",
-        auth.user_id,
-        {
-            "space": payload.space,
-            "node_type": payload.node_type,
-            "node_id": payload.node_id,
-        },
-    )
     _meter_call(ctx, auth, "/api/nodes")
     return response
 
@@ -741,69 +670,23 @@ def add_edge(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
-    validation = validate_edge(payload.from_space, payload.to_space, payload.relation)
-    validation.raise_if_invalid()
+    # Shared OntologyBuilder path (see add_node). The builder resolves real node
+    # types via the graph store's lookup_node_type, validates the relation, and
+    # produces a receipt + role-based store keys + audit in one place.
+    builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
+    try:
+        response = builder.add_edge(
+            payload.from_space,
+            payload.from_id,
+            payload.relation,
+            payload.to_space,
+            payload.to_id,
+            payload.properties,
+            subject_id=auth.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    from_type, to_type = _resolve_node_types(
-        ctx,
-        payload.from_space,
-        payload.from_id,
-        payload.to_space,
-        payload.to_id,
-    )
-
-    response: dict[str, Any] = {
-        "from": {"space": payload.from_space, "id": payload.from_id},
-        "relation": payload.relation,
-        "to": {"space": payload.to_space, "id": payload.to_id},
-        "stores": {},
-    }
-
-    if getattr(ctx.graph, "available", False):
-        try:
-            matched = ctx.graph.upsert_edge(
-                from_type,
-                payload.from_id,
-                payload.relation,
-                to_type,
-                payload.to_id,
-                payload.properties,
-            )
-            response["stores"]["graph"] = "ok" if matched else "no match"
-        except Exception as exc:
-            logger.warning("Graph edge write failed for %s -> %s: %s", payload.from_id, payload.to_id, exc)
-            response["stores"]["graph"] = f"error: {exc}"
-    else:
-        response["stores"]["graph"] = "unavailable"
-
-    if getattr(ctx.sql, "available", False):
-        try:
-            ctx.sql.register_edge(
-                payload.from_space,
-                payload.from_id,
-                payload.relation,
-                payload.to_space,
-                payload.to_id,
-            )
-            response["stores"]["sql"] = "ok"
-        except Exception as exc:
-            logger.warning("SQL edge registry failed for %s -> %s: %s", payload.from_id, payload.to_id, exc)
-            response["stores"]["sql"] = f"error: {exc}"
-    else:
-        response["stores"]["sql"] = "unavailable"
-
-    _log_event(
-        ctx.docs,
-        "edge_upsert",
-        auth.user_id,
-        {
-            "from_space": payload.from_space,
-            "from_id": payload.from_id,
-            "relation": payload.relation,
-            "to_space": payload.to_space,
-            "to_id": payload.to_id,
-        },
-    )
     _meter_call(ctx, auth, "/api/edges")
     return response
 
