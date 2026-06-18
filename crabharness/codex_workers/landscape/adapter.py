@@ -17,7 +17,8 @@ from crabharness.models import (
     ValidationIssue,
     ValidationReport,
 )
-from crabharness.semantic import determine_autoresearch_verdict, score_bundle_semantically
+
+from codex_workers._base import run_validation
 
 
 def _workspace_dir(root_dir: Path) -> Path:
@@ -98,36 +99,18 @@ def collect_bundle(
     )
 
 
-def validate_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationReport:
-    issues: list[ValidationIssue] = []
-    documents = bundle.summary.get("documents", [])
-    use_cases = bundle.summary.get("use_cases", [])
-    categories = bundle.summary.get("categories", [])
+def _field_check(bundle: ArtifactBundle, field: str) -> bool:
+    if field == "source_documents":
+        return len(bundle.summary.get("documents", [])) > 0
+    if field == "use_cases":
+        return len(bundle.summary.get("use_cases", [])) > 0
+    if field == "categories":
+        return len(bundle.summary.get("categories", [])) >= 2
+    return field in bundle.summary and bundle.summary.get(field) not in (None, "", [], {})
 
-    required = mission.success_criteria.required_fields or ["source_documents", "use_cases"]
-    passed = 0
-    for field in required:
-        if field == "source_documents":
-            ok = len(documents) > 0
-        elif field == "use_cases":
-            ok = len(use_cases) > 0
-        elif field == "categories":
-            ok = len(categories) >= 2
-        else:
-            ok = field in bundle.summary and bundle.summary.get(field) not in (None, "", [], {})
 
-        if ok:
-            passed += 1
-        else:
-            issues.append(
-                ValidationIssue(
-                    code=f"missing_{field}",
-                    severity="error",
-                    message=f"Required field `{field}` is missing from the landscape AI bundle.",
-                )
-            )
-
-    if len(categories) < 2:
+def _extra_checks(bundle: ArtifactBundle, issues: list[ValidationIssue]) -> None:
+    if len(bundle.summary.get("categories", [])) < 2:
         issues.append(
             ValidationIssue(
                 code="insufficient_category_coverage",
@@ -136,31 +119,19 @@ def validate_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationR
             )
         )
 
-    completeness = round(passed / max(len(required), 1), 3)
-    semantic_result = score_bundle_semantically(bundle, mission)
-    semantic_score = max(semantic_result.get("semantic_score", 0.0), _domain_semantic_score(bundle))
-    verdict = determine_autoresearch_verdict(completeness, semantic_score, mission)
-    threshold = mission.success_criteria.completeness_threshold
-    semantic_threshold = mission.success_criteria.min_semantic_score or 0.0
-    status = (
-        "pass"
-        if completeness >= threshold and semantic_score >= semantic_threshold and not any(issue.severity == "error" for issue in issues)
-        else "retry"
-    )
-    next_action = "promote" if status == "pass" else "retry"
-    if not documents and not use_cases:
-        status = "fail"
-        next_action = "reject"
 
-    return ValidationReport(
-        run_id=bundle.run_id,
-        mission_id=mission.mission_id,
-        status=status,
-        completeness_score=completeness,
-        semantic_score=semantic_score,
-        semantic_verdict=verdict,
-        issues=issues,
-        next_action=next_action,
+def validate_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationReport:
+    return run_validation(
+        bundle,
+        mission,
+        field_check=_field_check,
+        missing_message=lambda field: f"Required field `{field}` is missing from the landscape AI bundle.",
+        default_required_fields=["source_documents", "use_cases"],
+        extra_checks=_extra_checks,
+        semantic_override=lambda heuristic, b: max(heuristic, _domain_semantic_score(b)),
+        apply_semantic_gate=True,
+        fail_check=lambda b, _passed, _issues: not b.summary.get("documents", [])
+        and not b.summary.get("use_cases", []),
     )
 
 

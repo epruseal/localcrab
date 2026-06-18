@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from opencrab.common.text import slugify as _common_slugify
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.stores.local_doc_store import LocalDocStore
 from opencrab.stores.neo4j_store import Neo4jStore
@@ -40,7 +41,7 @@ def sha_id(prefix: str, value: str) -> str:
 
 
 def slugify(value: str) -> str:
-    return re.sub(r"[^a-z0-9가-힣]+", "-", value.lower()).strip("-") or "node"
+    return _common_slugify(value, allow_hangul=True, fallback="node")
 
 
 def parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:

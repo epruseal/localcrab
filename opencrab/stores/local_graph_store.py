@@ -15,6 +15,8 @@ import sqlite3
 from collections import deque
 from typing import Any
 
+from opencrab.stores._json import parse_props
+
 logger = logging.getLogger(__name__)
 
 
@@ -374,7 +376,7 @@ class LocalGraphStore:
                             dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
                             if not dst_pass:
                                 continue
-                            edge_props = self._parse_props(row["properties"])
+                            edge_props = parse_props(row["properties"])
                             if not _edge_passes(edge_props, True, dst_pass, pack_set):
                                 continue
                         visited.add(nid)
@@ -413,7 +415,7 @@ class LocalGraphStore:
                             src_pass = _node_passes(src_props, pack_set, include_unpackaged)
                             if not src_pass:
                                 continue
-                            edge_props = self._parse_props(row["properties"])
+                            edge_props = parse_props(row["properties"])
                             if not _edge_passes(edge_props, src_pass, True, pack_set):
                                 continue
                         visited.add(nid)
@@ -428,14 +430,6 @@ class LocalGraphStore:
 
         return results[:limit]
 
-    def _parse_props(self, raw: str | None) -> dict[str, Any]:
-        if not raw:
-            return {}
-        try:
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else {}
-        except (TypeError, ValueError):
-            return {}
 
     def _fetch_node_props_by_id(
         self, cur: sqlite3.Cursor, node_id: str
@@ -445,7 +439,7 @@ class LocalGraphStore:
             (node_id,),
         )
         row = cur.fetchone()
-        return self._parse_props(row["properties"]) if row else None
+        return parse_props(row["properties"]) if row else None
 
     def find_path(
         self, from_id: str, to_id: str, max_depth: int = 4
