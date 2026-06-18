@@ -3,7 +3,13 @@ Local document store — JSON-file-backed store for local-only mode.
 
 Implements the same interface as MongoStore so consumers are agnostic
 of the backend. Each "collection" is a single JSON file on disk.
-Thread-safety is handled by a simple file lock via a threading.Lock.
+
+THREAD SAFETY: a threading.Lock serialises all write operations (the
+read-modify-write of _load/_save). Reads take no lock and stay safe
+because _save writes to a temp file and os.replace()s it atomically, so a
+concurrent reader always sees either the whole old file or the whole new
+file — never a partially written one; _load also tolerates a corrupt file
+by returning {}.
 """
 
 from __future__ import annotations

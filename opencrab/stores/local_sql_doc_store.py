@@ -90,9 +90,9 @@ class LocalSQLDocStore:
     All writes use INSERT OR REPLACE (UPSERT) so callers can call upsert_*
     methods unconditionally without managing existence checks.
 
-    Thread-safety: sqlite3.connect(check_same_thread=False) + WAL mode allows
-    multiple threads to share a single connection safely — WAL guarantees
-    serialised writes and non-blocking reads.
+    Thread-safety: each thread gets its own sqlite3 connection (threading.local);
+    sharing one connection across threads corrupts even reads. WAL lets per-thread
+    connections read concurrently while a threading.Lock serialises writers.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -100,38 +100,52 @@ class LocalSQLDocStore:
         Replaces: LocalDocStore.__init__(data_dir) / MongoStore.__init__(uri, db_name)
         WHY: receive a file path rather than a directory so the caller controls
              exactly where the DB lives (simpler than data_dir + filename logic).
-        THREAD SAFETY: a threading.Lock serialises all write operations so that
-             multiple threads sharing a single connection never interleave
-             commits.  SQLite's check_same_thread=False allows cross-thread use
-             of the connection object; the Lock ensures only one thread is
-             executing a write at a time.
+        THREAD SAFETY: each thread gets its own sqlite3 connection
+             (threading.local) because sharing one connection across threads
+             corrupts even reads. A threading.Lock serialises writers so only one
+             per-thread connection writes the WAL file at a time (avoids
+             SQLITE_BUSY); reads take no lock and run concurrently under WAL.
         """
         self._db_path = db_path
         self._available = False
-        self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._local = threading.local()
+        self._conns_lock = threading.Lock()
+        self._all_conns: list[sqlite3.Connection] = []
         self._init_db()
+
+    def _new_conn(self) -> sqlite3.Connection:
+        """이 스레드 전용 커넥션 생성. WAL + synchronous=NORMAL 근거는
+        local_graph_store.py 와 동일(reader/writer 격리, 체크포인트시에만 fsync)."""
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        with self._conns_lock:
+            self._all_conns.append(conn)
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection | None:
+        """현재 스레드의 커넥션(없으면 생성). 기존 메서드의 self._conn.X 호출 호환."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._new_conn()
+            self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
         """
         Replaces: LocalDocStore's implicit dir creation + LocalGraphStore._init_db()
         WHY: WAL + synchronous=NORMAL is the same pattern as local_graph_store.py.
              Creates all three tables in a single transaction for atomicity.
-
-        PRAGMA details (copied rationale from local_graph_store.py):
-            WAL mode: readers never block writers and writers never block readers.
-            synchronous=NORMAL: fsync only at WAL checkpoint, not every commit.
-                Acceptable risk for a single-machine local store.
         """
         try:
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            cur = self._conn.cursor()
+            conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma
+            cur = conn.cursor()
             for ddl in _DDL:
                 cur.execute(ddl)
-            self._conn.commit()
+            conn.commit()
             self._available = True
             logger.info("LocalSQLDocStore initialised at %s", self._db_path)
         except Exception as exc:
@@ -162,11 +176,13 @@ class LocalSQLDocStore:
 
     def close(self) -> None:
         """Replaces: MongoStore.close() (LocalDocStore had no close())"""
-        if self._conn:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
+        with self._conns_lock:
+            for conn in self._all_conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
 
     # ------------------------------------------------------------------
     # Node document operations
