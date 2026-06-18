@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
+
+from opencrab.common.timefmt import now_iso
 
 _TABLES_SQLITE = [
     """
@@ -83,8 +84,6 @@ _TABLES_PG = [
 ]
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _fuzzy_similarity(a: str, b: str) -> float:
@@ -260,7 +259,7 @@ class IdentityEngine:
             "similarity": similarity,
             "method": method,
             "status": "pending",
-            "created_at": _now_iso(),
+            "created_at": now_iso(),
         }
 
     def resolve_duplicate(
@@ -337,7 +336,7 @@ class IdentityEngine:
             "candidate_id": candidate_id,
             "status": decision,
             "decided_by": decided_by,
-            "resolved_at": _now_iso(),
+            "resolved_at": now_iso(),
         }
 
     def find_duplicates_by_name(

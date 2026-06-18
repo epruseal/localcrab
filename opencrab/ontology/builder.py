@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
+from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.mongo_store import MongoStore
@@ -84,7 +84,7 @@ class OntologyBuilder:
         prop_result.raise_if_invalid()
 
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
-        receipt_ts = datetime.now(timezone.utc).isoformat()
+        receipt_ts = now_iso()
 
         output: dict[str, Any] = {
             "node_id": node_id,
@@ -212,7 +212,7 @@ class OntologyBuilder:
 
         props = properties or {}
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
-        receipt_ts = datetime.now(timezone.utc).isoformat()
+        receipt_ts = now_iso()
 
         output: dict[str, Any] = {
             "from": {"space": from_space, "id": from_id},

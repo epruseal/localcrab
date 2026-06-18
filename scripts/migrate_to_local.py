@@ -26,14 +26,12 @@ import logging
 import os
 import shutil
 import sys
-import time
-from datetime import datetime, UTC
-from pathlib import Path
+from datetime import UTC, datetime
 from typing import Any
 
 # rich 는 pyproject.toml 의존성에 포함돼 있음
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 console = Console()
@@ -93,7 +91,9 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     console.print("  Neo4j 연결 중...", end=" ")
     try:
         from neo4j import GraphDatabase  # type: ignore[import]
-        driver = GraphDatabase.driver(args.neo4j_uri, auth=(args.neo4j_user, args.neo4j_pass))
+
+        from opencrab.common.neo4j_driver import make_driver
+        driver = make_driver(GraphDatabase, args.neo4j_uri, args.neo4j_user, args.neo4j_pass)
         with driver.session() as sess:
             # READ ONLY: RETURN 1 로만 ping
             sess.run("RETURN 1").consume()

@@ -3,8 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from crabharness.models import ArtifactBundle, ArtifactFile, DelegationJob, MissionSpec, ValidationIssue, ValidationReport
-from crabharness.semantic import score_bundle_semantically, determine_autoresearch_verdict
+from crabharness.models import (
+    ArtifactBundle,
+    ArtifactFile,
+    DelegationJob,
+    MissionSpec,
+    ValidationReport,
+)
+
+from codex_workers._base import run_validation
 
 
 def collect_bundle(
@@ -53,60 +60,19 @@ def collect_bundle(
     )
 
 
+def _field_check(bundle: ArtifactBundle, field: str) -> bool:
+    if field == "repos":
+        return bundle.summary.get("repos_count", 0) > 0
+    return field in bundle.summary
+
+
 def validate_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationReport:
     """Validate GitHub trending bundle."""
-    issues: list[ValidationIssue] = []
-    required = mission.success_criteria.required_fields or ["repos"]
-
-    repos_count = bundle.summary.get("repos_count", 0)
-    passed = 0
-    checks_total = max(len(required), 1)
-
-    for field in required:
-        if field == "repos":
-            ok = repos_count > 0
-        else:
-            ok = field in bundle.summary
-
-        if ok:
-            passed += 1
-        else:
-            issues.append(
-                ValidationIssue(
-                    code=f"missing_{field}",
-                    severity="error",
-                    message=f"Required field `{field}` is missing from GitHub trending bundle.",
-                )
-            )
-
-    completeness = round(passed / checks_total, 3)
-
-    # Semantic scoring
-    semantic_result = score_bundle_semantically(bundle, mission)
-    semantic_score = semantic_result.get("semantic_score", 0.0)
-
-    # Autoresearch verdict
-    autoresearch_verdict = determine_autoresearch_verdict(
-        completeness_score=completeness,
-        semantic_score=semantic_score,
-        mission=mission,
-    )
-
-    threshold = mission.success_criteria.completeness_threshold
-    status = "pass" if completeness >= threshold and not any(issue.severity == "error" for issue in issues) else "retry"
-    next_action = "promote" if status == "pass" else "retry"
-
-    if passed == 0 and issues:
-        status = "fail"
-        next_action = "reject"
-
-    return ValidationReport(
-        run_id=bundle.run_id,
-        mission_id=mission.mission_id,
-        status=status,
-        completeness_score=completeness,
-        semantic_score=semantic_score,
-        semantic_verdict=autoresearch_verdict,
-        issues=issues,
-        next_action=next_action,
+    return run_validation(
+        bundle,
+        mission,
+        field_check=_field_check,
+        missing_message=lambda field: f"Required field `{field}` is missing from GitHub trending bundle.",
+        default_required_fields=["repos"],
+        fail_check=lambda _bundle, passed, issues: passed == 0 and bool(issues),
     )

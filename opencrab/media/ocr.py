@@ -7,13 +7,14 @@ and English OCR path without requiring system Tesseract packages.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from opencrab.common.hashing import file_sha256
 
 
 @dataclass(slots=True)
@@ -28,7 +29,7 @@ class OcrResult:
 
     def to_evidence(self, evidence_id: str | None = None) -> dict[str, Any]:
         path = Path(self.path)
-        digest = self.metadata.get("sha256") or _sha256(path)
+        digest = self.metadata.get("sha256") or file_sha256(path)
         return {
             "evidence_id": evidence_id or f"evidence:ocr:{digest[:16]}",
             "kind": "ocr_text",
@@ -50,18 +51,12 @@ class OcrResult:
         }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _image_metadata(path: Path) -> dict[str, Any]:
     stat = path.stat()
     metadata: dict[str, Any] = {
-        "sha256": _sha256(path),
+        "sha256": file_sha256(path),
         "bytes": stat.st_size,
         "mime_type": mimetypes.guess_type(path.name)[0],
     }
@@ -137,8 +132,8 @@ def _run_easyocr(path: Path, lang: str) -> OcrResult | None:
 
 def _run_tesseract(path: Path, lang: str) -> OcrResult | None:
     try:
-        from PIL import Image  # type: ignore
         import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
     except Exception:
         return None
 

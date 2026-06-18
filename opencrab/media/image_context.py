@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import mimetypes
@@ -10,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from opencrab.common.hashing import file_sha256
 
 
 @dataclass(slots=True)
@@ -26,7 +27,7 @@ class ImageContextResult:
 
     def to_evidence(self, evidence_id: str | None = None) -> dict[str, Any]:
         path = Path(self.path)
-        digest = self.metadata.get("sha256") or _sha256(path)
+        digest = self.metadata.get("sha256") or file_sha256(path)
         return {
             "evidence_id": evidence_id or f"evidence:clip:{digest[:16]}",
             "kind": "image_context",
@@ -49,12 +50,6 @@ class ImageContextResult:
         }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _normalise(values: list[float]) -> list[float]:
@@ -63,7 +58,7 @@ def _normalise(values: list[float]) -> list[float]:
 
 
 def _fallback_context(path: Path) -> ImageContextResult:
-    digest = _sha256(path)
+    digest = file_sha256(path)
     stat = path.stat()
     metadata: dict[str, Any] = {
         "sha256": digest,
@@ -114,7 +109,7 @@ def _sentence_transformer_context(path: Path, model_name: str) -> ImageContextRe
         model = SentenceTransformer(model_name)
         with Image.open(path) as image:
             vector = [float(v) for v in model.encode(image).tolist()]
-        digest = _sha256(path)
+        digest = file_sha256(path)
         return ImageContextResult(
             path=str(path),
             backend=f"sentence-transformers:{model_name}",

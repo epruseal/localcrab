@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from opencrab.common.timefmt import now_iso
 from opencrab.ontology.identity import IdentityEngine
 
 
@@ -70,10 +71,9 @@ class CanonicalizeEngine:
             Actor performing the merge.
         """
         import uuid
-        from datetime import datetime, timezone
 
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
-        receipt_ts = datetime.now(timezone.utc).isoformat()
+        receipt_ts = now_iso()
 
         # Register alias
         alias_record = self._identity.add_alias(

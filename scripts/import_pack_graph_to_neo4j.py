@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 from neo4j import GraphDatabase
 
+from opencrab.common.neo4j_driver import make_driver
+
 PACK_ID = "nvidia-nemotron-personas-korea"
 SPACE_TO_LABEL = {
     "resource": "Document",
@@ -327,7 +329,7 @@ def main() -> int:
     evidence_path = stage / "evidence/index.jsonl"
     status_path = stage.parent / "neo4j_import_status.json"
 
-    with GraphDatabase.driver(args.uri, auth=(args.user, args.password), max_connection_lifetime=3600) as driver:
+    with make_driver(GraphDatabase, args.uri, args.user, args.password, max_connection_lifetime=3600) as driver:
         driver.verify_connectivity()
         with driver.session() as session:
             ensure_schema(session)
