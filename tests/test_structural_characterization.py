@@ -131,12 +131,13 @@ def test_both_clean_props_coerce_nondict_to_empty(bad):
 
 
 # ---------------------------------------------------------------------------
-# 1d. _normalise_node vs normalise_node
-#     핵심 차이 박제:
-#       - opencrab: row.get("props") (graceful), space 추론 없음(LABEL_TO_SPACE 미사용),
-#         ontology_space/type/evidence_ids fallback 지원, node_type=labels[0]
-#       - script: record["props"] (KeyError on missing), LABEL_TO_SPACE 로 space 추론,
-#         node_type 은 LABELS 우선순위, ontology_space/evidence_ids fallback 없음
+# 1d. _normalise_node — 단일 구현(opencrab.pack.neo4j_export)을 도메인 파라미터로
+#     바인딩해 공유. 보존되는 본질 차이(파라미터로 표현):
+#       - opencrab: graceful(.get), LABEL_TO_SPACE/LABELS 미주입, node_type=labels[0]
+#       - script(strict/label_to_space/label_priority): KeyError, LABEL_TO_SPACE 로
+#         space 추론, LABELS 우선순위로 node_type
+#     §5 수렴(통합으로 script 가 opencrab fallback 획득): ontology_space / props["type"]
+#     / evidence_ids fallback 은 이제 두 구현이 공유한다.
 # ---------------------------------------------------------------------------
 
 def test_normalise_node_opencrab_full_row():
@@ -186,19 +187,22 @@ def test_normalise_node_opencrab_ontology_space_and_type_fallback():
     assert payload["node_type"] == "Custom"
 
 
-def test_normalise_node_script_ignores_ontology_space_and_type():
-    # script 는 ontology_space 도 props["type"] 도 보지 않는다.
+def test_normalise_node_script_now_honours_ontology_space_and_type():
+    # §5 수렴: 통합 전에는 script 가 ontology_space / props["type"] 를 무시했으나,
+    # 단일 구현으로 합치면서 opencrab 의 fallback 을 공유한다(누락 보완 = 기능 확대,
+    # 제약 약화 아님). 이제 두 구현 모두 동일하게 추론한다.
     row = {"props": {"id": "n3", "ontology_space": "subject", "type": "Custom"}, "labels": []}
-    payload = _expg.normalise_node(row)["payload"]
-    assert payload["space"] == ""
-    assert payload["node_type"] == ""
+    oc = _normalise_node(row)["payload"]
+    sc = _expg.normalise_node(row)["payload"]
+    assert oc["space"] == "subject" and oc["node_type"] == "Custom"
+    assert sc["space"] == "subject" and sc["node_type"] == "Custom"
 
 
-def test_normalise_node_evidence_refs_fallback_difference():
-    # opencrab 은 evidence_ids -> evidence_refs fallback, script 는 evidence_refs 만.
+def test_normalise_node_evidence_refs_fallback_now_shared():
+    # §5 수렴: 통합 후 script 도 evidence_ids -> evidence_refs fallback 을 적용한다.
     row = {"props": {"id": "n4", "evidence_ids": ["e1"]}, "labels": ["Evidence"]}
     assert _normalise_node(row)["payload"]["evidence_refs"] == ["e1"]
-    assert _expg.normalise_node(row)["payload"]["evidence_refs"] == []
+    assert _expg.normalise_node(row)["payload"]["evidence_refs"] == ["e1"]
 
 
 def test_normalise_node_node_type_priority_difference():
@@ -237,14 +241,12 @@ def test_normalise_node_missing_props_key_difference():
 
 
 # ---------------------------------------------------------------------------
-# 1e. _normalise_edge vs normalise_edge
-#     핵심 차이 박제:
-#       - opencrab: from_id/to_id = _node_id(props) (id/node_id/uuid -> sha),
-#         relation = row.relation or rel_props.relation, .get() graceful,
+# 1e. _normalise_edge — 단일 구현 공유. 보존되는 본질 차이(파라미터):
+#       - opencrab: from_id/to_id = id/node_id/uuid -> sha, .get() graceful,
 #         space 추론 없음
-#       - script: from_id = source_props.id or rel_props.from_id,
-#         relation = str(record["relation"]).lower() (None -> "none"),
-#         record["rel_props"] KeyError on missing, LABEL_TO_SPACE 로 space 추론
+#       - script(strict/label_to_space/rel_endpoint_fallback): record[...] KeyError,
+#         from_id/to_id 가 rel_props.from_id/to_id 로 보충 가능, LABEL_TO_SPACE 추론
+#     §5 수렴: relation=None 시 rel_props.relation fallback 은 이제 두 구현이 공유.
 # ---------------------------------------------------------------------------
 
 def test_normalise_edge_full_row_identical_when_ids_and_spaces_present():
@@ -295,9 +297,9 @@ def test_normalise_edge_from_to_id_fallback_difference():
     assert sc["to_id"] == "RID_TO"
 
 
-def test_normalise_edge_relation_none_difference():
-    # relation=None: opencrab 은 rel_props.relation fallback("fallback"),
-    # script 는 str(None).lower()="none".
+def test_normalise_edge_relation_none_now_shared():
+    # §5 수렴: relation=None 일 때 통합 후 script 도 rel_props.relation fallback 을
+    # 적용한다(이전엔 str(None).lower()="none" 이었음).
     erow = {
         "source_props": {"id": "s"},
         "target_props": {"id": "t"},
@@ -307,7 +309,7 @@ def test_normalise_edge_relation_none_difference():
         "target_labels": [],
     }
     assert _normalise_edge(erow)["payload"]["relation"] == "fallback"
-    assert _expg.normalise_edge(erow)["payload"]["relation"] == "none"
+    assert _expg.normalise_edge(erow)["payload"]["relation"] == "fallback"
 
 
 def test_normalise_edge_space_inference_difference():
