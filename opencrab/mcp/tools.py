@@ -1252,9 +1252,11 @@ def _slugify(text: str) -> str:
     """Generate a URL-safe pack_id slug from a title string.
 
     Strips MCP surrogate junk first (``_clean_str``) then delegates to the
-    shared slugify (Hangul dropped, fallback ``pack``).
+    shared slugify with ``allow_hangul=True``. Dropping Hangul collapsed every
+    all-Korean title onto the same fallback (``pack``), so distinct Korean packs
+    would have collided on one id — keeping Hangul makes the slug faithful.
     """
-    return slugify(_clean_str(text), fallback="pack")
+    return slugify(_clean_str(text), allow_hangul=True, fallback="pack")
 
 
 def _nine_space_hint() -> str:

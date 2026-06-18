@@ -13,10 +13,10 @@ Notable cross-implementation differences deliberately recorded below:
     a ``prefix:digest`` shape and hash a sorted-JSON encoding, while the
     obsidian importer uses SHA1[:16] with a ``prefix-digest`` shape and hashes
     the raw string. dedupe._compute_id uses SHA256[:16] with NO prefix.
-  * slugify helpers diverge: mcp.tools._slugify and landscape.adapter._slug
-    strip non-[a-z0-9] (Korean characters are dropped), with different empty
-    fallbacks ("pack" vs "item"); the obsidian importer's slugify keeps Korean
-    ([a-z0-9가-힣]) and falls back to "node".
+  * slugify helpers now converge on keeping Korean ([a-z0-9가-힣]): mcp.tools.
+    _slugify, landscape.adapter._slug and the obsidian importer all preserve
+    Hangul; they differ only in the empty-input fallback ("pack"/"item"/"node").
+    (Before §3, mcp/landscape stripped Korean, collapsing distinct titles.)
   * _now_iso (5 definitions) produces an aware ISO string ending "+00:00".
     dedupe now matches this via a local ``_now_iso`` helper (inlined, since
     crabharness must stay importable without opencrab) — previously it used a
@@ -438,7 +438,7 @@ def test_stable_id_family_divergence_summary():
 
 
 def test_mcp_slugify_golden():
-    """opencrab.mcp.tools._slugify — drops non-[a-z0-9], fallback "pack"."""
+    """opencrab.mcp.tools._slugify — keeps Hangul (allow_hangul=True), fallback "pack"."""
     from opencrab.mcp.tools import _slugify
 
     assert _slugify("Hello World") == "hello-world"
@@ -446,17 +446,17 @@ def test_mcp_slugify_golden():
     assert _slugify("   ") == "pack"
     assert _slugify("a@@b !!!") == "a-b"
     assert _slugify("  __Foo Bar__  ") == "foo-bar"
-    # Korean is stripped entirely (only "test" survives).
-    assert _slugify("한글 Test 노드") == "test"
-    # A purely-Korean title collapses to the fallback.
-    assert _slugify("한글노드") == "pack"
+    # Korean is now PRESERVED (§3): distinct Korean titles no longer collapse
+    # onto the "pack" fallback and collide.
+    assert _slugify("한글 Test 노드") == "한글-test-노드"
+    assert _slugify("한글노드") == "한글노드"
     assert _slugify("a___---  b") == "a-b"
     assert _slugify("UPPER") == "upper"
 
 
 def test_landscape_slug_golden():
-    """crabharness.codex_workers.landscape.adapter._slug — same regex as
-    mcp._slugify but fallback is "item" (not "pack")."""
+    """crabharness.codex_workers.landscape.adapter._slug — keeps Hangul (§3),
+    same behaviour as mcp._slugify but fallback is "item" (not "pack")."""
     adapter = _load_landscape_adapter()
     _slug = adapter._slug
 
@@ -465,8 +465,8 @@ def test_landscape_slug_golden():
     assert _slug("   ") == "item"
     assert _slug("a@@b !!!") == "a-b"
     assert _slug("  __Foo Bar__  ") == "foo-bar"
-    assert _slug("한글 Test 노드") == "test"
-    assert _slug("한글노드") == "item"
+    assert _slug("한글 Test 노드") == "한글-test-노드"
+    assert _slug("한글노드") == "한글노드"
     assert _slug("a___---  b") == "a-b"
     assert _slug("UPPER") == "upper"
 
@@ -489,17 +489,21 @@ def test_obsidian_slugify_golden_keeps_korean():
     assert _slug("UPPER") == "upper"
 
 
-def test_slug_family_korean_divergence():
-    """Side-by-side: same Korean input, three different outputs/fallbacks."""
+def test_slug_family_korean_convergence():
+    """After §3, all three slug helpers KEEP Korean and agree on the slug body.
+
+    Previously mcp/landscape dropped Korean (collapsing to "pack"/"item") while
+    only obsidian kept it. Now the three converge on the same Hangul slug; they
+    still differ only in the empty-input fallback ("pack"/"item"/"node")."""
     from opencrab.mcp.tools import _slugify
 
     adapter = _load_landscape_adapter()
     obs = _load_obsidian_module()
 
     text = "한글 노드"
-    assert _slugify(text) == "pack"        # Korean dropped -> empty -> fallback
-    assert adapter._slug(text) == "item"   # Korean dropped -> empty -> fallback
-    assert obs.slugify(text) == "한글-노드"  # Korean kept
+    assert _slugify(text) == "한글-노드"      # Korean kept (was "pack")
+    assert adapter._slug(text) == "한글-노드"  # Korean kept (was "item")
+    assert obs.slugify(text) == "한글-노드"    # Korean kept (unchanged)
 
 
 # ===========================================================================
