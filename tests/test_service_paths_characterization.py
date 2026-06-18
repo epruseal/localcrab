@@ -362,6 +362,50 @@ class TestPackSelectionCLI:
         assert parsed == []
 
 
+class TestResolvePacksErrorPolicy:
+    """공통 서비스 resolve_packs 의 예외 정책 분기 박제:
+    MCP(raise_on_error=False) 는 graceful degrade(AUTO_PACK_FAILED 경고),
+    CLI(raise_on_error=True) 는 예외 전파."""
+
+    @staticmethod
+    def _boom(*_a, **_k):
+        raise RuntimeError("kaboom")
+
+    def test_auto_pack_failure_graceful(self, monkeypatch):
+        from opencrab.services.pack_selection import AUTO_PACK_FAILED, resolve_packs
+
+        monkeypatch.setattr(
+            "opencrab.ontology.pack_registry.load_pack_registry", self._boom
+        )
+        sel = resolve_packs("q", None, True, False, "/tmp", raise_on_error=False)
+        assert sel.effective_pack_ids is None
+        assert sel.selected_packs == []
+        assert [w.code for w in sel.warnings] == [AUTO_PACK_FAILED]
+        assert sel.warnings[0].detail == "kaboom"
+
+    def test_auto_pack_failure_raises(self, monkeypatch):
+        from opencrab.services.pack_selection import resolve_packs
+
+        monkeypatch.setattr(
+            "opencrab.ontology.pack_registry.load_pack_registry", self._boom
+        )
+        with pytest.raises(RuntimeError):
+            resolve_packs("q", None, True, False, "/tmp", raise_on_error=True)
+
+    def test_pack_ids_override_does_not_touch_registry(self, monkeypatch):
+        # pack_ids 가 있으면 auto_pack 은 무력화되어 registry 를 건드리지 않는다
+        # (override 경고만 — 예외 함수가 호출되면 안 됨).
+        from opencrab.services.pack_selection import PACK_IDS_OVERRIDE_AUTO, resolve_packs
+
+        monkeypatch.setattr(
+            "opencrab.ontology.pack_registry.load_pack_registry", self._boom
+        )
+        sel = resolve_packs("q", ["pack-a"], True, False, "/tmp", raise_on_error=True)
+        assert sel.effective_pack_ids == ["pack-a"]
+        assert sel.auto_pack_active is False
+        assert [w.code for w in sel.warnings] == [PACK_IDS_OVERRIDE_AUTO]
+
+
 # ===========================================================================
 # 2. Query response envelope (per-interface shape)
 # ===========================================================================
