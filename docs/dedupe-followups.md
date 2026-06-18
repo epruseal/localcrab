@@ -66,7 +66,10 @@
 - **현재 차이**: 5개 `_now_iso` 정의(execution/workflow·approvals, ontology/identity·promotion, billing/hooks)는 aware `...+00:00`. `crabharness/dedupe.py` inline은 naive + 리터럴 `"Z"`(`datetime.utcnow().isoformat()+"Z"`).
 - **변경 시 영향**: dedupe를 aware 포맷으로 통일하면 → 문자열 표현이 `"Z"` → `"+00:00"`로 바뀜. dedupe가 생성한 타임스탬프를 **문자열 비교/정렬하거나 `"Z"` suffix를 파싱하는 소비처**가 있으면 깨짐. 시각 값 자체는 동일(둘 다 UTC)하나 직렬화 표현이 달라짐.
 
-## 5. Neo4j 행 정규화 두 구현의 의미 차이
+## 5. Neo4j 행 정규화 두 구현의 의미 차이 — 통합 보류(결정)
+
+> **결정(Phase 3)**: `_stable_json`≡`jdump`, `_sha_id`≡`sha_id`(비트단위 동일)와 `sha256_file`은 통합했으나, **`clean_props`/`normalise_node`/`normalise_edge` 정규화 함수는 통합 보류**. 아래의 의미 차이가 6가지 이상이라 단일 함수 파라미터화는 동작 버그 위험이 크다. opencrab 베이스 + `LABEL_TO_SPACE` 등 도메인 매핑 주입 방식의 통합은 별도 과제로 남긴다.
+
 
 `pack/neo4j_export.py`(opencrab)와 `scripts/export_pack_graph_from_neo4j.py`(스크립트)의 정규화 함수가 거의 동일하나 다음이 다름:
 - **clean_props**: opencrab은 입력 dict를 **그대로(동일 객체) 반환** → 이후 변형 시 원본 공유(부작용 위험). scripts는 `dict(value)` **얕은 복사** 반환.
