@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
+
+from opencrab.common.timefmt import now_iso
 
 _TABLE_SQLITE = """
 CREATE TABLE IF NOT EXISTS approval_queue (
@@ -47,8 +48,6 @@ CREATE TABLE IF NOT EXISTS approval_queue (
 """
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class ApprovalEngine:
@@ -113,7 +112,7 @@ class ApprovalEngine:
             "action_type": action_type,
             "subject_id": subject_id,
             "status": "pending",
-            "created_at": _now_iso(),
+            "created_at": now_iso(),
         }
 
     def resolve(
@@ -182,7 +181,7 @@ class ApprovalEngine:
             "status": decision,
             "reviewer_id": reviewer_id,
             "review_note": note,
-            "resolved_at": _now_iso(),
+            "resolved_at": now_iso(),
         }
 
     # ------------------------------------------------------------------

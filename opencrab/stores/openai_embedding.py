@@ -25,14 +25,14 @@ Ollama, vLLM, Text-Embeddings-Inference, 실제 OpenAI API 등 동일 스펙을 
 """
 
 import logging
-import math
 from typing import Any
 
 import httpx
 
+from opencrab.stores._embedding_utils import EMBEDDING_FUNCTION_NAME, l2_normalize
+
 logger = logging.getLogger(__name__)
 
-_EMBEDDING_FUNCTION_NAME = "kure_v1"
 # ChromaDB 1.5+ 는 get_or_create_collection 시 EF name 으로 컬렉션을
 # 재식별한다. 동일 name 을 반환해야 재시작 후에도 컬렉션을 재사용할 수 있다.
 
@@ -89,7 +89,7 @@ class OpenAIEmbeddingFunction:
 
     def name(self) -> str:
         """ChromaDB persistence 에서 EF 를 식별하는 고정 이름."""
-        return _EMBEDDING_FUNCTION_NAME
+        return EMBEDDING_FUNCTION_NAME
 
     def embed_query(self, input: list[str]) -> list[list[float]]:
         """ChromaDB 1.5+ 가 query 경로에서 호출하는 메서드.
@@ -133,11 +133,4 @@ class OpenAIEmbeddingFunction:
         data = resp.json()
         vecs = [item["embedding"] for item in data["data"]]
         # KURE 등은 이미 L2 정규화된 벡터를 반환하나, 안전하게 재정규화.
-        return [_l2_normalize(v) for v in vecs]
-
-
-def _l2_normalize(v: list[float]) -> list[float]:
-    norm = math.sqrt(sum(x * x for x in v))
-    if norm < 1e-9:
-        return v
-    return [x / norm for x in v]
+        return [l2_normalize(v) for v in vecs]

@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
 from typing import Any
+
+from opencrab.common.timefmt import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,6 @@ _TABLES_PG = [
 ]
 
 
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _insert_event_sql(is_sqlite: bool) -> str:
@@ -166,7 +165,7 @@ class BillingHooks:
             "event_type": event_type,
             "tenant_id": tenant_id,
             "count": count,
-            "created_at": _now_iso(),
+            "created_at": now_iso(),
         }
 
     # ------------------------------------------------------------------

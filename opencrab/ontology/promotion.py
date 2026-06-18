@@ -15,12 +15,9 @@ with a 'status' property tracking the lifecycle stage.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from opencrab.common.timefmt import now_iso
 
 
 class PromotionEngine:
@@ -110,7 +107,7 @@ class PromotionEngine:
             props["validated_by"] = validator_id
         if note:
             props["validation_note"] = note
-        props["validated_at"] = _now_iso()
+        props["validated_at"] = now_iso()
 
         result = self._builder.add_node(
             space=space,
@@ -146,7 +143,7 @@ class PromotionEngine:
             IDs of evidence nodes (space: 'evidence') supporting this promotion.
         """
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
-        receipt_ts = _now_iso()
+        receipt_ts = now_iso()
 
         props = {**existing_properties, "status": "promoted"}
         if promoted_by:
@@ -196,7 +193,7 @@ class PromotionEngine:
             props["rejected_by"] = rejected_by
         if reason:
             props["rejection_reason"] = reason
-        props["rejected_at"] = _now_iso()
+        props["rejected_at"] = now_iso()
 
         result = self._builder.add_node(
             space=space,

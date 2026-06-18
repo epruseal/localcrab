@@ -47,6 +47,8 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
+from opencrab.common.text import slugify
+
 logger = logging.getLogger(__name__)
 
 # chroma PersistentClient는 단일 프로세스 전용.
@@ -135,7 +137,12 @@ def _get_context() -> dict[str, Any]:
     from opencrab.ontology.impact import ImpactEngine
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
-    from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store, make_vector_store
+    from opencrab.stores.factory import (
+        make_doc_store,
+        make_graph_store,
+        make_sql_store,
+        make_vector_store,
+    )
 
     cfg = get_settings()
 
@@ -1032,8 +1039,8 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     # LocalGraphStore는 run_cypher()가 no-op(항상 [])이므로 Cypher를 사용할 수 없다.
     # 대신 LocalGraphStore.list_packs()가 동등한 SQL GROUP BY 집계를 제공한다.
     # Neo4j 모드에서는 기존 Cypher 경로를 그대로 유지해 동작 변화를 최소화한다.
-    from opencrab.stores.local_graph_store import LocalGraphStore
     from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+    from opencrab.stores.local_graph_store import LocalGraphStore
     if isinstance(graph, (LocalGraphStore, KuzuGraphStore)):
         rows = graph.list_packs(min_nodes)
         # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
@@ -1242,11 +1249,12 @@ def harness_promotion_apply(
 
 
 def _slugify(text: str) -> str:
-    """Generate a URL-safe pack_id slug from a title string."""
-    text = _clean_str(text).lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    text = text.strip("-")
-    return text or "pack"
+    """Generate a URL-safe pack_id slug from a title string.
+
+    Strips MCP surrogate junk first (``_clean_str``) then delegates to the
+    shared slugify (Hangul dropped, fallback ``pack``).
+    """
+    return slugify(_clean_str(text), fallback="pack")
 
 
 def _nine_space_hint() -> str:

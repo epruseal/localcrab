@@ -13,6 +13,8 @@ import os
 from collections import deque
 from typing import Any
 
+from opencrab.stores._json import parse_props as _parse
+
 logger = logging.getLogger(__name__)
 
 _NODE_DDL = (
@@ -25,16 +27,6 @@ _EDGE_DDL = (
     "FROM OntologyNode TO OntologyNode, "
     "relation STRING, properties STRING)"
 )
-
-
-def _parse(raw: str | None) -> dict[str, Any]:
-    if not raw:
-        return {}
-    try:
-        v = json.loads(raw)
-        return v if isinstance(v, dict) else {}
-    except (TypeError, ValueError):
-        return {}
 
 
 class KuzuGraphStore:
