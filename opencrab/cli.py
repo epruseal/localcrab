@@ -438,8 +438,8 @@ def query(
 ) -> None:
     """Run a hybrid query and print results."""
     from opencrab.config import get_settings
-    from opencrab.ontology.pack_registry import choose_packs, load_pack_registry
     from opencrab.ontology.query import HybridQuery
+    from opencrab.services.pack_selection import cli_warning_text, resolve_packs
     from opencrab.stores.factory import make_doc_store, make_graph_store, make_vector_store
 
     cfg = get_settings()
@@ -452,38 +452,23 @@ def query(
 
     space_filter = [s.strip() for s in spaces.split(",")] if spaces else None
 
-    effective_pack_ids: list[str] | None = list(pack_ids) if pack_ids else None
-    selected_packs: list[dict[str, Any]] = []
-
-    if effective_pack_ids and auto_pack:
+    selection = resolve_packs(
+        question,
+        list(pack_ids) if pack_ids else None,
+        auto_pack,
+        include_unpackaged,
+        cfg.local_data_dir,
+        raise_on_error=True,
+    )
+    effective_pack_ids = selection.effective_pack_ids
+    selected_packs = selection.selected_packs
+    auto_pack = selection.auto_pack_active
+    for warning in selection.warnings:
+        click.echo(cli_warning_text(warning), err=True)
+    for sp in selected_packs:
         click.echo(
-            "warning: --pack-id provided; ignoring --auto-pack.",
-            err=True,
-        )
-        auto_pack = False
-
-    if auto_pack:
-        registry = load_pack_registry(cfg.local_data_dir)
-        candidates = choose_packs(question, registry, limit=1)
-        if candidates:
-            pack, score, matched = candidates[0]
-            effective_pack_ids = [pack.pack_id]
-            selected_packs.append({"pack_id": pack.pack_id, "score": score, "matched": matched})
-            click.echo(
-                f"info: auto-pack selected '{pack.pack_id}' "
-                f"(score={score:.1f}, matched={matched[:6]})",
-                err=True,
-            )
-        else:
-            click.echo(
-                "warning: --auto-pack could not select a pack above the score threshold; "
-                "falling back to a full-store search.",
-                err=True,
-            )
-
-    if include_unpackaged and not effective_pack_ids:
-        click.echo(
-            "warning: --include-unpackaged has no effect without --pack-id or --auto-pack.",
+            f"info: auto-pack selected '{sp['pack_id']}' "
+            f"(score={sp['score']:.1f}, matched={sp['matched'][:6]})",
             err=True,
         )
 

@@ -60,3 +60,6 @@ startmcp.sh
 *token*
 *apikey*
 *api-key*
+
+# benchmark outputs (not part of source)
+outputs/

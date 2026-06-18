@@ -235,6 +235,7 @@ def ontology_add_node(
             node_type=node_type,
             node_id=node_id,
             properties=props,
+            subject_id=subject_id,
         )
         ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
         ctx["hybrid"].invalidate_bm25_cache()
@@ -343,41 +344,22 @@ def ontology_query(
         the response (default True). Set to False for the bare legacy shape.
     """
     from opencrab.config import get_settings
-    from opencrab.ontology.pack_registry import choose_packs, load_pack_registry
+    from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
     ctx = _get_context()
-    selected_packs: list[dict[str, Any]] = []
-    effective_pack_ids: list[str] | None = list(pack_ids) if pack_ids else None
-    pack_filter_warnings: list[str] = []
-
-    if effective_pack_ids and auto_pack:
-        pack_filter_warnings.append("pack_ids provided; ignoring auto_pack")
-        auto_pack = False
-
-    if auto_pack:
-        try:
-            cfg = get_settings()
-            registry = load_pack_registry(cfg.local_data_dir)
-            candidates = choose_packs(question, registry, limit=1)
-            if candidates:
-                pack, score, matched = candidates[0]
-                effective_pack_ids = [pack.pack_id]
-                selected_packs.append(
-                    {"pack_id": pack.pack_id, "score": score, "matched": matched}
-                )
-            else:
-                pack_filter_warnings.append(
-                    "auto_pack could not select a pack above the score threshold; "
-                    "falling back to full-store search"
-                )
-        except Exception as exc:
-            logger.warning("auto_pack selection failed: %s", exc)
-            pack_filter_warnings.append(f"auto_pack failed: {exc}")
-
-    if include_unpackaged and not effective_pack_ids:
-        pack_filter_warnings.append(
-            "include_unpackaged has no effect without pack_ids/auto_pack"
-        )
+    cfg = get_settings()
+    selection = resolve_packs(
+        question,
+        list(pack_ids) if pack_ids else None,
+        auto_pack,
+        include_unpackaged,
+        cfg.local_data_dir,
+        raise_on_error=False,
+    )
+    effective_pack_ids = selection.effective_pack_ids
+    selected_packs = selection.selected_packs
+    auto_pack = selection.auto_pack_active
+    pack_filter_warnings = [mcp_warning_text(w) for w in selection.warnings]
 
     try:
         results = ctx["hybrid"].query(
@@ -1252,9 +1234,11 @@ def _slugify(text: str) -> str:
     """Generate a URL-safe pack_id slug from a title string.
 
     Strips MCP surrogate junk first (``_clean_str``) then delegates to the
-    shared slugify (Hangul dropped, fallback ``pack``).
+    shared slugify with ``allow_hangul=True``. Dropping Hangul collapsed every
+    all-Korean title onto the same fallback (``pack``), so distinct Korean packs
+    would have collided on one id — keeping Hangul makes the slug faithful.
     """
-    return slugify(_clean_str(text), fallback="pack")
+    return slugify(_clean_str(text), allow_hangul=True, fallback="pack")
 
 
 def _nine_space_hint() -> str:

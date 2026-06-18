@@ -2,29 +2,79 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _sha_id(prefix: str, value: Any) -> str:
-    digest = hashlib.sha256(_stable_json(value).encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}:{digest}"
+# Canonical id/serialisation helpers live in opencrab.common.ids now; these
+# aliases keep the historical module-private names (and their importers) working
+# with byte-identical output.
+from opencrab.common.ids import canonical_json as _stable_json, stable_id as _sha_id
 
 
-def _clean_props(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
+def _clean_props(value: Any, *, copy: bool = False) -> dict[str, Any]:
+    """Coerce ``value`` to a dict.
+
+    ``copy=False`` (default) returns the *same* object — the historical
+    opencrab behaviour. ``copy=True`` returns a shallow copy (what the export
+    script did, to avoid mutating the source row).
+    """
+    if not isinstance(value, dict):
+        return {}
+    return dict(value) if copy else value
 
 
 def _node_id(props: dict[str, Any]) -> str:
     for key in ("id", "node_id", "uuid"):
         value = props.get(key)
+        if value:
+            return str(value)
+    return _sha_id("neo4j-node", props)
+
+
+def _resolve_node_type(
+    props: dict[str, Any],
+    labels: list[Any],
+    *,
+    label_priority: list[str] | None = None,
+) -> str:
+    explicit = props.get("node_type") or props.get("type")
+    if explicit:
+        return explicit
+    if label_priority:
+        for label in labels:
+            if label in label_priority:
+                return label
+    return labels[0] if labels else ""
+
+
+def _resolve_space(
+    props: dict[str, Any],
+    label_key: Any,
+    *,
+    label_to_space: dict[str, str] | None = None,
+) -> str:
+    space = props.get("space") or props.get("ontology_space")
+    if space:
+        return space
+    if label_to_space:
+        return label_to_space.get(str(label_key), "")
+    return ""
+
+
+def _endpoint_id(
+    props: dict[str, Any],
+    rel_props: dict[str, Any],
+    rel_key: str,
+    *,
+    rel_endpoint_fallback: bool = False,
+) -> str:
+    for key in ("id", "node_id", "uuid"):
+        value = props.get(key)
+        if value:
+            return str(value)
+    if rel_endpoint_fallback:
+        value = rel_props.get(rel_key)
         if value:
             return str(value)
     return _sha_id("neo4j-node", props)
@@ -76,18 +126,40 @@ def _edge_query(limit: int) -> str:
     """
 
 
-def _normalise_node(row: dict[str, Any]) -> dict[str, Any]:
-    props = _clean_props(row.get("props"))
-    labels = row.get("labels") or []
-    labels = labels if isinstance(labels, list) else list(labels)
+def _normalise_node(
+    row: dict[str, Any],
+    *,
+    label_to_space: dict[str, str] | None = None,
+    label_priority: list[str] | None = None,
+    strict: bool = False,
+    copy: bool = False,
+) -> dict[str, Any]:
+    """Normalise a Neo4j node row into OpenCrab Pack v1 shape.
+
+    Defaults reproduce opencrab's historical behaviour (graceful ``.get`` access,
+    no label-based space inference, ``node_type=labels[0]``). The export script
+    opts into its domain rules via params:
+
+    * ``label_to_space``  — infer ``space`` from a label when props lack one.
+    * ``label_priority``  — pick ``node_type`` by label priority over ``labels[0]``.
+    * ``strict``          — require ``props``/``labels`` keys (KeyError if absent).
+    * ``copy``            — shallow-copy props instead of sharing the source dict.
+
+    The ``ontology_space`` / ``props["type"]`` / ``evidence_ids`` fallbacks are
+    always applied (the script previously lacked them — this is a widening, not a
+    weakening: it only adds fallbacks, never drops a constraint).
+    """
+    props = _clean_props(row["props"] if strict else row.get("props"), copy=copy)
+    labels = list((row["labels"] if strict else row.get("labels")) or [])
+    node_type = _resolve_node_type(props, labels, label_priority=label_priority)
     node_id = _node_id(props)
     return {
         "kind": "node",
         "payload": {
             "id": node_id,
             "label": props.get("label") or props.get("name") or props.get("title") or node_id,
-            "space": props.get("space") or props.get("ontology_space") or "",
-            "node_type": props.get("node_type") or props.get("type") or (labels[0] if labels else ""),
+            "space": _resolve_space(props, node_type, label_to_space=label_to_space),
+            "node_type": node_type,
             "labels": labels,
             "properties": props,
             "evidence_refs": props.get("evidence_refs") or props.get("evidence_ids") or [],
@@ -95,23 +167,35 @@ def _normalise_node(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalise_edge(row: dict[str, Any]) -> dict[str, Any]:
-    source_props = _clean_props(row.get("source_props"))
-    target_props = _clean_props(row.get("target_props"))
-    rel_props = _clean_props(row.get("rel_props"))
-    source_id = _node_id(source_props)
-    target_id = _node_id(target_props)
+def _normalise_edge(
+    row: dict[str, Any],
+    *,
+    label_to_space: dict[str, str] | None = None,
+    strict: bool = False,
+    copy: bool = False,
+    rel_endpoint_fallback: bool = False,
+) -> dict[str, Any]:
+    """Normalise a Neo4j edge row. See :func:`_normalise_node` for the param
+    semantics; ``rel_endpoint_fallback`` additionally lets ``from_id``/``to_id``
+    fall back to ``rel_props['from_id'/'to_id']`` (the script's behaviour) before
+    hashing."""
+    source_props = _clean_props(row["source_props"] if strict else row.get("source_props"), copy=copy)
+    target_props = _clean_props(row["target_props"] if strict else row.get("target_props"), copy=copy)
+    rel_props = _clean_props(row["rel_props"] if strict else row.get("rel_props"), copy=copy)
+    source_labels = row.get("source_labels") or []
+    target_labels = row.get("target_labels") or []
+    relation_raw = row["relation"] if strict else row.get("relation")
     payload = {
-        "from_id": source_id,
-        "to_id": target_id,
-        "from_space": source_props.get("space") or source_props.get("ontology_space") or "",
-        "to_space": target_props.get("space") or target_props.get("ontology_space") or "",
-        "relation": str(row.get("relation") or rel_props.get("relation") or "").lower(),
+        "from_id": _endpoint_id(source_props, rel_props, "from_id", rel_endpoint_fallback=rel_endpoint_fallback),
+        "to_id": _endpoint_id(target_props, rel_props, "to_id", rel_endpoint_fallback=rel_endpoint_fallback),
+        "from_space": _resolve_space(source_props, source_labels[0] if source_labels else "", label_to_space=label_to_space),
+        "to_space": _resolve_space(target_props, target_labels[0] if target_labels else "", label_to_space=label_to_space),
+        "relation": str(relation_raw or rel_props.get("relation") or "").lower(),
         "properties": rel_props,
         "confidence": rel_props.get("confidence"),
         "evidence_refs": rel_props.get("evidence_refs") or rel_props.get("evidence_ids") or [],
-        "source_labels": row.get("source_labels") or [],
-        "target_labels": row.get("target_labels") or [],
+        "source_labels": source_labels,
+        "target_labels": target_labels,
     }
     payload["id"] = _edge_id(payload)
     return {"kind": "edge", "payload": payload}
