@@ -9,10 +9,12 @@ refactor consolidates these into shared helpers, these tests must keep passing
 unchanged — that is the regression safety net.
 
 Notable cross-implementation differences deliberately recorded below:
-  * stable-id helpers diverge: neo4j_export / export script use SHA256[:16] with
-    a ``prefix:digest`` shape and hash a sorted-JSON encoding, while the
-    obsidian importer uses SHA1[:16] with a ``prefix-digest`` shape and hashes
-    the raw string. dedupe._compute_id uses SHA256[:16] with NO prefix.
+  * stable-id helpers converged on opencrab.common.ids.stable_id (SHA256[:16]
+    over a sorted-JSON encoding, ``prefix:digest``): neo4j_export / export
+    script / obsidian importer all delegate to it. dedupe._compute_id is the
+    one deliberate carve-out (SHA256[:16] of ``source|key``, NO prefix) — a
+    local .seen.json key namespace kept separate (and crabharness stays
+    importable without opencrab).
   * slugify helpers now converge on keeping Korean ([a-z0-9가-힣]): mcp.tools.
     _slugify, landscape.adapter._slug and the obsidian importer all preserve
     Hangul; they differ only in the empty-input fallback ("pack"/"item"/"node").
@@ -343,6 +345,19 @@ def _load_landscape_adapter():
                 sys.modules[k] = v
 
 
+def test_stable_id_canonical_source_golden():
+    """opencrab.common.ids.stable_id — the canonical source the others delegate to."""
+    from opencrab.common.ids import canonical_json, stable_id
+
+    assert stable_id("p", "hello") == "p:5aa762ae383fbb72"
+    assert stable_id("p", "") == "p:12ae32cb1ec02d01"
+    assert stable_id("neo4j-node", {"id": "x", "name": "한글"}) == "neo4j-node:2fed141e36c8429b"
+    # canonical_json: sorted keys, unicode kept.
+    assert canonical_json({"b": 1, "a": "한"}) == '{"a": "한", "b": 1}'
+    prefix, sep, hexpart = stable_id("x", {"a": 1}).partition(":")
+    assert prefix == "x" and sep == ":" and re.fullmatch(r"[0-9a-f]{16}", hexpart)
+
+
 def test_neo4j_export_sha_id_golden():
     """opencrab.pack.neo4j_export._sha_id — SHA256[:16] over sorted-JSON,
     "prefix:digest" shape."""
@@ -379,21 +394,20 @@ def test_export_script_sha_id_matches_neo4j_export():
     assert export_mod.sha_id("neo4j-node", {"id": "x", "name": "한글"}) == "neo4j-node:2fed141e36c8429b"
 
 
-def test_obsidian_sha_id_golden_sha1_dash_shape():
-    """scripts/import_obsidian_vault.sha_id DIVERGES: SHA1[:16] over the RAW
-    string (no JSON), "prefix-digest" shape (dash, not colon)."""
+def test_obsidian_sha_id_now_canonical_form():
+    """§2 수렴: obsidian sha_id 도 정규형(SHA256[:16] over sorted-JSON,
+    "prefix:digest")으로 통일되었다. 이전엔 SHA1 + dash + raw-string 이었다."""
     obs = _load_obsidian_module()
-    assert obs.sha_id("obsidian", "hello") == "obsidian-aaf4c61ddcc5e8a2"
-    assert obs.sha_id("p", "") == "p-da39a3ee5e6b4b0d"
-    assert obs.sha_id("p", "한글나무") == "p-2edff1eac8bc6a8e"
+    assert obs.sha_id("obsidian", "hello") == "obsidian:5aa762ae383fbb72"
+    assert obs.sha_id("p", "") == "p:12ae32cb1ec02d01"
+    assert obs.sha_id("p", "한글나무") == "p:dcb6c695fabdc835"
     digest = obs.sha_id("x", "anything")
-    prefix, _, hexpart = digest.partition("-")
-    assert prefix == "x"
+    prefix, sep, hexpart = digest.partition(":")
+    assert prefix == "x" and sep == ":"
     assert len(hexpart) == 16
-    # Confirm it is SHA1, not SHA256, of the raw bytes.
-    assert hexpart == hashlib.sha1(b"anything").hexdigest()[:16]
-    # And confirm it is NOT the SHA256-of-JSON form used by neo4j_export.
-    assert hexpart != hashlib.sha256(b'"anything"').hexdigest()[:16]
+    # 정규형: SHA256-of-JSON('"anything"'), NOT the old SHA1-of-raw form.
+    assert hexpart == hashlib.sha256(b'"anything"').hexdigest()[:16]
+    assert hexpart != hashlib.sha1(b"anything").hexdigest()[:16]
 
 
 def test_dedupe_compute_id_golden_no_prefix():
@@ -412,24 +426,28 @@ def test_dedupe_compute_id_golden_no_prefix():
     assert _compute_id("a", "b") == hashlib.sha256(b"a|b").hexdigest()[:16]
 
 
-def test_stable_id_family_divergence_summary():
-    """Single test that contrasts all three id shapes side by side, so the
-    refactor can see exactly what must be preserved or unified."""
+def test_stable_id_family_convergence_summary():
+    """§2 수렴: neo4j_export 와 obsidian 은 이제 동일한 정규 stable_id 를 낸다.
+    dedupe._compute_id 만 의도적으로 분리 유지된다(로컬 .seen.json 키, 그래프
+    id 와 교차참조 없음 + crabharness 독립성)."""
     from crabharness.dedupe import _compute_id
 
+    from opencrab.common.ids import stable_id
     from opencrab.pack.neo4j_export import _sha_id
 
     obs = _load_obsidian_module()
 
-    neo = _sha_id("p", "hello")        # SHA256[:16] of '"hello"', colon
-    obsidian = obs.sha_id("p", "hello")  # SHA1[:16] of 'hello', dash
-    dedupe = _compute_id("p", "hello")   # SHA256[:16] of 'p|hello', no prefix
+    neo = _sha_id("p", "hello")          # SHA256[:16] of '"hello"', colon
+    obsidian = obs.sha_id("p", "hello")  # now the same canonical form
+    dedupe = _compute_id("p", "hello")   # SHA256[:16] of 'p|hello', no prefix (carve-out)
 
     assert neo == "p:5aa762ae383fbb72"
-    assert obsidian == "p-aaf4c61ddcc5e8a2"
+    # neo4j_export 와 obsidian 이 정규형으로 수렴 (둘 다 stable_id 와 동일).
+    assert obsidian == neo == stable_id("p", "hello")
+    # dedupe 만 별도 namespace 로 분리 유지.
     assert dedupe == hashlib.sha256(b"p|hello").hexdigest()[:16]
-    # All three differ from each other.
-    assert len({neo, obsidian, dedupe}) == 3
+    assert len({neo, obsidian}) == 1
+    assert dedupe not in {neo, obsidian}
 
 
 # ===========================================================================
