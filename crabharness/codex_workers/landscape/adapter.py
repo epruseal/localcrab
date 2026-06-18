@@ -136,7 +136,10 @@ def validate_bundle(bundle: ArtifactBundle, mission: MissionSpec) -> ValidationR
 
 
 def _slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "item"
+    # Keep Hangul (matches the shared opencrab.common.text.slugify with
+    # allow_hangul=True). Inlined rather than imported because codex_workers is
+    # an independent package that must load without opencrab installed.
+    return re.sub(r"[^a-z0-9가-힣]+", "-", value.lower()).strip("-") or "item"
 
 
 def _domain_semantic_score(bundle: ArtifactBundle) -> float:
