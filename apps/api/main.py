@@ -900,81 +900,15 @@ def list_edges(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-## ─── Remote MCP Server (Streamable HTTP, 2025-03-26) ────────────────────────
+## ─── Remote MCP Server (Streamable HTTP) ────────────────────────────────────
+# The /mcp routes are provided by the shared opencrab.mcp.http_app.mcp_router,
+# which delegates to MCPServer.handle_request — the same dispatch used by the
+# stdio server and `opencrab serve --transport http`. auth_token=None keeps this
+# endpoint open (as before); the standalone serve command can require a token.
 
-from opencrab.mcp.tools import TOOLS as MCP_TOOLS, dispatch_tool as _mcp_tools_dispatch  # noqa: E402
+from opencrab.mcp.http_app import mcp_router  # noqa: E402
 
-
-def _mcp_text(data: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, default=str)}]}
-
-
-async def _mcp_dispatch(tool_name: str, args: dict[str, Any], auth: AuthContext, ctx: ApiContext) -> Any:
-    return _mcp_tools_dispatch(tool_name, args)
-
-
-@app.get("/mcp")
-async def mcp_info() -> dict[str, Any]:
-    return {
-        "name": "opencrab",
-        "version": "0.1.0",
-        "protocol": "2025-03-26",
-        "endpoint": "/mcp",
-        "tools": len(MCP_TOOLS),
-    }
-
-
-@app.delete("/mcp")
-async def mcp_session_delete() -> JSONResponse:
-    # Stateless server — acknowledge session termination silently
-    return JSONResponse({}, status_code=200)
-
-
-@app.post("/mcp")
-async def mcp_endpoint(
-    request: Request,
-    ctx: ApiContext = Depends(get_context),
-) -> Any:
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
-
-    rpc_id = body.get("id")
-    method = body.get("method", "")
-    params = body.get("params") or {}
-    auth = AuthContext(user_id="tunnel", tier=_tier())
-
-    def ok(result: Any) -> JSONResponse:
-        return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "result": result})
-
-    def err(code: int, message: str) -> JSONResponse:
-        return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}})
-
-    if method == "initialize":
-        return ok({
-            "protocolVersion": "2025-03-26",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "opencrab", "version": "0.1.0"},
-        })
-
-    if method in ("notifications/initialized", "ping"):
-        return ok({})
-
-    if method == "tools/list":
-        return ok({"tools": MCP_TOOLS})
-
-    if method == "tools/call":
-        tool_name = params.get("name", "")
-        args = params.get("arguments") or {}
-        try:
-            result = await _mcp_dispatch(tool_name, args, auth, ctx)
-            return ok(_mcp_text(result))
-        except Exception as exc:
-            logger.exception("MCP tools/call failed: %s", tool_name)
-            return err(-32603, str(exc))
-
-    return err(-32601, f"Method not found: {method}")
+app.include_router(mcp_router(auth_token=None))
 
 
 if __name__ == "__main__":
