@@ -17,8 +17,10 @@ Notable cross-implementation differences deliberately recorded below:
     strip non-[a-z0-9] (Korean characters are dropped), with different empty
     fallbacks ("pack" vs "item"); the obsidian importer's slugify keeps Korean
     ([a-z0-9가-힣]) and falls back to "node".
-  * _now_iso (5 definitions) produces an aware ISO string ending "+00:00";
-    dedupe's inline timestamp is naive + literal "Z".
+  * _now_iso (5 definitions) produces an aware ISO string ending "+00:00".
+    dedupe now matches this via a local ``_now_iso`` helper (inlined, since
+    crabharness must stay importable without opencrab) — previously it used a
+    naive + literal "Z" timestamp.
 """
 
 from __future__ import annotations
@@ -126,20 +128,50 @@ def test_now_iso_all_five_share_one_format():
         assert parsed.utcoffset() == timezone.utc.utcoffset(None), label
 
 
-def test_dedupe_inline_timestamp_uses_naive_Z_format():
-    """dedupe.py inline timestamps differ: naive + literal "Z" (no offset).
+def test_dedupe_timestamp_is_aware_offset_format():
+    """dedupe.py now emits the SAME aware "+00:00" form as the _now_iso helpers.
 
-    This is the divergence the refactor will have to reconcile. We pin the
-    current shape by reproducing the exact expression used inline at
-    crabharness/crabharness/dedupe.py:53,93.
+    Previously dedupe used a naive + literal "Z" timestamp; §4 of the dedupe
+    consolidation replaced both inline call sites (dedupe.py:53,93) with a local
+    ``_now_iso()`` helper. crabharness is an independent package, so it inlines
+    the one-liner instead of importing ``opencrab.common.timefmt`` — but the
+    output must be byte-format-identical to it. This test is the drift guard.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    value = datetime.utcnow().isoformat() + "Z"
-    assert _NAIVE_Z_ISO_RE.match(value), value
-    assert value.endswith("Z")
-    # And it is NOT the aware offset form the _now_iso helpers produce.
-    assert not _AWARE_ISO_RE.match(value)
+    from crabharness.dedupe import _now_iso
+
+    value = _now_iso()
+    assert _AWARE_ISO_RE.match(value), value
+    assert not value.endswith("Z")
+    # It is NOT the old naive trailing-Z form anymore.
+    assert not _NAIVE_Z_ISO_RE.match(value)
+    parsed = datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timezone.utc.utcoffset(None)
+
+
+def test_dedupe_mark_seen_writes_aware_timestamps(tmp_path):
+    """End-to-end: the timestamps dedupe persists into .seen.json are aware.
+
+    Edge cases pinned: a fresh entry stamps both first_seen and last_seen; a
+    second mark_seen updates last_seen; mark_applied stamps applied_at. All
+    three must be the aware "+00:00" form (no trailing "Z").
+    """
+    import json as _json
+
+    from crabharness import dedupe
+
+    dedupe.mark_seen(tmp_path, "src", "key", title="t", url="u")
+    dedupe.mark_seen(tmp_path, "src", "key")
+    dedupe.mark_applied(tmp_path, "src", "key", score=1.0)
+
+    index = _json.loads((tmp_path / ".seen.json").read_text(encoding="utf-8"))
+    (entry,) = index.values()
+    for field in ("first_seen", "last_seen", "applied_at"):
+        ts = entry[field]
+        assert _AWARE_ISO_RE.match(ts), f"{field}={ts!r}"
+        assert not ts.endswith("Z"), field
 
 
 # ===========================================================================

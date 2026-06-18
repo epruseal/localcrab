@@ -1,0 +1,128 @@
+{
+  "scales": {
+    "1000": {
+      "node_count": 1000,
+      "edge_count": 852,
+      "neo4j_ingest_per_op": {
+        "node_elapsed_s": 9.535,
+        "edge_elapsed_s": 8.106,
+        "ok_nodes": 1000,
+        "ok_edges": 852,
+        "nodes_per_sec": 104.9,
+        "edges_per_sec": 105.1
+      },
+      "consistency": {
+        "neighbor_compare": {
+          "depth_1": {
+            "jaccard_mean": 1.0,
+            "only_in_sqlite_mean": 0,
+            "only_in_neo4j_mean": 0,
+            "sqlite_count_mean": 1,
+            "neo4j_count_mean": 1,
+            "perfect_match_rate": 1.0
+          },
+          "depth_2": {
+            "jaccard_mean": 1.0,
+            "only_in_sqlite_mean": 0,
+            "only_in_neo4j_mean": 0,
+            "sqlite_count_mean": 1,
+            "neo4j_count_mean": 1,
+            "perfect_match_rate": 1.0
+          },
+          "depth_3": {
+            "jaccard_mean": 1.0,
+            "only_in_sqlite_mean": 0,
+            "only_in_neo4j_mean": 0,
+            "sqlite_count_mean": 1,
+            "neo4j_count_mean": 1,
+            "perfect_match_rate": 1.0
+          }
+        },
+        "cypher": {
+          "sqlite_cypher_works": false,
+          "neo4j_cypher_works": true,
+          "neo4j_cypher_result_count": 1,
+          "sqlite_keyword_search_results": 0,
+          "neo4j_keyword_search_results": 0,
+          "impact": "SQLite 모드에서 run_cypher는 no-op → keyword_search/임의 Cypher가 항상 [] 반환. Neo4j 모드에서는 정상 동작."
+        },
+        "edge_type": {
+          "checked": 200,
+          "type_mismatches": 0,
+          "mismatch_rate": 0.0,
+          "note": "SQLite 엣지 from_type/to_type vs nodes.jsonl 기준 타입 비교"
+        }
+      },
+      "neo4j_query": {
+        "neighbors_d1": {
+          "mean_ms": 9.236,
+          "p50_ms": 8.573,
+          "p95_ms": 16.119,
+          "count_mean": 12
+        },
+        "neighbors_d2": {
+          "mean_ms": 6.924,
+          "p50_ms": 6.763,
+          "p95_ms": 9.296,
+          "count_mean": 12
+        },
+        "neighbors_d3": {
+          "mean_ms": 6.221,
+          "p50_ms": 5.985,
+          "p95_ms": 8.782,
+          "count_mean": 12
+        },
+        "get_node": {
+          "mean_ms": 3.422,
+          "p50_ms": 2.279,
+          "p95_ms": 4.947,
+          "count_mean": null
+        }
+      },
+      "sqlite": {
+        "ingest_per_op": {
+          "node_elapsed_s": 0.073,
+          "edge_elapsed_s": 0.072,
+          "ok_nodes": 1000,
+          "ok_edges": 852,
+          "nodes_per_sec": 13779.0,
+          "edges_per_sec": 11776.8
+        },
+        "ingest_batched": {
+          "node_elapsed_s": 0.023,
+          "edge_elapsed_s": 0.016,
+          "ok_nodes": 1000,
+          "ok_edges": 852,
+          "nodes_per_sec": 42715.6,
+          "edges_per_sec": 54030.9
+        },
+        "query": {
+          "neighbors_d1": {
+            "mean_ms": 0.313,
+            "p50_ms": 0.294,
+            "p95_ms": 0.362,
+            "count_mean": 12
+          },
+          "neighbors_d2": {
+            "mean_ms": 0.559,
+            "p50_ms": 0.547,
+            "p95_ms": 0.626,
+            "count_mean": 12
+          },
+          "neighbors_d3": {
+            "mean_ms": 0.562,
+            "p50_ms": 0.545,
+            "p95_ms": 0.771,
+            "count_mean": 12
+          },
+          "get_node": {
+            "mean_ms": 0.019,
+            "p50_ms": 0.019,
+            "p95_ms": 0.021,
+            "count_mean": null
+          }
+        }
+      }
+    }
+  }
+}
