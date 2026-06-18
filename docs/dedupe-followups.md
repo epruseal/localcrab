@@ -47,6 +47,16 @@
 
 ---
 
+### 1.8 pack 선택 로직 (MCP `ontology_query` ↔ CLI `query`) — 통합 보류(결정)
+
+> **결정(Phase 4)**: MCP와 CLI의 auto_pack 선택은 **결정 로직(`choose_packs` + 후보 언팩 + `selected_packs` 구성)은 동일하나 표면이 본질적으로 다르다**: (a) 충돌 경고 문구가 다름(MCP `"pack_ids provided; ignoring auto_pack"` vs CLI `"--pack-id provided; ignoring --auto-pack."`), (b) 경고 전달 채널이 다름(MCP는 `pack_filter.warnings` 리스트 vs CLI는 `click.echo(..., err=True)` stderr 즉시 출력 + 성공 시 `"auto-pack selected ..."` info), (c) 예외 처리가 다름(MCP는 try/except graceful fallback vs CLI는 예외 전파). 실제 공통 로직은 `choose_packs`(이미 공통) 위 ~5줄뿐.
+>
+> 특성화 테스트가 양쪽 동작을 정밀 박제(MCP 7케이스·CLI 4케이스)했고, 억지 통합은 이 동작을 깨거나 복잡한 파라미터화(`on_warning` 콜백, 문구 분기, 예외 정책 플래그)를 요구해 ROI 대비 회귀 위험이 크다. **§1의 MCP/HTTP 응답 통일 보류와 동일한 맥락**이라 함께 보류.
+>
+> **통합 시 설계안(향후)**: `opencrab/services/pack_selection.py`에 `resolve_packs(question, pack_ids, auto_pack, include_unpackaged, local_data_dir, *, raise_on_error) -> PackSelection(effective_pack_ids, selected_packs, warnings, auto_pack_used)`. 표준 warnings 키를 정의하고 인터페이스별 문구/채널 매핑을 어댑터가 담당. 단 이는 응답/문구 통일 결정과 묶어서 진행해야 함.
+
+---
+
 ## 2. stable_id 생성 불일치 (데이터 호환 위험)
 
 - **현재 차이**:
