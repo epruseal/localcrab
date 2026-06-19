@@ -131,6 +131,7 @@ CREATE INDEX ON opencrab_vectors_kure USING gin (metadata);
 ### 4.2 doc / sql 테이블 매핑
 
 - **sql**: `SQLStore._TABLES_SQL`(Postgres DDL)이 이미 존재 — `ontology_nodes`, `ontology_edges`, `impact_records`, `lever_simulations`, `rebac_policies`. 추가 작업 없이 URL만 Postgres로.
+  - ⚠️ **`ontology_nodes` 는 노드 본문이 아니라 얇은 레지스트리다.** `register_node(space, node_type, node_id)`(`builder.py:139`)로 **키 3개만** 저장하며 properties 컬럼이 없다. 노드 본문(properties JSON)은 `graph_nodes`(graph)·`doc_nodes`(doc)에 **중복 저장**된다. 따라서 단일-DB 이전은 이 3중 구조를 **각각 1:1 이전(parity-safe, §8.0)** 하고, 단일 canonical 노드 테이블로의 dedup 은 후속(§13)으로 둔다.
 - **doc**: `LocalSQLDocStore` 의 3테이블(`doc_nodes`(PK `space,node_id`), `doc_sources`, `audit_log`)을 Postgres 동등 테이블로 옮긴다. `properties`/`metadata`/`details` 는 SQLite에서 JSON TEXT였으나 Postgres에서는 **JSONB**로 승격 권장(검색·필터·FTS 용이).
 
 ### 4.3 차원(N) 관리 — KURE 1024 고정
@@ -187,6 +188,42 @@ CREATE INDEX ON opencrab_vectors_kure USING gin (metadata);
 
 **권장:** **(C)로 vectors/doc/sql 를 먼저 PG 통합** → graph 는 **AGE PoC 게이트**(aarch64 소스 빌드 성공 + Cypher 동등성 골든 테스트 통과, §11)를 넘으면 (A) 채택, 실패 시 (B) 재귀 CTE 폴백. PG19 GA 후 SQL/PGQ 재평가. 종착지는 graph 를 포함한 **완전 단일-DB**.
 
+### 6.4 Canonical store + AGE projection 원칙 (외부 검토 반영)
+
+외부 검토(Codex)가 제기한 안전 원칙을 채택한다: **graph 의 source of truth 는 항상 plain PG 테이블**(`graph_nodes`/`ontology_*` + §6.1 의 노드/엣지)이고, **AGE 는 그 위에 sync 하는 optional projection layer** 로 둔다. 이렇게 하면 AGE 장애·버전 문제가 나도 core 데이터·기능(재귀 CTE 경로)은 살아 있다.
+
+- **canonical(항상 존재):** plain PG 노드/엣지 테이블 + **재귀 CTE**(B)로 1-hop/N-hop/reverse·pack isolation·delete cascade 동작. 디버깅·migration·백업 검증이 SQL 로 투명.
+- **projection(선택, AGE 우선 후보):** canonical → AGE 그래프로 1방향 sync. Cypher 표현력/성능이 CTE 대비 명확히 이득일 때 채택.
+  - 사용자 지침에 따라 **AGE 를 우선 후보**로 평가하되(§6.3 PoC 게이트), canonical-CTE 가 항상 1차 안정 경로임을 병기. 둘 다 문서화하고 **Phase 4 벤치마크(§11)** 결과로 최종 선택(§8).
+
+```sql
+-- canonical 재귀 CTE traversal (확장 0, 결정론적)
+WITH RECURSIVE walk AS (
+  SELECT e.pack_id, e.from_space, e.from_id, e.relation, e.to_space, e.to_id,
+         1 AS depth, ARRAY[e.from_space||':'||e.from_id] AS path
+  FROM ontology_edges e
+  WHERE e.pack_id = :pack AND e.from_space = :sp AND e.from_id = :id
+  UNION ALL
+  SELECT e.pack_id, e.from_space, e.from_id, e.relation, e.to_space, e.to_id,
+         w.depth+1, w.path || (e.from_space||':'||e.from_id)
+  FROM ontology_edges e
+  JOIN walk w ON e.pack_id=w.pack_id AND e.from_space=w.to_space AND e.from_id=w.to_id
+  WHERE w.depth < 4 AND NOT (e.from_space||':'||e.from_id = ANY(w.path))  -- 사이클 가드
+)
+SELECT * FROM walk;
+```
+
+```sql
+-- AGE projection (옵션): canonical 에서 sync. source of truth 아님.
+CREATE EXTENSION IF NOT EXISTS age;  LOAD 'age';
+SET search_path = ag_catalog, "$user", public;
+SELECT create_graph('localcrab');
+SELECT * FROM cypher('localcrab', $$
+  MATCH (a {node_id:'concept:rag'}), (b {node_id:'concept:pgvector'})
+  CREATE (a)-[:DEPENDS_ON {pack_id:'demo'}]->(b)
+$$) AS (e agtype);
+```
+
 ---
 
 ## 7. BM25 vs Postgres FTS (선택)
@@ -200,7 +237,25 @@ CREATE INDEX ON opencrab_vectors_kure USING gin (metadata);
 
 ## 8. 마이그레이션 절차
 
-1. **PostgreSQL + pgvector 설치 (aarch64/RPi5).**
+### 8.0 단계적 경로 (외부 검토 반영 — 위험 최소화)
+
+각 단계는 **직전 단계 green 유지**를 전제로 진행한다(§11). 한 번에 모두 바꾸지 않는다.
+
+| Phase | 상태 | 내용 |
+|-------|------|------|
+| 0 | 현행 동결·측정 | SQLite 스키마/Chroma 컬렉션·차원·pack별 node/edge/vector count·대표 질의 20개·삭제 시나리오 측정(벤치 기준선) |
+| 1 | **PG + Chroma** | sql/doc 메타데이터를 PG 로 먼저 이전, **벡터는 Chroma 유지**. 앱 core 를 PG 기준으로 전환 |
+| 2 | **PG + pgvector** | Chroma → `opencrab_vectors_kure`(KURE 재임베딩). 동일 질의 Chroma vs pgvector top-k(recall@10·latency·pack 필터) 비교 |
+| 3 | **PG canonical graph(CTE)** | graph 를 plain PG 테이블 + 재귀 CTE 로 안정화(1-hop/N-hop/reverse·pack isolation·delete cascade) |
+| 4 | **AGE projection PoC** | canonical → AGE sync(§6.4). Cypher 표현력/성능/ sync 비용/장애 격리 검증 |
+| 5 | **최종 선택** | 벤치 결과로 AGE 채택 vs CTE 만 유지 결정 |
+
+> **노드 중복은 dedup 하지 않는다(parity-safe).** 현행 `graph_nodes`/`doc_nodes`/`ontology_nodes`(레지스트리) 3중 구조를 **각각 PG 테이블로 1:1 이전**해 스토어 계약·green→green parity 를 보존한다. 단일 canonical 노드 테이블로의 dedup 은 별도 후속 최적화(§13).
+> **설치는 RPi5 aarch64 네이티브 소스 빌드**(pgvector·AGE). Docker 이미지/Compose 는 docker 모드 한정이며 로컬 모드와 무관.
+
+### 8.1 상세 절차
+
+1. **PostgreSQL + pgvector 설치 (aarch64/RPi5, 네이티브).**
    - `apt install postgresql`, 그리고 pgvector: 배포판 패키지(`postgresql-16-pgvector` 등)가 있으면 apt, 없으면 소스 빌드(`make && make install`, `PG_CONFIG` 지정). aarch64 빌드 가능.
    - `CREATE EXTENSION vector;`
 2. **DB/롤 생성.** `postgres_url` 기본값과 일치하는 롤/DB(`opencrab`/`opencrab`) 또는 `.env` 의 `POSTGRES_URL` 로 설정.
@@ -248,7 +303,23 @@ PostgreSQL MVCC로 **MCP 서버 + 백그라운드 로더(또는 다중 클라이
 - **회귀 기준선(green 유지 대상):** KURE 한국어 top-k **MRR(현행 1.000)**, Chroma↔pgvector `count()`·`table_counts()` parity, BM25 결과 동등성, graph parity(LocalGraphStore 골든 vs AGE/CTE — `find_neighbors`/`find_path`/`list_packs`, Jaccard 임계).
 - **픽스처:** `tests/` 의 `local_stores` 패턴(monkeypatch `LOCAL_DATA_DIR`)을 **백엔드 파라미터라이즈** `stores(backend)`(`local` 임시 dir / `pg` 임시 스키마)로 확장. 임베딩은 **결정적 mock EF**(`__call__` 고정 벡터)로 외부 LM Studio/GGUF 의존 제거(두 백엔드 동일 벡터 → 결과 동치 비교). PG 테스트는 `@pytest.mark.skipif(no PG)`.
 - **동시성 스모크:** MCP 서버 + 백그라운드 로더 동시 적재(MVCC 락 무경합) — 현행 `test_store_concurrency.py` 패턴 PG 버전.
+- **pack-delete cascade 일관성(외부 검토 반영):** pack 삭제 시 해당 pack 의 node/edge/vector 가 4개 스토어(또는 PG 테이블) 전부에서 사라지고 **orphan row=0**. 현행 4중 fan-out 에서 삭제 정합은 실질 리스크이므로 회귀 차원으로 고정.
 - 실행: `pytest`(`pyproject.toml:92` testpaths=tests, asyncio auto). 회귀 게이트 = **전체 스위트가 두 백엔드 모두 green**.
+
+### 11.1 벤치마크 성공 기준 (Phase 2·4 의사결정 게이트)
+
+AGE 채택 여부·pgvector 전환 승인은 측정으로 결정한다(추측 금지). 목표 임계치:
+
+| 지표 | 목표 |
+|------|------|
+| single-pack vector top-k p95 | ≤ 100ms |
+| metadata-filtered top-k p95 | ≤ 200ms |
+| 3-hop graph traversal p95 | ≤ 100ms |
+| Chroma 대비 recall@10 | ≥ 0.95 |
+| pack isolation leakage | 0 (pack 간 누출 없음) |
+| pack delete consistency | orphan row 0 |
+| backup/restore | 1 command(또는 1 workflow)로 완전 복구 |
+| cold start / disk usage | SQLite+Chroma 대비 측정·기록(악화 시 명시) |
 
 ---
 
@@ -264,3 +335,22 @@ PostgreSQL MVCC로 **MCP 서버 + 백그라운드 로더(또는 다중 클라이
 - **각 워크스트림 내부도 green→green 파이프라인**(현행 특성화 테스트 통과 → PG 구현 → 동일 테스트 parity 통과)으로 단계화. 스트림 간 의존 없는 stage 는 pipeline 으로 무배리어 진행.
 - **합류 지점:** 공유 SQLAlchemy 엔진 시그니처와 `Settings` 신규 플래그(`STORE_BACKEND`)를 **먼저 합의(인터페이스 동결)** 후 분기. 최종 회귀(§11 전체 스위트)는 합류 후 일괄 게이트.
 - **착수 전 세션 컴팩트** 권장(탐색·조사로 컨텍스트 누적).
+
+---
+
+## 13. 외부 검토(Codex) 반영 요약
+
+동일 주제의 외부 검토(Codex)를 localcrab 실제 코드와 대조해 **채택/정정**을 정리한다. 방향(PG 단일화 + pgvector)은 일치.
+
+| 항목 | Codex 제안 | 본 문서 결정 | 근거 |
+|------|-----------|--------------|------|
+| AGE 위치 | optional projection, canonical=plain PG+CTE | **AGE 우선 후보로 평가하되 canonical-CTE 를 1차 안정 경로로 병기**(§6.4) | 사용자 지침(AGE 우선) + 안전성(장애 격리) 절충 |
+| graph traversal | 재귀 CTE | **CTE 를 canonical 경로로 채택**(§6.4 예시) | 확장 0·결정론·디버깅 용이 |
+| phasing | 5단계(PG+Chroma 중간) | **채택**(§8.0) | 단계별 green 유지로 위험 최소화 |
+| 벤치마크 임계치 | p95·recall·orphan=0 등 | **채택**(§11.1) | 측정 기반 의사결정 게이트 |
+| 노드 모델 | 단일 canonical `ontology_nodes`(properties 보유) | **반려 — parity-safe 다중 테이블 1:1 이전**(§8.0) | **`ontology_nodes` 는 실제로 키만 가진 얇은 레지스트리**(`sql_store.py:22`, `builder.py:139` 3인자); props 는 `graph_nodes`/`doc_nodes` 에 중복 저장. dedup 은 스토어 계약 대규모 리팩터 → 후속 |
+| chunk 모델 | `documents`/`text_units`/`text_embeddings` 정규화 | **범위 외** | localcrab 은 node-centric, 청크 미구현(`TextUnit`=문서 단위 1노드, `tools.py:1332-1358`); `pack_ingest_chunks` 미구현(`[[ingestion-via-mcp-plan]]`). 벡터 ID 는 node_id 유지 |
+| 벡터 차원 | 예시 1536 | **KURE 1024 고정**(§4.3) | 본 스택 표준 |
+| Docker 이미지/Compose | pgvector+AGE 이미지 | **docker 모드 한정**, 로컬은 aarch64 네이티브 빌드(§8.0) | 로컬 모드는 Docker 미사용 |
+
+**후속 분리 과제(범위 외):** ① 노드 3중 중복 dedup(단일 canonical 노드 테이블), ② chunk-level 저장(`pack_ingest_chunks`) — "청크 누락/적재 누락 재점검" 과제와 묶임.
