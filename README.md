@@ -92,7 +92,7 @@ claude mcp add localcrab -- opencrab serve
 
 **원격 접근 (직접 Streamable HTTP, Tailscale·cloudflared 등):**
 
-`serve --transport http`가 `/mcp` 엔드포인트를 직접 노출한다(supergateway 불필요). 인증이 필요하면 `--auth-token-file`(또는 `LOCALCRAB_MCP_TOKEN`)로 Bearer 토큰을 지정한다.
+`serve --transport http`가 `/mcp` 엔드포인트를 직접 노출한다(supergateway 불필요). 인증이 필요하면 `--auth-token-file`(또는 `LOCALCRAB_MCP_TOKEN`)로 토큰을 지정한다. 클라이언트는 `Authorization: Bearer <token>` 헤더 **또는** `/mcp?token=<token>` 쿼리 param 중 하나로 인증할 수 있다(같은 토큰, 둘 중 하나만 일치하면 통과).
 
 ```bash
 # 신뢰망(예: Tailscale) 직결 — 무인증
@@ -114,7 +114,9 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 }
 ```
 
-> 단일 프로세스 chroma 제약상 **uvicorn 단일 워커**로 실행된다(serve가 강제). 무인증 인스턴스는 신뢰망에만 바인드할 것. 인증이 필요한 외부 경로는 토큰을 지정하고 클라이언트는 `Authorization: Bearer <token>` 헤더를 보낸다.
+> 헤더를 설정할 수 없는 클라이언트는 URL에 토큰을 실어 인증할 수 있다: `"url": "http://<host>:8765/mcp?token=<token>"`. 다만 쿼리 param 토큰은 액세스 로그·프록시·브라우저 히스토리에 평문 노출될 수 있으니 가능하면 헤더 방식을 우선한다.
+
+> 단일 프로세스 chroma 제약상 **uvicorn 단일 워커**로 실행된다(serve가 강제). 무인증 인스턴스는 신뢰망에만 바인드할 것. 인증이 필요한 외부 경로는 토큰을 지정하고 클라이언트는 `Authorization: Bearer <token>` 헤더 또는 `?token=<token>` 쿼리 param으로 인증한다. 토큰이 설정되면 `/mcp`의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz`는 예외).
 
 ---
 
