@@ -13,7 +13,10 @@ Two surfaces share ``mcp_router``:
   - ``apps/api`` includes the same router so there is one HTTP MCP implementation.
 
 Authentication is optional: when an ``auth_token`` is provided the ``/mcp``
-route requires a matching ``Authorization: Bearer`` header (HMAC compare).
+routes require a matching credential, accepted from either an
+``Authorization: Bearer`` header or a ``?token=`` query param (HMAC compare).
+The query-param form exists for clients that cannot set custom headers; it is
+less safe than the header (params leak into access logs / proxies / history).
 Run with a single uvicorn worker — the underlying chroma PersistentClient is
 single-process only.
 """
@@ -62,26 +65,32 @@ def mcp_router(auth_token: str | None = None) -> APIRouter:
     server = MCPServer()  # constructed once; tool stores lazy-init on first call
     bearer = HTTPBearer(auto_error=False)
 
-    def _check(creds: HTTPAuthorizationCredentials | None) -> None:
+    def _matches(candidate: str | None) -> bool:
+        return candidate is not None and hmac.compare_digest(candidate.strip(), auth_token)
+
+    def _check(request: Request, creds: HTTPAuthorizationCredentials | None) -> None:
+        # Accept the token from the Authorization: Bearer header OR a ``?token=``
+        # query param; either matching is sufficient. The query param is for
+        # clients that cannot set headers, but it leaks into access logs /
+        # proxies / browser history — prefer the header when possible.
         if not auth_token:
             return  # unauthenticated instance
-        if (
-            creds is None
-            or creds.scheme.lower() != "bearer"
-            or not hmac.compare_digest(creds.credentials.strip(), auth_token)
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        bearer_tok = creds.credentials if (creds and creds.scheme.lower() == "bearer") else None
+        param_tok = request.query_params.get("token")
+        if _matches(bearer_tok) or _matches(param_tok):
+            return
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     @router.post("/mcp")
     async def mcp_post(
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
-        _check(creds)
+        _check(request, creds)
         try:
             body = await request.json()
         except Exception:
@@ -98,12 +107,20 @@ def mcp_router(auth_token: str | None = None) -> APIRouter:
         return Response(status_code=202) if resp is None else JSONResponse(resp)
 
     @router.get("/mcp")
-    async def mcp_get():
+    async def mcp_get(
+        request: Request,
+        creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ):
+        _check(request, creds)
         # Stateless server offers no server→client SSE stream; per spec, 405.
         return Response(status_code=405, headers={"Allow": "POST, DELETE"})
 
     @router.delete("/mcp")
-    async def mcp_delete():
+    async def mcp_delete(
+        request: Request,
+        creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ):
+        _check(request, creds)
         # Stateless: no session to terminate. Acknowledge.
         return Response(status_code=200)
 
