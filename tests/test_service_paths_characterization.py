@@ -435,7 +435,7 @@ class TestQueryResponseMCP:
         assert resp["spaces_filter"] is None
         assert resp["subject_id"] is None
         assert resp["tenant_id"] == "default"
-        assert resp["pipeline"] == {"bm25": True, "rerank": True}
+        assert resp["pipeline"] == {"bm25": True, "rerank": True, "fts": True}
         assert resp["total"] == 1
         # 결과 항목은 QueryResult.to_dict() 형태.
         assert resp["results"][0]["node_id"] == "n1"

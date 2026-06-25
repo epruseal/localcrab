@@ -233,6 +233,13 @@ $$) AS (e agtype);
 - **주의:** Postgres 기본 FTS는 한국어 형태소 분석이 약하다(`pg_bigm`/`pgroonga` 같은 확장 필요, aarch64 빌드 부담). 현재 BM25의 Hangul n-gram·BM25 가중·pack/space 필터를 FTS로 1:1 재현하기 어렵다.
 - **권장:** 이번 마이그레이션 범위에서 **제외**(BM25 파이썬 로직 유지). FTS는 별도 후속 과제로 분리. 단, `list_nodes` 가 Postgres로 옮겨가도 인터페이스가 동일하므로 BM25는 무변경으로 계속 동작한다.
 
+### 7.1 키워드 FTS 레그 (구현됨, 2026-06) — `feat/hybrid-fts-keyword`
+- BM25(노드 필드 색인)는 **청크 본문(`doc_sources.text`)을 색인하지 않아** 본문 속 약어·표준번호(JASO M345, FB/FC)·영어 다중어 질의가 전역 검색에서 밀리는 문제가 있었다.
+- 해결: doc store에 **백엔드-중립 capability** 추가 — `supports_keyword: bool` + `keyword_search(query, pack_ids, include_unpackaged, limit)`. `HybridQuery._fts_search()`가 capability 보유 시에만 호출(미지원·예외 시 graceful 폴백)하고 기존 `Reranker.rerank()`(RRF)로 융합. reranker source 가중치 `keyword`(>bm25).
+- **LocalSQLDocStore**: SQLite **FTS5** 가상테이블 `doc_sources_fts`(`tokenize='unicode61'`, 한+영) — `_init_db`에서 생성 + idempotent 마이그레이션, `upsert_source`에서 동기화. 질의는 `\w+` 토큰을 따옴표 OR 결합(연산자 주입 방지).
+- **Postgres(pgvector) 이전 시**: `PgDocStore`가 동일 capability를 `tsvector`(또는 `pg_bigm`/`pgroonga`) + GIN으로 구현하면 `HybridQuery`는 무변경. 미구현이면 `supports_keyword=False`로 두어 자동 폴백.
+- **한계(알려짐):** RRF는 다중 리트리버 동시 등장 항목을 우대하므로, 키워드 단독 매칭은 의미충돌(예 "smoke" 색상 청크)이 vector+graph로 강하게 잡힐 때 top-3 밖으로 밀릴 수 있다. pack 스코프 질의에선 정확. 깊은 RRF 단독소스 보정은 후속 과제.
+
 ---
 
 ## 8. 마이그레이션 절차

@@ -70,6 +70,7 @@ _RELATION_CUES = (
     "연결",
 )
 _SOURCE_WEIGHTS = {
+    "keyword": 1.3,  # FTS5 본문 키워드(약어·표준번호·다중어 정확매칭) 강하게 우대
     "bm25": 1.08,
     "vector": 1.0,
     "graph": 0.96,

@@ -70,6 +70,14 @@ nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)  # 핫 패스
 self._bm25_cache = BM25Index.build(nodes)
 ```
 
+> **키워드 FTS 레그(2026-06):** BM25는 그래프 **노드 필드**를 색인하므로 청크 **본문**
+> 속 약어·표준번호(JASO M345, FB/FC)는 놓칠 수 있다. 이를 보완해 `HybridQuery`는
+> 벡터·BM25·그래프에 더해 **키워드 레그**(`_fts_search`)를 추가한다 — doc store가
+> `supports_keyword` capability를 노출할 때만 `keyword_search(...)`를 호출(미지원 시 폴백).
+> `LocalSQLDocStore`는 `doc_sources` 본문을 SQLite **FTS5**(`doc_sources_fts`,
+> `unicode61` 한+영)로 색인한다. 다른 백엔드(Mongo/pgvector)는 동일 capability로 구현.
+> 자세한 내용·한계는 `docs/pgvector-migration-plan.md` §7.1.
+
 이 경로에서 JSON 파일 백엔드는 매 쿼리마다 `nodes.json` 전체를 파싱한다. 데이터가
 늘어날수록 지연이 선형으로 증가한다.
 
