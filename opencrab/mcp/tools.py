@@ -305,6 +305,7 @@ def ontology_query(
     tenant_id: str = "default",
     use_bm25: bool = True,
     use_rerank: bool = True,
+    use_fts: bool = True,
     pack_ids: list[str] | None = None,
     auto_pack: bool = False,
     include_unpackaged: bool = False,
@@ -369,6 +370,7 @@ def ontology_query(
             subject_id=subject_id,
             use_bm25=use_bm25,
             use_rerank=use_rerank,
+            use_fts=use_fts,
             pack_ids=effective_pack_ids,
             include_unpackaged=include_unpackaged,
         )
@@ -378,7 +380,7 @@ def ontology_query(
             "spaces_filter": spaces,
             "subject_id": subject_id,
             "tenant_id": tenant_id,
-            "pipeline": {"bm25": use_bm25, "rerank": use_rerank},
+            "pipeline": {"bm25": use_bm25, "rerank": use_rerank, "fts": use_fts},
             "total": len(results),
             "results": [r.to_dict() for r in results],
         }
@@ -1740,6 +1742,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "use_bm25": {
                     "type": "boolean",
                     "description": "Include BM25 keyword results (default true).",
+                    "default": True,
+                },
+                "use_fts": {
+                    "type": "boolean",
+                    "description": "Include FTS5 doc-body keyword results when the doc store supports it (default true).",
                     "default": True,
                 },
                 "use_rerank": {

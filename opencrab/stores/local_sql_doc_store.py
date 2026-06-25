@@ -108,6 +108,7 @@ class LocalSQLDocStore:
         """
         self._db_path = db_path
         self._available = False
+        self._fts_ok = False  # SQLite FTS5 키워드 색인 가용 여부(capability)
         self._lock = threading.Lock()
         self._local = threading.local()
         self._conns_lock = threading.Lock()
@@ -151,6 +152,30 @@ class LocalSQLDocStore:
         except Exception as exc:
             logger.warning("LocalSQLDocStore init failed: %s", exc)
             self._available = False
+            return
+        # FTS5 키워드 색인(선택) — 빌드에 FTS5 모듈이 없으면 graceful 비활성.
+        # 본문(doc_sources.text)을 한+영 unicode61 토크나이저로 색인 → 약어·표준번호·영어
+        # 다중어 질의 정확매칭(하이브리드 키워드 레그). 미가용 시 supports_keyword=False.
+        try:
+            cur.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS doc_sources_fts USING fts5("
+                "source_id UNINDEXED, text, "
+                "tokenize='unicode61 remove_diacritics 0')"
+            )
+            # 최초 1회 마이그레이션(idempotent): FTS 비었고 본문이 있으면 일괄 색인.
+            n_fts = cur.execute("SELECT count(*) FROM doc_sources_fts").fetchone()[0]
+            n_src = cur.execute("SELECT count(*) FROM doc_sources").fetchone()[0]
+            if n_fts == 0 and n_src > 0:
+                cur.execute(
+                    "INSERT INTO doc_sources_fts(source_id, text) "
+                    "SELECT source_id, text FROM doc_sources"
+                )
+                logger.info("doc_sources_fts migrated %d rows", n_src)
+            conn.commit()
+            self._fts_ok = True
+        except Exception as exc:
+            logger.warning("FTS5 keyword index unavailable (graceful): %s", exc)
+            self._fts_ok = False
 
     # ------------------------------------------------------------------
     # Availability / lifecycle
@@ -160,6 +185,12 @@ class LocalSQLDocStore:
     def available(self) -> bool:
         """Replaces: LocalDocStore.available / MongoStore.available"""
         return self._available
+
+    @property
+    def supports_keyword(self) -> bool:
+        """키워드 전문검색(FTS5) 지원 여부 — 하이브리드 키워드 레그 capability.
+        다른 백엔드(Mongo/pgvector)는 각자 이 capability를 구현/노출한다."""
+        return self._available and self._fts_ok
 
     def ping(self) -> bool:
         """
@@ -300,8 +331,75 @@ class LocalSQLDocStore:
                 """,
                 (source_id, text, json.dumps(metadata), ingested_at),
             )
+            # FTS5 동기화(delete+insert) — 본문 교체 시 옛 토큰 제거.
+            if self._fts_ok:
+                try:
+                    self._conn.execute(
+                        "DELETE FROM doc_sources_fts WHERE source_id=?", (source_id,)
+                    )
+                    self._conn.execute(
+                        "INSERT INTO doc_sources_fts(source_id, text) VALUES (?, ?)",
+                        (source_id, text),
+                    )
+                except Exception as exc:
+                    logger.warning("FTS sync failed for %s: %s", source_id, exc)
             self._conn.commit()
         return source_id
+
+    def keyword_search(
+        self,
+        query: str,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """본문(doc_sources) FTS5 키워드 검색 — 하이브리드 키워드 레그.
+
+        백엔드-중립 인터페이스: 호출측은 ``supports_keyword`` 로 가용성 확인 후 사용.
+        질의는 \\w+ 토큰만 추출해 각 토큰을 따옴표로 감싸 OR 결합 → FTS5 연산자
+        주입/구문오류 방지(따옴표·별표·연산자 입력도 안전). bm25 랭크 오름차순(=best first).
+        반환: [{source_id, node_id, text, metadata, score}] (score 높을수록 우수).
+        """
+        if not self._available or not self._fts_ok or not self._conn:
+            return []
+        import re
+
+        toks = re.findall(r"\w+", query or "", flags=re.UNICODE)
+        if not toks:
+            return []
+        match = " OR ".join(f'"{t}"' for t in toks)
+        try:
+            rows = self._conn.execute(
+                "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
+                "bm25(doc_sources_fts) AS rank "
+                "FROM doc_sources_fts f JOIN doc_sources s ON s.source_id = f.source_id "
+                "WHERE doc_sources_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match, max(1, limit) * 5),  # pack 필터 대비 overfetch
+            ).fetchall()
+        except Exception as exc:
+            logger.warning("keyword_search failed: %s", exc)
+            return []
+        try:
+            from opencrab.ontology.pack_provenance import matches_pack_filter
+        except Exception:
+            matches_pack_filter = None  # type: ignore
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+            if matches_pack_filter is not None and not matches_pack_filter(
+                {"metadata": meta}, pack_ids, include_unpackaged
+            ):
+                continue
+            out.append({
+                "source_id": r["sid"],
+                "node_id": meta.get("node_id") or r["sid"],
+                "text": r["text"],
+                "metadata": meta,
+                "score": -float(r["rank"] or 0.0),  # bm25: 작을수록 우수 → 부호반전
+            })
+            if len(out) >= limit:
+                break
+        return out
 
     def get_source(self, source_id: str) -> dict[str, Any] | None:
         """
