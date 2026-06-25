@@ -252,6 +252,7 @@ class HybridQuery:
         use_rerank: bool = True,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        use_fts: bool = True,
     ) -> list[QueryResult]:
         """
         Execute a hybrid query: vector + BM25 + graph expansion, then rerank.
@@ -299,10 +300,21 @@ class HybridQuery:
             if bm25_hits:
                 result_lists.append(bm25_hits)
 
-        # --- Stage 3: Graph expansion from vector and BM25 anchor nodes ---
+        # --- Stage 2b: FTS5 keyword search over doc bodies (capability-gated) ---
+        fts_hits: list[dict[str, Any]] = []
+        if use_fts:
+            fts_hits = self._fts_search(
+                question, spaces, profile.bm25_limit,
+                pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+            )
+            if fts_hits:
+                result_lists.append(fts_hits)
+
+        # --- Stage 3: Graph expansion from vector/BM25/FTS anchor nodes ---
         anchor_ids = _ordered_unique(
             [hit.node_id for hit in vector_hits if hit.node_id]
-            + [hit.get("node_id") for hit in bm25_hits],
+            + [hit.get("node_id") for hit in bm25_hits]
+            + [hit.get("node_id") for hit in fts_hits],
             profile.anchor_limit,
         )
         if anchor_ids and self._neo4j.available:
@@ -398,6 +410,43 @@ class HybridQuery:
         except Exception as exc:
             logger.warning("BM25 search error: %s", exc)
             return []
+
+    def _fts_search(
+        self,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        pack_ids: list[str] | None = None,
+        include_unpackaged: bool = False,
+    ) -> list[dict[str, Any]]:
+        """FTS5 키워드 검색 레그(본문 다중어/약어/표준번호 정확매칭).
+
+        백엔드-중립: doc store가 ``supports_keyword`` capability를 노출할 때만 사용.
+        미지원·예외 시 빈 리스트로 graceful fallback(기존 하이브리드 무손상).
+        """
+        ds = self._doc_store
+        if ds is None or not getattr(ds, "supports_keyword", False):
+            return []
+        try:
+            hits = ds.keyword_search(
+                question,
+                pack_ids=pack_ids,
+                include_unpackaged=include_unpackaged,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.warning("FTS keyword search error: %s", exc)
+            return []
+        out: list[dict[str, Any]] = []
+        for h in hits:
+            out.append({
+                "source": "keyword",
+                "node_id": h.get("node_id"),
+                "score": h.get("score", 0.0),
+                "text": h.get("text"),
+                "metadata": h.get("metadata") or {},
+            })
+        return out
 
     def _policy_filter(
         self,
