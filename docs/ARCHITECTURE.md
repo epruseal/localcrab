@@ -57,18 +57,38 @@ make_sql_store(settings)
 - `_save()`: 전체 dict 직렬화 후 atomic rename — O(N)
 - `list_nodes(limit=50000)`: 전체 파일 로드 후 슬라이스 — O(N)
 
-### 핫 패스: BM25 캐시 재구성
+### 핫 패스: BM25 캐시 재구성 (2026-06 개선 — 백그라운드 재빌드 + 경량 fingerprint)
 
-`ontology_query` 도구는 쿼리마다 BM25 인덱스의 fingerprint를 확인하고, 캐시가
-무효화되면 즉시 재구성한다.
+`BM25Index` 캐시는 원래 설계 의도("쓰기 시에만 재빌드, 쿼리마다 하지 않음", 커밋
+`ab21c95`)대로 동작하도록 정리됐다. 과거 회귀로 (a) dirty면 다음 쿼리가 동기
+재빌드를 떠안고 (b) not-dirty여도 매 쿼리 `list_nodes(50000)`+`json.loads`로
+fingerprint를 확인하던 비용이 쿼리 hot path에 실려 있었다(코퍼스 ~16만 노드 기준
+부하 큼). 현재는:
+
+- **재빌드는 백그라운드 워커**가 수행한다. `invalidate_bm25_cache()`(쓰기 핸들러가
+  호출)는 세대 카운터만 bump하고 워커를 깨운다(디바운스 `OPENCRAB_BM25_DEBOUNCE`,
+  기본 1.5s — 연속 ingest를 1회로 합침). 완료되면 새 인덱스를 **원자적 참조 교체**로
+  swap-in한다(단일 프로세스/GIL). 쿼리는 그동안 기존(약간 stale) 인덱스를 즉시 서빙.
+- **쿼리 hot path는 경량 fingerprint만** 확인한다 — `doc_store.bm25_fingerprint()`
+  = `SELECT COUNT(*), MAX(updated_at) FROM (SELECT … LIMIT N)`(행 파싱 없음,
+  `idx_doc_nodes_updated` 활용). 별도 프로세스(팩 적재·reingest)가 `invalidate`
+  없이 doc_nodes에 쓴 out-of-band 변경을 이 probe가 잡아 백그라운드 재빌드를
+  스케줄한다. `LIMIT N`은 `_BM25_NODE_LIMIT`과 일치시켜, 코퍼스가 N을 넘어도 count가
+  `BM25Index`(N개만 색인)와 어긋나지 않게 한다.
+- 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐.
 
 ```python
 # opencrab/ontology/query.py
 _BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
 
-nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)  # 핫 패스
-self._bm25_cache = BM25Index.build(nodes)
+# 쿼리 hot path: 경량 probe만 (불일치 시 백그라운드 재빌드 예약, stale 서빙)
+fp = self._doc_store.bm25_fingerprint(limit=_BM25_NODE_LIMIT)
+if fp != self._bm25_cache.fingerprint:
+    self.invalidate_bm25_cache()  # → 백그라운드 워커가 재빌드 후 atomic swap
 ```
+
+검색 품질(relevance·토크나이저·스코어링·커버리지)은 무변경 — `BM25Index.build/search`
+로직을 건드리지 않는다. freshness만 write-triggered(디바운스 창에서만 stale).
 
 > **키워드 FTS 레그(2026-06):** BM25는 그래프 **노드 필드**를 색인하므로 청크 **본문**
 > 속 약어·표준번호(JASO M345, FB/FC)는 놓칠 수 있다. 이를 보완해 `HybridQuery`는

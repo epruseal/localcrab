@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -232,14 +233,94 @@ class HybridQuery:
         # Optional stores attached at runtime by _get_context() in tools.py
         self._doc_store: Any = None
         self._rebac: Any = None
-        # BM25 index cache — rebuilt lazily, invalidated on every write
+        # BM25 index cache — rebuilt off the query hot path by a background
+        # worker thread (debounced). Queries serve the (possibly slightly
+        # stale) cached index immediately; a write or an out-of-band
+        # fingerprint mismatch schedules a rebuild that atomically swaps it in.
         self._bm25_cache: Any = None
         self._bm25_cache_size: int = 0
         self._bm25_dirty: bool = True
+        self._bm25_lock = threading.Lock()      # guards scheduling state
+        self._bm25_wake = threading.Event()      # invalidate → wake the worker
+        self._bm25_stop = threading.Event()      # shutdown signal
+        self._bm25_epoch = 0                      # generation counter (coalescing)
+        self._bm25_worker: threading.Thread | None = None
+        self._bm25_debounce = float(os.getenv("OPENCRAB_BM25_DEBOUNCE", "1.5"))
 
     def invalidate_bm25_cache(self) -> None:
-        """Mark the BM25 index stale so it is rebuilt on the next query."""
+        """Mark the BM25 index stale and schedule a debounced background rebuild.
+
+        Cheap and non-blocking: called from inside write handlers (holding the
+        process write lock), it only bumps a generation counter and wakes the
+        worker. Inert instances (no doc store attached, e.g. the FastAPI
+        ``ApiContext.hybrid``) never spawn a thread.
+        """
         self._bm25_dirty = True
+        if self._doc_store is None:
+            return
+        with self._bm25_lock:
+            self._bm25_epoch += 1
+            if self._bm25_worker is None or not self._bm25_worker.is_alive():
+                self._bm25_worker = threading.Thread(
+                    target=self._bm25_rebuild_loop,
+                    name="bm25-rebuild",
+                    daemon=True,
+                )
+                self._bm25_worker.start()
+            self._bm25_wake.set()
+
+    def _bm25_rebuild_loop(self) -> None:
+        """Background worker: debounce, then rebuild the BM25 index off-path.
+
+        Coalesces bursts of invalidations via ``_bm25_debounce`` + a generation
+        counter, and re-runs if a new invalidation arrived during a build so the
+        final index always reflects the last write.
+        """
+        BM25Index = _get_bm25()
+        from opencrab.ontology.bm25 import compute_fingerprint
+
+        while not self._bm25_stop.is_set():
+            self._bm25_wake.wait()
+            if self._bm25_stop.is_set():
+                break
+            self._bm25_wake.clear()
+            # Debounce: collapse a burst of invalidations into one rebuild.
+            self._bm25_stop.wait(self._bm25_debounce)
+            if self._bm25_stop.is_set():
+                break
+            build_epoch = self._bm25_epoch
+            try:
+                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+                fp = compute_fingerprint(nodes)
+                cache = self._bm25_cache
+                if cache is not None and fp == cache.fingerprint:
+                    self._bm25_dirty = False          # nothing actually changed
+                else:
+                    new_index = BM25Index.build(nodes)
+                    self._bm25_cache = new_index        # atomic ref swap (GIL)
+                    self._bm25_cache_size = len(nodes)
+                    self._bm25_dirty = False
+                    logger.debug("BM25 index rebuilt in background (%d nodes)", len(nodes))
+            except Exception as exc:  # keep serving the old cache on failure
+                logger.warning("BM25 background rebuild failed: %s", exc)
+            # A write landed mid-build → schedule one more pass.
+            if self._bm25_epoch != build_epoch:
+                self._bm25_wake.set()
+
+    def _bm25_join(self, timeout: float | None = None) -> None:
+        """Wait for any in-flight background rebuild to settle (tests/shutdown)."""
+        worker = self._bm25_worker
+        if worker is not None and worker.is_alive():
+            # Give the worker a chance to pick up a pending wake + debounce.
+            worker.join(timeout)
+
+    def shutdown_bm25(self, timeout: float = 2.0) -> None:
+        """Stop the background worker (called from server shutdown hooks)."""
+        self._bm25_stop.set()
+        self._bm25_wake.set()
+        worker = self._bm25_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout)
 
     def query(
         self,
@@ -362,6 +443,32 @@ class HybridQuery:
             ))
         return results
 
+    def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
+        """Cheap ``(count, max_updated_at)`` probe for stale-cache detection.
+
+        Prefers ``doc_store.bm25_fingerprint()`` (a ``COUNT(*), MAX(updated_at)``
+        query with no row parsing) so the query hot path avoids the 50k
+        ``list_nodes`` scan. Falls back to the heavy ``compute_fingerprint`` for
+        legacy stores without the capability. Returns ``None`` on error so the
+        caller simply skips the staleness check and serves the current index.
+
+        Must stay byte-for-byte equal to the fingerprint that
+        ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))`` records, including the
+        ``_BM25_NODE_LIMIT`` cap, so callers compare apples to apples.
+        """
+        ds = self._doc_store
+        if ds is None:
+            return None
+        try:
+            probe = getattr(ds, "bm25_fingerprint", None)
+            if probe is not None:
+                return probe(limit=_BM25_NODE_LIMIT)
+            from opencrab.ontology.bm25 import compute_fingerprint
+            return compute_fingerprint(ds.list_nodes(limit=_BM25_NODE_LIMIT))
+        except Exception as exc:
+            logger.debug("BM25 fingerprint probe failed: %s", exc)
+            return None
+
     def _bm25_search(
         self,
         question: str,
@@ -372,30 +479,31 @@ class HybridQuery:
     ) -> list[dict[str, Any]]:
         """Run BM25 search against doc store nodes, using a cached index.
 
-        The cache is rebuilt when the doc store's ``(count, max_timestamp)``
-        fingerprint diverges from the indexed snapshot. Callers can also
-        force a rebuild via ``invalidate_bm25_cache()``.
+        Hot path is rebuild-free: rebuilds run on a background worker
+        (:meth:`invalidate_bm25_cache`). The only synchronous build is the
+        cold start (no cache yet). On every query we run a *cheap* fingerprint
+        probe (``doc_store.bm25_fingerprint()`` — ``COUNT(*), MAX(updated_at)``,
+        no row parsing) to catch out-of-band writes (e.g. a separate pack-ingest
+        process) that never called ``invalidate_bm25_cache()``; on mismatch we
+        schedule a background rebuild and keep serving the current index.
         """
         try:
             BM25Index = _get_bm25()
-            from opencrab.ontology.bm25 import compute_fingerprint
 
-            need_rebuild = self._bm25_dirty or self._bm25_cache is None
-            if not need_rebuild and self._bm25_cache is not None:
-                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                if compute_fingerprint(nodes) != self._bm25_cache.fingerprint:
-                    need_rebuild = True
-                if need_rebuild:
-                    self._bm25_cache = BM25Index.build(nodes)
-                    self._bm25_cache_size = len(nodes)
-                    self._bm25_dirty = False
-                    logger.debug("BM25 index rebuilt (fingerprint mismatch, %d nodes)", len(nodes))
-            else:
+            if self._bm25_cache is None:
+                # Cold start: nothing to serve yet, so build synchronously once.
                 nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
                 self._bm25_cache = BM25Index.build(nodes)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False
-                logger.debug("BM25 index rebuilt (%d nodes)", self._bm25_cache_size)
+                logger.debug("BM25 index cold-built (%d nodes)", self._bm25_cache_size)
+            else:
+                # Cheap staleness probe — detects out-of-band writes without a
+                # full 50k list_nodes scan. Falls back to the heavy fingerprint
+                # only if the store predates bm25_fingerprint().
+                fp = self._bm25_probe_fingerprint()
+                if fp is not None and fp != self._bm25_cache.fingerprint:
+                    self.invalidate_bm25_cache()  # schedule bg rebuild; serve stale
 
             hits = self._bm25_cache.search(
                 question,
