@@ -228,10 +228,10 @@ $$) AS (e agtype);
 
 ## 7. BM25 vs Postgres FTS (선택)
 
-- 현재: 파이썬 인메모리 `BM25Index`(`opencrab/ontology/bm25.py`). `BM25Index.build(doc_store.list_nodes(limit=...))` 로 매 질의마다(스테일 핑거프린트 시) 재빌드. 한국어를 위해 `_tokenize` 가 Hangul 2/3-gram을 추가 생성하는 커스텀 토크나이저를 쓴다.
-- 대안: Postgres `tsvector`/`tsquery` FTS. `doc_nodes` 에 `tsvector` 생성 컬럼 + GIN 인덱스를 두면 재빌드 없이 증분 검색이 가능하고 다중 프로세스가 공유한다.
-- **주의:** Postgres 기본 FTS는 한국어 형태소 분석이 약하다(`pg_bigm`/`pgroonga` 같은 확장 필요, aarch64 빌드 부담). 현재 BM25의 Hangul n-gram·BM25 가중·pack/space 필터를 FTS로 1:1 재현하기 어렵다.
-- **권장:** 이번 마이그레이션 범위에서 **제외**(BM25 파이썬 로직 유지). FTS는 별도 후속 과제로 분리. 단, `list_nodes` 가 Postgres로 옮겨가도 인터페이스가 동일하므로 BM25는 무변경으로 계속 동작한다.
+- 현재: 파이썬 인메모리 `BM25Index`(`opencrab/ontology/bm25.py`). 한국어를 위해 `_tokenize` 가 Hangul 2/3-gram을 추가 생성하는 커스텀 토크나이저를 쓴다. **2026-06 개선(`feat/bm25-bg-rebuild`)**: 재빌드를 쿼리 hot path에서 분리 — `invalidate_bm25_cache()`가 백그라운드 워커를 디바운스(`OPENCRAB_BM25_DEBOUNCE`) 트리거하고 완료 시 원자적 swap, 쿼리는 경량 `doc_store.bm25_fingerprint()`(`COUNT(*), MAX(updated_at)` LIMIT N, 행 파싱 없음)만 확인해 out-of-band 쓰기를 감지(상세: `docs/ARCHITECTURE.md` 핫패스 §). `list_nodes(limit=50000)` 풀스캔/동기 재빌드가 hot path에서 제거됨.
+- 대안(최종 종착): Postgres `tsvector`/`tsquery` FTS. `doc_nodes` 에 `tsvector` 생성 컬럼 + GIN 인덱스를 두면 **재빌드·콜드빌드·out-of-band 정합성이 DB 네이티브로 해소**(증분 동기, 다중 프로세스 공유) — 위 백그라운드 재빌드도 불필요해진다.
+- **주의:** Postgres 기본 FTS(`unicode61`/`trigram`)는 한국어 2-gram 미지원 → `pg_bigm`/`pgroonga` 확장 필요(aarch64 빌드 부담). tsvector 흡수 시 선행 과제: ① Hangul n-gram 재현, ② `_node_text`의 `_TEXT_FIELDS` 필드가중을 다중 컬럼 + `ts_rank`/`bm25()` weight로 재설계, ③ `matches_pack_filter`/`infer_pack_id` pack·space 필터를 SQL where로 재현, ④ doc_nodes에 GIN 인덱스 신규 빌드(대량). **relevance 회귀 검증(BM25 결과 동등성·한국어 MRR) 필수.**
+- **권장:** tsvector 흡수는 이번 마이그레이션 범위에서 **제외**(개선된 인메모리 BM25 유지). 별도 후속 과제로 분리하되, 위 ①~④ 설계를 본 과제 정의로 삼는다. `list_nodes`/`bm25_fingerprint` 가 Postgres(`PgDocStore`)로 옮겨가도 인터페이스 동일하므로 BM25 백그라운드 재빌드는 무변경으로 계속 동작한다.
 
 ### 7.1 키워드 FTS 레그 (구현됨, 2026-06) — `feat/hybrid-fts-keyword`
 - BM25(노드 필드 색인)는 **청크 본문(`doc_sources.text`)을 색인하지 않아** 본문 속 약어·표준번호(JASO M345, FB/FC)·영어 다중어 질의가 전역 검색에서 밀리는 문제가 있었다.

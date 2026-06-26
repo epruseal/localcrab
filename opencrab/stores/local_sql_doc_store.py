@@ -290,6 +290,28 @@ class LocalSQLDocStore:
             ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
+        """Cheap ``(count, max_updated_at)`` over the first ``limit`` nodes.
+
+        Equivalent to ``compute_fingerprint(self.list_nodes(limit=limit))`` but
+        WITHOUT parsing JSON ``properties`` — this is the query hot-path probe
+        HybridQuery uses to detect a stale BM25 cache without the full 50k
+        ``list_nodes`` scan. The ``LIMIT`` subquery mirrors ``list_nodes`` (same
+        rowid order, same cap) so the count agrees even when the corpus exceeds
+        ``limit`` — BM25Index only indexes that many rows. ``MAX(updated_at)`` is
+        backed by ``idx_doc_nodes_updated``; ``doc_nodes`` has no ``ingested_at``
+        column, so ``compute_fingerprint`` (which also checks ``ingested_at``)
+        yields the same value here.
+        """
+        if not self._available or not self._conn:
+            raise RuntimeError("LocalSQLDocStore is not available.")
+        row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), '')"
+            " FROM (SELECT updated_at FROM doc_nodes LIMIT ?)",
+            (limit,),
+        ).fetchone()
+        return (int(row[0]), str(row[1]))
+
     def delete_node_doc(self, space: str, node_id: str) -> bool:
         """
         Replaces: LocalDocStore.delete_node_doc / MongoStore.delete_node_doc
