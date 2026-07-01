@@ -123,6 +123,34 @@ class Settings(BaseSettings):
     local_gguf_path: str = Field(default="", alias="LOCAL_GGUF_PATH")
 
     # ------------------------------------------------------------------
+    # 벡터 스토어 백엔드 (VECTOR_BACKEND 환경변수) — 임베딩 백엔드와 독립 축.
+    #
+    # 옵션:
+    #   "chroma"     (기본): ChromaDB. 기존 동작 100% 보존(롤백 기본값).
+    #   "sqlite-vec"       : sqlite-vec(vec0). 4스토어를 단일 SQLite WAL 규율로 통일해
+    #                        Chroma 다중프로세스 쓰기 제약/flock 층 제거. KURE(1024d) 표준
+    #                        — 앱이 EMBEDDING_BACKEND=openai 의 KURE EF 로 직접 임베딩 후
+    #                        INSERT(vec0 는 원시벡터 저장). VECTOR_DB_FILE 의 vec0 테이블 사용.
+    #   "pgvector"         : (예약) 추후 PG-unified 경로. 미구현 시 명시적 오류.
+    #
+    # 설계: docs/pgvector-migration-plan.md §3.6 / §9. embedding 은 백엔드와 무관하게
+    #       동일(ResilientEmbeddingFunction, KURE). 바뀌는 것은 저장/검색 백엔드뿐.
+    # 롤백: VECTOR_BACKEND 미설정 또는 "chroma" 로 되돌리면 기존 Chroma 스택 그대로.
+    # ------------------------------------------------------------------
+    vector_backend: str = Field(
+        default="chroma",
+        alias="VECTOR_BACKEND",
+        # Literal["chroma", "sqlite-vec", "pgvector"] — pydantic-settings 호환 str
+    )
+    # sqlite-vec 백엔드 벡터 DB 파일명(LOCAL_DATA_DIR 하위). graph.db/doc_store.db 와
+    # 같은 디렉터리라 단일 LOCAL_DATA_DIR 백업이 벡터까지 포함.
+    vector_db_file: str = Field(default="vectors.db", alias="VECTOR_DB_FILE")
+    # sqlite-vec vec0 테이블명(KURE 1024d 단일 표준).
+    vector_collection: str = Field(
+        default="vectors_kure", alias="VECTOR_COLLECTION"
+    )
+
+    # ------------------------------------------------------------------
     # MCP server
     # ------------------------------------------------------------------
     mcp_server_name: str = Field(default="opencrab", alias="MCP_SERVER_NAME")

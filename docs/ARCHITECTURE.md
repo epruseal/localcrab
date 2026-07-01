@@ -415,12 +415,22 @@ make_vector_store(settings)
 - **GGUF 자동 다운로드**: `LOCAL_GGUF_PATH` 미설정·파일 없으면 HuggingFace에서 자동 다운로드.
 - **컬렉션 분리**: minilm(384d)과 KURE(1024d)는 차원이 달라 별도 컬렉션 유지. 롤백 즉시 가능.
 
+**벡터 스토어 백엔드 (`VECTOR_BACKEND`) — 임베딩과 독립 축**:
+`make_vector_store` 는 먼저 `VECTOR_BACKEND` 로 분기한다(`EMBEDDING_BACKEND` 분기는 `chroma` 내부).
+- `chroma`(기본): `ChromaStore` (위 그림 그대로).
+- `sqlite-vec`: `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`). 벡터를 graph/doc/sql 과 같은
+  SQLite WAL 규율에 편입 → Chroma 다중프로세스 쓰기 제약/flock 층 제거. 임베딩은 KURE 공유 헬퍼
+  `_make_kure_embedding_function` 로 앱측 계산 후 INSERT. 전환: `scripts/migrate_chroma_to_sqlite_vec.py`,
+  설계·성능(전역 브루트포스·binary 2단계): `docs/pgvector-migration-plan.md` (A) §3.6/§3.7.
+- `pgvector`: 예약(미구현).
+
 관련 파일:
 - `opencrab/stores/openai_embedding.py` — OpenAI 호환 임베딩 EF
 - `opencrab/stores/llamacpp_embedding.py` — 로컬 GGUF EF (자동 다운로드 포함)
 - `opencrab/stores/resilient_embedding.py` — 폴백 자동 전환 래퍼
-- `opencrab/stores/factory.py` — `make_vector_store` 백엔드 분기
-- `opencrab/config.py` — `embedding_backend`, `openai_*`, `local_gguf_path` 등
+- `opencrab/stores/factory.py` — `make_vector_store` 백엔드 분기 (VECTOR_BACKEND × EMBEDDING_BACKEND)
+- `opencrab/stores/sqlite_vec_store.py` — sqlite-vec(vec0) 벡터 스토어
+- `opencrab/config.py` — `vector_backend`/`vector_db_file`/`vector_collection`, `embedding_backend`, `openai_*`, `local_gguf_path` 등
 
 성능 비교 (실측):
 

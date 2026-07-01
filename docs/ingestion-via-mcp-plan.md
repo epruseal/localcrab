@@ -2,6 +2,8 @@
 
 상태: 제안 (Proposed) · 작성일: 2026-06-18 · 코드 구현 없음 (설계 문서)
 
+> **⚠️ 갱신(2026-07-01):** 이 문서의 핵심 동기 중 하나였던 **"적재 시 MCP 중지" 운영 제약과 `chroma.lock(LOCK_EX)` 의존은, 벡터 백엔드를 `sqlite-vec`(vec0)로 라이브 전환하면서 이미 제거되었다**(`docs/pgvector-migration-plan.md` (A) 경로 라이브). 벡터가 SQLite WAL이 되어 적재 중에도 게이트웨이 무중단(로더 쓰기 ∥ serve 읽기, 라이터는 write.lock/busy_timeout 직렬화). 따라서 아래 §1의 "대량 재적재마다 MCP 중지" 부담 서술은 **chroma 백엔드 한정**이다. 다만 본 문서의 나머지 목표(`pack_purge`·`pack_ingest_chunks` MCP write 도구, 청크 단위 적재, 원자적 purge-replace)는 여전히 유효하다.
+
 범위 확정: `pack_purge`(삭제) · `pack_ingest_chunks`(청크 배치) **두 신규 MCP write 도구 신설 포함**. `--fresh`(purge-replace)까지 MCP 무중단으로 달성한다.
 
 관련 문서: `[[pgvector-migration-plan]]` (스토어 백엔드 교체 — 본 문서의 비목표)

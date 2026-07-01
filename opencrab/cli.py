@@ -154,7 +154,11 @@ def serve(
 
     import uvicorn
 
-    # Single worker: the chroma PersistentClient is single-process only.
+    # Single worker: historically required because the chroma PersistentClient is
+    # single-process only. Under VECTOR_BACKEND=sqlite-vec (SQLite WAL) multiple
+    # workers are technically possible, but 1 is retained — each worker would hold
+    # its own in-memory BM25 index + embedding function, and write.lock already
+    # serialises cross-process writes. Not a hard constraint under sqlite-vec.
     uvicorn.run(
         create_app(auth_token=token),
         host=bind_host,

@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "neo4j>=5.0",
     "chromadb>=0.5",
+    "sqlite-vec>=0.1.9",
     "pymongo>=4.0",
     "sqlalchemy>=2.0",
     "psycopg2-binary>=2.9",

@@ -99,6 +99,24 @@ def chroma_store(tmp_path):
     return s
 
 
+@pytest.fixture
+def sqlite_vec_store(tmp_path):
+    pytest.importorskip("sqlite_vec")
+    from _vec_helpers import MockEF
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    s = SqliteVecStore(
+        db_path=str(tmp_path / "vectors.db"),
+        embedding_function=MockEF(16),
+        dim=16,
+        collection_name="test_concurrency",
+    )
+    if not s.available:
+        pytest.skip("sqlite-vec가 이 환경에서 초기화되지 않음")
+    yield s
+    s.close()
+
+
 # ---------------------------------------------------------------------------
 # LocalGraphStore (핵심) — threading.Lock 쓰기 직렬화
 # ---------------------------------------------------------------------------
@@ -387,6 +405,144 @@ class TestChromaStoreConcurrency:
         chroma_store._available = False
         with pytest.raises(RuntimeError):
             chroma_store.add_texts(texts=["x"], metadatas=[{"k": "v"}], ids=["x"])
+
+
+# ---------------------------------------------------------------------------
+# SqliteVecStore — 스레드-로컬 커넥션 + write 락 + WAL (LocalSQLDocStore 패턴)
+# ---------------------------------------------------------------------------
+
+
+class TestSqliteVecConcurrency:
+    def test_concurrent_upsert(self, sqlite_vec_store):
+        """정상: 4스레드 × 10 upsert → 에러 0, count 일치 (write 락 직렬화 회귀)."""
+        N, M = 4, 10
+
+        def worker(tid: int) -> None:
+            for i in range(M):
+                sqlite_vec_store.upsert_texts(
+                    texts=[f"doc {tid} {i}"],
+                    metadatas=[{"pack_id": f"p{tid}"}],
+                    ids=[f"t{tid}_{i}"],
+                )
+
+        errors = run_threads(worker, N)
+        assert errors == [], f"동시 upsert 에러: {errors}"
+        assert sqlite_vec_store.count() == N * M
+
+    def test_reads_during_writes(self, sqlite_vec_store):
+        """핵심(WAL): 쓰기 중에도 읽기(query/count)가 차단·손상 없이 진행된다.
+
+        Chroma 의 다중프로세스 쓰기 제약을 대체하는 SqliteVecStore 의 목표 속성 —
+        라이터가 도는 중 리더는 마지막 커밋 스냅샷을 비차단으로 읽는다."""
+        for i in range(10):
+            sqlite_vec_store.upsert_texts(
+                texts=[f"seed {i}"], metadatas=[{"pack_id": "s"}], ids=[f"seed{i}"]
+            )
+
+        def writer(tid: int) -> None:
+            for i in range(15):
+                sqlite_vec_store.upsert_texts(
+                    texts=[f"w {tid} {i}"],
+                    metadatas=[{"pack_id": "w"}],
+                    ids=[f"w{tid}_{i}"],
+                )
+
+        def reader(tid: int) -> None:
+            for _ in range(20):
+                sqlite_vec_store.query("seed", n_results=5)
+                sqlite_vec_store.count()
+                sqlite_vec_store.get_by_id("seed0")
+
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def wrap(fn, tid):
+            try:
+                fn(tid)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=wrap, args=(writer, t)) for t in range(2)]
+        threads += [threading.Thread(target=wrap, args=(reader, t)) for t in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60.0)
+        assert not [th for th in threads if th.is_alive()], "데드락 의심"
+        assert errors == [], f"읽기/쓰기 혼합 중 손상 관측: {errors}"
+        assert sqlite_vec_store.count() == 10 + 2 * 15
+
+    def test_concurrent_resets_keep_store_valid(self, sqlite_vec_store):
+        """엣지: 여러 스레드가 reset_collection 동시 호출 → write 락으로 직렬화되어
+        에러 없이 유효 상태 유지."""
+        sqlite_vec_store.upsert_texts(
+            texts=["seed"], metadatas=[{"pack_id": "v"}], ids=["seed"]
+        )
+
+        def worker(tid: int) -> None:
+            for _ in range(5):
+                sqlite_vec_store.reset_collection()
+
+        errors = run_threads(worker, 4)
+        assert errors == [], f"동시 reset 에러: {errors}"
+        assert sqlite_vec_store.count() == 0
+        sqlite_vec_store.upsert_texts(
+            texts=["after"], metadatas=[{"pack_id": "v"}], ids=["after"]
+        )
+        assert sqlite_vec_store.count() == 1
+
+    def test_reads_during_reset_no_error(self, sqlite_vec_store):
+        """엣지: reset_collection(DELETE 기반)이 진행되는 동안 동시 읽기(query/
+        count/get_by_id)가 'no such table' 등으로 깨지지 않는다 — reset이 테이블을
+        DROP하지 않고 비우기만 하므로 리더는 항상 유효한 테이블을 본다."""
+        for i in range(30):
+            sqlite_vec_store.upsert_texts(
+                texts=[f"seed {i}"], metadatas=[{"pack_id": "s"}], ids=[f"s{i}"]
+            )
+        stop = threading.Event()
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def resetter() -> None:
+            for _ in range(8):
+                sqlite_vec_store.reset_collection()
+                for i in range(20):
+                    sqlite_vec_store.upsert_texts(
+                        texts=[f"r{i}"], metadatas=[{"pack_id": "s"}], ids=[f"r{i}"]
+                    )
+            stop.set()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    sqlite_vec_store.query("seed", n_results=5)
+                    sqlite_vec_store.count()
+                    sqlite_vec_store.get_by_id("s1")
+                except Exception as exc:  # noqa: BLE001 - 어떤 예외든 수집
+                    with lock:
+                        errors.append(exc)
+
+        threads = [threading.Thread(target=resetter)]
+        threads += [threading.Thread(target=reader) for _ in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60.0)
+        assert not [th for th in threads if th.is_alive()], "데드락 의심"
+        assert errors == [], f"reset 중 읽기 에러: {[str(e)[:80] for e in errors[:5]]}"
+        # reset 이후에도 정상 동작
+        assert sqlite_vec_store.count() >= 0
+        sqlite_vec_store.query("seed", n_results=3)
+
+    def test_unavailable_raises(self, sqlite_vec_store):
+        """에러: unavailable 시 RuntimeError (count 는 0 반환, 예외 없음)."""
+        sqlite_vec_store._available = False
+        with pytest.raises(RuntimeError):
+            sqlite_vec_store.upsert_texts(
+                texts=["x"], metadatas=[{"pack_id": "v"}], ids=["x"]
+            )
+        assert sqlite_vec_store.count() == 0
 
 
 # ---------------------------------------------------------------------------
