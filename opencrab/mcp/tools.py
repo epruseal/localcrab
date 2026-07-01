@@ -139,8 +139,6 @@ def _get_context() -> dict[str, Any]:
     if _context:
         return _context
 
-    _acquire_chroma_shared_lock()
-
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.ontology.impact import ImpactEngine
@@ -154,6 +152,12 @@ def _get_context() -> dict[str, Any]:
     )
 
     cfg = get_settings()
+
+    # chroma.lock (LOCK_SH) only coordinates with the offline chroma batch loader;
+    # skip it when the vector backend isn't chroma (sqlite-vec uses SQLite WAL, not
+    # chroma's flock layer, so the shared lock would be a pointless hold).
+    if cfg.vector_backend == "chroma":
+        _acquire_chroma_shared_lock()
 
     graph = make_graph_store(cfg)
     vector = make_vector_store(cfg)

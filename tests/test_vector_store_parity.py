@@ -97,6 +97,15 @@ class TestVectorStoreContract:
             pass
         assert store.count() == 0
 
+    def test_length_mismatch_raises(self, store):
+        # both backends must reject mismatched texts/metadatas/ids lengths
+        # (never silently truncate via zip)
+        with pytest.raises(Exception):
+            store.upsert_texts(
+                texts=["a", "b"], metadatas=[{"pack_id": "p"}], ids=["x"]
+            )
+        assert store.count() == 0
+
     def test_query_topk_ordering(self, store):
         _load(store)
         hits = store.query("fruit sweet banana", n_results=3)

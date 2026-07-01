@@ -492,6 +492,49 @@ class TestSqliteVecConcurrency:
         )
         assert sqlite_vec_store.count() == 1
 
+    def test_reads_during_reset_no_error(self, sqlite_vec_store):
+        """엣지: reset_collection(DELETE 기반)이 진행되는 동안 동시 읽기(query/
+        count/get_by_id)가 'no such table' 등으로 깨지지 않는다 — reset이 테이블을
+        DROP하지 않고 비우기만 하므로 리더는 항상 유효한 테이블을 본다."""
+        for i in range(30):
+            sqlite_vec_store.upsert_texts(
+                texts=[f"seed {i}"], metadatas=[{"pack_id": "s"}], ids=[f"s{i}"]
+            )
+        stop = threading.Event()
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def resetter() -> None:
+            for _ in range(8):
+                sqlite_vec_store.reset_collection()
+                for i in range(20):
+                    sqlite_vec_store.upsert_texts(
+                        texts=[f"r{i}"], metadatas=[{"pack_id": "s"}], ids=[f"r{i}"]
+                    )
+            stop.set()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    sqlite_vec_store.query("seed", n_results=5)
+                    sqlite_vec_store.count()
+                    sqlite_vec_store.get_by_id("s1")
+                except Exception as exc:  # noqa: BLE001 - 어떤 예외든 수집
+                    with lock:
+                        errors.append(exc)
+
+        threads = [threading.Thread(target=resetter)]
+        threads += [threading.Thread(target=reader) for _ in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60.0)
+        assert not [th for th in threads if th.is_alive()], "데드락 의심"
+        assert errors == [], f"reset 중 읽기 에러: {[str(e)[:80] for e in errors[:5]]}"
+        # reset 이후에도 정상 동작
+        assert sqlite_vec_store.count() >= 0
+        sqlite_vec_store.query("seed", n_results=3)
+
     def test_unavailable_raises(self, sqlite_vec_store):
         """에러: unavailable 시 RuntimeError (count 는 0 반환, 예외 없음)."""
         sqlite_vec_store._available = False

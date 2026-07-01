@@ -234,6 +234,8 @@ class SqliteVecStore:
             ]
         if metadatas is None:
             metadatas = [{} for _ in texts]
+        if len(ids) != len(texts) or len(metadatas) != len(texts):
+            raise ValueError("texts, metadatas, and ids must have the same length.")
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         with self._lock:
@@ -269,6 +271,8 @@ class SqliteVecStore:
             ids = [hashlib.sha256(t.encode()).hexdigest()[:16] for t in texts]
         if metadatas is None:
             metadatas = [{} for _ in texts]
+        if len(ids) != len(texts) or len(metadatas) != len(texts):
+            raise ValueError("texts, metadatas, and ids must have the same length.")
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         with self._lock:
@@ -304,13 +308,16 @@ class SqliteVecStore:
             self._conn.commit()
 
     def reset_collection(self) -> None:
-        """Drop and recreate the vec0 table (destructive). Serialised under the
-        write lock so concurrent resets never race."""
+        """Empty the collection (destructive). Uses DELETE (not DROP+CREATE) so
+        the table always exists: concurrent readers never observe a "no such
+        table" gap, and the write lock serialises concurrent resets. Same
+        dim/schema is retained (dim is fixed at construction)."""
         if not self._available:
             raise RuntimeError("SqliteVecStore is not available.")
         with self._lock:
-            self._conn.execute(f"DROP TABLE IF EXISTS {self._table}")
+            # ensure the table exists (idempotent) then clear all rows atomically
             self._conn.execute(self._create_table_sql())
+            self._conn.execute(f"DELETE FROM {self._table}")
             self._conn.commit()
         logger.info("SqliteVecStore: table '%s' reset.", self._table)
 
