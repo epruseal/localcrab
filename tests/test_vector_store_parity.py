@@ -213,6 +213,19 @@ def _bruteforce_topk(ef, corpus, query, k, packs=None):
     return [i for _, i in scored[:k]]
 
 
+def _bruteforce_topk_filter(ef, corpus, query, k, predicate):
+    """Exact top-k node_ids by cosine among corpus items matching `predicate`."""
+    qv = ef([query])[0]
+    scored = []
+    for _id, text, meta in corpus:
+        if not predicate(meta):
+            continue
+        v = ef([text])[0]
+        scored.append((sum(a * b for a, b in zip(qv, v)), _id))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [i for _, i in scored[:k]]
+
+
 def test_scale_over_4096_no_crash_and_pushdown_exact(tmp_path):
     from _vec_helpers import MockEF
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
@@ -250,13 +263,14 @@ def test_scale_over_4096_no_crash_and_pushdown_exact(tmp_path):
         hits = store.query(q, n_results=10, where=where)
         assert len(hits) <= 10
 
-    # 1b. Force fetch_k PAST vec0's 4096 cap so the clamp is actually exercised
-    #     (removing the clamp makes these raise OperationalError):
-    #       n_results=5000, no where     → fetch_k=5000 → clamp 4096
-    #       n_results=500, residual space → fetch_k=500*12=6000 → clamp 4096
+    # 1b. Force fetch_k to vec0's 4096 cap so the clamp is exercised (removing the
+    #     clamp makes these raise OperationalError):
+    #       n_results=5000, no where  → fetch_k=5000 → clamp 4096
+    #       residual (space) filter    → fetch_k = _VEC0_K_MAX (4096)
     big = store.query(q, n_results=5000, where=None)
     assert len(big) <= 5000
-    assert store.query(q, n_results=500, where={"space": "s1"}) is not None
+    res = store.query(q, n_results=500, where={"space": "s1"})
+    assert all(h["metadata"].get("space") == "s1" for h in res)  # residual filter honored
     store.query(q, n_results=600, where={"$and": [{"space": "s1"}, {"pack_id": "p0"}]})
 
     # 1c. duplicate pack in $in must not yield duplicate result rows
@@ -274,4 +288,56 @@ def test_scale_over_4096_no_crash_and_pushdown_exact(tmp_path):
         q, n_results=10, where={"pack_id": {"$in": ["p0", "p1"]}})] \
         == _bruteforce_topk(ef, corpus, q, 10, packs={"p0", "p1"})
 
+    store.close()
+
+
+def test_residual_filter_recall_exact_within_cap(tmp_path):
+    """Residual (non-pack) filter recall is EXACT when the corpus fits within
+    vec0's k cap. Regression guard for C1: the residual post-filter must scan up
+    to _VEC0_K_MAX and must not silently drop matches that rank beyond a small
+    inflate (the pre-fix code fetched only n_results*12 and returned []/short)."""
+    from _vec_helpers import MockEF
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    ef = MockEF(32)
+    store = SqliteVecStore(
+        db_path=str(tmp_path / "vres.db"), embedding_function=ef, dim=32,
+        collection_name="vres",
+    )
+    N = 2000  # < 4096 → top-4096 scan covers the whole corpus → exact recall
+    corpus = [
+        (f"n{i}", f"doc {i} body text", {"pack_id": f"p{i % 3}",
+                                         "space": "s1" if i % 7 == 0 else "s2"})
+        for i in range(N)
+    ]
+    store.add_texts(
+        texts=[t for _, t, _ in corpus], metadatas=[m for _, _, m in corpus],
+        ids=[i for i, _, _ in corpus],
+    )
+    q = "doc 13 body text"
+    # residual-only (space, not pushable) — matches must be recalled exactly
+    got = [h["id"] for h in store.query(q, n_results=10, where={"space": "s1"})]
+    exact = _bruteforce_topk_filter(ef, corpus, q, 10, lambda m: m.get("space") == "s1")
+    assert got == exact
+    assert all(h["metadata"]["space"] == "s1"
+               for h in store.query(q, n_results=10, where={"space": "s1"}))
+    store.close()
+
+
+def test_add_texts_duplicate_id_raises(tmp_path):
+    """Documented divergence from Chroma: vec0 has no INSERT OR IGNORE, so
+    add_texts raises on a duplicate primary key (Chroma warns and skips)."""
+    import sqlite3
+
+    from _vec_helpers import MockEF
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    store = SqliteVecStore(
+        db_path=str(tmp_path / "vdup.db"), embedding_function=MockEF(16), dim=16,
+        collection_name="vdup",
+    )
+    store.add_texts(texts=["a"], metadatas=[{"pack_id": "p"}], ids=["x"])
+    with pytest.raises(sqlite3.Error):
+        store.add_texts(texts=["b"], metadatas=[{"pack_id": "p"}], ids=["x"])
+    assert store.count() == 1
     store.close()

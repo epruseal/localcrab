@@ -58,9 +58,6 @@ logger = logging.getLogger(__name__)
 # down to the partition key so the common filters stay exact at any scale; only
 # residual constraints (e.g. `space`) fall back to a bounded post-filter.
 _VEC0_K_MAX = 4096
-# When a residual (non-pack) post-filter is needed, over-fetch by this factor so
-# enough candidates survive the filter, still clamped to _VEC0_K_MAX.
-_POST_FILTER_INFLATE = 12
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -127,6 +124,11 @@ class SqliteVecStore:
         conn.enable_load_extension(False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # Cross-process writers (e.g. an offline loader writing vectors.db while
+        # serve also writes) wait up to 5s for the write lock instead of getting
+        # SQLITE_BUSY immediately. (Python's connect(timeout=5.0) default already
+        # sets this; made explicit so the WAL multi-writer contract is in-code.)
+        conn.execute("PRAGMA busy_timeout=5000")
         with self._conns_lock:
             self._all_conns.append(conn)
         return conn
@@ -336,11 +338,17 @@ class SqliteVecStore:
         # actually pushable (eq/$in). Otherwise a residual post-filter is needed.
         pack_only = _is_pack_only(where) and pack_values is not None
 
-        # When the whole filter is pack (pushed to the partition key) or there is
-        # no filter, k = n_results is exact. Otherwise over-fetch for the residual
-        # post-filter. Always clamp to vec0's k limit (4096) to avoid a crash.
-        inflate = 1 if (predicate is None or pack_only) else _POST_FILTER_INFLATE
-        fetch_k = min(max(int(n_results) * inflate, int(n_results), 1), _VEC0_K_MAX)
+        # No filter / fully pushed-down pack filter → k = n_results is exact.
+        # Residual (non-pack) post-filter → scan up to vec0's k cap for best-effort
+        # recall: the residual field is filtered in Python, so matches beyond the
+        # 4096 nearest cannot be recovered (a hard vec0 k limit). Localcrab only
+        # emits pack (exact, pushed down) and space filters; space is absent from
+        # vector metadata so it matches nothing in either backend — the residual
+        # path is a correctness safety net, not a hot path.
+        if predicate is None or pack_only:
+            fetch_k = min(max(int(n_results), 1), _VEC0_K_MAX)
+        else:
+            fetch_k = _VEC0_K_MAX
 
         if pack_values:
             # pack_id $in / eq → one partition-pushed KNN per pack, merged. Each
