@@ -51,7 +51,11 @@ from opencrab.common.text import slugify
 
 logger = logging.getLogger(__name__)
 
-# chroma PersistentClient는 단일 프로세스 전용.
+# chroma PersistentClient는 chromadb 공식상 단일 프로세스 전용이다("not process-safe for
+# concurrent writers sharing the same local persistence path"; thread-safe도 단일 프로세스 내에서만
+# 보증). 즉 여러 serve가 같은 persist 경로를 공유하는 것은 공식 미지원이며, 아래 chroma.lock/
+# write.lock 은 그 위에 opencrab이 직접 얹은 커스텀 안전층이다(공식 보증 아님). 정공법은 단일
+# `chroma run` 서버 + HttpClient. 출처: cookbook.chromadb.dev/core/{system_constraints,clients}.
 # 공유 락(LOCK_SH)을 서버 수명 동안 보유 → load_local_packs.py의 배타 락(LOCK_EX)과 상호 배제.
 _chroma_lock_fh = None
 
@@ -69,7 +73,12 @@ def _acquire_chroma_shared_lock() -> None:
 # writes must be serialised. This is a *per-write* exclusive lock on a dedicated
 # write.lock file — entirely separate from the lifetime-held chroma.lock (LOCK_SH)
 # above, which only guards against the offline batch loader (LOCK_EX). Reads take
-# no lock and stay concurrent across processes.
+# no lock. NOTE: lockless concurrent reads across processes is THIS layer's design
+# assumption, NOT a chromadb guarantee — chromadb officially treats multi-process
+# PersistentClient sharing as unsupported. write.lock serialises the one hazard the
+# docs name explicitly (concurrent writers); cross-process reads here are
+# stale-risk (a reader's in-memory HNSW won't see another process's new vectors
+# until reload), not corruption. Robust fix = single chroma server + HttpClient.
 WRITE_TOOLS = {
     "ontology_add_node",
     "ontology_add_edge",

@@ -116,7 +116,7 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 
 > 헤더를 설정할 수 없는 클라이언트는 URL에 토큰을 실어 인증할 수 있다: `"url": "http://<host>:8765/mcp?token=<token>"`. 다만 쿼리 param 토큰은 액세스 로그·프록시·브라우저 히스토리에 평문 노출될 수 있으니 가능하면 헤더 방식을 우선한다.
 
-> 단일 프로세스 chroma 제약상 **uvicorn 단일 워커**로 실행된다(serve가 강제). 무인증 인스턴스는 신뢰망에만 바인드할 것. 인증이 필요한 외부 경로는 토큰을 지정하고 클라이언트는 `Authorization: Bearer <token>` 헤더 또는 `?token=<token>` 쿼리 param으로 인증한다. 토큰이 설정되면 `/mcp`의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz`는 예외).
+> **uvicorn 단일 워커**로 실행된다(serve가 강제). 원래 chroma PersistentClient 단일 프로세스 제약 때문이었고, `VECTOR_BACKEND=sqlite-vec`(SQLite WAL)에서는 하드 제약이 아니나 프로세스별 in-memory BM25/임베딩 유지를 위해 1로 둔다. 무인증 인스턴스는 신뢰망에만 바인드할 것. 인증이 필요한 외부 경로는 토큰을 지정하고 클라이언트는 `Authorization: Bearer <token>` 헤더 또는 `?token=<token>` 쿼리 param으로 인증한다. 토큰이 설정되면 `/mcp`의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz`는 예외).
 
 ---
 
@@ -228,6 +228,39 @@ opencrab serve
 export EMBEDDING_BACKEND=openai
 python backfill_kure.py
 ```
+
+## 벡터 스토어 백엔드 (`VECTOR_BACKEND`)
+
+임베딩 백엔드(`EMBEDDING_BACKEND`)와 **독립된 축**으로, 벡터를 어디에 저장·검색할지 고릅니다.
+
+**`chroma` (기본)**: ChromaDB PersistentClient. 기존 동작 100% 보존.
+
+**`sqlite-vec`**: sqlite-vec(vec0) — 벡터를 graph/doc/sql 과 **같은 SQLite WAL 규율**에 편입해
+Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거합니다. 앱이 KURE EF로 직접 임베딩 후
+`vec0` 테이블에 INSERT하므로 `EMBEDDING_BACKEND=openai`(KURE 1024d)와 함께 씁니다. 벡터 DB는
+`LOCAL_DATA_DIR/vectors.db`. 설계·트레이드오프: `docs/pgvector-migration-plan.md` (A) 경로.
+
+> 특성: pack-scoped 검색은 매우 빠르나(수 ms), 전역(pack 미지정) 검색은 브루트포스라 대규모에서 느립니다
+> (전역 고속화는 §3.7 binary 2단계 양자화 — 후속). 정확도는 exact라 Chroma HNSW보다 높습니다.
+
+**`pgvector`**: 예약(미구현) — `docs/pgvector-migration-plan.md` (B) 경로.
+
+| 환경변수 | 기본값 | 설명 |
+|----------|--------|------|
+| `VECTOR_BACKEND` | `chroma` | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
+| `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
+| `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
+
+```bash
+# Chroma → sqlite-vec 전환 (KURE 벡터를 그대로 1:1 이관)
+python scripts/migrate_chroma_to_sqlite_vec.py      # chroma → vectors.db
+export EMBEDDING_BACKEND=openai VECTOR_BACKEND=sqlite-vec
+opencrab serve
+```
+
+> **무중단 적재(sqlite-vec)**: chroma의 `chroma.lock(LOCK_EX)` 제약이 사라져 **적재 시 게이트웨이/서비스를 중단할 필요가 없다.** 벡터를 포함한 4스토어가 모두 SQLite WAL이라 로더/reingest 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. (chroma 백엔드에서는 기존대로 오프라인 `--fresh` 적재 시 중단 필요.)
+
+**롤백**: `VECTOR_BACKEND=chroma`(또는 미설정) → 기존 Chroma 스택으로 즉시 복귀(비파괴, Chroma 보존).
 
 ---
 
