@@ -163,6 +163,35 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # 벡터 ANN 가속 (VECTOR_ANN 환경변수) — sqlite-vec 백엔드 전용.
+    #
+    # 옵션:
+    #   ""(미설정, 기본) : off. 기존 exact 브루트포스 경로 100% 불변.
+    #   "binary"         : binary 2단계 양자화(§3.7). 전역(pack 미지정) 검색을
+    #                      ① bit 해밍 coarse(부호 1bit 사본, 후보 C개 추림) →
+    #                      ② float cosine rerank 로 답해 179k×1024d 브루트포스
+    #                      p95 ~868ms 를 ~30ms 대로 낮춘다. pack-scoped 검색은
+    #                      partition 사전필터로 이미 ~8ms 라 exact 유지(안전 기본).
+    #
+    # 전제: vec0 테이블에 embedding_bit 컬럼 필요. 신규/빈 DB 는 생성 시 자동 포함,
+    #       기존 DB 는 scripts/migrate_add_binary_quantization.py 로 비파괴 backfill
+    #       (재임베딩 없음 — float 원본의 부호 비트만 파생). 컬럼이 없으면 경고 후
+    #       exact 경로로 자동 폴백(동작은 안전, 가속만 없음).
+    # 설계: docs/pgvector-migration-plan.md §3.7, docs/vector-backends.md.
+    # 롤백: VECTOR_ANN 미설정으로 되돌리면 즉시 exact 경로로 복귀(스키마 원복 불필요
+    #       — bit 컬럼은 남아 있어도 미사용일 뿐이며 쓰기 시 계속 동기 유지됨).
+    # ------------------------------------------------------------------
+    vector_ann: str = Field(
+        default="",
+        alias="VECTOR_ANN",
+        # Literal["", "binary"] — pydantic-settings 호환을 위해 str 사용
+    )
+    # binary 2단계의 coarse 후보 수 C (recall 튜닝 노브). C↑ → exact 근접·느려짐.
+    # recall@10 ≥ 0.95 게이트를 통과하는 최소값을 벤치로 채택(§3.7). vec0 k 상한
+    # (4096)으로 클램프됨.
+    vector_ann_coarse_k: int = Field(default=512, alias="VECTOR_ANN_COARSE_K")
+
+    # ------------------------------------------------------------------
     # MCP server
     # ------------------------------------------------------------------
     mcp_server_name: str = Field(default="opencrab", alias="MCP_SERVER_NAME")

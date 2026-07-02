@@ -30,6 +30,10 @@ dependencies = [
     "neo4j>=5.0",
     "chromadb>=0.5",
     "sqlite-vec>=0.1.9",
+    # numpy: sqlite-vec binary 2단계 양자화(VECTOR_ANN=binary)의 sign-bit 패킹/
+    # hamming coarse(np.bitwise_count는 numpy 2.0+)/int8 rerank. chromadb 전이
+    # 의존성이지만 opencrab가 직접 import 하므로 명시.
+    "numpy>=2.0",
     "pymongo>=4.0",
     "sqlalchemy>=2.0",
     "psycopg2-binary>=2.9",

@@ -116,6 +116,13 @@ def make_vector_store(settings: Settings) -> Any:
                 f"현재 EMBEDDING_BACKEND={settings.embedding_backend!r}. "
                 "KURE EF 로 앱측 임베딩 후 vec0 에 INSERT 하므로 minilm(384d)은 미지원입니다."
             )
+        # VECTOR_ANN 유효성 검증: ""(off, 기본) / "binary"(2단계 양자화, §3.7)만 허용.
+        # 잘못된 값은 막연한 런타임 오류 대신 기동 시 명확한 설정 오류로 안내.
+        if settings.vector_ann not in ("", "binary"):
+            raise ValueError(
+                f"Unknown VECTOR_ANN: {settings.vector_ann!r} "
+                "(유효값: 미설정(off) 또는 'binary')"
+            )
         from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
         db_path = os.path.join(settings.local_data_dir, settings.vector_db_file)
@@ -125,6 +132,8 @@ def make_vector_store(settings: Settings) -> Any:
             embedding_function=ef,
             dim=settings.embed_dim,
             collection_name=settings.vector_collection,
+            ann=settings.vector_ann,
+            ann_coarse_k=settings.vector_ann_coarse_k,
         )
 
     if backend == "pgvector":
