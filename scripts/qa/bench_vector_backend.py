@@ -18,6 +18,23 @@ Notes:
   - The live Chroma dir (~2GB) is copied to --work-dir (default on nvme disk,
     NOT /tmp which is tmpfs) so the running gateway is never touched.
   - Vectors are streamed in batches; only a small query reservoir is held in RAM.
+
+BINARY MODE (--mode binary, docs/pgvector-migration-plan.md §3.7 gate):
+  Measures the binary 2-stage ANN path against exact float brute-force on an
+  ALREADY-MIGRATED vec0 DB (run scripts/migrate_add_binary_quantization.py on a
+  COPY first — this bench is read-only and never migrates/mutates the target;
+  point --src-db at the dev copy, NEVER at the live vectors.db):
+
+  - global exact float p50/p95 (the ~868ms baseline being replaced)
+  - global 2-stage (bit-hamming coarse C + cosine rerank) p50/p95 per C
+  - recall@10 : 2-stage top-10 vs exact float top-10 overlap, per C
+    → the smallest C with recall >= 0.95 is reported as the adopted C
+  - pack isolation leak on the exact partition-filtered path (must stay 0;
+    pack-scoped search keeps the exact path under VECTOR_ANN=binary)
+
+  Usage:
+    python scripts/qa/bench_vector_backend.py --mode binary \
+        --src-db /path/to/vectors-dev.db [--coarse-ks 256,512,1024]
 """
 
 from __future__ import annotations
@@ -53,17 +70,201 @@ def pctl(xs: list[float], p: float) -> float:
     return xs[k]
 
 
+def bench_binary(args: argparse.Namespace) -> int:
+    """§3.7 gate: binary 2-stage (real SqliteVecStore path) vs exact float.
+
+    Protocol (kept cheap — the exact baseline is the expensive part):
+      - exact global top-10 per query is computed ONCE and cached to a JSON
+        file next to --src-db (keyed by db/table/seed/queries); the C sweep
+        reuses it instead of re-running ~1s exact scans per C.
+      - the 2-stage numbers come from the REAL store (SqliteVecStore with
+        ann="binary"), driven via an injected EF that returns the sampled
+        stored vector — i.e. the exact code path serve uses.
+    """
+    import json as _json
+    import sqlite3
+
+    import sqlite_vec
+
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    rng = random.Random(args.seed)
+    if not args.src_db or not os.path.exists(args.src_db):
+        print(f"! --src-db not found: {args.src_db!r} (use a migrated DEV COPY)")
+        return 3
+    coarse_ks = [int(x) for x in args.coarse_ks.split(",") if x.strip()]
+
+    # raw read-only connection for sampling + exact baseline
+    conn = sqlite3.connect(f"file:{args.src_db}?mode=ro", uri=True)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    table = args.table
+
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if "embedding_bit" not in cols:
+        print(f"! table '{table}' has no embedding_bit column — run "
+              "scripts/migrate_add_binary_quantization.py on the copy first.")
+        return 3
+    n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    print(f"# src db  : {args.src_db} (read-only)")
+    print(f"# table   : {table}, rows {n}")
+
+    # ---- query sample: random stored vectors (real-data query proxies) ----
+    ids = [r[0] for r in conn.execute(f"SELECT node_id FROM {table}")]
+    q_ids = rng.sample(ids, min(args.queries, len(ids)))
+    q_blobs = [
+        bytes(conn.execute(
+            f"SELECT embedding FROM {table} WHERE node_id = ?", (qid,)
+        ).fetchone()[0])
+        for qid in q_ids
+    ]
+    print(f"# queries : {len(q_blobs)}")
+
+    # ---- exact float global top-10: computed ONCE, cached to JSON ----
+    cache_path = (f"{args.src_db}.bench_exact_"
+                  f"{table}_{args.seed}_{len(q_ids)}.json")
+    lat_exact: list[float] = []
+    if os.path.exists(cache_path):
+        with open(cache_path) as fh:
+            payload = _json.load(fh)
+        exact_top = payload["exact_top"]
+        lat_exact = payload["lat_ms"]
+        print(f"# exact baseline: reused cache {cache_path}")
+    else:
+        exact_top = []
+        for qid, qblob in zip(q_ids, q_blobs):
+            t = time.perf_counter()
+            rows = conn.execute(
+                f"SELECT node_id FROM {table} WHERE embedding MATCH ?"
+                " AND k = 11 ORDER BY distance",
+                (qblob,),
+            ).fetchall()
+            lat_exact.append((time.perf_counter() - t) * 1000.0)
+            exact_top.append([r[0] for r in rows if r[0] != qid][:10])
+        with open(cache_path, "w") as fh:
+            _json.dump({"exact_top": exact_top, "lat_ms": lat_exact}, fh)
+        print(f"# exact baseline: computed once, cached -> {cache_path}")
+
+    # ---- REAL store, ann=binary, injected EF returns the current vector ----
+    import struct
+
+    class _HolderEF:
+        def __init__(self) -> None:
+            self.vec: list[float] = []
+
+        def __call__(self, texts):  # noqa: ANN001
+            return [self.vec for _ in texts]
+
+    holder = _HolderEF()
+    dim = len(q_blobs[0]) // 4
+    store = SqliteVecStore(
+        db_path=args.src_db,
+        embedding_function=holder,
+        dim=dim,
+        collection_name=table,
+        ann="binary",
+        ann_coarse_k=coarse_ks[0],
+    )
+    if not store.available:
+        print("! store init failed")
+        return 3
+
+    # warm the ANN cache once (build time reported; excluded from latencies)
+    holder.vec = list(struct.unpack(f"{dim}f", q_blobs[0]))
+    t = time.perf_counter()
+    store.query("warm", n_results=1)
+    print(f"# ANN cache build+first query: {time.perf_counter()-t:.1f}s")
+
+    results = []  # (C, recall, p50, p95)
+    for C in coarse_ks:
+        store._ann_coarse_k = C  # QA-only knob; same store/cache reused
+        recalls = []
+        lat = []
+        for qid, qblob, ref in zip(q_ids, q_blobs, exact_top):
+            holder.vec = list(struct.unpack(f"{dim}f", qblob))
+            t = time.perf_counter()
+            hits = store.query("q", n_results=11)
+            lat.append((time.perf_counter() - t) * 1000.0)
+            got = [h["id"] for h in hits if h["id"] != qid][:10]
+            if ref:
+                recalls.append(len(set(ref) & set(got)) / len(ref))
+        results.append((C, statistics.mean(recalls) if recalls else 0.0,
+                        pctl(lat, 50), pctl(lat, 95)))
+        print(f"#   C={C:5d}: recall@10={results[-1][1]:.4f} "
+              f"p50={results[-1][2]:.1f}ms p95={results[-1][3]:.1f}ms")
+
+    # ---- pack isolation leak (exact partition path — unchanged under ANN) ----
+    packs = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT pack_id FROM {table} WHERE pack_id != '' LIMIT 60"
+    )]
+    lat_pack = []
+    leak = 0
+    for i, pk in enumerate(packs):
+        qblob = q_blobs[i % len(q_blobs)]
+        holder.vec = list(struct.unpack(f"{dim}f", qblob))
+        t = time.perf_counter()
+        hits = store.query("q", n_results=10, where={"pack_id": pk})
+        lat_pack.append((time.perf_counter() - t) * 1000.0)
+        leak += sum(1 for h in hits if h["metadata"].get("pack_id") != pk)
+
+    adopted = next((r for r in results if r[1] >= 0.95), None)
+
+    print("\n===== BINARY 2-STAGE BENCH RESULT =====")
+    print(f"corpus vectors          : {n}")
+    print(f"query sample            : {len(q_blobs)}")
+    print(f"global exact p50 / p95  : {pctl(lat_exact,50):.1f} / {pctl(lat_exact,95):.1f} ms  (baseline)")
+    for C, rec, p50, p95 in results:
+        print(f"global 2-stage C={C:5d}  : recall@10={rec:.4f}  p50/p95={p50:.1f}/{p95:.1f} ms")
+    print(f"pack-filter p50 / p95   : {pctl(lat_pack,50):.2f} / {pctl(lat_pack,95):.2f} ms")
+    print(f"pack isolation leak     : {leak}   [gate == 0]")
+    if adopted:
+        print(f"adopted C               : {adopted[0]} "
+              f"(smallest with recall>=0.95; recall={adopted[1]:.4f}, p95={adopted[3]:.1f}ms)")
+    else:
+        print("adopted C               : NONE (no tested C reached recall 0.95 — raise --coarse-ks)")
+
+    gate_recall = adopted is not None
+    gate_p95 = adopted is not None and adopted[3] <= 100.0
+    gate_leak = leak == 0
+    ok = gate_recall and gate_p95 and gate_leak
+    print("\nGATES:",
+          f"recall={'PASS' if gate_recall else 'FAIL'}",
+          f"2stage_p95={'PASS' if gate_p95 else 'FAIL'} [<=100ms]",
+          f"leak={'PASS' if gate_leak else 'FAIL'}")
+    print("OVERALL:", "PASS" if ok else "FAIL")
+    store.close()
+    conn.close()
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["chroma-parity", "binary"],
+                    default="chroma-parity",
+                    help="chroma-parity: original chroma-vs-vec0 gate; "
+                         "binary: §3.7 2-stage ANN gate on a migrated DB copy")
     ap.add_argument("--data-dir", default="/home/asdf/.openclaw/workspace/data/localcrab")
     ap.add_argument("--work-dir", default="/home/asdf/.openclaw/workspace",
                     help="disk-backed dir for temp copy+db (NOT tmpfs /tmp)")
     ap.add_argument("--collection", default=CHROMA_COLLECTION)
-    ap.add_argument("--queries", type=int, default=200)
+    ap.add_argument("--queries", type=int, default=200,
+                    help="(binary mode uses --queries too; 100 is enough)")
     ap.add_argument("--sample", type=int, default=0, help="corpus cap (0 = all)")
     ap.add_argument("--batch", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=1234)
+    # binary-mode options
+    ap.add_argument("--src-db", default=None,
+                    help="[binary] migrated vec0 DB COPY (read-only; never the live db)")
+    ap.add_argument("--table", default="vectors_kure",
+                    help="[binary] vec0 table name")
+    ap.add_argument("--coarse-ks", default="256,512,1024",
+                    help="[binary] comma-separated coarse candidate counts C to sweep")
     args = ap.parse_args()
+
+    if args.mode == "binary":
+        return bench_binary(args)
+
     rng = random.Random(args.seed)
 
     import chromadb
