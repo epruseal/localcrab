@@ -118,7 +118,8 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 - **`openai` (기본)**: OpenAI 호환 `/v1/embeddings` 서버(LM Studio·Ollama·vLLM·실제
   OpenAI 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction`
   구조. primary 서버가 죽으면 15초 TTL로 GGUF 폴백에 자동 전환하고 복구 후 자동 복귀한다.
-  GGUF 폴백은 KURE-v1-Q4_K_M(약 438MB)을 최초 실행 시 HuggingFace에서 자동 다운로드하며,
+  GGUF 폴백은 KURE-v1-Q8_0(약 635MB, 품질 우선 — Q4_K_M은 `LOCAL_GGUF_PATH`로 지정
+  가능한 저사양 대안)을 최초 실행 시 HuggingFace에서 자동 다운로드하며,
   `pip install "opencrab[gguf]"`로 `llama-cpp-python`을 설치해야 동작한다. 즉 외부 서버
   없이도 완전 로컬로 동작 가능하다. 한국어 검색 품질 실측: KURE-v1 MRR 1.000 (top-1 5/5)
   vs minilm MRR 0.285 (top-1 0/5).
@@ -170,7 +171,7 @@ opencrab serve
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버+GGUF 폴백, `local` = minilm |
-| `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소 |
+| `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소. 콤마로 여러 URL 을 나열하면 순서대로 시도하는 체인이 된다(예: `http://a:1234/v1,http://b:1234/v1`) — 첫 서버 장애 시 다음 서버, 전부 장애 시 GGUF 폴백. 단일 URL 이면 기존과 동일 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 임베딩 모델 id |
 | `EMBED_DIM` | `1024` | 임베딩 차원(모델에 맞게 설정) |
 | `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 GGUF 폴백 경로 |

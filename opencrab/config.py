@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     # 대안: openai 패키지 미설치라 httpx 직접 호출 방식 채택.
     # 기본값은 LM Studio 로컬 기본 포트. 원격 서버는 OPENAI_API_BASE 로 지정.
     # 서버 미가동이어도 로컬 GGUF 폴백(ResilientEmbeddingFunction)으로 동작한다.
+    #
+    # 다중 원격 지원(변경 이유): 원격 GPU 서버가 1대뿐이면 재부팅/점검 중
+    # GGUF 폴백(CPU, 느림)으로 떨어진다. 콤마로 여러 URL 을 나열하면
+    # ResilientEmbeddingFunction 이 순서대로 시도해 GGUF 로 내려가기 전에
+    # 다른 원격 서버를 우선 시도한다. 환경변수 이름은 그대로 두어(하위호환)
+    # 단일 URL 만 넣는 기존 배포는 동작 변화가 없다.
+    # 예: OPENAI_API_BASE="http://embed-host-1:1234/v1,http://embed-host-2:1234/v1"
     openai_api_base: str = Field(
         default="http://localhost:1234/v1",
         alias="OPENAI_API_BASE",
@@ -123,7 +130,7 @@ class Settings(BaseSettings):
     )
 
     # 로컬 GGUF 경로 (EMBEDDING_BACKEND=openai 시 폴백용).
-    # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q4_K_M, ~438MB).
+    # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q8_0, ~635MB).
     # 다른 모델을 쓰려면 LOCAL_GGUF_PATH 로 직접 경로 지정.
     local_gguf_path: str = Field(default="", alias="LOCAL_GGUF_PATH")
 
@@ -190,6 +197,16 @@ class Settings(BaseSettings):
     @property
     def is_local(self) -> bool:
         return self.storage_mode in ("local", "kuzu")
+
+    @property
+    def openai_api_bases(self) -> list[str]:
+        """openai_api_base 를 콤마 기준으로 split 한 리스트.
+
+        예: "http://a:1234/v1, http://b:1234/v1" -> ["http://a:1234/v1", "http://b:1234/v1"]
+        각 항목 strip, 빈 항목(연속 콤마·trailing 콤마 등) 제거. 단일 URL(콤마 없음)이면
+        길이 1 리스트 — 기존 단일 엔드포인트 동작과 100% 동일하다.
+        """
+        return [b.strip() for b in self.openai_api_base.split(",") if b.strip()]
 
     @property
     def vector_backend_resolved(self) -> str:

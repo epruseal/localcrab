@@ -66,29 +66,39 @@ def make_graph_store(settings: Settings) -> Any:
 
 
 def _make_kure_embedding_function(settings: Settings) -> Any:
-    """Assemble the KURE embedding function (primary=OpenAI 호환 서버 / fallback=
-    로컬 GGUF). 공유 헬퍼 — Chroma(openai 분기)·sqlite-vec·(추후 pgvector)가 동일
-    임베딩 경로를 재사용한다. 임베딩은 벡터 스토어 백엔드와 무관하게 동일하다.
+    """Assemble the KURE embedding function (primary=OpenAI 호환 서버(들) /
+    fallback=로컬 GGUF). 공유 헬퍼 — Chroma(openai 분기)·sqlite-vec·(추후
+    pgvector)가 동일 임베딩 경로를 재사용한다. 임베딩은 벡터 스토어 백엔드와
+    무관하게 동일하다.
+
+    settings.openai_api_bases 가 콤마로 여러 URL 을 담고 있으면 엔드포인트별로
+    OpenAIEmbeddingFunction 을 하나씩 만들어 리스트로 ResilientEmbeddingFunction
+    에 전달한다 — 순서대로 시도되는 체인(첫 URL 이 죽어도 다음 URL 을 우선
+    시도한 뒤에야 GGUF 폴백으로 내려간다). 단일 URL(기본값)이면 리스트 길이 1
+    이라 기존 동작과 동일하다.
 
     local_gguf_path 가 비어있으면 llamacpp_embedding._ensure_local_gguf() 가
-    KURE-v1-Q4_K_M 을 자동 다운로드. LM Studio 장애 시 폴백으로 사용됨.
+    KURE-v1-Q8_0 을 자동 다운로드. 모든 원격이 장애일 때 폴백으로 사용됨.
     """
     from opencrab.stores.openai_embedding import OpenAIEmbeddingFunction
     from opencrab.stores.llamacpp_embedding import LlamaCppEmbeddingFunction
     from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
 
-    primary_ef = OpenAIEmbeddingFunction(
-        api_base=settings.openai_api_base,
-        model=settings.openai_embed_model,
-        dim=settings.embed_dim,
-        timeout=settings.openai_timeout,
-        api_key=settings.openai_api_key,
-    )
+    primary_efs = [
+        OpenAIEmbeddingFunction(
+            api_base=api_base,
+            model=settings.openai_embed_model,
+            dim=settings.embed_dim,
+            timeout=settings.openai_timeout,
+            api_key=settings.openai_api_key,
+        )
+        for api_base in settings.openai_api_bases
+    ]
     fallback_ef = LlamaCppEmbeddingFunction(
         gguf_path=settings.local_gguf_path,
         dim=settings.embed_dim,
     )
-    return ResilientEmbeddingFunction(primary=primary_ef, fallback=fallback_ef)
+    return ResilientEmbeddingFunction(primary=primary_efs, fallback=fallback_ef)
 
 
 def make_vector_store(settings: Settings) -> Any:
