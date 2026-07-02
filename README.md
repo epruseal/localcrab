@@ -44,11 +44,13 @@ opencrab serve
 
 **로컬 모드 스토어 구성:**
 
+> **갱신(2026-07-02)**: 아래 표는 소프트웨어 기본값(`VECTOR_BACKEND=chroma`)을 보여줍니다. 이 머신의 현행 배포는 `VECTOR_BACKEND=sqlite-vec`(2026-07-01 라이브)로 전환되어, 벡터 백엔드가 `chroma/`가 아닌 `vectors.db`(SQLite vec0)입니다. 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend).
+
 | 역할 | 백엔드 | 파일 (`LOCAL_DATA_DIR` 기준) |
 |------|--------|------------------------------|
 | 그래프 | `LocalGraphStore` (SQLite BFS) | `graph.db` |
 | 문서 | `LocalSQLDocStore` (SQLite) | `doc_store.db` |
-| 벡터 | ChromaStore (PersistentClient) | `chroma/` |
+| 벡터 | ChromaStore (기본값) / **sqlite-vec(현행 배포)** | `chroma/` / **`vectors.db`** |
 | SQL | SQLStore (SQLite) | `opencrab.db` |
 
 아키텍처 상세는 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) 참고.
