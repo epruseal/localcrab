@@ -427,8 +427,12 @@ make_vector_store(settings)
 - `sqlite-vec`(로컬 모드 기본): `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`). 벡터를 graph/doc/sql 과 같은
   SQLite WAL 규율에 편입 → Chroma 다중프로세스 쓰기 제약/flock 층 제거. 임베딩은 KURE 공유 헬퍼
   `_make_kure_embedding_function` 로 앱측 계산 후 INSERT. `EMBEDDING_BACKEND=local`과 조합 시 ValueError.
+  검색 경로는 이원화: pack-scoped 는 partition key exact KNN(~8ms), 전역(pack 미지정)은 기본 exact
+  브루트포스이며 `VECTOR_ANN=binary` 옵트인 시 **binary 2단계 ANN**(bit hamming coarse
+  `VECTOR_ANN_COARSE_K`개 → float cosine rerank)으로 가속(기본 off, 기존 경로 불변; 기존 DB 는
+  `scripts/migrate_add_binary_quantization.py` 로 bit 컬럼 backfill).
   전환: `scripts/migrate_chroma_to_sqlite_vec.py`, 설계·성능(전역 브루트포스·binary 2단계):
-  `docs/pgvector-migration-plan.md` (A) §3.6/§3.7.
+  `docs/pgvector-migration-plan.md` (A) §3.6/§3.7, `docs/vector-backends.md` §4.1.
 - `chroma`(docker 모드 기본 / local+minilm 조합 기본): `ChromaStore` (위 그림 그대로).
 - `pgvector`: 예약(미구현).
 
