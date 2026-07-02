@@ -45,8 +45,13 @@ class MockEF:
         return [x / norm for x in vals]
 
 
-def build_vector_store(backend: str, tmp_path: Any, dim: int = 32) -> Any:
-    """Construct a vector store for the given backend with the shared MockEF."""
+def build_vector_store(
+    backend: str, tmp_path: Any, dim: int = 32, **kwargs: Any
+) -> Any:
+    """Construct a vector store for the given backend with the shared MockEF.
+
+    Extra kwargs are forwarded to the store constructor (e.g. ``ann="binary"``,
+    ``ann_coarse_k=...`` for SqliteVecStore's §3.7 2-stage path)."""
     ef = MockEF(dim)
     if backend == "chroma":
         from opencrab.stores.chroma_store import ChromaStore
@@ -58,6 +63,7 @@ def build_vector_store(backend: str, tmp_path: Any, dim: int = 32) -> Any:
             local_mode=True,
             local_path=str(tmp_path / "chroma"),
             embedding_function=ef,
+            **kwargs,
         )
     if backend == "sqlite-vec":
         from opencrab.stores.sqlite_vec_store import SqliteVecStore
@@ -67,5 +73,6 @@ def build_vector_store(backend: str, tmp_path: Any, dim: int = 32) -> Any:
             embedding_function=ef,
             dim=dim,
             collection_name="vtest",
+            **kwargs,
         )
     raise ValueError(f"unknown backend {backend!r}")
