@@ -73,6 +73,12 @@ class OpenAIEmbeddingFunction:
         self._batch = batch
         self._api_key = api_key or None
 
+    @property
+    def api_base(self) -> str:
+        """호출 대상 엔드포인트. ResilientEmbeddingFunction 이 다중 primary
+        로그 메시지에서 어느 엔드포인트인지 식별하는 데 사용."""
+        return self._api_base
+
     # ------------------------------------------------------------------
     # ChromaDB EmbeddingFunction 프로토콜
     # ------------------------------------------------------------------

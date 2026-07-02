@@ -401,7 +401,7 @@ Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지�
 ## 8. 임베딩 백엔드 (EMBEDDING_BACKEND)
 
 `EMBEDDING_BACKEND` 환경변수로 전환:
-- `openai` (기본): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`. primary(원격 서버) 실패 시 로컬 GGUF로 자동 폴백(438MB, 자동 다운로드, `pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요) — 외부 서버 없이도 완전 로컬 동작 가능.
+- `openai` (기본): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`. primary(원격 서버) 실패 시 로컬 GGUF로 자동 폴백(KURE-v1-Q8_0, ~635MB, 자동 다운로드, `pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요; 저사양은 `LOCAL_GGUF_PATH`로 Q4_K_M 지정 가능) — 외부 서버 없이도 완전 로컬 동작 가능.
   - **경량 대안(CPU 부담 시)**: [`BM-K/KoSimCSE-roberta`](https://huggingface.co/BM-K/KoSimCSE-roberta) (RoBERTa-base, ~110M, 768d) — KURE보다 가볍지만 한국어 전용·품질 다소 낮음. OpenAI 호환 서버(HF TEI 등)에 서빙 + `EMBED_DIM=768` + 별도 `EMBED_COLLECTION`이면 코드 수정 없이 사용(전량 재색인). 로컬 GGUF 폴백은 GGUF 빌드 필요해 기본 미적용.
   - **한 컬렉션 = 한 모델**: 모델·차원을 바꾸면 새 `EMBED_COLLECTION` + 전량 재색인 필요. 서로 다른 모델 벡터를 한 컬렉션에 섞지 말 것. primary/fallback도 동일 모델·차원이어야 함.
 - `local` (롤백 옵션): ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d). 컬렉션: `opencrab_vectors`. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮다. `VECTOR_BACKEND=sqlite-vec`와는 조합 불가(기동 시 ValueError) — sqlite-vec를 쓰려면 `EMBEDDING_BACKEND=openai`가 필요.
@@ -411,12 +411,21 @@ Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지�
 make_vector_store(settings)
   └─ EMBEDDING_BACKEND=openai
        └─ ChromaStore("opencrab_vectors_kure", ef=ResilientEmbeddingFunction)
-            ├─ primary: OpenAIEmbeddingFunction (GPU, http://<server-host>:1234)
+            ├─ primary[0]: OpenAIEmbeddingFunction (GPU, http://embed-host-1:1234/v1)
+            ├─ primary[1]: OpenAIEmbeddingFunction (GPU, http://embed-host-2:1234/v1)  ← 선택
+            ├─ ...                                    (OPENAI_API_BASE 콤마 구분 순서)
             └─ fallback: LlamaCppEmbeddingFunction (RPi5 CPU, 로컬 GGUF Q8_0)
 ```
 
 - **단일 컬렉션**: 적재·검색·폴백 모두 동일 KURE-v1 가중치(Q8_0) → 벡터 완전 호환.
-- **자동 폴백**: LM Studio 장애 시 로컬 GGUF로 15초 TTL 전환, 복구 후 자동 복귀.
+- **다중 엔드포인트 순차 체인**: `OPENAI_API_BASE`에 콤마로 여러 URL을 지정하면 primary가
+  리스트가 되어 순서대로 시도된다. 첫 원격이 죽어도 GGUF(CPU, 느림)로 내려가기 전에 다음
+  원격을 우선 시도. 단일 URL이면 길이 1 체인으로 기존 동작과 100% 동일. 모든 엔드포인트는
+  동일 모델(KURE-v1)을 서빙한다고 가정한다(`name()`은 첫 primary 기준 → 컬렉션 재사용 보장).
+- **자동 폴백 + 엔드포인트별 독립 TTL**: 각 primary는 실패 시 15초(health_ttl) 동안 개별적으로
+  건너뛴다 — 죽어 있는 엔드포인트 하나가 다음 엔드포인트 시도까지 지연시키지 않는다. 모든
+  primary가 실패/unhealthy면 로컬 GGUF 폴백. 복구 후 TTL 만료 시 자동 복귀(`force_check()`로
+  즉시 해제 가능).
 - **GGUF 자동 다운로드**: `LOCAL_GGUF_PATH` 미설정·파일 없으면 HuggingFace에서 자동 다운로드.
 - **컬렉션 분리**: minilm(384d)과 KURE(1024d)는 차원이 달라 별도 컬렉션 유지. 롤백 즉시 가능.
 
@@ -441,7 +450,7 @@ make_vector_store(settings)
 관련 파일:
 - `opencrab/stores/openai_embedding.py` — OpenAI 호환 임베딩 EF
 - `opencrab/stores/llamacpp_embedding.py` — 로컬 GGUF EF (자동 다운로드 포함)
-- `opencrab/stores/resilient_embedding.py` — 폴백 자동 전환 래퍼
+- `opencrab/stores/resilient_embedding.py` — 다중 primary 순차 체인 + 폴백 자동 전환 래퍼
 - `opencrab/stores/factory.py` — `make_vector_store` 백엔드 분기 (VECTOR_BACKEND × EMBEDDING_BACKEND)
 - `opencrab/stores/sqlite_vec_store.py` — sqlite-vec(vec0) 벡터 스토어
 - `opencrab/config.py` — `vector_backend`/`vector_db_file`/`vector_collection`, `embedding_backend`, `openai_*`, `local_gguf_path` 등

@@ -6,14 +6,17 @@
     라즈베리파이 CPU에서 로컬 GGUF 를 폴백으로 운용.
 
 기본 모델(자동 다운로드):
-  - KURE-v1-Q4_K_M (mykor/KURE-v1-gguf, 438MB)
-  - Q4_K_M 선택: Q8_0(600MB, ~0.7s) 대비 크기·속도 개선, 품질 손실 ~2%.
-  - 다른 모델을 쓰려면 LOCAL_GGUF_PATH 환경변수로 직접 경로 지정.
+  - KURE-v1-Q8_0 (mykor/KURE-v1-gguf, ~635MB)
+  - Q8_0 선택(변경 이유): 폴백이라도 primary(GPU FP16)와 최대한 동일한 검색
+    품질을 유지하기 위해 품질 우선. Q4_K_M(438MB, ~0.45s/건) 대비 크기 +197MB,
+    속도 ~0.7s/건으로 느리지만 품질 손실이 거의 없다(벡터 일치도 cosine ~0.9999).
+  - 저사양/저장공간 제약 환경은 LOCAL_GGUF_PATH 로 Q4_K_M 등 다른 양자화를
+    직접 지정하는 대안이 남아 있다(동일 모델·차원이므로 컬렉션 호환).
 
 대안:
   - 더 빠른 소형 모델(e5-small 등): 384d라 EMBED_COLLECTION 과 차원 불일치.
     같은 컬렉션을 재사용하려면 primary 와 동일 모델·차원 필요.
-  - CPU 속도: RPi5 Cortex-A76×4 NEON, Q4_K_M ~0.45s/건.
+  - CPU 속도: RPi5 Cortex-A76×4 NEON, Q8_0 ~0.7s/건 (Q4_K_M ~0.45s/건).
     폴백은 LM Studio 장애 시에만 발동되므로 허용.
 
 롤백:
@@ -131,10 +134,11 @@ class LlamaCppEmbeddingFunction:
 
 _DEFAULT_GGUF_DIR = "/home/asdf/models"
 _HF_REPO = "mykor/KURE-v1-gguf"
-_HF_FILENAME = "KURE-v1-Q4_K_M.gguf"
-# Q4_K_M 선택 이유: Q8_0(600MB, ~0.7s/건) 대비 크기 438MB·속도 ~0.45s/건.
-# 폴백은 LM Studio 장애 시 비상용이라 약간의 품질 손실(~2%) 감수.
-# LOCAL_GGUF_PATH 로 Q8_0 등 다른 양자화를 직접 지정할 수도 있음.
+_HF_FILENAME = "KURE-v1-Q8_0.gguf"
+# Q8_0 선택 이유(품질 우선): primary(GPU)와 거의 동일한 검색 품질 유지
+# (벡터 일치도 cosine ~0.9999). 크기 ~635MB·속도 ~0.7s/건으로
+# Q4_K_M(438MB, ~0.45s/건)보다 무겁지만 폴백 품질 저하를 없앤다.
+# 저사양 환경은 LOCAL_GGUF_PATH 로 Q4_K_M 등 다른 양자화를 직접 지정 가능.
 
 
 def _ensure_local_gguf(requested_path: str) -> str:
