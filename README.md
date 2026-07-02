@@ -173,7 +173,7 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 
 두 가지 임베딩 백엔드를 지원합니다.
 
-**`openai` (기본)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction` 구조입니다. KURE-v1(한국어 특화, 1024d)이 기본 모델입니다. GGUF 폴백은 438MB 파일을 자동 다운로드하며, 외부 서버 없이도 완전 로컬로 동작할 수 있습니다(`pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요).
+**`openai` (기본)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction` 구조입니다. KURE-v1(한국어 특화, 1024d)이 기본 모델입니다. GGUF 폴백은 KURE-v1-Q8_0(약 635MB, 품질 우선)을 자동 다운로드하며, 외부 서버 없이도 완전 로컬로 동작할 수 있습니다(`pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요). 저사양 환경은 `LOCAL_GGUF_PATH`로 Q4_K_M(438MB) 등 다른 양자화를 지정할 수 있습니다.
 
 **`local` (롤백 옵션)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮습니다.
 

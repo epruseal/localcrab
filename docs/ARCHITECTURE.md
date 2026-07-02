@@ -401,7 +401,7 @@ Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지�
 ## 8. 임베딩 백엔드 (EMBEDDING_BACKEND)
 
 `EMBEDDING_BACKEND` 환경변수로 전환:
-- `openai` (기본): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`. primary(원격 서버) 실패 시 로컬 GGUF로 자동 폴백(438MB, 자동 다운로드, `pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요) — 외부 서버 없이도 완전 로컬 동작 가능.
+- `openai` (기본): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`. primary(원격 서버) 실패 시 로컬 GGUF로 자동 폴백(KURE-v1-Q8_0, ~635MB, 자동 다운로드, `pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요; 저사양은 `LOCAL_GGUF_PATH`로 Q4_K_M 지정 가능) — 외부 서버 없이도 완전 로컬 동작 가능.
   - **경량 대안(CPU 부담 시)**: [`BM-K/KoSimCSE-roberta`](https://huggingface.co/BM-K/KoSimCSE-roberta) (RoBERTa-base, ~110M, 768d) — KURE보다 가볍지만 한국어 전용·품질 다소 낮음. OpenAI 호환 서버(HF TEI 등)에 서빙 + `EMBED_DIM=768` + 별도 `EMBED_COLLECTION`이면 코드 수정 없이 사용(전량 재색인). 로컬 GGUF 폴백은 GGUF 빌드 필요해 기본 미적용.
   - **한 컬렉션 = 한 모델**: 모델·차원을 바꾸면 새 `EMBED_COLLECTION` + 전량 재색인 필요. 서로 다른 모델 벡터를 한 컬렉션에 섞지 말 것. primary/fallback도 동일 모델·차원이어야 함.
 - `local` (롤백 옵션): ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d). 컬렉션: `opencrab_vectors`. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮다. `VECTOR_BACKEND=sqlite-vec`와는 조합 불가(기동 시 ValueError) — sqlite-vec를 쓰려면 `EMBEDDING_BACKEND=openai`가 필요.

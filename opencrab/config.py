@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     )
 
     # 로컬 GGUF 경로 (EMBEDDING_BACKEND=openai 시 폴백용).
-    # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q4_K_M, ~438MB).
+    # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q8_0, ~635MB).
     # 다른 모델을 쓰려면 LOCAL_GGUF_PATH 로 직접 경로 지정.
     local_gguf_path: str = Field(default="", alias="LOCAL_GGUF_PATH")
 
