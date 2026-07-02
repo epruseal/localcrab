@@ -205,7 +205,7 @@ CPU 자원이 부족하면 한국어 경량 임베딩 [`BM-K/KoSimCSE-roberta`](
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버(+GGUF 폴백), `local` = minilm(롤백) |
-| `OPENAI_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
+| `OPENAI_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소. 콤마 구분으로 여러 URL 지정 시 순서대로 시도하는 체인(첫 서버 장애 → 다음 서버 → 전부 장애 시 GGUF 폴백) |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
 | `OPENAI_API_KEY` | _(없음)_ | 인증 필요 서버 사용 시 Bearer 토큰. 무인증 서버는 미설정 |
 | `EMBED_DIM` | `1024` | 임베딩 차원 (모델에 맞게 설정) |
@@ -218,6 +218,16 @@ export EMBEDDING_BACKEND=openai
 export OPENAI_API_BASE=http://<server-host>:1234/v1
 export OPENAI_EMBED_MODEL=text-embedding-kure-v1
 opencrab serve
+```
+
+**다중 원격 엔드포인트(장애 대비)**: `OPENAI_API_BASE`에 콤마로 여러 URL을 나열하면
+순서대로 시도된다. 첫 서버가 죽어도 GGUF(CPU) 폴백으로 내려가기 전에 다음 서버를
+우선 시도한다. 각 엔드포인트는 독립적으로 헬스 TTL을 추적하므로, 죽어 있는 서버
+하나가 매 요청마다 지연을 만들지 않는다. 모든 엔드포인트가 동일 모델(KURE-v1)을
+서빙한다고 가정한다(컬렉션 재사용 보장).
+
+```bash
+export OPENAI_API_BASE="http://embed-host-1:1234/v1,http://embed-host-2:1234/v1"
 ```
 
 **롤백**: `EMBEDDING_BACKEND=local` → minilm 컬렉션으로 즉시 복귀(단, `VECTOR_BACKEND=sqlite-vec`와는 조합 불가 — 아래 [벡터 스토어 백엔드](#벡터-스토어-백엔드-vector_backend) 참고).

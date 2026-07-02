@@ -170,7 +170,7 @@ opencrab serve
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버+GGUF 폴백, `local` = minilm |
-| `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소 |
+| `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소. 콤마로 여러 URL 을 나열하면 순서대로 시도하는 체인이 된다(예: `http://a:1234/v1,http://b:1234/v1`) — 첫 서버 장애 시 다음 서버, 전부 장애 시 GGUF 폴백. 단일 URL 이면 기존과 동일 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 임베딩 모델 id |
 | `EMBED_DIM` | `1024` | 임베딩 차원(모델에 맞게 설정) |
 | `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 GGUF 폴백 경로 |
