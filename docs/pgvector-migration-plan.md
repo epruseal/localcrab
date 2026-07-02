@@ -12,9 +12,14 @@
 
 ---
 
-## 0. 현황 요약 (코드 기준 정확 인용)
+## 0. 현황 요약 (코드 기준 정확 인용, 본 설계 착수 시점의 baseline)
 
-로컬 모드(`STORAGE_MODE=local`, `Settings.is_local == True`)의 4개 스토어:
+> 아래는 (A) sqlite-vec 경로가 채택되기 **전** baseline이다. 이 baseline에서 관찰된 "약한 고리 = Chroma 하나"라는
+> 사실이 §1의 동기와 §2의 (A)/(B) 두 경로를 도출한다. 현재는 로컬 모드에서 `VECTOR_BACKEND` 미설정 시
+> `EMBEDDING_BACKEND=openai`(기본) 조합이면 (A) sqlite-vec가 기본으로 선택된다 — 상세: README
+> [벡터 스토어 백엔드](../README.md#벡터-스토어-백엔드-vector_backend), `docs/vector-backends.md`.
+
+로컬 모드(`STORAGE_MODE=local`, `Settings.is_local == True`)의 4개 스토어(baseline, sqlite-vec 도입 전):
 
 | 역할 | 구현 클래스 | 백엔드(로컬) | 동시 쓰기 |
 |------|-------------|--------------|-----------|
@@ -23,9 +28,9 @@
 | sql | `SQLStore` (`opencrab/stores/sql_store.py`) | SQLite `opencrab.db` | SQLite WAL |
 | vector | `ChromaStore` (`opencrab/stores/chroma_store.py`) | Chroma `PersistentClient` | **단일 프로세스만** |
 
-핵심 사실:
+핵심 사실(baseline 당시):
 
-- **벡터 백엔드는 항상 Chroma다.** 로컬은 `PersistentClient`(`local_mode=True`), docker는 `HttpClient`. `make_vector_store` 가 두 경우 모두 `ChromaStore` 를 반환한다.
+- **벡터 백엔드는 이 baseline 시점에는 항상 Chroma였다.** 로컬은 `PersistentClient`(`local_mode=True`), docker는 `HttpClient`. `make_vector_store` 가 두 경우 모두 `ChromaStore` 를 반환했다. (A) 채택 후 로컬 모드 기본은 sqlite-vec로 바뀌었다 — docker 모드는 여전히 `ChromaStore`(HttpClient).
 - **`SQLStore` 는 이미 PostgreSQL을 지원한다.** `__init__(url)`(`sql_store.py:142`) 에서 `url.startswith("sqlite")` 로 분기하며 SERIAL/TIMESTAMPTZ DDL(`_TABLES_SQL:20-79` — `ontology_nodes`/`ontology_edges`/`impact_records`/`lever_simulations`/`rebac_policies`)과 SQLite DDL(`_TABLES_SQL_SQLITE`)을 모두 갖고 있다. 설정값은 `config.py` 의 `postgres_url`(alias `POSTGRES_URL`, 기본 `postgresql://opencrab:opencrab@localhost:5432/opencrab`). 현재 `make_sql_store` 는 `settings.sqlite_url if settings.is_local else settings.postgres_url` 로 로컬에서 SQLite를 강제한다.
   - **드라이버 정정:** `SQLStore` 는 psycopg 를 직접 쓰지 않고 **SQLAlchemy `create_engine(url)`**(`sql_store.py:155-161`) 위에서 동작하며 `engine.begin()` 으로 트랜잭션을 연다. 따라서 신규 PG 스토어(vector/doc/graph)를 **같은 SQLAlchemy 엔진 인스턴스를 주입**받게 설계하면 4개 스토어가 **단일 커넥션 풀**을 공유한다 — 이것이 "단일 DB" 의 가장 깔끔한 실현이다(아래 §3·§5).
 - **임베딩은 ChromaStore가 자동 수행한다.** `ChromaStore` 는 컬렉션 생성 시 `embedding_function=self._embedding_function` 를 받고, `add_texts`/`upsert_texts`/`query` 는 **벡터가 아닌 텍스트**를 그대로 넘긴다(`self._collection.add(documents=texts, ...)`, `query_texts=[query_text]`). 즉 임베딩 계산은 Chroma 내부에서 일어난다.
@@ -36,7 +41,7 @@
 - **⇒ 단일규율 달성 경로가 둘이다(본 문서의 핵심 프레임).** 약한 고리는 Chroma **하나뿐**이고 graph/doc/sql 3스토어는 **이미 SQLite WAL**이다. 따라서 "한 규율로 통일"하는 길은:
   - **(A) 아래로 통합 = SQLite 단일**: Chroma → **sqlite-vec**(vec0 가상테이블) 교체 → 4스토어 전부 SQLite WAL. `LocalSQLDocStore` 가 이미 확립한 스레드-로컬 커넥션 + write 락 + WAL 규율을 그대로 재사용. **신규 인프라 0**, graph/doc/sql/FTS5 무변경.
   - **(B) 위로 통합 = Postgres 단일**: 전 스토어를 PG/pgvector 로. **MVCC 다중 라이터**. Postgres 데몬 + graph 재구현(AGE/CTE).
-  - 본 문서는 이 둘을 §1~§13 전반에서 **병렬**로 다루고, **§9 힌지**로 최종 선택한다. sqlite-vec 는 **임베딩 백엔드가 아니라 벡터 스토어 백엔드**(설정 축 = `STORE_BACKEND`, 임베딩은 KURE 유지)임에 유의.
+  - 본 문서는 이 둘을 §1~§13 전반에서 **병렬**로 다루고, **§9 힌지**로 최종 선택한다. sqlite-vec 는 **임베딩 백엔드가 아니라 벡터 스토어 백엔드**(설정 축 = `VECTOR_BACKEND`, 임베딩은 KURE 유지)임에 유의.
 
 ---
 
@@ -76,7 +81,7 @@
 | 임베딩 백엔드 | local(minilm 384d)+openai(KURE 1024d) 병존 | **KURE(1024d) 단일**, minilm 은 롤백용 Chroma 잔존 | **KURE(1024d) 단일**, minilm 은 롤백용 Chroma 잔존 |
 | 재임베딩 | — | **1회 필수**(Chroma 내부벡터 이전 불가) | **1회 필수**(동일) |
 | 코드 변경량 | — | 신규 `SqliteVecStore` 1개 + factory 분기 + 재임베딩. **doc/sql/graph/FTS 무변경** | 신규 `PgVectorStore`/`PgDocStore`(+graph 옵션), factory 분기, 공유 엔진 배선, 재임베딩 |
-| 롤백 난이도 | — | 낮음(Chroma 보존 + `STORE_BACKEND` 되돌림) | 낮음(Chroma 보존 + `STORE_BACKEND` 되돌림) |
+| 롤백 난이도 | — | 낮음(Chroma 보존 + `VECTOR_BACKEND` 되돌림) | 낮음(Chroma 보존 + `VECTOR_BACKEND` 되돌림) |
 
 ### 2.1 의사결정 매트릭스
 
@@ -99,7 +104,7 @@
 (A) `SqliteVecStore` 와 (B) `PgVectorStore` 는 **다음 두 가지를 동일하게** 따른다. 아래 §3.1~§3.5 는 (B) 전용 상세이나, **§3.1 인터페이스와 §3.2 앱측 임베딩·§3.4 폴백 가드는 (A)에도 1:1 그대로 적용**된다(§3.6 참조).
 
 - **인터페이스 1:1(§3.1).** 둘 다 `ChromaStore` 의 공개 메서드를 시그니처·반환·가드까지 동일 재현 → 호출부(`builder.py:147-166`, `query.py:620-667`)가 백엔드를 모른다.
-- **앱측 임베딩(§3.2).** Chroma 는 텍스트를 받아 내부 임베딩했지만, sqlite-vec/pgvector 는 **원시 벡터를 저장**하므로 앱이 `ResilientEmbeddingFunction`(KURE, `__call__(list[str])->list[list[float]]`)으로 **직접 계산 후 INSERT** 한다. 임베딩 경로는 **스토어와 무관하게 동일**하고, 바뀌는 것은 저장/검색 백엔드뿐이다. 설정 축은 `EMBEDDING_BACKEND`(임베딩)가 아니라 **`STORE_BACKEND`(벡터 스토어)** 다.
+- **앱측 임베딩(§3.2).** Chroma 는 텍스트를 받아 내부 임베딩했지만, sqlite-vec/pgvector 는 **원시 벡터를 저장**하므로 앱이 `ResilientEmbeddingFunction`(KURE, `__call__(list[str])->list[list[float]]`)으로 **직접 계산 후 INSERT** 한다. 임베딩 경로는 **스토어와 무관하게 동일**하고, 바뀌는 것은 저장/검색 백엔드뿐이다. 설정 축은 `EMBEDDING_BACKEND`(임베딩)가 아니라 **`VECTOR_BACKEND`(벡터 스토어)** 다.
 
 > **§3.1~§3.5 는 (B) PgVectorStore 상세.** (A) SqliteVecStore 상세는 **§3.6**.
 
@@ -262,7 +267,7 @@ CREATE VIRTUAL TABLE vectors_kure USING vec0(
 
 > **(B) PG-unified 한정.** (A) SQLite-unified 에서는 doc/sql 이 SQLite 그대로라 이 절 전체가 불필요하다(벡터만 교체).
 
-- **sql**: `make_sql_store`(`factory.py:162-167`) 가 로컬에서 `settings.sqlite_url` 을 쓰는 분기를, 신규 플래그(`STORE_BACKEND=pgvector`)로 분기. `SQLStore(url=settings.postgres_url)` 만으로 동작(Postgres DDL 이미 보유).
+- **sql**: `make_sql_store`(`factory.py:162-167`) 가 로컬에서 `settings.sqlite_url` 을 쓰는 분기를, 신규 플래그(`VECTOR_BACKEND=pgvector`)로 분기. `SQLStore(url=settings.postgres_url)` 만으로 동작(Postgres DDL 이미 보유).
 - **doc**: `LocalSQLDocStore`(`local_sql_doc_store.py`) 와 동일 인터페이스를 갖는 `PgDocStore` 신규 작성(시그니처는 `MongoStore`/`LocalSQLDocStore` 호환 — `list_nodes(limit=...)`, `upsert_node_doc`, `get_node_doc`, sources, `log_event`/`get_audit_log`). `doc_nodes`(PK `space,node_id`)/`doc_sources`/`audit_log` 의 `properties`/`metadata`/`details` 는 JSON TEXT → **JSONB**. `list_nodes(limit=50000)` 은 BM25 재빌드 핫패스이므로(§7) Postgres에서도 인덱스된 `LIMIT` 스캔으로 O(k) 보장.
 - **엔진 공유**: `PgDocStore`·`SQLStore`·`PgVectorStore` 모두 factory 가 1회 생성한 **동일 SQLAlchemy 엔진**을 주입받는다(§3.5). 단일 풀 + 교차 트랜잭션.
 - 데이터 이전: SQLite → Postgres 로우 단위 복사(§8). JSON TEXT 컬럼은 `::jsonb` 캐스트.
@@ -407,7 +412,7 @@ $$) AS (e agtype);
 4. **스키마 생성.** sql 테이블은 `SQLStore` 가 자동 생성. doc 테이블(JSONB) + `opencrab_vectors_kure vector(1024)` 벡터 테이블 DDL 적용. 인덱스는 데이터 적재 후 생성(IVFFlat은 적재 후 필수, HNSW는 권장).
 5. **전 벡터 재임베딩·재적재 (필수, KURE 단일).** Chroma 내부 벡터를 그대로 옮길 수 없다(임베딩 위치가 앱으로 이동). doc/노드 원본 텍스트에서 `ResilientEmbeddingFunction`(KURE) 으로 **재임베딩**하여 `opencrab_vectors_kure`(1024d)에 적재. minilm 재임베딩은 하지 않음(롤백용 Chroma 잔존).
 6. **doc/sql 덤프 이전.** SQLite `doc_store.db`/`opencrab.db` 의 로우를 Postgres로 복사(JSON TEXT → JSONB 캐스트). 1회성 마이그레이션 스크립트(범위 외, 본 문서는 설계만).
-7. **factory 분기.** `make_vector_store` 가 `PgVectorStore` 를, `make_doc_store`/`make_sql_store` 가 Postgres 백엔드를 선택하도록 신규 설정(`STORE_BACKEND=pgvector`) 추가. 기본값은 기존(local) 유지해 롤백 보장. graph 는 §6 롤아웃((C)→AGE/CTE)에 따름.
+7. **factory 분기.** `make_vector_store` 가 `PgVectorStore` 를, `make_doc_store`/`make_sql_store` 가 Postgres 백엔드를 선택하도록 신규 설정(`VECTOR_BACKEND=pgvector`) 추가. 기본값은 기존(local) 유지해 롤백 보장. graph 는 §6 롤아웃((C)→AGE/CTE)에 따름.
 8. **검증.** §11 회귀 스위트(green→green) 전체 통과 — 행 수 대조(`count()` vs Chroma, `table_counts()`), 대표 질의 top-k(특히 KURE 한국어 MRR), BM25 결과 동등성, graph 백엔드 parity, 다중 프로세스 동시 적재 스모크.
 
 ---
@@ -451,8 +456,8 @@ $$) AS (e agtype);
 
 **롤백 경로**
 
-- **기존 SQLite 파일과 Chroma 디렉터리를 보존**한다(삭제 금지). factory 분기 기본값을 기존(local)으로 두면, `STORE_BACKEND`/`EMBEDDING_BACKEND` 등 **설정만 되돌려** 즉시 기존 스택으로 복귀 가능. minilm(384d)은 롤백용 Chroma 컬렉션(`opencrab_vectors`)에 그대로 남아 있고, PG 의 `opencrab_vectors_kure`(1024d)는 별도 테이블이라 원복이 비파괴적이다.
-- **(A)(B) 공통.** 롤백 메커니즘은 동일하다 — Chroma 보존 + `STORE_BACKEND` 되돌림. (A)는 vec0 테이블(`vectors_kure`)이 별도 SQLite 객체라, (B)는 PG 테이블이 별도라 각각 원복이 비파괴적이다.
+- **기존 SQLite 파일과 Chroma 디렉터리를 보존**한다(삭제 금지). factory 분기 기본값을 기존(local)으로 두면, `VECTOR_BACKEND`/`EMBEDDING_BACKEND` 등 **설정만 되돌려** 즉시 기존 스택으로 복귀 가능. minilm(384d)은 롤백용 Chroma 컬렉션(`opencrab_vectors`)에 그대로 남아 있고, PG 의 `opencrab_vectors_kure`(1024d)는 별도 테이블이라 원복이 비파괴적이다.
+- **(A)(B) 공통.** 롤백 메커니즘은 동일하다 — Chroma 보존 + `VECTOR_BACKEND` 되돌림. (A)는 vec0 테이블(`vectors_kure`)이 별도 SQLite 객체라, (B)는 PG 테이블이 별도라 각각 원복이 비파괴적이다.
 
 ---
 
@@ -499,7 +504,7 @@ AGE 채택 여부·벡터 백엔드(sqlite-vec vs pgvector) 전환 승인은 측
 4. `factory` 분기 + 1회성 마이그레이션 스크립트 + 공유 엔진 배선(`builder.py` 4중 fan-out)
 
 - **각 워크스트림 내부도 green→green 파이프라인**(현행 특성화 테스트 통과 → PG 구현 → 동일 테스트 parity 통과)으로 단계화. 스트림 간 의존 없는 stage 는 pipeline 으로 무배리어 진행.
-- **합류 지점:** 공유 SQLAlchemy 엔진 시그니처와 `Settings` 신규 플래그(`STORE_BACKEND`)를 **먼저 합의(인터페이스 동결)** 후 분기. 최종 회귀(§11 전체 스위트)는 합류 후 일괄 게이트.
+- **합류 지점:** 공유 SQLAlchemy 엔진 시그니처와 `Settings` 신규 플래그(`VECTOR_BACKEND`)를 **먼저 합의(인터페이스 동결)** 후 분기. 최종 회귀(§11 전체 스위트)는 합류 후 일괄 게이트.
 - **착수 전 세션 컴팩트** 권장(탐색·조사로 컨텍스트 누적).
 
 ---

@@ -1,6 +1,6 @@
 # LocalCrab
 
-LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니다. 문서·데이터를 9-space MetaOntology 그래프로 적재하고, 벡터·BM25·그래프를 결합한 하이브리드 검색을 MCP 인터페이스로 제공합니다. Docker 없이 SQLite + 로컬 Chroma만으로 단일 머신에서 동작합니다.
+LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니다. 문서·데이터를 9-space MetaOntology 그래프로 적재하고, 벡터·BM25·그래프를 결합한 하이브리드 검색을 MCP 인터페이스로 제공합니다. Docker 없이 SQLite(sqlite-vec 벡터 백엔드 포함)만으로 단일 머신에서 동작합니다.
 
 [AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab)을 기반으로 한 로컬 배포판 fork입니다. 파이썬 패키지명·엔트리포인트는 upstream 머지 충돌을 줄이기 위해 `opencrab`을 유지합니다.
 
@@ -10,7 +10,7 @@ LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니�
 
 ## 핵심 기능
 
-- **로컬 우선**: Docker 불필요 — SQLite 그래프·문서 스토어 + 로컬 Chroma 벡터 스토어.
+- **로컬 우선**: Docker 불필요 — SQLite 그래프·문서·벡터(sqlite-vec) 스토어. 벡터 백엔드는 Chroma로도 전환 가능([벡터 스토어 백엔드](#벡터-스토어-백엔드-vector_backend) 참고).
 - **9-space MetaOntology 그래프**: 문법 검증 기반 노드·엣지 적재.
 - **하이브리드 검색**: 벡터(semantic) + BM25(키워드) + 그래프 이웃 탐색을 RRF로 통합.
 - **한국어 검색 품질**: OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백으로 KURE-v1 등 한국어 특화 모델 지원.
@@ -39,19 +39,19 @@ opencrab init
 
 ```bash
 opencrab serve
-# STORAGE_MODE=local (기본) — SQLite + 로컬 Chroma
+# STORAGE_MODE=local (기본) — SQLite(그래프·문서·벡터)
 ```
 
 **로컬 모드 스토어 구성:**
-
-> **갱신(2026-07-02)**: 아래 표는 소프트웨어 기본값(`VECTOR_BACKEND=chroma`)을 보여줍니다. 이 머신의 현행 배포는 `VECTOR_BACKEND=sqlite-vec`(2026-07-01 라이브)로 전환되어, 벡터 백엔드가 `chroma/`가 아닌 `vectors.db`(SQLite vec0)입니다. 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend).
 
 | 역할 | 백엔드 | 파일 (`LOCAL_DATA_DIR` 기준) |
 |------|--------|------------------------------|
 | 그래프 | `LocalGraphStore` (SQLite BFS) | `graph.db` |
 | 문서 | `LocalSQLDocStore` (SQLite) | `doc_store.db` |
-| 벡터 | ChromaStore (기본값) / **sqlite-vec(현행 배포)** | `chroma/` / **`vectors.db`** |
+| 벡터 | `SqliteVecStore` (기본) / `ChromaStore` (옵션) | `vectors.db` / `chroma/` |
 | SQL | SQLStore (SQLite) | `opencrab.db` |
+
+> 벡터 백엔드 기본값은 조건부입니다(`EMBEDDING_BACKEND`·`STORAGE_MODE`에 따라 결정). 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend), [벡터 백엔드 매트릭스](./docs/vector-backends.md).
 
 아키텍처 상세는 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) 참고.
 
@@ -173,14 +173,14 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 
 두 가지 임베딩 백엔드를 지원합니다.
 
-**`local` (기본)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮습니다.
+**`openai` (기본)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction` 구조입니다. KURE-v1(한국어 특화, 1024d)이 기본 모델입니다. GGUF 폴백은 438MB 파일을 자동 다운로드하며, 외부 서버 없이도 완전 로컬로 동작할 수 있습니다(`pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요).
 
-**`openai` (권장)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등) + 로컬 GGUF 폴백 자동 전환. KURE-v1 같은 한국어 특화 모델(1024d)을 쓰면 검색 품질이 크게 향상됩니다.
+**`local` (롤백 옵션)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮습니다.
 
 | 모델 | top-1 (5건) | MRR | 정답−무관 마진 | 건당 속도 |
 |------|-------------|-----|----------------|-----------|
-| minilm (기본, 384d ONNX) | 0/5 | 0.285 | −0.086 (무관 문서가 더 가까움) | ~0.25s 로컬 |
-| KURE-v1 LM Studio (주력, 1024d) | **5/5** | **1.000** | **+0.447** | ~0.06s GPU |
+| minilm (롤백용, 384d ONNX) | 0/5 | 0.285 | −0.086 (무관 문서가 더 가까움) | ~0.25s 로컬 |
+| KURE-v1 LM Studio (기본, 1024d) | **5/5** | **1.000** | **+0.447** | ~0.06s GPU |
 | KURE-v1 로컬 GGUF (폴백, 1024d) | **5/5** | **1.000** | **+0.446** | ~1.07s CPU |
 
 벡터 일치도(LM Studio ↔ 로컬 GGUF): cosine 평균 0.999853 — 폴백 전환 시에도 같은 컬렉션 그대로 사용.
@@ -204,7 +204,7 @@ CPU 자원이 부족하면 한국어 경량 임베딩 [`BM-K/KoSimCSE-roberta`](
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
-| `EMBEDDING_BACKEND` | `local` | `local` = minilm, `openai` = OpenAI 호환 서버 |
+| `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버(+GGUF 폴백), `local` = minilm(롤백) |
 | `OPENAI_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
 | `OPENAI_API_KEY` | _(없음)_ | 인증 필요 서버 사용 시 Bearer 토큰. 무인증 서버는 미설정 |
@@ -220,11 +220,11 @@ export OPENAI_EMBED_MODEL=text-embedding-kure-v1
 opencrab serve
 ```
 
-**롤백**: `EMBEDDING_BACKEND=local` 또는 미설정 → 기존 minilm 컬렉션으로 즉시 복귀.
+**롤백**: `EMBEDDING_BACKEND=local` → minilm 컬렉션으로 즉시 복귀(단, `VECTOR_BACKEND=sqlite-vec`와는 조합 불가 — 아래 [벡터 스토어 백엔드](#벡터-스토어-백엔드-vector_backend) 참고).
 
 ### 초기 적재 (backfill)
 
-`EMBEDDING_BACKEND=openai`로 전환 시, 기존 노드를 새 컬렉션으로 재임베딩합니다.
+기존에 `local`(minilm) 컬렉션으로 적재해둔 노드가 있고 `openai`(KURE)로 전환하는 경우, 기존 노드를 새 컬렉션으로 재임베딩해야 합니다.
 
 ```bash
 export EMBEDDING_BACKEND=openai
@@ -234,10 +234,16 @@ python backfill_kure.py
 ## 벡터 스토어 백엔드 (`VECTOR_BACKEND`)
 
 임베딩 백엔드(`EMBEDDING_BACKEND`)와 **독립된 축**으로, 벡터를 어디에 저장·검색할지 고릅니다.
+`VECTOR_BACKEND`를 명시하지 않으면 아래 규칙으로 조건부 결정됩니다.
 
-**`chroma` (기본)**: ChromaDB PersistentClient. 기존 동작 100% 보존.
+- `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → **`sqlite-vec`**
+- `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → **`chroma`**
+- `VECTOR_BACKEND`를 명시하면 항상 그 값이 우선합니다.
+- 예외: `VECTOR_BACKEND=sqlite-vec`를 명시했는데 `EMBEDDING_BACKEND=local`이면 기동 시 `ValueError`(minilm 384d는 sqlite-vec에서 미지원).
 
-**`sqlite-vec`**: sqlite-vec(vec0) — 벡터를 graph/doc/sql 과 **같은 SQLite WAL 규율**에 편입해
+모드×옵션 조합 전체 매트릭스와 백엔드별 장단점 상세는 [벡터 스토어 백엔드 매트릭스](./docs/vector-backends.md) 참고.
+
+**`sqlite-vec` (로컬 모드 기본)**: sqlite-vec(vec0) — 벡터를 graph/doc/sql 과 **같은 SQLite WAL 규율**에 편입해
 Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거합니다. 앱이 KURE EF로 직접 임베딩 후
 `vec0` 테이블에 INSERT하므로 `EMBEDDING_BACKEND=openai`(KURE 1024d)와 함께 씁니다. 벡터 DB는
 `LOCAL_DATA_DIR/vectors.db`. 설계·트레이드오프: `docs/pgvector-migration-plan.md` (A) 경로.
@@ -245,16 +251,18 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 > 특성: pack-scoped 검색은 매우 빠르나(수 ms), 전역(pack 미지정) 검색은 브루트포스라 대규모에서 느립니다
 > (전역 고속화는 §3.7 binary 2단계 양자화 — 후속). 정확도는 exact라 Chroma HNSW보다 높습니다.
 
+**`chroma` (docker 모드 기본 / local+minilm 조합 기본)**: ChromaDB. 로컬은 PersistentClient, docker는 HttpClient. 기존 동작 100% 보존.
+
 **`pgvector`**: 예약(미구현) — `docs/pgvector-migration-plan.md` (B) 경로.
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
-| `VECTOR_BACKEND` | `chroma` | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
+| `VECTOR_BACKEND` | _(미설정 — 위 조건부 규칙으로 결정)_ | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 
 ```bash
-# Chroma → sqlite-vec 전환 (KURE 벡터를 그대로 1:1 이관)
+# 기존 Chroma 컬렉션이 있는 상태에서 sqlite-vec로 전환(KURE 벡터를 그대로 1:1 이관)
 python scripts/migrate_chroma_to_sqlite_vec.py      # chroma → vectors.db
 export EMBEDDING_BACKEND=openai VECTOR_BACKEND=sqlite-vec
 opencrab serve
@@ -262,7 +270,7 @@ opencrab serve
 
 > **무중단 적재(sqlite-vec)**: chroma의 `chroma.lock(LOCK_EX)` 제약이 사라져 **적재 시 게이트웨이/서비스를 중단할 필요가 없다.** 벡터를 포함한 4스토어가 모두 SQLite WAL이라 로더/reingest 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. (chroma 백엔드에서는 기존대로 오프라인 `--fresh` 적재 시 중단 필요.)
 
-**롤백**: `VECTOR_BACKEND=chroma`(또는 미설정) → 기존 Chroma 스택으로 즉시 복귀(비파괴, Chroma 보존).
+**롤백**: `VECTOR_BACKEND=chroma` 명시 → Chroma 스택으로 즉시 복귀(비파괴, Chroma 보존).
 
 ---
 

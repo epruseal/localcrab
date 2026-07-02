@@ -250,25 +250,28 @@ retrieves the relationship structure that explains why the answer is true.
 `make_vector_store` 는 먼저 **`VECTOR_BACKEND`(벡터 스토어)**로 분기하고, `chroma` 경로 안에서
 다시 **`EMBEDDING_BACKEND`(임베딩)**로 분기한다. 두 축은 독립이다.
 
-- **`VECTOR_BACKEND=chroma`(기본)**: 아래 EMBEDDING_BACKEND 분기대로 ChromaStore 반환.
-- **`VECTOR_BACKEND=sqlite-vec`**: `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`, 테이블
+`VECTOR_BACKEND` 미설정 시 조건부 기본값:
+- `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → `sqlite-vec`
+- `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → `chroma`
+- 명시 설정은 항상 위 규칙보다 우선한다.
+
+- **`VECTOR_BACKEND=sqlite-vec`(로컬 모드 기본)**: `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`, 테이블
   `vectors_kure`) 반환. 임베딩은 공유 헬퍼 `_make_kure_embedding_function`(KURE, EMBEDDING_BACKEND
   무관하게 KURE 표준)로 앱측 계산 후 INSERT. Chroma의 다중프로세스 쓰기 제약을 SQLite WAL 규율로 대체.
-  설계·전환·성능: `docs/pgvector-migration-plan.md` (A) 경로 §3.6/§3.7, 전환 스크립트
-  `scripts/migrate_chroma_to_sqlite_vec.py`.
+  `EMBEDDING_BACKEND=local`과 조합 시 기동 ValueError(minilm 384d 미지원). 설계·전환·성능:
+  `docs/pgvector-migration-plan.md` (A) 경로 §3.6/§3.7, 전환 스크립트
+  `scripts/migrate_chroma_to_sqlite_vec.py`. 모드×옵션 매트릭스: `docs/vector-backends.md`.
+- **`VECTOR_BACKEND=chroma`(docker 모드 기본 / local+minilm 조합 기본)**: 아래 EMBEDDING_BACKEND 분기대로 ChromaStore 반환.
 - **`VECTOR_BACKEND=pgvector`**: 예약(미구현) — `NotImplementedError`.
 
 임베딩 조립은 `_make_kure_embedding_function(settings)` 로 추출되어 chroma(openai)·sqlite-vec 가
 공유한다(추후 pgvector 도 재사용).
 
-### `EMBEDDING_BACKEND=local` (기본값)
-
-기존 ChromaStore(`opencrab_vectors`, minilm 384d)를 반환한다. 코드 무변경.
-
-### `openai`
+### `EMBEDDING_BACKEND=openai` (기본값)
 
 ChromaStore(`opencrab_vectors_kure`, 1024d)와 ResilientEmbeddingFunction을 반환한다.
-KURE-v1(한국어 특화, 1024d)을 기본 모델로 사용한다.
+KURE-v1(한국어 특화, 1024d)을 기본 모델로 사용한다. `VECTOR_BACKEND` 조건부 기본 규칙에 따라
+로컬 모드에서는 실제로는 ChromaStore 대신 `SqliteVecStore`가 선택되는 경우가 기본 경로다(위 참고).
 
 ```
 ResilientEF = OpenAIEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운로드)
@@ -283,7 +286,7 @@ ResilientEF = OpenAIEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운�
   하위 `load_local_packs.py`가 `EMBEDDING_BACKEND` env를 따라가므로 자동 KURE 사용.
 - **backfill/적재 중 게이트웨이 중단 여부는 `VECTOR_BACKEND`에 따라 다르다:**
   - `chroma`: PersistentClient 단일 프로세스 제약(`chroma.lock` LOCK_EX) → 오프라인 로더 `--fresh` 시 게이트웨이 중단 필요.
-  - **`sqlite-vec`(2026-07-01 라이브)**: 벡터가 SQLite WAL이라 **적재 중 게이트웨이 중단 불필요** — 로더 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. graph/doc/sql은 이미 WAL이었으므로 chroma 제거로 4스토어 전부 무중단 적재 가능. 설계: `docs/pgvector-migration-plan.md §9`.
+  - **`sqlite-vec`**: 벡터가 SQLite WAL이라 **적재 중 게이트웨이 중단 불필요** — 로더 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. graph/doc/sql은 이미 WAL이므로 sqlite-vec 사용 시 4스토어 전부 무중단 적재 가능. 설계: `docs/pgvector-migration-plan.md §9`.
 
 ---
 

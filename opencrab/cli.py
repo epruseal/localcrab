@@ -194,9 +194,18 @@ def status() -> None:
     docs   = make_doc_store(cfg)
     sql    = make_sql_store(cfg)
 
+    # VECTOR_BACKEND 가 조건부 기본값(vector_backend_resolved)을 가지므로 라벨/경로도
+    # 하드코딩 대신 실제 선택된 백엔드를 반영한다.
+    if cfg.vector_backend_resolved == "sqlite-vec":
+        vector_label = "Vector (sqlite-vec)"
+        vector_path = cfg.local_data_dir + "/" + cfg.vector_db_file
+    else:
+        vector_label = "Vector (ChromaDB)"
+        vector_path = cfg.local_data_dir + "/chroma"
+
     store_rows: list[tuple[str, str, Any]] = [
         ("Graph (SQLite)",    cfg.local_data_dir + "/graph.db",    graph),
-        ("Vector (ChromaDB)", cfg.local_data_dir + "/chroma",      vector),
+        (vector_label,        vector_path,                         vector),
         ("Docs (JSON files)", cfg.local_data_dir + "/docs",        docs),
         ("SQL (SQLite)",      cfg.local_data_dir + "/opencrab.db", sql),
     ]

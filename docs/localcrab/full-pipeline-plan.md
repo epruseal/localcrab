@@ -17,7 +17,7 @@ User-facing wrappers and deployment assets should use `localcrab`.
 
 1. Core ontology stores and MCP tools
    - local SQLite graph store
-   - local Chroma vector store
+   - local vector store (sqlite-vec by default; Chroma as an alternate backend)
    - local JSON document store
    - MCP server exposed as `localcrab` (stdio, or direct Streamable HTTP via `serve --transport http`)
 

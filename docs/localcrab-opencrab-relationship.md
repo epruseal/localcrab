@@ -5,7 +5,8 @@ LocalCrab은 **[AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab)** �
 유지합니다.
 
 LocalCrab is a standalone local ontology service — it runs on a single machine
-without Docker using SQLite and a local Chroma client. OpenCrab SaaS, available at
+without Docker using SQLite for all stores, including vectors via sqlite-vec by
+default (Chroma remains available as an alternate vector backend). OpenCrab SaaS, available at
 [opencrab.sh](https://opencrab.sh), is a separate hosted ecosystem where packs are
 ingested, distributed, installed, queried, and shared.
 

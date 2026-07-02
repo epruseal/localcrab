@@ -43,7 +43,7 @@ class OpenAIEmbeddingFunction:
     Parameters
     ----------
     api_base : str
-        예: "http://100.77.10.49:1234/v1" 또는 "https://api.openai.com/v1"
+        예: "http://localhost:1234/v1" 또는 "https://api.openai.com/v1"
     model : str
         임베딩 모델 id. 예: "text-embedding-kure-v1", "text-embedding-3-small"
     dim : int

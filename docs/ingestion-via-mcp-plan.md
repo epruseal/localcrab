@@ -2,7 +2,7 @@
 
 상태: 제안 (Proposed) · 작성일: 2026-06-18 · 코드 구현 없음 (설계 문서)
 
-> **⚠️ 갱신(2026-07-01):** 이 문서의 핵심 동기 중 하나였던 **"적재 시 MCP 중지" 운영 제약과 `chroma.lock(LOCK_EX)` 의존은, 벡터 백엔드를 `sqlite-vec`(vec0)로 라이브 전환하면서 이미 제거되었다**(`docs/pgvector-migration-plan.md` (A) 경로 라이브). 벡터가 SQLite WAL이 되어 적재 중에도 게이트웨이 무중단(로더 쓰기 ∥ serve 읽기, 라이터는 write.lock/busy_timeout 직렬화). 따라서 아래 §1의 "대량 재적재마다 MCP 중지" 부담 서술은 **chroma 백엔드 한정**이다. 다만 본 문서의 나머지 목표(`pack_purge`·`pack_ingest_chunks` MCP write 도구, 청크 단위 적재, 원자적 purge-replace)는 여전히 유효하다.
+> **⚠️ 벡터 백엔드 한정 제약:** 이 문서의 핵심 동기 중 하나였던 **"적재 시 MCP 중지" 운영 제약과 `chroma.lock(LOCK_EX)` 의존은 `VECTOR_BACKEND=chroma` 사용 시에만 적용된다.** `VECTOR_BACKEND=sqlite-vec`(vec0)를 쓰면 벡터도 SQLite WAL이 되어 적재 중에도 게이트웨이 무중단(로더 쓰기 ∥ serve 읽기, 라이터는 write.lock/busy_timeout 직렬화)이 성립한다(`docs/pgvector-migration-plan.md` (A) 경로, `docs/vector-backends.md`). 따라서 아래 §1의 "대량 재적재마다 MCP 중지" 부담 서술은 **chroma 백엔드 한정**이다. 다만 본 문서의 나머지 목표(`pack_purge`·`pack_ingest_chunks` MCP write 도구, 청크 단위 적재, 원자적 purge-replace)는 벡터 백엔드와 무관하게 여전히 유효하다.
 
 범위 확정: `pack_purge`(삭제) · `pack_ingest_chunks`(청크 배치) **두 신규 MCP write 도구 신설 포함**. `--fresh`(purge-replace)까지 MCP 무중단으로 달성한다.
 
@@ -31,7 +31,7 @@ MCP 서버 측은 이 제약을 락으로 방어한다 (`opencrab/mcp/tools.py`)
 - uvicorn 은 `workers=1` 로 기동 (`opencrab/cli.py` 라인 158-162, 주석: "the chroma PersistentClient is single-process only") → chroma 를 만지는 프로세스는 MCP 단일 인스턴스뿐.
 - 여러 MCP 인스턴스(예: 인증/비인증 HTTP) 간 쓰기는 `_write_lock()` 이 `write.lock` 의 `LOCK_EX` 로 직렬화 (라인 84-95). write 도구 집합은 `WRITE_TOOLS` (라인 73-81): `ontology_add_node`, `ontology_add_edge`, `pack_create`, `pack_ingest`, `schema_pack_install`, `schema_pack_uninstall`, `harness_promotion_apply`.
 
-**운영 부담:** 대량 재적재마다 MCP 서버를 중지해야 하므로, 적재 동안 모든 읽기 쿼리/도구가 중단된다.
+**운영 부담(`VECTOR_BACKEND=chroma` 한정):** 대량 재적재마다 MCP 서버를 중지해야 하므로, 적재 동안 모든 읽기 쿼리/도구가 중단된다. `VECTOR_BACKEND=sqlite-vec` 사용 시에는 이 절 전체가 적용되지 않는다(문서 상단 배너 참고).
 
 ---
 

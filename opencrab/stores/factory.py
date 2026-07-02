@@ -92,9 +92,10 @@ def _make_kure_embedding_function(settings: Settings) -> Any:
 
 
 def make_vector_store(settings: Settings) -> Any:
-    """벡터 스토어 백엔드를 VECTOR_BACKEND 로 선택해 반환.
+    """벡터 스토어 백엔드를 VECTOR_BACKEND(resolved) 로 선택해 반환.
 
-    VECTOR_BACKEND(기본 "chroma"):
+    VECTOR_BACKEND 명시 설정이 없으면 vector_backend_resolved 가 조건부 기본값을
+    고른다(local 운영 + EMBEDDING_BACKEND=openai → "sqlite-vec", 그 외 → "chroma").
       "chroma"     : ChromaDB. EMBEDDING_BACKEND 로 EF 분기(기존 동작 100% 보존).
       "sqlite-vec" : sqlite-vec(vec0). 앱이 KURE EF 로 직접 임베딩 후 INSERT.
                      4스토어를 단일 SQLite WAL 규율로 통일(Chroma 제약 제거).
@@ -103,7 +104,7 @@ def make_vector_store(settings: Settings) -> Any:
     설계: docs/pgvector-migration-plan.md §3.6 / §9. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
     """
-    backend = settings.vector_backend
+    backend = settings.vector_backend_resolved
 
     if backend == "sqlite-vec":
         # sqlite-vec 는 앱측 임베딩이 필수이고 KURE(1024d) 를 표준으로 쓴다. minilm 은

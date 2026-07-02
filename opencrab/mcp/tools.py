@@ -156,7 +156,10 @@ def _get_context() -> dict[str, Any]:
     # chroma.lock (LOCK_SH) only coordinates with the offline chroma batch loader;
     # skip it when the vector backend isn't chroma (sqlite-vec uses SQLite WAL, not
     # chroma's flock layer, so the shared lock would be a pointless hold).
-    if cfg.vector_backend == "chroma":
+    # vector_backend_resolved (not the raw vector_backend field) — VECTOR_BACKEND
+    # is now unset by default and resolves conditionally (config.py), so a raw
+    # comparison would miss the chroma case whenever it's the resolved default.
+    if cfg.vector_backend_resolved == "chroma":
         _acquire_chroma_shared_lock()
 
     graph = make_graph_store(cfg)

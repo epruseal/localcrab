@@ -69,18 +69,21 @@ class Settings(BaseSettings):
     # 임베딩 백엔드 (EMBEDDING_BACKEND 환경변수)
     #
     # 옵션:
-    #   "local"  — ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d, 영어특화).
-    #              기존 동작 그대로. CHROMA_COLLECTION("opencrab_vectors") 사용.
-    #              llama-cpp-python / LM Studio 불필요. 롤백 기본값.
-    #   "openai" — OpenAI 호환 임베딩 서버(LM Studio 등) + 로컬 GGUF 폴백 자동 전환.
+    #   "openai" (기본) — OpenAI 호환 임베딩 서버(LM Studio 등) primary + 로컬 GGUF
+    #              자동다운로드 fallback (ResilientEmbeddingFunction). 서버가 죽어도
+    #              GGUF 폴백으로 계속 동작하므로 외부 서버가 필수 의존성은 아니다.
     #              EMBED_COLLECTION("opencrab_vectors_kure") 컬렉션 사용.
     #              실측(KURE-v1): top-1 5/5, MRR 1.000 vs minilm top-1 0/5, MRR 0.285.
+    #   "local"  — ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d, 영어특화).
+    #              CHROMA_COLLECTION("opencrab_vectors") 사용. llama-cpp-python /
+    #              LM Studio 불필요. 명시적 롤백 옵션(한국어 변별 실패 수준).
     #
-    # 변경 이유: 한국어 검색 품질 개선. minilm 은 한국어 변별 실패 수준.
-    # 롤백: EMBEDDING_BACKEND 미설정 또는 "local" 로 되돌리면 기존 컬렉션 그대로.
+    # 변경 이유: 한국어 검색 품질 개선. minilm 은 한국어 변별 실패 수준이라 기본값을
+    # openai(KURE)로 전환. GGUF 폴백이 있어 로컬 운영에서도 외부 서버 없이 동작한다.
+    # 롤백: EMBEDDING_BACKEND=local 로 명시하면 기존 minilm 컬렉션 그대로 사용.
     # ------------------------------------------------------------------
     embedding_backend: str = Field(
-        default="local",
+        default="openai",
         alias="EMBEDDING_BACKEND",
         # Literal["local", "openai"] — pydantic-settings 호환을 위해 str 사용
     )
@@ -88,8 +91,10 @@ class Settings(BaseSettings):
     # OpenAI 호환 임베딩 서버 설정 (EMBEDDING_BACKEND=openai 시 사용)
     # LM Studio, Ollama, vLLM, 실제 OpenAI 등 /v1/embeddings 구현 서버 모두 호환.
     # 대안: openai 패키지 미설치라 httpx 직접 호출 방식 채택.
+    # 기본값은 LM Studio 로컬 기본 포트. 원격 서버는 OPENAI_API_BASE 로 지정.
+    # 서버 미가동이어도 로컬 GGUF 폴백(ResilientEmbeddingFunction)으로 동작한다.
     openai_api_base: str = Field(
-        default="http://100.77.10.49:1234/v1",
+        default="http://localhost:1234/v1",
         alias="OPENAI_API_BASE",
     )
     # 서버에 로드된 임베딩 모델 id. /v1/models 로 확인.
@@ -126,7 +131,12 @@ class Settings(BaseSettings):
     # 벡터 스토어 백엔드 (VECTOR_BACKEND 환경변수) — 임베딩 백엔드와 독립 축.
     #
     # 옵션:
-    #   "chroma"     (기본): ChromaDB. 기존 동작 100% 보존(롤백 기본값).
+    #   ""(미설정, 기본) : 조건부 스마트 기본값 — vector_backend_resolved 참고.
+    #                      is_local(local/kuzu) AND EMBEDDING_BACKEND=openai 이면
+    #                      "sqlite-vec", 그 외(docker 모드 또는 EMBEDDING_BACKEND=local)
+    #                      는 "chroma". local 운영의 기본 조합(openai+local)이 곧
+    #                      sqlite-vec 이 되어 Chroma 다중프로세스 쓰기 제약을 피한다.
+    #   "chroma"           : ChromaDB. 기존 동작 100% 보존(명시 롤백 옵션).
     #   "sqlite-vec"       : sqlite-vec(vec0). 4스토어를 단일 SQLite WAL 규율로 통일해
     #                        Chroma 다중프로세스 쓰기 제약/flock 층 제거. KURE(1024d) 표준
     #                        — 앱이 EMBEDDING_BACKEND=openai 의 KURE EF 로 직접 임베딩 후
@@ -135,12 +145,14 @@ class Settings(BaseSettings):
     #
     # 설계: docs/pgvector-migration-plan.md §3.6 / §9. embedding 은 백엔드와 무관하게
     #       동일(ResilientEmbeddingFunction, KURE). 바뀌는 것은 저장/검색 백엔드뿐.
-    # 롤백: VECTOR_BACKEND 미설정 또는 "chroma" 로 되돌리면 기존 Chroma 스택 그대로.
+    # 롤백: VECTOR_BACKEND=chroma 로 명시하면 조건부 기본값과 무관하게 기존 Chroma
+    #       스택 그대로 사용(항상 명시 설정이 최우선).
     # ------------------------------------------------------------------
     vector_backend: str = Field(
-        default="chroma",
+        default="",
         alias="VECTOR_BACKEND",
-        # Literal["chroma", "sqlite-vec", "pgvector"] — pydantic-settings 호환 str
+        # Literal["", "chroma", "sqlite-vec", "pgvector"] — pydantic-settings 호환 str
+        # ""(빈 문자열) = 미설정 센티널. vector_backend_resolved 가 조건부로 해석.
     )
     # sqlite-vec 백엔드 벡터 DB 파일명(LOCAL_DATA_DIR 하위). graph.db/doc_store.db 와
     # 같은 디렉터리라 단일 LOCAL_DATA_DIR 백업이 벡터까지 포함.
@@ -178,6 +190,18 @@ class Settings(BaseSettings):
     @property
     def is_local(self) -> bool:
         return self.storage_mode in ("local", "kuzu")
+
+    @property
+    def vector_backend_resolved(self) -> str:
+        """VECTOR_BACKEND 가 명시 설정되면 그대로, 미설정("")이면 조건부 기본값을
+        반환한다. local 운영(is_local) + KURE 임베딩(openai) 조합에서만 sqlite-vec
+        을 기본으로 골라, docker 모드나 minilm(local) 임베딩에서는 기존 chroma
+        경로를 그대로 유지한다. 자세한 규칙은 vector_backend 필드 주석 참고."""
+        if self.vector_backend:
+            return self.vector_backend
+        if self.is_local and self.embedding_backend == "openai":
+            return "sqlite-vec"
+        return "chroma"
 
     @property
     def sqlite_url(self) -> str:

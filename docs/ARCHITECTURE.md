@@ -21,8 +21,10 @@ LocalCrab은 `STORAGE_MODE` 환경변수로 두 가지 백엔드를 선택한다
 | --- | --- | --- |
 | 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `Neo4jStore` (`bolt://localhost:7687`) |
 | 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `MongoStore` (MongoDB) |
-| 벡터 | `ChromaStore` (PersistentClient, `chroma/`) | `ChromaStore` (HttpClient) |
+| 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | `ChromaStore` (HttpClient) |
 | SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (PostgreSQL) |
+
+벡터 백엔드는 `VECTOR_BACKEND`(미설정 시 `STORAGE_MODE`·`EMBEDDING_BACKEND` 조건부 결정)로 선택한다. 상세 규칙·매트릭스는 §8과 `docs/vector-backends.md` 참고.
 
 ### 팩토리 (`opencrab/stores/factory.py`)
 
@@ -36,7 +38,10 @@ make_doc_store(settings)
     else     → MongoStore(uri=MONGODB_URI, db_name=MONGODB_DB)
 
 make_vector_store(settings)
-    → ChromaStore(local_mode=is_local, local_path="<LOCAL_DATA_DIR>/chroma")
+    VECTOR_BACKEND(명시 또는 조건부 기본) 로 분기:
+      "sqlite-vec" → SqliteVecStore(db_path="<LOCAL_DATA_DIR>/<VECTOR_DB_FILE>")  # EMBEDDING_BACKEND=local 조합 시 ValueError
+      "pgvector"   → NotImplementedError (예약)
+      "chroma"     → ChromaStore(local_mode=is_local, local_path="<LOCAL_DATA_DIR>/chroma")
 
 make_sql_store(settings)
     is_local → SQLStore(url="sqlite:///<LOCAL_DATA_DIR>/opencrab.db")
@@ -396,10 +401,10 @@ Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지�
 ## 8. 임베딩 백엔드 (EMBEDDING_BACKEND)
 
 `EMBEDDING_BACKEND` 환경변수로 전환:
-- `local` (기본): ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d). 컬렉션: `opencrab_vectors`.
-- `openai` (권장): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`.
+- `openai` (기본): OpenAI 호환 `/v1/embeddings` API 백엔드(*모델*이 아니라 *전송 방식*). 실제 OpenAI 클라우드 모델(`text-embedding-3-*`)도, 자체호스팅 서버(LM Studio·Ollama·vLLM·HF TEI) 모델도 사용 가능. 모델은 `OPENAI_EMBED_MODEL`, 차원은 `EMBED_DIM`으로 지정. 한국어 추천 기본은 KURE-v1 (한국어 SOTA, 1024d). 컬렉션: `opencrab_vectors_kure`. primary(원격 서버) 실패 시 로컬 GGUF로 자동 폴백(438MB, 자동 다운로드, `pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요) — 외부 서버 없이도 완전 로컬 동작 가능.
   - **경량 대안(CPU 부담 시)**: [`BM-K/KoSimCSE-roberta`](https://huggingface.co/BM-K/KoSimCSE-roberta) (RoBERTa-base, ~110M, 768d) — KURE보다 가볍지만 한국어 전용·품질 다소 낮음. OpenAI 호환 서버(HF TEI 등)에 서빙 + `EMBED_DIM=768` + 별도 `EMBED_COLLECTION`이면 코드 수정 없이 사용(전량 재색인). 로컬 GGUF 폴백은 GGUF 빌드 필요해 기본 미적용.
   - **한 컬렉션 = 한 모델**: 모델·차원을 바꾸면 새 `EMBED_COLLECTION` + 전량 재색인 필요. 서로 다른 모델 벡터를 한 컬렉션에 섞지 말 것. primary/fallback도 동일 모델·차원이어야 함.
+- `local` (롤백 옵션): ChromaDB 기본 EF (all-MiniLM-L6-v2, ONNX, 384d). 컬렉션: `opencrab_vectors`. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮다. `VECTOR_BACKEND=sqlite-vec`와는 조합 불가(기동 시 ValueError) — sqlite-vec를 쓰려면 `EMBEDDING_BACKEND=openai`가 필요.
 
 **KURE 아키텍처**:
 ```
@@ -417,12 +422,17 @@ make_vector_store(settings)
 
 **벡터 스토어 백엔드 (`VECTOR_BACKEND`) — 임베딩과 독립 축**:
 `make_vector_store` 는 먼저 `VECTOR_BACKEND` 로 분기한다(`EMBEDDING_BACKEND` 분기는 `chroma` 내부).
-- `chroma`(기본): `ChromaStore` (위 그림 그대로).
-- `sqlite-vec`: `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`). 벡터를 graph/doc/sql 과 같은
+`VECTOR_BACKEND` 미설정 시 조건부 기본: `STORAGE_MODE=local/kuzu` + `EMBEDDING_BACKEND=openai`(기본) →
+`sqlite-vec`; `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local` → `chroma`. 명시 설정은 항상 우선.
+- `sqlite-vec`(로컬 모드 기본): `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`). 벡터를 graph/doc/sql 과 같은
   SQLite WAL 규율에 편입 → Chroma 다중프로세스 쓰기 제약/flock 층 제거. 임베딩은 KURE 공유 헬퍼
-  `_make_kure_embedding_function` 로 앱측 계산 후 INSERT. 전환: `scripts/migrate_chroma_to_sqlite_vec.py`,
-  설계·성능(전역 브루트포스·binary 2단계): `docs/pgvector-migration-plan.md` (A) §3.6/§3.7.
+  `_make_kure_embedding_function` 로 앱측 계산 후 INSERT. `EMBEDDING_BACKEND=local`과 조합 시 ValueError.
+  전환: `scripts/migrate_chroma_to_sqlite_vec.py`, 설계·성능(전역 브루트포스·binary 2단계):
+  `docs/pgvector-migration-plan.md` (A) §3.6/§3.7.
+- `chroma`(docker 모드 기본 / local+minilm 조합 기본): `ChromaStore` (위 그림 그대로).
 - `pgvector`: 예약(미구현).
+
+모드×옵션 전체 매트릭스는 `docs/vector-backends.md` 참고.
 
 관련 파일:
 - `opencrab/stores/openai_embedding.py` — OpenAI 호환 임베딩 EF
