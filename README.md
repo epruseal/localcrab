@@ -258,8 +258,9 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 `vec0` 테이블에 INSERT하므로 `EMBEDDING_BACKEND=openai`(KURE 1024d)와 함께 씁니다. 벡터 DB는
 `LOCAL_DATA_DIR/vectors.db`. 설계·트레이드오프: `docs/pgvector-migration-plan.md` (A) 경로.
 
-> 특성: pack-scoped 검색은 매우 빠르나(수 ms), 전역(pack 미지정) 검색은 브루트포스라 대규모에서 느립니다
-> (전역 고속화는 §3.7 binary 2단계 양자화 — 후속). 정확도는 exact라 Chroma HNSW보다 높습니다.
+> 특성: pack-scoped 검색은 매우 빠르나(수 ms), 전역(pack 미지정) 검색은 기본 브루트포스라 대규모에서 느립니다.
+> 전역 고속화는 `VECTOR_ANN=binary`(binary 2단계 양자화, 기본 off) 옵트인으로 제공 —
+> 상세·마이그레이션·롤백은 [벡터 백엔드 매트릭스 §4.1](./docs/vector-backends.md) 참고. 정확도는 exact라 Chroma HNSW보다 높습니다.
 
 **`chroma` (docker 모드 기본 / local+minilm 조합 기본)**: ChromaDB. 로컬은 PersistentClient, docker는 HttpClient. 기존 동작 100% 보존.
 
@@ -270,6 +271,8 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 | `VECTOR_BACKEND` | _(미설정 — 위 조건부 규칙으로 결정)_ | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
+| `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(sqlite-vec 전용) |
+| `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수(recall 튜닝) |
 
 ```bash
 # 기존 Chroma 컬렉션이 있는 상태에서 sqlite-vec로 전환(KURE 벡터를 그대로 1:1 이관)

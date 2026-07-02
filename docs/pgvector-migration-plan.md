@@ -161,7 +161,7 @@ sqlite-vec(`asg017/sqlite-vec`)의 **vec0 가상테이블**을 백엔드로 쓰�
 - **동시성:** vec0 shadow table 은 일반 SQLite 테이블 → **SQLite WAL 상속**. `LocalSQLDocStore`(`local_sql_doc_store.py:98-178`)의 **스레드-로컬 커넥션 + `self._lock` write 락 + `PRAGMA journal_mode=WAL/synchronous=NORMAL` + `_all_conns` 생명주기 패턴을 그대로 차용**한다. 배치 선택: 전용 `vectors.db` 로 분리(스토어 독립성) 또는 `doc_store.db` 에 편입(단일 파일 백업 정합). **다중 프로세스 읽기 동시 + 라이터 직렬화** — 현행 로더 stop-to-load 와 정합(§9).
 - **가용성/폴백:** sqlite-vec 확장 로드 실패 시 `available=False`, 쓰기 `RuntimeError`, `count()→0` — §3.4 가드 동일 재현.
 
-### 3.7 성능 최적화 — binary 2단계 양자화 (전역 검색용, 후속 과제)
+### 3.7 성능 최적화 — binary 2단계 양자화 (전역 검색용) — **구현 완료(2026-07-02)**
 
 **동기(실측 2026-07-01, `scripts/qa/bench_vector_backend.py`).** 라이브 KURE 컬렉션 **179,622 벡터(1024d)** 기준:
 
@@ -182,26 +182,42 @@ sqlite-vec(`asg017/sqlite-vec`)의 **vec0 가상테이블**을 백엔드로 쓰�
 2. **rerank(float cosine):** 후보 C개의 원본 float 벡터만 qvec와 cosine 재정렬 → top-n. C개뿐이라 <5ms.
 - 결과 전역 ~30ms 목표. recall은 **C로 튜닝**(C↑ → exact 근접). where post-filter는 후보 단계에서 적용, partition pushdown은 coarse 단계에 동일 적용.
 
-**스키마(vec0).** 한 테이블에 두 벡터 컬럼(가능 여부 착수 시 확인; 불가 시 bit 전용 보조 테이블 + `node_id` 조인):
+**스키마(vec0) — 프리플라이트로 확정(0.1.9 실증).** 한 테이블 두 벡터 컬럼 **가능** — 단일 테이블 채택(보조 테이블 불필요). 단 `bit` 컬럼에 `distance_metric=hamming` 명시는 **파서 오류** — hamming 이 bit 의 유일/암묵 거리라 절 없이 선언한다:
 ```sql
 CREATE VIRTUAL TABLE vectors_kure USING vec0(
   node_id TEXT PRIMARY KEY,
   pack_id TEXT partition key,
   embedding     float[1024] distance_metric=cosine,   -- rerank(정밀)
-  embedding_bit bit[1024]   distance_metric=hamming,   -- coarse(고속)
+  embedding_bit bit[1024],                            -- coarse(고속, hamming 암묵)
   +document TEXT, +metadata TEXT
 );
 ```
+프리플라이트 추가 확정 사항:
+- **bit 값 바인딩은 `vec_bit(?)` 래핑 필수** — raw packed bytes 는 길이가 4의 배수라 float32 로 오인식됨. SQL측 파생은 `vec_quantize_binary(embedding)`(스토어 앱측 `_sign_bits` = `numpy.packbits(v > 0, bitorder="little")` 와 바이트 동일 — `> 0` 판정·LSB-first 임에 유의).
+- **bit 컬럼이 있으면 모든 INSERT 에 bit 값 필수**(NULL 불허) → 쓰기 경로 게이팅은 config 플래그가 아닌 **실제 스키마 감지**(`PRAGMA table_info`)로 구현(미마이그레이션 DB 는 기존 5컬럼 INSERT 그대로).
+- **vec0 는 `ALTER TABLE ADD COLUMN` 불가, `RENAME TO` 는 shadow 테이블을 옮기지 않아 파손** → 마이그레이션은 **임시테이블 스테이징 → 원본 DROP/재생성 → 재복사** 패턴(`scripts/migrate_add_binary_quantization.py`, 멱등·카운트 검증·백업 강제).
 
 **bit 파생 = 비파괴 마이그레이션.** float 원본의 **부호 비트만** 추출해 채운다 — **재임베딩 불필요**. 기존 `vectors.db`에 컬럼/보조테이블 추가 후 일괄 backfill(`bit = pack_sign_bits(float_vec)`). 따라서 **지금 float로 전환한 뒤 나중에 언제든 비파괴로 얹을 수 있다.**
 
 **recall 검증(필수 게이트).** binary 2단계 top-10 vs exact float top-10 overlap **≥0.95** 되도록 C 튜닝. `bench_vector_backend.py`에 binary 모드 추가해 재측정. (참고: int8[1024](1B/dim)은 ~200ms로 중간 옵션이나 100ms 미달이라 단독 부적합 → **binary 2단계 채택**.)
 
-**구현 위치.** `SqliteVecStore`(2단계 query 경로 + bit 저장/파생), `config`(예 `VECTOR_ANN=binary` 토글, 기본 off), 마이그레이션(bit backfill), 테스트(2단계 recall·parity), bench(binary 측정).
+**구현 위치(완료).** `SqliteVecStore`(`_knn_bit_rerank` 2단계 query 경로 + `_sign_bits` 파생 + 스키마 감지 쓰기 동기화 + 인프로세스 ANN 캐시), `config`(`VECTOR_ANN`(기본 off)/`VECTOR_ANN_COARSE_K`(기본 512)), `scripts/migrate_add_binary_quantization.py`(비파괴 backfill, 멱등, `--backup-to` 강제), `tests/test_sqlite_vec_binary_ann.py`(패킹·2단계=exact(C=전체)·off 불변·pack 누수 0·마이그레이션), `scripts/qa/bench_vector_backend.py --mode binary`(게이트 측정). 적용 범위: **전역(무필터) 검색만** 2단계 — pack-scoped 는 partition 사전필터로 이미 ~8ms 라 exact 유지(안전 기본), 잔여 필터 쿼리도 post-filter 풀 보존을 위해 exact 폴백.
 
-**리스크.** sqlite-vec 의 `bit`/`hamming`·다중 벡터컬럼은 pre-v1이라 착수 시 최소예제 검증 필수. recall은 C 의존 → 튜닝·게이트 없이 채택 금지. **전역 검색 빈도가 낮으면 이 최적화는 선택**(현 float로도 pack-scoped는 8ms로 충분, 전역만 ~0.9s).
+**구현 변경점(실측 기반, 설계 원문과의 차이).** 본 설계는 coarse/rerank 를 vec0 네이티브(bit MATCH + float 재정렬)로 상정했으나, 실측 결과 vec0 0.1.9 의 bit KNN 스캔 ~336ms(행당 vtab 오버헤드)·임의 point 접근 ~0.76ms/행(4MB 청크 실체화)으로 네이티브 2단계는 ~730ms — 게이트 불달성. 따라서 **쿼리 경로는 인프로세스 캐시**(RAM bit 행렬 coarse + int8 rerank + 상위 ~3n exact float 재확정, ~210MB@179k)로 구현하고, **bit 컬럼은 내구 표현으로 저장·동기 유지**(마이그레이션 딜리버러블 유지, 향후 vec0 네이티브 성능 개선 시 전환 가능). 캐시는 지연 빌드(~3s, shadow 청크 직독)·쓰기 무효화·O(1) 신선도 체크(max rowid + data_version)로 관리. 상세: `docs/vector-backends.md` §4.1.
 
-> **현 결정(2026-07-01):** 전역 지연을 수용하고 **float로 먼저 라이브 전환**(정확도↑·동시성 회복). binary 2단계는 위 설계대로 **후속 비파괴 확장**으로 보류.
+**리스크(해소 경과).** pre-v1 리스크는 프리플라이트 최소예제로 검증 완료(위 확정 사항). recall 은 C 의존 → 아래 게이트 실측으로 채택 C 확정.
+
+> **현 결정(2026-07-02): 구현 완료.** 2026-07-01 의 "후속 비파괴 확장 보류" 결정대로 float 라이브 전환 후 본 설계를 그대로 구현했다. 게이트 실측(179,784 실데이터 사본, `bench_vector_backend.py --mode binary`):
+>
+> | 지표 | 결과 | 게이트 |
+> |------|------|--------|
+> | 전역 exact p50/p95 (baseline) | 570.2 / 592.9 ms | (2026-07-01 측정치 868ms 급) |
+> | 전역 binary 2단계 p50/p95 (채택 C=512) | **47.8 / 54.8 ms** | ≤100ms ✅ |
+> | recall@10 vs exact (C=512) | **0.9950** | ≥0.95 ✅ (C=256: 0.9830, C=1024: 1.0000) |
+> | pack isolation leak | **0** | 0 ✅ |
+> | ANN 캐시 지연 빌드 | 2.6 s | — |
+>
+> 활성화는 `VECTOR_ANN=binary` 옵트인(기본 off — 미설정 시 기존 exact 경로 100% 불변). 운영 절차·롤백: `docs/vector-backends.md` §4.1.
 
 ---
 

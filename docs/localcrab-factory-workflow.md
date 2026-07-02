@@ -258,9 +258,12 @@ retrieves the relationship structure that explains why the answer is true.
 - **`VECTOR_BACKEND=sqlite-vec`(로컬 모드 기본)**: `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`, 테이블
   `vectors_kure`) 반환. 임베딩은 공유 헬퍼 `_make_kure_embedding_function`(KURE, EMBEDDING_BACKEND
   무관하게 KURE 표준)로 앱측 계산 후 INSERT. Chroma의 다중프로세스 쓰기 제약을 SQLite WAL 규율로 대체.
-  `EMBEDDING_BACKEND=local`과 조합 시 기동 ValueError(minilm 384d 미지원). 설계·전환·성능:
+  `EMBEDDING_BACKEND=local`과 조합 시 기동 ValueError(minilm 384d 미지원). factory 는 `VECTOR_ANN`
+  (기본 off / `binary` = 전역 검색 2단계 ANN)·`VECTOR_ANN_COARSE_K`(coarse 후보 수, 기본 512)도
+  검증 후 스토어에 전달한다 — 잘못된 `VECTOR_ANN` 값은 기동 ValueError. 설계·전환·성능:
   `docs/pgvector-migration-plan.md` (A) 경로 §3.6/§3.7, 전환 스크립트
-  `scripts/migrate_chroma_to_sqlite_vec.py`. 모드×옵션 매트릭스: `docs/vector-backends.md`.
+  `scripts/migrate_chroma_to_sqlite_vec.py`·`scripts/migrate_add_binary_quantization.py`.
+  모드×옵션 매트릭스: `docs/vector-backends.md`.
 - **`VECTOR_BACKEND=chroma`(docker 모드 기본 / local+minilm 조합 기본)**: 아래 EMBEDDING_BACKEND 분기대로 ChromaStore 반환.
 - **`VECTOR_BACKEND=pgvector`**: 예약(미구현) — `NotImplementedError`.
 
