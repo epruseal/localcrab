@@ -28,8 +28,8 @@ SCHEMA / INDEX (프리플라이트 실증 완료, 2026-07 — 이대로 구현):
     미채택) — where 필터의 pack_id 등가/멤버십은 이 컬럼으로 푸시다운하고,
     나머지 키는 ``metadata ->> 'key'`` JSONB 조건으로 번역한다(§ query 참고).
     ANN 인덱스는 HNSW(``vector_cosine_ops``, ``m=16, ef_construction=64``) —
-    쿼리 시 세션 파라미터 ``hnsw.ef_search``(생성자 인자, 기본 150 — recall 0.95
-    경계에 여유 마진을 둔 값)를 SET한다. HNSW 빌드가 이 RPi 환경의 좁은
+    쿼리 시 세션 파라미터 ``hnsw.ef_search``(생성자 인자, 기본 500 — 179k 전량
+    실측에서 150은 recall 0.9370로 게이트 미달, 500이 0.9600/p95 24.6ms)를 SET한다. HNSW 빌드가 이 RPi 환경의 좁은
     /dev/shm(64MB)에서 병렬 빌드로 실패하는 것을 프리플라이트에서 확인했으므로,
     인덱스 생성 직전 ``maintenance_work_mem='512MB'``/``max_parallel_maintenance_workers=0``
     을 SET한 뒤 CREATE INDEX한다(ensure-schema에서 1회, 세션 단위이므로 부작용 없음).
@@ -92,7 +92,7 @@ class PgVectorStore:
         embedding_function: Callable[[list[str]], list[list[float]]],
         dim: int = 1024,
         collection_name: str = "opencrab_vectors_kure",
-        ef_search: int = 150,
+        ef_search: int = 500,
     ) -> None:
         """
         Parameters
@@ -114,8 +114,8 @@ class PgVectorStore:
             f-string으로 SQL에 보간되므로 인젝션 방지).
         ef_search:
             쿼리 시 세션 파라미터 ``hnsw.ef_search`` 값(recall/속도 트레이드오프
-            노브). 기본 150 — 프리플라이트에서 recall 0.95 경계에 여유 마진을
-            확인한 값.
+            노브). 기본 500 — 179k 전량 실측에서 150은 recall 0.9370로 게이트
+            미달, 500이 recall 0.9600/p95 24.6ms(ef 곡선: vector-backends.md §4.2).
         """
         if embedding_function is None:
             raise ValueError("PgVectorStore requires an embedding_function.")

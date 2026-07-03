@@ -355,7 +355,7 @@ class PGGraphStore:
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Not supported in PG mode — returns empty list with a warning (matches local mode)."""
-        logger.warning("run_cypher() is not supported in local mode; returning [].")
+        logger.warning("run_cypher() is not supported in pg mode; returning [].")
         return []
 
     def _fetch_node_props(self, conn: Any, node_type: str, node_id: str) -> dict[str, Any] | None:

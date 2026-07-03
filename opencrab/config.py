@@ -158,7 +158,7 @@ class Settings(BaseSettings):
     #                        INSERT(vec0 는 원시벡터 저장). VECTOR_DB_FILE 의 vec0 테이블 사용.
     #   "pgvector"         : pgvector(PostgreSQL 확장). PG-unified((B) 경로) 구현
     #                        완료 — HNSW(m16/ef_construction64), 쿼리 시 세션
-    #                        hnsw.ef_search=PG_EF_SEARCH(기본 150). STORAGE_MODE=pg
+    #                        hnsw.ef_search=PG_EF_SEARCH(기본 500). STORAGE_MODE=pg
     #                        이면 자동 선택(vector_backend_resolved), local 모드에서
     #                        VECTOR_BACKEND=pgvector 명시 설정으로 벡터만 PG를 쓰는
     #                        조합도 가능(§6.3 (C) 단계). 실측: pgvector-migration-plan.md.
