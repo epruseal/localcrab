@@ -58,7 +58,7 @@ VECTOR_BACKEND 명시됨?
 
 | # | 경로 | 적재 방식 | 본 계획 범위 |
 |---|---|---|---|
-| ① | `load_local_packs.py` | 로컬 스토어 **직접** 적재(`make_*_store`+`OntologyBuilder`) + `--fresh` 삭제(`delete_pack`, 라인 313-361). 백엔드가 chroma면 적재 전 `chroma.lock(LOCK_EX)` 선점 후 실패 시 MCP 중지 안내(라인 585-598); sqlite-vec/pg면 이 락 로직 자체가 no-op | **MCP 모드 전환 대상** |
+| ① | `load_local_packs.py` (외부 ops 스크립트, `~/opencrab-dump/scripts/ops/`) | 로컬 스토어 **직접** 적재(`make_*_store`+`OntologyBuilder`) + `--fresh` 삭제(`delete_pack`). 로더는 백엔드 무관 **무조건** `chroma.lock(LOCK_EX)`을 flock한다 — 다만 sqlite-vec/pg 백엔드에서는 MCP 서버가 이 락의 SH를 잡지 않으므로(`tools.py`의 조건부 획득) EX 획득이 항상 즉시 성공해 **결과적으로 MCP 중지가 불필요**하다. chroma 백엔드일 때만 EX 실패 → MCP 중지 안내 경로가 발동한다 | **MCP 모드 전환 대상** |
 | ② | 대화 reingest hook — `hooks/claude/localcrab-session-end.sh` + `hooks/claude/localcrab-lib.sh` | **이미 MCP `pack_ingest` 경유**(append-only, purge 없음). `lc_call`이 `initialize`→`tools/call` 핸드셰이크 + 3회 재시도 + outbox 재시도 큐 구현 | **호환성 회귀 검증 대상** (신규 도구가 기존 `pack_ingest` 동작을 깨지 않는지) |
 | ③ | `load_to_localcrab.py` | Neo4j(STORAGE_MODE=docker) 벌크 적재. ①과 노드/엣지/청크 패스 **중복(복붙)** | **비목표**(별도 토폴로지, 영향분석만) |
 | 보조 | `backfill_kure.py`(vector/doc upsert만), `dump_*conversations.py` 3종(jsonl 변환 전단계, 스토어 미접근) | — | **비목표** |
@@ -109,7 +109,7 @@ VECTOR_BACKEND 명시됨?
 **로더 측 변경 (개념)**
 - 현재 `OntologyBuilder` 직접 호출 지점(노드 `load_nodes`, 엣지 `load_edges`, 청크 `load_chunks`)을 MCP 클라이언트 호출로 치환하는 어댑터를 둔다. **임베딩은 서버측에서 계산되므로 로더는 텍스트만 전송**한다(chroma/sqlite-vec 모두 동일 — 앱측 임베딩 후 저장이라는 계약은 `sqlite_vec_store.py`가 chroma의 openai 경로를 그대로 따른다).
 - **`id_map`은 로더가 입력 파일에서 직접 구축한다.** `load_nodes`가 이미 입력 row의 space/node_type을 정규화해 `id_map[node_id]=(space, node_type)`를 만들고(`load_local_packs.py:420`) 엣지 적재 시 조회한다(`456-464`). 즉 **서버 응답에 의존할 필요가 없다** — MCP 모드에서도 같은 입력 기반 맵을 유지하면 된다.
-- `chroma.lock(LOCK_EX)` 획득 로직은 MCP 모드에서 **건너뛴다**(로더가 chroma를 직접 만지지 않으므로). sqlite-vec/pg 백엔드면 애초에 이 로직 자체가 이미 조건부로 스킵된다(§1.2).
+- `chroma.lock(LOCK_EX)` 획득 로직은 MCP 모드에서 **건너뛴다**(로더가 chroma를 직접 만지지 않으므로). 참고: 현행 로더는 백엔드 무관 무조건 flock하지만, sqlite-vec/pg에서는 MCP 서버가 SH를 잡지 않아(`tools.py` 조건부 획득) 충돌이 발생하지 않는다 — 조건부 스킵은 MCP 서버 쪽(§1.2) 이야기다.
 
 ---
 
@@ -218,7 +218,7 @@ VECTOR_BACKEND 명시됨?
 - **purge 후 재적재 정합성:** 직접 모드 `--fresh` 결과와 MCP `pack_purge`+ingest 결과의 노드/엣지/청크 수·샘플이 일치하는지 비교.
 - **응답 부분실패 검출:** content wrapper(`{"content":[{"text":…}]}`) 파싱 후 `error`/`node_errors`/`edge_errors`를 로더가 검출·재시도하는지 확인(HTTP 200이어도 본문 error 가능).
 - **대량 적재 처리량:** 적응형 배치(큰 배치) vs 고정 256, JSON-RPC 배치 배열 유무별 적재 시간 측정. 다수 팩 동시 로드 시나리오에서 직접 모드 대비 회귀 폭 기록.
-- **락 안전:** chroma 백엔드일 때 MCP 모드 적재 중 `chroma.lock(LOCK_EX)`를 잡지 않음을 확인(로더가 chroma 미접근). sqlite-vec/pg 백엔드일 때는 애초에 이 로직이 조건부로 스킵됨(`vector_backend_resolved != "chroma"`)을 확인.
+- **락 안전:** chroma 백엔드일 때 MCP 모드 적재 중 `chroma.lock(LOCK_EX)`를 잡지 않음을 확인(로더가 chroma 미접근). sqlite-vec/pg 백엔드일 때는 MCP 서버가 SH를 잡지 않으므로(`vector_backend_resolved != "chroma"` — MCP 측 조건부 획득) 로더의 무조건 flock과 충돌하지 않음을 확인.
 - **백업 복구 리허설:** §5 단계 0 백업본으로 복원 시 적재 전 상태로 되돌아가는지 1회 확인.
 
 ---
