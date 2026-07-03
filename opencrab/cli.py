@@ -676,7 +676,7 @@ def export_neo4j_pack(
 ) -> None:
     """Export graph store snapshot to OpenCrab Pack v1 JSONL.
 
-    Works with all storage modes (local/kuzu/docker) via STORAGE_MODE env var.
+    Works with all storage modes (local/kuzu/docker/pg) via STORAGE_MODE env var.
     """
     from opencrab.config import get_settings
     from opencrab.pack import export_neo4j_opencrab_ingest

@@ -12,21 +12,47 @@ Usage:
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from opencrab.config import Settings
 
 
+@lru_cache(maxsize=8)
+def _get_pg_engine(url: str) -> Any:
+    """PG-unified(storage_mode=="pg") 모드에서 4스토어(sql/vector/doc/graph)가
+    공유할 SQLAlchemy 엔진을 URL당 1회만 생성해 캐시한다(§3.5 단일 커넥션 풀).
+
+    lru_cache 를 쓰는 이유: make_graph_store/make_vector_store/make_doc_store/
+    make_sql_store 는 기존 시그니처(settings 단일 인자)를 그대로 유지해야 하므로
+    프로세스 전역 상태를 팩토리 함수 사이에서 명시적으로 전달할 방법이 없다.
+    URL 을 캐시 키로 쓰면 같은 POSTGRES_URL 로 호출되는 모든 make_* 가 같은
+    Engine 인스턴스를 받는다(다른 URL 이면 별도 엔진 — 테스트에서 여러 DSN을
+    쓰는 경우에도 안전). 프로세스 수명 동안 유지되며, 각 스토어는
+    dsn_or_engine 이 Engine 인스턴스이면 close() 에서 dispose 하지 않는다
+    (owns_engine=False — 다른 스토어가 계속 쓰는 풀을 끊지 않기 위함).
+    """
+    from sqlalchemy import create_engine
+
+    return create_engine(url, pool_pre_ping=True)
+
+
 def make_graph_store(settings: Settings) -> Any:
-    """Return KuzuGraphStore (kuzu), LocalGraphStore (local), or Neo4jStore (docker).
+    """Return PGGraphStore (pg), KuzuGraphStore (kuzu), LocalGraphStore (local),
+    or Neo4jStore (docker).
 
     kuzu 모드는 ladybug>=0.18 런타임(리브랜딩된 KùzuDB)을 사용한다. 과거에는
     RPi5 16KB 페이지 커널에서 구버전 kuzu의 madvise 호출이 크래시해
     LD_PRELOAD=madv_noop.so 로 우회했으나, ladybug>=0.18 이 이 문제를 자체
     처리해(LadybugDB/ladybug#527) 우회가 더 이상 필요하지 않다.
     """
-    if settings.storage_mode == "kuzu":
+    if settings.storage_mode == "pg":
+        from opencrab.stores.pg_graph_store import PGGraphStore
+
+        engine = _get_pg_engine(settings.postgres_url)
+        return PGGraphStore(engine)
+    elif settings.storage_mode == "kuzu":
         from opencrab.stores.kuzu_graph_store import KuzuGraphStore
 
         db_path = os.path.join(settings.local_data_dir, "graph.kuzu")
@@ -91,7 +117,10 @@ def make_vector_store(settings: Settings) -> Any:
       "chroma"     : ChromaDB. EMBEDDING_BACKEND 로 EF 분기(기존 동작 100% 보존).
       "sqlite-vec" : sqlite-vec(vec0). 앱이 KURE EF 로 직접 임베딩 후 INSERT.
                      4스토어를 단일 SQLite WAL 규율로 통일(Chroma 제약 제거).
-      "pgvector"   : (예약) 미구현 — 명시적 오류.
+      "pgvector"   : pgvector(PostgreSQL 확장). STORAGE_MODE=pg 이면 sql/doc/graph
+                     와 동일 공유 SQLAlchemy 엔진을 주입받는다. storage_mode!="pg"
+                     여도 VECTOR_BACKEND=pgvector 를 명시하면 벡터만 PG 를 쓸 수
+                     있다(§6.3 (C) 단계 — 이 경우 postgres_url 로 자체 엔진 생성).
 
     설계: docs/pgvector-migration-plan.md §3.6 / §9. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
@@ -129,9 +158,32 @@ def make_vector_store(settings: Settings) -> Any:
         )
 
     if backend == "pgvector":
-        raise NotImplementedError(
-            "VECTOR_BACKEND=pgvector 는 아직 미구현입니다 "
-            "(docs/pgvector-migration-plan.md (B) 경로)."
+        from opencrab.stores.pg_vector_store import PgVectorStore
+
+        # EMBEDDING_BACKEND guard mirrors the sqlite-vec branch above: pgvector
+        # stores raw vectors (no internal EF), so the app-side KURE EF is
+        # required — minilm has no app-callable EF (Chroma-internal ONNX only).
+        if settings.embedding_backend != "openai":
+            raise ValueError(
+                "VECTOR_BACKEND=pgvector 는 EMBEDDING_BACKEND=openai (KURE 1024d) 가 필요합니다. "
+                f"현재 EMBEDDING_BACKEND={settings.embedding_backend!r}. "
+                "KURE EF 로 앱측 임베딩 후 pgvector 테이블에 INSERT 하므로 minilm(384d)은 미지원입니다."
+            )
+        # storage_mode=="pg" 이면 sql/doc/graph 와 동일 공유 엔진(§3.5). 아니면
+        # (VECTOR_BACKEND=pgvector 명시 + local 모드 등) 벡터 전용 DSN 으로
+        # PgVectorStore 가 자체 엔진을 생성한다(dsn_or_engine=str 경로).
+        dsn_or_engine: Any = (
+            _get_pg_engine(settings.postgres_url)
+            if settings.storage_mode == "pg"
+            else settings.postgres_url
+        )
+        ef = _make_kure_embedding_function(settings)
+        return PgVectorStore(
+            dsn_or_engine,
+            embedding_function=ef,
+            dim=settings.embed_dim,
+            collection_name=settings.embed_collection,
+            ef_search=settings.pg_ef_search,
         )
 
     if backend != "chroma":
@@ -166,7 +218,7 @@ def make_vector_store(settings: Settings) -> Any:
 
 
 def make_doc_store(settings: Settings) -> Any:
-    """Return LocalSQLDocStore (local) or MongoStore (docker).
+    """Return LocalSQLDocStore (local/kuzu), PgDocStore (pg), or MongoStore (docker).
 
     WHY LocalSQLDocStore INSTEAD OF LocalDocStore (JSON):
         list_nodes(limit=50000) is called on every BM25 cache rebuild (i.e.
@@ -197,6 +249,11 @@ def make_doc_store(settings: Settings) -> Any:
 
         db_path = Path(settings.local_data_dir) / "doc_store.db"
         return LocalSQLDocStore(str(db_path))
+    elif settings.storage_mode == "pg":
+        from opencrab.stores.pg_doc_store import PgDocStore
+
+        engine = _get_pg_engine(settings.postgres_url)
+        return PgDocStore(engine)
     else:
         from opencrab.stores.mongo_store import MongoStore
 
@@ -204,8 +261,11 @@ def make_doc_store(settings: Settings) -> Any:
 
 
 def make_sql_store(settings: Settings) -> Any:
-    """Return SQLStore with SQLite (local) or PostgreSQL (docker)."""
+    """Return SQLStore with SQLite (local/kuzu), PostgreSQL (docker), or the
+    shared PG engine's URL (pg — SQLStore itself always create_engine()s from a
+    URL, so it does not participate in the shared-Engine injection of
+    graph/doc/vector; it opens its own connection against the same database)."""
     from opencrab.stores.sql_store import SQLStore
 
-    url = settings.sqlite_url if settings.is_local else settings.postgres_url
+    url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
     return SQLStore(url=url)
