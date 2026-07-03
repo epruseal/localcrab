@@ -199,8 +199,9 @@ opencrab serve
   - MVCC로 리더가 라이터를 막지 않고, 라이터는 행 단위로만 경합 — 다중 프로세스
     (MCP 서버 + 백그라운드 로더)가 락 없이 동시에 읽고 쓸 수 있다.
   - **HNSW 인덱스**(`vector_cosine_ops`, `m=16, ef_construction=64`, 쿼리 세션
-    `hnsw.ef_search`=`PG_EF_SEARCH` 기본 150)가 **전역(pack 미지정) 검색도** 서브선형으로
-    처리 — 실측 p95 **6.44ms**. sqlite-vec가 전역 브루트포스(868ms)를 완화하려고 도입한
+    `hnsw.ef_search`=`PG_EF_SEARCH` 기본 500 — §4.2 Phase 2 게이트 재측정으로 150→500
+    상향)가 **전역(pack 미지정) 검색도** 서브선형으로 처리 — 179,784건 전량 실측 global
+    p95 **24.61ms**(ef=500). sqlite-vec가 전역 브루트포스(868ms)를 완화하려고 도입한
     binary 2단계 양자화(§4.1) 같은 별도 가속이 애초에 불필요하다.
   - `pg_dump`/`pg_restore`/PITR로 vectors·doc·sql·graph를 한 번에 정합성 있게 백업·복구.
 - **단점**
@@ -243,32 +244,50 @@ opencrab serve
 | pack-scoped p95 — 중(316건) | ≤100ms | 3.93 / **6.73** ms | ✅ |
 | pack-scoped p95 — 소(10건) | ≤100ms | 1.83 / **3.36** ms | ✅ |
 | 필터 조합(pack_id+metadata) p95 | ≤200ms | 7.09 / **7.90** ms | ✅ |
-| recall@10 (HNSW vs exact, ef_search=150) | ≥0.95 | **0.9440** | ❌ |
+| recall@10 (HNSW vs exact, ef_search=500) | ≥0.95 | **0.9600** | ✅ |
 | pack isolation leak | 0 | **0** | ✅ |
 
-**recall 게이트 FAIL 원인:** `PG_EF_SEARCH` 기본값 150은 프리플라이트(소규모)에서 정한
-값으로, 179,784건 전량에서는 마진이 부족하다. ef_search 스윕(100쿼리, 동일 시드) 실측 —
-`ef=150`: 0.9310, `ef=300`: 0.9430, `ef=500`: **0.9550**(게이트 통과). global p95가
-8.24/22.60ms로 게이트(≤100ms) 대비 여유가 크므로, `ef_search`를 500 부근으로 올려도
-지연 게이트는 유지될 가능성이 높다 — **채택 시 `PG_EF_SEARCH` 기본값 상향 필요**(후속 조치,
-본 벤치 범위 밖).
+**recall 게이트 — 수정 및 재측정:** 최초 실측(`ef_search=150`)은 recall@10 0.9440으로
+게이트 미달이었다. `PG_EF_SEARCH` 기본값을 500으로 상향(`opencrab/config.py`)하고
+179,784건 전량·200쿼리·동일 시드(1234)로 ef별 recall/global p95 곡선을 재실측했다:
+
+| ef_search | recall@10 | global p50/p95 |
+|---|---|---|
+| 150 | 0.9370 | 5.11 / 10.48 ms |
+| 300 | 0.9490 | 7.99 / 15.52 ms |
+| 400 | 0.9500 | 10.20 / 21.11 ms(게이트 경계, 마진 부족) |
+| **500(채택)** | **0.9600** | **12.00 / 24.61 ms** |
+| 550 이상 | 1.0000 | 683.87 / 712.41 ms(지연 급증 — 동시 부하 없는 단독 측정에서도 재현, 하드웨어/캐시 한계로 추정) |
+
+500을 채택값으로 확정했다 — recall 마진(0.96 vs 게이트 0.95)과 지연 마진(24.61ms vs 게이트
+100ms, 4배 여유)을 동시에 만족하는 마지막 안전 구간이며, 550 이상에서는 지연이 약
+30~60배 급격히 나빠지므로 그 구간은 피해야 한다.
 
 **graph 게이트** (`PGGraphStore.find_neighbors` vs `LocalGraphStore.find_neighbors`,
-동일 노드 20개 — 차수 상위 허브 5개(최대 차수 6,583) + 무작위 15개, `direction=both,
+동일 노드 20개 — 차수 상위 허브 5개(최대 차수 6,586) + 무작위 15개, `direction=both,
 depth=3, limit=50`):
 
-| 지표 | 목표 | 실측 | 판정 |
+| 지표 | 목표 | 실측(수정 후) | 판정 |
 |------|------|------|------|
-| PGGraphStore 3-hop p50/p95 | ≤100ms | 102.27 / **164.82** ms | ❌ |
+| PGGraphStore 3-hop p50/p95(20노드 전체) | ≤100ms | 5.96 / **11.02** ms | ✅ |
+| PGGraphStore 3-hop p95 — 허브 5개만 | ≤100ms | 3.05 / **3.64** ms | ✅ |
+| PGGraphStore 3-hop p95 — 무작위 15개만 | ≤100ms | 7.02 / **11.16** ms | ✅ |
 | LocalGraphStore 3-hop p50/p95(참고) | — | 4.75 / 9.34 ms | — |
 
-**graph 게이트 FAIL 원인:** `PGGraphStore.find_neighbors`는 `LocalGraphStore`와 동일하게
-Python 오케스트레이션 BFS(단일 재귀 CTE 아님, §6.4 설계대로)라, 홉마다 노드 수만큼 개별
-SQL 왕복이 발생한다. `LocalGraphStore`는 인프로세스 SQLite라 왕복 비용이 사실상 0인 반면,
-`PGGraphStore`는 매 왕복이 소켓(로컬호스트 TCP)을 타 — 고차수 허브(차수 6,583)에서
-왕복 횟수가 누적돼 게이트를 최대 65% 초과했다. 재귀 CTE로 왕복 1회에 묶는 대안은
-§6.4에서 이미 canonical 경로로 채택돼 있으나 `find_neighbors`는 아직 Python BFS 포트
-상태 — **재귀 CTE 전환이 후속 조치**(본 벤치는 현 구현 그대로 측정, 조작 없음).
+**graph 게이트 — 원인 및 수정 내역:** 최초 실측(102.27/164.82ms)의 원인은
+`find_neighbors`가 홉의 각 프론티어 노드마다 엣지를 조회한 뒤 **반환된 각 행마다
+목적지/출발지 노드 속성을 개별 SELECT로 재조회**하는 N+1 패턴이었다 — 차수 6,586 허브는
+1홉만으로도 최대 ~50회의 개별 SQL 왕복(소켓 비용)이 발생했다. `PGGraphStore.find_neighbors`
+(`opencrab/stores/pg_graph_store.py`)를 홉 단위 배치 조회로 재작성해 해소했다: BFS 큐는
+FIFO 특성상 항상 레벨(홉) 단위로 진행되므로, 한 홉의 프론티어 노드 전체를
+`unnest(:frontier_ids) CROSS JOIN LATERAL (... LIMIT :cap)` 쿼리 1회로 후보 엣지를
+모으고(`:cap` = `limit` — 기존 "remaining"이 가질 수 있는 최댓값과 동일한 안전 상한이라
+허브의 전체 엣지 목록을 긁어오지 않는 성질은 그대로 유지), 후보 노드 속성도
+`unnest`+`JOIN` 쿼리 1회로 모은다. 원본의 "remaining slot" 순차 선택 로직(노드/방향/행
+순서, pack 필터 3규칙)은 메모리상에서 그대로 재현했다 — SQL은 후보 수집만 배치화했을 뿐
+선택 로직은 손대지 않아 파리티가 보존된다. 파리티 검증: `tests/test_pg_graph_doc_parity.py`
+36개 전부 통과(`OPENCRAB_PG_TEST_URL` 설정 시). 재귀 CTE(§6.4 canonical 경로)로의 전환은
+여전히 미착수 상태이나, 이번 홉 단위 배치화만으로 게이트를 9배 이상 여유 있게 통과했다.
 
 **doc 스팟체크** (`PgDocStore.keyword_search`, 실데이터 질의 3종):
 
@@ -316,30 +335,33 @@ SQL 왕복이 발생한다. `LocalGraphStore`는 인프로세스 SQLite라 왕�
 | 디스크 사용량 | 2,474 MB(graph 299 + doc 970 + vector 1,205) | **3,584 MB**(graph 260 + doc 806 + vector 2,518) | **PG가 약 45% 큼** — HNSW 인덱스(벡터 테이블 2,518MB 중 상당 비중) + JSONB/TOAST + PG 튜플 오버헤드가 원인. VACUUM 미실행 상태 수치 |
 | 콜드 커넥션(최초 1회) | 0.4ms(파일 open) | 73.1ms(TCP 커넥션+ping) | 상시 서버 프로세스 특성상 1회성 비용, 커넥션 풀 재사용 후 steady-state 영향 없음 |
 
-**§11.1 게이트 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=150 기준):
+**§11.1 게이트 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=500 · find_neighbors
+홉 단위 배치화 적용 기준 — 수정 후 재측정):
 
 | 게이트 | 목표 | 실측 | 판정 |
 |---|---|---|---|
 | single-pack top-k p95 | ≤100ms | 2.93\~6.73ms(대/중/소) | ✅ |
 | metadata-filtered top-k p95 | ≤200ms | 7.90ms | ✅ |
-| 3-hop graph traversal p95 | ≤100ms | 164.82ms | ❌ |
-| recall@10 (HNSW vs exact) | ≥0.95 | 0.9440 | ❌ |
+| 3-hop graph traversal p95 | ≤100ms | **11.02ms**(수정 전 164.82ms) | ✅ |
+| recall@10 (HNSW vs exact) | ≥0.95 | **0.9600**(수정 전 ef=150 기준 0.9440) | ✅ |
 | pack isolation leakage | 0 | 0 | ✅ |
 | pack delete consistency | orphan 0 | 0 | ✅ |
 | backup/restore | 1 command 완전 복구 | 행수 100% 일치 | ✅ |
 | cold start / disk usage | 측정·기록 | 디스크 +45%, 콜드스타트 +73ms | 기록(악화 명시) |
 
-**결론:** 8개 게이트 중 6개 PASS, 2개(3-hop graph p95, recall@10) FAIL. 두 FAIL 모두
-원인이 특정돼 있고 **설정/구현 조정으로 해소 가능**한 성격이다 — recall은 `PG_EF_SEARCH`
-상향(500 부근, 지연 여유 충분), graph는 `find_neighbors`의 재귀 CTE 전환(§6.4 canonical
-경로로 이미 설계됨, 미구현 상태)이 후속 조치다. sqlite-vec(A) 쪽 §11.1 실측(pack-scoped
-p95 8.3ms exact / global p95 exact 593ms·binary 55ms recall 0.995)과 나란히 보면,
-pack-scoped 지연은 pgvector가 근소 우위(2.93\~6.73ms vs 8.3ms)이나 절대 격차는 작고,
-global 검색은 pgvector(HNSW, ef=150 기준 22.60ms)가 sqlite-vec의 binary 2단계(54.8ms)보다
-빠르면서 recall 조정 여지도 있다(ef_search 상향). graph/doc/backup 축은 pgvector 전용
-이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하나 graph 3-hop 지연은 현 구현 상태로는
-(A)의 인프로세스 SQLite(LocalGraphStore, 4.75\~9.34ms)에 크게 못 미친다. (A)/(B) 최종
-채택은 이 두 FAIL의 해소 여부(§9 힌지와 함께)를 확인한 뒤 재게이트로 확정한다.
+**결론:** 최초 게이트 실측은 8개 중 6개 PASS, 2개(3-hop graph p95, recall@10) FAIL이었다.
+두 FAIL 모두 원인을 특정해 해소했다 — recall은 `PG_EF_SEARCH` 기본값을 500으로 상향(ef별
+곡선 실측으로 550 이상의 지연 급증 구간을 확인하고 그 직전 안전값을 채택), graph는
+`find_neighbors`를 홉 단위 배치 조회(unnest+LATERAL)로 재작성해 N+1 SQL 왕복을 제거했다
+(재귀 CTE 전환은 여전히 미착수 상태로 남아 있으나 이번 배치화만으로 게이트를 만족).
+재측정 결과 8개 게이트 전부 PASS. sqlite-vec(A) 쪽 §11.1 실측(pack-scoped p95 8.3ms
+exact / global p95 exact 593ms·binary 55ms recall 0.995)과 나란히 보면, pack-scoped
+지연은 pgvector가 근소 우위(2.93\~6.73ms vs 8.3ms)이나 절대 격차는 작고, global 검색은
+pgvector(HNSW, ef=500 기준 24.61ms)가 sqlite-vec의 binary 2단계(54.8ms)보다 빠르면서
+recall도 게이트를 만족한다(0.96). graph 3-hop 지연도 수정 후 11.02ms로 (A)의 인프로세스
+SQLite(LocalGraphStore, 4.75\~9.34ms)에 근접한다. graph/doc/backup 축은 pgvector 전용
+이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하며, 두 FAIL이 해소됨에 따라 (B) 채택의
+성능 측 장애 요인은 남아 있지 않다. 최종 채택은 §9 힌지와 함께 확정한다.
 
 ---
 
@@ -422,7 +444,7 @@ opencrab serve
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(§4.1, sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수 C(recall 튜닝 노브, ≤4096) |
-| `PG_EF_SEARCH` | `150` | pgvector HNSW 쿼리 세션 파라미터 `hnsw.ef_search`(recall/속도 트레이드오프, pgvector 전용) |
+| `PG_EF_SEARCH` | `500` | pgvector HNSW 쿼리 세션 파라미터 `hnsw.ef_search`(recall/속도 트레이드오프, pgvector 전용) — §4.2 재측정으로 150→500 상향(recall@10 게이트 ≥0.95 확보) |
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버+GGUF 폴백, `local` = minilm |
 | `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소. 콤마로 여러 URL 을 나열하면 순서대로 시도하는 체인이 된다(예: `http://a:1234/v1,http://b:1234/v1`) — 첫 서버 장애 시 다음 서버, 전부 장애 시 GGUF 폴백. 단일 URL 이면 기존과 동일 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 임베딩 모델 id |

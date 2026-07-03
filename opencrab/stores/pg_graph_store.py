@@ -20,13 +20,31 @@ INTENTIONAL DEVIATION (find_neighbors/find_path traversal strategy):
     exact interleaving declaratively in one SQL statement risks subtle
     ordering/truncation differences from the reference implementation, and
     the task's own acceptance bar is "identical input -> identical output"
-    parity against LocalGraphStore. The performance property that actually
-    caused the hub blow-up (534ms) is preserved: every per-node fetch is
-    still bounded by "LIMIT :remaining" (never fetches a hub's full edge
-    list), which is the exact mechanism validated for LocalGraphStore at
-    154k/431k scale. Each hop is one localhost round trip; PGGraphStore does
-    not claim the identical 61ms p95 figure, but does not re-introduce the
-    unbounded-fetch failure mode either.
+    parity against LocalGraphStore.
+
+    find_neighbors() BATCHING (post-Phase-2-gate fix): the 179k-scale gate
+    measured 102.27/164.82ms p50/p95 on a 3-hop hub query (gate <=100ms),
+    root-caused to a per-ROW round trip: the original port fetched each
+    candidate edge's destination/source node properties with one
+    SELECT-by-PK *per row*, so a degree-6,583 hub incurred up to ~50
+    individual round trips for a single hop (capped by `limit`, but still
+    one socket round trip per row). Fixed by batching candidate collection
+    per BFS *level* (all frontier nodes at the same depth, processed
+    together in FIFO order — a queue-based BFS is always in level order, so
+    "the current level" is just the run of nodes at the front of the queue
+    sharing the same depth): one `unnest(:frontier_ids) CROSS JOIN LATERAL
+    (... LIMIT :cap)` query collects every frontier node's candidate edges
+    in one round trip (`:cap` = the traversal's `limit` parameter — the same
+    safe upper bound "remaining" could ever reach, so no hub's full edge
+    list is ever fetched), and one more `unnest` + join collects every
+    candidate node's properties in one round trip. The Python "remaining
+    slot" selection logic is untouched — it walks the prefetched rows in the
+    exact same per-node, per-direction, per-row order the original live
+    queries returned them in (same WHERE clause / no ORDER BY / same scan
+    plan, so slicing a `LIMIT :limit` batch to `[:remaining]` reproduces what
+    a live `LIMIT :remaining` query would have returned), so output is
+    unchanged — only round-trip *count* drops, from O(rows fetched) to O(3
+    per hop) regardless of frontier size or hub degree.
 
 LIFECYCLE NOTE: close() disposes the engine only when this store created it
     from a DSN string. When an external SQLAlchemy Engine is injected, the
@@ -359,6 +377,63 @@ class PGGraphStore:
         ).fetchone()
         return _as_dict(row[0]) if row else None
 
+    def _batch_frontier_edges(
+        self, conn: Any, frontier_ids: list[str], cap: int, out: bool
+    ) -> dict[str, list[tuple[str, str, str, Any]]]:
+        """One-round-trip candidate fetch for every node in `frontier_ids`.
+
+        Equivalent to running "SELECT ... WHERE from_id=:fid LIMIT :cap" (or
+        to_id for in-edges) once per frontier node, but as a single
+        unnest+LATERAL query. `cap` is `limit` (the traversal's max possible
+        "remaining" value) — a safe, hub-safe upper bound; callers still
+        apply the live "remaining" cap by slicing the per-node row list.
+        """
+        if not frontier_ids:
+            return {}
+        anchor_col = "from_id" if out else "to_id"
+        type_col = "to_type" if out else "from_type"
+        id_col = "to_id" if out else "from_id"
+        rows = conn.execute(
+            self._text(
+                f"""
+                SELECT f.frontier_id, e.c1, e.c2, e.relation, e.properties
+                FROM unnest(CAST(:ids AS text[])) AS f(frontier_id)
+                CROSS JOIN LATERAL (
+                    SELECT {type_col} AS c1, {id_col} AS c2, relation, properties
+                    FROM {self._t}.graph_edges
+                    WHERE {anchor_col} = f.frontier_id
+                    LIMIT :cap
+                ) e
+                """
+            ),
+            {"ids": frontier_ids, "cap": cap},
+        ).fetchall()
+        out_map: dict[str, list[tuple[str, str, str, Any]]] = {}
+        for frontier_id, c1, c2, relation, props in rows:
+            out_map.setdefault(frontier_id, []).append((c1, c2, relation, props))
+        return out_map
+
+    def _batch_node_props_multi(
+        self, conn: Any, pairs: set[tuple[str, str]]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """One-round-trip node-properties fetch for a set of (type, id) pairs."""
+        if not pairs:
+            return {}
+        types = [p[0] for p in pairs]
+        ids = [p[1] for p in pairs]
+        rows = conn.execute(
+            self._text(
+                f"""
+                SELECT g.node_type, g.node_id, g.properties
+                FROM unnest(CAST(:types AS text[]), CAST(:ids AS text[])) AS p(node_type, node_id)
+                JOIN {self._t}.graph_nodes g
+                  ON g.node_type = p.node_type AND g.node_id = p.node_id
+                """
+            ),
+            {"types": types, "ids": ids},
+        ).fetchall()
+        return {(r[0], r[1]): _as_dict(r[2]) for r in rows}
+
     def find_neighbors(
         self,
         node_id: str,
@@ -371,9 +446,10 @@ class PGGraphStore:
         """BFS neighbour traversal — Python-orchestrated port of LocalGraphStore.
 
         Same algorithm, same "remaining slot" fan-out cap per direction per
-        node (SQL LIMIT :remaining), same pack-filter 3-rule policy. See
-        module docstring for why this stays Python-orchestrated rather than
-        a single recursive CTE.
+        node, same pack-filter 3-rule policy. Candidate rows are gathered in
+        per-level batches (see module docstring / _batch_frontier_edges);
+        the selection logic below is otherwise identical to a naive
+        per-node, per-row live-query implementation.
         """
         self._require_available()
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
@@ -385,89 +461,90 @@ class PGGraphStore:
                     return []
 
             visited: set[str] = {node_id}
-            queue: deque[tuple[str, int]] = deque([(node_id, 0)])
             results: list[dict[str, Any]] = []
+            level: list[tuple[str, int]] = [(node_id, 0)]
 
-            while queue and len(results) < limit:
-                current_id, current_depth = queue.popleft()
-                if current_depth >= depth:
-                    continue
+            while level and len(results) < limit:
+                expandable = [nid for nid, d in level if d < depth]
 
-                if direction in ("out", "both"):
-                    remaining = limit - len(results)
-                    if remaining > 0:
-                        rows = conn.execute(
-                            self._text(
-                                f"""
-                                SELECT to_type, to_id, relation, properties
-                                FROM {self._t}.graph_edges WHERE from_id=:fid LIMIT :lim
-                                """
-                            ),
-                            {"fid": current_id, "lim": remaining},
-                        ).fetchall()
-                        for row in rows:
-                            if len(results) >= limit:
-                                break
-                            to_type, to_id, relation, edge_props_raw = row
-                            if to_id in visited:
-                                continue
-                            dst_props = self._fetch_node_props(conn, to_type, to_id)
-                            if not dst_props:
-                                continue
-                            if pack_set is not None:
-                                dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
-                                if not dst_pass:
-                                    continue
-                                edge_props = _as_dict(edge_props_raw)
-                                if not _edge_passes(edge_props, True, dst_pass, pack_set):
-                                    continue
-                            visited.add(to_id)
-                            results.append({
-                                "properties": dst_props,
-                                "labels": [to_type],
-                                "relation_type": relation,
-                                "relationship_types": [relation],
-                                "depth": current_depth + 1,
-                            })
-                            queue.append((to_id, current_depth + 1))
+                out_batch: dict[str, list] = {}
+                in_batch: dict[str, list] = {}
+                if expandable:
+                    if direction in ("out", "both"):
+                        out_batch = self._batch_frontier_edges(conn, expandable, limit, out=True)
+                    if direction in ("in", "both"):
+                        in_batch = self._batch_frontier_edges(conn, expandable, limit, out=False)
 
-                if direction in ("in", "both"):
-                    remaining = limit - len(results)
-                    if remaining > 0:
-                        rows = conn.execute(
-                            self._text(
-                                f"""
-                                SELECT from_type, from_id, relation, properties
-                                FROM {self._t}.graph_edges WHERE to_id=:tid LIMIT :lim
-                                """
-                            ),
-                            {"tid": current_id, "lim": remaining},
-                        ).fetchall()
-                        for row in rows:
-                            if len(results) >= limit:
-                                break
-                            from_type, from_id, relation, edge_props_raw = row
-                            if from_id in visited:
-                                continue
-                            src_props = self._fetch_node_props(conn, from_type, from_id)
-                            if not src_props:
-                                continue
-                            if pack_set is not None:
-                                src_pass = _node_passes(src_props, pack_set, include_unpackaged)
-                                if not src_pass:
+                candidate_pairs: set[tuple[str, str]] = set()
+                for rows in out_batch.values():
+                    candidate_pairs.update((c1, c2) for c1, c2, _rel, _props in rows)
+                for rows in in_batch.values():
+                    candidate_pairs.update((c1, c2) for c1, c2, _rel, _props in rows)
+                props_cache = self._batch_node_props_multi(conn, candidate_pairs)
+
+                next_level: list[tuple[str, int]] = []
+
+                for current_id, current_depth in level:
+                    if current_depth >= depth:
+                        continue
+
+                    if direction in ("out", "both"):
+                        remaining = limit - len(results)
+                        if remaining > 0:
+                            for to_type, to_id, relation, edge_props_raw in out_batch.get(current_id, [])[:remaining]:
+                                if len(results) >= limit:
+                                    break
+                                if to_id in visited:
                                     continue
-                                edge_props = _as_dict(edge_props_raw)
-                                if not _edge_passes(edge_props, src_pass, True, pack_set):
+                                dst_props = props_cache.get((to_type, to_id))
+                                if not dst_props:
                                     continue
-                            visited.add(from_id)
-                            results.append({
-                                "properties": src_props,
-                                "labels": [from_type],
-                                "relation_type": relation,
-                                "relationship_types": [relation],
-                                "depth": current_depth + 1,
-                            })
-                            queue.append((from_id, current_depth + 1))
+                                if pack_set is not None:
+                                    dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
+                                    if not dst_pass:
+                                        continue
+                                    edge_props = _as_dict(edge_props_raw)
+                                    if not _edge_passes(edge_props, True, dst_pass, pack_set):
+                                        continue
+                                visited.add(to_id)
+                                results.append({
+                                    "properties": dst_props,
+                                    "labels": [to_type],
+                                    "relation_type": relation,
+                                    "relationship_types": [relation],
+                                    "depth": current_depth + 1,
+                                })
+                                next_level.append((to_id, current_depth + 1))
+
+                    if direction in ("in", "both"):
+                        remaining = limit - len(results)
+                        if remaining > 0:
+                            for from_type, from_id, relation, edge_props_raw in in_batch.get(current_id, [])[:remaining]:
+                                if len(results) >= limit:
+                                    break
+                                if from_id in visited:
+                                    continue
+                                src_props = props_cache.get((from_type, from_id))
+                                if not src_props:
+                                    continue
+                                if pack_set is not None:
+                                    src_pass = _node_passes(src_props, pack_set, include_unpackaged)
+                                    if not src_pass:
+                                        continue
+                                    edge_props = _as_dict(edge_props_raw)
+                                    if not _edge_passes(edge_props, src_pass, True, pack_set):
+                                        continue
+                                visited.add(from_id)
+                                results.append({
+                                    "properties": src_props,
+                                    "labels": [from_type],
+                                    "relation_type": relation,
+                                    "relationship_types": [relation],
+                                    "depth": current_depth + 1,
+                                })
+                                next_level.append((from_id, current_depth + 1))
+
+                level = next_level
 
         return results[:limit]
 

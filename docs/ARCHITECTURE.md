@@ -476,9 +476,11 @@ make_vector_store(settings)
   `docs/pgvector-migration-plan.md` (A) §3.6/§3.7, `docs/vector-backends.md` §4.1.
 - `chroma`(docker 모드 기본 / local+minilm 조합 기본): `ChromaStore` (위 그림 그대로).
 - `pgvector`(`STORAGE_MODE=pg` 기본): `PgVectorStore`(HNSW `m=16,ef_construction=64`,
-  쿼리 세션 `hnsw.ef_search=PG_EF_SEARCH` 기본 150). `EMBEDDING_BACKEND=local`과 조합 시
-  ValueError(sqlite-vec와 동일 가드). 전역 검색도 HNSW로 실측 p95 6.44ms라 sqlite-vec의
-  binary 2단계 같은 별도 가속 불필요. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로.
+  쿼리 세션 `hnsw.ef_search=PG_EF_SEARCH` 기본 500 — §4.2 Phase 2 게이트 재측정으로
+  150→500 상향). `EMBEDDING_BACKEND=local`과 조합 시 ValueError(sqlite-vec와 동일 가드).
+  전역 검색도 HNSW로 179,784건 전량 실측 p95 24.61ms라 sqlite-vec의 binary 2단계 같은
+  별도 가속 불필요. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로,
+  `docs/vector-backends.md` §4.2.
 
 모드×옵션 전체 매트릭스는 `docs/vector-backends.md` 참고.
 

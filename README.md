@@ -279,8 +279,8 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 **`chroma` (docker 모드 기본 / local+minilm 조합 기본)**: ChromaDB. 로컬은 PersistentClient, docker는 HttpClient. 기존 동작 100% 보존.
 
 **`pgvector`** (`STORAGE_MODE=pg`에서 자동 선택): PostgreSQL 확장. HNSW 인덱스
-(`m=16, ef_construction=64`, 쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 150)로
-전역 검색도 실측 p95 6.44ms — sqlite-vec의 binary 2단계 같은 별도 가속이 불필요.
+(`m=16, ef_construction=64`, 쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 500)로
+전역 검색도 179,784건 전량 실측 p95 24.61ms — sqlite-vec의 binary 2단계 같은 별도 가속이 불필요.
 `pip install ".[pg]"` 필요. `STORAGE_MODE!=pg`에서도 `VECTOR_BACKEND=pgvector`를
 명시하면 벡터만 PG로 보낼 수 있습니다. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로.
 
@@ -291,7 +291,7 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수(recall 튜닝) |
-| `PG_EF_SEARCH` | `150` | pgvector HNSW 쿼리 세션 파라미터(recall/속도 트레이드오프, pgvector 전용) |
+| `PG_EF_SEARCH` | `500` | pgvector HNSW 쿼리 세션 파라미터(recall/속도 트레이드오프, pgvector 전용) |
 
 ```bash
 # 기존 Chroma 컬렉션이 있는 상태에서 sqlite-vec로 전환(KURE 벡터를 그대로 1:1 이관)

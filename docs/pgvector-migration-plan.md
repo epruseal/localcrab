@@ -24,8 +24,9 @@
 > 아래 각 항목은 §3~§10 원문의 해당 지점을 대체/보강한다.
 
 **스키마·인덱스 파라미터(§3.3/§4.1 확정).** HNSW `m=16, ef_construction=64`, 쿼리 시 세션
-파라미터 `hnsw.ef_search`(생성자 인자, 기본 150 — `PG_EF_SEARCH` 환경변수, recall 0.95 경계에
-여유 마진을 둔 값). 인덱스 생성 직전 `SET maintenance_work_mem='512MB'`/
+파라미터 `hnsw.ef_search`(생성자 인자, 기본 500 — `PG_EF_SEARCH` 환경변수. 프리플라이트 확정값
+150은 179,784건 전량 Phase 2 게이트에서 recall@10 0.9440으로 미달해 500으로 상향, 상세는
+`docs/vector-backends.md` §4.2). 인덱스 생성 직전 `SET maintenance_work_mem='512MB'`/
 `SET max_parallel_maintenance_workers=0`을 실행한 뒤 `CREATE INDEX`(ensure-schema에서 1회,
 세션 단위라 부작용 없음) — 이 RPi 환경의 좁은 `/dev/shm`(64MB)에서 병렬 HNSW 빌드가 실패하는
 것을 프리플라이트에서 확인해 회피한 것.

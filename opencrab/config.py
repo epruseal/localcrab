@@ -214,11 +214,21 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # pgvector HNSW 런타임 노브 (VECTOR_BACKEND=pgvector 전용, PG_EF_SEARCH 환경변수)
     #
-    # 쿼리 세션 파라미터 hnsw.ef_search 값(recall/속도 트레이드오프). 기본 150은
-    # 프리플라이트 실측(HNSW global p95 6.44ms, recall 0.95 경계)에 여유 마진을
-    # 둔 값 — docs/pgvector-migration-plan.md 프리플라이트 확정 사항 참고.
+    # 쿼리 세션 파라미터 hnsw.ef_search 값(recall/속도 트레이드오프). 프리플라이트
+    # (소규모)에서 정한 기본값 150은 Phase 2 통합 게이트(179,784행 KURE 1024d 전량,
+    # docs/vector-backends.md §4.2)에서 recall@10 0.9440으로 게이트(≥0.95) 미달
+    # 확인됨 — 500으로 상향. ef별 recall/global p95 실측 곡선(179,784행 전량,
+    # 200쿼리, seed=1234, RPi5):
+    #   ef=150: recall=0.9370  p50/p95=5.11/10.48ms
+    #   ef=300: recall=0.9490  p50/p95=7.99/15.52ms
+    #   ef=400: recall=0.9500  p50/p95=10.20/21.11ms  (게이트 경계, 마진 부족)
+    #   ef=500: recall=0.9600  p50/p95=12.00/24.61ms  ← 채택(마진 확보, 게이트
+    #           대비 지연 4배 여유)
+    #   ef=550+: recall=1.0000  p50/p95=683.87/712.41ms — 지연 급증(하드웨어/
+    #           캐시 한계로 추정, 동시 부하 없는 단독 측정에서도 재현) → 500
+    #           초과는 피할 것.
     # ------------------------------------------------------------------
-    pg_ef_search: int = Field(default=150, alias="PG_EF_SEARCH")
+    pg_ef_search: int = Field(default=500, alias="PG_EF_SEARCH")
 
     # ------------------------------------------------------------------
     # MCP server
