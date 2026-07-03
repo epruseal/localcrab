@@ -219,10 +219,127 @@ opencrab serve
   `scripts/migrate_sqlite_to_pg.py`로 1:1 복사(재임베딩 불필요 — sqlite-vec 표준이
   이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
 - 상세 설계·프리플라이트 실측·트레이드오프: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
-- **sqlite-vec(A) vs pgvector(B) 정면 비교 벤치**(pgvector-migration-plan.md §11.1 게이트 —
-  동일 코퍼스·동일 질의셋으로 두 백엔드를 나란히 측정): *Phase 2 통합 벤치에서 기입.*
-  위 수치(HNSW p95 6.44ms 등)는 pgvector 단독 프리플라이트 실측이며, (A)/(B) 선택을 위한
-  정면 비교는 아직 수행되지 않았다.
+
+#### 4.2 Phase 2 통합 벤치 — sqlite-vec(A) vs pgvector(B) §11.1 게이트 실측
+
+실코드 경로(`PgVectorStore`/`PGGraphStore`/`PgDocStore`, factory가 만드는 것과 동일한
+클래스)로 **179,784건 실데이터 KURE 1024d 벡터 전량 + graph 154,561 노드/431,377
+엣지 전량 + doc 156,744/64,801/1,711,237(node/source/audit) 전량**을 임시 PG 16
+컨테이너(`pgvector/pgvector:pg16`, `--shm-size=1g`)로 1:1 이관(`scripts/migrate_sqlite_to_pg.py
+--verify`, 행수 전부 일치 확인)한 뒤 측정했다. 벤치 조건: RPi5, ef_search=`PG_EF_SEARCH`
+기본값 150(별도 표기 없는 한).
+
+**이관 소요:** graph+doc+vector 전량 이관 총 약 18분(그중 벡터 bulk-copy 약 4.2분,
+`execute_values` batch, 실측 720\~740 rows/s) + HNSW 빌드(`m=16, ef_construction=64`,
+`PgVectorStore` 자체 설정대로 `maintenance_work_mem=512MB`/단일스레드) 약 4\~5분.
+
+**벡터 게이트** (`PgVectorStore.query`, 홀더 EF로 저장된 벡터를 그대로 질의에 재사용 —
+재임베딩 없음):
+
+| 지표 | 목표 | 실측 | 판정 |
+|------|------|------|------|
+| global top-10 p50/p95 | (참고) | 8.24 / 22.60 ms | — |
+| pack-scoped p95 — 대(10,887건) | ≤100ms | 2.93 / **4.36** ms | ✅ |
+| pack-scoped p95 — 중(316건) | ≤100ms | 3.93 / **6.73** ms | ✅ |
+| pack-scoped p95 — 소(10건) | ≤100ms | 1.83 / **3.36** ms | ✅ |
+| 필터 조합(pack_id+metadata) p95 | ≤200ms | 7.09 / **7.90** ms | ✅ |
+| recall@10 (HNSW vs exact, ef_search=150) | ≥0.95 | **0.9440** | ❌ |
+| pack isolation leak | 0 | **0** | ✅ |
+
+**recall 게이트 FAIL 원인:** `PG_EF_SEARCH` 기본값 150은 프리플라이트(소규모)에서 정한
+값으로, 179,784건 전량에서는 마진이 부족하다. ef_search 스윕(100쿼리, 동일 시드) 실측 —
+`ef=150`: 0.9310, `ef=300`: 0.9430, `ef=500`: **0.9550**(게이트 통과). global p95가
+8.24/22.60ms로 게이트(≤100ms) 대비 여유가 크므로, `ef_search`를 500 부근으로 올려도
+지연 게이트는 유지될 가능성이 높다 — **채택 시 `PG_EF_SEARCH` 기본값 상향 필요**(후속 조치,
+본 벤치 범위 밖).
+
+**graph 게이트** (`PGGraphStore.find_neighbors` vs `LocalGraphStore.find_neighbors`,
+동일 노드 20개 — 차수 상위 허브 5개(최대 차수 6,583) + 무작위 15개, `direction=both,
+depth=3, limit=50`):
+
+| 지표 | 목표 | 실측 | 판정 |
+|------|------|------|------|
+| PGGraphStore 3-hop p50/p95 | ≤100ms | 102.27 / **164.82** ms | ❌ |
+| LocalGraphStore 3-hop p50/p95(참고) | — | 4.75 / 9.34 ms | — |
+
+**graph 게이트 FAIL 원인:** `PGGraphStore.find_neighbors`는 `LocalGraphStore`와 동일하게
+Python 오케스트레이션 BFS(단일 재귀 CTE 아님, §6.4 설계대로)라, 홉마다 노드 수만큼 개별
+SQL 왕복이 발생한다. `LocalGraphStore`는 인프로세스 SQLite라 왕복 비용이 사실상 0인 반면,
+`PGGraphStore`는 매 왕복이 소켓(로컬호스트 TCP)을 타 — 고차수 허브(차수 6,583)에서
+왕복 횟수가 누적돼 게이트를 최대 65% 초과했다. 재귀 CTE로 왕복 1회에 묶는 대안은
+§6.4에서 이미 canonical 경로로 채택돼 있으나 `find_neighbors`는 아직 Python BFS 포트
+상태 — **재귀 CTE 전환이 후속 조치**(본 벤치는 현 구현 그대로 측정, 조작 없음).
+
+**doc 스팟체크** (`PgDocStore.keyword_search`, 실데이터 질의 3종):
+
+| 질의 유형 | 질의 | 지연 | 결과 |
+|---|---|---|---|
+| 영어 | `clinical trial biomarker` | 44.81ms | 0건(코퍼스에 매치 없음 — sanity, 게이트 아님) |
+| 약어 | `MRR` | 7.07ms | 2건, 내용 타당 |
+| 모델번호 | `KURE-v1` | **2873.17ms** | 10건, 내용 타당하나 지연 큼 — 짧은 토큰(`v1` 등) trigram ILIKE 폴백 경로가 인덱스를 충분히 활용하지 못한 것으로 추정(§ pg_doc_store.py KEYWORD SEARCH 주석 참고, 후속 조사 필요) |
+
+**pack delete 정합성** (`PgVectorStore.delete`, 소형 팩 `shiftone-dutch-coffee-assets`
+4건 삭제):
+
+| 지표 | 목표 | 실측 | 판정 |
+|---|---|---|---|
+| 잔존 행(해당 pack_id) | 0 | 0 | ✅ |
+| 고아 행(삭제된 id) | 0 | 0 | ✅ |
+| 전체 행수 델타 | -4 | -4(179,784→179,780) | ✅ |
+
+**백업/복구 게이트** (`pg_dump -Fc` → DB drop/recreate → `pg_restore`, 4스토어 행수
+재대조):
+
+| 항목 | 실측 |
+|---|---|
+| `pg_dump` 소요 / 덤프 크기 | 2m22.6s / 730MB |
+| `pg_restore` 소요(HNSW 재빌드 포함, 병렬 3워커 자동 채택) | 6m41.0s |
+| 복구 후 행수 | graph_nodes 154,561 / graph_edges 431,377 / doc_nodes 156,744 / doc_sources 64,801 / audit_log 1,711,237 / opencrab_vectors_kure 179,780 — **사전 수치와 전부 일치** |
+| 게이트(1커맨드 왕복 완전 복구) | ✅ **PASS** |
+
+**라이브 무간섭** (적재/HNSW 빌드/restore 전 구간, `POST /mcp initialize` 프로브):
+
+| 시점 | 응답시간 | free 가용량 |
+|---|---|---|
+| 적재 전(베이스라인) | 8.1ms | 5.3Gi |
+| 벡터 적재 중 | 1.2ms | 5.2Gi |
+| HNSW 빌드 직후 | 2.6ms | 5.1Gi |
+| 전 과정 종료 후 | 7.3ms | 5.4Gi |
+
+전 구간 서브10ms 유지, 라이브 서비스에 관측 가능한 저하 없음(swap 1.4→1.7Gi 소폭
+증가했으나 available 헤드룸 충분).
+
+**cold start / disk usage** (SQLite 3파일 대비 PG 3스토어, 동일 실데이터):
+
+| 항목 | SQLite(3파일 합계) | PG(3테이블군 합계) | 비고 |
+|---|---|---|---|
+| 디스크 사용량 | 2,474 MB(graph 299 + doc 970 + vector 1,205) | **3,584 MB**(graph 260 + doc 806 + vector 2,518) | **PG가 약 45% 큼** — HNSW 인덱스(벡터 테이블 2,518MB 중 상당 비중) + JSONB/TOAST + PG 튜플 오버헤드가 원인. VACUUM 미실행 상태 수치 |
+| 콜드 커넥션(최초 1회) | 0.4ms(파일 open) | 73.1ms(TCP 커넥션+ping) | 상시 서버 프로세스 특성상 1회성 비용, 커넥션 풀 재사용 후 steady-state 영향 없음 |
+
+**§11.1 게이트 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=150 기준):
+
+| 게이트 | 목표 | 실측 | 판정 |
+|---|---|---|---|
+| single-pack top-k p95 | ≤100ms | 2.93\~6.73ms(대/중/소) | ✅ |
+| metadata-filtered top-k p95 | ≤200ms | 7.90ms | ✅ |
+| 3-hop graph traversal p95 | ≤100ms | 164.82ms | ❌ |
+| recall@10 (HNSW vs exact) | ≥0.95 | 0.9440 | ❌ |
+| pack isolation leakage | 0 | 0 | ✅ |
+| pack delete consistency | orphan 0 | 0 | ✅ |
+| backup/restore | 1 command 완전 복구 | 행수 100% 일치 | ✅ |
+| cold start / disk usage | 측정·기록 | 디스크 +45%, 콜드스타트 +73ms | 기록(악화 명시) |
+
+**결론:** 8개 게이트 중 6개 PASS, 2개(3-hop graph p95, recall@10) FAIL. 두 FAIL 모두
+원인이 특정돼 있고 **설정/구현 조정으로 해소 가능**한 성격이다 — recall은 `PG_EF_SEARCH`
+상향(500 부근, 지연 여유 충분), graph는 `find_neighbors`의 재귀 CTE 전환(§6.4 canonical
+경로로 이미 설계됨, 미구현 상태)이 후속 조치다. sqlite-vec(A) 쪽 §11.1 실측(pack-scoped
+p95 8.3ms exact / global p95 exact 593ms·binary 55ms recall 0.995)과 나란히 보면,
+pack-scoped 지연은 pgvector가 근소 우위(2.93\~6.73ms vs 8.3ms)이나 절대 격차는 작고,
+global 검색은 pgvector(HNSW, ef=150 기준 22.60ms)가 sqlite-vec의 binary 2단계(54.8ms)보다
+빠르면서 recall 조정 여지도 있다(ef_search 상향). graph/doc/backup 축은 pgvector 전용
+이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하나 graph 3-hop 지연은 현 구현 상태로는
+(A)의 인프로세스 SQLite(LocalGraphStore, 4.75\~9.34ms)에 크게 못 미친다. (A)/(B) 최종
+채택은 이 두 FAIL의 해소 여부(§9 힌지와 함께)를 확인한 뒤 재게이트로 확정한다.
 
 ---
 
