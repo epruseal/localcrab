@@ -2,14 +2,14 @@
 graph.db (SQLite) → KùzuDB (.kuzu) 마이그레이션 스크립트
 
 배경:
-  LocalGraphStore(SQLite BFS)를 KùzuDB 기반 그래프 스토어로 이전한다.
-  이 시스템(RPi5 aarch64)은 CONFIG_PAGE_SIZE_16KB=y 커널을 사용하므로
-  KùzuDB의 buffer manager가 4KB madvise를 호출할 때 EINVAL이 발생한다.
-  LD_PRELOAD=madv_noop.so 로 워크어라운드한다 (madv_noop.so는 미정렬
-  madvise를 noop으로 대체).
+  LocalGraphStore(SQLite BFS)를 KùzuDB 기반 그래프 스토어(KuzuGraphStore,
+  런타임 패키지 ladybug>=0.18)로 이전한다. 이 시스템(RPi5 aarch64)은
+  CONFIG_PAGE_SIZE_16KB=y 커널을 사용하며, 구버전(kuzu 0.11.3)의 buffer
+  manager는 4KB 단위 madvise 호출로 EINVAL이 발생해 LD_PRELOAD=madv_noop.so
+  워크어라운드가 필요했다. 이 버그는 LadybugDB/ladybug#526→#527로 수정되어
+  v0.18.0(2026-07-01)부터 우회 없이 동작한다.
 
 사용법:
-    LD_PRELOAD=/path/to/madv_noop.so python scripts/migrate_graph_to_ladybug.py
     python scripts/migrate_graph_to_ladybug.py [--src SRC] [--dst DST] [--dry-run]
 
 기본값:
@@ -32,19 +32,6 @@ BUFFER_POOL = 256 * 1024 * 1024  # 256MB
 
 DEFAULT_SRC = "/home/asdf/.openclaw/workspace/data/localcrab/graph.db"
 DEFAULT_DST = "/home/asdf/.openclaw/workspace/data/localcrab/graph.kuzu"
-
-
-def _check_madv_noop() -> None:
-    """LD_PRELOAD madv_noop 없이 실행하면 실패할 가능성을 경고."""
-    ld_preload = os.environ.get("LD_PRELOAD", "")
-    if "madv_noop" not in ld_preload:
-        print(
-            "⚠️  경고: LD_PRELOAD에 madv_noop.so가 없습니다.\n"
-            "   이 시스템(RPi5 aarch64)은 16KB 페이지 커널을 사용합니다.\n"
-            "   실행 전 madv_noop.so를 빌드하고 LD_PRELOAD를 설정하세요:\n"
-            "     gcc -shared -fPIC -o madv_noop.so scripts/madv_noop.c -ldl\n"
-            "     LD_PRELOAD=$(pwd)/madv_noop.so python scripts/migrate_graph_to_ladybug.py\n"
-        )
 
 
 def _create_schema(conn) -> None:
@@ -159,17 +146,15 @@ def run(src_path: str, dst_path: str, dry_run: bool) -> None:
         print(f"  노드: {n_sq:,}  엣지: {e_sq:,}")
         return
 
-    _check_madv_noop()
-
     if os.path.exists(dst_path):
         backup = dst_path + ".bak"
         os.rename(dst_path, backup)
         print(f"기존 DST 백업: {backup}")
 
-    import kuzu  # kuzu==0.11.3 (LadybugDB 0.16.1은 16KB 페이지 커널 버그 있음)
+    import ladybug  # ladybug>=0.18 (rebranded KùzuDB, Database/Connection API unchanged)
 
-    db = kuzu.Database(dst_path, buffer_pool_size=BUFFER_POOL)
-    conn = kuzu.Connection(db)
+    db = ladybug.Database(dst_path, buffer_pool_size=BUFFER_POOL)
+    conn = ladybug.Connection(db)
 
     print("스키마 생성 중...")
     _create_schema(conn)

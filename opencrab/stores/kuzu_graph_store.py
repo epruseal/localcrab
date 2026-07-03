@@ -1,8 +1,17 @@
 """
-KuzuGraphStore — KùzuDB 0.11.3 기반 그래프 스토어.
+KuzuGraphStore — KùzuDB 기반 그래프 스토어. 런타임 패키지는 ladybug(KùzuDB가
+리브랜딩된 이름, https://github.com/LadybugDB/ladybug)이며 Database/Connection
+API는 kuzu와 동일하다. 클래스명·STORAGE_MODE="kuzu" 값은 공개 인터페이스
+하위호환을 위해 그대로 유지한다.
 
 LocalGraphStore(SQLite + Python BFS)와 동일한 인터페이스를 구현한다.
-RPi5 aarch64 (CONFIG_PAGE_SIZE_16KB=y) 환경에서는 LD_PRELOAD=madv_noop.so 필요.
+
+요구 버전: ladybug>=0.18. RPi5 aarch64 (CONFIG_PAGE_SIZE_16KB=y) 환경에서
+구버전(kuzu 0.11.3)은 buffer manager가 4KB 단위 madvise를 호출해 EINVAL로
+조용히 죽었다(LD_PRELOAD=madv_noop.so 우회 필요). 이 버그는
+LadybugDB/ladybug#526으로 보고되어 #527("Handle larger OS page sizes in VM
+eviction")로 수정되었고 v0.18.0(2026-07-01)에 포함되어, LD_PRELOAD 우회 없이
+동작한다.
 """
 
 from __future__ import annotations
@@ -30,22 +39,27 @@ _EDGE_DDL = (
 
 
 class KuzuGraphStore:
-    """KùzuDB-backed graph store with the same interface as LocalGraphStore."""
+    """KùzuDB-backed graph store with the same interface as LocalGraphStore.
+
+    Runtime package is ``ladybug`` (>=0.18) — the rebranded KùzuDB — but the
+    class name and STORAGE_MODE="kuzu" value stay unchanged for backward
+    compatibility.
+    """
 
     def __init__(
         self,
         db_path: str,
         buffer_pool_size: int = 256 * 1024 * 1024,
     ) -> None:
-        import kuzu  # kuzu==0.11.3
+        import ladybug  # ladybug>=0.18 (rebranded KùzuDB, Database/Connection API unchanged)
 
         parent = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(parent, exist_ok=True)
         self._db_path = db_path
         self._available = False
         try:
-            self._db = kuzu.Database(db_path, buffer_pool_size=buffer_pool_size)
-            self._conn = kuzu.Connection(self._db)
+            self._db = ladybug.Database(db_path, buffer_pool_size=buffer_pool_size)
+            self._conn = ladybug.Connection(self._db)
             self._ensure_schema()
             self._available = True
             logger.info("KuzuGraphStore initialised at %s", db_path)

@@ -12,39 +12,21 @@ Usage:
 from __future__ import annotations
 
 import os
-import sys
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from opencrab.config import Settings
 
-_MADV_NOOP = "/usr/local/lib/madv_noop.so"
-
-
-def _ensure_madv_noop() -> None:
-    """kuzu 모드 진입 시 LD_PRELOAD에 madv_noop.so 가 없으면 자동 재실행.
-
-    RPi5 aarch64 (CONFIG_PAGE_SIZE_16KB=y) 에서 KùzuDB가 4KB 단위 madvise를
-    호출하면 EINVAL이 발생한다. madv_noop.so 는 해당 호출을 noop으로 대체하는
-    LD_PRELOAD 심블 인터포저다.
-
-    같은 경로가 이미 LD_PRELOAD에 있으면 동적 링커가 중복 로드를 방지하므로
-    이중 실행 시에도 안전하다.
-    """
-    ld = os.environ.get("LD_PRELOAD", "")
-    if _MADV_NOOP in ld:
-        return
-    if not os.path.exists(_MADV_NOOP):
-        return  # 빌드 안 된 환경(비 RPi5)은 건너뜀
-    new_ld = f"{_MADV_NOOP}:{ld}" if ld else _MADV_NOOP
-    env = {**os.environ, "LD_PRELOAD": new_ld}
-    os.execve(sys.executable, [sys.executable] + sys.argv, env)
-
 
 def make_graph_store(settings: Settings) -> Any:
-    """Return KuzuGraphStore (kuzu), LocalGraphStore (local), or Neo4jStore (docker)."""
+    """Return KuzuGraphStore (kuzu), LocalGraphStore (local), or Neo4jStore (docker).
+
+    kuzu 모드는 ladybug>=0.18 런타임(리브랜딩된 KùzuDB)을 사용한다. 과거에는
+    RPi5 16KB 페이지 커널에서 구버전 kuzu의 madvise 호출이 크래시해
+    LD_PRELOAD=madv_noop.so 로 우회했으나, ladybug>=0.18 이 이 문제를 자체
+    처리해(LadybugDB/ladybug#527) 우회가 더 이상 필요하지 않다.
+    """
     if settings.storage_mode == "kuzu":
-        _ensure_madv_noop()
         from opencrab.stores.kuzu_graph_store import KuzuGraphStore
 
         db_path = os.path.join(settings.local_data_dir, "graph.kuzu")

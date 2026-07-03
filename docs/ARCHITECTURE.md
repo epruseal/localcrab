@@ -15,14 +15,28 @@
 
 ## 1. 스토어 구조
 
-LocalCrab은 `STORAGE_MODE` 환경변수로 두 가지 백엔드를 선택한다.
+LocalCrab은 `STORAGE_MODE` 환경변수로 세 가지 백엔드를 선택한다: `local`(기본),
+`kuzu`(그래프만 KuzuGraphStore, 나머지는 local과 동일), `docker`.
 
-| 스토어 역할 | local 모드 | docker 모드 |
-| --- | --- | --- |
-| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `Neo4jStore` (`bolt://localhost:7687`) |
-| 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `MongoStore` (MongoDB) |
-| 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | `ChromaStore` (HttpClient) |
-| SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (PostgreSQL) |
+| 스토어 역할 | local 모드 | kuzu 모드 | docker 모드 |
+| --- | --- | --- | --- |
+| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `KuzuGraphStore` (`graph.kuzu`, ladybug>=0.18) | `Neo4jStore` (`bolt://localhost:7687`) |
+| 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `LocalSQLDocStore` (local과 동일) | `MongoStore` (MongoDB) |
+| 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | local과 동일 | `ChromaStore` (HttpClient) |
+| SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (local과 동일) | `SQLStore` (PostgreSQL) |
+
+`kuzu` 모드는 `is_local=True`(그래프를 제외한 문서·벡터·SQL 스토어는 `local`과
+동일하게 선택된다). `ladybug`는 KùzuDB의 리브랜딩 패키지명이며
+(https://github.com/LadybugDB/ladybug), `Database`/`Connection` API는 kuzu와
+동일하다. 설치: `pip install ".[kuzu]"`.
+
+**운영 권장 구성**: 기본은 `local` — 4스토어(graph/doc/sql/vector)를 SQLite 단일
+규율로 통일해 백업(디렉터리 1개 파일 복사)·정합성 관리 대상을 1개로 줄인다.
+대규모 확장 시에는 `docker` 4종 혼합이 아니라 **PostgreSQL 단일 통합**(pgvector
+경로, `docs/pgvector-migration-plan.md` (B))으로 이행하는 편이 낫다. `docker`
+모드는 Neo4j/MongoDB/PostgreSQL/Chroma 4종 외부 서비스를 각각 백업·버전관리·
+정합성 관리해야 하는데, SaaS 규모(다중 테넌트, 조직 단위 격리, 팀별 별도
+인프라 요구)가 아니면 이 관리 비용이 Neo4j/Mongo 개별 이점을 상회한다.
 
 벡터 백엔드는 `VECTOR_BACKEND`(미설정 시 `STORAGE_MODE`·`EMBEDDING_BACKEND` 조건부 결정)로 선택한다. 상세 규칙·매트릭스는 §8과 `docs/vector-backends.md` 참고.
 
@@ -30,8 +44,9 @@ LocalCrab은 `STORAGE_MODE` 환경변수로 두 가지 백엔드를 선택한다
 
 ```
 make_graph_store(settings)
-    is_local → LocalGraphStore(db_path="<LOCAL_DATA_DIR>/graph.db")
-    else     → Neo4jStore(uri=NEO4J_URI, ...)
+    STORAGE_MODE=kuzu → KuzuGraphStore(db_path="<LOCAL_DATA_DIR>/graph.kuzu")
+    is_local          → LocalGraphStore(db_path="<LOCAL_DATA_DIR>/graph.db")
+    else              → Neo4jStore(uri=NEO4J_URI, ...)
 
 make_doc_store(settings)
     is_local → LocalSQLDocStore(db_path="<LOCAL_DATA_DIR>/doc_store.db")

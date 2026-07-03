@@ -53,6 +53,17 @@ opencrab serve
 
 > 벡터 백엔드 기본값은 조건부입니다(`EMBEDDING_BACKEND`·`STORAGE_MODE`에 따라 결정). 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend), [벡터 백엔드 매트릭스](./docs/vector-backends.md).
 
+`STORAGE_MODE=kuzu`로 실행하면 그래프만 `KuzuGraphStore`(ladybug>=0.18, `graph.kuzu`)로
+바뀌고 문서·벡터·SQL 스토어는 local 모드와 동일합니다. 설치: `pip install ".[kuzu]"`.
+
+> **운영 권장**: 기본은 `STORAGE_MODE=local` — graph/doc/sql/vector(sqlite-vec)를
+> 전부 SQLite 한 규율로 통일해 백업 디렉터리 1개·정합성 관리 대상 1개로 운영합니다.
+> 대규모로 커지면 PostgreSQL 단일 통합(pgvector 경로, 현재 예약/미구현 —
+> [pgvector-migration-plan.md](./docs/pgvector-migration-plan.md) (B) 참고)으로 이행하세요.
+> `docker` 모드(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 SaaS 규모가 아니면
+> 비권장입니다 — Neo4j/Mongo 각각의 이점이 4종 스토어를 따로 백업·버전관리·정합성
+> 관리하는 비용을 상회하지 못합니다.
+
 아키텍처 상세는 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) 참고.
 
 ### 4. 적재 & 질의
