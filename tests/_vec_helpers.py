@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import uuid
 from typing import Any
+
+import pytest
 
 
 class MockEF:
@@ -75,4 +79,24 @@ def build_vector_store(
             collection_name="vtest",
             **kwargs,
         )
+    if backend == "pg":
+        # 실 PG 없이는 테스트 불가능한 백엔드 — env 미설정/접속 불가 시 깔끔히
+        # skip(나머지 스위트는 무영향). 테스트별 격리를 위해 collection_name에
+        # uuid 접미사(공유 테스트 DB에서 병렬 실행/재실행 시 테이블 충돌 방지).
+        dsn = os.environ.get("OPENCRAB_PG_TEST_URL")
+        if not dsn:
+            pytest.skip("OPENCRAB_PG_TEST_URL not set - pg backend tests skipped")
+        from opencrab.stores.pg_vector_store import PgVectorStore
+
+        collection = kwargs.pop("collection_name", f"vtest_{uuid.uuid4().hex[:12]}")
+        store = PgVectorStore(
+            dsn_or_engine=dsn,
+            embedding_function=ef,
+            dim=dim,
+            collection_name=collection,
+            **kwargs,
+        )
+        if not store.available:
+            pytest.skip(f"Cannot connect to PG test DB at {dsn!r}")
+        return store
     raise ValueError(f"unknown backend {backend!r}")
