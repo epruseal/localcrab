@@ -451,7 +451,7 @@ $$) AS (e agtype);
 - 해결: doc store에 **백엔드-중립 capability** 추가 — `supports_keyword: bool` + `keyword_search(query, pack_ids, include_unpackaged, limit)`. `HybridQuery._fts_search()`가 capability 보유 시에만 호출(미지원·예외 시 graceful 폴백)하고 기존 `Reranker.rerank()`(RRF)로 융합. reranker source 가중치 `keyword`(>bm25).
 - **LocalSQLDocStore**: SQLite **FTS5** 가상테이블 `doc_sources_fts`(`tokenize='unicode61'`, 한+영) — `_init_db`에서 생성 + idempotent 마이그레이션, `upsert_source`에서 동기화. 질의는 `\w+` 토큰을 따옴표 OR 결합(연산자 주입 방지).
 - **(A) sqlite-vec 이전 시**: doc store 가 SQLite 그대로이므로 **FTS5(`doc_sources_fts`)는 무변경 유지** — 벡터·키워드가 모두 SQLite 로 일관되고 tsvector 전환 과제 자체가 없다.
-- **(B) Postgres(pgvector) 이전 시**: `PgDocStore`가 동일 capability를 `tsvector`(또는 `pg_bigm`/`pgroonga`) + GIN으로 구현하면 `HybridQuery`는 무변경. 미구현이면 `supports_keyword=False`로 두어 자동 폴백.
+- **(B) Postgres(pgvector) — 구현 완료.** `PgDocStore`(`opencrab/stores/pg_doc_store.py`)가 동일 capability를 구현해 `HybridQuery`는 무변경으로 재사용된다. 원문은 `pg_bigm`/`pgroonga` 확장을 상정했으나, 실제로는 확장 설치 부담 없는 **stock PG 경로**로 구현했다: 주 리그는 `to_tsvector('simple', text)` + `plainto_tsquery('simple', :q)` + `ts_rank`(GIN 인덱스), 3자 미만 짧은 토큰(한국어 다수)은 tsquery 어휘 매칭이 안 되므로 `pg_trgm`(`similarity()` + `gin_trgm_ops` GIN) ILIKE 폴백으로 보완한다. `'simple'` 설정은 한글 형태소 분석을 하지 않으므로 SQLite FTS5의 2/3-gram 커스텀 토크나이저와 동일하지 않다 — 짧은 토큰 매칭은 trigram 폴백이 담당. GIN 인덱스 생성 실패(확장 미가용) 시에는 `supports_keyword=False`로 graceful degrade해 §7 본문의 폴백 경로가 그대로 동작한다.
 - **한계(알려짐):** RRF는 다중 리트리버 동시 등장 항목을 우대하므로, 키워드 단독 매칭은 의미충돌(예 "smoke" 색상 청크)이 vector+graph로 강하게 잡힐 때 top-3 밖으로 밀릴 수 있다. pack 스코프 질의에선 정확. 깊은 RRF 단독소스 보정은 후속 과제.
 
 ---
@@ -496,7 +496,7 @@ $$) AS (e agtype);
 3. **공유 SQLAlchemy 엔진 부트스트랩.** factory 가 `create_engine(postgres_url)` 를 1회 생성해 sql/vector/doc 스토어에 주입(§3.5).
 4. **스키마 생성.** sql 테이블은 `SQLStore` 가 자동 생성. doc 테이블(JSONB) + `opencrab_vectors_kure vector(1024)` 벡터 테이블 DDL 적용. 인덱스는 데이터 적재 후 생성(IVFFlat은 적재 후 필수, HNSW는 권장).
 5. **전 벡터 재임베딩·재적재 (필수, KURE 단일).** Chroma 내부 벡터를 그대로 옮길 수 없다(임베딩 위치가 앱으로 이동). doc/노드 원본 텍스트에서 `ResilientEmbeddingFunction`(KURE) 으로 **재임베딩**하여 `opencrab_vectors_kure`(1024d)에 적재. minilm 재임베딩은 하지 않음(롤백용 Chroma 잔존).
-6. **doc/sql 덤프 이전.** SQLite `doc_store.db`/`opencrab.db` 의 로우를 Postgres로 복사(JSON TEXT → JSONB 캐스트). 1회성 마이그레이션 스크립트(범위 외, 본 문서는 설계만).
+6. **doc/sql 덤프 이전 — 구현 완료.** `scripts/migrate_sqlite_to_pg.py`가 graph/doc/sql/vector **4스토어 전체**를 1:1 이관한다(원문 설계 시점엔 doc/sql만 상정했으나 실제로는 graph·vector까지 같은 스크립트로 통합). JSON TEXT → JSONB 캐스트, 자연 유니크 키를 가진 테이블(`graph_nodes`/`graph_edges`, `doc_nodes`/`doc_sources`/`audit_log`, `rebac_policies`, 벡터 테이블)은 `ON CONFLICT DO UPDATE/NOTHING`으로 재실행 안전. 원본 SQLite는 SELECT 전용으로만 열어 무변경 보장, `--verify`로 이관 후 행수 대조. 벡터 테이블은 raw float32 벡터를 `vec_to_json(embedding)`으로 그대로 복사(재임베딩 0회, §0.1). 스키마 생성은 자체 DDL을 새로 만들지 않고 `PGGraphStore`/`PgDocStore` 생성자(ensure-schema)를 그대로 재사용하며, 벡터 테이블만 예외적으로 베이스 DDL을 인라인 복제해 **적재 후 HNSW 인덱스 생성**(§0.1 순서 강제와 동일 이유)한다.
 7. **factory 분기.** `make_vector_store` 가 `PgVectorStore` 를, `make_doc_store`/`make_sql_store` 가 Postgres 백엔드를 선택하도록 신규 설정(`VECTOR_BACKEND=pgvector`) 추가. 기본값은 기존(local) 유지해 롤백 보장. graph 는 §6 롤아웃((C)→AGE/CTE)에 따름.
 8. **검증.** §11 회귀 스위트(green→green) 전체 통과 — 행 수 대조(`count()` vs Chroma, `table_counts()`), 대표 질의 top-k(특히 KURE 한국어 MRR), BM25 결과 동등성, graph 백엔드 parity, 다중 프로세스 동시 적재 스모크.
 

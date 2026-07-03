@@ -5,7 +5,7 @@
 1. [스토어 구조](#1-스토어-구조)
 2. [LocalSQLDocStore 선택 근거](#2-localsqldocstore-선택-근거)
 3. [DuckDB 검토 결과 — 기각](#3-duckdb-검토-결과--기각)
-4. [LadybugDB Phase 2 로드맵](#4-ladybugdb-phase-2-로드맵)
+4. [Kuzu(ladybug) 그래프 스토어 — 현황](#4-kuzuladybug-그래프-스토어--현황)
 5. [마이그레이션 절차](#5-마이그레이션-절차)
 6. [BM25 커버리지 경고](#6-bm25-커버리지-경고)
 7. [SQLite 버전 요구사항](#7-sqlite-버전-요구사항)
@@ -218,22 +218,49 @@ doc 스토어의 핵심 연산(`upsert_node_doc`, `get_node_doc`, `list_nodes LI
 
 ---
 
-## 4. LadybugDB Phase 2 로드맵
+## 4. Kuzu(ladybug) 그래프 스토어 — 현황
 
-### Phase 전략
+> 과거 이 절은 "LadybugDB Phase 2 로드맵(예정)"으로 서술돼 있었으나, ladybug는
+> 이미 이 브랜치에 **현재 동작하는 opt-in 모드**(`STORAGE_MODE=kuzu`)로 구현되어
+> 있다 — 미래 계획이 아니다. 다만 **기본값은 여전히 `local`**이며, `kuzu`로
+> 전환해도 아래에서 보듯 그래프 상위 로직(ontology query/impact/export/MCP
+> tools)의 우회코드는 제거되지 않았다.
+
+### Phase 전략 (현황 반영)
 
 ```
 Phase 1 (완료): Neo4j → LocalGraphStore (SQLite BFS)
     목표: Docker 없이 로컬 실행 가능, 안정성 최우선
     결과: MCP 도구 전체 로컬 동작 확보
 
-Phase 2 (예정): LocalGraphStore → LadybugDB (임베디드 컬럼형 그래프 DB)
-    목표: Cypher 완전 복원, 우회코드 전면 제거
+Phase 2 (구현 완료, opt-in — 기본 아님): LocalGraphStore → KuzuGraphStore
+    (런타임 패키지 ladybug>=0.18, STORAGE_MODE=kuzu)
+    실제 결과: run_cypher()는 KuzuGraphStore에서 실동작(ladybug Database/
+    Connection API 사용)하지만, 상위 코드(query.py/impact.py/neo4j_export.py/
+    mcp/tools.py)는 여전히 `isinstance(x, (LocalGraphStore, KuzuGraphStore))`로
+    두 스토어를 묶어 동일한 우회 메서드 경로(find_by_relations/list_packs/
+    export_nodes·edges/get_node_by_id, Python BFS)를 탄다 — Cypher 가변 관계
+    패턴(`-[*1..N]-`)으로의 전환이나 isinstance 분기 제거는 아직 이뤄지지
+    않았다. KuzuGraphStore는 이 우회 메서드들을 자체적으로(내부적으로 Cypher를
+    쓰기도 하지만) 재구현했을 뿐, 호출부는 LocalGraphStore와 동일하게 취급한다.
 ```
+
+과거 RPi5 16KB 페이지 커널에서 구버전 kuzu(0.11.3)의 buffer manager가 4KB 단위
+`madvise` 호출로 EINVAL이 발생해 죽던 문제(`LD_PRELOAD=madv_noop.so` 우회 필요,
+`LadybugDB/ladybug#526`)는 `#527`("Handle larger OS page sizes in VM eviction")로
+수정되어 **ladybug v0.18.0(2026-07-01)부터 우회 없이 동작**한다. 이 브랜치에서
+`madv_noop.so`/`LD_PRELOAD` 워크어라운드는 factory.py/kuzu_graph_store.py/
+migrate_graph_to_ladybug.py의 히스토리 주석으로만 남아 있고, 현재 빌드/실행
+경로 어디에서도 요구되지 않는다. `scripts/madv_noop.c` 파일 자체는 저장소에
+남아 있으나 Makefile 등 어떤 빌드 설정에서도 더 이상 참조되지 않는 죽은
+코드다. 설치: `pip install ".[kuzu]"` (`ladybug>=0.18`). 기존 `graph.db`
+(SQLite) → `.kuzu` 마이그레이션은 `scripts/migrate_graph_to_ladybug.py`.
 
 ### 현재 LocalGraphStore의 한계
 
-`run_cypher()`는 영구 no-op이다 (`local_graph_store.py:254`):
+`LocalGraphStore.run_cypher()`는 영구 no-op이다 (`local_graph_store.py:298`) — 이는
+`local`(기본) 모드에서만 해당하며, `kuzu` 모드의 `KuzuGraphStore.run_cypher()`는
+아래에서 보듯 이미 실동작한다:
 
 ```python
 def run_cypher(self, cypher: str, params=None) -> list[dict]:
@@ -254,33 +281,64 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 | `keyword_search` | `export_nodes() + Python str.lower() 포함 검사` |
 | 엣지 저장 시 노드 타입 조회 | `get_node_by_id()` |
 
-코드베이스 전반에 `isinstance(graph, LocalGraphStore)` 분기가 존재한다. 또한
+코드베이스 전반에 `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기가
+존재한다(`ontology/query.py`, `ontology/impact.py`, `pack/neo4j_export.py`,
+`mcp/tools.py`) — `kuzu` 모드 도입 시 이 분기에서 `LocalGraphStore`를
+`KuzuGraphStore`로 **교체**한 것이 아니라 **튜플에 추가**했다. 즉 `KuzuGraphStore`도
+Neo4j 취급이 아니라 이 우회 경로를 그대로 탄다(위 표의 우회 메서드들을
+`KuzuGraphStore`가 자체 구현). 또한
 `find_neighbors()`는 Cypher 가변 관계 패턴(`*1..N`) 대신 Python BFS로 구현되어 있어,
 허브 노드(차수 수백 이상)에서 성능 열화가 발생한다 (`bench_graph_backends.py`
-실측: 43k 노드 / 최고 차수 615에서 d1 p50 = 11.86ms, 20k 대비 32× 급등).
+실측, `LocalGraphStore` 기준: 43k 노드 / 최고 차수 615에서 d1 p50 = 11.86ms, 20k
+대비 32× 급등). `KuzuGraphStore.find_neighbors()`도 depth=1은 전용 1-hop 쿼리,
+depth>1은 동일한 Python BFS 큐 방식이라(`kuzu_graph_store.py`) Cypher 가변 길이
+패턴으로의 교체는 `kuzu` 모드에서도 아직 이뤄지지 않았다.
 
 > **BFS SQL LIMIT 최적화**: `find_neighbors()`는 각 탐색 스텝에서 `remaining = limit - len(results)`를
 > SQL LIMIT에 전달해 fetchall I/O 자체를 줄이고, 내부 루프에서도 limit 도달 시
 > 즉시 break한다. SQL LIMIT만으로는 pack 필터 통과율이 낮을 때 보완이 안 되므로
 > 두 guard를 병용한다.
 
-### LadybugDB 전환 시 기대 효과
+### ladybug(kuzu 모드) 도입으로 실제 달성된 것 / 아직 안 된 것
 
-- KùzuDB 포크, 임베디드 컬럼형 그래프 DB
-- Cypher 네이티브 지원 → `run_cypher()` no-op 제거
-- `list_packs`, `find_by_relations`, `export_nodes/edges`, `get_node_by_id` 전부 Cypher로 대체
-- `isinstance(graph, LocalGraphStore)` 분기 전면 제거
-- Python BFS → Cypher 가변 관계 패턴(`-[*1..N]-`)으로 교체
-- 스토어 추상화 복원 (그래프 / doc 스토어가 동일 인터페이스만 구현)
+ladybug>=0.18 전환(`kuzu` 모드, opt-in)으로 실제 달성된 것:
 
-### 전환 전 필수 검증 체크리스트
+- `pip install ".[kuzu]"`로 설치 가능한 임베디드 컬럼형 그래프 DB(KùzuDB 리브랜딩,
+  https://github.com/LadybugDB/ladybug). `Database`/`Connection` API는 kuzu와 동일.
+- `KuzuGraphStore.run_cypher()`는 **실제로 Cypher를 실행**한다(더 이상 no-op) —
+  `local` 모드의 `LocalGraphStore.run_cypher()`는 여전히 영구 no-op.
+- RPi5 16KB 페이지 커널 madvise 크래시가 업스트림에서 해결되어(`#527`)
+  `LD_PRELOAD=madv_noop.so` 우회가 더 이상 필요 없다.
+- `scripts/migrate_graph_to_ladybug.py`로 기존 `graph.db`(SQLite) →
+  `graph.kuzu` 마이그레이션 가능(CSV COPY FROM 배치, `--dry-run` 지원).
 
-- [ ] LadybugDB의 Cypher 방언이 Neo4j Cypher와 호환되는지 확인 (`run_cypher()` 호출 시그니처 동일 여부)
-- [ ] `find_neighbors()` 결과 집합이 Neo4j 모드와 동등한지 검증 (Jaccard 유사도 기준)
-- [ ] MCP 서버 멀티스레드 환경에서 임베디드 DB의 동시 접근 안전성 검증
-- [ ] 대규모 그래프 (430k+ 노드) 에서 LadybugDB 인덱스 빌드 시간 측정
-- [ ] 기존 `graph.db` (SQLite) → LadybugDB 마이그레이션 스크립트 작성 및 검증
-- [ ] `list_packs`, `export_nodes/edges`, `find_by_relations` Cypher 쿼리 방언 차이 확인
+아직 실현되지 않은 것 (당초 "기대 효과"로 적혀 있었으나 현재도 유효한 갭):
+
+- `list_packs`, `find_by_relations`, `export_nodes/edges`, `get_node_by_id`가
+  Cypher로 통합 대체되지 않았다 — `KuzuGraphStore`가 동일한 이름의 메서드를
+  자체적으로 다시 구현했을 뿐, 호출부(ontology/query.py 등)는 `run_cypher()`를
+  직접 쓰지 않는다.
+- `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기는 제거되지 않고
+  오히려 튜플로 확장되었다.
+- `find_neighbors()`의 Python BFS → Cypher 가변 관계 패턴(`-[*1..N]-`) 교체는
+  `kuzu` 모드에서도 이뤄지지 않았다.
+- `STORAGE_MODE` 기본값은 여전히 `local`이다 — `kuzu`는 opt-in이며 default
+  승격 계획은 코드/설정 어디에도 명시돼 있지 않다.
+
+### 검증 상태
+
+- [x] ladybug의 `Database`/`Connection` API가 kuzu와 동일함을 확인(모듈
+      docstring, `kuzu_graph_store.py` 헤더 주석) — 클래스명·`STORAGE_MODE="kuzu"`
+      값은 하위호환을 위해 그대로 유지.
+- [x] RPi5 16KB 페이지 커널 madvise 크래시 수정 확인(`LadybugDB/ladybug#526`→`#527`,
+      v0.18.0에 포함) — 우회 불필요.
+- [x] 기존 `graph.db`(SQLite) → ladybug 마이그레이션 스크립트 작성 완료
+      (`scripts/migrate_graph_to_ladybug.py`).
+- [ ] `find_neighbors()` 결과 집합이 Neo4j 모드와 동등한지 검증 (Jaccard 유사도 기준) — 미확인.
+- [ ] MCP 서버 멀티스레드 환경에서 임베디드 DB의 동시 접근 안전성 검증 — 미확인.
+- [ ] 대규모 그래프(430k+ 노드)에서 ladybug 인덱스 빌드 시간 측정 — 미확인.
+- [ ] `list_packs`, `export_nodes/edges`, `find_by_relations`를 Cypher 로직으로
+      통합해 우회 메서드 중복을 제거할지 여부 — 설계 미착수.
 
 ---
 
@@ -463,8 +521,9 @@ make_vector_store(settings)
 
 **벡터 스토어 백엔드 (`VECTOR_BACKEND`) — 임베딩과 독립 축**:
 `make_vector_store` 는 먼저 `VECTOR_BACKEND` 로 분기한다(`EMBEDDING_BACKEND` 분기는 `chroma` 내부).
-`VECTOR_BACKEND` 미설정 시 조건부 기본: `STORAGE_MODE=local/kuzu` + `EMBEDDING_BACKEND=openai`(기본) →
-`sqlite-vec`; `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local` → `chroma`. 명시 설정은 항상 우선.
+`VECTOR_BACKEND` 미설정 시 조건부 기본(`vector_backend_resolved`, 체크 순서 고정): ①
+`STORAGE_MODE=pg` → `pgvector`; ② (아니고) `STORAGE_MODE=local/kuzu` + `EMBEDDING_BACKEND=openai`(기본) →
+`sqlite-vec`; ③ 그 외(`STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`) → `chroma`. 명시 설정은 항상 우선.
 - `sqlite-vec`(로컬 모드 기본): `SqliteVecStore`(vec0, `LOCAL_DATA_DIR/vectors.db`). 벡터를 graph/doc/sql 과 같은
   SQLite WAL 규율에 편입 → Chroma 다중프로세스 쓰기 제약/flock 층 제거. 임베딩은 KURE 공유 헬퍼
   `_make_kure_embedding_function` 로 앱측 계산 후 INSERT. `EMBEDDING_BACKEND=local`과 조합 시 ValueError.

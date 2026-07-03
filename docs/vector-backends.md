@@ -227,8 +227,9 @@ opencrab serve
 클래스)로 **179,784건 실데이터 KURE 1024d 벡터 전량 + graph 154,561 노드/431,377
 엣지 전량 + doc 156,744/64,801/1,711,237(node/source/audit) 전량**을 임시 PG 16
 컨테이너(`pgvector/pgvector:pg16`, `--shm-size=1g`)로 1:1 이관(`scripts/migrate_sqlite_to_pg.py
---verify`, 행수 전부 일치 확인)한 뒤 측정했다. 벤치 조건: RPi5, ef_search=`PG_EF_SEARCH`
-기본값 150(별도 표기 없는 한).
+--verify`, 행수 전부 일치 확인)한 뒤 측정했다. 벤치 조건: RPi5, ef_search=150(별도
+표기 없는 한 — 측정 당시 `PG_EF_SEARCH` 기본값. recall 게이트 미달로 이후 기본값을
+500으로 상향, 아래 재측정 참조).
 
 **이관 소요:** graph+doc+vector 전량 이관 총 약 18분(그중 벡터 bulk-copy 약 4.2분,
 `execute_values` batch, 실측 720\~740 rows/s) + HNSW 빌드(`m=16, ef_construction=64`,
