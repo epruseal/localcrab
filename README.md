@@ -56,6 +56,11 @@ opencrab serve
 `STORAGE_MODE=kuzu`로 실행하면 그래프만 `KuzuGraphStore`(ladybug>=0.18, `graph.kuzu`)로
 바뀌고 문서·벡터·SQL 스토어는 local 모드와 동일합니다. 설치: `pip install ".[kuzu]"`.
 
+`STORAGE_MODE=pg`로 실행하면 4스토어(graph/doc/sql/vector) 전부가 PostgreSQL 한
+서버(`POSTGRES_URL`)로 통합됩니다 — `PGGraphStore`/`PgDocStore`/`SQLStore(PG)`/
+`PgVectorStore`(pgvector HNSW), SQLAlchemy 공유 엔진·MVCC 다중 라이터. 설치:
+`pip install ".[pg]"`. 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend).
+
 > **운영 권장**: 기본은 `STORAGE_MODE=local` — graph/doc/sql/vector(sqlite-vec)를
 > 전부 SQLite 한 규율로 통일해 백업 디렉터리 1개·정합성 관리 대상 1개로 운영합니다.
 > 실시간 동시 write(MCP 서빙 중 백그라운드 로더)가 확정 요구이거나 벡터가 수백만
@@ -261,6 +266,7 @@ python backfill_kure.py
 `VECTOR_BACKEND`를 명시하지 않으면 아래 규칙으로 조건부 결정됩니다.
 
 - `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → **`sqlite-vec`**
+- `STORAGE_MODE=pg` → **`pgvector`** (4스토어 PG 통합의 벡터 축)
 - `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → **`chroma`**
 - `VECTOR_BACKEND`를 명시하면 항상 그 값이 우선합니다.
 - 예외: `VECTOR_BACKEND=sqlite-vec`를 명시했는데 `EMBEDDING_BACKEND=local`이면 기동 시 `ValueError`(minilm 384d는 sqlite-vec에서 미지원).
@@ -428,7 +434,7 @@ opencrab/
   schemas/        YAML 타입 스키마, 스키마 팩, 액션 스키마
   ontology/       빌더, 쿼리, identity, 정규화, 승인, ReBAC
   execution/      워크플로·승인 런타임
-  stores/         Neo4j, Chroma, Mongo, SQL, LocalGraphStore, LocalSQLDocStore
+  stores/         Local(SQLite)·Kuzu(ladybug)·PG(pgvector)·docker(Neo4j/Mongo/Chroma) 스토어 + 임베딩 EF
   mcp/            MCP 서버 및 툴 레지스트리
 crabharness/
   crabharness/    미션 플래너, 런타임, 검증, 프로모션 패키지 빌더
