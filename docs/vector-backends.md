@@ -12,11 +12,11 @@
 
 | 축 | 값 | 의미 |
 |----|----|------|
-| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` | 그래프·문서·SQL 스토어 위치. `local`/`kuzu`는 `is_local=True`(둘 다 SQLite/임베디드), `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스 |
-| `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector`(예약) | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
+| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` / `pg` | 그래프·문서·SQL 스토어 위치. `local`/`kuzu`는 `is_local=True`(둘 다 SQLite/임베디드), `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스, `pg`는 4스토어 전부 PostgreSQL(별도 분기, `is_local=False`) |
+| `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector` | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
 | `EMBEDDING_BACKEND` | `openai`(기본) / `local` | 텍스트를 벡터로 바꾸는 방식. 벡터 백엔드 축과 독립 |
 
-> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다.
+> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다. 실시간 동시 write(MCP 서빙 중 백그라운드 로더) 또는 벡터 수백만 스케일이 확정 요구이면 `pg`(PostgreSQL 단일 통합, MVCC 다중 라이터)로 이행한다 — §9 힌지 참고.
 
 ---
 
@@ -29,6 +29,8 @@
 VECTOR_BACKEND 명시됨?
   → 예: 그 값을 그대로 사용(항상 최우선)
   → 아니오:
+      STORAGE_MODE == "pg"
+        → "pgvector"
       is_local(STORAGE_MODE in {local, kuzu}) AND EMBEDDING_BACKEND == "openai"
         → "sqlite-vec"
       그 외 (STORAGE_MODE == "docker" 이거나 EMBEDDING_BACKEND == "local")
@@ -63,7 +65,9 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 | `local`/`kuzu` | `local` | `chroma` | 사용 | 가능(minilm 기본 조합) |
 | `docker` | 무관 | `chroma` | 사용 | 가능(docker 모드 표준) |
 | `docker` | 무관 | `sqlite-vec` | 사용(단, 로컬 파일 경로) | 코드상 `is_local` 체크 없이 backend 자체는 동작하나, docker 모드에서 vector만 SQLite로 로컬화하는 조합은 설계 의도 밖 — 권장하지 않음 |
-| 무관 | 무관 | `pgvector` | **미구현** | **예약** — 선택 시 `NotImplementedError`. 설계: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로 |
+| `pg` | `openai` | _(미설정)_ | **`pgvector`** | `STORAGE_MODE=pg`이면 자동 선택(4스토어 전부 PG) |
+| `pg` | `local` | 무관 | **기동 실패** | **불가** — `ValueError`(minilm 384d는 pgvector 미지원, sqlite-vec와 동일 가드) |
+| `local`/`kuzu`/`docker` | `openai` | `pgvector` | 사용(벡터만 PG) | 가능 — `STORAGE_MODE!=pg`여도 명시하면 벡터만 PG로 보낼 수 있음(§6.3 (C) 단계) |
 
 ---
 
@@ -185,13 +189,40 @@ opencrab serve
   - HNSW는 근사 검색이라 recall이 sqlite-vec의 exact 검색보다 낮을 수 있다
     (실측 recall@10 vs sqlite-vec 0.925).
 
-### `pgvector` (예약, 미구현)
+### `pgvector` (`STORAGE_MODE=pg` 기본 — 구현 완료)
 
 - 스토어 4종(graph/doc/sql/vector)을 PostgreSQL 한 서버로 통합하는 경로.
   **MVCC 다중 라이터**를 제공해 sqlite-vec의 "라이터 직렬화" 제약을 근본적으로 해소한다.
-- 현재 미구현. 채택 여부는 "진짜 다중 라이터가 필요한가"라는 단일 힌지로 판단한다
-  (로더가 MCP 서빙 중 동시 write해야 하거나, 벡터가 수백만 스케일이면 pgvector 필요).
-- 상세 설계·트레이드오프·전환 절차: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
+  graph/vector/doc는 factory가 `POSTGRES_URL`당 1회 생성하는 공유 SQLAlchemy 엔진(단일
+  커넥션 풀)을 주입받는다.
+- **장점**
+  - MVCC로 리더가 라이터를 막지 않고, 라이터는 행 단위로만 경합 — 다중 프로세스
+    (MCP 서버 + 백그라운드 로더)가 락 없이 동시에 읽고 쓸 수 있다.
+  - **HNSW 인덱스**(`vector_cosine_ops`, `m=16, ef_construction=64`, 쿼리 세션
+    `hnsw.ef_search`=`PG_EF_SEARCH` 기본 150)가 **전역(pack 미지정) 검색도** 서브선형으로
+    처리 — 실측 p95 **6.44ms**. sqlite-vec가 전역 브루트포스(868ms)를 완화하려고 도입한
+    binary 2단계 양자화(§4.1) 같은 별도 가속이 애초에 불필요하다.
+  - `pg_dump`/`pg_restore`/PITR로 vectors·doc·sql·graph를 한 번에 정합성 있게 백업·복구.
+- **단점**
+  - 상시 서버 프로세스(RPi5에서 SQLite/Chroma 인프로세스 대비 자원 점유 증가),
+    HNSW 빌드 시 CPU/메모리 스파이크(`maintenance_work_mem`/`max_parallel_maintenance_workers`
+    튜닝 필요 — 아래 인프라 주의 참고).
+  - `EMBEDDING_BACKEND=local`(minilm)과 조합 불가(sqlite-vec와 동일 가드, `ValueError`).
+- **pack_id 전용 컬럼(JSONB GIN 미채택)**: `pack_id`를 `metadata` JSONB에 묻지 않고
+  전용 컬럼 + btree 인덱스로 분리했다 — 프리플라이트 실증상 JSONB GIN 대비 이점이 없었고,
+  `pack_id` 등가/멤버십(`$in`)이 필터의 지배적 패턴이라 btree 등가 조회가 더 단순하고 빠르다.
+  나머지 메타 키는 `metadata ->> :key` 조건으로 그대로 SQL WHERE에 완전히 푸시다운된다
+  (sqlite-vec의 "LIMIT 이후 Python 후처리 필터" 같은 2단계가 구조적으로 없다).
+- **설치**: `pip install ".[pg]"`(pgvector 파이썬 패키지 — Postgres 확장 자체는
+  `CREATE EXTENSION vector`를 스토어 ensure-schema가 최초 사용 시 idempotent하게 실행).
+- **이관**: 기존 SQLite(graph.db/doc_store.db/opencrab.db/vectors.db) → PG는
+  `scripts/migrate_sqlite_to_pg.py`로 1:1 복사(재임베딩 불필요 — sqlite-vec 표준이
+  이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
+- 상세 설계·프리플라이트 실측·트레이드오프: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
+- **sqlite-vec(A) vs pgvector(B) 정면 비교 벤치**(pgvector-migration-plan.md §11.1 게이트 —
+  동일 코퍼스·동일 질의셋으로 두 백엔드를 나란히 측정): *Phase 2 통합 벤치에서 기입.*
+  위 수치(HNSW p95 6.44ms 등)는 pgvector 단독 프리플라이트 실측이며, (A)/(B) 선택을 위한
+  정면 비교는 아직 수행되지 않았다.
 
 ---
 
@@ -227,6 +258,23 @@ opencrab serve
 - 스크립트는 **재임베딩하지 않는다** — KURE 벡터를 그대로 복사한다. `--dry-run`,
   `--force`, `--batch` 옵션 지원. Chroma 원본은 삭제하지 않는(비파괴) 동작.
 
+### SQLite(local/kuzu) → PG-unified (`STORAGE_MODE=pg`) 전환
+
+```bash
+pip install ".[pg]"
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --dry-run   # 계획 확인
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify   # 4스토어 1:1 이관 + 행수 검증
+export STORAGE_MODE=pg POSTGRES_URL=postgresql://...
+opencrab serve
+```
+
+- **재임베딩 불필요** — sqlite-vec 표준이 이미 KURE(1024d)이므로 `vectors.db`의 raw
+  float 벡터를 `vec_to_json`으로 읽어 그대로 pgvector에 복사한다(§3.2/§4.3 정정 —
+  아래 pgvector-migration-plan.md §3.2 참고).
+- 원본 SQLite 파일은 **읽기 전용으로만 접근**(마이그레이션 스크립트가 절대 쓰지 않음) —
+  `--backup-to` 없이도 원본 무변경이 보장된다. `--verify`로 이관 후 행수 대조.
+- 멱등 — 이미 이관된 테이블(행수 일치)은 재실행 시 스킵.
+
 ### sqlite-vec → Chroma 롤백
 
 ```bash
@@ -252,11 +300,12 @@ opencrab serve
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
-| `VECTOR_BACKEND` | _(미설정 — §2 조건부 규칙)_ | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
+| `VECTOR_BACKEND` | _(미설정 — §2 조건부 규칙)_ | `chroma` \| `sqlite-vec` \| `pgvector` |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(§4.1, sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수 C(recall 튜닝 노브, ≤4096) |
+| `PG_EF_SEARCH` | `150` | pgvector HNSW 쿼리 세션 파라미터 `hnsw.ef_search`(recall/속도 트레이드오프, pgvector 전용) |
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버+GGUF 폴백, `local` = minilm |
 | `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소. 콤마로 여러 URL 을 나열하면 순서대로 시도하는 체인이 된다(예: `http://a:1234/v1,http://b:1234/v1`) — 첫 서버 장애 시 다음 서버, 전부 장애 시 GGUF 폴백. 단일 URL 이면 기존과 동일 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 임베딩 모델 id |

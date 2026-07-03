@@ -15,52 +15,69 @@
 
 ## 1. 스토어 구조
 
-LocalCrab은 `STORAGE_MODE` 환경변수로 세 가지 백엔드를 선택한다: `local`(기본),
-`kuzu`(그래프만 KuzuGraphStore, 나머지는 local과 동일), `docker`.
+LocalCrab은 `STORAGE_MODE` 환경변수로 네 가지 백엔드를 선택한다: `local`(기본),
+`kuzu`(그래프만 KuzuGraphStore, 나머지는 local과 동일), `docker`, `pg`(4스토어
+전부 PostgreSQL 통합).
 
-| 스토어 역할 | local 모드 | kuzu 모드 | docker 모드 |
-| --- | --- | --- | --- |
-| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `KuzuGraphStore` (`graph.kuzu`, ladybug>=0.18) | `Neo4jStore` (`bolt://localhost:7687`) |
-| 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `LocalSQLDocStore` (local과 동일) | `MongoStore` (MongoDB) |
-| 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | local과 동일 | `ChromaStore` (HttpClient) |
-| SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (local과 동일) | `SQLStore` (PostgreSQL) |
+| 스토어 역할 | local 모드 | kuzu 모드 | pg 모드 | docker 모드 |
+| --- | --- | --- | --- | --- |
+| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `KuzuGraphStore` (`graph.kuzu`, ladybug>=0.18) | `PGGraphStore` (공유 SQLAlchemy 엔진) | `Neo4jStore` (`bolt://localhost:7687`) |
+| 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `LocalSQLDocStore` (local과 동일) | `PgDocStore` (공유 엔진) | `MongoStore` (MongoDB) |
+| 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | local과 동일 | `PgVectorStore` (공유 엔진, HNSW) | `ChromaStore` (HttpClient) |
+| SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (local과 동일) | `SQLStore` (`POSTGRES_URL`, 자체 엔진) | `SQLStore` (PostgreSQL) |
 
 `kuzu` 모드는 `is_local=True`(그래프를 제외한 문서·벡터·SQL 스토어는 `local`과
 동일하게 선택된다). `ladybug`는 KùzuDB의 리브랜딩 패키지명이며
 (https://github.com/LadybugDB/ladybug), `Database`/`Connection` API는 kuzu와
 동일하다. 설치: `pip install ".[kuzu]"`.
 
+`pg` 모드는 `is_local=False`(별도 분기 — `local`/`kuzu`의 SQLite 변형이 아니다).
+graph/vector/doc 3스토어는 factory가 `POSTGRES_URL`당 1회 생성해 캐시하는 **공유
+SQLAlchemy 엔진**(`_get_pg_engine`, 단일 커넥션 풀)을 주입받는다. `SQLStore`만
+기존 시그니처(`url` 인자)를 유지하기 위해 자체 엔진을 연다(같은 DB를 향하지만
+별도 풀). 설치: `pip install ".[pg]"`. 설계·프리플라이트 실측:
+`docs/pgvector-migration-plan.md` (B) 경로.
+
 **운영 권장 구성**: 기본은 `local` — 4스토어(graph/doc/sql/vector)를 SQLite 단일
 규율로 통일해 백업(디렉터리 1개 파일 복사)·정합성 관리 대상을 1개로 줄인다.
-대규모 확장 시에는 `docker` 4종 혼합이 아니라 **PostgreSQL 단일 통합**(pgvector
-경로, `docs/pgvector-migration-plan.md` (B))으로 이행하는 편이 낫다. `docker`
-모드는 Neo4j/MongoDB/PostgreSQL/Chroma 4종 외부 서비스를 각각 백업·버전관리·
-정합성 관리해야 하는데, SaaS 규모(다중 테넌트, 조직 단위 격리, 팀별 별도
-인프라 요구)가 아니면 이 관리 비용이 Neo4j/Mongo 개별 이점을 상회한다.
+실시간 동시 write(MCP 서빙 중 백그라운드 로더)가 확정 요구이거나 벡터가 수백만
+스케일이면 `docker` 4종 혼합이 아니라 **`pg` 모드(PostgreSQL 단일 통합)**로
+이행하는 편이 낫다 — MVCC로 리더가 라이터를 막지 않고, graph/vector/doc가 단일
+커넥션 풀을 공유한다. `docker` 모드는 Neo4j/MongoDB/PostgreSQL/Chroma 4종 외부
+서비스를 각각 백업·버전관리·정합성 관리해야 하는데, SaaS 규모(다중 테넌트,
+조직 단위 격리, 팀별 별도 인프라 요구)가 아니면 이 관리 비용이 Neo4j/Mongo
+개별 이점을 상회한다.
 
 벡터 백엔드는 `VECTOR_BACKEND`(미설정 시 `STORAGE_MODE`·`EMBEDDING_BACKEND` 조건부 결정)로 선택한다. 상세 규칙·매트릭스는 §8과 `docs/vector-backends.md` 참고.
 
 ### 팩토리 (`opencrab/stores/factory.py`)
 
 ```
+_get_pg_engine(url)   # lru_cache(maxsize=8) — 1 Engine per POSTGRES_URL, shared by
+                       # graph/vector/doc below (single connection pool, §3.5)
+
 make_graph_store(settings)
+    STORAGE_MODE=pg   → PGGraphStore(_get_pg_engine(POSTGRES_URL))
     STORAGE_MODE=kuzu → KuzuGraphStore(db_path="<LOCAL_DATA_DIR>/graph.kuzu")
     is_local          → LocalGraphStore(db_path="<LOCAL_DATA_DIR>/graph.db")
     else              → Neo4jStore(uri=NEO4J_URI, ...)
 
 make_doc_store(settings)
-    is_local → LocalSQLDocStore(db_path="<LOCAL_DATA_DIR>/doc_store.db")
-    else     → MongoStore(uri=MONGODB_URI, db_name=MONGODB_DB)
+    is_local            → LocalSQLDocStore(db_path="<LOCAL_DATA_DIR>/doc_store.db")
+    STORAGE_MODE=pg     → PgDocStore(_get_pg_engine(POSTGRES_URL))
+    else                → MongoStore(uri=MONGODB_URI, db_name=MONGODB_DB)
 
 make_vector_store(settings)
-    VECTOR_BACKEND(명시 또는 조건부 기본) 로 분기:
+    VECTOR_BACKEND(명시 또는 조건부 기본, STORAGE_MODE=pg → "pgvector") 로 분기:
       "sqlite-vec" → SqliteVecStore(db_path="<LOCAL_DATA_DIR>/<VECTOR_DB_FILE>")  # EMBEDDING_BACKEND=local 조합 시 ValueError
-      "pgvector"   → NotImplementedError (예약)
+      "pgvector"   → PgVectorStore(engine or POSTGRES_URL, dim=EMBED_DIM,        # EMBEDDING_BACKEND=local 조합 시 ValueError
+                                    collection=EMBED_COLLECTION, ef_search=PG_EF_SEARCH)
+                     # STORAGE_MODE=pg → 공유 엔진 주입, 그 외(VECTOR_BACKEND=pgvector 명시)는 자체 엔진
       "chroma"     → ChromaStore(local_mode=is_local, local_path="<LOCAL_DATA_DIR>/chroma")
 
 make_sql_store(settings)
-    is_local → SQLStore(url="sqlite:///<LOCAL_DATA_DIR>/opencrab.db")
-    else     → SQLStore(url=POSTGRES_URL)
+    STORAGE_MODE in (docker, pg) → SQLStore(url=POSTGRES_URL)   # own engine, same DB as pg's shared pool
+    else                         → SQLStore(url="sqlite:///<LOCAL_DATA_DIR>/opencrab.db")
 ```
 
 `LOCAL_DATA_DIR` 기본값: `/home/asdf/.openclaw/workspace/data/localcrab`
@@ -458,7 +475,10 @@ make_vector_store(settings)
   전환: `scripts/migrate_chroma_to_sqlite_vec.py`, 설계·성능(전역 브루트포스·binary 2단계):
   `docs/pgvector-migration-plan.md` (A) §3.6/§3.7, `docs/vector-backends.md` §4.1.
 - `chroma`(docker 모드 기본 / local+minilm 조합 기본): `ChromaStore` (위 그림 그대로).
-- `pgvector`: 예약(미구현).
+- `pgvector`(`STORAGE_MODE=pg` 기본): `PgVectorStore`(HNSW `m=16,ef_construction=64`,
+  쿼리 세션 `hnsw.ef_search=PG_EF_SEARCH` 기본 150). `EMBEDDING_BACKEND=local`과 조합 시
+  ValueError(sqlite-vec와 동일 가드). 전역 검색도 HNSW로 실측 p95 6.44ms라 sqlite-vec의
+  binary 2단계 같은 별도 가속 불필요. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로.
 
 모드×옵션 전체 매트릭스는 `docs/vector-backends.md` 참고.
 

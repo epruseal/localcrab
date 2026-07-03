@@ -58,8 +58,11 @@ opencrab serve
 
 > **운영 권장**: 기본은 `STORAGE_MODE=local` — graph/doc/sql/vector(sqlite-vec)를
 > 전부 SQLite 한 규율로 통일해 백업 디렉터리 1개·정합성 관리 대상 1개로 운영합니다.
-> 대규모로 커지면 PostgreSQL 단일 통합(pgvector 경로, 현재 예약/미구현 —
-> [pgvector-migration-plan.md](./docs/pgvector-migration-plan.md) (B) 참고)으로 이행하세요.
+> 실시간 동시 write(MCP 서빙 중 백그라운드 로더)가 확정 요구이거나 벡터가 수백만
+> 스케일로 커지면 `STORAGE_MODE=pg`(PostgreSQL 단일 통합, 4스토어 전부 PG·MVCC 다중
+> 라이터, `pip install ".[pg]"` — [pgvector-migration-plan.md](./docs/pgvector-migration-plan.md)
+> (B) 경로)로 이행하세요. 기존 SQLite → PG 데이터 이관은
+> `scripts/migrate_sqlite_to_pg.py`(1:1 복사, 재임베딩 불필요) 참고.
 > `docker` 모드(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 SaaS 규모가 아니면
 > 비권장입니다 — Neo4j/Mongo 각각의 이점이 4종 스토어를 따로 백업·버전관리·정합성
 > 관리하는 비용을 상회하지 못합니다.
@@ -275,15 +278,20 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 
 **`chroma` (docker 모드 기본 / local+minilm 조합 기본)**: ChromaDB. 로컬은 PersistentClient, docker는 HttpClient. 기존 동작 100% 보존.
 
-**`pgvector`**: 예약(미구현) — `docs/pgvector-migration-plan.md` (B) 경로.
+**`pgvector`** (`STORAGE_MODE=pg`에서 자동 선택): PostgreSQL 확장. HNSW 인덱스
+(`m=16, ef_construction=64`, 쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 150)로
+전역 검색도 실측 p95 6.44ms — sqlite-vec의 binary 2단계 같은 별도 가속이 불필요.
+`pip install ".[pg]"` 필요. `STORAGE_MODE!=pg`에서도 `VECTOR_BACKEND=pgvector`를
+명시하면 벡터만 PG로 보낼 수 있습니다. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로.
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
-| `VECTOR_BACKEND` | _(미설정 — 위 조건부 규칙으로 결정)_ | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
+| `VECTOR_BACKEND` | _(미설정 — 위 조건부 규칙으로 결정)_ | `chroma` \| `sqlite-vec` \| `pgvector` |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수(recall 튜닝) |
+| `PG_EF_SEARCH` | `150` | pgvector HNSW 쿼리 세션 파라미터(recall/속도 트레이드오프, pgvector 전용) |
 
 ```bash
 # 기존 Chroma 컬렉션이 있는 상태에서 sqlite-vec로 전환(KURE 벡터를 그대로 1:1 이관)
@@ -295,6 +303,19 @@ opencrab serve
 > **무중단 적재(sqlite-vec)**: chroma의 `chroma.lock(LOCK_EX)` 제약이 사라져 **적재 시 게이트웨이/서비스를 중단할 필요가 없다.** 벡터를 포함한 4스토어가 모두 SQLite WAL이라 로더/reingest 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. (chroma 백엔드에서는 기존대로 오프라인 `--fresh` 적재 시 중단 필요.)
 
 **롤백**: `VECTOR_BACKEND=chroma` 명시 → Chroma 스택으로 즉시 복귀(비파괴, Chroma 보존).
+
+```bash
+# STORAGE_MODE=pg — 4스토어(graph/doc/sql/vector) 전부 PostgreSQL 한 서버로 통합
+pip install ".[pg]"
+export STORAGE_MODE=pg
+export POSTGRES_URL=postgresql://opencrab:opencrab@localhost:5432/opencrab
+opencrab serve
+
+# 기존 로컬 SQLite(graph.db/doc_store.db/opencrab.db/vectors.db) → PG 1회 이관
+# (재임베딩 없음 — vectors.db의 raw float 벡터를 그대로 복사)
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --dry-run
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify
+```
 
 ---
 

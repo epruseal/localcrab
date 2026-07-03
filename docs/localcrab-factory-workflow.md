@@ -251,6 +251,7 @@ retrieves the relationship structure that explains why the answer is true.
 다시 **`EMBEDDING_BACKEND`(임베딩)**로 분기한다. 두 축은 독립이다.
 
 `VECTOR_BACKEND` 미설정 시 조건부 기본값:
+- `STORAGE_MODE=pg` → `pgvector`
 - `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → `sqlite-vec`
 - `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → `chroma`
 - 명시 설정은 항상 위 규칙보다 우선한다.
@@ -265,10 +266,14 @@ retrieves the relationship structure that explains why the answer is true.
   `scripts/migrate_chroma_to_sqlite_vec.py`·`scripts/migrate_add_binary_quantization.py`.
   모드×옵션 매트릭스: `docs/vector-backends.md`.
 - **`VECTOR_BACKEND=chroma`(docker 모드 기본 / local+minilm 조합 기본)**: 아래 EMBEDDING_BACKEND 분기대로 ChromaStore 반환.
-- **`VECTOR_BACKEND=pgvector`**: 예약(미구현) — `NotImplementedError`.
+- **`VECTOR_BACKEND=pgvector`(`STORAGE_MODE=pg` 기본)**: `PgVectorStore`(HNSW `m=16,ef_construction=64`,
+  쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 150) 반환. `STORAGE_MODE=pg` 이면 factory 의 공유
+  SQLAlchemy 엔진을 주입, 아니면(로컬 모드에서 벡터만 PG) `postgres_url` 로 자체 엔진 생성.
+  `EMBEDDING_BACKEND=local`과 조합 시 기동 ValueError(sqlite-vec와 동일 가드). 설계·실측:
+  `docs/pgvector-migration-plan.md` (B) 경로.
 
-임베딩 조립은 `_make_kure_embedding_function(settings)` 로 추출되어 chroma(openai)·sqlite-vec 가
-공유한다(추후 pgvector 도 재사용).
+임베딩 조립은 `_make_kure_embedding_function(settings)` 로 추출되어 chroma(openai)·sqlite-vec·
+pgvector 가 공유한다.
 
 ### `EMBEDDING_BACKEND=openai` (기본값)
 
