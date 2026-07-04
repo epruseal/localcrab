@@ -12,11 +12,11 @@
 
 | 축 | 값 | 의미 |
 |----|----|------|
-| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` | 그래프·문서·SQL 스토어 위치. `local`/`kuzu`는 `is_local=True`(둘 다 SQLite/임베디드), `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스 |
-| `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector`(예약) | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
+| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` / `pg` | 그래프·문서·SQL 스토어 위치. `local`/`kuzu`는 `is_local=True`(둘 다 SQLite/임베디드), `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스, `pg`는 4스토어 전부 PostgreSQL(별도 분기, `is_local=False`) |
+| `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector` | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
 | `EMBEDDING_BACKEND` | `openai`(기본) / `local` | 텍스트를 벡터로 바꾸는 방식. 벡터 백엔드 축과 독립 |
 
-> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다.
+> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다. 실시간 동시 write(MCP 서빙 중 백그라운드 로더) 또는 벡터 수백만 스케일이 확정 요구이면 `pg`(PostgreSQL 단일 통합, MVCC 다중 라이터)로 이행한다 — §9 힌지 참고.
 
 ---
 
@@ -29,6 +29,8 @@
 VECTOR_BACKEND 명시됨?
   → 예: 그 값을 그대로 사용(항상 최우선)
   → 아니오:
+      STORAGE_MODE == "pg"
+        → "pgvector"
       is_local(STORAGE_MODE in {local, kuzu}) AND EMBEDDING_BACKEND == "openai"
         → "sqlite-vec"
       그 외 (STORAGE_MODE == "docker" 이거나 EMBEDDING_BACKEND == "local")
@@ -63,7 +65,9 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 | `local`/`kuzu` | `local` | `chroma` | 사용 | 가능(minilm 기본 조합) |
 | `docker` | 무관 | `chroma` | 사용 | 가능(docker 모드 표준) |
 | `docker` | 무관 | `sqlite-vec` | 사용(단, 로컬 파일 경로) | 코드상 `is_local` 체크 없이 backend 자체는 동작하나, docker 모드에서 vector만 SQLite로 로컬화하는 조합은 설계 의도 밖 — 권장하지 않음 |
-| 무관 | 무관 | `pgvector` | **미구현** | **예약** — 선택 시 `NotImplementedError`. 설계: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로 |
+| `pg` | `openai` | _(미설정)_ | **`pgvector`** | `STORAGE_MODE=pg`이면 자동 선택(4스토어 전부 PG) |
+| `pg` | `local` | 무관 | **기동 실패** | **불가** — `ValueError`(minilm 384d는 pgvector 미지원, sqlite-vec와 동일 가드) |
+| `local`/`kuzu`/`docker` | `openai` | `pgvector` | 사용(벡터만 PG) | 가능 — `STORAGE_MODE!=pg`여도 명시하면 벡터만 PG로 보낼 수 있음(§6.3 (C) 단계) |
 
 ---
 
@@ -185,13 +189,180 @@ opencrab serve
   - HNSW는 근사 검색이라 recall이 sqlite-vec의 exact 검색보다 낮을 수 있다
     (실측 recall@10 vs sqlite-vec 0.925).
 
-### `pgvector` (예약, 미구현)
+### `pgvector` (`STORAGE_MODE=pg` 기본 — 구현 완료)
 
 - 스토어 4종(graph/doc/sql/vector)을 PostgreSQL 한 서버로 통합하는 경로.
   **MVCC 다중 라이터**를 제공해 sqlite-vec의 "라이터 직렬화" 제약을 근본적으로 해소한다.
-- 현재 미구현. 채택 여부는 "진짜 다중 라이터가 필요한가"라는 단일 힌지로 판단한다
-  (로더가 MCP 서빙 중 동시 write해야 하거나, 벡터가 수백만 스케일이면 pgvector 필요).
-- 상세 설계·트레이드오프·전환 절차: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
+  graph/vector/doc는 factory가 `POSTGRES_URL`당 1회 생성하는 공유 SQLAlchemy 엔진(단일
+  커넥션 풀)을 주입받는다.
+- **장점**
+  - MVCC로 리더가 라이터를 막지 않고, 라이터는 행 단위로만 경합 — 다중 프로세스
+    (MCP 서버 + 백그라운드 로더)가 락 없이 동시에 읽고 쓸 수 있다.
+  - **HNSW 인덱스**(`vector_cosine_ops`, `m=16, ef_construction=64`, 쿼리 세션
+    `hnsw.ef_search`=`PG_EF_SEARCH` 기본 500 — §4.2 Phase 2 게이트 재측정으로 150→500
+    상향)가 **전역(pack 미지정) 검색도** 서브선형으로 처리 — 179,784건 전량 실측 global
+    p95 **24.61ms**(ef=500). sqlite-vec가 전역 브루트포스(868ms)를 완화하려고 도입한
+    binary 2단계 양자화(§4.1) 같은 별도 가속이 애초에 불필요하다.
+  - `pg_dump`/`pg_restore`/PITR로 vectors·doc·sql·graph를 한 번에 정합성 있게 백업·복구.
+- **단점**
+  - 상시 서버 프로세스(RPi5에서 SQLite/Chroma 인프로세스 대비 자원 점유 증가),
+    HNSW 빌드 시 CPU/메모리 스파이크(`maintenance_work_mem`/`max_parallel_maintenance_workers`
+    튜닝 필요 — 아래 인프라 주의 참고).
+  - `EMBEDDING_BACKEND=local`(minilm)과 조합 불가(sqlite-vec와 동일 가드, `ValueError`).
+- **pack_id 전용 컬럼(JSONB GIN 미채택)**: `pack_id`를 `metadata` JSONB에 묻지 않고
+  전용 컬럼 + btree 인덱스로 분리했다 — 프리플라이트 실증상 JSONB GIN 대비 이점이 없었고,
+  `pack_id` 등가/멤버십(`$in`)이 필터의 지배적 패턴이라 btree 등가 조회가 더 단순하고 빠르다.
+  나머지 메타 키는 `metadata ->> :key` 조건으로 그대로 SQL WHERE에 완전히 푸시다운된다
+  (sqlite-vec의 "LIMIT 이후 Python 후처리 필터" 같은 2단계가 구조적으로 없다).
+- **설치**: `pip install ".[pg]"`(pgvector 파이썬 패키지 — Postgres 확장 자체는
+  `CREATE EXTENSION vector`를 스토어 ensure-schema가 최초 사용 시 idempotent하게 실행).
+- **이관**: 기존 SQLite(graph.db/doc_store.db/opencrab.db/vectors.db) → PG는
+  `scripts/migrate_sqlite_to_pg.py`로 1:1 복사(재임베딩 불필요 — sqlite-vec 표준이
+  이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
+- 상세 설계·프리플라이트 실측·트레이드오프: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
+
+#### 4.2 Phase 2 통합 벤치 — sqlite-vec(A) vs pgvector(B) §11.1 게이트 실측
+
+실코드 경로(`PgVectorStore`/`PGGraphStore`/`PgDocStore`, factory가 만드는 것과 동일한
+클래스)로 **179,784건 실데이터 KURE 1024d 벡터 전량 + graph 154,561 노드/431,377
+엣지 전량 + doc 156,744/64,801/1,711,237(node/source/audit) 전량**을 임시 PG 16
+컨테이너(`pgvector/pgvector:pg16`, `--shm-size=1g`)로 1:1 이관(`scripts/migrate_sqlite_to_pg.py
+--verify`, 행수 전부 일치 확인)한 뒤 측정했다. 벤치 조건: RPi5, ef_search=150(별도
+표기 없는 한 — 측정 당시 `PG_EF_SEARCH` 기본값. recall 게이트 미달로 이후 기본값을
+500으로 상향, 아래 재측정 참조).
+
+**이관 소요:** graph+doc+vector 전량 이관 총 약 18분(그중 벡터 bulk-copy 약 4.2분,
+`execute_values` batch, 실측 720\~740 rows/s) + HNSW 빌드(`m=16, ef_construction=64`,
+`PgVectorStore` 자체 설정대로 `maintenance_work_mem=512MB`/단일스레드) 약 4\~5분.
+
+**벡터 게이트** (`PgVectorStore.query`, 홀더 EF로 저장된 벡터를 그대로 질의에 재사용 —
+재임베딩 없음):
+
+| 지표 | 목표 | 실측 | 판정 |
+|------|------|------|------|
+| global top-10 p50/p95 | (참고) | 8.24 / 22.60 ms | — |
+| pack-scoped p95 — 대(10,887건) | ≤100ms | 2.93 / **4.36** ms | ✅ |
+| pack-scoped p95 — 중(316건) | ≤100ms | 3.93 / **6.73** ms | ✅ |
+| pack-scoped p95 — 소(10건) | ≤100ms | 1.83 / **3.36** ms | ✅ |
+| 필터 조합(pack_id+metadata) p95 | ≤200ms | 7.09 / **7.90** ms | ✅ |
+| recall@10 (HNSW vs exact, ef_search=500) | ≥0.95 | **0.9600** | ✅ |
+| pack isolation leak | 0 | **0** | ✅ |
+
+**recall 게이트 — 수정 및 재측정:** 최초 실측(`ef_search=150`)은 recall@10 0.9440으로
+게이트 미달이었다. `PG_EF_SEARCH` 기본값을 500으로 상향(`opencrab/config.py`)하고
+179,784건 전량·200쿼리·동일 시드(1234)로 ef별 recall/global p95 곡선을 재실측했다:
+
+| ef_search | recall@10 | global p50/p95 |
+|---|---|---|
+| 150 | 0.9370 | 5.11 / 10.48 ms |
+| 300 | 0.9490 | 7.99 / 15.52 ms |
+| 400 | 0.9500 | 10.20 / 21.11 ms(게이트 경계, 마진 부족) |
+| **500(채택)** | **0.9600** | **12.00 / 24.61 ms** |
+| 550 이상 | 1.0000 | 683.87 / 712.41 ms(지연 급증 — 동시 부하 없는 단독 측정에서도 재현, 하드웨어/캐시 한계로 추정) |
+
+500을 채택값으로 확정했다 — recall 마진(0.96 vs 게이트 0.95)과 지연 마진(24.61ms vs 게이트
+100ms, 4배 여유)을 동시에 만족하는 마지막 안전 구간이며, 550 이상에서는 지연이 약
+30~60배 급격히 나빠지므로 그 구간은 피해야 한다.
+
+**graph 게이트** (`PGGraphStore.find_neighbors` vs `LocalGraphStore.find_neighbors`,
+동일 노드 20개 — 차수 상위 허브 5개(최대 차수 6,586) + 무작위 15개, `direction=both,
+depth=3, limit=50`):
+
+| 지표 | 목표 | 실측(수정 후) | 판정 |
+|------|------|------|------|
+| PGGraphStore 3-hop p50/p95(20노드 전체) | ≤100ms | 5.96 / **11.02** ms | ✅ |
+| PGGraphStore 3-hop p95 — 허브 5개만 | ≤100ms | 3.05 / **3.64** ms | ✅ |
+| PGGraphStore 3-hop p95 — 무작위 15개만 | ≤100ms | 7.02 / **11.16** ms | ✅ |
+| LocalGraphStore 3-hop p50/p95(참고) | — | 4.75 / 9.34 ms | — |
+
+**graph 게이트 — 원인 및 수정 내역:** 최초 실측(102.27/164.82ms)의 원인은
+`find_neighbors`가 홉의 각 프론티어 노드마다 엣지를 조회한 뒤 **반환된 각 행마다
+목적지/출발지 노드 속성을 개별 SELECT로 재조회**하는 N+1 패턴이었다 — 차수 6,586 허브는
+1홉만으로도 최대 ~50회의 개별 SQL 왕복(소켓 비용)이 발생했다. `PGGraphStore.find_neighbors`
+(`opencrab/stores/pg_graph_store.py`)를 홉 단위 배치 조회로 재작성해 해소했다: BFS 큐는
+FIFO 특성상 항상 레벨(홉) 단위로 진행되므로, 한 홉의 프론티어 노드 전체를
+`unnest(:frontier_ids) CROSS JOIN LATERAL (... LIMIT :cap)` 쿼리 1회로 후보 엣지를
+모으고(`:cap` = `limit` — 기존 "remaining"이 가질 수 있는 최댓값과 동일한 안전 상한이라
+허브의 전체 엣지 목록을 긁어오지 않는 성질은 그대로 유지), 후보 노드 속성도
+`unnest`+`JOIN` 쿼리 1회로 모은다. 원본의 "remaining slot" 순차 선택 로직(노드/방향/행
+순서, pack 필터 3규칙)은 메모리상에서 그대로 재현했다 — SQL은 후보 수집만 배치화했을 뿐
+선택 로직은 손대지 않아 파리티가 보존된다. 파리티 검증: `tests/test_pg_graph_doc_parity.py`
+36개 전부 통과(`OPENCRAB_PG_TEST_URL` 설정 시). 재귀 CTE(§6.4 canonical 경로)로의 전환은
+여전히 미착수 상태이나, 이번 홉 단위 배치화만으로 게이트를 9배 이상 여유 있게 통과했다.
+
+**doc 스팟체크** (`PgDocStore.keyword_search`, 실데이터 질의 3종):
+
+| 질의 유형 | 질의 | 지연 | 결과 |
+|---|---|---|---|
+| 영어 | `clinical trial biomarker` | 44.81ms | 0건(코퍼스에 매치 없음 — sanity, 게이트 아님) |
+| 약어 | `MRR` | 7.07ms | 2건, 내용 타당 |
+| 모델번호 | `KURE-v1` | **2873.17ms** | 10건, 내용 타당하나 지연 큼 — 짧은 토큰(`v1` 등) trigram ILIKE 폴백 경로가 인덱스를 충분히 활용하지 못한 것으로 추정(§ pg_doc_store.py KEYWORD SEARCH 주석 참고, 후속 조사 필요) |
+
+**pack delete 정합성** (`PgVectorStore.delete`, 소형 팩 `shiftone-dutch-coffee-assets`
+4건 삭제):
+
+| 지표 | 목표 | 실측 | 판정 |
+|---|---|---|---|
+| 잔존 행(해당 pack_id) | 0 | 0 | ✅ |
+| 고아 행(삭제된 id) | 0 | 0 | ✅ |
+| 전체 행수 델타 | -4 | -4(179,784→179,780) | ✅ |
+
+**백업/복구 게이트** (`pg_dump -Fc` → DB drop/recreate → `pg_restore`, 4스토어 행수
+재대조):
+
+| 항목 | 실측 |
+|---|---|
+| `pg_dump` 소요 / 덤프 크기 | 2m22.6s / 730MB |
+| `pg_restore` 소요(HNSW 재빌드 포함, 병렬 3워커 자동 채택) | 6m41.0s |
+| 복구 후 행수 | graph_nodes 154,561 / graph_edges 431,377 / doc_nodes 156,744 / doc_sources 64,801 / audit_log 1,711,237 / opencrab_vectors_kure 179,780 — **사전 수치와 전부 일치** |
+| 게이트(1커맨드 왕복 완전 복구) | ✅ **PASS** |
+
+**라이브 무간섭** (적재/HNSW 빌드/restore 전 구간, `POST /mcp initialize` 프로브):
+
+| 시점 | 응답시간 | free 가용량 |
+|---|---|---|
+| 적재 전(베이스라인) | 8.1ms | 5.3Gi |
+| 벡터 적재 중 | 1.2ms | 5.2Gi |
+| HNSW 빌드 직후 | 2.6ms | 5.1Gi |
+| 전 과정 종료 후 | 7.3ms | 5.4Gi |
+
+전 구간 서브10ms 유지, 라이브 서비스에 관측 가능한 저하 없음(swap 1.4→1.7Gi 소폭
+증가했으나 available 헤드룸 충분).
+
+**cold start / disk usage** (SQLite 3파일 대비 PG 3스토어, 동일 실데이터):
+
+| 항목 | SQLite(3파일 합계) | PG(3테이블군 합계) | 비고 |
+|---|---|---|---|
+| 디스크 사용량 | 2,474 MB(graph 299 + doc 970 + vector 1,205) | **3,584 MB**(graph 260 + doc 806 + vector 2,518) | **PG가 약 45% 큼** — HNSW 인덱스(벡터 테이블 2,518MB 중 상당 비중) + JSONB/TOAST + PG 튜플 오버헤드가 원인. VACUUM 미실행 상태 수치 |
+| 콜드 커넥션(최초 1회) | 0.4ms(파일 open) | 73.1ms(TCP 커넥션+ping) | 상시 서버 프로세스 특성상 1회성 비용, 커넥션 풀 재사용 후 steady-state 영향 없음 |
+
+**§11.1 게이트 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=500 · find_neighbors
+홉 단위 배치화 적용 기준 — 수정 후 재측정):
+
+| 게이트 | 목표 | 실측 | 판정 |
+|---|---|---|---|
+| single-pack top-k p95 | ≤100ms | 2.93\~6.73ms(대/중/소) | ✅ |
+| metadata-filtered top-k p95 | ≤200ms | 7.90ms | ✅ |
+| 3-hop graph traversal p95 | ≤100ms | **11.02ms**(수정 전 164.82ms) | ✅ |
+| recall@10 (HNSW vs exact) | ≥0.95 | **0.9600**(수정 전 ef=150 기준 0.9440) | ✅ |
+| pack isolation leakage | 0 | 0 | ✅ |
+| pack delete consistency | orphan 0 | 0 | ✅ |
+| backup/restore | 1 command 완전 복구 | 행수 100% 일치 | ✅ |
+| cold start / disk usage | 측정·기록 | 디스크 +45%, 콜드스타트 +73ms | 기록(악화 명시) |
+
+**결론:** 최초 게이트 실측은 8개 중 6개 PASS, 2개(3-hop graph p95, recall@10) FAIL이었다.
+두 FAIL 모두 원인을 특정해 해소했다 — recall은 `PG_EF_SEARCH` 기본값을 500으로 상향(ef별
+곡선 실측으로 550 이상의 지연 급증 구간을 확인하고 그 직전 안전값을 채택), graph는
+`find_neighbors`를 홉 단위 배치 조회(unnest+LATERAL)로 재작성해 N+1 SQL 왕복을 제거했다
+(재귀 CTE 전환은 여전히 미착수 상태로 남아 있으나 이번 배치화만으로 게이트를 만족).
+재측정 결과 8개 게이트 전부 PASS. sqlite-vec(A) 쪽 §11.1 실측(pack-scoped p95 8.3ms
+exact / global p95 exact 593ms·binary 55ms recall 0.995)과 나란히 보면, pack-scoped
+지연은 pgvector가 근소 우위(2.93\~6.73ms vs 8.3ms)이나 절대 격차는 작고, global 검색은
+pgvector(HNSW, ef=500 기준 24.61ms)가 sqlite-vec의 binary 2단계(54.8ms)보다 빠르면서
+recall도 게이트를 만족한다(0.96). graph 3-hop 지연도 수정 후 11.02ms로 (A)의 인프로세스
+SQLite(LocalGraphStore, 4.75\~9.34ms)에 근접한다. graph/doc/backup 축은 pgvector 전용
+이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하며, 두 FAIL이 해소됨에 따라 (B) 채택의
+성능 측 장애 요인은 남아 있지 않다. 최종 채택은 §9 힌지와 함께 확정한다.
 
 ---
 
@@ -227,6 +398,23 @@ opencrab serve
 - 스크립트는 **재임베딩하지 않는다** — KURE 벡터를 그대로 복사한다. `--dry-run`,
   `--force`, `--batch` 옵션 지원. Chroma 원본은 삭제하지 않는(비파괴) 동작.
 
+### SQLite(local/kuzu) → PG-unified (`STORAGE_MODE=pg`) 전환
+
+```bash
+pip install ".[pg]"
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --dry-run   # 계획 확인
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify   # 4스토어 1:1 이관 + 행수 검증
+export STORAGE_MODE=pg POSTGRES_URL=postgresql://...
+opencrab serve
+```
+
+- **재임베딩 불필요** — sqlite-vec 표준이 이미 KURE(1024d)이므로 `vectors.db`의 raw
+  float 벡터를 `vec_to_json`으로 읽어 그대로 pgvector에 복사한다(§3.2/§4.3 정정 —
+  아래 pgvector-migration-plan.md §3.2 참고).
+- 원본 SQLite 파일은 **읽기 전용으로만 접근**(마이그레이션 스크립트가 절대 쓰지 않음) —
+  `--backup-to` 없이도 원본 무변경이 보장된다. `--verify`로 이관 후 행수 대조.
+- 멱등 — 이미 이관된 테이블(행수 일치)은 재실행 시 스킵.
+
 ### sqlite-vec → Chroma 롤백
 
 ```bash
@@ -252,11 +440,12 @@ opencrab serve
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|
-| `VECTOR_BACKEND` | _(미설정 — §2 조건부 규칙)_ | `chroma` \| `sqlite-vec` \| `pgvector`(예약) |
+| `VECTOR_BACKEND` | _(미설정 — §2 조건부 규칙)_ | `chroma` \| `sqlite-vec` \| `pgvector` |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
 | `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(§4.1, sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수 C(recall 튜닝 노브, ≤4096) |
+| `PG_EF_SEARCH` | `500` | pgvector HNSW 쿼리 세션 파라미터 `hnsw.ef_search`(recall/속도 트레이드오프, pgvector 전용) — §4.2 재측정으로 150→500 상향(recall@10 게이트 ≥0.95 확보) |
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버+GGUF 폴백, `local` = minilm |
 | `OPENAI_API_BASE` | `http://<server-host>:1234/v1` | OpenAI 호환 서버 주소. 콤마로 여러 URL 을 나열하면 순서대로 시도하는 체인이 된다(예: `http://a:1234/v1,http://b:1234/v1`) — 첫 서버 장애 시 다음 서버, 전부 장애 시 GGUF 폴백. 단일 URL 이면 기존과 동일 |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 임베딩 모델 id |

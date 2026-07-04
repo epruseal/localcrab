@@ -24,9 +24,17 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Storage mode: "local" (no Docker) or "docker" (full services)
+    # Storage mode:
+    #   "local"  — no Docker. SQLite(graph/doc/sql) + Chroma/sqlite-vec(vector).
+    #   "docker" — full services (Neo4j + MongoDB + Postgres(sql only) + Chroma).
+    #   "kuzu"   — local variant with KuzuGraphStore (ladybug) instead of the
+    #              SQLite adjacency-table graph store; doc/sql/vector stay local.
+    #   "pg"     — PG-unified: 4스토어(graph/doc/sql/vector) 전부 PostgreSQL 한
+    #              서버·SQLAlchemy 공유 엔진으로 통합. MVCC 다중 라이터가 필요한
+    #              운영(§9 힌지: MCP 서빙 중 동시 write, 벡터 수백만 스케일)에
+    #              권장. 설계/실측: docs/pgvector-migration-plan.md (B) 경로.
     # ------------------------------------------------------------------
-    storage_mode: Literal["local", "docker", "kuzu"] = Field(
+    storage_mode: Literal["local", "docker", "kuzu", "pg"] = Field(
         default="local", alias="STORAGE_MODE"
     )
     local_data_dir: str = Field(default="/home/asdf/.openclaw/workspace/data/localcrab", alias="LOCAL_DATA_DIR")
@@ -148,7 +156,12 @@ class Settings(BaseSettings):
     #                        Chroma 다중프로세스 쓰기 제약/flock 층 제거. KURE(1024d) 표준
     #                        — 앱이 EMBEDDING_BACKEND=openai 의 KURE EF 로 직접 임베딩 후
     #                        INSERT(vec0 는 원시벡터 저장). VECTOR_DB_FILE 의 vec0 테이블 사용.
-    #   "pgvector"         : (예약) 추후 PG-unified 경로. 미구현 시 명시적 오류.
+    #   "pgvector"         : pgvector(PostgreSQL 확장). PG-unified((B) 경로) 구현
+    #                        완료 — HNSW(m16/ef_construction64), 쿼리 시 세션
+    #                        hnsw.ef_search=PG_EF_SEARCH(기본 500). STORAGE_MODE=pg
+    #                        이면 자동 선택(vector_backend_resolved), local 모드에서
+    #                        VECTOR_BACKEND=pgvector 명시 설정으로 벡터만 PG를 쓰는
+    #                        조합도 가능(§6.3 (C) 단계). 실측: pgvector-migration-plan.md.
     #
     # 설계: docs/pgvector-migration-plan.md §3.6 / §9. embedding 은 백엔드와 무관하게
     #       동일(ResilientEmbeddingFunction, KURE). 바뀌는 것은 저장/검색 백엔드뿐.
@@ -199,6 +212,25 @@ class Settings(BaseSettings):
     vector_ann_coarse_k: int = Field(default=512, alias="VECTOR_ANN_COARSE_K")
 
     # ------------------------------------------------------------------
+    # pgvector HNSW 런타임 노브 (VECTOR_BACKEND=pgvector 전용, PG_EF_SEARCH 환경변수)
+    #
+    # 쿼리 세션 파라미터 hnsw.ef_search 값(recall/속도 트레이드오프). 프리플라이트
+    # (소규모)에서 정한 기본값 150은 Phase 2 통합 게이트(179,784행 KURE 1024d 전량,
+    # docs/vector-backends.md §4.2)에서 recall@10 0.9440으로 게이트(≥0.95) 미달
+    # 확인됨 — 500으로 상향. ef별 recall/global p95 실측 곡선(179,784행 전량,
+    # 200쿼리, seed=1234, RPi5):
+    #   ef=150: recall=0.9370  p50/p95=5.11/10.48ms
+    #   ef=300: recall=0.9490  p50/p95=7.99/15.52ms
+    #   ef=400: recall=0.9500  p50/p95=10.20/21.11ms  (게이트 경계, 마진 부족)
+    #   ef=500: recall=0.9600  p50/p95=12.00/24.61ms  ← 채택(마진 확보, 게이트
+    #           대비 지연 4배 여유)
+    #   ef=550+: recall=1.0000  p50/p95=683.87/712.41ms — 지연 급증(하드웨어/
+    #           캐시 한계로 추정, 동시 부하 없는 단독 측정에서도 재현) → 500
+    #           초과는 피할 것.
+    # ------------------------------------------------------------------
+    pg_ef_search: int = Field(default=500, alias="PG_EF_SEARCH")
+
+    # ------------------------------------------------------------------
     # MCP server
     # ------------------------------------------------------------------
     mcp_server_name: str = Field(default="opencrab", alias="MCP_SERVER_NAME")
@@ -225,6 +257,9 @@ class Settings(BaseSettings):
 
     @property
     def is_local(self) -> bool:
+        # "pg" is deliberately excluded — it is a separate branch (make_*
+        # dispatches on storage_mode == "pg" explicitly in factory.py), not a
+        # local-SQLite variant like "kuzu".
         return self.storage_mode in ("local", "kuzu")
 
     @property
@@ -242,9 +277,13 @@ class Settings(BaseSettings):
         """VECTOR_BACKEND 가 명시 설정되면 그대로, 미설정("")이면 조건부 기본값을
         반환한다. local 운영(is_local) + KURE 임베딩(openai) 조합에서만 sqlite-vec
         을 기본으로 골라, docker 모드나 minilm(local) 임베딩에서는 기존 chroma
-        경로를 그대로 유지한다. 자세한 규칙은 vector_backend 필드 주석 참고."""
+        경로를 그대로 유지한다. storage_mode=="pg" 는 4스토어 통합 모드이므로
+        벡터도 무조건 pgvector(명시 VECTOR_BACKEND 설정이 여전히 최우선).
+        자세한 규칙은 vector_backend 필드 주석 참고."""
         if self.vector_backend:
             return self.vector_backend
+        if self.storage_mode == "pg":
+            return "pgvector"
         if self.is_local and self.embedding_backend == "openai":
             return "sqlite-vec"
         return "chroma"

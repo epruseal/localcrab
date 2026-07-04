@@ -117,6 +117,39 @@ def sqlite_vec_store(tmp_path):
     s.close()
 
 
+@pytest.fixture
+def pg_vector_store(tmp_path):
+    import os
+    import uuid
+
+    pytest.importorskip("sqlalchemy")
+    pytest.importorskip("psycopg2")
+    from _vec_helpers import MockEF
+    from opencrab.stores.pg_vector_store import PgVectorStore
+
+    dsn = os.environ.get("OPENCRAB_PG_TEST_URL")
+    if not dsn:
+        pytest.skip("OPENCRAB_PG_TEST_URL 미설정 - pg 동시성 테스트 스킵")
+    collection = f"test_concurrency_{uuid.uuid4().hex[:12]}"
+    s = PgVectorStore(
+        dsn_or_engine=dsn,
+        embedding_function=MockEF(16),
+        dim=16,
+        collection_name=collection,
+    )
+    if not s.available:
+        pytest.skip(f"PG 테스트 DB 접속 불가: {dsn!r}")
+    yield s
+    try:
+        from sqlalchemy import text
+
+        with s._engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {collection}"))
+    except Exception:
+        pass
+    s.close()
+
+
 # ---------------------------------------------------------------------------
 # LocalGraphStore (핵심) — threading.Lock 쓰기 직렬화
 # ---------------------------------------------------------------------------
@@ -543,6 +576,141 @@ class TestSqliteVecConcurrency:
                 texts=["x"], metadatas=[{"pack_id": "v"}], ids=["x"]
             )
         assert sqlite_vec_store.count() == 0
+
+
+# ---------------------------------------------------------------------------
+# PgVectorStore — SQLAlchemy 엔진 풀 + Postgres MVCC (앱 레벨 write lock 없음)
+# ---------------------------------------------------------------------------
+
+
+class TestPgVectorConcurrency:
+    def test_concurrent_upsert(self, pg_vector_store):
+        """정상: 4스레드 × 10 upsert → 에러 0, count 일치 (MVCC 하 동시 upsert 회귀)."""
+        N, M = 4, 10
+
+        def worker(tid: int) -> None:
+            for i in range(M):
+                pg_vector_store.upsert_texts(
+                    texts=[f"doc {tid} {i}"],
+                    metadatas=[{"pack_id": f"p{tid}"}],
+                    ids=[f"t{tid}_{i}"],
+                )
+
+        errors = run_threads(worker, N)
+        assert errors == [], f"동시 upsert 에러: {errors}"
+        assert pg_vector_store.count() == N * M
+
+    def test_reads_during_writes(self, pg_vector_store):
+        """핵심(MVCC): 쓰기 중에도 읽기(query/count)가 차단·손상 없이 진행된다 —
+        SqliteVecStore의 WAL 목표 속성을 Postgres MVCC로 대체 검증."""
+        for i in range(10):
+            pg_vector_store.upsert_texts(
+                texts=[f"seed {i}"], metadatas=[{"pack_id": "s"}], ids=[f"seed{i}"]
+            )
+
+        def writer(tid: int) -> None:
+            for i in range(15):
+                pg_vector_store.upsert_texts(
+                    texts=[f"w {tid} {i}"],
+                    metadatas=[{"pack_id": "w"}],
+                    ids=[f"w{tid}_{i}"],
+                )
+
+        def reader(tid: int) -> None:
+            for _ in range(20):
+                pg_vector_store.query("seed", n_results=5)
+                pg_vector_store.count()
+                pg_vector_store.get_by_id("seed0")
+
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def wrap(fn, tid):
+            try:
+                fn(tid)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=wrap, args=(writer, t)) for t in range(2)]
+        threads += [threading.Thread(target=wrap, args=(reader, t)) for t in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60.0)
+        assert not [th for th in threads if th.is_alive()], "데드락 의심"
+        assert errors == [], f"읽기/쓰기 혼합 중 손상 관측: {errors}"
+        assert pg_vector_store.count() == 10 + 2 * 15
+
+    def test_concurrent_resets_keep_store_valid(self, pg_vector_store):
+        """엣지: 여러 스레드가 reset_collection 동시 호출 → DELETE 트랜잭션의
+        원자성(MVCC)으로 에러 없이 유효 상태 유지."""
+        pg_vector_store.upsert_texts(
+            texts=["seed"], metadatas=[{"pack_id": "v"}], ids=["seed"]
+        )
+
+        def worker(tid: int) -> None:
+            for _ in range(5):
+                pg_vector_store.reset_collection()
+
+        errors = run_threads(worker, 4)
+        assert errors == [], f"동시 reset 에러: {errors}"
+        assert pg_vector_store.count() == 0
+        pg_vector_store.upsert_texts(
+            texts=["after"], metadatas=[{"pack_id": "v"}], ids=["after"]
+        )
+        assert pg_vector_store.count() == 1
+
+    def test_reads_during_reset_no_error(self, pg_vector_store):
+        """엣지: reset_collection(DELETE 기반)이 진행되는 동안 동시 읽기(query/
+        count/get_by_id)가 깨지지 않는다 — reset이 테이블을 DROP하지 않고
+        비우기만 하므로 리더는 항상 유효한 테이블을 본다."""
+        for i in range(30):
+            pg_vector_store.upsert_texts(
+                texts=[f"seed {i}"], metadatas=[{"pack_id": "s"}], ids=[f"s{i}"]
+            )
+        stop = threading.Event()
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def resetter() -> None:
+            for _ in range(8):
+                pg_vector_store.reset_collection()
+                for i in range(20):
+                    pg_vector_store.upsert_texts(
+                        texts=[f"r{i}"], metadatas=[{"pack_id": "s"}], ids=[f"r{i}"]
+                    )
+            stop.set()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    pg_vector_store.query("seed", n_results=5)
+                    pg_vector_store.count()
+                    pg_vector_store.get_by_id("s1")
+                except Exception as exc:  # noqa: BLE001 - 어떤 예외든 수집
+                    with lock:
+                        errors.append(exc)
+
+        threads = [threading.Thread(target=resetter)]
+        threads += [threading.Thread(target=reader) for _ in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60.0)
+        assert not [th for th in threads if th.is_alive()], "데드락 의심"
+        assert errors == [], f"reset 중 읽기 에러: {[str(e)[:80] for e in errors[:5]]}"
+        assert pg_vector_store.count() >= 0
+        pg_vector_store.query("seed", n_results=3)
+
+    def test_unavailable_raises(self, pg_vector_store):
+        """에러: unavailable 시 RuntimeError (count 는 0 반환, 예외 없음)."""
+        pg_vector_store._available = False
+        with pytest.raises(RuntimeError):
+            pg_vector_store.upsert_texts(
+                texts=["x"], metadatas=[{"pack_id": "v"}], ids=["x"]
+            )
+        assert pg_vector_store.count() == 0
 
 
 # ---------------------------------------------------------------------------

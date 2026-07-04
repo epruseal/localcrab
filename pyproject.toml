@@ -72,6 +72,13 @@ gguf = [
 kuzu = [
     "ladybug>=0.18",
 ]
+# STORAGE_MODE=pg (PGGraphStore/PgDocStore/PgVectorStore, 4스토어 PostgreSQL
+# 통합) 에 필요. sqlalchemy/psycopg2-binary 는 이미 기본 dependencies 에 있음
+# (SQLStore 의 기존 PG 지원 경로) — pgvector 는 Postgres 확장(CREATE EXTENSION
+# vector)의 파이썬 타입 어댑터 패키지로, PG-unified 배포에서만 필요.
+pg = [
+    "pgvector>=0.4",
+]
 
 [project.scripts]
 opencrab = "opencrab.cli:main"

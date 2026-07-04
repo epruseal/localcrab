@@ -100,12 +100,44 @@ def test_sqlite_vec_backend(tmp_path) -> None:
         store.close()
 
 
-def test_pgvector_reserved_not_implemented(tmp_path) -> None:
+def test_pgvector_backend_instantiates_without_live_connection(tmp_path) -> None:
+    """VECTOR_BACKEND=pgvector 는 이제 구현되어 PgVectorStore 를 반환한다.
+
+    PgVectorStore.__init__ 은 연결을 시도하지만 실패해도 raise 하지 않고
+    available=False 로 떨어진다(pg_vector_store.py의 가용성/폴백 가드,
+    ChromaStore/SqliteVecStore와 동일 패턴) — 그래서 실제 PG 서버 없이도
+    인스턴스화가 가능하다(no-live-connection 게이트, OPENCRAB_PG_TEST_URL 불필요).
+    """
+    from opencrab.config import Settings
+    from opencrab.stores.factory import make_vector_store
+    from opencrab.stores.pg_vector_store import PgVectorStore
+
+    settings = Settings(
+        VECTOR_BACKEND="pgvector",
+        EMBEDDING_BACKEND="openai",
+        LOCAL_DATA_DIR=str(tmp_path),
+        POSTGRES_URL="postgresql://opencrab:opencrab@127.0.0.1:1/opencrab",  # unreachable on purpose
+    )
+    store = make_vector_store(settings)
+    try:
+        assert isinstance(store, PgVectorStore)
+        assert store.available is False  # unreachable DSN -> graceful degrade, no raise
+    finally:
+        store.close()
+
+
+def test_pgvector_requires_openai_embedding(tmp_path) -> None:
+    """pgvector needs the app-side KURE EF; EMBEDDING_BACKEND=local (minilm,
+    no app-side EF, 384d) must raise a clear config error, not a cryptic crash."""
     from opencrab.config import Settings
     from opencrab.stores.factory import make_vector_store
 
-    settings = Settings(VECTOR_BACKEND="pgvector", LOCAL_DATA_DIR=str(tmp_path))
-    with pytest.raises(NotImplementedError):
+    settings = Settings(
+        VECTOR_BACKEND="pgvector",
+        EMBEDDING_BACKEND="local",
+        LOCAL_DATA_DIR=str(tmp_path),
+    )
+    with pytest.raises(ValueError):
         make_vector_store(settings)
 
 

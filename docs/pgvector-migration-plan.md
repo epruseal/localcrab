@@ -1,14 +1,83 @@
 # 스토어 단일화 마이그레이션 플랜 (SQLite-unified vs PG-unified)
 
-> 상태: 설계 문서(Design only). 코드 구현 없음.
+> 상태: **(A) SQLite-unified(sqlite-vec) 구현 완료 + (B) PG-unified(pgvector) 구현 완료**
+> (스토어 3종 `PgVectorStore`/`PGGraphStore`/`PgDocStore` + factory 배선(`STORAGE_MODE=pg`)
+> + `scripts/migrate_sqlite_to_pg.py` + 문서 현행화, 2026-07). 아래 본문(§0~§13)은 착수 시점의
+> **설계 원문**을 그대로 보존하고, **§0.1**에 구현 완료 후 확정된 프리플라이트 실측·정정 사항을
+> 덧붙인다 — 원문과 실제 구현이 다른 지점은 §0.1을 우선한다.
 > 선행 플랜 상호 참조: `[[ingestion-via-mcp-plan]]` (동시성의 1단계 — MCP 단일 라이터 경유 적재).
 > 본 문서는 그 다음 단계인 **스토어 통합** 옵션이다.
 > 두 단일규율 타깃을 병렬 비교한다: **(A) SQLite-unified(Chroma→sqlite-vec)** / **(B) PG-unified(pgvector)**.
-> **§9 의사결정 힌지(다중 라이터 요구 여부)**로 둘 중 하나를 선택한다.
+> **§9 의사결정 힌지(다중 라이터 요구 여부)**로 둘 중 하나를 선택한다 — 실무적으로는 **둘 다** 구현되어
+> `STORAGE_MODE`(`local`=A 경로 기본 / `pg`=B 경로)로 운영자가 고른다.
 
 > 본 문서는 원래 pgvector(B) 전용이었으나, 문서 자신이 §0/§2에서 밝히는 사실 — *동시성의 약한 고리는
 > Chroma 하나뿐이고 doc/sql/graph 는 이미 SQLite WAL* — 에서 자연히 도출되는 **(A) SQLite-unified(sqlite-vec)**
 > 경로를 대등하게 병기하도록 확장되었다. 파일명(`pgvector-migration-plan.md`)은 이력상 유지한다.
+
+---
+
+## 0.1 구현 완료 현황 (2026-07) — 프리플라이트 확정 사항 및 원문 정정
+
+> 이 절은 실제 구현(`opencrab/stores/pg_vector_store.py`/`pg_graph_store.py`/`pg_doc_store.py`,
+> `opencrab/stores/factory.py`, `scripts/migrate_sqlite_to_pg.py`)을 코드 기준으로 정리한다.
+> 아래 각 항목은 §3~§10 원문의 해당 지점을 대체/보강한다.
+
+**스키마·인덱스 파라미터(§3.3/§4.1 확정).** HNSW `m=16, ef_construction=64`, 쿼리 시 세션
+파라미터 `hnsw.ef_search`(생성자 인자, 기본 500 — `PG_EF_SEARCH` 환경변수. 프리플라이트 확정값
+150은 179,784건 전량 Phase 2 게이트에서 recall@10 0.9440으로 미달해 500으로 상향, 상세는
+`docs/vector-backends.md` §4.2). 인덱스 생성 직전 `SET maintenance_work_mem='512MB'`/
+`SET max_parallel_maintenance_workers=0`을 실행한 뒤 `CREATE INDEX`(ensure-schema에서 1회,
+세션 단위라 부작용 없음) — 이 RPi 환경의 좁은 `/dev/shm`(64MB)에서 병렬 HNSW 빌드가 실패하는
+것을 프리플라이트에서 확인해 회피한 것.
+
+**pack_id 전용 컬럼 채택(§3.5/§4.1 정정 — JSONB GIN 불채택).** `metadata JSONB`에 `pack_id`를
+묻지 않고 `pack_id TEXT` 전용 컬럼 + btree 인덱스로 분리했다. 근거: (1) `pack_id` 등가/멤버십
+(`$in`)이 where 필터의 지배적 패턴이라 btree 등가 조회로 충분하고 JSONB GIN 대비 프리플라이트
+실증상 이점이 없었다, (2) 나머지 메타 키는 `metadata ->> :key` 텍스트 비교로 SQL WHERE에 **완전히
+푸시다운**되므로(§3.1 대비 sqlite-vec의 "KNN 이후 Python 후처리 필터" 2단계가 구조적으로 없다),
+GIN 인덱스가 필요한 임의 중첩 쿼리 자체가 현재 요구사항에 없다.
+
+**재임베딩 불필요로 정정(§3.2/§8.1-5/§10 리스크 정정).** 원문은 "Chroma 내부 벡터를 그대로
+옮길 수 없어 전 벡터 재임베딩이 필수"라고 썼으나, 이는 **(A) sqlite-vec가 채택되어 로컬 모드
+기본이 되기 전** 시점(Chroma가 유일한 벡터 백엔드였던 baseline, §0)을 전제한 서술이다. (A)가
+이미 KURE(1024d) 표준으로 전량 재임베딩을 완료했으므로, (A)→(B) 전환은 **`vectors.db`(vec0)의
+raw float 벡터를 `vec_to_json`으로 읽어 pgvector에 그대로 복사**하면 된다(재임베딩 0회) —
+`scripts/migrate_sqlite_to_pg.py`가 이렇게 구현되어 있다. Chroma에서 직접 (B)로 가는 경로만
+원문의 재임베딩 필수가 여전히 유효하다(현재는 비표준 경로 — (A)를 거치는 것을 권장).
+
+**§3.7 binary 2단계 상응 불필요(HNSW 실측).** sqlite-vec는 전역(pack 미지정) 브루트포스가
+p95 868ms라 binary 2단계 양자화(§3.7)로 ~30ms대까지 가속했다. pgvector는 HNSW 인덱스 자체가
+서브선형 ANN이라 전역 검색도 **실측 p95 6.44ms**로 나와, 별도의 sign-bit 2단계 근사 경로를
+둘 이유가 없다 — `PgVectorStore` 모듈 docstring "WHY NOT BINARY 2-STAGE" 참고.
+
+**graph traversal — 재귀 CTE가 아닌 Python BFS 유지(§6.4 정정).** §6.4는 canonical 경로로
+재귀 CTE(`WITH RECURSIVE`)를 예시했으나, 실제 `PGGraphStore.find_neighbors`/`find_path`는
+**`LocalGraphStore`와 동일한 Python-orchestrated BFS 루프**를 유지하고 SQL만 sqlite3→PG
+파라미터 바인딩으로 치환했다. 이유: BFS의 "remaining slot" 예산(허브 노드 팬아웃 상한,
+`LIMIT :remaining`)이 양방향·다중 노드에 걸쳐 공유되는 FIFO 순서 의존 로직이라, 이를 단일 SQL
+문으로 선언적으로 재현하면 `LocalGraphStore` 대비 미묘한 순서/절단 차이가 생길 위험이 있고,
+검증 기준이 "동일 입력 → 동일 출력" parity이기 때문이다. 허브 폭주(534ms)를 막던 핵심 성질
+(모든 per-node fetch가 `LIMIT`으로 유계)은 그대로 보존된다 — 재귀 CTE는 여전히 **가능한
+후속 최적화**로 남아 있으나(프리플라이트 벤치는 61ms p95 LATERAL CTE를 검증), 채택하지 않았다.
+
+**인프라 주의 사항 (RPi5 실증, 재현 시 확인할 것).**
+1. **`/dev/shm` 용량 제약.** 기본 64MB인 환경에서 HNSW `CREATE INDEX`의 병렬 빌드가 실패한다.
+   `max_parallel_maintenance_workers=0`으로 병렬 빌드를 끄고 `maintenance_work_mem=512MB`로
+   단일 워커에 충분한 메모리를 준다(위 스키마 절 참고). `docker run --shm-size=...`로 `/dev/shm`
+   자체를 늘리는 대안도 있으나, 이 스토어는 세션 파라미터 우회를 택해 컨테이너 설정에
+   의존하지 않는다.
+2. **cgroup 메모리 상한과 `maintenance_work_mem`.** 컨테이너/cgroup으로 Postgres 프로세스
+   메모리가 제한된 환경(예: RPi Docker 기본 cgroup v2)에서는 `maintenance_work_mem=512MB` 설정이
+   컨테이너 메모리 상한을 압박할 수 있다 — HNSW 빌드 중 OOM kill 징후(컨테이너 비정상 종료)가
+   보이면 컨테이너 메모리 한도를 먼저 확인할 것(운영 배포 시 최소 1GB 여유 권장).
+
+**migrate_sqlite_to_pg.py 설계 요지.** 4스토어(graph/doc/sql/vector) 1:1 이관, 원본 SQLite는
+읽기 전용으로만 열어(쓰기 없음) 별도 `--backup-to` 없이도 원본 무변경을 보장하고, `--verify`로
+이관 후 행수 대조를 별도 단계로 수행한다. 벡터 테이블은 HNSW 인덱스를 **적재 후** 생성한다
+(빈 테이블에 인덱스부터 만들면 INSERT마다 증분 유지비용이 붙어 대량 적재 시 훨씬 느리다) —
+기본 테이블만 먼저 만들어 `execute_values`(batch=1000, 실측 834 rows/s)로 벌크 적재한 뒤에야
+`PgVectorStore`를 생성해 그 ensure-schema가 HNSW 인덱스를 만들도록 순서를 강제한다.
 
 ---
 
@@ -382,7 +451,7 @@ $$) AS (e agtype);
 - 해결: doc store에 **백엔드-중립 capability** 추가 — `supports_keyword: bool` + `keyword_search(query, pack_ids, include_unpackaged, limit)`. `HybridQuery._fts_search()`가 capability 보유 시에만 호출(미지원·예외 시 graceful 폴백)하고 기존 `Reranker.rerank()`(RRF)로 융합. reranker source 가중치 `keyword`(>bm25).
 - **LocalSQLDocStore**: SQLite **FTS5** 가상테이블 `doc_sources_fts`(`tokenize='unicode61'`, 한+영) — `_init_db`에서 생성 + idempotent 마이그레이션, `upsert_source`에서 동기화. 질의는 `\w+` 토큰을 따옴표 OR 결합(연산자 주입 방지).
 - **(A) sqlite-vec 이전 시**: doc store 가 SQLite 그대로이므로 **FTS5(`doc_sources_fts`)는 무변경 유지** — 벡터·키워드가 모두 SQLite 로 일관되고 tsvector 전환 과제 자체가 없다.
-- **(B) Postgres(pgvector) 이전 시**: `PgDocStore`가 동일 capability를 `tsvector`(또는 `pg_bigm`/`pgroonga`) + GIN으로 구현하면 `HybridQuery`는 무변경. 미구현이면 `supports_keyword=False`로 두어 자동 폴백.
+- **(B) Postgres(pgvector) — 구현 완료.** `PgDocStore`(`opencrab/stores/pg_doc_store.py`)가 동일 capability를 구현해 `HybridQuery`는 무변경으로 재사용된다. 원문은 `pg_bigm`/`pgroonga` 확장을 상정했으나, 실제로는 확장 설치 부담 없는 **stock PG 경로**로 구현했다: 주 리그는 `to_tsvector('simple', text)` + `plainto_tsquery('simple', :q)` + `ts_rank`(GIN 인덱스), 3자 미만 짧은 토큰(한국어 다수)은 tsquery 어휘 매칭이 안 되므로 `pg_trgm`(`similarity()` + `gin_trgm_ops` GIN) ILIKE 폴백으로 보완한다. `'simple'` 설정은 한글 형태소 분석을 하지 않으므로 SQLite FTS5의 2/3-gram 커스텀 토크나이저와 동일하지 않다 — 짧은 토큰 매칭은 trigram 폴백이 담당. GIN 인덱스 생성 실패(확장 미가용) 시에는 `supports_keyword=False`로 graceful degrade해 §7 본문의 폴백 경로가 그대로 동작한다.
 - **한계(알려짐):** RRF는 다중 리트리버 동시 등장 항목을 우대하므로, 키워드 단독 매칭은 의미충돌(예 "smoke" 색상 청크)이 vector+graph로 강하게 잡힐 때 top-3 밖으로 밀릴 수 있다. pack 스코프 질의에선 정확. 깊은 RRF 단독소스 보정은 후속 과제.
 
 ---
@@ -427,7 +496,7 @@ $$) AS (e agtype);
 3. **공유 SQLAlchemy 엔진 부트스트랩.** factory 가 `create_engine(postgres_url)` 를 1회 생성해 sql/vector/doc 스토어에 주입(§3.5).
 4. **스키마 생성.** sql 테이블은 `SQLStore` 가 자동 생성. doc 테이블(JSONB) + `opencrab_vectors_kure vector(1024)` 벡터 테이블 DDL 적용. 인덱스는 데이터 적재 후 생성(IVFFlat은 적재 후 필수, HNSW는 권장).
 5. **전 벡터 재임베딩·재적재 (필수, KURE 단일).** Chroma 내부 벡터를 그대로 옮길 수 없다(임베딩 위치가 앱으로 이동). doc/노드 원본 텍스트에서 `ResilientEmbeddingFunction`(KURE) 으로 **재임베딩**하여 `opencrab_vectors_kure`(1024d)에 적재. minilm 재임베딩은 하지 않음(롤백용 Chroma 잔존).
-6. **doc/sql 덤프 이전.** SQLite `doc_store.db`/`opencrab.db` 의 로우를 Postgres로 복사(JSON TEXT → JSONB 캐스트). 1회성 마이그레이션 스크립트(범위 외, 본 문서는 설계만).
+6. **doc/sql 덤프 이전 — 구현 완료.** `scripts/migrate_sqlite_to_pg.py`가 graph/doc/sql/vector **4스토어 전체**를 1:1 이관한다(원문 설계 시점엔 doc/sql만 상정했으나 실제로는 graph·vector까지 같은 스크립트로 통합). JSON TEXT → JSONB 캐스트, 자연 유니크 키를 가진 테이블(`graph_nodes`/`graph_edges`, `doc_nodes`/`doc_sources`/`audit_log`, `rebac_policies`, 벡터 테이블)은 `ON CONFLICT DO UPDATE/NOTHING`으로 재실행 안전. 원본 SQLite는 SELECT 전용으로만 열어 무변경 보장, `--verify`로 이관 후 행수 대조. 벡터 테이블은 raw float32 벡터를 `vec_to_json(embedding)`으로 그대로 복사(재임베딩 0회, §0.1). 스키마 생성은 자체 DDL을 새로 만들지 않고 `PGGraphStore`/`PgDocStore` 생성자(ensure-schema)를 그대로 재사용하며, 벡터 테이블만 예외적으로 베이스 DDL을 인라인 복제해 **적재 후 HNSW 인덱스 생성**(§0.1 순서 강제와 동일 이유)한다.
 7. **factory 분기.** `make_vector_store` 가 `PgVectorStore` 를, `make_doc_store`/`make_sql_store` 가 Postgres 백엔드를 선택하도록 신규 설정(`VECTOR_BACKEND=pgvector`) 추가. 기본값은 기존(local) 유지해 롤백 보장. graph 는 §6 롤아웃((C)→AGE/CTE)에 따름.
 8. **검증.** §11 회귀 스위트(green→green) 전체 통과 — 행 수 대조(`count()` vs Chroma, `table_counts()`), 대표 질의 top-k(특히 KURE 한국어 MRR), BM25 결과 동등성, graph 백엔드 parity, 다중 프로세스 동시 적재 스모크.
 

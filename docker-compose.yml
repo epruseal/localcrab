@@ -48,7 +48,13 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16
+    # pgvector/pgvector:pg16 = stock postgres:16 + the pgvector extension
+    # preinstalled (drop-in — same entrypoint/env/volumes). Needed for
+    # STORAGE_MODE=pg (4-store PG-unified) / VECTOR_BACKEND=pgvector.
+    # CREATE EXTENSION IF NOT EXISTS vector is NOT run here — each store's
+    # ensure-schema (PgVectorStore._ensure_schema) issues it idempotently on
+    # first use, so no init SQL script is needed for docker-compose bring-up.
+    image: pgvector/pgvector:pg16
     container_name: opencrab-postgres
     ports:
       - "5432:5432"

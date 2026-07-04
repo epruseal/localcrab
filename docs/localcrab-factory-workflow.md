@@ -251,6 +251,7 @@ retrieves the relationship structure that explains why the answer is true.
 다시 **`EMBEDDING_BACKEND`(임베딩)**로 분기한다. 두 축은 독립이다.
 
 `VECTOR_BACKEND` 미설정 시 조건부 기본값:
+- `STORAGE_MODE=pg` → `pgvector`
 - `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → `sqlite-vec`
 - `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → `chroma`
 - 명시 설정은 항상 위 규칙보다 우선한다.
@@ -265,10 +266,14 @@ retrieves the relationship structure that explains why the answer is true.
   `scripts/migrate_chroma_to_sqlite_vec.py`·`scripts/migrate_add_binary_quantization.py`.
   모드×옵션 매트릭스: `docs/vector-backends.md`.
 - **`VECTOR_BACKEND=chroma`(docker 모드 기본 / local+minilm 조합 기본)**: 아래 EMBEDDING_BACKEND 분기대로 ChromaStore 반환.
-- **`VECTOR_BACKEND=pgvector`**: 예약(미구현) — `NotImplementedError`.
+- **`VECTOR_BACKEND=pgvector`(`STORAGE_MODE=pg` 기본)**: `PgVectorStore`(HNSW `m=16,ef_construction=64`,
+  쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 500) 반환. `STORAGE_MODE=pg` 이면 factory 의 공유
+  SQLAlchemy 엔진을 주입, 아니면(로컬 모드에서 벡터만 PG) `postgres_url` 로 자체 엔진 생성.
+  `EMBEDDING_BACKEND=local`과 조합 시 기동 ValueError(sqlite-vec와 동일 가드). 설계·실측:
+  `docs/pgvector-migration-plan.md` (B) 경로.
 
-임베딩 조립은 `_make_kure_embedding_function(settings)` 로 추출되어 chroma(openai)·sqlite-vec 가
-공유한다(추후 pgvector 도 재사용).
+임베딩 조립은 `_make_kure_embedding_function(settings)` 로 추출되어 chroma(openai)·sqlite-vec·
+pgvector 가 공유한다.
 
 ### `EMBEDDING_BACKEND=openai` (기본값)
 
@@ -277,11 +282,14 @@ KURE-v1(한국어 특화, 1024d)을 기본 모델로 사용한다. `VECTOR_BACKE
 로컬 모드에서는 실제로는 ChromaStore 대신 `SqliteVecStore`가 선택되는 경우가 기본 경로다(위 참고).
 
 ```
-ResilientEF = OpenAIEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운로드)
+ResilientEF = [OpenAIEF(primary_1), OpenAIEF(primary_2), ...] + LlamaCppEF(fallback, lazy load, 자동 다운로드)
 ```
 
-- **OpenAIEF (primary)**: OpenAI 호환 임베딩 서버(LM Studio 등)에 요청.
-- **LlamaCppEF (fallback)**: primary 실패 시 lazy load. 모델 파일이 없으면 자동 다운로드 후 llama-cpp-python으로 직접 임베딩.
+- **OpenAIEF 리스트 (primary)**: `OPENAI_API_BASE`를 콤마로 split한 엔드포인트(`settings.openai_api_bases`)마다 하나씩 생성해
+  순서대로 시도하는 체인을 만든다 — 첫 URL이 죽어도 다음 URL을 먼저 시도한 뒤에야 GGUF 폴백으로 내려간다. 단일 URL(콤마
+  없음)이면 리스트 길이 1이라 기존 단일 엔드포인트 동작과 100% 동일하다. 다중 원격 지원은 원격 GPU 서버 1대 재부팅/점검 시
+  느린 CPU 폴백 대신 다른 원격 서버를 우선 시도하기 위한 기능이다.
+- **LlamaCppEF (fallback)**: 모든 primary 실패 시 lazy load. 모델 파일이 없으면 자동 다운로드 후 llama-cpp-python으로 직접 임베딩.
 
 ### 워크플로 호환성
 
@@ -290,6 +298,7 @@ ResilientEF = OpenAIEF(primary) + LlamaCppEF(fallback, lazy load, 자동 다운�
 - **backfill/적재 중 게이트웨이 중단 여부는 `VECTOR_BACKEND`에 따라 다르다:**
   - `chroma`: PersistentClient 단일 프로세스 제약(`chroma.lock` LOCK_EX) → 오프라인 로더 `--fresh` 시 게이트웨이 중단 필요.
   - **`sqlite-vec`**: 벡터가 SQLite WAL이라 **적재 중 게이트웨이 중단 불필요** — 로더 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. graph/doc/sql은 이미 WAL이므로 sqlite-vec 사용 시 4스토어 전부 무중단 적재 가능. 설계: `docs/pgvector-migration-plan.md §9`.
+  - **`pgvector`(`STORAGE_MODE=pg`)**: PostgreSQL MVCC(스냅샷 격리)라 **리더가 라이터를 막지 않는 진짜 다중 라이터** — sqlite-vec의 단일 라이터 직렬화보다 상위 동시성이며, MCP 서버와 백그라운드 로더가 락 충돌 없이 동시에 읽고 쓸 수 있어 적재 중 게이트웨이 중단이 불필요하다. 설계: `docs/pgvector-migration-plan.md §9`.
 
 ---
 

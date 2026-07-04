@@ -238,32 +238,229 @@ def bench_binary(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def bench_pg(args: argparse.Namespace) -> int:
+    """(B) PgVectorStore 게이트 측정 — sqlite vec0 DB 사본(--src-db, 예:
+    라이브 vectors.db의 오프라인 사본)의 벡터를 --pg-url 임시 테이블에 스트리밍
+    적재(``execute_values``, batch=1000) 후 측정한다:
+
+      - global top-10 p50/p95 (HNSW, ``hnsw.ef_search`` = --ef-search)
+      - pack-scoped(실 pack_id) p50/p95
+      - recall@10 : HNSW vs exact(동일 데이터, 인덱스 강제 비활성 스캔) top-10 overlap
+      - pack leak : pack-scoped 결과가 항상 지정 pack만 포함하는지(=0 이어야 함)
+
+    게이트 상수는 §11.1(recall>=0.95, pack p95<=200ms)을 재사용한다. 전역 p95는
+    HNSW가 서브선형이라 별도 게이트를 프리플라이트에서 신설하지 않았으므로(§3.7
+    binary 모드의 100ms 게이트와 달리 pgvector는 HNSW 자체가 답이라 참고치만 출력).
+
+    NOTE: 이 함수는 --mode pg 를 동작 가능하게 구현한 것이며, 179k 라이브 데이터
+    규모의 실통합 벤치는 이 PR 범위가 아니다(리드가 Phase 2에서 별도 실행) — 여기서는
+    작은 --sample(기본 1000)로 모드 동작만 스모크 확인했다.
+    """
+    import sqlite3
+    import struct
+
+    import sqlite_vec
+    from psycopg2.extras import execute_values
+    from sqlalchemy import create_engine, text
+
+    if not args.pg_url:
+        print("! --pg-url is required for --mode pg")
+        return 3
+    if not args.src_db or not os.path.exists(args.src_db):
+        print(f"! --src-db not found: {args.src_db!r} (use an OFFLINE COPY)")
+        return 3
+
+    rng = random.Random(args.seed)
+    table = args.table
+    pg_table = f"bench_pg_{int(time.time())}"
+
+    conn = sqlite3.connect(f"file:{args.src_db}?mode=ro", uri=True)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if "node_id" not in cols:
+        print(f"! table '{table}' missing expected columns {cols}")
+        return 3
+    n_total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    cap = min(args.sample, n_total) if args.sample else n_total
+    print(f"# src sqlite: {args.src_db} table={table} rows={n_total} using={cap}")
+
+    rows = conn.execute(
+        f"SELECT node_id, pack_id, embedding, document, metadata FROM {table} LIMIT ?",
+        (cap,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        print("! no rows sampled")
+        return 3
+    dim = len(bytes(rows[0][2])) // 4
+    print(f"# dim inferred: {dim}")
+
+    engine = create_engine(args.pg_url)
+    try:
+        with engine.begin() as c:
+            c.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            c.execute(text(f"DROP TABLE IF EXISTS {pg_table}"))
+            c.execute(text(
+                f"CREATE TABLE {pg_table} (node_id TEXT PRIMARY KEY, pack_id TEXT, "
+                f"embedding vector({dim}) NOT NULL, document TEXT, metadata JSONB)"
+            ))
+
+        t0 = time.perf_counter()
+        raw = engine.raw_connection()
+        try:
+            cur = raw.cursor()
+            payload = []
+            for node_id, pack_id, emb_blob, document, metadata in rows:
+                vec = struct.unpack(f"{dim}f", bytes(emb_blob))
+                vec_lit = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                payload.append(
+                    (node_id, pack_id, vec_lit, document, metadata or "{}")
+                )
+            execute_values(
+                cur,
+                f"INSERT INTO {pg_table} (node_id, pack_id, embedding, document, metadata) "
+                "VALUES %s",
+                payload,
+                template="(%s, %s, %s::vector, %s, %s::jsonb)",
+                page_size=1000,
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        build_s = time.perf_counter() - t0
+        print(f"# pg load: {len(rows)} rows in {build_s:.1f}s (table={pg_table})")
+
+        with engine.begin() as c:
+            c.execute(text("SET maintenance_work_mem = '512MB'"))
+            c.execute(text("SET max_parallel_maintenance_workers = 0"))
+            c.execute(text(
+                f"CREATE INDEX ON {pg_table} USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m=16, ef_construction=64)"
+            ))
+            c.execute(text(f"CREATE INDEX ON {pg_table} (pack_id)"))
+
+        n = len(rows)
+        q_idx = rng.sample(range(n), min(args.queries, n))
+
+        def qlit(i: int) -> str:
+            vec = struct.unpack(f"{dim}f", bytes(rows[i][2]))
+            return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+        # ---- global: HNSW vs exact (index scan disabled) top-10 ----
+        lat_hnsw: list[float] = []
+        lat_exact: list[float] = []
+        recalls: list[float] = []
+        with engine.connect() as c:
+            c.execute(text(f"SET hnsw.ef_search = {args.ef_search}"))
+            for i in q_idx:
+                node_id = rows[i][0]
+                v = qlit(i)
+                t = time.perf_counter()
+                hnsw_rows = c.execute(text(
+                    f"SELECT node_id FROM {pg_table} "
+                    "ORDER BY embedding <=> (:q)::vector LIMIT 11"
+                ), {"q": v}).fetchall()
+                lat_hnsw.append((time.perf_counter() - t) * 1000.0)
+                hnsw_top = [r[0] for r in hnsw_rows if r[0] != node_id][:10]
+
+                c.execute(text("SET enable_indexscan = off"))
+                c.execute(text("SET enable_bitmapscan = off"))
+                t = time.perf_counter()
+                exact_rows = c.execute(text(
+                    f"SELECT node_id FROM {pg_table} "
+                    "ORDER BY embedding <=> (:q)::vector LIMIT 11"
+                ), {"q": v}).fetchall()
+                lat_exact.append((time.perf_counter() - t) * 1000.0)
+                c.execute(text("SET enable_indexscan = on"))
+                c.execute(text("SET enable_bitmapscan = on"))
+                exact_top = [r[0] for r in exact_rows if r[0] != node_id][:10]
+                if exact_top:
+                    recalls.append(
+                        len(set(exact_top) & set(hnsw_top)) / len(exact_top)
+                    )
+
+        # ---- pack-scoped p95 + leak ----
+        packs = list({r[1] for r in rows if r[1]})[:60]
+        lat_pack: list[float] = []
+        leak = 0
+        with engine.connect() as c:
+            c.execute(text(f"SET hnsw.ef_search = {args.ef_search}"))
+            for i, pk in enumerate(packs):
+                v = qlit(q_idx[i % len(q_idx)])
+                t = time.perf_counter()
+                hits = c.execute(text(
+                    f"SELECT node_id, pack_id FROM {pg_table} WHERE pack_id = :pk "
+                    "ORDER BY embedding <=> (:q)::vector LIMIT 10"
+                ), {"pk": pk, "q": v}).fetchall()
+                lat_pack.append((time.perf_counter() - t) * 1000.0)
+                leak += sum(1 for r in hits if r[1] != pk)
+
+        recall_at_10 = statistics.mean(recalls) if recalls else 0.0
+        print("\n===== PG (pgvector/HNSW) BENCH RESULT =====")
+        print(f"corpus vectors          : {n}")
+        print(f"query sample            : {len(q_idx)}")
+        print(f"pg load time            : {build_s:.1f}s")
+        print(f"recall@10 (HNSW vs exact): {recall_at_10:.4f}   [gate >= 0.95]")
+        print(f"global HNSW  p50 / p95  : {pctl(lat_hnsw,50):.2f} / {pctl(lat_hnsw,95):.2f} ms")
+        print(f"global exact p50 / p95  : {pctl(lat_exact,50):.2f} / {pctl(lat_exact,95):.2f} ms  (enable_indexscan=off)")
+        print(f"pack-scoped  p50 / p95  : {pctl(lat_pack,50):.2f} / {pctl(lat_pack,95):.2f} ms   [gate p95 <= 200]")
+        print(f"pack isolation leak     : {leak}   [gate == 0]")
+
+        gate_recall = recall_at_10 >= 0.95
+        gate_pack = pctl(lat_pack, 95) <= 200.0 if lat_pack else True
+        gate_leak = leak == 0
+        ok = gate_recall and gate_pack and gate_leak
+        print("\nGATES:",
+              f"recall={'PASS' if gate_recall else 'FAIL'}",
+              f"pack_p95={'PASS' if gate_pack else 'FAIL'}",
+              f"leak={'PASS' if gate_leak else 'FAIL'}")
+        print("OVERALL:", "PASS" if ok else "FAIL")
+        return 0 if ok else 1
+    finally:
+        try:
+            with engine.begin() as c:
+                c.execute(text(f"DROP TABLE IF EXISTS {pg_table}"))
+        except Exception:
+            pass
+        engine.dispose()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["chroma-parity", "binary"],
+    ap.add_argument("--mode", choices=["chroma-parity", "binary", "pg"],
                     default="chroma-parity",
                     help="chroma-parity: original chroma-vs-vec0 gate; "
-                         "binary: §3.7 2-stage ANN gate on a migrated DB copy")
+                         "binary: §3.7 2-stage ANN gate on a migrated DB copy; "
+                         "pg: PgVectorStore(HNSW) gate from an offline vec0 DB copy")
     ap.add_argument("--data-dir", default="/home/asdf/.openclaw/workspace/data/localcrab")
     ap.add_argument("--work-dir", default="/home/asdf/.openclaw/workspace",
                     help="disk-backed dir for temp copy+db (NOT tmpfs /tmp)")
     ap.add_argument("--collection", default=CHROMA_COLLECTION)
     ap.add_argument("--queries", type=int, default=200,
-                    help="(binary mode uses --queries too; 100 is enough)")
+                    help="(binary/pg modes use --queries too; 100 is enough)")
     ap.add_argument("--sample", type=int, default=0, help="corpus cap (0 = all)")
     ap.add_argument("--batch", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=1234)
     # binary-mode options
     ap.add_argument("--src-db", default=None,
-                    help="[binary] migrated vec0 DB COPY (read-only; never the live db)")
+                    help="[binary/pg] source vec0 DB COPY (read-only; never the live db)")
     ap.add_argument("--table", default="vectors_kure",
-                    help="[binary] vec0 table name")
+                    help="[binary/pg] vec0 table name")
     ap.add_argument("--coarse-ks", default="256,512,1024",
                     help="[binary] comma-separated coarse candidate counts C to sweep")
+    # pg-mode options
+    ap.add_argument("--pg-url", default=None,
+                    help="[pg] PostgreSQL DSN for a disposable bench DB (never prod)")
+    ap.add_argument("--ef-search", type=int, default=150,
+                    help="[pg] hnsw.ef_search session parameter")
     args = ap.parse_args()
 
     if args.mode == "binary":
         return bench_binary(args)
+    if args.mode == "pg":
+        return bench_pg(args)
 
     rng = random.Random(args.seed)
 

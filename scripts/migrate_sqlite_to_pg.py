@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""1:1 migrate the 4 local SQLite stores (graph/doc/sql/vector) into a
+PostgreSQL PG-unified target (STORAGE_MODE=pg).
+
+WHAT THIS DOES: row-for-row copy, widening TEXT-JSON columns to JSONB and
+TEXT timestamps to TIMESTAMPTZ. NO re-embedding — the vector table's raw
+float32 vectors are copied as-is from the source sqlite-vec (vec0) table via
+``vec_to_json(embedding)`` (a lossless text serialisation Postgres accepts
+directly as a ``vector`` literal). If the source vec0 table has an
+``embedding_bit`` column (VECTOR_ANN=binary backfill,
+scripts/migrate_add_binary_quantization.py), it is IGNORED — PgVectorStore
+has no binary 2-stage path (its HNSW index already serves global search at
+p95 6.44ms, see docs/pgvector-migration-plan.md "WHY NOT BINARY 2-STAGE").
+
+SOURCE SAFETY: unlike migrate_add_binary_quantization.py (which rebuilds the
+source table in place and therefore REQUIRES --backup-to), this script only
+ever opens the source SQLite files with plain SELECT statements — it never
+issues a single write against them. The originals are guaranteed unmodified
+by construction; there is deliberately no --backup-to flag here. Instead,
+pass --verify to have the script assert (exit non-zero on mismatch) that the
+PostgreSQL row counts equal the SQLite source counts after loading.
+
+IDEMPOTENCY: each table is skipped (no-op) if it already exists in Postgres
+AND its row count already equals the source count — safe to re-run after an
+interruption. Tables with natural unique keys (graph_nodes/graph_edges,
+doc_nodes/doc_sources/audit_log, rebac_policies, the vector table) additionally
+upsert row-by-row (``ON CONFLICT DO UPDATE/NOTHING``) so a partial prior run
+does not duplicate rows. ``ontology_nodes``/``impact_records``/
+``lever_simulations`` have no natural unique key (SERIAL id only, not
+FK-referenced elsewhere) — for these three, a *partial* target (count > 0 but
+!= source count) is left untouched and reported instead of blindly
+re-inserting (which would duplicate history); operators should inspect and
+clear the table manually before re-running in that specific edge case.
+
+SCHEMA CREATION: this script does not hand-roll target DDL for graph/doc —
+it imports and instantiates PGGraphStore/PgDocStore (their constructors run
+ensure-schema idempotently). For the vector table it deliberately does NOT
+construct PgVectorStore before the bulk load (that would build the HNSW
+index against an empty table and then maintain it incrementally on every
+INSERT — much slower at scale than a bulk load followed by one index build).
+Instead it replicates just the base-table DDL inline, bulk-loads, and only
+THEN constructs PgVectorStore — whose ensure-schema idempotently creates the
+HNSW index post-load, honouring the `maintenance_work_mem`/
+`max_parallel_maintenance_workers` preflight settings already encoded in
+pg_vector_store.py (this script does not duplicate those settings).
+
+Usage:
+    python scripts/migrate_sqlite_to_pg.py \\
+        --data-dir /path/to/localcrab/data --pg-url postgresql://... \\
+        [--only graph,doc,sql,vector] [--limit 1000] [--batch 1000] \\
+        [--dry-run] [--verify]
+
+    # Individual file overrides (e.g. ad-hoc backup copies with non-default
+    # names) take precedence over --data-dir:
+    python scripts/migrate_sqlite_to_pg.py --pg-url postgresql://... \\
+        --vector-db /path/vectors-20260702-pre-ann.db \\
+        --graph-db /path/graph-pgbench.db \\
+        --doc-db /path/doc_store-pgbench.db --only graph,doc,vector --dry-run
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import time
+from typing import Any, Iterator
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_ident(name: str, what: str) -> str:
+    """Table/schema names are f-string-interpolated into DDL/DML below (same
+    pattern as pg_vector_store.py's _IDENT_RE) — reject anything that is not
+    a plain identifier before it ever reaches SQL."""
+    if not _IDENT_RE.match(name):
+        raise ValueError(f"Unsafe {what}: {name!r}")
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Source (SQLite) readers
+# ---------------------------------------------------------------------------
+
+
+def _sqlite_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _vec_sqlite_conn(db_path: str) -> sqlite3.Connection:
+    import sqlite_vec
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    return conn
+
+
+def _fetch_batches(
+    conn: sqlite3.Connection, sql: str, batch: int, limit: int | None
+) -> Iterator[list[sqlite3.Row]]:
+    if limit is not None:
+        sql = f"{sql} LIMIT {int(limit)}"
+    cur = conn.execute(sql)
+    while True:
+        rows = cur.fetchmany(batch)
+        if not rows:
+            return
+        yield rows
+
+
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+
+def _pg_count(pg_conn: Any, text: Any, table: str) -> int:
+    try:
+        row = pg_conn.execute(text(f"SELECT count(*) FROM {table}")).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Per-store migration
+# ---------------------------------------------------------------------------
+
+
+def migrate_graph(
+    db_path: str, engine: Any, schema: str, batch: int, limit: int | None, dry_run: bool
+) -> dict[str, int]:
+    from sqlalchemy import text
+
+    from opencrab.stores.pg_graph_store import PGGraphStore
+
+    if not os.path.exists(db_path):
+        print(f"# [graph] source not found, skipping: {db_path}")
+        return {}
+
+    src = _sqlite_conn(db_path)
+    src_nodes = _count(src, "graph_nodes")
+    src_edges = _count(src, "graph_edges")
+    print(f"# [graph] source rows: nodes={src_nodes} edges={src_edges}")
+
+    if dry_run:
+        print(f"# [graph] dry-run: would upsert into \"{schema}\".graph_nodes/graph_edges")
+        src.close()
+        return {"graph_nodes": src_nodes, "graph_edges": src_edges}
+
+    store = PGGraphStore(engine, schema=schema)  # idempotent ensure-schema
+    if not store.available:
+        raise RuntimeError("PGGraphStore is not available (connection failed).")
+    t = f'"{schema}"'
+
+    with engine.begin() as conn:
+        existing = _pg_count(conn, text, f"{t}.graph_nodes")
+    copied_nodes = 0
+    if existing == src_nodes and src_nodes > 0:
+        print(f"# [graph] graph_nodes already has {existing} rows == source — skip.")
+    else:
+        node_sql = text(
+            f"INSERT INTO {t}.graph_nodes (node_type, node_id, space_id, properties) "
+            "VALUES (:node_type, :node_id, :space_id, (:properties)::jsonb) "
+            "ON CONFLICT (node_type, node_id) DO UPDATE SET "
+            "space_id = EXCLUDED.space_id, properties = EXCLUDED.properties"
+        )
+        for rows in _fetch_batches(src, "SELECT node_type, node_id, space_id, properties FROM graph_nodes", batch, limit):
+            params = [dict(r) for r in rows]
+            with engine.begin() as conn:
+                conn.execute(node_sql, params)
+            copied_nodes += len(params)
+        print(f"#   graph_nodes: {copied_nodes} copied")
+
+    with engine.begin() as conn:
+        existing_e = _pg_count(conn, text, f"{t}.graph_edges")
+    copied_edges = 0
+    if existing_e == src_edges and src_edges > 0:
+        print(f"# [graph] graph_edges already has {existing_e} rows == source — skip.")
+    else:
+        edge_sql = text(
+            f"INSERT INTO {t}.graph_edges (from_type, from_id, relation, to_type, to_id, properties) "
+            "VALUES (:from_type, :from_id, :relation, :to_type, :to_id, (:properties)::jsonb) "
+            "ON CONFLICT (from_type, from_id, relation, to_type, to_id) DO UPDATE SET "
+            "properties = EXCLUDED.properties"
+        )
+        for rows in _fetch_batches(
+            src,
+            "SELECT from_type, from_id, relation, to_type, to_id, properties FROM graph_edges",
+            batch,
+            limit,
+        ):
+            params = [dict(r) for r in rows]
+            with engine.begin() as conn:
+                conn.execute(edge_sql, params)
+            copied_edges += len(params)
+        print(f"#   graph_edges: {copied_edges} copied")
+
+    src.close()
+    store.close()
+    return {"graph_nodes": src_nodes, "graph_edges": src_edges}
+
+
+def migrate_doc(
+    db_path: str, engine: Any, schema: str, batch: int, limit: int | None, dry_run: bool
+) -> dict[str, int]:
+    from sqlalchemy import text
+
+    from opencrab.stores.pg_doc_store import PgDocStore
+
+    if not os.path.exists(db_path):
+        print(f"# [doc] source not found, skipping: {db_path}")
+        return {}
+
+    src = _sqlite_conn(db_path)
+    counts = {
+        "doc_nodes": _count(src, "doc_nodes"),
+        "doc_sources": _count(src, "doc_sources"),
+        "audit_log": _count(src, "audit_log"),
+    }
+    print(f"# [doc] source rows: {counts}")
+
+    if dry_run:
+        print(f"# [doc] dry-run: would upsert into \"{schema}\".doc_nodes/doc_sources/audit_log")
+        src.close()
+        return counts
+
+    store = PgDocStore(engine, schema=schema)  # idempotent ensure-schema
+    if not store.available:
+        raise RuntimeError("PgDocStore is not available (connection failed).")
+    t = f'"{schema}"'
+
+    def _copy(table: str, cols: list[str], conflict_key: str, src_sql: str) -> int:
+        with engine.begin() as conn:
+            existing = _pg_count(conn, text, f"{t}.{table}")
+        if existing == counts[table] and counts[table] > 0:
+            print(f"# [doc] {table} already has {existing} rows == source — skip.")
+            return 0
+        casted = ", ".join(
+            f"(:{c})::jsonb" if c in ("properties", "metadata", "details")
+            else f"(:{c})::timestamptz" if c in ("updated_at", "ingested_at", "timestamp")
+            else f":{c}"
+            for c in cols
+        )
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in conflict_key.split(","))
+        sql = text(
+            f"INSERT INTO {t}.{table} ({', '.join(cols)}) VALUES ({casted}) "
+            f"ON CONFLICT ({conflict_key}) DO UPDATE SET {updates}"
+        )
+        copied = 0
+        for rows in _fetch_batches(src, src_sql, batch, limit):
+            params = [dict(r) for r in rows]
+            with engine.begin() as conn:
+                conn.execute(sql, params)
+            copied += len(params)
+        print(f"#   {table}: {copied} copied")
+        return copied
+
+    _copy(
+        "doc_nodes",
+        ["space", "node_id", "node_type", "properties", "updated_at"],
+        "space, node_id",
+        "SELECT space, node_id, node_type, properties, updated_at FROM doc_nodes",
+    )
+    _copy(
+        "doc_sources",
+        ["source_id", "text", "metadata", "ingested_at"],
+        "source_id",
+        "SELECT source_id, text, metadata, ingested_at FROM doc_sources",
+    )
+    _copy(
+        "audit_log",
+        ["event_id", "event_type", "subject_id", "details", "timestamp"],
+        "event_id",
+        "SELECT event_id, event_type, subject_id, details, timestamp FROM audit_log",
+    )
+
+    src.close()
+    store.close()
+    return counts
+
+
+def migrate_sql(
+    db_path: str, engine: Any, pg_url: str, batch: int, limit: int | None, dry_run: bool
+) -> dict[str, int]:
+    from sqlalchemy import text
+
+    from opencrab.stores.sql_store import SQLStore
+
+    if not os.path.exists(db_path):
+        print(f"# [sql] source not found, skipping: {db_path}")
+        return {}
+
+    src = _sqlite_conn(db_path)
+    tables = ["ontology_nodes", "ontology_edges", "impact_records", "lever_simulations", "rebac_policies"]
+    counts = {t: _count(src, t) for t in tables}
+    print(f"# [sql] source rows: {counts}")
+
+    if dry_run:
+        print("# [sql] dry-run: would insert into public.{ontology_nodes,ontology_edges,"
+              "impact_records,lever_simulations,rebac_policies} (SQLStore DDL)")
+        src.close()
+        return counts
+
+    # NOTE: use the caller-supplied DSN, not str(engine.url) — SQLAlchemy masks
+    # the password as "***" when an Engine URL is stringified, which would make
+    # SQLStore fail authentication.
+    store = SQLStore(url=pg_url)  # idempotent ensure-schema (own engine; PG DDL)
+    if not store.available:
+        raise RuntimeError("SQLStore is not available (connection failed).")
+
+    def _copy_natural_key(table: str, cols: list[str], conflict_key: str | None, src_sql: str) -> int:
+        with engine.begin() as conn:
+            existing = _pg_count(conn, text, table)
+        if existing == counts[table] and counts[table] > 0:
+            print(f"# [sql] {table} already has {existing} rows == source — skip.")
+            return 0
+        if existing > 0 and existing != counts[table] and conflict_key is None:
+            print(
+                f"! [sql] {table} has {existing} rows (partial, no natural key to upsert on); "
+                f"source has {counts[table]}. Leaving untouched — inspect manually."
+            )
+            return 0
+        placeholders = ", ".join(f":{c}" for c in cols)
+        sql_str = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
+        if conflict_key:
+            updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in conflict_key.split(","))
+            sql_str += f" ON CONFLICT ({conflict_key}) DO UPDATE SET {updates}"
+        sql = text(sql_str)
+        copied = 0
+        for rows in _fetch_batches(src, src_sql, batch, limit):
+            params = [dict(r) for r in rows]
+            # SQLite has no boolean type — SQLStore's SQLite DDL stores
+            # `granted` as INTEGER 0/1, but the PG DDL declares BOOLEAN and
+            # PostgreSQL does not implicitly cast an integer bind parameter to
+            # boolean. Convert app-side (bool()) rather than casting in SQL so
+            # the INSERT stays a plain bare-placeholder statement.
+            if "granted" in cols:
+                for p in params:
+                    p["granted"] = bool(p["granted"])
+            with engine.begin() as conn:
+                conn.execute(sql, params)
+            copied += len(params)
+        print(f"#   {table}: {copied} copied")
+        return copied
+
+    _copy_natural_key(
+        "ontology_nodes",
+        ["space", "node_type", "node_id", "created_at", "updated_at"],
+        "space, node_id",
+        "SELECT space, node_type, node_id, created_at, updated_at FROM ontology_nodes",
+    )
+    _copy_natural_key(
+        "ontology_edges",
+        ["from_space", "from_id", "relation", "to_space", "to_id", "created_at"],
+        "from_space, from_id, relation, to_space, to_id",
+        "SELECT from_space, from_id, relation, to_space, to_id, created_at FROM ontology_edges",
+    )
+    _copy_natural_key(
+        "impact_records",
+        ["node_id", "change_type", "impact_json", "analyzed_at"],
+        None,
+        "SELECT node_id, change_type, impact_json, analyzed_at FROM impact_records",
+    )
+    _copy_natural_key(
+        "lever_simulations",
+        ["lever_id", "direction", "magnitude", "results", "simulated_at"],
+        None,
+        "SELECT lever_id, direction, magnitude, results, simulated_at FROM lever_simulations",
+    )
+    _copy_natural_key(
+        "rebac_policies",
+        ["subject_id", "permission", "resource_id", "granted", "created_at"],
+        "subject_id, permission, resource_id",
+        "SELECT subject_id, permission, resource_id, granted, created_at FROM rebac_policies",
+    )
+
+    src.close()
+    # SQLStore has no close(); dispose its private engine directly (the store
+    # was created here solely to run its idempotent PG ensure-schema).
+    if getattr(store, "_engine", None) is not None:
+        store._engine.dispose()
+    return counts
+
+
+def migrate_vector(
+    db_path: str,
+    engine: Any,
+    src_table: str,
+    dst_table: str,
+    dim: int,
+    ef_search: int,
+    batch: int,
+    limit: int | None,
+    dry_run: bool,
+) -> dict[str, int]:
+    from sqlalchemy import text
+
+    if not os.path.exists(db_path):
+        print(f"# [vector] source not found, skipping: {db_path}")
+        return {}
+
+    _check_ident(src_table, "vector-src-table")
+    _check_ident(dst_table, "vector-dst-table")
+    src = _vec_sqlite_conn(db_path)
+    src_count = _count(src, src_table)
+    print(f"# [vector] source '{src_table}' rows: {src_count} (dim={dim})")
+
+    if dry_run:
+        print(f"# [vector] dry-run: would upsert into public.{dst_table} (raw float copy, no re-embed)")
+        src.close()
+        return {dst_table: src_count}
+
+    # ---- base table only (no HNSW yet) — see module docstring rationale ----
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.execute(
+            text(
+                f"CREATE TABLE IF NOT EXISTS {dst_table} ("
+                "node_id TEXT PRIMARY KEY, pack_id TEXT, "
+                f"embedding vector({dim}) NOT NULL, document TEXT, metadata JSONB)"
+            )
+        )
+        conn.execute(
+            text(f"CREATE INDEX IF NOT EXISTS {dst_table}_pack_id_idx ON {dst_table} (pack_id)")
+        )
+        existing = _pg_count(conn, text, dst_table)
+
+    copied = 0
+    if existing == src_count and src_count > 0:
+        print(f"# [vector] {dst_table} already has {existing} rows == source — skip bulk load.")
+    else:
+        insert_sql = (
+            f"INSERT INTO {dst_table} (node_id, pack_id, embedding, document, metadata) "
+            "VALUES %s ON CONFLICT (node_id) DO UPDATE SET "
+            "pack_id = EXCLUDED.pack_id, embedding = EXCLUDED.embedding, "
+            "document = EXCLUDED.document, metadata = EXCLUDED.metadata"
+        )
+        raw = engine.raw_connection()
+        try:
+            from psycopg2.extras import execute_values
+
+            t0 = time.perf_counter()
+            cur = raw.cursor()
+            for rows in _fetch_batches(
+                src,
+                f"SELECT node_id, pack_id, vec_to_json(embedding) AS embedding, document, metadata"
+                f" FROM {src_table}",
+                batch,
+                limit,
+            ):
+                values = [
+                    (r["node_id"], r["pack_id"], r["embedding"], r["document"], r["metadata"] or "{}")
+                    for r in rows
+                ]
+                execute_values(
+                    cur,
+                    insert_sql,
+                    values,
+                    template="(%s, %s, %s::vector, %s, %s::jsonb)",
+                )
+                raw.commit()
+                copied += len(values)
+                if copied % 5000 < batch:
+                    rate = copied / max(time.perf_counter() - t0, 1e-6)
+                    print(f"#   {dst_table}: {copied}/{src_count} ({rate:.0f} rows/s)")
+            cur.close()
+        finally:
+            raw.close()
+        print(f"#   {dst_table}: {copied} copied total")
+
+    # ---- NOW build the HNSW index (post-load) via PgVectorStore ensure-schema ----
+    def _unused_ef(_texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding_function should not be invoked during migration.")
+
+    from opencrab.stores.pg_vector_store import PgVectorStore
+
+    store = PgVectorStore(
+        engine,
+        embedding_function=_unused_ef,
+        dim=dim,
+        collection_name=dst_table,
+        ef_search=ef_search,
+    )
+    if not store.available:
+        raise RuntimeError("PgVectorStore is not available (connection failed) after bulk load.")
+    store.close()
+
+    src.close()
+    return {dst_table: src_count}
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--data-dir", default=None, help="dir with graph.db/doc_store.db/opencrab.db/vectors.db")
+    ap.add_argument("--graph-db", default=None, help="override graph.db path")
+    ap.add_argument("--doc-db", default=None, help="override doc_store.db path")
+    ap.add_argument("--sql-db", default=None, help="override opencrab.db path")
+    ap.add_argument("--vector-db", default=None, help="override vectors.db path")
+    ap.add_argument("--pg-url", default=None, help="target PostgreSQL DSN (default: settings.postgres_url)")
+    ap.add_argument("--pg-schema", default="public", help="graph/doc target schema (default: public)")
+    ap.add_argument(
+        "--vector-src-table", default=None, help="source vec0 table (default: settings.vector_collection)"
+    )
+    ap.add_argument(
+        "--vector-dst-table", default=None, help="target pgvector table (default: settings.embed_collection)"
+    )
+    ap.add_argument("--only", default="graph,doc,sql,vector", help="comma list of stores to migrate")
+    ap.add_argument("--batch", type=int, default=1000)
+    ap.add_argument("--limit", type=int, default=None, help="cap rows copied per table (smoke-test aid)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--verify", action="store_true", help="assert PG row counts == source after run")
+    args = ap.parse_args()
+
+    from opencrab.config import get_settings
+
+    settings = get_settings()
+    data_dir = args.data_dir or settings.local_data_dir
+    graph_db = args.graph_db or os.path.join(data_dir, "graph.db")
+    doc_db = args.doc_db or os.path.join(data_dir, "doc_store.db")
+    sql_db = args.sql_db or os.path.join(data_dir, "opencrab.db")
+    vector_db = args.vector_db or os.path.join(data_dir, settings.vector_db_file)
+    pg_url = args.pg_url or settings.postgres_url
+    vector_src_table = args.vector_src_table or settings.vector_collection
+    vector_dst_table = args.vector_dst_table or settings.embed_collection
+    only = {s.strip() for s in args.only.split(",") if s.strip()}
+    _check_ident(args.pg_schema, "pg-schema")
+
+    print(f"# data-dir : {data_dir}")
+    print(f"# pg-url   : {pg_url}")
+    print(f"# only     : {sorted(only)}")
+    print(f"# dry-run  : {args.dry_run}")
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(pg_url, pool_pre_ping=True) if not args.dry_run else None
+
+    source_counts: dict[str, dict[str, int]] = {}
+    try:
+        if "graph" in only:
+            source_counts["graph"] = migrate_graph(
+                graph_db, engine, args.pg_schema, args.batch, args.limit, args.dry_run
+            )
+        if "doc" in only:
+            source_counts["doc"] = migrate_doc(
+                doc_db, engine, args.pg_schema, args.batch, args.limit, args.dry_run
+            )
+        if "sql" in only:
+            source_counts["sql"] = migrate_sql(
+                sql_db, engine, pg_url, args.batch, args.limit, args.dry_run
+            )
+        if "vector" in only:
+            source_counts["vector"] = migrate_vector(
+                vector_db,
+                engine,
+                vector_src_table,
+                vector_dst_table,
+                settings.embed_dim,
+                settings.pg_ef_search,
+                args.batch,
+                args.limit,
+                args.dry_run,
+            )
+    except Exception as exc:
+        print(f"! migration failed: {exc}")
+        return 1
+
+    if args.dry_run:
+        print("RESULT: PASS (dry-run, no writes)")
+        return 0
+
+    if args.verify:
+        from sqlalchemy import text
+
+        print("# --verify: comparing source vs PG row counts")
+        mismatches = []
+        with engine.begin() as conn:
+            for group, tables in source_counts.items():
+                for table, src_n in tables.items():
+                    if group in ("graph",):
+                        full_table = f'"{args.pg_schema}".{table}'
+                    elif group == "doc":
+                        full_table = f'"{args.pg_schema}".{table}'
+                    else:
+                        full_table = table
+                    pg_n = _pg_count(conn, text, full_table)
+                    status = "OK" if pg_n == src_n else "MISMATCH"
+                    print(f"#   {group}.{table}: source={src_n} pg={pg_n} [{status}]")
+                    if pg_n != src_n:
+                        mismatches.append((group, table, src_n, pg_n))
+        if mismatches:
+            print(f"RESULT: FAIL ({len(mismatches)} mismatches)")
+            return 5
+        print("RESULT: PASS (all row counts match)")
+        return 0
+
+    print("RESULT: PASS (migration complete; pass --verify to assert row-count parity)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

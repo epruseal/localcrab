@@ -12,7 +12,7 @@ import pytest
 
 from _vec_helpers import MockEF, build_vector_store
 
-BACKENDS = ["chroma", "sqlite-vec"]
+BACKENDS = ["chroma", "sqlite-vec", "pg"]
 
 # node_id, text, metadata (pack_id + space present so where-filters are testable)
 CORPUS = [
@@ -37,6 +37,16 @@ def store(request, tmp_path):
     s = build_vector_store(request.param, tmp_path)
     assert s.available
     yield s
+    if request.param == "pg":
+        # 공유 PG 테스트 DB에 테이블이 누적되지 않도록 teardown에서 drop
+        # (다른 백엔드는 tmp_path 격리라 파일 삭제만으로 충분).
+        try:
+            from sqlalchemy import text
+
+            with s._engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {s._table}"))
+        except Exception:
+            pass
     if hasattr(s, "close"):
         s.close()
 
