@@ -84,14 +84,19 @@ def json_doc_store(tmp_path):
 @pytest.fixture
 def chroma_store(tmp_path):
     pytest.importorskip("chromadb")
+    from _vec_helpers import MockEF
+
     from opencrab.stores.chroma_store import ChromaStore
 
+    # EF 미주입 시 Chroma 기본 ONNX EF가 cold cache에서 79MB 모델을 다운로드해
+    # CI에서 스레드 경합/네트워크 실패를 유발하므로 MockEF를 명시 주입한다.
     s = ChromaStore(
         host="localhost",
         port=8000,
         collection_name="test_concurrency",
         local_mode=True,
         local_path=str(tmp_path / "chroma"),
+        embedding_function=MockEF(16),
     )
     if not s.available:
         pytest.skip("ChromaDB가 이 환경에서 초기화되지 않음(임베딩 모델 미가용 등)")
