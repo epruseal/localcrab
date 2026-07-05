@@ -65,9 +65,14 @@ class Neo4jStore:
             except Exception:
                 pass
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError("Neo4j is not available.")
+
     @contextmanager
     def _session(self) -> Generator[Any, None, None]:
-        if not self._available or self._driver is None:
+        self._require_available()
+        if self._driver is None:
             raise RuntimeError("Neo4j is not available.")
         session_kwargs = {"database": self._database} if self._database else {}
         with self._driver.session(**session_kwargs) as session:
@@ -122,8 +127,7 @@ class Neo4jStore:
         space_id:
             Optional space tag stored as a property.
         """
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         props = {**properties, "id": node_id}
         if space_id:
@@ -142,8 +146,7 @@ class Neo4jStore:
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
         """Retrieve a node by type and id."""
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         cypher = f"MATCH (n:{node_type} {{id: $id}}) RETURN properties(n) AS props"
         with self._session() as session:
@@ -173,8 +176,7 @@ class Neo4jStore:
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """Delete a node and all its relationships."""
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         cypher = f"MATCH (n:{node_type} {{id: $id}}) DETACH DELETE n RETURN count(n) AS cnt"
         with self._session() as session:
@@ -200,8 +202,7 @@ class Neo4jStore:
 
         Returns True on success.
         """
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         props = properties or {}
         prop_str = ", ".join(f"r.{k} = ${k}" for k in props) if props else "r.created = timestamp()"
@@ -225,8 +226,7 @@ class Neo4jStore:
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Execute arbitrary Cypher and return a list of record dicts."""
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         with self._session() as session:
             result = session.run(cypher, **(params or {}))
@@ -259,8 +259,7 @@ class Neo4jStore:
             When ``pack_ids`` is set, also allow nodes/edges with no
             ``pack_id`` property (legacy data).
         """
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         cypher, params = self._build_neighbors_cypher(
             node_id=node_id,
@@ -343,8 +342,7 @@ class Neo4jStore:
         self, from_id: str, to_id: str, max_depth: int = 4
     ) -> list[dict[str, Any]]:
         """Find shortest path between two nodes by id."""
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         cypher = f"""
             MATCH path = shortestPath(
@@ -365,8 +363,7 @@ class Neo4jStore:
 
     def count_nodes(self, node_type: str | None = None) -> int:
         """Count nodes, optionally filtered by type."""
-        if not self._available:
-            raise RuntimeError("Neo4j is not available.")
+        self._require_available()
 
         if node_type:
             cypher = f"MATCH (n:{node_type}) RETURN count(n) AS cnt"

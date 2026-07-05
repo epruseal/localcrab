@@ -18,61 +18,14 @@ import json
 import logging
 import os
 import sqlite3
-import threading
 from collections import deque
 from typing import Any
 
+from opencrab.stores._graph_common import _edge_passes, _node_passes
 from opencrab.stores._json import parse_props
+from opencrab.stores._sqlite_base import _SqliteConnMixin
 
 logger = logging.getLogger(__name__)
-
-
-def _node_pack_id(props: dict[str, Any]) -> str | None:
-    """Top-level lookup mirroring the unified provenance helper.
-
-    Imported lazily to avoid an import cycle (pack_provenance imports nothing
-    from opencrab.stores, but keep this file dependency-light).
-    """
-    pid = props.get("pack_id") if isinstance(props, dict) else None
-    if pid:
-        return str(pid)
-    return None
-
-
-def _node_passes(
-    props: dict[str, Any],
-    pack_set: set[str] | None,
-    include_unpackaged: bool,
-) -> bool:
-    if not pack_set:
-        return True
-    pid = _node_pack_id(props)
-    if pid is None:
-        return include_unpackaged
-    return pid in pack_set
-
-
-def _edge_passes(
-    edge_props: dict[str, Any],
-    src_passes: bool,
-    dst_passes: bool,
-    pack_set: set[str] | None,
-) -> bool:
-    """Apply the agreed edge filter rules.
-
-    Rules (see plan §4):
-      1. edge.pack_id in pack_set        -> pass (endpoints still must pass)
-      2. edge.pack_id not in pack_set    -> always exclude
-      3. edge has no pack_id             -> only pass when both endpoints pass
-    """
-    if not pack_set:
-        return True
-    edge_pid = _node_pack_id(edge_props) if isinstance(edge_props, dict) else None
-    if edge_pid is not None:
-        if edge_pid not in pack_set:
-            return False
-        return src_passes and dst_passes
-    return src_passes and dst_passes
 
 _DDL = [
     """
@@ -106,48 +59,14 @@ _DDL = [
 ]
 
 
-class LocalGraphStore:
+class LocalGraphStore(_SqliteConnMixin):
     """SQLite-backed graph store with the same interface as Neo4jStore."""
 
     def __init__(self, db_path: str) -> None:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
-        self._db_path = db_path
         self._available = False
-        # 쓰기 직렬화 락: 스레드별 커넥션이 같은 WAL 파일에 동시에 쓰면 SQLITE_BUSY가
-        # 나므로, 프로세스 내에서는 한 번에 한 writer만 쓰도록 직렬화한다.
-        self._lock = threading.Lock()
-        # 스레드-로컬 커넥션: 단일 sqlite3 커넥션을 여러 스레드가 공유하면 읽기조차
-        # "API misuse"로 깨진다. 스레드마다 자기 커넥션을 쓰면 WAL이 reader/writer를
-        # 격리해 읽기는 락 없이 동시 진행된다.
-        self._local = threading.local()
-        self._conns_lock = threading.Lock()
-        self._all_conns: list[sqlite3.Connection] = []
+        self._init_conn_state(db_path)
         self._init_db()
-
-    def _new_conn(self) -> sqlite3.Connection:
-        """이 스레드 전용 커넥션을 생성한다.
-
-        WAL: reader-writer를 격리해 쓰기 중에도 읽기를 허용. synchronous=NORMAL은
-        WAL 체크포인트 시에만 fsync해 처리량을 높인다(단일 머신/NVMe에서 수용 가능).
-        WAL은 DB 파일에 영속 설정되며 <db>-wal/<db>-shm가 생기므로 백업 시 함께 복사.
-        """
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        with self._conns_lock:
-            self._all_conns.append(conn)
-        return conn
-
-    @property
-    def _conn(self) -> sqlite3.Connection | None:
-        """현재 스레드의 커넥션(없으면 생성). 기존 메서드들이 self._conn.X 형태로
-        그대로 쓰도록 property로 노출한다."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._new_conn()
-            self._local.conn = conn
-        return conn
 
     def _init_db(self) -> None:
         try:
@@ -164,15 +83,6 @@ class LocalGraphStore:
     @property
     def available(self) -> bool:
         return self._available
-
-    def close(self) -> None:
-        with self._conns_lock:
-            for conn in self._all_conns:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._all_conns.clear()
 
     def ping(self) -> bool:
         try:
@@ -200,8 +110,7 @@ class LocalGraphStore:
         properties: dict[str, Any],
         space_id: str | None = None,
     ) -> dict[str, Any]:
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         props = {**properties, "id": node_id}
         with self._lock:
             cur = self._conn.cursor()
@@ -219,8 +128,7 @@ class LocalGraphStore:
         return props
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         cur.execute(
             "SELECT properties FROM graph_nodes WHERE node_type=? AND node_id=?",
@@ -247,8 +155,7 @@ class LocalGraphStore:
         return row["node_type"] if row else None
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
@@ -275,8 +182,7 @@ class LocalGraphStore:
         to_id: str,
         properties: dict[str, Any] | None = None,
     ) -> bool:
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
@@ -325,8 +231,7 @@ class LocalGraphStore:
             guaranteed to pass (they were enqueued only after passing), so
             edge passes reduce to "edge own pack_id ok AND dst passes".
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
 
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
         cur = self._conn.cursor()
@@ -470,8 +375,7 @@ class LocalGraphStore:
         self, from_id: str, to_id: str, max_depth: int = 4
     ) -> list[dict[str, Any]]:
         """BFS shortest path between two nodes."""
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
 
         cur = self._conn.cursor()
         visited: set[str] = {from_id}
@@ -503,8 +407,7 @@ class LocalGraphStore:
         return []
 
     def count_nodes(self, node_type: str | None = None) -> int:
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         if node_type:
             cur.execute("SELECT COUNT(*) FROM graph_nodes WHERE node_type=?", (node_type,))
@@ -543,8 +446,7 @@ class LocalGraphStore:
 
         SQLite >= 3.9.0 필요 (json_extract 지원).
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         cur.execute(
             """
@@ -594,8 +496,7 @@ class LocalGraphStore:
         IN (?, ...) placeholders는 relations 길이에 따라 동적으로 생성한다.
         SQL 인젝션 위험 없음 — 모두 바인딩 변수(?) 사용.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         if not relations:
             return []
 
@@ -650,8 +551,7 @@ class LocalGraphStore:
         반환값: properties dict에 'node_type' 키가 추가된 형태
             {"node_type": "Lever", "space": "...", "id": "...", ...}
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         cur.execute(
             "SELECT node_type, properties FROM graph_nodes WHERE node_id=? LIMIT 1",
@@ -688,8 +588,7 @@ class LocalGraphStore:
         반환 형식: [{"props": dict, "labels": ["NodeType"]}, ...]
             (_normalise_node()이 소비하는 형식과 동일)
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         if pack_id:
             cur.execute(
@@ -733,8 +632,7 @@ class LocalGraphStore:
         반환 형식: [{"source_props": dict, "source_labels": [...], ...}, ...]
             (_normalise_edge()이 소비하는 형식과 동일)
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         cur = self._conn.cursor()
         if pack_id:
             cur.execute(
@@ -794,8 +692,7 @@ class LocalGraphStore:
                        "space_id": str | None}
         반환: 처리된 노드 수.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         params = [
             (
                 n["node_type"],
@@ -827,8 +724,7 @@ class LocalGraphStore:
                        "to_type": str, "to_id": str, "properties": dict | None}
         반환: 처리된 엣지 수.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalGraphStore is not available.")
+        self._require_available()
         params = [
             (
                 e["from_type"],

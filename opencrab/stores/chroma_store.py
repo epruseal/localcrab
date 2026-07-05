@@ -8,11 +8,11 @@ LocalCrab factory always selects persistent local mode.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
-import time
 from typing import Any
+
+from opencrab.stores._vector_base import generate_add_ids, generate_upsert_ids
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,10 @@ class ChromaStore:
         with self._lock:
             return self._collection
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError("ChromaDB is not available.")
+
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
@@ -129,14 +133,10 @@ class ChromaStore:
         list[str]
             The IDs of the inserted documents.
         """
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
 
         if ids is None:
-            ids = [
-                hashlib.sha256(f"{t}{time.time_ns()}".encode()).hexdigest()[:16]
-                for t in texts
-            ]
+            ids = generate_add_ids(texts)
 
         if metadatas is None:
             metadatas = [{} for _ in texts]
@@ -155,13 +155,10 @@ class ChromaStore:
         ids: list[str] | None = None,
     ) -> list[str]:
         """Upsert (add or update) text chunks."""
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
 
         if ids is None:
-            ids = [
-                hashlib.sha256(t.encode()).hexdigest()[:16] for t in texts
-            ]
+            ids = generate_upsert_ids(texts)
         if metadatas is None:
             metadatas = [{} for _ in texts]
 
@@ -195,8 +192,7 @@ class ChromaStore:
         -------
         list of dicts with keys: id, document, metadata, distance.
         """
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
 
         kwargs: dict[str, Any] = {
             "query_texts": [query_text],
@@ -222,8 +218,7 @@ class ChromaStore:
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
         """Retrieve a document by its ID."""
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
 
         result = self._collection_handle().get(ids=[doc_id])
         if result["ids"]:
@@ -236,8 +231,7 @@ class ChromaStore:
 
     def delete(self, ids: list[str]) -> None:
         """Delete documents by their IDs."""
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
         self._collection_handle().delete(ids=ids)
 
     def count(self) -> int:
@@ -248,8 +242,7 @@ class ChromaStore:
 
     def reset_collection(self) -> None:
         """Delete and recreate the collection (destructive)."""
-        if not self._available:
-            raise RuntimeError("ChromaDB is not available.")
+        self._require_available()
         # delete→재생성으로 self._collection 핸들을 교체하므로 락으로 직렬화한다.
         # 락이 없으면 동시 reset 시 두 스레드가 같은 컬렉션을 delete 하여 '이미 삭제됨'
         # 에러가 나거나, 읽기가 삭제된 컬렉션을 가리키는 손상 핸들을 볼 수 있다.

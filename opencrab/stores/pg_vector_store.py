@@ -60,17 +60,21 @@ WHERE 번역 (Chroma dict → SQL, sqlite-vec과의 차이):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import re
-import time
 from collections.abc import Callable
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
+from opencrab.stores._vector_base import (
+    default_metadatas,
+    embed_and_validate,
+    generate_add_ids,
+    generate_upsert_ids,
+    validate_lengths,
+)
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+logger = logging.getLogger(__name__)
 
 
 def _to_pgvector_literal(vec: list[float]) -> str:
@@ -240,18 +244,16 @@ class PgVectorStore:
             except Exception:
                 pass
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError(f"{type(self).__name__} is not available.")
+
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        vectors = self._ef(list(texts))
-        for vec in vectors:
-            if len(vec) != self._dim:
-                raise RuntimeError(
-                    f"Embedding dim {len(vec)} != table dim {self._dim}."
-                )
-        return vectors
+        return embed_and_validate(self._ef, self._dim, texts)
 
     def add_texts(
         self,
@@ -262,19 +264,13 @@ class PgVectorStore:
         """텍스트 청크 추가(콘텐츠+시각 해시 ID, 생략 시). 중복 id는 PK 위반으로
         raise — ChromaStore(경고 후 skip)와의 의도적 차이, SqliteVecStore와 동일
         분기(add=엄격, upsert=갱신)."""
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         if not texts:
             return []
         if ids is None:
-            ids = [
-                hashlib.sha256(f"{t}{time.time_ns()}".encode()).hexdigest()[:16]
-                for t in texts
-            ]
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        if len(ids) != len(texts) or len(metadatas) != len(texts):
-            raise ValueError("texts, metadatas, and ids must have the same length.")
+            ids = generate_add_ids(texts)
+        metadatas = default_metadatas(texts, metadatas)
+        validate_lengths(texts, metadatas, ids)
         vectors = self._embed(texts)
 
         from sqlalchemy import text
@@ -306,16 +302,13 @@ class PgVectorStore:
         """업서트(콘텐츠 결정적 ID, 생략 시) — ``INSERT ... ON CONFLICT (node_id)
         DO UPDATE``로 원자적 갱신(vec0의 DELETE-then-INSERT와 달리 PG는 네이티브
         UPSERT를 지원)."""
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         if not texts:
             return []
         if ids is None:
-            ids = [hashlib.sha256(t.encode()).hexdigest()[:16] for t in texts]
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        if len(ids) != len(texts) or len(metadatas) != len(texts):
-            raise ValueError("texts, metadatas, and ids must have the same length.")
+            ids = generate_upsert_ids(texts)
+        metadatas = default_metadatas(texts, metadatas)
+        validate_lengths(texts, metadatas, ids)
         vectors = self._embed(texts)
 
         from sqlalchemy import text
@@ -342,8 +335,7 @@ class PgVectorStore:
         return ids
 
     def delete(self, ids: list[str]) -> None:
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         if not ids:
             return
         from sqlalchemy import text
@@ -365,8 +357,7 @@ class PgVectorStore:
         table" 갭을 절대 관측하지 않는다(SqliteVecStore reset_collection과 동일
         원칙). Postgres MVCC 하에서 트랜잭션 단위 원자성이 보장되므로 앱 레벨
         락 없이도 부분 상태가 노출되지 않는다."""
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         from sqlalchemy import text
 
         with self._engine.begin() as conn:
@@ -388,8 +379,7 @@ class PgVectorStore:
         SqliteVecStore와 동일 계약. where 필터는 SQL WHERE 절로 완전히
         푸시다운되므로(모듈 docstring 참고) sqlite-vec류 "필터 후 n개 미만" 엣지
         케이스가 구조적으로 없다."""
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         if n_results <= 0:
             return []
         qvec = self._embed([query_text])[0]
@@ -431,8 +421,7 @@ class PgVectorStore:
         return hits
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
-        if not self._available:
-            raise RuntimeError("PgVectorStore is not available.")
+        self._require_available()
         from sqlalchemy import text
 
         with self._engine.connect() as conn:
@@ -453,14 +442,11 @@ class PgVectorStore:
     def count(self) -> int:
         if not self._available:
             return 0
-        try:
-            from sqlalchemy import text
+        from sqlalchemy import text
 
-            with self._engine.connect() as conn:
-                row = conn.execute(text(f"SELECT count(*) FROM {self._table}")).fetchone()
-            return int(row[0]) if row is not None else 0
-        except Exception:
-            return 0
+        with self._engine.connect() as conn:
+            row = conn.execute(text(f"SELECT count(*) FROM {self._table}")).fetchone()
+        return int(row[0]) if row is not None else 0
 
 
 # ---------------------------------------------------------------------------

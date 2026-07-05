@@ -33,10 +33,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import threading
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+
+from opencrab.stores._sqlite_base import _SqliteConnMixin
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ _DDL = [
 ]
 
 
-class LocalSQLDocStore:
+class LocalSQLDocStore(_SqliteConnMixin):
     """SQLite-backed document store with the same interface as MongoStore /
     LocalDocStore.
 
@@ -106,34 +107,10 @@ class LocalSQLDocStore:
              per-thread connection writes the WAL file at a time (avoids
              SQLITE_BUSY); reads take no lock and run concurrently under WAL.
         """
-        self._db_path = db_path
         self._available = False
         self._fts_ok = False  # SQLite FTS5 키워드 색인 가용 여부(capability)
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self._conns_lock = threading.Lock()
-        self._all_conns: list[sqlite3.Connection] = []
+        self._init_conn_state(db_path)
         self._init_db()
-
-    def _new_conn(self) -> sqlite3.Connection:
-        """이 스레드 전용 커넥션 생성. WAL + synchronous=NORMAL 근거는
-        local_graph_store.py 와 동일(reader/writer 격리, 체크포인트시에만 fsync)."""
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        with self._conns_lock:
-            self._all_conns.append(conn)
-        return conn
-
-    @property
-    def _conn(self) -> sqlite3.Connection | None:
-        """현재 스레드의 커넥션(없으면 생성). 기존 메서드의 self._conn.X 호출 호환."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._new_conn()
-            self._local.conn = conn
-        return conn
 
     def _init_db(self) -> None:
         """
@@ -205,16 +182,6 @@ class LocalSQLDocStore:
         except Exception:
             return False
 
-    def close(self) -> None:
-        """Replaces: MongoStore.close() (LocalDocStore had no close())"""
-        with self._conns_lock:
-            for conn in self._all_conns:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._all_conns.clear()
-
     # ------------------------------------------------------------------
     # Node document operations
     # ------------------------------------------------------------------
@@ -233,8 +200,7 @@ class LocalSQLDocStore:
         SCHEMA: returns the composite key "space::node_id" for compatibility
             with LocalDocStore callers that use the return value.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         updated_at = datetime.now(UTC).isoformat()
         with self._lock:
             self._conn.execute(
@@ -252,8 +218,7 @@ class LocalSQLDocStore:
         Replaces: LocalDocStore.get_node_doc / MongoStore.get_node_doc
         WHY SQLite: O(log N) PK lookup vs O(N) full JSON parse + dict.get().
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         row = self._conn.execute(
             "SELECT space, node_id, node_type, properties, updated_at"
             " FROM doc_nodes WHERE space=? AND node_id=?",
@@ -274,8 +239,7 @@ class LocalSQLDocStore:
             so only the required rows are read from disk.
         SCHEMA: space=None skips the WHERE clause entirely (no filter cost).
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         if space:
             rows = self._conn.execute(
                 "SELECT space, node_id, node_type, properties, updated_at"
@@ -303,8 +267,7 @@ class LocalSQLDocStore:
         column, so ``compute_fingerprint`` (which also checks ``ingested_at``)
         yields the same value here.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         row = self._conn.execute(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), '')"
             " FROM (SELECT updated_at FROM doc_nodes LIMIT ?)",
@@ -318,8 +281,7 @@ class LocalSQLDocStore:
         WHY SQLite: JSON backend loads the whole file, removes the key, then
             re-serializes — O(N). SQLite DELETE by PK is O(log N).
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM doc_nodes WHERE space=? AND node_id=?",
@@ -342,8 +304,7 @@ class LocalSQLDocStore:
             truncation should do so before calling (MongoStore doesn't truncate
             either — only LocalDocStore did for legacy reasons).
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         ingested_at = datetime.now(UTC).isoformat()
         with self._lock:
             self._conn.execute(
@@ -428,8 +389,7 @@ class LocalSQLDocStore:
         Replaces: LocalDocStore.get_source / MongoStore.get_source
         WHY SQLite: O(log N) PK lookup.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         row = self._conn.execute(
             "SELECT source_id, text, metadata, ingested_at"
             " FROM doc_sources WHERE source_id=?",
@@ -449,8 +409,7 @@ class LocalSQLDocStore:
         Replaces: LocalDocStore.list_sources / MongoStore.list_sources
         WHY SQLite: LIMIT in query avoids loading rows we discard.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         rows = self._conn.execute(
             "SELECT source_id, text, metadata, ingested_at FROM doc_sources LIMIT ?",
             (limit,),
@@ -484,8 +443,7 @@ class LocalSQLDocStore:
             MongoStore's ObjectId semantics.  Returns event_id so callers can
             correlate entries.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         event_id = str(uuid.uuid4())
         timestamp = datetime.now(UTC).isoformat()
         with self._lock:
@@ -509,8 +467,7 @@ class LocalSQLDocStore:
             sorting the whole table.
         SCHEMA: ORDER BY timestamp DESC mirrors MongoStore's sort([("timestamp", -1)]).
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         if event_type:
             rows = self._conn.execute(
                 "SELECT event_id, event_type, subject_id, details, timestamp"
@@ -546,8 +503,7 @@ class LocalSQLDocStore:
             O(1) for SQLite (no full scan). JSON backend calls len() on a
             freshly-loaded dict — O(N) just to count.
         """
-        if not self._available or not self._conn:
-            raise RuntimeError("LocalSQLDocStore is not available.")
+        self._require_available()
         counts = {}
         for table, key in [
             ("doc_nodes", "nodes"),

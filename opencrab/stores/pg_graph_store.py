@@ -62,63 +62,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections import deque
 from typing import Any
 
+from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
+from opencrab.stores._graph_common import _as_dict, _edge_passes, _node_passes
+
 logger = logging.getLogger(__name__)
-
-_SCHEMA_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _node_pack_id(props: dict[str, Any]) -> str | None:
-    pid = props.get("pack_id") if isinstance(props, dict) else None
-    if pid:
-        return str(pid)
-    return None
-
-
-def _node_passes(
-    props: dict[str, Any],
-    pack_set: set[str] | None,
-    include_unpackaged: bool,
-) -> bool:
-    if not pack_set:
-        return True
-    pid = _node_pack_id(props)
-    if pid is None:
-        return include_unpackaged
-    return pid in pack_set
-
-
-def _edge_passes(
-    edge_props: dict[str, Any],
-    src_passes: bool,
-    dst_passes: bool,
-    pack_set: set[str] | None,
-) -> bool:
-    if not pack_set:
-        return True
-    edge_pid = _node_pack_id(edge_props) if isinstance(edge_props, dict) else None
-    if edge_pid is not None:
-        if edge_pid not in pack_set:
-            return False
-        return src_passes and dst_passes
-    return src_passes and dst_passes
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    """psycopg2 auto-decodes JSONB into dict/list; tolerate str/None too."""
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except (TypeError, ValueError):
-            return {}
-    return {}
-
 
 _DDL_TEMPLATE = [
     """

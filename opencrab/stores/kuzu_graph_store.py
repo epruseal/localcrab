@@ -22,6 +22,7 @@ import os
 from collections import deque
 from typing import Any
 
+from opencrab.stores._graph_common import _edge_passes, _node_passes
 from opencrab.stores._json import parse_props as _parse
 
 logger = logging.getLogger(__name__)
@@ -51,13 +52,13 @@ class KuzuGraphStore:
         db_path: str,
         buffer_pool_size: int = 256 * 1024 * 1024,
     ) -> None:
-        import ladybug  # ladybug>=0.18 (rebranded KùzuDB, Database/Connection API unchanged)
-
-        parent = os.path.dirname(os.path.abspath(db_path))
-        os.makedirs(parent, exist_ok=True)
         self._db_path = db_path
         self._available = False
         try:
+            import ladybug  # ladybug>=0.18 (rebranded KùzuDB, Database/Connection API unchanged)
+
+            parent = os.path.dirname(os.path.abspath(db_path))
+            os.makedirs(parent, exist_ok=True)
             self._db = ladybug.Database(db_path, buffer_pool_size=buffer_pool_size)
             self._conn = ladybug.Connection(self._db)
             self._ensure_schema()
@@ -103,6 +104,10 @@ class KuzuGraphStore:
     def ensure_constraints(self) -> None:
         pass  # PRIMARY KEY constraint in schema covers uniqueness
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError("KuzuGraphStore is not available.")
+
     # ------------------------------------------------------------------
     # Node operations
     # ------------------------------------------------------------------
@@ -114,8 +119,7 @@ class KuzuGraphStore:
         properties: dict[str, Any],
         space_id: str | None = None,
     ) -> dict[str, Any]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         props = {**properties, "id": node_id}
         props_json = json.dumps(props)
         self._conn.execute(
@@ -126,8 +130,7 @@ class KuzuGraphStore:
         return props
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         r = self._conn.execute(
             "MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) RETURN n.props LIMIT 1",
             {"id": node_id, "nt": node_type},
@@ -137,8 +140,7 @@ class KuzuGraphStore:
         return None
 
     def get_node_by_id(self, node_id: str) -> dict[str, Any] | None:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         r = self._conn.execute(
             "MATCH (n:OntologyNode {node_id: $id}) "
             "RETURN n.node_type, n.props LIMIT 1",
@@ -158,8 +160,7 @@ class KuzuGraphStore:
         return info.get("node_type") if info else None
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         try:
             self._conn.execute(
                 "MATCH (n:OntologyNode {node_id: $id}) DETACH DELETE n",
@@ -183,8 +184,7 @@ class KuzuGraphStore:
         to_id: str,
         properties: dict[str, Any] | None = None,
     ) -> bool:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         props_json = json.dumps(properties or {})
         try:
             self._conn.execute(
@@ -225,18 +225,13 @@ class KuzuGraphStore:
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
 
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
 
         if pack_set is not None:
             anchor = self.get_node_by_id(node_id)
-            anchor_pid = (anchor or {}).get("pack_id")
-            if anchor_pid is None:
-                if not include_unpackaged:
-                    return []
-            elif anchor_pid not in pack_set:
+            if not _node_passes(anchor or {}, pack_set, include_unpackaged):
                 return []
 
         if depth == 1:
@@ -302,16 +297,18 @@ class KuzuGraphStore:
             props = _parse(props_raw)
             props.setdefault("id", nid)
             if pack_set is not None:
-                pid = props.get("pack_id")
-                if pid is None:
-                    if not include_unpackaged:
-                        continue
-                elif pid not in pack_set:
+                # `node_id` is always the anchor side of this 1-hop query (the
+                # caller already verified it passes — once up front in
+                # find_neighbors for depth==1, or transitively for depth>1
+                # since every queued node already passed this same check when
+                # first discovered), so only the far side ("m", here) needs a
+                # fresh _node_passes check; pass True for the already-known
+                # side into _edge_passes (AND with True is a no-op either way).
+                m_passes = _node_passes(props, pack_set, include_unpackaged)
+                if not m_passes:
                     continue
-                # Edge pack_id rule: foreign-pack edge always excluded
                 edge_props = _parse(edge_props_raw)
-                edge_pid = edge_props.get("pack_id") if isinstance(edge_props, dict) else None
-                if edge_pid is not None and edge_pid not in pack_set:
+                if not _edge_passes(edge_props, True, m_passes, pack_set):
                     continue
             # Deduplicate: same destination via multiple edges → return once
             if nid in seen:
@@ -333,8 +330,7 @@ class KuzuGraphStore:
         direction: str = "out",
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         if not relations:
             return []
         limit = int(limit)
@@ -369,8 +365,7 @@ class KuzuGraphStore:
     def find_path(
         self, from_id: str, to_id: str, max_depth: int = 4
     ) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
 
         visited: set[str] = {from_id}
         queue: deque[tuple[str, list[dict[str, Any]]]] = deque([(from_id, [])])
@@ -399,8 +394,7 @@ class KuzuGraphStore:
         return []
 
     def count_nodes(self, node_type: str | None = None) -> int:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         if node_type:
             r = self._conn.execute(
                 "MATCH (n:OntologyNode {node_type: $nt}) RETURN count(n)",
@@ -415,8 +409,7 @@ class KuzuGraphStore:
     # ------------------------------------------------------------------
 
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         r = self._conn.execute(
             "MATCH (n:OntologyNode) RETURN n.node_id, n.props"
         )
@@ -456,8 +449,7 @@ class KuzuGraphStore:
         pack_id: str | None = None,
         limit: int = 500_000,
     ) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         r = self._conn.execute(
             f"MATCH (n:OntologyNode) RETURN n.node_type, n.props LIMIT {int(limit)}"
         )
@@ -481,8 +473,7 @@ class KuzuGraphStore:
         pack_id: str | None = None,
         limit: int = 1_000_000,
     ) -> list[dict[str, Any]]:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         r = self._conn.execute(
             f"MATCH (a:OntologyNode)-[e:OntologyEdge]->(b:OntologyNode) "
             f"RETURN a.node_type, a.props, b.node_type, b.props, e.relation, e.properties "
@@ -517,8 +508,7 @@ class KuzuGraphStore:
         return results
 
     def upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> int:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         for n in nodes:
             self.upsert_node(
                 n["node_type"],
@@ -529,8 +519,7 @@ class KuzuGraphStore:
         return len(nodes)
 
     def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
-        if not self._available:
-            raise RuntimeError("KuzuGraphStore is not available.")
+        self._require_available()
         count = 0
         for e in edges:
             ok = self.upsert_edge(
