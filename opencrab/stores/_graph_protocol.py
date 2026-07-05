@@ -144,14 +144,10 @@ class GraphStore(Protocol):
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """Delete one node and its incident edges.
 
-        QUIRK (documented, preserved across backends by design — see
-        pg_graph_store.PGGraphStore.delete_node docstring): the boolean
-        reflects whether at least one incident EDGE was removed, not
-        whether the node row itself was removed. A node with no edges
-        deletes silently but returns False. Neo4j deviates from this quirk
-        deliberately (``DETACH DELETE`` returns True whenever the node
-        itself existed, edges or not) since it has no shared cursor to
-        replicate the SQLite accident through.
+        Returns True iff the node itself was deleted (i.e. it existed
+        before the call) — unified across all four backends. A node with
+        zero incident edges still returns True. A nonexistent node returns
+        False.
         """
         ...
 
@@ -230,6 +226,12 @@ class GraphStore(Protocol):
         self, from_id: str, to_id: str, max_depth: int = 4
     ) -> list[dict[str, Any]]:
         """Shortest path from ``from_id`` to ``to_id``; ``[]`` if none found.
+
+        ``max_depth`` is the maximum number of HOPS (edges traversed), and
+        traversal follows only OUTGOING edges (``from_id`` -> ... ->
+        ``to_id``) — unified across all four backends. A path requiring
+        more than ``max_depth`` hops is not found, and a reverse-only edge
+        (b->a) does not make ``a`` reachable from ``a`` to ``b``.
 
         Returns a list of hop dicts: ``[{"node": dict, "relation": str}, ...]``,
         one entry per edge traversed (the ``from_id`` node itself is never

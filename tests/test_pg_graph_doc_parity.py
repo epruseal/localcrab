@@ -262,9 +262,11 @@ class TestGraphParity:
         assert pg.find_neighbors("hub1", **kwargs) == []
 
     def test_find_path(self, graph_pair):
+        """max_depth is a HOP bound (unified B1 contract) — the dataset's
+        chain is 5 hops long, so max_depth must be >= 5 to find it."""
         local, pg = graph_pair
-        local_path = local.find_path("packA_n0", "packA_n5", max_depth=4)
-        pg_path = pg.find_path("packA_n0", "packA_n5", max_depth=4)
+        local_path = local.find_path("packA_n0", "packA_n5", max_depth=5)
+        pg_path = pg.find_path("packA_n0", "packA_n5", max_depth=5)
         assert local_path == pg_path
         assert [step["relation"] for step in local_path] == ["next"] * 5
 
@@ -311,10 +313,10 @@ class TestGraphParity:
         pg_edges_p = sorted(pg.export_edges(pack_id="packA"), key=edge_key)
         assert local_edges_p == pg_edges_p
 
-    def test_upsert_node_batch_and_delete_node_quirk(self, graph_pair):
-        """delete_node()'s return value reflects whether *edges* were removed
-        (a reused-cursor rowcount quirk in LocalGraphStore) — verify both
-        backends replicate it identically."""
+    def test_delete_node_returns_true_when_node_deleted(self, graph_pair):
+        """delete_node()'s return value reflects whether the NODE itself was
+        deleted (unified B2 contract) — verify both backends agree,
+        regardless of incident edge count."""
         local, pg = graph_pair
         for store in (local, pg):
             store.upsert_nodes_batch(
@@ -326,9 +328,11 @@ class TestGraphParity:
                     "to_type": "Person", "to_id": "lonely1", "properties": {},
                 }]
             )
-            # lonely1 has one incident edge -> edges DELETE affects 1 row -> True
+            # lonely1 has one incident edge and exists -> True
             assert store.delete_node("Person", "lonely1") is True
-            # unpk_n9 has zero incident edges -> edges DELETE affects 0 rows -> False
+            # unpk_n9 has zero incident edges but exists -> True
+            assert store.delete_node("Person", "unpk_n9") is True
+            # already deleted -> False
             assert store.delete_node("Person", "unpk_n9") is False
 
 

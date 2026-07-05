@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-from opencrab.execution.workflow import VALID_STATUSES, WorkflowEngine
+from opencrab.execution.workflow import WorkflowEngine
 from opencrab.stores.sql_store import SQLStore
 
 
@@ -113,12 +113,26 @@ class TestWorkflowNormal:
         ids = [entry["id"] for entry in log]
         assert ids == sorted(ids)
 
-    @pytest.mark.parametrize("status", sorted(VALID_STATUSES))
-    def test_advance_accepts_every_valid_status(self, engine, status):
+    @pytest.mark.parametrize(
+        "chain",
+        [
+            ["running", "completed"],
+            ["running", "failed"],
+            ["approved", "running"],
+            ["approved", "rejected"],
+            ["rejected"],
+        ],
+    )
+    def test_advance_follows_legal_chain_from_pending(self, engine, chain):
+        """Transition-legality itself is covered exhaustively by
+        test_workflow_transitions.py; this only checks that a fresh
+        (pending) run can walk each legal chain end to end."""
         created = engine.create_run("promote_claim", {})
-        result = engine.advance(created["run_id"], status)
-        assert result["status"] == status
-        assert engine.get_run(created["run_id"])["status"] == status
+        run_id = created["run_id"]
+        for status in chain:
+            result = engine.advance(run_id, status)
+            assert result["status"] == status
+            assert engine.get_run(run_id)["status"] == status
 
 
 # ---------------------------------------------------------------------------

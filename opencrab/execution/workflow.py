@@ -21,6 +21,22 @@ VALID_STATUSES = frozenset(
     {"pending", "running", "approved", "rejected", "completed", "failed"}
 )
 
+# Legal status -> {status, ...} moves for WorkflowEngine.advance(). A run
+# starts at 'pending' (create_run) and can optionally pass through an
+# approval gate ('approved') or be rejected before ever running. Once
+# 'running', it resolves to 'completed' or 'failed'. completed/failed/
+# rejected are terminal -- this workflow has no reopen/retry verb.
+# Same-status is intentionally absent from every successor set: advancing a
+# run to its own current status is rejected, not treated as a no-op.
+VALID_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"running", "approved", "rejected"}),
+    "approved": frozenset({"running", "rejected"}),
+    "running": frozenset({"completed", "failed"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "rejected": frozenset(),
+}
+
 _TABLES_SQLITE = [
     """
     CREATE TABLE IF NOT EXISTS workflow_runs (
@@ -170,7 +186,10 @@ class WorkflowEngine:
         """
         Transition a run to *new_status* and append to action_log.
 
-        Raises ValueError if *new_status* is not a recognised status.
+        Raises ValueError if *new_status* is not a recognised status, if
+        *run_id* does not exist, or if the run's current status has no
+        legal transition to *new_status* per VALID_TRANSITIONS (this
+        includes advancing a status to itself).
         """
         from sqlalchemy import text
 
@@ -197,6 +216,20 @@ class WorkflowEngine:
             )
 
         with self._sql._engine.begin() as conn:
+            current_row = conn.execute(
+                text("SELECT status FROM workflow_runs WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            ).fetchone()
+            if current_row is None:
+                raise ValueError(f"Run '{run_id}' not found.")
+
+            current_status = current_row._mapping["status"]
+            if new_status not in VALID_TRANSITIONS.get(current_status, frozenset()):
+                raise ValueError(
+                    f"Illegal transition: cannot advance run '{run_id}' "
+                    f"from '{current_status}' to '{new_status}'."
+                )
+
             result = conn.execute(
                 text(update_sql), {"status": new_status, "run_id": run_id}
             )

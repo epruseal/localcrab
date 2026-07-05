@@ -50,12 +50,6 @@ LIFECYCLE NOTE: close() disposes the engine only when this store created it
     from a DSN string. When an external SQLAlchemy Engine is injected, the
     caller owns its lifecycle and close() is a no-op (unlike
     LocalGraphStore.close(), which always closes its own connections).
-
-QUIRK PRESERVED ON PURPOSE: delete_node()'s return value reflects the
-    *edges* DELETE rowcount, not the node DELETE rowcount, because the
-    reference implementation reuses one sqlite3 cursor across two execute()
-    calls and returns cur.rowcount after the *last* statement. See
-    delete_node() docstring.
 """
 
 from __future__ import annotations
@@ -234,23 +228,19 @@ class PGGraphStore:
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """Delete a node and its incident edges.
 
-        QUIRK PRESERVED: mirrors LocalGraphStore, which reuses one sqlite3
-        cursor for two DELETE statements and returns cur.rowcount from the
-        LAST execute() (the edges delete), NOT the node delete. So this
-        returns True iff at least one incident EDGE was removed — a node
-        with no edges deletes silently but returns False. Replicated here by
-        running both statements on one connection/transaction and returning
-        the edges-DELETE rowcount.
+        Returns True iff the node row itself was deleted (i.e. it existed
+        before the call) — matching Neo4jStore.delete_node's semantics.
         """
         self._require_available()
         with self._engine.begin() as conn:
-            conn.execute(
+            result = conn.execute(
                 self._text(
                     f"DELETE FROM {self._t}.graph_nodes WHERE node_type=:nt AND node_id=:nid"
                 ),
                 {"nt": node_type, "nid": node_id},
             )
-            result = conn.execute(
+            node_deleted = result.rowcount > 0
+            conn.execute(
                 self._text(
                     f"""
                     DELETE FROM {self._t}.graph_edges
@@ -259,8 +249,7 @@ class PGGraphStore:
                 ),
                 {"nt": node_type, "nid": node_id},
             )
-            rowcount = result.rowcount
-        return rowcount > 0
+        return node_deleted
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -523,7 +512,7 @@ class PGGraphStore:
 
             while queue:
                 current_id, path = queue.popleft()
-                if len(path) >= max_depth * 2:
+                if len(path) >= max_depth:
                     continue
 
                 rows = conn.execute(
