@@ -26,65 +26,30 @@ SCHEMA DESIGN:
     columns are avoided because the dict schema is open and varies by caller.
     json_extract() would add SQLite >= 3.38 dependency; caller-side json.loads
     keeps the version floor at 3.9.0 (same as local_graph_store.py).
+
+STAGE 6a (F1): the 13-method surface's SQL text and dict-shaping now live in
+    ``_SqlDocStoreBase`` (``_sql_doc_base.py``), parameterised by the SQLite
+    ``SqlDialect`` (``_sql_dialect.py``). This class supplies the SQLite-only
+    pieces the base deliberately doesn't cover: connection management (via
+    ``_SqliteConnMixin``), DDL bootstrap + FTS5 capability probing, the FTS5
+    ``keyword_search`` implementation, and the FTS5 shadow-table sync that
+    ``upsert_source`` needs on top of the base's ``doc_sources`` write.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
-import uuid
-from datetime import UTC, datetime
 from typing import Any
 
+from opencrab.stores._sql_dialect import SQLITE
+from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# DDL
-# ---------------------------------------------------------------------------
 
-_DDL = [
-    # doc_nodes: primary key on (space, node_id) → O(log N) PK lookup.
-    # updated_at index supports time-range queries added in the future and
-    # lets the DB engine sort without a full-table pass.
-    """
-    CREATE TABLE IF NOT EXISTS doc_nodes (
-        space       TEXT NOT NULL,
-        node_id     TEXT NOT NULL,
-        node_type   TEXT NOT NULL DEFAULT '',
-        properties  TEXT NOT NULL DEFAULT '{}',
-        updated_at  TEXT NOT NULL,
-        PRIMARY KEY (space, node_id)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated ON doc_nodes(updated_at)",
-    # doc_sources: simple PK on source_id.
-    """
-    CREATE TABLE IF NOT EXISTS doc_sources (
-        source_id   TEXT PRIMARY KEY,
-        text        TEXT NOT NULL DEFAULT '',
-        metadata    TEXT NOT NULL DEFAULT '{}',
-        ingested_at TEXT NOT NULL
-    )
-    """,
-    # audit_log: uuid4 PK prevents duplicates even under concurrent writers.
-    # timestamp DESC index avoids a full-table sort on every get_audit_log call.
-    """
-    CREATE TABLE IF NOT EXISTS audit_log (
-        event_id    TEXT PRIMARY KEY,
-        event_type  TEXT NOT NULL,
-        subject_id  TEXT,
-        details     TEXT NOT NULL DEFAULT '{}',
-        timestamp   TEXT NOT NULL
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp DESC)",
-]
-
-
-class LocalSQLDocStore(_SqliteConnMixin):
+class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     """SQLite-backed document store with the same interface as MongoStore /
     LocalDocStore.
 
@@ -95,6 +60,8 @@ class LocalSQLDocStore(_SqliteConnMixin):
     sharing one connection across threads corrupts even reads. WAL lets per-thread
     connections read concurrently while a threading.Lock serialises writers.
     """
+
+    _dialect = SQLITE
 
     def __init__(self, db_path: str) -> None:
         """
@@ -116,12 +83,14 @@ class LocalSQLDocStore(_SqliteConnMixin):
         """
         Replaces: LocalDocStore's implicit dir creation + LocalGraphStore._init_db()
         WHY: WAL + synchronous=NORMAL is the same pattern as local_graph_store.py.
-             Creates all three tables in a single transaction for atomicity.
+             DDL text now comes from DOC_STORE_SCHEMA via SQLITE.render_ddl() —
+             same three tables/indexes, same statement order, dialect-shared
+             with pg_doc_store.py — created in a single transaction for atomicity.
         """
         try:
             conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma
             cur = conn.cursor()
-            for ddl in _DDL:
+            for ddl in SQLITE.render_ddl(DOC_STORE_SCHEMA):
                 cur.execute(ddl)
             conn.commit()
             self._available = True
@@ -183,115 +152,31 @@ class LocalSQLDocStore(_SqliteConnMixin):
             return False
 
     # ------------------------------------------------------------------
-    # Node document operations
+    # Base-hook implementations (see _SqlDocStoreBase adoption contract)
     # ------------------------------------------------------------------
 
-    def upsert_node_doc(
-        self,
-        space: str,
-        node_type: str,
-        node_id: str,
-        properties: dict[str, Any],
-    ) -> str:
-        """
-        Replaces: LocalDocStore.upsert_node_doc / MongoStore.upsert_node_doc
-        WHY SQLite: JSON backend re-serializes the entire nodes dict on every
-            call (O(N) write). INSERT OR REPLACE touches a single B-tree page.
-        SCHEMA: returns the composite key "space::node_id" for compatibility
-            with LocalDocStore callers that use the return value.
-        """
-        self._require_available()
-        updated_at = datetime.now(UTC).isoformat()
+    def _table(self, name: str) -> str:
+        return name
+
+    def _fetch_all(self, sql: str, params: dict[str, Any]) -> list[Any]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _fetch_one(self, sql: str, params: dict[str, Any]) -> Any | None:
+        return self._conn.execute(sql, params).fetchone()
+
+    def _exec_write(self, sql: str, params: dict[str, Any]) -> int:
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO doc_nodes(space, node_id, node_type, properties, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (space, node_id, node_type, json.dumps(properties), updated_at),
-            )
+            cur = self._conn.execute(sql, params)
             self._conn.commit()
-        return f"{space}::{node_id}"
+            return cur.rowcount
 
-    def get_node_doc(self, space: str, node_id: str) -> dict[str, Any] | None:
-        """
-        Replaces: LocalDocStore.get_node_doc / MongoStore.get_node_doc
-        WHY SQLite: O(log N) PK lookup vs O(N) full JSON parse + dict.get().
-        """
-        self._require_available()
-        row = self._conn.execute(
-            "SELECT space, node_id, node_type, properties, updated_at"
-            " FROM doc_nodes WHERE space=? AND node_id=?",
-            (space, node_id),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_node(row)
+    def _row_get(self, row: Any, name: str) -> Any:
+        return row[name]
 
-    def list_nodes(
-        self, space: str | None = None, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        """
-        Replaces: LocalDocStore.list_nodes / MongoStore.list_nodes
-        WHY SQLite: this is the hot path — BM25 cache rebuild calls
-            list_nodes(limit=50000) on every query. JSON backend loads and
-            parses the entire file then slices; SQLite uses LIMIT in the query
-            so only the required rows are read from disk.
-        SCHEMA: space=None skips the WHERE clause entirely (no filter cost).
-        """
-        self._require_available()
-        if space:
-            rows = self._conn.execute(
-                "SELECT space, node_id, node_type, properties, updated_at"
-                " FROM doc_nodes WHERE space=? LIMIT ?",
-                (space, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT space, node_id, node_type, properties, updated_at"
-                " FROM doc_nodes LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
-        """Cheap ``(count, max_updated_at)`` over the first ``limit`` nodes.
-
-        Equivalent to ``compute_fingerprint(self.list_nodes(limit=limit))`` but
-        WITHOUT parsing JSON ``properties`` — this is the query hot-path probe
-        HybridQuery uses to detect a stale BM25 cache without the full 50k
-        ``list_nodes`` scan. The ``LIMIT`` subquery mirrors ``list_nodes`` (same
-        rowid order, same cap) so the count agrees even when the corpus exceeds
-        ``limit`` — BM25Index only indexes that many rows. ``MAX(updated_at)`` is
-        backed by ``idx_doc_nodes_updated``; ``doc_nodes`` has no ``ingested_at``
-        column, so ``compute_fingerprint`` (which also checks ``ingested_at``)
-        yields the same value here.
-        """
-        self._require_available()
-        row = self._conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(updated_at), '')"
-            " FROM (SELECT updated_at FROM doc_nodes LIMIT ?)",
-            (limit,),
-        ).fetchone()
-        return (int(row[0]), str(row[1]))
-
-    def delete_node_doc(self, space: str, node_id: str) -> bool:
-        """
-        Replaces: LocalDocStore.delete_node_doc / MongoStore.delete_node_doc
-        WHY SQLite: JSON backend loads the whole file, removes the key, then
-            re-serializes — O(N). SQLite DELETE by PK is O(log N).
-        """
-        self._require_available()
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM doc_nodes WHERE space=? AND node_id=?",
-                (space, node_id),
-            )
-            self._conn.commit()
-        return cur.rowcount > 0
+    # _require_available is provided by _SqliteConnMixin.
 
     # ------------------------------------------------------------------
-    # Source ingestion
+    # Source ingestion — override to keep the FTS5 shadow table in sync
     # ------------------------------------------------------------------
 
     def upsert_source(
@@ -299,23 +184,13 @@ class LocalSQLDocStore(_SqliteConnMixin):
     ) -> str:
         """
         Replaces: LocalDocStore.upsert_source / MongoStore.upsert_source
-        WHY SQLite: same O(N) → O(log N) argument as upsert_node_doc.
-        SCHEMA: text is stored as-is (no truncation); callers that need
-            truncation should do so before calling (MongoStore doesn't truncate
-            either — only LocalDocStore did for legacy reasons).
+        Writes doc_sources via the base implementation, then syncs the FTS5
+        shadow table (delete+insert) — the base has no denormalized keyword
+        index to keep current, so this store adds that step on top.
         """
-        self._require_available()
-        ingested_at = datetime.now(UTC).isoformat()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO doc_sources(source_id, text, metadata, ingested_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (source_id, text, json.dumps(metadata), ingested_at),
-            )
-            # FTS5 동기화(delete+insert) — 본문 교체 시 옛 토큰 제거.
-            if self._fts_ok:
+        result = super().upsert_source(source_id, text, metadata)
+        if self._fts_ok:
+            with self._lock:
                 try:
                     self._conn.execute(
                         "DELETE FROM doc_sources_fts WHERE source_id=?", (source_id,)
@@ -324,10 +199,10 @@ class LocalSQLDocStore(_SqliteConnMixin):
                         "INSERT INTO doc_sources_fts(source_id, text) VALUES (?, ?)",
                         (source_id, text),
                     )
+                    self._conn.commit()
                 except Exception as exc:
                     logger.warning("FTS sync failed for %s: %s", source_id, exc)
-            self._conn.commit()
-        return source_id
+        return result
 
     def keyword_search(
         self,
@@ -383,148 +258,3 @@ class LocalSQLDocStore(_SqliteConnMixin):
             if len(out) >= limit:
                 break
         return out
-
-    def get_source(self, source_id: str) -> dict[str, Any] | None:
-        """
-        Replaces: LocalDocStore.get_source / MongoStore.get_source
-        WHY SQLite: O(log N) PK lookup.
-        """
-        self._require_available()
-        row = self._conn.execute(
-            "SELECT source_id, text, metadata, ingested_at"
-            " FROM doc_sources WHERE source_id=?",
-            (source_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "source_id": row["source_id"],
-            "text": row["text"],
-            "metadata": json.loads(row["metadata"]),
-            "ingested_at": row["ingested_at"],
-        }
-
-    def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
-        """
-        Replaces: LocalDocStore.list_sources / MongoStore.list_sources
-        WHY SQLite: LIMIT in query avoids loading rows we discard.
-        """
-        self._require_available()
-        rows = self._conn.execute(
-            "SELECT source_id, text, metadata, ingested_at FROM doc_sources LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [
-            {
-                "source_id": r["source_id"],
-                "text": r["text"],
-                "metadata": json.loads(r["metadata"]),
-                "ingested_at": r["ingested_at"],
-            }
-            for r in rows
-        ]
-
-    # ------------------------------------------------------------------
-    # Audit log
-    # ------------------------------------------------------------------
-
-    def log_event(
-        self,
-        event_type: str,
-        subject_id: str | None,
-        details: dict[str, Any],
-    ) -> str:
-        """
-        Replaces: LocalDocStore.log_event / MongoStore.log_event
-        WHY SQLite: JSON backend loads, appends, re-serializes the entire log
-            on every event — O(N). SQLite INSERT is O(log N).
-        SCHEMA: event_id uses uuid4 (vs LocalDocStore's composite string key)
-            to guarantee uniqueness under concurrent writers and match
-            MongoStore's ObjectId semantics.  Returns event_id so callers can
-            correlate entries.
-        """
-        self._require_available()
-        event_id = str(uuid.uuid4())
-        timestamp = datetime.now(UTC).isoformat()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO audit_log(event_id, event_type, subject_id, details, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (event_id, event_type, subject_id, json.dumps(details), timestamp),
-            )
-            self._conn.commit()
-        return event_id
-
-    def get_audit_log(
-        self, limit: int = 100, event_type: str | None = None
-    ) -> list[dict[str, Any]]:
-        """
-        Replaces: LocalDocStore.get_audit_log / MongoStore.get_audit_log
-        WHY SQLite: LocalDocStore sorts all entries in Python then slices;
-            SQLite uses the idx_audit_ts index to return top-N rows without
-            sorting the whole table.
-        SCHEMA: ORDER BY timestamp DESC mirrors MongoStore's sort([("timestamp", -1)]).
-        """
-        self._require_available()
-        if event_type:
-            rows = self._conn.execute(
-                "SELECT event_id, event_type, subject_id, details, timestamp"
-                " FROM audit_log WHERE event_type=?"
-                " ORDER BY timestamp DESC LIMIT ?",
-                (event_type, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT event_id, event_type, subject_id, details, timestamp"
-                " FROM audit_log ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [
-            {
-                "event_id": r["event_id"],
-                "event_type": r["event_type"],
-                "subject_id": r["subject_id"],
-                "details": json.loads(r["details"]),
-                "timestamp": r["timestamp"],
-            }
-            for r in rows
-        ]
-
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
-
-    def collection_stats(self) -> dict[str, int]:
-        """
-        Replaces: LocalDocStore.collection_stats / MongoStore.collection_stats
-        WHY SQLite: COUNT(*) uses the table's B-tree internal page count —
-            O(1) for SQLite (no full scan). JSON backend calls len() on a
-            freshly-loaded dict — O(N) just to count.
-        """
-        self._require_available()
-        counts = {}
-        for table, key in [
-            ("doc_nodes", "nodes"),
-            ("doc_sources", "sources"),
-            ("audit_log", "audit_log"),
-        ]:
-            row = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
-            counts[key] = int(row[0]) if row else 0
-        return counts
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _row_to_node(row: sqlite3.Row) -> dict[str, Any]:
-        """Convert a doc_nodes DB row to the dict format callers expect."""
-        return {
-            "space": row["space"],
-            "node_id": row["node_id"],
-            "node_type": row["node_type"],
-            "properties": json.loads(row["properties"]),
-            "updated_at": row["updated_at"],
-        }
