@@ -60,12 +60,7 @@ class TestPgEnvNormal:
 
 
 class TestPgEnvError:
-    """OPENCRAB_PG_TEST_URL 미설정 시 명확한 사유로 skip."""
-
-    def test_skips_with_clear_reason_when_unset(self):
-        if PG_URL:
-            pytest.skip("OPENCRAB_PG_TEST_URL is set in this run — nothing to assert here")
-        pytest.skip("OPENCRAB_PG_TEST_URL not set — PG env tests skipped")
+    """연결 실패는 명확하고 빠르게 드러나야 한다."""
 
     def test_bogus_port_fails_fast_not_hang(self):
         """존재하지 않는 포트로의 연결은 짧은 타임아웃 내에 실패해야 한다(행 방지)."""
