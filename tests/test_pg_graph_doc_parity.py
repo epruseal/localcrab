@@ -576,6 +576,89 @@ class TestTypedPropertiesAndNullSemantics:
         assert pg_none == pg_empty
         assert local_none == pg_none
 
+    # ------------------------------------------------------------------
+    # Doc-store equivalents of the graph-store typed-properties/NULL/
+    # unicode/upsert-overwrite cases above (Stage 6a doc-store dialect
+    # unification golden contract — these were previously only exercised
+    # for the graph pair, not the doc pair).
+    # ------------------------------------------------------------------
+
+    def test_typed_properties_roundtrip_doc(self, doc_pair):
+        """Same JSON-typed-value roundtrip as
+        test_typed_properties_roundtrip_graph, but through
+        upsert_node_doc/get_node_doc (doc_nodes.properties)."""
+        local, pg = doc_pair
+        props = {
+            "count": 7,
+            "ratio": 3.14,
+            "flag_true": True,
+            "flag_false": False,
+            "nothing": None,
+            "nested": {"a": 1, "b": [1, 2, 3], "c": {"d": None}},
+            "items": [1, "two", 3.0, None, True],
+        }
+        for store in (local, pg):
+            store.upsert_node_doc("s1", "Doc", "typed_doc1", props)
+        local_props = local.get_node_doc("s1", "typed_doc1")["properties"]
+        pg_props = pg.get_node_doc("s1", "typed_doc1")["properties"]
+        for key, value in props.items():
+            assert local_props[key] == value
+            assert pg_props[key] == value
+        assert local_props == pg_props
+
+    def test_null_value_vs_missing_key_distinction_doc(self, doc_pair):
+        local, pg = doc_pair
+        for store in (local, pg):
+            store.upsert_node_doc("s1", "Doc", "null_doc1", {"present_null": None})
+        for store in (local, pg):
+            props = store.get_node_doc("s1", "null_doc1")["properties"]
+            assert "present_null" in props
+            assert props["present_null"] is None
+            assert "absent_key" not in props
+
+    def test_unicode_korean_and_emoji_roundtrip_doc(self, doc_pair):
+        """Unicode in both the doc node_id and the source content/metadata."""
+        local, pg = doc_pair
+        node_id = "한국어_문서_🐛"
+        props = {"title": "한글 제목 테스트", "emoji": "🦀🔥✨", "mixed": "hello 안녕 👋"}
+        for store in (local, pg):
+            store.upsert_node_doc("s1", "Doc", node_id, props)
+        local_doc = local.get_node_doc("s1", node_id)
+        pg_doc = pg.get_node_doc("s1", node_id)
+        for key, value in props.items():
+            assert local_doc["properties"][key] == value
+            assert pg_doc["properties"][key] == value
+
+        source_id = "소스_🦀_src"
+        text_ = "한국어 문서 검색 테스트 unicode emoji 🔥 content"
+        for store in (local, pg):
+            store.upsert_source(source_id, text_, {"lang": "ko", "tag": "🐛"})
+        local_src = local.get_source(source_id)
+        pg_src = pg.get_source(source_id)
+        assert local_src["text"] == text_ == pg_src["text"]
+        assert local_src["metadata"] == pg_src["metadata"] == {"lang": "ko", "tag": "🐛"}
+
+    def test_upsert_conflict_overwrites_not_merges_doc(self, doc_pair):
+        """Second upsert_node_doc()/upsert_source() replaces the JSON column
+        wholesale — a key present only in the first write must NOT survive."""
+        local, pg = doc_pair
+        for store in (local, pg):
+            store.upsert_node_doc("s1", "Doc", "ow_doc1", {"first_only": "x", "shared": "old"})
+            store.upsert_node_doc("s1", "Doc", "ow_doc1", {"shared": "new"})
+        for store in (local, pg):
+            props = store.get_node_doc("s1", "ow_doc1")["properties"]
+            assert "first_only" not in props
+            assert props["shared"] == "new"
+
+        for store in (local, pg):
+            store.upsert_source("ow_src1", "first text", {"first_only": "x", "shared": "old"})
+            store.upsert_source("ow_src1", "second text", {"shared": "new"})
+        for store in (local, pg):
+            src = store.get_source("ow_src1")
+            assert src["text"] == "second text"
+            assert "first_only" not in src["metadata"]
+            assert src["metadata"]["shared"] == "new"
+
     def test_list_packs_pack_id_type_divergence_int_vs_str(self, tmp_path, pg_engine):
         """DOCUMENTED DIVERGENCE (판단 보류, not fixed — pack_id is
         conventionally always a string everywhere else in the app; this test
