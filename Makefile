@@ -1,4 +1,4 @@
-.PHONY: help install dev-install status serve serve-http manifest lint format test coverage seed
+.PHONY: help install dev-install status serve serve-http manifest lint format test test-pg coverage seed
 
 PYTHON := python
 PIP    := pip
@@ -18,6 +18,7 @@ help:
 	@echo "  make lint          Run ruff linter"
 	@echo "  make format        Run black + isort"
 	@echo "  make test          Run test suite"
+	@echo "  make test-pg       Run test suite against local PG (opencrab_test)"
 	@echo "  make coverage      Run tests with coverage report"
 
 install:
@@ -50,6 +51,9 @@ format:
 
 test:
 	$(PYTEST) tests/ -v
+
+test-pg:
+	OPENCRAB_PG_TEST_URL=postgresql://opencrab:opencrab@localhost:5432/opencrab_test $(PYTEST) tests/ -v
 
 coverage:
 	$(PYTEST) tests/ --cov=opencrab --cov-report=term-missing --cov-report=html

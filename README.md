@@ -438,6 +438,22 @@ make coverage      # 커버리지 리포트
 OPENCRAB_INTEGRATION=1 pytest tests/ -v
 ```
 
+### PG 파리티 테스트
+
+`STORAGE_MODE=pg` (PGGraphStore/PgDocStore) 골든 파리티 테스트는 별도의 로컬
+PostgreSQL 인스턴스가 필요하며, `OPENCRAB_PG_TEST_URL` 미설정 시 자동으로
+skip됩니다. 실제 데이터 손상을 막기 위해 DB명이 `_test`로 끝나지 않으면
+tripwire 테스트가 실패합니다 — 반드시 전용 테스트 DB를 사용하세요.
+
+```bash
+docker compose up -d postgres         # pgvector/pgvector:pg16 기동
+docker exec opencrab-postgres createdb -U opencrab opencrab_test  # 최초 1회
+make test-pg                          # OPENCRAB_PG_TEST_URL 자동 설정 후 실행
+```
+
+CI(`.github/workflows/ci.yml`)는 동일한 구성을 postgres 서비스 컨테이너로
+띄워 매 PR마다 실행합니다.
+
 ---
 
 ## 프로젝트 구조
