@@ -86,8 +86,9 @@ def init(force: bool) -> None:
 
 
 def _write_default_env(path: Path) -> None:
-    content = """\
-LOCAL_DATA_DIR=/home/asdf/.openclaw/workspace/data/localcrab
+    default_data_dir = Path.home() / ".local" / "share" / "localcrab"
+    content = f"""\
+LOCAL_DATA_DIR={default_data_dir}
 CHROMA_COLLECTION=opencrab_vectors
 MCP_SERVER_NAME=localcrab
 MCP_SERVER_VERSION=0.1.0-localcrab
@@ -259,7 +260,10 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
 
     extensions = [e.strip() for e in extension.split(",")]
     root = Path(path)
-    files = list(root.rglob("*")) if recursive else list(root.iterdir())
+    if root.is_dir():
+        files = list(root.rglob("*")) if recursive else list(root.iterdir())
+    else:
+        files = [root]
     files = [f for f in files if f.is_file() and f.suffix in extensions]
 
     if not files:
@@ -337,7 +341,10 @@ def extract(
 
     extensions = [e.strip() for e in extension.split(",")]
     root = Path(path)
-    files = list(root.rglob("*")) if recursive else list(root.iterdir())
+    if root.is_dir():
+        files = list(root.rglob("*")) if recursive else list(root.iterdir())
+    else:
+        files = [root]
     files = [f for f in files if f.is_file() and f.suffix in extensions]
 
     if not files:
@@ -833,6 +840,8 @@ def packs_backfill_pack_id(
             "[yellow]warning: both --apply and --dry-run given; honouring --dry-run.[/yellow]"
         )
     elif apply_changes and dry_run is None:
+        effective_dry_run = False
+    elif apply_changes and dry_run is False:
         effective_dry_run = False
     elif dry_run is False and not apply_changes:
         console.print(

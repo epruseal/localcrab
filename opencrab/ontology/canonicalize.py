@@ -5,10 +5,14 @@ Operates on top of the IdentityEngine's alias table.
 A "canonical" node is the authoritative version; aliases redirect to it.
 
 Safe approach for early stage:
-  - Merge is write-through: canonical node inherits alias's properties
-  - Alias record is written to node_aliases
+  - Alias record is written to node_aliases (canonical_id <- alias_id)
   - Original alias node is NOT deleted (tombstone pattern)
   - All queries should call resolve_canonical() before lookup
+
+NOTE: merge_nodes' `merge_properties` flag is currently a receipt-only
+placeholder -- the `builder` passed to CanonicalizeEngine is stored but
+never invoked, so alias properties are NOT actually copied onto the
+canonical node yet. See merge_nodes' docstring.
 """
 
 from __future__ import annotations
@@ -48,8 +52,7 @@ class CanonicalizeEngine:
 
         Steps:
           1. Register alias_id as an alias of canonical_id (type='merge')
-          2. Optionally copy properties from alias node to canonical node
-          3. Return merge receipt
+          2. Return merge receipt
 
         The alias node is NOT deleted — it stays as a tombstone so existing
         references don't break. Callers should use resolve_canonical() to
@@ -66,7 +69,10 @@ class CanonicalizeEngine:
         canonical_type:
             Node type of the canonical node.
         merge_properties:
-            If True, copy non-null properties from alias node to canonical.
+            Reserved for future use. NOT YET IMPLEMENTED: the constructor's
+            `builder` argument is currently unused, so no properties are
+            copied from the alias node to the canonical node regardless of
+            this flag's value. Only alias registration happens.
         merged_by:
             Actor performing the merge.
         """

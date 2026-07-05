@@ -50,6 +50,17 @@ def local_env(tmp_path, monkeypatch):
 
     if hasattr(get_settings, "cache_clear"):
         get_settings.cache_clear()
+
+    # 기본 EMBEDDING_BACKEND="openai" 이면 vector store(sqlite-vec/chroma)가 실제
+    # KURE EF(OpenAI 원격 서버 + GGUF 자동 다운로드 폴백)를 만든다. 이 파일의 CLI
+    # query 경로(TestPackSelectionCLI)와 node/edge 쓰기 경로(TestNodeEdgeWriteMCP)가
+    # 모두 실제 vector store를 거치므로, factory 레벨에서 목으로 대체해 CI에서
+    # 네트워크/635MB 모델 다운로드 의존을 없앤다 (박제 대상은 store 반환 dict
+    # 형태이지 임베딩 품질이 아니다).
+    from opencrab.stores import factory
+
+    monkeypatch.setattr(factory, "_make_kure_embedding_function", lambda settings: _MockKureEF())
+
     yield tmp_path
     if hasattr(get_settings, "cache_clear"):
         get_settings.cache_clear()
@@ -112,6 +123,27 @@ def mcp_local_ctx(local_stores, builder):
         "hybrid": hybrid,
         "billing": BillingHooks(s),
     }
+
+
+class _MockKureEF:
+    """KURE 임베딩 EF 목(mock) — 네트워크 호출/GGUF 자동 다운로드 없이 결정적
+    고정 차원 벡터를 반환한다. tests/test_resilient_embedding.py 의 _MockEF /
+    _MockFallback 패턴과 동일한 최소 프로토콜(callable + name())만 구현한다.
+
+    node/edge 쓰기 경로 박제는 실제 vector store(SqliteVecStore/ChromaStore)의
+    반환 dict 형태가 목적이지 임베딩 품질이 아니므로, factory._make_kure_embedding_function
+    을 이걸로 대체해 ResilientEmbeddingFunction(OpenAI 원격 + GGUF 폴백) 의존을 없앤다.
+    """
+
+    def __init__(self, dim: int = 1024) -> None:
+        self._dim = dim
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        vec = [1.0] + [0.0] * (self._dim - 1)
+        return [vec for _ in input]
+
+    def name(self) -> str:
+        return "kure_v1"
 
 
 def _make_query_result(node_id: str = "n1", pack_id: str | None = "pack-a") -> QueryResult:

@@ -59,9 +59,30 @@ logger = logging.getLogger(__name__)
 _chroma_lock_fh = None
 
 
+def _lock_data_dir() -> str:
+    """락 파일(chroma.lock/write.lock)을 둘 데이터 디렉터리 경로.
+
+    os.environ.get() 직독을 get_settings() 보다 우선한다 — get_settings()는
+    lru_cache라 테스트가 실행 도중 monkeypatch한 LOCAL_DATA_DIR을 못 보는 stale
+    캐시 문제가 있다(env 직독은 매 호출 즉시 반영). 환경변수 미설정 시에만
+    get_settings().local_data_dir(HOME 파생 기본값 포함)로 폴백한다.
+
+    CI 러너처럼 .env가 없어 기본 디렉터리가 실제로 아직 존재하지 않는 경우를
+    대비해, 반환 전 os.makedirs(exist_ok=True)로 생성을 보장한다(락 파일 open()이
+    FileNotFoundError로 죽는 것을 방지).
+    """
+    data_dir = os.environ.get("LOCAL_DATA_DIR")
+    if not data_dir:
+        from opencrab.config import get_settings
+
+        data_dir = get_settings().local_data_dir
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
 def _acquire_chroma_shared_lock() -> None:
     global _chroma_lock_fh
-    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    data_dir = _lock_data_dir()
     lock_path = os.path.join(data_dir, "chroma.lock")
     _chroma_lock_fh = open(lock_path, "w")
     fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
@@ -92,7 +113,7 @@ WRITE_TOOLS = {
 @contextmanager
 def _write_lock():
     """Hold an exclusive cross-process lock for the duration of a write tool."""
-    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    data_dir = _lock_data_dir()
     lock_path = os.path.join(data_dir, "write.lock")
     fh = open(lock_path, "w")
     try:
@@ -1643,6 +1664,12 @@ def ontology_list_edges(
             return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
         except Exception as exc:
             logger.warning("export_edges failed: %s", exc)
+            if not hasattr(graph, "run_cypher"):
+                # No Neo4j fallback to try — report the real failure instead
+                # of falling through to the generic "unavailable" message,
+                # which would otherwise mask an operational error as if the
+                # store didn't exist at all.
+                return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
 
     # Neo4j backend
     if hasattr(graph, "run_cypher"):

@@ -24,6 +24,7 @@
 """
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from opencrab.stores._embedding_utils import EMBEDDING_FUNCTION_NAME, l2_normalize
@@ -42,7 +43,7 @@ class LlamaCppEmbeddingFunction:
     ----------
     gguf_path : str
         KURE-v1 Q8_0 GGUF 파일 경로.
-        예: "/home/asdf/models/KURE-v1-Q8_0.gguf"
+        예: "~/.cache/localcrab/models/KURE-v1-Q8_0.gguf"
     dim : int
         임베딩 차원. KURE = 1024. LM Studio 측과 동일해야 함.
     n_threads : int
@@ -132,7 +133,15 @@ class LlamaCppEmbeddingFunction:
 # GGUF 자동 다운로드
 # ---------------------------------------------------------------------------
 
-_DEFAULT_GGUF_DIR = "/home/asdf/models"
+def _default_gguf_dir() -> str:
+    """LOCAL_GGUF_PATH 미설정 시 기본 다운로드 디렉터리: 실행 사용자 홈 하위.
+
+    호출 시점마다 평가(모듈 임포트 시 고정 아님)해 HOME 변경(테스트의
+    monkeypatch 등)이 다음 호출부터 즉시 반영되도록 한다.
+    """
+    return str(Path.home() / ".cache" / "localcrab" / "models")
+
+
 _HF_REPO = "mykor/KURE-v1-gguf"
 _HF_FILENAME = "KURE-v1-Q8_0.gguf"
 # Q8_0 선택 이유(품질 우선): primary(GPU)와 거의 동일한 검색 품질 유지
@@ -161,7 +170,8 @@ def _ensure_local_gguf(requested_path: str) -> str:
     """
     import os
 
-    default_path = os.path.join(_DEFAULT_GGUF_DIR, _HF_FILENAME)
+    gguf_dir = _default_gguf_dir()
+    default_path = os.path.join(gguf_dir, _HF_FILENAME)
     target = requested_path if requested_path else default_path
 
     if os.path.exists(target):
@@ -172,7 +182,7 @@ def _ensure_local_gguf(requested_path: str) -> str:
         "  HuggingFace(%s)에서 자동 다운로드를 시도합니다...\n"
         "  수동 다운로드: huggingface-cli download %s %s --local-dir %s\n"
         "  또는 환경변수 LOCAL_GGUF_PATH 에 기존 GGUF 경로를 지정하세요.",
-        target, _HF_REPO, _HF_REPO, _HF_FILENAME, _DEFAULT_GGUF_DIR,
+        target, _HF_REPO, _HF_REPO, _HF_FILENAME, gguf_dir,
     )
 
     try:
@@ -182,15 +192,15 @@ def _ensure_local_gguf(requested_path: str) -> str:
             f"KURE GGUF 자동 다운로드 실패: huggingface_hub 미설치.\n"
             f"  pip install huggingface_hub 후 재시도하거나\n"
             f"  huggingface-cli download {_HF_REPO} {_HF_FILENAME} "
-            f"--local-dir {_DEFAULT_GGUF_DIR} 로 수동 다운로드하세요."
+            f"--local-dir {gguf_dir} 로 수동 다운로드하세요."
         ) from exc
 
     try:
-        os.makedirs(os.path.dirname(target) or _DEFAULT_GGUF_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(target) or gguf_dir, exist_ok=True)
         downloaded = hf_hub_download(
             repo_id=_HF_REPO,
             filename=_HF_FILENAME,
-            local_dir=os.path.dirname(target) or _DEFAULT_GGUF_DIR,
+            local_dir=os.path.dirname(target) or gguf_dir,
         )
         # hf_hub_download 가 다른 이름으로 저장할 수 있으므로 확인
         final = downloaded if os.path.exists(downloaded) else target
@@ -201,6 +211,6 @@ def _ensure_local_gguf(requested_path: str) -> str:
             f"KURE GGUF 자동 다운로드 실패: {exc}\n"
             f"  수동 다운로드:\n"
             f"    huggingface-cli download {_HF_REPO} {_HF_FILENAME} "
-            f"--local-dir {_DEFAULT_GGUF_DIR}\n"
+            f"--local-dir {gguf_dir}\n"
             f"  또는 LOCAL_GGUF_PATH 환경변수에 기존 경로를 지정하세요."
         ) from exc
