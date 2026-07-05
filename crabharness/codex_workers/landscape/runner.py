@@ -12,7 +12,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
-
 ROOT_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_DIR = ROOT_DIR / "_workspace"
 OUTPUT_PATH = WORKSPACE_DIR / "landscape-ai-usecases.json"

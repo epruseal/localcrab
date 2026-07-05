@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from _vec_helpers import MockEF, build_vector_store
 
 DIM = 32  # divisible by 8 (bit packing requirement)

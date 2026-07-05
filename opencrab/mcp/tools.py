@@ -42,7 +42,6 @@ import fcntl
 import hashlib
 import logging
 import os
-import re
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any

@@ -15,10 +15,9 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -103,6 +102,7 @@ def chroma_store(tmp_path):
 def sqlite_vec_store(tmp_path):
     pytest.importorskip("sqlite_vec")
     from _vec_helpers import MockEF
+
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
     s = SqliteVecStore(
@@ -125,6 +125,7 @@ def pg_vector_store(tmp_path):
     pytest.importorskip("sqlalchemy")
     pytest.importorskip("psycopg2")
     from _vec_helpers import MockEF
+
     from opencrab.stores.pg_vector_store import PgVectorStore
 
     dsn = os.environ.get("OPENCRAB_PG_TEST_URL")

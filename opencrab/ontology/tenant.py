@@ -20,7 +20,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -42,7 +42,7 @@ class TenantContext:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TenantContext":
+    def from_dict(cls, data: dict[str, Any]) -> TenantContext:
         return cls(
             tenant_id=data.get("tenant_id", "default"),
             subject_id=data.get("subject_id"),
@@ -50,7 +50,7 @@ class TenantContext:
         )
 
     @classmethod
-    def default(cls) -> "TenantContext":
+    def default(cls) -> TenantContext:
         return cls(tenant_id="default")
 
 

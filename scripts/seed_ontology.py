@@ -184,14 +184,8 @@ def seed() -> None:
 
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
-    from opencrab.ontology.impact import ImpactEngine
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
-    from opencrab.stores.chroma_store import ChromaStore
-    from opencrab.stores.mongo_store import MongoStore
-    from opencrab.stores.neo4j_store import Neo4jStore
-    from opencrab.stores.sql_store import SQLStore
-
     from opencrab.stores.factory import (
         make_doc_store,
         make_graph_store,
@@ -283,7 +277,7 @@ def seed() -> None:
     ingest_ok = 0
     for text, source_id, meta in INGEST_TEXTS:
         try:
-            result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+            hybrid.ingest(text=text, source_id=source_id, metadata=meta)
             if mongo.available:
                 mongo.upsert_source(source_id, text, meta)
             ingest_ok += 1

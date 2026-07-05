@@ -15,8 +15,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -29,19 +27,18 @@ from apps.api.main import (  # noqa: E402
     _safe_count,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
 
 
-class _FakeExecutionTimeout(Exception):
+class _FakeExecutionTimeoutError(Exception):
     """Imitates pymongo.errors.ExecutionTimeout by class name."""
 
     pass
 
 
-_FakeExecutionTimeout.__name__ = "ExecutionTimeout"
+_FakeExecutionTimeoutError.__name__ = "ExecutionTimeout"
 
 
 class _FakeCollection:
@@ -107,7 +104,7 @@ def test_count_user_nodes_unavailable():
 
 def test_count_user_nodes_timeout():
     docs = _FakeMongoDocs(
-        {"nodes": _FakeCollection(match_count=None, raises=_FakeExecutionTimeout("too slow"))}
+        {"nodes": _FakeCollection(match_count=None, raises=_FakeExecutionTimeoutError("too slow"))}
     )
     result = _count_user_nodes(docs, "u1")
     assert result.status == "timeout"
@@ -175,7 +172,7 @@ def test_count_user_sources_top_level_or_nested_iter():
 
 def test_count_user_sources_timeout():
     docs = _FakeMongoDocs(
-        {"sources": _FakeCollection(match_count=None, raises=_FakeExecutionTimeout("slow"))}
+        {"sources": _FakeCollection(match_count=None, raises=_FakeExecutionTimeoutError("slow"))}
     )
     result = _count_user_sources(docs, "u1")
     assert result.status == "timeout"
@@ -219,7 +216,7 @@ def test_safe_count_exception_classified_as_error():
 
 def test_safe_count_timeout_classified():
     def slow() -> int:
-        raise _FakeExecutionTimeout("deadline")
+        raise _FakeExecutionTimeoutError("deadline")
 
     result = _safe_count(slow)
     assert result.status == "timeout"

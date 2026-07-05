@@ -8,6 +8,7 @@ and English OCR path without requiring system Tesseract packages.
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from opencrab.common.hashing import file_sha256
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -103,7 +106,7 @@ def _run_easyocr(path: Path, lang: str) -> OcrResult | None:
             try:
                 confidences.append(float(confidence))
             except Exception:
-                pass
+                logger.debug("easyocr confidence parse failed for value %r", confidence, exc_info=True)
             boxes.append({"box": box, "text": text, "confidence": confidence})
         joined = "\n".join(texts).strip()
         confidence = round(sum(confidences) / len(confidences), 4) if confidences else None

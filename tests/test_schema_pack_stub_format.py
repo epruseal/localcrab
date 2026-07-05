@@ -10,8 +10,8 @@ properties` schemas that the validator actually enforces.
 
 from __future__ import annotations
 
-import yaml
 import pytest
+import yaml
 
 from opencrab.grammar.validator import validate_node_properties
 from opencrab.schemas import loader as schema_loader

@@ -9,7 +9,8 @@ from typing import Any
 # Canonical id/serialisation helpers live in opencrab.common.ids now; these
 # aliases keep the historical module-private names (and their importers) working
 # with byte-identical output.
-from opencrab.common.ids import canonical_json as _stable_json, stable_id as _sha_id
+from opencrab.common.ids import canonical_json as _stable_json
+from opencrab.common.ids import stable_id as _sha_id
 
 
 def _clean_props(value: Any, *, copy: bool = False) -> dict[str, Any]:
@@ -225,8 +226,8 @@ def export_neo4j_opencrab_ingest(
     # status="ok"로 거짓 성공 보고를 한다. 이를 방지하기 위해 LocalGraphStore 전용
     # export_nodes() / export_edges() 메서드(SQLite 네이티브 JOIN 쿼리)로 분기한다.
     # Neo4j 모드에서는 기존 Cypher 경로를 그대로 사용한다.
-    from opencrab.stores.local_graph_store import LocalGraphStore
     from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+    from opencrab.stores.local_graph_store import LocalGraphStore
     if isinstance(neo4j_store, (LocalGraphStore, KuzuGraphStore)):
         node_rows = neo4j_store.export_nodes(pack_id, node_limit)
         edge_rows = neo4j_store.export_edges(pack_id, edge_limit)

@@ -7,11 +7,7 @@ LocalSQLDocStore 미구현 시 해당 테스트는 skip 처리.
 
 from __future__ import annotations
 
-import json
-import os
 import sys
-import types
-from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -25,8 +21,7 @@ import pytest
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-import migrate_to_local as mig
-
+import migrate_to_local as mig  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -391,7 +386,7 @@ class TestBackupLocalData:
         chroma_dir.mkdir()
         (chroma_dir / "index.bin").write_text("vec")
 
-        backed_up = mig.backup_local_data(str(tmp_path))
+        mig.backup_local_data(str(tmp_path))
 
         # graph.db 백업 확인
         bak_files = list(tmp_path.glob("graph.db.bak.*"))
@@ -415,7 +410,7 @@ class TestBackupLocalData:
         graph_db = tmp_path / "graph.db"
         graph_db.write_text("x")
 
-        backed_up = mig.backup_local_data(str(tmp_path))
+        mig.backup_local_data(str(tmp_path))
         bak_files = list(tmp_path.glob("graph.db.bak.*"))
         assert len(bak_files) == 1
         # 타임스탬프 형식: YYYYMMDD_HHMMSS
@@ -565,6 +560,7 @@ class TestMigrateSQL:
     def test_migrate_sql_inserts_rows(self, tmp_path: Path) -> None:
         """PostgreSQL 테이블 데이터를 SQLite로 복사한다."""
         import logging
+
         import sqlalchemy
 
         src_engine = self._make_src_engine(tmp_path)
@@ -583,7 +579,8 @@ class TestMigrateSQL:
             )
 
         # ontology_nodes 에 최소 1개 이상 삽입됐는지 확인
-        from sqlalchemy import create_engine as ce, text as t
+        from sqlalchemy import create_engine as ce
+        from sqlalchemy import text as t
         eng = ce(f"sqlite:///{dst_path}")
         with eng.connect() as conn:
             row = conn.execute(t("SELECT COUNT(*) FROM ontology_nodes")).fetchone()
@@ -596,6 +593,7 @@ class TestMigrateSQL:
     def test_migrate_sql_duplicate_rows_not_counted(self, tmp_path: Path) -> None:
         """중복 행은 count에 포함되지 않아야 한다 (INSERT OR IGNORE + rowcount)."""
         import logging
+
         import sqlalchemy
 
         src_engine = self._make_src_engine(tmp_path)

@@ -18,7 +18,6 @@ RRF constant k=60 (standard, prevents high-rank docs dominating).
 from __future__ import annotations
 
 import logging
-import math
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -142,7 +141,6 @@ def _bm25_cross_score(query_tokens: list[str], doc_tokens: list[str], avgdl: flo
         return 0.0
     dl = len(doc_tokens)
     tf_map = Counter(doc_tokens)
-    n = 1  # single doc, IDF degenerates; use tf-based saturation only
     score = 0.0
     for term in query_tokens:
         tf = tf_map.get(term, 0)

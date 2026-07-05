@@ -10,7 +10,7 @@ flags so each worker keeps its exact original behaviour.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from crabharness.models import ArtifactBundle, MissionSpec, ValidationIssue, ValidationReport
 from crabharness.semantic import determine_autoresearch_verdict, score_bundle_semantically

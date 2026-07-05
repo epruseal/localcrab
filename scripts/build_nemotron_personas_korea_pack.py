@@ -11,7 +11,6 @@ import hashlib
 import json
 import shutil
 import sqlite3
-import sys
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path

@@ -362,14 +362,14 @@ def test_normalise_edge_missing_keys_difference():
 # 결정성 보장을 위해 monkeypatch 로 ANTHROPIC_API_KEY 를 제거한다.
 # ===========================================================================
 
+from codex_workers.github_trending.adapter import validate_bundle as gh_validate  # noqa: E402
+from codex_workers.landscape.adapter import validate_bundle as ls_validate  # noqa: E402
+from codex_workers.soeak.adapter import validate_soeak_bundle as so_validate  # noqa: E402
 from crabharness.models import (  # noqa: E402
     ArtifactBundle,
     MissionSpec,
     MissionSuccessCriteria,
 )
-from codex_workers.github_trending.adapter import validate_bundle as gh_validate  # noqa: E402
-from codex_workers.landscape.adapter import validate_bundle as ls_validate  # noqa: E402
-from codex_workers.soeak.adapter import validate_soeak_bundle as so_validate  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -731,11 +731,10 @@ def test_import_script_driver_args(tmp_path):
 
 def test_migrate_preflight_neo4j_driver_args():
     import chromadb
+    import migrate_to_local as mig  # scripts/ 는 test_migrate_to_local 가 sys.path 추가
     import neo4j
     import pymongo
     import sqlalchemy
-
-    import migrate_to_local as mig  # scripts/ 는 test_migrate_to_local 가 sys.path 추가
 
     capture: dict = {}
 

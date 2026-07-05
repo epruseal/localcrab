@@ -276,7 +276,7 @@ class HybridQuery:
         counter, and re-runs if a new invalidation arrived during a build so the
         final index always reflects the last write.
         """
-        BM25Index = _get_bm25()
+        BM25Index = _get_bm25()  # noqa: N806
         from opencrab.ontology.bm25 import compute_fingerprint
 
         while not self._bm25_stop.is_set():
@@ -488,7 +488,7 @@ class HybridQuery:
         schedule a background rebuild and keep serving the current index.
         """
         try:
-            BM25Index = _get_bm25()
+            BM25Index = _get_bm25()  # noqa: N806
 
             if self._bm25_cache is None:
                 # Cold start: nothing to serve yet, so build synchronously once.
@@ -807,8 +807,8 @@ class HybridQuery:
 
         # --- 로컬 모드: LocalGraphStore는 run_cypher()가 no-op이므로
         #     export_nodes() + Python-side 키워드 필터로 대체한다.
-        from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
         from opencrab.stores.kuzu_graph_store import KuzuGraphStore  # noqa: PLC0415
+        from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
         if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore)):
             kw_lower = keyword.lower()
             search_fields = ["name", "description", "text", "title", "label", "summary"]

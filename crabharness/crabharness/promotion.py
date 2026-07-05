@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from hashlib import sha1
 
-from .models import ArtifactBundle, MissionSpec, PromotionEdge, PromotionNode, PromotionPackage, ValidationReport
+from .models import (
+    ArtifactBundle,
+    MissionSpec,
+    PromotionEdge,
+    PromotionNode,
+    PromotionPackage,
+    ValidationReport,
+)
 
 
 def build_promotion_package(

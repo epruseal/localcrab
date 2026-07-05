@@ -3,6 +3,7 @@ LocalGraphStore 확장 메서드 테스트.
 run_cypher() no-op을 대체하는 SQLite 네이티브 메서드들의 동작 검증.
 """
 import pytest
+
 from opencrab.stores.local_graph_store import LocalGraphStore
 
 

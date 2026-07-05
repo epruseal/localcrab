@@ -25,7 +25,6 @@ from opencrab.grammar.manifest import (
     space_for_node_type,
 )
 from opencrab.grammar.validator import (
-    ValidationResult,
     describe_grammar,
     get_allowed_relations,
     validate_edge,
@@ -33,7 +32,6 @@ from opencrab.grammar.validator import (
     validate_node,
     validate_rebac_permission,
 )
-
 
 # ---------------------------------------------------------------------------
 # Manifest tests

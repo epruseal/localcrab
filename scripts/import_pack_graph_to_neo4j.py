@@ -12,8 +12,9 @@ import argparse
 import json
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from neo4j import GraphDatabase
 

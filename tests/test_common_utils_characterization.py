@@ -32,6 +32,7 @@ import importlib.util
 import re
 import sys
 import types
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -122,12 +123,12 @@ def test_now_iso_all_five_share_one_format():
     for label, value in values.items():
         assert _AWARE_ISO_RE.match(value), f"{label}: {value!r}"
     # Every value parses back to an aware datetime at +00:00.
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     for label, value in values.items():
         parsed = datetime.fromisoformat(value)
         assert parsed.tzinfo is not None, label
-        assert parsed.utcoffset() == timezone.utc.utcoffset(None), label
+        assert parsed.utcoffset() == UTC.utcoffset(None), label
 
 
 def test_dedupe_timestamp_is_aware_offset_format():
@@ -139,7 +140,7 @@ def test_dedupe_timestamp_is_aware_offset_format():
     the one-liner instead of importing ``opencrab.common.timefmt`` — but the
     output must be byte-format-identical to it. This test is the drift guard.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from crabharness.dedupe import _now_iso
 
@@ -150,7 +151,7 @@ def test_dedupe_timestamp_is_aware_offset_format():
     assert not _NAIVE_Z_ISO_RE.match(value)
     parsed = datetime.fromisoformat(value)
     assert parsed.tzinfo is not None
-    assert parsed.utcoffset() == timezone.utc.utcoffset(None)
+    assert parsed.utcoffset() == UTC.utcoffset(None)
 
 
 def test_dedupe_mark_seen_writes_aware_timestamps(tmp_path):
@@ -646,8 +647,10 @@ def test_parse_props_both_impls_agree(parse_impls):
 def test_embedding_function_name_constant_matches():
     """The shared ``EMBEDDING_FUNCTION_NAME`` constant is "kure_v1" and is
     re-exported into both embedding modules' namespaces via import."""
-    from opencrab.stores.llamacpp_embedding import EMBEDDING_FUNCTION_NAME as llama_name
-    from opencrab.stores.openai_embedding import EMBEDDING_FUNCTION_NAME as oai_name
+    from opencrab.stores.llamacpp_embedding import (
+        EMBEDDING_FUNCTION_NAME as llama_name,  # noqa: N811
+    )
+    from opencrab.stores.openai_embedding import EMBEDDING_FUNCTION_NAME as oai_name  # noqa: N811
 
     assert oai_name == "kure_v1"
     assert llama_name == "kure_v1"

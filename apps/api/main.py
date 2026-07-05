@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,9 +9,8 @@ from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -23,10 +21,15 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
 from opencrab.ontology.builder import OntologyBuilder
-from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
-from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store, make_vector_store
+from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
+from opencrab.stores.factory import (
+    make_doc_store,
+    make_graph_store,
+    make_sql_store,
+    make_vector_store,
+)
 
 logger = logging.getLogger("opencrab.api")
 if not logging.getLogger().handlers:

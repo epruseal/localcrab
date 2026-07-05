@@ -148,8 +148,6 @@ class ReBACEngine:
         if not valid_relations:
             return None
 
-        rel_filter = "|".join(valid_relations)
-
         # Direct check — find_neighbors() is implemented by all store backends
         try:
             neighbors = self._neo4j.find_neighbors(

@@ -8,7 +8,7 @@ and validation is skipped (schema-optional pattern).
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,7 @@ import yaml
 SCHEMAS_DIR = Path(__file__).parent / "types"
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_type_schema(node_type: str) -> dict[str, Any] | None:
     """
     Load the YAML schema for *node_type* from schemas/types/<node_type>.yaml.

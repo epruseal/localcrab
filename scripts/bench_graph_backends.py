@@ -474,7 +474,7 @@ def print_consistency_table(scale: int, report: dict):
 
     if "cypher" in report:
         cy = report["cypher"]
-        print(f"  [B] Cypher 기능 결손:")
+        print("  [B] Cypher 기능 결손:")
         print(f"      SQLite run_cypher 작동: {cy['sqlite_cypher_works']}  "
               f"(keyword 결과: {cy['sqlite_keyword_search_results']}개)")
         print(f"      Neo4j run_cypher 작동: {cy['neo4j_cypher_works']}  "
@@ -608,7 +608,6 @@ def run_bench(
             if not speed_only:
                 # 정합성 측정용 적재 (per-op, as-used)
                 print("  [SQLite] 적재 중 (per-op)…")
-                t0 = time.perf_counter()
                 n_el, e_el, ok_n, ok_e = ingest_to_store(
                     sqlite_store, nodes, edges, node_type_map, batched=False
                 )
@@ -815,7 +814,7 @@ def print_recommendation(results: dict):
     print(f"    B. Cypher 기능: SQLite 결손={'있음 (keyword_search 등 항상 []' if cypher_broken_in_sqlite else '없음'}")
     print(f"    C. 엣지 타입:   불일치율 {edge_type_mismatch_rate:.1%}",
           "→ 정합 양호" if edge_type_mismatch_rate < 0.05 else "→ 불일치 주의 필요")
-    print(f"    D. 크로스 스토어: 양 모드 모두 best-effort(트랜잭션 없음) → 부분 기록 리스크 동일")
+    print("    D. 크로스 스토어: 양 모드 모두 best-effort(트랜잭션 없음) → 부분 기록 리스크 동일")
     print()
     print("  [속도 결론]")
     print(f"    인제스트: {'SQLite 우위' if sqlite_faster_ingest else 'Neo4j 우위 or 비슷'}"

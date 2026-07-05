@@ -90,7 +90,8 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from opencrab.stores.chroma_store import _sanitize_metadata
 

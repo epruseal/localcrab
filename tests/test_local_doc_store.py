@@ -26,8 +26,9 @@ def store(tmp_path):
 
 class TestInit:
     def test_init_creates_data_dir(self, tmp_path):
-        from opencrab.stores.local_doc_store import LocalDocStore
         import os
+
+        from opencrab.stores.local_doc_store import LocalDocStore
 
         data_dir = str(tmp_path / "mystore")
         LocalDocStore(data_dir)

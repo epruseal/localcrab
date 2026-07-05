@@ -9,7 +9,6 @@ equivalence test. Uses tmp_path only (no real data) and a deterministic MockEF
 from __future__ import annotations
 
 import pytest
-
 from _vec_helpers import MockEF, build_vector_store
 
 BACKENDS = ["chroma", "sqlite-vec", "pg"]
@@ -246,7 +245,6 @@ def _bruteforce_topk_filter(ef, corpus, query, k, predicate):
 
 
 def test_scale_over_4096_no_crash_and_pushdown_exact(tmp_path):
-    from _vec_helpers import MockEF
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
     ef = MockEF(32)
@@ -315,7 +313,6 @@ def test_residual_filter_recall_exact_within_cap(tmp_path):
     vec0's k cap. Regression guard for C1: the residual post-filter must scan up
     to _VEC0_K_MAX and must not silently drop matches that rank beyond a small
     inflate (the pre-fix code fetched only n_results*12 and returned []/short)."""
-    from _vec_helpers import MockEF
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
     ef = MockEF(32)
@@ -348,7 +345,6 @@ def test_add_texts_duplicate_id_raises(tmp_path):
     add_texts raises on a duplicate primary key (Chroma warns and skips)."""
     import sqlite3
 
-    from _vec_helpers import MockEF
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
     store = SqliteVecStore(

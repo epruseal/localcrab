@@ -166,7 +166,7 @@ def run(src_path: str, dst_path: str, dry_run: bool) -> None:
     n_kz = conn.execute("MATCH (n:OntologyNode) RETURN count(n)").get_next()[0]
     e_kz = conn.execute("MATCH ()-[r:OntologyEdge]->() RETURN count(r)").get_next()[0]
 
-    print(f"\n검증:")
+    print("\n검증:")
     print(f"  노드 SQLite={n_sq:,}  KùzuDB={n_kz:,}  {'✓' if n_kz == n_sq else '✗'}")
     print(f"  엣지 SQLite={e_sq:,}  KùzuDB={e_kz:,}  {'✓' if e_kz == e_sq else '✗'}")
 

@@ -152,28 +152,33 @@ class _FakeStoreOK:
 
 def _hybrid():
     from unittest.mock import MagicMock
+
     from opencrab.ontology.query import HybridQuery
     hq = HybridQuery(MagicMock(), MagicMock())
     return hq
 
 
 def test_fts_leg_unsupported_backend_fallback():
-    hq = _hybrid(); hq._doc_store = _FakeStoreNoKeyword()
+    hq = _hybrid()
+    hq._doc_store = _FakeStoreNoKeyword()
     assert hq._fts_search("q", None, 10) == []   # 폴백, 크래시 없음
 
 
 def test_fts_leg_backend_error_graceful():
-    hq = _hybrid(); hq._doc_store = _FakeStoreRaises()
+    hq = _hybrid()
+    hq._doc_store = _FakeStoreRaises()
     assert hq._fts_search("q", None, 10) == []   # 예외 흡수
 
 
 def test_fts_leg_ok_returns_keyword_source():
-    hq = _hybrid(); hq._doc_store = _FakeStoreOK()
+    hq = _hybrid()
+    hq._doc_store = _FakeStoreOK()
     out = hq._fts_search("JASO M345", None, 10)
     assert out and out[0].get("source") == "keyword"
     assert out[0]["metadata"]["pack_id"] == "oil-standards-auto-moto"
 
 
 def test_fts_leg_no_doc_store():
-    hq = _hybrid(); hq._doc_store = None
+    hq = _hybrid()
+    hq._doc_store = None
     assert hq._fts_search("q", None, 10) == []

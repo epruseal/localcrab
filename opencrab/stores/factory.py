@@ -88,8 +88,8 @@ def _make_kure_embedding_function(settings: Settings) -> Any:
     local_gguf_path 가 비어있으면 llamacpp_embedding._ensure_local_gguf() 가
     KURE-v1-Q8_0 을 자동 다운로드. 모든 원격이 장애일 때 폴백으로 사용됨.
     """
-    from opencrab.stores.openai_embedding import OpenAIEmbeddingFunction
     from opencrab.stores.llamacpp_embedding import LlamaCppEmbeddingFunction
+    from opencrab.stores.openai_embedding import OpenAIEmbeddingFunction
     from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
 
     primary_efs = [

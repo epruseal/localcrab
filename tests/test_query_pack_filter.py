@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from opencrab.ontology.query import HybridQuery, _build_chroma_where
-
 
 # ---------------------------------------------------------------------------
 # T3 — _build_chroma_where four cases

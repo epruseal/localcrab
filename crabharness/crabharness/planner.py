@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from .models import DelegationJob, MissionSpec, WorkerCapability
 from .registry import list_workers
