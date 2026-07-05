@@ -18,6 +18,7 @@ from opencrab.stores._sql_dialect import (
     POSTGRES,
     SQLITE,
     Column,
+    IndexSpec,
     SchemaSpec,
     TableSpec,
 )
@@ -44,6 +45,14 @@ def test_bind_value_for_timestamp():
 def test_json_get_per_dialect():
     assert SQLITE.json_get("properties", "pack_id") == "json_extract(properties, '$.pack_id')"
     assert POSTGRES.json_get("properties", "pack_id") == "properties->>'pack_id'"
+
+
+def test_json_index_expr_per_dialect():
+    """PG needs an extra paren wrap for a functional index over an operator
+    expression (``->>``); SQLite's json_extract() is already a function call
+    so no extra wrap is needed — see _sql_graph_base.py's idx_nodes_pack."""
+    assert SQLITE.json_index_expr("properties", "pack_id") == "json_extract(properties, '$.pack_id')"
+    assert POSTGRES.json_index_expr("properties", "pack_id") == "(properties->>'pack_id')"
 
 
 # ---------------------------------------------------------------------------
@@ -268,3 +277,25 @@ def test_empty_json_columns_no_cast_postgres():
 def test_dialect_is_frozen():
     with pytest.raises(Exception):
         SQLITE.name = "postgres"  # type: ignore[misc]
+
+
+def test_render_ddl_json_key_index():
+    """IndexSpec.json_key renders via json_index_expr instead of a static
+    ``expr`` string (Stage 6b addition for graph-store's idx_nodes_pack)."""
+    spec = SchemaSpec(
+        tables=(
+            TableSpec(
+                name="t",
+                columns=(Column("id", "text"), Column("properties", "json", default="{}")),
+                primary_key=("id",),
+            ),
+        ),
+        indexes=(IndexSpec("idx_t_pack", "t", json_key=("properties", "pack_id")),),
+    )
+    sqlite_stmts = SQLITE.render_ddl(spec)
+    idx_sqlite = next(s for s in sqlite_stmts if "idx_t_pack" in s)
+    assert idx_sqlite == "CREATE INDEX IF NOT EXISTS idx_t_pack ON t(json_extract(properties, '$.pack_id'))"
+
+    pg_stmts = POSTGRES.render_ddl(spec, schema_name="s1")
+    idx_pg = next(s for s in pg_stmts if "idx_t_pack" in s)
+    assert idx_pg == 'CREATE INDEX IF NOT EXISTS idx_t_pack ON "s1".t((properties->>\'pack_id\'))'

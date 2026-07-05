@@ -67,7 +67,14 @@ class TableSpec:
 class IndexSpec:
     name: str
     table: str
-    expr: str  # e.g. "updated_at" or "timestamp DESC"
+    expr: str = ""  # e.g. "updated_at" or "timestamp DESC"
+    json_key: tuple[str, str] | None = None
+    """(column, key) for a JSON-field expression index (e.g. graph-store's
+    idx_nodes_pack on properties->>'pack_id'). Mutually exclusive with
+    ``expr`` — when set, ``SqlDialect.render_ddl`` computes the per-dialect
+    expression via ``json_index_expr`` instead of using ``expr`` verbatim,
+    since a JSON-key extraction is not renderable as one dialect-neutral
+    string (see ``SqlDialect.json_get`` / ``json_index_expr``)."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,19 @@ class SqlDialect:
         if self.name == "sqlite":
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"
+
+    def json_index_expr(self, col: str, key: str) -> str:
+        """``json_get`` wrapped for use as a functional-index expression.
+
+        PostgreSQL requires an extra pair of parens around an *operator*
+        expression (``->>``) used in ``CREATE INDEX ... (expr)`` — a bare
+        function call (SQLite's ``json_extract(...)``) needs none. Matches
+        pg_graph_store.py's ``idx_nodes_pack ON graph_nodes((properties->>
+        'pack_id'))`` vs local_graph_store.py's ``idx_nodes_pack ON
+        graph_nodes(json_extract(properties, '$.pack_id'))`` verbatim.
+        """
+        expr = self.json_get(col, key)
+        return f"({expr})" if self.name == "postgres" else expr
 
     # ------------------------------------------------------------------
     # INSERT / UPSERT
@@ -213,8 +233,9 @@ class SqlDialect:
             stmts.append(f"CREATE TABLE IF NOT EXISTS {prefix}{table.name} (\n        {body}\n    )")
             for idx in schema.indexes:
                 if idx.table == table.name:
+                    expr = self.json_index_expr(*idx.json_key) if idx.json_key else idx.expr
                     stmts.append(
-                        f"CREATE INDEX IF NOT EXISTS {idx.name} ON {prefix}{idx.table}({idx.expr})"
+                        f"CREATE INDEX IF NOT EXISTS {idx.name} ON {prefix}{idx.table}({expr})"
                     )
         return stmts
 

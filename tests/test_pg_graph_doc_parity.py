@@ -561,6 +561,32 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in node
             assert node["shared"] == "new"
 
+    def test_edge_upsert_conflict_overwrites_not_merges(self, graph_pair):
+        """Second upsert_edge() on the same (from_type, from_id, relation,
+        to_type, to_id) key replaces the properties column wholesale — a key
+        present only in the first write must NOT survive the second, on
+        either backend."""
+        local, pg = graph_pair
+        for store in (local, pg):
+            store.upsert_edge(
+                "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
+                {"first_only": "x", "shared": "old"},
+            )
+            store.upsert_edge(
+                "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
+                {"shared": "new"},
+            )
+        for store in (local, pg):
+            edges = [
+                e for e in store.export_edges()
+                if e["relation"] == "edgeprobe"
+                and e["source_props"].get("id") == "packA_n0"
+                and e["target_props"].get("id") == "packA_n1"
+            ]
+            assert len(edges) == 1  # no duplicate edge row from the second upsert
+            assert "first_only" not in edges[0]["rel_props"]
+            assert edges[0]["rel_props"]["shared"] == "new"
+
     def test_find_neighbors_empty_pack_ids_equals_none(self, graph_pair):
         """``pack_ids=[]`` (empty list) must behave identically to
         ``pack_ids=None`` on both backends — both are falsy in Python, so the
@@ -659,17 +685,23 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in src["metadata"]
             assert src["metadata"]["shared"] == "new"
 
-    def test_list_packs_pack_id_type_divergence_int_vs_str(self, tmp_path, pg_engine):
-        """DOCUMENTED DIVERGENCE (판단 보류, not fixed — pack_id is
-        conventionally always a string everywhere else in the app; this test
-        makes the underlying SQL-level type coercion explicit rather than
-        leaving it as a latent surprise). ``list_packs()`` projects pack_id
-        via a raw JSON field extraction: SQLite's ``json_extract()``
-        preserves the stored JSON scalar type (an int-valued pack_id
-        round-trips as a Python ``int``), while Postgres's ``->>`` operator
-        always coerces to ``text`` (the same pack_id round-trips as ``str``).
-        A caller comparing ``list_packs()[i]['pack_id']`` across backends
-        without normalizing via ``str()`` first will observe this."""
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Stage 6b Deliverable 2 (user-approved: unify pack_id to str). "
+            "The str-coercion now lives in _sql_graph_base.py's list_packs() "
+            "(inherited by any adopter), but LocalGraphStore/PGGraphStore are "
+            "not yet wired onto that base (F3/F4 follow-up) — until then, "
+            "LocalGraphStore's own list_packs() still returns pack_id as the "
+            "native JSON scalar type (int here), so this positive contract "
+            "is RED-pending-F3."
+        ),
+    )
+    def test_list_packs_pack_id_is_str_on_both_backends(self, tmp_path, pg_engine):
+        """Positive contract (supersedes the former
+        test_list_packs_pack_id_type_divergence_int_vs_str, which merely
+        documented the split): pack_id must be ``str`` on BOTH backends,
+        even when the stored JSON value is a native int."""
         schema = f"t{uuid.uuid4().hex[:12]}_ipk"
         local = LocalGraphStore(str(tmp_path / "intpack.db"))
         pg = PGGraphStore(pg_engine, schema=schema)
@@ -679,8 +711,9 @@ class TestTypedPropertiesAndNullSemantics:
                 store.upsert_node("Item", "ipk_n2", {"pack_id": 42})
             local_pid = local.list_packs()[0]["pack_id"]
             pg_pid = pg.list_packs()[0]["pack_id"]
-            assert isinstance(local_pid, int) and local_pid == 42
+            assert isinstance(local_pid, str) and local_pid == "42"
             assert isinstance(pg_pid, str) and pg_pid == "42"
+            assert local_pid == pg_pid
         finally:
             local.close()
             with pg_engine.begin() as conn:
