@@ -8,27 +8,34 @@ from opencrab.pack import export_neo4j_opencrab_ingest
 
 
 class FakeNeo4jStore:
+    """Stands in for a real Neo4jStore — export_nodes()/export_edges() are
+    the GraphStoreExtended methods export_neo4j_opencrab_ingest() now calls
+    directly (see opencrab/stores/_graph_protocol.py); this fake mirrors
+    their Cypher-native return shape rather than a run_cypher() call."""
+
     available = True
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str | None]]] = []
+        self.calls: list[tuple[str, str | None, int]] = []
 
-    def run_cypher(self, cypher: str, params: dict[str, str | None]):
-        self.calls.append((cypher, params))
-        if "MATCH (n)" in cypher:
-            return [
-                {
-                    "props": {
-                        "id": "node:fire-risk",
-                        "label": "내화성능 미달 위험",
-                        "space": "claim",
-                        "node_type": "Claim",
-                        "pack_id": "bench-pack",
-                        "evidence_refs": ["evidence:1"],
-                    },
-                    "labels": ["Claim"],
-                }
-            ]
+    def export_nodes(self, pack_id: str | None, limit: int):
+        self.calls.append(("export_nodes", pack_id, limit))
+        return [
+            {
+                "props": {
+                    "id": "node:fire-risk",
+                    "label": "내화성능 미달 위험",
+                    "space": "claim",
+                    "node_type": "Claim",
+                    "pack_id": "bench-pack",
+                    "evidence_refs": ["evidence:1"],
+                },
+                "labels": ["Claim"],
+            }
+        ]
+
+    def export_edges(self, pack_id: str | None, limit: int):
+        self.calls.append(("export_edges", pack_id, limit))
         return [
             {
                 "source_props": {"id": "node:material", "space": "concept", "node_type": "Entity"},

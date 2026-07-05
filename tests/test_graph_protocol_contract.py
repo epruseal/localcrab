@@ -1,23 +1,22 @@
 """
-R5 contract: pins that LocalGraphStore/PGGraphStore/KuzuGraphStore satisfy
-the ``GraphStore`` + ``GraphStoreExtended`` Protocols declared in
-opencrab/stores/_graph_protocol.py, and that Neo4jStore satisfies only the
-base ``GraphStore`` — the 7 extended methods are RED-first (xfail(strict))
-until D3 implements them on Neo4jStore.
+R5 contract: pins that LocalGraphStore/PGGraphStore/KuzuGraphStore/Neo4jStore
+all satisfy the ``GraphStore`` + ``GraphStoreExtended`` Protocols declared in
+opencrab/stores/_graph_protocol.py.
+
+Neo4jStore's 7 extended methods (get_node_by_id, list_packs,
+find_by_relations, export_nodes, export_edges, upsert_nodes_batch,
+upsert_edges_batch) were RED-first (xfail(strict)) until D3 implemented them
+— this file has since flipped green: the ``TestExtendedMethodsNeo4jPending``
+xfail class was replaced by ``TestExtendedMethodsNeo4jNormal`` /
+``...Error`` / ``...Edge`` below, which exercise the real Cypher each method
+builds against a mocked session.
 
 Neo4j is exercised via a mocked driver/session — no live Neo4j needed. The
-mock plumbing (``_make_connected_store``) is the same shape as
+mock plumbing (``_make_connected_neo4j``) is the same shape as
 tests/test_neo4j_helpers.py's ``_make_connected_store`` (that file's own
 docstring says it owns the mocked-session plumbing tests; this file only
-needs "does a connected Neo4jStore instance satisfy the Protocol", so the
-helper is duplicated locally rather than cross-imported).
-
-xfail(strict=True) is used for every "Neo4j should support extended method
-X" case: today those assertions fail (AttributeError / isinstance False),
-so xfail marks them as an *expected* failure and keeps this file green. Once
-D3 implements a method, its xfail case starts unexpectedly passing (XPASS),
-which strict=True turns into a hard failure — that failure is D3's signal to
-delete that one xfail marker.
+needs "does a connected Neo4jStore instance satisfy the Protocol / behave
+correctly", so the helper is duplicated locally rather than cross-imported).
 """
 
 from __future__ import annotations
@@ -30,11 +29,6 @@ import pytest
 
 from opencrab.stores._graph_protocol import GraphStore, GraphStoreExtended
 from opencrab.stores.neo4j_store import Neo4jStore
-
-NEO4J_XFAIL_REASON = (
-    "Neo4jStore does not implement this method yet — Stage 4 R5 worklist for D3. "
-    "Remove this xfail once D3 lands the implementation."
-)
 
 BACKENDS = ["local", "pg", "kuzu"]
 
@@ -131,8 +125,9 @@ class TestProtocolConformanceNormal:
         # Neo4jStore already implements all 13 base methods today.
         assert isinstance(neo4j_store, GraphStore)
 
-    @pytest.mark.xfail(strict=True, reason=NEO4J_XFAIL_REASON)
     def test_neo4j_satisfies_graph_store_extended(self, neo4j_store):
+        # D3 landed the 7 extended methods — Neo4jStore now satisfies the
+        # full GraphStoreExtended Protocol like the other three backends.
         assert isinstance(neo4j_store, GraphStoreExtended)
 
 
@@ -248,38 +243,220 @@ class TestExtendedMethodsNormal:
 
 
 # ---------------------------------------------------------------------------
-# Normal — Neo4j RED-first: extended methods expected to work once D3 lands
+# Normal — Neo4j's 7 newly-implemented extended methods (mocked session)
 # ---------------------------------------------------------------------------
 
 
-class TestExtendedMethodsNeo4jPending:
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_get_node_by_id(self, neo4j_store):
-        neo4j_store.get_node_by_id("x")
+class TestExtendedMethodsNeo4jNormal:
+    def test_get_node_by_id_returns_props_with_node_type(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = {
+            "props": {"id": "lv1", "name": "Lever One"},
+            "lbl": "Lever",
+        }
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_list_packs(self, neo4j_store):
-        neo4j_store.list_packs()
+        node = store.get_node_by_id("lv1")
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_find_by_relations(self, neo4j_store):
-        neo4j_store.find_by_relations("x", ["raises"])
+        assert node == {"id": "lv1", "name": "Lever One", "node_type": "Lever"}
+        cypher, kwargs = mock_session.run.call_args[0][0], mock_session.run.call_args[1]
+        assert "labels(n)[0]" in cypher
+        assert kwargs == {"id": "lv1"}
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_export_nodes(self, neo4j_store):
-        neo4j_store.export_nodes()
+    def test_list_packs_aggregates_by_pack_id(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = [
+            {"pack_id": "packA", "node_count": 3, "sample_title": "A"},
+            {"pack_id": "packB", "node_count": 1, "sample_title": ""},
+        ]
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_export_edges(self, neo4j_store):
-        neo4j_store.export_edges()
+        rows = store.list_packs(min_nodes=1)
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_upsert_nodes_batch(self, neo4j_store):
-        neo4j_store.upsert_nodes_batch([])
+        assert {r["pack_id"]: r["node_count"] for r in rows} == {"packA": 3, "packB": 1}
+        assert mock_session.run.call_args[1] == {"min_nodes": 1}
 
-    @pytest.mark.xfail(strict=True, raises=AttributeError, reason=NEO4J_XFAIL_REASON)
-    def test_upsert_edges_batch(self, neo4j_store):
-        neo4j_store.upsert_edges_batch([])
+    def test_find_by_relations_filters_to_requested_relation_types(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = [
+            {"props": {"id": "o1"}, "labels": ["Outcome"], "relation_type": "raises"}
+        ]
+
+        rows = store.find_by_relations("lv1", ["raises", "lowers"], "out", 20)
+
+        assert rows == [
+            {"properties": {"id": "o1"}, "labels": ["Outcome"], "relation_type": "raises"}
+        ]
+        cypher = mock_session.run.call_args[0][0]
+        assert "-[r:raises|lowers]->" in cypher
+        assert mock_session.run.call_args[1] == {"id": "lv1", "limit": 20}
+
+    def test_find_by_relations_in_direction_uses_incoming_arrow(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        store.find_by_relations("o1", ["raises"], "in", 20)
+
+        cypher = mock_session.run.call_args[0][0]
+        assert "<-[r:raises]-" in cypher
+
+    def test_export_nodes_filters_by_pack_id(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = [
+            {"props": {"id": "a0", "pack_id": "packA"}, "labels": ["Doc", "OpenCrabNode"]}
+        ]
+
+        rows = store.export_nodes(pack_id="packA")
+
+        assert rows == [
+            {"props": {"id": "a0", "pack_id": "packA"}, "labels": ["Doc", "OpenCrabNode"]}
+        ]
+        assert mock_session.run.call_args[1] == {"pack_id": "packA"}
+
+    def test_export_edges_filters_by_pack_id_on_endpoint(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = [
+            {
+                "source_props": {"id": "a0"},
+                "source_labels": ["Doc"],
+                "target_props": {"id": "a1"},
+                "target_labels": ["Doc"],
+                "rel_props": {},
+                "relation": "rel",
+            }
+        ]
+
+        rows = store.export_edges(pack_id="packA")
+
+        assert len(rows) == 1
+        assert rows[0]["source_props"]["id"] == "a0"
+        assert rows[0]["target_props"]["id"] == "a1"
+        assert rows[0]["relation"] == "rel"
+        assert mock_session.run.call_args[1] == {"pack_id": "packA"}
+
+    def test_upsert_nodes_batch_writes_all_and_returns_count(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+        mock_session.run.return_value.single.return_value = {"props": {"id": "n0"}}
+
+        nodes = [
+            {"node_type": "Doc", "node_id": f"n{i}", "properties": {"i": i}}
+            for i in range(3)
+        ]
+        count = store.upsert_nodes_batch(nodes)
+
+        assert count == 3
+        assert mock_session.run.call_count == 3
+
+    def test_upsert_edges_batch_writes_all_and_returns_count(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+        mock_session.run.return_value.single.return_value = {"r": "edge"}
+
+        edges = [
+            {
+                "from_type": "Doc", "from_id": f"n{i}", "relation": "next",
+                "to_type": "Doc", "to_id": f"n{i + 1}", "properties": {},
+            }
+            for i in range(2)
+        ]
+        count = store.upsert_edges_batch(edges)
+
+        assert count == 2
+        assert mock_session.run.call_count == 2
+
+    def test_upsert_edges_batch_counts_only_successful_upserts(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+        # First edge's MERGE finds/creates a record (success), second's
+        # MATCH on a missing endpoint returns no record (failure).
+        mock_session.run.return_value.single.side_effect = [{"r": "edge"}, None]
+
+        edges = [
+            {"from_type": "Doc", "from_id": "n0", "relation": "next", "to_type": "Doc", "to_id": "n1", "properties": {}},
+            {"from_type": "Doc", "from_id": "n1", "relation": "next", "to_type": "Doc", "to_id": "missing", "properties": {}},
+        ]
+        count = store.upsert_edges_batch(edges)
+
+        assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Error — Neo4j driver exceptions propagate through the new methods
+# ---------------------------------------------------------------------------
+
+
+class TestExtendedMethodsNeo4jError:
+    def test_get_node_by_id_driver_error_propagates(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.side_effect = RuntimeError("connection reset")
+
+        with pytest.raises(RuntimeError, match="connection reset"):
+            store.get_node_by_id("x")
+
+    def test_find_by_relations_driver_error_propagates(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.side_effect = RuntimeError("connection reset")
+
+        with pytest.raises(RuntimeError, match="connection reset"):
+            store.find_by_relations("x", ["raises"])
+
+    def test_export_nodes_driver_error_propagates(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.side_effect = RuntimeError("connection reset")
+
+        with pytest.raises(RuntimeError, match="connection reset"):
+            store.export_nodes()
+
+
+# ---------------------------------------------------------------------------
+# Edge — Neo4j: empty results, empty batches, not-found
+# ---------------------------------------------------------------------------
+
+
+class TestExtendedMethodsNeo4jEdge:
+    def test_get_node_by_id_not_found_returns_none(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = None
+
+        assert store.get_node_by_id("does-not-exist") is None
+
+    def test_list_packs_empty_store_returns_empty_list(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        assert store.list_packs() == []
+
+    def test_find_by_relations_empty_relations_returns_empty_list_without_query(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.find_by_relations("lv1", [], "out") == []
+        mock_session.run.assert_not_called()
+
+    def test_export_nodes_no_match_returns_empty_list(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        assert store.export_nodes(pack_id="does-not-exist") == []
+
+    def test_export_edges_no_match_returns_empty_list(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        assert store.export_edges(pack_id="does-not-exist") == []
+
+    def test_upsert_nodes_batch_empty_list_returns_zero(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.upsert_nodes_batch([]) == 0
+        mock_session.run.assert_not_called()
+
+    def test_upsert_edges_batch_empty_list_returns_zero(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.upsert_edges_batch([]) == 0
+        mock_session.run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
