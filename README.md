@@ -371,7 +371,7 @@ STORAGE_MODE=docker opencrab serve
 
 | 역할 | 백엔드 |
 |------|--------|
-| 그래프 | Neo4j (`NEO4J_URI`) |
+| 그래프 | Neo4j (`NEO4J_URI`, `NEO4J_DATABASE`) |
 | 문서 | MongoDB (`MONGODB_URI`) |
 | 벡터 | Chroma HTTP (`CHROMA_HOST:CHROMA_PORT`) |
 | SQL | PostgreSQL (`POSTGRES_URL`) |

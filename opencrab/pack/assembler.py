@@ -164,7 +164,7 @@ def assemble_pack_v1(
     title: str | None = None,
 ) -> dict[str, Any]:
     """Build an OpenCrab Pack v1 ZIP from a pack staging directory."""
-    if not _PACK_ID_RE.match(pack_id) or ".." in pack_id:
+    if not _PACK_ID_RE.fullmatch(pack_id) or ".." in pack_id:
         raise ValueError(f"invalid pack_id: {pack_id!r}")
     source = Path(source_dir).expanduser().resolve()
     if not source.exists():

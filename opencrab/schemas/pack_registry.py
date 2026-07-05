@@ -112,6 +112,8 @@ def install_pack(name: str) -> dict[str, Any]:
     if not pack:
         return {"error": f"Pack '{name}' not found. Available: {[p['name'] for p in list_packs()]}"}
 
+    import yaml
+
     _TYPES_DIR.mkdir(parents=True, exist_ok=True)
 
     created = []
@@ -122,8 +124,6 @@ def install_pack(name: str) -> dict[str, Any]:
         if path.exists():
             skipped.append(node_type)
             continue
-        import yaml
-
         header = _TYPE_TEMPLATE_HEADER.format(
             pack_name=pack["name"],
             pack_version=pack.get("version", "1.0.0"),
