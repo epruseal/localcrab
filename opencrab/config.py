@@ -7,10 +7,20 @@ All values can be overridden via environment variables or a .env file.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_local_data_dir() -> str:
+    """LOCAL_DATA_DIR 미설정 시 기본값: 실행 사용자 홈 하위 XDG 스타일 경로.
+
+    default_factory 로 인스턴스화 시점마다 평가되므로(모듈 임포트 시 고정 아님)
+    HOME 이 바뀌면(테스트의 monkeypatch 등) 다음 Settings() 호출부터 즉시 반영된다.
+    """
+    return str(Path.home() / ".local" / "share" / "localcrab")
 
 
 class Settings(BaseSettings):
@@ -37,7 +47,7 @@ class Settings(BaseSettings):
     storage_mode: Literal["local", "docker", "kuzu", "pg"] = Field(
         default="local", alias="STORAGE_MODE"
     )
-    local_data_dir: str = Field(default="/home/asdf/.openclaw/workspace/data/localcrab", alias="LOCAL_DATA_DIR")
+    local_data_dir: str = Field(default_factory=_default_local_data_dir, alias="LOCAL_DATA_DIR")
 
     # ------------------------------------------------------------------
     # Neo4j (docker mode only)

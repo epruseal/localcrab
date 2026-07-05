@@ -59,9 +59,15 @@ logger = logging.getLogger(__name__)
 _chroma_lock_fh = None
 
 
+def _lock_data_dir() -> str:
+    from opencrab.config import get_settings
+
+    return get_settings().local_data_dir
+
+
 def _acquire_chroma_shared_lock() -> None:
     global _chroma_lock_fh
-    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    data_dir = _lock_data_dir()
     lock_path = os.path.join(data_dir, "chroma.lock")
     _chroma_lock_fh = open(lock_path, "w")
     fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
@@ -92,7 +98,7 @@ WRITE_TOOLS = {
 @contextmanager
 def _write_lock():
     """Hold an exclusive cross-process lock for the duration of a write tool."""
-    data_dir = os.environ.get("LOCAL_DATA_DIR", "/home/asdf/.openclaw/workspace/data/localcrab")
+    data_dir = _lock_data_dir()
     lock_path = os.path.join(data_dir, "write.lock")
     fh = open(lock_path, "w")
     try:
@@ -1643,6 +1649,12 @@ def ontology_list_edges(
             return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
         except Exception as exc:
             logger.warning("export_edges failed: %s", exc)
+            if not hasattr(graph, "run_cypher"):
+                # No Neo4j fallback to try — report the real failure instead
+                # of falling through to the generic "unavailable" message,
+                # which would otherwise mask an operational error as if the
+                # store didn't exist at all.
+                return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
 
     # Neo4j backend
     if hasattr(graph, "run_cypher"):
