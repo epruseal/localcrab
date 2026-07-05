@@ -291,3 +291,63 @@ class TestOntologyListEdgesLocalBackend:
         assert result == {
             "edges": [], "total": 0, "error": "graph store unavailable", "pack_id_filter": None,
         }
+
+
+# ---------------------------------------------------------------------------
+# ontology_list_edges — Neo4j now implements export_edges() natively (R5),
+# so it returns the same wide shape as Local/PG/Kuzu instead of the old
+# narrow run_cypher fallback shape ({from_id,relation,to_id,props}).
+# ---------------------------------------------------------------------------
+
+
+class TestOntologyListEdgesNeo4jWideShapeContract:
+    def test_neo4j_like_backend_returns_wide_shape_not_narrow(self):
+        """Pins the contract: every backend's export_edges() (including
+        Neo4j's, added in R5) returns the wide shape
+        {source_props,source_labels,target_props,target_labels,rel_props,
+        relation} — ontology_list_edges must pass it through unchanged, never
+        the old narrow Neo4j-only {from_id,relation,to_id,props} shape."""
+        graph = MagicMock()
+        graph.export_edges.return_value = [
+            {
+                "source_props": {"id": "a0"}, "source_labels": ["Doc"],
+                "target_props": {"id": "a1"}, "target_labels": ["Doc"],
+                "rel_props": {"pack_id": "pack-a"}, "relation": "rel",
+            }
+        ]
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph}
+            result = ontology_list_edges(pack_id="pack-a")
+
+        assert result["total"] == 1
+        edge = result["edges"][0]
+        assert set(edge) == {
+            "source_props", "source_labels", "target_props", "target_labels",
+            "rel_props", "relation",
+        }
+        # pack_id/limit are forwarded verbatim to export_edges() — the
+        # backend (all four now) owns the a/b/r x pack_id/source/source_id
+        # filter widening, not this dispatch function.
+        graph.export_edges.assert_called_once_with(pack_id="pack-a", limit=200)
+        graph.run_cypher.assert_not_called()
+
+    def test_export_edges_exception_does_not_fall_back_to_run_cypher(self):
+        """Regression: before this fix, export_edges() raising fell through
+        to a run_cypher narrow-shape query whenever the backend also exposed
+        run_cypher (true of every real Neo4jStore) — silently returning a
+        DIFFERENT edge shape as if it were a success instead of surfacing
+        the real failure. Now that export_edges() is Neo4j's own native
+        method (not a Local/Kuzu-only capability), an exception from it is
+        always the real error — there is no more capability to fall back to."""
+        graph = MagicMock()
+        graph.export_edges.side_effect = RuntimeError("neo4j session closed")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph}
+            result = ontology_list_edges()
+
+        assert result == {
+            "edges": [], "total": 0, "error": "neo4j session closed", "pack_id_filter": None,
+        }
+        graph.run_cypher.assert_not_called()
