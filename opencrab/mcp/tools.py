@@ -1581,11 +1581,6 @@ def ontology_list_nodes(
     else:
         # Doc store fallback (no pack_id filter requested)
         nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
-        if pack_id:
-            nodes = [
-                n for n in nodes
-                if (n.get("properties") or {}).get("pack_id") == pack_id
-            ]
 
     return {
         "nodes": nodes,
@@ -1601,46 +1596,25 @@ def ontology_list_edges(
 ) -> dict[str, Any]:
     """List edges, optionally filtered by pack_id.
 
-    Local / Kuzu: uses export_edges(pack_id, limit).
-    Neo4j: falls back to pack_id-aware Cypher.
+    All four backends implement export_edges() natively (wide shape:
+    source_props/source_labels/target_props/target_labels/rel_props/relation
+    — see opencrab/stores/_graph_protocol.py). pack_id matches either
+    endpoint's pack_id/source/source_id, or the edge's own — the backend
+    owns that filter, not this function.
     """
     ctx = _get_context()
     graph = ctx["neo4j"]
     pack_id = _clean_str(pack_id) if pack_id else None
 
-    # Local / Kuzu backend
     if hasattr(graph, "export_edges"):
         try:
             edges = graph.export_edges(pack_id=pack_id, limit=limit)
             return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
         except Exception as exc:
+            # Report the real failure instead of falling through to the
+            # generic "unavailable" message, which would otherwise mask an
+            # operational error as if the store didn't exist at all.
             logger.warning("export_edges failed: %s", exc)
-            if not hasattr(graph, "run_cypher"):
-                # No Neo4j fallback to try — report the real failure instead
-                # of falling through to the generic "unavailable" message,
-                # which would otherwise mask an operational error as if the
-                # store didn't exist at all.
-                return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
-
-    # Neo4j backend
-    if hasattr(graph, "run_cypher"):
-        try:
-            if pack_id:
-                cypher = (
-                    "MATCH (a)-[r]->(b) WHERE r.pack_id = $pack_id "
-                    "RETURN a.id AS from_id, type(r) AS relation, b.id AS to_id, "
-                    "properties(r) AS props LIMIT $limit"
-                )
-                rows = graph.run_cypher(cypher, {"pack_id": pack_id, "limit": limit})
-            else:
-                cypher = (
-                    "MATCH (a)-[r]->(b) "
-                    "RETURN a.id AS from_id, type(r) AS relation, b.id AS to_id, "
-                    "properties(r) AS props LIMIT $limit"
-                )
-                rows = graph.run_cypher(cypher, {"limit": limit})
-            return {"edges": rows or [], "total": len(rows or []), "pack_id_filter": pack_id}
-        except Exception as exc:
             return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
 
     return {"edges": [], "total": 0, "error": "graph store unavailable", "pack_id_filter": pack_id}
