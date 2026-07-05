@@ -337,6 +337,7 @@ class KuzuGraphStore:
             raise RuntimeError("KuzuGraphStore is not available.")
         if not relations:
             return []
+        limit = int(limit)
 
         results: list[dict[str, Any]] = []
 

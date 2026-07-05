@@ -2,6 +2,8 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from opencrab.pack import assemble_pack_v1
 
 
@@ -31,3 +33,24 @@ def test_assemble_pack_v1_from_neo4j_ingest(tmp_path: Path):
         manifest = json.loads(archive.read("manifest.json"))
     assert manifest["format_version"] == "opencrab-pack-v1"
     assert manifest["counts"]["nodes"] == 2
+
+
+@pytest.mark.parametrize("pack_id", ["../evil", "/abs/path", "a/b"])
+def test_assemble_pack_v1_rejects_invalid_pack_id(tmp_path: Path, pack_id: str):
+    source = tmp_path / "stage"
+    source.mkdir()
+    out = tmp_path / "pack.zip"
+
+    with pytest.raises(ValueError, match="invalid pack_id"):
+        assemble_pack_v1(source, out, pack_id=pack_id, title="Pack Test")
+
+
+def test_assemble_pack_v1_accepts_valid_pack_id(tmp_path: Path):
+    source = tmp_path / "stage"
+    source.mkdir()
+    out = tmp_path / "pack.zip"
+
+    status = assemble_pack_v1(source, out, pack_id="my-pack_v1", title="Pack Test")
+
+    assert status["status"] == "ok"
+    assert status["pack_id"] == "my-pack_v1"

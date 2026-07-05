@@ -188,6 +188,15 @@ def test_find_by_relations_empty(store) -> None:
     assert results == []
 
 
+def test_find_by_relations_limit_string_coerced(store) -> None:
+    """limit may arrive as a str from raw JSON; must not crash the "both" branch."""
+    _make_graph(store)
+    results = store.find_by_relations("u1", ["owns", "can_view"], direction="both", limit="10")
+    ids = {r["properties"]["id"] for r in results}
+    assert "r1" in ids
+    assert "r2" in ids
+
+
 # ------------------------------------------------------------------
 # find_path
 # ------------------------------------------------------------------

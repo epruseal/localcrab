@@ -136,6 +136,23 @@ def test_t11_neo4j_include_unpackaged_allows_null_neighbor() -> None:
     assert "ALL(n IN nodes(path) WHERE n.pack_id IS NULL OR n.pack_id IN $pack_ids)" in cypher
 
 
+def test_t11_neo4j_depth_string_coerced_to_int() -> None:
+    """depth may arrive as a str from raw JSON; must not leak into the pattern uncoerced."""
+    cypher, _params = Neo4jStore._build_neighbors_cypher(
+        node_id="x", direction="out", depth="3", limit=5,
+        pack_ids=None, include_unpackaged=False,
+    )
+    assert "*1..3]" in cypher
+
+
+def test_t11_neo4j_depth_rejects_non_numeric_injection() -> None:
+    with pytest.raises(ValueError):
+        Neo4jStore._build_neighbors_cypher(
+            node_id="x", direction="out", depth="1] MATCH (n) DETACH DELETE n //",
+            limit=5, pack_ids=None, include_unpackaged=False,
+        )
+
+
 # ---------------------------------------------------------------------------
 # T6 regression — parallel edges / visited-before-filter bug
 # ---------------------------------------------------------------------------
