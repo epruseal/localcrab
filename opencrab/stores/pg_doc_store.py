@@ -8,8 +8,16 @@ delete_node_doc, upsert_source, keyword_search, get_source, list_sources,
 log_event, get_audit_log, collection_stats, ping, close, plus the
 available/supports_keyword properties.
 
+STAGE 6a F2: the 13-method surface (everything but keyword_search) is
+inherited from ``_SqlDocStoreBase`` (opencrab/stores/_sql_doc_base.py),
+parameterised by the POSTGRES ``SqlDialect`` (opencrab/stores/_sql_dialect.py).
+This module owns connection/engine management, DDL bootstrap, lifecycle, and
+keyword_search — see _sql_doc_base.py's module docstring for the adoption
+contract.
+
 SCHEMA: three tables mirror LocalSQLDocStore 1:1 — TEXT JSON columns become
-JSONB, TEXT timestamp columns become TIMESTAMPTZ.
+JSONB, TEXT timestamp columns become TIMESTAMPTZ. DDL is rendered from the
+shared ``DOC_STORE_SCHEMA`` spec via ``POSTGRES.render_ddl(...)``.
 
 KEYWORD SEARCH: LocalSQLDocStore uses SQLite FTS5 + bm25(). PG has no FTS5,
 so keyword_search here uses:
@@ -31,59 +39,23 @@ LocalSQLDocStore.close(), which always closes its own connections).
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
 from opencrab.stores._graph_common import _as_dict
+from opencrab.stores._sql_dialect import POSTGRES
+from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 
 logger = logging.getLogger(__name__)
 
-_DDL_TEMPLATE = [
-    """
-    CREATE TABLE IF NOT EXISTS {schema}.doc_nodes (
-        space       TEXT NOT NULL,
-        node_id     TEXT NOT NULL,
-        node_type   TEXT NOT NULL DEFAULT '',
-        properties  JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-        updated_at  TIMESTAMPTZ NOT NULL,
-        PRIMARY KEY (space, node_id)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated ON {schema}.doc_nodes(updated_at)",
-    """
-    CREATE TABLE IF NOT EXISTS {schema}.doc_sources (
-        source_id   TEXT PRIMARY KEY,
-        text        TEXT NOT NULL DEFAULT '',
-        metadata    JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-        ingested_at TIMESTAMPTZ NOT NULL
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS {schema}.audit_log (
-        event_id    TEXT PRIMARY KEY,
-        event_type  TEXT NOT NULL,
-        subject_id  TEXT,
-        details     JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-        timestamp   TIMESTAMPTZ NOT NULL
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_audit_ts ON {schema}.audit_log(timestamp DESC)",
-]
 
-def _ts_str(value: Any) -> str:
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value) if value is not None else ""
-
-
-class PgDocStore:
+class PgDocStore(_SqlDocStoreBase):
     """PostgreSQL-backed document store with the same interface as LocalSQLDocStore."""
+
+    _dialect = POSTGRES
 
     def __init__(self, dsn_or_engine: Any, schema: str = "public") -> None:
         if not _SCHEMA_IDENT_RE.match(schema):
@@ -119,13 +91,31 @@ class PgDocStore:
             conn.execute(self._text("SET TIME ZONE 'UTC'"))
             yield conn
 
-    @property
-    def _t(self) -> str:
-        return f'"{self._schema}"'
+    # ------------------------------------------------------------------
+    # _SqlDocStoreBase hooks
+    # ------------------------------------------------------------------
+
+    def _table(self, name: str) -> str:
+        return f'"{self._schema}".{name}'
+
+    def _fetch_all(self, sql: str, params: dict[str, Any]) -> list[Any]:
+        with self._conn() as conn:
+            return conn.execute(self._text(sql), params).fetchall()
+
+    def _fetch_one(self, sql: str, params: dict[str, Any]) -> Any | None:
+        with self._conn() as conn:
+            return conn.execute(self._text(sql), params).fetchone()
+
+    def _exec_write(self, sql: str, params: dict[str, Any]) -> int:
+        with self._conn(write=True) as conn:
+            return conn.execute(self._text(sql), params).rowcount
+
+    def _row_get(self, row: Any, name: str) -> Any:
+        return row._mapping[name]
 
     def _require_available(self) -> None:
         if not self._available:
-            raise RuntimeError("PgDocStore is not available.")
+            raise RuntimeError(f"{type(self).__name__} is not available.")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -136,8 +126,8 @@ class PgDocStore:
             with self._engine.begin() as conn:
                 if self._schema != "public":
                     conn.execute(self._text(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"'))
-                for ddl in _DDL_TEMPLATE:
-                    conn.execute(self._text(ddl.format(schema=f'"{self._schema}"')))
+                for ddl in POSTGRES.render_ddl(DOC_STORE_SCHEMA, schema_name=self._schema):
+                    conn.execute(self._text(ddl))
             self._available = True
             logger.info("PgDocStore initialised (schema=%s)", self._schema)
         except Exception as exc:
@@ -154,13 +144,13 @@ class PgDocStore:
                 conn.execute(
                     self._text(
                         f"CREATE INDEX IF NOT EXISTS idx_doc_sources_fts"
-                        f" ON {self._t}.doc_sources USING GIN (to_tsvector('simple', text))"
+                        f" ON {self._table('doc_sources')} USING GIN (to_tsvector('simple', text))"
                     )
                 )
                 conn.execute(
                     self._text(
                         f"CREATE INDEX IF NOT EXISTS idx_doc_sources_trgm"
-                        f" ON {self._t}.doc_sources USING GIN (text gin_trgm_ops)"
+                        f" ON {self._table('doc_sources')} USING GIN (text gin_trgm_ops)"
                     )
                 )
             self._kw_ok = True
@@ -192,132 +182,9 @@ class PgDocStore:
                 pass
 
     # ------------------------------------------------------------------
-    # Node document operations
+    # Keyword search — PG-specific (tsvector/ts_rank + pg_trgm ILIKE
+    # fallback); not provided by _SqlDocStoreBase, see its class docstring.
     # ------------------------------------------------------------------
-
-    def upsert_node_doc(
-        self,
-        space: str,
-        node_type: str,
-        node_id: str,
-        properties: dict[str, Any],
-    ) -> str:
-        self._require_available()
-        updated_at = datetime.now(UTC)
-        with self._conn(write=True) as conn:
-            conn.execute(
-                self._text(
-                    f"""
-                    INSERT INTO {self._t}.doc_nodes(space, node_id, node_type, properties, updated_at)
-                    VALUES (:space, :node_id, :node_type, CAST(:properties AS jsonb), :updated_at)
-                    ON CONFLICT (space, node_id) DO UPDATE SET
-                        node_type  = EXCLUDED.node_type,
-                        properties = EXCLUDED.properties,
-                        updated_at = EXCLUDED.updated_at
-                    """
-                ),
-                {
-                    "space": space,
-                    "node_id": node_id,
-                    "node_type": node_type,
-                    "properties": json.dumps(properties),
-                    "updated_at": updated_at,
-                },
-            )
-        return f"{space}::{node_id}"
-
-    def get_node_doc(self, space: str, node_id: str) -> dict[str, Any] | None:
-        self._require_available()
-        with self._conn() as conn:
-            row = conn.execute(
-                self._text(
-                    f"SELECT space, node_id, node_type, properties, updated_at"
-                    f" FROM {self._t}.doc_nodes WHERE space=:space AND node_id=:node_id"
-                ),
-                {"space": space, "node_id": node_id},
-            ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_node(row)
-
-    def list_nodes(
-        self, space: str | None = None, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        self._require_available()
-        with self._conn() as conn:
-            if space:
-                rows = conn.execute(
-                    self._text(
-                        f"SELECT space, node_id, node_type, properties, updated_at"
-                        f" FROM {self._t}.doc_nodes WHERE space=:space LIMIT :lim"
-                    ),
-                    {"space": space, "lim": limit},
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    self._text(
-                        f"SELECT space, node_id, node_type, properties, updated_at"
-                        f" FROM {self._t}.doc_nodes LIMIT :lim"
-                    ),
-                    {"lim": limit},
-                ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
-        self._require_available()
-        with self._conn() as conn:
-            row = conn.execute(
-                self._text(
-                    f"""
-                    SELECT COUNT(*), MAX(updated_at)
-                    FROM (SELECT updated_at FROM {self._t}.doc_nodes LIMIT :lim) sub
-                    """
-                ),
-                {"lim": limit},
-            ).fetchone()
-        return (int(row[0]), _ts_str(row[1]) if row[1] is not None else "")
-
-    def delete_node_doc(self, space: str, node_id: str) -> bool:
-        self._require_available()
-        with self._conn(write=True) as conn:
-            result = conn.execute(
-                self._text(
-                    f"DELETE FROM {self._t}.doc_nodes WHERE space=:space AND node_id=:node_id"
-                ),
-                {"space": space, "node_id": node_id},
-            )
-            rowcount = result.rowcount
-        return rowcount > 0
-
-    # ------------------------------------------------------------------
-    # Source ingestion
-    # ------------------------------------------------------------------
-
-    def upsert_source(
-        self, source_id: str, text: str, metadata: dict[str, Any]
-    ) -> str:
-        self._require_available()
-        ingested_at = datetime.now(UTC)
-        with self._conn(write=True) as conn:
-            conn.execute(
-                self._text(
-                    f"""
-                    INSERT INTO {self._t}.doc_sources(source_id, text, metadata, ingested_at)
-                    VALUES (:source_id, :text, CAST(:metadata AS jsonb), :ingested_at)
-                    ON CONFLICT (source_id) DO UPDATE SET
-                        text        = EXCLUDED.text,
-                        metadata    = EXCLUDED.metadata,
-                        ingested_at = EXCLUDED.ingested_at
-                    """
-                ),
-                {
-                    "source_id": source_id,
-                    "text": text,
-                    "metadata": json.dumps(metadata),
-                    "ingested_at": ingested_at,
-                },
-            )
-        return source_id
 
     def keyword_search(
         self,
@@ -335,6 +202,7 @@ class PgDocStore:
 
         short_token = any(len(t) < 3 for t in toks)
         overfetch = max(1, limit) * 5
+        table = self._table("doc_sources")
 
         try:
             with self._conn() as conn:
@@ -348,7 +216,7 @@ class PgDocStore:
                         self._text(
                             f"""
                             SELECT source_id, text, metadata, similarity(text, :qraw) AS rank
-                            FROM {self._t}.doc_sources
+                            FROM {table}
                             WHERE {conditions}
                             ORDER BY rank DESC
                             LIMIT :lim
@@ -362,7 +230,7 @@ class PgDocStore:
                             f"""
                             SELECT source_id, text, metadata,
                                    ts_rank(to_tsvector('simple', text), plainto_tsquery('simple', :q)) AS rank
-                            FROM {self._t}.doc_sources
+                            FROM {table}
                             WHERE to_tsvector('simple', text) @@ plainto_tsquery('simple', :q)
                             ORDER BY rank DESC
                             LIMIT :lim
@@ -396,143 +264,3 @@ class PgDocStore:
             if len(out) >= limit:
                 break
         return out
-
-    def get_source(self, source_id: str) -> dict[str, Any] | None:
-        self._require_available()
-        with self._conn() as conn:
-            row = conn.execute(
-                self._text(
-                    f"SELECT source_id, text, metadata, ingested_at"
-                    f" FROM {self._t}.doc_sources WHERE source_id=:source_id"
-                ),
-                {"source_id": source_id},
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "source_id": row[0],
-            "text": row[1],
-            "metadata": _as_dict(row[2]),
-            "ingested_at": _ts_str(row[3]),
-        }
-
-    def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
-        self._require_available()
-        with self._conn() as conn:
-            rows = conn.execute(
-                self._text(
-                    f"SELECT source_id, text, metadata, ingested_at"
-                    f" FROM {self._t}.doc_sources LIMIT :lim"
-                ),
-                {"lim": limit},
-            ).fetchall()
-        return [
-            {
-                "source_id": r[0],
-                "text": r[1],
-                "metadata": _as_dict(r[2]),
-                "ingested_at": _ts_str(r[3]),
-            }
-            for r in rows
-        ]
-
-    # ------------------------------------------------------------------
-    # Audit log
-    # ------------------------------------------------------------------
-
-    def log_event(
-        self,
-        event_type: str,
-        subject_id: str | None,
-        details: dict[str, Any],
-    ) -> str:
-        self._require_available()
-        event_id = str(uuid.uuid4())
-        timestamp = datetime.now(UTC)
-        with self._conn(write=True) as conn:
-            conn.execute(
-                self._text(
-                    f"""
-                    INSERT INTO {self._t}.audit_log(event_id, event_type, subject_id, details, timestamp)
-                    VALUES (:event_id, :event_type, :subject_id, CAST(:details AS jsonb), :timestamp)
-                    """
-                ),
-                {
-                    "event_id": event_id,
-                    "event_type": event_type,
-                    "subject_id": subject_id,
-                    "details": json.dumps(details),
-                    "timestamp": timestamp,
-                },
-            )
-        return event_id
-
-    def get_audit_log(
-        self, limit: int = 100, event_type: str | None = None
-    ) -> list[dict[str, Any]]:
-        self._require_available()
-        with self._conn() as conn:
-            if event_type:
-                rows = conn.execute(
-                    self._text(
-                        f"""
-                        SELECT event_id, event_type, subject_id, details, timestamp
-                        FROM {self._t}.audit_log WHERE event_type=:event_type
-                        ORDER BY timestamp DESC LIMIT :lim
-                        """
-                    ),
-                    {"event_type": event_type, "lim": limit},
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    self._text(
-                        f"""
-                        SELECT event_id, event_type, subject_id, details, timestamp
-                        FROM {self._t}.audit_log ORDER BY timestamp DESC LIMIT :lim
-                        """
-                    ),
-                    {"lim": limit},
-                ).fetchall()
-        return [
-            {
-                "event_id": r[0],
-                "event_type": r[1],
-                "subject_id": r[2],
-                "details": _as_dict(r[3]),
-                "timestamp": _ts_str(r[4]),
-            }
-            for r in rows
-        ]
-
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
-
-    def collection_stats(self) -> dict[str, int]:
-        self._require_available()
-        counts: dict[str, int] = {}
-        with self._conn() as conn:
-            for table, key in [
-                ("doc_nodes", "nodes"),
-                ("doc_sources", "sources"),
-                ("audit_log", "audit_log"),
-            ]:
-                row = conn.execute(
-                    self._text(f"SELECT COUNT(*) FROM {self._t}.{table}")  # noqa: S608
-                ).fetchone()
-                counts[key] = int(row[0]) if row else 0
-        return counts
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _row_to_node(row: Any) -> dict[str, Any]:
-        return {
-            "space": row[0],
-            "node_id": row[1],
-            "node_type": row[2],
-            "properties": _as_dict(row[3]),
-            "updated_at": _ts_str(row[4]),
-        }
