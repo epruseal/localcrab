@@ -40,6 +40,12 @@ def list_registered_types() -> list[str]:
 
 
 def reload_schema(node_type: str) -> dict[str, Any] | None:
-    """Clear the cache for *node_type* and reload from disk."""
+    """Clear the entire schema cache and reload *node_type* from disk.
+
+    ``functools.cache`` has no per-key eviction, so this clears ALL cached
+    types (not just *node_type*) before reloading. Callers (e.g. pack
+    installers) only need "cache is not stale" — they don't rely on other
+    types' cache entries surviving this call.
+    """
     load_type_schema.cache_clear()
     return load_type_schema(node_type)
