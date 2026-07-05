@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -118,3 +120,71 @@ def test_ensure_local_gguf_respects_explicit_requested_path(tmp_path):
     result = _ensure_local_gguf(str(gguf_file))
 
     assert result == str(gguf_file)
+
+
+# ---------------------------------------------------------------------------
+# opencrab.mcp.tools._lock_data_dir
+#
+# 배경(PR #25 CI 8건 실패): _lock_data_dir()가 os.environ.get() 직독 대신
+# get_settings()(lru_cache)만 쓰도록 바뀌면서 ① 테스트가 monkeypatch한
+# LOCAL_DATA_DIR을 캐시가 stale이라 못 보고, ② CI(.env 없음)에서 홈 파생 기본
+# 디렉터리가 실제로 존재하지 않아 open()이 FileNotFoundError로 실패했다.
+# 로컬은 repo의 .env 덕에 우연히 통과했었다(디렉터리가 이미 존재).
+# ---------------------------------------------------------------------------
+
+
+def test_lock_data_dir_creates_missing_directory_from_env(monkeypatch, tmp_path):
+    """LOCAL_DATA_DIR이 아직 존재하지 않는 경로를 가리켜도 자동 생성되어야 한다."""
+    nonexistent = tmp_path / "not-yet-created" / "nested"
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(nonexistent))
+    from opencrab.mcp import tools
+
+    result_dir = tools._lock_data_dir()
+
+    assert result_dir == str(nonexistent)
+    assert nonexistent.is_dir()
+
+
+def test_lock_data_dir_falls_back_to_settings_default_and_creates_dir(monkeypatch, tmp_path):
+    """LOCAL_DATA_DIR 미설정 + HOME=fake + CWD에 .env 없음(CI 재현) 이면
+    get_settings() 기본값(HOME 파생)을 쓰고, 그 디렉터리가 없으면 자동 생성해야 한다."""
+    monkeypatch.delenv("LOCAL_DATA_DIR", raising=False)
+    fake_home = tmp_path / "fake-home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.chdir(tmp_path)  # .env 없는 디렉터리로 이동 — CI의 CWD 조건 재현
+    from opencrab.config import get_settings
+
+    if hasattr(get_settings, "cache_clear"):
+        get_settings.cache_clear()
+    from opencrab.mcp import tools
+
+    result_dir = tools._lock_data_dir()
+
+    assert result_dir.startswith(str(fake_home))
+    assert Path(result_dir).is_dir()
+    if hasattr(get_settings, "cache_clear"):
+        get_settings.cache_clear()
+
+
+def test_lock_data_dir_env_change_reflected_without_stale_cache(monkeypatch, tmp_path):
+    """os.environ.get() 직독이 우선이므로 get_settings() lru_cache가 이전 값으로
+    stale이어도 최신 LOCAL_DATA_DIR을 즉시 반영해야 한다."""
+    from opencrab.config import get_settings
+
+    if hasattr(get_settings, "cache_clear"):
+        get_settings.cache_clear()
+    from opencrab.mcp import tools
+
+    dir_a = tmp_path / "dir_a"
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(dir_a))
+    get_settings()  # 캐시를 dir_a 기준으로 채움(스테일 시나리오 재현)
+
+    dir_b = tmp_path / "dir_b"
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(dir_b))
+
+    result_dir = tools._lock_data_dir()
+
+    assert result_dir == str(dir_b)
+    assert Path(dir_b).is_dir()
+    if hasattr(get_settings, "cache_clear"):
+        get_settings.cache_clear()
