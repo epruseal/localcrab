@@ -63,3 +63,11 @@ startmcp.sh
 
 # benchmark outputs (not part of source)
 outputs/
+
+# schema_pack_install 산출물 (biomedical)
+opencrab/schemas/types/Biomarker.yaml
+opencrab/schemas/types/ClinicalTrial.yaml
+opencrab/schemas/types/Disease.yaml
+opencrab/schemas/types/Drug.yaml
+opencrab/schemas/types/Gene.yaml
+opencrab/schemas/types/Pathway.yaml

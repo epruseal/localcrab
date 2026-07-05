@@ -15,3 +15,28 @@ spaces:
   - resource
   - evidence
   - claim
+type_specs:
+  Disease:
+    space: concept
+    required: [name]
+    optional: [description, icd10_code]
+  Gene:
+    space: concept
+    required: [name]
+    optional: [description, symbol, hgnc_id]
+  Drug:
+    space: concept
+    required: [name]
+    optional: [description, atc_code]
+  ClinicalTrial:
+    space: evidence
+    required: [name, phase]
+    optional: [description, status, nct_id]
+  Biomarker:
+    space: concept
+    required: [name]
+    optional: [description, biomarker_type]
+  Pathway:
+    space: concept
+    required: [name]
+    optional: [description]
