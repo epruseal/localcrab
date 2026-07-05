@@ -90,43 +90,6 @@ def _edge_id(payload: dict[str, Any]) -> str:
     return _sha_id("neo4j-edge", payload)
 
 
-def _pack_filter_clause(entity: str) -> str:
-    return (
-        "$pack_id IS NULL "
-        f"OR {entity}.pack_id = $pack_id "
-        f"OR {entity}.source = $pack_id "
-        f"OR {entity}.source_id = $pack_id"
-    )
-
-
-def _node_query(limit: int) -> str:
-    return f"""
-        MATCH (n)
-        WHERE {_pack_filter_clause("n")}
-        RETURN properties(n) AS props, labels(n) AS labels
-        LIMIT {int(limit)}
-    """
-
-
-def _edge_query(limit: int) -> str:
-    node_filter = (
-        f"({_pack_filter_clause('a')}) "
-        f"OR ({_pack_filter_clause('b')}) "
-        f"OR ({_pack_filter_clause('r')})"
-    )
-    return f"""
-        MATCH (a)-[r]->(b)
-        WHERE {node_filter}
-        RETURN properties(a) AS source_props,
-               labels(a) AS source_labels,
-               properties(b) AS target_props,
-               labels(b) AS target_labels,
-               properties(r) AS rel_props,
-               type(r) AS relation
-        LIMIT {int(limit)}
-    """
-
-
 def _normalise_node(
     row: dict[str, Any],
     *,
@@ -222,19 +185,13 @@ def export_neo4j_opencrab_ingest(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # LocalGraphStore는 run_cypher()가 no-op이므로 항상 0 노드/0 엣지를 반환하고
-    # status="ok"로 거짓 성공 보고를 한다. 이를 방지하기 위해 LocalGraphStore 전용
-    # export_nodes() / export_edges() 메서드(SQLite 네이티브 JOIN 쿼리)로 분기한다.
-    # Neo4j 모드에서는 기존 Cypher 경로를 그대로 사용한다.
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-    from opencrab.stores.local_graph_store import LocalGraphStore
-    if isinstance(neo4j_store, (LocalGraphStore, KuzuGraphStore)):
-        node_rows = neo4j_store.export_nodes(pack_id, node_limit)
-        edge_rows = neo4j_store.export_edges(pack_id, edge_limit)
-    else:
-        params = {"pack_id": pack_id}
-        node_rows = neo4j_store.run_cypher(_node_query(node_limit), params)
-        edge_rows = neo4j_store.run_cypher(_edge_query(edge_limit), params)
+    # All four backends implement export_nodes()/export_edges() natively —
+    # Neo4jStore's Cypher for both is copied verbatim from this module's
+    # former _node_query()/_edge_query() helpers (now removed), so this call
+    # produces byte-identical rows to the hand-rolled run_cypher() calls it
+    # replaces. See opencrab/stores/_graph_protocol.py.
+    node_rows = neo4j_store.export_nodes(pack_id, node_limit)
+    edge_rows = neo4j_store.export_edges(pack_id, edge_limit)
 
     node_count = 0
     edge_count = 0

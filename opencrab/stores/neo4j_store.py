@@ -383,3 +383,200 @@ class Neo4jStore:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Extended operations — GraphStoreExtended (opencrab/stores/_graph_protocol.py)
+    #
+    # These 7 methods mirror what LocalGraphStore/PGGraphStore/KuzuGraphStore
+    # already provide. Several were previously inlined as ad-hoc Cypher in
+    # consumers (content_pack_list's Neo4j branch, lever_simulate's Neo4j
+    # branch, pack/neo4j_export.py's _node_query/_edge_query, ontology_get_node's
+    # Neo4j fallback) — the Cypher below is copied from those call sites
+    # verbatim (or generalised, for find_by_relations) so switching a consumer
+    # from its old inline branch to calling these methods directly produces
+    # identical output.
+    # ------------------------------------------------------------------
+
+    def get_node_by_id(self, node_id: str) -> dict[str, Any] | None:
+        """Type-agnostic node lookup by id alone; None if not found.
+
+        Cypher matches ontology_get_node()'s former Neo4j fallback exactly
+        (``labels(n)[0]`` for node_type, unfiltered — a node created via
+        ``upsert_node``'s ``MERGE (n:OpenCrabNode:{node_type} ...)`` carries
+        both labels; this is the same label-ordering behaviour every other
+        ``labels(n)[0]`` call site in this codebase already relies on).
+        """
+        self._require_available()
+        cypher = "MATCH (n {id: $id}) RETURN properties(n) AS props, labels(n)[0] AS lbl LIMIT 1"
+        with self._session() as session:
+            result = session.run(cypher, id=node_id)
+            record = result.single()
+            if not record:
+                return None
+            props = dict(record["props"])
+            props["node_type"] = record["lbl"]
+            return props
+
+    def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
+        """Aggregate node counts per pack_id; packs below min_nodes omitted.
+
+        Cypher matches content_pack_list()'s former inline Neo4j branch:
+        anchor node (``dataset:{pack_id}``) title takes priority, falling
+        back to any node's ``source_package_title``.
+        """
+        self._require_available()
+        cypher = """
+            MATCH (n:OpenCrabNode)
+            WHERE n.pack_id IS NOT NULL
+            WITH n.pack_id AS pack_id, count(n) AS node_count,
+                 collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.title ELSE null END) AS anchor_titles,
+                 collect(n.source_package_title) AS pkg_titles
+            WHERE node_count >= $min_nodes
+            WITH pack_id, node_count,
+                 coalesce(
+                     [t IN anchor_titles WHERE t IS NOT NULL AND t <> ''][0],
+                     [t IN pkg_titles  WHERE t IS NOT NULL AND t <> ''][0],
+                     ''
+                 ) AS sample_title
+            RETURN pack_id, node_count, sample_title
+            ORDER BY node_count DESC
+        """
+        with self._session() as session:
+            result = session.run(cypher, min_nodes=min_nodes)
+            return [dict(record) for record in result]
+
+    def find_by_relations(
+        self,
+        node_id: str,
+        relations: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Single-hop neighbours filtered to a relation-type allow-list.
+
+        Cypher generalises lever_simulate()'s former inline Neo4j branch
+        (``-[r:raises|lowers|stabilizes|optimizes]->``) to an arbitrary
+        relation list and direction. Relation types are interpolated
+        directly into the pattern (Cypher cannot bind relationship types as
+        parameters) — same approach ``upsert_edge`` already uses for a
+        single relation type.
+        """
+        self._require_available()
+        if not relations:
+            return []
+
+        rel_pattern = "|".join(relations)
+        arrow = {
+            "out": f"-[r:{rel_pattern}]->",
+            "in": f"<-[r:{rel_pattern}]-",
+            "both": f"-[r:{rel_pattern}]-",
+        }.get(direction, f"-[r:{rel_pattern}]->")
+
+        cypher = f"""
+            MATCH (n {{id: $id}}){arrow}(m)
+            RETURN properties(m) AS props, labels(m) AS labels, type(r) AS relation_type
+            LIMIT $limit
+        """
+        with self._session() as session:
+            result = session.run(cypher, id=node_id, limit=limit)
+            return [
+                {
+                    "properties": dict(record["props"]),
+                    "labels": list(record["labels"]),
+                    "relation_type": record["relation_type"],
+                }
+                for record in result
+            ]
+
+    def export_nodes(
+        self, pack_id: str | None = None, limit: int = 500_000
+    ) -> list[dict[str, Any]]:
+        """Bulk node export for pack ingest/re-export tooling.
+
+        Cypher is identical to pack/neo4j_export.py's former inline
+        ``_node_query()`` helper (pack_id matches ``pack_id``, ``source``,
+        or ``source_id``).
+        """
+        self._require_available()
+        cypher = f"""
+            MATCH (n)
+            WHERE $pack_id IS NULL
+               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id
+            RETURN properties(n) AS props, labels(n) AS labels
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_id=pack_id)
+            return [
+                {"props": dict(record["props"]), "labels": list(record["labels"])}
+                for record in result
+            ]
+
+    def export_edges(
+        self, pack_id: str | None = None, limit: int = 1_000_000
+    ) -> list[dict[str, Any]]:
+        """Bulk edge export, joined with both endpoints' properties.
+
+        Cypher is identical to pack/neo4j_export.py's former inline
+        ``_edge_query()`` helper (pack_id matches either endpoint's
+        ``pack_id``/``source``/``source_id``, or the edge's own).
+        """
+        self._require_available()
+        node_filter = (
+            "($pack_id IS NULL OR a.pack_id = $pack_id OR a.source = $pack_id OR a.source_id = $pack_id) "
+            "OR ($pack_id IS NULL OR b.pack_id = $pack_id OR b.source = $pack_id OR b.source_id = $pack_id) "
+            "OR ($pack_id IS NULL OR r.pack_id = $pack_id OR r.source = $pack_id OR r.source_id = $pack_id)"
+        )
+        cypher = f"""
+            MATCH (a)-[r]->(b)
+            WHERE {node_filter}
+            RETURN properties(a) AS source_props, labels(a) AS source_labels,
+                   properties(b) AS target_props, labels(b) AS target_labels,
+                   properties(r) AS rel_props, type(r) AS relation
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_id=pack_id)
+            return [
+                {
+                    "source_props": dict(record["source_props"]),
+                    "source_labels": list(record["source_labels"]),
+                    "target_props": dict(record["target_props"]),
+                    "target_labels": list(record["target_labels"]),
+                    "rel_props": dict(record["rel_props"]),
+                    "relation": record["relation"],
+                }
+                for record in result
+            ]
+
+    def upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> int:
+        """Bulk upsert; returns the count processed.
+
+        Per-item loop calling ``upsert_node`` — same approach
+        ``KuzuGraphStore.upsert_nodes_batch`` uses, since a node's label is
+        fixed at Cypher-compile time and a single ``UNWIND`` can't vary the
+        label across a mixed-node_type batch without APOC.
+        """
+        self._require_available()
+        for n in nodes:
+            self.upsert_node(
+                n["node_type"], n["node_id"], n.get("properties", {}), n.get("space_id")
+            )
+        return len(nodes)
+
+    def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
+        """Bulk upsert; returns the count of edges that upserted successfully.
+
+        Per-item loop calling ``upsert_edge`` — mirrors
+        ``KuzuGraphStore.upsert_edges_batch``.
+        """
+        self._require_available()
+        count = 0
+        for e in edges:
+            ok = self.upsert_edge(
+                e["from_type"], e["from_id"], e["relation"],
+                e["to_type"], e["to_id"], e.get("properties"),
+            )
+            if ok:
+                count += 1
+        return count

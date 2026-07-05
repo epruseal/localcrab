@@ -384,6 +384,57 @@ class PGGraphStore:
         ).fetchall()
         return {(r[0], r[1]): _as_dict(r[2]) for r in rows}
 
+    def _expand(
+        self,
+        direction: str,
+        batch: dict[str, list],
+        current_id: str,
+        current_depth: int,
+        remaining: int,
+        visited: set[str],
+        results: list[dict[str, Any]],
+        next_level: list[tuple[str, int]],
+        limit: int,
+        pack_set: set[str] | None,
+        include_unpackaged: bool,
+        props_cache: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        """Consume one node's prefetched candidate edges for one direction.
+
+        `direction` is "out" (current_id is the edge's from-side, the
+        candidate is the to-side) or "in" (current_id is the to-side,
+        candidate is the from-side). The current node is always
+        already-known-passing (checked when it was added to `results`, or is
+        the anchor), so it contributes `True` to the `_edge_passes` from/to
+        pair while the candidate contributes its freshly computed pass/fail.
+        """
+        is_out = direction == "out"
+        for other_type, other_id, relation, edge_props_raw in batch.get(current_id, [])[:remaining]:
+            if len(results) >= limit:
+                break
+            if other_id in visited:
+                continue
+            other_props = props_cache.get((other_type, other_id))
+            if not other_props:
+                continue
+            if pack_set is not None:
+                other_pass = _node_passes(other_props, pack_set, include_unpackaged)
+                if not other_pass:
+                    continue
+                edge_props = _as_dict(edge_props_raw)
+                from_pass, to_pass = (True, other_pass) if is_out else (other_pass, True)
+                if not _edge_passes(edge_props, from_pass, to_pass, pack_set):
+                    continue
+            visited.add(other_id)
+            results.append({
+                "properties": other_props,
+                "labels": [other_type],
+                "relation_type": relation,
+                "relationship_types": [relation],
+                "depth": current_depth + 1,
+            })
+            next_level.append((other_id, current_depth + 1))
+
     def find_neighbors(
         self,
         node_id: str,
@@ -441,58 +492,20 @@ class PGGraphStore:
                     if direction in ("out", "both"):
                         remaining = limit - len(results)
                         if remaining > 0:
-                            for to_type, to_id, relation, edge_props_raw in out_batch.get(current_id, [])[:remaining]:
-                                if len(results) >= limit:
-                                    break
-                                if to_id in visited:
-                                    continue
-                                dst_props = props_cache.get((to_type, to_id))
-                                if not dst_props:
-                                    continue
-                                if pack_set is not None:
-                                    dst_pass = _node_passes(dst_props, pack_set, include_unpackaged)
-                                    if not dst_pass:
-                                        continue
-                                    edge_props = _as_dict(edge_props_raw)
-                                    if not _edge_passes(edge_props, True, dst_pass, pack_set):
-                                        continue
-                                visited.add(to_id)
-                                results.append({
-                                    "properties": dst_props,
-                                    "labels": [to_type],
-                                    "relation_type": relation,
-                                    "relationship_types": [relation],
-                                    "depth": current_depth + 1,
-                                })
-                                next_level.append((to_id, current_depth + 1))
+                            self._expand(
+                                "out", out_batch, current_id, current_depth, remaining,
+                                visited, results, next_level, limit, pack_set,
+                                include_unpackaged, props_cache,
+                            )
 
                     if direction in ("in", "both"):
                         remaining = limit - len(results)
                         if remaining > 0:
-                            for from_type, from_id, relation, edge_props_raw in in_batch.get(current_id, [])[:remaining]:
-                                if len(results) >= limit:
-                                    break
-                                if from_id in visited:
-                                    continue
-                                src_props = props_cache.get((from_type, from_id))
-                                if not src_props:
-                                    continue
-                                if pack_set is not None:
-                                    src_pass = _node_passes(src_props, pack_set, include_unpackaged)
-                                    if not src_pass:
-                                        continue
-                                    edge_props = _as_dict(edge_props_raw)
-                                    if not _edge_passes(edge_props, src_pass, True, pack_set):
-                                        continue
-                                visited.add(from_id)
-                                results.append({
-                                    "properties": src_props,
-                                    "labels": [from_type],
-                                    "relation_type": relation,
-                                    "relationship_types": [relation],
-                                    "depth": current_depth + 1,
-                                })
-                                next_level.append((from_id, current_depth + 1))
+                            self._expand(
+                                "in", in_batch, current_id, current_depth, remaining,
+                                visited, results, next_level, limit, pack_set,
+                                include_unpackaged, props_cache,
+                            )
 
                 level = next_level
 

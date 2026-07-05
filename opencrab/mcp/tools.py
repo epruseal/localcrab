@@ -1056,57 +1056,20 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     if not graph.available:
         return {"error": "graph store unavailable"}
 
-    # LocalGraphStore는 run_cypher()가 no-op(항상 [])이므로 Cypher를 사용할 수 없다.
-    # 대신 LocalGraphStore.list_packs()가 동등한 SQL GROUP BY 집계를 제공한다.
-    # Neo4j 모드에서는 기존 Cypher 경로를 그대로 유지해 동작 변화를 최소화한다.
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-    from opencrab.stores.local_graph_store import LocalGraphStore
-    if isinstance(graph, (LocalGraphStore, KuzuGraphStore)):
-        rows = graph.list_packs(min_nodes)
-        # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
-        packs = []
-        for r in rows:
-            pid = r.get("pack_id") or ""
-            title = r.get("sample_title") or ""
-            display = title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
-            packs.append({
-                "pack_id":    pid,
-                "node_count": r["node_count"],
-                "title":      display or pid or "(no pack_id)",
-            })
-        return {"total": len(packs), "packs": packs}
-
-    # Neo4j 모드: anchor 우선 + source_package_title 폴백
-    cypher = """
-    MATCH (n:OpenCrabNode)
-    WHERE n.pack_id IS NOT NULL
-    WITH n.pack_id AS pack_id, count(n) AS node_count,
-         collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.title ELSE null END) AS anchor_titles,
-         collect(n.source_package_title) AS pkg_titles
-    WHERE node_count >= $min_nodes
-    WITH pack_id, node_count,
-         coalesce(
-             [t IN anchor_titles WHERE t IS NOT NULL AND t <> ''][0],
-             [t IN pkg_titles  WHERE t IS NOT NULL AND t <> ''][0],
-             ''
-         ) AS sample_title
-    RETURN pack_id, node_count, sample_title
-    ORDER BY node_count DESC
-    """
-    rows = graph.run_cypher(cypher, {"min_nodes": min_nodes})
-
+    # All four backends implement list_packs() natively (Local/PG: SQL GROUP
+    # BY; Kuzu/Neo4j: Cypher aggregation) — see opencrab/stores/_graph_protocol.py.
+    rows = graph.list_packs(min_nodes)
+    # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
     packs = []
     for r in rows:
-        pid = r["pack_id"] or ""
-        title = r["sample_title"] or ""
-        # trim trailing " ontology pack" boilerplate for readability
+        pid = r.get("pack_id") or ""
+        title = r.get("sample_title") or ""
         display = title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
         packs.append({
             "pack_id":    pid,
             "node_count": r["node_count"],
             "title":      display or pid or "(no pack_id)",
         })
-
     return {"total": len(packs), "packs": packs}
 
 
@@ -1564,26 +1527,13 @@ def pack_ingest(
 def ontology_get_node(node_id: str) -> dict[str, Any]:
     """Fetch a single node by node_id regardless of type.
 
-    Works across all storage backends:
-    - Local / Kuzu: uses get_node_by_id() (type-agnostic, single SQL/Cypher LIMIT 1)
-    - Neo4j: falls back to type-agnostic Cypher MATCH (n {id: $id})
+    All four storage backends implement get_node_by_id() natively (type-
+    agnostic, single SQL/Cypher LIMIT 1) — see opencrab/stores/_graph_protocol.py.
     """
     ctx = _get_context()
     graph = ctx["neo4j"]
     node_id = _clean_str(node_id)
-    result: dict[str, Any] | None = None
-
-    # Local / Kuzu backend
-    if hasattr(graph, "get_node_by_id"):
-        result = graph.get_node_by_id(node_id)
-    # Neo4j backend: type-agnostic Cypher
-    elif hasattr(graph, "run_cypher"):
-        rows = graph.run_cypher(
-            "MATCH (n {id: $id}) RETURN properties(n) AS props, labels(n)[0] AS lbl LIMIT 1",
-            {"id": node_id},
-        )
-        if rows:
-            result = {**(rows[0].get("props") or {}), "node_type": rows[0].get("lbl")}
+    result = graph.get_node_by_id(node_id)
 
     if result is None:
         return {"found": False, "node_id": node_id}
@@ -1598,7 +1548,8 @@ def ontology_list_nodes(
     """List nodes filtered by space and/or pack_id.
 
     When pack_id is given, queries the graph store's export_nodes(pack_id=...)
-    which uses an indexed SQL filter (idx_nodes_pack) — avoids the limit-before-
+    (all four backends implement it — see opencrab/stores/_graph_protocol.py)
+    which uses an indexed/native pack_id filter — avoids the limit-before-
     filter bug that would occur if we fetched N rows then Python-filtered.
     When pack_id is absent, falls back to the doc store's list_nodes.
     """
@@ -1608,8 +1559,8 @@ def ontology_list_nodes(
 
     nodes: list[dict[str, Any]] = []
 
-    if pack_id and hasattr(ctx["neo4j"], "export_nodes"):
-        # Graph store: indexed pack_id filter → correct count before limit
+    if pack_id:
+        # Graph store: indexed/native pack_id filter → correct count before limit
         raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
         # normalise to same shape as doc store list_nodes
@@ -1628,7 +1579,7 @@ def ontology_list_nodes(
                 "properties": props,
             })
     else:
-        # Doc store fallback (no pack_id or no export_nodes on backend)
+        # Doc store fallback (no pack_id filter requested)
         nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
         if pack_id:
             nodes = [
