@@ -60,9 +60,24 @@ _chroma_lock_fh = None
 
 
 def _lock_data_dir() -> str:
-    from opencrab.config import get_settings
+    """락 파일(chroma.lock/write.lock)을 둘 데이터 디렉터리 경로.
 
-    return get_settings().local_data_dir
+    os.environ.get() 직독을 get_settings() 보다 우선한다 — get_settings()는
+    lru_cache라 테스트가 실행 도중 monkeypatch한 LOCAL_DATA_DIR을 못 보는 stale
+    캐시 문제가 있다(env 직독은 매 호출 즉시 반영). 환경변수 미설정 시에만
+    get_settings().local_data_dir(HOME 파생 기본값 포함)로 폴백한다.
+
+    CI 러너처럼 .env가 없어 기본 디렉터리가 실제로 아직 존재하지 않는 경우를
+    대비해, 반환 전 os.makedirs(exist_ok=True)로 생성을 보장한다(락 파일 open()이
+    FileNotFoundError로 죽는 것을 방지).
+    """
+    data_dir = os.environ.get("LOCAL_DATA_DIR")
+    if not data_dir:
+        from opencrab.config import get_settings
+
+        data_dir = get_settings().local_data_dir
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
 
 
 def _acquire_chroma_shared_lock() -> None:
