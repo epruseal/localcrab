@@ -50,4 +50,4 @@ jobs:
       - name: Test
         env:
           OPENCRAB_PG_TEST_URL: postgresql://opencrab:opencrab@localhost:5432/opencrab_test
-        run: pytest -q --cov=opencrab --cov-fail-under=77 -o addopts=''
+        run: pytest -q --cov=opencrab --cov-fail-under=82 -o addopts=''
