@@ -1,0 +1,53 @@
+# RATCHET 계약: --cov-fail-under 은 단계별(Stage)로만 올라가는 하한선(ratchet
+# floor)이다. 각 리팩토링 Stage PR은 그 시점까지 달성한 커버리지 이상으로 이
+# 값을 올리되 절대 낮추지 않는다. Stage 9(커버리지 마감)에서 pyproject.toml의
+# [tool.coverage.report] fail_under = 80 이 최종 발효되면, 이 옵션은 제거하고
+# `pytest --cov=opencrab --cov-fail-under` 없이 pyproject 설정에 위임한다.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: opencrab
+          POSTGRES_PASSWORD: opencrab
+          POSTGRES_DB: opencrab_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opencrab -d opencrab_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,pg]"
+
+      - name: Install ladybug (best-effort, kuzu tests skip if unavailable)
+        run: pip install "ladybug>=0.18" || echo "ladybug unavailable — kuzu tests will skip"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Test
+        env:
+          OPENCRAB_PG_TEST_URL: postgresql://opencrab:opencrab@localhost:5432/opencrab_test
+        run: pytest -q --cov=opencrab --cov-fail-under=62 -o addopts=''

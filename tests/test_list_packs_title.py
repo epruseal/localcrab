@@ -68,6 +68,7 @@ def test_local_list_packs_empty_when_no_anchor_no_pkg_title(local_store):
 
 @pytest.fixture
 def kuzu_store(tmp_path):
+    pytest.importorskip("ladybug")
     from opencrab.stores.kuzu_graph_store import KuzuGraphStore
     s = KuzuGraphStore(db_path=str(tmp_path / "test_kuzu"))
     yield s

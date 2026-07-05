@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("ladybug")
+
 
 @pytest.fixture
 def store(tmp_path: Path):
