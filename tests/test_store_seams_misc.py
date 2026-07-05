@@ -3,10 +3,11 @@
 graceful degrade on a missing ``ladybug``), and the ``_require_available()``
 guard-message contracts for neo4j_store/mongo_store/sql_store/kuzu_graph_store.
 
-Green against the PRE-adoption code EXCEPT the three groups explicitly
+Green against the PRE-adoption code EXCEPT the two groups explicitly
 marked red-first below (kuzu pack-filter equivalence, kuzu missing-ladybug
-degrade) and the xfail(strict) vector-store ``count()`` escalation (inherited
-judgment ①, owned by C2 — delivered here as evidence, not fixed in this file).
+degrade). The vector-store ``count()`` swallow bug (formerly inherited
+judgment ①, xfail(strict)) is now fixed in sqlite_vec_store.py/
+pg_vector_store.py; the pinning tests below are plain green.
 """
 
 from __future__ import annotations
@@ -326,27 +327,19 @@ class TestKuzuPackFilterEquivalence:
 
 
 # ---------------------------------------------------------------------------
-# INHERITED JUDGMENT ① (escalated to C2 — chroma_store.py/sqlite_vec_store.py/
-# pg_vector_store.py are not owned by this adopter): sqlite_vec_store.count()
-# and pg_vector_store.count() wrap the *live query* in `except Exception:
-# return 0` — not just the `if not self._available: return 0` early return
-# that test_stores.py:97-101 pins as an intentional, tested contract.  A
-# genuine failure (locked DB, dropped table, connection drop) during the
-# count query is therefore indistinguishable from "0 rows", unlike graph
-# stores' count_nodes() (raises) or chroma_store.count() (no such swallow
-# around its own live `.count()` call — only the availability early-return).
-# Judged: BUG (masks real failures), not an intended degrade. Not fixed here
-# — delivered as evidence; xfail(strict) so a future fix flips this green.
+# FIXED (was INHERITED JUDGMENT ①, escalated to C2): sqlite_vec_store.count()
+# and pg_vector_store.count() used to wrap the *live query* in
+# `except Exception: return 0` — not just the `if not self._available:
+# return 0` early return that test_stores.py:97-101 pins as an intentional,
+# tested contract. A genuine failure (locked DB, dropped table, connection
+# drop) during the count query was therefore indistinguishable from "0 rows",
+# unlike graph stores' count_nodes() (raises) or chroma_store.count() (no such
+# swallow around its own live `.count()` call — only the availability
+# early-return). Both vector stores now let a real query exception propagate;
+# these tests pin that contract (red→green).
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ESCALATED to C2 (owns sqlite_vec_store.py): count() swallows ANY "
-    "exception during the live count query, not just the unavailable-store "
-    "early return, masking real failures as '0 rows'. See stage report "
-    "judgment (1).",
-)
 def test_sqlite_vec_count_surfaces_real_query_errors_not_just_unavailable(tmp_path):
     from _vec_helpers import build_vector_store
 
@@ -356,6 +349,24 @@ def test_sqlite_vec_count_surfaces_real_query_errors_not_just_unavailable(tmp_pa
         # Still `available=True` — this is a genuine query-time failure, not
         # the unavailable-store case test_stores.py:97-101 already pins.
         store._conn.execute(f"DROP TABLE {store._table}")
+        with pytest.raises(Exception):
+            store.count()
+    finally:
+        store.close()
+
+
+def test_pg_vector_count_surfaces_real_query_errors_not_just_unavailable(tmp_path):
+    from _vec_helpers import build_vector_store
+
+    store = build_vector_store("pg", tmp_path, dim=8)
+    try:
+        store.add_texts(texts=["a"], metadatas=[{}], ids=["n1"])
+        # Still `available=True` — this is a genuine query-time failure, not
+        # the unavailable-store case test_stores.py:97-101 already pins.
+        from sqlalchemy import text
+
+        with store._engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE {store._table}"))
         with pytest.raises(Exception):
             store.count()
     finally:
