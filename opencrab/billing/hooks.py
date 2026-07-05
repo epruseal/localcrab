@@ -129,6 +129,16 @@ class BillingHooks:
             Quantity (e.g. number of nodes written in a batch).
         metadata:
             Optional extra info (e.g. space, node_type, query text).
+
+        Returns
+        -------
+        On success: ``{"ok": True, "event_id": ..., "event_type": ..., "tenant_id": ...,
+        "count": ..., "created_at": ...}``.
+        On failure (never raises): ``{"ok": False, "error": str(exc)}`` — no
+        ``event_id`` is included since no row was persisted. Callers that only
+        care about "did billing not crash my write" can ignore the return
+        value entirely (this method never raises); callers that need to know
+        whether the event was actually recorded must check ``ok``.
         """
         import json
 
@@ -159,8 +169,10 @@ class BillingHooks:
                 )
         except Exception as exc:
             logger.warning("BillingHooks.emit failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
 
         return {
+            "ok": True,
             "event_id": event_id,
             "event_type": event_type,
             "tenant_id": tenant_id,

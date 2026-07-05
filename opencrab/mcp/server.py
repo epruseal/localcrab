@@ -22,7 +22,7 @@ import sys
 from typing import Any
 
 from opencrab.config import get_settings
-from opencrab.mcp.tools import TOOLS, dispatch_tool
+from opencrab.mcp.tools import TOOLS, UnknownToolError, dispatch_tool
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +197,13 @@ class MCPServer:
 
         try:
             result = dispatch_tool(name, arguments)
-        except KeyError as exc:
-            raise KeyError(str(exc)) from exc
+        except UnknownToolError:
+            # Genuinely unregistered tool name — surface as JSON-RPC
+            # METHOD_NOT_FOUND. Any OTHER exception (including a KeyError
+            # raised incidentally by a tool's own logic) falls through to
+            # the generic envelope below instead of being misreported as
+            # "method not found".
+            raise
         except Exception as exc:
             logger.warning("Tool '%s' raised: %s", name, exc)
             result = {"error": str(exc)}

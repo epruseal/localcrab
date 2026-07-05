@@ -220,22 +220,25 @@ class MongoStore:
         event_type: str,
         subject_id: str | None,
         details: dict[str, Any],
-    ) -> None:
-        """Append an audit log entry (fire-and-forget; errors are suppressed)."""
-        if not self._available:
-            return
+    ) -> str:
+        """Append an audit log entry. Returns the inserted event id as a string.
 
-        try:
-            self._db["audit_log"].insert_one(
-                {
-                    "event_type": event_type,
-                    "subject_id": subject_id,
-                    "details": details,
-                    "timestamp": datetime.now(tz=UTC),
-                }
-            )
-        except Exception as exc:
-            logger.debug("Audit log write failed: %s", exc)
+        Raises RuntimeError when MongoDB is unavailable, matching the other
+        doc store backends (LocalSQLDocStore, PgDocStore), which also return
+        an event_id str so callers can correlate audit entries.
+        """
+        if not self._available:
+            raise RuntimeError("MongoDB is not available.")
+
+        result = self._db["audit_log"].insert_one(
+            {
+                "event_type": event_type,
+                "subject_id": subject_id,
+                "details": details,
+                "timestamp": datetime.now(tz=UTC),
+            }
+        )
+        return str(result.inserted_id)
 
     def get_audit_log(
         self, limit: int = 100, event_type: str | None = None

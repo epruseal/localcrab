@@ -2293,6 +2293,18 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+class UnknownToolError(KeyError):
+    """Raised by dispatch_tool() when `name` is not a registered tool.
+
+    A KeyError subclass so existing `except KeyError` / `pytest.raises(KeyError)`
+    call sites keep working unchanged. Callers that need to distinguish "no
+    such tool" from an incidental KeyError raised *inside* a tool's own logic
+    (e.g. a dict lookup bug) should catch this specific type — server.py's
+    MCP JSON-RPC layer maps only this to METHOD_NOT_FOUND, letting any other
+    KeyError fall through to the generic tool-exception error envelope.
+    """
+
+
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     """
     Look up and call a tool by name.
@@ -2310,12 +2322,12 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
 
     Raises
     ------
-    KeyError
-        If the tool name is not registered.
+    UnknownToolError
+        If the tool name is not registered (subclass of KeyError).
     """
     fn = _TOOL_FUNCTIONS.get(name)
     if fn is None:
-        raise KeyError(f"Unknown tool: '{name}'. Available: {list(_TOOL_FUNCTIONS)}")
+        raise UnknownToolError(f"Unknown tool: '{name}'. Available: {list(_TOOL_FUNCTIONS)}")
     if name in WRITE_TOOLS:
         with _write_lock():
             return fn(**arguments)

@@ -128,6 +128,12 @@ class TestChromaStoreUnit:
 
 
 class TestMongoStoreUnit:
+    @pytest.fixture(autouse=True)
+    def _fast_timeout(self, fast_mongo_timeout):
+        """invalid-host 연결 실패를 5s가 아닌 ~100ms 만에 재현
+        (conftest.py의 fast_mongo_timeout 참고). 이 클래스의 모든
+        테스트가 대상이므로 클래스 레벨 autouse fixture로 적용."""
+
     def test_unavailable_when_connection_fails(self):
         from opencrab.stores.mongo_store import MongoStore
 
@@ -140,12 +146,16 @@ class TestMongoStoreUnit:
         store = MongoStore("mongodb://invalid-host:27017", "testdb")
         assert store.ping() is False
 
-    def test_log_event_silently_ignored_when_unavailable(self):
+    def test_log_event_raises_when_unavailable(self):
+        # Contract aligned with LocalSQLDocStore/PgDocStore: log_event raises
+        # RuntimeError (and returns an event_id str) instead of silently
+        # no-op'ing. See tests/test_mongo_unit.py for the full contract
+        # coverage (mocked, instant).
         from opencrab.stores.mongo_store import MongoStore
 
         store = MongoStore("mongodb://invalid-host:27017", "testdb")
-        # Should not raise
-        store.log_event("test_event", "u1", {"detail": "value"})
+        with pytest.raises(RuntimeError, match="not available"):
+            store.log_event("test_event", "u1", {"detail": "value"})
 
     def test_collection_stats_empty_when_unavailable(self):
         from opencrab.stores.mongo_store import MongoStore
