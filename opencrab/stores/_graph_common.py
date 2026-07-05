@@ -14,13 +14,19 @@ inter-copy differences found, no parameterisation needed):
       pg_doc_store._SCHEMA_IDENT_RE, pg_vector_store._IDENT_RE, and
       sqlite_vec_store._IDENT_RE.
 
-NOT EXTRACTED: opencrab/stores/kuzu_graph_store.py re-implements the same
+C3 UPDATE: opencrab/stores/kuzu_graph_store.py originally re-implemented the
     pack-filter 3-rule policy INLINE in ``find_neighbors()`` /
-    ``_find_neighbors_1hop()`` (~228-241, ~304-315) because its Cypher
-    result rows don't carry a standalone node/edge properties dict shaped
-    for these helpers without restructuring the query. Its adopter (C3) must
-    verify the inline logic is behaviourally equivalent to
-    ``_node_passes``/``_edge_passes`` below rather than porting this module.
+    ``_find_neighbors_1hop()``, on the assumption that its Cypher result rows
+    didn't carry a standalone node/edge properties dict shaped for these
+    helpers. Verification found ``_parse()`` (opencrab/stores/_json.py)
+    already returns a plain dict for both, so no restructuring was needed —
+    the module now imports and calls ``_node_passes``/``_edge_passes``
+    directly. This also fixed two real divergences the inline copy had from
+    the policy below: it compared a node's raw ``pack_id`` (no ``str()``
+    cast, so a numeric pack_id failed a string ``pack_ids`` filter) and
+    treated a falsy pack_id (e.g. ``""``) as a real foreign pack_id (always
+    excluded) instead of "no pack_id" (governed by ``include_unpackaged``).
+    See tests/test_store_seams_misc.py::TestKuzuPackFilterEquivalence.
 """
 
 from __future__ import annotations

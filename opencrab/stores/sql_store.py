@@ -185,6 +185,10 @@ class SQLStore:
     def available(self) -> bool:
         return self._available
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError("SQL store is not available.")
+
     def ping(self) -> bool:
         """Return True if the database is reachable."""
         try:
@@ -202,8 +206,7 @@ class SQLStore:
 
     def register_node(self, space: str, node_type: str, node_id: str) -> None:
         """Insert or update a node registry entry."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         from sqlalchemy import text
 
@@ -226,8 +229,7 @@ class SQLStore:
         self, from_space: str, from_id: str, relation: str, to_space: str, to_id: str
     ) -> None:
         """Insert or ignore an edge registry entry."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         from sqlalchemy import text
 
@@ -258,8 +260,7 @@ class SQLStore:
         self, node_id: str, change_type: str, impact: dict[str, Any]
     ) -> int:
         """Persist an impact analysis result. Returns the row id."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         import json
 
@@ -293,8 +294,7 @@ class SQLStore:
 
     def get_impacts(self, node_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """Retrieve recent impact records for a node."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         import json
 
@@ -326,8 +326,7 @@ class SQLStore:
         self, lever_id: str, direction: str, magnitude: float, results: dict[str, Any]
     ) -> int:
         """Persist a lever simulation result."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         import json
 
@@ -378,8 +377,7 @@ class SQLStore:
         granted: bool = True,
     ) -> None:
         """Upsert a ReBAC policy row."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         from sqlalchemy import text
 
@@ -415,8 +413,7 @@ class SQLStore:
 
         Returns True/False if a policy exists, None if no policy row found.
         """
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         from sqlalchemy import text
 
@@ -435,8 +432,7 @@ class SQLStore:
 
     def list_policies(self, subject_id: str) -> list[dict[str, Any]]:
         """List all policies for a given subject."""
-        if not self._available:
-            raise RuntimeError("SQL store is not available.")
+        self._require_available()
 
         from sqlalchemy import text
 

@@ -69,6 +69,10 @@ class MongoStore:
     def available(self) -> bool:
         return self._available
 
+    def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError("MongoDB is not available.")
+
     def ping(self) -> bool:
         """Return True if MongoDB is reachable."""
         try:
@@ -101,8 +105,7 @@ class MongoStore:
         `properties.owner_id` is mirrored to a top-level `owner_id` column so
         ownership counters can use an indexed field instead of a nested path.
         """
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         doc: dict[str, Any] = {
             "space": space,
@@ -129,8 +132,7 @@ class MongoStore:
 
     def get_node_doc(self, space: str, node_id: str) -> dict[str, Any] | None:
         """Retrieve a node document by space and node_id."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         doc = self._db["nodes"].find_one(
             {"space": space, "node_id": node_id}, {"_id": 0}
@@ -141,8 +143,7 @@ class MongoStore:
         self, space: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """List node documents, optionally filtered by space."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         query: dict[str, Any] = {}
         if space:
@@ -152,8 +153,7 @@ class MongoStore:
 
     def delete_node_doc(self, space: str, node_id: str) -> bool:
         """Delete a node document. Returns True if deleted."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         result = self._db["nodes"].delete_one({"space": space, "node_id": node_id})
         return result.deleted_count > 0
@@ -173,8 +173,7 @@ class MongoStore:
         `metadata.user_id` is mirrored to a top-level `user_id` column so
         ownership counters can use an indexed field instead of a nested path.
         """
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         doc: dict[str, Any] = {
             "source_id": source_id,
@@ -197,16 +196,14 @@ class MongoStore:
 
     def get_source(self, source_id: str) -> dict[str, Any] | None:
         """Retrieve a source document."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         doc = self._db["sources"].find_one({"source_id": source_id}, {"_id": 0})
         return dict(doc) if doc else None
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
         """List all ingested sources."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         cursor = self._db["sources"].find({}, {"_id": 0, "text": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
@@ -227,8 +224,7 @@ class MongoStore:
         doc store backends (LocalSQLDocStore, PgDocStore), which also return
         an event_id str so callers can correlate audit entries.
         """
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         result = self._db["audit_log"].insert_one(
             {
@@ -244,8 +240,7 @@ class MongoStore:
         self, limit: int = 100, event_type: str | None = None
     ) -> list[dict[str, Any]]:
         """Retrieve recent audit log entries."""
-        if not self._available:
-            raise RuntimeError("MongoDB is not available.")
+        self._require_available()
 
         query: dict[str, Any] = {}
         if event_type:

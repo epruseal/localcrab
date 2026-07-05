@@ -39,9 +39,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
+from opencrab.stores._graph_common import _as_dict
 
-_SCHEMA_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+logger = logging.getLogger(__name__)
 
 _DDL_TEMPLATE = [
     """
@@ -74,19 +75,6 @@ _DDL_TEMPLATE = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_audit_ts ON {schema}.audit_log(timestamp DESC)",
 ]
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except (TypeError, ValueError):
-            return {}
-    return {}
-
 
 def _ts_str(value: Any) -> str:
     if hasattr(value, "isoformat"):

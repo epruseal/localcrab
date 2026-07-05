@@ -84,7 +84,6 @@ BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/pgvector-migration-plan.md §3.7):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -93,6 +92,14 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from opencrab.stores._sqlite_base import _SqliteConnMixin
+from opencrab.stores._vector_base import (
+    default_metadatas,
+    embed_and_validate,
+    generate_add_ids,
+    generate_upsert_ids,
+    validate_lengths,
+)
 from opencrab.stores.chroma_store import _sanitize_metadata
 
 logger = logging.getLogger(__name__)
@@ -139,7 +146,7 @@ class _AnnCache:
         self.max_rowid = max_rowid
 
 
-class SqliteVecStore:
+class SqliteVecStore(_SqliteConnMixin):
     """sqlite-vec (vec0) adapter mirroring the ChromaStore public interface."""
 
     def __init__(
@@ -184,7 +191,6 @@ class SqliteVecStore:
             raise ValueError(f"Unsafe collection_name: {collection_name!r}")
         if ann not in ("", "binary"):
             raise ValueError(f"Unknown ann mode: {ann!r} (valid: '', 'binary')")
-        self._db_path = db_path
         self._ef = embedding_function
         self._dim = int(dim)
         self._table = collection_name
@@ -200,48 +206,29 @@ class SqliteVecStore:
         self._ann_cache_lock = threading.Lock()
         self._conn_dv: dict[int, int] = {}
         self._available = False
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self._conns_lock = threading.Lock()
-        self._all_conns: list[Any] = []
+        self._init_conn_state(db_path)
         self._init_db()
 
     # ------------------------------------------------------------------
     # Connection / lifecycle
     # ------------------------------------------------------------------
 
-    def _new_conn(self) -> Any:
-        """Per-thread connection with WAL + sqlite-vec extension loaded.
+    def _configure_connection(self, conn: Any) -> None:
+        """sqlite-vec extension load + cross-process writer tolerance.
 
-        WAL + synchronous=NORMAL mirrors local_sql_doc_store.py (reader/writer
-        isolation, fsync only at checkpoint)."""
-        import sqlite3
-
+        Runs after the mixin's WAL/synchronous pragmas (the original loaded
+        the extension before them) — inert reorder, extension loading and
+        journal-mode/sync pragmas are independent SQLite session settings."""
         import sqlite_vec
 
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
         # Cross-process writers (e.g. an offline loader writing vectors.db while
         # serve also writes) wait up to 5s for the write lock instead of getting
         # SQLITE_BUSY immediately. (Python's connect(timeout=5.0) default already
         # sets this; made explicit so the WAL multi-writer contract is in-code.)
         conn.execute("PRAGMA busy_timeout=5000")
-        with self._conns_lock:
-            self._all_conns.append(conn)
-        return conn
-
-    @property
-    def _conn(self) -> Any:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._new_conn()
-            self._local.conn = conn
-        return conn
 
     def _create_table_sql(self, with_bit: bool = False) -> str:
         # The bit column is declared WITHOUT distance_metric — hamming is the
@@ -313,27 +300,12 @@ class SqliteVecStore:
         except Exception:
             return False
 
-    def close(self) -> None:
-        with self._conns_lock:
-            for conn in self._all_conns:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._all_conns.clear()
-
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        vectors = self._ef(list(texts))
-        for vec in vectors:
-            if len(vec) != self._dim:
-                raise RuntimeError(
-                    f"Embedding dim {len(vec)} != table dim {self._dim}."
-                )
-        return vectors
+        return embed_and_validate(self._ef, self._dim, texts)
 
     def _serialize(self, vec: list[float]) -> Any:
         import sqlite_vec
@@ -389,19 +361,13 @@ class SqliteVecStore:
         without raising), this is a plain vec0 INSERT and raises on a duplicate
         primary key — vec0 supports neither INSERT OR IGNORE nor UPSERT. Callers
         that may re-add ids should use upsert_texts (builder.py uses upsert)."""
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         if not texts:
             return []
         if ids is None:
-            ids = [
-                hashlib.sha256(f"{t}{time.time_ns()}".encode()).hexdigest()[:16]
-                for t in texts
-            ]
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        if len(ids) != len(texts) or len(metadatas) != len(texts):
-            raise ValueError("texts, metadatas, and ids must have the same length.")
+            ids = generate_add_ids(texts)
+        metadatas = default_metadatas(texts, metadatas)
+        validate_lengths(texts, metadatas, ids)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
@@ -422,16 +388,13 @@ class SqliteVecStore:
     ) -> list[str]:
         """Upsert (content-deterministic IDs when omitted). vec0 has no UPSERT
         for virtual tables, so this is DELETE-then-INSERT per id."""
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         if not texts:
             return []
         if ids is None:
-            ids = [hashlib.sha256(t.encode()).hexdigest()[:16] for t in texts]
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        if len(ids) != len(texts) or len(metadatas) != len(texts):
-            raise ValueError("texts, metadatas, and ids must have the same length.")
+            ids = generate_upsert_ids(texts)
+        metadatas = default_metadatas(texts, metadatas)
+        validate_lengths(texts, metadatas, ids)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
@@ -448,8 +411,7 @@ class SqliteVecStore:
         return ids
 
     def delete(self, ids: list[str]) -> None:
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         if not ids:
             return
         with self._lock:
@@ -465,8 +427,7 @@ class SqliteVecStore:
         the table always exists: concurrent readers never observe a "no such
         table" gap, and the write lock serialises concurrent resets. Same
         dim/schema is retained (dim is fixed at construction)."""
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         with self._lock:
             # ensure the table exists (idempotent, schema-preserving) then
             # clear all rows atomically
@@ -490,8 +451,7 @@ class SqliteVecStore:
     ) -> list[dict[str, Any]]:
         """Semantic KNN search. Returns dicts with keys id/document/metadata/
         distance (cosine distance = 1 - cos), matching ChromaStore.query."""
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         if n_results <= 0:
             return []
         qvec = self._embed([query_text])[0]
@@ -514,38 +474,9 @@ class SqliteVecStore:
         else:
             fetch_k = _VEC0_K_MAX
 
-        if pack_values:
-            # pack_id $in / eq → one partition-pushed KNN per pack, merged. Each
-            # is exact within its pack, so the global top-n across packs is exact.
-            # Pack-scoped search stays EXACT even under ann="binary" — the
-            # partition pre-filter already makes it fast (~8ms measured), so
-            # §3.7 keeps exact as the safe default here.
-            rows: list[dict[str, Any]] = []
-            for pk in pack_values:
-                rows.extend(self._knn(qvec, fetch_k, pack=pk))
-            rows.sort(key=lambda r: r["distance"])
-        elif (
-            self._ann == "binary"
-            and self._has_bit_column
-            and predicate is None
-        ):
-            # PURE-GLOBAL search (no filter at all) → binary 2-stage ANN
-            # (§3.7): in-RAM bit-hamming coarse (C candidates) → int8 rerank →
-            # exact float refinement of the top ~3n. This is the 868ms hot
-            # path being accelerated. Queries WITH residual (non-pack) filters
-            # fall back to the exact scan below so the Python post-filter
-            # keeps its full 4096-candidate pool (unchanged semantics).
-            # On any cache failure the helper returns None → exact fallback.
-            rows_ann = self._knn_bit_rerank(
-                qvec, max(self._ann_coarse_k, fetch_k), n_results
-            )
-            rows = (
-                rows_ann
-                if rows_ann is not None
-                else self._knn(qvec, fetch_k, pack=None)
-            )
-        else:
-            rows = self._knn(qvec, fetch_k, pack=None)
+        rows = self._select_query_mode(
+            qvec, pack_values, predicate, fetch_k, n_results
+        )
 
         hits: list[dict[str, Any]] = []
         for row in rows:
@@ -582,6 +513,45 @@ class SqliteVecStore:
             )
         return out
 
+    def _select_query_mode(
+        self,
+        qvec: list[float],
+        pack_values: list[str] | None,
+        predicate: Callable[[dict[str, Any]], bool] | None,
+        fetch_k: int,
+        n_results: int,
+    ) -> list[dict[str, Any]]:
+        """Pick which KNN strategy serves this query, and run it.
+
+        - ``pack_values`` present → one partition-pushed KNN per pack, merged
+          (exact within each pack, so the global top-n across packs is exact).
+          Pack-scoped search stays EXACT even under ``ann="binary"`` — the
+          partition pre-filter already makes it fast (~8ms measured), so
+          §3.7 keeps exact as the safe default here.
+        - no pack constraint, ``ann="binary"`` eligible (bit column present)
+          and no residual filter → PURE-GLOBAL binary 2-stage ANN (§3.7):
+          in-RAM bit-hamming coarse → int8 rerank → exact float refinement of
+          the top ~3n. This is the 868ms hot path being accelerated. Queries
+          WITH residual (non-pack) filters fall back to the exact scan so the
+          Python post-filter keeps its full 4096-candidate pool (unchanged
+          semantics). On any cache failure the helper returns None → exact
+          fallback.
+        - otherwise → plain exact brute-force KNN.
+        """
+        if pack_values:
+            rows: list[dict[str, Any]] = []
+            for pk in pack_values:
+                rows.extend(self._knn(qvec, fetch_k, pack=pk))
+            rows.sort(key=lambda r: r["distance"])
+            return rows
+        if self._ann == "binary" and self._has_bit_column and predicate is None:
+            rows_ann = self._knn_bit_rerank(
+                qvec, max(self._ann_coarse_k, fetch_k), n_results
+            )
+            if rows_ann is not None:
+                return rows_ann
+        return self._knn(qvec, fetch_k, pack=None)
+
     # ------------------------------------------------------------------
     # Binary 2-stage ANN (§3.7) — in-process cache path
     # ------------------------------------------------------------------
@@ -611,6 +581,20 @@ class SqliteVecStore:
             f"SELECT max(rowid) FROM {self._table}_rowids"
         ).fetchone()[0]
         return max_rowid == cache.max_rowid
+
+    def _quantize_rows(self, sub: Any) -> tuple[Any, Any, Any]:
+        """Derive sign-bit packing + symmetric int8 quantization for a batch of
+        raw float vectors (rows x dim). Split out of :meth:`_build_ann_cache`'s
+        per-chunk loop — pure numpy math, no I/O, no cache-object mutation."""
+        import numpy as np
+
+        bits_sub = np.packbits(sub > 0, axis=1, bitorder="little")
+        scale_sub = np.abs(sub).max(axis=1) / 127.0
+        scale_sub[scale_sub == 0] = 1.0
+        q8_sub = np.clip(np.round(sub / scale_sub[:, None]), -127, 127).astype(
+            np.int8
+        )
+        return bits_sub, q8_sub, scale_sub
 
     def _build_ann_cache(self) -> _AnnCache | None:
         """Build the in-RAM ANN cache by reading vec0's shadow tables directly.
@@ -666,13 +650,10 @@ class SqliteVecStore:
             pos_idx = np.fromiter((e[0] for e in entries), dtype=np.int64)
             off_idx = np.fromiter((e[1] for e in entries), dtype=np.int64)
             sub = arr[off_idx]
-            bits[pos_idx] = np.packbits(sub > 0, axis=1, bitorder="little")
-            sc = np.abs(sub).max(axis=1) / 127.0
-            sc[sc == 0] = 1.0
-            scale[pos_idx] = sc
-            q8[pos_idx] = np.clip(
-                np.round(sub / sc[:, None]), -127, 127
-            ).astype(np.int8)
+            bits_sub, q8_sub, scale_sub = self._quantize_rows(sub)
+            bits[pos_idx] = bits_sub
+            q8[pos_idx] = q8_sub
+            scale[pos_idx] = scale_sub
         # uint64 view speeds XOR+popcount ~8× when the row width allows it
         if bits.shape[1] % 8 == 0:
             bits = bits.view(np.uint64)
@@ -717,8 +698,6 @@ class SqliteVecStore:
         displacement is absorbed by the 3n refinement pool (measured: exact
         top-10 stays within the int8 top-30 on real data).
         """
-        import numpy as np
-
         try:
             cache = self._get_ann_cache()
         except Exception as exc:
@@ -731,30 +710,57 @@ class SqliteVecStore:
             return None
         if cache is None:
             return None
-        n = len(cache.ids)
-        if n == 0:
+        if len(cache.ids) == 0:
             return []
 
-        q = np.asarray(qvec, dtype=np.float32)
+        cand = self._ann_coarse_candidates(cache, qvec, coarse_k)
+        refine_ids = self._ann_rerank_candidates(cache, cand, qvec, n_results)
+        return self._ann_refine_exact(qvec, refine_ids)
+
+    def _ann_coarse_candidates(
+        self, cache: _AnnCache, qvec: list[float], coarse_k: int
+    ) -> Any:
+        """Stage 1 (coarse): hamming(sign(qvec), bit matrix) via numpy
+        XOR+bitwise_count → row-indices into ``cache`` of the top
+        ``coarse_k`` candidates (~16ms at 179k)."""
+        import numpy as np
+
         qbits = np.frombuffer(_sign_bits(qvec), dtype=np.uint8)
         if cache.bits.dtype == np.uint64:
             qbits = qbits.view(np.uint64)
         ham = np.bitwise_count(cache.bits ^ qbits).sum(axis=1, dtype=np.uint32)
 
+        n = len(cache.ids)
         c = min(max(int(coarse_k), 1), n)
         if c >= n:
-            cand = np.arange(n)
-        else:
-            cand = np.argpartition(ham, c - 1)[:c]
+            return np.arange(n)
+        return np.argpartition(ham, c - 1)[:c]
 
+    def _ann_rerank_candidates(
+        self, cache: _AnnCache, cand: Any, qvec: list[float], n_results: int
+    ) -> list[str]:
+        """Stage 2 (rerank): int8-dequantized cosine over the coarse
+        candidates (RAM, ~5ms) → node ids of the top R = max(3n, n+20)
+        refinement pool."""
+        import numpy as np
+
+        q = np.asarray(qvec, dtype=np.float32)
         sub = cache.q8[cand].astype(np.float32) * cache.scale[cand, None]
         denom = np.linalg.norm(sub, axis=1) * (np.linalg.norm(q) or 1.0)
         denom[denom == 0] = 1.0
         sims = (sub @ q) / denom
         r = min(len(cand), max(3 * int(n_results), int(n_results) + 20))
-        top_local = np.argpartition(-sims, r - 1)[:r] if r < len(cand) else             np.arange(len(cand))
-        refine_ids = [cache.ids[i] for i in cand[top_local]]
+        top_local = (
+            np.argpartition(-sims, r - 1)[:r] if r < len(cand) else np.arange(len(cand))
+        )
+        return [cache.ids[i] for i in cand[top_local]]
 
+    def _ann_refine_exact(
+        self, qvec: list[float], refine_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Stage 3 (refine): EXACT float cosine + document/metadata for the
+        refinement pool via vec0 point queries (~0.76ms each → ~23ms at
+        R=30). Returned distances are exact — same contract as :meth:`_knn`."""
         qser = self._serialize(qvec)
         scored: list[dict[str, Any]] = []
         for nid in refine_ids:
@@ -779,8 +785,7 @@ class SqliteVecStore:
         return scored
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
-        if not self._available:
-            raise RuntimeError("SqliteVecStore is not available.")
+        self._require_available()
         row = self._conn.execute(
             f"SELECT node_id, document, metadata FROM {self._table}"
             " WHERE node_id = ?",
