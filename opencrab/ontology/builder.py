@@ -260,18 +260,22 @@ class OntologyBuilder:
 
         # --- MongoDB audit ---
         if self._mongo.available:
-            self._mongo.log_event(
-                "edge_upsert",
-                subject_id=subject_id,
-                details={
-                    "from_space": from_space,
-                    "from_id": from_id,
-                    "relation": relation,
-                    "to_space": to_space,
-                    "to_id": to_id,
-                },
-            )
-            output["stores"]["docs"] = "audited"
+            try:
+                self._mongo.log_event(
+                    "edge_upsert",
+                    subject_id=subject_id,
+                    details={
+                        "from_space": from_space,
+                        "from_id": from_id,
+                        "relation": relation,
+                        "to_space": to_space,
+                        "to_id": to_id,
+                    },
+                )
+                output["stores"]["docs"] = "audited"
+            except Exception as exc:
+                logger.warning("MongoDB audit log write failed: %s", exc)
+                output["stores"]["docs"] = f"error: {exc}"
         else:
             output["stores"]["docs"] = "unavailable"
 
