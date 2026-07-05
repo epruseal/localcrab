@@ -62,10 +62,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Callable
 from typing import Any
 
+from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
 from opencrab.stores._vector_base import (
     default_metadatas,
     embed_and_validate,
@@ -75,8 +75,6 @@ from opencrab.stores._vector_base import (
 )
 
 logger = logging.getLogger(__name__)
-
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _to_pgvector_literal(vec: list[float]) -> str:
@@ -444,14 +442,11 @@ class PgVectorStore:
     def count(self) -> int:
         if not self._available:
             return 0
-        try:
-            from sqlalchemy import text
+        from sqlalchemy import text
 
-            with self._engine.connect() as conn:
-                row = conn.execute(text(f"SELECT count(*) FROM {self._table}")).fetchone()
-            return int(row[0]) if row is not None else 0
-        except Exception:
-            return 0
+        with self._engine.connect() as conn:
+            row = conn.execute(text(f"SELECT count(*) FROM {self._table}")).fetchone()
+        return int(row[0]) if row is not None else 0
 
 
 # ---------------------------------------------------------------------------

@@ -86,12 +86,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 import time
 from collections.abc import Callable
 from typing import Any
 
+from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
 from opencrab.stores._sqlite_base import _SqliteConnMixin
 from opencrab.stores._vector_base import (
     default_metadatas,
@@ -109,8 +109,6 @@ logger = logging.getLogger(__name__)
 # down to the partition key so the common filters stay exact at any scale; only
 # residual constraints (e.g. `space`) fall back to a bounded post-filter.
 _VEC0_K_MAX = 4096
-
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _sign_bits(vec: list[float]) -> bytes:
@@ -802,14 +800,9 @@ class SqliteVecStore(_SqliteConnMixin):
     def count(self) -> int:
         if not self._available:
             return 0
-        try:
-            return int(
-                self._conn.execute(
-                    f"SELECT count(*) FROM {self._table}"
-                ).fetchone()[0]
-            )
-        except Exception:
-            return 0
+        return int(
+            self._conn.execute(f"SELECT count(*) FROM {self._table}").fetchone()[0]
+        )
 
 
 # ---------------------------------------------------------------------------
