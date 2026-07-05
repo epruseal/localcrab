@@ -5,8 +5,11 @@ SQL-text differences exercised by the doc-store 13-method surface
 
 THIS IS NOT A GENERAL SQL RENDERER. It only reproduces the handful of
 fragments those two stores actually emit today:
-    - INSERT (plain) / INSERT-as-upsert (INSERT OR REPLACE vs
-      INSERT ... ON CONFLICT ... DO UPDATE SET)
+    - INSERT (plain) / INSERT-as-upsert (``INSERT ... ON CONFLICT (...) DO
+      UPDATE SET ...`` — identical shape on both dialects; SQLite has
+      supported this upsert syntax since 3.24 (2018), see "ROWID STABILITY"
+      below for why this replaced an earlier ``INSERT OR REPLACE`` SQLite
+      branch)
     - DDL for the three doc-store tables (doc_nodes / doc_sources /
       audit_log), from one dialect-neutral ``SchemaSpec``
     - a couple of small per-value helpers (timestamp bind value, "now"
@@ -32,6 +35,27 @@ WHAT IT DELIBERATELY DOES NOT COVER:
 DERIVATION: every fragment below was checked against the literal SQL text in
 local_sql_doc_store.py and pg_doc_store.py at Stage 6a authoring time (see
 DOC_STORE_SCHEMA in _sql_doc_base.py for the exact column-by-column mapping).
+
+ROWID STABILITY (Stage 6b post-adoption fix — a real regression the reviewer
+caught, not a Stage 6a design choice): ``upsert()``'s SQLite branch originally
+emitted ``INSERT OR REPLACE``, which is a DELETE-then-INSERT under the hood —
+it allocates a NEW rowid for the replaced row. The pre-refactor
+local_graph_store.py instead hand-wrote ``INSERT ... ON CONFLICT (...) DO
+UPDATE SET ...`` (rowid-preserving), because _sql_graph_base.py's
+find_neighbors()/export_*() rely on stable, repeatable no-ORDER-BY scan order
+across re-upserts of already-seen keys (a LIMIT-capped hub fan-out must
+return the *same* truncated subset run over run, not just an unordered
+equivalent set — see _sql_graph_base.py's find_neighbors() docstring). Once
+LocalGraphStore adopted this shared dialect, the OR-REPLACE branch silently
+reintroduced that instability. Fixed by dropping the SQLite/PG branch
+entirely: SQLite has supported ``ON CONFLICT (...) DO UPDATE SET col =
+EXCLUDED.col`` since 3.24 (2018), so one code path now serves both dialects.
+The doc-store callers (upsert_node_doc/upsert_source) are unaffected by this
+change in the sense that matters here — list_nodes()/list_sources() are
+already exercised only via order-agnostic (sorted-set) parity assertions, so
+they never depended on OR REPLACE's delete+reinsert behavior for
+correctness — but they get the same rowid-preserving upsert as a side effect
+of the unification.
 """
 
 from __future__ import annotations
@@ -171,16 +195,13 @@ class SqlDialect:
         *,
         json_columns: Sequence[str] = (),
     ) -> str:
-        """INSERT ... ON CONFLICT DO UPDATE (PG) / INSERT OR REPLACE (SQLite).
-
-        ``conflict_cols`` is unused for SQLite (INSERT OR REPLACE relies on
-        the table's own PK/UNIQUE constraint implicitly — matches
-        local_sql_doc_store.py's ``INSERT OR REPLACE INTO doc_nodes(...)``
-        exactly) but is required to build PG's ``ON CONFLICT (...)`` clause.
+        """INSERT ... ON CONFLICT (...) DO UPDATE SET ... — identical shape on
+        both dialects (see module docstring's "ROWID STABILITY": SQLite's
+        upsert syntax, supported since 3.24, is used here instead of INSERT
+        OR REPLACE precisely because it preserves the existing row's rowid
+        instead of deleting and reinserting it).
         """
         base = self.insert(table, columns, json_columns=json_columns)
-        if self.name == "sqlite":
-            return base.replace("INSERT INTO", "INSERT OR REPLACE INTO", 1)
         conflict = ", ".join(conflict_cols)
         set_clause = ",\n    ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
         return f"{base}\nON CONFLICT ({conflict}) DO UPDATE SET\n    {set_clause}"

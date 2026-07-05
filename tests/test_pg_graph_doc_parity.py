@@ -706,3 +706,61 @@ class TestTypedPropertiesAndNullSemantics:
             local.close()
             with pg_engine.begin() as conn:
                 conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+class TestUpsertRowidStability:
+    """Regression pin for the "ROWID STABILITY" fix in _sql_dialect.py:
+    SqlDialect.upsert() must use ``ON CONFLICT (...) DO UPDATE SET ...`` on
+    BOTH backends, never SQLite's ``INSERT OR REPLACE`` (a delete+reinsert
+    that allocates a new rowid). find_neighbors()/export_*() have no
+    ORDER BY, so their scan order tracks physical row order; re-upserting an
+    already-seen edge must not silently reshuffle that order — a LIMIT-capped
+    hub fan-out must return a *stable* truncated subset across repeated
+    re-ingestion (the everyday reingest-pipeline case), not just an
+    unordered-equivalent one from run to run.
+
+    Was RED against the SQLite-adopted _sql_graph_base.py before the fix
+    (INSERT OR REPLACE moved the re-upserted edge to the end of the physical
+    scan order); confirmed green after switching SQLite to ON CONFLICT DO
+    UPDATE (rowid-preserving, matching pre-refactor local_graph_store.py's
+    hand-written SQL and PG's pre-existing behavior)."""
+
+    def _neighbor_ids(self, store, anchor: str) -> list[str]:
+        return [
+            n["properties"]["id"]
+            for n in store.find_neighbors(anchor, direction="out", depth=1, limit=100)
+        ]
+
+    def test_reupsert_edge_does_not_reshuffle_scan_order(self, tmp_path, pg_engine):
+        schema = f"t{uuid.uuid4().hex[:12]}_rowid"
+        local = LocalGraphStore(str(tmp_path / "rowid.db"))
+        pg = PGGraphStore(pg_engine, schema=schema)
+        try:
+            for store in (local, pg):
+                store.upsert_node("Anchor", "anchor1", {})
+                for i in range(10):
+                    store.upsert_node("Leaf", f"leaf{i}", {})
+                    store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", f"leaf{i}", {"v": 1})
+
+            local_before = self._neighbor_ids(local, "anchor1")
+            pg_before = self._neighbor_ids(pg, "anchor1")
+            assert len(local_before) == 10
+            assert len(pg_before) == 10
+
+            # Re-upsert a MIDDLE edge (same conflict key: from/relation/to) with
+            # changed properties — must UPDATE in place, not delete+reinsert.
+            for store in (local, pg):
+                store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", "leaf5", {"v": 2})
+
+            local_after = self._neighbor_ids(local, "anchor1")
+            pg_after = self._neighbor_ids(pg, "anchor1")
+
+            assert local_after == local_before, (
+                "SQLite scan order changed after a same-key edge re-upsert — "
+                "rowid was not preserved (INSERT OR REPLACE regression)"
+            )
+            assert pg_after == pg_before
+        finally:
+            local.close()
+            with pg_engine.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

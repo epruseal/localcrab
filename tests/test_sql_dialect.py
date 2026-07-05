@@ -131,7 +131,11 @@ def test_postgres_insert_plain_casts_json_columns():
     )
 
 
-def test_sqlite_upsert_is_insert_or_replace():
+def test_sqlite_upsert_on_conflict_do_update():
+    """SQLite's upsert uses ON CONFLICT DO UPDATE, same as PG — NOT INSERT OR
+    REPLACE, which would allocate a new rowid on every conflict (delete +
+    reinsert) and destabilize no-ORDER-BY scan order across re-upserts of an
+    already-seen key. See module docstring's "ROWID STABILITY"."""
     sql = SQLITE.upsert(
         "doc_nodes",
         ["space", "node_id", "node_type", "properties", "updated_at"],
@@ -139,8 +143,12 @@ def test_sqlite_upsert_is_insert_or_replace():
         update_cols=["node_type", "properties", "updated_at"],
         json_columns=["properties"],
     )
-    assert sql.startswith("INSERT OR REPLACE INTO doc_nodes(")
-    assert "ON CONFLICT" not in sql
+    assert sql.startswith("INSERT INTO doc_nodes(")
+    assert "OR REPLACE" not in sql
+    assert "ON CONFLICT (space, node_id) DO UPDATE SET" in sql
+    assert "node_type = EXCLUDED.node_type" in sql
+    assert "properties = EXCLUDED.properties" in sql
+    assert "updated_at = EXCLUDED.updated_at" in sql
     assert "?" not in sql  # named placeholders, not qmark — see test_sqlite_insert_plain
     for col in ("space", "node_id", "node_type", "properties", "updated_at"):
         assert f":{col}" in sql

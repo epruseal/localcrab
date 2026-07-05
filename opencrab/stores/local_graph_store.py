@@ -21,8 +21,8 @@ PERF NOTE (find_neighbors hub fan-out): this adopter does NOT override
     ``_prefetch_frontier`` — the base's default (one per-node query per BFS
     level, capped at the level-wide ``limit``) was benchmarked against a
     ~10k-out-edge hub node vs. the pre-adoption "live remaining" SQL LIMIT and
-    found to not regress materially (see scripts/bench_local_graph_hub.py and
-    the Stage 6b F3 handoff notes) — the historical 32x hub-fanout fix
+    found to not regress materially (measured ~1.2x, well under threshold) —
+    the historical 32x hub-fanout fix
     (see git history for this file) is preserved by the *inner* `_expand`
     loop's `[:remaining]` slice + early `break`, both still present in
     ``_sql_graph_base.py``'s ``_expand``, so results are unaffected either way.
