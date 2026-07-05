@@ -321,3 +321,88 @@ class TestMongoStoreEdgeCases:
 
         set_doc = mock_db["nodes"].update_one.call_args[0][1]["$set"]
         assert "owner_id" not in set_doc
+
+
+# ---------------------------------------------------------------------------
+# OntologyBuilder <-> mongo audit contract
+# ---------------------------------------------------------------------------
+#
+# BUG FOUND: opencrab/ontology/builder.py's add_edge() calls
+# self._mongo.log_event(...) for the "MongoDB audit" step (~line 263)
+# *without* a try/except, unlike add_node()'s mongo block (~line 120-131)
+# which wraps upsert_node_doc + log_event together. Once log_event was
+# changed (this stage) to raise RuntimeError instead of silently
+# swallowing insert failures, a transient Mongo write error during
+# add_edge's audit step now propagates out of add_edge entirely — even
+# though the Neo4j/SQL writes already succeeded. Fixed by wrapping the
+# edge audit block in the same try/except + output["stores"]["docs"]
+# error-marker pattern already used everywhere else in this file.
+
+
+class _StubGraphOrSqlStore:
+    """Minimal stand-in for Neo4jStore/SQLStore — reports unavailable so
+    add_edge's graph/sql branches take the simple 'unavailable' path and
+    only the mongo audit branch under test is exercised."""
+
+    available = False
+
+
+def _make_builder(mongo: MagicMock):
+    from opencrab.ontology.builder import OntologyBuilder
+
+    return OntologyBuilder(
+        neo4j=_StubGraphOrSqlStore(), mongo=mongo, sql=_StubGraphOrSqlStore()
+    )
+
+
+class TestOntologyBuilderMongoAuditContract:
+    def test_add_edge_docs_marker_unchanged_on_success(self):
+        # Success-path marker stays the literal "audited" — pinned as a
+        # public API shape by test_service_paths_characterization.py's
+        # TestNodeEdgeWriteMCP/HTTP::test_add_edge_success_shape. Only the
+        # error path changes in this fix.
+        mongo = MagicMock(available=True)
+        mongo.log_event.return_value = "ev-1"
+        builder = _make_builder(mongo)
+
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+
+        assert result["stores"]["docs"] == "audited"
+
+    def test_add_edge_docs_marker_is_error_when_log_event_raises(self):
+        # Red before the fix: this raised RuntimeError out of add_edge
+        # entirely instead of degrading gracefully like every other store
+        # branch (graph/sql) and like add_node's mongo block.
+        mongo = MagicMock(available=True)
+        mongo.log_event.side_effect = RuntimeError("insert failed")
+        builder = _make_builder(mongo)
+
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+
+        assert result["stores"]["docs"] == "error: insert failed"
+
+    def test_add_edge_docs_marker_unavailable_when_mongo_unavailable(self):
+        mongo = MagicMock(available=False)
+        builder = _make_builder(mongo)
+
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+
+        assert result["stores"]["docs"] == "unavailable"
+        mongo.log_event.assert_not_called()
+
+    def test_add_node_docs_marker_symmetric_success_case(self):
+        # Symmetric normal-path check: add_node's mongo block (already
+        # try/except-protected) continues to report "ok (id=<mongo_id>)"
+        # now that log_event returns a str instead of None.
+        mongo = MagicMock(available=True)
+        mongo.upsert_node_doc.return_value = "node-doc-1"
+        mongo.log_event.return_value = "ev-2"
+        builder = _make_builder(mongo)
+
+        result = builder.add_node(
+            "subject", "User", "u1",
+            {"name": "Alice", "email": "a@ex.com", "role": "admin"},
+        )
+
+        assert result["stores"]["docs"] == "ok (id=node-doc-1)"
+        mongo.log_event.assert_called_once()
