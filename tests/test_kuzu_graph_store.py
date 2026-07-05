@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytest.importorskip("ladybug")
+
 
 @pytest.fixture
 def store(tmp_path: Path):
