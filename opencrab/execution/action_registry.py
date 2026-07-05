@@ -7,7 +7,7 @@ Schema is optional: if no file exists for an action, validation always passes.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ import yaml
 ACTIONS_DIR = Path(__file__).parent.parent / "schemas" / "actions"
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_action_schema(action_name: str) -> dict[str, Any] | None:
     """
     Load the YAML schema for *action_name* from schemas/actions/<action_name>.yaml.

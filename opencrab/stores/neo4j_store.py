@@ -299,6 +299,7 @@ class Neo4jStore:
         Separated for unit testing — exercising real Neo4j is out of scope
         for this change; we only verify the generated query structure.
         """
+        depth = int(depth)
         arrow = {
             "out": "-[rels*1..{depth}]->",
             "in": "<-[rels*1..{depth}]-",

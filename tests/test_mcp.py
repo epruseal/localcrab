@@ -7,8 +7,6 @@ All tests mock the underlying stores so no live services are required.
 from __future__ import annotations
 
 import json
-from io import StringIO
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -671,7 +669,6 @@ class TestImpactEngine:
         assert len(triggered_ids) >= 3
 
     def test_analyse_persists_to_sql(self, engine):
-        from opencrab.stores.sql_store import SQLStore
 
         engine.analyse("n4", "update")
         records = engine._sql.get_impacts("n4")

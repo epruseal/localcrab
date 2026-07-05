@@ -141,7 +141,7 @@ class BM25Index:
     # ------------------------------------------------------------------
 
     @classmethod
-    def build(cls, nodes: list[dict[str, Any]]) -> "BM25Index":
+    def build(cls, nodes: list[dict[str, Any]]) -> BM25Index:
         """
         Build a BM25 index from a list of node dicts.
 

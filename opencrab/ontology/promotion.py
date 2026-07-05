@@ -164,7 +164,7 @@ class PromotionEngine:
         edge_results = []
         for ev_id in (evidence_ids or []):
             try:
-                edge = self._builder.add_edge(
+                self._builder.add_edge(
                     from_space="evidence",
                     from_id=ev_id,
                     relation="supports",

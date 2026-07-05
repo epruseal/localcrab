@@ -12,7 +12,6 @@ import pytest
 from opencrab.config import Settings
 from opencrab.stores.resilient_embedding import ResilientEmbeddingFunction
 
-
 # ----------------------------------------------------------------------
 # config.py: openai_api_bases comma parsing
 # ----------------------------------------------------------------------

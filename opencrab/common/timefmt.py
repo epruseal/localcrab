@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def now_iso() -> str:
@@ -11,4 +11,4 @@ def now_iso() -> str:
     Consolidates the identical ``_now_iso`` definitions previously duplicated in
     execution/, ontology/, and billing/ modules.
     """
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

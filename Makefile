@@ -1,4 +1,4 @@
-.PHONY: help install dev-install status serve serve-http query manifest lint format test coverage seed
+.PHONY: help install dev-install status serve serve-http manifest lint format test coverage seed
 
 PYTHON := python
 PIP    := pip

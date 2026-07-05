@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 SEEN_INDEX_FILE = ".seen.json"
 
@@ -17,7 +16,7 @@ def _now_iso() -> str:
     the one-liner rather than import it because ``crabharness`` is an
     independent package (it must stay importable with opencrab absent).
     """
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _get_seen_index_path(workspace_dir: Path) -> Path:

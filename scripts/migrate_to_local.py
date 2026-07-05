@@ -705,7 +705,7 @@ def main() -> None:
     local_data_dir = os.path.abspath(local_data_dir)
     os.makedirs(local_data_dir, exist_ok=True)
 
-    console.print(f"\n[bold]OpenCrab docker → local 마이그레이션[/bold]")
+    console.print("\n[bold]OpenCrab docker → local 마이그레이션[/bold]")
     console.print(f"  로컬 데이터 디렉토리: {local_data_dir}")
     console.print(f"  dry-run: {args.dry_run}\n")
 

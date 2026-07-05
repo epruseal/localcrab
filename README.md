@@ -152,14 +152,16 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 | `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`) |
 | `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--pack-id`, `--json-output`) |
 | `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
-| `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드) |
-| `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드 |
+| `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드)[^media] |
+| `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드[^media] |
 | `opencrab export-neo4j-pack` | 그래프 스냅샷을 OpenCrab Pack v1 JSONL로 내보내기 |
 | `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 |
 | `opencrab packs list` | 적재된 팩 목록 |
 | `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
 | `opencrab packs backfill-pack-id` | 노드·엣지에 `pack_id` 역보충 |
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
+
+[^media]: easyocr/torch는 기본 pip extra에 포함되지 않습니다. 별도 설치 필요: `pip install -r requirements/localcrab-media.txt`.
 
 ---
 
@@ -257,8 +259,9 @@ export OPENAI_API_BASE="http://embed-host-1:1234/v1,http://embed-host-2:1234/v1"
 
 ```bash
 export EMBEDDING_BACKEND=openai
-python backfill_kure.py
 ```
+
+> `backfill_kure.py`는 이 레포에 **포함되어 있지 않은 외부 운영 스크립트**입니다(`~/opencrab-dump` 쪽에서 관리, vector/doc upsert 전용). 위 환경변수를 설정한 뒤 해당 운영 스크립트를 실행해 재임베딩하세요. 상세: [docs/ingestion-via-mcp-plan.md](./docs/ingestion-via-mcp-plan.md).
 
 ## 벡터 스토어 백엔드 (`VECTOR_BACKEND`)
 
@@ -325,6 +328,17 @@ python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify
 
 ---
 
+## 기타 환경변수
+
+| 환경변수 | 기본값 | 설명 |
+|----------|--------|------|
+| `ANTHROPIC_API_KEY` | _(없음)_ | `opencrab extract`의 `--api-key` 미지정 시 폴백(Claude 모델 호출용) |
+| `OPENCRAB_BM25_NODE_LIMIT` | `50000` | BM25 인덱스가 doc 스토어에서 로드하는 노드 상한(인덱스 빌드 시간·메모리 제한). 상세: [ARCHITECTURE.md §6](./docs/ARCHITECTURE.md) |
+| `OPENCRAB_BM25_DEBOUNCE` | `1.5` | BM25 백그라운드 재빌드 디바운스(초) — 연속 ingest를 1회 재빌드로 합침. 상세: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
+| `OPENCRAB_AUTO_PACK_MIN_SCORE` | `10.0` | 자동 팩 선택(키워드 기반 결정적 스코어링)에서 top-1 후보를 채택하는 최소 점수. 미달 시 팩 필터 없이 조회 |
+
+---
+
 ## MetaOntology OS
 
 ### 9 Spaces
@@ -357,7 +371,7 @@ STORAGE_MODE=docker opencrab serve
 
 | 역할 | 백엔드 |
 |------|--------|
-| 그래프 | Neo4j (`NEO4J_URI`) |
+| 그래프 | Neo4j (`NEO4J_URI`, `NEO4J_DATABASE`) |
 | 문서 | MongoDB (`MONGODB_URI`) |
 | 벡터 | Chroma HTTP (`CHROMA_HOST:CHROMA_PORT`) |
 | SQL | PostgreSQL (`POSTGRES_URL`) |

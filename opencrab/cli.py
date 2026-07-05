@@ -850,62 +850,64 @@ def packs_backfill_pack_id(
     }
 
     conn = _sqlite3.connect(db_path)
-    conn.row_factory = _sqlite3.Row
-    cur = conn.cursor()
+    try:
+        conn.row_factory = _sqlite3.Row
+        cur = conn.cursor()
 
-    def _process(table: str, key_cols: tuple[str, ...]) -> None:
-        cur.execute(f"SELECT {', '.join(key_cols)}, properties FROM {table}")
-        rows = cur.fetchall()
-        for row in rows:
-            try:
-                props = json.loads(row["properties"]) if row["properties"] else {}
-            except (TypeError, ValueError):
-                props = {}
-            if not isinstance(props, dict):
-                summary[f"{table.split('_')[1]}_skipped"] += 1
-                continue
-            if props.get("pack_id"):
-                continue
-            inferred: str | None = None
-            for candidate_key in ("source_path", "source_id", "id"):
-                value = props.get(candidate_key)
-                if value:
-                    inferred = infer_pack_id_from_path(str(value))
-                    if inferred:
-                        break
-            if not inferred:
-                # node_id column from the row itself
-                for key in key_cols:
-                    if key.endswith("_id"):
-                        inferred = infer_pack_id_from_path(str(row[key]))
+        def _process(table: str, key_cols: tuple[str, ...]) -> None:
+            cur.execute(f"SELECT {', '.join(key_cols)}, properties FROM {table}")
+            rows = cur.fetchall()
+            for row in rows:
+                try:
+                    props = json.loads(row["properties"]) if row["properties"] else {}
+                except (TypeError, ValueError):
+                    props = {}
+                if not isinstance(props, dict):
+                    summary[f"{table.split('_')[1]}_skipped"] += 1
+                    continue
+                if props.get("pack_id"):
+                    continue
+                inferred: str | None = None
+                for candidate_key in ("source_path", "source_id", "id"):
+                    value = props.get(candidate_key)
+                    if value:
+                        inferred = infer_pack_id_from_path(str(value))
                         if inferred:
                             break
-            if inferred:
-                props["pack_id"] = inferred
-                summary_key = f"{table.split('_')[1]}_inferred"
-                summary[summary_key] += 1
-            elif assume_pack_id:
-                props["pack_id"] = assume_pack_id
-                summary_key = f"{table.split('_')[1]}_assumed"
-                summary[summary_key] += 1
-            else:
-                summary_key = f"{table.split('_')[1]}_skipped"
-                summary[summary_key] += 1
-                continue
-            if not effective_dry_run:
-                set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
-                values = [json.dumps(props)] + [row[c] for c in key_cols]
-                cur.execute(
-                    f"UPDATE {table} SET properties=? WHERE {set_clauses}",
-                    values,
-                )
+                if not inferred:
+                    # node_id column from the row itself
+                    for key in key_cols:
+                        if key.endswith("_id"):
+                            inferred = infer_pack_id_from_path(str(row[key]))
+                            if inferred:
+                                break
+                if inferred:
+                    props["pack_id"] = inferred
+                    summary_key = f"{table.split('_')[1]}_inferred"
+                    summary[summary_key] += 1
+                elif assume_pack_id:
+                    props["pack_id"] = assume_pack_id
+                    summary_key = f"{table.split('_')[1]}_assumed"
+                    summary[summary_key] += 1
+                else:
+                    summary_key = f"{table.split('_')[1]}_skipped"
+                    summary[summary_key] += 1
+                    continue
+                if not effective_dry_run:
+                    set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
+                    values = [json.dumps(props)] + [row[c] for c in key_cols]
+                    cur.execute(
+                        f"UPDATE {table} SET properties=? WHERE {set_clauses}",
+                        values,
+                    )
 
-    _process("graph_nodes", ("node_type", "node_id"))
-    _process("graph_edges", ("from_type", "from_id", "relation", "to_type", "to_id"))
+        _process("graph_nodes", ("node_type", "node_id"))
+        _process("graph_edges", ("from_type", "from_id", "relation", "to_type", "to_id"))
 
-    if not effective_dry_run:
-        conn.commit()
-    conn.close()
+        if not effective_dry_run:
+            conn.commit()
+    finally:
+        conn.close()
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:

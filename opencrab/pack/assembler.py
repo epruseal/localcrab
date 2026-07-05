@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import zipfile
@@ -13,6 +14,8 @@ from typing import Any
 from opencrab.common.hashing import file_sha256
 
 EMPTY_JSONL = ""
+
+_PACK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -161,6 +164,8 @@ def assemble_pack_v1(
     title: str | None = None,
 ) -> dict[str, Any]:
     """Build an OpenCrab Pack v1 ZIP from a pack staging directory."""
+    if not _PACK_ID_RE.fullmatch(pack_id) or ".." in pack_id:
+        raise ValueError(f"invalid pack_id: {pack_id!r}")
     source = Path(source_dir).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)

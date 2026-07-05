@@ -10,11 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
-from opencrab.ontology.rebac import AccessDecision, ReBACEngine
+from opencrab.ontology.rebac import ReBACEngine
 from opencrab.stores.local_graph_store import LocalGraphStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -6,8 +6,6 @@ STORAGE_MODE value, and that Settings.is_local behaves correctly.
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_settings_local_is_local_true() -> None:
     from opencrab.config import Settings

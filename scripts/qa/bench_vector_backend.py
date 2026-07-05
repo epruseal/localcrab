@@ -464,9 +464,9 @@ def main() -> int:
 
     rng = random.Random(args.seed)
 
-    import chromadb
     import sqlite3
 
+    import chromadb
     import sqlite_vec
 
     live_chroma = os.path.join(args.data_dir, "chroma")
@@ -522,12 +522,14 @@ def main() -> int:
                 # reservoir sample
                 seen += 1
                 if len(q_ids) < K:
-                    q_ids.append(_id); q_raw.append(vec)
+                    q_ids.append(_id)
+                    q_raw.append(vec)
                     q_vecs.append(sqlite_vec.serialize_float32(vec))
                 else:
                     j = rng.randint(0, seen - 1)
                     if j < K:
-                        q_ids[j] = _id; q_raw[j] = vec
+                        q_ids[j] = _id
+                        q_raw[j] = vec
                         q_vecs[j] = sqlite_vec.serialize_float32(vec)
             conn.executemany(
                 "INSERT INTO v(node_id, pack_id, embedding) VALUES (?,?,?)", rows

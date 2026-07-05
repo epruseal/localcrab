@@ -41,7 +41,7 @@ parsed/
 ocr/
 images/
 clip/
-scripts/import_to_neo4j.py
+scripts/import_pack_graph_to_neo4j.py
 neo4j/import_status.json
 neo4j/export_status.json
 ```

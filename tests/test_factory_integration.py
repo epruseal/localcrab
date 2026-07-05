@@ -8,9 +8,6 @@ lru_cache re-use) so each test gets a clean, isolated Settings instance.
 
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

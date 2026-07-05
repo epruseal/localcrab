@@ -18,7 +18,6 @@ from typing import Any
 
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
-from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore

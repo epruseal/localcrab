@@ -7,14 +7,12 @@ ChromaStore는 MagicMock으로 대체한다.
 
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from opencrab.ontology.query import HybridQuery
 from opencrab.stores.local_graph_store import LocalGraphStore
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
