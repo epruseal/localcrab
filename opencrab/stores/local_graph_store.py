@@ -155,6 +155,8 @@ class LocalGraphStore(_SqliteConnMixin):
         return row["node_type"] if row else None
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
+        """True iff the node itself was deleted (unified B2 contract) —
+        the incident-edge cleanup below is a side effect, not the signal."""
         self._require_available()
         with self._lock:
             cur = self._conn.cursor()
@@ -162,12 +164,13 @@ class LocalGraphStore(_SqliteConnMixin):
                 "DELETE FROM graph_nodes WHERE node_type=? AND node_id=?",
                 (node_type, node_id),
             )
+            node_deleted = cur.rowcount > 0
             cur.execute(
                 "DELETE FROM graph_edges WHERE (from_type=? AND from_id=?) OR (to_type=? AND to_id=?)",
                 (node_type, node_id, node_type, node_id),
             )
             self._conn.commit()
-            return cur.rowcount > 0
+            return node_deleted
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -390,7 +393,7 @@ class LocalGraphStore(_SqliteConnMixin):
 
         while queue:
             current_id, path = queue.popleft()
-            if len(path) >= max_depth * 2:
+            if len(path) >= max_depth:
                 continue
 
             cur.execute(

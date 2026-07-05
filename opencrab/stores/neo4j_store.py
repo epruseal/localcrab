@@ -346,7 +346,7 @@ class Neo4jStore:
 
         cypher = f"""
             MATCH path = shortestPath(
-                (a {{id: $from_id}})-[*1..{max_depth}]-(b {{id: $to_id}})
+                (a {{id: $from_id}})-[*1..{max_depth}]->(b {{id: $to_id}})
             )
             RETURN [node IN nodes(path) | properties(node)] AS node_props,
                    [rel IN relationships(path) | type(rel)] AS rel_types
