@@ -55,6 +55,53 @@ def test_json_index_expr_per_dialect():
     assert POSTGRES.json_index_expr("properties", "pack_id") == "(properties->>'pack_id')"
 
 
+def test_list_packs_pg_json_get_is_parenthesized_in_concat():
+    """Regression guard: _sql_graph_base.py's list_packs() builds
+    `'dataset:' || {json_get(...)}` — on PG, `||` binds tighter than `->>`,
+    so an unparenthesized `'dataset:' || properties->>'pack_id'` parses as
+    `('dataset:' || properties) ->> 'pack_id'` and throws
+    InvalidTextRepresentation at runtime (concatenating text with the raw
+    jsonb column) instead of raising at review time. This bug shipped once
+    (caught by the PG parity suite, not by any SQLite-only unit test, since
+    SQLite's json_extract() is a function call with no such precedence
+    trap) — this test pins the fix at the dialect/SQL-text level so it can't
+    silently regress even without a live PG connection."""
+    from opencrab.stores._sql_graph_base import _SqlGraphStoreBase
+
+    class _CapturingPgDouble(_SqlGraphStoreBase):
+        _dialect = POSTGRES
+
+        def __init__(self) -> None:
+            self._available = True
+            self.captured_sql = ""
+
+        def _table(self, name: str) -> str:
+            return name
+
+        def _fetch_all(self, sql, params):
+            self.captured_sql = sql
+            return []
+
+        def _fetch_one(self, sql, params):
+            raise NotImplementedError
+
+        def _exec_write(self, sql, params):
+            raise NotImplementedError
+
+        def _exec_write_many(self, statements):
+            raise NotImplementedError
+
+        def _exec_write_batch(self, sql, params_list):
+            raise NotImplementedError
+
+        def _require_available(self) -> None:
+            pass
+
+    store = _CapturingPgDouble()
+    store.list_packs()
+    assert "'dataset:' || (properties->>'pack_id')" in store.captured_sql
+
+
 # ---------------------------------------------------------------------------
 # insert / upsert SQL text
 # ---------------------------------------------------------------------------

@@ -527,7 +527,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 {pid} AS pack_id,
                 COUNT(*) AS node_count,
                 COALESCE(
-                    MAX(CASE WHEN node_id = 'dataset:' || {pid} THEN {title} END),
+                    -- ({pid}) parenthesized: PG's `||` binds tighter than `->>`,
+                    -- so an unparenthesized `'dataset:' || properties->>'pack_id'`
+                    -- parses as `('dataset:' || properties) ->> 'pack_id'` and
+                    -- throws on the raw jsonb concat. SQLite's json_extract(...)
+                    -- is a function call, so the extra parens are a no-op there.
+                    MAX(CASE WHEN node_id = 'dataset:' || ({pid}) THEN {title} END),
                     MAX({src_title}),
                     ''
                 ) AS sample_title

@@ -685,18 +685,6 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in src["metadata"]
             assert src["metadata"]["shared"] == "new"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Stage 6b Deliverable 2 (user-approved: unify pack_id to str). "
-            "The str-coercion now lives in _sql_graph_base.py's list_packs() "
-            "(inherited by any adopter), but LocalGraphStore/PGGraphStore are "
-            "not yet wired onto that base (F3/F4 follow-up) — until then, "
-            "LocalGraphStore's own list_packs() still returns pack_id as the "
-            "native JSON scalar type (int here), so this positive contract "
-            "is RED-pending-F3."
-        ),
-    )
     def test_list_packs_pack_id_is_str_on_both_backends(self, tmp_path, pg_engine):
         """Positive contract (supersedes the former
         test_list_packs_pack_id_type_divergence_int_vs_str, which merely

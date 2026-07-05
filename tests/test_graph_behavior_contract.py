@@ -305,11 +305,10 @@ class TestDeleteNodeTypeMismatch:
     """delete_node(node_type, node_id) must match on the (node_type, node_id)
     PAIR, not node_id alone — a wrong node_type must be a no-op (return
     False, node stays). local/pg/neo4j already do this (WHERE .../Cypher
-    label checks both); kuzu_graph_store.py's Cypher (``MATCH (n:OntologyNode
-    {node_id: $id}) DETACH DELETE n``) matches by node_id ONLY, so a wrong
-    node_type still deletes the node — Stage 6b's inherited RED case (its
-    fix belongs to a kuzu-specific lane / F4, not the two SQL stores this
-    stage migrates)."""
+    label checks both); kuzu_graph_store.py's Cypher now also matches both
+    (``MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) DETACH DELETE n``)
+    — fixed in Stage 6b F4 (was previously node_id-only, so a wrong node_type
+    still deleted the node)."""
 
     def test_local_wrong_type_is_noop(self, local_store):
         local_store.upsert_node("Item", "a", {})
@@ -322,16 +321,6 @@ class TestDeleteNodeTypeMismatch:
         assert pg_store.delete_node("WrongType", "a") is False
         assert pg_store.get_node_by_id("a") is not None
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "kuzu_graph_store.py's delete_node Cypher matches by node_id "
-            "only, ignoring node_type -- deleting with a wrong node_type "
-            "still removes the node. Fix: add node_type to the MATCH/WHERE "
-            "clause (owned by a dedicated kuzu lane, not Stage 6b's two SQL "
-            "graph stores)."
-        ),
-    )
     def test_kuzu_wrong_type_is_noop(self, kuzu_store):
         kuzu_store.upsert_node("Item", "a", {})
         assert kuzu_store.delete_node("WrongType", "a") is False
