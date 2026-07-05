@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -435,3 +436,165 @@ class TestDocParity:
             assert local_hits and pg_hits
             assert all(h["metadata"]["pack_id"] == "packA" for h in local_hits)
             assert all(h["metadata"]["pack_id"] == "packA" for h in pg_hits)
+
+    def test_keyword_search_korean_corpus_top_set_overlap(self, tmp_path, pg_engine):
+        """FTS5 unicode61 (SQLite) vs to_tsvector('simple', ...) (PG) tokenize
+        CJK differently in general, but for whitespace-segmented Korean words
+        (this app's actual corpus shape) both should still retrieve the same
+        documents — asserted as set-membership overlap, matching the ASCII
+        keyword test's acceptance bar above."""
+        schema = f"t{uuid.uuid4().hex[:12]}_kr"
+        local = LocalSQLDocStore(str(tmp_path / "kr_doc.db"))
+        pg = PgDocStore(pg_engine, schema=schema)
+        try:
+            docs = [
+                ("kr_src0", "인공지능 기계학습 자연어처리 연구 문서", {"node_id": "kr_d0"}),
+                ("kr_src1", "인공지능 딥러닝 신경망 모델 학습", {"node_id": "kr_d1"}),
+                ("kr_src2", "데이터베이스 트랜잭션 격리 수준 설명", {"node_id": "kr_d2"}),
+            ]
+            for sid, text_, meta in docs:
+                local.upsert_source(sid, text_, meta)
+                pg.upsert_source(sid, text_, meta)
+
+            local_hits = local.keyword_search("인공지능 학습", limit=10)
+            pg_hits = pg.keyword_search("인공지능 학습", limit=10)
+            assert local_hits and pg_hits
+            local_ids = {h["source_id"] for h in local_hits}
+            pg_ids = {h["source_id"] for h in pg_hits}
+            assert local_ids & pg_ids, (
+                f"no top-10 overlap for Korean query: local={local_ids} pg={pg_ids}"
+            )
+        finally:
+            local.close()
+            with pg_engine.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+    def test_doc_node_updated_at_roundtrip_same_logical_instant(self, doc_pair):
+        """SQLite stores updated_at as an ISO-8601 string
+        (``datetime.now(UTC).isoformat()``); PG stores it as TIMESTAMPTZ and
+        stringifies it back via ``.isoformat()`` on read. Both must parse as
+        timezone-aware UTC instants captured around the same wall-clock
+        moment (this test's own upsert call), not merely as opaque strings."""
+        local, pg = doc_pair
+        local.upsert_node_doc("s1", "Doc", "ts_probe", {"x": 1})
+        pg.upsert_node_doc("s1", "Doc", "ts_probe", {"x": 1})
+        local_ts = datetime.fromisoformat(local.get_node_doc("s1", "ts_probe")["updated_at"])
+        pg_ts = datetime.fromisoformat(pg.get_node_doc("s1", "ts_probe")["updated_at"])
+        assert local_ts.tzinfo is not None and pg_ts.tzinfo is not None
+        now = datetime.now(UTC)
+        assert abs((now - local_ts).total_seconds()) < 10
+        assert abs((now - pg_ts).total_seconds()) < 10
+
+
+# ---------------------------------------------------------------------------
+# Typed properties / NULL semantics / unicode / upsert-overwrite / pack_id
+# filter edge cases (golden contract additions — R7 pre-unification hardening)
+# ---------------------------------------------------------------------------
+
+
+class TestTypedPropertiesAndNullSemantics:
+    def test_typed_properties_roundtrip_graph(self, graph_pair):
+        """int/float/bool/None/nested dict/list all roundtrip through
+        upsert_node/get_node with identical Python types and values on both
+        backends (both go through a full JSON encode/decode of the whole
+        properties blob, so no per-scalar type coercion applies here — unlike
+        the pack_id GROUP BY projection in list_packs(), see the dedicated
+        divergence test below)."""
+        local, pg = graph_pair
+        props = {
+            "count": 7,
+            "ratio": 3.14,
+            "flag_true": True,
+            "flag_false": False,
+            "nothing": None,
+            "nested": {"a": 1, "b": [1, 2, 3], "c": {"d": None}},
+            "items": [1, "two", 3.0, None, True],
+        }
+        for store in (local, pg):
+            store.upsert_node("TypedProbe", "typed1", props)
+        local_node = local.get_node("TypedProbe", "typed1")
+        pg_node = pg.get_node("TypedProbe", "typed1")
+        for key, value in props.items():
+            assert local_node[key] == value
+            assert pg_node[key] == value
+        assert local_node == pg_node
+
+    def test_null_value_vs_missing_key_distinction(self, graph_pair):
+        local, pg = graph_pair
+        for store in (local, pg):
+            store.upsert_node("NullProbe", "null1", {"present_null": None})
+        local_node = local.get_node("NullProbe", "null1")
+        pg_node = pg.get_node("NullProbe", "null1")
+        for node in (local_node, pg_node):
+            assert "present_null" in node
+            assert node["present_null"] is None
+            assert "absent_key" not in node
+
+    def test_unicode_korean_and_emoji_roundtrip(self, graph_pair):
+        local, pg = graph_pair
+        node_id = "한국어_노드_🐛"
+        props = {"name": "한글 이름 테스트", "emoji": "🦀🔥✨", "mixed": "hello 안녕 👋"}
+        for store in (local, pg):
+            store.upsert_node("UnicodeProbe", node_id, props)
+        local_node = local.get_node("UnicodeProbe", node_id)
+        pg_node = pg.get_node("UnicodeProbe", node_id)
+        for key, value in props.items():
+            assert local_node[key] == value
+            assert pg_node[key] == value
+        assert local.get_node_by_id(node_id)["id"] == node_id
+        assert pg.get_node_by_id(node_id)["id"] == node_id
+
+    def test_upsert_conflict_overwrites_not_merges(self, graph_pair):
+        """Second upsert_node() replaces the properties column wholesale
+        (``ON CONFLICT DO UPDATE SET properties = excluded/EXCLUDED``); a key
+        present only in the first write must NOT survive the second."""
+        local, pg = graph_pair
+        for store in (local, pg):
+            store.upsert_node("OverwriteProbe", "ow1", {"first_only": "x", "shared": "old"})
+            store.upsert_node("OverwriteProbe", "ow1", {"shared": "new"})
+        for store in (local, pg):
+            node = store.get_node("OverwriteProbe", "ow1")
+            assert "first_only" not in node
+            assert node["shared"] == "new"
+
+    def test_find_neighbors_empty_pack_ids_equals_none(self, graph_pair):
+        """``pack_ids=[]`` (empty list) must behave identically to
+        ``pack_ids=None`` on both backends — both are falsy in Python, so the
+        BFS's ``pack_set = set(pack_ids) if pack_ids else None`` guard treats
+        them the same (no filtering applied)."""
+        local, pg = graph_pair
+        kwargs_common = dict(direction="both", depth=1, limit=1000)
+        local_none = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
+        local_empty = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
+        pg_none = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
+        pg_empty = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
+        assert local_none == local_empty
+        assert pg_none == pg_empty
+        assert local_none == pg_none
+
+    def test_list_packs_pack_id_type_divergence_int_vs_str(self, tmp_path, pg_engine):
+        """DOCUMENTED DIVERGENCE (판단 보류, not fixed — pack_id is
+        conventionally always a string everywhere else in the app; this test
+        makes the underlying SQL-level type coercion explicit rather than
+        leaving it as a latent surprise). ``list_packs()`` projects pack_id
+        via a raw JSON field extraction: SQLite's ``json_extract()``
+        preserves the stored JSON scalar type (an int-valued pack_id
+        round-trips as a Python ``int``), while Postgres's ``->>`` operator
+        always coerces to ``text`` (the same pack_id round-trips as ``str``).
+        A caller comparing ``list_packs()[i]['pack_id']`` across backends
+        without normalizing via ``str()`` first will observe this."""
+        schema = f"t{uuid.uuid4().hex[:12]}_ipk"
+        local = LocalGraphStore(str(tmp_path / "intpack.db"))
+        pg = PGGraphStore(pg_engine, schema=schema)
+        try:
+            for store in (local, pg):
+                store.upsert_node("Item", "ipk_n1", {"pack_id": 42})
+                store.upsert_node("Item", "ipk_n2", {"pack_id": 42})
+            local_pid = local.list_packs()[0]["pack_id"]
+            pg_pid = pg.list_packs()[0]["pack_id"]
+            assert isinstance(local_pid, int) and local_pid == 42
+            assert isinstance(pg_pid, str) and pg_pid == "42"
+        finally:
+            local.close()
+            with pg_engine.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

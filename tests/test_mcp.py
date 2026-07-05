@@ -539,7 +539,10 @@ class TestMCPServer:
 
 class TestOntologyBuilder:
     @pytest.fixture
-    def builder(self):
+    def builder(self, fast_mongo_timeout):
+        # fast_mongo_timeout (tests/conftest.py) 는 이 fixture 재구성 시마다
+        # MongoStore가 실제로 5s씩 기다리던 연결 실패를 ~100ms로 단축한다
+        # (Neo4jStore는 DNS 실패로 이미 빠름, 병목이 아니었음).
         from opencrab.ontology.builder import OntologyBuilder
         from opencrab.stores.mongo_store import MongoStore
         from opencrab.stores.neo4j_store import Neo4jStore
