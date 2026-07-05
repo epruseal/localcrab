@@ -162,13 +162,15 @@ class KuzuGraphStore:
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """True iff the node itself was deleted (unified B2 contract) — a
         DETACH DELETE matching zero nodes does not raise, so existence must
-        be checked before the delete rather than inferred from "no exception"."""
+        be checked before the delete rather than inferred from "no exception".
+        The MATCH is on the (node_type, node_id) PAIR, matching every other
+        backend's delete_node contract — a wrong node_type must be a no-op."""
         self._require_available()
         try:
             existed = self.get_node(node_type, node_id) is not None
             self._conn.execute(
-                "MATCH (n:OntologyNode {node_id: $id}) DETACH DELETE n",
-                {"id": node_id},
+                "MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) DETACH DELETE n",
+                {"id": node_id, "nt": node_type},
             )
             return existed
         except Exception as exc:

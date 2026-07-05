@@ -18,6 +18,7 @@ from opencrab.stores._sql_dialect import (
     POSTGRES,
     SQLITE,
     Column,
+    IndexSpec,
     SchemaSpec,
     TableSpec,
 )
@@ -44,6 +45,61 @@ def test_bind_value_for_timestamp():
 def test_json_get_per_dialect():
     assert SQLITE.json_get("properties", "pack_id") == "json_extract(properties, '$.pack_id')"
     assert POSTGRES.json_get("properties", "pack_id") == "properties->>'pack_id'"
+
+
+def test_json_index_expr_per_dialect():
+    """PG needs an extra paren wrap for a functional index over an operator
+    expression (``->>``); SQLite's json_extract() is already a function call
+    so no extra wrap is needed — see _sql_graph_base.py's idx_nodes_pack."""
+    assert SQLITE.json_index_expr("properties", "pack_id") == "json_extract(properties, '$.pack_id')"
+    assert POSTGRES.json_index_expr("properties", "pack_id") == "(properties->>'pack_id')"
+
+
+def test_list_packs_pg_json_get_is_parenthesized_in_concat():
+    """Regression guard: _sql_graph_base.py's list_packs() builds
+    `'dataset:' || {json_get(...)}` — on PG, `||` binds tighter than `->>`,
+    so an unparenthesized `'dataset:' || properties->>'pack_id'` parses as
+    `('dataset:' || properties) ->> 'pack_id'` and throws
+    InvalidTextRepresentation at runtime (concatenating text with the raw
+    jsonb column) instead of raising at review time. This bug shipped once
+    (caught by the PG parity suite, not by any SQLite-only unit test, since
+    SQLite's json_extract() is a function call with no such precedence
+    trap) — this test pins the fix at the dialect/SQL-text level so it can't
+    silently regress even without a live PG connection."""
+    from opencrab.stores._sql_graph_base import _SqlGraphStoreBase
+
+    class _CapturingPgDouble(_SqlGraphStoreBase):
+        _dialect = POSTGRES
+
+        def __init__(self) -> None:
+            self._available = True
+            self.captured_sql = ""
+
+        def _table(self, name: str) -> str:
+            return name
+
+        def _fetch_all(self, sql, params):
+            self.captured_sql = sql
+            return []
+
+        def _fetch_one(self, sql, params):
+            raise NotImplementedError
+
+        def _exec_write(self, sql, params):
+            raise NotImplementedError
+
+        def _exec_write_many(self, statements):
+            raise NotImplementedError
+
+        def _exec_write_batch(self, sql, params_list):
+            raise NotImplementedError
+
+        def _require_available(self) -> None:
+            pass
+
+    store = _CapturingPgDouble()
+    store.list_packs()
+    assert "'dataset:' || (properties->>'pack_id')" in store.captured_sql
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +131,11 @@ def test_postgres_insert_plain_casts_json_columns():
     )
 
 
-def test_sqlite_upsert_is_insert_or_replace():
+def test_sqlite_upsert_on_conflict_do_update():
+    """SQLite's upsert uses ON CONFLICT DO UPDATE, same as PG — NOT INSERT OR
+    REPLACE, which would allocate a new rowid on every conflict (delete +
+    reinsert) and destabilize no-ORDER-BY scan order across re-upserts of an
+    already-seen key. See module docstring's "ROWID STABILITY"."""
     sql = SQLITE.upsert(
         "doc_nodes",
         ["space", "node_id", "node_type", "properties", "updated_at"],
@@ -83,8 +143,12 @@ def test_sqlite_upsert_is_insert_or_replace():
         update_cols=["node_type", "properties", "updated_at"],
         json_columns=["properties"],
     )
-    assert sql.startswith("INSERT OR REPLACE INTO doc_nodes(")
-    assert "ON CONFLICT" not in sql
+    assert sql.startswith("INSERT INTO doc_nodes(")
+    assert "OR REPLACE" not in sql
+    assert "ON CONFLICT (space, node_id) DO UPDATE SET" in sql
+    assert "node_type = EXCLUDED.node_type" in sql
+    assert "properties = EXCLUDED.properties" in sql
+    assert "updated_at = EXCLUDED.updated_at" in sql
     assert "?" not in sql  # named placeholders, not qmark — see test_sqlite_insert_plain
     for col in ("space", "node_id", "node_type", "properties", "updated_at"):
         assert f":{col}" in sql
@@ -268,3 +332,25 @@ def test_empty_json_columns_no_cast_postgres():
 def test_dialect_is_frozen():
     with pytest.raises(Exception):
         SQLITE.name = "postgres"  # type: ignore[misc]
+
+
+def test_render_ddl_json_key_index():
+    """IndexSpec.json_key renders via json_index_expr instead of a static
+    ``expr`` string (Stage 6b addition for graph-store's idx_nodes_pack)."""
+    spec = SchemaSpec(
+        tables=(
+            TableSpec(
+                name="t",
+                columns=(Column("id", "text"), Column("properties", "json", default="{}")),
+                primary_key=("id",),
+            ),
+        ),
+        indexes=(IndexSpec("idx_t_pack", "t", json_key=("properties", "pack_id")),),
+    )
+    sqlite_stmts = SQLITE.render_ddl(spec)
+    idx_sqlite = next(s for s in sqlite_stmts if "idx_t_pack" in s)
+    assert idx_sqlite == "CREATE INDEX IF NOT EXISTS idx_t_pack ON t(json_extract(properties, '$.pack_id'))"
+
+    pg_stmts = POSTGRES.render_ddl(spec, schema_name="s1")
+    idx_pg = next(s for s in pg_stmts if "idx_t_pack" in s)
+    assert idx_pg == 'CREATE INDEX IF NOT EXISTS idx_t_pack ON "s1".t((properties->>\'pack_id\'))'

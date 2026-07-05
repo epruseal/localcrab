@@ -561,6 +561,32 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in node
             assert node["shared"] == "new"
 
+    def test_edge_upsert_conflict_overwrites_not_merges(self, graph_pair):
+        """Second upsert_edge() on the same (from_type, from_id, relation,
+        to_type, to_id) key replaces the properties column wholesale — a key
+        present only in the first write must NOT survive the second, on
+        either backend."""
+        local, pg = graph_pair
+        for store in (local, pg):
+            store.upsert_edge(
+                "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
+                {"first_only": "x", "shared": "old"},
+            )
+            store.upsert_edge(
+                "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
+                {"shared": "new"},
+            )
+        for store in (local, pg):
+            edges = [
+                e for e in store.export_edges()
+                if e["relation"] == "edgeprobe"
+                and e["source_props"].get("id") == "packA_n0"
+                and e["target_props"].get("id") == "packA_n1"
+            ]
+            assert len(edges) == 1  # no duplicate edge row from the second upsert
+            assert "first_only" not in edges[0]["rel_props"]
+            assert edges[0]["rel_props"]["shared"] == "new"
+
     def test_find_neighbors_empty_pack_ids_equals_none(self, graph_pair):
         """``pack_ids=[]`` (empty list) must behave identically to
         ``pack_ids=None`` on both backends — both are falsy in Python, so the
@@ -659,17 +685,11 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in src["metadata"]
             assert src["metadata"]["shared"] == "new"
 
-    def test_list_packs_pack_id_type_divergence_int_vs_str(self, tmp_path, pg_engine):
-        """DOCUMENTED DIVERGENCE (판단 보류, not fixed — pack_id is
-        conventionally always a string everywhere else in the app; this test
-        makes the underlying SQL-level type coercion explicit rather than
-        leaving it as a latent surprise). ``list_packs()`` projects pack_id
-        via a raw JSON field extraction: SQLite's ``json_extract()``
-        preserves the stored JSON scalar type (an int-valued pack_id
-        round-trips as a Python ``int``), while Postgres's ``->>`` operator
-        always coerces to ``text`` (the same pack_id round-trips as ``str``).
-        A caller comparing ``list_packs()[i]['pack_id']`` across backends
-        without normalizing via ``str()`` first will observe this."""
+    def test_list_packs_pack_id_is_str_on_both_backends(self, tmp_path, pg_engine):
+        """Positive contract (supersedes the former
+        test_list_packs_pack_id_type_divergence_int_vs_str, which merely
+        documented the split): pack_id must be ``str`` on BOTH backends,
+        even when the stored JSON value is a native int."""
         schema = f"t{uuid.uuid4().hex[:12]}_ipk"
         local = LocalGraphStore(str(tmp_path / "intpack.db"))
         pg = PGGraphStore(pg_engine, schema=schema)
@@ -679,8 +699,67 @@ class TestTypedPropertiesAndNullSemantics:
                 store.upsert_node("Item", "ipk_n2", {"pack_id": 42})
             local_pid = local.list_packs()[0]["pack_id"]
             pg_pid = pg.list_packs()[0]["pack_id"]
-            assert isinstance(local_pid, int) and local_pid == 42
+            assert isinstance(local_pid, str) and local_pid == "42"
             assert isinstance(pg_pid, str) and pg_pid == "42"
+            assert local_pid == pg_pid
+        finally:
+            local.close()
+            with pg_engine.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+class TestUpsertRowidStability:
+    """Regression pin for the "ROWID STABILITY" fix in _sql_dialect.py:
+    SqlDialect.upsert() must use ``ON CONFLICT (...) DO UPDATE SET ...`` on
+    BOTH backends, never SQLite's ``INSERT OR REPLACE`` (a delete+reinsert
+    that allocates a new rowid). find_neighbors()/export_*() have no
+    ORDER BY, so their scan order tracks physical row order; re-upserting an
+    already-seen edge must not silently reshuffle that order — a LIMIT-capped
+    hub fan-out must return a *stable* truncated subset across repeated
+    re-ingestion (the everyday reingest-pipeline case), not just an
+    unordered-equivalent one from run to run.
+
+    Was RED against the SQLite-adopted _sql_graph_base.py before the fix
+    (INSERT OR REPLACE moved the re-upserted edge to the end of the physical
+    scan order); confirmed green after switching SQLite to ON CONFLICT DO
+    UPDATE (rowid-preserving, matching pre-refactor local_graph_store.py's
+    hand-written SQL and PG's pre-existing behavior)."""
+
+    def _neighbor_ids(self, store, anchor: str) -> list[str]:
+        return [
+            n["properties"]["id"]
+            for n in store.find_neighbors(anchor, direction="out", depth=1, limit=100)
+        ]
+
+    def test_reupsert_edge_does_not_reshuffle_scan_order(self, tmp_path, pg_engine):
+        schema = f"t{uuid.uuid4().hex[:12]}_rowid"
+        local = LocalGraphStore(str(tmp_path / "rowid.db"))
+        pg = PGGraphStore(pg_engine, schema=schema)
+        try:
+            for store in (local, pg):
+                store.upsert_node("Anchor", "anchor1", {})
+                for i in range(10):
+                    store.upsert_node("Leaf", f"leaf{i}", {})
+                    store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", f"leaf{i}", {"v": 1})
+
+            local_before = self._neighbor_ids(local, "anchor1")
+            pg_before = self._neighbor_ids(pg, "anchor1")
+            assert len(local_before) == 10
+            assert len(pg_before) == 10
+
+            # Re-upsert a MIDDLE edge (same conflict key: from/relation/to) with
+            # changed properties — must UPDATE in place, not delete+reinsert.
+            for store in (local, pg):
+                store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", "leaf5", {"v": 2})
+
+            local_after = self._neighbor_ids(local, "anchor1")
+            pg_after = self._neighbor_ids(pg, "anchor1")
+
+            assert local_after == local_before, (
+                "SQLite scan order changed after a same-key edge re-upsert — "
+                "rowid was not preserved (INSERT OR REPLACE regression)"
+            )
+            assert pg_after == pg_before
         finally:
             local.close()
             with pg_engine.begin() as conn:

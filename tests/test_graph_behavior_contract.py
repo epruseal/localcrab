@@ -301,6 +301,32 @@ class TestDeleteNodeKuzu:
         assert kuzu_store.delete_node("Item", "never_existed") is False
 
 
+class TestDeleteNodeTypeMismatch:
+    """delete_node(node_type, node_id) must match on the (node_type, node_id)
+    PAIR, not node_id alone — a wrong node_type must be a no-op (return
+    False, node stays). local/pg/neo4j already do this (WHERE .../Cypher
+    label checks both); kuzu_graph_store.py's Cypher now also matches both
+    (``MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) DETACH DELETE n``)
+    — fixed in Stage 6b F4 (was previously node_id-only, so a wrong node_type
+    still deleted the node)."""
+
+    def test_local_wrong_type_is_noop(self, local_store):
+        local_store.upsert_node("Item", "a", {})
+        assert local_store.delete_node("WrongType", "a") is False
+        assert local_store.get_node_by_id("a") is not None
+
+    @requires_pg
+    def test_pg_wrong_type_is_noop(self, pg_store):
+        pg_store.upsert_node("Item", "a", {})
+        assert pg_store.delete_node("WrongType", "a") is False
+        assert pg_store.get_node_by_id("a") is not None
+
+    def test_kuzu_wrong_type_is_noop(self, kuzu_store):
+        kuzu_store.upsert_node("Item", "a", {})
+        assert kuzu_store.delete_node("WrongType", "a") is False
+        assert kuzu_store.get_node_by_id("a") is not None
+
+
 class TestDeleteNodeNeo4j:
     """Neo4j is already the reference semantics for B2 -- pin, not RED."""
 

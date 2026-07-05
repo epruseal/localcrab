@@ -53,7 +53,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     """SQLite-backed document store with the same interface as MongoStore /
     LocalDocStore.
 
-    All writes use INSERT OR REPLACE (UPSERT) so callers can call upsert_*
+    All writes use INSERT ... ON CONFLICT DO UPDATE (UPSERT) so callers can call upsert_*
     methods unconditionally without managing existence checks.
 
     Thread-safety: each thread gets its own sqlite3 connection (threading.local);
