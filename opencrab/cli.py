@@ -18,14 +18,49 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+if TYPE_CHECKING:
+    from opencrab.config import Settings
+
 console = Console()
+
+
+def _make_stores(
+    cfg: Settings,
+    *,
+    graph: bool = False,
+    vector: bool = False,
+    doc: bool = False,
+    sql: bool = False,
+) -> SimpleNamespace:
+    """Construct only the store backends a command actually needs.
+
+    Each store carries its own setup cost (the vector store in particular
+    loads the KURE embedding chain), so building all four unconditionally
+    would e.g. load an embedding model for a command like
+    ``export-neo4j-pack`` that never touches vectors. Callers request only
+    the stores they use; unrequested attributes are ``None``.
+    """
+    from opencrab.stores.factory import (
+        make_doc_store,
+        make_graph_store,
+        make_sql_store,
+        make_vector_store,
+    )
+
+    return SimpleNamespace(
+        graph=make_graph_store(cfg) if graph else None,
+        vector=make_vector_store(cfg) if vector else None,
+        doc=make_doc_store(cfg) if doc else None,
+        sql=make_sql_store(cfg) if sql else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -178,22 +213,14 @@ def serve(
 def status() -> None:
     """Check connectivity to all configured data stores."""
     from opencrab.config import get_settings
-    from opencrab.stores.factory import (
-        make_doc_store,
-        make_graph_store,
-        make_sql_store,
-        make_vector_store,
-    )
 
     cfg = get_settings()
     mode_label = "[bold cyan]LOCAL MODE[/bold cyan]"
     storage_loc = cfg.local_data_dir
     console.print(f"\n{mode_label} - storage at: {storage_loc}\n")
 
-    graph  = make_graph_store(cfg)
-    vector = make_vector_store(cfg)
-    docs   = make_doc_store(cfg)
-    sql    = make_sql_store(cfg)
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
+    graph, vector, docs, sql = stores.graph, stores.vector, stores.doc, stores.sql
 
     # VECTOR_BACKEND 가 조건부 기본값(vector_backend_resolved)을 가지므로 라벨/경로도
     # 하드코딩 대신 실제 선택된 백엔드를 반영한다.
@@ -250,12 +277,10 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     from opencrab.config import get_settings
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
-    from opencrab.stores.factory import make_doc_store, make_graph_store, make_vector_store
 
     cfg = get_settings()
-    chroma = make_vector_store(cfg)
-    neo4j = make_graph_store(cfg)
-    mongo = make_doc_store(cfg)
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True)
+    chroma, neo4j, mongo = stores.vector, stores.graph, stores.doc
     hybrid = HybridQuery(chroma, neo4j)
 
     extensions = [e.strip() for e in extension.split(",")]
@@ -323,7 +348,6 @@ def extract(
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.ontology.extractor import LLMExtractor
-    from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store
 
     if not api_key:
         import os
@@ -333,9 +357,8 @@ def extract(
         raise SystemExit(1)
 
     cfg = get_settings()
-    graph = make_graph_store(cfg)
-    doc = make_doc_store(cfg)
-    sql = make_sql_store(cfg)
+    stores = _make_stores(cfg, graph=True, doc=True, sql=True)
+    graph, doc, sql = stores.graph, stores.doc, stores.sql
     builder = OntologyBuilder(graph, doc, sql)
     extractor = LLMExtractor(api_key=api_key, model=model)
 
@@ -460,12 +483,10 @@ def query(
     from opencrab.config import get_settings
     from opencrab.ontology.query import HybridQuery
     from opencrab.services.pack_selection import cli_warning_text, resolve_packs
-    from opencrab.stores.factory import make_doc_store, make_graph_store, make_vector_store
 
     cfg = get_settings()
-    chroma = make_vector_store(cfg)
-    neo4j = make_graph_store(cfg)
-    docs = make_doc_store(cfg)
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True)
+    chroma, neo4j, docs = stores.vector, stores.graph, stores.doc
     hybrid = HybridQuery(chroma, neo4j)
     if docs.available:
         hybrid._doc_store = docs  # noqa: SLF001 — same wiring tools.py uses
@@ -687,10 +708,9 @@ def export_neo4j_pack(
     """
     from opencrab.config import get_settings
     from opencrab.pack import export_neo4j_opencrab_ingest
-    from opencrab.stores.factory import make_graph_store
 
     cfg = get_settings()
-    graph = make_graph_store(cfg)
+    graph = _make_stores(cfg, graph=True).graph
     status = export_neo4j_opencrab_ingest(
         graph,
         output,
@@ -823,10 +843,8 @@ def packs_backfill_pack_id(
     ``properties.source_path`` / ``source_id`` / ``node_id`` / ``id``.
     ``--assume-pack-id X`` fills every still-empty entry with X.
     """
-    import sqlite3 as _sqlite3
-
     from opencrab.config import get_settings
-    from opencrab.ontology.pack_provenance import infer_pack_id_from_path
+    from opencrab.ontology.pack_provenance import backfill_pack_ids, resolve_backfill_dry_run
 
     cfg = get_settings()
     db_path = Path(cfg.local_data_dir) / "graph.db"
@@ -834,89 +852,13 @@ def packs_backfill_pack_id(
         console.print(f"[red]graph.db not found: {db_path}[/red]")
         raise SystemExit(1)
 
-    effective_dry_run = True
-    if apply_changes and dry_run is True:
-        console.print(
-            "[yellow]warning: both --apply and --dry-run given; honouring --dry-run.[/yellow]"
-        )
-    elif apply_changes and dry_run is None:
-        effective_dry_run = False
-    elif apply_changes and dry_run is False:
-        effective_dry_run = False
-    elif dry_run is False and not apply_changes:
-        console.print(
-            "[yellow]warning: --no-dry-run given without --apply; staying in dry-run.[/yellow]"
-        )
+    effective_dry_run, warning = resolve_backfill_dry_run(apply_changes, dry_run)
+    if warning:
+        console.print(f"[yellow]{warning}[/yellow]")
 
-    summary = {
-        "dry_run": effective_dry_run,
-        "nodes_inferred": 0,
-        "nodes_assumed": 0,
-        "nodes_skipped": 0,
-        "edges_inferred": 0,
-        "edges_assumed": 0,
-        "edges_skipped": 0,
-    }
-
-    conn = _sqlite3.connect(db_path)
-    try:
-        conn.row_factory = _sqlite3.Row
-        cur = conn.cursor()
-
-        def _process(table: str, key_cols: tuple[str, ...]) -> None:
-            cur.execute(f"SELECT {', '.join(key_cols)}, properties FROM {table}")
-            rows = cur.fetchall()
-            for row in rows:
-                try:
-                    props = json.loads(row["properties"]) if row["properties"] else {}
-                except (TypeError, ValueError):
-                    props = {}
-                if not isinstance(props, dict):
-                    summary[f"{table.split('_')[1]}_skipped"] += 1
-                    continue
-                if props.get("pack_id"):
-                    continue
-                inferred: str | None = None
-                for candidate_key in ("source_path", "source_id", "id"):
-                    value = props.get(candidate_key)
-                    if value:
-                        inferred = infer_pack_id_from_path(str(value))
-                        if inferred:
-                            break
-                if not inferred:
-                    # node_id column from the row itself
-                    for key in key_cols:
-                        if key.endswith("_id"):
-                            inferred = infer_pack_id_from_path(str(row[key]))
-                            if inferred:
-                                break
-                if inferred:
-                    props["pack_id"] = inferred
-                    summary_key = f"{table.split('_')[1]}_inferred"
-                    summary[summary_key] += 1
-                elif assume_pack_id:
-                    props["pack_id"] = assume_pack_id
-                    summary_key = f"{table.split('_')[1]}_assumed"
-                    summary[summary_key] += 1
-                else:
-                    summary_key = f"{table.split('_')[1]}_skipped"
-                    summary[summary_key] += 1
-                    continue
-                if not effective_dry_run:
-                    set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
-                    values = [json.dumps(props)] + [row[c] for c in key_cols]
-                    cur.execute(
-                        f"UPDATE {table} SET properties=? WHERE {set_clauses}",
-                        values,
-                    )
-
-        _process("graph_nodes", ("node_type", "node_id"))
-        _process("graph_edges", ("from_type", "from_id", "relation", "to_type", "to_id"))
-
-        if not effective_dry_run:
-            conn.commit()
-    finally:
-        conn.close()
+    summary = backfill_pack_ids(
+        db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
+    )
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:
@@ -930,10 +872,9 @@ def packs_reindex_bm25() -> None:
     """Rebuild the BM25 cache once (escape hatch; lazy rebuild is the default)."""
     from opencrab.config import get_settings
     from opencrab.ontology.bm25 import BM25Index
-    from opencrab.stores.factory import make_doc_store
 
     cfg = get_settings()
-    docs = make_doc_store(cfg)
+    docs = _make_stores(cfg, doc=True).doc
     if not docs.available:
         console.print("[red]Doc store unavailable.[/red]")
         raise SystemExit(1)

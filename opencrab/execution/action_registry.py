@@ -11,7 +11,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-import yaml
+from opencrab.schemas.loader import load_yaml_schema
 
 ACTIONS_DIR = Path(__file__).parent.parent / "schemas" / "actions"
 
@@ -24,11 +24,18 @@ def load_action_schema(action_name: str) -> dict[str, Any] | None:
     Returns None if no schema file exists (action is unregistered — still allowed).
     Result is cached after first load.
     """
-    path = ACTIONS_DIR / f"{action_name}.yaml"
-    if not path.exists():
-        return None
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml_schema(ACTIONS_DIR, action_name)
+
+
+def reload_action_schema(action_name: str) -> dict[str, Any] | None:
+    """Clear the entire schema cache and reload *action_name* from disk.
+
+    Mirrors ``opencrab.schemas.loader.reload_schema``: ``functools.cache``
+    has no per-key eviction, so this clears ALL cached actions (not just
+    *action_name*) before reloading.
+    """
+    load_action_schema.cache_clear()
+    return load_action_schema(action_name)
 
 
 def list_registered_actions() -> list[str]:

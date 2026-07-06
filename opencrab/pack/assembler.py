@@ -13,8 +13,6 @@ from typing import Any
 
 from opencrab.common.hashing import file_sha256
 
-EMPTY_JSONL = ""
-
 _PACK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -64,44 +62,72 @@ def _normalise_ingest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, A
     return nodes, edges, evidence
 
 
+def _evidence_ref_stats(rows: list[dict[str, Any]], evidence_ids: set[Any]) -> tuple[int, int, int]:
+    """Return (total refs, unresolved refs, rows carrying at least one ref)."""
+    total = 0
+    missing = 0
+    with_refs = 0
+    for row in rows:
+        refs = row.get("evidence_refs") or []
+        if not refs:
+            continue
+        with_refs += 1
+        total += len(refs)
+        missing += sum(1 for ref in refs if ref not in evidence_ids)
+    return total, missing, with_refs
+
+
+def _ratio(total: int, missing: int) -> float | None:
+    """Fraction resolved, or None when there's nothing to measure (never a
+    fabricated 1.0 for an empty/uncomputable metric)."""
+    if total == 0:
+        return None
+    return round((total - missing) / total, 4)
+
+
 def _quality_report(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute pack quality metrics from the actual assembled data.
+
+    Only metrics derivable from nodes/edges/evidence are reported. Metrics
+    that would require pipeline-stage inputs this function doesn't receive
+    (parsing/OCR/CLIP completeness, multi-hop path coverage) are dropped
+    rather than emitted as fake constants -- see report to the caller for
+    the audit trail of what changed.
+    """
     evidence_ids = {row.get("evidence_id") or row.get("id") for row in evidence}
     node_ids = {row.get("id") for row in nodes}
-    missing_evidence = 0
-    for row in [*nodes, *edges]:
-        refs = row.get("evidence_refs") or []
-        if refs and evidence_ids:
-            missing_evidence += sum(1 for ref in refs if ref not in evidence_ids)
+
+    node_ref_total, node_ref_missing, _ = _evidence_ref_stats(nodes, evidence_ids)
+    edge_ref_total, edge_ref_missing, edge_with_refs = _evidence_ref_stats(edges, evidence_ids)
+    total_refs = node_ref_total + edge_ref_total
+    total_missing = node_ref_missing + edge_ref_missing
+
     broken_edges = sum(1 for edge in edges if edge.get("from_id") not in node_ids or edge.get("to_id") not in node_ids)
-    status = "pass" if missing_evidence == 0 and broken_edges == 0 else "warn"
+    referenced_ids = {edge.get("from_id") for edge in edges} | {edge.get("to_id") for edge in edges}
+    orphan_nodes = sum(1 for node in nodes if node.get("id") not in referenced_ids)
+
+    status = "pass" if total_missing == 0 and broken_edges == 0 else "warn"
     return {
         "status": status,
         "summary": {
-            "parsing_completeness": 1.0,
-            "ocr_completeness": None,
-            "clip_coverage": None,
-            "evidence_coverage": 1.0 if missing_evidence == 0 else 0.0,
-            "chunk_coverage": 1.0,
-            "node_evidence_integrity": 1.0 if missing_evidence == 0 else 0.0,
-            "edge_evidence_integrity": 1.0 if missing_evidence == 0 else 0.0,
-            "relationship_evidence_coverage": 1.0,
-            "multihop_path_coverage": 1.0,
-            "graph_reference_integrity": 1.0 if broken_edges == 0 else 0.0,
+            "evidence_coverage": _ratio(total_refs, total_missing),
+            "node_evidence_integrity": _ratio(node_ref_total, node_ref_missing),
+            "edge_evidence_integrity": _ratio(edge_ref_total, edge_ref_missing),
+            "relationship_evidence_coverage": round(edge_with_refs / len(edges), 4) if edges else None,
+            "graph_reference_integrity": round((len(edges) - broken_edges) / len(edges), 4) if edges else None,
         },
         "checks": {
             "grammar": "not_run",
-            "schema": "pass",
-            "evidence_refs": "pass" if missing_evidence == 0 else "warn",
-            "orphan_nodes": "not_run",
+            "schema": "not_run",
+            "evidence_refs": "pass" if total_missing == 0 else "warn",
+            "orphan_nodes": "pass" if orphan_nodes == 0 else "warn",
             "broken_edges": "pass" if broken_edges == 0 else "fail",
-            "neo4j_import": "pass",
+            "neo4j_import": "not_run",
         },
         "counts": {
-            "missing_evidence_refs": missing_evidence,
+            "missing_evidence_refs": total_missing,
             "broken_edges": broken_edges,
-            "orphan_nodes": 0,
-            "parser_failures": 0,
-            "ocr_low_confidence_spans": 0,
+            "orphan_nodes": orphan_nodes,
         },
         "issues": [],
     }
@@ -156,6 +182,63 @@ def _manifest(pack_id: str, title: str, nodes: list[dict[str, Any]], edges: list
     }
 
 
+def _stage_optional_dirs(source: Path, root: Path) -> None:
+    """Copy the recommended optional staging directories when present."""
+    for dirname in ["raw", "parsed", "ocr", "images", "clip", "scripts"]:
+        src = source / dirname
+        if src.exists():
+            shutil.copytree(src, root / dirname)
+
+
+def _load_graph_data(source: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Path, list[dict[str, Any]]]:
+    """Load nodes/edges/evidence, preferring dedicated graph/evidence files
+    over the combined neo4j ingest JSONL when both are present."""
+    ingest_src = source / "neo4j/opencrab_ingest.jsonl"
+    ingest_rows = _read_jsonl(ingest_src)
+    nodes, edges, evidence = _normalise_ingest_rows(ingest_rows)
+
+    graph_nodes_src = source / "graph/nodes.jsonl"
+    graph_edges_src = source / "graph/edges.jsonl"
+    evidence_src = source / "evidence/index.jsonl"
+    if graph_nodes_src.exists():
+        nodes = _read_jsonl(graph_nodes_src)
+    if graph_edges_src.exists():
+        edges = _read_jsonl(graph_edges_src)
+    if evidence_src.exists():
+        evidence = _read_jsonl(evidence_src)
+    return nodes, edges, evidence, ingest_src, ingest_rows
+
+
+def _write_neo4j_artifacts(
+    source: Path,
+    root: Path,
+    ingest_src: Path,
+    ingest_rows: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    if not _copy_if_exists(ingest_src, root / "neo4j/opencrab_ingest.jsonl"):
+        _write_jsonl(root / "neo4j/opencrab_ingest.jsonl", ingest_rows)
+    _copy_if_exists(source / "neo4j/export_status.json", root / "neo4j/export_status.json")
+    if not (root / "neo4j/export_status.json").exists():
+        _write_json(root / "neo4j/export_status.json", {"status": "not_run", "nodes": len(nodes), "edges": len(edges)})
+    if not _copy_if_exists(source / "neo4j/import.cypher", root / "neo4j/import.cypher"):
+        (root / "neo4j/import.cypher").write_text("// Import graph/nodes.jsonl and graph/edges.jsonl into Neo4j before export.\n", encoding="utf-8")
+
+
+def _write_static_artifacts(root: Path, title: str) -> None:
+    _write_json(root / "sample_queries.json", {"queries": []})
+    _write_json(root / "community_reports.json", {"reports": []})
+    (root / "README.md").write_text(f"# {title}\n\nOpenCrab Pack v1 artifact assembled by LocalCrab.\n", encoding="utf-8")
+
+
+def _zip_root(root: Path, output: Path) -> None:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(root).as_posix())
+
+
 def assemble_pack_v1(
     source_dir: str | Path,
     output_zip: str | Path,
@@ -177,50 +260,21 @@ def assemble_pack_v1(
         root = Path(tmp_name) / pack_id
         root.mkdir(parents=True)
 
-        # Preserve recommended optional directories when present.
-        for dirname in ["raw", "parsed", "ocr", "images", "clip", "scripts"]:
-            src = source / dirname
-            if src.exists():
-                shutil.copytree(src, root / dirname)
-
-        ingest_src = source / "neo4j/opencrab_ingest.jsonl"
-        ingest_rows = _read_jsonl(ingest_src)
-        nodes, edges, evidence = _normalise_ingest_rows(ingest_rows)
-
-        graph_nodes_src = source / "graph/nodes.jsonl"
-        graph_edges_src = source / "graph/edges.jsonl"
-        evidence_src = source / "evidence/index.jsonl"
-        if graph_nodes_src.exists():
-            nodes = _read_jsonl(graph_nodes_src)
-        if graph_edges_src.exists():
-            edges = _read_jsonl(graph_edges_src)
-        if evidence_src.exists():
-            evidence = _read_jsonl(evidence_src)
+        _stage_optional_dirs(source, root)
+        nodes, edges, evidence, ingest_src, ingest_rows = _load_graph_data(source)
 
         _write_jsonl(root / "graph/nodes.jsonl", nodes)
         _write_jsonl(root / "graph/edges.jsonl", edges)
         _write_jsonl(root / "evidence/index.jsonl", evidence)
         _write_json(root / "quality/report.json", _quality_report(nodes, edges, evidence))
 
-        if not _copy_if_exists(ingest_src, root / "neo4j/opencrab_ingest.jsonl"):
-            _write_jsonl(root / "neo4j/opencrab_ingest.jsonl", ingest_rows)
-        _copy_if_exists(source / "neo4j/export_status.json", root / "neo4j/export_status.json")
-        if not (root / "neo4j/export_status.json").exists():
-            _write_json(root / "neo4j/export_status.json", {"status": "not_run", "nodes": len(nodes), "edges": len(edges)})
-        if not _copy_if_exists(source / "neo4j/import.cypher", root / "neo4j/import.cypher"):
-            (root / "neo4j/import.cypher").write_text("// Import graph/nodes.jsonl and graph/edges.jsonl into Neo4j before export.\n", encoding="utf-8")
-
-        _write_json(root / "sample_queries.json", {"queries": []})
-        _write_json(root / "community_reports.json", {"reports": []})
-        (root / "README.md").write_text(f"# {title}\n\nOpenCrab Pack v1 artifact assembled by LocalCrab.\n", encoding="utf-8")
+        _write_neo4j_artifacts(source, root, ingest_src, ingest_rows, nodes, edges)
+        _write_static_artifacts(root, title)
 
         manifest = _manifest(pack_id, title, nodes, edges, evidence, root)
         _write_json(root / "manifest.json", manifest)
 
-        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(root.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(root).as_posix())
+        _zip_root(root, output)
 
     pack_sha = file_sha256(output)
     return {"status": "ok", "pack_id": pack_id, "output": str(output), "pack_sha256": pack_sha, "nodes": len(nodes), "edges": len(edges), "evidence": len(evidence)}

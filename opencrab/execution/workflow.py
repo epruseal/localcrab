@@ -16,6 +16,7 @@ import uuid
 from typing import Any
 
 from opencrab.common.timefmt import now_iso
+from opencrab.execution._sql import ensure_tables, now_expr
 
 VALID_STATUSES = frozenset(
     {"pending", "running", "approved", "rejected", "completed", "failed"}
@@ -109,12 +110,7 @@ class WorkflowEngine:
 
     def _ensure_tables(self) -> None:
         """Create workflow tables if they don't exist."""
-        from sqlalchemy import text
-
-        tables = _TABLES_SQLITE if self._sql._is_sqlite else _TABLES_PG
-        with self._sql._engine.begin() as conn:
-            for ddl in tables:
-                conn.execute(text(ddl))
+        ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
 
     # ------------------------------------------------------------------
     # Write
@@ -202,18 +198,11 @@ class WorkflowEngine:
         output_json = json.dumps(output or {}, ensure_ascii=False)
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
 
-        if self._sql._is_sqlite:
-            update_sql = (
-                "UPDATE workflow_runs "
-                "SET status = :status, updated_at = datetime('now') "
-                "WHERE run_id = :run_id"
-            )
-        else:
-            update_sql = (
-                "UPDATE workflow_runs "
-                "SET status = :status, updated_at = NOW() "
-                "WHERE run_id = :run_id"
-            )
+        update_sql = (
+            "UPDATE workflow_runs "
+            f"SET status = :status, updated_at = {now_expr(self._sql)} "
+            "WHERE run_id = :run_id"
+        )
 
         with self._sql._engine.begin() as conn:
             current_row = conn.execute(

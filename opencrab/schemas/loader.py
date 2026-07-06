@@ -17,6 +17,21 @@ import yaml
 SCHEMAS_DIR = Path(__file__).parent / "types"
 
 
+def load_yaml_schema(directory: Path, name: str) -> dict[str, Any] | None:
+    """Load ``directory/<name>.yaml``, or return None if it doesn't exist.
+
+    Shared by this module's ``load_type_schema`` and
+    ``opencrab.execution.action_registry``'s ``load_action_schema`` -- both
+    are otherwise-identical schema-optional @cache YAML loaders that only
+    differ in which directory and cache they use.
+    """
+    path = directory / f"{name}.yaml"
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
 @cache
 def load_type_schema(node_type: str) -> dict[str, Any] | None:
     """
@@ -25,11 +40,7 @@ def load_type_schema(node_type: str) -> dict[str, Any] | None:
     Returns None if no schema file exists for that type.
     The result is cached after the first load.
     """
-    path = SCHEMAS_DIR / f"{node_type}.yaml"
-    if not path.exists():
-        return None
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml_schema(SCHEMAS_DIR, node_type)
 
 
 def list_registered_types() -> list[str]:

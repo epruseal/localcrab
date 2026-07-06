@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 from opencrab.common.timefmt import now_iso
+from opencrab.execution._sql import ensure_tables, now_expr
 
 _TABLE_SQLITE = """
 CREATE TABLE IF NOT EXISTS approval_queue (
@@ -63,11 +64,7 @@ class ApprovalEngine:
 
     def _ensure_table(self) -> None:
         """Create approval_queue table if it doesn't exist."""
-        from sqlalchemy import text
-
-        ddl = _TABLE_SQLITE if self._sql._is_sqlite else _TABLE_PG
-        with self._sql._engine.begin() as conn:
-            conn.execute(text(ddl))
+        ensure_tables(self._sql, [_TABLE_SQLITE], [_TABLE_PG])
 
     # ------------------------------------------------------------------
     # Write
@@ -146,20 +143,12 @@ class ApprovalEngine:
         if decision not in {"approved", "rejected"}:
             raise ValueError(f"Decision must be 'approved' or 'rejected', got '{decision}'.")
 
-        if self._sql._is_sqlite:
-            update_sql = (
-                "UPDATE approval_queue "
-                "SET status = :decision, reviewer_id = :reviewer_id, "
-                "    review_note = :note, resolved_at = datetime('now') "
-                "WHERE approval_id = :approval_id AND status = 'pending'"
-            )
-        else:
-            update_sql = (
-                "UPDATE approval_queue "
-                "SET status = :decision, reviewer_id = :reviewer_id, "
-                "    review_note = :note, resolved_at = NOW() "
-                "WHERE approval_id = :approval_id AND status = 'pending'"
-            )
+        update_sql = (
+            "UPDATE approval_queue "
+            "SET status = :decision, reviewer_id = :reviewer_id, "
+            f"    review_note = :note, resolved_at = {now_expr(self._sql)} "
+            "WHERE approval_id = :approval_id AND status = 'pending'"
+        )
 
         with self._sql._engine.begin() as conn:
             result = conn.execute(
