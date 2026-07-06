@@ -134,7 +134,9 @@ def _normalise_node(
     always applied (the script previously lacked them — this is a widening, not a
     weakening: it only adds fallbacks, never drops a constraint).
     """
-    defaults = _NODE_PRESETS.get(preset, _NODE_PRESETS["lenient"])
+    if preset is not None and preset not in _NODE_PRESETS:
+        raise ValueError(f"unknown preset: {preset!r} (expected one of {sorted(_NODE_PRESETS)})")
+    defaults = _NODE_PRESETS[preset or "lenient"]
     strict = defaults["strict"] if strict is None else strict
     copy = defaults["copy"] if copy is None else copy
     props = _clean_props(row["props"] if strict else row.get("props"), copy=copy)
@@ -168,7 +170,9 @@ def _normalise_edge(
     semantics (including ``preset``); ``rel_endpoint_fallback`` additionally
     lets ``from_id``/``to_id`` fall back to ``rel_props['from_id'/'to_id']``
     (the script's behaviour) before hashing."""
-    defaults = _EDGE_PRESETS.get(preset, _EDGE_PRESETS["lenient"])
+    if preset is not None and preset not in _EDGE_PRESETS:
+        raise ValueError(f"unknown preset: {preset!r} (expected one of {sorted(_EDGE_PRESETS)})")
+    defaults = _EDGE_PRESETS[preset or "lenient"]
     strict = defaults["strict"] if strict is None else strict
     copy = defaults["copy"] if copy is None else copy
     rel_endpoint_fallback = defaults["rel_endpoint_fallback"] if rel_endpoint_fallback is None else rel_endpoint_fallback
