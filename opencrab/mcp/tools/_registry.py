@@ -86,7 +86,13 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     extra error wrapping (handlers self-wrap), and write-serialising via the
     shared write_lock/WRITE_TOOLS for tools that mutate the stores.
     """
-    from opencrab.mcp.tools._context import WRITE_TOOLS, _write_lock
+    # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._context
+    # shim submodule: importing a submodule for the first time binds it as an
+    # attribute of the parent package under its own name, which would silently
+    # overwrite __init__.py's module-level `_context` dict (same name) the moment
+    # this import ran — verified empirically (tests/test_mcp.py's `_context.clear()`
+    # started hitting a module object instead of a dict).
+    from opencrab.mcp.tools import WRITE_TOOLS, _write_lock
 
     spec = _REGISTRY.get(name)
     if spec is None:
