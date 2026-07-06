@@ -33,12 +33,24 @@ def sql_store(request, tmp_path):
     dsn = os.environ.get("OPENCRAB_PG_TEST_URL")
     if not dsn:
         pytest.skip("OPENCRAB_PG_TEST_URL 미설정 - PG _sql 헬퍼 테스트 스킵")
-    store = SQLStore(dsn)
+    # 공유 public 대신 uuid 스키마 격리 (A2 패턴) — 병렬 세션 간 probe 테이블 경합 방지.
+    import uuid
+
+    from sqlalchemy import create_engine
+
+    schema = f"t{uuid.uuid4().hex[:12]}_sqlh"
+    admin = create_engine(dsn)
+    with admin.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    sep = "&" if "?" in dsn else "?"
+    store = SQLStore(f"{dsn}{sep}options=-csearch_path%3D{schema}")
     if not store.available:
         pytest.skip(f"PG 테스트 DB 접속 불가: {dsn!r}")
     yield store
-    with store._engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS _sql_helper_probe"))
+    store._engine.dispose()
+    with admin.begin() as conn:
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+    admin.dispose()
 
 
 # ---------------------------------------------------------------------------

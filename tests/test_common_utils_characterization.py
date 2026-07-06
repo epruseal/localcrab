@@ -102,12 +102,12 @@ def _all_now_iso_funcs():
         "workflow": workflow_now,
         "approvals": approvals_now,
         "identity": identity_now,
-        "promotion": promotion_now,
+        "timefmt": promotion_now,
         "billing": billing_now,
     }
 
 
-@pytest.mark.parametrize("label", ["workflow", "approvals", "identity", "promotion", "billing"])
+@pytest.mark.parametrize("label", ["workflow", "approvals", "identity", "timefmt", "billing"])
 def test_now_iso_aware_offset_format(label):
     """All 5 _now_iso definitions emit an aware "+00:00" offset ISO string."""
     func = _all_now_iso_funcs()[label]
