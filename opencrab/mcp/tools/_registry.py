@@ -29,13 +29,25 @@ class ToolSpec:
     order: int
 
 
-def tool(name: str, schema: dict[str, Any]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Register `fn` as the handler for MCP tool `name`, with its tools/list schema."""
+def tool(
+    name: str, schema: dict[str, Any], *, order: int | None = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Register `fn` as the handler for MCP tool `name`, with its tools/list schema.
+
+    `order` pins the position in ``build_tools()``'s output explicitly. Needed
+    because the golden tool order (tests/test_tool_registry_contract.py) is
+    interleaved across handler modules (e.g. graph.py, query.py, graph.py,
+    query.py, ...) — plain decoration/import order can't reproduce that once
+    handlers live in separate files, since each module executes top-to-bottom
+    as one unit. When omitted, falls back to registration (insertion) order,
+    which is sufficient for ad-hoc/test registrations.
+    """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
         if name in _REGISTRY:
             raise ValueError(f"tool {name!r} already registered")
-        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=len(_REGISTRY))
+        resolved_order = order if order is not None else len(_REGISTRY)
+        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order)
         return fn
 
     return deco
@@ -86,7 +98,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     extra error wrapping (handlers self-wrap), and write-serialising via the
     shared write_lock/WRITE_TOOLS for tools that mutate the stores.
     """
-    # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._context
+    # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._shared
     # shim submodule: importing a submodule for the first time binds it as an
     # attribute of the parent package under its own name, which would silently
     # overwrite __init__.py's module-level `_context` dict (same name) the moment

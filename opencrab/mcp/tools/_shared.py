@@ -1,13 +1,15 @@
-"""Shared plumbing shim — transitional layout note (R9 / Stage 7).
+"""Shared plumbing shim (Stage 10 rename of ``_context.py``).
 
 Re-exports the shared context/lock/sanitisation helpers from the package
-(where they currently still live, in ``__init__.py``) rather than physically
-hosting them here. A real move must happen in the SAME change that repoints
-every internal call site in ``__init__.py`` AND every test that does
+(``__init__.py``, where they still physically live) rather than hosting them
+here. A real move would need to happen in the same change that repoints
+every internal call site AND every test that does
 ``patch("opencrab.mcp.tools._get_context")`` (etc.) to the new location —
 otherwise those patches silently stop taking effect (see ``__init__.py``'s
 module docstring for the mock.patch namespace-binding reasoning, verified
-empirically). Deferred to the G-agent migration.
+empirically). No code currently imports this submodule directly (only the
+package's own re-exported names are used); it exists as a stable landing
+spot for a future physical move.
 """
 
 from __future__ import annotations
