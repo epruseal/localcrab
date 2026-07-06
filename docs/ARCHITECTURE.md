@@ -277,9 +277,13 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 | `ontology_lever_simulate` | `LocalGraphStore.find_by_relations()` — 1-홉 relation 필터 |
 | `export` | `LocalGraphStore.export_nodes()` / `export_edges()` |
 | `analyse` | `LocalGraphStore.get_node_by_id()` |
-| `ontology_rebac_check` | `find_neighbors(depth=1,2)` — Python BFS direct/transitive |
+| `ReBACEngine.check()` | `find_neighbors(depth=1,2)` — Python BFS direct/transitive |
 | `keyword_search` | `export_nodes() + Python str.lower() 포함 검사` |
 | 엣지 저장 시 노드 타입 조회 | `get_node_by_id()` |
+
+(구 `ontology_rebac_check` MCP 툴은 실사용 이력 0으로 삭제됨(Stage 7) — 위 행은
+`query.py`의 policy-aware 필터링이 여전히 호출하는 내부 엔진 `ReBACEngine.check()`
+기준으로 갱신했다.)
 
 코드베이스 전반에 `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기가
 존재한다(`ontology/query.py`, `ontology/impact.py`, `pack/neo4j_export.py`,

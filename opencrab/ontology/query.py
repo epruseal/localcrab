@@ -22,7 +22,7 @@ from typing import Any
 
 from opencrab.ontology.pack_provenance import infer_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
-from opencrab.ontology.text_cues import QUERY_RELATION_CUES as _RELATION_QUERY_CUES
+from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_QUERY_CUES
 from opencrab.stores.chroma_store import ChromaStore
 from opencrab.stores.neo4j_store import Neo4jStore
 

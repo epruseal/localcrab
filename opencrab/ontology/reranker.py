@@ -21,7 +21,7 @@ import logging
 from collections import Counter, defaultdict
 from typing import Any
 
-from opencrab.ontology.text_cues import RERANK_RELATION_CUES as _RELATION_CUES
+from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_CUES
 from opencrab.ontology.text_cues import tokenize as _tokenize
 
 logger = logging.getLogger(__name__)

@@ -7,12 +7,11 @@ reranker.py (the Hangul-aware BM25 tokenizer), and the relation/multi-hop
 reranker.py uses to boost graph/keyword sources during rerank.
 
 NOTE: ``QUERY_RELATION_CUES`` (query.py's former ``_RELATION_QUERY_CUES``) and
-``RERANK_RELATION_CUES`` (reranker.py's former ``_RELATION_CUES``) are
-near-duplicates but were never identical: the query-side list contains
-"applicable" where the rerank-side list contains "because" instead. That
-predates this extraction. They are kept as two distinct tuples here — not
-merged or deduped — to preserve each module's exact prior behaviour;
-unifying the word sets is a product decision, not a refactor.
+``RERANK_RELATION_CUES`` (reranker.py's former ``_RELATION_CUES``) were
+near-duplicates that predate this extraction: the query-side list had
+"applicable" where the rerank-side list had "because" instead. Unified
+2026-07-06 by user decision (recall-favoring) into one canonical
+``RELATION_CUES`` tuple; both names are now aliases of it.
 """
 
 from __future__ import annotations
@@ -44,9 +43,10 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-# query.py: widens vector/bm25/graph limits and graph_depth when the question
-# reads as a "why"/relationship-seeking query.
-QUERY_RELATION_CUES = (
+# Canonical relation-cue set. Widens vector/bm25/graph limits and graph_depth
+# in query.py, and boosts graph/keyword sources during rerank.py's rerank —
+# both consumers share this single word list (see module note above).
+RELATION_CUES = (
     "why",
     "reason",
     "rationale",
@@ -54,6 +54,7 @@ QUERY_RELATION_CUES = (
     "revision",
     "background",
     "cannot",
+    "because",
     "applicable",
     "risk",
     "law",
@@ -71,6 +72,9 @@ QUERY_RELATION_CUES = (
     "연결",
 )
 
+# Back-compat aliases for the existing per-module import names.
+QUERY_RELATION_CUES = RELATION_CUES
+
 # query.py: additionally widens graph_depth up to 3 for multi-hop questions.
 QUERY_MULTIHOP_CUES = (
     "connect",
@@ -87,30 +91,4 @@ QUERY_MULTIHOP_CUES = (
     "구분",
 )
 
-# reranker.py: boosts graph/keyword sources when the query reads as
-# relation-seeking. See module note above re: divergence from
-# QUERY_RELATION_CUES.
-RERANK_RELATION_CUES = (
-    "why",
-    "reason",
-    "rationale",
-    "change",
-    "revision",
-    "background",
-    "because",
-    "cannot",
-    "risk",
-    "law",
-    "regulation",
-    "이유",
-    "변경",
-    "개정",
-    "배경",
-    "불가",
-    "불가능",
-    "위험",
-    "법규",
-    "조합",
-    "관계",
-    "연결",
-)
+RERANK_RELATION_CUES = RELATION_CUES
