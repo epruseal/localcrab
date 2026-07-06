@@ -34,6 +34,32 @@ Exposed tools (16):
   approval_request, billing_get_usage, billing_list_events,
   identity_*(5), canonicalize_*(2), promotion_*(4),
   ontology_extract, ontology_ingest
+
+── R9 패키지 분해 진행 상태 (Stage 7) ───────────────────────────────────────
+이 파일(__init__.py)이 지금 이 패키지의 실제 구현 홈이다 — 과거 tools.py가
+있던 자리 그대로, 내용도 100% 동일(verbatim). `_legacy.py` / `_context.py`는
+아직 이 파일에서 로직을 재-export만 하는 얇은 호환 shim이고, `_registry.py`는
+차기 @tool 데코레이터 인프라(아직 미배선)다.
+
+왜 로직이 `_legacy.py`가 아니라 여기 있는가: `tests/test_mcp.py`,
+`tests/test_mcp_dispatch_extended.py` 등 다수 테스트가
+`patch("opencrab.mcp.tools._get_context")` / `patch("opencrab.mcp.tools.content_pack_list")`
+식으로 **패키지 이름**을 몽키패치한다. `unittest.mock.patch`는 대상 모듈의
+`__dict__` 항목 하나만 바꾸는데, `content_pack_list`나 `pack_ingest` 같은 함수의
+전역 이름 조회는 "그 함수가 정의된 모듈"의 `__dict__`를 참조한다(파이썬 LEGB).
+따라서 실제 로직이 `_legacy.py`(별도 모듈)에 있고 `__init__.py`는 그걸
+재-export만 한다면, `patch("opencrab.mcp.tools.X")`는 `__init__.py` 쪽 사본만
+바꿀 뿐 `_legacy.py` 안에서 서로를 호출하는 함수들에는 전혀 반영되지 않는다
+(직접 재현·확인함 — 별도 모듈 분리 시 mock이 조용히 무시된다). 이 패키지의
+모듈명 자체가 정확히 `opencrab.mcp.tools`인 `__init__.py`에 로직을 두면 이
+문제가 원천적으로 발생하지 않는다.
+
+G-agent 마이그레이션 방식: 이 파일에서 핸들러 로직을 읽어 query.py/pack.py/
+schema.py/graph.py/harness.py 등 새 모듈로 "복사"하고 `_registry.py`의 `@tool`
+로 등록한 뒤, 이 파일에서 해당 함수/스키마 항목을 삭제한다(동시에 그 함수를
+겨냥하던 테스트의 patch 대상도 새 모듈 경로로 함께 갱신). 모든 핸들러가
+이전되면 `__init__.py`는 `_registry.py`의 TOOLS/dispatch_tool/UnknownToolError를
+재-export하는 얇은 파일로 교체되고, `_legacy.py`는 삭제된다.
 """
 
 from __future__ import annotations
