@@ -58,15 +58,19 @@ def test_list_nodes_json_vs_sql_comparison(tmp_path):
         sql_store.upsert_node_doc("sp", "T", f"node_{i}", props)
         json_store.upsert_node_doc("sp", "T", f"node_{i}", props)
 
-    # SQL 측정
-    start = time.perf_counter()
-    sql_result = sql_store.list_nodes(limit=50000)
-    sql_elapsed = time.perf_counter() - start
+    # 3회 측정 최솟값 — 공유 CI 러너의 스케줄러 노이즈로 단발 측정이 10배 비율
+    # 단언을 flake시키므로(관측: SQL 11ms vs JSON 1ms) 최솟값으로 강건화한다.
+    def _best_of_3(fn):
+        elapsed = float("inf")
+        result = None
+        for _ in range(3):
+            start = time.perf_counter()
+            result = fn()
+            elapsed = min(elapsed, time.perf_counter() - start)
+        return result, elapsed
 
-    # JSON 측정
-    start = time.perf_counter()
-    json_result = json_store.list_nodes(limit=50000)
-    json_elapsed = time.perf_counter() - start
+    sql_result, sql_elapsed = _best_of_3(lambda: sql_store.list_nodes(limit=50000))
+    json_result, json_elapsed = _best_of_3(lambda: json_store.list_nodes(limit=50000))
 
     ratio = json_elapsed / sql_elapsed if sql_elapsed > 0 else float("inf")
     print(f"\nSQL: {sql_elapsed:.4f}s, JSON: {json_elapsed:.4f}s, ratio: {ratio:.2f}x (JSON/SQL)")
