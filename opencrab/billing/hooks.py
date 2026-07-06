@@ -24,6 +24,7 @@ import uuid
 from typing import Any
 
 from opencrab.common.timefmt import now_iso
+from opencrab.execution._sql import ensure_tables, is_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +93,8 @@ class BillingHooks:
         self._ensure_tables()
 
     def _ensure_tables(self) -> None:
-        from sqlalchemy import text
-
-        tables = _TABLES_SQLITE if self._sql._is_sqlite else _TABLES_PG
         try:
-            with self._sql._engine.begin() as conn:
-                for ddl in tables:
-                    conn.execute(text(ddl))
+            ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)
 
@@ -154,7 +150,7 @@ class BillingHooks:
                 meta_str = str(metadata)
 
         try:
-            sql = _insert_event_sql(self._sql._is_sqlite)
+            sql = _insert_event_sql(is_sqlite(self._sql))
             with self._sql._engine.begin() as conn:
                 conn.execute(
                     text(sql),

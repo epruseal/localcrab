@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 from collections import Counter
 from typing import Any
 
 from opencrab.ontology.pack_provenance import infer_pack_id, matches_pack_filter
+from opencrab.ontology.text_cues import tokenize as _tokenize
 
 logger = logging.getLogger(__name__)
 
@@ -48,30 +48,7 @@ _TEXT_FIELDS = (
     "source",
     "heading_path",
 )
-_HANGUL_RE = re.compile(r"[가-힣]")
 _MAX_PROPERTY_TEXT = 1200
-
-
-def _tokenize(text: str) -> list[str]:
-    """Lowercase, strip punctuation, split on whitespace.
-
-    Korean construction benchmarks contain many compound nouns and short
-    relation cues ("변경 이유", "적용 불가", "개정"). Whitespace tokenisation
-    alone misses those matches, so Hangul tokens also contribute 2- and 3-char
-    n-grams. This keeps exact English behaviour while making Korean recall
-    much less brittle.
-    """
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    tokens: list[str] = []
-    for token in text.split():
-        if not token:
-            continue
-        tokens.append(token)
-        if _HANGUL_RE.search(token) and len(token) >= 3:
-            for n in (2, 3):
-                tokens.extend(token[i : i + n] for i in range(0, len(token) - n + 1))
-    return tokens
 
 
 def _flatten_property_text(value: Any, depth: int = 0) -> list[str]:

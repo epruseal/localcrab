@@ -126,10 +126,8 @@ class TestActionRegistryEdge:
         """
         Characterizes the documented behavior ("Result is cached after first
         load.") -- a file edit after the first load is invisible until the
-        process-wide cache is cleared. There is no reload_schema() counterpart
-        here (unlike schemas/loader.py). This is intentional documentation of
-        current behavior, not an assertion that it is the desired long-term
-        contract -- see PR notes for the audit judgment.
+        process-wide cache is cleared via load_action_schema.cache_clear()
+        or reload_action_schema() (see TestReloadActionSchema below).
         """
         _write_yaml(actions_dir, "do_thing", {"parameters": {"a": {"required": True}}})
         first = action_registry.load_action_schema("do_thing")
@@ -140,6 +138,52 @@ class TestActionRegistryEdge:
 
         assert second == first  # stale: reflects the state at first load, not the edit
 
+
+# ---------------------------------------------------------------------------
+# reload_action_schema (symmetric with schemas/loader.py's reload_schema)
+# ---------------------------------------------------------------------------
+
+
+class TestReloadActionSchema:
+    def test_reload_action_schema_reflects_changed_yaml_on_disk(self, actions_dir):
+        _write_yaml(actions_dir, "do_thing", {"parameters": {"a": {"required": True}}})
+        first = action_registry.load_action_schema("do_thing")
+        assert first == {"parameters": {"a": {"required": True}}}
+
+        _write_yaml(actions_dir, "do_thing", {"parameters": {"b": {"required": True}}})
+        # Without reload, the cached (stale) value would still be returned.
+        assert action_registry.load_action_schema("do_thing") == first
+
+        updated = action_registry.reload_action_schema("do_thing")
+        assert updated == {"parameters": {"b": {"required": True}}}
+
+    def test_reload_action_schema_unknown_action_returns_none_and_clears_cache(self, actions_dir):
+        _write_yaml(actions_dir, "known_action", {"parameters": {}})
+        assert action_registry.load_action_schema("known_action") is not None
+
+        # Reloading an unrelated, unknown action still clears the whole
+        # cache (documented clear-all behavior) and returns None for it.
+        assert action_registry.reload_action_schema("no_such_action") is None
+        assert action_registry.load_action_schema("known_action") is not None
+
+    def test_reload_action_schema_clears_all_not_just_named_action(self, actions_dir):
+        _write_yaml(actions_dir, "a_action", {"parameters": {"x": {}}})
+        _write_yaml(actions_dir, "b_action", {"parameters": {"y": {}}})
+
+        action_registry.load_action_schema("a_action")
+        action_registry.load_action_schema("b_action")
+
+        _write_yaml(actions_dir, "b_action", {"parameters": {"y": {}, "z": {}}})
+
+        # Reloading a_action must also pick up b_action's on-disk change,
+        # proving the cache-clear is global, not scoped to "a_action".
+        action_registry.reload_action_schema("a_action")
+        assert action_registry.load_action_schema("b_action") == {
+            "parameters": {"y": {}, "z": {}}
+        }
+
+
+class TestActionRegistryEnumIgnored:
     def test_validate_action_params_ignores_enum_and_type_constraints(self):
         """
         Uses the real shipped schema opencrab/schemas/actions/promote_claim.yaml

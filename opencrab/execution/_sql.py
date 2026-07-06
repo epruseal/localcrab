@@ -1,0 +1,62 @@
+"""
+Shared SQL-dialect plumbing for the execution/billing layer.
+
+workflow.py (workflow_runs/action_log), approvals.py (approval_queue), and
+billing/hooks.py (billing_events) each hand-roll the same three things:
+  - picking a SQLite-DDL-list vs PG-DDL-list by ``sql_store._is_sqlite``
+  - a "run these CREATE TABLE/INDEX statements once" ensure-tables loop
+  - a ``datetime('now')`` vs ``NOW()`` branch for hand-written UPDATE SQL
+
+This module centralizes that plumbing on top of the dialect fragments
+already defined in ``opencrab.stores._sql_dialect`` (SqlDialect
+SQLITE/POSTGRES), without adopting its SchemaSpec/render_ddl system --
+each of the three callers still writes its own literal CREATE TABLE
+strings per dialect (columns differ table to table); this only stops
+each module from re-deriving "is this store sqlite or postgres", "what's
+the ensure-tables loop", and "what's the now() fragment" by hand.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
+
+from opencrab.stores._sql_dialect import POSTGRES, SQLITE, SqlDialect
+
+
+def dialect_for(sql_store: Any) -> SqlDialect:
+    """Return the ``SqlDialect`` matching *sql_store*'s backend."""
+    return SQLITE if sql_store._is_sqlite else POSTGRES
+
+
+def is_sqlite(sql_store: Any) -> bool:
+    """Whether *sql_store* is backed by SQLite (vs PostgreSQL)."""
+    return bool(sql_store._is_sqlite)
+
+
+def now_expr(sql_store: Any) -> str:
+    """SQL "current time" fragment for *sql_store*'s dialect: ``datetime('now')``
+    for SQLite, ``NOW()`` for PostgreSQL."""
+    return dialect_for(sql_store).now_expr()
+
+
+def ensure_tables(
+    sql_store: Any,
+    ddl_sqlite: Sequence[str],
+    ddl_pg: Sequence[str],
+) -> None:
+    """Run *ddl_sqlite* or *ddl_pg* (whichever matches *sql_store*'s dialect)
+    inside one transaction, in order.
+
+    Each caller supplies its own per-dialect DDL statement list (table
+    columns/types differ per module); this only picks the right list for
+    the store's backend and executes it. Callers that need to swallow
+    setup failures (e.g. BillingHooks, which is fire-and-forget) wrap this
+    call in their own try/except -- this function itself always raises.
+    """
+    from sqlalchemy import text
+
+    ddl = ddl_sqlite if sql_store._is_sqlite else ddl_pg
+    with sql_store._engine.begin() as conn:
+        for stmt in ddl:
+            conn.execute(text(stmt))

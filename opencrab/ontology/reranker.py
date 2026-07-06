@@ -18,9 +18,11 @@ RRF constant k=60 (standard, prevents high-rank docs dominating).
 from __future__ import annotations
 
 import logging
-import re
 from collections import Counter, defaultdict
 from typing import Any
+
+from opencrab.ontology.text_cues import RERANK_RELATION_CUES as _RELATION_CUES
+from opencrab.ontology.text_cues import tokenize as _tokenize
 
 logger = logging.getLogger(__name__)
 
@@ -30,44 +32,6 @@ _K1 = 1.5
 _B = 0.75
 
 
-def _tokenize(text: str) -> list[str]:
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    tokens: list[str] = []
-    for token in text.split():
-        if not token:
-            continue
-        tokens.append(token)
-        if re.search(r"[가-힣]", token) and len(token) >= 3:
-            for n in (2, 3):
-                tokens.extend(token[i : i + n] for i in range(0, len(token) - n + 1))
-    return tokens
-
-
-_RELATION_CUES = (
-    "why",
-    "reason",
-    "rationale",
-    "change",
-    "revision",
-    "background",
-    "because",
-    "cannot",
-    "risk",
-    "law",
-    "regulation",
-    "이유",
-    "변경",
-    "개정",
-    "배경",
-    "불가",
-    "불가능",
-    "위험",
-    "법규",
-    "조합",
-    "관계",
-    "연결",
-)
 _SOURCE_WEIGHTS = {
     "keyword": 1.3,  # FTS5 본문 키워드(약어·표준번호·다중어 정확매칭) 강하게 우대
     "bm25": 1.08,

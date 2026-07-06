@@ -12,6 +12,23 @@ from typing import Any
 from opencrab.common.ids import canonical_json as _stable_json
 from opencrab.common.ids import stable_id as _sha_id
 
+# Named presets for the strict/copy/rel_endpoint_fallback trio below. These are
+# additive sugar on top of the individual flags -- they do NOT replace them.
+# scripts/export_pack_graph_from_neo4j.py and tests/test_structural_characterization.py
+# call _normalise_node/_normalise_edge directly with the individual flags (in
+# specific combinations, including asserting the strict=True KeyError path), so
+# the flags themselves stay exactly as-is; `preset` just supplies their
+# defaults when the caller doesn't pass them explicitly (explicit kwargs always
+# win over the preset).
+_NODE_PRESETS: dict[str, dict[str, bool]] = {
+    "lenient": {"strict": False, "copy": False},
+    "strict": {"strict": True, "copy": True},
+}
+_EDGE_PRESETS: dict[str, dict[str, bool]] = {
+    "lenient": {"strict": False, "copy": False, "rel_endpoint_fallback": False},
+    "strict": {"strict": True, "copy": True, "rel_endpoint_fallback": True},
+}
+
 
 def _clean_props(value: Any, *, copy: bool = False) -> dict[str, Any]:
     """Coerce ``value`` to a dict.
@@ -95,8 +112,9 @@ def _normalise_node(
     *,
     label_to_space: dict[str, str] | None = None,
     label_priority: list[str] | None = None,
-    strict: bool = False,
-    copy: bool = False,
+    preset: str | None = None,
+    strict: bool | None = None,
+    copy: bool | None = None,
 ) -> dict[str, Any]:
     """Normalise a Neo4j node row into OpenCrab Pack v1 shape.
 
@@ -108,11 +126,17 @@ def _normalise_node(
     * ``label_priority``  — pick ``node_type`` by label priority over ``labels[0]``.
     * ``strict``          — require ``props``/``labels`` keys (KeyError if absent).
     * ``copy``            — shallow-copy props instead of sharing the source dict.
+    * ``preset``          — ``"lenient"`` (default) or ``"strict"``, supplies the
+      ``strict``/``copy`` defaults above; an explicitly-passed ``strict``/``copy``
+      always overrides the preset.
 
     The ``ontology_space`` / ``props["type"]`` / ``evidence_ids`` fallbacks are
     always applied (the script previously lacked them — this is a widening, not a
     weakening: it only adds fallbacks, never drops a constraint).
     """
+    defaults = _NODE_PRESETS.get(preset, _NODE_PRESETS["lenient"])
+    strict = defaults["strict"] if strict is None else strict
+    copy = defaults["copy"] if copy is None else copy
     props = _clean_props(row["props"] if strict else row.get("props"), copy=copy)
     labels = list((row["labels"] if strict else row.get("labels")) or [])
     node_type = _resolve_node_type(props, labels, label_priority=label_priority)
@@ -135,14 +159,19 @@ def _normalise_edge(
     row: dict[str, Any],
     *,
     label_to_space: dict[str, str] | None = None,
-    strict: bool = False,
-    copy: bool = False,
-    rel_endpoint_fallback: bool = False,
+    preset: str | None = None,
+    strict: bool | None = None,
+    copy: bool | None = None,
+    rel_endpoint_fallback: bool | None = None,
 ) -> dict[str, Any]:
     """Normalise a Neo4j edge row. See :func:`_normalise_node` for the param
-    semantics; ``rel_endpoint_fallback`` additionally lets ``from_id``/``to_id``
-    fall back to ``rel_props['from_id'/'to_id']`` (the script's behaviour) before
-    hashing."""
+    semantics (including ``preset``); ``rel_endpoint_fallback`` additionally
+    lets ``from_id``/``to_id`` fall back to ``rel_props['from_id'/'to_id']``
+    (the script's behaviour) before hashing."""
+    defaults = _EDGE_PRESETS.get(preset, _EDGE_PRESETS["lenient"])
+    strict = defaults["strict"] if strict is None else strict
+    copy = defaults["copy"] if copy is None else copy
+    rel_endpoint_fallback = defaults["rel_endpoint_fallback"] if rel_endpoint_fallback is None else rel_endpoint_fallback
     source_props = _clean_props(row["source_props"] if strict else row.get("source_props"), copy=copy)
     target_props = _clean_props(row["target_props"] if strict else row.get("target_props"), copy=copy)
     rel_props = _clean_props(row["rel_props"] if strict else row.get("rel_props"), copy=copy)
