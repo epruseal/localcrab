@@ -22,6 +22,39 @@ from opencrab.stores.sql_store import SQLStore
 PG_URL = os.environ.get("OPENCRAB_PG_TEST_URL")
 
 
+def _pg_scoped_store(dsn: str, suffix: str):
+    """Build a SQLStore whose (unqualified) DDL lands in a fresh, uuid-named
+    PG schema rather than the shared `public` schema -- prevents concurrent
+    pytest sessions from tripping over each other's CREATE/DROP TABLE.
+
+    Mechanism: pointing every pooled connection's `search_path` at a schema
+    that exists (and only that schema) makes BillingHooks/SQLStore's
+    unqualified DDL/DML land there without touching production code.
+    psycopg2/libpq honor a `-c search_path=...` passed via the `options`
+    connect kwarg, and SQLAlchemy forwards unrecognised URL query params
+    straight through to psycopg2.connect().
+    """
+    from sqlalchemy import create_engine, text
+
+    schema = f"t{uuid.uuid4().hex[:12]}_{suffix}"
+    admin_engine = create_engine(dsn)
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    sep = "&" if "?" in dsn else "?"
+    scoped_dsn = f"{dsn}{sep}options=-csearch_path%3D{schema}"
+    store = SQLStore(scoped_dsn)
+    return store, schema, admin_engine
+
+
+def _drop_pg_schema(admin_engine, schema: str) -> None:
+    from sqlalchemy import text
+
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+    admin_engine.dispose()
+
+
 class _BrokenEngine:
     """Stand-in for a closed/broken SQLAlchemy engine."""
 
@@ -118,14 +151,20 @@ class TestEmitEdgeCases:
     @pytest.mark.skipif(not PG_URL, reason="OPENCRAB_PG_TEST_URL not set — PG billing test skipped")
     def test_emit_pg_jsonb_cast_path(self):
         tenant = f"pg-billing-{uuid.uuid4().hex[:8]}"
-        store = SQLStore(PG_URL)
-        hooks = BillingHooks(store)
+        store, schema, admin_engine = _pg_scoped_store(PG_URL, "bill")
+        if not store.available:
+            _drop_pg_schema(admin_engine, schema)
+            pytest.skip(f"PG 테스트 DB 접속 불가: {PG_URL!r}")
+        try:
+            hooks = BillingHooks(store)
 
-        result = hooks.emit("ingest", tenant_id=tenant, metadata={"source_id": "doc-1", "n": 3})
+            result = hooks.emit("ingest", tenant_id=tenant, metadata={"source_id": "doc-1", "n": 3})
 
-        assert result["ok"] is True
-        events = hooks.list_events(tenant_id=tenant, limit=5)
-        assert any(e["event_id"] == result["event_id"] for e in events)
+            assert result["ok"] is True
+            events = hooks.list_events(tenant_id=tenant, limit=5)
+            assert any(e["event_id"] == result["event_id"] for e in events)
+        finally:
+            _drop_pg_schema(admin_engine, schema)
 
     def test_get_usage_aggregates_multiple_events_by_type(self):
         store = SQLStore("sqlite:///:memory:")

@@ -102,3 +102,19 @@ def test_bm25_and_reranker_tokenize_are_identical(text: str) -> None:
 def test_bm25_and_reranker_tokenize_is_the_same_function_object() -> None:
     assert bm25._tokenize is text_cues.tokenize
     assert reranker._tokenize is text_cues.tokenize
+
+
+# ---------------------------------------------------------------------------
+# Contract: query-side and rerank-side relation cues are one unified set
+# (2026-07-06 decision — recall-favoring union, see text_cues.py docstring)
+# ---------------------------------------------------------------------------
+
+def test_query_and_rerank_relation_cues_are_the_same_set() -> None:
+    assert set(text_cues.QUERY_RELATION_CUES) == set(text_cues.RERANK_RELATION_CUES)
+
+
+def test_relation_cues_include_applicable_and_because() -> None:
+    assert "applicable" in text_cues.QUERY_RELATION_CUES
+    assert "applicable" in text_cues.RERANK_RELATION_CUES
+    assert "because" in text_cues.QUERY_RELATION_CUES
+    assert "because" in text_cues.RERANK_RELATION_CUES

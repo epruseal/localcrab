@@ -93,10 +93,10 @@ def _all_now_iso_funcs():
     # their import). Pinning them here still asserts every call site converged
     # on the same helper; the golden format assertions below are unchanged.
     from opencrab.billing.hooks import now_iso as billing_now
+    from opencrab.common.timefmt import now_iso as promotion_now
     from opencrab.execution.approvals import now_iso as approvals_now
     from opencrab.execution.workflow import now_iso as workflow_now
     from opencrab.ontology.identity import now_iso as identity_now
-    from opencrab.ontology.promotion import now_iso as promotion_now
 
     return {
         "workflow": workflow_now,
