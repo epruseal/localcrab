@@ -1,14 +1,12 @@
-"""Compatibility shim — transitional layout note (R9 / Stage 7).
+"""Compatibility shim — stable import path only.
 
-The actual tool implementations live in ``opencrab.mcp.tools`` (this
-package's ``__init__.py``), not here — see that module's docstring for why
-(mock.patch namespace binding: functions must live in the module literally
-named ``opencrab.mcp.tools`` for ``patch("opencrab.mcp.tools.<name>")`` to
-reach their internal call sites). This file exists only so
-``opencrab.mcp.tools._legacy`` is a stable, importable path during the
-G-agent migration; it just re-exports everything from the package.
-
-G-agents: read/copy handler source out of ``__init__.py``, not this file.
+Tool handlers live in the sibling submodules (``graph.py`` / ``query.py`` /
+``pack.py`` / ``schema.py`` / ``harness.py``); shared plumbing
+(``_get_context``, the ``_context`` cache dict, locks, sanitizers) stays in
+the package ``__init__.py`` so ``patch("opencrab.mcp.tools.<name>")`` keeps
+working (handlers late-import those names from the package at call time).
+This file just re-exports everything so ``opencrab.mcp.tools._legacy``
+remains importable for older callers.
 """
 
 from __future__ import annotations

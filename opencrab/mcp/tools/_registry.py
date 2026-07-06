@@ -1,14 +1,12 @@
-"""@tool registry scaffolding for the R9 tools.py -> tools/ package migration.
+"""@tool registry — the single source for MCP tool name/schema/handler/order.
 
-Not wired in yet: the package's TOOLS / dispatch_tool / UnknownToolError
-(exported from ``__init__.py`` — see its module docstring) still come from
-the pre-migration implementation. As G-agent modules extract handlers out of
-``__init__.py`` into ``query.py`` / ``pack.py`` / ``schema.py`` / ``graph.py``
-/ ``harness.py``, each handler registers itself here via
-``@tool(name, schema)``. Once every handler has moved, ``__init__.py``
-switches TOOLS/dispatch_tool/UnknownToolError over to ``build_tools()`` /
-``dispatch_tool()`` below, and this module (plus a slimmed ``__init__.py``)
-replaces the pre-migration implementation; ``_legacy.py`` is then deleted.
+Handlers live in the sibling submodules (``graph.py`` / ``query.py`` /
+``pack.py`` / ``schema.py`` / ``harness.py``) and register themselves via
+``@tool(name, schema, order=N)``. The package ``__init__.py`` imports those
+modules, then derives TOOLS / TOOL_SCHEMAS / _TOOL_FUNCTIONS / dispatch_tool
+from ``_REGISTRY`` here. ``order`` pins the golden TOOLS ordering (which is
+interleaved across modules — see ``tool()``'s docstring); duplicate names and
+order collisions both raise at import time.
 """
 
 from __future__ import annotations
@@ -47,6 +45,9 @@ def tool(
         if name in _REGISTRY:
             raise ValueError(f"tool {name!r} already registered")
         resolved_order = order if order is not None else len(_REGISTRY)
+        collision = next((s.name for s in _REGISTRY.values() if s.order == resolved_order), None)
+        if collision is not None:
+            raise ValueError(f"tool {name!r} order={resolved_order} collides with {collision!r}")
         _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order)
         return fn
 
@@ -108,7 +109,9 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
 
     spec = _REGISTRY.get(name)
     if spec is None:
-        raise UnknownToolError(f"Unknown tool: '{name}'. Available: {list(_REGISTRY)}")
+        # order 정렬 — 물리 분할 후에도 pre-split과 동일한 목록 순서 유지.
+        available = [s.name for s in sorted(_REGISTRY.values(), key=lambda s: s.order)]
+        raise UnknownToolError(f"Unknown tool: '{name}'. Available: {available}")
     if name in WRITE_TOOLS:
         with _write_lock():
             return spec.fn(**arguments)
