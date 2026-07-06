@@ -207,10 +207,9 @@ class TestToolDispatch:
             assert len(result["triggered_impacts"]) == 1
 
     def test_ontology_rebac_check_not_exposed_via_mcp(self):
-        """ontology_rebac_check는 MCP 비노출 (현재 워크플로 미사용). 함수 본체는 보존."""
-        from opencrab.mcp.tools import dispatch_tool, ontology_rebac_check  # noqa: F401
+        """ontology_rebac_check는 MCP 비노출 — 휴면 코드로 삭제됨(git history 보존)."""
+        from opencrab.mcp.tools import dispatch_tool
 
-        assert callable(ontology_rebac_check)
         with pytest.raises(KeyError, match="Unknown tool"):
             dispatch_tool("ontology_rebac_check", {
                 "subject_id": "u1", "permission": "view", "resource_id": "doc1"
@@ -238,22 +237,17 @@ class TestToolDispatch:
 
     def test_ontology_ingest_not_exposed_via_mcp(self):
         """ontology_ingest is no longer dispatched via MCP (pack_ingest로 일원화).
-        Function body is retained in tools.py but removed from _TOOL_FUNCTIONS."""
-        from opencrab.mcp.tools import dispatch_tool, ontology_ingest  # noqa: F401
+        Dormant code was deleted outright (git history preserves it)."""
+        from opencrab.mcp.tools import dispatch_tool
 
-        # Function body must still be importable (code preserved)
-        assert callable(ontology_ingest)
-
-        # MCP dispatch must raise (not in _TOOL_FUNCTIONS)
         with pytest.raises(KeyError, match="Unknown tool"):
             dispatch_tool("ontology_ingest", {"text": "t", "source_id": "s"})
 
     def test_ontology_extract_not_exposed_via_mcp(self):
         """ontology_extract is no longer dispatched via MCP.
-        Function body is retained in tools.py but removed from _TOOL_FUNCTIONS."""
-        from opencrab.mcp.tools import dispatch_tool, ontology_extract  # noqa: F401
+        Dormant code was deleted outright (git history preserves it)."""
+        from opencrab.mcp.tools import dispatch_tool
 
-        assert callable(ontology_extract)
         with pytest.raises(KeyError, match="Unknown tool"):
             dispatch_tool("ontology_extract", {"text": "t", "source_id": "s"})
 
