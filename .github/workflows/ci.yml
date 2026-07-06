@@ -1,8 +1,6 @@
-# RATCHET 계약: --cov-fail-under 은 단계별(Stage)로만 올라가는 하한선(ratchet
-# floor)이다. 각 리팩토링 Stage PR은 그 시점까지 달성한 커버리지 이상으로 이
-# 값을 올리되 절대 낮추지 않는다. Stage 9(커버리지 마감)에서 pyproject.toml의
-# [tool.coverage.report] fail_under = 80 이 최종 발효되면, 이 옵션은 제거하고
-# `pytest --cov=opencrab --cov-fail-under` 없이 pyproject 설정에 위임한다.
+# 커버리지 게이트는 pyproject.toml [tool.coverage.report] fail_under 에 위임한다
+# (Stage 9에서 래칫 오버라이드 제거 완료, 현재 85%). pytest --cov 실행 시 리포트
+# 단계에서 이 값이 자동 발효되므로 CLI --cov-fail-under 은 두지 않는다.
 name: CI
 
 on:
@@ -50,4 +48,4 @@ jobs:
       - name: Test
         env:
           OPENCRAB_PG_TEST_URL: postgresql://opencrab:opencrab@localhost:5432/opencrab_test
-        run: pytest -q --cov=opencrab --cov-fail-under=82 -o addopts=''
+        run: pytest -q --cov=opencrab -o addopts=''
