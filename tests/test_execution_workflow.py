@@ -14,11 +14,46 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 import pytest
 
 from opencrab.execution.workflow import WorkflowEngine
 from opencrab.stores.sql_store import SQLStore
+
+
+def _pg_scoped_store(dsn: str, suffix: str):
+    """Build a SQLStore whose (unqualified) DDL lands in a fresh, uuid-named
+    PG schema rather than the shared `public` schema -- prevents concurrent
+    pytest sessions from tripping over each other's CREATE/DROP TABLE.
+
+    Mechanism: SQLStore/WorkflowEngine issue unqualified `CREATE TABLE` /
+    `SELECT ... FROM workflow_runs` etc., so pointing every pooled
+    connection's `search_path` at a schema that exists (and only that
+    schema) makes all of that DDL/DML land there without touching
+    WorkflowEngine or SQLStore. psycopg2/libpq honor a `-c search_path=...`
+    passed via the `options` connect kwarg, and SQLAlchemy forwards
+    unrecognised URL query params straight through to psycopg2.connect().
+    """
+    from sqlalchemy import create_engine, text
+
+    schema = f"t{uuid.uuid4().hex[:12]}_{suffix}"
+    admin_engine = create_engine(dsn)
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    sep = "&" if "?" in dsn else "?"
+    scoped_dsn = f"{dsn}{sep}options=-csearch_path%3D{schema}"
+    store = SQLStore(scoped_dsn)
+    return store, schema, admin_engine
+
+
+def _drop_pg_schema(admin_engine, schema: str) -> None:
+    from sqlalchemy import text
+
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+    admin_engine.dispose()
 
 
 @pytest.fixture(params=["sqlite", "pg"])
@@ -33,15 +68,12 @@ def sql_store(request, tmp_path):
     dsn = os.environ.get("OPENCRAB_PG_TEST_URL")
     if not dsn:
         pytest.skip("OPENCRAB_PG_TEST_URL 미설정 - PG 워크플로우 테스트 스킵")
-    store = SQLStore(dsn)
+    store, schema, admin_engine = _pg_scoped_store(dsn, "wf")
     if not store.available:
+        _drop_pg_schema(admin_engine, schema)
         pytest.skip(f"PG 테스트 DB 접속 불가: {dsn!r}")
     yield store
-    from sqlalchemy import text
-
-    with store._engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS action_log"))
-        conn.execute(text("DROP TABLE IF EXISTS workflow_runs"))
+    _drop_pg_schema(admin_engine, schema)
 
 
 @pytest.fixture

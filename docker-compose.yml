@@ -73,7 +73,13 @@ services:
     restart: unless-stopped
 
   chromadb:
-    image: chromadb/chroma:latest
+    # Pinned to match the chromadb Python client tested against this repo
+    # (pip show chromadb == 1.5.9; server image tags track the client's
+    # version 1:1 post-1.0). Docker-mode Chroma is not the recommended path
+    # here (see README — sqlite-vec/embedded is default; this compose file
+    # targets SaaS-scale opt-in), so exactness matters less than having a
+    # reproducible, non-floating tag.
+    image: chromadb/chroma:1.5.9
     container_name: opencrab-chromadb
     ports:
       - "8000:8000"

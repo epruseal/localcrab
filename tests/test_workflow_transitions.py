@@ -218,6 +218,41 @@ class TestWorkflowTransitionsEdge:
         assert actual == EXPECTED_TRANSITIONS
 
 
+def _pg_scoped_store(dsn: str, suffix: str):
+    """Build a SQLStore whose (unqualified) DDL lands in a fresh, uuid-named
+    PG schema rather than the shared `public` schema -- prevents concurrent
+    pytest sessions from tripping over each other's CREATE/DROP TABLE.
+
+    Mechanism: pointing every pooled connection's `search_path` at a schema
+    that exists (and only that schema) makes WorkflowEngine/SQLStore's
+    unqualified DDL/DML land there without touching production code.
+    psycopg2/libpq honor a `-c search_path=...` passed via the `options`
+    connect kwarg, and SQLAlchemy forwards unrecognised URL query params
+    straight through to psycopg2.connect().
+    """
+    import uuid
+
+    from sqlalchemy import create_engine, text
+
+    schema = f"t{uuid.uuid4().hex[:12]}_{suffix}"
+    admin_engine = create_engine(dsn)
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    sep = "&" if "?" in dsn else "?"
+    scoped_dsn = f"{dsn}{sep}options=-csearch_path%3D{schema}"
+    store = SQLStore(scoped_dsn)
+    return store, schema, admin_engine
+
+
+def _drop_pg_schema(admin_engine, schema: str) -> None:
+    from sqlalchemy import text
+
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+    admin_engine.dispose()
+
+
 @pytest.fixture
 def pg_engine_dsn():
     dsn = os.environ.get("OPENCRAB_PG_TEST_URL")
@@ -232,13 +267,14 @@ class TestWorkflowTransitionsPg:
     passing sqlite run does not guarantee PG parity."""
 
     def test_legal_chain_pending_running_completed(self, pg_engine_dsn, tmp_path):
-        store = SQLStore(pg_engine_dsn)
+        store, schema, admin_engine = _pg_scoped_store(pg_engine_dsn, "wft")
         if not store.available:
+            _drop_pg_schema(admin_engine, schema)
             pytest.skip(f"PG test DB unreachable: {pg_engine_dsn!r}")
-        engine = WorkflowEngine(store)
-        created = engine.create_run("add_node", {})
-        run_id = created["run_id"]
         try:
+            engine = WorkflowEngine(store)
+            created = engine.create_run("add_node", {})
+            run_id = created["run_id"]
             engine.advance(run_id, "running")
             engine.advance(run_id, "completed")
             assert engine.get_run(run_id)["status"] == "completed"
@@ -246,8 +282,4 @@ class TestWorkflowTransitionsPg:
             with pytest.raises(ValueError):
                 engine.advance(run_id, "pending")
         finally:
-            from sqlalchemy import text
-
-            with store._engine.begin() as conn:
-                conn.execute(text("DELETE FROM action_log WHERE run_id = :r"), {"r": run_id})
-                conn.execute(text("DELETE FROM workflow_runs WHERE run_id = :r"), {"r": run_id})
+            _drop_pg_schema(admin_engine, schema)

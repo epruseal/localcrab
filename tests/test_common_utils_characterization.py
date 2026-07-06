@@ -93,21 +93,21 @@ def _all_now_iso_funcs():
     # their import). Pinning them here still asserts every call site converged
     # on the same helper; the golden format assertions below are unchanged.
     from opencrab.billing.hooks import now_iso as billing_now
+    from opencrab.common.timefmt import now_iso as promotion_now
     from opencrab.execution.approvals import now_iso as approvals_now
     from opencrab.execution.workflow import now_iso as workflow_now
     from opencrab.ontology.identity import now_iso as identity_now
-    from opencrab.ontology.promotion import now_iso as promotion_now
 
     return {
         "workflow": workflow_now,
         "approvals": approvals_now,
         "identity": identity_now,
-        "promotion": promotion_now,
+        "timefmt": promotion_now,
         "billing": billing_now,
     }
 
 
-@pytest.mark.parametrize("label", ["workflow", "approvals", "identity", "promotion", "billing"])
+@pytest.mark.parametrize("label", ["workflow", "approvals", "identity", "timefmt", "billing"])
 def test_now_iso_aware_offset_format(label):
     """All 5 _now_iso definitions emit an aware "+00:00" offset ISO string."""
     func = _all_now_iso_funcs()[label]
