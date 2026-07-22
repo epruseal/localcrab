@@ -36,8 +36,11 @@ ResilientEmbeddingFunction — 다중 원격(LM Studio 등) ↔ 로컬 GGUF 자�
 """
 
 import logging
+import os
 import time
 from typing import Any
+
+from opencrab.stores._embedding_utils import l2_normalize
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,23 @@ def _label(ef: Any, index: int) -> str:
     if api_base:
         return str(api_base)
     return f"primary[{index}]"
+
+
+# ── 장문 윈도우 분할 (KURE n_ctx 8192 초과 방지, 2026-07-22) ─────────────
+# 서버(llama.cpp)는 초과 입력을 head 절단해 임베딩하므로 후반부 신호가 유실된다.
+# 한도 초과 텍스트는 윈도우로 나눠 각각 임베딩한 뒤 mean pooling + L2 정규화로
+# 벡터 1개를 복원한다. 문자 기준 근사(한국어 XLM-R ~2자/토큰, 보수 마진).
+EMBED_WINDOW_CHARS = int(os.environ.get("EMBED_WINDOW_CHARS", "9000"))
+_WINDOW_MIN_TAIL = 1500  # 꼬리 윈도우가 이보다 짧으면 직전에 병합(평균 희석 방지)
+
+def _split_windows(text: str) -> list[str]:
+    if len(text) <= EMBED_WINDOW_CHARS:
+        return [text]
+    ws = [text[i:i + EMBED_WINDOW_CHARS] for i in range(0, len(text), EMBED_WINDOW_CHARS)]
+    if len(ws) > 1 and len(ws[-1]) < _WINDOW_MIN_TAIL:
+        ws[-2] += ws[-1]
+        ws.pop()
+    return ws
 
 
 class ResilientEmbeddingFunction:
@@ -87,7 +107,7 @@ class ResilientEmbeddingFunction:
     # ChromaDB EmbeddingFunction 프로토콜
     # ------------------------------------------------------------------
 
-    def __call__(self, input: list[str]) -> list[list[float]]:
+    def _embed_chain(self, input: list[str]) -> list[list[float]]:
         """healthy 한 primary 를 순서대로 시도 → 전부 실패/unhealthy 시 fallback."""
         if not input:
             return []
@@ -108,6 +128,33 @@ class ResilientEmbeddingFunction:
         # 모든 primary 가 unhealthy 이거나 실패 → fallback 경로
         logger.info("임베딩 폴백: 로컬 GGUF (모든 primary 장애 또는 unhealthy)")
         return self._fallback(input)
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        """healthy 한 primary 를 순서대로 시도 → 전부 실패/unhealthy 시 fallback.
+        장문은 윈도우 분할→개별 임베딩→mean pooling+L2 정규화로 벡터 1개 복원."""
+        if not input:
+            return []
+        expanded: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for text in input:
+            ws = _split_windows(text)
+            spans.append((len(expanded), len(expanded) + len(ws)))
+            expanded.extend(ws)
+
+        vecs = self._embed_chain(expanded)
+
+        if len(expanded) == len(input):
+            return vecs
+        out: list[list[float]] = []
+        for a, b in spans:
+            if b - a == 1:
+                out.append(vecs[a])
+            else:
+                n = b - a
+                dim = len(vecs[a])
+                pooled = [sum(vecs[j][k] for j in range(a, b)) / n for k in range(dim)]
+                out.append(l2_normalize(pooled))
+        return out
 
     def name(self) -> str:
         """ChromaDB persistence 식별 이름. 첫 primary 와 동일("kure_v1") 반환.
