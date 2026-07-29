@@ -22,7 +22,7 @@ import os
 from collections import deque
 from typing import Any
 
-from opencrab.stores._graph_common import _edge_passes, _node_passes
+from opencrab.stores._graph_common import _edge_passes, _merge_space, _node_passes
 from opencrab.stores._json import parse_props as _parse
 
 logger = logging.getLogger(__name__)
@@ -456,14 +456,17 @@ class KuzuGraphStore:
         limit: int = 500_000,
     ) -> list[dict[str, Any]]:
         self._require_available()
+        # space_id is returned so _merge_space can restore it into props: this
+        # backend keeps space in its own column (see _NODE_DDL), but the
+        # protocol's export shape carries it inside props.
         r = self._conn.execute(
-            f"MATCH (n:OntologyNode) RETURN n.node_type, n.props LIMIT {int(limit)}"
+            f"MATCH (n:OntologyNode) RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}"
         )
         results: list[dict[str, Any]] = []
         while r.has_next():
             row = r.get_next()
-            ntype, props_raw = row[0], row[1]
-            props = _parse(props_raw)
+            ntype, space_id, props_raw = row[0], row[1], row[2]
+            props = _merge_space(_parse(props_raw), space_id)
             if pack_id is not None:
                 if (
                     props.get("pack_id") != pack_id
@@ -480,19 +483,22 @@ class KuzuGraphStore:
         limit: int = 1_000_000,
     ) -> list[dict[str, Any]]:
         self._require_available()
+        # a.space_id / b.space_id: same reason as export_nodes -- both
+        # endpoints' props must carry their space.
         r = self._conn.execute(
             f"MATCH (a:OntologyNode)-[e:OntologyEdge]->(b:OntologyNode) "
-            f"RETURN a.node_type, a.props, b.node_type, b.props, e.relation, e.properties "
+            f"RETURN a.node_type, a.props, b.node_type, b.props, e.relation, e.properties, "
+            f"a.space_id, b.space_id "
             f"LIMIT {int(limit)}"
         )
         results: list[dict[str, Any]] = []
         while r.has_next():
             row = r.get_next()
-            at, ap, bt, bp, rel, ep = (
-                row[0], row[1], row[2], row[3], row[4], row[5]
+            at, ap, bt, bp, rel, ep, asp, bsp = (
+                row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
             )
-            sp = _parse(ap)
-            tp = _parse(bp)
+            sp = _merge_space(_parse(ap), asp)
+            tp = _merge_space(_parse(bp), bsp)
             rp = _parse(ep)
             if pack_id is not None:
                 if (

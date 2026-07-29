@@ -122,7 +122,7 @@ import logging
 from collections import deque
 from typing import Any
 
-from opencrab.stores._graph_common import _as_dict, _edge_passes, _node_passes
+from opencrab.stores._graph_common import _as_dict, _edge_passes, _merge_space, _node_passes
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
 logger = logging.getLogger(__name__)
@@ -613,18 +613,27 @@ class _SqlGraphStoreBase(abc.ABC):
     ) -> list[dict[str, Any]]:
         self._require_available()
         table = self._table("graph_nodes")
+        # space_id is selected so _merge_space can restore it into props: this
+        # backend keeps space in its own column, but the protocol's export shape
+        # carries it inside props (see _merge_space for the measured fallout).
         if pack_id:
             pid = self._dialect.json_get("properties", "pack_id")
             src = self._dialect.json_get("properties", "source")
             src_id = self._dialect.json_get("properties", "source_id")
             sql = (
-                f"SELECT node_type, properties FROM {table}"
+                f"SELECT node_type, space_id, properties FROM {table}"
                 f" WHERE {pid} = :pid OR {src} = :pid OR {src_id} = :pid LIMIT :lim"
             )
             rows = self._fetch_all(sql, {"pid": pack_id, "lim": limit})
         else:
-            rows = self._fetch_all(f"SELECT node_type, properties FROM {table} LIMIT :lim", {"lim": limit})
-        return [{"props": _as_dict(properties), "labels": [node_type]} for node_type, properties in rows]
+            rows = self._fetch_all(
+                f"SELECT node_type, space_id, properties FROM {table} LIMIT :lim",
+                {"lim": limit},
+            )
+        return [
+            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            for node_type, space_id, properties in rows
+        ]
 
     def export_edges(
         self,
@@ -634,11 +643,14 @@ class _SqlGraphStoreBase(abc.ABC):
         self._require_available()
         nodes = self._table("graph_nodes")
         edges = self._table("graph_edges")
+        # a.space_id / b.space_id are selected for the same reason as in
+        # export_nodes -- both endpoints' props must carry their space.
         base_select = f"""
             SELECT
                 a.node_type AS from_type, a.properties AS source_props,
                 b.node_type AS to_type,   b.properties AS target_props,
-                e.properties AS rel_props, e.relation
+                e.properties AS rel_props, e.relation,
+                a.space_id AS from_space_id, b.space_id AS to_space_id
             FROM {edges} e
             JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
             JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
@@ -660,8 +672,8 @@ class _SqlGraphStoreBase(abc.ABC):
             rows = self._fetch_all(base_select + " LIMIT :lim", {"lim": limit})
         return [
             {
-                "source_props": _as_dict(r[1]), "source_labels": [r[0]],
-                "target_props": _as_dict(r[3]), "target_labels": [r[2]],
+                "source_props": _merge_space(_as_dict(r[1]), r[6]), "source_labels": [r[0]],
+                "target_props": _merge_space(_as_dict(r[3]), r[7]), "target_labels": [r[2]],
                 "rel_props": _as_dict(r[4]), "relation": r[5],
             }
             for r in rows

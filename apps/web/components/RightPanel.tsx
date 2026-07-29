@@ -122,7 +122,7 @@ export default function RightPanel({ selectedNode, controls, onControlChange, ap
                   {selectedNode.space}
                 </span>
                 <span className="badge">{selectedNode.node_type}</span>
-                <span className="badge">{selectedNode.degree} links</span>
+                <span className="badge">{selectedNode.degree_in_view} links in view</span>
               </div>
               <hr className="gold-line" />
               <div style={{ fontSize: 10, color: '#555', marginBottom: 6, letterSpacing: '0.06em' }}>PROPERTIES</div>

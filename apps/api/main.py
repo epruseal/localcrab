@@ -745,7 +745,15 @@ def list_nodes(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
-    """Return all nodes for graph visualization."""
+    """Return nodes for graph visualization.
+
+    ``degree_in_view`` counts a node's links **within the returned edge set**
+    (``/api/edges``, capped at ``EDGE_VIZ_LIMIT``), not its degree in the whole
+    graph -- a hub node can score 458 here while holding 3302 edges overall.
+    That is deliberate: this payload drives a rendered subgraph, so sizing and
+    "N links" labels should describe what is on screen. Callers needing true
+    degree must count edges themselves.
+    """
     # export_nodes/export_edges are part of the graph-store protocol
     # (opencrab/stores/_graph_protocol.py) and every backend implements them.
     # The previous implementation called ctx.graph.run_query(<Cypher>), which is
@@ -755,14 +763,14 @@ def list_nodes(
     try:
         raw = ctx.graph.export_nodes(limit=NODE_VIZ_LIMIT)
 
-        # Degree is computed from the same edge set the graph view renders, so
-        # the two endpoints stay consistent with each other.
-        degree: dict[str, int] = {}
+        # Computed from the same edge set the graph view renders, so the two
+        # endpoints stay consistent with each other.
+        degree_in_view: dict[str, int] = {}
         for item in ctx.graph.export_edges(limit=EDGE_VIZ_LIMIT):
             for side in ("source_props", "target_props"):
                 nid = _viz_node_id(item.get(side) or {})
                 if nid:
-                    degree[nid] = degree.get(nid, 0) + 1
+                    degree_in_view[nid] = degree_in_view.get(nid, 0) + 1
 
         nodes = []
         for item in (raw or []):
@@ -777,7 +785,7 @@ def list_nodes(
                 "space": _viz_space(props),
                 "node_type": _viz_type(item.get("labels"), props),
                 "properties": visible,
-                "degree": degree.get(nid, 0),
+                "degree_in_view": degree_in_view.get(nid, 0),
             })
         return {"nodes": nodes, "total": len(nodes)}
     except Exception as exc:

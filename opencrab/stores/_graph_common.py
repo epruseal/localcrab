@@ -97,3 +97,31 @@ def _as_dict(value: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             return {}
     return {}
+
+
+def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
+    """Fold the graph store's ``space_id`` column into a node's properties.
+
+    The SQL and Kuzu backends keep ``space`` in a dedicated column while
+    ``upsert_node`` only injects ``id`` into ``properties`` -- so a node's space
+    reaches ``properties`` solely when the caller happened to put it there. The
+    GraphStore protocol (see ``_graph_protocol.export_nodes``) nonetheless
+    documents the export shape as ``{"props": dict, "labels": [str]}`` with the
+    space carried inside ``props``, which is how Neo4j behaves (space is a real
+    property there). Every props-only consumer therefore mis-reads SQL/Kuzu
+    exports: measured 2026-07-29 on a live store, 206,817 of 248,304 nodes
+    (83.3%) had no ``space`` key, which silently dropped 88% of the candidates
+    in the BM25 space filter (``ontology/query.py``), emptied the space field in
+    ``ontology_list_nodes`` and pack export, and made the graph API fall back to
+    "concept".
+
+    Restoring it at read time is exact: on that same store the column was
+    non-NULL for all 248,304 rows and never disagreed with ``props["space"]``
+    where both existed.
+
+    A ``space`` already present in ``props`` always wins -- the column is a
+    fallback, never an override, so an explicit caller-supplied value survives.
+    """
+    if not space_id or props.get("space"):
+        return props
+    return {**props, "space": space_id}

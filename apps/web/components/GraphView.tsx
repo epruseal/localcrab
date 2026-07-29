@@ -216,7 +216,7 @@ export default function GraphView({
       )
       .force('charge', d3.forceManyBody<SimNode>().strength(-repelForce))
       .force('center', d3.forceCenter<SimNode>(width / 2, height / 2).strength(centerForce))
-      .force('collision', d3.forceCollide<SimNode>((node) => nodeRadius(node.degree) * nodeSize + 4))
+      .force('collision', d3.forceCollide<SimNode>((node) => nodeRadius(node.degree_in_view) * nodeSize + 4))
 
     simRef.current = sim
 
@@ -234,7 +234,7 @@ export default function GraphView({
       .selectAll<SVGCircleElement, SimNode>('circle')
       .data(simNodes)
       .join('circle')
-      .attr('r', (d) => nodeRadius(d.degree) * nodeSize)
+      .attr('r', (d) => nodeRadius(d.degree_in_view) * nodeSize)
       .attr('fill', (d) => nodeColor(d))
       .attr('stroke', (d) => (d.id === selectedId ? '#fff' : 'transparent'))
       .attr('stroke-width', 2)
@@ -274,7 +274,7 @@ export default function GraphView({
         tip.innerHTML = [
           `<span style="color:${nodeColor(d)};font-weight:600">${themeLabel(d)}</span>`,
           `<span style="color:#faf2d6">${d.id}</span>`,
-          `<span style="color:#bdae93;font-size:11px">${d.node_type} | ${d.degree} links | ${d.space}</span>`,
+          `<span style="color:#bdae93;font-size:11px">${d.node_type} | ${d.degree_in_view} links in view | ${d.space}</span>`,
         ].join('<br/>')
       })
       .on('mousemove', (event) => {
@@ -296,7 +296,7 @@ export default function GraphView({
       .attr('font-size', 9)
       .attr('fill', '#bdae93')
       .attr('text-anchor', 'middle')
-      .attr('dy', (d) => nodeRadius(d.degree) * nodeSize + 12)
+      .attr('dy', (d) => nodeRadius(d.degree_in_view) * nodeSize + 12)
       .style('pointer-events', 'none')
       .attr('opacity', (d) => {
         if (!searchTerm) return 0.7

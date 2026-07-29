@@ -11,7 +11,8 @@ export interface OcNode {
   space: string
   node_type: string
   properties: Record<string, unknown>
-  degree: number
+  // Links within the returned edge set, not the node total (see /api/nodes).
+  degree_in_view: number
 }
 
 export interface OcEdge {

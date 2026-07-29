@@ -514,3 +514,71 @@ class TestExtendedMethodsEdge:
     def test_upsert_edges_batch_empty_list_returns_zero(self, backend):
         _name, store = backend
         assert store.upsert_edges_batch([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# export_* must carry `space` inside props (regression: space_id column dropped)
+#
+# The SQL and Kuzu backends keep space in a dedicated `space_id` column while
+# upsert_node only injects `id` into properties. export_nodes/export_edges used
+# to select `properties` alone, so the exported props had no `space` key unless
+# a caller had put one there -- measured 2026-07-29 on a live store, 206,817 of
+# 248,304 nodes (83.3%) lacked it. Every props-only consumer broke silently:
+# the BM25 space filter in ontology/query.py discarded 88% of its candidates,
+# ontology_list_nodes and pack export emitted an empty space, and the graph API
+# fell back to "concept".
+#
+# The protocol documents the export shape as {"props": dict, "labels": [str]}
+# with space inside props (which is how Neo4j behaves natively), so these pin
+# that contract for every backend.
+# ---------------------------------------------------------------------------
+
+
+class TestExportCarriesSpace:
+    def test_export_nodes_props_carry_space_from_column(self, backend):
+        _name, store = backend
+        store.upsert_node("TextUnit", "n-space-1", {"text": "body"}, space_id="evidence")
+
+        rows = store.export_nodes()
+        row = next(r for r in rows if (r["props"].get("id") == "n-space-1"))
+
+        assert row["props"]["space"] == "evidence"
+        assert row["labels"] == ["TextUnit"]
+
+    def test_explicit_props_space_is_not_overwritten_by_column(self, backend):
+        """The column is a fallback, never an override."""
+        _name, store = backend
+        store.upsert_node(
+            "TextUnit", "n-space-2", {"text": "body", "space": "claim"}, space_id="evidence"
+        )
+
+        rows = store.export_nodes()
+        row = next(r for r in rows if (r["props"].get("id") == "n-space-2"))
+
+        assert row["props"]["space"] == "claim"
+
+    def test_export_edges_both_endpoints_carry_space(self, backend):
+        _name, store = backend
+        store.upsert_node("Document", "e-src", {"title": "Doc"}, space_id="resource")
+        store.upsert_node("TextUnit", "e-dst", {"text": "body"}, space_id="evidence")
+        store.upsert_edge("Document", "e-src", "contains", "TextUnit", "e-dst")
+
+        rows = store.export_edges()
+        row = next(
+            r for r in rows
+            if r["source_props"].get("id") == "e-src" and r["target_props"].get("id") == "e-dst"
+        )
+
+        assert row["source_props"]["space"] == "resource"
+        assert row["target_props"]["space"] == "evidence"
+        assert row["relation"] == "contains"
+
+    def test_missing_space_id_leaves_props_untouched(self, backend):
+        """No space column value -> no invented key (callers keep distinguishing)."""
+        _name, store = backend
+        store.upsert_node("TextUnit", "n-space-3", {"text": "body"})
+
+        rows = store.export_nodes()
+        row = next(r for r in rows if (r["props"].get("id") == "n-space-3"))
+
+        assert "space" not in row["props"] or row["props"]["space"] in ("", None)
