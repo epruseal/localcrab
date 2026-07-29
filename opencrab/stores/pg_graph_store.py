@@ -69,7 +69,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
-from opencrab.stores._graph_common import _as_dict
+from opencrab.stores._graph_common import _as_dict, _merge_space
 from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
 
@@ -230,10 +230,12 @@ class PGGraphStore(_SqlGraphStoreBase):
             return {}
         types = [p[0] for p in pairs]
         ids = [p[1] for p in pairs]
+        # g.space_id is folded into props (see _merge_space) so this override
+        # returns the same shape as the base's get_node-backed default.
         rows = conn.execute(
             self._text(
                 f"""
-                SELECT g.node_type, g.node_id, g.properties
+                SELECT g.node_type, g.node_id, g.properties, g.space_id
                 FROM unnest(CAST(:types AS text[]), CAST(:ids AS text[])) AS p(node_type, node_id)
                 JOIN {self._table('graph_nodes')} g
                   ON g.node_type = p.node_type AND g.node_id = p.node_id
@@ -241,7 +243,7 @@ class PGGraphStore(_SqlGraphStoreBase):
             ),
             {"types": types, "ids": ids},
         ).fetchall()
-        return {(r[0], r[1]): _as_dict(r[2]) for r in rows}
+        return {(r[0], r[1]): _merge_space(_as_dict(r[2]), r[3]) for r in rows}
 
     def _prefetch_frontier(
         self, frontier_ids: list[str], cap: int, out: bool

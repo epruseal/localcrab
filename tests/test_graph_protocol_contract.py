@@ -574,11 +574,77 @@ class TestExportCarriesSpace:
         assert row["relation"] == "contains"
 
     def test_missing_space_id_leaves_props_untouched(self, backend):
-        """No space column value -> no invented key (callers keep distinguishing)."""
+        """No space column value -> no invented key (callers keep distinguishing).
+
+        Kuzu stores ``space_id or ""``, so an absent space surfaces as an empty
+        string there rather than NULL; both must leave props without the key.
+        """
         _name, store = backend
         store.upsert_node("TextUnit", "n-space-3", {"text": "body"})
 
         rows = store.export_nodes()
         row = next(r for r in rows if (r["props"].get("id") == "n-space-3"))
 
-        assert "space" not in row["props"] or row["props"]["space"] in ("", None)
+        assert "space" not in row["props"]
+
+    def test_falsy_props_space_is_filled_from_column(self, backend):
+        """An empty/None space in props is treated as absent, not as a value.
+
+        Pins the precedence _merge_space actually implements: only a *truthy*
+        props value wins. An empty space would otherwise survive and keep
+        reproducing the exact breakage this fold exists to fix.
+        """
+        _name, store = backend
+        store.upsert_node(
+            "TextUnit", "n-space-4", {"text": "body", "space": ""}, space_id="evidence"
+        )
+
+        rows = store.export_nodes()
+        row = next(r for r in rows if (r["props"].get("id") == "n-space-4"))
+
+        assert row["props"]["space"] == "evidence"
+
+
+# ---------------------------------------------------------------------------
+# The same fold must apply to the single-node reads, not just the bulk exports
+#
+# get_node is the funnel for _batch_node_props (and therefore find_neighbors'
+# BFS) and for find_path; get_node_by_id backs lookup_node_type and
+# ontology/impact.py. Leaving them unfolded kept the defect alive on those
+# paths after export_nodes was fixed -- impact.py:126/:170 read props["space"]
+# and fell back to a node-type label guess.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleNodeReadsCarrySpace:
+    def test_get_node_carries_space(self, backend):
+        _name, store = backend
+        store.upsert_node("TextUnit", "g-1", {"text": "body"}, space_id="evidence")
+
+        assert store.get_node("TextUnit", "g-1")["space"] == "evidence"
+
+    def test_get_node_by_id_carries_space(self, backend):
+        _name, store = backend
+        store.upsert_node("TextUnit", "g-2", {"text": "body"}, space_id="evidence")
+
+        props = store.get_node_by_id("g-2")
+        assert props["space"] == "evidence"
+        assert props["node_type"] == "TextUnit"
+
+    def test_find_neighbors_props_carry_space(self, backend):
+        _name, store = backend
+        store.upsert_node("Document", "g-anchor", {"title": "Doc"}, space_id="resource")
+        store.upsert_node("TextUnit", "g-nb", {"text": "body"}, space_id="evidence")
+        store.upsert_edge("Document", "g-anchor", "contains", "TextUnit", "g-nb")
+
+        hits = store.find_neighbors("g-anchor", direction="both", depth=1, limit=10)
+        nb = next(h for h in hits if (h.get("properties") or h).get("id") == "g-nb")
+        props = nb.get("properties") or nb
+
+        assert props["space"] == "evidence"
+
+    def test_get_node_does_not_override_explicit_space(self, backend):
+        _name, store = backend
+        store.upsert_node("TextUnit", "g-3", {"text": "b", "space": "claim"}, space_id="evidence")
+
+        assert store.get_node("TextUnit", "g-3")["space"] == "claim"

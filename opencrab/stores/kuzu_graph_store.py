@@ -131,25 +131,29 @@ class KuzuGraphStore:
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
         self._require_available()
+        # n.space_id is folded in for the same reason as export_nodes (see
+        # _merge_space); this is also the funnel for _batch_node_props.
         r = self._conn.execute(
-            "MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) RETURN n.props LIMIT 1",
+            "MATCH (n:OntologyNode {node_id: $id, node_type: $nt}) "
+            "RETURN n.props, n.space_id LIMIT 1",
             {"id": node_id, "nt": node_type},
         )
         if r.has_next():
-            return _parse(r.get_next()[0])
+            row = r.get_next()
+            return _merge_space(_parse(row[0]), row[1])
         return None
 
     def get_node_by_id(self, node_id: str) -> dict[str, Any] | None:
         self._require_available()
         r = self._conn.execute(
             "MATCH (n:OntologyNode {node_id: $id}) "
-            "RETURN n.node_type, n.props LIMIT 1",
+            "RETURN n.node_type, n.props, n.space_id LIMIT 1",
             {"id": node_id},
         )
         if not r.has_next():
             return None
         row = r.get_next()
-        props = _parse(row[1])
+        props = dict(_merge_space(_parse(row[1]), row[2]))
         props["node_type"] = row[0]
         props.setdefault("id", node_id)
         return props
@@ -282,25 +286,28 @@ class KuzuGraphStore:
         if direction == "out":
             q = (
                 "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties"
+                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
             )
         elif direction == "in":
             q = (
                 "MATCH (n:OntologyNode {node_id: $id})<-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties"
+                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
             )
         else:
             q = (
                 "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties"
+                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
             )
         r = self._conn.execute(q + f" LIMIT {int(limit)}", {"id": node_id})
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
         while r.has_next():
             row = r.get_next()
-            nid, ntype, props_raw, rel, edge_props_raw = row[0], row[1], row[2], row[3], row[4]
-            props = _parse(props_raw)
+            nid, ntype, props_raw, rel, edge_props_raw, m_space = (
+                row[0], row[1], row[2], row[3], row[4], row[5]
+            )
+            # m.space_id folded in so neighbour props match get_node's shape.
+            props = dict(_merge_space(_parse(props_raw), m_space))
             props.setdefault("id", nid)
             if pack_set is not None:
                 # `node_id` is always the anchor side of this 1-hop query (the

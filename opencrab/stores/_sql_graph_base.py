@@ -242,12 +242,15 @@ class _SqlGraphStoreBase(abc.ABC):
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
         self._require_available()
+        # space_id is folded in for the same reason as export_nodes (see
+        # _merge_space). This is the funnel for _batch_node_props (hence
+        # find_neighbors' BFS) and find_path, so fixing it here covers them.
         sql = (
-            f"SELECT properties FROM {self._table('graph_nodes')}"
+            f"SELECT properties, space_id FROM {self._table('graph_nodes')}"
             " WHERE node_type=:node_type AND node_id=:node_id"
         )
         row = self._fetch_one(sql, {"node_type": node_type, "node_id": node_id})
-        return _as_dict(row[0]) if row else None
+        return _merge_space(_as_dict(row[0]), row[1]) if row else None
 
     def lookup_node_type(self, node_id: str) -> str | None:
         """No ``_require_available()`` — mirrors both existing stores, which
@@ -320,9 +323,12 @@ class _SqlGraphStoreBase(abc.ABC):
         return []
 
     def _fetch_node_props_by_id(self, node_id: str) -> dict[str, Any] | None:
-        sql = f"SELECT properties FROM {self._table('graph_nodes')} WHERE node_id=:nid LIMIT 1"
+        sql = (
+            f"SELECT properties, space_id FROM {self._table('graph_nodes')}"
+            " WHERE node_id=:nid LIMIT 1"
+        )
         row = self._fetch_one(sql, {"nid": node_id})
-        return _as_dict(row[0]) if row else None
+        return _merge_space(_as_dict(row[0]), row[1]) if row else None
 
     def _fetch_edges_for_node(
         self, node_id: str, cap: int, out: bool
@@ -598,11 +604,14 @@ class _SqlGraphStoreBase(abc.ABC):
 
     def get_node_by_id(self, node_id: str) -> dict[str, Any] | None:
         self._require_available()
-        sql = f"SELECT node_type, properties FROM {self._table('graph_nodes')} WHERE node_id=:nid LIMIT 1"
+        sql = (
+            f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
+            " WHERE node_id=:nid LIMIT 1"
+        )
         row = self._fetch_one(sql, {"nid": node_id})
         if not row:
             return None
-        props = _as_dict(row[1])
+        props = dict(_merge_space(_as_dict(row[1]), row[2]))
         props["node_type"] = row[0]
         return props
 
