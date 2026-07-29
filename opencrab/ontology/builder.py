@@ -229,15 +229,53 @@ class OntologyBuilder:
         }
 
         # Resolve real node types from whichever graph store is available.
-        # Both LocalGraphStore and Neo4jStore expose lookup_node_type(node_id),
-        # so local mode no longer flattens edge labels to a per-space default.
-        # Falls back to space defaults only when the lookup returns None.
+        # All four backends expose lookup_node_type(node_id) (see
+        # opencrab/stores/_graph_protocol.py), so local mode no longer flattens
+        # edge labels to a per-space default.
+        #
+        # A None lookup means the endpoint node does not exist. Falling back to
+        # the space default here used to write a *wrong-typed* row: the SQL
+        # backends' upsert_edge is a plain INSERT with no endpoint check, while
+        # Neo4jStore.upsert_edge uses MATCH and writes nothing. Because
+        # graph_edges' primary key includes from_type/to_type, such a row could
+        # not be corrected by re-running the ingest -- it stayed as a permanent
+        # dangling edge typed as the space's first node type (resource ->
+        # Project, subject -> User).
+        #
+        # Both endpoints are now checked, and a missing one yields the same
+        # "no match" contract Neo4j already had.
+        #
+        # The check only runs when the graph store is available and implements
+        # lookup_node_type: an unavailable store cannot tell "node absent" from
+        # "store down", and it writes nothing anyway, so no wrong-typed row can
+        # be created. In that case the space default is kept as before.
         lookup = getattr(self._neo4j, "lookup_node_type", None)
-        from_type = (lookup(from_id) if lookup else None) or _space_to_default_type(from_space)
-        to_type = (lookup(to_id) if lookup else None) or _space_to_default_type(to_space)
+        if lookup is not None and self._neo4j.available:
+            from_type = lookup(from_id)
+            to_type = lookup(to_id)
+            missing = [
+                f"{space}/{nid}"
+                for space, nid, ntype in (
+                    (from_space, from_id, from_type),
+                    (to_space, to_id, to_type),
+                )
+                if ntype is None
+            ]
+        else:
+            from_type = _space_to_default_type(from_space)
+            to_type = _space_to_default_type(to_space)
+            missing = []
 
         # --- Neo4j write ---
-        if self._neo4j.available:
+        if missing:
+            # Endpoint node absent -> refuse the write instead of inventing a type.
+            logger.warning(
+                "edge %s -[%s]-> %s skipped: endpoint node(s) not found: %s",
+                from_id, relation, to_id, ", ".join(missing),
+            )
+            output["stores"]["graph"] = f"no match (missing node: {', '.join(missing)})"
+            output["missing_nodes"] = missing
+        elif self._neo4j.available:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
@@ -248,7 +286,11 @@ class OntologyBuilder:
             output["stores"]["graph"] = "unavailable"
 
         # --- PostgreSQL registry ---
-        if self._sql.available:
+        # Skipped when the graph write was refused, so the registry cannot end
+        # up listing an edge the graph does not hold.
+        if missing:
+            output["stores"]["sql"] = "skipped (missing node)"
+        elif self._sql.available:
             try:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)
                 output["stores"]["sql"] = "ok"

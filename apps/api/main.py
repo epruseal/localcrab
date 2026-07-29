@@ -723,32 +723,61 @@ def get_usage(
     }
 
 
+NODE_VIZ_LIMIT = 500
+EDGE_VIZ_LIMIT = 2000
+
+
+def _viz_node_id(props: dict[str, Any]) -> str:
+    """Node id as stored by every backend (see ontology_list_nodes)."""
+    return props.get("node_id") or props.get("id") or ""
+
+
+def _viz_space(props: dict[str, Any]) -> str:
+    return props.get("space_id") or props.get("space") or "concept"
+
+
+def _viz_type(labels: list[str] | None, props: dict[str, Any]) -> str:
+    return (labels or [None])[0] or props.get("node_type") or "Node"
+
+
 @app.get("/api/nodes")
 def list_nodes(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
     """Return all nodes for graph visualization."""
+    # export_nodes/export_edges are part of the graph-store protocol
+    # (opencrab/stores/_graph_protocol.py) and every backend implements them.
+    # The previous implementation called ctx.graph.run_query(<Cypher>), which is
+    # defined by no store in this repo -- it raised AttributeError on the SQL
+    # backends and would have hit the no-op run_cypher() stub even if renamed.
+    # This mirrors the normalisation ontology_list_nodes already uses.
     try:
-        raw = ctx.graph.run_query(
-            "MATCH (n) OPTIONAL MATCH (n)-[r]-() "
-            "RETURN n.id AS id, n.space AS space, n.node_type AS node_type, "
-            "properties(n) AS props, count(r) AS degree "
-            "LIMIT 500"
-        )
+        raw = ctx.graph.export_nodes(limit=NODE_VIZ_LIMIT)
+
+        # Degree is computed from the same edge set the graph view renders, so
+        # the two endpoints stay consistent with each other.
+        degree: dict[str, int] = {}
+        for item in ctx.graph.export_edges(limit=EDGE_VIZ_LIMIT):
+            for side in ("source_props", "target_props"):
+                nid = _viz_node_id(item.get(side) or {})
+                if nid:
+                    degree[nid] = degree.get(nid, 0) + 1
+
         nodes = []
-        for row in (raw or []):
-            nid = row.get("id")
+        for item in (raw or []):
+            props = item.get("props") or {}
+            nid = _viz_node_id(props)
             if not nid:
                 continue
-            props = {k: v for k, v in (row.get("props") or {}).items()
-                     if k not in ("id", "space", "node_type")}
+            visible = {k: v for k, v in props.items()
+                       if k not in ("id", "node_id", "space", "space_id", "node_type")}
             nodes.append({
                 "id": nid,
-                "space": row.get("space", "concept"),
-                "node_type": row.get("node_type", "Node"),
-                "properties": props,
-                "degree": row.get("degree", 0),
+                "space": _viz_space(props),
+                "node_type": _viz_type(item.get("labels"), props),
+                "properties": visible,
+                "degree": degree.get(nid, 0),
             })
         return {"nodes": nodes, "total": len(nodes)}
     except Exception as exc:
@@ -763,22 +792,20 @@ def list_edges(
 ) -> dict[str, Any]:
     """Return all edges for graph visualization."""
     try:
-        raw = ctx.graph.run_query(
-            "MATCH (a)-[r]->(b) "
-            "RETURN a.id AS from_id, b.id AS to_id, type(r) AS relation, "
-            "a.space AS from_space, b.space AS to_space "
-            "LIMIT 2000"
-        )
+        raw = ctx.graph.export_edges(limit=EDGE_VIZ_LIMIT)
         edges = []
-        for row in (raw or []):
-            if not row.get("from_id") or not row.get("to_id"):
+        for item in (raw or []):
+            src = item.get("source_props") or {}
+            tgt = item.get("target_props") or {}
+            from_id, to_id = _viz_node_id(src), _viz_node_id(tgt)
+            if not from_id or not to_id:
                 continue
             edges.append({
-                "from_id": row["from_id"],
-                "to_id": row["to_id"],
-                "relation": row.get("relation", "relates_to"),
-                "from_space": row.get("from_space", "concept"),
-                "to_space": row.get("to_space", "concept"),
+                "from_id": from_id,
+                "to_id": to_id,
+                "relation": item.get("relation") or "relates_to",
+                "from_space": _viz_space(src),
+                "to_space": _viz_space(tgt),
             })
         return {"edges": edges, "total": len(edges)}
     except Exception as exc:
