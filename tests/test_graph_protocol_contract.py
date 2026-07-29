@@ -648,3 +648,67 @@ class TestSingleNodeReadsCarrySpace:
         store.upsert_node("TextUnit", "g-3", {"text": "b", "space": "claim"}, space_id="evidence")
 
         assert store.get_node("TextUnit", "g-3")["space"] == "claim"
+
+
+# ---------------------------------------------------------------------------
+# Exhaustive sweep: EVERY node-returning read must carry space
+#
+# Two rounds of this fix were scoped by reasoning about call funnels rather than
+# by enumerating the readers, and both times a sibling path survived: first the
+# single-node reads (after export_* was fixed), then Kuzu's find_by_relations /
+# find_path (the SQL backends route those through get_node, Kuzu issues its own
+# Cypher). This sweep is the enumeration -- every method that returns node
+# properties is exercised against the same fixture, so a newly added or
+# refactored reader that forgets the fold fails here instead of silently
+# degrading a consumer.
+# ---------------------------------------------------------------------------
+
+
+def _space_of(entry):
+    """Node props out of whichever shape a reader returns."""
+    if entry is None:
+        return None
+    props = entry.get("properties") or entry.get("props") or entry
+    return props.get("space")
+
+
+class TestEveryNodeReadCarriesSpace:
+    @pytest.fixture
+    def seeded(self, backend):
+        _name, store = backend
+        store.upsert_node("Document", "s-anchor", {"title": "Doc"}, space_id="resource")
+        store.upsert_node("TextUnit", "s-far", {"text": "body"}, space_id="evidence")
+        store.upsert_edge("Document", "s-anchor", "contains", "TextUnit", "s-far")
+        return store
+
+    def test_get_node(self, seeded):
+        assert _space_of(seeded.get_node("TextUnit", "s-far")) == "evidence"
+
+    def test_get_node_by_id(self, seeded):
+        assert _space_of(seeded.get_node_by_id("s-far")) == "evidence"
+
+    def test_find_neighbors(self, seeded):
+        hits = seeded.find_neighbors("s-anchor", direction="both", depth=1, limit=10)
+        far = next(h for h in hits if _space_of(h) is not None or True)
+        assert _space_of(far) == "evidence"
+
+    def test_find_by_relations(self, seeded):
+        hits = seeded.find_by_relations("s-anchor", ["contains"], "out")
+        assert hits, "edge should be reachable by relation"
+        assert _space_of(hits[0]) == "evidence"
+
+    def test_find_path(self, seeded):
+        path = seeded.find_path("s-anchor", "s-far", max_depth=3)
+        assert path, "path should exist"
+        assert _space_of(path[-1]["node"]) == "evidence"
+
+    def test_export_nodes(self, seeded):
+        rows = seeded.export_nodes()
+        row = next(r for r in rows if r["props"].get("id") == "s-far")
+        assert row["props"]["space"] == "evidence"
+
+    def test_export_edges(self, seeded):
+        rows = seeded.export_edges()
+        row = next(r for r in rows if r["target_props"].get("id") == "s-far")
+        assert row["source_props"]["space"] == "resource"
+        assert row["target_props"]["space"] == "evidence"

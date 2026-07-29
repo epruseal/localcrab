@@ -350,12 +350,15 @@ class KuzuGraphStore:
 
         results: list[dict[str, Any]] = []
 
+        # m.space_id is folded in (see _merge_space). The SQL backends get this
+        # for free because their find_by_relations/find_path go through
+        # get_node; Kuzu issues its own Cypher, so each query needs the column.
         def _fetch(q: str) -> None:
             r = self._conn.execute(q, {"id": node_id, "rels": relations})
             while r.has_next() and len(results) < limit:
                 row = r.get_next()
-                nid, ntype, props_raw, rel = row[0], row[1], row[2], row[3]
-                props = _parse(props_raw)
+                nid, ntype, props_raw, rel, m_space = row[0], row[1], row[2], row[3], row[4]
+                props = dict(_merge_space(_parse(props_raw), m_space))
                 props.setdefault("id", nid)
                 results.append({
                     "properties": props,
@@ -366,12 +369,15 @@ class KuzuGraphStore:
         if direction in ("out", "both"):
             _fetch(
                 "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
-                f"WHERE e.relation IN $rels RETURN m.node_id, m.node_type, m.props, e.relation LIMIT {limit}"
+                "WHERE e.relation IN $rels "
+                f"RETURN m.node_id, m.node_type, m.props, e.relation, m.space_id LIMIT {limit}"
             )
         if direction in ("in", "both") and len(results) < limit:
             _fetch(
                 "MATCH (n:OntologyNode {node_id: $id})<-[e:OntologyEdge]-(m:OntologyNode) "
-                f"WHERE e.relation IN $rels RETURN m.node_id, m.node_type, m.props, e.relation LIMIT {limit - len(results)}"
+                "WHERE e.relation IN $rels "
+                f"RETURN m.node_id, m.node_type, m.props, e.relation, m.space_id "
+                f"LIMIT {limit - len(results)}"
             )
         return results
 
@@ -387,15 +393,16 @@ class KuzuGraphStore:
             current_id, path = queue.popleft()
             if len(path) >= max_depth:
                 continue
+            # m.space_id folded in for the same reason as find_by_relations.
             r = self._conn.execute(
                 "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation",
+                "RETURN m.node_id, m.node_type, m.props, e.relation, m.space_id",
                 {"id": current_id},
             )
             while r.has_next():
                 row = r.get_next()
-                nid, ntype, props_raw, rel = row[0], row[1], row[2], row[3]
-                props = _parse(props_raw)
+                nid, ntype, props_raw, rel, m_space = row[0], row[1], row[2], row[3], row[4]
+                props = dict(_merge_space(_parse(props_raw), m_space))
                 props.setdefault("id", nid)
                 props.setdefault("node_type", ntype)
                 new_path = path + [{"node": props, "relation": rel}]
