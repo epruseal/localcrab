@@ -145,6 +145,14 @@ class TestToolDispatch:
                 "to_space": "resource", "to_id": "doc1",
             })
             assert result["relation"] == "owns"
+            builder.add_edge.assert_called_once_with(
+                from_space="subject",
+                from_id="u1",
+                relation="owns",
+                to_space="resource",
+                to_id="doc1",
+                properties={},
+            )
 
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool
