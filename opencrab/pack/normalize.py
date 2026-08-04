@@ -277,7 +277,15 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     # 이 함수가 중첩 "properties"만 읽어 그 필드들이 라이브에 하나도 실리지 않았다
     # (약 120개 팩, 실측 확인). 재빌드 없이 회수하려면 최상위도 흡수해야 한다.
     # 중첩 값이 우선한다 — 정본 위치가 중첩이기 때문이다.
-    _nested_only = dict(props)          # statement 폴백은 흡수 전 값으로만 판단한다(아래 사유)
+    # statement 폴백은 흡수 전 값으로만 판단한다(아래 사유). **사본**인 것이 중요하다.
+    #
+    # 지금 이 dict() 를 지우고 별칭으로 둬도 동작은 같다 — 적대 검증이 128팩 238,987 노드로
+    # 실측했다(characterization sha256 불변, 2026-08-04). 흡수가 props 를 in-place 로 바꾸지
+    # 않고 새 dict 로 **재바인딩**하고, 사본 시점과 아래 폴백 사이에 statement/text/description
+    # 을 쓰는 코드가 없기 때문이다. 즉 등가성은 코드 순서라는 깨지기 쉬운 전제에 얹혀 있다.
+    # 그 전제가 깨지는 순간 이미 적재된 Claim 2,039건(59팩)의 statement 가 조용히 바뀌므로
+    # 사본을 유지한다. 테스트로는 못 잡는 종류라 여기에 남긴다.
+    _nested_only = dict(props)
     _stray = {k: v for k, v in row.items() if k not in NODE_STRUCT_KEYS}
     if _stray:
         _merged = flatten_props(_stray)

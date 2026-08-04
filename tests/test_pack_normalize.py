@@ -139,6 +139,34 @@ def _node(**kw):
     return base
 
 
+def test_returns_space_type_id_props_in_that_order():
+    """반환 계약 전체를 한 번은 통째로 단언한다.
+
+    나머지 검사가 props 만 보고 node_id 를 `_i` 로 버리면, id 를 workspace_id 나
+    pack_name 으로 바꿔치기해도 전부 통과한다(2026-08-04 적대 검증이 실증).
+    node_id 는 id_map 의 키이자 모든 엣지 endpoint 해석의 기준이라 틀리면 팩 전체가 무너진다.
+    """
+    row = _node(id="node-1", workspace_id="workspace-1", space="resource",
+                node_type="Document", properties={"title": "제목"})
+    space, node_type, node_id, props = N.transform_node("pack-1", row)
+    assert (space, node_type, node_id) == ("resource", "Document", "node-1")
+    assert props["pack_id"] == "pack-1"
+
+
+@pytest.mark.parametrize("decoy_key,decoy", [
+    ("workspace_id", "workspace-1"), ("label", "라벨값"), ("source_type", "src"),
+])
+def test_node_id_is_never_taken_from_another_field(decoy_key, decoy):
+    _s, _t, node_id, _p = N.transform_node(
+        "pack-1", _node(id="node-1", **{decoy_key: decoy}))
+    assert node_id == "node-1"
+
+
+def test_node_id_is_not_the_pack_name():
+    _s, _t, node_id, _p = N.transform_node("pack-1", _node(id="node-1"))
+    assert node_id == "node-1"
+
+
 def test_nested_properties_beat_legacy_top_level():
     """정본 위치는 중첩이다. 반대로 되면 이미 적재된 값이 조용히 바뀐다."""
     _s, _t, _i, props = N.transform_node("p", _node(properties={"k": "중첩"}, k="최상위"))
