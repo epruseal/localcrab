@@ -137,6 +137,122 @@ KEEP: dict[tuple[str, str], str] = {("claim", "evidence"): "EVIDENCED_BY"}
 TRACE_SRC: frozenset[str] = frozenset({"claim", "lever", "outcome", "policy"})
 
 
+# ── node_type -> (space, node_type) 정규화 표 ───────────────────
+#
+# 팩은 도메인 어휘로 node_type 을 쓴다("LawArticle", "Quote", "DesignToken"). grammar 는
+# 9-space 별 정해진 타입만 안다. 적재기가 이 표로 번역한다.
+#
+# **이 표는 생산자에게도 계약이다.** 선언한 space 와 표가 지목하는 space 가 다르면
+# 적재 시 노드가 다른 space 로 재태깅되고, 그 노드에 붙은 엣지가 grammar 위반으로
+# 통째로 skip 된다(예: evidence 노드에 node_type="TextUnit" -> 적재기가 concept 으로
+# remap -> 연결 엣지 전량 유실). 그래서 빌더의 validate() 가 이 표를 보고 함정을 경고한다.
+# 이관 전에는 이 표가 적재기에만 있어 빌더가 역방향 import(try/except) 로 겨우 참조했다.
+NODE_TYPE_OVERRIDE: dict[str, tuple[str, str]] = {
+    # codex 구형 (evidence -> concept 수정)
+    "TextUnit":             ("concept",    "Topic"),
+    # graphrag/구형 Entity(필수 prop name·entity_type 미보유) -> Concept 통합
+    # (aprilia-mana-850 등 concept/Entity 노드 skip 방지; original_type 보존)
+    "Entity":               ("concept",    "Concept"),
+    # 9-space 구조: axis 노드 -> concept/Concept 통합 (구조적 메타 노드)
+    "OntologyAxis":         ("concept",    "Concept"),
+    # krds 커스텀 타입
+    "DesignSystem":         ("subject",    "Org"),
+    "ComponentCategory":    ("subject",    "Team"),
+    "Designer":             ("community",  "Community"),
+    "Developer":            ("community",  "Community"),
+    "GovernmentStaff":      ("community",  "Community"),
+    "Citizen":              ("community",  "Community"),
+    "ElderlyUser":          ("community",  "Community"),
+    "UserWithDisability":   ("community",  "Community"),
+    "LowVisionUser":        ("community",  "Community"),
+    "DesignOutcome":        ("outcome",    "Outcome"),
+    "DesignPolicy":         ("policy",     "Policy"),
+    "Component":            ("concept",    "Concept"),
+    "ComponentHTML":        ("resource",   "Document"),
+    "ComponentSCSS":        ("resource",   "Document"),
+    "IconSet":              ("resource",   "Document"),
+    "TokenFile":            ("resource",   "Document"),
+    "GuidelinePage":        ("resource",   "Document"),
+    "DesignToken":          ("concept",    "Concept"),
+    "ComponentVariant":     ("lever",      "Lever"),
+    "TokenMode":            ("lever",      "Lever"),
+    "GuidelineEvidence":    ("evidence",   "Evidence"),
+    "MarkupEvidence":       ("evidence",   "Evidence"),
+    "TokenEvidence":        ("evidence",   "Evidence"),
+    "DesignPrinciple":      ("policy",     "Policy"),
+    "UsageGuideline":       ("claim",      "Claim"),
+    "AccessibilityGuideline": ("claim",    "Claim"),
+    # 공공데이터품질관리 커스텀 타입 + 이미지 evidence
+    "TextEvidence":         ("evidence",   "Evidence"),
+    "VisualEvidence":       ("evidence",   "Evidence"),
+    "Guideline":            ("resource",   "Document"),  # 지침서=문서, policy->resource:classifies 경로 활용
+    "DiagnosisCriterion":   ("claim",      "Claim"),
+    "QualityIndicator":     ("concept",    "Concept"),
+    "Article":              ("resource",   "Document"),
+    "Principle":            ("policy",     "Policy"),
+    "Law":                  ("resource",   "Document"),
+    "QualityAttribute":     ("concept",    "Concept"),
+    "LawText":              ("resource",   "Document"),  # 법령 조문=출처문서, evidence 아님
+    "Domain":               ("concept",    "Concept"),
+    "StandardArtifact":     ("resource",   "Document"),
+    "Stakeholder":          ("community",  "Community"),
+    "Role":                 ("subject",    "Team"),
+    "ProvisionMode":        ("lever",      "Lever"),
+    "WebPage":              ("resource",   "Document"),
+    "Committee":            ("subject",    "Team"),
+    "Center":               ("subject",   "Org"),
+    "Agency":               ("subject",    "Org"),
+    "Governance":           ("policy",     "Policy"),
+    # 전자정부사업관리
+    "AdminRule":            ("resource",   "Document"),   # 행정규칙=공식문서, resource->resource:cites 경로 활용
+    "Program":              ("subject",    "Org"),
+    "RoleCategory":         ("subject",    "Team"),
+    "Authority":            ("subject",    "Org"),
+    "StandardDeliverable":  ("resource",   "Document"),
+    "Deliverable":          ("resource",   "Document"),
+    "DeliverableCatalog":   ("resource",   "Document"),
+    "LawArticle":           ("resource",   "Document"),
+    "Guide":                ("resource",   "Document"),
+    "Manual":               ("resource",   "Document"),
+    "Stage":                ("concept",    "Concept"),
+    "SecurityWeaknessCategory": ("concept", "Concept"),
+    "Lifecycle":            ("concept",    "Concept"),
+    "Sensitivity":          ("policy",     "Sensitivity"),   # grammar: policy/Sensitivity
+    "ApprovalRule":         ("policy",     "ApprovalRule"),  # grammar: policy/ApprovalRule
+    "Risk":                 ("outcome",    "Risk"),          # grammar: outcome/Risk
+    "CommunityReport":      ("community",  "CommunityReport"),  # grammar: community/CommunityReport
+    "KPI":                  ("outcome",    "KPI"),           # grammar: outcome/KPI
+    # 명문장1007
+    "Quote":                ("evidence",   "Evidence"),
+    "Work":                 ("resource",   "Document"),
+    "Author":               ("subject",    "Org"),      # 행위자: owns/has_category 엣지 필요
+    "Film":                 ("resource",   "Document"),
+    "Poem":                 ("resource",   "Document"),
+    "Play":                 ("resource",   "Document"),
+    "Scripture":            ("resource",   "Document"),
+    "Collection":           ("concept",    "Concept"),  # space=concept — related_to/part_of 엣지 경로
+    "Character":            ("subject",    "Org"),      # 행위자: has_category 엣지 필요
+    "Speech":               ("resource",   "Document"), # space=resource — contains/owns 엣지 경로
+    "Source":               ("subject",    "Org"),      # space=subject — has_category 엣지 경로
+    "AuthorIndex":          ("subject",    "Org"),
+    "Theme":                ("concept",    "Concept"),
+    "Genre":                ("concept",    "Concept"),
+}
+
+# node_type 이 NODE_TYPE_OVERRIDE 에도 없을 때 space 로 기본 타입 결정.
+SPACE_DEFAULT_TYPE: dict[str, tuple[str, str]] = {
+    "evidence":  ("evidence",  "Evidence"),
+    "resource":  ("resource",  "Document"),
+    "subject":   ("subject",   "Org"),
+    "concept":   ("concept",   "Concept"),
+    "lever":     ("lever",     "Lever"),
+    "outcome":   ("outcome",   "Outcome"),
+    "policy":    ("policy",    "Policy"),
+    "claim":     ("claim",     "Claim"),
+    "community": ("community", "Community"),
+}
+
+
 # ── 레거시 흡수 규칙 ────────────────────────────────────────────
 
 def absorb_legacy_top_level(row: dict[str, Any]) -> dict[str, Any]:
