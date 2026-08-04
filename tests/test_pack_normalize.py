@@ -69,6 +69,18 @@ def test_override_reverse_returns_swapped_spaces():
         "evidence", "supports", "claim", True)
 
 
+def test_every_override_value_is_a_truthy_pair():
+    """`if override:` 가 `is not None` 과 등가임을 보장하는 전제.
+
+    값이 falsy 해질 수 있으면 그 항목만 조용히 REL_MAP 경로로 새는데, 두 경로는
+    반전 규칙이 달라 방향이 뒤집힌다. 전제를 여기서 못박아 등가 변이를 없앤다.
+    """
+    for key, value in N.LABEL_SPACE_OVERRIDE.items():
+        assert value, f"{key} 의 값이 falsy 다"
+        relation, reverse = value
+        assert relation and isinstance(reverse, bool), f"{key} -> {value!r}"
+
+
 def test_override_without_reverse_keeps_direction():
     assert N.resolve_edge("SUPPORTS", "claim", "outcome") == (
         "claim", "supports", "outcome", False)
@@ -187,6 +199,14 @@ def test_label_is_generalized_to_name():
     assert props["name"] == "표시이름" and props["label"] == "표시이름"
 
 
+def test_label_generalization_does_not_overwrite_existing_values():
+    """맨 끝 일반화는 setdefault 다 — 대입으로 바꾸면 팩이 준 label·name 이 조용히 덮인다."""
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(label="행의 라벨",
+                   properties={"label": "원래 라벨", "name": "원래 이름"}))
+    assert props["label"] == "원래 라벨" and props["name"] == "원래 이름"
+
+
 def test_missing_label_does_not_invent_a_name():
     """UUID 오염 방지 — 실제 label 보유 행에만 주입한다."""
     _s, _t, _i, props = N.transform_node("p", _node(label=None))
@@ -258,11 +278,50 @@ def test_collection_completeness_gets_valid_status_and_score():
     assert props["status"] == "pass" and props["score"] == 1.0
 
 
-def test_collection_completeness_keeps_valid_status():
+@pytest.mark.parametrize("blank", ["", None])
+def test_document_title_is_filled_when_blank(blank):
+    """조건은 `not props.get("title")` 다 — 키 부재뿐 아니라 **빈 값**도 채운다.
+
+    빈 문자열은 required 를 만족한 것처럼 보이지만 스키마 검증을 통과해도 표시가 죽는다.
+    키 부재로만 검사하면 `not` 을 `is None` 으로 바꿔도 테스트가 통과한다.
+    """
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document", label="문서",
+                   properties={"title": blank}))
+    assert props["title"] == "문서"
+
+
+@pytest.mark.parametrize("space,node_type", [
+    ("subject", "Team"), ("subject", "Org"),
+    ("outcome", "Outcome"), ("lever", "Lever"), ("policy", "Policy"),
+])
+def test_name_is_filled_when_blank(space, node_type):
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space=space, node_type=node_type, label="이름",
+                   properties={"name": ""}))
+    assert props["name"] == "이름"
+
+
+def test_policy_rule_type_is_filled_when_blank():
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="policy", node_type="Policy", properties={"rule_type": ""}))
+    assert props["rule_type"] == "classification"
+
+
+def test_user_name_is_filled_without_a_label():
+    """User 는 name 자동채움 분기가 따로 있다 — label 이 없으면 여기가 유일 경로다."""
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space="subject", node_type="User", label=None))
+    assert t == "User" and props["name"] == "n1"
+
+
+@pytest.mark.parametrize("status", ["pass", "retry", "fail"])
+def test_collection_completeness_keeps_every_valid_status(status):
+    """유효 enum 3종을 전부 돈다 — 하나만 보면 그 값만 남기는 변이가 생존한다."""
     _s, _t, _i, props = N.transform_node(
         "p", _node(space="claim", node_type="CollectionCompleteness",
-                   properties={"status": "retry", "score": 0.5}))
-    assert props["status"] == "retry" and props["score"] == 0.5
+                   properties={"status": status, "score": 0.5}))
+    assert props["status"] == status and props["score"] == 0.5
 
 
 def test_policy_gets_name_and_rule_type():
@@ -308,6 +367,12 @@ def test_flatten_keeps_scalar_lists_but_chroma_serializes_them():
     assert N.chroma_safe_meta(d)["xs"] == "[1, 2, 3]"
 
 
+def test_nested_dict_is_stringified_by_flatten():
+    """스토어는 스칼라만 받는다 — dict 를 그대로 두면 적재가 죽는다."""
+    out = N.flatten_props({"d": {"a": 1}})["d"]
+    assert isinstance(out, str) and out == "{'a': 1}"
+
+
 def test_none_handling_differs_between_the_two():
     """flatten 은 빈 문자열, chroma 는 키 제거(Chroma 가 None 을 거부한다)."""
     assert N.flatten_props({"a": None})["a"] == ""
@@ -343,6 +408,13 @@ def test_original_source_moves_to_source_doc():
 def test_document_id_is_lifted_from_the_row():
     meta = N.transform_chunk_meta("p", {"metadata": {}, "document_id": "d1"})
     assert meta["document_id"] == "d1"
+
+
+@pytest.mark.parametrize("blank", ["", None])
+def test_blank_document_id_is_not_promoted(blank):
+    """조건은 truthiness 다 — 빈 값을 올리면 라이브에 빈 document_id 가 생긴다."""
+    assert "document_id" not in N.transform_chunk_meta(
+        "p", {"metadata": {}, "document_id": blank})
 
 
 def test_missing_metadata_is_tolerated():
