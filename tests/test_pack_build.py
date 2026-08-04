@@ -330,30 +330,81 @@ class TestTraceabilityRetarget:
         직결된다.
         """
         doc = pack.resource("d", "문서")
-        for i in "abc":
+        # **등록순과 사전순을 일부러 어긋나게** 둔다. `ev-a/b/c` 순으로 넣으면
+        # `sorted(self._ev_of[tgt])[0]` 같은 회귀가 같은 답을 내서 생존한다(적대 검증 실측).
+        for i in ("b", "a", "c"):
             pack.ev(f"ev-{i}", doc, f"근거{i}", f"본문{i}")
         c = pack.claim("c", "주장")
         pack.edge(c, doc, "supports")
         retargeted = [e for e in pack.edges if e["source_id"] == c]
-        assert [e["target_id"] for e in retargeted] == ["ev-a"]
+        assert [e["target_id"] for e in retargeted] == ["ev-b"]
 
-    def test_claim_to_resource_without_evidence_is_dropped(self, pack):
-        """리타겟할 evidence 가 없으면 반전하지 않고 드롭한다.
+    @pytest.mark.parametrize("space", ["claim", "lever", "outcome", "policy"])
+    def test_every_trace_src_space_is_retargeted(self, pack, space):
+        """리타겟은 `_TRACE_SRC` **네 공간 전부**에 걸린다.
 
-        reverse 가드를 빼면 `resource --states--> claim` 이 생기는데, 방향이 뒤집힌
-        채로 적재되어 traceability 가 거꾸로 기록된다.
+        기존 검사가 claim 하나뿐이라 lever/outcome/policy 를 `_TRACE_SRC` 에서 빼도
+        스위트가 통과했다(적대 검증 실측).
         """
         doc = pack.resource("d", "문서")
-        c = pack.claim("c", "주장")
-        pack.edge(c, doc, "supports")
-        assert [e for e in pack.edges if e["source_id"] in (c, doc)] == []
+        pack.ev("e1", doc, "근거", "본문")
+        src = getattr(pack, space)("s", "노드")
+        pack.edge(src, doc, "supports")
+        assert [(e["source_id"], e["target_id"]) for e in pack.edges
+                if e["source_id"] == src] == [(src, "e1")]
+
+    # reverse 가드가 **실효**인 공간쌍은 이 둘뿐이다. 정방향 grammar 가 없고 역방향은
+    # 있어서, 가드가 없으면 `resource --states--> claim` / `resource --has_mode--> lever`
+    # 로 뒤집혀 실린다. 나머지 둘은 다른 분기다(아래 두 테스트가 그 차이를 못박는다).
+    @pytest.mark.parametrize("space,label,reverse_rel", [
+        ("claim", "supports", "states"),
+        ("lever", "affects", "has_mode"),
+    ])
+    def test_trace_src_to_resource_without_evidence_is_dropped(
+            self, pack, space, label, reverse_rel):
+        """리타겟할 evidence 가 없으면 **반전하지 않고 드롭**한다.
+
+        **양끝을 다 본다.** 예전에는 claim 쪽만 `in (c, doc)` 로 보고 lever 쪽은
+        `== lv` 만 봐서, 가드를 `ss == 'claim'` 으로 좁히면 lever 가 target 으로 뒤집힌
+        형태를 놓쳤다. 두 검사가 비대칭인데 커밋 메시지는 대칭이라고 적었다(적대 검증 지적).
+        """
+        from opencrab.pack.schema import ALLOWED
+        assert ("resource", space) in ALLOWED and (space, "resource") not in ALLOWED, \
+            "가드가 실효인 전제(정방향 없음 + 역방향 있음)가 깨졌다"
+        doc = pack.resource("d", "문서")
+        src = getattr(pack, space)("s", "노드")
+        pack.edge(src, doc, label)
+        assert [e for e in pack.edges if src in (e["source_id"], e["target_id"])] == []
+        assert reverse_rel not in [e["label"] for e in pack.edges]
         assert sum(pack._eskip.values()) == 1
 
-    def test_lever_to_resource_without_evidence_is_dropped(self, pack):
+    def test_outcome_to_resource_drops_without_needing_the_guard(self, pack):
+        """outcome -> resource 는 양방향 모두 grammar 에 없어 가드와 무관하게 드롭된다.
+
+        위 테스트에 outcome 을 끼워 넣으면 "가드가 지킨다"는 거짓 인상을 준다.
+        분기가 다르다는 사실 자체를 못박는다.
+        """
+        from opencrab.pack.schema import ALLOWED
+        assert ("outcome", "resource") not in ALLOWED
+        assert ("resource", "outcome") not in ALLOWED
         doc = pack.resource("d", "문서")
-        lv = pack.lever("l", "레버")
-        pack.edge(lv, doc, "affects")
-        assert [e for e in pack.edges if e["source_id"] == lv] == []
+        oc = pack.outcome("o", "성과")
+        pack.edge(oc, doc, "supports")
+        assert [e for e in pack.edges if oc in (e["source_id"], e["target_id"])] == []
+
+    def test_policy_to_resource_is_a_valid_pair_and_is_not_dropped(self, pack):
+        """policy -> resource 는 정합 공간쌍이라 드롭이 아니라 FIX 된다.
+
+        `_TRACE_SRC` 네 공간을 뭉뚱그려 "전부 드롭"이라고 쓰면 이 케이스에서 거짓이 된다.
+        """
+        doc = pack.resource("d", "문서")
+        po = pack.policy("p", "정책")
+        pack.edge(po, doc, "supports")
+        edges = [e for e in pack.edges if e["source_id"] == po]
+        assert len(edges) == 1
+        assert edges[0]["target_id"] == doc
+        assert edges[0]["label"] == "classifies"        # FIX 대표값
+        assert edges[0]["properties"]["source_label"] == "supports"
 
     def test_non_traceability_space_still_reverses(self, pack):
         """가드는 traceability 에만 걸린다 — 일반 공간쌍은 그대로 반전한다."""
