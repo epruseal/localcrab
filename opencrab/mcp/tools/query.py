@@ -75,6 +75,11 @@ logger = logging.getLogger(__name__)
                     "description": "Embed selected_packs / pack_filter / metadata.pack_id in the response.",
                     "default": True,
                 },
+                "include_canonical_ids": {
+                    "type": "boolean",
+                    "description": "Resolve each result against the graph (exact lookup) and attach canonical pack_id/node_id/node_type/space/document_id, plus canonical source/relation/target for graph edges. Unresolvable ids are reported as unresolved, never substituted.",
+                    "default": True,
+                },
             },
             "required": ["question"],
         },
@@ -94,6 +99,7 @@ def ontology_query(
     auto_pack: bool = False,
     include_unpackaged: bool = False,
     include_pack_provenance: bool = True,
+    include_canonical_ids: bool = True,
 ) -> dict[str, Any]:
     """
     Run a hybrid vector + BM25 + graph query against the ontology.
@@ -127,9 +133,15 @@ def ontology_query(
     include_pack_provenance:
         Embed ``metadata.pack_id`` and ``selected_packs``/``pack_filter`` in
         the response (default True). Set to False for the bare legacy shape.
+    include_canonical_ids:
+        Resolve every result against the graph with an exact ``node_id``
+        lookup and attach a ``canonical`` block (plus ``graph_context.edge``
+        for graph hits). Costs at most one indexed single-row lookup per
+        distinct node id in the returned page; set False to skip it entirely.
     """
     from opencrab.config import get_settings
     from opencrab.mcp.tools import _get_context
+    from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
     ctx = _get_context()
@@ -160,6 +172,11 @@ def ontology_query(
             include_unpackaged=include_unpackaged,
         )
         ctx["billing"].on_query(tenant_id, subject_id, question)
+        result_dicts = [r.to_dict() for r in results]
+        if include_canonical_ids:
+            # .get: a context without a graph store (test doubles, degraded
+            # deployments) must not turn a good query into an error.
+            enrich_canonical(ctx.get("neo4j"), result_dicts)
         response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
@@ -167,7 +184,7 @@ def ontology_query(
             "tenant_id": tenant_id,
             "pipeline": {"bm25": use_bm25, "rerank": use_rerank, "fts": use_fts},
             "total": len(results),
-            "results": [r.to_dict() for r in results],
+            "results": result_dicts,
         }
         if include_pack_provenance:
             response["selected_packs"] = selected_packs

@@ -748,6 +748,22 @@ class HybridQuery:
                         rel_type = n.get("relation_type") or n.get("relationship_type") or ""
                         rel_key = str(rel_type).upper()
                         base_score = _EDGE_WEIGHTS.get(rel_key, _DEFAULT_EDGE_SCORE) * hop_decay
+                        context: dict[str, Any] = {
+                            "anchor_id": anchor_id,
+                            "labels": n.get("labels", []),
+                            "relation_type": rel_type,
+                            "relationship_types": n.get("relationship_types"),
+                            "depth": n.get("depth") or depth,
+                        }
+                        # anchor_id is the BFS root, NOT the traversed edge's
+                        # source (they differ at every depth > 1, and even at
+                        # depth 1 the direction is unknown for direction="both").
+                        # Carry the store's real endpoints when it reports them.
+                        if n.get("from_id") and n.get("to_id"):
+                            context["edge_endpoints"] = {
+                                "from_id": n["from_id"],
+                                "to_id": n["to_id"],
+                            }
                         expanded.append(
                             QueryResult(
                                 source="graph",
@@ -755,13 +771,7 @@ class HybridQuery:
                                 score=base_score,
                                 text=_property_text(props, rel_type),
                                 metadata=props,
-                                graph_context={
-                                    "anchor_id": anchor_id,
-                                    "labels": n.get("labels", []),
-                                    "relation_type": rel_type,
-                                    "relationship_types": n.get("relationship_types"),
-                                    "depth": n.get("depth") or depth,
-                                },
+                                graph_context=context,
                             )
                         )
             except Exception as exc:

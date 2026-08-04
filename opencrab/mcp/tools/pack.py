@@ -191,23 +191,65 @@ def _ingest_into_pack(
     }
 
 
+_QUERY_DEFAULT_LIMIT = 10
+
+
+def _manifest_extras() -> dict[str, tuple[list[str], list[str]]]:
+    """``{pack_id: (keywords, tags)}`` from the on-disk manifest registry.
+
+    Loaded ONCE per call (the registry scan walks every pack directory, so a
+    per-pack ``get_pack`` would re-read every manifest N times). Joined onto
+    the graph-derived candidates by exact pack_id, and the registry can never
+    *introduce* a pack: a manifest with no ingested nodes stays invisible.
+    ``category`` is folded into tags so the shared scorer needs no new field.
+    """
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import load_pack_registry
+
+    try:
+        registry = load_pack_registry(get_settings().local_data_dir)
+    except Exception as exc:  # noqa: BLE001 — registry is optional metadata
+        logger.debug("manifest registry load failed: %s", exc)
+        return {}
+
+    extras: dict[str, tuple[list[str], list[str]]] = {}
+    for info in registry:
+        tags = list(info.tags)
+        category = info.raw.get("category")
+        if isinstance(category, str) and category:
+            tags.append(category)
+        extras[info.pack_id] = (list(info.keywords), tags)
+    return extras
+
+
 @tool(
     "content_pack_list",
     {
-        "description": "List all content packs currently loaded in the localcrab ontology (Neo4j). Returns pack_id, node count, and display title for each pack.",
+        "description": (
+            "List content packs loaded in the localcrab ontology graph. Returns pack_id, node count, "
+            "and display title for each pack. Without `query` this is the full list; with `query` the "
+            "packs are filtered and ranked by deterministic keyword relevance (pack_id, title, "
+            "description, keywords/tags/category)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "min_nodes": {"type": "integer", "description": "Only return packs with at least this many nodes (default 1).", "default": 1},
+                "query": {"type": "string", "description": "Optional search text. When given, only packs scoring above zero are returned, ordered by relevance. Only packs actually loaded in the graph are candidates."},
+                "limit": {"type": "integer", "description": "Maximum packs to return. Defaults to 10 when `query` is given, unlimited otherwise."},
             },
             "required": [],
         },
     },
     order=9,
 )
-def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
+def content_pack_list(
+    min_nodes: int = 1,
+    query: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
     """
-    List all content packs loaded into the localcrab ontology stores.
+    List content packs loaded into the localcrab ontology stores.
 
     Returns each pack_id with node count and a representative title
     derived from node properties (source_package_title / title / name).
@@ -216,8 +258,22 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     ----------
     min_nodes:
         Only return packs with at least this many nodes (default 1).
+    query:
+        Optional relevance filter. Candidates are exactly the packs present in
+        the graph (a manifest with no ingested nodes is never surfaced); each
+        is scored with the same deterministic scorer auto_pack uses, and packs
+        scoring zero are dropped. Ordering is
+        ``(score desc, node_count desc, pack_id asc)`` — fully tie-broken, so
+        repeated calls return the identical order.
+    limit:
+        Cap on returned packs. Defaults to 10 when ``query`` is given.
+
+    NOTE: pack_create/pack_ingest call this with NO arguments on purpose —
+    their pack_id existence check is an exact membership test against the FULL
+    list. Passing a query there would shrink the candidate set and reject
+    packs that really exist.
     """
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _clean_str, _get_context
 
     ctx = _get_context()
     graph = ctx["neo4j"]
@@ -227,7 +283,8 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     # All four backends implement list_packs() natively (Local/PG: SQL GROUP
     # BY; Kuzu/Neo4j: Cypher aggregation) — see opencrab/stores/_graph_protocol.py.
     rows = graph.list_packs(min_nodes)
-    # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
+    # list_packs() 반환 형식:
+    # [{"pack_id": str, "node_count": int, "sample_title": str, "sample_description": str}]
     packs = []
     for r in rows:
         pid = r.get("pack_id") or ""
@@ -238,7 +295,66 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
             "node_count": r["node_count"],
             "title":      display or pid or "(no pack_id)",
         })
-    return {"total": len(packs), "packs": packs}
+
+    # Whitespace-only query == no query (an empty filter must not return an
+    # empty pack list). This is input normalisation, not term correction.
+    query = _clean_str(query).strip() if query else ""
+    if not query:
+        if limit is not None and limit >= 0 and len(packs) > limit:
+            return {"total": limit, "packs": packs[:limit], "truncated": True}
+        return {"total": len(packs), "packs": packs}
+
+    scanned = len(packs)
+    ranked = _rank_packs(query, rows, packs)
+    effective_limit = _QUERY_DEFAULT_LIMIT if limit is None else limit
+    truncated = effective_limit >= 0 and len(ranked) > effective_limit
+    if truncated:
+        ranked = ranked[:effective_limit]
+    response: dict[str, Any] = {
+        "total": len(ranked),
+        "query": query,
+        "scanned": scanned,
+        "packs": ranked,
+    }
+    if truncated:
+        response["truncated"] = True
+    return response
+
+
+def _rank_packs(
+    query: str,
+    rows: list[dict[str, Any]],
+    packs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Score graph-loaded packs against ``query``; deterministic ordering.
+
+    ``rows`` are the raw ``list_packs()`` rows (they carry the anchor
+    description that the display shape drops); ``packs`` is the parallel
+    display shape built above.
+    """
+    from opencrab.ontology.pack_registry import PackInfo, score_pack
+
+    extras = _manifest_extras()
+    scored: list[tuple[float, int, str, dict[str, Any]]] = []
+    for row, pack in zip(rows, packs, strict=True):
+        pack_id = pack["pack_id"]
+        keywords, tags = extras.get(pack_id, ([], []))
+        info = PackInfo(
+            pack_id=pack_id,
+            title=row.get("sample_title") or "",
+            description=row.get("sample_description") or "",
+            keywords=keywords,
+            tags=tags,
+        )
+        score, matched = score_pack(query, info)
+        if score <= 0.0:
+            continue
+        scored.append((score, pack["node_count"], pack_id, {**pack, "score": score, "matched": matched}))
+
+    # (score desc, node_count desc, pack_id asc) — the third key makes the
+    # order total, so the same input always yields the same output.
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in scored]
 
 
 @tool(
@@ -334,6 +450,8 @@ def pack_create(
     if not slug:
         return {"error": "Could not derive a valid pack_id from title."}
 
+    # NO arguments: the duplicate check is an exact membership test and must
+    # see the FULL pack list (see content_pack_list's docstring).
     existing = content_pack_list()
     existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
     if slug in existing_ids:
@@ -477,6 +595,9 @@ def pack_ingest(
 
     pack_id = _clean_str(pack_id)
 
+    # NO arguments: pack_id must match an existing pack EXACTLY. Passing a
+    # query/limit here would narrow the candidate set and reject packs that
+    # really exist — the contract is exact match, never fuzzy resolution.
     existing = content_pack_list()
     existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
     if pack_id not in existing_ids:
