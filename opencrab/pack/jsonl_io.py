@@ -21,9 +21,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator
 
 SHARD_LIMIT = int(os.environ.get("JSONL_SHARD_LIMIT", 40 * 1024 * 1024))
 _MAX_SHARDS = 100  # 2자리 zero-pad — 논리 파일당 최대 ~4GB(40MB×100)
@@ -39,7 +39,7 @@ def slug(value: str) -> str:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # ── shard 경로 계층 ──────────────────────────────────────────
