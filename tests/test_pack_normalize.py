@@ -49,6 +49,19 @@ def test_registered_type_invalid_for_space_falls_back_again():
     assert N.resolve_node_space_type("subject", "Document") == SPACE_DEFAULT_TYPE["subject"]
 
 
+def test_space_default_keys_are_all_real_spaces():
+    """2단계(grammar 미등록 -> space 기본형)가 3단계에 흡수되는 전제.
+
+    3단계는 `_allowed` 가 비어 있지 않을 때만 발동한다. SPACE_DEFAULT_TYPE 의 키가
+    전부 실재 space 라면 미등록 타입은 3단계에서도 똑같이 걸리므로 2단계 제거는
+    등가 변이다(적대 검증이 전 조합 differences 0 으로 실증). 이 전제가 깨지면
+    2단계가 유일 경로가 되므로 여기서 못박는다.
+    """
+    for space in SPACE_DEFAULT_TYPE:
+        allowed = N._GRAMMAR_SPACES.get(space, {}).get("node_types", ())
+        assert allowed, f"{space} 가 grammar 에 없다 — 2단계가 유일 경로가 된다"
+
+
 def test_valid_pair_is_left_alone():
     assert N.resolve_node_space_type("resource", "Document") == ("resource", "Document")
 
@@ -142,9 +155,21 @@ def test_legacy_top_level_custom_fields_are_absorbed():
     assert props["커스텀"] == "값"
 
 
-def test_struct_keys_are_not_absorbed():
+@pytest.mark.parametrize("key", sorted(NODE_STRUCT_KEYS - {"id", "properties", "degree", "label"}))
+def test_no_struct_key_leaks_into_props(key):
+    """구조 키는 흡수 대상이 아니다 — 전 항목을 돈다.
+
+    한두 개만 보면 집합에서 다른 하나를 빼도 통과한다. 실제로 그렇게 썼다가
+    `workspace_id` 제거 변이를 생존시켰다(실데이터 238,987건 전건 보유,
+    2026-08-04 적대 검증). degree/label 은 아래 별도 계약으로 props 에 들어가고,
+    id/properties 는 흡수 로직의 입력 자체라 이 목록에서 뺀다.
+    """
+    _s, _t, _i, props = N.transform_node("p", _node(**{key: "누출값"}))
+    assert key not in props, f"{key} 가 props 로 새어 들어갔다"
+
+
+def test_only_declared_struct_keys_reach_props():
     _s, _t, _i, props = N.transform_node("p", _node(degree=7, source_type="x"))
-    assert "source_type" not in props
     assert set(props) & NODE_STRUCT_KEYS <= {"degree", "label", "properties"}
 
 
@@ -344,6 +369,25 @@ def test_valid_document_format_is_untouched(fmt):
     _s, _t, _i, props = N.transform_node(
         "p", _node(space="resource", node_type="Document", properties={"format": fmt}))
     assert props["format"] == fmt and "format_original" not in props
+
+
+def test_transform_node_flattens_nested_properties():
+    """flatten_props 를 직접만 검사하면 transform_node 가 그것을 **부르는지**는 안 본다.
+
+    실제로 `flatten_props(...)` 를 `dict(...)` 로 바꾸는 변이가 생존했다
+    (2026-08-04 적대 검증). 스토어는 스칼라만 받으므로 미호출은 적재 실패다.
+    """
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(properties={"d": {"a": 1}, "n": None, "mixed": [1, {"x": 2}]}))
+    assert props["d"] == "{'a': 1}"
+    assert props["n"] == ""
+    assert isinstance(props["mixed"], str)
+
+
+def test_transform_node_flattens_absorbed_legacy_values_too():
+    """흡수 경로도 같은 flatten 을 거쳐야 한다 — 최상위에도 중첩 dict 가 올 수 있다."""
+    _s, _t, _i, props = N.transform_node("p", _node(레거시={"a": 1}, properties={}))
+    assert props["레거시"] == "{'a': 1}"
 
 
 def test_transform_node_is_deterministic():
