@@ -270,6 +270,82 @@ class TestValidateRemapHazard:
             pack.validate()
 
 
+class TestStrayTopLevelAlwaysBlocks:
+    """**91만 필드 사고의 재발 방지 불변식.** 적대 검증에서 이 축이 무보호였다.
+
+    `build.py` 의 stray 검사는 `errors.append(msg)` 를 **strict 와 무관하게** 한다.
+    그것을 `if strict:` 로 되돌려도 기존 테스트 96건이 전부 통과했다(변이 V7 생존).
+    커스텀 필드가 노드 최상위에 펼쳐지면 적재기가 통째로 못 읽어 조용히 사라진다 —
+    경고로 낮추는 순간 사고가 그대로 재발한다.
+    """
+
+    def test_stray_top_level_raises_even_without_strict(self, pack):
+        pack.node("n1", "L", "Concept", "concept")
+        pack.nodes[0]["brand"] = "Yamaha"          # 생산자를 우회해 직접 오염
+        with pytest.raises(ValueError, match="비구조 키"):
+            pack.validate(strict=False)
+
+    def test_stray_message_names_the_key_and_the_fix(self, pack):
+        pack.node("n1", "L", "Concept", "concept")
+        pack.nodes[0]["brand"] = "Yamaha"
+        with pytest.raises(ValueError) as ei:
+            pack.validate(strict=False)
+        assert "brand" in str(ei.value)
+        assert "properties" in str(ei.value)
+
+    def test_save_is_blocked_by_stray(self, pack):
+        """save() 가 validate() 를 먼저 부르므로 오염된 팩은 디스크에 안 남는다."""
+        pack.node("n1", "L", "Concept", "concept")
+        pack.nodes[0]["brand"] = "Yamaha"
+        with pytest.raises(ValueError, match="비구조 키"):
+            pack.save()
+        assert not (pack.out / "nodes.jsonl").exists()
+
+
+class TestTraceabilityRetarget:
+    """traceability(claim/lever/outcome/policy)의 방향·리타겟 규칙.
+
+    적대 검증에서 `_TRACE_SRC` 조건 반전(V4)과 reverse 가드 제거(V5)가 둘 다 생존했다.
+    이 규칙이 깨지면 채점기의 근거 연결 계산이 조용히 무너진다.
+    """
+
+    def test_claim_to_resource_is_retargeted_to_its_evidence(self, pack):
+        """claim -> resource 는 그 resource 의 evidence 로 옮겨 붙는다(정방향 유지)."""
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "근거", "본문")
+        c = pack.claim("c", "주장")
+        pack.edge(c, doc, "supports")
+        retargeted = [e for e in pack.edges if e["source_id"] == c]
+        assert len(retargeted) == 1
+        assert retargeted[0]["target_id"] == "e1"
+        assert retargeted[0]["label"] == "EVIDENCED_BY"
+
+    def test_claim_to_resource_without_evidence_is_dropped(self, pack):
+        """리타겟할 evidence 가 없으면 반전하지 않고 드롭한다.
+
+        reverse 가드를 빼면 `resource --states--> claim` 이 생기는데, 방향이 뒤집힌
+        채로 적재되어 traceability 가 거꾸로 기록된다.
+        """
+        doc = pack.resource("d", "문서")
+        c = pack.claim("c", "주장")
+        pack.edge(c, doc, "supports")
+        assert [e for e in pack.edges if e["source_id"] in (c, doc)] == []
+        assert sum(pack._eskip.values()) == 1
+
+    def test_lever_to_resource_without_evidence_is_dropped(self, pack):
+        doc = pack.resource("d", "문서")
+        lv = pack.lever("l", "레버")
+        pack.edge(lv, doc, "affects")
+        assert [e for e in pack.edges if e["source_id"] == lv] == []
+
+    def test_non_traceability_space_still_reverses(self, pack):
+        """가드는 traceability 에만 걸린다 — 일반 공간쌍은 그대로 반전한다."""
+        doc = pack.resource("d", "문서")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("e", doc, "contains")
+        assert (pack.edges[0]["source_id"], pack.edges[0]["target_id"]) == (doc, "e")
+
+
 class TestValidateOther:
     def test_dangling_edge_blocks_only_in_strict(self, pack):
         pack.edge("ghost-a", "ghost-b", "related_to")

@@ -300,9 +300,14 @@ class Pack:
         #     node_type='TextUnit' → 로더가 concept으로 remap → 엣지 grammar 위반 skip).
         #
         #     이관 전에는 이 표가 적재기에만 있어 `try: from scripts.ops.load_local_packs
-        #     import NODE_TYPE_OVERRIDE / except: _NTO = None` 으로 가져왔다. 즉 적재기를
-        #     import 할 수 없는 환경(=대부분의 빌드 환경)에서는 이 검사가 **통째로 조용히
-        #     꺼져** 있었다. 이제 표가 schema 에 있으므로 항상 돈다.
+        #     import NODE_TYPE_OVERRIDE / except: _NTO = None` 으로 가져왔다. 즉 import 가
+        #     실패하면 이 검사가 **통째로 조용히 꺼진다**.
+        #
+        #     실측 정정(2026-08-04 적대 검증): opencrab 이 설치된 인터프리터에서는 그 지연
+        #     import 가 성공해 검사가 켜져 있었다(Mac venv·rpi5 양쪽 확인). 꺼지는 조건은
+        #     "opencrab 미설치"뿐이다. 이전 주석이 "대부분의 빌드 환경에서 꺼져 있었다"고
+        #     쓴 것은 근거 없는 과장이었다. **이관의 실제 이득은 "꺼져 있던 걸 켰다"가
+        #     아니라 "import 실패로 꺼질 수 있는 경로를 없애고 역의존을 제거했다"다.**
         hazard = Counter()
         for n in self.nodes:
             nt = n.get('node_type')
