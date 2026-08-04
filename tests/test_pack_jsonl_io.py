@@ -14,8 +14,10 @@ import json
 import pytest
 
 from opencrab.pack.jsonl_io import (
+    _MAX_SHARDS,
     SHARD_LIMIT,
     ShardedAppender,
+    _shard_path,
     count_jsonl,
     iter_jsonl,
     iter_jsonl_lines,
@@ -222,13 +224,70 @@ class TestReadAndLoudFail:
 # 유틸
 # ---------------------------------------------------------------------------
 
+class TestShardBoundaries:
+    """경계 조건. 전부 2026-08-04 적대 검증에서 **생존한 돌연변이**를 닫는 검사다."""
+
+    def test_shard_index_limit_is_enforced_at_the_boundary(self, p):
+        """`assert idx < _MAX_SHARDS` 를 `<=` 로 바꿔도 아무 테스트가 안 죽었다.
+
+        idx=100 이면 `chunks.100.jsonl` 이 만들어지는데 `shard_paths` 의 glob 은
+        `[0-9][0-9]` 라 그 파일을 **못 본다**. 즉 데이터가 조용히 사라진다.
+        이 assert 가 유일한 방어선이므로 경계 양쪽을 못박는다.
+        """
+        assert _shard_path(p, _MAX_SHARDS - 1).name == "chunks.99.jsonl"
+        with pytest.raises(AssertionError):
+            _shard_path(p, _MAX_SHARDS)
+
+    def test_glob_cannot_see_three_digit_shards(self, p):
+        """위 assert 가 왜 유일한 방어선인지 — 규칙 자체를 고정한다."""
+        p.with_name("chunks.100.jsonl").write_text('{"id":0}\n', encoding="utf-8")
+        assert shard_paths(p) == []
+
+    def test_appender_shards_never_exceed_limit(self, tmp_path):
+        """`> self.limit` 를 `> self.limit + 1` 로 바꿔도 생존했다.
+
+        같은 변이를 write_jsonl_sharded 에 걸면 잡히는데 Appender 에서는 안 잡혔다 —
+        두 writer 의 경계 커버리지가 비대칭이었다.
+        """
+        q = tmp_path / "raw.jsonl"
+        limit = 300
+        with ShardedAppender(q, limit=limit) as w:
+            for i in range(40):
+                w.write(rec(i, pad=50))
+        shards = shard_paths(q)
+        assert len(shards) > 1
+        assert all(s.stat().st_size <= limit for s in shards), \
+            [s.stat().st_size for s in shards]
+
+    def test_appender_exact_fit_does_not_roll_over(self, tmp_path):
+        """롤오버 조건 `>` 를 `>=` 로 바꿔도 생존했다 — 경계 동작을 고정한다."""
+        q = tmp_path / "raw.jsonl"
+        line = json.dumps(rec(1))
+        n = len(line.encode("utf-8")) + 1
+        with ShardedAppender(q, limit=2 * n) as w:   # 정확히 두 줄이 들어간다
+            w.write(rec(1))
+            w.write(rec(1))
+        assert shard_paths(q) == [q], "정확히 맞는 두 번째 줄은 롤오버를 유발하면 안 된다"
+
+    def test_default_shard_limit_is_forty_megabytes(self):
+        """테스트가 늘 limit 을 주입해서 기본값 자체는 무검증이었다(변이 생존)."""
+        assert SHARD_LIMIT == 40 * 1024 * 1024
+
+
 class TestHelpers:
     def test_sha_is_sha256_utf8(self):
         assert sha("abc") == hashlib.sha256(b"abc").hexdigest()
 
-    def test_sha_handles_surrogates(self):
-        """surrogatepass 없이는 크롤링 원문에서 UnicodeEncodeError 가 난다."""
-        assert len(sha("\ud800")) == 64
+    def test_sha_of_lone_surrogate_is_pinned(self):
+        """`surrogatepass` 를 `replace` 로 바꿔도 길이 검사만으로는 안 잡혔다(변이 생존).
+
+        sha() 는 노드 ID 생성기다. 카톡·카페 덤프처럼 lone surrogate 가 섞인 원천에서
+        인코딩 정책이 바뀌면 **팩 전체의 id 가 조용히 갈린다**. 고정값으로 못박는다.
+        """
+        assert sha("\ud800") == hashlib.sha256(
+            "\ud800".encode("utf-8", "surrogatepass")).hexdigest()
+        assert sha("\ud800") != hashlib.sha256(
+            "\ud800".encode("utf-8", "replace")).hexdigest()
 
     def test_slug_lowercases_and_dashes(self):
         assert slug("Hello World!") == "hello-world"

@@ -20,6 +20,7 @@ from opencrab.pack.schema import (
     TRACE_SRC,
     PackSchemaError,
     absorb_legacy_top_level,
+    check_grammar_tables,
     stray_top_level_keys,
     validate_chunk,
     validate_edge,
@@ -96,6 +97,36 @@ class TestGrammarDerivation:
         assert used <= set(ALL_SPACES)
 
 
+class TestGrammarTableGuard:
+    """import 시점 자기정합성 가드. 무력화해도 아무 테스트가 안 죽었다(변이 생존).
+
+    위 TestGrammarDerivation 이 표 자체는 지키므로 불변식은 보호되지만, 가드가
+    사문이 되는 것은 별개 문제다 — 여기서 가드의 세 분기를 직접 건다.
+    """
+
+    def test_current_tables_pass(self):
+        check_grammar_tables(ALLOWED, FIX)
+
+    def test_fix_pair_absent_from_allowed_is_rejected(self):
+        fix = dict(FIX)
+        fix[("concept", "존재하지않는공간")] = "related_to"
+        with pytest.raises(RuntimeError, match="manifest 에 없는 공간쌍"):
+            check_grammar_tables(ALLOWED, fix)
+
+    def test_fix_value_outside_allowed_set_is_rejected(self):
+        fix = dict(FIX)
+        fix[("concept", "concept")] = "아무거나"
+        with pytest.raises(RuntimeError, match="허용 집합 밖"):
+            check_grammar_tables(ALLOWED, fix)
+
+    def test_allowed_pair_without_fix_default_is_rejected(self):
+        """manifest 에 공간쌍이 추가됐는데 FIX 를 안 고친 경우 — 실제로 잦은 함정."""
+        allowed = dict(ALLOWED)
+        allowed[("concept", "subject")] = frozenset({"related_to"})
+        with pytest.raises(RuntimeError, match="FIX 대표값이 없다"):
+            check_grammar_tables(allowed, FIX)
+
+
 # ---------------------------------------------------------------------------
 # 노드 props 규약 — 91만 필드 사고의 회귀 검사
 # ---------------------------------------------------------------------------
@@ -139,6 +170,16 @@ class TestValidateNode:
         del row[key]
         with pytest.raises(PackSchemaError, match="필수 필드"):
             validate_node(row)
+
+    @pytest.mark.parametrize("key", ["id", "label", "node_type", "space"])
+    def test_empty_string_required_field_rejected(self, key):
+        """`if not row.get(key)` 를 `if key not in row` 로 바꿔도 생존했다(변이).
+
+        빈 문자열 id 는 dangling 검사를 통과하면서 라이브에 유령 노드를 만든다 —
+        "키가 있다"가 아니라 "값이 있다"가 계약이다.
+        """
+        with pytest.raises(PackSchemaError, match="필수 필드"):
+            validate_node(_node(**{key: ""}))
 
     def test_space_outside_nine_space_rejected(self):
         with pytest.raises(PackSchemaError, match="9-space"):
@@ -238,6 +279,20 @@ class TestAbsorbLegacyTopLevel:
         before = {k: (dict(v) if isinstance(v, dict) else v) for k, v in row.items()}
         absorb_legacy_top_level(row)
         assert row == before
+
+    @pytest.mark.parametrize("stray", [{}, {"brand": "Yamaha"}])
+    def test_result_is_independent_of_input(self, stray):
+        """방어 복사를 제거해도 생존했다(변이) — 반환값이 row 를 별칭하는 경로가 있었다.
+
+        stray 가 없으면 예전 구현은 `row["properties"]` 를 그대로 돌려줄 수 있었고,
+        호출자가 그 dict 에 pack_id 를 넣는 순간 원본 행이 오염된다. 적재기가 정확히
+        그렇게 쓴다(`props["pack_id"] = pack_name`).
+        """
+        row = _node(properties={"year": 2019}, **stray)
+        got = absorb_legacy_top_level(row)
+        got["pack_id"] = "오염"
+        assert "pack_id" not in row["properties"]
+        assert "pack_id" not in row
 
     def test_missing_properties_key(self):
         row = _node()

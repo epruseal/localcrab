@@ -45,23 +45,32 @@ _NS = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 # ALL_SPACES 2곳, _NODE_STRUCT_KEYS 1곳). __all__ 에 올려 린터가 미사용으로
 # 지우지 못하게 하고, 지우면 무엇이 깨지는지 여기 남긴다.
 __all__ = [
-    'Pack', 'ALL_SPACES',
+    'Pack', 'ALL_SPACES', 'DEFAULT_OUT_ROOT',
     'json', '_NODE_STRUCT_KEYS', '_RESERVED_NODE_KEYS',
 ]
+
+# 호스트 리포가 주입하는 출력 루트 기본값. opencrab-dump 의 shim 이 자기 __file__
+# 기준으로 이 값을 세팅한다.
+#
+# **환경변수를 쓰지 않는 이유가 중요하다.** 한때 shim 이
+# `os.environ.setdefault('PACK_OUT_ROOT', ...)` 로 기본값을 넣었는데, 그러면
+# `os.environ.get('PACK_OUT_ROOT')` 로 "호출자가 드라이런을 지정했는가"를 판정하던
+# 코드가 **항상 참**이 된다. 실제로 그 때문에 운영 빌드가 git 추적 산출물
+# (chatgpt/canonical/, *-prep/) 대신 스크래치 경로로 조용히 새 나갔다
+# (2026-08-04 검증에서 발각). 프로세스 전역 상태를 건드리지 않고 모듈 변수로 받는다.
+DEFAULT_OUT_ROOT: str | None = None
 
 
 class Pack:
     def __init__(self, slug, title, source_type='reference-public', out_root=None):
-        # 출력 루트는 반드시 명시(인자 또는 PACK_OUT_ROOT env)한다.
+        # 출력 루트 결정 순서: 인자 > PACK_OUT_ROOT env > 호스트 주입 기본값.
         #
         # 이전에는 `Path(__file__).parents[2] / 'by-pack'` 으로 자동 유도했다. 그 코드가
         # opencrab-dump 안에 있는 동안에는 맞았지만, 이 모듈이 localcrab 으로 옮겨온
         # 지금은 localcrab 리포 안에 by-pack 을 만들고 mkdir(exist_ok=True) 라 **예외
         # 없이 조용히 성공**한다. 팩이 엉뚱한 곳에 쌓이는데 아무도 모른다.
-        # opencrab-dump 의 shim 이 자기 __file__ 기준으로 PACK_OUT_ROOT 기본값을 넣어주므로
-        # 기존 빌더 호출부는 그대로 돈다.
         if out_root is None:
-            out_root = os.environ.get('PACK_OUT_ROOT')
+            out_root = os.environ.get('PACK_OUT_ROOT') or DEFAULT_OUT_ROOT
         if not out_root:
             raise ValueError(
                 'Pack(out_root=...) 또는 PACK_OUT_ROOT env 로 출력 루트를 지정하라. '

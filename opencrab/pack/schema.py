@@ -364,19 +364,33 @@ def validate_chunk(row: dict[str, Any]) -> None:
             "청크에는 레거시 흡수 경로가 없다 — metadata 에 넣어라.")
 
 
-# ── import 시점 자기정합성 ──────────────────────────────────────
-# FIX 가 ALLOWED 와 어긋나면 생산자가 grammar 위반 엣지를 만들어낸다. 그 상태로
-# 팩을 빌드하면 적재기가 조용히 엣지를 버리므로, 표가 어긋나는 즉시 import 를
-# 실패시킨다. manifest 가 바뀌었는데 FIX 를 안 고친 경우가 정확히 이 함정이다.
-_fix_orphans = sorted(set(FIX) - set(ALLOWED))
-if _fix_orphans:  # pragma: no cover - 표가 정합한 동안 도달 불가
-    raise RuntimeError(
-        f"FIX 에 grammar manifest 에 없는 공간쌍이 있다: {_fix_orphans}")
-_fix_bad = sorted(k for k, v in FIX.items() if v not in ALLOWED[k])
-if _fix_bad:  # pragma: no cover - 표가 정합한 동안 도달 불가
-    raise RuntimeError(
-        f"FIX 의 대표 relation 이 해당 공간쌍의 허용 집합 밖이다: {_fix_bad}")
-_allowed_orphans = sorted(set(ALLOWED) - set(FIX))
-if _allowed_orphans:  # pragma: no cover - 표가 정합한 동안 도달 불가
-    raise RuntimeError(
-        f"grammar manifest 공간쌍에 FIX 대표값이 없다: {_allowed_orphans}")
+# ── 표 자기정합성 ───────────────────────────────────────────────
+
+def check_grammar_tables(
+    allowed: dict[tuple[str, str], frozenset[str]],
+    fix: dict[tuple[str, str], str],
+) -> None:
+    """FIX 가 ALLOWED 와 정합한지 검사한다. 어긋나면 ``RuntimeError``.
+
+    어긋난 채로 두면 생산자가 grammar 위반 엣지를 만들고 적재기가 그것을 조용히
+    버린다. manifest 가 바뀌었는데 FIX 를 안 고친 경우가 정확히 이 함정이다.
+
+    모듈 import 시점에 호출한다. 함수로 분리한 이유는 **가드 자체가 사문이 돼도
+    아무도 모르는 것**을 막기 위해서다 — inline 이면 무력화해도 테스트가 통과했다
+    (2026-08-04 검증에서 실측).
+    """
+    fix_orphans = sorted(set(fix) - set(allowed))
+    if fix_orphans:
+        raise RuntimeError(
+            f"FIX 에 grammar manifest 에 없는 공간쌍이 있다: {fix_orphans}")
+    fix_bad = sorted(k for k, v in fix.items() if v not in allowed[k])
+    if fix_bad:
+        raise RuntimeError(
+            f"FIX 의 대표 relation 이 해당 공간쌍의 허용 집합 밖이다: {fix_bad}")
+    allowed_orphans = sorted(set(allowed) - set(fix))
+    if allowed_orphans:
+        raise RuntimeError(
+            f"grammar manifest 공간쌍에 FIX 대표값이 없다: {allowed_orphans}")
+
+
+check_grammar_tables(ALLOWED, FIX)
