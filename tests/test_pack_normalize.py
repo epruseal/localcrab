@@ -193,6 +193,100 @@ def test_missing_label_does_not_invent_a_name():
     assert "name" not in props
 
 
+def test_degree_defaults_from_top_level_then_zero():
+    """degree 는 구조 키라 흡수 대상이 아니다 — setdefault 가 유일한 유입 경로다.
+
+    실측(2026-08-04, 128팩 238,987노드): 중첩 보유 35,250 · 최상위만 60,097 ·
+    둘 다 없음 143,640. 즉 20만 노드가 이 한 줄에 의존한다.
+    """
+    _s, _t, _i, props = N.transform_node("p", _node(degree=7))
+    assert props["degree"] == 7
+    _s, _t, _i, props = N.transform_node("p", _node())
+    assert props["degree"] == 0
+
+
+def test_nested_degree_beats_top_level():
+    _s, _t, _i, props = N.transform_node("p", _node(degree=7, properties={"degree": 3}))
+    assert props["degree"] == 3
+
+
+def test_document_title_is_filled_from_label():
+    """Document 스키마의 required 필드 — 비면 add_node 가 ValueError 로 죽는다."""
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document", label="문서 제목"))
+    assert t == "Document" and props["title"] == "문서 제목"
+
+
+def test_existing_title_is_not_overwritten():
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document", label="라벨",
+                   properties={"title": "원래 제목"}))
+    assert props["title"] == "원래 제목"
+
+
+@pytest.mark.parametrize("space,node_type", [
+    ("subject", "Team"), ("subject", "Org"),
+    ("outcome", "Outcome"), ("lever", "Lever"), ("policy", "Policy"),
+])
+def test_name_is_filled_even_without_a_label(space, node_type):
+    """label 이 없으면 타입별 자동채움이 name 의 **유일한** 유입 경로다.
+
+    label 이 있으면 맨 끝의 label->name 일반화가 어차피 채우므로, 그 경우로만 검사하면
+    자동채움을 통째로 지워도 테스트가 통과한다(실제로 그렇게 만들었다가 변이 2종을
+    생존시켰다). name 은 required 라 비면 add_node 가 ValueError 로 죽는다.
+    """
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space=space, node_type=node_type, label=None))
+    assert t == node_type and props["name"] == "n1"
+
+
+@pytest.mark.parametrize("space,node_type", [
+    ("subject", "Team"), ("outcome", "Outcome"), ("lever", "Lever"),
+])
+def test_name_follows_label_when_present(space, node_type):
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space=space, node_type=node_type, label="이름"))
+    assert props["name"] == "이름"
+
+
+def test_collection_completeness_gets_valid_status_and_score():
+    """status 는 enum(pass/retry/fail) — 위반값이 들어가면 add_node 가 skip 된다."""
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space="claim", node_type="CollectionCompleteness",
+                   properties={"status": "이상한값"}))
+    assert t == "CollectionCompleteness"
+    assert props["status"] == "pass" and props["score"] == 1.0
+
+
+def test_collection_completeness_keeps_valid_status():
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="claim", node_type="CollectionCompleteness",
+                   properties={"status": "retry", "score": 0.5}))
+    assert props["status"] == "retry" and props["score"] == 0.5
+
+
+def test_policy_gets_name_and_rule_type():
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space="policy", node_type="Policy", label="정책명"))
+    assert t == "Policy"
+    assert props["name"] == "정책명" and props["rule_type"] == "classification"
+
+
+def test_document_format_enum_violation_is_corrected():
+    """실측 19건(n2sf 15 · krmf 3 · aiready 1, 예 'pdf(pdftotext)')."""
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document",
+                   properties={"format": "pdf(pdftotext)"}))
+    assert props["format"] == "plain" and props["format_original"] == "pdf(pdftotext)"
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "pdf", "html", "plain"])
+def test_valid_document_format_is_untouched(fmt):
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document", properties={"format": fmt}))
+    assert props["format"] == fmt and "format_original" not in props
+
+
 def test_transform_node_is_deterministic():
     """증분 대조가 이 결정성에 의존한다 — 시각·난수 삽입 금지."""
     row = _node(properties={"a": 1})
@@ -218,6 +312,13 @@ def test_none_handling_differs_between_the_two():
     """flatten 은 빈 문자열, chroma 는 키 제거(Chroma 가 None 을 거부한다)."""
     assert N.flatten_props({"a": None})["a"] == ""
     assert "a" not in N.chroma_safe_meta({"a": None})
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_bool_survives_both_as_bool(value):
+    """bool 은 스칼라다 — 문자열화하면 Chroma 필터 `where={"k": True}` 가 안 맞는다."""
+    assert N.flatten_props({"k": value})["k"] is value
+    assert N.chroma_safe_meta({"k": value})["k"] is value
 
 
 def test_mixed_lists_are_stringified_by_both():
