@@ -320,6 +320,23 @@ class TestTraceabilityRetarget:
         assert retargeted[0]["target_id"] == "e1"
         assert retargeted[0]["label"] == "EVIDENCED_BY"
 
+    def test_retarget_picks_the_first_evidence_of_the_document(self, pack):
+        """evidence 가 여러 건이면 **첫 번째**(문서 대표)로 간다.
+
+        적대 검증에서 `self._ev_of[tgt][0]` 을 `[-1]` 로 바꿔도 116건이 전부 통과했다.
+        위 테스트가 evidence 1건짜리라 첫/끝을 구분하지 못했기 때문이다. 실팩에서
+        resource 하나에 evidence 가 여러 건 달리는 것은 정상이고(egov-audit 최대 43,
+        n2sf 최대 52, msk-imaging 최대 26), "리타겟된 근거가 어느 것인가"는 팩 의미에
+        직결된다.
+        """
+        doc = pack.resource("d", "문서")
+        for i in "abc":
+            pack.ev(f"ev-{i}", doc, f"근거{i}", f"본문{i}")
+        c = pack.claim("c", "주장")
+        pack.edge(c, doc, "supports")
+        retargeted = [e for e in pack.edges if e["source_id"] == c]
+        assert [e["target_id"] for e in retargeted] == ["ev-a"]
+
     def test_claim_to_resource_without_evidence_is_dropped(self, pack):
         """리타겟할 evidence 가 없으면 반전하지 않고 드롭한다.
 
