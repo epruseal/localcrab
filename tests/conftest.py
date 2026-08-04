@@ -7,6 +7,21 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# 테스트는 호스트의 운영 env 파일을 읽지 않는다.
+#
+# Settings 는 표준 위치(~/.openclaw/localcrab-kure.env)를 자동으로 읽는다
+# (config._default_env_files, 2026-08-04). 운영 배선이 실행 경로마다 갈리던
+# 결함을 닫기 위한 것인데, 그대로 두면 이 머신에서만 "기본값" 테스트가 깨진다
+# — 실제로 OPENAI_API_BASE(단일 base 기대)와 VECTOR_BACKEND(pg 모드 기대)가
+# 운영값에 덮여 3건이 실패했다. 호스트마다 결과가 달라지는 테스트는 게이트로서
+# 쓸모가 없으므로 세션 전체를 격리한다.
+#
+# fixture 가 아니라 모듈 최상단인 이유: get_settings() 는 lru_cache 이고 일부
+# 모듈은 임포트 시점에 Settings 를 만든다. fixture 로는 늦는다.
+# setdefault 이므로 호출자가 LOCALCRAB_ENV_FILE 을 명시하면 그대로 존중된다
+# (표준 env 로딩 자체를 검증하는 테스트가 이 경로로 실제 파일을 지정한다).
+os.environ.setdefault("LOCALCRAB_ENV_FILE", os.devnull)
+
 import pytest
 
 

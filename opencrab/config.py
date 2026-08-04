@@ -6,12 +6,47 @@ All values can be overridden via environment variables or a .env file.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 운영 환경파일의 표준 위치. systemd 유닛의 EnvironmentFile 과 같은 파일을 가리킨다.
+# LOCALCRAB_ENV_FILE 로 덮어쓸 수 있어 다른 호스트/테스트에 이식 가능하다.
+DEFAULT_ENV_FILE = "~/.openclaw/localcrab-kure.env"
+
+
+def _default_env_files() -> tuple[str, ...]:
+    """Settings 가 읽을 env 파일 목록. 뒤에 오는 파일이 앞을 덮는다.
+
+    변경 이유(2026-08-04): OPENAI_API_BASE 가 systemd 유닛의 EnvironmentFile 에만
+    배선돼 있어, 서비스를 거치지 않는 실행 경로에서는 코드 기본값
+    "http://localhost:1234/v1" 이 그대로 쓰였다. ssh 로 적재 CLI 를 직접 돌린
+    실측에서 원격 GPU 두 대(도달 가능)를 못 보고 로컬 GGUF(CPU) 폴백으로
+    1,218건을 43분간 임베딩했다. 경고 로그 154줄 외에 눈에 띄는 신호가 없었다.
+
+    같은 클래스가 두 번째다. 2026-07-07 에는 반대 방향으로 터졌다 — 서비스가
+    repo .env 를 읽지 않아(WorkingDirectory=~) LOCAL_DATA_DIR 을 env 파일 쪽에
+    고정해야 했다. 실행 경로마다 설정 소스가 갈리는 구조가 원인이므로, 경로별
+    배선을 하나 더 늘리는 대신(.zshrc 는 비대화형 ssh 에서 로드조차 안 된다)
+    Settings 가 표준 위치를 직접 읽게 한다. 이제 systemd·CLI·cron·테스트가
+    같은 파일을 본다.
+
+    우선순위: 실제 환경변수 > CWD .env > 표준 위치.
+    실제 환경변수가 env_file 보다 우선하는 것은 pydantic-settings 규칙이므로,
+    EnvironmentFile 로 값을 주입하는 기존 서비스의 동작은 바뀌지 않는다.
+    파일이 없으면 pydantic-settings 가 조용히 건너뛴다.
+
+    lru_cache 를 걸지 않는다. get_settings() 가 이미 캐시하고, 테스트가
+    HOME/LOCALCRAB_ENV_FILE 을 monkeypatch 한 뒤 Settings() 를 새로 만드는
+    경로를 막지 않기 위해서다(_default_local_data_dir 과 같은 이유).
+    """
+    override = os.environ.get("LOCALCRAB_ENV_FILE")
+    base = override if override else DEFAULT_ENV_FILE
+    return (str(Path(base).expanduser()), ".env")
 
 
 def _default_local_data_dir() -> str:
@@ -32,6 +67,16 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    def __init__(self, **kwargs):
+        """env_file 기본값을 인스턴스화 시점에 계산한다.
+
+        model_config 에 직접 넣으면 클래스 정의(=모듈 임포트) 시점에 Path.home()
+        이 고정돼, HOME 이나 LOCALCRAB_ENV_FILE 을 monkeypatch 하는 테스트가
+        무력해진다. 호출자가 _env_file 을 명시하면 그것을 그대로 존중한다.
+        """
+        kwargs.setdefault("_env_file", _default_env_files())
+        super().__init__(**kwargs)
 
     # ------------------------------------------------------------------
     # Storage mode:

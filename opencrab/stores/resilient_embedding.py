@@ -102,6 +102,12 @@ class ResilientEmbeddingFunction:
         # primary 별 독립 unhealthy TTL. 인덱스로 추적(동일 EF 인스턴스
         # 중복 등록 엣지케이스에도 안전).
         self._unhealthy_until: list[float] = [0.0] * len(self._primaries)
+        # 폴백 사용 횟수. 폴백은 설계상 정상 동작이지만 CPU 라 10배 이상 느리다.
+        # 2026-08-04 적재에서 primary 가 통째로 오배선돼 전량이 이 경로로 갔는데,
+        # WARNING 154줄 외에 집계가 없어 43분이 지나서야 발견됐다. 호출부가
+        # 종료 요약에 쓸 수 있도록 카운터를 노출한다.
+        self._fallback_calls = 0
+        self._primary_calls = 0
 
     # ------------------------------------------------------------------
     # ChromaDB EmbeddingFunction 프로토콜
@@ -116,7 +122,9 @@ class ResilientEmbeddingFunction:
             if not self._is_healthy(i):
                 continue
             try:
-                return ef(input)
+                out = ef(input)
+                self._primary_calls += 1
+                return out
             except Exception as exc:
                 logger.warning(
                     "임베딩 primary 실패 (%s): %s → 다음 엔드포인트 시도",
@@ -126,8 +134,19 @@ class ResilientEmbeddingFunction:
                 self._mark_unhealthy(i)
 
         # 모든 primary 가 unhealthy 이거나 실패 → fallback 경로
+        self._fallback_calls += 1
         logger.info("임베딩 폴백: 로컬 GGUF (모든 primary 장애 또는 unhealthy)")
         return self._fallback(input)
+
+    @property
+    def fallback_calls(self) -> int:
+        """폴백(로컬 GGUF, CPU)으로 처리한 배치 수."""
+        return self._fallback_calls
+
+    @property
+    def primary_calls(self) -> int:
+        """primary(원격 GPU)로 처리한 배치 수."""
+        return self._primary_calls
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         """healthy 한 primary 를 순서대로 시도 → 전부 실패/unhealthy 시 fallback.

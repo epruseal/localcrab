@@ -183,6 +183,44 @@ def test_all_primaries_unhealthy_skips_to_fallback_without_calling() -> None:
     assert len(fallback.calls) == 2
 
 
+def test_fallback_calls_counted() -> None:
+    """폴백 사용을 집계한다.
+
+    2026-08-04 적재에서 primary 가 통째로 오배선돼 1,218건 전량이 CPU 폴백으로
+    갔는데, 신호가 WARNING 로그뿐이라 43분이 지나서야 발견됐다. 호출부가 종료
+    요약에 "몇 배치가 폴백이었나"를 찍을 수 있어야 한다.
+    """
+    p1 = _MockEF("p1", fail=True)
+    fallback = _MockFallback()
+    ef = ResilientEmbeddingFunction(primary=[p1], fallback=fallback)
+
+    assert ef.fallback_calls == 0
+    assert ef.primary_calls == 0
+
+    ef(["a"])
+    assert ef.fallback_calls == 1
+    assert ef.primary_calls == 0
+
+    ef(["b"])          # TTL 안이라 primary 를 건너뛰고 바로 폴백
+    assert ef.fallback_calls == 2
+    assert ef.primary_calls == 0
+
+
+def test_primary_calls_counted_and_no_fallback_on_success() -> None:
+    """정상 경로에서는 폴백 카운터가 0이어야 한다 — 카운터가 늘 켜져 있으면
+    경보로서 의미가 없다."""
+    p1 = _MockEF("p1")
+    fallback = _MockFallback()
+    ef = ResilientEmbeddingFunction(primary=[p1], fallback=fallback)
+
+    ef(["a"])
+    ef(["b"])
+
+    assert ef.primary_calls == 2
+    assert ef.fallback_calls == 0
+    assert len(fallback.calls) == 0
+
+
 def test_name_returns_first_primary_name() -> None:
     p1 = _MockEF("p1")
     p2 = _MockEF("p2")
