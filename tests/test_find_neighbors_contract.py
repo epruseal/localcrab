@@ -180,10 +180,16 @@ class TestFindNeighborsNormal:
             "relation_type",
             "relationship_types",
             "depth",
+            # Canonical endpoints of the traversed edge — the only place the
+            # edge's direction survives (direction="both" and depth > 1 both
+            # make the caller's anchor an unreliable stand-in for the source).
+            "from_id",
+            "to_id",
         }
         assert row["labels"] == ["Chain"]
         assert row["relation_type"] == "next"
         assert row["relationship_types"] == ["next"]
+        assert (row["from_id"], row["to_id"]) == ("n0", "n1")
 
 
 # ---------------------------------------------------------------------------

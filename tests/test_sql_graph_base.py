@@ -211,10 +211,27 @@ def test_list_packs_pack_id_is_always_str():
 
 def test_list_packs_sample_title_from_dataset_anchor():
     store = _store()
-    store.upsert_node("Dataset", "dataset:packA", {"pack_id": "packA", "title": "My Pack"})
+    store.upsert_node(
+        "Dataset",
+        "dataset:packA",
+        {"pack_id": "packA", "title": "My Pack", "description": "About pack A"},
+    )
     store.upsert_node("Item", "i1", {"pack_id": "packA"})
     packs = store.list_packs()
-    assert packs[0] == {"pack_id": "packA", "node_count": 2, "sample_title": "My Pack"}
+    assert packs[0] == {
+        "pack_id": "packA",
+        "node_count": 2,
+        "sample_title": "My Pack",
+        # description은 anchor에만 있고 노드 단위 폴백이 없다.
+        "sample_description": "About pack A",
+    }
+
+
+def test_list_packs_sample_description_empty_without_anchor():
+    store = _store()
+    store.upsert_node("Item", "i1", {"pack_id": "packB", "description": "노드 설명"})
+    packs = store.list_packs()
+    assert packs[0]["sample_description"] == ""
 
 
 def test_list_packs_min_nodes_filter():

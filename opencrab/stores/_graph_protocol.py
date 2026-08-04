@@ -213,7 +213,14 @@ class GraphStore(Protocol):
 
         Returns a list of dicts, each shaped:
             {"properties": dict, "labels": [str], "relation_type": str,
-             "relationship_types": [str], "depth": int}
+             "relationship_types": [str], "depth": int,
+             "from_id": str, "to_id": str}
+        ``from_id``/``to_id`` are the canonical endpoints of the edge that
+        reached this neighbour, in true edge direction (so with
+        ``direction="both"`` the anchor may be either side, and at depth > 1
+        neither endpoint is the anchor). Optional: Neo4jStore does not emit
+        them yet, so consumers must treat their absence as "unknown", never as
+        "the anchor is the source".
         Ordering is backend-native (SQLite/PG: edge-table insertion/scan
         order; Neo4j: engine-internal index order) — not guaranteed
         identical across backends when a LIMIT truncates a high-degree hub.
@@ -279,10 +286,14 @@ class GraphStoreExtended(Protocol):
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """Aggregate node counts per ``pack_id``; packs below ``min_nodes`` omitted.
 
-        Returns ``[{"pack_id": str, "node_count": int, "sample_title": str}, ...]``
-        ordered by node_count descending. ``sample_title`` prefers the
-        pack_create anchor node's title, then any node's
-        ``source_package_title``, else ``""``.
+        Returns ``[{"pack_id": str, "node_count": int, "sample_title": str,
+        "sample_description": str}, ...]`` ordered by node_count descending.
+        ``sample_title`` prefers the pack_create anchor node's title, then any
+        node's ``source_package_title``, else ``""``. ``sample_description`` is
+        the anchor node's ``description`` only (no node-level fallback exists),
+        else ``""`` — it is projected inside this same aggregation so
+        pack-relevance scoring (``content_pack_list(query=...)``) needs no
+        per-pack follow-up lookup.
         """
         ...
 

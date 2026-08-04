@@ -405,6 +405,13 @@ class _SqlGraphStoreBase(abc.ABC):
                 "relation_type": relation,
                 "relationship_types": [relation],
                 "depth": current_depth + 1,
+                # Canonical endpoints of the edge just traversed. Both ids are
+                # already in hand here (no extra query), and they are the only
+                # place the *direction* survives: find_neighbors is usually
+                # called with direction="both", and the caller's anchor is not
+                # the edge source once depth > 1.
+                "from_id": current_id if is_out else other_id,
+                "to_id": other_id if is_out else current_id,
             })
             next_level.append((other_id, current_depth + 1))
 
@@ -528,6 +535,7 @@ class _SqlGraphStoreBase(abc.ABC):
         pid = self._dialect.json_get("properties", "pack_id")
         title = self._dialect.json_get("properties", "title")
         src_title = self._dialect.json_get("properties", "source_package_title")
+        desc = self._dialect.json_get("properties", "description")
         sql = f"""
             SELECT
                 {pid} AS pack_id,
@@ -541,7 +549,11 @@ class _SqlGraphStoreBase(abc.ABC):
                     MAX(CASE WHEN node_id = 'dataset:' || ({pid}) THEN {title} END),
                     MAX({src_title}),
                     ''
-                ) AS sample_title
+                ) AS sample_title,
+                COALESCE(
+                    MAX(CASE WHEN node_id = 'dataset:' || ({pid}) THEN {desc} END),
+                    ''
+                ) AS sample_description
             FROM {table}
             WHERE {pid} IS NOT NULL
             GROUP BY {pid}
@@ -550,8 +562,13 @@ class _SqlGraphStoreBase(abc.ABC):
         """
         rows = self._fetch_all(sql, {"min_nodes": min_nodes})
         return [
-            {"pack_id": str(pack_id), "node_count": node_count, "sample_title": sample_title or ""}
-            for pack_id, node_count, sample_title in rows
+            {
+                "pack_id": str(pack_id),
+                "node_count": node_count,
+                "sample_title": sample_title or "",
+                "sample_description": sample_description or "",
+            }
+            for pack_id, node_count, sample_title, sample_description in rows
         ]
 
     @staticmethod

@@ -283,24 +283,56 @@ class KuzuGraphStore:
         pack_set: set[str] | None,
         include_unpackaged: bool,
     ) -> list[dict[str, Any]]:
-        if direction == "out":
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        elif direction == "in":
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})<-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        else:
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        r = self._conn.execute(q + f" LIMIT {int(limit)}", {"id": node_id})
-        results: list[dict[str, Any]] = []
+        # direction="both" is issued as two *directed* passes rather than one
+        # undirected MATCH: the undirected form cannot say which side of the
+        # edge the anchor was on, and find_neighbors' from_id/to_id contract
+        # needs that. Total results are still capped at `limit`.
+        arrows = {
+            "out": ("-[e:OntologyEdge]->", True),
+            "in": ("<-[e:OntologyEdge]-", False),
+        }
+        passes = [arrows[direction]] if direction in arrows else [arrows["out"], arrows["in"]]
+
         seen: set[str] = set()
+        buckets: list[list[dict[str, Any]]] = []
+        for arrow, is_out in passes:
+            q = (
+                f"MATCH (n:OntologyNode {{node_id: $id}}){arrow}(m:OntologyNode) "
+                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
+            )
+            r = self._conn.execute(q + f" LIMIT {int(limit)}", {"id": node_id})
+            bucket: list[dict[str, Any]] = []
+            self._collect_1hop(
+                r, node_id, is_out, bucket, seen, pack_set, include_unpackaged
+            )
+            buckets.append(bucket)
+
+        if len(buckets) == 1:
+            return buckets[0][:limit]
+
+        # Round-robin between directions rather than draining "out" first: a
+        # hub with more than `limit` out-edges would otherwise starve its
+        # in-edges completely, which the single undirected MATCH never did.
+        results: list[dict[str, Any]] = []
+        for i in range(max((len(b) for b in buckets), default=0)):
+            for bucket in buckets:
+                if i < len(bucket):
+                    results.append(bucket[i])
+                    if len(results) >= limit:
+                        return results
+        return results
+
+    def _collect_1hop(
+        self,
+        r: Any,
+        node_id: str,
+        is_out: bool,
+        results: list[dict[str, Any]],
+        seen: set[str],
+        pack_set: set[str] | None,
+        include_unpackaged: bool,
+    ) -> None:
+        """Drain one directed 1-hop result set into ``results`` (dedup by node)."""
         while r.has_next():
             row = r.get_next()
             nid, ntype, props_raw, rel, edge_props_raw, m_space = (
@@ -333,8 +365,10 @@ class KuzuGraphStore:
                 "relation_type": rel,
                 "relationship_types": [rel],
                 "depth": 1,
+                # Canonical edge endpoints (see _sql_graph_base._expand).
+                "from_id": node_id if is_out else nid,
+                "to_id": nid if is_out else node_id,
             })
-        return results
 
     def find_by_relations(
         self,
@@ -435,6 +469,7 @@ class KuzuGraphStore:
         )
         counts: dict[str, int] = {}
         anchor_titles: dict[str, str] = {}
+        anchor_descs: dict[str, str] = {}
         pkg_titles: dict[str, str] = {}
         while r.has_next():
             row = r.get_next()
@@ -449,6 +484,9 @@ class KuzuGraphStore:
                 t = props.get("title") or ""
                 if t:
                     anchor_titles[pid] = t
+                d = props.get("description") or ""
+                if d:
+                    anchor_descs[pid] = d
             # 2순위: source_package_title (외부 pack 로더)
             if pid not in pkg_titles:
                 t = props.get("source_package_title") or ""
@@ -459,6 +497,9 @@ class KuzuGraphStore:
                 "pack_id": pid,
                 "node_count": cnt,
                 "sample_title": anchor_titles.get(pid) or pkg_titles.get(pid) or "",
+                # description은 anchor에만 존재한다(source_package_title 같은
+                # 노드 단위 폴백이 없다) — 없으면 빈 문자열.
+                "sample_description": anchor_descs.get(pid, ""),
             }
             for pid, cnt in sorted(counts.items(), key=lambda x: -x[1])
             if cnt >= min_nodes

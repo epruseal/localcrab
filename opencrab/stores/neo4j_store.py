@@ -430,6 +430,7 @@ class Neo4jStore:
             WHERE n.pack_id IS NOT NULL
             WITH n.pack_id AS pack_id, count(n) AS node_count,
                  collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.title ELSE null END) AS anchor_titles,
+                 collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.description ELSE null END) AS anchor_descs,
                  collect(n.source_package_title) AS pkg_titles
             WHERE node_count >= $min_nodes
             WITH pack_id, node_count,
@@ -437,8 +438,12 @@ class Neo4jStore:
                      [t IN anchor_titles WHERE t IS NOT NULL AND t <> ''][0],
                      [t IN pkg_titles  WHERE t IS NOT NULL AND t <> ''][0],
                      ''
-                 ) AS sample_title
-            RETURN pack_id, node_count, sample_title
+                 ) AS sample_title,
+                 coalesce(
+                     [d IN anchor_descs WHERE d IS NOT NULL AND d <> ''][0],
+                     ''
+                 ) AS sample_description
+            RETURN pack_id, node_count, sample_title, sample_description
             ORDER BY node_count DESC
         """
         with self._session() as session:
