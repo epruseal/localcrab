@@ -36,6 +36,15 @@ def rec(i, pad=0):
     return {"id": i, "text": "x" * pad}
 
 
+def _line_bytes(record) -> int:
+    """이 레코드가 파일에서 차지하는 바이트(직렬화 + 개행).
+
+    경계 테스트가 limit 을 이 값에서 **유도**하게 하려고 둔다. 상수를 손으로 고르면
+    롤오버 조건이 1바이트 흔들려도 분할 지점이 안 바뀌어 경계 변이가 그냥 산다.
+    """
+    return len(json.dumps(record, ensure_ascii=False).encode("utf-8")) + 1
+
+
 @pytest.fixture
 def p(tmp_path):
     return tmp_path / "chunks.jsonl"
@@ -244,26 +253,47 @@ class TestShardBoundaries:
         assert shard_paths(p) == []
 
     def test_appender_shards_never_exceed_limit(self, tmp_path):
-        """`> self.limit` 를 `> self.limit + 1` 로 바꿔도 생존했다.
+        """append writer 가 만든 shard 는 전부 limit 이하다.
 
-        같은 변이를 write_jsonl_sharded 에 걸면 잡히는데 Appender 에서는 안 잡혔다 —
-        두 writer 의 경계 커버리지가 비대칭이었다.
+        limit 을 **레코드 크기에서 유도**한다. 예전에는 `limit=300` 에 60바이트 레코드를
+        썼는데, 그러면 롤오버 조건이 1바이트 흔들려도 분할 지점이 안 바뀌어 경계 변이가
+        그냥 산다(`> limit` -> `> limit + 1` 이 실제로 생존했다, 2026-08-04 실측).
+        `limit = 2*n - 1` 이면 두 번째 줄에서 `size + nbytes == limit + 1` 이 정확히
+        성립해 그 1바이트가 판정을 뒤집는다 — 상수를 손으로 고르면 이 성질을 잃는다.
         """
         q = tmp_path / "raw.jsonl"
-        limit = 300
+        n = _line_bytes(rec(1))
+        limit = 2 * n - 1
         with ShardedAppender(q, limit=limit) as w:
-            for i in range(40):
-                w.write(rec(i, pad=50))
+            w.write(rec(1))
+            w.write(rec(1))
         shards = shard_paths(q)
-        assert len(shards) > 1
+        assert len(shards) == 2, "두 번째 줄은 limit 을 1바이트 넘겨 롤오버해야 한다"
         assert all(s.stat().st_size <= limit for s in shards), \
             [s.stat().st_size for s in shards]
+
+    def test_rewrite_shards_never_exceed_limit(self, p):
+        """rewrite writer 도 같은 경계를 지킨다 — **두 writer 를 대칭으로 건다.**
+
+        예전 주석은 "이 변이가 write_jsonl_sharded 에서는 잡힌다"고 적었는데 거짓이었다.
+        그 오진 때문에 rewrite 쪽 경계가 점검에서 통째로 빠져 있었다(2026-08-04 적대
+        검증). 진단을 믿고 한쪽을 빼면 그 한쪽이 그대로 무방비가 된다.
+        """
+        n = _line_bytes(rec(1))
+        limit = 2 * n - 1
+        out = write_jsonl_sharded(p, [rec(1), rec(1)], limit=limit)
+        assert len(out) == 2
+        assert all(s.stat().st_size <= limit for s in shard_paths(p))
+
+    def test_rewrite_exact_fit_does_not_roll_over(self, p):
+        """rewrite 쪽 롤오버 경계(`>` vs `>=`)도 대칭으로 고정한다."""
+        n = _line_bytes(rec(1))
+        assert write_jsonl_sharded(p, [rec(1), rec(1)], limit=2 * n) == [p]
 
     def test_appender_exact_fit_does_not_roll_over(self, tmp_path):
         """롤오버 조건 `>` 를 `>=` 로 바꿔도 생존했다 — 경계 동작을 고정한다."""
         q = tmp_path / "raw.jsonl"
-        line = json.dumps(rec(1))
-        n = len(line.encode("utf-8")) + 1
+        n = _line_bytes(rec(1))
         with ShardedAppender(q, limit=2 * n) as w:   # 정확히 두 줄이 들어간다
             w.write(rec(1))
             w.write(rec(1))

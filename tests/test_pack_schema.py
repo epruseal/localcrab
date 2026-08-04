@@ -5,8 +5,12 @@
   - grammar 표 사본이 정본과 드리프트할 수 있던 구조
 """
 
+import pathlib
+from unittest import mock
+
 import pytest
 
+from opencrab.grammar import manifest
 from opencrab.grammar.manifest import META_EDGES
 from opencrab.pack.schema import (
     ALL_SPACES,
@@ -125,6 +129,25 @@ class TestGrammarTableGuard:
         allowed[("concept", "subject")] = frozenset({"related_to"})
         with pytest.raises(RuntimeError, match="FIX 대표값이 없다"):
             check_grammar_tables(allowed, FIX)
+
+    def test_the_guard_is_actually_invoked_at_import_time(self):
+        """**호출부**를 건다. 함수만 검사하면 호출을 지워도 아무도 모른다.
+
+        적대 검증 실측: `check_grammar_tables(ALLOWED, FIX)` 호출 한 줄을 주석 처리해도
+        스위트 전량이 통과했다. 가드를 함수로 승격한 목적이 "사문화를 막는 것"인데
+        정작 그 목적이 반만 달성돼 있었다.
+
+        manifest 에 FIX 가 모르는 공간쌍을 끼운 채 schema 소스를 실행하면 import 가
+        실패해야 한다 — 호출이 살아 있어야만 그렇게 된다.
+        """
+        import opencrab.pack.schema as schema_mod
+        src = pathlib.Path(schema_mod.__file__).read_text(encoding="utf-8")
+        extra = dict(from_space="concept", to_space="subject",
+                     relations=["related_to"], description="테스트용 주입")
+        ns = {"__name__": "opencrab.pack.schema_probe", "__file__": schema_mod.__file__}
+        with mock.patch.object(manifest, "META_EDGES", [*manifest.META_EDGES, extra]):
+            with pytest.raises(RuntimeError, match="FIX 대표값이 없다"):
+                exec(compile(src, schema_mod.__file__, "exec"), ns)
 
 
 # ---------------------------------------------------------------------------
