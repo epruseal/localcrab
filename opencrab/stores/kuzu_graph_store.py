@@ -567,13 +567,29 @@ class KuzuGraphStore:
         self,
         pack_id: str | None = None,
         limit: int = 500_000,
+        space: str | None = None,
     ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the Cypher WHERE clause
+        ahead of LIMIT via the ``space_id`` node property -- a plain
+        equality check, since Kuzu keeps space in its own column (see
+        _NODE_DDL) just like the SQL backends (issue #54). ``pack_id``
+        stays a Python post-filter: it lives inside the JSON-serialized
+        ``props`` blob, which this Cypher query has no native way to
+        index into (pre-existing, separate from #54's space bug)."""
         self._require_available()
         # space_id is returned so _merge_space can restore it into props: this
         # backend keeps space in its own column (see _NODE_DDL), but the
         # protocol's export shape carries it inside props.
+        # WHERE clause is only added when space is given -- a bound $space
+        # parameter of None makes Kuzu's query planner unable to infer the
+        # parameter's type ("Value is not a valid boolean"), since unlike
+        # the SQL backends it has no untyped-NULL literal to fall back on.
+        where_clause = "WHERE n.space_id = $space " if space is not None else ""
+        params = {"space": space} if space is not None else {}
         r = self._conn.execute(
-            f"MATCH (n:OntologyNode) RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}"
+            f"MATCH (n:OntologyNode) {where_clause}"
+            f"RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}",
+            params,
         )
         results: list[dict[str, Any]] = []
         while r.has_next():

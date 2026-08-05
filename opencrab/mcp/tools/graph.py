@@ -14,7 +14,6 @@ rationale.
 
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import Any
 
@@ -272,15 +271,13 @@ def ontology_list_nodes(
     """List nodes filtered by space and/or pack_id.
 
     When pack_id is given, queries the graph store's export_nodes(pack_id=...,
-    space=...) (all four backends implement export_nodes — see
-    opencrab/stores/_graph_protocol.py) which uses an indexed/native pack_id
-    filter — avoids the limit-before-filter bug that would occur if we
-    fetched N rows then Python-filtered. The SQL-backed stores
-    (_sql_graph_base.py, used by local/pg mode) also push ``space`` into the
-    same WHERE clause ahead of LIMIT, so it shares that guarantee (issue
-    #54); backends that don't accept the ``space`` kwarg yet fall back to
-    the Python post-filter below, same as before. When pack_id is absent,
-    falls back to the doc store's list_nodes.
+    space=..., limit=...). All three concrete backends (SQL-backed
+    local/pg, Kuzu, Neo4j) push ``space`` into their native query ahead of
+    ``limit`` — see each backend's export_nodes and the shared contract
+    in opencrab/stores/_graph_protocol.py — so the count is correct before
+    truncation instead of being Python-filtered after (issue #54; same
+    class of bug #62 fixed for find_neighbors' pack filter). When pack_id
+    is absent, falls back to the doc store's list_nodes.
     """
     from opencrab.mcp.tools import _clean_str, _get_context
 
@@ -291,15 +288,15 @@ def ontology_list_nodes(
     nodes: list[dict[str, Any]] = []
 
     if pack_id:
-        # Graph store: indexed/native pack_id (+ space, when supported)
-        # filter → correct count before limit.
-        graph_store = ctx["neo4j"]
-        if "space" in inspect.signature(graph_store.export_nodes).parameters:
-            raw = graph_store.export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
-        else:
-            raw = graph_store.export_nodes(pack_id=pack_id, limit=limit)
+        # Graph store: indexed/native pack_id + space filter → correct count
+        # before limit (all three backends implement the same contract, see
+        # _graph_protocol.py#export_nodes).
+        raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
-        # normalise to same shape as doc store list_nodes
+        # normalise to same shape as doc store list_nodes. The space check
+        # below is now redundant with the backend's own filter (kept as
+        # cheap defense-in-depth, same spirit as _expand()'s redundant
+        # pack_set check in _sql_graph_base.py) rather than load-bearing.
         for item in raw:
             props = item.get("props") or {}
             labels = item.get("labels") or []

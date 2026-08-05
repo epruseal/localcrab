@@ -386,12 +386,14 @@ class TestToolDispatch:
             assert result["found"] is False
 
     def test_ontology_list_nodes_pack_filter(self):
-        """ontology_list_nodes filters by pack_id in Python."""
+        """ontology_list_nodes filters by pack_id via the graph store."""
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            # pack_id 있을 때는 graph.export_nodes(pack_id=...) 경로 사용
-            # (limit-before-filter 버그 회피용 인덱스 쿼리)
+            # pack_id 있을 때는 graph.export_nodes(pack_id=..., space=...) 경로 사용
+            # (limit-before-filter 버그 회피용 인덱스 쿼리, issue #54: space 도
+            # 서버 쪽에서 함께 걸린다 -- 아래 assert_called_once_with 의 space=None
+            # 이 그 계약을 검증한다)
             graph = MagicMock()
             graph.export_nodes.return_value = [
                 {"props": {"node_id": "n1", "pack_id": "pack-a", "space": "evidence"}, "labels": ["TextUnit"]},
@@ -406,8 +408,37 @@ class TestToolDispatch:
             result = dispatch_tool("ontology_list_nodes", {"pack_id": "pack-a"})
             assert result["total"] == 2
             assert result["pack_id_filter"] == "pack-a"
-            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100)
+            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100, space=None)
             mongo.list_nodes.assert_not_called()  # doc store는 pack_id 있을 때 사용 안 함
+
+    def test_ontology_list_nodes_pack_and_space_filter_pushes_space_kwarg(self):
+        """issue #54 contract: when both pack_id and space are given,
+        ontology_list_nodes MUST forward space= to export_nodes so the
+        backend can push it into its native query ahead of limit — a
+        regression that silently drops the kwarg (e.g. reverting to a
+        Python-only post-filter) is caught here via assert_called_once_with,
+        not just by the return value."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            # Mock stands in for a backend that already pushed the space
+            # filter server-side -- only matching rows come back.
+            graph.export_nodes.return_value = [
+                {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
+            ]
+            mongo = MagicMock()
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": mongo, "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool(
+                "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
+            )
+            assert result["total"] == 1
+            assert result["nodes"][0]["space"] == "concept"
+            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=10, space="concept")
 
     def test_ontology_list_edges_local_backend(self):
         """ontology_list_edges uses export_edges on Local/Kuzu backends."""

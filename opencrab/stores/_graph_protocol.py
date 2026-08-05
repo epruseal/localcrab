@@ -323,13 +323,19 @@ class GraphStoreExtended(Protocol):
         ...
 
     def export_nodes(
-        self, pack_id: str | None = None, limit: int = 500_000
+        self, pack_id: str | None = None, limit: int = 500_000, space: str | None = None
     ) -> list[dict[str, Any]]:
         """Bulk node export for pack ingest/re-export tooling.
 
         ``pack_id=None`` exports everything (up to ``limit``); otherwise
         matches a node whose ``pack_id``, ``source``, or ``source_id``
-        property equals ``pack_id``. Result shape:
+        property equals ``pack_id``. ``space=None`` (default) applies no
+        space filter; otherwise every implementation pushes the space
+        equality check into its native query (SQL WHERE / Cypher WHERE)
+        ahead of ``limit``, not after -- filtering client-side post-limit
+        silently undercounts and misreports ``total`` whenever the matching
+        rows happen to sort past the limit boundary (issue #54). Result
+        shape:
             {"props": dict, "labels": [str]}
         (the shape ``_normalise_node()`` in opencrab/pack/neo4j_export.py
         consumes).

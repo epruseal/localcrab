@@ -285,6 +285,20 @@ def test_export_nodes_pack_filter(store) -> None:
     assert rows[0]["props"]["id"] == "x1"
 
 
+def test_export_nodes_space_filter_pushed_ahead_of_limit(store) -> None:
+    """issue #54: space must be pushed into the Cypher WHERE clause ahead of
+    LIMIT, not Python-filtered after -- otherwise target-space rows sorting
+    past the limit boundary would be silently undercounted."""
+    for i in range(20):
+        store.upsert_node("X", f"a{i:02d}", {}, space_id="noise")
+    for i in range(5):
+        store.upsert_node("X", f"z{i:02d}", {}, space_id="concept")
+
+    rows = store.export_nodes(space="concept", limit=10)
+    assert len(rows) == 5
+    assert all(r["props"]["space"] == "concept" for r in rows)
+
+
 def test_export_edges(store) -> None:
     store.upsert_node("A", "a", {})
     store.upsert_node("B", "b", {})

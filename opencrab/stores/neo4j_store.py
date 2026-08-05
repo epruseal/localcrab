@@ -514,24 +514,29 @@ class Neo4jStore:
             ]
 
     def export_nodes(
-        self, pack_id: str | None = None, limit: int = 500_000
+        self, pack_id: str | None = None, limit: int = 500_000, space: str | None = None
     ) -> list[dict[str, Any]]:
         """Bulk node export for pack ingest/re-export tooling.
 
         Cypher is identical to pack/neo4j_export.py's former inline
         ``_node_query()`` helper (pack_id matches ``pack_id``, ``source``,
-        or ``source_id``).
+        or ``source_id``). ``space``, when given, is pushed into the same
+        WHERE clause ahead of LIMIT via the ``space`` node property --
+        Neo4jStore writes ``props["space"]`` natively on upsert (see
+        ``upsert_node``), so this is real pushdown, not a Python post-filter
+        (issue #54).
         """
         self._require_available()
         cypher = f"""
             MATCH (n)
-            WHERE $pack_id IS NULL
-               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id
+            WHERE ($pack_id IS NULL
+               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id)
+              AND ($space IS NULL OR n.space = $space)
             RETURN properties(n) AS props, labels(n) AS labels
             LIMIT {int(limit)}
         """
         with self._session() as session:
-            result = session.run(cypher, pack_id=pack_id)
+            result = session.run(cypher, pack_id=pack_id, space=space)
             return [
                 {"props": dict(record["props"]), "labels": list(record["labels"])}
                 for record in result
