@@ -49,10 +49,18 @@ def _build_type_schema(
     *extra_required*/*extra_optional* let a legacy-stub migration carry over
     field names the manifest doesn't define -- e.g. a field a user added by
     hand to a previously-installed stub. Required wins if a name appears in
-    both. Legacy shape only ever stored flat field-name lists (no per-field
-    type/nullable/enum), so folding a name into ``properties`` here uses the
-    exact same {type: string, nullable: ...} convention already applied to
-    every manifest-defined field below -- no extra judgment call needed.
+    both.
+
+    Legacy shape only ever stored flat field-name lists -- no per-field type,
+    so these extra fields get NO ``type`` (and no ``nullable``): inventing
+    "string" would be a guess, and grammar.validator.validate_node_properties
+    now actually enforces declared types (#48), so a wrong guess would reject
+    real data (e.g. a numeric field the user marked required). Omitting
+    ``type`` entirely, rather than declaring an unknown-to-the-validator
+    type name, is deliberate: the validator's type-check loop only runs when
+    ``spec.get("type")`` is not None, so an absent key skips the check
+    silently (no per-node warning-log spam), while presence + required-ness
+    are still enforced.
     """
     type_specs = pack.get("type_specs", {}) or {}
     spec = type_specs.get(node_type, {}) or {}
@@ -61,20 +69,20 @@ def _build_type_schema(
     required_fields = list(spec.get("required") or ["name"])
     optional_fields = list(spec.get("optional") or ["description", "status"])
 
-    for field_name in extra_required or []:
-        if field_name not in required_fields:
-            required_fields.append(field_name)
-        if field_name in optional_fields:
-            optional_fields.remove(field_name)
-    for field_name in extra_optional or []:
-        if field_name not in required_fields and field_name not in optional_fields:
-            optional_fields.append(field_name)
-
     properties: dict[str, Any] = {}
     for field_name in required_fields:
         properties[field_name] = {"type": "string", "required": True, "nullable": False}
     for field_name in optional_fields:
         properties[field_name] = {"type": "string", "required": False, "nullable": True}
+
+    for field_name in extra_required or []:
+        if field_name in properties:
+            properties[field_name]["required"] = True
+        else:
+            properties[field_name] = {"required": True}
+    for field_name in extra_optional or []:
+        if field_name not in properties:
+            properties[field_name] = {"required": False}
 
     return {
         "type": node_type,
@@ -168,6 +176,15 @@ def install_pack(name: str) -> dict[str, Any]:
     over into the new ``properties`` and reported in
     ``preserved_extra_fields``, decided before anything is written to disk.
 
+    The reverse edit -- a user removing a manifest-required field from the
+    stub's ``required``/``optional`` lists -- is NOT honoured: a file that no
+    longer declares the pack's own required fields isn't this pack's schema
+    to keep incomplete, and re-deciding that is not migration's call. The
+    manifest's fields are always regenerated. But that revival is not silent:
+    any manifest-required field the old file no longer required (dropped
+    entirely or demoted to ``optional``) is reported in
+    ``revived_manifest_fields``, again decided before the write.
+
     Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
@@ -182,6 +199,7 @@ def install_pack(name: str) -> dict[str, Any]:
     migrated = []
     skipped = []
     preserved_extra_fields: dict[str, dict[str, list[str]]] = {}
+    revived_manifest_fields: dict[str, dict[str, list[str]]] = {}
 
     for node_type in pack.get("types", []):
         path = _TYPES_DIR / f"{node_type}.yaml"
@@ -211,17 +229,29 @@ def install_pack(name: str) -> dict[str, Any]:
                 skipped.append(node_type)
                 continue
 
-            # Decide what would be lost BEFORE writing anything: a field a
-            # user added to this stub's required/optional lists by hand,
-            # after install, that the current pack manifest doesn't define.
+            # Decide what would change BEFORE writing anything.
             old_required = existing.get("required") or []
             old_optional = existing.get("optional") or []
             manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
             manifest_required = manifest_spec.get("required") or ["name"]
             manifest_optional = manifest_spec.get("optional") or ["description", "status"]
+
+            # Fields the user added that the manifest doesn't define -- kept.
             extra_required = [f for f in old_required if f not in manifest_required]
             extra_optional = [
                 f for f in old_optional if f not in manifest_optional and f not in extra_required
+            ]
+            # Manifest-required fields the old file no longer required --
+            # dropped from `required` entirely, or just demoted to
+            # `optional`. Migration always regenerates the manifest's own
+            # required fields (a file missing them isn't this pack's schema
+            # anymore, and un-requiring is not migration's call to make), so
+            # these come back required. Not honouring the removal, but not
+            # silent about it either. The optional side is informational
+            # only (no enforcement consequence either way).
+            revived_required = [f for f in manifest_required if f not in old_required]
+            revived_optional = [
+                f for f in manifest_optional if f not in old_required and f not in old_optional
             ]
 
             schema = _build_type_schema(
@@ -237,7 +267,15 @@ def install_pack(name: str) -> dict[str, Any]:
                     "pack manifest -- required=%r optional=%r",
                     name, node_type, extra_required, extra_optional,
                 )
-            else:
+            if revived_required or revived_optional:
+                revived_manifest_fields[node_type] = {"required": revived_required, "optional": revived_optional}
+                logger.warning(
+                    "Pack '%s': migrated %s, re-added manifest field(s) that were missing from "
+                    "the old file's required/optional lists -- required=%r optional=%r "
+                    "(migration does not honour dropping a pack's own fields)",
+                    name, node_type, revived_required, revived_optional,
+                )
+            if not (extra_required or extra_optional or revived_required or revived_optional):
                 logger.info("Pack '%s': migrated legacy-shape schema for %s", name, node_type)
             continue
         schema = _build_type_schema(pack, node_type)
@@ -261,6 +299,7 @@ def install_pack(name: str) -> dict[str, Any]:
         "migrated": migrated,
         "skipped": skipped,
         "preserved_extra_fields": preserved_extra_fields,
+        "revived_manifest_fields": revived_manifest_fields,
         "total_types": len(pack.get("types", [])),
     }
 

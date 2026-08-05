@@ -87,12 +87,19 @@ def test_uninstall_removes_generated_stub(tmp_pack_env):
     assert not (tmp_pack_env / "Widget.yaml").exists()
 
 
-def test_install_pack_migrates_legacy_shape_stub(tmp_pack_env):
+def test_install_pack_migrates_legacy_shape_stub(tmp_pack_env, caplog):
     """install_pack must detect and regenerate a pre-existing legacy-shape
     stub (node_type/pack/required/optional, no `properties`) instead of
     unconditionally skipping it -- that unconditional skip is what made the
     live installed biomedical-pack stubs (issue #38) permanently stuck in
     the shape validate_node_properties can't read.
+
+    This file also demotes the manifest-required `name` field to `optional`
+    (`required: []`). Migration always regenerates the manifest's own
+    required fields (see test_install_pack_reports_revived_manifest_field
+    for why), so `name` comes back required here too -- and PR #104 codex
+    review (P2, second round) requires that not be silent: it must show up
+    in `revived_manifest_fields`.
     """
     types_dir = tmp_pack_env
     legacy = {
@@ -106,10 +113,13 @@ def test_install_pack_migrates_legacy_shape_stub(tmp_pack_env):
         encoding="utf-8",
     )
 
-    result = pack_registry.install_pack("testpack")
+    with caplog.at_level("WARNING"):
+        result = pack_registry.install_pack("testpack")
     assert result["migrated"] == ["Widget"]
     assert result["created"] == []
     assert result["skipped"] == []
+    assert result["revived_manifest_fields"] == {"Widget": {"required": ["name"], "optional": []}}
+    assert any("re-added manifest field" in rec.message for rec in caplog.records)
 
     data = yaml.safe_load((types_dir / "Widget.yaml").read_text(encoding="utf-8"))
     assert "properties" in data
@@ -171,15 +181,24 @@ def test_install_pack_preserves_hand_written_file_that_fakes_pack_field(tmp_pack
 
 
 def test_install_pack_preserves_user_added_field_on_migration(tmp_pack_env, caplog):
-    """PR #104 codex review (P1): a generation-header stub can still have
-    been hand-edited *after* install -- adding a constraint to a previously
-    installed stub is a natural usage pattern. If the field the user added
-    (`legacy_only_field`) isn't in the current pack manifest's type_specs,
-    migration must carry it into the new `properties` rather than drop it
-    -- overwriting a stub that still carries the generation header is not
-    licence to discard content the header-check alone can't prove is
-    machine-only. Silently dropping it would recreate the exact class of
-    bug this issue exists to fix (constraint disappears on reinstall).
+    """PR #104 codex review (P1, first round): a generation-header stub can
+    still have been hand-edited *after* install -- adding a constraint to a
+    previously installed stub is a natural usage pattern. If the field the
+    user added (`legacy_only_field`) isn't in the current pack manifest's
+    type_specs, migration must carry it into the new `properties` rather
+    than drop it -- overwriting a stub that still carries the generation
+    header is not licence to discard content the header-check alone can't
+    prove is machine-only. Silently dropping it would recreate the exact
+    class of bug this issue exists to fix (constraint disappears on
+    reinstall).
+
+    PR #104 codex review (P1, second round): legacy shape only ever stored
+    a flat field-name list -- it has no per-field type. The preserved field
+    must NOT get an invented `type: string`, since grammar.validator now
+    actually enforces declared types (#48) and a wrong guess would reject
+    real non-string data. See
+    test_install_pack_preserved_field_accepts_non_string_value below for
+    the regression this exists to prevent.
     """
     types_dir = tmp_pack_env
     legacy = {
@@ -200,19 +219,54 @@ def test_install_pack_preserves_user_added_field_on_migration(tmp_pack_env, capl
     assert result["preserved_extra_fields"] == {
         "Widget": {"required": ["legacy_only_field"], "optional": []}
     }
+    assert result["revived_manifest_fields"] == {}
     assert any("carried over user-added field" in rec.message for rec in caplog.records)
 
     data = yaml.safe_load((types_dir / "Widget.yaml").read_text(encoding="utf-8"))
     assert "properties" in data
     assert data["properties"]["legacy_only_field"]["required"] is True
+    assert "type" not in data["properties"]["legacy_only_field"]  # no guessed type
+    assert "nullable" not in data["properties"]["legacy_only_field"]  # no guessed nullability
     assert data["properties"]["name"]["required"] is True
     assert data["properties"]["description"]["required"] is False
 
-    # The preserved field is actually enforced now, not just present in the file.
+    # The preserved field is actually enforced (presence/required-ness) now,
+    # not just present in the file.
     schema_loader.load_type_schema.cache_clear()
     missing = validate_node_properties("Widget", {"name": "Foo", "description": "x"})
     assert missing.valid is False
     assert "legacy_only_field" in missing.error
+
+
+def test_install_pack_preserved_field_accepts_non_string_value(tmp_pack_env):
+    """PR #104 codex review (P1, second round) -- the core regression.
+
+    grammar.validator.validate_node_properties#_value_matches_type rejects
+    a value that doesn't match a `type` the schema declares. Confirmed by
+    reading validator.py directly: `declared_type = spec.get("type")`, and
+    the type-check loop only runs `if declared_type is not None`. So a
+    preserved field with NO `type` key skips the type check entirely --
+    the field's presence/required-ness is still enforced, but its value is
+    never type-checked. If migration had instead guessed `type: string`
+    (the pre-fix behaviour), this exact call would fail with "must be of
+    type 'string', got int" for a real, valid integer value like a price.
+    """
+    types_dir = tmp_pack_env
+    legacy = {
+        "node_type": "Widget",
+        "pack": "testpack",
+        "required": ["name", "price"],
+        "optional": [],
+    }
+    (types_dir / "Widget.yaml").write_text(
+        "# Auto-generated by schema pack 'testpack' v1.0.0\n" + yaml.safe_dump(legacy),
+        encoding="utf-8",
+    )
+    pack_registry.install_pack("testpack")
+    schema_loader.load_type_schema.cache_clear()
+
+    ok = validate_node_properties("Widget", {"name": "Widget A", "price": 42})
+    assert ok.valid is True, ok.error
 
 
 def test_install_pack_continues_past_unreadable_existing_file(tmp_path, monkeypatch):
