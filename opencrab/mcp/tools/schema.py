@@ -41,6 +41,7 @@ def schema_pack_list() -> dict[str, Any]:
         },
     },
     order=11,
+    writes=True,
 )
 def schema_pack_install(name: str) -> dict[str, Any]:
     """
@@ -72,6 +73,7 @@ def schema_pack_install(name: str) -> dict[str, Any]:
         },
     },
     order=12,
+    writes=True,
 )
 def schema_pack_uninstall(name: str, force: bool = False) -> dict[str, Any]:
     """

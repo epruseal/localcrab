@@ -115,26 +115,9 @@ def _acquire_chroma_shared_lock() -> None:
     fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
 
 
-# Tools that mutate the stores. When several MCP server processes run against the
-# same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
-# writes must be serialised. This is a *per-write* exclusive lock on a dedicated
-# write.lock file — entirely separate from the lifetime-held chroma.lock (LOCK_SH)
-# above, which only guards against the offline batch loader (LOCK_EX). Reads take
-# no lock. NOTE: lockless concurrent reads across processes is THIS layer's design
-# assumption, NOT a chromadb guarantee — chromadb officially treats multi-process
-# PersistentClient sharing as unsupported. write.lock serialises the one hazard the
-# docs name explicitly (concurrent writers); cross-process reads here are
-# stale-risk (a reader's in-memory HNSW won't see another process's new vectors
-# until reload), not corruption. Robust fix = single chroma server + HttpClient.
-WRITE_TOOLS = {
-    "ontology_add_node",
-    "ontology_add_edge",
-    "pack_create",
-    "pack_ingest",
-    "schema_pack_install",
-    "schema_pack_uninstall",
-    "harness_promotion_apply",
-}
+# WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
+# once every handler submodule has registered via @tool(..., writes=True) — see
+# that assembly for the full rationale of *why* write tools need serialising.
 
 
 @contextmanager
@@ -322,3 +305,25 @@ TOOLS: list[dict[str, Any]] = build_tools()
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in _REGISTRY.items()}
 _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {name: spec.fn for name, spec in _REGISTRY.items()}
 dispatch_tool = _registry_dispatch_tool
+
+# Tools that mutate the stores. When several MCP server processes run against the
+# same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
+# writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
+# lock on a dedicated write.lock file — entirely separate from the lifetime-held
+# chroma.lock (LOCK_SH) above, which only guards against the offline batch loader
+# (LOCK_EX). Reads take no lock. NOTE: lockless concurrent reads across processes
+# is THIS layer's design assumption, NOT a chromadb guarantee — chromadb
+# officially treats multi-process PersistentClient sharing as unsupported.
+# write.lock serialises the one hazard the docs name explicitly (concurrent
+# writers); cross-process reads here are stale-risk (a reader's in-memory HNSW
+# won't see another process's new vectors until reload), not corruption. Robust
+# fix = single chroma server + HttpClient.
+#
+# *Derived* from each handler's `@tool(..., writes=True)` declaration (see
+# _registry.tool) rather than hand-copied here. Issue #65: a hand-maintained
+# WRITE_TOOLS set silently missed ontology_impact / ontology_lever_simulate,
+# which persist rows via save_impact/save_simulation, so dispatch_tool never
+# locked around them. Deriving it means a future write handler that forgets
+# `writes=True` fails the registry contract test instead of silently
+# bypassing the lock.
+WRITE_TOOLS: frozenset[str] = frozenset(name for name, spec in _REGISTRY.items() if spec.writes)

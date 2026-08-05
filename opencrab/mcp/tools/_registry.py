@@ -25,10 +25,11 @@ class ToolSpec:
     schema: dict[str, Any]
     fn: Callable[..., Any]
     order: int
+    writes: bool = False
 
 
 def tool(
-    name: str, schema: dict[str, Any], *, order: int | None = None
+    name: str, schema: dict[str, Any], *, order: int | None = None, writes: bool = False
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register `fn` as the handler for MCP tool `name`, with its tools/list schema.
 
@@ -39,6 +40,12 @@ def tool(
     handlers live in separate files, since each module executes top-to-bottom
     as one unit. When omitted, falls back to registration (insertion) order,
     which is sufficient for ad-hoc/test registrations.
+
+    `writes=True` declares that this handler mutates a store (SQL/graph/vector/
+    doc), so `dispatch_tool` must hold the cross-process write lock for the
+    duration of the call (see `opencrab.mcp.tools.WRITE_TOOLS`, which is
+    *derived* from this flag rather than hand-maintained — issue #65: a
+    hand-maintained WRITE_TOOLS set silently missed two write handlers).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -48,7 +55,7 @@ def tool(
         collision = next((s.name for s in _REGISTRY.values() if s.order == resolved_order), None)
         if collision is not None:
             raise ValueError(f"tool {name!r} order={resolved_order} collides with {collision!r}")
-        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order)
+        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order, writes=writes)
         return fn
 
     return deco
@@ -97,7 +104,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
 
     Thin lookup + call, matching the pre-migration dispatch_tool exactly: no
     extra error wrapping (handlers self-wrap), and write-serialising via the
-    shared write_lock/WRITE_TOOLS for tools that mutate the stores.
+    shared write_lock for tools declared `writes=True` (see `tool()`).
     """
     # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._shared
     # shim submodule: importing a submodule for the first time binds it as an
@@ -105,14 +112,14 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     # overwrite __init__.py's module-level `_context` dict (same name) the moment
     # this import ran — verified empirically (tests/test_mcp.py's `_context.clear()`
     # started hitting a module object instead of a dict).
-    from opencrab.mcp.tools import WRITE_TOOLS, _write_lock
+    from opencrab.mcp.tools import _write_lock
 
     spec = _REGISTRY.get(name)
     if spec is None:
         # order 정렬 — 물리 분할 후에도 pre-split과 동일한 목록 순서 유지.
         available = [s.name for s in sorted(_REGISTRY.values(), key=lambda s: s.order)]
         raise UnknownToolError(f"Unknown tool: '{name}'. Available: {available}")
-    if name in WRITE_TOOLS:
+    if spec.writes:
         with _write_lock():
             return spec.fn(**arguments)
     return spec.fn(**arguments)

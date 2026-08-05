@@ -426,6 +426,7 @@ def _rank_packs(
         },
     },
     order=13,
+    writes=True,
 )
 def pack_create(
     title: str,
@@ -572,6 +573,7 @@ def pack_create(
         },
     },
     order=14,
+    writes=True,
 )
 def pack_ingest(
     pack_id: str,

@@ -219,6 +219,10 @@ def ontology_query(
         },
     },
     order=7,
+    # #65: analyse() persists a row via ImpactEngine -> save_impact() (SQL
+    # INSERT into impact_records), so this "analysis" tool must be lock-covered
+    # like any other write despite its read-shaped name.
+    writes=True,
 )
 def ontology_impact(
     node_id: str,
@@ -270,6 +274,9 @@ def ontology_impact(
         },
     },
     order=8,
+    # #65: lever_simulate() persists a row via ImpactEngine -> save_simulation()
+    # (SQL INSERT into lever_simulations); same rationale as ontology_impact above.
+    writes=True,
 )
 def ontology_lever_simulate(
     lever_id: str,

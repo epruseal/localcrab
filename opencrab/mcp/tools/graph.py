@@ -77,6 +77,7 @@ def ontology_manifest() -> dict[str, Any]:
         },
     },
     order=1,
+    writes=True,
 )
 def ontology_add_node(
     space: str,
@@ -152,6 +153,7 @@ def ontology_add_node(
         },
     },
     order=2,
+    writes=True,
 )
 def ontology_add_edge(
     from_space: str,
