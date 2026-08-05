@@ -12,6 +12,7 @@ import pytest
 
 from opencrab.grammar import manifest
 from opencrab.grammar.manifest import META_EDGES
+from opencrab.pack import schema
 from opencrab.pack.schema import (
     ALL_SPACES,
     ALLOWED,
@@ -352,3 +353,59 @@ class TestStructKeySets:
     def test_edge_and_chunk_carry_their_own_bag(self):
         assert "properties" in EDGE_STRUCT_KEYS
         assert "metadata" in CHUNK_STRUCT_KEYS
+
+
+# ── 표 내용 계약 ──────────────────────────────────────────────────────────────
+#
+# 표는 계약의 절반이다. 함수만 검사하면 표 내용이 무검사로 남는다 — 전면 스윕
+# (scripts/qa/mutate_module.py)이 이 모듈을 훑자 814종 중 451종이 표 리터럴에서
+# 생존했다(2026-08-05). 항목을 하나씩 쓸 수 없으므로 지문으로 닫고, 표를 고치는 것이
+# 라이브 판정을 바꾸는 일임을 지문 갱신이라는 의도적 행위로 강제한다.
+# (normalize 쪽 표는 tests/test_pack_normalize.py 가 같은 방식으로 고정한다.)
+
+def _table_fingerprint(table):
+    import hashlib
+    import json
+
+    if isinstance(table, frozenset):
+        payload = sorted(table)
+    else:
+        payload = sorted((repr(k), repr(v)) for k, v in table.items())
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+SCHEMA_TABLE_FINGERPRINTS = {
+    "NODE_STRUCT_KEYS": ("9ce69c22b6b723499951407d74f1515441ff4b8bc8dca64154a5b9c70fdd9f99", 9),
+    "EDGE_STRUCT_KEYS": ("1e8da7546c7e48c6f96687249188e67e44f6ffe8239417a5bcc28c7a5f48b08f", 7),
+    "CHUNK_STRUCT_KEYS": ("829b995bce491b903710d6c2108dfaaff8d601b883ccd88c66f920da17282adc", 8),
+    "RESERVED_NODE_KEYS": ("1b9148cbae0578281a7048f14c3c06b3539f1c6a054dd6c501790c59bf16917f", 6),
+    "FIX": ("47f96c7baeca4d70057b1604eab12ed5733635d3b77385721f1e22aeaa6b84b8", 38),
+    "KEEP": ("cf38ac073e29544ca91a144972958f5ed4170d15b5e7fb02774eb3f36f65bc66", 1),
+    "TRACE_SRC": ("939516f210f90597d0b95b57b52efb64aa89952b5eaf181e844d23865a83d273", 4),
+    "NODE_TYPE_OVERRIDE": ("a78048f4610c345c16416bf2c2faf603787eeda39528e328eb63824f5f1c0b36", 81),
+    "SPACE_DEFAULT_TYPE": ("281b8aa6600302f054040006c7402bdbcee2d9cfa9bc6fcabe7fd102ee4f1398", 9),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SCHEMA_TABLE_FINGERPRINTS))
+def test_schema_table_content_is_pinned(name):
+    """표를 고치면 여기서 걸린다 — 지문과 항목 수를 함께 갱신하고 사유를 커밋에 남겨라."""
+    want_fp, want_len = SCHEMA_TABLE_FINGERPRINTS[name]
+    table = getattr(schema, name)
+    assert len(table) == want_len, f"{name} 항목 수 {len(table)} != {want_len}"
+    assert _table_fingerprint(table) == want_fp, f"{name} 내용이 바뀌었다"
+
+
+def test_stray_check_uses_stray_keys_not_the_absorb_result():
+    """`stray_top_level_keys` 를 `absorb_legacy_top_level` 로 바꿔도 대부분 안 보인다.
+
+    갈리는 것은 **최상위 비구조 키가 없고 중첩 properties 만 있는** 행이다 —
+    absorb 는 그 중첩 내용을 돌려주므로 truthy 가 되어 정상 행이 계약 위반으로 거절된다.
+    엄격 모드(allow_legacy_top_level=False)로 새 팩을 검사할 때 전건이 튕긴다.
+    """
+    row = {"id": "n1", "label": "라벨", "node_type": "Concept", "space": "concept",
+           "properties": {"custom": "값"}}
+    schema.validate_node(row, allow_legacy_top_level=False)   # 예외 없이 통과해야 한다
+    assert schema.stray_top_level_keys(row) == {}
+    assert schema.absorb_legacy_top_level(row) == {"custom": "값"}

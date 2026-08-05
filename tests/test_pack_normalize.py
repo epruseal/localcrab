@@ -873,3 +873,110 @@ def test_types_outside_the_statement_list_get_no_statement():
 def test_none_label_is_treated_as_empty():
     """`(label or "")` 의 기본값을 지우면 None.upper() 로 죽는다."""
     assert N.resolve_edge(None, "concept", "concept") == ("concept", "", "concept", False)
+
+
+# ── 표 내용 계약 ──────────────────────────────────────────────────────────────
+#
+# 표는 판정의 절반이다. 함수만 검사하면 표 내용이 무검사로 남는다 — 전면 스윕이
+# 표 리터럴까지 훑자 813종 중 576종이 생존했다(2026-08-05). 손으로 196개 항목을
+# 다 쓸 수는 없으므로 두 축으로 닫는다:
+#   ① 구조 불변식 — 존재하지 않는 relation·node_type 으로 바뀌면 즉시 걸린다.
+#      실측 위반 0 이라 보편 단언이 가능하다.
+#   ② 내용 지문 — ①을 통과하는 **유효값끼리의 교체**(part_of -> related_to)를 잡는다.
+#      표를 고치는 것은 라이브 판정을 바꾸는 일이라, 지문 갱신이라는 의도적 행위를 강제한다.
+
+def _fingerprint(table):
+    import hashlib
+    import json
+
+    if isinstance(table, frozenset):
+        payload = sorted(table)
+    else:
+        payload = sorted((repr(k), repr(v)) for k, v in table.items())
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+TABLE_FINGERPRINTS = {
+    "REL_MAP": ("a269d2029ccf067947cb468fb8880d4e453cb5c5a6f5b0f5c71641f3fbed3516", 55),
+    "REVERSE_RELATIONS": ("b9ac61265dba3b6a955bbb4178d6fde0692b2443e53740075f1ba894fc1b012b", 3),
+    "LABEL_SPACE_OVERRIDE": ("5321b1bf4f7fdbac2cd7d17885b277db37da2ea89953d5851a679101e5bd5d93", 48),
+    "NODE_TYPE_OVERRIDE": ("a78048f4610c345c16416bf2c2faf603787eeda39528e328eb63824f5f1c0b36", 81),
+    "SPACE_DEFAULT_TYPE": ("281b8aa6600302f054040006c7402bdbcee2d9cfa9bc6fcabe7fd102ee4f1398", 9),
+}
+
+
+def _table(name):
+    from opencrab.pack import schema
+
+    return getattr(N, name, None) or getattr(schema, name)
+
+
+@pytest.mark.parametrize("name", sorted(TABLE_FINGERPRINTS))
+def test_table_content_is_pinned(name):
+    """표를 고치면 여기서 걸린다 — 지문과 항목 수를 함께 갱신하라.
+
+    갱신은 "라이브 적재 판정을 바꾼다"는 뜻이므로, 무엇이 왜 바뀌는지 커밋에 적을 것.
+    """
+    want_fp, want_len = TABLE_FINGERPRINTS[name]
+    table = _table(name)
+    assert len(table) == want_len, f"{name} 항목 수 {len(table)} != {want_len}"
+    assert _fingerprint(table) == want_fp, f"{name} 내용이 바뀌었다"
+
+
+def test_every_rel_map_value_is_a_real_grammar_relation():
+    from opencrab.pack.schema import ALLOWED
+
+    known = {r for rels in ALLOWED.values() for r in rels}
+    unknown = sorted({v for v in N.REL_MAP.values() if v not in known})
+    assert not unknown, f"grammar 에 없는 relation: {unknown}"
+
+
+def test_every_override_resolves_to_a_grammar_valid_edge():
+    """반전까지 적용한 뒤의 (from, to, relation) 이 문법에 있어야 한다.
+
+    없으면 그 라벨의 엣지가 적재 시 전량 skip 된다 — 표에 오타 하나로 팩이 반쪽 적재된다.
+    """
+    from opencrab.pack.schema import ALLOWED
+
+    bad = []
+    for (label, fs, ts), (relation, reverse) in N.LABEL_SPACE_OVERRIDE.items():
+        a, b = (ts, fs) if reverse else (fs, ts)
+        if relation not in ALLOWED.get((a, b), ()):
+            bad.append((label, fs, ts, relation, reverse))
+    assert not bad, f"grammar 무효 override: {bad}"
+
+
+def test_every_reverse_relation_is_declared_in_rel_map():
+    """REL_MAP 에 없는 라벨을 반전 목록에만 넣으면 lowercase 폴백과 반전이 엇갈린다."""
+    orphan = sorted(label for label in N.REVERSE_RELATIONS if label not in N.REL_MAP)
+    assert not orphan, f"REL_MAP 미등록 반전 라벨: {orphan}"
+
+
+@pytest.mark.parametrize("name", ["NODE_TYPE_OVERRIDE", "SPACE_DEFAULT_TYPE"])
+def test_every_type_table_target_is_valid_in_its_space(name):
+    bad = [(k, v) for k, v in _table(name).items()
+           if v[1] not in N._GRAMMAR_SPACES.get(v[0], {}).get("node_types", ())]
+    assert not bad, f"{name} 의 무효 (space, node_type): {bad}"
+
+
+# ── 호출 대상 계약 ────────────────────────────────────────────────────────────
+
+def test_legacy_absorption_uses_flatten_not_chroma_semantics():
+    """흡수 경로도 flatten_props 여야 한다.
+
+    chroma_safe_meta 로 바꿔도 대부분 같은 결과라 안 보인다 — 두 함수가 갈리는 것은
+    **스칼라 리스트**(flatten 은 유지, chroma 는 문자열화)와 **None**(flatten 은 "",
+    chroma 는 키 제거)뿐이다. 그 두 값으로만 구분된다(2026-08-05 적대 검증 실증).
+    """
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(legacy_list=[1, 2], legacy_none=None, properties={}))
+    assert props["legacy_list"] == [1, 2]
+    assert props["legacy_none"] == ""
+
+
+def test_chunk_meta_uses_chroma_not_flatten_semantics():
+    """반대 방향 — 청크 메타는 chroma 의미론이라 None 키가 사라지고 리스트가 문자열이 된다."""
+    meta = N.transform_chunk_meta("p", {"metadata": {"xs": [1, 2], "n": None}})
+    assert meta["xs"] == "[1, 2]"
+    assert "n" not in meta

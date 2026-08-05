@@ -54,6 +54,23 @@ class _Op:
         return f"{self.kind}@L{self.line}"
 
 
+def _message_text_nodes(tree):
+    """f-string 의 **리터럴 텍스트** 조각. 진단 메시지 문구는 동작이 아니다.
+
+    문구를 바꿔도 예외 종류·발생 여부가 같으므로 "생존"으로 세면 잡음만 늘고 진짜 결함이
+    묻힌다(2026-08-05 schema 스윕에서 22종이 전부 이 부류였다). f-string **안의 식**
+    (`row.get("id")` 같은 것)은 동작일 수 있으므로 제외하지 않는다.
+    """
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.JoinedStr):
+            for part in n.values:
+                if isinstance(part, ast.Constant):
+                    out.add((part.lineno, part.col_offset,
+                             part.end_lineno, part.end_col_offset))
+    return out
+
+
 def _docstring_nodes(tree):
     """docstring 은 동작이 아니다 — 변이 대상에서 뺀다(잡음 제거)."""
     out = set()
@@ -67,9 +84,68 @@ def _docstring_nodes(tree):
     return out
 
 
+def _table_constants(tree):
+    """모듈 최상단 UPPER_CASE 표 리터럴 안의 상수들.
+
+    함수 본문만 훑으면 표의 **내용**이 무검사로 남는다 — 적대 검증이
+    `"HAS_ASSEMBLY": "part_of"` -> `"related_to"` 한 글자로 실증했다(2026-08-05).
+    표는 판정의 절반이므로 같은 스윕에 넣는다.
+    """
+    out = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if not names or not any(n.isupper() or n.upper() == n for n in names):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
+                for c in ast.walk(sub):
+                    if isinstance(c, ast.Constant):
+                        out.append(c)
+    return out
+
+
+def _module_functions(tree):
+    """최상단 함수명 -> 위치인자 개수. 호출 대상 교체용."""
+    return {n.name: len(n.args.args) for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
 def _collect(tree):
     ops = []
     skip = _docstring_nodes(tree)
+    msgs = _message_text_nodes(tree)
+    funcs = _module_functions(tree)
+
+    # 0-a. 표 리터럴 내용 변이
+    for c in _table_constants(tree):
+        v = c.value
+        repl = None
+        if isinstance(v, str) and v:
+            repl = v + "_MUT"
+        elif v is True:
+            repl = False
+        elif v is False:
+            repl = True
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            repl = v + 1
+        if repl is not None:
+            ops.append(_Op(f"table-const:{v!r}->{repl!r}", c,
+                           lambda n, r=repl: setattr(n, "value", r)))
+
+    # 0-b. 호출 대상 교체(같은 위치인자 개수의 다른 최상단 함수로)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in funcs):
+            arity = len(node.args)
+            for other, oarity in funcs.items():
+                if other != node.func.id and oarity == arity:
+                    ops.append(_Op(f"call-target:{node.func.id}->{other}", node,
+                                   lambda n, o=other: setattr(
+                                       n.func, "id", o)))
+
     # 함수 본문 안만 대상으로 한다(모듈 최상단 표 리터럴은 별도 축).
     for fn in [n for n in ast.walk(tree)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
@@ -106,7 +182,10 @@ def _collect(tree):
                 ops.append(_Op(f"drop-{node.func.attr}-default", node,
                                lambda n: setattr(n, "args", n.args[:1])))
             # 5. 상수 뒤집기
-            if isinstance(node, ast.Constant) and (node.lineno, node.col_offset) not in skip:
+            if (isinstance(node, ast.Constant)
+                    and (node.lineno, node.col_offset) not in skip
+                    and (node.lineno, node.col_offset, node.end_lineno,
+                         node.end_col_offset) not in msgs):
                 v = node.value
                 repl = None
                 if v is True:
