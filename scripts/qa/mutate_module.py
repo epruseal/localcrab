@@ -133,6 +133,29 @@ def _message_text_nodes(tree):
     return out
 
 
+def _annotation_nodes(tree):
+    """타입 어노테이션 안의 노드 위치. 동작이 아니라 변이 대상에서 뺀다.
+
+    `from __future__ import annotations` 아래에서 어노테이션은 문자열로만 남아 런타임에
+    평가되지 않는다. 그래서 `Path | str` -> `Path & str` 같은 변이가 **전부 생존**하는데
+    (실측 2026-08-05: jsonl_io 8건 + schema 1건), 이건 미검사가 아니라 잡음이다.
+    잡음이 쌓이면 진짜 생존자가 묻힌다 — 산술 축을 새로 넣으면서 같이 딸려온 것이다.
+    """
+    out = set()
+    for n in ast.walk(tree):
+        holders = []
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            holders = [a.annotation for a in
+                       (*n.args.args, *n.args.kwonlyargs, *n.args.posonlyargs)
+                       if a.annotation] + ([n.returns] if n.returns else [])
+        elif isinstance(n, ast.AnnAssign) and n.annotation:
+            holders = [n.annotation]
+        for h in holders:
+            for sub in ast.walk(h):
+                out.add(_pos(sub))
+    return out
+
+
 def _docstring_nodes(tree):
     """docstring 은 동작이 아니다 — 변이 대상에서 뺀다(잡음 제거)."""
     out = set()
@@ -221,6 +244,7 @@ def _collect(tree):
     ops = []
     skip = _docstring_nodes(tree)
     msgs = _message_text_nodes(tree)
+    anns = _annotation_nodes(tree)
     funcs = _module_functions(tree)
 
     # 0-a. 최상단 상수 변이(모듈 + 클래스). 표 리터럴 안팎을 모두 포함한다.
@@ -323,7 +347,7 @@ def _collect(tree):
             # `stray[k] += 1` -> `-= 1` 로 바꾸면 진단이 "비구조 키 3종 **-9건**" 을
             # 출력하는데 82 건이 전부 통과했다. Counter 가 음수여도 truthy 라 차단은
             # 유지되지만 운영자가 보는 건수의 부호가 뒤집힌다.
-            if isinstance(node, (ast.AugAssign, ast.BinOp)):
+            if isinstance(node, (ast.AugAssign, ast.BinOp)) and _pos(node) not in anns:
                 t = type(node.op)
                 if t in ARITH_FLIP:
                     tag = "aug" if isinstance(node, ast.AugAssign) else "bin"

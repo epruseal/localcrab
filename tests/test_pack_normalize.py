@@ -975,6 +975,58 @@ JUDGMENT_MAPPINGS = {
 }
 
 
+class TestOverrideTakesPrecedenceOverRelMap:
+    """`LABEL_SPACE_OVERRIDE` 가 `REL_MAP` 보다 **먼저** 확정한다.
+
+    return 삭제 축을 새로 넣자 `resolve_edge` 의 비반전 override 분기
+    `return from_space, relation, to_space, False` 를 지워도 전부 통과했다
+    (2026-08-05). override 경로가 이 함수 수준에서 통째로 무검사였다는 뜻이다.
+
+    실측: 비반전 override 45 건 중 **38 건이 REL_MAP 폴백과 다른 relation** 을 낸다.
+    `SUPPORTS` 를 예로 들면 폴백은 `supports` 지만 lever->evidence 에서는
+    `evidenced_by`, policy->evidence 에서는 `cites` 다. return 이 사라지면 그 38 건이
+    조용히 폴백 값으로 실린다 — 라이브에서 근거 연결의 의미가 바뀐다.
+    """
+
+    @staticmethod
+    def _fallback(label):
+        return N.REL_MAP.get(label, label.lower())
+
+    def test_most_overrides_actually_differ_from_the_fallback(self):
+        """**비공허성 보증.** 이 수가 0 이면 아래 검사들은 폴백만으로도 통과한다."""
+        differing = [k for k, (rel, rev) in N.LABEL_SPACE_OVERRIDE.items()
+                     if not rev and self._fallback(k[0]) != rel]
+        assert len(differing) >= 38, (
+            f"폴백과 다른 비반전 override 가 {len(differing)}건뿐이다 — "
+            "override 경로를 실제로 태우는지 의심하라")
+
+    @pytest.mark.parametrize("key", sorted(
+        k for k, v in N.LABEL_SPACE_OVERRIDE.items() if not v[1]))
+    def test_non_reversing_override_wins(self, key):
+        label, frm, to = key
+        rel, _ = N.LABEL_SPACE_OVERRIDE[key]
+        assert N.resolve_edge(label, frm, to) == (frm, rel, to, False)
+
+    @pytest.mark.parametrize("key", sorted(
+        k for k, v in N.LABEL_SPACE_OVERRIDE.items() if v[1]))
+    def test_reversing_override_swaps_the_endpoints(self, key):
+        label, frm, to = key
+        rel, _ = N.LABEL_SPACE_OVERRIDE[key]
+        assert N.resolve_edge(label, frm, to) == (to, rel, frm, True)
+
+    def test_override_beats_rel_map_on_a_concrete_pair(self):
+        """표를 읽지 않고 값을 직접 적어 두는 대표 사례 하나.
+
+        SUPPORTS 는 REL_MAP 에 `supports` 로 있지만 lever->evidence 에서는
+        `evidenced_by` 여야 한다. 두 표의 우선순위가 뒤집히면 여기서 걸린다.
+        """
+        assert N.REL_MAP["SUPPORTS"] == "supports"
+        assert N.resolve_edge("SUPPORTS", "lever", "evidence") == \
+            ("lever", "evidenced_by", "evidence", False)
+        assert N.resolve_edge("SUPPORTS", "policy", "evidence") == \
+            ("policy", "cites", "evidence", False)
+
+
 def test_rel_map_partitions_into_identity_and_judgment():
     """분할이 전수인지. 키가 늘면 어느 한쪽에 등록해야 하므로 조용히 못 늘어난다."""
     identity = {k for k, v in N.REL_MAP.items() if k.lower() == v}

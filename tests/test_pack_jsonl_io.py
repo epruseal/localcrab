@@ -372,6 +372,82 @@ class TestTwoWritersHoldTheSameContract:
         assert jsonl_exists(str(q))
 
 
+class TestSizeTrackingSurvivesRollover:
+    """롤오버 **이후** 의 크기 추적. 두 writer 대칭으로 건다.
+
+    기존 경계 검사가 전부 **롤오버 1 회짜리**(2 줄)라 "롤오버 뒤 size 를 0 으로
+    리셋하는가"가 무검사로 남았다. `self.size = 0` 을 `= 1` 로 바꾸거나 그 문장을
+    지워도 통과했다(2026-08-05 스윕). 리셋이 틀어지면 **두 번째 shard 부터** 상한이
+    조금씩 밀려 shard 크기가 계약을 넘는다 — GitHub 100MB 하드리밋이 그 계약의 이유다.
+
+    n 줄이 정확히 shard 하나에 들어가는 limit 을 쓰고 3 개 shard 를 만들어, 두 번째
+    롤오버까지 태운다.
+    """
+
+    def test_appender_rolls_over_at_the_same_boundary_every_time(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        n = _line_bytes(rec(1))
+        limit = 2 * n                      # 정확히 두 줄이 한 shard
+        with ShardedAppender(q, limit=limit) as w:
+            for _ in range(6):
+                w.write(rec(1))
+        shards = shard_paths(q)
+        assert [s.name for s in shards] == [
+            "raw.00.jsonl", "raw.01.jsonl", "raw.02.jsonl"]
+        assert [s.stat().st_size for s in shards] == [limit, limit, limit], \
+            "리셋이 틀어지면 두 번째 shard 부터 크기가 밀린다"
+        assert len(list(iter_jsonl(q))) == 6
+
+    def test_rewrite_rolls_over_at_the_same_boundary_every_time(self, p):
+        n = _line_bytes(rec(1))
+        limit = 2 * n
+        out = write_jsonl_sharded(p, [rec(1)] * 6, limit=limit)
+        assert [f.name for f in out] == [
+            "chunks.00.jsonl", "chunks.01.jsonl", "chunks.02.jsonl"]
+        assert [f.stat().st_size for f in out] == [limit, limit, limit]
+        assert len(list(iter_jsonl(p))) == 6
+
+    def test_appender_size_starts_from_the_existing_file(self, tmp_path):
+        """이어쓰기는 기존 파일 크기에서 출발한다 — 0 에서 시작하면 상한을 넘긴다."""
+        q = tmp_path / "raw.jsonl"
+        n = _line_bytes(rec(1))
+        write_jsonl_sharded(q, [rec(1)], limit=10 * n)
+        with ShardedAppender(q, limit=2 * n) as w:
+            w.write(rec(1))
+            w.write(rec(1))              # 여기서 상한 초과 -> 롤오버
+        assert all(s.stat().st_size <= 2 * n for s in shard_paths(q))
+        assert len(list(iter_jsonl(q))) == 3
+
+
+class TestStaleShardCleanup:
+    """축소 rewrite 가 구 shard 를 지우는 경로. `unlink(missing_ok=True)` 가 계약이다.
+
+    base -> .00 rename 이 일어나면 `old` 에 담아 둔 base 는 **이미 사라진 뒤**라
+    `missing_ok=False` 면 rewrite 가 통째로 터진다. 기존 검사는 빈 디렉터리에서
+    시작해 `old` 가 비어 있었고, 그래서 unlink 가 한 번도 안 불렸다.
+    """
+
+    def test_rewrite_over_an_existing_base_that_gets_renamed(self, p):
+        n = _line_bytes(rec(1))
+        write_jsonl_sharded(p, [rec(1)], limit=10 * n)      # base 단일 파일 생성
+        assert p.exists()
+        out = write_jsonl_sharded(p, [rec(1)] * 4, limit=2 * n)  # 분할 -> base rename
+        assert out[0].name == "chunks.00.jsonl"
+        assert not p.exists()
+        assert len(list(iter_jsonl(p))) == 4
+
+    def test_shrinking_from_many_shards_removes_every_leftover(self, p):
+        n = _line_bytes(rec(1))
+        write_jsonl_sharded(p, [rec(1)] * 8, limit=2 * n)
+        before = shard_paths(p)
+        assert len(before) == 4
+        # 2 줄은 정확히 상한에 맞아 롤오버가 없다 -> base 단일 파일로 돌아온다.
+        write_jsonl_sharded(p, [rec(1)] * 2, limit=2 * n)
+        assert shard_paths(p) == [p]
+        assert not any(s.exists() for s in before), "구 shard 가 전부 지워져야 한다"
+        assert len(list(iter_jsonl(p))) == 2
+
+
 class TestAppenderClosesItsFile:
     """`__exit__` 이 `close()` 대신 `flush()` 를 불러도 22 건이 전부 통과했다.
 
