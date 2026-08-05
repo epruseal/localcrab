@@ -6,6 +6,7 @@
 """
 
 import pathlib
+import re
 from unittest import mock
 
 import pytest
@@ -204,6 +205,9 @@ class TestDiagnosticIdentifiesTheFailingRow:
         (validate_node, _node, "node-1", "label"),
         (validate_edge, _edge, "edge-1", "source_id"),
         (validate_chunk, _chunk, "chunk-1", "document_id"),
+        # id 와 빠진 필드 이름이 **같은** 경우. 아래 정규식이 위치를 고정하지 않으면
+        # 두 단언이 서로의 조각으로 충족돼 한쪽이 사라져도 통과한다(적대 검증 지적).
+        (validate_node, _node, "label", "label"),
     ])
     def test_message_carries_the_row_id(self, validator, builder, rid, missing):
         row = builder()
@@ -211,9 +215,12 @@ class TestDiagnosticIdentifiesTheFailingRow:
         del row[missing]
         with pytest.raises(PackSchemaError) as ei:
             validator(row)
-        assert repr(rid) in str(ei.value), \
-            f"실패 행을 식별할 수 없다: {ei.value}"
-        assert missing in str(ei.value), "어느 필드가 빠졌는지도 있어야 한다"
+        # **위치를 고정한다.** `x in msg` 두 개로 나누면 rid == missing 일 때 각 단언이
+        # 상대방 조각으로 충족된다 — 한쪽을 지워도 통과하는 구멍이 생긴다.
+        # "필수 필드 <빠진필드> 가 없다: <행id>" 순서를 통째로 요구한다.
+        want = rf"필수 필드 {re.escape(repr(missing))} 가 없다: {re.escape(repr(rid))}"
+        assert re.search(want, str(ei.value)), \
+            f"진단이 (빠진 필드, 실패 행 id) 를 그 순서로 담아야 한다: {ei.value}"
 
 
 class TestValidateNode:
