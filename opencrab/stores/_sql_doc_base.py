@@ -105,6 +105,15 @@ DOC_STORE_SCHEMA = SchemaSpec(
     ),
     indexes=(
         IndexSpec("idx_doc_nodes_updated", "doc_nodes", "updated_at"),
+        # list_nodes()'s ORDER BY updated_at DESC, space, node_id (#63 tie-
+        # breaker, codex P2) needs its own composite index in this exact
+        # column order + direction, or SQLite/PG fall back to a temp B-tree
+        # sort instead of walking the index — measured 3x slower at live
+        # scale (253k rows: 435ms indexed sort vs 1303ms temp-B-tree, see
+        # PR #100). idx_doc_nodes_updated (above) is kept: bm25_fingerprint's
+        # bare MAX(updated_at) and any other single-column updated_at lookup
+        # still use it fine.
+        IndexSpec("idx_doc_nodes_updated_tiebreak", "doc_nodes", "updated_at DESC, space, node_id"),
         IndexSpec("idx_audit_ts", "audit_log", "timestamp DESC"),
     ),
 )
