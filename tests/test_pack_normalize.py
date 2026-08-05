@@ -496,3 +496,122 @@ def test_missing_metadata_is_tolerated():
 def test_transform_chunk_meta_is_deterministic():
     row = {"metadata": {"char_start": 0}, "document_id": "d"}
     assert N.transform_chunk_meta("p", row) == N.transform_chunk_meta("p", row)
+
+
+# ── 무정규화 계약 ─────────────────────────────────────────────────────────────
+#
+# 아래는 전부 "이 계층은 값을 **있는 그대로** 옮긴다"는 계약이다. 조용한 정규화(공백 제거,
+# 길이 절단, 유니코드 NFC, 키 정렬, 대소문자 무시)는 하나같이 "개선처럼 보이는 변경"이라
+# 리뷰를 통과하기 쉬운데, 실데이터에는 NFD 라벨 149,286건 · 공백 민감 라벨 2,616건 ·
+# 255자 초과 라벨 86건이 있어 전부 라이브 표시·조회를 바꾼다(2026-08-04 적대 검증 실측).
+# node_id 와 label 은 조회 키라 한 글자만 달라져도 참조가 끊긴다.
+
+def test_label_is_passed_through_without_trimming():
+    row = _node(label="끝에 개행이 있다\n")
+    _s, _t, _i, props = N.transform_node("p", row)
+    assert props["label"] == "끝에 개행이 있다\n"
+    assert props["name"] == "끝에 개행이 있다\n"
+
+
+def test_label_is_not_truncated():
+    long_label = "가" * 300
+    _s, _t, _i, props = N.transform_node("p", _node(label=long_label))
+    assert props["label"] == long_label and len(props["label"]) == 300
+
+
+def test_label_unicode_form_is_preserved():
+    """NFD(자모 분리) 라벨을 NFC 로 합치면 조회 키가 바뀐다 — 실데이터 149,286건."""
+    nfd = "가".encode().decode()  # 기준
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", "가")
+    assert decomposed != nfd
+    _s, _t, _i, props = N.transform_node("p", _node(label=decomposed))
+    assert props["label"] == decomposed
+
+
+def test_empty_label_falls_back_to_node_id():
+    """`or` 다 — 빈 문자열도 폴백한다. `is None` 으로 바꾸면 빈 label 이 그대로 나간다."""
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(id="n1", label="", space="policy", node_type="Policy"))
+    assert props["name"] == "n1"
+
+
+def test_node_type_override_lookup_is_case_sensitive():
+    """대소문자 무시로 바꾸면 의도치 않은 타입이 remap 된다."""
+    src = next(k for k in NODE_TYPE_OVERRIDE if k != k.lower())
+    assert src.lower() not in NODE_TYPE_OVERRIDE
+    assert N.resolve_node_space_type("concept", src) == NODE_TYPE_OVERRIDE[src]
+    # 소문자 변형은 override 를 타지 않는다(미등록 타입 경로로 간다)
+    assert N.resolve_node_space_type("concept", src.lower()) != NODE_TYPE_OVERRIDE[src]
+
+
+def test_edge_label_lookup_does_not_strip_whitespace():
+    """공백을 떼면 " has_part " 가 HAS_PART 로 붙어 방향까지 뒤집힌다."""
+    a, rel, b, rev = N.resolve_edge(" has_part ", "resource", "concept")
+    assert (a, rel, b, rev) == ("resource", " has_part ", "concept", False)
+
+
+def test_edge_fallback_preserves_unicode_form():
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", "é")
+    _a, rel, _b, _rev = N.resolve_edge(decomposed, "concept", "concept")
+    assert rel == decomposed.lower()
+    assert unicodedata.normalize("NFC", rel) != rel
+
+
+def test_flatten_preserves_key_order():
+    assert list(N.flatten_props({"z": 1, "a": 2})) == ["z", "a"]
+
+
+def test_chroma_preserves_key_order():
+    assert list(N.chroma_safe_meta({"z": 1, "a": 2})) == ["z", "a"]
+
+
+def test_flatten_empty_dict_becomes_its_repr():
+    """빈 dict 는 `""` 가 아니라 `"{}"` 다 — None 과 구분되어야 한다."""
+    assert N.flatten_props({"d": {}})["d"] == "{}"
+    assert N.flatten_props({"n": None})["n"] == ""
+
+
+def test_flatten_keeps_empty_list_as_a_list():
+    """빈 리스트는 스칼라 리스트다(all() 이 참) — 문자열화하지 않는다."""
+    assert N.flatten_props({"l": []})["l"] == []
+
+
+def test_chunk_source_move_overwrites_existing_source_doc():
+    """pop 이라 항상 덮는다 — setdefault 로 바꾸면 원본 경로가 유실된다."""
+    meta = N.transform_chunk_meta(
+        "pack", {"metadata": {"source": "진짜경로.md", "source_doc": "낡은값"}})
+    assert meta["source_doc"] == "진짜경로.md"
+
+
+def test_blank_chunk_source_is_still_moved():
+    """조건은 키 존재다 — truthiness 로 바꾸면 빈 source 가 pack 이름에 조용히 덮인다."""
+    meta = N.transform_chunk_meta("pack", {"metadata": {"source": ""}})
+    assert meta["source_doc"] == "" and meta["source"] == "pack"
+
+
+def _dup_mapping(pairs):
+    """중복 키를 내는 Mapping. dict 서브클래스로 만들면 빈 dict 라 falsy 가 되어
+    `(d or {})` 에 먹히므로 비-dict 로 만든다."""
+    class DupItems:
+        def items(self):
+            return list(pairs)
+    return DupItems()
+
+
+def test_duplicate_keys_from_a_mapping_take_the_last_value():
+    """dict 입력으로는 관측 불가하지만 이 함수는 임의 Mapping 을 받는다.
+
+    `out[k] = v` 를 `elif k not in out` 로 바꾸면 first-wins 가 되어, 중복 항목을 내는
+    Mapping(정렬된 다중값, DB 커서 래퍼 등)에서 조용히 다른 값이 실린다.
+    현재 계약은 last-wins 이며 그것이 dict 의미론과 일치한다.
+    """
+    scalars = _dup_mapping([("k", "첫값"), ("k", "끝값")])
+    assert N.chroma_safe_meta(scalars)["k"] == "끝값"
+    # 비스칼라 분기도 같은 규칙이어야 한다 — 한쪽만 보면 다른 분기의 first-wins 변이가 산다
+    nonscalars = _dup_mapping([("k", {"a": 1}), ("k", {"b": 2})])
+    assert N.chroma_safe_meta(nonscalars)["k"] == "{'b': 2}"
+    # 스칼라 -> 비스칼라, 비스칼라 -> 스칼라 로 넘어가는 경우도 마지막이 이긴다
+    mixed = _dup_mapping([("k", "첫값"), ("k", {"b": 2})])
+    assert N.chroma_safe_meta(mixed)["k"] == "{'b': 2}"
