@@ -184,6 +184,38 @@ class TestValidateNodeProps:
         assert "'id'" in str(ei.value) and "'label'" in str(ei.value)
 
 
+class TestDiagnosticIdentifiesTheFailingRow:
+    """필수 필드 오류 메시지는 **어느 행이 실패했는지**를 말해야 한다.
+
+    세 검사의 메시지가 `{row.get('id')!r}` 로 실패 행의 id 를 붙인다. 그 `'id'` 를 빈
+    문자열로 바꾸는 변이가 세 자리 전부에서 살아남았다(2026-08-05 스윕).
+
+    처음엔 "예외 종류·발생이 같으니 표시 문구 전용 등가"로 판정했는데 **틀렸다.** id 가 없는
+    행만 입력으로 썼기 때문이다. id 가 **있고** 다른 필드가 빠진 행에서는 갈린다:
+
+        원본: 노드에 필수 필드 'label' 가 없다: 'node-1'
+        변이: 노드에 필수 필드 'label' 가 없다: None
+
+    운영자가 수만 행 중 어느 것이 문제인지 잃는다. **등가를 측정할 때도 입력이 그 변이가
+    건드리는 축을 갈라야 한다** — 이 실수를 등가 판정에서 세 번 반복했다(적대 검증 지적).
+    """
+
+    @pytest.mark.parametrize("validator,builder,rid,missing", [
+        (validate_node, _node, "node-1", "label"),
+        (validate_edge, _edge, "edge-1", "source_id"),
+        (validate_chunk, _chunk, "chunk-1", "document_id"),
+    ])
+    def test_message_carries_the_row_id(self, validator, builder, rid, missing):
+        row = builder()
+        row["id"] = rid
+        del row[missing]
+        with pytest.raises(PackSchemaError) as ei:
+            validator(row)
+        assert repr(rid) in str(ei.value), \
+            f"실패 행을 식별할 수 없다: {ei.value}"
+        assert missing in str(ei.value), "어느 필드가 빠졌는지도 있어야 한다"
+
+
 class TestValidateNode:
     def test_minimal_valid_node(self):
         validate_node(_node())
