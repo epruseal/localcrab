@@ -257,13 +257,20 @@ class _Bm25CacheWorker:
             build_epoch = self._epoch
             try:
                 ds = self._doc_store_getter()
-                nodes = ds.list_nodes(limit=_BM25_NODE_LIMIT)
-                # Whole-table fingerprint (#63), not just the (possibly
-                # capped) nodes we're about to index — otherwise this would
-                # never again match a whole-table probe once the corpus
-                # exceeds the cap, and every query would schedule a rebuild.
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up): a write
+                # landing between the two calls must make the recorded
+                # fingerprint OLDER than the nodes we index, not newer. Newer
+                # (the reversed order) would bake that write's effect into
+                # the nodes while stamping a fingerprint that already
+                # matches the post-write store state — the next probe would
+                # then agree "nothing changed" and the write is never
+                # reflected. Older is safe: the next probe sees a mismatch
+                # and schedules one extra (harmless) rebuild.
                 probe = getattr(ds, "bm25_fingerprint", None)
-                fp = probe(limit=_BM25_NODE_LIMIT) if probe is not None else compute_fingerprint(nodes)
+                fp = probe(limit=_BM25_NODE_LIMIT) if probe is not None else None
+                nodes = ds.list_nodes(limit=_BM25_NODE_LIMIT)
+                if fp is None:
+                    fp = compute_fingerprint(nodes)
                 cache = self.cache
                 if cache is not None and fp == cache.fingerprint:
                     self.dirty = False          # nothing actually changed
@@ -547,11 +554,15 @@ class HybridQuery:
 
             if self._bm25_cache is None:
                 # Cold start: nothing to serve yet, so build synchronously once.
-                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                # Whole-table fingerprint (#63) so later probes stay
-                # comparable; None (probe failed) falls back to
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up) — see the
+                # matching comment in _Bm25CacheWorker._rebuild_loop for why
+                # this order (not the reverse) is the safe one: a write
+                # landing in between must make the fingerprint stale relative
+                # to the nodes, never the other way round, or that write is
+                # never picked up. None (probe failed) falls back to
                 # compute_fingerprint(nodes) inside BM25Index.build().
                 fp = self._bm25_probe_fingerprint()
+                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
                 self._bm25_cache = BM25Index.build(nodes, fingerprint=fp)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False

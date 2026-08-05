@@ -167,6 +167,70 @@ def _seed_ordered(ds, count: int, space: str = "s1") -> None:
     ds._conn.commit()
 
 
+def test_t8_race_between_fingerprint_and_nodes_is_never_lost(tmp_path, monkeypatch) -> None:
+    """#63 follow-up (codex High): fingerprint must be fetched BEFORE nodes,
+    not after. Simulate a write landing in the gap between the two calls by
+    injecting it as a side effect of ``list_nodes`` — the call that runs
+    SECOND under the fix. With fingerprint-first:
+      - the race write lands inside the ``list_nodes`` call, so it IS
+        already in the index we just built;
+      - but the fingerprint we stamped was fetched BEFORE the write, so it's
+        stale relative to what we actually indexed;
+      - the next probe sees the true (post-write) state, diverges from that
+        stale stamp, and schedules one more (harmless, self-correcting)
+        rebuild.
+    The reverse order (nodes first, fingerprint second — the bug this test
+    guards against) would do the opposite: the write lands after nodes are
+    already snapshotted (so it's MISSING from the index) but before the
+    fingerprint is fetched (so the stamp already reflects the write). The
+    next probe would then agree with that stamp and never reschedule — the
+    write is lost forever."""
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.ontology import query as query_module
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    for i in range(5):
+        ds.upsert_node_doc("s1", "T", f"n{i}", {"name": "alpha"})
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 100)  # no cap pressure here
+
+    real_list_nodes = ds.list_nodes
+    injected = {"done": False}
+
+    def racy_list_nodes(*args, **kwargs):
+        # A write lands here: after the fingerprint probe already ran
+        # (call #1 in the fixed order), before list_nodes (call #2) returns.
+        if not injected["done"]:
+            injected["done"] = True
+            ds.upsert_node_doc("s1", "T", "race", {"name": "alpha"})
+        return real_list_nodes(*args, **kwargs)
+
+    ds.list_nodes = racy_list_nodes
+
+    hybrid = _hybrid(ds)
+    try:
+        hybrid._bm25_search("alpha", spaces=None, limit=25)  # cold build
+
+        indexed_ids = {h["node_id"] for h in hybrid._bm25_cache.search("alpha", limit=25)}
+        assert "race" in indexed_ids, "the race write must already be in the index"
+
+        live_fp = ds.bm25_fingerprint()
+        assert hybrid._bm25_cache.fingerprint != live_fp, (
+            "the stamped fingerprint must be the OLDER pre-write value, "
+            "not the post-write value — that's what schedules the "
+            "self-correcting follow-up rebuild instead of hiding the write"
+        )
+
+        # Next query: probe diverges from the stale stamp → one more
+        # rebuild → fingerprint converges. The write was never lost.
+        hybrid._bm25_search("alpha", spaces=None, limit=25)
+        assert _wait_until(lambda: hybrid._bm25_cache.fingerprint == ds.bm25_fingerprint())
+    finally:
+        hybrid.shutdown_bm25()
+
+
 def test_t8_no_rebuild_scheduled_when_over_cap_and_unchanged(tmp_path, monkeypatch) -> None:
     """Regression (#63 follow-up): the lead reproduced build-time capped
     fingerprint (10, ts) vs whole-table probe (20, ts) never comparing equal,
