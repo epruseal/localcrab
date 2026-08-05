@@ -52,15 +52,26 @@ def _build_type_schema(
     both.
 
     Legacy shape only ever stored flat field-name lists -- no per-field type,
-    so these extra fields get NO ``type`` (and no ``nullable``): inventing
-    "string" would be a guess, and grammar.validator.validate_node_properties
-    now actually enforces declared types (#48), so a wrong guess would reject
-    real data (e.g. a numeric field the user marked required). Omitting
-    ``type`` entirely, rather than declaring an unknown-to-the-validator
-    type name, is deliberate: the validator's type-check loop only runs when
+    so these extra fields get NO ``type``: inventing "string" would be a
+    guess, and grammar.validator.validate_node_properties now actually
+    enforces declared types (#48), so a wrong guess would reject real data
+    (e.g. a numeric field the user marked required). Omitting ``type``
+    entirely, rather than declaring an unknown-to-the-validator type name,
+    is deliberate: the validator's type-check loop only runs when
     ``spec.get("type")`` is not None, so an absent key skips the check
     silently (no per-node warning-log spam), while presence + required-ness
     are still enforced.
+
+    No property here ever gets a ``nullable`` key, manifest-defined or
+    extra. It is not read anywhere in this repo (validate_node_properties
+    only looks at ``required``/``default``/``enum``/``type`` -- confirmed by
+    reading the function; tracked as issue #106), and it duplicated
+    ``required`` (required -> non-nullable, optional -> nullable) instead of
+    being derived from it. That duplication is exactly what regressed when a
+    manifest-optional field got promoted to required by *extra_required*
+    below: the promotion flipped ``required`` but not the already-written
+    ``nullable``, producing a self-contradictory required-and-nullable
+    schema. One key can't disagree with itself.
     """
     type_specs = pack.get("type_specs", {}) or {}
     spec = type_specs.get(node_type, {}) or {}
@@ -71,9 +82,9 @@ def _build_type_schema(
 
     properties: dict[str, Any] = {}
     for field_name in required_fields:
-        properties[field_name] = {"type": "string", "required": True, "nullable": False}
+        properties[field_name] = {"type": "string", "required": True}
     for field_name in optional_fields:
-        properties[field_name] = {"type": "string", "required": False, "nullable": True}
+        properties[field_name] = {"type": "string", "required": False}
 
     for field_name in extra_required or []:
         if field_name in properties:
