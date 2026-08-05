@@ -364,6 +364,25 @@ class TestEv:
         assert pack.chunks[0]["metadata"]["char_end"] == 6
         assert pack.chunks[0]["text"] == "ab"
 
+    def test_contains_edge_is_an_exact_match_so_no_source_label(self, pack):
+        """`ev()` 가 거는 `contains` 는 **정확히 일치**하는 라벨이라 원본 표기를 남기지 않는다.
+
+        라벨 문자열을 빈 값으로 바꾸는 변이가 살아남았다(2026-08-05). 결과 라벨은 FIX 대표값이
+        `contains` 라 그대로 `contains` 지만, `rel != raw` 가 참이 되어 **모든 evidence 엣지에
+        `source_label: ''` 가 붙는다.** 기존 검사가 라벨만 봐서 못 잡았다.
+        추론으로 "등가"라고 판단했다가 측정에서 뒤집힌 사례다.
+        """
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        assert pack.edges[0]["label"] == "contains"
+        assert pack.edges[0]["properties"] == {}, "정확히 일치하면 source_label 을 남기지 않는다"
+
+    def test_ev_returns_the_evidence_id(self, pack):
+        """`return eid` 를 지워도 아무도 안 죽었다 — 호출자가 이 반환값으로 엣지를 건다."""
+        doc = pack.resource("d", "문서")
+        assert pack.ev("e1", doc, "라벨", "본문") == "e1"
+        assert pack.ev("e1", doc, "다시", "본문") == "e1", "중복 등록도 id 를 돌려준다"
+
     def test_reregistering_same_eid_is_a_silent_noop(self, pack):
         doc = pack.resource("d", "문서")
         pack.ev("e1", doc, "라벨", "a", node_props={"k": 1})
@@ -838,6 +857,118 @@ class TestDiagnosticsReportRealNumbers:
         pack.edge("co", "s", "owns2")
         pack.save()
         assert "grammar 드롭 엣지 2건" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("known", ["source", "target"])
+    def test_aggregation_skips_edges_with_one_unknown_space(self, pack, capsys, known):
+        """`if ss is None or tt is None: continue` — **한쪽만** 몰라도 건너뛴다.
+
+        `or` 를 `and` 로 바꾸거나 이 `if` 를 지우면 `_ALLOWED.get((ss, None))` 로 조회가 들어가
+        정상 엣지가 위반으로 집계된다. 기존 검사는 양끝을 다 알거나 다 모르는 경우만 써서
+        두 항을 구분하지 못했다(2026-08-05 스윕).
+        """
+        if known == "source":
+            pack.node("a", "A", "Concept", "concept")
+            pack.edge("a", "ghost", "related_to")
+        else:
+            pack.node("b", "B", "Evidence", "evidence")
+            pack.edge("ghost", "b", "related_to")
+        pack.validate()
+        out = capsys.readouterr().out
+        assert "grammar 위반" not in out, "한쪽 space 를 모르면 위반으로 세면 안 된다"
+
+    def test_keep_pair_label_is_not_counted_as_a_violation(self, pack, capsys):
+        """`ok = label in ALLOWED[...] or KEEP[...] == label` — **KEEP 경로**가 살아 있어야 한다.
+
+        `or` 를 `and` 로 바꾸면 KEEP 공간쌍(claim→evidence)의 정상 엣지가 전부 위반으로 잡힌다.
+        기존 검사에 KEEP 쌍 엣지가 없어서 그 항이 무검사였다.
+        """
+        from opencrab.pack.schema import ALLOWED, KEEP
+        assert ("claim", "evidence") in KEEP
+        pack.node("c", "C", "Claim", "claim")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("c", "e", "supports")
+        assert pack.edges[0]["label"] == KEEP[("claim", "evidence")]
+        assert pack.edges[0]["label"] not in ALLOWED.get(("claim", "evidence"), ()), \
+            "ALLOWED 에도 있으면 KEEP 항을 구분하지 못한다"
+        pack.validate()
+        assert "grammar 위반" not in capsys.readouterr().out
+
+    def test_edge_without_properties_key_does_not_crash_aggregation(self, pack, capsys):
+        """`e.get('properties', {})` 의 기본값이 없으면 `None.get(...)` 로 터진다.
+
+        생산자는 항상 `properties` 를 넣지만, 이 집계는 **외부에서 만들어진 엣지 목록**에도
+        돌 수 있어야 한다. 기본값을 지우는 변이가 살아남았다.
+        """
+        pack.node("r", "R", "Document", "resource")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("r", "e", "contains")
+        del pack.edges[0]["properties"]
+        pack.validate()
+        assert "grammar 위반" not in capsys.readouterr().out
+
+    def test_fix_count_ignores_source_label_equal_to_label(self, pack, capsys):
+        """`if src_label and src_label != label` — 같으면 치환이 아니므로 세지 않는다.
+
+        `and` 를 `or` 로 바꾸면 빈 문자열 `source_label` 이 치환으로 집계된다.
+        """
+        pack.node("r", "R", "Document", "resource")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("r", "e", "contains")
+        pack.edges[0]["properties"]["source_label"] = "contains"   # 같은 값
+        pack.validate()
+        assert "자동치환(FIX)" not in capsys.readouterr().out
+
+    def test_grammar_violation_blocks_in_strict_mode(self, pack, capsys):
+        """위반 리포트의 `if strict: errors.append(msg)` 를 지워도 아무도 안 죽었다.
+
+        기존 검사가 전부 비-strict 호출이라 **차단 여부**가 무검사였다. 위반은 경고 등급이
+        아니라 strict 에서 빌드를 막아야 한다.
+        """
+        pack.edge("a", "b", "related_to")              # space 미확정으로 검증 우회
+        pack.node("a", "A", "Concept", "concept")
+        pack.node("b", "B", "Evidence", "evidence")
+        pack.validate(strict=False)                    # 경고만
+        assert "grammar 위반" in capsys.readouterr().out
+        with pytest.raises(ValueError, match="grammar 위반"):
+            pack.validate(strict=True)
+
+    def test_dangling_blocks_only_in_strict_mode(self, pack, capsys):
+        """`if strict:` 를 지우면 dangling 이 항상 차단된다 — stray 와 달리 경고 등급이다."""
+        pack.edge("ghost-a", "ghost-b", "related_to")
+        pack.validate(strict=False)                    # 예외 없이 통과해야 한다
+        assert "dangling" in capsys.readouterr().out
+        with pytest.raises(ValueError, match="dangling"):
+            pack.validate(strict=True)
+
+    @pytest.mark.parametrize("report,setup", [
+        ("grammar 위반", "viol"),
+        ("자동치환(FIX)", "fixed"),
+        ("remap 함정", "hazard"),
+    ])
+    def test_every_detail_report_caps_at_eight(self, pack, capsys, report, setup):
+        """세 리포트 모두 상위 8건만 나열한다. 캡 3자리가 전부 무검사였다."""
+        if setup == "viol":
+            for i in range(9):
+                pack.edge(f"a{i}", f"b{i}", f"위반{i}")          # space 미확정으로 우회
+                pack.node(f"a{i}", "A", "Concept", "concept")
+                pack.node(f"b{i}", "B", "Evidence", "evidence")
+        elif setup == "fixed":
+            for i in range(9):
+                pack.node(f"a{i}", "A", "Concept", "concept")
+                pack.node(f"b{i}", "B", "Evidence", "evidence")
+                pack.edge(f"a{i}", f"b{i}", f"치환{i}")
+        else:
+            # hazard 키는 (선언 space, node_type, 로더 space) 라 **서로 다른 node_type** 9종이
+            # 필요하다. 같은 타입 9개는 1종으로 합쳐져 캡이 관측되지 않는다.
+            types = [nt for nt, v in NODE_TYPE_OVERRIDE.items() if v[0] != "evidence"][:9]
+            assert len(types) == 9
+            for i, nt in enumerate(types):
+                pack.node(f"n{i}", f"L{i}", nt, "evidence")
+        pack.validate()
+        out = capsys.readouterr().out
+        block = out.split(report)[1]
+        detail = [ln for ln in block.splitlines() if ln.startswith("      ")]
+        assert len(detail) == 8, f"{report} 상세가 {len(detail)}줄 — 상위 8건이어야 한다"
 
     def test_reports_list_actionable_detail_lines_not_just_totals(self, pack, capsys):
         """총계 밑의 **상세 줄**이 실제 작업 지시다 — 루프를 지워도 총계는 그대로다.

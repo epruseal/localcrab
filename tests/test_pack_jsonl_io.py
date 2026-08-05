@@ -419,6 +419,32 @@ class TestSizeTrackingSurvivesRollover:
         assert len(list(iter_jsonl(q))) == 3
 
 
+class TestOneByteBoundary:
+    """`if size > 0 and …` 의 **0** 경계. 두 writer 대칭.
+
+    `> 0` 을 `> 1` 로 바꾸면 **size 가 정확히 1일 때만** 판정이 갈린다. 그런 상태에 닿는
+    입력은 하나뿐이다 — 빈 문자열 레코드(`nbytes = 0 + 1 = 1`), 또는 개행 하나만 든 기존 파일.
+    기존 경계 검사가 전부 정상 크기 레코드를 써서 이 한 칸을 못 봤다(2026-08-05 스윕).
+
+    실측: 원본은 상한 초과를 감지해 분할하고, `> 1` 변이는 **분할하지 않는다.**
+    상한을 넘긴 파일이 조용히 하나로 남으면 GitHub 100MB 하드리밋에 그대로 걸린다.
+    """
+
+    def test_rewrite_rolls_over_after_a_one_byte_record(self, p):
+        out = write_jsonl_sharded(p, ["", "abc"], limit=2)
+        assert [f.name for f in out] == ["chunks.00.jsonl", "chunks.01.jsonl"], \
+            "size 가 정확히 1 이어도 상한 초과는 감지해야 한다"
+        assert list(iter_jsonl_lines(p)) == ["", "abc"]
+
+    def test_appender_rolls_over_from_a_one_byte_existing_file(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_text("\n", encoding="utf-8")           # 정확히 1바이트
+        with ShardedAppender(q, limit=2) as w:
+            w.write_line("abc")
+        assert [s.name for s in shard_paths(q)] == ["raw.00.jsonl", "raw.01.jsonl"]
+        assert list(iter_jsonl_lines(q)) == ["", "abc"]
+
+
 class TestStaleShardCleanup:
     """축소 rewrite 가 구 shard 를 지우는 경로. `unlink(missing_ok=True)` 가 계약이다.
 

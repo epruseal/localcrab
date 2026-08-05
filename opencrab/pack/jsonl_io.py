@@ -75,6 +75,9 @@ def logical_sha256(path: Path | str) -> str:
     h = hashlib.sha256()
     for p in shard_paths(path):
         with open(p, "rb") as f:
+            # 블록 크기는 **결과에 영향이 없다**(2026-08-05 측정: 4,000행 다중 shard 에서
+            # 1<<20 / 2<<20 / 1<<21 / 1<<3 전부 같은 sha). 스트리밍 해시라 청크 경계가
+            # 달라도 바이트 열이 같기 때문이다. 성능 상수일 뿐 계약이 아니다.
             for block in iter(lambda: f.read(1 << 20), b""):
                 h.update(block)
     return h.hexdigest()
@@ -119,6 +122,10 @@ class ShardedAppender:
         self._f = open(self.current, "a", encoding="utf-8")
 
     def _rollover(self):
+        # close() 를 지워도 결과는 같다(2026-08-05 측정: 20KB 버퍼 잔류 상태에서도 첫 shard
+        # 내용 동일). rename 이 inode 를 따라가고 `self._f` 재대입 시 옛 객체가 같은 inode 로
+        # flush 되기 때문이다. **그래도 명시적으로 닫는다** — 그 등가성은 CPython 의 참조계수
+        # 즉시 해제에 기대는 것이고, 다른 구현·다른 GC 타이밍에서는 성립하지 않는다.
         self._f.close()
         if self.current == self.logical:                     # base형 → .00 rename
             renamed = _shard_path(self.logical, 0)

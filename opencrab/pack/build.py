@@ -136,7 +136,16 @@ class Pack:
             elif (ss, tt) in _KEEP:
                 rel = _KEEP[(ss, tt)]                       # 로더가 reverse 처리 (claim→evidence)
             elif allowed:
+                # `or` 오른쪽(사전순 첫 원소)은 **현재 도달 불가**다 — FIX 가 ALLOWED 38 쌍을
+                # 전부 덮고 falsy 값도 없다(2026-08-05 표 대사). 그래도 남겨 둔다: FIX 에
+                # 구멍이 생기면 조용히 KeyError 로 죽는 대신 사전순 대표값으로 버틴다.
+                # 주의 — FIX 값과 사전순 첫 원소는 12/38 쌍에서 **다르고** 그중엔 의미가
+                # 정반대인 것도 있다(lever->outcome: raises vs lowers).
                 rel = _FIX.get((ss, tt)) or sorted(allowed)[0]
+            # 이 가드에서 **현재 실효인 것은 'resource' 뿐**이다(2026-08-05 표 대사:
+            # traceability x evidence 로 이 분기에 닿는 공간쌍이 0개다. claim->evidence 는
+            # KEEP 이 먼저 잡고, 나머지는 정방향 grammar 가 있다). 'evidence' 는 방어적
+            # 여분이며 grammar 가 바뀌면 실효가 된다 — 그래서 지우지 않는다.
             elif _ALLOWED.get((tt, ss)) and not (ss in _TRACE_SRC and tt in ('evidence', 'resource')):
                 src, tgt, ss, tt = tgt, src, tt, ss          # 공간쌍 없음 → 방향 반전(traceability는 정방향 유지)
                 rel = _FIX.get((ss, tt)) or sorted(_ALLOWED[(ss, tt)])[0]
