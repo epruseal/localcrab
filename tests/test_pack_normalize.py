@@ -615,3 +615,50 @@ def test_duplicate_keys_from_a_mapping_take_the_last_value():
     # 스칼라 -> 비스칼라, 비스칼라 -> 스칼라 로 넘어가는 경우도 마지막이 이긴다
     mixed = _dup_mapping([("k", "첫값"), ("k", {"b": 2})])
     assert N.chroma_safe_meta(mixed)["k"] == "{'b': 2}"
+
+
+# ── 타입·조건 경계 계약 ───────────────────────────────────────────────────────
+#
+# 아래는 "값의 타입과 조건 판정을 바꾸지 않는다"는 계약이다. 캐스팅과 조건 완화는
+# 국소적으로는 무해해 보이지만 라이브 스키마 검증·조회 키·중복 판정을 바꾼다.
+
+def test_original_type_is_recorded_only_when_it_changed():
+    """`if original_type != node_type` 을 항상 참으로 바꾸면 remap 되지 않은 노드에도
+    original_type 이 붙어 라이브 properties 가 통째로 달라진다."""
+    _s, t, _i, props = N.transform_node("p", _node(space="resource", node_type="Document"))
+    assert t == "Document" and "original_type" not in props
+
+
+def test_degree_value_is_not_cast():
+    """int() 캐스팅을 넣으면 문자열 degree 가 조용히 타입을 바꾸고, 캐스팅 불가값은 죽는다."""
+    _s, _t, _i, props = N.transform_node("p", _node(degree="7"))
+    assert props["degree"] == "7" and isinstance(props["degree"], str)
+
+
+def test_collection_completeness_score_default_is_a_float():
+    """int(1.0) 로 바꿔도 `== 1.0` 은 참이라 값 비교로는 안 잡힌다 — 타입까지 본다."""
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="claim", node_type="CollectionCompleteness"))
+    assert props["score"] == 1.0 and isinstance(props["score"], float)
+
+
+def test_node_id_type_is_preserved():
+    """str() 로 감싸면 정수 id 가 문자열이 되어 id_map 조회가 통째로 어긋난다."""
+    _s, _t, node_id, _p = N.transform_node("p", _node(id=12345))
+    assert node_id == 12345 and isinstance(node_id, int)
+
+
+@pytest.mark.parametrize("falsy", [None, [], "", 0])
+def test_non_dict_properties_are_treated_as_empty(falsy):
+    """`or {}` 다 — `get(..., {})` 로 바꾸면 falsy 비-dict 가 그대로 흘러 .items() 에서 죽거나
+    엉뚱하게 해석된다."""
+    _s, _t, _i, props = N.transform_node("p", _node(properties=falsy))
+    assert props["pack_id"] == "p"      # 예외 없이 정상 변환된다
+    assert "0" not in props
+
+
+def test_row_document_id_beats_metadata():
+    """행의 document_id 가 권위다 — 삽입 순서를 바꾸면 metadata 의 낡은 값이 이긴다."""
+    meta = N.transform_chunk_meta(
+        "p", {"metadata": {"document_id": "메타쪽"}, "document_id": "행쪽"})
+    assert meta["document_id"] == "행쪽"
