@@ -172,6 +172,14 @@ def ontology_query(
             include_unpackaged=include_unpackaged,
         )
         results = outcome.results
+        # This is a store write (billing_events INSERT), but ontology_query stays
+        # writes=False: billing.on_query -> BillingHooks.emit uses UNIQUE(event_id)
+        # + INSERT OR IGNORE / ON CONFLICT DO NOTHING (opencrab/billing/hooks.py),
+        # so it's idempotent append-only and doesn't need write.lock's cross-process
+        # serialisation. Forcing writes=True here would serialise every query
+        # (high-frequency, read-shaped) behind the write mutex for no correctness
+        # gain. Decided in #65's review against #68 (E-4 lock ownership map); see
+        # `writes` field docstring in _registry.py#tool for the general rule.
         ctx["billing"].on_query(tenant_id, subject_id, question)
         result_dicts = [r.to_dict() for r in results]
         if include_canonical_ids:
@@ -226,6 +234,10 @@ def ontology_query(
         },
     },
     order=7,
+    # #65: analyse() persists a row via ImpactEngine -> save_impact() (SQL
+    # INSERT into impact_records), so this "analysis" tool must be lock-covered
+    # like any other write despite its read-shaped name.
+    writes=True,
 )
 def ontology_impact(
     node_id: str,
@@ -277,6 +289,9 @@ def ontology_impact(
         },
     },
     order=8,
+    # #65: lever_simulate() persists a row via ImpactEngine -> save_simulation()
+    # (SQL INSERT into lever_simulations); same rationale as ontology_impact above.
+    writes=True,
 )
 def ontology_lever_simulate(
     lever_id: str,
