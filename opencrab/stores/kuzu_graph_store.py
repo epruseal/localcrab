@@ -283,6 +283,28 @@ class KuzuGraphStore:
         pack_set: set[str] | None,
         include_unpackaged: bool,
     ) -> list[dict[str, Any]]:
+        # ISSUE #62 (NOT fixed here — left as a clear note, not a half-fix):
+        # this method has the same LIMIT-before-pack-filter defect as the SQL
+        # backends had (fixed in _sql_graph_base.py's _fetch_edges_for_node /
+        # pg_graph_store.py's _batch_frontier_edges via a shared _pack_where
+        # SQL-predicate generator) — `LIMIT {limit}` below runs before
+        # `_collect_1hop` applies `_node_passes`/`_edge_passes`, so a hub
+        # whose first `limit` edges are all out-of-pack can starve in-pack
+        # neighbours that exist further down the scan.
+        #
+        # Pushing the filter into this Cypher WHERE the way neo4j_store.py
+        # does is NOT a safe drop-in here: OntologyNode.props / OntologyEdge
+        # .properties are declared STRING (a serialized JSON blob — see the
+        # CREATE TABLE DDL above and `_parse()`), not per-field typed
+        # columns, so there is no `m.pack_id`/`e.pack_id` to put in a WHERE
+        # clause. Doing this safely would need either a real `pack_id`
+        # column populated at write time (schema + backfill, out of this
+        # fix's scope) or Kuzu's JSON extension (`INSTALL json; LOAD json;`)
+        # to extract from the blob in Cypher — an added runtime dependency
+        # this fix should not silently introduce. Left unfixed; a real
+        # `pack_id` column is the safe follow-up, using this method's SQL
+        # counterpart as the template for what the WHERE clause should say.
+        #
         # direction="both" is issued as two *directed* passes rather than one
         # undirected MATCH: the undirected form cannot say which side of the
         # edge the anchor was on, and find_neighbors' from_id/to_id contract

@@ -83,6 +83,7 @@ def _ingest_into_pack(
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import store_write_failures
 
     ctx = _get_context()
     added_nodes = 0
@@ -96,13 +97,24 @@ def _ingest_into_pack(
         try:
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
-            ctx["builder"].add_node(
+            node_result = ctx["builder"].add_node(
                 space=_clean_str(item.get("space", "")),
                 node_type=_clean_str(item.get("node_type", "")),
                 node_id=_clean_str(item.get("node_id", "")),
                 properties=props,
             )
-            added_nodes += 1
+            # add_node never raises for a per-store failure (see builder.py's
+            # module docstring) — it reports "error: ..." inside the returned
+            # stores map instead, so a bare try/except here would count a
+            # failed write as a success. Inspect the map explicitly.
+            node_stores = node_result.get("stores") if isinstance(node_result, dict) else None
+            failures = store_write_failures(node_stores or {})
+            if failures:
+                node_errors.append(
+                    f"{item.get('node_id', '?')}: " + "; ".join(failures)
+                )
+            else:
+                added_nodes += 1
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {exc}")
 
@@ -110,7 +122,7 @@ def _ingest_into_pack(
         try:
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
-            ctx["builder"].add_edge(
+            edge_result = ctx["builder"].add_edge(
                 from_space=_clean_str(item.get("from_space", "")),
                 from_id=_clean_str(item.get("from_id", "")),
                 relation=_clean_str(item.get("relation", "")),
@@ -118,7 +130,18 @@ def _ingest_into_pack(
                 to_id=_clean_str(item.get("to_id", "")),
                 properties=props,
             )
-            added_edges += 1
+            # Same as above: a missing edge endpoint is reported as
+            # stores["graph"] = "no match (missing node: ...)" without
+            # raising, so it must be read out of the stores map too.
+            edge_stores = edge_result.get("stores") if isinstance(edge_result, dict) else None
+            failures = store_write_failures(edge_stores or {})
+            if failures:
+                edge_errors.append(
+                    f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: "
+                    + "; ".join(failures)
+                )
+            else:
+                added_edges += 1
         except Exception as exc:
             edge_errors.append(
                 f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
@@ -145,15 +168,30 @@ def _ingest_into_pack(
                     node_props["title"] = meta["title"]
                 if meta.get("source"):
                     node_props["source"] = meta["source"]
-                ctx["builder"].add_node(
+                evidence_result = ctx["builder"].add_node(
                     space="evidence",
                     node_type="TextUnit",
                     node_id=source_id,
                     properties=node_props,
                 )
-                evidence_node = source_id
-                added_nodes += 1
-                stores["evidence_node"] = "ok"
+                # Same store-map inspection as the node/edge loops above —
+                # a per-store failure here would otherwise still count as a
+                # successful evidence node.
+                evidence_stores = (
+                    evidence_result.get("stores")
+                    if isinstance(evidence_result, dict)
+                    else None
+                )
+                failures = store_write_failures(evidence_stores or {})
+                if failures:
+                    node_errors.append(
+                        f"{source_id} (evidence/TextUnit): " + "; ".join(failures)
+                    )
+                    stores["evidence_node"] = "; ".join(failures)
+                else:
+                    evidence_node = source_id
+                    added_nodes += 1
+                    stores["evidence_node"] = "ok"
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
                 stores["evidence_node"] = f"error: {exc}"
@@ -179,7 +217,20 @@ def _ingest_into_pack(
 
     ctx["hybrid"].invalidate_bm25_cache()
 
+    # Partial failure = any node/edge write error, or any leftover "error:"/
+    # "no match" status sitting in the legacy text-path `stores` dict (chromadb/
+    # mongodb). pack_create/pack_ingest both build their response as
+    # {"status": "ok", ..., **ingest_result} — since ingest_result is spread
+    # last, this "status" wins over their literal "ok" and callers get an
+    # accurate top-level signal instead of an unconditional "ok".
+    status = (
+        "partial"
+        if node_errors or edge_errors or store_write_failures(stores)
+        else "ok"
+    )
+
     return {
+        "status": status,
         "pack_id": pack_id,
         "added_nodes": added_nodes,
         "added_edges": added_edges,
@@ -446,6 +497,7 @@ def pack_create(
     (text_as_node=True, default) or embedded as a vector blob only (False).
     """
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
+    from opencrab.ontology.builder import store_write_failures
 
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
@@ -465,7 +517,7 @@ def pack_create(
     ctx = _get_context()
     anchor_node_id = f"dataset:{slug}"
     try:
-        ctx["builder"].add_node(
+        anchor_result = ctx["builder"].add_node(
             space="resource",
             node_type="Dataset",
             node_id=anchor_node_id,
@@ -478,6 +530,24 @@ def pack_create(
         )
     except Exception as exc:
         return {"error": f"anchor node failed: {exc}"}
+
+    # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
+    # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
+    # inside the returned stores map. store_write_failures already applies
+    # the one place-to-judge rule (graph is system of record, docs/sql/vector
+    # are optional) — reuse that split here instead of re-deciding it:
+    #   - graph itself failed -> the pack doesn't exist in the graph, hard
+    #     error (matches the "anchor missing = no pack" contract below).
+    #   - only optional stores failed -> the pack DOES exist (graph write
+    #     went through), so report success and surface which stores lagged,
+    #     same as _ingest_into_pack's node/edge loops do via node_errors.
+    anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
+    anchor_failures = store_write_failures(anchor_stores or {})
+    anchor_graph_failures = [f for f in anchor_failures if f.startswith("graph:")]
+    if anchor_graph_failures:
+        return {"error": "anchor node failed: " + "; ".join(anchor_graph_failures)}
+    # Anything left here is optional-store-only (graph already ruled out above).
+    anchor_optional_failures = anchor_failures
 
     source_id: str | None = None
     if text:
@@ -496,13 +566,21 @@ def pack_create(
         text_as_node=text_as_node,
     )
 
-    return {
+    result = {
         "status": "ok",
         "pack_id": slug,
         "title": _clean_str(title),
         "anchor_node": anchor_node_id,
         **ingest_result,
     }
+    if anchor_optional_failures:
+        # ingest_result's own "status" (spread above) may already be "ok" —
+        # force "partial" and surface the anchor's optional-store failures
+        # the same way node_errors/edge_errors do, so callers see the pack
+        # was created but not every store has the anchor.
+        result["status"] = "partial"
+        result["anchor_errors"] = anchor_optional_failures
+    return result
 
 
 @tool(

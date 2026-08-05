@@ -178,11 +178,14 @@ class TestToolDispatch:
         from opencrab.ontology.query import QueryResult
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            from opencrab.ontology.query import QueryOutcome
+
             mock_result = QueryResult(
                 source="vector", node_id="n1", score=0.9, text="Test text", metadata={}
             )
             hybrid = MagicMock()
-            hybrid.query.return_value = [mock_result]
+            # #51: query() returns QueryOutcome(results, warnings), not a bare list.
+            hybrid.query.return_value = QueryOutcome(results=[mock_result], warnings=[])
             mock_ctx.return_value = {
                 "builder": MagicMock(), "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": hybrid, "mongo": MagicMock(),

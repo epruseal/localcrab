@@ -153,6 +153,11 @@ class OntologyBuilder:
                         "pack_id": str(props.get("pack_id") or ""),
                         "source": str(props.get("pack") or props.get("pack_id") or ""),
                         "node_id": node_id,
+                        # #51 루트 픽스: space where-필터(query.py._build_chroma_where)가
+                        # 매치할 키가 벡터 메타데이터에 없어 항상 0건이었다. 신규 벡터부터
+                        # 기록한다 — 백필 전 기존 벡터는 여전히 없으므로 query.py 쪽에서
+                        # 과도기 경고를 노출한다(sqlite_vec_store.py 주석 참조).
+                        "space": space,
                     }
                     self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
                     output["stores"]["vector"] = "ok"
@@ -328,6 +333,38 @@ class OntologyBuilder:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def store_write_failures(stores: dict[str, Any]) -> list[str]:
+    """Return ``"{store}: {status}"`` entries for statuses that mean the
+    write did NOT actually happen: ``"error: ..."`` (store threw) or
+    ``"no match"`` / ``"no match (missing node: ...)"`` (edge endpoint
+    missing, or the graph upsert matched nothing). ``"unavailable"`` and
+    ``"skipped (...)"`` on the optional stores (docs/sql/vector) are NOT
+    failures — those are expected when a store isn't configured or was
+    deliberately skipped after a sibling failure.
+
+    ``graph`` is different: it is the system of record, so ``"unavailable"``
+    there means the write landed nowhere that counts, even if optional
+    stores went through. That combination is rare in a real deployment
+    (graph is always configured), but the contract of this function is
+    "did the write actually happen", so an unavailable graph store must
+    count as a failure too.
+
+    Callers that only check ``add_node``/``add_edge`` for a raised exception
+    (see the module docstring: individual store failures are swallowed and
+    reported here, not raised) must call this on the returned ``stores`` map
+    to know whether the write actually succeeded everywhere it matters.
+    """
+    failures = []
+    for store, status in stores.items():
+        if not isinstance(status, str):
+            continue
+        if status.startswith("error:") or status.startswith("no match"):
+            failures.append(f"{store}: {status}")
+        elif store == "graph" and status == "unavailable":
+            failures.append(f"{store}: {status}")
+    return failures
 
 
 def _space_to_default_type(space_id: str) -> str:

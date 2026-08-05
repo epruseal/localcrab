@@ -83,6 +83,37 @@ class QueryResult:
         }
 
 
+@dataclass
+class QueryOutcome:
+    """Return value of :meth:`HybridQuery.query`.
+
+    #51: warnings must travel in the return value, not instance state —
+    ``HybridQuery`` is a process-lifetime singleton (see ``_get_context()``)
+    served from a threadpool (sync MCP/HTTP handlers), so an instance
+    attribute like the old ``self._last_warnings`` is shared and clobbered
+    across concurrent requests (same defect class as ``PackSelection``
+    in pack_selection.py was built to avoid — a local list returned per call).
+
+    Delegates ``__iter__``/``__len__``/``__getitem__`` to ``results`` so
+    existing call sites that treat the return value as ``list[QueryResult]``
+    (``for r in results``, ``len(results)``, ``results[0]``) keep working
+    unchanged; only code that wants the transitional warnings needs to know
+    about this type.
+    """
+
+    results: list[QueryResult]
+    warnings: list[str] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(self, idx):
+        return self.results[idx]
+
+
 @dataclass(frozen=True)
 class _QueryProfile:
     """Adaptive retrieval settings for the current question."""
@@ -256,13 +287,26 @@ class _Bm25CacheWorker:
                 break
             build_epoch = self._epoch
             try:
-                nodes = self._doc_store_getter().list_nodes(limit=_BM25_NODE_LIMIT)
-                fp = compute_fingerprint(nodes)
+                ds = self._doc_store_getter()
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up): a write
+                # landing between the two calls must make the recorded
+                # fingerprint OLDER than the nodes we index, not newer. Newer
+                # (the reversed order) would bake that write's effect into
+                # the nodes while stamping a fingerprint that already
+                # matches the post-write store state — the next probe would
+                # then agree "nothing changed" and the write is never
+                # reflected. Older is safe: the next probe sees a mismatch
+                # and schedules one extra (harmless) rebuild.
+                probe = getattr(ds, "bm25_fingerprint", None)
+                fp = probe(limit=_BM25_NODE_LIMIT) if probe is not None else None
+                nodes = ds.list_nodes(limit=_BM25_NODE_LIMIT)
+                if fp is None:
+                    fp = compute_fingerprint(nodes)
                 cache = self.cache
                 if cache is not None and fp == cache.fingerprint:
                     self.dirty = False          # nothing actually changed
                 else:
-                    new_index = BM25Index.build(nodes)
+                    new_index = BM25Index.build(nodes, fingerprint=fp)
                     self.cache = new_index        # atomic ref swap (GIL)
                     self.cache_size = len(nodes)
                     self.dirty = False
@@ -368,7 +412,7 @@ class HybridQuery:
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
         use_fts: bool = True,
-    ) -> list[QueryResult]:
+    ) -> QueryOutcome:
         """
         Execute a hybrid query: vector + BM25 + graph expansion, then rerank.
 
@@ -392,10 +436,28 @@ class HybridQuery:
 
         Returns
         -------
-        list[QueryResult] sorted by descending score.
+        QueryOutcome — ``.results`` (list[QueryResult], descending score) plus
+        ``.warnings`` (list[str]). Acts like the old bare list[QueryResult] for
+        iteration/len/indexing (see QueryOutcome docstring), so existing callers
+        that only care about results are unaffected.
         """
         result_lists: list[list[dict[str, Any]]] = []
         profile = _profile_for_query(question, limit, graph_depth)
+
+        # #51: 벡터 store 는 "space" 키가 없는 메타데이터를 매치 실패로 처리한다(무시가
+        # 아님 — Chroma missing-key 시맨틱의 의도적 복제, sqlite_vec_store.py 참조).
+        # builder.py 는 이 픽스 이후 신규 벡터에만 space 를 기록하므로, 백필 전까지는
+        # 기존 벡터가 space 필터에서 조용히 빠진다. "0건"과 "필터 미적용"을 호출자가
+        # 구분할 수 있도록 지역 변수에 담아 반환값(QueryOutcome)으로 전달한다 — 인스턴스
+        # 상태(self.*)는 프로세스 수명 싱글턴 + 스레드풀 실행 환경에서 요청 간 경합이
+        # 생기므로 쓰지 않는다(BM25/FTS 레그는 영향 없음).
+        warnings: list[str] = []
+        if spaces:
+            warnings.append(
+                "spaces filter: vectors ingested before this fix carry no 'space' "
+                "metadata and are excluded from the vector search leg until a "
+                "backfill runs (see issue #51); BM25/FTS legs are unaffected."
+            )
 
         # --- Stage 1: Vector similarity search ---
         vector_hits = self._vector_search(
@@ -475,7 +537,7 @@ class HybridQuery:
                 metadata=metadata,
                 graph_context=item.get("graph_context"),
             ))
-        return results
+        return QueryOutcome(results=results, warnings=warnings)
 
     def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
         """Cheap ``(count, max_updated_at)`` probe for stale-cache detection.
@@ -486,9 +548,24 @@ class HybridQuery:
         legacy stores without the capability. Returns ``None`` on error so the
         caller simply skips the staleness check and serves the current index.
 
-        Must stay byte-for-byte equal to the fingerprint that
-        ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))`` records, including the
-        ``_BM25_NODE_LIMIT`` cap, so callers compare apples to apples.
+        NOTE (#63): ``doc_store.bm25_fingerprint()`` reports the WHOLE table,
+        deliberately ignoring ``_BM25_NODE_LIMIT`` — a capped fingerprint pins
+        at exactly the cap once the corpus exceeds it, so count-based change
+        detection would never fire again regardless of row ordering.
+
+        Must stay byte-for-byte comparable with the fingerprint recorded on
+        ``self._bm25_cache`` — both the cold-start build (see ``_bm25_search``)
+        and the background rebuild (``_Bm25CacheWorker._rebuild_loop``) stamp
+        the index with *this same* whole-table probe result via
+        ``BM25Index.build(nodes, fingerprint=...)``, not
+        ``compute_fingerprint(nodes)`` on the (possibly capped) indexed nodes.
+        That's what keeps this comparison meaningful once the corpus exceeds
+        the cap: both sides measure "what does the store look like", not "what
+        did we index" vs "what does the store look like" (which would never
+        agree again and would schedule a rebuild on every query). Legacy
+        stores without ``bm25_fingerprint()`` fall back to the capped
+        ``compute_fingerprint`` below on both sides consistently, so they
+        don't have this problem in the first place.
         """
         ds = self._doc_store
         if ds is None:
@@ -526,8 +603,16 @@ class HybridQuery:
 
             if self._bm25_cache is None:
                 # Cold start: nothing to serve yet, so build synchronously once.
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up) — see the
+                # matching comment in _Bm25CacheWorker._rebuild_loop for why
+                # this order (not the reverse) is the safe one: a write
+                # landing in between must make the fingerprint stale relative
+                # to the nodes, never the other way round, or that write is
+                # never picked up. None (probe failed) falls back to
+                # compute_fingerprint(nodes) inside BM25Index.build().
+                fp = self._bm25_probe_fingerprint()
                 nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                self._bm25_cache = BM25Index.build(nodes)
+                self._bm25_cache = BM25Index.build(nodes, fingerprint=fp)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False
                 logger.debug("BM25 index cold-built (%d nodes)", self._bm25_cache_size)
