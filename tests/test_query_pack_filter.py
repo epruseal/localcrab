@@ -247,16 +247,14 @@ def test_51_builder_writes_space_into_vector_metadata() -> None:
     """Root fix: OntologyBuilder.add_node must write 'space' into vector metadata
     so the where-clause SqliteVecStore/_build_chroma_where builds actually has a
     key to match against, for nodes ingested from here on."""
-    from unittest.mock import MagicMock as _MM
-
     from opencrab.ontology.builder import OntologyBuilder
 
-    vec = _MM()
+    vec = MagicMock()
     vec.available = True
-    vec.upsert_texts = _MM()
-    graph = _MM(available=False)
-    docs = _MM(available=False)
-    sql = _MM(available=False)
+    vec.upsert_texts = MagicMock()
+    graph = MagicMock(available=False)
+    docs = MagicMock(available=False)
+    sql = MagicMock(available=False)
     builder = OntologyBuilder(graph, docs, sql, vec=vec)
 
     builder.add_node("resource", "Document", "n1", {"title": "hello world", "pack_id": "pack-a"})
