@@ -32,7 +32,12 @@ _TYPE_TEMPLATE_HEADER = """\
 """
 
 
-def _build_type_schema(pack: dict[str, Any], node_type: str) -> dict[str, Any]:
+def _build_type_schema(
+    pack: dict[str, Any],
+    node_type: str,
+    extra_required: list[str] | None = None,
+    extra_optional: list[str] | None = None,
+) -> dict[str, Any]:
     """Build a validator-compatible schema dict for *node_type* from *pack*.
 
     Uses ``type_specs`` in the pack manifest (per-type space/required/optional)
@@ -40,13 +45,30 @@ def _build_type_schema(pack: dict[str, Any], node_type: str) -> dict[str, Any]:
     name/description/status shape otherwise. Output mirrors the hand-written
     schemas in schemas/types/ (type/version/space/properties) so
     grammar.validator.validate_node_properties actually enforces it.
+
+    *extra_required*/*extra_optional* let a legacy-stub migration carry over
+    field names the manifest doesn't define -- e.g. a field a user added by
+    hand to a previously-installed stub. Required wins if a name appears in
+    both. Legacy shape only ever stored flat field-name lists (no per-field
+    type/nullable/enum), so folding a name into ``properties`` here uses the
+    exact same {type: string, nullable: ...} convention already applied to
+    every manifest-defined field below -- no extra judgment call needed.
     """
     type_specs = pack.get("type_specs", {}) or {}
     spec = type_specs.get(node_type, {}) or {}
     default_space = (pack.get("spaces") or ["concept"])[0]
     space = spec.get("space", default_space)
-    required_fields = spec.get("required") or ["name"]
-    optional_fields = spec.get("optional") or ["description", "status"]
+    required_fields = list(spec.get("required") or ["name"])
+    optional_fields = list(spec.get("optional") or ["description", "status"])
+
+    for field_name in extra_required or []:
+        if field_name not in required_fields:
+            required_fields.append(field_name)
+        if field_name in optional_fields:
+            optional_fields.remove(field_name)
+    for field_name in extra_optional or []:
+        if field_name not in required_fields and field_name not in optional_fields:
+            optional_fields.append(field_name)
 
     properties: dict[str, Any] = {}
     for field_name in required_fields:
@@ -139,9 +161,12 @@ def install_pack(name: str) -> dict[str, Any]:
     shape made validation a permanent no-op. A legacy-shape file WITHOUT
     that header is left untouched and only warned about, since it could be
     hand-written (the ``pack:`` field alone is not proof install_pack wrote
-    it -- a user can type that too). Migrating drops any old required/
-    optional values that the pack manifest doesn't also define; that loss
-    is reported in ``discarded_constraints`` and logged.
+    it -- a user can type that too). A generation-header stub can also have
+    been hand-edited *after* install (a natural way to add a constraint) --
+    migrating never drops a required/optional field the old file had, even
+    if the pack manifest doesn't define it: any such extra field is carried
+    over into the new ``properties`` and reported in
+    ``preserved_extra_fields``, decided before anything is written to disk.
 
     Returns a result dict with created/migrated/skipped counts.
     """
@@ -156,7 +181,7 @@ def install_pack(name: str) -> dict[str, Any]:
     created = []
     migrated = []
     skipped = []
-    discarded_constraints: dict[str, dict[str, list[str]]] = {}
+    preserved_extra_fields: dict[str, dict[str, list[str]]] = {}
 
     for node_type in pack.get("types", []):
         path = _TYPES_DIR / f"{node_type}.yaml"
@@ -165,8 +190,8 @@ def install_pack(name: str) -> dict[str, Any]:
             pack_version=pack.get("version", "1.0.0"),
         )
         if path.exists():
-            existing_content = path.read_text(encoding="utf-8")
             try:
+                existing_content = path.read_text(encoding="utf-8")
                 existing = yaml.safe_load(existing_content)
             except Exception as exc:
                 logger.warning("Pack '%s': failed to read existing schema for %s: %s", name, node_type, exc)
@@ -185,18 +210,32 @@ def install_pack(name: str) -> dict[str, Any]:
                 )
                 skipped.append(node_type)
                 continue
+
+            # Decide what would be lost BEFORE writing anything: a field a
+            # user added to this stub's required/optional lists by hand,
+            # after install, that the current pack manifest doesn't define.
             old_required = existing.get("required") or []
             old_optional = existing.get("optional") or []
-            schema = _build_type_schema(pack, node_type)
+            manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
+            manifest_required = manifest_spec.get("required") or ["name"]
+            manifest_optional = manifest_spec.get("optional") or ["description", "status"]
+            extra_required = [f for f in old_required if f not in manifest_required]
+            extra_optional = [
+                f for f in old_optional if f not in manifest_optional and f not in extra_required
+            ]
+
+            schema = _build_type_schema(
+                pack, node_type, extra_required=extra_required, extra_optional=extra_optional
+            )
             content = header + yaml.safe_dump(schema, sort_keys=False, allow_unicode=True)
             path.write_text(content, encoding="utf-8")
             migrated.append(node_type)
-            if old_required or old_optional:
-                discarded_constraints[node_type] = {"required": old_required, "optional": old_optional}
-                logger.warning(
-                    "Pack '%s': migrated %s, discarding legacy required=%r optional=%r "
-                    "(field list is now defined by the pack manifest's type_specs instead)",
-                    name, node_type, old_required, old_optional,
+            if extra_required or extra_optional:
+                preserved_extra_fields[node_type] = {"required": extra_required, "optional": extra_optional}
+                logger.info(
+                    "Pack '%s': migrated %s, carried over user-added field(s) not in the "
+                    "pack manifest -- required=%r optional=%r",
+                    name, node_type, extra_required, extra_optional,
                 )
             else:
                 logger.info("Pack '%s': migrated legacy-shape schema for %s", name, node_type)
@@ -221,7 +260,7 @@ def install_pack(name: str) -> dict[str, Any]:
         "created": created,
         "migrated": migrated,
         "skipped": skipped,
-        "discarded_constraints": discarded_constraints,
+        "preserved_extra_fields": preserved_extra_fields,
         "total_types": len(pack.get("types", [])),
     }
 

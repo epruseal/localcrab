@@ -163,19 +163,23 @@ def test_install_pack_preserves_hand_written_file_that_fakes_pack_field(tmp_pack
 
     assert result["migrated"] == []
     assert result["skipped"] == ["Widget"]
-    assert result["discarded_constraints"] == {}
+    assert result["preserved_extra_fields"] == {}
 
     data = yaml.safe_load((types_dir / "Widget.yaml").read_text(encoding="utf-8"))
     assert data == handwritten  # required=["name", "sku"] survives untouched
     assert any("NOT be auto-migrated" in rec.message for rec in caplog.records)
 
 
-def test_install_pack_reports_discarded_constraints_on_migration(tmp_pack_env, caplog):
-    """When a genuine (marker-carrying) legacy stub is migrated, any old
-    required/optional values not silently absorbed into the new manifest-
-    derived properties must show up in the return value and the log --
-    a silent loss is exactly what the original issue's stale-artifact bug
-    already caused once.
+def test_install_pack_preserves_user_added_field_on_migration(tmp_pack_env, caplog):
+    """PR #104 codex review (P1): a generation-header stub can still have
+    been hand-edited *after* install -- adding a constraint to a previously
+    installed stub is a natural usage pattern. If the field the user added
+    (`legacy_only_field`) isn't in the current pack manifest's type_specs,
+    migration must carry it into the new `properties` rather than drop it
+    -- overwriting a stub that still carries the generation header is not
+    licence to discard content the header-check alone can't prove is
+    machine-only. Silently dropping it would recreate the exact class of
+    bug this issue exists to fix (constraint disappears on reinstall).
     """
     types_dir = tmp_pack_env
     legacy = {
@@ -189,14 +193,61 @@ def test_install_pack_reports_discarded_constraints_on_migration(tmp_pack_env, c
         encoding="utf-8",
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         result = pack_registry.install_pack("testpack")
 
     assert result["migrated"] == ["Widget"]
-    assert result["discarded_constraints"] == {
-        "Widget": {"required": ["name", "legacy_only_field"], "optional": ["description"]}
+    assert result["preserved_extra_fields"] == {
+        "Widget": {"required": ["legacy_only_field"], "optional": []}
     }
-    assert any("discarding legacy required" in rec.message for rec in caplog.records)
+    assert any("carried over user-added field" in rec.message for rec in caplog.records)
+
+    data = yaml.safe_load((types_dir / "Widget.yaml").read_text(encoding="utf-8"))
+    assert "properties" in data
+    assert data["properties"]["legacy_only_field"]["required"] is True
+    assert data["properties"]["name"]["required"] is True
+    assert data["properties"]["description"]["required"] is False
+
+    # The preserved field is actually enforced now, not just present in the file.
+    schema_loader.load_type_schema.cache_clear()
+    missing = validate_node_properties("Widget", {"name": "Foo", "description": "x"})
+    assert missing.valid is False
+    assert "legacy_only_field" in missing.error
+
+
+def test_install_pack_continues_past_unreadable_existing_file(tmp_path, monkeypatch):
+    """PR #104 codex review (P2): `path.read_text()` for an existing file used
+    to sit outside the try/except that only wrapped `yaml.safe_load`, so a
+    file with invalid UTF-8 (or any other read error) raised out of the loop
+    and aborted the whole pack install -- every other type in the pack was
+    left uninstalled too. One bad file must only skip that one type.
+    """
+    packs_dir = tmp_path / "packs"
+    types_dir = tmp_path / "types"
+    packs_dir.mkdir()
+    types_dir.mkdir()
+
+    manifest = {
+        "name": "twotype",
+        "version": "1.0.0",
+        "types": ["Widget", "Gadget"],
+        "spaces": ["concept"],
+        "type_specs": {
+            "Widget": {"space": "concept", "required": ["name"], "optional": []},
+            "Gadget": {"space": "concept", "required": ["name"], "optional": []},
+        },
+    }
+    (packs_dir / "twotype.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    monkeypatch.setattr(pack_registry, "_PACKS_DIR", packs_dir)
+    monkeypatch.setattr(pack_registry, "_TYPES_DIR", types_dir)
+
+    # Invalid UTF-8 byte sequence -- read_text(encoding="utf-8") raises.
+    (types_dir / "Widget.yaml").write_bytes(b"\xff\xfe not valid utf-8")
+
+    result = pack_registry.install_pack("twotype")
+    assert result["skipped"] == ["Widget"]
+    assert result["created"] == ["Gadget"]
+    assert (types_dir / "Gadget.yaml").exists()
 
 
 def test_install_pack_skips_non_dict_yaml_without_crashing(tmp_pack_env):
