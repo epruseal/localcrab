@@ -20,6 +20,33 @@ _SPACE_NODE_TYPES: dict[str, set[str]] = {
     space_id: set(spec["node_types"]) for space_id, spec in SPACES.items()
 }
 
+# Property "type" names -> Python type(s), sourced from the actual values used
+# across opencrab/schemas/types/*.yaml ("string", "int", "float" — no others
+# exist today). "float" also accepts plain ints (5 is a valid float). bool is
+# a subclass of int in Python, so it is excluded explicitly below rather than
+# relying on isinstance() alone.
+_PROPERTY_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "int": int,
+    "float": (int, float),
+}
+
+
+def _value_matches_type(value: Any, type_name: str) -> bool:
+    """True if *value* satisfies declared *type_name*, else False.
+
+    A *type_name* absent from ``_PROPERTY_TYPE_MAP`` (i.e. unknown to this
+    validator) always matches — failing closed on an unrecognised type would
+    break ingestion for any schema using it, so unknown types are left
+    unenforced rather than rejected.
+    """
+    py_type = _PROPERTY_TYPE_MAP.get(type_name)
+    if py_type is None:
+        return True
+    if isinstance(value, bool) and py_type is not bool:
+        return False
+    return isinstance(value, py_type)
+
 # Map (from_space, to_space) -> set[relation]
 _EDGE_RELATION_MAP: dict[tuple[str, str], set[str]] = {}
 for _edge in META_EDGES:
@@ -235,6 +262,21 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
             if allowed is not None and value is not None and value not in allowed:
                 errors.append(
                     f"Field '{field}' must be one of {allowed}, got '{value}'."
+                )
+
+    # Type check
+    for field, value in properties.items():
+        if field in schema_props:
+            spec = schema_props[field]
+            declared_type = spec.get("type")
+            if (
+                declared_type is not None
+                and value is not None
+                and not _value_matches_type(value, declared_type)
+            ):
+                errors.append(
+                    f"Field '{field}' must be of type '{declared_type}', "
+                    f"got {type(value).__name__} ({value!r})."
                 )
 
     if errors:
