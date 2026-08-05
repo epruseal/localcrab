@@ -167,24 +167,27 @@ def _seed_ordered(ds, count: int, space: str = "s1") -> None:
     ds._conn.commit()
 
 
-def test_t8_race_between_fingerprint_and_nodes_is_never_lost(tmp_path, monkeypatch) -> None:
-    """#63 follow-up (codex High): fingerprint must be fetched BEFORE nodes,
-    not after. Simulate a write landing in the gap between the two calls by
-    injecting it as a side effect of ``list_nodes`` — the call that runs
-    SECOND under the fix. With fingerprint-first:
-      - the race write lands inside the ``list_nodes`` call, so it IS
-        already in the index we just built;
-      - but the fingerprint we stamped was fetched BEFORE the write, so it's
-        stale relative to what we actually indexed;
-      - the next probe sees the true (post-write) state, diverges from that
-        stale stamp, and schedules one more (harmless, self-correcting)
-        rebuild.
-    The reverse order (nodes first, fingerprint second — the bug this test
-    guards against) would do the opposite: the write lands after nodes are
-    already snapshotted (so it's MISSING from the index) but before the
-    fingerprint is fetched (so the stamp already reflects the write). The
-    next probe would then agree with that stamp and never reschedule — the
-    write is lost forever."""
+def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
+    """#63 follow-up (codex High): pins the CALL ORDER — the fingerprint
+    probe must run before ``list_nodes``, not after.
+
+    Why the order matters: if ``list_nodes`` ran first and a write landed
+    right after it (before the fingerprint probe), the fingerprint would be
+    stamped from the POST-write store state while the indexed nodes are the
+    STALE pre-write snapshot. The next probe would then agree with that
+    already-current stamp and never reschedule a rebuild — the write would
+    be lost forever. Fingerprint-first flips the risk: any write in the gap
+    makes the stamped fingerprint OLDER than what got indexed, so the next
+    probe disagrees and schedules one extra (harmless) rebuild instead.
+
+    Caveat: this asserts the order of the two calls (via a write injected as
+    a ``list_nodes`` side effect, which by construction still lands before
+    the real snapshot). It does NOT reproduce genuine concurrent
+    interleaving between two threads/processes — that would need a hook
+    inside the store itself, which is more machinery than this regression
+    guard is worth. Reversing the order below makes this test fail, which is
+    the property it actually protects.
+    """
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
     from opencrab.ontology import query as query_module
 
@@ -224,7 +227,7 @@ def test_t8_race_between_fingerprint_and_nodes_is_never_lost(tmp_path, monkeypat
         )
 
         # Next query: probe diverges from the stale stamp → one more
-        # rebuild → fingerprint converges. The write was never lost.
+        # (harmless) rebuild → fingerprint converges.
         hybrid._bm25_search("alpha", spaces=None, limit=25)
         assert _wait_until(lambda: hybrid._bm25_cache.fingerprint == ds.bm25_fingerprint())
     finally:
