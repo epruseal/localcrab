@@ -117,6 +117,10 @@ class _SqliteConnMixin:
         가능한 동작은 그대로이고, 그 경로에서도 rollback이 실행되도록 보장만 넓힌다
         — "예외를 삼킨다"는 없이 불변식만 강화하는 변경이라 폭넓은 예외 포착의
         일반적 위험(에러 은폐)이 적용되지 않는다.
+
+        rollback() 자체가 실패할 가능성(디스크 오류 등)은 별개로 대비한다: 그 경우도
+        try/except로 감싸 로그만 남기고 원래 예외를 그대로 재던진다 — rollback 실패로
+        원래 예외가 가려지면 호출자는 배치가 왜 실패했는지 영영 알 수 없게 된다.
         """
         with self._lock:
             conn = self._conn
@@ -124,7 +128,13 @@ class _SqliteConnMixin:
                 yield conn
                 conn.commit()
             except BaseException:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except BaseException as rollback_exc:
+                    logger.error(
+                        "%s._tx: rollback failed (original exception still raised): %s",
+                        type(self).__name__, rollback_exc,
+                    )
                 raise
 
     def close(self) -> None:
