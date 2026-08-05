@@ -111,13 +111,19 @@ class _SqliteConnMixin:
         자동 롤백이 없다). 그 상태로 놔두면 같은 스레드의 다음 무관한 쓰기가 호출하는
         commit()에 앞서 실패한 배치의 부분 실행분까지 묻어 들어간다. 배치 쓰기 헬퍼는
         모두 이 컨텍스트 매니저를 거쳐야 그 틈이 막힌다.
+
+        ``BaseException``까지 잡는다(``Exception``이 아니라): KeyboardInterrupt나
+        SystemExit이 배치 도중 끼어들어도 항상 재던지므로(swallow하지 않음) 관찰
+        가능한 동작은 그대로이고, 그 경로에서도 rollback이 실행되도록 보장만 넓힌다
+        — "예외를 삼킨다"는 없이 불변식만 강화하는 변경이라 폭넓은 예외 포착의
+        일반적 위험(에러 은폐)이 적용되지 않는다.
         """
         with self._lock:
             conn = self._conn
             try:
                 yield conn
                 conn.commit()
-            except Exception:
+            except BaseException:
                 conn.rollback()
                 raise
 

@@ -221,22 +221,46 @@ class _FTSFailProxy:
     else to the real connection — including commit()/rollback(), so the
     real connection's transaction state is what gets asserted on."""
 
-    def __init__(self, real: sqlite3.Connection) -> None:
+    def __init__(self, real: sqlite3.Connection, fail_marker: str = "INSERT INTO doc_sources_fts") -> None:
         self._real = real
+        self._fail_marker = fail_marker
+
+    def _check(self, sql: str) -> None:
+        if self._fail_marker in sql:
+            raise sqlite3.OperationalError("forced failure: " + self._fail_marker)
 
     def execute(self, sql, params=None):
-        if "INSERT INTO doc_sources_fts" in sql:
-            raise sqlite3.OperationalError("forced FTS insert failure")
+        self._check(sql)
         return self._real.execute(sql) if params is None else self._real.execute(sql, params)
 
     def executemany(self, sql, params_list):
         return self._real.executemany(sql, params_list)
+
+    def cursor(self):
+        return _FTSFailCursor(self._real.cursor(), self)
 
     def commit(self):
         return self._real.commit()
 
     def rollback(self):
         return self._real.rollback()
+
+
+class _FTSFailCursor:
+    """Wraps a real sqlite3.Cursor so ``_init_db``'s ``conn.cursor()`` +
+    ``cur.execute(...)`` FTS bootstrap path is covered by the same
+    fail_marker check as ``_FTSFailProxy.execute``."""
+
+    def __init__(self, real_cursor: sqlite3.Cursor, proxy: "_FTSFailProxy") -> None:
+        self._real = real_cursor
+        self._proxy = proxy
+
+    def execute(self, sql, params=None):
+        self._proxy._check(sql)
+        return self._real.execute(sql) if params is None else self._real.execute(sql, params)
+
+    def fetchone(self):
+        return self._real.fetchone()
 
 
 class TestUpsertSourceTransaction:
@@ -273,6 +297,55 @@ class TestUpsertSourceTransaction:
         store.upsert_source("src2", "second", {})
         assert store.get_source("src1") is None
         assert store.get_source("src2") is not None
+
+
+class TestFtsBootstrapRollback:
+    """Issue #79 adversarial-verification follow-up: _init_db's FTS5
+    bootstrap (CREATE VIRTUAL TABLE + one-time backfill INSERT) commits
+    unconditionally on success, but unlike the core DDL block it does NOT
+    make the store unavailable on failure (_fts_ok just goes False) — so the
+    store keeps accepting writes afterward on the same thread connection.
+
+    NOTE on what actually rolls back: CREATE VIRTUAL TABLE is DDL — Python's
+    sqlite3 module does not open an implicit transaction ahead of DDL (only
+    ahead of DML), so it autocommits immediately regardless of _tx() and
+    stays created (harmless: IF NOT EXISTS makes re-running it a no-op). The
+    real risk _tx() closes is the backfill INSERT (DML): before this fix, a
+    mid-INSERT failure left that statement's implicit transaction open with
+    no commit/rollback, and the NEXT successful write's commit() on the same
+    connection would confirm it. _tx()'s except-clause rollback() now closes
+    that transaction unconditionally on any failure in the block."""
+
+    def test_backfill_failure_leaves_no_dangling_transaction(self, store):
+        # Simulate reopening a legacy DB: doc_sources has a row but the FTS
+        # shadow table doesn't exist yet, so the next _init_db() call takes
+        # the one-time backfill branch (n_fts == 0 and n_src > 0).
+        store._conn.execute("DROP TABLE doc_sources_fts")
+        store._conn.commit()
+        store._conn.execute(
+            "INSERT INTO doc_sources (source_id, text, metadata, ingested_at) "
+            "VALUES ('legacy', 'legacy text', '{}', '2020-01-01')"
+        )
+        store._conn.commit()
+
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(
+            real_conn, fail_marker="INSERT INTO doc_sources_fts(source_id, text)"
+        )
+        try:
+            store._init_db()  # re-run bootstrap; the backfill INSERT fails
+        finally:
+            store._local.conn = real_conn
+
+        assert store._fts_ok is False
+        # _tx()'s rollback() ran — no transaction left dangling on the real
+        # connection for a later write's commit() to sweep up.
+        assert real_conn.in_transaction is False
+
+        # a normal unrelated write on the same thread still commits cleanly
+        # and only itself — nothing from the failed backfill is smuggled in.
+        store.upsert_node_doc("s", "T", "n1", {})
+        assert store.get_node_doc("s", "n1") is not None
 
 
 # ---------------------------------------------------------------------------
