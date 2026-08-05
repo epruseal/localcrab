@@ -460,30 +460,27 @@ class HybridQuery:
                 "doc_nodes.space, a real column builder.add_node has always "
                 "populated)."
             )
-            # #52 follow-up (codex hostile review): doc_sources (the FTS/
-            # keyword_search leg's table) has NO space column — space is read
-            # from the JSON `metadata` blob (see LocalSQLDocStore.keyword_search).
-            # Unlike vectors, NO current production writer of doc_sources
-            # populates a "space" key there: opencrab/mcp/tools/pack.py's
-            # legacy ingestion path (text_as_node=False, the only path that
-            # calls upsert_source at all) has no `space` in scope to write —
-            # its function signature carries no space parameter at all. The
-            # grammar-compliant text_as_node=True path never touches
-            # doc_sources in the first place (it embeds via builder.add_node
-            # instead, explicitly skipping upsert_source to avoid duplicate
-            # writes). So today a spaces-filtered FTS query strictly and
-            # correctly excludes every doc_sources row (none carry a space),
-            # not a subset — this is NOT a backfill-then-fixed situation like
-            # #51's vectors; it needs a real caller-side change (an API
-            # surface question outside this fix's file ownership: pack.py is
-            # owned elsewhere) before any doc_sources content can ever match
-            # a spaces filter. Warn loudly rather than let "0 results" look
-            # like "nothing matched the query".
+            # #52 follow-up (codex hostile review, round 2): doc_sources (the
+            # FTS/keyword_search leg's table) has NO space column — space is
+            # read from the JSON `metadata` blob (see
+            # LocalSQLDocStore.keyword_search). Writers DO exist and are
+            # tagged as of this fix: opencrab/mcp/tools/pack.py's legacy
+            # ingestion path (text_as_node=False) now defaults
+            # meta.setdefault("space", "evidence"), and apps/api/main.py's
+            # ingest_text endpoint already passes the caller's arbitrary
+            # metadata straight through to upsert_source, so a caller who
+            # sets "space" there is honored too. Same class of gap as #51's
+            # vectors, not worse: only ROWS WRITTEN BEFORE THIS FIX carry no
+            # 'space' key and are excluded from a spaces-filtered FTS query
+            # until backfilled; newly-ingested rows are tagged and match
+            # normally. Warn about that stale-row gap rather than let a
+            # caller mistake "0 results (untagged legacy row)" for "nothing
+            # matched the query".
             warnings.append(
-                "spaces filter: the FTS/keyword leg (doc_sources) has no writer "
-                "that tags 'space' in metadata today, so it returns zero results "
-                "whenever spaces is set — this is a known gap (issue #52 "
-                "follow-up), not a partial/backfillable one like the vector leg."
+                "spaces filter: doc_sources rows written before this fix carry "
+                "no 'space' metadata and are excluded from the FTS/keyword leg "
+                "until a backfill runs (see issue #52); rows ingested since "
+                "this fix are tagged and match normally."
             )
 
         # --- Stage 1: Vector similarity search ---
