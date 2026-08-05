@@ -81,13 +81,22 @@ def test_bool_rejected_for_int_and_float(tmp_schema_env, type_name):
     assert "value" in result.error
 
 
-def test_unknown_declared_type_does_not_block_ingestion(tmp_schema_env):
+def test_unknown_declared_type_does_not_block_ingestion_but_warns(tmp_schema_env, caplog):
     """A declared type this validator doesn't recognise must fail open,
     not closed -- otherwise any schema using a new/unmapped type name
-    would break ingestion entirely."""
+    would break ingestion entirely. But it must not fail *silently*:
+    a warning is the signal that the declared constraint is a no-op,
+    so whoever declares `type: list` next notices instead of believing
+    they added a check that does nothing (this is the exact shape of
+    issue #48)."""
     _write_schema(tmp_schema_env, "Thing", "timestamp")
-    result = validate_node_properties("Thing", {"value": "2026-08-05T00:00:00Z"})
+    with caplog.at_level("WARNING", logger="opencrab.grammar.validator"):
+        result = validate_node_properties("Thing", {"value": "2026-08-05T00:00:00Z"})
     assert result.valid is True
+    assert any(
+        "timestamp" in rec.message and "not validated" in rec.message
+        for rec in caplog.records
+    )
 
 
 def test_none_value_skips_type_check_when_nullable(tmp_schema_env):

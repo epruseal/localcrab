@@ -7,10 +7,13 @@ source of truth for what constitutes a valid ontology operation.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from opencrab.grammar.manifest import META_EDGES, SPACES
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal lookup tables (built once at import time)
@@ -42,6 +45,11 @@ def _value_matches_type(value: Any, type_name: str) -> bool:
     """
     py_type = _PROPERTY_TYPE_MAP.get(type_name)
     if py_type is None:
+        logger.warning(
+            "Property type '%s' is not validated -- add it to "
+            "_PROPERTY_TYPE_MAP or remove the declaration.",
+            type_name,
+        )
         return True
     if isinstance(value, bool) and py_type is not bool:
         return False
