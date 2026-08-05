@@ -131,6 +131,8 @@ class ShardedAppender:
             renamed = _shard_path(self.logical, 0)
             self.current.rename(renamed)
             self.current = renamed
+        # maxsplit=1 이 계약이다. 논리 이름에 점이 있으면(chunks.v1.jsonl) 분할 stem 이
+        # `chunks.v1.03` 이 되고 rsplit(".", 2)[1] 은 'v1' 을 집어 int() 에서 터진다.
         idx = int(self.current.stem.rsplit(".", 1)[1]) + 1
         self.current = _shard_path(self.logical, idx)
         self._f = open(self.current, "a", encoding="utf-8")

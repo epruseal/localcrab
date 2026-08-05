@@ -445,6 +445,39 @@ class TestOneByteBoundary:
         assert list(iter_jsonl_lines(q)) == ["", "abc"]
 
 
+class TestDottedLogicalNames:
+    """논리 파일명에 점이 있어도 shard 인덱스를 정확히 집는다.
+
+    `int(stem.rsplit(".", 1)[1])` 의 **maxsplit 1** 이 계약이다. 처음엔 "shard stem 의 점은
+    항상 1개"라고 측정해 등가로 판정했는데 **틀렸다** — `chunks.jsonl` 한 종류만 봤다.
+    논리 이름에 점이 있으면 분할 stem 은 `chunks.v1.03` 이 되고, `rsplit(".", 2)[1]` 은
+    `'v1'` 을 집어 `int()` 에서 터진다(적대 검증 실증, 2026-08-05).
+
+    측정할 때도 입력이 분기를 구분해야 한다는 것의 실례다.
+    """
+
+    @pytest.mark.parametrize("name", ["chunks.v1.jsonl", "nodes.2026-08.jsonl"])
+    def test_rollover_reads_the_index_not_a_name_segment(self, tmp_path, name):
+        q = tmp_path / name
+        n = _line_bytes(rec(1))
+        with ShardedAppender(q, limit=2 * n - 1) as w:
+            for _ in range(4):
+                w.write(rec(1))
+        stem = Path(name).stem
+        assert [s.name for s in shard_paths(q)] == [
+            f"{stem}.{i:02d}.jsonl" for i in range(4)]
+        assert len(list(iter_jsonl(q))) == 4
+
+    @pytest.mark.parametrize("name", ["chunks.v1.jsonl", "nodes.2026-08.jsonl"])
+    def test_rewrite_rollover_handles_dotted_names(self, tmp_path, name):
+        q = tmp_path / name
+        n = _line_bytes(rec(1))
+        out = write_jsonl_sharded(q, [rec(1)] * 4, limit=2 * n - 1)
+        stem = Path(name).stem
+        assert [f.name for f in out] == [f"{stem}.{i:02d}.jsonl" for i in range(4)]
+        assert len(list(iter_jsonl(q))) == 4
+
+
 class TestStaleShardCleanup:
     """축소 rewrite 가 구 shard 를 지우는 경로. `unlink(missing_ok=True)` 가 계약이다.
 

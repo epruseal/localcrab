@@ -865,7 +865,15 @@ class TestDiagnosticsReportRealNumbers:
         `or` 를 `and` 로 바꾸거나 이 `if` 를 지우면 `_ALLOWED.get((ss, None))` 로 조회가 들어가
         정상 엣지가 위반으로 집계된다. 기존 검사는 양끝을 다 알거나 다 모르는 경우만 써서
         두 항을 구분하지 못했다(2026-08-05 스윕).
+
+        **비공허성 보증**: 같은 실행에 "반드시 위반으로 잡혀야 하는" 엣지를 하나 섞는다.
+        그게 없으면 집계 루프를 통째로 건너뛰는 변이도 통과한다(적대 검증 실증, 2026-08-05).
         """
+        # (1) 반드시 잡혀야 하는 것 — 양끝을 다 아는 위반 엣지
+        pack.edge("k1", "k2", "말도안되는라벨")
+        pack.node("k1", "K1", "Concept", "concept")
+        pack.node("k2", "K2", "Evidence", "evidence")
+        # (2) 잡히면 안 되는 것 — 한쪽만 아는 엣지
         if known == "source":
             pack.node("a", "A", "Concept", "concept")
             pack.edge("a", "ghost", "related_to")
@@ -874,22 +882,27 @@ class TestDiagnosticsReportRealNumbers:
             pack.edge("ghost", "b", "related_to")
         pack.validate()
         out = capsys.readouterr().out
-        assert "grammar 위반" not in out, "한쪽 space 를 모르면 위반으로 세면 안 된다"
+        assert "grammar 위반 엣지 1건" in out, \
+            "집계가 아예 안 돌면 이 검사는 공허하다 — 위반 1건은 반드시 잡혀야 한다"
+        assert "related_to" not in out, "한쪽 space 를 모르는 엣지를 위반으로 세면 안 된다"
 
     def test_keep_pair_label_is_not_counted_as_a_violation(self, pack, capsys):
         """`ok = label in ALLOWED[...] or KEEP[...] == label` — **KEEP 경로**가 살아 있어야 한다.
 
         `or` 를 `and` 로 바꾸면 KEEP 공간쌍(claim→evidence)의 정상 엣지가 전부 위반으로 잡힌다.
-        기존 검사에 KEEP 쌍 엣지가 없어서 그 항이 무검사였다.
+
+        **기대값을 표에서 읽지 않는다.** 처음엔 `KEEP[("claim","evidence")]` 로 단언했는데,
+        그러면 표 자체를 `WRONG_LABEL` 로 바꿔도 기대가 같이 움직여 통과한다(적대 검증 실증,
+        2026-08-05). 검증 대상을 런타임에 읽어 기대값을 만들면 그 대상의 변경을 못 잡는다.
         """
         from opencrab.pack.schema import ALLOWED, KEEP
-        assert ("claim", "evidence") in KEEP
+        assert KEEP[("claim", "evidence")] == "EVIDENCED_BY", "KEEP 값이 바뀌었다"
+        assert "EVIDENCED_BY" not in ALLOWED.get(("claim", "evidence"), ()), \
+            "ALLOWED 에도 있으면 KEEP 항을 구분하지 못한다"
         pack.node("c", "C", "Claim", "claim")
         pack.node("e", "E", "Evidence", "evidence")
         pack.edge("c", "e", "supports")
-        assert pack.edges[0]["label"] == KEEP[("claim", "evidence")]
-        assert pack.edges[0]["label"] not in ALLOWED.get(("claim", "evidence"), ()), \
-            "ALLOWED 에도 있으면 KEEP 항을 구분하지 못한다"
+        assert pack.edges[0]["label"] == "EVIDENCED_BY"
         pack.validate()
         assert "grammar 위반" not in capsys.readouterr().out
 
@@ -897,14 +910,23 @@ class TestDiagnosticsReportRealNumbers:
         """`e.get('properties', {})` 의 기본값이 없으면 `None.get(...)` 로 터진다.
 
         생산자는 항상 `properties` 를 넣지만, 이 집계는 **외부에서 만들어진 엣지 목록**에도
-        돌 수 있어야 한다. 기본값을 지우는 변이가 살아남았다.
+        돌 수 있어야 한다.
+
+        **비공허성 보증**: `properties` 를 지운 엣지 옆에 FIX 치환 엣지를 하나 둔다. 그러면
+        "터지지 않았다"뿐 아니라 **집계가 실제로 끝까지 돌았다**는 것까지 단언한다.
+        그게 없으면 `src_label = None` 로 고정하는 변이도 통과한다(적대 검증 실증).
         """
         pack.node("r", "R", "Document", "resource")
         pack.node("e", "E", "Evidence", "evidence")
         pack.edge("r", "e", "contains")
-        del pack.edges[0]["properties"]
+        del pack.edges[0]["properties"]                 # properties 키 자체가 없는 엣지
+        pack.node("a", "A", "Concept", "concept")
+        pack.edge("a", "e", "정합불가라벨")               # FIX 치환 -> 집계에 잡혀야 한다
         pack.validate()
-        assert "grammar 위반" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "자동치환(FIX) 엣지 1건" in out, \
+            "집계가 중간에 죽거나 src_label 을 못 읽으면 이 검사는 공허하다"
+        assert "grammar 위반" not in out
 
     def test_fix_count_ignores_source_label_equal_to_label(self, pack, capsys):
         """`if src_label and src_label != label` — 같으면 치환이 아니므로 세지 않는다.
