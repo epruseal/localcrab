@@ -20,6 +20,7 @@ from opencrab.pack.schema import (
     EDGE_STRUCT_KEYS,
     NODE_STRUCT_KEYS,
     NODE_TYPE_OVERRIDE,
+    SPACE_DEFAULT_TYPE,
     PackSchemaError,
 )
 
@@ -206,6 +207,106 @@ class TestEdge:
         """space 를 모르면 grammar 검사를 못 한다. 그 통과분을 validate() 가 잡는다."""
         pack.edge("unknown-a", "unknown-b", "whatever")
         assert pack.edges[0]["label"] == "whatever"
+
+
+class TestFixIsTheRepresentativeNotTheAlphabeticalFirst:
+    """정합 불가 라벨의 대체값은 **FIX 표의 대표값**이지 사전순 첫 원소가 아니다.
+
+    `rel = _FIX.get((ss, tt)) or sorted(allowed)[0]` 에서 `or` 를 `and` 로 바꾸면
+    결과가 `sorted(allowed)[0]` 이 되는데, 스윕에서 그 변이가 살아남았다(2026-08-05).
+    기존 검사가 `resource->evidence` 만 썼고 그 쌍은 FIX 와 sorted[0] 이 같아서
+    두 값을 구분하지 못했기 때문이다.
+
+    실측(2026-08-05): ALLOWED 38 쌍 중 **12 쌍**에서 둘이 다르고, 그중에는 의미가
+    정반대인 것이 있다.
+
+        lever   -> outcome   FIX=raises      sorted[0]=lowers
+        evidence-> claim     FIX=supports    sorted[0]=contradicts
+        policy  -> subject   FIX=requires_approval  sorted[0]=denies
+
+    사전순으로 새면 라이브 그래프에서 엣지 의미가 뒤집힌다. 발산하는 쌍으로 못박는다.
+    """
+
+    @pytest.mark.parametrize("src_space,tgt_space,fix_rel,alpha_first", [
+        ("lever", "outcome", "raises", "lowers"),
+        ("evidence", "claim", "supports", "contradicts"),
+        ("policy", "subject", "requires_approval", "denies"),
+    ])
+    def test_unfit_label_becomes_the_fix_value(
+            self, pack, src_space, tgt_space, fix_rel, alpha_first):
+        from opencrab.pack.schema import ALLOWED, FIX
+        assert FIX[(src_space, tgt_space)] == fix_rel
+        assert sorted(ALLOWED[(src_space, tgt_space)])[0] == alpha_first
+        assert fix_rel != alpha_first, "발산하지 않으면 이 검사는 두 값을 구분하지 못한다"
+
+        pack.node("s", "S", SPACE_DEFAULT_TYPE[src_space], src_space)
+        pack.node("t", "T", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
+        pack.edge("s", "t", "정합불가라벨")
+        assert pack.edges[0]["label"] == fix_rel
+
+    def test_reversed_pair_also_uses_the_fix_value(self, pack):
+        """반전 분기도 같은 규칙이다 — 한쪽만 걸면 다른 쪽이 무방비가 된다.
+
+        outcome -> lever 는 grammar 에 없고 lever -> outcome 은 있다. 반전 후
+        FIX=raises / sorted[0]=lowers 로 발산한다.
+        """
+        from opencrab.pack.schema import ALLOWED
+        assert ("outcome", "lever") not in ALLOWED and ("lever", "outcome") in ALLOWED
+        pack.node("o", "O", "Outcome", "outcome")
+        pack.node("lv", "L", "Lever", "lever")
+        pack.edge("o", "lv", "정합불가라벨")
+        e = pack.edges[0]
+        assert (e["source_id"], e["target_id"]) == ("lv", "o")
+        assert e["label"] == "raises"
+
+
+class TestEdgeNeedsBothSpacesToValidate:
+    """`if ss and tt:` — 양끝 space 를 **둘 다** 알아야 grammar 검사를 한다.
+
+    `and` 를 `or` 로 바꾼 변이가 살아남았다. 기존 검사가 "둘 다 모르는" 경우만 봐서
+    한쪽만 아는 경우를 구분하지 못했다. 한쪽만 알고 검사에 들어가면
+    `_ALLOWED.get((ss, None))` 이 되어 정합 라벨이 엉뚱하게 드롭되거나 치환된다.
+    """
+
+    @pytest.mark.parametrize("known", ["source", "target"])
+    def test_one_known_endpoint_skips_grammar_validation(self, pack, known):
+        if known == "source":
+            pack.node("a", "A", "Concept", "concept")
+            pack.edge("a", "unknown-b", "슬쩍만든라벨")
+        else:
+            pack.node("b", "B", "Concept", "concept")
+            pack.edge("unknown-a", "b", "슬쩍만든라벨")
+        assert len(pack.edges) == 1, "한쪽만 알면 드롭하지 않는다"
+        assert pack.edges[0]["label"] == "슬쩍만든라벨", "치환도 하지 않는다"
+        assert pack.edges[0]["properties"] == {}
+        assert sum(pack._eskip.values()) == 0
+
+
+class TestUidDiscriminators:
+    """헬퍼마다 uid 앞에 붙이는 **판별자**가 팩 안의 id 충돌을 막는다.
+
+    `self.uid('resource', slug)` 의 `'resource'` 를 빈 문자열로 바꾸는 변이가
+    9 개 헬퍼 전부에서 살아남았다(2026-08-05). 전부 빈 문자열이 되면 같은 slug 를 쓴
+    서로 다른 space 의 노드가 **같은 id** 가 되어 뒤에 온 쪽이 조용히 사라진다
+    (`node()` 는 이미 등록된 id 를 그냥 반환한다).
+    """
+
+    HELPERS = ["resource", "subject", "concept", "claim",
+               "community", "outcome", "lever", "policy"]
+
+    def test_same_slug_in_different_spaces_gets_different_ids(self, pack):
+        ids = {h: getattr(pack, h)("동일슬러그", f"{h} 라벨") for h in self.HELPERS}
+        assert len(set(ids.values())) == len(self.HELPERS), \
+            f"판별자가 없으면 충돌한다: {ids}"
+        assert len(pack.nodes) == len(self.HELPERS), "충돌하면 노드가 조용히 사라진다"
+
+    def test_edge_uid_does_not_collide_with_node_uid(self, pack):
+        """엣지 id 는 `uid('edge', src, rel, tgt)` 다 — 판별자가 없으면 노드와 겹칠 수 있다."""
+        r = pack.resource("d", "문서")
+        e = pack.node("e", "E", "Evidence", "evidence")
+        pack.edge(r, e, "contains")
+        assert pack.edges[0]["id"] not in {n["id"] for n in pack.nodes}
+        assert pack.edges[0]["id"] == pack.uid("edge", r, "contains", e)
 
 
 class TestEv:
@@ -622,6 +723,22 @@ class TestDiagnosticsReportRealNumbers:
         pack.validate()
         assert "dangling 노드 참조 엣지 2건" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("missing", ["source", "target"])
+    def test_dangling_detects_a_single_missing_endpoint(self, pack, capsys, missing):
+        """`source not in _nid **or** target not in _nid` — 한쪽만 없어도 dangling 이다.
+
+        기존 검사가 **양끝 다 없는** 엣지만 써서 `or` 의 두 항을 구분하지 못했다.
+        그래서 `not in` 을 `in` 으로 뒤집는 변이가 양쪽 항 모두에서 살아남았다
+        (2026-08-05). 한쪽씩 빠뜨려 두 항을 따로 건다.
+        """
+        pack.node("real", "R", "Concept", "concept")
+        if missing == "source":
+            pack.edge("ghost", "real", "related_to")
+        else:
+            pack.edge("real", "ghost", "related_to")
+        pack.validate()
+        assert "dangling 노드 참조 엣지 1건" in capsys.readouterr().out
+
     def test_grammar_violation_count_is_reported(self, pack, capsys):
         for i in range(3):
             pack.edge(f"a{i}", f"b{i}", "related_to")     # space 미확정으로 우회
@@ -644,6 +761,24 @@ class TestDiagnosticsReportRealNumbers:
         pack.concept("k1", "개념")
         pack.validate()
         assert "evidence_refs 없는 claim/concept 3/3건" in capsys.readouterr().out
+
+    def test_evidence_linked_nodes_are_excluded_from_the_unlinked_count(
+            self, pack, capsys):
+        """근거에 **연결된** claim/concept 은 세지 않는다.
+
+        기존 검사에 엣지가 하나도 없어서 `ev_touch` 집계 루프가 통째로 안 돌았다.
+        그래서 그 안의 비교·키 접근·문장 삭제 변이가 전부 살아남았다(2026-08-05).
+        양방향(evidence 가 src 인 경우와 tgt 인 경우)을 모두 태운다.
+        """
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "근거", "본문")
+        linked_claim = pack.claim("c1", "연결된 주장")
+        pack.edge(linked_claim, "e1", "supports")      # claim -> evidence (KEEP)
+        linked_concept = pack.concept("k1", "연결된 개념")
+        pack.edge("e1", linked_concept, "mentions")    # evidence -> concept
+        pack.claim("c2", "고아 주장")
+        pack.validate()
+        assert "evidence_refs 없는 claim/concept 1/3건" in capsys.readouterr().out
 
     def test_empty_spaces_are_listed_by_name(self, pack, capsys):
         """채워진 space 는 빠지고 **나머지 8 개가 전부** 나열돼야 한다."""
@@ -677,6 +812,68 @@ class TestDiagnosticsReportRealNumbers:
         pack.edge("co", "s", "owns2")
         pack.save()
         assert "grammar 드롭 엣지 2건" in capsys.readouterr().out
+
+    def test_reports_list_actionable_detail_lines_not_just_totals(self, pack, capsys):
+        """총계 밑의 **상세 줄**이 실제 작업 지시다 — 루프를 지워도 총계는 그대로다.
+
+        네 리포트(grammar 위반 / FIX 치환 / remap 함정 / 드롭 엣지)의 상세 루프를
+        삭제하는 변이가 전부 살아남았다(2026-08-05). 총계만 검사했기 때문이다.
+        운영자는 "무엇을" 고칠지를 이 줄에서 읽는다.
+        """
+        pack.node("a", "A", "Concept", "concept")
+        pack.node("b", "B", "Evidence", "evidence")
+        pack.edge("a", "b", "정합불가라벨")            # FIX 치환
+        pack.node("n1", "L", "TextUnit", "evidence")   # remap 함정
+        pack.edge("ghost-a", "ghost-b", "related_to")
+        pack.node("ghost-a", "A", "Concept", "concept")
+        pack.node("ghost-b", "B", "Evidence", "evidence")   # grammar 위반(우회 통과분)
+        pack.validate()
+        out = capsys.readouterr().out
+        assert "concept→evidence" in out, "위반·치환 줄에 공간쌍이 나와야 한다"
+        assert "정합불가라벨" in out, "치환 줄에 원본 라벨이 나와야 한다"
+        assert "node_type='TextUnit'" in out, "함정 줄에 문제의 node_type 이 나와야 한다"
+
+    def test_detail_lines_are_capped_at_eight(self, pack, capsys):
+        """상위 8건만 나열한다. 캡이 바뀌면 운영자가 보는 정보량이 조용히 달라진다."""
+        # community -> subject 는 양방향 모두 grammar 에 없어 드롭된다.
+        # 라벨이 서로 달라야 _eskip 키가 9종으로 갈린다.
+        for i in range(9):
+            pack.node(f"co{i}", "CO", "Community", "community")
+            pack.node(f"s{i}", "S", "Org", "subject")
+            pack.edge(f"co{i}", f"s{i}", f"라벨{i}")
+        assert pack.edges == [], "이 쌍은 드롭돼야 이 검사가 성립한다"
+        pack.save()
+        out = capsys.readouterr().out
+        detail = [ln for ln in out.splitlines() if "community→subject" in ln]
+        assert len(detail) == 8, f"상위 8건이어야 한다: {len(detail)}"
+        assert "드롭 엣지 9건" in out, "총계는 자르지 않는다"
+
+    def test_save_space_histogram_is_labelled(self, pack, capsys):
+        pack.node("n1", "L", "Concept", "concept")
+        pack.save()
+        assert "  spaces:" in capsys.readouterr().out
+
+    def test_error_message_names_which_gate_blocked(self, pack):
+        """차단 사유가 strict 항목인지 항상차단 항목인지 문구로 구분된다.
+
+        예전 문구가 PACK_LIB_STRICT 만 언급해 "env 를 끄면 우회된다"는 오해를 낳았다.
+        두 문구를 각각 못박는다 — 빈 문자열로 바꾸는 변이가 둘 다 살아남았다.
+        """
+        pack.node("n1", "L", "Concept", "concept")
+        pack.nodes[0]["brand"] = "Yamaha"
+        with pytest.raises(ValueError, match=r"항상 차단 항목\(strict 무관\)"):
+            pack.validate(strict=False)
+        with pytest.raises(ValueError, match="PACK_LIB_STRICT=1 항목 또는 항상 차단 항목"):
+            pack.validate(strict=True)
+
+    def test_hazard_detail_names_the_loader_space_not_the_declared_one(
+            self, pack, capsys):
+        """함정 줄은 `선언 space -> 로더 space` 를 보여준다. 두 값이 뒤바뀌면 무의미하다."""
+        pack.node("n1", "L", "TextUnit", "evidence")
+        pack.validate()
+        line = next(ln for ln in capsys.readouterr().out.splitlines()
+                    if "node_type='TextUnit'" in ln)
+        assert "선언 evidence" in line and "로더 concept" in line
 
     def test_multiple_errors_are_joined_not_truncated(self, pack):
         """차단 사유가 여럿이면 전부 보여야 한다 — 하나만 고치고 다시 도는 낭비를 막는다."""

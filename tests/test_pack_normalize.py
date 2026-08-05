@@ -1001,16 +1001,33 @@ def _pair_without_override(label):
     raise AssertionError(f"{label}: 전 공간쌍이 override 라 REL_MAP 경로를 못 탄다")
 
 
+# 방향을 **반전** 시키는 라벨. 기대값을 여기 적어 두는 것이 핵심이다.
+#
+# 처음에는 테스트 안에서 `if label in N.REVERSE_RELATIONS:` 로 분기했는데, 그러면
+# **자기가 지켜야 할 표를 런타임에 읽어 기대값을 정하는** 자기참조가 된다. 적대 검증이
+# 실증했다(2026-08-05): `REVERSE_RELATIONS` 에서 `SHOWN_IN` 을 빼면 else 분기로 넘어가
+# 그대로 통과하고 지문만 걸렸다. 반전 소실은 라이브에서 src/tgt 가 뒤바뀌는 비등가 변경이다.
+REVERSING_LABELS = frozenset({"HAS_ASSEMBLY", "HAS_PART", "SHOWN_IN"})
+
+
+def test_reversing_labels_match_the_table():
+    """기대 집합과 표가 어긋나면 둘 중 하나가 틀린 것이다 — 조용히 갈리지 않게 못박는다."""
+    assert set(N.REVERSE_RELATIONS) == REVERSING_LABELS
+
+
 @pytest.mark.parametrize("label", sorted(JUDGMENT_MAPPINGS))
 def test_judgment_mapping_survives_through_resolve_edge(label):
-    """표를 읽지 않고 **동작**으로 확인한다 — 표가 그대로여도 조회 논리가 바뀌면 걸린다."""
+    """표를 읽지 않고 **동작**으로 확인한다 — 표가 그대로여도 조회 논리가 바뀌면 걸린다.
+
+    반전 여부도 이 파일의 상수로 기대한다(표를 읽어 분기하면 표 변경을 못 잡는다).
+    """
     frm, to = _pair_without_override(label)
     want = JUDGMENT_MAPPINGS[label]
     got = N.resolve_edge(label, frm, to)
-    if label in N.REVERSE_RELATIONS:
-        assert got == (to, want, frm, True)
+    if label in REVERSING_LABELS:
+        assert got == (to, want, frm, True), "반전 라벨은 양끝을 뒤집어 돌려줘야 한다"
     else:
-        assert got == (frm, want, to, False)
+        assert got == (frm, want, to, False), "반전 라벨이 아닌데 뒤집혔다"
 
 
 @pytest.mark.parametrize("label", sorted(

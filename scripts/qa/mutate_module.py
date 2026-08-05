@@ -37,10 +37,12 @@ docstring 과 f-string 의 **리터럴 텍스트** 는 동작이 아니라 제�
 쌍이 살아남는 경우(서로 상쇄하는 변이)는 실제로는 드물다. **안 한다고 여기 적어 둔다 —
 "전부 훑었다"고 읽히면 안 된다.**
 
-판정 세 갈래:
+판정 네 갈래:
   KILLED   테스트가 실패했다(pytest rc=1). 계약이 실제로 검사하고 있다.
   BROKEN   모듈이 뜨지도 못했다(rc>=2, 수집 에러). 검출은 됐지만 **계약 검증이 아니다** —
            검출력 지표에서 분리해야 "N 종 KILLED" 가 과대평가되지 않는다.
+  HUNG     제한 시간(RUN_TIMEOUT) 안에 안 끝났다. 무한 루프·메모리 폭증. 역시 계약
+           검증이 아니고, 무엇보다 **분리해 세지 않으면 스윕이 통째로 멈춘 걸 모른다.**
   SURVIVED 미검사 경로(고쳐라) 또는 등가 변이(추론하지 말고 입력 격자로 차분 0 을
            **측정해** 등가임을 보이고, 그 전제를 불변식 테스트로 못박아라).
 
@@ -52,9 +54,11 @@ docstring 과 f-string 의 **리터럴 텍스트** 는 동작이 아니라 제�
         tests/test_pack_normalize.py /tmp/sweep.json
 """
 import ast
+import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +77,24 @@ PACK_SUITES: dict[str, tuple[str, ...]] = {
 }
 
 PY = sys.executable
+
+# 변이 1건당 테스트 실행 상한(초). 정상 스위트는 1 초 미만이라 200 배 여유다.
+#
+# **왜 필요한가.** 상한이 없으면 스윕이 조용히 영원히 멈춘다. 실측(2026-08-05):
+# `ShardedAppender.write` 안의 `self.write_line(...)` 를 `self.write(...)` 로 바꾸는
+# 변이가 무한 재귀에 빠지는데, 매 단계 문자열을 재직렬화해 RecursionError 전에 메모리가
+# 폭증한다. 스윕이 6 분간 같은 지점에 멈춰 있었고 아무 신호도 없었다 — 이 도구가 닫으려는
+# "조용한 실패" 클래스를 도구 자신이 저지르고 있었다(RC2 와 같은 부류).
+RUN_TIMEOUT = 180
+
+# pytest 가 쓰지 않는 반환값. 시간 초과를 rc 로 흘려보낸다.
+_HUNG = -9
+
+# 산술 연산자 뒤집기 표.
+ARITH_FLIP = {ast.Add: ast.Sub, ast.Sub: ast.Add,
+              ast.Mult: ast.FloorDiv, ast.FloorDiv: ast.Mult,
+              ast.LShift: ast.RShift, ast.RShift: ast.LShift,
+              ast.BitOr: ast.BitAnd, ast.BitAnd: ast.BitOr}
 
 
 def _pos(n):
@@ -295,6 +317,18 @@ def _collect(tree):
                 if len(names) >= 2:
                     ops.append(_Op(f"kwarg:{names[0]}<->{names[1]}", node,
                                    lambda n: _swap_kwargs(n)))
+            # 6-b. 산술 연산자 뒤집기(AugAssign / BinOp).
+            #
+            # **적대 검증이 이 축의 부재를 비등가 생존 4건으로 실증했다**(2026-08-05).
+            # `stray[k] += 1` -> `-= 1` 로 바꾸면 진단이 "비구조 키 3종 **-9건**" 을
+            # 출력하는데 82 건이 전부 통과했다. Counter 가 음수여도 truthy 라 차단은
+            # 유지되지만 운영자가 보는 건수의 부호가 뒤집힌다.
+            if isinstance(node, (ast.AugAssign, ast.BinOp)):
+                t = type(node.op)
+                if t in ARITH_FLIP:
+                    tag = "aug" if isinstance(node, ast.AugAssign) else "bin"
+                    ops.append(_Op(f"{tag}:{t.__name__}->{ARITH_FLIP[t].__name__}", node,
+                                   lambda n, o=ARITH_FLIP[t]: setattr(n, "op", o())))
             # 7. 슬라이스 경계 이동
             if isinstance(node, ast.Slice):
                 for fld in ("lower", "upper"):
@@ -334,7 +368,10 @@ def _collect(tree):
                 if not isinstance(stmts, list) or len(stmts) < 2:
                     continue
                 for idx, st in enumerate(stmts):
-                    if isinstance(st, ast.Return) or (st.lineno, st.col_offset) in skip:
+                    # return 도 지운다. 예전에는 제외했는데 그러면 "이른 반환으로 나가는
+                    # 것"과 "계속 진행하는 것"의 차이가 통째로 무검사가 된다 — 조기 반환은
+                    # 중복 방지·드롭 같은 판정의 실행 그 자체다(적대 검증 지적, 2026-08-05).
+                    if (st.lineno, st.col_offset) in skip:
                         continue
                     ops.append(_Op(f"del-stmt:{type(st).__name__}", st,
                                    lambda n, h=holder, f=field, i=idx:
@@ -382,16 +419,54 @@ def run_tests(clone: Path, tests: tuple[str, ...]) -> int:
     for pc in clone.rglob("__pycache__"):
         shutil.rmtree(pc, ignore_errors=True)
     env = {**os.environ, "PYTHONPATH": str(clone.resolve())}
-    r = subprocess.run(
+    # 자기 프로세스 그룹으로 띄운다. 시간 초과 시 pytest 만 죽이면 **그 자식들이 고아로
+    # 남는다** — 이 스위트에는 하위 프로세스를 띄우는 검사가 있고(env 변수명 계약),
+    # 고아가 쌓이면 뒤 변이들의 측정까지 오염된다.
+    proc = subprocess.Popen(
         [PY, "-B", "-m", "pytest", *tests, "-x", "-q",
          "-p", "no:cacheprovider", "-o", "addopts="],
-        cwd=clone, env=env, capture_output=True, text=True)
-    return r.returncode
+        cwd=clone, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True)
+    try:
+        proc.communicate(timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        proc.communicate()
+        return _HUNG
+    return proc.returncode
+
+
+def _assert_tests_import_the_module(clone: Path, module: str,
+                                    tests: tuple[str, ...]) -> None:
+    """테스트가 **정말 그 모듈을 쓰는지** 확인한다. 아니면 죽는다.
+
+    `PACK_SUITES` 는 등록을 강제하지만 대응이 맞는지는 강제하지 않았다. 적대 검증이
+    실증했다(2026-08-05): `jsonl_io` 변이를 `normalize` 테스트로 돌리면
+    `총 10 KILLED 0 SURVIVED 10` 이 조용히 나온다. 사람은 그 0 을 "테스트가 약하다"로
+    읽지 "배선이 틀렸다"로 읽지 않는다 — RC1 과 같은 계열의 구멍이다.
+    """
+    dotted = module.removesuffix(".py").replace("/", ".")
+    tail = dotted.rsplit(".", 1)[-1]
+    parent = dotted.rsplit(".", 1)[0]
+    for t in tests:
+        tree = ast.parse((clone / t).read_text())
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import) and any(a.name == dotted for a in n.names):
+                return
+            if isinstance(n, ast.ImportFrom):
+                if n.module == dotted:
+                    return
+                if n.module == parent and any(a.name == tail for a in n.names):
+                    return
+    sys.exit(f"배선 오류: {' '.join(tests)} 가 {dotted} 를 import 하지 않는다.\n"
+             f"오매핑된 스윕은 생존자만 잔뜩 내고 아무것도 검증하지 않는다 — 죽는다.")
 
 
 def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
     """모듈 하나를 전면 스윕한다. 원본은 finally 에서 반드시 복원한다."""
     target = clone / module
+    _assert_tests_import_the_module(clone, module, tests)
     orig_src = target.read_text()
     ops = _collect(ast.parse(orig_src))
     print(f"\n### {module}  변이 {len(ops)}종  테스트 {' '.join(tests)}", flush=True)
@@ -400,7 +475,7 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
     assert rc == 0, f"baseline 이 깨져 있으면 매트릭스는 무효다 (rc={rc})"
     print("BASELINE rc=0", flush=True)
 
-    survived, invalid, killed, broken = [], [], 0, []
+    survived, invalid, killed, broken, hung = [], [], 0, [], []
     try:
         for i, op in enumerate(ops, 1):
             src = _mutate_source(orig_src, op)
@@ -418,18 +493,20 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
                 survived.append(op.label())
             elif rc == 1:
                 killed += 1                          # 테스트가 계약을 검사해서 잡았다
+            elif rc == _HUNG:
+                hung.append(op.label())              # 무한 루프·메모리 폭증
             else:
                 broken.append(op.label())            # 모듈이 뜨지도 못했다 — 계약 검증 아님
             if i % 50 == 0:
                 print(f"  {i}/{len(ops)}  killed={killed} broken={len(broken)} "
-                      f"survived={len(survived)}", flush=True)
+                      f"hung={len(hung)} survived={len(survived)}", flush=True)
     finally:
         target.write_text(orig_src)
 
     res = {"module": module, "tests": list(tests), "total": len(ops),
-           "killed": killed, "broken": broken, "invalid": invalid,
+           "killed": killed, "broken": broken, "hung": hung, "invalid": invalid,
            "survived": survived}
-    print(f"총 {len(ops)}  KILLED {killed}  BROKEN {len(broken)}  "
+    print(f"총 {len(ops)}  KILLED {killed}  BROKEN {len(broken)}  HUNG {len(hung)}  "
           f"적용불가 {len(invalid)}  SURVIVED {len(survived)}")
     for lbl in survived:
         print("  생존:", lbl)
@@ -437,6 +514,8 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
         print("  적용불가:", lbl)            # 정체 불명의 숫자를 남기지 않는다
     for lbl in broken:
         print("  BROKEN(모듈 미기동):", lbl)
+    for lbl in hung:
+        print(f"  HUNG({RUN_TIMEOUT}s 초과):", lbl)
     return res
 
 
@@ -473,7 +552,8 @@ def main():
     print("\n===== 요약 =====")
     for r in results:
         print(f"  {r['module']:34} 총 {r['total']:4}  KILLED {r['killed']:4}  "
-              f"BROKEN {len(r['broken']):3}  SURVIVED {len(r['survived']):3}")
+              f"BROKEN {len(r['broken']):3}  HUNG {len(r['hung']):3}  "
+              f"SURVIVED {len(r['survived']):3}")
     total_survived = sum(len(r["survived"]) for r in results)
     print(f"  생존 합계 {total_survived}")
     if out_json:
