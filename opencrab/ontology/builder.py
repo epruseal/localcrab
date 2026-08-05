@@ -355,6 +355,18 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     (see the module docstring: individual store failures are swallowed and
     reported here, not raised) must call this on the returned ``stores`` map
     to know whether the write actually succeeded everywhere it matters.
+
+    DIAGNOSTIC, not authoritative for billing: this is a NEGATIVE list — "no
+    recognized failure string" is its pass condition, which is fail-open for
+    any status shape it doesn't recognize (missing key, non-string value, a
+    status this function was never taught). It exists for building
+    human-readable error messages (``node_errors``/``edge_errors``/
+    ``anchor_errors`` entries) where under-reporting an unrecognized status
+    is an acceptable cost. Money-critical "did this actually get billable"
+    decisions must use ``store_write_succeeded()`` below instead — issue #66's
+    codex review is exactly the story of a billing gate built on this
+    negative-list shape being fail-open (see ``graph_write_failed``'s history
+    in git blame, and pack.py's legacy text-ingest gate, both now converted).
     """
     failures = []
     for store, status in stores.items():
@@ -367,29 +379,50 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     return failures
 
 
+def store_write_succeeded(stores: dict[str, Any], key: str | None = None) -> bool:
+    """The single authoritative "did a write actually happen" check for
+    money-critical (billing) decisions in this codebase. POSITIVE
+    confirmation only: a status of literally ``"ok"`` is success, everything
+    else — a recognized failure, ``"unavailable"``, ``"skipped (...)"``, a
+    missing key, a non-string value, a missing/non-dict ``stores`` — is not.
+    Never guess "probably fine" for a receipt shape this function doesn't
+    recognize (issue #66's codex review: a fail-open "no known failure ->
+    bill" check let malformed/incomplete receipts and ``"unavailable"``
+    optional-store statuses get billed for writes that landed nowhere).
+
+    key:
+        ``"graph"`` (or any specific store key) checks only that store —
+        this is what a node/edge write's billing decision needs, since the
+        graph store is the system of record and an optional-store-only
+        success (e.g. only ``docs`` came back ``"ok"``, ``graph`` did not)
+        must NOT count as a landed write. ``None`` (default) checks whether
+        ANY store in the map is ``"ok"`` — this is what a write with no
+        single system-of-record store needs, e.g. pack.py's legacy
+        text-ingest path, which never touches ``graph`` at all and can land
+        in either the vector store or the doc store.
+    """
+    if not isinstance(stores, dict):
+        return False
+    if key is not None:
+        return stores.get(key) == "ok"
+    return any(status == "ok" for status in stores.values())
+
+
 def graph_write_failed(stores: dict[str, Any]) -> bool:
     """True unless ``stores`` (an add_node/add_edge result's ``"stores"``
     map) POSITIVELY confirms the write landed in the graph store — the
-    system of record.
-
-    Fail-closed by design: a missing/non-dict ``stores``, a missing
-    ``"graph"`` key, or any status string other than the literal ``"ok"``
-    all count as "did not land" — the caller must not guess "probably fine"
-    for a receipt shape it doesn't recognize. Money-critical callers (billing
-    gates) rely on this: issue #66's codex review caught a fail-open version
-    of this check (recognized failure strings blocked billing, but an
-    unrecognized/malformed receipt fell through and got billed anyway).
+    system of record. Thin wrapper over ``store_write_succeeded(stores,
+    "graph")`` — see that function's docstring for the fail-closed
+    contract this relies on.
 
     Optional-store status (docs/sql/vector) is irrelevant here on purpose —
     an optional-store-only failure still means the write landed (the entity
     exists and is queryable), matching the same "graph failed = hard
     failure, optional-store-only failed = partial success" split
     ``opencrab/mcp/tools/pack.py#pack_create`` already applies to its anchor
-    node write. See ``store_write_failures()`` above for that broader,
-    all-stores classification — this function only asks the graph-specific
-    question a billing decision needs.
+    node write.
     """
-    return not (isinstance(stores, dict) and stores.get("graph") == "ok")
+    return not store_write_succeeded(stores, "graph")
 
 
 def _space_to_default_type(space_id: str) -> str:

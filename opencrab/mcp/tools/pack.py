@@ -91,7 +91,7 @@ def _ingest_into_pack(
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
-    from opencrab.ontology.builder import store_write_failures
+    from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
     ctx = _get_context()
     added_nodes = 0
@@ -227,18 +227,23 @@ def _ingest_into_pack(
     # that item's own store_write_failures() was empty (see the node/edge
     # loops), and evidence_node (text_as_node=True) rolls into added_nodes
     # the same way — so all three already mean "this actually got written",
-    # not just "no exception was raised". text_stores_failed covers the
-    # text_as_node=False legacy branch, whose only success signal lives in
-    # `stores` (chromadb/mongodb), not in added_nodes/added_edges. A call
-    # that wrote NOTHING (every item failed, no successful text) must not
-    # bill — see issue #105/#66 review: builder writes fail via a result
-    # string, not an exception, so "no exception" alone is not "it worked".
+    # not just "no exception was raised".
+    #
+    # The text_as_node=False legacy branch is different: it never touches
+    # `graph` at all (vector-only embedding + a doc_sources record), so its
+    # only success signal lives in `stores` (chromadb/mongodb), not in
+    # added_nodes/added_edges. A codex re-review caught this branch still
+    # using store_write_failures()'s negative-list shape here (fail-open:
+    # "no known failure" included "unavailable", so a legacy ingest where
+    # BOTH the vector and doc stores were unavailable — nothing written
+    # anywhere — still billed). store_write_succeeded(stores) is the fix:
+    # positive confirmation that at least one of chromadb/mongodb actually
+    # came back "ok". See that function's docstring in builder.py for why it
+    # is now the sole authority for "did a write happen" in this codebase —
+    # store_write_failures() stays diagnostic-only (error-message text).
     text_stores_failed = bool(store_write_failures(stores))
-    wrote_anything = (
-        added_nodes > 0
-        or added_edges > 0
-        or (text_ingested and not text_as_node and not text_stores_failed)
-    )
+    legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
+    wrote_anything = added_nodes > 0 or added_edges > 0 or legacy_text_landed
     if wrote_anything:
         billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
         if not billing_result.get("ok"):

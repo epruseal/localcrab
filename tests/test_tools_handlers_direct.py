@@ -263,6 +263,44 @@ class TestIngestIntoPack:
             )
         assert result["stores"]["mongodb"] == "error: mongo down"
 
+    def test_error_legacy_path_both_stores_unavailable_does_not_bill(self):
+        """#66 codex re-review (3rd round): the legacy text_as_node=False
+        path bypasses added_nodes/added_edges entirely (it never touches
+        `graph`) — its only success signal is the `stores` dict. Before this
+        fix, "unavailable" wasn't treated as a failure there (it only fails
+        the "graph" store, and this path never sets that key), so a legacy
+        ingest where BOTH the vector store and the doc store are unavailable
+        — nothing written anywhere — still fired on_ingest. Pin: it must not."""
+        builder = MagicMock()
+        billing = MagicMock()
+        hybrid = MagicMock()
+        hybrid.ingest.return_value = {"stores": {"chromadb": "unavailable"}}
+        mongo = MagicMock()
+        mongo.available = False  # -> stores["mongodb"] = "unavailable"
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            result = _ingest_into_pack(
+                "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+            )
+        assert result["stores"] == {"chromadb": "unavailable", "mongodb": "unavailable"}
+        assert result["text_ingested"] is True  # the attempt was made
+        billing.on_ingest.assert_not_called()  # but nothing actually landed
+
+    def test_normal_legacy_path_vector_only_success_still_bills(self):
+        """Positive-confirmation counterpart: chromadb comes back "ok" (even
+        though mongodb, an optional audit record, is unavailable) — the text
+        really did land in the vector store, so this must still bill."""
+        builder = MagicMock()
+        billing = MagicMock()
+        hybrid = MagicMock()
+        hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
+        mongo = MagicMock()
+        mongo.available = False
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
+        billing.on_ingest.assert_called_once_with("default", None, "src-5")
+
     def test_edge_no_content_is_a_noop(self):
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx()
