@@ -244,6 +244,24 @@ class TestFixIsTheRepresentativeNotTheAlphabeticalFirst:
         pack.edge("s", "t", "정합불가라벨")
         assert pack.edges[0]["label"] == fix_rel
 
+    def test_the_alphabetical_fallback_is_unreachable_but_guarded(self):
+        """`_FIX.get(...) or sorted(allowed)[0]` 의 **or 오른쪽은 현재 도달 불가**다.
+
+        그 전제가 무엇에 의해 지켜지는지를 여기서 못박는다. FIX 에 구멍이 나면
+        `check_grammar_tables` 가 **import 시점에** RuntimeError 로 죽는다 —
+        즉 fallback 이 조용히 발동하는 상태 자체가 존재할 수 없다.
+
+        전제(FIX 가 ALLOWED 를 전부 덮음)와 그 전제를 지키는 가드를 한 자리에서 잇지 않으면,
+        나중에 가드가 사문화됐을 때 fallback 이 사전순 대표값을 조용히 쓰기 시작한다.
+        그 값은 12/38 쌍에서 FIX 와 다르고 일부는 의미가 정반대다(raises vs lowers).
+        """
+        from opencrab.pack.schema import ALLOWED, FIX, check_grammar_tables
+        assert set(FIX) >= set(ALLOWED), "FIX 가 ALLOWED 를 전부 덮어야 fallback 이 도달 불가다"
+        assert all(FIX[k] for k in ALLOWED), "FIX 값이 falsy 면 or 오른쪽이 발동한다"
+        holed = {k: v for k, v in FIX.items() if k != ("lever", "outcome")}
+        with pytest.raises(RuntimeError, match="FIX 대표값이 없다"):
+            check_grammar_tables(ALLOWED, holed)
+
     def test_reversed_pair_also_uses_the_fix_value(self, pack):
         """반전 분기도 같은 규칙이다 — 한쪽만 걸면 다른 쪽이 무방비가 된다.
 

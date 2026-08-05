@@ -316,6 +316,10 @@ def validate_node(row: dict[str, Any], *, allow_legacy_top_level: bool = True) -
     ``allow_legacy_top_level=False`` 로 부르면 최상위 커스텀 필드를 계약 위반으로
     본다. 새로 만든 팩에 쓴다 — 기존 팩은 레거시 흡수 대상이라 True 여야 통과한다.
     """
+    # 메시지 안의 `row.get('id')` 는 **`.get` 이어야 한다.** 여기 오는 행은 정의상 필수 필드가
+    # 빠져 있고, `row['id']` 로 바꾸면 진단을 만들다가 `KeyError` 가 나서 `PackSchemaError`
+    # 계약이 깨진다(적대 검증 실증, 2026-08-05). 표시되는 **값**(id 가 없으면 None)은 진단용
+    # 이지만 **접근 방식**은 계약이다 — "메시지일 뿐"이라고 단순화하지 마라.
     for key in ("id", "label", "node_type", "space"):
         if not row.get(key):
             raise PackSchemaError(f"노드에 필수 필드 {key!r} 가 없다: {row.get('id')!r}")
