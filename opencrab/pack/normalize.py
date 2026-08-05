@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from opencrab.grammar.manifest import SPACES as _GRAMMAR_SPACES
 from opencrab.pack.schema import NODE_STRUCT_KEYS, NODE_TYPE_OVERRIDE, SPACE_DEFAULT_TYPE
 
@@ -22,8 +25,13 @@ _GRAMMAR_NODE_TYPES: frozenset[str] = frozenset(
     nt for s in _GRAMMAR_SPACES.values() for nt in s["node_types"]
 )
 
+# 세 표는 **불변**이다. 모듈 최상단의 평범한 dict/set 이면 소비자 한 곳이
+# `REL_MAP["X"] = ...` 한 줄로 적재기·게이트·리포트의 판정을 전역에서 바꿀 수 있다 —
+# 적대 검증이 실증했다(REL_MAP_ISOLATED: False, 2026-08-04). 지금 그런 코드는 없지만
+# 표를 정본으로 모은 목적이 "판정이 한 곳에서만 정해진다"이므로 가능성 자체를 없앤다.
+#
 # 원본 graphrag/dump 관계 → 9-space 정규화 관계
-REL_MAP: dict[str, str] = {
+REL_MAP: Mapping[str, str] = MappingProxyType({
     # Honda GraphRAG
     "HAS_ASSEMBLY":        "part_of",       # 반전: Vehicle→Assembly → Assembly part_of Vehicle
     "HAS_PART":            "part_of",       # 반전: Assembly→Part → Part part_of Assembly
@@ -88,18 +96,18 @@ REL_MAP: dict[str, str] = {
     "RELATED_TO":          "related_to",
     # 명문장1007
     "EXEMPLIFIES":         "exemplifies",     # evidence→concept: exemplifies (supports 아님)
-}
+})
 
 # 원본 방향을 반전시켜야 하는 관계
-REVERSE_RELATIONS: set[str] = {
+REVERSE_RELATIONS: frozenset[str] = frozenset({
     "HAS_ASSEMBLY",
     "HAS_PART",
     "SHOWN_IN",
-}
+})
 
 # (label, src_space, tgt_space) → (relation, reverse)
 # REL_MAP이 공간쌍을 구분 못 하는 경우 명시 매핑. 3-tuple로 정확히 분기.
-LABEL_SPACE_OVERRIDE: dict[tuple[str, str, str], tuple[str, bool]] = {
+LABEL_SPACE_OVERRIDE: Mapping[tuple[str, str, str], tuple[str, bool]] = MappingProxyType({
     # ── SUPPORTS ─────────────────────────────────────────────────────────────
     ("SUPPORTS", "claim",     "evidence"): ("supports",      True),   # 반전 → evidence→claim:supports
     ("SUPPORTS", "claim",     "outcome"):  ("supports",      False),  # claim→outcome:supports (krds 18건)
@@ -164,7 +172,7 @@ LABEL_SPACE_OVERRIDE: dict[tuple[str, str, str], tuple[str, bool]] = {
     ("DEFINES",      "resource", "resource"): ("cites",      False),  # resource→resource: cites (AdminRule→Guideline 5건)
     ("COMPLIES_WITH","claim",    "resource"): ("states",     True),   # 반전 → resource→claim:states (8건)
     ("SCOPES",       "resource", "concept"):  ("mentions",   False),  # resource→concept: mentions (6건)
-}
+})
 
 def flatten_props(d: dict) -> dict:
     """Node props: primitives 유지, nested dict → str."""

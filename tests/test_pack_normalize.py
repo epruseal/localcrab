@@ -5,6 +5,8 @@
 적재 성공을 뜻하지 않게 되고, 그것이 2026-08-04 이관의 이유였다.
 """
 
+from types import MappingProxyType
+
 import pytest
 
 from opencrab.pack import normalize
@@ -322,11 +324,17 @@ def test_name_follows_label_when_present(space, node_type):
     assert props["name"] == "이름"
 
 
-def test_collection_completeness_gets_valid_status_and_score():
-    """status 는 enum(pass/retry/fail) — 위반값이 들어가면 add_node 가 skip 된다."""
+@pytest.mark.parametrize("bad", ["이상한값", "", None, "PASS", "passed"])
+def test_collection_completeness_corrects_every_invalid_status(bad):
+    """status 는 enum(pass/retry/fail) — 위반값이 들어가면 add_node 가 skip 된다.
+
+    빈 문자열까지 도는 이유: 유효값 튜플에서 한 원소를 빈 문자열로 바꾸는 변이는
+    빈 status 를 유효로 통과시킨다. 대표값 하나만 보면 그 변이가 생존한다
+    (2026-08-04 전면 스윕에서 실제로 생존했다).
+    """
     _s, t, _i, props = N.transform_node(
         "p", _node(space="claim", node_type="CollectionCompleteness",
-                   properties={"status": "이상한값"}))
+                   properties={"status": bad}))
     assert t == "CollectionCompleteness"
     assert props["status"] == "pass" and props["score"] == 1.0
 
@@ -662,3 +670,206 @@ def test_row_document_id_beats_metadata():
     meta = N.transform_chunk_meta(
         "p", {"metadata": {"document_id": "메타쪽"}, "document_id": "행쪽"})
     assert meta["document_id"] == "행쪽"
+
+
+# ── 표 불변성 / 필수 필드 / 제어문자 ──────────────────────────────────────────
+
+@pytest.mark.parametrize("name", ["REL_MAP", "LABEL_SPACE_OVERRIDE"])
+def test_mapping_tables_are_mapping_proxies(name):
+    """소비자 한 곳이 표를 바꾸면 적재기·게이트·리포트의 판정이 전역에서 오염된다.
+
+    표를 정본으로 모은 목적이 "판정이 한 곳에서만 정해진다"이므로, 우회 검사가 아니라
+    변형 가능성 자체를 없앤다(적대 검증 실증: REL_MAP_ISOLATED False, 2026-08-04).
+
+    타입으로 **분기**하지 말고 타입을 **단언**한다 — 분기하면 표가 mutable set 으로
+    바뀌었을 때 dict 쪽 가지로 빠져 엉뚱한 TypeError 로 통과한다(그렇게 썼다가 A7 을
+    생존시켰다).
+    """
+    table = getattr(N, name)
+    assert isinstance(table, MappingProxyType), f"{name} 이 {type(table).__name__} 이다"
+    with pytest.raises(TypeError):
+        table["오염"] = "값"          # type: ignore[index]
+
+
+def test_reverse_relations_is_a_frozenset():
+    assert isinstance(N.REVERSE_RELATIONS, frozenset), \
+        f"{type(N.REVERSE_RELATIONS).__name__} 이다"
+    with pytest.raises(AttributeError):
+        N.REVERSE_RELATIONS.add("오염")   # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("name", ["NODE_TYPE_OVERRIDE", "SPACE_DEFAULT_TYPE"])
+def test_schema_tables_are_mapping_proxies(name):
+    """형제 경로 — 같은 패턴이라 함께 막는다."""
+    from opencrab.pack import schema
+
+    table = getattr(schema, name)
+    assert isinstance(table, MappingProxyType), f"{name} 이 {type(table).__name__} 이다"
+    with pytest.raises(TypeError):
+        table["오염"] = ("concept", "Concept")
+
+
+def test_missing_id_raises_rather_than_yielding_none():
+    """`row["id"]` 다 — `.get()` 으로 바꾸면 node_id=None 노드가 조용히 만들어져
+    id_map 과 엣지 endpoint 가 통째로 어긋난다. 없는 id 는 즉시 실패해야 한다."""
+    row = {"label": "라벨", "space": "concept", "node_type": "Concept"}
+    with pytest.raises(KeyError):
+        N.transform_node("p", row)
+
+
+def test_explicit_none_space_is_not_coerced():
+    """`get(key, default)` 다 — falsy 폴백으로 바꾸면 None space 가 concept 으로 둔갑한다.
+    키가 있는데 값이 None 인 것은 데이터 결함이며 조용히 메우면 원인이 사라진다."""
+    space, _t, _i, _p = N.transform_node("p", _node(space=None, node_type="Concept"))
+    assert space is None
+
+
+def test_explicit_none_node_type_is_recorded_as_the_original():
+    """None 은 grammar 미등록이라 space 기본형으로 귀착하되, **원본이 None 이었다는 사실**이
+    original_type 에 남는다. falsy 폴백으로 바꾸면 node_type 이 애초에 "Concept" 이 되어
+    original_type 키 자체가 사라지고, 데이터 결함이 흔적 없이 지워진다."""
+    _s, node_type, _i, props = N.transform_node("p", _node(space="concept", node_type=None))
+    assert node_type == "Concept"
+    assert "original_type" in props and props["original_type"] is None
+
+
+def test_control_characters_in_property_values_survive():
+    """라벨뿐 아니라 properties 값에서도 NUL·제어문자를 제거하지 않는다."""
+    _s, _t, _i, props = N.transform_node("p", _node(properties={"v": "c\x00d\n\t"}))
+    assert props["v"] == "c\x00d\n\t"
+
+
+def test_control_characters_survive_flatten_of_nested_values():
+    assert N.flatten_props({"d": {"k": "a\x00b"}})["d"] == "{'k': 'a\\x00b'}"
+
+
+# ── 자동채움 클래스: 기존 유효값을 절대 덮지 않는다 ──────────────────────────
+#
+# 아래 표는 transform_node 의 required·enum 자동채움 **전량**이다. 하나씩 손으로
+# 검사하면 매번 인접한 것이 빠진다 — 실제로 여러 라운드에 걸쳐 그렇게 새어나갔다.
+# 필드를 추가하면 이 표에 넣는다.
+
+AUTOFILL_FIELDS = [
+    ("resource", "Document", "title"),
+    ("subject", "Team", "name"),
+    ("subject", "Org", "name"),
+    ("outcome", "Outcome", "name"),
+    ("lever", "Lever", "name"),
+    ("policy", "Policy", "name"),
+    ("policy", "Policy", "rule_type"),
+    ("subject", "User", "name"),
+    ("subject", "User", "email"),
+]
+
+
+@pytest.mark.parametrize("space,node_type,field", AUTOFILL_FIELDS)
+def test_autofill_never_overwrites_an_existing_value(space, node_type, field):
+    """조건은 전부 `not props.get(field)` 다 — 키 이름을 바꾸거나 조건을 없애면
+    팩이 준 값이 조용히 덮인다."""
+    _s, t, _i, props = N.transform_node(
+        "p", _node(space=space, node_type=node_type, label="라벨",
+                   properties={field: "원래값"}))
+    assert t == node_type
+    assert props[field] == "원래값"
+
+
+@pytest.mark.parametrize("space,node_type,field", AUTOFILL_FIELDS)
+def test_autofill_fills_when_the_field_is_blank(space, node_type, field):
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space=space, node_type=node_type, label="라벨",
+                   properties={field: ""}))
+    assert props[field]
+
+
+def test_user_email_is_not_marked_synthesized_when_supplied():
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="subject", node_type="User",
+                   properties={"email": "real@example.com"}))
+    assert props["email"] == "real@example.com"
+    assert "email_synthesized" not in props
+
+
+# ── enum 클래스: 유효값 튜플의 모든 원소를 존중한다 ──────────────────────────
+
+@pytest.mark.parametrize("role", ["admin", "editor", "viewer", "agent", "analyst", "engineer"])
+def test_every_valid_user_role_is_preserved(role):
+    """튜플에서 한 원소만 빠져도 그 역할이 viewer 로 강등된다 — 전 원소를 돈다."""
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="subject", node_type="User", properties={"role": role}))
+    assert props["role"] == role and "role_original" not in props
+
+
+def test_absent_role_is_left_alone():
+    _s, _t, _i, props = N.transform_node("p", _node(space="subject", node_type="User"))
+    assert "role" not in props and "role_original" not in props
+
+
+def test_absent_document_format_is_left_alone():
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="resource", node_type="Document"))
+    assert "format" not in props and "format_original" not in props
+
+
+# ── 기본값 클래스: 키가 아예 없을 때의 폴백 ──────────────────────────────────
+
+def test_missing_space_defaults_to_concept():
+    """`row.get("space", "concept")` — 기본값을 지우면 None 이 흘러 grammar 조회가 깨진다."""
+    row = {"id": "n1", "label": "라벨", "node_type": "Concept"}
+    space, node_type, _i, _p = N.transform_node("p", row)
+    assert (space, node_type) == ("concept", "Concept")
+
+
+def test_missing_node_type_defaults_to_concept_type():
+    row = {"id": "n1", "label": "라벨", "space": "concept"}
+    space, node_type, _i, props = N.transform_node("p", row)
+    assert (space, node_type) == ("concept", "Concept")
+    assert "original_type" not in props        # 기본값이므로 remap 이 아니다
+
+
+@pytest.mark.parametrize("space", [None, "", "존재하지않는space"])
+def test_unknown_space_does_not_crash_type_resolution(space):
+    """`_GRAMMAR_SPACES.get(space, {})` 의 기본값을 지우면 None.get 으로 죽는다."""
+    assert N.resolve_node_space_type(space, "Concept") == (space, "Concept")
+
+
+# ── statement 폴백 클래스 ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("node_type", ["Claim", "CollectionCompleteness", "Covariate"])
+def test_statement_branch_covers_every_listed_type(node_type):
+    _s, _t, _i, props = N.transform_node(
+        "p", _node(space="claim", node_type=node_type, label="라벨"))
+    assert props["statement"] == "라벨"
+
+
+def test_statement_fallback_order_is_text_then_description_then_label():
+    both = N.transform_node("p", _node(
+        space="claim", node_type="Claim", label="라벨",
+        properties={"text": "본문", "description": "설명"}))[3]
+    assert both["statement"] == "본문"
+    desc_only = N.transform_node("p", _node(
+        space="claim", node_type="Claim", label="라벨",
+        properties={"description": "설명"}))[3]
+    assert desc_only["statement"] == "설명"
+    neither = N.transform_node("p", _node(
+        space="claim", node_type="Claim", label="라벨", properties={}))[3]
+    assert neither["statement"] == "라벨"
+
+
+def test_existing_statement_is_not_replaced():
+    _s, _t, _i, props = N.transform_node("p", _node(
+        space="claim", node_type="Claim", label="라벨",
+        properties={"statement": "원래 문장", "text": "본문"}))
+    assert props["statement"] == "원래 문장"
+
+
+def test_types_outside_the_statement_list_get_no_statement():
+    """`and` 를 `or` 로 바꾸면 관계없는 노드에도 statement 가 생긴다."""
+    _s, _t, _i, props = N.transform_node("p", _node(space="concept", node_type="Concept"))
+    assert "statement" not in props
+
+
+# ── resolve_edge 경계 ────────────────────────────────────────────────────────
+
+def test_none_label_is_treated_as_empty():
+    """`(label or "")` 의 기본값을 지우면 None.upper() 로 죽는다."""
+    assert N.resolve_edge(None, "concept", "concept") == ("concept", "", "concept", False)

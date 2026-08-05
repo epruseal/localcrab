@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from opencrab.grammar.manifest import META_EDGES
@@ -147,7 +149,7 @@ TRACE_SRC: frozenset[str] = frozenset({"claim", "lever", "outcome", "policy"})
 # 통째로 skip 된다(예: evidence 노드에 node_type="TextUnit" -> 적재기가 concept 으로
 # remap -> 연결 엣지 전량 유실). 그래서 빌더의 validate() 가 이 표를 보고 함정을 경고한다.
 # 이관 전에는 이 표가 적재기에만 있어 빌더가 역방향 import(try/except) 로 겨우 참조했다.
-NODE_TYPE_OVERRIDE: dict[str, tuple[str, str]] = {
+NODE_TYPE_OVERRIDE: Mapping[str, tuple[str, str]] = MappingProxyType({
     # codex 구형 (evidence -> concept 수정)
     "TextUnit":             ("concept",    "Topic"),
     # graphrag/구형 Entity(필수 prop name·entity_type 미보유) -> Concept 통합
@@ -237,10 +239,10 @@ NODE_TYPE_OVERRIDE: dict[str, tuple[str, str]] = {
     "AuthorIndex":          ("subject",    "Org"),
     "Theme":                ("concept",    "Concept"),
     "Genre":                ("concept",    "Concept"),
-}
+})
 
 # node_type 이 NODE_TYPE_OVERRIDE 에도 없을 때 space 로 기본 타입 결정.
-SPACE_DEFAULT_TYPE: dict[str, tuple[str, str]] = {
+SPACE_DEFAULT_TYPE: Mapping[str, tuple[str, str]] = MappingProxyType({
     "evidence":  ("evidence",  "Evidence"),
     "resource":  ("resource",  "Document"),
     "subject":   ("subject",   "Org"),
@@ -250,7 +252,7 @@ SPACE_DEFAULT_TYPE: dict[str, tuple[str, str]] = {
     "policy":    ("policy",    "Policy"),
     "claim":     ("claim",     "Claim"),
     "community": ("community", "Community"),
-}
+})
 
 
 # ── 레거시 흡수 규칙 ────────────────────────────────────────────
