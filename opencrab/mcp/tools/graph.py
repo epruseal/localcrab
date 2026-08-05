@@ -286,6 +286,20 @@ def ontology_list_nodes(
     count. When pack_id is absent, falls back to the doc store's
     list_nodes (unchanged, pre-existing "total = len(page)" behavior for
     that path -- not part of #54's pack_id+space scope).
+
+    SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
+    export_nodes are two separate queries, not wrapped in one transaction/
+    snapshot. A write landing on the same pack_id/space between them can
+    make ``total`` and ``len(nodes)`` momentarily disagree (e.g. a node
+    inserted in that gap is counted in ``total`` but missed by the already-
+    issued ``export_nodes`` page, or vice versa for a delete). This is a
+    deliberate tradeoff, not an oversight: a cross-query transaction here
+    would need to work uniformly across three backends with different
+    transaction/snapshot primitives (SQL, Kuzu, Neo4j) for a single-user,
+    mostly-read MCP tool call, which is not worth the complexity for a
+    momentary, self-correcting inconsistency (the next call reflects
+    current state). Callers must not assume ``total`` and ``len(nodes)``
+    are always perfectly reconciled under concurrent writes.
     """
     from opencrab.mcp.tools import _clean_str, _get_context
 

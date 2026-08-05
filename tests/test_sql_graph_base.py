@@ -85,7 +85,7 @@ def test_graph_store_schema_renders_and_executes_sqlite():
         indexes = {
             r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
         }
-        assert {"idx_nodes_pack", "idx_edges_from", "idx_edges_to"} <= indexes
+        assert {"idx_nodes_pack", "idx_nodes_space", "idx_edges_from", "idx_edges_to"} <= indexes
     finally:
         conn.close()
 
@@ -476,6 +476,32 @@ def test_count_exported_nodes_not_capped_by_limit():
 
     total = store.count_exported_nodes(pack_id="p1", space="concept")
     assert total == 30  # but the true count is not
+
+
+def test_count_exported_nodes_query_uses_space_index_not_full_scan():
+    """issue #54 audit finding [4]: adding count_exported_nodes doubles the
+    number of queries ontology_list_nodes issues (one for the page, one for
+    total). Measured against 250k rows / 200 packs x 3 spaces, the combined
+    "(pack_id OR source OR source_id) AND space_id" predicate did a full
+    `SCAN graph_nodes` (idx_nodes_pack alone can't help: SQLite won't turn a
+    3-way OR across one indexed + two unindexed expressions into an index
+    union) -- ~209ms per call at that scale. Adding idx_nodes_space (a
+    plain column index, same idea as idx_edges_from/idx_edges_to) flips the
+    plan to `SEARCH ... USING INDEX idx_nodes_space`, since space_id is
+    always present in this call path and highly selective. This asserts the
+    plan, not just correctness, so a future change that silently drops
+    space_id from the WHERE clause (defeating the index) is caught here."""
+    store = _store()
+    conn = store._conn  # _SqliteGraphStoreDouble exposes the raw sqlite3 connection
+    # Reuse the exact same WHERE builder count_exported_nodes calls (not a
+    # hand-typed reconstruction) so this test's query can't silently drift
+    # from what the implementation actually runs.
+    where_sql, params = store._export_nodes_where("p1", "concept")
+    sql = f"SELECT COUNT(*) FROM graph_nodes{where_sql}"
+    plan = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    plan_text = " ".join(str(row) for row in plan)
+    assert "SCAN graph_nodes" not in plan_text
+    assert "idx_nodes_space" in plan_text
 
 
 def test_upsert_nodes_batch_and_edges_batch():

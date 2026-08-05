@@ -37,28 +37,36 @@ of each store module):
     find_path             yes     yes     yes     yes
     count_nodes           yes     yes     yes     yes
     -------------------- ------- ------- ------- -------
-    get_node_by_id        yes     yes     yes     NO
-    list_packs            yes     yes     yes     NO
-    find_by_relations     yes     yes     yes     NO
-    export_nodes          yes     yes     yes     NO
-    export_edges          yes     yes     yes     NO
-    upsert_nodes_batch    yes     yes     yes     NO
-    upsert_edges_batch    yes     yes     yes     NO
+    get_node_by_id        yes     yes     yes     yes
+    list_packs            yes     yes     yes     yes
+    find_by_relations     yes     yes     yes     yes
+    export_nodes          yes     yes     yes     yes
+    count_exported_nodes  yes     yes     yes     yes
+    export_edges          yes     yes     yes     yes
+    upsert_nodes_batch    yes     yes     yes     yes
+    upsert_edges_batch    yes     yes     yes     yes
 
-Neo4j is missing exactly 7 methods (the "extended" block above) — this is
-D3's worklist for Stage 4's R5 leg. Note ``get_node_by_id`` is grouped with
-the extended/missing block, NOT the always-present block: Neo4jStore has no
-such method (its callers fall back to a type-agnostic ``run_cypher`` MATCH
-instead — see opencrab/mcp/tools.py:ontology_get_node and
-opencrab/ontology/impact.py's ``_is_local`` branch).
+CORRECTION (issue #54 audit finding [5], verified by grepping each `def` in
+neo4j_store.py): this table previously marked all 7 "extended" methods NO
+for Neo4j and claimed "Neo4j is missing exactly 7 methods" — stale relative
+to the source (already flagged separately as issue #64's D-3, since
+Neo4jStore has implemented every one of them for a while). Corrected here
+because #54's own changes added a new method (``count_exported_nodes``) and
+extended an existing one (``export_nodes``) on Neo4jStore, which would have
+made the table's staleness worse if left uncorrected. Note this table only
+tracks *method presence*; whether ``isinstance(store, GraphStore)`` /
+``isinstance(store, GraphStoreExtended)`` actually evaluates True for
+Neo4jStore today (the runtime-checkable behavior implied by the surrounding
+module docstring, e.g. mcp/tools.py's and ontology/impact.py's isinstance
+branches) is unverified here and is #64's scope, not #54's — do not treat
+this table's "yes" as a claim about those call sites' current behavior.
 
 ``@runtime_checkable`` is set so ``isinstance(store, GraphStore)`` works as
 a drop-in replacement for the ``isinstance(store, (LocalGraphStore,
-KuzuGraphStore, PGGraphStore))`` tuple checks above — note that until D3
-closes the gap, Neo4jStore will NOT satisfy this Protocol (isinstance check
-fails, since 7 required methods are absent), so ``GraphStoreExtended``
-below is deliberately split out as a separate Protocol consumers can check
-against independently of the base ``GraphStore``.
+KuzuGraphStore, PGGraphStore))`` tuple checks above; ``GraphStoreExtended``
+below is a separate Protocol consumers can check against independently of
+the base ``GraphStore`` (see #64 for whether that split is still warranted
+now that method presence is at parity).
 """
 
 from __future__ import annotations
@@ -363,9 +371,13 @@ class GraphStoreExtended(Protocol):
         except ``KuzuGraphStore``'s ``pack_id`` case: ``pack_id`` lives
         inside a JSON-serialized ``props`` blob Cypher cannot index into (the
         same limitation ``export_nodes`` has there), so when ``pack_id`` is
-        given, KuzuGraphStore falls back to an unbounded ``export_nodes``
-        scan + Python filter to keep the count exact -- see
-        ``KuzuGraphStore.count_exported_nodes`` for the tracked follow-up.
+        given, KuzuGraphStore scans every space-matching row (no LIMIT
+        clause -- a cap here would just move issue #54's bug to a bigger
+        number) and counts the Python-filtered result. This guarantee --
+        exact, uncapped, regardless of match count -- holds for every
+        implementation and every argument combination; see
+        ``KuzuGraphStore.count_exported_nodes`` for the tracked scalability
+        follow-up (the pack_id case costs an O(n) scan, not O(1)).
         """
         ...
 

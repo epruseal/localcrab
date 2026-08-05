@@ -618,23 +618,43 @@ class KuzuGraphStore:
         on ``space`` alone -- cheap, no row materialization. When
         ``pack_id`` IS given, an exact server-side count is not possible:
         ``pack_id`` lives inside the JSON-serialized ``props`` blob (same
-        limitation ``export_nodes`` has), so this falls back to an unbounded
-        ``export_nodes`` scan + Python filter and counts the result. That
-        keeps the count exact at the cost of an O(n) scan specific to this
-        backend's pack_id+space combination -- a pre-existing characteristic
-        of Kuzu's pack_id filter (already true of ``export_nodes`` itself),
-        not a new regression. Tracked separately as a scalability follow-up,
-        not fixed here.
+        limitation ``export_nodes`` has), so this scans every space-matching
+        row and counts the Python-filtered result -- deliberately with NO
+        LIMIT clause in the Cypher (audit finding #54-[7]: an earlier
+        version delegated to ``export_nodes(..., limit=500_000)``, which
+        silently re-capped `total` at 500,000 instead of the caller's
+        original `limit` -- same bug, bigger ceiling. There is no cap here
+        at all, so there is no ceiling to hit regardless of match count).
+        That keeps the count exact at the cost of an O(n) scan specific to
+        this backend's pack_id+space combination -- a pre-existing
+        characteristic of Kuzu's pack_id filter (already true of
+        ``export_nodes`` itself), not a new regression. Tracked separately
+        as a scalability follow-up, not fixed here.
         """
         self._require_available()
-        if pack_id is not None:
-            return len(self.export_nodes(pack_id=pack_id, space=space, limit=500_000))
         where_clause = "WHERE n.space_id = $space " if space is not None else ""
         params = {"space": space} if space is not None else {}
+        if pack_id is None:
+            r = self._conn.execute(
+                f"MATCH (n:OntologyNode) {where_clause}RETURN count(n)", params
+            )
+            return int(r.get_next()[0])
+        # No LIMIT clause anywhere in this query -- unlike export_nodes,
+        # which needs one for its display-page contract, a count has no use
+        # for a partial scan.
         r = self._conn.execute(
-            f"MATCH (n:OntologyNode) {where_clause}RETURN count(n)", params
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.props", params
         )
-        return int(r.get_next()[0])
+        count = 0
+        while r.has_next():
+            props = _parse(r.get_next()[0])
+            if (
+                props.get("pack_id") == pack_id
+                or props.get("source") == pack_id
+                or props.get("source_id") == pack_id
+            ):
+                count += 1
+        return count
 
     def export_edges(
         self,

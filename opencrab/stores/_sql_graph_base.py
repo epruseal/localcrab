@@ -174,6 +174,18 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
     ),
     indexes=(
         IndexSpec("idx_nodes_pack", "graph_nodes", json_key=("properties", "pack_id")),
+        # issue #54 audit finding [4]: export_nodes/count_exported_nodes's
+        # combined "pack_id OR source OR source_id) AND space_id" WHERE was
+        # measured (250k rows, 200 packs x 3 spaces) doing a full
+        # `SCAN graph_nodes` -- idx_nodes_pack alone doesn't help because
+        # SQLite won't turn a 3-way OR across one indexed + two unindexed
+        # expressions into an index-union. Adding this single plain-column
+        # index on the always-present, highly-selective space_id flips the
+        # plan to `SEARCH ... USING INDEX idx_nodes_space`, cutting the
+        # measured COUNT from ~209ms to ~93-116ms (see PR discussion) --
+        # same "index instead of eating the scan" resolution #63 used for
+        # its own 3x regression.
+        IndexSpec("idx_nodes_space", "graph_nodes", expr="space_id"),
         IndexSpec("idx_edges_from", "graph_edges", expr="from_id"),
         IndexSpec("idx_edges_to", "graph_edges", expr="to_id"),
     ),
