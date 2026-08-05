@@ -369,12 +369,9 @@ class SqliteVecStore(_SqliteConnMixin):
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
-        with self._lock:
+        with self._tx() as conn:
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                self._conn.execute(
-                    insert_sql, self._insert_params(_id, text, meta, vec)
-                )
-            self._conn.commit()
+                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
 
@@ -396,15 +393,10 @@ class SqliteVecStore(_SqliteConnMixin):
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
-        with self._lock:
+        with self._tx() as conn:
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                self._conn.execute(
-                    f"DELETE FROM {self._table} WHERE node_id = ?", (_id,)
-                )
-                self._conn.execute(
-                    insert_sql, self._insert_params(_id, text, meta, vec)
-                )
-            self._conn.commit()
+                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
+                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
 
@@ -412,12 +404,9 @@ class SqliteVecStore(_SqliteConnMixin):
         self._require_available()
         if not ids:
             return
-        with self._lock:
+        with self._tx() as conn:
             for _id in ids:
-                self._conn.execute(
-                    f"DELETE FROM {self._table} WHERE node_id = ?", (_id,)
-                )
-            self._conn.commit()
+                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
         self._ann_cache = None  # in-process write → invalidate ANN cache
 
     def reset_collection(self) -> None:
@@ -426,14 +415,11 @@ class SqliteVecStore(_SqliteConnMixin):
         table" gap, and the write lock serialises concurrent resets. Same
         dim/schema is retained (dim is fixed at construction)."""
         self._require_available()
-        with self._lock:
+        with self._tx() as conn:
             # ensure the table exists (idempotent, schema-preserving) then
             # clear all rows atomically
-            self._conn.execute(
-                self._create_table_sql(with_bit=self._has_bit_column)
-            )
-            self._conn.execute(f"DELETE FROM {self._table}")
-            self._conn.commit()
+            conn.execute(self._create_table_sql(with_bit=self._has_bit_column))
+            conn.execute(f"DELETE FROM {self._table}")
         self._ann_cache = None  # in-process write → invalidate ANN cache
         logger.info("SqliteVecStore: table '%s' reset.", self._table)
 

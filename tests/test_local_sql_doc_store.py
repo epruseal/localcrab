@@ -6,6 +6,7 @@ Fixture: tmp_path creates a fresh DB file per test; no shared state.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -211,6 +212,132 @@ class TestSource:
 
     def test_list_sources_empty_returns_empty(self, store):
         assert store.list_sources() == []
+
+
+class _FTSFailProxy:
+    """sqlite3.Connection is an immutable C type (can't monkeypatch its
+    execute directly), so this thin proxy stands in for the thread-local
+    connection to force the FTS5 INSERT to fail while delegating everything
+    else to the real connection — including commit()/rollback(), so the
+    real connection's transaction state is what gets asserted on."""
+
+    def __init__(self, real: sqlite3.Connection, fail_marker: str = "INSERT INTO doc_sources_fts") -> None:
+        self._real = real
+        self._fail_marker = fail_marker
+
+    def _check(self, sql: str) -> None:
+        if self._fail_marker in sql:
+            raise sqlite3.OperationalError("forced failure: " + self._fail_marker)
+
+    def execute(self, sql, params=None):
+        self._check(sql)
+        return self._real.execute(sql) if params is None else self._real.execute(sql, params)
+
+    def executemany(self, sql, params_list):
+        return self._real.executemany(sql, params_list)
+
+    def commit(self):
+        return self._real.commit()
+
+    def rollback(self):
+        return self._real.rollback()
+
+
+class TestUpsertSourceTransaction:
+    """Issue #79: upsert_source used to write doc_sources via
+    super().upsert_source() (its own commit), then sync doc_sources_fts in a
+    SEPARATE commit. A failure in the FTS step left doc_sources committed but
+    doc_sources_fts not — permanently inconsistent, and no rollback could fix
+    it because the doc_sources commit had already happened. Now both writes
+    share one _exec_write_many transaction."""
+
+    def test_fts_failure_rolls_back_doc_sources_too(self, store):
+        store.upsert_source("keep", "baseline, unrelated", {})
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # doc_sources rolled back together with the FTS failure, not left as
+        # an orphaned commit inconsistent with the (also-absent) FTS row.
+        assert store.get_source("src1") is None
+        assert store.get_source("keep") is not None
+
+    def test_later_write_does_not_smuggle_in_failed_upsert(self, store):
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # unrelated, independent successful write on the same thread connection
+        store.upsert_source("src2", "second", {})
+        assert store.get_source("src1") is None
+        assert store.get_source("src2") is not None
+
+
+class TestFtsBootstrapRollback:
+    """Issue #79 adversarial-verification follow-up: _init_db's FTS5
+    bootstrap (CREATE VIRTUAL TABLE + one-time backfill INSERT) commits
+    unconditionally on success, but unlike the core DDL block it does NOT
+    make the store unavailable on failure (_fts_ok just goes False) — so the
+    store keeps accepting writes afterward on the same thread connection.
+
+    NOTE on what actually rolls back: CREATE VIRTUAL TABLE is DDL — Python's
+    sqlite3 module does not open an implicit transaction ahead of DDL (only
+    ahead of DML), so it autocommits immediately regardless of _tx() and
+    stays created (harmless: IF NOT EXISTS makes re-running it a no-op). The
+    real risk _tx() closes is the backfill INSERT (DML): before this fix, a
+    mid-INSERT failure left that statement's implicit transaction open with
+    no commit/rollback, and the NEXT successful write's commit() on the same
+    connection would confirm it. _tx()'s except-clause rollback() now closes
+    that transaction unconditionally on any failure in the block.
+
+    REPRO NOTE: a Python-level proxy that raises BEFORE delegating to the
+    real sqlite3 connection never reaches the engine, so it never actually
+    opens sqlite3's implicit transaction — asserting rollback happened would
+    trivially pass even with no rollback() call at all (that was the exact
+    gap an adversarial review caught in an earlier version of this test).
+    This test instead corrupts a real FTS5 shadow table
+    (``doc_sources_fts_docsize``, one of the internal tables FTS5 itself
+    creates to track per-row bookkeeping) so ``COUNT(*)`` — a plain read —
+    still succeeds and the backfill branch is taken, but the backfill INSERT
+    genuinely fails INSIDE SQLite's engine ("SQL logic error", confirmed
+    empirically), which is a real step-time failure and therefore DOES open
+    sqlite3's implicit transaction before failing — the same class of
+    failure a real disk/constraint error would cause in production."""
+
+    def test_backfill_failure_leaves_no_dangling_transaction(self, store):
+        real_conn = store._conn
+        # Two source rows inserted directly (bypassing upsert_source, so
+        # doc_sources_fts is never synced) — matches the legacy-DB state the
+        # one-time backfill branch (n_fts == 0 and n_src > 0) exists to fix.
+        real_conn.execute(
+            "INSERT INTO doc_sources VALUES ('s1', 'hello world', '{}', '2020-01-01')"
+        )
+        real_conn.execute(
+            "INSERT INTO doc_sources VALUES ('s2', 'second row', '{}', '2020-01-01')"
+        )
+        real_conn.commit()
+        real_conn.execute("DROP TABLE doc_sources_fts_docsize")
+        real_conn.commit()
+        assert real_conn.in_transaction is False  # clean baseline before the repro
+
+        store._init_db()  # re-run bootstrap; backfill INSERT fails for real
+
+        assert store._fts_ok is False
+        # _tx()'s rollback() closed the transaction the failed INSERT
+        # genuinely opened inside SQLite — not left dangling for a later
+        # write's commit() to sweep up.
+        assert real_conn.in_transaction is False
+
+        # a normal unrelated write on the same thread still commits cleanly
+        # and only itself — nothing from the failed backfill is smuggled in.
+        store.upsert_node_doc("s", "T", "n1", {})
+        assert store.get_node_doc("s", "n1") is not None
 
 
 # ---------------------------------------------------------------------------
