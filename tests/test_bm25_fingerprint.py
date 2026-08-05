@@ -126,7 +126,10 @@ def test_t8_invalidate_marks_dirty() -> None:
 
 
 def test_t8_bm25_fingerprint_matches_compute_fingerprint(tmp_path) -> None:
-    """The cheap SQL fingerprint must equal compute_fingerprint(list_nodes)."""
+    """The cheap SQL fingerprint always reflects the WHOLE table (#63), so it
+    matches compute_fingerprint(list_nodes(<uncapped>)) regardless of the
+    `limit` kwarg passed to bm25_fingerprint — that kwarg is kept only for
+    call-site compatibility with BM25's _BM25_NODE_LIMIT and is not applied."""
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
     ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
@@ -135,11 +138,9 @@ def test_t8_bm25_fingerprint_matches_compute_fingerprint(tmp_path) -> None:
     ds.upsert_node_doc("claim", "Claim", "a", {"name": "alpha"})
     ds.upsert_node_doc("claim", "Claim", "b", {"name": "beta"})
 
-    # Full set and a smaller cap (mirrors BM25's _BM25_NODE_LIMIT slicing).
+    whole_table = compute_fingerprint(ds.list_nodes(limit=50000))
     for lim in (50000, 1):
-        assert ds.bm25_fingerprint(limit=lim) == compute_fingerprint(
-            ds.list_nodes(limit=lim)
-        )
+        assert ds.bm25_fingerprint(limit=lim) == whole_table
 
 
 def test_t8_coalesces_burst_invalidations() -> None:

@@ -188,28 +188,42 @@ class _SqlDocStoreBase(abc.ABC):
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         self._require_available()
         table = self._table("doc_nodes")
+        # ORDER BY updated_at DESC: 정렬 없이 LIMIT 만 걸면 어느 행이 뽑힐지 SQL 표준상
+        # 보장되지 않는다(#63). 최신순으로 고정해 상한을 넘는 코퍼스에서도 최소한
+        # 최근 변경분은 검색 가능하고, 선택 결과가 결정적이도록 한다.
         if space:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} WHERE space=:space LIMIT :lim"
+                f" FROM {table} WHERE space=:space ORDER BY updated_at DESC LIMIT :lim"
             )
             params = {"space": space, "lim": limit}
         else:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} LIMIT :lim"
+                f" FROM {table} ORDER BY updated_at DESC LIMIT :lim"
             )
             params = {"lim": limit}
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
     def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
+        """Cheap ``(COUNT(*), MAX(updated_at))`` staleness probe over the WHOLE
+        ``doc_nodes`` table — deliberately independent of ``limit`` (#63).
+
+        The BM25 index only ever holds up to ``limit`` rows (see
+        ``HybridQuery`` / ``_BM25_NODE_LIMIT``), but the fingerprint must not
+        share that cap: once the corpus exceeds it, a capped COUNT pins at
+        exactly ``limit`` forever, so count-based change detection would never
+        fire again regardless of row ordering. ``limit`` is kept as a
+        parameter only for call-site compatibility with callers that pass the
+        BM25 cap; it is not applied here.
+        """
         self._require_available()
         sql = (
             f"SELECT COUNT(*) AS cnt, MAX(updated_at) AS max_ts"
-            f" FROM (SELECT updated_at FROM {self._table('doc_nodes')} LIMIT :lim) sub"
+            f" FROM {self._table('doc_nodes')}"
         )
-        row = self._fetch_one(sql, {"lim": limit})
+        row = self._fetch_one(sql, {})
         count = int(self._row_get(row, "cnt"))
         max_ts = self._row_get(row, "max_ts")
         return (count, _ts_str(max_ts) if max_ts is not None else "")

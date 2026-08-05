@@ -486,9 +486,16 @@ class HybridQuery:
         legacy stores without the capability. Returns ``None`` on error so the
         caller simply skips the staleness check and serves the current index.
 
-        Must stay byte-for-byte equal to the fingerprint that
-        ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))`` records, including the
-        ``_BM25_NODE_LIMIT`` cap, so callers compare apples to apples.
+        NOTE (#63): ``doc_store.bm25_fingerprint()`` now reports the WHOLE
+        table, deliberately ignoring ``_BM25_NODE_LIMIT`` — a capped fingerprint
+        pins at exactly the cap once the corpus exceeds it, so count-based
+        change detection would never fire again. That means this probe is
+        *not* byte-for-byte equal to ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))``'s
+        recorded fingerprint once the corpus exceeds the cap: they will keep
+        differing (by count) even when nothing new has changed, which
+        schedules a harmless-but-recurring debounced background rescan. Legacy
+        stores without ``bm25_fingerprint()`` fall back to the capped
+        ``compute_fingerprint`` below and don't have this effect.
         """
         ds = self._doc_store
         if ds is None:
