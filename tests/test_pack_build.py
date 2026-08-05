@@ -1,6 +1,6 @@
 """팩 생산자(opencrab.pack.build) 테스트.
 
-이관 전 이 코드는 opencrab-dump 에 있었고 테스트가 없었다. 계약(schema)과 같은 리포로
+이관 전 이 코드는 호스트 리포에 있었고 테스트가 없었다. 계약(schema)과 같은 리포로
 옮겨온 목적이 "생산자와 소비자를 한 스위트에서 묶는 것"이므로, 여기서는 생산자가 계약을
 지키는지와 이관에서 바뀐 두 가지(출력 루트, remap 함정 검사)를 고정한다.
 """
@@ -27,7 +27,7 @@ from opencrab.pack.schema import (
 
 @pytest.fixture(autouse=True)
 def _no_host_default(monkeypatch):
-    """호스트 리포(opencrab-dump shim)가 주입하는 기본값에서 테스트를 격리한다."""
+    """호스트 리포의 shim 이 주입하는 기본값에서 테스트를 격리한다."""
     monkeypatch.setattr(build_mod, "DEFAULT_OUT_ROOT", None)
     monkeypatch.delenv("PACK_OUT_ROOT", raising=False)
 
@@ -58,8 +58,8 @@ class TestOutRoot:
     def test_missing_out_root_raises(self):
         """자동 유도는 리포를 넘는 순간 조용히 틀린 곳에 쓴다(mkdir(exist_ok=True) 라 예외도 없다).
 
-        이관 전에는 `Path(__file__).parents[2] / 'by-pack'` 이었고, 이 파일이 localcrab 으로
-        온 지금 그 코드가 남아 있었다면 localcrab 리포 안에 by-pack 을 만들었을 것이다.
+        이관 전에는 `Path(__file__).parents[2] / <출력 디렉터리>` 였고, 이 파일이 이리로
+        온 지금 그 코드가 남아 있었다면 **이 리포 안에** 출력 디렉터리를 만들었을 것이다.
         """
         with pytest.raises(ValueError, match="출력 루트"):
             Pack("t", "제목")
@@ -70,7 +70,7 @@ class TestOutRoot:
             Pack("t", "제목")
 
     def test_host_default_out_root_is_used(self, tmp_path, monkeypatch):
-        """호스트 리포가 주입하는 기본값. opencrab-dump shim 이 이 경로로 by-pack 을 준다."""
+        """호스트 리포가 주입하는 기본값. 호스트 shim 이 이 경로로 출력 루트를 준다."""
         monkeypatch.setattr(build_mod, "DEFAULT_OUT_ROOT", str(tmp_path))
         assert Pack("t", "제목").out == tmp_path / "t"
 
@@ -83,7 +83,7 @@ class TestOutRoot:
         """**회귀 검사.** 한때 shim 이 `os.environ.setdefault('PACK_OUT_ROOT', ...)` 로
         기본값을 넣었다. 그러면 `os.environ.get('PACK_OUT_ROOT')` 로 "호출자가 드라이런을
         지정했는가"를 판정하던 코드가 항상 참이 되어, 운영 빌드가 git 추적 산출물
-        (chatgpt/canonical/, *-prep/00_index/) 대신 스크래치 경로로 조용히 새 나갔다.
+        (git 추적 산출물) 대신 스크래치 경로로 조용히 새 나갔다.
         exit 0 에 성공 배너까지 나서 아무도 몰랐다(2026-08-04 검증에서 발각).
 
         출력 루트 해석은 프로세스 전역 상태를 건드리면 안 된다.
@@ -606,7 +606,7 @@ class TestSave:
         assert len(stamps) == 1
 
     def test_module_reexports_json_for_legacy_builders(self):
-        """`pack_lib.json.dumps(...)` 를 쓰는 빌더가 있다(실측 3곳)."""
+        """`<이 모듈>.json.dumps(...)` 처럼 모듈을 통해 접근하는 빌더가 있다(실측 3곳)."""
         from opencrab.pack import build
         assert build.json is json
 
@@ -936,7 +936,7 @@ class TestDiagnosticsReportRealNumbers:
 class TestPublicSurface:
     """`__all__` 은 장식이 아니라 레거시 빌더의 접근 계약이다.
 
-    `pack_lib.json.dumps(...)`, `pack_lib.ALL_SPACES`, `pack_lib._NODE_STRUCT_KEYS`
+    `<이 모듈>.json.dumps(...)`, `<이 모듈>.ALL_SPACES`, `<이 모듈>._NODE_STRUCT_KEYS`
     처럼 모듈을 통해 접근하는 빌더가 있다(실측 3곳/2곳/1곳). 스윕에서 `__all__` 항목
     문자열을 바꾸는 변이 6 건이 전부 생존했다.
     """
@@ -972,7 +972,7 @@ class TestDefaults:
 
     적대 검증이 `source_type='reference-public'` 를 `'reference-private'` 로 바꿨는데
     57 건이 전부 통과했다(2026-08-05). 기존 검사가 override 경로만 봤기 때문이다.
-    실측: opencrab-dump 의 `Pack()` 대입 60 건 중 `source_type` 을 명시하는 것은 22 건
+    실측: 호스트 리포의 `Pack()` 대입 60 건 중 `source_type` 을 명시하는 것은 22 건
     뿐이고 **38 건이 이 기본값에 의존**한다. 이 값은 노드·청크의 최상위 필드로 그대로
     라이브에 실린다.
     """

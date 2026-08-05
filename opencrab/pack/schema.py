@@ -1,9 +1,9 @@
-"""by-pack 팩 소스 포맷의 계약(contract) 정본.
+"""팩 소스 포맷의 계약(contract) 정본.
 
-`by-pack/<slug>/{nodes,edges,chunks}.jsonl` 은 생산자(팩 빌더)와 소비자(적재기,
-채점기, cloud-pack 조립기)가 공유하는 교환 포맷이다. 이 모듈이 그 포맷을 코드로
-정의한다. 이전에는 정의가 어디에도 없고 생산자와 소비자가 서로 다른 리포에서
-같은 규칙을 각자 재선언했으며, 그 결과 두 번의 실사고가 났다.
+`<팩>/{nodes,edges,chunks}.jsonl` 은 생산자(팩 빌더)와 소비자(적재기, 채점기,
+cloud-pack 조립기)가 공유하는 교환 포맷이다. 이 모듈이 그 포맷을 코드로 정의한다.
+이전에는 정의가 어디에도 없고 생산자와 소비자가 서로 다른 리포에서 같은 규칙을
+각자 재선언했으며, 그 결과 두 번의 실사고가 났다.
 
 1. 노드 커스텀 필드 91만 건이 라이브에 도달하지 못했다. 생산자는 props 를 노드
    최상위에 펼쳤고 소비자는 중첩 ``properties`` 만 읽었다. 어느 게이트도 잡지
@@ -72,9 +72,9 @@ RESERVED_NODE_KEYS: frozenset[str] = frozenset({
 def _allowed_from_manifest() -> dict[tuple[str, str], frozenset[str]]:
     """(from_space, to_space) -> 허용 relation 집합, grammar manifest 에서 직접 유도.
 
-    스냅샷을 뜨지 않는다. opencrab-dump 에는 이 표를 손으로 베낀 사본이 있었고
-    "변경 시 동기화" 주석에 정합성을 맡기고 있었다. 유도로 바꾸면 드리프트가
-    구조적으로 불가능해진다.
+    스냅샷을 뜨지 않는다. 호출자 쪽에 이 표를 손으로 베낀 사본이 있었고 "변경 시
+    동기화" 주석에 정합성을 맡기고 있었다. 유도로 바꾸면 드리프트가 구조적으로
+    불가능해진다.
     """
     return {
         (e["from_space"], e["to_space"]): frozenset(e["relations"])

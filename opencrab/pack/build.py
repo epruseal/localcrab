@@ -40,8 +40,8 @@ _RESERVED_NODE_KEYS = RESERVED_NODE_KEYS
 _NS = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 
 # 이 모듈 안에서는 안 쓰지만 **모듈 속성으로 노출돼야 하는** 이름들.
-# 기존 빌더들이 `pack_lib.json.dumps(...)`, `pack_lib.ALL_SPACES`,
-# `pack_lib._NODE_STRUCT_KEYS` 처럼 모듈을 통해 접근한다(실측: json 3곳,
+# 기존 빌더들이 `<이 모듈>.json.dumps(...)`, `<이 모듈>.ALL_SPACES`,
+# `<이 모듈>._NODE_STRUCT_KEYS` 처럼 모듈을 통해 접근한다(실측: json 3곳,
 # ALL_SPACES 2곳, _NODE_STRUCT_KEYS 1곳). __all__ 에 올려 린터가 미사용으로
 # 지우지 못하게 하고, 지우면 무엇이 깨지는지 여기 남긴다.
 __all__ = [
@@ -49,14 +49,14 @@ __all__ = [
     'json', '_NODE_STRUCT_KEYS', '_RESERVED_NODE_KEYS',
 ]
 
-# 호스트 리포가 주입하는 출력 루트 기본값. opencrab-dump 의 shim 이 자기 __file__
+# 호스트 리포가 주입하는 출력 루트 기본값. 호스트 쪽 shim 이 자기 __file__
 # 기준으로 이 값을 세팅한다.
 #
 # **환경변수를 쓰지 않는 이유가 중요하다.** 한때 shim 이
 # `os.environ.setdefault('PACK_OUT_ROOT', ...)` 로 기본값을 넣었는데, 그러면
 # `os.environ.get('PACK_OUT_ROOT')` 로 "호출자가 드라이런을 지정했는가"를 판정하던
 # 코드가 **항상 참**이 된다. 실제로 그 때문에 운영 빌드가 git 추적 산출물
-# (chatgpt/canonical/, *-prep/) 대신 스크래치 경로로 조용히 새 나갔다
+# (git 추적 산출물) 대신 스크래치 경로로 조용히 새 나갔다
 # (2026-08-04 검증에서 발각). 프로세스 전역 상태를 건드리지 않고 모듈 변수로 받는다.
 DEFAULT_OUT_ROOT: str | None = None
 
@@ -65,10 +65,10 @@ class Pack:
     def __init__(self, slug, title, source_type='reference-public', out_root=None):
         # 출력 루트 결정 순서: 인자 > PACK_OUT_ROOT env > 호스트 주입 기본값.
         #
-        # 이전에는 `Path(__file__).parents[2] / 'by-pack'` 으로 자동 유도했다. 그 코드가
-        # opencrab-dump 안에 있는 동안에는 맞았지만, 이 모듈이 localcrab 으로 옮겨온
-        # 지금은 localcrab 리포 안에 by-pack 을 만들고 mkdir(exist_ok=True) 라 **예외
-        # 없이 조용히 성공**한다. 팩이 엉뚱한 곳에 쌓이는데 아무도 모른다.
+        # 이전에는 `Path(__file__).parents[2] / <출력 디렉터리>` 로 자동 유도했다.
+        # 그 코드가 호스트 리포 안에 있는 동안에는 맞았지만, 이 모듈이 이리로 옮겨온
+        # 지금은 **이 리포 안에** 출력 디렉터리를 만들고 mkdir(exist_ok=True) 라
+        # **예외 없이 조용히 성공**한다. 팩이 엉뚱한 곳에 쌓이는데 아무도 모른다.
         if out_root is None:
             out_root = os.environ.get('PACK_OUT_ROOT') or DEFAULT_OUT_ROOT
         if not out_root:
@@ -95,9 +95,9 @@ class Pack:
         """노드 1건 기록. props는 **평면 dict**로 넘긴다 (예: {'mst': '268103'}).
 
         props는 노드의 중첩 "properties" 키에 담긴다. 최상위로 펼치지 않는다.
-        이것이 저장소 정본 형태다 — 로더(load_local_packs.transform_node),
-        MCP pack_ingest, build_pack_zip, split_by_pack이 모두 중첩 "properties"만 읽는다.
-        2026-08-03 이전 pack_lib은 최상위로 펼쳤고, 그 결과 pack_lib으로 만든 팩의
+        이것이 저장소 정본 형태다 — 적재기의 노드 변환(`normalize.transform_node`),
+        MCP pack_ingest, cloud-pack 조립기, 팩 분할기가 모두 중첩 "properties"만 읽는다.
+        2026-08-03 이전 생산자는 최상위로 펼쳤고, 그 결과 그 생산자로 만든 팩의
         노드 커스텀 필드가 라이브 그래프에 하나도 실리지 않았다(실측 확인).
         """
         if nid in self._nid:
@@ -228,7 +228,7 @@ class Pack:
         errors = []
 
         # (e) 노드 properties 형태 — 커스텀 필드가 최상위에 펼쳐져 있으면 로더가 통째로 버린다.
-        # 이 검사가 없어서 pack_lib 팩 전량의 노드 커스텀 필드가 라이브에서 죽어 있었고
+        # 이 검사가 없어서 그 생산자로 만든 팩 전량의 노드 커스텀 필드가 라이브에서 죽어 있었고
         # 어떤 게이트에서도 안 걸렸다(2026-08-03 발각). 생산자 이탈을 여기서 막는다.
         stray = Counter()
         for n in self.nodes:
@@ -299,12 +299,12 @@ class Pack:
         #     적재 시 로더가 노드 space를 바꿔 연결 엣지가 대량 skip된다(예: evidence 노드에
         #     node_type='TextUnit' → 로더가 concept으로 remap → 엣지 grammar 위반 skip).
         #
-        #     이관 전에는 이 표가 적재기에만 있어 `try: from scripts.ops.load_local_packs
-        #     import NODE_TYPE_OVERRIDE / except: _NTO = None` 으로 가져왔다. 즉 import 가
+        #     이관 전에는 이 표가 적재기에만 있어 `try: from <적재기> import
+        #     NODE_TYPE_OVERRIDE / except: _NTO = None` 으로 가져왔다. 즉 import 가
         #     실패하면 이 검사가 **통째로 조용히 꺼진다**.
         #
         #     실측 정정(2026-08-04 적대 검증): opencrab 이 설치된 인터프리터에서는 그 지연
-        #     import 가 성공해 검사가 켜져 있었다(Mac venv·rpi5 양쪽 확인). 꺼지는 조건은
+        #     import 가 성공해 검사가 켜져 있었다(개발·운영 양쪽 확인). 꺼지는 조건은
         #     "opencrab 미설치"뿐이다. 이전 주석이 "대부분의 빌드 환경에서 꺼져 있었다"고
         #     쓴 것은 근거 없는 과장이었다. **이관의 실제 이득은 "꺼져 있던 걸 켰다"가
         #     아니라 "import 실패로 꺼질 수 있는 경로를 없애고 역의존을 제거했다"다.**

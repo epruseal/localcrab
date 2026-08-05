@@ -1,7 +1,7 @@
-"""by-pack 물리 포맷(opencrab.pack.jsonl_io) 테스트.
+"""팩 물리 포맷(opencrab.pack.jsonl_io) 테스트.
 
-opencrab-dump 의 수동 스모크(scripts/qa/test_jsonl_io.py, 17 checks)를 pytest 로
-옮기고 shard 계층의 loud-fail 설계를 검사로 고정한다.
+호스트 쪽 수동 스모크(17 checks)를 pytest 로 옮기고 shard 계층의 loud-fail 설계를
+검사로 고정한다.
 
 핵심 불변식: **분할되면 base 이름의 파일은 존재하지 않는다.** 미개조 소비자가
 base 만 읽고 일부 데이터만 조용히 얻는 silent partial read 를 FileNotFoundError

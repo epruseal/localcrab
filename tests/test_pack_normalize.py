@@ -183,7 +183,7 @@ def test_nested_properties_beat_legacy_top_level():
 def test_legacy_top_level_custom_fields_are_absorbed():
     """91만 필드가 라이브에 도달하지 못한 사고의 회귀 검사.
 
-    2026-08-03 이전 pack_lib 은 커스텀 필드를 노드 최상위에 펼쳤고 이 함수는
+    2026-08-03 이전 생산자는 커스텀 필드를 노드 최상위에 펼쳤고 이 함수는
     중첩 properties 만 읽었다.
     """
     _s, _t, _i, props = N.transform_node("p", _node(커스텀="값", properties={}))
@@ -937,7 +937,7 @@ def test_table_content_is_pinned(name):
 # 통과하므로 변경 감지이지 의미 보존 증명이 아니다.
 #
 # 그 틈을 여기서 좁힌다. 다만 **과장하지 않는다** — 판단표의 의미가 옳다는 것을 단위
-# 테스트가 독립적으로 증명할 수는 없다. 그 역할은 opencrab-dump 의 128 팩 characterization
+# 테스트가 독립적으로 증명할 수는 없다. 그 역할은 호스트 쪽 128 팩 characterization
 # (엣지 779,636 건 재계산)이 한다. 여기서 얻는 것은 세 가지다:
 #   ① 표를 읽지 않고 `resolve_edge` **동작**으로 확인한다 — 표가 그대로여도 조회 논리가
 #      바뀌면 걸린다.
@@ -947,9 +947,9 @@ def test_table_content_is_pinned(name):
 #      본다.
 
 # raw 라벨을 소문자로 내린 것과 결과가 **다른** 매핑 = 사람이 내린 판단.
-# 코퍼스 실측(2026-08-05, by-pack 128팩): CONSTRAINS 1,360건/9팩, HAS_SESSION 659건/5팩,
+# 코퍼스 실측(2026-08-05, 팩 128개): CONSTRAINS 1,360건/9팩, HAS_SESSION 659건/5팩,
 # ACHIEVES 495건/44팩, AFFECTS 461건/34팩. Honda GraphRAG 계열 7키(HAS_ASSEMBLY 등)는
-# 현재 by-pack 에 출현 0 이며 graphrag 임포트 경로 전용이다.
+# 현재 코퍼스에 출현 0 이며 graphrag 임포트 경로 전용이다.
 JUDGMENT_MAPPINGS = {
     "ACHIEVES": "contributes_to",
     "AFFECTS": "optimizes",

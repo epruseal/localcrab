@@ -1,12 +1,12 @@
-"""by-pack 행 → 라이브 스토어 표현의 **순수** 정규화 계층.
+"""팩 소스 행 → 라이브 스토어 표현의 **순수** 정규화 계층.
 
 여기 있는 것은 전부 부작용 없는 결정적 변환이다 — 스토어 쓰기·env·파일 I/O 없음.
-적재기(load), 증분 대조, 게이트(check_grammar_fit)가 **같은 함수**를 봐야 하므로 이 모듈이 정본이다.
+적재 경로, 증분 대조, 문법 정합 게이트가 **같은 함수**를 봐야 하므로 이 모듈이 정본이다.
 
 **왜 분리했는가.** 2026-08-04 이관 전에는 같은 판정이 세 곳에 있었다:
-  1. `load_local_packs.load_edges()` 인라인 (실제 적재 경로, 정본)
-  2. `check_grammar_fit.fits()` / `resolve_effective_space()` 재구현 (게이트)
-  3. `edge_skip_report` 가 표만 import 해 자체 해석
+  1. 적재기의 엣지 해석부 인라인 (실제 적재 경로, 정본)
+  2. 문법 정합 게이트의 재구현
+  3. 엣지 skip 리포트가 표만 가져다 자체 해석
 게이트가 정본을 재구현하면 게이트 통과가 적재 성공을 뜻하지 않게 된다. 실제로
 `transform_node` 가 커스텀 필드를 못 읽어 91만 필드가 라이브에 도달하지 못한 사고와
 같은 계층 문제다. 해석은 `resolve_node_space_type()` / `resolve_edge()` 하나뿐이다.
@@ -212,7 +212,7 @@ def chroma_safe_meta(d: dict) -> dict:
 def resolve_node_space_type(space: str, node_type: str) -> tuple[str, str]:
     """원본 (space, node_type) → **적재기가 실제로 쓰는** (space, node_type).
 
-    transform_node 의 앞부분을 그대로 뽑은 것이다. 게이트(check_grammar_fit)가 이 판정을
+    transform_node 의 앞부분을 그대로 뽑은 것이다. 문법 정합 게이트가 이 판정을
     재구현하면 게이트 통과가 적재 성공을 뜻하지 않게 되므로 양쪽이 이 함수를 공용한다.
 
     순서가 계약이다:
@@ -265,7 +265,7 @@ def resolve_edge(
 
 
 def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
-    """by-pack 노드 행 → (space, node_type, node_id, props) 결정적 변환.
+    """팩 소스 노드 행 → (space, node_type, node_id, props) 결정적 변환.
 
     적재(load_nodes)와 증분 대조(load_nodes_incremental)가 공용한다 —
     라이브 properties와의 동일성 비교가 이 변환의 결정성에 의존하므로
@@ -281,7 +281,7 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     space, node_type = resolve_node_space_type(space, node_type)
 
     props     = flatten_props(row.get("properties") or {})
-    # 레거시 호환: 2026-08-03 이전 pack_lib은 커스텀 필드를 노드 최상위에 펼쳤고
+    # 레거시 호환: 2026-08-03 이전 생산자는 커스텀 필드를 노드 최상위에 펼쳤고
     # 이 함수가 중첩 "properties"만 읽어 그 필드들이 라이브에 하나도 실리지 않았다
     # (약 120개 팩, 실측 확인). 재빌드 없이 회수하려면 최상위도 흡수해야 한다.
     # 중첩 값이 우선한다 — 정본 위치가 중첩이기 때문이다.
@@ -337,7 +337,7 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     if node_type == "User":
         if not props.get("name"):
             props["name"] = label
-        # User 스키마는 name/email/role 을 모두 required 로 잡는데 by-pack 의
+        # User 스키마는 name/email/role 을 모두 required 로 잡는데 팩 소스의
         # 저자 노드에는 이메일이 없다. 채우지 않으면 add_node 가 ValueError 를
         # 던지고 load_nodes 가 skip 으로 삼켜, 그 저자에게 달린 엣지만 남아
         # 영구 dangling 이 된다(2026-07-29 실측: 저자 4명 누락 -> 엣지 11,833건).
@@ -372,7 +372,7 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     ):
         props["role_original"] = props["role"]
         props["role"] = "viewer"
-    # label→name 일반화(2026-07-22): by-pack label은 top-level 필드라 여기서
+    # label→name 일반화(2026-07-22): 팩 소스의 label은 top-level 필드라 여기서
     # props에 보존하지 않으면 라이브에서 표시이름이 완전 유실된다
     # (실측: Concept 6,142/6,196·Topic 545 전건 name 부재). UUID 오염 방지를
     # 위해 실제 label 보유 행에만 주입. Concept 등은 타입 스키마가 없어
@@ -385,7 +385,7 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
 
 
 def transform_chunk_meta(pack_name: str, row: dict) -> dict:
-    """by-pack 청크 행 → Chroma/doc_sources 저장용 meta dict 결정적 변환.
+    """팩 소스 청크 행 → Chroma/doc_sources 저장용 meta dict 결정적 변환.
 
     load_chunks(전량)와 load_chunks_incremental(증분 대조)이 공용한다 —
     라이브 metadata와의 동일성 비교가 이 변환의 결정성에 의존한다.
