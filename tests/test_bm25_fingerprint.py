@@ -84,15 +84,26 @@ def _hybrid(doc_store) -> HybridQuery:
 
 def test_t8_background_rebuild_on_fingerprint_change() -> None:
     """A diverged fingerprint schedules a background rebuild; the query serves
-    the (stale) cache immediately and the worker swaps in the new index."""
+    the (stale) cache immediately and the worker swaps in the new index.
+
+    The probe reflects the store's real state at each point in time (the
+    index's own recorded fingerprint is stamped FROM this same probe, not
+    from compute_fingerprint(indexed_nodes) — see #63): first the 1-node
+    state, then the grown 2-node state, then the rebuild loop re-probes and
+    finds the same 2-node state again (nothing changed since the mismatch
+    that woke it), matching what it just built.
+    """
     doc_store = MagicMock()
     doc_store.available = True
     doc_store.list_nodes = MagicMock(side_effect=[
-        [_node("a", pack_id="A")],                       # cold build → (1, "")
-        [_node("a", pack_id="A"), _node("b", pack_id="A")],  # bg rebuild → (2, "")
+        [_node("a", pack_id="A")],                       # cold build (1 node)
+        [_node("a", pack_id="A"), _node("b", pack_id="A")],  # bg rebuild (2 nodes)
     ])
-    # Cheap probe reports the grown corpus, diverging from the cached (1, "").
-    doc_store.bm25_fingerprint = MagicMock(return_value=(2, ""))
+    doc_store.bm25_fingerprint = MagicMock(side_effect=[
+        (1, ""),  # stamped onto the cold-built index
+        (2, ""),  # hot-path probe on the 2nd search: diverges from (1, "") → invalidate
+        (2, ""),  # rebuild loop's own probe: matches what it's about to build
+    ])
 
     hybrid = _hybrid(doc_store)
     try:
@@ -141,6 +152,92 @@ def test_t8_bm25_fingerprint_matches_compute_fingerprint(tmp_path) -> None:
     whole_table = compute_fingerprint(ds.list_nodes(limit=50000))
     for lim in (50000, 1):
         assert ds.bm25_fingerprint(limit=lim) == whole_table
+
+
+def _seed_ordered(ds, count: int, space: str = "s1") -> None:
+    """Seed ``count`` nodes with strictly increasing, controlled
+    ``updated_at`` so cap selection (ORDER BY updated_at DESC) is
+    predictable rather than depending on ``datetime.now()`` call spacing."""
+    for i in range(count):
+        ds.upsert_node_doc(space, "T", f"n{i}", {"name": "alpha"})
+        ds._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?",
+            (f"2026-01-01T00:00:{i:02d}", f"n{i}"),
+        )
+    ds._conn.commit()
+
+
+def test_t8_no_rebuild_scheduled_when_over_cap_and_unchanged(tmp_path, monkeypatch) -> None:
+    """Regression (#63 follow-up): the lead reproduced build-time capped
+    fingerprint (10, ts) vs whole-table probe (20, ts) never comparing equal,
+    which scheduled a background rebuild on every single query forever, even
+    with nothing changed. Fixed by stamping the index's own fingerprint from
+    the same whole-table probe at build time (BM25Index.build(fingerprint=)),
+    so once nothing changes, probe and cache.fingerprint agree again."""
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.ontology import query as query_module
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    _seed_ordered(ds, 20)
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 10)  # cap < corpus (20)
+
+    hybrid = _hybrid(ds)
+    list_nodes_spy = MagicMock(wraps=ds.list_nodes)
+    ds.list_nodes = list_nodes_spy
+    try:
+        hybrid._bm25_search("alpha", spaces=None, limit=5)  # cold build
+        calls_after_cold = list_nodes_spy.call_count
+
+        for _ in range(5):
+            hybrid._bm25_search("alpha", spaces=None, limit=5)
+        time.sleep(0.2)  # let any (incorrectly) scheduled rebuild run
+
+        assert list_nodes_spy.call_count == calls_after_cold, (
+            "nothing changed; a background rebuild must not be scheduled "
+            "just because the corpus exceeds the BM25 cap"
+        )
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_t8_rebuild_scheduled_when_row_outside_cap_updated(tmp_path, monkeypatch) -> None:
+    """Complement to the above: a real change outside the cap window must
+    still be picked up (this is the original #63 bug, kept as a regression
+    test at the HybridQuery integration level, not just the store level)."""
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.ontology import query as query_module
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    _seed_ordered(ds, 20)
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 10)
+
+    hybrid = _hybrid(ds)
+    try:
+        hybrid._bm25_search("alpha", spaces=None, limit=25)  # cold build: top 10 (n10..n19)
+        indexed_ids = {h["node_id"] for h in hybrid._bm25_cache.search("alpha", limit=25)}
+        assert "n5" not in indexed_ids
+
+        ds._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?",
+            ("2026-01-02T00:00:00", "n5"),
+        )
+        ds._conn.commit()
+
+        hybrid._bm25_search("alpha", spaces=None, limit=25)  # probe now diverges
+
+        def _n5_indexed() -> bool:
+            hits = hybrid._bm25_cache.search("alpha", limit=25)
+            return "n5" in {h["node_id"] for h in hits}
+
+        assert _wait_until(_n5_indexed)
+    finally:
+        hybrid.shutdown_bm25()
 
 
 def test_t8_coalesces_burst_invalidations() -> None:

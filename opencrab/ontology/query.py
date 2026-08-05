@@ -256,13 +256,19 @@ class _Bm25CacheWorker:
                 break
             build_epoch = self._epoch
             try:
-                nodes = self._doc_store_getter().list_nodes(limit=_BM25_NODE_LIMIT)
-                fp = compute_fingerprint(nodes)
+                ds = self._doc_store_getter()
+                nodes = ds.list_nodes(limit=_BM25_NODE_LIMIT)
+                # Whole-table fingerprint (#63), not just the (possibly
+                # capped) nodes we're about to index — otherwise this would
+                # never again match a whole-table probe once the corpus
+                # exceeds the cap, and every query would schedule a rebuild.
+                probe = getattr(ds, "bm25_fingerprint", None)
+                fp = probe(limit=_BM25_NODE_LIMIT) if probe is not None else compute_fingerprint(nodes)
                 cache = self.cache
                 if cache is not None and fp == cache.fingerprint:
                     self.dirty = False          # nothing actually changed
                 else:
-                    new_index = BM25Index.build(nodes)
+                    new_index = BM25Index.build(nodes, fingerprint=fp)
                     self.cache = new_index        # atomic ref swap (GIL)
                     self.cache_size = len(nodes)
                     self.dirty = False
@@ -486,16 +492,24 @@ class HybridQuery:
         legacy stores without the capability. Returns ``None`` on error so the
         caller simply skips the staleness check and serves the current index.
 
-        NOTE (#63): ``doc_store.bm25_fingerprint()`` now reports the WHOLE
-        table, deliberately ignoring ``_BM25_NODE_LIMIT`` — a capped fingerprint
-        pins at exactly the cap once the corpus exceeds it, so count-based
-        change detection would never fire again. That means this probe is
-        *not* byte-for-byte equal to ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))``'s
-        recorded fingerprint once the corpus exceeds the cap: they will keep
-        differing (by count) even when nothing new has changed, which
-        schedules a harmless-but-recurring debounced background rescan. Legacy
+        NOTE (#63): ``doc_store.bm25_fingerprint()`` reports the WHOLE table,
+        deliberately ignoring ``_BM25_NODE_LIMIT`` — a capped fingerprint pins
+        at exactly the cap once the corpus exceeds it, so count-based change
+        detection would never fire again regardless of row ordering.
+
+        Must stay byte-for-byte comparable with the fingerprint recorded on
+        ``self._bm25_cache`` — both the cold-start build (see ``_bm25_search``)
+        and the background rebuild (``_Bm25CacheWorker._rebuild_loop``) stamp
+        the index with *this same* whole-table probe result via
+        ``BM25Index.build(nodes, fingerprint=...)``, not
+        ``compute_fingerprint(nodes)`` on the (possibly capped) indexed nodes.
+        That's what keeps this comparison meaningful once the corpus exceeds
+        the cap: both sides measure "what does the store look like", not "what
+        did we index" vs "what does the store look like" (which would never
+        agree again and would schedule a rebuild on every query). Legacy
         stores without ``bm25_fingerprint()`` fall back to the capped
-        ``compute_fingerprint`` below and don't have this effect.
+        ``compute_fingerprint`` below on both sides consistently, so they
+        don't have this problem in the first place.
         """
         ds = self._doc_store
         if ds is None:
@@ -534,7 +548,11 @@ class HybridQuery:
             if self._bm25_cache is None:
                 # Cold start: nothing to serve yet, so build synchronously once.
                 nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                self._bm25_cache = BM25Index.build(nodes)
+                # Whole-table fingerprint (#63) so later probes stay
+                # comparable; None (probe failed) falls back to
+                # compute_fingerprint(nodes) inside BM25Index.build().
+                fp = self._bm25_probe_fingerprint()
+                self._bm25_cache = BM25Index.build(nodes, fingerprint=fp)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False
                 logger.debug("BM25 index cold-built (%d nodes)", self._bm25_cache_size)
