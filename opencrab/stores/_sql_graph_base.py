@@ -646,10 +646,17 @@ class _SqlGraphStoreBase(abc.ABC):
         ``_expand``). Under that invariant, ``_edge_passes``' ``src_passes``
         is always True, which is what lets this reduce to two independent
         clauses instead of a full min/max reproduction of ``_edge_passes``.
+
+        Uses ``json_truthy_text`` (not the bare ``json_get`` extraction) for
+        both sides: a raw JSON extraction is non-NULL for ``""``/``0``/
+        ``false``, which Python's ``_node_pack_id`` treats as "no pack_id"
+        (falsy). Without this, those values would be wrongly excluded here
+        — before ``LIMIT`` even runs — instead of being governed by
+        ``include_unpackaged`` like ``_node_passes`` does.
         """
         placeholders, params = self._in_placeholders(sorted(pack_set), prefix)
-        node_pid = self._dialect.json_get(node_col, "pack_id")
-        edge_pid = self._dialect.json_get(edge_col, "pack_id")
+        node_pid = self._dialect.json_truthy_text(node_col, "pack_id")
+        edge_pid = self._dialect.json_truthy_text(edge_col, "pack_id")
         node_cond = f"{node_pid} IN ({placeholders})"
         if include_unpackaged:
             node_cond = f"({node_cond} OR {node_pid} IS NULL)"

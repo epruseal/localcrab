@@ -144,6 +144,61 @@ class SqlDialect:
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"
 
+    def json_truthy_text(self, col: str, key: str) -> str:
+        """Canonical TEXT form of a JSON field, or SQL NULL — mirroring
+        Python's truthiness test in ``opencrab/stores/_graph_common.py``'s
+        ``_node_pack_id`` (``str(pid) if pid else None``) EXACTLY, not just
+        ``json_get``'s bare extraction:
+
+        - JSON ``null``/missing key -> NULL (``json_get`` already got this
+          part right on its own).
+        - JSON ``""`` (empty string) -> NULL (``json_get`` alone does NOT:
+          a bare extraction is non-NULL text ``''``, which a naive ``pid IS
+          NULL`` check would miss, wrongly treating an empty-string pack_id
+          as a real foreign pack_id instead of "no pack_id").
+        - JSON ``0``/``false`` -> NULL (same gap: these are non-NULL but
+          Python-falsy).
+        - JSON string ``"0"`` -> ``'0'`` (stays truthy — distinguished from
+          the number ``0`` via ``json_type``/``jsonb_typeof``, since a bare
+          text comparison cannot tell a JSON number from a JSON string that
+          happens to look like one).
+        - JSON number (e.g. ``1``) -> its TEXT form (e.g. ``'1'``), so it
+          can actually match a ``pack_ids`` list of strings — SQLite's
+          ``json_extract`` preserves the JSON scalar's native type, and
+          comparing an INTEGER to a bound TEXT parameter never matches.
+        - JSON ``true`` -> ``'True'`` (matches Python's ``str(True)``).
+
+        Used by ``_SqlGraphStoreBase._pack_where`` for both the node- and
+        edge-side pack_id checks so the pushed-down SQL predicate and
+        ``_node_passes``/``_edge_passes`` can never disagree on what counts
+        as "no pack_id" (see issue #62 comment thread, cluster 5 —
+        empty-vs-absent divergence).
+        """
+        raw = self.json_get(col, key)
+        if self.name == "sqlite":
+            typ = f"json_type({col}, '$.{key}')"
+            return (
+                f"(CASE {typ}"
+                f" WHEN 'null' THEN NULL"
+                f" WHEN 'false' THEN NULL"
+                f" WHEN 'true' THEN 'True'"
+                f" WHEN 'text' THEN NULLIF({raw}, '')"
+                f" WHEN 'integer' THEN NULLIF(CAST({raw} AS TEXT), '0')"
+                f" WHEN 'real' THEN NULLIF(CAST({raw} AS TEXT), '0.0')"
+                f" ELSE CAST({raw} AS TEXT)"  # missing key, object, array
+                f" END)"
+            )
+        typ = f"jsonb_typeof({col}->'{key}')"
+        return (
+            f"(CASE {typ}"
+            f" WHEN 'null' THEN NULL"
+            f" WHEN 'boolean' THEN (CASE WHEN {raw} = 'true' THEN 'True' ELSE NULL END)"
+            f" WHEN 'string' THEN NULLIF({raw}, '')"
+            f" WHEN 'number' THEN NULLIF({raw}, '0')"
+            f" ELSE {raw}"  # missing key, object, array
+            f" END)"
+        )
+
     def json_index_expr(self, col: str, key: str) -> str:
         """``json_get`` wrapped for use as a functional-index expression.
 
