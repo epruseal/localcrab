@@ -106,6 +106,17 @@ def test_install_pack_migrates_legacy_shape_stub(tmp_pack_env, caplog):
     for why), so `name` comes back required here too -- and PR #104 codex
     review (P2, second round) requires that not be silent: it must show up
     in `revived_manifest_fields`.
+
+    Independent-verifier finding (4th round): `name` must show up ONLY in
+    `revived_manifest_fields`, not also in `preserved_extra_fields`. The old
+    `extra_optional` filter excluded `manifest_optional` and `extra_required`
+    but not `manifest_required`, so a manifest-required field demoted to
+    `optional` in the old file was misclassified as a user-added "extra"
+    optional field -- the return dict claimed `name` was both a preserved
+    user addition (false; nothing was preserved, the demotion was
+    overridden) and a revived manifest field (true), contradicting itself
+    and the docstring's contract that `preserved_extra_fields` only holds
+    fields the manifest doesn't define.
     """
     types_dir = tmp_pack_env
     legacy = {
@@ -125,6 +136,7 @@ def test_install_pack_migrates_legacy_shape_stub(tmp_pack_env, caplog):
     assert result["created"] == []
     assert result["skipped"] == []
     assert result["revived_manifest_fields"] == {"Widget": {"required": ["name"], "optional": []}}
+    assert result["preserved_extra_fields"] == {}
     assert any("re-added manifest field" in rec.message for rec in caplog.records)
 
     data = yaml.safe_load((types_dir / "Widget.yaml").read_text(encoding="utf-8"))

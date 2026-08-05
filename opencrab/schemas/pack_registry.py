@@ -250,7 +250,9 @@ def install_pack(name: str) -> dict[str, Any]:
             # Fields the user added that the manifest doesn't define -- kept.
             extra_required = [f for f in old_required if f not in manifest_required]
             extra_optional = [
-                f for f in old_optional if f not in manifest_optional and f not in extra_required
+                f
+                for f in old_optional
+                if f not in manifest_optional and f not in manifest_required and f not in extra_required
             ]
             # Manifest-required fields the old file no longer required --
             # dropped from `required` entirely, or just demoted to
