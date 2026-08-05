@@ -476,9 +476,28 @@ class TestPackCreate:
             )
         billing.on_ingest.assert_called_once_with("acme", "u1", result["evidence_node"])
 
-    def test_normal_bills_ingest_using_pack_id_when_no_source_id(self):
-        """No text -> no source_id, so on_ingest must fall back to pack_id
-        (its signature requires a non-None string)."""
+    def test_normal_bills_ingest_using_pack_id_when_nodes_given_but_no_text(self):
+        """nodes given, no text -> no source_id, so on_ingest must fall back
+        to pack_id (its signature requires a non-None string)."""
+        builder = MagicMock()
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            pack_create(
+                title="Node Pack", pack_id="node-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        billing.on_ingest.assert_called_once_with("default", None, "node-pack")
+
+    def test_normal_empty_pack_create_does_not_bill_ingest(self):
+        """#66/#105 review: a pack_create with no nodes/edges/text creates
+        only the anchor node (a separate write, outside _ingest_into_pack) —
+        there is nothing for _ingest_into_pack itself to have ingested, so it
+        must not fire a phantom on_ingest event for zero content."""
         builder = MagicMock()
         billing = MagicMock()
         with (
@@ -488,7 +507,29 @@ class TestPackCreate:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             mock_list.return_value = {"packs": []}
             pack_create(title="Empty Pack", pack_id="empty-pack")
-        billing.on_ingest.assert_called_once_with("default", None, "empty-pack")
+        billing.on_ingest.assert_not_called()
+
+    def test_error_all_writes_failed_does_not_bill_ingest(self):
+        """#66/#105 review: builder.add_node/add_edge don't raise for a
+        per-store failure — they report "error: ..."/"no match" inside the
+        returned stores map (see builder.py's module docstring). A call
+        where every provided item failed that way must not bill, even though
+        no exception was ever raised."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "error: disk down"}}
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            result = pack_ingest(
+                "existing-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        assert result["added_nodes"] == 0
+        billing.on_ingest.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +740,43 @@ class TestHarnessPromotionApply:
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             harness_promotion_apply(_VALID_PACKAGE, dry_run=True)
         mock_ctx.assert_not_called()
+
+    def test_error_graph_write_failure_does_not_bill(self):
+        """#66/#105 review: builder.add_node() doesn't raise for a per-store
+        failure — it returns normally with "error: ..." inside stores
+        (builder.py's module docstring). node_receipts still gets an entry
+        (unchanged contract), but billing must not count it: no exception was
+        raised, yet nothing actually landed in the graph."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {
+            "receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "error: disk down"}
+        }
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
+        billing.on_harness_apply.assert_not_called()
+
+    def test_normal_partial_success_bills_only_the_nodes_that_landed(self):
+        """Mixed batch: one node write succeeds, one fails at the store
+        level. Billing must count only the successful one, not
+        len(node_receipts) (which would be 2)."""
+        package = dict(_VALID_PACKAGE, nodes=[
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds2", "properties": {}},
+        ])
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.side_effect = [
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}},
+            {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "error: disk down"}},
+        ]
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(package, dry_run=False)
+        assert len(result["node_receipts"]) == 2
+        billing.on_harness_apply.assert_called_once_with("default", None, "pkg-1", 1)
 
     def test_error_apply_node_and_edge_write_failures_recorded(self):
         """Real (non-dry-run) write failures for both nodes and edges are

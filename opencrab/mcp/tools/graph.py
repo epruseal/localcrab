@@ -200,6 +200,7 @@ def ontology_add_edge(
         stamped into edge properties, unlike ontology_add_node).
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import graph_write_failed
 
     ctx = _get_context()
     from_id = _clean_str(from_id)
@@ -214,17 +215,28 @@ def ontology_add_edge(
             to_id=to_id,
             properties=_clean_meta(properties or {}),
         )
-        billing_result = ctx["billing"].on_edge_write(tenant_id, subject_id, relation)
-        if not billing_result.get("ok"):
-            # #105: emit() is fire-and-forget by design and never raises, but
-            # a failed persist must not vanish with only BillingHooks' own
-            # internal log line — surface it here too so this handler's own
-            # log context (tenant/relation) is attached. Does not fail the
-            # write: the edge write already succeeded above.
-            logger.warning(
-                "on_edge_write billing event failed to persist (tenant=%s, relation=%s): %s",
-                tenant_id, relation, billing_result.get("error"),
-            )
+        # #66 hardening: builder.add_edge() never raises for a per-store
+        # failure (missing endpoint / store down all come back as a string
+        # inside result["stores"], see builder.py's module docstring) — a
+        # bare "no exception -> bill" would charge for edges that never
+        # landed anywhere. graph_write_failed() reads the SAME store-status
+        # map ontology_add_edge already returns to the caller, so a rejected
+        # write ("no match (missing node: ...)" / "error: ..." / graph
+        # "unavailable") is never billed. Optional-store-only failures
+        # (docs) still bill — the edge exists in the graph either way.
+        if not graph_write_failed(result.get("stores") or {}):
+            billing_result = ctx["billing"].on_edge_write(tenant_id, subject_id, relation)
+            if not billing_result.get("ok"):
+                # #105: emit() is fire-and-forget by design and never raises,
+                # but a failed persist must not vanish with only
+                # BillingHooks' own internal log line — surface it here too
+                # so this handler's own log context (tenant/relation) is
+                # attached. Does not fail the write: the edge write already
+                # succeeded above.
+                logger.warning(
+                    "on_edge_write billing event failed to persist (tenant=%s, relation=%s): %s",
+                    tenant_id, relation, billing_result.get("error"),
+                )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:

@@ -231,6 +231,61 @@ class TestToolDispatch:
             })
             billing.on_edge_write.assert_not_called()
 
+    def test_ontology_add_edge_graph_store_failure_does_not_bill(self):
+        """#66/#105 review: builder.add_edge() doesn't raise for a per-store
+        failure — a missing endpoint or a down graph store comes back as a
+        status STRING inside result["stores"]["graph"] (builder.py's module
+        docstring), not an exception. The earlier failure-does-not-bill test
+        only covered the raised-exception branch; this pins the (more
+        common) silent-failure branch that codex's adversarial review
+        flagged as still billing a write that never landed."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {
+                "relation": "owns",
+                "stores": {"graph": "no match (missing node: resource/doc1)"},
+            }
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            result = dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            assert result["relation"] == "owns"  # handler returns the result unchanged
+            billing.on_edge_write.assert_not_called()
+
+    def test_ontology_add_edge_optional_store_failure_still_bills(self):
+        """Graph write succeeded; only an optional store (docs) failed. The
+        edge exists and is queryable, so this must still bill — matching
+        pack_create's own graph-is-system-of-record split."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {
+                "relation": "owns",
+                "stores": {"graph": "ok", "docs": "error: mongo down"},
+            }
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            billing.on_edge_write.assert_called_once_with("default", None, "owns")
+
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool
 

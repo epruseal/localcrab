@@ -10,17 +10,33 @@ Billable event types:
   edge_write     — ontology_add_edge called (successful write)
   query          — ontology_query or query_bm25 called
   ingest         — pack_create / pack_ingest called
-  harness_apply  — harness_promotion_apply called
+  harness_apply  — harness_promotion_apply called (MCP or CLI, see below)
 
 Each event stores: tenant_id, subject_id, event_type, count, metadata, ts.
 Aggregation queries can sum counts by (tenant_id, event_type, day) for billing.
 
+Only events for writes that actually landed are billed: `graph` is the
+system of record (opencrab/ontology/builder.py's module docstring), so a
+call whose write failed there is not billed even though add_node/add_edge
+raise no exception for a per-store failure (see
+`opencrab.ontology.builder.store_write_failures`/`graph_write_failed`).
+Optional-store-only failures (docs/sql/vector) still bill — the entity
+exists and is queryable, matching pack_create's own "graph failed = hard
+error, optional-store-only failed = partial success" split.
+
 Issue #66: this module used to also document a ``promotion`` event fired by
-an ``on_promotion`` hook. That hook had zero callers repo-wide *and* no tool
-to call it from — the MCP tool it was meant for (``promotion_promote``) was
-already deleted as dead code (see ``opencrab/mcp/tools/__init__.py``'s
-module docstring; ``tests/test_mcp.py::test_tools_list_not_empty`` pins its
-absence). Deleted rather than wired — there was nothing to wire it to.
+an ``on_promotion`` hook (metadata: a single ``node_id`` per call — one
+candidate promoted at a time). That hook had zero callers repo-wide. It
+stays deleted: no code path matches its per-node-id shape. The MCP tool it
+was meant for (``promotion_promote``) was already deleted as dead code (see
+``opencrab/mcp/tools/__init__.py``'s module docstring;
+``tests/test_mcp.py::test_tools_list_not_empty`` pins its absence). A
+second, non-MCP write surface DOES exist —
+``crabharness/crabharness/apply.py#apply_promotion_package`` (reachable via
+``crabharness apply`` on the CLI) — but it applies a whole PromotionPackage
+(many nodes/edges) exactly like ``harness_promotion_apply`` does, not a
+single already-promoted node_id. It is billed as `harness_apply`, the hook
+that already matches that shape, rather than resurrecting `on_promotion`.
 """
 
 from __future__ import annotations
@@ -122,7 +138,7 @@ class BillingHooks:
         Parameters
         ----------
         event_type:
-            One of: node_write, edge_write, query, ingest, promotion, harness_apply.
+            One of: node_write, edge_write, query, ingest, harness_apply.
         tenant_id:
             Tenant identifier (default: 'default' for single-tenant deployments).
         subject_id:

@@ -19,6 +19,8 @@ from .models import PromotionPackage
 def apply_promotion_package(
     package_path: str | Path,
     dry_run: bool = False,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a PromotionPackage to OpenCrab.
@@ -29,11 +31,28 @@ def apply_promotion_package(
         Path to a JSON file containing a serialised PromotionPackage.
     dry_run:
         If True, validate without writing to any store.
+    tenant_id:
+        Tenant identifier for the ``harness_apply`` billing event fired on a
+        live (non-dry-run) apply. No CLI flag exposes this yet — the
+        crabharness CLI always applies as the default tenant; multi-tenant
+        CLI usage is left for a follow-up (see opencrab issue #66's PR).
+    subject_id:
+        Optional actor for the same billing event.
 
     Returns
     -------
     dict with keys:
         package_id, node_receipts, edge_receipts, errors, dry_run
+
+    Notes
+    -----
+    Issue #66: this CLI/library path applies a whole PromotionPackage (many
+    nodes/edges via OntologyBuilder) exactly like the MCP tool
+    ``harness_promotion_apply`` — it is billed the same way, as a single
+    ``harness_apply`` event whose count is the number of nodes that actually
+    landed in the graph store (see ``graph_write_failed`` below: OntologyBuilder
+    doesn't raise for a per-store failure, so "no exception" alone doesn't
+    mean "written").
     """
     path = Path(package_path)
     if not path.exists():
@@ -45,7 +64,7 @@ def apply_promotion_package(
     # Import OpenCrab components — optional dependency
     try:
         from opencrab.config import Settings
-        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store
     except ImportError as exc:
         raise ImportError(
@@ -132,6 +151,27 @@ def apply_promotion_package(
                 "edge": f"{edge.from_id} -[{edge.relation}]-> {edge.to_id}",
                 "error": str(exc),
             })
+
+    # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
+    # module docstring) — bill it the same way harness_promotion_apply (the
+    # MCP twin of this function) does, counting only nodes that actually
+    # landed in the graph. builder.add_node() doesn't raise for a per-store
+    # failure (see builder.py's module docstring), so len(node_receipts)
+    # alone would overcount — graph_write_failed() filters those out.
+    try:
+        from opencrab.billing.hooks import BillingHooks
+
+        billed_node_count = sum(
+            1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
+        )
+        if billed_node_count > 0:
+            BillingHooks(sql).on_harness_apply(
+                tenant_id, subject_id, package.package_id, billed_node_count
+            )
+    except Exception as exc:  # noqa: BLE001 — billing is fire-and-forget, never blocks apply
+        import logging
+
+        logging.getLogger(__name__).warning("harness_apply billing failed: %s", exc)
 
     return {
         "package_id": package.package_id,

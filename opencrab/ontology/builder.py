@@ -367,6 +367,21 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     return failures
 
 
+def graph_write_failed(stores: dict[str, Any]) -> bool:
+    """True if ``stores`` (an add_node/add_edge result's ``"stores"`` map)
+    shows the write did NOT land in the graph store — the system of record.
+
+    Thin, graph-only wrapper over ``store_write_failures()`` for callers that
+    must decide whether a write actually happened before treating it as
+    billable: an optional-store failure (docs/sql/vector) doesn't count here
+    (the entity still exists and is queryable), matching the same
+    "graph failed = hard failure, optional-store-only failed = partial
+    success" split ``opencrab/mcp/tools/pack.py#pack_create`` already applies
+    to its anchor node write.
+    """
+    return any(f.startswith("graph:") for f in store_write_failures(stores))
+
+
 def _space_to_default_type(space_id: str) -> str:
     """Return a default node type label for a space when the real type is unknown."""
     from opencrab.grammar.manifest import SPACES

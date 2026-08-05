@@ -223,15 +223,33 @@ def _ingest_into_pack(
 
         text_ingested = True
 
-    billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
-    if not billing_result.get("ok"):
-        # #105: don't repeat the on_node_write/on_query pattern of discarding
-        # emit()'s result — surface a failed persist in this module's own
-        # log context too, without failing the (already-succeeded) ingest.
-        logger.warning(
-            "on_ingest billing event failed to persist (pack_id=%s): %s",
-            pack_id, billing_result.get("error"),
-        )
+    # #66 hardening: added_nodes/added_edges are only incremented above when
+    # that item's own store_write_failures() was empty (see the node/edge
+    # loops), and evidence_node (text_as_node=True) rolls into added_nodes
+    # the same way — so all three already mean "this actually got written",
+    # not just "no exception was raised". text_stores_failed covers the
+    # text_as_node=False legacy branch, whose only success signal lives in
+    # `stores` (chromadb/mongodb), not in added_nodes/added_edges. A call
+    # that wrote NOTHING (every item failed, no successful text) must not
+    # bill — see issue #105/#66 review: builder writes fail via a result
+    # string, not an exception, so "no exception" alone is not "it worked".
+    text_stores_failed = bool(store_write_failures(stores))
+    wrote_anything = (
+        added_nodes > 0
+        or added_edges > 0
+        or (text_ingested and not text_as_node and not text_stores_failed)
+    )
+    if wrote_anything:
+        billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
+        if not billing_result.get("ok"):
+            # #105: don't repeat the on_node_write/on_query pattern of
+            # discarding emit()'s result — surface a failed persist in this
+            # module's own log context too, without failing the
+            # (already-succeeded) ingest.
+            logger.warning(
+                "on_ingest billing event failed to persist (pack_id=%s): %s",
+                pack_id, billing_result.get("error"),
+            )
     ctx["hybrid"].invalidate_bm25_cache()
 
     # Partial failure = any node/edge write error, or any leftover "error:"/
@@ -240,11 +258,7 @@ def _ingest_into_pack(
     # {"status": "ok", ..., **ingest_result} — since ingest_result is spread
     # last, this "status" wins over their literal "ok" and callers get an
     # accurate top-level signal instead of an unconditional "ok".
-    status = (
-        "partial"
-        if node_errors or edge_errors or store_write_failures(stores)
-        else "ok"
-    )
+    status = "partial" if node_errors or edge_errors or text_stores_failed else "ok"
 
     return {
         "status": status,
