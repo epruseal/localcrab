@@ -418,6 +418,30 @@ class TestPackCreate:
             result = pack_create(title="No Graph", pack_id="no-graph-pack")
         assert result == {"error": "anchor node failed: graph: unavailable"}
 
+    def test_normal_anchor_optional_store_failure_still_reports_created(self):
+        """graph write for the anchor succeeded but an optional store
+        (docs/sql/vector) failed: the pack DOES exist (graph has it), so this
+        must be reported as created (no top-level "error"), with status
+        "partial" and the failed store surfaced in anchor_errors — not
+        downgraded to the hard "anchor node failed" error, which would tell
+        the caller to retry into a "pack already exists" dead end."""
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "ok", "docs": "error: mongo down", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Partial Store", pack_id="partial-store-pack")
+        assert "error" not in result
+        assert result["pack_id"] == "partial-store-pack"
+        assert result["anchor_node"] == "dataset:partial-store-pack"
+        assert result["status"] == "partial"
+        assert result["anchor_errors"] == ["docs: error: mongo down"]
+
     def test_normal_with_text_materialises_evidence_node(self):
         builder = MagicMock()
         hybrid = MagicMock()

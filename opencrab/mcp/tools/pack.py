@@ -532,15 +532,21 @@ def pack_create(
 
     # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
     # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
-    # inside the returned stores map. Without this the anchor node write
-    # could fail everywhere and pack_create would still report the pack as
-    # created — and unlike a node/edge inside the pack, a missing anchor
-    # means the pack itself doesn't exist, so this is a hard error, not a
-    # partial-success entry.
+    # inside the returned stores map. store_write_failures already applies
+    # the one place-to-judge rule (graph is system of record, docs/sql/vector
+    # are optional) — reuse that split here instead of re-deciding it:
+    #   - graph itself failed -> the pack doesn't exist in the graph, hard
+    #     error (matches the "anchor missing = no pack" contract below).
+    #   - only optional stores failed -> the pack DOES exist (graph write
+    #     went through), so report success and surface which stores lagged,
+    #     same as _ingest_into_pack's node/edge loops do via node_errors.
     anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
     anchor_failures = store_write_failures(anchor_stores or {})
-    if anchor_failures:
-        return {"error": "anchor node failed: " + "; ".join(anchor_failures)}
+    anchor_graph_failures = [f for f in anchor_failures if f.startswith("graph:")]
+    if anchor_graph_failures:
+        return {"error": "anchor node failed: " + "; ".join(anchor_graph_failures)}
+    # Anything left here is optional-store-only (graph already ruled out above).
+    anchor_optional_failures = anchor_failures
 
     source_id: str | None = None
     if text:
@@ -559,13 +565,21 @@ def pack_create(
         text_as_node=text_as_node,
     )
 
-    return {
+    result = {
         "status": "ok",
         "pack_id": slug,
         "title": _clean_str(title),
         "anchor_node": anchor_node_id,
         **ingest_result,
     }
+    if anchor_optional_failures:
+        # ingest_result's own "status" (spread above) may already be "ok" —
+        # force "partial" and surface the anchor's optional-store failures
+        # the same way node_errors/edge_errors do, so callers see the pack
+        # was created but not every store has the anchor.
+        result["status"] = "partial"
+        result["anchor_errors"] = anchor_optional_failures
+    return result
 
 
 @tool(
