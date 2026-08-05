@@ -160,7 +160,7 @@ def ontology_query(
     pack_filter_warnings = [mcp_warning_text(w) for w in selection.warnings]
 
     try:
-        results = ctx["hybrid"].query(
+        outcome = ctx["hybrid"].query(
             question=question,
             spaces=spaces,
             limit=limit,
@@ -171,6 +171,7 @@ def ontology_query(
             pack_ids=effective_pack_ids,
             include_unpackaged=include_unpackaged,
         )
+        results = outcome.results
         ctx["billing"].on_query(tenant_id, subject_id, question)
         result_dicts = [r.to_dict() for r in results]
         if include_canonical_ids:
@@ -186,6 +187,12 @@ def ontology_query(
             "total": len(results),
             "results": result_dicts,
         }
+        # #51: spaces 필터가 벡터 leg 에서 조용히 0건이 되는 과도기 상태를 응답에
+        # 드러낸다(호출자가 "결과 없음"과 "필터 적용 불가"를 구분할 수 있도록).
+        # outcome.warnings 는 query() 호출마다 새로 만들어지는 지역 반환값이라
+        # 동시 요청 간 공유 상태 경합이 없다(QueryOutcome 참조).
+        if outcome.warnings:
+            response["spaces_filter_warnings"] = list(outcome.warnings)
         if include_pack_provenance:
             response["selected_packs"] = selected_packs
             response["pack_filter"] = {

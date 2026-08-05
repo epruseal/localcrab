@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from opencrab.ontology.query import QueryResult
+from opencrab.ontology.query import QueryOutcome, QueryResult
 
 
 def _stub_context(hybrid_mock: MagicMock) -> dict:
@@ -34,11 +34,17 @@ def _make_result(pack_id: str | None = "pack-a") -> QueryResult:
     )
 
 
+def _outcome(pack_id: str | None = "pack-a") -> QueryOutcome:
+    """#51: HybridQuery.query() returns QueryOutcome(results, warnings), not a
+    bare list — mock the actual contract."""
+    return QueryOutcome(results=[_make_result(pack_id)], warnings=[])
+
+
 def test_t10_ontology_query_includes_envelope_fields():
     from opencrab.mcp import tools
 
     hybrid = MagicMock()
-    hybrid.query = MagicMock(return_value=[_make_result("pack-a")])
+    hybrid.query = MagicMock(return_value=_outcome("pack-a"))
 
     with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
         response = tools.ontology_query(
@@ -60,7 +66,7 @@ def test_t10_legacy_callers_can_ignore_new_fields():
     from opencrab.mcp import tools
 
     hybrid = MagicMock()
-    hybrid.query = MagicMock(return_value=[_make_result(None)])
+    hybrid.query = MagicMock(return_value=_outcome(None))
 
     with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
         response = tools.ontology_query(question="alpha")
@@ -73,7 +79,7 @@ def test_t10_pack_ids_take_priority_over_auto_pack():
     from opencrab.mcp import tools
 
     hybrid = MagicMock()
-    hybrid.query = MagicMock(return_value=[_make_result("pack-a")])
+    hybrid.query = MagicMock(return_value=_outcome("pack-a"))
 
     with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
         response = tools.ontology_query(
@@ -92,7 +98,7 @@ def test_t10_include_pack_provenance_false_drops_envelope_additions():
     from opencrab.mcp import tools
 
     hybrid = MagicMock()
-    hybrid.query = MagicMock(return_value=[_make_result("pack-a")])
+    hybrid.query = MagicMock(return_value=_outcome("pack-a"))
 
     with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
         response = tools.ontology_query(

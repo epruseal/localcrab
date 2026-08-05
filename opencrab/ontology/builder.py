@@ -153,6 +153,11 @@ class OntologyBuilder:
                         "pack_id": str(props.get("pack_id") or ""),
                         "source": str(props.get("pack") or props.get("pack_id") or ""),
                         "node_id": node_id,
+                        # #51 루트 픽스: space where-필터(query.py._build_chroma_where)가
+                        # 매치할 키가 벡터 메타데이터에 없어 항상 0건이었다. 신규 벡터부터
+                        # 기록한다 — 백필 전 기존 벡터는 여전히 없으므로 query.py 쪽에서
+                        # 과도기 경고를 노출한다(sqlite_vec_store.py 주석 참조).
+                        "space": space,
                     }
                     self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
                     output["stores"]["vector"] = "ok"
