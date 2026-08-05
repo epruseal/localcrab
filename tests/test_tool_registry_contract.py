@@ -118,9 +118,25 @@ class TestWriteLockCoverage:
     instead of silently bypassing the cross-process write lock.
     """
 
-    # Tools known (by inspection of their store calls) to mutate state.
-    # Mirrors GOLDEN_TOOL_NAMES's role above: an explicit, reviewable list that
-    # must equal what the registry actually declares.
+    # NOTE on what "write" means here: this is a *needs write.lock* list, not a
+    # *touches a store* list (see the `writes` field docstring in
+    # _registry.py#tool for the full rule). ontology_query is deliberately
+    # EXCLUDED even though it INSERTs into billing_events via
+    # `ctx["billing"].on_query()` — that insert is idempotent append-only
+    # (UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING), so it
+    # doesn't need cross-process serialisation, and locking every query would
+    # cost real latency on a high-frequency, read-shaped path for no
+    # correctness gain. Decided in #65's review against #68 (E-4 lock
+    # ownership map).
+    #
+    # Yes, this is itself a hand-maintained list (codex's point in #65's
+    # review) — its role is different from WRITE_TOOLS though: WRITE_TOOLS is
+    # the derived *source of truth* dispatch_tool acts on (see
+    # test_write_tools_is_derived_from_registry_writes_flag below); this list
+    # is a reviewable regression pin that fails loudly if that source of truth
+    # ever silently drifts (a tool's writes= flag changes without a human
+    # reviewing whether it should have). Mirrors GOLDEN_TOOL_NAMES's role
+    # above for the same reason.
     GOLDEN_WRITE_TOOL_NAMES = {
         "ontology_add_node",
         "ontology_add_edge",

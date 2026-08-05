@@ -306,7 +306,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in _
 _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {name: spec.fn for name, spec in _REGISTRY.items()}
 dispatch_tool = _registry_dispatch_tool
 
-# Tools that mutate the stores. When several MCP server processes run against the
+# Tools that need the cross-process write.lock (NOT "tools that touch a store" —
+# see the `writes` field docstring in _registry.py#tool; a store write that is
+# idempotent append-only, e.g. billing_events via ontology_query, deliberately
+# stays out of this set). When several MCP server processes run against the
 # same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
 # writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
 # lock on a dedicated write.lock file — entirely separate from the lifetime-held
@@ -326,4 +329,13 @@ dispatch_tool = _registry_dispatch_tool
 # locked around them. Deriving it means a future write handler that forgets
 # `writes=True` fails the registry contract test instead of silently
 # bypassing the lock.
+#
+# One-time snapshot, not a live view: computed once here, after all five
+# handler submodules (graph/query/pack/schema/harness) have been imported
+# above and finished registering into _REGISTRY, so it correctly captures
+# every built-in tool. A tool registered into _REGISTRY *after* this line
+# would not appear in WRITE_TOOLS — acceptable today because nothing
+# registers tools post-import except tests, which clean up their probe
+# registrations in a `finally` (see
+# tests/test_tool_registry_contract.py::TestWriteLockCoverage).
 WRITE_TOOLS: frozenset[str] = frozenset(name for name, spec in _REGISTRY.items() if spec.writes)

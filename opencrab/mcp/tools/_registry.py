@@ -25,6 +25,10 @@ class ToolSpec:
     schema: dict[str, Any]
     fn: Callable[..., Any]
     order: int
+    # NOTE: `writes` means "needs the cross-process write.lock", NOT "touches a
+    # store". See `tool()`'s docstring — a tool can INSERT and still be
+    # writes=False if that write is idempotent append-only (billing_events via
+    # ontology_query is the concrete example, decided in issue #65's review).
     writes: bool = False
 
 
@@ -41,11 +45,29 @@ def tool(
     as one unit. When omitted, falls back to registration (insertion) order,
     which is sufficient for ad-hoc/test registrations.
 
-    `writes=True` declares that this handler mutates a store (SQL/graph/vector/
-    doc), so `dispatch_tool` must hold the cross-process write lock for the
-    duration of the call (see `opencrab.mcp.tools.WRITE_TOOLS`, which is
-    *derived* from this flag rather than hand-maintained — issue #65: a
-    hand-maintained WRITE_TOOLS set silently missed two write handlers).
+    `writes=True` means *this handler needs the cross-process write.lock held
+    for its call* — it is NOT a "does this handler ever touch a store" flag.
+    `dispatch_tool` reads it to decide whether to wrap the call in
+    `_write_lock()` (see `opencrab.mcp.tools.WRITE_TOOLS`, which is *derived*
+    from this flag rather than hand-maintained — issue #65: a hand-maintained
+    WRITE_TOOLS set silently missed two write handlers).
+
+    The lock exists to serialise concurrent writers across processes so they
+    don't race each other. A store write that is already idempotent and
+    append-only (UNIQUE constraint + INSERT OR IGNORE / ON CONFLICT DO
+    NOTHING, no read-modify-write) does not need that protection — two
+    processes racing to insert the same event_id just both no-op past the
+    first. Marking such a handler `writes=True` anyway would only cost every
+    caller lock contention for no correctness gain (e.g. it would serialise
+    every `ontology_query` call, a read-shaped, high-frequency path, behind a
+    single cross-process mutex just because it also fires an idempotent
+    billing event). Reviewed against issue #68 (E-4, lock ownership map) in
+    #65's review round; concrete example: `ontology_query` calls
+    `billing.on_query()` -> `billing_events` INSERT, and stays `writes=False`.
+    If a future handler performs a NON-idempotent or read-modify-write store
+    mutation, it must be `writes=True` regardless of how "read-shaped" the
+    tool's name looks (this is exactly how #65 was missed for
+    ontology_impact/ontology_lever_simulate).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
