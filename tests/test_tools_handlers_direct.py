@@ -239,10 +239,75 @@ class TestIngestIntoPack:
             mock_ctx.return_value = _base_ctx()
             result = _ingest_into_pack("pack-a")
         assert result == {
+            "status": "ok",
             "pack_id": "pack-a", "added_nodes": 0, "added_edges": 0,
             "node_errors": [], "edge_errors": [], "stores": {},
             "text_ingested": False, "evidence_node": None,
         }
+
+    def test_error_node_store_partial_failure_not_counted(self):
+        """The real failure shape from OntologyBuilder.add_node: it returns
+        normally (no exception) with an "error: ..." entry inside the
+        `stores` map when one backend write fails. A bare try/except around
+        the call cannot catch this — the return value itself must be
+        inspected, or the failed write gets counted as added."""
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
+        }
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            result = _ingest_into_pack(
+                "pack-a",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        assert result["added_nodes"] == 0
+        assert result["node_errors"] == ["e1: graph: error: disk I/O"]
+        assert result["status"] == "partial"
+
+    def test_error_edge_missing_endpoint_not_counted(self):
+        """The real failure shape from OntologyBuilder.add_edge for a missing
+        endpoint: it returns normally with
+        stores["graph"] = "no match (missing node: ...)" — no exception, so
+        this must not be counted as added_edges."""
+        builder = MagicMock()
+        builder.add_edge.return_value = {
+            "stores": {
+                "graph": "no match (missing node: concept/no-such-a, concept/no-such-b)",
+                "sql": "skipped (missing node)",
+                "docs": "unavailable",
+            }
+        }
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            result = _ingest_into_pack(
+                "pack-a",
+                edges=[{
+                    "from_space": "concept", "from_id": "no-such-a", "relation": "related_to",
+                    "to_space": "concept", "to_id": "no-such-b",
+                }],
+            )
+        assert result["added_edges"] == 0
+        assert result["edge_errors"] == [
+            "no-such-a→no-such-b: graph: no match "
+            "(missing node: concept/no-such-a, concept/no-such-b)"
+        ]
+        assert result["status"] == "partial"
+
+    def test_normal_status_ok_when_all_stores_succeed(self):
+        """status must reflect real per-store outcomes, not just be a fixed
+        "ok" — this asserts the success side of that contract."""
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok", "docs": "ok", "sql": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            result = _ingest_into_pack(
+                "pack-a",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        assert result["added_nodes"] == 1
+        assert result["node_errors"] == []
+        assert result["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +393,29 @@ class TestPackIngestErrors:
         assert result == {
             "error": "no content provided: supply at least one of nodes, edges, or text"
         }
+
+    def test_error_store_partial_failure_propagates_to_top_level_status(self):
+        """pack_ingest hardcodes {"status": "ok", ..., **ingest_result} — this
+        checks that _ingest_into_pack's real "partial" status wins over that
+        literal default (dict literal: a later **-spread key overrides an
+        earlier one), so callers see partial failure instead of always "ok"."""
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            result = pack_ingest(
+                "existing-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        assert result["status"] == "partial"
+        assert result["added_nodes"] == 0
+        assert result["node_errors"] == ["e1: graph: error: disk I/O"]
 
 
 # ---------------------------------------------------------------------------
