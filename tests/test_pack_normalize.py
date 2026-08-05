@@ -10,7 +10,12 @@ from types import MappingProxyType
 import pytest
 
 from opencrab.pack import normalize
-from opencrab.pack.schema import NODE_STRUCT_KEYS, NODE_TYPE_OVERRIDE, SPACE_DEFAULT_TYPE
+from opencrab.pack.schema import (
+    ALL_SPACES,
+    NODE_STRUCT_KEYS,
+    NODE_TYPE_OVERRIDE,
+    SPACE_DEFAULT_TYPE,
+)
 
 N = normalize
 
@@ -922,6 +927,98 @@ def test_table_content_is_pinned(name):
     table = _table(name)
     assert len(table) == want_len, f"{name} 항목 수 {len(table)} != {want_len}"
     assert _fingerprint(table) == want_fp, f"{name} 내용이 바뀌었다"
+
+
+# ── REL_MAP 의미 앵커 ────────────────────────────────────────────────────────
+#
+# 적대 검증이 지문의 성격을 정확히 규정했다(2026-08-05): 구조 불변식은 **존재하지 않는**
+# relation·orphan reverse 키를 실제로 잡지만(장식이 아니다), **유효하지만 다른** 값으로의
+# 교체(`part_of` -> `related_to`)는 지문만 잡는다. 그리고 지문은 기대값을 함께 고치면
+# 통과하므로 변경 감지이지 의미 보존 증명이 아니다.
+#
+# 그 틈을 여기서 좁힌다. 다만 **과장하지 않는다** — 판단표의 의미가 옳다는 것을 단위
+# 테스트가 독립적으로 증명할 수는 없다. 그 역할은 opencrab-dump 의 128 팩 characterization
+# (엣지 779,636 건 재계산)이 한다. 여기서 얻는 것은 세 가지다:
+#   ① 표를 읽지 않고 `resolve_edge` **동작**으로 확인한다 — 표가 그대로여도 조회 논리가
+#      바뀌면 걸린다.
+#   ② 항등(대문자→소문자 정규화) 34 건과 판단 21 건으로 **전수 분할**한다. 키가 새로
+#      생기면 반드시 어느 한쪽에 등록해야 하므로 조용히 늘어날 수 없다.
+#   ③ 판단 매핑은 값을 명시해 둔다. 리뷰어가 sha 대신 "이 라벨은 왜 이 relation 인가"를
+#      본다.
+
+# raw 라벨을 소문자로 내린 것과 결과가 **다른** 매핑 = 사람이 내린 판단.
+# 코퍼스 실측(2026-08-05, by-pack 128팩): CONSTRAINS 1,360건/9팩, HAS_SESSION 659건/5팩,
+# ACHIEVES 495건/44팩, AFFECTS 461건/34팩. Honda GraphRAG 계열 7키(HAS_ASSEMBLY 등)는
+# 현재 by-pack 에 출현 0 이며 graphrag 임포트 경로 전용이다.
+JUDGMENT_MAPPINGS = {
+    "ACHIEVES": "contributes_to",
+    "AFFECTS": "optimizes",
+    "CONSTRAINS": "governs",
+    "CONTAINS_TURN": "describes",
+    "DEPENDS_ON": "related_to",
+    "ENABLES": "contributes_to",
+    "EVIDENCES": "contains",
+    "HAS_ASSEMBLY": "part_of",
+    "HAS_CHUNK": "contains",
+    "HAS_PART": "part_of",
+    "HAS_PART_NUMBER": "related_to",
+    "HAS_RESOURCE": "owns",
+    "HAS_SESSION": "contains",
+    "HAS_TOKEN_CATEGORY": "mentions",
+    "INSTANCE_OF": "subclass_of",
+    "PREDICTS": "related_to",
+    "REQUIRES_APPROVAL": "governs",
+    "SHOWN_IN": "mentions",
+    "STABILIZES": "optimizes",
+    "USED_IN_MODEL": "part_of",
+    "USES_CANONICAL_PART": "related_to",
+}
+
+
+def test_rel_map_partitions_into_identity_and_judgment():
+    """분할이 전수인지. 키가 늘면 어느 한쪽에 등록해야 하므로 조용히 못 늘어난다."""
+    identity = {k for k, v in N.REL_MAP.items() if k.lower() == v}
+    judgment = {k for k, v in N.REL_MAP.items() if k.lower() != v}
+    assert identity & judgment == set()
+    assert identity | judgment == set(N.REL_MAP)
+    assert judgment == set(JUDGMENT_MAPPINGS), \
+        "판단 매핑이 늘거나 줄었다 — JUDGMENT_MAPPINGS 에 근거와 함께 등록하라"
+    assert len(identity) == 34
+
+
+def _pair_without_override(label):
+    """이 라벨이 override 에 가려지지 않는 공간쌍. 없으면 **실패시킨다**.
+
+    처음에는 ("resource", "concept") 로 고정하고 가려지면 skip 했다. 그런데 그러면
+    DESCRIBES·PART_OF·SCOPES 세 항등키가 조용히 무검사로 빠진다 — 지금 닫고 있는
+    "조용한 미검사" 클래스 그 자체라, 가려지지 않는 쌍을 찾아 반드시 검사한다.
+    """
+    spaces = sorted(ALL_SPACES)
+    for frm in spaces:
+        for to in spaces:
+            if (label, frm, to) not in N.LABEL_SPACE_OVERRIDE:
+                return frm, to
+    raise AssertionError(f"{label}: 전 공간쌍이 override 라 REL_MAP 경로를 못 탄다")
+
+
+@pytest.mark.parametrize("label", sorted(JUDGMENT_MAPPINGS))
+def test_judgment_mapping_survives_through_resolve_edge(label):
+    """표를 읽지 않고 **동작**으로 확인한다 — 표가 그대로여도 조회 논리가 바뀌면 걸린다."""
+    frm, to = _pair_without_override(label)
+    want = JUDGMENT_MAPPINGS[label]
+    got = N.resolve_edge(label, frm, to)
+    if label in N.REVERSE_RELATIONS:
+        assert got == (to, want, frm, True)
+    else:
+        assert got == (frm, want, to, False)
+
+
+@pytest.mark.parametrize("label", sorted(
+    k for k, v in N.REL_MAP.items() if k.lower() == v))
+def test_identity_mapping_is_exactly_lowercasing(label):
+    """항등 매핑은 대소문자 정규화일 뿐이다 — 다른 relation 으로 새면 안 된다."""
+    frm, to = _pair_without_override(label)
+    assert N.resolve_edge(label, frm, to)[1] == label.lower()
 
 
 def test_every_rel_map_value_is_a_real_grammar_relation():

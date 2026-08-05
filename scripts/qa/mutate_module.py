@@ -1,38 +1,78 @@
 #!/usr/bin/env python
-"""모듈 하나에 대한 전면 기계 돌연변이 — 테스트의 검출력을 수치로 잰다.
+"""모듈 하나 또는 팩 계층 전체에 대한 전면 기계 돌연변이 — 테스트의 검출력을 수치로 잰다.
 
-**왜 있는가.** 2026-08-04 이 계층을 이관하며 적대 검증을 7라운드 돌렸는데, 매 라운드
+**왜 있는가.** 2026-08-04 이 계층을 이관하며 적대 검증을 9라운드 돌렸는데, 매 라운드
 새 결함이 나왔다. 원인은 코드가 아니라 방법이었다 — 검증자가 지적한 지점만 손으로
 막으니 **인접한 같은 클래스**가 다음 라운드에 다시 나왔다. 7라운드에서 이 도구로
 전면을 훑자 215종 중 생존 39종이 한 번에 드러났고, 그것이 두 클래스
 ("기존 유효값을 덮지 않는가", "유효값 튜플의 모든 원소를 존중하는가")로 수렴했다.
 지적 대응이 아니라 **클래스 폐쇄**로 바꾼 것이 루프를 끊었다.
 
-변이 대상: 비교 연산자, not, and/or, `.get(k, default)`·`.setdefault(k, default)` 의
-기본값, 상수, 문장 삭제. docstring 은 동작이 아니라 제외한다.
+**9라운드에서 이 도구 자신의 결함 두 종류가 드러났다(2026-08-05).**
 
-생존자가 나오면 둘 중 하나다 — 미검사 경로(고쳐라) 또는 등가 변이(추론하지 말고
-입력 격자로 차분 0 을 **측정해** 등가임을 보이고, 그 전제를 불변식 테스트로 못박아라).
+- *RC1 — 소급 미적용.* 도구를 만든 뒤 "그때 내가 만진 모듈"만 돌렸다. 먼저 이관된
+  ``jsonl_io.py``·``build.py`` 는 도구가 없던 시절 옮겨졌고 그 뒤로 **한 번도 스윕되지
+  않았다**. 첫 스윕이 곧바로 생존 21종을 냈다 — 누적 잔량이다. 그래서 대상을 사람이
+  고르지 못하게 ``--all`` 과 :data:`PACK_SUITES` 를 둔다. 등록되지 않은 모듈이
+  ``opencrab/pack/`` 에 생기면 ``--all`` 이 **실패**한다.
+- *RC2 — 조용한 0.* ``_module_functions`` 가 ``tree.body`` 만 봐서 클래스 메서드를 하나도
+  못 모았고, 그 결과 ``build.py`` 의 호출대상 변이가 **0** 으로 보고됐다. 사람은 그 0을
+  "대상 없음"으로 읽는다. "수집 실패"와 "대상 없음"이 같은 숫자로 나오면 안 된다.
+  이 리포가 ``check_shard_guards.py`` 까지 만들어 막아온 클래스를 검사 도구가 저지르고
+  있었다. 아래 네 자리를 전부 고쳤다: 클래스 메서드 수집, 클래스 본문 표 수집,
+  적용불가 op 라벨 출력, KILLED/BROKEN 분리.
+
+변이 대상: 비교 연산자, not, and/or, ``.get(k, d)``·``.setdefault(k, d)`` 의 기본값, 상수,
+문장 삭제, 모듈·클래스 최상단 표 리터럴, 호출 대상(모듈 함수 / 같은 클래스의 메서드).
+docstring 과 f-string 의 **리터럴 텍스트** 는 동작이 아니라 제외한다.
+
+**함수 기본 인자값은 이미 대상이다.** ``ast.walk(fn)`` 이 ``fn.args.defaults`` 까지 돌기
+때문에 ``missing_ok: bool = False`` 는 ``const:False->True`` 로 생성된다(9라운드에서
+"mutator 에 기본값 축을 추가하라"는 처방이 나왔으나 측정해 보니 오진이었다 — 이미
+생성되고 있었고 **테스트가 없어서 생존**했다). 진단을 그대로 따랐으면 중복 오퍼레이터만
+늘고 진짜 원인인 테스트 부재는 그대로 남았을 것이다.
+
+**복합(두 위치 동시) 변이는 하지 않는다.** n 개 변이의 쌍은 n²/2 이고 normalize 기준
+812² /2 ≈ 33 만 회의 pytest 실행이라 현실적이지 않다. 단일 변이가 전부 죽는 상태에서
+쌍이 살아남는 경우(서로 상쇄하는 변이)는 실제로는 드물다. **안 한다고 여기 적어 둔다 —
+"전부 훑었다"고 읽히면 안 된다.**
+
+판정 세 갈래:
+  KILLED   테스트가 실패했다(pytest rc=1). 계약이 실제로 검사하고 있다.
+  BROKEN   모듈이 뜨지도 못했다(rc>=2, 수집 에러). 검출은 됐지만 **계약 검증이 아니다** —
+           검출력 지표에서 분리해야 "N 종 KILLED" 가 과대평가되지 않는다.
+  SURVIVED 미검사 경로(고쳐라) 또는 등가 변이(추론하지 말고 입력 격자로 차분 0 을
+           **측정해** 등가임을 보이고, 그 전제를 불변식 테스트로 못박아라).
 
 사용:
-    python scripts/qa/mutate_module.py <리포루트> <모듈경로> <테스트경로> [결과.json]
+    python scripts/qa/mutate_module.py <리포루트> --all [결과.json]
+    python scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
 예:
     python scripts/qa/mutate_module.py . opencrab/pack/normalize.py \
         tests/test_pack_normalize.py /tmp/sweep.json
 """
 import ast
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-CLONE = Path(sys.argv[1])
-TARGET = CLONE / sys.argv[2]
-TESTS = sys.argv[3]
+# 모듈 -> 그 모듈의 계약을 검사하는 테스트. `--all` 이 이 표를 쓴다.
+#
+# **이 표가 RC1(소급 미적용)의 폐쇄 장치다.** 사람이 "이번에 만진 모듈"만 고르는 경로를
+# 없애려고 둔다. `opencrab/pack/` 에 모듈이 새로 생겼는데 여기 없으면 `--all` 이 죽는다.
+PACK_SUITES: dict[str, tuple[str, ...]] = {
+    "opencrab/pack/normalize.py": ("tests/test_pack_normalize.py",),
+    "opencrab/pack/schema.py": ("tests/test_pack_schema.py",),
+    "opencrab/pack/jsonl_io.py": ("tests/test_pack_jsonl_io.py",),
+    "opencrab/pack/build.py": ("tests/test_pack_build.py",),
+    "opencrab/pack/assembler.py": ("tests/test_pack_assembler.py",),
+    "opencrab/pack/neo4j_export.py": ("tests/test_pack_neo4j_export.py",),
+}
+
 PY = sys.executable
-ORIG_SRC = TARGET.read_text()
-TREE = ast.parse(ORIG_SRC)
 
 
 def _pos(n):
@@ -84,33 +124,75 @@ def _docstring_nodes(tree):
     return out
 
 
-def _table_constants(tree):
-    """모듈 최상단 UPPER_CASE 표 리터럴 안의 상수들.
+def _toplevel_constants(tree, skip):
+    """모듈 **및 클래스** 최상단 대입에 등장하는 모든 상수.
 
     함수 본문만 훑으면 표의 **내용**이 무검사로 남는다 — 적대 검증이
     `"HAS_ASSEMBLY": "part_of"` -> `"related_to"` 한 글자로 실증했다(2026-08-05).
     표는 판정의 절반이므로 같은 스윕에 넣는다.
+
+    **여기서 세 번 범위를 넓혔다(전부 "조용한 0" 이었다, RC2).**
+
+    1. *클래스 본문.* 예전에는 `tree.body` 만 봐서 `class X: TABLE = {...}` 이 통째로
+       0 으로 보고됐다. 그 0 은 "표가 없다"가 아니라 "안 봤다"였다.
+    2. *컨테이너 밖의 스칼라.* 예전에는 Dict/Set/List/Tuple **안**만 봤다. 그래서
+       `_MAX_SHARDS = 100`(세 자리 shard 를 glob 이 못 보게 막는 **유일한** 방어선),
+       `SHARD_LIMIT = int(os.environ.get("JSONL_SHARD_LIMIT", ...))`(env 이름이 계약),
+       `_NS = uuid.UUID('6ba7b810-...')`(바뀌면 **전 팩의 uid 가 갈린다**)가 전부
+       무검사로 남았다. 최상단 대입은 어느 것이든 모듈 상태다.
+    3. *이름 필터 제거.* UPPER_CASE 만 보면 `__all__` 같은 계약이 빠진다. 최상단
+       대입을 이름으로 거르는 근거가 없다 — 값에 상수가 없으면 op 도 안 생긴다.
+
+    중복 제거는 필수다. `ast.walk` 로 중첩 컨테이너를 다시 걸으면 같은 상수가 여러 번
+    수집되고, 그러면 **같은 변이를 여러 번 돌린 것이 총 변이 수로 보고된다**
+    (구 구현 실측: normalize 593 append / 고유 353 — 240 건이 중복이었다).
     """
-    out = []
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        names = [t.id for t in targets if isinstance(t, ast.Name)]
-        if not names or not any(n.isupper() or n.upper() == n for n in names):
-            continue
-        for sub in ast.walk(node):
-            if isinstance(sub, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
-                for c in ast.walk(sub):
-                    if isinstance(c, ast.Constant):
-                        out.append(c)
+    holders = [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    out, seen = [], set()
+    for holder in holders:
+        for node in holder.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            for c in ast.walk(node):
+                if not isinstance(c, ast.Constant):
+                    continue
+                if (c.lineno, c.col_offset) in skip or _pos(c) in seen:
+                    continue
+                seen.add(_pos(c))
+                out.append(c)
     return out
 
 
 def _module_functions(tree):
-    """최상단 함수명 -> 위치인자 개수. 호출 대상 교체용."""
+    """최상단 함수명 -> 위치인자 개수. 호출 대상 교체용(`foo(...)` 형태)."""
     return {n.name: len(n.args.args) for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _class_methods(tree):
+    """ClassDef -> {메서드명: self 를 뺀 위치인자 개수}. `self.foo(...)` 교체용.
+
+    **RC2 의 진원지.** 예전 `_module_functions` 는 `tree.body` 만 봐서 클래스 메서드를
+    하나도 못 모았고, 전부 메서드로 이뤄진 `build.py` 는 호출대상 변이가 0 으로
+    보고됐다. 0 이 "대상 없음"인지 "수집 실패"인지 구분되지 않는 게 문제였다.
+    """
+    out = {}
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        methods = {}
+        for m in cls.body:
+            if not isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # staticmethod 는 self 를 안 받는다 — 일괄 -1 하면 arity 가 하나씩 밀려
+            # 교체 후보가 엉뚱하게 매칭되거나 통째로 비어 **또 0 이 된다**.
+            static = any(isinstance(d, ast.Name) and d.id == "staticmethod"
+                         for d in m.decorator_list)
+            n = len(m.args.args) - (0 if static else 1)
+            if n >= 0:
+                methods[m.name] = n
+        out[cls] = methods
+    return out
 
 
 def _collect(tree):
@@ -119,8 +201,10 @@ def _collect(tree):
     msgs = _message_text_nodes(tree)
     funcs = _module_functions(tree)
 
-    # 0-a. 표 리터럴 내용 변이
-    for c in _table_constants(tree):
+    # 0-a. 최상단 상수 변이(모듈 + 클래스). 표 리터럴 안팎을 모두 포함한다.
+    for c in _toplevel_constants(tree, skip):
+        if (c.lineno, c.col_offset, c.end_lineno, c.end_col_offset) in msgs:
+            continue
         v = c.value
         repl = None
         if isinstance(v, str) and v:
@@ -132,10 +216,10 @@ def _collect(tree):
         elif isinstance(v, (int, float)) and not isinstance(v, bool):
             repl = v + 1
         if repl is not None:
-            ops.append(_Op(f"table-const:{v!r}->{repl!r}", c,
+            ops.append(_Op(f"top-const:{v!r}->{repl!r}", c,
                            lambda n, r=repl: setattr(n, "value", r)))
 
-    # 0-b. 호출 대상 교체(같은 위치인자 개수의 다른 최상단 함수로)
+    # 0-b. 호출 대상 교체 — 모듈 함수(`foo(...)`)
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in funcs):
@@ -143,10 +227,26 @@ def _collect(tree):
             for other, oarity in funcs.items():
                 if other != node.func.id and oarity == arity:
                     ops.append(_Op(f"call-target:{node.func.id}->{other}", node,
-                                   lambda n, o=other: setattr(
-                                       n.func, "id", o)))
+                                   lambda n, o=other: setattr(n.func, "id", o)))
 
-    # 함수 본문 안만 대상으로 한다(모듈 최상단 표 리터럴은 별도 축).
+    # 0-c. 호출 대상 교체 — 같은 클래스의 메서드(`self.foo(...)`)
+    for cls, methods in _class_methods(tree).items():
+        for node in ast.walk(cls):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                    and node.func.attr in methods):
+                continue
+            arity = len(node.args)
+            for other, oarity in methods.items():
+                if other != node.func.attr and oarity == arity:
+                    ops.append(_Op(
+                        f"self-call:{node.func.attr}->{other}", node,
+                        lambda n, o=other: setattr(n.func, "attr", o)))
+
+    # 함수 본문 안. `ast.walk(fn)` 은 `fn.args.defaults` 도 도므로 **기본 인자값은 아래
+    # 상수 축이 이미 잡는다**(별도 축이 필요하다는 진단은 오진이었다, 2026-08-05 측정).
     for fn in [n for n in ast.walk(tree)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
         for node in ast.walk(fn):
@@ -181,7 +281,33 @@ def _collect(tree):
                     and node.func.attr in ("get", "setdefault") and len(node.args) == 2):
                 ops.append(_Op(f"drop-{node.func.attr}-default", node,
                                lambda n: setattr(n, "args", n.args[:1])))
-            # 5. 상수 뒤집기
+            # 5. 예외 타입 교체 — `raise X(...)` 의 X 를 바꿔 except 절 계층을 흔든다.
+            #    PackSchemaError 가 ValueError 하위라는 계약처럼, 잡히는 쪽이 계약이다.
+            if (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                    and isinstance(node.exc.func, ast.Name)):
+                cur = node.exc.func.id
+                alt = "RuntimeError" if cur != "RuntimeError" else "ValueError"
+                ops.append(_Op(f"raise:{cur}->{alt}", node.exc,
+                               lambda n, a=alt: setattr(n.func, "id", a)))
+            # 6. 키워드 인자 이름 교체 — 같은 호출 안의 다른 키워드로 바꿔 배선을 흔든다.
+            if isinstance(node, ast.Call) and len(node.keywords) >= 2:
+                names = [k.arg for k in node.keywords if k.arg]
+                if len(names) >= 2:
+                    ops.append(_Op(f"kwarg:{names[0]}<->{names[1]}", node,
+                                   lambda n: _swap_kwargs(n)))
+            # 7. 슬라이스 경계 이동
+            if isinstance(node, ast.Slice):
+                for fld in ("lower", "upper"):
+                    tgt = getattr(node, fld, None)
+                    if isinstance(tgt, ast.Constant) and isinstance(tgt.value, int):
+                        ops.append(_Op(f"slice-{fld}:{tgt.value}->{tgt.value + 1}", tgt,
+                                       lambda n: setattr(n, "value", n.value + 1)))
+            # 8. dict comprehension 의 키와 값 교환
+            if isinstance(node, ast.DictComp):
+                ops.append(_Op("dictcomp-swap-key-value", node,
+                               lambda n: n.__dict__.update(
+                                   {"key": n.value, "value": n.key})))
+            # 9. 상수 뒤집기(기본 인자값 포함 — walk 가 args.defaults 를 돈다)
             if (isinstance(node, ast.Constant)
                     and (node.lineno, node.col_offset) not in skip
                     and (node.lineno, node.col_offset, node.end_lineno,
@@ -201,7 +327,7 @@ def _collect(tree):
                 if repl is not None or (v is False):
                     ops.append(_Op(f"const:{v!r}->{repl!r}", node,
                                    lambda n, r=repl: setattr(n, "value", r)))
-        # 6. 문장 삭제(본문이 비지 않는 선에서)
+        # 10. 문장 삭제(본문이 비지 않는 선에서)
         for holder in ast.walk(fn):
             for field in ("body", "orelse", "finalbody"):
                 stmts = getattr(holder, field, None)
@@ -213,11 +339,22 @@ def _collect(tree):
                     ops.append(_Op(f"del-stmt:{type(st).__name__}", st,
                                    lambda n, h=holder, f=field, i=idx:
                                    getattr(h, f).__setitem__(i, ast.Pass())))
+    # 11. 데코레이터 제거 — 데코레이터가 동작의 일부인 경우(@property, @staticmethod 등)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and node.decorator_list:
+            ops.append(_Op(f"drop-decorator:{node.name}", node,
+                           lambda n: setattr(n, "decorator_list", [])))
     return ops
 
 
-def _mutate_source(op):
-    tree = ast.parse(ORIG_SRC)
+def _swap_kwargs(call):
+    named = [k for k in call.keywords if k.arg]
+    named[0].arg, named[1].arg = named[1].arg, named[0].arg
+
+
+def _mutate_source(orig_src, op):
+    tree = ast.parse(orig_src)
     # 같은 위치의 노드를 새 트리에서 찾는다(줄·컬럼·타입으로 매칭)
     want = _pos(op.node)
     for holder in ast.walk(tree):
@@ -235,55 +372,114 @@ def _mutate_source(op):
     return None
 
 
-def run_tests():
-    for pc in CLONE.rglob("__pycache__"):
+def run_tests(clone: Path, tests: tuple[str, ...]) -> int:
+    """변이본을 **반드시** import 하도록 PYTHONPATH 를 도구가 직접 건다.
+
+    호출자가 PYTHONPATH 를 잊으면 pip 설치된 실제 패키지를 읽어 전 변이가 조용히
+    생존하거나 조용히 죽는다 — 1 라운드에서 검증자가 실제로 이 함정에 빠져 "변이해도
+    characterization 이 안 바뀐다"는 틀린 결론을 냈다(2026-08-04). 도구가 스스로 건다.
+    """
+    for pc in clone.rglob("__pycache__"):
         shutil.rmtree(pc, ignore_errors=True)
+    env = {**os.environ, "PYTHONPATH": str(clone.resolve())}
     r = subprocess.run(
-        [PY, "-B", "-m", "pytest", TESTS, "-x", "-q",
+        [PY, "-B", "-m", "pytest", *tests, "-x", "-q",
          "-p", "no:cacheprovider", "-o", "addopts="],
-        cwd=CLONE, capture_output=True, text=True)
+        cwd=clone, env=env, capture_output=True, text=True)
     return r.returncode
 
 
-def main():
-    if len(sys.argv) < 4:
-        sys.exit(__doc__)
-    ops = _collect(TREE)
-    print(f"수집한 변이 {len(ops)}종", flush=True)
-    assert run_tests() == 0, "baseline 이 깨져 있으면 매트릭스는 무효다"
+def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
+    """모듈 하나를 전면 스윕한다. 원본은 finally 에서 반드시 복원한다."""
+    target = clone / module
+    orig_src = target.read_text()
+    ops = _collect(ast.parse(orig_src))
+    print(f"\n### {module}  변이 {len(ops)}종  테스트 {' '.join(tests)}", flush=True)
+
+    rc = run_tests(clone, tests)
+    assert rc == 0, f"baseline 이 깨져 있으면 매트릭스는 무효다 (rc={rc})"
     print("BASELINE rc=0", flush=True)
 
-    survived, invalid, killed = [], 0, 0
+    survived, invalid, killed, broken = [], [], 0, []
     try:
         for i, op in enumerate(ops, 1):
-            src = _mutate_source(op)
+            src = _mutate_source(orig_src, op)
             if src is None:
-                invalid += 1
+                invalid.append(op.label())          # 조용히 세지 않는다(RC2)
                 continue
             try:
                 compile(src, "<mut>", "exec")
             except SyntaxError:
-                invalid += 1
+                invalid.append(op.label())
                 continue
-            TARGET.write_text(src)
-            if run_tests() == 0:
+            target.write_text(src)
+            rc = run_tests(clone, tests)
+            if rc == 0:
                 survived.append(op.label())
+            elif rc == 1:
+                killed += 1                          # 테스트가 계약을 검사해서 잡았다
             else:
-                killed += 1
-            if i % 25 == 0:
-                print(f"  {i}/{len(ops)}  killed={killed} survived={len(survived)}",
-                      flush=True)
+                broken.append(op.label())            # 모듈이 뜨지도 못했다 — 계약 검증 아님
+            if i % 50 == 0:
+                print(f"  {i}/{len(ops)}  killed={killed} broken={len(broken)} "
+                      f"survived={len(survived)}", flush=True)
     finally:
-        TARGET.write_text(ORIG_SRC)
+        target.write_text(orig_src)
 
-    print(f"\n총 {len(ops)}  적용불가 {invalid}  KILLED {killed}  SURVIVED {len(survived)}")
-    for s in survived:
-        print("  생존:", s)
-    if len(sys.argv) > 4:
-        Path(sys.argv[4]).write_text(json.dumps(
-            {"total": len(ops), "invalid": invalid, "killed": killed,
-             "survived": survived}, ensure_ascii=False, indent=2))
+    res = {"module": module, "tests": list(tests), "total": len(ops),
+           "killed": killed, "broken": broken, "invalid": invalid,
+           "survived": survived}
+    print(f"총 {len(ops)}  KILLED {killed}  BROKEN {len(broken)}  "
+          f"적용불가 {len(invalid)}  SURVIVED {len(survived)}")
+    for lbl in survived:
+        print("  생존:", lbl)
+    for lbl in invalid:
+        print("  적용불가:", lbl)            # 정체 불명의 숫자를 남기지 않는다
+    for lbl in broken:
+        print("  BROKEN(모듈 미기동):", lbl)
+    return res
+
+
+def _all_targets(clone: Path) -> list[tuple[str, tuple[str, ...]]]:
+    """`opencrab/pack/` 전 모듈. 등록되지 않은 모듈이 있으면 **죽는다**(RC1 폐쇄)."""
+    found = {f"opencrab/pack/{p.name}" for p in (clone / "opencrab/pack").glob("*.py")
+             if p.name != "__init__.py"}
+    missing = sorted(found - set(PACK_SUITES))
+    if missing:
+        sys.exit(f"PACK_SUITES 에 없는 모듈: {missing}\n"
+                 f"스윕 대상을 사람이 고르지 못하게 하려고 죽는다 — 표에 등록하라.")
+    gone = sorted(set(PACK_SUITES) - found)
+    if gone:
+        sys.exit(f"PACK_SUITES 에 있는데 파일이 없다: {gone}")
+    return [(m, PACK_SUITES[m]) for m in sorted(found)]
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+    clone = Path(sys.argv[1])
+
+    if sys.argv[2] == "--all":
+        targets = _all_targets(clone)
+        out_json = sys.argv[3] if len(sys.argv) > 3 else None
+    else:
+        if len(sys.argv) < 4:
+            sys.exit(__doc__)
+        targets = [(sys.argv[2], tuple(sys.argv[3].split(",")))]
+        out_json = sys.argv[4] if len(sys.argv) > 4 else None
+
+    results = [sweep(clone, m, t) for m, t in targets]
+
+    print("\n===== 요약 =====")
+    for r in results:
+        print(f"  {r['module']:34} 총 {r['total']:4}  KILLED {r['killed']:4}  "
+              f"BROKEN {len(r['broken']):3}  SURVIVED {len(r['survived']):3}")
+    total_survived = sum(len(r["survived"]) for r in results)
+    print(f"  생존 합계 {total_survived}")
+    if out_json:
+        Path(out_json).write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    return 1 if total_survived else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

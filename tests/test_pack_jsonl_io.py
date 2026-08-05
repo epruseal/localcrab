@@ -9,10 +9,16 @@ base 만 읽고 일부 데이터만 조용히 얻는 silent partial read 를 Fil
 """
 
 import hashlib
+import inspect
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
+from opencrab.pack import jsonl_io as jsonl_io_mod
 from opencrab.pack.jsonl_io import (
     _MAX_SHARDS,
     SHARD_LIMIT,
@@ -200,6 +206,19 @@ class TestReadAndLoudFail:
         assert jsonl_exists(p)
         assert not jsonl_exists(tmp_path / "none.jsonl")
 
+    def test_iter_jsonl_lines_default_raises_on_missing(self, tmp_path):
+        """raw 라인 스트림도 기본은 loud-fail 이다.
+
+        `iter_jsonl` 쪽만 검사하고 있었다. 그래서 `missing_ok: bool = False` 를 `True` 로
+        바꾸는 변이가 40 건 전부 통과한 채 살아남았다(2026-08-05 적대 검증). 두 함수는
+        기본값이 같아야 하고, 그 기본값이 이 리포의 silent partial read 방지 설계다.
+        """
+        with pytest.raises(FileNotFoundError):
+            list(iter_jsonl_lines(tmp_path / "none.jsonl"))
+
+    def test_iter_jsonl_lines_missing_ok_yields_nothing(self, tmp_path):
+        assert list(iter_jsonl_lines(tmp_path / "none.jsonl", missing_ok=True)) == []
+
     def test_count_jsonl_sums_all_shards(self, p):
         write_jsonl_sharded(p, [rec(i, 400) for i in range(50)], limit=5_000)
         assert count_jsonl(p) == 50
@@ -302,6 +321,108 @@ class TestShardBoundaries:
     def test_default_shard_limit_is_forty_megabytes(self):
         """테스트가 늘 limit 을 주입해서 기본값 자체는 무검증이었다(변이 생존)."""
         assert SHARD_LIMIT == 40 * 1024 * 1024
+
+
+class TestExistenceIsAboutTheFileNotItsContents:
+    """`jsonl_exists` 는 "파일이 있는가"이지 "내용이 있는가"가 아니다.
+
+    적대 검증이 `return bool(shard_paths(path))` 를 `return bool(count_jsonl(path))` 로
+    바꿨는데 40 건이 전부 통과했다(2026-08-05). 기존 검사가 레코드를 **쓴 뒤에만**
+    존재를 봤기 때문이다.
+
+    이 구분이 왜 계약인가. 호출부가 약 60 곳이고 전부 `if not jsonl_exists(x): skip`
+    형태의 게이트다. 라인수 기반이 되면 "생산은 됐는데 0 건"과 "생산 자체가 안 됨"이
+    같은 답을 내서 진단이 불가능해진다. 실제로 `check_dangling` 은 빈 edges.jsonl 팩을
+    통째로 건너뛰게 되고, 적재기는 빈 nodes.jsonl 팩을 조용히 지나친다.
+    생산자 쪽 계약(`test_empty_records_creates_empty_base`)이 빈 base 파일 생성을
+    보장하므로 이 입력은 가정이 아니라 실재한다.
+    """
+
+    def test_empty_base_file_exists(self, p):
+        write_jsonl_sharded(p, [])
+        assert p.exists() and p.read_text(encoding="utf-8") == ""
+        assert jsonl_exists(p) is True
+        assert count_jsonl(p) == 0, "빈 파일은 존재하지만 0 건 — 둘은 다른 질문이다"
+
+    def test_empty_shards_exist(self, p):
+        """분할 상태에서도 같다. base 는 없고 shard 만 비어 있는 경우."""
+        for i in range(2):
+            p.with_name(f"chunks.{i:02d}.jsonl").write_text("", encoding="utf-8")
+        assert not p.exists()
+        assert jsonl_exists(p) is True
+        assert count_jsonl(p) == 0
+
+    def test_missing_does_not_exist(self, tmp_path):
+        assert jsonl_exists(tmp_path / "none.jsonl") is False
+
+    def test_corruption_propagates_rather_than_being_swallowed(self, p):
+        """base+shard 공존은 `jsonl_exists` 를 통해서도 조용히 True 가 되면 안 된다."""
+        p.write_text('{"id":0}\n', encoding="utf-8")
+        p.with_name("chunks.00.jsonl").write_text('{"id":1}\n', encoding="utf-8")
+        with pytest.raises(RuntimeError, match="base와 shard"):
+            jsonl_exists(p)
+
+
+class TestModuleLevelConstants:
+    """모듈 최상단 **스칼라** 상수. 돌연변이 스윕이 오래 못 보던 사각지대였다.
+
+    스윕이 컨테이너 리터럴 안만 훑어서, 표에 안 들어 있는 최상단 상수는 어느 축에도
+    안 걸렸다(2026-08-05 발견). 아래 둘은 값 자체가 계약이다.
+    """
+
+    def test_max_shards_is_two_digits_worth(self):
+        """`_MAX_SHARDS` 는 glob 패턴 `[0-9][0-9]` 와 **짝** 이다.
+
+        100 이상이면 `chunks.100.jsonl` 이 만들어지는데 glob 이 그 파일을 못 봐서
+        데이터가 조용히 사라진다. 두 값은 따로 못 움직인다.
+        """
+        assert _MAX_SHARDS == 100
+        assert _shard_path(Path("x/chunks.jsonl"), _MAX_SHARDS - 1).name == "chunks.99.jsonl"
+
+    def test_shard_limit_reads_the_documented_env_var(self, tmp_path):
+        """env 변수 **이름** 이 운영 계약이다 — 오타가 나면 조용히 기본값으로 돌아간다.
+
+        모듈을 reload 하면 이미 이 모듈을 import 한 다른 모듈(build 등)이 옛 객체를
+        붙든 채 남아 테스트 순서에 따라 결과가 달라진다. 별도 프로세스에서 읽는다.
+        """
+        root = Path(jsonl_io_mod.__file__).resolve().parents[2]
+        env = {**os.environ, "JSONL_SHARD_LIMIT": "12345",
+               "PYTHONPATH": str(root)}
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import opencrab.pack.jsonl_io as m; print(m.SHARD_LIMIT)"],
+            cwd=root, env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "12345"
+
+
+class TestDefaultArguments:
+    """공개 호출부의 기본 인자값 고정.
+
+    `iter_jsonl_lines(missing_ok=False)` 변이가 살아남은 뒤에 둔다. 개별 행동 검사가
+    본체이고(위 `test_iter_jsonl_lines_default_raises_on_missing` 등) 이 표는 **행동으로
+    관측하기 어려운 나머지**를 덮는 그물이다. 표만 두면 기대값을 같이 고치는 순간
+    통과하므로, 행동 검사를 대체하지 않는다.
+    """
+
+    EXPECTED = {
+        "iter_jsonl_lines": {"missing_ok": False},
+        "iter_jsonl": {"missing_ok": False},
+        "write_jsonl_sharded": {"limit": None},
+    }
+
+    @pytest.mark.parametrize("name", sorted(EXPECTED))
+    def test_function_defaults_are_pinned(self, name):
+        fn = getattr(jsonl_io_mod, name)
+        got = {k: v.default for k, v in inspect.signature(fn).parameters.items()
+               if v.default is not inspect.Parameter.empty}
+        assert got == self.EXPECTED[name]
+
+    def test_appender_limit_default_is_none_meaning_module_limit(self):
+        got = {k: v.default
+               for k, v in inspect.signature(ShardedAppender.__init__).parameters.items()
+               if v.default is not inspect.Parameter.empty}
+        assert got == {"limit": None}
 
 
 class TestHelpers:

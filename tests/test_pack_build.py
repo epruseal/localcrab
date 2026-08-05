@@ -5,6 +5,7 @@
 지키는지와 이관에서 바뀐 두 가지(출력 루트, remap 함정 검사)를 고정한다.
 """
 
+import inspect
 import json
 import os
 
@@ -474,3 +475,86 @@ class TestSave:
         """`pack_lib.json.dumps(...)` 를 쓰는 빌더가 있다(실측 3곳)."""
         from opencrab.pack import build
         assert build.json is json
+
+
+# ---------------------------------------------------------------------------
+# 기본값 — 호출부가 생략하는 값이라 무검사로 남기 쉽다
+# ---------------------------------------------------------------------------
+
+class TestDefaults:
+    """생략 가능한 인자의 기본값. **호출부 다수가 이 값에 의존한다.**
+
+    적대 검증이 `source_type='reference-public'` 를 `'reference-private'` 로 바꿨는데
+    57 건이 전부 통과했다(2026-08-05). 기존 검사가 override 경로만 봤기 때문이다.
+    실측: opencrab-dump 의 `Pack()` 대입 60 건 중 `source_type` 을 명시하는 것은 22 건
+    뿐이고 **38 건이 이 기본값에 의존**한다. 이 값은 노드·청크의 최상위 필드로 그대로
+    라이브에 실린다.
+    """
+
+    def test_default_source_type_lands_on_nodes_and_chunks(self, pack):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        assert pack.nodes[0]["source_type"] == "reference-public"
+        assert pack.chunks[0]["source_type"] == "reference-public"
+
+    def test_explicit_source_type_replaces_the_default_everywhere(self, tmp_path):
+        p = Pack("t", "제목", source_type="self-authored", out_root=str(tmp_path))
+        doc = p.resource("d", "문서")
+        p.ev("e1", doc, "라벨", "본문")
+        assert {n["source_type"] for n in p.nodes} == {"self-authored"}
+        assert p.chunks[0]["source_type"] == "self-authored"
+
+    @pytest.mark.parametrize("maker,expected_type", [
+        ("resource", "Document"),
+        ("subject", "Org"),
+    ])
+    def test_default_node_types(self, pack, maker, expected_type):
+        getattr(pack, maker)("s", "라벨")
+        assert pack.nodes[0]["node_type"] == expected_type
+
+    def test_ev_default_node_type(self, pack):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        assert pack.nodes[1]["node_type"] == "TextEvidence"
+
+    @pytest.mark.parametrize(
+        "maker", ["concept", "claim", "community", "outcome", "lever", "policy"])
+    def test_blank_desc_produces_no_properties_key(self, pack, maker):
+        """`desc=''` 는 properties 를 만들지 않는다 — 빈 설명이 실리면 안 된다."""
+        getattr(pack, maker)("s", "라벨")
+        assert "properties" not in pack.nodes[0]
+
+    def test_uid_namespace_uuid_is_pinned(self, tmp_path):
+        """`_NS` 가 바뀌면 **모든 팩의 모든 노드 id 가 통째로 갈린다.**
+
+        기존 uid 검사는 결정성(같은 입력 → 같은 출력)과 팩 간 분리만 봤다. 둘 다 상대
+        비교라 네임스페이스를 통째로 바꿔도 그대로 성립한다. 절대값으로 못박는다.
+        """
+        assert str(build_mod._NS) == "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        assert Pack("t", "제목", out_root=str(tmp_path)).uid("x", 1) == \
+            "2fd29310-7523-5e4f-a6b5-da85617f0693"
+
+    EXPECTED_DEFAULTS = {
+        "__init__": {"source_type": "reference-public", "out_root": None},
+        "node": {"props": None},
+        "edge": {"props": None},
+        "ev": {"extra": None, "ntype": "TextEvidence", "node_props": None},
+        "resource": {"nt": "Document", "props": None},
+        "subject": {"nt": "Org", "props": None},
+        "concept": {"desc": ""},
+        "claim": {"desc": ""},
+        "community": {"desc": ""},
+        "outcome": {"desc": ""},
+        "lever": {"desc": ""},
+        "policy": {"desc": ""},
+        "validate": {"strict": None},
+    }
+
+    @pytest.mark.parametrize("name", sorted(EXPECTED_DEFAULTS))
+    def test_method_defaults_are_pinned(self, name):
+        """행동 검사로 덮이지 않는 나머지를 메우는 그물. 행동 검사를 대체하지 않는다 —
+        기대값을 같이 고치면 통과하므로 변경 감지이지 의미 보존 증명이 아니다."""
+        got = {k: v.default
+               for k, v in inspect.signature(getattr(Pack, name)).parameters.items()
+               if v.default is not inspect.Parameter.empty}
+        assert got == self.EXPECTED_DEFAULTS[name]
