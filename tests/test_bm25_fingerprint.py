@@ -188,8 +188,8 @@ def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
     guard is worth. Reversing the order below makes this test fail, which is
     the property it actually protects.
     """
-    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
     from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
     ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
     if not getattr(ds, "_available", False):
@@ -241,8 +241,8 @@ def test_t8_no_rebuild_scheduled_when_over_cap_and_unchanged(tmp_path, monkeypat
     with nothing changed. Fixed by stamping the index's own fingerprint from
     the same whole-table probe at build time (BM25Index.build(fingerprint=)),
     so once nothing changes, probe and cache.fingerprint agree again."""
-    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
     from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
     ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
     if not getattr(ds, "_available", False):
@@ -274,8 +274,8 @@ def test_t8_rebuild_scheduled_when_row_outside_cap_updated(tmp_path, monkeypatch
     """Complement to the above: a real change outside the cap window must
     still be picked up (this is the original #63 bug, kept as a regression
     test at the HybridQuery integration level, not just the store level)."""
-    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
     from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
     ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
     if not getattr(ds, "_available", False):
