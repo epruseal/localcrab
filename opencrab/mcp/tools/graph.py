@@ -248,7 +248,11 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     "ontology_list_nodes",
     {
         "description": (
-            "List nodes from the doc store, optionally filtered by space and/or pack_id. "
+            "List nodes, optionally filtered by space and/or pack_id. Without pack_id, lists "
+            "from the doc store. With pack_id, lists from the graph store, and `total` in the "
+            "response is the TRUE count of all matching nodes -- it is NOT capped by `limit` "
+            "and can be larger than the number of `nodes` actually returned; if `total` "
+            "exceeds len(nodes), the page was truncated and a larger `limit` will return more. "
             "Useful for inspecting a pack's contents after ingest."
         ),
         "inputSchema": {
@@ -256,7 +260,14 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
             "properties": {
                 "space": {"type": "string", "description": "Optional MetaOntology space filter (e.g. evidence, concept)."},
                 "pack_id": {"type": "string", "description": "Optional pack_id filter."},
-                "limit": {"type": "integer", "description": "Maximum results (default 100).", "default": 100},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum number of `nodes` rows returned (default 100). Does NOT cap "
+                        "`total`, which always reflects the full match count."
+                    ),
+                    "default": 100,
+                },
             },
             "required": [],
         },
@@ -270,22 +281,27 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
-    When pack_id is given, queries the graph store's export_nodes(pack_id=...,
-    space=..., limit=...) for the displayed page, and count_exported_nodes
-    (same predicate, no LIMIT) for ``total``. All three concrete backends
-    (SQL-backed local/pg, Kuzu, Neo4j) push ``space`` into their native
-    query ahead of ``limit`` — see each backend's export_nodes and the
-    shared contract in opencrab/stores/_graph_protocol.py — so the returned
-    rows are correct before truncation instead of being Python-filtered
-    after (issue #54; same class of bug #62 fixed for find_neighbors' pack
-    filter). ``total`` is deliberately NOT ``len(nodes)``: that would still
-    be capped at ``limit`` even with the pushdown fix, which is the actual
-    bug #54 reported (a caller cannot tell "5 of 5 matches" from "5 of 3000
+    When pack_id is given, this calls (in this order, matching the code
+    below) the graph store's count_exported_nodes(pack_id=..., space=...,
+    no LIMIT) first for ``total``, THEN export_nodes(pack_id=..., space=...,
+    limit=...) for the displayed page. All three concrete backends
+    (SQL-backed local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j,
+    ``pack_id`` too) into their native query ahead of ``limit`` — see each
+    backend's export_nodes and the shared contract in
+    opencrab/stores/_graph_protocol.py — so the returned rows are correct
+    before truncation instead of being Python-filtered after (issue #54;
+    same class of bug #62 fixed for find_neighbors' pack filter). ``total``
+    is deliberately NOT ``len(nodes)``: that would still be capped at
+    ``limit`` even with the pushdown fix, which is the actual bug #54
+    reported (a caller cannot tell "5 of 5 matches" from "5 of 3000
     matches, truncated" from the row count alone) — count_exported_nodes
     runs the identical filter with no LIMIT so ``total`` is the true match
-    count. When pack_id is absent, falls back to the doc store's
-    list_nodes (unchanged, pre-existing "total = len(page)" behavior for
-    that path -- not part of #54's pack_id+space scope).
+    count. This total/page split, and that ``total`` is never limit-capped,
+    is also stated in this tool's MCP ``description`` (the part of this
+    contract an MCP client actually sees -- this docstring is developer-
+    only and never reaches a client). When pack_id is absent, falls back to
+    the doc store's list_nodes (unchanged, pre-existing "total = len(page)"
+    behavior for that path -- not part of #54's pack_id+space scope).
 
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/

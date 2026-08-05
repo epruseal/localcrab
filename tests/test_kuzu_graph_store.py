@@ -299,6 +299,29 @@ def test_export_nodes_space_filter_pushed_ahead_of_limit(store) -> None:
     assert all(r["props"]["space"] == "concept" for r in rows)
 
 
+def test_export_nodes_pack_id_filter_pushed_ahead_of_limit(store) -> None:
+    """issue #54 audit finding [3]: export_nodes' pack_id filter must apply
+    BEFORE limit truncation, same as count_exported_nodes already does --
+    otherwise a caller can see an accurate `total` (from
+    count_exported_nodes) alongside a wrongly-truncated-to-empty `nodes`
+    page from export_nodes, e.g. `total: 5, nodes: []`, whenever the first
+    `limit` space-matching rows Cypher returns all happen to be the wrong
+    pack_id. Seeds 150 wrong-pack_id "noise" nodes first, then 5
+    right-pack_id nodes last, all in the same space, so with a small limit
+    the old LIMIT-before-pack_id-filter order would return zero matches."""
+    for i in range(150):
+        store.upsert_node("X", f"a{i:03d}", {"pack_id": "wrong"}, space_id="concept")
+    for i in range(5):
+        store.upsert_node("X", f"z{i:02d}", {"pack_id": "target"}, space_id="concept")
+
+    page = store.export_nodes(pack_id="target", space="concept", limit=10)
+    total = store.count_exported_nodes(pack_id="target", space="concept")
+
+    assert total == 5
+    assert len(page) == 5  # NOT [] -- total and the page must agree
+    assert all(r["props"]["pack_id"] == "target" for r in page)
+
+
 def test_count_exported_nodes_space_only_not_capped_by_limit(store) -> None:
     """issue #54: count_exported_nodes(space=...) is a real Cypher count(n)
     pushdown, so it must report the true match count even when it exceeds

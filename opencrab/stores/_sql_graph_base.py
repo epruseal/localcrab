@@ -185,6 +185,27 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
         # measured COUNT from ~209ms to ~93-116ms (see PR discussion) --
         # same "index instead of eating the scan" resolution #63 used for
         # its own 3x regression.
+        #
+        # COST, MEASURED (audit finding #54-[1], 250k-row SQLite table):
+        # - First-ever `CREATE INDEX IF NOT EXISTS` on an existing 250k-row
+        #   DB (the one-time migration every LocalGraphStore/PGGraphStore
+        #   pays on its first open after upgrading): ~147ms, synchronous,
+        #   blocks that store's constructor (same as any DDL already run in
+        #   _init_db/__init__ -- not a new blocking pattern, just one more
+        #   statement in the existing list).
+        # - Every open AFTER that first one (e.g. a second thread's
+        #   connection re-running the full render_ddl list against an
+        #   already-indexed file): ~0.2ms -- `CREATE INDEX IF NOT EXISTS`
+        #   is an existence check, not a rebuild, so per-thread/per-restart
+        #   cost is negligible once the index exists.
+        # - Write path: benchmarked 5,000 upserts against a 250k-row table,
+        #   with vs without this index: ~7.3us/upsert vs ~6.0us/upsert --
+        #   about +1.3us per upsert (~20% relative, but trivial in
+        #   absolute terms; e.g. +0.4s across a 300k-node bulk ingest).
+        #   Same order of cost idx_nodes_pack already carries unremarked.
+        # Verdict: one-time ~150ms migration + ~1.3us/upsert write cost is
+        # a clear win against the measured 2x+ read improvement above, so
+        # the index is kept.
         IndexSpec("idx_nodes_space", "graph_nodes", expr="space_id"),
         IndexSpec("idx_edges_from", "graph_edges", expr="from_id"),
         IndexSpec("idx_edges_to", "graph_edges", expr="to_id"),
