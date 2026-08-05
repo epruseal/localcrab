@@ -91,23 +91,20 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         return self._conn.execute(sql, params).fetchone()
 
     def _exec_write(self, sql: str, params: dict[str, Any]) -> int:
-        with self._lock:
-            cur = self._conn.execute(sql, params)
-            self._conn.commit()
+        with self._tx() as conn:
+            cur = conn.execute(sql, params)
             return cur.rowcount
 
     def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]:
-        with self._lock:
+        with self._tx() as conn:
             rowcounts = []
             for sql, params in statements:
-                cur = self._conn.execute(sql, params)
+                cur = conn.execute(sql, params)
                 rowcounts.append(cur.rowcount)
-            self._conn.commit()
             return rowcounts
 
     def _exec_write_batch(self, sql: str, params_list: list[dict[str, Any]]) -> None:
-        with self._lock:
-            self._conn.executemany(sql, params_list)
-            self._conn.commit()
+        with self._tx() as conn:
+            conn.executemany(sql, params_list)
 
     # ``_require_available`` is inherited from ``_SqliteConnMixin``.

@@ -93,3 +93,36 @@ class TestExportNodesEdges:
         rows = store.export_edges()
         assert len(rows) == 1
         assert rows[0]["relation"] == "rel"
+
+
+class TestBatchWriteRollback:
+    """Issue #79 regression: a mid-batch failure in upsert_nodes_batch must not
+    leave earlier rows of that same batch uncommitted-yet-persistable — they
+    must roll back, and a later unrelated successful write must not smuggle
+    them in on the back of its commit()."""
+
+    def test_partial_batch_failure_leaves_no_rows(self, store):
+        # 3rd node violates the node_type NOT NULL constraint mid-executemany.
+        nodes = [
+            {"node_type": "T", "node_id": "n1", "properties": {}},
+            {"node_type": "T", "node_id": "n2", "properties": {}},
+            {"node_type": None, "node_id": "n3", "properties": {}},
+        ]
+        with pytest.raises(Exception):
+            store.upsert_nodes_batch(nodes)
+        assert store.count_nodes() == 0
+
+    def test_later_write_does_not_smuggle_in_failed_batch(self, store):
+        nodes = [
+            {"node_type": "T", "node_id": "n1", "properties": {}},
+            {"node_type": None, "node_id": "n2", "properties": {}},
+        ]
+        with pytest.raises(Exception):
+            store.upsert_nodes_batch(nodes)
+
+        # unrelated, independent successful write on the same thread connection
+        store.upsert_node("Other", "ok-1", {})
+
+        assert store.count_nodes() == 1
+        assert store.get_node_by_id("n1") is None
+        assert store.get_node_by_id("ok-1") is not None

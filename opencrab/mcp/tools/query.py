@@ -160,7 +160,7 @@ def ontology_query(
     pack_filter_warnings = [mcp_warning_text(w) for w in selection.warnings]
 
     try:
-        results = ctx["hybrid"].query(
+        outcome = ctx["hybrid"].query(
             question=question,
             spaces=spaces,
             limit=limit,
@@ -171,6 +171,15 @@ def ontology_query(
             pack_ids=effective_pack_ids,
             include_unpackaged=include_unpackaged,
         )
+        results = outcome.results
+        # This is a store write (billing_events INSERT), but ontology_query stays
+        # writes=False: billing.on_query -> BillingHooks.emit uses UNIQUE(event_id)
+        # + INSERT OR IGNORE / ON CONFLICT DO NOTHING (opencrab/billing/hooks.py),
+        # so it's idempotent append-only and doesn't need write.lock's cross-process
+        # serialisation. Forcing writes=True here would serialise every query
+        # (high-frequency, read-shaped) behind the write mutex for no correctness
+        # gain. Decided in #65's review against #68 (E-4 lock ownership map); see
+        # `writes` field docstring in _registry.py#tool for the general rule.
         ctx["billing"].on_query(tenant_id, subject_id, question)
         result_dicts = [r.to_dict() for r in results]
         if include_canonical_ids:
@@ -186,6 +195,12 @@ def ontology_query(
             "total": len(results),
             "results": result_dicts,
         }
+        # #51: spaces 필터가 벡터 leg 에서 조용히 0건이 되는 과도기 상태를 응답에
+        # 드러낸다(호출자가 "결과 없음"과 "필터 적용 불가"를 구분할 수 있도록).
+        # outcome.warnings 는 query() 호출마다 새로 만들어지는 지역 반환값이라
+        # 동시 요청 간 공유 상태 경합이 없다(QueryOutcome 참조).
+        if outcome.warnings:
+            response["spaces_filter_warnings"] = list(outcome.warnings)
         if include_pack_provenance:
             response["selected_packs"] = selected_packs
             response["pack_filter"] = {
@@ -219,6 +234,10 @@ def ontology_query(
         },
     },
     order=7,
+    # #65: analyse() persists a row via ImpactEngine -> save_impact() (SQL
+    # INSERT into impact_records), so this "analysis" tool must be lock-covered
+    # like any other write despite its read-shaped name.
+    writes=True,
 )
 def ontology_impact(
     node_id: str,
@@ -270,6 +289,9 @@ def ontology_impact(
         },
     },
     order=8,
+    # #65: lever_simulate() persists a row via ImpactEngine -> save_simulation()
+    # (SQL INSERT into lever_simulations); same rationale as ontology_impact above.
+    writes=True,
 )
 def ontology_lever_simulate(
     lever_id: str,

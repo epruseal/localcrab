@@ -36,6 +36,7 @@ from ._registry import tool
         },
     },
     order=15,
+    writes=True,
 )
 def harness_promotion_apply(
     package: dict[str, Any],

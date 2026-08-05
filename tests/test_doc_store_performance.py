@@ -6,6 +6,7 @@ pytest-benchmark 없이 time 모듈로 직접 측정한다.
 
 from __future__ import annotations
 
+import statistics
 import time
 
 
@@ -58,19 +59,25 @@ def test_list_nodes_json_vs_sql_comparison(tmp_path):
         sql_store.upsert_node_doc("sp", "T", f"node_{i}", props)
         json_store.upsert_node_doc("sp", "T", f"node_{i}", props)
 
-    # 3회 측정 최솟값 — 공유 CI 러너의 스케줄러 노이즈로 단발 측정이 10배 비율
-    # 단언을 flake시키므로(관측: SQL 11ms vs JSON 1ms) 최솟값으로 강건화한다.
-    def _best_of_3(fn):
-        elapsed = float("inf")
+    # 9회 측정 중앙값 — 절대 시간이 1~10ms대라 공유 CI 러너의 스케줄러 노이즈
+    # 하나가 어느 한쪽에만 끼면 10배 비율 단언이 flake한다(#63 PR #100에서
+    # 재관측: SQL 11ms vs JSON 1ms — 이전에 3회 최솟값으로 강건화를 시도했던
+    # 바로 그 실패 시그니처가 그대로 재발했다. 최솟값은 극값 하나에 좌우되기
+    # 쉬우므로 표본을 늘리고 중앙값으로 바꿔 노이즈 내성을 높인다. 로컬
+    # 반복 측정(수십 회, main/이 브랜치 각각)에서 비율은 항상 1.6~2.8x
+    # 대역에 머물렀고 10x 근처에도 가지 않았다 — 즉 설계상 정말 10배 가까이
+    # 느려진 것이 아니라 CI 노이즈가 유발한 단발 이상치였다.
+    def _median_of(fn, n=9):
         result = None
-        for _ in range(3):
+        samples = []
+        for _ in range(n):
             start = time.perf_counter()
             result = fn()
-            elapsed = min(elapsed, time.perf_counter() - start)
-        return result, elapsed
+            samples.append(time.perf_counter() - start)
+        return result, statistics.median(samples)
 
-    sql_result, sql_elapsed = _best_of_3(lambda: sql_store.list_nodes(limit=50000))
-    json_result, json_elapsed = _best_of_3(lambda: json_store.list_nodes(limit=50000))
+    sql_result, sql_elapsed = _median_of(lambda: sql_store.list_nodes(limit=50000))
+    json_result, json_elapsed = _median_of(lambda: json_store.list_nodes(limit=50000))
 
     ratio = json_elapsed / sql_elapsed if sql_elapsed > 0 else float("inf")
     print(f"\nSQL: {sql_elapsed:.4f}s, JSON: {json_elapsed:.4f}s, ratio: {ratio:.2f}x (JSON/SQL)")

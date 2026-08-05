@@ -74,6 +74,62 @@ class TestPgGraphBatchHelpers:
             store.close()
             _drop_schema(pg_engine, schema)
 
+    def test_pack_filter_matches_node_passes_across_falsy_and_typed_pack_ids(self, pg_engine):
+        """PG counterpart of test_sql_graph_base.py's same-named test — issue
+        #62 follow-up. Confirms ``SqlDialect.json_truthy_text``'s PG branch
+        (``jsonb_typeof`` + numeric-cast zero check, not text comparison)
+        agrees with ``_node_passes`` on the same falsy/typed pack_id shapes,
+        via ``_batch_frontier_edges`` (PG's actual find_neighbors query
+        path, not just the SQLite base's). Manually verified live against
+        this same PG instance before this test existed; this pins that
+        verification instead of leaving it a one-off.
+        """
+        from opencrab.stores._graph_common import _node_passes
+
+        schema = f"t{uuid.uuid4().hex[:12]}_pf"
+        store = PGGraphStore(pg_engine, schema=schema)
+        try:
+            store.upsert_node("Hub", "hub", {})
+            variants: dict[str, dict] = {
+                "n_null": {"pack_id": None},
+                "n_missing": {},
+                "n_empty": {"pack_id": ""},
+                "n_zero": {"pack_id": 0},
+                "n_real_zero": {"pack_id": 0.0},  # trap: text "0.0" != "0"
+                "n_false": {"pack_id": False},
+                "n_own_pack": {"pack_id": "A"},
+                "n_foreign": {"pack_id": "B"},
+                "n_number": {"pack_id": 5},
+                "n_true": {"pack_id": True},
+                "n_string_zero": {"pack_id": "0"},  # trap: truthy, not falsy 0
+            }
+            for node_id, props in variants.items():
+                store.upsert_node("Item", node_id, props)
+                store.upsert_edge("Hub", "hub", "touches", "Item", node_id)
+
+            for pack_ids, include_unpackaged in [
+                (["A"], False),
+                (["A"], True),
+                (["5", "True"], False),
+                (["0"], False),
+            ]:
+                pack_set = set(pack_ids)
+                expected = {
+                    node_id
+                    for node_id, props in variants.items()
+                    if _node_passes({**props, "id": node_id}, pack_set, include_unpackaged)
+                }
+                with store._conn() as conn:
+                    rows = store._batch_frontier_edges(
+                        conn, ["hub"], cap=50, out=True,
+                        pack_set=pack_set, include_unpackaged=include_unpackaged,
+                    )
+                actual = {other_id for _t, other_id, _rel, _props in rows.get("hub", [])}
+                assert actual == expected, (pack_ids, include_unpackaged, actual, expected)
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
     def test_empty_frontier_short_circuits_without_a_query(self, pg_engine):
         schema = f"t{uuid.uuid4().hex[:12]}_ef"
         store = PGGraphStore(pg_engine, schema=schema)
