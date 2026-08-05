@@ -130,6 +130,19 @@ class TestEmitFailure:
         hooks.on_node_write("t1", "u1", "space", "User")
         hooks.on_query("t1", "u1", "some question")
 
+    def test_66_wired_wrappers_never_raise_and_report_ok_false(self):
+        """The three wrappers newly wired for #66 (unlike on_node_write/
+        on_query above) return emit()'s dict so callers CAN notice a
+        failure — this pins that they still never raise, and that ok=False
+        actually comes through instead of being swallowed by the wrapper."""
+        store = SQLStore("sqlite:///:memory:")
+        hooks = BillingHooks(store)
+        hooks._sql._engine = _BrokenEngine()
+
+        assert hooks.on_edge_write("t1", "u1", "owns")["ok"] is False
+        assert hooks.on_ingest("t1", "u1", "src1")["ok"] is False
+        assert hooks.on_harness_apply("t1", "u1", "pkg1", 3)["ok"] is False
+
 
 # ---------------------------------------------------------------------------
 # Edge cases
@@ -191,3 +204,44 @@ class TestEmitEdgeCases:
         events = hooks.list_events(tenant_id=tenant, limit=2)
 
         assert len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# #66: on_edge_write / on_ingest / on_harness_apply had zero callers
+# repo-wide (on_promotion had zero callers AND no tool to call it from —
+# promotion_promote was already deleted as dead MCP-tool code, see
+# tests/test_mcp.py::test_tools_list_not_empty). This pins the resolution:
+# on_promotion is gone, the other three are documented and wired at their
+# respective MCP handlers (graph.py/pack.py/harness.py).
+# ---------------------------------------------------------------------------
+
+
+class TestHookSurfaceMatchesDocs:
+    def test_on_promotion_hook_was_deleted_not_wired(self):
+        """No tool ever called it, and none exists to call it from — deleting
+        the hook (not wiring it) is the correct resolution, see hooks.py's
+        module docstring."""
+        assert not hasattr(BillingHooks, "on_promotion")
+
+    def test_documented_event_types_match_the_on_star_wrapper_methods(self):
+        """The module docstring's "Billable event types" list must stay in
+        sync with the actual on_* wrapper methods — this is exactly the kind
+        of drift that let 4 of 6 documented-but-unwired hooks go unnoticed."""
+        import inspect
+
+        import opencrab.billing.hooks as hooks_module
+
+        on_star_methods = {
+            name[len("on_"):]
+            for name, fn in vars(BillingHooks).items()
+            if name.startswith("on_") and inspect.isfunction(fn)
+        }
+        assert on_star_methods == {"node_write", "edge_write", "query", "ingest", "harness_apply"}
+
+        docstring = hooks_module.__doc__ or ""
+        table = docstring.split("Billable event types:")[1].split("Each event stores:")[0]
+        table_lines = [ln.strip() for ln in table.strip().splitlines()]
+        documented_types = {ln.split()[0] for ln in table_lines if ln}
+        assert documented_types == on_star_methods, (
+            f"docstring table {documented_types} != on_* methods {on_star_methods}"
+        )

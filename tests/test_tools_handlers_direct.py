@@ -458,6 +458,38 @@ class TestPackCreate:
         # anchor node + evidence node -> 2 add_node calls
         assert builder.add_node.call_count == 2
 
+    def test_normal_bills_one_ingest_event_using_source_id(self):
+        """#66: pack_create/pack_ingest never called billing.on_ingest — every
+        pack write went unbilled. One call to _ingest_into_pack -> one
+        on_ingest event, using the text's source_id when text is given."""
+        builder = MagicMock()
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(
+                title="Doc Pack", pack_id="doc-pack", text="some content",
+                tenant_id="acme", subject_id="u1",
+            )
+        billing.on_ingest.assert_called_once_with("acme", "u1", result["evidence_node"])
+
+    def test_normal_bills_ingest_using_pack_id_when_no_source_id(self):
+        """No text -> no source_id, so on_ingest must fall back to pack_id
+        (its signature requires a non-None string)."""
+        builder = MagicMock()
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            pack_create(title="Empty Pack", pack_id="empty-pack")
+        billing.on_ingest.assert_called_once_with("default", None, "empty-pack")
+
 
 # ---------------------------------------------------------------------------
 # pack_ingest — error branches not covered by test_mcp.py's text-path tests
@@ -504,6 +536,47 @@ class TestPackIngestErrors:
         assert result["status"] == "partial"
         assert result["added_nodes"] == 0
         assert result["node_errors"] == ["e1: graph: error: disk I/O"]
+
+    def test_normal_bills_ingest_event(self):
+        """#66: pack_ingest never called billing.on_ingest."""
+        builder = MagicMock()
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            pack_ingest(
+                "existing-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                tenant_id="acme", subject_id="u1",
+            )
+        billing.on_ingest.assert_called_once_with("acme", "u1", "existing-pack")
+
+    def test_normal_billing_persist_failure_is_logged_but_ingest_still_succeeds(self, caplog):
+        """#105: on_ingest's returned {"ok": ...} must actually be inspected,
+        not discarded — a failed persist is logged, and does not fail the
+        (already-succeeded) content write."""
+        import logging
+
+        builder = MagicMock()
+        billing = MagicMock()
+        billing.on_ingest.return_value = {"ok": False, "error": "database is locked"}
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            with caplog.at_level(logging.WARNING):
+                result = pack_ingest(
+                    "existing-pack",
+                    nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                )
+        assert result["status"] == "ok"
+        assert any("on_ingest" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +664,41 @@ class TestHarnessPromotionApply:
             "from_id": "ds1", "relation": "related_to", "to_id": "ds2",
             "receipt_id": "r2", "receipt_ts": "t2", "stores": {"sql": "ok"},
         }
+
+    def test_normal_bills_harness_apply_event(self):
+        """#66: on_harness_apply had zero callers repo-wide before this fix."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            harness_promotion_apply(_VALID_PACKAGE, dry_run=False, tenant_id="acme", subject_id="u1")
+        billing.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+
+    def test_normal_billing_persist_failure_is_logged_but_apply_still_succeeds(self, caplog):
+        """#105: on_harness_apply's returned {"ok": ...} must actually be
+        inspected, not discarded — a failed persist is logged, and does not
+        fail the (already-applied) promotion package."""
+        import logging
+
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        billing.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            with caplog.at_level(logging.WARNING):
+                result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert result["summary"]["errors"] == 0
+        assert any("on_harness_apply" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
+
+    def test_normal_dry_run_does_not_bill(self):
+        """dry_run never calls _get_context (asserted above), so billing must
+        stay untouched too — nothing was written."""
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            harness_promotion_apply(_VALID_PACKAGE, dry_run=True)
+        mock_ctx.assert_not_called()
 
     def test_error_apply_node_and_edge_write_failures_recorded(self):
         """Real (non-dry-run) write failures for both nodes and edges are

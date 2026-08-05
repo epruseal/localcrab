@@ -6,15 +6,21 @@ Every billable operation fires a BillingEvent that is persisted to
 Stripe/Paddle integration) can read these to generate invoices.
 
 Billable event types:
-  node_write     — add_node() called (successful write)
-  edge_write     — add_edge() called (successful write)
+  node_write     — ontology_add_node called (successful write)
+  edge_write     — ontology_add_edge called (successful write)
   query          — ontology_query or query_bm25 called
-  ingest         — ontology_ingest called
-  promotion      — promotion_promote called (candidate → promoted)
+  ingest         — pack_create / pack_ingest called
   harness_apply  — harness_promotion_apply called
 
 Each event stores: tenant_id, subject_id, event_type, count, metadata, ts.
 Aggregation queries can sum counts by (tenant_id, event_type, day) for billing.
+
+Issue #66: this module used to also document a ``promotion`` event fired by
+an ``on_promotion`` hook. That hook had zero callers repo-wide *and* no tool
+to call it from — the MCP tool it was meant for (``promotion_promote``) was
+already deleted as dead code (see ``opencrab/mcp/tools/__init__.py``'s
+module docstring; ``tests/test_mcp.py::test_tools_list_not_empty`` pins its
+absence). Deleted rather than wired — there was nothing to wire it to.
 """
 
 from __future__ import annotations
@@ -179,24 +185,39 @@ class BillingHooks:
     # ------------------------------------------------------------------
     # Convenience wrappers (called by tools.py)
     # ------------------------------------------------------------------
+    #
+    # NOTE (issue #66, see also #105): on_node_write/on_query pre-date this
+    # fix and discard emit()'s return value at both the wrapper and the call
+    # site — a lock-contention or storage failure there is silently invisible
+    # beyond a WARNING log. #105 owns fixing that pair (and emit()'s own
+    # durability: retries, sqlite timeout). The three wrappers below are
+    # newly wired by #66 and deliberately do NOT repeat that swallow: they
+    # return emit()'s {"ok": ...} dict so their call sites can notice (and
+    # log at the handler's own logger) a failed billing write instead of
+    # only relying on BillingHooks' internal warning.
 
     def on_node_write(self, tenant_id: str, subject_id: str | None, space: str, node_type: str) -> None:
         self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
 
-    def on_edge_write(self, tenant_id: str, subject_id: str | None, relation: str) -> None:
-        self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
+    def on_edge_write(
+        self, tenant_id: str, subject_id: str | None, relation: str
+    ) -> dict[str, Any]:
+        return self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
 
     def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> None:
         self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
 
-    def on_ingest(self, tenant_id: str, subject_id: str | None, source_id: str) -> None:
-        self.emit("ingest", tenant_id, subject_id, metadata={"source_id": source_id})
+    def on_ingest(
+        self, tenant_id: str, subject_id: str | None, source_id: str
+    ) -> dict[str, Any]:
+        return self.emit("ingest", tenant_id, subject_id, metadata={"source_id": source_id})
 
-    def on_promotion(self, tenant_id: str, subject_id: str | None, node_id: str) -> None:
-        self.emit("promotion", tenant_id, subject_id, metadata={"node_id": node_id})
-
-    def on_harness_apply(self, tenant_id: str, subject_id: str | None, package_id: str, node_count: int) -> None:
-        self.emit("harness_apply", tenant_id, subject_id, count=node_count, metadata={"package_id": package_id})
+    def on_harness_apply(
+        self, tenant_id: str, subject_id: str | None, package_id: str, node_count: int
+    ) -> dict[str, Any]:
+        return self.emit(
+            "harness_apply", tenant_id, subject_id, count=node_count, metadata={"package_id": package_id}
+        )
 
     # ------------------------------------------------------------------
     # Usage reporting

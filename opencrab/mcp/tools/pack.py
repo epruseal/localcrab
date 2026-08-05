@@ -68,8 +68,16 @@ def _ingest_into_pack(
     source_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM.
+
+    Bills exactly one ``ingest`` billing event per call (issue #66) — shared
+    by pack_create/pack_ingest so both go through a single instrumentation
+    point rather than each needing its own billing call. Uses ``source_id``
+    when text was ingested, else falls back to ``pack_id`` (on_ingest's
+    signature requires a non-None string).
 
     Parameters
     ----------
@@ -215,6 +223,15 @@ def _ingest_into_pack(
 
         text_ingested = True
 
+    billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
+    if not billing_result.get("ok"):
+        # #105: don't repeat the on_node_write/on_query pattern of discarding
+        # emit()'s result — surface a failed persist in this module's own
+        # log context too, without failing the (already-succeeded) ingest.
+        logger.warning(
+            "on_ingest billing event failed to persist (pack_id=%s): %s",
+            pack_id, billing_result.get("error"),
+        )
     ctx["hybrid"].invalidate_bm25_cache()
 
     # Partial failure = any node/edge write error, or any leftover "error:"/
@@ -472,6 +489,14 @@ def _rank_packs(
                     "default": True,
                     "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["title"],
         },
@@ -487,6 +512,8 @@ def pack_create(
     edges: list[dict[str, Any]] | None = None,
     text: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new localcrab ontology pack and ingest content into it.
@@ -495,6 +522,7 @@ def pack_create(
     pack_id is auto-slugged from title unless explicitly provided.
     Optional text is materialised as a 9-space evidence/TextUnit graph node
     (text_as_node=True, default) or embedded as a vector blob only (False).
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
     from opencrab.ontology.builder import store_write_failures
@@ -564,6 +592,8 @@ def pack_create(
         source_id=source_id,
         metadata={"title": _clean_str(title), "source": "pack_create"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
     result = {
@@ -646,6 +676,14 @@ def pack_create(
                     "type": "string",
                     "description": "Optional stable source identifier for the text document. Auto-generated from title+text hash if omitted.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["pack_id"],
         },
@@ -661,6 +699,8 @@ def pack_ingest(
     title: str | None = None,
     source_id: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add content into an EXISTING localcrab ontology pack.
@@ -670,6 +710,7 @@ def pack_ingest(
     (text_as_node=True, default) so it becomes a grammar-compliant first-class
     node. Set text_as_node=False for legacy vector-only embedding.
     Fails if the pack does not exist — use pack_create first.
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, content_pack_list
 
@@ -708,6 +749,8 @@ def pack_ingest(
         source_id=sid,
         metadata={"title": _clean_str(title or ""), "source": "pack_ingest"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
     return {"status": "ok", "pack_id": pack_id, **ingest_result}

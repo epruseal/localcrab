@@ -148,6 +148,14 @@ def ontology_add_node(
                 "to_space": {"type": "string", "description": "Target node space."},
                 "to_id": {"type": "string", "description": "Target node ID."},
                 "properties": {"type": "object", "description": "Optional edge properties."},
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
         },
@@ -162,6 +170,8 @@ def ontology_add_edge(
     to_space: str,
     to_id: str,
     properties: dict[str, Any] | None = None,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add a directed edge between two ontology nodes.
@@ -183,21 +193,38 @@ def ontology_add_edge(
         ID of the target node.
     properties:
         Optional edge properties.
+    tenant_id:
+        Tenant identifier for multi-tenant isolation (default: 'default').
+    subject_id:
+        Optional subject performing the write (for billing/audit — not
+        stamped into edge properties, unlike ontology_add_node).
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
 
     ctx = _get_context()
     from_id = _clean_str(from_id)
     to_id = _clean_str(to_id)
+    relation = _clean_str(relation)
     try:
         result = ctx["builder"].add_edge(
             from_space=_clean_str(from_space),
             from_id=from_id,
-            relation=_clean_str(relation),
+            relation=relation,
             to_space=_clean_str(to_space),
             to_id=to_id,
             properties=_clean_meta(properties or {}),
         )
+        billing_result = ctx["billing"].on_edge_write(tenant_id, subject_id, relation)
+        if not billing_result.get("ok"):
+            # #105: emit() is fire-and-forget by design and never raises, but
+            # a failed persist must not vanish with only BillingHooks' own
+            # internal log line — surface it here too so this handler's own
+            # log context (tenant/relation) is attached. Does not fail the
+            # write: the edge write already succeeded above.
+            logger.warning(
+                "on_edge_write billing event failed to persist (tenant=%s, relation=%s): %s",
+                tenant_id, relation, billing_result.get("error"),
+            )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:

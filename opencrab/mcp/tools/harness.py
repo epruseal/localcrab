@@ -6,9 +6,12 @@ function scope rather than at module level.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ._registry import tool
+
+logger = logging.getLogger(__name__)
 
 
 @tool(
@@ -31,6 +34,14 @@ from ._registry import tool
                     "description": "Validate without writing to stores.",
                     "default": False,
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the apply (for billing/audit).",
+                },
             },
             "required": ["package"],
         },
@@ -41,6 +52,8 @@ from ._registry import tool
 def harness_promotion_apply(
     package: dict[str, Any],
     dry_run: bool = False,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a CrabHarness PromotionPackage directly to the OpenCrab ontology stores.
@@ -56,6 +69,11 @@ def harness_promotion_apply(
         A serialised PromotionPackage object (from CrabHarness promotion-stub output).
     dry_run:
         If True, validate grammar + schema without writing to any store.
+    tenant_id:
+        Tenant identifier for multi-tenant isolation (default: 'default').
+    subject_id:
+        Optional subject performing the apply (for billing/audit). Ignored
+        when dry_run=True — nothing is written, so nothing is billed.
     """
     try:
         from crabharness.crabharness.models import PromotionPackage
@@ -141,6 +159,17 @@ def harness_promotion_apply(
                 "edge": f"{edge.from_id}-[{edge.relation}]->{edge.to_id}",
                 "error": str(exc),
             })
+
+    billing_result = ctx["billing"].on_harness_apply(
+        tenant_id, subject_id, promo.package_id, len(node_receipts)
+    )
+    if not billing_result.get("ok"):
+        # #105: don't discard emit()'s result — surface a failed persist
+        # here too, without failing the (already-applied) promotion package.
+        logger.warning(
+            "on_harness_apply billing event failed to persist (package_id=%s): %s",
+            promo.package_id, billing_result.get("error"),
+        )
 
     return {
         "package_id": promo.package_id,
