@@ -15,21 +15,25 @@
 레거시 ``HybridQuery.keyword_search()`` (다른 코드 경로, issue #86 소유)를 겨냥한
 것이라 이 갭을 덮지 못했다 — 이 파일이 그 갭을 채운다.
 
-PRE-BACKFILL GAP (codex 적대검증 2라운드): FTS leg 의 space 필터 메커니즘은
-정상이고, opencrab/mcp/tools/pack.py 의 legacy ingest(text_as_node=False)
-가 이제 ``meta.setdefault("space", "evidence")`` 로 신규 데이터를 태깅한다
-(apps/api/main.py 의 ingest_text 는 이미 호출자 metadata 를 그대로 흘려보내
-호출자가 지정한 space 도 그대로 존중된다). #51 의 벡터 leg 와 동일한 종류의
-갭만 남는다: 이 fix 이전에 적재된 행은 space 태그가 없어 backfill 전까지
-spaces 필터에서 제외된다. 아래
-``test_fts_leg_pre_backfill_legacy_row_excluded_until_backfill`` 이 그 구
-데이터 갭을 pin 하고,
-``test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it`` /
-``test_ingest_into_pack_legacy_path_respects_caller_supplied_space`` 가 실제
-프로덕션 함수(``_ingest_into_pack``)로 적재한 신규 데이터는 필터가 정상
-동작함을 증명한다. ``test_hybrid_query_warns_about_fts_space_gap`` 은
-HybridQuery.query 가 이 backfill 갭을 QueryOutcome.warnings 로 명시적으로
-경고함을 검증한다(조용한 0건이 아니라).
+PRE-BACKFILL GAP (검증 3라운드): FTS leg 의 space 필터 메커니즘은 정상이고,
+opencrab/mcp/tools/pack.py 의 legacy ingest(text_as_node=False)가 이제
+``meta.setdefault("space", "evidence")`` 로 신규 데이터를 태깅한다. 이 태깅은
+**pack.py 의 ingest 도구를 거치는 경로에 한정**된다 — apps/api/main.py 의
+REST ``/api/ingest`` 엔드포인트는 pack.py 를 전혀 거치지 않고
+``hybrid.ingest`` + ``docs.upsert_source`` 로 직행하며 space 기본값이 없다
+(3라운드 검증에서 확인됨; #66 도 이 표면을 배선하지 않았고 #110 의 backfill
+범위로 넘어감 — 이번 fix 범위 밖). 남는 갭은 두 가지: (1) #51 의 벡터 leg 와
+동일한 종류 — 이 fix 이전에 적재된 행은 space 태그가 없어 backfill 전까지
+spaces 필터에서 제외된다. (2) REST 경로로 적재된 행은 호출자가 명시적으로
+metadata["space"] 를 넣지 않는 한 이 fix 이후에도 계속 태그되지 않는다. 아래
+``test_fts_leg_pre_backfill_legacy_row_excluded_until_backfill`` 이 (1)을
+pin 하고, ``test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it``
+/ ``test_ingest_into_pack_legacy_path_respects_caller_supplied_space`` 가 실제
+프로덕션 함수(``_ingest_into_pack``, pack.py 경로)로 적재한 신규 데이터는
+필터가 정상 동작함을 증명한다. ``test_hybrid_query_warns_about_fts_space_gap``
+은 HybridQuery.query 의 경고가 이 두 갭을 정확한 범위로(REST 경로는 여전히
+태그 안 됨을 포함해) 명시적으로 알림을 검증한다(조용한 0건이나 과장된
+"전부 태그됨" 주장이 아니라).
 """
 from __future__ import annotations
 
@@ -381,6 +385,14 @@ def test_hybrid_query_warns_about_fts_space_gap(hybrid):
 
     assert "n-untagged" not in {r.node_id for r in outcome}
     assert any("FTS/keyword leg" in w for w in outcome.warnings), (
-        "spaces-filtered query must warn that the FTS leg cannot match "
-        "any real doc_sources data today, not fail silently"
+        "spaces-filtered query must warn that untagged doc_sources rows "
+        "are excluded, not fail silently"
+    )
+    # Round-3 verifier fix: the warning must NOT overclaim that everything
+    # ingested since this fix is tagged — only pack.py's ingest tools default
+    # a space; apps/api/main.py's REST endpoint does not, so the warning must
+    # name that carve-out explicitly rather than imply universal coverage.
+    assert any("pack.py" in w and "REST" in w for w in outcome.warnings), (
+        "warning must scope the 'tagged by default' claim to pack.py's "
+        "ingest tools, not REST /api/ingest"
     )

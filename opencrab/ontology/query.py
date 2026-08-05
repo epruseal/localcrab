@@ -460,27 +460,33 @@ class HybridQuery:
                 "doc_nodes.space, a real column builder.add_node has always "
                 "populated)."
             )
-            # #52 follow-up (codex hostile review, round 2): doc_sources (the
+            # #52 follow-up (verifier, round 3): doc_sources (the
             # FTS/keyword_search leg's table) has NO space column — space is
             # read from the JSON `metadata` blob (see
-            # LocalSQLDocStore.keyword_search). Writers DO exist and are
-            # tagged as of this fix: opencrab/mcp/tools/pack.py's legacy
-            # ingestion path (text_as_node=False) now defaults
-            # meta.setdefault("space", "evidence"), and apps/api/main.py's
-            # ingest_text endpoint already passes the caller's arbitrary
-            # metadata straight through to upsert_source, so a caller who
-            # sets "space" there is honored too. Same class of gap as #51's
-            # vectors, not worse: only ROWS WRITTEN BEFORE THIS FIX carry no
-            # 'space' key and are excluded from a spaces-filtered FTS query
-            # until backfilled; newly-ingested rows are tagged and match
-            # normally. Warn about that stale-row gap rather than let a
-            # caller mistake "0 results (untagged legacy row)" for "nothing
-            # matched the query".
+            # LocalSQLDocStore.keyword_search). Only ONE writer is fixed by
+            # this change: opencrab/mcp/tools/pack.py's legacy ingestion path
+            # (text_as_node=False) now defaults meta.setdefault("space",
+            # "evidence") before writing the SAME meta dict to both
+            # hybrid.ingest (vector leg) and mongo.upsert_source (this leg).
+            # apps/api/main.py's REST /api/ingest endpoint does NOT go
+            # through pack.py at all — it calls hybrid.ingest +
+            # docs.upsert_source directly with no space default (main.py
+            # :199-204, :507-521) — so a REST caller who doesn't set
+            # metadata["space"] themselves still produces an untagged row
+            # today. That surface is intentionally out of this fix's scope
+            # (#66 left it unwired too; tracked under #110's backfill
+            # instead). So the accurate claim is narrower than "everything
+            # ingested since this fix is tagged": only rows written via
+            # pack.py's ingest tools are tagged by default; rows written
+            # before this fix OR via the REST endpoint without an explicit
+            # space are still excluded until backfilled/fixed there.
             warnings.append(
-                "spaces filter: doc_sources rows written before this fix carry "
-                "no 'space' metadata and are excluded from the FTS/keyword leg "
-                "until a backfill runs (see issue #52); rows ingested since "
-                "this fix are tagged and match normally."
+                "spaces filter: doc_sources rows written before this fix, or "
+                "via apps/api/main.py's REST ingest endpoint without an "
+                "explicit 'space' in metadata, carry no 'space' tag and are "
+                "excluded from the FTS/keyword leg until a backfill runs (see "
+                "issue #52/#110); rows ingested through pack.py's ingest tools "
+                "are tagged by default and match normally."
             )
 
         # --- Stage 1: Vector similarity search ---
