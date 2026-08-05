@@ -285,6 +285,71 @@ def test_find_neighbors_anchor_fails_filter_returns_empty():
     assert store.find_neighbors("a", pack_ids=["other"]) == []
 
 
+def test_pack_filter_matches_node_passes_across_falsy_and_typed_pack_ids():
+    """Issue #62 follow-up: SQL's pushed-down pack predicate (_pack_where /
+    ``SqlDialect.json_truthy_text``) must admit exactly the same nodes
+    ``_node_passes`` does, for every JSON pack_id shape — not just
+    null/missing. A bare JSON extraction is non-NULL for ``""``/``0``/
+    ``false`` (Python-falsy, "no pack_id" per ``_node_pack_id``) and
+    SQLite's ``json_extract`` preserves a JSON number's native type (never
+    text-equal to a bound string ``pack_ids`` entry) — either gap would
+    make the SQL side wrongly exclude/admit rows relative to Python,
+    silently reproducing a narrower form of issue #62's LIMIT-before-filter
+    bug for these specific value shapes.
+
+    Contrastive by construction: for each (pack_ids, include_unpackaged)
+    config, the expected admit set is computed directly from
+    ``_node_passes`` (not hand-derived), so this catches either side
+    drifting from the other, not just today's specific bug.
+    """
+    from opencrab.stores._graph_common import _node_passes
+
+    # Exercises _fetch_edges_for_node directly (not the full find_neighbors
+    # BFS) so the anchor's own pack membership — a separate, already-covered
+    # concern (test_find_neighbors_anchor_fails_filter_returns_empty) — can't
+    # confound which (pack_ids, include_unpackaged) configs are exercisable
+    # below. Every edge here carries no properties of its own, so
+    # ``_edge_passes`` collapses to exactly the node-side check (its
+    # ``src_passes`` is always True by the BFS invariant ``_pack_where``
+    # documents, and ``dst_passes`` is the node check itself).
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    variants: dict[str, dict] = {
+        "n_null": {"pack_id": None},
+        "n_missing": {},
+        "n_empty": {"pack_id": ""},
+        "n_zero": {"pack_id": 0},
+        "n_real_zero": {"pack_id": 0.0},  # trap: text "0.0" != text "0", must still be falsy
+        "n_false": {"pack_id": False},
+        "n_own_pack": {"pack_id": "A"},
+        "n_foreign": {"pack_id": "B"},
+        "n_number": {"pack_id": 5},
+        "n_true": {"pack_id": True},
+        "n_string_zero": {"pack_id": "0"},  # trap: truthy string, must NOT be folded into falsy 0
+    }
+    for node_id, props in variants.items():
+        store.upsert_node("Item", node_id, props)
+        store.upsert_edge("Hub", "hub", "touches", "Item", node_id)
+
+    for pack_ids, include_unpackaged in [
+        (["A"], False),
+        (["A"], True),
+        (["5", "True"], False),
+        (["0"], False),  # n_string_zero must be admitted here, n_zero/n_real_zero must not
+    ]:
+        pack_set = set(pack_ids)
+        expected = {
+            node_id
+            for node_id, props in variants.items()
+            if _node_passes({**props, "id": node_id}, pack_set, include_unpackaged)
+        }
+        rows = store._fetch_edges_for_node(
+            "hub", cap=50, out=True, pack_set=pack_set, include_unpackaged=include_unpackaged
+        )
+        actual = {other_id for _other_type, other_id, _rel, _props in rows}
+        assert actual == expected, (pack_ids, include_unpackaged, actual, expected)
+
+
 def test_find_neighbors_hub_fanout_respects_limit():
     store = _store()
     store.upsert_node("Hub", "hub", {})
