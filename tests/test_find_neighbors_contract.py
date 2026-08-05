@@ -297,3 +297,39 @@ class TestFindNeighborsEdge:
 
         rows = store.find_neighbors("a", pack_ids=["A"])
         assert rows == []
+
+    def test_pack_filter_survives_hub_fanout_beyond_limit(self, backend):
+        """Issue #62: the pack filter must apply BEFORE limit, not after.
+
+        ``_seed_hub``'s fanout=5 is too small to expose this — it never
+        exceeds ``limit`` (default 50), so a LIMIT-before-filter bug and a
+        filter-before-LIMIT fix return identical results either way. Here
+        fan-out (105) is far larger than ``limit`` (10), and the 5 in-pack
+        edges are upserted LAST, after 100 foreign-pack edges, so they land
+        past the limit boundary in insertion/scan order. A backend that
+        applies ``LIMIT 10`` before the pack filter sees only foreign-pack
+        rows and returns nothing; one that filters first finds all 5.
+
+        Local/PG were fixed (pack filter pushed into the SQL WHERE clause,
+        see ``_sql_graph_base.py``'s ``_pack_where``). Kuzu was deliberately
+        left unfixed — its ``props``/``properties`` columns are opaque
+        serialized-JSON STRING blobs, not per-field columns, so there is no
+        safe way to push this into Cypher WHERE without a schema change
+        (see the note in ``kuzu_graph_store.py``'s ``_find_neighbors_1hop``)
+        — so this pins its still-broken behavior rather than papering over
+        it with an xfail.
+        """
+        name, store = backend
+        store.upsert_node("Hub", "h", {"pack_id": "A"})
+        for i in range(100):
+            store.upsert_node("Other", f"o{i}", {"pack_id": "OTHER"})
+            store.upsert_edge("Hub", "h", "touches", "Other", f"o{i}", {})
+        for i in range(5):
+            store.upsert_node("Target", f"p{i}", {"pack_id": "A"})
+            store.upsert_edge("Hub", "h", "touches", "Target", f"p{i}", {})
+
+        rows = store.find_neighbors("h", direction="out", depth=1, limit=10, pack_ids=["A"])
+        if name == "kuzu":
+            assert _ids(rows) == set()
+        else:
+            assert _ids(rows) == {f"p{i}" for i in range(5)}

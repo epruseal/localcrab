@@ -331,27 +331,63 @@ class _SqlGraphStoreBase(abc.ABC):
         return _merge_space(_as_dict(row[0]), row[1]) if row else None
 
     def _fetch_edges_for_node(
-        self, node_id: str, cap: int, out: bool
+        self,
+        node_id: str,
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> list[tuple[str, str, str, Any]]:
         """Default per-node candidate-edge fetch (one query, LIMIT cap).
         Column order is always (other_type, other_id, relation, properties)
         regardless of direction, so callers never branch on direction to
-        read a row."""
-        table = self._table("graph_edges")
-        if out:
-            sql = f"SELECT to_type, to_id, relation, properties FROM {table} WHERE from_id=:nid LIMIT :cap"
-        else:
-            sql = f"SELECT from_type, from_id, relation, properties FROM {table} WHERE to_id=:nid LIMIT :cap"
-        return self._fetch_all(sql, {"nid": node_id, "cap": cap})
+        read a row.
+
+        When ``pack_set`` is given, the pack filter (``_pack_where``) is
+        pushed into this query's WHERE clause — joined against
+        ``graph_nodes`` for the "other" endpoint — so ``LIMIT :cap`` applies
+        AFTER filtering, not before (issue #62)."""
+        edges = self._table("graph_edges")
+        anchor_col = "from_id" if out else "to_id"
+        other_type_col = "to_type" if out else "from_type"
+        other_id_col = "to_id" if out else "from_id"
+
+        if pack_set is None:
+            sql = (
+                f"SELECT {other_type_col}, {other_id_col}, relation, properties"
+                f" FROM {edges} WHERE {anchor_col}=:nid LIMIT :cap"
+            )
+            return self._fetch_all(sql, {"nid": node_id, "cap": cap})
+
+        nodes = self._table("graph_nodes")
+        pack_where, pack_params = self._pack_where(
+            "n.properties", "e.properties", pack_set, include_unpackaged, "fe"
+        )
+        sql = (
+            f"SELECT e.{other_type_col}, e.{other_id_col}, e.relation, e.properties"
+            f" FROM {edges} e"
+            f" JOIN {nodes} n ON n.node_type=e.{other_type_col} AND n.node_id=e.{other_id_col}"
+            f" WHERE e.{anchor_col}=:nid AND {pack_where}"
+            f" LIMIT :cap"
+        )
+        return self._fetch_all(sql, {"nid": node_id, "cap": cap, **pack_params})
 
     def _prefetch_frontier(
-        self, frontier_ids: list[str], cap: int, out: bool
+        self,
+        frontier_ids: list[str],
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """HOOK — default per-row prefetch (one query per frontier node,
         reproducing LocalGraphStore's historical behavior). PgGraphStore's
         adopter overrides this with a single unnest+LATERAL batch query (see
         module docstring)."""
-        return {fid: self._fetch_edges_for_node(fid, cap, out) for fid in frontier_ids}
+        return {
+            fid: self._fetch_edges_for_node(fid, cap, out, pack_set, include_unpackaged)
+            for fid in frontier_ids
+        }
 
     def _batch_node_props(
         self, pairs: set[tuple[str, str]]
@@ -445,9 +481,15 @@ class _SqlGraphStoreBase(abc.ABC):
             in_batch: dict[str, list] = {}
             if expandable:
                 if direction in ("out", "both"):
-                    out_batch = self._prefetch_frontier(expandable, limit, out=True)
+                    out_batch = self._prefetch_frontier(
+                        expandable, limit, out=True,
+                        pack_set=pack_set, include_unpackaged=include_unpackaged,
+                    )
                 if direction in ("in", "both"):
-                    in_batch = self._prefetch_frontier(expandable, limit, out=False)
+                    in_batch = self._prefetch_frontier(
+                        expandable, limit, out=False,
+                        pack_set=pack_set, include_unpackaged=include_unpackaged,
+                    )
 
             candidate_pairs: set[tuple[str, str]] = set()
             for rows in out_batch.values():
@@ -578,6 +620,41 @@ class _SqlGraphStoreBase(abc.ABC):
         SQLAlchemy's ``bindparam(expanding=True)`` on the PG side)."""
         names = [f"{prefix}{i}" for i in range(len(values))]
         return ", ".join(f":{n}" for n in names), dict(zip(names, values, strict=True))
+
+    def _pack_where(
+        self,
+        node_col: str,
+        edge_col: str,
+        pack_set: set[str],
+        include_unpackaged: bool,
+        prefix: str,
+    ) -> tuple[str, dict[str, str]]:
+        """SINGLE SOURCE for translating the shared pack-filter policy
+        (``opencrab/stores/_graph_common.py``'s ``_node_passes``/
+        ``_edge_passes``) into SQL, so it can be pushed into a WHERE clause
+        ahead of ``LIMIT`` instead of applied in Python after truncation
+        (issue #62: a hub whose first ``limit`` edges are all out-of-pack
+        could starve every in-pack neighbour before the Python filter ever
+        saw them). Both ``_fetch_edges_for_node`` (below) and
+        ``PGGraphStore._batch_frontier_edges`` call this one method, so a
+        future change to the policy cannot silently diverge between them.
+
+        Only valid for a candidate edge whose "current" endpoint has ALREADY
+        passed ``_node_passes`` (true for every caller in this file's BFS —
+        the anchor is checked once up front, and any other node only ever
+        reaches ``_prefetch_frontier`` after passing that same check in
+        ``_expand``). Under that invariant, ``_edge_passes``' ``src_passes``
+        is always True, which is what lets this reduce to two independent
+        clauses instead of a full min/max reproduction of ``_edge_passes``.
+        """
+        placeholders, params = self._in_placeholders(sorted(pack_set), prefix)
+        node_pid = self._dialect.json_get(node_col, "pack_id")
+        edge_pid = self._dialect.json_get(edge_col, "pack_id")
+        node_cond = f"{node_pid} IN ({placeholders})"
+        if include_unpackaged:
+            node_cond = f"({node_cond} OR {node_pid} IS NULL)"
+        edge_cond = f"({edge_pid} IS NULL OR {edge_pid} IN ({placeholders}))"
+        return f"{node_cond} AND {edge_cond}", params
 
     def find_by_relations(
         self,
