@@ -14,6 +14,7 @@ rationale.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -270,11 +271,16 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
-    When pack_id is given, queries the graph store's export_nodes(pack_id=...)
-    (all four backends implement it — see opencrab/stores/_graph_protocol.py)
-    which uses an indexed/native pack_id filter — avoids the limit-before-
-    filter bug that would occur if we fetched N rows then Python-filtered.
-    When pack_id is absent, falls back to the doc store's list_nodes.
+    When pack_id is given, queries the graph store's export_nodes(pack_id=...,
+    space=...) (all four backends implement export_nodes — see
+    opencrab/stores/_graph_protocol.py) which uses an indexed/native pack_id
+    filter — avoids the limit-before-filter bug that would occur if we
+    fetched N rows then Python-filtered. The SQL-backed stores
+    (_sql_graph_base.py, used by local/pg mode) also push ``space`` into the
+    same WHERE clause ahead of LIMIT, so it shares that guarantee (issue
+    #54); backends that don't accept the ``space`` kwarg yet fall back to
+    the Python post-filter below, same as before. When pack_id is absent,
+    falls back to the doc store's list_nodes.
     """
     from opencrab.mcp.tools import _clean_str, _get_context
 
@@ -285,8 +291,13 @@ def ontology_list_nodes(
     nodes: list[dict[str, Any]] = []
 
     if pack_id:
-        # Graph store: indexed/native pack_id filter → correct count before limit
-        raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit)
+        # Graph store: indexed/native pack_id (+ space, when supported)
+        # filter → correct count before limit.
+        graph_store = ctx["neo4j"]
+        if "space" in inspect.signature(graph_store.export_nodes).parameters:
+            raw = graph_store.export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
+        else:
+            raw = graph_store.export_nodes(pack_id=pack_id, limit=limit)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
         # normalise to same shape as doc store list_nodes
         for item in raw:

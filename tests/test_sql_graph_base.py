@@ -436,6 +436,29 @@ def test_export_nodes_and_edges_with_pack_filter():
     assert len(p2_edges) == 1  # target node b carries pack_id=p2
 
 
+def test_export_nodes_pack_id_and_space_pushdown_beyond_limit_boundary():
+    """issue #54: pack_id + space together must not undercount when the
+    matching (target-space) rows sort AFTER the limit boundary.
+
+    Seeds one pack with 20 "noise"-space nodes inserted first, then 5
+    "concept"-space nodes inserted last. With limit=10 and the old
+    limit-before-filter behaviour, export_nodes(pack_id=..., limit=10) would
+    fetch only the first 10 rows (all "noise") and a Python space post-filter
+    would find zero matches -- undercounting 5 real matches down to 0. The
+    fix pushes space into the WHERE clause ahead of LIMIT, so all 5 matches
+    are returned regardless of scan order.
+    """
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"a{i:02d}", {"pack_id": "p1"}, space_id="noise")
+    for i in range(5):
+        store.upsert_node("Item", f"z{i:02d}", {"pack_id": "p1"}, space_id="concept")
+
+    rows = store.export_nodes(pack_id="p1", space="concept", limit=10)
+    assert len(rows) == 5
+    assert all(r["props"]["space"] == "concept" for r in rows)
+
+
 def test_upsert_nodes_batch_and_edges_batch():
     store = _store()
     n = store.upsert_nodes_batch([

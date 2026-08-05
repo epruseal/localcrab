@@ -776,26 +776,32 @@ class _SqlGraphStoreBase(abc.ABC):
         self,
         pack_id: str | None = None,
         limit: int = 500_000,
+        space: str | None = None,
     ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the WHERE clause ahead of
+        LIMIT (issue #54: same "store truncates, caller Python-filters"
+        pattern as #62's pack-filter pushdown for ``find_neighbors``). Unlike
+        pack_id, space lives in its own ``space_id`` column, so this is a
+        plain equality clause -- no JSON extraction needed."""
         self._require_available()
         table = self._table("graph_nodes")
         # space_id is selected so _merge_space can restore it into props: this
         # backend keeps space in its own column, but the protocol's export shape
         # carries it inside props (see _merge_space for the measured fallout).
+        where_parts: list[str] = []
+        params: dict[str, Any] = {"lim": limit}
         if pack_id:
             pid = self._dialect.json_get("properties", "pack_id")
             src = self._dialect.json_get("properties", "source")
             src_id = self._dialect.json_get("properties", "source_id")
-            sql = (
-                f"SELECT node_type, space_id, properties FROM {table}"
-                f" WHERE {pid} = :pid OR {src} = :pid OR {src_id} = :pid LIMIT :lim"
-            )
-            rows = self._fetch_all(sql, {"pid": pack_id, "lim": limit})
-        else:
-            rows = self._fetch_all(
-                f"SELECT node_type, space_id, properties FROM {table} LIMIT :lim",
-                {"lim": limit},
-            )
+            where_parts.append(f"({pid} = :pid OR {src} = :pid OR {src_id} = :pid)")
+            params["pid"] = pack_id
+        if space:
+            where_parts.append("space_id = :space")
+            params["space"] = space
+        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        sql = f"SELECT node_type, space_id, properties FROM {table}{where_sql} LIMIT :lim"
+        rows = self._fetch_all(sql, params)
         return [
             {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
             for node_type, space_id, properties in rows
