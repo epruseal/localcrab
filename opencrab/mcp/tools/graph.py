@@ -271,13 +271,21 @@ def ontology_list_nodes(
     """List nodes filtered by space and/or pack_id.
 
     When pack_id is given, queries the graph store's export_nodes(pack_id=...,
-    space=..., limit=...). All three concrete backends (SQL-backed
-    local/pg, Kuzu, Neo4j) push ``space`` into their native query ahead of
-    ``limit`` — see each backend's export_nodes and the shared contract
-    in opencrab/stores/_graph_protocol.py — so the count is correct before
-    truncation instead of being Python-filtered after (issue #54; same
-    class of bug #62 fixed for find_neighbors' pack filter). When pack_id
-    is absent, falls back to the doc store's list_nodes.
+    space=..., limit=...) for the displayed page, and count_exported_nodes
+    (same predicate, no LIMIT) for ``total``. All three concrete backends
+    (SQL-backed local/pg, Kuzu, Neo4j) push ``space`` into their native
+    query ahead of ``limit`` — see each backend's export_nodes and the
+    shared contract in opencrab/stores/_graph_protocol.py — so the returned
+    rows are correct before truncation instead of being Python-filtered
+    after (issue #54; same class of bug #62 fixed for find_neighbors' pack
+    filter). ``total`` is deliberately NOT ``len(nodes)``: that would still
+    be capped at ``limit`` even with the pushdown fix, which is the actual
+    bug #54 reported (a caller cannot tell "5 of 5 matches" from "5 of 3000
+    matches, truncated" from the row count alone) — count_exported_nodes
+    runs the identical filter with no LIMIT so ``total`` is the true match
+    count. When pack_id is absent, falls back to the doc store's
+    list_nodes (unchanged, pre-existing "total = len(page)" behavior for
+    that path -- not part of #54's pack_id+space scope).
     """
     from opencrab.mcp.tools import _clean_str, _get_context
 
@@ -286,12 +294,17 @@ def ontology_list_nodes(
     cleaned_space = _clean_str(space) if space else None
 
     nodes: list[dict[str, Any]] = []
+    total = 0
 
     if pack_id:
-        # Graph store: indexed/native pack_id + space filter → correct count
+        graph_store = ctx["neo4j"]
+        # True match count, independent of `limit` (issue #54's core
+        # requirement -- see this function's docstring).
+        total = graph_store.count_exported_nodes(pack_id=pack_id, space=cleaned_space)
+        # Graph store: indexed/native pack_id + space filter → correct rows
         # before limit (all three backends implement the same contract, see
         # _graph_protocol.py#export_nodes).
-        raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
+        raw = graph_store.export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
         # normalise to same shape as doc store list_nodes. The space check
         # below is now redundant with the backend's own filter (kept as
@@ -314,10 +327,11 @@ def ontology_list_nodes(
     else:
         # Doc store fallback (no pack_id filter requested)
         nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
+        total = len(nodes)
 
     return {
         "nodes": nodes,
-        "total": len(nodes),
+        "total": total,
         "space_filter": space,
         "pack_id_filter": pack_id,
     }

@@ -606,6 +606,36 @@ class KuzuGraphStore:
             results.append({"props": props, "labels": [ntype]})
         return results
 
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Exact match count for the same predicate ``export_nodes`` filters
+        on, unbounded by any LIMIT (issue #54: ``total`` must reflect the
+        true match count, not get truncated by a caller's display
+        ``limit``).
+
+        When ``pack_id`` is None, this is a real Cypher ``count(n)`` pushdown
+        on ``space`` alone -- cheap, no row materialization. When
+        ``pack_id`` IS given, an exact server-side count is not possible:
+        ``pack_id`` lives inside the JSON-serialized ``props`` blob (same
+        limitation ``export_nodes`` has), so this falls back to an unbounded
+        ``export_nodes`` scan + Python filter and counts the result. That
+        keeps the count exact at the cost of an O(n) scan specific to this
+        backend's pack_id+space combination -- a pre-existing characteristic
+        of Kuzu's pack_id filter (already true of ``export_nodes`` itself),
+        not a new regression. Tracked separately as a scalability follow-up,
+        not fixed here.
+        """
+        self._require_available()
+        if pack_id is not None:
+            return len(self.export_nodes(pack_id=pack_id, space=space, limit=500_000))
+        where_clause = "WHERE n.space_id = $space " if space is not None else ""
+        params = {"space": space} if space is not None else {}
+        r = self._conn.execute(
+            f"MATCH (n:OntologyNode) {where_clause}RETURN count(n)", params
+        )
+        return int(r.get_next()[0])
+
     def export_edges(
         self,
         pack_id: str | None = None,

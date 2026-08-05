@@ -339,6 +339,33 @@ class GraphStoreExtended(Protocol):
             {"props": dict, "labels": [str]}
         (the shape ``_normalise_node()`` in opencrab/pack/neo4j_export.py
         consumes).
+
+        A caller that needs an accurate MATCH COUNT (e.g. to report
+        ``total`` alongside a limited page of rows) must NOT use
+        ``len(export_nodes(..., limit=N))`` -- that is still capped by
+        ``limit`` even with the space/pack_id pushdown above. Use
+        ``count_exported_nodes`` instead, which applies the identical
+        predicate with no LIMIT.
+        """
+        ...
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Exact count of nodes matching the same ``pack_id``/``space``
+        predicate ``export_nodes`` filters on, with no LIMIT applied
+        (issue #54: a caller reporting ``total`` must not have it capped by
+        whatever display ``limit`` it also passes to ``export_nodes`` --
+        ``len(export_nodes(..., limit=N))`` silently truncates at ``N`` even
+        after the space/pack_id pushdown fix).
+
+        Every implementation runs a real ``COUNT(*)``/``count(n)`` query
+        except ``KuzuGraphStore``'s ``pack_id`` case: ``pack_id`` lives
+        inside a JSON-serialized ``props`` blob Cypher cannot index into (the
+        same limitation ``export_nodes`` has there), so when ``pack_id`` is
+        given, KuzuGraphStore falls back to an unbounded ``export_nodes``
+        scan + Python filter to keep the count exact -- see
+        ``KuzuGraphStore.count_exported_nodes`` for the tracked follow-up.
         """
         ...
 

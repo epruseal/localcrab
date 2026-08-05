@@ -393,8 +393,9 @@ class TestToolDispatch:
             # pack_id 있을 때는 graph.export_nodes(pack_id=..., space=...) 경로 사용
             # (limit-before-filter 버그 회피용 인덱스 쿼리, issue #54: space 도
             # 서버 쪽에서 함께 걸린다 -- 아래 assert_called_once_with 의 space=None
-            # 이 그 계약을 검증한다)
+            # 이 그 계약을 검증한다). total 은 별도로 count_exported_nodes 에서 온다.
             graph = MagicMock()
+            graph.count_exported_nodes.return_value = 2
             graph.export_nodes.return_value = [
                 {"props": {"node_id": "n1", "pack_id": "pack-a", "space": "evidence"}, "labels": ["TextUnit"]},
                 {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
@@ -409,19 +410,21 @@ class TestToolDispatch:
             assert result["total"] == 2
             assert result["pack_id_filter"] == "pack-a"
             graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100, space=None)
+            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space=None)
             mongo.list_nodes.assert_not_called()  # doc store는 pack_id 있을 때 사용 안 함
 
     def test_ontology_list_nodes_pack_and_space_filter_pushes_space_kwarg(self):
         """issue #54 contract: when both pack_id and space are given,
-        ontology_list_nodes MUST forward space= to export_nodes so the
-        backend can push it into its native query ahead of limit — a
-        regression that silently drops the kwarg (e.g. reverting to a
-        Python-only post-filter) is caught here via assert_called_once_with,
-        not just by the return value."""
+        ontology_list_nodes MUST forward space= to export_nodes (and to
+        count_exported_nodes) so the backend can push it into its native
+        query ahead of limit — a regression that silently drops the kwarg
+        (e.g. reverting to a Python-only post-filter) is caught here via
+        assert_called_once_with, not just by the return value."""
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             graph = MagicMock()
+            graph.count_exported_nodes.return_value = 1
             # Mock stands in for a backend that already pushed the space
             # filter server-side -- only matching rows come back.
             graph.export_nodes.return_value = [
@@ -439,6 +442,37 @@ class TestToolDispatch:
             assert result["total"] == 1
             assert result["nodes"][0]["space"] == "concept"
             graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=10, space="concept")
+            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space="concept")
+
+    def test_ontology_list_nodes_total_not_capped_by_limit(self):
+        """issue #54's actual complaint: `total` must report the TRUE match
+        count even when it is larger than `limit` (i.e. more rows match than
+        the page returned). Before this fix, total was len(nodes) -- capped
+        at whatever page export_nodes(limit=...) returned, so this exact
+        case (3000 real matches, only 10 returned) silently reported
+        total=10 instead of 3000."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            # count_exported_nodes (no LIMIT) sees the true total; export_nodes
+            # (LIMIT 10) returns only a page of it -- the two are intentionally
+            # different sizes here to prove `total` is NOT derived from `nodes`.
+            graph.count_exported_nodes.return_value = 3000
+            graph.export_nodes.return_value = [
+                {"props": {"node_id": f"n{i}", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]}
+                for i in range(10)
+            ]
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": MagicMock(), "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool(
+                "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
+            )
+            assert result["total"] == 3000
+            assert len(result["nodes"]) == 10
 
     def test_ontology_list_edges_local_backend(self):
         """ontology_list_edges uses export_edges on Local/Kuzu backends."""

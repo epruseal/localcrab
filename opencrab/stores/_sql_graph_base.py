@@ -772,24 +772,16 @@ class _SqlGraphStoreBase(abc.ABC):
         props["node_type"] = row[0]
         return props
 
-    def export_nodes(
-        self,
-        pack_id: str | None = None,
-        limit: int = 500_000,
-        space: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """``space``, when given, is pushed into the WHERE clause ahead of
-        LIMIT (issue #54: same "store truncates, caller Python-filters"
-        pattern as #62's pack-filter pushdown for ``find_neighbors``). Unlike
-        pack_id, space lives in its own ``space_id`` column, so this is a
-        plain equality clause -- no JSON extraction needed."""
-        self._require_available()
-        table = self._table("graph_nodes")
-        # space_id is selected so _merge_space can restore it into props: this
-        # backend keeps space in its own column, but the protocol's export shape
-        # carries it inside props (see _merge_space for the measured fallout).
+    def _export_nodes_where(
+        self, pack_id: str | None, space: str | None
+    ) -> tuple[str, dict[str, Any]]:
+        """Shared pack_id/space WHERE-clause builder for ``export_nodes`` and
+        ``count_exported_nodes`` -- keeping the predicate in one place
+        guarantees the COUNT variant can never silently drift from what
+        ``export_nodes`` actually filters on (issue #54: that agreement is
+        the whole point of ``count_exported_nodes`` existing)."""
         where_parts: list[str] = []
-        params: dict[str, Any] = {"lim": limit}
+        params: dict[str, Any] = {}
         if pack_id:
             pid = self._dialect.json_get("properties", "pack_id")
             src = self._dialect.json_get("properties", "source")
@@ -800,12 +792,47 @@ class _SqlGraphStoreBase(abc.ABC):
             where_parts.append("space_id = :space")
             params["space"] = space
         where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return where_sql, params
+
+    def export_nodes(
+        self,
+        pack_id: str | None = None,
+        limit: int = 500_000,
+        space: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the WHERE clause ahead of
+        LIMIT (issue #54: same "store truncates, caller Python-filters"
+        pattern as #62's pack-filter pushdown for ``find_neighbors``). Unlike
+        pack_id, space lives in its own ``space_id`` column, so this is a
+        plain equality clause -- no JSON extraction needed. For an accurate
+        match count that isn't capped by ``limit``, use
+        ``count_exported_nodes`` instead of ``len(export_nodes(...))``."""
+        self._require_available()
+        table = self._table("graph_nodes")
+        # space_id is selected so _merge_space can restore it into props: this
+        # backend keeps space in its own column, but the protocol's export shape
+        # carries it inside props (see _merge_space for the measured fallout).
+        where_sql, params = self._export_nodes_where(pack_id, space)
+        params = {**params, "lim": limit}
         sql = f"SELECT node_type, space_id, properties FROM {table}{where_sql} LIMIT :lim"
         rows = self._fetch_all(sql, params)
         return [
             {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
             for node_type, space_id, properties in rows
         ]
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Real ``COUNT(*)`` with the exact same predicate ``export_nodes``
+        filters on (via the shared ``_export_nodes_where``), unbounded by any
+        LIMIT -- issue #54: ``total`` must reflect the true match count, not
+        get truncated by a caller's display ``limit``."""
+        self._require_available()
+        table = self._table("graph_nodes")
+        where_sql, params = self._export_nodes_where(pack_id, space)
+        row = self._fetch_one(f"SELECT COUNT(*) FROM {table}{where_sql}", params)  # noqa: S608
+        return int(row[0]) if row else 0
 
     def export_edges(
         self,

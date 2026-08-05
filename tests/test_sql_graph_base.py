@@ -459,6 +459,25 @@ def test_export_nodes_pack_id_and_space_pushdown_beyond_limit_boundary():
     assert all(r["props"]["space"] == "concept" for r in rows)
 
 
+def test_count_exported_nodes_not_capped_by_limit():
+    """issue #54's actual complaint: `total` must reflect the true match
+    count even when it EXCEEDS the caller's display `limit` -- not just
+    "not undercounted below the real total while <= limit" (the previous
+    test above). Seeds 30 matching nodes, asks export_nodes for only a
+    limit=5 page, and asserts count_exported_nodes (no LIMIT) reports the
+    full 30 -- something len(export_nodes(..., limit=5)) can never do
+    since it is capped at 5 by construction."""
+    store = _store()
+    for i in range(30):
+        store.upsert_node("Item", f"n{i:02d}", {"pack_id": "p1"}, space_id="concept")
+
+    page = store.export_nodes(pack_id="p1", space="concept", limit=5)
+    assert len(page) == 5  # display page still capped, as intended
+
+    total = store.count_exported_nodes(pack_id="p1", space="concept")
+    assert total == 30  # but the true count is not
+
+
 def test_upsert_nodes_batch_and_edges_batch():
     store = _store()
     n = store.upsert_nodes_batch([

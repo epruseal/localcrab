@@ -299,6 +299,33 @@ def test_export_nodes_space_filter_pushed_ahead_of_limit(store) -> None:
     assert all(r["props"]["space"] == "concept" for r in rows)
 
 
+def test_count_exported_nodes_space_only_not_capped_by_limit(store) -> None:
+    """issue #54: count_exported_nodes(space=...) is a real Cypher count(n)
+    pushdown, so it must report the true match count even when it exceeds
+    export_nodes' own display limit."""
+    for i in range(30):
+        store.upsert_node("X", f"n{i:02d}", {}, space_id="concept")
+
+    page = store.export_nodes(space="concept", limit=5)
+    assert len(page) == 5
+
+    assert store.count_exported_nodes(space="concept") == 30
+
+
+def test_count_exported_nodes_with_pack_id_falls_back_to_exact_scan(store) -> None:
+    """pack_id can't be pushed into Cypher here (JSON blob props), so
+    count_exported_nodes(pack_id=..., space=...) falls back to an unbounded
+    export_nodes scan + Python filter. This must still be EXACT -- not
+    capped by any limit -- even though it costs an O(n) scan instead of a
+    cheap COUNT (pre-existing Kuzu pack_id characteristic, not a new bug)."""
+    for i in range(30):
+        store.upsert_node("X", f"a{i:02d}", {"pack_id": "target"}, space_id="concept")
+    for i in range(10):
+        store.upsert_node("X", f"b{i:02d}", {"pack_id": "other"}, space_id="concept")
+
+    assert store.count_exported_nodes(pack_id="target", space="concept") == 30
+
+
 def test_export_edges(store) -> None:
     store.upsert_node("A", "a", {})
     store.upsert_node("B", "b", {})

@@ -223,13 +223,18 @@ class TestOntologyListNodesLocalBackend:
             "nodes": [], "total": 0, "space_filter": None, "pack_id_filter": None,
         }
 
-    def test_limit_boundary_caps_result_count(self, graph, docs):
+    def test_limit_boundary_caps_rows_but_not_total(self, graph, docs):
+        """issue #54: `limit` caps the returned `nodes` page, but `total`
+        must still report the true match count (5), not the page size (2).
+        Before the fix, `total` was len(nodes) and this asserted total == 2
+        -- exactly the bug the issue reported."""
         for i in range(5):
             graph.upsert_node("Lever", f"lev-{i}", {"pack_id": "pack-a"})
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = {"neo4j": graph, "mongo": docs}
             result = ontology_list_nodes(pack_id="pack-a", limit=2)
-        assert result["total"] == 2
+        assert len(result["nodes"]) == 2
+        assert result["total"] == 5
 
 
 # ---------------------------------------------------------------------------

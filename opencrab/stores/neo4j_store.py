@@ -542,6 +542,26 @@ class Neo4jStore:
                 for record in result
             ]
 
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Real ``count(n)`` with the exact same predicate ``export_nodes``
+        filters on, unbounded by any LIMIT -- issue #54: ``total`` must
+        reflect the true match count, not get truncated by a caller's
+        display ``limit``."""
+        self._require_available()
+        cypher = """
+            MATCH (n)
+            WHERE ($pack_id IS NULL
+               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id)
+              AND ($space IS NULL OR n.space = $space)
+            RETURN count(n) AS total
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_id=pack_id, space=space)
+            record = result.single()
+            return int(record["total"]) if record else 0
+
     def export_edges(
         self, pack_id: str | None = None, limit: int = 1_000_000
     ) -> list[dict[str, Any]]:
