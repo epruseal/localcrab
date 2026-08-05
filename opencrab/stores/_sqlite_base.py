@@ -35,9 +35,11 @@ INTER-COPY DIFFERENCE: sqlite_vec_store.py's ``_new_conn()`` additionally
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,26 @@ class _SqliteConnMixin:
             conn = self._new_conn()
             self._local.conn = conn
         return conn
+
+    @contextlib.contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """쓰기 트랜잭션 경계. 쓰기 락을 쥔 채 커넥션을 내주고, with 블록이 예외 없이
+        끝나면 commit, 예외가 나면 rollback 후 재던진다.
+
+        WHY: 파이썬 sqlite3는 DML 앞에 암묵적으로 BEGIN을 걸어, 커밋 전 예외가 나면
+        트랜잭션이 열린 채로 스레드 커넥션에 남는다(SQLAlchemy engine.begin()과 달리
+        자동 롤백이 없다). 그 상태로 놔두면 같은 스레드의 다음 무관한 쓰기가 호출하는
+        commit()에 앞서 실패한 배치의 부분 실행분까지 묻어 들어간다. 배치 쓰기 헬퍼는
+        모두 이 컨텍스트 매니저를 거쳐야 그 틈이 막힌다.
+        """
+        with self._lock:
+            conn = self._conn
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def close(self) -> None:
         with self._conns_lock:

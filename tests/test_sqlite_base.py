@@ -115,6 +115,57 @@ class TestError:
 # ---------------------------------------------------------------------------
 
 
+class TestTx:
+    """``_tx()`` — commit-on-success / rollback-on-exception transaction boundary.
+
+    Regression for the issue where ``_exec_write_many``/``_exec_write_batch``
+    committed after the loop with no except/rollback: a mid-batch exception
+    left partially-executed statements sitting uncommitted in the thread's
+    connection, and the NEXT unrelated successful write's commit() would
+    silently persist them too.
+    """
+
+    def _make_table(self, store: _FakeStore) -> None:
+        store._conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, val TEXT NOT NULL)")
+        store._conn.commit()
+
+    def test_commits_on_success(self, tmp_path):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        self._make_table(store)
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t VALUES ('a', '1')")
+        rows = store._conn.execute("SELECT id FROM t").fetchall()
+        assert [r[0] for r in rows] == ["a"]
+
+    def test_rolls_back_partial_batch_on_exception(self, tmp_path):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        self._make_table(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t VALUES ('a', '1')")
+                conn.execute("INSERT INTO t VALUES ('b', '2')")
+                # NOT NULL violation — third statement of the batch fails.
+                conn.execute("INSERT INTO t (id, val) VALUES ('c', NULL)")
+        # pre-exception state: none of the batch's rows (not even 'a'/'b') persisted.
+        rows = store._conn.execute("SELECT id FROM t").fetchall()
+        assert rows == []
+
+    def test_later_successful_write_does_not_smuggle_in_failed_batch(self, tmp_path):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        self._make_table(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t VALUES ('a', '1')")
+                conn.execute("INSERT INTO t (id, val) VALUES ('b', NULL)")
+        # A later, unrelated write on the SAME thread connection succeeds.
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t VALUES ('z', '9')")
+        # Only the later write's row is present — the failed batch's 'a' did
+        # not get smuggled in on the back of this commit.
+        rows = sorted(r[0] for r in store._conn.execute("SELECT id FROM t").fetchall())
+        assert rows == ["z"]
+
+
 class TestEdge:
     def test_double_close_idempotent(self, tmp_path):
         store = _FakeStore(str(tmp_path / "a.db"))

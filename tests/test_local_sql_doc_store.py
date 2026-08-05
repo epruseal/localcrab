@@ -6,6 +6,7 @@ Fixture: tmp_path creates a fresh DB file per test; no shared state.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -211,6 +212,67 @@ class TestSource:
 
     def test_list_sources_empty_returns_empty(self, store):
         assert store.list_sources() == []
+
+
+class _FTSFailProxy:
+    """sqlite3.Connection is an immutable C type (can't monkeypatch its
+    execute directly), so this thin proxy stands in for the thread-local
+    connection to force the FTS5 INSERT to fail while delegating everything
+    else to the real connection — including commit()/rollback(), so the
+    real connection's transaction state is what gets asserted on."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def execute(self, sql, params=None):
+        if "INSERT INTO doc_sources_fts" in sql:
+            raise sqlite3.OperationalError("forced FTS insert failure")
+        return self._real.execute(sql) if params is None else self._real.execute(sql, params)
+
+    def executemany(self, sql, params_list):
+        return self._real.executemany(sql, params_list)
+
+    def commit(self):
+        return self._real.commit()
+
+    def rollback(self):
+        return self._real.rollback()
+
+
+class TestUpsertSourceTransaction:
+    """Issue #79: upsert_source used to write doc_sources via
+    super().upsert_source() (its own commit), then sync doc_sources_fts in a
+    SEPARATE commit. A failure in the FTS step left doc_sources committed but
+    doc_sources_fts not — permanently inconsistent, and no rollback could fix
+    it because the doc_sources commit had already happened. Now both writes
+    share one _exec_write_many transaction."""
+
+    def test_fts_failure_rolls_back_doc_sources_too(self, store):
+        store.upsert_source("keep", "baseline, unrelated", {})
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # doc_sources rolled back together with the FTS failure, not left as
+        # an orphaned commit inconsistent with the (also-absent) FTS row.
+        assert store.get_source("src1") is None
+        assert store.get_source("keep") is not None
+
+    def test_later_write_does_not_smuggle_in_failed_upsert(self, store):
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # unrelated, independent successful write on the same thread connection
+        store.upsert_source("src2", "second", {})
+        assert store.get_source("src1") is None
+        assert store.get_source("src2") is not None
 
 
 # ---------------------------------------------------------------------------
