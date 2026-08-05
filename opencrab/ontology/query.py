@@ -456,7 +456,34 @@ class HybridQuery:
             warnings.append(
                 "spaces filter: vectors ingested before this fix carry no 'space' "
                 "metadata and are excluded from the vector search leg until a "
-                "backfill runs (see issue #51); BM25/FTS legs are unaffected."
+                "backfill runs (see issue #51); BM25 leg is unaffected (reads "
+                "doc_nodes.space, a real column builder.add_node has always "
+                "populated)."
+            )
+            # #52 follow-up (codex hostile review): doc_sources (the FTS/
+            # keyword_search leg's table) has NO space column — space is read
+            # from the JSON `metadata` blob (see LocalSQLDocStore.keyword_search).
+            # Unlike vectors, NO current production writer of doc_sources
+            # populates a "space" key there: opencrab/mcp/tools/pack.py's
+            # legacy ingestion path (text_as_node=False, the only path that
+            # calls upsert_source at all) has no `space` in scope to write —
+            # its function signature carries no space parameter at all. The
+            # grammar-compliant text_as_node=True path never touches
+            # doc_sources in the first place (it embeds via builder.add_node
+            # instead, explicitly skipping upsert_source to avoid duplicate
+            # writes). So today a spaces-filtered FTS query strictly and
+            # correctly excludes every doc_sources row (none carry a space),
+            # not a subset — this is NOT a backfill-then-fixed situation like
+            # #51's vectors; it needs a real caller-side change (an API
+            # surface question outside this fix's file ownership: pack.py is
+            # owned elsewhere) before any doc_sources content can ever match
+            # a spaces filter. Warn loudly rather than let "0 results" look
+            # like "nothing matched the query".
+            warnings.append(
+                "spaces filter: the FTS/keyword leg (doc_sources) has no writer "
+                "that tags 'space' in metadata today, so it returns zero results "
+                "whenever spaces is set — this is a known gap (issue #52 "
+                "follow-up), not a partial/backfillable one like the vector leg."
             )
 
         # --- Stage 1: Vector similarity search ---
@@ -827,14 +854,20 @@ class HybridQuery:
 
         for anchor_id in anchor_ids[:max_anchors]:
             try:
-                # Only forward pack/space kwargs when active so older graph
-                # store stubs (without the new signature) keep working.
-                extra: dict[str, Any] = {}
+                # pack_ids/include_unpackaged stay conditional (pre-existing
+                # pattern, out of #52's scope — see #54 for why conditional
+                # kwarg-forwarding on an unsupported *active* filter is a
+                # smell, not a feature: it lets a filter silently vanish
+                # instead of failing loud). spaces is forwarded
+                # unconditionally: every find_neighbors implementation in
+                # this tree now has the parameter (see _sql_graph_base.py /
+                # kuzu_graph_store.py / neo4j_store.py), so there is no
+                # "older stub" left to protect — a stub that still lacks it
+                # is a test double that should be fixed, not accommodated.
+                extra: dict[str, Any] = {"spaces": spaces}
                 if pack_ids:
                     extra["pack_ids"] = pack_ids
                     extra["include_unpackaged"] = include_unpackaged
-                if spaces:
-                    extra["spaces"] = spaces
                 neighbours = self._neo4j.find_neighbors(
                     node_id=anchor_id,
                     direction="both",

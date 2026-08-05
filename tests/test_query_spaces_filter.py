@@ -14,6 +14,18 @@
 으로만 호출하고, ``tests/test_query_keyword_local.py`` 의 space 필터 테스트는
 레거시 ``HybridQuery.keyword_search()`` (다른 코드 경로, issue #86 소유)를 겨냥한
 것이라 이 갭을 덮지 못했다 — 이 파일이 그 갭을 채운다.
+
+KNOWN GAP (codex 적대검증, 최초 수정 이후 발견): FTS leg 의 space 필터는
+메커니즘상 정상이지만 실제 프로덕션 데이터에는 무용하다 — doc_sources 를 쓰는
+유일한 경로(opencrab/mcp/tools/pack.py 의 legacy ingest, text_as_node=False)
+가 space 를 쓸 방법 자체가 없기 때문(함수 시그니처에 space 파라미터가 없음).
+#51 의 벡터 leg 와 달리 "구 데이터만 비어있고 신규는 채워짐" 이 아니라 신규
+데이터도 영구히 비어있다 — pack.py API 변경(이 fix 의 소유 범위 밖) 없이는
+고칠 수 없다. 아래
+``test_fts_leg_gap_real_ingestion_shape_has_no_space_tag`` /
+``test_hybrid_query_warns_about_fts_space_gap`` 가 이 갭을 실제 ingest 경로와
+동일한 메타데이터 형태로 pin 하고, HybridQuery.query 가 이를 QueryOutcome.warnings
+로 명시적으로 경고함을 검증한다(조용한 0건이 아니라).
 """
 from __future__ import annotations
 
@@ -238,3 +250,72 @@ def test_hybrid_query_spaces_filter_end_to_end(hybrid):
     for r in outcome:
         space = (r.metadata or {}).get("space")
         assert space in (None, "A"), f"result {r.node_id!r} has foreign space {space!r}"
+
+
+# ---------------------------------------------------------------------------
+# KNOWN GAP (codex hostile review on #52's first pass) — the FTS leg's
+# space filter is correct-but-useless against real production data, and
+# that severity was originally mis-reported as a "non-blocking caveat".
+#
+# doc_sources (the table keyword_search reads) has no `space` column; the
+# filter reads it from the JSON `metadata` blob. The ONLY production writer
+# of doc_sources is opencrab/mcp/tools/pack.py's legacy ingest path
+# (`text_as_node=False`) — and that function's signature has no `space`
+# parameter anywhere in scope to write one. (The grammar-compliant
+# `text_as_node=True` path never touches doc_sources at all — it embeds via
+# builder.add_node and explicitly skips upsert_source "to avoid duplicate
+# writes".) So unlike #51's vectors (an old-data backfill gap — new writes
+# ARE tagged), doc_sources content is *structurally* untaggable today: NO
+# row, old or new, ever gets a `space` key without a caller-side API change
+# to pack.py — which is owned elsewhere and out of this fix's file
+# ownership (opencrab/ontology/query.py's _fts_search/_graph_expand,
+# opencrab/stores/*).
+#
+# These two tests pin that reality using the exact realistic metadata shape
+# pack.py's legacy path produces (pack_id only, no space key) — a
+# spaces-filtered FTS query strictly and correctly excludes it (matching
+# the BM25/vector legs' strict semantics), and HybridQuery.query surfaces
+# that as an explicit warning rather than a silent "nothing matched".
+# ---------------------------------------------------------------------------
+
+
+def test_fts_leg_gap_real_ingestion_shape_has_no_space_tag(doc_store):
+    if not doc_store.supports_keyword:
+        pytest.skip("FTS5 unavailable in this SQLite build")
+
+    # Mirrors opencrab/mcp/tools/pack.py's `_ingest_into_pack` legacy path
+    # verbatim: `meta = _clean_meta(metadata or {}); meta["pack_id"] = pack_id`
+    # — no `space` key, because that function has no space parameter at all.
+    doc_store.upsert_source(
+        "src-untagged", "JASO M345 apple oil standard classification",
+        {"pack_id": "oil-standards-auto-moto", "node_id": "n-untagged"},
+    )
+
+    unfiltered = doc_store.keyword_search("JASO M345", limit=10)
+    assert unfiltered, "unfiltered search must still find real, untagged production data"
+
+    filtered = doc_store.keyword_search("JASO M345", spaces=["A"], limit=10)
+    assert filtered == [], (
+        "documents the known gap: untagged doc_sources rows are strictly "
+        "excluded by any spaces filter today — there is no production path "
+        "that would make this pass with real data (see comment block above)"
+    )
+
+
+def test_hybrid_query_warns_about_fts_space_gap(hybrid):
+    hq, doc, _graph = hybrid
+    if not doc.supports_keyword:
+        pytest.skip("FTS5 unavailable in this SQLite build")
+
+    doc.upsert_source(
+        "src-untagged", "JASO M345 apple oil standard classification",
+        {"pack_id": "oil-standards-auto-moto", "node_id": "n-untagged"},
+    )
+
+    outcome = hq.query("JASO M345 apple oil standard classification", spaces=["A"], limit=10)
+
+    assert "n-untagged" not in {r.node_id for r in outcome}
+    assert any("FTS/keyword leg" in w for w in outcome.warnings), (
+        "spaces-filtered query must warn that the FTS leg cannot match "
+        "any real doc_sources data today, not fail silently"
+    )
