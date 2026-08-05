@@ -427,6 +427,17 @@ class _SqlGraphStoreBase(abc.ABC):
             if not other_props:
                 continue
             if pack_set is not None:
+                # Provably redundant for SCALAR pack_id values only: SQL
+                # already applied this same policy (via _pack_where /
+                # json_truthy_text) before LIMIT ran, so for a string/
+                # number/boolean/null pack_id this can never reject a row
+                # that reached here. It stays real, load-bearing defense
+                # for a non-scalar pack_id (a JSON object/array) — SQL's
+                # json_truthy_text falls through to a raw JSON-serialized
+                # ELSE for those (undefined relative to Python, see its
+                # docstring), so a composite pack_id can slip past the SQL
+                # filter and only get caught here. Do not delete this
+                # thinking it is dead code.
                 other_pass = _node_passes(other_props, pack_set, include_unpackaged)
                 if not other_pass:
                     continue

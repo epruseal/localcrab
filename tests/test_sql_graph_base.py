@@ -319,11 +319,13 @@ def test_pack_filter_matches_node_passes_across_falsy_and_typed_pack_ids():
         "n_missing": {},
         "n_empty": {"pack_id": ""},
         "n_zero": {"pack_id": 0},
+        "n_real_zero": {"pack_id": 0.0},  # trap: text "0.0" != text "0", must still be falsy
         "n_false": {"pack_id": False},
         "n_own_pack": {"pack_id": "A"},
         "n_foreign": {"pack_id": "B"},
         "n_number": {"pack_id": 5},
         "n_true": {"pack_id": True},
+        "n_string_zero": {"pack_id": "0"},  # trap: truthy string, must NOT be folded into falsy 0
     }
     for node_id, props in variants.items():
         store.upsert_node("Item", node_id, props)
@@ -333,6 +335,7 @@ def test_pack_filter_matches_node_passes_across_falsy_and_typed_pack_ids():
         (["A"], False),
         (["A"], True),
         (["5", "True"], False),
+        (["0"], False),  # n_string_zero must be admitted here, n_zero/n_real_zero must not
     ]:
         pack_set = set(pack_ids)
         expected = {
