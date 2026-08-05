@@ -205,9 +205,13 @@ class TestDiagnosticIdentifiesTheFailingRow:
         (validate_node, _node, "node-1", "label"),
         (validate_edge, _edge, "edge-1", "source_id"),
         (validate_chunk, _chunk, "chunk-1", "document_id"),
-        # id 와 빠진 필드 이름이 **같은** 경우. 아래 정규식이 위치를 고정하지 않으면
-        # 두 단언이 서로의 조각으로 충족돼 한쪽이 사라져도 통과한다(적대 검증 지적).
+        # id 와 빠진 필드 이름이 **같은** 경우. 순서를 고정하지 않으면 두 단언이 서로의
+        # 조각으로 충족돼 한쪽이 사라져도 통과한다(적대 검증 지적).
         (validate_node, _node, "label", "label"),
+        # id 에 **정규식 메타문자**와 **따옴표**가 든 경우. 이게 없으면 아래 `re.escape` 를
+        # 지워도 전부 통과한다 — 즉 escape 의 필요성이 검증되지 않는다(적대 검증 실증).
+        (validate_node, _node, r"row[1].*+?", "label"),
+        (validate_node, _node, "it's \"quoted\"", "label"),
     ])
     def test_message_carries_the_row_id(self, validator, builder, rid, missing):
         row = builder()
@@ -215,11 +219,16 @@ class TestDiagnosticIdentifiesTheFailingRow:
         del row[missing]
         with pytest.raises(PackSchemaError) as ei:
             validator(row)
-        # **위치를 고정한다.** `x in msg` 두 개로 나누면 rid == missing 일 때 각 단언이
-        # 상대방 조각으로 충족된다 — 한쪽을 지워도 통과하는 구멍이 생긴다.
-        # "필수 필드 <빠진필드> 가 없다: <행id>" 순서를 통째로 요구한다.
-        want = rf"필수 필드 {re.escape(repr(missing))} 가 없다: {re.escape(repr(rid))}"
-        assert re.search(want, str(ei.value)), \
+        # **순서만 고정하고 문구에는 결합하지 않는다.**
+        #
+        # `x in msg` 두 개로 나누면 rid == missing 일 때 각 단언이 상대방 조각으로 충족돼
+        # 한쪽을 지워도 통과한다. 그래서 순서를 요구한다.
+        #
+        # 반대로 `필수 필드 … 가 없다: …` 처럼 **문구를 통째로** 요구하면 조사 하나만 바꿔도
+        # (`가` -> `이`) 깨진다 — 그건 계약이 아니라 잡음이다(적대 검증 지적). 사이에 무엇이
+        # 오든 상관하지 않고 **(빠진 필드, 행 id) 순서**만 본다.
+        want = rf"{re.escape(repr(missing))}.*?{re.escape(repr(rid))}"
+        assert re.search(want, str(ei.value), re.S), \
             f"진단이 (빠진 필드, 실패 행 id) 를 그 순서로 담아야 한다: {ei.value}"
 
 
