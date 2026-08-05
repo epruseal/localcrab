@@ -204,14 +204,18 @@ def test_51_query_sets_transitional_warning_when_spaces_filter_used() -> None:
     match failure (not "ignored"), so a spaces filter silently zeroes the
     vector leg for pre-fix data until a backfill runs. Callers must be able to
     tell "no results" apart from "filter could not be applied".
+
+    The warning travels in QueryOutcome.warnings (query()'s return value), not
+    instance state — HybridQuery is a process-lifetime singleton served from a
+    threadpool, so instance state would race across concurrent requests.
     """
     chroma = MagicMock()
     chroma.available = True
     chroma.query = MagicMock(return_value=[])
     hybrid = HybridQuery(chroma, MagicMock(available=False))
-    hybrid.query("q", spaces=["claim"], use_rerank=False, use_bm25=False, use_fts=False)
-    assert hybrid._last_warnings
-    assert "space" in hybrid._last_warnings[0]
+    outcome = hybrid.query("q", spaces=["claim"], use_rerank=False, use_bm25=False, use_fts=False)
+    assert outcome.warnings
+    assert "space" in outcome.warnings[0]
 
 
 def test_51_query_no_warning_when_spaces_not_used() -> None:
@@ -220,8 +224,23 @@ def test_51_query_no_warning_when_spaces_not_used() -> None:
     chroma.available = True
     chroma.query = MagicMock(return_value=[])
     hybrid = HybridQuery(chroma, MagicMock(available=False))
-    hybrid.query("q", spaces=None, use_rerank=False, use_bm25=False, use_fts=False)
-    assert hybrid._last_warnings == []
+    outcome = hybrid.query("q", spaces=None, use_rerank=False, use_bm25=False, use_fts=False)
+    assert outcome.warnings == []
+
+
+def test_51_query_outcome_still_iterates_len_and_indexes_like_a_list() -> None:
+    """QueryOutcome must stay a drop-in replacement for the old list[QueryResult]
+    return value so unrelated call sites (cli.py, existing tests) don't break."""
+    hit = {"id": "v1", "document": "a", "metadata": {"node_id": "n1"}, "distance": 0.1}
+    chroma = MagicMock()
+    chroma.available = True
+    chroma.query = MagicMock(return_value=[hit])
+    hybrid = HybridQuery(chroma, MagicMock(available=False))
+    outcome = hybrid.query("q", use_rerank=False, use_bm25=False, use_fts=False)
+    assert len(outcome) == 1
+    assert [r.node_id for r in outcome] == ["n1"]
+    assert outcome[0].node_id == "n1"
+    assert bool(outcome) is True
 
 
 def test_51_builder_writes_space_into_vector_metadata() -> None:

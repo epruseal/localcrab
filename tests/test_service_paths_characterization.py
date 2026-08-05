@@ -30,7 +30,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from opencrab.ontology.query import QueryResult
+from opencrab.ontology.query import QueryOutcome, QueryResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -154,9 +154,13 @@ def _make_query_result(node_id: str = "n1", pack_id: str | None = "pack-a") -> Q
 
 
 def _mock_query_ctx(results):
-    """ontology_query envelope 분기 박제용: hybrid만 MagicMock, 나머지는 stub."""
+    """ontology_query envelope 분기 박제용: hybrid만 MagicMock, 나머지는 stub.
+
+    #51: HybridQuery.query()는 QueryOutcome(results, warnings)을 반환한다
+    (더 이상 bare list가 아님) — 실제 계약과 맞춰 mock한다.
+    """
     hybrid = MagicMock()
-    hybrid.query.return_value = results
+    hybrid.query.return_value = QueryOutcome(results=results, warnings=[])
     billing = MagicMock()
     billing.on_query = MagicMock()
     return {

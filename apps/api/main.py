@@ -565,7 +565,7 @@ def query_ontology(
         raise_on_error=False,
     )
 
-    results = ctx.hybrid.query(
+    outcome = ctx.hybrid.query(
         question=payload.question,
         spaces=payload.spaces,
         limit=payload.limit,
@@ -573,6 +573,7 @@ def query_ontology(
         pack_ids=selection.effective_pack_ids,
         include_unpackaged=payload.include_unpackaged,
     )
+    results = outcome.results
 
     keyword_fallback: list[dict[str, Any]] = []
     if not results:
@@ -599,6 +600,11 @@ def query_ontology(
         "selected_packs": selection.selected_packs,
         "pack_filter": pack_filter,
     }
+    # #51: spaces 필터의 과도기 경고를 MCP(response["spaces_filter_warnings"])와
+    # 동일하게 노출한다. outcome.warnings 는 query() 반환값(지역 변수)이라
+    # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
+    if outcome.warnings:
+        response["spaces_filter_warnings"] = list(outcome.warnings)
     _log_event(
         ctx.docs,
         "query",

@@ -83,6 +83,37 @@ class QueryResult:
         }
 
 
+@dataclass
+class QueryOutcome:
+    """Return value of :meth:`HybridQuery.query`.
+
+    #51: warnings must travel in the return value, not instance state —
+    ``HybridQuery`` is a process-lifetime singleton (see ``_get_context()``)
+    served from a threadpool (sync MCP/HTTP handlers), so an instance
+    attribute like the old ``self._last_warnings`` is shared and clobbered
+    across concurrent requests (same defect class as ``PackSelection``
+    in pack_selection.py was built to avoid — a local list returned per call).
+
+    Delegates ``__iter__``/``__len__``/``__getitem__`` to ``results`` so
+    existing call sites that treat the return value as ``list[QueryResult]``
+    (``for r in results``, ``len(results)``, ``results[0]``) keep working
+    unchanged; only code that wants the transitional warnings needs to know
+    about this type.
+    """
+
+    results: list[QueryResult]
+    warnings: list[str] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(self, idx):
+        return self.results[idx]
+
+
 @dataclass(frozen=True)
 class _QueryProfile:
     """Adaptive retrieval settings for the current question."""
@@ -298,9 +329,6 @@ class HybridQuery:
         # Optional stores attached at runtime by _get_context() in tools.py
         self._doc_store: Any = None
         self._rebac: Any = None
-        # #51 과도기 경고: 마지막 query() 호출에서 발생한 캐치-업 불가 상황을 담는다.
-        # MCP/CLI 가 query() 호출 뒤 읽어 응답에 노출한다(호출 시그니처는 유지).
-        self._last_warnings: list[str] = []
         # BM25 index cache — rebuilt off the query hot path by a background
         # worker thread (debounced). Queries serve the (possibly slightly
         # stale) cached index immediately; a write or an out-of-band
@@ -371,7 +399,7 @@ class HybridQuery:
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
         use_fts: bool = True,
-    ) -> list[QueryResult]:
+    ) -> QueryOutcome:
         """
         Execute a hybrid query: vector + BM25 + graph expansion, then rerank.
 
@@ -395,7 +423,10 @@ class HybridQuery:
 
         Returns
         -------
-        list[QueryResult] sorted by descending score.
+        QueryOutcome — ``.results`` (list[QueryResult], descending score) plus
+        ``.warnings`` (list[str]). Acts like the old bare list[QueryResult] for
+        iteration/len/indexing (see QueryOutcome docstring), so existing callers
+        that only care about results are unaffected.
         """
         result_lists: list[list[dict[str, Any]]] = []
         profile = _profile_for_query(question, limit, graph_depth)
@@ -404,10 +435,12 @@ class HybridQuery:
         # 아님 — Chroma missing-key 시맨틱의 의도적 복제, sqlite_vec_store.py 참조).
         # builder.py 는 이 픽스 이후 신규 벡터에만 space 를 기록하므로, 백필 전까지는
         # 기존 벡터가 space 필터에서 조용히 빠진다. "0건"과 "필터 미적용"을 호출자가
-        # 구분할 수 있도록 매 호출마다 경고 상태를 갱신한다(BM25/FTS 레그는 영향 없음).
-        self._last_warnings = []
+        # 구분할 수 있도록 지역 변수에 담아 반환값(QueryOutcome)으로 전달한다 — 인스턴스
+        # 상태(self.*)는 프로세스 수명 싱글턴 + 스레드풀 실행 환경에서 요청 간 경합이
+        # 생기므로 쓰지 않는다(BM25/FTS 레그는 영향 없음).
+        warnings: list[str] = []
         if spaces:
-            self._last_warnings.append(
+            warnings.append(
                 "spaces filter: vectors ingested before this fix carry no 'space' "
                 "metadata and are excluded from the vector search leg until a "
                 "backfill runs (see issue #51); BM25/FTS legs are unaffected."
@@ -491,7 +524,7 @@ class HybridQuery:
                 metadata=metadata,
                 graph_context=item.get("graph_context"),
             ))
-        return results
+        return QueryOutcome(results=results, warnings=warnings)
 
     def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
         """Cheap ``(count, max_updated_at)`` probe for stale-cache detection.
