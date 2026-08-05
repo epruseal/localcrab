@@ -298,6 +298,9 @@ class HybridQuery:
         # Optional stores attached at runtime by _get_context() in tools.py
         self._doc_store: Any = None
         self._rebac: Any = None
+        # #51 과도기 경고: 마지막 query() 호출에서 발생한 캐치-업 불가 상황을 담는다.
+        # MCP/CLI 가 query() 호출 뒤 읽어 응답에 노출한다(호출 시그니처는 유지).
+        self._last_warnings: list[str] = []
         # BM25 index cache — rebuilt off the query hot path by a background
         # worker thread (debounced). Queries serve the (possibly slightly
         # stale) cached index immediately; a write or an out-of-band
@@ -396,6 +399,19 @@ class HybridQuery:
         """
         result_lists: list[list[dict[str, Any]]] = []
         profile = _profile_for_query(question, limit, graph_depth)
+
+        # #51: 벡터 store 는 "space" 키가 없는 메타데이터를 매치 실패로 처리한다(무시가
+        # 아님 — Chroma missing-key 시맨틱의 의도적 복제, sqlite_vec_store.py 참조).
+        # builder.py 는 이 픽스 이후 신규 벡터에만 space 를 기록하므로, 백필 전까지는
+        # 기존 벡터가 space 필터에서 조용히 빠진다. "0건"과 "필터 미적용"을 호출자가
+        # 구분할 수 있도록 매 호출마다 경고 상태를 갱신한다(BM25/FTS 레그는 영향 없음).
+        self._last_warnings = []
+        if spaces:
+            self._last_warnings.append(
+                "spaces filter: vectors ingested before this fix carry no 'space' "
+                "metadata and are excluded from the vector search leg until a "
+                "backfill runs (see issue #51); BM25/FTS legs are unaffected."
+            )
 
         # --- Stage 1: Vector similarity search ---
         vector_hits = self._vector_search(

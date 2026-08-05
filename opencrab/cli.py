@@ -520,6 +520,9 @@ def query(
         pack_ids=effective_pack_ids,
         include_unpackaged=include_unpackaged,
     )
+    # #51: spaces 필터의 과도기 경고(백필 전 기존 벡터 제외)를 pack 경고와 동일하게 echo.
+    for warning in hybrid._last_warnings:  # noqa: SLF001 — tools.py 와 동일한 기존 관행
+        click.echo(f"warning: {warning}", err=True)
 
     # --- Legacy list JSON output (must remain unchanged in shape) ---
     if json_output and not json_envelope:

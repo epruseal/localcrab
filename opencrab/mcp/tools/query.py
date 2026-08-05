@@ -186,6 +186,11 @@ def ontology_query(
             "total": len(results),
             "results": result_dicts,
         }
+        # #51: spaces 필터가 벡터 leg 에서 조용히 0건이 되는 과도기 상태를 응답에
+        # 드러낸다(호출자가 "결과 없음"과 "필터 적용 불가"를 구분할 수 있도록).
+        space_warnings = list(getattr(ctx["hybrid"], "_last_warnings", []))
+        if space_warnings:
+            response["spaces_filter_warnings"] = space_warnings
         if include_pack_provenance:
             response["selected_packs"] = selected_packs
             response["pack_filter"] = {

@@ -177,3 +177,70 @@ def test_t12_no_overfetch_server_side_path() -> None:
     kwargs = query_mock.call_args.kwargs
     # No over-fetch: min(5, 20) = 5
     assert kwargs["n_results"] == 5
+
+
+# ---------------------------------------------------------------------------
+# #51 — spaces filter: request builds the right where clause, and the
+# transitional "filter may be incomplete" signal is surfaced (not silently 0).
+# ---------------------------------------------------------------------------
+
+
+def test_51_vector_search_forwards_spaces_where_clause() -> None:
+    """_vector_search asks the backend for the 'space' where clause it built."""
+    hit = {"id": "v1", "document": "a", "metadata": {"space": "claim", "node_id": "n1"}, "distance": 0.1}
+    query_mock = MagicMock(return_value=[hit])
+    hybrid = _make_hybrid_with_chroma(query_mock)
+    results = hybrid._vector_search("x", spaces=["claim"], limit=5)
+    kwargs = query_mock.call_args.kwargs
+    assert kwargs["where"] == {"space": "claim"}
+    assert [r.node_id for r in results] == ["n1"]
+
+
+def test_51_query_sets_transitional_warning_when_spaces_filter_used() -> None:
+    """query() surfaces a caller-visible warning when a spaces filter is active.
+
+    Root cause: vectors ingested before builder.py wrote 'space' into metadata
+    have no such key, and SqliteVecStore/Chroma both treat a missing key as a
+    match failure (not "ignored"), so a spaces filter silently zeroes the
+    vector leg for pre-fix data until a backfill runs. Callers must be able to
+    tell "no results" apart from "filter could not be applied".
+    """
+    chroma = MagicMock()
+    chroma.available = True
+    chroma.query = MagicMock(return_value=[])
+    hybrid = HybridQuery(chroma, MagicMock(available=False))
+    hybrid.query("q", spaces=["claim"], use_rerank=False, use_bm25=False, use_fts=False)
+    assert hybrid._last_warnings
+    assert "space" in hybrid._last_warnings[0]
+
+
+def test_51_query_no_warning_when_spaces_not_used() -> None:
+    """No spaces filter → no transitional warning (existing spaces=None behaviour)."""
+    chroma = MagicMock()
+    chroma.available = True
+    chroma.query = MagicMock(return_value=[])
+    hybrid = HybridQuery(chroma, MagicMock(available=False))
+    hybrid.query("q", spaces=None, use_rerank=False, use_bm25=False, use_fts=False)
+    assert hybrid._last_warnings == []
+
+
+def test_51_builder_writes_space_into_vector_metadata() -> None:
+    """Root fix: OntologyBuilder.add_node must write 'space' into vector metadata
+    so the where-clause SqliteVecStore/_build_chroma_where builds actually has a
+    key to match against, for nodes ingested from here on."""
+    from unittest.mock import MagicMock as _MM
+
+    from opencrab.ontology.builder import OntologyBuilder
+
+    vec = _MM()
+    vec.available = True
+    vec.upsert_texts = _MM()
+    graph = _MM(available=False)
+    docs = _MM(available=False)
+    sql = _MM(available=False)
+    builder = OntologyBuilder(graph, docs, sql, vec=vec)
+
+    builder.add_node("resource", "Document", "n1", {"title": "hello world", "pack_id": "pack-a"})
+
+    kwargs = vec.upsert_texts.call_args.kwargs
+    assert kwargs["metadatas"][0]["space"] == "resource"

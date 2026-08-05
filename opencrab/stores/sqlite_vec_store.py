@@ -464,9 +464,12 @@ class SqliteVecStore(_SqliteConnMixin):
         # Residual (non-pack) post-filter → scan up to vec0's k cap for best-effort
         # recall: the residual field is filtered in Python, so matches beyond the
         # 4096 nearest cannot be recovered (a hard vec0 k limit). Localcrab only
-        # emits pack (exact, pushed down) and space filters; space is absent from
-        # vector metadata so it matches nothing in either backend — the residual
-        # path is a correctness safety net, not a hot path.
+        # emits pack (exact, pushed down) and space filters; space is only written
+        # to vector metadata starting with builder.py's #51 fix, so vectors ingested
+        # before that fix still have no "space" key and match nothing here (missing
+        # key = _MISSING = no match, replicating Chroma's missing-key semantics) —
+        # query.py surfaces a transitional warning for this until a backfill runs.
+        # The residual path itself is a correctness safety net, not a hot path.
         if predicate is None or pack_only:
             fetch_k = min(max(int(n_results), 1), _VEC0_K_MAX)
         else:
