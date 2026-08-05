@@ -98,6 +98,42 @@ class TestApplyPromotionPackageBilling:
             result = apply_promotion_package(package_path, dry_run=False, tenant_id="acme", subject_id="u1")
         assert result["summary"]["nodes_written"] == 1
         billing_instance.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+        assert result["billing"] == {"billed_node_count": 1, "ok": True}
+
+    def test_normal_billing_persist_failure_is_visible_in_result_not_just_a_log(self, tmp_path, caplog):
+        """#66 codex re-review, finding [4]: apply_promotion_package's outer
+        try/except only catches raised exceptions — on_harness_apply()
+        itself never raises (it returns {"ok": False, ...} on a failed
+        persist, same fire-and-forget contract as every other on_* wrapper).
+        Before this fix that soft failure was discarded with ZERO
+        visibility, not even a log line. Now it must show up both as a log
+        line (#105's minimum bar) and in the returned/printed result dict
+        (crabharness/cli.py's `_write()` prints this dict as the CLI's own
+        output) — a log alone is what #105 already flagged as insufficient."""
+        import logging
+
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        )
+        billing_instance.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
+        package_path = _write_package(tmp_path, _VALID_PACKAGE)
+        with (
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            with caplog.at_level(logging.WARNING):
+                result = apply_promotion_package(package_path, dry_run=False)
+        assert result["summary"]["nodes_written"] == 1  # apply itself still succeeded
+        assert result["billing"] == {
+            "billed_node_count": 1, "ok": False, "error": "database is locked",
+        }
+        assert any("harness_apply" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
 
     def test_error_graph_write_failure_does_not_bill(self, tmp_path):
         """Same accuracy fix as harness.py: OntologyBuilder.add_node() doesn't
@@ -118,6 +154,26 @@ class TestApplyPromotionPackageBilling:
 
             result = apply_promotion_package(package_path, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
+        billing_instance.on_harness_apply.assert_not_called()
+
+    def test_error_malformed_receipt_does_not_bill(self, tmp_path):
+        """Fail-closed pin (#66 codex re-review, finding [3]): a "stores" map
+        with no "graph" key at all must not bill — an unrecognized receipt
+        shape is not a positive success signal."""
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        )
+        package_path = _write_package(tmp_path, _VALID_PACKAGE)
+        with (
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            apply_promotion_package(package_path, dry_run=False)
         billing_instance.on_harness_apply.assert_not_called()
 
     def test_normal_dry_run_does_not_bill(self, tmp_path):

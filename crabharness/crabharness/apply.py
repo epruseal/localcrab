@@ -10,10 +10,13 @@ Each operation returns a receipt_id + receipt_ts (Phase 1 feature).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from .models import PromotionPackage
+
+logger = logging.getLogger(__name__)
 
 
 def apply_promotion_package(
@@ -158,20 +161,41 @@ def apply_promotion_package(
     # landed in the graph. builder.add_node() doesn't raise for a per-store
     # failure (see builder.py's module docstring), so len(node_receipts)
     # alone would overcount — graph_write_failed() filters those out.
+    #
+    # #66 codex re-review, finding [4]: on_harness_apply() itself never
+    # raises (emit() is fire-and-forget by contract — see hooks.py), it
+    # returns {"ok": False, "error": ...} on a failed persist instead. The
+    # outer try/except below only catches actual exceptions (e.g. a broken
+    # BillingHooks import/construction), so a soft ok=False was previously
+    # discarded with zero visibility — not even a log line, since nothing
+    # inspected the return value. `billing` in the returned dict (which
+    # crabharness/cli.py's `_write()` prints as part of the command's own
+    # JSON output, not just a log line #105 already flagged as insufficient
+    # for this exact class of failure) makes both cases visible: how many
+    # nodes were actually billed, and whether the persist itself failed.
+    billing_status: dict[str, Any] = {"billed_node_count": 0, "ok": True}
     try:
         from opencrab.billing.hooks import BillingHooks
 
         billed_node_count = sum(
             1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
         )
+        billing_status["billed_node_count"] = billed_node_count
         if billed_node_count > 0:
-            BillingHooks(sql).on_harness_apply(
+            billing_result = BillingHooks(sql).on_harness_apply(
                 tenant_id, subject_id, package.package_id, billed_node_count
             )
+            if not billing_result.get("ok"):
+                billing_status["ok"] = False
+                billing_status["error"] = billing_result.get("error")
+                logger.warning(
+                    "harness_apply billing event failed to persist (package_id=%s): %s",
+                    package.package_id, billing_result.get("error"),
+                )
     except Exception as exc:  # noqa: BLE001 — billing is fire-and-forget, never blocks apply
-        import logging
-
-        logging.getLogger(__name__).warning("harness_apply billing failed: %s", exc)
+        billing_status["ok"] = False
+        billing_status["error"] = str(exc)
+        logger.warning("harness_apply billing failed: %s", exc)
 
     return {
         "package_id": package.package_id,
@@ -186,4 +210,5 @@ def apply_promotion_package(
             "edges_written": len(edge_receipts),
             "errors": len(errors),
         },
+        "billing": billing_status,
     }

@@ -24,19 +24,9 @@ Optional-store-only failures (docs/sql/vector) still bill — the entity
 exists and is queryable, matching pack_create's own "graph failed = hard
 error, optional-store-only failed = partial success" split.
 
-Issue #66: this module used to also document a ``promotion`` event fired by
-an ``on_promotion`` hook (metadata: a single ``node_id`` per call — one
-candidate promoted at a time). That hook had zero callers repo-wide. It
-stays deleted: no code path matches its per-node-id shape. The MCP tool it
-was meant for (``promotion_promote``) was already deleted as dead code (see
-``opencrab/mcp/tools/__init__.py``'s module docstring;
-``tests/test_mcp.py::test_tools_list_not_empty`` pins its absence). A
-second, non-MCP write surface DOES exist —
-``crabharness/crabharness/apply.py#apply_promotion_package`` (reachable via
-``crabharness apply`` on the CLI) — but it applies a whole PromotionPackage
-(many nodes/edges) exactly like ``harness_promotion_apply`` does, not a
-single already-promoted node_id. It is billed as `harness_apply`, the hook
-that already matches that shape, rather than resurrecting `on_promotion`.
+A 6th event type, fired by a since-DELETED ``on_promotion`` hook, is gone
+for good (issue #66: zero callers, and no code shape matches its
+per-node_id signature — see git history / the PR discussion for why).
 """
 
 from __future__ import annotations

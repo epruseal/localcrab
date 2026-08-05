@@ -710,11 +710,25 @@ class TestHarnessPromotionApply:
         """#66: on_harness_apply had zero callers repo-wide before this fix."""
         builder = MagicMock()
         billing = MagicMock()
-        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             harness_promotion_apply(_VALID_PACKAGE, dry_run=False, tenant_id="acme", subject_id="u1")
         billing.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+
+    def test_error_malformed_receipt_does_not_bill(self):
+        """#66 codex re-review, finding [3]: a "stores" map with no "graph"
+        key at all (e.g. only optional stores reported) is a receipt shape
+        this code doesn't recognize — fail-closed means that must NOT bill,
+        not fall through to "no known failure -> bill it"."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
+        billing.on_harness_apply.assert_not_called()
 
     def test_normal_billing_persist_failure_is_logged_but_apply_still_succeeds(self, caplog):
         """#105: on_harness_apply's returned {"ok": ...} must actually be
@@ -724,7 +738,7 @@ class TestHarnessPromotionApply:
 
         builder = MagicMock()
         billing = MagicMock()
-        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         billing.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)

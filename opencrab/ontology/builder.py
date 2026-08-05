@@ -368,18 +368,28 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
 
 
 def graph_write_failed(stores: dict[str, Any]) -> bool:
-    """True if ``stores`` (an add_node/add_edge result's ``"stores"`` map)
-    shows the write did NOT land in the graph store — the system of record.
+    """True unless ``stores`` (an add_node/add_edge result's ``"stores"``
+    map) POSITIVELY confirms the write landed in the graph store — the
+    system of record.
 
-    Thin, graph-only wrapper over ``store_write_failures()`` for callers that
-    must decide whether a write actually happened before treating it as
-    billable: an optional-store failure (docs/sql/vector) doesn't count here
-    (the entity still exists and is queryable), matching the same
-    "graph failed = hard failure, optional-store-only failed = partial
-    success" split ``opencrab/mcp/tools/pack.py#pack_create`` already applies
-    to its anchor node write.
+    Fail-closed by design: a missing/non-dict ``stores``, a missing
+    ``"graph"`` key, or any status string other than the literal ``"ok"``
+    all count as "did not land" — the caller must not guess "probably fine"
+    for a receipt shape it doesn't recognize. Money-critical callers (billing
+    gates) rely on this: issue #66's codex review caught a fail-open version
+    of this check (recognized failure strings blocked billing, but an
+    unrecognized/malformed receipt fell through and got billed anyway).
+
+    Optional-store status (docs/sql/vector) is irrelevant here on purpose —
+    an optional-store-only failure still means the write landed (the entity
+    exists and is queryable), matching the same "graph failed = hard
+    failure, optional-store-only failed = partial success" split
+    ``opencrab/mcp/tools/pack.py#pack_create`` already applies to its anchor
+    node write. See ``store_write_failures()`` above for that broader,
+    all-stores classification — this function only asks the graph-specific
+    question a billing decision needs.
     """
-    return any(f.startswith("graph:") for f in store_write_failures(stores))
+    return not (isinstance(stores, dict) and stores.get("graph") == "ok")
 
 
 def _space_to_default_type(space_id: str) -> str:

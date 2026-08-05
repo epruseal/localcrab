@@ -106,6 +106,7 @@ def ontology_add_node(
         Optional subject performing the write (stamped into properties).
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import graph_write_failed
     from opencrab.ontology.tenant import TenantContext, stamp_properties
 
     ctx = _get_context()
@@ -122,7 +123,14 @@ def ontology_add_node(
             properties=props,
             subject_id=subject_id,
         )
-        ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
+        # #66 codex re-review (finding [8]): this sibling of
+        # ontology_add_edge had the exact same fail-open bug — add_node()
+        # never raises for a per-store failure (builder.py's module
+        # docstring), so a bare "no exception -> bill" call here charged for
+        # nodes that never landed in the graph. Same graph-only,
+        # fail-closed gate as ontology_add_edge/harness_promotion_apply.
+        if not graph_write_failed(result.get("stores") or {}):
+            ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:
