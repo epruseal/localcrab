@@ -18,7 +18,6 @@ import logging
 from typing import Any
 
 from opencrab.common.text import slugify
-from opencrab.ontology.builder import store_write_failures
 
 from ._registry import tool
 
@@ -84,6 +83,7 @@ def _ingest_into_pack(
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import store_write_failures
 
     ctx = _get_context()
     added_nodes = 0
@@ -496,6 +496,7 @@ def pack_create(
     (text_as_node=True, default) or embedded as a vector blob only (False).
     """
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
+    from opencrab.ontology.builder import store_write_failures
 
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
@@ -515,7 +516,7 @@ def pack_create(
     ctx = _get_context()
     anchor_node_id = f"dataset:{slug}"
     try:
-        ctx["builder"].add_node(
+        anchor_result = ctx["builder"].add_node(
             space="resource",
             node_type="Dataset",
             node_id=anchor_node_id,
@@ -528,6 +529,18 @@ def pack_create(
         )
     except Exception as exc:
         return {"error": f"anchor node failed: {exc}"}
+
+    # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
+    # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
+    # inside the returned stores map. Without this the anchor node write
+    # could fail everywhere and pack_create would still report the pack as
+    # created — and unlike a node/edge inside the pack, a missing anchor
+    # means the pack itself doesn't exist, so this is a hard error, not a
+    # partial-success entry.
+    anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
+    anchor_failures = store_write_failures(anchor_stores or {})
+    if anchor_failures:
+        return {"error": "anchor node failed: " + "; ".join(anchor_failures)}
 
     source_id: str | None = None
     if text:

@@ -31,6 +31,7 @@ from opencrab.mcp.tools import (
     pack_create,
     pack_ingest,
 )
+from opencrab.ontology.builder import store_write_failures
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +128,34 @@ class TestSchemaPackDelegation:
             mock_uninstall.return_value = {"removed": [], "kept": ["Gene.yaml"]}
             dispatch_tool("schema_pack_uninstall", {"name": "biomedical"})
         mock_uninstall.assert_called_once_with("biomedical", False)
+
+
+# ---------------------------------------------------------------------------
+# store_write_failures — the shared "did this write actually happen" rule
+# ---------------------------------------------------------------------------
+
+
+class TestStoreWriteFailures:
+    def test_normal_all_ok_is_no_failures(self):
+        assert store_write_failures({"graph": "ok", "docs": "ok", "sql": "ok"}) == []
+
+    def test_normal_optional_store_unavailable_is_not_a_failure(self):
+        """docs/sql/vector being unavailable is a normal deployment shape
+        (those backends are optional) — not a write failure."""
+        assert store_write_failures({"graph": "ok", "docs": "unavailable", "sql": "unavailable"}) == []
+
+    def test_error_graph_unavailable_is_a_failure(self):
+        """graph is the system of record: unavailable there means the write
+        landed nowhere that counts, even if optional stores succeeded."""
+        assert store_write_failures({"graph": "unavailable", "docs": "ok"}) == ["graph: unavailable"]
+
+    def test_error_store_error_status_is_a_failure(self):
+        assert store_write_failures({"graph": "error: disk I/O"}) == ["graph: error: disk I/O"]
+
+    def test_error_no_match_status_is_a_failure(self):
+        assert store_write_failures({"graph": "no match (missing node: a, b)"}) == [
+            "graph: no match (missing node: a, b)"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +382,41 @@ class TestPackCreate:
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
         assert result == {"error": "anchor node failed: graph down"}
+
+    def test_error_anchor_node_store_failure_without_raising(self):
+        """The anchor node write can also fail the way _ingest_into_pack's
+        node/edge loops do: add_node returns normally (no exception) with an
+        "error: ..." status inside stores. A missing/broken anchor means the
+        pack doesn't really exist, so this must be a hard error, not a
+        reported-as-created pack."""
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Broken Store", pack_id="broken-store-pack")
+        assert result == {"error": "anchor node failed: graph: error: disk I/O"}
+
+    def test_error_anchor_node_graph_unavailable(self):
+        """graph unavailable for the anchor write is also a failure — the
+        anchor would land nowhere that counts even if docs/sql wrote."""
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "unavailable", "docs": "ok", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="No Graph", pack_id="no-graph-pack")
+        assert result == {"error": "anchor node failed: graph: unavailable"}
 
     def test_normal_with_text_materialises_evidence_node(self):
         builder = MagicMock()

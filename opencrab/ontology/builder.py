@@ -335,8 +335,16 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     write did NOT actually happen: ``"error: ..."`` (store threw) or
     ``"no match"`` / ``"no match (missing node: ...)"`` (edge endpoint
     missing, or the graph upsert matched nothing). ``"unavailable"`` and
-    ``"skipped (...)"`` are NOT failures — those are expected when a store
-    isn't configured or was deliberately skipped after a sibling failure.
+    ``"skipped (...)"`` on the optional stores (docs/sql/vector) are NOT
+    failures — those are expected when a store isn't configured or was
+    deliberately skipped after a sibling failure.
+
+    ``graph`` is different: it is the system of record, so ``"unavailable"``
+    there means the write landed nowhere that counts, even if optional
+    stores went through. That combination is rare in a real deployment
+    (graph is always configured), but the contract of this function is
+    "did the write actually happen", so an unavailable graph store must
+    count as a failure too.
 
     Callers that only check ``add_node``/``add_edge`` for a raised exception
     (see the module docstring: individual store failures are swallowed and
@@ -345,9 +353,11 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     """
     failures = []
     for store, status in stores.items():
-        if isinstance(status, str) and (
-            status.startswith("error:") or status.startswith("no match")
-        ):
+        if not isinstance(status, str):
+            continue
+        if status.startswith("error:") or status.startswith("no match"):
+            failures.append(f"{store}: {status}")
+        elif store == "graph" and status == "unavailable":
             failures.append(f"{store}: {status}")
     return failures
 
