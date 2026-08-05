@@ -498,6 +498,7 @@ class HybridQuery:
             graph_results = self._graph_expand(
                 anchor_ids, profile.graph_depth, profile.graph_limit,
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+                spaces=spaces,
             )
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
@@ -650,6 +651,11 @@ class HybridQuery:
 
         백엔드-중립: doc store가 ``supports_keyword`` capability를 노출할 때만 사용.
         미지원·예외 시 빈 리스트로 graceful fallback(기존 하이브리드 무손상).
+
+        issue #52: ``spaces`` was accepted here but never forwarded to
+        ``keyword_search`` — this leg silently ignored the caller's space
+        filter. Now forwarded straight through; the doc store pushes it into
+        its own SQL WHERE clause (see ``LocalSQLDocStore.keyword_search``).
         """
         ds = self._doc_store
         if ds is None or not getattr(ds, "supports_keyword", False):
@@ -660,6 +666,7 @@ class HybridQuery:
                 pack_ids=pack_ids,
                 include_unpackaged=include_unpackaged,
                 limit=limit,
+                spaces=spaces,
             )
         except Exception as exc:
             logger.warning("FTS keyword search error: %s", exc)
@@ -795,12 +802,20 @@ class HybridQuery:
         limit: int,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[QueryResult]:
         """Expand graph neighbourhood from anchor node IDs.
 
         Uses at most 3 anchors for depth > 1 (multi-hop) to keep result sets
         manageable. Edge-type weights adjust the baseline score; a per-hop
         decay of 0.85 reduces scores for deeper neighbours.
+
+        issue #52: this method previously had no ``spaces`` parameter at
+        all — the graph leg silently ignored the caller's space filter and
+        mixed in neighbours from every space. Now pushed straight into
+        ``find_neighbors`` (real ``space``/``space_id`` column or property
+        on every backend, so no post-filter-after-LIMIT class of bug — see
+        each store's ``find_neighbors`` docstring).
         """
         if not self._neo4j.available:
             return []
@@ -812,12 +827,14 @@ class HybridQuery:
 
         for anchor_id in anchor_ids[:max_anchors]:
             try:
-                # Only forward pack kwargs when one is active so older graph
+                # Only forward pack/space kwargs when active so older graph
                 # store stubs (without the new signature) keep working.
                 extra: dict[str, Any] = {}
                 if pack_ids:
                     extra["pack_ids"] = pack_ids
                     extra["include_unpackaged"] = include_unpackaged
+                if spaces:
+                    extra["spaces"] = spaces
                 neighbours = self._neo4j.find_neighbors(
                     node_id=anchor_id,
                     direction="both",

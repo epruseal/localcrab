@@ -248,6 +248,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
         limit: int = 20,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """본문(doc_sources) FTS5 키워드 검색 — 하이브리드 키워드 레그.
 
@@ -255,6 +256,19 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         질의는 \\w+ 토큰만 추출해 각 토큰을 따옴표로 감싸 OR 결합 → FTS5 연산자
         주입/구문오류 방지(따옴표·별표·연산자 입력도 안전). bm25 랭크 오름차순(=best first).
         반환: [{source_id, node_id, text, metadata, score}] (score 높을수록 우수).
+
+        ``spaces`` (issue #52): strict space-membership filter pushed into
+        the SQL WHERE clause (``json_extract(s.metadata, '$.space')``, via
+        ``self._dialect.json_get`` — the same extractor the graph store's
+        pack filter uses), not a Python post-filter. ``doc_sources`` has no
+        dedicated ``space`` column (only ``doc_nodes`` does), so this reads
+        it out of the JSON ``metadata`` blob the same way ``pack_id`` is
+        currently read there — but unlike the pack filter below (a Python
+        post-filter over an overfetched candidate set, an established,
+        pre-existing pattern in this method), ``spaces`` is applied ahead of
+        ``LIMIT`` to avoid the same limit-before-filter starvation class
+        issue #62 fixed for the graph store. No "include unspaced" mode,
+        matching the BM25/vector legs' strict semantics.
         """
         if not self._available or not self._fts_ok or not self._conn:
             return []
@@ -264,13 +278,21 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         if not toks:
             return []
         match = " OR ".join(f'"{t}"' for t in toks)
+        where_sql = "WHERE doc_sources_fts MATCH ?"
+        params: list[Any] = [match]
+        if spaces:
+            space_expr = self._dialect.json_get("s.metadata", "space")
+            placeholders = ",".join("?" for _ in spaces)
+            where_sql += f" AND {space_expr} IN ({placeholders})"
+            params.extend(spaces)
+        params.append(max(1, limit) * 5)  # pack 필터 대비 overfetch
         try:
             rows = self._conn.execute(
                 "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
                 "bm25(doc_sources_fts) AS rank "
                 "FROM doc_sources_fts f JOIN doc_sources s ON s.source_id = f.source_id "
-                "WHERE doc_sources_fts MATCH ? ORDER BY rank LIMIT ?",
-                (match, max(1, limit) * 5),  # pack 필터 대비 overfetch
+                f"{where_sql} ORDER BY rank LIMIT ?",
+                params,
             ).fetchall()
         except Exception as exc:
             logger.warning("keyword_search failed: %s", exc)
