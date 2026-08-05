@@ -14,7 +14,14 @@ import pytest
 from opencrab.pack import build as build_mod
 from opencrab.pack.build import Pack
 from opencrab.pack.jsonl_io import iter_jsonl
-from opencrab.pack.schema import NODE_TYPE_OVERRIDE, PackSchemaError
+from opencrab.pack.schema import (
+    ALL_SPACES,
+    CHUNK_STRUCT_KEYS,
+    EDGE_STRUCT_KEYS,
+    NODE_STRUCT_KEYS,
+    NODE_TYPE_OVERRIDE,
+    PackSchemaError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -475,6 +482,245 @@ class TestSave:
         """`pack_lib.json.dumps(...)` 를 쓰는 빌더가 있다(실측 3곳)."""
         from opencrab.pack import build
         assert build.json is json
+
+
+# ---------------------------------------------------------------------------
+# 레코드 구조 — 노드만 지키고 엣지·청크는 무방비였다
+# ---------------------------------------------------------------------------
+
+class TestRecordStructureMatchesTheSchema:
+    """생산된 세 레코드의 **키 집합**이 계약(schema)과 정확히 같아야 한다.
+
+    노드는 `validate()` 의 stray 검사가 지키지만 **엣지·청크에는 같은 검사가 없다.**
+    전면 스윕에서 `'source_id'`·`'document_id'`·`'char_start'` 같은 키 이름을 빈
+    문자열로 바꾼 변이가 전부 생존했다(2026-08-05). 키 하나가 바뀌면 적재기가 그
+    필드를 통째로 못 읽는데, 그게 정확히 91만 필드 사고의 형태다.
+
+    schema 의 집합을 그대로 기대값으로 쓴다 — 여기 값을 따로 적으면 계약이 또 이중화된다.
+    """
+
+    @pytest.fixture
+    def built(self, pack):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문", extra={"page": 3})
+        return pack
+
+    def test_edge_keys_are_exactly_the_edge_struct_keys(self, built):
+        assert set(built.edges[0]) == set(EDGE_STRUCT_KEYS)
+
+    def test_chunk_keys_are_exactly_the_chunk_struct_keys(self, built):
+        assert set(built.chunks[0]) == set(CHUNK_STRUCT_KEYS)
+
+    def test_node_keys_are_a_subset_of_the_node_struct_keys(self, built):
+        """노드는 선택 키(properties·degree)가 있어 부분집합이다. 초과가 사고였다."""
+        for n in built.nodes:
+            assert set(n) <= set(NODE_STRUCT_KEYS), set(n) - set(NODE_STRUCT_KEYS)
+
+    def test_chunk_metadata_carries_the_documented_fields(self, built):
+        meta = built.chunks[0]["metadata"]
+        assert set(meta) == {"evidence_index", "char_start", "char_end",
+                             "source_package_title", "page"}
+        assert meta["char_start"] == 0
+        assert meta["source_package_title"] == built.title
+
+    def test_edge_endpoints_are_not_swapped(self, pack):
+        """`source_id`/`target_id` 이름이 서로 바뀌어도 키 집합 검사는 통과한다 —
+        값까지 본다."""
+        pack.node("r", "R", "Document", "resource")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("r", "e", "contains")
+        assert (pack.edges[0]["source_id"], pack.edges[0]["target_id"]) == ("r", "e")
+
+    def test_chunk_source_and_document_id_both_point_at_the_document(self, pack):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        c = pack.chunks[0]
+        assert (c["document_id"], c["source"], c["id"]) == (doc, doc, "e1")
+
+
+# ---------------------------------------------------------------------------
+# 9-space 헬퍼 — 각자 어느 space·node_type 을 붙이는가
+# ---------------------------------------------------------------------------
+
+class TestSpaceHelpers:
+    """9 개 헬퍼가 붙이는 `(space, node_type)`. 전면 스윕에서 전부 무검사였다.
+
+    `pack.claim(...)` 이 claim 이 아닌 space 를 붙이면 그 노드에 걸린 엣지가 grammar
+    불일치로 적재 시 대량 skip 된다 — 조용한 데이터 유실이다.
+    """
+
+    EXPECTED = {
+        "resource": ("resource", "Document"),
+        "subject": ("subject", "Org"),
+        "concept": ("concept", "Concept"),
+        "claim": ("claim", "Claim"),
+        "community": ("community", "Community"),
+        "outcome": ("outcome", "Outcome"),
+        "lever": ("lever", "Lever"),
+        "policy": ("policy", "Policy"),
+    }
+
+    @pytest.mark.parametrize("helper", sorted(EXPECTED))
+    def test_helper_space_and_node_type(self, pack, helper):
+        getattr(pack, helper)("s", "라벨")
+        n = pack.nodes[0]
+        assert (n["space"], n["node_type"]) == self.EXPECTED[helper]
+
+    @pytest.mark.parametrize("helper", ["concept", "claim", "community",
+                                        "outcome", "lever", "policy"])
+    def test_desc_lands_in_description_property(self, pack, helper):
+        getattr(pack, helper)("s", "라벨", "설명")
+        assert pack.nodes[0]["properties"] == {"description": "설명"}
+
+    def test_evidence_helper_space(self, pack):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        assert pack.nodes[1]["space"] == "evidence"
+
+    def test_helpers_cover_every_grammar_space(self, pack):
+        """evidence 는 `ev()`, 나머지 8 개는 전용 헬퍼. 9-space 를 다 덮는지."""
+        covered = {sp for sp, _ in self.EXPECTED.values()} | {"evidence"}
+        assert covered == set(ALL_SPACES)
+
+
+# ---------------------------------------------------------------------------
+# validate / save 진단 — "출력이 났다" 만 보고 수치는 안 봤다
+# ---------------------------------------------------------------------------
+
+class TestDiagnosticsReportRealNumbers:
+    """진단 출력의 **집계**가 계약이다.
+
+    기존 검사는 전부 `"..." in out` 형태라 문구만 봤다. 그래서 `stray[k] += 1` 을
+    `+= 2` 로, 카운터 증분과 상위 N 캡을 바꾸는 변이가 전부 생존했다(2026-08-05).
+    운영자는 이 숫자를 보고 팩을 고칠지 말지 정한다 — 숫자가 틀리면 판단이 틀린다.
+    """
+
+    def test_stray_counts_kinds_and_occurrences(self, pack):
+        pack.node("n1", "L", "Concept", "concept")
+        pack.node("n2", "L", "Concept", "concept")
+        pack.nodes[0]["brand"] = "Yamaha"      # 1종
+        pack.nodes[1]["brand"] = "Honda"       # 같은 종, 2건째
+        pack.nodes[1]["model"] = "CB"          # 2종
+        with pytest.raises(ValueError) as ei:
+            pack.validate()
+        assert "2종 3건" in str(ei.value), str(ei.value)
+
+    def test_stray_key_list_is_capped_but_the_total_is_not(self, pack, capsys):
+        """목록은 8 개로 자르되 **총계는 자르지 않는다** — 잘린 걸 알 수 있어야 한다."""
+        pack.node("n1", "L", "Concept", "concept")
+        for i in range(12):
+            pack.nodes[0][f"k{i:02d}"] = i
+        with pytest.raises(ValueError):
+            pack.validate()
+        out = capsys.readouterr().out
+        assert "12종 12건" in out
+        assert "'k07'" in out and "'k08'" not in out, "상위 8개만 나열해야 한다"
+
+    def test_dangling_count_is_reported(self, pack, capsys):
+        pack.edge("ghost-a", "ghost-b", "related_to")
+        pack.edge("ghost-c", "ghost-d", "related_to")
+        pack.validate()
+        assert "dangling 노드 참조 엣지 2건" in capsys.readouterr().out
+
+    def test_grammar_violation_count_is_reported(self, pack, capsys):
+        for i in range(3):
+            pack.edge(f"a{i}", f"b{i}", "related_to")     # space 미확정으로 우회
+        for i in range(3):
+            pack.node(f"a{i}", "A", "Concept", "concept")
+            pack.node(f"b{i}", "B", "Evidence", "evidence")
+        pack.validate()
+        assert "grammar 위반 엣지 3건" in capsys.readouterr().out
+
+    def test_fix_substitution_count_is_reported(self, pack, capsys):
+        pack.node("r", "R", "Document", "resource")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("r", "e", "슬쩍만든라벨")
+        pack.validate()
+        assert "자동치환(FIX) 엣지 1건" in capsys.readouterr().out
+
+    def test_unlinked_claim_concept_ratio_is_reported(self, pack, capsys):
+        pack.claim("c1", "주장1")
+        pack.claim("c2", "주장2")
+        pack.concept("k1", "개념")
+        pack.validate()
+        assert "evidence_refs 없는 claim/concept 3/3건" in capsys.readouterr().out
+
+    def test_empty_spaces_are_listed_by_name(self, pack, capsys):
+        """채워진 space 는 빠지고 **나머지 8 개가 전부** 나열돼야 한다."""
+        pack.node("n1", "L", "Concept", "concept")
+        pack.validate()
+        line = next(ln for ln in capsys.readouterr().out.splitlines()
+                    if "9-space 비어있음" in ln)
+        assert "'concept'" not in line
+        for sp in ALL_SPACES:
+            if sp != "concept":
+                assert f"'{sp}'" in line, f"{sp} 가 빈 space 목록에서 빠졌다"
+
+    def test_remap_hazard_count_is_reported(self, pack, capsys):
+        pack.node("n1", "L", "TextUnit", "evidence")
+        pack.node("n2", "L", "TextUnit", "evidence")
+        pack.validate()
+        assert "remap 함정 2건" in capsys.readouterr().out
+
+    def test_save_reports_final_counts_and_space_histogram(self, pack, capsys):
+        doc = pack.resource("d", "문서")
+        pack.ev("e1", doc, "라벨", "본문")
+        pack.save()
+        out = capsys.readouterr().out
+        assert "FINAL t: 2 nodes, 1 edges, 1 chunks" in out
+        assert "'resource': 1" in out and "'evidence': 1" in out
+
+    def test_save_reports_dropped_edge_count(self, pack, capsys):
+        pack.node("co", "CO", "Community", "community")
+        pack.node("s", "S", "Org", "subject")
+        pack.edge("co", "s", "owns")
+        pack.edge("co", "s", "owns2")
+        pack.save()
+        assert "grammar 드롭 엣지 2건" in capsys.readouterr().out
+
+    def test_multiple_errors_are_joined_not_truncated(self, pack):
+        """차단 사유가 여럿이면 전부 보여야 한다 — 하나만 고치고 다시 도는 낭비를 막는다."""
+        pack.node("n1", "L", "TextUnit", "evidence")
+        pack.nodes[0]["brand"] = "Yamaha"
+        with pytest.raises(ValueError) as ei:
+            pack.validate(strict=True)
+        msg = str(ei.value)
+        assert "비구조 키" in msg and "remap 함정" in msg
+        assert "; " in msg
+
+
+# ---------------------------------------------------------------------------
+# __all__ — 레거시 빌더가 모듈 속성으로 접근하는 이름들
+# ---------------------------------------------------------------------------
+
+class TestPublicSurface:
+    """`__all__` 은 장식이 아니라 레거시 빌더의 접근 계약이다.
+
+    `pack_lib.json.dumps(...)`, `pack_lib.ALL_SPACES`, `pack_lib._NODE_STRUCT_KEYS`
+    처럼 모듈을 통해 접근하는 빌더가 있다(실측 3곳/2곳/1곳). 스윕에서 `__all__` 항목
+    문자열을 바꾸는 변이 6 건이 전부 생존했다.
+    """
+
+    def test_all_names_exist_on_the_module(self):
+        missing = [n for n in build_mod.__all__ if not hasattr(build_mod, n)]
+        assert not missing, f"__all__ 에 있는데 모듈에 없다: {missing}"
+
+    def test_documented_legacy_names_are_exported(self):
+        assert set(build_mod.__all__) == {
+            "Pack", "ALL_SPACES", "DEFAULT_OUT_ROOT",
+            "json", "_NODE_STRUCT_KEYS", "_RESERVED_NODE_KEYS"}
+
+    def test_star_import_provides_the_legacy_names(self):
+        ns: dict = {}
+        exec("from opencrab.pack.build import *", ns)      # noqa: S102
+        for n in ("Pack", "ALL_SPACES", "json",
+                  "_NODE_STRUCT_KEYS", "_RESERVED_NODE_KEYS"):
+            assert n in ns, f"{n} 이 star import 로 안 나온다"
+
+    def test_underscore_aliases_are_the_schema_tables_themselves(self):
+        """별칭이 다른 객체를 가리키면 계약이 조용히 이중화된다."""
+        assert build_mod._NODE_STRUCT_KEYS is NODE_STRUCT_KEYS
+        assert build_mod._NTO is NODE_TYPE_OVERRIDE
 
 
 # ---------------------------------------------------------------------------

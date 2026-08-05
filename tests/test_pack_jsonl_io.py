@@ -323,6 +323,107 @@ class TestShardBoundaries:
         assert SHARD_LIMIT == 40 * 1024 * 1024
 
 
+class TestTwoWritersHoldTheSameContract:
+    """rewrite(`write_jsonl_sharded`) 와 append(`ShardedAppender`) 는 **대칭** 이다.
+
+    이 파일에는 이미 "두 writer 를 대칭으로 건다"는 교훈이 적혀 있다(경계 조건 쪽,
+    2026-08-04). 그런데 그 원칙을 **경계에만** 적용하고 나머지 계약에는 적용하지
+    않았다. 전면 스윕이 그 대가를 보여줬다(2026-08-05): 아래 넷이 전부 rewrite 쪽만
+    검사돼 append 쪽 변이가 그대로 생존했다.
+
+        부모 디렉터리 생성 / ensure_ascii=False / 첫 shard 이름 .00 / str 경로 수용
+
+    한쪽만 거는 순간 다른 쪽이 무방비가 된다 — 클래스로 닫는다.
+    """
+
+    def test_appender_creates_parent_directory(self, tmp_path):
+        deep = tmp_path / "a" / "b" / "nodes.jsonl"
+        with ShardedAppender(deep) as w:
+            w.write(rec(0))
+        assert deep.exists()
+
+    def test_appender_does_not_escape_non_ascii(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        with ShardedAppender(q) as w:
+            w.write({"k": "한글"})
+        assert "한글" in q.read_text(encoding="utf-8")
+
+    def test_appender_rollover_names_first_shard_zero_zero(self, tmp_path):
+        """base -> .00 rename. 인덱스를 1 로 바꿔도 아무 검사가 안 죽었다."""
+        q = tmp_path / "raw.jsonl"
+        n = _line_bytes(rec(1))
+        with ShardedAppender(q, limit=2 * n - 1) as w:
+            w.write(rec(1))
+            w.write(rec(1))
+        assert [s.name for s in shard_paths(q)] == ["raw.00.jsonl", "raw.01.jsonl"]
+
+    @pytest.mark.parametrize("writer", ["rewrite", "append"])
+    def test_str_path_is_accepted(self, tmp_path, writer):
+        """시그니처가 `Path | str` 다. `path = Path(path)` 를 지워도 아무도 안 죽었다."""
+        q = tmp_path / "raw.jsonl"
+        if writer == "rewrite":
+            write_jsonl_sharded(str(q), [rec(0)])
+        else:
+            with ShardedAppender(str(q)) as w:
+                w.write(rec(0))
+        assert list(iter_jsonl(str(q))) == [rec(0)]
+        assert shard_paths(str(q)) == [q]
+        assert count_jsonl(str(q)) == 1
+        assert jsonl_exists(str(q))
+
+
+class TestAppenderClosesItsFile:
+    """`__exit__` 이 `close()` 대신 `flush()` 를 불러도 22 건이 전부 통과했다.
+
+    CPython 이 참조가 끊긴 파일 객체를 GC 로 닫아 주기 때문이다. 그 동작에 기대면
+    (a) 다른 구현·다른 GC 타이밍에서 버퍼가 남고 (b) 열린 fd 가 누적된다.
+    context manager 를 쓰는 이유가 결정적 해제이므로 계약으로 못박는다.
+    """
+
+    def test_exit_closes_the_underlying_file(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        with ShardedAppender(q) as w:
+            w.write(rec(1))
+            assert not w._f.closed
+        assert w._f.closed, "with 블록을 벗어나면 파일은 닫혀 있어야 한다"
+
+    def test_close_is_not_merely_flush(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        w = ShardedAppender(q)
+        w.write(rec(1))
+        w.flush()
+        assert not w._f.closed, "flush 는 닫지 않는다 — 둘은 다른 연산이다"
+        w.close()
+        assert w._f.closed
+
+
+class TestRewriteInternals:
+    """rewrite 경로의 내부 분기. 스윕에서 생존한 것들을 닫는다."""
+
+    def test_stale_shard_removal_tolerates_already_gone_base(self, p):
+        """base -> .00 rename 뒤 base 는 이미 없다. `unlink(missing_ok=True)` 가 그
+        전제이고, False 로 바꾸면 분할이 일어나는 모든 rewrite 가 터진다."""
+        n = _line_bytes(rec(1))
+        out = write_jsonl_sharded(p, [rec(1), rec(1)], limit=2 * n - 1)
+        assert out[0].name == "chunks.00.jsonl"
+        assert not p.exists()
+        assert list(iter_jsonl(p)) == [rec(1), rec(1)]
+
+    def test_rewrite_returns_exactly_the_files_it_wrote(self, p):
+        """반환 목록이 실제 물리 파일과 일치해야 소비자가 정리·검증을 할 수 있다."""
+        out = write_jsonl_sharded(p, [rec(i, 400) for i in range(50)], limit=5_000)
+        assert out == shard_paths(p)
+        assert all(f.exists() for f in out)
+
+    def test_shrink_unlinks_every_stale_shard(self, p):
+        write_jsonl_sharded(p, [rec(i, 400) for i in range(300)], limit=2_000)
+        many = shard_paths(p)
+        assert len(many) > 9
+        write_jsonl_sharded(p, [rec(0)], limit=10_000)
+        assert shard_paths(p) == [p]
+        assert not any(s.exists() for s in many if s != p), "구 shard 가 하나라도 남으면 손상 판정된다"
+
+
 class TestExistenceIsAboutTheFileNotItsContents:
     """`jsonl_exists` 는 "파일이 있는가"이지 "내용이 있는가"가 아니다.
 
