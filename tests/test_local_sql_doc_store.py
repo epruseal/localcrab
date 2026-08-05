@@ -156,6 +156,130 @@ class TestListNodes:
         assert len(store.list_nodes(space="beta", limit=100)) == 6
         assert len(store.list_nodes(limit=100)) == 10
 
+    def _set_updated_at(self, store, node_id: str, iso_ts: str) -> None:
+        """Force a specific ``updated_at`` so ordering/selection is controlled
+        deterministically in tests, rather than relying on ``datetime.now()``
+        call-to-call drift."""
+        store._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?", (iso_ts, node_id)
+        )
+        store._conn.commit()
+
+    def test_list_nodes_orders_by_updated_at_desc(self, store):
+        """#63: no ORDER BY meant an under-cap LIMIT picked an arbitrary
+        (physical-order) subset. The cap must pick deterministically, and
+        recency ordering is what keeps the most recently changed rows
+        searchable once the corpus exceeds the cap."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        # Cap below the corpus size: only the 10 most recently updated rows.
+        result = store.list_nodes(limit=10)
+        ids = [r["node_id"] for r in result]
+        assert ids == [f"n{i}" for i in range(19, 9, -1)]
+
+        # Selection is stable/deterministic across repeated calls.
+        assert [r["node_id"] for r in store.list_nodes(limit=10)] == ids
+
+    def test_list_nodes_cap_picks_up_newly_updated_row(self, store):
+        """A row outside the cap window becomes visible again once it's the
+        most recently updated — the whole point of ordering by recency."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=10)]
+        self._set_updated_at(store, "n5", "2026-01-02T00:00:00")
+        assert "n5" in [r["node_id"] for r in store.list_nodes(limit=10)]
+
+    def test_list_nodes_tie_break_is_deterministic_at_cap_boundary(self, store):
+        """codex P2 (#63 follow-up): a batch load / migration commonly gives
+        many rows the exact same updated_at. If several of those tied rows
+        straddle the cap boundary, ORDER BY updated_at DESC alone leaves
+        their relative order unspecified by the SQL standard — repeated
+        calls (or a rebuild after a physical reorg) could pick a different
+        subset each time, resurrecting the non-determinism this whole PR
+        exists to remove. (space, node_id) is the PK, so adding it as a
+        tie-breaker guarantees a total order."""
+        # 15 rows, all with the SAME updated_at, cap=10: without a
+        # tie-breaker, which 10 of the 15 tied rows come back is undefined.
+        # Zero-padded ids so lexicographic (space, node_id) order == numeric
+        # order, keeping the expected-winners assertion below unambiguous.
+        for i in range(15):
+            store.upsert_node_doc("s1", "T", f"n{i:02d}", {"i": i})
+            self._set_updated_at(store, f"n{i:02d}", "2026-01-01T00:00:00")
+
+        first = [r["node_id"] for r in store.list_nodes(limit=10)]
+        for _ in range(5):
+            assert [r["node_id"] for r in store.list_nodes(limit=10)] == first
+
+        # (space, node_id) ASC tie-break: lowest node_ids win the tie.
+        assert first == [f"n{i:02d}" for i in range(10)]
+
+
+# ---------------------------------------------------------------------------
+# bm25_fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestBm25Fingerprint:
+    """#63: the fingerprint must reflect the WHOLE table, independent of any
+    cap. A capped COUNT pins at exactly the cap once the corpus exceeds it,
+    so a change to a row outside the cap's selection would otherwise never
+    be observed."""
+
+    def _seed(self, store, space: str, count: int, prefix: str = "n") -> None:
+        for i in range(count):
+            store.upsert_node_doc(space, "T", f"{prefix}{i}", {"i": i})
+
+    def _set_updated_at(self, store, node_id: str, iso_ts: str) -> None:
+        store._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?", (iso_ts, node_id)
+        )
+        store._conn.commit()
+
+    def test_fingerprint_ignores_the_cap(self, store):
+        self._seed(store, "s1", 20)
+        # A tiny cap must not change the reported fingerprint: it always
+        # reflects all 20 rows, not the capped subset.
+        assert store.bm25_fingerprint(limit=5) == store.bm25_fingerprint(limit=50000)
+        assert store.bm25_fingerprint(limit=5)[0] == 20
+
+    def test_fingerprint_changes_when_row_outside_cap_is_updated(self, store):
+        """Reproduces the verifier's finding: with a small cap, updating a
+        node outside the first N physical/ordered rows must still move the
+        fingerprint, because the fingerprint is no longer capped at all."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        cap = 10
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=cap)]
+
+        fp_before = store.bm25_fingerprint(limit=cap)
+        self._set_updated_at(store, "n5", "2026-01-02T00:00:00")
+        fp_after = store.bm25_fingerprint(limit=cap)
+
+        assert fp_before != fp_after
+        # Count doesn't change (no insert/delete) — the max timestamp does.
+        assert fp_before[0] == fp_after[0] == 20
+        assert fp_after[1] != fp_before[1]
+
+    def test_fingerprint_count_reflects_deletes_outside_cap(self, store):
+        """A capped COUNT would stay pinned at the cap after a delete outside
+        the selected window; the whole-table COUNT must not."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        cap = 10
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=cap)]
+        fp_before = store.bm25_fingerprint(limit=cap)
+        store.delete_node_doc("s1", "n5")
+        fp_after = store.bm25_fingerprint(limit=cap)
+        assert fp_after[0] == fp_before[0] - 1
+
 
 # ---------------------------------------------------------------------------
 # delete_node_doc

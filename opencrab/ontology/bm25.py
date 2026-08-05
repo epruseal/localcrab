@@ -118,12 +118,26 @@ class BM25Index:
     # ------------------------------------------------------------------
 
     @classmethod
-    def build(cls, nodes: list[dict[str, Any]]) -> BM25Index:
+    def build(
+        cls,
+        nodes: list[dict[str, Any]],
+        fingerprint: tuple[int, str] | None = None,
+    ) -> BM25Index:
         """
         Build a BM25 index from a list of node dicts.
 
         Each dict must have at least 'node_id', 'space', 'node_type'.
         Properties are read from the 'properties' sub-dict.
+
+        fingerprint: optional override for the recorded staleness fingerprint
+        (see ``fingerprint`` property). Pass the doc store's whole-table
+        ``bm25_fingerprint()`` here so the recorded value means "the store
+        looked like this when the index was (re)built", not "these are the
+        (possibly capped) N nodes we happened to index" (#63) — the two stop
+        being comparable once the corpus exceeds the indexing cap otherwise,
+        and every query would schedule a rebuild forever. Defaults to
+        ``compute_fingerprint(nodes)`` for callers with no store probe (e.g.
+        tests, or one-off CLI builds from an already-fetched node list).
         """
         idx = cls()
         idx._docs = nodes
@@ -143,7 +157,7 @@ class BM25Index:
         for term, df in idx._df.items():
             idx._idf[term] = math.log((n - df + 0.5) / (df + 0.5) + 1)
 
-        idx._fingerprint = compute_fingerprint(nodes)
+        idx._fingerprint = fingerprint if fingerprint is not None else compute_fingerprint(nodes)
         logger.debug("BM25Index built: %d nodes, %d unique terms", n, len(idx._idf))
         return idx
 
