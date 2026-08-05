@@ -192,6 +192,30 @@ class TestListNodes:
         self._set_updated_at(store, "n5", "2026-01-02T00:00:00")
         assert "n5" in [r["node_id"] for r in store.list_nodes(limit=10)]
 
+    def test_list_nodes_tie_break_is_deterministic_at_cap_boundary(self, store):
+        """codex P2 (#63 follow-up): a batch load / migration commonly gives
+        many rows the exact same updated_at. If several of those tied rows
+        straddle the cap boundary, ORDER BY updated_at DESC alone leaves
+        their relative order unspecified by the SQL standard — repeated
+        calls (or a rebuild after a physical reorg) could pick a different
+        subset each time, resurrecting the non-determinism this whole PR
+        exists to remove. (space, node_id) is the PK, so adding it as a
+        tie-breaker guarantees a total order."""
+        # 15 rows, all with the SAME updated_at, cap=10: without a
+        # tie-breaker, which 10 of the 15 tied rows come back is undefined.
+        # Zero-padded ids so lexicographic (space, node_id) order == numeric
+        # order, keeping the expected-winners assertion below unambiguous.
+        for i in range(15):
+            store.upsert_node_doc("s1", "T", f"n{i:02d}", {"i": i})
+            self._set_updated_at(store, f"n{i:02d}", "2026-01-01T00:00:00")
+
+        first = [r["node_id"] for r in store.list_nodes(limit=10)]
+        for _ in range(5):
+            assert [r["node_id"] for r in store.list_nodes(limit=10)] == first
+
+        # (space, node_id) ASC tie-break: lowest node_ids win the tie.
+        assert first == [f"n{i:02d}" for i in range(10)]
+
 
 # ---------------------------------------------------------------------------
 # bm25_fingerprint

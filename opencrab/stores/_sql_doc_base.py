@@ -191,16 +191,21 @@ class _SqlDocStoreBase(abc.ABC):
         # ORDER BY updated_at DESC: 정렬 없이 LIMIT 만 걸면 어느 행이 뽑힐지 SQL 표준상
         # 보장되지 않는다(#63). 최신순으로 고정해 상한을 넘는 코퍼스에서도 최소한
         # 최근 변경분은 검색 가능하고, 선택 결과가 결정적이도록 한다.
+        # tie-breaker (space, node_id): updated_at 이 동률인 행이 상한 경계에 여럿
+        # 있으면(배치 적재·마이그레이션에서 흔함) updated_at 만으로는 그 안에서 순서가
+        # 여전히 미정이라 매번 다른 부분집합이 뽑힐 수 있다. (space, node_id) 는 PK라
+        # 전순서를 보장한다(codex P2).
         if space:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} WHERE space=:space ORDER BY updated_at DESC LIMIT :lim"
+                f" FROM {table} WHERE space=:space"
+                f" ORDER BY updated_at DESC, space, node_id LIMIT :lim"
             )
             params = {"space": space, "lim": limit}
         else:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} ORDER BY updated_at DESC LIMIT :lim"
+                f" FROM {table} ORDER BY updated_at DESC, space, node_id LIMIT :lim"
             )
             params = {"lim": limit}
         rows = self._fetch_all(sql, params)
