@@ -194,6 +194,7 @@ class PGGraphStore(_SqlGraphStoreBase):
         out: bool,
         pack_set: set[str] | None = None,
         include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """One-round-trip candidate fetch for every node in `frontier_ids`.
 
@@ -203,10 +204,12 @@ class PGGraphStore(_SqlGraphStoreBase):
         "remaining" value) — a safe, hub-safe upper bound; callers still
         apply the live "remaining" cap by slicing the per-node row list.
 
-        When `pack_set` is given, the pack filter (`_pack_where`, shared
-        with `_SqlGraphStoreBase._fetch_edges_for_node`) is joined into the
-        LATERAL subquery itself, so `LIMIT :cap` applies AFTER filtering,
-        not before (issue #62).
+        When `pack_set`/`space_set` are given, their filters (`_pack_where`,
+        shared with `_SqlGraphStoreBase._fetch_edges_for_node`, and a plain
+        `gn.space_id IN (...)` — `space_id` is a real column, unlike
+        `pack_id`) are joined into the LATERAL subquery itself, so
+        `LIMIT :cap` applies AFTER filtering, not before (issue #62, and
+        issue #52 for the space leg).
         """
         if not frontier_ids:
             return {}
@@ -214,7 +217,7 @@ class PGGraphStore(_SqlGraphStoreBase):
         type_col = "to_type" if out else "from_type"
         id_col = "to_id" if out else "from_id"
 
-        if pack_set is None:
+        if pack_set is None and space_set is None:
             sql = f"""
                 SELECT f.frontier_id, e.c1, e.c2, e.relation, e.properties
                 FROM unnest(CAST(:ids AS text[])) AS f(frontier_id)
@@ -227,9 +230,19 @@ class PGGraphStore(_SqlGraphStoreBase):
                 """
             params: dict[str, Any] = {"ids": frontier_ids, "cap": cap}
         else:
-            pack_where, pack_params = self._pack_where(
-                "gn.properties", "ge.properties", pack_set, include_unpackaged, "bf"
-            )
+            where_clauses: list[str] = []
+            params = {"ids": frontier_ids, "cap": cap}
+            if pack_set is not None:
+                pack_where, pack_params = self._pack_where(
+                    "gn.properties", "ge.properties", pack_set, include_unpackaged, "bf"
+                )
+                where_clauses.append(pack_where)
+                params.update(pack_params)
+            if space_set is not None:
+                placeholders, space_params = self._in_placeholders(sorted(space_set), "bfsp")
+                where_clauses.append(f"gn.space_id IN ({placeholders})")
+                params.update(space_params)
+            extra_where = " AND ".join(where_clauses)
             sql = f"""
                 SELECT f.frontier_id, e.c1, e.c2, e.relation, e.properties
                 FROM unnest(CAST(:ids AS text[])) AS f(frontier_id)
@@ -238,11 +251,10 @@ class PGGraphStore(_SqlGraphStoreBase):
                     FROM {self._table('graph_edges')} ge
                     JOIN {self._table('graph_nodes')} gn
                       ON gn.node_type = ge.{type_col} AND gn.node_id = ge.{id_col}
-                    WHERE ge.{anchor_col} = f.frontier_id AND {pack_where}
+                    WHERE ge.{anchor_col} = f.frontier_id AND {extra_where}
                     LIMIT :cap
                 ) e
                 """
-            params = {"ids": frontier_ids, "cap": cap, **pack_params}
 
         rows = conn.execute(self._text(sql), params).fetchall()
         out_map: dict[str, list[tuple[str, str, str, Any]]] = {}
@@ -280,13 +292,14 @@ class PGGraphStore(_SqlGraphStoreBase):
         out: bool,
         pack_set: set[str] | None = None,
         include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """HOOK override — one short-lived connection, verbatim batched query
         (see module docstring). Do NOT let this fall back to the base's
         per-node default; that would silently regress hub-fanout perf."""
         with self._conn() as conn:
             return self._batch_frontier_edges(
-                conn, frontier_ids, cap, out, pack_set, include_unpackaged
+                conn, frontier_ids, cap, out, pack_set, include_unpackaged, space_set
             )
 
     def _batch_node_props(

@@ -22,7 +22,12 @@ import os
 from collections import deque
 from typing import Any
 
-from opencrab.stores._graph_common import _edge_passes, _merge_space, _node_passes
+from opencrab.stores._graph_common import (
+    _edge_passes,
+    _merge_space,
+    _node_passes,
+    _space_passes,
+)
 from opencrab.stores._json import parse_props as _parse
 
 logger = logging.getLogger(__name__)
@@ -234,19 +239,31 @@ class KuzuGraphStore:
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """``spaces`` (issue #52): strict space-membership filter. Unlike
+        ``pack_id`` (opaque JSON blob here, see #62's note in
+        ``_find_neighbors_1hop`` on why that filter is NOT pushed into
+        Cypher), ``space_id`` is a real top-level column on ``OntologyNode``
+        (see ``_NODE_DDL``), so this one CAN be pushed into the Cypher WHERE
+        ahead of LIMIT."""
         self._require_available()
 
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        space_set: set[str] | None = set(spaces) if spaces else None
 
         if pack_set is not None:
             anchor = self.get_node_by_id(node_id)
             if not _node_passes(anchor or {}, pack_set, include_unpackaged):
                 return []
+        if space_set is not None:
+            anchor = self.get_node_by_id(node_id)
+            if not _space_passes(anchor or {}, space_set):
+                return []
 
         if depth == 1:
             return self._find_neighbors_1hop(
-                node_id, direction, limit, pack_set, include_unpackaged
+                node_id, direction, limit, pack_set, include_unpackaged, space_set
             )
 
         # depth > 1: Python BFS using 1-hop queries
@@ -260,7 +277,7 @@ class KuzuGraphStore:
                 continue
             hops = self._find_neighbors_1hop(
                 current_id, direction, limit - len(results),
-                pack_set, include_unpackaged,
+                pack_set, include_unpackaged, space_set,
             )
             for nb in hops:
                 nid = nb.get("properties", {}).get("id")
@@ -282,6 +299,7 @@ class KuzuGraphStore:
         limit: int,
         pack_set: set[str] | None,
         include_unpackaged: bool,
+        space_set: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         # ISSUE #62 (NOT fixed here — left as a clear note, not a half-fix):
         # this method has the same LIMIT-before-pack-filter defect as the SQL
@@ -305,6 +323,11 @@ class KuzuGraphStore:
         # `pack_id` column is the safe follow-up, using this method's SQL
         # counterpart as the template for what the WHERE clause should say.
         #
+        # `space_set` (issue #52) does NOT have this problem: `space_id` is
+        # already a real top-level column (see `_NODE_DDL`), so it IS pushed
+        # into the Cypher WHERE below, ahead of LIMIT — no JSON extension
+        # needed.
+        #
         # direction="both" is issued as two *directed* passes rather than one
         # undirected MATCH: the undirected form cannot say which side of the
         # edge the anchor was on, and find_neighbors' from_id/to_id contract
@@ -317,15 +340,21 @@ class KuzuGraphStore:
 
         seen: set[str] = set()
         buckets: list[list[dict[str, Any]]] = []
+        params: dict[str, Any] = {"id": node_id}
+        where_sql = ""
+        if space_set is not None:
+            params["spaces"] = sorted(space_set)
+            where_sql = " WHERE m.space_id IN $spaces"
         for arrow, is_out in passes:
             q = (
-                f"MATCH (n:OntologyNode {{node_id: $id}}){arrow}(m:OntologyNode) "
+                f"MATCH (n:OntologyNode {{node_id: $id}}){arrow}(m:OntologyNode)"
+                f"{where_sql} "
                 "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
             )
-            r = self._conn.execute(q + f" LIMIT {int(limit)}", {"id": node_id})
+            r = self._conn.execute(q + f" LIMIT {int(limit)}", params)
             bucket: list[dict[str, Any]] = []
             self._collect_1hop(
-                r, node_id, is_out, bucket, seen, pack_set, include_unpackaged
+                r, node_id, is_out, bucket, seen, pack_set, include_unpackaged, space_set
             )
             buckets.append(bucket)
 
@@ -353,6 +382,7 @@ class KuzuGraphStore:
         seen: set[str],
         pack_set: set[str] | None,
         include_unpackaged: bool,
+        space_set: set[str] | None = None,
     ) -> None:
         """Drain one directed 1-hop result set into ``results`` (dedup by node)."""
         while r.has_next():
@@ -363,6 +393,12 @@ class KuzuGraphStore:
             # m.space_id folded in so neighbour props match get_node's shape.
             props = dict(_merge_space(_parse(props_raw), m_space))
             props.setdefault("id", nid)
+            if space_set is not None and not _space_passes(props, space_set):
+                # Redundant for the common case (already pushed into the
+                # Cypher WHERE above, ahead of LIMIT) — kept as
+                # defense-in-depth for the same _merge_space precedence edge
+                # case documented in _sql_graph_base.py's _expand.
+                continue
             if pack_set is not None:
                 # `node_id` is always the anchor side of this 1-hop query (the
                 # caller already verified it passes — once up front in

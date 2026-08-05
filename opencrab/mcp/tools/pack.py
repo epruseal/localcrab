@@ -152,6 +152,20 @@ def _ingest_into_pack(
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
         meta["pack_id"] = pack_id
+        # issue #52 follow-up: the legacy branch below (text_as_node=False)
+        # writes this same `meta` into both the vector store (hybrid.ingest)
+        # and doc_sources (mongo.upsert_source) with no `space` tag, so
+        # spaces-filtered queries could never match it. The text_as_node=True
+        # branch a few lines down already tags its TextUnit node
+        # `space="evidence"` — this is the same kind of content (raw
+        # ingested text), so default it to the same space here for
+        # consistency, while still letting an explicit caller-supplied
+        # `metadata["space"]` (e.g. apps/api/main.py's IngestRequest.metadata,
+        # which already passes arbitrary caller metadata straight through)
+        # win. Existing rows written before this change remain untagged —
+        # see the space-filter warning in HybridQuery.query() and #52's
+        # backfill note.
+        meta.setdefault("space", "evidence")
 
         if text_as_node:
             # Materialise text as a 9-space evidence/TextUnit graph node so it
