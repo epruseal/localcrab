@@ -285,28 +285,54 @@ class TestEdgeNeedsBothSpacesToValidate:
 class TestUidDiscriminators:
     """헬퍼마다 uid 앞에 붙이는 **판별자**가 팩 안의 id 충돌을 막는다.
 
-    `self.uid('resource', slug)` 의 `'resource'` 를 빈 문자열로 바꾸는 변이가
-    9 개 헬퍼 전부에서 살아남았다(2026-08-05). 전부 빈 문자열이 되면 같은 slug 를 쓴
-    서로 다른 space 의 노드가 **같은 id** 가 되어 뒤에 온 쪽이 조용히 사라진다
-    (`node()` 는 이미 등록된 id 를 그냥 반환한다).
+    판별자가 비면 같은 slug 를 쓴 서로 다른 space 의 노드가 **같은 id** 가 되어 뒤에
+    온 쪽이 조용히 사라진다(`node()` 는 이미 등록된 id 를 그냥 반환한다).
+
+    **처음에는 "8개 헬퍼에 같은 slug 를 주고 id 가 전부 다른지" 로 썼는데 그게 틀렸다.**
+    판별자 **하나만** 비어도 나머지 7개가 그대로라 id 는 여전히 전부 다르다. 즉 그
+    검사가 잡는 것은 8곳이 동시에 바뀌는 복합 변이뿐인데, 스윕 도구는 복합 변이를
+    생성하지 않는다고 스스로 명시했다 — 스윕이 만들 수 없는 입력만 덮은 셈이다
+    (적대 검증 지적, 2026-08-05: 8개 판별자를 하나씩 비우는 변이가 전부 생존).
+    **한 자리 변이로 죽도록** 헬퍼별 절대 id 를 못박는다.
     """
 
-    HELPERS = ["resource", "subject", "concept", "claim",
-               "community", "outcome", "lever", "policy"]
+    # slug "동일슬러그", 팩 slug "t" 기준 실측값. uuid5 라 결정적이다.
+    EXPECTED_IDS = {
+        "resource": "a345c018-d97c-5ff7-b77f-4a4b811fd660",
+        "subject": "2bc34ed5-3822-58e9-bbb0-c2988ee1a83b",
+        "concept": "9fea1a26-c1d9-5adf-86e2-161da5b87035",
+        "claim": "7c8c3172-752b-53ce-9cc9-61adca71bdd6",
+        "community": "ccfdd8d1-ef45-5bc8-96fd-d0170571439c",
+        "outcome": "b146f873-4c95-57d8-9343-8f5830d9b206",
+        "lever": "d6b87152-6575-5eaf-a813-d49658af880f",
+        "policy": "8623978d-e9fb-5e9b-9a1f-48d2c12354ea",
+    }
 
-    def test_same_slug_in_different_spaces_gets_different_ids(self, pack):
-        ids = {h: getattr(pack, h)("동일슬러그", f"{h} 라벨") for h in self.HELPERS}
-        assert len(set(ids.values())) == len(self.HELPERS), \
-            f"판별자가 없으면 충돌한다: {ids}"
-        assert len(pack.nodes) == len(self.HELPERS), "충돌하면 노드가 조용히 사라진다"
+    @pytest.mark.parametrize("helper", sorted(EXPECTED_IDS))
+    def test_helper_id_is_pinned(self, pack, helper):
+        """한 자리만 바뀌어도 여기서 죽는다."""
+        assert getattr(pack, helper)("동일슬러그", "라벨") == self.EXPECTED_IDS[helper]
+
+    def test_pinned_ids_are_all_distinct(self, pack):
+        """위 고정값들이 서로 달라야 판별자가 제 역할을 한다(비공허성 보증)."""
+        assert len(set(self.EXPECTED_IDS.values())) == len(self.EXPECTED_IDS)
 
     def test_edge_uid_does_not_collide_with_node_uid(self, pack):
         """엣지 id 는 `uid('edge', src, rel, tgt)` 다 — 판별자가 없으면 노드와 겹칠 수 있다."""
         r = pack.resource("d", "문서")
-        e = pack.node("e", "E", "Evidence", "evidence")
+        e = pack.node("ev", "E", "Evidence", "evidence")
         pack.edge(r, e, "contains")
+        assert pack.edges[0]["id"] == "19ac6ed5-2a73-5965-86d4-63e3599be869"
         assert pack.edges[0]["id"] not in {n["id"] for n in pack.nodes}
-        assert pack.edges[0]["id"] == pack.uid("edge", r, "contains", e)
+
+    def test_node_returns_the_id_it_registered(self, pack):
+        """`node()` 의 `return nid` 를 지워도 아무도 안 죽었다.
+
+        기존 검사가 `e = pack.node(...)` 로 받아 **기대값도 같은 e 로** 계산해서
+        자기정합이었다. 반환값은 헬퍼·`ev()`·호출자 전부가 의존하는 계약이다.
+        """
+        assert pack.node("zz", "Z", "Concept", "concept") == "zz"
+        assert pack.node("zz", "다시", "Concept", "concept") == "zz", "중복 등록도 id 를 돌려준다"
 
 
 class TestEv:
@@ -832,6 +858,23 @@ class TestDiagnosticsReportRealNumbers:
         assert "concept→evidence" in out, "위반·치환 줄에 공간쌍이 나와야 한다"
         assert "정합불가라벨" in out, "치환 줄에 원본 라벨이 나와야 한다"
         assert "node_type='TextUnit'" in out, "함정 줄에 문제의 node_type 이 나와야 한다"
+
+    def test_fix_detail_line_shows_the_pair_in_the_edge_direction(self, pack, capsys):
+        """FIX 상세줄의 공간쌍 방향을 **그 줄만 특정해** 못박는다.
+
+        위 검사는 `"concept→evidence" in out` 인데 그 부분문자열을 **grammar 위반 줄이
+        대신 공급**한다. 그래서 FIX 줄의 `(ss, tt)` 를 `(tt, ss)` 로 뒤집는 변이가
+        135 건 통과한 채 살아남았다(적대 검증 실증, 2026-08-05).
+        방향이 뒤집히면 운영자가 반대쪽 공간쌍을 고치러 간다.
+        """
+        pack.node("a", "A", "Concept", "concept")
+        pack.node("b", "B", "Evidence", "evidence")
+        pack.edge("a", "b", "정합불가라벨")           # FIX 치환만 발생(위반 아님)
+        pack.validate()
+        fix_block = capsys.readouterr().out.split("자동치환(FIX)")[1]
+        line = next(ln for ln in fix_block.splitlines() if "정합불가라벨" in ln)
+        assert "concept→evidence" in line, f"엣지 방향 그대로여야 한다: {line}"
+        assert "evidence→concept" not in line
 
     def test_detail_lines_are_capped_at_eight(self, pack, capsys):
         """상위 8건만 나열한다. 캡이 바뀌면 운영자가 보는 정보량이 조용히 달라진다."""

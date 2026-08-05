@@ -463,12 +463,20 @@ def run_tests(clone: Path, tests: tuple[str, ...]) -> int:
 
 def _assert_tests_import_the_module(clone: Path, module: str,
                                     tests: tuple[str, ...]) -> None:
-    """테스트가 **정말 그 모듈을 쓰는지** 확인한다. 아니면 죽는다.
+    """테스트 파일에 **그 모듈의 import 문이 있는지** 확인한다. 없으면 죽는다.
 
     `PACK_SUITES` 는 등록을 강제하지만 대응이 맞는지는 강제하지 않았다. 적대 검증이
     실증했다(2026-08-05): `jsonl_io` 변이를 `normalize` 테스트로 돌리면
     `총 10 KILLED 0 SURVIVED 10` 이 조용히 나온다. 사람은 그 0 을 "테스트가 약하다"로
     읽지 "배선이 틀렸다"로 읽지 않는다 — RC1 과 같은 계열의 구멍이다.
+
+    **이 검사의 한계를 정직하게 적어 둔다.** 보는 것은 import 문의 존재뿐이고
+    "그 모듈을 실제로 검사하는가"는 보증하지 않는다. 적대 검증이 30개 오조합 중 3개가
+    통과함을 실증했다(2026-08-05): `jsonl_io x test_pack_build`(후자가
+    `iter_jsonl` 을 쓴다), `schema x test_pack_{build,normalize}`. 미사용 import 한
+    줄을 넣어도 통과한다. 사용 여부까지 올려도 위 세 조합은 실제 사용이라 안 닫힌다 —
+    구문 검사로는 여기까지다. 그래서 아래 `sweep()` 이 **경험적 게이트**(KILLED 0 이면
+    배선을 의심하라)를 따로 둔다.
     """
     dotted = module.removesuffix(".py").replace("/", ".")
     tail = dotted.rsplit(".", 1)[-1]
@@ -526,6 +534,12 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
                       f"hung={len(hung)} survived={len(survived)}", flush=True)
     finally:
         target.write_text(orig_src)
+
+    # 경험적 배선 게이트. 구문 검사(import 문 존재)로는 오매핑을 다 못 막으므로
+    # 결과로 한 번 더 본다 — 한 종도 못 죽였다면 그 테스트는 이 모듈을 안 보고 있다.
+    if ops and killed == 0:
+        print(f"  ⚠ 배선 의심: {module} 변이를 {' '.join(tests)} 가 한 종도 죽이지 못했다. "
+              f"오매핑이 아닌지 확인하라.", flush=True)
 
     res = {"module": module, "tests": list(tests), "total": len(ops),
            "killed": killed, "broken": broken, "hung": hung, "invalid": invalid,
