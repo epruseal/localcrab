@@ -354,6 +354,14 @@ class GraphStoreExtended(Protocol):
         ``limit`` even with the space/pack_id pushdown above. Use
         ``count_exported_nodes`` instead, which applies the identical
         predicate with no LIMIT.
+
+        ``limit <= 0`` (issue #120): every implementation returns ``[]``
+        immediately, without issuing a query. This is the pinned contract
+        for both ``limit=0`` (0 rows requested -> 0 rows returned, checked
+        BEFORE any row is collected -- Kuzu's ``pack_id`` branch used to
+        collect one row before checking) and negative ``limit`` (which has
+        no natural "N rows" meaning; treating it as unbounded would be a
+        footgun -- e.g. SQLite maps a bound ``LIMIT -1`` to "no limit").
         """
         ...
 

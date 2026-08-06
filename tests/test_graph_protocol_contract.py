@@ -243,6 +243,49 @@ class TestExtendedMethodsNormal:
 
 
 # ---------------------------------------------------------------------------
+# issue #120: export_nodes' three implementations (SQL backend shared by
+# local/pg, Kuzu's no-pack_id branch, Kuzu's pack_id branch) must all treat
+# ``limit <= 0`` as "return nothing", checked BEFORE any row is collected --
+# not after (Kuzu's pack_id branch used to append its first match, then
+# check the limit, so limit=0 still returned 1 row). Negative limit gets the
+# same "return nothing" treatment, since it otherwise has backend-specific
+# meaning (e.g. SQLite maps a bound LIMIT -1 to "unlimited").
+# ---------------------------------------------------------------------------
+
+
+class TestExportNodesLimitContract:
+    def test_limit_zero_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+
+        assert store.export_nodes(limit=0) == []
+
+    def test_limit_zero_with_pack_id_returns_empty_list(self, backend):
+        """Pins the exact issue #120 regression: Kuzu's pack_id branch
+        appended its first match before checking the limit."""
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {"pack_id": "packA"})
+        store.upsert_node("Doc", "a1", {"pack_id": "packA"})
+
+        assert store.export_nodes(pack_id="packA", limit=0) == []
+
+    def test_negative_limit_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+
+        assert store.export_nodes(limit=-1) == []
+
+    def test_negative_limit_with_pack_id_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {"pack_id": "packA"})
+        store.upsert_node("Doc", "a1", {"pack_id": "packA"})
+
+        assert store.export_nodes(pack_id="packA", limit=-1) == []
+
+
+# ---------------------------------------------------------------------------
 # Normal — Neo4j's 7 newly-implemented extended methods (mocked session)
 # ---------------------------------------------------------------------------
 
