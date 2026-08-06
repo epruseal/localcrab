@@ -240,6 +240,7 @@ class Neo4jStore:
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Find neighboring nodes up to *depth* hops.
@@ -258,6 +259,13 @@ class Neo4jStore:
         include_unpackaged:
             When ``pack_ids`` is set, also allow nodes/edges with no
             ``pack_id`` property (legacy data).
+        spaces:
+            Optional space allow-list (issue #52). When set, every node
+            along the path (anchor included) must have ``n.space IN
+            spaces`` — strict membership, no "include unspaced" escape
+            hatch (matches the BM25/vector legs' semantics). ``upsert_node``
+            writes ``space`` as a plain node property here, so this pushes
+            straight into the WHERE clause, same as ``pack_ids``.
         """
         self._require_available()
 
@@ -268,6 +276,7 @@ class Neo4jStore:
             limit=limit,
             pack_ids=pack_ids,
             include_unpackaged=include_unpackaged,
+            spaces=spaces,
         )
 
         with self._session() as session:
@@ -292,6 +301,7 @@ class Neo4jStore:
         limit: int,
         pack_ids: list[str] | None,
         include_unpackaged: bool,
+        spaces: list[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Pure helper that builds the Cypher query string and parameters.
 
@@ -324,6 +334,16 @@ class Neo4jStore:
                 where_clauses.append(
                     "ALL(r IN relationships(path) WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
                 )
+
+        if spaces:
+            # Strict membership, no "include unspaced" escape hatch (matches
+            # the BM25/vector legs — issue #52). `space` is a plain node
+            # property (see upsert_node's `props["space"] = space_id`), so
+            # this is a direct WHERE push, same shape as pack_ids above.
+            params["spaces"] = list(spaces)
+            where_clauses.append(
+                "ALL(n IN nodes(path) WHERE n.space IN $spaces)"
+            )
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 

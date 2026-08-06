@@ -8,11 +8,14 @@ and validation is skipped (schema-optional pattern).
 
 from __future__ import annotations
 
+import logging
 from functools import cache
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 SCHEMAS_DIR = Path(__file__).parent / "types"
 
@@ -39,8 +42,23 @@ def load_type_schema(node_type: str) -> dict[str, Any] | None:
 
     Returns None if no schema file exists for that type.
     The result is cached after the first load.
+
+    Warns when the loaded schema has a legacy shape (top-level `required`/
+    `optional` lists, no `properties` mapping) -- consumers such as
+    grammar.validator.validate_node_properties only read `properties`, so a
+    legacy schema silently enforces nothing. See opencrab/schemas/pack_registry.py
+    (install_pack migration) for the fix path: reinstalling the owning pack
+    regenerates the file in the current shape.
     """
-    return load_yaml_schema(SCHEMAS_DIR, node_type)
+    schema = load_yaml_schema(SCHEMAS_DIR, node_type)
+    if schema is not None and "properties" not in schema and ("required" in schema or "optional" in schema):
+        logger.warning(
+            "Type schema '%s' has a legacy shape (required/optional without "
+            "properties); required-field and enum checks will silently no-op "
+            "for this type. Reinstall the owning schema pack to migrate it.",
+            node_type,
+        )
+    return schema
 
 
 def list_registered_types() -> list[str]:

@@ -456,7 +456,37 @@ class HybridQuery:
             warnings.append(
                 "spaces filter: vectors ingested before this fix carry no 'space' "
                 "metadata and are excluded from the vector search leg until a "
-                "backfill runs (see issue #51); BM25/FTS legs are unaffected."
+                "backfill runs (see issue #51); BM25 leg is unaffected (reads "
+                "doc_nodes.space, a real column builder.add_node has always "
+                "populated)."
+            )
+            # #52 follow-up (verifier, round 3): doc_sources (the
+            # FTS/keyword_search leg's table) has NO space column — space is
+            # read from the JSON `metadata` blob (see
+            # LocalSQLDocStore.keyword_search). Only ONE writer is fixed by
+            # this change: opencrab/mcp/tools/pack.py's legacy ingestion path
+            # (text_as_node=False) now defaults meta.setdefault("space",
+            # "evidence") before writing the SAME meta dict to both
+            # hybrid.ingest (vector leg) and mongo.upsert_source (this leg).
+            # apps/api/main.py's REST /api/ingest endpoint does NOT go
+            # through pack.py at all — it calls hybrid.ingest +
+            # docs.upsert_source directly with no space default (main.py
+            # :199-204, :507-521) — so a REST caller who doesn't set
+            # metadata["space"] themselves still produces an untagged row
+            # today. That surface is intentionally out of this fix's scope
+            # (#66 left it unwired too; tracked under #110's backfill
+            # instead). So the accurate claim is narrower than "everything
+            # ingested since this fix is tagged": only rows written via
+            # pack.py's ingest tools are tagged by default; rows written
+            # before this fix OR via the REST endpoint without an explicit
+            # space are still excluded until backfilled/fixed there.
+            warnings.append(
+                "spaces filter: doc_sources rows written before this fix, or "
+                "via apps/api/main.py's REST ingest endpoint without an "
+                "explicit 'space' in metadata, carry no 'space' tag and are "
+                "excluded from the FTS/keyword leg until a backfill runs (see "
+                "issue #52/#110); rows ingested through pack.py's ingest tools "
+                "are tagged by default and match normally."
             )
 
         # --- Stage 1: Vector similarity search ---
@@ -498,6 +528,7 @@ class HybridQuery:
             graph_results = self._graph_expand(
                 anchor_ids, profile.graph_depth, profile.graph_limit,
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+                spaces=spaces,
             )
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
@@ -650,6 +681,11 @@ class HybridQuery:
 
         백엔드-중립: doc store가 ``supports_keyword`` capability를 노출할 때만 사용.
         미지원·예외 시 빈 리스트로 graceful fallback(기존 하이브리드 무손상).
+
+        issue #52: ``spaces`` was accepted here but never forwarded to
+        ``keyword_search`` — this leg silently ignored the caller's space
+        filter. Now forwarded straight through; the doc store pushes it into
+        its own SQL WHERE clause (see ``LocalSQLDocStore.keyword_search``).
         """
         ds = self._doc_store
         if ds is None or not getattr(ds, "supports_keyword", False):
@@ -660,6 +696,7 @@ class HybridQuery:
                 pack_ids=pack_ids,
                 include_unpackaged=include_unpackaged,
                 limit=limit,
+                spaces=spaces,
             )
         except Exception as exc:
             logger.warning("FTS keyword search error: %s", exc)
@@ -795,12 +832,20 @@ class HybridQuery:
         limit: int,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[QueryResult]:
         """Expand graph neighbourhood from anchor node IDs.
 
         Uses at most 3 anchors for depth > 1 (multi-hop) to keep result sets
         manageable. Edge-type weights adjust the baseline score; a per-hop
         decay of 0.85 reduces scores for deeper neighbours.
+
+        issue #52: this method previously had no ``spaces`` parameter at
+        all — the graph leg silently ignored the caller's space filter and
+        mixed in neighbours from every space. Now pushed straight into
+        ``find_neighbors`` (real ``space``/``space_id`` column or property
+        on every backend, so no post-filter-after-LIMIT class of bug — see
+        each store's ``find_neighbors`` docstring).
         """
         if not self._neo4j.available:
             return []
@@ -812,9 +857,17 @@ class HybridQuery:
 
         for anchor_id in anchor_ids[:max_anchors]:
             try:
-                # Only forward pack kwargs when one is active so older graph
-                # store stubs (without the new signature) keep working.
-                extra: dict[str, Any] = {}
+                # pack_ids/include_unpackaged stay conditional (pre-existing
+                # pattern, out of #52's scope — see #54 for why conditional
+                # kwarg-forwarding on an unsupported *active* filter is a
+                # smell, not a feature: it lets a filter silently vanish
+                # instead of failing loud). spaces is forwarded
+                # unconditionally: every find_neighbors implementation in
+                # this tree now has the parameter (see _sql_graph_base.py /
+                # kuzu_graph_store.py / neo4j_store.py), so there is no
+                # "older stub" left to protect — a stub that still lacks it
+                # is a test double that should be fixed, not accommodated.
+                extra: dict[str, Any] = {"spaces": spaces}
                 if pack_ids:
                     extra["pack_ids"] = pack_ids
                     extra["include_unpackaged"] = include_unpackaged

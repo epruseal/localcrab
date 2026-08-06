@@ -191,6 +191,7 @@ class GraphStore(Protocol):
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """BFS neighbour traversal up to ``depth`` hops from ``node_id``.
 
@@ -210,6 +211,13 @@ class GraphStore(Protocol):
             dropped; an edge with no ``pack_id`` survives only when both
             endpoints pass the node filter. The anchor itself must also
             pass, or the whole call returns ``[]``.
+        spaces: optional space allow-list (issue #52). Strict membership —
+            unlike ``pack_ids`` there is no "include unspaced" mode. Every
+            node visited (anchor included) must have its space in this
+            list, or the whole call returns ``[]``. Pushed into the
+            store's native query ahead of any LIMIT on every backend
+            (``space``/``space_id`` is a real column/property everywhere,
+            unlike ``pack_id`` which is JSON-blob-only on Kuzu).
 
         Returns a list of dicts, each shaped:
             {"properties": dict, "labels": [str], "relation_type": str,

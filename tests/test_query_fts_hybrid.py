@@ -144,7 +144,7 @@ class _FakeStoreRaises:
 
 class _FakeStoreOK:
     supports_keyword = True
-    def keyword_search(self, query, pack_ids=None, include_unpackaged=False, limit=20):
+    def keyword_search(self, query, pack_ids=None, include_unpackaged=False, limit=20, spaces=None):
         return [{"source_id": "x", "node_id": "x", "text": "JASO M345 ...",
                  "metadata": {"pack_id": "oil-standards-auto-moto", "node_id": "x"},
                  "score": 1.0}]

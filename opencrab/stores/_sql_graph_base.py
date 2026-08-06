@@ -122,7 +122,13 @@ import logging
 from collections import deque
 from typing import Any
 
-from opencrab.stores._graph_common import _as_dict, _edge_passes, _merge_space, _node_passes
+from opencrab.stores._graph_common import (
+    _as_dict,
+    _edge_passes,
+    _merge_space,
+    _node_passes,
+    _space_passes,
+)
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
 logger = logging.getLogger(__name__)
@@ -337,22 +343,26 @@ class _SqlGraphStoreBase(abc.ABC):
         out: bool,
         pack_set: set[str] | None = None,
         include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> list[tuple[str, str, str, Any]]:
         """Default per-node candidate-edge fetch (one query, LIMIT cap).
         Column order is always (other_type, other_id, relation, properties)
         regardless of direction, so callers never branch on direction to
         read a row.
 
-        When ``pack_set`` is given, the pack filter (``_pack_where``) is
-        pushed into this query's WHERE clause — joined against
-        ``graph_nodes`` for the "other" endpoint — so ``LIMIT :cap`` applies
-        AFTER filtering, not before (issue #62)."""
+        When ``pack_set``/``space_set`` are given, their filters
+        (``_pack_where`` / ``space_id IN (...)``) are pushed into this
+        query's WHERE clause — joined against ``graph_nodes`` for the
+        "other" endpoint — so ``LIMIT :cap`` applies AFTER filtering, not
+        before (issue #62, and issue #52 for the space leg). Unlike
+        ``pack_id`` (a JSON property), ``space_id`` is a real column, so no
+        JSON extraction helper is needed — a plain ``IN`` clause suffices."""
         edges = self._table("graph_edges")
         anchor_col = "from_id" if out else "to_id"
         other_type_col = "to_type" if out else "from_type"
         other_id_col = "to_id" if out else "from_id"
 
-        if pack_set is None:
+        if pack_set is None and space_set is None:
             sql = (
                 f"SELECT {other_type_col}, {other_id_col}, relation, properties"
                 f" FROM {edges} WHERE {anchor_col}=:nid LIMIT :cap"
@@ -360,17 +370,27 @@ class _SqlGraphStoreBase(abc.ABC):
             return self._fetch_all(sql, {"nid": node_id, "cap": cap})
 
         nodes = self._table("graph_nodes")
-        pack_where, pack_params = self._pack_where(
-            "n.properties", "e.properties", pack_set, include_unpackaged, "fe"
-        )
+        where_clauses: list[str] = []
+        params: dict[str, Any] = {"nid": node_id, "cap": cap}
+        if pack_set is not None:
+            pack_where, pack_params = self._pack_where(
+                "n.properties", "e.properties", pack_set, include_unpackaged, "fe"
+            )
+            where_clauses.append(pack_where)
+            params.update(pack_params)
+        if space_set is not None:
+            placeholders, space_params = self._in_placeholders(sorted(space_set), "fesp")
+            where_clauses.append(f"n.space_id IN ({placeholders})")
+            params.update(space_params)
+        extra_where = " AND ".join(where_clauses)
         sql = (
             f"SELECT e.{other_type_col}, e.{other_id_col}, e.relation, e.properties"
             f" FROM {edges} e"
             f" JOIN {nodes} n ON n.node_type=e.{other_type_col} AND n.node_id=e.{other_id_col}"
-            f" WHERE e.{anchor_col}=:nid AND {pack_where}"
+            f" WHERE e.{anchor_col}=:nid AND {extra_where}"
             f" LIMIT :cap"
         )
-        return self._fetch_all(sql, {"nid": node_id, "cap": cap, **pack_params})
+        return self._fetch_all(sql, params)
 
     def _prefetch_frontier(
         self,
@@ -379,13 +399,14 @@ class _SqlGraphStoreBase(abc.ABC):
         out: bool,
         pack_set: set[str] | None = None,
         include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """HOOK — default per-row prefetch (one query per frontier node,
         reproducing LocalGraphStore's historical behavior). PgGraphStore's
         adopter overrides this with a single unnest+LATERAL batch query (see
         module docstring)."""
         return {
-            fid: self._fetch_edges_for_node(fid, cap, out, pack_set, include_unpackaged)
+            fid: self._fetch_edges_for_node(fid, cap, out, pack_set, include_unpackaged, space_set)
             for fid in frontier_ids
         }
 
@@ -415,6 +436,7 @@ class _SqlGraphStoreBase(abc.ABC):
         pack_set: set[str] | None,
         include_unpackaged: bool,
         props_cache: dict[tuple[str, str], dict[str, Any]],
+        space_set: set[str] | None = None,
     ) -> None:
         """Consume one node's prefetched candidate edges for one direction."""
         is_out = direction == "out"
@@ -426,6 +448,16 @@ class _SqlGraphStoreBase(abc.ABC):
             other_props = props_cache.get((other_type, other_id))
             if not other_props:
                 continue
+            if space_set is not None:
+                # Redundant for the common case: SQL already filtered on the
+                # real `space_id` column ahead of LIMIT (see
+                # _fetch_edges_for_node). Kept as defense-in-depth for the one
+                # divergent case _merge_space documents — an explicit
+                # caller-supplied props["space"] wins over the column — so a
+                # node whose properties JSON disagrees with its column is
+                # still caught here rather than leaking cross-space.
+                if not _space_passes(other_props, space_set):
+                    continue
             if pack_set is not None:
                 # Provably redundant for SCALAR pack_id values only: SQL
                 # already applied this same policy (via _pack_where /
@@ -470,15 +502,26 @@ class _SqlGraphStoreBase(abc.ABC):
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """BFS neighbour traversal, processed one depth-level at a time (see
-        module docstring's "_prefetch_frontier / _batch_node_props HOOKS")."""
+        module docstring's "_prefetch_frontier / _batch_node_props HOOKS").
+
+        ``spaces`` (issue #52): strict space-membership filter, pushed into
+        the SQL WHERE clause ahead of LIMIT (``_fetch_edges_for_node``) —
+        same "filter before limit, not after" discipline as ``pack_ids``
+        (issue #62), and cheaper since ``space_id`` is a real column, not a
+        JSON property. No "include unspaced" escape hatch, matching the
+        BM25/vector legs' strict semantics."""
         self._require_available()
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        space_set: set[str] | None = set(spaces) if spaces else None
 
-        if pack_set is not None:
+        if pack_set is not None or space_set is not None:
             anchor_props = self._fetch_node_props_by_id(node_id)
             if not _node_passes(anchor_props or {}, pack_set, include_unpackaged):
+                return []
+            if not _space_passes(anchor_props or {}, space_set):
                 return []
 
         visited: set[str] = {node_id}
@@ -495,11 +538,13 @@ class _SqlGraphStoreBase(abc.ABC):
                     out_batch = self._prefetch_frontier(
                         expandable, limit, out=True,
                         pack_set=pack_set, include_unpackaged=include_unpackaged,
+                        space_set=space_set,
                     )
                 if direction in ("in", "both"):
                     in_batch = self._prefetch_frontier(
                         expandable, limit, out=False,
                         pack_set=pack_set, include_unpackaged=include_unpackaged,
+                        space_set=space_set,
                     )
 
             candidate_pairs: set[tuple[str, str]] = set()
@@ -521,7 +566,7 @@ class _SqlGraphStoreBase(abc.ABC):
                         self._expand(
                             "out", out_batch, current_id, current_depth, remaining,
                             visited, results, next_level, limit, pack_set,
-                            include_unpackaged, props_cache,
+                            include_unpackaged, props_cache, space_set,
                         )
 
                 if direction in ("in", "both"):
@@ -530,7 +575,7 @@ class _SqlGraphStoreBase(abc.ABC):
                         self._expand(
                             "in", in_batch, current_id, current_depth, remaining,
                             visited, results, next_level, limit, pack_set,
-                            include_unpackaged, props_cache,
+                            include_unpackaged, props_cache, space_set,
                         )
 
             level = next_level

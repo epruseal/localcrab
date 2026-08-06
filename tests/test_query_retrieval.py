@@ -61,7 +61,10 @@ def test_hybrid_query_expands_graph_from_bm25_anchor_for_relation_intent() -> No
         def __init__(self) -> None:
             self.calls: list[dict[str, int | str]] = []
 
-        def find_neighbors(self, node_id: str, direction: str = "both", depth: int = 1, limit: int = 50):
+        def find_neighbors(
+            self, node_id: str, direction: str = "both", depth: int = 1, limit: int = 50,
+            pack_ids=None, include_unpackaged: bool = False, spaces=None,
+        ):
             self.calls.append({"node_id": node_id, "depth": depth, "limit": limit})
             return [
                 {

@@ -86,6 +86,21 @@ def _edge_passes(
     return src_passes and dst_passes
 
 
+def _space_passes(props: dict[str, Any], space_set: set[str] | None) -> bool:
+    """Strict space-membership check (issue #52).
+
+    Unlike the pack filter, there is no "include unspaced" escape hatch here
+    — this mirrors the BM25 (``bm25.py``'s ``doc.get("space") not in
+    spaces``) and vector (``sqlite_vec_store.py``) legs, which both treat a
+    missing/foreign space as a hard exclude. ``props["space"]`` is expected
+    to already be folded in via ``_merge_space`` for the SQL/Kuzu backends
+    (native on Neo4jStore).
+    """
+    if not space_set:
+        return True
+    return props.get("space") in space_set
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     """psycopg2 auto-decodes JSONB into dict/list; tolerate str/None too."""
     if isinstance(value, dict):
