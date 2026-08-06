@@ -14,6 +14,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+import pytest
+
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
 
@@ -502,6 +504,131 @@ def test_count_exported_nodes_query_uses_space_index_not_full_scan():
     plan_text = " ".join(str(row) for row in plan)
     assert "SCAN graph_nodes" not in plan_text
     assert "idx_nodes_space" in plan_text
+
+
+def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap():
+    """issue #86: HybridQuery.keyword_search used to call
+    ``export_nodes(limit=_BM25_NODE_LIMIT)`` (50,000) and search only THOSE
+    rows in Python -- on a 252k-row corpus, ~80% of nodes were silently
+    unreachable by keyword search. This is #54's limit-before-filter class
+    applied to the keyword predicate instead of pack_id/space.
+
+    Seeds 60 "noise" nodes (no keyword match) inserted first, then 5
+    keyword-matching nodes inserted last -- if search_nodes truncated the
+    scan to some cap before matching (the old export_nodes-based approach,
+    with any cap smaller than 60), these 5 would sort past the boundary and
+    never be found. search_nodes pushes the keyword predicate into the SQL
+    WHERE clause instead, so it finds all 5 regardless of scan order or
+    corpus size."""
+    store = _store()
+    for i in range(60):
+        store.upsert_node("Item", f"noise{i:03d}", {"name": f"unrelated {i}"})
+    for i in range(5):
+        store.upsert_node("Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+
+    rows = store.search_nodes("needle", limit=10)
+
+    assert len(rows) == 5
+    assert all("needle" in r["props"]["name"] for r in rows)
+
+
+def test_search_nodes_space_filter_pushed_ahead_of_limit():
+    """spaces is pushed into the same WHERE clause as the keyword predicate
+    (both ahead of LIMIT), mirroring export_nodes' space pushdown (#54)."""
+    store = _store()
+    store.upsert_node("Item", "n-claim", {"name": "shared term"}, space_id="claim")
+    store.upsert_node("Item", "n-policy", {"name": "shared term"}, space_id="policy")
+
+    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["space"] == "claim"
+
+
+def test_search_nodes_escapes_like_wildcards():
+    """A literal ``%``/``_`` in the search keyword must be matched literally,
+    not interpreted as a SQL LIKE wildcard -- otherwise a keyword like
+    "50%" would match every row instead of only rows containing "50%"."""
+    store = _store()
+    store.upsert_node("Item", "n-1", {"name": "discount 50% today"})
+    store.upsert_node("Item", "n-2", {"name": "discount fifty percent today"})
+
+    rows = store.search_nodes("50%", limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["name"] == "discount 50% today"
+
+
+def test_search_nodes_limit_zero_returns_empty_not_unbounded():
+    """issue #86 boundary check (same class as issue #120's Mongo
+    ``.limit(0)`` surprise): binding ``limit`` straight into SQL ``LIMIT
+    :lim`` is dialect-dependent for non-positive values -- SQLite treats a
+    NEGATIVE limit as "no limit at all" (unbounded), and PostgreSQL raises
+    ``LIMIT must not be negative`` for the same input. search_nodes clamps
+    ``limit<=0`` to an empty result up front so both dialects agree and
+    neither a full unbounded scan nor a SQL error can happen."""
+    store = _store()
+    for i in range(5):
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=0) == []
+
+
+def test_search_nodes_negative_limit_returns_empty_not_unbounded_scan():
+    """The dangerous half of the above: SQLite's ``LIMIT -1`` means
+    UNBOUNDED, so a negative limit reaching the raw SQL unclamped would
+    silently return every matching row instead of erroring or returning
+    nothing -- the same shape of surprise issue #120 flagged for Mongo's
+    ``.limit(0)``. Seeds enough matching rows that "unbounded" and "empty"
+    are trivially distinguishable."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=-1) == []
+
+
+def test_search_nodes_field_injection_cannot_bypass_limit_or_leak_all_rows():
+    """issue #86 bot finding (SQL injection, P2 per the bot / higher per
+    reviewer): unlike ``keyword`` (a bound SQL parameter), each ``fields``
+    entry was interpolated directly into a JSON path expression
+    (``self._dialect.json_get``) with no escaping. A crafted field like
+    ``"x')) LIKE '%' OR 1=1) --"`` closes the surrounding parens early,
+    ORs in an always-true predicate, and comments out everything after it
+    -- including the ``LIMIT`` clause -- so every row is returned
+    regardless of ``limit``. ``fields`` is now validated against
+    ``KEYWORD_SEARCH_FIELDS`` before it touches any SQL, so this raises
+    ``ValueError`` instead of executing attacker-controlled SQL."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i}", {"name": f"row {i}"})
+
+    payload = ("x')) LIKE '%' OR 1=1) --",)
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("nomatch", limit=2, fields=payload)
+
+
+def test_search_nodes_rejects_field_with_apostrophe():
+    """A field name containing a plain apostrophe (not even a crafted
+    payload -- just a legitimate-looking typo) breaks out of the quoted
+    JSON path literal and previously crashed with
+    ``sqlite3.OperationalError`` instead of failing predictably. The
+    whitelist rejects it before it ever reaches SQL."""
+    store = _store()
+    store.upsert_node("Item", "n1", {"o'clock": "irrelevant"})
+
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("irrelevant", fields=("o'clock",))
+
+
+def test_search_nodes_empty_fields_returns_empty_not_a_sql_error():
+    """An empty ``fields`` tuple must not reach SQL as ``WHERE ()``
+    (invalid syntax) -- "search zero fields" has exactly one sane meaning
+    (nothing can ever match), so it short-circuits to ``[]``."""
+    store = _store()
+    store.upsert_node("Item", "n1", {"name": "anything"})
+
+    assert store.search_nodes("anything", fields=()) == []
 
 
 def test_upsert_nodes_batch_and_edges_batch():

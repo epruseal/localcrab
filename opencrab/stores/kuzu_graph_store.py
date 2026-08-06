@@ -24,11 +24,13 @@ from collections.abc import Iterator
 from typing import Any
 
 from opencrab.stores._graph_common import (
+    KEYWORD_SEARCH_FIELDS,
     _edge_passes,
     _merge_space,
     _node_passes,
     _normalize_space,
     _space_passes,
+    _validate_search_fields,
 )
 from opencrab.stores._json import parse_props as _parse
 
@@ -705,6 +707,71 @@ class KuzuGraphStore:
             for _ntype, props in self._scan_space_matching(space)
             if self._matches_pack_id(props, pack_id)
         )
+
+    def search_nodes(
+        self,
+        keyword: str,
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search of ``keyword`` across ``fields``
+        of every node, restricted to ``spaces`` if given (issue #86, the
+        same "LIMIT before filter" class ``_scan_space_matching``'s
+        ``pack_id`` branch fixed for #54's Kuzu port):
+        ``HybridQuery.keyword_search`` used to fetch only the first 50,000
+        rows via ``export_nodes`` and search only those in Python, silently
+        missing ~80% of a 252k-row corpus with no error.
+
+        ``spaces`` (a real ``space_id`` column, unlike the search fields
+        below) is pushed into the Cypher WHERE clause. The search fields
+        themselves live inside the JSON-serialized ``props`` blob, which
+        Cypher can't index into any more than it can for ``pack_id`` (see
+        ``_scan_space_matching``'s docstring) -- so this streams every
+        space-matching row with NO LIMIT clause and stops only once
+        ``limit`` keyword matches are found, i.e. LIMIT is applied AFTER
+        the keyword filter, not before.
+
+        ``limit <= 0`` short-circuits to ``[]`` without scanning (issue
+        #86 boundary check): the break condition below is
+        ``len(results) >= limit``, checked only AFTER appending a match, so
+        ``limit=0`` previously still returned the first match found (one
+        row, not zero) and any negative ``limit`` behaved like ``limit=1``
+        -- neither is "caller wants nothing back". Matches the same
+        ``limit<=0`` -> ``[]`` contract as the SQL backends' search_nodes
+        (see _sql_graph_base.py).
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- ``fields`` never reaches Cypher text here (it's
+        only ever used as a plain ``dict.get(f)`` key below, so an
+        arbitrary string is inert, not an injection vector), but the
+        validation still runs so a bad ``fields`` argument fails the SAME
+        way (loud ``ValueError``) on every backend rather than raising a
+        SQL error on the SQL backends and being silently accepted here.
+        Empty ``fields`` returns ``[]`` immediately: no field can ever
+        match, so there is nothing to search for."""
+        self._require_available()
+        if limit <= 0:
+            return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
+        kw_lower = keyword.lower()
+        where_clause = "WHERE n.space_id IN $spaces " if spaces else ""
+        params: dict[str, Any] = {"spaces": spaces} if spaces else {}
+        r = self._conn.execute(
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.node_type, n.space_id, n.props",
+            params,
+        )
+        results: list[dict[str, Any]] = []
+        while r.has_next():
+            ntype, space_id, props_raw = r.get_next()
+            props = _merge_space(_parse(props_raw), space_id)
+            if any(kw_lower in str(props[f]).lower() for f in fields if props.get(f)):
+                results.append({"props": props, "labels": [ntype]})
+                if len(results) >= limit:
+                    break
+        return results
 
     def export_edges(
         self,

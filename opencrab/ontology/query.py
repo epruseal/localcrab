@@ -992,32 +992,29 @@ class HybridQuery:
         if not self._neo4j.available:
             return []
 
-        # --- 로컬 모드: LocalGraphStore는 run_cypher()가 no-op이므로
-        #     export_nodes() + Python-side 키워드 필터로 대체한다.
+        # --- 로컬/PG/Kuzu 모드: 이 세 백엔드는 run_cypher()가 no-op이므로
+        #     search_nodes() 로 대체한다 -- keyword/space 필터를 각 백엔드의
+        #     SQL WHERE / Cypher WHERE 로 LIMIT 이전에 푸시다운한다 (issue #86:
+        #     이전에는 export_nodes(limit=_BM25_NODE_LIMIT) 로 먼저 5만 건만
+        #     가져온 뒤 그 안에서만 Python 으로 키워드/space 를 걸러, 25만 건
+        #     코퍼스의 약 80% 가 검색에서 영구히 제외됐다 -- #54 의
+        #     limit-before-filter 결함과 같은 클래스, export_nodes/
+        #     count_exported_nodes 가 아니라 search_nodes 라는 별도 메서드인
+        #     이유는 export_nodes 가 pack 추출용 범용 벌크 export 이고 이
+        #     키워드 검색과는 무관한 용도이기 때문).
         # NOTE: GraphStore Protocol(opencrab/stores/_graph_protocol.py)에는
-        # keyword_search 메서드가 없어 이 isinstance 분기를 아직 제거할 수 없다
-        # (R5는 그 Protocol에 이미 있는 7개 메서드만 다뤘다) — Stage 8에서 정리 예정.
+        # keyword_search/search_nodes 메서드가 없어 이 isinstance 분기를 아직
+        # 제거할 수 없다 (R5는 그 Protocol에 이미 있는 7개 메서드만 다뤘다) —
+        # Stage 8에서 정리 예정.
         from opencrab.stores.kuzu_graph_store import KuzuGraphStore  # noqa: PLC0415
         from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
-        if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore)):
-            kw_lower = keyword.lower()
-            search_fields = ["name", "description", "text", "title", "label", "summary"]
-            candidate_rows = self._neo4j.export_nodes(limit=_BM25_NODE_LIMIT)
-            results: list[dict[str, Any]] = []
-            for row in candidate_rows:
-                props = row.get("props", {})
-                labels = row.get("labels", [""])
-                # spaces 필터
-                if spaces and props.get("space") not in spaces:
-                    continue
-                for field in search_fields:
-                    val = props.get(field, "")
-                    if val and kw_lower in str(val).lower():
-                        results.append({"node": props, "label": labels[0] if labels else ""})
-                        break
-                if len(results) >= limit:
-                    break
-            return results
+        from opencrab.stores.pg_graph_store import PGGraphStore  # noqa: PLC0415
+        if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore, PGGraphStore)):
+            rows = self._neo4j.search_nodes(keyword, spaces=spaces, limit=limit)
+            return [
+                {"node": row.get("props", {}), "label": (row.get("labels") or [""])[0]}
+                for row in rows
+            ]
 
         # --- Neo4j(Docker) 모드: 기존 Cypher 경로 유지
         space_filter = ""

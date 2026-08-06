@@ -330,6 +330,36 @@ class TestKeywordSearchNeo4jPath:
         assert hybrid.keyword_search("x") == []
 
 
+class TestKeywordSearchPgRouting:
+    """issue #86: PGGraphStore was missing from the isinstance tuple that
+    routes keyword_search to the SQL-pushdown search_nodes() path, so
+    STORAGE_MODE=pg silently fell through to the "Neo4j(Docker) cypher
+    path" above instead -- which calls run_cypher(), a documented no-op
+    for every SQL backend (_SqlGraphStoreBase.run_cypher just logs a
+    warning and returns []). keyword_search() under PG mode always
+    returned [] with no error, a separate dead path from #86's main
+    50,000-node cap bug but caught by the same "check sibling call sites"
+    sweep -- both the Local/Kuzu path and the isinstance tuple that gates
+    it live in the one function this issue's fix touches."""
+
+    def test_pg_graph_store_routes_to_search_nodes_not_run_cypher(self) -> None:
+        from opencrab.stores.pg_graph_store import PGGraphStore
+
+        pg = MagicMock(spec=PGGraphStore)
+        assert isinstance(pg, PGGraphStore)  # sanity: spec mock satisfies isinstance
+        pg.available = True
+        pg.search_nodes = MagicMock(
+            return_value=[{"props": {"name": "n1"}, "labels": ["Concept"]}]
+        )
+        hybrid = HybridQuery(MagicMock(available=False), pg)
+
+        results = hybrid.keyword_search("term", spaces=["s1"], limit=5)
+
+        assert results == [{"node": {"name": "n1"}, "label": "Concept"}]
+        pg.search_nodes.assert_called_once_with("term", spaces=["s1"], limit=5)
+        pg.run_cypher.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _policy_filter — normal/error/edge
 # ---------------------------------------------------------------------------

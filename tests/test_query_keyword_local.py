@@ -150,6 +150,77 @@ def test_keyword_match_text_field(hybrid: HybridQuery, local_store: LocalGraphSt
     assert results[0]["node"]["text"] == "The ontology defines concepts."
 
 
+def test_keyword_search_finds_matches_beyond_any_node_scan_cap(
+    hybrid: HybridQuery, local_store: LocalGraphStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #86: keyword_search used to call
+    ``export_nodes(limit=_BM25_NODE_LIMIT)`` (50,000 by default) and search
+    only THOSE rows in Python -- a corpus larger than that cap had its tail
+    permanently unreachable by keyword search, silently (no error, just
+    fewer/no results). The fix pushes the keyword predicate into the
+    store's own query (SQL WHERE / Cypher+Python scan) instead of
+    truncating the candidate set first, so it no longer matters where in
+    scan order the matches fall -- proved here by patching the cap down to
+    10 (seeding 50,000 rows for a unit test isn't practical) and seeding 20
+    non-matching nodes first, then 5 matching nodes last: the old
+    limit-before-filter code would have scanned only the first 10 rows
+    (all noise) and found zero matches."""
+    import opencrab.ontology.query as query_module
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 10)
+    for i in range(20):
+        _insert_node(local_store, "Item", f"noise{i:03d}", {"name": f"unrelated {i}"})
+    for i in range(5):
+        _insert_node(local_store, "Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+
+    results = hybrid.keyword_search("needle", limit=10)
+
+    assert len(results) == 5
+    assert all("needle" in r["node"]["name"] for r in results)
+
+
+def test_keyword_search_matches_non_ascii_case_insensitively(
+    hybrid: HybridQuery, local_store: LocalGraphStore
+) -> None:
+    """issue #86 verifier finding: search_nodes()'s SQL predicate lowers the
+    stored value with SQLite's builtin ``LOWER()``, which is ASCII-only -- a
+    stored "FÜR" would stay "FÜR" (Ü untouched) and never match a "für"
+    keyword even though the keyword side IS lowered correctly in Python. The
+    OLD keyword_search lowered both sides in Python (Unicode-aware), so this
+    would have passed before the SQL-pushdown fix -- LocalGraphStore now
+    overrides SQLite's ``lower`` SQL function with Python's Unicode-aware
+    ``str.lower`` (_configure_connection) to keep parity."""
+    _insert_node(local_store, "Doc", "d-1", {"name": "Grundgesetz FÜR die Bundesrepublik"})
+    _insert_node(local_store, "Doc", "d-2", {"name": "unrelated"})
+
+    results = hybrid.keyword_search("für")
+
+    assert len(results) == 1
+    assert results[0]["node"]["name"] == "Grundgesetz FÜR die Bundesrepublik"
+
+
+def test_keyword_search_tolerates_non_string_property_values(
+    hybrid: HybridQuery, local_store: LocalGraphStore
+) -> None:
+    """issue #86 2nd verifier finding: a non-string value in a searched
+    field (e.g. a numeric "name") crashed the LOWER() UDF with
+    AttributeError, which sqlite3 surfaces as OperationalError out of the
+    whole query -- failing keyword_search for EVERY node in the store, not
+    just the offending one, regardless of the search keyword. The OLD
+    Python-only keyword_search (``str(val).lower()``), Kuzu's search_nodes
+    (``str(props[f]).lower()``), and SQLite's own builtin ``LOWER()``
+    (implicit text coercion, e.g. ``LOWER(123) = '123'``) all tolerate this;
+    the UDF must too."""
+    _insert_node(local_store, "Item", "n-int", {"name": 12345})
+    _insert_node(local_store, "Item", "n-float", {"name": 3.14159})
+    _insert_node(local_store, "Item", "n-str", {"name": "unrelated text"})
+
+    results = hybrid.keyword_search("123")
+
+    assert len(results) == 1
+    assert results[0]["node"]["name"] == 12345
+
+
 def test_keyword_result_format(hybrid: HybridQuery, local_store: LocalGraphStore) -> None:
     """반환 결과의 형식이 {'node': dict, 'label': str} 이어야 한다."""
     _insert_node(local_store, "Concept", "c-1", {"name": "knowledge graph"})
