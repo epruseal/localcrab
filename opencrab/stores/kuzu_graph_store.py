@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from collections import deque
+from collections.abc import Iterator
 from typing import Any
 
 from opencrab.stores._graph_common import (
@@ -563,32 +564,143 @@ class KuzuGraphStore:
             if cnt >= min_nodes
         ]
 
+    def _scan_space_matching(
+        self, space: str | None
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield ``(node_type, props)`` for every node matching ``space``,
+        with NO LIMIT clause -- shared by ``export_nodes`` and
+        ``count_exported_nodes`` for their ``pack_id`` branch, since
+        ``pack_id`` lives inside the JSON-serialized ``props`` blob and
+        can't be pushed into Cypher the way ``space_id`` (a real column,
+        see _NODE_DDL) can (issue #54).
+
+        Sharing this one scan is deliberate (audit finding #54-[3]): an
+        earlier version had ``export_nodes`` apply its LIMIT BEFORE the
+        pack_id filter while ``count_exported_nodes`` filtered pack_id
+        first -- same predicate, different order, so a caller could see an
+        accurate ``total`` alongside a truncated-to-empty ``nodes`` page
+        (e.g. ``total: 5, nodes: []``) whenever the first ``limit`` rows
+        Cypher happened to return were all wrong-pack_id. Both callers now
+        filter pack_id from this same unlimited stream before either one
+        applies its own truncation (``export_nodes`` slices to ``limit``
+        AFTER filtering; ``count_exported_nodes`` doesn't slice at all).
+
+        MEMORY (audit finding #54-[2]): this is a generator, not a list
+        build -- ``r.has_next()``/``r.get_next()`` pull one row at a time
+        from the underlying pybind11 query cursor (ladybug's
+        ``QueryResult``, see its docstring), so nothing here calls
+        ``get_all()`` or otherwise materializes the full result set in
+        Python. ``export_nodes`` additionally stops pulling (breaks out of
+        the loop that consumes this generator) as soon as it has ``limit``
+        pack_id-matching rows, so it never drains rows beyond what it
+        needs. ``count_exported_nodes`` has no such early exit by
+        definition -- an exact count must see every matching row -- so it
+        is the one caller that pays the full O(n) traversal (pre-existing
+        Kuzu pack_id characteristic per #54-[7]'s docstring, not new here).
+        MEASURED: RSS delta for count_exported_nodes(pack_id=...) fully
+        draining this generator over 50,000 rows was ~5.6MB (~112 bytes of
+        Python-level overhead per row, consistent with one dict at a time
+        rather than a buffered list of 50,000 dicts) -- not proportional
+        to holding the whole result set, and export_nodes' early-exit path
+        (limit=10 against the same 50,000 rows) added only ~0.5MB more.
+        """
+        where_clause = "WHERE n.space_id = $space " if space is not None else ""
+        params = {"space": space} if space is not None else {}
+        r = self._conn.execute(
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.node_type, n.space_id, n.props",
+            params,
+        )
+        while r.has_next():
+            ntype, space_id, props_raw = r.get_next()
+            yield ntype, _merge_space(_parse(props_raw), space_id)
+
+    @staticmethod
+    def _matches_pack_id(props: dict[str, Any], pack_id: str) -> bool:
+        return (
+            props.get("pack_id") == pack_id
+            or props.get("source") == pack_id
+            or props.get("source_id") == pack_id
+        )
+
     def export_nodes(
         self,
         pack_id: str | None = None,
         limit: int = 500_000,
+        space: str | None = None,
     ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the Cypher WHERE clause
+        ahead of LIMIT via the ``space_id`` node property -- a plain
+        equality check, since Kuzu keeps space in its own column (see
+        _NODE_DDL) just like the SQL backends (issue #54).
+
+        ``pack_id`` lives inside the JSON-serialized ``props`` blob, which
+        Cypher has no native way to index into, so it cannot be pushed into
+        the WHERE clause the way ``space`` can. To still apply ``limit``
+        AFTER the pack_id filter (not before -- audit finding #54-[3]: an
+        earlier version put LIMIT first here while ``count_exported_nodes``
+        already filtered pack_id first, so an accurate `total` could
+        disagree with a wrongly-truncated `nodes` page), this scans all
+        space-matching rows via ``_scan_space_matching`` (no LIMIT in that
+        Cypher), Python-filters by pack_id, and stops as soon as ``limit``
+        matches are collected -- not before."""
         self._require_available()
-        # space_id is returned so _merge_space can restore it into props: this
-        # backend keeps space in its own column (see _NODE_DDL), but the
-        # protocol's export shape carries it inside props.
-        r = self._conn.execute(
-            f"MATCH (n:OntologyNode) RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}"
-        )
-        results: list[dict[str, Any]] = []
-        while r.has_next():
-            row = r.get_next()
-            ntype, space_id, props_raw = row[0], row[1], row[2]
-            props = _merge_space(_parse(props_raw), space_id)
-            if pack_id is not None:
-                if (
-                    props.get("pack_id") != pack_id
-                    and props.get("source") != pack_id
-                    and props.get("source_id") != pack_id
-                ):
-                    continue
-            results.append({"props": props, "labels": [ntype]})
+        if pack_id is None:
+            # No JSON-blob filter needed -- space (if any) is already
+            # applied server-side, so LIMIT can stay in the Cypher query
+            # itself (cheapest path: the engine can stop scanning early).
+            where_clause = "WHERE n.space_id = $space " if space is not None else ""
+            params = {"space": space} if space is not None else {}
+            r = self._conn.execute(
+                f"MATCH (n:OntologyNode) {where_clause}"
+                f"RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}",
+                params,
+            )
+            results: list[dict[str, Any]] = []
+            while r.has_next():
+                ntype, space_id, props_raw = r.get_next()
+                results.append(
+                    {"props": _merge_space(_parse(props_raw), space_id), "labels": [ntype]}
+                )
+            return results
+        results = []
+        for ntype, props in self._scan_space_matching(space):
+            if self._matches_pack_id(props, pack_id):
+                results.append({"props": props, "labels": [ntype]})
+                if len(results) >= limit:
+                    break
         return results
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Exact match count for the same predicate ``export_nodes`` filters
+        on, applied in the SAME order (space pushed into Cypher, pack_id
+        filtered from an unlimited scan before any truncation -- see
+        ``export_nodes``' docstring and ``_scan_space_matching``), unbounded
+        by any LIMIT (issue #54: ``total`` must reflect the true match
+        count, not get truncated by a caller's display ``limit``).
+
+        When ``pack_id`` is None, this is a real Cypher ``count(n)`` pushdown
+        on ``space`` alone -- cheap, no row materialization. When ``pack_id``
+        IS given, an exact server-side count is not possible (same JSON-blob
+        limitation as ``export_nodes``), so this counts every
+        ``_scan_space_matching`` row that matches pack_id -- an O(n) scan,
+        pre-existing characteristic of Kuzu's pack_id filter, not new here
+        (tracked separately as a scalability follow-up).
+        """
+        self._require_available()
+        if pack_id is None:
+            where_clause = "WHERE n.space_id = $space " if space is not None else ""
+            params = {"space": space} if space is not None else {}
+            r = self._conn.execute(
+                f"MATCH (n:OntologyNode) {where_clause}RETURN count(n)", params
+            )
+            return int(r.get_next()[0])
+        return sum(
+            1
+            for _ntype, props in self._scan_space_matching(space)
+            if self._matches_pack_id(props, pack_id)
+        )
 
     def export_edges(
         self,

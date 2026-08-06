@@ -285,6 +285,97 @@ def test_export_nodes_pack_filter(store) -> None:
     assert rows[0]["props"]["id"] == "x1"
 
 
+def test_export_nodes_space_filter_pushed_ahead_of_limit(store) -> None:
+    """issue #54: space must be pushed into the Cypher WHERE clause ahead of
+    LIMIT, not Python-filtered after -- otherwise target-space rows sorting
+    past the limit boundary would be silently undercounted."""
+    for i in range(20):
+        store.upsert_node("X", f"a{i:02d}", {}, space_id="noise")
+    for i in range(5):
+        store.upsert_node("X", f"z{i:02d}", {}, space_id="concept")
+
+    rows = store.export_nodes(space="concept", limit=10)
+    assert len(rows) == 5
+    assert all(r["props"]["space"] == "concept" for r in rows)
+
+
+def test_export_nodes_pack_id_filter_pushed_ahead_of_limit(store) -> None:
+    """issue #54 audit finding [3]: export_nodes' pack_id filter must apply
+    BEFORE limit truncation, same as count_exported_nodes already does --
+    otherwise a caller can see an accurate `total` (from
+    count_exported_nodes) alongside a wrongly-truncated-to-empty `nodes`
+    page from export_nodes, e.g. `total: 5, nodes: []`, whenever the first
+    `limit` space-matching rows Cypher returns all happen to be the wrong
+    pack_id. Seeds 150 wrong-pack_id "noise" nodes first, then 5
+    right-pack_id nodes last, all in the same space, so with a small limit
+    the old LIMIT-before-pack_id-filter order would return zero matches."""
+    for i in range(150):
+        store.upsert_node("X", f"a{i:03d}", {"pack_id": "wrong"}, space_id="concept")
+    for i in range(5):
+        store.upsert_node("X", f"z{i:02d}", {"pack_id": "target"}, space_id="concept")
+
+    page = store.export_nodes(pack_id="target", space="concept", limit=10)
+    total = store.count_exported_nodes(pack_id="target", space="concept")
+
+    assert total == 5
+    assert len(page) == 5  # NOT [] -- total and the page must agree
+    assert all(r["props"]["pack_id"] == "target" for r in page)
+
+
+def test_count_exported_nodes_space_only_not_capped_by_limit(store) -> None:
+    """issue #54: count_exported_nodes(space=...) is a real Cypher count(n)
+    pushdown, so it must report the true match count even when it exceeds
+    export_nodes' own display limit."""
+    for i in range(30):
+        store.upsert_node("X", f"n{i:02d}", {}, space_id="concept")
+
+    page = store.export_nodes(space="concept", limit=5)
+    assert len(page) == 5
+
+    assert store.count_exported_nodes(space="concept") == 30
+
+
+def test_count_exported_nodes_with_pack_id_falls_back_to_exact_scan(store) -> None:
+    """pack_id can't be pushed into Cypher here (JSON blob props), so
+    count_exported_nodes(pack_id=..., space=...) scans every space-matching
+    row and Python-filters. This must still be EXACT -- not capped by any
+    limit -- even though it costs an O(n) scan instead of a cheap COUNT
+    (pre-existing Kuzu pack_id characteristic, not a new bug)."""
+    for i in range(30):
+        store.upsert_node("X", f"a{i:02d}", {"pack_id": "target"}, space_id="concept")
+    for i in range(10):
+        store.upsert_node("X", f"b{i:02d}", {"pack_id": "other"}, space_id="concept")
+
+    assert store.count_exported_nodes(pack_id="target", space="concept") == 30
+
+
+def test_count_exported_nodes_with_pack_id_has_no_limit_clause(store, monkeypatch) -> None:
+    """issue #54 audit finding [7]: an earlier version delegated to
+    export_nodes(pack_id=..., limit=500_000), which silently re-capped
+    `total` at 500,000 instead of the caller's original small `limit` --
+    same bug, just a bigger ceiling. 500k+ rows aren't practical to seed in
+    a unit test, so this proves the fix structurally instead: the Cypher
+    count_exported_nodes(pack_id=...) issues has no LIMIT clause at all, so
+    there is no ceiling of any size to hit."""
+    for i in range(5):
+        store.upsert_node("X", f"a{i:02d}", {"pack_id": "target"}, space_id="concept")
+
+    queries: list[str] = []
+    real_execute = store._conn.execute
+
+    def spy(query, *args, **kwargs):
+        queries.append(query)
+        return real_execute(query, *args, **kwargs)
+
+    monkeypatch.setattr(store._conn, "execute", spy)
+
+    total = store.count_exported_nodes(pack_id="target", space="concept")
+
+    assert total == 5
+    assert queries  # the spy actually intercepted at least one call
+    assert all("LIMIT" not in q for q in queries)
+
+
 def test_export_edges(store) -> None:
     store.upsert_node("A", "a", {})
     store.upsert_node("B", "b", {})

@@ -309,7 +309,37 @@ class TestExtendedMethodsNeo4jNormal:
         assert rows == [
             {"props": {"id": "a0", "pack_id": "packA"}, "labels": ["Doc", "OpenCrabNode"]}
         ]
-        assert mock_session.run.call_args[1] == {"pack_id": "packA"}
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": None}
+
+    def test_export_nodes_pushes_space_into_cypher_params(self):
+        """issue #54: space must reach the Cypher WHERE clause as a bound
+        parameter (real pushdown ahead of LIMIT via the ``n.space`` property
+        Neo4jStore writes on upsert), not a Python post-filter."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        store.export_nodes(pack_id="packA", space="concept")
+
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": "concept"}
+        cypher = mock_session.run.call_args[0][0]
+        assert "$space" in cypher
+
+    def test_count_exported_nodes_not_capped_by_limit(self):
+        """issue #54: count_exported_nodes is a real count(n) query with the
+        same predicate as export_nodes but no LIMIT -- it must report the
+        true match count, which a caller cannot get from
+        len(export_nodes(..., limit=N)) once N is smaller than the real
+        total."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = {"total": 3000}
+
+        total = store.count_exported_nodes(pack_id="packA", space="concept")
+
+        assert total == 3000
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": "concept"}
+        cypher = mock_session.run.call_args[0][0]
+        assert "count(n)" in cypher
+        assert "LIMIT" not in cypher
 
     def test_export_edges_filters_by_pack_id_on_endpoint(self):
         store, _driver, mock_session = _make_connected_neo4j()
