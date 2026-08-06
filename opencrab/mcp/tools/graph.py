@@ -263,8 +263,10 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Maximum number of `nodes` rows returned (default 100). Does NOT cap "
-                        "`total`, which always reflects the full match count."
+                        "Maximum number of `nodes` rows returned (default 100). WITH pack_id: "
+                        "does NOT cap `total`, which is the full match count regardless of "
+                        "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
+                        "IS capped at `limit` (total == len(nodes) always in that case)."
                     ),
                     "default": 100,
                 },
@@ -281,27 +283,41 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
-    When pack_id is given, this calls (in this order, matching the code
-    below) the graph store's count_exported_nodes(pack_id=..., space=...,
-    no LIMIT) first for ``total``, THEN export_nodes(pack_id=..., space=...,
-    limit=...) for the displayed page. All three concrete backends
-    (SQL-backed local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j,
-    ``pack_id`` too) into their native query ahead of ``limit`` — see each
-    backend's export_nodes and the shared contract in
-    opencrab/stores/_graph_protocol.py — so the returned rows are correct
-    before truncation instead of being Python-filtered after (issue #54;
-    same class of bug #62 fixed for find_neighbors' pack filter). ``total``
-    is deliberately NOT ``len(nodes)``: that would still be capped at
-    ``limit`` even with the pushdown fix, which is the actual bug #54
-    reported (a caller cannot tell "5 of 5 matches" from "5 of 3000
-    matches, truncated" from the row count alone) — count_exported_nodes
-    runs the identical filter with no LIMIT so ``total`` is the true match
-    count. This total/page split, and that ``total`` is never limit-capped,
-    is also stated in this tool's MCP ``description`` (the part of this
-    contract an MCP client actually sees -- this docstring is developer-
-    only and never reaches a client). When pack_id is absent, falls back to
-    the doc store's list_nodes (unchanged, pre-existing "total = len(page)"
-    behavior for that path -- not part of #54's pack_id+space scope).
+    WITH pack_id: this calls (in this order, matching the code below) the
+    graph store's count_exported_nodes(pack_id=..., space=..., no LIMIT)
+    first for ``total``, THEN export_nodes(pack_id=..., space=..., limit=...)
+    for the displayed page. All three concrete backends (SQL-backed
+    local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j, ``pack_id``
+    too) into their native query ahead of ``limit`` — see each backend's
+    export_nodes and the shared contract in opencrab/stores/_graph_protocol.py
+    — so the returned rows are correct before truncation instead of being
+    Python-filtered after (issue #54; same class of bug #62 fixed for
+    find_neighbors' pack filter). ``total`` is deliberately NOT
+    ``len(nodes)``: that would still be capped at ``limit`` even with the
+    pushdown fix, which is the actual bug #54 reported (a caller cannot
+    tell "5 of 5 matches" from "5 of 3000 matches, truncated" from the row
+    count alone) — count_exported_nodes runs the identical filter with no
+    LIMIT so ``total`` is the true match count.
+
+    WITHOUT pack_id: falls back to the doc store's list_nodes, and ``total``
+    IS ``len(nodes)`` — i.e. IS capped at ``limit``, same failure mode #54
+    reported, just in a different subsystem (doc store, not graph store).
+    Judged and left unfixed here (audit finding, MCP-visibility round):
+    structurally this is NOT impossible to fix the same way — the SQL-backed
+    doc stores (LocalSQLDocStore/PgDocStore, both opencrab/stores/
+    _sql_doc_base.py) could grow a real ``COUNT(*) WHERE space=...``
+    sibling to ``list_nodes``, mirroring count_exported_nodes exactly, and
+    MongoStore (docker mode) has ``count_documents()`` for the same
+    purpose. It is left out of this fix because it is a different
+    subsystem than #54's named scope (graph.py's pack_id+space path +
+    _sql_graph_base.py's export_nodes), touching three more backend files
+    with their own test suites — a same-sized second effort, not a small
+    extension of this one. Tracked as a follow-up, not silently accepted:
+    the MCP ``description`` and ``limit`` parameter description (the part
+    of this contract an MCP client actually sees -- this docstring is
+    developer-only and never reaches a client) both say plainly that
+    ``total`` is limit-capped in the no-pack_id case, so no caller is told
+    a false "always accurate" guarantee in the meantime.
 
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/
