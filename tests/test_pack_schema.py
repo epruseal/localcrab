@@ -6,7 +6,6 @@
 """
 
 import pathlib
-import re
 from unittest import mock
 
 import pytest
@@ -219,24 +218,22 @@ class TestDiagnosticIdentifiesTheFailingRow:
         del row[missing]
         with pytest.raises(PackSchemaError) as ei:
             validator(row)
-        # 계약은 셋이다 — **빠진 필드**, **부재라는 사실**, **실패 행 id** 가 그 순서로
-        # 한 줄 안에 붙어 있을 것.
+        # **문자열이 아니라 속성으로 본다.** 이 단언은 네 번 실패한 끝에 여기 왔다.
+        #   1차 `x in msg` 두 개        rid == missing 이면 서로를 충족 -> 한쪽 지워도 통과
+        #   2차 문구 통째로 요구         조사만 바꿔도(`가`->`이`) 깨짐. 계약이 아니라 잡음
+        #   3차 순서만 요구 + re.S       너무 느슨. 의미 역전·줄 분리가 통과
+        #   4차 의미 앵커(`없다`) + 간격 상한
+        #        -> **여전히 우회된다.** `... 가 없다? 아니다, 있다: ...` 가 통과했다
+        #           (적대 검증 실증, 2026-08-06). 부분문자열로 의미를 지킬 수 없다.
         #
-        # 이 단언은 두 번 실패한 끝에 여기 왔다.
-        #   1차: `x in msg` 두 개  -> rid == missing 이면 서로를 충족시켜 한쪽을 지워도 통과
-        #   2차: 문구 통째로 요구  -> 조사만 바꿔도(`가`->`이`) 깨진다. 계약이 아니라 잡음
-        #   3차: 순서만 요구(.*? + re.S) -> **너무 느슨했다.** 적대 검증이 실증한 통과 사례:
-        #          "필수 필드 'label' 는 정상, 행 'node-1' 는 실패"   (의미 역전)
-        #          "필수 필드 'label'\n진단 분리선\n행 id 'node-1'"    (줄 분리)
-        #        거짓 진단이 통과하면 이 검사는 아무것도 지키지 않는다.
-        #
-        # 그래서 **최소 의미 앵커**(`없다`)와 **간격 상한**을 둔다. 조사·어순 다듬기는
-        # 통과하되, 부재가 아닌 것을 부재처럼 쓰거나 두 값을 떼어놓으면 걸린다.
-        # `re.S` 는 쓰지 않는다 — 한 줄 안에 있어야 한 진단이다.
-        gap = r".{0,20}"
-        want = (rf"{re.escape(repr(missing))}{gap}없다{gap}{re.escape(repr(rid))}")
-        assert re.search(want, str(ei.value)), \
-            f"진단이 (빠진 필드, 부재, 실패 행 id) 를 한 줄에 담아야 한다: {ei.value}"
+        # 근본 원인은 단언이 아니라 **진단을 문자열로만 노출한 설계**였다. 예외가
+        # `missing_field`/`row_id` 를 속성으로 들고 있으면 문구를 어떻게 다듬든,
+        # 어떤 언어로 쓰든, 부정문을 넣든 이 계약은 흔들리지 않는다.
+        assert ei.value.missing_field == missing
+        assert ei.value.row_id == rid
+        # 사람이 읽는 문구에도 두 값이 있어야 한다(운영자가 로그만 보는 경우).
+        # 이건 **보조** 단언이다 — 구조화 속성이 정본이므로 문구는 느슨하게만 본다.
+        assert repr(missing) in str(ei.value) and repr(rid) in str(ei.value)
 
 
 class TestValidateNode:

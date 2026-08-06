@@ -287,7 +287,22 @@ def stray_top_level_keys(row: dict[str, Any]) -> dict[str, Any]:
 # ── 검증 ────────────────────────────────────────────────────────
 
 class PackSchemaError(ValueError):
-    """팩 레코드가 계약을 어겼다."""
+    """팩 레코드가 계약을 어겼다.
+
+    **진단은 문자열이 아니라 속성으로도 노출한다.** 소비자(적재기·게이트·리포트)가
+    "어느 행의 어느 필드가 문제인가"를 알아야 하는데, 메시지 문구를 파싱하게 하면
+    문구를 다듬는 순간 소비자가 깨진다. 실제로 그 계약을 문자열 검사로 지키려다
+    단언을 네 번 고쳤고, 마지막에도 부정문 우회가 남았다
+    (`... 가 없다? 아니다, 있다: ...` 가 통과, 2026-08-06 적대 검증).
+
+    문구는 사람이 읽는 것이고, `missing_field` / `row_id` 가 기계가 읽는 것이다.
+    """
+
+    def __init__(self, message: str, *, missing_field: str | None = None,
+                 row_id: Any = None) -> None:
+        super().__init__(message)
+        self.missing_field = missing_field
+        self.row_id = row_id
 
 
 def validate_node_props(nid: Any, props: dict[str, Any] | None) -> None:
@@ -322,7 +337,9 @@ def validate_node(row: dict[str, Any], *, allow_legacy_top_level: bool = True) -
     # 이지만 **접근 방식**은 계약이다 — "메시지일 뿐"이라고 단순화하지 마라.
     for key in ("id", "label", "node_type", "space"):
         if not row.get(key):
-            raise PackSchemaError(f"노드에 필수 필드 {key!r} 가 없다: {row.get('id')!r}")
+            raise PackSchemaError(
+                f"노드에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
+                missing_field=key, row_id=row.get("id"))
     if row["space"] not in ALL_SPACES:
         raise PackSchemaError(
             f"노드 {row['id']!r} 의 space {row['space']!r} 가 9-space 밖이다: {ALL_SPACES}")
@@ -342,7 +359,9 @@ def validate_edge(row: dict[str, Any]) -> None:
     """edges.jsonl 한 행을 검사한다."""
     for key in ("id", "source_id", "target_id", "label"):
         if not row.get(key):
-            raise PackSchemaError(f"엣지에 필수 필드 {key!r} 가 없다: {row.get('id')!r}")
+            raise PackSchemaError(
+                f"엣지에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
+                missing_field=key, row_id=row.get("id"))
     props = row.get("properties")
     if props is not None and not isinstance(props, dict):
         raise PackSchemaError(
@@ -358,7 +377,9 @@ def validate_chunk(row: dict[str, Any]) -> None:
     """chunks.jsonl 한 행을 검사한다."""
     for key in ("id", "document_id", "text"):
         if row.get(key) is None:
-            raise PackSchemaError(f"청크에 필수 필드 {key!r} 가 없다: {row.get('id')!r}")
+            raise PackSchemaError(
+                f"청크에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
+                missing_field=key, row_id=row.get("id"))
     meta = row.get("metadata")
     if meta is not None and not isinstance(meta, dict):
         raise PackSchemaError(
