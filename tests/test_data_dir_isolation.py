@@ -2,9 +2,12 @@
 
 The test suite must never be able to reach the user's real default data
 directory (``~/.local/share/localcrab``), even if an individual test forgets
-to isolate itself. ``tests/conftest.py`` forces ``LOCAL_DATA_DIR`` to a
-session-scoped temp dir for the whole run; this file pins that behaviour so a
-future test (or a reverted conftest change) cannot silently regress it.
+to isolate itself, AND even if the invoking shell has already exported
+``LOCAL_DATA_DIR`` to a real (possibly production) path before pytest starts
+— that is exactly the scenario a mere ``setdefault`` would have missed.
+``tests/conftest.py`` therefore *overrides* ``LOCAL_DATA_DIR`` unconditionally
+to a session-scoped temp dir; this file pins that behaviour so a future test
+(or a reverted conftest change) cannot silently regress it.
 
 The concrete reachable choke point is ``opencrab.mcp.tools._write_lock()``:
 every ``dispatch_tool`` call for a ``writes=True`` tool goes through it
@@ -19,13 +22,21 @@ import os
 from pathlib import Path
 
 
-def test_session_default_is_not_the_real_data_dir():
-    """conftest.py must have forced LOCAL_DATA_DIR away from the real default."""
+def test_session_default_is_the_forced_session_temp_dir():
+    """conftest.py must have overridden LOCAL_DATA_DIR to its own session temp
+    dir — not merely "some value other than the HOME-derived default". This
+    is the check that actually catches a shell that pre-exported LOCAL_DATA_DIR
+    to a real (e.g. production) path: only an exact match to the value
+    conftest.py itself created proves the override, not a passthrough, won."""
+    import conftest
+
+    forced = Path(os.environ["LOCAL_DATA_DIR"]).resolve()
+    assert forced == Path(conftest._TEST_DATA_DIR).resolve()
+
+    # Belt-and-suspenders: also confirm it isn't the HOME-derived default.
     from opencrab.config import _default_local_data_dir
 
-    real_default = Path(_default_local_data_dir()).resolve()
-    forced = Path(os.environ["LOCAL_DATA_DIR"]).resolve()
-    assert forced != real_default
+    assert forced != Path(_default_local_data_dir()).resolve()
 
 
 def test_write_lock_never_touches_real_data_dir():

@@ -13,8 +13,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 # 테스트 스위트가 사용자의 실제 데이터 디렉터리(LOCAL_DATA_DIR 미설정 시
-# get_settings().local_data_dir 의 HOME 파생 기본값)에 쓰지 못하도록 세션
-# 전체를 강제 격리한다 (이슈 #126).
+# get_settings().local_data_dir 의 HOME 파생 기본값, 또는 실행 셸이 이미
+# export 해둔 임의의 실경로)에 쓰지 못하도록 세션 전체를 강제 격리한다
+# (이슈 #126).
 #
 # 계기: 개별 테스트가 store/context 생성을 mock 하면서도 _write_lock()
 # (opencrab/mcp/tools/__init__.py) 은 그대로 통과시켜, 실제 경로에
@@ -25,14 +26,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 폴백한다는 구조 자체다 — 그래서 개별 테스트를 고치는 대신(A) 모든
 # 테스트가 거쳐가는 지점에서 폴백 자체를 차단한다(B, 근본 원인).
 #
-# setdefault 인 이유는 LOCALCRAB_ENV_FILE 과 동일: 호출자가 LOCAL_DATA_DIR
-# 을 명시하면(예: tests/test_config_defaults.py 가 monkeypatch.delenv 뒤
-# HOME 파생 기본값 자체를 검증) 그대로 존중된다. 모듈 최상단인 이유도
-# 동일 — get_settings() 는 lru_cache 이고 일부 모듈은 임포트 시점에
-# Settings 를 만들므로 fixture 로는 늦는다.
+# LOCALCRAB_ENV_FILE 아래 블록과 달리 setdefault 가 아니라 무조건 override 다.
+# 개발자/CI 셸이 이미 LOCAL_DATA_DIR 을(설령 진짜 프로덕션 경로를) export 해둔
+# 채로 pytest 를 실행하는 경우가 바로 이 이슈가 막으려는 시나리오 자체이므로,
+# "호출자가 명시하면 존중한다" 는 여기서는 안전장치가 아니라 구멍이다(코드
+# 리뷰 지적). LOCAL_DATA_DIR 의 기본값 파생 로직 자체를 검증하는 테스트
+# (tests/test_config_defaults.py)는 monkeypatch.delenv/setenv 로 이 값을
+# 테스트 범위 안에서 직접 지우거나 바꾸므로 이 override 와 충돌하지 않는다.
+# 모듈 최상단인 이유는 LOCALCRAB_ENV_FILE 과 동일 — get_settings() 는
+# lru_cache 이고 일부 모듈은 임포트 시점에 Settings 를 만들므로 fixture 로는
+# 늦는다.
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="localcrab-test-data-")
 atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
-os.environ.setdefault("LOCAL_DATA_DIR", _TEST_DATA_DIR)
+os.environ["LOCAL_DATA_DIR"] = _TEST_DATA_DIR
 
 # 테스트는 호스트의 운영 env 파일을 읽지 않는다.
 #
