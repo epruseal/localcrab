@@ -294,7 +294,13 @@ def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
     old rows are deliberately left where they are, in opencrab.db's
     billing_events; see ``opencrab.billing.hooks``'s module docstring
     ("NO AUTOMATIC MIGRATION") for why an automatic copy was tried and
-    reverted, and what to do if that history is ever needed.
+    reverted, and what to do if that history is ever needed. Built with
+    `create_tables=False`: SQLStore normally also creates the generic
+    ontology_nodes/ontology_edges/impact_records/lever_simulations/
+    rebac_policies schema on connect, which billing.db has no use for
+    (BillingHooks._ensure_tables() creates billing_events itself) and would
+    otherwise sit there as 5 confusingly-empty tables in a file meant to
+    hold exactly one.
     """
     if settings.storage_mode in ("docker", "pg"):
         return sql_store
@@ -304,4 +310,4 @@ def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
     from opencrab.stores.sql_store import SQLStore
 
     db_path = Path(settings.local_data_dir) / "billing.db"
-    return SQLStore(url=f"sqlite:///{db_path}")
+    return SQLStore(url=f"sqlite:///{db_path}", create_tables=False)

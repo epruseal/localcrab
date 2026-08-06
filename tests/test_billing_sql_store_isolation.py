@@ -54,6 +54,30 @@ class TestMakeBillingSqlStoreRouting:
         assert billing_store._url == f"sqlite:///{tmp_path / 'billing.db'}"
         assert sql._url == f"sqlite:///{tmp_path / 'opencrab.db'}"
 
+    def test_billing_db_holds_only_billing_events_not_the_generic_sql_schema(self, tmp_path):
+        """Verifier follow-up: SQLStore normally also creates ontology_nodes/
+        ontology_edges/impact_records/lever_simulations/rebac_policies on
+        connect -- billing.db has no use for that (BillingHooks creates
+        billing_events itself) and having it there anyway would contradict
+        "billing-only file" and confuse a future reader."""
+        import sqlite3
+
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_billing_sql_store, make_sql_store
+
+        settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+        sql = make_sql_store(settings)
+        billing_store = make_billing_sql_store(settings, sql)
+        BillingHooks(billing_store)  # creates billing_events
+
+        conn = sqlite3.connect(str(tmp_path / "billing.db"))
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        conn.close()
+        assert "billing_events" in names
+        assert names.isdisjoint(
+            {"ontology_nodes", "ontology_edges", "impact_records", "lever_simulations", "rebac_policies"}
+        )
+
     def test_kuzu_mode_also_gets_a_separate_billing_db_file(self, tmp_path):
         """kuzu is a local-mode variant (only the graph store differs) --
         billing must be separated there too, not just under storage_mode
