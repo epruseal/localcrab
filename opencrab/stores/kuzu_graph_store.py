@@ -646,8 +646,20 @@ class KuzuGraphStore:
         disagree with a wrongly-truncated `nodes` page), this scans all
         space-matching rows via ``_scan_space_matching`` (no LIMIT in that
         Cypher), Python-filters by pack_id, and stops as soon as ``limit``
-        matches are collected -- not before."""
+        matches are collected -- not before.
+
+        ``limit <= 0`` (issue #120): returns ``[]`` before issuing any query,
+        in both branches below -- 0 rows requested must mean 0 rows returned,
+        not "1 row slipped through because it was collected before the limit
+        check" (the pack_id branch's original bug) and not "unbounded" (a
+        negative limit has no natural SQL/Cypher meaning here; this store's
+        SQL-backend sibling would even hand SQLite ``LIMIT -1``, which SQLite
+        treats as "no limit" -- the opposite of what a negative count should
+        do). This is the same rule the SQL backend now applies (see
+        ``_sql_graph_base.py``'s ``export_nodes``), so all three paths agree."""
         self._require_available()
+        if limit <= 0:
+            return []
         if pack_id is None:
             # No JSON-blob filter needed -- space (if any) is already
             # applied server-side, so LIMIT can stay in the Cypher query

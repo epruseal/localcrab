@@ -195,7 +195,13 @@ class _SqlDocStoreBase(abc.ABC):
         return self._row_to_node(row)
 
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0`` (issue #120 follow-up): returns ``[]`` without
+        querying, same contract as ``_sql_graph_base.py``'s ``export_nodes``
+        -- SQLite maps a bound ``LIMIT -1`` to "no limit", so without this
+        guard a negative ``limit`` here would return the entire table."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("doc_nodes")
         # ORDER BY updated_at DESC: 정렬 없이 LIMIT 만 걸면 어느 행이 뽑힐지 SQL 표준상
         # 보장되지 않는다(#63). 최신순으로 고정해 상한을 넘는 코퍼스에서도 최소한
@@ -289,7 +295,11 @@ class _SqlDocStoreBase(abc.ABC):
         return self._row_to_source(row)
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` without querying -- same contract
+        as ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
         sql = (
             f"SELECT source_id, text, metadata, ingested_at"
             f" FROM {self._table('doc_sources')} LIMIT :lim"
@@ -327,7 +337,11 @@ class _SqlDocStoreBase(abc.ABC):
     def get_audit_log(
         self, limit: int = 100, event_type: str | None = None
     ) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` without querying -- same contract
+        as ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("audit_log")
         if event_type:
             sql = (

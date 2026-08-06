@@ -532,8 +532,15 @@ class Neo4jStore:
         Neo4jStore writes ``props["space"]`` natively on upsert (see
         ``upsert_node``), so this is real pushdown, not a Python post-filter
         (issue #54).
+
+        ``limit <= 0`` (issue #120): returns ``[]`` without issuing a query
+        -- a raw negative ``LIMIT`` literal is invalid Cypher (Neo4j rejects
+        it at runtime), and the SQL/Kuzu backends already never query for
+        ``limit <= 0``, so this keeps all four implementations agreeing.
         """
         self._require_available()
+        if limit <= 0:
+            return []
         cypher = f"""
             MATCH (n)
             WHERE ($pack_id IS NULL

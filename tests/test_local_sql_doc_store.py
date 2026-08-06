@@ -156,6 +156,17 @@ class TestListNodes:
         assert len(store.list_nodes(space="beta", limit=100)) == 6
         assert len(store.list_nodes(limit=100)) == 10
 
+    def test_list_nodes_limit_zero_returns_empty(self, store):
+        """issue #120 follow-up: 0 rows requested must mean 0 rows back."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=0) == []
+
+    def test_list_nodes_negative_limit_returns_empty(self, store):
+        """SQLite maps a bound ``LIMIT -1`` to "no limit" -- without the
+        guard this would return all 3 rows instead of []."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=-1) == []
+
     def _set_updated_at(self, store, node_id: str, iso_ts: str) -> None:
         """Force a specific ``updated_at`` so ordering/selection is controlled
         deterministically in tests, rather than relying on ``datetime.now()``
@@ -337,6 +348,14 @@ class TestSource:
     def test_list_sources_empty_returns_empty(self, store):
         assert store.list_sources() == []
 
+    def test_list_sources_limit_zero_returns_empty(self, store):
+        store.upsert_source("s0", "text", {})
+        assert store.list_sources(limit=0) == []
+
+    def test_list_sources_negative_limit_returns_empty(self, store):
+        store.upsert_source("s0", "text", {})
+        assert store.list_sources(limit=-1) == []
+
 
 class _FTSFailProxy:
     """sqlite3.Connection is an immutable C type (can't monkeypatch its
@@ -507,6 +526,14 @@ class TestAuditLog:
 
     def test_get_audit_log_empty(self, store):
         assert store.get_audit_log() == []
+
+    def test_get_audit_log_limit_zero_returns_empty(self, store):
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=0) == []
+
+    def test_get_audit_log_negative_limit_returns_empty(self, store):
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=-1) == []
 
 
 # ---------------------------------------------------------------------------
