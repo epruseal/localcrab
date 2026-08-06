@@ -326,11 +326,12 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
                         "does NOT cap `total`, which is the full match count regardless of "
                         "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
                         "IS capped at `limit` (total == len(nodes) always in that case). "
-                        "0 is valid and returns no nodes (issue #120); negative values are "
-                        "rejected."
+                        "0 or negative values are not an error -- they return an empty `nodes` "
+                        "page (issue #120). This server does not validate `limit` against this "
+                        "schema before calling the handler, so a negative value is never "
+                        "rejected outright; it is simply defined to mean 'no rows'."
                     ),
                     "default": 100,
-                    "minimum": 0,
                 },
             },
             "required": [],
@@ -469,7 +470,18 @@ def ontology_list_nodes(
             "type": "object",
             "properties": {
                 "pack_id": {"type": "string", "description": "Optional pack_id filter."},
-                "limit": {"type": "integer", "description": "Maximum results (default 200).", "default": 200},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum results (default 200). Unlike ontology_list_nodes, 0 or "
+                        "negative values here are NOT yet defined to return an empty page -- "
+                        "export_edges' store-side guard for issue #120 is a separate, not-yet-"
+                        "landed fix (tracked in a follow-up issue); a negative value's behavior "
+                        "is backend-dependent today and may return the entire edge set. Do not "
+                        "rely on 0/negative here until that follow-up lands."
+                    ),
+                    "default": 200,
+                },
             },
             "required": [],
         },
