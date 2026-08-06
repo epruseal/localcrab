@@ -130,7 +130,18 @@ def ontology_add_node(
         # nodes that never landed in the graph. Same graph-only,
         # fail-closed gate as ontology_add_edge/harness_promotion_apply.
         if not graph_write_failed(result.get("stores") or {}):
-            ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
+            billing_result = ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
+            if not billing_result.get("ok"):
+                # #105: emit() is fire-and-forget by design and never raises,
+                # but a failed persist must not vanish with only
+                # BillingHooks' own internal log line — surface it here too
+                # so this handler's own log context (tenant/space/node_type)
+                # is attached. Does not fail the write: the node write
+                # already succeeded above.
+                logger.warning(
+                    "on_node_write billing event failed to persist (tenant=%s, space=%s, node_type=%s): %s",
+                    tenant_id, space, node_type, billing_result.get("error"),
+                )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:

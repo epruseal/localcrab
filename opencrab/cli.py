@@ -254,6 +254,35 @@ def status() -> None:
             status_text = "[red]UNAVAILABLE[/red]"
         table.add_row(name, url, status_text)
 
+    # issue #105 codex follow-up: billing_events now lives in its own file
+    # in local/kuzu mode (make_billing_sql_store) and can fail independently
+    # of `sql` -- a corrupt billing.db or a permission problem specific to
+    # that one file. BillingHooks swallows a failed table-creation into a
+    # WARNING log only (see its `tables_ready` attribute), so without this
+    # row `status` could report every configured store OK while every
+    # billing event is silently being dropped -- the same "failure is
+    # swallowed and nobody notices" shape issue #105 itself was about, one
+    # layer up from emit()'s own return value. pg/docker mode shares `sql`
+    # (make_billing_sql_store returns it unchanged there), so its health is
+    # already covered by the "SQL" row above -- no separate row needed.
+    from opencrab.billing.hooks import BillingHooks
+    from opencrab.stores.factory import make_billing_sql_store
+
+    billing_store = make_billing_sql_store(cfg, sql)
+    if billing_store is not sql:
+        billing_hooks = BillingHooks(billing_store)
+        if not billing_store.available:
+            billing_status = "[red]UNAVAILABLE[/red]"
+        elif not billing_hooks.tables_ready:
+            billing_status = "[red]UNAVAILABLE (table creation failed)[/red]"
+        else:
+            try:
+                ok = billing_store.ping()
+                billing_status = "[green]OK[/green]" if ok else "[yellow]CONNECTED (ping failed)[/yellow]"
+            except Exception:
+                billing_status = "[yellow]CONNECTED[/yellow]"
+        table.add_row("Billing (SQLite)", cfg.local_data_dir + "/billing.db", billing_status)
+
     console.print(table)
 
 

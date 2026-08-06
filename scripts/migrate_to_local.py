@@ -192,6 +192,8 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
       doc_store.db  → doc_store.db.bak.{ts}  (있으면)
       chroma/       → chroma.bak.{ts}/        (있으면)
       opencrab.db   → opencrab.db.bak.{ts}    (있으면)
+      billing.db    → billing.db.bak.{ts}     (있으면 — issue #105: billing_events
+                                                 는 opencrab.db 가 아닌 이 파일에 있다)
     주의: shutil.copy2/copytree 사용. 없으면 경고만 출력하고 스킵.
     반환: {원본경로: 백업경로} (백업된 항목만)
     """
@@ -204,6 +206,12 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
         ("doc_store.db", "file"),
         ("chroma",       "dir"),
         ("opencrab.db",  "file"),
+        # issue #105: billing_events moved out of opencrab.db into its own
+        # file so it stops contending with write.lock'd writers for
+        # opencrab.db's SQLite file lock. It must be backed up separately or
+        # a split that was meant to prevent billing data loss would cause a
+        # bigger one (unbacked-up billing history).
+        ("billing.db",   "file"),
     ]
 
     for name, kind in targets:
