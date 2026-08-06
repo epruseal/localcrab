@@ -322,7 +322,6 @@ def load_edges(
 
     for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
             raw_label = row.get("label") or row.get("relation") or ""
-            lookup_label = raw_label.upper()   # 매핑 lookup은 대소문자 무시(원본은 source_label에 보존)
             src_id    = row.get("source_id") or row.get("from_id") or ""
             tgt_id    = row.get("target_id") or row.get("to_id")   or ""
 
@@ -449,7 +448,9 @@ def load_chunks(
             log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
             for sid, txt, meta in zip(b_ids, b_texts, b_metas):
                 flush_single(sid, txt, meta)
-        b_texts.clear(); b_ids.clear(); b_metas.clear()
+        b_texts.clear()
+        b_ids.clear()
+        b_metas.clear()
 
     for row in iter_jsonl(chunks_file):  # shard-aware 논리 스트림
             chunk_id = row["id"]
@@ -528,7 +529,10 @@ def load_chunks_incremental(
             log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
             for sid, txt, meta, kind in zip(b_ids, b_texts, b_metas, b_kinds):
                 flush_single(sid, txt, meta, kind)
-        b_texts.clear(); b_ids.clear(); b_metas.clear(); b_kinds.clear()
+        b_texts.clear()
+        b_ids.clear()
+        b_metas.clear()
+        b_kinds.clear()
 
     for row in iter_jsonl(chunks_file):  # shard-aware 논리 스트림
             chunk_id = row["id"]
@@ -543,9 +547,15 @@ def load_chunks_incremental(
             live = live_chunks.get(chunk_id)
 
             if live is None:
-                b_ids.append(chunk_id); b_texts.append(row["text"]); b_metas.append(meta); b_kinds.append("new")
+                b_ids.append(chunk_id)
+                b_texts.append(row["text"])
+                b_metas.append(meta)
+                b_kinds.append("new")
             elif live[0] != row["text"]:
-                b_ids.append(chunk_id); b_texts.append(row["text"]); b_metas.append(meta); b_kinds.append("txt")
+                b_ids.append(chunk_id)
+                b_texts.append(row["text"])
+                b_metas.append(meta)
+                b_kinds.append("txt")
             elif live[1] != meta:
                 # 텍스트 불변, 메타만 변경 — 임베딩 없이 upsert_source만(FTS는 자동 싱크)
                 try:
