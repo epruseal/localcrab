@@ -2,10 +2,37 @@
 (e.g. ``_vec_helpers``) can be imported by test modules regardless of pytest's
 import mode."""
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# 테스트 스위트가 사용자의 실제 데이터 디렉터리(LOCAL_DATA_DIR 미설정 시
+# get_settings().local_data_dir 의 HOME 파생 기본값)에 쓰지 못하도록 세션
+# 전체를 강제 격리한다 (이슈 #126).
+#
+# 계기: 개별 테스트가 store/context 생성을 mock 하면서도 _write_lock()
+# (opencrab/mcp/tools/__init__.py) 은 그대로 통과시켜, 실제 경로에
+# write.lock 을 남기는 사례가 반복됐다(tests/test_mcp.py 등). 과거에는
+# 부분적으로만 mock 된 테스트가 실제 경로에 잘못된 스키마의 .db 까지
+# 만든 적도 있다. 원인은 개별 테스트의 실수가 아니라, LOCAL_DATA_DIR 이
+# 비어 있으면 어떤 코드 경로든 조용히 실제 HOME 기반 기본값으로
+# 폴백한다는 구조 자체다 — 그래서 개별 테스트를 고치는 대신(A) 모든
+# 테스트가 거쳐가는 지점에서 폴백 자체를 차단한다(B, 근본 원인).
+#
+# setdefault 인 이유는 LOCALCRAB_ENV_FILE 과 동일: 호출자가 LOCAL_DATA_DIR
+# 을 명시하면(예: tests/test_config_defaults.py 가 monkeypatch.delenv 뒤
+# HOME 파생 기본값 자체를 검증) 그대로 존중된다. 모듈 최상단인 이유도
+# 동일 — get_settings() 는 lru_cache 이고 일부 모듈은 임포트 시점에
+# Settings 를 만들므로 fixture 로는 늦는다.
+_TEST_DATA_DIR = tempfile.mkdtemp(prefix="localcrab-test-data-")
+atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
+os.environ.setdefault("LOCAL_DATA_DIR", _TEST_DATA_DIR)
 
 # 테스트는 호스트의 운영 env 파일을 읽지 않는다.
 #
@@ -21,8 +48,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 # setdefault 이므로 호출자가 LOCALCRAB_ENV_FILE 을 명시하면 그대로 존중된다
 # (표준 env 로딩 자체를 검증하는 테스트가 이 경로로 실제 파일을 지정한다).
 os.environ.setdefault("LOCALCRAB_ENV_FILE", os.devnull)
-
-import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
