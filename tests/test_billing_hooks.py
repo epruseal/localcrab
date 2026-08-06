@@ -119,22 +119,48 @@ class TestEmitFailure:
         assert "error" in result
         assert "event_id" not in result
 
-    def test_on_node_write_wrapper_never_raises_on_broken_engine(self):
-        """Callers (mcp/tools.py) call on_* wrappers and ignore the return
-        value entirely — the outage must stay invisible to them."""
+    def test_failure_log_identifies_the_lost_event_not_just_the_exception(self, caplog):
+        """#105 (2nd review round): emit_failure_count (an unreadable
+        process-local counter) was removed because nothing could ever read
+        it. The replacement is a log line an operator can actually grep
+        after the fact -- it must carry enough to identify WHAT was lost
+        (event_id, event_type, tenant_id), not just that something failed."""
+        import logging
+
         store = SQLStore("sqlite:///:memory:")
         hooks = BillingHooks(store)
         hooks._sql._engine = _BrokenEngine()
 
-        # Must not raise.
-        hooks.on_node_write("t1", "u1", "space", "User")
-        hooks.on_query("t1", "u1", "some question")
+        with caplog.at_level(logging.WARNING):
+            result = hooks.emit("harness_apply", tenant_id="acme-corp", subject_id="u42")
+
+        assert result["ok"] is False
+        records = [r.message for r in caplog.records if "BillingHooks.emit failed" in r.message]
+        assert len(records) == 1
+        message = records[0]
+        assert "harness_apply" in message
+        assert "acme-corp" in message
+        assert "u42" in message
+        assert "evt_" in message  # the event_id that would have been persisted
+
+    def test_on_node_write_and_on_query_never_raise_and_report_ok_false(self):
+        """#105: on_node_write/on_query used to return None, which made it
+        structurally impossible for ANY caller to notice a failed persist —
+        they now return emit()'s dict like the other three wrappers below,
+        so this pins that they still never raise, and that ok=False actually
+        comes through instead of being swallowed by the wrapper."""
+        store = SQLStore("sqlite:///:memory:")
+        hooks = BillingHooks(store)
+        hooks._sql._engine = _BrokenEngine()
+
+        assert hooks.on_node_write("t1", "u1", "space", "User")["ok"] is False
+        assert hooks.on_query("t1", "u1", "some question")["ok"] is False
 
     def test_66_wired_wrappers_never_raise_and_report_ok_false(self):
-        """The three wrappers newly wired for #66 (unlike on_node_write/
-        on_query above) return emit()'s dict so callers CAN notice a
-        failure — this pins that they still never raise, and that ok=False
-        actually comes through instead of being swallowed by the wrapper."""
+        """The three wrappers newly wired for #66 return emit()'s dict so
+        callers CAN notice a failure — this pins that they still never
+        raise, and that ok=False actually comes through instead of being
+        swallowed by the wrapper."""
         store = SQLStore("sqlite:///:memory:")
         hooks = BillingHooks(store)
         hooks._sql._engine = _BrokenEngine()
@@ -204,6 +230,96 @@ class TestEmitEdgeCases:
         events = hooks.list_events(tenant_id=tenant, limit=2)
 
         assert len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# #105: the actual reason this fix exists. An earlier version of this fix
+# retried the billing insert with backoff when it shared opencrab.db's file
+# with write.lock'd writers -- that only shrank the failure window and slept
+# synchronously in the request path (opencrab/mcp/http_app.py's async
+# handler would have blocked on it). The real fix is that billing_events no
+# longer shares that file at all (see make_billing_sql_store), so there is
+# no contention to retry around in the first place. Both tests below use
+# only a throwaway tmp_path scratch DB -- never a live database -- and a
+# second raw sqlite3 connection genuinely holding SQLite's write lock (not
+# mocked), held open for the whole call with no release/timing dependency.
+# ---------------------------------------------------------------------------
+
+
+class TestBillingNotBlockedByWriteLockHolder:
+    @staticmethod
+    def _hold_write_lock(db_path):
+        """Open a second, real sqlite3 connection and reserve the write
+        lock the way a long write.lock-held handler (e.g. a bulk
+        pack_ingest via ontology_add_node, writes=True) would while it
+        works -- BEGIN IMMEDIATE reserves the lock immediately, and the
+        INSERT plus the deliberate absence of a commit keeps it held for as
+        long as the caller wants (here: the whole test body)."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path), timeout=1)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO ontology_nodes (space, node_type, node_id) VALUES ('s', 't', 'n1')")
+        return conn
+
+    def test_billing_insert_succeeds_immediately_while_opencrab_db_write_lock_is_held(self, tmp_path):
+        """The fixed shape: billing lives in its own file (billing.db), so a
+        writer holding opencrab.db's write lock for the ENTIRE test (never
+        released) does not block, slow down, or fail the billing insert."""
+        import time
+
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_billing_sql_store, make_sql_store
+
+        settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+        sql = make_sql_store(settings)  # creates opencrab.db + its tables
+        billing_store = make_billing_sql_store(settings, sql)
+        hooks = BillingHooks(billing_store)
+        assert billing_store is not sql  # sanity: really is a separate file
+
+        blocker = self._hold_write_lock(tmp_path / "opencrab.db")
+        try:
+            start = time.monotonic()
+            result = hooks.emit("query", metadata={"question": "contended"})
+            elapsed = time.monotonic() - start
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert result["ok"] is True
+        assert elapsed < 1.0  # no lock wait, no retry backoff -- effectively instant
+
+    def test_negative_control_the_old_shared_file_shape_really_did_block(self, tmp_path):
+        """Proves the contention this fix removes was real: BillingHooks
+        wired the pre-#105 way (sharing `sql`'s own file/store, exactly what
+        make_billing_sql_store now avoids) DOES fail under the identical
+        held lock. Not exercised by the fixed path above -- this is what it
+        would look like without this fix."""
+        from sqlalchemy import create_engine
+
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_sql_store
+
+        settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+        sql = make_sql_store(settings)
+        # Short busy-timeout so this negative control fails fast instead of
+        # waiting out the real 5s DBAPI default -- the failure mode, not its
+        # timing, is what's under test.
+        sql._engine = create_engine(
+            f"sqlite:///{tmp_path / 'opencrab.db'}",
+            connect_args={"timeout": 0.05, "check_same_thread": False},
+        )
+        hooks_sharing_file = BillingHooks(sql)  # the pre-#105 wiring: no separation
+
+        blocker = self._hold_write_lock(tmp_path / "opencrab.db")
+        try:
+            result = hooks_sharing_file.emit("query", metadata={"question": "contended"})
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert result["ok"] is False
+        assert "locked" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------

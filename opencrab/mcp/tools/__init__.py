@@ -175,6 +175,7 @@ def _get_context() -> dict[str, Any]:
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
     from opencrab.stores.factory import (
+        make_billing_sql_store,
         make_doc_store,
         make_graph_store,
         make_sql_store,
@@ -207,8 +208,12 @@ def _get_context() -> dict[str, Any]:
     hybrid._rebac = rebac
 
     # Phase 5: billing hooks
+    # issue #105: billing_events gets its own SQLite file in local/kuzu mode
+    # (a no-op passthrough to `sql` in pg/docker mode) — see
+    # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
+    # module docstring (including "NO AUTOMATIC MIGRATION") for why.
     from opencrab.billing.hooks import BillingHooks
-    billing = BillingHooks(sql)
+    billing = BillingHooks(make_billing_sql_store(cfg, sql))
 
     _context = {
         "neo4j": graph,
@@ -307,9 +312,13 @@ _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {name: spec.fn for name, spec i
 dispatch_tool = _registry_dispatch_tool
 
 # Tools that need the cross-process write.lock (NOT "tools that touch a store" —
-# see the `writes` field docstring in _registry.py#tool; a store write that is
-# idempotent append-only, e.g. billing_events via ontology_query, deliberately
-# stays out of this set). When several MCP server processes run against the
+# see the `writes` field docstring in _registry.py#tool; a store write whose
+# file is structurally independent of every write.lock'd writer's file, so
+# there is no contention for the lock to prevent in the first place, e.g.
+# billing_events via ontology_query (its own billing.db — issue #105
+# corrected both the earlier idempotency rationale and a later
+# retry-with-backoff attempt, neither of which was the real fix), deliberately
+# stays out of this set. When several MCP server processes run against the
 # same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
 # writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
 # lock on a dedicated write.lock file — entirely separate from the lifetime-held

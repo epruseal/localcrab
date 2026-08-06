@@ -269,3 +269,45 @@ def make_sql_store(settings: Settings) -> Any:
 
     url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
     return SQLStore(url=url)
+
+
+def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
+    """Return the SQLStore ``BillingHooks`` should use.
+
+    issue #105: billing_events used to share `sql_store`'s file/engine with
+    ontology_nodes/impact_records/lever_simulations — tables written under
+    the cross-process write.lock. SQLite's default (non-WAL) journal mode
+    takes a whole-FILE write lock, so an unlocked billing insert could block
+    behind, or lose to, an unrelated long write (e.g. bulk pack_ingest) for
+    as long as that write took — see ``opencrab.billing.hooks``'s module
+    docstring for the full analysis of why WAL and retry-with-backoff both
+    fail to fix this and only file separation does.
+
+    PG/docker mode: `sql_store` is returned as-is. PostgreSQL uses row-level
+    locking, not a whole-file lock, so this contention never existed there —
+    no reason to open a second connection.
+
+    Local/kuzu (SQLite) mode: a new SQLStore on its own file, `billing.db`,
+    next to graph.db/doc_store.db/opencrab.db in the same LOCAL_DATA_DIR
+    (fixed filename, no env var — same convention as doc_store.db; nobody
+    has asked to configure this path). It starts EMPTY — a pre-#105 install's
+    old rows are deliberately left where they are, in opencrab.db's
+    billing_events; see ``opencrab.billing.hooks``'s module docstring
+    ("NO AUTOMATIC MIGRATION") for why an automatic copy was tried and
+    reverted, and what to do if that history is ever needed. Built with
+    `create_tables=False`: SQLStore normally also creates the generic
+    ontology_nodes/ontology_edges/impact_records/lever_simulations/
+    rebac_policies schema on connect, which billing.db has no use for
+    (BillingHooks._ensure_tables() creates billing_events itself) and would
+    otherwise sit there as 5 confusingly-empty tables in a file meant to
+    hold exactly one.
+    """
+    if settings.storage_mode in ("docker", "pg"):
+        return sql_store
+
+    from pathlib import Path
+
+    from opencrab.stores.sql_store import SQLStore
+
+    db_path = Path(settings.local_data_dir) / "billing.db"
+    return SQLStore(url=f"sqlite:///{db_path}", create_tables=False)

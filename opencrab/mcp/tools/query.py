@@ -173,14 +173,32 @@ def ontology_query(
         )
         results = outcome.results
         # This is a store write (billing_events INSERT), but ontology_query stays
-        # writes=False: billing.on_query -> BillingHooks.emit uses UNIQUE(event_id)
-        # + INSERT OR IGNORE / ON CONFLICT DO NOTHING (opencrab/billing/hooks.py),
-        # so it's idempotent append-only and doesn't need write.lock's cross-process
-        # serialisation. Forcing writes=True here would serialise every query
-        # (high-frequency, read-shaped) behind the write mutex for no correctness
-        # gain. Decided in #65's review against #68 (E-4 lock ownership map); see
-        # `writes` field docstring in _registry.py#tool for the general rule.
-        ctx["billing"].on_query(tenant_id, subject_id, question)
+        # writes=False. NOT because the insert is idempotent (issue #105: it
+        # isn't -- BillingHooks.emit mints a fresh UUID per call, so
+        # UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING only
+        # dedupes a literal double-send, never resurrects a failed one), and
+        # NOT because losing this event would be an acceptable performance
+        # trade (protecting it IS the correctness goal #105 exists for).
+        # writes=False is safe here because billing_events lives in its own
+        # SQLite file (issue #105: opencrab.billing.hooks module docstring +
+        # opencrab.stores.factory.make_billing_sql_store) separate from the
+        # write.lock'd tables' file -- a billing insert here never contends
+        # with an unrelated writer no matter how long that writer holds
+        # write.lock, so forcing writes=True would only cost every query --
+        # a high-frequency, read-shaped path -- lock contention for no
+        # correctness gain. Decided in #65's review against #68 (E-4 lock
+        # ownership map); see `writes` field docstring in
+        # _registry.py#tool for the general rule.
+        billing_result = ctx["billing"].on_query(tenant_id, subject_id, question)
+        if not billing_result.get("ok"):
+            # #105: emit() is fire-and-forget by design and never raises, but a
+            # failed persist must not vanish with only BillingHooks' own internal
+            # log line -- surface it here too. Does not fail the query: the
+            # query already succeeded above.
+            logger.warning(
+                "on_query billing event failed to persist (tenant=%s, subject=%s): %s",
+                tenant_id, subject_id, billing_result.get("error"),
+            )
         result_dicts = [r.to_dict() for r in results]
         if include_canonical_ids:
             # .get: a context without a graph store (test doubles, degraded
