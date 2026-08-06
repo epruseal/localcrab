@@ -381,6 +381,78 @@ class TestLocalGraphStore:
         assert row == ("Team", "Document")
 
 
+class TestBuilderSubjectIdAudit:
+    """Issue #119: subject_id passed to OntologyBuilder.add_node/add_edge must
+    reach the doc store's audit log (log_event), not just billing. These tests
+    exercise the REAL LocalDocStore (not a mock) so the audit trail is checked
+    end to end: builder call -> log_event -> get_audit_log.
+    """
+
+    def _builder(self, tmp_path):
+        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.stores.local_doc_store import LocalDocStore
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.sql_store import SQLStore
+
+        graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+        doc = LocalDocStore(data_dir=str(tmp_path / "docs"))
+        sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
+        return OntologyBuilder(graph, doc, sql), doc
+
+    def test_add_node_subject_id_reaches_audit_log(self, tmp_path):
+        builder, doc = self._builder(tmp_path)
+        builder.add_node(
+            space="subject", node_type="User", node_id="u1",
+            properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+            subject_id="actor-1",
+        )
+        entries = doc.get_audit_log(event_type="node_upsert")
+        assert len(entries) == 1
+        assert entries[0]["subject_id"] == "actor-1"
+
+    def test_add_node_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
+        builder, doc = self._builder(tmp_path)
+        builder.add_node(
+            space="subject", node_type="User", node_id="u1",
+            properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+        )
+        entries = doc.get_audit_log(event_type="node_upsert")
+        assert len(entries) == 1
+        assert entries[0]["subject_id"] is None
+
+    def test_add_edge_subject_id_reaches_audit_log(self, tmp_path):
+        builder, doc = self._builder(tmp_path)
+        builder.add_node(
+            space="subject", node_type="Team", node_id="team_alpha", properties={"name": "Alpha"}
+        )
+        builder.add_node(
+            space="resource", node_type="Document", node_id="doc_42", properties={"title": "Doc"}
+        )
+        builder.add_edge(
+            from_space="subject", from_id="team_alpha", relation="owns",
+            to_space="resource", to_id="doc_42", subject_id="actor-2",
+        )
+        entries = doc.get_audit_log(event_type="edge_upsert")
+        assert len(entries) == 1
+        assert entries[0]["subject_id"] == "actor-2"
+
+    def test_add_edge_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
+        builder, doc = self._builder(tmp_path)
+        builder.add_node(
+            space="subject", node_type="Team", node_id="team_alpha", properties={"name": "Alpha"}
+        )
+        builder.add_node(
+            space="resource", node_type="Document", node_id="doc_42", properties={"title": "Doc"}
+        )
+        builder.add_edge(
+            from_space="subject", from_id="team_alpha", relation="owns",
+            to_space="resource", to_id="doc_42",
+        )
+        entries = doc.get_audit_log(event_type="edge_upsert")
+        assert len(entries) == 1
+        assert entries[0]["subject_id"] is None
+
+
 @INTEGRATION
 class TestNeo4jIntegration:
     @pytest.fixture

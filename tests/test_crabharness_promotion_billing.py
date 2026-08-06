@@ -80,6 +80,67 @@ def _patch_factories(builder_add_node_return):
     return graph, docs, sql, builder_instance, billing_instance
 
 
+_VALID_PACKAGE_WITH_EDGE = {
+    "package_id": "pkg-1",
+    "mission_id": "mis-1",
+    "run_id": "run-1",
+    "nodes": [{"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}}],
+    "edges": [{
+        "from_space": "resource", "from_id": "ds1", "relation": "related_to",
+        "to_space": "resource", "to_id": "ds2",
+    }],
+}
+
+
+class TestApplyPromotionPackageSubjectIdAudit:
+    """Issue #119: apply_promotion_package (crabharness apply's non-MCP twin
+    of harness.py#harness_promotion_apply) had the same gap: subject_id
+    reached on_harness_apply (billing) but not builder.add_node/add_edge
+    (audit) in its promotion loop."""
+
+    def test_normal_subject_id_reaches_both_node_and_edge_write(self, tmp_path):
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        )
+        builder_instance.add_edge.return_value = {
+            "receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}
+        }
+        package_path = _write_package(tmp_path, _VALID_PACKAGE_WITH_EDGE)
+        with (
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            apply_promotion_package(package_path, dry_run=False, tenant_id="acme", subject_id="u1")
+        assert builder_instance.add_node.call_args.kwargs["subject_id"] == "u1"
+        assert builder_instance.add_edge.call_args.kwargs["subject_id"] == "u1"
+
+    def test_normal_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        )
+        builder_instance.add_edge.return_value = {
+            "receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}
+        }
+        package_path = _write_package(tmp_path, _VALID_PACKAGE_WITH_EDGE)
+        with (
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            apply_promotion_package(package_path, dry_run=False)
+        assert builder_instance.add_node.call_args.kwargs["subject_id"] is None
+        assert builder_instance.add_edge.call_args.kwargs["subject_id"] is None
+
+
 class TestApplyPromotionPackageBilling:
     def test_normal_bills_harness_apply_event(self, tmp_path):
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(

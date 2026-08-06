@@ -123,6 +123,7 @@ def _ingest_into_pack(
                 node_type=_clean_str(item.get("node_type", "")),
                 node_id=_clean_str(item.get("node_id", "")),
                 properties=props,
+                subject_id=subject_id,
             )
             # add_node never raises for a per-store failure (see builder.py's
             # module docstring) — it reports "error: ..." inside the returned
@@ -152,6 +153,7 @@ def _ingest_into_pack(
                 to_space=_clean_str(item.get("to_space", "")),
                 to_id=_clean_str(item.get("to_id", "")),
                 properties=props,
+                subject_id=subject_id,
             )
             # Same as above: a missing edge endpoint is reported as
             # stores["graph"] = "no match (missing node: ...)" without
@@ -212,6 +214,7 @@ def _ingest_into_pack(
                     node_type="TextUnit",
                     node_id=source_id,
                     properties=node_props,
+                    subject_id=subject_id,
                 )
                 # Same store-map inspection as the node/edge loops above —
                 # a per-store failure here would otherwise still count as a
@@ -602,6 +605,7 @@ def pack_create(
                 "description": _clean_str(description or ""),
                 "created_by": "localcrab-mcp",
             },
+            subject_id=subject_id,
         )
     except Exception as exc:
         return {"error": f"anchor node failed: {exc}"}

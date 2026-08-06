@@ -278,6 +278,50 @@ class TestIngestIntoPack:
         assert result["edge_errors"] == []
         hybrid.invalidate_bm25_cache.assert_called_once()
 
+    def test_normal_subject_id_reaches_every_write_in_the_batch(self):
+        """Issue #119: _ingest_into_pack's node loop, edge loop, and
+        evidence-node write each call builder.add_node/add_edge separately —
+        subject_id was billed once for the whole call but never forwarded to
+        any of these three write sites' own audit event. Pin that ALL THREE
+        receive the same subject_id (a partial fix — e.g. only the node loop
+        fixed — would make the audit trail inconsistent within one call,
+        which is worse than the original all-anonymous bug)."""
+        builder = MagicMock()
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            _ingest_into_pack(
+                "pack-a",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                edges=[{
+                    "from_space": "concept", "from_id": "e1", "relation": "related_to",
+                    "to_space": "concept", "to_id": "e2",
+                }],
+                text="hello world", source_id="src-1",
+                subject_id="actor-1",
+            )
+        # First add_node call is the "nodes=" loop entry, second is the
+        # evidence/TextUnit node from the text= branch.
+        assert builder.add_node.call_args_list[0].kwargs["subject_id"] == "actor-1"
+        assert builder.add_node.call_args_list[1].kwargs["subject_id"] == "actor-1"
+        assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+
+    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+        builder = MagicMock()
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            _ingest_into_pack(
+                "pack-a",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                edges=[{
+                    "from_space": "concept", "from_id": "e1", "relation": "related_to",
+                    "to_space": "concept", "to_id": "e2",
+                }],
+                text="hello world", source_id="src-1",
+            )
+        assert builder.add_node.call_args_list[0].kwargs["subject_id"] is None
+        assert builder.add_node.call_args_list[1].kwargs["subject_id"] is None
+        assert builder.add_edge.call_args.kwargs["subject_id"] is None
+
     def test_error_node_write_failure_recorded_without_aborting(self):
         builder = MagicMock()
         builder.add_node.side_effect = [None, RuntimeError("bad node")]
@@ -528,6 +572,33 @@ class TestPackCreate:
         builder.add_node.assert_called_once()
         assert builder.add_node.call_args.kwargs["space"] == "resource"
         assert builder.add_node.call_args.kwargs["node_type"] == "Dataset"
+
+    def test_normal_forwards_subject_id_to_anchor_node_audit(self):
+        """Issue #119: pack_create's anchor node write (a builder.add_node
+        call separate from _ingest_into_pack's own node/edge/evidence loops)
+        had the same gap — subject_id reached the ingest billing event but
+        not this write's own audit event. Pin that it now reaches
+        builder.add_node."""
+        builder = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": []}
+            pack_create(title="My Pack", pack_id="my-pack", subject_id="actor-1")
+        assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+
+    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+        builder = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_list.return_value = {"packs": []}
+            pack_create(title="My Pack", pack_id="my-pack")
+        assert builder.add_node.call_args.kwargs["subject_id"] is None
 
     def test_error_pack_already_exists(self):
         with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
@@ -894,6 +965,44 @@ class TestHarnessPromotionApply:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             harness_promotion_apply(_VALID_PACKAGE, dry_run=False, tenant_id="acme", subject_id="u1")
         billing.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+
+    def test_normal_subject_id_reaches_every_node_and_edge_write(self):
+        """Issue #119: subject_id reached on_harness_apply (billing) but never
+        builder.add_node/add_edge (audit) in the promotion loop — every write
+        in a promotion was audited with a null actor while the billing row
+        named one. Pin BOTH the node and edge write receive it, for every
+        item in the loop (a partial fix across a multi-write op is worse than
+        the original bug)."""
+        package = dict(_VALID_PACKAGE, nodes=[
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds2", "properties": {}},
+        ], edges=[{
+            "from_space": "resource", "from_id": "ds1", "relation": "related_to",
+            "to_space": "resource", "to_id": "ds2",
+        }])
+        builder = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            harness_promotion_apply(package, dry_run=False, subject_id="actor-1")
+        for call in builder.add_node.call_args_list:
+            assert call.kwargs["subject_id"] == "actor-1"
+        assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+
+    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+        package = dict(_VALID_PACKAGE, edges=[{
+            "from_space": "resource", "from_id": "ds1", "relation": "related_to",
+            "to_space": "resource", "to_id": "ds2",
+        }])
+        builder = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder)
+            harness_promotion_apply(package, dry_run=False)
+        assert builder.add_node.call_args.kwargs["subject_id"] is None
+        assert builder.add_edge.call_args.kwargs["subject_id"] is None
 
     def test_error_malformed_receipt_does_not_bill(self):
         """#66 codex re-review, finding [3]: a "stores" map with no "graph"
