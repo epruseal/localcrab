@@ -381,6 +381,19 @@ def ontology_list_nodes(
     ``total`` is limit-capped in the no-pack_id case, so no caller is told
     a false "always accurate" guarantee in the meantime.
 
+    ``limit <= 0`` (issue #120 follow-up): both branches return ``[]`` (and
+    doc-store's ``total`` is then ``0`` too, since it's ``len(nodes)`` in
+    that branch) -- the WITH-pack_id and WITHOUT-pack_id paths agree here
+    even though they disagree on ``total`` semantics above. This wasn't
+    true for every doc-store backend when the WITH-pack_id side of this
+    contract first landed: MongoStore's ``list_nodes`` passed ``limit``
+    straight to pymongo's ``Cursor.limit()``, where ``0`` means "no limit"
+    (the opposite of this contract) -- same footgun class as SQLite mapping
+    a bound ``LIMIT -1`` to "no limit" in ``_sql_doc_base.py``, just
+    triggered by a different value. All three doc-store backends
+    (LocalSQLDocStore/PgDocStore via ``_sql_doc_base.py``, MongoStore) now
+    guard ``limit <= 0`` before querying, matching the graph store side.
+
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/
     snapshot. A write landing on the same pack_id/space between them can
