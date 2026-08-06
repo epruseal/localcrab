@@ -122,12 +122,19 @@ class TestWriteLockCoverage:
     # *touches a store* list (see the `writes` field docstring in
     # _registry.py#tool for the full rule). ontology_query is deliberately
     # EXCLUDED even though it INSERTs into billing_events via
-    # `ctx["billing"].on_query()` — that insert is idempotent append-only
-    # (UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING), so it
-    # doesn't need cross-process serialisation, and locking every query would
-    # cost real latency on a high-frequency, read-shaped path for no
-    # correctness gain. Decided in #65's review against #68 (E-4 lock
-    # ownership map).
+    # `ctx["billing"].on_query()` — NOT because that insert is idempotent
+    # (issue #105: it isn't, each call mints a fresh event_id, so
+    # UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING only
+    # dedupes a literal double-send, never resurrects a failed insert), and
+    # NOT because losing it under contention would be an acceptable trade
+    # (protecting it IS the correctness goal #105 exists for). It's safe
+    # because billing_events lives in its own SQLite file (`billing.db`,
+    # local/kuzu mode — see opencrab.stores.factory.make_billing_sql_store),
+    # so it structurally never contends with a write.lock'd writer's file
+    # lock regardless of how long that writer runs — locking every query
+    # would cost real latency on a high-frequency, read-shaped path for a
+    # contention that doesn't happen. Decided in #65's review against #68
+    # (E-4 lock ownership map).
     #
     # Yes, this is itself a hand-maintained list (codex's point in #65's
     # review) — its role is different from WRITE_TOOLS though: WRITE_TOOLS is

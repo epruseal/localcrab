@@ -123,13 +123,63 @@ class TestInit:
 class TestStatus:
     # --- Normal ---
     def test_fresh_local_dir_reports_ok_for_all_stores(self, cli_env, runner):
-        """Fresh LOCAL_DATA_DIR: graph/vector/docs/sql are all local-SQLite
-        backed and self-create on first use, so all four must report OK."""
+        """Fresh LOCAL_DATA_DIR: graph/vector/docs/sql/billing are all local-
+        SQLite backed and self-create on first use, so all five must report
+        OK. billing_events lives in its own file (billing.db, issue #105) so
+        it gets its own row alongside the other four."""
         result = runner.invoke(main, ["status"])
         assert result.exit_code == 0
         assert "LOCAL MODE" in result.output
         assert "UNAVAILABLE" not in result.output
-        assert result.output.count("OK") == 4
+        assert "Billing" in result.output
+        assert result.output.count("OK") == 5
+
+    # --- Error ---
+    def test_billing_store_unavailable_is_reported_not_swallowed(self, cli_env, runner):
+        """issue #105 codex follow-up: billing.db can fail independently of
+        the main SQL store now that it's a separate file (corrupt file, a
+        permission problem specific to that one path). Before this fix,
+        `status` never looked at the billing store at all, so it could
+        report every configured store healthy while billing_events was
+        completely dead. Pin that an unavailable billing store shows up."""
+        from unittest.mock import MagicMock
+
+        broken_billing_store = MagicMock()
+        broken_billing_store.available = False
+
+        with patch("opencrab.stores.factory.make_billing_sql_store", return_value=broken_billing_store):
+            result = runner.invoke(main, ["status"])
+
+        assert result.exit_code == 0
+        assert "Billing" in result.output
+        assert "UNAVAILABLE" in result.output
+
+    def test_billing_table_creation_failure_is_reported(self, cli_env, runner):
+        """Narrower than the connection-level case above: the billing store
+        itself connects fine (available=True) but BillingHooks couldn't
+        create billing_events (e.g. disk full, a permissions problem on
+        CREATE TABLE specifically). This must be distinguishable from a
+        healthy store, not silently reported as OK."""
+        from unittest.mock import MagicMock
+
+        store_that_connects_but_cant_create_tables = MagicMock()
+        store_that_connects_but_cant_create_tables.available = True
+        store_that_connects_but_cant_create_tables._engine.begin.side_effect = RuntimeError("disk full")
+
+        with patch(
+            "opencrab.stores.factory.make_billing_sql_store",
+            return_value=store_that_connects_but_cant_create_tables,
+        ):
+            result = runner.invoke(main, ["status"])
+
+        assert result.exit_code == 0
+        # Rich wraps the status cell across lines at narrow widths and
+        # re-draws box-border characters on the continuation line, so check
+        # each word rather than one contiguous phrase.
+        assert "Billing" in result.output
+        assert "UNAVAILABLE" in result.output
+        assert "table" in result.output
+        assert "creation failed" in result.output
 
 
 # ---------------------------------------------------------------------------

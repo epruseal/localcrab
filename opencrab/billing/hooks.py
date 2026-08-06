@@ -27,6 +27,54 @@ error, optional-store-only failed = partial success" split.
 A 6th event type, fired by a since-DELETED ``on_promotion`` hook, is gone
 for good (issue #66: zero callers, and no code shape matches its
 per-node_id signature — see git history / the PR discussion for why).
+
+STORAGE (issue #105): in local/kuzu (SQLite) mode this table lives in its
+OWN file, ``billing.db`` — NOT ``opencrab.db``, which ontology_nodes /
+impact_records / lever_simulations / rebac_policies share. Those tables are
+written under the cross-process ``write.lock``; ``opencrab.db``'s SQLAlchemy
+engine does not enable WAL (see ``sql_store.py``), so it uses SQLite's
+default rollback journal, which takes a whole-FILE write lock — any two
+writers to the SAME file serialise, even across unrelated tables. Billing
+writes are deliberately NOT covered by ``write.lock`` (ontology_query would
+otherwise serialise every read behind it — see
+``opencrab/mcp/tools/_registry.py``'s ``tool()`` docstring), so before this
+fix a billing insert could block behind, or lose to, an unrelated long write
+(e.g. a bulk ``pack_ingest``) for as long as that write took. An earlier
+version of this fix added a retry-with-backoff loop around the insert; that
+only shrank the failure window (and, worse, slept synchronously inside the
+request path — see ``opencrab/mcp/http_app.py``'s async handler, which would
+block on it). WAL would not have fixed it either: WAL only separates
+readers from a writer, not writer from writer, so two writers to one file
+still serialise even under WAL. The only structural fix is not sharing the
+file: no query anywhere in this codebase JOINs ``billing_events`` with
+another table (confirmed by grep), so there was never a reason for it to be
+there. See ``opencrab.stores.factory.make_billing_sql_store`` for the store
+construction. PG/docker mode is unaffected (PostgreSQL uses row-level
+locking, not a whole-file lock) and keeps billing_events on the same
+database as everything else.
+
+NO AUTOMATIC MIGRATION (issue #105, second review round): a pre-#105 local
+install may still have historical rows sitting in ``opencrab.db``'s
+``billing_events`` table. That table is deliberately left exactly where it
+is — untouched, unrenamed, un-copied. An earlier version of this fix copied
+those rows into ``billing.db`` on startup and renamed the source table; that
+turned out to add its own three bugs (copy-then-rename-then-mark-done is not
+atomic against a mid-sequence crash, two processes racing the same
+first-ever startup could both attempt it with no lock, and the rename itself
+is an unlocked schema write against the very file ``write.lock`` exists to
+serialise — exactly the class of hazard this whole fix is about removing).
+Paying that complexity has no payoff: grep confirms zero callers anywhere in
+this codebase read ``get_usage()``/``list_events()`` (only this module's own
+tests do) and nothing queries ``billing_events`` directly either — the table
+is currently write-only. Splitting write-only, unread history across two
+files costs nothing today. If a real consumer of billing history shows up,
+migrate explicitly at that point: write a one-off script (same shape as
+``scripts/migrate_sqlite_to_pg.py``) that reads the old rows from
+``opencrab.db`` with a plain ``SELECT`` and ``INSERT OR IGNORE``s them into
+``billing.db`` — a single, human-triggered pass with no crash-recovery or
+concurrent-startup story to design, because it isn't running in every
+process's boot path anymore. See ``docs/ARCHITECTURE.md``'s billing.db entry
+for the same note aimed at operators, not just this code's future authors.
 """
 
 from __future__ import annotations
@@ -102,11 +150,20 @@ class BillingHooks:
 
     def __init__(self, sql_store: Any) -> None:
         self._sql = sql_store
+        # issue #105 (codex follow-up): billing.db can now fail
+        # independently of the main SQL store (corrupt file, a permission
+        # problem specific to that one file) -- _ensure_tables() below used
+        # to swallow that into a WARNING log only, with nothing durable to
+        # check afterwards. `tables_ready` gives callers (opencrab status,
+        # or anything else that wants to know) a real signal instead of
+        # having to grep logs. See opencrab/cli.py#status for the consumer.
+        self.tables_ready = False
         self._ensure_tables()
 
     def _ensure_tables(self) -> None:
         try:
             ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
+            self.tables_ready = True
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)
 
@@ -161,22 +218,42 @@ class BillingHooks:
             except Exception:
                 meta_str = str(metadata)
 
+        sql = _insert_event_sql(is_sqlite(self._sql))
+        params = {
+            "eid": event_id,
+            "tid": tenant_id,
+            "sid": subject_id,
+            "etype": event_type,
+            "cnt": count,
+            "meta": meta_str,
+        }
+
         try:
-            sql = _insert_event_sql(is_sqlite(self._sql))
             with self._sql._engine.begin() as conn:
-                conn.execute(
-                    text(sql),
-                    {
-                        "eid": event_id,
-                        "tid": tenant_id,
-                        "sid": subject_id,
-                        "etype": event_type,
-                        "cnt": count,
-                        "meta": meta_str,
-                    },
-                )
+                conn.execute(text(sql), params)
         except Exception as exc:
-            logger.warning("BillingHooks.emit failed: %s", exc)
+            # issue #105: this used to retry a handful of times on "database
+            # is locked" before giving up. That was papering over the real
+            # problem (billing sharing a SQLite file with write.lock'd
+            # writers -- see this module's docstring) with a synchronous
+            # sleep in the request path, and only shrank the failure window
+            # rather than closing it. Billing now lives on its own file, so
+            # a transient lock here (e.g. two billing writes landing in the
+            # same instant) is rare and brief enough for the DBAPI's own
+            # busy-timeout (sql_store.py's explicit `timeout`) to absorb
+            # without any retry loop of ours.
+            #
+            # issue #105 (2nd review round): a bare "emit failed: <exc>" log
+            # identifies THAT something was lost but not WHAT -- an operator
+            # grepping logs after the fact can't tell which event, whose
+            # tenant, or when. Log every field that would have identified the
+            # row, not just the exception, so a lost event is at least
+            # reconstructable from the log even with no durable counter.
+            logger.warning(
+                "BillingHooks.emit failed: event_id=%s event_type=%s tenant_id=%s "
+                "subject_id=%s at=%s error=%s",
+                event_id, event_type, tenant_id, subject_id, now_iso(), exc,
+            )
             return {"ok": False, "error": str(exc)}
 
         return {
@@ -192,26 +269,30 @@ class BillingHooks:
     # Convenience wrappers (called by tools.py)
     # ------------------------------------------------------------------
     #
-    # NOTE (issue #66, see also #105): on_node_write/on_query pre-date this
-    # fix and discard emit()'s return value at both the wrapper and the call
-    # site — a lock-contention or storage failure there is silently invisible
-    # beyond a WARNING log. #105 owns fixing that pair (and emit()'s own
-    # durability: retries, sqlite timeout). The three wrappers below are
-    # newly wired by #66 and deliberately do NOT repeat that swallow: they
-    # return emit()'s {"ok": ...} dict so their call sites can notice (and
-    # log at the handler's own logger) a failed billing write instead of
-    # only relying on BillingHooks' internal warning.
+    # NOTE (issue #66, #105): every wrapper below returns emit()'s
+    # {"ok": ...} dict so its call site CAN notice (and log with its own
+    # tenant/handler context) a failed billing write instead of relying only
+    # on BillingHooks' internal WARNING. on_node_write/on_query used to
+    # return None here, which made that structurally impossible regardless
+    # of whether the call site bothered to check — #105 fixed that pair to
+    # match the other three (wired by #66). The lock contention this pair
+    # used to be exposed to is now avoided structurally (billing has its own
+    # SQLite file — see this module's docstring), not retried around, so
+    # there is no separate "still needs the call site's attention" case to
+    # call out here anymore.
 
-    def on_node_write(self, tenant_id: str, subject_id: str | None, space: str, node_type: str) -> None:
-        self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
+    def on_node_write(
+        self, tenant_id: str, subject_id: str | None, space: str, node_type: str
+    ) -> dict[str, Any]:
+        return self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
 
     def on_edge_write(
         self, tenant_id: str, subject_id: str | None, relation: str
     ) -> dict[str, Any]:
         return self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
 
-    def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> None:
-        self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
+    def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> dict[str, Any]:
+        return self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
 
     def on_ingest(
         self, tenant_id: str, subject_id: str | None, source_id: str

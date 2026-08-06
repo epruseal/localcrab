@@ -27,8 +27,11 @@ class ToolSpec:
     order: int
     # NOTE: `writes` means "needs the cross-process write.lock", NOT "touches a
     # store". See `tool()`'s docstring — a tool can INSERT and still be
-    # writes=False if that write is idempotent append-only (billing_events via
-    # ontology_query is the concrete example, decided in issue #65's review).
+    # writes=False if serialising it behind the lock would cost more (a
+    # read-shaped, high-frequency path) than the write is worth protecting
+    # (billing_events via ontology_query is the concrete example, decided in
+    # issue #65's review; issue #105 corrected the idempotency rationale
+    # originally recorded here — see `tool()`'s docstring below).
     writes: bool = False
 
 
@@ -53,21 +56,31 @@ def tool(
     WRITE_TOOLS set silently missed two write handlers).
 
     The lock exists to serialise concurrent writers across processes so they
-    don't race each other. A store write that is already idempotent and
-    append-only (UNIQUE constraint + INSERT OR IGNORE / ON CONFLICT DO
-    NOTHING, no read-modify-write) does not need that protection — two
-    processes racing to insert the same event_id just both no-op past the
-    first. Marking such a handler `writes=True` anyway would only cost every
-    caller lock contention for no correctness gain (e.g. it would serialise
-    every `ontology_query` call, a read-shaped, high-frequency path, behind a
-    single cross-process mutex just because it also fires an idempotent
-    billing event). Reviewed against issue #68 (E-4, lock ownership map) in
-    #65's review round; concrete example: `ontology_query` calls
-    `billing.on_query()` -> `billing_events` INSERT, and stays `writes=False`.
-    If a future handler performs a NON-idempotent or read-modify-write store
-    mutation, it must be `writes=True` regardless of how "read-shaped" the
-    tool's name looks (this is exactly how #65 was missed for
-    ontology_impact/ontology_lever_simulate).
+    don't race each other. `ontology_query` -> `billing.on_query()` ->
+    `billing_events` INSERT is the one handler that skips it despite writing:
+    NOT because that insert is idempotent (issue #105: it isn't — each call
+    mints a fresh event_id, so the table's UNIQUE(event_id) + INSERT OR
+    IGNORE / ON CONFLICT DO NOTHING only dedupes a literal double-send of the
+    same event_id, and can never resurrect one that failed to persist), and
+    NOT because losing a billing event would be an acceptable trade for
+    query throughput — protecting billing IS a correctness goal, which is
+    the entire reason issue #105 exists. `writes=False` is safe here because
+    the contention this lock would otherwise be needed for DOESN'T HAPPEN:
+    billing_events lives in its own SQLite file (`billing.db`, local/kuzu
+    mode — see `opencrab.stores.factory.make_billing_sql_store`), separate
+    from the write.lock'd tables' file (`opencrab.db`). SQLite's write lock
+    is per-file, so a billing insert never contends with an unrelated write
+    there no matter how long that write holds `write.lock`. (An earlier
+    version of this fix instead retried the insert with backoff on lock
+    contention while still sharing the file — that only shrank the failure
+    window and blocked the request thread doing it; see
+    `opencrab.billing.hooks`'s module docstring for the full analysis,
+    including why WAL would not have been sufficient either.) Reviewed
+    against issue #68 (E-4, lock ownership map) in #65's review round. If a
+    future handler performs a store mutation that a shared file's write
+    lock is the only thing protecting, it must be `writes=True` regardless
+    of how "read-shaped" the tool's name looks (this is exactly how #65 was
+    missed for ontology_impact/ontology_lever_simulate).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
