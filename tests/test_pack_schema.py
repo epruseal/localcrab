@@ -239,6 +239,44 @@ class TestDiagnosticIdentifiesTheFailingRow:
         # 자기참조 기대값을 만든 것이 이번이 세 번째다.
         assert str(ei.value) == f"{kind}에 필수 필드 {missing!r} 가 없다: {rid!r}"
 
+    # 위 6케이스는 전부 **필드를 하나만 뺀 행**이다. 그래서 "여러 필수 필드가 동시에
+    # 없을 때 어느 것을 보고하는가"라는 축이 통째로 비어 있었고, 필수키 튜플 순서를
+    # 역순으로 뒤집는 변이가 87 passed 를 그대로 유지했다(적대 검증 실증, 2026-08-06: D7):
+    #
+    #     row = {'id': None, 'node_type': 'Concept', 'space': 'concept'}   # label 도 없음
+    #     원본  : 노드에 필수 필드 'id' 가 없다: None
+    #     D7 변이: 노드에 필수 필드 'label' 가 없다: None   <- 다른 필드를 지목
+    #
+    # 이 파일의 docstring 이 세 번 반복해 적은 원칙("등가를 측정할 때도 입력이 그 변이가
+    # 건드리는 축을 갈라야 한다")을 **그 원칙을 적은 테스트 자신이** 또 어겼다.
+    # 이번이 네 번째다. 축을 가르는 입력은 "동시에 여러 개가 빈 행"이다.
+    @pytest.mark.parametrize("validator,builder,kind,keys", [
+        (validate_node, _node, "노드", ("id", "label", "node_type", "space")),
+        (validate_edge, _edge, "엣지", ("id", "source_id", "target_id", "label")),
+        (validate_chunk, _chunk, "청크", ("id", "document_id", "text")),
+    ])
+    def test_first_declared_missing_field_is_the_one_reported(
+            self, validator, builder, kind, keys):
+        """여러 필수 필드가 동시에 비면 **선언 순서상 첫 번째**를 보고한다.
+
+        운영자가 수만 행을 고칠 때 "어느 필드부터 채우라"는 지시가 행마다 달라지면
+        진단이 쓸모없어진다. 순서는 계약이다.
+
+        전 조합(2개 동시 부재 전부)을 돈다 — 한 조합만 보면 그 조합만 우연히 맞는
+        순서 변이가 살아남는다.
+        """
+        for i, first in enumerate(keys):
+            for later in keys[i + 1:]:
+                row = builder()
+                row["id"] = "row-1"
+                row[first] = None
+                row[later] = None
+                with pytest.raises(PackSchemaError) as ei:
+                    validator(row)
+                assert ei.value.missing_field == first, (
+                    f"{kind}: {first!r}·{later!r} 가 동시에 비었는데 {ei.value.missing_field!r} 를 "
+                    f"보고했다 — 필수키 선언 순서 {keys} 와 어긋난다")
+
 
 class TestMissingRequiredTemplate:
     """필수 필드 부재 문구를 **한 곳에서** 검사한다.
@@ -275,6 +313,19 @@ class TestMissingRequiredTemplate:
         `getattr(PackSchemaError, "missing_required")` 로 부르면 카운트가 0인데 동작은
         같다(적대 검증 실증, 2026-08-06: `alias_comment_bypass_source_guard` /
         `dynamic_comment_bypass_source_guard`). 문자열이 아니라 **구문 구조**로 본다.
+
+        **이 테스트가 못 보는 것을 정직하게 적는다**(적대 검증 실증, 2026-08-06):
+
+        1. **인자값을 안 본다.** `Call/Attribute/Name` 모양만 확인하므로 kind·key·row_id
+           에 무엇이 담기는지, 필수키 튜플의 내용과 **순서**가 어떤지는 전혀 모른다.
+           튜플 순서 역전 변이(D7)를 이 테스트는 잡지 못한다 —
+           `test_first_declared_missing_field_is_the_one_reported` 가 잡는다.
+        2. **런타임 몬키패치에 눈이 멀어 있다.** 클래스 정의 뒤에
+           `PackSchemaError.missing_required = classmethod(_sneaky)` 로 갈아치우면 raise
+           사이트의 소스 문법은 그대로라 **이 테스트만 단독 실행하면 통과한다**(1 passed).
+           스위트 전체가 24 failed 로 잡는 것은 이 테스트가 아니라 곁의 런타임 동작
+           테스트들이다. 즉 "팩토리 우회를 막는다"는 이 테스트의 방어 범위는
+           **소스 수준 우회까지**다. 그 이상을 기대하지 마라.
         """
         import ast
         import pathlib
