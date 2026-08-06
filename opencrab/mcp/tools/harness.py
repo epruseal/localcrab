@@ -128,6 +128,7 @@ def harness_promotion_apply(
                 node_type=node.node_type,
                 node_id=node.node_id,
                 properties=node.properties or {},
+                subject_id=subject_id,
             )
             node_receipts.append({
                 "node_id": node.node_id,
@@ -146,6 +147,7 @@ def harness_promotion_apply(
                 relation=edge.relation,
                 to_space=edge.to_space,
                 to_id=edge.to_id,
+                subject_id=subject_id,
             )
             edge_receipts.append({
                 "from_id": edge.from_id,
