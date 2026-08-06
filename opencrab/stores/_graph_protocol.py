@@ -362,6 +362,33 @@ class GraphStoreExtended(Protocol):
         collect one row before checking) and negative ``limit`` (which has
         no natural "N rows" meaning; treating it as unbounded would be a
         footgun -- e.g. SQLite maps a bound ``LIMIT -1`` to "no limit").
+
+        SCOPE OF "BACKEND-WIDE" (issue #120, round 3 -- this line exists
+        because "every implementation" was declared twice before without
+        saying what "every" enumerates, and a 5th and 6th implementation
+        were found missing the guard each time it wasn't spelled out):
+        this ``limit <= 0 -> []`` contract covers exactly these 8 methods,
+        no more, no less --
+          - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
+            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared),
+            ``KuzuGraphStore``, ``Neo4jStore``.
+          - ``list_nodes`` / ``list_sources`` / ``get_audit_log`` on all 4
+            doc stores: ``_sql_doc_base.py`` (LocalSQLDocStore + PgDocStore,
+            shared), ``MongoStore``, and ``LocalDocStore`` (the legacy
+            JSON store -- NOT reachable through ``factory.py``, but kept
+            for callers that instantiate it directly per that module's own
+            "WHY LocalDocStore IS KEPT" docstring, so it is in scope too).
+        Explicitly NOT covered, left as pre-existing/tracked-separately
+        gaps rather than silently absorbed into this contract: any other
+        ``limit``-accepting method on these same stores (``find_neighbors``,
+        ``find_by_relations``, ``export_edges``, ``bm25_fingerprint`` --
+        the last is deliberately limit-independent by design, see its own
+        docstring) and any method on a store outside the graph/doc surface
+        entirely (vector stores' top-k ``limit``, ``sql_store.py``'s
+        ``get_impacts`` -- a different subsystem per that module's own
+        docstring: "impact records, ReBAC policy assignments, lever
+        simulations"). A future round extending this contract to one of
+        those must add it to this enumeration, not just fix the code.
         """
         ...
 
