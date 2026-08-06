@@ -207,6 +207,51 @@ class TestStoreWriteSucceeded:
         stores unavailable, key=None must not fall through to success."""
         assert store_write_succeeded({"chromadb": "unavailable", "mongodb": "unavailable"}) is False
 
+    # -----------------------------------------------------------------
+    # Adversarial values (#66 codex re-review, 5th round, finding [1]):
+    # a bare `startswith("ok")` is WIDER than the two real success shapes
+    # ("ok" and "ok (...)") and would silently bill any future status that
+    # merely starts with those two letters. These pin the narrower contract.
+    # -----------------------------------------------------------------
+
+    def test_error_okay_is_not_success(self):
+        """"okay" starts with "ok" but is neither of the two real shapes."""
+        assert store_write_succeeded({"graph": "okay"}, "graph") is False
+
+    def test_error_ok_dash_error_is_not_success(self):
+        assert store_write_succeeded({"graph": "ok-error: disk down"}, "graph") is False
+
+    def test_error_ok_but_failed_is_not_success(self):
+        assert store_write_succeeded({"graph": "ok_but_failed"}, "graph") is False
+
+    def test_error_ok_no_paren_with_trailing_text_is_not_success(self):
+        """"ok " (trailing space, no paren) is not the decorated shape either
+        — only "ok (...)" is recognized, not any "ok <anything>"."""
+        assert store_write_succeeded({"graph": "ok degraded"}, "graph") is False
+
+    def test_normal_real_shapes_still_recognized(self):
+        """The narrower rule must not have thrown out the two real shapes
+        while excluding the adversarial ones above."""
+        assert store_write_succeeded({"graph": "ok"}, "graph") is True
+        assert store_write_succeeded({"docs": "ok (id=abc123)"}, "docs") is True
+
+    # -----------------------------------------------------------------
+    # Non-string defense: a malformed stores map must never raise — a
+    # billing decision blowing up would fail the write it's judging.
+    # -----------------------------------------------------------------
+
+    def test_error_none_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": None}, "graph") is False
+
+    def test_error_dict_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": {"nested": "ok"}}, "graph") is False
+
+    def test_error_int_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": 200}, "graph") is False
+
+    def test_error_non_dict_stores_key_none_does_not_raise(self):
+        assert store_write_succeeded("not a dict", None) is False  # type: ignore[arg-type]
+
 
 # ---------------------------------------------------------------------------
 # _ingest_into_pack — node/edge loops + evidence-node materialisation

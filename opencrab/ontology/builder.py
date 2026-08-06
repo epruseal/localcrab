@@ -397,36 +397,50 @@ def store_write_succeeded(stores: dict[str, Any], key: str | None = None) -> boo
     let malformed/incomplete receipts and ``"unavailable"`` optional-store
     statuses get billed for writes that landed nowhere).
 
-    A status counts as success iff it starts with ``"ok"`` — verified
-    against every literal status string ``OntologyBuilder.add_node``/
-    ``add_edge`` (this module) and ``HybridQuery.ingest``
-    (``opencrab/ontology/query.py``) actually assign, as of issue #66's 4th
-    codex round (a bare ``== "ok"`` comparison had rejected the decorated
-    shape and silently stopped billing real successes — the opposite bug):
+    A status counts as success iff it is EXACTLY ``"ok"`` or matches the
+    decorated shape ``"ok (...)"`` (starts with ``"ok ("``) — the two, and
+    only two, real shapes ``OntologyBuilder.add_node``/``add_edge`` (this
+    module) and ``HybridQuery.ingest`` (``opencrab/ontology/query.py``)
+    actually assign, as of issue #66's 5th codex round:
 
-      recognized as success (all start with "ok", none of the strings below
-      do — this is the whole contract):
+      recognized as success (this is the whole contract, not a prefix
+      guess — a bare ``startswith("ok")`` was tried in the 4th round and
+      rejected for being wider than the real values: it would silently
+      have billed a future ``"okay"``/``"ok-error: ..."`` status too):
         "ok"                     — graph node/edge write, sql registry write
         f"ok (id={mongo_id})"    — Mongo doc write (add_node)
         f"ok (id={vector_id})"   — Chroma vector write (query.py ingest())
 
-      NOT recognized as success (on purpose — a caller that needs one of
-      these treated as success must decide that explicitly, not get it for
-      free from a prefix match):
-        "audited"                 — Mongo edge audit log (add_edge). A
-                                     different word, not "ok"-prefixed. No
-                                     current ``key=None`` caller scans an
-                                     edge's ``stores`` map, so this has never
-                                     been reachable — if one starts to, this
-                                     function will (correctly) not bill it
-                                     until someone decides "audited" counts.
+      NOT recognized as success (on purpose):
+        "audited"                 — Mongo edge audit log (builder.py
+                                     add_edge). This IS a real, positive
+                                     confirmation that the edge write
+                                     happened (log_event succeeded) — but it
+                                     is deliberately excluded here anyway,
+                                     because every current edge-billing
+                                     caller (graph.py#ontology_add_edge,
+                                     harness.py, apply.py) uses
+                                     key="graph", which never reads the
+                                     "docs" entry at all — "audited"
+                                     therefore has zero effect on any real
+                                     billing decision today. Recognizing it
+                                     would only matter for a future
+                                     key=None caller that scans an edge's
+                                     stores map, and nobody has decided
+                                     whether an edge should be billable off
+                                     of its audit log alone (vs. its graph
+                                     write) — so it stays unrecognized
+                                     until that decision is made on purpose,
+                                     not inherited for free.
         "skipped (no text)"       — neither success nor failure.
         "skipped (missing node)"
         "unavailable" / "error: ..." / "no match..." — recognized failures.
 
     CONTRACT (enforced by convention, not code): any new success status
-    added to this codebase MUST start with "ok", or every caller of this
-    function silently stops billing it. See the "ok (id=...)" assignment
+    added to this codebase MUST be exactly "ok" or "ok (...)" , or every
+    caller of this function silently stops billing it — and conversely, a
+    new FAILURE status must NOT start with "ok " (with a trailing space)
+    or it would be misread as success. See the "ok (id=...)" assignment
     sites in this file and in query.py's ``ingest()`` — each carries a
     one-line pointer back to this contract.
 
@@ -443,7 +457,13 @@ def store_write_succeeded(stores: dict[str, Any], key: str | None = None) -> boo
     """
 
     def _is_ok(status: Any) -> bool:
-        return isinstance(status, str) and status.startswith("ok")
+        # Exactly "ok", or the decorated "ok (...)" shape — NOT a bare
+        # startswith("ok") prefix, which would also (wrongly) accept a
+        # future "okay"/"ok-error: ..." status. isinstance() short-circuits
+        # before .startswith() ever runs on a non-string value (None, a
+        # dict, ...), so a malformed status can't raise here — a billing
+        # decision must never blow up the write it's judging.
+        return isinstance(status, str) and (status == "ok" or status.startswith("ok ("))
 
     if not isinstance(stores, dict):
         return False
