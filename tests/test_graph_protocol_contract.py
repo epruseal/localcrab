@@ -517,6 +517,29 @@ class TestExtendedMethodsNeo4jEdge:
 
         assert store.export_edges(pack_id="does-not-exist") == []
 
+    def test_export_nodes_limit_zero_returns_empty_list_without_querying(self):
+        """issue #120: the contract says ``limit <= 0`` returns ``[]``
+        WITHOUT issuing a query -- Neo4j's own LIMIT is a raw Cypher literal
+        (not parameterized), so this can't be proven by result shape alone
+        the way the SQL/Kuzu backends can; asserting ``session.run`` was
+        never called (after the constructor's own connectivity check, hence
+        ``reset_mock()``) is the only way to pin "no query issued" here."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_nodes(limit=0) == []
+        mock_session.run.assert_not_called()
+
+    def test_export_nodes_negative_limit_returns_empty_list_without_querying(self):
+        """issue #120: a raw negative Cypher LIMIT literal is invalid and
+        would raise at the driver -- the guard must short-circuit before
+        that query is ever built, same as limit=0 above."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_nodes(limit=-1) == []
+        mock_session.run.assert_not_called()
+
     def test_upsert_nodes_batch_empty_list_returns_zero(self):
         store, _driver, mock_session = _make_connected_neo4j()
         mock_session.run.reset_mock()

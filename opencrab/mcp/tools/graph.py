@@ -314,9 +314,12 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
                         "Maximum number of `nodes` rows returned (default 100). WITH pack_id: "
                         "does NOT cap `total`, which is the full match count regardless of "
                         "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
-                        "IS capped at `limit` (total == len(nodes) always in that case)."
+                        "IS capped at `limit` (total == len(nodes) always in that case). "
+                        "0 is valid and returns no nodes (issue #120); negative values are "
+                        "rejected."
                     ),
                     "default": 100,
+                    "minimum": 0,
                 },
             },
             "required": [],
