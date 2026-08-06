@@ -236,6 +236,35 @@ class TestOntologyListNodesLocalBackend:
         assert len(result["nodes"]) == 2
         assert result["total"] == 5
 
+    def test_space_mismatch_no_longer_desyncs_total_from_nodes(self, graph, docs):
+        """Issue #118: upsert_node used to store space_id (column) and
+        properties["space"] (JSON) independently. count_exported_nodes
+        counted by the COLUMN; export_nodes returned that same row but
+        _merge_space (JSON wins) reported a DIFFERENT space back out; this
+        tool's own post-filter (`n_space != cleaned_space` below) then
+        dropped it -- producing exactly the `total: 1(+), nodes: []` split
+        the issue reports, whenever the mismatched rows sort ahead of the
+        genuine match and `limit` cuts the page off before reaching it.
+
+        Seeds 3 (== limit) nodes where the caller passed space_id="target"
+        but properties["space"]="other" FIRST, then one genuinely
+        space="target" node AFTER.
+        """
+        for i in range(3):
+            graph.upsert_node(
+                "Lever", f"mis-{i}", {"pack_id": "pack-a", "space": "other"}, space_id="target"
+            )
+        graph.upsert_node("Lever", "real-1", {"pack_id": "pack-a"}, space_id="target")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs}
+            result = ontology_list_nodes(pack_id="pack-a", space="target", limit=3)
+
+        assert result["total"] == len(result["nodes"])
+        assert result["nodes"], "starved: a real space=target match exists but nodes is empty"
+        assert all(n["space"] == "target" for n in result["nodes"])
+        assert result["nodes"][0]["node_id"] == "real-1"
+
 
 # ---------------------------------------------------------------------------
 # ontology_list_edges — real LocalGraphStore backend

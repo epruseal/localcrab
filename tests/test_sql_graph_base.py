@@ -523,3 +523,66 @@ def test_upsert_nodes_batch_empty_returns_zero():
     store = _store()
     assert store.upsert_nodes_batch([]) == 0
     assert store.upsert_edges_batch([]) == 0
+
+
+def test_upsert_nodes_batch_normalizes_space_same_as_upsert_node():
+    """Issue #118: upsert_nodes_batch builds its params dict inline instead
+    of delegating to upsert_node, so it needs the identical
+    _normalize_space reconciliation applied per node -- otherwise a batch
+    caller could reintroduce the exact space_id/properties["space"]
+    divergence upsert_node itself no longer allows."""
+    store = _store()
+    store.upsert_nodes_batch([
+        {
+            "node_type": "Item", "node_id": "a",
+            "properties": {"space": "claim"}, "space_id": "evidence",
+        },
+    ])
+    row = store._conn.execute(
+        "SELECT space_id, properties FROM graph_nodes WHERE node_id='a'"
+    ).fetchone()
+    assert row[0] == "claim"  # column follows the JSON value, not the caller's stale arg
+    assert '"space": "claim"' in row[1]
+
+
+# ---------------------------------------------------------------------------
+# Issue #118: space_id (column) vs properties["space"] (JSON) divergence
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_node_normalizes_space_id_column_to_match_props_space():
+    """Direct invariant check (belt-and-suspenders alongside the
+    find_neighbors/export_nodes starvation regression tests): after
+    upsert_node, the space_id COLUMN must equal the effective
+    properties["space"] value -- the two can no longer diverge."""
+    store = _store()
+    store.upsert_node("Item", "a", {"space": "claim"}, space_id="evidence")
+    row = store._conn.execute(
+        "SELECT space_id, properties FROM graph_nodes WHERE node_id='a'"
+    ).fetchone()
+    assert row[0] == "claim"
+    assert '"space": "claim"' in row[1]
+
+
+def test_export_nodes_space_mismatch_no_longer_desyncs_total_from_len():
+    """Issue #118: total (count_exported_nodes) and len(nodes)
+    (export_nodes) must stay consistent even when rows are written with a
+    caller-mismatched space_id/properties["space"] pair -- see
+    tests/test_mcp_dispatch_extended.py's
+    test_space_mismatch_no_longer_desyncs_total_from_nodes for the
+    end-to-end (ontology_list_nodes) reproduction of the exact
+    `total: N, nodes: []` symptom the issue reports; this pins the same
+    invariant at the store level.
+    """
+    store = _store()
+    for i in range(3):
+        store.upsert_node(
+            "Item", f"mis{i}", {"pack_id": "p1", "space": "other"}, space_id="target"
+        )
+    store.upsert_node("Item", "real", {"pack_id": "p1"}, space_id="target")
+
+    total = store.count_exported_nodes(pack_id="p1", space="target")
+    page = store.export_nodes(pack_id="p1", space="target", limit=3)
+
+    assert total == len(page) == 1
+    assert page[0]["props"]["id"] == "real"

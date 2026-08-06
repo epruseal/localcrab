@@ -114,6 +114,64 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _normalize_space(props: dict[str, Any], space_id: str | None) -> tuple[dict[str, Any], str | None]:
+    """Reconcile a node's two space representations BEFORE a write lands
+    (issue #118), so ``space_id`` (the column SQL/Cypher predicates filter
+    on) and ``props["space"]`` (what ``_merge_space`` below already treats as
+    authoritative on read) can never diverge for any node written through
+    ``upsert_node``/``upsert_nodes_batch`` again.
+
+    Without this, a caller could pass a different value in each place (the
+    ``space_id`` argument vs. an explicit ``properties["space"]`` key) and
+    both landed independently -- ``space_id`` filters (``find_neighbors``,
+    ``export_nodes``/``count_exported_nodes``, Kuzu's ``_scan_space_matching``)
+    then ran on the stale COLUMN ahead of any ``LIMIT``, while the Python
+    post-filter (``_space_passes``, fed by ``_merge_space`` below) checked the
+    JSON value AFTER ``LIMIT`` -- so a hub whose first ``limit`` candidates
+    were all column-matching-but-JSON-mismatched consumed the whole limit and
+    got rejected, starving genuinely valid neighbours further down the scan.
+
+    SAME precedence as ``_merge_space`` (a truthy ``props["space"]`` wins) --
+    not the reverse -- because that precedence is already the store's pinned,
+    tested read-time contract (see
+    tests/test_graph_protocol_contract.py::TestExportCarriesSpace, which
+    predates this fix and must keep passing unchanged): an explicit
+    caller-supplied ``properties["space"]`` has always survived being
+    overwritten by the column. This fix does not change WHICH value wins; it
+    makes the LOSING side (the column) actually get updated to match instead
+    of silently disagreeing forever.
+
+    Returns ``(props, space_id)`` -- ``props`` is the input dict unchanged
+    (same object) unless a value needs folding in (matching ``_merge_space``'s
+    own mutation contract); ``space_id`` is the effective value to persist in
+    the column.
+
+    SCOPE: this closes the divergence for every write going through
+    ``upsert_node``/``upsert_nodes_batch`` from here on. It does NOT retroactively
+    fix rows already divergent before this shipped -- measured live 2026-08-06
+    (see PR description), 0 of 252,604 graph_nodes had a real space_id/
+    properties["space"] disagreement, so no backfill was needed at ship time.
+    # ponytail: SQL/Cypher predicates (find_neighbors, export_nodes,
+    # count_exported_nodes, _scan_space_matching) still filter on the raw
+    # space_id column, not an effective-space expression -- a row written
+    # out-of-band (direct DB edit, restored backup, external migration) after
+    # this ships could still be divergent and still starve a LIMIT-bound
+    # query the way issue #118 describes. Upgrade path if that ever measures
+    # nonzero again: either re-run the backfill query above, or push
+    # COALESCE(NULLIF(json_extract(properties,'$.space'),''), space_id) into
+    # the predicate (measured cost on this store's live 250k-row table: an
+    # indexed `space_id = ?` SEARCH at ~2.5ms became a full `SCAN` at
+    # ~439ms -- 173x -- so pair it with a second index on the JSON
+    # expression, not a bare COALESCE wrap, if it's ever needed).
+    """
+    space = props.get("space")
+    if space:
+        return props, space
+    if space_id:
+        return {**props, "space": space_id}, space_id
+    return props, space_id
+
+
 def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
     """Fold the graph store's ``space_id`` column into a node's properties.
 

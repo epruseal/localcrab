@@ -127,6 +127,7 @@ from opencrab.stores._graph_common import (
     _edge_passes,
     _merge_space,
     _node_passes,
+    _normalize_space,
     _space_passes,
 )
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
@@ -266,6 +267,10 @@ class _SqlGraphStoreBase(abc.ABC):
     ) -> dict[str, Any]:
         self._require_available()
         props = {**properties, "id": node_id}
+        # issue #118: reconcile space_id/props["space"] before either lands,
+        # so the SQL predicates below (space_id column) can never disagree
+        # with what _merge_space would report back out on read.
+        props, space_id = _normalize_space(props, space_id)
         sql = self._dialect.upsert(
             self._table("graph_nodes"),
             ["node_type", "node_id", "space_id", "properties"],
@@ -927,15 +932,21 @@ class _SqlGraphStoreBase(abc.ABC):
             update_cols=["space_id", "properties"],
             json_columns=["properties"],
         )
-        params = [
-            {
+        # issue #118: same write shape as upsert_node (a props dict + a
+        # separate space_id column) built inline here instead of delegating
+        # to upsert_node, so it needs the identical _normalize_space
+        # reconciliation applied per node -- otherwise a batch caller could
+        # reintroduce the exact divergence upsert_node no longer allows.
+        params = []
+        for n in nodes:
+            props = {**n.get("properties", {}), "id": n["node_id"]}
+            props, space_id = _normalize_space(props, n.get("space_id"))
+            params.append({
                 "node_type": n["node_type"],
                 "node_id": n["node_id"],
-                "space_id": n.get("space_id"),
-                "properties": json.dumps({**n.get("properties", {}), "id": n["node_id"]}),
-            }
-            for n in nodes
-        ]
+                "space_id": space_id,
+                "properties": json.dumps(props),
+            })
         self._exec_write_batch(sql, params)
         return len(params)
 

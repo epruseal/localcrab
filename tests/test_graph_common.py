@@ -11,6 +11,7 @@ from opencrab.stores._graph_common import (
     _edge_passes,
     _node_pack_id,
     _node_passes,
+    _normalize_space,
 )
 
 # ---------------------------------------------------------------------------
@@ -123,6 +124,55 @@ class TestAsDict:
     def test_other_types_return_empty_dict(self):
         assert _as_dict(42) == {}
         assert _as_dict([1, 2]) == {}
+
+
+# ---------------------------------------------------------------------------
+# _normalize_space (issue #118)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeSpace:
+    def test_truthy_props_space_wins_and_overwrites_space_id(self):
+        """Same precedence as _merge_space: an explicit properties["space"]
+        survives, and the returned space_id is updated to match it -- the
+        column must never disagree with what a read later reports."""
+        props, space_id = _normalize_space({"space": "claim"}, "evidence")
+        assert props["space"] == "claim"
+        assert space_id == "claim"
+
+    def test_falsy_props_space_is_filled_from_space_id(self):
+        props, space_id = _normalize_space({"space": ""}, "evidence")
+        assert props["space"] == "evidence"
+        assert space_id == "evidence"
+
+    def test_missing_props_space_is_filled_from_space_id(self):
+        props, space_id = _normalize_space({"text": "body"}, "evidence")
+        assert props["space"] == "evidence"
+        assert space_id == "evidence"
+
+    def test_no_space_id_and_no_props_space_leaves_both_absent(self):
+        props, space_id = _normalize_space({"text": "body"}, None)
+        assert "space" not in props
+        assert space_id is None
+
+    def test_no_space_id_but_truthy_props_space_is_promoted_to_space_id(self):
+        """The column must get populated even when the caller only supplied
+        properties["space"] and no explicit space_id -- otherwise the
+        SQL/Kuzu space_id predicates could never match this node at all."""
+        props, space_id = _normalize_space({"space": "concept"}, None)
+        assert props["space"] == "concept"
+        assert space_id == "concept"
+
+    def test_input_dict_not_mutated_when_value_folded_in(self):
+        original = {"text": "body"}
+        props, _space_id = _normalize_space(original, "evidence")
+        assert "space" not in original
+        assert props is not original
+
+    def test_input_dict_returned_unchanged_when_nothing_to_fold(self):
+        original = {"space": "claim"}
+        props, _space_id = _normalize_space(original, "evidence")
+        assert props is original
 
 
 # ---------------------------------------------------------------------------
