@@ -49,9 +49,32 @@ still serialise even under WAL. The only structural fix is not sharing the
 file: no query anywhere in this codebase JOINs ``billing_events`` with
 another table (confirmed by grep), so there was never a reason for it to be
 there. See ``opencrab.stores.factory.make_billing_sql_store`` for the store
-construction and one-time migration of any pre-#105 rows. PG/docker mode is
-unaffected (PostgreSQL uses row-level locking, not a whole-file lock) and
-keeps billing_events on the same database as everything else.
+construction. PG/docker mode is unaffected (PostgreSQL uses row-level
+locking, not a whole-file lock) and keeps billing_events on the same
+database as everything else.
+
+NO AUTOMATIC MIGRATION (issue #105, second review round): a pre-#105 local
+install may still have historical rows sitting in ``opencrab.db``'s
+``billing_events`` table. That table is deliberately left exactly where it
+is — untouched, unrenamed, un-copied. An earlier version of this fix copied
+those rows into ``billing.db`` on startup and renamed the source table; that
+turned out to add its own three bugs (copy-then-rename-then-mark-done is not
+atomic against a mid-sequence crash, two processes racing the same
+first-ever startup could both attempt it with no lock, and the rename itself
+is an unlocked schema write against the very file ``write.lock`` exists to
+serialise — exactly the class of hazard this whole fix is about removing).
+Paying that complexity has no payoff: grep confirms zero callers anywhere in
+this codebase read ``get_usage()``/``list_events()`` (only this module's own
+tests do) and nothing queries ``billing_events`` directly either — the table
+is currently write-only. Splitting write-only, unread history across two
+files costs nothing today. If a real consumer of billing history shows up,
+migrate explicitly at that point: write a one-off script (same shape as
+``scripts/migrate_sqlite_to_pg.py``) that reads the old rows from
+``opencrab.db`` with a plain ``SELECT`` and ``INSERT OR IGNORE``s them into
+``billing.db`` — a single, human-triggered pass with no crash-recovery or
+concurrent-startup story to design, because it isn't running in every
+process's boot path anymore. See ``docs/ARCHITECTURE.md``'s billing.db entry
+for the same note aimed at operators, not just this code's future authors.
 """
 
 from __future__ import annotations
@@ -125,106 +148,15 @@ class BillingHooks:
     All methods are fire-and-forget (errors are logged, never raised).
     """
 
-    def __init__(self, sql_store: Any, *, migrate_from: Any | None = None) -> None:
+    def __init__(self, sql_store: Any) -> None:
         self._sql = sql_store
         self._ensure_tables()
-        if migrate_from is not None:
-            self._migrate_from(migrate_from)
 
     def _ensure_tables(self) -> None:
         try:
             ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)
-
-    def _migrate_from(self, old_store: Any) -> None:
-        """One-time copy of any billing_events rows left behind in
-        `old_store` by a pre-#105 install (where billing shared opencrab.db
-        with write.lock'd tables -- see this module's docstring).
-
-        Cost on every call after the first successful run: one
-        ``Path.exists()`` stat -- a marker file next to the target SQLite db
-        short-circuits before opening either database, so a large or
-        growing old table costs nothing on later startups (a naive
-        ATTACH+INSERT-every-boot would re-scan the whole old table forever).
-
-        Uses raw ``sqlite3`` rather than either store's SQLAlchemy engine:
-        ATTACH/DETACH's transaction scoping is otherwise at the mercy of
-        SQLAlchemy's implicit BEGIN, and a raw connection can be closed
-        outright afterwards instead of returning an attached-database handle
-        to a pool for some future, unrelated query to trip over.
-
-        Deliberately does not DROP the old table (only ever meaningful in
-        SQLite local/kuzu mode, and only if it's actually SQLite -- PG has
-        nothing to migrate and never calls this): an operator inspecting
-        opencrab.db later must not mistake it for live data, so a
-        successful migration also renames it to
-        ``billing_events_migrated_to_billing_db`` -- unmistakable from the
-        schema itself, not just a log line that may have scrolled away.
-        Actually dropping it, if ever wanted, is a separate explicit action.
-        """
-        import sqlite3
-        from pathlib import Path
-
-        new_url = getattr(self._sql, "_url", "")
-        old_url = getattr(old_store, "_url", "")
-        if not (new_url.startswith("sqlite:///") and old_url.startswith("sqlite:///")):
-            return  # only meaningful for two real SQLite files
-
-        new_db_path = Path(new_url[len("sqlite:///"):])
-        old_db_path = Path(old_url[len("sqlite:///"):])
-        marker = new_db_path.parent / f"{new_db_path.name}.migrated"
-        if marker.exists():
-            return
-        if not old_db_path.is_file():
-            marker.touch()  # fresh install, nothing to migrate -- stay free forever
-            return
-
-        try:
-            old_conn = sqlite3.connect(str(old_db_path))
-            try:
-                has_table = old_conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='billing_events'"
-                ).fetchone()
-                if has_table:
-                    new_conn = sqlite3.connect(str(new_db_path))
-                    try:
-                        new_conn.execute("ATTACH DATABASE ? AS old_billing", (str(old_db_path),))
-                        cur = new_conn.execute(
-                            "INSERT OR IGNORE INTO billing_events "
-                            "(event_id, tenant_id, subject_id, event_type, count, metadata, created_at) "
-                            "SELECT event_id, tenant_id, subject_id, event_type, count, metadata, created_at "
-                            "FROM old_billing.billing_events"
-                        )
-                        moved = cur.rowcount
-                        new_conn.commit()
-                        new_conn.execute("DETACH DATABASE old_billing")
-                    finally:
-                        new_conn.close()
-
-                    old_conn.execute(
-                        "ALTER TABLE billing_events RENAME TO billing_events_migrated_to_billing_db"
-                    )
-                    old_conn.commit()
-
-                    if moved > 0:
-                        logger.info(
-                            "billing_events: migrated %d historical row(s) from %s to %s "
-                            "(issue #105). The old table in %s is renamed to "
-                            "billing_events_migrated_to_billing_db -- stale, kept for safety, "
-                            "no longer read or written by BillingHooks.",
-                            moved, old_db_path.name, new_db_path.name, old_db_path.name,
-                        )
-            finally:
-                old_conn.close()
-        except Exception as exc:
-            logger.warning(
-                "billing_events migration to %s failed, will retry next startup: %s",
-                new_db_path.name, exc,
-            )
-            return  # marker NOT written -- retry next process start
-
-        marker.touch()
 
     # ------------------------------------------------------------------
     # Core emit
@@ -301,7 +233,18 @@ class BillingHooks:
             # same instant) is rare and brief enough for the DBAPI's own
             # busy-timeout (sql_store.py's explicit `timeout`) to absorb
             # without any retry loop of ours.
-            logger.warning("BillingHooks.emit failed: %s", exc)
+            #
+            # issue #105 (2nd review round): a bare "emit failed: <exc>" log
+            # identifies THAT something was lost but not WHAT -- an operator
+            # grepping logs after the fact can't tell which event, whose
+            # tenant, or when. Log every field that would have identified the
+            # row, not just the exception, so a lost event is at least
+            # reconstructable from the log even with no durable counter.
+            logger.warning(
+                "BillingHooks.emit failed: event_id=%s event_type=%s tenant_id=%s "
+                "subject_id=%s at=%s error=%s",
+                event_id, event_type, tenant_id, subject_id, now_iso(), exc,
+            )
             return {"ok": False, "error": str(exc)}
 
         return {

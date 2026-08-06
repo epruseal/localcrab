@@ -4,8 +4,20 @@ Tests for opencrab.stores.factory.make_billing_sql_store (issue #105).
 Focus: billing_events gets its own SQLite file in local/kuzu mode instead
 of sharing opencrab.db with write.lock'd tables (see opencrab/billing/
 hooks.py's module docstring for why sharing the file was the actual bug),
-PG/docker mode is untouched, and any rows a pre-#105 install already wrote
-to the old, shared table get migrated over exactly once.
+and PG/docker mode is untouched.
+
+NO MIGRATION (issue #105, second review round): an earlier version of this
+fix copied any pre-#105 rows out of opencrab.db's billing_events into the
+new billing.db on startup, gated by a marker file. codex's re-review found
+three real problems with that: the copy-then-rename-then-mark-done sequence
+wasn't atomic against a mid-sequence crash, two processes racing the very
+first startup could both attempt it with no lock between them, and the
+rename itself was an unlocked schema write against the shared file --
+exactly the class of hazard this fix exists to remove. Since nothing in
+this codebase reads billing_events (see opencrab.billing.hooks's module
+docstring), paying that complexity had no payoff. The tests below pin the
+reverted behaviour: billing.db starts empty and opencrab.db's old table (if
+any) is left completely alone.
 """
 
 from __future__ import annotations
@@ -36,12 +48,11 @@ class TestMakeBillingSqlStoreRouting:
         settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
         sql = make_sql_store(settings)
 
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
+        billing_store = make_billing_sql_store(settings, sql)
 
         assert billing_store is not sql
         assert billing_store._url == f"sqlite:///{tmp_path / 'billing.db'}"
         assert sql._url == f"sqlite:///{tmp_path / 'opencrab.db'}"
-        assert migrate_from is sql
 
     def test_kuzu_mode_also_gets_a_separate_billing_db_file(self, tmp_path):
         """kuzu is a local-mode variant (only the graph store differs) --
@@ -53,13 +64,12 @@ class TestMakeBillingSqlStoreRouting:
         settings = Settings(STORAGE_MODE="kuzu", LOCAL_DATA_DIR=str(tmp_path))
         sql = make_sql_store(settings)
 
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
+        billing_store = make_billing_sql_store(settings, sql)
 
         assert billing_store is not sql
         assert billing_store._url == f"sqlite:///{tmp_path / 'billing.db'}"
-        assert migrate_from is sql
 
-    def test_pg_mode_reuses_the_same_store_and_skips_migration(self, tmp_path):
+    def test_pg_mode_reuses_the_same_store(self, tmp_path):
         """PG uses row-level locking, not a whole-file lock -- there is no
         contention to separate billing away from, so no second connection
         should even be opened."""
@@ -69,31 +79,32 @@ class TestMakeBillingSqlStoreRouting:
         settings = Settings(STORAGE_MODE="pg", POSTGRES_URL="postgresql://unused/db")
         fake_sql = object()  # identity check only -- must never be dereferenced
 
-        billing_store, migrate_from = make_billing_sql_store(settings, fake_sql)
+        billing_store = make_billing_sql_store(settings, fake_sql)
 
         assert billing_store is fake_sql
-        assert migrate_from is None
 
-    def test_docker_mode_reuses_the_same_store_and_skips_migration(self, tmp_path):
+    def test_docker_mode_reuses_the_same_store(self, tmp_path):
         from opencrab.config import Settings
         from opencrab.stores.factory import make_billing_sql_store
 
         settings = Settings(STORAGE_MODE="docker", POSTGRES_URL="postgresql://unused/db")
         fake_sql = object()
 
-        billing_store, migrate_from = make_billing_sql_store(settings, fake_sql)
+        billing_store = make_billing_sql_store(settings, fake_sql)
 
         assert billing_store is fake_sql
-        assert migrate_from is None
 
 
-class TestBillingEventsMigration:
-    def test_migrates_pre_105_rows_and_marks_old_table_stale(self, tmp_path):
+class TestNoAutomaticMigration:
+    def test_billing_db_starts_empty_even_when_old_table_has_rows(self, tmp_path):
+        """The core reverted behaviour: opencrab.db having historical
+        billing_events rows must NOT make billing.db start pre-populated --
+        no ATTACH, no copy, nothing reads the old table at all."""
         from opencrab.config import Settings
         from opencrab.stores.factory import make_billing_sql_store, make_sql_store
 
         settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
-        sql = make_sql_store(settings)  # creates opencrab.db (no billing_events yet)
+        sql = make_sql_store(settings)  # creates opencrab.db
         old_path = tmp_path / "opencrab.db"
 
         # Simulate a pre-#105 install: billing_events already lives in
@@ -107,30 +118,15 @@ class TestBillingEventsMigration:
         conn.commit()
         conn.close()
 
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
-        hooks = BillingHooks(billing_store, migrate_from=migrate_from)
+        billing_store = make_billing_sql_store(settings, sql)
+        hooks = BillingHooks(billing_store)
 
-        events = hooks.list_events(tenant_id="legacy", limit=10)
-        assert {e["event_id"] for e in events} == {"evt_pre105_a", "evt_pre105_b"}
+        assert hooks.list_events(tenant_id="legacy", limit=10) == []
 
-        # Old table is unmistakably stale -- renamed, not silently left
-        # under the live name for a future reader to mistake for current
-        # data (issue #105 review: "keep it, but leave a trace").
-        check = sqlite3.connect(str(old_path))
-        names = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        check.close()
-        assert "billing_events" not in names
-        assert "billing_events_migrated_to_billing_db" in names
-
-        marker = tmp_path / "billing.db.migrated"
-        assert marker.exists()
-
-    def test_second_construction_short_circuits_on_marker_no_db_touched(self, tmp_path, monkeypatch):
-        """Cost after the first successful migration must be ~free: a
-        Path.exists() stat, nothing more. Proven here by making sqlite3.connect
-        raise -- if the migration path were re-entered (e.g. a naive
-        re-scan of a possibly-large old table on every startup), this
-        would fail loudly instead of just being slow."""
+    def test_old_table_in_opencrab_db_is_left_completely_untouched(self, tmp_path):
+        """Not renamed, not dropped, not written to -- the exact row count,
+        name, and content from before BillingHooks ever ran must survive
+        unchanged. No marker file is created anywhere either."""
         from opencrab.config import Settings
         from opencrab.stores.factory import make_billing_sql_store, make_sql_store
 
@@ -143,44 +139,39 @@ class TestBillingEventsMigration:
         conn.execute("INSERT INTO billing_events (event_id, event_type) VALUES ('evt_x', 'query')")
         conn.commit()
         conn.close()
+        before_mtime = old_path.stat().st_mtime_ns
 
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
-        BillingHooks(billing_store, migrate_from=migrate_from)  # first run: real migration
-        assert (tmp_path / "billing.db.migrated").exists()
+        billing_store = make_billing_sql_store(settings, sql)
+        BillingHooks(billing_store)
 
-        def _boom(*args, **kwargs):
-            raise AssertionError("sqlite3.connect must not be called once the marker exists")
+        after_mtime = old_path.stat().st_mtime_ns
+        assert after_mtime == before_mtime  # never opened for writing
 
-        monkeypatch.setattr(sqlite3, "connect", _boom)
-        billing_store2, migrate_from2 = make_billing_sql_store(settings, sql)
-        hooks2 = BillingHooks(billing_store2, migrate_from=migrate_from2)  # must not touch sqlite3
-        monkeypatch.undo()
+        check = sqlite3.connect(str(old_path))
+        names = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        rows = check.execute("SELECT event_id FROM billing_events").fetchall()
+        check.close()
+        assert "billing_events" in names  # still the live name, not renamed
+        assert [r[0] for r in rows] == ["evt_x"]  # untouched
 
-        events = hooks2.list_events(limit=10)
-        assert len(events) == 1  # unchanged -- no duplicate work happened
+        assert not (tmp_path / "billing.db.migrated").exists()  # no marker machinery left behind
 
-    def test_fresh_install_with_no_old_table_sets_marker_immediately(self, tmp_path):
-        """No pre-existing billing_events at all (e.g. a fresh install, or
-        the old opencrab.db doesn't even exist yet) must not error, and
-        must still set the marker so future startups skip the check too."""
+    def test_no_second_connection_or_marker_ever_touches_old_db(self, tmp_path, monkeypatch):
+        """Constructing BillingHooks against the new store must never open a
+        second sqlite3 connection at all -- there is no migration code path
+        left to open one."""
         from opencrab.config import Settings
         from opencrab.stores.factory import make_billing_sql_store, make_sql_store
 
         settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
-        sql = make_sql_store(settings)  # opencrab.db exists, but no billing_events table
+        sql = make_sql_store(settings)
 
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
-        hooks = BillingHooks(billing_store, migrate_from=migrate_from)
+        def _boom(*args, **kwargs):
+            raise AssertionError("BillingHooks must not touch raw sqlite3 at all")
 
-        assert hooks.list_events(limit=10) == []
-        assert (tmp_path / "billing.db.migrated").exists()
+        monkeypatch.setattr(sqlite3, "connect", _boom)
+        billing_store = make_billing_sql_store(settings, sql)
+        hooks = BillingHooks(billing_store)  # uses SQLAlchemy only, not raw sqlite3
+        monkeypatch.undo()
 
-    def test_pg_mode_migrate_from_none_is_a_true_no_op(self, tmp_path):
-        """migrate_from=None (PG/docker) must not attempt anything -- pins
-        that BillingHooks.__init__ only calls _migrate_from when a real old
-        store is passed."""
-        from opencrab.stores.sql_store import SQLStore
-
-        store = SQLStore("sqlite:///:memory:")
-        hooks = BillingHooks(store, migrate_from=None)  # must not raise
         assert hooks.list_events(limit=10) == []

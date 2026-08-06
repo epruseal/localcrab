@@ -119,6 +119,30 @@ class TestEmitFailure:
         assert "error" in result
         assert "event_id" not in result
 
+    def test_failure_log_identifies_the_lost_event_not_just_the_exception(self, caplog):
+        """#105 (2nd review round): emit_failure_count (an unreadable
+        process-local counter) was removed because nothing could ever read
+        it. The replacement is a log line an operator can actually grep
+        after the fact -- it must carry enough to identify WHAT was lost
+        (event_id, event_type, tenant_id), not just that something failed."""
+        import logging
+
+        store = SQLStore("sqlite:///:memory:")
+        hooks = BillingHooks(store)
+        hooks._sql._engine = _BrokenEngine()
+
+        with caplog.at_level(logging.WARNING):
+            result = hooks.emit("harness_apply", tenant_id="acme-corp", subject_id="u42")
+
+        assert result["ok"] is False
+        records = [r.message for r in caplog.records if "BillingHooks.emit failed" in r.message]
+        assert len(records) == 1
+        message = records[0]
+        assert "harness_apply" in message
+        assert "acme-corp" in message
+        assert "u42" in message
+        assert "evt_" in message  # the event_id that would have been persisted
+
     def test_on_node_write_and_on_query_never_raise_and_report_ok_false(self):
         """#105: on_node_write/on_query used to return None, which made it
         structurally impossible for ANY caller to notice a failed persist —
@@ -249,8 +273,8 @@ class TestBillingNotBlockedByWriteLockHolder:
 
         settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
         sql = make_sql_store(settings)  # creates opencrab.db + its tables
-        billing_store, migrate_from = make_billing_sql_store(settings, sql)
-        hooks = BillingHooks(billing_store, migrate_from=migrate_from)
+        billing_store = make_billing_sql_store(settings, sql)
+        hooks = BillingHooks(billing_store)
         assert billing_store is not sql  # sanity: really is a separate file
 
         blocker = self._hold_write_lock(tmp_path / "opencrab.db")

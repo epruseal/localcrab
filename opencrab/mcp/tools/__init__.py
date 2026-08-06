@@ -211,10 +211,9 @@ def _get_context() -> dict[str, Any]:
     # issue #105: billing_events gets its own SQLite file in local/kuzu mode
     # (a no-op passthrough to `sql` in pg/docker mode) — see
     # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
-    # module docstring for why.
+    # module docstring (including "NO AUTOMATIC MIGRATION") for why.
     from opencrab.billing.hooks import BillingHooks
-    billing_sql, billing_migrate_from = make_billing_sql_store(cfg, sql)
-    billing = BillingHooks(billing_sql, migrate_from=billing_migrate_from)
+    billing = BillingHooks(make_billing_sql_store(cfg, sql))
 
     _context = {
         "neo4j": graph,
