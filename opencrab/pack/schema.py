@@ -295,7 +295,16 @@ class PackSchemaError(ValueError):
     단언을 네 번 고쳤고, 마지막에도 부정문 우회가 남았다
     (`... 가 없다? 아니다, 있다: ...` 가 통과, 2026-08-06 적대 검증).
 
-    문구는 사람이 읽는 것이고, `missing_field` / `row_id` 가 기계가 읽는 것이다.
+    **문구도 계약이다 — 속성만으로는 부족하다.** 처음엔 "문구는 리뷰 사안"이라고 판단했는데
+    틀렸다. MCP 도구가 예외를 `{"error": str(exc)}` 로 감싸 그대로 응답에 싣고
+    (`opencrab/mcp/tools/graph.py:128,202`, `_registry.py:82`), 적재기·API 도 `str(exc)` 만
+    로그에 남긴다. `missing_field`/`row_id` 는 현재 이 모듈과 테스트 밖에서 아무도 안 읽는다.
+    즉 **거짓 문구가 운영 사용자에게 그대로 도달하는 실경로가 있다**(적대 검증이 MCP handler 에
+    거짓 메시지를 주입해 실증, 2026-08-06).
+
+    그래서 문구를 **속성에서 생성**한다. 세 검사가 각자 f-string 을 손으로 쓰면 문구와 속성이
+    어긋날 수 있지만, 아래 :meth:`missing_required` 를 통하면 어긋날 수가 없다 — 템플릿이
+    한 곳뿐이고 그 한 곳만 검사하면 된다.
     """
 
     def __init__(self, message: str, *, missing_field: str | None = None,
@@ -303,6 +312,16 @@ class PackSchemaError(ValueError):
         super().__init__(message)
         self.missing_field = missing_field
         self.row_id = row_id
+
+    @classmethod
+    def missing_required(cls, kind: str, key: str, row_id: Any) -> PackSchemaError:
+        """필수 필드 부재 오류. **문구와 속성을 한 자리에서 함께 만든다.**
+
+        호출부가 f-string 을 직접 쓰지 못하게 하는 것이 요점이다. 문구를 바꾸려면 이
+        템플릿을 고쳐야 하고, 그러면 이 한 곳을 보는 테스트가 곧바로 잡는다.
+        """
+        return cls(f"{kind}에 필수 필드 {key!r} 가 없다: {row_id!r}",
+                   missing_field=key, row_id=row_id)
 
 
 def validate_node_props(nid: Any, props: dict[str, Any] | None) -> None:
@@ -337,9 +356,7 @@ def validate_node(row: dict[str, Any], *, allow_legacy_top_level: bool = True) -
     # 이지만 **접근 방식**은 계약이다 — "메시지일 뿐"이라고 단순화하지 마라.
     for key in ("id", "label", "node_type", "space"):
         if not row.get(key):
-            raise PackSchemaError(
-                f"노드에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
-                missing_field=key, row_id=row.get("id"))
+            raise PackSchemaError.missing_required("노드", key, row.get("id"))
     if row["space"] not in ALL_SPACES:
         raise PackSchemaError(
             f"노드 {row['id']!r} 의 space {row['space']!r} 가 9-space 밖이다: {ALL_SPACES}")
@@ -359,9 +376,7 @@ def validate_edge(row: dict[str, Any]) -> None:
     """edges.jsonl 한 행을 검사한다."""
     for key in ("id", "source_id", "target_id", "label"):
         if not row.get(key):
-            raise PackSchemaError(
-                f"엣지에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
-                missing_field=key, row_id=row.get("id"))
+            raise PackSchemaError.missing_required("엣지", key, row.get("id"))
     props = row.get("properties")
     if props is not None and not isinstance(props, dict):
         raise PackSchemaError(
@@ -377,9 +392,7 @@ def validate_chunk(row: dict[str, Any]) -> None:
     """chunks.jsonl 한 행을 검사한다."""
     for key in ("id", "document_id", "text"):
         if row.get(key) is None:
-            raise PackSchemaError(
-                f"청크에 필수 필드 {key!r} 가 없다: {row.get('id')!r}",
-                missing_field=key, row_id=row.get("id"))
+            raise PackSchemaError.missing_required("청크", key, row.get("id"))
     meta = row.get("metadata")
     if meta is not None and not isinstance(meta, dict):
         raise PackSchemaError(

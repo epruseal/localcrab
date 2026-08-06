@@ -231,9 +231,54 @@ class TestDiagnosticIdentifiesTheFailingRow:
         # 어떤 언어로 쓰든, 부정문을 넣든 이 계약은 흔들리지 않는다.
         assert ei.value.missing_field == missing
         assert ei.value.row_id == rid
-        # 사람이 읽는 문구에도 두 값이 있어야 한다(운영자가 로그만 보는 경우).
-        # 이건 **보조** 단언이다 — 구조화 속성이 정본이므로 문구는 느슨하게만 본다.
-        assert repr(missing) in str(ei.value) and repr(rid) in str(ei.value)
+        # 문구는 팩토리가 만든다 — 세 검사가 각자 쓰지 않으므로 여기서는 "그 템플릿을
+        # 썼는가"만 본다. 문구 자체의 정확성은 아래 TestMissingRequiredTemplate 이 한 곳에서 건다.
+        assert str(ei.value) == str(
+            PackSchemaError.missing_required(str(ei.value).split("에 ")[0], missing, rid))
+
+
+class TestMissingRequiredTemplate:
+    """필수 필드 부재 문구를 **한 곳에서** 검사한다.
+
+    처음엔 "문구는 리뷰 사안이지 테스트 사안이 아니다"라고 판단하고 속성만 검사했다.
+    **틀렸다.** MCP 도구가 예외를 `{"error": str(exc)}` 로 감싸 그대로 응답에 싣고
+    (`opencrab/mcp/tools/graph.py:128,202`), `missing_field`/`row_id` 는 이 모듈과 테스트
+    밖에서 아무도 안 읽는다. 즉 **거짓 문구가 운영 사용자에게 도달하는 실경로가 있다**
+    (적대 검증이 MCP handler 에 거짓 메시지를 주입해 실증, 2026-08-06).
+
+    문구가 계약이라면 문자열 검사가 필요하다. 다만 그것을 **세 자리에 흩어 두면** 앞서
+    네 라운드를 태운 부분문자열 싸움이 되풀이된다. 팩토리로 템플릿을 한 곳에 모았으니
+    여기 한 자리만 정확히 못박으면 된다.
+    """
+
+    @pytest.mark.parametrize("kind", ["노드", "엣지", "청크"])
+    def test_message_is_exactly_the_template(self, kind):
+        e = PackSchemaError.missing_required(kind, "label", "row-1")
+        assert str(e) == f"{kind}에 필수 필드 'label' 가 없다: 'row-1'"
+        assert (e.missing_field, e.row_id) == ("label", "row-1")
+
+    def test_message_states_absence_not_presence(self):
+        """부정문·역전 문구를 막는다. 템플릿이 한 곳이라 이 검사 하나로 충분하다."""
+        msg = str(PackSchemaError.missing_required("노드", "label", "row-1"))
+        assert msg.endswith("가 없다: 'row-1'"), msg
+        for bad in ("아니다", "있다:", "정상", "실패"):
+            assert bad not in msg.replace("가 없다", ""), f"{bad!r} 가 문구에 섞였다: {msg}"
+
+    def test_every_raise_site_uses_the_factory(self):
+        """세 검사가 f-string 을 직접 쓰면 문구와 속성이 다시 어긋날 수 있다.
+
+        소스에서 필수필드 문구가 **정확히 한 번**(팩토리 안)만 나타나는지 본다.
+        두 번 이상이면 어딘가가 템플릿을 복제한 것이다.
+        """
+        import pathlib
+
+        import opencrab.pack.schema as m
+        src = pathlib.Path(m.__file__).read_text(encoding="utf-8")
+        assert src.count("PackSchemaError.missing_required(") == 3, \
+            "node/edge/chunk 세 검사가 전부 팩토리를 써야 한다"
+        assert src.count("def missing_required(") == 1
+        assert src.count("필수 필드 {key!r}") == 1, \
+            "필수필드 문구는 팩토리에만 있어야 한다 — 호출부가 직접 쓰면 속성과 어긋난다"
 
 
 class TestValidateNode:
