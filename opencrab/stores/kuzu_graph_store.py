@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from opencrab.stores._graph_common import (
+    KEYWORD_SEARCH_FIELDS,
     _edge_passes,
     _merge_space,
     _node_passes,
@@ -705,6 +706,47 @@ class KuzuGraphStore:
             for _ntype, props in self._scan_space_matching(space)
             if self._matches_pack_id(props, pack_id)
         )
+
+    def search_nodes(
+        self,
+        keyword: str,
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search of ``keyword`` across ``fields``
+        of every node, restricted to ``spaces`` if given (issue #86, the
+        same "LIMIT before filter" class ``_scan_space_matching``'s
+        ``pack_id`` branch fixed for #54's Kuzu port):
+        ``HybridQuery.keyword_search`` used to fetch only the first 50,000
+        rows via ``export_nodes`` and search only those in Python, silently
+        missing ~80% of a 252k-row corpus with no error.
+
+        ``spaces`` (a real ``space_id`` column, unlike the search fields
+        below) is pushed into the Cypher WHERE clause. The search fields
+        themselves live inside the JSON-serialized ``props`` blob, which
+        Cypher can't index into any more than it can for ``pack_id`` (see
+        ``_scan_space_matching``'s docstring) -- so this streams every
+        space-matching row with NO LIMIT clause and stops only once
+        ``limit`` keyword matches are found, i.e. LIMIT is applied AFTER
+        the keyword filter, not before."""
+        self._require_available()
+        kw_lower = keyword.lower()
+        where_clause = "WHERE n.space_id IN $spaces " if spaces else ""
+        params: dict[str, Any] = {"spaces": spaces} if spaces else {}
+        r = self._conn.execute(
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.node_type, n.space_id, n.props",
+            params,
+        )
+        results: list[dict[str, Any]] = []
+        while r.has_next():
+            ntype, space_id, props_raw = r.get_next()
+            props = _merge_space(_parse(props_raw), space_id)
+            if any(kw_lower in str(props[f]).lower() for f in fields if props.get(f)):
+                results.append({"props": props, "labels": [ntype]})
+                if len(results) >= limit:
+                    break
+        return results
 
     def export_edges(
         self,

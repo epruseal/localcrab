@@ -504,6 +504,59 @@ def test_count_exported_nodes_query_uses_space_index_not_full_scan():
     assert "idx_nodes_space" in plan_text
 
 
+def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap():
+    """issue #86: HybridQuery.keyword_search used to call
+    ``export_nodes(limit=_BM25_NODE_LIMIT)`` (50,000) and search only THOSE
+    rows in Python -- on a 252k-row corpus, ~80% of nodes were silently
+    unreachable by keyword search. This is #54's limit-before-filter class
+    applied to the keyword predicate instead of pack_id/space.
+
+    Seeds 60 "noise" nodes (no keyword match) inserted first, then 5
+    keyword-matching nodes inserted last -- if search_nodes truncated the
+    scan to some cap before matching (the old export_nodes-based approach,
+    with any cap smaller than 60), these 5 would sort past the boundary and
+    never be found. search_nodes pushes the keyword predicate into the SQL
+    WHERE clause instead, so it finds all 5 regardless of scan order or
+    corpus size."""
+    store = _store()
+    for i in range(60):
+        store.upsert_node("Item", f"noise{i:03d}", {"name": f"unrelated {i}"})
+    for i in range(5):
+        store.upsert_node("Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+
+    rows = store.search_nodes("needle", limit=10)
+
+    assert len(rows) == 5
+    assert all("needle" in r["props"]["name"] for r in rows)
+
+
+def test_search_nodes_space_filter_pushed_ahead_of_limit():
+    """spaces is pushed into the same WHERE clause as the keyword predicate
+    (both ahead of LIMIT), mirroring export_nodes' space pushdown (#54)."""
+    store = _store()
+    store.upsert_node("Item", "n-claim", {"name": "shared term"}, space_id="claim")
+    store.upsert_node("Item", "n-policy", {"name": "shared term"}, space_id="policy")
+
+    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["space"] == "claim"
+
+
+def test_search_nodes_escapes_like_wildcards():
+    """A literal ``%``/``_`` in the search keyword must be matched literally,
+    not interpreted as a SQL LIKE wildcard -- otherwise a keyword like
+    "50%" would match every row instead of only rows containing "50%"."""
+    store = _store()
+    store.upsert_node("Item", "n-1", {"name": "discount 50% today"})
+    store.upsert_node("Item", "n-2", {"name": "discount fifty percent today"})
+
+    rows = store.search_nodes("50%", limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["name"] == "discount 50% today"
+
+
 def test_upsert_nodes_batch_and_edges_batch():
     store = _store()
     n = store.upsert_nodes_batch([

@@ -377,6 +377,44 @@ def test_count_exported_nodes_with_pack_id_has_no_limit_clause(store, monkeypatc
 
 
 # ------------------------------------------------------------------
+# Issue #86: keyword search_nodes must not truncate the scan before
+# applying the keyword filter (the pack_id-in-Kuzu #54 pattern applied to
+# a keyword predicate instead of pack_id).
+# ------------------------------------------------------------------
+
+
+def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
+    """HybridQuery.keyword_search used to call export_nodes(limit=50000)
+    and search only those rows in Python, silently missing the rest of a
+    corpus larger than that cap. search_nodes instead streams every
+    space-matching row with no LIMIT and Python-filters keyword, stopping
+    only once `limit` matches are found -- so matches after any arbitrary
+    scan boundary are still found. Seeds 60 non-matching nodes first, then
+    5 matching nodes last."""
+    for i in range(60):
+        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}"})
+    for i in range(5):
+        store.upsert_node("X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+
+    rows = store.search_nodes("needle", limit=10)
+
+    assert len(rows) == 5
+    assert all("needle" in r["props"]["name"] for r in rows)
+
+
+def test_search_nodes_space_filter_pushed_into_cypher(store) -> None:
+    """spaces is pushed into the Cypher WHERE clause (space_id is a real
+    column), narrowing the scan before the Python keyword filter runs."""
+    store.upsert_node("X", "n-claim", {"name": "shared term"}, space_id="claim")
+    store.upsert_node("X", "n-policy", {"name": "shared term"}, space_id="policy")
+
+    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["space"] == "claim"
+
+
+# ------------------------------------------------------------------
 # Issue #118: space_id (column) vs properties["space"] (JSON) divergence
 # ------------------------------------------------------------------
 

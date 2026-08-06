@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Node-property fields ``HybridQuery.keyword_search()``
+# (opencrab/ontology/query.py) matches a keyword against. Shared by every
+# graph-store backend's ``search_nodes()`` (_sql_graph_base.py,
+# kuzu_graph_store.py) AND by query.py itself, so the field list can't drift
+# between backends the way the old inline duplicate risked (issue #86).
+KEYWORD_SEARCH_FIELDS: tuple[str, ...] = (
+    "name",
+    "description",
+    "text",
+    "title",
+    "label",
+    "summary",
+)
+
 
 def _node_pack_id(props: dict[str, Any]) -> str | None:
     """Top-level lookup mirroring the unified provenance helper.
