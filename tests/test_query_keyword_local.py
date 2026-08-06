@@ -179,6 +179,26 @@ def test_keyword_search_finds_matches_beyond_any_node_scan_cap(
     assert all("needle" in r["node"]["name"] for r in results)
 
 
+def test_keyword_search_matches_non_ascii_case_insensitively(
+    hybrid: HybridQuery, local_store: LocalGraphStore
+) -> None:
+    """issue #86 verifier finding: search_nodes()'s SQL predicate lowers the
+    stored value with SQLite's builtin ``LOWER()``, which is ASCII-only -- a
+    stored "FÜR" would stay "FÜR" (Ü untouched) and never match a "für"
+    keyword even though the keyword side IS lowered correctly in Python. The
+    OLD keyword_search lowered both sides in Python (Unicode-aware), so this
+    would have passed before the SQL-pushdown fix -- LocalGraphStore now
+    overrides SQLite's ``lower`` SQL function with Python's Unicode-aware
+    ``str.lower`` (_configure_connection) to keep parity."""
+    _insert_node(local_store, "Doc", "d-1", {"name": "Grundgesetz FÜR die Bundesrepublik"})
+    _insert_node(local_store, "Doc", "d-2", {"name": "unrelated"})
+
+    results = hybrid.keyword_search("für")
+
+    assert len(results) == 1
+    assert results[0]["node"]["name"] == "Grundgesetz FÜR die Bundesrepublik"
+
+
 def test_keyword_result_format(hybrid: HybridQuery, local_store: LocalGraphStore) -> None:
     """반환 결과의 형식이 {'node': dict, 'label': str} 이어야 한다."""
     _insert_node(local_store, "Concept", "c-1", {"name": "knowledge graph"})

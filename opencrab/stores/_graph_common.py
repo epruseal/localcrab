@@ -41,10 +41,15 @@ logger = logging.getLogger(__name__)
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Node-property fields ``HybridQuery.keyword_search()``
-# (opencrab/ontology/query.py) matches a keyword against. Shared by every
-# graph-store backend's ``search_nodes()`` (_sql_graph_base.py,
-# kuzu_graph_store.py) AND by query.py itself, so the field list can't drift
-# between backends the way the old inline duplicate risked (issue #86).
+# (opencrab/ontology/query.py) matches a keyword against on the Local/PG/Kuzu
+# path. Shared by every graph-store backend's ``search_nodes()``
+# (_sql_graph_base.py, kuzu_graph_store.py) and declared on the
+# ``search_nodes`` Protocol method (_graph_protocol.py) so those three
+# backends' field lists can't drift apart (issue #86). query.py's own Neo4j
+# Cypher CONTAINS branch does NOT import this constant -- it still hardcodes
+# a 3-field subset (name/description/text, missing title/label/summary),
+# a pre-existing Local/Kuzu-vs-Neo4j field-list mismatch tracked separately
+# as issue #129, out of this issue's scope.
 KEYWORD_SEARCH_FIELDS: tuple[str, ...] = (
     "name",
     "description",
