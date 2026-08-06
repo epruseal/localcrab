@@ -219,17 +219,24 @@ class TestDiagnosticIdentifiesTheFailingRow:
         del row[missing]
         with pytest.raises(PackSchemaError) as ei:
             validator(row)
-        # **순서만 고정하고 문구에는 결합하지 않는다.**
+        # 계약은 셋이다 — **빠진 필드**, **부재라는 사실**, **실패 행 id** 가 그 순서로
+        # 한 줄 안에 붙어 있을 것.
         #
-        # `x in msg` 두 개로 나누면 rid == missing 일 때 각 단언이 상대방 조각으로 충족돼
-        # 한쪽을 지워도 통과한다. 그래서 순서를 요구한다.
+        # 이 단언은 두 번 실패한 끝에 여기 왔다.
+        #   1차: `x in msg` 두 개  -> rid == missing 이면 서로를 충족시켜 한쪽을 지워도 통과
+        #   2차: 문구 통째로 요구  -> 조사만 바꿔도(`가`->`이`) 깨진다. 계약이 아니라 잡음
+        #   3차: 순서만 요구(.*? + re.S) -> **너무 느슨했다.** 적대 검증이 실증한 통과 사례:
+        #          "필수 필드 'label' 는 정상, 행 'node-1' 는 실패"   (의미 역전)
+        #          "필수 필드 'label'\n진단 분리선\n행 id 'node-1'"    (줄 분리)
+        #        거짓 진단이 통과하면 이 검사는 아무것도 지키지 않는다.
         #
-        # 반대로 `필수 필드 … 가 없다: …` 처럼 **문구를 통째로** 요구하면 조사 하나만 바꿔도
-        # (`가` -> `이`) 깨진다 — 그건 계약이 아니라 잡음이다(적대 검증 지적). 사이에 무엇이
-        # 오든 상관하지 않고 **(빠진 필드, 행 id) 순서**만 본다.
-        want = rf"{re.escape(repr(missing))}.*?{re.escape(repr(rid))}"
-        assert re.search(want, str(ei.value), re.S), \
-            f"진단이 (빠진 필드, 실패 행 id) 를 그 순서로 담아야 한다: {ei.value}"
+        # 그래서 **최소 의미 앵커**(`없다`)와 **간격 상한**을 둔다. 조사·어순 다듬기는
+        # 통과하되, 부재가 아닌 것을 부재처럼 쓰거나 두 값을 떼어놓으면 걸린다.
+        # `re.S` 는 쓰지 않는다 — 한 줄 안에 있어야 한 진단이다.
+        gap = r".{0,20}"
+        want = (rf"{re.escape(repr(missing))}{gap}없다{gap}{re.escape(repr(rid))}")
+        assert re.search(want, str(ei.value)), \
+            f"진단이 (빠진 필드, 부재, 실패 행 id) 를 한 줄에 담아야 한다: {ei.value}"
 
 
 class TestValidateNode:
