@@ -31,7 +31,7 @@ from opencrab.mcp.tools import (
     pack_create,
     pack_ingest,
 )
-from opencrab.ontology.builder import store_write_failures
+from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +158,101 @@ class TestStoreWriteFailures:
         ]
 
 
+class TestStoreWriteSucceeded:
+    """#66 codex re-review (4th round), finding [2]: pins the exact success
+    vocabulary this function must recognize — verified against every real
+    status string OntologyBuilder.add_node/add_edge and HybridQuery.ingest()
+    actually assign (see store_write_succeeded's docstring in builder.py for
+    the full inventory). A bare `== "ok"` comparison rejected the decorated
+    "ok (id=...)" shape and silently stopped billing real successes; these
+    tests exist so that regression can't ship unnoticed again."""
+
+    def test_normal_bare_ok_is_success(self):
+        assert store_write_succeeded({"graph": "ok"}, "graph") is True
+
+    def test_normal_decorated_ok_with_id_is_success(self):
+        """Real production shape for docs (builder.py add_node) and
+        chromadb (query.py HybridQuery.ingest())."""
+        assert store_write_succeeded({"docs": "ok (id=abc123)"}, "docs") is True
+        assert store_write_succeeded({"chromadb": "ok (id=vec-1)"}) is True
+
+    def test_error_audited_is_not_recognized_as_success(self):
+        """Deliberately excluded (see the docstring): "audited" (edge audit
+        log) is a different word, not "ok"-prefixed."""
+        assert store_write_succeeded({"docs": "audited"}, "docs") is False
+
+    def test_error_skipped_is_not_success(self):
+        assert store_write_succeeded({"vector": "skipped (no text)"}, "vector") is False
+
+    def test_error_unavailable_is_not_success(self):
+        assert store_write_succeeded({"graph": "unavailable"}, "graph") is False
+
+    def test_error_missing_key_is_not_success(self):
+        """The exact fail-closed case #66's 2nd codex round caught: a stores
+        map that simply doesn't have the requested key must not be treated
+        as a positive success."""
+        assert store_write_succeeded({"sql": "ok"}, "graph") is False
+
+    def test_error_non_dict_stores_is_not_success(self):
+        assert store_write_succeeded(None, "graph") is False  # type: ignore[arg-type]
+
+    def test_normal_key_none_checks_any_store(self):
+        """key=None (pack.py's legacy text-ingest gate): success if ANY
+        store in the map succeeded, regardless of which one."""
+        assert store_write_succeeded({"chromadb": "unavailable", "mongodb": "ok"}) is True
+        assert store_write_succeeded({"chromadb": "ok (id=x)", "mongodb": "unavailable"}) is True
+
+    def test_error_key_none_all_unavailable_is_not_success(self):
+        """The exact scenario #66's 3rd codex round caught: both optional
+        stores unavailable, key=None must not fall through to success."""
+        assert store_write_succeeded({"chromadb": "unavailable", "mongodb": "unavailable"}) is False
+
+    # -----------------------------------------------------------------
+    # Adversarial values (#66 codex re-review, 5th round, finding [1]):
+    # a bare `startswith("ok")` is WIDER than the two real success shapes
+    # ("ok" and "ok (...)") and would silently bill any future status that
+    # merely starts with those two letters. These pin the narrower contract.
+    # -----------------------------------------------------------------
+
+    def test_error_okay_is_not_success(self):
+        """"okay" starts with "ok" but is neither of the two real shapes."""
+        assert store_write_succeeded({"graph": "okay"}, "graph") is False
+
+    def test_error_ok_dash_error_is_not_success(self):
+        assert store_write_succeeded({"graph": "ok-error: disk down"}, "graph") is False
+
+    def test_error_ok_but_failed_is_not_success(self):
+        assert store_write_succeeded({"graph": "ok_but_failed"}, "graph") is False
+
+    def test_error_ok_no_paren_with_trailing_text_is_not_success(self):
+        """"ok " (trailing space, no paren) is not the decorated shape either
+        — only "ok (...)" is recognized, not any "ok <anything>"."""
+        assert store_write_succeeded({"graph": "ok degraded"}, "graph") is False
+
+    def test_normal_real_shapes_still_recognized(self):
+        """The narrower rule must not have thrown out the two real shapes
+        while excluding the adversarial ones above."""
+        assert store_write_succeeded({"graph": "ok"}, "graph") is True
+        assert store_write_succeeded({"docs": "ok (id=abc123)"}, "docs") is True
+
+    # -----------------------------------------------------------------
+    # Non-string defense: a malformed stores map must never raise — a
+    # billing decision blowing up would fail the write it's judging.
+    # -----------------------------------------------------------------
+
+    def test_error_none_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": None}, "graph") is False
+
+    def test_error_dict_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": {"nested": "ok"}}, "graph") is False
+
+    def test_error_int_status_value_does_not_raise(self):
+        assert store_write_succeeded({"graph": 200}, "graph") is False
+
+    def test_error_non_dict_stores_key_none_does_not_raise(self):
+        assert store_write_succeeded("not a dict", None) is False  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # _ingest_into_pack — node/edge loops + evidence-node materialisation
 # ---------------------------------------------------------------------------
@@ -262,6 +357,79 @@ class TestIngestIntoPack:
                 "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
             )
         assert result["stores"]["mongodb"] == "error: mongo down"
+
+    def test_error_legacy_path_both_stores_unavailable_does_not_bill(self):
+        """#66 codex re-review (3rd round): the legacy text_as_node=False
+        path bypasses added_nodes/added_edges entirely (it never touches
+        `graph`) — its only success signal is the `stores` dict. Before this
+        fix, "unavailable" wasn't treated as a failure there (it only fails
+        the "graph" store, and this path never sets that key), so a legacy
+        ingest where BOTH the vector store and the doc store are unavailable
+        — nothing written anywhere — still fired on_ingest. Pin: it must not."""
+        builder = MagicMock()
+        billing = MagicMock()
+        hybrid = MagicMock()
+        hybrid.ingest.return_value = {"stores": {"chromadb": "unavailable"}}
+        mongo = MagicMock()
+        mongo.available = False  # -> stores["mongodb"] = "unavailable"
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            result = _ingest_into_pack(
+                "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+            )
+        assert result["stores"] == {"chromadb": "unavailable", "mongodb": "unavailable"}
+        assert result["text_ingested"] is True  # the attempt was made
+        billing.on_ingest.assert_not_called()  # but nothing actually landed
+
+    def test_normal_legacy_path_vector_only_success_still_bills(self):
+        """Positive-confirmation counterpart: chromadb comes back its REAL
+        production shape — "ok (id=...)" (opencrab/ontology/query.py's
+        HybridQuery.ingest() decorates the status with the vector id, it
+        never returns a bare "ok") — even though mongodb, an optional audit
+        record, is unavailable. The text really did land in the vector
+        store, so this must still bill.
+
+        #66 codex re-review (4th round), finding [2]/[5]: an earlier version
+        of this test used a bare "ok" mock, which passed against a bare
+        `== "ok"` billing check that REJECTED the real decorated string and
+        silently stopped billing every legacy vector-only success in
+        production — the fixture was shaped to match the implementation
+        instead of the real contract, so it could not catch that regression.
+        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns."""
+        builder = MagicMock()
+        billing = MagicMock()
+        hybrid = MagicMock()
+        hybrid.ingest.return_value = {"stores": {"chromadb": "ok (id=vec-src-5)"}}
+        mongo = MagicMock()
+        mongo.available = False
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
+        billing.on_ingest.assert_called_once_with("default", None, "src-5")
+
+    def test_normal_real_hybrid_ingest_output_shape_bills(self):
+        """Not a mock at all — exercises the REAL
+        opencrab.ontology.query.HybridQuery.ingest() (only its Chroma client
+        stubbed) so this test cannot drift from production's actual status
+        string shape the way a hand-built dict can. Guards against the exact
+        class of bug the finding above describes recurring."""
+        from opencrab.ontology.query import HybridQuery
+
+        builder = MagicMock()
+        billing = MagicMock()
+        chroma = MagicMock()
+        chroma.available = True
+        chroma.upsert_texts.return_value = ["vec-real-1"]
+        hybrid = HybridQuery(chroma=chroma, neo4j=MagicMock(available=False))
+        mongo = MagicMock()
+        mongo.available = False
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            result = _ingest_into_pack(
+                "pack-a", text="legacy text", source_id="src-6", text_as_node=False,
+            )
+        assert result["stores"]["chromadb"] == "ok (id=vec-real-1)"
+        billing.on_ingest.assert_called_once_with("default", None, "src-6")
 
     def test_edge_no_content_is_a_noop(self):
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
@@ -458,6 +626,88 @@ class TestPackCreate:
         # anchor node + evidence node -> 2 add_node calls
         assert builder.add_node.call_count == 2
 
+    def test_normal_bills_one_ingest_event_using_source_id(self):
+        """#66: pack_create/pack_ingest never called billing.on_ingest — every
+        pack write went unbilled. One call to _ingest_into_pack -> one
+        on_ingest event, using the text's source_id when text is given.
+
+        builder.add_node's mocked return must include a real "graph": "ok"
+        (the only status OntologyBuilder.add_node ever assigns that key —
+        see builder.py) — the billing gate now positively confirms the
+        graph write landed (issue #66 codex re-review), so a bare
+        MagicMock() return (no "graph" key at all) would no longer count as
+        billable, same as it wouldn't in production."""
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(
+                title="Doc Pack", pack_id="doc-pack", text="some content",
+                tenant_id="acme", subject_id="u1",
+            )
+        billing.on_ingest.assert_called_once_with("acme", "u1", result["evidence_node"])
+
+    def test_normal_bills_ingest_using_pack_id_when_nodes_given_but_no_text(self):
+        """nodes given, no text -> no source_id, so on_ingest must fall back
+        to pack_id (its signature requires a non-None string)."""
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            pack_create(
+                title="Node Pack", pack_id="node-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        billing.on_ingest.assert_called_once_with("default", None, "node-pack")
+
+    def test_normal_empty_pack_create_does_not_bill_ingest(self):
+        """#66/#105 review: a pack_create with no nodes/edges/text creates
+        only the anchor node (a separate write, outside _ingest_into_pack) —
+        there is nothing for _ingest_into_pack itself to have ingested, so it
+        must not fire a phantom on_ingest event for zero content."""
+        builder = MagicMock()
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": []}
+            pack_create(title="Empty Pack", pack_id="empty-pack")
+        billing.on_ingest.assert_not_called()
+
+    def test_error_all_writes_failed_does_not_bill_ingest(self):
+        """#66/#105 review: builder.add_node/add_edge don't raise for a
+        per-store failure — they report "error: ..."/"no match" inside the
+        returned stores map (see builder.py's module docstring). A call
+        where every provided item failed that way must not bill, even though
+        no exception was ever raised."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "error: disk down"}}
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            result = pack_ingest(
+                "existing-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+            )
+        assert result["added_nodes"] == 0
+        billing.on_ingest.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # pack_ingest — error branches not covered by test_mcp.py's text-path tests
@@ -504,6 +754,49 @@ class TestPackIngestErrors:
         assert result["status"] == "partial"
         assert result["added_nodes"] == 0
         assert result["node_errors"] == ["e1: graph: error: disk I/O"]
+
+    def test_normal_bills_ingest_event(self):
+        """#66: pack_ingest never called billing.on_ingest."""
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        billing = MagicMock()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            pack_ingest(
+                "existing-pack",
+                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                tenant_id="acme", subject_id="u1",
+            )
+        billing.on_ingest.assert_called_once_with("acme", "u1", "existing-pack")
+
+    def test_normal_billing_persist_failure_is_logged_but_ingest_still_succeeds(self, caplog):
+        """#105: on_ingest's returned {"ok": ...} must actually be inspected,
+        not discarded — a failed persist is logged, and does not fail the
+        (already-succeeded) content write."""
+        import logging
+
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        billing = MagicMock()
+        billing.on_ingest.return_value = {"ok": False, "error": "database is locked"}
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+            with caplog.at_level(logging.WARNING):
+                result = pack_ingest(
+                    "existing-pack",
+                    nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                )
+        assert result["status"] == "ok"
+        assert any("on_ingest" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +884,92 @@ class TestHarnessPromotionApply:
             "from_id": "ds1", "relation": "related_to", "to_id": "ds2",
             "receipt_id": "r2", "receipt_ts": "t2", "stores": {"sql": "ok"},
         }
+
+    def test_normal_bills_harness_apply_event(self):
+        """#66: on_harness_apply had zero callers repo-wide before this fix."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            harness_promotion_apply(_VALID_PACKAGE, dry_run=False, tenant_id="acme", subject_id="u1")
+        billing.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+
+    def test_error_malformed_receipt_does_not_bill(self):
+        """#66 codex re-review, finding [3]: a "stores" map with no "graph"
+        key at all (e.g. only optional stores reported) is a receipt shape
+        this code doesn't recognize — fail-closed means that must NOT bill,
+        not fall through to "no known failure -> bill it"."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
+        billing.on_harness_apply.assert_not_called()
+
+    def test_normal_billing_persist_failure_is_logged_but_apply_still_succeeds(self, caplog):
+        """#105: on_harness_apply's returned {"ok": ...} must actually be
+        inspected, not discarded — a failed persist is logged, and does not
+        fail the (already-applied) promotion package."""
+        import logging
+
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        billing.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            with caplog.at_level(logging.WARNING):
+                result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert result["summary"]["errors"] == 0
+        assert any("on_harness_apply" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
+
+    def test_normal_dry_run_does_not_bill(self):
+        """dry_run never calls _get_context (asserted above), so billing must
+        stay untouched too — nothing was written."""
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            harness_promotion_apply(_VALID_PACKAGE, dry_run=True)
+        mock_ctx.assert_not_called()
+
+    def test_error_graph_write_failure_does_not_bill(self):
+        """#66/#105 review: builder.add_node() doesn't raise for a per-store
+        failure — it returns normally with "error: ..." inside stores
+        (builder.py's module docstring). node_receipts still gets an entry
+        (unchanged contract), but billing must not count it: no exception was
+        raised, yet nothing actually landed in the graph."""
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {
+            "receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "error: disk down"}
+        }
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
+        billing.on_harness_apply.assert_not_called()
+
+    def test_normal_partial_success_bills_only_the_nodes_that_landed(self):
+        """Mixed batch: one node write succeeds, one fails at the store
+        level. Billing must count only the successful one, not
+        len(node_receipts) (which would be 2)."""
+        package = dict(_VALID_PACKAGE, nodes=[
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
+            {"space": "resource", "node_type": "Dataset", "node_id": "ds2", "properties": {}},
+        ])
+        builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.side_effect = [
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}},
+            {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "error: disk down"}},
+        ]
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            result = harness_promotion_apply(package, dry_run=False)
+        assert len(result["node_receipts"]) == 2
+        billing.on_harness_apply.assert_called_once_with("default", None, "pkg-1", 1)
 
     def test_error_apply_node_and_edge_write_failures_recorded(self):
         """Real (non-dry-run) write failures for both nodes and edges are

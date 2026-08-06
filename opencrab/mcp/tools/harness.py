@@ -6,9 +6,12 @@ function scope rather than at module level.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ._registry import tool
+
+logger = logging.getLogger(__name__)
 
 
 @tool(
@@ -31,6 +34,14 @@ from ._registry import tool
                     "description": "Validate without writing to stores.",
                     "default": False,
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the apply (for billing/audit).",
+                },
             },
             "required": ["package"],
         },
@@ -41,6 +52,8 @@ from ._registry import tool
 def harness_promotion_apply(
     package: dict[str, Any],
     dry_run: bool = False,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a CrabHarness PromotionPackage directly to the OpenCrab ontology stores.
@@ -56,6 +69,11 @@ def harness_promotion_apply(
         A serialised PromotionPackage object (from CrabHarness promotion-stub output).
     dry_run:
         If True, validate grammar + schema without writing to any store.
+    tenant_id:
+        Tenant identifier for multi-tenant isolation (default: 'default').
+    subject_id:
+        Optional subject performing the apply (for billing/audit). Ignored
+        when dry_run=True — nothing is written, so nothing is billed.
     """
     try:
         from crabharness.crabharness.models import PromotionPackage
@@ -98,6 +116,7 @@ def harness_promotion_apply(
         }
 
     from opencrab.mcp.tools import _get_context
+    from opencrab.ontology.builder import graph_write_failed
 
     ctx = _get_context()
     builder = ctx["builder"]
@@ -141,6 +160,30 @@ def harness_promotion_apply(
                 "edge": f"{edge.from_id}-[{edge.relation}]->{edge.to_id}",
                 "error": str(exc),
             })
+
+    # #66 hardening: builder.add_node() never raises for a per-store failure
+    # (see builder.py's module docstring) — a node_receipts entry exists even
+    # when result["stores"]["graph"] is "error: ..."/"unavailable", so
+    # len(node_receipts) alone overcounts. graph_write_failed() reads each
+    # receipt's own "stores" map (already captured above) to bill only the
+    # nodes that actually landed in the graph — the system of record.
+    # Doesn't touch node_receipts/summary themselves (existing contract for
+    # callers), only the count fed to billing.
+    billed_node_count = sum(
+        1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
+    )
+    if billed_node_count > 0:
+        billing_result = ctx["billing"].on_harness_apply(
+            tenant_id, subject_id, promo.package_id, billed_node_count
+        )
+        if not billing_result.get("ok"):
+            # #105: don't discard emit()'s result — surface a failed persist
+            # here too, without failing the (already-applied) promotion
+            # package.
+            logger.warning(
+                "on_harness_apply billing event failed to persist (package_id=%s): %s",
+                promo.package_id, billing_result.get("error"),
+            )
 
     return {
         "package_id": promo.package_id,

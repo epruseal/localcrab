@@ -120,6 +120,12 @@ class OntologyBuilder:
         if self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
+                # store_write_succeeded() (below in this module) only
+                # recognizes exactly "ok" or the "ok (...)" shape (status ==
+                # "ok" or status.startswith("ok (")) as success — keep the
+                # literal "ok (" (space + open-paren included) if this
+                # format ever changes, or this status silently stops being
+                # billed.
                 output["stores"]["docs"] = f"ok (id={mongo_id})"
                 self._mongo.log_event(
                     "node_upsert",
@@ -319,6 +325,10 @@ class OntologyBuilder:
                         "to_id": to_id,
                     },
                 )
+                # Deliberately not "ok"-prefixed: store_write_succeeded()
+                # does NOT recognize "audited" as success (see its
+                # docstring) — an edge's docs status is an audit log entry,
+                # not a stored copy of the edge.
                 output["stores"]["docs"] = "audited"
             except Exception as exc:
                 logger.warning("MongoDB audit log write failed: %s", exc)
@@ -355,6 +365,18 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     (see the module docstring: individual store failures are swallowed and
     reported here, not raised) must call this on the returned ``stores`` map
     to know whether the write actually succeeded everywhere it matters.
+
+    DIAGNOSTIC, not authoritative for billing: this is a NEGATIVE list — "no
+    recognized failure string" is its pass condition, which is fail-open for
+    any status shape it doesn't recognize (missing key, non-string value, a
+    status this function was never taught). It exists for building
+    human-readable error messages (``node_errors``/``edge_errors``/
+    ``anchor_errors`` entries) where under-reporting an unrecognized status
+    is an acceptable cost. Money-critical "did this actually get billable"
+    decisions must use ``store_write_succeeded()`` below instead — issue #66's
+    codex review is exactly the story of a billing gate built on this
+    negative-list shape being fail-open (see ``graph_write_failed``'s history
+    in git blame, and pack.py's legacy text-ingest gate, both now converted).
     """
     failures = []
     for store, status in stores.items():
@@ -365,6 +387,109 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
         elif store == "graph" and status == "unavailable":
             failures.append(f"{store}: {status}")
     return failures
+
+
+def store_write_succeeded(stores: dict[str, Any], key: str | None = None) -> bool:
+    """The single authoritative "did a write actually happen" check for
+    money-critical (billing) decisions in this codebase. POSITIVE
+    confirmation only: everything except a recognized success status is
+    "not confirmed" — a missing key, a non-string value, a missing/non-dict
+    ``stores``, or any status this function doesn't recognize. Never guess
+    "probably fine" for a receipt shape this function doesn't recognize
+    (issue #66's codex review: a fail-open "no known failure -> bill" check
+    let malformed/incomplete receipts and ``"unavailable"`` optional-store
+    statuses get billed for writes that landed nowhere).
+
+    A status counts as success iff it is EXACTLY ``"ok"`` or matches the
+    decorated shape ``"ok (...)"`` (starts with ``"ok ("``) — the two, and
+    only two, real shapes ``OntologyBuilder.add_node``/``add_edge`` (this
+    module) and ``HybridQuery.ingest`` (``opencrab/ontology/query.py``)
+    actually assign, as of issue #66's 5th codex round:
+
+      recognized as success (this is the whole contract, not a prefix
+      guess — a bare ``startswith("ok")`` was tried in the 4th round and
+      rejected for being wider than the real values: it would silently
+      have billed a future ``"okay"``/``"ok-error: ..."`` status too):
+        "ok"                     — graph node/edge write, sql registry write
+        f"ok (id={mongo_id})"    — Mongo doc write (add_node)
+        f"ok (id={vector_id})"   — Chroma vector write (query.py ingest())
+
+      NOT recognized as success (on purpose):
+        "audited"                 — Mongo edge audit log (builder.py
+                                     add_edge). This IS a real, positive
+                                     confirmation that the edge write
+                                     happened (log_event succeeded) — but it
+                                     is deliberately excluded here anyway,
+                                     because every current edge-billing
+                                     caller (graph.py#ontology_add_edge,
+                                     harness.py, apply.py) uses
+                                     key="graph", which never reads the
+                                     "docs" entry at all — "audited"
+                                     therefore has zero effect on any real
+                                     billing decision today. Recognizing it
+                                     would only matter for a future
+                                     key=None caller that scans an edge's
+                                     stores map, and nobody has decided
+                                     whether an edge should be billable off
+                                     of its audit log alone (vs. its graph
+                                     write) — so it stays unrecognized
+                                     until that decision is made on purpose,
+                                     not inherited for free.
+        "skipped (no text)"       — neither success nor failure.
+        "skipped (missing node)"
+        "unavailable" / "error: ..." / "no match..." — recognized failures.
+
+    CONTRACT (enforced by convention, not code): any new success status
+    added to this codebase MUST be exactly "ok" or "ok (...)" , or every
+    caller of this function silently stops billing it — and conversely, a
+    new FAILURE status must NOT start with "ok " (with a trailing space)
+    or it would be misread as success. See the "ok (id=...)" assignment
+    sites in this file and in query.py's ``ingest()`` — each carries a
+    one-line pointer back to this contract.
+
+    key:
+        ``"graph"`` (or any specific store key) checks only that store —
+        this is what a node/edge write's billing decision needs, since the
+        graph store is the system of record and an optional-store-only
+        success (e.g. only ``docs`` came back ``"ok"``, ``graph`` did not)
+        must NOT count as a landed write. ``None`` (default) checks whether
+        ANY store in the map succeeded — this is what a write with no
+        single system-of-record store needs, e.g. pack.py's legacy
+        text-ingest path, which never touches ``graph`` at all and can land
+        in either the vector store or the doc store.
+    """
+
+    def _is_ok(status: Any) -> bool:
+        # Exactly "ok", or the decorated "ok (...)" shape — NOT a bare
+        # startswith("ok") prefix, which would also (wrongly) accept a
+        # future "okay"/"ok-error: ..." status. isinstance() short-circuits
+        # before .startswith() ever runs on a non-string value (None, a
+        # dict, ...), so a malformed status can't raise here — a billing
+        # decision must never blow up the write it's judging.
+        return isinstance(status, str) and (status == "ok" or status.startswith("ok ("))
+
+    if not isinstance(stores, dict):
+        return False
+    if key is not None:
+        return _is_ok(stores.get(key))
+    return any(_is_ok(status) for status in stores.values())
+
+
+def graph_write_failed(stores: dict[str, Any]) -> bool:
+    """True unless ``stores`` (an add_node/add_edge result's ``"stores"``
+    map) POSITIVELY confirms the write landed in the graph store — the
+    system of record. Thin wrapper over ``store_write_succeeded(stores,
+    "graph")`` — see that function's docstring for the fail-closed
+    contract this relies on.
+
+    Optional-store status (docs/sql/vector) is irrelevant here on purpose —
+    an optional-store-only failure still means the write landed (the entity
+    exists and is queryable), matching the same "graph failed = hard
+    failure, optional-store-only failed = partial success" split
+    ``opencrab/mcp/tools/pack.py#pack_create`` already applies to its anchor
+    node write.
+    """
+    return not store_write_succeeded(stores, "graph")
 
 
 def _space_to_default_type(space_id: str) -> str:

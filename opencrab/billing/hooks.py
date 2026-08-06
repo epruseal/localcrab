@@ -6,15 +6,27 @@ Every billable operation fires a BillingEvent that is persisted to
 Stripe/Paddle integration) can read these to generate invoices.
 
 Billable event types:
-  node_write     — add_node() called (successful write)
-  edge_write     — add_edge() called (successful write)
+  node_write     — ontology_add_node called (successful write)
+  edge_write     — ontology_add_edge called (successful write)
   query          — ontology_query or query_bm25 called
-  ingest         — ontology_ingest called
-  promotion      — promotion_promote called (candidate → promoted)
-  harness_apply  — harness_promotion_apply called
+  ingest         — pack_create / pack_ingest called
+  harness_apply  — harness_promotion_apply called (MCP or CLI, see below)
 
 Each event stores: tenant_id, subject_id, event_type, count, metadata, ts.
 Aggregation queries can sum counts by (tenant_id, event_type, day) for billing.
+
+Only events for writes that actually landed are billed: `graph` is the
+system of record (opencrab/ontology/builder.py's module docstring), so a
+call whose write failed there is not billed even though add_node/add_edge
+raise no exception for a per-store failure (see
+`opencrab.ontology.builder.store_write_failures`/`graph_write_failed`).
+Optional-store-only failures (docs/sql/vector) still bill — the entity
+exists and is queryable, matching pack_create's own "graph failed = hard
+error, optional-store-only failed = partial success" split.
+
+A 6th event type, fired by a since-DELETED ``on_promotion`` hook, is gone
+for good (issue #66: zero callers, and no code shape matches its
+per-node_id signature — see git history / the PR discussion for why).
 """
 
 from __future__ import annotations
@@ -116,7 +128,7 @@ class BillingHooks:
         Parameters
         ----------
         event_type:
-            One of: node_write, edge_write, query, ingest, promotion, harness_apply.
+            One of: node_write, edge_write, query, ingest, harness_apply.
         tenant_id:
             Tenant identifier (default: 'default' for single-tenant deployments).
         subject_id:
@@ -179,24 +191,39 @@ class BillingHooks:
     # ------------------------------------------------------------------
     # Convenience wrappers (called by tools.py)
     # ------------------------------------------------------------------
+    #
+    # NOTE (issue #66, see also #105): on_node_write/on_query pre-date this
+    # fix and discard emit()'s return value at both the wrapper and the call
+    # site — a lock-contention or storage failure there is silently invisible
+    # beyond a WARNING log. #105 owns fixing that pair (and emit()'s own
+    # durability: retries, sqlite timeout). The three wrappers below are
+    # newly wired by #66 and deliberately do NOT repeat that swallow: they
+    # return emit()'s {"ok": ...} dict so their call sites can notice (and
+    # log at the handler's own logger) a failed billing write instead of
+    # only relying on BillingHooks' internal warning.
 
     def on_node_write(self, tenant_id: str, subject_id: str | None, space: str, node_type: str) -> None:
         self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
 
-    def on_edge_write(self, tenant_id: str, subject_id: str | None, relation: str) -> None:
-        self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
+    def on_edge_write(
+        self, tenant_id: str, subject_id: str | None, relation: str
+    ) -> dict[str, Any]:
+        return self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
 
     def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> None:
         self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
 
-    def on_ingest(self, tenant_id: str, subject_id: str | None, source_id: str) -> None:
-        self.emit("ingest", tenant_id, subject_id, metadata={"source_id": source_id})
+    def on_ingest(
+        self, tenant_id: str, subject_id: str | None, source_id: str
+    ) -> dict[str, Any]:
+        return self.emit("ingest", tenant_id, subject_id, metadata={"source_id": source_id})
 
-    def on_promotion(self, tenant_id: str, subject_id: str | None, node_id: str) -> None:
-        self.emit("promotion", tenant_id, subject_id, metadata={"node_id": node_id})
-
-    def on_harness_apply(self, tenant_id: str, subject_id: str | None, package_id: str, node_count: int) -> None:
-        self.emit("harness_apply", tenant_id, subject_id, count=node_count, metadata={"package_id": package_id})
+    def on_harness_apply(
+        self, tenant_id: str, subject_id: str | None, package_id: str, node_count: int
+    ) -> dict[str, Any]:
+        return self.emit(
+            "harness_apply", tenant_id, subject_id, count=node_count, metadata={"package_id": package_id}
+        )
 
     # ------------------------------------------------------------------
     # Usage reporting

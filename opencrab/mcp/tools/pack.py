@@ -68,8 +68,16 @@ def _ingest_into_pack(
     source_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM.
+
+    Bills exactly one ``ingest`` billing event per call (issue #66) — shared
+    by pack_create/pack_ingest so both go through a single instrumentation
+    point rather than each needing its own billing call. Uses ``source_id``
+    when text was ingested, else falls back to ``pack_id`` (on_ingest's
+    signature requires a non-None string).
 
     Parameters
     ----------
@@ -83,7 +91,7 @@ def _ingest_into_pack(
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
-    from opencrab.ontology.builder import store_write_failures
+    from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
     ctx = _get_context()
     added_nodes = 0
@@ -92,6 +100,19 @@ def _ingest_into_pack(
     edge_errors: list[str] = []
     stores: dict[str, Any] = {}
     evidence_node: str | None = None
+    # Billing-only signal (issue #66 codex review, findings [4]/[6]): kept
+    # deliberately SEPARATE from added_nodes/added_edges below.
+    # added_nodes/added_edges require store_write_failures() to see zero
+    # failures across ALL stores (graph + every optional one) — that is this
+    # tool's own, stricter, pre-existing "did I fully write this" accounting
+    # for its response body (added_nodes/node_errors), and changing it would
+    # ripple into that response contract for no billing-accuracy reason.
+    # Billability only needs the graph store (the system of record) to have
+    # landed — the same rule graph.py/harness.py/apply.py already use — so
+    # it is computed here independently via store_write_succeeded(), proving
+    # the billing gate (`wrote_anything` below) is driven by that one
+    # function alone, not by store_write_failures()-derived counters.
+    billable_write = False
 
     for item in nodes or []:
         try:
@@ -115,6 +136,8 @@ def _ingest_into_pack(
                 )
             else:
                 added_nodes += 1
+            if store_write_succeeded(node_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {exc}")
 
@@ -142,6 +165,8 @@ def _ingest_into_pack(
                 )
             else:
                 added_edges += 1
+            if store_write_succeeded(edge_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             edge_errors.append(
                 f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
@@ -206,6 +231,8 @@ def _ingest_into_pack(
                     evidence_node = source_id
                     added_nodes += 1
                     stores["evidence_node"] = "ok"
+                if store_write_succeeded(evidence_stores or {}, "graph"):
+                    billable_write = True
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
                 stores["evidence_node"] = f"error: {exc}"
@@ -229,6 +256,33 @@ def _ingest_into_pack(
 
         text_ingested = True
 
+    # #66 codex re-review, findings [4]/[6]: the billing gate must be
+    # provably driven by store_write_succeeded() ALONE, not by
+    # store_write_failures()-derived counters (added_nodes/added_edges are
+    # kept for the tool's own response body — see `billable_write`'s
+    # docstring-comment above the node loop — but must not leak into this
+    # decision). billable_write already covers every node/edge/evidence-node
+    # write via store_write_succeeded(..., "graph"). The text_as_node=False
+    # legacy branch never touches `graph` at all (vector-only embedding + a
+    # doc_sources record), so its own signal is store_write_succeeded(stores)
+    # with no key — positive confirmation that at least one of
+    # chromadb/mongodb actually came back a recognized "ok"-prefixed status
+    # (see that function's docstring in builder.py for the full success-value
+    # inventory this is based on, and why "unavailable" alone must not bill).
+    text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
+    legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
+    wrote_anything = billable_write or legacy_text_landed
+    if wrote_anything:
+        billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
+        if not billing_result.get("ok"):
+            # #105: don't repeat the on_node_write/on_query pattern of
+            # discarding emit()'s result — surface a failed persist in this
+            # module's own log context too, without failing the
+            # (already-succeeded) ingest.
+            logger.warning(
+                "on_ingest billing event failed to persist (pack_id=%s): %s",
+                pack_id, billing_result.get("error"),
+            )
     ctx["hybrid"].invalidate_bm25_cache()
 
     # Partial failure = any node/edge write error, or any leftover "error:"/
@@ -237,11 +291,7 @@ def _ingest_into_pack(
     # {"status": "ok", ..., **ingest_result} — since ingest_result is spread
     # last, this "status" wins over their literal "ok" and callers get an
     # accurate top-level signal instead of an unconditional "ok".
-    status = (
-        "partial"
-        if node_errors or edge_errors or store_write_failures(stores)
-        else "ok"
-    )
+    status = "partial" if node_errors or edge_errors or text_stores_failed else "ok"
 
     return {
         "status": status,
@@ -486,6 +536,14 @@ def _rank_packs(
                     "default": True,
                     "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["title"],
         },
@@ -501,6 +559,8 @@ def pack_create(
     edges: list[dict[str, Any]] | None = None,
     text: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new localcrab ontology pack and ingest content into it.
@@ -509,6 +569,7 @@ def pack_create(
     pack_id is auto-slugged from title unless explicitly provided.
     Optional text is materialised as a 9-space evidence/TextUnit graph node
     (text_as_node=True, default) or embedded as a vector blob only (False).
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
     from opencrab.ontology.builder import store_write_failures
@@ -578,6 +639,8 @@ def pack_create(
         source_id=source_id,
         metadata={"title": _clean_str(title), "source": "pack_create"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
     result = {
@@ -660,6 +723,14 @@ def pack_create(
                     "type": "string",
                     "description": "Optional stable source identifier for the text document. Auto-generated from title+text hash if omitted.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["pack_id"],
         },
@@ -675,6 +746,8 @@ def pack_ingest(
     title: str | None = None,
     source_id: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add content into an EXISTING localcrab ontology pack.
@@ -684,6 +757,7 @@ def pack_ingest(
     (text_as_node=True, default) so it becomes a grammar-compliant first-class
     node. Set text_as_node=False for legacy vector-only embedding.
     Fails if the pack does not exist — use pack_create first.
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, content_pack_list
 
@@ -722,6 +796,8 @@ def pack_ingest(
         source_id=sid,
         metadata={"title": _clean_str(title or ""), "source": "pack_ingest"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
     return {"status": "ok", "pack_id": pack_id, **ingest_result}

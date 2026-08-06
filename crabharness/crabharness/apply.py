@@ -10,15 +10,20 @@ Each operation returns a receipt_id + receipt_ts (Phase 1 feature).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from .models import PromotionPackage
 
+logger = logging.getLogger(__name__)
+
 
 def apply_promotion_package(
     package_path: str | Path,
     dry_run: bool = False,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a PromotionPackage to OpenCrab.
@@ -29,11 +34,28 @@ def apply_promotion_package(
         Path to a JSON file containing a serialised PromotionPackage.
     dry_run:
         If True, validate without writing to any store.
+    tenant_id:
+        Tenant identifier for the ``harness_apply`` billing event fired on a
+        live (non-dry-run) apply. No CLI flag exposes this yet — the
+        crabharness CLI always applies as the default tenant; multi-tenant
+        CLI usage is left for a follow-up (see opencrab issue #66's PR).
+    subject_id:
+        Optional actor for the same billing event.
 
     Returns
     -------
     dict with keys:
         package_id, node_receipts, edge_receipts, errors, dry_run
+
+    Notes
+    -----
+    Issue #66: this CLI/library path applies a whole PromotionPackage (many
+    nodes/edges via OntologyBuilder) exactly like the MCP tool
+    ``harness_promotion_apply`` — it is billed the same way, as a single
+    ``harness_apply`` event whose count is the number of nodes that actually
+    landed in the graph store (see ``graph_write_failed`` below: OntologyBuilder
+    doesn't raise for a per-store failure, so "no exception" alone doesn't
+    mean "written").
     """
     path = Path(package_path)
     if not path.exists():
@@ -45,7 +67,7 @@ def apply_promotion_package(
     # Import OpenCrab components — optional dependency
     try:
         from opencrab.config import Settings
-        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store
     except ImportError as exc:
         raise ImportError(
@@ -133,6 +155,48 @@ def apply_promotion_package(
                 "error": str(exc),
             })
 
+    # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
+    # module docstring) — bill it the same way harness_promotion_apply (the
+    # MCP twin of this function) does, counting only nodes that actually
+    # landed in the graph. builder.add_node() doesn't raise for a per-store
+    # failure (see builder.py's module docstring), so len(node_receipts)
+    # alone would overcount — graph_write_failed() filters those out.
+    #
+    # #66 codex re-review, finding [4]: on_harness_apply() itself never
+    # raises (emit() is fire-and-forget by contract — see hooks.py), it
+    # returns {"ok": False, "error": ...} on a failed persist instead. The
+    # outer try/except below only catches actual exceptions (e.g. a broken
+    # BillingHooks import/construction), so a soft ok=False was previously
+    # discarded with zero visibility — not even a log line, since nothing
+    # inspected the return value. `billing` in the returned dict (which
+    # crabharness/cli.py's `_write()` prints as part of the command's own
+    # JSON output, not just a log line #105 already flagged as insufficient
+    # for this exact class of failure) makes both cases visible: how many
+    # nodes were actually billed, and whether the persist itself failed.
+    billing_status: dict[str, Any] = {"billed_node_count": 0, "ok": True}
+    try:
+        from opencrab.billing.hooks import BillingHooks
+
+        billed_node_count = sum(
+            1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
+        )
+        billing_status["billed_node_count"] = billed_node_count
+        if billed_node_count > 0:
+            billing_result = BillingHooks(sql).on_harness_apply(
+                tenant_id, subject_id, package.package_id, billed_node_count
+            )
+            if not billing_result.get("ok"):
+                billing_status["ok"] = False
+                billing_status["error"] = billing_result.get("error")
+                logger.warning(
+                    "harness_apply billing event failed to persist (package_id=%s): %s",
+                    package.package_id, billing_result.get("error"),
+                )
+    except Exception as exc:  # noqa: BLE001 — billing is fire-and-forget, never blocks apply
+        billing_status["ok"] = False
+        billing_status["error"] = str(exc)
+        logger.warning("harness_apply billing failed: %s", exc)
+
     return {
         "package_id": package.package_id,
         "mission_id": package.mission_id,
@@ -146,4 +210,5 @@ def apply_promotion_package(
             "edges_written": len(edge_receipts),
             "errors": len(errors),
         },
+        "billing": billing_status,
     }
