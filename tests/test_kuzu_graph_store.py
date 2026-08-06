@@ -414,6 +414,21 @@ def test_search_nodes_space_filter_pushed_into_cypher(store) -> None:
     assert rows[0]["props"]["space"] == "claim"
 
 
+def test_search_nodes_limit_zero_and_negative_return_empty(store) -> None:
+    """issue #86 boundary check: the break condition is ``len(results) >=
+    limit``, checked only AFTER appending a match -- so ``limit=0``
+    previously still returned the first match found (1 row, not 0), and
+    any negative limit behaved like ``limit=1`` (same off-by-one: an empty
+    ``results`` list's length, 0, is never `>=` a negative number until
+    AFTER the first append). Neither is "caller wants nothing back" (the
+    same class of surprise issue #120 flagged for Mongo's ``.limit(0)``)."""
+    store.upsert_node("X", "n1", {"name": "matches everything"})
+    store.upsert_node("X", "n2", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=0) == []
+    assert store.search_nodes("matches", limit=-1) == []
+
+
 # ------------------------------------------------------------------
 # Issue #118: space_id (column) vs properties["space"] (JSON) divergence
 # ------------------------------------------------------------------

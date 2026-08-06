@@ -729,8 +729,19 @@ class KuzuGraphStore:
         ``_scan_space_matching``'s docstring) -- so this streams every
         space-matching row with NO LIMIT clause and stops only once
         ``limit`` keyword matches are found, i.e. LIMIT is applied AFTER
-        the keyword filter, not before."""
+        the keyword filter, not before.
+
+        ``limit <= 0`` short-circuits to ``[]`` without scanning (issue
+        #86 boundary check): the break condition below is
+        ``len(results) >= limit``, checked only AFTER appending a match, so
+        ``limit=0`` previously still returned the first match found (one
+        row, not zero) and any negative ``limit`` behaved like ``limit=1``
+        -- neither is "caller wants nothing back". Matches the same
+        ``limit<=0`` -> ``[]`` contract as the SQL backends' search_nodes
+        (see _sql_graph_base.py)."""
         self._require_available()
+        if limit <= 0:
+            return []
         kw_lower = keyword.lower()
         where_clause = "WHERE n.space_id IN $spaces " if spaces else ""
         params: dict[str, Any] = {"spaces": spaces} if spaces else {}

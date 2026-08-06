@@ -557,6 +557,35 @@ def test_search_nodes_escapes_like_wildcards():
     assert rows[0]["props"]["name"] == "discount 50% today"
 
 
+def test_search_nodes_limit_zero_returns_empty_not_unbounded():
+    """issue #86 boundary check (same class as issue #120's Mongo
+    ``.limit(0)`` surprise): binding ``limit`` straight into SQL ``LIMIT
+    :lim`` is dialect-dependent for non-positive values -- SQLite treats a
+    NEGATIVE limit as "no limit at all" (unbounded), and PostgreSQL raises
+    ``LIMIT must not be negative`` for the same input. search_nodes clamps
+    ``limit<=0`` to an empty result up front so both dialects agree and
+    neither a full unbounded scan nor a SQL error can happen."""
+    store = _store()
+    for i in range(5):
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=0) == []
+
+
+def test_search_nodes_negative_limit_returns_empty_not_unbounded_scan():
+    """The dangerous half of the above: SQLite's ``LIMIT -1`` means
+    UNBOUNDED, so a negative limit reaching the raw SQL unclamped would
+    silently return every matching row instead of erroring or returning
+    nothing -- the same shape of surprise issue #120 flagged for Mongo's
+    ``.limit(0)``. Seeds enough matching rows that "unbounded" and "empty"
+    are trivially distinguishable."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=-1) == []
+
+
 def test_upsert_nodes_batch_and_edges_batch():
     store = _store()
     n = store.upsert_nodes_batch([

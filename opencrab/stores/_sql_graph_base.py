@@ -901,8 +901,24 @@ class _SqlGraphStoreBase(abc.ABC):
         Case-insensitivity is done in SQL (``LOWER(...)``) rather than
         Python so it composes with pushdown; ``%``/``_``/``\\`` in
         ``keyword`` are escaped so a literal percent or underscore in the
-        search term can't be misread as a SQL LIKE wildcard."""
+        search term can't be misread as a SQL LIKE wildcard.
+
+        ``limit <= 0`` short-circuits to ``[]`` without a query (issue
+        #86 boundary check, same class as #120's ``.limit(0)`` Mongo
+        surprise): SQLite treats a NEGATIVE ``LIMIT`` as "no limit at
+        all" (unbounded scan) rather than "zero rows", and PostgreSQL
+        raises ``LIMIT must not be negative`` for the same input --
+        binding ``limit`` straight into ``LIMIT :lim`` would make this one
+        shared method behave three different ways (SQLite: unbounded scan,
+        Postgres: SQL error, ``0``: empty on both) depending on dialect and
+        sign. Clamping here keeps ``limit<=0`` meaning exactly one thing
+        ("caller wants nothing back") on every SQL backend. Checked AFTER
+        ``_require_available()`` so an unavailable store still raises
+        (matching every other guarded method's contract) rather than
+        returning ``[]`` and masking the real problem."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("graph_nodes")
         kw = keyword.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         where_parts = [
