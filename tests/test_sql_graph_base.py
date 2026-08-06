@@ -14,6 +14,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+import pytest
+
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
 
@@ -584,6 +586,49 @@ def test_search_nodes_negative_limit_returns_empty_not_unbounded_scan():
         store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
 
     assert store.search_nodes("matches", limit=-1) == []
+
+
+def test_search_nodes_field_injection_cannot_bypass_limit_or_leak_all_rows():
+    """issue #86 bot finding (SQL injection, P2 per the bot / higher per
+    reviewer): unlike ``keyword`` (a bound SQL parameter), each ``fields``
+    entry was interpolated directly into a JSON path expression
+    (``self._dialect.json_get``) with no escaping. A crafted field like
+    ``"x')) LIKE '%' OR 1=1) --"`` closes the surrounding parens early,
+    ORs in an always-true predicate, and comments out everything after it
+    -- including the ``LIMIT`` clause -- so every row is returned
+    regardless of ``limit``. ``fields`` is now validated against
+    ``KEYWORD_SEARCH_FIELDS`` before it touches any SQL, so this raises
+    ``ValueError`` instead of executing attacker-controlled SQL."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i}", {"name": f"row {i}"})
+
+    payload = ("x')) LIKE '%' OR 1=1) --",)
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("nomatch", limit=2, fields=payload)
+
+
+def test_search_nodes_rejects_field_with_apostrophe():
+    """A field name containing a plain apostrophe (not even a crafted
+    payload -- just a legitimate-looking typo) breaks out of the quoted
+    JSON path literal and previously crashed with
+    ``sqlite3.OperationalError`` instead of failing predictably. The
+    whitelist rejects it before it ever reaches SQL."""
+    store = _store()
+    store.upsert_node("Item", "n1", {"o'clock": "irrelevant"})
+
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("irrelevant", fields=("o'clock",))
+
+
+def test_search_nodes_empty_fields_returns_empty_not_a_sql_error():
+    """An empty ``fields`` tuple must not reach SQL as ``WHERE ()``
+    (invalid syntax) -- "search zero fields" has exactly one sane meaning
+    (nothing can ever match), so it short-circuits to ``[]``."""
+    store = _store()
+    store.upsert_node("Item", "n1", {"name": "anything"})
+
+    assert store.search_nodes("anything", fields=()) == []
 
 
 def test_upsert_nodes_batch_and_edges_batch():

@@ -130,6 +130,7 @@ from opencrab.stores._graph_common import (
     _node_passes,
     _normalize_space,
     _space_passes,
+    _validate_search_fields,
 )
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
@@ -915,10 +916,25 @@ class _SqlGraphStoreBase(abc.ABC):
         ("caller wants nothing back") on every SQL backend. Checked AFTER
         ``_require_available()`` so an unavailable store still raises
         (matching every other guarded method's contract) rather than
-        returning ``[]`` and masking the real problem."""
+        returning ``[]`` and masking the real problem.
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- each field name below is interpolated directly
+        into a JSON path via ``self._dialect.json_get`` with NO escaping
+        (unlike ``keyword``, which is a bound parameter), so an
+        unvalidated ``fields`` value is a SQL injection vector. See
+        ``_validate_search_fields`` (_graph_common.py) for the rejected
+        payload and why unknown fields raise instead of being silently
+        dropped. An empty ``fields`` tuple returns ``[]`` immediately --
+        an empty WHERE-clause OR-group is invalid SQL (``WHERE ()``), and
+        "search zero fields" has only one sane meaning: no field can ever
+        match, so there is nothing to search for."""
         self._require_available()
         if limit <= 0:
             return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
         table = self._table("graph_nodes")
         kw = keyword.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         where_parts = [

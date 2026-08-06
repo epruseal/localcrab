@@ -30,6 +30,7 @@ from opencrab.stores._graph_common import (
     _node_passes,
     _normalize_space,
     _space_passes,
+    _validate_search_fields,
 )
 from opencrab.stores._json import parse_props as _parse
 
@@ -738,10 +739,23 @@ class KuzuGraphStore:
         row, not zero) and any negative ``limit`` behaved like ``limit=1``
         -- neither is "caller wants nothing back". Matches the same
         ``limit<=0`` -> ``[]`` contract as the SQL backends' search_nodes
-        (see _sql_graph_base.py)."""
+        (see _sql_graph_base.py).
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- ``fields`` never reaches Cypher text here (it's
+        only ever used as a plain ``dict.get(f)`` key below, so an
+        arbitrary string is inert, not an injection vector), but the
+        validation still runs so a bad ``fields`` argument fails the SAME
+        way (loud ``ValueError``) on every backend rather than raising a
+        SQL error on the SQL backends and being silently accepted here.
+        Empty ``fields`` returns ``[]`` immediately: no field can ever
+        match, so there is nothing to search for."""
         self._require_available()
         if limit <= 0:
             return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
         kw_lower = keyword.lower()
         where_clause = "WHERE n.space_id IN $spaces " if spaces else ""
         params: dict[str, Any] = {"spaces": spaces} if spaces else {}

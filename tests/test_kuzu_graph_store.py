@@ -429,6 +429,27 @@ def test_search_nodes_limit_zero_and_negative_return_empty(store) -> None:
     assert store.search_nodes("matches", limit=-1) == []
 
 
+def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
+    """issue #86 bot finding: ``fields`` never reaches Cypher text on the
+    Kuzu backend (it's only ever a plain ``dict.get(f)`` key), so it has no
+    injection surface of its own here -- but a bad ``fields`` value must
+    still raise the SAME ``ValueError`` it does on the SQL backends, not be
+    silently accepted, so a caller can't get three different behaviors out
+    of one method depending on which backend happens to be active."""
+    store.upsert_node("X", "n1", {"name": "irrelevant"})
+
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("irrelevant", fields=("not_a_real_field",))
+
+
+def test_search_nodes_empty_fields_returns_empty(store) -> None:
+    """Empty ``fields`` means "nothing can ever match" on every backend,
+    including Kuzu -- matches the SQL backends' contract."""
+    store.upsert_node("X", "n1", {"name": "anything"})
+
+    assert store.search_nodes("anything", fields=()) == []
+
+
 # ------------------------------------------------------------------
 # Issue #118: space_id (column) vs properties["space"] (JSON) divergence
 # ------------------------------------------------------------------
