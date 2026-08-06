@@ -6,6 +6,15 @@ Approach (safe for early stage):
   - Nodes are stamped with tenant_id in their properties on write
   - Queries can filter by tenant_id via space metadata or properties
   - The SQL billing_events table tracks usage per tenant
+  - The doc-store audit_log (OntologyBuilder.add_node/add_edge's audit
+    event, written via each doc store's log_event()) has NO tenant_id
+    field in any backend (Mongo/local-JSON/SQL) — it only ever captures
+    subject_id. A tenant-aware write's own audit trail cannot say which
+    tenant it belonged to. This is a distinct defect from issue #119
+    (subject_id reaching billing but not audit): here there is no
+    tenant_id parameter on the builder or log_event() to forward in the
+    first place, so it needs a schema change, not a keyword fix. Tracked
+    as a follow-up, out of #119's scope.
   - No hard DB-level row isolation yet (planned for Phase 6)
 
 TenantContext is a thin dataclass passed through the call stack.
