@@ -128,6 +128,30 @@ class TestToolDispatch:
             # graph success ("graph": "ok") does bill.
             billing.on_node_write.assert_called_once_with("default", None, "subject", "User")
 
+    def test_ontology_add_node_forwards_subject_id_to_builder_audit(self):
+        """Issue #119 sibling check: ontology_add_node already forwarded
+        subject_id to builder.add_node (unlike ontology_add_edge, which did
+        not). Pin that the SAME subject_id reaches both builder.add_node
+        (audit) and on_node_write (billing), so a future regression here is
+        caught the same way the edge/harness/pack sites now are."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_node.return_value = {"node_id": "u1", "stores": {"graph": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_node", {
+                "space": "subject", "node_type": "User", "node_id": "u1",
+                "subject_id": "actor-1",
+            })
+            assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+            billing.on_node_write.assert_called_once_with("default", "actor-1", "subject", "User")
+
     def test_ontology_add_node_graph_store_failure_does_not_bill(self):
         """#66 codex re-review, finding [8]: add_node() doesn't raise for a
         per-store failure — the exact same silent-failure shape already
@@ -203,12 +227,40 @@ class TestToolDispatch:
                 to_space="resource",
                 to_id="doc1",
                 properties={},
+                subject_id=None,
             )
             # #66: on_edge_write had zero callers repo-wide before this fix —
             # every edge write went unbilled. Pin the call with the defaults
             # (no tenant_id/subject_id passed) matching ontology_add_node's
             # on_node_write wiring pattern.
             billing.on_edge_write.assert_called_once_with("default", None, "owns")
+
+    def test_ontology_add_edge_forwards_subject_id_to_builder_audit(self):
+        """Issue #119: subject_id was billed via on_edge_write but never
+        forwarded to builder.add_edge, so the edge's audit event (builder.py's
+        mongo.log_event("edge_upsert", subject_id=...)) recorded a null actor
+        even though the billing row named one. Pin that the SAME subject_id
+        supplied by the caller reaches both builder.add_edge (audit) and
+        on_edge_write (billing)."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {"relation": "owns", "stores": {"graph": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+                "subject_id": "actor-1",
+            })
+            assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+            billing.on_edge_write.assert_called_once_with("default", "actor-1", "owns")
 
     def test_ontology_add_edge_billing_uses_explicit_tenant_and_subject(self):
         from opencrab.mcp.tools import dispatch_tool

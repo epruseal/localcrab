@@ -233,6 +233,7 @@ def ontology_add_edge(
             to_space=_clean_str(to_space),
             to_id=to_id,
             properties=_clean_meta(properties or {}),
+            subject_id=subject_id,
         )
         # #66 hardening: builder.add_edge() never raises for a per-store
         # failure (missing endpoint / store down all come back as a string
