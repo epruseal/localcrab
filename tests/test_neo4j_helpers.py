@@ -98,6 +98,21 @@ class TestNeo4jStoreNormal:
         kwargs = mock_session.run.call_args[1]
         assert "space" not in kwargs
 
+    def test_upsert_node_space_id_argument_wins_over_conflicting_props_space(self):
+        """Issue #118 codex review [2]: upsert_node now goes through the
+        shared _normalize_space (same function _sql_graph_base.py and
+        kuzu_graph_store.py use), so all three backends must agree on which
+        value wins when a caller passes conflicting ones. Neo4j already did
+        this (unconditional overwrite) before the shared helper existed --
+        this pins that the refactor preserved it exactly."""
+        store, _driver, mock_session = _make_connected_store()
+        mock_session.run.return_value.single.return_value = {"props": {"id": "u1"}}
+
+        store.upsert_node("User", "u1", {"space": "claim"}, space_id="evidence")
+
+        kwargs = mock_session.run.call_args[1]
+        assert kwargs["space"] == "evidence"
+
     def test_get_node_returns_none_when_no_record(self):
         store, _driver, mock_session = _make_connected_store()
         mock_session.run.return_value.single.return_value = None

@@ -27,6 +27,7 @@ from opencrab.stores._graph_common import (
     _edge_passes,
     _merge_space,
     _node_passes,
+    _normalize_space,
     _space_passes,
 )
 from opencrab.stores._json import parse_props as _parse
@@ -127,6 +128,9 @@ class KuzuGraphStore:
     ) -> dict[str, Any]:
         self._require_available()
         props = {**properties, "id": node_id}
+        # issue #118: same reconciliation as _sql_graph_base.py's upsert_node
+        # -- see _normalize_space's docstring for why and its precedence.
+        props, space_id = _normalize_space(props, space_id)
         props_json = json.dumps(props)
         self._conn.execute(
             "MERGE (n:OntologyNode {node_id: $id}) "

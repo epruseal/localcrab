@@ -236,6 +236,35 @@ class TestOntologyListNodesLocalBackend:
         assert len(result["nodes"]) == 2
         assert result["total"] == 5
 
+    def test_space_mismatch_no_longer_desyncs_total_from_nodes(self, graph, docs):
+        """Issue #118: upsert_node used to store space_id (column) and
+        properties["space"] (JSON) independently. count_exported_nodes
+        counted by the COLUMN; export_nodes returned that same row but
+        _merge_space reported whatever properties["space"] literally said
+        back out; this tool's own post-filter (`n_space != cleaned_space`
+        below) then dropped rows whose reported space didn't match --
+        producing exactly the `total: N, nodes: []`-shaped split the issue
+        reports (here: total=4 from the column-only count, but only 1 row
+        surviving the post-filter, since 3 of the 4 were mislabeled).
+
+        ``limit=10`` (not capped to the seeded count) so the only possible
+        source of a total/len(nodes) mismatch is this correctness bug, not
+        ordinary limit truncation (already covered by the pre-existing
+        #54 `test_limit_boundary_caps_rows_but_not_total`).
+        """
+        for i in range(3):
+            graph.upsert_node(
+                "Lever", f"mis-{i}", {"pack_id": "pack-a", "space": "other"}, space_id="target"
+            )
+        graph.upsert_node("Lever", "real-1", {"pack_id": "pack-a"}, space_id="target")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs}
+            result = ontology_list_nodes(pack_id="pack-a", space="target", limit=10)
+
+        assert result["total"] == len(result["nodes"]) == 4
+        assert all(n["space"] == "target" for n in result["nodes"])
+
 
 # ---------------------------------------------------------------------------
 # ontology_list_edges — real LocalGraphStore backend

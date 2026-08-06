@@ -575,8 +575,20 @@ class TestExportCarriesSpace:
         assert row["props"]["space"] == "evidence"
         assert row["labels"] == ["TextUnit"]
 
-    def test_explicit_props_space_is_not_overwritten_by_column(self, backend):
-        """The column is a fallback, never an override."""
+    def test_explicit_space_id_argument_overwrites_props_space(self, backend):
+        """issue #118 codex review [2]: the explicit ``space_id`` ARGUMENT
+        wins over a conflicting ``properties["space"]`` key, not the other
+        way around -- this used to pin the reverse ("the column is a
+        fallback, never an override"), which matched _merge_space's
+        read-time precedence but NOT what neo4j_store.py's own upsert_node
+        already did (``if space_id: props["space"] = space_id``,
+        unconditional). Flipped so all three backends agree with each
+        other, using Neo4j's pre-existing behavior (and the less-surprising
+        rule: a caller's explicit ``space=`` argument should not be
+        silently overridden by an incidental key in an arbitrary
+        ``properties`` dict) as the target, not the reverse. See
+        opencrab/stores/_graph_common.py's ``_normalize_space`` docstring.
+        """
         _name, store = backend
         store.upsert_node(
             "TextUnit", "n-space-2", {"text": "body", "space": "claim"}, space_id="evidence"
@@ -585,7 +597,7 @@ class TestExportCarriesSpace:
         rows = store.export_nodes()
         row = next(r for r in rows if (r["props"].get("id") == "n-space-2"))
 
-        assert row["props"]["space"] == "claim"
+        assert row["props"]["space"] == "evidence"
 
     def test_export_edges_both_endpoints_carry_space(self, backend):
         _name, store = backend
@@ -673,11 +685,15 @@ class TestSingleNodeReadsCarrySpace:
 
         assert props["space"] == "evidence"
 
-    def test_get_node_does_not_override_explicit_space(self, backend):
+    def test_get_node_reflects_space_id_argument_over_conflicting_props_space(self, backend):
+        """issue #118 codex review [2]: the explicit space_id ARGUMENT wins
+        (see test_graph_protocol_contract.py::TestExportCarriesSpace's
+        test_explicit_space_id_argument_overwrites_props_space for the
+        export_nodes-level version of this same precedence pin)."""
         _name, store = backend
         store.upsert_node("TextUnit", "g-3", {"text": "b", "space": "claim"}, space_id="evidence")
 
-        assert store.get_node("TextUnit", "g-3")["space"] == "claim"
+        assert store.get_node("TextUnit", "g-3")["space"] == "evidence"
 
 
 # ---------------------------------------------------------------------------
