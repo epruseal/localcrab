@@ -200,19 +200,19 @@ class TestDiagnosticIdentifiesTheFailingRow:
     건드리는 축을 갈라야 한다** — 이 실수를 등가 판정에서 세 번 반복했다(적대 검증 지적).
     """
 
-    @pytest.mark.parametrize("validator,builder,rid,missing", [
-        (validate_node, _node, "node-1", "label"),
-        (validate_edge, _edge, "edge-1", "source_id"),
-        (validate_chunk, _chunk, "chunk-1", "document_id"),
+    @pytest.mark.parametrize("validator,builder,kind,rid,missing", [
+        (validate_node, _node, "노드", "node-1", "label"),
+        (validate_edge, _edge, "엣지", "edge-1", "source_id"),
+        (validate_chunk, _chunk, "청크", "chunk-1", "document_id"),
         # id 와 빠진 필드 이름이 **같은** 경우. 순서를 고정하지 않으면 두 단언이 서로의
         # 조각으로 충족돼 한쪽이 사라져도 통과한다(적대 검증 지적).
-        (validate_node, _node, "label", "label"),
+        (validate_node, _node, "노드", "label", "label"),
         # id 에 **정규식 메타문자**와 **따옴표**가 든 경우. 이게 없으면 아래 `re.escape` 를
         # 지워도 전부 통과한다 — 즉 escape 의 필요성이 검증되지 않는다(적대 검증 실증).
-        (validate_node, _node, r"row[1].*+?", "label"),
-        (validate_node, _node, "it's \"quoted\"", "label"),
+        (validate_node, _node, "노드", r"row[1].*+?", "label"),
+        (validate_node, _node, "노드", "it's \"quoted\"", "label"),
     ])
-    def test_message_carries_the_row_id(self, validator, builder, rid, missing):
+    def test_message_carries_the_row_id(self, validator, builder, kind, rid, missing):
         row = builder()
         row["id"] = rid
         del row[missing]
@@ -231,10 +231,13 @@ class TestDiagnosticIdentifiesTheFailingRow:
         # 어떤 언어로 쓰든, 부정문을 넣든 이 계약은 흔들리지 않는다.
         assert ei.value.missing_field == missing
         assert ei.value.row_id == rid
-        # 문구는 팩토리가 만든다 — 세 검사가 각자 쓰지 않으므로 여기서는 "그 템플릿을
-        # 썼는가"만 본다. 문구 자체의 정확성은 아래 TestMissingRequiredTemplate 이 한 곳에서 건다.
-        assert str(ei.value) == str(
-            PackSchemaError.missing_required(str(ei.value).split("에 ")[0], missing, rid))
+        # 기대 문자열은 **여기서 직접 쓴다.** 앞선 판은 기대값을 팩토리로 만들면서 `kind` 를
+        # 실제 메시지에서 떼어 왔다(`str(ei.value).split("에 ")[0]`). 자기참조라
+        # **세 검사가 서로의 kind 를 써도 통과한다** — validate_node 가 "엣지" 를 붙여도
+        # 기대값이 따라 바뀐다(적대 검증 실증, 2026-08-06:
+        # `row_id_test_uses_message_derived_kind` / `wrong_validator_kind_would_pass`).
+        # 자기참조 기대값을 만든 것이 이번이 세 번째다.
+        assert str(ei.value) == f"{kind}에 필수 필드 {missing!r} 가 없다: {rid!r}"
 
 
 class TestMissingRequiredTemplate:
@@ -257,26 +260,51 @@ class TestMissingRequiredTemplate:
         assert str(e) == f"{kind}에 필수 필드 'label' 가 없다: 'row-1'"
         assert (e.missing_field, e.row_id) == ("label", "row-1")
 
-    def test_message_states_absence_not_presence(self):
-        """부정문·역전 문구를 막는다. 템플릿이 한 곳이라 이 검사 하나로 충분하다."""
-        msg = str(PackSchemaError.missing_required("노드", "label", "row-1"))
-        assert msg.endswith("가 없다: 'row-1'"), msg
-        for bad in ("아니다", "있다:", "정상", "실패"):
-            assert bad not in msg.replace("가 없다", ""), f"{bad!r} 가 문구에 섞였다: {msg}"
+    # `test_message_states_absence_not_presence` 를 여기서 **삭제했다.** 금지어 목록
+    # (`아니다`/`있다:`/`정상`/`실패`)로 거짓 문구를 막으려 했는데 블랙리스트는 원리적으로
+    # 우회된다 — 목록에 없는 다른 거짓 문구는 그대로 통과했다(적대 검증 실증, 2026-08-06:
+    # `forbidden_word_subtest_accepts_alternate_false_wording`). 바로 위
+    # `test_message_is_exactly_the_template` 이 **완전 일치**를 걸므로 어떤 거짓 문구도
+    # 통과할 수 없다. 완전 일치 옆의 블랙리스트는 보호를 더하지 않고 거짓 안심만 준다.
 
     def test_every_raise_site_uses_the_factory(self):
-        """세 검사가 f-string 을 직접 쓰면 문구와 속성이 다시 어긋날 수 있다.
+        """세 검사의 필수필드 raise 가 전부 팩토리를 거치는지 **AST 로** 본다.
 
-        소스에서 필수필드 문구가 **정확히 한 번**(팩토리 안)만 나타나는지 본다.
-        두 번 이상이면 어딘가가 템플릿을 복제한 것이다.
+        앞선 판은 소스 문자열 `src.count("PackSchemaError.missing_required(") == 3` 을 셌다.
+        **우회된다** — `_mr = PackSchemaError.missing_required` 로 alias 를 두거나
+        `getattr(PackSchemaError, "missing_required")` 로 부르면 카운트가 0인데 동작은
+        같다(적대 검증 실증, 2026-08-06: `alias_comment_bypass_source_guard` /
+        `dynamic_comment_bypass_source_guard`). 문자열이 아니라 **구문 구조**로 본다.
         """
+        import ast
         import pathlib
 
         import opencrab.pack.schema as m
         src = pathlib.Path(m.__file__).read_text(encoding="utf-8")
-        assert src.count("PackSchemaError.missing_required(") == 3, \
-            "node/edge/chunk 세 검사가 전부 팩토리를 써야 한다"
-        assert src.count("def missing_required(") == 1
+        fns = {n.name: n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef)}
+        for name in ("validate_node", "validate_edge", "validate_chunk"):
+            # 필수필드 루프(`for key in (...)`) 안의 raise 만 대상이다. 같은 함수의 다른
+            # raise(space 범위·properties 타입)는 팩토리를 쓰지 않는 게 정상이라 전량을
+            # 요구할 수 없다. 루프가 사라지면 조용히 0건이 되므로 루프와 raise 의 존재를
+            # 각각 단언한다 — 대가로 **루프를 if 3개로 언롤하는 정당한 리팩터도 실패한다**
+            # (측정: 5개 주입 중 M5). 조용한 통과보다 시끄러운 실패를 택한 것이고,
+            # 메시지가 "필수필드 루프가 없다"라 원인이 바로 보인다.
+            loops = [n for n in fns[name].body if isinstance(n, ast.For)]
+            assert loops, f"{name} 에 필수필드 루프가 없다"
+            raises = [n for lp in loops for n in ast.walk(lp) if isinstance(n, ast.Raise)]
+            assert raises, f"{name} 의 필수필드 루프에 raise 가 없다"
+            for r in raises:
+                f = getattr(r.exc, "func", None)
+                assert (isinstance(r.exc, ast.Call)
+                        and isinstance(f, ast.Attribute)
+                        and f.attr == "missing_required"
+                        and isinstance(f.value, ast.Name)
+                        and f.value.id == "PackSchemaError"), (
+                    f"{name}:{r.lineno} 가 PackSchemaError.missing_required 를 "
+                    "직접 부르지 않는다")
+        # 템플릿 **리터럴**의 복제만 문자열로 본다. 이건 alias 로 우회할 수 있는 대상이
+        # 아니다 — 문구를 베껴 쓰면 반드시 소스에 한 벌 더 나타난다.
         assert src.count("필수 필드 {key!r}") == 1, \
             "필수필드 문구는 팩토리에만 있어야 한다 — 호출부가 직접 쓰면 속성과 어긋난다"
 
