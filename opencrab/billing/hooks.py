@@ -150,11 +150,20 @@ class BillingHooks:
 
     def __init__(self, sql_store: Any) -> None:
         self._sql = sql_store
+        # issue #105 (codex follow-up): billing.db can now fail
+        # independently of the main SQL store (corrupt file, a permission
+        # problem specific to that one file) -- _ensure_tables() below used
+        # to swallow that into a WARNING log only, with nothing durable to
+        # check afterwards. `tables_ready` gives callers (opencrab status,
+        # or anything else that wants to know) a real signal instead of
+        # having to grep logs. See opencrab/cli.py#status for the consumer.
+        self.tables_ready = False
         self._ensure_tables()
 
     def _ensure_tables(self) -> None:
         try:
             ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
+            self.tables_ready = True
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)
 
