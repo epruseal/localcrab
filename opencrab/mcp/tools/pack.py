@@ -100,6 +100,19 @@ def _ingest_into_pack(
     edge_errors: list[str] = []
     stores: dict[str, Any] = {}
     evidence_node: str | None = None
+    # Billing-only signal (issue #66 codex review, findings [4]/[6]): kept
+    # deliberately SEPARATE from added_nodes/added_edges below.
+    # added_nodes/added_edges require store_write_failures() to see zero
+    # failures across ALL stores (graph + every optional one) — that is this
+    # tool's own, stricter, pre-existing "did I fully write this" accounting
+    # for its response body (added_nodes/node_errors), and changing it would
+    # ripple into that response contract for no billing-accuracy reason.
+    # Billability only needs the graph store (the system of record) to have
+    # landed — the same rule graph.py/harness.py/apply.py already use — so
+    # it is computed here independently via store_write_succeeded(), proving
+    # the billing gate (`wrote_anything` below) is driven by that one
+    # function alone, not by store_write_failures()-derived counters.
+    billable_write = False
 
     for item in nodes or []:
         try:
@@ -123,6 +136,8 @@ def _ingest_into_pack(
                 )
             else:
                 added_nodes += 1
+            if store_write_succeeded(node_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {exc}")
 
@@ -150,6 +165,8 @@ def _ingest_into_pack(
                 )
             else:
                 added_edges += 1
+            if store_write_succeeded(edge_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             edge_errors.append(
                 f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
@@ -214,6 +231,8 @@ def _ingest_into_pack(
                     evidence_node = source_id
                     added_nodes += 1
                     stores["evidence_node"] = "ok"
+                if store_write_succeeded(evidence_stores or {}, "graph"):
+                    billable_write = True
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
                 stores["evidence_node"] = f"error: {exc}"
@@ -237,27 +256,22 @@ def _ingest_into_pack(
 
         text_ingested = True
 
-    # #66 hardening: added_nodes/added_edges are only incremented above when
-    # that item's own store_write_failures() was empty (see the node/edge
-    # loops), and evidence_node (text_as_node=True) rolls into added_nodes
-    # the same way — so all three already mean "this actually got written",
-    # not just "no exception was raised".
-    #
-    # The text_as_node=False legacy branch is different: it never touches
-    # `graph` at all (vector-only embedding + a doc_sources record), so its
-    # only success signal lives in `stores` (chromadb/mongodb), not in
-    # added_nodes/added_edges. A codex re-review caught this branch still
-    # using store_write_failures()'s negative-list shape here (fail-open:
-    # "no known failure" included "unavailable", so a legacy ingest where
-    # BOTH the vector and doc stores were unavailable — nothing written
-    # anywhere — still billed). store_write_succeeded(stores) is the fix:
-    # positive confirmation that at least one of chromadb/mongodb actually
-    # came back "ok". See that function's docstring in builder.py for why it
-    # is now the sole authority for "did a write happen" in this codebase —
-    # store_write_failures() stays diagnostic-only (error-message text).
-    text_stores_failed = bool(store_write_failures(stores))
+    # #66 codex re-review, findings [4]/[6]: the billing gate must be
+    # provably driven by store_write_succeeded() ALONE, not by
+    # store_write_failures()-derived counters (added_nodes/added_edges are
+    # kept for the tool's own response body — see `billable_write`'s
+    # docstring-comment above the node loop — but must not leak into this
+    # decision). billable_write already covers every node/edge/evidence-node
+    # write via store_write_succeeded(..., "graph"). The text_as_node=False
+    # legacy branch never touches `graph` at all (vector-only embedding + a
+    # doc_sources record), so its own signal is store_write_succeeded(stores)
+    # with no key — positive confirmation that at least one of
+    # chromadb/mongodb actually came back a recognized "ok"-prefixed status
+    # (see that function's docstring in builder.py for the full success-value
+    # inventory this is based on, and why "unavailable" alone must not bill).
+    text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
     legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
-    wrote_anything = added_nodes > 0 or added_edges > 0 or legacy_text_landed
+    wrote_anything = billable_write or legacy_text_landed
     if wrote_anything:
         billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
         if not billing_result.get("ok"):

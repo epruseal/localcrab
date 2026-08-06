@@ -954,6 +954,9 @@ class HybridQuery:
                 metadatas=[meta],
                 ids=[source_id],
             )
+            # opencrab.ontology.builder.store_write_succeeded() treats any
+            # status starting with "ok" as success — keep that prefix if
+            # this format ever changes.
             result["stores"]["chromadb"] = f"ok (id={ids[0]})"
             result["vector_id"] = ids[0]
         except Exception as exc:

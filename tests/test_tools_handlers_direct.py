@@ -31,7 +31,7 @@ from opencrab.mcp.tools import (
     pack_create,
     pack_ingest,
 )
-from opencrab.ontology.builder import store_write_failures
+from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +156,56 @@ class TestStoreWriteFailures:
         assert store_write_failures({"graph": "no match (missing node: a, b)"}) == [
             "graph: no match (missing node: a, b)"
         ]
+
+
+class TestStoreWriteSucceeded:
+    """#66 codex re-review (4th round), finding [2]: pins the exact success
+    vocabulary this function must recognize — verified against every real
+    status string OntologyBuilder.add_node/add_edge and HybridQuery.ingest()
+    actually assign (see store_write_succeeded's docstring in builder.py for
+    the full inventory). A bare `== "ok"` comparison rejected the decorated
+    "ok (id=...)" shape and silently stopped billing real successes; these
+    tests exist so that regression can't ship unnoticed again."""
+
+    def test_normal_bare_ok_is_success(self):
+        assert store_write_succeeded({"graph": "ok"}, "graph") is True
+
+    def test_normal_decorated_ok_with_id_is_success(self):
+        """Real production shape for docs (builder.py add_node) and
+        chromadb (query.py HybridQuery.ingest())."""
+        assert store_write_succeeded({"docs": "ok (id=abc123)"}, "docs") is True
+        assert store_write_succeeded({"chromadb": "ok (id=vec-1)"}) is True
+
+    def test_error_audited_is_not_recognized_as_success(self):
+        """Deliberately excluded (see the docstring): "audited" (edge audit
+        log) is a different word, not "ok"-prefixed."""
+        assert store_write_succeeded({"docs": "audited"}, "docs") is False
+
+    def test_error_skipped_is_not_success(self):
+        assert store_write_succeeded({"vector": "skipped (no text)"}, "vector") is False
+
+    def test_error_unavailable_is_not_success(self):
+        assert store_write_succeeded({"graph": "unavailable"}, "graph") is False
+
+    def test_error_missing_key_is_not_success(self):
+        """The exact fail-closed case #66's 2nd codex round caught: a stores
+        map that simply doesn't have the requested key must not be treated
+        as a positive success."""
+        assert store_write_succeeded({"sql": "ok"}, "graph") is False
+
+    def test_error_non_dict_stores_is_not_success(self):
+        assert store_write_succeeded(None, "graph") is False  # type: ignore[arg-type]
+
+    def test_normal_key_none_checks_any_store(self):
+        """key=None (pack.py's legacy text-ingest gate): success if ANY
+        store in the map succeeded, regardless of which one."""
+        assert store_write_succeeded({"chromadb": "unavailable", "mongodb": "ok"}) is True
+        assert store_write_succeeded({"chromadb": "ok (id=x)", "mongodb": "unavailable"}) is True
+
+    def test_error_key_none_all_unavailable_is_not_success(self):
+        """The exact scenario #66's 3rd codex round caught: both optional
+        stores unavailable, key=None must not fall through to success."""
+        assert store_write_succeeded({"chromadb": "unavailable", "mongodb": "unavailable"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -287,19 +337,54 @@ class TestIngestIntoPack:
         billing.on_ingest.assert_not_called()  # but nothing actually landed
 
     def test_normal_legacy_path_vector_only_success_still_bills(self):
-        """Positive-confirmation counterpart: chromadb comes back "ok" (even
-        though mongodb, an optional audit record, is unavailable) — the text
-        really did land in the vector store, so this must still bill."""
+        """Positive-confirmation counterpart: chromadb comes back its REAL
+        production shape — "ok (id=...)" (opencrab/ontology/query.py's
+        HybridQuery.ingest() decorates the status with the vector id, it
+        never returns a bare "ok") — even though mongodb, an optional audit
+        record, is unavailable. The text really did land in the vector
+        store, so this must still bill.
+
+        #66 codex re-review (4th round), finding [2]/[5]: an earlier version
+        of this test used a bare "ok" mock, which passed against a bare
+        `== "ok"` billing check that REJECTED the real decorated string and
+        silently stopped billing every legacy vector-only success in
+        production — the fixture was shaped to match the implementation
+        instead of the real contract, so it could not catch that regression.
+        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns."""
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
-        hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
+        hybrid.ingest.return_value = {"stores": {"chromadb": "ok (id=vec-src-5)"}}
         mongo = MagicMock()
         mongo.available = False
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
             _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
         billing.on_ingest.assert_called_once_with("default", None, "src-5")
+
+    def test_normal_real_hybrid_ingest_output_shape_bills(self):
+        """Not a mock at all — exercises the REAL
+        opencrab.ontology.query.HybridQuery.ingest() (only its Chroma client
+        stubbed) so this test cannot drift from production's actual status
+        string shape the way a hand-built dict can. Guards against the exact
+        class of bug the finding above describes recurring."""
+        from opencrab.ontology.query import HybridQuery
+
+        builder = MagicMock()
+        billing = MagicMock()
+        chroma = MagicMock()
+        chroma.available = True
+        chroma.upsert_texts.return_value = ["vec-real-1"]
+        hybrid = HybridQuery(chroma=chroma, neo4j=MagicMock(available=False))
+        mongo = MagicMock()
+        mongo.available = False
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            result = _ingest_into_pack(
+                "pack-a", text="legacy text", source_id="src-6", text_as_node=False,
+            )
+        assert result["stores"]["chromadb"] == "ok (id=vec-real-1)"
+        billing.on_ingest.assert_called_once_with("default", None, "src-6")
 
     def test_edge_no_content_is_a_noop(self):
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
@@ -499,8 +584,16 @@ class TestPackCreate:
     def test_normal_bills_one_ingest_event_using_source_id(self):
         """#66: pack_create/pack_ingest never called billing.on_ingest — every
         pack write went unbilled. One call to _ingest_into_pack -> one
-        on_ingest event, using the text's source_id when text is given."""
+        on_ingest event, using the text's source_id when text is given.
+
+        builder.add_node's mocked return must include a real "graph": "ok"
+        (the only status OntologyBuilder.add_node ever assigns that key —
+        see builder.py) — the billing gate now positively confirms the
+        graph write landed (issue #66 codex re-review), so a bare
+        MagicMock() return (no "graph" key at all) would no longer count as
+        billable, same as it wouldn't in production."""
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -518,6 +611,7 @@ class TestPackCreate:
         """nodes given, no text -> no source_id, so on_ingest must fall back
         to pack_id (its signature requires a non-None string)."""
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -619,6 +713,7 @@ class TestPackIngestErrors:
     def test_normal_bills_ingest_event(self):
         """#66: pack_ingest never called billing.on_ingest."""
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -640,6 +735,7 @@ class TestPackIngestErrors:
         import logging
 
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         billing.on_ingest.return_value = {"ok": False, "error": "database is locked"}
         with (
