@@ -530,7 +530,8 @@ def test_upsert_nodes_batch_normalizes_space_same_as_upsert_node():
     of delegating to upsert_node, so it needs the identical
     _normalize_space reconciliation applied per node -- otherwise a batch
     caller could reintroduce the exact space_id/properties["space"]
-    divergence upsert_node itself no longer allows."""
+    divergence upsert_node itself no longer allows. Precedence (codex
+    review [2]): the explicit space_id ARGUMENT wins, matching Neo4j."""
     store = _store()
     store.upsert_nodes_batch([
         {
@@ -541,8 +542,8 @@ def test_upsert_nodes_batch_normalizes_space_same_as_upsert_node():
     row = store._conn.execute(
         "SELECT space_id, properties FROM graph_nodes WHERE node_id='a'"
     ).fetchone()
-    assert row[0] == "claim"  # column follows the JSON value, not the caller's stale arg
-    assert '"space": "claim"' in row[1]
+    assert row[0] == "evidence"  # the explicit argument wins, not the stale JSON key
+    assert '"space": "evidence"' in row[1]
 
 
 # ---------------------------------------------------------------------------
@@ -560,19 +561,23 @@ def test_upsert_node_normalizes_space_id_column_to_match_props_space():
     row = store._conn.execute(
         "SELECT space_id, properties FROM graph_nodes WHERE node_id='a'"
     ).fetchone()
-    assert row[0] == "claim"
-    assert '"space": "claim"' in row[1]
+    assert row[0] == "evidence"
+    assert '"space": "evidence"' in row[1]
 
 
-def test_export_nodes_space_mismatch_no_longer_desyncs_total_from_len():
-    """Issue #118: total (count_exported_nodes) and len(nodes)
-    (export_nodes) must stay consistent even when rows are written with a
-    caller-mismatched space_id/properties["space"] pair -- see
-    tests/test_mcp_dispatch_extended.py's
-    test_space_mismatch_no_longer_desyncs_total_from_nodes for the
-    end-to-end (ontology_list_nodes) reproduction of the exact
-    `total: N, nodes: []` symptom the issue reports; this pins the same
-    invariant at the store level.
+def test_export_nodes_space_mismatch_reports_the_requested_space_not_the_stale_json():
+    """Issue #118: export_nodes has no Python post-filter of its own (unlike
+    ontology_list_nodes -- see test_mcp_dispatch_extended.py's
+    test_space_mismatch_no_longer_desyncs_total_from_nodes for that end-to-
+    end reproduction of the `total: N, nodes: []` symptom); its own
+    correctness invariant is narrower but just as real: every row a
+    space=X query returns must be LABELED space==X, and count_exported_nodes
+    (SQL-only) must agree with len(export_nodes(..., a limit large enough
+    to not truncate)). Pre-fix, a row selected by the column filter
+    (space_id="target") could still be merged (via _merge_space, which
+    reads whatever properties["space"] literally says) into a report
+    claiming a DIFFERENT space entirely -- so a caller asking for
+    space="target" got back rows self-labeled as "other".
     """
     store = _store()
     for i in range(3):
@@ -582,7 +587,7 @@ def test_export_nodes_space_mismatch_no_longer_desyncs_total_from_len():
     store.upsert_node("Item", "real", {"pack_id": "p1"}, space_id="target")
 
     total = store.count_exported_nodes(pack_id="p1", space="target")
-    page = store.export_nodes(pack_id="p1", space="target", limit=3)
+    page = store.export_nodes(pack_id="p1", space="target", limit=10)
 
-    assert total == len(page) == 1
-    assert page[0]["props"]["id"] == "real"
+    assert total == len(page) == 4
+    assert all(r["props"]["space"] == "target" for r in page)

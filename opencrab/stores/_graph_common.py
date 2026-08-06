@@ -32,8 +32,11 @@ C3 UPDATE: opencrab/stores/kuzu_graph_store.py originally re-implemented the
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -114,49 +117,87 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _valid_space(value: Any) -> str | None:
+    """The only value shape ``_space_passes`` (below) actually treats as a
+    usable space identifier: a non-empty ``str`` (it does ``props.get(
+    "space") in space_set``, a set of caller-supplied strings -- anything
+    else, e.g. an int/dict/list/bool, can never be in that set regardless of
+    its value). Used by both ``_normalize_space`` and ``_merge_space`` so a
+    value the WRITE side considers "real" is exactly the same one the READ
+    side does -- issue #118 codex review [3]: before this, both used bare
+    Python truthiness on ``props.get("space")`` directly, which agreed on
+    falsy-vs-truthy but not on TYPE (a truthy non-string, e.g. ``{"a": 1}``
+    or ``5``, would have been treated as "a real space" by one code path's
+    truthiness check while never matching anything at the actual filtering
+    layer) -- and it keeps ``_normalize_space`` from ever writing a
+    non-string value into the ``space_id`` TEXT column, which risked a
+    binding error on PG (see this module's docstring, "kept" tests) even
+    when SQLite silently tolerated it.
+    """
+    return value if isinstance(value, str) and value else None
+
+
 def _normalize_space(props: dict[str, Any], space_id: str | None) -> tuple[dict[str, Any], str | None]:
     """Reconcile a node's two space representations BEFORE a write lands
     (issue #118), so ``space_id`` (the column SQL/Cypher predicates filter
-    on) and ``props["space"]`` (what ``_merge_space`` below already treats as
-    authoritative on read) can never diverge for any node written through
-    ``upsert_node``/``upsert_nodes_batch`` again.
+    on) and ``props["space"]`` can never diverge for any node written
+    through ``upsert_node``/``upsert_nodes_batch`` again. Shared by
+    ``_sql_graph_base.py`` (SQLite + PG), ``kuzu_graph_store.py``, and
+    ``neo4j_store.py`` -- issue #118 codex review [2]: before this, Neo4j's
+    own inline ``if space_id: props["space"] = space_id`` (explicit argument
+    wins) and this function's precedence (JSON wins, matching ``_merge_space``
+    below) picked DIFFERENT winners for the same conflicting input, so the
+    same ``upsert_node(..., properties={"space": "B"}, space_id="A")`` call
+    landed as space "B" on SQL/Kuzu but space "A" on Neo4j -- a cross-backend
+    inconsistency worse than the single-store divergence this function
+    exists to close. All three backends now call this one function, so they
+    cannot drift again.
 
-    Without this, a caller could pass a different value in each place (the
-    ``space_id`` argument vs. an explicit ``properties["space"]`` key) and
-    both landed independently -- ``space_id`` filters (``find_neighbors``,
-    ``export_nodes``/``count_exported_nodes``, Kuzu's ``_scan_space_matching``)
-    then ran on the stale COLUMN ahead of any ``LIMIT``, while the Python
-    post-filter (``_space_passes``, fed by ``_merge_space`` below) checked the
-    JSON value AFTER ``LIMIT`` -- so a hub whose first ``limit`` candidates
-    were all column-matching-but-JSON-mismatched consumed the whole limit and
-    got rejected, starving genuinely valid neighbours further down the scan.
+    PRECEDENCE: the explicit ``space_id`` ARGUMENT wins when it is a valid,
+    truthy string -- not ``props["space"]``. This is the reverse of
+    ``_merge_space``'s read-time fallback (still JSON-wins, see below) and
+    is a deliberate choice, not an oversight: an explicit ``space=`` the
+    caller passed to ``upsert_node`` is the least-surprising authority --
+    silently letting an incidental key in an arbitrary ``properties`` dict
+    override it is not. It is also what Neo4j already did (the actual
+    precedent named in the issue), so this makes SQL/Kuzu match Neo4j
+    instead of the other way around. Re-measured live 2026-08-06 (see PR
+    description) across every combination the two values can disagree on
+    (not just "both present and different" -- also JSON-truthy/column-NULL,
+    the case codex review [1] pointed out the first measurement missed): 0
+    of 252,604 graph_nodes actually diverge either way, so flipping the
+    precedence does not touch any existing data.
+    tests/test_graph_protocol_contract.py::TestExportCarriesSpace's
+    ``test_explicit_props_space_is_not_overwritten_by_column`` pinned the
+    OLD precedence and was updated (renamed) alongside this change.
 
-    SAME precedence as ``_merge_space`` (a truthy ``props["space"]`` wins) --
-    not the reverse -- because that precedence is already the store's pinned,
-    tested read-time contract (see
-    tests/test_graph_protocol_contract.py::TestExportCarriesSpace, which
-    predates this fix and must keep passing unchanged): an explicit
-    caller-supplied ``properties["space"]`` has always survived being
-    overwritten by the column. This fix does not change WHICH value wins; it
-    makes the LOSING side (the column) actually get updated to match instead
-    of silently disagreeing forever.
+    WARNING, NOT SILENT DISCARD (codex review [2]): when both sides are
+    valid, truthy, and DIFFERENT, the losing value is not just dropped --
+    it's logged, since a caller passing conflicting values for the same
+    node is itself a sign of a bug somewhere upstream worth surfacing.
 
     Returns ``(props, space_id)`` -- ``props`` is the input dict unchanged
     (same object) unless a value needs folding in (matching ``_merge_space``'s
-    own mutation contract); ``space_id`` is the effective value to persist in
-    the column.
+    own mutation contract); ``space_id`` is the effective value to persist,
+    ALWAYS either ``None`` or a non-empty ``str`` (never a passthrough of a
+    caller's invalid, e.g. non-string, argument -- see ``_valid_space``).
 
     SCOPE: this closes the divergence for every write going through
-    ``upsert_node``/``upsert_nodes_batch`` from here on. It does NOT retroactively
-    fix rows already divergent before this shipped -- measured live 2026-08-06
-    (see PR description), 0 of 252,604 graph_nodes had a real space_id/
-    properties["space"] disagreement, so no backfill was needed at ship time.
+    ``upsert_node``/``upsert_nodes_batch``/Neo4jStore's own ``upsert_node``
+    from here on. It does NOT retroactively fix rows already divergent
+    before this shipped (measured 0 live, so nothing to backfill), and it
+    does NOT cover writers that bypass these methods entirely -- two
+    scripts (``scripts/build_nemotron_personas_korea_pack.py``,
+    ``scripts/migrate_sqlite_to_pg.py``) INSERT into ``graph_nodes``
+    directly (codex review [4]/[7]); left as-is per that review (a
+    follow-up, not this fix's scope), noted here so this docstring does not
+    overstate the invariant's reach.
     # ponytail: SQL/Cypher predicates (find_neighbors, export_nodes,
     # count_exported_nodes, _scan_space_matching) still filter on the raw
     # space_id column, not an effective-space expression -- a row written
-    # out-of-band (direct DB edit, restored backup, external migration) after
-    # this ships could still be divergent and still starve a LIMIT-bound
-    # query the way issue #118 describes. Upgrade path if that ever measures
+    # out-of-band (the two scripts above, a direct DB edit, a restored
+    # backup) could still be divergent and still starve a LIMIT-bound query
+    # the way issue #118 describes. Upgrade path if that ever measures
     # nonzero again: either re-run the backfill query above, or push
     # COALESCE(NULLIF(json_extract(properties,'$.space'),''), space_id) into
     # the predicate (measured cost on this store's live 250k-row table: an
@@ -164,12 +205,21 @@ def _normalize_space(props: dict[str, Any], space_id: str | None) -> tuple[dict[
     # ~439ms -- 173x -- so pair it with a second index on the JSON
     # expression, not a bare COALESCE wrap, if it's ever needed).
     """
-    space = props.get("space")
-    if space:
-        return props, space
-    if space_id:
-        return {**props, "space": space_id}, space_id
-    return props, space_id
+    sid = _valid_space(space_id)
+    pspace = _valid_space(props.get("space"))
+    if sid and pspace and sid != pspace:
+        logger.warning(
+            "upsert_node: space_id=%r and properties['space']=%r disagree for "
+            "node_id=%r; space_id (the explicit argument) wins.",
+            sid, pspace, props.get("id"),
+        )
+    if sid:
+        if pspace == sid:
+            return props, sid
+        return {**props, "space": sid}, sid
+    if pspace:
+        return props, pspace
+    return props, None
 
 
 def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
@@ -194,15 +244,34 @@ def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
     non-NULL for all 248,304 rows and never disagreed with ``props["space"]``
     where both were present.
 
-    Precedence: a **truthy** ``props["space"]`` wins, so an explicit
-    caller-supplied value survives. A falsy one (``""``/``None``) is treated as
-    absent and the column fills it -- an empty space is not a meaningful value,
-    and leaving it would keep exactly the breakage this exists to fix.
+    Precedence: a **truthy, string** ``props["space"]`` wins, so an explicit
+    caller-supplied value survives. A falsy one (``""``/``None``) OR a
+    non-string one (e.g. an int/dict a caller wrote directly, bypassing
+    ``upsert_node``) is treated as absent and the column fills it -- an
+    empty or wrong-shaped space is not a meaningful value, and leaving it
+    would keep exactly the breakage this exists to fix. (issue #118 codex
+    review [3]: this used to be a bare ``props.get("space")`` truthiness
+    check, which agreed with ``_normalize_space``'s on falsy-vs-truthy but
+    not on type -- ``_valid_space`` is now the single shared definition of
+    "a real space value" both functions use, so a write-time and read-time
+    judgement of the same row can no longer disagree just because one
+    checked the type and the other didn't.)
+
+    NOTE this is the OPPOSITE precedence from ``_normalize_space`` (which
+    makes the ``space_id`` argument win) -- deliberate, not a leftover: this
+    function's job is to be a read-time SAFETY NET for rows this fix cannot
+    retroactively touch (written before it shipped, or by a script that
+    bypasses ``upsert_node`` -- see ``_normalize_space``'s docstring
+    "SCOPE"), so it keeps favoring whatever a human is most likely to have
+    intentionally put in the JSON by hand. For every row written through
+    ``upsert_node``/``upsert_nodes_batch`` after this fix, ``space_id`` and
+    ``props["space"]`` are identical by construction, so this function's
+    choice of winner never actually matters for them either way.
 
     Returns the input dict unchanged (same object) when there is nothing to
     fold; otherwise a new dict. The input is never mutated, so callers sharing a
     props dict cannot be polluted through this.
     """
-    if not space_id or props.get("space"):
+    if not space_id or _valid_space(props.get("space")):
         return props
     return {**props, "space": space_id}

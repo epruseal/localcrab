@@ -240,15 +240,17 @@ class TestOntologyListNodesLocalBackend:
         """Issue #118: upsert_node used to store space_id (column) and
         properties["space"] (JSON) independently. count_exported_nodes
         counted by the COLUMN; export_nodes returned that same row but
-        _merge_space (JSON wins) reported a DIFFERENT space back out; this
-        tool's own post-filter (`n_space != cleaned_space` below) then
-        dropped it -- producing exactly the `total: 1(+), nodes: []` split
-        the issue reports, whenever the mismatched rows sort ahead of the
-        genuine match and `limit` cuts the page off before reaching it.
+        _merge_space reported whatever properties["space"] literally said
+        back out; this tool's own post-filter (`n_space != cleaned_space`
+        below) then dropped rows whose reported space didn't match --
+        producing exactly the `total: N, nodes: []`-shaped split the issue
+        reports (here: total=4 from the column-only count, but only 1 row
+        surviving the post-filter, since 3 of the 4 were mislabeled).
 
-        Seeds 3 (== limit) nodes where the caller passed space_id="target"
-        but properties["space"]="other" FIRST, then one genuinely
-        space="target" node AFTER.
+        ``limit=10`` (not capped to the seeded count) so the only possible
+        source of a total/len(nodes) mismatch is this correctness bug, not
+        ordinary limit truncation (already covered by the pre-existing
+        #54 `test_limit_boundary_caps_rows_but_not_total`).
         """
         for i in range(3):
             graph.upsert_node(
@@ -258,12 +260,10 @@ class TestOntologyListNodesLocalBackend:
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = {"neo4j": graph, "mongo": docs}
-            result = ontology_list_nodes(pack_id="pack-a", space="target", limit=3)
+            result = ontology_list_nodes(pack_id="pack-a", space="target", limit=10)
 
-        assert result["total"] == len(result["nodes"])
-        assert result["nodes"], "starved: a real space=target match exists but nodes is empty"
+        assert result["total"] == len(result["nodes"]) == 4
         assert all(n["space"] == "target" for n in result["nodes"])
-        assert result["nodes"][0]["node_id"] == "real-1"
 
 
 # ---------------------------------------------------------------------------

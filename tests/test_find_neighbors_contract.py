@@ -347,26 +347,31 @@ class TestFindNeighborsSpaceMismatch:
         different values for each produced a genuinely divergent row.
         find_neighbors' SQL/Cypher pushdown filtered candidate edges on the
         space_id COLUMN ahead of LIMIT, while the Python post-filter
-        (_space_passes, fed by _merge_space, which treats JSON as
-        authoritative) ran AFTER LIMIT -- so `limit` column-matching-but-
-        JSON-mismatched rows consumed the whole limit and were then all
-        rejected, starving genuinely valid neighbours further down the scan.
+        (_space_passes, fed by _merge_space) ran AFTER LIMIT -- so `limit`
+        column-matching-but-JSON-mismatched rows consumed the whole limit
+        and were then all rejected, starving genuinely valid neighbours
+        further down the scan.
 
-        Root-cause fix (_graph_common.py's _normalize_space, same
-        precedence as _merge_space: a truthy properties["space"] wins):
-        upsert_node now reconciles space_id/properties["space"] at WRITE
-        time, so the "mismatched" nodes seeded below are no longer stored
-        as space="target" at all post-fix (JSON wins -> they become
-        genuine, correctly-excluded space="other" nodes) -- there is no
-        longer any way to construct the pre-fix divergent row shape through
-        this store's public write API, which is exactly why the always-
-        valid nodes seeded after them are reachable again.
+        Root-cause fix (_graph_common.py's _normalize_space -- the explicit
+        space_id ARGUMENT wins over properties["space"], see its docstring
+        for why): upsert_node now reconciles space_id/properties["space"]
+        at WRITE time, so the "mismatched" nodes seeded below can no longer
+        be stored divergent at all post-fix -- properties["space"] is
+        forced to match the space_id argument the caller actually passed
+        ("target"), so they become genuine, correctly-INCLUDED space=
+        "target" nodes. There is no longer any way to construct the
+        pre-fix divergent row shape through this store's public write API
+        at all, which is exactly why find_neighbors is never starved by it
+        again -- not just for the always-valid nodes seeded after the
+        mismatched batch, but for the (now also valid) mismatched batch
+        itself, since it is impossible to tell them apart anymore.
         """
         _name, store = backend
         store.upsert_node("Hub", "h", {}, space_id="target")
-        # First 10 (== limit): space_id says "target" but properties["space"]
-        # says "other" -- pre-fix these are stored genuinely divergent and
-        # consume the whole SQL LIMIT before Python ever rejects them.
+        # First 10 (== limit): caller passes space_id="target" but
+        # properties["space"]="other" -- pre-fix these are stored genuinely
+        # divergent and consume the whole SQL LIMIT before Python ever
+        # rejects them.
         for i in range(10):
             store.upsert_node("Leaf", f"m{i}", {"space": "other"}, space_id="target")
             store.upsert_edge("Hub", "h", "touches", "Leaf", f"m{i}", {})
@@ -378,6 +383,7 @@ class TestFindNeighborsSpaceMismatch:
 
         rows = store.find_neighbors("h", direction="out", depth=1, limit=10, spaces=["target"])
 
-        assert rows, "starved: 5 real space=target neighbours exist but find_neighbors returned none"
-        assert _ids(rows) == {f"v{i}" for i in range(5)}
+        assert rows, "starved: 15 real space=target neighbours exist but find_neighbors returned none"
+        assert len(rows) == 10  # limit boundary reached -- not starved down to 0 or 5
+        assert _ids(rows) <= {f"m{i}" for i in range(10)} | {f"v{i}" for i in range(5)}
         assert all(r["properties"].get("space") == "target" for r in rows)

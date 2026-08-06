@@ -132,15 +132,25 @@ class TestAsDict:
 
 
 class TestNormalizeSpace:
-    def test_truthy_props_space_wins_and_overwrites_space_id(self):
-        """Same precedence as _merge_space: an explicit properties["space"]
-        survives, and the returned space_id is updated to match it -- the
-        column must never disagree with what a read later reports."""
-        props, space_id = _normalize_space({"space": "claim"}, "evidence")
-        assert props["space"] == "claim"
-        assert space_id == "claim"
+    """Precedence (issue #118 codex review [2]): the explicit ``space_id``
+    ARGUMENT wins over a conflicting ``properties["space"]`` key -- matches
+    what neo4j_store.py's upsert_node already did, and is now shared by all
+    three backends via this one function (see its docstring)."""
 
-    def test_falsy_props_space_is_filled_from_space_id(self):
+    def test_truthy_space_id_wins_and_overwrites_props_space(self):
+        props, space_id = _normalize_space({"space": "claim"}, "evidence")
+        assert props["space"] == "evidence"
+        assert space_id == "evidence"
+
+    def test_no_space_id_but_truthy_props_space_is_promoted_to_space_id(self):
+        """The column must get populated even when the caller only supplied
+        properties["space"] and no explicit space_id -- otherwise the
+        SQL/Kuzu space_id predicates could never match this node at all."""
+        props, space_id = _normalize_space({"space": "concept"}, None)
+        assert props["space"] == "concept"
+        assert space_id == "concept"
+
+    def test_falsy_props_space_is_overwritten_by_space_id(self):
         props, space_id = _normalize_space({"space": ""}, "evidence")
         assert props["space"] == "evidence"
         assert space_id == "evidence"
@@ -155,14 +165,6 @@ class TestNormalizeSpace:
         assert "space" not in props
         assert space_id is None
 
-    def test_no_space_id_but_truthy_props_space_is_promoted_to_space_id(self):
-        """The column must get populated even when the caller only supplied
-        properties["space"] and no explicit space_id -- otherwise the
-        SQL/Kuzu space_id predicates could never match this node at all."""
-        props, space_id = _normalize_space({"space": "concept"}, None)
-        assert props["space"] == "concept"
-        assert space_id == "concept"
-
     def test_input_dict_not_mutated_when_value_folded_in(self):
         original = {"text": "body"}
         props, _space_id = _normalize_space(original, "evidence")
@@ -170,9 +172,57 @@ class TestNormalizeSpace:
         assert props is not original
 
     def test_input_dict_returned_unchanged_when_nothing_to_fold(self):
-        original = {"space": "claim"}
-        props, _space_id = _normalize_space(original, "evidence")
+        """Nothing to fold means the two ALREADY agree (or space_id wins but
+        props["space"] already equals it) -- not merely "props has a
+        space", since with this precedence a differing props["space"] is
+        always overwritten."""
+        original = {"space": "evidence"}
+        props, space_id = _normalize_space(original, "evidence")
         assert props is original
+        assert space_id == "evidence"
+
+    # -- codex review [3]: type contract must match _merge_space/_valid_space --
+
+    def test_non_string_props_space_is_not_a_valid_value(self):
+        """An int/dict truthy properties["space"] is not a usable space
+        identifier (see _valid_space) -- ignored, same as if absent."""
+        props, space_id = _normalize_space({"space": 5}, None)
+        assert space_id is None
+        assert props["space"] == 5  # untouched, not promoted into space_id
+
+    def test_non_string_space_id_argument_is_not_promoted(self):
+        """A caller passing a non-string space_id (misuse) must never end up
+        written into the space_id column -- avoids the PG bind-type-error
+        risk codex review [7] flagged."""
+        props, space_id = _normalize_space({"text": "body"}, 5)  # type: ignore[arg-type]
+        assert space_id is None
+        assert "space" not in props
+
+    def test_non_string_space_id_falls_back_to_valid_props_space(self):
+        props, space_id = _normalize_space({"space": "concept"}, 5)  # type: ignore[arg-type]
+        assert space_id == "concept"
+        assert props["space"] == "concept"
+
+    # -- codex review [2]: conflicts are logged, not silently dropped --
+
+    def test_conflicting_values_logs_a_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _normalize_space({"space": "claim", "id": "n1"}, "evidence")
+        assert any(
+            "claim" in r.message and "evidence" in r.message and "n1" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_conflict_does_not_log(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _normalize_space({"space": "evidence"}, "evidence")
+            _normalize_space({}, "evidence")
+            _normalize_space({"space": "concept"}, None)
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------

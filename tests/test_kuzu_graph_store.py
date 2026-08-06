@@ -383,25 +383,28 @@ def test_count_exported_nodes_with_pack_id_has_no_limit_clause(store, monkeypatc
 
 def test_upsert_node_normalizes_space_id_to_match_props_space(store) -> None:
     """Direct invariant check: after upsert_node, the space_id column must
-    equal the effective properties["space"] value (same precedence as
-    _merge_space -- a truthy properties["space"] wins and space_id is
-    updated to match it), so the two can no longer diverge."""
+    equal the effective properties["space"] value -- the two can no longer
+    diverge. Precedence (codex review [2]): the explicit space_id ARGUMENT
+    wins, matching Neo4j (which does this natively -- see neo4j_store.py)."""
     store.upsert_node("Item", "a", {"space": "claim"}, space_id="evidence")
     r = store._conn.execute(
         "MATCH (n:OntologyNode {node_id: $id}) RETURN n.space_id, n.props", {"id": "a"}
     )
     space_id, props_raw = r.get_next()
-    assert space_id == "claim"
-    assert '"space": "claim"' in props_raw
+    assert space_id == "evidence"
+    assert '"space": "evidence"' in props_raw
 
 
-def test_export_nodes_space_mismatch_no_longer_desyncs_total_from_len(store) -> None:
-    """Issue #118: total (count_exported_nodes) and len(nodes)
-    (export_nodes) must stay consistent even when nodes are written with a
-    caller-mismatched space_id/properties["space"] pair. pack_id is given so
-    both calls go through _scan_space_matching (issue #118 explicitly names
-    it as a path sharing this risk: its Cypher WHERE filters on the raw
-    space_id column)."""
+def test_export_nodes_space_mismatch_reports_the_requested_space_not_the_stale_json(store) -> None:
+    """Issue #118: every row a space="target" query returns must be LABELED
+    space=="target", and count_exported_nodes (SQL-only) must agree with
+    len(export_nodes(..., a limit large enough to not truncate)). pack_id
+    is given so both calls go through _scan_space_matching (issue #118
+    explicitly names it as a path sharing this risk: its Cypher WHERE
+    filters on the raw space_id column). Pre-fix, a row selected by that
+    column filter could still be merged (via _merge_space, which reads
+    whatever properties["space"] literally says) into a report claiming a
+    DIFFERENT space entirely."""
     for i in range(3):
         store.upsert_node(
             "Item", f"mis{i}", {"pack_id": "p1", "space": "other"}, space_id="target"
@@ -409,10 +412,10 @@ def test_export_nodes_space_mismatch_no_longer_desyncs_total_from_len(store) -> 
     store.upsert_node("Item", "real", {"pack_id": "p1"}, space_id="target")
 
     total = store.count_exported_nodes(pack_id="p1", space="target")
-    page = store.export_nodes(pack_id="p1", space="target", limit=3)
+    page = store.export_nodes(pack_id="p1", space="target", limit=10)
 
-    assert total == len(page) == 1
-    assert page[0]["props"]["id"] == "real"
+    assert total == len(page) == 4
+    assert all(r["props"]["space"] == "target" for r in page)
 
 
 def test_export_edges(store) -> None:
