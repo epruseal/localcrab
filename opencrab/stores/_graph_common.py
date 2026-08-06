@@ -130,9 +130,8 @@ def _valid_space(value: Any) -> str | None:
     or ``5``, would have been treated as "a real space" by one code path's
     truthiness check while never matching anything at the actual filtering
     layer) -- and it keeps ``_normalize_space`` from ever writing a
-    non-string value into the ``space_id`` TEXT column, which risked a
-    binding error on PG (see this module's docstring, "kept" tests) even
-    when SQLite silently tolerated it.
+    non-string value into the ``space_id`` TEXT column, which risked a PG
+    bind-type error even where SQLite would have silently tolerated it.
     """
     return value if isinstance(value, str) and value else None
 
@@ -169,7 +168,10 @@ def _normalize_space(props: dict[str, Any], space_id: str | None) -> tuple[dict[
     precedence does not touch any existing data.
     tests/test_graph_protocol_contract.py::TestExportCarriesSpace's
     ``test_explicit_props_space_is_not_overwritten_by_column`` pinned the
-    OLD precedence and was updated (renamed) alongside this change.
+    OLD precedence and was renamed/flipped to
+    ``test_explicit_space_id_argument_overwrites_props_space`` alongside
+    this change (same file's ``TestSingleNodeReadsCarrySpace`` had a second,
+    ``get_node``-level copy of the same old pin, flipped too).
 
     WARNING, NOT SILENT DISCARD (codex review [2]): when both sides are
     valid, truthy, and DIFFERENT, the losing value is not just dropped --
