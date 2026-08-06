@@ -13,6 +13,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
+from opencrab.stores._graph_common import _normalize_space
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,8 +132,13 @@ class Neo4jStore:
         self._require_available()
 
         props = {**properties, "id": node_id}
-        if space_id:
-            props["space"] = space_id
+        # issue #118 codex review [2]: this used to be an inline
+        # `if space_id: props["space"] = space_id`, which happened to already
+        # match the precedence _normalize_space now defines (explicit
+        # space_id argument wins) -- switched to the shared helper so all
+        # three backends provably run the same rule instead of three
+        # independently-maintained copies of it drifting apart again.
+        props, _space_id = _normalize_space(props, space_id)
 
         set_clause = ", ".join(f"n.{k} = ${k}" for k in props)
         cypher = f"""
