@@ -390,8 +390,23 @@ export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/loca
   graph.db-shm      # 공유 메모리 파일 — 백업 시 반드시 포함
   doc_store.db      # LocalSQLDocStore (SQLite)
   chroma/           # Chroma PersistentClient
-  opencrab.db       # SQLStore (SQLite)
+  opencrab.db       # SQLStore (SQLite) — ontology_nodes/edges, impact_records,
+                     # lever_simulations, rebac_policies
+  billing.db        # billing_events 전용 (issue #105부터 opencrab.db 분리 —
+                     # write.lock 쓰기와 SQLite 파일 잠금이 경합하지 않도록)
 ```
+
+> **issue #105 이전 설치라면 `opencrab.db`에도 `billing_events` 테이블이 남아
+> 있을 수 있다.** 그 테이블은 의도적으로 손대지 않는다 — 이름도 안 바꾸고
+> 복사도 하지 않는다(자동 마이그레이션을 시도했다가 코드 리뷰에서 원자성·
+> 동시 기동·잠금 없는 스키마 쓰기 세 가지 결함이 나와 되돌렸다). 이 저장소
+> 안에서 `BillingHooks.get_usage()`/`list_events()`를 부르는 코드가 없어
+> (grep으로 확인, 테스트 제외 0건) 지금은 과거 이력이 두 파일에 나뉘어
+> 있어도 실질적 영향이 없다. **나중에 이 데이터를 실제로 읽는 소비자가
+> 생기면** 그때 `scripts/migrate_sqlite_to_pg.py`와 같은 형태의 1회성
+> 스크립트를 작성해 `opencrab.db`의 구 `billing_events`를 `SELECT`로 읽어
+> `billing.db`에 `INSERT OR IGNORE`하면 된다 — 사람이 직접 실행하는 단발성
+> 작업이므로 기동 경로의 크래시 복구·동시성 설계가 필요 없다.
 
 **3. 수동 백업**
 
@@ -402,10 +417,12 @@ WAL 모드 사용 시 `.db`만 복사하면 체크포인트되지 않은 WAL 데
 cp graph.db graph.db-wal graph.db-shm /backup/path/
 cp doc_store.db /backup/path/
 cp opencrab.db /backup/path/
+cp billing.db /backup/path/
 cp -r chroma/ /backup/path/chroma/
 ```
 
-> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일을 자동으로 함께 복사한다.
+> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일과 `billing.db`를
+> 자동으로 함께 복사한다.
 
 **4. 검증**
 

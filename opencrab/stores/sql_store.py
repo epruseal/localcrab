@@ -139,11 +139,21 @@ _TABLES_SQL_SQLITE = [
 class SQLStore:
     """SQLAlchemy adapter supporting PostgreSQL and SQLite."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, *, create_tables: bool = True) -> None:
         self._url = url
         self._engine: Any = None
         self._available = False
         self._is_sqlite = url.startswith("sqlite")
+        # issue #105 (verifier follow-up): billing.db is meant to hold only
+        # billing_events (BillingHooks._ensure_tables() creates that table
+        # itself), but SQLStore._connect() unconditionally created the full
+        # ontology_nodes/ontology_edges/impact_records/lever_simulations/
+        # rebac_policies schema on every connect -- harmless, but it
+        # contradicted "billing-only file" and would have cost a future
+        # reader (operator or migration script) time figuring out why empty
+        # tables were sitting in billing.db. make_billing_sql_store passes
+        # create_tables=False; every other caller keeps the default (True).
+        self._create_tables_on_connect = create_tables
         self._connect()
 
     # ------------------------------------------------------------------
@@ -157,6 +167,23 @@ class SQLStore:
             connect_args: dict[str, Any] = {}
             if self._is_sqlite:
                 connect_args["check_same_thread"] = False
+                # issue #105: SQLAlchemy 2.0's pysqlite dialect only forwards
+                # a `timeout` (the DBAPI busy-wait, in seconds, before a
+                # locked table raises "database is locked") when it appears
+                # in the URL query string -- config.py's sqlite_url has no
+                # query, so without this the value in effect was silently
+                # the sqlite3 default (5.0s; measured 5.01s on this
+                # machine). Pinning it here makes that a decision instead of
+                # an accident. Left at the sqlite3 default rather than
+                # raised: this is the engine used by every SQLStore caller
+                # (not just billing), so a bigger value would make ANY
+                # contended statement here block longer. Billing doesn't
+                # need a bigger value anyway: billing_events lives in its
+                # own SQLite file (billing.db, local/kuzu mode) so it never
+                # contends with a long writer transaction on THIS engine's
+                # file in the first place -- see
+                # opencrab.stores.factory.make_billing_sql_store.
+                connect_args["timeout"] = 5.0
 
             self._engine = create_engine(self._url, connect_args=connect_args)
             self._text = text
@@ -166,7 +193,8 @@ class SQLStore:
 
             self._available = True
             logger.info("SQL store connected (%s)", self._url.split("@")[-1])
-            self._create_tables()
+            if self._create_tables_on_connect:
+                self._create_tables()
         except Exception as exc:
             logger.warning("SQL store unavailable: %s", exc)
             self._available = False
