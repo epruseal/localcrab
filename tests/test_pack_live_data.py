@@ -46,6 +46,31 @@ class TestRejectsUnusableTargets:
         assert "경로 없음" in str(ei.value)
         assert str(gone) in str(ei.value), "어느 경로가 문제인지 말해야 한다"
 
+    def test_lexically_normalising_the_path_must_not_admit_it(self, monkeypatch, tmp_path):
+        """`Path(d).is_dir()` 를 `Path(d).resolve().is_dir()` 로 "개선"하면 가드가 약해진다.
+
+        `resolve()` 는 **존재하지 않는 중간 요소를 낀 `..` 를 렉시컬하게 접는다.**
+        아래 경로에서 `ghost` 는 없는데 `resolve()` 는 그것을 지워 `real` 로 만들어
+        버리므로, 원본 가드가 정상 거부하던 경로가 통과한다:
+
+            Path(tmp/ghost/../real).is_dir()            -> False  (거부: 옳다)
+            Path(tmp/ghost/../real).resolve().is_dir()  -> True   (통과: 가드 약화)
+
+        심링크·`~` 처리 개선처럼 보이는 자연스러운 후속 변경이라 실제로 들어올 수 있다.
+        기존 8건은 이 변이를 **전부 통과시켰다**(적대 검증 실증, 2026-08-06: N5).
+        스테일 export 의 오타가 바로 이 형태를 만든다 — 없는 디렉터리를 거쳐 실재하는
+        다른 저장소를 가리키는 경로.
+        """
+        (tmp_path / "real").mkdir()
+        lexical = tmp_path / "ghost" / ".." / "real"
+        assert not (tmp_path / "ghost").exists(), "전제: 중간 요소가 실재하면 안 된다"
+        assert lexical.resolve().is_dir(), "전제: resolve() 하면 실재 디렉터리가 된다"
+
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(lexical))
+        with pytest.raises(SystemExit) as ei:
+            require_live_data("load_nodes")
+        assert "경로 없음" in str(ei.value)
+
     def test_file_is_not_a_directory(self, monkeypatch, tmp_path):
         """`is_dir()` 을 `exists()` 로 바꾸는 변이를 잡는다.
 
