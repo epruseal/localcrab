@@ -120,9 +120,12 @@ class OntologyBuilder:
         if self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
-                # store_write_succeeded() (below in this module) treats any
-                # status starting with "ok" as success — keep that prefix if
-                # this format ever changes.
+                # store_write_succeeded() (below in this module) only
+                # recognizes exactly "ok" or the "ok (...)" shape (status ==
+                # "ok" or status.startswith("ok (")) as success — keep the
+                # literal "ok (" (space + open-paren included) if this
+                # format ever changes, or this status silently stops being
+                # billed.
                 output["stores"]["docs"] = f"ok (id={mongo_id})"
                 self._mongo.log_event(
                     "node_upsert",
