@@ -173,22 +173,22 @@ def ontology_query(
         )
         results = outcome.results
         # This is a store write (billing_events INSERT), but ontology_query stays
-        # writes=False. The real reason (issue #105 corrected this comment: the
-        # previous version cited UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT
-        # DO NOTHING as making the insert idempotent and therefore safe to run
-        # unlocked -- that is false, since BillingHooks.emit mints a fresh UUID
-        # per call, so the conflict clause can never fire on a retry; it dedupes
-        # a literal double-send of the same event_id, not a failed-then-retried
-        # one) is purely a performance tradeoff: forcing writes=True here would
-        # serialise every query -- a high-frequency, read-shaped path -- behind
-        # the single cross-process write.lock, for no correctness gain. The
-        # actual cost of staying writes=False is that this billing insert is
-        # best-effort: if a long-running write.lock holder (e.g. a bulk
-        # pack_ingest) outlasts BillingHooks.emit's own lock-contention retries,
-        # the usage event for this query is lost. That loss is now observable
-        # (emit_failure_count / the "ok" dict below) instead of only a WARNING
-        # log. Decided in #65's review against #68 (E-4 lock ownership map); see
-        # `writes` field docstring in _registry.py#tool for the general rule.
+        # writes=False. NOT because the insert is idempotent (issue #105: it
+        # isn't -- BillingHooks.emit mints a fresh UUID per call, so
+        # UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING only
+        # dedupes a literal double-send, never resurrects a failed one), and
+        # NOT because losing this event would be an acceptable performance
+        # trade (protecting it IS the correctness goal #105 exists for).
+        # writes=False is safe here because billing_events lives in its own
+        # SQLite file (issue #105: opencrab.billing.hooks module docstring +
+        # opencrab.stores.factory.make_billing_sql_store) separate from the
+        # write.lock'd tables' file -- a billing insert here never contends
+        # with an unrelated writer no matter how long that writer holds
+        # write.lock, so forcing writes=True would only cost every query --
+        # a high-frequency, read-shaped path -- lock contention for no
+        # correctness gain. Decided in #65's review against #68 (E-4 lock
+        # ownership map); see `writes` field docstring in
+        # _registry.py#tool for the general rule.
         billing_result = ctx["billing"].on_query(tenant_id, subject_id, question)
         if not billing_result.get("ok"):
             # #105: emit() is fire-and-forget by design and never raises, but a

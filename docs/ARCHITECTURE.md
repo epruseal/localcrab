@@ -390,7 +390,10 @@ export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/loca
   graph.db-shm      # 공유 메모리 파일 — 백업 시 반드시 포함
   doc_store.db      # LocalSQLDocStore (SQLite)
   chroma/           # Chroma PersistentClient
-  opencrab.db       # SQLStore (SQLite)
+  opencrab.db       # SQLStore (SQLite) — ontology_nodes/edges, impact_records,
+                     # lever_simulations, rebac_policies
+  billing.db        # billing_events 전용 (issue #105부터 opencrab.db 분리 —
+                     # write.lock 쓰기와 SQLite 파일 잠금이 경합하지 않도록)
 ```
 
 **3. 수동 백업**
@@ -402,10 +405,12 @@ WAL 모드 사용 시 `.db`만 복사하면 체크포인트되지 않은 WAL 데
 cp graph.db graph.db-wal graph.db-shm /backup/path/
 cp doc_store.db /backup/path/
 cp opencrab.db /backup/path/
+cp billing.db /backup/path/
 cp -r chroma/ /backup/path/chroma/
 ```
 
-> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일을 자동으로 함께 복사한다.
+> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일과 `billing.db`를
+> 자동으로 함께 복사한다.
 
 **4. 검증**
 

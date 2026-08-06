@@ -90,6 +90,12 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            # issue #105: apply.py now also calls make_billing_sql_store(settings, sql)
+            # before constructing BillingHooks -- unpatched, that would really hit
+            # Settings()'s default LOCAL_DATA_DIR (a real path on whatever machine
+            # runs this test) since only make_sql_store above is mocked. BillingHooks
+            # itself is mocked too, so migrate_from's actual value doesn't matter here.
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=(sql, None)),
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
@@ -121,6 +127,12 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            # issue #105: apply.py now also calls make_billing_sql_store(settings, sql)
+            # before constructing BillingHooks -- unpatched, that would really hit
+            # Settings()'s default LOCAL_DATA_DIR (a real path on whatever machine
+            # runs this test) since only make_sql_store above is mocked. BillingHooks
+            # itself is mocked too, so migrate_from's actual value doesn't matter here.
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=(sql, None)),
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
@@ -147,6 +159,12 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            # issue #105: apply.py now also calls make_billing_sql_store(settings, sql)
+            # before constructing BillingHooks -- unpatched, that would really hit
+            # Settings()'s default LOCAL_DATA_DIR (a real path on whatever machine
+            # runs this test) since only make_sql_store above is mocked. BillingHooks
+            # itself is mocked too, so migrate_from's actual value doesn't matter here.
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=(sql, None)),
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
@@ -168,6 +186,12 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            # issue #105: apply.py now also calls make_billing_sql_store(settings, sql)
+            # before constructing BillingHooks -- unpatched, that would really hit
+            # Settings()'s default LOCAL_DATA_DIR (a real path on whatever machine
+            # runs this test) since only make_sql_store above is mocked. BillingHooks
+            # itself is mocked too, so migrate_from's actual value doesn't matter here.
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=(sql, None)),
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):

@@ -61,20 +61,26 @@ def tool(
     NOT because that insert is idempotent (issue #105: it isn't — each call
     mints a fresh event_id, so the table's UNIQUE(event_id) + INSERT OR
     IGNORE / ON CONFLICT DO NOTHING only dedupes a literal double-send of the
-    same event_id, and can never resurrect one that failed to persist), but
-    because forcing writes=True here would serialise every `ontology_query`
-    call — a read-shaped, high-frequency path — behind the single
-    cross-process mutex for no correctness gain, purely to protect a billing
-    side-effect. The real cost of that choice: this billing insert is
-    best-effort. If a long-running write.lock holder outlasts
-    `BillingHooks.emit`'s own lock-contention retries (see
-    opencrab/billing/hooks.py), the usage event is lost — observably (an
-    `ok: False` return / `emit_failure_count`), not silently, but lost.
-    Reviewed against issue #68 (E-4, lock ownership map) in #65's review
-    round. If a future handler performs a store mutation whose loss under
-    contention is NOT acceptable, it must be `writes=True` regardless of how
-    "read-shaped" the tool's name looks (this is exactly how #65 was missed
-    for ontology_impact/ontology_lever_simulate).
+    same event_id, and can never resurrect one that failed to persist), and
+    NOT because losing a billing event would be an acceptable trade for
+    query throughput — protecting billing IS a correctness goal, which is
+    the entire reason issue #105 exists. `writes=False` is safe here because
+    the contention this lock would otherwise be needed for DOESN'T HAPPEN:
+    billing_events lives in its own SQLite file (`billing.db`, local/kuzu
+    mode — see `opencrab.stores.factory.make_billing_sql_store`), separate
+    from the write.lock'd tables' file (`opencrab.db`). SQLite's write lock
+    is per-file, so a billing insert never contends with an unrelated write
+    there no matter how long that write holds `write.lock`. (An earlier
+    version of this fix instead retried the insert with backoff on lock
+    contention while still sharing the file — that only shrank the failure
+    window and blocked the request thread doing it; see
+    `opencrab.billing.hooks`'s module docstring for the full analysis,
+    including why WAL would not have been sufficient either.) Reviewed
+    against issue #68 (E-4, lock ownership map) in #65's review round. If a
+    future handler performs a store mutation that a shared file's write
+    lock is the only thing protecting, it must be `writes=True` regardless
+    of how "read-shaped" the tool's name looks (this is exactly how #65 was
+    missed for ontology_impact/ontology_lever_simulate).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:

@@ -68,7 +68,12 @@ def apply_promotion_package(
     try:
         from opencrab.config import Settings
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
-        from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store
+        from opencrab.stores.factory import (
+            make_billing_sql_store,
+            make_doc_store,
+            make_graph_store,
+            make_sql_store,
+        )
     except ImportError as exc:
         raise ImportError(
             "opencrab package is required for promotion apply. "
@@ -182,7 +187,11 @@ def apply_promotion_package(
         )
         billing_status["billed_node_count"] = billed_node_count
         if billed_node_count > 0:
-            billing_result = BillingHooks(sql).on_harness_apply(
+            # issue #105: billing gets its own SQLite file in local/kuzu mode
+            # (no-op passthrough to `sql` in pg/docker) -- see
+            # make_billing_sql_store's docstring.
+            billing_sql, billing_migrate_from = make_billing_sql_store(settings, sql)
+            billing_result = BillingHooks(billing_sql, migrate_from=billing_migrate_from).on_harness_apply(
                 tenant_id, subject_id, package.package_id, billed_node_count
             )
             if not billing_result.get("ok"):

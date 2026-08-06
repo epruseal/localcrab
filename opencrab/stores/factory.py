@@ -269,3 +269,39 @@ def make_sql_store(settings: Settings) -> Any:
 
     url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
     return SQLStore(url=url)
+
+
+def make_billing_sql_store(settings: Settings, sql_store: Any) -> tuple[Any, Any | None]:
+    """Return the (store, migrate_from) pair ``BillingHooks`` should use.
+
+    issue #105: billing_events used to share `sql_store`'s file/engine with
+    ontology_nodes/impact_records/lever_simulations — tables written under
+    the cross-process write.lock. SQLite's default (non-WAL) journal mode
+    takes a whole-FILE write lock, so an unlocked billing insert could block
+    behind, or lose to, an unrelated long write (e.g. bulk pack_ingest) for
+    as long as that write took — see ``opencrab.billing.hooks``'s module
+    docstring for the full analysis of why WAL and retry-with-backoff both
+    fail to fix this and only file separation does.
+
+    PG/docker mode: `sql_store` is returned as-is, with `migrate_from=None`.
+    PostgreSQL uses row-level locking, not a whole-file lock, so this
+    contention never existed there — no reason to open a second connection
+    or move anything.
+
+    Local/kuzu (SQLite) mode: a new SQLStore on its own file, `billing.db`,
+    next to graph.db/doc_store.db/opencrab.db in the same LOCAL_DATA_DIR
+    (fixed filename, no env var — same convention as doc_store.db; nobody
+    has asked to configure this path). `sql_store` is returned as
+    `migrate_from` so the caller's `BillingHooks(..., migrate_from=...)`
+    can move over any rows a pre-#105 install already wrote to the old,
+    shared table.
+    """
+    if settings.storage_mode in ("docker", "pg"):
+        return sql_store, None
+
+    from pathlib import Path
+
+    from opencrab.stores.sql_store import SQLStore
+
+    db_path = Path(settings.local_data_dir) / "billing.db"
+    return SQLStore(url=f"sqlite:///{db_path}"), sql_store

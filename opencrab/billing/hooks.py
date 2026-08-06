@@ -27,12 +27,36 @@ error, optional-store-only failed = partial success" split.
 A 6th event type, fired by a since-DELETED ``on_promotion`` hook, is gone
 for good (issue #66: zero callers, and no code shape matches its
 per-node_id signature — see git history / the PR discussion for why).
+
+STORAGE (issue #105): in local/kuzu (SQLite) mode this table lives in its
+OWN file, ``billing.db`` — NOT ``opencrab.db``, which ontology_nodes /
+impact_records / lever_simulations / rebac_policies share. Those tables are
+written under the cross-process ``write.lock``; ``opencrab.db``'s SQLAlchemy
+engine does not enable WAL (see ``sql_store.py``), so it uses SQLite's
+default rollback journal, which takes a whole-FILE write lock — any two
+writers to the SAME file serialise, even across unrelated tables. Billing
+writes are deliberately NOT covered by ``write.lock`` (ontology_query would
+otherwise serialise every read behind it — see
+``opencrab/mcp/tools/_registry.py``'s ``tool()`` docstring), so before this
+fix a billing insert could block behind, or lose to, an unrelated long write
+(e.g. a bulk ``pack_ingest``) for as long as that write took. An earlier
+version of this fix added a retry-with-backoff loop around the insert; that
+only shrank the failure window (and, worse, slept synchronously inside the
+request path — see ``opencrab/mcp/http_app.py``'s async handler, which would
+block on it). WAL would not have fixed it either: WAL only separates
+readers from a writer, not writer from writer, so two writers to one file
+still serialise even under WAL. The only structural fix is not sharing the
+file: no query anywhere in this codebase JOINs ``billing_events`` with
+another table (confirmed by grep), so there was never a reason for it to be
+there. See ``opencrab.stores.factory.make_billing_sql_store`` for the store
+construction and one-time migration of any pre-#105 rows. PG/docker mode is
+unaffected (PostgreSQL uses row-level locking, not a whole-file lock) and
+keeps billing_events on the same database as everything else.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 import uuid
 from typing import Any
 
@@ -40,22 +64,6 @@ from opencrab.common.timefmt import now_iso
 from opencrab.execution._sql import ensure_tables, is_sqlite
 
 logger = logging.getLogger(__name__)
-
-# issue #105: emit() used to make exactly one INSERT attempt and treat any
-# failure (including plain lock contention from a long-running writer
-# elsewhere, e.g. a bulk pack_ingest) as final. "database is locked" is the
-# one sqlite3/SQLAlchemy error string that means "try again, the data is
-# fine, another writer just has the file" — every other exception (schema
-# error, broken engine, bad JSON, ...) means retrying is pointless. The
-# needle is matched case-insensitively against str(exc); SQLAlchemy wraps
-# the raw sqlite3.OperationalError but keeps its message verbatim.
-_LOCK_ERROR_NEEDLE = "database is locked"
-_MAX_LOCK_RETRIES = 3
-_RETRY_BACKOFF_SECONDS = 0.05
-
-
-def _is_lock_error(exc: Exception) -> bool:
-    return _LOCK_ERROR_NEEDLE in str(exc).lower()
 
 _TABLES_SQLITE = [
     """
@@ -117,28 +125,106 @@ class BillingHooks:
     All methods are fire-and-forget (errors are logged, never raised).
     """
 
-    def __init__(self, sql_store: Any) -> None:
+    def __init__(self, sql_store: Any, *, migrate_from: Any | None = None) -> None:
         self._sql = sql_store
-        # issue #105: a WARNING log line was, before this fix, the ONLY trace
-        # of a lost billing event -- nothing else observed it. This counter
-        # is a second, queryable route: process-lifetime count of emit()
-        # calls that ultimately failed to persist (lock contention that
-        # outlasted the retries below, or any other error), independent of
-        # whether a given caller bothered to check emit()'s return dict.
-        self._emit_failures = 0
         self._ensure_tables()
-
-    @property
-    def emit_failure_count(self) -> int:
-        """Count of emit() calls that failed to persist since this
-        BillingHooks instance was created. See the note in __init__."""
-        return self._emit_failures
+        if migrate_from is not None:
+            self._migrate_from(migrate_from)
 
     def _ensure_tables(self) -> None:
         try:
             ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)
+
+    def _migrate_from(self, old_store: Any) -> None:
+        """One-time copy of any billing_events rows left behind in
+        `old_store` by a pre-#105 install (where billing shared opencrab.db
+        with write.lock'd tables -- see this module's docstring).
+
+        Cost on every call after the first successful run: one
+        ``Path.exists()`` stat -- a marker file next to the target SQLite db
+        short-circuits before opening either database, so a large or
+        growing old table costs nothing on later startups (a naive
+        ATTACH+INSERT-every-boot would re-scan the whole old table forever).
+
+        Uses raw ``sqlite3`` rather than either store's SQLAlchemy engine:
+        ATTACH/DETACH's transaction scoping is otherwise at the mercy of
+        SQLAlchemy's implicit BEGIN, and a raw connection can be closed
+        outright afterwards instead of returning an attached-database handle
+        to a pool for some future, unrelated query to trip over.
+
+        Deliberately does not DROP the old table (only ever meaningful in
+        SQLite local/kuzu mode, and only if it's actually SQLite -- PG has
+        nothing to migrate and never calls this): an operator inspecting
+        opencrab.db later must not mistake it for live data, so a
+        successful migration also renames it to
+        ``billing_events_migrated_to_billing_db`` -- unmistakable from the
+        schema itself, not just a log line that may have scrolled away.
+        Actually dropping it, if ever wanted, is a separate explicit action.
+        """
+        import sqlite3
+        from pathlib import Path
+
+        new_url = getattr(self._sql, "_url", "")
+        old_url = getattr(old_store, "_url", "")
+        if not (new_url.startswith("sqlite:///") and old_url.startswith("sqlite:///")):
+            return  # only meaningful for two real SQLite files
+
+        new_db_path = Path(new_url[len("sqlite:///"):])
+        old_db_path = Path(old_url[len("sqlite:///"):])
+        marker = new_db_path.parent / f"{new_db_path.name}.migrated"
+        if marker.exists():
+            return
+        if not old_db_path.is_file():
+            marker.touch()  # fresh install, nothing to migrate -- stay free forever
+            return
+
+        try:
+            old_conn = sqlite3.connect(str(old_db_path))
+            try:
+                has_table = old_conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='billing_events'"
+                ).fetchone()
+                if has_table:
+                    new_conn = sqlite3.connect(str(new_db_path))
+                    try:
+                        new_conn.execute("ATTACH DATABASE ? AS old_billing", (str(old_db_path),))
+                        cur = new_conn.execute(
+                            "INSERT OR IGNORE INTO billing_events "
+                            "(event_id, tenant_id, subject_id, event_type, count, metadata, created_at) "
+                            "SELECT event_id, tenant_id, subject_id, event_type, count, metadata, created_at "
+                            "FROM old_billing.billing_events"
+                        )
+                        moved = cur.rowcount
+                        new_conn.commit()
+                        new_conn.execute("DETACH DATABASE old_billing")
+                    finally:
+                        new_conn.close()
+
+                    old_conn.execute(
+                        "ALTER TABLE billing_events RENAME TO billing_events_migrated_to_billing_db"
+                    )
+                    old_conn.commit()
+
+                    if moved > 0:
+                        logger.info(
+                            "billing_events: migrated %d historical row(s) from %s to %s "
+                            "(issue #105). The old table in %s is renamed to "
+                            "billing_events_migrated_to_billing_db -- stale, kept for safety, "
+                            "no longer read or written by BillingHooks.",
+                            moved, old_db_path.name, new_db_path.name, old_db_path.name,
+                        )
+            finally:
+                old_conn.close()
+        except Exception as exc:
+            logger.warning(
+                "billing_events migration to %s failed, will retry next startup: %s",
+                new_db_path.name, exc,
+            )
+            return  # marker NOT written -- retry next process start
+
+        marker.touch()
 
     # ------------------------------------------------------------------
     # Core emit
@@ -201,20 +287,22 @@ class BillingHooks:
             "meta": meta_str,
         }
 
-        attempt = 0
-        while True:
-            try:
-                with self._sql._engine.begin() as conn:
-                    conn.execute(text(sql), params)
-                break
-            except Exception as exc:
-                if _is_lock_error(exc) and attempt < _MAX_LOCK_RETRIES:
-                    attempt += 1
-                    time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
-                    continue
-                self._emit_failures += 1
-                logger.warning("BillingHooks.emit failed: %s", exc)
-                return {"ok": False, "error": str(exc)}
+        try:
+            with self._sql._engine.begin() as conn:
+                conn.execute(text(sql), params)
+        except Exception as exc:
+            # issue #105: this used to retry a handful of times on "database
+            # is locked" before giving up. That was papering over the real
+            # problem (billing sharing a SQLite file with write.lock'd
+            # writers -- see this module's docstring) with a synchronous
+            # sleep in the request path, and only shrank the failure window
+            # rather than closing it. Billing now lives on its own file, so
+            # a transient lock here (e.g. two billing writes landing in the
+            # same instant) is rare and brief enough for the DBAPI's own
+            # busy-timeout (sql_store.py's explicit `timeout`) to absorb
+            # without any retry loop of ours.
+            logger.warning("BillingHooks.emit failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
 
         return {
             "ok": True,
@@ -235,10 +323,11 @@ class BillingHooks:
     # on BillingHooks' internal WARNING. on_node_write/on_query used to
     # return None here, which made that structurally impossible regardless
     # of whether the call site bothered to check — #105 fixed that pair to
-    # match the other three (wired by #66). emit() itself now also retries
-    # on lock contention (see _is_lock_error) and counts terminal failures
-    # in emit_failure_count, so a slow-but-clearing lock no longer needs the
-    # call site's attention at all.
+    # match the other three (wired by #66). The lock contention this pair
+    # used to be exposed to is now avoided structurally (billing has its own
+    # SQLite file — see this module's docstring), not retried around, so
+    # there is no separate "still needs the call site's attention" case to
+    # call out here anymore.
 
     def on_node_write(
         self, tenant_id: str, subject_id: str | None, space: str, node_type: str

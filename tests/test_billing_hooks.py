@@ -145,19 +145,6 @@ class TestEmitFailure:
         assert hooks.on_ingest("t1", "u1", "src1")["ok"] is False
         assert hooks.on_harness_apply("t1", "u1", "pkg1", 3)["ok"] is False
 
-    def test_broken_engine_failure_increments_emit_failure_count(self):
-        """#105: emit_failure_count is a second, log-independent route to
-        observe a lost billing event (see BillingHooks.__init__)."""
-        store = SQLStore("sqlite:///:memory:")
-        hooks = BillingHooks(store)
-        hooks._sql._engine = _BrokenEngine()
-
-        assert hooks.emit_failure_count == 0
-        hooks.emit("query", metadata={"question": "hi"})
-        assert hooks.emit_failure_count == 1
-        hooks.emit("query", metadata={"question": "hi again"})
-        assert hooks.emit_failure_count == 2
-
 
 # ---------------------------------------------------------------------------
 # Edge cases
@@ -222,103 +209,93 @@ class TestEmitEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# #105: emit() must retry a REAL "database is locked" (not treat it as
-# terminal on the first attempt like every other exception), and must not
-# retry anything else. All three tests below use a throwaway file-backed
-# scratch DB in tmp_path -- never a real project database -- and a second
-# raw sqlite3 connection to genuinely hold SQLite's write lock, so the
-# "database is locked" hit is the real DBAPI error, not a mock standing in
-# for it.
+# #105: the actual reason this fix exists. An earlier version of this fix
+# retried the billing insert with backoff when it shared opencrab.db's file
+# with write.lock'd writers -- that only shrank the failure window and slept
+# synchronously in the request path (opencrab/mcp/http_app.py's async
+# handler would have blocked on it). The real fix is that billing_events no
+# longer shares that file at all (see make_billing_sql_store), so there is
+# no contention to retry around in the first place. Both tests below use
+# only a throwaway tmp_path scratch DB -- never a live database -- and a
+# second raw sqlite3 connection genuinely holding SQLite's write lock (not
+# mocked), held open for the whole call with no release/timing dependency.
 # ---------------------------------------------------------------------------
 
 
-class TestEmitLockRetry:
+class TestBillingNotBlockedByWriteLockHolder:
     @staticmethod
-    def _scratch_hooks(tmp_path, *, sqlite_timeout: float) -> tuple[BillingHooks, str]:
-        """A BillingHooks whose engine has a short sqlite busy-timeout, so a
-        real lock raises "database is locked" quickly instead of sqlite3's
-        own internal busy-handler silently absorbing the wait -- this test
-        is about emit()'s OWN retry loop, layered on top of whatever DBAPI
-        busy-timeout sql_store.py configures (issue #105's other fix)."""
-        from sqlalchemy import create_engine
-
-        db_path = str(tmp_path / "billing_lock_scratch.db")
-        store = SQLStore(f"sqlite:///{db_path}")
-        store._engine = create_engine(
-            f"sqlite:///{db_path}",
-            connect_args={"timeout": sqlite_timeout, "check_same_thread": False},
-        )
-        hooks = BillingHooks(store)
-        return hooks, db_path
-
-    def test_fails_without_retry_then_succeeds_with_retry_once_lock_clears(self, tmp_path, monkeypatch):
-        """Requirement 1 (issue #105 test plan): with retries disabled, a
-        held write lock makes emit() fail. With retries enabled (the actual
-        fix), the identical contention succeeds once the lock is released
-        inside the retry window."""
+    def _hold_write_lock(db_path):
+        """Open a second, real sqlite3 connection and reserve the write
+        lock the way a long write.lock-held handler (e.g. a bulk
+        pack_ingest via ontology_add_node, writes=True) would while it
+        works -- BEGIN IMMEDIATE reserves the lock immediately, and the
+        INSERT plus the deliberate absence of a commit keeps it held for as
+        long as the caller wants (here: the whole test body)."""
         import sqlite3
-        import threading
+
+        conn = sqlite3.connect(str(db_path), timeout=1)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO ontology_nodes (space, node_type, node_id) VALUES ('s', 't', 'n1')")
+        return conn
+
+    def test_billing_insert_succeeds_immediately_while_opencrab_db_write_lock_is_held(self, tmp_path):
+        """The fixed shape: billing lives in its own file (billing.db), so a
+        writer holding opencrab.db's write lock for the ENTIRE test (never
+        released) does not block, slow down, or fail the billing insert."""
         import time
 
-        import opencrab.billing.hooks as hooks_module
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_billing_sql_store, make_sql_store
 
-        hooks, db_path = self._scratch_hooks(tmp_path, sqlite_timeout=0.02)
+        settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+        sql = make_sql_store(settings)  # creates opencrab.db + its tables
+        billing_store, migrate_from = make_billing_sql_store(settings, sql)
+        hooks = BillingHooks(billing_store, migrate_from=migrate_from)
+        assert billing_store is not sql  # sanity: really is a separate file
 
-        # --- (a) no retry: a held lock is a terminal failure -------------
-        blocker = sqlite3.connect(db_path, timeout=1)
-        blocker.execute("BEGIN IMMEDIATE")  # reserves the write lock, no commit yet
-        monkeypatch.setattr(hooks_module, "_MAX_LOCK_RETRIES", 0)
+        blocker = self._hold_write_lock(tmp_path / "opencrab.db")
         try:
-            result_no_retry = hooks.emit("query", metadata={"question": "no-retry"})
+            start = time.monotonic()
+            result = hooks.emit("query", metadata={"question": "contended"})
+            elapsed = time.monotonic() - start
         finally:
             blocker.rollback()
             blocker.close()
 
-        assert result_no_retry["ok"] is False
-        assert "locked" in result_no_retry["error"].lower()
+        assert result["ok"] is True
+        assert elapsed < 1.0  # no lock wait, no retry backoff -- effectively instant
 
-        # --- (b) with retry: same contention, but the lock clears midway -
-        monkeypatch.undo()  # restore real _MAX_LOCK_RETRIES for part (b)
-        blocker2 = sqlite3.connect(db_path, timeout=1, check_same_thread=False)
-        blocker2.execute("BEGIN IMMEDIATE")
+    def test_negative_control_the_old_shared_file_shape_really_did_block(self, tmp_path):
+        """Proves the contention this fix removes was real: BillingHooks
+        wired the pre-#105 way (sharing `sql`'s own file/store, exactly what
+        make_billing_sql_store now avoids) DOES fail under the identical
+        held lock. Not exercised by the fixed path above -- this is what it
+        would look like without this fix."""
+        from sqlalchemy import create_engine
 
-        def release_after_delay() -> None:
-            time.sleep(0.12)  # well under the retry loop's ~0.3s total backoff budget
-            blocker2.commit()
-            blocker2.close()
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_sql_store
 
-        releaser = threading.Thread(target=release_after_delay)
-        releaser.start()
+        settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+        sql = make_sql_store(settings)
+        # Short busy-timeout so this negative control fails fast instead of
+        # waiting out the real 5s DBAPI default -- the failure mode, not its
+        # timing, is what's under test.
+        sql._engine = create_engine(
+            f"sqlite:///{tmp_path / 'opencrab.db'}",
+            connect_args={"timeout": 0.05, "check_same_thread": False},
+        )
+        hooks_sharing_file = BillingHooks(sql)  # the pre-#105 wiring: no separation
+
+        blocker = self._hold_write_lock(tmp_path / "opencrab.db")
         try:
-            result_with_retry = hooks.emit("query", metadata={"question": "with-retry"})
+            result = hooks_sharing_file.emit("query", metadata={"question": "contended"})
         finally:
-            releaser.join()
-
-        assert result_with_retry["ok"] is True
-        assert result_with_retry["event_id"].startswith("evt_")
-
-    def test_non_lock_exception_returns_immediately_no_backoff_loop(self, tmp_path, monkeypatch):
-        """Requirement 2: an exception that retrying can never fix (here: a
-        missing table, standing in for e.g. a schema error) must return on
-        the first attempt -- time.sleep must never be called."""
-        import time
-
-        hooks, _ = self._scratch_hooks(tmp_path, sqlite_timeout=0.02)
-        sleep_calls: list[float] = []
-        monkeypatch.setattr(time, "sleep", lambda s: sleep_calls.append(s))
-
-        # Drop the table emit() writes to -> "no such table" is NOT a lock
-        # error, so _is_lock_error() must reject it and emit() must not loop.
-        from sqlalchemy import text
-
-        with hooks._sql._engine.begin() as conn:
-            conn.execute(text("DROP TABLE billing_events"))
-
-        result = hooks.emit("query", metadata={"question": "schema-broken"})
+            blocker.rollback()
+            blocker.close()
 
         assert result["ok"] is False
-        assert "locked" not in result["error"].lower()
-        assert sleep_calls == []  # proves no backoff loop was entered
+        assert "locked" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------
