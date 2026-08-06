@@ -32,6 +32,7 @@ per-node_id signature — see git history / the PR discussion for why).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -39,6 +40,22 @@ from opencrab.common.timefmt import now_iso
 from opencrab.execution._sql import ensure_tables, is_sqlite
 
 logger = logging.getLogger(__name__)
+
+# issue #105: emit() used to make exactly one INSERT attempt and treat any
+# failure (including plain lock contention from a long-running writer
+# elsewhere, e.g. a bulk pack_ingest) as final. "database is locked" is the
+# one sqlite3/SQLAlchemy error string that means "try again, the data is
+# fine, another writer just has the file" — every other exception (schema
+# error, broken engine, bad JSON, ...) means retrying is pointless. The
+# needle is matched case-insensitively against str(exc); SQLAlchemy wraps
+# the raw sqlite3.OperationalError but keeps its message verbatim.
+_LOCK_ERROR_NEEDLE = "database is locked"
+_MAX_LOCK_RETRIES = 3
+_RETRY_BACKOFF_SECONDS = 0.05
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    return _LOCK_ERROR_NEEDLE in str(exc).lower()
 
 _TABLES_SQLITE = [
     """
@@ -102,7 +119,20 @@ class BillingHooks:
 
     def __init__(self, sql_store: Any) -> None:
         self._sql = sql_store
+        # issue #105: a WARNING log line was, before this fix, the ONLY trace
+        # of a lost billing event -- nothing else observed it. This counter
+        # is a second, queryable route: process-lifetime count of emit()
+        # calls that ultimately failed to persist (lock contention that
+        # outlasted the retries below, or any other error), independent of
+        # whether a given caller bothered to check emit()'s return dict.
+        self._emit_failures = 0
         self._ensure_tables()
+
+    @property
+    def emit_failure_count(self) -> int:
+        """Count of emit() calls that failed to persist since this
+        BillingHooks instance was created. See the note in __init__."""
+        return self._emit_failures
 
     def _ensure_tables(self) -> None:
         try:
@@ -161,23 +191,30 @@ class BillingHooks:
             except Exception:
                 meta_str = str(metadata)
 
-        try:
-            sql = _insert_event_sql(is_sqlite(self._sql))
-            with self._sql._engine.begin() as conn:
-                conn.execute(
-                    text(sql),
-                    {
-                        "eid": event_id,
-                        "tid": tenant_id,
-                        "sid": subject_id,
-                        "etype": event_type,
-                        "cnt": count,
-                        "meta": meta_str,
-                    },
-                )
-        except Exception as exc:
-            logger.warning("BillingHooks.emit failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
+        sql = _insert_event_sql(is_sqlite(self._sql))
+        params = {
+            "eid": event_id,
+            "tid": tenant_id,
+            "sid": subject_id,
+            "etype": event_type,
+            "cnt": count,
+            "meta": meta_str,
+        }
+
+        attempt = 0
+        while True:
+            try:
+                with self._sql._engine.begin() as conn:
+                    conn.execute(text(sql), params)
+                break
+            except Exception as exc:
+                if _is_lock_error(exc) and attempt < _MAX_LOCK_RETRIES:
+                    attempt += 1
+                    time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
+                self._emit_failures += 1
+                logger.warning("BillingHooks.emit failed: %s", exc)
+                return {"ok": False, "error": str(exc)}
 
         return {
             "ok": True,
@@ -192,26 +229,29 @@ class BillingHooks:
     # Convenience wrappers (called by tools.py)
     # ------------------------------------------------------------------
     #
-    # NOTE (issue #66, see also #105): on_node_write/on_query pre-date this
-    # fix and discard emit()'s return value at both the wrapper and the call
-    # site — a lock-contention or storage failure there is silently invisible
-    # beyond a WARNING log. #105 owns fixing that pair (and emit()'s own
-    # durability: retries, sqlite timeout). The three wrappers below are
-    # newly wired by #66 and deliberately do NOT repeat that swallow: they
-    # return emit()'s {"ok": ...} dict so their call sites can notice (and
-    # log at the handler's own logger) a failed billing write instead of
-    # only relying on BillingHooks' internal warning.
+    # NOTE (issue #66, #105): every wrapper below returns emit()'s
+    # {"ok": ...} dict so its call site CAN notice (and log with its own
+    # tenant/handler context) a failed billing write instead of relying only
+    # on BillingHooks' internal WARNING. on_node_write/on_query used to
+    # return None here, which made that structurally impossible regardless
+    # of whether the call site bothered to check — #105 fixed that pair to
+    # match the other three (wired by #66). emit() itself now also retries
+    # on lock contention (see _is_lock_error) and counts terminal failures
+    # in emit_failure_count, so a slow-but-clearing lock no longer needs the
+    # call site's attention at all.
 
-    def on_node_write(self, tenant_id: str, subject_id: str | None, space: str, node_type: str) -> None:
-        self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
+    def on_node_write(
+        self, tenant_id: str, subject_id: str | None, space: str, node_type: str
+    ) -> dict[str, Any]:
+        return self.emit("node_write", tenant_id, subject_id, metadata={"space": space, "node_type": node_type})
 
     def on_edge_write(
         self, tenant_id: str, subject_id: str | None, relation: str
     ) -> dict[str, Any]:
         return self.emit("edge_write", tenant_id, subject_id, metadata={"relation": relation})
 
-    def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> None:
-        self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
+    def on_query(self, tenant_id: str, subject_id: str | None, question: str) -> dict[str, Any]:
+        return self.emit("query", tenant_id, subject_id, metadata={"question": question[:200]})
 
     def on_ingest(
         self, tenant_id: str, subject_id: str | None, source_id: str

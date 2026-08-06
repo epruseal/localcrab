@@ -307,9 +307,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {name: spec.fn for name, spec i
 dispatch_tool = _registry_dispatch_tool
 
 # Tools that need the cross-process write.lock (NOT "tools that touch a store" —
-# see the `writes` field docstring in _registry.py#tool; a store write that is
-# idempotent append-only, e.g. billing_events via ontology_query, deliberately
-# stays out of this set). When several MCP server processes run against the
+# see the `writes` field docstring in _registry.py#tool; a store write whose
+# loss under lock contention is acceptable and whose read-shaped, high-frequency
+# call pattern makes locking too costly, e.g. billing_events via ontology_query,
+# deliberately stays out of this set — issue #105 corrected the idempotency
+# rationale previously recorded here). When several MCP server processes run against the
 # same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
 # writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
 # lock on a dedicated write.lock file — entirely separate from the lifetime-held

@@ -119,22 +119,24 @@ class TestEmitFailure:
         assert "error" in result
         assert "event_id" not in result
 
-    def test_on_node_write_wrapper_never_raises_on_broken_engine(self):
-        """Callers (mcp/tools.py) call on_* wrappers and ignore the return
-        value entirely — the outage must stay invisible to them."""
+    def test_on_node_write_and_on_query_never_raise_and_report_ok_false(self):
+        """#105: on_node_write/on_query used to return None, which made it
+        structurally impossible for ANY caller to notice a failed persist —
+        they now return emit()'s dict like the other three wrappers below,
+        so this pins that they still never raise, and that ok=False actually
+        comes through instead of being swallowed by the wrapper."""
         store = SQLStore("sqlite:///:memory:")
         hooks = BillingHooks(store)
         hooks._sql._engine = _BrokenEngine()
 
-        # Must not raise.
-        hooks.on_node_write("t1", "u1", "space", "User")
-        hooks.on_query("t1", "u1", "some question")
+        assert hooks.on_node_write("t1", "u1", "space", "User")["ok"] is False
+        assert hooks.on_query("t1", "u1", "some question")["ok"] is False
 
     def test_66_wired_wrappers_never_raise_and_report_ok_false(self):
-        """The three wrappers newly wired for #66 (unlike on_node_write/
-        on_query above) return emit()'s dict so callers CAN notice a
-        failure — this pins that they still never raise, and that ok=False
-        actually comes through instead of being swallowed by the wrapper."""
+        """The three wrappers newly wired for #66 return emit()'s dict so
+        callers CAN notice a failure — this pins that they still never
+        raise, and that ok=False actually comes through instead of being
+        swallowed by the wrapper."""
         store = SQLStore("sqlite:///:memory:")
         hooks = BillingHooks(store)
         hooks._sql._engine = _BrokenEngine()
@@ -142,6 +144,19 @@ class TestEmitFailure:
         assert hooks.on_edge_write("t1", "u1", "owns")["ok"] is False
         assert hooks.on_ingest("t1", "u1", "src1")["ok"] is False
         assert hooks.on_harness_apply("t1", "u1", "pkg1", 3)["ok"] is False
+
+    def test_broken_engine_failure_increments_emit_failure_count(self):
+        """#105: emit_failure_count is a second, log-independent route to
+        observe a lost billing event (see BillingHooks.__init__)."""
+        store = SQLStore("sqlite:///:memory:")
+        hooks = BillingHooks(store)
+        hooks._sql._engine = _BrokenEngine()
+
+        assert hooks.emit_failure_count == 0
+        hooks.emit("query", metadata={"question": "hi"})
+        assert hooks.emit_failure_count == 1
+        hooks.emit("query", metadata={"question": "hi again"})
+        assert hooks.emit_failure_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +219,106 @@ class TestEmitEdgeCases:
         events = hooks.list_events(tenant_id=tenant, limit=2)
 
         assert len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# #105: emit() must retry a REAL "database is locked" (not treat it as
+# terminal on the first attempt like every other exception), and must not
+# retry anything else. All three tests below use a throwaway file-backed
+# scratch DB in tmp_path -- never a real project database -- and a second
+# raw sqlite3 connection to genuinely hold SQLite's write lock, so the
+# "database is locked" hit is the real DBAPI error, not a mock standing in
+# for it.
+# ---------------------------------------------------------------------------
+
+
+class TestEmitLockRetry:
+    @staticmethod
+    def _scratch_hooks(tmp_path, *, sqlite_timeout: float) -> tuple[BillingHooks, str]:
+        """A BillingHooks whose engine has a short sqlite busy-timeout, so a
+        real lock raises "database is locked" quickly instead of sqlite3's
+        own internal busy-handler silently absorbing the wait -- this test
+        is about emit()'s OWN retry loop, layered on top of whatever DBAPI
+        busy-timeout sql_store.py configures (issue #105's other fix)."""
+        from sqlalchemy import create_engine
+
+        db_path = str(tmp_path / "billing_lock_scratch.db")
+        store = SQLStore(f"sqlite:///{db_path}")
+        store._engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": sqlite_timeout, "check_same_thread": False},
+        )
+        hooks = BillingHooks(store)
+        return hooks, db_path
+
+    def test_fails_without_retry_then_succeeds_with_retry_once_lock_clears(self, tmp_path, monkeypatch):
+        """Requirement 1 (issue #105 test plan): with retries disabled, a
+        held write lock makes emit() fail. With retries enabled (the actual
+        fix), the identical contention succeeds once the lock is released
+        inside the retry window."""
+        import sqlite3
+        import threading
+        import time
+
+        import opencrab.billing.hooks as hooks_module
+
+        hooks, db_path = self._scratch_hooks(tmp_path, sqlite_timeout=0.02)
+
+        # --- (a) no retry: a held lock is a terminal failure -------------
+        blocker = sqlite3.connect(db_path, timeout=1)
+        blocker.execute("BEGIN IMMEDIATE")  # reserves the write lock, no commit yet
+        monkeypatch.setattr(hooks_module, "_MAX_LOCK_RETRIES", 0)
+        try:
+            result_no_retry = hooks.emit("query", metadata={"question": "no-retry"})
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert result_no_retry["ok"] is False
+        assert "locked" in result_no_retry["error"].lower()
+
+        # --- (b) with retry: same contention, but the lock clears midway -
+        monkeypatch.undo()  # restore real _MAX_LOCK_RETRIES for part (b)
+        blocker2 = sqlite3.connect(db_path, timeout=1, check_same_thread=False)
+        blocker2.execute("BEGIN IMMEDIATE")
+
+        def release_after_delay() -> None:
+            time.sleep(0.12)  # well under the retry loop's ~0.3s total backoff budget
+            blocker2.commit()
+            blocker2.close()
+
+        releaser = threading.Thread(target=release_after_delay)
+        releaser.start()
+        try:
+            result_with_retry = hooks.emit("query", metadata={"question": "with-retry"})
+        finally:
+            releaser.join()
+
+        assert result_with_retry["ok"] is True
+        assert result_with_retry["event_id"].startswith("evt_")
+
+    def test_non_lock_exception_returns_immediately_no_backoff_loop(self, tmp_path, monkeypatch):
+        """Requirement 2: an exception that retrying can never fix (here: a
+        missing table, standing in for e.g. a schema error) must return on
+        the first attempt -- time.sleep must never be called."""
+        import time
+
+        hooks, _ = self._scratch_hooks(tmp_path, sqlite_timeout=0.02)
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleep_calls.append(s))
+
+        # Drop the table emit() writes to -> "no such table" is NOT a lock
+        # error, so _is_lock_error() must reject it and emit() must not loop.
+        from sqlalchemy import text
+
+        with hooks._sql._engine.begin() as conn:
+            conn.execute(text("DROP TABLE billing_events"))
+
+        result = hooks.emit("query", metadata={"question": "schema-broken"})
+
+        assert result["ok"] is False
+        assert "locked" not in result["error"].lower()
+        assert sleep_calls == []  # proves no backoff loop was entered
 
 
 # ---------------------------------------------------------------------------

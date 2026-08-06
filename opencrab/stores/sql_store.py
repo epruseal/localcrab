@@ -157,6 +157,24 @@ class SQLStore:
             connect_args: dict[str, Any] = {}
             if self._is_sqlite:
                 connect_args["check_same_thread"] = False
+                # issue #105: SQLAlchemy 2.0's pysqlite dialect only forwards
+                # a `timeout` (the DBAPI busy-wait, in seconds, before a
+                # locked table raises "database is locked") when it appears
+                # in the URL query string -- config.py's sqlite_url has no
+                # query, so without this the value in effect was silently
+                # the sqlite3 default (5.0s; measured 5.01s on this
+                # machine). Pinning it here makes that a decision instead of
+                # an accident. Left at the sqlite3 default rather than
+                # raised: this is the engine used by every SQLStore caller
+                # (not just billing), so a bigger value would make ANY
+                # contended statement here block longer, not just billing
+                # inserts. A single writer transaction that outlasts this
+                # anyway (e.g. a bulk pack_ingest) is handled on the billing
+                # side instead -- see the finite retry loop in
+                # opencrab.billing.hooks.BillingHooks.emit -- which is
+                # scoped to the one caller that actually needs to tolerate
+                # it.
+                connect_args["timeout"] = 5.0
 
             self._engine = create_engine(self._url, connect_args=connect_args)
             self._text = text
