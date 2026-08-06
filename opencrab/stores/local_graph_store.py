@@ -65,8 +65,19 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         Unicode-aware lowering -- matching what the OLD Python-only
         `keyword_search` did on both sides, and matching PG's already
         locale-aware ``LOWER()`` / Kuzu's Python-side ``.lower()`` (search_nodes
-        never leaves Python there), so all three backends agree again."""
-        conn.create_function("lower", 1, lambda s: s if s is None else s.lower())
+        never leaves Python there), so all three backends agree again.
+
+        ``str(s).lower()``, not bare ``s.lower()`` (issue #86 2nd verifier
+        finding): a non-string property value (e.g. ``{"name": 12345}``) hit
+        this UDF and raised, which sqlite3 propagates as an
+        ``OperationalError`` out of the whole query -- crashing
+        ``search_nodes()`` for every node, not just the offending one. The
+        builtin ``LOWER()`` it replaces silently coerces
+        (``LOWER(123) = '123'``), and so do the OLD Python-only
+        `keyword_search` (``str(val).lower()``) and Kuzu's ``search_nodes``
+        (``str(props[f]).lower()``) -- ``str(s).lower()`` here matches all
+        three instead of introducing a 4th, stricter behaviour."""
+        conn.create_function("lower", 1, lambda s: None if s is None else str(s).lower())
 
     def _init_db(self) -> None:
         try:

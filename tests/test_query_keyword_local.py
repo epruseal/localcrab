@@ -199,6 +199,28 @@ def test_keyword_search_matches_non_ascii_case_insensitively(
     assert results[0]["node"]["name"] == "Grundgesetz FÜR die Bundesrepublik"
 
 
+def test_keyword_search_tolerates_non_string_property_values(
+    hybrid: HybridQuery, local_store: LocalGraphStore
+) -> None:
+    """issue #86 2nd verifier finding: a non-string value in a searched
+    field (e.g. a numeric "name") crashed the LOWER() UDF with
+    AttributeError, which sqlite3 surfaces as OperationalError out of the
+    whole query -- failing keyword_search for EVERY node in the store, not
+    just the offending one, regardless of the search keyword. The OLD
+    Python-only keyword_search (``str(val).lower()``), Kuzu's search_nodes
+    (``str(props[f]).lower()``), and SQLite's own builtin ``LOWER()``
+    (implicit text coercion, e.g. ``LOWER(123) = '123'``) all tolerate this;
+    the UDF must too."""
+    _insert_node(local_store, "Item", "n-int", {"name": 12345})
+    _insert_node(local_store, "Item", "n-float", {"name": 3.14159})
+    _insert_node(local_store, "Item", "n-str", {"name": "unrelated text"})
+
+    results = hybrid.keyword_search("123")
+
+    assert len(results) == 1
+    assert results[0]["node"]["name"] == 12345
+
+
 def test_keyword_result_format(hybrid: HybridQuery, local_store: LocalGraphStore) -> None:
     """반환 결과의 형식이 {'node': dict, 'label': str} 이어야 한다."""
     _insert_node(local_store, "Concept", "c-1", {"name": "knowledge graph"})
