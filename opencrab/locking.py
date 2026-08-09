@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import threading
 from collections.abc import Iterator
@@ -54,8 +55,23 @@ def _open_lock(path: str) -> BinaryIO:
 
 def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
     if os.name != "nt":
-        fcntl.flock(fh, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        return
+        operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        if timeout is None:
+            fcntl.flock(fh, operation)
+            return
+
+        deadline = monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for file lock") from exc
+                sleep(min(0.1, remaining))
 
     # msvcrt has no reader/writer lock.  A shared request is therefore an
     # exclusive lock on Windows; callers must use a timeout so a second MCP
