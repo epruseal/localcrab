@@ -57,3 +57,14 @@ with file_lock('write.lock', sys.argv[1]):
         assert second_marker.exists()
     finally:
         first.wait(timeout=2)
+
+
+def test_file_lock_creates_explicit_dir_and_normalizes_symlinks(tmp_path):
+    real_dir = tmp_path / "real"
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+
+    with file_lock("write.lock", str(link_dir)):
+        assert (real_dir / "write.lock").exists()
+        with file_lock("write.lock", str(real_dir)):
+            pass

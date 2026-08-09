@@ -32,7 +32,9 @@ def lock_data_dir() -> str:
 
 
 def _lock_path(filename: str, data_dir: str | None) -> str:
-    return os.path.abspath(os.path.join(data_dir or lock_data_dir(), filename))
+    path = os.path.realpath(os.path.abspath(os.path.join(data_dir or lock_data_dir(), filename)))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def _process_lock(path: str) -> threading.RLock:
