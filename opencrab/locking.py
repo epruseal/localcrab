@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from time import sleep
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 def lock_data_dir() -> str:
@@ -23,12 +28,28 @@ def lock_data_dir() -> str:
 def file_lock(filename: str, data_dir: str | None = None) -> Iterator[None]:
     """Hold an exclusive lock file until the enclosed operation completes."""
     lock_path = os.path.join(data_dir or lock_data_dir(), filename)
-    fh = open(lock_path, "w")
+    fh = open(lock_path, "a+" if os.name == "nt" else "w")
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if os.name == "nt":
+            fh.seek(0)
+            fh.write("\0")
+            fh.flush()
+            fh.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    sleep(0.1)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
+        if os.name == "nt":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
 
 
