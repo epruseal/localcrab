@@ -34,6 +34,8 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from opencrab.locking import file_lock
+
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -727,7 +729,8 @@ def main() -> None:
         return
 
     # Step 1 — 백업
-    backup_local_data(local_data_dir)
+    with file_lock("write.lock", local_data_dir):
+        backup_local_data(local_data_dir)
 
     report: dict[str, Any] = {
         "started_at": datetime.now(UTC).isoformat(),
@@ -743,9 +746,10 @@ def main() -> None:
         graph_db_path = os.path.join(local_data_dir, "graph.db")
         local_graph = LocalGraphStore(db_path=graph_db_path)
         try:
-            graph_result = migrate_graph(
-                preflight_result["neo4j_driver"], local_graph, args.batch_size, logger
-            )
+            with file_lock("write.lock", local_data_dir):
+                graph_result = migrate_graph(
+                    preflight_result["neo4j_driver"], local_graph, args.batch_size, logger
+                )
             report["results"]["graph"] = graph_result
             console.print(f"  [green]완료[/green] nodes={graph_result['nodes']:,} edges={graph_result['edges']:,}")
         finally:
@@ -768,9 +772,10 @@ def main() -> None:
             doc_store = LocalDocStore(data_dir=docs_dir)
             console.print("  [yellow]LocalSQLDocStore 미구현 → LocalDocStore(JSON) fallback[/yellow]")
 
-        docs_result = migrate_docs(
-            preflight_result["mongo_db"], doc_store, args.batch_size, logger
-        )
+        with file_lock("write.lock", local_data_dir):
+            docs_result = migrate_docs(
+                preflight_result["mongo_db"], doc_store, args.batch_size, logger
+            )
         report["results"]["docs"] = docs_result
         console.print(
             f"  [green]완료[/green] nodes={docs_result['nodes']:,} "
@@ -787,13 +792,14 @@ def main() -> None:
         os.makedirs(chroma_local_path, exist_ok=True)
         local_chroma = chromadb.PersistentClient(path=chroma_local_path)
 
-        vectors_result = migrate_vectors(
-            preflight_result["chroma_http"],
-            local_chroma,
-            args.chroma_collection,
-            args.batch_size,
-            logger,
-        )
+        with file_lock("write.lock", local_data_dir):
+            vectors_result = migrate_vectors(
+                preflight_result["chroma_http"],
+                local_chroma,
+                args.chroma_collection,
+                args.batch_size,
+                logger,
+            )
         report["results"]["vectors"] = vectors_result
         console.print(f"  [green]완료[/green] vectors={vectors_result['vectors']:,}")
     else:
@@ -803,7 +809,8 @@ def main() -> None:
     if not args.skip_sql:
         console.rule("[bold blue]Step 5 — SQL 마이그레이션 (PostgreSQL → SQLite)")
         sqlite_path = os.path.join(local_data_dir, "opencrab.db")
-        sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
+        with file_lock("write.lock", local_data_dir):
+            sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
         report["results"]["sql"] = sql_result
         total_rows = sum(sql_result["tables"].values())
         console.print(f"  [green]완료[/green] total rows={total_rows:,}")
