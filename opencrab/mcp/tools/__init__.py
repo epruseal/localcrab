@@ -72,10 +72,11 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
+from opencrab.locking import file_lock, lock_data_dir
+
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
-from opencrab.locking import file_lock, lock_data_dir
 
 # chroma PersistentClient는 chromadb 공식상 단일 프로세스 전용이다("not process-safe for
 # concurrent writers sharing the same local persistence path"; thread-safe도 단일 프로세스 내에서만
