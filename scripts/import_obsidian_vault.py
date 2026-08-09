@@ -11,6 +11,7 @@ from typing import Any
 
 from opencrab.common.ids import stable_id
 from opencrab.common.text import slugify as _common_slugify
+from opencrab.locking import write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.stores.local_doc_store import LocalDocStore
 from opencrab.stores.neo4j_store import Neo4jStore
@@ -176,7 +177,7 @@ def excerpt(text: str, limit: int = 1200) -> str:
     return compact[:limit]
 
 
-def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
+def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
     files = sorted(vault_root.rglob("*.md"))
     notes = [build_note_record(vault_root, path) for path in files]
     workspace_id = vault_workspace_id(vault_root)
@@ -421,6 +422,14 @@ def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_passwo
         "tag_topics": len(tag_names),
         "unresolved_link_topics": len(unresolved_links),
     }
+
+
+def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
+    """Import one vault under the same cross-process write boundary as APIs."""
+    with write_lock(str(local_data_dir)):
+        return _import_vault_unlocked(
+            vault_root, neo4j_uri, neo4j_user, neo4j_password, neo4j_database, local_data_dir
+        )
 
 
 def main() -> None:

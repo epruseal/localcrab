@@ -22,7 +22,7 @@ import sys
 from typing import Any
 
 from opencrab.config import get_settings
-from opencrab.mcp.tools import TOOLS, UnknownToolError, dispatch_tool
+from opencrab.mcp.tools import TOOLS, UnknownToolError, close_context, dispatch_tool
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +61,19 @@ class MCPServer:
         """
         logger.info("OpenCrab MCP server starting (name=%s, version=%s)", self._name, self._version)
 
-        for raw_line in sys.stdin:
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
+        try:
+            for raw_line in sys.stdin:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
 
-            response = self._handle_raw(raw_line)
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-
-        logger.info("OpenCrab MCP server shutting down (EOF).")
+                response = self._handle_raw(raw_line)
+                if response is not None:
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
+        finally:
+            close_context()
+            logger.info("OpenCrab MCP server shutting down (EOF).")
 
     # ------------------------------------------------------------------
     # Request handling

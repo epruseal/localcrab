@@ -189,12 +189,17 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         pass
     except Exception as exc:
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
-        return
 
     try:
         docs.log_event(event_type, payload=details, actor=user_id)
     except Exception as exc:
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
+
+
+def _audit_event(ctx: ApiContext, event_type: str, user_id: str, details: dict[str, Any]) -> None:
+    """Protect legacy JSON and SQL audit stores across API processes."""
+    with write_lock():
+        _log_event(ctx.docs, event_type, user_id, details)
 
 
 def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, Any]) -> str | None:
@@ -356,8 +361,8 @@ def _meter_call(ctx: ApiContext, auth: AuthContext, endpoint: str) -> None:
     if auth.tier != "api":
         return
 
-    _log_event(
-        ctx.docs,
+    _audit_event(
+        ctx,
         "api_meter",
         auth.user_id,
         {"endpoint": endpoint, "tier": auth.tier},
@@ -527,17 +532,17 @@ def ingest_text(
         else:
             result["stores"]["documents"] = "unavailable"
 
-    _log_event(
-        ctx.docs,
-        "ingest",
-        auth.user_id,
-        {
-            "source_id": source_id,
-            "text_length": len(payload.text),
-            "tier": auth.tier,
-        },
-    )
-    _meter_call(ctx, auth, "/api/ingest")
+        _audit_event(
+            ctx,
+            "ingest",
+            auth.user_id,
+            {
+                "source_id": source_id,
+                "text_length": len(payload.text),
+                "tier": auth.tier,
+            },
+        )
+        _meter_call(ctx, auth, "/api/ingest")
 
     sources_count = _count_user_sources(ctx.docs, auth.user_id)
     result["tier"] = auth.tier
@@ -606,8 +611,8 @@ def query_ontology(
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
-    _log_event(
-        ctx.docs,
+    _audit_event(
+        ctx,
         "query",
         auth.user_id,
         {
@@ -632,16 +637,16 @@ def analyse_impact(
             change_type=payload.change_type,
             depth=payload.depth,
         ).to_dict()
-    _log_event(
-        ctx.docs,
-        "impact",
-        auth.user_id,
-        {
-            "node_id": payload.node_id,
-            "change_type": payload.change_type,
-        },
-    )
-    _meter_call(ctx, auth, "/api/impact")
+        _audit_event(
+            ctx,
+            "impact",
+            auth.user_id,
+            {
+                "node_id": payload.node_id,
+                "change_type": payload.change_type,
+            },
+        )
+        _meter_call(ctx, auth, "/api/impact")
     return result
 
 
@@ -668,11 +673,11 @@ def add_node(
                 properties,
                 subject_id=auth.user_id,
             )
+            _meter_call(ctx, auth, "/api/nodes")
     except ValueError as exc:
         # Grammar / required-field validation failure — a client error, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    _meter_call(ctx, auth, "/api/nodes")
     return response
 
 
@@ -697,10 +702,10 @@ def add_edge(
                 payload.properties,
                 subject_id=auth.user_id,
             )
+            _meter_call(ctx, auth, "/api/edges")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    _meter_call(ctx, auth, "/api/edges")
     return response
 
 

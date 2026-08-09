@@ -183,6 +183,7 @@ def seed() -> None:
     console.print("[dim]Populating example analytics platform ontology...[/dim]\n")
 
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
@@ -220,7 +221,8 @@ def seed() -> None:
 
     # Ensure constraints
     if neo4j.available:
-        neo4j.ensure_constraints()
+        with write_lock(cfg.local_data_dir):
+            neo4j.ensure_constraints()
         console.print("[dim]Neo4j constraints ensured.[/dim]")
 
     # --- Seed nodes ---
@@ -231,7 +233,8 @@ def seed() -> None:
         task = progress.add_task("Adding nodes...", total=len(NODES))
         for space, node_type, node_id, props in NODES:
             try:
-                builder.add_node(space, node_type, node_id, props)
+                with write_lock(cfg.local_data_dir):
+                    builder.add_node(space, node_type, node_id, props)
                 node_ok += 1
             except Exception as exc:
                 console.print(f"  [red]FAIL[/red] {node_id}: {exc}")
@@ -248,7 +251,8 @@ def seed() -> None:
         task = progress.add_task("Adding edges...", total=len(EDGES))
         for from_space, from_id, relation, to_space, to_id in EDGES:
             try:
-                builder.add_edge(from_space, from_id, relation, to_space, to_id)
+                with write_lock(cfg.local_data_dir):
+                    builder.add_edge(from_space, from_id, relation, to_space, to_id)
                 edge_ok += 1
             except Exception as exc:
                 console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {exc}")
@@ -261,11 +265,12 @@ def seed() -> None:
     console.print("\n[bold]Seeding ReBAC policies...[/bold]")
     if sql.available:
         try:
-            rebac.grant("user-alice", "view",    "ds-events")
-            rebac.grant("user-alice", "edit",    "doc-spec")
-            rebac.grant("user-bob",   "admin",   "proj-analytics")
-            rebac.grant("team-data",  "view",    "ds-events")
-            rebac.deny("agent-rag",   "edit",    "ds-events")
+            with write_lock(cfg.local_data_dir):
+                rebac.grant("user-alice", "view",    "ds-events")
+                rebac.grant("user-alice", "edit",    "doc-spec")
+                rebac.grant("user-bob",   "admin",   "proj-analytics")
+                rebac.grant("team-data",  "view",    "ds-events")
+                rebac.deny("agent-rag",   "edit",    "ds-events")
             console.print("  [green]5 policies seeded.[/green]")
         except Exception as exc:
             console.print(f"  [red]Policy seed failed: {exc}[/red]")
@@ -277,9 +282,10 @@ def seed() -> None:
     ingest_ok = 0
     for text, source_id, meta in INGEST_TEXTS:
         try:
-            hybrid.ingest(text=text, source_id=source_id, metadata=meta)
-            if mongo.available:
-                mongo.upsert_source(source_id, text, meta)
+            with write_lock(cfg.local_data_dir):
+                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+                if mongo.available:
+                    mongo.upsert_source(source_id, text, meta)
             ingest_ok += 1
             console.print(f"  [green]OK[/green] {source_id} ({len(text)} chars)")
         except Exception as exc:
