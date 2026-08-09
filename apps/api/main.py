@@ -511,13 +511,12 @@ def ingest_text(
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
     source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
-    _enforce_ingest_limits(ctx, auth, source_id)
-
     metadata = dict(payload.metadata)
     metadata.setdefault("user_id", auth.user_id)
     metadata.setdefault("source_id", source_id)
 
     with write_lock():
+        _enforce_ingest_limits(ctx, auth, source_id)
         result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
 
         source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)

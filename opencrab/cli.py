@@ -328,29 +328,29 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     console.print(f"[cyan]Ingesting {len(files)} file(s)...[/cyan]")
 
     ok_count = 0
-    with write_lock():
-        for file in files:
-            try:
-                text = file.read_text(encoding="utf-8", errors="ignore")
-                if not text.strip():
-                    continue
-                source_id = str(file.resolve())
-                meta = {"source_path": str(file), "extension": file.suffix}
+    for file in files:
+        try:
+            text = file.read_text(encoding="utf-8", errors="ignore")
+            if not text.strip():
+                continue
+            source_id = str(file.resolve())
+            meta = {"source_path": str(file), "extension": file.suffix}
 
-                effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-                if effective_pack:
-                    meta["pack_id"] = effective_pack
+            effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
+            if effective_pack:
+                meta["pack_id"] = effective_pack
 
+            with write_lock():
                 hybrid.ingest(text=text, source_id=source_id, metadata=meta)
 
                 if mongo.available:
                     mongo.upsert_source(source_id, text, meta)
 
-                ok_count += 1
-                tag = f" pack={effective_pack}" if effective_pack else ""
-                console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
-            except Exception as exc:
-                console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
+            ok_count += 1
+            tag = f" pack={effective_pack}" if effective_pack else ""
+            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
+        except Exception as exc:
+            console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 
     console.print(f"\n[bold green]Ingested {ok_count}/{len(files)} files.[/bold green]")
 
