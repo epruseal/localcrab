@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -34,17 +35,54 @@ def test_file_lock_honors_timeout(tmp_path):
 import sys, time
 from opencrab.locking import file_lock
 with file_lock('write.lock', sys.argv[1]):
+    open(sys.argv[2], 'w').close()
     time.sleep(0.35)
 """
+    marker = tmp_path / "held"
     env = {"PYTHONPATH": "."}
-    first = subprocess.Popen([sys.executable, "-c", script, str(tmp_path)], env=env)
+    first = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(marker)], env=env)
     try:
-        time.sleep(0.05)
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
         with pytest.raises(TimeoutError):
             with file_lock("write.lock", str(tmp_path), timeout=0.05):
                 pass
     finally:
         first.wait(timeout=2)
+
+
+def test_file_lock_honors_timeout_for_other_thread(tmp_path):
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with file_lock("write.lock", str(tmp_path)):
+            ready.set()
+            release.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert ready.wait(timeout=2)
+    try:
+        with pytest.raises(TimeoutError):
+            with file_lock("write.lock", str(tmp_path), timeout=0.05):
+                pass
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+
+def test_file_lock_releases_process_guard_when_open_fails(tmp_path):
+    lock_path = tmp_path / "write.lock"
+    lock_path.mkdir()
+    with pytest.raises(IsADirectoryError):
+        with file_lock("write.lock", str(tmp_path)):
+            pass
+    lock_path.rmdir()
+    with file_lock("write.lock", str(tmp_path)):
+        pass
 
 
 def test_file_lock_serializes_subprocesses(tmp_path):

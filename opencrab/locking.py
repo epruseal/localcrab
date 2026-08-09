@@ -115,45 +115,51 @@ def file_lock(
     """
     path = _lock_path(filename, data_dir)
     process_lock = _process_lock(path)
-    process_lock.acquire()
-    held = getattr(_held, "locks", None)
-    if held is None:
-        held = _held.locks = {}
-    current = held.get(path)
-    if current is not None:
-        held[path] = (current[0] + 1, current[1])
-        try:
-            yield
-        finally:
-            depth, fh = held[path]
-            if depth == 1:
-                del held[path]
-            else:
-                held[path] = (depth - 1, fh)
-            process_lock.release()
-        return
-
-    fh = _open_lock(path)
-    acquired = False
+    deadline = None if timeout is None else monotonic() + max(timeout, 0)
+    if deadline is None:
+        process_lock.acquire()
+    elif not process_lock.acquire(timeout=max(0, deadline - monotonic())):
+        raise TimeoutError("timed out waiting for in-process file lock")
     try:
-        _acquire(fh, shared=shared, timeout=timeout)
-        acquired = True
-        held[path] = (1, fh)
+        held = getattr(_held, "locks", None)
+        if held is None:
+            held = _held.locks = {}
+        current = held.get(path)
+        if current is not None:
+            held[path] = (current[0] + 1, current[1])
+            try:
+                yield
+            finally:
+                depth, fh = held[path]
+                if depth == 1:
+                    del held[path]
+                else:
+                    held[path] = (depth - 1, fh)
+            return
+
+        fh = None
+        acquired = False
         try:
-            yield
-        finally:
-            held.pop(path, None)
-            if acquired:
-                try:
-                    _release(fh)
-                finally:
+            fh = _open_lock(path)
+            remaining = None if deadline is None else max(0, deadline - monotonic())
+            _acquire(fh, shared=shared, timeout=remaining)
+            acquired = True
+            held[path] = (1, fh)
+            try:
+                yield
+            finally:
+                held.pop(path, None)
+                if acquired:
+                    try:
+                        _release(fh)
+                    finally:
+                        fh.close()
+                else:
                     fh.close()
-            else:
+        except BaseException:
+            if fh is not None and not acquired:
                 fh.close()
-    except BaseException:
-        if not acquired:
-            fh.close()
-        raise
+            raise
     finally:
         process_lock.release()
 
