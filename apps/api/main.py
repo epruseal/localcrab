@@ -20,6 +20,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
+from opencrab.locking import write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
@@ -516,15 +517,16 @@ def ingest_text(
     metadata.setdefault("user_id", auth.user_id)
     metadata.setdefault("source_id", source_id)
 
-    result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
+    with write_lock():
+        result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
 
-    source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
-    if source_doc_id:
-        result["stores"]["documents"] = f"ok (id={source_doc_id})"
-    elif _docs_available(ctx.docs):
-        result["stores"]["documents"] = "ok"
-    else:
-        result["stores"]["documents"] = "unavailable"
+        source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
+        if source_doc_id:
+            result["stores"]["documents"] = f"ok (id={source_doc_id})"
+        elif _docs_available(ctx.docs):
+            result["stores"]["documents"] = "ok"
+        else:
+            result["stores"]["documents"] = "unavailable"
 
     _log_event(
         ctx.docs,
@@ -625,11 +627,12 @@ def analyse_impact(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
-    result = ctx.impact.analyse(
-        node_id=payload.node_id,
-        change_type=payload.change_type,
-        depth=payload.depth,
-    ).to_dict()
+    with write_lock():
+        result = ctx.impact.analyse(
+            node_id=payload.node_id,
+            change_type=payload.change_type,
+            depth=payload.depth,
+        ).to_dict()
     _log_event(
         ctx.docs,
         "impact",
@@ -658,13 +661,14 @@ def add_node(
 
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        response = builder.add_node(
-            payload.space,
-            payload.node_type,
-            payload.node_id,
-            properties,
-            subject_id=auth.user_id,
-        )
+        with write_lock():
+            response = builder.add_node(
+                payload.space,
+                payload.node_type,
+                payload.node_id,
+                properties,
+                subject_id=auth.user_id,
+            )
     except ValueError as exc:
         # Grammar / required-field validation failure — a client error, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -684,15 +688,16 @@ def add_edge(
     # produces a receipt + role-based store keys + audit in one place.
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        response = builder.add_edge(
-            payload.from_space,
-            payload.from_id,
-            payload.relation,
-            payload.to_space,
-            payload.to_id,
-            payload.properties,
-            subject_id=auth.user_id,
-        )
+        with write_lock():
+            response = builder.add_edge(
+                payload.from_space,
+                payload.from_id,
+                payload.relation,
+                payload.to_space,
+                payload.to_id,
+                payload.properties,
+                subject_id=auth.user_id,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

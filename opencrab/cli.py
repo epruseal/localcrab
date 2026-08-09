@@ -304,6 +304,7 @@ def status() -> None:
 def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
 
@@ -327,28 +328,29 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     console.print(f"[cyan]Ingesting {len(files)} file(s)...[/cyan]")
 
     ok_count = 0
-    for file in files:
-        try:
-            text = file.read_text(encoding="utf-8", errors="ignore")
-            if not text.strip():
-                continue
-            source_id = str(file.resolve())
-            meta = {"source_path": str(file), "extension": file.suffix}
+    with write_lock():
+        for file in files:
+            try:
+                text = file.read_text(encoding="utf-8", errors="ignore")
+                if not text.strip():
+                    continue
+                source_id = str(file.resolve())
+                meta = {"source_path": str(file), "extension": file.suffix}
 
-            effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-            if effective_pack:
-                meta["pack_id"] = effective_pack
+                effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
+                if effective_pack:
+                    meta["pack_id"] = effective_pack
 
-            hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
 
-            if mongo.available:
-                mongo.upsert_source(source_id, text, meta)
+                if mongo.available:
+                    mongo.upsert_source(source_id, text, meta)
 
-            ok_count += 1
-            tag = f" pack={effective_pack}" if effective_pack else ""
-            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
-        except Exception as exc:
-            console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
+                ok_count += 1
+                tag = f" pack={effective_pack}" if effective_pack else ""
+                console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
+            except Exception as exc:
+                console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 
     console.print(f"\n[bold green]Ingested {ok_count}/{len(files)} files.[/bold green]")
 
@@ -375,6 +377,7 @@ def extract(
 ) -> None:
     """LLM-extract ontology nodes/edges from files and write to the graph."""
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.ontology.extractor import LLMExtractor
 
@@ -421,29 +424,30 @@ def extract(
                 console.print()
 
             if not dry_run:
-                for node in result.nodes:
-                    try:
-                        builder.add_node(
-                            space=node.space,
-                            node_type=node.node_type,
-                            node_id=node.node_id,
-                            properties=node.properties,
-                        )
-                    except Exception as exc:
-                        console.print(f"    [red]node {node.node_id}: {exc}[/red]")
+                with write_lock():
+                    for node in result.nodes:
+                        try:
+                            builder.add_node(
+                                space=node.space,
+                                node_type=node.node_type,
+                                node_id=node.node_id,
+                                properties=node.properties,
+                            )
+                        except Exception as exc:
+                            console.print(f"    [red]node {node.node_id}: {exc}[/red]")
 
-                for edge in result.edges:
-                    try:
-                        builder.add_edge(
-                            from_space=edge.from_space,
-                            from_id=edge.from_id,
-                            relation=edge.relation,
-                            to_space=edge.to_space,
-                            to_id=edge.to_id,
-                            properties=edge.properties,
-                        )
-                    except Exception as exc:
-                        console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")
+                    for edge in result.edges:
+                        try:
+                            builder.add_edge(
+                                from_space=edge.from_space,
+                                from_id=edge.from_id,
+                                relation=edge.relation,
+                                to_space=edge.to_space,
+                                to_id=edge.to_id,
+                                properties=edge.properties,
+                            )
+                        except Exception as exc:
+                            console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")
 
             total_nodes += len(result.nodes)
             total_edges += len(result.edges)
@@ -878,6 +882,7 @@ def packs_backfill_pack_id(
     ``--assume-pack-id X`` fills every still-empty entry with X.
     """
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.pack_provenance import backfill_pack_ids, resolve_backfill_dry_run
 
     cfg = get_settings()
@@ -890,9 +895,10 @@ def packs_backfill_pack_id(
     if warning:
         console.print(f"[yellow]{warning}[/yellow]")
 
-    summary = backfill_pack_ids(
-        db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
-    )
+    with write_lock():
+        summary = backfill_pack_ids(
+            db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
+        )
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:

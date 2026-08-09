@@ -67,7 +67,6 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
-import fcntl
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -76,6 +75,7 @@ from typing import Any
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
+from opencrab.locking import file_lock, lock_data_dir
 
 # chroma PersistentClient는 chromadb 공식상 단일 프로세스 전용이다("not process-safe for
 # concurrent writers sharing the same local persistence path"; thread-safe도 단일 프로세스 내에서만
@@ -98,13 +98,7 @@ def _lock_data_dir() -> str:
     대비해, 반환 전 os.makedirs(exist_ok=True)로 생성을 보장한다(락 파일 open()이
     FileNotFoundError로 죽는 것을 방지).
     """
-    data_dir = os.environ.get("LOCAL_DATA_DIR")
-    if not data_dir:
-        from opencrab.config import get_settings
-
-        data_dir = get_settings().local_data_dir
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    return lock_data_dir()
 
 
 def _acquire_chroma_shared_lock() -> None:
@@ -112,6 +106,8 @@ def _acquire_chroma_shared_lock() -> None:
     data_dir = _lock_data_dir()
     lock_path = os.path.join(data_dir, "chroma.lock")
     _chroma_lock_fh = open(lock_path, "w")
+    import fcntl
+
     fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
 
 
@@ -123,15 +119,8 @@ def _acquire_chroma_shared_lock() -> None:
 @contextmanager
 def _write_lock():
     """Hold an exclusive cross-process lock for the duration of a write tool."""
-    data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "write.lock")
-    fh = open(lock_path, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX)  # blocks until no other instance is writing
+    with file_lock("write.lock", _lock_data_dir()):
         yield
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
 
 
 def _clean_str(s: str) -> str:
