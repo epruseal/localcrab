@@ -72,7 +72,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir, release_file_lock
+from opencrab.locking import file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
@@ -84,7 +84,6 @@ from ._registry import dispatch_tool as _registry_dispatch_tool
 # write.lock 은 그 위에 opencrab이 직접 얹은 커스텀 안전층이다(공식 보증 아님). 정공법은 단일
 # `chroma run` 서버 + HttpClient. 출처: cookbook.chromadb.dev/core/{system_constraints,clients}.
 # 공유 락(LOCK_SH)을 서버 수명 동안 보유 → load_local_packs.py의 배타 락(LOCK_EX)과 상호 배제.
-_chroma_lock_fh = None
 _context_lock = threading.RLock()
 
 
@@ -103,26 +102,8 @@ def _lock_data_dir() -> str:
     return lock_data_dir()
 
 
-def _acquire_chroma_shared_lock() -> None:
-    global _chroma_lock_fh
-    if _chroma_lock_fh is not None:
-        return
-    data_dir = _lock_data_dir()
-    # Windows has no shared byte-range lock.  The common implementation uses
-    # an exclusive fallback there, but the timeout turns a second MCP process
-    # into a clear startup failure instead of an unbounded hang.
-    _chroma_lock_fh = acquire_file_lock("chroma.lock", data_dir, shared=True, timeout=10)
-
-
-def _release_chroma_shared_lock() -> None:
-    global _chroma_lock_fh
-    fh, _chroma_lock_fh = _chroma_lock_fh, None
-    if fh is not None:
-        release_file_lock(fh)
-
-
 def close_context() -> None:
-    """Close MCP stores and release the lifetime Chroma lock."""
+    """Close MCP stores and release their local Chroma lifetime lock."""
     global _context
     with _context_lock:
         context, _context = _context, {}
@@ -133,7 +114,6 @@ def close_context() -> None:
             close = getattr(context.get(key), "close", None)
             if callable(close):
                 close()
-        _release_chroma_shared_lock()
 
 
 # WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
@@ -198,9 +178,6 @@ def _get_context() -> dict[str, Any]:
         )
 
         cfg = get_settings()
-        if cfg.vector_backend_resolved == "chroma":
-            _acquire_chroma_shared_lock()
-
         try:
             graph = make_graph_store(cfg)
             vector = make_vector_store(cfg)
@@ -216,7 +193,6 @@ def _get_context() -> dict[str, Any]:
 
             billing = BillingHooks(make_billing_sql_store(cfg, sql))
         except BaseException:
-            _release_chroma_shared_lock()
             raise
 
         _context = {
@@ -273,8 +249,6 @@ __all__ = [
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",
     "_TOOL_FUNCTIONS",
-    "_acquire_chroma_shared_lock",
-    "_release_chroma_shared_lock",
     "_clean_meta",
     "_clean_str",
     "_context",

@@ -103,6 +103,28 @@ def chroma_store(tmp_path):
     return s
 
 
+def test_local_chroma_clients_share_lifetime_lock(tmp_path):
+    pytest.importorskip("chromadb")
+    from _vec_helpers import MockEF
+
+    import opencrab.stores.chroma_store as chroma_module
+    from opencrab.stores.chroma_store import ChromaStore
+
+    path = str(tmp_path / "chroma")
+    key = str(tmp_path.resolve())
+    first = ChromaStore("localhost", 8000, "shared", True, path, MockEF(16))
+    second = ChromaStore("localhost", 8000, "shared", True, path, MockEF(16))
+    try:
+        if not first.available or not second.available:
+            pytest.skip("ChromaDB가 이 환경에서 초기화되지 않음")
+        assert chroma_module._local_locks[key][1] == 2
+    finally:
+        first.close()
+        assert chroma_module._local_locks[key][1] == 1
+        second.close()
+        assert key not in chroma_module._local_locks
+
+
 @pytest.fixture
 def sqlite_vec_store(tmp_path):
     pytest.importorskip("sqlite_vec")

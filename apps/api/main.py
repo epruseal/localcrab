@@ -409,8 +409,15 @@ def _close_context(ctx: ApiContext | None) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     app.state.context = _build_context()
-    yield
-    _close_context(getattr(app.state, "context", None))
+    try:
+        yield
+    finally:
+        _close_context(getattr(app.state, "context", None))
+        # apps/api embeds the MCP router, so its standalone lifespan is not
+        # installed.  Close the shared MCP context here as well.
+        from opencrab.mcp.tools import close_context
+
+        close_context()
 
 
 app = FastAPI(

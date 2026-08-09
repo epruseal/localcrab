@@ -9,12 +9,47 @@ LocalCrab factory always selects persistent local mode.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 
+from opencrab.locking import acquire_file_lock, release_file_lock
 from opencrab.stores._vector_base import generate_add_ids, generate_upsert_ids
 
 logger = logging.getLogger(__name__)
+
+_local_lock_guard = threading.Lock()
+_local_locks: dict[str, tuple[Any, int]] = {}
+
+
+def _acquire_local_lock(local_path: str) -> tuple[str, Any]:
+    """Share one lifetime lock among local clients in this process.
+
+    Windows emulates shared locks as exclusive byte-range locks, so separate
+    handles in the API and embedded MCP contexts would deadlock each other.
+    """
+    data_dir = os.path.realpath(os.path.abspath(os.path.dirname(local_path)))
+    with _local_lock_guard:
+        current = _local_locks.get(data_dir)
+        if current is not None:
+            fh, count = current
+            _local_locks[data_dir] = (fh, count + 1)
+            return data_dir, fh
+        fh = acquire_file_lock("chroma.lock", data_dir, shared=True, timeout=10)
+        _local_locks[data_dir] = (fh, 1)
+        return data_dir, fh
+
+
+def _release_local_lock(data_dir: str, fh: Any) -> None:
+    with _local_lock_guard:
+        current = _local_locks.get(data_dir)
+        if current is None or current[0] is not fh:
+            return
+        if current[1] > 1:
+            _local_locks[data_dir] = (fh, current[1] - 1)
+            return
+        del _local_locks[data_dir]
+    release_file_lock(fh)
 
 
 class ChromaStore:
@@ -42,6 +77,8 @@ class ChromaStore:
         self._client: Any = None
         self._collection: Any = None
         self._available = False
+        self._lifetime_lock_data_dir: str | None = None
+        self._lifetime_lock_fh: Any = None
         # Chroma 자체는 프로세스 내 스레드 안전(공식 System Constraints)이라 add/upsert/
         # delete 에는 별도 락이 불필요하다. 이 락은 앱 레벨 공유 상태인 self._collection
         # 핸들 교체(reset_collection)를 원자화하고, 읽기/쓰기가 교체 도중의 핸들을 보지
@@ -58,8 +95,10 @@ class ChromaStore:
             import chromadb  # type: ignore[import]
 
             if self._local_mode:
-                import os
                 os.makedirs(self._local_path, exist_ok=True)
+                self._lifetime_lock_data_dir, self._lifetime_lock_fh = _acquire_local_lock(
+                    self._local_path
+                )
                 self._client = chromadb.PersistentClient(path=self._local_path)
                 logger.info("ChromaDB local mode at %s", self._local_path)
             else:
@@ -76,6 +115,7 @@ class ChromaStore:
             )
             self._available = True
         except Exception as exc:
+            self._release_lifetime_lock()
             if self._local_mode:
                 logger.warning("ChromaDB local init failed: %s", exc)
             else:
@@ -83,6 +123,17 @@ class ChromaStore:
                     "ChromaDB unavailable (%s:%s): %s", self._host, self._port, exc
                 )
             self._available = False
+
+    def _release_lifetime_lock(self) -> None:
+        data_dir, fh = self._lifetime_lock_data_dir, self._lifetime_lock_fh
+        self._lifetime_lock_data_dir = None
+        self._lifetime_lock_fh = None
+        if data_dir is not None and fh is not None:
+            _release_local_lock(data_dir, fh)
+
+    def close(self) -> None:
+        """Release the process-lifetime exclusion for local persistence."""
+        self._release_lifetime_lock()
 
     @property
     def available(self) -> bool:
