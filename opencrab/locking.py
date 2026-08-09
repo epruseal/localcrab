@@ -6,6 +6,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from time import sleep
+from typing import BinaryIO
 
 if os.name == "nt":
     import msvcrt
@@ -24,32 +25,73 @@ def lock_data_dir() -> str:
     return data_dir
 
 
-@contextmanager
-def file_lock(filename: str, data_dir: str | None = None) -> Iterator[None]:
-    """Hold an exclusive lock file until the enclosed operation completes."""
+def _open_lock(filename: str, data_dir: str | None = None) -> BinaryIO:
     lock_path = os.path.join(data_dir or lock_data_dir(), filename)
-    fh = open(lock_path, "a+" if os.name == "nt" else "w")
     try:
-        if os.name == "nt":
-            fh.seek(0)
-            fh.write("\0")
+        return open(lock_path, "r+b")
+    except FileNotFoundError:
+        return open(lock_path, "w+b")
+
+
+def _acquire(fh: BinaryIO, *, shared: bool) -> None:
+    if os.name == "nt":
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
             fh.flush()
-            fh.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    sleep(0.1)
-        else:
-            fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        while True:
+            try:
+                # Windows msvcrt has no shared flock; exclusive is the safe
+                # fallback for the Chroma lifetime lock.
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                sleep(0.1)
+    else:
+        fcntl.flock(fh, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+
+
+def _release(fh: BinaryIO) -> None:
+    if os.name == "nt":
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def file_lock(
+    filename: str, data_dir: str | None = None, *, shared: bool = False
+) -> Iterator[None]:
+    """Hold a cross-process lock until the enclosed operation completes."""
+    fh = _open_lock(filename, data_dir)
+    try:
+        _acquire(fh, shared=shared)
         yield
     finally:
-        if os.name == "nt":
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+        _release(fh)
+        fh.close()
+
+
+def acquire_file_lock(
+    filename: str, data_dir: str | None = None, *, shared: bool = False
+) -> BinaryIO:
+    """Acquire a lock and return its open handle for lifetime-scoped use."""
+    fh = _open_lock(filename, data_dir)
+    try:
+        _acquire(fh, shared=shared)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+def release_file_lock(fh: BinaryIO) -> None:
+    """Release and close a handle returned by :func:`acquire_file_lock`."""
+    try:
+        _release(fh)
+    finally:
         fh.close()
 
 

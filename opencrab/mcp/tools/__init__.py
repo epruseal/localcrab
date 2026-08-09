@@ -67,12 +67,11 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from opencrab.locking import file_lock, lock_data_dir
+from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
@@ -105,11 +104,7 @@ def _lock_data_dir() -> str:
 def _acquire_chroma_shared_lock() -> None:
     global _chroma_lock_fh
     data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "chroma.lock")
-    _chroma_lock_fh = open(lock_path, "w")
-    import fcntl
-
-    fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
+    _chroma_lock_fh = acquire_file_lock("chroma.lock", data_dir, shared=True)
 
 
 # WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
