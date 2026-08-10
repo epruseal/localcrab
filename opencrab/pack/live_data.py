@@ -47,6 +47,11 @@ def require_live_data(ctx: str = "") -> None:
     try:
         ok = Path(d).is_dir()
     except OSError as exc:
-        sys.exit(f"LOCAL_DATA_DIR 경로 없음: {d} — 경로를 확인할 수 없다({exc}){suffix}")
+        # 경로를 그대로 두 번 실으면 4천자 경로에서 메시지가 8천자가 되고, 정작 행동
+        # 가능한 정보(`File name too long`)가 그 사이에 묻힌다(적대 검증 지적).
+        # 앞뒤만 남기고 가운데를 접는다 — 어느 경로인지는 양끝으로 충분히 식별된다.
+        shown = d if len(d) <= 140 else f"{d[:60]}…({len(d)}자)…{d[-60:]}"
+        sys.exit(f"LOCAL_DATA_DIR 경로 없음: {shown} — 경로를 확인할 수 없다"
+                 f"({type(exc).__name__}: {exc.strerror or exc}){suffix}")
     if not ok:
         sys.exit(f"LOCAL_DATA_DIR 경로 없음: {d} — 오타이거나 스테일 export다{suffix}")

@@ -13,11 +13,19 @@
 `resolve`·`normpath`·`realpath`·`is_symlink` 관용은 전부 "개선"처럼 보이지만 이 가드에
 한해서는 **약화**다. 수용 집합은 정확히 `Path(값).is_dir()` 이어야 한다.
 
-이 불변식을 문장으로만 두면 다음 사람이 또 "개선"한다. 그래서
-`TestAcceptanceSetIsExactlyIsDir` 이 거부·수용 양쪽을 **표로** 고정한다.
+이 불변식을 문장으로만 두면 다음 사람이 또 "개선"한다. 그래서 **코드가 강제한다** —
+구조는 두 축으로 갈려 있다:
+
+  · **값 축** — `TestVerdictEqualsIsDir` 이 기대 판정을 손으로 적지 않고
+    `_oracle(value)`(= `Path(value).is_dir()`, OSError 는 거부)과 대사한다.
+    표로 열거하던 판은 열거 밖 변형(`expandvars`·`rstrip`·백슬래시)이 그대로 통과했다.
+  · **출처·조건 축** — `TestGuardDependsOnNothingButThatOneValue` 가 모듈 전체를
+    봉인한다(env 1회·`sys.exit` 만·최상위 실행문 금지). 이 축은 값으로 못 잡는다:
+    `if "pytest" not in sys.modules: return` 은 **운영에서만** 가드를 무효로 만든다.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 
 import pytest
@@ -114,6 +122,28 @@ class TestVerdictEqualsIsDir:
                 require_live_data("load_nodes")
             assert "경로 없음" in str(ei.value), f"{case}: {value!r}"
 
+    # 값 축의 잔여 구멍은 **생성**으로 메운다. 코퍼스에 3행 더 붙이면 다시 열거고,
+    # 다음엔 다른 문자셋·다른 접두사가 남는다(적대 검증 실증, 2026-08-10: N5 비-ASCII /
+    # N6 접두사 허용목록 / N7 길이 분기). 오라클이 이미 기대값을 계산하므로 값을 늘리는
+    # 비용이 0에 수렴한다 — 축을 조합으로 훑는다.
+    @pytest.mark.parametrize("charset", ["ascii", "한글", "🧭"])
+    @pytest.mark.parametrize("length", ["짧음", "4k", "6k"])
+    @pytest.mark.parametrize("prefix", ["tmp", "/Volumes", "/mnt", "/net"])
+    def test_generated_values_match_the_oracle(self, charset, length, prefix,
+                                               monkeypatch, tmp_path):
+        stem = {"ascii": "seg", "한글": "구간", "🧭": "🧭"}[charset]
+        n = {"짧음": 1, "4k": 4096 // max(1, len(stem)), "6k": 6000 // max(1, len(stem))}[length]
+        base = str(tmp_path) if prefix == "tmp" else prefix
+        value = f"{base}/{stem * n}"
+        want_accept = _oracle(value)
+        monkeypatch.setenv("LOCAL_DATA_DIR", value)
+        if want_accept:
+            assert require_live_data("load_nodes") is None, f"과잉 거부: {value[:80]}…"
+        else:
+            with pytest.raises(SystemExit) as ei:
+                require_live_data("load_nodes")
+            assert "경로 없음" in str(ei.value), f"{charset}/{length}/{prefix}"
+
     def test_the_corpus_actually_splits_both_ways(self, tmp_path):
         """코퍼스가 수용·거부 **양쪽**을 담고 있어야 한다.
 
@@ -127,39 +157,96 @@ class TestVerdictEqualsIsDir:
         assert len(verdicts) == len(_CORPUS) >= 15, f"코퍼스 {len(verdicts)}행"
 
 
-class TestReadsOnlyOneEnvKey:
-    """**출처 축**은 값 코퍼스로 못 잡는다 — 소스로 닫는다.
+class TestGuardDependsOnNothingButThatOneValue:
+    """**출처·조건 축**은 값 코퍼스로 못 잡는다 — 모듈 전체를 봉인해 닫는다.
 
-    `LOCAL_DATA_DIR` 이 없을 때 다른 키로 폴백하거나, 백도어 env 로 가드를 통째로
-    건너뛰게 만드는 변이는 **입력값이 아니라 입력 출처**를 바꾼다. 어떤 값을 넣어도
-    안 갈리므로 오라클로는 원리적으로 못 잡는다(적대 검증 실증, 2026-08-10: B9·B10).
+    앞선 판은 `require_live_data` **함수 본문만** AST 로 봤다. 그래서 스코프 밖의
+    형태가 전부 통과했다(적대 검증 실증, 2026-08-10: N1~N4·N11). 7종 전원 진짜 확대다:
 
-        DATA_DIR 폴백        미설정 + DATA_DIR=실재            -> 원본 REJECT / 변이 ACCEPT
-        SKIP 백도어          없는 경로 + SKIP_LIVE_GUARD=1     -> 원본 REJECT / 변이 ACCEPT
+        모듈 최상위 SKIP 백도어    없는 경로 + SKIP=1        -> REJECT 였던 것이 ACCEPT
+        헬퍼 함수 간접 폴백        미설정 + DATA_DIR=실재     -> REJECT 였던 것이 ACCEPT
+        pytest 감지 백도어        없는 경로(운영 환경)        -> REJECT 였던 것이 ACCEPT
+        sys.argv 백도어          없는 경로 + argv --force   -> REJECT 였던 것이 ACCEPT
 
-    값 축은 위 오라클이, 출처 축은 여기가 닫는다. 축을 갈라야 `Path(d).absolute()`
-    같은 정상 리팩터를 막지 않으면서 둘 다 닫힌다.
+    **`pytest` 감지가 최악이다.** `if "pytest" not in sys.modules: return` 한 줄이면
+    가드가 **운영에서만 통째로 무효**가 되는데 스위트는 초록이다 — 테스트 안에서는 항상
+    pytest 가 있으므로 오라클이 원리적으로 못 본다.
+
+    그래서 세 규칙으로 **모듈 전체**를 봉인한다. 셋 다 값 축을 건드리지 않으므로
+    `Path(d).absolute()`·`os.stat` 같은 정상 리팩터는 계속 산다.
     """
 
-    def test_environ_is_read_exactly_once_with_one_key(self):
-        import ast
-
+    @staticmethod
+    def _tree():
         import opencrab.pack.live_data as m
-        src = pathlib.Path(m.__file__).read_text(encoding="utf-8")
-        fn = next(n for n in ast.parse(src).body
-                  if isinstance(n, ast.FunctionDef) and n.name == "require_live_data")
-        reads = []
-        for x in ast.walk(fn):
-            if isinstance(x, ast.Attribute) and x.attr == "environ":
-                reads.append(ast.unparse(x))
-            elif isinstance(x, ast.Name) and x.id == "environ":
-                reads.append(x.id)
+        return ast.parse(pathlib.Path(m.__file__).read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _is_environ(node) -> bool:
+        return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+    @classmethod
+    def _env_reads(cls, tree):
+        """env 접근 **노드에서만** 키를 뽑는다.
+
+        앞선 판은 함수 안 **모든 Call 의 문자열 상수**를 env 키로 수집하고 `X.environ`
+        속성만 읽기로 셌다. 그래서 `os.environ.get(키, "")` 의 **기본값**과 무관한
+        함수의 인자가 키로 오판되고, `os.getenv(키)` 는 0회로 세어져 **진성 등가 3종이
+        죽었다**(적대 검증 실증, 2026-08-10: EQ1·EQ2·B2'). 과잉 계약은 정상 리팩터를
+        막으므로 미검출만큼이나 나쁘다.
+        """
+        out = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                if n.func.attr == "get" and cls._is_environ(n.func.value):
+                    out.append(n.args[0] if n.args else None)          # os.environ.get("K")
+                elif n.func.attr == "getenv":
+                    out.append(n.args[0] if n.args else None)          # os.getenv("K")
+            elif isinstance(n, ast.Subscript) and cls._is_environ(n.value):
+                out.append(n.slice)                                    # os.environ["K"]
+        return out
+
+    def test_environ_is_read_once_with_one_key_module_wide(self):
+        """모듈 **전체**에서 env 접근 1회, 키는 `LOCAL_DATA_DIR` 하나."""
+        reads = self._env_reads(self._tree())
+        keys = [n.value if isinstance(n, ast.Constant) else ast.unparse(n) for n in reads]
         assert len(reads) == 1, (
-            f"가드가 os.environ 을 {len(reads)}회 읽는다 — 폴백 키나 백도어가 끼어들 자리다: {reads}")
-        keys = [c.value for x in ast.walk(fn) if isinstance(x, ast.Call)
-                for c in x.args if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-        assert keys == ["LOCAL_DATA_DIR"], (
-            f"가드가 읽는 env 키가 LOCAL_DATA_DIR 하나가 아니다: {keys}")
+            f"모듈 전체에서 env 를 {len(reads)}회 읽는다 — 폴백 키나 백도어가 끼어들 "
+            f"자리다: {keys}")
+        assert keys == ["LOCAL_DATA_DIR"], f"env 키가 하나가 아니다: {keys}"
+
+    def test_sys_is_used_only_to_exit(self):
+        """`sys` 는 `sys.exit` 로만 쓴다 — `sys.modules`·`sys.argv` 분기 금지.
+
+        그 둘은 **값이 아니라 실행 맥락**으로 분기하게 만든다. 테스트 안과 운영에서
+        다르게 동작하는 가드는 어떤 값 검사로도 잡을 수 없다.
+        """
+        used = sorted({
+            n.attr for n in ast.walk(self._tree())
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+            and n.value.id == "sys"
+        })
+        assert used == ["exit"], (
+            f"sys 를 exit 외로 쓴다: {used} — 실행 맥락으로 분기하면 테스트 안에서만 "
+            "동작하는 가드가 된다")
+
+    def test_module_top_level_has_no_executable_statements(self):
+        """최상위에 docstring·import·def 외의 실행문이 없다.
+
+        모듈 상수 백도어와 메모 캐시가 끼어드는 자리다. 최상위 할당 하나면
+        `_SKIP = os.environ.get(...)` 로 위 두 검사를 우회할 수 있다.
+        """
+        allowed = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
+                   ast.ClassDef)
+        stray = []
+        for i, node in enumerate(self._tree().body):
+            if isinstance(node, allowed):
+                continue
+            if i == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                continue                                   # 모듈 docstring
+            stray.append(f"L{node.lineno}: {ast.unparse(node)[:60]}")
+        assert not stray, "최상위 실행문이 있다 — 백도어·캐시가 끼어드는 자리다:\n  " + \
+            "\n  ".join(stray)
 
 
 class TestRejectsUnusableTargets:
