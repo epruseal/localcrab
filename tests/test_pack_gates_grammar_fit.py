@@ -118,3 +118,49 @@ class TestPrediction:
         r = gf.predict_grammar_fit([_n("a"), _n("b")], [e])
         assert r["missing_endpoint"] == 0, f"{field_pair} 를 못 읽었다"
         assert r["total_edges"] == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 반환 계약 — score 의 `counts` 와 **같은 클래스**다.
+#
+# 판정(`pass`·수치)만 걸면 키 이름을 `""` 로 바꾸는 변이가 통과한다. 판정은 그대로인데
+# 호출자가 `KeyError` 로 죽는다 — 게이트가 초록인 채 파이프라인이 끊긴다.
+# 돌연변이 스윕 실측(2026-08-10): 이 모듈 총 77 중 생존 15, 그중
+# `top_violations`·`detail`·`count` 키 이름 변이가 살아 있었다.
+# score 에서 이미 닫은 축을 형제 모듈에 안 건 것이 클래스 미폐쇄다.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestReturnContract:
+    KEYS = {"pass", "total_edges", "violations", "missing_endpoint",
+            "top_violations", "violations_detail", "detail"}
+    DETAIL_KEYS = {"label", "from_space", "to_space", "count", "allowed"}
+
+    def _bad(self, n=1):
+        nodes = [_n(f"a{i}") for i in range(n)] + [_n(f"b{i}") for i in range(n)]
+        edges = [_e(f"a{i}", f"b{i}", f"없는관계{i}") for i in range(n)]
+        return gf.predict_grammar_fit(nodes, edges)
+
+    def test_top_level_keys_are_exactly_these_seven(self):
+        assert set(self._bad().keys()) == self.KEYS
+
+    def test_violation_detail_keys_are_exactly_these_five(self):
+        d = self._bad()["violations_detail"][0]
+        assert set(d.keys()) == self.DETAIL_KEYS
+
+    def test_top_violations_is_capped_at_five(self):
+        """상한이 없으면 미정합 관계가 많은 팩에서 한 줄이 수백 항목을 뱉는다.
+
+        상한을 늘리는 변이는 판정을 안 바꾸므로 수치 검사로는 안 잡힌다.
+        """
+        r = self._bad(7)
+        assert r["violations"] == 7, "전제: 7종이 전부 미정합이어야 한다"
+        assert len(r["top_violations"]) == 5, f"상한이 5가 아니다: {len(r['top_violations'])}"
+        assert len(r["violations_detail"]) == 7, "상세는 잘리지 않는다 — 상한은 요약에만 건다"
+
+    def test_detail_sentence_reports_all_three_counts(self):
+        """요약 문장이 총·미정합·누락 셋을 다 말하는가. 하나라도 빠지면 운영자가 오판한다."""
+        nodes = [_n("a"), _n("b")]
+        r = gf.predict_grammar_fit(nodes, [_e("a", "b", "없는관계"), _e("a", "유령", "CITES")])
+        assert (r["total_edges"], r["violations"], r["missing_endpoint"]) == (1, 1, 1)
+        assert r["detail"] == "엣지 1건 중 grammar 미정합 1건, endpoint 누락 1건"

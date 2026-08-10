@@ -98,3 +98,77 @@ class TestMissingFiles:
         d = _pack(tmp_path, [_n("a")], [_e("a", "a")], chunks=None)
         r = check_pack(d)
         assert r is not None and r["chunks"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 반환 계약 + 판정 경계 — score 의 `counts` 격자와 **같은 클래스**다.
+#
+# 돌연변이 스윕 실측(2026-08-10): 이 모듈 총 55 중 생존 5. 전부 여기서 닫는 축이다 —
+# `ev_lt_ok` 기본값, 파일 존재 판정의 `and`, 반환 키 이름, 사유 문자열의 비교기호.
+# score 하나만 닫고 형제 게이트를 안 본 것이 클래스 미폐쇄였다.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestReturnContract:
+    KEYS = {"ok", "nodes", "edges", "dangling", "evidence", "chunks", "reasons"}
+
+    def test_top_level_keys_are_exactly_these_seven(self, tmp_path):
+        r = check_pack(_pack(tmp_path, [_n("a"), _n("b")], [_e("a", "b")]))
+        assert set(r.keys()) == self.KEYS
+
+    def test_counts_are_reported_not_just_the_verdict(self, tmp_path):
+        """수치가 판정과 같이 나와야 운영자가 어디를 고칠지 안다."""
+        nodes = [_n("a"), _n("b"), _n("e1", space="evidence")]
+        chunks = [{"id": "e1", "document_id": "a", "text": "x"}]
+        r = check_pack(_pack(tmp_path, nodes, [_e("a", "b")], chunks))
+        assert (r["nodes"], r["edges"], r["evidence"], r["chunks"]) == (3, 1, 1, 1)
+
+
+class TestEvidenceChunkPolarity:
+    """`ev_lt_ok` 는 **기본이 엄격(==)** 이다.
+
+    기본값이 느슨(`<=`)해지면 evidence 가 청크보다 적은 팩이 조용히 통과한다 —
+    호출자가 완화를 **명시적으로** 선언하게 하려고 둔 인자인데 그 의미가 뒤집힌다.
+    """
+
+    def _pack23(self, tmp_path):
+        nodes = [_n("a"), _n("b")] + [_n(f"e{i}", space="evidence") for i in range(2)]
+        chunks = [{"id": f"e{i}", "document_id": "a", "text": "x"} for i in range(3)]
+        return _pack(tmp_path, nodes, [_e("a", "b")], chunks)
+
+    def test_default_is_strict_equality(self, tmp_path):
+        r = check_pack(self._pack23(tmp_path))
+        assert (r["evidence"], r["chunks"]) == (2, 3), "전제: evidence < chunks"
+        assert r["ok"] is False, "기본값이 느슨해졌다 — evidence!=chunks 를 통과시켰다"
+        assert "evidence==chunks 위반" in r["reasons"], f"사유 문구가 다르다: {r['reasons']}"
+
+    def test_opt_in_relaxation_accepts_fewer_evidence(self, tmp_path):
+        r = check_pack(self._pack23(tmp_path), ev_lt_ok=True)
+        assert r["ok"] is True, "명시적 완화가 안 먹었다"
+        assert r["reasons"] == []
+
+    def test_relaxed_mode_still_rejects_more_evidence_than_chunks(self, tmp_path):
+        """완화는 **한 방향**이다. evidence 가 청크보다 많으면 완화 모드에서도 위반이다."""
+        nodes = [_n("a"), _n("b")] + [_n(f"e{i}", space="evidence") for i in range(3)]
+        chunks = [{"id": "e0", "document_id": "a", "text": "x"}]
+        r = check_pack(_pack(tmp_path, nodes, [_e("a", "b")], chunks), ev_lt_ok=True)
+        assert (r["evidence"], r["chunks"]) == (3, 1)
+        assert r["ok"] is False
+        assert "evidence<=chunks 위반" in r["reasons"], f"사유 문구가 다르다: {r['reasons']}"
+
+
+class TestMissingFileIsNotAVerdict:
+    """노드·엣지 **둘 다** 있어야 검사할 수 있다. 하나라도 없으면 `None`(검사 불가)이다.
+
+    `and` 가 `or` 로 바뀌면 한쪽만 있어도 검사를 진행해 **없는 파일을 0건으로** 읽는다 —
+    "엣지 0건이라 dangling 0" 이 되어 초록이 난다. 검사 불가와 통과는 다른 신호다.
+    """
+
+    @pytest.mark.parametrize("present", ["nodes", "edges"], ids=["only-nodes", "only-edges"])
+    def test_one_sided_pack_is_uncheckable(self, tmp_path, present):
+        d = tmp_path / present
+        d.mkdir(parents=True)
+        rows = [_n("a")] if present == "nodes" else [_e("a", "b")]
+        (d / f"{present}.jsonl").write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        assert check_pack(d) is None, f"{present} 만 있는데 판정을 냈다 — 검사 불가여야 한다"
