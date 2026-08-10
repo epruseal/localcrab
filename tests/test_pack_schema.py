@@ -5,6 +5,7 @@
   - grammar 표 사본이 정본과 드리프트할 수 있던 구조
 """
 
+import copy
 import itertools
 import pathlib
 from unittest import mock
@@ -447,6 +448,19 @@ class TestOnlyPackSchemaErrorEscapes:
             row = base()
             row.update(variant)
             rows.append(row)
+        # **드롭 개수 축.** 앞선 판은 "어느 키를 빼는가"를 전수로 열고 "**몇 개**를 빼는가"는
+        # 1에 고정했다. 그래서 **빈 행에서만** 터지는 형태가 통과했다(적대 검증 실증,
+        # 2026-08-10: Y2·Y7):
+        #
+        #     _first = next(iter(row))       -> validate_edge({}) 가 StopIteration
+        #     _v = list(row.values())[0]     -> validate_edge({}) 가 IndexError
+        #
+        # `{}` 는 정상 JSON 이고 malformed JSONL 줄로 실제로 나온다. `StopIteration` 은
+        # 특히 나쁘다 — 적재기가 제너레이터·comprehension 안에서 검사를 부르면 예외가
+        # 아니라 **조용한 순회 종료**로 흡수돼 행이 통째로 사라진다.
+        rows.append({})
+        rows.append({"workspace_id": "pack"})          # 거의 빈 행
+        rows.append({k: base()[k] for k in list(base())[:1]})  # 키 1개만 있는 행
         # 필수 필드가 전부 빈 극단
         empty = base()
         for k in struct_key:
@@ -454,18 +468,32 @@ class TestOnlyPackSchemaErrorEscapes:
         rows.append(empty)
         return rows
 
-    @pytest.mark.parametrize("validator,base,keys,bad", [
+    @pytest.mark.parametrize("validator,base,keys,bad,kw", [
         (validate_node, _node, ("id", "label", "node_type", "space"),
-         {"properties": "dict 아님"}),
+         {"properties": "dict 아님"}, {}),
+        # **strict 모드를 따로 돌린다.** 노드의 stray 검사는 `allow_legacy_top_level=False`
+        # 일 때만 도는데 그 인자를 안 주면 `schema.py` 의 노드 stray raise 에 **영원히
+        # 도달하지 않는다**. 그래서 그 한 자리만 `sorted(stray)` 로 되돌려도 142 passed
+        # 였다(적대 검증 실증, 2026-08-10: SORT_NODE). 형제 3자리를 다 고쳐도 가드가
+        # 2자리만 덮으면 세 번째는 무보증이다.
+        (validate_node, _node, ("id", "label", "node_type", "space"),
+         {"properties": "dict 아님"}, {"allow_legacy_top_level": False}),
         (validate_edge, _edge, ("id", "source_id", "target_id", "label"),
-         {"properties": "dict 아님"}),
+         {"properties": "dict 아님"}, {}),
         (validate_chunk, _chunk, ("id", "document_id", "text"),
-         {"metadata": "dict 아님"}),
+         {"metadata": "dict 아님"}, {}),
     ])
-    def test_no_other_exception_type_escapes(self, validator, base, keys, bad):
+    def test_no_other_exception_type_escapes(self, validator, base, keys, bad, kw):
         for row in self._rows(base, keys, bad):
+            # **입력 불변성.** 검사가 호출자의 행을 변형하면, 적재기는 검사 뒤 그 행을
+            # 그대로 쓰므로 **파일에는 있고 라이브에는 없는** 상태가 된다 — 이 모듈이
+            # 존재하는 이유인 91만 필드 사고와 같은 모양이다. 계약이 어디에도 없어서
+            # `row.pop('workspace_id', None)` 한 줄이 142 passed 를 유지했다
+            # (적대 검증 실증, 2026-08-10: Y9). `absorb_legacy_top_level` 에는 이미
+            # 같은 계약이 있었고 형제 함수에 미적용이었을 뿐이다.
+            before = copy.deepcopy(row)
             try:
-                validator(row)
+                validator(row, **kw)
             except PackSchemaError as exc:
                 # id 키가 **없는** 행이면 `row_id` 는 None 이어야 한다. 이 단언이 없으면
                 # `row.get("id", "<unknown>")` 처럼 **위조 식별자**를 채우는 변이가
@@ -479,6 +507,9 @@ class TestOnlyPackSchemaErrorEscapes:
                 pytest.fail(
                     f"{type(exc).__name__}: {exc} — 계약은 PackSchemaError 뿐이다. "
                     f"입력 행: {row!r}")
+            assert row == before, (
+                f"검사가 호출자의 행을 변형했다 — 적재기는 이 행을 그대로 쓴다. "
+                f"잃은 키={sorted(set(before) - set(row), key=str)}, 입력: {before!r}")
 
     def test_diagnostics_never_subscript_the_row(self):
         """`raise` **문 안의** 첨자를 막는다 — 방어 범위를 정확히 적는다.
