@@ -52,11 +52,13 @@ from __future__ import annotations
 
 import ast
 import json
+import pathlib
 import re
 from collections import defaultdict
 
 import pytest
 
+from opencrab.pack.gates import score as gs
 from opencrab.pack.gates.score import grade_pack
 
 
@@ -280,6 +282,30 @@ def _fx_trace_875():
     return nodes, [_ge(f"t{k}", nid, "evidence0") for k, nid in enumerate(need[:14])], []
 
 
+def _fx_trace_full():
+    """추적 대상 **전량 연결** = 만점 분기. 격자에 만점 행이 없으면 만점 상수가 열린다.
+
+    적대 검증이 실증했다: `s4 = 20 if rate >= 0.90` 의 `20` 을 `21` 로 바꾸면
+    격자·규모 표는 **전부 통과**하는데(47 passed) 128팩 채점이 바뀐다. 다른 클래스가
+    잡고 있었을 뿐 격자 자신은 그 분기를 한 번도 지나지 않았다.
+    """
+    nodes = _base()
+    need = [f"{sp}{i}" for sp in ("policy", "claim", "lever", "outcome") for i in range(4)]
+    return nodes, [_ge(f"t{k}", nid, "evidence0") for k, nid in enumerate(need)], []
+
+
+def _fx_trace_interior():
+    """임계도 만점도 아닌 **구간 내부** 한 점(55%).
+
+    경계 양쪽만 고정하면 내부를 바꾸는 변이가 통과한다 — 설계 검증이 인메모리 모델로
+    보였다(`pinned (1.0, 0.875)` 상태에서 `0.55 -> 11` 변이가 수용됨).
+    유한한 두 점은 구간을 닫지 못하므로 세 번째 점을 둔다.
+    """
+    nodes = _base(policy=5, claim=5, lever=5, outcome=5)
+    need = [f"{sp}{i}" for sp in ("policy", "claim", "lever", "outcome") for i in range(5)]
+    return nodes, [_ge(f"t{k}", nid, "evidence0") for k, nid in enumerate(need[:11])], []
+
+
 def _fx_trace_policy_unlinked():
     """claim·lever·outcome 만 연결. policy 가 추적 대상에서 빠지면 만점이 된다."""
     nodes = _base()
@@ -396,6 +422,12 @@ GRID = [
     ("trace-threshold-is-90", _fx_trace_875,
      {"space": 25, "balance": 10, "source": 0, "trace": 19, "integrity": 15, "scale": 1}, 70,
      "추적 임계 0.90. 0.85 면 87.5% 가 만점이 된다"),
+    ("trace-full-credit-is-20", _fx_trace_full,
+     {"space": 25, "balance": 10, "source": 0, "trace": 20, "integrity": 15, "scale": 1}, 71,
+     "만점 분기의 상수 20. 이 행이 없으면 20->21 변이가 격자를 통과한다(실증됨)"),
+    ("trace-interior-point-55pct", _fx_trace_interior,
+     {"space": 25, "balance": 10, "source": 0, "trace": 12, "integrity": 15, "scale": 1}, 63,
+     "임계도 만점도 아닌 구간 내부. 두 점만으로는 구간이 안 닫힌다"),
     ("trace-includes-policy", _fx_trace_policy_unlinked,
      {"space": 25, "balance": 10, "source": 0, "trace": 17, "integrity": 15, "scale": 1}, 68,
      "추적 대상 = claim·lever·outcome·**policy**. policy 가 빠지면 만점"),
@@ -464,19 +496,34 @@ class TestConstantGrid:
         assert r["counts"] == {"nodes": len(nodes), "edges": len(edges),
                                "chunks": len(chunks)}, f"[{axis}] counts 계약 위반"
 
-    def test_grid_covers_every_section(self):
-        """6개 항목이 **전부** 어느 표에선가 기준선에서 움직이는가.
+    def test_grid_pins_each_section_at_both_ends(self):
+        """6개 항목이 **만점과 그보다 낮은 값 양쪽**에서 고정되는가.
 
-        격자 자신에 대한 비공허성 검사다. 한 항목이라도 안 움직이면 그 항목의 상수는
-        여전히 열려 있는데, 통과하는 테스트 개수만 보면 닫힌 것처럼 보인다.
-        `scale` 은 경계 양쪽이 필요해 `SCALE_GRID` 로 분리돼 있으므로 **두 표를 다 본다**
-        (처음엔 `GRID` 만 보다가 이 검사가 `scale` 누락을 잡아냈다).
+        격자 자신에 대한 비공허성 검사다. 1판은 "기준선에서 **움직였는가**"만 봤는데,
+        그러면 **만점 분기를 한 번도 안 지나는** 축이 있어도 통과한다.
+        실제로 그랬다 — `trace` 만점 상수 20 을 21 로 바꾸면 격자·규모 표는 전부
+        통과하면서(47 passed) 128팩 채점이 바뀌었다(적대 검증 실증, 2026-08-10).
+        "축을 열어 놓고 그 위의 한 점만 고정"의 재발이고, 이 검사가 그것을 못 봤다.
+
+        만점(`full`)은 루브릭 배점이라 **리터럴로 적는다** — `grade_pack` 에서 유도하면
+        배점이 바뀔 때 기대값도 같이 바뀌어 자기참조가 된다.
         """
-        baseline = GRID[0][2]
-        moved = {k for _a, _b, sec, _t, _w in GRID[1:] for k in sec if sec[k] != baseline[k]}
-        if len({row[3] for row in SCALE_GRID}) > 1:
-            moved.add("scale")
-        assert moved == set(baseline), f"흔들리지 않은 항목이 남았다: {set(baseline) - moved}"
+        full = {"space": 25, "balance": 10, "source": 20,
+                "trace": 20, "integrity": 15, "scale": 10}
+        seen: dict[str, set[int]] = {k: set() for k in full}
+        for _a, _b, sec, _t, _w in GRID:
+            for k, v in sec.items():
+                seen[k].add(v)
+        for _n, _e, _c, scale, _w in SCALE_GRID:
+            seen["scale"].add(scale)
+
+        missing_max = {k for k, m in full.items() if m not in seen[k]}
+        assert not missing_max, (
+            f"만점 분기를 한 번도 안 지나는 항목: {sorted(missing_max)} — "
+            "그 항목의 만점 상수는 격자로 안 닫힌다")
+        missing_low = {k for k, m in full.items() if not any(v < m for v in seen[k])}
+        assert not missing_low, (
+            f"만점 아래 값이 없는 항목: {sorted(missing_low)} — 감점 분기가 안 닫힌다")
 
 
 def _scale_pack(n_nodes, n_edges, n_chunks):
@@ -619,6 +666,35 @@ class TestStructKeySetIsExactlyNine:
         nodes[0] = _gn("subject0", "subject", 아무키="값")
         r = grade_pack(_pack(tmp_path / "k-other", nodes, [], []))
         assert any("[shape]" in g for g in r["gaps"]), "비구조 키인데 경고가 없다"
+
+    def test_the_set_is_exactly_these_nine_not_a_superset(self):
+        """이름이 약속하는 것을 실제로 건다 — **정확히 이 9개**.
+
+        위 두 검사는 행동만 본다. 그래서 생산 코드가 집합에 **키를 추가**해도 둘 다
+        통과한다(설계 검증 지적: 상위집합만 고정하고 있다). 행동으로 "정확한 집합"을
+        거는 것은 원리적으로 불가능하다 — 비회원을 전수 열거해야 하기 때문이다.
+        그래서 **집합 자체**를 본다.
+
+        소스를 AST 로 읽는 이유: `score.py` 는 이번 라운드에서 **무수정**이다(이관
+        무결성 증거를 보존한다). 모듈 상수로 노출하면 더 깔끔하지만 그건 소스 변경이다.
+        기대값은 리터럴이라 자기참조가 아니다 — 생산 집합이 바뀌면 여기서 깨진다.
+        """
+        src = pathlib.Path(gs.__file__).read_text(encoding="utf-8")
+        found = None
+        for node in ast.walk(ast.parse(src)):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "struct_keys"
+                    and isinstance(node.value, ast.Set)):
+                found = {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+                break
+        assert found is not None, (
+            "`struct_keys` 집합 리터럴을 못 찾았다 — 형태가 바뀌었으면 이 검사도 고쳐라. "
+            "찾기 실패를 통과로 두면 검사가 조용히 죽는다")
+        assert found == set(self.STRUCT), (
+            f"구조 키 집합이 달라졌다: 추가 {sorted(found - set(self.STRUCT))} · "
+            f"삭제 {sorted(set(self.STRUCT) - found)}")
+        assert len(found) == 9
 
 
 class TestEveryDeductionSaysWhy:
