@@ -186,7 +186,7 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 | | `schema_pack_uninstall` | 스키마 팩 제거 |
 | **하니스** | `harness_promotion_apply` | CrabHarness PromotionPackage 적용 (`dry_run` 지원) |
 
-> ReBAC/identity/promotion/billing 등 툴은 코드에 있으나 현재 MCP 미노출 상태입니다. `opencrab/mcp/tools.py`에서 해당 툴을 주석 해제하면 복원됩니다.
+> ReBAC/identity/promotion/billing 등 툴은 코드에 있으나 현재 MCP 미노출 상태입니다. `opencrab/mcp/tools/__init__.py`에서 해당 툴을 주석 해제하면 복원됩니다.
 
 ---
 
@@ -412,6 +412,8 @@ community_reports.json
 ```
 
 포맷 상세: [OpenCrab Pack v1 ZIP 형식](./docs/opencrab-pack-v1.md)
+
+`opencrab/pack/`(팩 빌드·검증·적재·내보내기 공용 라이브러리) 모듈 지도와 설계 원칙은 [팩 계약 계층](./docs/pack-contract-layer.md) 참고.
 
 ### CrabHarness
 
