@@ -212,6 +212,12 @@ class TestDiagnosticIdentifiesTheFailingRow:
         # 지워도 전부 통과한다 — 즉 escape 의 필요성이 검증되지 않는다(적대 검증 실증).
         (validate_node, _node, "노드", r"row[1].*+?", "label"),
         (validate_node, _node, "노드", "it's \"quoted\"", "label"),
+        # id 가 **문자열이 아닌** 경우. 이게 없으면 `row_id` 를 문자열일 때만 유지하는
+        # 변이가 세 검사 전부에서 살아남는다(적대 검증 실증, 2026-08-10: W3).
+        # `{"id": 12345}` 는 정상 JSON 이고 팩토리도 `row_id: Any` 로 받는다.
+        (validate_node, _node, "노드", 12345, "label"),
+        (validate_edge, _edge, "엣지", 3.5, "source_id"),
+        (validate_chunk, _chunk, "청크", 0, "text"),
     ])
     def test_message_carries_the_row_id(self, validator, builder, kind, rid, missing):
         row = builder()
@@ -251,13 +257,14 @@ class TestDiagnosticIdentifiesTheFailingRow:
     # 이 파일의 docstring 이 세 번 반복해 적은 원칙("등가를 측정할 때도 입력이 그 변이가
     # 건드리는 축을 갈라야 한다")을 **그 원칙을 적은 테스트 자신이** 또 어겼다.
     # 이번이 네 번째다. 축을 가르는 입력은 "동시에 여러 개가 빈 행"이다.
+    @pytest.mark.parametrize("rid", ["row-1", 12345, 3.5])
     @pytest.mark.parametrize("validator,builder,kind,keys", [
         (validate_node, _node, "노드", ("id", "label", "node_type", "space")),
         (validate_edge, _edge, "엣지", ("id", "source_id", "target_id", "label")),
         (validate_chunk, _chunk, "청크", ("id", "document_id", "text")),
     ])
     def test_first_declared_missing_field_is_the_one_reported(
-            self, validator, builder, kind, keys):
+            self, validator, builder, kind, keys, rid):
         """여러 필수 필드가 동시에 비면 **선언 순서상 첫 번째**를 보고한다.
 
         운영자가 수만 행을 고칠 때 "어느 필드부터 채우라"는 지시가 행마다 달라지면
@@ -279,7 +286,7 @@ class TestDiagnosticIdentifiesTheFailingRow:
             for combo in itertools.combinations(keys, r):
                 first = combo[0]          # combinations 는 입력 순서를 보존한다
                 row = builder()
-                row["id"] = "row-1"
+                row["id"] = rid
                 for k in combo:
                     row[k] = None
                 with pytest.raises(PackSchemaError) as ei:
@@ -288,12 +295,20 @@ class TestDiagnosticIdentifiesTheFailingRow:
                 assert ei.value.missing_field == first, (
                     f"{kind}: {list(combo)} 가 동시에 비었는데 {ei.value.missing_field!r} 를 "
                     f"보고했다 — 필수키 선언 순서 {keys} 와 어긋난다")
-                # id 자체가 빈 조합이면 row_id 는 None 이 맞다(그 행에 id 가 없으므로).
-                want_rid = None if "id" in combo else "row-1"
-                assert ei.value.row_id == want_rid, (
+                # 기대값을 **입력 행에서 직접 유도한다.** 앞선 판은 `"row-1"` 리터럴을
+                # 특례 계산으로 박았고, 그래서 `row_id` 를 `isinstance(str)` 일 때만
+                # 유지하는 변이가 129 passed 를 그대로 통과했다(적대 검증 실증,
+                # 2026-08-10: W3). `{"id": 12345}` 는 정상 JSON 이고 팩토리도
+                # `row_id: Any` 로 받는다 — 문자열은 이 축의 한 점일 뿐이었다.
+                #
+                # 타입을 열거로 늘리면(12345, 3.5, Decimal, bytes …) 네 번째 점 수정이
+                # 된다. `row` 는 **테스트가 만든 입력**이므로 여기서 유도해도 자기참조가
+                # 아니다 — 자기참조의 기준은 "기대값이 검증 대상에서 왔는가"다.
+                assert ei.value.row_id == row.get("id"), (
                     f"{kind}: {list(combo)} 에서 row_id 가 {ei.value.row_id!r} — "
                     f"어느 행이 문제인지 잃는다")
-                assert str(ei.value) == f"{kind}에 필수 필드 {first!r} 가 없다: {want_rid!r}"
+                assert str(ei.value) == (
+                    f"{kind}에 필수 필드 {first!r} 가 없다: {row.get('id')!r}")
         # 루프가 0회 돌면 위 단언이 **하나도 실행되지 않고** 통과한다.
         want_seen = sum(1 for r in range(2, len(keys) + 1)
                         for _ in itertools.combinations(keys, r))
@@ -385,6 +400,84 @@ class TestMissingRequiredTemplate:
         # 아니다 — 문구를 베껴 쓰면 반드시 소스에 한 벌 더 나타난다.
         assert src.count("필수 필드 {key!r}") == 1, \
             "필수필드 문구는 팩토리에만 있어야 한다 — 호출부가 직접 쓰면 속성과 어긋난다"
+
+
+class TestOnlyPackSchemaErrorEscapes:
+    """어떤 dict 를 넣어도 `PackSchemaError` 외의 예외가 새면 안 된다.
+
+    진단 문구가 `row['id']` 첨자를 쓰던 시절, **검사 순서를 바꾸는 리팩터만으로**
+    `PackSchemaError` 가 `KeyError` 로 바뀌었다. 그런데 스위트는 129 passed 를 그대로
+    유지했다(적대 검증 실증, 2026-08-10: W8b):
+
+        엣지 stray 검사를 필수 루프보다 앞으로 옮김 + id 키 없는 행
+        -> BASELINE  PackSchemaError("엣지에 필수 필드 'id' 가 없다: None")
+        -> 변이 후    KeyError: 'id'
+
+    같은 실패 모드를 이 파일 위쪽(`schema.py` 필수 루프 주석)이 이미 문서화했는데,
+    그 교훈이 **한 자리에만** 적용되고 형제 raise 7자리는 첨자 그대로였다. 결함을 고치면
+    형제 경로도 같은 패턴인지 검사한다는 규율의 미적용이다. 이제 8첨자를 `.get` 으로
+    바꿨고, 되돌리지 못하도록 여기서 불변식을 건다 — 검사 **순서와 무관하게** 성립한다.
+
+    입력에는 반드시 **id 키가 없으면서 stray 키가 있는 행**과 **id 키가 없으면서
+    properties 가 비 dict 인 행**이 들어가야 한다. 그 둘이 없으면 이 테스트도 장식이다.
+    """
+
+    def _rows(self, base, struct_key, extra_bad):
+        rows = []
+        for drop in (None, "id"):
+            for variant in ({}, {"낯선키": 1}, extra_bad, {"낯선키": 1, **extra_bad}):
+                row = base()
+                row.update(variant)
+                if drop:
+                    row.pop(drop, None)
+                rows.append(row)
+        # 필수 필드가 전부 빈 극단
+        empty = base()
+        for k in struct_key:
+            empty[k] = None
+        rows.append(empty)
+        return rows
+
+    @pytest.mark.parametrize("validator,base,keys,bad", [
+        (validate_node, _node, ("id", "label", "node_type", "space"),
+         {"properties": "dict 아님"}),
+        (validate_edge, _edge, ("id", "source_id", "target_id", "label"),
+         {"properties": "dict 아님"}),
+        (validate_chunk, _chunk, ("id", "document_id", "text"),
+         {"metadata": "dict 아님"}),
+    ])
+    def test_no_other_exception_type_escapes(self, validator, base, keys, bad):
+        for row in self._rows(base, keys, bad):
+            try:
+                validator(row)
+            except PackSchemaError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - 계약 위반을 잡는 것이 목적
+                pytest.fail(
+                    f"{type(exc).__name__}: {exc} — 계약은 PackSchemaError 뿐이다. "
+                    f"입력 행: {row!r}")
+
+    def test_diagnostics_never_subscript_the_row(self):
+        """소스에도 못을 박는다 — 새 raise 가 첨자를 들고 들어오는 것을 막는다.
+
+        위 행동 테스트는 **내가 넣은 입력 조합**만 본다. 새로 생긴 검사가 다른 키를
+        첨자로 읽으면 그 조합을 안 넣은 한 안 걸린다. 구조로도 건다.
+        """
+        import ast
+        import pathlib as _pl
+
+        import opencrab.pack.schema as m
+        src = _pl.Path(m.__file__).read_text(encoding="utf-8")
+        bad = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Raise):
+                continue
+            for x in ast.walk(node):
+                if isinstance(x, ast.Subscript) and isinstance(x.value, ast.Name):
+                    bad.append(f"L{node.lineno}: {ast.unparse(x)}")
+        assert not bad, (
+            "진단 문구가 행을 첨자로 읽는다 — 그 키가 없으면 KeyError 로 계약이 깨진다. "
+            "`.get()` 을 써라:\n  " + "\n  ".join(bad))
 
 
 class TestValidateNode:

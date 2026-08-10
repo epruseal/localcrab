@@ -359,16 +359,16 @@ def validate_node(row: dict[str, Any], *, allow_legacy_top_level: bool = True) -
             raise PackSchemaError.missing_required("노드", key, row.get("id"))
     if row["space"] not in ALL_SPACES:
         raise PackSchemaError(
-            f"노드 {row['id']!r} 의 space {row['space']!r} 가 9-space 밖이다: {ALL_SPACES}")
+            f"노드 {row.get('id')!r} 의 space {row.get('space')!r} 가 9-space 밖이다: {ALL_SPACES}")
     props = row.get("properties")
     if props is not None and not isinstance(props, dict):
         raise PackSchemaError(
-            f"노드 {row['id']!r} 의 properties 가 dict 가 아니다: {type(props).__name__}")
+            f"노드 {row.get('id')!r} 의 properties 가 dict 가 아니다: {type(props).__name__}")
     if not allow_legacy_top_level:
         stray = stray_top_level_keys(row)
         if stray:
             raise PackSchemaError(
-                f"노드 {row['id']!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
+                f"노드 {row.get('id')!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
                 ' 커스텀 필드는 중첩 "properties" 에 넣어야 적재기가 읽는다.')
 
 
@@ -380,11 +380,11 @@ def validate_edge(row: dict[str, Any]) -> None:
     props = row.get("properties")
     if props is not None and not isinstance(props, dict):
         raise PackSchemaError(
-            f"엣지 {row['id']!r} 의 properties 가 dict 가 아니다: {type(props).__name__}")
+            f"엣지 {row.get('id')!r} 의 properties 가 dict 가 아니다: {type(props).__name__}")
     stray = {k for k in row if k not in EDGE_STRUCT_KEYS}
     if stray:
         raise PackSchemaError(
-            f"엣지 {row['id']!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
+            f"엣지 {row.get('id')!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
             "엣지에는 레거시 흡수 경로가 없다 — properties 에 넣어라.")
 
 
@@ -396,11 +396,11 @@ def validate_chunk(row: dict[str, Any]) -> None:
     meta = row.get("metadata")
     if meta is not None and not isinstance(meta, dict):
         raise PackSchemaError(
-            f"청크 {row['id']!r} 의 metadata 가 dict 가 아니다: {type(meta).__name__}")
+            f"청크 {row.get('id')!r} 의 metadata 가 dict 가 아니다: {type(meta).__name__}")
     stray = {k for k in row if k not in CHUNK_STRUCT_KEYS}
     if stray:
         raise PackSchemaError(
-            f"청크 {row['id']!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
+            f"청크 {row.get('id')!r} 최상위에 비구조 키 {sorted(stray)} 가 있다. "
             "청크에는 레거시 흡수 경로가 없다 — metadata 에 넣어라.")
 
 
