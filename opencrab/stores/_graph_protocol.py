@@ -444,9 +444,9 @@ class GraphStoreExtended(Protocol):
             simulations".
         NOT in the domain at all, so not an exclusion: the vector stores.
         ``ChromaStore``, ``PgVectorStore`` and ``SqliteVecStore`` have no
-        ``limit`` parameter anywhere -- their top-k bound is ``n_results``,
-        a distinct parameter with distinct semantics (candidates to score,
-        not rows to return), so this contract has nothing to say about it.
+        ``limit`` parameter anywhere -- they bound top-k with ``n_results``.
+        That is a different parameter, so this contract says nothing about
+        it either way; it is not an exclusion, it is out of scope.
         A future round extending this contract to one of those must add it
         to this enumeration, not just fix the code.
         """
