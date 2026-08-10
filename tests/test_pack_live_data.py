@@ -157,96 +157,167 @@ class TestVerdictEqualsIsDir:
         assert len(verdicts) == len(_CORPUS) >= 15, f"코퍼스 {len(verdicts)}행"
 
 
-class TestGuardDependsOnNothingButThatOneValue:
-    """**출처·조건 축**은 값 코퍼스로 못 잡는다 — 모듈 전체를 봉인해 닫는다.
+def _run_guard_out_of_process(value, *, env=None, argv=(), flags=(), pre=""):
+    """가드를 **별도 프로세스**에서 돌려 수용/거부를 관측한다.
 
-    앞선 판은 `require_live_data` **함수 본문만** AST 로 봤다. 그래서 스코프 밖의
-    형태가 전부 통과했다(적대 검증 실증, 2026-08-10: N1~N4·N11). 7종 전원 진짜 확대다:
+    소스를 문법으로 검사하던 판은 우회가 끝이 없었다. `os.environ` 이라는 attr 모양,
+    `sys` 라는 이름, 노드 종류 — 파이썬으로 같은 일을 하는 문법은 값 변형만큼 무한하다
+    (적대 검증 실증, 2026-08-10: M1~M11 전원 통과). 값 축에서 오라클이 한 일을
+    출처 축에서는 이 함수가 한다 — **문법이 아니라 결과를 본다.**
 
-        모듈 최상위 SKIP 백도어    없는 경로 + SKIP=1        -> REJECT 였던 것이 ACCEPT
-        헬퍼 함수 간접 폴백        미설정 + DATA_DIR=실재     -> REJECT 였던 것이 ACCEPT
-        pytest 감지 백도어        없는 경로(운영 환경)        -> REJECT 였던 것이 ACCEPT
-        sys.argv 백도어          없는 경로 + argv --force   -> REJECT 였던 것이 ACCEPT
-
-    **`pytest` 감지가 최악이다.** `if "pytest" not in sys.modules: return` 한 줄이면
-    가드가 **운영에서만 통째로 무효**가 되는데 스위트는 초록이다 — 테스트 안에서는 항상
-    pytest 가 있으므로 오라클이 원리적으로 못 본다.
-
-    그래서 세 규칙으로 **모듈 전체**를 봉인한다. 셋 다 값 축을 건드리지 않으므로
-    `Path(d).absolute()`·`os.stat` 같은 정상 리팩터는 계속 산다.
+    서브프로세스인 것이 결정적이다. `if "pytest" not in sys.modules: return` 처럼
+    **테스트 안에서만 동작하는 가드**가 원리적으로 불가능해진다.
     """
+    import json as _json
+    import os as _os
+    import subprocess
+    import sys as _sys
+
+    import opencrab.pack.live_data as _m
+    root = str(pathlib.Path(_m.__file__).resolve().parents[2])
+    script = (
+        f"{pre}\n"
+        "import sys, json\n"
+        "from opencrab.pack.live_data import require_live_data\n"
+        "try:\n"
+        "    require_live_data('load_nodes')\n"
+        "    print(json.dumps({'accept': True}))\n"
+        "except SystemExit as e:\n"
+        "    print(json.dumps({'accept': False, 'msg': str(e)}))\n"
+    )
+    child = dict(_os.environ)
+    child.pop("OPENCRAB_SKIP_LIVE_GUARD", None)
+    if value is None:
+        child.pop("LOCAL_DATA_DIR", None)      # 미설정 — 폴백 분기에 닿는 유일한 맥락
+    else:
+        child["LOCAL_DATA_DIR"] = value
+    child["PYTHONPATH"] = root + _os.pathsep + child.get("PYTHONPATH", "")
+    child["PYTHONDONTWRITEBYTECODE"] = "1"
+    child.update(env or {})
+    out = subprocess.run(
+        [_sys.executable, "-B", *flags, "-c", script, *argv],
+        capture_output=True, text=True, env=child, timeout=60,
+    )
+    line = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
+    assert line, f"자식 프로세스가 판정을 안 냈다: rc={out.returncode} err={out.stderr[:400]}"
+    return _json.loads(line[-1])["accept"]
+
+
+class TestVerdictIsInvariantAcrossExecutionContexts:
+    """**가드의 판정은 `LOCAL_DATA_DIR` 값에만 의존한다.**
+
+    값 축은 오라클이 닫았다. 이 축은 "값이 아니라 **실행 맥락**으로 분기하는" 형태이고,
+    어떤 값 코퍼스로도 원리적으로 못 잡는다. 앞선 판은 소스를 AST 로 봉인해 닫으려
+    했는데 문법 우회가 11종 전부 통과했다(2026-08-10: M1~M11). 그중:
+
+        platform.system() == "Linux" 면 return
+        -> macOS 개발기 스위트는 초록, **Linux 운영기에서만 가드가 통째로 무효**
+        from sys import argv 로 --force 백도어      import sys as _s 로 pytest 감지
+        from os import environ / getattr(os,"environ") / os.environ.copy() / os.environb
+        다른 모듈에 백도어를 두고 import              ClassDef 본문 · 기본인자 평가 · __debug__
+
+    문법을 열거하는 대신 **결과를 관측**한다. 맥락 6종 × 값 3종 = 18 케이스로 유한하고,
+    다음에 나올 새 우회 문법도 자동으로 걸린다.
+    """
+
+    @staticmethod
+    def _values(tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        afile = tmp_path / "afile"
+        afile.write_text("x")
+        return {"실재 디렉터리": str(real), "없는 경로": str(tmp_path / "nope"),
+                "파일": str(afile)}
+
+    def test_unset_stays_rejected_even_when_other_env_points_somewhere_real(self, tmp_path):
+        """`LOCAL_DATA_DIR` 미설정이면 **다른 env 가 실재를 가리켜도** 거부다.
+
+        폴백 분기(`environ.get(K) or environ.get("DATA_DIR")`)는 그 키가 **없을 때만**
+        닿는다. 위 맥락들은 값을 항상 설정하므로 폴백에 도달하지 못한다
+        (자체 측정: `from os import environ` 폴백이 82 passed 로 생존).
+        """
+        real = tmp_path / "real"
+        real.mkdir()
+        for other in ("DATA_DIR", "OPENCRAB_DATA_DIR", "HOME"):
+            assert _run_guard_out_of_process(None, env={other: str(real)}) is False, (
+                f"{other} 가 실재를 가리킨다고 미설정이 통과했다 — 폴백 키가 끼어 있다")
+
+    @pytest.mark.parametrize("value_kind", ["실재 디렉터리", "없는 경로", "파일"])
+    @pytest.mark.parametrize("ctx", [
+        "기준", "무관 env 대량", "argv 잡음", "최적화 모드", "platform=Linux", "hostname 변조",
+    ])
+    def test_verdict_matches_the_oracle_in_every_context(self, ctx, value_kind, tmp_path):
+        vals = self._values(tmp_path)
+        value = vals[value_kind]
+        opts = {
+            "기준": {},
+            "무관 env 대량": {"env": {"DATA_DIR": vals["실재 디렉터리"],
+                                    "OPENCRAB_SKIP_LIVE_GUARD": "1",
+                                    "OPENCRAB_FORCE": "1"}},
+            "argv 잡음": {"argv": ["--force", "--yes"]},
+            "최적화 모드": {"flags": ["-O"]},
+            "platform=Linux": {"pre": "import platform; platform.system = lambda: 'Linux'"},
+            "hostname 변조": {"pre": "import socket; socket.gethostname = lambda: 'prod-01'"},
+        }[ctx]
+        got = _run_guard_out_of_process(value, **opts)
+        assert got is _oracle(value), (
+            f"맥락 {ctx!r} 에서 판정이 갈렸다 — 가드가 값 이외의 것에 의존한다. "
+            f"값={value_kind} 기대={_oracle(value)} 실제={got}")
+
+
+class TestSourceSealingWhitelist:
+    """소스 봉인은 **화이트리스트**로 한다 — 블랙리스트는 새 문법이 계속 샌다.
+
+    앞선 판은 `environ` 이라는 attr, `sys` 라는 이름, 실행문이라는 노드 종류를
+    **금지**했다. 파이썬은 같은 일을 다른 문법으로 하는 방법이 무한하므로 그 방식은
+    끝나지 않는다(M1~M11). 허용 집합은 유한하고, 정당한 리팩터가 새 이름을 필요로 하면
+    **그때 한 줄 추가하며 리뷰가 발생한다** — 이게 결정적 차이다.
+
+    위 실행 맥락 불변성이 주 방어고, 이 검사는 심층 방어다.
+    """
+
+    _ALLOWED_IMPORTS = {"os", "sys", "pathlib", "__future__"}
 
     @staticmethod
     def _tree():
         import opencrab.pack.live_data as m
         return ast.parse(pathlib.Path(m.__file__).read_text(encoding="utf-8"))
 
-    @staticmethod
-    def _is_environ(node) -> bool:
-        return isinstance(node, ast.Attribute) and node.attr == "environ"
+    def test_only_expected_modules_are_imported(self):
+        got = set()
+        for n in ast.walk(self._tree()):
+            if isinstance(n, ast.Import):
+                got |= {a.name.split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                got.add(n.module.split(".")[0])
+        extra = sorted(got - self._ALLOWED_IMPORTS)
+        assert not extra, (
+            f"허용 밖 모듈을 import 한다: {extra}. 허용 집합은 {sorted(self._ALLOWED_IMPORTS)} — "
+            "정당한 필요라면 이 목록에 추가하되 **왜 필요한지 리뷰를 받아라**. "
+            "`platform`·`socket` 같은 실행 맥락 모듈이 여기서 걸린다")
 
-    @classmethod
-    def _env_reads(cls, tree):
-        """env 접근 **노드에서만** 키를 뽑는다.
+    def test_top_level_assignments_are_literal_only(self):
+        """최상위 할당은 **우변이 리터럴일 때만** 허용한다.
 
-        앞선 판은 함수 안 **모든 Call 의 문자열 상수**를 env 키로 수집하고 `X.environ`
-        속성만 읽기로 셌다. 그래서 `os.environ.get(키, "")` 의 **기본값**과 무관한
-        함수의 인자가 키로 오판되고, `os.getenv(키)` 는 0회로 세어져 **진성 등가 3종이
-        죽었다**(적대 검증 실증, 2026-08-10: EQ1·EQ2·B2'). 과잉 계약은 정상 리팩터를
-        막으므로 미검출만큼이나 나쁘다.
+        노드 **종류**로 금지하던 판은 `__all__ = [...]`·메시지 상수·`if TYPE_CHECKING:`
+        같은 표준 관용구까지 막았다(적대 검증 지적: C1·C2·C7 — 백도어 위험 0인데 거부).
+        우변의 성질로 판정하면 그것들은 살아나고 `_SKIP = os.environ.get(...)` 은 계속 죽는다.
         """
-        out = []
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
-                if n.func.attr == "get" and cls._is_environ(n.func.value):
-                    out.append(n.args[0] if n.args else None)          # os.environ.get("K")
-                elif n.func.attr == "getenv":
-                    out.append(n.args[0] if n.args else None)          # os.getenv("K")
-            elif isinstance(n, ast.Subscript) and cls._is_environ(n.value):
-                out.append(n.slice)                                    # os.environ["K"]
-        return out
-
-    def test_environ_is_read_once_with_one_key_module_wide(self):
-        """모듈 **전체**에서 env 접근 1회, 키는 `LOCAL_DATA_DIR` 하나."""
-        reads = self._env_reads(self._tree())
-        keys = [n.value if isinstance(n, ast.Constant) else ast.unparse(n) for n in reads]
-        assert len(reads) == 1, (
-            f"모듈 전체에서 env 를 {len(reads)}회 읽는다 — 폴백 키나 백도어가 끼어들 "
-            f"자리다: {keys}")
-        assert keys == ["LOCAL_DATA_DIR"], f"env 키가 하나가 아니다: {keys}"
-
-    def test_sys_is_used_only_to_exit(self):
-        """`sys` 는 `sys.exit` 로만 쓴다 — `sys.modules`·`sys.argv` 분기 금지.
-
-        그 둘은 **값이 아니라 실행 맥락**으로 분기하게 만든다. 테스트 안과 운영에서
-        다르게 동작하는 가드는 어떤 값 검사로도 잡을 수 없다.
-        """
-        used = sorted({
-            n.attr for n in ast.walk(self._tree())
-            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
-            and n.value.id == "sys"
-        })
-        assert used == ["exit"], (
-            f"sys 를 exit 외로 쓴다: {used} — 실행 맥락으로 분기하면 테스트 안에서만 "
-            "동작하는 가드가 된다")
-
-    def test_module_top_level_has_no_executable_statements(self):
-        """최상위에 docstring·import·def 외의 실행문이 없다.
-
-        모듈 상수 백도어와 메모 캐시가 끼어드는 자리다. 최상위 할당 하나면
-        `_SKIP = os.environ.get(...)` 로 위 두 검사를 우회할 수 있다.
-        """
-        allowed = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
-                   ast.ClassDef)
-        stray = []
-        for i, node in enumerate(self._tree().body):
-            if isinstance(node, allowed):
+        bad = []
+        for node in self._tree().body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
-            if i == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-                continue                                   # 모듈 docstring
-            stray.append(f"L{node.lineno}: {ast.unparse(node)[:60]}")
-        assert not stray, "최상위 실행문이 있다 — 백도어·캐시가 끼어드는 자리다:\n  " + \
-            "\n  ".join(stray)
+            rhs = node.value
+            if rhs is None:
+                continue
+            if any(isinstance(x, (ast.Call, ast.Attribute, ast.Name))
+                   for x in ast.walk(rhs)):
+                bad.append(f"L{node.lineno}: {ast.unparse(node)[:70]}")
+        assert not bad, (
+            "최상위 할당의 우변이 리터럴이 아니다 — 백도어·캐시가 끼어드는 자리다.\n  "
+            + "\n  ".join(bad)
+            + "\n허용: docstring · from __future__ · import · def · class · "
+              "리터럴 할당 · if TYPE_CHECKING 블록")
 
 
 class TestRejectsUnusableTargets:
