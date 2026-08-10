@@ -92,6 +92,11 @@ PACK_SUITES: dict[str, tuple[str, ...]] = {
     "opencrab/pack/assembler.py": ("tests/test_pack_assembler.py",),
     "opencrab/pack/neo4j_export.py": ("tests/test_pack_neo4j_export.py",),
     "opencrab/pack/cloud.py": ("tests/test_pack_cloud.py",),
+    "opencrab/pack/live_data.py": ("tests/test_pack_live_data.py",),
+    "opencrab/pack/load.py": ("tests/test_pack_load.py",),
+    "opencrab/pack/gates/score.py": ("tests/test_pack_gates_score.py",),
+    "opencrab/pack/gates/dangling.py": ("tests/test_pack_gates_dangling.py",),
+    "opencrab/pack/gates/grammar_fit.py": ("tests/test_pack_gates_grammar_fit.py",),
 }
 
 PY = sys.executable
@@ -576,8 +581,21 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
 
 
 def _all_targets(clone: Path) -> list[tuple[str, tuple[str, ...]]]:
-    """`opencrab/pack/` 전 모듈. 등록되지 않은 모듈이 있으면 **죽는다**(RC1 폐쇄)."""
-    found = {f"opencrab/pack/{p.name}" for p in (clone / "opencrab/pack").glob("*.py")
+    """`opencrab/pack/` 전 모듈. 등록되지 않은 모듈이 있으면 **죽는다**(RC1 폐쇄).
+
+    **`rglob` 인 이유 — RC1 이 하위 패키지로 재발했다(2026-08-10).** 종전 `glob("*.py")`
+    는 한 층만 봤다. 게이트가 `opencrab/pack/gates/` 로 들어오자 세 모듈이 `--all` 에서
+    **조용히 사라졌다** — 같은 라운드에 미등록된 `load.py`·`live_data.py` 는 큰 소리로
+    죽었는데(둘 다 한 층 위) `gates/` 는 한마디도 안 나왔다. 이 도구가 자기 docstring 에
+    RC2("조용한 0")로 적어 둔 바로 그 형태다. 열거 대상의 **깊이**를 한 점에 고정해 둔 것이
+    원인이고, 이 프로젝트가 반복해 온 "축을 열어 놓고 그 위 한 점만 고정"과 같은 클래스다.
+
+    재발하면 다시 조용해지지 않는다: 하위 패키지 모듈이 `PACK_SUITES` 에 **등록돼 있으므로**,
+    누가 `rglob` 을 `glob` 으로 되돌리면 아래 `gone` 검사가 "파일이 없다"로 죽는다.
+    등록 그 자체가 실명 방지 장치다.
+    """
+    pack = clone / "opencrab/pack"
+    found = {p.relative_to(clone).as_posix() for p in pack.rglob("*.py")
              if p.name != "__init__.py"}
     missing = sorted(found - set(PACK_SUITES))
     if missing:
