@@ -83,10 +83,21 @@ class TestUsesTheCanonicalResolvers:
 
 class TestPrediction:
     def test_clean_pack_passes(self):
-        nodes = [_n("a"), _n("b")]
-        r = gf.predict_grammar_fit(nodes, [_e("a", "b", "RELATES_TO")])
-        assert r["total_edges"] == 1
-        assert r["pass"] is (r["violations"] == 0 and r["missing_endpoint"] == 0)
+        """기대값을 **리터럴로** 적는다.
+
+        1판은 `r["pass"] is (r["violations"] == 0 and ...)` 였다 — 반환값끼리 대사하는
+        항등식이라 **정합 판정문 자체를 지워도** 통과한다(스윕 실측: `del-stmt:If@L81`
+        생존). 자기참조 테스트는 통과 개수만 늘린다.
+
+        리터럴로 바꾸자마자 **픽스처 자신의 결함**이 드러났다: 1판이 쓰던 `RELATES_TO` 는
+        concept->concept 허용 목록(`depends_on`·`influences`·`part_of`·`related_to`·
+        `subclass_of`)에 없어서 "clean pack" 이 실은 미정합 1건이었다. 자기참조 단언이
+        그것을 몇 라운드 동안 가리고 있었다.
+        """
+        nodes = [_n("a"), _n("b")]           # 둘 다 concept
+        r = gf.predict_grammar_fit(nodes, [_e("a", "b", "related_to")])
+        assert (r["total_edges"], r["violations"], r["missing_endpoint"]) == (1, 0, 0)
+        assert r["pass"] is True
 
     def test_missing_endpoint_is_counted_separately_not_as_violation(self):
         """endpoint 누락은 정합 판정 **대상 밖**이다.
@@ -164,3 +175,79 @@ class TestReturnContract:
         r = gf.predict_grammar_fit(nodes, [_e("a", "b", "없는관계"), _e("a", "유령", "CITES")])
         assert (r["total_edges"], r["violations"], r["missing_endpoint"]) == (1, 1, 1)
         assert r["detail"] == "엣지 1건 중 grammar 미정합 1건, endpoint 누락 1건"
+
+
+class TestNodeFieldDefaults:
+    """노드에 필드가 **없을 때**의 기본값도 계약이다.
+
+    실팩에는 `space`·`node_type` 이 빠진 노드가 있다. 기본값이 바뀌면 그 노드들의
+    effective space 가 통째로 달라져 정합 판정이 뒤집힌다. 모든 픽스처가 두 필드를
+    갖고 있으면 이 축은 영영 안 갈린다(스윕 실측: `drop-get-default@L47,L48` 생존).
+    """
+
+    @pytest.mark.parametrize("row,why", [
+        ({"id": "x", "label": "x"}, "둘 다 없음 -> concept/Concept"),
+        ({"id": "x", "label": "x", "node_type": "Concept"}, "space 없음 -> concept"),
+        ({"id": "x", "label": "x", "space": "concept"}, "node_type 없음 -> Concept"),
+    ], ids=["both-absent", "no-space", "no-node-type"])
+    def test_absent_fields_fall_back_to_concept(self, row, why):
+        got = gf.effective_spaces([row])["x"]
+        assert got == resolve_node_space_type("concept", "Concept")[0], why
+
+    def test_present_space_is_not_overridden_by_the_default(self):
+        """기본값이 실제 값을 덮으면 안 된다 — `"space"` 키 이름이 깨지면 그렇게 된다."""
+        got = gf.effective_spaces([_n("c1", space="claim")])["c1"]
+        assert got == resolve_node_space_type("claim", "Concept")[0]
+        assert got != resolve_node_space_type("concept", "Concept")[0], (
+            "전제: claim 과 concept 의 effective space 가 달라야 이 검사가 유효하다")
+
+    def test_present_node_type_is_not_overridden_by_the_default(self):
+        got = gf.effective_spaces([{"id": "d1", "label": "d1",
+                                    "space": "resource", "node_type": "Document"}])["d1"]
+        assert got == resolve_node_space_type("resource", "Document")[0]
+
+
+class TestBulkImportEdgeKeys:
+    """엣지 라벨도 두 관례가 섞여 있다. `relation` 을 못 읽으면 라벨이 `""` 이 되어
+    **전 엣지가 미정합**으로 잡힌다(스윕 실측: `const:'relation'->''@L75` 생존)."""
+
+    def test_relation_key_is_read_when_label_absent(self):
+        nodes = [_n("a"), _n("b")]
+        e = {"id": "e1", "source_id": "a", "target_id": "b", "relation": "related_to"}
+        r = gf.predict_grammar_fit(nodes, [e])
+        assert (r["total_edges"], r["violations"]) == (1, 0), \
+            "relation 을 못 읽어 라벨이 빈 문자열이 됐다"
+
+
+class TestFitsIsTheVerdictNotEdgeAllowed:
+    """정합 판정은 `fits` 다 — `edge_allowed` 로 바꿔치면 **반전 관계**에서 갈린다.
+
+    스윕 실측: `call-target:fits->edge_allowed@L81` 생존. 두 함수는 대칭 공간쌍에서
+    같은 답을 내므로 비대칭·반전 관계를 써야 축이 갈린다.
+    """
+
+    def test_reversed_relation_is_fit_and_counted_as_such(self):
+        nodes = [_n("c1", space="claim"), _n("e1", space="evidence")]
+        _a, _rel, _b, reversed_ = resolve_edge("EVIDENCED_BY", "claim", "evidence")
+        assert reversed_ is True, "전제: 반전 관계여야 한다"
+        r = gf.predict_grammar_fit(nodes, [_e("c1", "e1", "EVIDENCED_BY")])
+        assert (r["total_edges"], r["violations"]) == (1, 0), \
+            "반전 관계를 미정합으로 셌다 — 판정 함수가 정본이 아니다"
+        assert r["pass"] is True
+
+
+class TestAllowedIsNoneWhenNothingIsAllowed:
+    """허용 relation 이 **하나도 없는** 공간쌍은 `None` 이다(빈 리스트가 아니다).
+
+    빈 리스트와 `None` 은 호출자에게 다른 뜻이다 — 전자는 "목록이 비었다", 후자는
+    "이 방향은 아예 불가"다. 스윕 실측: `drop-or-default@L89` 생존.
+    """
+
+    def test_detail_allowed_is_none_for_a_forbidden_direction(self):
+        nodes = [_n("e1", space="evidence"), _n("s1", space="subject")]
+        r = gf.predict_grammar_fit(nodes, [_e("e1", "s1", "아무관계")])
+        assert r["violations"] == 1
+        d = r["violations_detail"][0]
+        assert (d["from_space"], d["to_space"]) == ("evidence", "subject")
+        assert d["allowed"] is None, (
+            f"허용이 없는 방향인데 {d['allowed']!r} — 빈 리스트와 None 은 다른 뜻이다")
