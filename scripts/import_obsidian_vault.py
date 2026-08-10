@@ -11,6 +11,7 @@ from typing import Any
 
 from opencrab.common.ids import stable_id
 from opencrab.common.text import slugify as _common_slugify
+from opencrab.locking import write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.stores.local_doc_store import LocalDocStore
 from opencrab.stores.neo4j_store import Neo4jStore
@@ -176,9 +177,13 @@ def excerpt(text: str, limit: int = 1200) -> str:
     return compact[:limit]
 
 
-def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
-    files = sorted(vault_root.rglob("*.md"))
-    notes = [build_note_record(vault_root, path) for path in files]
+def _collect_notes(vault_root: Path) -> list[NoteRecord]:
+    """Read and parse the vault without holding the shared write lock."""
+    return [build_note_record(vault_root, path) for path in sorted(vault_root.rglob("*.md"))]
+
+
+def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path, notes: list[NoteRecord] | None = None) -> dict[str, int]:
+    notes = notes if notes is not None else _collect_notes(vault_root)
     workspace_id = vault_workspace_id(vault_root)
 
     note_by_rel = {note.rel_path[:-3] if note.rel_path.endswith(".md") else note.rel_path: note for note in notes}
@@ -421,6 +426,15 @@ def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_passwo
         "tag_topics": len(tag_names),
         "unresolved_link_topics": len(unresolved_links),
     }
+
+
+def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
+    """Import one vault under the same cross-process write boundary as APIs."""
+    notes = _collect_notes(vault_root)
+    with write_lock(str(local_data_dir)):
+        return _import_vault_unlocked(
+            vault_root, neo4j_uri, neo4j_user, neo4j_password, neo4j_database, local_data_dir, notes
+        )
 
 
 def main() -> None:

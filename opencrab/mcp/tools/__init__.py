@@ -67,11 +67,11 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
-import fcntl
-import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
+
+from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
@@ -98,21 +98,29 @@ def _lock_data_dir() -> str:
     대비해, 반환 전 os.makedirs(exist_ok=True)로 생성을 보장한다(락 파일 open()이
     FileNotFoundError로 죽는 것을 방지).
     """
-    data_dir = os.environ.get("LOCAL_DATA_DIR")
-    if not data_dir:
-        from opencrab.config import get_settings
-
-        data_dir = get_settings().local_data_dir
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    return lock_data_dir()
 
 
 def _acquire_chroma_shared_lock() -> None:
+    """Hold a shared lock on chroma.lock for the server's lifetime.
+
+    ``shared=True`` is a real ``LOCK_SH`` on POSIX, letting several local
+    chroma-backed processes hold it concurrently, but ``opencrab.locking``
+    emulates it as an exclusive byte-range lock on Windows (msvcrt has no
+    reader/writer lock), so two local chroma processes on Windows would
+    block each other rather than share (issue #140).
+
+    Only MCP takes this lock. The REST app and the migration script open
+    local chroma clients without it, so the exclusion it is meant to
+    provide does not actually hold -- also issue #140, which is where the
+    ownership redesign belongs. This function deliberately keeps ``main``'s
+    semantics (one module-global handle, rebound per call) rather than
+    refcounting: #70 measured the rebinding design and found it does NOT
+    leak on CPython, and a refcount that fails to decrement on the context
+    initialisation failure path would be strictly worse.
+    """
     global _chroma_lock_fh
-    data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "chroma.lock")
-    _chroma_lock_fh = open(lock_path, "w")
-    fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
+    _chroma_lock_fh = acquire_file_lock("chroma.lock", _lock_data_dir(), shared=True)
 
 
 # WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
@@ -123,15 +131,8 @@ def _acquire_chroma_shared_lock() -> None:
 @contextmanager
 def _write_lock():
     """Hold an exclusive cross-process lock for the duration of a write tool."""
-    data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "write.lock")
-    fh = open(lock_path, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX)  # blocks until no other instance is writing
+    with file_lock("write.lock", _lock_data_dir()):
         yield
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
 
 
 def _clean_str(s: str) -> str:
