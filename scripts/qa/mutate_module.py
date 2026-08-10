@@ -91,6 +91,7 @@ PACK_SUITES: dict[str, tuple[str, ...]] = {
     "opencrab/pack/build.py": ("tests/test_pack_build.py",),
     "opencrab/pack/assembler.py": ("tests/test_pack_assembler.py",),
     "opencrab/pack/neo4j_export.py": ("tests/test_pack_neo4j_export.py",),
+    "opencrab/pack/cloud.py": ("tests/test_pack_cloud.py",),
 }
 
 PY = sys.executable
