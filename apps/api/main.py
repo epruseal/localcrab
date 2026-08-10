@@ -197,12 +197,6 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
 
 
-def _audit_event(ctx: ApiContext, event_type: str, user_id: str, details: dict[str, Any]) -> None:
-    """Protect legacy JSON and SQL audit stores across API processes."""
-    with write_lock():
-        _log_event(ctx.docs, event_type, user_id, details)
-
-
 def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, Any]) -> str | None:
     if not _docs_available(docs):
         return None
@@ -362,8 +356,8 @@ def _meter_call(ctx: ApiContext, auth: AuthContext, endpoint: str) -> None:
     if auth.tier != "api":
         return
 
-    _audit_event(
-        ctx,
+    _log_event(
+        ctx.docs,
         "api_meter",
         auth.user_id,
         {"endpoint": endpoint, "tier": auth.tier},
@@ -535,8 +529,8 @@ def ingest_text(
         else:
             result["stores"]["documents"] = "unavailable"
 
-        _audit_event(
-            ctx,
+        _log_event(
+            ctx.docs,
             "ingest",
             auth.user_id,
             {
@@ -614,8 +608,8 @@ def query_ontology(
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
-    _audit_event(
-        ctx,
+    _log_event(
+        ctx.docs,
         "query",
         auth.user_id,
         {
@@ -640,8 +634,8 @@ def analyse_impact(
             change_type=payload.change_type,
             depth=payload.depth,
         ).to_dict()
-        _audit_event(
-            ctx,
+        _log_event(
+            ctx.docs,
             "impact",
             auth.user_id,
             {

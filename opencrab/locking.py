@@ -87,9 +87,15 @@ def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             return
         except OSError as exc:
-            if deadline is not None and monotonic() >= deadline:
+            if deadline is None:
+                sleep(0.1)
+                continue
+            remaining = deadline - monotonic()
+            if remaining <= 0:
                 raise TimeoutError("timed out waiting for Windows file lock") from exc
-            sleep(0.1)
+            # Same clamp as the POSIX branch: a flat sleep(0.1) would make a
+            # timeout smaller than the poll interval overshoot by up to 100ms.
+            sleep(min(0.1, remaining))
 
 
 def _release(fh: BinaryIO) -> None:
@@ -137,29 +143,27 @@ def file_lock(
                     held[path] = (depth - 1, fh)
             return
 
-        fh = None
-        acquired = False
+        # Three failure boundaries, deliberately separate: a failed open
+        # must not close a handle that does not exist, a failed acquire
+        # must close the handle but NOT unlock a region it never owned,
+        # and a successful acquire must always unlock and close. Every one
+        # of them still releases ``process_lock`` via the outer finally.
+        fh = _open_lock(path)
         try:
-            fh = _open_lock(path)
             remaining = None if deadline is None else max(0, deadline - monotonic())
             _acquire(fh, shared=shared, timeout=remaining)
-            acquired = True
-            held[path] = (1, fh)
-            try:
-                yield
-            finally:
-                held.pop(path, None)
-                if acquired:
-                    try:
-                        _release(fh)
-                    finally:
-                        fh.close()
-                else:
-                    fh.close()
         except BaseException:
-            if fh is not None and not acquired:
-                fh.close()
+            fh.close()
             raise
+        held[path] = (1, fh)
+        try:
+            yield
+        finally:
+            held.pop(path, None)
+            try:
+                _release(fh)
+            finally:
+                fh.close()
     finally:
         process_lock.release()
 

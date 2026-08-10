@@ -108,7 +108,16 @@ def _acquire_chroma_shared_lock() -> None:
     chroma-backed processes hold it concurrently, but ``opencrab.locking``
     emulates it as an exclusive byte-range lock on Windows (msvcrt has no
     reader/writer lock), so two local chroma processes on Windows would
-    block each other rather than share (see follow-up issue).
+    block each other rather than share (issue #140).
+
+    Only MCP takes this lock. The REST app and the migration script open
+    local chroma clients without it, so the exclusion it is meant to
+    provide does not actually hold -- also issue #140, which is where the
+    ownership redesign belongs. This function deliberately keeps ``main``'s
+    semantics (one module-global handle, rebound per call) rather than
+    refcounting: #70 measured the rebinding design and found it does NOT
+    leak on CPython, and a refcount that fails to decrement on the context
+    initialisation failure path would be strictly worse.
     """
     global _chroma_lock_fh
     _chroma_lock_fh = acquire_file_lock("chroma.lock", _lock_data_dir(), shared=True)

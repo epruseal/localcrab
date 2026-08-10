@@ -882,7 +882,6 @@ def packs_backfill_pack_id(
     ``--assume-pack-id X`` fills every still-empty entry with X.
     """
     from opencrab.config import get_settings
-    from opencrab.locking import write_lock
     from opencrab.ontology.pack_provenance import backfill_pack_ids, resolve_backfill_dry_run
 
     cfg = get_settings()
@@ -895,10 +894,13 @@ def packs_backfill_pack_id(
     if warning:
         console.print(f"[yellow]{warning}[/yellow]")
 
-    with write_lock():
-        summary = backfill_pack_ids(
-            db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
-        )
+    # No write_lock() here on purpose: backfill_pack_ids() takes it itself,
+    # around the write and only when there is one. Locking here as well would
+    # take an exclusive lock for --dry-run, which writes nothing, and would
+    # leave every non-CLI caller of backfill_pack_ids() unprotected.
+    summary = backfill_pack_ids(
+        db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
+    )
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:

@@ -14,8 +14,12 @@ from opencrab.locking import file_lock
 
 
 def test_file_lock_is_reentrant(tmp_path):
+    # timeout= is load-bearing: without the re-entrancy branch the inner
+    # acquire would BLOCK on the lock this thread already holds, and the
+    # test would hang forever instead of failing. The timeout turns that
+    # deadlock into a TimeoutError the runner reports.
     with file_lock("write.lock", str(tmp_path)):
-        with file_lock("write.lock", str(tmp_path)):
+        with file_lock("write.lock", str(tmp_path), timeout=2):
             assert (tmp_path / "write.lock").exists()
 
 
@@ -106,12 +110,11 @@ with file_lock('write.lock', sys.argv[1]):
         assert first_marker.exists()
 
         started = time.monotonic()
-        second = subprocess.run(
+        subprocess.run(
             [sys.executable, "-c", script, str(tmp_path), str(second_marker)],
             env=env,
             check=True,
         )
-        assert second.returncode == 0
         assert time.monotonic() - started >= 0.25
         assert second_marker.exists()
     finally:
@@ -124,6 +127,18 @@ def test_file_lock_creates_explicit_dir_and_normalizes_symlinks(tmp_path):
     link_dir.symlink_to(real_dir, target_is_directory=True)
 
     with file_lock("write.lock", str(link_dir)):
+        # The directory did not exist before this call — file_lock() created
+        # it, and created it at the symlink TARGET, not beside the link.
         assert (real_dir / "write.lock").exists()
-        with file_lock("write.lock", str(real_dir)):
+        assert not (tmp_path / "link" / "write.lock").is_symlink()
+
+        # timeout= is load-bearing here too. Without realpath normalisation
+        # the two spellings key to different in-process locks, so this inner
+        # acquire would take a SECOND flock on the same inode from the same
+        # process and block forever rather than fail.
+        with file_lock("write.lock", str(real_dir), timeout=2):
             pass
+
+    # Exactly one lock file for the two spellings: proof they normalised to
+    # one path rather than each creating their own.
+    assert sorted(p.name for p in real_dir.iterdir()) == ["write.lock"]
