@@ -390,14 +390,19 @@ class GraphStoreExtended(Protocol):
         because "every implementation" was declared twice before without
         saying what "every" enumerates, and a 5th and 6th implementation
         were found missing the guard each time it wasn't spelled out).
-        DOMAIN of this enumeration: PUBLIC methods on the classes in
-        ``opencrab/stores/*.py`` that take a parameter literally named
-        ``limit``. Private helpers inherit the status of the public method
-        that calls them and are not listed separately -- ``_expand``
-        (_sql_graph_base.py), ``_find_neighbors_1hop`` (kuzu_graph_store.py)
-        and ``_build_neighbors_cypher`` (neo4j_store.py) all take a
-        ``limit`` and are all reached only through ``find_neighbors``,
-        which is in the NOT-covered list below.
+        DOMAIN of this enumeration: PUBLIC methods on the CONCRETE backend
+        classes in ``opencrab/stores/*.py`` that take a parameter literally
+        named ``limit``. Two exclusions from that domain, both because
+        there is no code there to guard:
+          - the Protocol declarations in THIS file (``GraphStore``,
+            ``GraphStoreExtended``). Their bodies are ``...``; they state
+            the interface, and the guard lives in each implementation.
+          - private helpers, which inherit the status of the public method
+            that calls them: ``_expand`` (_sql_graph_base.py),
+            ``_find_neighbors_1hop`` (kuzu_graph_store.py) and
+            ``_build_neighbors_cypher`` (neo4j_store.py) all take a
+            ``limit`` and are each reached only through ``find_neighbors``,
+            which is in the NOT-covered list below.
         The ``limit <= 0 -> []`` contract is pinned on exactly the methods
         enumerated below, no more, no less --
           - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
