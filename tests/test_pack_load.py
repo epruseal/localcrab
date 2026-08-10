@@ -1028,3 +1028,63 @@ class TestGuardActuallyFires:
             fn(*([None] * n))
         assert "LOCAL_DATA_DIR" in str(ei.value)
         assert f"[{name}]" in str(ei.value), "어느 함수가 걸렸는지 말해야 한다"
+
+
+class TestPackLiveCountsIsTheSingleSourceOfTruth:
+    """`pack_live_counts` 가 라이브 4축 대사 SQL 의 **유일한 자리**인가.
+
+    이 쿼리는 한동안 두 벌이었다 — `incremental_finalize` 안에 한 벌, 호출자 리포의
+    대사 스크립트에 또 한 벌. 스토어 스키마가 바뀌면 한쪽만 고쳐지고, 그 어긋남은
+    "카운트가 안 맞는다"로만 보여 원인 추적이 어렵다. 스키마 세부는 스토어를 가진 쪽이
+    정본이어야 한다는 것이 이 이관의 전제다(2026-08-11 통합).
+
+    **엣지축이 왜 있는가**: 노드·문서·벡터만 대사하던 동안 by-pack 대비 미적재 엣지
+    187,069건(15팩)이 전 팩 "정상" 판정을 통과했다. 축을 하나 빼면 그 축의 결손은
+    영영 안 보인다 — 그래서 축 집합 자체를 계약으로 건다.
+    """
+
+    AXES = {"nodes", "edges", "docs", "vectors"}
+
+    def _stores(self, tmp_path):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+        return (LocalGraphStore(str(tmp_path / "graph.db")),
+                LocalSQLDocStore(str(tmp_path / "doc.db")),
+                None)
+
+    def test_returns_exactly_four_axes(self, tmp_path):
+        graph, docs, vec = self._stores(tmp_path)
+        got = pack_load.pack_live_counts("아무팩", graph, docs, vec)
+        assert set(got) == self.AXES, (
+            f"축 집합이 달라졌다: {sorted(got)} — 축을 빼면 그 축의 결손이 영영 안 보인다")
+        assert all(isinstance(v, int) for v in got.values())
+
+    def test_empty_store_is_all_zero_not_missing(self, tmp_path):
+        """없는 팩은 **0** 이다. 키가 빠지면 호출자가 KeyError 로 죽는다."""
+        graph, docs, vec = self._stores(tmp_path)
+        assert pack_load.pack_live_counts("없는팩", graph, docs, vec) \
+            == dict.fromkeys(self.AXES, 0)
+
+    def test_vector_store_without_conn_yields_zero_not_crash(self, tmp_path):
+        """벡터 백엔드가 `_conn` 을 안 내주는 경우가 있다 — 죽지 말고 0 이어야 한다."""
+        graph, docs, _ = self._stores(tmp_path)
+
+        class NoConn:
+            pass
+
+        assert pack_load.pack_live_counts("p", graph, docs, NoConn())["vectors"] == 0
+
+    def test_the_sql_lives_here_only(self):
+        """호출자가 같은 쿼리를 다시 선언하지 않는가 — **구조로** 건다.
+
+        문서에 "정본은 하나"라고 적는 것으로는 두 벌이 되는 것을 못 막는다. 실제로
+        그렇게 두 벌이 됐다. 이 모듈 안에 카운트 SQL 이 있는지만 확인하고, 호출자 쪽은
+        그 리포의 게이트가 본다(단방향 의존이라 여기서 호출자를 알 수 없다).
+        """
+        import inspect
+
+        src = inspect.getsource(pack_load.pack_live_counts)
+        for table in ("graph_nodes", "graph_edges", "doc_sources"):
+            assert f"FROM {table}" in src, f"{table} 카운트가 정본에서 사라졌다"
+        assert src.count("SELECT COUNT(*)") == 4, (
+            "카운트 쿼리 수가 4가 아니다 — 축을 늘렸으면 AXES 와 이 수도 같이 고쳐라")

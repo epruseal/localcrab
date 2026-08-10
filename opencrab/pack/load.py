@@ -47,6 +47,45 @@ def _batched(seq: list, size: int = 500):
         yield seq[i:i + size]
 
 
+def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
+    """팩 하나의 **라이브 4축 카운트**. 적재 전후 대사의 정본이다.
+
+    노드·엣지·문서·벡터를 스토어에서 직접 센다. 이 SQL 은 **스토어 스키마 세부**라
+    호출자 리포가 아니라 여기가 자리다 — 호출자가 같은 쿼리를 따로 적어 두면 스키마가
+    바뀔 때 한쪽만 고쳐지고, 그 어긋남은 "카운트가 안 맞는다"로만 보여 원인 추적이 어렵다.
+    실제로 `incremental_finalize` 와 호출자의 대사 스크립트가 **같은 쿼리를 두 벌** 갖고
+    있었다(2026-08-11 이관 정리에서 통합).
+
+    **엣지축은 2026-07-30 에 추가됐다.** 노드·문서·벡터만 대사하던 동안 by-pack 대비
+    미적재 엣지 187,069건(15팩)이 전 팩 "정상" 판정을 통과했다. 축을 하나 빼면 그 축의
+    결손은 영영 안 보인다.
+
+    결손의 **원인**(grammar 공간쌍 미정의 등)은 판정하지 않는다 — 숫자만 낸다.
+    벡터 스토어가 `_conn` 을 안 내주면 0 을 돌려준다(백엔드마다 다르다).
+    """
+    g = graph._conn.execute(
+        "SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack_id')=?",
+        (pack_name,),
+    ).fetchone()[0]
+    e = graph._conn.execute(
+        "SELECT COUNT(*) FROM graph_edges WHERE json_extract(properties,'$.pack_id')=?",
+        (pack_name,),
+    ).fetchone()[0]
+    d = docs._conn.execute(
+        "SELECT COUNT(*) FROM doc_sources WHERE json_extract(metadata,'$.pack_id')=?"
+        " OR json_extract(metadata,'$.source')=?",
+        (pack_name, pack_name),
+    ).fetchone()[0]
+    v = 0
+    v_conn = getattr(vec, "_conn", None)
+    v_table = getattr(vec, "_table", None) or "vectors_kure"
+    if v_conn is not None:
+        v = v_conn.execute(
+            f"SELECT COUNT(*) FROM {v_table} WHERE pack_id = ?", (pack_name,)
+        ).fetchone()[0]
+    return {"nodes": g, "edges": e, "docs": d, "vectors": v}
+
+
 def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)"""
     require_live_data("delete_pack")
@@ -712,22 +751,8 @@ def incremental_finalize(
             log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 3원 대사 출력 (assert 아님 — 숫자 보고) ────────────────────────────
-    graph_count = graph._conn.execute(
-        "SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack_id')=?",
-        (pack_name,),
-    ).fetchone()[0]
-    doc_count = docs._conn.execute(
-        "SELECT COUNT(*) FROM doc_sources WHERE json_extract(metadata,'$.pack_id')=?"
-        " OR json_extract(metadata,'$.source')=?",
-        (pack_name, pack_name),
-    ).fetchone()[0]
-    vec_count = 0
-    v_conn  = getattr(vec, "_conn", None)
-    v_table = getattr(vec, "_table", None) or "vectors_kure"
-    if v_conn is not None:
-        vec_count = v_conn.execute(
-            f"SELECT COUNT(*) FROM {v_table} WHERE pack_id = ?", (pack_name,)
-        ).fetchone()[0]
+    counts = pack_live_counts(pack_name, graph, docs, vec)
+    graph_count, doc_count, vec_count = counts["nodes"], counts["docs"], counts["vectors"]
     vec_expected = len(bypack_node_ids | bypack_chunk_ids)
 
     print(
