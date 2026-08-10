@@ -110,6 +110,10 @@ PY = sys.executable
 # "조용한 실패" 클래스를 도구 자신이 저지르고 있었다(RC2 와 같은 부류).
 RUN_TIMEOUT = 180
 
+# 변이 전 원본을 여기에 둔다. 정상 종료(예외 포함)에서는 `finally` 가 지우므로,
+# **남아 있다는 것 자체가 지난 실행이 비정상 종료했다는 신호**다.
+BACKUP_SUFFIX = ".mutate-backup"
+
 # pytest 가 쓰지 않는 반환값. 시간 초과를 rc 로 흘려보낸다.
 _HUNG = -9
 
@@ -519,10 +523,27 @@ def _assert_tests_import_the_module(clone: Path, module: str,
 
 
 def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
-    """모듈 하나를 전면 스윕한다. 원본은 finally 에서 반드시 복원한다."""
+    """모듈 하나를 전면 스윕한다.
+
+    **복원 보장 범위를 정확히 적는다.** 한동안 이 자리에 "원본은 finally 에서 **반드시**
+    복원한다"고 적혀 있었는데 거짓이었다 — `try/finally` 는 **프로세스 안의 예외**만
+    막는다. 외부에서 `SIGTERM` 이 오면(CI 타임아웃, 셸 도구의 시간 제한, `kill`)
+    파이썬은 기본적으로 즉시 죽고 `finally` 를 태우지 않는다. 적대 검증이 실제로
+    그렇게 만들었고, 모듈이 **변이된 채 영구히 남았다**(에러 배너도 없이, 2026-08-11).
+
+    그래서 두 겹으로 바꿨다:
+    1. `SIGTERM`/`SIGINT`/`SIGHUP` 에 핸들러를 걸어 정상 종료 경로로 돌린다 —
+       그러면 `finally` 가 탄다.
+    2. 그래도 못 막는 경우(`SIGKILL`, 프로세스 강제 종료, 전원 차단)를 위해
+       **백업 파일**을 남긴다. 다음 실행이 그것을 발견하면 크게 알리고 복원한다.
+
+    `SIGKILL` 은 어떤 핸들러로도 못 막는다 — 그때는 백업이 유일한 회수 경로다.
+    """
     target = clone / module
     _assert_tests_import_the_module(clone, module, tests)
     orig_src = target.read_text()
+    backup = target.with_suffix(target.suffix + BACKUP_SUFFIX)
+    backup.write_text(orig_src, encoding="utf-8")
     ops = _collect(ast.parse(orig_src))
     print(f"\n### {module}  변이 {len(ops)}종  테스트 {' '.join(tests)}", flush=True)
 
@@ -557,6 +578,7 @@ def sweep(clone: Path, module: str, tests: tuple[str, ...]) -> dict:
                       f"hung={len(hung)} survived={len(survived)}", flush=True)
     finally:
         target.write_text(orig_src)
+        backup.unlink(missing_ok=True)
 
     # 경험적 배선 게이트. 구문 검사(import 문 존재)로는 오매핑을 다 못 막으므로
     # 결과로 한 번 더 본다 — 한 종도 못 죽였다면 그 테스트는 이 모듈을 안 보고 있다.
@@ -607,10 +629,45 @@ def _all_targets(clone: Path) -> list[tuple[str, tuple[str, ...]]]:
     return [(m, PACK_SUITES[m]) for m in sorted(found)]
 
 
+def _install_signal_handlers() -> None:
+    """외부 종료 신호를 정상 종료 경로로 돌린다 — 그래야 `finally` 가 탄다.
+
+    `try/finally` 만으로는 부족하다는 것이 실측으로 드러났다(위 `sweep` docstring).
+    `SIGKILL` 은 여기서도 못 막으므로 백업 파일이 최후 수단이다.
+    """
+    def _bail(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(sig, _bail)
+
+
+def _recover_backups(clone: Path) -> list[str]:
+    """지난 실행이 남긴 백업을 복원한다. **조용히 하지 않는다.**
+
+    백업이 남아 있다 = 지난 실행이 `finally` 를 못 태우고 죽었다 = 그 모듈이 변이된 채
+    남아 있었을 수 있다. 발견 사실과 복원 여부를 반드시 출력한다.
+    """
+    done = []
+    for bak in sorted((clone / "opencrab").rglob(f"*{BACKUP_SUFFIX}")):
+        target = bak.with_suffix("")
+        if target.exists() and target.read_text() != bak.read_text():
+            target.write_text(bak.read_text(), encoding="utf-8")
+            done.append(f"{target.relative_to(clone)} (변이 상태였다 — 복원함)")
+        else:
+            done.append(f"{target.relative_to(clone)} (이미 원본과 같음)")
+        bak.unlink()
+    return done
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     clone = Path(sys.argv[1])
+    _install_signal_handlers()
+    for line in _recover_backups(clone):
+        print(f"[복구] 지난 실행이 비정상 종료했다: {line}")
 
     if sys.argv[2] == "--all":
         targets = _all_targets(clone)
