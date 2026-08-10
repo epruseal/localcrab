@@ -390,6 +390,14 @@ class GraphStoreExtended(Protocol):
         because "every implementation" was declared twice before without
         saying what "every" enumerates, and a 5th and 6th implementation
         were found missing the guard each time it wasn't spelled out).
+        DOMAIN of this enumeration: PUBLIC methods on the classes in
+        ``opencrab/stores/*.py`` that take a parameter literally named
+        ``limit``. Private helpers inherit the status of the public method
+        that calls them and are not listed separately -- ``_expand``
+        (_sql_graph_base.py), ``_find_neighbors_1hop`` (kuzu_graph_store.py)
+        and ``_build_neighbors_cypher`` (neo4j_store.py) all take a
+        ``limit`` and are all reached only through ``find_neighbors``,
+        which is in the NOT-covered list below.
         The ``limit <= 0 -> []`` contract is pinned on exactly the methods
         enumerated below, no more, no less --
           - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
@@ -428,12 +436,17 @@ class GraphStoreExtended(Protocol):
             forever once the corpus exceeds the cap (#63) -- so a
             ``limit <= 0 -> []`` guard there would be a regression, not a
             fix. See its own docstring.
-          - any method on a store outside the graph/doc surface entirely:
-            vector stores' top-k ``limit``, and ``sql_store.py``'s
-            ``get_impacts``, which binds a negative ``limit`` straight into
-            ``LIMIT :limit`` (unbounded on SQLite) -- a different subsystem
-            per that module's own docstring: "impact records, ReBAC policy
-            assignments, lever simulations".
+          - ``sql_store.py``'s ``get_impacts``, the only limit-accepting
+            method outside the graph/doc surface. It binds a negative
+            ``limit`` straight into ``LIMIT :limit`` (unbounded on SQLite),
+            but belongs to a different subsystem per that module's own
+            docstring: "impact records, ReBAC policy assignments, lever
+            simulations".
+        NOT in the domain at all, so not an exclusion: the vector stores.
+        ``ChromaStore``, ``PgVectorStore`` and ``SqliteVecStore`` have no
+        ``limit`` parameter anywhere -- their top-k bound is ``n_results``,
+        a distinct parameter with distinct semantics (candidates to score,
+        not rows to return), so this contract has nothing to say about it.
         A future round extending this contract to one of those must add it
         to this enumeration, not just fix the code.
         """
