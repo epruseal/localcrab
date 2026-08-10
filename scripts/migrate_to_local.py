@@ -60,12 +60,26 @@ def _filter_auth_tables(table_names: Any) -> list[str]:
 
 
 def _pg_table_names(pg_engine: Any) -> set[str]:
-    """All base table names in the PostgreSQL source's public schema."""
+    """All base table names in the schema this connection actually resolves to.
+
+    ``current_schema()``, not a literal ``'public'``: a DSN may pin a different
+    schema via ``options=-csearch_path%3D...`` (several of this repo's
+    PostgreSQL tests do exactly that to isolate themselves), and ``SQLStore``
+    then creates its tables *there* while the migration reads them through
+    unqualified names. Inspecting only ``public`` would find no auth tables in
+    that setup, so the fail-closed guard below would stay silent and the run
+    would report success having dropped every user and every issued token --
+    precisely the failure the guard exists to prevent. This matches what
+    ``SQLStore.table_counts`` already uses.
+    """
     from sqlalchemy import text  # type: ignore[import]
 
     with pg_engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()"
+            )
         ).fetchall()
     return {r[0] for r in rows}
 

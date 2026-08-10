@@ -80,7 +80,9 @@ make_sql_store(settings)
     else                         → SQLStore(url="sqlite:///<LOCAL_DATA_DIR>/opencrab.db")
 ```
 
-`LOCAL_DATA_DIR` 기본값: `/home/asdf/.openclaw/workspace/data/localcrab`
+`LOCAL_DATA_DIR` 기본값: `~/.local/share/localcrab` (실행 사용자의 HOME 에서
+파생된다 — `config.py::_default_local_data_dir`, 회귀 방지는
+`tests/test_config_defaults.py`).
 
 ---
 

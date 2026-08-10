@@ -312,8 +312,8 @@ class TestSQLStoreUnit:
         assert "packs" not in counts
 
     def test_fresh_schema_rejects_is_local_out_of_domain(self, sql_store):
-        from sqlalchemy.exc import IntegrityError
         from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
 
         with pytest.raises(IntegrityError):
             with sql_store._engine.begin() as conn:
@@ -325,8 +325,8 @@ class TestSQLStoreUnit:
                 )
 
     def test_fresh_schema_rejects_disabled_out_of_domain(self, sql_store):
-        from sqlalchemy.exc import IntegrityError
         from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
 
         with pytest.raises(IntegrityError):
             with sql_store._engine.begin() as conn:
@@ -338,8 +338,8 @@ class TestSQLStoreUnit:
                 )
 
     def test_fresh_schema_rejects_second_local_user(self, sql_store):
-        from sqlalchemy.exc import IntegrityError
         from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
 
         with sql_store._engine.begin() as conn:
             conn.execute(

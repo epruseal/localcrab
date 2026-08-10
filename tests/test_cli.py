@@ -288,8 +288,9 @@ class TestUserTokenCLI:
         assert enable.exit_code == 0
         assert "Enabled" in enable.output
 
-        listing = runner.invoke(main, ["user", "list"])
-        # find the row for user_id and confirm disabled reads False again
+        # Both surfaces, because they can drift: the store says disabled is
+        # False again, and `user list` -- the only way an operator actually
+        # sees it -- reports the same.
         from opencrab.auth import list_users
         from opencrab.config import get_settings
         from opencrab.stores.factory import make_sql_store
@@ -297,6 +298,16 @@ class TestUserTokenCLI:
         sql = make_sql_store(get_settings())
         row = [u for u in list_users(sql) if u["user_id"] == user_id][0]
         assert row["disabled"] is False
+
+        listing = runner.invoke(main, ["user", "list"])
+        assert listing.exit_code == 0
+        # `user list` renders a rich table (unlike `user add`, which emits
+        # JSON), so assert on the row: this user is neither local nor
+        # disabled, so its row must carry no "True" at all. Fails if either
+        # flag column regresses.
+        row_line = [ln for ln in listing.output.splitlines() if user_id in ln]
+        assert len(row_line) == 1, listing.output
+        assert "True" not in row_line[0], row_line[0]
 
     # --- Edge ---
     def test_disable_unknown_user_exits_nonzero(self, cli_env, runner):
