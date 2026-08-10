@@ -483,7 +483,22 @@ class _RecordingVec:
         self.deleted: list[str] = []
         self._fail_over = fail_batches_larger_than
 
-    def upsert_texts(self, texts, ids, metadatas):
+    def upsert_texts(self, texts, metadatas=None, ids=None):
+        """**실 스토어와 같은 시그니처**여야 한다 — `(texts, metadatas, ids)`.
+
+        앞선 판은 `(texts, ids, metadatas)` 로 순서를 뒤집어 선언했다. `load.py` 는
+        전부 키워드로 부르므로 실동작은 무사했지만, 스텁이 실계약을 반대로 선언한
+        탓에 **위치인자 축의 모든 테스트가 구조적으로 무력**했다(적대 검증 실증,
+        2026-08-10: N15 — 건별 재시도를 위치인자로 바꾸면 id 와 메타가 뒤바뀌는데
+        50 passed). 스텁이 실계약을 잘못 베끼면 스텁 자체가 사각지대다.
+
+        길이 검증도 실 스토어를 따른다 — 실제로는 `ValueError` 인데 스텁이 `zip` 으로
+        조용히 절단하면 길이 불일치 변이가 안 보인다(N13).
+        """
+        ids = list(ids or [])
+        metadatas = list(metadatas or [{}] * len(texts))
+        if not (len(texts) == len(metadatas) == len(ids)):
+            raise ValueError("texts, metadatas, and ids must have the same length.")
         self.calls.append((len(ids), list(ids)))
         if self._fail_over is not None and len(ids) > self._fail_over:
             raise RuntimeError("주입된 배치 실패")
@@ -492,7 +507,7 @@ class _RecordingVec:
         # 통째로 폐기하는 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M18b).
         # 그 변이는 문서화된 실사고(청크 메타 30필드 소실)의 재현이다. 스텁이 실스토어보다
         # 관대하면 스텁이 곧 사각지대가 된다.
-        for i, meta in zip(ids, metadatas or [{}] * len(ids)):
+        for i, meta in zip(ids, metadatas):
             self.metas[i] = dict(meta or {})
 
     def delete(self, ids):
@@ -798,6 +813,207 @@ class TestDeletePackVectorBranch:
     def test_vector_branch_is_skipped_when_unavailable(self, live):
         _b, graph, docs = live
         assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec()) == (0, 0, 0)
+
+
+class TestIncrementalFinalizeActuallyDeletes:
+    """**핀을 통과한 뒤 실제로 무엇을 지우는가.**
+
+    앞선 판은 안전핀 5건을 걸었지만 `incremental_finalize` 의 **삭제·정리 본체**는
+    여전히 0줄 커버였다. 그래서 "지웠다고 보고하고 안 지우기", "다른 팩 엣지 삭제",
+    "앵커 삭제", "살아있는 청크·노드의 벡터 삭제" 가 전부 50 passed 를 유지했다
+    (적대 검증 실증, 2026-08-10: N1b·N2·N3·N4·N5·N6·N10·N12).
+
+    핀은 "언제 멈추는가"만 본다. 멈추지 않았을 때 무엇이 사라지는지는 별개 계약이다.
+    """
+
+    def _seed_nodes(self, builder, tmp_path, ids, pack="pack-1"):
+        f = _write_jsonl(tmp_path / f"n_{pack}.jsonl", [_node(id=i) for i in ids])
+        pack_load.load_nodes(pack, f, builder, {})
+
+    def _live(self, graph, docs, vec=None, pack="pack-1"):
+        return pack_load.live_pack_state(pack, graph, docs, vec or _NoVec())
+
+    def test_chunk_deletion_is_committed_and_visible_to_another_connection(
+            self, live, tmp_path):
+        """삭제가 **별도 커넥션에서도** 보여야 한다 — `commit` 누락이 갈리는 지점이다.
+
+        같은 커넥션으로만 확인하면 미커밋 삭제가 통과한다(N10). 그리고 카운트만 맞추고
+        실제로 안 지우는 변이(N1b)도 여기서 갈린다.
+        """
+        import sqlite3
+        builder, graph, docs = live
+        self._seed_nodes(builder, tmp_path, ["n1"])
+        # 청크 4개 중 1개만 삭제 후보 = 25% — 30% 핀에 안 걸리게 한다.
+        # (핀은 별도 테스트가 건다. 여기서 보는 것은 **핀을 통과한 뒤**의 삭제다.)
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(1, 5)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        assert set(state["chunks"]) == {"c1", "c2", "c3", "c4"}
+
+        keep = {"c1", "c2", "c3"}
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, keep, set(), False, 1, len(keep))
+
+        assert res["chunk_del"] == 1, res
+        other = sqlite3.connect(f"file:{tmp_path / 'doc.db'}?mode=ro", uri=True)
+        try:
+            left = {r[0] for r in other.execute("SELECT source_id FROM doc_sources")}
+        finally:
+            other.close()
+        assert left == keep, (
+            f"별도 커넥션에서 본 청크가 {left} (기대 {keep}) — 삭제가 커밋되지 않았거나 "
+            "지웠다고 보고만 하고 실제로는 안 지웠다")
+
+    def test_stale_edge_cleanup_only_touches_its_own_pack(self, live, tmp_path):
+        """stale 엣지 정리가 **자기 팩 엣지만** 지워야 한다."""
+        builder, graph, docs = live
+        # **순서가 계약이다.** `graph_edges` PK 는 `(from_type,from_id,relation,to_type,to_id)`
+        # 라 pack_id 를 안 담는다. 그래서 삭제 SQL 의 pack_id 필터는 "상태를 포착한 뒤
+        # 다른 팩이 같은 triple 을 가져간" 경우에만 의미를 갖는다 — 진입점이 상태를 먼저
+        # 포착하고 여러 팩을 순차 적재하므로 실제로 도달 가능한 순서다.
+        # 그 순서를 안 만들면 필터를 지워도 아무 일이 없다(자체 측정: 필터 제거 시 59 passed).
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        pack_load.load_nodes("다른팩", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "e.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+
+        state = self._live(graph, docs)                 # ① pack-1 상태 포착
+        assert state["edges"], "전제: 포착 시점에 pack-1 이 그 엣지를 갖는다"
+        pack_load.load_edges("다른팩", ef, builder, id_map)   # ② 다른 팩이 같은 triple 을 가져간다
+        owner = json.loads(graph._conn.execute(
+            "SELECT properties FROM graph_edges").fetchone()[0]).get("pack_id")
+        assert owner == "다른팩", f"전제: 소유가 넘어가야 한다 (현재 {owner})"
+
+        # ③ pack-1 이 낡은 상태로 정리 — 자기 것이 아닌 행을 지우면 안 된다
+        pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1", "n2"}, set(), {("n1", "cites", "n9")}, True, 2, 0)
+
+        left = {json.loads(r[0]).get("pack_id") for r in graph._conn.execute(
+            "SELECT properties FROM graph_edges")}
+        assert "다른팩" in left, (
+            f"소유가 넘어간 엣지를 지웠다 — 남은 pack_id={left}. 삭제 SQL 의 pack_id "
+            "필터가 없으면 낡은 상태로 남의 팩 행을 지운다")
+
+    def test_empty_applied_edges_skips_cleanup(self, live, tmp_path):
+        """`applied_edges` 가 비면 엣지 정리를 **건너뛰어야** 한다.
+
+        edges.jsonl 누락 의심 상황이다 — 그대로 진행하면 라이브 엣지가 전량 삭제된다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "e.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+        before = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        assert before == 1
+
+        state = self._live(graph, docs)
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1", "n2"}, set(), set(), True, 2, 0)      # applied 가 비었다
+
+        after = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        assert res["edge_del"] == 0 and after == 1, (
+            f"반영 엣지 0건인데 정리를 진행했다 — edge_del={res['edge_del']}, 남은 {after}건")
+
+    def test_anchor_nodes_are_never_deletion_candidates(self, live, tmp_path):
+        """`dataset:` 앵커는 by-pack 에 없어도 삭제 후보에서 빠져야 한다."""
+        builder, graph, docs = live
+        self._seed_nodes(builder, tmp_path, ["n1", "dataset:앵커"])
+        state = self._live(graph, docs)
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, set(), set(), True, 1, 0)            # 앵커는 by-pack 에 없다
+        left = set(self._live(graph, docs)["nodes"])
+        assert "dataset:앵커" in left, f"앵커를 지웠다 — 남은 노드 {left}, node_del={res['node_del']}"
+
+    def test_vector_orphan_cleanup_excludes_this_run(self, live, tmp_path):
+        """이번 적재의 노드·청크 id 는 벡터 고아 삭제에서 **둘 다** 빠져야 한다.
+
+        하나만 빼면 살아있는 쪽의 벡터가 지워진다(N4·N6).
+        """
+        builder, graph, docs = live
+        self._seed_nodes(builder, tmp_path, ["n1"])
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+
+        class _VecWithIds(_NoVec):
+            available = True
+            _table = "vectors_kure"
+
+            def __init__(self, ids):
+                super().__init__()
+                import sqlite3
+                self._conn = sqlite3.connect(":memory:")
+                self._conn.execute(
+                    f"CREATE TABLE {self._table} (node_id TEXT, pack_id TEXT)")
+                self._conn.executemany(
+                    f"INSERT INTO {self._table} VALUES (?, 'pack-1')", [(i,) for i in ids])
+                self._conn.commit()
+
+        vec = _VecWithIds(["n1", "c1", "고아1"])
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec)
+        pack_load.incremental_finalize(
+            "pack-1", graph, docs, vec, state,
+            {"n1"}, {"c1"}, set(), True, 1, 1)
+        assert "n1" not in vec.deleted, f"살아있는 노드의 벡터를 지웠다: {vec.deleted}"
+        assert "c1" not in vec.deleted, f"살아있는 청크의 벡터를 지웠다: {vec.deleted}"
+
+
+class TestStubsMatchTheRealStoreContract:
+    """스텁이 실 스토어 시그니처와 **일치**해야 한다.
+
+    앞선 판의 `_RecordingVec.upsert_texts` 는 `(texts, ids, metadatas)` 였는데
+    실 스토어는 `(texts, metadatas=None, ids=None)` 다. `load.py` 가 전부 키워드로
+    부르므로 실동작은 무사했지만, **스텁이 실계약을 반대로 선언한 탓에 위치인자 축의
+    테스트가 전부 무력**했다(적대 검증 실증, 2026-08-10: N15·N13).
+
+    "스텁을 실계약에 맞추자"는 산문으로는 다음 스텁에서 또 어긋난다. 시그니처를
+    코드로 대사한다 — 스텁이 실계약을 잘못 베끼는 것이 **구조적으로 불가능**해진다.
+    """
+
+    @pytest.mark.parametrize("method", ["upsert_texts", "delete"])
+    def test_recording_vec_signature_matches_the_real_store(self, method):
+        from opencrab.stores.sqlite_vec_store import SqliteVecStore
+        real = inspect.signature(getattr(SqliteVecStore, method))
+        stub = inspect.signature(getattr(_RecordingVec, method))
+        assert list(stub.parameters) == list(real.parameters), (
+            f"_RecordingVec.{method} 의 파라미터가 실 스토어와 다르다:\n"
+            f"  실  {list(real.parameters)}\n  스텁 {list(stub.parameters)}")
+
+    def test_length_mismatch_raises_like_the_real_store(self):
+        """실 스토어는 길이 불일치를 `ValueError` 로 거부한다 — 스텁도 그래야 한다.
+
+        `zip` 으로 조용히 절단하면 메타가 한 건 모자란 변이가 안 보인다.
+        """
+        vec = _RecordingVec()
+        with pytest.raises(ValueError, match="same length"):
+            vec.upsert_texts(texts=["a", "b"], metadatas=[{}], ids=["x", "y"])
+
+    def test_every_vec_stub_covers_the_methods_load_actually_calls(self):
+        """`load.py` 가 부르는 벡터 메서드를 스텁이 전부 갖고 있는가.
+
+        빠진 메서드가 있으면 그 경로는 테스트에서 **실행조차 안 된다** — `_NoVec` 만
+        쓰던 판에서 `delete_pack` 의 벡터 분기가 그랬다(M20).
+        """
+        src = pathlib.Path(pack_load.__file__).read_text(encoding="utf-8")
+        called = {
+            x.func.attr for x in ast.walk(ast.parse(src))
+            if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute)
+            and isinstance(x.func.value, ast.Name) and x.func.value.id == "vec"
+        }
+        # `available` 은 속성이라 Call 에 안 잡힌다. 메서드만 본다.
+        missing = sorted(called - set(dir(_RecordingVec)))
+        assert not missing, (
+            f"load.py 가 vec.{missing} 를 부르는데 _RecordingVec 에 없다 — "
+            "그 경로는 테스트에서 실행조차 안 된다")
 
 
 class TestGuardActuallyFires:
