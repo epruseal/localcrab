@@ -67,12 +67,11 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from opencrab.locking import file_lock, lock_data_dir
+from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
@@ -84,7 +83,7 @@ from ._registry import dispatch_tool as _registry_dispatch_tool
 # write.lock 은 그 위에 opencrab이 직접 얹은 커스텀 안전층이다(공식 보증 아님). 정공법은 단일
 # `chroma run` 서버 + HttpClient. 출처: cookbook.chromadb.dev/core/{system_constraints,clients}.
 # 공유 락(LOCK_SH)을 서버 수명 동안 보유 → load_local_packs.py의 배타 락(LOCK_EX)과 상호 배제.
-_context_lock = threading.RLock()
+_chroma_lock_fh = None
 
 
 def _lock_data_dir() -> str:
@@ -102,18 +101,17 @@ def _lock_data_dir() -> str:
     return lock_data_dir()
 
 
-def close_context() -> None:
-    """Close MCP stores and release their local Chroma lifetime lock."""
-    global _context
-    with _context_lock:
-        context, _context = _context, {}
-        shutdown = getattr(context.get("hybrid"), "shutdown_bm25", None)
-        if callable(shutdown):
-            shutdown()
-        for key in ("neo4j", "chroma", "mongo", "sql"):
-            close = getattr(context.get(key), "close", None)
-            if callable(close):
-                close()
+def _acquire_chroma_shared_lock() -> None:
+    """Hold a shared lock on chroma.lock for the server's lifetime.
+
+    ``shared=True`` is a real ``LOCK_SH`` on POSIX, letting several local
+    chroma-backed processes hold it concurrently, but ``opencrab.locking``
+    emulates it as an exclusive byte-range lock on Windows (msvcrt has no
+    reader/writer lock), so two local chroma processes on Windows would
+    block each other rather than share (see follow-up issue).
+    """
+    global _chroma_lock_fh
+    _chroma_lock_fh = acquire_file_lock("chroma.lock", _lock_data_dir(), shared=True)
 
 
 # WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
@@ -160,53 +158,67 @@ _context: dict[str, Any] = {}
 def _get_context() -> dict[str, Any]:
     """Lazily initialise LocalCrab stores and engines using the local factory."""
     global _context
-    with _context_lock:
-        if _context:
-            return _context
-
-        from opencrab.config import get_settings
-        from opencrab.ontology.builder import OntologyBuilder
-        from opencrab.ontology.impact import ImpactEngine
-        from opencrab.ontology.query import HybridQuery
-        from opencrab.ontology.rebac import ReBACEngine
-        from opencrab.stores.factory import (
-            make_billing_sql_store,
-            make_doc_store,
-            make_graph_store,
-            make_sql_store,
-            make_vector_store,
-        )
-
-        cfg = get_settings()
-        try:
-            graph = make_graph_store(cfg)
-            vector = make_vector_store(cfg)
-            docs = make_doc_store(cfg)
-            sql = make_sql_store(cfg)
-            builder = OntologyBuilder(graph, docs, sql, vec=vector)
-            rebac = ReBACEngine(graph, sql)
-            impact = ImpactEngine(graph, sql)
-            hybrid = HybridQuery(vector, graph)
-            hybrid._doc_store = docs
-            hybrid._rebac = rebac
-            from opencrab.billing.hooks import BillingHooks
-
-            billing = BillingHooks(make_billing_sql_store(cfg, sql))
-        except BaseException:
-            raise
-
-        _context = {
-            "neo4j": graph,
-            "chroma": vector,
-            "mongo": docs,
-            "sql": sql,
-            "builder": builder,
-            "rebac": rebac,
-            "impact": impact,
-            "hybrid": hybrid,
-            "billing": billing,
-        }
+    if _context:
         return _context
+
+    from opencrab.config import get_settings
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.ontology.impact import ImpactEngine
+    from opencrab.ontology.query import HybridQuery
+    from opencrab.ontology.rebac import ReBACEngine
+    from opencrab.stores.factory import (
+        make_billing_sql_store,
+        make_doc_store,
+        make_graph_store,
+        make_sql_store,
+        make_vector_store,
+    )
+
+    cfg = get_settings()
+
+    # chroma.lock (LOCK_SH) only coordinates with the offline chroma batch loader;
+    # skip it when the vector backend isn't chroma (sqlite-vec uses SQLite WAL, not
+    # chroma's flock layer, so the shared lock would be a pointless hold).
+    # vector_backend_resolved (not the raw vector_backend field) — VECTOR_BACKEND
+    # is now unset by default and resolves conditionally (config.py), so a raw
+    # comparison would miss the chroma case whenever it's the resolved default.
+    if cfg.vector_backend_resolved == "chroma":
+        _acquire_chroma_shared_lock()
+
+    graph = make_graph_store(cfg)
+    vector = make_vector_store(cfg)
+    docs = make_doc_store(cfg)
+    sql = make_sql_store(cfg)
+
+    builder = OntologyBuilder(graph, docs, sql, vec=vector)
+    rebac = ReBACEngine(graph, sql)
+    impact = ImpactEngine(graph, sql)
+    hybrid = HybridQuery(vector, graph)
+
+    # Attach Phase 4 dependencies to HybridQuery for BM25 + policy filter
+    hybrid._doc_store = docs
+    hybrid._rebac = rebac
+
+    # Phase 5: billing hooks
+    # issue #105: billing_events gets its own SQLite file in local/kuzu mode
+    # (a no-op passthrough to `sql` in pg/docker mode) — see
+    # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
+    # module docstring (including "NO AUTOMATIC MIGRATION") for why.
+    from opencrab.billing.hooks import BillingHooks
+    billing = BillingHooks(make_billing_sql_store(cfg, sql))
+
+    _context = {
+        "neo4j": graph,
+        "chroma": vector,
+        "mongo": docs,
+        "sql": sql,
+        "builder": builder,
+        "rebac": rebac,
+        "impact": impact,
+        "hybrid": hybrid,
+        "billing": billing,
+    }
+    return _context
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +261,11 @@ __all__ = [
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",
     "_TOOL_FUNCTIONS",
+    "_acquire_chroma_shared_lock",
     "_clean_meta",
     "_clean_str",
     "_context",
     "_get_context",
-    "close_context",
     "_ingest_into_pack",
     "_lock_data_dir",
     "_nine_space_hint",

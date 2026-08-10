@@ -189,6 +189,7 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         pass
     except Exception as exc:
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
+        return
 
     try:
         docs.log_event(event_type, payload=details, actor=user_id)
@@ -413,11 +414,6 @@ async def lifespan(app: FastAPI) -> Any:
         yield
     finally:
         _close_context(getattr(app.state, "context", None))
-        # apps/api embeds the MCP router, so its standalone lifespan is not
-        # installed.  Close the shared MCP context here as well.
-        from opencrab.mcp.tools import close_context
-
-        close_context()
 
 
 app = FastAPI(

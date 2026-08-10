@@ -790,18 +790,15 @@ def main() -> None:
         import chromadb  # type: ignore[import]
         chroma_local_path = os.path.join(local_data_dir, "chroma")
         os.makedirs(chroma_local_path, exist_ok=True)
-        # MCP holds this lock shared for the lifetime of its PersistentClient;
-        # take it exclusively before opening our own client for migration.
-        with file_lock("chroma.lock", local_data_dir):
-            local_chroma = chromadb.PersistentClient(path=chroma_local_path)
-            with file_lock("write.lock", local_data_dir):
-                vectors_result = migrate_vectors(
-                    preflight_result["chroma_http"],
-                    local_chroma,
-                    args.chroma_collection,
-                    args.batch_size,
-                    logger,
-                )
+        local_chroma = chromadb.PersistentClient(path=chroma_local_path)
+        with file_lock("write.lock", local_data_dir):
+            vectors_result = migrate_vectors(
+                preflight_result["chroma_http"],
+                local_chroma,
+                args.chroma_collection,
+                args.batch_size,
+                logger,
+            )
         report["results"]["vectors"] = vectors_result
         console.print(f"  [green]완료[/green] vectors={vectors_result['vectors']:,}")
     else:

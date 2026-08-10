@@ -13,26 +13,6 @@ from fastapi.testclient import TestClient
 
 from opencrab.mcp.http_app import _resolve_token, create_app
 
-
-def test_composite_api_lifespan_closes_embedded_mcp_context(monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from apps.api import main as api_main
-
-    context = object()
-    with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(api_main, "_build_context", lambda: context)
-        closed_api: list[object] = []
-        patcher.setattr(api_main, "_close_context", closed_api.append)
-        closed_mcp: list[bool] = []
-        patcher.setattr(
-            "opencrab.mcp.tools.close_context", lambda: closed_mcp.append(True)
-        )
-        with TestClient(api_main.app):
-            pass
-    assert closed_api == [context]
-    assert closed_mcp == [True]
-
 # ---------------------------------------------------------------------------
 # _resolve_token — precedence: CLI > env > file
 # ---------------------------------------------------------------------------

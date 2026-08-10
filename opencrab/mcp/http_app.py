@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import hmac
 import os
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
@@ -33,7 +32,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from opencrab.mcp.server import MCPServer
-from opencrab.mcp.tools import close_context
 
 
 def _resolve_token(cli_token: str | None = None, cli_token_file: str | None = None) -> str | None:
@@ -131,14 +129,7 @@ def mcp_router(auth_token: str | None = None) -> APIRouter:
 
 def create_app(auth_token: str | None = None) -> FastAPI:
     """Lightweight FastAPI app for ``serve --transport http`` — MCP router + healthz."""
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        try:
-            yield
-        finally:
-            close_context()
-
-    app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(docs_url=None, redoc_url=None)
     app.include_router(mcp_router(auth_token))
 
     @app.get("/healthz")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from opencrab.mcp.tools import (
     WRITE_TOOLS,
+    _acquire_chroma_shared_lock,
     _clean_meta,
     _clean_str,
     _get_context,
@@ -27,6 +28,7 @@ from opencrab.mcp.tools import (
 
 __all__ = [
     "WRITE_TOOLS",
+    "_acquire_chroma_shared_lock",
     "_clean_meta",
     "_clean_str",
     "_get_context",
