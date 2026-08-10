@@ -392,17 +392,26 @@ class GraphStoreExtended(Protocol):
         were found missing the guard each time it wasn't spelled out).
         DOMAIN of this enumeration: PUBLIC methods on the CONCRETE backend
         classes in ``opencrab/stores/*.py`` that take a parameter literally
-        named ``limit``. Two exclusions from that domain, both because
-        there is no code there to guard:
+        named ``limit``. Two exclusions from that domain, for DIFFERENT
+        reasons -- do not collapse them:
           - the Protocol declarations in THIS file (``GraphStore``,
-            ``GraphStoreExtended``). Their bodies are ``...``; they state
-            the interface, and the guard lives in each implementation.
-          - private helpers, which inherit the status of the public method
-            that calls them: ``_expand`` (_sql_graph_base.py),
-            ``_find_neighbors_1hop`` (kuzu_graph_store.py) and
-            ``_build_neighbors_cypher`` (neo4j_store.py) all take a
-            ``limit`` and are each reached only through ``find_neighbors``,
-            which is in the NOT-covered list below.
+            ``GraphStoreExtended``) are excluded because there is nothing
+            to guard: their bodies are ``...``. They state the interface;
+            the guard lives in each implementation.
+          - private helpers are excluded on entirely different grounds:
+            they DO contain real executable code, and each one uses its
+            ``limit`` (``_find_neighbors_1hop`` executes one bounded query
+            per directed pass; ``_build_neighbors_cypher`` executes nothing
+            and returns Cypher containing ``LIMIT $limit`` plus params
+            binding ``limit``, for ``find_neighbors`` to run; ``_expand``
+            runs no query at all and slices an already-fetched batch with
+            ``[:remaining]``).
+            They are excluded because production reaches all three ONLY
+            through ``find_neighbors``, which is itself classified below,
+            so their status is decided there. A guard on a helper would be the
+            wrong placement, not a missing one. If any of them ever gains
+            a second public caller, it stops inheriting and needs its own
+            row here.
         The ``limit <= 0 -> []`` contract is pinned on exactly the methods
         enumerated below, no more, no less --
           - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
