@@ -119,6 +119,77 @@ def init(force: bool) -> None:
         )
     )
 
+    _bootstrap_local_user()
+
+
+def _bootstrap_local_user() -> None:
+    """Create the bootstrap owner/local user + token once (#144), atomically
+    (a crash between creating the user and issuing its token must not leave
+    a tokenless local user -- see ``auth.bootstrap_local_user``). Idempotent:
+    a second ``opencrab init`` finds the existing is_local user (enabled or
+    disabled -- ``get_local_user`` doesn't filter on that) and does not
+    recreate the user or reissue a token; reissuing would silently undo an
+    operator's deliberate ``user disable``."""
+    from sqlalchemy.exc import IntegrityError
+
+    from opencrab.auth import bootstrap_local_user, get_local_user
+    from opencrab.config import get_settings
+
+    cfg = get_settings()
+    sql = _make_stores(cfg, sql=True).sql
+    if not sql.available:
+        console.print("[red]SQL store unavailable -- skipping user bootstrap.[/red]")
+        raise SystemExit(1)
+
+    existing = get_local_user(sql)
+    if existing is not None:
+        console.print(f"[dim]Local user already bootstrapped ({existing.user_id}).[/dim]")
+        return
+
+    try:
+        user_id, secret = bootstrap_local_user(sql)
+    except IntegrityError as exc:
+        # Concurrent `init`: two runs both saw "no local user" above and both
+        # tried to insert is_local=1 -- only idx_users_single_local's own
+        # violation is that benign race; any other IntegrityError is a real
+        # failure and must propagate. bootstrap_local_user's `begin()` block
+        # already rolled back and closed the failed transaction, so
+        # get_local_user(sql) below opens a fresh connection rather than
+        # reusing the aborted one (required on PostgreSQL, where an aborted
+        # transaction can't be queried further).
+        #
+        # Dialects report this differently: PostgreSQL's message names the
+        # index ("duplicate key value violates unique constraint
+        # \"idx_users_single_local\""); SQLite's names the column instead
+        # ("UNIQUE constraint failed: users.is_local", confirmed by direct
+        # reproduction) -- match either.
+        orig = str(exc.orig)
+        if "idx_users_single_local" not in orig and "users.is_local" not in orig:
+            raise
+        existing = get_local_user(sql)
+        if existing is None:
+            console.print(
+                "[red]Local user bootstrap race detected, but no local user "
+                "exists afterward -- something else is wrong.[/red]"
+            )
+            raise SystemExit(1) from exc
+        console.print(
+            f"[dim]Local user already bootstrapped ({existing.user_id}) "
+            "(lost a concurrent init race).[/dim]"
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[bold]Local user created:[/bold] {user_id}\n\n"
+            "[bold]Bootstrap token (shown once -- save it now):[/bold]\n"
+            f"[cyan]{secret}[/cyan]\n\n"
+            f"[dim]Lost it? Run: opencrab token issue {user_id}[/dim]",
+            title="OpenCrab Auth Bootstrap",
+            border_style="yellow",
+        )
+    )
+
 
 def _write_default_env(path: Path) -> None:
     default_data_dir = Path.home() / ".local" / "share" / "localcrab"
@@ -929,6 +1000,172 @@ def packs_reindex_bm25() -> None:
             default=str,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# user group (#144)
+# ---------------------------------------------------------------------------
+
+
+def _require_sql():
+    """Shared helper: build the SQL store or exit(1) if unavailable."""
+    from opencrab.config import get_settings
+
+    sql = _make_stores(get_settings(), sql=True).sql
+    if not sql.available:
+        console.print("[red]SQL store unavailable.[/red]")
+        raise SystemExit(1)
+    return sql
+
+
+@main.group()
+def user() -> None:
+    """Manage principal-store users."""
+
+
+@user.command("add")
+@click.argument("display_name")
+@click.option(
+    "--local",
+    "is_local",
+    is_flag=True,
+    default=False,
+    help="Bind as the stdio/CLI local principal (at most one; see 'opencrab init').",
+)
+def user_add(display_name: str, is_local: bool) -> None:
+    """Create a new user."""
+    from opencrab.auth import create_user
+
+    sql = _require_sql()
+    try:
+        user_id = create_user(sql, display_name, is_local=is_local)
+    except Exception as exc:
+        console.print(f"[red]Could not create user: {exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print_json(
+        json.dumps(
+            {"user_id": user_id, "display_name": display_name, "is_local": is_local},
+            ensure_ascii=False,
+        )
+    )
+
+
+@user.command("list")
+def user_list() -> None:
+    """List all users."""
+    from opencrab.auth import list_users
+
+    sql = _require_sql()
+    users = list_users(sql)
+    table = Table(title="OpenCrab Users", show_header=True, header_style="bold cyan")
+    table.add_column("user_id", style="bold")
+    table.add_column("display_name")
+    table.add_column("local")
+    table.add_column("disabled")
+    table.add_column("created_at")
+    for u in users:
+        table.add_row(
+            u["user_id"], u["display_name"], str(u["is_local"]), str(u["disabled"]), str(u["created_at"])
+        )
+    console.print(table)
+
+
+@user.command("disable")
+@click.argument("user_id")
+def user_disable(user_id: str) -> None:
+    """Disable a user (their tokens stop verifying)."""
+    from opencrab.auth import disable_user
+
+    sql = _require_sql()
+    try:
+        disabled = disable_user(sql, user_id)
+    except Exception as exc:
+        console.print(f"[red]Could not disable user: {exc}[/red]")
+        raise SystemExit(1) from exc
+    if not disabled:
+        console.print(f"[red]No such user: {user_id}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]Disabled {user_id}[/green]")
+
+
+@user.command("enable")
+@click.argument("user_id")
+def user_enable(user_id: str) -> None:
+    """Re-enable a disabled user (their tokens verify again). The recovery
+    path that makes ``user disable`` (including on the local user) safe."""
+    from opencrab.auth import enable_user
+
+    sql = _require_sql()
+    if not enable_user(sql, user_id):
+        console.print(f"[red]No such user: {user_id}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]Enabled {user_id}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# token group (#144)
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def token() -> None:
+    """Manage API tokens."""
+
+
+@token.command("issue")
+@click.argument("user_id")
+@click.option("--name", default=None, help="Optional label for this token.")
+def token_issue(user_id: str, name: str | None) -> None:
+    """Issue a new token for a user. Prints the secret once."""
+    from opencrab.auth import issue_token
+
+    sql = _require_sql()
+    try:
+        token_id, secret = issue_token(sql, user_id, name=name)
+    except ValueError as exc:
+        console.print(f"[red]Could not issue token: {exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print(
+        Panel(
+            f"[bold]token_id:[/bold] {token_id}\n\n"
+            "[bold]Secret (shown once -- save it now):[/bold]\n"
+            f"[cyan]{secret}[/cyan]",
+            title="OpenCrab Token Issued",
+            border_style="yellow",
+        )
+    )
+
+
+@token.command("list")
+@click.argument("user_id")
+def token_list(user_id: str) -> None:
+    """List a user's tokens (never shows hashes or secrets)."""
+    from opencrab.auth import list_tokens
+
+    sql = _require_sql()
+    tokens = list_tokens(sql, user_id)
+    table = Table(title=f"Tokens for {user_id}", show_header=True, header_style="bold cyan")
+    table.add_column("token_id", style="bold")
+    table.add_column("name")
+    table.add_column("created_at")
+    table.add_column("last_used_at")
+    table.add_column("revoked_at")
+    for t in tokens:
+        table.add_row(
+            t["token_id"], t["name"] or "", str(t["created_at"]), str(t["last_used_at"]), str(t["revoked_at"])
+        )
+    console.print(table)
+
+
+@token.command("revoke")
+@click.argument("token_id")
+def token_revoke(token_id: str) -> None:
+    """Revoke a token."""
+    from opencrab.auth import revoke_token
+
+    sql = _require_sql()
+    revoke_token(sql, token_id)
+    console.print(f"[green]Revoked {token_id}[/green]")
 
 
 # ---------------------------------------------------------------------------

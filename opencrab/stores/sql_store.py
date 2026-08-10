@@ -76,6 +76,51 @@ _TABLES_SQL = [
         UNIQUE (subject_id, permission, resource_id)
     )
     """,
+    # Users (#144: verified-principal registry -- see opencrab/auth.py)
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id      VARCHAR(64)  PRIMARY KEY,
+        display_name VARCHAR(256) NOT NULL,
+        is_local     BOOLEAN      NOT NULL DEFAULT FALSE,
+        disabled     BOOLEAN      NOT NULL DEFAULT FALSE,
+        created_at   TIMESTAMPTZ  DEFAULT NOW()
+    )
+    """,
+    # At most one is_local=TRUE user -- stdio/CLI needs exactly one to bind to.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_local
+    ON users (is_local) WHERE is_local = TRUE
+    """,
+    # API tokens. token_hash is the sha256 hex of the presented secret --
+    # the plaintext is never persisted (see #144 acceptance criteria).
+    """
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token_id     VARCHAR(64)  PRIMARY KEY,
+        user_id      VARCHAR(64)  NOT NULL REFERENCES users (user_id),
+        token_hash   VARCHAR(64)  NOT NULL UNIQUE,
+        name         VARCHAR(256),
+        created_at   TIMESTAMPTZ  DEFAULT NOW(),
+        last_used_at TIMESTAMPTZ,
+        revoked_at   TIMESTAMPTZ
+    )
+    """,
+    # Pack ownership/visibility registry (#143 sec. "설계의 축"). Created here
+    # so #146 can start without a DDL migration; not read/written by anything
+    # yet in this PR.
+    """
+    CREATE TABLE IF NOT EXISTS packs (
+        pack_id      VARCHAR(256) PRIMARY KEY,
+        owner_id     VARCHAR(64)  NOT NULL REFERENCES users (user_id),
+        visibility   VARCHAR(32)  NOT NULL DEFAULT 'private',
+        title        VARCHAR(512),
+        description  TEXT,
+        forked_from  VARCHAR(256),
+        created_at   TIMESTAMPTZ  DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ  DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_packs_owner ON packs (owner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_packs_visibility ON packs (visibility)",
 ]
 
 # SQLite-compatible equivalents (no SERIAL, no TIMESTAMPTZ)
@@ -133,6 +178,55 @@ _TABLES_SQL_SQLITE = [
         UNIQUE (subject_id, permission, resource_id)
     )
     """,
+    # Users (#144: verified-principal registry -- see opencrab/auth.py).
+    # is_local/disabled get an explicit value-domain CHECK on SQLite --
+    # PostgreSQL's BOOLEAN columns already constrain the domain by type, but
+    # SQLite has no BOOLEAN type (it's just an INTEGER convention), so
+    # nothing before this stopped e.g. is_local=2 from being written.
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id      TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        is_local     INTEGER NOT NULL DEFAULT 0 CHECK (is_local IN (0, 1)),
+        disabled     INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)),
+        created_at   TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    # At most one is_local=1 user -- stdio/CLI needs exactly one to bind to.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_local
+    ON users (is_local) WHERE is_local = 1
+    """,
+    # API tokens. token_hash is the sha256 hex of the presented secret --
+    # the plaintext is never persisted (see #144 acceptance criteria).
+    """
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token_id     TEXT PRIMARY KEY,
+        user_id      TEXT NOT NULL REFERENCES users (user_id),
+        token_hash   TEXT NOT NULL UNIQUE,
+        name         TEXT,
+        created_at   TEXT DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        revoked_at   TEXT
+    )
+    """,
+    # Pack ownership/visibility registry (#143 sec. "설계의 축"). Created here
+    # so #146 can start without a DDL migration; not read/written by anything
+    # yet in this PR.
+    """
+    CREATE TABLE IF NOT EXISTS packs (
+        pack_id      TEXT PRIMARY KEY,
+        owner_id     TEXT NOT NULL REFERENCES users (user_id),
+        visibility   TEXT NOT NULL DEFAULT 'private',
+        title        TEXT,
+        description  TEXT,
+        forked_from  TEXT,
+        created_at   TEXT DEFAULT (datetime('now')),
+        updated_at   TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_packs_owner ON packs (owner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_packs_visibility ON packs (visibility)",
 ]
 
 
@@ -486,16 +580,54 @@ class SQLStore:
     # ------------------------------------------------------------------
 
     def table_counts(self) -> dict[str, int]:
-        """Return row counts for all tables."""
+        """Return row counts for tables that currently exist.
+
+        A store opened with ``create_tables=False`` (see
+        ``factory.make_billing_sql_store``), or a pre-#144 database that
+        predates the users/api_tokens/packs tables, may not have all of
+        the tables below -- querying one unconditionally raised "no such
+        table". Pre-querying which tables actually exist and counting only
+        those avoids that. Deliberately NOT per-table try/except: on
+        PostgreSQL a failed statement aborts the whole transaction, so any
+        count after the first failure would fail too.
+        """
         if not self._available:
             return {}
 
         from sqlalchemy import text
 
+        tables = [
+            "ontology_nodes",
+            "ontology_edges",
+            "impact_records",
+            "lever_simulations",
+            "rebac_policies",
+            "users",
+            "api_tokens",
+            "packs",
+        ]
         counts: dict[str, int] = {}
-        tables = ["ontology_nodes", "ontology_edges", "impact_records", "lever_simulations", "rebac_policies"]
         with self._engine.connect() as conn:
+            if self._is_sqlite:
+                existing = {
+                    row[0]
+                    for row in conn.execute(
+                        text("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    )
+                }
+            else:
+                existing = {
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = current_schema()"
+                        )
+                    )
+                }
             for table in tables:
+                if table not in existing:
+                    continue
                 row = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).fetchone()  # noqa: S608
                 counts[table] = int(row[0]) if row else 0
         return counts

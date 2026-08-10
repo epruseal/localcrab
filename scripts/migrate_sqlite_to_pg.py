@@ -128,6 +128,37 @@ def _pg_count(pg_conn: Any, text: Any, table: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# #144 fail-closed guard — migrate_sql's table list below does not (and, per
+# the issue, cannot yet safely) copy users/api_tokens/packs. A run that
+# completes without them silently drops every user and every issued token
+# while still printing RESULT: PASS — --verify would not catch it either,
+# since it only re-checks tables already present in migrate_sql's own count
+# map. Detect this BEFORE any work happens (dry-run included) and require an
+# explicit opt-in to proceed.
+# ---------------------------------------------------------------------------
+
+_AUTH_TABLES = ("users", "api_tokens", "packs")
+
+
+def _sqlite_table_names(db_path: str) -> set[str]:
+    """Real (non-internal) table names in a SQLite file."""
+    conn = _sqlite_conn(db_path)
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    finally:
+        conn.close()
+    return {r[0] for r in rows if not r[0].startswith("sqlite_")}
+
+
+def _auth_tables_present(sql_db_path: str) -> list[str]:
+    """Sorted #144 auth tables present in the source opencrab.db, or [] if the
+    file doesn't exist or has none."""
+    if not os.path.exists(sql_db_path):
+        return []
+    return sorted(_sqlite_table_names(sql_db_path) & set(_AUTH_TABLES))
+
+
+# ---------------------------------------------------------------------------
 # Per-store migration
 # ---------------------------------------------------------------------------
 
@@ -520,6 +551,13 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None, help="cap rows copied per table (smoke-test aid)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true", help="assert PG row counts == source after run")
+    ap.add_argument(
+        "--allow-unmigrated",
+        action="store_true",
+        help="proceed even though source has users/api_tokens/packs (#144) that "
+        "this script's table list does not copy (excluded tables are listed in "
+        "the final summary); without this flag such a source aborts the run",
+    )
     args = ap.parse_args()
 
     from opencrab.config import get_settings
@@ -540,6 +578,21 @@ def main() -> int:
     print(f"# pg-url   : {pg_url}")
     print(f"# only     : {sorted(only)}")
     print(f"# dry-run  : {args.dry_run}")
+
+    excluded_auth_tables: list[str] = []
+    if "sql" in only:
+        excluded_auth_tables = _auth_tables_present(sql_db)
+        if excluded_auth_tables and not args.allow_unmigrated:
+            print(
+                f"! source has auth table(s) {excluded_auth_tables} that this "
+                "migration's table list does not copy (#144) — completing would "
+                "silently drop every user and every issued token while still "
+                "reporting success. Pass --allow-unmigrated to proceed anyway "
+                "(excluded tables will be listed in the final summary)."
+            )
+            return 2
+        if excluded_auth_tables:
+            print(f"# [sql] --allow-unmigrated: excluding {excluded_auth_tables} from migration")
 
     from sqlalchemy import create_engine
 
@@ -575,8 +628,10 @@ def main() -> int:
         print(f"! migration failed: {exc}")
         return 1
 
+    excluded_note = f" (excluded: {excluded_auth_tables})" if excluded_auth_tables else ""
+
     if args.dry_run:
-        print("RESULT: PASS (dry-run, no writes)")
+        print(f"RESULT: PASS (dry-run, no writes){excluded_note}")
         return 0
 
     if args.verify:
@@ -601,10 +656,10 @@ def main() -> int:
         if mismatches:
             print(f"RESULT: FAIL ({len(mismatches)} mismatches)")
             return 5
-        print("RESULT: PASS (all row counts match)")
+        print(f"RESULT: PASS (all row counts match){excluded_note}")
         return 0
 
-    print("RESULT: PASS (migration complete; pass --verify to assert row-count parity)")
+    print(f"RESULT: PASS (migration complete; pass --verify to assert row-count parity){excluded_note}")
     return 0
 
 

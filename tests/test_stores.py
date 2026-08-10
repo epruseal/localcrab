@@ -259,6 +259,103 @@ class TestSQLStoreUnit:
         assert isinstance(counts, dict)
         assert "ontology_nodes" in counts
         assert "rebac_policies" in counts
+        # #144: users/api_tokens/packs tables added alongside rebac_policies.
+        assert counts["users"] == 0
+        assert counts["api_tokens"] == 0
+        assert counts["packs"] == 0
+
+    def test_table_counts_on_store_with_create_tables_false(self, tmp_path):
+        """A store opened with create_tables=False (e.g.
+        factory.make_billing_sql_store) has NO tables at all -- table_counts
+        must not raise "no such table", just report an empty dict."""
+        from opencrab.stores.sql_store import SQLStore
+
+        store = SQLStore(f"sqlite:///{tmp_path / 'empty.db'}", create_tables=False)
+        assert store.table_counts() == {}
+
+    def test_table_counts_on_pre_144_database(self, tmp_path):
+        """A database created before #144 has only the original five
+        tables -- users/api_tokens/packs don't exist yet. table_counts must
+        report counts for the five that exist and simply omit the rest,
+        not raise."""
+        from sqlalchemy import create_engine, text
+
+        from opencrab.stores.sql_store import SQLStore
+
+        db_path = tmp_path / "pre144.db"
+        pre_144_tables = [
+            """
+            CREATE TABLE ontology_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT NOT NULL,
+                node_type TEXT NOT NULL, node_id TEXT NOT NULL
+            )
+            """,
+            "CREATE TABLE ontology_edges (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE impact_records (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE lever_simulations (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE rebac_policies (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        ]
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            for ddl in pre_144_tables:
+                conn.execute(text(ddl))
+        engine.dispose()
+
+        store = SQLStore(f"sqlite:///{db_path}", create_tables=False)
+        counts = store.table_counts()
+        assert set(counts) == {
+            "ontology_nodes", "ontology_edges", "impact_records",
+            "lever_simulations", "rebac_policies",
+        }
+        assert "users" not in counts
+        assert "api_tokens" not in counts
+        assert "packs" not in counts
+
+    def test_fresh_schema_rejects_is_local_out_of_domain(self, sql_store):
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+
+        with pytest.raises(IntegrityError):
+            with sql_store._engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO users (user_id, display_name, is_local) "
+                        "VALUES ('u1', 'Bad', 2)"
+                    )
+                )
+
+    def test_fresh_schema_rejects_disabled_out_of_domain(self, sql_store):
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+
+        with pytest.raises(IntegrityError):
+            with sql_store._engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO users (user_id, display_name, disabled) "
+                        "VALUES ('u1', 'Bad', 2)"
+                    )
+                )
+
+    def test_fresh_schema_rejects_second_local_user(self, sql_store):
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+
+        with sql_store._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (user_id, display_name, is_local) "
+                    "VALUES ('u1', 'Local One', 1)"
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with sql_store._engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO users (user_id, display_name, is_local) "
+                        "VALUES ('u2', 'Local Two', 1)"
+                    )
+                )
 
     def test_unavailable_store_raises(self):
         from opencrab.stores.sql_store import SQLStore
