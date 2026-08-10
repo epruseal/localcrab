@@ -201,10 +201,31 @@ class TestNodeFieldDefaults:
         assert got != resolve_node_space_type("concept", "Concept")[0], (
             "전제: claim 과 concept 의 effective space 가 달라야 이 검사가 유효하다")
 
-    def test_present_node_type_is_not_overridden_by_the_default(self):
-        got = gf.effective_spaces([{"id": "d1", "label": "d1",
-                                    "space": "resource", "node_type": "Document"}])["d1"]
-        assert got == resolve_node_space_type("resource", "Document")[0]
+    def test_node_type_actually_changes_the_effective_space(self):
+        """`node_type` 키를 **읽는지**를 건다.
+
+        `resource`+`Document` 같은 조합으로는 안 갈린다 — 그 space 는 node_type 과
+        무관하게 같은 답이 나오기 때문이다(스윕 실측: `const:'node_type'->''@L48` 생존).
+        node_type 이 결과를 실제로 바꾸는 조합을 써야 축이 갈린다.
+        """
+        row = {"id": "a1", "label": "a1", "space": "subject", "node_type": "AdminRule"}
+        got = gf.effective_spaces([row])["a1"]
+        assert got == resolve_node_space_type("subject", "AdminRule")[0]
+        assert got != resolve_node_space_type("subject", "Concept")[0], (
+            "전제: AdminRule 이 기본 Concept 과 다른 space 를 내야 이 검사가 유효하다")
+
+    def test_node_type_default_value_is_unreachable_by_design(self):
+        """`n.get("node_type", "Concept")` 의 **기본값**은 결과를 바꿀 수 없다 — 등가 증명.
+
+        9-space 전수로 `Concept` · `None` · `""` 셋이 **모두 같은 답**을 낸다. 그래서
+        그 리터럴을 흔드는 변이 2종(`'Concept'->''`, `drop-get-default`)이 살아남는다.
+        결함이 아니라 도달 불가다. 이 단언이 깨지면 = 기본값이 의미를 갖게 됐다는 뜻이고,
+        그때는 위 2종이 진짜 미검사 축이 되므로 픽스처를 추가해야 한다.
+        """
+        for sp in ["subject", "community", "policy", "claim", "concept",
+                   "resource", "evidence", "lever", "outcome"]:
+            got = {resolve_node_space_type(sp, t)[0] for t in ("Concept", None, "")}
+            assert len(got) == 1, f"{sp}: node_type 기본값이 결과를 바꾼다 {got}"
 
 
 class TestBulkImportEdgeKeys:
