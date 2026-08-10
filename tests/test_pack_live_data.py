@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from opencrab.pack.live_data import require_live_data
@@ -29,8 +31,7 @@ def _clean_env(monkeypatch):
 
 
 def _lab(tmp_path):
-    """심링크가 섞이지 않은 실험장. macOS `tmp_path` 는 pytest 가 이미 resolve 해 주지만
-    그 사실에 의존하지 않고, 케이스마다 필요한 것을 명시적으로 만든다."""
+    """값 코퍼스가 참조할 실물들. 심링크 3종을 실제로 만든다."""
     real = tmp_path / "real"
     real.mkdir()
     afile = tmp_path / "afile"
@@ -44,73 +45,121 @@ def _lab(tmp_path):
     return real, afile, link_dir, link_file, dangling
 
 
-# 거부해야 할 값. 각 행의 주석은 **그 행이 없으면 살아남는 변이**다.
-_REJECT = {
-    "리터럴 틸드":            lambda tp, lab: "~",                       # expanduser()
-    "틸드+하위경로":          lambda tp, lab: "~/localcrab",             # expanduser()
-    "앞뒤 공백":              lambda tp, lab: f" {lab[0]} ",               # d.strip()
-    "없는 중간요소+..":       lambda tp, lab: str(tp / "ghost" / ".." / "real"),
-                                                                       # resolve/normpath/realpath
-    "파일 심링크":            lambda tp, lab: str(lab[3]),                 # or is_symlink()
-    "끊어진 심링크":          lambda tp, lab: str(lab[4]),                 # or is_symlink()
-    "없는 상대경로":          lambda tp, lab: "no/such/relative/dir",    # isabs 분기
-    "파일":                   lambda tp, lab: str(lab[1]),                 # exists()
-    "없는 절대경로":          lambda tp, lab: str(tp / "nope"),
+# 값 **코퍼스**. 기대 판정을 붙이지 않는다 — 그것은 아래 오라클이 계산한다.
+# 표에 기대값을 손으로 적던 판은 열거 밖 변형 축이 그대로 열려 있었다.
+_CORPUS = {
+    "실재 디렉터리":       lambda tp, lab: str(lab[0]),
+    "디렉터리 심링크":     lambda tp, lab: str(lab[2]),
+    "파일":                lambda tp, lab: str(lab[1]),
+    "파일 심링크":         lambda tp, lab: str(lab[3]),
+    "끊어진 심링크":       lambda tp, lab: str(lab[4]),
+    "없는 절대경로":       lambda tp, lab: str(tp / "nope"),
+    "없는 상대경로":       lambda tp, lab: "no/such/relative/dir",
+    "없는 중간요소+..":    lambda tp, lab: str(tp / "ghost" / ".." / "real"),
+    "리터럴 틸드":         lambda tp, lab: "~",
+    "틸드+하위경로":       lambda tp, lab: "~/localcrab",
+    "앞뒤 공백":           lambda tp, lab: f" {lab[0]} ",
+    # 아래 4종은 오라클 전환과 함께 들어온 축이다. 각각 expandvars / rstrip /
+    # 백슬래시 변환 / OSError 삼킴 변이를 가른다(적대 검증 실증, 2026-08-10: B1·B3·B4·B8).
+    "env 변수 표기":       lambda tp, lab: "$TMPDIR",
+    "env 변수 중괄호":     lambda tp, lab: "${HOME}",
+    "후행 개행":           lambda tp, lab: f"{lab[0]}\n",
+    "백슬래시 구분자":     lambda tp, lab: str(tp).replace("/", "\\") + "\\real",
+    "초장문 경로":         lambda tp, lab: "/tmp/" + "a" * 4096,
 }
 
-# 수용해야 할 값. **이쪽이 없으면 위 거부 목록이 과잉 계약이 된다** —
-# 심링크를 통째로 막는 구현도 거부 목록만으로는 통과해 버린다.
-_ACCEPT = {
-    "실재 디렉터리":          lambda tp, lab: str(lab[0]),
-    "디렉터리 심링크":        lambda tp, lab: str(lab[2]),
-}
+
+def _oracle(value: str) -> bool:
+    """계약 그 자체. 이 함수가 곧 불변식이다.
+
+    가드가 값을 **어떻게** 판정해야 하는지를 여기 한 번만 적는다. 값별 기대 판정을
+    손으로 적으면 열거 밖 변형이 남지만, 오라클과 대사하면 코퍼스에 그 변형이 건드리는
+    값이 하나만 있어도 변이가 죽는다.
+
+    `is_dir()` 이 `OSError` 로 답을 못 하면 **수용해선 안 된다** — 판정 불가를
+    통과로 바꾸는 것이 곧 확대다.
+    """
+    if not value:
+        return False          # 미설정과 같은 취급(별도 분기, 아래 테스트가 따로 건다)
+    try:
+        return pathlib.Path(value).is_dir()
+    except OSError:
+        return False
 
 
-class TestAcceptanceSetIsExactlyIsDir:
-    """수용 집합을 **표로** 못박는다 — 케이스 하나씩 붙이는 방식은 두 번 뚫렸다.
+class TestVerdictEqualsIsDir:
+    """수용 집합은 **정확히** ``Path(값).is_dir()`` 이다 — 오라클로 건다.
 
-    처음엔 `resolve()` 변이 하나만 막는 canary 를 넣었다. 그건 **연산자 하나에 대한
-    점 수정**이었고, 같은 클래스(가드가 원본보다 넓은 입력을 수용)에 속한 다른 변이
-    4종이 그대로 살아남았다(적대 검증 실증, 2026-08-10):
+    앞선 두 판은 값을 손으로 열거했다. 처음엔 `resolve()` 하나만(canary), 다음엔
+    거부 9행·수용 2행 표. 표는 지적된 4종을 정확히 닫았지만 **여전히 열거**라서 열거
+    밖 축이 그대로 열려 있었다 — `expandvars`·`rstrip`·백슬래시 변환·`OSError` 삼킴
+    4종이 21 passed 를 유지했다(적대 검증 실증, 2026-08-10: B1·B3·B4·B8).
 
-        expanduser()      `~`                 -> 원본 REJECT / 변이 ACCEPT
-        d.strip()         " …/real "          -> 원본 REJECT / 변이 ACCEPT
-        or is_symlink()   파일·끊어진 심링크   -> 원본 REJECT / 변이 ACCEPT
-        isabs 분기         없는 상대경로        -> 원본 REJECT / 변이 ACCEPT
-
-    `~` 가 위험한 이유는 구체적이다: 따옴표로 감싼 env 값(`.env`, docker-compose,
-    Makefile)에서 셸은 틸드를 전개하지 않는다. `LOCAL_DATA_DIR="~"` 가 홈으로 전개돼
-    통과하면 이 가드가 스스로 정의한 실패 모드가 그대로 발생한다.
-
-    같은 클래스가 두 번 뚫렸으므로 회피 케이스를 또 붙이지 않고 축 전체를 닫는다.
+    변형 함수는 무한하다. 열거로는 못 따라간다. 반면 불변식은 한 줄이다 —
+    그것을 문장이 아니라 **실행되는 오라클**로 쓰면 축 전체가 닫힌다.
+    그러면서도 `Path(d).absolute()`·`os.path.isdir(d)` 같은 **진성 등가**는 오라클과
+    판정이 같으므로 계속 산다. 과잉 계약 없이 클래스만 닫힌다.
     """
 
-    @pytest.mark.parametrize("case", sorted(_REJECT))
-    def test_rejected(self, case, monkeypatch, tmp_path):
-        value = _REJECT[case](tmp_path, _lab(tmp_path))
+    @pytest.mark.parametrize("case", sorted(_CORPUS))
+    def test_verdict_matches_the_oracle(self, case, monkeypatch, tmp_path):
+        value = _CORPUS[case](tmp_path, _lab(tmp_path))
+        want_accept = _oracle(value)
         monkeypatch.setenv("LOCAL_DATA_DIR", value)
-        with pytest.raises(SystemExit) as ei:
-            require_live_data("load_nodes")
-        assert "경로 없음" in str(ei.value), f"{case}: {value!r}"
+        if want_accept:
+            assert require_live_data("load_nodes") is None, (
+                f"{case}: is_dir() 는 True 인데 가드가 거부했다 — 과잉 거부다. {value!r}")
+        else:
+            with pytest.raises(SystemExit) as ei:
+                require_live_data("load_nodes")
+            assert "경로 없음" in str(ei.value), f"{case}: {value!r}"
 
-    @pytest.mark.parametrize("case", sorted(_ACCEPT))
-    def test_accepted(self, case, monkeypatch, tmp_path):
-        value = _ACCEPT[case](tmp_path, _lab(tmp_path))
-        monkeypatch.setenv("LOCAL_DATA_DIR", value)
-        assert require_live_data("load_nodes") is None, f"{case}: {value!r}"
+    def test_the_corpus_actually_splits_both_ways(self, tmp_path):
+        """코퍼스가 수용·거부 **양쪽**을 담고 있어야 한다.
 
-    def test_the_table_actually_splits_the_axis(self, tmp_path):
-        """표의 각 행이 **실제로** 원본 판정을 가르는지 확인한다.
-
-        거부 행이 사실 `is_dir()` 로도 True 라면 그 행은 아무 변이도 못 잡는 장식이다.
-        표가 커질수록 이런 장식이 섞이기 쉬우므로 표 자신을 검사한다.
+        전부 거부면 "항상 거부" 구현이 통과하고, 전부 수용이면 그 반대다.
+        오라클 방식에서도 코퍼스가 한쪽으로 쏠리면 검출력이 사라진다.
         """
-        from pathlib import Path
         lab = _lab(tmp_path)
-        for case, make in _REJECT.items():
-            assert not Path(make(tmp_path, lab)).is_dir(), f"거부 행인데 is_dir() 이 True: {case}"
-        for case, make in _ACCEPT.items():
-            assert Path(make(tmp_path, lab)).is_dir(), f"수용 행인데 is_dir() 이 False: {case}"
+        verdicts = [_oracle(make(tmp_path, lab)) for make in _CORPUS.values()]
+        assert any(verdicts), "코퍼스에 수용되는 값이 하나도 없다"
+        assert not all(verdicts), "코퍼스에 거부되는 값이 하나도 없다"
+        assert len(verdicts) == len(_CORPUS) >= 15, f"코퍼스 {len(verdicts)}행"
+
+
+class TestReadsOnlyOneEnvKey:
+    """**출처 축**은 값 코퍼스로 못 잡는다 — 소스로 닫는다.
+
+    `LOCAL_DATA_DIR` 이 없을 때 다른 키로 폴백하거나, 백도어 env 로 가드를 통째로
+    건너뛰게 만드는 변이는 **입력값이 아니라 입력 출처**를 바꾼다. 어떤 값을 넣어도
+    안 갈리므로 오라클로는 원리적으로 못 잡는다(적대 검증 실증, 2026-08-10: B9·B10).
+
+        DATA_DIR 폴백        미설정 + DATA_DIR=실재            -> 원본 REJECT / 변이 ACCEPT
+        SKIP 백도어          없는 경로 + SKIP_LIVE_GUARD=1     -> 원본 REJECT / 변이 ACCEPT
+
+    값 축은 위 오라클이, 출처 축은 여기가 닫는다. 축을 갈라야 `Path(d).absolute()`
+    같은 정상 리팩터를 막지 않으면서 둘 다 닫힌다.
+    """
+
+    def test_environ_is_read_exactly_once_with_one_key(self):
+        import ast
+
+        import opencrab.pack.live_data as m
+        src = pathlib.Path(m.__file__).read_text(encoding="utf-8")
+        fn = next(n for n in ast.parse(src).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "require_live_data")
+        reads = []
+        for x in ast.walk(fn):
+            if isinstance(x, ast.Attribute) and x.attr == "environ":
+                reads.append(ast.unparse(x))
+            elif isinstance(x, ast.Name) and x.id == "environ":
+                reads.append(x.id)
+        assert len(reads) == 1, (
+            f"가드가 os.environ 을 {len(reads)}회 읽는다 — 폴백 키나 백도어가 끼어들 자리다: {reads}")
+        keys = [c.value for x in ast.walk(fn) if isinstance(x, ast.Call)
+                for c in x.args if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+        assert keys == ["LOCAL_DATA_DIR"], (
+            f"가드가 읽는 env 키가 LOCAL_DATA_DIR 하나가 아니다: {keys}")
 
 
 class TestRejectsUnusableTargets:

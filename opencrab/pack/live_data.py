@@ -9,6 +9,16 @@
 읽기 전용 도구는 호출하지 않는다(라이브가 없는 장비에서 통째로 죽으면 안 된다 — import
 시점 가드가 실제로 읽기 전용 게이트 2종을 죽인 적이 있다).
 
+**불변식 — 이 가드는 ``LOCAL_DATA_DIR`` 값을 어떤 방식으로도 변형하지 않는다.**
+수용 집합은 정확히 ``Path(값).is_dir()`` 이다. ``expanduser``·``strip``·``resolve``·
+``normpath``·``realpath``·``expandvars``·``normcase``·``is_symlink`` 관용은 전부
+"개선"처럼 보이지만 이 가드에 한해서는 **약화**다 — 정규화는 예외 없이 수용 집합을 넓히고,
+넓어진 만큼이 엉뚱한 저장소다. 그리고 ``os.environ`` 은 **정확히 한 번, 이 키로만** 읽는다:
+다른 키로 폴백하거나 건너뛰기 백도어를 두면 값이 아니라 **출처**가 확대된다.
+(이 문장을 테스트에만 두었더니 다음 사람이 이 파일만 보고 "개선"을 넣을 수 있었다 —
+적대 검증 지적, 2026-08-10. 계약은 ``tests/test_pack_live_data.py`` 가 오라클과
+소스 단언으로 강제한다.)
+
 **설정 해석기가 아니다.** ``opencrab.config`` 의 ``local_data_dir`` 은 미설정 시 홈 파생
 기본값을 만들고, ``opencrab.mcp.tools._lock_data_dir`` 은 없으면 ``os.makedirs`` 로
 **만든다.** 둘 다 "일할 자리를 마련한다"는 목적이라 옳다. 이 가드는 정반대 목적이다 —
@@ -30,5 +40,13 @@ def require_live_data(ctx: str = "") -> None:
     d = os.environ.get("LOCAL_DATA_DIR")
     if not d:
         sys.exit(f"LOCAL_DATA_DIR 미설정 — 쓰기 경로는 대상 저장소를 명시해야 한다{suffix}")
-    if not Path(d).is_dir():
+    # `is_dir()` 이 항상 bool 을 준다는 통념은 틀렸다 — 이름이 너무 길거나(ENAMETOOLONG)
+    # 경로 해석이 실패하면 `OSError` 를 던진다. 그대로 두면 가드가 트레이스백으로 죽어
+    # "PackSchemaError/SystemExit 만 나온다"는 계약이 깨지고, 운영자는 원인을 못 본다.
+    # **답을 못 하는 경우는 거부**다 — 판정 불가를 통과로 바꾸는 것이 곧 수용 집합 확대다.
+    try:
+        ok = Path(d).is_dir()
+    except OSError as exc:
+        sys.exit(f"LOCAL_DATA_DIR 경로 없음: {d} — 경로를 확인할 수 없다({exc}){suffix}")
+    if not ok:
         sys.exit(f"LOCAL_DATA_DIR 경로 없음: {d} — 오타이거나 스테일 export다{suffix}")
