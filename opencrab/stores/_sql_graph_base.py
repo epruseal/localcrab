@@ -851,8 +851,18 @@ class _SqlGraphStoreBase(abc.ABC):
         pack_id, space lives in its own ``space_id`` column, so this is a
         plain equality clause -- no JSON extraction needed. For an accurate
         match count that isn't capped by ``limit``, use
-        ``count_exported_nodes`` instead of ``len(export_nodes(...))``."""
+        ``count_exported_nodes`` instead of ``len(export_nodes(...))``.
+
+        ``limit <= 0`` (issue #120): returns ``[]`` without querying. This
+        matters more than it looks: SQLite treats a bound ``LIMIT -1`` as
+        "no limit at all" (verified -- ``LIMIT ?`` with param ``-1`` returns
+        every row), so without this guard a negative ``limit`` here would
+        silently return the *entire* unbounded table instead of nothing.
+        Kuzu's ``export_nodes`` applies the same ``limit <= 0`` guard so all
+        backends agree on both ``limit=0`` and negative ``limit``."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("graph_nodes")
         # space_id is selected so _merge_space can restore it into props: this
         # backend keeps space in its own column, but the protocol's export shape

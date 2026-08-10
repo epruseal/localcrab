@@ -377,6 +377,92 @@ class GraphStoreExtended(Protocol):
         ``limit`` even with the space/pack_id pushdown above. Use
         ``count_exported_nodes`` instead, which applies the identical
         predicate with no LIMIT.
+
+        ``limit <= 0`` (issue #120): every implementation returns ``[]``
+        immediately, without issuing a query. This is the pinned contract
+        for both ``limit=0`` (0 rows requested -> 0 rows returned, checked
+        BEFORE any row is collected -- Kuzu's ``pack_id`` branch used to
+        collect one row before checking) and negative ``limit`` (which has
+        no natural "N rows" meaning; treating it as unbounded would be a
+        footgun -- e.g. SQLite maps a bound ``LIMIT -1`` to "no limit").
+
+        SCOPE OF "BACKEND-WIDE" (issue #120, round 3 -- this line exists
+        because "every implementation" was declared twice before without
+        saying what "every" enumerates, and a 5th and 6th implementation
+        were found missing the guard each time it wasn't spelled out).
+        DOMAIN of this enumeration: PUBLIC methods on the CONCRETE backend
+        classes in ``opencrab/stores/*.py`` that take a parameter literally
+        named ``limit``. Two exclusions from that domain, for DIFFERENT
+        reasons -- do not collapse them:
+          - the Protocol declarations in THIS file (``GraphStore``,
+            ``GraphStoreExtended``) are excluded because there is nothing
+            to guard: their bodies are ``...``. They state the interface;
+            the guard lives in each implementation.
+          - private helpers are excluded on entirely different grounds:
+            they DO contain real executable code, and each one uses its
+            ``limit`` (``_find_neighbors_1hop`` executes one bounded query
+            per directed pass; ``_build_neighbors_cypher`` executes nothing
+            and returns Cypher containing ``LIMIT $limit`` plus params
+            binding ``limit``, for ``find_neighbors`` to run; ``_expand``
+            runs no query at all and slices an already-fetched batch with
+            ``[:remaining]``).
+            They are excluded because production reaches all three ONLY
+            through ``find_neighbors``, which is itself classified below,
+            so their status is decided there. A guard on a helper would be the
+            wrong placement, not a missing one. If any of them ever gains
+            a second public caller, it stops inheriting and needs its own
+            row here.
+        The ``limit <= 0 -> []`` contract is pinned on exactly the methods
+        enumerated below, no more, no less --
+          - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
+            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared),
+            ``KuzuGraphStore``, ``Neo4jStore``.
+          - ``list_nodes`` / ``list_sources`` / ``get_audit_log`` on all 4
+            doc stores: ``_sql_doc_base.py`` (LocalSQLDocStore + PgDocStore,
+            shared), ``MongoStore``, and ``LocalDocStore`` (the legacy
+            JSON store -- NOT reachable through ``factory.py``, but kept
+            for callers that instantiate it directly per that module's own
+            "WHY LocalDocStore IS KEPT" docstring, so it is in scope too).
+          - ``search_nodes`` on 3 of the 4 graph stores, across 2
+            implementations: ``_sql_graph_base.py`` (LocalGraphStore +
+            PGGraphStore, shared) and ``KuzuGraphStore``. ``Neo4jStore`` has
+            no ``search_nodes`` -- see the GAP TABLE above, which is why
+            this is the one covered method that is not "all 4". Guarded by
+            issue #86, not by #120, but it is the same contract and belongs
+            in this enumeration so the list stays exhaustive.
+        Explicitly NOT covered, left as pre-existing/tracked-separately
+        gaps rather than silently absorbed into this contract:
+          - other ``limit``-accepting GRAPH-store methods --
+            ``find_neighbors``, ``find_by_relations`` and ``export_edges``
+            (issue #131).
+          - other ``limit``-accepting DOC-store methods --
+            ``keyword_search``, implemented separately (NOT shared via
+            ``_sql_doc_base.py``) in ``local_sql_doc_store.py`` and
+            ``pg_doc_store.py``; ``MongoStore`` and ``LocalDocStore`` have
+            none. Both implementations overfetch
+            ``max(1, limit) * 5`` rows and then append BEFORE testing
+            ``len(out) >= limit``, so ``limit <= 0`` yields 1 row rather
+            than 0 -- the same append-before-check shape as the Kuzu bug
+            #120 fixed, tracked separately. And ``bm25_fingerprint`` on
+            ``_sql_doc_base.py`` (no graph store implements it), which
+            accepts a ``limit`` but never applies it: it is a whole-table
+            ``COUNT(*)`` staleness probe and a capped count would pin
+            forever once the corpus exceeds the cap (#63) -- so a
+            ``limit <= 0 -> []`` guard there would be a regression, not a
+            fix. See its own docstring.
+          - ``sql_store.py``'s ``get_impacts``, the only limit-accepting
+            method outside the graph/doc surface. It binds a negative
+            ``limit`` straight into ``LIMIT :limit`` (unbounded on SQLite),
+            but belongs to a different subsystem per that module's own
+            docstring: "impact records, ReBAC policy assignments, lever
+            simulations".
+        NOT in the domain at all, so not an exclusion: the vector stores.
+        ``ChromaStore``, ``PgVectorStore`` and ``SqliteVecStore`` have no
+        ``limit`` parameter anywhere -- they bound top-k with ``n_results``.
+        That is a different parameter, so this contract says nothing about
+        it either way; it is not an exclusion, it is out of scope.
+        A future round extending this contract to one of those must add it
+        to this enumeration, not just fix the code.
         """
         ...
 

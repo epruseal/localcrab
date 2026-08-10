@@ -142,6 +142,18 @@ class TestListNodes:
         assert len(store.list_nodes(space="beta", limit=100)) == 6
         assert len(store.list_nodes(limit=100)) == 10
 
+    def test_list_nodes_limit_zero_returns_empty(self, store):
+        """issue #120 follow-up: 0 rows requested must mean 0 rows back."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=0) == []
+
+    def test_list_nodes_negative_limit_returns_empty(self, store):
+        """``rows[:limit]`` with a negative limit is Python slicing (drops
+        the last ``abs(limit)`` rows), not "no limit" -- without the guard
+        this would return 2 rows (all but the last), not []."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=-1) == []
+
 
 # ---------------------------------------------------------------------------
 # delete_node_doc
@@ -198,6 +210,19 @@ class TestSource:
     def test_list_sources_empty_returns_empty(self, store):
         assert store.list_sources() == []
 
+    def test_list_sources_limit_zero_returns_empty(self, store):
+        store.upsert_source("s0", "text", {})
+        assert store.list_sources(limit=0) == []
+
+    def test_list_sources_negative_limit_returns_empty(self, store):
+        # 2 rows, not 1: with only 1 row, unguarded `rows[:-1]` (dropping
+        # "the last row") coincidentally also yields [] and the test would
+        # pass for the wrong reason -- this pins the real "all but last"
+        # bug the guard fixes.
+        store.upsert_source("s0", "text", {})
+        store.upsert_source("s1", "text", {})
+        assert store.list_sources(limit=-1) == []
+
 
 # ---------------------------------------------------------------------------
 # Audit log
@@ -234,6 +259,16 @@ class TestAuditLog:
             store.log_event("tick", None, {})
         result = store.get_audit_log(limit=5)
         assert len(result) == 5
+
+    def test_get_audit_log_limit_zero_returns_empty(self, store):
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=0) == []
+
+    def test_get_audit_log_negative_limit_returns_empty(self, store):
+        # 2 entries, not 1 -- see test_list_sources_negative_limit_returns_empty.
+        store.log_event("tick", None, {})
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=-1) == []
 
     def test_get_audit_log_empty(self, store):
         assert store.get_audit_log() == []

@@ -101,6 +101,14 @@ class LocalDocStore:
         return data.get(f"{space}::{node_id}")
 
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0`` (issue #120 follow-up): returns ``[]`` without
+        loading -- ``rows[:limit]`` with a negative ``limit`` is Python
+        slicing, not "no limit"/"unlimited" like the other backends' native
+        LIMIT quirks; it means "all but the last ``abs(limit)`` rows", a
+        fourth distinct wrong answer. Same guard, same contract as every
+        other store's list_nodes/export_nodes."""
+        if limit <= 0:
+            return []
         data = self._load("nodes")
         rows = list(data.values())
         if space:
@@ -148,6 +156,10 @@ class LocalDocStore:
         return self._load("sources").get(source_id)
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` -- same contract as ``list_nodes``
+        above."""
+        if limit <= 0:
+            return []
         return list(self._load("sources").values())[:limit]
 
     # ------------------------------------------------------------------
@@ -173,6 +185,10 @@ class LocalDocStore:
             self._save("audit_log", data)
 
     def get_audit_log(self, limit: int = 100, event_type: str | None = None) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` -- same contract as ``list_nodes``
+        above."""
+        if limit <= 0:
+            return []
         data = self._load("audit_log")
         entries = sorted(data.values(), key=lambda e: e["timestamp"], reverse=True)
         if event_type:

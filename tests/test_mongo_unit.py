@@ -125,6 +125,23 @@ class TestMongoStoreNormal:
         cursor.limit.assert_called_once_with(10)
         assert result == [{"node_id": "a"}, {"node_id": "b"}]
 
+    def test_list_nodes_limit_zero_returns_empty_without_querying(self):
+        """issue #120 follow-up: pymongo's own ``Cursor.limit(0)`` means "no
+        limit" (the opposite of this contract), so the guard must stop
+        before ``find`` is ever called -- proven here the same way as the
+        Neo4j export_nodes fix, by asserting the collection method was
+        never invoked."""
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.list_nodes(limit=0) == []
+        mock_db["nodes"].find.assert_not_called()
+
+    def test_list_nodes_negative_limit_returns_empty_without_querying(self):
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.list_nodes(limit=-1) == []
+        mock_db["nodes"].find.assert_not_called()
+
     def test_delete_node_doc_true_when_deleted(self):
         store, _client, mock_db = _make_connected_store()
         mock_db["nodes"].delete_one.return_value = MagicMock(deleted_count=1)
@@ -161,6 +178,18 @@ class TestMongoStoreNormal:
         mock_db["sources"].find.assert_called_once_with({}, {"_id": 0, "text": 0})
         cursor.limit.assert_called_once_with(5)
 
+    def test_list_sources_limit_zero_returns_empty_without_querying(self):
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.list_sources(limit=0) == []
+        mock_db["sources"].find.assert_not_called()
+
+    def test_list_sources_negative_limit_returns_empty_without_querying(self):
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.list_sources(limit=-1) == []
+        mock_db["sources"].find.assert_not_called()
+
     def test_get_audit_log_sorts_desc_and_limits(self):
         store, _client, mock_db = _make_connected_store()
         cursor = mock_db["audit_log"].find.return_value
@@ -175,6 +204,18 @@ class TestMongoStoreNormal:
         cursor.sort.assert_called_once_with("timestamp", -1)
         cursor.limit.assert_called_once_with(20)
         assert result == [{"event_type": "login"}]
+
+    def test_get_audit_log_limit_zero_returns_empty_without_querying(self):
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.get_audit_log(limit=0) == []
+        mock_db["audit_log"].find.assert_not_called()
+
+    def test_get_audit_log_negative_limit_returns_empty_without_querying(self):
+        store, _client, mock_db = _make_connected_store()
+
+        assert store.get_audit_log(limit=-1) == []
+        mock_db["audit_log"].find.assert_not_called()
 
     def test_collection_stats_counts_all_collections(self):
         store, _client, mock_db = _make_connected_store()

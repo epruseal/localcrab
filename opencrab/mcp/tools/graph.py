@@ -325,7 +325,11 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
                         "Maximum number of `nodes` rows returned (default 100). WITH pack_id: "
                         "does NOT cap `total`, which is the full match count regardless of "
                         "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
-                        "IS capped at `limit` (total == len(nodes) always in that case)."
+                        "IS capped at `limit` (total == len(nodes) always in that case). "
+                        "0 or negative values are not an error -- they return an empty `nodes` "
+                        "page (issue #120). This server does not validate `limit` against this "
+                        "schema before calling the handler, so a negative value is never "
+                        "rejected outright; it is simply defined to mean 'no rows'."
                     ),
                     "default": 100,
                 },
@@ -377,6 +381,19 @@ def ontology_list_nodes(
     developer-only and never reaches a client) both say plainly that
     ``total`` is limit-capped in the no-pack_id case, so no caller is told
     a false "always accurate" guarantee in the meantime.
+
+    ``limit <= 0`` (issue #120 follow-up): both branches return ``[]`` (and
+    doc-store's ``total`` is then ``0`` too, since it's ``len(nodes)`` in
+    that branch) -- the WITH-pack_id and WITHOUT-pack_id paths agree here
+    even though they disagree on ``total`` semantics above. This wasn't
+    true for every doc-store backend when the WITH-pack_id side of this
+    contract first landed: MongoStore's ``list_nodes`` passed ``limit``
+    straight to pymongo's ``Cursor.limit()``, where ``0`` means "no limit"
+    (the opposite of this contract) -- same footgun class as SQLite mapping
+    a bound ``LIMIT -1`` to "no limit" in ``_sql_doc_base.py``, just
+    triggered by a different value. All three doc-store backends
+    (LocalSQLDocStore/PgDocStore via ``_sql_doc_base.py``, MongoStore) now
+    guard ``limit <= 0`` before querying, matching the graph store side.
 
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/
@@ -453,7 +470,18 @@ def ontology_list_nodes(
             "type": "object",
             "properties": {
                 "pack_id": {"type": "string", "description": "Optional pack_id filter."},
-                "limit": {"type": "integer", "description": "Maximum results (default 200).", "default": 200},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum results (default 200). Unlike ontology_list_nodes, 0 or "
+                        "negative values here are NOT yet defined to return an empty page -- "
+                        "export_edges' store-side guard for issue #120 is a separate, not-yet-"
+                        "landed fix (tracked in a follow-up issue); a negative value's behavior "
+                        "is backend-dependent today and may return the entire edge set. Do not "
+                        "rely on 0/negative here until that follow-up lands."
+                    ),
+                    "default": 200,
+                },
             },
             "required": [],
         },

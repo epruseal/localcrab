@@ -142,8 +142,20 @@ class MongoStore:
     def list_nodes(
         self, space: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        """List node documents, optionally filtered by space."""
+        """List node documents, optionally filtered by space.
+
+        ``limit <= 0`` (issue #120 follow-up): returns ``[]`` without
+        querying. pymongo's own ``Cursor.limit(0)`` means "no limit" (see
+        its docstring), which is the opposite of what a caller passing 0
+        rows requested means -- same class of footgun as SQLite mapping a
+        bound ``LIMIT -1`` to "no limit" (see ``_sql_doc_base.py``'s
+        ``list_nodes``), just triggered by a different value on a different
+        engine. This guard makes 0 and negative agree with every other
+        backend regardless of which engine is behind the store.
+        """
         self._require_available()
+        if limit <= 0:
+            return []
 
         query: dict[str, Any] = {}
         if space:
@@ -202,8 +214,13 @@ class MongoStore:
         return dict(doc) if doc else None
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
-        """List all ingested sources."""
+        """List all ingested sources.
+
+        ``limit <= 0``: returns ``[]`` without querying -- same contract as
+        ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
 
         cursor = self._db["sources"].find({}, {"_id": 0, "text": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
@@ -239,8 +256,13 @@ class MongoStore:
     def get_audit_log(
         self, limit: int = 100, event_type: str | None = None
     ) -> list[dict[str, Any]]:
-        """Retrieve recent audit log entries."""
+        """Retrieve recent audit log entries.
+
+        ``limit <= 0``: returns ``[]`` without querying -- same contract as
+        ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
 
         query: dict[str, Any] = {}
         if event_type:
