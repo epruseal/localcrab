@@ -17,7 +17,16 @@
 매뉴얼 계산에서 가져온다 — `build_zip` 자체의 출력을 기대값으로 되읽지 않는다.
 
 **변이 스윕 결과(2026-08-10, `scripts/qa/mutate_module.py`) 202종 중 4종 생존,
-전부 등가로 확인됨** — 추론이 아니라 입력 격자로 차분 0을 측정했다:
+전부 등가로 확인됨** — 추론이 아니라 입력 격자로 차분 0을 측정했다.
+
+**이 수치의 범위 한정.** "202종"은 그 도구의 **연산자 집합 안에서만** 참이다. 도구는
+비교 연산자·not·and/or·기본값·상수·문장 삭제·표 리터럴·호출 대상을 흔들 뿐,
+`ZIP_DEFLATED`->`ZIP_STORED` 같은 **상수 교체**나 `writestr` 순서 재배열 축은 만들지
+않는다. 실제로 그 두 축은 스윕이 초록인 채로 적대 검증이 손으로 뚫었고(2026-08-10),
+그래서 `TestPhysicalRepresentation` 을 따로 두었다. 복합(두 위치 동시) 변이도 안 한다.
+"202종 통과"를 "전부 훑었다"로 읽지 마라 — 그 오독이 이번 라운드 사고의 출발점이었다.
+
+생존 4종의 등가 근거:
   - `mkdir(parents=True, exist_ok=True)`의 두 kwarg를 맞바꾸는 변이: 둘 다 상수
     `True`라 이름이 바뀌어도 값이 같다.
   - dangling edge 판정의 `if not src or not tgt: ...` 선점검(boolop 뒤집기·
@@ -597,6 +606,120 @@ class TestErrorMessages:
         with pytest.raises(SystemExit) as ei:
             build_zip(d, tmp_path / "out.zip")
         assert "readable document/chunk" in str(ei.value)
+
+
+class TestPhysicalRepresentation:
+    """ZIP 의 **물리 표현**도 계약이다 — 내용이 같아도 표현이 바뀌면 소비자가 깨진다.
+
+    적대 검증이 실측으로 보였다(2026-08-10): `ZIP_DEFLATED` 를 `ZIP_STORED` 로 바꾸면
+    산출물이 170KB -> 767KB(4.5배)가 되는데 어느 테스트도 안 잡았고, 엔트리 순서를
+    역전시켜도 마찬가지였다. 엔트리 **내용** sha 는 0건 변경이므로 "등가"로 읽을 수도
+    있으나, 업로드 비용과 스트리밍 소비자의 읽기 순서는 등가가 아니다.
+
+    내용 계약(`TestZipStructure` 등)은 무엇이 들어 있는지를 걸고, 여기서는 **어떻게
+    들어 있는지**를 건다.
+    """
+
+    def _out(self, tmp_path):
+        d = _pack(tmp_path, "p", [_n("a", space="resource"), _n("b", space="concept")],
+                  edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        build_zip(d, out)
+        return out
+
+    def test_every_entry_is_deflated_not_stored(self, tmp_path):
+        """무압축으로 바뀌면 배포 비용이 몇 배가 된다. 판정도 해시도 안 바뀌므로
+        압축 방식 자체를 건다."""
+        with zipfile.ZipFile(self._out(tmp_path)) as zf:
+            methods = {i.filename: i.compress_type for i in zf.infolist()}
+        assert set(methods.values()) == {zipfile.ZIP_DEFLATED}, \
+            f"DEFLATED 가 아닌 엔트리가 있다: {methods}"
+
+    def test_entry_order_is_manifest_then_graph_then_cloud(self, tmp_path):
+        """순서를 **리스트로** 단언한다. 집합으로 걸면 역전 변이가 통과한다.
+
+        manifest 가 먼저여야 소비자가 나머지를 읽기 전에 포맷을 판별할 수 있다.
+        """
+        with zipfile.ZipFile(self._out(tmp_path)) as zf:
+            assert zf.namelist() == [
+                "manifest.json",
+                "graph/nodes.jsonl",
+                "graph/edges.jsonl",
+                "cloud/documents.jsonl",
+                "cloud/chunks.jsonl",
+            ]
+
+    def test_node_records_keep_input_order(self, tmp_path):
+        """레코드 순서는 입력 순서다 — 정렬하거나 뒤집지 않는다.
+
+        호출자의 3-jsonl 과 ZIP 안의 `graph/nodes.jsonl` 을 줄 단위로 대사하는
+        소비자가 있으므로 순서가 바뀌면 그 대사가 통째로 어긋난다.
+        """
+        ids = ["z1", "a1", "m1"]                       # 일부러 사전순이 아니다
+        d = _pack(tmp_path, "ord", [_n(i, space="resource") for i in ids],
+                  edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "ord.zip"
+        build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            got = [json.loads(x)["id"]
+                   for x in zf.read("graph/nodes.jsonl").decode().splitlines()]
+        assert got == ids, f"입력 순서가 안 지켜졌다: {got}"
+
+    def test_manifest_indent_is_exactly_two_for_nested_levels(self, tmp_path):
+        """indent=2 를 **중첩 단계까지** 건다. 최상위 키 하나만 보면 indent=4 도 통과한다."""
+        with zipfile.ZipFile(self._out(tmp_path)) as zf:
+            raw = zf.read("manifest.json").decode()
+        assert '\n  "format"' in raw, "최상위 들여쓰기가 2칸이 아니다"
+        assert '\n    "nodes"' in raw, "중첩 들여쓰기가 2칸 단위가 아니다"
+
+
+class TestSpacesCountsOnlyGraphNodes:
+    """`spaces` 집계의 **출처**가 `graph_nodes` 인가(원본 `nodes` 가 아니라).
+
+    id 없는 노드는 `graph/nodes.jsonl` 에 안 실린다. 그런데 `spaces` 를 원본에서 세면
+    manifest 가 "resource 2개"라고 하는데 실제 엔트리에는 1개만 있게 된다 —
+    manifest 와 본문이 어긋나고, 그 어긋남은 counts 만 보는 테스트로는 안 보인다.
+    """
+
+    def test_node_without_id_is_excluded_from_space_distribution(self, tmp_path):
+        d = _pack(tmp_path, "p",
+                  [{"id": "", "label": "no-id", "space": "resource"},
+                   _n("a", space="resource")],
+                  edges=[], chunks=[_c("c1", "hi")])
+        manifest = build_zip(d, tmp_path / "out.zip")
+        assert manifest["spaces"]["resource"] == 1, \
+            "id 없는 노드가 space 분포에 잡혔다 — manifest 와 본문이 어긋난다"
+        assert manifest["counts"]["nodes"] == 1
+        assert sum(manifest["spaces"].values()) == manifest["counts"]["nodes"], \
+            "space 합계와 노드 수가 안 맞는다"
+
+
+class TestAbsentOptionalFieldsBecomeNoneNotMissing:
+    """없는 선택 필드는 **키를 지우는 게 아니라 `None`** 으로 실린다.
+
+    소비자가 `e["created_at"]` 로 읽으면 키가 없을 때 `KeyError` 로 죽는다. 값이
+    `None` 인 것과 키가 없는 것은 다른 계약이고, 전자가 이 포맷의 계약이다.
+    """
+
+    def test_edge_created_at_is_none_when_absent(self, tmp_path):
+        nodes = [_n("n1"), _n("n2")]
+        edges = [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "cites"}]
+        d = _pack(tmp_path, "p", nodes, edges=edges, chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            edge = json.loads(zf.read("graph/edges.jsonl").decode().strip())
+        assert "created_at" in edge, "키 자체가 사라졌다 — 소비자가 KeyError 로 죽는다"
+        assert edge["created_at"] is None
+
+    def test_document_created_at_is_none_when_absent(self, tmp_path):
+        d = _pack(tmp_path, "p", [_n("r1", space="resource")],
+                  edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            doc = json.loads(zf.read("cloud/documents.jsonl").decode().strip())
+        assert "created_at" in doc and doc["created_at"] is None
 
 
 class TestNodeIdFiltering:
