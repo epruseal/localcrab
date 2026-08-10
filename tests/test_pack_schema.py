@@ -5,6 +5,7 @@
   - grammar 표 사본이 정본과 드리프트할 수 있던 구조
 """
 
+import itertools
 import pathlib
 from unittest import mock
 
@@ -262,20 +263,41 @@ class TestDiagnosticIdentifiesTheFailingRow:
         운영자가 수만 행을 고칠 때 "어느 필드부터 채우라"는 지시가 행마다 달라지면
         진단이 쓸모없어진다. 순서는 계약이다.
 
-        전 조합(2개 동시 부재 전부)을 돈다 — 한 조합만 보면 그 조합만 우연히 맞는
-        순서 변이가 살아남는다.
+        **크기 2 에서 멈추지 않는다.** 2개 조합만 돌던 판은 "3개 이상 동시 부재일 때만
+        마지막 필드를 보고"하는 변이를 통과시켰다(적대 검증 실증, 2026-08-10: V3).
+        축을 열어 놓고 깊이를 2에서 끊으면 그 밑은 여전히 무방비다 — `combinations` 로
+        2부터 전 크기까지 돈다(노드 11 · 엣지 11 · 청크 4 = 26 조합).
+
+        **그리고 이 축 위에서 계약을 전부 단언한다.** 앞선 판은 `missing_field` 하나만
+        봤고, 그래서 **같은 축에서** `row_id` 를 `None` 으로 뭉개는 변이가 90 passed 를
+        유지했다(V12). 잃는 것은 이 클래스 docstring 이 "운영자가 수만 행 중 어느 것이
+        문제인지 잃는다"라고 못박은 바로 그 값이다. 단일 부재 테스트는 세 가지를 다 보는데
+        다중 부재만 하나만 보면 대칭이 깨진다.
         """
-        for i, first in enumerate(keys):
-            for later in keys[i + 1:]:
+        seen = 0
+        for r in range(2, len(keys) + 1):
+            for combo in itertools.combinations(keys, r):
+                first = combo[0]          # combinations 는 입력 순서를 보존한다
                 row = builder()
                 row["id"] = "row-1"
-                row[first] = None
-                row[later] = None
+                for k in combo:
+                    row[k] = None
                 with pytest.raises(PackSchemaError) as ei:
                     validator(row)
+                seen += 1
                 assert ei.value.missing_field == first, (
-                    f"{kind}: {first!r}·{later!r} 가 동시에 비었는데 {ei.value.missing_field!r} 를 "
+                    f"{kind}: {list(combo)} 가 동시에 비었는데 {ei.value.missing_field!r} 를 "
                     f"보고했다 — 필수키 선언 순서 {keys} 와 어긋난다")
+                # id 자체가 빈 조합이면 row_id 는 None 이 맞다(그 행에 id 가 없으므로).
+                want_rid = None if "id" in combo else "row-1"
+                assert ei.value.row_id == want_rid, (
+                    f"{kind}: {list(combo)} 에서 row_id 가 {ei.value.row_id!r} — "
+                    f"어느 행이 문제인지 잃는다")
+                assert str(ei.value) == f"{kind}에 필수 필드 {first!r} 가 없다: {want_rid!r}"
+        # 루프가 0회 돌면 위 단언이 **하나도 실행되지 않고** 통과한다.
+        want_seen = sum(1 for r in range(2, len(keys) + 1)
+                        for _ in itertools.combinations(keys, r))
+        assert seen == want_seen, f"조합 순회 {seen}회 (기대 {want_seen})"
 
 
 class TestMissingRequiredTemplate:
@@ -323,9 +345,14 @@ class TestMissingRequiredTemplate:
         2. **런타임 몬키패치에 눈이 멀어 있다.** 클래스 정의 뒤에
            `PackSchemaError.missing_required = classmethod(_sneaky)` 로 갈아치우면 raise
            사이트의 소스 문법은 그대로라 **이 테스트만 단독 실행하면 통과한다**(1 passed).
-           스위트 전체가 24 failed 로 잡는 것은 이 테스트가 아니라 곁의 런타임 동작
-           테스트들이다. 즉 "팩토리 우회를 막는다"는 이 테스트의 방어 범위는
-           **소스 수준 우회까지**다. 그 이상을 기대하지 마라.
+           그 변이를 잡는 것은 이 테스트가 아니라 곁의 런타임 동작 테스트들이다.
+           즉 "팩토리 우회를 막는다"는 이 테스트의 방어 범위는 **소스 수준 우회까지**다.
+           그 이상을 기대하지 마라.
+
+           (실패 **건수**는 근거로 쓰지 마라 — `_sneaky` 본문에 따라 갈린다. 다른 문구를
+           쓰면 27 failed, 원 문구를 베껴 쓰면 13 failed 로 측정됐다. 후자에서는 아래
+           템플릿 리터럴 카운트가 단독으로도 잡는다. 앞선 판이 "24 failed"를 단정값으로
+           적었는데 재현되지 않았다 — 적대 검증 지적, 2026-08-10.)
         """
         import ast
         import pathlib
@@ -372,14 +399,20 @@ class TestValidateNode:
             validate_node(row)
 
     @pytest.mark.parametrize("key", ["id", "label", "node_type", "space"])
-    def test_empty_string_required_field_rejected(self, key):
+    @pytest.mark.parametrize("empty", ["", 0, False, [], {}])
+    def test_empty_value_required_field_rejected(self, key, empty):
         """`if not row.get(key)` 를 `if key not in row` 로 바꿔도 생존했다(변이).
 
         빈 문자열 id 는 dangling 검사를 통과하면서 라이브에 유령 노드를 만든다 —
         "키가 있다"가 아니라 "값이 있다"가 계약이다.
+
+        **falsy 를 `""` 하나로 고정하지 않는다.** 빈 문자열만 넣던 판은
+        `not row.get(key)` 를 `row.get(key) in (None, "")` 로 바꾸는 변이를 통과시켰고,
+        그러면 `id=0` 인 노드가 검증을 통째로 빠져나간다(적대 검증 실증, 2026-08-10: V11).
+        위 유령 노드 사고와 같은 클래스이고 값의 **타입**만 다르다.
         """
         with pytest.raises(PackSchemaError, match="필수 필드"):
-            validate_node(_node(**{key: ""}))
+            validate_node(_node(**{key: empty}))
 
     def test_space_outside_nine_space_rejected(self):
         with pytest.raises(PackSchemaError, match="9-space"):
@@ -415,6 +448,17 @@ class TestValidateEdge:
         with pytest.raises(PackSchemaError, match="필수 필드"):
             validate_edge(row)
 
+    @pytest.mark.parametrize("key", ["id", "source_id", "target_id", "label"])
+    @pytest.mark.parametrize("empty", ["", 0, False, [], {}])
+    def test_empty_value_required_field_rejected(self, key, empty):
+        """엣지도 `not row.get(key)` 다 — 노드와 같은 계약이 걸려야 한다.
+
+        한쪽만 걸면 `row.get(key) in (None, "")` 변이가 엣지에서만 살아남는다
+        (적대 검증 실증, 2026-08-10: V11).
+        """
+        with pytest.raises(PackSchemaError, match="필수 필드"):
+            validate_edge(_edge(**{key: empty}))
+
     def test_stray_top_level_rejected_no_legacy_path(self):
         """엣지에는 레거시 흡수 경로가 없다 — 전수 실측에서 0건이므로 관용하지 않는다."""
         with pytest.raises(PackSchemaError, match="비구조 키"):
@@ -436,9 +480,26 @@ class TestValidateChunk:
         with pytest.raises(PackSchemaError, match="필수 필드"):
             validate_chunk(row)
 
-    def test_empty_text_is_valid(self):
-        """빈 청크는 계약 위반이 아니다 — 필드 부재만 위반이다."""
-        validate_chunk(_chunk(text=""))
+    @pytest.mark.parametrize("empty", ["", 0, False])
+    def test_falsy_but_present_values_are_valid(self, empty):
+        """청크만 `is None` 이다 — 이 **비대칭은 의도**이고, 그 자체가 계약이다.
+
+        빈 청크는 계약 위반이 아니다(필드 부재만 위반). 그래서 노드·엣지의 falsy 거부를
+        청크로 확장하면 안 된다.
+
+        앞선 판은 이 비대칭을 `text=""` 한 케이스로만 지켰고, 그래서 청크의 `is None` 을
+        노드·엣지처럼 falsy 로 바꾸는 변이가 1건만 실패해 잡히긴 했지만 계약의 **방향**이
+        고정되지 않았다(적대 검증 지적, 2026-08-10: V5·V7c). positive 로 못박는다 —
+        "값이 falsy 여도 **있으면** 통과한다."
+        """
+        validate_chunk(_chunk(text=empty))
+        validate_chunk(_chunk(document_id=empty))
+
+    def test_none_required_field_rejected(self):
+        """부재의 판정 기준은 `None` 이다 — 위 positive 와 짝을 이룬다."""
+        for key in ("id", "document_id", "text"):
+            with pytest.raises(PackSchemaError, match="필수 필드"):
+                validate_chunk(_chunk(**{key: None}))
 
     def test_stray_top_level_rejected(self):
         with pytest.raises(PackSchemaError, match="비구조 키"):
