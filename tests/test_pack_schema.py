@@ -423,68 +423,94 @@ class TestOnlyPackSchemaErrorEscapes:
     properties 가 비 dict 인 행**이 들어가야 한다. 그 둘이 없으면 이 테스트도 장식이다.
     """
 
-    def _rows(self, base, struct_key, extra_bad):
+    # ── 행 생성 축. 하나씩 붙이지 않고 **곱집합**으로 돈다 ────────────────────
+    #
+    # 다섯 라운드 동안 이 corpus 는 축을 하나씩 열었다: 드롭할 키(전수) -> 드롭할 개수
+    # (빈 dict). 매번 **직전에 지적된 축만** 열었고, 그때마다 아직 안 연 축이 뚫렸다
+    # (적대 검증 지적, 2026-08-10). 마지막 라운드에 뚫린 것만 해도 넷이다:
+    #
+    #   Z1  행 길이 2~5 구멍   — 필수 4필드만 있는 최소 엣지가 corpus 에 없었다
+    #   Z4  stray 키가 빈 문자열 — `if stray:` -> `if any(stray)` 가 통과
+    #   Z6  stray **값**이 None — null 하나가 옆의 커스텀 필드까지 함께 통과시킨다
+    #   Z7  노드 space 가 concept 하나뿐 — resource 에서 strict 를 건너뛰면
+    #       **91만 필드 사고가 그대로 재현**되는데 corpus 가 그 분기를 못 본다
+    #
+    # 축을 또 하나 붙이면 여섯 번째가 남는다. 축을 **선언하고 곱집합으로** 돈다.
+    _STRAY_VARIANTS = (
+        {},
+        {"낯선키": 1},
+        {"낯선키": "x"},
+        {"낯선키": None},                  # stray 값이 null (Z6)
+        {"낯선키": None, "year": 2019},    # null 이 옆의 stray 를 가린다 (Z6)
+        {"": 1},                           # 빈 문자열 키 (Z4)
+        {7: "x"},                          # 비문자열 키 — sorted 전순서 (SORT)
+        {7: "x", "낯선키": 1},
+    )
+
+    def _shapes(self, base, required):
+        """행 **길이** 축. 빈 행 · 1키 · **필수만 있는 최소 행** · 전체.
+
+        양 끝(빈 행·전체)만 채우던 판은 중간 길이에서만 터지는 형태를 통과시켰다
+        (Z1: `len(row)` 가 2~5 일 때만 첨자). 필수 키만 남긴 최소 행이 그 구간이고,
+        그것은 malformed 팩의 전형이다.
+        """
+        full = base()
+        return [
+            {},
+            {k: full[k] for k in list(full)[:1]},
+            {k: full[k] for k in required if k in full},
+            full,
+        ]
+
+    def _rows(self, base, required, extra_bad, spaces=()):
         rows = []
-        # **드롭 축을 구조 키 전수로 연다.** `'id'` 하나만 빼던 판은 다른 키를 첨자로
-        # 읽는 변이를 통과시켰다(적대 검증 실증, 2026-08-10: X5):
-        #
-        #     _ws = row['workspace_id']   # stray raise 직전, 독립 Assign 문
-        #     -> workspace_id 없는 **정상 엣지 행**이 KeyError 로 죽는데 142 passed
-        #
-        # `workspace_id` 를 목록에 추가하는 것은 여섯 번째 점 수정이고 다음엔
-        # `created_at` 이 남는다. 전수로 열면 **어떤 구조 키를 첨자로 읽든, raise 안이든
-        # 밖이든** 잡힌다 — 그래서 아래 AST 가드가 못 보는 형태를 열거할 필요가 없어진다.
-        # 비용: 검사당 9 -> 최대 41행. 무시할 수준이다.
+        # 축 1 — 드롭할 **키**(구조 키 전수) × 축 2 — stray 변형
         for drop in [None, *sorted(base())]:
-            for variant in ({}, {"낯선키": 1}, extra_bad, {"낯선키": 1, **extra_bad}):
+            for variant in self._STRAY_VARIANTS:
                 row = base()
                 row.update(variant)
                 if drop:
                     row.pop(drop, None)
                 rows.append(row)
-        # 비문자열 최상위 키 — `sorted(stray)` 가 int 와 str 을 비교하면 TypeError 다.
-        # 이 행이 없으면 "어떤 dict 를 넣어도"라는 이 클래스의 주장이 거짓인 채 남는다.
-        for variant in ({7: "x"}, {7: "x", "낯선키": 1}):
-            row = base()
-            row.update(variant)
-            rows.append(row)
-        # **드롭 개수 축.** 앞선 판은 "어느 키를 빼는가"를 전수로 열고 "**몇 개**를 빼는가"는
-        # 1에 고정했다. 그래서 **빈 행에서만** 터지는 형태가 통과했다(적대 검증 실증,
-        # 2026-08-10: Y2·Y7):
-        #
-        #     _first = next(iter(row))       -> validate_edge({}) 가 StopIteration
-        #     _v = list(row.values())[0]     -> validate_edge({}) 가 IndexError
-        #
-        # `{}` 는 정상 JSON 이고 malformed JSONL 줄로 실제로 나온다. `StopIteration` 은
-        # 특히 나쁘다 — 적재기가 제너레이터·comprehension 안에서 검사를 부르면 예외가
-        # 아니라 **조용한 순회 종료**로 흡수돼 행이 통째로 사라진다.
-        rows.append({})
-        rows.append({"workspace_id": "pack"})          # 거의 빈 행
-        rows.append({k: base()[k] for k in list(base())[:1]})  # 키 1개만 있는 행
+        # 축 3 — 행 **길이** × 축 2
+        for shape in self._shapes(base, required):
+            for variant in self._STRAY_VARIANTS:
+                row = dict(shape)
+                row.update(variant)
+                rows.append(row)
+        # 축 4 — 노드의 `space` 값. 이 축이 없으면 space 로 분기하는 변이가 안 보인다.
+        for sp in spaces:
+            for variant in self._STRAY_VARIANTS:
+                row = base()
+                row["space"] = sp
+                row.update(variant)
+                rows.append(row)
         # 필수 필드가 전부 빈 극단
         empty = base()
-        for k in struct_key:
+        for k in required:
             empty[k] = None
         rows.append(empty)
+        rows.append(dict(extra_bad))       # 비 dict properties/metadata 단독
         return rows
 
-    @pytest.mark.parametrize("validator,base,keys,bad,kw", [
+    @pytest.mark.parametrize("validator,base,keys,bad,kw,spaces", [
         (validate_node, _node, ("id", "label", "node_type", "space"),
-         {"properties": "dict 아님"}, {}),
+         {"properties": "dict 아님"}, {}, ("concept", "resource")),
         # **strict 모드를 따로 돌린다.** 노드의 stray 검사는 `allow_legacy_top_level=False`
         # 일 때만 도는데 그 인자를 안 주면 `schema.py` 의 노드 stray raise 에 **영원히
         # 도달하지 않는다**. 그래서 그 한 자리만 `sorted(stray)` 로 되돌려도 142 passed
         # 였다(적대 검증 실증, 2026-08-10: SORT_NODE). 형제 3자리를 다 고쳐도 가드가
         # 2자리만 덮으면 세 번째는 무보증이다.
         (validate_node, _node, ("id", "label", "node_type", "space"),
-         {"properties": "dict 아님"}, {"allow_legacy_top_level": False}),
+         {"properties": "dict 아님"}, {"allow_legacy_top_level": False},
+         ("concept", "resource")),
         (validate_edge, _edge, ("id", "source_id", "target_id", "label"),
-         {"properties": "dict 아님"}, {}),
+         {"properties": "dict 아님"}, {}, ()),
         (validate_chunk, _chunk, ("id", "document_id", "text"),
-         {"metadata": "dict 아님"}, {}),
+         {"metadata": "dict 아님"}, {}, ()),
     ])
-    def test_no_other_exception_type_escapes(self, validator, base, keys, bad, kw):
-        for row in self._rows(base, keys, bad):
+    def test_no_other_exception_type_escapes(self, validator, base, keys, bad, kw, spaces):
+        for row in self._rows(base, keys, bad, spaces):
             # **입력 불변성.** 검사가 호출자의 행을 변형하면, 적재기는 검사 뒤 그 행을
             # 그대로 쓰므로 **파일에는 있고 라이브에는 없는** 상태가 된다 — 이 모듈이
             # 존재하는 이유인 91만 필드 사고와 같은 모양이다. 계약이 어디에도 없어서
@@ -495,6 +521,16 @@ class TestOnlyPackSchemaErrorEscapes:
             try:
                 validator(row, **kw)
             except PackSchemaError as exc:
+                # **정체성도 계약이다.** `except PackSchemaError` 는 서브클래스를 잡고
+                # `match=` 도 통과하므로, `__str__` 을 갈아치운 서브클래스가 진단을 통째로
+                # 지워도 143 passed 였다(적대 검증 실증, 2026-08-10: Z2):
+                #     BASELINE  엣지 'e1' 최상위에 비구조 키 ['brand'] 가 있다. …
+                #     Z2        엣지 비구조 키          <- 행 id 와 키 목록이 사라짐
+                # stray raise 는 `missing_field`/`row_id` 를 안 채우므로 문구가 **유일한**
+                # 진단 경로다. 이 파일이 "문구가 계약"이라고 전제하는 이상 클래스도 계약이다.
+                assert type(exc) is PackSchemaError, (
+                    f"{type(exc).__name__} 은 PackSchemaError 의 서브클래스다 — 진단 문구·"
+                    f"속성 계약을 우회할 수 있다. 정확히 PackSchemaError 여야 한다. 입력: {row!r}")
                 # id 키가 **없는** 행이면 `row_id` 는 None 이어야 한다. 이 단언이 없으면
                 # `row.get("id", "<unknown>")` 처럼 **위조 식별자**를 채우는 변이가
                 # 통과한다(적대 검증 실증, 2026-08-10: X1·W10b). 세 라운드가 row_id 를
@@ -510,6 +546,48 @@ class TestOnlyPackSchemaErrorEscapes:
             assert row == before, (
                 f"검사가 호출자의 행을 변형했다 — 적재기는 이 행을 그대로 쓴다. "
                 f"잃은 키={sorted(set(before) - set(row), key=str)}, 입력: {before!r}")
+
+    @pytest.mark.parametrize("validator,base,kw,spaces", [
+        (validate_edge, _edge, {}, ()),
+        (validate_chunk, _chunk, {}, ()),
+        # 노드는 **strict 일 때만** 최상위 커스텀 필드가 위반이다. 기본 모드는 레거시
+        # 흡수 경로라 통과가 정상 — 그래서 이 계약은 strict 행에만 건다.
+        (validate_node, _node, {"allow_legacy_top_level": False}, ("concept", "resource")),
+    ])
+    def test_every_stray_key_is_actually_rejected(self, validator, base, kw, spaces):
+        """**거부해야 할 것이 거부되는가.** 위 테스트는 "잘못된 예외가 새지 않는가"만 본다.
+
+        그 둘은 다른 계약이다. 예외 종류만 보던 판은 **거부를 통째로 건너뛰는** 변이
+        셋을 통과시켰다(적대 검증 실증, 2026-08-10):
+
+            Z4  `if stray:` -> `if any(stray)`     {"": 1} 이 통과
+            Z6  값이 None 인 stray 를 봐줌          {"brand": None, "year": 2019} 가
+                                                   통째로 통과 — year 까지 조용히 사라진다
+            Z7  strict 를 space="resource" 에서 건너뜀
+                                                   -> **91만 필드 사고 그대로 재현**
+
+        Z7 이 특히 무겁다. `resource`/Document 는 팩에서 가장 흔한 노드 타입이고, 그
+        분기가 열리면 새 팩을 strict 로 검사해도 최상위 커스텀 필드가 전량 통과한 뒤
+        적재기는 중첩만 읽는다 — 이 모듈이 존재하는 이유인 바로 그 사고다.
+
+        기대값은 **테스트가 주입한 변형에서** 유도한다. 모듈의 구조 키 집합을 읽어
+        판정하면 그 집합이 바뀔 때 기대값도 따라 바뀌는 자기참조가 된다.
+        """
+        for variant in self._STRAY_VARIANTS:
+            introduced = [k for k in variant if k not in base()]
+            for sp in (spaces or (None,)):
+                row = base()
+                if sp is not None:
+                    row["space"] = sp
+                row.update(variant)
+                if not introduced:
+                    validator(row, **kw)          # 깨끗한 행은 통과해야 한다
+                    continue
+                with pytest.raises(PackSchemaError) as ei:
+                    validator(row, **kw)
+                assert "비구조 키" in str(ei.value), (
+                    f"stray {introduced} 가 있는데 다른 이유로 거부됐거나 문구가 바뀌었다: "
+                    f"{ei.value} / space={sp!r} / 입력 {row!r}")
 
     def test_diagnostics_never_subscript_the_row(self):
         """`raise` **문 안의** 첨자를 막는다 — 방어 범위를 정확히 적는다.
