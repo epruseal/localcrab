@@ -883,3 +883,43 @@ class TestProvenEquivalences:
             seen.add(r["sections"]["scale"])
         assert seen == {1, 4, 7, 10}, f"규모 점수의 실제 치역이 바뀌었다: {sorted(seen)}"
         assert min(seen) >= 1, "0 하한이 도달 가능해졌다 — 등가 증명이 깨졌다"
+
+
+class TestEverySpaceIsActuallyChecked:
+    """9개 space **전부**가 감점 판정을 받는가.
+
+    격자는 `lever`(빈 공간)와 `outcome`(희소)만 감점까지 몰아갔다. 나머지 7개는 픽스처가
+    늘 4개씩 채워 둬서 **판정에 한 번도 안 걸렸다.** 그래서 `NSPACES` 에서 그중 하나를
+    빼도 테스트가 전부 통과한다 — 적대 검증 실측(2026-08-10): 9개를 하나씩 빼 보니
+    `community`·`claim`·`concept`·`evidence` **4개가 99 passed 로 통과**하면서
+    128팩 중 6팩의 점수를 바꿨다.
+
+    "축을 열어 놓고 그 위의 한 점만 고정"이 **space 축 안에서** 또 일어난 것이다.
+    한 space 만 대표로 거는 대신 9개를 전부 돌린다.
+    """
+
+    @pytest.mark.parametrize("sp", SPACES)
+    def test_empty_space_costs_eight_for_every_space(self, tmp_path, sp):
+        r = grade_pack(_pack(tmp_path / f"e-{sp}", _base(**{sp: 0}), [], []))
+        assert r["sections"]["space"] == 17, (
+            f"'{sp}' 를 비웠는데 감점이 8이 아니다 — 이 space 가 NSPACES 에서 빠졌거나 "
+            "이름이 달라졌다")
+        assert any(f"'{sp}' 공간 비어있음" in g for g in r["gaps"]), \
+            f"'{sp}' 가 비었는데 갭이 그 이름을 안 말한다: {r['gaps']}"
+
+    @pytest.mark.parametrize("sp", SPACES)
+    def test_sparse_space_costs_three_for_every_space(self, tmp_path, sp):
+        r = grade_pack(_pack(tmp_path / f"s-{sp}", _base(**{sp: 2}), [], []))
+        assert r["sections"]["space"] == 22, f"'{sp}' 가 2개인데 감점이 3이 아니다"
+        assert any(f"'{sp}' 노드 2개(<3)" in g for g in r["gaps"]), \
+            f"'{sp}' 희소인데 갭이 그 이름을 안 말한다: {r['gaps']}"
+
+    def test_nspaces_is_exactly_these_nine_in_order(self):
+        """목록 자체를 건다 — 원소를 빼거나 이름을 바꾸거나 순서를 흔들면 여기서 죽는다.
+
+        위 두 검사는 **행동**으로 각 space 를 확인한다. 이 검사는 **목록**을 확인한다.
+        둘 다 필요하다: 행동만 걸면 목록에 없는 space 가 추가되는 것을 못 보고,
+        목록만 걸면 이름이 맞는데 판정에 안 쓰이는 경우를 못 본다.
+        """
+        assert gs.NSPACES == ["subject", "community", "policy", "claim", "concept",
+                              "resource", "evidence", "lever", "outcome"]
