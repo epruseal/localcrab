@@ -186,6 +186,92 @@ class TestCustomPropertiesSurvive:
             "최상위 커스텀 필드가 라이브에 도달하지 못했다 — 91만 필드 사고와 같은 형태다")
         assert props.get("중첩") == "값", "중첩 properties 가 유실됐다"
 
+    def test_every_row_kind_carries_pack_id_into_the_store(self, live, tmp_path):
+        """**축 전체를 닫는다** — 노드 하나만 걸던 판은 엣지·청크가 통째로 무방비였다.
+
+        앞선 판은 `test_top_level_custom_field_reaches_the_store` 로 **노드만** 걸었다.
+        측정해 보니 엣지 `properties` 를 빈 dict 로 만드는 변이도, 청크
+        `transform_chunk_meta` 결과를 빈 dict 로 만드는 변이도 **35 passed 를 그대로
+        유지했다**(2026-08-10). 사고가 난 축은 "커스텀 필드가 라이브에 도달하는가"인데
+        세 종류 중 하나에만 못을 박아 둔 것이다.
+
+        그리고 이 축은 표시용이 아니다. `pack_id` 는 세 종류 **전부**의 커스텀 필드
+        안에 있고, 그것이 증분·삭제가 팩을 식별하는 **유일한 키**다:
+
+            노드  properties.pack_id  -> live_pack_state / delete_pack
+            엣지  properties.pack_id  -> live_pack_state
+            청크  metadata.pack_id    -> live_pack_state / delete_pack
+
+        하나라도 유실되면 그 팩은 증분에 안 보이고 삭제도 안 된다 — 파일에는 있는데
+        라이브에서 사라지는 91만 필드 사고와 같은 기전이다. 그래서 스토어를 직접 들여다보지
+        않고 **`live_pack_state` 왕복**으로 건다. 그것이 실제 소비 경로다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2",
+                            "label": "CITES", "properties": {"근거": "본문 3쪽"}}])
+        ok, skip, err = pack_load.load_edges("pack-1", ef, builder, id_map)
+        assert ok == 1, f"엣지 적재 실패 ok={ok} skip={skip} err={err}"
+
+        cf = _write_jsonl(tmp_path / "chunks.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "3"}}])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert set(state["nodes"]) == {"n1", "n2"}, "노드가 pack_id 로 안 찾아진다"
+        assert state["edges"], (
+            "엣지가 pack_id 로 안 찾아진다 — properties 가 라이브에 도달하지 못했다")
+        assert set(state["chunks"]) == {"c1"}, (
+            "청크가 pack_id 로 안 찾아진다 — metadata 가 라이브에 도달하지 못했다")
+
+    def test_edge_keeps_the_original_label_after_normalisation(self, live, tmp_path):
+        """정규화가 라벨을 바꿔도 **원본은 `source_label` 로 남아야** 한다.
+
+        `resolve_edge` 가 `CITES` -> `cites` 처럼 라벨을 갈아치운다. 원본이 사라지면
+        "왜 이 관계가 이렇게 됐는가"를 라이브에서 역추적할 수 없다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+        row = graph._conn.execute(
+            "SELECT properties FROM graph_edges WHERE from_id = ?", ("n1",)).fetchone()
+        assert row is not None, "엣지가 그래프에 없다"
+        props = json.loads(row[0])
+        assert props.get("source_label") == "CITES", (
+            f"원본 라벨이 유실됐다: {props}")
+
+    def test_pack_id_in_the_file_never_overwrites_the_loading_pack(self, live, tmp_path):
+        """덤프에 내장된 `pack_id` 가 적재 대상 팩을 덮으면 안 된다.
+
+        실사고: 엣지 216,711건이 파일 안의 옛 `pack_id` 로 오염됐다. 원본은
+        `origin_pack_id` 로 보존하고 `pack_id` 는 적재 대상으로 강제한다.
+        이 분기는 파일이 `properties.pack_id` 를 **갖고 있을 때만** 갈린다 —
+        그 입력을 안 주면 강제 로직을 지워도 아무도 모른다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES",
+                            "properties": {"pack_id": "낡은-팩"}}])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+        props = json.loads(graph._conn.execute(
+            "SELECT properties FROM graph_edges WHERE from_id = ?", ("n1",)).fetchone()[0])
+        assert props["pack_id"] == "pack-1", "파일의 pack_id 가 적재 대상을 덮었다"
+        assert props["origin_pack_id"] == "낡은-팩", "원본 pack_id 가 보존되지 않았다"
+        assert pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["edges"], (
+            "오염된 pack_id 때문에 엣지가 자기 팩에서 안 보인다")
+
     def test_id_map_records_space_and_type_for_every_row(self, live, tmp_path):
         """엣지 endpoint 해석이 이 맵에 의존한다. 적재 성공 여부와 무관하게 채워져야 한다."""
         builder, _, _ = live
@@ -235,6 +321,33 @@ class TestLoadNodesIncremental:
         n_new, n_chg, n_same, skip, err, _ = pack_load.load_nodes_incremental(
             "pack-1", f, builder, {}, live_nodes, graph, docs)
         assert (n_new, n_chg, n_same) == (0, 1, 0)
+
+    def test_node_type_change_removes_the_old_row(self, live, tmp_path):
+        """타입이 바뀌면 **구 행을 지운 뒤** 새 타입으로 넣어야 한다.
+
+        그래프는 `(node_type, node_id)` 로 행을 잡으므로, 지우지 않으면 같은 id 가
+        두 타입으로 동시에 존재하는 고아가 남는다. 엣지 endpoint 해석이 어느 쪽을
+        잡을지 비결정이 된다.
+
+        앞선 판은 same/chg/new **카운터만** 걸었고, 그래서 `graph.delete_node` 호출을
+        통째로 지우는 변이가 35 passed 를 유지했다(2026-08-10). 카운터가 아니라
+        **스토어 상태**를 봐야 갈리는 분기다 — chg 카운트는 어느 쪽이든 1이다.
+        """
+        builder, graph, docs = live
+        f_old = _write_jsonl(tmp_path / "old.jsonl", [_node(id="n1", node_type="Document")])
+        pack_load.load_nodes("pack-1", f_old, builder, {})
+        assert graph.get_node("Document", "n1") is not None
+
+        live_nodes = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        f_new = _write_jsonl(tmp_path / "new.jsonl",
+                             [_node(id="n1", node_type="Concept", space="concept")])
+        _n, n_chg, _s, _sk, _e, _ids = pack_load.load_nodes_incremental(
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs)
+
+        assert n_chg == 1, "타입 변경이 chg 로 세어지지 않았다"
+        assert graph.get_node("Concept", "n1") is not None, "새 타입 행이 없다"
+        assert graph.get_node("Document", "n1") is None, (
+            "구 타입 행이 남았다 — 같은 id 가 두 타입으로 존재하는 고아다")
 
     def test_unknown_row_is_counted_as_new(self, live, tmp_path):
         builder, graph, docs = live
