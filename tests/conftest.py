@@ -2,8 +2,13 @@
 (e.g. ``_vec_helpers``) can be imported by test modules regardless of pytest's
 import mode."""
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -22,7 +27,27 @@ sys.path.insert(0, os.path.dirname(__file__))
 # (표준 env 로딩 자체를 검증하는 테스트가 이 경로로 실제 파일을 지정한다).
 os.environ.setdefault("LOCALCRAB_ENV_FILE", os.devnull)
 
-import pytest
+# 테스트는 호스트의 **실 데이터 디렉터리**에도 쓰지 않는다.
+#
+# `LOCAL_DATA_DIR` 이 없으면 `Settings` 가 `~/.local/share/localcrab` 로 폴백하고,
+# `opencrab/mcp/tools/__init__.py::_write_lock()` 이 거기에 `write.lock` 을 만든다.
+# 실측(2026-08-10, `HOME` 을 가짜로 두고 전체 스위트 실행): 가짜 HOME 아래
+# `.local/share/localcrab/write.lock` **1개 생성**. 운영자 HOME 이면 그것이 라이브다.
+# 적대 검증도 독립적으로 잡았다 — OS 샌드박스로 그 경로를 막자 11건이 PermissionError 로
+# 실패했다. 즉 그때까지의 초록은 **실 디렉터리에 쓸 수 있어서** 났던 것이다.
+#
+# **`setdefault` 가 아니라 항상 덮는다.** 이 리포의 운영 워크플로는 셸에
+# `LOCAL_DATA_DIR` 을 export 한 채로 돈다 — `setdefault` 면 바로 그 상황에서 보호가
+# 사라진다. 실 디렉터리를 겨냥하려면 `OPENCRAB_TEST_USE_REAL_DATA_DIR=1` 로 **명시**해야
+# 한다(선언은 값이 아니라 의도여야 한다).
+#
+# fixture 가 아니라 모듈 최상단인 이유는 위 `LOCALCRAB_ENV_FILE` 과 같다 —
+# `get_settings()` 는 lru_cache 이고 일부 모듈은 임포트 시점에 Settings 를 만든다.
+_TEST_DATA_DIR = tempfile.mkdtemp(prefix="localcrab-test-data-")
+if os.environ.get("OPENCRAB_TEST_USE_REAL_DATA_DIR") != "1":
+    os.environ["LOCAL_DATA_DIR"] = _TEST_DATA_DIR
+atexit.register(shutil.rmtree, _TEST_DATA_DIR, True)
+
 
 
 @pytest.fixture(scope="session", autouse=True)
