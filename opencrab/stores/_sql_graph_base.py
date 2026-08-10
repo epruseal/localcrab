@@ -123,12 +123,14 @@ from collections import deque
 from typing import Any
 
 from opencrab.stores._graph_common import (
+    KEYWORD_SEARCH_FIELDS,
     _as_dict,
     _edge_passes,
     _merge_space,
     _node_passes,
     _normalize_space,
     _space_passes,
+    _validate_search_fields,
 )
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
@@ -886,6 +888,86 @@ class _SqlGraphStoreBase(abc.ABC):
         where_sql, params = self._export_nodes_where(pack_id, space)
         row = self._fetch_one(f"SELECT COUNT(*) FROM {table}{where_sql}", params)  # noqa: S608
         return int(row[0]) if row else 0
+
+    def search_nodes(
+        self,
+        keyword: str,
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search of ``keyword`` across ``fields``
+        of every node's JSON ``properties``, optionally restricted to
+        ``spaces`` -- both pushed into the SQL WHERE clause ahead of
+        ``LIMIT`` (issue #86, the same "store truncates first, caller
+        filters after" class ``_export_nodes_where`` fixed for #54:
+        ``HybridQuery.keyword_search`` used to fetch only the first
+        50,000 rows via ``export_nodes`` and search only those in Python,
+        silently missing ~80% of a 252k-row corpus with no error). Unlike
+        ``export_nodes``, this ``LIMIT`` is the caller's actual desired
+        result count, not an internal cap -- applying it here is correct
+        once the keyword/space predicate is already in the WHERE clause,
+        because every row that reaches LIMIT already matched.
+
+        Case-insensitivity is done in SQL (``LOWER(...)``) rather than
+        Python so it composes with pushdown; ``%``/``_``/``\\`` in
+        ``keyword`` are escaped so a literal percent or underscore in the
+        search term can't be misread as a SQL LIKE wildcard.
+
+        ``limit <= 0`` short-circuits to ``[]`` without a query (issue
+        #86 boundary check, same class as #120's ``.limit(0)`` Mongo
+        surprise): SQLite treats a NEGATIVE ``LIMIT`` as "no limit at
+        all" (unbounded scan) rather than "zero rows", and PostgreSQL
+        raises ``LIMIT must not be negative`` for the same input --
+        binding ``limit`` straight into ``LIMIT :lim`` would make this one
+        shared method behave three different ways (SQLite: unbounded scan,
+        Postgres: SQL error, ``0``: empty on both) depending on dialect and
+        sign. Clamping here keeps ``limit<=0`` meaning exactly one thing
+        ("caller wants nothing back") on every SQL backend. Checked AFTER
+        ``_require_available()`` so an unavailable store still raises
+        (matching every other guarded method's contract) rather than
+        returning ``[]`` and masking the real problem.
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- each field name below is interpolated directly
+        into a JSON path via ``self._dialect.json_get`` with NO escaping
+        (unlike ``keyword``, which is a bound parameter), so an
+        unvalidated ``fields`` value is a SQL injection vector. See
+        ``_validate_search_fields`` (_graph_common.py) for the rejected
+        payload and why unknown fields raise instead of being silently
+        dropped. An empty ``fields`` tuple returns ``[]`` immediately --
+        an empty WHERE-clause OR-group is invalid SQL (``WHERE ()``), and
+        "search zero fields" has only one sane meaning: no field can ever
+        match, so there is nothing to search for."""
+        self._require_available()
+        if limit <= 0:
+            return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
+        table = self._table("graph_nodes")
+        kw = keyword.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where_parts = [
+            "(" + " OR ".join(
+                f"LOWER({self._dialect.json_get('properties', f)}) LIKE :kw ESCAPE '\\'"
+                for f in fields
+            ) + ")"
+        ]
+        params: dict[str, Any] = {"kw": f"%{kw}%"}
+        if spaces:
+            placeholders = ", ".join(f":space{i}" for i in range(len(spaces)))
+            where_parts.append(f"space_id IN ({placeholders})")
+            params.update({f"space{i}": s for i, s in enumerate(spaces)})
+        params["lim"] = limit
+        sql = (
+            f"SELECT node_type, space_id, properties FROM {table} "
+            f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
+        )
+        rows = self._fetch_all(sql, params)  # noqa: S608
+        return [
+            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            for node_type, space_id, properties in rows
+        ]
 
     def export_edges(
         self,

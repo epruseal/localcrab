@@ -42,9 +42,18 @@ of each store module):
     find_by_relations     yes     yes     yes     yes
     export_nodes          yes     yes     yes     yes
     count_exported_nodes  yes     yes     yes     yes
+    search_nodes          yes     yes     yes     no
     export_edges          yes     yes     yes     yes
     upsert_nodes_batch    yes     yes     yes     yes
     upsert_edges_batch    yes     yes     yes     yes
+
+``search_nodes`` (issue #86) is the one row above that is genuinely "no" for
+Neo4j, not stale -- ``HybridQuery.keyword_search`` never needed a
+Neo4jStore.search_nodes because its Cypher ``CONTAINS`` branch already
+pushes the same keyword/space predicate straight into Cypher without going
+through a store method (see query.py's isinstance branch, which routes
+Local/PG/Kuzu to ``search_nodes`` and leaves Neo4j on that pre-existing
+Cypher path).
 
 CORRECTION (issue #54 audit finding [5], verified by grepping each `def` in
 neo4j_store.py): this table previously marked all 7 "extended" methods NO
@@ -274,6 +283,20 @@ class GraphStore(Protocol):
 class GraphStoreExtended(Protocol):
     """The 7 methods LocalGraphStore/PGGraphStore/KuzuGraphStore share that
     Neo4jStore currently lacks (D3's Stage-4 R5 worklist).
+
+    ``search_nodes`` (issue #86, see the GAP TABLE above) is deliberately
+    NOT declared as an 8th member here, even though it fits this Protocol's
+    "Local/PG/Kuzu have it, Neo4j doesn't" shape: ``test_graph_protocol_
+    contract.py::test_neo4j_satisfies_graph_store_extended`` asserts
+    ``isinstance(neo4j_store, GraphStoreExtended)`` is True, a real
+    per-instance parity check (``@runtime_checkable``) proving Neo4jStore
+    actually implements every declared member -- adding ``search_nodes``
+    here would make that assertion False and break the invariant this
+    Protocol exists to guarantee. ``search_nodes`` has no consumer that
+    checks ``isinstance(store, GraphStoreExtended)`` either: ``query.py``'s
+    only routing check is a concrete-class isinstance tuple (Local/PG/Kuzu),
+    so there is nothing for a Protocol declaration to buy here beyond the
+    GAP TABLE's documentation, which already covers it.
 
     Split into its own Protocol (rather than folded into ``GraphStore``)
     because until D3 implements these on Neo4jStore, no Neo4j instance can

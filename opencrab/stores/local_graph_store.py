@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from typing import Any
 
 from opencrab.stores._json import parse_props  # noqa: F401 — re-exported for tests/callers
@@ -52,6 +53,31 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         self._available = False
         self._init_conn_state(db_path)
         self._init_db()
+
+    def _configure_connection(self, conn: sqlite3.Connection) -> None:
+        """search_nodes()'s keyword predicate (_sql_graph_base.py) matches
+        via SQL ``LOWER(...) LIKE``, but SQLite's builtin ``LOWER()`` is
+        ASCII-only -- a stored "FÜR" stays "FÜR" (issue #86 verifier
+        finding), so it never matches a "für" keyword even though the
+        keyword itself IS lowered (in Python, which IS Unicode-aware) before
+        binding. Overriding the SQL ``lower`` function with Python's
+        ``str.lower`` makes both sides of the comparison use the same
+        Unicode-aware lowering -- matching what the OLD Python-only
+        `keyword_search` did on both sides, and matching PG's already
+        locale-aware ``LOWER()`` / Kuzu's Python-side ``.lower()`` (search_nodes
+        never leaves Python there), so all three backends agree again.
+
+        ``str(s).lower()``, not bare ``s.lower()`` (issue #86 2nd verifier
+        finding): a non-string property value (e.g. ``{"name": 12345}``) hit
+        this UDF and raised, which sqlite3 propagates as an
+        ``OperationalError`` out of the whole query -- crashing
+        ``search_nodes()`` for every node, not just the offending one. The
+        builtin ``LOWER()`` it replaces silently coerces
+        (``LOWER(123) = '123'``), and so do the OLD Python-only
+        `keyword_search` (``str(val).lower()``) and Kuzu's ``search_nodes``
+        (``str(props[f]).lower()``) -- ``str(s).lower()`` here matches all
+        three instead of introducing a 4th, stricter behaviour."""
+        conn.create_function("lower", 1, lambda s: None if s is None else str(s).lower())
 
     def _init_db(self) -> None:
         try:

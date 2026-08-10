@@ -40,6 +40,68 @@ logger = logging.getLogger(__name__)
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Node-property fields ``HybridQuery.keyword_search()``
+# (opencrab/ontology/query.py) matches a keyword against on the Local/PG/Kuzu
+# path. Shared by every graph-store backend's ``search_nodes()``
+# (_sql_graph_base.py, kuzu_graph_store.py) so those two implementations'
+# field lists can't drift apart (issue #86). Documented (not declared as an
+# actual member -- see that Protocol's docstring for why) in the GAP TABLE
+# of ``search_nodes``'s Protocol, _graph_protocol.py. query.py's own Neo4j
+# Cypher CONTAINS branch does NOT import this constant -- it still hardcodes
+# a 3-field subset (name/description/text, missing title/label/summary),
+# a pre-existing Local/Kuzu-vs-Neo4j field-list mismatch tracked separately
+# as issue #129, out of this issue's scope.
+#
+# ALSO THE WHITELIST for ``search_nodes(..., fields=...)`` (issue #86 bot
+# finding): the SQL backend interpolates each field name directly into a
+# JSON-path expression (``_dialect.json_get``), so an unvalidated
+# caller-supplied field is a SQL injection vector -- see
+# ``_validate_search_fields`` below, which every ``search_nodes()``
+# implementation calls before using ``fields`` for anything.
+KEYWORD_SEARCH_FIELDS: tuple[str, ...] = (
+    "name",
+    "description",
+    "text",
+    "title",
+    "label",
+    "summary",
+)
+
+_KEYWORD_SEARCH_FIELDS_SET = frozenset(KEYWORD_SEARCH_FIELDS)
+
+
+def _validate_search_fields(fields: tuple[str, ...]) -> None:
+    """Reject any ``search_nodes(..., fields=...)`` value not in
+    ``KEYWORD_SEARCH_FIELDS`` (issue #86 bot finding, P2/injection):
+    ``_sql_graph_base.py``'s ``search_nodes`` interpolates each field name
+    straight into a JSON path via ``self._dialect.json_get`` with no
+    escaping, so a crafted field like ``"x')) LIKE '%' OR 1=1) --"``
+    rewrites the WHERE clause and comments out ``LIMIT``, returning every
+    row regardless of the caller's requested limit -- the exact asymmetry
+    flagged: ``keyword`` was already a bound parameter (safe), ``fields``
+    was raw string interpolation (not).
+
+    Called by both SQL and Kuzu ``search_nodes()`` even though Kuzu's own
+    use of ``fields`` (a plain ``dict.get(f)`` lookup, never interpolated
+    into Cypher text) has no injection surface of its own -- this keeps a
+    bad ``fields`` argument failing the SAME way (a loud ``ValueError``) on
+    every backend instead of "SQL error/wrong rows" on one and
+    "silently ignored" on another. REJECTS rather than silently dropping
+    unknown fields: dropping would change a caller's result set with no
+    signal about why, which is worse than a loud, immediate failure.
+
+    The only current caller (``HybridQuery.keyword_search``) never
+    overrides the default ``KEYWORD_SEARCH_FIELDS``, so this validation is
+    a no-op on that path today -- it exists to keep a future caller from
+    reopening the hole, not to fix an exploited path.
+    """
+    invalid = [f for f in fields if f not in _KEYWORD_SEARCH_FIELDS_SET]
+    if invalid:
+        raise ValueError(
+            f"search_nodes: fields must be a subset of KEYWORD_SEARCH_FIELDS "
+            f"{KEYWORD_SEARCH_FIELDS}; got unsupported field(s) {invalid!r}"
+        )
+
 
 def _node_pack_id(props: dict[str, Any]) -> str | None:
     """Top-level lookup mirroring the unified provenance helper.

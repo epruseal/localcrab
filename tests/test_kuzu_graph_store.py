@@ -377,6 +377,80 @@ def test_count_exported_nodes_with_pack_id_has_no_limit_clause(store, monkeypatc
 
 
 # ------------------------------------------------------------------
+# Issue #86: keyword search_nodes must not truncate the scan before
+# applying the keyword filter (the pack_id-in-Kuzu #54 pattern applied to
+# a keyword predicate instead of pack_id).
+# ------------------------------------------------------------------
+
+
+def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
+    """HybridQuery.keyword_search used to call export_nodes(limit=50000)
+    and search only those rows in Python, silently missing the rest of a
+    corpus larger than that cap. search_nodes instead streams every
+    space-matching row with no LIMIT and Python-filters keyword, stopping
+    only once `limit` matches are found -- so matches after any arbitrary
+    scan boundary are still found. Seeds 60 non-matching nodes first, then
+    5 matching nodes last."""
+    for i in range(60):
+        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}"})
+    for i in range(5):
+        store.upsert_node("X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+
+    rows = store.search_nodes("needle", limit=10)
+
+    assert len(rows) == 5
+    assert all("needle" in r["props"]["name"] for r in rows)
+
+
+def test_search_nodes_space_filter_pushed_into_cypher(store) -> None:
+    """spaces is pushed into the Cypher WHERE clause (space_id is a real
+    column), narrowing the scan before the Python keyword filter runs."""
+    store.upsert_node("X", "n-claim", {"name": "shared term"}, space_id="claim")
+    store.upsert_node("X", "n-policy", {"name": "shared term"}, space_id="policy")
+
+    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["props"]["space"] == "claim"
+
+
+def test_search_nodes_limit_zero_and_negative_return_empty(store) -> None:
+    """issue #86 boundary check: the break condition is ``len(results) >=
+    limit``, checked only AFTER appending a match -- so ``limit=0``
+    previously still returned the first match found (1 row, not 0), and
+    any negative limit behaved like ``limit=1`` (same off-by-one: an empty
+    ``results`` list's length, 0, is never `>=` a negative number until
+    AFTER the first append). Neither is "caller wants nothing back" (the
+    same class of surprise issue #120 flagged for Mongo's ``.limit(0)``)."""
+    store.upsert_node("X", "n1", {"name": "matches everything"})
+    store.upsert_node("X", "n2", {"name": "matches everything"})
+
+    assert store.search_nodes("matches", limit=0) == []
+    assert store.search_nodes("matches", limit=-1) == []
+
+
+def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
+    """issue #86 bot finding: ``fields`` never reaches Cypher text on the
+    Kuzu backend (it's only ever a plain ``dict.get(f)`` key), so it has no
+    injection surface of its own here -- but a bad ``fields`` value must
+    still raise the SAME ``ValueError`` it does on the SQL backends, not be
+    silently accepted, so a caller can't get three different behaviors out
+    of one method depending on which backend happens to be active."""
+    store.upsert_node("X", "n1", {"name": "irrelevant"})
+
+    with pytest.raises(ValueError, match="fields"):
+        store.search_nodes("irrelevant", fields=("not_a_real_field",))
+
+
+def test_search_nodes_empty_fields_returns_empty(store) -> None:
+    """Empty ``fields`` means "nothing can ever match" on every backend,
+    including Kuzu -- matches the SQL backends' contract."""
+    store.upsert_node("X", "n1", {"name": "anything"})
+
+    assert store.search_nodes("anything", fields=()) == []
+
+
+# ------------------------------------------------------------------
 # Issue #118: space_id (column) vs properties["space"] (JSON) divergence
 # ------------------------------------------------------------------
 
