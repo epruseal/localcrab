@@ -47,6 +47,25 @@ def _batched(seq: list, size: int = 500):
         yield seq[i:i + size]
 
 
+# 4축 대사 쿼리 **문자열 정본**. `pack_live_counts()` 가 이것을 쓰고, 스토어 객체 없이
+# raw sqlite3 로 세는 호출자도 **같은 문자열**을 가져다 쓴다.
+#
+# 왜 함수만으로는 부족한가: 어떤 호출자는 `sqlite3.connect(..., mode=ro)` 로 파일을 직접
+# 열어 센다(스토어 객체를 안 만든다). 그런 자리는 함수를 못 부르므로 쿼리를 손으로
+# 베끼게 되고, 실제로 그렇게 **5벌**이 됐다. 그중 하나는 이미 정본과 갈려 있었다 —
+# `doc_sources` 를 `pack_id` 로만 세고 `OR ... $.source` 를 빠뜨려, 그 형태로 태그된
+# 행을 통째로 못 셌다(실측: 5건 중 3건 누락, 2026-08-11 적대 검증).
+COUNT_SQL: dict[str, str] = {
+    "nodes": "SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack_id')=?",
+    "edges": "SELECT COUNT(*) FROM graph_edges WHERE json_extract(properties,'$.pack_id')=?",
+    # doc_sources 는 **두 형태**로 태그돼 있다. 한쪽만 세면 조용히 적게 나온다.
+    "docs": ("SELECT COUNT(*) FROM doc_sources WHERE json_extract(metadata,'$.pack_id')=?"
+             " OR json_extract(metadata,'$.source')=?"),
+}
+# 파라미터 개수가 쿼리마다 다르다 — docs 만 pack_name 을 두 번 받는다.
+COUNT_SQL_ARGC: dict[str, int] = {"nodes": 1, "edges": 1, "docs": 2}
+
+
 def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
     """팩 하나의 **라이브 4축 카운트**. 적재 전후 대사의 정본이다.
 
@@ -63,19 +82,9 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
     결손의 **원인**(grammar 공간쌍 미정의 등)은 판정하지 않는다 — 숫자만 낸다.
     벡터 스토어가 `_conn` 을 안 내주면 0 을 돌려준다(백엔드마다 다르다).
     """
-    g = graph._conn.execute(
-        "SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack_id')=?",
-        (pack_name,),
-    ).fetchone()[0]
-    e = graph._conn.execute(
-        "SELECT COUNT(*) FROM graph_edges WHERE json_extract(properties,'$.pack_id')=?",
-        (pack_name,),
-    ).fetchone()[0]
-    d = docs._conn.execute(
-        "SELECT COUNT(*) FROM doc_sources WHERE json_extract(metadata,'$.pack_id')=?"
-        " OR json_extract(metadata,'$.source')=?",
-        (pack_name, pack_name),
-    ).fetchone()[0]
+    g = graph._conn.execute(COUNT_SQL["nodes"], (pack_name,)).fetchone()[0]
+    e = graph._conn.execute(COUNT_SQL["edges"], (pack_name,)).fetchone()[0]
+    d = docs._conn.execute(COUNT_SQL["docs"], (pack_name,) * COUNT_SQL_ARGC["docs"]).fetchone()[0]
     v = 0
     v_conn = getattr(vec, "_conn", None)
     v_table = getattr(vec, "_table", None) or "vectors_kure"
