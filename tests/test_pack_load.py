@@ -292,6 +292,12 @@ class _NoVec:
 
     available = False
 
+    def __init__(self):
+        self.deleted: list[str] = []
+
+    def delete(self, ids):
+        self.deleted.extend(ids)
+
 
 class TestLoadNodesIncremental:
     def test_identical_row_is_skipped_without_touching_any_store(self, live, tmp_path):
@@ -394,7 +400,7 @@ class TestLoadEdges:
         `resolve_edge` 가 내부에서 upper() 를 하므로 행동 격차는 없었다. 그 사실을 여기
         고정한다 — 죽은 변수를 지우는 정리 커밋이 행동을 바꾸지 않았음을 이 테스트가 보장한다.
         """
-        builder, _, _ = live
+        builder, graph, _ = live
         nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
         id_map: dict = {}
         pack_load.load_nodes("pack-1", nf, builder, id_map)
@@ -402,7 +408,24 @@ class TestLoadEdges:
                              [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "cites"}])
         upper = _write_jsonl(tmp_path / "e_upper.jsonl",
                              [{"id": "e2", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
-        assert pack_load.load_edges("p", lower, builder, id_map) == pack_load.load_edges("p", upper, builder, id_map)
+        # **SUT 대 SUT 비교를 버린다.** 앞선 판은 `load_edges(lower) == load_edges(upper)`
+        # 만 봤고, 그래서 양쪽이 똑같이 틀리면 통과했다 — 반전 엣지의 endpoint 교환을
+        # 지우는 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M17).
+        # 자기참조 기대값으로 FAIL 받은 것이 이번이 세 번째다. 독립 기대값으로 바꾼다:
+        # 둘 다 relation 은 'cites' 로 정규화되고, source_label 은 **원형 그대로** 남는다.
+        # 같은 (from, relation, to) 는 upsert 로 덮이므로 **순차로** 확인한다.
+        seen = []
+        for f, raw in ((lower, "cites"), (upper, "CITES")):
+            ok, skip, err = pack_load.load_edges("p", f, builder, id_map)
+            assert (ok, skip, err) == (1, 0, 0), f"{raw}: ok={ok} skip={skip} err={err}"
+            rel, props = graph._conn.execute(
+                "SELECT relation, properties FROM graph_edges WHERE from_id = ?",
+                ("n1",)).fetchone()
+            seen.append((rel, json.loads(props)["source_label"]))
+        assert [r for r, _ in seen] == ["cites", "cites"], (
+            f"대소문자에 따라 relation 이 갈렸다: {seen}")
+        assert [lbl for _, lbl in seen] == ["cites", "CITES"], (
+            f"원본 라벨이 보존되지 않았다 — 라이브에서 역추적이 불가능해진다: {seen}")
 
 
 class TestDeletePack:
@@ -456,6 +479,8 @@ class _RecordingVec:
         self.available = True
         self.calls: list[tuple[int, list[str]]] = []
         self.ids: list[str] = []
+        self.metas: dict[str, dict] = {}      # 벡터에 실제로 도달한 메타
+        self.deleted: list[str] = []
         self._fail_over = fail_batches_larger_than
 
     def upsert_texts(self, texts, ids, metadatas):
@@ -463,6 +488,16 @@ class _RecordingVec:
         if self._fail_over is not None and len(ids) > self._fail_over:
             raise RuntimeError("주입된 배치 실패")
         self.ids.extend(ids)
+        # **metadatas 를 반드시 보관한다.** 앞선 판은 이 인자를 버렸고, 그래서 청크 메타를
+        # 통째로 폐기하는 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M18b).
+        # 그 변이는 문서화된 실사고(청크 메타 30필드 소실)의 재현이다. 스텁이 실스토어보다
+        # 관대하면 스텁이 곧 사각지대가 된다.
+        for i, meta in zip(ids, metadatas or [{}] * len(ids)):
+            self.metas[i] = dict(meta or {})
+
+    def delete(self, ids):
+        """`incremental_finalize` 가 부른다. 이게 없으면 그 함수를 아예 호출할 수 없다."""
+        self.deleted.extend(ids)
 
 
 def _chunk(i, text="본문"):
@@ -512,6 +547,257 @@ class TestLoadChunks:
         assert (ok, err) == (3, 0), "배치 실패 후 건별 재시도가 전부 살리지 못했다"
         assert [n for n, _ in vec.calls] == [3, 1, 1, 1], (
             f"배치 1회 실패 후 건별 3회여야 한다: {[n for n, _ in vec.calls]}")
+
+
+class TestChunksIncremental:
+    """`load_chunks_incremental` — 재임베딩 생략 판정.
+
+    이 함수는 커버리지 0이었다(486-574 전량 미커버). 그래서 "라이브 대조를 아예 안 해서
+    매 증분마다 전량 재임베딩"과 "메타만 바뀐 행을 same 으로 흘려 라이브가 영구 스테일"
+    두 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M15·M12).
+
+    카운터만 보면 안 갈린다 — **임베딩 호출 여부**와 **doc_sources 실제 갱신**을 본다.
+    """
+
+    def test_identical_chunk_is_skipped_without_re_embedding(self, live, tmp_path):
+        _b, _g, docs = live
+        f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1, "본문")])
+        vec = _RecordingVec()
+        pack_load.load_chunks("pack-1", f, vec, docs)
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+
+        vec2 = _RecordingVec()
+        c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
+            "pack-1", f, vec2, docs, live_chunks)
+        assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
+            f"동일 청크가 same 이 아니다: new={c_new} txt={c_txt} meta={c_meta} same={c_same}")
+        assert vec2.calls == [], (
+            "동일 청크인데 임베딩을 다시 호출했다 — 매 증분마다 전량 재임베딩된다")
+        assert ids == {"c1"}
+
+    def test_text_change_triggers_re_embedding(self, live, tmp_path):
+        _b, _g, docs = live
+        f1 = _write_jsonl(tmp_path / "c1.jsonl", [_chunk(1, "처음")])
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs)
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+
+        f2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문")])
+        vec = _RecordingVec()
+        _n, c_txt, _m, c_same, _e, _i = pack_load.load_chunks_incremental(
+            "pack-1", f2, vec, docs, live_chunks)
+        assert (c_txt, c_same) == (1, 0), f"텍스트 변경이 txt 로 안 세어졌다 ({c_txt},{c_same})"
+        assert vec.ids == ["c1"], "텍스트가 바뀌었는데 재임베딩하지 않았다"
+
+    def test_metadata_only_change_updates_the_store_without_re_embedding(self, live, tmp_path):
+        """메타만 바뀌면 재임베딩은 생략하되 **문서 스토어는 실제로 갱신**해야 한다.
+
+        카운터만 보는 테스트는 "meta 로 세고 아무것도 안 하는" 변이를 통과시킨다.
+        라이브 메타가 영구히 스테일해진다.
+        """
+        _b, _g, docs = live
+        f1 = _write_jsonl(tmp_path / "c1.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "3"}}])
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs)
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+
+        f2 = _write_jsonl(tmp_path / "c2.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "99"}}])
+        vec = _RecordingVec()
+        _n, _t, c_meta, c_same, _e, _i = pack_load.load_chunks_incremental(
+            "pack-1", f2, vec, docs, live_chunks)
+        assert (c_meta, c_same) == (1, 0), f"메타 변경이 meta 로 안 세어졌다 ({c_meta},{c_same})"
+        assert vec.calls == [], "메타만 바뀌었는데 재임베딩했다"
+        stored = json.loads(docs._conn.execute(
+            "SELECT metadata FROM doc_sources WHERE source_id = ?", ("c1",)).fetchone()[0])
+        assert stored.get("쪽") == "99", (
+            f"meta 로 세었지만 문서 스토어가 갱신되지 않았다 — 라이브가 영구 스테일이다: {stored}")
+
+
+class TestIncrementalFinalizeSafetyPins:
+    """`incremental_finalize` 의 안전핀 — **삭제 권한을 가진 함수**인데 커버리지 0이었다.
+
+    595-744 전량 미커버였고, 그래서 30% 삭제폭주 핀을 무력화해도, 0-항목 핀을 통과시켜
+    라이브 노드를 **전멸**시켜도 35 passed 가 유지됐다(적대 검증 실증, 2026-08-10:
+    M8·M16). 실측 피해:
+
+        M16 0-항목 핀 통과   -> node_del=10 · 라이브 노드 10 -> 0 (전멸)
+        M8  30% 핀 무력화    -> node_del=9  · 라이브 노드 10 -> 1
+
+    안전핀은 "평소엔 아무 일도 안 하는" 코드라 테스트가 없으면 **있는지조차 알 수 없다.**
+    """
+
+    def _seed(self, builder, docs, tmp_path, n=10, pack="pack-1"):
+        rows = [_node(id=f"n{i}") for i in range(n)]
+        f = _write_jsonl(tmp_path / "nodes.jsonl", rows)
+        pack_load.load_nodes(pack, f, builder, {})
+        return {r["id"] for r in rows}
+
+    def _live(self, graph, docs, pack="pack-1"):
+        return pack_load.live_pack_state(pack, graph, docs, _NoVec())
+
+    def test_zero_bypack_nodes_aborts_instead_of_deleting_everything(self, live, tmp_path):
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        assert len(state["nodes"]) == 10
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                set(), set(), set(), False, 0, 0)
+        assert "by-pack 파일 누락 의심" in str(ei.value)
+        assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
+
+    def test_zero_bypack_chunks_aborts_too(self, live, tmp_path):
+        """0-항목 핀은 **노드와 청크 둘**이다. 노드만 걸면 청크 핀이 무방비다.
+
+        노드 핀만 테스트하던 판은 청크 핀을 통째로 통과시키는 변이가 46 passed 를
+        유지했다(자체 측정, 2026-08-10: M16c). 축을 열어 놓고 한 점만 고정하는 실수를
+        **이 파일 안에서 또** 저지른 것이라 즉시 닫는다.
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
+        pack_load.load_chunks("pack-1", f, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        assert state["chunks"], "전제: 라이브에 청크가 있어야 한다"
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0)
+        assert "by-pack 청크 0건" in str(ei.value), str(ei.value)
+        assert self._live(graph, docs)["chunks"], "중단했는데 청크가 지워졌다"
+
+    def test_deletion_ratio_over_thirty_percent_aborts(self, live, tmp_path):
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        keep = {"n0"}                       # 9/10 = 90% 삭제 후보
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+        assert "삭제 후보 비율 초과" in str(ei.value)
+        assert "--force-delete" in str(ei.value), "강행 방법을 알려야 한다"
+        assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
+
+    def test_force_delete_bypasses_the_ratio_pin(self, live, tmp_path):
+        """핀은 **우회 가능해야** 한다 — 안 그러면 정당한 대량 정리가 막힌다.
+
+        이게 없으면 `force_delete` 분기를 통째로 지우는 변이가 안 잡힌다.
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n0"}, set(), set(), True, 1, 0)
+        assert res["node_del"] == 9, f"강행했는데 9건이 안 지워졌다: {res}"
+        assert set(self._live(graph, docs)["nodes"]) == {"n0"}
+
+    def test_ratio_under_the_pin_deletes_normally(self, live, tmp_path):
+        """정상 경로 — 핀이 항상 중단시키면 증분 정리가 통째로 죽는다."""
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        keep = {f"n{i}" for i in range(8)}   # 2/10 = 20%
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            keep, set(), set(), False, len(keep), 0)
+        assert res["node_del"] == 2, res
+        assert set(self._live(graph, docs)["nodes"]) == keep
+
+
+class TestReversedEdgeSwapsEndpoints:
+    """`HAS_PART` 같은 반전 관계는 **endpoint 도 함께 바뀌어야** 한다.
+
+    `resolve_edge("HAS_PART", …)` 는 `part_of` 로 정규화하면서 `reversed=True` 를 준다.
+    `n1 HAS_PART n2` 는 의미상 `n2 part_of n1` 이다. endpoint 를 안 바꾸면 그래프에
+    **방향이 뒤집힌 관계**가 들어가고, 영향도 분석이 통째로 거꾸로 나온다.
+
+    앞선 판은 `load_edges(lower) == load_edges(upper)` 라는 SUT 대 SUT 비교뿐이라
+    교환을 지우는 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M17).
+    반전 관계 라벨을 아예 입력에 안 넣었으므로 그 분기가 실행조차 안 됐다.
+    """
+
+    def test_endpoints_are_swapped_for_a_reversed_relation(self, live, tmp_path):
+        builder, graph, _ = live
+        # `part_of` 는 concept->concept 에서만 허용된다(grammar). 공간을 안 맞추면
+        # 반전 분기에 닿기도 전에 문법 위반으로 skip 돼 테스트가 무의미해진다.
+        nf = _write_jsonl(tmp_path / "nodes.jsonl",
+                          [_node(id="n1", node_type="Concept", space="concept"),
+                           _node(id="n2", node_type="Concept", space="concept")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+
+        from opencrab.pack.normalize import resolve_edge
+        assert resolve_edge("HAS_PART", "concept", "concept")[3] is True, (
+            "전제: HAS_PART 가 반전 관계여야 이 테스트가 의미를 갖는다")
+
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2",
+                            "label": "HAS_PART"}])
+        applied: set = set()
+        ok, skip, err = pack_load.load_edges("pack-1", ef, builder, id_map, applied=applied)
+        assert (ok, skip, err) == (1, 0, 0), f"ok={ok} skip={skip} err={err}"
+
+        row = graph._conn.execute(
+            "SELECT from_id, relation, to_id FROM graph_edges").fetchone()
+        assert tuple(row) == ("n2", "part_of", "n1"), (
+            f"반전 관계인데 endpoint 가 안 바뀌었다: {tuple(row)} — 방향이 거꾸로 들어갔다")
+        assert applied == {("n2", "part_of", "n1")}, (
+            f"applied 도 반전 **후** 기준이어야 증분 정리가 같은 것을 본다: {applied}")
+
+
+class _SqliteVecLike:
+    """sqlite-vec 백엔드 흉내 — `_conn`/`_table`/`pack_id` 컬럼을 갖는다.
+
+    `_NoVec`(available=False)만 쓰던 판은 `delete_pack` 의 벡터 분기(`load.py:119-138`)가
+    **한 번도 실행되지 않았고**, 그래서 그 분기를 통째로 죽이는 변이가 46 passed 를
+    유지했다(적대 검증 실증, 2026-08-10: M20). `--fresh` 재적재 때 벡터 고아가 남는다.
+    스텁이 실스토어의 형태를 안 흉내내면 그 경로는 영원히 미검증이다.
+    """
+
+    _table = "vectors_kure"
+
+    def __init__(self):
+        import sqlite3
+        self.available = True
+        self._conn = sqlite3.connect(":memory:")
+        self._conn.execute(
+            f"CREATE TABLE {self._table} (node_id TEXT PRIMARY KEY, pack_id TEXT)")
+        self._conn.commit()
+
+    def seed(self, pack, ids):
+        self._conn.executemany(
+            f"INSERT INTO {self._table} VALUES (?, ?)", [(i, pack) for i in ids])
+        self._conn.commit()
+
+    def rows(self):
+        return {(r[0], r[1]) for r in
+                self._conn.execute(f"SELECT node_id, pack_id FROM {self._table}")}
+
+
+class TestDeletePackVectorBranch:
+    def test_vectors_of_the_named_pack_are_deleted(self, live, tmp_path):
+        _b, graph, docs = live
+        vec = _SqliteVecLike()
+        vec.seed("pack-a", ["a1", "a2"])
+        vec.seed("pack-b", ["b1"])
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
+        assert vec.rows() == {("b1", "pack-b")}, (
+            f"다른 팩의 벡터까지 지웠거나 대상이 남았다: {vec.rows()}")
+
+    def test_vector_branch_is_skipped_when_unavailable(self, live):
+        _b, graph, docs = live
+        assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec()) == (0, 0, 0)
 
 
 class TestGuardActuallyFires:
