@@ -401,23 +401,33 @@ class GraphStoreExtended(Protocol):
             JSON store -- NOT reachable through ``factory.py``, but kept
             for callers that instantiate it directly per that module's own
             "WHY LocalDocStore IS KEPT" docstring, so it is in scope too).
-          - ``search_nodes`` on the 2 graph stores that implement it
-            (``_sql_graph_base.py``, ``KuzuGraphStore``; ``Neo4jStore`` has
-            no ``search_nodes`` -- see the GAP TABLE above). Guarded by
+          - ``search_nodes`` on 3 of the 4 graph stores, across 2
+            implementations: ``_sql_graph_base.py`` (LocalGraphStore +
+            PGGraphStore, shared) and ``KuzuGraphStore``. ``Neo4jStore`` has
+            no ``search_nodes`` -- see the GAP TABLE above, which is why
+            this is the one covered method that is not "all 4". Guarded by
             issue #86, not by #120, but it is the same contract and belongs
             in this enumeration so the list stays exhaustive.
         Explicitly NOT covered, left as pre-existing/tracked-separately
         gaps rather than silently absorbed into this contract:
-          - other ``limit``-accepting graph-store methods --
-            ``find_neighbors``, ``find_by_relations``, ``export_edges``
-            (issue #131), and ``bm25_fingerprint``, which is deliberately
-            limit-independent by design (see its own docstring).
-          - ``keyword_search`` on the SQL doc stores
-            (``LocalSQLDocStore``, ``PgDocStore``): it overfetches
-            ``max(1, limit) * 5`` rows and then appends BEFORE testing
+          - other ``limit``-accepting GRAPH-store methods --
+            ``find_neighbors``, ``find_by_relations`` and ``export_edges``
+            (issue #131).
+          - other ``limit``-accepting DOC-store methods --
+            ``keyword_search``, implemented separately (NOT shared via
+            ``_sql_doc_base.py``) in ``local_sql_doc_store.py`` and
+            ``pg_doc_store.py``; ``MongoStore`` and ``LocalDocStore`` have
+            none. Both implementations overfetch
+            ``max(1, limit) * 5`` rows and then append BEFORE testing
             ``len(out) >= limit``, so ``limit <= 0`` yields 1 row rather
             than 0 -- the same append-before-check shape as the Kuzu bug
-            #120 fixed, tracked separately.
+            #120 fixed, tracked separately. And ``bm25_fingerprint`` on
+            ``_sql_doc_base.py`` (no graph store implements it), which
+            accepts a ``limit`` but never applies it: it is a whole-table
+            ``COUNT(*)`` staleness probe and a capped count would pin
+            forever once the corpus exceeds the cap (#63) -- so a
+            ``limit <= 0 -> []`` guard there would be a regression, not a
+            fix. See its own docstring.
           - any method on a store outside the graph/doc surface entirely:
             vector stores' top-k ``limit``, and ``sql_store.py``'s
             ``get_impacts``, which binds a negative ``limit`` straight into
