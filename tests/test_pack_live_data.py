@@ -7,6 +7,14 @@
 
 이 파일이 거는 것은 가드 **자체의 행동**이다. "쓰기 함수 전량이 이것을 부르는가"라는
 커버리지 계약은 적재 함수가 넘어오는 시점에 별도로 건다.
+
+**불변식 — 가드는 `LOCAL_DATA_DIR` 값을 어떤 방식으로도 변형하지 않는다.**
+정규화는 전부 수용 집합을 넓히고, 넓어진 만큼이 엉뚱한 저장소다. `expanduser`·`strip`·
+`resolve`·`normpath`·`realpath`·`is_symlink` 관용은 전부 "개선"처럼 보이지만 이 가드에
+한해서는 **약화**다. 수용 집합은 정확히 `Path(값).is_dir()` 이어야 한다.
+
+이 불변식을 문장으로만 두면 다음 사람이 또 "개선"한다. 그래서
+`TestAcceptanceSetIsExactlyIsDir` 이 거부·수용 양쪽을 **표로** 고정한다.
 """
 from __future__ import annotations
 
@@ -18,6 +26,91 @@ from opencrab.pack.live_data import require_live_data
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("LOCAL_DATA_DIR", raising=False)
+
+
+def _lab(tmp_path):
+    """심링크가 섞이지 않은 실험장. macOS `tmp_path` 는 pytest 가 이미 resolve 해 주지만
+    그 사실에 의존하지 않고, 케이스마다 필요한 것을 명시적으로 만든다."""
+    real = tmp_path / "real"
+    real.mkdir()
+    afile = tmp_path / "afile"
+    afile.write_text("not a dir")
+    link_dir = tmp_path / "link_to_dir"
+    link_dir.symlink_to(real, target_is_directory=True)
+    link_file = tmp_path / "link_to_file"
+    link_file.symlink_to(afile)
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    return real, afile, link_dir, link_file, dangling
+
+
+# 거부해야 할 값. 각 행의 주석은 **그 행이 없으면 살아남는 변이**다.
+_REJECT = {
+    "리터럴 틸드":            lambda tp, lab: "~",                       # expanduser()
+    "틸드+하위경로":          lambda tp, lab: "~/localcrab",             # expanduser()
+    "앞뒤 공백":              lambda tp, lab: f" {lab[0]} ",               # d.strip()
+    "없는 중간요소+..":       lambda tp, lab: str(tp / "ghost" / ".." / "real"),
+                                                                       # resolve/normpath/realpath
+    "파일 심링크":            lambda tp, lab: str(lab[3]),                 # or is_symlink()
+    "끊어진 심링크":          lambda tp, lab: str(lab[4]),                 # or is_symlink()
+    "없는 상대경로":          lambda tp, lab: "no/such/relative/dir",    # isabs 분기
+    "파일":                   lambda tp, lab: str(lab[1]),                 # exists()
+    "없는 절대경로":          lambda tp, lab: str(tp / "nope"),
+}
+
+# 수용해야 할 값. **이쪽이 없으면 위 거부 목록이 과잉 계약이 된다** —
+# 심링크를 통째로 막는 구현도 거부 목록만으로는 통과해 버린다.
+_ACCEPT = {
+    "실재 디렉터리":          lambda tp, lab: str(lab[0]),
+    "디렉터리 심링크":        lambda tp, lab: str(lab[2]),
+}
+
+
+class TestAcceptanceSetIsExactlyIsDir:
+    """수용 집합을 **표로** 못박는다 — 케이스 하나씩 붙이는 방식은 두 번 뚫렸다.
+
+    처음엔 `resolve()` 변이 하나만 막는 canary 를 넣었다. 그건 **연산자 하나에 대한
+    점 수정**이었고, 같은 클래스(가드가 원본보다 넓은 입력을 수용)에 속한 다른 변이
+    4종이 그대로 살아남았다(적대 검증 실증, 2026-08-10):
+
+        expanduser()      `~`                 -> 원본 REJECT / 변이 ACCEPT
+        d.strip()         " …/real "          -> 원본 REJECT / 변이 ACCEPT
+        or is_symlink()   파일·끊어진 심링크   -> 원본 REJECT / 변이 ACCEPT
+        isabs 분기         없는 상대경로        -> 원본 REJECT / 변이 ACCEPT
+
+    `~` 가 위험한 이유는 구체적이다: 따옴표로 감싼 env 값(`.env`, docker-compose,
+    Makefile)에서 셸은 틸드를 전개하지 않는다. `LOCAL_DATA_DIR="~"` 가 홈으로 전개돼
+    통과하면 이 가드가 스스로 정의한 실패 모드가 그대로 발생한다.
+
+    같은 클래스가 두 번 뚫렸으므로 회피 케이스를 또 붙이지 않고 축 전체를 닫는다.
+    """
+
+    @pytest.mark.parametrize("case", sorted(_REJECT))
+    def test_rejected(self, case, monkeypatch, tmp_path):
+        value = _REJECT[case](tmp_path, _lab(tmp_path))
+        monkeypatch.setenv("LOCAL_DATA_DIR", value)
+        with pytest.raises(SystemExit) as ei:
+            require_live_data("load_nodes")
+        assert "경로 없음" in str(ei.value), f"{case}: {value!r}"
+
+    @pytest.mark.parametrize("case", sorted(_ACCEPT))
+    def test_accepted(self, case, monkeypatch, tmp_path):
+        value = _ACCEPT[case](tmp_path, _lab(tmp_path))
+        monkeypatch.setenv("LOCAL_DATA_DIR", value)
+        assert require_live_data("load_nodes") is None, f"{case}: {value!r}"
+
+    def test_the_table_actually_splits_the_axis(self, tmp_path):
+        """표의 각 행이 **실제로** 원본 판정을 가르는지 확인한다.
+
+        거부 행이 사실 `is_dir()` 로도 True 라면 그 행은 아무 변이도 못 잡는 장식이다.
+        표가 커질수록 이런 장식이 섞이기 쉬우므로 표 자신을 검사한다.
+        """
+        from pathlib import Path
+        lab = _lab(tmp_path)
+        for case, make in _REJECT.items():
+            assert not Path(make(tmp_path, lab)).is_dir(), f"거부 행인데 is_dir() 이 True: {case}"
+        for case, make in _ACCEPT.items():
+            assert Path(make(tmp_path, lab)).is_dir(), f"수용 행인데 is_dir() 이 False: {case}"
 
 
 class TestRejectsUnusableTargets:
