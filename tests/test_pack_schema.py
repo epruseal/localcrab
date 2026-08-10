@@ -424,13 +424,29 @@ class TestOnlyPackSchemaErrorEscapes:
 
     def _rows(self, base, struct_key, extra_bad):
         rows = []
-        for drop in (None, "id"):
+        # **드롭 축을 구조 키 전수로 연다.** `'id'` 하나만 빼던 판은 다른 키를 첨자로
+        # 읽는 변이를 통과시켰다(적대 검증 실증, 2026-08-10: X5):
+        #
+        #     _ws = row['workspace_id']   # stray raise 직전, 독립 Assign 문
+        #     -> workspace_id 없는 **정상 엣지 행**이 KeyError 로 죽는데 142 passed
+        #
+        # `workspace_id` 를 목록에 추가하는 것은 여섯 번째 점 수정이고 다음엔
+        # `created_at` 이 남는다. 전수로 열면 **어떤 구조 키를 첨자로 읽든, raise 안이든
+        # 밖이든** 잡힌다 — 그래서 아래 AST 가드가 못 보는 형태를 열거할 필요가 없어진다.
+        # 비용: 검사당 9 -> 최대 41행. 무시할 수준이다.
+        for drop in [None, *sorted(base())]:
             for variant in ({}, {"낯선키": 1}, extra_bad, {"낯선키": 1, **extra_bad}):
                 row = base()
                 row.update(variant)
                 if drop:
                     row.pop(drop, None)
                 rows.append(row)
+        # 비문자열 최상위 키 — `sorted(stray)` 가 int 와 str 을 비교하면 TypeError 다.
+        # 이 행이 없으면 "어떤 dict 를 넣어도"라는 이 클래스의 주장이 거짓인 채 남는다.
+        for variant in ({7: "x"}, {7: "x", "낯선키": 1}):
+            row = base()
+            row.update(variant)
+            rows.append(row)
         # 필수 필드가 전부 빈 극단
         empty = base()
         for k in struct_key:
@@ -450,18 +466,31 @@ class TestOnlyPackSchemaErrorEscapes:
         for row in self._rows(base, keys, bad):
             try:
                 validator(row)
-            except PackSchemaError:
-                pass
+            except PackSchemaError as exc:
+                # id 키가 **없는** 행이면 `row_id` 는 None 이어야 한다. 이 단언이 없으면
+                # `row.get("id", "<unknown>")` 처럼 **위조 식별자**를 채우는 변이가
+                # 통과한다(적대 검증 실증, 2026-08-10: X1·W10b). 세 라운드가 row_id 를
+                # 지키는 데 쓰였는데 정작 "id 가 없을 때" 축은 비어 있었다.
+                if "id" not in row and exc.row_id is not None:
+                    pytest.fail(
+                        f"id 키가 없는 행인데 row_id={exc.row_id!r} — 없는 식별자를 "
+                        f"지어냈다. 운영자가 존재하지 않는 행을 찾게 된다. 입력: {row!r}")
             except Exception as exc:  # noqa: BLE001 - 계약 위반을 잡는 것이 목적
                 pytest.fail(
                     f"{type(exc).__name__}: {exc} — 계약은 PackSchemaError 뿐이다. "
                     f"입력 행: {row!r}")
 
     def test_diagnostics_never_subscript_the_row(self):
-        """소스에도 못을 박는다 — 새 raise 가 첨자를 들고 들어오는 것을 막는다.
+        """`raise` **문 안의** 첨자를 막는다 — 방어 범위를 정확히 적는다.
 
-        위 행동 테스트는 **내가 넣은 입력 조합**만 본다. 새로 생긴 검사가 다른 키를
-        첨자로 읽으면 그 조합을 안 넣은 한 안 걸린다. 구조로도 건다.
+        앞선 판은 이 검사가 "다른 키를 첨자로 읽는" 경우까지 막는다고 적었는데
+        **틀렸다.** `ast.walk` 를 `ast.Raise` 노드에서 시작하므로, 첨자를 독립
+        `Assign` 문으로 빼내면(`_ws = row['workspace_id']` 를 raise 앞에) 설계상
+        보이지 않는다(적대 검증 실증, 2026-08-10: X5).
+
+        서술된 방어 범위가 실제보다 넓으면 다음 사람이 없는 방어를 믿는다. 사실대로:
+        **이 검사는 raise 문 안만 본다. 지역변수 경유는 위 행동 테스트의 드롭 전수가
+        잡는다.** 두 검사는 겹치는 게 아니라 각자 다른 형태를 맡는다.
         """
         import ast
         import pathlib as _pl
