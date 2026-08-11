@@ -55,6 +55,13 @@
 | | `delete_pack`·`live_pack_state` 의 chroma | `$or(pack_id, source)` |
 | **대사** — 센다·비교한다 | `COUNT_SQL` 노드·엣지 · `live_pack_state` 노드·엣지 | `pack_id` |
 | | `COUNT_SQL["docs"]` · `live_pack_state` 청크 | `pack_id` \| `source` |
+| | `pack_live_counts` **벡터축** | sql·sqlalchemy: `pack_id` 컬럼 · **chroma: `$or(pack_id, source)`** |
+
+**벡터축만 대사인데도 회수와 같은 `$or` 를 쓴다.** 이유는 저장 구조다 — sqlite-vec 의
+`pack_id` 는 vec0 **파티션 키**라 애초에 그 하나뿐이고, chroma 에서는 세는 대상과 지우는
+대상이 갈리면 "센 것과 지운 것이 다른 집합"이 된다. 여기만 예외인 것이 **의도**이고,
+그래서 표에 적는다. 적어 두지 않으면 다음 사람이 "대사는 좁아야 한다"는 규칙에 맞춰
+이 줄을 좁히고, 그 순간 대사와 회수가 어긋난다.
 
 **통일하지 마라.** 둘을 맞추려는 시도가 세 번 연속 실패했고 매번 다른 이유였다.
 
@@ -68,8 +75,20 @@
   이 DELETE 를 안 넓히면 그 엣지가 **매 증분마다 stale 로 뽑혀 0행을 지운다** —
   조용한 과다계상이 조용한 영구 무동작이 된다. 두 술어는 **짝**이다.
 
-`pack` 키는 `normalize.transform_node` 가 모든 노드에 쓰는데(`pack_id` 와 같은 값) 읽는 소비자가
-없다. 제거는 라이브 전 노드를 한 번 재기록시키므로 별건이고, **미루는 동안 회수는 그 키를 본다.**
+`pack` 키는 `normalize.transform_node:309` 가 모든 노드에 쓴다(`pack_id` 와 같은 값).
+**죽은 키가 아니다** — `ontology.builder.add_node:160` 이 노드 벡터의 메타를 만들 때 이것을 읽는다:
+
+```python
+"source": str(props.get("pack") or props.get("pack_id") or ""),
+```
+
+즉 **모든 노드 벡터의 `source` 가 `properties.pack` 에서 나온다.** 그리고 위 회수 chroma
+술어가 매치하는 키가 바로 그 `source` 다 — `pack` 은 회수가 보는 값을 **만들어내는 생산자**다.
+
+그래서 `pack` 을 건드리는 변경은 **벡터 메타까지 함께 본다**. 예: 팩 이름을 바꾸면서
+`pack_id` 만 갱신하고 `pack` 을 그대로 두면, 그 뒤 새로 쓰이는 노드 벡터가 **옛 이름을
+`source` 로 달고**, `$or(pack_id, source)` 회수가 그것을 옛 팩 소속으로 집어간다.
+`pack` 제거를 미루는 동안 회수가 그 키를 보는 이유이기도 하다.
 
 ### 2. `pack_live_counts()` 는 `int | None` 을 돌려준다
 
@@ -144,6 +163,24 @@ python scripts/qa/mutate_module.py <리포루트> --all /tmp/sweep.json
 | `gates/dangling.py` | `4633e0d` | 55 | 55 | **0** | — |
 | `gates/grammar_fit.py` | `5f2d1a6` | 77 | 75 | 2 | 등가 증명(`node_type` 기본값은 9-space 전수에서 도달 불가) |
 | `cloud.py` | `790fd7e` | 202 | 198 | 4 | 전량 등가 증명(kwarg 상수 1 · dangling 선점검 흡수 3) |
+| **`load.py`** | `b27b75b` | **910** | 505 | **403** | **미해소.** 아래 참조 |
+
+> **`load.py` 403 생존은 이 표의 종료 조건을 만족하지 않는다.** 등가 증명도 없다.
+> 이 모듈은 **유일하게 삭제 권한을 가진** 자리이고, 생존자 중 40종이 `incremental_finalize`
+> 안에 몰려 있다. 그중 무거운 것:
+>
+> - `for (f_id, r, t_id) in stale_edges:` 를 **통째로 삭제** — 엣지 정리가 사라져도 전 스위트 초록
+> - `vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]` 의 `not in` → `in`
+>   — 공유 evidence 벡터를 **지키던 필터가 그것만 골라 지우는 필터로** 뒤집힌다
+> - `deleted = False` → `True` — 실패한 삭제를 성공으로 계상(커밋 `d48267e` 가 고친 바로 그 결함)
+> - 30% 핀의 `chunk_ratio` 팔, 앵커 보호의 **벡터 고아 경로**, `chunk_del` 의 요청수/실제수 —
+>   각각 노드 쪽만 걸려 있고 짝이 비어 있다
+>
+> 원인의 상당수는 **음성 테스트만 있고 양성 테스트가 없는 것**이다. 예를 들어
+> `edge_del == 0` 만 확인하면 "아무것도 안 지운다"도 통과한다. **실재하는 stale 엣지가
+> 실제로 지워지고 그 수가 맞는지**를 확인하는 테스트가 있어야 한다.
+>
+> 적대 검증(2026-08-11)이 잰 수치다. 줄이거나 등가 증명을 붙이기 전에는 이 표가 **초록이 아니다.**
 
 > **한동안 `score.py` 의 "격자 전"이 58 로 적혀 있었다. 거짓이다.** 58 은 격자를 이미
 > 절반쯤 넣은 뒤의 중간 측정치였고 참값은 162 다. 두 독립 검증자가 각각 재현해 잡아냈다.
