@@ -12,6 +12,7 @@ order collisions both raise at import time.
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from opencrab.auth import Principal
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, ToolSpec] = {}
 
@@ -163,16 +166,6 @@ class ForbiddenArgumentError(ValueError):
     believe it had taken effect."""
 
 
-class ToolAccessDeniedError(PermissionError):
-    """Raised by dispatch_tool() when the calling principal's access tier
-    (#150) does not cover the tool's ``ToolSpec.access``. A remote (non-local)
-    principal hitting an ADMIN-tier tool is the concrete case today (see
-    ``allowed_access_tiers``). Deliberately raised even for a tool that is
-    ALSO absent from that principal's ``tools/list`` output -- hiding it from
-    the list must not be the only thing standing between a caller and the
-    handler (#150 issue body: list filter and call check are independent)."""
-
-
 def allowed_access_tiers(principal: Principal) -> frozenset[AccessTier]:
     """Access tiers *principal* may see (tools/list) and call (dispatch_tool).
 
@@ -304,11 +297,40 @@ def build_tools() -> list[dict[str, Any]]:
 
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
-    """Look up and call a registered tool by name.
+    """Look up, authorize, and call a registered tool by name.
 
-    Thin lookup + call, matching the pre-migration dispatch_tool exactly: no
-    extra error wrapping (handlers self-wrap), and write-serialising via the
-    shared write_lock for tools declared `writes=True` (see `tool()`).
+    #150 v3: the dispatch order is deliberate and load-bearing --
+
+        1. principal            -- current_principal(), LookupError if unbound
+        2. lookup + authorize   -- merged: a name that isn't registered and a
+                                   name the principal isn't tiered for produce
+                                   the SAME UnknownToolError, computed from
+                                   the SAME tools_for_principal(principal)
+                                   "Available" list
+        3. client-argument validation -- _FORBIDDEN_ARGS / reserved-identity
+        4. handler execution
+
+    Step 2 running before step 3 is the fix: the earlier ordering validated
+    arguments before checking tier, so a remote caller that already knew an
+    ADMIN-tier tool's name could attach a client-supplied ``subject_id`` and
+    get back ForbiddenArgumentError instead of "unknown tool" -- confirming
+    the tool exists and revealing which gate rejected it. With lookup+
+    authorization first, that path now dead-ends at the exact same
+    UnknownToolError a genuinely unregistered name would raise.
+
+    "The same" is intentionally an invariant, not a coincidence: a hidden
+    tool (registered, but outside the caller's access tier) must be
+    indistinguishable, at the HTTP response, from a name absent from
+    ``_REGISTRY`` altogether -- otherwise the list filter in
+    ``tools_for_principal`` is decoration, not access control. The
+    "Available" list embedded in the message is themselves scoped by
+    ``tools_for_principal(principal)`` (not the raw registry), so it never
+    differs between the two cases either.
+
+    This does NOT try to close every side channel: server logs (see the
+    WARNING below), and dispatch timing, both still distinguish "hidden"
+    from "never existed" -- accepted, documented limits (issue #150's PR
+    description), not gaps in this function.
 
     #145: a client-supplied ``tenant_id`` / ``subject_id`` in `arguments` is
     rejected outright (ForbiddenArgumentError), and the handler itself runs
@@ -320,6 +342,11 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     no principal is bound at all -- by design there is no anonymous
     fallback (#143), so every path into dispatch_tool (stdio via cli.py's
     `serve`, HTTP via http_app.py's `_check`) must have bound one first.
+    Calling dispatch_tool() directly with no principal_scope open (e.g. a
+    bare script, or a test that forgot to bind one) now fails on step 1
+    with LookupError, before the name is even looked up -- a behavior
+    change from the pre-#150 dispatch order, where an unregistered name
+    would have raised UnknownToolError first regardless of principal.
     """
     # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._shared
     # shim submodule: importing a submodule for the first time binds it as an
@@ -327,14 +354,34 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     # overwrite __init__.py's module-level `_context` dict (same name) the moment
     # this import ran — verified empirically (tests/test_mcp.py's `_context.clear()`
     # started hitting a module object instead of a dict).
+    from opencrab.auth import current_principal, principal_scope
     from opencrab.mcp.tools import _write_lock
 
+    # Step 1: principal. LookupError propagates as-is (#143: no anonymous
+    # fallback) -- nothing below may run without one.
+    principal = current_principal()
+
+    # Step 2: lookup + authorization, merged. A caller must not be able to
+    # tell "never registered" apart from "registered but not in my tier" --
+    # so both produce the identical UnknownToolError, built from the
+    # identical tools_for_principal(principal)-scoped Available list.
     spec = _REGISTRY.get(name)
-    if spec is None:
-        # order 정렬 — 물리 분할 후에도 pre-split과 동일한 목록 순서 유지.
-        available = [s.name for s in sorted(_REGISTRY.values(), key=lambda s: s.order)]
+    if spec is None or not _tool_allowed(spec, principal):
+        if spec is not None:
+            # Hidden, not missing: worth a server-side WARNING (principal,
+            # tool, required tier) for operators -- the response itself
+            # carries none of this. A genuinely unregistered name logs
+            # nothing here, same as before #150.
+            logger.warning(
+                "hidden tool call: %r requires %r access; principal %r "
+                "(is_local=%s) does not have it -- reporting as unknown",
+                name, spec.access.value, principal.user_id, principal.is_local,
+            )
+        available = [s["name"] for s in tools_for_principal(principal)]
         raise UnknownToolError(f"Unknown tool: '{name}'. Available: {available}")
 
+    # Step 3: client-argument validation -- only reached once the caller is
+    # both known and authorized for this tool.
     forbidden = [key for key in _FORBIDDEN_ARGS if key in arguments]
     if forbidden:
         raise ForbiddenArgumentError(
@@ -352,22 +399,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
             "caller does not believe its value was stored."
         )
 
-    from opencrab.auth import current_principal, principal_scope
-
-    principal = current_principal()
-
-    # #150: independent re-check of the same tier a hidden tool was hidden
-    # for. `tools/list` filtering (`tools_for_principal`) only changes what
-    # the caller SEES -- `tools/call` does not consult it, so a caller that
-    # already knows an ADMIN-tier tool's name must be refused here too, or
-    # hiding it from the list would be decoration, not access control.
-    if not _tool_allowed(spec, principal):
-        raise ToolAccessDeniedError(
-            f"tool {name!r} requires {spec.access.value!r} access; principal "
-            f"{principal.user_id!r} (is_local={principal.is_local}) does not "
-            "have it."
-        )
-
+    # Step 4: execute.
     with principal_scope(principal):
         if spec.writes:
             with _write_lock():

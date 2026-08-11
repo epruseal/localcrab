@@ -76,7 +76,6 @@ from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 from ._registry import _REGISTRY, build_tools
 from ._registry import AccessTier as AccessTier
 from ._registry import ForbiddenArgumentError as ForbiddenArgumentError
-from ._registry import ToolAccessDeniedError as ToolAccessDeniedError
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
 from ._registry import tools_for_principal as tools_for_principal
@@ -272,7 +271,6 @@ __all__ = [
     "TOOL_SCHEMAS",
     "AccessTier",
     "ForbiddenArgumentError",
-    "ToolAccessDeniedError",
     "UnknownToolError",
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",
