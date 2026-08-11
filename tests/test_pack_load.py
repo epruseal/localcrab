@@ -1272,3 +1272,192 @@ class TestVectorMetadataFollowsDocMetadata:
             f"미지원 백엔드인데 meta 로 세었다 ({c_meta},{c_txt}) — 벡터가 옛 메타로 남는다")
         assert len(vec.ids) > before, "재임베딩이 안 일어났다"
         assert vec.metas["c1"]["document_id"] == "doc-B"
+
+
+# ───────────────────────── 계약: 실패해도 조용히 성공하지 않는다 ─────────────────────────
+#
+# 아래 4개는 리뷰가 지목한 "실패 전파" 축이다 — 스토어 실패를 예외 없이 삼키는
+# add_node/add_edge/delete_node 의 계약(반환값을 봐야 진짜 결과를 안다) 위에서,
+# 실패가 (a) 카운터를 속이지 않는지 (b) 삭제 보호를 깨지 않는지 (c) 비교 기준을
+# 섣불리 옮기지 않는지를 각각 건다.
+
+class _VecMetaAlwaysFailsAndReembedAlsoFails:
+    """`update_metadata`도, 재임베딩(`upsert_texts`)도 둘 다 실패 — 벡터가 통째로 죽은 상태.
+
+    메타 전용 분기가 재임베딩으로 우회해도 그 우회조차 실패하면 벡터는 여전히 옛 값이다.
+    이런 상황에서 `doc_sources`(다음 증분의 비교 기준)를 옮기면 다음 실행이 "동일"로
+    오판해 이 불일치가 영구히 남는다 — 옮기지 않아야 한다.
+    """
+
+    available = True
+
+    def update_metadata(self, chunk_id: str, meta: dict) -> bool:
+        return False
+
+    def upsert_texts(self, texts, metadatas=None, ids=None):
+        raise RuntimeError("주입된 벡터 스토어 다운")
+
+    def delete(self, ids):
+        pass
+
+
+class TestFailedVectorMetaUpdateDoesNotMoveTheDocBaseline:
+    """① 벡터 갱신 실패 주입 시 doc 기준이 안 옮겨가고, 다음 증분이 c_same 이 아니어야 한다."""
+
+    def test_doc_metadata_stays_old_and_next_increment_reprocesses(self, live, tmp_path):
+        builder, graph, docs = live
+        f1 = _write_jsonl(tmp_path / "c1.jsonl",
+                          [{"id": "c1", "text": "고정된 본문", "document_id": "doc-A", "source": "p"}])
+        pack_load.load_chunks("p", f1, _RecordingVec(), docs)
+        state = pack_load.live_pack_state("p", graph, docs, _NoVec())
+
+        f2 = _write_jsonl(tmp_path / "c2.jsonl",
+                          [{"id": "c1", "text": "고정된 본문", "document_id": "doc-B", "source": "p"}])
+        broken = _VecMetaAlwaysFailsAndReembedAlsoFails()
+        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+            "p", f2, broken, docs, state["chunks"])
+        assert err == 1 and c_meta == 0, (
+            f"벡터가 완전히 죽었는데 성공으로 세었다 (c_meta={c_meta} err={err})")
+
+        row = docs._conn.execute(
+            "SELECT metadata FROM doc_sources WHERE source_id=?", ("c1",)).fetchone()
+        meta_after = json.loads(row[0])
+        assert meta_after.get("document_id") == "doc-A", (
+            "벡터 갱신이 실패했는데 doc 비교 기준이 새 메타로 옮겨갔다 — "
+            f"다음 증분이 이 변경을 영영 못 본다 (실제 {meta_after.get('document_id')!r})")
+
+        # 다음 증분: doc 이 옛 메타 그대로이므로 live[1] != meta 로 다시 걸려야 한다
+        # (= c_same 이 아니어야 한다). 이번엔 정상 벡터로 재시도해 실제로 복구되는지도 본다.
+        state2 = pack_load.live_pack_state("p", graph, docs, _NoVec())
+        working_vec = _RecordingVec()
+        c_new2, c_txt2, c_meta2, c_same2, err2, _ = pack_load.load_chunks_incremental(
+            "p", f2, working_vec, docs, state2["chunks"])
+        assert c_same2 == 0, (
+            "doc 기준이 안 옮겨갔어야 하는데 다음 증분이 same 으로 판정했다 — 영구 불일치")
+        assert working_vec.metas.get("c1", {}).get("document_id") == "doc-B", (
+            "재시도에서도 벡터에 새 메타가 도달하지 않았다")
+
+
+class TestFailedEdgeWriteStaysInAppliedProtection:
+    """② 저장 실패 엣지가 `applied` 에 남아 `incremental_finalize` 의 stale 삭제를 면해야 한다.
+
+    실패해도 안 넣으면, 이전 증분에서 이미 라이브에 들어가 있는 동일 엣지가
+    `stale_edges = live_edges - applied_edges` 계산에 걸려 삭제된다
+    (재현: live_edges={('f','r','t')}, applied_edges=set() → stale_delete_would_run=True,
+    2026-08-11 적대 검증).
+    """
+
+    def test_store_write_failure_does_not_orphan_the_live_edge(self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        ok, skip, err = pack_load.load_edges("pack-1", ef, builder, id_map)
+        assert ok == 1, "사전 조건: 최초 적재는 성공해야 한다"
+
+        live_state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert live_state["edges"], "사전 조건: 엣지가 라이브에 있어야 한다"
+
+        # 이번 증분에서 같은 엣지를 다시 반영하려는데 그래프 쓰기가 실패한다고 가정.
+        def _broken_upsert_edge(*a, **kw):
+            raise RuntimeError("주입된 그래프 쓰기 실패")
+        monkeypatch.setattr(graph, "upsert_edge", _broken_upsert_edge)
+
+        applied: set = set()
+        ok2, skip2, err2 = pack_load.load_edges(
+            "pack-1", ef, builder, id_map, applied=applied)
+        assert ok2 == 0 and err2 == 1, f"저장 실패가 err 로 안 잡혔다 (ok={ok2} err={err2})"
+        assert applied, "저장 실패해도 applied 에는 넣어야 한다 — 안 넣으면 stale 로 오판된다"
+
+        result = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), live_state,
+            bypack_node_ids={"n1", "n2"}, bypack_chunk_ids=set(),
+            applied_edges=applied, force_delete=False,
+            nodes_total=2, chunks_total=0,
+        )
+        assert result["edge_del"] == 0, (
+            "applied 에 남은 실패 엣지가 stale 로 오판돼 지워졌다")
+        left = graph._conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE from_id=?", ("n1",)).fetchone()[0]
+        assert left == 1, f"라이브 엣지가 실제로 삭제됐다 (남은 {left}건)"
+
+
+class TestFailedAddNodeLeavesOldTypedRowIntact:
+    """③ 타입 변경에서 `add_node` 저장이 실패하면 구 타입 행이 살아남아야 한다.
+
+    새 행이 실제로 저장된 뒤에만 구 타입 행을 지우는 순서(load.py 주석 참조)가
+    지켜지지 않으면, 저장 실패 시 구 행과 그 cascade 엣지가 이미 사라진 채로
+    다음 증분도 같은 이유로 또 실패해 **영구 소실**된다.
+    """
+
+    def test_add_node_store_failure_keeps_the_old_type(self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        f_old = _write_jsonl(tmp_path / "old.jsonl", [_node(id="n1", node_type="Document")])
+        pack_load.load_nodes("pack-1", f_old, builder, {})
+        assert graph.get_node("Document", "n1") is not None, "사전 조건: 구 타입 행이 있어야 한다"
+
+        live_nodes = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+
+        def _broken_upsert_node(*a, **kw):
+            raise RuntimeError("주입된 그래프 쓰기 실패")
+        monkeypatch.setattr(graph, "upsert_node", _broken_upsert_node)
+
+        f_new = _write_jsonl(tmp_path / "new.jsonl",
+                             [_node(id="n1", node_type="Concept", space="concept")])
+        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs)
+
+        assert err == 1, (
+            f"저장 실패가 err 로 안 잡혔다 (n_new={n_new} n_chg={n_chg} err={err})")
+        assert graph.get_node("Document", "n1") is not None, (
+            "add_node 가 실패했는데 구 타입 행이 지워졌다 — 재시도로도 복구 불가능한 영구 소실")
+        assert graph.get_node("Concept", "n1") is None, "실패했는데 신규 타입 행이 생겼다"
+
+
+class TestDeleteNodeFalseIsNotCounted:
+    """④ `delete_node` 가 `False`(실제로는 안 지워짐)를 돌려주면 `node_del` 이 오르면 안 된다.
+
+    `_sql_graph_base.py` 의 4백엔드 통일 계약("Returns True iff the node itself was
+    deleted")을 무시하고 예외 없이 통과했다는 이유만으로 세면, 실제로는 아무것도 안
+    지워졌는데 "지웠다"고 보고하는 상태가 만들어진다.
+    """
+
+    def test_incremental_finalize_node_del_reflects_actual_deletion(
+            self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", f, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert "n1" in state["nodes"], "사전 조건: 노드가 라이브에 있어야 한다"
+
+        monkeypatch.setattr(graph, "delete_node", lambda *a, **kw: False)
+
+        # by-pack 에 n1 대신 다른 id 만 있다고 신고 — n1 이 삭제 후보가 되지만
+        # delete_node 가 False 를 돌려준다. bypack_node_ids 를 완전히 비우면
+        # 안전핀 0(by-pack 파일 누락 의심)이 먼저 sys.exit 하므로 빈 집합은 피한다.
+        result = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            bypack_node_ids={"다른-노드"}, bypack_chunk_ids=set(),
+            applied_edges=set(), force_delete=True,
+            nodes_total=0, chunks_total=0,
+        )
+        assert result["node_del"] == 0, (
+            "delete_node 가 False 를 돌려줬는데 node_del 을 세었다 — "
+            f"실제로는 안 지워졌는데 지웠다고 보고한다 (node_del={result['node_del']})")
+
+    def test_delete_pack_node_del_reflects_actual_deletion(self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        assert graph.get_node("Document", "n1") is not None
+
+        monkeypatch.setattr(graph, "delete_node", lambda *a, **kw: False)
+        node_del, _chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
+            "pack-1", graph, docs, _NoVec())
+
+        assert node_del == 0, (
+            "delete_node 가 False 를 돌려줬는데 delete_pack 의 node_del 을 세었다 "
+            f"(실제 {node_del})")
