@@ -809,6 +809,204 @@ class TestIncrementalFinalizeSafetyPins:
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
 
+class TestIncrementalFinalize:
+    """`incremental_finalize` 전용 계약을 **한 클래스**에서 5축 전부 건다(2026-08-11 추가 지시).
+
+    적대 검증 실증: 0-항목 안전핀을 `pass` 로 무력화해도 스위트 전체가 green 이었다 —
+    그 정도로 이 함수는(삭제 권한을 가진 유일한 함수인데도) 전용 커버리지가 없었다.
+
+    아래 1·2축의 상세 근거·변이 실측(그리고 30% 핀의 값+방향 경계)은
+    `TestIncrementalFinalizeSafetyPins` 에 이미 있고, 앵커 보호(`dataset:` 접두사)는
+    `TestIncrementalFinalizeActuallyDeletes` 에 이미 있다 — 여기서는 그 계약이
+    **이 클래스 하나만 읽어도** 5축 전부 보이도록 다시 걸고(짧게, 근거는 원 클래스
+    참조), 아직 어디에도 없던 두 축(`created_by=title-backfill` 앵커,
+    `had_write_failures`)을 새로 채운다. `had_write_failures` 쪽이 특히 중요하다 —
+    이번 리뷰로 처음 생긴 안전핀인데 지금까지 테스트가 하나도 없었다.
+    """
+
+    def _seed(self, builder, docs, tmp_path, n=10, pack="pack-1"):
+        rows = [_node(id=f"n{i}") for i in range(n)]
+        f = _write_jsonl(tmp_path / "nodes.jsonl", rows)
+        pack_load.load_nodes(pack, f, builder, {})
+        return {r["id"] for r in rows}
+
+    def _live(self, graph, docs, pack="pack-1"):
+        return pack_load.live_pack_state(pack, graph, docs, _NoVec())
+
+    # ── 1. 0-item 안전핀 (근거: TestIncrementalFinalizeSafetyPins) ────────
+
+    def test_zero_item_pin_fires_for_nodes_and_chunks(self, live, tmp_path):
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        with pytest.raises(SystemExit):
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                set(), set(), set(), False, 0, 0)
+        assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 노드가 지워졌다"
+
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state2 = self._live(graph, docs)
+        with pytest.raises(SystemExit):
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state2,
+                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0)
+        assert self._live(graph, docs)["chunks"], "중단했는데 청크가 지워졌다"
+
+    # ── 2. 30% 안전핀 — 값과 방향 + force_delete 우회 ──────────────────
+
+    @pytest.mark.parametrize("keep_n, expect_abort", [
+        (7, False),   # 3/10 = 정확히 0.30 — 통과해야 한다(`>` 지 `>=` 아님)
+        (6, True),    # 4/10 = 0.40 — 발동해야 한다
+    ])
+    def test_thirty_percent_pin_value_and_direction(
+            self, live, tmp_path, keep_n, expect_abort):
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        keep = {f"n{i}" for i in range(keep_n)}
+        if expect_abort:
+            with pytest.raises(SystemExit) as ei:
+                pack_load.incremental_finalize(
+                    "pack-1", graph, docs, _NoVec(), state,
+                    keep, set(), set(), False, len(keep), 0)
+            assert "삭제 후보 비율 초과" in str(ei.value)
+        else:
+            res = pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+            assert res["node_del"] == 10 - keep_n, res
+
+    def test_force_delete_bypasses_thirty_percent_pin(self, live, tmp_path):
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n0"}, set(), set(), True, 1, 0)
+        assert res["node_del"] == 9, res
+
+    # ── 3. 앵커 보호 — dataset: 접두사(근거: TestIncrementalFinalizeActuallyDeletes)
+    #      + created_by=title-backfill(여기서 처음 건다) ────────────────
+
+    def test_title_backfill_anchor_is_protected_like_dataset_prefix(self, live, tmp_path):
+        """`_is_anchor` 의 두 조건 중 `dataset:` 접두사만 기존 커버리지가 있었다 —
+        `created_by=title-backfill` 조건은 지금까지 무테스트였다."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [
+            _node(id="n1"),
+            _node(id="backfilled-1", properties={"created_by": "title-backfill"}),
+        ])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        state = self._live(graph, docs)
+        assert "backfilled-1" in state["nodes"], "사전 조건: 앵커가 라이브에 있어야 한다"
+
+        # backfilled-1 은 by-pack 에 없다고 신고 — 앵커가 아니면 삭제 후보가 된다.
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, set(), set(), True, 1, 0)
+
+        left = set(self._live(graph, docs)["nodes"])
+        assert "backfilled-1" in left, (
+            f"title-backfill 앵커를 지웠다 — 남은 노드 {left}, node_del={res['node_del']}")
+
+    # ── 4. 삭제 카운터가 요청 수가 아니라 실제 성공 수를 반영하는가 ──────
+
+    def test_edge_del_reflects_actual_deletion_not_requested(self, live, tmp_path):
+        """`stale_edges` 후보에 있어도 `graph_edges` 에 실제로 없으면 `edge_del` 을 세면 안 된다.
+
+        무조건 `edge_del += 1` 이던 판은 이런 "요청은 했지만 대상이 없던" 경우도 세서,
+        아무것도 안 지워졌는데 지웠다고 보고했다. `cur.rowcount` 로 세는 지금 계약을 건다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        state = self._live(graph, docs)
+        # graph_edges 에 실제로 없는 유령 엣지를 live 엣지 집합에 섞는다.
+        state = dict(state)
+        state["edges"] = {("n1", "cites", "유령-n9")}
+
+        # applied_edges 를 완전히 비우면 "반영 엣지 0건" 안전핀이 먼저 정리를 통째로
+        # 스킵해 버리므로, 무관한 다른 triple 을 넣어 그 핀을 피하면서 유령 엣지는
+        # 여전히 stale 후보(=DELETE 대상)로 남게 한다.
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1", "n2"}, set(), {("무관", "무관계", "무관-y")}, True, 2, 0)
+        assert res["edge_del"] == 0, (
+            f"실제로 존재하지 않던 엣지인데 edge_del 을 세었다: {res}")
+
+    def test_vec_orphan_del_does_not_count_a_failed_batch(self, live, tmp_path):
+        """벡터 삭제가 예외를 던진 배치는 `vec_orphan_del`에 들어가면 안 된다.
+
+        `vec.delete()`에는 실제 삭제를 확인할 API가 없어 성공 시엔 "요청 수"를 셀
+        수밖에 없다(코드 주석 참조) — 그래도 **예외가 난 배치**까지 세면 안 된다.
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path, n=1)
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+
+        class _VecThatAlwaysFailsDelete(_NoVec):
+            available = True
+
+            def delete(self, ids):
+                raise RuntimeError("주입된 벡터 삭제 실패")
+
+        vec = _VecThatAlwaysFailsDelete()
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec)
+        state = dict(state)
+        state["vec_ids"] = {"고아-벡터-1"}   # 스텁은 실제로 벡터 id 를 못 내므로 직접 채운다
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, vec, state,
+            {"n0"}, {"c1"}, set(), True, 1, 1)
+        assert res["vec_orphan_del"] == 0, (
+            f"벡터 삭제가 예외를 던졌는데 vec_orphan_del 을 세었다: {res}")
+
+    # ── 5. had_write_failures — 지금까지 어디에도 없던 축 ────────────────
+
+    def test_had_write_failures_skips_all_cleanup_and_marks_the_result(self, live, tmp_path):
+        """`True` 면 4종 삭제를 전부 건너뛰고 `skipped_cleanup=True` 를 반환해야 한다.
+
+        부분 실패 상태를 기준으로 삭제 판정을 내리면 안 된다(삭제는 되돌릴 수 없다).
+        `bypack_node_ids`/`bypack_chunk_ids` 를 텅 비워 신고해도(정상 경로라면
+        안전핀 0 이 sys.exit 했을 상황) `had_write_failures=True` 는 그 핀 자체를
+        건너뛰고 조용히 정리만 안 하고 끝나야 한다.
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        before_nodes = set(state["nodes"])
+        before_chunks = set(state["chunks"])
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            set(), set(), set(), False, 0, 0,
+            had_write_failures=True,
+        )
+        assert res == {
+            "node_del": 0, "chunk_del": 0, "edge_del": 0, "vec_orphan_del": 0,
+            "skipped_cleanup": True,
+        }, res
+        after = self._live(graph, docs)
+        assert set(after["nodes"]) == before_nodes, "삭제를 건너뛰어야 하는데 노드가 지워졌다"
+        assert set(after["chunks"]) == before_chunks, "삭제를 건너뛰어야 하는데 청크가 지워졌다"
+
+    def test_had_write_failures_defaults_to_false_and_old_behaviour_holds(self, live, tmp_path):
+        """기본값 `False` 는 종전 동작(안전핀 정상 작동)을 유지해야 한다 — 호출자
+        시그니처 추가만으로는 기존 호출을 깨지 않는다는 계약의 회귀 방지 절반이다."""
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        with pytest.raises(SystemExit):
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                set(), set(), set(), False, 0, 0)   # had_write_failures 생략
+
+
 class TestReversedEdgeSwapsEndpoints:
     """`HAS_PART` 같은 반전 관계는 **endpoint 도 함께 바뀌어야** 한다.
 
