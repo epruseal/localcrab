@@ -795,10 +795,19 @@ def incremental_finalize(
     force_delete: bool,
     nodes_total: int,
     chunks_total: int,
+    had_write_failures: bool = False,
 ) -> dict:
     """증분 삭제 + 3원 대사. live는 live_pack_state()의 반환 dict.
 
-    반환: {"node_del":…, "chunk_del":…, "edge_del":…, "vec_orphan_del":…}
+    `had_write_failures=True`면 이번 적재 중 저장 실패(add_node/add_edge 영수증에
+    남은 실패)가 있었다는 뜻이다. **삭제는 되돌릴 수 없다** — 부분적으로만 반영된
+    결과를 기준으로 "무엇이 파일에서 빠졌는가"를 판정하면, 실패해서 아직 못 쓴 행과
+    진짜로 파일에서 빠진 행을 구분할 수 없다. 그래서 이 경우 node_del/chunk_del/
+    edge_del/vec_orphan_del **삭제를 전부 건너뛰고** 반환 dict에
+    `"skipped_cleanup": True`를 남긴다. 다음 증분이 온전히 성공하면 그때 정리된다.
+
+    반환: {"node_del":…, "chunk_del":…, "edge_del":…, "vec_orphan_del":…,
+           "skipped_cleanup": bool}
     """
     require_live_data("incremental_finalize")
     live_nodes  = live["nodes"]
@@ -806,119 +815,130 @@ def incremental_finalize(
     live_edges  = live["edges"]
     live_vecids = live["vec_ids"]
 
-    # ── 안전핀 0: by-pack 파일 누락 의심 (0-항목인데 라이브엔 데이터 존재) ──────
-    if not bypack_node_ids and live_nodes:
-        sys.exit(
-            f"ERROR: [{pack_name}] by-pack 노드 0건 · 라이브 {len(live_nodes)}건 —"
-            " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
-        )
-    if not bypack_chunk_ids and live_chunks:
-        sys.exit(
-            f"ERROR: [{pack_name}] by-pack 청크 0건 · 라이브 {len(live_chunks)}건 —"
-            " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
-        )
-
-    # ── 삭제 후보 (앵커 제외) ──────────────────────────────────────────────
     def _is_anchor(node_id: str) -> bool:
         if node_id.startswith("dataset:"):
             return True
         props = live_nodes.get(node_id, (None, None, {}))[2]
         return props.get("created_by") == "title-backfill"
 
-    node_del_candidates = {nid for nid in (set(live_nodes) - bypack_node_ids) if not _is_anchor(nid)}
-    chunk_del_candidates = set(live_chunks) - bypack_chunk_ids
+    node_del = chunk_del = edge_del = vec_orphan_del = 0
 
-    # ── 안전핀 30%: 삭제 폭주 방지 ───────────────────────────────────────────
-    node_ratio  = len(node_del_candidates)  / max(1, len(live_nodes))
-    chunk_ratio = len(chunk_del_candidates) / max(1, len(live_chunks))
-    if (node_ratio > 0.30 or chunk_ratio > 0.30) and not force_delete:
-        sys.exit(
-            f"ERROR: [{pack_name}] 삭제 후보 비율 초과 — "
-            f"노드 {len(node_del_candidates)}/{len(live_nodes)}({node_ratio:.1%}) "
-            f"청크 {len(chunk_del_candidates)}/{len(live_chunks)}({chunk_ratio:.1%}) — "
-            "--force-delete 로 강행하십시오."
-        )
-
-    # ── 노드 삭제 ────────────────────────────────────────────────────────
-    node_del = 0
-    for node_id in node_del_candidates:
-        node_type, space_id, _props = live_nodes[node_id]
-        try:
-            graph.delete_node(node_type, node_id)
-        except Exception:
-            pass
-        try:
-            docs.delete_node_doc(space_id or "concept", node_id)
-        except Exception:
-            pass
-        node_del += 1
-
-    # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ──────────────────────────
-    chunk_del = 0
-    chunk_del_list = list(chunk_del_candidates)
-    for batch in _batched(chunk_del_list):
-        placeholders = ",".join("?" * len(batch))
-        try:
-            cur = docs._conn.execute(
-                f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
-            )
-            chunk_del += cur.rowcount
-        except Exception as exc:
-            log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-        try:
-            docs._conn.execute(
-                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
-            )
-        except Exception as exc:
-            log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
-    docs._conn.commit()
-    if chunk_del_list:
-        # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
-        # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
-        vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]
-        try:
-            if vec_del_ids:
-                vec.delete(vec_del_ids)
-        except Exception as exc:
-            log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
-
-    # ── 엣지 정리 (live에 있으나 이번 적재에서 재확인되지 않은 엣지) ────────
-    # 안전핀: applied가 통째로 비었는데 live 엣지가 있으면 edges.jsonl 누락/전건
-    # 문법 실패 의심 — 전량 삭제 대신 스킵(0-항목 핀과 동일 클래스, 2026-07-22)
-    if not applied_edges and live_edges:
+    if had_write_failures:
         print(
-            f"  ⚠️ [{pack_name}] 반영 엣지 0건·라이브 {len(live_edges)}건 — "
-            "edges.jsonl 누락 의심, 엣지 정리 스킵",
+            f"  ⚠️ [{pack_name}] 이번 적재에 저장 실패가 있었다 — 부분 실패를 기준으로"
+            " 삭제를 판정할 수 없다(삭제는 되돌릴 수 없다). 증분 삭제(노드/청크/엣지/"
+            "벡터고아) 전부 스킵 — 다음 증분이 온전히 성공하면 그때 정리된다.",
             flush=True,
         )
-        stale_edges = set()
     else:
-        stale_edges = live_edges - applied_edges
-    edge_del = 0
-    for (f_id, r, t_id) in stale_edges:
-        try:
-            graph._conn.execute(
-                "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?"
-                " AND json_extract(properties,'$.pack_id')=?",
-                (f_id, r, t_id, pack_name),
+        # ── 안전핀 0: by-pack 파일 누락 의심 (0-항목인데 라이브엔 데이터 존재) ──
+        if not bypack_node_ids and live_nodes:
+            sys.exit(
+                f"ERROR: [{pack_name}] by-pack 노드 0건 · 라이브 {len(live_nodes)}건 —"
+                " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
             )
-            edge_del += 1
-        except Exception as exc:
-            log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
-    graph._conn.commit()
+        if not bypack_chunk_ids and live_chunks:
+            sys.exit(
+                f"ERROR: [{pack_name}] by-pack 청크 0건 · 라이브 {len(live_chunks)}건 —"
+                " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
+            )
 
-    # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
-    # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
-    vec_orphans = [
-        i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
-    ]
-    vec_orphan_del = 0
-    for batch in _batched(vec_orphans):
-        try:
-            vec.delete(batch)
-            vec_orphan_del += len(batch)
-        except Exception as exc:
-            log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
+        # ── 삭제 후보 (앵커 제외) ──────────────────────────────────────────
+        node_del_candidates = {nid for nid in (set(live_nodes) - bypack_node_ids) if not _is_anchor(nid)}
+        chunk_del_candidates = set(live_chunks) - bypack_chunk_ids
+
+        # ── 안전핀 30%: 삭제 폭주 방지 ───────────────────────────────────────
+        node_ratio  = len(node_del_candidates)  / max(1, len(live_nodes))
+        chunk_ratio = len(chunk_del_candidates) / max(1, len(live_chunks))
+        if (node_ratio > 0.30 or chunk_ratio > 0.30) and not force_delete:
+            sys.exit(
+                f"ERROR: [{pack_name}] 삭제 후보 비율 초과 — "
+                f"노드 {len(node_del_candidates)}/{len(live_nodes)}({node_ratio:.1%}) "
+                f"청크 {len(chunk_del_candidates)}/{len(live_chunks)}({chunk_ratio:.1%}) — "
+                "--force-delete 로 강행하십시오."
+            )
+
+        # ── 노드 삭제 ────────────────────────────────────────────────────
+        for node_id in node_del_candidates:
+            node_type, space_id, _props = live_nodes[node_id]
+            try:
+                deleted = graph.delete_node(node_type, node_id)
+            except Exception:
+                deleted = False
+            try:
+                docs.delete_node_doc(space_id or "concept", node_id)
+            except Exception:
+                pass
+            if deleted:
+                node_del += 1
+
+        # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
+        chunk_del_list = list(chunk_del_candidates)
+        for batch in _batched(chunk_del_list):
+            placeholders = ",".join("?" * len(batch))
+            try:
+                cur = docs._conn.execute(
+                    f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
+                )
+                chunk_del += cur.rowcount
+            except Exception as exc:
+                log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
+            try:
+                docs._conn.execute(
+                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
+                )
+            except Exception as exc:
+                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+        docs._conn.commit()
+        if chunk_del_list:
+            # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
+            # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
+            vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]
+            try:
+                if vec_del_ids:
+                    vec.delete(vec_del_ids)
+            except Exception as exc:
+                log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
+
+        # ── 엣지 정리 (live에 있으나 이번 적재에서 재확인되지 않은 엣지) ──────
+        # 안전핀: applied가 통째로 비었는데 live 엣지가 있으면 edges.jsonl 누락/전건
+        # 문법 실패 의심 — 전량 삭제 대신 스킵(0-항목 핀과 동일 클래스, 2026-07-22)
+        if not applied_edges and live_edges:
+            print(
+                f"  ⚠️ [{pack_name}] 반영 엣지 0건·라이브 {len(live_edges)}건 — "
+                "edges.jsonl 누락 의심, 엣지 정리 스킵",
+                flush=True,
+            )
+            stale_edges = set()
+        else:
+            stale_edges = live_edges - applied_edges
+        for (f_id, r, t_id) in stale_edges:
+            try:
+                cur = graph._conn.execute(
+                    "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?"
+                    " AND json_extract(properties,'$.pack_id')=?",
+                    (f_id, r, t_id, pack_name),
+                )
+                # rowcount로 센다 — 무조건 +=1이면 노드 삭제의 cascade가 이미 지운
+                # 엣지까지 여기서 다시 세어 **이중 계상**한다.
+                edge_del += cur.rowcount
+            except Exception as exc:
+                log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
+        graph._conn.commit()
+
+        # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
+        # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
+        vec_orphans = [
+            i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
+        ]
+        for batch in _batched(vec_orphans):
+            try:
+                # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
+                # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
+                vec.delete(batch)
+                vec_orphan_del += len(batch)
+            except Exception as exc:
+                log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 3원 대사 출력 (assert 아님 — 숫자 보고) ────────────────────────────
     counts = pack_live_counts(pack_name, graph, docs, vec)
@@ -941,4 +961,5 @@ def incremental_finalize(
         "chunk_del": chunk_del,
         "edge_del": edge_del,
         "vec_orphan_del": vec_orphan_del,
+        "skipped_cleanup": had_write_failures,
     }
