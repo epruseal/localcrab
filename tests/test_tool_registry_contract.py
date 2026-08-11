@@ -20,9 +20,11 @@ from opencrab.mcp.tools import TOOLS, UnknownToolError, dispatch_tool
 
 # #145: dispatch_tool() now calls current_principal() for every tool (read or
 # write); bind a fixed test principal for every test in this module (see
-# conftest.py's bind_test_principal). The unknown-tool tests below don't
-# need it -- dispatch_tool checks tool existence before touching the
-# principal -- but binding it uniformly keeps this module simple.
+# conftest.py's bind_test_principal). #150 v3 changed this to matter for the
+# unknown-tool tests too: dispatch_tool now resolves the principal BEFORE
+# looking the name up (see _registry.dispatch_tool's docstring), so calling
+# it with no principal bound at all raises LookupError, not UnknownToolError
+# -- this module's bind_test_principal keeps that a non-issue here.
 pytestmark = pytest.mark.usefixtures("bind_test_principal")
 
 # Golden contract: exact tool names, in exact order, snapshotted from the
@@ -217,12 +219,13 @@ class TestWriteLockCoverage:
         assert read_name not in _REGISTRY
 
         try:
+            from opencrab.mcp.tools._registry import AccessTier
 
-            @tool(write_name, schema, writes=True)
+            @tool(write_name, schema, access=AccessTier.WRITE, writes=True)
             def _write_probe(**kwargs):
                 return {"locked": events == ["enter"]}
 
-            @tool(read_name, schema)
+            @tool(read_name, schema, access=AccessTier.READ)
             def _read_probe(**kwargs):
                 return {"locked": events == ["enter"]}
 
@@ -242,7 +245,7 @@ class TestWriteLockCoverage:
 
 class TestRegistryDuplicateGuard:
     def test_tool_decorator_raises_on_duplicate_registration(self):
-        from opencrab.mcp.tools._registry import _REGISTRY, tool
+        from opencrab.mcp.tools._registry import _REGISTRY, AccessTier, tool
 
         name = "__contract_test_duplicate_probe__"
         assert name not in _REGISTRY
@@ -252,14 +255,80 @@ class TestRegistryDuplicateGuard:
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
             }
 
-            @tool(name, schema)
+            @tool(name, schema, access=AccessTier.READ)
             def _probe_one():
                 return {"ok": True}
 
             with pytest.raises(ValueError, match="already registered"):
 
-                @tool(name, schema)
+                @tool(name, schema, access=AccessTier.READ)
                 def _probe_two():
                     return {"ok": True}
         finally:
             _REGISTRY.pop(name, None)
+
+
+class TestAccessTierRequired:
+    """#150 acceptance criterion: a tool registered with no access tier must
+    fail at IMPORT time (like the duplicate-name / order-collision guards
+    above), not silently default to some tier."""
+
+    def test_tool_without_access_raises_type_error(self):
+        from opencrab.mcp.tools._registry import _REGISTRY, tool
+
+        name = "__contract_test_missing_access_probe__"
+        assert name not in _REGISTRY
+        schema = {
+            "description": "probe",
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+        }
+        with pytest.raises(TypeError):
+
+            @tool(name, schema)
+            def _probe(**kwargs):
+                return {"ok": True}
+
+        # The decorator call must fail before `deco` runs at all -- nothing
+        # should land in the registry.
+        assert name not in _REGISTRY
+
+
+class TestAccessTierClassification:
+    """#150: pins each golden tool's access tier so a future PR that changes
+    one without review fails loudly here, plus the two specific claims the
+    issue makes -- ADMIN is exactly the three host-mutating tools, and
+    ontology_query (writes=False) is WRITE-tier, not the "side-effect-free
+    read" its writes=False flag might suggest (billing insert)."""
+
+    GOLDEN_ADMIN_TOOL_NAMES = {
+        "schema_pack_install",
+        "schema_pack_uninstall",
+        "harness_promotion_apply",
+    }
+
+    def test_admin_tier_matches_golden_list(self):
+        from opencrab.mcp.tools._registry import _REGISTRY, AccessTier
+
+        admin = {name for name, spec in _REGISTRY.items() if spec.access is AccessTier.ADMIN}
+        assert admin == self.GOLDEN_ADMIN_TOOL_NAMES
+
+    def test_ontology_query_is_not_classified_as_side_effect_free_read(self):
+        """#150 issue body: ontology_query must NOT be classified as a
+        side-effect-free read -- it INSERTs a billing_events row despite
+        writes=False (see WRITE_TOOLS's docstring in __init__.py)."""
+        from opencrab.mcp.tools._registry import _REGISTRY, AccessTier
+
+        spec = _REGISTRY["ontology_query"]
+        assert spec.access is not AccessTier.READ
+        assert spec.access is AccessTier.WRITE
+        assert spec.writes is False  # unchanged from #65/#105 -- separate axis
+
+    def test_every_golden_tool_has_an_access_tier(self):
+        """Belt-and-suspenders: every tool actually reachable from TOOLS has
+        gone through `tool()`'s required `access` kwarg (a tool that somehow
+        landed in the registry without one couldn't exist -- `tool()` would
+        have raised -- but this pins the observable property directly)."""
+        from opencrab.mcp.tools._registry import _REGISTRY, AccessTier
+
+        for name in GOLDEN_TOOL_NAMES:
+            assert isinstance(_REGISTRY[name].access, AccessTier), name

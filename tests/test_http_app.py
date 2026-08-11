@@ -356,6 +356,207 @@ class TestBatchAndNotifications:
 
 
 # ---------------------------------------------------------------------------
+# #150: per-principal MCP tool exposure. ADMIN-tier tools
+# (schema_pack_install/uninstall, harness_promotion_apply) are hidden from
+# tools/list AND rejected by tools/call for a remote (non-local, token-only)
+# principal -- the local bootstrapped user from `bootstrapped`/`client` above
+# is_local=True, so it keeps seeing/calling all 16.
+# ---------------------------------------------------------------------------
+
+_ADMIN_TOOL_NAMES = {"schema_pack_install", "schema_pack_uninstall", "harness_promotion_apply"}
+
+
+@pytest.fixture
+def remote_identity(bootstrapped):
+    """(user_id, secret) for a second user on the SAME sql store as
+    `bootstrapped`, with is_local=False -- a token-authenticated remote
+    principal, as opposed to the local bootstrapped one."""
+    from opencrab.auth import create_user, issue_token
+
+    sql, _local_user_id, _local_secret = bootstrapped
+    user_id = create_user(sql, "remote-user", is_local=False)
+    _token_id, secret = issue_token(sql, user_id)
+    return user_id, secret
+
+
+@pytest.fixture
+def remote_secret(remote_identity):
+    """Back-compat: most tests only need the bearer secret, not the id."""
+    return remote_identity[1]
+
+
+class TestToolExposureByPrincipal:
+    def test_tools_list_admin_tools_hidden_from_remote_principal(self, client, bootstrapped, remote_secret):
+        _, _, local_secret = bootstrapped
+        local_names = {
+            t["name"]
+            for t in client.post(
+                "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=_auth(local_secret)
+            ).json()["result"]["tools"]
+        }
+        remote_names = {
+            t["name"]
+            for t in client.post(
+                "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=_auth(remote_secret)
+            ).json()["result"]["tools"]
+        }
+        assert _ADMIN_TOOL_NAMES <= local_names
+        assert remote_names == local_names - _ADMIN_TOOL_NAMES
+
+    def test_tools_list_no_cross_user_cache_leak_across_interleaved_requests(
+        self, client, bootstrapped, remote_secret
+    ):
+        """Same MCPServer instance (constructed once by `mcp_router`), hit by
+        alternating local/remote requests: if tools/list were memoised
+        anywhere keyed on something other than the caller's principal, one
+        principal's filtered (or unfiltered) list would leak into the
+        other's response. Interleaving -- not just "call each once" -- is
+        what would actually surface a naive process-global cache."""
+        _, _, local_secret = bootstrapped
+        for _ in range(3):
+            local_names = {
+                t["name"]
+                for t in client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers=_auth(local_secret),
+                ).json()["result"]["tools"]
+            }
+            remote_names = {
+                t["name"]
+                for t in client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers=_auth(remote_secret),
+                ).json()["result"]["tools"]
+            }
+            assert _ADMIN_TOOL_NAMES & local_names == _ADMIN_TOOL_NAMES
+            assert _ADMIN_TOOL_NAMES & remote_names == set()
+
+    def test_tools_call_admin_tool_denied_for_remote_principal(self, client, remote_identity):
+        """The core #150 test: a caller that already knows an ADMIN-tier
+        tool's name (it doesn't need tools/list to have shown it) still gets
+        refused by tools/call -- the list filter alone would be decoration.
+
+        #150 v3 (D2/D3): this is now a JSON-RPC top-level error
+        (METHOD_NOT_FOUND, -32601), NOT the normal tool-envelope error (HTTP
+        200 + {"error": ...} inside `result.content`) the pre-fix code used
+        -- the denial is reported via ``UnknownToolError`` (see
+        ``opencrab.mcp.tools._registry.dispatch_tool``'s docstring), the
+        SAME contract a genuinely unregistered tool name gets, and the same
+        JSON-RPC error code ``opencrab/mcp/server.py``'s
+        ``_handle_tools_call``/``handle_request`` already used for
+        ``UnknownToolError``. No store is ever touched for a denied call
+        (see tests/test_mcp_tool_exposure.py's spy-based proof)."""
+        user_id, secret = remote_identity
+        resp = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "schema_pack_install", "arguments": {"name": "saas"}},
+            },
+            headers=_auth(secret),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "result" not in body
+        assert body["error"]["code"] == -32601
+        assert "schema_pack_install" in body["error"]["message"]
+        # criterion 6/7: nothing in the response body leaks the actual
+        # remote principal's id -- checked against a REMOTE principal
+        # specifically, since a local-only test could not exercise the
+        # hidden/denied path at all.
+        assert user_id not in json_module.dumps(body)
+
+    def test_tools_call_hidden_admin_tool_is_indistinguishable_from_removed(self, client, remote_secret):
+        """#150 v3 D1, at the real HTTP transport: for the SAME remote
+        principal and SAME requested name, (a) the tool present but
+        ADMIN-tier (hidden) and (b) the tool removed from the registry
+        outright must produce byte-identical HTTP status and JSON-RPC error
+        bodies. `_REGISTRY` is restored via a full dict snapshot in
+        `finally` so this does not corrupt later tests' tool listing/order."""
+        from opencrab.mcp.tools._registry import _REGISTRY
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "schema_pack_install", "arguments": {}},
+        }
+        hidden_resp = client.post("/mcp", json=payload, headers=_auth(remote_secret))
+
+        snapshot = dict(_REGISTRY)
+        try:
+            del _REGISTRY["schema_pack_install"]
+            removed_resp = client.post("/mcp", json=payload, headers=_auth(remote_secret))
+        finally:
+            _REGISTRY.clear()
+            _REGISTRY.update(snapshot)
+
+        assert list(_REGISTRY.keys()) == list(snapshot.keys())
+        assert hidden_resp.status_code == removed_resp.status_code == 200
+        assert hidden_resp.json() == removed_resp.json()
+
+    def test_batch_with_hidden_tool_call_and_notification_exact_shape(self, client, remote_secret):
+        """#150 v3 criterion 12: pin the exact batch/notification shape when
+        one item in the batch is a hidden-tool tools/call. The notification
+        gets no response entry at all; the hidden call gets a top-level
+        JSON-RPC error entry (not a success envelope); the trailing
+        READ-tier call still succeeds -- one bad item does not derail the
+        rest of the batch."""
+        resp = client.post(
+            "/mcp",
+            json=[
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "schema_pack_install", "arguments": {}},
+                },
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "schema_pack_list", "arguments": {}},
+                },
+            ],
+            headers=_auth(remote_secret),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body) == 2  # the notification produced no entry
+        assert body[0]["id"] == 1
+        assert "result" not in body[0]
+        assert body[0]["error"]["code"] == -32601
+        assert body[1]["id"] == 2
+        assert "error" not in body[1]
+        content = json_module.loads(body[1]["result"]["content"][0]["text"])
+        assert "error" not in content
+
+    def test_tools_call_read_tool_still_works_for_remote_principal(self, client, remote_secret):
+        """Sanity check the denial above is tier-specific, not "remote can't
+        call anything": a READ-tier tool works fine for the same principal.
+        schema_pack_list needs no store context (see schema.py's module
+        docstring), so this needs no _get_context stub."""
+        resp = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "schema_pack_list", "arguments": {}},
+            },
+            headers=_auth(remote_secret),
+        )
+        assert resp.status_code == 200
+        content = json_module.loads(resp.json()["result"]["content"][0]["text"])
+        assert "error" not in content
+
+
+# ---------------------------------------------------------------------------
 # refuse_stale_shared_secret_env
 # ---------------------------------------------------------------------------
 

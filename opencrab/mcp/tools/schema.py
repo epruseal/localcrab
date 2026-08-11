@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._registry import tool
+from ._registry import AccessTier, tool
 
 
 @tool(
@@ -19,6 +19,7 @@ from ._registry import tool
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     order=10,
+    access=AccessTier.READ,
 )
 def schema_pack_list() -> dict[str, Any]:
     """List all available schema packs with install status."""
@@ -41,6 +42,11 @@ def schema_pack_list() -> dict[str, Any]:
         },
     },
     order=11,
+    # #150: ADMIN, not WRITE -- this mutates the HOST FILESYSTEM (type YAML
+    # under schemas/types/) as a process-global change, not a graph write.
+    # Withheld from remote (non-local) principals -- see
+    # opencrab.mcp.tools._registry.allowed_access_tiers.
+    access=AccessTier.ADMIN,
     writes=True,
 )
 def schema_pack_install(name: str) -> dict[str, Any]:
@@ -73,6 +79,8 @@ def schema_pack_install(name: str) -> dict[str, Any]:
         },
     },
     order=12,
+    # #150: ADMIN -- same host-filesystem rationale as schema_pack_install.
+    access=AccessTier.ADMIN,
     writes=True,
 )
 def schema_pack_uninstall(name: str, force: bool = False) -> dict[str, Any]:

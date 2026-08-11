@@ -205,6 +205,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 
 > ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다 — 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
 
+> **사용자별 노출 (#150).** 위 16개는 로컬 principal(stdio/CLI) 기준입니다. 원격(토큰 인증) principal은 `schema_pack_install` / `schema_pack_uninstall` / `harness_promotion_apply`(관리 등급, 호스트 파일시스템 또는 팩 경계 밖 쓰기) 3개가 `tools/list`에서 빠지고 `tools/call`로 직접 호출해도 거부됩니다(13개만 사용 가능). 등급은 `users.role` 컬럼이 아니라 `Principal.is_local`에서 유도합니다 — 로컬 사용자는 어차피 그 파일들을 직접 편집할 수 있는 주체라 나눌 실익이 있는 경계가 로컬 대 원격이기 때문입니다. 원격 관리자가 둘 이상 필요해지면 그때 역할 컬럼을 도입합니다. 자세한 내용은 `opencrab/mcp/tools/_registry.py`의 `AccessTier`/`allowed_access_tiers`를 참고하세요.
+
 ---
 
 ## 임베딩 백엔드
