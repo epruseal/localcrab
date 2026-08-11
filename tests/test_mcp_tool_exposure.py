@@ -355,6 +355,17 @@ class TestFourDispatchStatesExactCodesAndBodies:
         content = json.loads(response["result"]["content"][0]["text"])
         assert "error" in content
 
+    def test_unbound_principal_beats_name_lookup_for_an_unregistered_name(self):
+        """#150 v3 D4, the distinguishing case: dispatch_tool resolves the
+        principal in step 1, BEFORE the registry lookup in step 2. With no
+        principal bound, an unregistered name therefore raises a bare
+        LookupError -- not the UnknownToolError it raised before #150.
+        The server-level test above cannot pin this down: it goes through a
+        registered name, where both orderings would fail identically."""
+        with pytest.raises(LookupError) as excinfo:
+            dispatch_tool("ghost-never-registered", {})
+        assert not isinstance(excinfo.value, UnknownToolError)
+
     def test_hidden_admin_tool_for_remote_is_method_not_found(self, server):
         with principal_scope(_REMOTE):
             response = self._call(server, "schema_pack_install")
