@@ -27,7 +27,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from opencrab.ontology.builder import OntologyBuilder
+from opencrab.ontology.builder import OntologyBuilder, store_write_failures
 from opencrab.pack.jsonl_io import iter_jsonl
 from opencrab.pack.live_data import require_live_data
 from opencrab.pack.normalize import (
@@ -361,8 +361,17 @@ def load_nodes(
             id_map[node_id] = (space, node_type)
 
             try:
-                builder.add_node(space, node_type, node_id, properties=props)
-                ok += 1
+                res = builder.add_node(space, node_type, node_id, properties=props)
+                # **영수증을 본다.** `add_node`는 스토어 실패를 예외로 올리지 않고 반환
+                # dict에 적는다 — `builder.store_write_failures()`의 docstring이
+                # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
+                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+                if fails:
+                    err += 1
+                    log.warning("노드 저장 실패 %s (%s/%s): %s",
+                                node_id, space, node_type, "; ".join(fails))
+                else:
+                    ok += 1
             except ValueError as ve:
                 skip += 1
                 log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
@@ -417,23 +426,41 @@ def load_nodes_incremental(
                         print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
                     continue
 
-                if live[0] != node_type:
-                    # 타입 변경 — 구 행 고아 방지(신규 타입으로 add_node 하기 전에 구 행 제거)
-                    try:
-                        graph.delete_node(live[0], node_id)
-                    except Exception:
-                        pass
-                    try:
-                        docs.delete_node_doc(live[1] or space, node_id)
-                    except Exception:
-                        pass
+            # 타입이 바뀐 구 행은 **새 노드가 실제로 저장된 뒤에** 지운다(아래).
+            #
+            # 종전에는 `add_node` **전에** 지웠다. 그러면 저장이 실패했을 때 구 노드와
+            # cascade 엣지가 이미 없어 **재시도로도 복구되지 않는다** — 다음 증분은
+            # `live is None` 으로 보고 다시 시도하다 같은 이유로 또 실패한다. 영구 소실이다.
+            # 노드 키가 `(node_type, node_id)` 라 타입이 다르면 잠시 공존할 수 있으므로
+            # 이 순서가 가능하다. 저장이 실패하면 구 행이 남아 **현상 유지**가 된다.
+            stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
             try:
-                builder.add_node(space, node_type, node_id, properties=props)
-                if live is None:
-                    n_new += 1
+                res = builder.add_node(space, node_type, node_id, properties=props)
+                # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
+                # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
+                # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
+                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+                if fails:
+                    err += 1
+                    log.warning("노드 저장 실패 %s (%s/%s): %s",
+                                node_id, space, node_type, "; ".join(fails))
                 else:
-                    n_chg += 1
+                    if stale_typed is not None:
+                        # 새 행이 저장된 뒤에만 구 타입 행을 지운다.
+                        try:
+                            graph.delete_node(stale_typed[0], node_id)
+                        except Exception as exc:
+                            log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
+                                        node_id, stale_typed[0], exc)
+                        try:
+                            docs.delete_node_doc(stale_typed[1], node_id)
+                        except Exception:
+                            pass
+                    if live is None:
+                        n_new += 1
+                    else:
+                        n_chg += 1
             except ValueError as ve:
                 skip += 1
                 log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
@@ -497,6 +524,16 @@ def load_edges(
             if _reversed:
                 src_id, tgt_id = tgt_id, src_id
 
+            if applied is not None:
+                # **성공/실패와 무관하게 넣는다.** 이 시점에서 (src_id, relation, tgt_id)는
+                # 반전까지 반영된 최종 형태로 확정됐다 — 이 행이 파일에 있다는 사실 자체가
+                # "고아가 아니다"의 근거다. 저장이 실패해도 여기 안 넣으면, 이전 증분에서
+                # 이미 라이브에 들어가 있는 동일 엣지가 `incremental_finalize`의
+                # `stale_edges = live_edges - applied_edges`에 걸려 **삭제**된다
+                # (재현: live_edges={('f','r','t')}, applied_edges=set() →
+                # stale_delete_would_run=True, 2026-08-11 적대 검증).
+                applied.add((src_id, relation, tgt_id))
+
             props: dict = {}
             props["source_label"] = raw_label   # 원본 라벨 보존
             if row.get("properties"):
@@ -510,11 +547,18 @@ def load_edges(
             props["pack_id"] = pack_name
 
             try:
-                builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props)
-                ok += 1
-                if applied is not None:
-                    # 반전(do_reverse/REVERSE_RELATIONS) 적용 후의 최종 src/tgt 기준
-                    applied.add((src_id, relation, tgt_id))
+                res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props)
+                # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
+                # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
+                # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).
+                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+                if fails:
+                    err += 1
+                    reasons[('저장 실패', f'{raw_label}→{relation}', from_space, to_space)] += 1
+                    log.warning("엣지 저장 실패 %s->%s [%s→%s]: %s",
+                                src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
+                else:
+                    ok += 1
             except ValueError as ve:
                 skip += 1
                 reasons[('grammar 위반', f'{raw_label}→{relation}', from_space, to_space)] += 1
