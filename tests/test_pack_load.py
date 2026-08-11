@@ -770,6 +770,44 @@ class TestIncrementalFinalizeSafetyPins:
         assert res["node_del"] == 2, res
         assert set(self._live(graph, docs)["nodes"]) == keep
 
+    def test_exactly_thirty_percent_is_allowed_not_aborted(self, live, tmp_path):
+        """**경계 자체**를 건다 — 위 셋은 값만 걸고 비교 방향을 안 건다.
+
+        `node_ratio > 0.30` 을 `>=` 로 바꾸는 변이는 "초과 시 중단"(90%)·"force 우회"·
+        "미만 시 정상"(20%) 셋을 **전부 통과한다** — 어느 것도 정확히 0.30 을 안 지난다.
+        실측(2026-08-11): 그 변이로 68개가 그대로 green 이었다.
+
+        그런데 방향이 바뀌면 **정확히 30%인 팩이 삭제에서 빠진다.** 정상 정리가 조용히
+        멈추는 것이고, 운영자는 "왜 안 지워지지"만 보게 된다. 값과 방향은 같이 걸어야 한다
+        (호출자 리포의 `SCORE_THRESHOLD` 계약이 같은 이유로 비교 방향을 함께 건다).
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        keep = {f"n{i}" for i in range(7)}   # 3/10 = 정확히 0.30
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            keep, set(), set(), False, len(keep), 0)
+        assert res["node_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
+        assert set(self._live(graph, docs)["nodes"]) == keep
+
+    def test_just_over_thirty_percent_aborts(self, live, tmp_path):
+        """경계 바로 위 — 위 테스트와 짝이다.
+
+        둘을 같이 걸어야 `>` 를 `>=` 로도, `0.30` 을 `0.31` 로도 못 바꾼다.
+        한쪽만 걸면 반대쪽으로 밀 수 있다.
+        """
+        builder, graph, docs = live
+        self._seed(builder, docs, tmp_path)
+        state = self._live(graph, docs)
+        keep = {f"n{i}" for i in range(6)}   # 4/10 = 0.40, 경계 바로 위
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+        assert "삭제 후보 비율 초과" in str(ei.value)
+        assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
+
 
 class TestReversedEdgeSwapsEndpoints:
     """`HAS_PART` 같은 반전 관계는 **endpoint 도 함께 바뀌어야** 한다.
