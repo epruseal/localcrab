@@ -124,10 +124,14 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     import json as _json
     try:
         if kind == "sql":
-            handle.execute(f"UPDATE {table} SET metadata = ? WHERE node_id = ?",
-                           (_json.dumps(meta, ensure_ascii=False), chunk_id))
+            cur = handle.execute(f"UPDATE {table} SET metadata = ? WHERE node_id = ?",
+                                  (_json.dumps(meta, ensure_ascii=False), chunk_id))
             handle.commit()
-            return True
+            # rowcount == 0이면 UPDATE가 아무 행도 못 건드린 것이다(node_id가 벡터
+            # 테이블에 없음 등) — 그런데도 True를 돌려주면 호출자가 "메타를 고쳤다"고
+            # 믿고 doc 기준을 옮기고, 벡터는 옛 메타 그대로 남아 다음 증분이 c_same으로
+            # 넘어간다(영구 불일치). rowcount를 봐야 재임베딩 경로로 보낼 수 있다.
+            return bool(cur.rowcount)
         if kind == "chroma":
             handle.update(ids=[chunk_id], metadatas=[meta])
             return True
