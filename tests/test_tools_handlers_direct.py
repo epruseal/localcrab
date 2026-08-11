@@ -33,6 +33,11 @@ from opencrab.mcp.tools import (
 )
 from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
+# #145: these handlers now call current_principal() internally; bind a fixed
+# test principal for every test in this module (see conftest.py's
+# bind_test_principal).
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 
 @pytest.fixture(autouse=True)
 def _clear_context():
@@ -573,12 +578,16 @@ class TestPackCreate:
         assert builder.add_node.call_args.kwargs["space"] == "resource"
         assert builder.add_node.call_args.kwargs["node_type"] == "Dataset"
 
-    def test_normal_forwards_subject_id_to_anchor_node_audit(self):
-        """Issue #119: pack_create's anchor node write (a builder.add_node
-        call separate from _ingest_into_pack's own node/edge/evidence loops)
-        had the same gap — subject_id reached the ingest billing event but
-        not this write's own audit event. Pin that it now reaches
-        builder.add_node."""
+    def test_normal_forwards_principal_to_anchor_node_audit(self):
+        """Issue #119, inverted for #145: pack_create's anchor node write (a
+        builder.add_node call separate from _ingest_into_pack's own
+        node/edge/evidence loops) had the same gap — subject_id reached the
+        ingest billing event but not this write's own audit event. Pin that
+        it now reaches builder.add_node -- sourced from the caller's
+        server-derived principal (pack_create takes no subject_id argument
+        at all anymore, #145)."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -586,10 +595,14 @@ class TestPackCreate:
         ):
             mock_ctx.return_value = _base_ctx(builder=builder)
             mock_list.return_value = {"packs": []}
-            pack_create(title="My Pack", pack_id="my-pack", subject_id="actor-1")
+            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+                pack_create(title="My Pack", pack_id="my-pack")
         assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
 
-    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+    def test_normal_uses_bound_principal_by_default(self):
+        """#145: there is no "omitted subject_id" state anymore -- pack_create
+        always uses whatever current_principal() resolves to (bound here by
+        the bind_test_principal fixture)."""
         builder = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -598,7 +611,7 @@ class TestPackCreate:
             mock_ctx.return_value = _base_ctx(builder=builder)
             mock_list.return_value = {"packs": []}
             pack_create(title="My Pack", pack_id="my-pack")
-        assert builder.add_node.call_args.kwargs["subject_id"] is None
+        assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
 
     def test_error_pack_already_exists(self):
         with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
@@ -707,7 +720,14 @@ class TestPackCreate:
         see builder.py) — the billing gate now positively confirms the
         graph write landed (issue #66 codex re-review), so a bare
         MagicMock() return (no "graph" key at all) would no longer count as
-        billable, same as it wouldn't in production."""
+        billable, same as it wouldn't in production.
+
+        #145: tenant_id/subject_id are no longer pack_create arguments --
+        tenant_id is fixed at 'default' and subject_id comes from the
+        caller's server-derived principal (bound here via principal_scope
+        instead of passed as a kwarg)."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
@@ -717,15 +737,17 @@ class TestPackCreate:
         ):
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             mock_list.return_value = {"packs": []}
-            result = pack_create(
-                title="Doc Pack", pack_id="doc-pack", text="some content",
-                tenant_id="acme", subject_id="u1",
-            )
-        billing.on_ingest.assert_called_once_with("acme", "u1", result["evidence_node"])
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = pack_create(
+                    title="Doc Pack", pack_id="doc-pack", text="some content",
+                )
+        billing.on_ingest.assert_called_once_with("default", "u1", result["evidence_node"])
 
     def test_normal_bills_ingest_using_pack_id_when_nodes_given_but_no_text(self):
         """nodes given, no text -> no source_id, so on_ingest must fall back
-        to pack_id (its signature requires a non-None string)."""
+        to pack_id (its signature requires a non-None string). subject_id is
+        the bind_test_principal fixture's principal (#145: no longer a
+        client argument)."""
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
@@ -739,7 +761,7 @@ class TestPackCreate:
                 title="Node Pack", pack_id="node-pack",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
             )
-        billing.on_ingest.assert_called_once_with("default", None, "node-pack")
+        billing.on_ingest.assert_called_once_with("default", "test-user", "node-pack")
 
     def test_normal_empty_pack_create_does_not_bill_ingest(self):
         """#66/#105 review: a pack_create with no nodes/edges/text creates
@@ -827,7 +849,13 @@ class TestPackIngestErrors:
         assert result["node_errors"] == ["e1: graph: error: disk I/O"]
 
     def test_normal_bills_ingest_event(self):
-        """#66: pack_ingest never called billing.on_ingest."""
+        """#66: pack_ingest never called billing.on_ingest.
+
+        #145: tenant_id/subject_id are no longer pack_ingest arguments --
+        tenant_id is fixed at 'default' and subject_id comes from the
+        caller's server-derived principal (bound here via principal_scope)."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
@@ -837,12 +865,12 @@ class TestPackIngestErrors:
         ):
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
-            pack_ingest(
-                "existing-pack",
-                nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
-                tenant_id="acme", subject_id="u1",
-            )
-        billing.on_ingest.assert_called_once_with("acme", "u1", "existing-pack")
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                pack_ingest(
+                    "existing-pack",
+                    nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
+                )
+        billing.on_ingest.assert_called_once_with("default", "u1", "existing-pack")
 
     def test_normal_billing_persist_failure_is_logged_but_ingest_still_succeeds(self, caplog):
         """#105: on_ingest's returned {"ok": ...} must actually be inspected,
@@ -957,14 +985,22 @@ class TestHarnessPromotionApply:
         }
 
     def test_normal_bills_harness_apply_event(self):
-        """#66: on_harness_apply had zero callers repo-wide before this fix."""
+        """#66: on_harness_apply had zero callers repo-wide before this fix.
+
+        #145: tenant_id/subject_id are no longer harness_promotion_apply
+        arguments -- tenant_id is fixed at 'default' and subject_id comes
+        from the caller's server-derived principal (bound here via
+        principal_scope)."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            harness_promotion_apply(_VALID_PACKAGE, dry_run=False, tenant_id="acme", subject_id="u1")
-        billing.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
+        billing.on_harness_apply.assert_called_once_with("default", "u1", "pkg-1", 1)
 
     def test_normal_subject_id_reaches_every_node_and_edge_write(self):
         """Issue #119: subject_id reached on_harness_apply (billing) but never
@@ -972,7 +1008,10 @@ class TestHarnessPromotionApply:
         in a promotion was audited with a null actor while the billing row
         named one. Pin BOTH the node and edge write receive it, for every
         item in the loop (a partial fix across a multi-write op is worse than
-        the original bug)."""
+        the original bug). #145: subject_id is now the caller's
+        server-derived principal, bound via principal_scope, not a kwarg."""
+        from opencrab.auth import Principal, principal_scope
+
         package = dict(_VALID_PACKAGE, nodes=[
             {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
             {"space": "resource", "node_type": "Dataset", "node_id": "ds2", "properties": {}},
@@ -985,12 +1024,16 @@ class TestHarnessPromotionApply:
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder)
-            harness_promotion_apply(package, dry_run=False, subject_id="actor-1")
+            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+                harness_promotion_apply(package, dry_run=False)
         for call in builder.add_node.call_args_list:
             assert call.kwargs["subject_id"] == "actor-1"
         assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
 
-    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+    def test_normal_uses_bound_principal_by_default(self):
+        """#145: there is no "omitted subject_id" state anymore --
+        harness_promotion_apply always uses whatever current_principal()
+        resolves to (bound here by the bind_test_principal fixture)."""
         package = dict(_VALID_PACKAGE, edges=[{
             "from_space": "resource", "from_id": "ds1", "relation": "related_to",
             "to_space": "resource", "to_id": "ds2",
@@ -1001,8 +1044,8 @@ class TestHarnessPromotionApply:
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder)
             harness_promotion_apply(package, dry_run=False)
-        assert builder.add_node.call_args.kwargs["subject_id"] is None
-        assert builder.add_edge.call_args.kwargs["subject_id"] is None
+        assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
+        assert builder.add_edge.call_args.kwargs["subject_id"] == "test-user"
 
     def test_error_malformed_receipt_does_not_bill(self):
         """#66 codex re-review, finding [3]: a "stores" map with no "graph"
@@ -1078,7 +1121,7 @@ class TestHarnessPromotionApply:
             mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             result = harness_promotion_apply(package, dry_run=False)
         assert len(result["node_receipts"]) == 2
-        billing.on_harness_apply.assert_called_once_with("default", None, "pkg-1", 1)
+        billing.on_harness_apply.assert_called_once_with("default", "test-user", "pkg-1", 1)
 
     def test_error_apply_node_and_edge_write_failures_recorded(self):
         """Real (non-dry-run) write failures for both nodes and edges are

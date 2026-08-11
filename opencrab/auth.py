@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
+import os
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -37,6 +38,44 @@ from dataclasses import dataclass
 from typing import Any
 
 _TOKEN_PREFIX = "lc_"
+
+# Pre-#145 shared-secret env vars. None of them configure anything anymore --
+# the shared-secret auth model they fed (opencrab/mcp/http_app.py's old
+# ``auth_token`` param, apps/api/main.py's OPENCRAB_API_KEY) is deleted. A
+# leftover value would make an operator believe a deployment is still gated
+# when it isn't, which is worse than no env var at all.
+_STALE_SECRET_ENV_VARS = ("OPENCRAB_API_KEY", "LOCALCRAB_MCP_TOKEN", "LOCALCRAB_MCP_TOKEN_FILE")
+
+
+def refuse_stale_shared_secret_env() -> None:
+    """Raise if a pre-#145 shared-secret env var is still set.
+
+    Lives here (not ``opencrab.mcp.http_app`` or ``opencrab.mcp.server``) so
+    every process entry point that must call it can, without a circular
+    import: ``opencrab.mcp.http_app`` imports ``opencrab.mcp.server``
+    (``MCPServer``), so ``server.py`` cannot import back from
+    ``http_app.py``. ``opencrab.auth`` depends on neither, so both -- plus
+    ``opencrab/cli.py`` and ``apps/api/main.py`` -- import it from here.
+    ``http_app`` re-exports the name for backward compatibility with
+    existing imports/tests.
+    """
+    stale = [name for name in _STALE_SECRET_ENV_VARS if os.environ.get(name, "").strip()]
+    if stale:
+        raise RuntimeError(
+            "Refusing to start: stale shared-secret env var(s) set: "
+            f"{', '.join(stale)}. These no longer configure authentication "
+            "(the shared-secret model was deleted in #145) -- per-user "
+            "tokens issued via 'opencrab token issue' are the only auth "
+            "mechanism now.\n"
+            "Found in this process's environment. If you did not export it "
+            "yourself, check whatever launched the process (a docker-compose "
+            "environment: entry, a systemd unit's Environment=, a wrapper "
+            "script) -- and, when running apps/api, the repository root .env "
+            "or apps/.env, which that entry point loads into the environment "
+            "at import time (#88). Other entry points do not read those "
+            "files into the environment, so a value left only in a .env "
+            "file is not what triggered this."
+        )
 
 
 @dataclass(frozen=True)
@@ -357,3 +396,111 @@ def principal_scope(principal: Principal) -> Iterator[None]:
         yield
     finally:
         _current_principal.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Process entry-point guards (#145)
+#
+# These live here rather than in cli.py or mcp/server.py because BOTH of those
+# need them and mcp/http_app.py already imports mcp/server.py -- putting the
+# shared logic in either would make the import graph circular. They are also
+# the reason `python -m opencrab.mcp.server` is not a hole: that entry point
+# calls the same two functions cli.py's `serve --transport stdio` does.
+# ---------------------------------------------------------------------------
+
+def require_local_principal() -> Principal:
+    """Return the enabled local-user Principal, or raise with what to do.
+
+    stdio has no per-request identity: the transport's trust boundary is the
+    OS process, and the server acts as exactly one local user for its whole
+    lifetime. Both stdio entry points bind this, and so does every CLI command
+    that writes on the user's behalf.
+
+    CREATES NOTHING. A caller that has no local user must fail leaving the data
+    directory exactly as it found it -- refusing a write and then leaving a
+    freshly created database file behind is its own small lie. That takes two
+    precautions, because either alone is insufficient:
+
+    - ``make_sql_store`` builds ``SQLStore`` with its default
+      ``create_tables=True``, so it would run DDL. Hence ``create_tables=False``.
+    - On SQLite that is still not enough: *connecting* to a path that does not
+      exist creates the file. Hence the ``is_file()`` precheck, which is only
+      meaningful where the store is a local file.
+
+    ``settings.is_local`` is ``local`` and ``kuzu``. The other two modes,
+    ``docker`` and ``pg``, both point ``make_sql_store`` at PostgreSQL, where
+    there is no file to check -- they connect (without DDL) and read.
+
+    A missing ``users`` table is treated as "not bootstrapped", the same as a
+    missing file. A *connection* failure is not: swallowing it as "run init"
+    would send an operator chasing the wrong problem.
+    """
+    from pathlib import Path
+
+    from opencrab.config import get_settings
+    from opencrab.stores.sql_store import SQLStore
+
+    settings = get_settings()
+    not_bootstrapped = RuntimeError(
+        "No local user is bootstrapped. Run 'opencrab init' first -- it "
+        "creates the local user and issues its first token."
+    )
+
+    if settings.is_local:
+        # File first: on SQLite, *connecting* to a missing path creates it.
+        if not Path(settings.local_data_dir, "opencrab.db").is_file():
+            raise not_bootstrapped
+        url = settings.sqlite_url
+    else:
+        # docker and pg both mean PostgreSQL. No file to check, and
+        # `make_sql_store` is not used here because it would take SQLStore's
+        # default create_tables=True and run DDL -- this function must not.
+        url = settings.postgres_url
+
+    sql = SQLStore(url=url, create_tables=False)
+
+    if not getattr(sql, "available", False):
+        # SQLStore swallows the connect error into a log line and a False
+        # flag, so the reason is not retrievable here. What IS known: the
+        # local file existed (checked above) or this is a remote database.
+        # Either way the store failed to open, which is not the same thing as
+        # "you have not run init" -- reporting it as that would send an
+        # operator to fix the wrong problem.
+        raise RuntimeError(
+            "Could not open the SQL store. This is not a missing bootstrap -- "
+            "the database exists (or is remote) but did not connect. Check the "
+            "preceding 'SQL store unavailable' log line for the driver error, "
+            "then the file permissions or the PostgreSQL connection settings."
+        )
+
+    try:
+        principal = get_local_user(sql)
+    except Exception as exc:  # noqa: BLE001
+        # Distinguish "no users table yet" (not bootstrapped) from a real
+        # query/driver failure, which must surface as itself.
+        if _looks_like_missing_table(exc):
+            raise not_bootstrapped from exc
+        raise
+
+    if principal is None:
+        raise not_bootstrapped
+    if principal.disabled:
+        raise RuntimeError(
+            f"The local user ({principal.user_id}) is disabled. Re-enable it "
+            f"with 'opencrab user enable {principal.user_id}'."
+        )
+    return principal
+
+
+def _looks_like_missing_table(exc: Exception) -> bool:
+    """True when *exc* says the ``users`` table does not exist.
+
+    Dialect-specific wording, matched loosely on purpose: SQLite says
+    "no such table: users", PostgreSQL says 'relation "users" does not exist'.
+    Getting this wrong in the permissive direction would hide a connection
+    failure behind "run init", so the match requires the table name.
+    """
+    text = str(getattr(exc, "orig", exc)).lower()
+    if "users" not in text:
+        return False
+    return "no such table" in text or "does not exist" in text or "undefined table" in text

@@ -219,44 +219,80 @@ LOG_LEVEL=INFO
 @click.option("--host", default=None, help="HTTP bind host (http only). Defaults to config.")
 @click.option("--port", default=None, type=int, help="HTTP bind port (http only). Defaults to config.")
 @click.option(
-    "--auth-token",
-    default=None,
-    help="Bearer token for the HTTP transport. Unset + no token source = no auth.",
+    "--allow-query-token",
+    is_flag=True,
+    default=False,
+    help=(
+        "http only. Also accept the token as ?token= in the URL. OFF by default: "
+        "a URL-borne credential leaks into access logs, proxy logs, browser "
+        "history and Referer headers. Enable it only for clients that cannot "
+        "set an Authorization header -- see docs/mcp-client-auth.md."
+    ),
 )
-@click.option("--auth-token-file", default=None, help="Path to a file holding the bearer token (http only).")
 def serve(
     transport: str,
     host: str | None,
     port: int | None,
-    auth_token: str | None,
-    auth_token_file: str | None,
+    allow_query_token: bool,
 ) -> None:
     """Start the OpenCrab MCP server (stdio by default, or Streamable HTTP)."""
+    from opencrab.auth import refuse_stale_shared_secret_env
+
+    # #145: a leftover pre-#145 shared-secret env var no longer protects
+    # anything -- refuse both transports rather than let an operator believe
+    # they're still gated. create_app() (http path) checks this too, but
+    # stdio never calls create_app, so it must be checked here as well.
+    try:
+        refuse_stale_shared_secret_env()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+
     if transport == "stdio":
+        if allow_query_token:
+            # Rejected, not ignored: stdio carries no HTTP request, so the flag
+            # can never take effect. Ignoring it would leave the operator
+            # believing query-token auth is on.
+            console.print(
+                "[red]--allow-query-token applies to --transport http only "
+                "(stdio has no HTTP request to carry a query parameter).[/red]"
+            )
+            raise SystemExit(1)
         # Suppress all non-error logging to keep the stdio JSON-RPC channel clean.
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
+        from opencrab.auth import principal_scope, require_local_principal
         from opencrab.mcp.server import MCPServer
 
-        MCPServer().run()
+        try:
+            principal = require_local_principal()
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
+
+        # #145: stdio serves exactly one local principal for its whole
+        # lifetime (there is no per-request identity over stdio) -- bind it
+        # once around the entire blocking run loop so every tools/call
+        # dispatched during it can read current_principal().
+        with principal_scope(principal):
+            MCPServer().run()
         return
 
     # transport == "http"
     from opencrab.config import get_settings
-    from opencrab.mcp.http_app import _resolve_token, create_app
+    from opencrab.mcp.http_app import create_app
 
     cfg = get_settings()
     bind_host = host or cfg.mcp_http_host
     bind_port = port or cfg.mcp_http_port
-    token = _resolve_token(auth_token, auth_token_file)
 
     # HTTP can log normally — stdout is not a protocol channel here.
     logging.basicConfig(
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         stream=sys.stderr,
     )
-    mode = "auth" if token else "OPEN(no-auth)"
     console.print(
-        f"[green]OpenCrab MCP (Streamable HTTP, {mode}) → http://{bind_host}:{bind_port}/mcp[/green]"
+        "[green]OpenCrab MCP (Streamable HTTP, per-user bearer token auth) → "
+        f"http://{bind_host}:{bind_port}/mcp[/green]"
     )
 
     import uvicorn
@@ -267,7 +303,7 @@ def serve(
     # its own in-memory BM25 index + embedding function, and write.lock already
     # serialises cross-process writes. Not a hard constraint under sqlite-vec.
     uvicorn.run(
-        create_app(auth_token=token),
+        create_app(allow_query_token=allow_query_token),
         host=bind_host,
         port=bind_port,
         workers=1,
@@ -374,10 +410,22 @@ def status() -> None:
 )
 def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
+
+    # #145: a CLI write is attributed to the local user, and resolving the
+    # principal happens BEFORE any store is opened or written -- a missing
+    # local user must fail with an instruction, not a traceback halfway
+    # through an ingest run. Admin commands (init/user/token/status) are
+    # deliberately exempt: they are how a local user comes to exist.
+    try:
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
 
     cfg = get_settings()
     stores = _make_stores(cfg, graph=True, vector=True, doc=True)
@@ -405,7 +453,13 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             if not text.strip():
                 continue
             source_id = str(file.resolve())
-            meta = {"source_path": str(file), "extension": file.suffix}
+            # user_id is the audit actor for this source row. Set from the
+            # server-resolved principal, never from anything the caller typed.
+            meta = {
+                "source_path": str(file),
+                "extension": file.suffix,
+                "user_id": principal.user_id,
+            }
 
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
             if effective_pack:
@@ -416,6 +470,21 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
 
                 if mongo.available:
                     mongo.upsert_source(source_id, text, meta)
+                    # Audit row carries the same actor as the source metadata.
+                    try:
+                        mongo.log_event(
+                            "ingest",
+                            subject_id=principal.user_id,
+                            details={"source_id": source_id, "pack_id": effective_pack},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Audit is best-effort by contract: a failed audit row
+                        # must not lose an otherwise-good ingest. But it must
+                        # not vanish either -- silently swallowing it lets an
+                        # actor-less ingest report success.
+                        console.print(
+                            f"  [yellow]audit record failed for {source_id}: {exc}[/yellow]"
+                        )
 
             ok_count += 1
             tag = f" pack={effective_pack}" if effective_pack else ""
@@ -447,6 +516,7 @@ def extract(
     api_key: str | None,
 ) -> None:
     """LLM-extract ontology nodes/edges from files and write to the graph."""
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
     from opencrab.ontology.builder import OntologyBuilder
@@ -458,6 +528,20 @@ def extract(
     if not api_key:
         console.print("[red]ANTHROPIC_API_KEY not set. Pass --api-key or set the env var.[/red]")
         raise SystemExit(1)
+
+    # #145: only the writing path needs an actor. --dry-run writes nothing, so
+    # requiring a bootstrapped local user there would break a command that
+    # works today. Ordered AFTER the argument checks above and BEFORE any store
+    # is opened: a missing API key is the more specific failure and should be
+    # what the operator sees, but a missing local user must still stop the run
+    # before anything is written rather than partway through extraction.
+    principal = None
+    if not dry_run:
+        try:
+            principal = require_local_principal()
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
 
     cfg = get_settings()
     stores = _make_stores(cfg, graph=True, doc=True, sql=True)
@@ -503,6 +587,7 @@ def extract(
                                 node_type=node.node_type,
                                 node_id=node.node_id,
                                 properties=node.properties,
+                                subject_id=principal.user_id,
                             )
                         except Exception as exc:
                             console.print(f"    [red]node {node.node_id}: {exc}[/red]")
@@ -516,6 +601,7 @@ def extract(
                                 to_space=edge.to_space,
                                 to_id=edge.to_id,
                                 properties=edge.properties,
+                                subject_id=principal.user_id,
                             )
                         except Exception as exc:
                             console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")

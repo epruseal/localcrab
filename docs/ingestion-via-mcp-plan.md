@@ -94,8 +94,8 @@ VECTOR_BACKEND 명시됨?
 - **Stateless 프로토콜**: 이 HTTP 전송은 의도적으로 **무상태**다 (`http_app.py` 모듈 docstring, `mcp_post`). `initialize`/`notifications/initialized` 핸드셰이크 없이도 각 POST가 독립적으로 `tools/call`을 처리한다(`server.py` `_dispatch`). 따라서 로더는 세션 관리 없이 httpx로 `{"jsonrpc":"2.0","method":"tools/call","params":{"name":...,"arguments":...},"id":1}`를 바로 POST하면 된다. **JSON-RPC 배열(배치)도 수용**되어 한 요청에 여러 `tools/call`을 담을 수 있다(`http_app.py`).
 - **응답 형식**: 결과는 MCP content wrapper `{"content":[{"type":"text","text":<json 문자열>}]}`로 감싸진다(`server.py`). 또한 도구 내부 예외는 `{"error":...}`로 감싸져 **HTTP 200이어도 본문에 error가 들어올 수 있다**. `pack_ingest`류는 `node_errors`/`edge_errors` 리스트를 반환한다. → 로더는 content를 파싱해 `error`/부분 실패를 검사·재시도해야 한다.
 - **기존 MCP 클라이언트 재사용**: 대화 reingest hook의 `lc_call`(`hooks/claude/localcrab-lib.sh`)이 MCP 호출 + 3회 재시도 + outbox 재시도 큐를 이미 구현한다(§1.5 ②). 로더 클라이언트는 이 재시도·부분실패·큐 패턴을 참고/공유해 중복 구현을 피한다.
-- 인증: Bearer 토큰. `--auth-token` 또는 `--auth-token-file`로 주입되며 `_resolve_token()`으로 해석(정의는 `opencrab/mcp/http_app.py`; `cli.py`는 호출 지점). 우선순위: CLI 토큰 > `LOCALCRAB_MCP_TOKEN` env > 토큰 파일. 토큰이 없으면 `OPEN(no-auth)`. 검증은 `hmac.compare_digest`.
-  - **인증 경로 선택**: 로더가 **로컬 동일 호스트**에서 돌면 무인증 인스턴스(:8765)로 붙어 Bearer 처리를 생략할 수 있다. 외부/인증 인스턴스(:8766)를 쓸 때만 토큰 파일을 로드해 `Authorization: Bearer <token>` 헤더로 전달한다.
+- 인증(#145 이후): **사용자별 토큰**. `opencrab init` → `opencrab user add` → `opencrab token issue <user_id>` 로 발급하고 `Authorization: Bearer <token>` 로 제시한다. 서버는 `opencrab.auth.verify_token` 으로 `users`/`api_tokens` 를 조회해 검증한다. **무인증 모드와 공유 비밀 방식은 삭제됐다** — 관련 환경변수가 남아 있으면 기동을 거부한다. 헤더를 못 보내는 클라이언트용으로 `--allow-query-token`(기본 꺼짐)이 있다.
+  - **인증 경로**: 무인증 인스턴스는 더 이상 존재하지 않는다. 로컬이든 원격이든 로더는 발급받은 토큰을 `Authorization: Bearer <token>` 헤더로 전달한다. 로컬 동일 호스트라면 stdio 전송이 더 단순하다 — 그쪽은 OS 프로세스 경계가 신뢰 근거이고 로컬 사용자로 자동 바인딩된다.
 
 **재사용 가능한 기존 도구 시그니처** (`opencrab/mcp/tools.py`)
 - `ontology_add_node(space, node_type, node_id, properties=None, tenant_id="default", subject_id=None)` — 건별 노드.
@@ -195,13 +195,13 @@ VECTOR_BACKEND 명시됨?
 - 로더가 스토어를 직접 열지 않으므로 스토어 API 변경 시 손볼 지점이 하나로 준다(§1.3).
 - chroma 사용 시(docker 모드 등): "적재 시 MCP 중지" 운영 제약 제거, 다중 프로세스 제약을 구조적으로 회피(쓰기 프로세스가 MCP 1개).
 - HTTP가 stateless라 로더 클라이언트가 단순(initialize 핸드셰이크 불필요). hook의 `lc_call` 재사용 가능.
-- 로컬 무인증 인스턴스(:8765) 사용 시 **Bearer 토큰 처리를 생략** 가능.
+- 로컬에서는 stdio 전송을 쓰면 토큰 처리가 불필요하다(로컬 사용자로 자동 바인딩).
 - 적응형 배치 + JSON-RPC 배치 배열로 **대량 팩 로드 효율 확보**(왕복·락 횟수 절감, 짧은 락 점유 유지).
 
 **단점**
 - 건별/배치 모두 HTTP 왕복 + `_write_lock()` 직렬화 오버헤드 → 오프라인 직접 적재보다 느릴 수 있음.
 - 청크 배치 도구 + **삭제 도구(`pack_purge`)** 신설 등 MCP 도구 추가 작업 필요. 벡터 삭제 API가 백엔드마다 달라(§3.5) 어댑터 코드가 필요.
-- 인증 인스턴스(:8766) 사용 시 Bearer 토큰 인증/배포를 로더가 다뤄야 함(로컬 무인증 인스턴스 사용 시 완화).
+- HTTP 전송을 쓰면 로더가 토큰 발급·배포를 다뤄야 한다(stdio 사용 시 불필요).
 - 적재가 MCP 쓰기 락을 공유하므로, 락 점유 정책(배치 단위)을 잘못 잡으면 일반 쓰기 지연 가능. **pg 모드에서도 `write.lock`이 여전히 모든 write를 직렬화**하므로, MVCC가 주는 진짜 다중 라이터 이점을 MCP 계층이 상쇄한다(§1.3) — 이 직렬화를 백엔드별로 조건부화하는 건 별도 과제.
 - 중복 적재 엔진 `load_to_localcrab.py`(Neo4j)는 MCP 전환에서 제외되어 **별도 유지보수로 남는다**(§1.5 중복 경고).
 

@@ -102,3 +102,98 @@ def fast_mongo_timeout(monkeypatch):
         return real_client(uri, **kwargs)
 
     monkeypatch.setattr(pymongo, "MongoClient", _fast_client)
+
+
+@pytest.fixture
+def bind_test_principal():
+    """Bind a fixed ``Principal`` for the duration of a test.
+
+    #145: ``dispatch_tool``/the tool handlers in ``opencrab.mcp.tools.*``
+    now call ``current_principal()`` unconditionally (it raises LookupError
+    with no scope bound -- #143: no anonymous fallback). In production a
+    principal is always bound upstream (opencrab/mcp/http_app.py's
+    per-request token verification, or opencrab/cli.py's stdio local-user
+    binding) before dispatch_tool ever runs; test modules that call
+    dispatch_tool()/handler functions directly must open that scope
+    themselves. Opt in per-module via
+    ``pytestmark = pytest.mark.usefixtures("bind_test_principal")`` rather
+    than session-autouse, so tests that specifically pin the "no principal
+    bound" behaviour (tests/test_auth.py's
+    TestCurrentPrincipal::test_current_principal_raises_outside_scope) keep
+    seeing a genuinely empty scope.
+    """
+    from opencrab.auth import Principal, principal_scope
+
+    principal = Principal(user_id="test-user", is_local=True, disabled=False)
+    with principal_scope(principal):
+        yield principal
+
+
+# ---------------------------------------------------------------------------
+# #145: CLI writes must carry an actor
+# ---------------------------------------------------------------------------
+
+# Tests that are SUPPOSED to hit "no local user", keyed by exact node ID.
+# The only reason that lands here is "the test asserts the refusal itself".
+# The other legitimate cases never reach the gate at all and so need no entry:
+# --dry-run resolves no principal, and argument validation (a missing API key,
+# say) fails first. The stale-entry check below is what proved that -- listing
+# the no-API-key test made this fixture fail on its first run.
+PRINCIPAL_REFUSAL_EXPECTED = {
+    "tests/test_auth_boundary.py::TestCliWriteActor::test_ingest_without_local_user_fails_before_writing":
+        "asserts the refusal",
+    "tests/test_auth_boundary.py::TestPrincipalResolutionCreatesNothing::test_local_refusal_leaves_no_files":
+        "asserts the refusal, and that it creates nothing on the way out",
+}
+
+
+@pytest.fixture(autouse=True)
+def _cli_write_needs_principal(request, monkeypatch):
+    """Fail any test that trips the CLI write gate without declaring it.
+
+    Written as a hook on the product function rather than a scan of the test
+    files. A scan has to answer "which tests invoke a CLI write?", and that
+    question leaks: CliRunner, subprocess, an argv wrapper, a parametrized
+    command name, a direct Click callback call. Every earlier attempt in this
+    change to enumerate call sites missed one. Wrapping the function itself
+    needs no such answer -- whatever route the call takes, it arrives here.
+
+    Two directions, both failures:
+      - a refusal in a test that is not in PRINCIPAL_REFUSAL_EXPECTED means a
+        test lost its local user and is now passing for the wrong reason
+        (this is exactly how two ingest tests silently broke: they already
+        failed in this environment for a missing optional dependency, so a
+        baseline set comparison could not see the new cause)
+      - no refusal in a test that IS listed means the entry is stale
+
+    Only covers same-process calls. Subprocess tests run their own interpreter
+    and assert on exit code and stderr directly.
+    """
+    import opencrab.auth as auth_mod
+
+    refused = []
+    real = auth_mod.require_local_principal
+
+    def _wrapped():
+        try:
+            return real()
+        except RuntimeError as exc:
+            if "opencrab init" in str(exc):
+                refused.append(str(exc))
+            raise
+
+    monkeypatch.setattr(auth_mod, "require_local_principal", _wrapped)
+    yield
+    node_id = request.node.nodeid
+    expected = node_id in PRINCIPAL_REFUSAL_EXPECTED
+    if refused and not expected:
+        pytest.fail(
+            f"{node_id} tripped the CLI write gate (no local user). Either give "
+            f"it the `bootstrapped` fixture / bootstrap inline, or add it to "
+            f"conftest.PRINCIPAL_REFUSAL_EXPECTED with a reason."
+        )
+    if expected and not refused:
+        pytest.fail(
+            f"{node_id} is listed in conftest.PRINCIPAL_REFUSAL_EXPECTED but did "
+            f"not trip the gate -- the entry is stale, remove it."
+        )

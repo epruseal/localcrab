@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from opencrab.ontology.query import QueryOutcome, QueryResult
+
+# #145: ontology_query() now calls current_principal() internally; bind a
+# fixed test principal for every test in this module (see conftest.py's
+# bind_test_principal for why this is opt-in per module, not autouse).
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
 
 
 def _stub_context(hybrid_mock: MagicMock) -> dict:

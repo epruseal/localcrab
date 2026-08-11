@@ -13,6 +13,11 @@ import pytest
 
 from opencrab.mcp.tools import pack_create, pack_ingest
 
+# #145: pack_create/pack_ingest now call current_principal() internally;
+# bind a fixed test principal for every test in this module (see
+# conftest.py's bind_test_principal).
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 _EXISTING = {"total": 1, "packs": [{"pack_id": "claude", "node_count": 9709, "title": "Claude"}]}
 
 

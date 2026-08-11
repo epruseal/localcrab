@@ -113,15 +113,23 @@ claude mcp add localcrab -- opencrab serve
 
 **원격 접근 (직접 Streamable HTTP, Tailscale·cloudflared 등):**
 
-`serve --transport http`가 `/mcp` 엔드포인트를 직접 노출한다(supergateway 불필요). 인증이 필요하면 `--auth-token-file`(또는 `LOCALCRAB_MCP_TOKEN`)로 토큰을 지정한다. 클라이언트는 `Authorization: Bearer <token>` 헤더 **또는** `/mcp?token=<token>` 쿼리 param 중 하나로 인증할 수 있다(같은 토큰, 둘 중 하나만 일치하면 통과).
+`serve --transport http`가 `/mcp` 엔드포인트를 직접 노출한다(supergateway 불필요).
+
+**인증은 사용자별 토큰뿐이다(#145).** 무인증 모드와 공유 비밀(`--auth-token-file`, `LOCALCRAB_MCP_TOKEN`, `OPENCRAB_API_KEY`)은 삭제됐다 — 그 환경변수가 남아 있으면 **기동을 거부**한다(효력 없는 변수를 보고 보호받는다고 믿는 상태가 가장 위험하다).
 
 ```bash
-# 신뢰망(예: Tailscale) 직결 — 무인증
-opencrab serve --transport http --host 0.0.0.0 --port 8765
+# 1) 로컬 사용자 + 첫 토큰 생성 (1회)
+opencrab init
 
-# 외부 노출(예: cloudflared 뒤) — Bearer 인증
-opencrab serve --transport http --host 127.0.0.1 --port 8766 \
-  --auth-token-file ~/.openclaw/localcrab-mcp.token
+# 2) 원격 클라이언트마다 사용자와 토큰 발급
+opencrab user add "my-laptop"
+opencrab token issue <user_id>          # 평문은 이때 한 번만 출력된다
+
+# 3) 기동 (헤더 인증)
+opencrab serve --transport http --host 127.0.0.1 --port <port>
+
+# 4) 헤더를 못 보내는 클라이언트가 있을 때만
+opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-token
 ```
 
 ```json
@@ -129,15 +137,22 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
   "mcpServers": {
     "localcrab": {
       "type": "http",
-      "url": "http://<host>:8765/mcp"
+      "url": "http://<host>:<port>/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
 
-> 헤더를 설정할 수 없는 클라이언트는 URL에 토큰을 실어 인증할 수 있다: `"url": "http://<host>:8765/mcp?token=<token>"`. 다만 쿼리 param 토큰은 액세스 로그·프록시·브라우저 히스토리에 평문 노출될 수 있으니 가능하면 헤더 방식을 우선한다.
+> **`--allow-query-token` 은 기본 꺼짐이다.** 켜면 `"url": "http://<host>:<port>/mcp?token=<token>"` 형태가 통하지만, URL 자격증명은 액세스 로그·프록시 로그·브라우저 히스토리·Referer 헤더에 남는다. 켠 배포는 토큰을 더 자주 회전하고 클라이언트마다 별도 토큰을 발급할 것.
+>
+> **어느 클라이언트가 어느 방식을 지원하는지는 [`docs/mcp-client-auth.md`](docs/mcp-client-auth.md) 를 본다.** 특히 **claude.ai 웹은 커스텀 헤더를 설정할 수 없어 쿼리 파라미터가 유일한 수단**이다. 인증 메커니즘을 제거하거나 기본값을 바꾸기 전에 그 표에서 사용 중인 클라이언트가 없는지 먼저 확인할 것.
+>
+> 헤더와 쿼리 토큰이 함께 오면 **헤더가 결정한다.** 헤더가 있는데 무효면 쿼리로 폴백하지 않고 401 이다 — 폴백하면 쓰레기 헤더를 붙여 `--allow-query-token` 제한을 우회할 수 있다.
+>
+> 브라우저에 직접 노출하는 배포는 `OPENCRAB_CORS_ORIGINS` 로 **Origin 허용 목록을 명시**한다. 비워 두면 교차 출처 접근이 차단된다(wildcard 로 열리지 않는다).
 
-> **uvicorn 단일 워커**로 실행된다(serve가 강제). 원래 chroma PersistentClient 단일 프로세스 제약 때문이었고, `VECTOR_BACKEND=sqlite-vec`(SQLite WAL)에서는 하드 제약이 아니나 프로세스별 in-memory BM25/임베딩 유지를 위해 1로 둔다. 무인증 인스턴스는 신뢰망에만 바인드할 것. 인증이 필요한 외부 경로는 토큰을 지정하고 클라이언트는 `Authorization: Bearer <token>` 헤더 또는 `?token=<token>` 쿼리 param으로 인증한다. 토큰이 설정되면 `/mcp`의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz`는 예외).
+> **uvicorn 단일 워커**로 실행된다(serve가 강제). 원래 chroma PersistentClient 단일 프로세스 제약 때문이었고, `VECTOR_BACKEND=sqlite-vec`(SQLite WAL)에서는 하드 제약이 아니나 프로세스별 in-memory BM25/임베딩 유지를 위해 1로 둔다. `/mcp` 의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz` 는 예외).
 
 ---
 
@@ -146,7 +161,9 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 | 명령어 | 설명 |
 |--------|------|
 | `opencrab init` | `.env` 생성 (기본 설정 템플릿) |
-| `opencrab serve` | MCP 서버 시작 (stdio 기본; `--transport http`로 Streamable HTTP + 선택적 Bearer 인증) |
+| `opencrab serve` | MCP 서버 시작 (stdio 기본; `--transport http` 로 Streamable HTTP). 인증은 사용자별 토큰 필수 |
+| `opencrab user add\|list\|disable\|enable` | 사용자 관리 |
+| `opencrab token issue\|list\|revoke` | 사용자별 토큰 관리 (평문은 발급 시 1회만 출력) |
 | `opencrab status` | 모든 스토어 연결 상태 확인 |
 | `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`) |
 | `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`) |
@@ -228,7 +245,7 @@ CPU 자원이 부족하면 한국어 경량 임베딩 [`BM-K/KoSimCSE-roberta`](
 | `EMBEDDING_BACKEND` | `openai` | `openai` = OpenAI 호환 서버(+GGUF 폴백), `local` = minilm(롤백) |
 | `OPENAI_API_BASE` | `http://localhost:1234/v1` | OpenAI 호환 서버 주소. 콤마 구분으로 여러 URL 지정 시 순서대로 시도하는 체인(첫 서버 장애 → 다음 서버 → 전부 장애 시 GGUF 폴백) |
 | `OPENAI_EMBED_MODEL` | `text-embedding-kure-v1` | 서버에 로드된 모델 id |
-| `OPENAI_API_KEY` | _(없음)_ | 인증 필요 서버 사용 시 Bearer 토큰. 무인증 서버는 미설정 |
+| `OPENAI_API_KEY` | _(없음)_ | 임베딩 서버가 인증을 요구할 때의 Bearer 토큰 (아웃바운드 자격증명) |
 | `EMBED_DIM` | `1024` | 임베딩 차원 (모델에 맞게 설정) |
 | `LOCAL_GGUF_PATH` | _(자동 다운로드)_ | 로컬 폴백 GGUF 경로 |
 | `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명 |

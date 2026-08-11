@@ -106,6 +106,21 @@ class UnknownToolError(KeyError):
     """
 
 
+class ForbiddenArgumentError(ValueError):
+    """Raised by dispatch_tool() when `arguments` carries a client-supplied
+    ``tenant_id`` / ``subject_id`` (#145, #143 invariant 2: principal is
+    server-derived, never client-supplied). Rejected explicitly rather than
+    silently stripped -- a caller whose value was quietly dropped would
+    believe it had taken effect."""
+
+
+# Client-supplied identity fields dispatch_tool refuses outright. The
+# principal reaching a handler must come from current_principal() (bound by
+# the caller -- opencrab/mcp/http_app.py's per-request token verification or
+# opencrab/cli.py's stdio local-user binding), never from `arguments`.
+_FORBIDDEN_ARGS = ("tenant_id", "subject_id")
+
+
 def _envelope(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap `fn` so any exception becomes ``{"error": str(exc)}`` exactly once.
 
@@ -140,6 +155,17 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     Thin lookup + call, matching the pre-migration dispatch_tool exactly: no
     extra error wrapping (handlers self-wrap), and write-serialising via the
     shared write_lock for tools declared `writes=True` (see `tool()`).
+
+    #145: a client-supplied ``tenant_id`` / ``subject_id`` in `arguments` is
+    rejected outright (ForbiddenArgumentError), and the handler itself runs
+    inside ``principal_scope(current_principal())`` -- re-binding the
+    *already* server-derived principal explicitly here means a handler that
+    calls ``current_principal()`` never depends on the caller having
+    remembered to open the scope correctly; dispatch_tool is the one place
+    that must get this right. ``current_principal()`` raises LookupError if
+    no principal is bound at all -- by design there is no anonymous
+    fallback (#143), so every path into dispatch_tool (stdio via cli.py's
+    `serve`, HTTP via http_app.py's `_check`) must have bound one first.
     """
     # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._shared
     # shim submodule: importing a submodule for the first time binds it as an
@@ -154,7 +180,20 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
         # order 정렬 — 물리 분할 후에도 pre-split과 동일한 목록 순서 유지.
         available = [s.name for s in sorted(_REGISTRY.values(), key=lambda s: s.order)]
         raise UnknownToolError(f"Unknown tool: '{name}'. Available: {available}")
-    if spec.writes:
-        with _write_lock():
-            return spec.fn(**arguments)
-    return spec.fn(**arguments)
+
+    forbidden = [key for key in _FORBIDDEN_ARGS if key in arguments]
+    if forbidden:
+        raise ForbiddenArgumentError(
+            f"tool {name!r}: client-supplied {forbidden} is not allowed -- "
+            "the principal is derived server-side from the caller's "
+            "authenticated identity, never from tool arguments."
+        )
+
+    from opencrab.auth import current_principal, principal_scope
+
+    principal = current_principal()
+    with principal_scope(principal):
+        if spec.writes:
+            with _write_lock():
+                return spec.fn(**arguments)
+        return spec.fn(**arguments)

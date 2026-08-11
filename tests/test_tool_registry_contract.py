@@ -18,6 +18,13 @@ import pytest
 
 from opencrab.mcp.tools import TOOLS, UnknownToolError, dispatch_tool
 
+# #145: dispatch_tool() now calls current_principal() for every tool (read or
+# write); bind a fixed test principal for every test in this module (see
+# conftest.py's bind_test_principal). The unknown-tool tests below don't
+# need it -- dispatch_tool checks tool existence before touching the
+# principal -- but binding it uniformly keeps this module simple.
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 # Golden contract: exact tool names, in exact order, snapshotted from the
 # pre-migration TOOLS list. Any G-agent commit that changes this list
 # (renames, reorders, adds, or removes a tool) must fail this test loudly.

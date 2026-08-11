@@ -34,14 +34,6 @@ logger = logging.getLogger(__name__)
                     "description": "Validate without writing to stores.",
                     "default": False,
                 },
-                "tenant_id": {
-                    "type": "string",
-                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
-                },
-                "subject_id": {
-                    "type": "string",
-                    "description": "Optional subject performing the apply (for billing/audit).",
-                },
             },
             "required": ["package"],
         },
@@ -52,8 +44,6 @@ logger = logging.getLogger(__name__)
 def harness_promotion_apply(
     package: dict[str, Any],
     dry_run: bool = False,
-    tenant_id: str = "default",
-    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a CrabHarness PromotionPackage directly to the OpenCrab ontology stores.
@@ -69,11 +59,11 @@ def harness_promotion_apply(
         A serialised PromotionPackage object (from CrabHarness promotion-stub output).
     dry_run:
         If True, validate grammar + schema without writing to any store.
-    tenant_id:
-        Tenant identifier for multi-tenant isolation (default: 'default').
-    subject_id:
-        Optional subject performing the apply (for billing/audit). Ignored
-        when dry_run=True — nothing is written, so nothing is billed.
+
+    The apply's subject is the caller's server-derived ``current_principal()``
+    (#145) -- never a client argument; tenant_id stays fixed at 'default'.
+    Not read at all when dry_run=True — nothing is written, so nothing is
+    billed.
     """
     try:
         from crabharness.crabharness.models import PromotionPackage
@@ -115,11 +105,15 @@ def harness_promotion_apply(
             "errors": errors,
         }
 
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _get_context
     from opencrab.ontology.builder import graph_write_failed
 
     ctx = _get_context()
     builder = ctx["builder"]
+    principal = current_principal()
+    tenant_id = "default"
+    subject_id = principal.user_id
 
     for node in promo.nodes:
         try:

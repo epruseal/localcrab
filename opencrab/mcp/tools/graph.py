@@ -84,8 +84,6 @@ def ontology_add_node(
     node_type: str,
     node_id: str,
     properties: dict[str, Any] | None = None,
-    tenant_id: str = "default",
-    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add or update a node in the MetaOntology graph.
@@ -100,16 +98,22 @@ def ontology_add_node(
         Stable unique identifier.
     properties:
         Key/value properties for the node.
-    tenant_id:
-        Tenant identifier for multi-tenant isolation (default: 'default').
-    subject_id:
-        Optional subject performing the write (stamped into properties).
+
+    The writing subject is never a client-supplied argument (#145, #143
+    invariant 2) -- it is the caller's server-derived ``current_principal()``,
+    bound by dispatch_tool before this handler runs. tenant_id stays fixed at
+    'default' -- multi-tenant scoping is out of scope for this fix (tracked
+    separately, see opencrab/ontology/tenant.py's module docstring).
     """
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import graph_write_failed
     from opencrab.ontology.tenant import TenantContext, stamp_properties
 
     ctx = _get_context()
+    principal = current_principal()
+    tenant_id = "default"
+    subject_id = principal.user_id
     space = _clean_str(space)
     node_type = _clean_str(node_type)
     node_id = _clean_str(node_id)
@@ -167,14 +171,6 @@ def ontology_add_node(
                 "to_space": {"type": "string", "description": "Target node space."},
                 "to_id": {"type": "string", "description": "Target node ID."},
                 "properties": {"type": "object", "description": "Optional edge properties."},
-                "tenant_id": {
-                    "type": "string",
-                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
-                },
-                "subject_id": {
-                    "type": "string",
-                    "description": "Optional subject performing the write (for billing/audit).",
-                },
             },
             "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
         },
@@ -189,8 +185,6 @@ def ontology_add_edge(
     to_space: str,
     to_id: str,
     properties: dict[str, Any] | None = None,
-    tenant_id: str = "default",
-    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add a directed edge between two ontology nodes.
@@ -212,16 +206,19 @@ def ontology_add_edge(
         ID of the target node.
     properties:
         Optional edge properties.
-    tenant_id:
-        Tenant identifier for multi-tenant isolation (default: 'default').
-    subject_id:
-        Optional subject performing the write (for billing/audit — not
-        stamped into edge properties, unlike ontology_add_node).
+
+    The writing subject is never a client-supplied argument (#145) -- it is
+    the caller's server-derived ``current_principal()``. tenant_id stays
+    fixed at 'default', matching ontology_add_node.
     """
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import graph_write_failed
 
     ctx = _get_context()
+    principal = current_principal()
+    tenant_id = "default"
+    subject_id = principal.user_id
     from_id = _clean_str(from_id)
     to_id = _clean_str(to_id)
     relation = _clean_str(relation)

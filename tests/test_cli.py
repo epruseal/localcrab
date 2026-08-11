@@ -52,6 +52,23 @@ def runner():
 
 
 @pytest.fixture()
+def bootstrapped(cli_env):
+    """``cli_env`` plus a bootstrapped local user.
+
+    Store-writing CLI commands (`ingest`, `extract`) refuse to run without a
+    local principal since #145 -- a write has to be attributable. Tests that
+    exercise what those commands *do*, rather than the auth gate itself, need
+    a user to exist first. Returns the local user_id.
+    """
+    from opencrab.auth import bootstrap_local_user
+    from opencrab.config import get_settings
+    from opencrab.stores.factory import make_sql_store
+
+    user_id, _secret = bootstrap_local_user(make_sql_store(get_settings()))
+    return user_id
+
+
+@pytest.fixture()
 def mock_vector_store(tmp_path):
     """Patch factory.make_vector_store so ingest/query never construct the
     real KURE embedding chain (OpenAI-compatible server + GGUF fallback) —
@@ -412,7 +429,7 @@ class TestStatus:
 class TestIngest:
     # --- Normal ---
     def test_ingest_directory_writes_vector_and_reports_count(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         (cli_env / "a.txt").write_text("hello world")
         (cli_env / "b.md").write_text("second doc")
@@ -433,7 +450,7 @@ class TestIngest:
 
     # --- Edge ---
     def test_ingest_single_file_path_is_accepted(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         """A single file (not a directory) is a plausible PATH argument
         (click.Path(exists=True) allows file_okay+dir_okay by default) and
@@ -450,7 +467,7 @@ class TestIngest:
         assert mock_vector_store.count() == 1
 
     def test_ingest_pack_id_inferred_from_path(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         pack_dir = cli_env / "packs" / "demo-pack" / "stage"
         pack_dir.mkdir(parents=True)
@@ -477,7 +494,7 @@ class TestQuery:
         assert "No results found." in result.output
 
     def test_human_output_finds_ingested_result(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         (cli_env / "doc.txt").write_text("the quick brown fox jumps")
         assert runner.invoke(main, ["ingest", str(cli_env / "doc.txt")]).exit_code == 0
@@ -754,7 +771,7 @@ def _make_extraction_result(source_id: str):
 class TestExtract:
     # --- Normal ---
     def test_extract_writes_nodes_and_edges_and_reports_summary(
-        self, cli_env, runner
+        self, bootstrapped, cli_env, runner
     ):
         (cli_env / "doc.md").write_text("Alex owns the demo project.")
 
@@ -818,7 +835,7 @@ class TestExtract:
         assert "ANTHROPIC_API_KEY" in result.output
 
     # --- Edge ---
-    def test_extract_single_file_path_is_accepted(self, cli_env, runner):
+    def test_extract_single_file_path_is_accepted(self, bootstrapped, cli_env, runner):
         f = cli_env / "solo.md"
         f.write_text("Alex owns the demo project.")
 
