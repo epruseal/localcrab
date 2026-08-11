@@ -356,6 +356,120 @@ class TestBatchAndNotifications:
 
 
 # ---------------------------------------------------------------------------
+# #150: per-principal MCP tool exposure. ADMIN-tier tools
+# (schema_pack_install/uninstall, harness_promotion_apply) are hidden from
+# tools/list AND rejected by tools/call for a remote (non-local, token-only)
+# principal -- the local bootstrapped user from `bootstrapped`/`client` above
+# is_local=True, so it keeps seeing/calling all 16.
+# ---------------------------------------------------------------------------
+
+_ADMIN_TOOL_NAMES = {"schema_pack_install", "schema_pack_uninstall", "harness_promotion_apply"}
+
+
+@pytest.fixture
+def remote_secret(bootstrapped):
+    """A second user on the SAME sql store as `bootstrapped`, with
+    is_local=False -- a token-authenticated remote principal, as opposed to
+    the local bootstrapped one."""
+    from opencrab.auth import create_user, issue_token
+
+    sql, _local_user_id, _local_secret = bootstrapped
+    user_id = create_user(sql, "remote-user", is_local=False)
+    _token_id, secret = issue_token(sql, user_id)
+    return secret
+
+
+class TestToolExposureByPrincipal:
+    def test_tools_list_admin_tools_hidden_from_remote_principal(self, client, bootstrapped, remote_secret):
+        _, _, local_secret = bootstrapped
+        local_names = {
+            t["name"]
+            for t in client.post(
+                "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=_auth(local_secret)
+            ).json()["result"]["tools"]
+        }
+        remote_names = {
+            t["name"]
+            for t in client.post(
+                "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=_auth(remote_secret)
+            ).json()["result"]["tools"]
+        }
+        assert _ADMIN_TOOL_NAMES <= local_names
+        assert remote_names == local_names - _ADMIN_TOOL_NAMES
+
+    def test_tools_list_no_cross_user_cache_leak_across_interleaved_requests(
+        self, client, bootstrapped, remote_secret
+    ):
+        """Same MCPServer instance (constructed once by `mcp_router`), hit by
+        alternating local/remote requests: if tools/list were memoised
+        anywhere keyed on something other than the caller's principal, one
+        principal's filtered (or unfiltered) list would leak into the
+        other's response. Interleaving -- not just "call each once" -- is
+        what would actually surface a naive process-global cache."""
+        _, _, local_secret = bootstrapped
+        for _ in range(3):
+            local_names = {
+                t["name"]
+                for t in client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers=_auth(local_secret),
+                ).json()["result"]["tools"]
+            }
+            remote_names = {
+                t["name"]
+                for t in client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers=_auth(remote_secret),
+                ).json()["result"]["tools"]
+            }
+            assert _ADMIN_TOOL_NAMES & local_names == _ADMIN_TOOL_NAMES
+            assert _ADMIN_TOOL_NAMES & remote_names == set()
+
+    def test_tools_call_admin_tool_denied_for_remote_principal(self, client, remote_secret):
+        """The core #150 test: a caller that already knows an ADMIN-tier
+        tool's name (it doesn't need tools/list to have shown it) still gets
+        refused by tools/call -- the list filter alone would be decoration.
+        Surfaces as the normal tool-envelope error (HTTP 200, {"error": ...}
+        in the content), same as every other handler-level rejection at this
+        transport (see TestPrincipalIsServerDerived above) -- no store is
+        ever touched for a denied call."""
+        resp = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "schema_pack_install", "arguments": {"name": "saas"}},
+            },
+            headers=_auth(remote_secret),
+        )
+        assert resp.status_code == 200
+        content = json_module.loads(resp.json()["result"]["content"][0]["text"])
+        assert "error" in content
+
+    def test_tools_call_read_tool_still_works_for_remote_principal(self, client, remote_secret):
+        """Sanity check the denial above is tier-specific, not "remote can't
+        call anything": a READ-tier tool works fine for the same principal.
+        schema_pack_list needs no store context (see schema.py's module
+        docstring), so this needs no _get_context stub."""
+        resp = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "schema_pack_list", "arguments": {}},
+            },
+            headers=_auth(remote_secret),
+        )
+        assert resp.status_code == 200
+        content = json_module.loads(resp.json()["result"]["content"][0]["text"])
+        assert "error" not in content
+
+
+# ---------------------------------------------------------------------------
 # refuse_stale_shared_secret_env
 # ---------------------------------------------------------------------------
 

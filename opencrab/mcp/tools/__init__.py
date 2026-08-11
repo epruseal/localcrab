@@ -74,9 +74,12 @@ from typing import Any
 from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
+from ._registry import AccessTier as AccessTier
 from ._registry import ForbiddenArgumentError as ForbiddenArgumentError
+from ._registry import ToolAccessDeniedError as ToolAccessDeniedError
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
+from ._registry import tools_for_principal as tools_for_principal
 
 # chroma PersistentClient는 chromadb 공식상 단일 프로세스 전용이다("not process-safe for
 # concurrent writers sharing the same local persistence path"; thread-safe도 단일 프로세스 내에서만
@@ -267,7 +270,9 @@ from .schema import (  # noqa: E402
 __all__ = [
     "TOOLS",
     "TOOL_SCHEMAS",
+    "AccessTier",
     "ForbiddenArgumentError",
+    "ToolAccessDeniedError",
     "UnknownToolError",
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",
@@ -299,6 +304,7 @@ __all__ = [
     "schema_pack_install",
     "schema_pack_list",
     "schema_pack_uninstall",
+    "tools_for_principal",
 ]
 
 # ---------------------------------------------------------------------------

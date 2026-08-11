@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._registry import tool
+from ._registry import AccessTier, tool
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
         },
     },
     order=0,
+    access=AccessTier.READ,
 )
 def ontology_manifest() -> dict[str, Any]:
     """
@@ -77,6 +78,7 @@ def ontology_manifest() -> dict[str, Any]:
         },
     },
     order=1,
+    access=AccessTier.WRITE,
     writes=True,
 )
 def ontology_add_node(
@@ -176,6 +178,7 @@ def ontology_add_node(
         },
     },
     order=2,
+    access=AccessTier.WRITE,
     writes=True,
 )
 def ontology_add_edge(
@@ -281,6 +284,7 @@ def ontology_add_edge(
         },
     },
     order=4,
+    access=AccessTier.READ,
 )
 def ontology_get_node(node_id: str) -> dict[str, Any]:
     """Fetch a single node by node_id regardless of type.
@@ -335,6 +339,7 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
         },
     },
     order=5,
+    access=AccessTier.READ,
 )
 def ontology_list_nodes(
     space: str | None = None,
@@ -484,6 +489,7 @@ def ontology_list_nodes(
         },
     },
     order=6,
+    access=AccessTier.READ,
 )
 def ontology_list_edges(
     pack_id: str | None = None,

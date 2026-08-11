@@ -21,8 +21,9 @@ import logging
 import sys
 from typing import Any
 
+from opencrab.auth import current_principal
 from opencrab.config import get_settings
-from opencrab.mcp.tools import TOOLS, UnknownToolError, dispatch_tool
+from opencrab.mcp.tools import UnknownToolError, dispatch_tool, tools_for_principal
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +181,24 @@ class MCPServer:
         }
 
     def _handle_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Return the list of all available MCP tools."""
-        return {"tools": TOOLS}
+        """Return the MCP tools visible to the caller (#150).
+
+        Scoped by the caller's ``current_principal()`` -- bound upstream by
+        the transport (``opencrab/mcp/http_app.py``'s per-request token
+        verification, or ``opencrab/mcp/server.py``'s/``opencrab/cli.py``'s
+        stdio local-user binding) before ``handle_request`` is ever called.
+        Fail-closed like ``dispatch_tool``: with no principal bound,
+        ``current_principal()`` raises ``LookupError`` rather than falling
+        back to "show everything" -- there is no anonymous fallback (#143).
+
+        This is the list-side half of #150's tool exposure control; the
+        call-side half is ``dispatch_tool``'s own independent access-tier
+        check (see ``opencrab.mcp.tools._registry.dispatch_tool``) -- hiding
+        a tool here does not, by itself, stop ``tools/call`` from reaching
+        it, so that check exists and is NOT skipped just because this
+        method already filtered the list.
+        """
+        return {"tools": tools_for_principal(current_principal())}
 
     def _handle_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         """

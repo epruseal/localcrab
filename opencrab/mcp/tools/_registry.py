@@ -14,9 +14,39 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from opencrab.auth import Principal
 
 _REGISTRY: dict[str, ToolSpec] = {}
+
+
+class AccessTier(StrEnum):
+    """Exposure/permission tier for MCP tool listing and dispatch (#150).
+
+    A DIFFERENT axis from ``ToolSpec.writes``: `writes` means "needs the
+    cross-process write.lock", not "read vs write vs admin" (see that
+    field's own docstring). A tool can be `writes=False` and still be
+    WRITE- or ADMIN-tier here — `ontology_query` is the concrete example:
+    `writes=False` (no lock needed, its billing insert lives in its own
+    SQLite file) but it is NOT the side-effect-free read its name suggests,
+    so it is WRITE-tier, not READ-tier (#150's test pins this).
+
+    READ  -- no mutation of any kind.
+    WRITE -- mutates graph/doc/vector/SQL state, including a read-shaped
+             tool with a write side effect (ontology_query's billing insert).
+    ADMIN -- mutates the host filesystem or process-global schema state
+             (schema_pack_install/uninstall write YAML under
+             schemas/types/; harness_promotion_apply applies a promotion
+             package). See `allowed_access_tiers` for who gets to see/call
+             ADMIN-tier tools.
+    """
+
+    READ = "read"
+    WRITE = "write"
+    ADMIN = "admin"
 
 
 @dataclass(frozen=True)
@@ -25,6 +55,11 @@ class ToolSpec:
     schema: dict[str, Any]
     fn: Callable[..., Any]
     order: int
+    # Required, no default (#150): a tool registered without an access tier
+    # must fail at import time (like a duplicate name / order collision
+    # below), not silently default to some tier. See `tool()`'s `access`
+    # parameter, which is what actually enforces "no default".
+    access: AccessTier
     # NOTE: `writes` means "needs the cross-process write.lock", NOT "touches a
     # store". See `tool()`'s docstring — a tool can INSERT and still be
     # writes=False if serialising it behind the lock would cost more (a
@@ -36,7 +71,12 @@ class ToolSpec:
 
 
 def tool(
-    name: str, schema: dict[str, Any], *, order: int | None = None, writes: bool = False
+    name: str,
+    schema: dict[str, Any],
+    *,
+    access: AccessTier,
+    order: int | None = None,
+    writes: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register `fn` as the handler for MCP tool `name`, with its tools/list schema.
 
@@ -81,6 +121,13 @@ def tool(
     lock is the only thing protecting, it must be `writes=True` regardless
     of how "read-shaped" the tool's name looks (this is exactly how #65 was
     missed for ontology_impact/ontology_lever_simulate).
+
+    `access` (#150) is required and keyword-only with NO default: a missing
+    value fails the call with ``TypeError`` before ``deco`` even runs, i.e.
+    at import time, the same way a duplicate name or an order collision does
+    below — a default would let a new tool register with an unreviewed tier
+    instead of failing loudly. See ``AccessTier`` for what each tier means
+    and ``allowed_access_tiers`` for how a tier maps to who can see/call it.
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -90,7 +137,9 @@ def tool(
         collision = next((s.name for s in _REGISTRY.values() if s.order == resolved_order), None)
         if collision is not None:
             raise ValueError(f"tool {name!r} order={resolved_order} collides with {collision!r}")
-        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order, writes=writes)
+        _REGISTRY[name] = ToolSpec(
+            name=name, schema=schema, fn=fn, order=resolved_order, access=access, writes=writes
+        )
         return fn
 
     return deco
@@ -112,6 +161,73 @@ class ForbiddenArgumentError(ValueError):
     server-derived, never client-supplied). Rejected explicitly rather than
     silently stripped -- a caller whose value was quietly dropped would
     believe it had taken effect."""
+
+
+class ToolAccessDeniedError(PermissionError):
+    """Raised by dispatch_tool() when the calling principal's access tier
+    (#150) does not cover the tool's ``ToolSpec.access``. A remote (non-local)
+    principal hitting an ADMIN-tier tool is the concrete case today (see
+    ``allowed_access_tiers``). Deliberately raised even for a tool that is
+    ALSO absent from that principal's ``tools/list`` output -- hiding it from
+    the list must not be the only thing standing between a caller and the
+    handler (#150 issue body: list filter and call check are independent)."""
+
+
+def allowed_access_tiers(principal: Principal) -> frozenset[AccessTier]:
+    """Access tiers *principal* may see (tools/list) and call (dispatch_tool).
+
+    Derived from ``Principal.is_local`` -- there is deliberately no
+    ``users.role`` column (#150 design decision, see the PR description for
+    the full rationale). Short version: ADMIN-tier tools mutate the HOST
+    FILESYSTEM or process-global schema state (schema_pack_install/
+    uninstall, harness_promotion_apply). A local principal (stdio/CLI) is
+    already someone who can edit those same files directly, so there is no
+    privilege boundary MCP tool exposure could add for them. A remote
+    (token-authenticated, ``is_local=False``) principal has no such standing
+    access, so ADMIN-tier tools are withheld from it. The upgrade path, if a
+    deployment ever needs more than one remote admin, is to add
+    ``users.role`` then -- not to build it now for a boundary with a single
+    inhabitant (the local user).
+
+    This is a DIFFERENT axis from pack ownership (#143): pack write
+    authorization is per-pack-owner and applies identically to local and
+    remote principals; #143's "stdio/CLI has no admin bypass" is about that
+    axis, not this one.
+
+    Fail-closed by construction: there is no branch here that returns "all
+    tiers" for anything other than ``is_local is True`` on an already
+    server-derived ``Principal`` -- a caller with no bound principal never
+    reaches this function (``current_principal()`` raises first, both here
+    and in ``dispatch_tool``).
+    """
+    if principal.is_local:
+        return frozenset(AccessTier)
+    return frozenset({AccessTier.READ, AccessTier.WRITE})
+
+
+def _tool_allowed(spec: ToolSpec, principal: Principal) -> bool:
+    """Shared judgment call used, independently, by both the tools/list
+    filter (`tools_for_principal`) and the tools/call gate (`dispatch_tool`)
+    -- see #150: neither may be the only place this is decided."""
+    return spec.access in allowed_access_tiers(principal)
+
+
+def tools_for_principal(principal: Principal) -> list[dict[str, Any]]:
+    """tools/list view scoped to *principal*'s access tiers (#150).
+
+    Same tool descriptor shape as ``build_tools()``, filtered by
+    ``_tool_allowed``. Computed fresh on every call (no memoisation here or
+    in the caller) -- with a per-process cache keyed only by tool name, a
+    remote caller's filtered list could leak from/into a local caller's
+    request on the same server process. There is currently no such cache to
+    keep straight: this function and ``build_tools()`` both walk
+    ``_REGISTRY`` on every call.
+    """
+    return [
+        {"name": spec.name, **spec.schema}
+        for spec in sorted(_REGISTRY.values(), key=lambda s: s.order)
+        if _tool_allowed(spec, principal)
+    ]
 
 
 # Client-supplied identity fields dispatch_tool refuses outright. The
@@ -239,6 +355,19 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     from opencrab.auth import current_principal, principal_scope
 
     principal = current_principal()
+
+    # #150: independent re-check of the same tier a hidden tool was hidden
+    # for. `tools/list` filtering (`tools_for_principal`) only changes what
+    # the caller SEES -- `tools/call` does not consult it, so a caller that
+    # already knows an ADMIN-tier tool's name must be refused here too, or
+    # hiding it from the list would be decoration, not access control.
+    if not _tool_allowed(spec, principal):
+        raise ToolAccessDeniedError(
+            f"tool {name!r} requires {spec.access.value!r} access; principal "
+            f"{principal.user_id!r} (is_local={principal.is_local}) does not "
+            "have it."
+        )
+
     with principal_scope(principal):
         if spec.writes:
             with _write_lock():

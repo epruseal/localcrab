@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._registry import tool
+from ._registry import AccessTier, tool
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,14 @@ logger = logging.getLogger(__name__)
         },
     },
     order=15,
+    # #150: ADMIN (confirmed design decision, not derived from the handler
+    # body alone) -- unlike pack_create/pack_ingest, this writes an arbitrary
+    # space/node_type/node_id with no owning-pack scope at all, i.e. no
+    # per-pack boundary a remote principal's ownership could be checked
+    # against. Grouped with schema_pack_install/uninstall as the ADMIN tier
+    # (see opencrab.mcp.tools._registry.allowed_access_tiers): withheld from
+    # remote (non-local) principals.
+    access=AccessTier.ADMIN,
     writes=True,
 )
 def harness_promotion_apply(

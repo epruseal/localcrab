@@ -19,7 +19,7 @@ from typing import Any
 
 from opencrab.common.text import slugify
 
-from ._registry import tool
+from ._registry import AccessTier, tool
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +360,7 @@ def _manifest_extras() -> dict[str, tuple[list[str], list[str]]]:
         },
     },
     order=9,
+    access=AccessTier.READ,
 )
 def content_pack_list(
     min_nodes: int = 1,
@@ -544,6 +545,7 @@ def _rank_packs(
         },
     },
     order=13,
+    access=AccessTier.WRITE,
     writes=True,
 )
 def pack_create(
@@ -728,6 +730,7 @@ def pack_create(
         },
     },
     order=14,
+    access=AccessTier.WRITE,
     writes=True,
 )
 def pack_ingest(

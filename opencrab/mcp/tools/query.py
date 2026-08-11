@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._registry import tool
+from ._registry import AccessTier, tool
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,13 @@ logger = logging.getLogger(__name__)
         },
     },
     order=3,
+    # #150: WRITE, not READ, despite the read-shaped name and writes=False
+    # (no cross-process lock needed -- see the `writes` field docstring in
+    # _registry.py). This handler INSERTs a billing_events row via
+    # ctx["billing"].on_query() (see WRITE_TOOLS's docstring in
+    # __init__.py), so it is not the side-effect-free read its schema
+    # description implies; #150's registry test pins this.
+    access=AccessTier.WRITE,
 )
 def ontology_query(
     question: str,
@@ -254,6 +261,7 @@ def ontology_query(
     # #65: analyse() persists a row via ImpactEngine -> save_impact() (SQL
     # INSERT into impact_records), so this "analysis" tool must be lock-covered
     # like any other write despite its read-shaped name.
+    access=AccessTier.WRITE,
     writes=True,
 )
 def ontology_impact(
@@ -308,6 +316,7 @@ def ontology_impact(
     order=8,
     # #65: lever_simulate() persists a row via ImpactEngine -> save_simulation()
     # (SQL INSERT into lever_simulations); same rationale as ontology_impact above.
+    access=AccessTier.WRITE,
     writes=True,
 )
 def ontology_lever_simulate(
