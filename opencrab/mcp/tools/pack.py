@@ -387,21 +387,31 @@ def content_pack_list(
     limit:
         Cap on returned packs. Defaults to 10 when ``query`` is given.
 
-    NOTE: pack_create/pack_ingest call this with NO arguments on purpose —
-    their pack_id existence check is an exact membership test against the FULL
-    list. Passing a query there would shrink the candidate set and reject
-    packs that really exist.
+    NOTE: pack_ingest calls this with NO arguments on purpose — its pack_id
+    existence check is an exact membership test against the FULL list a
+    caller can see. Passing a query there would shrink the candidate set and
+    reject packs that really exist.
+
+    #146: candidates are additionally scoped to ``readable_pack_ids`` — the
+    caller's own packs plus every non-private one (#143 invariant 3). The
+    ``packs`` registry (not this store's node-count aggregation) is the
+    authority for existence/ownership/visibility; graph.list_packs() below
+    is only ever an auxiliary node-count/title source.
     """
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.packs.registry import readable_pack_ids
 
     ctx = _get_context()
     graph = ctx["neo4j"]
     if not graph.available:
         return {"error": "graph store unavailable"}
 
+    readable = readable_pack_ids(ctx["sql"], current_principal())
+
     # All four backends implement list_packs() natively (Local/PG: SQL GROUP
     # BY; Kuzu/Neo4j: Cypher aggregation) — see opencrab/stores/_graph_protocol.py.
-    rows = graph.list_packs(min_nodes)
+    rows = [r for r in graph.list_packs(min_nodes) if (r.get("pack_id") or "") in readable]
     # list_packs() 반환 형식:
     # [{"pack_id": str, "node_count": int, "sample_title": str, "sample_description": str}]
     packs = []
@@ -569,8 +579,9 @@ def pack_create(
     stays fixed at 'default'.
     """
     from opencrab.auth import current_principal
-    from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
+    from opencrab.mcp.tools import _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures
+    from opencrab.packs.registry import create_pack as _register_pack
 
     principal = current_principal()
     tenant_id = "default"
@@ -579,18 +590,26 @@ def pack_create(
     if not slug:
         return {"error": "Could not derive a valid pack_id from title."}
 
-    # NO arguments: the duplicate check is an exact membership test and must
-    # see the FULL pack list (see content_pack_list's docstring).
-    existing = content_pack_list()
-    existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
-    if slug in existing_ids:
-        return {
-            "error": "pack already exists",
-            "pack_id": slug,
-            "hint": "use pack_ingest to add more content",
-        }
-
     ctx = _get_context()
+
+    # #146: the registry (packs table), not a full content_pack_list() scan,
+    # is now the single authority for "is this slug taken". A collision is
+    # NEVER reported as an error (#143 invariant 7 — that would tell the
+    # caller someone else already owns the exact slug they guessed): the
+    # registry quietly appends "-2", "-3", ... instead, so `slug` below may
+    # differ from the caller's requested pack_id. The actually-assigned
+    # pack_id is always in the response.
+    try:
+        slug = _register_pack(
+            ctx["sql"],
+            owner_id=subject_id,
+            pack_id=slug,
+            title=_clean_str(title),
+            description=_clean_str(description or ""),
+        )
+    except Exception as exc:
+        return {"error": f"pack registration failed: {exc}"}
+
     anchor_node_id = f"dataset:{slug}"
     try:
         anchor_result = ctx["builder"].add_node(
@@ -800,3 +819,73 @@ def pack_ingest(
     )
 
     return {"status": "ok", "pack_id": pack_id, **ingest_result}
+
+
+@tool(
+    "pack_publish",
+    {
+        "description": (
+            "Set a content pack's visibility. Owner-only. `visibility` is one of: "
+            "private (default — only the owner can see or use it), "
+            "public-read (anyone can read/query it), or "
+            "public-fork (anyone can read/query it and fork it into their own pack)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack_id": {
+                    "type": "string",
+                    "description": "Pack to change visibility for.",
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["private", "public-read", "public-fork"],
+                    "description": "New visibility.",
+                },
+            },
+            "required": ["pack_id", "visibility"],
+        },
+    },
+    order=16,
+    writes=True,
+)
+def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
+    """
+    Set a pack's visibility (#146). Owner-only — the caller's server-derived
+    ``current_principal()`` (#145) must own ``pack_id``, never a client
+    argument.
+
+    #143 invariant 7 (existence must not leak): a pack_id that doesn't
+    exist at all, and a private pack owned by someone else, both return the
+    identical "pack not found" error — indistinguishable to the caller. A
+    pack that IS visible (public-read/public-fork) but owned by someone
+    else returns a distinct "not the pack owner" error instead, since that
+    pack's existence is already observable to anyone (e.g. via
+    content_pack_list).
+    """
+    from opencrab.auth import current_principal
+    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.packs.registry import PackForbiddenError, PackNotFoundError
+    from opencrab.packs.registry import set_visibility as _set_visibility
+
+    ctx = _get_context()
+    principal = current_principal()
+    pack_id = _clean_str(pack_id)
+    visibility = _clean_str(visibility)
+
+    try:
+        pack = _set_visibility(ctx["sql"], principal, pack_id, visibility)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except PackNotFoundError:
+        return {"error": "pack not found", "pack_id": pack_id}
+    except PackForbiddenError:
+        return {
+            "error": "not the pack owner",
+            "pack_id": pack_id,
+            "hint": "use pack_fork to copy this pack into your own",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"pack_publish failed: {exc}"}
+
+    return {"status": "ok", "pack_id": pack["pack_id"], "visibility": pack["visibility"]}

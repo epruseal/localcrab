@@ -12,8 +12,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.mcp.tools import content_pack_list
 from opencrab.ontology.pack_registry import PackInfo
+
+# Fixed test principal for every call through _call() below. #146:
+# content_pack_list() now scopes candidates to readable_pack_ids(sql,
+# current_principal()) -- _call()'s default registry (every row's pack_id,
+# see below) makes this principal own everything, reproducing the pre-#146
+# "no scoping" behaviour for every test that doesn't care about ownership.
+# Tests that DO care about scoping (bottom of file) bind other principals
+# and/or pass an explicit `readable` set.
+_PRINCIPAL = Principal(user_id="u1", is_local=True, disabled=False)
 
 
 def _graph(rows):
@@ -33,17 +43,24 @@ def _row(pack_id, node_count=1, title="", description=""):
 
 
 def _ctx(graph):
-    return {"neo4j": graph}
+    return {"neo4j": graph, "sql": MagicMock()}
 
 
-def _call(rows, registry=(), **kwargs):
+def _call(rows, registry=(), readable=None, **kwargs):
+    """``readable`` defaults to every pack_id in ``rows`` (i.e. no scoping —
+    the legacy contract every pre-#146 test in this file exercises)."""
+    if readable is None:
+        readable = {r["pack_id"] for r in rows}
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
+        patch("opencrab.packs.registry.readable_pack_ids") as mock_readable,
     ):
         mock_ctx.return_value = _ctx(_graph(rows))
         mock_reg.return_value = list(registry)
-        return content_pack_list(**kwargs)
+        mock_readable.return_value = set(readable)
+        with principal_scope(_PRINCIPAL):
+            return content_pack_list(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +185,13 @@ def test_manifest_registry_is_loaded_once_per_call():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
+        patch("opencrab.packs.registry.readable_pack_ids") as mock_readable,
     ):
         mock_ctx.return_value = _ctx(_graph(rows))
         mock_reg.return_value = []
-        content_pack_list(query="커피")
+        mock_readable.return_value = {r["pack_id"] for r in rows}
+        with principal_scope(_PRINCIPAL):
+            content_pack_list(query="커피")
     assert mock_reg.call_count == 1
 
 
@@ -180,10 +200,13 @@ def test_manifest_failure_degrades_to_graph_only():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
+        patch("opencrab.packs.registry.readable_pack_ids") as mock_readable,
     ):
         mock_ctx.return_value = _ctx(_graph(rows))
         mock_reg.side_effect = OSError("boom")
-        result = content_pack_list(query="커피")
+        mock_readable.return_value = {r["pack_id"] for r in rows}
+        with principal_scope(_PRINCIPAL):
+            result = content_pack_list(query="커피")
     assert [p["pack_id"] for p in result["packs"]] == ["coffee"]
 
 
@@ -205,11 +228,14 @@ def test_min_nodes_is_forwarded_to_store():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
+        patch("opencrab.packs.registry.readable_pack_ids") as mock_readable,
     ):
         graph = _graph(rows)
         mock_ctx.return_value = _ctx(graph)
         mock_reg.return_value = []
-        content_pack_list(min_nodes=7, query="커피")
+        mock_readable.return_value = {r["pack_id"] for r in rows}
+        with principal_scope(_PRINCIPAL):
+            content_pack_list(min_nodes=7, query="커피")
     graph.list_packs.assert_called_once_with(7)
 
 
@@ -251,3 +277,39 @@ def test_local_store_projects_anchor_description(tmp_path: Path):
             "sample_description": "커피 원두 로스팅",
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# #146: 등록부 스코핑 — 자기 팩 + 공개 팩만
+# ---------------------------------------------------------------------------
+
+
+def test_scopes_to_owned_and_public_packs_only():
+    """graph에는 세 팩이 모두 적재돼 있어도, readable_pack_ids가 돌려주는
+    (owner=principal ∪ visibility!=private) 집합 밖의 팩은 응답에서 빠진다."""
+    rows = [
+        _row("mine", 3, "내 팩", ""),
+        _row("someone-elses-public", 5, "남의 공개 팩", ""),
+        _row("someone-elses-private", 7, "남의 비공개 팩", ""),
+    ]
+    result = _call(rows, readable={"mine", "someone-elses-public"})
+    assert {p["pack_id"] for p in result["packs"]} == {"mine", "someone-elses-public"}
+
+
+def test_readable_pack_ids_called_with_real_principal():
+    """readable_pack_ids가 current_principal()로 스코프된다 -- ctx["sql"]과
+    함께 호출되는지, 그리고 다른 principal이면 다른 결과가 나오는지 확인."""
+    rows = [_row("p1", 1, "", "")]
+    sql_sentinel = MagicMock()
+    with (
+        patch("opencrab.mcp.tools._get_context") as mock_ctx,
+        patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
+        patch("opencrab.packs.registry.readable_pack_ids") as mock_readable,
+    ):
+        mock_ctx.return_value = {"neo4j": _graph(rows), "sql": sql_sentinel}
+        mock_reg.return_value = []
+        mock_readable.return_value = set()
+        with principal_scope(_PRINCIPAL):
+            result = content_pack_list()
+    mock_readable.assert_called_once_with(sql_sentinel, _PRINCIPAL)
+    assert result["packs"] == []

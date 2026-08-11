@@ -74,7 +74,10 @@ class TestContentPackList:
         graph.list_packs.return_value = [
             {"pack_id": "biomed", "node_count": 5, "sample_title": "Biomed ontology pack"},
         ]
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.packs.registry.readable_pack_ids", return_value={"biomed"}),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list(min_nodes=1)
         assert result == {
@@ -86,10 +89,30 @@ class TestContentPackList:
         graph = MagicMock()
         graph.available = True
         graph.list_packs.return_value = [{"pack_id": "p1", "node_count": 2, "sample_title": ""}]
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.packs.registry.readable_pack_ids", return_value={"p1"}),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
         assert result["packs"][0]["title"] == "p1"
+
+    def test_normal_scopes_to_readable_pack_ids(self):
+        """#146: a pack the caller can't see (not owned, not public) never
+        appears, even though it's loaded in the graph with real nodes."""
+        graph = MagicMock()
+        graph.available = True
+        graph.list_packs.return_value = [
+            {"pack_id": "mine", "node_count": 1, "sample_title": ""},
+            {"pack_id": "not-mine", "node_count": 1, "sample_title": ""},
+        ]
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.packs.registry.readable_pack_ids", return_value={"mine"}),
+        ):
+            mock_ctx.return_value = _base_ctx(neo4j=graph)
+            result = content_pack_list()
+        assert [p["pack_id"] for p in result["packs"]] == ["mine"]
 
     def test_edge_graph_unavailable_returns_error(self):
         graph = MagicMock()
@@ -613,15 +636,27 @@ class TestPackCreate:
             pack_create(title="My Pack", pack_id="my-pack")
         assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
 
-    def test_error_pack_already_exists(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
-            result = pack_create(title="Existing", pack_id="existing-pack")
-        assert result == {
-            "error": "pack already exists",
-            "pack_id": "existing-pack",
-            "hint": "use pack_ingest to add more content",
-        }
+    def test_taken_slug_is_quietly_suffixed_not_an_error(self):
+        """#146: the registry (packs table), not a content_pack_list() scan,
+        now decides slug collisions -- and a collision is never an error
+        (#143 invariant 7: an "already exists" error would tell the caller
+        someone else owns that exact slug). See tests/test_packs_registry.py
+        for the full registry-level collision/ownership contract."""
+        from opencrab.auth import Principal, principal_scope
+        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
+
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "someone-else", "existing-pack", title="Existing")
+
+        builder = MagicMock()
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            with principal_scope(Principal(user_id="test-user", is_local=True, disabled=False)):
+                result = pack_create(title="Existing", pack_id="existing-pack")
+        assert "error" not in result
+        assert result["pack_id"] == "existing-pack-2"
+        assert result["anchor_node"] == "dataset:existing-pack-2"
 
     def test_error_anchor_node_write_failure(self):
         builder = MagicMock()

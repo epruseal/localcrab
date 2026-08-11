@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from opencrab.mcp.tools import pack_create, pack_ingest
+from opencrab.mcp.tools import pack_ingest
 
 # #145: pack_create/pack_ingest now call current_principal() internally;
 # bind a fixed test principal for every test in this module (see
@@ -52,14 +52,13 @@ def test_pack_ingest_asks_for_the_unfiltered_pack_list(ctx):
     mock_list.assert_called_once_with()
 
 
-def test_pack_create_asks_for_the_unfiltered_pack_list(ctx):
-    with (
-        patch("opencrab.mcp.tools._get_context", return_value=ctx),
-        patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-    ):
-        mock_list.return_value = _EXISTING
-        pack_create(title="새 팩", pack_id="brand-new")
-    mock_list.assert_called_once_with()
+# pack_create's own duplicate-check used to be exactly this ("ask for the
+# unfiltered list, exact-match against it") — #146 replaced it with the
+# `packs` registry (owner_id/visibility), which decides slug collisions by
+# quietly suffixing rather than erroring (#143 invariant 7). See
+# tests/test_packs_registry.py for that contract; pack_ingest's own
+# exact-match behaviour below (querying content_pack_list, still the read
+# path #146 scoped) is unchanged.
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +98,3 @@ def test_exact_pack_id_passes_and_is_stored_verbatim(ctx):
     assert kwargs["properties"]["pack_id"] == "claude"
 
 
-def test_pack_create_rejects_duplicate_exact_id(ctx):
-    with (
-        patch("opencrab.mcp.tools._get_context", return_value=ctx),
-        patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-    ):
-        mock_list.return_value = _EXISTING
-        result = pack_create(title="Claude", pack_id="claude")
-    assert result["error"] == "pack already exists"
-    ctx["builder"].add_node.assert_not_called()
