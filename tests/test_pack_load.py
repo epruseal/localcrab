@@ -1081,10 +1081,25 @@ class TestPackLiveCountsIsTheSingleSourceOfTruth:
         그렇게 두 벌이 됐다. 이 모듈 안에 카운트 SQL 이 있는지만 확인하고, 호출자 쪽은
         그 리포의 게이트가 본다(단방향 의존이라 여기서 호출자를 알 수 없다).
         """
+        sql = pack_load.COUNT_SQL
+        assert set(sql) == {"nodes", "edges", "docs"}, (
+            f"COUNT_SQL 축이 달라졌다: {sorted(sql)} — 벡터는 백엔드마다 테이블명이 달라 "
+            "여기 두지 않는다(함수가 런타임에 정한다)")
+        for axis, table in (("nodes", "graph_nodes"), ("edges", "graph_edges"),
+                            ("docs", "doc_sources")):
+            assert f"FROM {table}" in sql[axis], f"{axis} 쿼리가 {table} 를 안 센다"
+
+        # **`docs` 는 두 태그 형태를 다 세야 한다.** `$.source` 절이 빠진 사본이
+        # 실제로 있었고, 그 사본은 source 로만 태그된 행을 통째로 놓쳤다
+        # (실측: 5건 중 3건 누락, 2026-08-11 적대 검증).
+        assert "$.pack_id" in sql["docs"] and "$.source" in sql["docs"], (
+            "docs 쿼리가 한쪽 태그만 센다 — 이것이 5벌 사본 중 하나에서 실제로 난 사고다")
+        assert pack_load.COUNT_SQL_ARGC["docs"] == 2, (
+            "docs 는 pack_name 을 두 번 받는다 — argc 가 틀리면 조용히 잘못 센다")
+
+        # 함수가 그 문자열을 **실제로 쓰는가**. 상수만 맞고 본문이 딴 쿼리를 쓰면 무의미하다.
         import inspect
 
-        src = inspect.getsource(pack_load.pack_live_counts)
-        for table in ("graph_nodes", "graph_edges", "doc_sources"):
-            assert f"FROM {table}" in src, f"{table} 카운트가 정본에서 사라졌다"
-        assert src.count("SELECT COUNT(*)") == 4, (
-            "카운트 쿼리 수가 4가 아니다 — 축을 늘렸으면 AXES 와 이 수도 같이 고쳐라")
+        body = inspect.getsource(pack_load.pack_live_counts)
+        assert "COUNT_SQL[" in body, "정본 상수를 안 쓰고 쿼리를 다시 적었다"
+        assert "FROM graph_nodes" not in body, "본문에 인라인 SQL 이 되살아났다"
