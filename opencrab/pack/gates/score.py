@@ -84,7 +84,11 @@ def grade_pack(pack_dir: Path | str, expected_sources: int | None = None) -> dic
     non_ev = [n for n in nodes if n["space"] != "evidence"]
     sp_cnt = Counter(n["space"] for n in non_ev)
     total_ne = max(1, len(non_ev))
-    top_sp, top_n = sp_cnt.most_common(1)[0]
+    # **비-evidence 가 하나도 없는 팩이 있다.** 그러면 `most_common(1)[0]` 이
+    # `IndexError` 로 죽는다 — 채점기는 어떤 팩 모양에도 **리포트를 내야지 크래시하면
+    # 안 된다**(2026-08-11 리뷰 지적). 균형은 "최다 space 가 얼마나 차지하는가"인데
+    # 셀 것이 없으면 편중도 없다: 0 으로 본다.
+    top_sp, top_n = sp_cnt.most_common(1)[0] if sp_cnt else ("(없음)", 0)
     ratio = top_n / total_ne
     if ratio <= 0.60:
         s2 = 10

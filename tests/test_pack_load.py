@@ -504,13 +504,28 @@ class _RecordingVec:
     (`tests/test_impact_graph_paths.py` 의 FakeSQLStore 와 같은 계층).
     """
 
-    def __init__(self, fail_batches_larger_than: int | None = None):
+    def __init__(self, fail_batches_larger_than: int | None = None,
+                 supports_meta_update: bool = True):
         self.available = True
         self.calls: list[tuple[int, list[str]]] = []
         self.ids: list[str] = []
         self.metas: dict[str, dict] = {}      # 벡터에 실제로 도달한 메타
         self.deleted: list[str] = []
         self._fail_over = fail_batches_larger_than
+        # **메타만 갱신하는 경로를 흉내낸다.** 실 `SqliteVecStore` 는 `_conn`/`_table` 을
+        # 노출해 `UPDATE ... SET metadata` 가 되는데, 스텁이 그걸 안 흉내내면
+        # 적재기가 "이 백엔드는 메타 갱신을 못 한다"고 판단해 재임베딩으로 우회한다 —
+        # 스텁 한계가 실동작처럼 보인다. 이 파일 docstring 이 경고하는 그 함정이다.
+        self.meta_updates: list[tuple[str, dict]] = []
+        self._supports_meta_update = supports_meta_update
+
+    def update_metadata(self, chunk_id: str, meta: dict) -> bool:
+        """메타만 갱신. `supports_meta_update=False` 면 미지원 백엔드를 흉내낸다."""
+        if not self._supports_meta_update:
+            return False
+        self.meta_updates.append((chunk_id, meta))
+        self.metas[chunk_id] = meta
+        return True
 
     def upsert_texts(self, texts, metadatas=None, ids=None):
         """**실 스토어와 같은 시그니처**여야 한다 — `(texts, metadatas, ids)`.
@@ -1132,3 +1147,48 @@ class TestPackLiveCountsIsTheSingleSourceOfTruth:
         body = inspect.getsource(pack_load.pack_live_counts)
         assert "COUNT_SQL[" in body, "정본 상수를 안 쓰고 쿼리를 다시 적었다"
         assert "FROM graph_nodes" not in body, "본문에 인라인 SQL 이 되살아났다"
+
+
+class TestVectorMetadataFollowsDocMetadata:
+    """텍스트 불변·메타만 변경일 때 **벡터 메타도 따라가는가**.
+
+    안 따라가면 의미검색이 돌려주는 메타와 메타 필터가 옛 값을 계속 본다. 더 나쁜 것은
+    **다음 증분이 갱신된 doc 메타와 비교해 "동일"로 판정**한다는 점이다 — 그 어긋남은
+    전량 재적재 전에는 영영 안 고쳐진다(2026-08-11 리뷰 지적).
+
+    미지원 백엔드에서는 **조용히 넘어가지 않고 재임베딩으로 우회**해야 한다.
+    조용히 성공을 보고하면 같은 영구 불일치가 남는다.
+    """
+
+    def _pack(self, tmp_path, doc_id):
+        return _write_jsonl(tmp_path / "c.jsonl", [
+            {"id": "c1", "text": "고정된 본문", "document_id": doc_id, "source": "p"}])
+
+    def test_metadata_change_reaches_the_vector_store(self, live, tmp_path):
+        builder, graph, docs = live
+        vec = _RecordingVec()
+        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs)
+        state = pack_load.live_pack_state("p", graph, docs, _NoVec())
+
+        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"])
+        assert (c_meta, c_txt, c_same) == (1, 0, 0), (
+            f"메타만 바뀐 청크가 meta 로 안 세어졌다 ({c_meta},{c_txt},{c_same})")
+        assert vec.meta_updates, "벡터 메타 갱신이 호출되지 않았다 — doc 만 고쳐졌다"
+        assert vec.metas["c1"]["document_id"] == "doc-B", (
+            "벡터에 도달한 메타가 옛 값이다 — 의미검색이 계속 옛 메타를 돌려준다")
+
+    def test_unsupported_backend_falls_back_to_re_embedding(self, live, tmp_path):
+        """메타 갱신을 못 하는 백엔드면 **재임베딩으로라도** 맞춘다."""
+        builder, graph, docs = live
+        vec = _RecordingVec(supports_meta_update=False)
+        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs)
+        state = pack_load.live_pack_state("p", graph, docs, _NoVec())
+        before = len(vec.ids)
+
+        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"])
+        assert c_meta == 0 and c_txt == 1, (
+            f"미지원 백엔드인데 meta 로 세었다 ({c_meta},{c_txt}) — 벡터가 옛 메타로 남는다")
+        assert len(vec.ids) > before, "재임베딩이 안 일어났다"
+        assert vec.metas["c1"]["document_id"] == "doc-B"

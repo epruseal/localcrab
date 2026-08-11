@@ -51,13 +51,31 @@ def _shard_path(path: Path, idx: int) -> Path:
 
 def shard_paths(path: Path | str) -> list[Path]:
     """논리 경로 → 실제 물리 파일 목록.
-    base만 → [base] / shards만 → 정렬된 shard들 / 둘 다 → RuntimeError / 없음 → []."""
+    base만 → [base] / shards만 → 정렬된 shard들 / 둘 다 → RuntimeError / 없음 → [].
+
+    **번호가 `00` 부터 연속이 아니면 죽는다.** 이 모듈의 존재 이유는 "부분만 읽고
+    조용히 넘어가는 것"을 막는 것인데(base 를 단일 `open()` 하면 `FileNotFoundError` 로
+    즉사시키는 설계), 정작 **조각이 중간에 빠진 경우**는 남은 것을 이어붙여 통과시켰다.
+    전송 중단이나 실수 삭제로 `.01` 이 없으면 적재기가 **불완전한 팩을 오류 없이 삼킨다** —
+    같은 클래스의 사고를 같은 파일이 한쪽만 막고 있었던 것이다(2026-08-11 리뷰 지적,
+    재현: `.00`·`.02` 만 두면 2행이 그대로 읽혔다).
+    """
     path = Path(path)
     shards = sorted(path.parent.glob(f"{path.stem}.[0-9][0-9]{path.suffix}"))
     if path.exists() and shards:
         raise RuntimeError(f"base와 shard가 동시에 존재(부분 마이그레이션/롤백 잔재): {path}")
     if path.exists():
         return [path]
+    if shards:
+        want = [_shard_path(path, i) for i in range(len(shards))]
+        if shards != want:
+            got = [p.name for p in shards]
+            missing = [p.name for p in want if p not in shards]
+            raise RuntimeError(
+                f"shard 번호가 00 부터 연속이 아니다: {path}\n"
+                f"  발견: {got}\n  기대: {[p.name for p in want]}\n"
+                f"  빠진 것: {missing}\n"
+                "이어붙이면 불완전한 팩을 오류 없이 적재한다 — 전송 중단이나 실수 삭제를 의심하라.")
     return shards
 
 

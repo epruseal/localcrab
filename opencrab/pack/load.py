@@ -75,6 +75,67 @@ COUNT_SQL: dict[str, str] = {
 COUNT_SQL_ARGC: dict[str, int] = {"nodes": 1, "edges": 1, "docs": 2}
 
 
+def _vec_backend(vec):
+    """벡터 스토어가 **팩 단위 연산을 어떤 방식으로 지원하는가**.
+
+    반환: `("sql", conn, table)` · `("chroma", collection, None)` ·
+          `("sqlalchemy", engine, table)` · `(None, None, None)`
+
+    **왜 한 자리로 모으는가.** 종전에는 삭제(`delete_pack`)·수집(`live_pack_state`)이
+    각자 `getattr(vec, "_conn")` / `hasattr(vec, "_collection")` 를 따로 열거했고,
+    그 목록에서 **pgvector 가 빠져 있었다**(`_engine`/`_table` 만 노출한다).
+    결과는 조용한 실패였다 — 삭제는 "성공"을 보고하면서 벡터가 전부 남고,
+    증분은 `vec_ids` 가 항상 비어 고아 임베딩을 영영 못 지운다(2026-08-11 리뷰 지적).
+
+    같은 열거를 두 곳에 두면 한쪽만 고쳐진다. 판별을 여기 하나로 두고,
+    **지원하지 않는 백엔드는 `None` 으로 명시**해 호출자가 조용히 0 을 내지 않게 한다.
+    """
+    if not getattr(vec, "available", False):
+        return (None, None, None)
+    conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
+    if conn is not None:
+        return ("sql", conn, getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure"))
+    if hasattr(vec, "_collection"):
+        return ("chroma", vec._collection, None)
+    engine = getattr(vec, "_engine", None)
+    if engine is not None:
+        return ("sqlalchemy", engine, getattr(vec, "_table", None) or "vectors")
+    return (None, None, None)
+
+
+def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
+    """벡터 레코드의 **메타데이터만** 갱신. 성공하면 True.
+
+    텍스트가 안 바뀌었으니 임베딩은 그대로 두고 메타만 맞춘다. 백엔드가 그 연산을
+    지원하지 않으면 **False 를 돌려 호출자가 재임베딩으로 우회**하게 한다 —
+    조용히 True 를 내면 그 어긋남이 영구히 남는다(다음 증분이 "동일"로 판정하므로).
+    """
+    # 백엔드가 전용 API 를 내놓으면 그것을 쓴다 — 내부 속성을 뒤지는 것보다 낫고,
+    # 테스트 더블도 이 축으로 실계약을 흉내낼 수 있다.
+    updater = getattr(vec, "update_metadata", None)
+    if callable(updater):
+        try:
+            return bool(updater(chunk_id, meta))
+        except Exception as exc:                              # noqa: BLE001
+            log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
+            return False
+
+    kind, handle, table = _vec_backend(vec)
+    import json as _json
+    try:
+        if kind == "sql":
+            handle.execute(f"UPDATE {table} SET metadata = ? WHERE node_id = ?",
+                           (_json.dumps(meta, ensure_ascii=False), chunk_id))
+            handle.commit()
+            return True
+        if kind == "chroma":
+            handle.update(ids=[chunk_id], metadatas=[meta])
+            return True
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
+    return False
+
+
 def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
     """팩 하나의 **라이브 4축 카운트**. 적재 전후 대사의 정본이다.
 
@@ -110,15 +171,21 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     node_del = 0
 
     # ── graph_nodes: pack_id == pack_name 인 노드 조회 ──────────────────
+    #
+    # **레거시 `source` 폴백은 정확일치여야 한다.** `LIKE '%{pack}%'` 였을 때
+    # 한 팩 이름이 다른 팩 이름의 **부분 문자열**이면 경계를 넘었다 — `pack-a` 를
+    # 지우면 `pack_id` 가 `pack-a-v2` 인 노드까지 삭제되고 엣지가 cascade 로 따라간다
+    # (재현: 그 노드의 레거시 `source` 가 "pack-a-legacy-dump" 이면 걸린다, 2026-08-11).
+    # **삭제는 되돌릴 수 없다** — 경계 판정을 문자열 포함으로 하면 안 되는 자리다.
     rows = graph._conn.execute(
         """
         SELECT node_type, node_id,
                COALESCE(json_extract(properties, '$.space'), 'concept') as space
         FROM graph_nodes
         WHERE json_extract(properties, '$.pack_id') = ?
-           OR json_extract(properties, '$.source') LIKE ?
+           OR json_extract(properties, '$.source') = ?
         """,
-        (pack_name, f"%{pack_name}%"),
+        (pack_name, pack_name),
     ).fetchall()
 
     for node_type, node_id, space in rows:
@@ -177,20 +244,29 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     chunk_vec_del = 0
     if vec.available:
         try:
-            # SqliteVecStore(KURE): vectors_kure.pack_id 컬럼으로 직접 삭제
-            conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
-            table = getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure")
-            if conn is not None:
-                cur = conn.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
-                conn.commit()
+            kind, handle, table = _vec_backend(vec)
+            if kind == "sql":
+                cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
+                handle.commit()
                 chunk_vec_del = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-            elif hasattr(vec, "_collection"):
-                # Chroma 폴백: metadata.source 기준
-                result = vec._collection.get(where={"source": pack_name})
+            elif kind == "chroma":
+                result = handle.get(where={"source": pack_name})
                 ids_to_del = result.get("ids", [])
                 if ids_to_del:
-                    vec._collection.delete(ids=ids_to_del)
+                    handle.delete(ids=ids_to_del)
                     chunk_vec_del = len(ids_to_del)
+            elif kind == "sqlalchemy":
+                from sqlalchemy import text as _sa_text
+                with handle.begin() as _c:
+                    r = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
+                                   {"p": pack_name})
+                    chunk_vec_del = r.rowcount or 0
+            else:
+                # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
+                # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
+                log.warning(
+                    "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
+                    "수동 정리가 필요하다", type(vec).__name__, pack_name)
         except Exception as e:
             log.warning("벡터 delete 오류(%s): %s", pack_name, e)
 
@@ -246,14 +322,26 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         edges.add((from_id, relation, to_id))
 
     vec_ids: set[str] = set()
-    if vec.available:
-        conn = getattr(vec, "_conn", None)
-        table = getattr(vec, "_table", None) or "vectors_kure"
-        if conn is not None:
-            for (node_id,) in conn.execute(
-                f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
-            ).fetchall():
+    kind, handle, table = _vec_backend(vec)
+    if kind == "sql":
+        for (node_id,) in handle.execute(
+            f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
+        ).fetchall():
+            vec_ids.add(node_id)
+    elif kind == "chroma":
+        got = handle.get(where={"source": pack_name})
+        vec_ids.update(got.get("ids", []))
+    elif kind == "sqlalchemy":
+        from sqlalchemy import text as _sa_text
+        with handle.connect() as _c:
+            for (node_id,) in _c.execute(
+                _sa_text(f"SELECT node_id FROM {table} WHERE pack_id = :p"), {"p": pack_name}):
                 vec_ids.add(node_id)
+    elif getattr(vec, "available", False):
+        # 빈 집합은 "벡터가 없다"로 읽힌다. 그러면 증분이 고아 임베딩을 **영영 못 지운다** —
+        # 삭제된 노드의 벡터가 의미검색에 계속 뜬다. 모른다는 것을 말한다.
+        log.warning("벡터 ID 열거 미지원 백엔드(%s) — 고아 임베딩을 판정할 수 없다",
+                    type(vec).__name__)
 
     return {"nodes": nodes, "chunks": chunks, "edges": edges, "vec_ids": vec_ids}
 
@@ -619,10 +707,25 @@ def load_chunks_incremental(
                 b_metas.append(meta)
                 b_kinds.append("txt")
             elif live[1] != meta:
-                # 텍스트 불변, 메타만 변경 — 임베딩 없이 upsert_source만(FTS는 자동 싱크)
+                # 텍스트 불변, 메타만 변경 — 임베딩은 재계산하지 않는다(텍스트가 같으므로).
+                #
+                # **다만 벡터 쪽 메타데이터도 같이 고쳐야 한다.** 종전에는 `doc_sources`
+                # 만 갱신했는데, 그러면 의미검색이 돌려주는 메타와 메타 필터가 **옛 값**을
+                # 계속 본다. 게다가 다음 증분은 갱신된 doc 메타와 비교해 "동일"로 판정하므로
+                # **그 어긋남이 영구히 남는다** — 전량 재적재 전에는 안 고쳐진다
+                # (2026-08-11 리뷰 지적). 벡터를 못 고치는 백엔드면 조용히 넘기지 않고
+                # 텍스트 경로로 보내 재임베딩시킨다.
                 try:
                     docs.upsert_source(chunk_id, row["text"], meta)
-                    c_meta += 1
+                    if _vec_meta_update(vec, chunk_id, meta):
+                        c_meta += 1
+                    else:
+                        # 벡터 메타를 못 고쳤다 — 재임베딩으로라도 맞춘다.
+                        b_ids.append(chunk_id)
+                        b_texts.append(row["text"])
+                        b_metas.append(meta)
+                        b_kinds.append("txt")
+                        continue
                 except Exception as exc:
                     err += 1
                     log.warning("청크 메타갱신 오류(%s) %s: %s", pack_name, chunk_id[:8], exc)

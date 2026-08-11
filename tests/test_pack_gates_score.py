@@ -923,3 +923,24 @@ class TestEverySpaceIsActuallyChecked:
         """
         assert gs.NSPACES == ["subject", "community", "policy", "claim", "concept",
                               "resource", "evidence", "lever", "outcome"]
+
+
+class TestGraderNeverCrashesOnValidPackShapes:
+    """채점기는 어떤 팩 모양에도 **리포트를 낸다** — 크래시는 판정이 아니다.
+
+    `most_common(1)[0]` 이 비-evidence 0 개인 팩에서 `IndexError` 로 죽었다
+    (2026-08-11 리뷰 지적). 저품질 팩과 채점 실패를 구분하는 것이 이 게이트의 계약인데
+    (`TestMissingNodesFileIsNotAVerdict` 참조) 크래시는 그 구분 자체를 무너뜨린다.
+    """
+
+    def test_evidence_only_pack_gets_a_report_not_an_exception(self, tmp_path):
+        nodes = [_gn(f"e{i}", "evidence") for i in range(3)]
+        r = grade_pack(_pack(tmp_path / "ev", nodes, [], []))
+        assert r is not None and isinstance(r["total"], int)
+        assert r["sections"]["balance"] == 10, (
+            "셀 비-evidence 가 없으면 편중도 없다 — 균형은 만점이어야 한다")
+        assert r["sections"]["space"] == 0, "8개 space 가 비었으므로 0 하한"
+
+    def test_single_node_pack_gets_a_report(self, tmp_path):
+        r = grade_pack(_pack(tmp_path / "one", [_gn("a", "concept")], [], []))
+        assert r is not None and isinstance(r["total"], int)
