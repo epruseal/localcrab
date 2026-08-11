@@ -106,6 +106,133 @@ class TestDispatchContract:
         assert isinstance(result, dict)
 
 
+class TestWriteLockCoverage:
+    """Issue #65: WRITE_TOOLS used to be a hand-copied set in __init__.py that
+    silently drifted from what handlers actually did — ontology_impact and
+    ontology_lever_simulate call save_impact()/save_simulation() (SQL INSERTs)
+    but were absent from the set, so dispatch_tool never locked around them.
+
+    WRITE_TOOLS is now *derived* from each handler's `@tool(..., writes=True)`
+    declaration (see opencrab/mcp/tools/_registry.py). These tests pin that
+    invariant so a future write handler that forgets `writes=True` fails here
+    instead of silently bypassing the cross-process write lock.
+    """
+
+    # NOTE on what "write" means here: this is a *needs write.lock* list, not a
+    # *touches a store* list (see the `writes` field docstring in
+    # _registry.py#tool for the full rule). ontology_query is deliberately
+    # EXCLUDED even though it INSERTs into billing_events via
+    # `ctx["billing"].on_query()` — NOT because that insert is idempotent
+    # (issue #105: it isn't, each call mints a fresh event_id, so
+    # UNIQUE(event_id) + INSERT OR IGNORE / ON CONFLICT DO NOTHING only
+    # dedupes a literal double-send, never resurrects a failed insert), and
+    # NOT because losing it under contention would be an acceptable trade
+    # (protecting it IS the correctness goal #105 exists for). It's safe
+    # because billing_events lives in its own SQLite file (`billing.db`,
+    # local/kuzu mode — see opencrab.stores.factory.make_billing_sql_store),
+    # so it structurally never contends with a write.lock'd writer's file
+    # lock regardless of how long that writer runs — locking every query
+    # would cost real latency on a high-frequency, read-shaped path for a
+    # contention that doesn't happen. Decided in #65's review against #68
+    # (E-4 lock ownership map).
+    #
+    # Yes, this is itself a hand-maintained list (codex's point in #65's
+    # review) — its role is different from WRITE_TOOLS though: WRITE_TOOLS is
+    # the derived *source of truth* dispatch_tool acts on (see
+    # test_write_tools_is_derived_from_registry_writes_flag below); this list
+    # is a reviewable regression pin that fails loudly if that source of truth
+    # ever silently drifts (a tool's writes= flag changes without a human
+    # reviewing whether it should have). Mirrors GOLDEN_TOOL_NAMES's role
+    # above for the same reason.
+    GOLDEN_WRITE_TOOL_NAMES = {
+        "ontology_add_node",
+        "ontology_add_edge",
+        "ontology_impact",
+        "ontology_lever_simulate",
+        "schema_pack_install",
+        "schema_pack_uninstall",
+        "pack_create",
+        "pack_ingest",
+        "harness_promotion_apply",
+    }
+
+    def test_write_tools_matches_golden_list(self):
+        from opencrab.mcp.tools import WRITE_TOOLS
+
+        assert WRITE_TOOLS == self.GOLDEN_WRITE_TOOL_NAMES
+
+    def test_write_tools_is_derived_from_registry_writes_flag(self):
+        """WRITE_TOOLS must equal {name for name, spec in _REGISTRY if spec.writes} —
+        i.e. it is computed, not a second hand-maintained copy."""
+        from opencrab.mcp.tools import WRITE_TOOLS
+        from opencrab.mcp.tools._registry import _REGISTRY
+
+        declared_writers = {name for name, spec in _REGISTRY.items() if spec.writes}
+        assert WRITE_TOOLS == declared_writers
+
+    def test_ontology_impact_and_lever_simulate_declared_as_writes(self):
+        """Regression pin for the exact #65 omission."""
+        from opencrab.mcp.tools._registry import _REGISTRY
+
+        assert _REGISTRY["ontology_impact"].writes is True
+        assert _REGISTRY["ontology_lever_simulate"].writes is True
+
+    def test_dispatch_tool_holds_write_lock_iff_tool_declares_writes(self):
+        """Behavioral: dispatch_tool must hold _write_lock while calling any
+        handler registered with writes=True, and must NOT hold it otherwise.
+        Uses throwaway probe tools (same pattern as
+        TestRegistryDuplicateGuard) so this doesn't depend on any specific
+        handler's store/context dependencies — it exercises dispatch_tool's
+        actual locking behavior directly, which is what would catch a future
+        write tool that forgets `writes=True`.
+        """
+        from unittest.mock import patch
+
+        from opencrab.mcp.tools import dispatch_tool
+        from opencrab.mcp.tools._registry import _REGISTRY, tool
+
+        events: list[str] = []
+
+        class _FakeLock:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *exc_info):
+                events.append("exit")
+
+        schema = {
+            "description": "probe",
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+        }
+        write_name = "__contract_test_write_probe__"
+        read_name = "__contract_test_read_probe__"
+        assert write_name not in _REGISTRY
+        assert read_name not in _REGISTRY
+
+        try:
+
+            @tool(write_name, schema, writes=True)
+            def _write_probe(**kwargs):
+                return {"locked": events == ["enter"]}
+
+            @tool(read_name, schema)
+            def _read_probe(**kwargs):
+                return {"locked": events == ["enter"]}
+
+            with patch("opencrab.mcp.tools._write_lock", return_value=_FakeLock()):
+                result = dispatch_tool(write_name, {})
+                assert events == ["enter", "exit"]
+                assert result["locked"] is True
+
+                events.clear()
+                result = dispatch_tool(read_name, {})
+                assert events == []
+                assert result["locked"] is False
+        finally:
+            _REGISTRY.pop(write_name, None)
+            _REGISTRY.pop(read_name, None)
+
+
 class TestRegistryDuplicateGuard:
     def test_tool_decorator_raises_on_duplicate_registration(self):
         from opencrab.mcp.tools._registry import _REGISTRY, tool

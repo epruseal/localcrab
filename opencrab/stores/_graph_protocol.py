@@ -37,28 +37,45 @@ of each store module):
     find_path             yes     yes     yes     yes
     count_nodes           yes     yes     yes     yes
     -------------------- ------- ------- ------- -------
-    get_node_by_id        yes     yes     yes     NO
-    list_packs            yes     yes     yes     NO
-    find_by_relations     yes     yes     yes     NO
-    export_nodes          yes     yes     yes     NO
-    export_edges          yes     yes     yes     NO
-    upsert_nodes_batch    yes     yes     yes     NO
-    upsert_edges_batch    yes     yes     yes     NO
+    get_node_by_id        yes     yes     yes     yes
+    list_packs            yes     yes     yes     yes
+    find_by_relations     yes     yes     yes     yes
+    export_nodes          yes     yes     yes     yes
+    count_exported_nodes  yes     yes     yes     yes
+    search_nodes          yes     yes     yes     no
+    export_edges          yes     yes     yes     yes
+    upsert_nodes_batch    yes     yes     yes     yes
+    upsert_edges_batch    yes     yes     yes     yes
 
-Neo4j is missing exactly 7 methods (the "extended" block above) — this is
-D3's worklist for Stage 4's R5 leg. Note ``get_node_by_id`` is grouped with
-the extended/missing block, NOT the always-present block: Neo4jStore has no
-such method (its callers fall back to a type-agnostic ``run_cypher`` MATCH
-instead — see opencrab/mcp/tools.py:ontology_get_node and
-opencrab/ontology/impact.py's ``_is_local`` branch).
+``search_nodes`` (issue #86) is the one row above that is genuinely "no" for
+Neo4j, not stale -- ``HybridQuery.keyword_search`` never needed a
+Neo4jStore.search_nodes because its Cypher ``CONTAINS`` branch already
+pushes the same keyword/space predicate straight into Cypher without going
+through a store method (see query.py's isinstance branch, which routes
+Local/PG/Kuzu to ``search_nodes`` and leaves Neo4j on that pre-existing
+Cypher path).
+
+CORRECTION (issue #54 audit finding [5], verified by grepping each `def` in
+neo4j_store.py): this table previously marked all 7 "extended" methods NO
+for Neo4j and claimed "Neo4j is missing exactly 7 methods" — stale relative
+to the source (already flagged separately as issue #64's D-3, since
+Neo4jStore has implemented every one of them for a while). Corrected here
+because #54's own changes added a new method (``count_exported_nodes``) and
+extended an existing one (``export_nodes``) on Neo4jStore, which would have
+made the table's staleness worse if left uncorrected. Note this table only
+tracks *method presence*; whether ``isinstance(store, GraphStore)`` /
+``isinstance(store, GraphStoreExtended)`` actually evaluates True for
+Neo4jStore today (the runtime-checkable behavior implied by the surrounding
+module docstring, e.g. mcp/tools.py's and ontology/impact.py's isinstance
+branches) is unverified here and is #64's scope, not #54's — do not treat
+this table's "yes" as a claim about those call sites' current behavior.
 
 ``@runtime_checkable`` is set so ``isinstance(store, GraphStore)`` works as
 a drop-in replacement for the ``isinstance(store, (LocalGraphStore,
-KuzuGraphStore, PGGraphStore))`` tuple checks above — note that until D3
-closes the gap, Neo4jStore will NOT satisfy this Protocol (isinstance check
-fails, since 7 required methods are absent), so ``GraphStoreExtended``
-below is deliberately split out as a separate Protocol consumers can check
-against independently of the base ``GraphStore``.
+KuzuGraphStore, PGGraphStore))`` tuple checks above; ``GraphStoreExtended``
+below is a separate Protocol consumers can check against independently of
+the base ``GraphStore`` (see #64 for whether that split is still warranted
+now that method presence is at parity).
 """
 
 from __future__ import annotations
@@ -191,6 +208,7 @@ class GraphStore(Protocol):
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """BFS neighbour traversal up to ``depth`` hops from ``node_id``.
 
@@ -210,10 +228,24 @@ class GraphStore(Protocol):
             dropped; an edge with no ``pack_id`` survives only when both
             endpoints pass the node filter. The anchor itself must also
             pass, or the whole call returns ``[]``.
+        spaces: optional space allow-list (issue #52). Strict membership —
+            unlike ``pack_ids`` there is no "include unspaced" mode. Every
+            node visited (anchor included) must have its space in this
+            list, or the whole call returns ``[]``. Pushed into the
+            store's native query ahead of any LIMIT on every backend
+            (``space``/``space_id`` is a real column/property everywhere,
+            unlike ``pack_id`` which is JSON-blob-only on Kuzu).
 
         Returns a list of dicts, each shaped:
             {"properties": dict, "labels": [str], "relation_type": str,
-             "relationship_types": [str], "depth": int}
+             "relationship_types": [str], "depth": int,
+             "from_id": str, "to_id": str}
+        ``from_id``/``to_id`` are the canonical endpoints of the edge that
+        reached this neighbour, in true edge direction (so with
+        ``direction="both"`` the anchor may be either side, and at depth > 1
+        neither endpoint is the anchor). Optional: Neo4jStore does not emit
+        them yet, so consumers must treat their absence as "unknown", never as
+        "the anchor is the source".
         Ordering is backend-native (SQLite/PG: edge-table insertion/scan
         order; Neo4j: engine-internal index order) — not guaranteed
         identical across backends when a LIMIT truncates a high-degree hub.
@@ -252,6 +284,20 @@ class GraphStoreExtended(Protocol):
     """The 7 methods LocalGraphStore/PGGraphStore/KuzuGraphStore share that
     Neo4jStore currently lacks (D3's Stage-4 R5 worklist).
 
+    ``search_nodes`` (issue #86, see the GAP TABLE above) is deliberately
+    NOT declared as an 8th member here, even though it fits this Protocol's
+    "Local/PG/Kuzu have it, Neo4j doesn't" shape: ``test_graph_protocol_
+    contract.py::test_neo4j_satisfies_graph_store_extended`` asserts
+    ``isinstance(neo4j_store, GraphStoreExtended)`` is True, a real
+    per-instance parity check (``@runtime_checkable``) proving Neo4jStore
+    actually implements every declared member -- adding ``search_nodes``
+    here would make that assertion False and break the invariant this
+    Protocol exists to guarantee. ``search_nodes`` has no consumer that
+    checks ``isinstance(store, GraphStoreExtended)`` either: ``query.py``'s
+    only routing check is a concrete-class isinstance tuple (Local/PG/Kuzu),
+    so there is nothing for a Protocol declaration to buy here beyond the
+    GAP TABLE's documentation, which already covers it.
+
     Split into its own Protocol (rather than folded into ``GraphStore``)
     because until D3 implements these on Neo4jStore, no Neo4j instance can
     satisfy them — keeping them separate lets consumer code do:
@@ -279,10 +325,14 @@ class GraphStoreExtended(Protocol):
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """Aggregate node counts per ``pack_id``; packs below ``min_nodes`` omitted.
 
-        Returns ``[{"pack_id": str, "node_count": int, "sample_title": str}, ...]``
-        ordered by node_count descending. ``sample_title`` prefers the
-        pack_create anchor node's title, then any node's
-        ``source_package_title``, else ``""``.
+        Returns ``[{"pack_id": str, "node_count": int, "sample_title": str,
+        "sample_description": str}, ...]`` ordered by node_count descending.
+        ``sample_title`` prefers the pack_create anchor node's title, then any
+        node's ``source_package_title``, else ``""``. ``sample_description`` is
+        the anchor node's ``description`` only (no node-level fallback exists),
+        else ``""`` — it is projected inside this same aggregation so
+        pack-relevance scoring (``content_pack_list(query=...)``) needs no
+        per-pack follow-up lookup.
         """
         ...
 
@@ -304,16 +354,139 @@ class GraphStoreExtended(Protocol):
         ...
 
     def export_nodes(
-        self, pack_id: str | None = None, limit: int = 500_000
+        self, pack_id: str | None = None, limit: int = 500_000, space: str | None = None
     ) -> list[dict[str, Any]]:
         """Bulk node export for pack ingest/re-export tooling.
 
         ``pack_id=None`` exports everything (up to ``limit``); otherwise
         matches a node whose ``pack_id``, ``source``, or ``source_id``
-        property equals ``pack_id``. Result shape:
+        property equals ``pack_id``. ``space=None`` (default) applies no
+        space filter; otherwise every implementation pushes the space
+        equality check into its native query (SQL WHERE / Cypher WHERE)
+        ahead of ``limit``, not after -- filtering client-side post-limit
+        silently undercounts and misreports ``total`` whenever the matching
+        rows happen to sort past the limit boundary (issue #54). Result
+        shape:
             {"props": dict, "labels": [str]}
         (the shape ``_normalise_node()`` in opencrab/pack/neo4j_export.py
         consumes).
+
+        A caller that needs an accurate MATCH COUNT (e.g. to report
+        ``total`` alongside a limited page of rows) must NOT use
+        ``len(export_nodes(..., limit=N))`` -- that is still capped by
+        ``limit`` even with the space/pack_id pushdown above. Use
+        ``count_exported_nodes`` instead, which applies the identical
+        predicate with no LIMIT.
+
+        ``limit <= 0`` (issue #120): every implementation returns ``[]``
+        immediately, without issuing a query. This is the pinned contract
+        for both ``limit=0`` (0 rows requested -> 0 rows returned, checked
+        BEFORE any row is collected -- Kuzu's ``pack_id`` branch used to
+        collect one row before checking) and negative ``limit`` (which has
+        no natural "N rows" meaning; treating it as unbounded would be a
+        footgun -- e.g. SQLite maps a bound ``LIMIT -1`` to "no limit").
+
+        SCOPE OF "BACKEND-WIDE" (issue #120, round 3 -- this line exists
+        because "every implementation" was declared twice before without
+        saying what "every" enumerates, and a 5th and 6th implementation
+        were found missing the guard each time it wasn't spelled out).
+        DOMAIN of this enumeration: PUBLIC methods on the CONCRETE backend
+        classes in ``opencrab/stores/*.py`` that take a parameter literally
+        named ``limit``. Two exclusions from that domain, for DIFFERENT
+        reasons -- do not collapse them:
+          - the Protocol declarations in THIS file (``GraphStore``,
+            ``GraphStoreExtended``) are excluded because there is nothing
+            to guard: their bodies are ``...``. They state the interface;
+            the guard lives in each implementation.
+          - private helpers are excluded on entirely different grounds:
+            they DO contain real executable code, and each one uses its
+            ``limit`` (``_find_neighbors_1hop`` executes one bounded query
+            per directed pass; ``_build_neighbors_cypher`` executes nothing
+            and returns Cypher containing ``LIMIT $limit`` plus params
+            binding ``limit``, for ``find_neighbors`` to run; ``_expand``
+            runs no query at all and slices an already-fetched batch with
+            ``[:remaining]``).
+            They are excluded because production reaches all three ONLY
+            through ``find_neighbors``, which is itself classified below,
+            so their status is decided there. A guard on a helper would be the
+            wrong placement, not a missing one. If any of them ever gains
+            a second public caller, it stops inheriting and needs its own
+            row here.
+        The ``limit <= 0 -> []`` contract is pinned on exactly the methods
+        enumerated below, no more, no less --
+          - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
+            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared),
+            ``KuzuGraphStore``, ``Neo4jStore``.
+          - ``list_nodes`` / ``list_sources`` / ``get_audit_log`` on all 4
+            doc stores: ``_sql_doc_base.py`` (LocalSQLDocStore + PgDocStore,
+            shared), ``MongoStore``, and ``LocalDocStore`` (the legacy
+            JSON store -- NOT reachable through ``factory.py``, but kept
+            for callers that instantiate it directly per that module's own
+            "WHY LocalDocStore IS KEPT" docstring, so it is in scope too).
+          - ``search_nodes`` on 3 of the 4 graph stores, across 2
+            implementations: ``_sql_graph_base.py`` (LocalGraphStore +
+            PGGraphStore, shared) and ``KuzuGraphStore``. ``Neo4jStore`` has
+            no ``search_nodes`` -- see the GAP TABLE above, which is why
+            this is the one covered method that is not "all 4". Guarded by
+            issue #86, not by #120, but it is the same contract and belongs
+            in this enumeration so the list stays exhaustive.
+        Explicitly NOT covered, left as pre-existing/tracked-separately
+        gaps rather than silently absorbed into this contract:
+          - other ``limit``-accepting GRAPH-store methods --
+            ``find_neighbors``, ``find_by_relations`` and ``export_edges``
+            (issue #131).
+          - other ``limit``-accepting DOC-store methods --
+            ``keyword_search``, implemented separately (NOT shared via
+            ``_sql_doc_base.py``) in ``local_sql_doc_store.py`` and
+            ``pg_doc_store.py``; ``MongoStore`` and ``LocalDocStore`` have
+            none. Both implementations overfetch
+            ``max(1, limit) * 5`` rows and then append BEFORE testing
+            ``len(out) >= limit``, so ``limit <= 0`` yields 1 row rather
+            than 0 -- the same append-before-check shape as the Kuzu bug
+            #120 fixed, tracked separately. And ``bm25_fingerprint`` on
+            ``_sql_doc_base.py`` (no graph store implements it), which
+            accepts a ``limit`` but never applies it: it is a whole-table
+            ``COUNT(*)`` staleness probe and a capped count would pin
+            forever once the corpus exceeds the cap (#63) -- so a
+            ``limit <= 0 -> []`` guard there would be a regression, not a
+            fix. See its own docstring.
+          - ``sql_store.py``'s ``get_impacts``, the only limit-accepting
+            method outside the graph/doc surface. It binds a negative
+            ``limit`` straight into ``LIMIT :limit`` (unbounded on SQLite),
+            but belongs to a different subsystem per that module's own
+            docstring: "impact records, ReBAC policy assignments, lever
+            simulations".
+        NOT in the domain at all, so not an exclusion: the vector stores.
+        ``ChromaStore``, ``PgVectorStore`` and ``SqliteVecStore`` have no
+        ``limit`` parameter anywhere -- they bound top-k with ``n_results``.
+        That is a different parameter, so this contract says nothing about
+        it either way; it is not an exclusion, it is out of scope.
+        A future round extending this contract to one of those must add it
+        to this enumeration, not just fix the code.
+        """
+        ...
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Exact count of nodes matching the same ``pack_id``/``space``
+        predicate ``export_nodes`` filters on, with no LIMIT applied
+        (issue #54: a caller reporting ``total`` must not have it capped by
+        whatever display ``limit`` it also passes to ``export_nodes`` --
+        ``len(export_nodes(..., limit=N))`` silently truncates at ``N`` even
+        after the space/pack_id pushdown fix).
+
+        Every implementation runs a real ``COUNT(*)``/``count(n)`` query
+        except ``KuzuGraphStore``'s ``pack_id`` case: ``pack_id`` lives
+        inside a JSON-serialized ``props`` blob Cypher cannot index into (the
+        same limitation ``export_nodes`` has there), so when ``pack_id`` is
+        given, KuzuGraphStore scans every space-matching row (no LIMIT
+        clause -- a cap here would just move issue #54's bug to a bigger
+        number) and counts the Python-filtered result. This guarantee --
+        exact, uncapped, regardless of match count -- holds for every
+        implementation and every argument combination; see
+        ``KuzuGraphStore.count_exported_nodes`` for the tracked scalability
+        follow-up (the pack_id case costs an O(n) scan, not O(1)).
         """
         ...
 

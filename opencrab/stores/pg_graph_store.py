@@ -187,7 +187,14 @@ class PGGraphStore(_SqlGraphStoreBase):
     # ------------------------------------------------------------------
 
     def _batch_frontier_edges(
-        self, conn: Any, frontier_ids: list[str], cap: int, out: bool
+        self,
+        conn: Any,
+        frontier_ids: list[str],
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """One-round-trip candidate fetch for every node in `frontier_ids`.
 
@@ -196,15 +203,22 @@ class PGGraphStore(_SqlGraphStoreBase):
         unnest+LATERAL query. `cap` is `limit` (the traversal's max possible
         "remaining" value) — a safe, hub-safe upper bound; callers still
         apply the live "remaining" cap by slicing the per-node row list.
+
+        When `pack_set`/`space_set` are given, their filters (`_pack_where`,
+        shared with `_SqlGraphStoreBase._fetch_edges_for_node`, and a plain
+        `gn.space_id IN (...)` — `space_id` is a real column, unlike
+        `pack_id`) are joined into the LATERAL subquery itself, so
+        `LIMIT :cap` applies AFTER filtering, not before (issue #62, and
+        issue #52 for the space leg).
         """
         if not frontier_ids:
             return {}
         anchor_col = "from_id" if out else "to_id"
         type_col = "to_type" if out else "from_type"
         id_col = "to_id" if out else "from_id"
-        rows = conn.execute(
-            self._text(
-                f"""
+
+        if pack_set is None and space_set is None:
+            sql = f"""
                 SELECT f.frontier_id, e.c1, e.c2, e.relation, e.properties
                 FROM unnest(CAST(:ids AS text[])) AS f(frontier_id)
                 CROSS JOIN LATERAL (
@@ -214,9 +228,35 @@ class PGGraphStore(_SqlGraphStoreBase):
                     LIMIT :cap
                 ) e
                 """
-            ),
-            {"ids": frontier_ids, "cap": cap},
-        ).fetchall()
+            params: dict[str, Any] = {"ids": frontier_ids, "cap": cap}
+        else:
+            where_clauses: list[str] = []
+            params = {"ids": frontier_ids, "cap": cap}
+            if pack_set is not None:
+                pack_where, pack_params = self._pack_where(
+                    "gn.properties", "ge.properties", pack_set, include_unpackaged, "bf"
+                )
+                where_clauses.append(pack_where)
+                params.update(pack_params)
+            if space_set is not None:
+                placeholders, space_params = self._in_placeholders(sorted(space_set), "bfsp")
+                where_clauses.append(f"gn.space_id IN ({placeholders})")
+                params.update(space_params)
+            extra_where = " AND ".join(where_clauses)
+            sql = f"""
+                SELECT f.frontier_id, e.c1, e.c2, e.relation, e.properties
+                FROM unnest(CAST(:ids AS text[])) AS f(frontier_id)
+                CROSS JOIN LATERAL (
+                    SELECT ge.{type_col} AS c1, ge.{id_col} AS c2, ge.relation, ge.properties
+                    FROM {self._table('graph_edges')} ge
+                    JOIN {self._table('graph_nodes')} gn
+                      ON gn.node_type = ge.{type_col} AND gn.node_id = ge.{id_col}
+                    WHERE ge.{anchor_col} = f.frontier_id AND {extra_where}
+                    LIMIT :cap
+                ) e
+                """
+
+        rows = conn.execute(self._text(sql), params).fetchall()
         out_map: dict[str, list[tuple[str, str, str, Any]]] = {}
         for frontier_id, c1, c2, relation, props in rows:
             out_map.setdefault(frontier_id, []).append((c1, c2, relation, props))
@@ -246,13 +286,21 @@ class PGGraphStore(_SqlGraphStoreBase):
         return {(r[0], r[1]): _merge_space(_as_dict(r[2]), r[3]) for r in rows}
 
     def _prefetch_frontier(
-        self, frontier_ids: list[str], cap: int, out: bool
+        self,
+        frontier_ids: list[str],
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """HOOK override — one short-lived connection, verbatim batched query
         (see module docstring). Do NOT let this fall back to the base's
         per-node default; that would silently regress hub-fanout perf."""
         with self._conn() as conn:
-            return self._batch_frontier_edges(conn, frontier_ids, cap, out)
+            return self._batch_frontier_edges(
+                conn, frontier_ids, cap, out, pack_set, include_unpackaged, space_set
+            )
 
     def _batch_node_props(
         self, pairs: set[tuple[str, str]]

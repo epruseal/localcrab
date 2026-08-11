@@ -89,8 +89,12 @@ def _write_pack_manifest(root: Path, pack_id: str, **fields) -> Path:
 
 
 class TestInit:
+    # init now also bootstraps a local user + token (#144), which touches the
+    # SQL store at LOCAL_DATA_DIR -- these need cli_env (not just cwd
+    # isolation) so they never reach the real default data dir.
+
     # --- Normal ---
-    def test_fresh_dir_creates_env(self, runner):
+    def test_fresh_dir_creates_env(self, cli_env, runner):
         with runner.isolated_filesystem():
             result = runner.invoke(main, ["init"])
             assert result.exit_code == 0
@@ -98,7 +102,7 @@ class TestInit:
             assert "Created" in result.output
 
     # --- Edge ---
-    def test_existing_env_not_clobbered_without_force(self, runner):
+    def test_existing_env_not_clobbered_without_force(self, cli_env, runner):
         with runner.isolated_filesystem():
             Path(".env").write_text("CUSTOM=1\n")
             result = runner.invoke(main, ["init"])
@@ -106,13 +110,231 @@ class TestInit:
             assert Path(".env").read_text() == "CUSTOM=1\n"
             assert "already exists" in result.output
 
-    def test_force_overwrites_existing_env(self, runner):
+    def test_force_overwrites_existing_env(self, cli_env, runner):
         with runner.isolated_filesystem():
             Path(".env").write_text("CUSTOM=1\n")
             result = runner.invoke(main, ["init", "--force"])
             assert result.exit_code == 0
             assert Path(".env").read_text() != "CUSTOM=1\n"
             assert "Created" in result.output
+
+
+class TestInitBootstrap:
+    """#144: 'opencrab init' bootstraps the local owner user + token once."""
+
+    def test_bootstraps_local_user_and_prints_token_once(self, cli_env, runner):
+        with runner.isolated_filesystem():
+            result = runner.invoke(main, ["init"])
+        assert result.exit_code == 0
+        assert "Bootstrap token" in result.output
+        assert "lc_" in result.output
+
+        from opencrab.auth import list_users
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        users = list_users(sql)
+        assert len(users) == 1
+        assert users[0]["is_local"] is True
+
+    def test_second_run_is_idempotent(self, cli_env, runner):
+        with runner.isolated_filesystem():
+            first = runner.invoke(main, ["init"])
+            assert first.exit_code == 0
+            second = runner.invoke(main, ["init", "--force"])
+        assert second.exit_code == 0
+        assert "already bootstrapped" in second.output
+        assert "Bootstrap token" not in second.output
+
+        from opencrab.auth import list_users
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        users = list_users(sql)
+        assert len(users) == 1
+
+    def test_init_fails_when_sql_store_unavailable(self, cli_env, runner):
+        """3c: init must FAIL (non-zero) when the SQL store is unavailable,
+        not silently skip the bootstrap and report success."""
+        unavailable_sql = MagicMock()
+        unavailable_sql.available = False
+
+        with runner.isolated_filesystem():
+            with patch(
+                "opencrab.stores.factory.make_sql_store", return_value=unavailable_sql
+            ):
+                result = runner.invoke(main, ["init"])
+
+        assert result.exit_code != 0
+        assert "unavailable" in result.output.lower()
+
+    def test_revoking_all_tokens_then_init_does_not_reissue(self, cli_env, runner):
+        """Re-running init after revoking every token must not print a new
+        token or create a second local user -- reissuing would silently
+        undo an operator's deliberate revoke."""
+        from opencrab.auth import list_tokens, list_users, revoke_token
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        with runner.isolated_filesystem():
+            first = runner.invoke(main, ["init"])
+            assert first.exit_code == 0
+
+            sql = make_sql_store(get_settings())
+            user_id = list_users(sql)[0]["user_id"]
+            for t in list_tokens(sql, user_id):
+                revoke_token(sql, t["token_id"])
+
+            second = runner.invoke(main, ["init", "--force"])
+            assert second.exit_code == 0
+            assert "already bootstrapped" in second.output
+            assert "Bootstrap token" not in second.output
+
+            users = list_users(sql)
+            assert len(users) == 1
+            tokens_after = list_tokens(sql, user_id)
+            assert len(tokens_after) == 1
+            assert tokens_after[0]["revoked_at"] is not None
+
+    def test_concurrent_init_race_lands_on_a_single_local_user(self, cli_env, runner):
+        """3e: two concurrent inits both see "no local user" and both try
+        to insert one. Simulated deterministically: seed a local user
+        directly (the "winner"), then force this init's idempotency check
+        to see None on its first read (as a real racer would) so it
+        proceeds to insert and hits the real unique-index violation. cli.py
+        must catch ONLY that violation and re-read (a fresh connection) to
+        discover the winner's row -- not fail, not create a second one."""
+        from opencrab.auth import bootstrap_local_user, get_local_user
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        with runner.isolated_filesystem():
+            cfg = get_settings()
+            sql = make_sql_store(cfg)
+            winner_user_id, _ = bootstrap_local_user(sql)
+
+            real_get_local_user = get_local_user
+            calls = {"n": 0}
+
+            def fake_get_local_user(s):
+                calls["n"] += 1
+                return None if calls["n"] == 1 else real_get_local_user(s)
+
+            with patch("opencrab.auth.get_local_user", side_effect=fake_get_local_user):
+                result = runner.invoke(main, ["init"])
+
+        assert result.exit_code == 0
+        assert "already bootstrapped" in result.output
+
+        from opencrab.auth import list_users
+
+        users = list_users(sql)
+        assert len(users) == 1
+        assert users[0]["user_id"] == winner_user_id
+
+
+# ---------------------------------------------------------------------------
+# user / token (#144)
+# ---------------------------------------------------------------------------
+
+
+class TestUserTokenCLI:
+    # --- Normal ---
+    def test_add_list_disable_user(self, cli_env, runner):
+        add = runner.invoke(main, ["user", "add", "Alice"])
+        assert add.exit_code == 0
+        user_id = json.loads(add.output)["user_id"]
+
+        listing = runner.invoke(main, ["user", "list"])
+        assert listing.exit_code == 0
+        assert user_id in listing.output
+
+        disable = runner.invoke(main, ["user", "disable", user_id])
+        assert disable.exit_code == 0
+        assert "Disabled" in disable.output
+
+    def test_issue_list_revoke_token(self, cli_env, runner):
+        user_id = json.loads(runner.invoke(main, ["user", "add", "Bob"]).output)["user_id"]
+
+        issued = runner.invoke(main, ["token", "issue", user_id, "--name", "cli-test"])
+        assert issued.exit_code == 0
+        assert "lc_" in issued.output
+
+        listing = runner.invoke(main, ["token", "list", user_id])
+        assert listing.exit_code == 0
+        assert "cli-test" in listing.output
+        assert "lc_" not in listing.output  # secret never listed
+
+        from opencrab.auth import list_tokens
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        token_id = list_tokens(sql, user_id)[0]["token_id"]
+
+        revoked = runner.invoke(main, ["token", "revoke", token_id])
+        assert revoked.exit_code == 0
+        assert "Revoked" in revoked.output
+
+    def test_user_disable_enable_round_trip(self, cli_env, runner):
+        user_id = json.loads(runner.invoke(main, ["user", "add", "Carol"]).output)["user_id"]
+
+        disable = runner.invoke(main, ["user", "disable", user_id])
+        assert disable.exit_code == 0
+
+        enable = runner.invoke(main, ["user", "enable", user_id])
+        assert enable.exit_code == 0
+        assert "Enabled" in enable.output
+
+        # Both surfaces, because they can drift: the store says disabled is
+        # False again, and `user list` -- the only way an operator actually
+        # sees it -- reports the same.
+        from opencrab.auth import list_users
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        row = [u for u in list_users(sql) if u["user_id"] == user_id][0]
+        assert row["disabled"] is False
+
+        listing = runner.invoke(main, ["user", "list"])
+        assert listing.exit_code == 0
+        # `user list` renders a rich table (unlike `user add`, which emits
+        # JSON), so assert on the row: this user is neither local nor
+        # disabled, so its row must carry no "True" at all. Fails if either
+        # flag column regresses.
+        row_line = [ln for ln in listing.output.splitlines() if user_id in ln]
+        assert len(row_line) == 1, listing.output
+        assert "True" not in row_line[0], row_line[0]
+
+    # --- Edge ---
+    def test_disable_unknown_user_exits_nonzero(self, cli_env, runner):
+        result = runner.invoke(main, ["user", "disable", "user_doesnotexist"])
+        assert result.exit_code != 0
+        assert "No such user" in result.output
+
+    def test_enable_unknown_user_exits_nonzero(self, cli_env, runner):
+        result = runner.invoke(main, ["user", "enable", "user_doesnotexist"])
+        assert result.exit_code != 0
+        assert "No such user" in result.output
+
+    # --- Error: 3g CLI error surfacing for the new auth.py exceptions ---
+    def test_token_issue_unknown_user_clear_error_no_traceback(self, cli_env, runner):
+        result = runner.invoke(main, ["token", "issue", "user_doesnotexist"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "Could not issue token" in result.output
+
+    def test_token_issue_disabled_user_clear_error_no_traceback(self, cli_env, runner):
+        user_id = json.loads(runner.invoke(main, ["user", "add", "Dana"]).output)["user_id"]
+        runner.invoke(main, ["user", "disable", user_id])
+
+        result = runner.invoke(main, ["token", "issue", user_id])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "Could not issue token" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +345,63 @@ class TestInit:
 class TestStatus:
     # --- Normal ---
     def test_fresh_local_dir_reports_ok_for_all_stores(self, cli_env, runner):
-        """Fresh LOCAL_DATA_DIR: graph/vector/docs/sql are all local-SQLite
-        backed and self-create on first use, so all four must report OK."""
+        """Fresh LOCAL_DATA_DIR: graph/vector/docs/sql/billing are all local-
+        SQLite backed and self-create on first use, so all five must report
+        OK. billing_events lives in its own file (billing.db, issue #105) so
+        it gets its own row alongside the other four."""
         result = runner.invoke(main, ["status"])
         assert result.exit_code == 0
         assert "LOCAL MODE" in result.output
         assert "UNAVAILABLE" not in result.output
-        assert result.output.count("OK") == 4
+        assert "Billing" in result.output
+        assert result.output.count("OK") == 5
+
+    # --- Error ---
+    def test_billing_store_unavailable_is_reported_not_swallowed(self, cli_env, runner):
+        """issue #105 codex follow-up: billing.db can fail independently of
+        the main SQL store now that it's a separate file (corrupt file, a
+        permission problem specific to that one path). Before this fix,
+        `status` never looked at the billing store at all, so it could
+        report every configured store healthy while billing_events was
+        completely dead. Pin that an unavailable billing store shows up."""
+        from unittest.mock import MagicMock
+
+        broken_billing_store = MagicMock()
+        broken_billing_store.available = False
+
+        with patch("opencrab.stores.factory.make_billing_sql_store", return_value=broken_billing_store):
+            result = runner.invoke(main, ["status"])
+
+        assert result.exit_code == 0
+        assert "Billing" in result.output
+        assert "UNAVAILABLE" in result.output
+
+    def test_billing_table_creation_failure_is_reported(self, cli_env, runner):
+        """Narrower than the connection-level case above: the billing store
+        itself connects fine (available=True) but BillingHooks couldn't
+        create billing_events (e.g. disk full, a permissions problem on
+        CREATE TABLE specifically). This must be distinguishable from a
+        healthy store, not silently reported as OK."""
+        from unittest.mock import MagicMock
+
+        store_that_connects_but_cant_create_tables = MagicMock()
+        store_that_connects_but_cant_create_tables.available = True
+        store_that_connects_but_cant_create_tables._engine.begin.side_effect = RuntimeError("disk full")
+
+        with patch(
+            "opencrab.stores.factory.make_billing_sql_store",
+            return_value=store_that_connects_but_cant_create_tables,
+        ):
+            result = runner.invoke(main, ["status"])
+
+        assert result.exit_code == 0
+        # Rich wraps the status cell across lines at narrow widths and
+        # re-draws box-border characters on the continuation line, so check
+        # each word rather than one contiguous phrase.
+        assert "Billing" in result.output
+        assert "UNAVAILABLE" in result.output
+        assert "table" in result.output
+        assert "creation failed" in result.output
 
 
 # ---------------------------------------------------------------------------

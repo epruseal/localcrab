@@ -77,6 +77,7 @@ def ontology_manifest() -> dict[str, Any]:
         },
     },
     order=1,
+    writes=True,
 )
 def ontology_add_node(
     space: str,
@@ -105,6 +106,7 @@ def ontology_add_node(
         Optional subject performing the write (stamped into properties).
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import graph_write_failed
     from opencrab.ontology.tenant import TenantContext, stamp_properties
 
     ctx = _get_context()
@@ -121,7 +123,25 @@ def ontology_add_node(
             properties=props,
             subject_id=subject_id,
         )
-        ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
+        # #66 codex re-review (finding [8]): this sibling of
+        # ontology_add_edge had the exact same fail-open bug — add_node()
+        # never raises for a per-store failure (builder.py's module
+        # docstring), so a bare "no exception -> bill" call here charged for
+        # nodes that never landed in the graph. Same graph-only,
+        # fail-closed gate as ontology_add_edge/harness_promotion_apply.
+        if not graph_write_failed(result.get("stores") or {}):
+            billing_result = ctx["billing"].on_node_write(tenant_id, subject_id, space, node_type)
+            if not billing_result.get("ok"):
+                # #105: emit() is fire-and-forget by design and never raises,
+                # but a failed persist must not vanish with only
+                # BillingHooks' own internal log line — surface it here too
+                # so this handler's own log context (tenant/space/node_type)
+                # is attached. Does not fail the write: the node write
+                # already succeeded above.
+                logger.warning(
+                    "on_node_write billing event failed to persist (tenant=%s, space=%s, node_type=%s): %s",
+                    tenant_id, space, node_type, billing_result.get("error"),
+                )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:
@@ -147,11 +167,20 @@ def ontology_add_node(
                 "to_space": {"type": "string", "description": "Target node space."},
                 "to_id": {"type": "string", "description": "Target node ID."},
                 "properties": {"type": "object", "description": "Optional edge properties."},
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
         },
     },
     order=2,
+    writes=True,
 )
 def ontology_add_edge(
     from_space: str,
@@ -160,6 +189,8 @@ def ontology_add_edge(
     to_space: str,
     to_id: str,
     properties: dict[str, Any] | None = None,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add a directed edge between two ontology nodes.
@@ -181,21 +212,51 @@ def ontology_add_edge(
         ID of the target node.
     properties:
         Optional edge properties.
+    tenant_id:
+        Tenant identifier for multi-tenant isolation (default: 'default').
+    subject_id:
+        Optional subject performing the write (for billing/audit — not
+        stamped into edge properties, unlike ontology_add_node).
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import graph_write_failed
 
     ctx = _get_context()
     from_id = _clean_str(from_id)
     to_id = _clean_str(to_id)
+    relation = _clean_str(relation)
     try:
         result = ctx["builder"].add_edge(
             from_space=_clean_str(from_space),
             from_id=from_id,
-            relation=_clean_str(relation),
+            relation=relation,
             to_space=_clean_str(to_space),
             to_id=to_id,
             properties=_clean_meta(properties or {}),
+            subject_id=subject_id,
         )
+        # #66 hardening: builder.add_edge() never raises for a per-store
+        # failure (missing endpoint / store down all come back as a string
+        # inside result["stores"], see builder.py's module docstring) — a
+        # bare "no exception -> bill" would charge for edges that never
+        # landed anywhere. graph_write_failed() reads the SAME store-status
+        # map ontology_add_edge already returns to the caller, so a rejected
+        # write ("no match (missing node: ...)" / "error: ..." / graph
+        # "unavailable") is never billed. Optional-store-only failures
+        # (docs) still bill — the edge exists in the graph either way.
+        if not graph_write_failed(result.get("stores") or {}):
+            billing_result = ctx["billing"].on_edge_write(tenant_id, subject_id, relation)
+            if not billing_result.get("ok"):
+                # #105: emit() is fire-and-forget by design and never raises,
+                # but a failed persist must not vanish with only
+                # BillingHooks' own internal log line — surface it here too
+                # so this handler's own log context (tenant/relation) is
+                # attached. Does not fail the write: the edge write already
+                # succeeded above.
+                logger.warning(
+                    "on_edge_write billing event failed to persist (tenant=%s, relation=%s): %s",
+                    tenant_id, relation, billing_result.get("error"),
+                )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
     except ValueError as exc:
@@ -246,7 +307,11 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     "ontology_list_nodes",
     {
         "description": (
-            "List nodes from the doc store, optionally filtered by space and/or pack_id. "
+            "List nodes, optionally filtered by space and/or pack_id. Without pack_id, lists "
+            "from the doc store. With pack_id, lists from the graph store, and `total` in the "
+            "response is the TRUE count of all matching nodes -- it is NOT capped by `limit` "
+            "and can be larger than the number of `nodes` actually returned; if `total` "
+            "exceeds len(nodes), the page was truncated and a larger `limit` will return more. "
             "Useful for inspecting a pack's contents after ingest."
         ),
         "inputSchema": {
@@ -254,7 +319,20 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
             "properties": {
                 "space": {"type": "string", "description": "Optional MetaOntology space filter (e.g. evidence, concept)."},
                 "pack_id": {"type": "string", "description": "Optional pack_id filter."},
-                "limit": {"type": "integer", "description": "Maximum results (default 100).", "default": 100},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum number of `nodes` rows returned (default 100). WITH pack_id: "
+                        "does NOT cap `total`, which is the full match count regardless of "
+                        "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
+                        "IS capped at `limit` (total == len(nodes) always in that case). "
+                        "0 or negative values are not an error -- they return an empty `nodes` "
+                        "page (issue #120). This server does not validate `limit` against this "
+                        "schema before calling the handler, so a negative value is never "
+                        "rejected outright; it is simply defined to mean 'no rows'."
+                    ),
+                    "default": 100,
+                },
             },
             "required": [],
         },
@@ -268,11 +346,68 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
-    When pack_id is given, queries the graph store's export_nodes(pack_id=...)
-    (all four backends implement it — see opencrab/stores/_graph_protocol.py)
-    which uses an indexed/native pack_id filter — avoids the limit-before-
-    filter bug that would occur if we fetched N rows then Python-filtered.
-    When pack_id is absent, falls back to the doc store's list_nodes.
+    WITH pack_id: this calls (in this order, matching the code below) the
+    graph store's count_exported_nodes(pack_id=..., space=..., no LIMIT)
+    first for ``total``, THEN export_nodes(pack_id=..., space=..., limit=...)
+    for the displayed page. All three concrete backends (SQL-backed
+    local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j, ``pack_id``
+    too) into their native query ahead of ``limit`` — see each backend's
+    export_nodes and the shared contract in opencrab/stores/_graph_protocol.py
+    — so the returned rows are correct before truncation instead of being
+    Python-filtered after (issue #54; same class of bug #62 fixed for
+    find_neighbors' pack filter). ``total`` is deliberately NOT
+    ``len(nodes)``: that would still be capped at ``limit`` even with the
+    pushdown fix, which is the actual bug #54 reported (a caller cannot
+    tell "5 of 5 matches" from "5 of 3000 matches, truncated" from the row
+    count alone) — count_exported_nodes runs the identical filter with no
+    LIMIT so ``total`` is the true match count.
+
+    WITHOUT pack_id: falls back to the doc store's list_nodes, and ``total``
+    IS ``len(nodes)`` — i.e. IS capped at ``limit``, same failure mode #54
+    reported, just in a different subsystem (doc store, not graph store).
+    Judged and left unfixed here (audit finding, MCP-visibility round):
+    structurally this is NOT impossible to fix the same way — the SQL-backed
+    doc stores (LocalSQLDocStore/PgDocStore, both opencrab/stores/
+    _sql_doc_base.py) could grow a real ``COUNT(*) WHERE space=...``
+    sibling to ``list_nodes``, mirroring count_exported_nodes exactly, and
+    MongoStore (docker mode) has ``count_documents()`` for the same
+    purpose. It is left out of this fix because it is a different
+    subsystem than #54's named scope (graph.py's pack_id+space path +
+    _sql_graph_base.py's export_nodes), touching three more backend files
+    with their own test suites — a same-sized second effort, not a small
+    extension of this one. Tracked as a follow-up, not silently accepted:
+    the MCP ``description`` and ``limit`` parameter description (the part
+    of this contract an MCP client actually sees -- this docstring is
+    developer-only and never reaches a client) both say plainly that
+    ``total`` is limit-capped in the no-pack_id case, so no caller is told
+    a false "always accurate" guarantee in the meantime.
+
+    ``limit <= 0`` (issue #120 follow-up): both branches return ``[]`` (and
+    doc-store's ``total`` is then ``0`` too, since it's ``len(nodes)`` in
+    that branch) -- the WITH-pack_id and WITHOUT-pack_id paths agree here
+    even though they disagree on ``total`` semantics above. This wasn't
+    true for every doc-store backend when the WITH-pack_id side of this
+    contract first landed: MongoStore's ``list_nodes`` passed ``limit``
+    straight to pymongo's ``Cursor.limit()``, where ``0`` means "no limit"
+    (the opposite of this contract) -- same footgun class as SQLite mapping
+    a bound ``LIMIT -1`` to "no limit" in ``_sql_doc_base.py``, just
+    triggered by a different value. All three doc-store backends
+    (LocalSQLDocStore/PgDocStore via ``_sql_doc_base.py``, MongoStore) now
+    guard ``limit <= 0`` before querying, matching the graph store side.
+
+    SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
+    export_nodes are two separate queries, not wrapped in one transaction/
+    snapshot. A write landing on the same pack_id/space between them can
+    make ``total`` and ``len(nodes)`` momentarily disagree (e.g. a node
+    inserted in that gap is counted in ``total`` but missed by the already-
+    issued ``export_nodes`` page, or vice versa for a delete). This is a
+    deliberate tradeoff, not an oversight: a cross-query transaction here
+    would need to work uniformly across three backends with different
+    transaction/snapshot primitives (SQL, Kuzu, Neo4j) for a single-user,
+    mostly-read MCP tool call, which is not worth the complexity for a
+    momentary, self-correcting inconsistency (the next call reflects
+    current state). Callers must not assume ``total`` and ``len(nodes)``
+    are always perfectly reconciled under concurrent writes.
     """
     from opencrab.mcp.tools import _clean_str, _get_context
 
@@ -281,12 +416,22 @@ def ontology_list_nodes(
     cleaned_space = _clean_str(space) if space else None
 
     nodes: list[dict[str, Any]] = []
+    total = 0
 
     if pack_id:
-        # Graph store: indexed/native pack_id filter → correct count before limit
-        raw = ctx["neo4j"].export_nodes(pack_id=pack_id, limit=limit)
+        graph_store = ctx["neo4j"]
+        # True match count, independent of `limit` (issue #54's core
+        # requirement -- see this function's docstring).
+        total = graph_store.count_exported_nodes(pack_id=pack_id, space=cleaned_space)
+        # Graph store: indexed/native pack_id + space filter → correct rows
+        # before limit (all three backends implement the same contract, see
+        # _graph_protocol.py#export_nodes).
+        raw = graph_store.export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
-        # normalise to same shape as doc store list_nodes
+        # normalise to same shape as doc store list_nodes. The space check
+        # below is now redundant with the backend's own filter (kept as
+        # cheap defense-in-depth, same spirit as _expand()'s redundant
+        # pack_set check in _sql_graph_base.py) rather than load-bearing.
         for item in raw:
             props = item.get("props") or {}
             labels = item.get("labels") or []
@@ -304,10 +449,11 @@ def ontology_list_nodes(
     else:
         # Doc store fallback (no pack_id filter requested)
         nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
+        total = len(nodes)
 
     return {
         "nodes": nodes,
-        "total": len(nodes),
+        "total": total,
         "space_filter": space,
         "pack_id_filter": pack_id,
     }
@@ -324,7 +470,18 @@ def ontology_list_nodes(
             "type": "object",
             "properties": {
                 "pack_id": {"type": "string", "description": "Optional pack_id filter."},
-                "limit": {"type": "integer", "description": "Maximum results (default 200).", "default": 200},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum results (default 200). Unlike ontology_list_nodes, 0 or "
+                        "negative values here are NOT yet defined to return an empty page -- "
+                        "export_edges' store-side guard for issue #120 is a separate, not-yet-"
+                        "landed fix (tracked in a follow-up issue); a negative value's behavior "
+                        "is backend-dependent today and may return the entire edge set. Do not "
+                        "rely on 0/negative here until that follow-up lands."
+                    ),
+                    "default": 200,
+                },
             },
             "required": [],
         },

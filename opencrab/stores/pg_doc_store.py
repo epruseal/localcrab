@@ -192,7 +192,13 @@ class PgDocStore(_SqlDocStoreBase):
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
         limit: int = 20,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """``spaces`` (issue #52): strict space-membership filter pushed into
+        the WHERE clause (``metadata->>'space' IN (...)``) ahead of LIMIT —
+        see ``LocalSQLDocStore.keyword_search``'s docstring for why this
+        differs from the pack filter below (an established Python
+        post-filter over an overfetched set)."""
         if not self._available or not self._kw_ok:
             return []
 
@@ -204,6 +210,13 @@ class PgDocStore(_SqlDocStoreBase):
         overfetch = max(1, limit) * 5
         table = self._table("doc_sources")
 
+        space_where = ""
+        space_params: dict[str, Any] = {}
+        if spaces:
+            placeholders = ", ".join(f":sp{i}" for i in range(len(spaces)))
+            space_where = f" AND metadata->>'space' IN ({placeholders})"
+            space_params = {f"sp{i}": s for i, s in enumerate(spaces)}
+
         try:
             with self._conn() as conn:
                 if short_token:
@@ -211,13 +224,13 @@ class PgDocStore(_SqlDocStoreBase):
                     params: dict[str, Any] = {
                         f"t{i}": f"%{t}%" for i, t in enumerate(toks)
                     }
-                    params.update({"qraw": query, "lim": overfetch})
+                    params.update({"qraw": query, "lim": overfetch, **space_params})
                     rows = conn.execute(
                         self._text(
                             f"""
                             SELECT source_id, text, metadata, similarity(text, :qraw) AS rank
                             FROM {table}
-                            WHERE {conditions}
+                            WHERE ({conditions}){space_where}
                             ORDER BY rank DESC
                             LIMIT :lim
                             """
@@ -231,12 +244,12 @@ class PgDocStore(_SqlDocStoreBase):
                             SELECT source_id, text, metadata,
                                    ts_rank(to_tsvector('simple', text), plainto_tsquery('simple', :q)) AS rank
                             FROM {table}
-                            WHERE to_tsvector('simple', text) @@ plainto_tsquery('simple', :q)
+                            WHERE to_tsvector('simple', text) @@ plainto_tsquery('simple', :q){space_where}
                             ORDER BY rank DESC
                             LIMIT :lim
                             """
                         ),
-                        {"q": query, "lim": overfetch},
+                        {"q": query, "lim": overfetch, **space_params},
                     ).fetchall()
         except Exception as exc:
             logger.warning("keyword_search failed: %s", exc)

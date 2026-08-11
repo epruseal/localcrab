@@ -32,7 +32,12 @@ _TYPE_TEMPLATE_HEADER = """\
 """
 
 
-def _build_type_schema(pack: dict[str, Any], node_type: str) -> dict[str, Any]:
+def _build_type_schema(
+    pack: dict[str, Any],
+    node_type: str,
+    extra_required: list[str] | None = None,
+    extra_optional: list[str] | None = None,
+) -> dict[str, Any]:
     """Build a validator-compatible schema dict for *node_type* from *pack*.
 
     Uses ``type_specs`` in the pack manifest (per-type space/required/optional)
@@ -40,19 +45,55 @@ def _build_type_schema(pack: dict[str, Any], node_type: str) -> dict[str, Any]:
     name/description/status shape otherwise. Output mirrors the hand-written
     schemas in schemas/types/ (type/version/space/properties) so
     grammar.validator.validate_node_properties actually enforces it.
+
+    *extra_required*/*extra_optional* let a legacy-stub migration carry over
+    field names the manifest doesn't define -- e.g. a field a user added by
+    hand to a previously-installed stub. Required wins if a name appears in
+    both.
+
+    Legacy shape only ever stored flat field-name lists -- no per-field type,
+    so these extra fields get NO ``type``: inventing "string" would be a
+    guess, and grammar.validator.validate_node_properties now actually
+    enforces declared types (#48), so a wrong guess would reject real data
+    (e.g. a numeric field the user marked required). Omitting ``type``
+    entirely, rather than declaring an unknown-to-the-validator type name,
+    is deliberate: the validator's type-check loop only runs when
+    ``spec.get("type")`` is not None, so an absent key skips the check
+    silently (no per-node warning-log spam), while presence + required-ness
+    are still enforced.
+
+    No property here ever gets a ``nullable`` key, manifest-defined or
+    extra. It is not read anywhere in this repo (validate_node_properties
+    only looks at ``required``/``default``/``enum``/``type`` -- confirmed by
+    reading the function; tracked as issue #106), and it duplicated
+    ``required`` (required -> non-nullable, optional -> nullable) instead of
+    being derived from it. That duplication is exactly what regressed when a
+    manifest-optional field got promoted to required by *extra_required*
+    below: the promotion flipped ``required`` but not the already-written
+    ``nullable``, producing a self-contradictory required-and-nullable
+    schema. One key can't disagree with itself.
     """
     type_specs = pack.get("type_specs", {}) or {}
     spec = type_specs.get(node_type, {}) or {}
     default_space = (pack.get("spaces") or ["concept"])[0]
     space = spec.get("space", default_space)
-    required_fields = spec.get("required") or ["name"]
-    optional_fields = spec.get("optional") or ["description", "status"]
+    required_fields = list(spec.get("required") or ["name"])
+    optional_fields = list(spec.get("optional") or ["description", "status"])
 
     properties: dict[str, Any] = {}
     for field_name in required_fields:
-        properties[field_name] = {"type": "string", "required": True, "nullable": False}
+        properties[field_name] = {"type": "string", "required": True}
     for field_name in optional_fields:
-        properties[field_name] = {"type": "string", "required": False, "nullable": True}
+        properties[field_name] = {"type": "string", "required": False}
+
+    for field_name in extra_required or []:
+        if field_name in properties:
+            properties[field_name]["required"] = True
+        else:
+            properties[field_name] = {"required": True}
+    for field_name in extra_optional or []:
+        if field_name not in properties:
+            properties[field_name] = {"required": False}
 
     return {
         "type": node_type,
@@ -61,6 +102,34 @@ def _build_type_schema(pack: dict[str, Any], node_type: str) -> dict[str, Any]:
         "pack": pack["name"],
         "properties": properties,
     }
+
+
+def _is_legacy_shape(data: Any) -> bool:
+    """Return True if *data* is a dict with legacy required/optional and no properties.
+
+    Older versions of ``_build_type_schema`` wrote ``node_type/pack/required/
+    optional`` with no ``properties`` mapping. ``validate_node_properties``
+    only reads ``schema.get("properties", {})``, so those stubs validate as
+    a permanent no-op. Guards against non-dict YAML (a bare list/scalar is
+    valid YAML but has no ``.get``) by just saying "not legacy shape".
+    """
+    return (
+        isinstance(data, dict)
+        and "properties" not in data
+        and ("required" in data or "optional" in data)
+    )
+
+
+def _has_generation_marker(content: str, pack_name: str) -> bool:
+    """Return True if *content* carries this tool's own generated-file header.
+
+    This -- not the ``pack:`` YAML field -- is what makes a file safe to
+    overwrite. A user could hand-write ``pack: biomedical`` into their own
+    customised file (e.g. copy-pasted from a real stub), so the field alone
+    is not proof install_pack produced it. The literal header comment from
+    ``_TYPE_TEMPLATE_HEADER`` is under this tool's exclusive control.
+    """
+    return content.startswith(f"# Auto-generated by schema pack '{pack_name}'")
 
 
 def list_packs() -> list[dict[str, Any]]:
@@ -104,9 +173,30 @@ def install_pack(name: str) -> dict[str, Any]:
     Install a schema pack by generating type YAML files.
 
     Each type in the pack gets a stub schema written to schemas/types/.
-    Existing schemas are NOT overwritten (safety: user customisations preserved).
+    Existing schemas are NOT overwritten -- unless they are a legacy-shape
+    stub (required/optional, no properties) that also carries this tool's
+    own generation header (see ``_is_legacy_shape`` / ``_has_generation_marker``),
+    in which case they are regenerated in place ("migrated") since the old
+    shape made validation a permanent no-op. A legacy-shape file WITHOUT
+    that header is left untouched and only warned about, since it could be
+    hand-written (the ``pack:`` field alone is not proof install_pack wrote
+    it -- a user can type that too). A generation-header stub can also have
+    been hand-edited *after* install (a natural way to add a constraint) --
+    migrating never drops a required/optional field the old file had, even
+    if the pack manifest doesn't define it: any such extra field is carried
+    over into the new ``properties`` and reported in
+    ``preserved_extra_fields``, decided before anything is written to disk.
 
-    Returns a result dict with created/skipped counts.
+    The reverse edit -- a user removing a manifest-required field from the
+    stub's ``required``/``optional`` lists -- is NOT honoured: a file that no
+    longer declares the pack's own required fields isn't this pack's schema
+    to keep incomplete, and re-deciding that is not migration's call. The
+    manifest's fields are always regenerated. But that revival is not silent:
+    any manifest-required field the old file no longer required (dropped
+    entirely or demoted to ``optional``) is reported in
+    ``revived_manifest_fields``, again decided before the write.
+
+    Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
     if not pack:
@@ -117,17 +207,90 @@ def install_pack(name: str) -> dict[str, Any]:
     _TYPES_DIR.mkdir(parents=True, exist_ok=True)
 
     created = []
+    migrated = []
     skipped = []
+    preserved_extra_fields: dict[str, dict[str, list[str]]] = {}
+    revived_manifest_fields: dict[str, dict[str, list[str]]] = {}
 
     for node_type in pack.get("types", []):
         path = _TYPES_DIR / f"{node_type}.yaml"
-        if path.exists():
-            skipped.append(node_type)
-            continue
         header = _TYPE_TEMPLATE_HEADER.format(
             pack_name=pack["name"],
             pack_version=pack.get("version", "1.0.0"),
         )
+        if path.exists():
+            try:
+                existing_content = path.read_text(encoding="utf-8")
+                existing = yaml.safe_load(existing_content)
+            except Exception as exc:
+                logger.warning("Pack '%s': failed to read existing schema for %s: %s", name, node_type, exc)
+                skipped.append(node_type)
+                continue
+            if not _is_legacy_shape(existing):
+                skipped.append(node_type)
+                continue
+            if not _has_generation_marker(existing_content, name):
+                logger.warning(
+                    "Pack '%s': %s has a legacy shape (required/optional, no "
+                    "properties) but lacks this tool's generation header, so "
+                    "it will NOT be auto-migrated -- it may be hand-written. "
+                    "Inspect it manually and add `properties` yourself.",
+                    name, node_type,
+                )
+                skipped.append(node_type)
+                continue
+
+            # Decide what would change BEFORE writing anything.
+            old_required = existing.get("required") or []
+            old_optional = existing.get("optional") or []
+            manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
+            manifest_required = manifest_spec.get("required") or ["name"]
+            manifest_optional = manifest_spec.get("optional") or ["description", "status"]
+
+            # Fields the user added that the manifest doesn't define -- kept.
+            extra_required = [f for f in old_required if f not in manifest_required]
+            extra_optional = [
+                f
+                for f in old_optional
+                if f not in manifest_optional and f not in manifest_required and f not in extra_required
+            ]
+            # Manifest-required fields the old file no longer required --
+            # dropped from `required` entirely, or just demoted to
+            # `optional`. Migration always regenerates the manifest's own
+            # required fields (a file missing them isn't this pack's schema
+            # anymore, and un-requiring is not migration's call to make), so
+            # these come back required. Not honouring the removal, but not
+            # silent about it either. The optional side is informational
+            # only (no enforcement consequence either way).
+            revived_required = [f for f in manifest_required if f not in old_required]
+            revived_optional = [
+                f for f in manifest_optional if f not in old_required and f not in old_optional
+            ]
+
+            schema = _build_type_schema(
+                pack, node_type, extra_required=extra_required, extra_optional=extra_optional
+            )
+            content = header + yaml.safe_dump(schema, sort_keys=False, allow_unicode=True)
+            path.write_text(content, encoding="utf-8")
+            migrated.append(node_type)
+            if extra_required or extra_optional:
+                preserved_extra_fields[node_type] = {"required": extra_required, "optional": extra_optional}
+                logger.info(
+                    "Pack '%s': migrated %s, carried over user-added field(s) not in the "
+                    "pack manifest -- required=%r optional=%r",
+                    name, node_type, extra_required, extra_optional,
+                )
+            if revived_required or revived_optional:
+                revived_manifest_fields[node_type] = {"required": revived_required, "optional": revived_optional}
+                logger.warning(
+                    "Pack '%s': migrated %s, re-added manifest field(s) that were missing from "
+                    "the old file's required/optional lists -- required=%r optional=%r "
+                    "(migration does not honour dropping a pack's own fields)",
+                    name, node_type, revived_required, revived_optional,
+                )
+            if not (extra_required or extra_optional or revived_required or revived_optional):
+                logger.info("Pack '%s': migrated legacy-shape schema for %s", name, node_type)
+            continue
         schema = _build_type_schema(pack, node_type)
         content = header + yaml.safe_dump(schema, sort_keys=False, allow_unicode=True)
         path.write_text(content, encoding="utf-8")
@@ -137,7 +300,7 @@ def install_pack(name: str) -> dict[str, Any]:
     # Invalidate loader cache
     try:
         from opencrab.schemas.loader import reload_schema
-        for t in created:
+        for t in created + migrated:
             reload_schema(t)
     except Exception as exc:
         logger.warning("Pack '%s': failed to reload schema cache: %s", name, exc)
@@ -146,7 +309,10 @@ def install_pack(name: str) -> dict[str, Any]:
         "pack": name,
         "version": pack.get("version"),
         "created": created,
+        "migrated": migrated,
         "skipped": skipped,
+        "preserved_extra_fields": preserved_extra_fields,
+        "revived_manifest_fields": revived_manifest_fields,
         "total_types": len(pack.get("types", [])),
     }
 

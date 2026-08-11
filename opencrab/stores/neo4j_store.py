@@ -13,6 +13,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
+from opencrab.stores._graph_common import _normalize_space
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,8 +132,13 @@ class Neo4jStore:
         self._require_available()
 
         props = {**properties, "id": node_id}
-        if space_id:
-            props["space"] = space_id
+        # issue #118 codex review [2]: this used to be an inline
+        # `if space_id: props["space"] = space_id`, which happened to already
+        # match the precedence _normalize_space now defines (explicit
+        # space_id argument wins) -- switched to the shared helper so all
+        # three backends provably run the same rule instead of three
+        # independently-maintained copies of it drifting apart again.
+        props, _space_id = _normalize_space(props, space_id)
 
         set_clause = ", ".join(f"n.{k} = ${k}" for k in props)
         cypher = f"""
@@ -240,6 +247,7 @@ class Neo4jStore:
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Find neighboring nodes up to *depth* hops.
@@ -258,6 +266,13 @@ class Neo4jStore:
         include_unpackaged:
             When ``pack_ids`` is set, also allow nodes/edges with no
             ``pack_id`` property (legacy data).
+        spaces:
+            Optional space allow-list (issue #52). When set, every node
+            along the path (anchor included) must have ``n.space IN
+            spaces`` — strict membership, no "include unspaced" escape
+            hatch (matches the BM25/vector legs' semantics). ``upsert_node``
+            writes ``space`` as a plain node property here, so this pushes
+            straight into the WHERE clause, same as ``pack_ids``.
         """
         self._require_available()
 
@@ -268,6 +283,7 @@ class Neo4jStore:
             limit=limit,
             pack_ids=pack_ids,
             include_unpackaged=include_unpackaged,
+            spaces=spaces,
         )
 
         with self._session() as session:
@@ -292,6 +308,7 @@ class Neo4jStore:
         limit: int,
         pack_ids: list[str] | None,
         include_unpackaged: bool,
+        spaces: list[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Pure helper that builds the Cypher query string and parameters.
 
@@ -324,6 +341,16 @@ class Neo4jStore:
                 where_clauses.append(
                     "ALL(r IN relationships(path) WHERE r.pack_id IS NULL OR r.pack_id IN $pack_ids)"
                 )
+
+        if spaces:
+            # Strict membership, no "include unspaced" escape hatch (matches
+            # the BM25/vector legs — issue #52). `space` is a plain node
+            # property (see upsert_node's `props["space"] = space_id`), so
+            # this is a direct WHERE push, same shape as pack_ids above.
+            params["spaces"] = list(spaces)
+            where_clauses.append(
+                "ALL(n IN nodes(path) WHERE n.space IN $spaces)"
+            )
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
@@ -430,6 +457,7 @@ class Neo4jStore:
             WHERE n.pack_id IS NOT NULL
             WITH n.pack_id AS pack_id, count(n) AS node_count,
                  collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.title ELSE null END) AS anchor_titles,
+                 collect(CASE WHEN n.id = 'dataset:' + n.pack_id THEN n.description ELSE null END) AS anchor_descs,
                  collect(n.source_package_title) AS pkg_titles
             WHERE node_count >= $min_nodes
             WITH pack_id, node_count,
@@ -437,8 +465,12 @@ class Neo4jStore:
                      [t IN anchor_titles WHERE t IS NOT NULL AND t <> ''][0],
                      [t IN pkg_titles  WHERE t IS NOT NULL AND t <> ''][0],
                      ''
-                 ) AS sample_title
-            RETURN pack_id, node_count, sample_title
+                 ) AS sample_title,
+                 coalesce(
+                     [d IN anchor_descs WHERE d IS NOT NULL AND d <> ''][0],
+                     ''
+                 ) AS sample_description
+            RETURN pack_id, node_count, sample_title, sample_description
             ORDER BY node_count DESC
         """
         with self._session() as session:
@@ -489,28 +521,60 @@ class Neo4jStore:
             ]
 
     def export_nodes(
-        self, pack_id: str | None = None, limit: int = 500_000
+        self, pack_id: str | None = None, limit: int = 500_000, space: str | None = None
     ) -> list[dict[str, Any]]:
         """Bulk node export for pack ingest/re-export tooling.
 
         Cypher is identical to pack/neo4j_export.py's former inline
         ``_node_query()`` helper (pack_id matches ``pack_id``, ``source``,
-        or ``source_id``).
+        or ``source_id``). ``space``, when given, is pushed into the same
+        WHERE clause ahead of LIMIT via the ``space`` node property --
+        Neo4jStore writes ``props["space"]`` natively on upsert (see
+        ``upsert_node``), so this is real pushdown, not a Python post-filter
+        (issue #54).
+
+        ``limit <= 0`` (issue #120): returns ``[]`` without issuing a query
+        -- a raw negative ``LIMIT`` literal is invalid Cypher (Neo4j rejects
+        it at runtime), and the SQL/Kuzu backends already never query for
+        ``limit <= 0``, so this keeps all four implementations agreeing.
         """
         self._require_available()
+        if limit <= 0:
+            return []
         cypher = f"""
             MATCH (n)
-            WHERE $pack_id IS NULL
-               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id
+            WHERE ($pack_id IS NULL
+               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id)
+              AND ($space IS NULL OR n.space = $space)
             RETURN properties(n) AS props, labels(n) AS labels
             LIMIT {int(limit)}
         """
         with self._session() as session:
-            result = session.run(cypher, pack_id=pack_id)
+            result = session.run(cypher, pack_id=pack_id, space=space)
             return [
                 {"props": dict(record["props"]), "labels": list(record["labels"])}
                 for record in result
             ]
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Real ``count(n)`` with the exact same predicate ``export_nodes``
+        filters on, unbounded by any LIMIT -- issue #54: ``total`` must
+        reflect the true match count, not get truncated by a caller's
+        display ``limit``."""
+        self._require_available()
+        cypher = """
+            MATCH (n)
+            WHERE ($pack_id IS NULL
+               OR n.pack_id = $pack_id OR n.source = $pack_id OR n.source_id = $pack_id)
+              AND ($space IS NULL OR n.space = $space)
+            RETURN count(n) AS total
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_id=pack_id, space=space)
+            record = result.single()
+            return int(record["total"]) if record else 0
 
     def export_edges(
         self, pack_id: str | None = None, limit: int = 1_000_000

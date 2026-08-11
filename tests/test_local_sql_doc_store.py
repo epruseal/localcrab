@@ -6,6 +6,7 @@ Fixture: tmp_path creates a fresh DB file per test; no shared state.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -155,6 +156,141 @@ class TestListNodes:
         assert len(store.list_nodes(space="beta", limit=100)) == 6
         assert len(store.list_nodes(limit=100)) == 10
 
+    def test_list_nodes_limit_zero_returns_empty(self, store):
+        """issue #120 follow-up: 0 rows requested must mean 0 rows back."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=0) == []
+
+    def test_list_nodes_negative_limit_returns_empty(self, store):
+        """SQLite maps a bound ``LIMIT -1`` to "no limit" -- without the
+        guard this would return all 3 rows instead of []."""
+        self._seed(store, "s1", 3)
+        assert store.list_nodes(limit=-1) == []
+
+    def _set_updated_at(self, store, node_id: str, iso_ts: str) -> None:
+        """Force a specific ``updated_at`` so ordering/selection is controlled
+        deterministically in tests, rather than relying on ``datetime.now()``
+        call-to-call drift."""
+        store._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?", (iso_ts, node_id)
+        )
+        store._conn.commit()
+
+    def test_list_nodes_orders_by_updated_at_desc(self, store):
+        """#63: no ORDER BY meant an under-cap LIMIT picked an arbitrary
+        (physical-order) subset. The cap must pick deterministically, and
+        recency ordering is what keeps the most recently changed rows
+        searchable once the corpus exceeds the cap."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        # Cap below the corpus size: only the 10 most recently updated rows.
+        result = store.list_nodes(limit=10)
+        ids = [r["node_id"] for r in result]
+        assert ids == [f"n{i}" for i in range(19, 9, -1)]
+
+        # Selection is stable/deterministic across repeated calls.
+        assert [r["node_id"] for r in store.list_nodes(limit=10)] == ids
+
+    def test_list_nodes_cap_picks_up_newly_updated_row(self, store):
+        """A row outside the cap window becomes visible again once it's the
+        most recently updated — the whole point of ordering by recency."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=10)]
+        self._set_updated_at(store, "n5", "2026-01-02T00:00:00")
+        assert "n5" in [r["node_id"] for r in store.list_nodes(limit=10)]
+
+    def test_list_nodes_tie_break_is_deterministic_at_cap_boundary(self, store):
+        """codex P2 (#63 follow-up): a batch load / migration commonly gives
+        many rows the exact same updated_at. If several of those tied rows
+        straddle the cap boundary, ORDER BY updated_at DESC alone leaves
+        their relative order unspecified by the SQL standard — repeated
+        calls (or a rebuild after a physical reorg) could pick a different
+        subset each time, resurrecting the non-determinism this whole PR
+        exists to remove. (space, node_id) is the PK, so adding it as a
+        tie-breaker guarantees a total order."""
+        # 15 rows, all with the SAME updated_at, cap=10: without a
+        # tie-breaker, which 10 of the 15 tied rows come back is undefined.
+        # Zero-padded ids so lexicographic (space, node_id) order == numeric
+        # order, keeping the expected-winners assertion below unambiguous.
+        for i in range(15):
+            store.upsert_node_doc("s1", "T", f"n{i:02d}", {"i": i})
+            self._set_updated_at(store, f"n{i:02d}", "2026-01-01T00:00:00")
+
+        first = [r["node_id"] for r in store.list_nodes(limit=10)]
+        for _ in range(5):
+            assert [r["node_id"] for r in store.list_nodes(limit=10)] == first
+
+        # (space, node_id) ASC tie-break: lowest node_ids win the tie.
+        assert first == [f"n{i:02d}" for i in range(10)]
+
+
+# ---------------------------------------------------------------------------
+# bm25_fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestBm25Fingerprint:
+    """#63: the fingerprint must reflect the WHOLE table, independent of any
+    cap. A capped COUNT pins at exactly the cap once the corpus exceeds it,
+    so a change to a row outside the cap's selection would otherwise never
+    be observed."""
+
+    def _seed(self, store, space: str, count: int, prefix: str = "n") -> None:
+        for i in range(count):
+            store.upsert_node_doc(space, "T", f"{prefix}{i}", {"i": i})
+
+    def _set_updated_at(self, store, node_id: str, iso_ts: str) -> None:
+        store._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?", (iso_ts, node_id)
+        )
+        store._conn.commit()
+
+    def test_fingerprint_ignores_the_cap(self, store):
+        self._seed(store, "s1", 20)
+        # A tiny cap must not change the reported fingerprint: it always
+        # reflects all 20 rows, not the capped subset.
+        assert store.bm25_fingerprint(limit=5) == store.bm25_fingerprint(limit=50000)
+        assert store.bm25_fingerprint(limit=5)[0] == 20
+
+    def test_fingerprint_changes_when_row_outside_cap_is_updated(self, store):
+        """Reproduces the verifier's finding: with a small cap, updating a
+        node outside the first N physical/ordered rows must still move the
+        fingerprint, because the fingerprint is no longer capped at all."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        cap = 10
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=cap)]
+
+        fp_before = store.bm25_fingerprint(limit=cap)
+        self._set_updated_at(store, "n5", "2026-01-02T00:00:00")
+        fp_after = store.bm25_fingerprint(limit=cap)
+
+        assert fp_before != fp_after
+        # Count doesn't change (no insert/delete) — the max timestamp does.
+        assert fp_before[0] == fp_after[0] == 20
+        assert fp_after[1] != fp_before[1]
+
+    def test_fingerprint_count_reflects_deletes_outside_cap(self, store):
+        """A capped COUNT would stay pinned at the cap after a delete outside
+        the selected window; the whole-table COUNT must not."""
+        self._seed(store, "s1", 20)
+        for i in range(20):
+            self._set_updated_at(store, f"n{i}", f"2026-01-01T00:00:{i:02d}")
+
+        cap = 10
+        assert "n5" not in [r["node_id"] for r in store.list_nodes(limit=cap)]
+        fp_before = store.bm25_fingerprint(limit=cap)
+        store.delete_node_doc("s1", "n5")
+        fp_after = store.bm25_fingerprint(limit=cap)
+        assert fp_after[0] == fp_before[0] - 1
+
 
 # ---------------------------------------------------------------------------
 # delete_node_doc
@@ -212,6 +348,140 @@ class TestSource:
     def test_list_sources_empty_returns_empty(self, store):
         assert store.list_sources() == []
 
+    def test_list_sources_limit_zero_returns_empty(self, store):
+        store.upsert_source("s0", "text", {})
+        assert store.list_sources(limit=0) == []
+
+    def test_list_sources_negative_limit_returns_empty(self, store):
+        store.upsert_source("s0", "text", {})
+        assert store.list_sources(limit=-1) == []
+
+
+class _FTSFailProxy:
+    """sqlite3.Connection is an immutable C type (can't monkeypatch its
+    execute directly), so this thin proxy stands in for the thread-local
+    connection to force the FTS5 INSERT to fail while delegating everything
+    else to the real connection — including commit()/rollback(), so the
+    real connection's transaction state is what gets asserted on."""
+
+    def __init__(self, real: sqlite3.Connection, fail_marker: str = "INSERT INTO doc_sources_fts") -> None:
+        self._real = real
+        self._fail_marker = fail_marker
+
+    def _check(self, sql: str) -> None:
+        if self._fail_marker in sql:
+            raise sqlite3.OperationalError("forced failure: " + self._fail_marker)
+
+    def execute(self, sql, params=None):
+        self._check(sql)
+        return self._real.execute(sql) if params is None else self._real.execute(sql, params)
+
+    def executemany(self, sql, params_list):
+        return self._real.executemany(sql, params_list)
+
+    def commit(self):
+        return self._real.commit()
+
+    def rollback(self):
+        return self._real.rollback()
+
+
+class TestUpsertSourceTransaction:
+    """Issue #79: upsert_source used to write doc_sources via
+    super().upsert_source() (its own commit), then sync doc_sources_fts in a
+    SEPARATE commit. A failure in the FTS step left doc_sources committed but
+    doc_sources_fts not — permanently inconsistent, and no rollback could fix
+    it because the doc_sources commit had already happened. Now both writes
+    share one _exec_write_many transaction."""
+
+    def test_fts_failure_rolls_back_doc_sources_too(self, store):
+        store.upsert_source("keep", "baseline, unrelated", {})
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # doc_sources rolled back together with the FTS failure, not left as
+        # an orphaned commit inconsistent with the (also-absent) FTS row.
+        assert store.get_source("src1") is None
+        assert store.get_source("keep") is not None
+
+    def test_later_write_does_not_smuggle_in_failed_upsert(self, store):
+        real_conn = store._conn
+        store._local.conn = _FTSFailProxy(real_conn)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.upsert_source("src1", "hello world", {})
+        finally:
+            store._local.conn = real_conn
+        # unrelated, independent successful write on the same thread connection
+        store.upsert_source("src2", "second", {})
+        assert store.get_source("src1") is None
+        assert store.get_source("src2") is not None
+
+
+class TestFtsBootstrapRollback:
+    """Issue #79 adversarial-verification follow-up: _init_db's FTS5
+    bootstrap (CREATE VIRTUAL TABLE + one-time backfill INSERT) commits
+    unconditionally on success, but unlike the core DDL block it does NOT
+    make the store unavailable on failure (_fts_ok just goes False) — so the
+    store keeps accepting writes afterward on the same thread connection.
+
+    NOTE on what actually rolls back: CREATE VIRTUAL TABLE is DDL — Python's
+    sqlite3 module does not open an implicit transaction ahead of DDL (only
+    ahead of DML), so it autocommits immediately regardless of _tx() and
+    stays created (harmless: IF NOT EXISTS makes re-running it a no-op). The
+    real risk _tx() closes is the backfill INSERT (DML): before this fix, a
+    mid-INSERT failure left that statement's implicit transaction open with
+    no commit/rollback, and the NEXT successful write's commit() on the same
+    connection would confirm it. _tx()'s except-clause rollback() now closes
+    that transaction unconditionally on any failure in the block.
+
+    REPRO NOTE: a Python-level proxy that raises BEFORE delegating to the
+    real sqlite3 connection never reaches the engine, so it never actually
+    opens sqlite3's implicit transaction — asserting rollback happened would
+    trivially pass even with no rollback() call at all (that was the exact
+    gap an adversarial review caught in an earlier version of this test).
+    This test instead corrupts a real FTS5 shadow table
+    (``doc_sources_fts_docsize``, one of the internal tables FTS5 itself
+    creates to track per-row bookkeeping) so ``COUNT(*)`` — a plain read —
+    still succeeds and the backfill branch is taken, but the backfill INSERT
+    genuinely fails INSIDE SQLite's engine ("SQL logic error", confirmed
+    empirically), which is a real step-time failure and therefore DOES open
+    sqlite3's implicit transaction before failing — the same class of
+    failure a real disk/constraint error would cause in production."""
+
+    def test_backfill_failure_leaves_no_dangling_transaction(self, store):
+        real_conn = store._conn
+        # Two source rows inserted directly (bypassing upsert_source, so
+        # doc_sources_fts is never synced) — matches the legacy-DB state the
+        # one-time backfill branch (n_fts == 0 and n_src > 0) exists to fix.
+        real_conn.execute(
+            "INSERT INTO doc_sources VALUES ('s1', 'hello world', '{}', '2020-01-01')"
+        )
+        real_conn.execute(
+            "INSERT INTO doc_sources VALUES ('s2', 'second row', '{}', '2020-01-01')"
+        )
+        real_conn.commit()
+        real_conn.execute("DROP TABLE doc_sources_fts_docsize")
+        real_conn.commit()
+        assert real_conn.in_transaction is False  # clean baseline before the repro
+
+        store._init_db()  # re-run bootstrap; backfill INSERT fails for real
+
+        assert store._fts_ok is False
+        # _tx()'s rollback() closed the transaction the failed INSERT
+        # genuinely opened inside SQLite — not left dangling for a later
+        # write's commit() to sweep up.
+        assert real_conn.in_transaction is False
+
+        # a normal unrelated write on the same thread still commits cleanly
+        # and only itself — nothing from the failed backfill is smuggled in.
+        store.upsert_node_doc("s", "T", "n1", {})
+        assert store.get_node_doc("s", "n1") is not None
+
 
 # ---------------------------------------------------------------------------
 # Audit log
@@ -256,6 +526,14 @@ class TestAuditLog:
 
     def test_get_audit_log_empty(self, store):
         assert store.get_audit_log() == []
+
+    def test_get_audit_log_limit_zero_returns_empty(self, store):
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=0) == []
+
+    def test_get_audit_log_negative_limit_returns_empty(self, store):
+        store.log_event("tick", None, {})
+        assert store.get_audit_log(limit=-1) == []
 
 
 # ---------------------------------------------------------------------------

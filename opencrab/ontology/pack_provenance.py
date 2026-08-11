@@ -27,6 +27,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from opencrab.locking import write_lock
+
 _PACK_RE = re.compile(r"/packs/([^/]+)/")
 
 
@@ -139,7 +141,7 @@ def resolve_backfill_dry_run(
     return True, None
 
 
-def backfill_pack_ids(
+def _backfill_pack_ids_unlocked(
     db_path: str | Path,
     *,
     assume_pack_id: str | None = None,
@@ -223,3 +225,20 @@ def backfill_pack_ids(
         conn.close()
 
     return summary
+
+
+def backfill_pack_ids(
+    db_path: str | Path,
+    *,
+    assume_pack_id: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Back-fill pack IDs under the lock for the database being changed."""
+    if dry_run:
+        return _backfill_pack_ids_unlocked(
+            db_path, assume_pack_id=assume_pack_id, dry_run=True
+        )
+    with write_lock(str(Path(db_path).resolve().parent)):
+        return _backfill_pack_ids_unlocked(
+            db_path, assume_pack_id=assume_pack_id, dry_run=False
+        )

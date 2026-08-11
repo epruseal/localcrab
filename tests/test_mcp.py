@@ -107,14 +107,15 @@ class TestToolDispatch:
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
+            billing = MagicMock()
             builder.add_node.return_value = {
                 "node_id": "u1", "space": "subject", "node_type": "User",
-                "properties": {}, "stores": {"neo4j": "ok"}
+                "properties": {}, "stores": {"graph": "ok"}
             }
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": billing,
             }
             result = dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -122,22 +123,96 @@ class TestToolDispatch:
             })
             assert result["node_id"] == "u1"
             assert "stores" in result
+            # #66 codex re-review [8]: on_node_write is the sibling of
+            # on_edge_write and had the same fail-open gap. Pin that a real
+            # graph success ("graph": "ok") does bill.
+            billing.on_node_write.assert_called_once_with("default", None, "subject", "User")
+
+    def test_ontology_add_node_forwards_subject_id_to_builder_audit(self):
+        """Issue #119 sibling check: ontology_add_node already forwarded
+        subject_id to builder.add_node (unlike ontology_add_edge, which did
+        not). Pin that the SAME subject_id reaches both builder.add_node
+        (audit) and on_node_write (billing), so a future regression here is
+        caught the same way the edge/harness/pack sites now are."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_node.return_value = {"node_id": "u1", "stores": {"graph": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_node", {
+                "space": "subject", "node_type": "User", "node_id": "u1",
+                "subject_id": "actor-1",
+            })
+            assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+            billing.on_node_write.assert_called_once_with("default", "actor-1", "subject", "User")
+
+    def test_ontology_add_node_graph_store_failure_does_not_bill(self):
+        """#66 codex re-review, finding [8]: add_node() doesn't raise for a
+        per-store failure — the exact same silent-failure shape already
+        fixed on ontology_add_edge, just never applied to this sibling."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_node.return_value = {
+                "node_id": "u1", "stores": {"graph": "error: disk down"}
+            }
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            result = dispatch_tool("ontology_add_node", {
+                "space": "subject", "node_type": "User", "node_id": "u1",
+            })
+            assert result["node_id"] == "u1"  # handler returns the result unchanged
+            billing.on_node_write.assert_not_called()
+
+    def test_ontology_add_node_malformed_receipt_does_not_bill(self):
+        """#66 codex re-review, finding [3] (applied here too since the same
+        gate — graph_write_failed — is shared by add_node and add_edge):
+        a "stores" map with no "graph" key at all is a receipt shape this
+        code doesn't recognize, not a positive success signal. Fail-closed:
+        unrecognized must not bill, only a literal "graph": "ok" does."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_node.return_value = {"node_id": "u1", "stores": {"sql": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_node", {
+                "space": "subject", "node_type": "User", "node_id": "u1",
+            })
+            billing.on_node_write.assert_not_called()
 
     def test_ontology_add_edge_success(self):
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
+            billing = MagicMock()
             builder.add_edge.return_value = {
                 "from": {"space": "subject", "id": "u1"},
                 "relation": "owns",
                 "to": {"space": "resource", "id": "doc1"},
-                "stores": {"neo4j": "ok"},
+                "stores": {"graph": "ok"},
             }
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": billing,
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -152,7 +227,188 @@ class TestToolDispatch:
                 to_space="resource",
                 to_id="doc1",
                 properties={},
+                subject_id=None,
             )
+            # #66: on_edge_write had zero callers repo-wide before this fix —
+            # every edge write went unbilled. Pin the call with the defaults
+            # (no tenant_id/subject_id passed) matching ontology_add_node's
+            # on_node_write wiring pattern.
+            billing.on_edge_write.assert_called_once_with("default", None, "owns")
+
+    def test_ontology_add_edge_forwards_subject_id_to_builder_audit(self):
+        """Issue #119: subject_id was billed via on_edge_write but never
+        forwarded to builder.add_edge, so the edge's audit event (builder.py's
+        mongo.log_event("edge_upsert", subject_id=...)) recorded a null actor
+        even though the billing row named one. Pin that the SAME subject_id
+        supplied by the caller reaches both builder.add_edge (audit) and
+        on_edge_write (billing)."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {"relation": "owns", "stores": {"graph": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+                "subject_id": "actor-1",
+            })
+            assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+            billing.on_edge_write.assert_called_once_with("default", "actor-1", "owns")
+
+    def test_ontology_add_edge_billing_uses_explicit_tenant_and_subject(self):
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {"stores": {"graph": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+                "tenant_id": "acme", "subject_id": "u1",
+            })
+            billing.on_edge_write.assert_called_once_with("acme", "u1", "owns")
+
+    def test_ontology_add_edge_malformed_receipt_does_not_bill(self):
+        """Fail-closed pin (finding [3], applies equally to add_edge): a
+        "stores" map missing the "graph" key entirely must not bill — an
+        unrecognized receipt shape is not a positive success signal."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {"stores": {"docs": "ok"}}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            billing.on_edge_write.assert_not_called()
+
+    def test_ontology_add_edge_billing_persist_failure_is_logged_but_write_still_succeeds(self, caplog):
+        """#105: a failed billing emit() must not vanish silently and must not
+        fail the (already-succeeded) edge write — this pins the observability
+        fix made alongside #66's wiring: the handler now inspects
+        on_edge_write's returned {"ok": ...} dict instead of discarding it."""
+        import logging
+
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {"relation": "owns", "stores": {"graph": "ok"}}
+            billing.on_edge_write.return_value = {"ok": False, "error": "database is locked"}
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            with caplog.at_level(logging.WARNING):
+                result = dispatch_tool("ontology_add_edge", {
+                    "from_space": "subject", "from_id": "u1",
+                    "relation": "owns",
+                    "to_space": "resource", "to_id": "doc1",
+                })
+        assert result["relation"] == "owns"  # write itself still succeeded
+        assert any("on_edge_write" in rec.message and "database is locked" in rec.message
+                    for rec in caplog.records)
+
+    def test_ontology_add_edge_failure_does_not_bill(self):
+        """A grammar-invalid edge must not emit a billing event — mirrors
+        ontology_add_node's on_node_write, which only fires after a
+        successful builder.add_edge call."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.side_effect = ValueError("Relation 'mentions' is not valid")
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "mentions",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            billing.on_edge_write.assert_not_called()
+
+    def test_ontology_add_edge_graph_store_failure_does_not_bill(self):
+        """#66/#105 review: builder.add_edge() doesn't raise for a per-store
+        failure — a missing endpoint or a down graph store comes back as a
+        status STRING inside result["stores"]["graph"] (builder.py's module
+        docstring), not an exception. The earlier failure-does-not-bill test
+        only covered the raised-exception branch; this pins the (more
+        common) silent-failure branch that codex's adversarial review
+        flagged as still billing a write that never landed."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {
+                "relation": "owns",
+                "stores": {"graph": "no match (missing node: resource/doc1)"},
+            }
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            result = dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            assert result["relation"] == "owns"  # handler returns the result unchanged
+            billing.on_edge_write.assert_not_called()
+
+    def test_ontology_add_edge_optional_store_failure_still_bills(self):
+        """Graph write succeeded; only an optional store (docs) failed. The
+        edge exists and is queryable, so this must still bill — matching
+        pack_create's own graph-is-system-of-record split."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            builder = MagicMock()
+            billing = MagicMock()
+            builder.add_edge.return_value = {
+                "relation": "owns",
+                "stores": {"graph": "ok", "docs": "error: mongo down"},
+            }
+            mock_ctx.return_value = {
+                "builder": builder, "rebac": MagicMock(),
+                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
+                "billing": billing,
+            }
+            dispatch_tool("ontology_add_edge", {
+                "from_space": "subject", "from_id": "u1",
+                "relation": "owns",
+                "to_space": "resource", "to_id": "doc1",
+            })
+            billing.on_edge_write.assert_called_once_with("default", None, "owns")
 
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool
@@ -178,11 +434,14 @@ class TestToolDispatch:
         from opencrab.ontology.query import QueryResult
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            from opencrab.ontology.query import QueryOutcome
+
             mock_result = QueryResult(
                 source="vector", node_id="n1", score=0.9, text="Test text", metadata={}
             )
             hybrid = MagicMock()
-            hybrid.query.return_value = [mock_result]
+            # #51: query() returns QueryOutcome(results, warnings), not a bare list.
+            hybrid.query.return_value = QueryOutcome(results=[mock_result], warnings=[])
             mock_ctx.return_value = {
                 "builder": MagicMock(), "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": hybrid, "mongo": MagicMock(),
@@ -383,13 +642,16 @@ class TestToolDispatch:
             assert result["found"] is False
 
     def test_ontology_list_nodes_pack_filter(self):
-        """ontology_list_nodes filters by pack_id in Python."""
+        """ontology_list_nodes filters by pack_id via the graph store."""
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            # pack_id 있을 때는 graph.export_nodes(pack_id=...) 경로 사용
-            # (limit-before-filter 버그 회피용 인덱스 쿼리)
+            # pack_id 있을 때는 graph.export_nodes(pack_id=..., space=...) 경로 사용
+            # (limit-before-filter 버그 회피용 인덱스 쿼리, issue #54: space 도
+            # 서버 쪽에서 함께 걸린다 -- 아래 assert_called_once_with 의 space=None
+            # 이 그 계약을 검증한다). total 은 별도로 count_exported_nodes 에서 온다.
             graph = MagicMock()
+            graph.count_exported_nodes.return_value = 2
             graph.export_nodes.return_value = [
                 {"props": {"node_id": "n1", "pack_id": "pack-a", "space": "evidence"}, "labels": ["TextUnit"]},
                 {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
@@ -403,8 +665,70 @@ class TestToolDispatch:
             result = dispatch_tool("ontology_list_nodes", {"pack_id": "pack-a"})
             assert result["total"] == 2
             assert result["pack_id_filter"] == "pack-a"
-            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100)
+            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100, space=None)
+            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space=None)
             mongo.list_nodes.assert_not_called()  # doc store는 pack_id 있을 때 사용 안 함
+
+    def test_ontology_list_nodes_pack_and_space_filter_pushes_space_kwarg(self):
+        """issue #54 contract: when both pack_id and space are given,
+        ontology_list_nodes MUST forward space= to export_nodes (and to
+        count_exported_nodes) so the backend can push it into its native
+        query ahead of limit — a regression that silently drops the kwarg
+        (e.g. reverting to a Python-only post-filter) is caught here via
+        assert_called_once_with, not just by the return value."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            graph.count_exported_nodes.return_value = 1
+            # Mock stands in for a backend that already pushed the space
+            # filter server-side -- only matching rows come back.
+            graph.export_nodes.return_value = [
+                {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
+            ]
+            mongo = MagicMock()
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": mongo, "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool(
+                "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
+            )
+            assert result["total"] == 1
+            assert result["nodes"][0]["space"] == "concept"
+            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=10, space="concept")
+            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space="concept")
+
+    def test_ontology_list_nodes_total_not_capped_by_limit(self):
+        """issue #54's actual complaint: `total` must report the TRUE match
+        count even when it is larger than `limit` (i.e. more rows match than
+        the page returned). Before this fix, total was len(nodes) -- capped
+        at whatever page export_nodes(limit=...) returned, so this exact
+        case (3000 real matches, only 10 returned) silently reported
+        total=10 instead of 3000."""
+        from opencrab.mcp.tools import dispatch_tool
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            graph = MagicMock()
+            # count_exported_nodes (no LIMIT) sees the true total; export_nodes
+            # (LIMIT 10) returns only a page of it -- the two are intentionally
+            # different sizes here to prove `total` is NOT derived from `nodes`.
+            graph.count_exported_nodes.return_value = 3000
+            graph.export_nodes.return_value = [
+                {"props": {"node_id": f"n{i}", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]}
+                for i in range(10)
+            ]
+            mock_ctx.return_value = {
+                "neo4j": graph, "mongo": MagicMock(), "builder": MagicMock(),
+                "hybrid": MagicMock(), "rebac": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(),
+            }
+            result = dispatch_tool(
+                "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
+            )
+            assert result["total"] == 3000
+            assert len(result["nodes"]) == 10
 
     def test_ontology_list_edges_local_backend(self):
         """ontology_list_edges uses export_edges on Local/Kuzu backends."""

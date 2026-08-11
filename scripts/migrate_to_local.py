@@ -34,8 +34,55 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from opencrab.locking import file_lock
+
 console = Console()
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# #144 fail-closed guard — migrate_sql() below (and preflight's own table
+# list) predate #144's users/api_tokens/packs tables and don't copy them. A
+# run that completes without them silently drops every user and every issued
+# token while still reporting success. Detect this in preflight (before any
+# work happens, dry-run included) via a fresh information_schema query — not
+# the hard-coded 5-table list used elsewhere in this script — and require an
+# explicit opt-in to proceed.
+# ---------------------------------------------------------------------------
+
+_AUTH_TABLES = ("users", "api_tokens", "packs")
+
+
+def _filter_auth_tables(table_names: Any) -> list[str]:
+    """Pure decision logic (kept separate from the DB call so it can be
+    tested without a live PostgreSQL instance): which #144 auth tables are
+    present in an arbitrary iterable of table names."""
+    return sorted(set(table_names) & set(_AUTH_TABLES))
+
+
+def _pg_table_names(pg_engine: Any) -> set[str]:
+    """All base table names in the schema this connection actually resolves to.
+
+    ``current_schema()``, not a literal ``'public'``: a DSN may pin a different
+    schema via ``options=-csearch_path%3D...`` (several of this repo's
+    PostgreSQL tests do exactly that to isolate themselves), and ``SQLStore``
+    then creates its tables *there* while the migration reads them through
+    unqualified names. Inspecting only ``public`` would find no auth tables in
+    that setup, so the fail-closed guard below would stay silent and the run
+    would report success having dropped every user and every issued token --
+    precisely the failure the guard exists to prevent. This matches what
+    ``SQLStore.table_counts`` already uses.
+    """
+    from sqlalchemy import text  # type: ignore[import]
+
+    with pg_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()"
+            )
+        ).fetchall()
+    return {r[0] for r in rows}
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -66,6 +113,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--chroma-collection", default="opencrab_vectors", metavar="COL")
     p.add_argument("--pg-url",
                    default="postgresql://opencrab:opencrab@localhost:5432/opencrab", metavar="U")
+    p.add_argument("--allow-unmigrated", action="store_true",
+                   help="소스에 users/api_tokens/packs(#144)가 있어도 마이그레이션하지 않고 "
+                        "진행합니다 (요약에 제외 목록 표시). 이 플래그 없이는 중단됩니다.")
     return p.parse_args()
 
 
@@ -165,6 +215,25 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         result["pg_engine"] = pg_engine
         total_pg = sum(sql_counts.values())
         console.print(f"[green]OK[/green] (total rows={total_pg:,})")
+
+        if not args.skip_sql:
+            excluded_auth_tables = _filter_auth_tables(_pg_table_names(pg_engine))
+            if excluded_auth_tables and args.allow_unmigrated:
+                console.print(
+                    f"  [yellow]--allow-unmigrated[/yellow]: 인증 테이블 {excluded_auth_tables} "
+                    "제외하고 진행합니다 (#144)"
+                )
+                result["excluded_auth_tables"] = excluded_auth_tables
+            elif excluded_auth_tables:
+                console.print(
+                    f"  [red]FAIL[/red]: 소스에 이 스크립트가 복사하지 않는 인증 테이블 "
+                    f"{excluded_auth_tables} 이(가) 있습니다 (#144)"
+                )
+                errors.append(
+                    f"PostgreSQL: auth table(s) {excluded_auth_tables} present but not migrated "
+                    "(#144); pass --allow-unmigrated to proceed anyway — completing without them "
+                    "silently drops every user and every issued token while still reporting success"
+                )
     except Exception as exc:
         console.print(f"[red]FAIL[/red]: {exc}")
         errors.append(f"PostgreSQL: {exc}")
@@ -192,6 +261,8 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
       doc_store.db  → doc_store.db.bak.{ts}  (있으면)
       chroma/       → chroma.bak.{ts}/        (있으면)
       opencrab.db   → opencrab.db.bak.{ts}    (있으면)
+      billing.db    → billing.db.bak.{ts}     (있으면 — issue #105: billing_events
+                                                 는 opencrab.db 가 아닌 이 파일에 있다)
     주의: shutil.copy2/copytree 사용. 없으면 경고만 출력하고 스킵.
     반환: {원본경로: 백업경로} (백업된 항목만)
     """
@@ -204,6 +275,12 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
         ("doc_store.db", "file"),
         ("chroma",       "dir"),
         ("opencrab.db",  "file"),
+        # issue #105: billing_events moved out of opencrab.db into its own
+        # file so it stops contending with write.lock'd writers for
+        # opencrab.db's SQLite file lock. It must be backed up separately or
+        # a split that was meant to prevent billing data loss would cause a
+        # bigger one (unbacked-up billing history).
+        ("billing.db",   "file"),
     ]
 
     for name, kind in targets:
@@ -712,19 +789,24 @@ def main() -> None:
     # Step 0 — Pre-flight
     preflight_result = preflight(args)
     source_counts = preflight_result["counts"]
+    excluded_auth_tables = preflight_result.get("excluded_auth_tables", [])
 
     if args.dry_run:
         console.print("\n[bold yellow]--dry-run 모드: 여기서 종료합니다.[/bold yellow]")
         _print_counts_table(source_counts)
+        if excluded_auth_tables:
+            console.print(f"[yellow]--allow-unmigrated: 제외된 테이블 {excluded_auth_tables}[/yellow]")
         return
 
     # Step 1 — 백업
-    backup_local_data(local_data_dir)
+    with file_lock("write.lock", local_data_dir):
+        backup_local_data(local_data_dir)
 
     report: dict[str, Any] = {
         "started_at": datetime.now(UTC).isoformat(),
         "local_data_dir": local_data_dir,
         "source_counts": source_counts,
+        "excluded_auth_tables": excluded_auth_tables,
         "results": {},
     }
 
@@ -735,9 +817,10 @@ def main() -> None:
         graph_db_path = os.path.join(local_data_dir, "graph.db")
         local_graph = LocalGraphStore(db_path=graph_db_path)
         try:
-            graph_result = migrate_graph(
-                preflight_result["neo4j_driver"], local_graph, args.batch_size, logger
-            )
+            with file_lock("write.lock", local_data_dir):
+                graph_result = migrate_graph(
+                    preflight_result["neo4j_driver"], local_graph, args.batch_size, logger
+                )
             report["results"]["graph"] = graph_result
             console.print(f"  [green]완료[/green] nodes={graph_result['nodes']:,} edges={graph_result['edges']:,}")
         finally:
@@ -760,9 +843,10 @@ def main() -> None:
             doc_store = LocalDocStore(data_dir=docs_dir)
             console.print("  [yellow]LocalSQLDocStore 미구현 → LocalDocStore(JSON) fallback[/yellow]")
 
-        docs_result = migrate_docs(
-            preflight_result["mongo_db"], doc_store, args.batch_size, logger
-        )
+        with file_lock("write.lock", local_data_dir):
+            docs_result = migrate_docs(
+                preflight_result["mongo_db"], doc_store, args.batch_size, logger
+            )
         report["results"]["docs"] = docs_result
         console.print(
             f"  [green]완료[/green] nodes={docs_result['nodes']:,} "
@@ -778,14 +862,14 @@ def main() -> None:
         chroma_local_path = os.path.join(local_data_dir, "chroma")
         os.makedirs(chroma_local_path, exist_ok=True)
         local_chroma = chromadb.PersistentClient(path=chroma_local_path)
-
-        vectors_result = migrate_vectors(
-            preflight_result["chroma_http"],
-            local_chroma,
-            args.chroma_collection,
-            args.batch_size,
-            logger,
-        )
+        with file_lock("write.lock", local_data_dir):
+            vectors_result = migrate_vectors(
+                preflight_result["chroma_http"],
+                local_chroma,
+                args.chroma_collection,
+                args.batch_size,
+                logger,
+            )
         report["results"]["vectors"] = vectors_result
         console.print(f"  [green]완료[/green] vectors={vectors_result['vectors']:,}")
     else:
@@ -795,7 +879,8 @@ def main() -> None:
     if not args.skip_sql:
         console.rule("[bold blue]Step 5 — SQL 마이그레이션 (PostgreSQL → SQLite)")
         sqlite_path = os.path.join(local_data_dir, "opencrab.db")
-        sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
+        with file_lock("write.lock", local_data_dir):
+            sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
         report["results"]["sql"] = sql_result
         total_rows = sum(sql_result["tables"].values())
         console.print(f"  [green]완료[/green] total rows={total_rows:,}")
@@ -808,6 +893,8 @@ def main() -> None:
     report_path = write_report(report, local_data_dir)
     console.print(f"  리포트 저장: {report_path}")
     print_summary(report)
+    if excluded_auth_tables:
+        console.print(f"[yellow]제외된 테이블 (--allow-unmigrated): {excluded_auth_tables}[/yellow]")
     console.print("\n[bold green]마이그레이션 완료![/bold green]")
 
 

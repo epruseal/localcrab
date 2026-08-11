@@ -105,6 +105,15 @@ DOC_STORE_SCHEMA = SchemaSpec(
     ),
     indexes=(
         IndexSpec("idx_doc_nodes_updated", "doc_nodes", "updated_at"),
+        # list_nodes()'s ORDER BY updated_at DESC, space, node_id (#63 tie-
+        # breaker, codex P2) needs its own composite index in this exact
+        # column order + direction, or SQLite/PG fall back to a temp B-tree
+        # sort instead of walking the index — measured 3x slower at live
+        # scale (253k rows: 435ms indexed sort vs 1303ms temp-B-tree, see
+        # PR #100). idx_doc_nodes_updated (above) is kept: bm25_fingerprint's
+        # bare MAX(updated_at) and any other single-column updated_at lookup
+        # still use it fine.
+        IndexSpec("idx_doc_nodes_updated_tiebreak", "doc_nodes", "updated_at DESC, space, node_id"),
         IndexSpec("idx_audit_ts", "audit_log", "timestamp DESC"),
     ),
 )
@@ -186,30 +195,55 @@ class _SqlDocStoreBase(abc.ABC):
         return self._row_to_node(row)
 
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0`` (issue #120 follow-up): returns ``[]`` without
+        querying, same contract as ``_sql_graph_base.py``'s ``export_nodes``
+        -- SQLite maps a bound ``LIMIT -1`` to "no limit", so without this
+        guard a negative ``limit`` here would return the entire table."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("doc_nodes")
+        # ORDER BY updated_at DESC: 정렬 없이 LIMIT 만 걸면 어느 행이 뽑힐지 SQL 표준상
+        # 보장되지 않는다(#63). 최신순으로 고정해 상한을 넘는 코퍼스에서도 최소한
+        # 최근 변경분은 검색 가능하고, 선택 결과가 결정적이도록 한다.
+        # tie-breaker (space, node_id): updated_at 이 동률인 행이 상한 경계에 여럿
+        # 있으면(배치 적재·마이그레이션에서 흔함) updated_at 만으로는 그 안에서 순서가
+        # 여전히 미정이라 매번 다른 부분집합이 뽑힐 수 있다. (space, node_id) 는 PK라
+        # 전순서를 보장한다(codex P2).
         if space:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} WHERE space=:space LIMIT :lim"
+                f" FROM {table} WHERE space=:space"
+                f" ORDER BY updated_at DESC, space, node_id LIMIT :lim"
             )
             params = {"space": space, "lim": limit}
         else:
             sql = (
                 f"SELECT space, node_id, node_type, properties, updated_at"
-                f" FROM {table} LIMIT :lim"
+                f" FROM {table} ORDER BY updated_at DESC, space, node_id LIMIT :lim"
             )
             params = {"lim": limit}
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
     def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
+        """Cheap ``(COUNT(*), MAX(updated_at))`` staleness probe over the WHOLE
+        ``doc_nodes`` table — deliberately independent of ``limit`` (#63).
+
+        The BM25 index only ever holds up to ``limit`` rows (see
+        ``HybridQuery`` / ``_BM25_NODE_LIMIT``), but the fingerprint must not
+        share that cap: once the corpus exceeds it, a capped COUNT pins at
+        exactly ``limit`` forever, so count-based change detection would never
+        fire again regardless of row ordering. ``limit`` is kept as a
+        parameter only for call-site compatibility with callers that pass the
+        BM25 cap; it is not applied here.
+        """
         self._require_available()
         sql = (
             f"SELECT COUNT(*) AS cnt, MAX(updated_at) AS max_ts"
-            f" FROM (SELECT updated_at FROM {self._table('doc_nodes')} LIMIT :lim) sub"
+            f" FROM {self._table('doc_nodes')}"
         )
-        row = self._fetch_one(sql, {"lim": limit})
+        row = self._fetch_one(sql, {})
         count = int(self._row_get(row, "cnt"))
         max_ts = self._row_get(row, "max_ts")
         return (count, _ts_str(max_ts) if max_ts is not None else "")
@@ -261,7 +295,11 @@ class _SqlDocStoreBase(abc.ABC):
         return self._row_to_source(row)
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` without querying -- same contract
+        as ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
         sql = (
             f"SELECT source_id, text, metadata, ingested_at"
             f" FROM {self._table('doc_sources')} LIMIT :lim"
@@ -299,7 +337,11 @@ class _SqlDocStoreBase(abc.ABC):
     def get_audit_log(
         self, limit: int = 100, event_type: str | None = None
     ) -> list[dict[str, Any]]:
+        """``limit <= 0``: returns ``[]`` without querying -- same contract
+        as ``list_nodes`` above."""
         self._require_available()
+        if limit <= 0:
+            return []
         table = self._table("audit_log")
         if event_type:
             sql = (

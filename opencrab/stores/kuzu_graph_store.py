@@ -20,9 +20,18 @@ import json
 import logging
 import os
 from collections import deque
+from collections.abc import Iterator
 from typing import Any
 
-from opencrab.stores._graph_common import _edge_passes, _merge_space, _node_passes
+from opencrab.stores._graph_common import (
+    KEYWORD_SEARCH_FIELDS,
+    _edge_passes,
+    _merge_space,
+    _node_passes,
+    _normalize_space,
+    _space_passes,
+    _validate_search_fields,
+)
 from opencrab.stores._json import parse_props as _parse
 
 logger = logging.getLogger(__name__)
@@ -121,6 +130,9 @@ class KuzuGraphStore:
     ) -> dict[str, Any]:
         self._require_available()
         props = {**properties, "id": node_id}
+        # issue #118: same reconciliation as _sql_graph_base.py's upsert_node
+        # -- see _normalize_space's docstring for why and its precedence.
+        props, space_id = _normalize_space(props, space_id)
         props_json = json.dumps(props)
         self._conn.execute(
             "MERGE (n:OntologyNode {node_id: $id}) "
@@ -234,19 +246,31 @@ class KuzuGraphStore:
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """``spaces`` (issue #52): strict space-membership filter. Unlike
+        ``pack_id`` (opaque JSON blob here, see #62's note in
+        ``_find_neighbors_1hop`` on why that filter is NOT pushed into
+        Cypher), ``space_id`` is a real top-level column on ``OntologyNode``
+        (see ``_NODE_DDL``), so this one CAN be pushed into the Cypher WHERE
+        ahead of LIMIT."""
         self._require_available()
 
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        space_set: set[str] | None = set(spaces) if spaces else None
 
         if pack_set is not None:
             anchor = self.get_node_by_id(node_id)
             if not _node_passes(anchor or {}, pack_set, include_unpackaged):
                 return []
+        if space_set is not None:
+            anchor = self.get_node_by_id(node_id)
+            if not _space_passes(anchor or {}, space_set):
+                return []
 
         if depth == 1:
             return self._find_neighbors_1hop(
-                node_id, direction, limit, pack_set, include_unpackaged
+                node_id, direction, limit, pack_set, include_unpackaged, space_set
             )
 
         # depth > 1: Python BFS using 1-hop queries
@@ -260,7 +284,7 @@ class KuzuGraphStore:
                 continue
             hops = self._find_neighbors_1hop(
                 current_id, direction, limit - len(results),
-                pack_set, include_unpackaged,
+                pack_set, include_unpackaged, space_set,
             )
             for nb in hops:
                 nid = nb.get("properties", {}).get("id")
@@ -282,25 +306,92 @@ class KuzuGraphStore:
         limit: int,
         pack_set: set[str] | None,
         include_unpackaged: bool,
+        space_set: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        if direction == "out":
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        elif direction == "in":
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})<-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        else:
-            q = (
-                "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]-(m:OntologyNode) "
-                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
-            )
-        r = self._conn.execute(q + f" LIMIT {int(limit)}", {"id": node_id})
-        results: list[dict[str, Any]] = []
+        # ISSUE #62 (NOT fixed here — left as a clear note, not a half-fix):
+        # this method has the same LIMIT-before-pack-filter defect as the SQL
+        # backends had (fixed in _sql_graph_base.py's _fetch_edges_for_node /
+        # pg_graph_store.py's _batch_frontier_edges via a shared _pack_where
+        # SQL-predicate generator) — `LIMIT {limit}` below runs before
+        # `_collect_1hop` applies `_node_passes`/`_edge_passes`, so a hub
+        # whose first `limit` edges are all out-of-pack can starve in-pack
+        # neighbours that exist further down the scan.
+        #
+        # Pushing the filter into this Cypher WHERE the way neo4j_store.py
+        # does is NOT a safe drop-in here: OntologyNode.props / OntologyEdge
+        # .properties are declared STRING (a serialized JSON blob — see the
+        # CREATE TABLE DDL above and `_parse()`), not per-field typed
+        # columns, so there is no `m.pack_id`/`e.pack_id` to put in a WHERE
+        # clause. Doing this safely would need either a real `pack_id`
+        # column populated at write time (schema + backfill, out of this
+        # fix's scope) or Kuzu's JSON extension (`INSTALL json; LOAD json;`)
+        # to extract from the blob in Cypher — an added runtime dependency
+        # this fix should not silently introduce. Left unfixed; a real
+        # `pack_id` column is the safe follow-up, using this method's SQL
+        # counterpart as the template for what the WHERE clause should say.
+        #
+        # `space_set` (issue #52) does NOT have this problem: `space_id` is
+        # already a real top-level column (see `_NODE_DDL`), so it IS pushed
+        # into the Cypher WHERE below, ahead of LIMIT — no JSON extension
+        # needed.
+        #
+        # direction="both" is issued as two *directed* passes rather than one
+        # undirected MATCH: the undirected form cannot say which side of the
+        # edge the anchor was on, and find_neighbors' from_id/to_id contract
+        # needs that. Total results are still capped at `limit`.
+        arrows = {
+            "out": ("-[e:OntologyEdge]->", True),
+            "in": ("<-[e:OntologyEdge]-", False),
+        }
+        passes = [arrows[direction]] if direction in arrows else [arrows["out"], arrows["in"]]
+
         seen: set[str] = set()
+        buckets: list[list[dict[str, Any]]] = []
+        params: dict[str, Any] = {"id": node_id}
+        where_sql = ""
+        if space_set is not None:
+            params["spaces"] = sorted(space_set)
+            where_sql = " WHERE m.space_id IN $spaces"
+        for arrow, is_out in passes:
+            q = (
+                f"MATCH (n:OntologyNode {{node_id: $id}}){arrow}(m:OntologyNode)"
+                f"{where_sql} "
+                "RETURN m.node_id, m.node_type, m.props, e.relation, e.properties, m.space_id"
+            )
+            r = self._conn.execute(q + f" LIMIT {int(limit)}", params)
+            bucket: list[dict[str, Any]] = []
+            self._collect_1hop(
+                r, node_id, is_out, bucket, seen, pack_set, include_unpackaged, space_set
+            )
+            buckets.append(bucket)
+
+        if len(buckets) == 1:
+            return buckets[0][:limit]
+
+        # Round-robin between directions rather than draining "out" first: a
+        # hub with more than `limit` out-edges would otherwise starve its
+        # in-edges completely, which the single undirected MATCH never did.
+        results: list[dict[str, Any]] = []
+        for i in range(max((len(b) for b in buckets), default=0)):
+            for bucket in buckets:
+                if i < len(bucket):
+                    results.append(bucket[i])
+                    if len(results) >= limit:
+                        return results
+        return results
+
+    def _collect_1hop(
+        self,
+        r: Any,
+        node_id: str,
+        is_out: bool,
+        results: list[dict[str, Any]],
+        seen: set[str],
+        pack_set: set[str] | None,
+        include_unpackaged: bool,
+        space_set: set[str] | None = None,
+    ) -> None:
+        """Drain one directed 1-hop result set into ``results`` (dedup by node)."""
         while r.has_next():
             row = r.get_next()
             nid, ntype, props_raw, rel, edge_props_raw, m_space = (
@@ -309,6 +400,12 @@ class KuzuGraphStore:
             # m.space_id folded in so neighbour props match get_node's shape.
             props = dict(_merge_space(_parse(props_raw), m_space))
             props.setdefault("id", nid)
+            if space_set is not None and not _space_passes(props, space_set):
+                # Redundant for the common case (already pushed into the
+                # Cypher WHERE above, ahead of LIMIT) — kept as
+                # defense-in-depth for the same _merge_space precedence edge
+                # case documented in _sql_graph_base.py's _expand.
+                continue
             if pack_set is not None:
                 # `node_id` is always the anchor side of this 1-hop query (the
                 # caller already verified it passes — once up front in
@@ -333,8 +430,10 @@ class KuzuGraphStore:
                 "relation_type": rel,
                 "relationship_types": [rel],
                 "depth": 1,
+                # Canonical edge endpoints (see _sql_graph_base._expand).
+                "from_id": node_id if is_out else nid,
+                "to_id": nid if is_out else node_id,
             })
-        return results
 
     def find_by_relations(
         self,
@@ -435,6 +534,7 @@ class KuzuGraphStore:
         )
         counts: dict[str, int] = {}
         anchor_titles: dict[str, str] = {}
+        anchor_descs: dict[str, str] = {}
         pkg_titles: dict[str, str] = {}
         while r.has_next():
             row = r.get_next()
@@ -449,6 +549,9 @@ class KuzuGraphStore:
                 t = props.get("title") or ""
                 if t:
                     anchor_titles[pid] = t
+                d = props.get("description") or ""
+                if d:
+                    anchor_descs[pid] = d
             # 2순위: source_package_title (외부 pack 로더)
             if pid not in pkg_titles:
                 t = props.get("source_package_title") or ""
@@ -459,36 +562,227 @@ class KuzuGraphStore:
                 "pack_id": pid,
                 "node_count": cnt,
                 "sample_title": anchor_titles.get(pid) or pkg_titles.get(pid) or "",
+                # description은 anchor에만 존재한다(source_package_title 같은
+                # 노드 단위 폴백이 없다) — 없으면 빈 문자열.
+                "sample_description": anchor_descs.get(pid, ""),
             }
             for pid, cnt in sorted(counts.items(), key=lambda x: -x[1])
             if cnt >= min_nodes
         ]
 
+    def _scan_space_matching(
+        self, space: str | None
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield ``(node_type, props)`` for every node matching ``space``,
+        with NO LIMIT clause -- shared by ``export_nodes`` and
+        ``count_exported_nodes`` for their ``pack_id`` branch, since
+        ``pack_id`` lives inside the JSON-serialized ``props`` blob and
+        can't be pushed into Cypher the way ``space_id`` (a real column,
+        see _NODE_DDL) can (issue #54).
+
+        Sharing this one scan is deliberate (audit finding #54-[3]): an
+        earlier version had ``export_nodes`` apply its LIMIT BEFORE the
+        pack_id filter while ``count_exported_nodes`` filtered pack_id
+        first -- same predicate, different order, so a caller could see an
+        accurate ``total`` alongside a truncated-to-empty ``nodes`` page
+        (e.g. ``total: 5, nodes: []``) whenever the first ``limit`` rows
+        Cypher happened to return were all wrong-pack_id. Both callers now
+        filter pack_id from this same unlimited stream before either one
+        applies its own truncation (``export_nodes`` slices to ``limit``
+        AFTER filtering; ``count_exported_nodes`` doesn't slice at all).
+
+        MEMORY (audit finding #54-[2]): this is a generator, not a list
+        build -- ``r.has_next()``/``r.get_next()`` pull one row at a time
+        from the underlying pybind11 query cursor (ladybug's
+        ``QueryResult``, see its docstring), so nothing here calls
+        ``get_all()`` or otherwise materializes the full result set in
+        Python. ``export_nodes`` additionally stops pulling (breaks out of
+        the loop that consumes this generator) as soon as it has ``limit``
+        pack_id-matching rows, so it never drains rows beyond what it
+        needs. ``count_exported_nodes`` has no such early exit by
+        definition -- an exact count must see every matching row -- so it
+        is the one caller that pays the full O(n) traversal (pre-existing
+        Kuzu pack_id characteristic per #54-[7]'s docstring, not new here).
+        MEASURED: RSS delta for count_exported_nodes(pack_id=...) fully
+        draining this generator over 50,000 rows was ~5.6MB (~112 bytes of
+        Python-level overhead per row, consistent with one dict at a time
+        rather than a buffered list of 50,000 dicts) -- not proportional
+        to holding the whole result set, and export_nodes' early-exit path
+        (limit=10 against the same 50,000 rows) added only ~0.5MB more.
+        """
+        where_clause = "WHERE n.space_id = $space " if space is not None else ""
+        params = {"space": space} if space is not None else {}
+        r = self._conn.execute(
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.node_type, n.space_id, n.props",
+            params,
+        )
+        while r.has_next():
+            ntype, space_id, props_raw = r.get_next()
+            yield ntype, _merge_space(_parse(props_raw), space_id)
+
+    @staticmethod
+    def _matches_pack_id(props: dict[str, Any], pack_id: str) -> bool:
+        return (
+            props.get("pack_id") == pack_id
+            or props.get("source") == pack_id
+            or props.get("source_id") == pack_id
+        )
+
     def export_nodes(
         self,
         pack_id: str | None = None,
         limit: int = 500_000,
+        space: str | None = None,
     ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the Cypher WHERE clause
+        ahead of LIMIT via the ``space_id`` node property -- a plain
+        equality check, since Kuzu keeps space in its own column (see
+        _NODE_DDL) just like the SQL backends (issue #54).
+
+        ``pack_id`` lives inside the JSON-serialized ``props`` blob, which
+        Cypher has no native way to index into, so it cannot be pushed into
+        the WHERE clause the way ``space`` can. To still apply ``limit``
+        AFTER the pack_id filter (not before -- audit finding #54-[3]: an
+        earlier version put LIMIT first here while ``count_exported_nodes``
+        already filtered pack_id first, so an accurate `total` could
+        disagree with a wrongly-truncated `nodes` page), this scans all
+        space-matching rows via ``_scan_space_matching`` (no LIMIT in that
+        Cypher), Python-filters by pack_id, and stops as soon as ``limit``
+        matches are collected -- not before.
+
+        ``limit <= 0`` (issue #120): returns ``[]`` before issuing any query,
+        in both branches below -- 0 rows requested must mean 0 rows returned,
+        not "1 row slipped through because it was collected before the limit
+        check" (the pack_id branch's original bug) and not "unbounded" (a
+        negative limit has no natural SQL/Cypher meaning here; this store's
+        SQL-backend sibling would even hand SQLite ``LIMIT -1``, which SQLite
+        treats as "no limit" -- the opposite of what a negative count should
+        do). This is the same rule the SQL backend now applies (see
+        ``_sql_graph_base.py``'s ``export_nodes``), so all three paths agree."""
         self._require_available()
-        # space_id is returned so _merge_space can restore it into props: this
-        # backend keeps space in its own column (see _NODE_DDL), but the
-        # protocol's export shape carries it inside props.
+        if limit <= 0:
+            return []
+        if pack_id is None:
+            # No JSON-blob filter needed -- space (if any) is already
+            # applied server-side, so LIMIT can stay in the Cypher query
+            # itself (cheapest path: the engine can stop scanning early).
+            where_clause = "WHERE n.space_id = $space " if space is not None else ""
+            params = {"space": space} if space is not None else {}
+            r = self._conn.execute(
+                f"MATCH (n:OntologyNode) {where_clause}"
+                f"RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}",
+                params,
+            )
+            results: list[dict[str, Any]] = []
+            while r.has_next():
+                ntype, space_id, props_raw = r.get_next()
+                results.append(
+                    {"props": _merge_space(_parse(props_raw), space_id), "labels": [ntype]}
+                )
+            return results
+        results = []
+        for ntype, props in self._scan_space_matching(space):
+            if self._matches_pack_id(props, pack_id):
+                results.append({"props": props, "labels": [ntype]})
+                if len(results) >= limit:
+                    break
+        return results
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Exact match count for the same predicate ``export_nodes`` filters
+        on, applied in the SAME order (space pushed into Cypher, pack_id
+        filtered from an unlimited scan before any truncation -- see
+        ``export_nodes``' docstring and ``_scan_space_matching``), unbounded
+        by any LIMIT (issue #54: ``total`` must reflect the true match
+        count, not get truncated by a caller's display ``limit``).
+
+        When ``pack_id`` is None, this is a real Cypher ``count(n)`` pushdown
+        on ``space`` alone -- cheap, no row materialization. When ``pack_id``
+        IS given, an exact server-side count is not possible (same JSON-blob
+        limitation as ``export_nodes``), so this counts every
+        ``_scan_space_matching`` row that matches pack_id -- an O(n) scan,
+        pre-existing characteristic of Kuzu's pack_id filter, not new here
+        (tracked separately as a scalability follow-up).
+        """
+        self._require_available()
+        if pack_id is None:
+            where_clause = "WHERE n.space_id = $space " if space is not None else ""
+            params = {"space": space} if space is not None else {}
+            r = self._conn.execute(
+                f"MATCH (n:OntologyNode) {where_clause}RETURN count(n)", params
+            )
+            return int(r.get_next()[0])
+        return sum(
+            1
+            for _ntype, props in self._scan_space_matching(space)
+            if self._matches_pack_id(props, pack_id)
+        )
+
+    def search_nodes(
+        self,
+        keyword: str,
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search of ``keyword`` across ``fields``
+        of every node, restricted to ``spaces`` if given (issue #86, the
+        same "LIMIT before filter" class ``_scan_space_matching``'s
+        ``pack_id`` branch fixed for #54's Kuzu port):
+        ``HybridQuery.keyword_search`` used to fetch only the first 50,000
+        rows via ``export_nodes`` and search only those in Python, silently
+        missing ~80% of a 252k-row corpus with no error.
+
+        ``spaces`` (a real ``space_id`` column, unlike the search fields
+        below) is pushed into the Cypher WHERE clause. The search fields
+        themselves live inside the JSON-serialized ``props`` blob, which
+        Cypher can't index into any more than it can for ``pack_id`` (see
+        ``_scan_space_matching``'s docstring) -- so this streams every
+        space-matching row with NO LIMIT clause and stops only once
+        ``limit`` keyword matches are found, i.e. LIMIT is applied AFTER
+        the keyword filter, not before.
+
+        ``limit <= 0`` short-circuits to ``[]`` without scanning (issue
+        #86 boundary check): the break condition below is
+        ``len(results) >= limit``, checked only AFTER appending a match, so
+        ``limit=0`` previously still returned the first match found (one
+        row, not zero) and any negative ``limit`` behaved like ``limit=1``
+        -- neither is "caller wants nothing back". Matches the same
+        ``limit<=0`` -> ``[]`` contract as the SQL backends' search_nodes
+        (see _sql_graph_base.py).
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- ``fields`` never reaches Cypher text here (it's
+        only ever used as a plain ``dict.get(f)`` key below, so an
+        arbitrary string is inert, not an injection vector), but the
+        validation still runs so a bad ``fields`` argument fails the SAME
+        way (loud ``ValueError``) on every backend rather than raising a
+        SQL error on the SQL backends and being silently accepted here.
+        Empty ``fields`` returns ``[]`` immediately: no field can ever
+        match, so there is nothing to search for."""
+        self._require_available()
+        if limit <= 0:
+            return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
+        kw_lower = keyword.lower()
+        where_clause = "WHERE n.space_id IN $spaces " if spaces else ""
+        params: dict[str, Any] = {"spaces": spaces} if spaces else {}
         r = self._conn.execute(
-            f"MATCH (n:OntologyNode) RETURN n.node_type, n.space_id, n.props LIMIT {int(limit)}"
+            f"MATCH (n:OntologyNode) {where_clause}RETURN n.node_type, n.space_id, n.props",
+            params,
         )
         results: list[dict[str, Any]] = []
         while r.has_next():
-            row = r.get_next()
-            ntype, space_id, props_raw = row[0], row[1], row[2]
+            ntype, space_id, props_raw = r.get_next()
             props = _merge_space(_parse(props_raw), space_id)
-            if pack_id is not None:
-                if (
-                    props.get("pack_id") != pack_id
-                    and props.get("source") != pack_id
-                    and props.get("source_id") != pack_id
-                ):
-                    continue
-            results.append({"props": props, "labels": [ntype]})
+            if any(kw_lower in str(props[f]).lower() for f in fields if props.get(f)):
+                results.append({"props": props, "labels": [ntype]})
+                if len(results) >= limit:
+                    break
         return results
 
     def export_edges(

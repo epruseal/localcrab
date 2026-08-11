@@ -144,6 +144,85 @@ class SqlDialect:
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"
 
+    def json_truthy_text(self, col: str, key: str) -> str:
+        """Canonical TEXT form of a JSON field, or SQL NULL — mirroring
+        Python's truthiness test in ``opencrab/stores/_graph_common.py``'s
+        ``_node_pack_id`` (``str(pid) if pid else None``), not just
+        ``json_get``'s bare extraction:
+
+        - JSON ``null``/missing key -> NULL (``json_get`` already got this
+          part right on its own).
+        - JSON ``""`` (empty string) -> NULL (``json_get`` alone does NOT:
+          a bare extraction is non-NULL text ``''``, which a naive ``pid IS
+          NULL`` check would miss, wrongly treating an empty-string pack_id
+          as a real foreign pack_id instead of "no pack_id").
+        - JSON ``0``/``0.0``/``false`` -> NULL (same gap: these are non-NULL
+          but Python-falsy). Zero is compared numerically (PG: cast to
+          ``numeric``; SQLite: ``json_extract`` already normalises any zero
+          REAL to ``'0.0'`` on CAST), not as raw text, so ``0``/``0.0``/
+          ``0.00``/``-0`` all collapse to the same NULL regardless of how
+          the number was originally written.
+        - JSON string ``"0"`` -> ``'0'`` (stays truthy — distinguished from
+          the number ``0`` via ``json_type``/``jsonb_typeof``, since a bare
+          text comparison cannot tell a JSON number from a JSON string that
+          happens to look like one).
+        - JSON number (e.g. ``1``) -> its TEXT form (e.g. ``'1'``), so it
+          can actually match a ``pack_ids`` list of strings — SQLite's
+          ``json_extract`` preserves the JSON scalar's native type, and
+          comparing an INTEGER to a bound TEXT parameter never matches.
+        - JSON ``true`` -> ``'True'`` (matches Python's ``str(True)``).
+
+        SCALAR VALUES ONLY. This is exact for string/number/boolean/null —
+        every shape ``pack_id`` has ever actually held (measured live,
+        2026-08-05: 252,579/252,585 graph_nodes and 614,986/614,988
+        graph_edges rows are JSON text, the rest missing; zero object,
+        array, or number/boolean rows). For a JSON object or array,
+        behavior is UNDEFINED relative to Python: this falls through to
+        ``ELSE`` (SQLite: the raw JSON text, e.g. ``'{"a":1}'``; PG: same
+        via ``->>``), while Python's ``str(pid)`` on a dict/list produces
+        Python's own repr (e.g. ``"{'a': 1}"``) — the two will never agree
+        on a canonical text form for a composite value, and reconciling
+        JSON-serialization vs Python-repr is not attempted here (a
+        composite ``pack_id`` is a data error, not a value either side
+        needs to correctly rank-and-file). See ``_SqlGraphStoreBase._expand``
+        for why the Python-side filter staying in place still matters for
+        this one gap.
+
+        Used by ``_SqlGraphStoreBase._pack_where`` for both the node- and
+        edge-side pack_id checks so the pushed-down SQL predicate and
+        ``_node_passes``/``_edge_passes`` can never disagree on what counts
+        as "no pack_id" (see issue #62 comment thread, cluster 5 —
+        empty-vs-absent divergence).
+        """
+        raw = self.json_get(col, key)
+        if self.name == "sqlite":
+            typ = f"json_type({col}, '$.{key}')"
+            return (
+                f"(CASE {typ}"
+                f" WHEN 'null' THEN NULL"
+                f" WHEN 'false' THEN NULL"
+                f" WHEN 'true' THEN 'True'"
+                f" WHEN 'text' THEN NULLIF({raw}, '')"
+                f" WHEN 'integer' THEN NULLIF(CAST({raw} AS TEXT), '0')"
+                f" WHEN 'real' THEN NULLIF(CAST({raw} AS TEXT), '0.0')"
+                f" ELSE CAST({raw} AS TEXT)"  # missing key, object, array
+                f" END)"
+            )
+        node = f"{col}->'{key}'"
+        typ = f"jsonb_typeof({node})"
+        return (
+            f"(CASE {typ}"
+            f" WHEN 'null' THEN NULL"
+            f" WHEN 'boolean' THEN (CASE WHEN {raw} = 'true' THEN 'True' ELSE NULL END)"
+            f" WHEN 'string' THEN NULLIF({raw}, '')"
+            # Text comparison alone would miss "0.0"/"0.00"/"-0" — jsonb's
+            # ->> preserves the number's original literal spelling, unlike
+            # SQLite's CAST (see docstring), so this compares numerically.
+            f" WHEN 'number' THEN (CASE WHEN ({node})::numeric = 0 THEN NULL ELSE {raw} END)"
+            f" ELSE {raw}"  # missing key, object, array
+            f" END)"
+        )
+
     def json_index_expr(self, col: str, key: str) -> str:
         """``json_get`` wrapped for use as a functional-index expression.
 

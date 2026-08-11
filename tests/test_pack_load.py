@@ -446,11 +446,40 @@ class TestDeletePack:
         assert graph.get_node("Document", "b1") is not None, (
             "다른 팩의 노드까지 지웠다 — 팩 경계가 무너졌다")
         assert chunk_vec_del == 0, "vec.available 이 False 면 벡터 삭제는 0이어야 한다"
-        # `node_del` 은 **노드 수가 아니다.** 그래프 행 + doc_nodes 보강 행의 합이라
-        # 노드 2개에 4가 나온다(출력 라벨도 "노드+엣지"다). 호출부가 이것을 노드 수로
-        # 읽으면 3원 대사가 어긋난다 — 그 의미를 여기 못박는다.
-        assert node_del == 4, (
-            f"node_del 은 그래프 행 + doc_nodes 보강 행의 합이다 (실제 {node_del})")
+        # `node_del` 은 **노드 수가 아니다.** 그래프 행 + `doc_nodes` **보강** 행의 합이다.
+        # 호출부가 이것을 노드 수로 읽으면 3원 대사가 어긋난다 — 그 의미를 못박는다.
+        #
+        # 한동안 이 값이 4 였다(노드 2개인데). 첫 루프의 `docs.delete_node_doc()` 이
+        # 조용히 실패하고 `except` 로 빠져서, 뒤의 "graph 트윈 없이 남은 앵커 정리"가
+        # 같은 2행을 다시 지웠기 때문이다. 상류가 그 삭제를 고치면서(#100 계열)
+        # 보강분이 0 이 됐다 — **동작 개선이지 퇴행이 아니다.**
+        #
+        # 그래서 숫자 하나를 박지 않고 **구성**을 건다: 보강분은 첫 루프가 놓친 것만
+        # 세야 하고, 정상 경로에서는 0 이어야 한다. 그것이 이 값의 계약이다.
+        assert node_del == 2, (
+            f"node_del 이 {node_del} 이다 — 노드 2개면 그래프 행 2 + 보강 0 이어야 한다. "
+            "4 가 나오면 첫 루프의 doc_nodes 삭제가 다시 실패해 같은 행을 두 번 세는 것이다")
+
+        # **보강 경로가 죽지는 않았는가.** 위 단언만으로는 그 코드를 통째로 지워도 통과한다.
+        # graph 트윈 없이 `doc_nodes` 에만 있는 앵커를 심어 실제로 정리되는지 본다.
+        # 스키마를 읽어서 NOT NULL 컬럼을 채운다 — 손으로 적으면 스키마가 바뀔 때
+        # 이 테스트만 조용히 깨진다(실제로 `updated_at` 을 빠뜨려 IntegrityError 가 났다).
+        cols = {r[1]: r for r in docs._conn.execute("PRAGMA table_info(doc_nodes)")}
+        vals = {"space": "resource", "node_id": "orphan-1",
+                "properties": json.dumps({"pack_id": "pack-c"})}
+        for name, info in cols.items():
+            if name in vals or info[4] is not None:      # 이미 채웠거나 기본값 있음
+                continue
+            if info[3]:                                   # NOT NULL
+                vals[name] = "1970-01-01T00:00:00Z" if "at" in name else ""
+        docs._conn.execute(
+            f"INSERT INTO doc_nodes ({','.join(vals)}) "
+            f"VALUES ({','.join('?' * len(vals))})", tuple(vals.values()))
+        docs._conn.commit()
+        n2, *_ = pack_load.delete_pack("pack-c", graph, docs, _NoVec())
+        assert n2 == 1, (
+            f"graph 트윈 없는 doc_nodes 앵커가 안 지워졌다 (실제 {n2}) — "
+            "보강 경로가 죽었다. backfill 이 만든 앵커가 팩 삭제 후에도 남는다")
 
     def test_deleted_pack_disappears_from_live_state(self, live, tmp_path):
         """왕복: 적재 → 삭제 → 라이브 상태가 비어 있다."""

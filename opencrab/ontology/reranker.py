@@ -50,6 +50,11 @@ def _item_text(item: dict[str, Any]) -> str:
     parts = [str(item.get("text") or "")]
     metadata = item.get("metadata") or {}
     graph_context = item.get("graph_context") or {}
+    # edge_endpoints carries raw node ids for provenance only. Leaving it in
+    # the haystack would let a parent node's id accidentally match a relation
+    # cue and shift ranking — a provenance field must not change scores.
+    if "edge_endpoints" in graph_context:
+        graph_context = {k: v for k, v in graph_context.items() if k != "edge_endpoints"}
     try:
         parts.append(str(metadata))
         parts.append(str(graph_context))

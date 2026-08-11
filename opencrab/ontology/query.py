@@ -83,6 +83,37 @@ class QueryResult:
         }
 
 
+@dataclass
+class QueryOutcome:
+    """Return value of :meth:`HybridQuery.query`.
+
+    #51: warnings must travel in the return value, not instance state —
+    ``HybridQuery`` is a process-lifetime singleton (see ``_get_context()``)
+    served from a threadpool (sync MCP/HTTP handlers), so an instance
+    attribute like the old ``self._last_warnings`` is shared and clobbered
+    across concurrent requests (same defect class as ``PackSelection``
+    in pack_selection.py was built to avoid — a local list returned per call).
+
+    Delegates ``__iter__``/``__len__``/``__getitem__`` to ``results`` so
+    existing call sites that treat the return value as ``list[QueryResult]``
+    (``for r in results``, ``len(results)``, ``results[0]``) keep working
+    unchanged; only code that wants the transitional warnings needs to know
+    about this type.
+    """
+
+    results: list[QueryResult]
+    warnings: list[str] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(self, idx):
+        return self.results[idx]
+
+
 @dataclass(frozen=True)
 class _QueryProfile:
     """Adaptive retrieval settings for the current question."""
@@ -256,13 +287,26 @@ class _Bm25CacheWorker:
                 break
             build_epoch = self._epoch
             try:
-                nodes = self._doc_store_getter().list_nodes(limit=_BM25_NODE_LIMIT)
-                fp = compute_fingerprint(nodes)
+                ds = self._doc_store_getter()
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up): a write
+                # landing between the two calls must make the recorded
+                # fingerprint OLDER than the nodes we index, not newer. Newer
+                # (the reversed order) would bake that write's effect into
+                # the nodes while stamping a fingerprint that already
+                # matches the post-write store state — the next probe would
+                # then agree "nothing changed" and the write is never
+                # reflected. Older is safe: the next probe sees a mismatch
+                # and schedules one extra (harmless) rebuild.
+                probe = getattr(ds, "bm25_fingerprint", None)
+                fp = probe(limit=_BM25_NODE_LIMIT) if probe is not None else None
+                nodes = ds.list_nodes(limit=_BM25_NODE_LIMIT)
+                if fp is None:
+                    fp = compute_fingerprint(nodes)
                 cache = self.cache
                 if cache is not None and fp == cache.fingerprint:
                     self.dirty = False          # nothing actually changed
                 else:
-                    new_index = BM25Index.build(nodes)
+                    new_index = BM25Index.build(nodes, fingerprint=fp)
                     self.cache = new_index        # atomic ref swap (GIL)
                     self.cache_size = len(nodes)
                     self.dirty = False
@@ -368,7 +412,7 @@ class HybridQuery:
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
         use_fts: bool = True,
-    ) -> list[QueryResult]:
+    ) -> QueryOutcome:
         """
         Execute a hybrid query: vector + BM25 + graph expansion, then rerank.
 
@@ -392,10 +436,58 @@ class HybridQuery:
 
         Returns
         -------
-        list[QueryResult] sorted by descending score.
+        QueryOutcome — ``.results`` (list[QueryResult], descending score) plus
+        ``.warnings`` (list[str]). Acts like the old bare list[QueryResult] for
+        iteration/len/indexing (see QueryOutcome docstring), so existing callers
+        that only care about results are unaffected.
         """
         result_lists: list[list[dict[str, Any]]] = []
         profile = _profile_for_query(question, limit, graph_depth)
+
+        # #51: 벡터 store 는 "space" 키가 없는 메타데이터를 매치 실패로 처리한다(무시가
+        # 아님 — Chroma missing-key 시맨틱의 의도적 복제, sqlite_vec_store.py 참조).
+        # builder.py 는 이 픽스 이후 신규 벡터에만 space 를 기록하므로, 백필 전까지는
+        # 기존 벡터가 space 필터에서 조용히 빠진다. "0건"과 "필터 미적용"을 호출자가
+        # 구분할 수 있도록 지역 변수에 담아 반환값(QueryOutcome)으로 전달한다 — 인스턴스
+        # 상태(self.*)는 프로세스 수명 싱글턴 + 스레드풀 실행 환경에서 요청 간 경합이
+        # 생기므로 쓰지 않는다(BM25/FTS 레그는 영향 없음).
+        warnings: list[str] = []
+        if spaces:
+            warnings.append(
+                "spaces filter: vectors ingested before this fix carry no 'space' "
+                "metadata and are excluded from the vector search leg until a "
+                "backfill runs (see issue #51); BM25 leg is unaffected (reads "
+                "doc_nodes.space, a real column builder.add_node has always "
+                "populated)."
+            )
+            # #52 follow-up (verifier, round 3): doc_sources (the
+            # FTS/keyword_search leg's table) has NO space column — space is
+            # read from the JSON `metadata` blob (see
+            # LocalSQLDocStore.keyword_search). Only ONE writer is fixed by
+            # this change: opencrab/mcp/tools/pack.py's legacy ingestion path
+            # (text_as_node=False) now defaults meta.setdefault("space",
+            # "evidence") before writing the SAME meta dict to both
+            # hybrid.ingest (vector leg) and mongo.upsert_source (this leg).
+            # apps/api/main.py's REST /api/ingest endpoint does NOT go
+            # through pack.py at all — it calls hybrid.ingest +
+            # docs.upsert_source directly with no space default (main.py
+            # :199-204, :507-521) — so a REST caller who doesn't set
+            # metadata["space"] themselves still produces an untagged row
+            # today. That surface is intentionally out of this fix's scope
+            # (#66 left it unwired too; tracked under #110's backfill
+            # instead). So the accurate claim is narrower than "everything
+            # ingested since this fix is tagged": only rows written via
+            # pack.py's ingest tools are tagged by default; rows written
+            # before this fix OR via the REST endpoint without an explicit
+            # space are still excluded until backfilled/fixed there.
+            warnings.append(
+                "spaces filter: doc_sources rows written before this fix, or "
+                "via apps/api/main.py's REST ingest endpoint without an "
+                "explicit 'space' in metadata, carry no 'space' tag and are "
+                "excluded from the FTS/keyword leg until a backfill runs (see "
+                "issue #52/#110); rows ingested through pack.py's ingest tools "
+                "are tagged by default and match normally."
+            )
 
         # --- Stage 1: Vector similarity search ---
         vector_hits = self._vector_search(
@@ -436,6 +528,7 @@ class HybridQuery:
             graph_results = self._graph_expand(
                 anchor_ids, profile.graph_depth, profile.graph_limit,
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
+                spaces=spaces,
             )
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
@@ -475,7 +568,7 @@ class HybridQuery:
                 metadata=metadata,
                 graph_context=item.get("graph_context"),
             ))
-        return results
+        return QueryOutcome(results=results, warnings=warnings)
 
     def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
         """Cheap ``(count, max_updated_at)`` probe for stale-cache detection.
@@ -486,9 +579,24 @@ class HybridQuery:
         legacy stores without the capability. Returns ``None`` on error so the
         caller simply skips the staleness check and serves the current index.
 
-        Must stay byte-for-byte equal to the fingerprint that
-        ``BM25Index.build(list_nodes(_BM25_NODE_LIMIT))`` records, including the
-        ``_BM25_NODE_LIMIT`` cap, so callers compare apples to apples.
+        NOTE (#63): ``doc_store.bm25_fingerprint()`` reports the WHOLE table,
+        deliberately ignoring ``_BM25_NODE_LIMIT`` — a capped fingerprint pins
+        at exactly the cap once the corpus exceeds it, so count-based change
+        detection would never fire again regardless of row ordering.
+
+        Must stay byte-for-byte comparable with the fingerprint recorded on
+        ``self._bm25_cache`` — both the cold-start build (see ``_bm25_search``)
+        and the background rebuild (``_Bm25CacheWorker._rebuild_loop``) stamp
+        the index with *this same* whole-table probe result via
+        ``BM25Index.build(nodes, fingerprint=...)``, not
+        ``compute_fingerprint(nodes)`` on the (possibly capped) indexed nodes.
+        That's what keeps this comparison meaningful once the corpus exceeds
+        the cap: both sides measure "what does the store look like", not "what
+        did we index" vs "what does the store look like" (which would never
+        agree again and would schedule a rebuild on every query). Legacy
+        stores without ``bm25_fingerprint()`` fall back to the capped
+        ``compute_fingerprint`` below on both sides consistently, so they
+        don't have this problem in the first place.
         """
         ds = self._doc_store
         if ds is None:
@@ -526,8 +634,16 @@ class HybridQuery:
 
             if self._bm25_cache is None:
                 # Cold start: nothing to serve yet, so build synchronously once.
+                # Fingerprint FIRST, nodes SECOND (#63 follow-up) — see the
+                # matching comment in _Bm25CacheWorker._rebuild_loop for why
+                # this order (not the reverse) is the safe one: a write
+                # landing in between must make the fingerprint stale relative
+                # to the nodes, never the other way round, or that write is
+                # never picked up. None (probe failed) falls back to
+                # compute_fingerprint(nodes) inside BM25Index.build().
+                fp = self._bm25_probe_fingerprint()
                 nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                self._bm25_cache = BM25Index.build(nodes)
+                self._bm25_cache = BM25Index.build(nodes, fingerprint=fp)
                 self._bm25_cache_size = len(nodes)
                 self._bm25_dirty = False
                 logger.debug("BM25 index cold-built (%d nodes)", self._bm25_cache_size)
@@ -565,6 +681,11 @@ class HybridQuery:
 
         백엔드-중립: doc store가 ``supports_keyword`` capability를 노출할 때만 사용.
         미지원·예외 시 빈 리스트로 graceful fallback(기존 하이브리드 무손상).
+
+        issue #52: ``spaces`` was accepted here but never forwarded to
+        ``keyword_search`` — this leg silently ignored the caller's space
+        filter. Now forwarded straight through; the doc store pushes it into
+        its own SQL WHERE clause (see ``LocalSQLDocStore.keyword_search``).
         """
         ds = self._doc_store
         if ds is None or not getattr(ds, "supports_keyword", False):
@@ -575,6 +696,7 @@ class HybridQuery:
                 pack_ids=pack_ids,
                 include_unpackaged=include_unpackaged,
                 limit=limit,
+                spaces=spaces,
             )
         except Exception as exc:
             logger.warning("FTS keyword search error: %s", exc)
@@ -710,12 +832,20 @@ class HybridQuery:
         limit: int,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[QueryResult]:
         """Expand graph neighbourhood from anchor node IDs.
 
         Uses at most 3 anchors for depth > 1 (multi-hop) to keep result sets
         manageable. Edge-type weights adjust the baseline score; a per-hop
         decay of 0.85 reduces scores for deeper neighbours.
+
+        issue #52: this method previously had no ``spaces`` parameter at
+        all — the graph leg silently ignored the caller's space filter and
+        mixed in neighbours from every space. Now pushed straight into
+        ``find_neighbors`` (real ``space``/``space_id`` column or property
+        on every backend, so no post-filter-after-LIMIT class of bug — see
+        each store's ``find_neighbors`` docstring).
         """
         if not self._neo4j.available:
             return []
@@ -727,9 +857,17 @@ class HybridQuery:
 
         for anchor_id in anchor_ids[:max_anchors]:
             try:
-                # Only forward pack kwargs when one is active so older graph
-                # store stubs (without the new signature) keep working.
-                extra: dict[str, Any] = {}
+                # pack_ids/include_unpackaged stay conditional (pre-existing
+                # pattern, out of #52's scope — see #54 for why conditional
+                # kwarg-forwarding on an unsupported *active* filter is a
+                # smell, not a feature: it lets a filter silently vanish
+                # instead of failing loud). spaces is forwarded
+                # unconditionally: every find_neighbors implementation in
+                # this tree now has the parameter (see _sql_graph_base.py /
+                # kuzu_graph_store.py / neo4j_store.py), so there is no
+                # "older stub" left to protect — a stub that still lacks it
+                # is a test double that should be fixed, not accommodated.
+                extra: dict[str, Any] = {"spaces": spaces}
                 if pack_ids:
                     extra["pack_ids"] = pack_ids
                     extra["include_unpackaged"] = include_unpackaged
@@ -748,6 +886,22 @@ class HybridQuery:
                         rel_type = n.get("relation_type") or n.get("relationship_type") or ""
                         rel_key = str(rel_type).upper()
                         base_score = _EDGE_WEIGHTS.get(rel_key, _DEFAULT_EDGE_SCORE) * hop_decay
+                        context: dict[str, Any] = {
+                            "anchor_id": anchor_id,
+                            "labels": n.get("labels", []),
+                            "relation_type": rel_type,
+                            "relationship_types": n.get("relationship_types"),
+                            "depth": n.get("depth") or depth,
+                        }
+                        # anchor_id is the BFS root, NOT the traversed edge's
+                        # source (they differ at every depth > 1, and even at
+                        # depth 1 the direction is unknown for direction="both").
+                        # Carry the store's real endpoints when it reports them.
+                        if n.get("from_id") and n.get("to_id"):
+                            context["edge_endpoints"] = {
+                                "from_id": n["from_id"],
+                                "to_id": n["to_id"],
+                            }
                         expanded.append(
                             QueryResult(
                                 source="graph",
@@ -755,13 +909,7 @@ class HybridQuery:
                                 score=base_score,
                                 text=_property_text(props, rel_type),
                                 metadata=props,
-                                graph_context={
-                                    "anchor_id": anchor_id,
-                                    "labels": n.get("labels", []),
-                                    "relation_type": rel_type,
-                                    "relationship_types": n.get("relationship_types"),
-                                    "depth": n.get("depth") or depth,
-                                },
+                                graph_context=context,
                             )
                         )
             except Exception as exc:
@@ -806,6 +954,11 @@ class HybridQuery:
                 metadatas=[meta],
                 ids=[source_id],
             )
+            # opencrab.ontology.builder.store_write_succeeded() only
+            # recognizes exactly "ok" or the "ok (...)" shape (status ==
+            # "ok" or status.startswith("ok (")) as success — keep the
+            # literal "ok (" (space + open-paren included) if this format
+            # ever changes, or this status silently stops being billed.
             result["stores"]["chromadb"] = f"ok (id={ids[0]})"
             result["vector_id"] = ids[0]
         except Exception as exc:
@@ -839,32 +992,29 @@ class HybridQuery:
         if not self._neo4j.available:
             return []
 
-        # --- 로컬 모드: LocalGraphStore는 run_cypher()가 no-op이므로
-        #     export_nodes() + Python-side 키워드 필터로 대체한다.
+        # --- 로컬/PG/Kuzu 모드: 이 세 백엔드는 run_cypher()가 no-op이므로
+        #     search_nodes() 로 대체한다 -- keyword/space 필터를 각 백엔드의
+        #     SQL WHERE / Cypher WHERE 로 LIMIT 이전에 푸시다운한다 (issue #86:
+        #     이전에는 export_nodes(limit=_BM25_NODE_LIMIT) 로 먼저 5만 건만
+        #     가져온 뒤 그 안에서만 Python 으로 키워드/space 를 걸러, 25만 건
+        #     코퍼스의 약 80% 가 검색에서 영구히 제외됐다 -- #54 의
+        #     limit-before-filter 결함과 같은 클래스, export_nodes/
+        #     count_exported_nodes 가 아니라 search_nodes 라는 별도 메서드인
+        #     이유는 export_nodes 가 pack 추출용 범용 벌크 export 이고 이
+        #     키워드 검색과는 무관한 용도이기 때문).
         # NOTE: GraphStore Protocol(opencrab/stores/_graph_protocol.py)에는
-        # keyword_search 메서드가 없어 이 isinstance 분기를 아직 제거할 수 없다
-        # (R5는 그 Protocol에 이미 있는 7개 메서드만 다뤘다) — Stage 8에서 정리 예정.
+        # keyword_search/search_nodes 메서드가 없어 이 isinstance 분기를 아직
+        # 제거할 수 없다 (R5는 그 Protocol에 이미 있는 7개 메서드만 다뤘다) —
+        # Stage 8에서 정리 예정.
         from opencrab.stores.kuzu_graph_store import KuzuGraphStore  # noqa: PLC0415
         from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
-        if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore)):
-            kw_lower = keyword.lower()
-            search_fields = ["name", "description", "text", "title", "label", "summary"]
-            candidate_rows = self._neo4j.export_nodes(limit=_BM25_NODE_LIMIT)
-            results: list[dict[str, Any]] = []
-            for row in candidate_rows:
-                props = row.get("props", {})
-                labels = row.get("labels", [""])
-                # spaces 필터
-                if spaces and props.get("space") not in spaces:
-                    continue
-                for field in search_fields:
-                    val = props.get(field, "")
-                    if val and kw_lower in str(val).lower():
-                        results.append({"node": props, "label": labels[0] if labels else ""})
-                        break
-                if len(results) >= limit:
-                    break
-            return results
+        from opencrab.stores.pg_graph_store import PGGraphStore  # noqa: PLC0415
+        if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore, PGGraphStore)):
+            rows = self._neo4j.search_nodes(keyword, spaces=spaces, limit=limit)
+            return [
+                {"node": row.get("props", {}), "label": (row.get("labels") or [""])[0]}
+                for row in rows
+            ]
 
         # --- Neo4j(Docker) 모드: 기존 Cypher 경로 유지
         space_filter = ""

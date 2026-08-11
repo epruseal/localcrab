@@ -119,6 +119,77 @@ def init(force: bool) -> None:
         )
     )
 
+    _bootstrap_local_user()
+
+
+def _bootstrap_local_user() -> None:
+    """Create the bootstrap owner/local user + token once (#144), atomically
+    (a crash between creating the user and issuing its token must not leave
+    a tokenless local user -- see ``auth.bootstrap_local_user``). Idempotent:
+    a second ``opencrab init`` finds the existing is_local user (enabled or
+    disabled -- ``get_local_user`` doesn't filter on that) and does not
+    recreate the user or reissue a token; reissuing would silently undo an
+    operator's deliberate ``user disable``."""
+    from sqlalchemy.exc import IntegrityError
+
+    from opencrab.auth import bootstrap_local_user, get_local_user
+    from opencrab.config import get_settings
+
+    cfg = get_settings()
+    sql = _make_stores(cfg, sql=True).sql
+    if not sql.available:
+        console.print("[red]SQL store unavailable -- skipping user bootstrap.[/red]")
+        raise SystemExit(1)
+
+    existing = get_local_user(sql)
+    if existing is not None:
+        console.print(f"[dim]Local user already bootstrapped ({existing.user_id}).[/dim]")
+        return
+
+    try:
+        user_id, secret = bootstrap_local_user(sql)
+    except IntegrityError as exc:
+        # Concurrent `init`: two runs both saw "no local user" above and both
+        # tried to insert is_local=1 -- only idx_users_single_local's own
+        # violation is that benign race; any other IntegrityError is a real
+        # failure and must propagate. bootstrap_local_user's `begin()` block
+        # already rolled back and closed the failed transaction, so
+        # get_local_user(sql) below opens a fresh connection rather than
+        # reusing the aborted one (required on PostgreSQL, where an aborted
+        # transaction can't be queried further).
+        #
+        # Dialects report this differently: PostgreSQL's message names the
+        # index ("duplicate key value violates unique constraint
+        # \"idx_users_single_local\""); SQLite's names the column instead
+        # ("UNIQUE constraint failed: users.is_local", confirmed by direct
+        # reproduction) -- match either.
+        orig = str(exc.orig)
+        if "idx_users_single_local" not in orig and "users.is_local" not in orig:
+            raise
+        existing = get_local_user(sql)
+        if existing is None:
+            console.print(
+                "[red]Local user bootstrap race detected, but no local user "
+                "exists afterward -- something else is wrong.[/red]"
+            )
+            raise SystemExit(1) from exc
+        console.print(
+            f"[dim]Local user already bootstrapped ({existing.user_id}) "
+            "(lost a concurrent init race).[/dim]"
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[bold]Local user created:[/bold] {user_id}\n\n"
+            "[bold]Bootstrap token (shown once -- save it now):[/bold]\n"
+            f"[cyan]{secret}[/cyan]\n\n"
+            f"[dim]Lost it? Run: opencrab token issue {user_id}[/dim]",
+            title="OpenCrab Auth Bootstrap",
+            border_style="yellow",
+        )
+    )
+
 
 def _write_default_env(path: Path) -> None:
     default_data_dir = Path.home() / ".local" / "share" / "localcrab"
@@ -254,6 +325,35 @@ def status() -> None:
             status_text = "[red]UNAVAILABLE[/red]"
         table.add_row(name, url, status_text)
 
+    # issue #105 codex follow-up: billing_events now lives in its own file
+    # in local/kuzu mode (make_billing_sql_store) and can fail independently
+    # of `sql` -- a corrupt billing.db or a permission problem specific to
+    # that one file. BillingHooks swallows a failed table-creation into a
+    # WARNING log only (see its `tables_ready` attribute), so without this
+    # row `status` could report every configured store OK while every
+    # billing event is silently being dropped -- the same "failure is
+    # swallowed and nobody notices" shape issue #105 itself was about, one
+    # layer up from emit()'s own return value. pg/docker mode shares `sql`
+    # (make_billing_sql_store returns it unchanged there), so its health is
+    # already covered by the "SQL" row above -- no separate row needed.
+    from opencrab.billing.hooks import BillingHooks
+    from opencrab.stores.factory import make_billing_sql_store
+
+    billing_store = make_billing_sql_store(cfg, sql)
+    if billing_store is not sql:
+        billing_hooks = BillingHooks(billing_store)
+        if not billing_store.available:
+            billing_status = "[red]UNAVAILABLE[/red]"
+        elif not billing_hooks.tables_ready:
+            billing_status = "[red]UNAVAILABLE (table creation failed)[/red]"
+        else:
+            try:
+                ok = billing_store.ping()
+                billing_status = "[green]OK[/green]" if ok else "[yellow]CONNECTED (ping failed)[/yellow]"
+            except Exception:
+                billing_status = "[yellow]CONNECTED[/yellow]"
+        table.add_row("Billing (SQLite)", cfg.local_data_dir + "/billing.db", billing_status)
+
     console.print(table)
 
 
@@ -275,6 +375,7 @@ def status() -> None:
 def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
 
@@ -310,10 +411,11 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             if effective_pack:
                 meta["pack_id"] = effective_pack
 
-            hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+            with write_lock():
+                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
 
-            if mongo.available:
-                mongo.upsert_source(source_id, text, meta)
+                if mongo.available:
+                    mongo.upsert_source(source_id, text, meta)
 
             ok_count += 1
             tag = f" pack={effective_pack}" if effective_pack else ""
@@ -346,6 +448,7 @@ def extract(
 ) -> None:
     """LLM-extract ontology nodes/edges from files and write to the graph."""
     from opencrab.config import get_settings
+    from opencrab.locking import write_lock
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.ontology.extractor import LLMExtractor
 
@@ -392,29 +495,30 @@ def extract(
                 console.print()
 
             if not dry_run:
-                for node in result.nodes:
-                    try:
-                        builder.add_node(
-                            space=node.space,
-                            node_type=node.node_type,
-                            node_id=node.node_id,
-                            properties=node.properties,
-                        )
-                    except Exception as exc:
-                        console.print(f"    [red]node {node.node_id}: {exc}[/red]")
+                with write_lock():
+                    for node in result.nodes:
+                        try:
+                            builder.add_node(
+                                space=node.space,
+                                node_type=node.node_type,
+                                node_id=node.node_id,
+                                properties=node.properties,
+                            )
+                        except Exception as exc:
+                            console.print(f"    [red]node {node.node_id}: {exc}[/red]")
 
-                for edge in result.edges:
-                    try:
-                        builder.add_edge(
-                            from_space=edge.from_space,
-                            from_id=edge.from_id,
-                            relation=edge.relation,
-                            to_space=edge.to_space,
-                            to_id=edge.to_id,
-                            properties=edge.properties,
-                        )
-                    except Exception as exc:
-                        console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")
+                    for edge in result.edges:
+                        try:
+                            builder.add_edge(
+                                from_space=edge.from_space,
+                                from_id=edge.from_id,
+                                relation=edge.relation,
+                                to_space=edge.to_space,
+                                to_id=edge.to_id,
+                                properties=edge.properties,
+                            )
+                        except Exception as exc:
+                            console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")
 
             total_nodes += len(result.nodes)
             total_edges += len(result.edges)
@@ -513,13 +617,18 @@ def query(
             err=True,
         )
 
-    results = hybrid.query(
+    outcome = hybrid.query(
         question=question,
         spaces=space_filter,
         limit=limit,
         pack_ids=effective_pack_ids,
         include_unpackaged=include_unpackaged,
     )
+    results = outcome.results
+    # #51: spaces 필터의 과도기 경고(백필 전 기존 벡터 제외)를 pack 경고와 동일하게 echo.
+    # outcome.warnings 는 query() 의 반환값(지역 변수)이라 인스턴스 상태 경합이 없다.
+    for warning in outcome.warnings:
+        click.echo(f"warning: {warning}", err=True)
 
     # --- Legacy list JSON output (must remain unchanged in shape) ---
     if json_output and not json_envelope:
@@ -856,6 +965,10 @@ def packs_backfill_pack_id(
     if warning:
         console.print(f"[yellow]{warning}[/yellow]")
 
+    # No write_lock() here on purpose: backfill_pack_ids() takes it itself,
+    # around the write and only when there is one. Locking here as well would
+    # take an exclusive lock for --dry-run, which writes nothing, and would
+    # leave every non-CLI caller of backfill_pack_ids() unprotected.
     summary = backfill_pack_ids(
         db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
     )
@@ -887,6 +1000,172 @@ def packs_reindex_bm25() -> None:
             default=str,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# user group (#144)
+# ---------------------------------------------------------------------------
+
+
+def _require_sql():
+    """Shared helper: build the SQL store or exit(1) if unavailable."""
+    from opencrab.config import get_settings
+
+    sql = _make_stores(get_settings(), sql=True).sql
+    if not sql.available:
+        console.print("[red]SQL store unavailable.[/red]")
+        raise SystemExit(1)
+    return sql
+
+
+@main.group()
+def user() -> None:
+    """Manage principal-store users."""
+
+
+@user.command("add")
+@click.argument("display_name")
+@click.option(
+    "--local",
+    "is_local",
+    is_flag=True,
+    default=False,
+    help="Bind as the stdio/CLI local principal (at most one; see 'opencrab init').",
+)
+def user_add(display_name: str, is_local: bool) -> None:
+    """Create a new user."""
+    from opencrab.auth import create_user
+
+    sql = _require_sql()
+    try:
+        user_id = create_user(sql, display_name, is_local=is_local)
+    except Exception as exc:
+        console.print(f"[red]Could not create user: {exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print_json(
+        json.dumps(
+            {"user_id": user_id, "display_name": display_name, "is_local": is_local},
+            ensure_ascii=False,
+        )
+    )
+
+
+@user.command("list")
+def user_list() -> None:
+    """List all users."""
+    from opencrab.auth import list_users
+
+    sql = _require_sql()
+    users = list_users(sql)
+    table = Table(title="OpenCrab Users", show_header=True, header_style="bold cyan")
+    table.add_column("user_id", style="bold")
+    table.add_column("display_name")
+    table.add_column("local")
+    table.add_column("disabled")
+    table.add_column("created_at")
+    for u in users:
+        table.add_row(
+            u["user_id"], u["display_name"], str(u["is_local"]), str(u["disabled"]), str(u["created_at"])
+        )
+    console.print(table)
+
+
+@user.command("disable")
+@click.argument("user_id")
+def user_disable(user_id: str) -> None:
+    """Disable a user (their tokens stop verifying)."""
+    from opencrab.auth import disable_user
+
+    sql = _require_sql()
+    try:
+        disabled = disable_user(sql, user_id)
+    except Exception as exc:
+        console.print(f"[red]Could not disable user: {exc}[/red]")
+        raise SystemExit(1) from exc
+    if not disabled:
+        console.print(f"[red]No such user: {user_id}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]Disabled {user_id}[/green]")
+
+
+@user.command("enable")
+@click.argument("user_id")
+def user_enable(user_id: str) -> None:
+    """Re-enable a disabled user (their tokens verify again). The recovery
+    path that makes ``user disable`` (including on the local user) safe."""
+    from opencrab.auth import enable_user
+
+    sql = _require_sql()
+    if not enable_user(sql, user_id):
+        console.print(f"[red]No such user: {user_id}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]Enabled {user_id}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# token group (#144)
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def token() -> None:
+    """Manage API tokens."""
+
+
+@token.command("issue")
+@click.argument("user_id")
+@click.option("--name", default=None, help="Optional label for this token.")
+def token_issue(user_id: str, name: str | None) -> None:
+    """Issue a new token for a user. Prints the secret once."""
+    from opencrab.auth import issue_token
+
+    sql = _require_sql()
+    try:
+        token_id, secret = issue_token(sql, user_id, name=name)
+    except ValueError as exc:
+        console.print(f"[red]Could not issue token: {exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print(
+        Panel(
+            f"[bold]token_id:[/bold] {token_id}\n\n"
+            "[bold]Secret (shown once -- save it now):[/bold]\n"
+            f"[cyan]{secret}[/cyan]",
+            title="OpenCrab Token Issued",
+            border_style="yellow",
+        )
+    )
+
+
+@token.command("list")
+@click.argument("user_id")
+def token_list(user_id: str) -> None:
+    """List a user's tokens (never shows hashes or secrets)."""
+    from opencrab.auth import list_tokens
+
+    sql = _require_sql()
+    tokens = list_tokens(sql, user_id)
+    table = Table(title=f"Tokens for {user_id}", show_header=True, header_style="bold cyan")
+    table.add_column("token_id", style="bold")
+    table.add_column("name")
+    table.add_column("created_at")
+    table.add_column("last_used_at")
+    table.add_column("revoked_at")
+    for t in tokens:
+        table.add_row(
+            t["token_id"], t["name"] or "", str(t["created_at"]), str(t["last_used_at"]), str(t["revoked_at"])
+        )
+    console.print(table)
+
+
+@token.command("revoke")
+@click.argument("token_id")
+def token_revoke(token_id: str) -> None:
+    """Revoke a token."""
+    from opencrab.auth import revoke_token
+
+    sql = _require_sql()
+    revoke_token(sql, token_id)
+    console.print(f"[green]Revoked {token_id}[/green]")
 
 
 # ---------------------------------------------------------------------------

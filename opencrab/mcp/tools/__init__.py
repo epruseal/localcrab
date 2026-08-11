@@ -67,11 +67,11 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
-import fcntl
-import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
+
+from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import UnknownToolError as UnknownToolError
@@ -98,57 +98,41 @@ def _lock_data_dir() -> str:
     대비해, 반환 전 os.makedirs(exist_ok=True)로 생성을 보장한다(락 파일 open()이
     FileNotFoundError로 죽는 것을 방지).
     """
-    data_dir = os.environ.get("LOCAL_DATA_DIR")
-    if not data_dir:
-        from opencrab.config import get_settings
-
-        data_dir = get_settings().local_data_dir
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    return lock_data_dir()
 
 
 def _acquire_chroma_shared_lock() -> None:
+    """Hold a shared lock on chroma.lock for the server's lifetime.
+
+    ``shared=True`` is a real ``LOCK_SH`` on POSIX, letting several local
+    chroma-backed processes hold it concurrently, but ``opencrab.locking``
+    emulates it as an exclusive byte-range lock on Windows (msvcrt has no
+    reader/writer lock), so two local chroma processes on Windows would
+    block each other rather than share (issue #140).
+
+    Only MCP takes this lock. The REST app and the migration script open
+    local chroma clients without it, so the exclusion it is meant to
+    provide does not actually hold -- also issue #140, which is where the
+    ownership redesign belongs. This function deliberately keeps ``main``'s
+    semantics (one module-global handle, rebound per call) rather than
+    refcounting: #70 measured the rebinding design and found it does NOT
+    leak on CPython, and a refcount that fails to decrement on the context
+    initialisation failure path would be strictly worse.
+    """
     global _chroma_lock_fh
-    data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "chroma.lock")
-    _chroma_lock_fh = open(lock_path, "w")
-    fcntl.flock(_chroma_lock_fh, fcntl.LOCK_SH)
+    _chroma_lock_fh = acquire_file_lock("chroma.lock", _lock_data_dir(), shared=True)
 
 
-# Tools that mutate the stores. When several MCP server processes run against the
-# same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
-# writes must be serialised. This is a *per-write* exclusive lock on a dedicated
-# write.lock file — entirely separate from the lifetime-held chroma.lock (LOCK_SH)
-# above, which only guards against the offline batch loader (LOCK_EX). Reads take
-# no lock. NOTE: lockless concurrent reads across processes is THIS layer's design
-# assumption, NOT a chromadb guarantee — chromadb officially treats multi-process
-# PersistentClient sharing as unsupported. write.lock serialises the one hazard the
-# docs name explicitly (concurrent writers); cross-process reads here are
-# stale-risk (a reader's in-memory HNSW won't see another process's new vectors
-# until reload), not corruption. Robust fix = single chroma server + HttpClient.
-WRITE_TOOLS = {
-    "ontology_add_node",
-    "ontology_add_edge",
-    "pack_create",
-    "pack_ingest",
-    "schema_pack_install",
-    "schema_pack_uninstall",
-    "harness_promotion_apply",
-}
+# WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
+# once every handler submodule has registered via @tool(..., writes=True) — see
+# that assembly for the full rationale of *why* write tools need serialising.
 
 
 @contextmanager
 def _write_lock():
     """Hold an exclusive cross-process lock for the duration of a write tool."""
-    data_dir = _lock_data_dir()
-    lock_path = os.path.join(data_dir, "write.lock")
-    fh = open(lock_path, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX)  # blocks until no other instance is writing
+    with file_lock("write.lock", _lock_data_dir()):
         yield
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
 
 
 def _clean_str(s: str) -> str:
@@ -192,6 +176,7 @@ def _get_context() -> dict[str, Any]:
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
     from opencrab.stores.factory import (
+        make_billing_sql_store,
         make_doc_store,
         make_graph_store,
         make_sql_store,
@@ -224,8 +209,12 @@ def _get_context() -> dict[str, Any]:
     hybrid._rebac = rebac
 
     # Phase 5: billing hooks
+    # issue #105: billing_events gets its own SQLite file in local/kuzu mode
+    # (a no-op passthrough to `sql` in pg/docker mode) — see
+    # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
+    # module docstring (including "NO AUTOMATIC MIGRATION") for why.
     from opencrab.billing.hooks import BillingHooks
-    billing = BillingHooks(sql)
+    billing = BillingHooks(make_billing_sql_store(cfg, sql))
 
     _context = {
         "neo4j": graph,
@@ -322,3 +311,41 @@ TOOLS: list[dict[str, Any]] = build_tools()
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in _REGISTRY.items()}
 _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {name: spec.fn for name, spec in _REGISTRY.items()}
 dispatch_tool = _registry_dispatch_tool
+
+# Tools that need the cross-process write.lock (NOT "tools that touch a store" —
+# see the `writes` field docstring in _registry.py#tool; a store write whose
+# file is structurally independent of every write.lock'd writer's file, so
+# there is no contention for the lock to prevent in the first place, e.g.
+# billing_events via ontology_query (its own billing.db — issue #105
+# corrected both the earlier idempotency rationale and a later
+# retry-with-backoff attempt, neither of which was the real fix), deliberately
+# stays out of this set. When several MCP server processes run against the
+# same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
+# writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
+# lock on a dedicated write.lock file — entirely separate from the lifetime-held
+# chroma.lock (LOCK_SH) above, which only guards against the offline batch loader
+# (LOCK_EX). Reads take no lock. NOTE: lockless concurrent reads across processes
+# is THIS layer's design assumption, NOT a chromadb guarantee — chromadb
+# officially treats multi-process PersistentClient sharing as unsupported.
+# write.lock serialises the one hazard the docs name explicitly (concurrent
+# writers); cross-process reads here are stale-risk (a reader's in-memory HNSW
+# won't see another process's new vectors until reload), not corruption. Robust
+# fix = single chroma server + HttpClient.
+#
+# *Derived* from each handler's `@tool(..., writes=True)` declaration (see
+# _registry.tool) rather than hand-copied here. Issue #65: a hand-maintained
+# WRITE_TOOLS set silently missed ontology_impact / ontology_lever_simulate,
+# which persist rows via save_impact/save_simulation, so dispatch_tool never
+# locked around them. Deriving it means a future write handler that forgets
+# `writes=True` fails the registry contract test instead of silently
+# bypassing the lock.
+#
+# One-time snapshot, not a live view: computed once here, after all five
+# handler submodules (graph/query/pack/schema/harness) have been imported
+# above and finished registering into _REGISTRY, so it correctly captures
+# every built-in tool. A tool registered into _REGISTRY *after* this line
+# would not appear in WRITE_TOOLS — acceptable today because nothing
+# registers tools post-import except tests, which clean up their probe
+# registrations in a `finally` (see
+# tests/test_tool_registry_contract.py::TestWriteLockCoverage).
+WRITE_TOOLS: frozenset[str] = frozenset(name for name, spec in _REGISTRY.items() if spec.writes)

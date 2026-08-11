@@ -330,6 +330,36 @@ class TestKeywordSearchNeo4jPath:
         assert hybrid.keyword_search("x") == []
 
 
+class TestKeywordSearchPgRouting:
+    """issue #86: PGGraphStore was missing from the isinstance tuple that
+    routes keyword_search to the SQL-pushdown search_nodes() path, so
+    STORAGE_MODE=pg silently fell through to the "Neo4j(Docker) cypher
+    path" above instead -- which calls run_cypher(), a documented no-op
+    for every SQL backend (_SqlGraphStoreBase.run_cypher just logs a
+    warning and returns []). keyword_search() under PG mode always
+    returned [] with no error, a separate dead path from #86's main
+    50,000-node cap bug but caught by the same "check sibling call sites"
+    sweep -- both the Local/Kuzu path and the isinstance tuple that gates
+    it live in the one function this issue's fix touches."""
+
+    def test_pg_graph_store_routes_to_search_nodes_not_run_cypher(self) -> None:
+        from opencrab.stores.pg_graph_store import PGGraphStore
+
+        pg = MagicMock(spec=PGGraphStore)
+        assert isinstance(pg, PGGraphStore)  # sanity: spec mock satisfies isinstance
+        pg.available = True
+        pg.search_nodes = MagicMock(
+            return_value=[{"props": {"name": "n1"}, "labels": ["Concept"]}]
+        )
+        hybrid = HybridQuery(MagicMock(available=False), pg)
+
+        results = hybrid.keyword_search("term", spaces=["s1"], limit=5)
+
+        assert results == [{"node": {"name": "n1"}, "label": "Concept"}]
+        pg.search_nodes.assert_called_once_with("term", spaces=["s1"], limit=5)
+        pg.run_cypher.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _policy_filter — normal/error/edge
 # ---------------------------------------------------------------------------
@@ -409,6 +439,53 @@ class TestGraphExpand:
         results = hybrid._graph_expand(["bad", "good"], depth=1, limit=10)
         assert len(results) == 1
         assert results[0].node_id == "good_n"
+
+    def test_store_edge_endpoints_are_carried_into_graph_context(self) -> None:
+        neo4j = MagicMock()
+        neo4j.available = True
+        neo4j.find_neighbors = MagicMock(return_value=[{
+            "properties": {"id": "n2"},
+            "relation_type": "contains",
+            "labels": ["X"],
+            "depth": 2,
+            "from_id": "n1",
+            "to_id": "n2",
+        }])
+        hybrid = HybridQuery(MagicMock(available=False), neo4j)
+        ctx = hybrid._graph_expand(["anchor"], depth=2, limit=10)[0].graph_context
+        assert ctx["edge_endpoints"] == {"from_id": "n1", "to_id": "n2"}
+        # anchor_id는 그대로 유지되어야 한다(호환), 다만 edge source가 아니다.
+        assert ctx["anchor_id"] == "anchor"
+
+    def test_missing_store_endpoints_leave_no_edge_endpoints_key(self) -> None:
+        neo4j = MagicMock()
+        neo4j.available = True
+        neo4j.find_neighbors = MagicMock(return_value=[{
+            "properties": {"id": "n2"},
+            "relation_type": "contains",
+            "labels": ["X"],
+            "depth": 1,
+        }])
+        hybrid = HybridQuery(MagicMock(available=False), neo4j)
+        ctx = hybrid._graph_expand(["anchor"], depth=1, limit=10)[0].graph_context
+        assert "edge_endpoints" not in ctx
+
+
+class TestRerankerIgnoresEdgeEndpoints:
+    """provenance 필드가 랭킹 점수를 바꾸면 안 된다."""
+
+    def test_edge_endpoints_are_excluded_from_the_haystack(self) -> None:
+        from opencrab.ontology.reranker import _item_text
+
+        base = {"text": "본문", "metadata": {}, "graph_context": {"relation_type": "contains"}}
+        with_endpoints = {
+            **base,
+            "graph_context": {
+                "relation_type": "contains",
+                "edge_endpoints": {"from_id": "risk:change:law", "to_id": "n2"},
+            },
+        }
+        assert _item_text(with_endpoints) == _item_text(base)
 
 
 # ---------------------------------------------------------------------------

@@ -186,7 +186,7 @@ opencrab serve --transport http --host 127.0.0.1 --port 8766 \
 | | `schema_pack_uninstall` | 스키마 팩 제거 |
 | **하니스** | `harness_promotion_apply` | CrabHarness PromotionPackage 적용 (`dry_run` 지원) |
 
-> ReBAC/identity/promotion/billing 등 툴은 코드에 있으나 현재 MCP 미노출 상태입니다. `opencrab/mcp/tools/__init__.py`에서 해당 툴을 주석 해제하면 복원됩니다.
+> ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다 — 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
 
 ---
 

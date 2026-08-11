@@ -6,6 +6,7 @@ Public API:
     load_pack_registry(local_data_dir)
     get_pack(local_data_dir, pack_id)
     choose_packs(question, packs, min_score=...)
+    score_pack(question, pack)
 
 Auto-pack scoring is deterministic and keyword-based (no LLM). The first
 implementation returns only the top-1 candidate above ``min_score``; multi-
@@ -205,7 +206,15 @@ def _resolve_aliases(question_tokens: set[str]) -> set[str]:
     return expanded
 
 
-def _score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
+def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
+    """Deterministic keyword score of one pack against ``question``.
+
+    Public because ``content_pack_list(query=...)`` ranks graph-loaded packs
+    with the *same* function auto-pack uses — two scorers would let the browse
+    ranking and the auto-selection disagree about which pack a question means.
+    Callers that only want the ranking (not auto_pack's 10.0 threshold) apply
+    their own cutoff to the returned score.
+    """
     q_lower = (question or "").lower()
     if not q_lower:
         return 0.0, []
@@ -293,7 +302,7 @@ def choose_packs(
 
     scored: list[tuple[PackInfo, float, list[str]]] = []
     for pack in packs:
-        score, matched = _score_pack(question, pack)
+        score, matched = score_pack(question, pack)
         if score >= threshold and score > 0.0:
             scored.append((pack, score, matched))
     scored.sort(key=lambda item: item[1], reverse=True)

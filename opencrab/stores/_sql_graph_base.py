@@ -122,7 +122,16 @@ import logging
 from collections import deque
 from typing import Any
 
-from opencrab.stores._graph_common import _as_dict, _edge_passes, _merge_space, _node_passes
+from opencrab.stores._graph_common import (
+    KEYWORD_SEARCH_FIELDS,
+    _as_dict,
+    _edge_passes,
+    _merge_space,
+    _node_passes,
+    _normalize_space,
+    _space_passes,
+    _validate_search_fields,
+)
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
 logger = logging.getLogger(__name__)
@@ -168,6 +177,44 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
     ),
     indexes=(
         IndexSpec("idx_nodes_pack", "graph_nodes", json_key=("properties", "pack_id")),
+        # issue #54 audit finding [4]: export_nodes/count_exported_nodes's
+        # combined "pack_id OR source OR source_id) AND space_id" WHERE was
+        # measured (250k rows, 200 packs x 3 spaces) doing a full
+        # `SCAN graph_nodes` -- idx_nodes_pack alone doesn't help because
+        # SQLite won't turn a 3-way OR across one indexed + two unindexed
+        # expressions into an index-union. Adding this single plain-column
+        # index on the always-present, highly-selective space_id flips the
+        # plan to `SEARCH ... USING INDEX idx_nodes_space`, cutting the
+        # measured COUNT from ~209ms to ~93-116ms (see PR discussion) --
+        # same "index instead of eating the scan" resolution #63 used for
+        # its own 3x regression.
+        #
+        # COST, MEASURED (audit finding #54-[1], 250k-row SQLite table):
+        # - `CREATE INDEX IF NOT EXISTS` for this whole schema runs exactly
+        #   ONCE per store instance, inside `_init_db()`/`__init__` (see
+        #   LocalGraphStore/PGGraphStore) -- NOT once per thread-local
+        #   connection. Per-thread connections (`_new_conn()` in
+        #   _sqlite_base.py) only run two PRAGMAs (WAL, synchronous); they
+        #   never touch DDL. So there is exactly one first-ever build per
+        #   physical DB file, not a per-thread/per-connection cost.
+        # - First-ever `CREATE INDEX IF NOT EXISTS` on an existing 250k-row
+        #   DB (the one-time migration every LocalGraphStore/PGGraphStore
+        #   pays on its first open after upgrading, in that single
+        #   `_init_db()` call): ~150ms, synchronous, blocks that store's
+        #   constructor (same as any DDL already run there -- not a new
+        #   blocking pattern, just one more statement in the existing
+        #   list). Every later store open against the same (already
+        #   indexed) file: ~0.1ms (existence check only).
+        # - Write path: upsert cost with vs without this index was
+        #   benchmarked at 250k existing rows; the measured delta was at
+        #   noise level (within run-to-run variance, no consistent
+        #   direction) rather than a clear regression -- not reporting a
+        #   specific number here since it did not reproduce reliably
+        #   across runs.
+        # Verdict: a bounded ~150ms one-time migration and no measurable
+        # write regression against the measured 2x+ read improvement
+        # above, so the index is kept.
+        IndexSpec("idx_nodes_space", "graph_nodes", expr="space_id"),
         IndexSpec("idx_edges_from", "graph_edges", expr="from_id"),
         IndexSpec("idx_edges_to", "graph_edges", expr="to_id"),
     ),
@@ -222,6 +269,10 @@ class _SqlGraphStoreBase(abc.ABC):
     ) -> dict[str, Any]:
         self._require_available()
         props = {**properties, "id": node_id}
+        # issue #118: reconcile space_id/props["space"] before either lands,
+        # so the SQL predicates below (space_id column) can never disagree
+        # with what _merge_space would report back out on read.
+        props, space_id = _normalize_space(props, space_id)
         sql = self._dialect.upsert(
             self._table("graph_nodes"),
             ["node_type", "node_id", "space_id", "properties"],
@@ -331,27 +382,78 @@ class _SqlGraphStoreBase(abc.ABC):
         return _merge_space(_as_dict(row[0]), row[1]) if row else None
 
     def _fetch_edges_for_node(
-        self, node_id: str, cap: int, out: bool
+        self,
+        node_id: str,
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> list[tuple[str, str, str, Any]]:
         """Default per-node candidate-edge fetch (one query, LIMIT cap).
         Column order is always (other_type, other_id, relation, properties)
         regardless of direction, so callers never branch on direction to
-        read a row."""
-        table = self._table("graph_edges")
-        if out:
-            sql = f"SELECT to_type, to_id, relation, properties FROM {table} WHERE from_id=:nid LIMIT :cap"
-        else:
-            sql = f"SELECT from_type, from_id, relation, properties FROM {table} WHERE to_id=:nid LIMIT :cap"
-        return self._fetch_all(sql, {"nid": node_id, "cap": cap})
+        read a row.
+
+        When ``pack_set``/``space_set`` are given, their filters
+        (``_pack_where`` / ``space_id IN (...)``) are pushed into this
+        query's WHERE clause — joined against ``graph_nodes`` for the
+        "other" endpoint — so ``LIMIT :cap`` applies AFTER filtering, not
+        before (issue #62, and issue #52 for the space leg). Unlike
+        ``pack_id`` (a JSON property), ``space_id`` is a real column, so no
+        JSON extraction helper is needed — a plain ``IN`` clause suffices."""
+        edges = self._table("graph_edges")
+        anchor_col = "from_id" if out else "to_id"
+        other_type_col = "to_type" if out else "from_type"
+        other_id_col = "to_id" if out else "from_id"
+
+        if pack_set is None and space_set is None:
+            sql = (
+                f"SELECT {other_type_col}, {other_id_col}, relation, properties"
+                f" FROM {edges} WHERE {anchor_col}=:nid LIMIT :cap"
+            )
+            return self._fetch_all(sql, {"nid": node_id, "cap": cap})
+
+        nodes = self._table("graph_nodes")
+        where_clauses: list[str] = []
+        params: dict[str, Any] = {"nid": node_id, "cap": cap}
+        if pack_set is not None:
+            pack_where, pack_params = self._pack_where(
+                "n.properties", "e.properties", pack_set, include_unpackaged, "fe"
+            )
+            where_clauses.append(pack_where)
+            params.update(pack_params)
+        if space_set is not None:
+            placeholders, space_params = self._in_placeholders(sorted(space_set), "fesp")
+            where_clauses.append(f"n.space_id IN ({placeholders})")
+            params.update(space_params)
+        extra_where = " AND ".join(where_clauses)
+        sql = (
+            f"SELECT e.{other_type_col}, e.{other_id_col}, e.relation, e.properties"
+            f" FROM {edges} e"
+            f" JOIN {nodes} n ON n.node_type=e.{other_type_col} AND n.node_id=e.{other_id_col}"
+            f" WHERE e.{anchor_col}=:nid AND {extra_where}"
+            f" LIMIT :cap"
+        )
+        return self._fetch_all(sql, params)
 
     def _prefetch_frontier(
-        self, frontier_ids: list[str], cap: int, out: bool
+        self,
+        frontier_ids: list[str],
+        cap: int,
+        out: bool,
+        pack_set: set[str] | None = None,
+        include_unpackaged: bool = False,
+        space_set: set[str] | None = None,
     ) -> dict[str, list[tuple[str, str, str, Any]]]:
         """HOOK — default per-row prefetch (one query per frontier node,
         reproducing LocalGraphStore's historical behavior). PgGraphStore's
         adopter overrides this with a single unnest+LATERAL batch query (see
         module docstring)."""
-        return {fid: self._fetch_edges_for_node(fid, cap, out) for fid in frontier_ids}
+        return {
+            fid: self._fetch_edges_for_node(fid, cap, out, pack_set, include_unpackaged, space_set)
+            for fid in frontier_ids
+        }
 
     def _batch_node_props(
         self, pairs: set[tuple[str, str]]
@@ -379,6 +481,7 @@ class _SqlGraphStoreBase(abc.ABC):
         pack_set: set[str] | None,
         include_unpackaged: bool,
         props_cache: dict[tuple[str, str], dict[str, Any]],
+        space_set: set[str] | None = None,
     ) -> None:
         """Consume one node's prefetched candidate edges for one direction."""
         is_out = direction == "out"
@@ -390,7 +493,28 @@ class _SqlGraphStoreBase(abc.ABC):
             other_props = props_cache.get((other_type, other_id))
             if not other_props:
                 continue
+            if space_set is not None:
+                # Redundant for the common case: SQL already filtered on the
+                # real `space_id` column ahead of LIMIT (see
+                # _fetch_edges_for_node). Kept as defense-in-depth for the one
+                # divergent case _merge_space documents — an explicit
+                # caller-supplied props["space"] wins over the column — so a
+                # node whose properties JSON disagrees with its column is
+                # still caught here rather than leaking cross-space.
+                if not _space_passes(other_props, space_set):
+                    continue
             if pack_set is not None:
+                # Provably redundant for SCALAR pack_id values only: SQL
+                # already applied this same policy (via _pack_where /
+                # json_truthy_text) before LIMIT ran, so for a string/
+                # number/boolean/null pack_id this can never reject a row
+                # that reached here. It stays real, load-bearing defense
+                # for a non-scalar pack_id (a JSON object/array) — SQL's
+                # json_truthy_text falls through to a raw JSON-serialized
+                # ELSE for those (undefined relative to Python, see its
+                # docstring), so a composite pack_id can slip past the SQL
+                # filter and only get caught here. Do not delete this
+                # thinking it is dead code.
                 other_pass = _node_passes(other_props, pack_set, include_unpackaged)
                 if not other_pass:
                     continue
@@ -405,6 +529,13 @@ class _SqlGraphStoreBase(abc.ABC):
                 "relation_type": relation,
                 "relationship_types": [relation],
                 "depth": current_depth + 1,
+                # Canonical endpoints of the edge just traversed. Both ids are
+                # already in hand here (no extra query), and they are the only
+                # place the *direction* survives: find_neighbors is usually
+                # called with direction="both", and the caller's anchor is not
+                # the edge source once depth > 1.
+                "from_id": current_id if is_out else other_id,
+                "to_id": other_id if is_out else current_id,
             })
             next_level.append((other_id, current_depth + 1))
 
@@ -416,15 +547,26 @@ class _SqlGraphStoreBase(abc.ABC):
         limit: int = 50,
         pack_ids: list[str] | None = None,
         include_unpackaged: bool = False,
+        spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """BFS neighbour traversal, processed one depth-level at a time (see
-        module docstring's "_prefetch_frontier / _batch_node_props HOOKS")."""
+        module docstring's "_prefetch_frontier / _batch_node_props HOOKS").
+
+        ``spaces`` (issue #52): strict space-membership filter, pushed into
+        the SQL WHERE clause ahead of LIMIT (``_fetch_edges_for_node``) —
+        same "filter before limit, not after" discipline as ``pack_ids``
+        (issue #62), and cheaper since ``space_id`` is a real column, not a
+        JSON property. No "include unspaced" escape hatch, matching the
+        BM25/vector legs' strict semantics."""
         self._require_available()
         pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        space_set: set[str] | None = set(spaces) if spaces else None
 
-        if pack_set is not None:
+        if pack_set is not None or space_set is not None:
             anchor_props = self._fetch_node_props_by_id(node_id)
             if not _node_passes(anchor_props or {}, pack_set, include_unpackaged):
+                return []
+            if not _space_passes(anchor_props or {}, space_set):
                 return []
 
         visited: set[str] = {node_id}
@@ -438,9 +580,17 @@ class _SqlGraphStoreBase(abc.ABC):
             in_batch: dict[str, list] = {}
             if expandable:
                 if direction in ("out", "both"):
-                    out_batch = self._prefetch_frontier(expandable, limit, out=True)
+                    out_batch = self._prefetch_frontier(
+                        expandable, limit, out=True,
+                        pack_set=pack_set, include_unpackaged=include_unpackaged,
+                        space_set=space_set,
+                    )
                 if direction in ("in", "both"):
-                    in_batch = self._prefetch_frontier(expandable, limit, out=False)
+                    in_batch = self._prefetch_frontier(
+                        expandable, limit, out=False,
+                        pack_set=pack_set, include_unpackaged=include_unpackaged,
+                        space_set=space_set,
+                    )
 
             candidate_pairs: set[tuple[str, str]] = set()
             for rows in out_batch.values():
@@ -461,7 +611,7 @@ class _SqlGraphStoreBase(abc.ABC):
                         self._expand(
                             "out", out_batch, current_id, current_depth, remaining,
                             visited, results, next_level, limit, pack_set,
-                            include_unpackaged, props_cache,
+                            include_unpackaged, props_cache, space_set,
                         )
 
                 if direction in ("in", "both"):
@@ -470,7 +620,7 @@ class _SqlGraphStoreBase(abc.ABC):
                         self._expand(
                             "in", in_batch, current_id, current_depth, remaining,
                             visited, results, next_level, limit, pack_set,
-                            include_unpackaged, props_cache,
+                            include_unpackaged, props_cache, space_set,
                         )
 
             level = next_level
@@ -528,6 +678,7 @@ class _SqlGraphStoreBase(abc.ABC):
         pid = self._dialect.json_get("properties", "pack_id")
         title = self._dialect.json_get("properties", "title")
         src_title = self._dialect.json_get("properties", "source_package_title")
+        desc = self._dialect.json_get("properties", "description")
         sql = f"""
             SELECT
                 {pid} AS pack_id,
@@ -541,7 +692,11 @@ class _SqlGraphStoreBase(abc.ABC):
                     MAX(CASE WHEN node_id = 'dataset:' || ({pid}) THEN {title} END),
                     MAX({src_title}),
                     ''
-                ) AS sample_title
+                ) AS sample_title,
+                COALESCE(
+                    MAX(CASE WHEN node_id = 'dataset:' || ({pid}) THEN {desc} END),
+                    ''
+                ) AS sample_description
             FROM {table}
             WHERE {pid} IS NOT NULL
             GROUP BY {pid}
@@ -550,8 +705,13 @@ class _SqlGraphStoreBase(abc.ABC):
         """
         rows = self._fetch_all(sql, {"min_nodes": min_nodes})
         return [
-            {"pack_id": str(pack_id), "node_count": node_count, "sample_title": sample_title or ""}
-            for pack_id, node_count, sample_title in rows
+            {
+                "pack_id": str(pack_id),
+                "node_count": node_count,
+                "sample_title": sample_title or "",
+                "sample_description": sample_description or "",
+            }
+            for pack_id, node_count, sample_title, sample_description in rows
         ]
 
     @staticmethod
@@ -561,6 +721,48 @@ class _SqlGraphStoreBase(abc.ABC):
         SQLAlchemy's ``bindparam(expanding=True)`` on the PG side)."""
         names = [f"{prefix}{i}" for i in range(len(values))]
         return ", ".join(f":{n}" for n in names), dict(zip(names, values, strict=True))
+
+    def _pack_where(
+        self,
+        node_col: str,
+        edge_col: str,
+        pack_set: set[str],
+        include_unpackaged: bool,
+        prefix: str,
+    ) -> tuple[str, dict[str, str]]:
+        """SINGLE SOURCE for translating the shared pack-filter policy
+        (``opencrab/stores/_graph_common.py``'s ``_node_passes``/
+        ``_edge_passes``) into SQL, so it can be pushed into a WHERE clause
+        ahead of ``LIMIT`` instead of applied in Python after truncation
+        (issue #62: a hub whose first ``limit`` edges are all out-of-pack
+        could starve every in-pack neighbour before the Python filter ever
+        saw them). Both ``_fetch_edges_for_node`` (below) and
+        ``PGGraphStore._batch_frontier_edges`` call this one method, so a
+        future change to the policy cannot silently diverge between them.
+
+        Only valid for a candidate edge whose "current" endpoint has ALREADY
+        passed ``_node_passes`` (true for every caller in this file's BFS —
+        the anchor is checked once up front, and any other node only ever
+        reaches ``_prefetch_frontier`` after passing that same check in
+        ``_expand``). Under that invariant, ``_edge_passes``' ``src_passes``
+        is always True, which is what lets this reduce to two independent
+        clauses instead of a full min/max reproduction of ``_edge_passes``.
+
+        Uses ``json_truthy_text`` (not the bare ``json_get`` extraction) for
+        both sides: a raw JSON extraction is non-NULL for ``""``/``0``/
+        ``false``, which Python's ``_node_pack_id`` treats as "no pack_id"
+        (falsy). Without this, those values would be wrongly excluded here
+        — before ``LIMIT`` even runs — instead of being governed by
+        ``include_unpackaged`` like ``_node_passes`` does.
+        """
+        placeholders, params = self._in_placeholders(sorted(pack_set), prefix)
+        node_pid = self._dialect.json_truthy_text(node_col, "pack_id")
+        edge_pid = self._dialect.json_truthy_text(edge_col, "pack_id")
+        node_cond = f"{node_pid} IN ({placeholders})"
+        if include_unpackaged:
+            node_cond = f"({node_cond} OR {node_pid} IS NULL)"
+        edge_cond = f"({edge_pid} IS NULL OR {edge_pid} IN ({placeholders}))"
+        return f"{node_cond} AND {edge_cond}", params
 
     def find_by_relations(
         self,
@@ -615,30 +817,153 @@ class _SqlGraphStoreBase(abc.ABC):
         props["node_type"] = row[0]
         return props
 
-    def export_nodes(
-        self,
-        pack_id: str | None = None,
-        limit: int = 500_000,
-    ) -> list[dict[str, Any]]:
-        self._require_available()
-        table = self._table("graph_nodes")
-        # space_id is selected so _merge_space can restore it into props: this
-        # backend keeps space in its own column, but the protocol's export shape
-        # carries it inside props (see _merge_space for the measured fallout).
+    def _export_nodes_where(
+        self, pack_id: str | None, space: str | None
+    ) -> tuple[str, dict[str, Any]]:
+        """Shared pack_id/space WHERE-clause builder for ``export_nodes`` and
+        ``count_exported_nodes`` -- keeping the predicate in one place
+        guarantees the COUNT variant can never silently drift from what
+        ``export_nodes`` actually filters on (issue #54: that agreement is
+        the whole point of ``count_exported_nodes`` existing)."""
+        where_parts: list[str] = []
+        params: dict[str, Any] = {}
         if pack_id:
             pid = self._dialect.json_get("properties", "pack_id")
             src = self._dialect.json_get("properties", "source")
             src_id = self._dialect.json_get("properties", "source_id")
-            sql = (
-                f"SELECT node_type, space_id, properties FROM {table}"
-                f" WHERE {pid} = :pid OR {src} = :pid OR {src_id} = :pid LIMIT :lim"
-            )
-            rows = self._fetch_all(sql, {"pid": pack_id, "lim": limit})
-        else:
-            rows = self._fetch_all(
-                f"SELECT node_type, space_id, properties FROM {table} LIMIT :lim",
-                {"lim": limit},
-            )
+            where_parts.append(f"({pid} = :pid OR {src} = :pid OR {src_id} = :pid)")
+            params["pid"] = pack_id
+        if space:
+            where_parts.append("space_id = :space")
+            params["space"] = space
+        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return where_sql, params
+
+    def export_nodes(
+        self,
+        pack_id: str | None = None,
+        limit: int = 500_000,
+        space: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """``space``, when given, is pushed into the WHERE clause ahead of
+        LIMIT (issue #54: same "store truncates, caller Python-filters"
+        pattern as #62's pack-filter pushdown for ``find_neighbors``). Unlike
+        pack_id, space lives in its own ``space_id`` column, so this is a
+        plain equality clause -- no JSON extraction needed. For an accurate
+        match count that isn't capped by ``limit``, use
+        ``count_exported_nodes`` instead of ``len(export_nodes(...))``.
+
+        ``limit <= 0`` (issue #120): returns ``[]`` without querying. This
+        matters more than it looks: SQLite treats a bound ``LIMIT -1`` as
+        "no limit at all" (verified -- ``LIMIT ?`` with param ``-1`` returns
+        every row), so without this guard a negative ``limit`` here would
+        silently return the *entire* unbounded table instead of nothing.
+        Kuzu's ``export_nodes`` applies the same ``limit <= 0`` guard so all
+        backends agree on both ``limit=0`` and negative ``limit``."""
+        self._require_available()
+        if limit <= 0:
+            return []
+        table = self._table("graph_nodes")
+        # space_id is selected so _merge_space can restore it into props: this
+        # backend keeps space in its own column, but the protocol's export shape
+        # carries it inside props (see _merge_space for the measured fallout).
+        where_sql, params = self._export_nodes_where(pack_id, space)
+        params = {**params, "lim": limit}
+        sql = f"SELECT node_type, space_id, properties FROM {table}{where_sql} LIMIT :lim"
+        rows = self._fetch_all(sql, params)
+        return [
+            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            for node_type, space_id, properties in rows
+        ]
+
+    def count_exported_nodes(
+        self, pack_id: str | None = None, space: str | None = None
+    ) -> int:
+        """Real ``COUNT(*)`` with the exact same predicate ``export_nodes``
+        filters on (via the shared ``_export_nodes_where``), unbounded by any
+        LIMIT -- issue #54: ``total`` must reflect the true match count, not
+        get truncated by a caller's display ``limit``."""
+        self._require_available()
+        table = self._table("graph_nodes")
+        where_sql, params = self._export_nodes_where(pack_id, space)
+        row = self._fetch_one(f"SELECT COUNT(*) FROM {table}{where_sql}", params)  # noqa: S608
+        return int(row[0]) if row else 0
+
+    def search_nodes(
+        self,
+        keyword: str,
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search of ``keyword`` across ``fields``
+        of every node's JSON ``properties``, optionally restricted to
+        ``spaces`` -- both pushed into the SQL WHERE clause ahead of
+        ``LIMIT`` (issue #86, the same "store truncates first, caller
+        filters after" class ``_export_nodes_where`` fixed for #54:
+        ``HybridQuery.keyword_search`` used to fetch only the first
+        50,000 rows via ``export_nodes`` and search only those in Python,
+        silently missing ~80% of a 252k-row corpus with no error). Unlike
+        ``export_nodes``, this ``LIMIT`` is the caller's actual desired
+        result count, not an internal cap -- applying it here is correct
+        once the keyword/space predicate is already in the WHERE clause,
+        because every row that reaches LIMIT already matched.
+
+        Case-insensitivity is done in SQL (``LOWER(...)``) rather than
+        Python so it composes with pushdown; ``%``/``_``/``\\`` in
+        ``keyword`` are escaped so a literal percent or underscore in the
+        search term can't be misread as a SQL LIKE wildcard.
+
+        ``limit <= 0`` short-circuits to ``[]`` without a query (issue
+        #86 boundary check, same class as #120's ``.limit(0)`` Mongo
+        surprise): SQLite treats a NEGATIVE ``LIMIT`` as "no limit at
+        all" (unbounded scan) rather than "zero rows", and PostgreSQL
+        raises ``LIMIT must not be negative`` for the same input --
+        binding ``limit`` straight into ``LIMIT :lim`` would make this one
+        shared method behave three different ways (SQLite: unbounded scan,
+        Postgres: SQL error, ``0``: empty on both) depending on dialect and
+        sign. Clamping here keeps ``limit<=0`` meaning exactly one thing
+        ("caller wants nothing back") on every SQL backend. Checked AFTER
+        ``_require_available()`` so an unavailable store still raises
+        (matching every other guarded method's contract) rather than
+        returning ``[]`` and masking the real problem.
+
+        ``fields`` is validated against ``KEYWORD_SEARCH_FIELDS`` (issue
+        #86 bot finding) -- each field name below is interpolated directly
+        into a JSON path via ``self._dialect.json_get`` with NO escaping
+        (unlike ``keyword``, which is a bound parameter), so an
+        unvalidated ``fields`` value is a SQL injection vector. See
+        ``_validate_search_fields`` (_graph_common.py) for the rejected
+        payload and why unknown fields raise instead of being silently
+        dropped. An empty ``fields`` tuple returns ``[]`` immediately --
+        an empty WHERE-clause OR-group is invalid SQL (``WHERE ()``), and
+        "search zero fields" has only one sane meaning: no field can ever
+        match, so there is nothing to search for."""
+        self._require_available()
+        if limit <= 0:
+            return []
+        if not fields:
+            return []
+        _validate_search_fields(fields)
+        table = self._table("graph_nodes")
+        kw = keyword.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where_parts = [
+            "(" + " OR ".join(
+                f"LOWER({self._dialect.json_get('properties', f)}) LIKE :kw ESCAPE '\\'"
+                for f in fields
+            ) + ")"
+        ]
+        params: dict[str, Any] = {"kw": f"%{kw}%"}
+        if spaces:
+            placeholders = ", ".join(f":space{i}" for i in range(len(spaces)))
+            where_parts.append(f"space_id IN ({placeholders})")
+            params.update({f"space{i}": s for i, s in enumerate(spaces)})
+        params["lim"] = limit
+        sql = (
+            f"SELECT node_type, space_id, properties FROM {table} "
+            f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
+        )
+        rows = self._fetch_all(sql, params)  # noqa: S608
         return [
             {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
             for node_type, space_id, properties in rows
@@ -699,15 +1024,21 @@ class _SqlGraphStoreBase(abc.ABC):
             update_cols=["space_id", "properties"],
             json_columns=["properties"],
         )
-        params = [
-            {
+        # issue #118: same write shape as upsert_node (a props dict + a
+        # separate space_id column) built inline here instead of delegating
+        # to upsert_node, so it needs the identical _normalize_space
+        # reconciliation applied per node -- otherwise a batch caller could
+        # reintroduce the exact divergence upsert_node no longer allows.
+        params = []
+        for n in nodes:
+            props = {**n.get("properties", {}), "id": n["node_id"]}
+            props, space_id = _normalize_space(props, n.get("space_id"))
+            params.append({
                 "node_type": n["node_type"],
                 "node_id": n["node_id"],
-                "space_id": n.get("space_id"),
-                "properties": json.dumps({**n.get("properties", {}), "id": n["node_id"]}),
-            }
-            for n in nodes
-        ]
+                "space_id": space_id,
+                "properties": json.dumps(props),
+            })
         self._exec_write_batch(sql, params)
         return len(params)
 

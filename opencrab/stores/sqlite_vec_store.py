@@ -369,12 +369,9 @@ class SqliteVecStore(_SqliteConnMixin):
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
-        with self._lock:
+        with self._tx() as conn:
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                self._conn.execute(
-                    insert_sql, self._insert_params(_id, text, meta, vec)
-                )
-            self._conn.commit()
+                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
 
@@ -396,15 +393,10 @@ class SqliteVecStore(_SqliteConnMixin):
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
-        with self._lock:
+        with self._tx() as conn:
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                self._conn.execute(
-                    f"DELETE FROM {self._table} WHERE node_id = ?", (_id,)
-                )
-                self._conn.execute(
-                    insert_sql, self._insert_params(_id, text, meta, vec)
-                )
-            self._conn.commit()
+                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
+                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
 
@@ -412,12 +404,9 @@ class SqliteVecStore(_SqliteConnMixin):
         self._require_available()
         if not ids:
             return
-        with self._lock:
+        with self._tx() as conn:
             for _id in ids:
-                self._conn.execute(
-                    f"DELETE FROM {self._table} WHERE node_id = ?", (_id,)
-                )
-            self._conn.commit()
+                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
         self._ann_cache = None  # in-process write → invalidate ANN cache
 
     def reset_collection(self) -> None:
@@ -426,14 +415,11 @@ class SqliteVecStore(_SqliteConnMixin):
         table" gap, and the write lock serialises concurrent resets. Same
         dim/schema is retained (dim is fixed at construction)."""
         self._require_available()
-        with self._lock:
+        with self._tx() as conn:
             # ensure the table exists (idempotent, schema-preserving) then
             # clear all rows atomically
-            self._conn.execute(
-                self._create_table_sql(with_bit=self._has_bit_column)
-            )
-            self._conn.execute(f"DELETE FROM {self._table}")
-            self._conn.commit()
+            conn.execute(self._create_table_sql(with_bit=self._has_bit_column))
+            conn.execute(f"DELETE FROM {self._table}")
         self._ann_cache = None  # in-process write → invalidate ANN cache
         logger.info("SqliteVecStore: table '%s' reset.", self._table)
 
@@ -464,9 +450,12 @@ class SqliteVecStore(_SqliteConnMixin):
         # Residual (non-pack) post-filter → scan up to vec0's k cap for best-effort
         # recall: the residual field is filtered in Python, so matches beyond the
         # 4096 nearest cannot be recovered (a hard vec0 k limit). Localcrab only
-        # emits pack (exact, pushed down) and space filters; space is absent from
-        # vector metadata so it matches nothing in either backend — the residual
-        # path is a correctness safety net, not a hot path.
+        # emits pack (exact, pushed down) and space filters; space is only written
+        # to vector metadata starting with builder.py's #51 fix, so vectors ingested
+        # before that fix still have no "space" key and match nothing here (missing
+        # key = _MISSING = no match, replicating Chroma's missing-key semantics) —
+        # query.py surfaces a transitional warning for this until a backfill runs.
+        # The residual path itself is a correctness safety net, not a hot path.
         if predicate is None or pack_only:
             fetch_k = min(max(int(n_results), 1), _VEC0_K_MAX)
         else:

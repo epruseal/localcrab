@@ -243,6 +243,49 @@ class TestExtendedMethodsNormal:
 
 
 # ---------------------------------------------------------------------------
+# issue #120: export_nodes' three implementations (SQL backend shared by
+# local/pg, Kuzu's no-pack_id branch, Kuzu's pack_id branch) must all treat
+# ``limit <= 0`` as "return nothing", checked BEFORE any row is collected --
+# not after (Kuzu's pack_id branch used to append its first match, then
+# check the limit, so limit=0 still returned 1 row). Negative limit gets the
+# same "return nothing" treatment, since it otherwise has backend-specific
+# meaning (e.g. SQLite maps a bound LIMIT -1 to "unlimited").
+# ---------------------------------------------------------------------------
+
+
+class TestExportNodesLimitContract:
+    def test_limit_zero_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+
+        assert store.export_nodes(limit=0) == []
+
+    def test_limit_zero_with_pack_id_returns_empty_list(self, backend):
+        """Pins the exact issue #120 regression: Kuzu's pack_id branch
+        appended its first match before checking the limit."""
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {"pack_id": "packA"})
+        store.upsert_node("Doc", "a1", {"pack_id": "packA"})
+
+        assert store.export_nodes(pack_id="packA", limit=0) == []
+
+    def test_negative_limit_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+
+        assert store.export_nodes(limit=-1) == []
+
+    def test_negative_limit_with_pack_id_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {"pack_id": "packA"})
+        store.upsert_node("Doc", "a1", {"pack_id": "packA"})
+
+        assert store.export_nodes(pack_id="packA", limit=-1) == []
+
+
+# ---------------------------------------------------------------------------
 # Normal — Neo4j's 7 newly-implemented extended methods (mocked session)
 # ---------------------------------------------------------------------------
 
@@ -309,7 +352,37 @@ class TestExtendedMethodsNeo4jNormal:
         assert rows == [
             {"props": {"id": "a0", "pack_id": "packA"}, "labels": ["Doc", "OpenCrabNode"]}
         ]
-        assert mock_session.run.call_args[1] == {"pack_id": "packA"}
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": None}
+
+    def test_export_nodes_pushes_space_into_cypher_params(self):
+        """issue #54: space must reach the Cypher WHERE clause as a bound
+        parameter (real pushdown ahead of LIMIT via the ``n.space`` property
+        Neo4jStore writes on upsert), not a Python post-filter."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+
+        store.export_nodes(pack_id="packA", space="concept")
+
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": "concept"}
+        cypher = mock_session.run.call_args[0][0]
+        assert "$space" in cypher
+
+    def test_count_exported_nodes_not_capped_by_limit(self):
+        """issue #54: count_exported_nodes is a real count(n) query with the
+        same predicate as export_nodes but no LIMIT -- it must report the
+        true match count, which a caller cannot get from
+        len(export_nodes(..., limit=N)) once N is smaller than the real
+        total."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = {"total": 3000}
+
+        total = store.count_exported_nodes(pack_id="packA", space="concept")
+
+        assert total == 3000
+        assert mock_session.run.call_args[1] == {"pack_id": "packA", "space": "concept"}
+        cypher = mock_session.run.call_args[0][0]
+        assert "count(n)" in cypher
+        assert "LIMIT" not in cypher
 
     def test_export_edges_filters_by_pack_id_on_endpoint(self):
         store, _driver, mock_session = _make_connected_neo4j()
@@ -444,6 +517,29 @@ class TestExtendedMethodsNeo4jEdge:
 
         assert store.export_edges(pack_id="does-not-exist") == []
 
+    def test_export_nodes_limit_zero_returns_empty_list_without_querying(self):
+        """issue #120: the contract says ``limit <= 0`` returns ``[]``
+        WITHOUT issuing a query -- Neo4j's own LIMIT is a raw Cypher literal
+        (not parameterized), so this can't be proven by result shape alone
+        the way the SQL/Kuzu backends can; asserting ``session.run`` was
+        never called (after the constructor's own connectivity check, hence
+        ``reset_mock()``) is the only way to pin "no query issued" here."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_nodes(limit=0) == []
+        mock_session.run.assert_not_called()
+
+    def test_export_nodes_negative_limit_returns_empty_list_without_querying(self):
+        """issue #120: a raw negative Cypher LIMIT literal is invalid and
+        would raise at the driver -- the guard must short-circuit before
+        that query is ever built, same as limit=0 above."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_nodes(limit=-1) == []
+        mock_session.run.assert_not_called()
+
     def test_upsert_nodes_batch_empty_list_returns_zero(self):
         store, _driver, mock_session = _make_connected_neo4j()
         mock_session.run.reset_mock()
@@ -545,8 +641,20 @@ class TestExportCarriesSpace:
         assert row["props"]["space"] == "evidence"
         assert row["labels"] == ["TextUnit"]
 
-    def test_explicit_props_space_is_not_overwritten_by_column(self, backend):
-        """The column is a fallback, never an override."""
+    def test_explicit_space_id_argument_overwrites_props_space(self, backend):
+        """issue #118 codex review [2]: the explicit ``space_id`` ARGUMENT
+        wins over a conflicting ``properties["space"]`` key, not the other
+        way around -- this used to pin the reverse ("the column is a
+        fallback, never an override"), which matched _merge_space's
+        read-time precedence but NOT what neo4j_store.py's own upsert_node
+        already did (``if space_id: props["space"] = space_id``,
+        unconditional). Flipped so all three backends agree with each
+        other, using Neo4j's pre-existing behavior (and the less-surprising
+        rule: a caller's explicit ``space=`` argument should not be
+        silently overridden by an incidental key in an arbitrary
+        ``properties`` dict) as the target, not the reverse. See
+        opencrab/stores/_graph_common.py's ``_normalize_space`` docstring.
+        """
         _name, store = backend
         store.upsert_node(
             "TextUnit", "n-space-2", {"text": "body", "space": "claim"}, space_id="evidence"
@@ -555,7 +663,7 @@ class TestExportCarriesSpace:
         rows = store.export_nodes()
         row = next(r for r in rows if (r["props"].get("id") == "n-space-2"))
 
-        assert row["props"]["space"] == "claim"
+        assert row["props"]["space"] == "evidence"
 
     def test_export_edges_both_endpoints_carry_space(self, backend):
         _name, store = backend
@@ -643,11 +751,15 @@ class TestSingleNodeReadsCarrySpace:
 
         assert props["space"] == "evidence"
 
-    def test_get_node_does_not_override_explicit_space(self, backend):
+    def test_get_node_reflects_space_id_argument_over_conflicting_props_space(self, backend):
+        """issue #118 codex review [2]: the explicit space_id ARGUMENT wins
+        (see test_graph_protocol_contract.py::TestExportCarriesSpace's
+        test_explicit_space_id_argument_overwrites_props_space for the
+        export_nodes-level version of this same precedence pin)."""
         _name, store = backend
         store.upsert_node("TextUnit", "g-3", {"text": "b", "space": "claim"}, space_id="evidence")
 
-        assert store.get_node("TextUnit", "g-3")["space"] == "claim"
+        assert store.get_node("TextUnit", "g-3")["space"] == "evidence"
 
 
 # ---------------------------------------------------------------------------

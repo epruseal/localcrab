@@ -40,6 +40,15 @@ from opencrab.pack.normalize import (
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
 
+# 스토어가 저장하면서 **자기가 채워 넣는** 키. 증분 비교에서 빼야 한다 —
+# 넣지 않으면 by-pack 원본과 라이브가 영원히 다르게 보여 **매 증분마다 전량 재적재**된다.
+#
+# 한동안 `id` 하나만 뺐는데, 상류가 `space_id`/`properties[space]` 우선순위를 통합하면서
+# `space` 도 주입하게 됐고(#125) 그 순간 동일한 행이 전부 chg 로 판정됐다.
+# 이름을 하나 더 적는 대신 "스토어가 넣는 것"이라는 축으로 묶는다.
+STORE_INJECTED_KEYS = frozenset({"id", "space"})
+
+
 
 def _batched(seq: list, size: int = 500):
     """SQLite 파라미터 상한(기본 999) 회피용 배치 분할."""
@@ -307,7 +316,12 @@ def load_nodes_incremental(
 
             live = live_nodes.get(node_id)
             if live is not None:
-                live_props = {k: v for k, v in live[2].items() if k != "id"}  # upsert_node가 주입하는 'id' 제외
+                # **스토어가 주입하는 키는 비교에서 뺀다.** 한동안 `id` 하나만 뺐는데,
+                # upstream 이 `space_id`/`properties[space]` 우선순위를 통합하면서
+                # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
+                # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
+                # "스토어가 넣는 것"이라는 축으로 묶는다.
+                live_props = {k: v for k, v in live[2].items() if k not in STORE_INJECTED_KEYS}
                 if live[0] == node_type and live_props == props:
                     n_same += 1
                     done = n_new + n_chg + n_same + skip + err

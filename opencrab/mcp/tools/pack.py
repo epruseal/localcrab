@@ -68,8 +68,16 @@ def _ingest_into_pack(
     source_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """Store caller-supplied nodes/edges and/or embed text, all tagged with pack_id. No server LLM.
+
+    Bills exactly one ``ingest`` billing event per call (issue #66) — shared
+    by pack_create/pack_ingest so both go through a single instrumentation
+    point rather than each needing its own billing call. Uses ``source_id``
+    when text was ingested, else falls back to ``pack_id`` (on_ingest's
+    signature requires a non-None string).
 
     Parameters
     ----------
@@ -83,6 +91,7 @@ def _ingest_into_pack(
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
+    from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
     ctx = _get_context()
     added_nodes = 0
@@ -91,18 +100,45 @@ def _ingest_into_pack(
     edge_errors: list[str] = []
     stores: dict[str, Any] = {}
     evidence_node: str | None = None
+    # Billing-only signal (issue #66 codex review, findings [4]/[6]): kept
+    # deliberately SEPARATE from added_nodes/added_edges below.
+    # added_nodes/added_edges require store_write_failures() to see zero
+    # failures across ALL stores (graph + every optional one) — that is this
+    # tool's own, stricter, pre-existing "did I fully write this" accounting
+    # for its response body (added_nodes/node_errors), and changing it would
+    # ripple into that response contract for no billing-accuracy reason.
+    # Billability only needs the graph store (the system of record) to have
+    # landed — the same rule graph.py/harness.py/apply.py already use — so
+    # it is computed here independently via store_write_succeeded(), proving
+    # the billing gate (`wrote_anything` below) is driven by that one
+    # function alone, not by store_write_failures()-derived counters.
+    billable_write = False
 
     for item in nodes or []:
         try:
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
-            ctx["builder"].add_node(
+            node_result = ctx["builder"].add_node(
                 space=_clean_str(item.get("space", "")),
                 node_type=_clean_str(item.get("node_type", "")),
                 node_id=_clean_str(item.get("node_id", "")),
                 properties=props,
+                subject_id=subject_id,
             )
-            added_nodes += 1
+            # add_node never raises for a per-store failure (see builder.py's
+            # module docstring) — it reports "error: ..." inside the returned
+            # stores map instead, so a bare try/except here would count a
+            # failed write as a success. Inspect the map explicitly.
+            node_stores = node_result.get("stores") if isinstance(node_result, dict) else None
+            failures = store_write_failures(node_stores or {})
+            if failures:
+                node_errors.append(
+                    f"{item.get('node_id', '?')}: " + "; ".join(failures)
+                )
+            else:
+                added_nodes += 1
+            if store_write_succeeded(node_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {exc}")
 
@@ -110,15 +146,29 @@ def _ingest_into_pack(
         try:
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
-            ctx["builder"].add_edge(
+            edge_result = ctx["builder"].add_edge(
                 from_space=_clean_str(item.get("from_space", "")),
                 from_id=_clean_str(item.get("from_id", "")),
                 relation=_clean_str(item.get("relation", "")),
                 to_space=_clean_str(item.get("to_space", "")),
                 to_id=_clean_str(item.get("to_id", "")),
                 properties=props,
+                subject_id=subject_id,
             )
-            added_edges += 1
+            # Same as above: a missing edge endpoint is reported as
+            # stores["graph"] = "no match (missing node: ...)" without
+            # raising, so it must be read out of the stores map too.
+            edge_stores = edge_result.get("stores") if isinstance(edge_result, dict) else None
+            failures = store_write_failures(edge_stores or {})
+            if failures:
+                edge_errors.append(
+                    f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: "
+                    + "; ".join(failures)
+                )
+            else:
+                added_edges += 1
+            if store_write_succeeded(edge_stores or {}, "graph"):
+                billable_write = True
         except Exception as exc:
             edge_errors.append(
                 f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
@@ -129,6 +179,20 @@ def _ingest_into_pack(
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
         meta["pack_id"] = pack_id
+        # issue #52 follow-up: the legacy branch below (text_as_node=False)
+        # writes this same `meta` into both the vector store (hybrid.ingest)
+        # and doc_sources (mongo.upsert_source) with no `space` tag, so
+        # spaces-filtered queries could never match it. The text_as_node=True
+        # branch a few lines down already tags its TextUnit node
+        # `space="evidence"` — this is the same kind of content (raw
+        # ingested text), so default it to the same space here for
+        # consistency, while still letting an explicit caller-supplied
+        # `metadata["space"]` (e.g. apps/api/main.py's IngestRequest.metadata,
+        # which already passes arbitrary caller metadata straight through)
+        # win. Existing rows written before this change remain untagged —
+        # see the space-filter warning in HybridQuery.query() and #52's
+        # backfill note.
+        meta.setdefault("space", "evidence")
 
         if text_as_node:
             # Materialise text as a 9-space evidence/TextUnit graph node so it
@@ -145,15 +209,33 @@ def _ingest_into_pack(
                     node_props["title"] = meta["title"]
                 if meta.get("source"):
                     node_props["source"] = meta["source"]
-                ctx["builder"].add_node(
+                evidence_result = ctx["builder"].add_node(
                     space="evidence",
                     node_type="TextUnit",
                     node_id=source_id,
                     properties=node_props,
+                    subject_id=subject_id,
                 )
-                evidence_node = source_id
-                added_nodes += 1
-                stores["evidence_node"] = "ok"
+                # Same store-map inspection as the node/edge loops above —
+                # a per-store failure here would otherwise still count as a
+                # successful evidence node.
+                evidence_stores = (
+                    evidence_result.get("stores")
+                    if isinstance(evidence_result, dict)
+                    else None
+                )
+                failures = store_write_failures(evidence_stores or {})
+                if failures:
+                    node_errors.append(
+                        f"{source_id} (evidence/TextUnit): " + "; ".join(failures)
+                    )
+                    stores["evidence_node"] = "; ".join(failures)
+                else:
+                    evidence_node = source_id
+                    added_nodes += 1
+                    stores["evidence_node"] = "ok"
+                if store_write_succeeded(evidence_stores or {}, "graph"):
+                    billable_write = True
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
                 stores["evidence_node"] = f"error: {exc}"
@@ -177,9 +259,45 @@ def _ingest_into_pack(
 
         text_ingested = True
 
+    # #66 codex re-review, findings [4]/[6]: the billing gate must be
+    # provably driven by store_write_succeeded() ALONE, not by
+    # store_write_failures()-derived counters (added_nodes/added_edges are
+    # kept for the tool's own response body — see `billable_write`'s
+    # docstring-comment above the node loop — but must not leak into this
+    # decision). billable_write already covers every node/edge/evidence-node
+    # write via store_write_succeeded(..., "graph"). The text_as_node=False
+    # legacy branch never touches `graph` at all (vector-only embedding + a
+    # doc_sources record), so its own signal is store_write_succeeded(stores)
+    # with no key — positive confirmation that at least one of
+    # chromadb/mongodb actually came back a recognized "ok"-prefixed status
+    # (see that function's docstring in builder.py for the full success-value
+    # inventory this is based on, and why "unavailable" alone must not bill).
+    text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
+    legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
+    wrote_anything = billable_write or legacy_text_landed
+    if wrote_anything:
+        billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
+        if not billing_result.get("ok"):
+            # #105: don't repeat the on_node_write/on_query pattern of
+            # discarding emit()'s result — surface a failed persist in this
+            # module's own log context too, without failing the
+            # (already-succeeded) ingest.
+            logger.warning(
+                "on_ingest billing event failed to persist (pack_id=%s): %s",
+                pack_id, billing_result.get("error"),
+            )
     ctx["hybrid"].invalidate_bm25_cache()
 
+    # Partial failure = any node/edge write error, or any leftover "error:"/
+    # "no match" status sitting in the legacy text-path `stores` dict (chromadb/
+    # mongodb). pack_create/pack_ingest both build their response as
+    # {"status": "ok", ..., **ingest_result} — since ingest_result is spread
+    # last, this "status" wins over their literal "ok" and callers get an
+    # accurate top-level signal instead of an unconditional "ok".
+    status = "partial" if node_errors or edge_errors or text_stores_failed else "ok"
+
     return {
+        "status": status,
         "pack_id": pack_id,
         "added_nodes": added_nodes,
         "added_edges": added_edges,
@@ -191,23 +309,65 @@ def _ingest_into_pack(
     }
 
 
+_QUERY_DEFAULT_LIMIT = 10
+
+
+def _manifest_extras() -> dict[str, tuple[list[str], list[str]]]:
+    """``{pack_id: (keywords, tags)}`` from the on-disk manifest registry.
+
+    Loaded ONCE per call (the registry scan walks every pack directory, so a
+    per-pack ``get_pack`` would re-read every manifest N times). Joined onto
+    the graph-derived candidates by exact pack_id, and the registry can never
+    *introduce* a pack: a manifest with no ingested nodes stays invisible.
+    ``category`` is folded into tags so the shared scorer needs no new field.
+    """
+    from opencrab.config import get_settings
+    from opencrab.ontology.pack_registry import load_pack_registry
+
+    try:
+        registry = load_pack_registry(get_settings().local_data_dir)
+    except Exception as exc:  # noqa: BLE001 — registry is optional metadata
+        logger.debug("manifest registry load failed: %s", exc)
+        return {}
+
+    extras: dict[str, tuple[list[str], list[str]]] = {}
+    for info in registry:
+        tags = list(info.tags)
+        category = info.raw.get("category")
+        if isinstance(category, str) and category:
+            tags.append(category)
+        extras[info.pack_id] = (list(info.keywords), tags)
+    return extras
+
+
 @tool(
     "content_pack_list",
     {
-        "description": "List all content packs currently loaded in the localcrab ontology (Neo4j). Returns pack_id, node count, and display title for each pack.",
+        "description": (
+            "List content packs loaded in the localcrab ontology graph. Returns pack_id, node count, "
+            "and display title for each pack. Without `query` this is the full list; with `query` the "
+            "packs are filtered and ranked by deterministic keyword relevance (pack_id, title, "
+            "description, keywords/tags/category)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "min_nodes": {"type": "integer", "description": "Only return packs with at least this many nodes (default 1).", "default": 1},
+                "query": {"type": "string", "description": "Optional search text. When given, only packs scoring above zero are returned, ordered by relevance. Only packs actually loaded in the graph are candidates."},
+                "limit": {"type": "integer", "description": "Maximum packs to return. Defaults to 10 when `query` is given, unlimited otherwise."},
             },
             "required": [],
         },
     },
     order=9,
 )
-def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
+def content_pack_list(
+    min_nodes: int = 1,
+    query: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
     """
-    List all content packs loaded into the localcrab ontology stores.
+    List content packs loaded into the localcrab ontology stores.
 
     Returns each pack_id with node count and a representative title
     derived from node properties (source_package_title / title / name).
@@ -216,8 +376,22 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     ----------
     min_nodes:
         Only return packs with at least this many nodes (default 1).
+    query:
+        Optional relevance filter. Candidates are exactly the packs present in
+        the graph (a manifest with no ingested nodes is never surfaced); each
+        is scored with the same deterministic scorer auto_pack uses, and packs
+        scoring zero are dropped. Ordering is
+        ``(score desc, node_count desc, pack_id asc)`` — fully tie-broken, so
+        repeated calls return the identical order.
+    limit:
+        Cap on returned packs. Defaults to 10 when ``query`` is given.
+
+    NOTE: pack_create/pack_ingest call this with NO arguments on purpose —
+    their pack_id existence check is an exact membership test against the FULL
+    list. Passing a query there would shrink the candidate set and reject
+    packs that really exist.
     """
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _clean_str, _get_context
 
     ctx = _get_context()
     graph = ctx["neo4j"]
@@ -227,7 +401,8 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
     # All four backends implement list_packs() natively (Local/PG: SQL GROUP
     # BY; Kuzu/Neo4j: Cypher aggregation) — see opencrab/stores/_graph_protocol.py.
     rows = graph.list_packs(min_nodes)
-    # list_packs() 반환 형식: [{"pack_id": str, "node_count": int, "sample_title": str}]
+    # list_packs() 반환 형식:
+    # [{"pack_id": str, "node_count": int, "sample_title": str, "sample_description": str}]
     packs = []
     for r in rows:
         pid = r.get("pack_id") or ""
@@ -238,7 +413,66 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
             "node_count": r["node_count"],
             "title":      display or pid or "(no pack_id)",
         })
-    return {"total": len(packs), "packs": packs}
+
+    # Whitespace-only query == no query (an empty filter must not return an
+    # empty pack list). This is input normalisation, not term correction.
+    query = _clean_str(query).strip() if query else ""
+    if not query:
+        if limit is not None and limit >= 0 and len(packs) > limit:
+            return {"total": limit, "packs": packs[:limit], "truncated": True}
+        return {"total": len(packs), "packs": packs}
+
+    scanned = len(packs)
+    ranked = _rank_packs(query, rows, packs)
+    effective_limit = _QUERY_DEFAULT_LIMIT if limit is None else limit
+    truncated = effective_limit >= 0 and len(ranked) > effective_limit
+    if truncated:
+        ranked = ranked[:effective_limit]
+    response: dict[str, Any] = {
+        "total": len(ranked),
+        "query": query,
+        "scanned": scanned,
+        "packs": ranked,
+    }
+    if truncated:
+        response["truncated"] = True
+    return response
+
+
+def _rank_packs(
+    query: str,
+    rows: list[dict[str, Any]],
+    packs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Score graph-loaded packs against ``query``; deterministic ordering.
+
+    ``rows`` are the raw ``list_packs()`` rows (they carry the anchor
+    description that the display shape drops); ``packs`` is the parallel
+    display shape built above.
+    """
+    from opencrab.ontology.pack_registry import PackInfo, score_pack
+
+    extras = _manifest_extras()
+    scored: list[tuple[float, int, str, dict[str, Any]]] = []
+    for row, pack in zip(rows, packs, strict=True):
+        pack_id = pack["pack_id"]
+        keywords, tags = extras.get(pack_id, ([], []))
+        info = PackInfo(
+            pack_id=pack_id,
+            title=row.get("sample_title") or "",
+            description=row.get("sample_description") or "",
+            keywords=keywords,
+            tags=tags,
+        )
+        score, matched = score_pack(query, info)
+        if score <= 0.0:
+            continue
+        scored.append((score, pack["node_count"], pack_id, {**pack, "score": score, "matched": matched}))
+
+    # (score desc, node_count desc, pack_id asc) — the third key makes the
+    # order total, so the same input always yields the same output.
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in scored]
 
 
 @tool(
@@ -305,11 +539,20 @@ def content_pack_list(min_nodes: int = 1) -> dict[str, Any]:
                     "default": True,
                     "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["title"],
         },
     },
     order=13,
+    writes=True,
 )
 def pack_create(
     title: str,
@@ -319,6 +562,8 @@ def pack_create(
     edges: list[dict[str, Any]] | None = None,
     text: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new localcrab ontology pack and ingest content into it.
@@ -327,13 +572,17 @@ def pack_create(
     pack_id is auto-slugged from title unless explicitly provided.
     Optional text is materialised as a 9-space evidence/TextUnit graph node
     (text_as_node=True, default) or embedded as a vector blob only (False).
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
+    from opencrab.ontology.builder import store_write_failures
 
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
         return {"error": "Could not derive a valid pack_id from title."}
 
+    # NO arguments: the duplicate check is an exact membership test and must
+    # see the FULL pack list (see content_pack_list's docstring).
     existing = content_pack_list()
     existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
     if slug in existing_ids:
@@ -346,7 +595,7 @@ def pack_create(
     ctx = _get_context()
     anchor_node_id = f"dataset:{slug}"
     try:
-        ctx["builder"].add_node(
+        anchor_result = ctx["builder"].add_node(
             space="resource",
             node_type="Dataset",
             node_id=anchor_node_id,
@@ -356,9 +605,28 @@ def pack_create(
                 "description": _clean_str(description or ""),
                 "created_by": "localcrab-mcp",
             },
+            subject_id=subject_id,
         )
     except Exception as exc:
         return {"error": f"anchor node failed: {exc}"}
+
+    # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
+    # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
+    # inside the returned stores map. store_write_failures already applies
+    # the one place-to-judge rule (graph is system of record, docs/sql/vector
+    # are optional) — reuse that split here instead of re-deciding it:
+    #   - graph itself failed -> the pack doesn't exist in the graph, hard
+    #     error (matches the "anchor missing = no pack" contract below).
+    #   - only optional stores failed -> the pack DOES exist (graph write
+    #     went through), so report success and surface which stores lagged,
+    #     same as _ingest_into_pack's node/edge loops do via node_errors.
+    anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
+    anchor_failures = store_write_failures(anchor_stores or {})
+    anchor_graph_failures = [f for f in anchor_failures if f.startswith("graph:")]
+    if anchor_graph_failures:
+        return {"error": "anchor node failed: " + "; ".join(anchor_graph_failures)}
+    # Anything left here is optional-store-only (graph already ruled out above).
+    anchor_optional_failures = anchor_failures
 
     source_id: str | None = None
     if text:
@@ -375,15 +643,25 @@ def pack_create(
         source_id=source_id,
         metadata={"title": _clean_str(title), "source": "pack_create"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
-    return {
+    result = {
         "status": "ok",
         "pack_id": slug,
         "title": _clean_str(title),
         "anchor_node": anchor_node_id,
         **ingest_result,
     }
+    if anchor_optional_failures:
+        # ingest_result's own "status" (spread above) may already be "ok" —
+        # force "partial" and surface the anchor's optional-store failures
+        # the same way node_errors/edge_errors do, so callers see the pack
+        # was created but not every store has the anchor.
+        result["status"] = "partial"
+        result["anchor_errors"] = anchor_optional_failures
+    return result
 
 
 @tool(
@@ -449,11 +727,20 @@ def pack_create(
                     "type": "string",
                     "description": "Optional stable source identifier for the text document. Auto-generated from title+text hash if omitted.",
                 },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Optional subject performing the write (for billing/audit).",
+                },
             },
             "required": ["pack_id"],
         },
     },
     order=14,
+    writes=True,
 )
 def pack_ingest(
     pack_id: str,
@@ -463,6 +750,8 @@ def pack_ingest(
     title: str | None = None,
     source_id: str | None = None,
     text_as_node: bool = True,
+    tenant_id: str = "default",
+    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add content into an EXISTING localcrab ontology pack.
@@ -472,11 +761,15 @@ def pack_ingest(
     (text_as_node=True, default) so it becomes a grammar-compliant first-class
     node. Set text_as_node=False for legacy vector-only embedding.
     Fails if the pack does not exist — use pack_create first.
+    tenant_id/subject_id are passed through to the ``ingest`` billing event.
     """
     from opencrab.mcp.tools import _clean_str, content_pack_list
 
     pack_id = _clean_str(pack_id)
 
+    # NO arguments: pack_id must match an existing pack EXACTLY. Passing a
+    # query/limit here would narrow the candidate set and reject packs that
+    # really exist — the contract is exact match, never fuzzy resolution.
     existing = content_pack_list()
     existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
     if pack_id not in existing_ids:
@@ -507,6 +800,8 @@ def pack_ingest(
         source_id=sid,
         metadata={"title": _clean_str(title or ""), "source": "pack_ingest"},
         text_as_node=text_as_node,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
     )
 
     return {"status": "ok", "pack_id": pack_id, **ingest_result}

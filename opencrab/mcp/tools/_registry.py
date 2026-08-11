@@ -25,10 +25,18 @@ class ToolSpec:
     schema: dict[str, Any]
     fn: Callable[..., Any]
     order: int
+    # NOTE: `writes` means "needs the cross-process write.lock", NOT "touches a
+    # store". See `tool()`'s docstring — a tool can INSERT and still be
+    # writes=False if serialising it behind the lock would cost more (a
+    # read-shaped, high-frequency path) than the write is worth protecting
+    # (billing_events via ontology_query is the concrete example, decided in
+    # issue #65's review; issue #105 corrected the idempotency rationale
+    # originally recorded here — see `tool()`'s docstring below).
+    writes: bool = False
 
 
 def tool(
-    name: str, schema: dict[str, Any], *, order: int | None = None
+    name: str, schema: dict[str, Any], *, order: int | None = None, writes: bool = False
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register `fn` as the handler for MCP tool `name`, with its tools/list schema.
 
@@ -39,6 +47,40 @@ def tool(
     handlers live in separate files, since each module executes top-to-bottom
     as one unit. When omitted, falls back to registration (insertion) order,
     which is sufficient for ad-hoc/test registrations.
+
+    `writes=True` means *this handler needs the cross-process write.lock held
+    for its call* — it is NOT a "does this handler ever touch a store" flag.
+    `dispatch_tool` reads it to decide whether to wrap the call in
+    `_write_lock()` (see `opencrab.mcp.tools.WRITE_TOOLS`, which is *derived*
+    from this flag rather than hand-maintained — issue #65: a hand-maintained
+    WRITE_TOOLS set silently missed two write handlers).
+
+    The lock exists to serialise concurrent writers across processes so they
+    don't race each other. `ontology_query` -> `billing.on_query()` ->
+    `billing_events` INSERT is the one handler that skips it despite writing:
+    NOT because that insert is idempotent (issue #105: it isn't — each call
+    mints a fresh event_id, so the table's UNIQUE(event_id) + INSERT OR
+    IGNORE / ON CONFLICT DO NOTHING only dedupes a literal double-send of the
+    same event_id, and can never resurrect one that failed to persist), and
+    NOT because losing a billing event would be an acceptable trade for
+    query throughput — protecting billing IS a correctness goal, which is
+    the entire reason issue #105 exists. `writes=False` is safe here because
+    the contention this lock would otherwise be needed for DOESN'T HAPPEN:
+    billing_events lives in its own SQLite file (`billing.db`, local/kuzu
+    mode — see `opencrab.stores.factory.make_billing_sql_store`), separate
+    from the write.lock'd tables' file (`opencrab.db`). SQLite's write lock
+    is per-file, so a billing insert never contends with an unrelated write
+    there no matter how long that write holds `write.lock`. (An earlier
+    version of this fix instead retried the insert with backoff on lock
+    contention while still sharing the file — that only shrank the failure
+    window and blocked the request thread doing it; see
+    `opencrab.billing.hooks`'s module docstring for the full analysis,
+    including why WAL would not have been sufficient either.) Reviewed
+    against issue #68 (E-4, lock ownership map) in #65's review round. If a
+    future handler performs a store mutation that a shared file's write
+    lock is the only thing protecting, it must be `writes=True` regardless
+    of how "read-shaped" the tool's name looks (this is exactly how #65 was
+    missed for ontology_impact/ontology_lever_simulate).
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -48,7 +90,7 @@ def tool(
         collision = next((s.name for s in _REGISTRY.values() if s.order == resolved_order), None)
         if collision is not None:
             raise ValueError(f"tool {name!r} order={resolved_order} collides with {collision!r}")
-        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order)
+        _REGISTRY[name] = ToolSpec(name=name, schema=schema, fn=fn, order=resolved_order, writes=writes)
         return fn
 
     return deco
@@ -97,7 +139,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
 
     Thin lookup + call, matching the pre-migration dispatch_tool exactly: no
     extra error wrapping (handlers self-wrap), and write-serialising via the
-    shared write_lock/WRITE_TOOLS for tools that mutate the stores.
+    shared write_lock for tools declared `writes=True` (see `tool()`).
     """
     # Import from the package (__init__.py) itself, NOT the opencrab.mcp.tools._shared
     # shim submodule: importing a submodule for the first time binds it as an
@@ -105,14 +147,14 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     # overwrite __init__.py's module-level `_context` dict (same name) the moment
     # this import ran — verified empirically (tests/test_mcp.py's `_context.clear()`
     # started hitting a module object instead of a dict).
-    from opencrab.mcp.tools import WRITE_TOOLS, _write_lock
+    from opencrab.mcp.tools import _write_lock
 
     spec = _REGISTRY.get(name)
     if spec is None:
         # order 정렬 — 물리 분할 후에도 pre-split과 동일한 목록 순서 유지.
         available = [s.name for s in sorted(_REGISTRY.values(), key=lambda s: s.order)]
         raise UnknownToolError(f"Unknown tool: '{name}'. Available: {available}")
-    if name in WRITE_TOOLS:
+    if spec.writes:
         with _write_lock():
             return spec.fn(**arguments)
     return spec.fn(**arguments)

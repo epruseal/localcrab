@@ -194,13 +194,15 @@ def test_postgres_upsert_single_column_conflict():
 
 def test_render_ddl_sqlite_statement_count_and_order():
     stmts = SQLITE.render_ddl(DOC_STORE_SCHEMA)
-    # 3 tables + 2 indexes (idx_doc_nodes_updated, idx_audit_ts) = 5 statements
-    assert len(stmts) == 5
+    # 3 tables + 3 indexes (idx_doc_nodes_updated, idx_doc_nodes_updated_tiebreak
+    # — #63 tie-break composite index, codex P2 — and idx_audit_ts) = 6 statements
+    assert len(stmts) == 6
     assert stmts[0].startswith("CREATE TABLE IF NOT EXISTS doc_nodes")
     assert stmts[1].startswith("CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated")
-    assert stmts[2].startswith("CREATE TABLE IF NOT EXISTS doc_sources")
-    assert stmts[3].startswith("CREATE TABLE IF NOT EXISTS audit_log")
-    assert stmts[4].startswith("CREATE INDEX IF NOT EXISTS idx_audit_ts")
+    assert stmts[2].startswith("CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated_tiebreak")
+    assert stmts[3].startswith("CREATE TABLE IF NOT EXISTS doc_sources")
+    assert stmts[4].startswith("CREATE TABLE IF NOT EXISTS audit_log")
+    assert stmts[5].startswith("CREATE INDEX IF NOT EXISTS idx_audit_ts")
 
 
 def test_render_ddl_sqlite_types_and_defaults():
@@ -211,10 +213,10 @@ def test_render_ddl_sqlite_types_and_defaults():
     assert "updated_at TEXT NOT NULL" in doc_nodes_ddl
     assert "PRIMARY KEY (space, node_id)" in doc_nodes_ddl
 
-    doc_sources_ddl = stmts[2]
+    doc_sources_ddl = stmts[3]
     assert "source_id TEXT PRIMARY KEY" in doc_sources_ddl
 
-    audit_log_ddl = stmts[3]
+    audit_log_ddl = stmts[4]
     assert "event_id TEXT PRIMARY KEY" in audit_log_ddl
     # subject_id is nullable: no NOT NULL, no DEFAULT
     assert "subject_id TEXT," in audit_log_ddl or "subject_id TEXT\n" in audit_log_ddl

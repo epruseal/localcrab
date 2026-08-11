@@ -180,10 +180,16 @@ class TestFindNeighborsNormal:
             "relation_type",
             "relationship_types",
             "depth",
+            # Canonical endpoints of the traversed edge — the only place the
+            # edge's direction survives (direction="both" and depth > 1 both
+            # make the caller's anchor an unreliable stand-in for the source).
+            "from_id",
+            "to_id",
         }
         assert row["labels"] == ["Chain"]
         assert row["relation_type"] == "next"
         assert row["relationship_types"] == ["next"]
+        assert (row["from_id"], row["to_id"]) == ("n0", "n1")
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +297,93 @@ class TestFindNeighborsEdge:
 
         rows = store.find_neighbors("a", pack_ids=["A"])
         assert rows == []
+
+    def test_pack_filter_survives_hub_fanout_beyond_limit(self, backend):
+        """Issue #62: the pack filter must apply BEFORE limit, not after.
+
+        ``_seed_hub``'s fanout=5 is too small to expose this — it never
+        exceeds ``limit`` (default 50), so a LIMIT-before-filter bug and a
+        filter-before-LIMIT fix return identical results either way. Here
+        fan-out (105) is far larger than ``limit`` (10), and the 5 in-pack
+        edges are upserted LAST, after 100 foreign-pack edges, so they land
+        past the limit boundary in insertion/scan order. A backend that
+        applies ``LIMIT 10`` before the pack filter sees only foreign-pack
+        rows and returns nothing; one that filters first finds all 5.
+
+        Local/PG were fixed (pack filter pushed into the SQL WHERE clause,
+        see ``_sql_graph_base.py``'s ``_pack_where``). Kuzu was deliberately
+        left unfixed — its ``props``/``properties`` columns are opaque
+        serialized-JSON STRING blobs, not per-field columns, so there is no
+        safe way to push this into Cypher WHERE without a schema change
+        (see the note in ``kuzu_graph_store.py``'s ``_find_neighbors_1hop``)
+        — so this pins its still-broken behavior rather than papering over
+        it with an xfail.
+        """
+        name, store = backend
+        store.upsert_node("Hub", "h", {"pack_id": "A"})
+        for i in range(100):
+            store.upsert_node("Other", f"o{i}", {"pack_id": "OTHER"})
+            store.upsert_edge("Hub", "h", "touches", "Other", f"o{i}", {})
+        for i in range(5):
+            store.upsert_node("Target", f"p{i}", {"pack_id": "A"})
+            store.upsert_edge("Hub", "h", "touches", "Target", f"p{i}", {})
+
+        rows = store.find_neighbors("h", direction="out", depth=1, limit=10, pack_ids=["A"])
+        if name == "kuzu":
+            assert _ids(rows) == set()
+        else:
+            assert _ids(rows) == {f"p{i}" for i in range(5)}
+
+
+# ---------------------------------------------------------------------------
+# Issue #118: space_id (column) vs properties["space"] (JSON) divergence
+# ---------------------------------------------------------------------------
+
+
+class TestFindNeighborsSpaceMismatch:
+    def test_space_mismatch_no_longer_starves_valid_neighbors(self, backend):
+        """Issue #118: upsert_node used to store space_id (column) and
+        properties["space"] (JSON) independently, so a caller passing
+        different values for each produced a genuinely divergent row.
+        find_neighbors' SQL/Cypher pushdown filtered candidate edges on the
+        space_id COLUMN ahead of LIMIT, while the Python post-filter
+        (_space_passes, fed by _merge_space) ran AFTER LIMIT -- so `limit`
+        column-matching-but-JSON-mismatched rows consumed the whole limit
+        and were then all rejected, starving genuinely valid neighbours
+        further down the scan.
+
+        Root-cause fix (_graph_common.py's _normalize_space -- the explicit
+        space_id ARGUMENT wins over properties["space"], see its docstring
+        for why): upsert_node now reconciles space_id/properties["space"]
+        at WRITE time, so the "mismatched" nodes seeded below can no longer
+        be stored divergent at all post-fix -- properties["space"] is
+        forced to match the space_id argument the caller actually passed
+        ("target"), so they become genuine, correctly-INCLUDED space=
+        "target" nodes. There is no longer any way to construct the
+        pre-fix divergent row shape through this store's public write API
+        at all, which is exactly why find_neighbors is never starved by it
+        again -- not just for the always-valid nodes seeded after the
+        mismatched batch, but for the (now also valid) mismatched batch
+        itself, since it is impossible to tell them apart anymore.
+        """
+        _name, store = backend
+        store.upsert_node("Hub", "h", {}, space_id="target")
+        # First 10 (== limit): caller passes space_id="target" but
+        # properties["space"]="other" -- pre-fix these are stored genuinely
+        # divergent and consume the whole SQL LIMIT before Python ever
+        # rejects them.
+        for i in range(10):
+            store.upsert_node("Leaf", f"m{i}", {"space": "other"}, space_id="target")
+            store.upsert_edge("Hub", "h", "touches", "Leaf", f"m{i}", {})
+        # 5 more, always-valid (no divergence), inserted AFTER the mismatched
+        # batch so a LIMIT-before-effective-filter bug never reaches them.
+        for i in range(5):
+            store.upsert_node("Leaf", f"v{i}", {}, space_id="target")
+            store.upsert_edge("Hub", "h", "touches", "Leaf", f"v{i}", {})
+
+        rows = store.find_neighbors("h", direction="out", depth=1, limit=10, spaces=["target"])
+
+        assert rows, "starved: 15 real space=target neighbours exist but find_neighbors returned none"
+        assert len(rows) == 10  # limit boundary reached -- not starved down to 0 or 5
+        assert _ids(rows) <= {f"m{i}" for i in range(10)} | {f"v{i}" for i in range(5)}
+        assert all(r["properties"].get("space") == "target" for r in rows)
