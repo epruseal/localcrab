@@ -201,6 +201,12 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     # 지우면 `pack_id` 가 `pack-a-v2` 인 노드까지 삭제되고 엣지가 cascade 로 따라간다
     # (재현: 그 노드의 레거시 `source` 가 "pack-a-legacy-dump" 이면 걸린다, 2026-08-11).
     # **삭제는 되돌릴 수 없다** — 경계 판정을 문자열 포함으로 하면 안 되는 자리다.
+    #
+    # **회수(reclaim) 술어라 대사(reconcile)보다 넓다.** `source_id`는 스토어 export
+    # 계약이 인정하는 레거시 키. `pack`은 `normalize.py`가 전 노드에 쓰는데 대사
+    # 술어(COUNT_SQL 등)를 포함한 어떤 술어도 안 보던 키다 — `pack` 자체를 없애는
+    # 것은 후속 과제로 미뤘지만, 미루는 동안에도 삭제 대상 조회는 그 키로 태그된
+    # 행을 봐야 고아로 남기지 않는다(2026-08-11 리뷰 지적).
     rows = graph._conn.execute(
         """
         SELECT node_type, node_id,
@@ -208,8 +214,10 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
         FROM graph_nodes
         WHERE json_extract(properties, '$.pack_id') = ?
            OR json_extract(properties, '$.source') = ?
+           OR json_extract(properties, '$.source_id') = ?
+           OR json_extract(properties, '$.pack') = ?
         """,
-        (pack_name, pack_name),
+        (pack_name, pack_name, pack_name, pack_name),
     ).fetchall()
 
     for node_type, node_id, space in rows:
@@ -232,9 +240,17 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
 
     # ── doc_nodes: graph 트윈 없이 남은 pack_id 앵커 노드 직접 정리 ───────
     # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
+    # 위 graph_nodes 조회와 동일한 4키(pack_id/source/source_id/pack)를 본다 —
+    # 회수 술어이므로 대사 술어보다 넓게 잡는다.
     dn_rows = docs._conn.execute(
-        "SELECT space, node_id FROM doc_nodes WHERE json_extract(properties, '$.pack_id') = ?",
-        (pack_name,),
+        """
+        SELECT space, node_id FROM doc_nodes
+        WHERE json_extract(properties, '$.pack_id') = ?
+           OR json_extract(properties, '$.source') = ?
+           OR json_extract(properties, '$.source_id') = ?
+           OR json_extract(properties, '$.pack') = ?
+        """,
+        (pack_name, pack_name, pack_name, pack_name),
     ).fetchall()
     doc_node_extra_del = 0
     for space, node_id in dn_rows:
@@ -282,7 +298,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
                 handle.commit()
                 chunk_vec_del = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             elif kind == "chroma":
-                result = handle.get(where={"source": pack_name})
+                # 회수 술어 — pack_id 또는 레거시 source 둘 다 매치. 라이브
+                # doc_sources 2,010행이 pack_id만 갖고 source는 0건이라, source
+                # 단독 술어는 그 100%를 놓친다(2026-08-11 리뷰 지적).
+                result = handle.get(
+                    where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
                 ids_to_del = result.get("ids", [])
                 if ids_to_del:
                     handle.delete(ids=ids_to_del)
@@ -363,7 +383,9 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         ).fetchall():
             vec_ids.add(node_id)
     elif kind == "chroma":
-        got = handle.get(where={"source": pack_name})
+        # 회수 술어 — pack_id 또는 레거시 source 둘 다 매치(delete_pack의 chroma
+        # 분기와 동일 근거, 2026-08-11 리뷰 지적).
+        got = handle.get(where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
         vec_ids.update(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
