@@ -11,6 +11,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# #145: dispatch_tool()/the tool handlers now call current_principal()
+# internally; bind a fixed test principal for every test in this module (see
+# conftest.py's bind_test_principal for why this is opt-in per module, not
+# autouse -- tests/test_auth.py needs a genuinely empty scope for its own
+# "no principal bound" tests).
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 # ---------------------------------------------------------------------------
 # Tool dispatcher tests
 # ---------------------------------------------------------------------------
@@ -125,15 +132,19 @@ class TestToolDispatch:
             assert "stores" in result
             # #66 codex re-review [8]: on_node_write is the sibling of
             # on_edge_write and had the same fail-open gap. Pin that a real
-            # graph success ("graph": "ok") does bill.
-            billing.on_node_write.assert_called_once_with("default", None, "subject", "User")
+            # graph success ("graph": "ok") does bill. subject_id is the
+            # bind_test_principal fixture's principal (#145: it can no
+            # longer be a client argument -- see the rejection test below).
+            billing.on_node_write.assert_called_once_with("default", "test-user", "subject", "User")
 
-    def test_ontology_add_node_forwards_subject_id_to_builder_audit(self):
-        """Issue #119 sibling check: ontology_add_node already forwarded
-        subject_id to builder.add_node (unlike ontology_add_edge, which did
-        not). Pin that the SAME subject_id reaches both builder.add_node
-        (audit) and on_node_write (billing), so a future regression here is
-        caught the same way the edge/harness/pack sites now are."""
+    def test_ontology_add_node_forwards_principal_to_builder_audit(self):
+        """Issue #119 sibling check, inverted for #145: ontology_add_node
+        already forwarded subject_id to builder.add_node (unlike
+        ontology_add_edge, which did not). Pin that the SAME subject_id
+        reaches both builder.add_node (audit) and on_node_write (billing) --
+        now sourced from the caller's server-derived principal instead of a
+        client-supplied argument."""
+        from opencrab.auth import Principal, principal_scope
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
@@ -145,12 +156,27 @@ class TestToolDispatch:
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
                 "billing": billing,
             }
+            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+                dispatch_tool("ontology_add_node", {
+                    "space": "subject", "node_type": "User", "node_id": "u1",
+                })
+            assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+            billing.on_node_write.assert_called_once_with("default", "actor-1", "subject", "User")
+
+    def test_ontology_add_node_rejects_client_subject_id(self):
+        """#145, #143 invariant 2: a client-supplied subject_id in
+        `arguments` is rejected outright, not silently ignored -- a
+        silently-dropped value would make the caller believe it took
+        effect. Was TestToolDispatch::
+        test_ontology_add_node_forwards_subject_id_to_builder_audit before
+        #145, which pinned the opposite (now-insecure) behaviour."""
+        from opencrab.mcp.tools import ForbiddenArgumentError, dispatch_tool
+
+        with pytest.raises(ForbiddenArgumentError):
             dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
                 "subject_id": "actor-1",
             })
-            assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
-            billing.on_node_write.assert_called_once_with("default", "actor-1", "subject", "User")
 
     def test_ontology_add_node_graph_store_failure_does_not_bill(self):
         """#66 codex re-review, finding [8]: add_node() doesn't raise for a
@@ -220,6 +246,8 @@ class TestToolDispatch:
                 "to_space": "resource", "to_id": "doc1",
             })
             assert result["relation"] == "owns"
+            # subject_id is the bind_test_principal fixture's principal
+            # (#145: no longer a client argument).
             builder.add_edge.assert_called_once_with(
                 from_space="subject",
                 from_id="u1",
@@ -227,21 +255,23 @@ class TestToolDispatch:
                 to_space="resource",
                 to_id="doc1",
                 properties={},
-                subject_id=None,
+                subject_id="test-user",
             )
             # #66: on_edge_write had zero callers repo-wide before this fix —
-            # every edge write went unbilled. Pin the call with the defaults
-            # (no tenant_id/subject_id passed) matching ontology_add_node's
-            # on_node_write wiring pattern.
-            billing.on_edge_write.assert_called_once_with("default", None, "owns")
+            # every edge write went unbilled. Pin the call with the caller's
+            # principal (tenant_id fixed at 'default') matching
+            # ontology_add_node's on_node_write wiring pattern.
+            billing.on_edge_write.assert_called_once_with("default", "test-user", "owns")
 
-    def test_ontology_add_edge_forwards_subject_id_to_builder_audit(self):
-        """Issue #119: subject_id was billed via on_edge_write but never
-        forwarded to builder.add_edge, so the edge's audit event (builder.py's
-        mongo.log_event("edge_upsert", subject_id=...)) recorded a null actor
-        even though the billing row named one. Pin that the SAME subject_id
-        supplied by the caller reaches both builder.add_edge (audit) and
-        on_edge_write (billing)."""
+    def test_ontology_add_edge_forwards_principal_to_builder_audit(self):
+        """Issue #119, inverted for #145: subject_id was billed via
+        on_edge_write but never forwarded to builder.add_edge, so the edge's
+        audit event (builder.py's mongo.log_event("edge_upsert",
+        subject_id=...)) recorded a null actor even though the billing row
+        named one. Pin that the SAME subject_id -- now the caller's
+        server-derived principal, not a client-supplied argument -- reaches
+        both builder.add_edge (audit) and on_edge_write (billing)."""
+        from opencrab.auth import Principal, principal_scope
         from opencrab.mcp.tools import dispatch_tool
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
@@ -253,34 +283,31 @@ class TestToolDispatch:
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
                 "billing": billing,
             }
-            dispatch_tool("ontology_add_edge", {
-                "from_space": "subject", "from_id": "u1",
-                "relation": "owns",
-                "to_space": "resource", "to_id": "doc1",
-                "subject_id": "actor-1",
-            })
+            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+                dispatch_tool("ontology_add_edge", {
+                    "from_space": "subject", "from_id": "u1",
+                    "relation": "owns",
+                    "to_space": "resource", "to_id": "doc1",
+                })
             assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
             billing.on_edge_write.assert_called_once_with("default", "actor-1", "owns")
 
-    def test_ontology_add_edge_billing_uses_explicit_tenant_and_subject(self):
-        from opencrab.mcp.tools import dispatch_tool
+    def test_ontology_add_edge_rejects_client_tenant_and_subject_id(self):
+        """#145, #143 invariant 2: client-supplied tenant_id and/or
+        subject_id in `arguments` are rejected outright, never silently
+        accepted -- there is no more "explicit tenant" client capability at
+        all (tenant_id is fixed server-side at 'default'). Was
+        TestToolDispatch::test_ontology_add_edge_billing_uses_explicit_tenant_and_subject
+        before #145, which pinned the opposite (now-insecure) behaviour."""
+        from opencrab.mcp.tools import ForbiddenArgumentError, dispatch_tool
 
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            builder = MagicMock()
-            billing = MagicMock()
-            builder.add_edge.return_value = {"stores": {"graph": "ok"}}
-            mock_ctx.return_value = {
-                "builder": builder, "rebac": MagicMock(),
-                "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
-            }
+        with pytest.raises(ForbiddenArgumentError):
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
                 "relation": "owns",
                 "to_space": "resource", "to_id": "doc1",
                 "tenant_id": "acme", "subject_id": "u1",
             })
-            billing.on_edge_write.assert_called_once_with("acme", "u1", "owns")
 
     def test_ontology_add_edge_malformed_receipt_does_not_bill(self):
         """Fail-closed pin (finding [3], applies equally to add_edge): a
@@ -408,7 +435,7 @@ class TestToolDispatch:
                 "relation": "owns",
                 "to_space": "resource", "to_id": "doc1",
             })
-            billing.on_edge_write.assert_called_once_with("default", None, "owns")
+            billing.on_edge_write.assert_called_once_with("default", "test-user", "owns")
 
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool

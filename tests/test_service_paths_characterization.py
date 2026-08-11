@@ -34,6 +34,14 @@ from opencrab.ontology.query import QueryOutcome, QueryResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# #145: ontology_query()/ontology_add_node()/ontology_add_edge() now call
+# current_principal() internally; bind a fixed test principal for every test
+# in this module (see conftest.py's bind_test_principal). TestNodeEdgeWriteMCP
+# via mcp_local_ctx and TestNodeEdgeWriteHTTP via http_auth bind their OWN
+# real bootstrapped principal instead (nested principal_scope wins for their
+# duration), since those paths characterize real audit/owner attribution.
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 
 # ===========================================================================
 # Shared fixtures
@@ -99,8 +107,25 @@ def builder(local_stores):
 
 
 @pytest.fixture()
-def mcp_local_ctx(local_stores, builder):
-    """MCP _get_context()가 반환하는 형태의 실 로컬 ctx (빌더 경유 쓰기 박제용)."""
+def local_principal(local_stores):
+    """Bootstrap a real local user+token against local_stores["sql"] (#145:
+    every write path now needs a real server-derived principal -- there is
+    no more X-User-Id / shared-key stand-in). Returns (user_id, secret)."""
+    from opencrab.auth import bootstrap_local_user
+
+    return bootstrap_local_user(local_stores["sql"])
+
+
+@pytest.fixture()
+def mcp_local_ctx(local_stores, builder, local_principal):
+    """MCP _get_context()가 반환하는 형태의 실 로컬 ctx (빌더 경유 쓰기 박제용).
+
+    #145: ontology_add_node/ontology_add_edge now call current_principal()
+    internally -- bind local_principal's bootstrapped user for the whole
+    fixture lifetime so every test using this ctx has one, without each
+    test body having to open its own principal_scope.
+    """
+    from opencrab.auth import Principal, principal_scope
     from opencrab.billing.hooks import BillingHooks
     from opencrab.ontology.impact import ImpactEngine
     from opencrab.ontology.query import HybridQuery
@@ -112,7 +137,7 @@ def mcp_local_ctx(local_stores, builder):
     hybrid._doc_store = local_stores["docs"]
     rebac = ReBACEngine(g, s)
     hybrid._rebac = rebac
-    return {
+    ctx = {
         "neo4j": g,
         "chroma": local_stores["vector"],
         "mongo": local_stores["docs"],
@@ -123,6 +148,9 @@ def mcp_local_ctx(local_stores, builder):
         "hybrid": hybrid,
         "billing": BillingHooks(s),
     }
+    user_id, _secret = local_principal
+    with principal_scope(Principal(user_id=user_id, is_local=True, disabled=False)):
+        yield ctx
 
 
 class _MockKureEF:
@@ -199,8 +227,13 @@ def api_module():
 
 @pytest.fixture()
 def http_client(local_env, api_module, monkeypatch):
-    """TestClient with lifespan entered. raise_server_exceptions=False로 500도 응답으로 관찰."""
-    monkeypatch.setenv("OPENCRAB_API_KEY", "testkey")
+    """TestClient with lifespan entered. raise_server_exceptions=False로 500도 응답으로 관찰.
+
+    #145: OPENCRAB_API_KEY no longer configures anything -- setting it would
+    now trip refuse_stale_shared_secret_env() and fail app startup outright.
+    Auth is per-user bearer tokens (see the http_auth fixture below), bootstrapped
+    against the same LOCAL_DATA_DIR the app's own lifespan-built SQLStore opens.
+    """
     monkeypatch.setenv("OPENCRAB_TIER", "free")
     from fastapi.testclient import TestClient
 
@@ -208,7 +241,13 @@ def http_client(local_env, api_module, monkeypatch):
         yield client
 
 
-HTTP_AUTH = {"Authorization": "Bearer testkey", "X-User-Id": "tester"}
+@pytest.fixture()
+def http_auth(local_principal):
+    """Bearer-auth headers for a real bootstrapped local user+token (#145:
+    replaces the deleted OPENCRAB_API_KEY + X-User-Id combination -- the
+    principal is now server-derived from this token, never client-asserted)."""
+    _user_id, secret = local_principal
+    return {"Authorization": f"Bearer {secret}"}
 
 
 # ===========================================================================
@@ -469,7 +508,10 @@ class TestQueryResponseMCP:
         }
         assert resp["question"] == "alpha"
         assert resp["spaces_filter"] is None
-        assert resp["subject_id"] is None
+        # #145: subject_id is the bind_test_principal fixture's principal
+        # (no longer a client-supplied argument, and never None -- a
+        # principal is always bound by the time a handler runs).
+        assert resp["subject_id"] == "test-user"
         assert resp["tenant_id"] == "default"
         assert resp["pipeline"] == {"bm25": True, "rerank": True, "fts": True}
         assert resp["total"] == 1
@@ -523,9 +565,9 @@ class TestQueryResponseMCP:
 
 
 class TestQueryResponseHTTP:
-    def test_empty_store_shape(self, http_client):
+    def test_empty_store_shape(self, http_client, http_auth):
         resp = http_client.post(
-            "/api/query", json={"question": "zzz_no_match_keyword_zzz"}, headers=HTTP_AUTH
+            "/api/query", json={"question": "zzz_no_match_keyword_zzz"}, headers=http_auth
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -556,7 +598,9 @@ class TestQueryResponseHTTP:
     def test_query_requires_auth(self, http_client):
         resp = http_client.post("/api/query", json={"question": "x"})
         assert resp.status_code == 401
-        assert resp.json() == {"detail": "Invalid API token."}
+        # #145: require_auth's message changed with the shared-key -> bearer-
+        # token switch (see apps/api/main.py's require_auth).
+        assert resp.json() == {"detail": "Invalid or missing bearer token."}
 
     def test_query_bad_token_rejected(self, http_client):
         resp = http_client.post(
@@ -564,15 +608,15 @@ class TestQueryResponseHTTP:
         )
         assert resp.status_code == 401
 
-    def test_query_limit_validation_422(self, http_client):
+    def test_query_limit_validation_422(self, http_client, http_auth):
         # QueryRequest.limit le=25 → 초과 시 pydantic 422.
         resp = http_client.post(
-            "/api/query", json={"question": "x", "limit": 999}, headers=HTTP_AUTH
+            "/api/query", json={"question": "x", "limit": 999}, headers=http_auth
         )
         assert resp.status_code == 422
 
-    def test_query_empty_question_422(self, http_client):
-        resp = http_client.post("/api/query", json={"question": ""}, headers=HTTP_AUTH)
+    def test_query_empty_question_422(self, http_client, http_auth):
+        resp = http_client.post("/api/query", json={"question": ""}, headers=http_auth)
         assert resp.status_code == 422
 
 
@@ -674,7 +718,7 @@ class TestNodeEdgeWriteMCP:
 
 
 class TestNodeEdgeWriteHTTP:
-    def test_add_node_success_shape(self, http_client):
+    def test_add_node_success_shape(self, http_client, http_auth, local_principal):
         resp = http_client.post(
             "/api/nodes",
             json={
@@ -684,15 +728,21 @@ class TestNodeEdgeWriteHTTP:
                 # §1.2 수렴: HTTP 도 이제 builder 경유라 User 필수필드(email/role)를 요구.
                 "properties": {"name": "Alice", "email": "a@ex.com", "role": "admin"},
             },
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert resp.status_code == 200
         body = resp.json()
         assert body["node_id"] == "u1"
         assert body["space"] == "subject"
         assert body["node_type"] == "User"
-        # HTTP는 owner_id를 자동 주입 (X-User-Id) — builder 경유 후에도 보존.
-        assert body["properties"]["owner_id"] == "tester"
+        # #145 inversion: owner_id used to come straight from the
+        # client-asserted X-User-Id header ("tester", trusted with no
+        # verification -- #143's #72). It is now the verified bearer
+        # token's own principal -- a client can no longer spoof it by
+        # sending a different header value (see test_add_node below has no
+        # X-User-Id equivalent to send at all anymore).
+        expected_user_id, _secret = local_principal
+        assert body["properties"]["owner_id"] == expected_user_id
         # §1.3 수렴: HTTP/MCP 모두 역할 기반 stores 키(graph/docs/sql/vector).
         assert set(body["stores"].keys()) == {"graph", "docs", "sql", "vector"}
         assert body["stores"]["graph"] == "ok"
@@ -702,7 +752,7 @@ class TestNodeEdgeWriteHTTP:
         assert isinstance(body["receipt_id"], str)
         assert isinstance(body["receipt_ts"], str)
 
-    def test_add_node_invalid_space_returns_422(self, http_client):
+    def test_add_node_invalid_space_returns_422(self, http_client, http_auth):
         """§1.1 수렴: grammar 검증 실패는 이제 명시적 422(이전엔 미포착 ValueError→500).
 
         MCP 는 동일 입력에 error dict(valid=False)를 반환한다 — 전송 계층별 표현은
@@ -711,12 +761,12 @@ class TestNodeEdgeWriteHTTP:
         resp = http_client.post(
             "/api/nodes",
             json={"space": "badspace", "node_type": "User", "node_id": "x"},
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert resp.status_code == 422
         assert "badspace" in resp.json()["detail"]
 
-    def test_add_node_missing_grammar_field_returns_422(self, http_client):
+    def test_add_node_missing_grammar_field_returns_422(self, http_client, http_auth):
         """§1.2 수렴: HTTP 도 grammar 필수 property(email/role) 누락 시 422.
 
         이전에는 HTTP 가 필수필드를 검증하지 않아 name 만으로 200 통과했다. builder
@@ -729,45 +779,45 @@ class TestNodeEdgeWriteHTTP:
                 "node_id": "u_incomplete",
                 "properties": {"name": "Alice"},
             },
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert resp.status_code == 422
         detail = resp.json()["detail"]
         assert "email" in detail and "role" in detail
 
-    def test_add_node_missing_field_422(self, http_client):
+    def test_add_node_missing_field_422(self, http_client, http_auth):
         resp = http_client.post(
-            "/api/nodes", json={"space": "subject"}, headers=HTTP_AUTH
+            "/api/nodes", json={"space": "subject"}, headers=http_auth
         )
         assert resp.status_code == 422
 
-    def test_add_node_duplicate_id_reupserts(self, http_client):
+    def test_add_node_duplicate_id_reupserts(self, http_client, http_auth):
         payload = {
             "space": "subject",
             "node_type": "User",
             "node_id": "dup1",
             "properties": {"name": "A", "email": "a@ex.com", "role": "admin"},
         }
-        first = http_client.post("/api/nodes", json=payload, headers=HTTP_AUTH)
+        first = http_client.post("/api/nodes", json=payload, headers=http_auth)
         second = http_client.post(
             "/api/nodes",
             json={**payload, "properties": {**payload["properties"], "name": "B"}},
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert first.status_code == 200
         assert second.status_code == 200
         assert second.json()["stores"]["graph"] == "ok"
 
-    def test_add_edge_success_shape(self, http_client):
+    def test_add_edge_success_shape(self, http_client, http_auth):
         http_client.post(
             "/api/nodes",
             json={"space": "subject", "node_type": "User", "node_id": "u1", "properties": {"name": "A", "email": "a@ex.com", "role": "admin"}},
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         http_client.post(
             "/api/nodes",
             json={"space": "resource", "node_type": "Project", "node_id": "p1", "properties": {"name": "PX"}},
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         resp = http_client.post(
             "/api/edges",
@@ -778,7 +828,7 @@ class TestNodeEdgeWriteHTTP:
                 "to_space": "resource",
                 "to_id": "p1",
             },
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -793,7 +843,7 @@ class TestNodeEdgeWriteHTTP:
         # §1.6 수렴: edge 응답에도 receipt.
         assert isinstance(body["receipt_id"], str)
 
-    def test_add_edge_invalid_relation_returns_422(self, http_client):
+    def test_add_edge_invalid_relation_returns_422(self, http_client, http_auth):
         """§1.1 수렴: 잘못된 relation 은 이제 명시적 422(이전엔 미포착 ValueError→500)."""
         resp = http_client.post(
             "/api/edges",
@@ -804,7 +854,7 @@ class TestNodeEdgeWriteHTTP:
                 "to_space": "resource",
                 "to_id": "p1",
             },
-            headers=HTTP_AUTH,
+            headers=http_auth,
         )
         assert resp.status_code == 422
 

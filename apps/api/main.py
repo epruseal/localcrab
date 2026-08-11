@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -403,6 +403,9 @@ def _close_context(ctx: ApiContext | None) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
+    from opencrab.mcp.http_app import refuse_stale_shared_secret_env
+
+    refuse_stale_shared_secret_env()
     app.state.context = _build_context()
     try:
         yield
@@ -421,9 +424,16 @@ cors_origins = [
     for item in os.getenv("OPENCRAB_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
     if item.strip()
 ]
+# Fail CLOSED on an empty allowlist (#145). The previous `cors_origins or ["*"]`
+# turned "the operator set OPENCRAB_CORS_ORIGINS to an empty value" into "every
+# origin may send credentialed requests" -- the opposite of what clearing a
+# setting should mean. An empty list means no cross-origin access; a browser
+# deployment must name its origins explicitly. (`*` with
+# allow_credentials=True is rejected by browsers anyway, so the old fallback
+# was both unsafe in intent and broken in practice.)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins or ["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -436,22 +446,34 @@ def get_context() -> ApiContext:
 
 def require_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+    ctx: ApiContext = Depends(get_context),
 ) -> AuthContext:
-    expected_api_key = os.getenv("OPENCRAB_API_KEY", "").strip()
-    if not expected_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="OPENCRAB_API_KEY is not configured.",
-        )
+    """Derive the principal from a per-user bearer token (#145).
 
-    if credentials is None or credentials.scheme.lower() != "bearer" or credentials.credentials != expected_api_key:
+    Replaces the pre-#145 shared ``OPENCRAB_API_KEY`` + client-asserted
+    ``X-User-Id`` header: that let any key holder impersonate any user
+    (#143's #72). The principal is now verified server-side
+    (``opencrab.auth.verify_token``) and every downstream use of
+    ``auth.user_id`` in this module -- owner stamping, ingest quota checks,
+    audit attribution, ``/api/usage`` -- reads this server-derived value
+    instead of a client-supplied one.
+    """
+    from opencrab.auth import verify_token
+
+    presented = (
+        credentials.credentials
+        if (credentials is not None and credentials.scheme.lower() == "bearer")
+        else None
+    )
+    principal = verify_token(ctx.sql, presented) if presented else None
+    if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API token.",
+            detail="Invalid or missing bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return AuthContext(user_id=x_user_id or "anonymous", tier=_tier())
+    return AuthContext(user_id=principal.user_id, tier=_tier())
 
 
 def _enforce_ingest_limits(ctx: ApiContext, auth: AuthContext, source_id: str) -> None:
@@ -836,12 +858,18 @@ def list_edges(
 ## ─── Remote MCP Server (Streamable HTTP) ────────────────────────────────────
 # The /mcp routes are provided by the shared opencrab.mcp.http_app.mcp_router,
 # which delegates to MCPServer.handle_request — the same dispatch used by the
-# stdio server and `opencrab serve --transport http`. auth_token=None keeps this
-# endpoint open (as before); the standalone serve command can require a token.
+# stdio server and `opencrab serve --transport http`. #145: mcp_router() now
+# requires its own per-user bearer token on every request (no more
+# auth_token=None open mount) — the same verification opencrab.mcp.http_app
+# uses standalone, reused here rather than reimplemented.
 
-from opencrab.mcp.http_app import mcp_router  # noqa: E402
+from opencrab.mcp.http_app import install_mcp_no_store, mcp_router  # noqa: E402
 
-app.include_router(mcp_router(auth_token=None))
+app.include_router(mcp_router())
+# Same guarantee as create_app(): /mcp responses this app produces --
+# including framework-generated 405s and validation errors -- must be
+# uncacheable. Two mount points means two installs.
+install_mcp_no_store(app)
 
 
 if __name__ == "__main__":

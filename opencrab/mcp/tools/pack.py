@@ -539,14 +539,6 @@ def _rank_packs(
                     "default": True,
                     "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
                 },
-                "tenant_id": {
-                    "type": "string",
-                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
-                },
-                "subject_id": {
-                    "type": "string",
-                    "description": "Optional subject performing the write (for billing/audit).",
-                },
             },
             "required": ["title"],
         },
@@ -562,8 +554,6 @@ def pack_create(
     edges: list[dict[str, Any]] | None = None,
     text: str | None = None,
     text_as_node: bool = True,
-    tenant_id: str = "default",
-    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new localcrab ontology pack and ingest content into it.
@@ -572,11 +562,17 @@ def pack_create(
     pack_id is auto-slugged from title unless explicitly provided.
     Optional text is materialised as a 9-space evidence/TextUnit graph node
     (text_as_node=True, default) or embedded as a vector blob only (False).
-    tenant_id/subject_id are passed through to the ``ingest`` billing event.
+    The ``ingest`` billing event's subject is the caller's server-derived
+    ``current_principal()`` (#145) -- never a client argument; tenant_id
+    stays fixed at 'default'.
     """
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context, content_pack_list
     from opencrab.ontology.builder import store_write_failures
 
+    principal = current_principal()
+    tenant_id = "default"
+    subject_id = principal.user_id
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
         return {"error": "Could not derive a valid pack_id from title."}
@@ -727,14 +723,6 @@ def pack_create(
                     "type": "string",
                     "description": "Optional stable source identifier for the text document. Auto-generated from title+text hash if omitted.",
                 },
-                "tenant_id": {
-                    "type": "string",
-                    "description": "Tenant identifier for multi-tenant isolation (default: 'default').",
-                },
-                "subject_id": {
-                    "type": "string",
-                    "description": "Optional subject performing the write (for billing/audit).",
-                },
             },
             "required": ["pack_id"],
         },
@@ -750,8 +738,6 @@ def pack_ingest(
     title: str | None = None,
     source_id: str | None = None,
     text_as_node: bool = True,
-    tenant_id: str = "default",
-    subject_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add content into an EXISTING localcrab ontology pack.
@@ -761,10 +747,16 @@ def pack_ingest(
     (text_as_node=True, default) so it becomes a grammar-compliant first-class
     node. Set text_as_node=False for legacy vector-only embedding.
     Fails if the pack does not exist — use pack_create first.
-    tenant_id/subject_id are passed through to the ``ingest`` billing event.
+    The ``ingest`` billing event's subject is the caller's server-derived
+    ``current_principal()`` (#145) -- never a client argument; tenant_id
+    stays fixed at 'default'.
     """
+    from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, content_pack_list
 
+    principal = current_principal()
+    tenant_id = "default"
+    subject_id = principal.user_id
     pack_id = _clean_str(pack_id)
 
     # NO arguments: pack_id must match an existing pack EXACTLY. Passing a

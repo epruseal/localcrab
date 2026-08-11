@@ -242,7 +242,15 @@ class MCPServer:
 
 
 def main() -> None:
-    """Start the MCP server (called by cli.py serve command)."""
+    """Start the stdio MCP server.
+
+    Reachable two ways -- ``opencrab serve --transport stdio`` and
+    ``python -m opencrab.mcp.server`` -- so the auth boundary has to live
+    here, not only in cli.py. Both go through the same two guards in
+    ``opencrab.auth`` (#145): refuse leftover shared-secret env vars, and
+    bind the local user as the principal for the process's whole lifetime.
+    stdio has no per-request identity; its trust boundary is the OS process.
+    """
     import io
     import logging
 
@@ -259,8 +267,23 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    server = MCPServer()
-    server.run()
+
+    from opencrab.auth import (
+        principal_scope,
+        refuse_stale_shared_secret_env,
+        require_local_principal,
+    )
+
+    try:
+        refuse_stale_shared_secret_env()
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        # stdout is the JSON-RPC channel -- diagnostics go to stderr only.
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    with principal_scope(principal):
+        MCPServer().run()
 
 
 if __name__ == "__main__":

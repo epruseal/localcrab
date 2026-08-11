@@ -28,6 +28,11 @@ from opencrab.mcp.tools import (
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
+# #145: dispatch_tool() now calls current_principal() for every tool
+# (read or write); bind a fixed test principal for every test in this
+# module (see conftest.py's bind_test_principal).
+pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
 
 @pytest.fixture(autouse=True)
 def _clear_context():

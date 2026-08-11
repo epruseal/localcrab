@@ -19,8 +19,7 @@ logger = logging.getLogger(__name__)
     "ontology_query",
     {
         "description": (
-            "Hybrid vector + BM25 + graph search with RRF reranking. "
-            "Pass subject_id for policy-aware filtering via ReBAC."
+            "Hybrid vector + BM25 + graph search with RRF reranking."
         ),
         "inputSchema": {
             "type": "object",
@@ -35,10 +34,6 @@ logger = logging.getLogger(__name__)
                     "type": "integer",
                     "description": "Maximum number of results (default 10).",
                     "default": 10,
-                },
-                "subject_id": {
-                    "type": "string",
-                    "description": "Optional subject ID for policy-aware filtering (ReBAC view check).",
                 },
                 "use_bm25": {
                     "type": "boolean",
@@ -90,8 +85,6 @@ def ontology_query(
     question: str,
     spaces: list[str] | None = None,
     limit: int = 10,
-    subject_id: str | None = None,
-    tenant_id: str = "default",
     use_bm25: bool = True,
     use_rerank: bool = True,
     use_fts: bool = True,
@@ -104,8 +97,14 @@ def ontology_query(
     """
     Run a hybrid vector + BM25 + graph query against the ontology.
 
-    Pipeline: vector similarity → BM25 keyword → graph expansion →
-    RRF reranking → policy-aware filter (if subject_id provided).
+    Pipeline: vector similarity → BM25 keyword → graph expansion → RRF
+    reranking. No policy-aware (ReBAC) filter runs here: HybridQuery's
+    ``subject_id`` param drives ``_policy_filter``, which is fail-closed
+    (ReBACEngine.check returns granted=False for any unpolicied node), so
+    wiring the caller's principal into it would silently drop every result
+    with no explicit grant (#143's explicit prohibition). subject_id is
+    therefore never forwarded to ``hybrid.query`` here, client-supplied or
+    not -- #145 removed it as a tool argument entirely.
 
     Parameters
     ----------
@@ -115,8 +114,6 @@ def ontology_query(
         Optional list of space IDs to restrict the search.
     limit:
         Maximum number of results.
-    subject_id:
-        If set, filters results to only nodes the subject can view (ReBAC).
     use_bm25:
         Include BM25 keyword results (default True).
     use_rerank:
@@ -139,6 +136,7 @@ def ontology_query(
         for graph hits). Costs at most one indexed single-row lookup per
         distinct node id in the returned page; set False to skip it entirely.
     """
+    from opencrab.auth import current_principal
     from opencrab.config import get_settings
     from opencrab.mcp.tools import _get_context
     from opencrab.services.canonical_ids import enrich as enrich_canonical
@@ -146,6 +144,8 @@ def ontology_query(
 
     ctx = _get_context()
     cfg = get_settings()
+    principal = current_principal()
+    tenant_id = "default"
     selection = resolve_packs(
         question,
         list(pack_ids) if pack_ids else None,
@@ -164,7 +164,6 @@ def ontology_query(
             question=question,
             spaces=spaces,
             limit=limit,
-            subject_id=subject_id,
             use_bm25=use_bm25,
             use_rerank=use_rerank,
             use_fts=use_fts,
@@ -189,7 +188,7 @@ def ontology_query(
         # correctness gain. Decided in #65's review against #68 (E-4 lock
         # ownership map); see `writes` field docstring in
         # _registry.py#tool for the general rule.
-        billing_result = ctx["billing"].on_query(tenant_id, subject_id, question)
+        billing_result = ctx["billing"].on_query(tenant_id, principal.user_id, question)
         if not billing_result.get("ok"):
             # #105: emit() is fire-and-forget by design and never raises, but a
             # failed persist must not vanish with only BillingHooks' own internal
@@ -197,7 +196,7 @@ def ontology_query(
             # query already succeeded above.
             logger.warning(
                 "on_query billing event failed to persist (tenant=%s, subject=%s): %s",
-                tenant_id, subject_id, billing_result.get("error"),
+                tenant_id, principal.user_id, billing_result.get("error"),
             )
         result_dicts = [r.to_dict() for r in results]
         if include_canonical_ids:
@@ -207,7 +206,7 @@ def ontology_query(
         response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
-            "subject_id": subject_id,
+            "subject_id": principal.user_id,
             "tenant_id": tenant_id,
             "pipeline": {"bm25": use_bm25, "rerank": use_rerank, "fts": use_fts},
             "total": len(results),

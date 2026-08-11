@@ -74,6 +74,7 @@ from typing import Any
 from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
+from ._registry import ForbiddenArgumentError as ForbiddenArgumentError
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
 
@@ -266,6 +267,7 @@ from .schema import (  # noqa: E402
 __all__ = [
     "TOOLS",
     "TOOL_SCHEMAS",
+    "ForbiddenArgumentError",
     "UnknownToolError",
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",

@@ -114,7 +114,11 @@ services:
     environment:
       STORAGE_MODE: docker
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      OPENCRAB_API_KEY: ${OPENCRAB_API_KEY:-local-opencrab-key}
+      # OPENCRAB_API_KEY removed (#145): the shared-secret model it fed is
+      # gone, and the API now REFUSES to start when it is set -- so leaving
+      # it here (with a default, no less) meant the default compose stack
+      # could not boot. Auth is per-user tokens: run 'opencrab init', then
+      # 'opencrab user add' / 'opencrab token issue' per client.
       OPENCRAB_TIER: ${OPENCRAB_TIER:-free}
       OPENCRAB_CORS_ORIGINS: ${OPENCRAB_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       NEO4J_URI: bolt://neo4j:7687
@@ -148,7 +152,9 @@ services:
     environment:
       PORT: 3000
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001}
-      NEXT_PUBLIC_OPENCRAB_API_KEY: ${NEXT_PUBLIC_OPENCRAB_API_KEY:-local-opencrab-key}
+      # NEXT_PUBLIC_OPENCRAB_API_KEY removed (#145): NEXT_PUBLIC_* is compiled
+      # into the browser bundle, so it can never hold a credential. The web UI
+      # takes a per-user token from the operator (#149).
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-pk_test_replace_me}
       CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-sk_test_replace_me}
     depends_on:
