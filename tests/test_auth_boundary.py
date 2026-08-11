@@ -558,3 +558,84 @@ class TestErrorHandlerStaysInsideMcp:
         install_mcp_no_store(app)
         with pytest.raises(RuntimeError, match="business logic bug"):
             TestClient(app, raise_server_exceptions=True).get("/api/thing")
+
+
+class TestReservedIdentityKeysInPayloads:
+    """The argument-level rejection had a door beside it: the same identities
+    travelled inside `properties` / `metadata`. `stamp_properties` uses
+    setdefault, so a caller-supplied tenant_id or created_by survived to the
+    store, and `ontology_add_edge` does not stamp at all so anything passed
+    through. The Mongo store additionally mirrors properties.owner_id to a
+    top-level column that REST reads as ownership.
+
+    The check walks the whole argument structure rather than guarding the call
+    sites. There are six of them today and every hand-written list of "places
+    to guard" in this change missed at least one; a walk cannot miss a site it
+    has never heard of."""
+
+    @pytest.mark.parametrize(
+        "arguments,expected",
+        [
+            ({"properties": {"tenant_id": "other"}}, "properties.tenant_id"),
+            ({"properties": {"created_by": "victim"}}, "properties.created_by"),
+            ({"properties": {"owner_id": "victim"}}, "properties.owner_id"),
+            ({"properties": {"subject_id": "victim"}}, "properties.subject_id"),
+            ({"metadata": {"user_id": "victim"}}, "metadata.user_id"),
+            ({"nodes": [{"properties": {"tenant_id": "x"}}]}, "nodes[0].properties.tenant_id"),
+            ({"edges": [{"properties": {"created_by": "x"}}]}, "edges[0].properties.created_by"),
+            (
+                {"package": {"nodes": [{"properties": {"owner_id": "x"}}]}},
+                "package.nodes[0].properties.owner_id",
+            ),
+            ({"a": {"b": [{"c": {"properties": {"owner_id": "x"}}}]}}, "a.b[0].c.properties.owner_id"),
+        ],
+    )
+    def test_reserved_key_is_found_at_any_depth(self, arguments, expected):
+        from opencrab.mcp.tools._registry import _reserved_identity_violations
+
+        assert _reserved_identity_violations(arguments) == [expected]
+
+    def test_ordinary_properties_pass(self):
+        """The check must not become a reason to stop passing real data."""
+        from opencrab.mcp.tools._registry import _reserved_identity_violations
+
+        assert _reserved_identity_violations(
+            {"properties": {"title": "hello", "text": "body", "pack_id": "p1"}}
+        ) == []
+
+    @pytest.mark.parametrize(
+        "tool,arguments",
+        [
+            (
+                "ontology_add_node",
+                {
+                    "space": "resource",
+                    "node_type": "Dataset",
+                    "node_id": "dataset:x",
+                    "properties": {"tenant_id": "other", "created_by": "victim"},
+                },
+            ),
+            (
+                "ontology_add_edge",
+                {
+                    "from_space": "resource",
+                    "from_id": "a",
+                    "relation": "owns",
+                    "to_space": "resource",
+                    "to_id": "b",
+                    "properties": {"owner_id": "victim"},
+                },
+            ),
+        ],
+    )
+    def test_dispatch_rejects_and_writes_nothing(self, env, tool, arguments):
+        """Rejected at dispatch, before the handler runs -- so no partial write."""
+        from opencrab.auth import Principal, principal_scope
+        from opencrab.mcp.tools import dispatch_tool
+        from opencrab.mcp.tools._registry import ForbiddenArgumentError
+
+        before = sorted(os.listdir(env))
+        with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+            with pytest.raises(ForbiddenArgumentError, match="reserved identity key"):
+                dispatch_tool(tool, arguments)
+        assert sorted(os.listdir(env)) == before

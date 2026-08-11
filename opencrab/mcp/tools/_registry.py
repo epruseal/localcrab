@@ -120,6 +120,44 @@ class ForbiddenArgumentError(ValueError):
 # opencrab/cli.py's stdio local-user binding), never from `arguments`.
 _FORBIDDEN_ARGS = ("tenant_id", "subject_id")
 
+# The same identities can also arrive INSIDE a payload, and rejecting only the
+# top-level arguments would leave the door beside the gate wide open:
+# `ontology_add_node(properties={"tenant_id": "other", "created_by": "victim"})`
+# reached the store because `stamp_properties` uses setdefault and keeps a
+# caller-provided value. `ontology_add_edge` does not stamp at all, so anything
+# passed straight through. `owner_id` is here too: the Mongo store mirrors
+# `properties.owner_id` to a top-level column that REST reads as ownership.
+_RESERVED_IDENTITY_KEYS = ("tenant_id", "subject_id", "created_by", "owner_id", "user_id")
+
+# Payload dicts whose contents are caller-authored and end up persisted.
+_PAYLOAD_KEYS = ("properties", "metadata")
+
+
+def _reserved_identity_violations(value: Any, path: str = "") -> list[str]:
+    """Find reserved identity keys inside any nested properties/metadata dict.
+
+    Walks the whole argument structure rather than checking the handful of
+    call sites that exist today. Those sites are six and counting -- add_node,
+    add_edge, pack_create's nodes and edges, pack_ingest's source metadata and
+    text node, harness_promotion_apply's package -- and enumerating them by
+    hand is exactly the mistake this change kept making: every hand-written
+    list of "places to guard" in this work missed at least one. A walk cannot
+    miss a site it has never heard of.
+    """
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            here = f"{path}.{key}" if path else str(key)
+            if key in _PAYLOAD_KEYS and isinstance(sub, dict):
+                found += [
+                    f"{here}.{k}" for k in _RESERVED_IDENTITY_KEYS if k in sub
+                ]
+            found += _reserved_identity_violations(sub, here)
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            found += _reserved_identity_violations(item, f"{path}[{i}]")
+    return found
+
 
 def _envelope(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap `fn` so any exception becomes ``{"error": str(exc)}`` exactly once.
@@ -187,6 +225,15 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
             f"tool {name!r}: client-supplied {forbidden} is not allowed -- "
             "the principal is derived server-side from the caller's "
             "authenticated identity, never from tool arguments."
+        )
+
+    embedded = _reserved_identity_violations(arguments)
+    if embedded:
+        raise ForbiddenArgumentError(
+            f"tool {name!r}: reserved identity key(s) {embedded} in the payload "
+            "are not allowed -- the server derives these from the caller's "
+            "authenticated identity. Rejected rather than overwritten so the "
+            "caller does not believe its value was stored."
         )
 
     from opencrab.auth import current_principal, principal_scope
