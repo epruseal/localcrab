@@ -1097,26 +1097,68 @@ class TestPackLiveCountsIsTheSingleSourceOfTruth:
                 None)
 
     def test_returns_exactly_four_axes(self, tmp_path):
+        """축 집합은 vec 백엔드 지원 여부와 무관하게 고정 — `vectors` 키는 항상 있다.
+
+        값의 **타입**은 갈린다(아래 별도 테스트) — `None`과 `0`은 다른 사실이라
+        여기서는 축 집합만 건다.
+        """
         graph, docs, vec = self._stores(tmp_path)
         got = pack_load.pack_live_counts("아무팩", graph, docs, vec)
         assert set(got) == self.AXES, (
             f"축 집합이 달라졌다: {sorted(got)} — 축을 빼면 그 축의 결손이 영영 안 보인다")
-        assert all(isinstance(v, int) for v in got.values())
 
-    def test_empty_store_is_all_zero_not_missing(self, tmp_path):
-        """없는 팩은 **0** 이다. 키가 빠지면 호출자가 KeyError 로 죽는다."""
+    def test_graph_and_doc_axes_are_always_int(self, tmp_path):
+        """nodes/edges/docs는 스토어가 항상 있으니 백엔드와 무관하게 `int`다."""
         graph, docs, vec = self._stores(tmp_path)
-        assert pack_load.pack_live_counts("없는팩", graph, docs, vec) \
-            == dict.fromkeys(self.AXES, 0)
+        got = pack_load.pack_live_counts("아무팩", graph, docs, vec)
+        for axis in ("nodes", "edges", "docs"):
+            assert isinstance(got[axis], int), f"{axis}가 int가 아니다: {got[axis]!r}"
 
-    def test_vector_store_without_conn_yields_zero_not_crash(self, tmp_path):
-        """벡터 백엔드가 `_conn` 을 안 내주는 경우가 있다 — 죽지 말고 0 이어야 한다."""
+    def test_vectors_axis_is_int_when_backend_supports_counting(self, tmp_path):
+        """벡터 백엔드가 팩 단위 카운트를 낼 수 있으면(`sql` 종류) `vectors`도 `int`다.
+
+        `_vec_backend()`가 `_conn`/`_table`을 가진 sqlite-vec 형태(`_SqliteVecLike`)를
+        인식해 실제로 세야 한다 — 종전에는 `getattr(vec, "_conn")`을 직접 봐서
+        Chroma·pgvector에서 늘 0이었는데, 그 버그가 이 스텁으로는 안 잡혔다
+        (스텁이 sqlite-vec 형태라 우연히 통과했다). 여기서 명시적으로 int 계약을 건다.
+        """
+        graph, docs, _ = self._stores(tmp_path)
+        vec = _SqliteVecLike()
+        vec.seed("아무팩", ["v1", "v2"])
+        got = pack_load.pack_live_counts("아무팩", graph, docs, vec)
+        assert got["vectors"] == 2, f"벡터 2건을 세어야 한다 (실제 {got['vectors']!r})"
+
+    def test_empty_store_graph_axes_are_zero_not_missing(self, tmp_path):
+        """없는 팩이라도 nodes/edges/docs는 **0**이다. 키가 빠지면 호출자가 KeyError로 죽는다."""
+        graph, docs, vec = self._stores(tmp_path)
+        got = pack_load.pack_live_counts("없는팩", graph, docs, vec)
+        for axis in ("nodes", "edges", "docs"):
+            assert got[axis] == 0, f"{axis}가 0이 아니다: {got[axis]!r}"
+
+    def test_empty_but_supported_vec_backend_is_zero(self, tmp_path):
+        """벡터 백엔드가 카운트를 **낼 수 있는데** 팩이 없으면 `0`이다(`None`이 아니다).
+
+        `0`(세어보니 없다)과 `None`(셀 방법이 없어 모른다)을 가르는 계약의 반쪽 —
+        지원되는 백엔드에서 빈 결과까지 `None`으로 새면 "모른다"와 "없다"가 다시 섞인다.
+        """
+        graph, docs, _ = self._stores(tmp_path)
+        vec = _SqliteVecLike()  # 아무것도 seed하지 않음 — 빈 스토어
+        assert pack_load.pack_live_counts("없는팩", graph, docs, vec)["vectors"] == 0
+
+    def test_vector_store_without_conn_yields_none_not_crash(self, tmp_path):
+        """벡터 백엔드가 팩 단위 카운트를 **못 내는** 경우 — 죽지 말고 `None`이어야 한다.
+
+        종전 계약은 이 경우도 `0`을 돌려줬다. 그러면 "벡터가 없다"(사실)와
+        "셀 방법을 모른다"(진단 정보 없음)가 같은 숫자로 뭉개져, 예컨대 pgvector
+        미가용 팩과 실제로 벡터가 0건인 팩을 3원 대사 출력만 보고는 구분할 수 없었다.
+        `_vec_backend()`가 인식하지 못하는 형태(`available` 속성조차 없음)는 `None`이다.
+        """
         graph, docs, _ = self._stores(tmp_path)
 
         class NoConn:
             pass
 
-        assert pack_load.pack_live_counts("p", graph, docs, NoConn())["vectors"] == 0
+        assert pack_load.pack_live_counts("p", graph, docs, NoConn())["vectors"] is None
 
     def test_the_sql_lives_here_only(self):
         """호출자가 같은 쿼리를 다시 선언하지 않는가 — **구조로** 건다.

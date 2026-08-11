@@ -140,7 +140,7 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     return False
 
 
-def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
+def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
     """팩 하나의 **라이브 4축 카운트**. 적재 전후 대사의 정본이다.
 
     노드·엣지·문서·벡터를 스토어에서 직접 센다. 이 SQL 은 **스토어 스키마 세부**라
@@ -154,18 +154,38 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int]:
     결손은 영영 안 보인다.
 
     결손의 **원인**(grammar 공간쌍 미정의 등)은 판정하지 않는다 — 숫자만 낸다.
-    벡터 스토어가 `_conn` 을 안 내주면 0 을 돌려준다(백엔드마다 다르다).
+
+    **`vectors` 는 `int | None`.** 벡터 카운트는 `_vec_backend()` 를 거친다 —
+    종전에는 `getattr(vec, "_conn")` 를 직접 봐서 Chroma·pgvector 에서 **항상 0**
+    이었다(둘 다 `_conn` 을 안 낸다). 팩 단위 카운트를 낼 수 있으면(`sql`/
+    `chroma`/`sqlalchemy`) 실제로 세어 `int` 를 돌려주고(빈 스토어면 `0`), 낼 수
+    없으면(백엔드 미지원·미가용) `None` 을 돌려준다. **`0` 과 `None` 은 다른
+    사실이다** — `0` 은 "세어보니 없다", `None` 은 "셀 방법이 없어 모른다"다.
+    이 둘을 섞으면 "벡터 0건"이라는 잘못된 결론이 조용히 보고서에 남는다.
     """
     g = graph._conn.execute(COUNT_SQL["nodes"], (pack_name,)).fetchone()[0]
     e = graph._conn.execute(COUNT_SQL["edges"], (pack_name,)).fetchone()[0]
     d = docs._conn.execute(COUNT_SQL["docs"], (pack_name,) * COUNT_SQL_ARGC["docs"]).fetchone()[0]
-    v = 0
-    v_conn = getattr(vec, "_conn", None)
-    v_table = getattr(vec, "_table", None) or "vectors_kure"
-    if v_conn is not None:
-        v = v_conn.execute(
-            f"SELECT COUNT(*) FROM {v_table} WHERE pack_id = ?", (pack_name,)
+
+    v: int | None
+    kind, handle, table = _vec_backend(vec)
+    if kind == "sql":
+        v = handle.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE pack_id = ?", (pack_name,)
         ).fetchone()[0]
+    elif kind == "chroma":
+        # 회수(reclaim) 술어와 동일하게 pack_id 와 레거시 source 를 모두 본다
+        # (item 8 참고 — pack_id 만 갖고 source 가 0건인 라이브 행이 다수 있다).
+        got = handle.get(where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
+        v = len(got.get("ids", []))
+    elif kind == "sqlalchemy":
+        from sqlalchemy import text as _sa_text
+        with handle.connect() as _c:
+            v = _c.execute(
+                _sa_text(f"SELECT COUNT(*) FROM {table} WHERE pack_id = :p"), {"p": pack_name}
+            ).scalar()
+    else:
+        v = None
     return {"nodes": g, "edges": e, "docs": d, "vectors": v}
 
 
@@ -961,10 +981,15 @@ def incremental_finalize(
     graph_count, doc_count, vec_count = counts["nodes"], counts["docs"], counts["vectors"]
     vec_expected = len(bypack_node_ids | bypack_chunk_ids)
 
+    # vec_count 는 `int | None` 이다(pack_live_counts 계약). `None` 은 "백엔드가
+    # 카운트를 못 낸다"는 뜻이라 vec_expected 와 뺄셈하면 TypeError 다 — 산술하지
+    # 않고 "미확인"이라고만 말한다.
+    vec_line = (f"vec {vec_count} (기대 {vec_expected} {vec_count - vec_expected:+d})"
+                if vec_count is not None else f"vec ? (기대 {vec_expected}, 미확인)")
     print(
         f"  [{pack_name}] 3원 대사: graph {graph_count} (by-pack {nodes_total} {graph_count - nodes_total:+d}) / "
         f"doc {doc_count} (by-pack {chunks_total} {doc_count - chunks_total:+d}) / "
-        f"vec {vec_count} (기대 {vec_expected} {vec_count - vec_expected:+d})",
+        f"{vec_line}",
         flush=True,
     )
     print(
