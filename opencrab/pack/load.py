@@ -193,14 +193,22 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     ).fetchall()
 
     for node_type, node_id, space in rows:
-        # delete_node: 노드 + 관련 엣지 cascade
-        graph.delete_node(node_type, node_id)
+        # delete_node: 노드 + 관련 엣지 cascade. bool을 돌려준다(_sql_graph_base.py
+        # 4백엔드 통일 계약, "Returns True iff the node itself was deleted") —
+        # 그 값을 보고서만 node_del을 센다. cascade로 함께 지워지는 엣지 수는
+        # 이 반환값에 없으므로 여기서 세지 않는다(엣지는 별도 축).
+        try:
+            deleted = graph.delete_node(node_type, node_id)
+        except Exception as exc:
+            deleted = False
+            log.warning("노드 삭제 오류(%s) %s/%s: %s", pack_name, node_type, node_id, exc)
         # doc_nodes 삭제
         try:
             docs.delete_node_doc(space, node_id)
         except Exception:
             pass
-        node_del += 1
+        if deleted:
+            node_del += 1
 
     # ── doc_nodes: graph 트윈 없이 남은 pack_id 앵커 노드 직접 정리 ───────
     # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
@@ -258,6 +266,8 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
                 ids_to_del = result.get("ids", [])
                 if ids_to_del:
                     handle.delete(ids=ids_to_del)
+                    # Chroma의 delete()는 삭제 건수를 돌려주지 않는다 — 이 값은
+                    # "요청 수"이지 확인된 삭제 수가 아니다.
                     chunk_vec_del = len(ids_to_del)
             elif kind == "sqlalchemy":
                 from sqlalchemy import text as _sa_text
