@@ -67,6 +67,23 @@ def _base_ctx(**overrides):
 # ---------------------------------------------------------------------------
 
 
+def _reg_row(pack_id, title="", description=""):
+    """A ``list_packs_for`` row shape (opencrab.packs.registry._row_to_dict)
+    -- see tests/test_content_pack_list_query.py for the full query/ranking
+    contract; this module's tests only cover the plumbing (title-stripping,
+    fallback, the #146 registry-is-the-source join)."""
+    return {
+        "pack_id": pack_id,
+        "owner_id": "test-user",
+        "visibility": "private",
+        "title": title,
+        "description": description,
+        "forked_from": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
 class TestContentPackList:
     def test_normal_strips_pack_suffix_from_title(self):
         graph = MagicMock()
@@ -76,12 +93,14 @@ class TestContentPackList:
         ]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.readable_pack_ids", return_value={"biomed"}),
+            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("biomed")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list(min_nodes=1)
         assert result == {
             "total": 1,
+            "node_count_known": True,
+            "min_nodes_applied": True,
             "packs": [{"pack_id": "biomed", "node_count": 5, "title": "Biomed"}],
         }
 
@@ -91,14 +110,15 @@ class TestContentPackList:
         graph.list_packs.return_value = [{"pack_id": "p1", "node_count": 2, "sample_title": ""}]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.readable_pack_ids", return_value={"p1"}),
+            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("p1")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
         assert result["packs"][0]["title"] == "p1"
 
-    def test_normal_scopes_to_readable_pack_ids(self):
-        """#146: a pack the caller can't see (not owned, not public) never
+    def test_normal_scopes_to_registry_rows(self):
+        """#146 C: candidates come from ``list_packs_for`` (the registry),
+        not graph.list_packs() -- a pack_id the registry didn't return never
         appears, even though it's loaded in the graph with real nodes."""
         graph = MagicMock()
         graph.available = True
@@ -108,19 +128,29 @@ class TestContentPackList:
         ]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.readable_pack_ids", return_value={"mine"}),
+            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("mine")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
         assert [p["pack_id"] for p in result["packs"]] == ["mine"]
 
-    def test_edge_graph_unavailable_returns_error(self):
+    def test_edge_graph_unavailable_returns_unknown_counts_not_error(self):
+        """#146 C: graph unavailable no longer short-circuits to a
+        top-level "error" -- registry-readable packs are still listed, with
+        node_count_known/min_nodes_applied false and every node_count
+        null (see test_content_pack_list_query.py for the full contract)."""
         graph = MagicMock()
         graph.available = False
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("mine")]),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
-        assert result == {"error": "graph store unavailable"}
+        assert "error" not in result
+        assert result["node_count_known"] is False
+        assert result["min_nodes_applied"] is False
+        assert result["packs"] == [{"pack_id": "mine", "node_count": None, "title": "mine"}]
 
 
 # ---------------------------------------------------------------------------
@@ -1476,7 +1506,11 @@ class TestGetContextRealWiring:
         tools_mod._context.clear()
         try:
             result = tools_mod.dispatch_tool("content_pack_list", {})
-            assert result == {"total": 0, "packs": []}
+            # #146 C: a fresh LOCAL_DATA_DIR has no `packs` registry rows,
+            # so the registry-sourced candidate list is empty regardless of
+            # the (real, available) graph store's own state.
+            assert result["total"] == 0
+            assert result["packs"] == []
             assert set(tools_mod._context.keys()) == {
                 "neo4j", "chroma", "mongo", "sql",
                 "builder", "rebac", "impact", "hybrid", "billing",

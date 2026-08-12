@@ -352,8 +352,8 @@ def _manifest_extras() -> dict[str, tuple[list[str], list[str]]]:
         "inputSchema": {
             "type": "object",
             "properties": {
-                "min_nodes": {"type": "integer", "description": "Only return packs with at least this many nodes (default 1).", "default": 1},
-                "query": {"type": "string", "description": "Optional search text. When given, only packs scoring above zero are returned, ordered by relevance. Only packs actually loaded in the graph are candidates."},
+                "min_nodes": {"type": "integer", "description": "Only return packs with at least this many nodes, when node counts are known (default 0 -- see node_count_known in the response).", "default": 0},
+                "query": {"type": "string", "description": "Optional search text. When given, only packs scoring above zero are returned, ordered by relevance."},
                 "limit": {"type": "integer", "description": "Maximum packs to return. Defaults to 10 when `query` is given, unlimited otherwise."},
             },
             "required": [],
@@ -363,27 +363,54 @@ def _manifest_extras() -> dict[str, tuple[list[str], list[str]]]:
     access=AccessTier.READ,
 )
 def content_pack_list(
-    min_nodes: int = 1,
+    min_nodes: int = 0,
     query: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
     """
-    List content packs loaded into the localcrab ontology stores.
+    List content packs the caller can see, per the ``packs`` ownership/
+    visibility registry.
 
-    Returns each pack_id with node count and a representative title
-    derived from node properties (source_package_title / title / name).
+    #146: the registry (``opencrab.packs.registry.list_packs_for`` — the
+    caller's own packs plus every non-private one, #143 invariant 3) is now
+    the SOURCE of this list, not ``graph.list_packs()``'s node-count
+    aggregation (#143 acceptance criteria: "graph.list_packs()를 팩 목록의
+    권위로 쓰는 호출부가 0건"). A pack registered but not yet graph-loaded
+    (e.g. right after ``pack_create``) still shows up; a graph-loaded
+    pack_id with no registry row (shouldn't normally happen, but pre-#146
+    legacy data before the backfill migration runs) is dropped rather than
+    surfaced with no known owner.
+
+    graph.list_packs(0) is consulted only as an AUXILIARY node-count/title
+    source, joined onto the registry rows by pack_id. When the graph store
+    is unavailable, or the aggregation call itself raises, node counts are
+    simply unknown for every pack in this response (never a partial mix,
+    never a top-level error) -- see ``node_count_known``/
+    ``min_nodes_applied`` below.
+
+    Response shape
+    --------------
+    Top-level ``node_count_known`` (bool) and ``min_nodes_applied`` (bool)
+    describe the WHOLE response, always both true or both false together:
+
+    - True: graph aggregation succeeded. Each pack's ``node_count`` is a
+      real int (0 is a legitimate "no nodes yet" count, not "unknown").
+      ``min_nodes`` was applied as a real filter.
+    - False: graph unavailable or the aggregation call raised. Each pack's
+      ``node_count`` is ``None`` -- "unknown", never guessed at or
+      defaulted to 0. ``min_nodes`` is NOT applied (filtering on an unknown
+      quantity would be arbitrary) -- every readable pack is returned.
 
     Parameters
     ----------
     min_nodes:
-        Only return packs with at least this many nodes (default 1).
+        Only return packs with at least this many nodes (default 0). Only
+        takes effect when node counts are known -- see above.
     query:
-        Optional relevance filter. Candidates are exactly the packs present in
-        the graph (a manifest with no ingested nodes is never surfaced); each
-        is scored with the same deterministic scorer auto_pack uses, and packs
-        scoring zero are dropped. Ordering is
-        ``(score desc, node_count desc, pack_id asc)`` — fully tie-broken, so
-        repeated calls return the identical order.
+        Optional relevance filter. Every readable registered pack is a
+        candidate (not just graph-loaded ones); each is scored with the
+        same deterministic scorer auto_pack uses, and packs scoring zero
+        are dropped. Ordering is ``(score desc, pack_id asc)``.
     limit:
         Cap on returned packs. Defaults to 10 when ``query`` is given.
 
@@ -391,56 +418,89 @@ def content_pack_list(
     existence check is an exact membership test against the FULL list a
     caller can see. Passing a query there would shrink the candidate set and
     reject packs that really exist.
-
-    #146: candidates are additionally scoped to ``readable_pack_ids`` — the
-    caller's own packs plus every non-private one (#143 invariant 3). The
-    ``packs`` registry (not this store's node-count aggregation) is the
-    authority for existence/ownership/visibility; graph.list_packs() below
-    is only ever an auxiliary node-count/title source.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
-    from opencrab.packs.registry import readable_pack_ids
+    from opencrab.packs.registry import list_packs_for
 
     ctx = _get_context()
     graph = ctx["neo4j"]
-    if not graph.available:
-        return {"error": "graph store unavailable"}
 
-    readable = readable_pack_ids(ctx["sql"], current_principal())
+    registry_rows = list_packs_for(ctx["sql"], current_principal())
 
     # All four backends implement list_packs() natively (Local/PG: SQL GROUP
     # BY; Kuzu/Neo4j: Cypher aggregation) — see opencrab/stores/_graph_protocol.py.
-    rows = [r for r in graph.list_packs(min_nodes) if (r.get("pack_id") or "") in readable]
-    # list_packs() 반환 형식:
-    # [{"pack_id": str, "node_count": int, "sample_title": str, "sample_description": str}]
-    packs = []
-    for r in rows:
-        pid = r.get("pack_id") or ""
-        title = r.get("sample_title") or ""
-        display = title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
-        packs.append({
-            "pack_id":    pid,
-            "node_count": r["node_count"],
-            "title":      display or pid or "(no pack_id)",
+    # Called unfiltered (0): min_nodes filtering now happens below, against
+    # the registry-sourced candidate list, not delegated to the store.
+    node_count_known = False
+    graph_agg: dict[str, dict[str, Any]] = {}
+    if getattr(graph, "available", False):
+        try:
+            graph_agg = {
+                r["pack_id"]: r for r in graph.list_packs(0) if r.get("pack_id")
+            }
+            node_count_known = True
+        except Exception as exc:  # noqa: BLE001 — aggregation is best-effort
+            logger.debug("content_pack_list: graph.list_packs() aggregation failed: %s", exc)
+            node_count_known = False
+    min_nodes_applied = node_count_known
+
+    enriched = []
+    for row in registry_rows:
+        pid = row["pack_id"]
+        agg = graph_agg.get(pid)
+        if node_count_known:
+            node_count = agg["node_count"] if agg else 0
+            if node_count < min_nodes:
+                continue
+        else:
+            node_count = None
+        # #146: registry title/description win (they're the authority for
+        # this pack's identity); the graph anchor node is only a fallback
+        # for a pack the registry has no title/description for yet.
+        raw_title = row.get("title") or (agg.get("sample_title") if agg else "") or ""
+        description = row.get("description") or (agg.get("sample_description") if agg else "") or ""
+        display_title = raw_title.replace(" ontology pack", "").replace(" ontology Pack", "").strip()
+        enriched.append({
+            "pack_id": pid,
+            "node_count": node_count,
+            "title": display_title or pid,
+            "_raw_title": raw_title,
+            "_description": description,
         })
 
     # Whitespace-only query == no query (an empty filter must not return an
     # empty pack list). This is input normalisation, not term correction.
     query = _clean_str(query).strip() if query else ""
     if not query:
-        if limit is not None and limit >= 0 and len(packs) > limit:
-            return {"total": limit, "packs": packs[:limit], "truncated": True}
-        return {"total": len(packs), "packs": packs}
+        if node_count_known:
+            enriched.sort(key=lambda p: (-p["node_count"], p["pack_id"]))
+        else:
+            enriched.sort(key=lambda p: p["pack_id"])
+        packs = [_display_pack(p) for p in enriched]
+        total = len(packs)
+        response: dict[str, Any] = {
+            "total": total,
+            "node_count_known": node_count_known,
+            "min_nodes_applied": min_nodes_applied,
+            "packs": packs,
+        }
+        if limit is not None and limit >= 0 and total > limit:
+            response["total"] = limit
+            response["packs"] = packs[:limit]
+            response["truncated"] = True
+        return response
 
-    scanned = len(packs)
-    ranked = _rank_packs(query, rows, packs)
+    scanned = len(enriched)
+    ranked = _rank_packs(query, enriched)
     effective_limit = _QUERY_DEFAULT_LIMIT if limit is None else limit
     truncated = effective_limit >= 0 and len(ranked) > effective_limit
     if truncated:
         ranked = ranked[:effective_limit]
-    response: dict[str, Any] = {
+    response = {
         "total": len(ranked),
+        "node_count_known": node_count_known,
+        "min_nodes_applied": min_nodes_applied,
         "query": query,
         "scanned": scanned,
         "packs": ranked,
@@ -450,40 +510,50 @@ def content_pack_list(
     return response
 
 
-def _rank_packs(
-    query: str,
-    rows: list[dict[str, Any]],
-    packs: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Score graph-loaded packs against ``query``; deterministic ordering.
+def _display_pack(item: dict[str, Any]) -> dict[str, Any]:
+    """Strip the internal scoring-only fields (``_raw_title``/
+    ``_description``) an ``enriched`` entry carries, leaving the public
+    response shape."""
+    return {"pack_id": item["pack_id"], "node_count": item["node_count"], "title": item["title"]}
 
-    ``rows`` are the raw ``list_packs()`` rows (they carry the anchor
-    description that the display shape drops); ``packs`` is the parallel
-    display shape built above.
+
+def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Score candidate packs against ``query``; deterministic ordering.
+
+    ``enriched`` is content_pack_list's internal per-pack list (registry
+    title/description already resolved with graph-anchor fallback, node
+    counts already known-or-null) -- the SAME resolution rule scoring uses
+    here is what built ``title``/``_raw_title``/``_description`` in the
+    first place, so ranking and display never disagree about a pack's
+    identity.
     """
     from opencrab.ontology.pack_registry import PackInfo, score_pack
 
     extras = _manifest_extras()
-    scored: list[tuple[float, int, str, dict[str, Any]]] = []
-    for row, pack in zip(rows, packs, strict=True):
-        pack_id = pack["pack_id"]
+    scored: list[tuple[float, str, dict[str, Any]]] = []
+    for item in enriched:
+        pack_id = item["pack_id"]
         keywords, tags = extras.get(pack_id, ([], []))
         info = PackInfo(
             pack_id=pack_id,
-            title=row.get("sample_title") or "",
-            description=row.get("sample_description") or "",
+            title=item["_raw_title"],
+            description=item["_description"],
             keywords=keywords,
             tags=tags,
         )
         score, matched = score_pack(query, info)
         if score <= 0.0:
             continue
-        scored.append((score, pack["node_count"], pack_id, {**pack, "score": score, "matched": matched}))
+        display = _display_pack(item)
+        display["score"] = score
+        display["matched"] = matched
+        scored.append((score, pack_id, display))
 
-    # (score desc, node_count desc, pack_id asc) — the third key makes the
-    # order total, so the same input always yields the same output.
-    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
-    return [item[3] for item in scored]
+    # (score desc, pack_id asc) -- same ordering whether node counts are
+    # known or not (#146 C: node_count is no longer part of the tie-break,
+    # since it can be null).
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [t[2] for t in scored]
 
 
 @tool(
