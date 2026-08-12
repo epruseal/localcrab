@@ -49,6 +49,34 @@ log = logging.getLogger(__name__)
 STORE_INJECTED_KEYS = frozenset({"id", "space"})
 
 
+# 앵커 노드 판정(F4-a). `dataset:` 프리픽스 노드나 title-backfill 이 만든 노드는
+# graph 트윈이 없거나 있어도 삭제 후보에서 빼야 한다 — 이 판정을 두 곳(Python 술어,
+# SQL WHERE 조각)에서 각자 구현하면 갈린다. 실제로 종전엔 `incremental_finalize`
+# 지역 함수 하나뿐이었는데, F4-b 가 `live_pack_state`(모듈 함수, `incremental_finalize`
+# 밖)에서도 같은 판정이 필요해지면서 두 벌이 될 뻔했다.
+#
+# SQL 쪽에 `LIKE` 를 쓰면 안 된다 — SQLite `LIKE` 는 ASCII 대소문자를 무시해서
+# `DATASET:x` 도 앵커로 잡는데 Python `str.startswith` 는 그 행을 안 잡는다.
+# 그러면 graph 축과 doc 축이 서로 다른 노드를 앵커로 보고 판정이 갈린다.
+# `GLOB` 은 대소문자를 구분해 Python 쪽과 일치한다.
+ANCHOR_SQL = (
+    "(node_id GLOB 'dataset:*'"
+    " OR COALESCE(json_extract(properties,'$.created_by'),'') = 'title-backfill')"
+)
+
+
+def _is_anchor_node(node_id: str, props: dict) -> bool:
+    """앵커 노드 판정의 Python 쪽 정본. `ANCHOR_SQL` 과 같은 조건을 낸다.
+
+    `live_nodes` 같은 특정 dict 를 안에서 조회하지 않는다 — 호출자가 props 를
+    직접 넘긴다. 예전 구현은 `incremental_finalize` 지역 함수가 `live_nodes`
+    를 닫혀서 참조했는데, `live_nodes` 밖 node_id(예: doc_nodes 에만 있는 앵커)
+    는 조회하면 빈 dict 를 받아 앵커가 앵커로 안 잡혔다.
+    """
+    if node_id.startswith("dataset:"):
+        return True
+    return props.get("created_by") == "title-backfill"
+
 
 def _batched(seq: list, size: int = 500):
     """SQLite 파라미터 상한(기본 999) 회피용 배치 분할."""
@@ -174,9 +202,10 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
             f"SELECT COUNT(*) FROM {table} WHERE pack_id = ?", (pack_name,)
         ).fetchone()[0]
     elif kind == "chroma":
-        # 회수(reclaim) 술어와 동일하게 pack_id 와 레거시 source 를 모두 본다
-        # (item 8 참고 — pack_id 만 갖고 source 가 0건인 라이브 행이 다수 있다).
-        got = handle.get(where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
+        # F6 이후 delete_pack 의 회수 술어와 동일하게 pack_id 단일 키로 좁혔다 —
+        # source 는 소유 키가 아니라 대사에도 넣지 않는다(위 graph_nodes 조회
+        # 주석 참고).
+        got = handle.get(where={"pack_id": pack_name})
         v = len(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
@@ -202,22 +231,26 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     # (재현: 그 노드의 레거시 `source` 가 "pack-a-legacy-dump" 이면 걸린다, 2026-08-11).
     # **삭제는 되돌릴 수 없다** — 경계 판정을 문자열 포함으로 하면 안 되는 자리다.
     #
-    # **회수(reclaim) 술어라 대사(reconcile)보다 넓다.** `source_id`는 스토어 export
-    # 계약이 인정하는 레거시 키. `pack`은 `normalize.py`가 전 노드에 쓰는데 대사
-    # 술어(COUNT_SQL 등)를 포함한 어떤 술어도 안 보던 키다 — `pack` 자체를 없애는
-    # 것은 후속 과제로 미뤘지만, 미루는 동안에도 삭제 대상 조회는 그 키로 태그된
-    # 행을 봐야 고아로 남기지 않는다(2026-08-11 리뷰 지적).
+    # **회수(reclaim) 술어를 `pack_id` 단일 소유 키로 좁힌다.** 한동안 `source`/
+    # `source_id`/`pack` 까지 OR 로 넓게 봤는데, 그 세 키는 이 노드의 **소유**를
+    # 말하지 않는다.
+    #   - `source`/`source_id`: `transform_node` 가 입력의 외래 `source`/`source_id`
+    #     를 properties 에 **보존**한다(`normalize.py:297-301` 이 NODE_STRUCT_KEYS
+    #     밖 키를 그대로 병합). 그것을 회수 키로 두면 `pack_id` 가 다른 팩인 행이
+    #     엉뚱한 `delete_pack('A')` 호출에 걸린다 — 소유 키가 아니다.
+    #   - `pack`: 생산자가 `pack` 을 `pack_id` 와 **같은 값으로만** 쓴다
+    #     (`normalize.py:308-309`). 넓혀도 회수 범위가 한 행도 안 늘고, rename 이
+    #     `pack` 을 갱신 안 해 생기는 stale alias 를 오히려 회수 술어가 보게 만든다.
+    # 대사(reconcile) 술어(COUNT_SQL·live_pack_state)와 폭이 다른 것은 의도다 —
+    # `docs/pack-contract-layer.md` 의 회수/대사 분리 서술과 일치시킨다.
     rows = graph._conn.execute(
         """
         SELECT node_type, node_id,
                COALESCE(json_extract(properties, '$.space'), 'concept') as space
         FROM graph_nodes
         WHERE json_extract(properties, '$.pack_id') = ?
-           OR json_extract(properties, '$.source') = ?
-           OR json_extract(properties, '$.source_id') = ?
-           OR json_extract(properties, '$.pack') = ?
         """,
-        (pack_name, pack_name, pack_name, pack_name),
+        (pack_name,),
     ).fetchall()
 
     for node_type, node_id, space in rows:
@@ -240,17 +273,14 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
 
     # ── doc_nodes: graph 트윈 없이 남은 pack_id 앵커 노드 직접 정리 ───────
     # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
-    # 위 graph_nodes 조회와 동일한 4키(pack_id/source/source_id/pack)를 본다 —
-    # 회수 술어이므로 대사 술어보다 넓게 잡는다.
+    # 위 graph_nodes 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
+    # source/source_id/pack 제외 근거를 그대로 적용한다).
     dn_rows = docs._conn.execute(
         """
         SELECT space, node_id FROM doc_nodes
         WHERE json_extract(properties, '$.pack_id') = ?
-           OR json_extract(properties, '$.source') = ?
-           OR json_extract(properties, '$.source_id') = ?
-           OR json_extract(properties, '$.pack') = ?
         """,
-        (pack_name, pack_name, pack_name, pack_name),
+        (pack_name,),
     ).fetchall()
     doc_node_extra_del = 0
     for space, node_id in dn_rows:
@@ -298,11 +328,9 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
                 handle.commit()
                 chunk_vec_del = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             elif kind == "chroma":
-                # 회수 술어 — pack_id 또는 레거시 source 둘 다 매치. 라이브
-                # doc_sources 2,010행이 pack_id만 갖고 source는 0건이라, source
-                # 단독 술어는 그 100%를 놓친다(2026-08-11 리뷰 지적).
-                result = handle.get(
-                    where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
+                # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
+                # 근거와 동일: source 는 소유 키가 아니다).
+                result = handle.get(where={"pack_id": pack_name})
                 ids_to_del = result.get("ids", [])
                 if ids_to_del:
                     handle.delete(ids=ids_to_del)
@@ -340,6 +368,9 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
       chunks: {source_id: (text, metadata_dict)}
       edges: {(from_id, relation, to_id), ...}
       vec_ids: {node_id, ...}
+      doc_node_spaces: {node_id: {space, ...}} — doc_nodes 축 대사용(F4). 이미 이
+        함수가 `docs._conn` 을 쥐고 있으므로(위 doc_sources 조회) 같은 커넥션으로
+        모은다. 앵커는 뺀다 — 앵커는 삭제 후보가 아니므로 대사 대상도 아니다.
     """
     nodes: dict[str, tuple[str, str, dict]] = {}
     for node_type, node_id, space_id, properties in graph._conn.execute(
@@ -383,9 +414,13 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         ).fetchall():
             vec_ids.add(node_id)
     elif kind == "chroma":
-        # 회수 술어 — pack_id 또는 레거시 source 둘 다 매치(delete_pack의 chroma
-        # 분기와 동일 근거, 2026-08-11 리뷰 지적).
-        got = handle.get(where={"$or": [{"pack_id": pack_name}, {"source": pack_name}]})
+        # F6 이후 delete_pack 의 회수 술어와 동일하게 pack_id 단일 키로 좁혔다.
+        # 이 vec_ids 는 incremental_finalize 에서 그대로
+        # `vec_orphans = live_vecids - (bypack_node_ids | bypack_chunk_ids)` 로
+        # 이어져 **삭제를 만든다** — source 까지 넓게 매치하면 pack_id 가 다른
+        # 팩인 벡터 행(레거시 source 만 이 팩명과 같은 행)이 고아 후보에 섞여
+        # 지워진다. F6 가 SQL 쪽에서 닫은 것과 같은 교차팩 삭제 경로다.
+        got = handle.get(where={"pack_id": pack_name})
         vec_ids.update(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
@@ -399,7 +434,25 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         log.warning("벡터 ID 열거 미지원 백엔드(%s) — 고아 임베딩을 판정할 수 없다",
                     type(vec).__name__)
 
-    return {"nodes": nodes, "chunks": chunks, "edges": edges, "vec_ids": vec_ids}
+    # doc_node_spaces (F4-b): 노드축 **대사(reconcile)** 술어(pack_id 단일 키) —
+    # 위 nodes 조회와 동일한 폭이다. 회수(4키) 술어를 쓰면 `pack` 으로만 태그된
+    # 행의 doc 은 지워지고 graph 는 남아 새 비대칭이 생긴다.
+    doc_node_spaces: dict[str, set[str]] = {}
+    for node_id, space in docs._conn.execute(
+        f"""
+        SELECT node_id, space
+        FROM doc_nodes
+        WHERE json_extract(properties, '$.pack_id') = ?
+          AND NOT {ANCHOR_SQL}
+        """,
+        (pack_name,),
+    ).fetchall():
+        doc_node_spaces.setdefault(node_id, set()).add(space)
+
+    return {
+        "nodes": nodes, "chunks": chunks, "edges": edges, "vec_ids": vec_ids,
+        "doc_node_spaces": doc_node_spaces,
+    }
 
 
 def load_nodes(
@@ -450,17 +503,51 @@ def load_nodes_incremental(
     live_nodes: dict[str, tuple[str, str, dict]],
     graph,
     docs,
+    doc_node_spaces: dict[str, set[str]],
 ) -> tuple[int, int, int, int, int, set]:
     """노드 증분 적재. 라이브와 동일한 행은 완전 스킵(어떤 스토어도 미접촉).
 
     graph/docs는 명시 파라미터 — OntologyBuilder는 스토어를 내부명(_neo4j/_mongo)으로
     보관하므로 builder 속성 접근은 불가(vendor 실측, 2026-07-22).
 
+    `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
+    노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
+    남아 있는 경우 그 자리에서 Y 행을 지운다(F4-c). 한동안 기본값 `None` 으로
+    받아 생략을 허용했는데, 그러면 호출자가 안 넘겨도 예외 없이 이 정리가
+    **조용히 꺼진다** — 그리고 그 누락을 `incremental_finalize`(F4-d)가 못 잡는다.
+    F4-d 의 doc 축 후보는 `set(doc_node_spaces) - bypack_node_ids` 라 **입력에
+    아직 있는 노드**(bypack_node_ids 안)의 이종 space 잔재는 그쪽 후보에 안 잡힌다
+    — 그게 정확히 F4-c 의 몫이다. 조용히 꺼지면 타입 변경 잔재가 영영 안 걷힌다.
+    빈 dict(`{}`)는 유효하다 — "대사할 doc 행이 없다"는 사실이고, 없는 것과는
+    다르다.
+
     반환: (n_new, n_chg, n_same, skip, err, bypack_ids)
     """
     require_live_data("load_nodes_incremental")
     n_new = n_chg = n_same = skip = err = 0
     bypack_ids: set[str] = set()
+
+    def _cleanup_stale_doc_spaces(node_id: str, space: str) -> None:
+        """이 node_id 가 이번에 `space` 로 확정됐다 — doc_node_spaces 에 기록된
+        다른 space 의 doc 행은 이제 고아다.
+
+        `incremental_finalize` 의 doc 축 정리(F4-d)가 증분 사이에 놓친 것을
+        뒤에서 한 번 더 쓸어가긴 하지만, 그 전까지 다른 space 의 stale 행이
+        살아 있으면 검색이 옛 space 로도 이 노드를 반환한다. 여기서 즉시
+        지우면 그 창을 없앤다. 멱등이다 — 이번에 실패해도(반환 False·예외)
+        다음 실행이 `doc_node_spaces` 를 다시 계산해 재시도한다.
+        """
+        if not doc_node_spaces:
+            return
+        stale = doc_node_spaces.get(node_id, set()) - {space}
+        for other_space in stale:
+            try:
+                ok_del = docs.delete_node_doc(other_space, node_id)
+            except Exception as exc:
+                log.warning("doc 이종 space 정리 오류 %s space=%s: %s", node_id, other_space, exc)
+                continue
+            if not ok_del:
+                log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
     for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
             space, node_type, node_id, props = transform_node(pack_name, row)
@@ -477,6 +564,10 @@ def load_nodes_incremental(
                 live_props = {k: v for k, v in live[2].items() if k not in STORE_INJECTED_KEYS}
                 if live[0] == node_type and live_props == props:
                     n_same += 1
+                    # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
+                    # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
+                    # same 경로도 확인한다.
+                    _cleanup_stale_doc_spaces(node_id, space)
                     done = n_new + n_chg + n_same + skip + err
                     if done % 500 == 0:
                         print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
@@ -509,10 +600,25 @@ def load_nodes_incremental(
                         except Exception as exc:
                             log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
                                         node_id, stale_typed[0], exc)
-                        try:
-                            docs.delete_node_doc(stale_typed[1], node_id)
-                        except Exception:
-                            pass
+                        # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
+                        # PK 는 `(space, node_id)` 로 타입을 안 담는다. space 가 같으면
+                        # 위 `add_node` 의 `upsert_node_doc` 이 **같은 행을 이미 신 값으로
+                        # 갱신**했으므로 지울 구 행이 없다 — 여기서 지우면 방금 갱신한
+                        # 행이 사라진다(2026-08-12 실측: doc 행 0 소실). space 가 다를
+                        # 때만 구 space 행이 별도로 남아 삭제 대상이다. 원본(이관 전)은
+                        # 삭제가 add_node **앞**이라 이 문제가 없었고, 저장 실패 시 영구
+                        # 소실을 막으려 저장-후-삭제로 순서를 바꾼 것(위 주석)이 이 가드를
+                        # 필요하게 만들었다.
+                        if stale_typed[1] != space:
+                            try:
+                                docs.delete_node_doc(stale_typed[1], node_id)
+                            except Exception as exc:
+                                log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
+                                            node_id, stale_typed[1], exc)
+                    # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
+                    # doc 행을 정리한다. stale_typed 삭제와는 별개다 — 저건 "타입이
+                    # 바뀐 구 행"이고 이건 "같은 노드가 다른 space 로도 찍혀 있던 것"이다.
+                    _cleanup_stale_doc_spaces(node_id, space)
                     if live is None:
                         n_new += 1
                     else:
@@ -853,150 +959,173 @@ def incremental_finalize(
     force_delete: bool,
     nodes_total: int,
     chunks_total: int,
-    had_write_failures: bool = False,
 ) -> dict:
     """증분 삭제 + 3원 대사. live는 live_pack_state()의 반환 dict.
 
-    `had_write_failures=True`면 이번 적재 중 저장 실패(add_node/add_edge 영수증에
-    남은 실패)가 있었다는 뜻이다. **삭제는 되돌릴 수 없다** — 부분적으로만 반영된
-    결과를 기준으로 "무엇이 파일에서 빠졌는가"를 판정하면, 실패해서 아직 못 쓴 행과
-    진짜로 파일에서 빠진 행을 구분할 수 없다. 그래서 이 경우 node_del/chunk_del/
-    edge_del/vec_orphan_del **삭제를 전부 건너뛰고** 반환 dict에
-    `"skipped_cleanup": True`를 남긴다. 다음 증분이 온전히 성공하면 그때 정리된다.
-
     반환: {"node_del":…, "chunk_del":…, "edge_del":…, "vec_orphan_del":…,
-           "skipped_cleanup": bool}
+           "doc_orphan_del":…}
     """
     require_live_data("incremental_finalize")
     live_nodes  = live["nodes"]
     live_chunks = live["chunks"]
     live_edges  = live["edges"]
     live_vecids = live["vec_ids"]
+    doc_node_spaces = live["doc_node_spaces"]  # F4-b: {node_id: {space, ...}}
 
     def _is_anchor(node_id: str) -> bool:
-        if node_id.startswith("dataset:"):
-            return True
-        props = live_nodes.get(node_id, (None, None, {}))[2]
-        return props.get("created_by") == "title-backfill"
+        return _is_anchor_node(node_id, live_nodes.get(node_id, (None, None, {}))[2])
 
-    node_del = chunk_del = edge_del = vec_orphan_del = 0
+    node_del = chunk_del = edge_del = vec_orphan_del = doc_orphan_del = 0
 
-    if had_write_failures:
-        print(
-            f"  ⚠️ [{pack_name}] 이번 적재에 저장 실패가 있었다 — 부분 실패를 기준으로"
-            " 삭제를 판정할 수 없다(삭제는 되돌릴 수 없다). 증분 삭제(노드/청크/엣지/"
-            "벡터고아) 전부 스킵 — 다음 증분이 온전히 성공하면 그때 정리된다.",
-            flush=True,
+    # ── 안전핀 0: by-pack 파일 누락 의심 (0-항목인데 라이브엔 데이터 존재) ──
+    if not bypack_node_ids and live_nodes:
+        sys.exit(
+            f"ERROR: [{pack_name}] by-pack 노드 0건 · 라이브 {len(live_nodes)}건 —"
+            " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
         )
-    else:
-        # ── 안전핀 0: by-pack 파일 누락 의심 (0-항목인데 라이브엔 데이터 존재) ──
-        if not bypack_node_ids and live_nodes:
-            sys.exit(
-                f"ERROR: [{pack_name}] by-pack 노드 0건 · 라이브 {len(live_nodes)}건 —"
-                " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
-            )
-        if not bypack_chunk_ids and live_chunks:
-            sys.exit(
-                f"ERROR: [{pack_name}] by-pack 청크 0건 · 라이브 {len(live_chunks)}건 —"
-                " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
-            )
+    if not bypack_chunk_ids and live_chunks:
+        sys.exit(
+            f"ERROR: [{pack_name}] by-pack 청크 0건 · 라이브 {len(live_chunks)}건 —"
+            " by-pack 파일 누락 의심 — 삭제 폭주 방지 중단"
+        )
 
-        # ── 삭제 후보 (앵커 제외) ──────────────────────────────────────────
-        node_del_candidates = {nid for nid in (set(live_nodes) - bypack_node_ids) if not _is_anchor(nid)}
-        chunk_del_candidates = set(live_chunks) - bypack_chunk_ids
+    # ── 삭제 후보 (앵커 제외) ──────────────────────────────────────────
+    node_del_candidates = {nid for nid in (set(live_nodes) - bypack_node_ids) if not _is_anchor(nid)}
+    chunk_del_candidates = set(live_chunks) - bypack_chunk_ids
+    # doc 축 후보(F4-d). 노드 축 후보와 축이 다르다 — node_del_candidates 는
+    # "노드 자체가 사라졌는가"고, 이건 "이 노드가 남아있어도 이 space 의 doc
+    # 행은 재확인됐는가"다. doc_node_spaces 는 이미 앵커를 뺀 채로 온다(F4-b).
+    doc_del_candidates = set(doc_node_spaces) - bypack_node_ids
 
-        # ── 안전핀 30%: 삭제 폭주 방지 ───────────────────────────────────────
-        node_ratio  = len(node_del_candidates)  / max(1, len(live_nodes))
-        chunk_ratio = len(chunk_del_candidates) / max(1, len(live_chunks))
-        if (node_ratio > 0.30 or chunk_ratio > 0.30) and not force_delete:
+    # ── 안전핀: doc_node_spaces 가 비었는데 후보가 있으면 불변식 위반 ──────
+    # doc_del_candidates 는 집합 뺄셈이라 정의상 doc_node_spaces 의 부분집합이다.
+    # 그런데도 위반이 보이면 doc_node_spaces 계산 자체가 깨진 것이고, 그 상태로는
+    # 30% 핀도 못 막는다(분모가 0이라 `max(1, ...)` 로 얼버무리면 100% 넘는 삭제가
+    # 조용히 통과한다). 즉시 중단한다.
+    if not doc_node_spaces and doc_del_candidates:
+        sys.exit(
+            f"ERROR: [{pack_name}] doc_node_spaces 0건인데 doc 삭제 후보"
+            f" {len(doc_del_candidates)}건 — 불변식 위반(후보는 doc_node_spaces 의"
+            " 부분집합이어야 한다), 중단"
+        )
+
+    # ── 안전핀 30%: 삭제 폭주 방지 ───────────────────────────────────────
+    node_ratio  = len(node_del_candidates)  / max(1, len(live_nodes))
+    chunk_ratio = len(chunk_del_candidates) / max(1, len(live_chunks))
+    if (node_ratio > 0.30 or chunk_ratio > 0.30) and not force_delete:
+        sys.exit(
+            f"ERROR: [{pack_name}] 삭제 후보 비율 초과 — "
+            f"노드 {len(node_del_candidates)}/{len(live_nodes)}({node_ratio:.1%}) "
+            f"청크 {len(chunk_del_candidates)}/{len(live_chunks)}({chunk_ratio:.1%}) — "
+            "--force-delete 로 강행하십시오."
+        )
+    # doc 축 30% 핀은 노드/청크와 별도다 — 분모가 doc_node_spaces 의 **노드 수**다
+    # (행 수가 아니다). 한 노드가 여러 space 에 걸쳐 있으면 행 수가 노드 수보다
+    # 많아지므로, 행 수를 분모로 쓰면 같은 삭제량도 비율이 낮게 나와 핀이 무뎌진다.
+    # doc_node_spaces 가 비면 후보도 비므로(위 불변식 핀에서 이미 확인됐다) 건너뛴다.
+    if doc_node_spaces:
+        doc_node_ratio = len(doc_del_candidates) / len(doc_node_spaces)
+        if doc_node_ratio > 0.30 and not force_delete:
             sys.exit(
-                f"ERROR: [{pack_name}] 삭제 후보 비율 초과 — "
-                f"노드 {len(node_del_candidates)}/{len(live_nodes)}({node_ratio:.1%}) "
-                f"청크 {len(chunk_del_candidates)}/{len(live_chunks)}({chunk_ratio:.1%}) — "
+                f"ERROR: [{pack_name}] doc 삭제 후보 비율 초과 — "
+                f"{len(doc_del_candidates)}/{len(doc_node_spaces)}({doc_node_ratio:.1%}) — "
                 "--force-delete 로 강행하십시오."
             )
 
-        # ── 노드 삭제 ────────────────────────────────────────────────────
-        for node_id in node_del_candidates:
-            node_type, space_id, _props = live_nodes[node_id]
-            try:
-                deleted = graph.delete_node(node_type, node_id)
-            except Exception:
-                deleted = False
-            try:
-                docs.delete_node_doc(space_id or "concept", node_id)
-            except Exception:
-                pass
-            if deleted:
-                node_del += 1
+    # ── 노드 삭제 ────────────────────────────────────────────────────
+    # doc 삭제는 여기서 하지 않는다 — 아래 doc 축 정리(doc_del_candidates)가
+    # 이 node_id 의 모든 space 를 한 번에 지운다. 예전엔 여기서 live_nodes 의
+    # space_id 하나만 지워서 다른 space 의 행을 놓쳤다(F4-d, 2026-08-11 설계 지적).
+    for node_id in node_del_candidates:
+        node_type, _space_id, _props = live_nodes[node_id]
+        try:
+            deleted = graph.delete_node(node_type, node_id)
+        except Exception as exc:
+            log.warning("노드 삭제 오류(%s) %s type=%s: %s", pack_name, node_id, node_type, exc)
+            continue
+        if deleted:
+            node_del += 1
 
-        # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
-        chunk_del_list = list(chunk_del_candidates)
-        for batch in _batched(chunk_del_list):
-            placeholders = ",".join("?" * len(batch))
+    # ── doc 축 정리: 후보 노드의 모든 space 행을 지운다 ─────────────────────
+    # load_nodes_incremental 의 F4-c 가 매 증분 실시간으로 대부분 정리하지만,
+    # 그 경로를 안 거치는 자리(위 노드 삭제 경로 등)의 doc 삭제도 여기서 합류한다.
+    for node_id in doc_del_candidates:
+        for space in doc_node_spaces[node_id]:
             try:
-                cur = docs._conn.execute(
-                    f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
-                )
-                chunk_del += cur.rowcount
+                ok_del = docs.delete_node_doc(space, node_id)
             except Exception as exc:
-                log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-            try:
-                docs._conn.execute(
-                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
-                )
-            except Exception as exc:
-                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
-        docs._conn.commit()
-        if chunk_del_list:
-            # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
-            # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
-            vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]
-            try:
-                if vec_del_ids:
-                    vec.delete(vec_del_ids)
-            except Exception as exc:
-                log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
+                log.warning("doc 고아 삭제 오류(%s) %s space=%s: %s", pack_name, node_id, space, exc)
+                continue
+            if ok_del:
+                doc_orphan_del += 1
 
-        # ── 엣지 정리 (live에 있으나 이번 적재에서 재확인되지 않은 엣지) ──────
-        # 안전핀: applied가 통째로 비었는데 live 엣지가 있으면 edges.jsonl 누락/전건
-        # 문법 실패 의심 — 전량 삭제 대신 스킵(0-항목 핀과 동일 클래스, 2026-07-22)
-        if not applied_edges and live_edges:
-            print(
-                f"  ⚠️ [{pack_name}] 반영 엣지 0건·라이브 {len(live_edges)}건 — "
-                "edges.jsonl 누락 의심, 엣지 정리 스킵",
-                flush=True,
+    # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
+    chunk_del_list = list(chunk_del_candidates)
+    for batch in _batched(chunk_del_list):
+        placeholders = ",".join("?" * len(batch))
+        try:
+            cur = docs._conn.execute(
+                f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
             )
-            stale_edges = set()
-        else:
-            stale_edges = live_edges - applied_edges
-        for (f_id, r, t_id) in stale_edges:
-            try:
-                cur = graph._conn.execute(
-                    "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?"
-                    " AND json_extract(properties,'$.pack_id')=?",
-                    (f_id, r, t_id, pack_name),
-                )
-                # rowcount로 센다 — 무조건 +=1이면 노드 삭제의 cascade가 이미 지운
-                # 엣지까지 여기서 다시 세어 **이중 계상**한다.
-                edge_del += cur.rowcount
-            except Exception as exc:
-                log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
-        graph._conn.commit()
+            chunk_del += cur.rowcount
+        except Exception as exc:
+            log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
+        try:
+            docs._conn.execute(
+                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
+            )
+        except Exception as exc:
+            log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+    docs._conn.commit()
+    if chunk_del_list:
+        # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
+        # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
+        vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]
+        try:
+            if vec_del_ids:
+                vec.delete(vec_del_ids)
+        except Exception as exc:
+            log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
 
-        # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
-        # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
-        vec_orphans = [
-            i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
-        ]
-        for batch in _batched(vec_orphans):
-            try:
-                # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
-                # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
-                vec.delete(batch)
-                vec_orphan_del += len(batch)
-            except Exception as exc:
-                log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
+    # ── 엣지 정리 (live에 있으나 이번 적재에서 재확인되지 않은 엣지) ──────
+    # 안전핀: applied가 통째로 비었는데 live 엣지가 있으면 edges.jsonl 누락/전건
+    # 문법 실패 의심 — 전량 삭제 대신 스킵(0-항목 핀과 동일 클래스, 2026-07-22)
+    if not applied_edges and live_edges:
+        print(
+            f"  ⚠️ [{pack_name}] 반영 엣지 0건·라이브 {len(live_edges)}건 — "
+            "edges.jsonl 누락 의심, 엣지 정리 스킵",
+            flush=True,
+        )
+        stale_edges = set()
+    else:
+        stale_edges = live_edges - applied_edges
+    for (f_id, r, t_id) in stale_edges:
+        try:
+            cur = graph._conn.execute(
+                "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?"
+                " AND json_extract(properties,'$.pack_id')=?",
+                (f_id, r, t_id, pack_name),
+            )
+            # rowcount로 센다 — 무조건 +=1이면 노드 삭제의 cascade가 이미 지운
+            # 엣지까지 여기서 다시 세어 **이중 계상**한다.
+            edge_del += cur.rowcount
+        except Exception as exc:
+            log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
+    graph._conn.commit()
+
+    # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
+    # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
+    vec_orphans = [
+        i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
+    ]
+    for batch in _batched(vec_orphans):
+        try:
+            # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
+            # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
+            vec.delete(batch)
+            vec_orphan_del += len(batch)
+        except Exception as exc:
+            log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 3원 대사 출력 (assert 아님 — 숫자 보고) ────────────────────────────
     counts = pack_live_counts(pack_name, graph, docs, vec)
@@ -1015,7 +1144,8 @@ def incremental_finalize(
         flush=True,
     )
     print(
-        f"  [{pack_name}] 증분 삭제: 노드 {node_del} / 청크 {chunk_del} / 엣지 {edge_del} / 벡터고아 {vec_orphan_del}",
+        f"  [{pack_name}] 증분 삭제: 노드 {node_del} / 청크 {chunk_del} / 엣지 {edge_del} / "
+        f"벡터고아 {vec_orphan_del} / doc고아 {doc_orphan_del}",
         flush=True,
     )
 
@@ -1024,5 +1154,5 @@ def incremental_finalize(
         "chunk_del": chunk_del,
         "edge_del": edge_del,
         "vec_orphan_del": vec_orphan_del,
-        "skipped_cleanup": had_write_failures,
+        "doc_orphan_del": doc_orphan_del,
     }
