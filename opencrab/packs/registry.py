@@ -80,6 +80,37 @@ def get_pack(sql: Any, pack_id: str) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+def _is_pack_id_conflict(exc: Any) -> bool:
+    """True only for the pack_id PK/UNIQUE violation ``_insert_pack``'s
+    slug-collision retry is meant to swallow. Every other ``IntegrityError``
+    (FK, CHECK, NOT NULL, or a form we don't recognise) must be re-raised --
+    blindly treating every ``IntegrityError`` as "slug taken" is the bug
+    this classifies away from (a FK violation, say, would otherwise be
+    silently reported as a collision and retried forever).
+
+    Reads ``exc.orig`` (the driver-native exception DBAPI wraps), not the
+    outer SQLAlchemy exception -- the identifying attributes below only
+    exist on the driver object.
+
+    - SQLite: ``orig.sqlite_errorname`` is ``SQLITE_CONSTRAINT_PRIMARYKEY``
+      or ``SQLITE_CONSTRAINT_UNIQUE`` AND the message names
+      ``packs.pack_id`` (so a UNIQUE violation on some other column/table
+      isn't misclassified as a pack_id collision).
+    - PostgreSQL: ``orig.pgcode == "23505"`` (unique_violation).
+    """
+    orig = getattr(exc, "orig", None)
+    sqlite_errorname = getattr(orig, "sqlite_errorname", None)
+    if sqlite_errorname is not None:
+        return sqlite_errorname in (
+            "SQLITE_CONSTRAINT_PRIMARYKEY",
+            "SQLITE_CONSTRAINT_UNIQUE",
+        ) and "packs.pack_id" in str(orig)
+    pgcode = getattr(orig, "pgcode", None)
+    if pgcode is not None:
+        return pgcode == "23505"
+    return False
+
+
 def _insert_pack(
     sql: Any,
     pack_id: str,
@@ -93,6 +124,10 @@ def _insert_pack(
     concurrent ``pack_create`` calls onto the same slug; letting the PK's
     UNIQUE constraint be the single point of truth avoids that TOCTOU
     window entirely.
+
+    Only a pack_id collision (see ``_is_pack_id_conflict``) is swallowed
+    into ``False`` -- any other ``IntegrityError`` (FK, CHECK, ...) is
+    re-raised rather than misreported as "slug taken".
     """
     from sqlalchemy import text
     from sqlalchemy.exc import IntegrityError
@@ -113,8 +148,10 @@ def _insert_pack(
                 },
             )
         return True
-    except IntegrityError:
-        return False
+    except IntegrityError as exc:
+        if _is_pack_id_conflict(exc):
+            return False
+        raise
 
 
 def create_pack(

@@ -23,6 +23,8 @@ from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.packs.registry import (
     PackForbiddenError,
     PackNotFoundError,
+    _insert_pack,
+    _is_pack_id_conflict,
     assert_writable,
     create_pack,
     get_pack,
@@ -83,6 +85,133 @@ class TestCreatePack:
         create_pack(sql, alice, "origin")
         pack_id = create_pack(sql, alice, "fork-of-origin", forked_from="origin")
         assert get_pack(sql, pack_id)["forked_from"] == "origin"
+
+
+# ---------------------------------------------------------------------------
+# _is_pack_id_conflict / _insert_pack — IntegrityError classification (#146
+# pre-fix E: blindly treating every IntegrityError as "slug taken" would
+# retry/misreport FK, CHECK, and NOT NULL violations as collisions too).
+# ---------------------------------------------------------------------------
+
+
+class _FakeOrig:
+    """Minimal double for the driver-native exception ``exc.orig`` wraps --
+    a bare MagicMock would answer ``getattr(mock, "pgcode", None)`` with
+    another MagicMock (never None), defeating the classification's
+    attribute-presence checks."""
+
+    def __init__(self, message: str = "", **attrs):
+        self._message = message
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def __str__(self) -> str:
+        return self._message
+
+
+class _FakeExc:
+    def __init__(self, orig):
+        self.orig = orig
+
+
+class TestIsPackIdConflict:
+    """E2a: classification unit tests (codex-mandated -- a mutant that makes
+    ``_insert_pack`` swallow every IntegrityError still passes an E1-only
+    suite; these pin the classifier itself)."""
+
+    def test_sqlite_primary_key_violation_on_pack_id_is_conflict(self):
+        exc = _FakeExc(_FakeOrig(
+            "UNIQUE constraint failed: packs.pack_id",
+            sqlite_errorname="SQLITE_CONSTRAINT_PRIMARYKEY",
+        ))
+        assert _is_pack_id_conflict(exc) is True
+
+    def test_sqlite_unique_violation_on_pack_id_is_conflict(self):
+        exc = _FakeExc(_FakeOrig(
+            "UNIQUE constraint failed: packs.pack_id",
+            sqlite_errorname="SQLITE_CONSTRAINT_UNIQUE",
+        ))
+        assert _is_pack_id_conflict(exc) is True
+
+    def test_sqlite_foreign_key_violation_is_not_conflict(self):
+        exc = _FakeExc(_FakeOrig(
+            "FOREIGN KEY constraint failed",
+            sqlite_errorname="SQLITE_CONSTRAINT_FOREIGNKEY",
+        ))
+        assert _is_pack_id_conflict(exc) is False
+
+    def test_sqlite_unique_violation_on_other_column_is_not_conflict(self):
+        """A UNIQUE violation naming a different table/column must not be
+        misread as a pack_id slug collision."""
+        exc = _FakeExc(_FakeOrig(
+            "UNIQUE constraint failed: users.email",
+            sqlite_errorname="SQLITE_CONSTRAINT_UNIQUE",
+        ))
+        assert _is_pack_id_conflict(exc) is False
+
+    def test_postgres_unique_violation_is_conflict(self):
+        exc = _FakeExc(_FakeOrig(
+            "duplicate key value violates unique constraint",
+            pgcode="23505",
+        ))
+        assert _is_pack_id_conflict(exc) is True
+
+    def test_postgres_foreign_key_violation_is_not_conflict(self):
+        exc = _FakeExc(_FakeOrig(
+            "insert or update on table violates foreign key constraint",
+            pgcode="23503",
+        ))
+        assert _is_pack_id_conflict(exc) is False
+
+    def test_unrecognised_orig_form_is_not_conflict(self):
+        """No sqlite_errorname, no pgcode -- fail closed (re-raise), never
+        guess "must be a collision"."""
+        exc = _FakeExc(_FakeOrig("some other db error"))
+        assert _is_pack_id_conflict(exc) is False
+
+
+class TestInsertPackClassification:
+    def test_e1_same_pack_id_reinsert_returns_false(self, sql, alice):
+        """E1: the original collision-detection contract, unchanged."""
+        assert _insert_pack(sql, "dup", alice, None, None, None) is True
+        assert _insert_pack(sql, "dup", alice, None, None, None) is False
+
+    def test_e2b_fk_violation_reraises_without_any_retry(self, sql, monkeypatch):
+        """E2b: a real FK-shaped IntegrityError (owner_id referencing a
+        nonexistent user, with the SQLite connection's FK pragma turned on
+        for this test's engine only) must propagate out of create_pack
+        rather than being swallowed as "slug taken" -- and create_pack must
+        not have retried at all (a mutant that classifies FK errors as
+        conflicts would otherwise silently exhaust every retry attempt and
+        raise a misleading RuntimeError instead of the real IntegrityError)."""
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+
+        import opencrab.packs.registry as registry_mod
+
+        # sql's engine uses SQLAlchemy's SingletonThreadPool for
+        # sqlite:///:memory: (one physical connection per thread, reused
+        # across every .connect()/.begin() call) -- setting the pragma once
+        # here persists for every later connection this test's thread makes,
+        # unlike a real multi-connection SQLite pool where it would need to
+        # be set per-connection (e.g. via a "connect" event).
+        with sql._engine.connect() as conn:
+            conn.execute(text("PRAGMA foreign_keys=ON"))
+            conn.commit()
+
+        calls: list[str] = []
+        real_insert = registry_mod._insert_pack
+
+        def _counting_insert(*args, **kwargs):
+            calls.append(args[1])  # pack_id positional arg
+            return real_insert(*args, **kwargs)
+
+        monkeypatch.setattr(registry_mod, "_insert_pack", _counting_insert)
+
+        with pytest.raises(IntegrityError):
+            registry_mod.create_pack(sql, "no-such-user", "orphan-pack")
+        assert len(calls) == 1
+        assert get_pack(sql, "orphan-pack") is None
 
 
 # ---------------------------------------------------------------------------
