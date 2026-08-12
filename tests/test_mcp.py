@@ -549,17 +549,23 @@ class TestToolDispatch:
     def test_pack_ingest_text_creates_evidence_node(self):
         """pack_ingest with text materialises an evidence/TextUnit node via builder.add_node."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
 
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "test-user", "test-pack")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             hybrid = MagicMock()
             hybrid.invalidate_bm25_cache = MagicMock()
             mongo = MagicMock()
             mongo.available = False
+            graph = MagicMock()
+            graph.available = True
             mock_ctx.return_value = {
+                "neo4j": graph,
+                "sql": sql,
                 "builder": builder,
                 "hybrid": hybrid,
                 "mongo": mongo,
@@ -567,7 +573,6 @@ class TestToolDispatch:
                 "impact": MagicMock(),
                 "billing": MagicMock(),
             }
-            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
 
             result = dispatch_tool("pack_ingest", {
                 "pack_id": "test-pack",
@@ -600,18 +605,24 @@ class TestToolDispatch:
     def test_pack_ingest_text_as_node_false_legacy(self):
         """pack_ingest with text_as_node=False uses legacy vector-only path."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
 
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "test-user", "test-pack")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             hybrid = MagicMock()
             hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
             hybrid.invalidate_bm25_cache = MagicMock()
             mongo = MagicMock()
             mongo.available = False
+            graph = MagicMock()
+            graph.available = True
             mock_ctx.return_value = {
+                "neo4j": graph,
+                "sql": sql,
                 "builder": builder,
                 "hybrid": hybrid,
                 "mongo": mongo,
@@ -619,7 +630,6 @@ class TestToolDispatch:
                 "impact": MagicMock(),
                 "billing": MagicMock(),
             }
-            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
 
             result = dispatch_tool("pack_ingest", {
                 "pack_id": "test-pack",

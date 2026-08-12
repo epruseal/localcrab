@@ -871,24 +871,55 @@ def pack_ingest(
     The ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
     stays fixed at 'default'.
+
+    #146: existence is no longer checked via a ``content_pack_list()`` scan
+    (that read path is scoped to what the caller can WRITE-then-READ, but
+    graph.list_packs() membership was never ownership -- any reader in the
+    readable set could write into a pack they don't own). ``assert_writable``
+    is the same registry-authority check ``pack_publish`` already uses:
+    owner-only, with the two-exception existence-leak contract (#143
+    invariant 7) unchanged.
+
+    **Behaviour change**: an authenticated caller could previously ingest
+    into anyone else's PUBLIC pack (only readable-set membership was
+    checked, not ownership). Now only the owner can write -- #143 invariant
+    4 ("쓰기는 소유자만") enforced here for the first time, not a
+    regression.
     """
     from opencrab.auth import current_principal
-    from opencrab.mcp.tools import _clean_str, content_pack_list
+    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.packs.registry import PackForbiddenError, PackNotFoundError, assert_writable
 
     principal = current_principal()
     tenant_id = "default"
     subject_id = principal.user_id
     pack_id = _clean_str(pack_id)
 
-    # NO arguments: pack_id must match an existing pack EXACTLY. Passing a
-    # query/limit here would narrow the candidate set and reject packs that
-    # really exist — the contract is exact match, never fuzzy resolution.
-    existing = content_pack_list()
-    existing_ids = {p["pack_id"] for p in existing.get("packs", [])}
-    if pack_id not in existing_ids:
+    ctx = _get_context()
+    graph = ctx["neo4j"]
+    # Reject before any store write is attempted -- if the graph (system of
+    # record for pack content) is down, there is nothing safe to write.
+    if not getattr(graph, "available", False):
+        return {"error": "graph store unavailable"}
+
+    try:
+        assert_writable(ctx["sql"], principal, pack_id)
+    except PackNotFoundError:
+        # #143 invariant 7: identical response for "doesn't exist at all"
+        # and "exists but it's someone else's private pack" -- existence of
+        # a private pack must not be observable to non-owners.
         return {
             "error": "pack not found; use pack_create first",
             "pack_id": pack_id,
+        }
+    except PackForbiddenError:
+        # A visible (public) pack owned by someone else -- existence is
+        # already observable (content_pack_list), so this can safely say
+        # more than "not found".
+        return {
+            "error": "PACK_NOT_WRITABLE: not the pack owner",
+            "pack_id": pack_id,
+            "hint": "use pack_fork to copy this pack into your own",
         }
 
     if not (nodes or edges or text):

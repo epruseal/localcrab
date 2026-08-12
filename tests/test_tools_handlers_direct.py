@@ -62,6 +62,20 @@ def _base_ctx(**overrides):
     return ctx
 
 
+def _writable_ctx(pack_id, owner="test-user", **overrides):
+    """A ``_base_ctx()`` with a real in-memory SQLStore carrying one packs
+    registry row for ``pack_id`` owned by ``owner`` -- #146 D: pack_ingest's
+    existence/ownership check is ``assert_writable`` against the real
+    ``packs`` table now, not a mocked ``content_pack_list()``."""
+    from opencrab.packs.registry import create_pack as _register_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore("sqlite:///:memory:")
+    _register_pack(sql, owner, pack_id)
+    overrides.setdefault("sql", sql)
+    return _base_ctx(**overrides)
+
+
 # ---------------------------------------------------------------------------
 # content_pack_list
 # ---------------------------------------------------------------------------
@@ -860,12 +874,8 @@ class TestPackCreate:
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "error: disk down"}}
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder, billing=billing)
             result = pack_ingest(
                 "existing-pack",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
@@ -1076,8 +1086,10 @@ class TestPackCreateCompensatingDelete:
 
 class TestPackIngestErrors:
     def test_error_pack_not_found(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": []}
+        from opencrab.stores.sql_store import SQLStore
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(sql=SQLStore("sqlite:///:memory:"))
             result = pack_ingest("nonexistent-pack", text="hello")
         assert result == {
             "error": "pack not found; use pack_create first",
@@ -1085,8 +1097,8 @@ class TestPackIngestErrors:
         }
 
     def test_error_no_content_provided(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack")
             result = pack_ingest("existing-pack")
         assert result == {
             "error": "no content provided: supply at least one of nodes, edges, or text"
@@ -1101,12 +1113,8 @@ class TestPackIngestErrors:
         builder.add_node.return_value = {
             "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
         }
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder)
             result = pack_ingest(
                 "existing-pack",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
@@ -1126,12 +1134,10 @@ class TestPackIngestErrors:
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx(
+                "existing-pack", owner="u1", builder=builder, billing=billing
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 pack_ingest(
                     "existing-pack",
@@ -1149,12 +1155,8 @@ class TestPackIngestErrors:
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         billing.on_ingest.return_value = {"ok": False, "error": "database is locked"}
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder, billing=billing)
             with caplog.at_level(logging.WARNING):
                 result = pack_ingest(
                     "existing-pack",
