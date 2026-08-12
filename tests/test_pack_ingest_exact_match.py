@@ -144,7 +144,10 @@ def test_response_dict_is_identical_for_unregistered_and_someone_elses_private(s
         "error": "pack not found; use pack_create first",
         "pack_id": "alice-secret",
     }
-    assert set(unregistered.keys()) == set(private.keys())
+    # docstring 의 "전체 dict 동일" 을 문자 그대로 단언한다: 유일하게
+    # 달라도 되는 필드(요청 pack_id 의 에코)를 정규화하면 두 dict 는
+    # 완전히 같아야 한다. key set 비교보다 강하다 (값 차이도 잡는다).
+    assert {**unregistered, "pack_id": None} == {**private, "pack_id": None}
 
 
 def test_graph_unavailable_rejects_before_any_store_write(sql, ctx):

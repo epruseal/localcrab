@@ -315,6 +315,60 @@ class TestStageOutcomesAndExitCodes:
         monkeypatch.setattr(migrate, "_backfill_doc", lambda *a, **kw: {"skipped": True})
         assert migrate.main(["--apply", "--skip-backup"]) == 3
 
+    def test_exit_code_3_when_wrapper_unavailable_but_graph_db_readable(
+        self, bootstrapped_owner, env, monkeypatch, capsys
+    ):
+        """M-g1 (codex counterexample from the implementation review): a
+        readable graph.db with an UNAVAILABLE graph *wrapper* backfills
+        fine, but pack_id enumeration is skipped -- the graph's packs never
+        reach the registry, and #147 deployed against that run would hide
+        them all. registry_enumeration must gate the exit code in its own
+        right (asserting all three stage outcomes pins registry_enumeration
+        as the stage that fired, not a graph/docs skip). This must hold
+        regardless of default-pack registration: registering the default
+        pack is NOT the same thing as having enumerated the graph."""
+
+        class _UnavailableGraph:
+            available = False  # no _dialect attr -> _graph_missing_node_ids returns []
+
+        _seed_graph(env)
+        _seed_doc(env)
+        monkeypatch.setattr(
+            "opencrab.stores.factory.make_graph_store", lambda settings: _UnavailableGraph()
+        )
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+        assert rc == 3
+        assert "registry_enumeration: skipped" in out
+        assert "graph_backfill: skipped" not in out
+        assert "docs_backfill: skipped" not in out
+
+    def test_exit_code_3_when_graph_rows_are_left_unattributed(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """M-g2: a graph_nodes row whose properties is valid JSON but not a
+        dict (backfill_pack_ids counts it as nodes_skipped and cannot
+        attribute it) leaves a pack_id-less row behind -- invariant 5.
+        The stage must demote to skipped, surface the real count in the
+        summary, and gate the exit code."""
+        import json
+        import sqlite3
+
+        _seed_graph(env)
+        _seed_doc(env)
+        with sqlite3.connect(str(env / "graph.db")) as conn:
+            conn.execute(
+                "INSERT INTO graph_nodes (node_type, node_id, space_id, properties) "
+                "VALUES ('Entity', 'non-dict-props', 'concept', ?)",
+                (json.dumps("just a string"),),
+            )
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+        assert rc == 3
+        assert "graph_backfill: skipped" in out
+        assert "nodes_skipped=1" in out
+        assert "row(s) left unattributed" in out
+
     def test_exit_code_1_when_a_stage_raises_and_does_not_propagate(
         self, bootstrapped_owner, env, monkeypatch
     ):

@@ -527,22 +527,38 @@ def main(argv: list[str] | None = None) -> int:
         print("\n2) Backfilling graph rows with no pack_id...")
         node_ids_needing_check = _graph_missing_node_ids(graph)
         graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
-        stage_outcomes["graph_backfill"] = dict(
-            zip(
-                ("outcome", "reason"),
-                _stage_outcome(
-                    graph_stats,
-                    ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
-                ),
-                strict=True,
-            )
+        graph_outcome, graph_reason = _stage_outcome(
+            graph_stats,
+            ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
         )
+        # Row-level skips (non-dict JSON properties etc. -- rows
+        # backfill_pack_ids could NOT attribute) leave pack_id-less rows
+        # behind, which violates invariant 5 exactly like a whole-stage
+        # skip does.  Demote the stage so it gates the exit code; always
+        # surface the counts in the summary.
+        rows_skipped = int(graph_stats.get("nodes_skipped") or 0) + int(
+            graph_stats.get("edges_skipped") or 0
+        )
+        if rows_skipped and graph_outcome != "skipped":
+            graph_outcome = "skipped"
+            graph_reason = (
+                f"{rows_skipped} row(s) left unattributed "
+                f"(nodes_skipped={graph_stats.get('nodes_skipped') or 0}, "
+                f"edges_skipped={graph_stats.get('edges_skipped') or 0}) -- "
+                f"was: {graph_reason}"
+            )
+        stage_outcomes["graph_backfill"] = {"outcome": graph_outcome, "reason": graph_reason}
 
         print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
         registry_stats = _register_graph_packs(sql, graph, owner_id, args.apply)
         graph_available_for_enum = getattr(graph, "available", False)
         registry_pending = default_pending + int(registry_stats.get("unregistered") or 0)
-        if not graph_available_for_enum and not default_pending:
+        if not graph_available_for_enum:
+            # Unconditional: registering the default pack is NOT the same
+            # thing as having enumerated the graph's pack_ids.  (An earlier
+            # version reported "applied" here whenever default_pending was
+            # set, which let a fresh registry + unavailable-wrapper run
+            # exit 0 with the graph's packs never registered.)
             registry_outcome, registry_reason = (
                 "skipped",
                 "graph unavailable -- pack_id enumeration skipped (default-pack registration still ran)",
@@ -592,21 +608,26 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("\nDry-run. Re-run with --apply (and --backup-to/--skip-backup) to perform writes.")
 
-    # Only graph_backfill/docs_backfill gate the exit code -- those are the
-    # two stages whose SCOPE limits (non-local storage_mode, a doc store
-    # that's neither SQL- nor Mongo-backed) mean #147's read-path scoping
-    # would be built on incompletely-inspected data. vector_backfill is
-    # documented as best-effort FOREVER (module docstring SCOPE) regardless
-    # of store availability -- it was never a completeness guarantee, so its
-    # skip doesn't gate deployment. registry_enumeration's own "skipped" (a
-    # symptom of the same graph unavailability) is already covered by
-    # graph_backfill's skip in that same run.
-    gating = {stage_outcomes[n]["outcome"] for n in ("graph_backfill", "docs_backfill")}
+    # graph_backfill, docs_backfill AND registry_enumeration gate the exit
+    # code -- stages whose SCOPE limits mean #147's read-path scoping would
+    # be built on incompletely-inspected (or never-registered) data.
+    # registry_enumeration gates in its own right: its skip is NOT always
+    # accompanied by a graph_backfill skip -- a readable graph.db with an
+    # unavailable graph *wrapper* backfills "clean" while enumeration is
+    # skipped, leaving the graph's packs unregistered.  vector_backfill
+    # alone stays out: it is documented as best-effort FOREVER (module
+    # docstring SCOPE) regardless of store availability -- it was never a
+    # completeness guarantee, so its skip doesn't gate deployment.
+    gating = {
+        stage_outcomes[n]["outcome"]
+        for n in ("graph_backfill", "docs_backfill", "registry_enumeration")
+    }
     if "skipped" in gating:
         print(
-            "\n! graph_backfill and/or docs_backfill was skipped (out of "
-            "scope) -- exit code 3. #147 must not deploy against a code-3 "
-            "run: some backend's data was never even inspected.",
+            "\n! graph_backfill, docs_backfill and/or registry_enumeration "
+            "was skipped (out of scope) -- exit code 3. #147 must not "
+            "deploy against a code-3 run: some backend's data was never "
+            "even inspected or registered.",
             file=sys.stderr,
         )
         return 3
