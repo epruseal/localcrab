@@ -51,44 +51,59 @@
 
 | | 어디 | 팩 소속 판정 키 |
 |---|---|---|
-| **회수** — 지운다 | `delete_pack` 의 graph_nodes·doc_nodes | `pack_id` \| `source` \| `source_id` \| `pack` |
-| | `delete_pack`·`live_pack_state` 의 chroma | `$or(pack_id, source)` |
-| **대사** — 센다·비교한다 | `COUNT_SQL` 노드·엣지 · `live_pack_state` 노드·엣지 | `pack_id` |
+| **회수** — 지운다 | `delete_pack` 의 graph_nodes·doc_nodes | `pack_id` |
+| | `delete_pack` 의 doc_sources | `pack_id` \| `source` |
+| | `delete_pack`·`live_pack_state`·`pack_live_counts` 의 chroma | `pack_id` |
+| **대사** — 센다·비교한다 | `COUNT_SQL` 노드·엣지 · `live_pack_state` 노드·엣지·`doc_node_spaces` | `pack_id` |
 | | `COUNT_SQL["docs"]` · `live_pack_state` 청크 | `pack_id` \| `source` |
-| | `pack_live_counts` **벡터축** | sql·sqlalchemy: `pack_id` 컬럼 · **chroma: `$or(pack_id, source)`** |
+| | `pack_live_counts` **벡터축** | sql·sqlalchemy: `pack_id` 컬럼 · chroma: `pack_id` |
 
-**벡터축만 대사인데도 회수와 같은 `$or` 를 쓴다.** 이유는 저장 구조다 — sqlite-vec 의
-`pack_id` 는 vec0 **파티션 키**라 애초에 그 하나뿐이고, chroma 에서는 세는 대상과 지우는
-대상이 갈리면 "센 것과 지운 것이 다른 집합"이 된다. 여기만 예외인 것이 **의도**이고,
-그래서 표에 적는다. 적어 두지 않으면 다음 사람이 "대사는 좁아야 한다"는 규칙에 맞춰
-이 줄을 좁히고, 그 순간 대사와 회수가 어긋난다.
+**두 축이 갈리는 자리는 청크축 하나뿐이다.** `doc_sources` 는 회수도 대사도 `pack_id | source`
+를 본다 — `transform_chunk_meta` 가 `source = pack_name` 을 **강제**하고 원본 `source` 는
+`source_doc` 으로 옮기므로, 청크에서 `source` 는 소유 태그가 맞다. 그 계약을 지키는 것이
+청크를 쓰는 **모든** 경로가 `transform_chunk_meta` 를 통과한다는 조건이다.
 
-**통일하지 마라.** 둘을 맞추려는 시도가 세 번 연속 실패했고 매번 다른 이유였다.
+### 노드·엣지축에서 `source`·`source_id` 를 회수 키로 쓰지 마라
 
-- **대사를 넓히면**: `load_edges` 가 팩 파일의 임의 속성을 엣지 props 에 병합하므로, 어떤 엣지가
-  `source: "<다른 팩>"` 을 갖고 있으면 그 다른 팩의 증분이 그것을 `live_edges` 에 담고 →
-  자기 `applied_edges` 에 없으니 stale 로 판정 → **타 팩 엣지를 지운다.**
-  그리고 `graph_nodes` 는 `pack_id` 에만 인덱스가 있어 넓히면 커버링 인덱스를 잃는다.
-- **회수를 좁히면**: 레거시 키로만 태그된 행이 삭제에서 빠져 **영영 남는다.**
-  삭제는 되돌릴 수 없으므로 회수 쪽에 보험을 든다.
-- **한쪽만 넓히면**: `incremental_finalize` 의 엣지 DELETE 는 팩 절이 좁다. 대사를 넓히고
-  이 DELETE 를 안 넓히면 그 엣지가 **매 증분마다 stale 로 뽑혀 0행을 지운다** —
-  조용한 과다계상이 조용한 영구 무동작이 된다. 두 술어는 **짝**이다.
+`transform_node` 는 `NODE_STRUCT_KEYS` 밖의 입력 키를 properties 에 **그대로 병합한다.**
+입력 노드가 `source: "<다른 팩>"` 을 갖고 있으면 그 값이 살아남는다. 그것을 회수 키로 두면
+`pack_id` 가 B 인 행이 `delete_pack("A")` 에 걸린다. **소유 태그가 아니다.**
 
-`pack` 키는 `normalize.transform_node:309` 가 모든 노드에 쓴다(`pack_id` 와 같은 값).
-**죽은 키가 아니다** — `ontology.builder.add_node:160` 이 노드 벡터의 메타를 만들 때 이것을 읽는다:
+    PYTHONPATH=<이 리포> python -c "from opencrab.pack.normalize import transform_node; \
+      print(transform_node('owner', {'id':'n1','properties':{'source':'foreign'}})[3])"
+
+### `pack` 도 회수 키가 아니다
+
+생산자가 `pack` 을 `pack_id` 와 **같은 값으로만** 쓰므로(`normalize.transform_node`)
+회수 범위를 한 행도 넓히지 못한다. 반면 `rename_pack_ids` 는 `pack_id` 만 갱신하므로,
+회수가 `pack` 을 보면 rename 이 남긴 옛 이름이 회수 판정에 끼어든다. 이득 0, 위험만 는다.
+
+다만 **`pack` 은 죽은 키가 아니다** — `ontology.builder.add_node` 가 노드 벡터의 메타를
+만들 때 이것을 읽는다:
 
 ```python
 "source": str(props.get("pack") or props.get("pack_id") or ""),
 ```
 
-즉 **모든 노드 벡터의 `source` 가 `properties.pack` 에서 나온다.** 그리고 위 회수 chroma
-술어가 매치하는 키가 바로 그 `source` 다 — `pack` 은 회수가 보는 값을 **만들어내는 생산자**다.
+즉 노드 벡터의 `source` 가 `properties.pack` 에서 나온다. 회수가 그 `source` 를 더는 안 보므로
+지금은 무해하지만, `pack` 을 건드리는 변경은 **벡터 메타까지 함께 봐야 한다.**
+`pack` 자체를 없애는 것이 정본 해법이다(localcrab #159).
 
-그래서 `pack` 을 건드리는 변경은 **벡터 메타까지 함께 본다**. 예: 팩 이름을 바꾸면서
-`pack_id` 만 갱신하고 `pack` 을 그대로 두면, 그 뒤 새로 쓰이는 노드 벡터가 **옛 이름을
-`source` 로 달고**, `$or(pack_id, source)` 회수가 그것을 옛 팩 소속으로 집어간다.
-`pack` 제거를 미루는 동안 회수가 그 키를 보는 이유이기도 하다.
+### 통일하려는 시도를 조심하라
+
+과거에 둘을 맞추려는 시도가 반복해서 실패했다. 남아 있는 근거:
+
+- **대사를 넓히면**: `load_edges` 가 팩 파일의 임의 속성을 엣지 props 에 병합하므로, 어떤 엣지가
+  `source: "<다른 팩>"` 을 갖고 있으면 그 다른 팩의 증분이 그것을 `live_edges` 에 담고
+  자기 `applied_edges` 에 없으니 stale 로 판정해 **타 팩 엣지를 지운다.**
+  그리고 `graph_nodes` 는 `pack_id` 에만 인덱스가 있어 넓히면 커버링 인덱스를 잃는다.
+- **doc 축만 넓히면**: `pack` 으로만 태그된 행의 doc 은 지워지는데 graph 는 `live_pack_state`
+  에 안 잡혀 **영영 남는다.** 축 하나를 넓히면 그 축과 짝인 축도 같이 넓어져야 한다.
+- **한쪽만 넓히면**: `incremental_finalize` 의 엣지 DELETE 는 팩 절이 좁다. 대사를 넓히고
+  이 DELETE 를 안 넓히면 그 엣지가 **매 증분마다 stale 로 뽑혀 0행을 지운다** —
+  조용한 과다계상이 조용한 영구 무동작이 된다. 두 술어는 **짝**이다.
+
+`pack_id` 없이 폴백 키로만 태그된 행은 증분이 걷지 못한다. 그 축은 localcrab #164 가 다룬다.
 
 ### 2. `pack_live_counts()` 는 `int | None` 을 돌려준다
 
@@ -96,14 +111,35 @@
 다른 사실이라 섞으면 안 된다 — 종전에는 둘 다 `0` 이라 Chroma·pgvector 에서 **항상 결손처럼
 보였다**. 호출자는 **산술 전에 `None` 을 걸러라.** 그냥 빼면 `TypeError` 다.
 
-### 3. `incremental_finalize(..., had_write_failures=)` 를 채워라
+### 3. `load_nodes_incremental(..., doc_node_spaces=)` 는 **필수**다
 
-`True` 면 그 팩의 **삭제 4종을 전부 건너뛰고** 반환 dict 에 `skipped_cleanup: True` 를 넣는다.
-기본값이 `False` 라 **안 넘기면 안전핀이 한 번도 안 켜진다.**
+`live_pack_state` 가 돌려주는 `{node_id: {space, ...}}` 를 그대로 넘겨라. 기본값을 두지 않은
+것이 의도다 — 기본값이 있으면 안 넘긴 호출자에서 doc 잔재 정리가 **조용히 꺼지고** 그 사실이
+어디에도 안 남는다.
 
-호출자는 그 팩의 노드·엣지·청크 적재에서 **`err` 이 하나라도 있으면** `True` 로 넘긴다
-(`skip` 은 아니다 — 문법위반 skip 은 정상 동작이고 `err` 이 저장 실패다).
-부분적으로 실패한 적재의 결과로 되돌릴 수 없는 삭제를 하면 안 된다.
+이 인자가 닫는 것은 **타입 변경 잔재**다. 노드 타입이 바뀌면 새 타입 행이 저장된 뒤 구 행을
+지우는데, graph 는 지워지고 doc 이 남으면 다음 실행의 `live` 조회가 새 타입만 보고 `same` 으로
+끝나 **재시도조차 안 한다.** 그래서 `same` 경로에서도 이 정리가 돈다.
+
+`incremental_finalize` 가 이 누락을 대신 잡지 못한다. 그쪽 doc 축 후보는
+`set(doc_node_spaces) - bypack_node_ids` 라 **입력에 아직 있는** 노드는 후보가 아니다.
+타입 변경 잔재는 정의상 입력에 있는 노드의 것이므로 이 자리에서만 걷힌다.
+
+빈 dict 는 유효한 입력이다(대사할 doc 행이 없다는 사실). `None` 과 다르다.
+
+### 4. 앵커 판정은 **한 곳에서만** 정의한다
+
+Python 술어와 SQL 조각을 같은 정의에서 낸다. 두 벌로 두면 갈린다. 두 함정이 실측됐다.
+
+- SQLite `LIKE` 는 ASCII 대소문자를 **무시**한다. `LIKE 'dataset:%'` 는 `DATASET:x` 를 앵커로
+  보고 Python `startswith("dataset:")` 는 안 본다. 그러면 graph 는 삭제 후보인데 doc 은
+  제외돼 두 축이 갈린다. **`GLOB 'dataset:*'` 을 써라.**
+- `json_extract(...) <> 'title-backfill'` 은 키가 없을 때 NULL 비교라 **UNKNOWN** 이 되고
+  그 행이 통째로 빠진다. 라이브 doc 노드에는 `created_by` 가 없으므로 이 형태를 쓰면
+  후보가 전량 사라진다. **`COALESCE(..., '')` 로 감싸라.**
+
+재현: 같은 node_id 격자(`dataset:` · `DATASET:` · `DaTaSeT:` · `created_by` 없음)를 두 구현에
+태워 판정이 일치하는지 본다.
 
 ### 왜 "세는 집합"과 "지키는 집합"이 다른가
 
@@ -119,6 +155,24 @@
 `add_node`/`add_edge` 는 스토어 실패를 **예외로 안 올리고 반환 dict 에 적는다**
 (`ontology.builder.store_write_failures()` docstring 이 "호출자가 이것을 불러야 실제 성공
 여부를 안다"고 명시한다). 그 영수증을 봐야 `ok` 가 참이 된다.
+
+**이 분리가 "저장 실패 시 정리 보류" 안전핀이 불필요한 이유다.** 네 삭제 축의 보호 집합이
+전부 저장 **전에** 파일에서 만들어진다.
+
+| 축 | 보호 집합이 채워지는 시점 |
+|---|---|
+| 노드 | `transform_node` 직후, `add_node` 전 |
+| 청크 | 중복 제외 직후, 저장 전 |
+| 엣지 | `resolve_edge` 직후, `add_edge` 전 |
+| 벡터 고아 | 위 두 집합의 합에서 유도 |
+
+따라서 **저장에 실패한 행은 이미 삭제 후보가 아니다.** 그 위에 "실패가 있으면 팩 전체 정리를
+건너뛴다"는 핀을 얹으면 보호가 늘지 않고 정상 정리만 막는다. 결정적 실패(문법위반 등)가 있는
+팩은 그 정리가 **영구히** 꺼진다. 그래서 그 핀을 제거했다.
+
+원본에 이미 있던 **0건 핀**(by-pack 이 비었는데 라이브에 데이터가 있으면 중단)과
+**비율 핀**(삭제 후보 비율 초과 시 중단)은 성격이 다르다 — 그것들은 "입력 자체가 수상하다"를
+보는 것이고 그대로 남아 있다.
 
 ## 검출력 측정 — 계약 테스트가 실제로 무엇을 잡는가
 
@@ -186,22 +240,18 @@ PYTHONPATH=. python scripts/qa/mutate_module.py . opencrab/pack/load.py \
     tests/test_pack_load.py /tmp/sweep.json
 ```
 
-> **`load.py` 는 미해소다.** 생존자가 남아 있고 등가 증명도 없다. 이 모듈은 **유일하게
-> 삭제 권한을 가진** 자리이고 생존자가 `incremental_finalize` 에 몰려 있다. 성격은 이렇다:
+> **`load.py` 는 미해소다.** 전량 스윕을 재실행해 생존 0 또는 전량 등가 증명이 나오기
+> 전에는 상태가 바뀌지 않는다. 이 모듈은 **유일하게 삭제 권한을 가진** 자리다.
 >
-> - `for (f_id, r, t_id) in stale_edges:` 를 **통째로 삭제** — 엣지 정리가 사라져도 전 스위트 초록
-> - `vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]` 의 `not in` → `in`
->   — 공유 evidence 벡터를 **지키던 필터가 그것만 골라 지우는 필터로** 뒤집힌다
-> - `deleted = False` → `True` — 실패한 삭제를 성공으로 계상
-> - 30% 핀의 `chunk_ratio` 팔, 앵커 보호의 **벡터 고아 경로**, `chunk_del` 의 요청수/실제수 —
->   각각 노드 쪽만 걸려 있고 짝이 비어 있다
+> 원인의 상당수는 **음성 테스트만 있고 양성 테스트가 없는 것**이었다. `edge_del == 0` 만
+> 확인하면 "아무것도 안 지운다"도 통과한다. 적대 검증 두 곳이 각각 재현했다(2026-08-11).
 >
-> 원인의 상당수는 **음성 테스트만 있고 양성 테스트가 없는 것**이다. `edge_del == 0` 만
-> 확인하면 "아무것도 안 지운다"도 통과한다. **실재하는 stale 엣지가 실제로 지워지고 그 수가
-> 맞는지**를 확인하는 테스트가 있어야 한다.
->
-> 적대 검증 두 곳이 각각 재현했다(2026-08-11). 상태가 `해소` 로 바뀌기 전에는 이 표가
-> **초록이 아니다.**
+> 2026-08-12 수정 라운드가 닫은 클래스(각각 양성 테스트 + 변형 red 재측정으로 고정):
+> 삭제 4축 양성 삭제(stale 엣지 루프 통삭제 포함) · 비율 핀 3축 격리와 경계 연산자 ·
+> doc 축 분모와 앵커 술어 · FTS 그림자 경로별 삭제 · 같은-space 타입 변경 가드.
+> 재현은 위 스윕 명령과 `tests/test_pack_load.py` 의 폐쇄 게이트 변형 목록으로 한다.
+> **잔여 생존자는 #166 이 추적한다** — 수치는 그 이슈와 스윕 산출물에서 읽어라.
+> 상태가 `해소` 로 바뀌기 전에는 이 표가 **초록이 아니다.**
 
 ### 새 모듈은 `PACK_SUITES`에 등록해야 한다
 
