@@ -59,6 +59,17 @@ SAFETY:
     aborts immediately rather than silently under- or over-writing.
   - Idempotent: rows already carrying a pack_id, and pack_ids already
     registered, are left untouched on a re-run.
+  - Every run ends with a structured per-stage report (graph_backfill,
+    registry_enumeration, docs_backfill, vector_backfill), each one of
+    clean (nothing to do) / applied (found and, in --apply mode, wrote
+    something) / skipped (backend out of SCOPE above) / failed (raised --
+    the run stops there, later stages do not run). Exit code: 1 if any
+    stage failed; else 3 if graph_backfill or docs_backfill was skipped
+    (#147 must NOT deploy against a code-3 run -- one of the two backends
+    #147's read-path scoping depends on was never even inspected);
+    vector_backfill's skip does NOT gate the exit code -- it is
+    best-effort FOREVER per the Vector SCOPE note above, regardless of
+    store availability, never a completeness guarantee; else 0.
 
 Usage:
     python scripts/migrate_pack_ownership.py                 # dry-run
@@ -148,13 +159,17 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
     return {"graph_distinct_packs": len(rows), "unregistered": len(candidates), "created": created}
 
 
-def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> str:
+def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> tuple[str, bool]:
+    """Returns ``(DEFAULT_PACK_ID, was_pending)`` -- ``was_pending`` is True
+    when the default pack row did NOT already exist at the start of this
+    call (dry-run or --apply alike), so callers can tell "nothing to do"
+    from "found something" without re-querying."""
     from opencrab.packs.registry import _insert_pack, get_pack
 
     existing = get_pack(sql, DEFAULT_PACK_ID)
     if existing is not None:
         print(f"  default pack {DEFAULT_PACK_ID!r} already registered (owner={existing['owner_id']})")
-        return DEFAULT_PACK_ID
+        return DEFAULT_PACK_ID, False
     print(f"  default pack {DEFAULT_PACK_ID!r} not yet registered")
     if apply:
         if not _insert_pack(sql, DEFAULT_PACK_ID, owner_id, DEFAULT_PACK_TITLE, None, None):
@@ -162,7 +177,7 @@ def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> str:
                 f"default pack {DEFAULT_PACK_ID!r} was created by someone else "
                 "between the check above and this insert -- re-run the script."
             )
-    return DEFAULT_PACK_ID
+    return DEFAULT_PACK_ID, True
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +408,55 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Structured per-stage outcomes
+# ---------------------------------------------------------------------------
+#
+# Every stage below ends in exactly one of four outcomes:
+#   clean   -- nothing needed doing.
+#   applied -- something needed doing (dry-run: would be written;
+#              --apply: was written).
+#   skipped -- the stage's backend is out of scope for this migration (see
+#              module docstring SCOPE: non-local graph, an unavailable
+#              store, or a vector store missing get_by_id/upsert_texts).
+#   failed  -- the stage raised; main() catches it, stops running further
+#              stages (an inconsistent partial state is worse than an
+#              incomplete one), and returns 1.
+#
+# Exit code: every stage clean/applied -> 0; any stage skipped -> 3 (see
+# module docstring SAFETY -- #147 must not deploy against a code 3 run,
+# since it means some backend's data was never even inspected); any stage
+# failed -> 1.
+
+
+def _stage_outcome(stats: dict[str, Any], pending_keys: tuple[str, ...]) -> tuple[str, str]:
+    """clean/applied/skipped for a stage whose stats dict already marks
+    itself ``{"skipped": True}`` when out of scope (``_backfill_graph``,
+    ``_backfill_doc``) -- ``pending_keys`` are the stats fields that count
+    as "something needed doing"."""
+    if stats.get("skipped"):
+        return "skipped", "backend out of scope for this migration (see module docstring SCOPE)"
+    pending = sum(int(stats.get(k) or 0) for k in pending_keys)
+    if pending == 0:
+        return "clean", "nothing to do"
+    return "applied", f"{pending} item(s) needed backfilling"
+
+
+def _docs_stage_outcome(stats: dict[str, Any]) -> tuple[str, str]:
+    """Like ``_stage_outcome`` but for ``_backfill_doc``'s nested shape
+    (``{"doc_nodes": {...}, "doc_sources": {...}}`` for SQL-backed stores,
+    ``{"nodes": {...}, "sources": {...}}`` for Mongo -- both are dicts of
+    sub-dicts carrying their own "missing" count)."""
+    if stats.get("skipped"):
+        return "skipped", "doc store unavailable or not SQL/Mongo-backed"
+    pending = sum(
+        int(sub.get("missing") or 0) for sub in stats.values() if isinstance(sub, dict)
+    )
+    if pending == 0:
+        return "clean", "nothing to do"
+    return "applied", f"{pending} row(s) needed backfilling"
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -451,29 +515,101 @@ def main(argv: list[str] | None = None) -> int:
     docs = make_doc_store(settings)
     vector = make_vector_store(settings)
 
-    print("\n1) Ensuring the default (catch-all) pack is registered...")
-    default_pack_id = _ensure_default_pack(sql, owner_id, args.apply)
+    # {stage_name: {"outcome": ..., "reason": ...}} -- populated as each
+    # stage below runs, printed in full in the Summary regardless of where
+    # a failure stops the sequence.
+    stage_outcomes: dict[str, dict[str, str]] = {}
 
-    print("\n2) Backfilling graph rows with no pack_id...")
-    node_ids_needing_check = _graph_missing_node_ids(graph)
-    graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
+    try:
+        print("\n1) Ensuring the default (catch-all) pack is registered...")
+        default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
 
-    print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
-    registry_stats = _register_graph_packs(sql, graph, owner_id, args.apply)
+        print("\n2) Backfilling graph rows with no pack_id...")
+        node_ids_needing_check = _graph_missing_node_ids(graph)
+        graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
+        stage_outcomes["graph_backfill"] = dict(
+            zip(
+                ("outcome", "reason"),
+                _stage_outcome(
+                    graph_stats,
+                    ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
+                ),
+                strict=True,
+            )
+        )
 
-    print("\n4) Backfilling doc rows with no pack_id...")
-    doc_stats = _backfill_doc(docs, default_pack_id, args.apply)
+        print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
+        registry_stats = _register_graph_packs(sql, graph, owner_id, args.apply)
+        graph_available_for_enum = getattr(graph, "available", False)
+        registry_pending = default_pending + int(registry_stats.get("unregistered") or 0)
+        if not graph_available_for_enum and not default_pending:
+            registry_outcome, registry_reason = (
+                "skipped",
+                "graph unavailable -- pack_id enumeration skipped (default-pack registration still ran)",
+            )
+        elif registry_pending == 0:
+            registry_outcome, registry_reason = "clean", "nothing to do"
+        else:
+            registry_outcome, registry_reason = "applied", f"{registry_pending} row(s) needed registering"
+        stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
 
-    print("\n5) Backfilling vector rows with no pack_id (best-effort)...")
-    vector_stats = _backfill_vector(vector, node_ids_needing_check, default_pack_id, args.apply)
+        print("\n4) Backfilling doc rows with no pack_id...")
+        doc_stats = _backfill_doc(docs, default_pack_id, args.apply)
+        stage_outcomes["docs_backfill"] = dict(
+            zip(("outcome", "reason"), _docs_stage_outcome(doc_stats), strict=True)
+        )
+
+        print("\n5) Backfilling vector rows with no pack_id (best-effort)...")
+        vector_in_scope = (
+            hasattr(vector, "get_by_id")
+            and hasattr(vector, "upsert_texts")
+            and getattr(vector, "available", False)
+        )
+        vector_stats = _backfill_vector(vector, node_ids_needing_check, default_pack_id, args.apply)
+        if not vector_in_scope:
+            vector_outcome, vector_reason = (
+                "skipped",
+                "vector store unavailable or missing get_by_id/upsert_texts (best-effort only, see module docstring SCOPE)",
+            )
+        else:
+            vector_outcome, vector_reason = _stage_outcome(vector_stats, ("missing",))
+        stage_outcomes["vector_backfill"] = {"outcome": vector_outcome, "reason": vector_reason}
+    except Exception as exc:
+        # Whichever named stage above didn't get an entry yet is the one
+        # that failed -- fill it in explicitly rather than leaving it
+        # implicit, so the summary always accounts for all four stages.
+        for name in ("graph_backfill", "registry_enumeration", "docs_backfill", "vector_backfill"):
+            stage_outcomes.setdefault(name, {"outcome": "failed", "reason": str(exc)})
+        print(f"\n! stage failed: {exc}", file=sys.stderr)
+        print("\nSummary (incomplete -- a stage failed, later stages did not run):")
+        for name, info in stage_outcomes.items():
+            print(f"  {name}: {info['outcome']} ({info['reason']})")
+        return 1
 
     print("\nSummary:")
-    print(f"  registry: {registry_stats}")
-    print(f"  graph:    {graph_stats}")
-    print(f"  doc:      {doc_stats}")
-    print(f"  vector:   {vector_stats}")
+    for name, info in stage_outcomes.items():
+        print(f"  {name}: {info['outcome']} ({info['reason']})")
     if not args.apply:
         print("\nDry-run. Re-run with --apply (and --backup-to/--skip-backup) to perform writes.")
+
+    # Only graph_backfill/docs_backfill gate the exit code -- those are the
+    # two stages whose SCOPE limits (non-local storage_mode, a doc store
+    # that's neither SQL- nor Mongo-backed) mean #147's read-path scoping
+    # would be built on incompletely-inspected data. vector_backfill is
+    # documented as best-effort FOREVER (module docstring SCOPE) regardless
+    # of store availability -- it was never a completeness guarantee, so its
+    # skip doesn't gate deployment. registry_enumeration's own "skipped" (a
+    # symptom of the same graph unavailability) is already covered by
+    # graph_backfill's skip in that same run.
+    gating = {stage_outcomes[n]["outcome"] for n in ("graph_backfill", "docs_backfill")}
+    if "skipped" in gating:
+        print(
+            "\n! graph_backfill and/or docs_backfill was skipped (out of "
+            "scope) -- exit code 3. #147 must not deploy against a code-3 "
+            "run: some backend's data was never even inspected.",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 

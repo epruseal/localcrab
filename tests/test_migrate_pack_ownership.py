@@ -212,8 +212,11 @@ class TestApply:
         assert sources_stats["missing"] == 0
 
     def test_acceptance_registry_row_count(self, bootstrapped_owner, env):
-        """Acceptance criterion: registry row count == distinct graph
-        pack_id count + 1 (the default pack)."""
+        """Acceptance criterion: the registry's pack_id set equals the
+        graph's distinct pack_id set exactly (set equality, not a "+1 for
+        the default pack" arithmetic formula -- the default pack_id is
+        itself one of the graph's distinct pack_ids once backfilled rows
+        carry it, so a separate "+1" would double-count it)."""
         _seed_graph(env)
         assert migrate.main(["--apply", "--skip-backup"]) == 0
 
@@ -273,6 +276,80 @@ class TestApply:
         with pytest.raises(SystemExit) as exc_info:
             migrate.main(["--apply", "--backup-to", str(backup_dir)])
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# Structured per-stage outcomes + exit codes (#146 M)
+# ---------------------------------------------------------------------------
+
+
+class TestStageOutcomesAndExitCodes:
+    def test_exit_code_0_when_every_stage_is_clean_or_applied_vector_skip_excluded(
+        self, bootstrapped_owner, env
+    ):
+        """The sandboxed test env has no sqlite_vec installed, so
+        vector_backfill is ALWAYS "skipped" here -- this is exactly the
+        real-world "optional dependency not installed" case, not a
+        graph/doc SCOPE gap, so it must NOT gate the exit code to 3 (see
+        main()'s ``gating`` comment)."""
+        _seed_graph(env)
+        _seed_doc(env)
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+    def test_exit_code_3_when_graph_backfill_is_out_of_scope(
+        self, bootstrapped_owner, env, monkeypatch
+    ):
+        """graph_backfill/docs_backfill are the two stages whose SCOPE
+        limits gate the exit code -- inject the "out of scope" outcome
+        directly (same shape _backfill_graph already returns for a
+        non-local storage_mode or missing graph.db) rather than standing up
+        a real non-local backend."""
+        _seed_doc(env)
+        monkeypatch.setattr(migrate, "_backfill_graph", lambda *a, **kw: {"skipped": True})
+        assert migrate.main(["--apply", "--skip-backup"]) == 3
+
+    def test_exit_code_3_when_docs_backfill_is_out_of_scope(
+        self, bootstrapped_owner, env, monkeypatch
+    ):
+        _seed_graph(env)
+        monkeypatch.setattr(migrate, "_backfill_doc", lambda *a, **kw: {"skipped": True})
+        assert migrate.main(["--apply", "--skip-backup"]) == 3
+
+    def test_exit_code_1_when_a_stage_raises_and_does_not_propagate(
+        self, bootstrapped_owner, env, monkeypatch
+    ):
+        """#146 M: a stage failure (e.g. the concurrent-writer RuntimeError
+        _register_graph_packs already raises on a rowcount mismatch) is
+        caught inside main() and turned into exit code 1 -- it must not
+        escape main() as an unhandled exception."""
+        _seed_graph(env)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("simulated concurrent-writer race")
+
+        monkeypatch.setattr(migrate, "_register_graph_packs", _boom)
+        rc = migrate.main(["--apply", "--skip-backup"])  # must not raise
+        assert rc == 1
+
+    def test_failed_stage_stops_later_stages_from_running(
+        self, bootstrapped_owner, env, monkeypatch
+    ):
+        """A failure in an earlier stage must stop the pipeline -- writing
+        docs/vector backfills after a failed graph/registry stage would
+        leave an inconsistent partial migration."""
+        _seed_graph(env)
+        _seed_doc(env)
+        doc_calls: list[int] = []
+        monkeypatch.setattr(
+            migrate, "_backfill_doc", lambda *a, **kw: doc_calls.append(1) or {"skipped": True}
+        )
+        monkeypatch.setattr(
+            migrate,
+            "_register_graph_packs",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
+        assert doc_calls == []
 
 
 # ---------------------------------------------------------------------------
