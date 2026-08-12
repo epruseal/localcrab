@@ -66,20 +66,75 @@ class TestCreatePack:
         assert row["title"] == "My Pack"
 
     def test_colliding_slug_is_quietly_suffixed_not_an_error(self, sql, alice, bob):
+        """#146 B: on collision the retry draws a random suffix (not a
+        sequential -2, -3, ... counter -- see create_pack's docstring for
+        why a sequential counter would leak how many others hold the exact
+        slug), so we assert the *shape* of the assigned id rather than an
+        exact value: starts with the requested slug, differs from it,
+        isn't the old sequential pattern, and resolves immediately."""
         first = create_pack(sql, alice, "coffee", title="Alice's coffee notes")
         second = create_pack(sql, bob, "coffee", title="Bob's coffee notes")
         assert first == "coffee"
-        assert second == "coffee-2"
+        assert second != "coffee"
+        assert second.startswith("coffee-")
+        assert second not in ("coffee-2", "coffee-3")
         # Both rows exist, correctly owned -- no exception, no shared identity.
         assert get_pack(sql, "coffee")["owner_id"] == alice
-        assert get_pack(sql, "coffee-2")["owner_id"] == bob
+        assert get_pack(sql, second)["owner_id"] == bob
 
-    def test_three_way_collision_increments_suffix(self, sql, alice, bob):
+    def test_three_way_collision_each_gets_a_distinct_random_suffix(self, sql, alice, bob):
         carol = create_user(sql, "Carol")
-        create_pack(sql, alice, "coffee")
-        create_pack(sql, bob, "coffee")
+        first = create_pack(sql, alice, "coffee")
+        second = create_pack(sql, bob, "coffee")
         third = create_pack(sql, carol, "coffee")
-        assert third == "coffee-3"
+        assert first == "coffee"
+        assert len({first, second, third}) == 3  # all distinct
+        for pack_id in (second, third):
+            assert pack_id.startswith("coffee-")
+            assert pack_id not in ("coffee-2", "coffee-3")
+            assert get_pack(sql, pack_id) is not None
+
+    def test_b1_single_collision_gets_one_random_retry(self, sql, alice, bob, monkeypatch):
+        """B1: forces the exact retry path -- first candidate taken, the
+        very next random draw succeeds -- and pins that _insert_pack is
+        called exactly twice (no sequential attempts in between)."""
+        import opencrab.packs.registry as registry_mod
+
+        create_pack(sql, alice, "coffee")
+        monkeypatch.setattr(registry_mod.secrets, "token_hex", lambda n: "aaaa0000")
+        calls: list[str] = []
+        real_insert = registry_mod._insert_pack
+
+        def _counting_insert(sql_, pack_id, *rest):
+            calls.append(pack_id)
+            return real_insert(sql_, pack_id, *rest)
+
+        monkeypatch.setattr(registry_mod, "_insert_pack", _counting_insert)
+
+        assigned = registry_mod.create_pack(sql, bob, "coffee")
+        assert assigned == "coffee-aaaa0000"
+        assert calls == ["coffee", "coffee-aaaa0000"]
+        assert get_pack(sql, "coffee-aaaa0000")["owner_id"] == bob
+
+    def test_b2_exhausting_all_random_attempts_raises_and_leaves_no_row(
+        self, sql, alice, bob, monkeypatch
+    ):
+        """B2: every one of the 8 random retries collides (token_hex is
+        monkeypatched to always draw the same already-occupied candidate) ->
+        RuntimeError, and the registry ends up with no new row for the
+        failed call (only the pre-seeded "coffee" and "coffee-deadbeef"
+        rows exist)."""
+        import opencrab.packs.registry as registry_mod
+
+        create_pack(sql, alice, "coffee")
+        create_pack(sql, alice, "coffee-deadbeef")  # pre-occupy every future random candidate
+        monkeypatch.setattr(registry_mod.secrets, "token_hex", lambda n: "deadbeef")
+
+        before = {row["pack_id"] for row in list_packs_for(sql, Principal(user_id=alice, is_local=False, disabled=False))}
+        with pytest.raises(RuntimeError):
+            registry_mod.create_pack(sql, bob, "coffee")
+        after = {row["pack_id"] for row in list_packs_for(sql, Principal(user_id=alice, is_local=False, disabled=False))}
+        assert after == before
 
     def test_forked_from_is_recorded(self, sql, alice):
         create_pack(sql, alice, "origin")
@@ -385,7 +440,11 @@ class TestPackCreateCollision:
         assert "error" not in result_a
         assert "error" not in result_b
         assert result_a["pack_id"] == "my-notes"
-        assert result_b["pack_id"] == "my-notes-2"
+        # #146 B: random suffix on collision, not sequential -2 -- shape,
+        # not exact value.
+        assert result_b["pack_id"] != "my-notes"
+        assert result_b["pack_id"].startswith("my-notes-")
+        assert result_b["pack_id"] != "my-notes-2"
         # Neither response contains an "already exists"-style message or any
         # hint that a colliding pack exists.
         assert "hint" not in result_a

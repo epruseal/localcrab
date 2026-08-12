@@ -26,9 +26,9 @@ VISIBILITIES = ("private", "public-read", "public-fork")
 
 _SELECT_COLS = "pack_id, owner_id, visibility, title, description, forked_from, created_at, updated_at"
 
-# _insert_pack retries pack_id, pack_id-2, pack_id-3, ... this many times
-# before falling back to a random-suffixed slug (see create_pack).
-_MAX_SUFFIX_ATTEMPTS = 50
+# On a pack_id collision, create_pack retries this many random-suffixed
+# candidates before giving up (see create_pack).
+_MAX_RANDOM_ATTEMPTS = 8
 
 
 class PackNotFoundError(LookupError):
@@ -167,24 +167,26 @@ def create_pack(
     ``pack_id``.
 
     When ``pack_id`` is already taken (by anyone, including another user),
-    this quietly appends ``-2``, ``-3``, ... and retries rather than
-    erroring (#143 invariant 7: an error naming "already exists" would
-    tell the caller someone else already holds that exact slug -- see
-    ``pack_create`` in ``opencrab/mcp/tools/pack.py`` for the caller side
-    of this contract, and pack_id format is never changed, only
-    suffixed). Falls back to a random 8-hex-char suffix after
-    ``_MAX_SUFFIX_ATTEMPTS`` sequential slugs are all taken, so this
-    always terminates even under a flood of identically-titled packs.
+    this quietly appends a random 8-hex-char suffix and retries rather than
+    erroring (#143 invariant 7: an error naming "already exists" would tell
+    the caller someone else already holds that exact slug -- see
+    ``pack_create`` in ``opencrab/mcp/tools/pack.py`` for the caller side of
+    this contract, and pack_id format is never changed, only suffixed). A
+    sequential ``-2``, ``-3``, ... suffix would leak a second bit beyond
+    "a collision happened" -- how many others are already using this
+    exact slug -- so every retry after the first collision draws an
+    independent random suffix instead. Gives up after
+    ``_MAX_RANDOM_ATTEMPTS`` tries (collisions across 8 independent
+    32-bit-space draws is not a real-world flood, only a stuck RNG or a
+    saturated keyspace) and raises ``RuntimeError`` rather than looping
+    forever -- no row is left behind by a failed call.
     """
     if _insert_pack(sql, pack_id, owner_id, title, description, forked_from):
         return pack_id
-    for n in range(2, _MAX_SUFFIX_ATTEMPTS + 2):
-        candidate = f"{pack_id}-{n}"
+    for _ in range(_MAX_RANDOM_ATTEMPTS):
+        candidate = f"{pack_id}-{secrets.token_hex(4)}"
         if _insert_pack(sql, candidate, owner_id, title, description, forked_from):
             return candidate
-    candidate = f"{pack_id}-{secrets.token_hex(4)}"
-    if _insert_pack(sql, candidate, owner_id, title, description, forked_from):
-        return candidate
     raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
 
 

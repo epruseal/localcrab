@@ -654,9 +654,12 @@ class TestPackCreate:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             with principal_scope(Principal(user_id="test-user", is_local=True, disabled=False)):
                 result = pack_create(title="Existing", pack_id="existing-pack")
+        # #146 B: random suffix on collision, not sequential -2.
         assert "error" not in result
-        assert result["pack_id"] == "existing-pack-2"
-        assert result["anchor_node"] == "dataset:existing-pack-2"
+        assert result["pack_id"] != "existing-pack"
+        assert result["pack_id"].startswith("existing-pack-")
+        assert result["pack_id"] != "existing-pack-2"
+        assert result["anchor_node"] == f"dataset:{result['pack_id']}"
 
     def test_error_anchor_node_write_failure(self):
         builder = MagicMock()
