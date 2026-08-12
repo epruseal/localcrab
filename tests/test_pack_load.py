@@ -315,7 +315,7 @@ class TestLoadNodesIncremental:
         assert "n1" in live_nodes, "적재한 노드가 라이브 상태에 안 보인다"
 
         n_new, n_chg, n_same, skip, err, ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs)
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {})
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             "라이브와 동일한 행이 same 으로 판정되지 않았다 — 매 증분마다 전량 재적재된다")
         assert ids == {"n1"}
@@ -325,7 +325,7 @@ class TestLoadNodesIncremental:
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", 발행연도="2027")])
         live_nodes = {"n1": ("Document", "resource", {"발행연도": "2026", "pack_id": "pack-1"})}
         n_new, n_chg, n_same, skip, err, _ = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs)
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {})
         assert (n_new, n_chg, n_same) == (0, 1, 0)
 
     def test_node_type_change_removes_the_old_row(self, live, tmp_path):
@@ -348,7 +348,7 @@ class TestLoadNodesIncremental:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         _n, n_chg, _s, _sk, _e, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs)
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert n_chg == 1, "타입 변경이 chg 로 세어지지 않았다"
         assert graph.get_node("Concept", "n1") is not None, "새 타입 행이 없다"
@@ -359,7 +359,7 @@ class TestLoadNodesIncremental:
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
         n_new, n_chg, n_same, _, _, _ = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, {}, graph, docs)
+            "pack-1", f, builder, {}, {}, graph, docs, {})
         assert (n_new, n_chg, n_same) == (1, 0, 0)
 
 
@@ -563,6 +563,33 @@ def _chunk(i, text="본문"):
     return {"id": f"c{i}", "document_id": "n1", "text": text}
 
 
+def _expect_node_chunk_ratio_msg(pack, node_cand, node_live, chunk_cand, chunk_live):
+    """`incremental_finalize` 의 노드/청크 30% 핀 메시지를 입력 산술에서 그대로
+    재구성한다(load.py 의 f-string 과 1:1 대응, 앵커된 `==` 단언용).
+
+    분모 표시는 `len(live_*)` 그대로(0 이어도 그대로 0) — 나눗셈에만 `max(1, …)`
+    을 쓰는 load.py 의 계약과 정확히 같다.
+    """
+    node_ratio = node_cand / max(1, node_live)
+    chunk_ratio = chunk_cand / max(1, chunk_live)
+    return (
+        f"ERROR: [{pack}] 삭제 후보 비율 초과 — "
+        f"노드 {node_cand}/{node_live}({node_ratio:.1%}) "
+        f"청크 {chunk_cand}/{chunk_live}({chunk_ratio:.1%}) — "
+        "--force-delete 로 강행하십시오."
+    )
+
+
+def _expect_doc_ratio_msg(pack, doc_cand, doc_denominator):
+    """doc 축 30% 핀 메시지 재구성(load.py:1019-1022 과 1:1 대응)."""
+    doc_ratio = doc_cand / doc_denominator
+    return (
+        f"ERROR: [{pack}] doc 삭제 후보 비율 초과 — "
+        f"{doc_cand}/{doc_denominator}({doc_ratio:.1%}) — "
+        "--force-delete 로 강행하십시오."
+    )
+
+
 class TestLoadChunks:
     def test_chunks_reach_both_vector_and_doc_stores(self, live, tmp_path):
         _builder, _graph, docs = live
@@ -740,8 +767,7 @@ class TestIncrementalFinalizeSafetyPins:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
                 keep, set(), set(), False, len(keep), 0)
-        assert "삭제 후보 비율 초과" in str(ei.value)
-        assert "--force-delete" in str(ei.value), "강행 방법을 알려야 한다"
+        assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 9, 10, 0, 0), str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
     def test_force_delete_bypasses_the_ratio_pin(self, live, tmp_path):
@@ -805,7 +831,7 @@ class TestIncrementalFinalizeSafetyPins:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
                 keep, set(), set(), False, len(keep), 0)
-        assert "삭제 후보 비율 초과" in str(ei.value)
+        assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 4, 10, 0, 0), str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
 
@@ -871,7 +897,8 @@ class TestIncrementalFinalize:
                 pack_load.incremental_finalize(
                     "pack-1", graph, docs, _NoVec(), state,
                     keep, set(), set(), False, len(keep), 0)
-            assert "삭제 후보 비율 초과" in str(ei.value)
+            assert str(ei.value) == _expect_node_chunk_ratio_msg(
+                "pack-1", 10 - keep_n, 10, 0, 0), str(ei.value)
         else:
             res = pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
@@ -964,47 +991,294 @@ class TestIncrementalFinalize:
         assert res["vec_orphan_del"] == 0, (
             f"벡터 삭제가 예외를 던졌는데 vec_orphan_del 을 세었다: {res}")
 
-    # ── 5. had_write_failures — 지금까지 어디에도 없던 축 ────────────────
+    # ── 5. had_write_failures 안전핀은 제거됐다(F5 설계 결정) ─────────────
+    #
+    # 삭제 축 전부가 저장 성공이 아니라 **파일**에서 보호 집합을 만든다
+    # (`bypack_ids.add` 는 저장 **전**에 실행된다) — 저장 실패한 행은 이미
+    # 삭제 후보가 아니므로, 이 핀은 보호를 더하지 않고 정상 정리만 막았다.
+    # 중립성(핀 제거가 무해함)의 회귀 방지는 `TestPinRemovalIsNeutralAcrossSinks`
+    # 가 노드·엣지·청크 세 sink 각각으로 건다.
 
-    def test_had_write_failures_skips_all_cleanup_and_marks_the_result(self, live, tmp_path):
-        """`True` 면 4종 삭제를 전부 건너뛰고 `skipped_cleanup=True` 를 반환해야 한다.
-
-        부분 실패 상태를 기준으로 삭제 판정을 내리면 안 된다(삭제는 되돌릴 수 없다).
-        `bypack_node_ids`/`bypack_chunk_ids` 를 텅 비워 신고해도(정상 경로라면
-        안전핀 0 이 sys.exit 했을 상황) `had_write_failures=True` 는 그 핀 자체를
-        건너뛰고 조용히 정리만 안 하고 끝나야 한다.
+    def test_positional_call_without_a_had_write_failures_kwarg_still_hits_the_zero_item_pin(
+            self, live, tmp_path):
+        """이름을 고쳤다 — 예전엔 `had_write_failures=False` 기본값이 종전 동작을
+        지키는지를 걸었는데, 그 인자 자체가 지금은 없다(위 참고). 남은 것은
+        시그니처가 여전히 위치인자 11개뿐이라는 것과, 순수 위치인자 호출도
+        0-item 안전핀(SystemExit)을 정상 발동시킨다는 것 — 이 둘을 지금 실제로
+        검증하는 이름·docstring 으로 바꾼다. 예전엔 위치인자 개수가 우연히
+        맞아서만 통과했다.
         """
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
-        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
         state = self._live(graph, docs)
-        before_nodes = set(state["nodes"])
-        before_chunks = set(state["chunks"])
-
-        res = pack_load.incremental_finalize(
-            "pack-1", graph, docs, _NoVec(), state,
-            set(), set(), set(), False, 0, 0,
-            had_write_failures=True,
-        )
-        assert res == {
-            "node_del": 0, "chunk_del": 0, "edge_del": 0, "vec_orphan_del": 0,
-            "skipped_cleanup": True,
-        }, res
-        after = self._live(graph, docs)
-        assert set(after["nodes"]) == before_nodes, "삭제를 건너뛰어야 하는데 노드가 지워졌다"
-        assert set(after["chunks"]) == before_chunks, "삭제를 건너뛰어야 하는데 청크가 지워졌다"
-
-    def test_had_write_failures_defaults_to_false_and_old_behaviour_holds(self, live, tmp_path):
-        """기본값 `False` 는 종전 동작(안전핀 정상 작동)을 유지해야 한다 — 호출자
-        시그니처 추가만으로는 기존 호출을 깨지 않는다는 계약의 회귀 방지 절반이다."""
-        builder, graph, docs = live
-        self._seed(builder, docs, tmp_path)
-        state = self._live(graph, docs)
+        params = inspect.signature(pack_load.incremental_finalize).parameters
+        assert "had_write_failures" not in params, (
+            "had_write_failures 가 되살아났다 — 삭제 축 전부가 파일 기준 보호 집합을 "
+            "쓰므로 이 핀은 보호를 더하지 않고 정상 정리만 막는다(F5)")
         with pytest.raises(SystemExit):
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                set(), set(), set(), False, 0, 0)   # had_write_failures 생략
+                set(), set(), set(), False, 0, 0)   # 순수 위치인자, kwarg 없음
+
+
+class TestRatioPinAxisIsolation:
+    """G1 — 노드·청크·doc 3축 30% 핀이 서로 **격리**돼 있는가.
+
+    적대 검증 실증(2026-08-11): 노드/청크 핀(`node_ratio > 0.30 or chunk_ratio >
+    0.30`)만 무력화한(0.30→1.30) 사본에서도 `pytest -q` 가 114 passed 였다 — doc 핀
+    메시지가 기존 `"삭제 후보 비율 초과" in str(ei.value)` 부분문자열 단언을 그대로
+    만족시켜, 노드·청크 축 자체가 무력화된 것을 아무도 못 잡았다.
+
+    이 클래스는 축마다 **다른 두 축을 0(또는 <30%)으로 고정**한 입력을 쓰고,
+    기대 메시지를 입력 산술에서 그대로 포맷해(`_expect_*_msg`) `==` 로 전체 대조한다
+    (부분문자열 `in` 금지 — v10 검수 조건).
+    """
+
+    def _seed_nodes(self, builder, tmp_path, ids, pack="pack-1"):
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id=i) for i in ids])
+        pack_load.load_nodes(pack, f, builder, {})
+
+    def _live(self, graph, docs, pack="pack-1"):
+        return pack_load.live_pack_state(pack, graph, docs, _NoVec())
+
+    # ── 노드 축 격리 (청크 0 · doc 축 완전 비움) ────────────────────────
+
+    def test_node_only_exactly_thirty_percent_is_not_aborted(self, live, tmp_path):
+        builder, graph, docs = live
+        ids = [f"n{i}" for i in range(10)]
+        self._seed_nodes(builder, tmp_path, ids)
+        for nid in ids:                       # doc 축을 완전히 비워 노드 축만 남긴다
+            docs.delete_node_doc("resource", nid)
+        state = self._live(graph, docs)
+        assert state["doc_node_spaces"] == {}, "전제: doc 축이 비어 있어야 노드 축만 걸린다"
+        chunk_ratio = 0 / max(1, len(state["chunks"]))
+        assert chunk_ratio < 0.30, "전제(자기 단언): 청크 축은 0 이어야 한다"
+
+        keep = {f"n{i}" for i in range(7)}    # 3/10 = 정확히 0.30
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            keep, set(), set(), False, len(keep), 0)
+        assert res["node_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
+
+    def test_node_only_over_thirty_percent_aborts(self, live, tmp_path):
+        builder, graph, docs = live
+        ids = [f"n{i}" for i in range(10)]
+        self._seed_nodes(builder, tmp_path, ids)
+        for nid in ids:
+            docs.delete_node_doc("resource", nid)
+        state = self._live(graph, docs)
+        assert state["doc_node_spaces"] == {}, "전제: doc 축이 비어 있어야 노드 축만 걸린다"
+        chunk_ratio = 0 / max(1, len(state["chunks"]))
+        assert chunk_ratio < 0.30, "전제(자기 단언): 청크 축은 0 이어야 한다"
+
+        keep = {"n0"}                          # 9/10 = 90%
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+        assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 9, 10, 0, 0), str(ei.value)
+        assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
+
+    # ── 청크 축 격리 (노드·doc 축 전부 비움 — 노드를 아예 안 심는다) ──────
+
+    def test_chunk_only_exactly_thirty_percent_is_not_aborted(self, live, tmp_path):
+        _builder, graph, docs = live
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(10)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        assert state["nodes"] == {} and state["doc_node_spaces"] == {}, (
+            "전제(자기 단언): 노드·doc 축이 완전히 비어 있어야 청크 축만 격리된다")
+
+        keep_chunks = {f"c{i}" for i in range(7)}   # 3/10 = 정확히 0.30
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            set(), keep_chunks, set(), False, 0, len(keep_chunks))
+        assert res["chunk_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
+
+    def test_chunk_only_over_thirty_percent_aborts(self, live, tmp_path):
+        _builder, graph, docs = live
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(10)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        assert state["nodes"] == {} and state["doc_node_spaces"] == {}, (
+            "전제(자기 단언): 노드·doc 축이 완전히 비어 있어야 청크 축만 격리된다")
+
+        keep_chunks = {f"c{i}" for i in range(6)}   # 4/10 = 40%
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                set(), keep_chunks, set(), False, 0, len(keep_chunks))
+        assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 0, 0, 4, 10), str(ei.value)
+        assert len(self._live(graph, docs)["chunks"]) == 10, "중단했는데 청크가 지워졌다"
+
+    # ── doc 축 격리 (노드·청크 축 <30% 로 고정) ─────────────────────────
+    #
+    # doc 축 분모는 doc_node_spaces 의 **노드 수**다(F4-d) — 행 수가 아니다. 여기서는
+    # 그 분모를 노드 축 분모와 **의도적으로 다르게** 만든다(10개 노드 중 3개만
+    # doc_node_spaces 에 남긴다). 그러면 같은 3개 후보가 노드 축엔 3/10=30%(경계,
+    # 미발동)를, doc 축엔 3/3=100%(발동)을 내 두 축이 실제로 분리됐음이 드러난다.
+    # 이 분모(노드 수)가 행 수로 바뀌는 변이는 별도로 `TestDocAxisDenominator` 가
+    # 33.3%/20% 조합으로 더 촘촘히 잡는다(G5).
+
+    def test_doc_only_over_thirty_percent_aborts_node_and_chunk_stay_isolated(
+            self, live, tmp_path):
+        builder, graph, docs = live
+        ids = [f"n{i}" for i in range(10)]
+        self._seed_nodes(builder, tmp_path, ids)
+        for nid in ids[3:]:                    # 7개는 doc 행을 지워 doc 분모를 3으로 좁힌다
+            docs.delete_node_doc("resource", nid)
+        state = self._live(graph, docs)
+        assert set(state["doc_node_spaces"]) == {"n0", "n1", "n2"}, (
+            f"전제: doc_node_spaces 가 3개 노드여야 한다: {set(state['doc_node_spaces'])}")
+
+        keep = set(ids) - {"n0"}               # 노드 후보 1개뿐(n0) — doc 후보도 n0 뿐
+        node_ratio = 1 / 10
+        chunk_ratio = 0 / max(1, len(state["chunks"]))
+        assert node_ratio < 0.30 and chunk_ratio < 0.30, (
+            "전제(자기 단언): 노드·청크 축은 30% 미만이어야 doc 축만 격리된다")
+
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+        assert str(ei.value) == _expect_doc_ratio_msg("pack-1", 1, 3), str(ei.value)
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n0",))}
+        assert left_spaces == {"resource"}, "중단했는데 doc 행이 지워졌다"
+
+
+class TestPinRemovalIsNeutralAcrossSinks:
+    """F1 회귀 방지 — `had_write_failures` 안전핀 제거가 **중립**임을 세 sink 각각으로 건다.
+
+    핀이 지키려던 것은 "이번 실행에 저장 실패가 하나라도 있으면 삭제를 통째로
+    건너뛴다"였다. 그런데 삭제 후보 집합은 저장 성공 여부가 아니라 **파일**에서
+    만들어진다 — 노드는 `bypack_ids.add(node_id)` 가 `add_node` **전**에 실행되고
+    (load.py 주석 "add 성공 여부와 무관하게 항상"), 엣지는 `applied.add(...)` 가
+    저장 성공/실패와 무관하게 항상 실행되며, 청크는 `bypack_ids.add(chunk_id)` 가
+    write 시도 전에 실행된다. 즉 저장이 실패한 행도 이미 보호 집합에 들어 있으므로
+    핀이 없어도 그 행은 삭제되지 않는다 — 핀은 보호를 더하지 않고 **무관한** stale
+    행의 정상 정리만 막고 있었다.
+
+    아래 세 테스트는 각 sink 에서 (1) 무관한 stale 행이 실제로 지워지고
+    (2) 저장 실패한 행 자신은 지워지지 않는다는 것을 **같은 실행**에서 함께 건다.
+    """
+
+    def test_node_write_failure_does_not_block_stale_node_cleanup(
+            self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert set(state["nodes"]) == {"n1", "n2"}, "전제: 두 노드 다 라이브에 있어야 한다"
+
+        def _broken_upsert_node(*a, **kw):
+            raise RuntimeError("주입된 그래프 쓰기 실패")
+        monkeypatch.setattr(graph, "upsert_node", _broken_upsert_node)
+
+        # 이번 증분: n1 은 값이 바뀌어 재저장을 시도하지만 실패한다. n2 는 파일에서
+        # 아예 빠졌다 — n1 의 실패와 무관한 stale 후보다.
+        f2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="n1", 발행연도="2027")])
+        n_new, n_chg, n_same, skip, err, bypack_ids = pack_load.load_nodes_incremental(
+            "pack-1", f2, builder, {}, state["nodes"], graph, docs, {})
+        assert err == 1, f"저장 실패가 err 로 안 잡혔다: n_new={n_new} n_chg={n_chg} err={err}"
+        assert bypack_ids == {"n1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            bypack_ids, set(), set(), True, 1, 0)
+        assert res["node_del"] == 1, (
+            f"저장 실패가 있었다는 이유로 무관한 stale 노드(n2) 정리가 막혔다: {res}")
+        left = set(pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"])
+        assert "n2" not in left, "무관한 stale 노드(n2)가 실제로 안 지워졌다"
+        assert "n1" in left, (
+            "저장 실패한 행(n1)이 지워졌다 — by-pack 보호 집합에 있어 안 지워져야 한다")
+
+    def test_edge_write_failure_does_not_block_stale_edge_cleanup(
+            self, live, tmp_path, monkeypatch):
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2"), _node(id="n3")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "e.jsonl", [
+            {"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"},
+            {"id": "e2", "source_id": "n2", "target_id": "n3", "label": "CITES"},
+        ])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert state["edges"] == {("n1", "cites", "n2"), ("n2", "cites", "n3")}
+
+        def _broken_upsert_edge(*a, **kw):
+            raise RuntimeError("주입된 그래프 쓰기 실패")
+        monkeypatch.setattr(graph, "upsert_edge", _broken_upsert_edge)
+
+        # 이번 증분: e1 만 재반영을 시도하지만 저장이 실패한다. e2 는 파일에서
+        # 아예 빠졌다 — e1 의 실패와 무관한 stale 후보다.
+        ef2 = _write_jsonl(tmp_path / "e2.jsonl",
+                           [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        applied: set = set()
+        ok, skip, err = pack_load.load_edges("pack-1", ef2, builder, id_map, applied=applied)
+        assert (ok, err) == (0, 1), f"저장 실패가 err 로 안 잡혔다: ok={ok} err={err}"
+        assert applied == {("n1", "cites", "n2")}, "저장 실패와 무관하게 applied 는 채워져야 한다"
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1", "n2", "n3"}, set(), applied, True, 3, 0)
+        assert res["edge_del"] == 1, (
+            f"저장 실패가 있었다는 이유로 무관한 stale 엣지(e2) 정리가 막혔다: {res}")
+        left = {(r[0], r[1], r[2]) for r in graph._conn.execute(
+            "SELECT from_id, relation, to_id FROM graph_edges")}
+        assert ("n2", "cites", "n3") not in left, "무관한 stale 엣지(e2)가 실제로 안 지워졌다"
+        assert ("n1", "cites", "n2") in left, (
+            "저장 실패한 엣지(e1)가 지워졌다 — applied 보호 집합에 있어 안 지워져야 한다")
+
+    def test_chunk_write_failure_does_not_block_stale_chunk_cleanup(self, live, tmp_path):
+        builder, graph, docs = live
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1, "본문1"), _chunk(2, "본문2")])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+        assert set(live_chunks) == {"c1", "c2"}
+
+        class _VecFailsOn(_NoVec):
+            """지정 id 의 `upsert_texts` 호출만 실패시킨다 — 나머지는 실동작(delete)."""
+            available = True
+
+            def __init__(self, fail_id):
+                super().__init__()
+                self._fail_id = fail_id
+
+            def upsert_texts(self, texts, metadatas=None, ids=None):
+                if self._fail_id in (ids or []):
+                    raise RuntimeError("주입된 벡터 쓰기 실패")
+
+        # 이번 증분: c1 은 텍스트가 바뀌어 재임베딩을 시도하지만 실패한다. c2 는
+        # 파일에서 아예 빠졌다 — c1 의 실패와 무관한 stale 후보다.
+        cf2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문1")])
+        c_new, c_txt, c_meta, c_same, err, bypack_ids = pack_load.load_chunks_incremental(
+            "pack-1", cf2, _VecFailsOn("c1"), docs, live_chunks)
+        assert err == 1, f"저장 실패가 err 로 안 잡혔다: c_txt={c_txt} err={err}"
+        assert bypack_ids == {"c1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
+
+        self._seed_one_node(builder, tmp_path)
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"anchor-node"}, bypack_ids, set(), True, 1, 1)
+        assert res["chunk_del"] == 1, (
+            f"저장 실패가 있었다는 이유로 무관한 stale 청크(c2) 정리가 막혔다: {res}")
+        left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
+        assert "c2" not in left, "무관한 stale 청크(c2)가 실제로 안 지워졌다"
+        assert "c1" in left, (
+            "저장 실패한 청크(c1)가 지워졌다 — by-pack 보호 집합에 있어 안 지워져야 한다")
+        row = docs._conn.execute(
+            "SELECT text FROM doc_sources WHERE source_id='c1'").fetchone()
+        assert row[0] == "본문1", (
+            "벡터 쓰기가 실패했는데 doc_sources 가 새 텍스트로 갱신됐다 — "
+            f"영구 불일치 (실제 {row[0]!r})")
+
+    def _seed_one_node(self, builder, tmp_path):
+        f = _write_jsonl(tmp_path / "anchor.jsonl", [_node(id="anchor-node")])
+        pack_load.load_nodes("pack-1", f, builder, {})
 
 
 class TestReversedEdgeSwapsEndpoints:
@@ -1075,6 +1349,22 @@ class _SqliteVecLike:
     def rows(self):
         return {(r[0], r[1]) for r in
                 self._conn.execute(f"SELECT node_id, pack_id FROM {self._table}")}
+
+    def delete(self, ids):
+        """`incremental_finalize` 의 벡터 고아 정리가 부르는 일반 삭제 경로.
+
+        `delete_pack` 의 sql 분기는 `_vec_backend()` 를 거쳐 직접 SQL 을 실행하지만
+        (위 클래스 docstring), `incremental_finalize` 의 고아 정리는 백엔드 종류와
+        무관하게 `vec.delete(ids)` 를 호출한다 — 진짜 sqlite 행을 지워야 "요청 목록"
+        이 아니라 **실제 backend row** 로 확인하는 양성 테스트가 성립한다.
+        """
+        ids = list(ids)
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        self._conn.execute(
+            f"DELETE FROM {self._table} WHERE node_id IN ({placeholders})", ids)
+        self._conn.commit()
 
 
 class TestDeletePackVectorBranch:
@@ -1245,6 +1535,442 @@ class TestIncrementalFinalizeActuallyDeletes:
             {"n1"}, {"c1"}, set(), True, 1, 1)
         assert "n1" not in vec.deleted, f"살아있는 노드의 벡터를 지웠다: {vec.deleted}"
         assert "c1" not in vec.deleted, f"살아있는 청크의 벡터를 지웠다: {vec.deleted}"
+
+    def test_chunk_deletion_batches_correctly_across_the_500_item_boundary(
+            self, live, tmp_path):
+        """`_batched` 기본 크기(500)를 실제로 넘는 입력으로 배치 경계를 강제한다.
+
+        한 배치만 도는 입력으로는 `chunk_del += cur.rowcount` 를 `= cur.rowcount`
+        (마지막 배치만 반영)로 바꾸는 변이나 `placeholders` 개수가 틀어지는 변이가
+        안 잡힌다 — 전량이 실제로 지워지는지까지 확인해야 갈린다.
+        """
+        builder, graph, docs = live
+        self._seed_nodes(builder, tmp_path, ["n1"])
+        n = 620   # 500 경계를 넘겨 배치 2개(500+120)를 강제한다
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(n)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = self._live(graph, docs)
+        assert len(state["chunks"]) == n
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, {"없는-청크"}, set(), True, 1, 0)
+
+        assert res["chunk_del"] == n, (
+            f"배치 경계를 넘는 삭제가 전량 반영되지 않았다 (기대 {n}, 실제 {res['chunk_del']})")
+        left = docs._conn.execute("SELECT COUNT(*) FROM doc_sources").fetchone()[0]
+        assert left == 0, f"배치 경계를 넘는 청크가 실제로는 안 지워졌다 (남은 {left}건)"
+
+
+class TestIncrementalFinalizePositiveDeletionAcrossAllFourAxes:
+    """핀을 통과한 뒤 **4축(노드·청크·엣지·벡터) 전부**가 실제로 지워지는가를 한
+    시나리오에서 함께 확인한다(2026-08-11 F5 지시).
+
+    지금까지의 양성 테스트는 축마다 흩어져 있었고, 벡터는 `vec.deleted`(요청
+    리스트)만 확인해 `vec.delete()` 가 실제로 아무 것도 안 지워도 통과했다. 여기서는
+    삭제 전 대상이 실제로 존재한다는 전제, 그 팩의 candidate 이고 by-pack 에 없는
+    것만 지워진다는 것, 0건 핀을 피할 무관한 applied edge, 다른 팩의 동일 relation
+    triple 은 살아남는다는 것, 그리고 벡터는 `_SqliteVecLike` 의 진짜 sqlite 테이블을
+    **별도 커넥션**으로 읽어 확인하는 것까지 한 실행에서 전부 건다.
+    """
+
+    def test_stale_node_chunk_edge_and_vector_orphan_are_all_actually_removed(
+            self, live, tmp_path):
+        import sqlite3
+        builder, graph, docs = live
+
+        nf = _write_jsonl(tmp_path / "n.jsonl",
+                          [_node(id="n1"), _node(id="n2"), _node(id="stale-n")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "e.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        pack_load.load_edges("pack-1", ef, builder, id_map)
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+
+        vec = _SqliteVecLike()
+        vec.seed("pack-1", ["c1", "고아-벡터"])
+
+        # 다른 팩이 **같은 relation, 다른 endpoint** 의 엣지를 갖는다 — 살아남아야 한다.
+        nf2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="m1"), _node(id="m2")])
+        pack_load.load_nodes("다른팩", nf2, builder, id_map)
+        ef2 = _write_jsonl(tmp_path / "e2.jsonl",
+                          [{"id": "e2", "source_id": "m1", "target_id": "m2", "label": "CITES"}])
+        pack_load.load_edges("다른팩", ef2, builder, id_map)
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec)
+        # ── 전제: 삭제 전 대상이 실제로 존재한다 ──
+        assert "stale-n" in state["nodes"]
+        assert {"c1", "c2"} <= set(state["chunks"])
+        assert ("n1", "cites", "n2") in state["edges"]
+        assert "고아-벡터" in state["vec_ids"]
+
+        # ── 이번 증분: stale-n·c2 는 by-pack 에서 빠지고, 엣지는 전량 stale
+        #    (무관한 applied 항목으로 "반영 엣지 0건" 핀을 피한다) ──
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, vec, state,
+            {"n1", "n2"}, {"c1"}, {("무관", "무관계", "무관-y")}, True, 2, 1)
+
+        assert res["node_del"] == 1, res
+        assert res["chunk_del"] == 1, res
+        assert res["edge_del"] == 1, res
+        assert res["vec_orphan_del"] == 1, res
+
+        # ── 별도 커넥션으로 readback — "지웠다고 보고만 하고 실제론 안 지웠다"를 배제한다 ──
+        g2 = sqlite3.connect(f"file:{tmp_path / 'graph.db'}?mode=ro", uri=True)
+        d2 = sqlite3.connect(f"file:{tmp_path / 'doc.db'}?mode=ro", uri=True)
+        try:
+            node_ids = {r[0] for r in g2.execute("SELECT node_id FROM graph_nodes")}
+            edges = {(r[0], r[1], r[2]) for r in g2.execute(
+                "SELECT from_id, relation, to_id FROM graph_edges")}
+            chunk_ids = {r[0] for r in d2.execute("SELECT source_id FROM doc_sources")}
+        finally:
+            g2.close()
+            d2.close()
+
+        assert "stale-n" not in node_ids, "stale 노드가 실제로 안 지워졌다"
+        assert {"n1", "n2"} <= node_ids, "무관한 살아있는 노드까지 지워졌다"
+        assert ("n1", "cites", "n2") not in edges, "stale 엣지가 실제로 안 지워졌다"
+        assert ("m1", "cites", "m2") in edges, "다른 팩의 동일 relation triple 이 지워졌다"
+        assert "c2" not in chunk_ids, "stale 청크가 실제로 안 지워졌다"
+        assert "c1" in chunk_ids, "무관한 살아있는 청크까지 지워졌다"
+        assert vec.rows() == {("c1", "pack-1")}, (
+            f"벡터 고아가 요청만 되고 실제 backend 행에서는 안 지워졌다: {vec.rows()}")
+
+
+class TestDeletePackReclaimPredicateIsPackIdOnly:
+    """`delete_pack` 의 회수(reclaim) 술어 4표 — `graph_nodes`/`graph_edges`/`doc_nodes`
+    는 `pack_id` 단일 키, `doc_sources` 만 `pack_id OR source` 다(load.py 주석
+    226-245, 294-300).
+
+    `source`/`source_id`/`pack` 는 소유 키가 아니다 — `transform_node` 가 입력의 외래
+    `source` 를 properties 에 그대로 보존하므로, 다른 팩 소유 행에 지금 지우려는
+    팩명과 우연히 같은 `source` 값이 실제로 생길 수 있다(예: 예전에 그 팩에서 이
+    노드를 참조했던 흔적). 그 값으로 회수되면 남의 팩이 지워진다.
+    """
+
+    def test_graph_nodes_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+        builder, graph, docs = live
+        # own-pack 소유 노드인데 properties.source 가 지우려는 팩명과 같다.
+        f = _write_jsonl(tmp_path / "n.jsonl",
+                         [_node(id="n1", properties={"source": "target"})])
+        pack_load.load_nodes("own-pack", f, builder, {})
+        assert graph.get_node("Document", "n1") is not None
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+        assert graph.get_node("Document", "n1") is not None, (
+            "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 소유 노드가 지워졌다")
+
+    def test_graph_edges_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("own-pack", nf, builder, id_map)
+        ef = _write_jsonl(tmp_path / "e.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES",
+                            "properties": {"source": "target"}}])
+        pack_load.load_edges("own-pack", ef, builder, id_map)
+        before = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        assert before == 1
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+        after = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        assert after == 1, "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 엣지가 지워졌다"
+
+    def test_doc_nodes_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+        builder, graph, docs = live
+        docs.upsert_node_doc("resource", "Document", "orphan-1",
+                              {"pack_id": "own-pack", "source": "target"})
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+        left = docs._conn.execute(
+            "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("orphan-1",)).fetchone()[0]
+        assert left == 1, "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 doc_nodes 행이 지워졌다"
+
+    def test_doc_sources_reclaim_matches_pack_id_or_source_but_ignores_other_tags(
+            self, live, tmp_path):
+        """`doc_sources` 는 **유일하게** `source` 도 본다 — 그래서 `source=target` 은
+        실제로 지워져야 하고(양성 절반), `pack_id` 도 `source` 도 아닌 다른 태그가
+        같은 값이어도 지워지면 안 된다(음성 절반)."""
+        _builder, _graph, docs = live
+        docs.upsert_source("c-by-source", "본문", {"source": "target"})
+        docs.upsert_source("c-by-unrelated-tag", "본문",
+                           {"pack_id": "own-pack", "tag": "target"})
+
+        pack_load.delete_pack("target", _graph, docs, _NoVec())
+
+        left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
+        assert "c-by-source" not in left, (
+            "doc_sources 의 source 매치가 실제로 안 지워졌다 — doc_sources 만의 OR 축이 죽었다")
+        assert "c-by-unrelated-tag" in left, (
+            "pack_id/source 가 아닌 다른 태그가 같은 값이라는 이유로 doc_sources 행이 지워졌다")
+
+
+class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
+    """G6 — `doc_sources` 회수 양방향(pack_id·source) + FTS5 그림자 테이블 정리.
+
+    FTS 삭제는 **두 독립 경로**에 있다: `delete_pack`(load.py:314) 과
+    `incremental_finalize`(load.py:1063). 한쪽만 부르는 테스트는 다른 쪽 DELETE 를
+    지워도 통과한다(v10 검수 지적) — 그래서 각 경로를 **별도 테스트**로 건다.
+
+    백엔드 한정: `LocalSQLDocStore` 전용이다(Pg=GIN·Mongo=없음, 2026-08-12 실측).
+    `live` fixture 가 이 백엔드를 직접 인스턴스화하므로 별도 분기는 두지 않는다.
+    """
+
+    def test_source_only_and_pack_id_only_rows_are_both_reclaimed_unrelated_survives(
+            self, live, tmp_path):
+        """pack_id 만 태그된 행·source 만 태그된 행 둘 다 회수돼야 한다(양방향) —
+        `doc_sources` 회수 술어가 `source` 단독으로 축소되면 pack_id-only 행이,
+        `pack_id` 단독으로 축소되면 source-only 행이 각각 안 지워진다."""
+        _builder, _graph, docs = live
+        docs.upsert_source("c-source-only", "본문A", {"source": "pack-1"})
+        docs.upsert_source("c-pack-id-only", "본문B", {"pack_id": "pack-1"})
+        docs.upsert_source("c-unrelated", "본문C", {"pack_id": "다른팩", "tag": "pack-1"})
+
+        pack_load.delete_pack("pack-1", _graph, docs, _NoVec())
+
+        left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
+        assert "c-source-only" not in left, "source 만 일치하는 행이 안 지워졌다"
+        assert "c-pack-id-only" not in left, "pack_id 만 일치하는 행이 안 지워졌다"
+        assert "c-unrelated" in left, "pack_id/source 가 아닌 무관 태그 행이 지워졌다"
+
+    def test_delete_pack_removes_the_fts_shadow_row_and_leaves_unrelated_row(
+            self, live, tmp_path):
+        """`delete_pack` 경로의 FTS 삭제(load.py:314) — 행 단위 독립 readback."""
+        _builder, _graph, docs = live
+        if not docs._fts_ok:
+            pytest.skip("FTS5 미가용 빌드 — doc_sources_fts 가상 테이블이 없다")
+
+        docs.upsert_source("c1", "삭제 대상 본문", {"pack_id": "pack-1"})
+        docs.upsert_source("c2", "무관 본문", {"pack_id": "다른팩"})
+
+        meta_before = json.loads(docs._conn.execute(
+            "SELECT metadata FROM doc_sources WHERE source_id=?", ("c1",)).fetchone()[0])
+        assert meta_before.get("pack_id") == "pack-1", (
+            "전제: c1 이 pack_id 매치로 delete_pack 후보가 되어야 한다 "
+            "(delete_pack 은 keep 집합이 없어 pack_id/source 매치 자체가 후보 조건이다)")
+        before = {r[0] for r in docs._conn.execute(
+            "SELECT source_id FROM doc_sources_fts")}
+        assert "c1" in before, "전제: 삭제 전 대상이 FTS 에 있어야 한다"
+
+        node_del, chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
+            "pack-1", _graph, docs, _NoVec())
+        assert chunk_sql_del == 1, (node_del, chunk_sql_del)
+
+        after = {r[0] for r in docs._conn.execute(
+            "SELECT source_id FROM doc_sources_fts")}
+        assert "c1" not in after, f"delete_pack 이 FTS 그림자 행을 안 지웠다: {after}"
+        assert "c2" in after, f"무관 행이 delete_pack 의 FTS 삭제에 함께 지워졌다: {after}"
+
+    def test_incremental_finalize_removes_the_fts_shadow_row_and_leaves_unrelated_row(
+            self, live, tmp_path):
+        """`incremental_finalize` 경로의 FTS 삭제(load.py:1063) — `delete_pack` 과는
+        **독립된 코드 경로**라 별도로 걸어야 한다. 행 단위 독립 readback."""
+        builder, graph, docs = live
+        if not docs._fts_ok:
+            pytest.skip("FTS5 미가용 빌드 — doc_sources_fts 가상 테이블이 없다")
+
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert set(state["chunks"]) == {"c1", "c2"}, "전제: 삭제 전 대상이 live 에 있어야 한다"
+
+        before = {r[0] for r in docs._conn.execute(
+            "SELECT source_id FROM doc_sources_fts")}
+        assert "c1" in before, "전제: 삭제 전 대상이 FTS 에 있어야 한다"
+
+        keep_chunks = {"c2"}    # c1 만 후보 — bypack_chunk_ids 에 없다
+        assert "c1" not in keep_chunks, "전제: c1 이 bypack_chunk_ids 에 없어야 후보가 된다"
+        # 1/2 = 50% > 30% 라 30% 핀에 걸린다 — 이 테스트의 초점은 핀이 아니라 핀을
+        # 통과한 뒤의 FTS 삭제이므로 force_delete 로 강행한다(핀 자체는 G1 이 건다).
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, keep_chunks, set(), True, 1, len(keep_chunks))
+        assert res["chunk_del"] == 1, res
+
+        after = {r[0] for r in docs._conn.execute(
+            "SELECT source_id FROM doc_sources_fts")}
+        assert "c1" not in after, f"incremental_finalize 가 FTS 그림자 행을 안 지웠다: {after}"
+        assert "c2" in after, f"무관 행이 incremental_finalize 의 FTS 삭제에 함께 지워졌다: {after}"
+
+
+class _FakeChromaCollection:
+    """`.get(where=...)`/`.delete(ids=...)`/`.update(ids=..., metadatas=...)` 만
+    흉내내는 최소 Chroma 컬렉션 더블.
+
+    `_NoVec`(available=False)만 쓰던 판은 `delete_pack`/`pack_live_counts`/
+    `live_pack_state`/`_vec_meta_update` 의 Chroma 분기가 **한 번도 실행되지
+    않았다** — 그 경로는 영원히 미검증이었다(#pgvector 실측과 같은 클래스, F5).
+    """
+
+    def __init__(self, rows):
+        self._rows: dict[str, str] = dict(rows)       # {node_id: pack_id}
+        self.metas: dict[str, dict] = {}
+        self.get_calls: list[dict | None] = []
+        self.delete_calls: list[list[str]] = []
+        self.update_calls: list[tuple[list[str], list[dict]]] = []
+
+    def get(self, where=None):
+        self.get_calls.append(where)
+        pid = (where or {}).get("pack_id")
+        ids = [i for i, p in self._rows.items() if p == pid]
+        return {"ids": ids}
+
+    def delete(self, ids):
+        self.delete_calls.append(list(ids))
+        for i in ids:
+            self._rows.pop(i, None)
+            self.metas.pop(i, None)
+
+    def update(self, ids, metadatas):
+        self.update_calls.append((list(ids), list(metadatas)))
+        for i, m in zip(ids, metadatas):
+            self.metas[i] = dict(m)
+
+
+class _FakeChromaVec:
+    """`_conn`/`conn`/`_engine` 이 없고 `_collection` 만 있는 Chroma 형태."""
+
+    available = True
+
+    def __init__(self, rows):
+        self._collection = _FakeChromaCollection(rows)
+
+
+class TestChromaBackendBranches:
+    """`_vec_backend()` 가 `"chroma"` 로 인식하는 형태(F5-1) — 4자리 전부를 태운다."""
+
+    def test_delete_pack_uses_single_pack_id_predicate_and_deletes_the_matched_rows(
+            self, live, tmp_path):
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "b1": "pack-b"})
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
+        assert vec._collection.get_calls[-1] == {"pack_id": "pack-a"}, (
+            f"회수 술어가 pack_id 단일 조건이 아니다: {vec._collection.get_calls[-1]} — "
+            "$or 로 되돌리면 이 단언이 깨져야 한다")
+        assert set(vec._collection._rows) == {"b1"}, (
+            f"다른 팩의 벡터까지 지웠거나 대상이 남았다: {vec._collection._rows}")
+
+    def test_pack_live_counts_counts_via_get(self, tmp_path):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+        graph = LocalGraphStore(str(tmp_path / "graph.db"))
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "b1": "pack-b"})
+
+        got = pack_load.pack_live_counts("pack-a", graph, docs, vec)
+        assert got["vectors"] == 2, f"벡터 2건을 세어야 한다 (실제 {got['vectors']!r})"
+        assert vec._collection.get_calls[-1] == {"pack_id": "pack-a"}
+
+    def test_live_pack_state_collects_vec_ids_via_get(self, live, tmp_path):
+        builder, graph, docs = live
+        self._seed_node(builder, tmp_path, "n1")
+        vec = _FakeChromaVec({"n1": "pack-1", "고아": "pack-1", "b1": "pack-b"})
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec)
+        assert state["vec_ids"] == {"n1", "고아"}, state["vec_ids"]
+        assert vec._collection.get_calls[-1] == {"pack_id": "pack-1"}
+
+    def test_vec_meta_update_calls_collection_update(self):
+        vec = _FakeChromaVec({"c1": "pack-1"})
+        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
+        assert ok is True
+        assert vec._collection.metas.get("c1") == {"쪽": "99"}, (
+            "메타 갱신이 컬렉션에 실제로 반영되지 않았다")
+
+    def _seed_node(self, builder, tmp_path, node_id):
+        f = _write_jsonl(tmp_path / f"{node_id}.jsonl", [_node(id=node_id)])
+        pack_load.load_nodes("pack-1", f, builder, {})
+
+
+class _SqlAlchemyVecLike:
+    """pgvector 형태 흉내 — `_engine`/`_table` 만 노출한다(실 SQLAlchemy 엔진, in-memory
+    SQLite 위에서 돈다).
+
+    `_vec_backend()` 는 `_conn`/`conn` 도 `_collection` 도 없고 `_engine` 만 있는
+    이 형태를 `"sqlalchemy"` 로 인식해야 한다 — pgvector 실스토어가 실제로
+    `_engine`/`_table` 만 노출한다(load.py `_vec_backend` docstring).
+    `begin()`/`connect()` 컨텍스트와 `rowcount`/`scalar()` 를 손으로 흉내내는 대신
+    이미 프로젝트 의존성인 진짜 SQLAlchemy 를 그대로 쓴다 — 계약을 잘못 베낄
+    위험이 없다.
+    """
+
+    _table = "vectors_pg"
+
+    def __init__(self):
+        from sqlalchemy import create_engine, text
+        self.available = True
+        self._engine = create_engine("sqlite:///:memory:")
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                f"CREATE TABLE {self._table} (node_id TEXT PRIMARY KEY, pack_id TEXT)"))
+
+    def seed(self, pack, ids):
+        from sqlalchemy import text
+        with self._engine.begin() as conn:
+            for i in ids:
+                conn.execute(text(f"INSERT INTO {self._table} VALUES (:i, :p)"),
+                             {"i": i, "p": pack})
+
+    def rows(self):
+        from sqlalchemy import text
+        with self._engine.connect() as conn:
+            return {(r[0], r[1]) for r in conn.execute(
+                text(f"SELECT node_id, pack_id FROM {self._table}"))}
+
+
+class TestSqlAlchemyBackendBranches:
+    """`_vec_backend()` 가 `"sqlalchemy"` 로 인식하는 형태(pgvector, F5-1)."""
+
+    def test_delete_pack_deletes_via_begin_and_reflects_real_rowcount(self, live, tmp_path):
+        _builder, graph, docs = live
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-a", ["a1", "a2"])
+        vec.seed("pack-b", ["b1"])
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
+        assert vec.rows() == {("b1", "pack-b")}, (
+            f"다른 팩의 벡터까지 지웠거나 대상이 남았다: {vec.rows()}")
+
+    def test_pack_live_counts_counts_via_connect_and_scalar(self, tmp_path):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+        graph = LocalGraphStore(str(tmp_path / "graph.db"))
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-a", ["a1", "a2"])
+
+        got = pack_load.pack_live_counts("pack-a", graph, docs, vec)
+        assert got["vectors"] == 2, f"벡터 2건을 세어야 한다 (실제 {got['vectors']!r})"
+
+    def test_live_pack_state_collects_vec_ids_via_connect(self, live, tmp_path):
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", f, builder, {})
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-1", ["n1", "고아"])
+        vec.seed("pack-b", ["b1"])
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec)
+        assert state["vec_ids"] == {"n1", "고아"}, state["vec_ids"]
+
+    def test_vec_meta_update_has_no_dedicated_branch_and_falls_back_to_false(self):
+        """`_vec_meta_update` 는 `"sql"`/`"chroma"` 두 종류만 분기하고 `"sqlalchemy"`
+        분기가 없다 — pgvector 형태는 예외 없이 `False` 로 떨어져 호출자가
+        재임베딩으로 우회한다. 분기가 새로 생기면 이 테스트가 깨져 알려준다."""
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-1", ["c1"])
+        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
+        assert ok is False, (
+            "sqlalchemy 형태에 메타 갱신 전용 분기가 새로 생겼다 — 이 테스트를 "
+            "그 분기에 맞게 다시 써야 한다")
 
 
 class TestStubsMatchTheRealStoreContract:
@@ -1606,13 +2332,385 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs)
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert err == 1, (
             f"저장 실패가 err 로 안 잡혔다 (n_new={n_new} n_chg={n_chg} err={err})")
         assert graph.get_node("Document", "n1") is not None, (
             "add_node 가 실패했는데 구 타입 행이 지워졌다 — 재시도로도 복구 불가능한 영구 소실")
         assert graph.get_node("Concept", "n1") is None, "실패했는데 신규 타입 행이 생겼다"
+
+
+class TestDocSpaceResidueCleanup:
+    """F4 — doc 고아 세 부류(타입 변경 잔재 / 입력에서 사라진 고아 / space 어긋남)를
+    각각 확인한다(2026-08-11 F4 지시).
+    """
+
+    def test_type_change_residue_is_cleaned_even_on_the_same_path(self, live, tmp_path):
+        """(a) graph 는 새 타입, doc 은 구 space. 노드가 입력에 아직 있고 same 으로
+        끝나는 경로에서도 구 space doc 행이 지워져야 한다."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl",
+                          [_node(id="n1", node_type="Concept", space="concept")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        assert graph.get_node("Concept", "n1") is not None
+
+        # 구 space 잔재를 직접 심는다 — 지난 증분의 F4-c 정리가 실패했다고 가정한다.
+        docs.upsert_node_doc("resource", "Document", "n1", {"pack_id": "pack-1"})
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert state["doc_node_spaces"].get("n1") == {"concept", "resource"}, (
+            "전제: doc_node_spaces 가 두 space 를 다 모아야 한다")
+
+        # 같은 파일을 다시 적재 — 노드 자체는 안 바뀌었으므로 same 경로를 타야 한다.
+        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            "pack-1", nf, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+        assert n_same == 1, f"전제 위반 — same 경로가 아니다: new={n_new} chg={n_chg} same={n_same}"
+
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
+        assert left_spaces == {"concept"}, (
+            f"same 경로에서 구 space(resource) doc 잔재가 안 지워졌다: {left_spaces}")
+
+    def test_orphan_doc_node_without_graph_twin_is_cleaned_by_finalize(self, live, tmp_path):
+        """(b) graph 행 없음, doc 행만 남음. `incremental_finalize` 의 doc 축이 잡아야 한다."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        docs.upsert_node_doc("resource", "Document", "orphan-1", {"pack_id": "pack-1"})
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert "orphan-1" not in state["nodes"], "전제: graph 트윈이 없어야 한다"
+        assert state["doc_node_spaces"].get("orphan-1") == {"resource"}
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, set(), set(), True, 1, 0)
+
+        assert res["doc_orphan_del"] == 1, res
+        left = docs._conn.execute(
+            "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("orphan-1",)).fetchone()[0]
+        assert left == 0, "graph 트윈 없는 doc 고아가 안 지워졌다"
+
+    def test_all_spaces_for_a_doc_candidate_are_removed_not_just_the_live_space(
+            self, live, tmp_path):
+        """(c) 삭제 후보 노드의 doc 행이 여러 space 에 걸쳐 있으면 **전부** 지워져야
+        한다 — `live_nodes` 의 space 하나만 지우면 다른 space 잔재가 남는다."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        docs.upsert_node_doc("concept", "Concept", "n1", {"pack_id": "pack-1"})  # 어긋난 space 잔재
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert state["doc_node_spaces"]["n1"] == {"resource", "concept"}
+        assert state["nodes"]["n1"][1] == "resource", "전제: graph 축 space 는 resource 뿐이다"
+
+        res = pack_load.incremental_finalize(   # n1 이 by-pack 에서 사라졌다고 신고
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n2"}, set(), set(), True, 1, 0)
+
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
+        assert left_spaces == set(), (
+            f"삭제 후보 노드의 doc 행이 live space(resource) 만 지워지고 다른 "
+            f"space(concept) 잔재가 남았다: {left_spaces}, res={res}")
+
+    def test_space_moving_type_change_cleans_stale_and_legacy_spaces_together(
+            self, live, tmp_path):
+        """(d, v10 검수: 실제 F4 잔재를 대표하는 시나리오) — 타입이 바뀌면서 space 도
+        함께 바뀐다. live 는 구 타입(구 space) 하나, doc 은 구 space 행 + 무관
+        legacy space 행 2종. 입력이 신 타입(신 space)으로 들어오면 stale_typed
+        삭제(구 space, load.py:604)와 `_cleanup_stale_doc_spaces`(legacy space,
+        load.py:610)가 **함께** 걸려야 신·구·legacy 세 space 전부가 맞는 최종
+        상태로 수렴한다. 후자 하나만 빠져도(예: chg 경로 호출 제거) legacy 행이
+        남는다.
+        """
+        builder, graph, docs = live
+        nf1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Document", space="resource")])
+        pack_load.load_nodes("pack-1", nf1, builder, {})
+        assert graph.get_node("Document", "n1") is not None
+
+        # legacy space 잔재 — 지난 증분이 F4-c 정리 전에 실패했다고 가정한다.
+        docs.upsert_node_doc("subject", "Agent", "n1", {"pack_id": "pack-1"})
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert state["doc_node_spaces"].get("n1") == {"resource", "subject"}, (
+            "전제: doc_node_spaces 가 구 space·legacy space 를 모두 모아야 한다")
+
+        nf2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            "pack-1", nf2, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+        assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
+            n_new, n_chg, n_same, skip, err)
+
+        assert graph.get_node("Document", "n1") is None, "구 타입 그래프 행이 안 지워졌다"
+        assert graph.get_node("Concept", "n1") is not None, "신 타입 그래프 행이 없다"
+
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
+        assert left_spaces == {"concept"}, (
+            f"구 space(resource) · legacy space(subject) 잔재가 안 지워지고 남았다: "
+            f"{left_spaces}")
+
+    def test_same_space_sequential_type_change_updates_the_single_row_in_place(
+            self, live, tmp_path):
+        """같은 space 안에서 타입만 바뀌는 순차 변경 — `doc_nodes` PK 가
+        `(space, node_id)` 라 물리 행은 **하나**로 유지돼야 하고(UPSERT 갱신),
+        그 하나가 최종 타입·properties 값을 반영해야 한다. 행 수만 보면 안
+        갈린다(v10 조건) — 갱신을 빼먹고 구 값을 그대로 둬도 행 수는 1 그대로다.
+
+        이관 회귀 회귀방지(2026-08-12): stale_typed doc 삭제에 space 동일성 가드가
+        없으면(load.py:604 부근) space 가 안 바뀐 이 경로에서 `add_node` 가 upsert 로
+        방금 갱신한 행을 그대로 지워 물리 행이 **0개**가 된다(실측·team-lead 확인 완료).
+        """
+        builder, graph, docs = live
+        nf1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Document", space="resource")])
+        pack_load.load_nodes("pack-1", nf1, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        nf2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="File", space="resource",
+                                  properties={"버전": "2"})])
+        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            "pack-1", nf2, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+        assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
+            n_new, n_chg, n_same, skip, err)
+
+        rows = docs._conn.execute(
+            "SELECT node_type, properties FROM doc_nodes WHERE space=? AND node_id=?",
+            ("resource", "n1")).fetchall()
+        assert len(rows) == 1, f"같은 space 순차 타입 변경인데 물리 행이 {len(rows)}개다"
+        node_type, props_json = rows[0]
+        props = json.loads(props_json)
+        assert node_type == "File", f"doc_nodes 행의 node_type 이 신 타입으로 갱신 안 됨: {node_type}"
+        assert props.get("버전") == "2", f"doc_nodes 행의 properties 가 신 값으로 갱신 안 됨: {props}"
+
+
+class TestAnchorPredicateAgreesAcrossPythonAndSQL:
+    """`_is_anchor_node`(Python)와 `ANCHOR_SQL`(SQLite GLOB)이 **같은 판정**을 내야 한다.
+
+    `LIKE` 였다면 대소문자를 무시해 `DATASET:x` 도 앵커로 잡고 Python `str.startswith`
+    는 안 잡아 두 축이 갈렸을 것이다(load.py 주석). `GLOB` 은 대소문자를 구분해
+    일치한다 — 그 일치를 대소문자 격자로 확인한다.
+    """
+
+    @pytest.mark.parametrize("node_id, expect_anchor", [
+        ("dataset:x", True), ("DATASET:x", False), ("DaTaSeT:x", False),
+    ])
+    def test_python_predicate_is_case_sensitive(self, node_id, expect_anchor):
+        assert pack_load._is_anchor_node(node_id, {}) is expect_anchor
+
+    @pytest.mark.parametrize("node_id, expect_anchor", [
+        ("dataset:x", True), ("DATASET:x", False), ("DaTaSeT:x", False),
+    ])
+    def test_sql_doc_axis_agrees_with_the_python_predicate(
+            self, live, tmp_path, node_id, expect_anchor):
+        """앵커면 `doc_node_spaces` 에서 **빠져야** 하고, 아니면 **있어야** 한다 —
+        SQL(GLOB) 판정이 Python 술어와 갈리면 이 단언이 깨진다."""
+        builder, graph, docs = live
+        docs.upsert_node_doc("resource", "Document", node_id, {"pack_id": "pack-1"})
+        doc_node_spaces = pack_load.live_pack_state(
+            "pack-1", graph, docs, _NoVec())["doc_node_spaces"]
+        is_excluded = node_id not in doc_node_spaces
+        assert is_excluded == expect_anchor, (
+            f"{node_id}: SQL(GLOB) 이 앵커로 판정({is_excluded})했지만 Python 술어는 "
+            f"{pack_load._is_anchor_node(node_id, {})} — ANCHOR_SQL 과 _is_anchor_node 가 불일치")
+
+    def test_title_backfill_anchor_is_excluded_from_the_doc_axis_too(self, live, tmp_path):
+        """`created_by=title-backfill` 도 `dataset:` 접두사와 같은 자격으로 doc 축에서
+        빠져야 한다 — 지금까지 doc 축(SQL) 쪽으로는 무테스트였다."""
+        builder, graph, docs = live
+        docs.upsert_node_doc("resource", "Document", "backfilled-1",
+                              {"pack_id": "pack-1", "created_by": "title-backfill"})
+        doc_node_spaces = pack_load.live_pack_state(
+            "pack-1", graph, docs, _NoVec())["doc_node_spaces"]
+        assert "backfilled-1" not in doc_node_spaces, (
+            "title-backfill 앵커가 doc_node_spaces 후보에 들어왔다 — SQL 축이 안 걸렀다")
+
+    def test_row_without_created_by_key_is_not_silently_excluded(self, live, tmp_path):
+        """`created_by` 키가 아예 없는 정상 행. `COALESCE` 가 없으면 `json_extract` 가
+        NULL 을 내 `NULL = 'title-backfill'` 도 NULL 이 되고, `NOT (... OR NULL)` 이
+        WHERE 절에서 falsy 로 취급돼 이 행이 앵커가 아닌데도 doc_node_spaces 에서
+        통째로 빠진다 — 그러면 이런 행은 doc 축 대사에서 영영 제외된다."""
+        builder, graph, docs = live
+        docs.upsert_node_doc("resource", "Document", "n1", {"pack_id": "pack-1"})
+        doc_node_spaces = pack_load.live_pack_state(
+            "pack-1", graph, docs, _NoVec())["doc_node_spaces"]
+        assert "n1" in doc_node_spaces, (
+            "created_by 가 없는 정상 행이 doc_node_spaces 에서 빠졌다 — COALESCE 누락 의심")
+
+
+class _FalsyButNonEmptyDict(dict):
+    """`bool()` 은 항상 False 를 내지만 `set(...)`/순회는 실제 키를 낸다.
+
+    `doc_del_candidates = set(doc_node_spaces) - bypack_node_ids` 는 `doc_node_spaces`
+    에서 파생되므로, 정상 상태로는 "분모가 비었는데 후보가 있다"는 불변식 위반이
+    나올 수 없다(집합 뺄셈은 부분집합만 낸다) — 그래서 이 안전핀은 `doc_node_spaces`
+    계산 자체가 깨진 미래의 버그를 잡기 위한 방어선이다. 그 방어선이 실제로
+    발동하는지는 `not doc_node_spaces`(bool)와 `set(doc_node_spaces)`(iteration)가
+    서로 다른 정보를 보는, 진성이 아닌 입력으로만 확인할 수 있다.
+    """
+
+    def __bool__(self):
+        return False
+
+
+class TestDocAxisSafetyPinEdgeCases:
+    def test_empty_doc_node_spaces_denominator_does_not_raise_zero_division(
+            self, live, tmp_path):
+        """doc_node_spaces 가 비면 30% 핀을 건너뛰어야 한다 — 분모가 0인 나눗셈을
+        시도하면 ZeroDivisionError 로 죽는다."""
+        builder, graph, docs = live
+        state = pack_load.live_pack_state("없는-팩", graph, docs, _NoVec())
+        assert state["doc_node_spaces"] == {} and not state["nodes"] and not state["chunks"]
+
+        res = pack_load.incremental_finalize(   # 예외 없이 끝나야 한다
+            "없는-팩", graph, docs, _NoVec(), state,
+            set(), set(), set(), False, 0, 0)
+        assert res["doc_orphan_del"] == 0
+
+    def test_invariant_violation_pin_fires_when_candidates_outrun_the_denominator(
+            self, live, tmp_path):
+        """비었는데(bool 기준) 후보가 있으면(순회 기준) 불변식 위반으로 중단해야 한다.
+
+        `doc_del_candidates` 가 `doc_node_spaces` 의 부분집합이라는 불변식은 정상
+        입력으로는 절대 안 깨진다 — `_FalsyButNonEmptyDict` 로 `not doc_node_spaces`
+        와 `set(doc_node_spaces)` 를 인위적으로 갈라놓아야 이 핀이 발동한다.
+        """
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        state = dict(state)
+        state["doc_node_spaces"] = _FalsyButNonEmptyDict({"n1": {"resource"}})
+
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(   # bypack 은 비지 않게(0-item 핀 회피), n1 은 안 담아 후보로 남긴다
+                "pack-1", graph, docs, _NoVec(), state,
+                {"다른-노드"}, set(), set(), False, 1, 0)
+        assert "불변식 위반" in str(ei.value), str(ei.value)
+
+
+class TestDocAxisDenominatorAndMutationGuards:
+    """G5 — doc 30% 핀 분모(노드 수 vs 행 수) 픽스처 + 별건 변형 3건 겨냥 테스트.
+
+    분모 픽스처는 노드 축·doc 축의 분모를 **의도적으로 다르게** 만들어(노드 10개
+    중 3개만 doc_node_spaces 에 남기고 그 3개에 총 5행을 분산) 같은 후보 집합이
+    노드 수 분모로는 33.3%(발동)를, 행 수 분모로는 20%(미발동)를 낸다 — 이 조합은
+    `incremental_finalize` 가 분모를 노드 수 대신 행 수로 재는 변이를 그대로 잡는다
+    (`SystemExit` 를 기대하는데 변이 하에서는 안 나므로 즉시 red).
+    """
+
+    def _seed_nodes(self, builder, tmp_path, ids, pack="pack-1"):
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id=i) for i in ids])
+        pack_load.load_nodes(pack, f, builder, {})
+
+    def test_doc_axis_denominator_is_node_count_and_fires_at_thirty_three_percent(
+            self, live, tmp_path):
+        builder, graph, docs = live
+        ids = [f"n{i}" for i in range(10)]
+        self._seed_nodes(builder, tmp_path, ids)
+        for nid in ids[3:]:                     # 7개는 doc 행을 지워 노드 분모를 3으로 좁힌다
+            docs.delete_node_doc("resource", nid)
+        # n1·n2 에 legacy space 행을 더해 물리 행 합을 5로 벌린다(노드 분모 3과 다른 값) —
+        # 행 수 분모였다면 1/5=20%(미발동)가 됐을 조합이다.
+        docs.upsert_node_doc("subject", "Agent", "n1", {"pack_id": "pack-1"})
+        docs.upsert_node_doc("subject", "Agent", "n2", {"pack_id": "pack-1"})
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert set(state["doc_node_spaces"]) == {"n0", "n1", "n2"}, (
+            f"전제: doc_node_spaces 가 3개 노드여야 한다: {set(state['doc_node_spaces'])}")
+        total_rows = sum(len(v) for v in state["doc_node_spaces"].values())
+        assert total_rows == 5, f"전제: 물리 행 합이 5여야 한다(노드 분모 3과 달라야 함): {total_rows}"
+
+        keep = set(ids) - {"n0"}                # 노드·doc 후보 둘 다 n0 하나뿐
+        node_ratio = 1 / 10
+        chunk_ratio = 0 / max(1, len(state["chunks"]))
+        assert node_ratio < 0.30 and chunk_ratio < 0.30, (
+            "전제(자기 단언): 노드·청크 축은 30% 미만이어야 doc 축만 걸린다")
+
+        with pytest.raises(SystemExit) as ei:
+            pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                keep, set(), set(), False, len(keep), 0)
+        assert str(ei.value) == _expect_doc_ratio_msg("pack-1", 1, 3), str(ei.value)
+
+    def test_doc_axis_exactly_thirty_percent_with_asymmetric_denominator_is_not_aborted(
+            self, live, tmp_path):
+        """doc 축 분모(10)가 노드 축 분모(20)와 **다른 채로** 정확히 0.30 경계를
+        걸어야, `>` 를 `>=` 로 바꾸는 변이와 분모를 다른 값으로 바꾸는 변이를
+        동시에 잡는다. 타 축(<30%) 도 함께 자기 단언한다."""
+        builder, graph, docs = live
+        ids = [f"n{i}" for i in range(20)]
+        self._seed_nodes(builder, tmp_path, ids)
+        for nid in ids[10:]:                    # 10개는 doc 행을 지워 doc 분모를 10으로 좁힌다
+            docs.delete_node_doc("resource", nid)
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert set(state["doc_node_spaces"]) == set(ids[:10]), (
+            f"전제: doc_node_spaces 가 10개 노드여야 한다: {set(state['doc_node_spaces'])}")
+
+        candidates = {"n0", "n1", "n2"}          # doc 분모 10 중 3 = 정확히 0.30
+        keep = set(ids) - candidates
+        node_ratio = len(candidates) / 20
+        chunk_ratio = 0 / max(1, len(state["chunks"]))
+        assert node_ratio < 0.30, f"전제(자기 단언): 노드 축은 30% 미만이어야 한다: {node_ratio}"
+        assert chunk_ratio < 0.30
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            keep, set(), set(), False, len(keep), 0)
+        assert res["doc_orphan_del"] == 3, (
+            f"doc 축 정확히 30%(분모 10)는 핀에 걸리면 안 된다: {res}")
+
+    def test_load_nodes_incremental_doc_node_spaces_has_no_default(self):
+        """`doc_node_spaces` 는 필수 인자다(기본값이 없다) — 기본값 `None` 이 되살아나면
+        호출자가 안 넘겨도 예외 없이 F4-c 정리가 조용히 꺼진다(load.py 독스트링,
+        "한동안 기본값 None 으로 받아 생략을 허용했는데...조용히 꺼진다")."""
+        params = inspect.signature(pack_load.load_nodes_incremental).parameters
+        assert params["doc_node_spaces"].default is inspect.Parameter.empty, (
+            "doc_node_spaces 에 기본값이 생겼다 — 필수 인자 계약이 깨졌다")
+
+    def test_doc_node_spaces_reconcile_predicate_is_pack_id_only_not_four_key(
+            self, live, tmp_path):
+        """`live_pack_state` 의 doc_node_spaces 대사(reconcile) 술어는 `pack_id`
+        단일 키다(F4-b) — `delete_pack` 의 회수(4키: pack_id/source/source_id/pack)
+        와 폭이 다르다. 4키로 넓히면 `pack` 으로만 태그된 행(pack_id 없음)이 후보에
+        섞여, 그래프는 안 바뀌었는데 doc 만 지워지는 새 비대칭이 생긴다."""
+        builder, graph, docs = live
+        docs.upsert_node_doc("resource", "Document", "n-legacy-pack-tag-only",
+                              {"pack": "pack-1"})   # pack_id 없음, legacy pack 필드만
+        doc_node_spaces = pack_load.live_pack_state(
+            "pack-1", graph, docs, _NoVec())["doc_node_spaces"]
+        assert "n-legacy-pack-tag-only" not in doc_node_spaces, (
+            "legacy pack 필드만 있는 doc 행이 doc_node_spaces 후보에 들어왔다 — "
+            "대사 술어가 pack_id 단일 키에서 4키로 넓어진 것으로 의심된다")
+
+
+class TestDocOrphanDeleteFalseIsNotCounted:
+    def test_delete_node_doc_returning_false_does_not_increment_doc_orphan_del(
+            self, live, tmp_path, monkeypatch):
+        """`delete_node_doc` 이 실제로는 못 지웠다는 뜻인 `False` 를 돌려주면
+        `doc_orphan_del` 이 오르면 안 된다 — 그래프 축의 `delete_node`/`False` 계약
+        (`TestDeleteNodeFalseIsNotCounted`)과 같은 요구를 doc 축에도 건다."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        docs.upsert_node_doc("resource", "Document", "orphan-1", {"pack_id": "pack-1"})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert "orphan-1" in state["doc_node_spaces"]
+
+        monkeypatch.setattr(docs, "delete_node_doc", lambda *a, **kw: False)
+
+        res = pack_load.incremental_finalize(
+            "pack-1", graph, docs, _NoVec(), state,
+            {"n1"}, set(), set(), True, 1, 0)
+        assert res["doc_orphan_del"] == 0, (
+            "delete_node_doc 가 False 를 돌려줬는데 doc_orphan_del 을 세었다 — "
+            f"실제로는 안 지워졌는데 지웠다고 보고한다 (res={res})")
 
 
 class TestDeleteNodeFalseIsNotCounted:
@@ -1659,3 +2757,67 @@ class TestDeleteNodeFalseIsNotCounted:
         assert node_del == 0, (
             "delete_node 가 False 를 돌려줬는데 delete_pack 의 node_del 을 세었다 "
             f"(실제 {node_del})")
+
+
+class TestLoadLogsInsteadOfSwallowing:
+    """G4-7 — load.py 안 두 곳의 무로그 삼킴을 `log.warning` 으로 바꿨다(예외는
+    여전히 흡수해 적재를 안 죽이지만, 이제 기록은 남는다). `caplog` 로 주입한
+    예외 메시지가 실제로 로그에 도달하는지 확인한다.
+    """
+
+    def test_stale_typed_doc_delete_failure_is_logged_not_silently_swallowed(
+            self, live, tmp_path, monkeypatch, caplog):
+        """`load_nodes_incremental` 의 타입 변경 구 doc 삭제(load.py:604)가 실패하면
+        예전엔 `except Exception: pass` 로 조용히 삼켰다 — 이제 `log.warning` 이다.
+
+        `doc_node_spaces={}` 로 넘겨 F4-c(`_cleanup_stale_doc_spaces`)의 자체
+        `delete_node_doc` 호출을 비활성화하고, 이 지점(stale_typed 정리) 하나만
+        격리한다(이 파일의 기존 관례 — `TestFailedAddNodeLeavesOldTypedRowIntact` 도
+        마지막 인자로 `{}` 를 쓴다).
+        """
+        builder, graph, docs = live
+        nf1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Document", space="resource")])
+        pack_load.load_nodes("pack-1", nf1, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        def _boom(*a, **kw):
+            raise RuntimeError("주입된 doc 삭제 실패")
+        monkeypatch.setattr(docs, "delete_node_doc", _boom)
+
+        nf2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        with caplog.at_level("WARNING", logger="opencrab.pack.load"):
+            n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+                "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {})
+        assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
+            n_new, n_chg, n_same, skip, err)
+        assert any("주입된 doc 삭제 실패" in r.getMessage() for r in caplog.records), (
+            "타입 변경 구 doc 삭제 실패가 로그에 안 남았다: "
+            f"{[r.getMessage() for r in caplog.records]}")
+
+    def test_node_deletion_failure_in_incremental_finalize_is_logged_and_continues(
+            self, live, tmp_path, monkeypatch, caplog):
+        """`incremental_finalize` 의 노드 삭제 루프(load.py 약 1031행)가 예외를
+        던지면 예전엔 `except Exception: deleted = False` 로 조용히 삼켰다 —
+        이제 `log.warning` 을 남기고 다음 노드로 계속한다(삭제는 여전히 실패로
+        취급 — `node_del` 이 오르면 안 된다)."""
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", nf, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        def _boom(*a, **kw):
+            raise RuntimeError("주입된 노드 삭제 실패")
+        monkeypatch.setattr(graph, "delete_node", _boom)
+
+        with caplog.at_level("WARNING", logger="opencrab.pack.load"):
+            res = pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVec(), state,
+                {"무관-id"}, set(), set(), True, 0, 0)
+        assert res["node_del"] == 0, (
+            "노드 삭제가 예외를 던졌는데 node_del 을 세었다 — "
+            f"실제로는 안 지워졌는데 지웠다고 보고한다: {res}")
+        assert any("주입된 노드 삭제 실패" in r.getMessage() for r in caplog.records), (
+            "노드 삭제 실패가 로그에 안 남았다: "
+            f"{[r.getMessage() for r in caplog.records]}")
