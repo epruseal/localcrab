@@ -580,8 +580,9 @@ def pack_create(
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
-    from opencrab.ontology.builder import store_write_failures
+    from opencrab.ontology.builder import store_write_failures, store_write_succeeded
     from opencrab.packs.registry import create_pack as _register_pack
+    from opencrab.packs.registry import delete_pack_row
 
     principal = current_principal()
     tenant_id = "default"
@@ -596,7 +597,7 @@ def pack_create(
     # is now the single authority for "is this slug taken". A collision is
     # NEVER reported as an error (#143 invariant 7 — that would tell the
     # caller someone else already owns the exact slug they guessed): the
-    # registry quietly appends "-2", "-3", ... instead, so `slug` below may
+    # registry quietly appends a random suffix instead, so `slug` below may
     # differ from the caller's requested pack_id. The actually-assigned
     # pack_id is always in the response.
     try:
@@ -611,6 +612,8 @@ def pack_create(
         return {"error": f"pack registration failed: {exc}"}
 
     anchor_node_id = f"dataset:{slug}"
+    anchor_result: dict[str, Any] | None = None
+    anchor_exc: Exception | None = None
     try:
         anchor_result = ctx["builder"].add_node(
             space="resource",
@@ -625,25 +628,51 @@ def pack_create(
             subject_id=subject_id,
         )
     except Exception as exc:
-        return {"error": f"anchor node failed: {exc}"}
+        anchor_exc = exc
 
     # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
     # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
-    # inside the returned stores map. store_write_failures already applies
-    # the one place-to-judge rule (graph is system of record, docs/sql/vector
-    # are optional) — reuse that split here instead of re-deciding it:
-    #   - graph itself failed -> the pack doesn't exist in the graph, hard
-    #     error (matches the "anchor missing = no pack" contract below).
-    #   - only optional stores failed -> the pack DOES exist (graph write
-    #     went through), so report success and surface which stores lagged,
-    #     same as _ingest_into_pack's node/edge loops do via node_errors.
+    # inside the returned stores map. graph is the system of record (the
+    # "anchor missing = no pack" contract), so the positive
+    # store_write_succeeded() check is the single source of truth for
+    # whether the anchor actually landed -- not just "no error reported".
     anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
-    anchor_failures = store_write_failures(anchor_stores or {})
-    anchor_graph_failures = [f for f in anchor_failures if f.startswith("graph:")]
-    if anchor_graph_failures:
-        return {"error": "anchor node failed: " + "; ".join(anchor_graph_failures)}
-    # Anything left here is optional-store-only (graph already ruled out above).
-    anchor_optional_failures = anchor_failures
+    graph_landed = anchor_exc is None and store_write_succeeded(anchor_stores or {}, "graph")
+
+    if not graph_landed:
+        # The registry row created above now points at an anchor that
+        # doesn't exist -- a phantom pack. Compensate by deleting that row
+        # (#146 follow-up #170: this undoes ONLY the registry insert, never
+        # any store the anchor write itself may have partially landed in;
+        # once graph.add_node has actually succeeded this branch is
+        # unreachable, so there is nothing to undo past this point).
+        if anchor_exc is not None:
+            error_msg = f"anchor node failed: {anchor_exc}"
+        else:
+            graph_failures = [
+                f for f in store_write_failures(anchor_stores or {}) if f.startswith("graph:")
+            ]
+            error_msg = "anchor node failed: " + (
+                "; ".join(graph_failures) or "graph write did not succeed"
+            )
+        try:
+            deleted = delete_pack_row(ctx["sql"], slug, subject_id)
+            if not deleted:
+                logger.warning(
+                    "pack_create compensating delete found no matching row "
+                    "(pack_id=%s owner=%s)",
+                    slug, subject_id,
+                )
+        except Exception as del_exc:
+            logger.warning(
+                "pack_create compensating delete failed (pack_id=%s owner=%s): %s",
+                slug, subject_id, del_exc,
+            )
+        return {"error": error_msg}
+
+    # Graph landed -> the pack really exists. Anything left here is
+    # optional-store-only (graph already confirmed above).
+    anchor_optional_failures = store_write_failures(anchor_stores or {})
 
     source_id: str | None = None
     if text:

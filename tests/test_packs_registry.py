@@ -408,12 +408,17 @@ class TestSetVisibility:
 
 
 def _base_ctx(sql, **overrides):
+    builder = MagicMock()
+    # pack_create's compensating-delete branch (#146 A) requires positive
+    # confirmation the anchor write landed in graph -- a bare MagicMock()
+    # return isn't a dict, so store_write_succeeded() would read it as "no".
+    builder.add_node.return_value = {"stores": {"graph": "ok"}}
     ctx = {
         "neo4j": MagicMock(),
         "chroma": MagicMock(),
         "mongo": MagicMock(),
         "sql": sql,
-        "builder": MagicMock(),
+        "builder": builder,
         "rebac": MagicMock(),
         "impact": MagicMock(),
         "hybrid": MagicMock(),

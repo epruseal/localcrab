@@ -190,6 +190,30 @@ def create_pack(
     raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
 
 
+def delete_pack_row(sql: Any, pack_id: str, owner_id: str) -> bool:
+    """Delete ONE row from the ``packs`` registry table -- ``pack_id`` AND
+    ``owner_id`` must both match (an owner can only ever remove their own
+    row; this is not a general admin delete). Returns True iff a row was
+    actually removed.
+
+    Registry row only -- does NOT touch any graph/doc/sql/vector content
+    tagged with this pack_id. Currently used only as ``pack_create``'s
+    compensating delete when the anchor node it just registered a slug for
+    fails to actually land in the graph (#146, follow-up #170): a
+    registry row with no anchor would be a phantom pack. A full
+    ``pack_delete`` (removing content too) is a separate, not-yet-built
+    tool.
+    """
+    from sqlalchemy import text
+
+    with sql._engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM packs WHERE pack_id = :pid AND owner_id = :oid"),
+            {"pid": pack_id, "oid": owner_id},
+        )
+        return result.rowcount > 0
+
+
 def readable_pack_ids(sql: Any, principal: Principal) -> set[str]:
     """``{owner_id = principal} ∪ {visibility != 'private'}`` (#143
     invariant 3). Always a concrete set -- there is no way to call this
