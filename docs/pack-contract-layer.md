@@ -43,6 +43,36 @@
 
 이 계층은 호출자(어느 리포에서 이 패키지를 쓰든)의 저장 디렉터리 레이아웃이나 보유한 팩 목록을 모른다. 파일 경로는 항상 호출자가 인자로 넘긴다. `opencrab/pack/__init__.py`는 이 원칙에 따라 가벼운 모듈(`assembler`, `cloud`, `neo4j_export`)만 재노출하고, 스토어·임베딩 의존이 무거운 `load`/`gates`는 최상위로 끌어오지 않는다 — 필요한 쪽이 하위 모듈을 직접 import한다.
 
+## 호출자가 반드시 아는 계약 — `jsonl_io.py`
+
+### `shard_paths`는 "모르는 shard 이름"을 조용히 무시하지 않는다
+
+두 자리(`00`~`99`) zero-pad 밖의 숫자 꼬리(`.100`, 유니코드 숫자 등)나 `.gz` 인접 파일
+(`{stem}{suffix}.gz`, `{stem}.NN{suffix}.gz`)을 만나면 `RuntimeError`로 죽는다. 이 스킴이
+읽을 줄 모르는 형태의 파일이 조용히 "부재"로 읽히는 것을 막는 설계다 — base+shard 공존을
+막는 기존 loud-fail(위 모듈 지도 참고)과 같은 이유다.
+
+발견은 `scandir` + 정규식 한 벌로 한다(`glob`이 아니다) — `Path.glob`은 stem에 `[`·`*`
+같은 메타문자가 있으면 실재하는 shard를 못 찾는다. 발견은 넓게(`\d+`, 유니코드 숫자
+포함) 잡고 지원 판정은 좁게(ASCII `[0-9]{2}` fullmatch) 하므로, 두 자리 밖 숫자는
+"발견됐지만 이 스킴은 지원 안 함"으로 갈린다 — 못 찾아서 안전한 것과 찾았는데 거부하는
+것은 다른 안전성이다.
+
+`_shard_path`의 shard 개수 상한 검사(`idx >= _MAX_SHARDS`)는 `assert`가 아니라
+`raise RuntimeError`다 — `python -O`로 실행되는 프로세스에서도 사라지지 않는다.
+
+재현:
+```
+PYTHONPATH=<이 리포> python -c "
+from opencrab.pack.jsonl_io import shard_paths
+from pathlib import Path
+Path('/tmp/probe.100.jsonl').write_text('{}')
+shard_paths(Path('/tmp/probe.jsonl'))"   # RuntimeError: 지원 밖 shard 이름 발견
+```
+
+pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass`·
+`TestOptimizedModeDoesNotDisableTheGuard`.
+
 ## 호출자가 반드시 아는 계약 — `load.py`
 
 이 셋은 **틀리면 조용히 망가진다**. 예외도 안 나고 수치만 거짓이 된다.
@@ -141,6 +171,26 @@ Python 술어와 SQL 조각을 같은 정의에서 낸다. 두 벌로 두면 갈
 재현: 같은 node_id 격자(`dataset:` · `DATASET:` · `DaTaSeT:` · `created_by` 없음)를 두 구현에
 태워 판정이 일치하는지 본다.
 
+### 5. `_vec_meta_update`의 chroma 분기는 delete+add **치환**이다
+
+chromadb의 `update`/`upsert`는 메타데이터를 **병합**한다(겹치는 키만 갱신, 그 외 키는
+존속) — 실측(2026-08-12, chromadb 1.5.7, `EphemeralClient`). 청크 스키마가 줄어들어
+없어진 옛 메타 키(스테일 키)를 지우려면 병합이 아니라 치환이 필요해서, 이 분기는
+`delete`+`add`로 레코드를 처음부터 다시 짓는다.
+
+URI가 붙은 레코드(`uris` API로 만들어진 레코드 — 이 시스템은 그런 레코드를 생산하지
+않는다)는 **치환하지 않는다.** 외부 기록으로 보고 `False`를 돌려 호출자가 upsert
+병합으로 우회하게 한다. 치환 후에는 4축을 검증한다 — ID 동일성, 메타 정확 일치, 문서
+일치, 임베딩 존재·차원·허용오차(상대+절대 `1e-6`) 값 비교. 하나라도 어긋나면 `False`
+(재임베딩으로 우회).
+
+**닫지 않은 창**: `delete`가 실패하고 호출자가 upsert로 우회하면, 겹치는 메타 키는
+갱신되지만 그 외 스테일 키는 살아남는다(병합이므로). 이 창은 `localcrab#175`로
+위임돼 있다 — `_vec_meta_update`가 닫는 범위가 아니다.
+
+재현: `tests/test_pack_load.py`의 `TestVecMetaUpdateChromaReplace`(결함주입
+`_FakeChromaCollection`으로 get/delete/add 각 실패 축과 후검증 축을 개별로 확인).
+
 ### 왜 "세는 집합"과 "지키는 집합"이 다른가
 
 `ok` 카운터는 *이번 실행이 실제로 저장한 수*이고, `applied_edges`·`bypack_ids` 는
@@ -173,6 +223,57 @@ Python 술어와 SQL 조각을 같은 정의에서 낸다. 두 벌로 두면 갈
 원본에 이미 있던 **0건 핀**(by-pack 이 비었는데 라이브에 데이터가 있으면 중단)과
 **비율 핀**(삭제 후보 비율 초과 시 중단)은 성격이 다르다 — 그것들은 "입력 자체가 수상하다"를
 보는 것이고 그대로 남아 있다.
+
+## 호출자가 반드시 아는 계약 — `gates/score.py`
+
+### 소스 커버리지(3번 항목)는 `document_id` 검증형 폴백을 쓴다
+
+청크의 `source`가 결측(`None`)이거나 빈 문자열이면 **절대 그대로 계수하지 않는다.**
+그 청크에 `document_id`가 있고 그 값이 실제 resource 노드 id 집합(`res_ids`)에 있을
+때만 그 resource를 폴백으로 계수한다. `document_id`가 무관한(어느 resource도 아닌)
+값이면 여전히 미계수다 — 검증 없는 폴백은 합성 반례(무관 `document_id`)에서 0점이어야
+할 팩에 점수를 준다.
+
+`source`가 있는 청크는(값이 무엇이든) 이 폴백과 무관하게 종전처럼 그대로 계수된다 —
+폴백은 **source 결측(빈 문자열 포함)일 때만** 켜진다. `source` 문자열이 우연히
+resource id와 같으면 같은 원소로 뭉쳐 dedup이 **과소** 방향으로만 틀어진다(과다
+계수는 없다).
+
+측정(2026-08-12, `by-pack` 129팩 전수 재채점 — `grade_pack` 대상은 그 중 128팩뿐이다,
+아래 "129/128 구분" 참고):
+
+| 팩 | 이전 | 이후 |
+|---|---|---|
+| claude | 68 | 88 |
+| codex | 71 | 90 |
+| fable-mac | 71 | 91 |
+| fable-rpi | 73 | 93 |
+| openclaw | 71 | 91 |
+
+이 5팩만 바뀌었다. 나머지 123팩은 diff 0.
+
+재현(이 커밋의 `score.py`와 임의 이전 커밋을 대조):
+```
+PYTHONPATH=<이 리포> python -c "
+from pathlib import Path
+from opencrab.pack.gates.score import grade_pack
+root = Path('<by-pack 경로>')
+for d in sorted(root.iterdir()):
+    if d.is_dir():
+        r = grade_pack(d)
+        if r: print(d.name, r['total'])"
+```
+이전 버전과 대조하려면 `git show <이전 커밋>:opencrab/pack/gates/score.py`를 별도
+모듈로 로드해 같은 순회를 두 번 돌리고 `total`을 비교한다.
+
+pytest 대상: `tests/test_pack_gates_score.py`의 `TestSourceCoverageResourceFallback`.
+
+### 129/128 구분
+
+`by-pack`에는 팩 디렉터리가 129개 있지만 `grade_pack`이 판정을 내는 것은 128개뿐이다
+— `honda-parts-vision`은 `nodes.jsonl`이 없어 `grade_pack`이 `None`을 돌려준다
+(`None`은 "검사 불가"이지 "0점"이 아니다, `TestMissingNodesFileIsNotAVerdict` 참고).
+"128팩 전수"라는 표현이 이 문서·커밋 메시지에 나오면 이 1건이 빠진 수라는 뜻이다.
 
 ## 검출력 측정 — 계약 테스트가 실제로 무엇을 잡는가
 
