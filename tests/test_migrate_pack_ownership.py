@@ -279,6 +279,126 @@ class TestApply:
 
 
 # ---------------------------------------------------------------------------
+# _ensure_default_pack owner-mismatch guard (#146 M P1-3)
+# ---------------------------------------------------------------------------
+
+
+def _packs_snapshot(sql) -> list[tuple]:
+    from sqlalchemy import text
+
+    with sql._engine.connect() as conn:
+        return sorted(tuple(r) for r in conn.execute(text("SELECT pack_id, owner_id FROM packs")).fetchall())
+
+
+def _graph_doc_snapshot(env):
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    graph = LocalGraphStore(str(env / "graph.db"))
+    try:
+        nodes = sorted(
+            (n, graph.get_node("Entity", n).get("pack_id")) for n in ("packless-1", "packless-2")
+        )
+    finally:
+        graph.close()
+    docs = LocalSQLDocStore(str(env / "doc_store.db"))
+    try:
+        packless_doc = docs.get_node_doc("concept", "packless-doc")["properties"].get("pack_id")
+    finally:
+        docs.close()
+    return nodes, packless_doc
+
+
+class TestDefaultPackOwnerMismatch:
+    """gate R1: a pre-existing ``default`` row owned by someone OTHER than
+    the bootstrap owner aborts (rc 1) in BOTH dry-run and --apply, with the
+    registry/graph/doc state provably unchanged before vs. after."""
+
+    def test_dry_run_and_apply_both_abort_state_unchanged(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack
+        from opencrab.stores.factory import make_sql_store
+
+        _seed_graph(env)
+        _seed_doc(env)
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
+
+        before_packs = _packs_snapshot(sql)
+        before_data = _graph_doc_snapshot(env)
+
+        rc_dry = migrate.main([])
+        assert rc_dry == 1
+        assert _packs_snapshot(sql) == before_packs
+        assert _graph_doc_snapshot(env) == before_data
+
+        rc_apply = migrate.main(["--apply", "--skip-backup"])
+        assert rc_apply == 1
+        assert _packs_snapshot(sql) == before_packs
+        assert _graph_doc_snapshot(env) == before_data
+
+    def test_dry_run_aborts_even_with_zero_unattributed_legacy_data(self, bootstrapped_owner, env):
+        """clean-DB policy: no packless data at all still aborts -- the
+        reserved-identity invariant matters going forward, not just for
+        today's row count."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
+
+        assert migrate.main([]) == 1
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
+
+    def test_error_message_names_reserved_identity_and_resolution_steps(
+        self, bootstrapped_owner, env, capsys
+    ):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
+        err = capsys.readouterr().err
+        assert "reserved catch-all identity" in err
+        assert "renaming/transferring" in err or "re-bootstrapping" in err
+
+
+class TestDefaultPackOwnerMatchesBootstrap:
+    """gate R2: a pre-existing ``default`` row owned by the SAME bootstrap
+    owner is reused normally -- rc unaffected, and legacy data is actually
+    attributed to it with that owner intact."""
+
+    def test_apply_reuses_default_and_attributes_legacy_data(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack, get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(
+            sql, migrate.DEFAULT_PACK_ID, bootstrapped_owner, "Pre-existing default", None, None
+        )
+        _seed_graph(env)
+        _seed_doc(env)
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        default = get_pack(sql, migrate.DEFAULT_PACK_ID)
+        assert default is not None
+        assert default["owner_id"] == bootstrapped_owner
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            assert graph.get_node("Entity", "packless-1")["pack_id"] == migrate.DEFAULT_PACK_ID
+        finally:
+            graph.close()
+
+
+# ---------------------------------------------------------------------------
 # Structured per-stage outcomes + exit codes (#146 M)
 # ---------------------------------------------------------------------------
 

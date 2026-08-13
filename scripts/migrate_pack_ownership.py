@@ -163,11 +163,41 @@ def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> tuple[str, boo
     """Returns ``(DEFAULT_PACK_ID, was_pending)`` -- ``was_pending`` is True
     when the default pack row did NOT already exist at the start of this
     call (dry-run or --apply alike), so callers can tell "nothing to do"
-    from "found something" without re-querying."""
+    from "found something" without re-querying.
+
+    Raises ``RuntimeError`` -- unconditionally, dry-run and --apply alike,
+    and regardless of whether there is any unattributed legacy data to
+    migrate right now -- when a ``default`` row already exists but is owned
+    by someone other than ``owner_id`` (#146 M P1-3). ``default`` is the
+    reserved catch-all identity #147's read-path scoping and #148's
+    pack-less-write default both resolve to; silently reusing whoever
+    already squats that slug would hand them every unattributed legacy row
+    (a privilege escalation), and even a "no legacy data today" run would
+    leave the reserved-identity invariant broken for every pack-less write
+    that comes after it. This migration never auto-renames or auto-steals
+    the row -- an operator decision, not a script's, per SAFETY above.
+    """
     from opencrab.pack.ownership import _insert_pack, get_pack
 
     existing = get_pack(sql, DEFAULT_PACK_ID)
     if existing is not None:
+        if existing["owner_id"] != owner_id:
+            raise RuntimeError(
+                f"default pack {DEFAULT_PACK_ID!r} is already registered to "
+                f"owner {existing['owner_id']!r}, not the bootstrap owner "
+                f"{owner_id!r}. 'default' is the reserved catch-all identity "
+                "every pack-less write resolves to (#147 read-path scoping, "
+                "#148 pack-less-write default) -- reusing someone else's row "
+                "here would hand them every unattributed legacy row. This "
+                "aborts even when there is no legacy data to attribute right "
+                "now, because the reserved-identity invariant must hold "
+                "going forward regardless of today's row count. Resolve by "
+                "renaming/transferring the squatting pack away from "
+                f"{DEFAULT_PACK_ID!r}, or by confirming its current owner is "
+                "genuinely meant to be the catch-all identity and "
+                "re-bootstrapping the local user to match -- then re-run "
+                "this script."
+            )
         print(f"  default pack {DEFAULT_PACK_ID!r} already registered (owner={existing['owner_id']})")
         return DEFAULT_PACK_ID, False
     print(f"  default pack {DEFAULT_PACK_ID!r} not yet registered")
