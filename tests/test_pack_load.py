@@ -2499,11 +2499,20 @@ class TestPackLiveCountsIsTheSingleSourceOfTruth:
         assert pack_load.COUNT_SQL_ARGC["docs"] == 2, (
             "docs 는 pack_name 을 두 번 받는다 — argc 가 틀리면 조용히 잘못 센다")
 
-        # 함수가 그 문자열을 **실제로 쓰는가**. 상수만 맞고 본문이 딴 쿼리를 쓰면 무의미하다.
+        # 함수가 그 정본을 **실제로 쓰는가**. 상수만 맞고 본문이 딴 쿼리를 쓰면 무의미하다.
+        #
+        # [Δ r11 P1, #142 재리뷰] `pack_live_counts` 자신은 이제 레거시 qmark
+        # `COUNT_SQL[...]` 을 직접 실행하지 않는다 — PG 스토어(`_conn` 이 메서드,
+        # `?` 위치 파라미터 미지원)에서도 동작해야 하므로 `build_count_sql()`
+        # (named 플레이스홀더, 방언 중립)을 호출해 `_fetch_one` 으로 돌린다.
+        # `COUNT_SQL`(위에서 확인한 레거시 export)은 그 산출물에서 기계 파생된
+        # 것이라 두 벌이 아니다 — 이 단언은 "본문이 빌더를 거치는가·raw SQL
+        # 리터럴을 다시 안 적는가"로 갱신한다(원래 취지인 "인라인 중복 SQL
+        # 방지"는 그대로 유지).
         import inspect
 
         body = inspect.getsource(pack_load.pack_live_counts)
-        assert "COUNT_SQL[" in body, "정본 상수를 안 쓰고 쿼리를 다시 적었다"
+        assert "build_count_sql(" in body, "정본 빌더를 안 쓰고 쿼리를 다시 적었다"
         assert "FROM graph_nodes" not in body, "본문에 인라인 SQL 이 되살아났다"
 
 

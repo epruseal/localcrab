@@ -10,11 +10,18 @@
 진입점을 안 거치고 이 함수들을 직접 호출하는 경로에서 통째로 빠진다(실측: 그런 호출
 스크립트가 3종 있었다). 계약은 `tests/test_pack_load.py` 가 AST 로 건다.
 
-**스토어 private 속성 직접 접근이 21곳 있다**(`docs._conn` 12, `graph._conn` 6,
-`vec._collection` 2). 이관 전에는 패키지 밖에서의 접근이라 명백한 계약 위반이었고, 지금은
-패키지 안이라 형식적으로는 정당해졌다. 그러나 그것이 가리키는 사실은 그대로다 —
-스토어 protocol(`opencrab/stores/_graph_protocol.py`)에 삭제·카운트 API 가 없다.
-protocol 승격은 4백엔드 전부 구현을 요구하므로 별건으로 다룬다.
+**스토어 private `_conn` 속성 직접 접근은 0곳이다(r11 P1, #142 재리뷰).** 종전엔
+`graph._conn`/`docs._conn` 을 직접 열어 sqlite 방언 SQL(`?` 위치 파라미터·`json_extract`·
+`GLOB`)을 실행했다 — PG 스토어(`PGGraphStore`/`PgDocStore`)의 `_conn` 은 속성이 아니라
+`@contextmanager` **메서드**라 이 모듈은 PG 모드에서 전멸했다. 지금은 두 스토어가 이미
+노출하는 중립 훅(`_fetch_all`/`_fetch_one`/`_exec_write`(`:name` named 파라미터)·
+`_dialect.json_get`/`_table(...)`)만 거친다 — sqlite/PG 어느 쪽에서도 이 모듈은 `_conn` 을
+모른다. 재현: `tests/test_pack_load.py::TestNoRawConnAccess`(AST 스캔, vec 백엔드 판별용
+`getattr(vec, "_conn", None)` 1곳만 명시 예외).
+
+스토어 protocol(`opencrab/stores/_graph_protocol.py`)에는 여전히 삭제·카운트 API 가 없다 —
+그 사실 자체는 이번 전환으로 안 바뀐다. protocol 승격은 4백엔드 전부 구현을 요구하므로
+별건으로 다룬다.
 
 **`sys.exit` 가 `incremental_finalize` 안에 3곳 있다**(증분 삭제 안전핀). 라이브러리
 코드로서는 부적절하지만 이 커밋은 순수 이동이라 행동을 바꾸지 않는다. 예외로의 승격도 별건.
@@ -23,8 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
@@ -35,6 +44,7 @@ from opencrab.pack.normalize import (
     transform_chunk_meta,
     transform_node,
 )
+from opencrab.stores._sql_dialect import SQLITE, SqlDialect
 
 # 로거 이름은 `__name__` 이다. 이관 전에는 호출자 스크립트 파일명으로 고정돼 있었는데
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
@@ -49,20 +59,145 @@ log = logging.getLogger(__name__)
 STORE_INJECTED_KEYS = frozenset({"id", "space"})
 
 
-# 앵커 노드 판정(F4-a). `dataset:` 프리픽스 노드나 title-backfill 이 만든 노드는
-# graph 트윈이 없거나 있어도 삭제 후보에서 빼야 한다 — 이 판정을 두 곳(Python 술어,
-# SQL WHERE 조각)에서 각자 구현하면 갈린다. 실제로 종전엔 `incremental_finalize`
-# 지역 함수 하나뿐이었는데, F4-b 가 `live_pack_state`(모듈 함수, `incremental_finalize`
-# 밖)에서도 같은 판정이 필요해지면서 두 벌이 될 뻔했다.
+# ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
 #
-# SQL 쪽에 `LIKE` 를 쓰면 안 된다 — SQLite `LIKE` 는 ASCII 대소문자를 무시해서
-# `DATASET:x` 도 앵커로 잡는데 Python `str.startswith` 는 그 행을 안 잡는다.
-# 그러면 graph 축과 doc 축이 서로 다른 노드를 앵커로 보고 판정이 갈린다.
-# `GLOB` 은 대소문자를 구분해 Python 쪽과 일치한다.
-ANCHOR_SQL = (
-    "(node_id GLOB 'dataset:*'"
-    " OR COALESCE(json_extract(properties,'$.created_by'),'') = 'title-backfill')"
-)
+# 이 절 전체가 `_conn` 직접 접근·sqlite 전용 SQL 을 걷어내고 두 스토어가 이미
+# 노출하는 중립 훅(`_fetch_all`/`_fetch_one`/`_exec_write`(`:name`)·
+# `_dialect.json_get`/`_table`)으로 전환하는 자리다. `ANCHOR_SQL`/`COUNT_SQL`/
+# `COUNT_SQL_ARGC` 는 **레거시 export** 로 남는다(호출자 호환) — 지금은
+# `build_anchor_sql(SQLITE)`/`build_count_sql(SQLITE)` 산출물에서 기계 파생된다.
+
+
+def _json_str_eq(dialect: SqlDialect, col: str, key: str, param: str) -> str:
+    """JSON 필드의 **문자열 스칼라 전용** 등가 비교 — `col->key == :param`.
+
+    바닥 `json_extract`/`->>` 등가는 타입을 안 가린다(JSON 정수·불리언·복합값도
+    텍스트로 변환돼 매치될 수 있다). `pack_id`/`source` 는 실측상 전량 문자열이라
+    (129팩 대사, v6 검수 — 갈리는 사례 0건) 문자열 전용으로 좁혀도 행 집합이
+    바뀌지 않는다. sqlite `json_type=... AND json_extract=...` / PG
+    `jsonb_typeof=... AND ->>=...` — 두 형 모두 "이 키가 JSON 문자열이고 그 값이
+    param 과 같다"만 참으로 본다. 비문자열 `pack_id`(정의된 비지원, docstring)는
+    이 술어 아래서는 항상 거짓이다.
+    """
+    if dialect.name == "sqlite":
+        return (f"json_type({col}, '$.{key}') = 'text' AND "
+                f"json_extract({col}, '$.{key}') = :{param}")
+    return f"jsonb_typeof({col}->'{key}') = 'string' AND {col}->>'{key}' = :{param}"
+
+
+def _in_names(prefix: str, seq: list[str]) -> tuple[str, dict[str, str]]:
+    """`IN (...)` 목록을 named 플레이스홀더로 전개 — `_sql_graph_base.py:717-723`
+    의 `_SqlGraphStoreBase._in_placeholders`(스토어 정적 메서드)와 같은 형태다.
+    그 메서드는 스토어 인스턴스에 묶여 있어 load.py(호출자)에서 직접 재사용할
+    수 없다 — 이 지역 사본이 세 번째 사본으로 또 갈리지 않도록 출처를 여기 적는다.
+
+    빈 `seq` 는 `("", {})` 를 낸다 — 현재 호출 지점은 전부 `_batched(...)` 를 거쳐
+    도달하므로(`_batched([])` 는 배치를 하나도 안 낸다) 실행 시 이 분기에 닿지
+    않지만, PG 는 `IN ()` 을 문법 오류로 거부하므로(sqlite 도 마찬가지) 방어적으로
+    조기 반환한다.
+    """
+    if not seq:
+        return "", {}
+    names = [f"{prefix}{i}" for i in range(len(seq))]
+    return ", ".join(f":{n}" for n in names), dict(zip(names, seq, strict=True))
+
+
+def build_anchor_sql(dialect: SqlDialect) -> str:
+    """앵커 노드 판정(F4-a) SQL — **양성 술어**(호출부가 필요시 `AND NOT (...)` 로
+    감싼다. `_is_anchor_node` 의 SQL 쪽 정본, 두 방언에서 같은 판정을 낸다.
+
+    `dataset:` 프리픽스 노드나 title-backfill 이 만든 노드는 graph 트윈이 없거나
+    있어도 삭제 후보에서 빼야 한다 — 이 판정을 Python 술어(`_is_anchor_node`)와
+    SQL WHERE 조각에서 각자 구현하면 갈린다.
+
+    대소문자 함정: sqlite `LIKE` 는 ASCII 대소문자를 무시해서 `DATASET:x` 도
+    앵커로 잡는데 Python `str.startswith` 는 그 행을 안 잡는다 — 그러면 graph
+    축과 doc 축이 서로 다른 노드를 앵커로 본다. sqlite 는 `GLOB`(대소문자 구분)
+    을 쓴다. PG 의 `LIKE` 는 (sqlite 와 달리) 기본이 대소문자 구분이라 그대로
+    Python 쪽과 일치한다(v6 검수 실증: `text()` 바인드 오인 없음·이스케이프 정확).
+    """
+    created_by = dialect.json_get("properties", "created_by")
+    prefix_pred = "node_id GLOB 'dataset:*'" if dialect.name == "sqlite" else "node_id LIKE 'dataset:%'"
+    return f"({prefix_pred} OR COALESCE({created_by},'') = 'title-backfill')"
+
+
+def build_count_sql(
+    dialect: SqlDialect, *,
+    graph_table: Callable[[str], str] | None = None,
+    doc_table: Callable[[str], str] | None = None,
+) -> dict[str, str]:
+    """4축 대사 카운트 SQL(named 플레이스홀더, 문자열 전용 스칼라 정책) —
+    `pack_live_counts()` 의 정본. `graph_table`/`doc_table` 은 축별 테이블명
+    리졸버(기본 bare = 현행과 동일한 테이블명 — PG 는 `store._table` 을 넘겨
+    스키마 프리픽스를 받는다).
+
+    파라미터 이름은 **의도적으로 재사용**한다(`:pack` 이 한 쿼리 안에 여러 번
+    나올 수 있다) — sqlite3 named 스타일도 SQLAlchemy `text()` 도 같은 이름의
+    반복 바인드를 지원하므로 호출자는 `{"pack": pack_name}` 하나만 넘기면 된다.
+    """
+    gt = graph_table or (lambda n: n)
+    dt = doc_table or (lambda n: n)
+    node_pred = _json_str_eq(dialect, "properties", "pack_id", "pack")
+    edge_pred = _json_str_eq(dialect, "properties", "pack_id", "pack")
+    # docs 는 **두 형태**로 태그돼 있다(pack_id·source) — 한쪽만 세면 조용히
+    # 적게 나온다(실측: 5벌 사본 중 하나가 이 함정에 걸렸다, 2026-08-11).
+    doc_pred = (f"{_json_str_eq(dialect, 'metadata', 'pack_id', 'pack')}"
+                f" OR {_json_str_eq(dialect, 'metadata', 'source', 'pack')}")
+    return {
+        "nodes": f"SELECT COUNT(*) AS n FROM {gt('graph_nodes')} WHERE {node_pred}",
+        "edges": f"SELECT COUNT(*) AS n FROM {gt('graph_edges')} WHERE {edge_pred}",
+        "docs": f"SELECT COUNT(*) AS n FROM {dt('doc_sources')} WHERE {doc_pred}",
+    }
+
+
+def _as_json_dict(value) -> dict:
+    """JSON 컬럼 값 정규화(그래프/문서 축 공용). sqlite 는 TEXT 로, PG(jsonb) 는
+    드라이버가 이미 dict 로 디코드해 돌려준다 — 이 함수 하나가 양쪽을 받는다.
+    `None` 은 빈 dict(컬럼 기본값 `'{}'` 과 같은 의미)."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return dict(value)
+
+
+_NAMED_TOKEN_RE = re.compile(r":[A-Za-z_]\w*")
+
+
+def _assert_no_named_token_in_string_literals(sql: str) -> None:
+    """`:name` 토큰이 SQL 문자열 리터럴(작은따옴표 구간) 안에 있으면 아래
+    named→qmark 위치 전개가 리터럴 내용을 오염시킨다 — 그런 리터럴이 없는지
+    정적으로 확인한다(게이트 ⑨). 이 모듈이 생성하는 SQL 은 이스케이프된
+    작은따옴표를 쓰지 않으므로 단순 홀짝 분리로 충분하다.
+    """
+    parts = sql.split("'")
+    literals = parts[1::2]  # 홀수 인덱스가 따옴표로 감싸인 구간
+    for lit in literals:
+        assert not _NAMED_TOKEN_RE.search(lit), (
+            f"SQL 리터럴 안에 named 토큰이 있다 — named→qmark 전개가 리터럴을 깬다: {lit!r}")
+
+
+def _named_to_qmark(sql: str) -> tuple[str, int]:
+    """named(`:name`) 플레이스홀더를 qmark(`?`) 위치 파라미터로 전개 — 레거시
+    `COUNT_SQL` export 의 파생 규칙. ARGC 는 치환된 토큰 출현 수(같은 이름이
+    반복돼도 각 출현이 위치 파라미터 하나다)."""
+    _assert_no_named_token_in_string_literals(sql)
+    argc = 0
+
+    def _sub(_m: re.Match) -> str:
+        nonlocal argc
+        argc += 1
+        return "?"
+
+    return _NAMED_TOKEN_RE.sub(_sub, sql), argc
+
+
+# ── 앵커 SQL — sqlite 방언 산출물이 레거시 export다(과거 리터럴과 공백만 다르다:
+# `_dialect.json_get` 이 쉼표 뒤 공백을 낸다 — 의미는 동일, gate ④가 공백
+# 정규화로 확인한다).
+ANCHOR_SQL = build_anchor_sql(SQLITE)
 
 
 def _is_anchor_node(node_id: str, props: dict) -> bool:
@@ -84,23 +219,21 @@ def _batched(seq: list, size: int = 500):
         yield seq[i:i + size]
 
 
-# 4축 대사 쿼리 **문자열 정본**. `pack_live_counts()` 가 이것을 쓰고, 스토어 객체 없이
-# raw sqlite3 로 세는 호출자도 **같은 문자열**을 가져다 쓴다.
-#
-# 왜 함수만으로는 부족한가: 어떤 호출자는 `sqlite3.connect(..., mode=ro)` 로 파일을 직접
-# 열어 센다(스토어 객체를 안 만든다). 그런 자리는 함수를 못 부르므로 쿼리를 손으로
-# 베끼게 되고, 실제로 그렇게 **5벌**이 됐다. 그중 하나는 이미 정본과 갈려 있었다 —
-# `doc_sources` 를 `pack_id` 로만 세고 `OR ... $.source` 를 빠뜨려, 그 형태로 태그된
-# 행을 통째로 못 셌다(실측: 5건 중 3건 누락, 2026-08-11 적대 검증).
-COUNT_SQL: dict[str, str] = {
-    "nodes": "SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack_id')=?",
-    "edges": "SELECT COUNT(*) FROM graph_edges WHERE json_extract(properties,'$.pack_id')=?",
-    # doc_sources 는 **두 형태**로 태그돼 있다. 한쪽만 세면 조용히 적게 나온다.
-    "docs": ("SELECT COUNT(*) FROM doc_sources WHERE json_extract(metadata,'$.pack_id')=?"
-             " OR json_extract(metadata,'$.source')=?"),
-}
-# 파라미터 개수가 쿼리마다 다르다 — docs 만 pack_name 을 두 번 받는다.
-COUNT_SQL_ARGC: dict[str, int] = {"nodes": 1, "edges": 1, "docs": 2}
+# 4축 대사 쿼리 **레거시 qmark export**. `pack_live_counts()` 자신은 이제
+# `build_count_sql()` 의 named-플레이스홀더 산출물을 `_fetch_one` 으로 실행한다
+# (아래 정의) — 이 딕셔너리는 스토어 객체 없이 raw sqlite3 로 세는 호출자용
+# 하위호환이다(그런 호출자는 `sqlite3.connect(..., mode=ro)` 로 파일을 직접 열어
+# 스토어 훅을 못 쓴다). `build_count_sql(SQLITE)` 산출물에서 named→qmark 로
+# **기계 파생**한다 — 손으로 두 벌을 유지하지 않는다(과거 5벌 사본 중 하나가
+# `$.source` 절을 빠뜨려 그 형태로 태그된 행을 통째로 못 셌다, 2026-08-11 적대
+# 검증). 행 집합은 `build_count_sql` 과 동일(문자열 전용 스칼라 정책은 양쪽 다
+# 적용) — 리터럴 텍스트는 과거 손으로 쓴 버전과 다르다(정상, 파생 규칙 산출물).
+_COUNT_SQL_NAMED = build_count_sql(SQLITE)
+COUNT_SQL: dict[str, str] = {}
+COUNT_SQL_ARGC: dict[str, int] = {}
+for _axis, _sql in _COUNT_SQL_NAMED.items():
+    COUNT_SQL[_axis], COUNT_SQL_ARGC[_axis] = _named_to_qmark(_sql)
+del _axis, _sql, _COUNT_SQL_NAMED
 
 
 def _vec_backend(vec):
@@ -215,6 +348,25 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     return False
 
 
+# graph/doc 두 축이 이 모듈의 SQL 진입점(`pack_live_counts`·`delete_pack`·
+# `live_pack_state`)에 필요로 하는 훅 세트. graph 축엔 `_row_get` 이 없다
+# (`_sql_graph_base.py` 의 계약 — 위치 접근이 정착 관례).
+_GRAPH_SQL_HOOKS = ("_table", "_fetch_all", "_fetch_one", "_exec_write")
+_DOC_SQL_HOOKS = ("_table", "_fetch_all", "_fetch_one", "_exec_write", "_row_get")
+
+
+def _require_sql_hooks(store, hooks: tuple[str, ...], label: str) -> None:
+    """비SQL 스토어(예: Kuzu — `_conn` 은 있으나 이 훅 세트가 없다)는 이 모듈의
+    적재/회수 진입점을 쓸 수 없다. 예전엔 그런 스토어로 부르면 `_conn` 없는
+    속성 접근이 `AttributeError` 로 죽었다 — 원인이 모호했다. 여기서 명시적으로
+    거부해 무엇이 왜 안 되는지 말한다."""
+    missing = [h for h in hooks if not hasattr(store, h)]
+    if missing:
+        raise NotImplementedError(
+            f"pack 적재/회수는 SQL 계열 graph/doc 스토어 전용입니다"
+            f"({label} 이 {', '.join(missing)} 훅이 없습니다: {type(store).__name__})")
+
+
 def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
     """팩 하나의 **라이브 4축 카운트**. 적재 전후 대사의 정본이다.
 
@@ -237,10 +389,19 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
     없으면(백엔드 미지원·미가용) `None` 을 돌려준다. **`0` 과 `None` 은 다른
     사실이다** — `0` 은 "세어보니 없다", `None` 은 "셀 방법이 없어 모른다"다.
     이 둘을 섞으면 "벡터 0건"이라는 잘못된 결론이 조용히 보고서에 남는다.
+
+    graph/doc SQL 은 `build_count_sql()`(named 플레이스홀더, 방언 중립)을
+    `_fetch_one` 으로 실행한다 — sqlite/PG 어느 쪽에서도 `_conn` 을 직접 열지
+    않는다(r11 P1). graph 축은 SELECT 컬럼이 COUNT 하나뿐이라 위치 접근(`[0]`)
+    이고, doc 축은 `_row_get` 로 읽는다(두 축의 기존 관례 그대로).
     """
-    g = graph._conn.execute(COUNT_SQL["nodes"], (pack_name,)).fetchone()[0]
-    e = graph._conn.execute(COUNT_SQL["edges"], (pack_name,)).fetchone()[0]
-    d = docs._conn.execute(COUNT_SQL["docs"], (pack_name,) * COUNT_SQL_ARGC["docs"]).fetchone()[0]
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
+    graph_sql = build_count_sql(graph._dialect, graph_table=graph._table)
+    doc_sql = build_count_sql(docs._dialect, doc_table=docs._table)
+    g = graph._fetch_one(graph_sql["nodes"], {"pack": pack_name})[0]
+    e = graph._fetch_one(graph_sql["edges"], {"pack": pack_name})[0]
+    d = docs._row_get(docs._fetch_one(doc_sql["docs"], {"pack": pack_name}), "n")
 
     v: int | None
     kind, handle, table = _vec_backend(vec)
@@ -268,6 +429,8 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
 def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)"""
     require_live_data("delete_pack")
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
     node_del = 0
 
     # ── graph_nodes: pack_id == pack_name 인 노드 조회 ──────────────────
@@ -290,15 +453,16 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     #     `pack` 을 갱신 안 해 생기는 stale alias 를 오히려 회수 술어가 보게 만든다.
     # 대사(reconcile) 술어(COUNT_SQL·live_pack_state)와 폭이 다른 것은 의도다 —
     # `docs/pack-contract-layer.md` 의 회수/대사 분리 서술과 일치시킨다.
-    rows = graph._conn.execute(
-        """
-        SELECT node_type, node_id,
-               COALESCE(json_extract(properties, '$.space'), 'concept') as space
-        FROM graph_nodes
-        WHERE json_extract(properties, '$.pack_id') = ?
+    space_expr = graph._dialect.json_get("properties", "space")
+    node_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
+    rows = graph._fetch_all(
+        f"""
+        SELECT node_type, node_id, COALESCE({space_expr}, 'concept') AS space
+        FROM {graph._table('graph_nodes')}
+        WHERE {node_pack_pred}
         """,
-        (pack_name,),
-    ).fetchall()
+        {"pack": pack_name},
+    )
 
     for node_type, node_id, space in rows:
         # delete_node: 노드 + 관련 엣지 cascade. bool을 돌려준다(_sql_graph_base.py
@@ -322,48 +486,56 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
     # 위 graph_nodes 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
     # source/source_id/pack 제외 근거를 그대로 적용한다).
-    dn_rows = docs._conn.execute(
-        """
-        SELECT space, node_id FROM doc_nodes
-        WHERE json_extract(properties, '$.pack_id') = ?
-        """,
-        (pack_name,),
-    ).fetchall()
-    doc_node_extra_del = 0
-    for space, node_id in dn_rows:
-        cur = docs._conn.execute(
-            "DELETE FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
-        )
-        doc_node_extra_del += cur.rowcount
-    docs._conn.commit()
+    # 조회 후 행별 삭제 대신 **집합 단위 DELETE 1문장** — 삭제 집합이 바로 위
+    # graph_nodes 조회와 동일한 술어(`$.pack_id`)이므로 rowcount 가 행별 삭제
+    # 총합과 등가다(게이트 ⑪, 실측 대조로 확인). 조회를 유지할 이유가 없다.
+    dn_pack_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+    doc_node_extra_del = docs._exec_write(
+        f"DELETE FROM {docs._table('doc_nodes')} WHERE {dn_pack_pred}",
+        {"pack": pack_name},
+    )
     node_del += doc_node_extra_del
 
     # ── doc_sources (청크): metadata.source == pack_name 또는 metadata.pack_id == pack_name
     # (실제 레코드는 source가 아니라 pack_id 필드에만 팩 식별자를 갖는 경우가 있음)
-    src_rows = docs._conn.execute(
-        "SELECT source_id FROM doc_sources WHERE json_extract(metadata, '$.source') = ?"
-        " OR json_extract(metadata, '$.pack_id') = ?",
-        (pack_name, pack_name),
-    ).fetchall()
-    src_ids = [r[0] for r in src_rows]
+    src_pred = (f"{_json_str_eq(docs._dialect, 'metadata', 'source', 'pack')}"
+                f" OR {_json_str_eq(docs._dialect, 'metadata', 'pack_id', 'pack')}")
+    src_rows = docs._fetch_all(
+        f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
+        {"pack": pack_name},
+    )
+    src_ids = [docs._row_get(r, "source_id") for r in src_rows]
 
+    doc_sources_table = docs._table("doc_sources")
     chunk_sql_del = 0
     fts_del = 0
     for batch in _batched(src_ids):
-        placeholders = ",".join("?" * len(batch))
-        cur = docs._conn.execute(
-            f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
+        placeholders, in_params = _in_names("sid", batch)
+        if not placeholders:                          # 도달 불가(위 주석) — 방어
+            continue
+        chunk_sql_del += docs._exec_write(
+            f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
+            in_params,
         )
-        chunk_sql_del += cur.rowcount
-        # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨)
-        try:
-            cur2 = docs._conn.execute(
-                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
-            )
-            fts_del += cur2.rowcount
-        except Exception as exc:
-            log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
-    docs._conn.commit()
+        # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨).
+        # [Δ r11 P1] sqlite 전용 방언 게이트만 신설 — 순서(doc_sources 삭제 뒤
+        # FTS 삭제)와 삭제 실패의 warning-삼킴은 **현행 그대로 유지**한다(FTS-first
+        # 로 뒤집지 않는다). 근거: 고아 FTS 행은 `keyword_search`(doc_sources
+        # 와 INNER JOIN, local_sql_doc_store.py:293)에서 안 보여 무해하고, 같은
+        # source_id 가 재적재되면 `upsert_source` 의 DELETE+INSERT 가 자가
+        # 치유한다(v6 검수 실측: orphan 상태 검색 결과 미포함·재업서트 후 fts
+        # 행 1). 전량 회수는 재실행으로 안 되고(별건, 대사 스윕 필요) —
+        # `_init_db` 의 n_fts==0 백필 가드(local_sql_doc_store.py:131)가 이
+        # 고아를 건드리는 유일한 비-JOIN 소비처다(그 가드는 "FTS 가 통째로
+        # 비어 있을 때"만 발동하므로 부분 고아는 못 건드린다).
+        if docs._dialect.name == "sqlite":
+            try:
+                fts_del += docs._exec_write(
+                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
+                    in_params,
+                )
+            except Exception as exc:
+                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 벡터 삭제: SqliteVecStore(KURE, pack_id 컬럼) 우선, Chroma(_collection) 폴백 ──
     chunk_vec_del = 0
@@ -408,49 +580,60 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
 
 
 def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
-    """증분 대조용 라이브 상태 로드 (delete_pack과 동일한 접근 관례: graph._conn/docs._conn).
+    """증분 대조용 라이브 상태 로드 (delete_pack과 동일한 접근 관례: 방언 중립 훅
+    — `_fetch_all`/`_dialect.json_get`/`_table`, `_conn` 직접 접근 없음).
 
     반환 dict:
       nodes: {node_id: (node_type, space_id, props_dict)}
       chunks: {source_id: (text, metadata_dict)}
       edges: {(from_id, relation, to_id), ...}
       vec_ids: {node_id, ...}
-      doc_node_spaces: {node_id: {space, ...}} — doc_nodes 축 대사용(F4). 이미 이
-        함수가 `docs._conn` 을 쥐고 있으므로(위 doc_sources 조회) 같은 커넥션으로
-        모은다. 앵커는 뺀다 — 앵커는 삭제 후보가 아니므로 대사 대상도 아니다.
+      doc_node_spaces: {node_id: {space, ...}} — doc_nodes 축 대사용(F4). doc 축
+        쿼리들은 각자 `docs._fetch_all` 로 독립 호출한다(PG 는 매 호출이 단명
+        커넥션 — sqlite 처럼 하나의 커넥션을 계속 쥐고 있지 않는다). 앵커는
+        뺀다 — 앵커는 삭제 후보가 아니므로 대사 대상도 아니다.
     """
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
+
+    node_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
     nodes: dict[str, tuple[str, str, dict]] = {}
-    for node_type, node_id, space_id, properties in graph._conn.execute(
-        """
+    for node_type, node_id, space_id, properties in graph._fetch_all(
+        f"""
         SELECT node_type, node_id, space_id, properties
-        FROM graph_nodes
-        WHERE json_extract(properties, '$.pack_id') = ?
+        FROM {graph._table('graph_nodes')}
+        WHERE {node_pred}
         """,
-        (pack_name,),
-    ).fetchall():
-        nodes[node_id] = (node_type, space_id, json.loads(properties))
+        {"pack": pack_name},
+    ):
+        nodes[node_id] = (node_type, space_id, _as_json_dict(properties))
 
+    chunk_pred = (f"{_json_str_eq(docs._dialect, 'metadata', 'pack_id', 'pack')}"
+                  f" OR {_json_str_eq(docs._dialect, 'metadata', 'source', 'pack')}")
     chunks: dict[str, tuple[str, dict]] = {}
-    for source_id, text, metadata in docs._conn.execute(
-        """
+    for row in docs._fetch_all(
+        f"""
         SELECT source_id, text, metadata
-        FROM doc_sources
-        WHERE json_extract(metadata, '$.pack_id') = ?
-           OR json_extract(metadata, '$.source') = ?
+        FROM {docs._table('doc_sources')}
+        WHERE {chunk_pred}
         """,
-        (pack_name, pack_name),
-    ).fetchall():
-        chunks[source_id] = (text, json.loads(metadata))
+        {"pack": pack_name},
+    ):
+        source_id = docs._row_get(row, "source_id")
+        text = docs._row_get(row, "text")
+        metadata = docs._row_get(row, "metadata")
+        chunks[source_id] = (text, _as_json_dict(metadata))
 
+    edge_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
     edges: set[tuple[str, str, str]] = set()
-    for from_id, relation, to_id in graph._conn.execute(
-        """
+    for from_id, relation, to_id in graph._fetch_all(
+        f"""
         SELECT from_id, relation, to_id
-        FROM graph_edges
-        WHERE json_extract(properties, '$.pack_id') = ?
+        FROM {graph._table('graph_edges')}
+        WHERE {edge_pred}
         """,
-        (pack_name,),
-    ).fetchall():
+        {"pack": pack_name},
+    ):
         edges.add((from_id, relation, to_id))
 
     vec_ids: set[str] = set()
@@ -484,16 +667,20 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     # doc_node_spaces (F4-b): 노드축 **대사(reconcile)** 술어(pack_id 단일 키) —
     # 위 nodes 조회와 동일한 폭이다. 회수(4키) 술어를 쓰면 `pack` 으로만 태그된
     # 행의 doc 은 지워지고 graph 는 남아 새 비대칭이 생긴다.
+    dn_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+    anchor_sql = build_anchor_sql(docs._dialect)
     doc_node_spaces: dict[str, set[str]] = {}
-    for node_id, space in docs._conn.execute(
+    for row in docs._fetch_all(
         f"""
         SELECT node_id, space
-        FROM doc_nodes
-        WHERE json_extract(properties, '$.pack_id') = ?
-          AND NOT {ANCHOR_SQL}
+        FROM {docs._table('doc_nodes')}
+        WHERE {dn_pred}
+          AND NOT {anchor_sql}
         """,
-        (pack_name,),
-    ).fetchall():
+        {"pack": pack_name},
+    ):
+        node_id = docs._row_get(row, "node_id")
+        space = docs._row_get(row, "space")
         doc_node_spaces.setdefault(node_id, set()).add(space)
 
     return {
@@ -819,20 +1006,29 @@ def load_chunks(
     b_metas: list[dict] = []
 
     def flush_single(sid: str, txt: str, meta: dict) -> bool:
-        """청크 1건 upsert. 성공 시 True."""
+        """청크 1건 upsert. 성공 시 True — **doc 쓰기까지 성공해야** True다.
+
+        [Δ r11 P2, #142 재리뷰] 종전엔 `docs.upsert_source` 실패를 통째로
+        삼켰다(`except Exception: pass`) — 벡터는 써졌는데 doc(BM25 색인·앵커
+        판정의 근거)만 결손 나도 `ok` 가 올라 호출자가 실패를 알 방법이 없었다.
+        이제 doc 쓰기 실패는 err 로 세고 청크 ID 와 함께 경고를 남긴다 — 그
+        청크는 doc_sources 기준선이 안 움직이므로 다음 증분이 재시도한다.
+        """
         nonlocal ok, err
         try:
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
-            try:
-                docs.upsert_source(sid, txt, meta)
-            except Exception:
-                pass
-            ok += 1
-            return True
         except Exception as exc2:
             err += 1
             log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc2)
             return False
+        try:
+            docs.upsert_source(sid, txt, meta)
+        except Exception as exc3:
+            err += 1
+            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+            return False
+        ok += 1
+        return True
 
     def flush() -> None:
         nonlocal ok, err
@@ -840,17 +1036,23 @@ def load_chunks(
             return
         try:
             vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
-            for sid, txt, meta in zip(b_ids, b_texts, b_metas):
-                try:
-                    docs.upsert_source(sid, txt, meta)
-                except Exception:
-                    pass
-            ok += len(b_texts)
         except Exception as exc:
             # 배치 실패 시 건별 재시도 (1건 결함이 배치 전체를 날리지 않게)
             log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
             for sid, txt, meta in zip(b_ids, b_texts, b_metas):
                 flush_single(sid, txt, meta)
+        else:
+            # [Δ r11 P2] doc 쓰기 실패를 더 이상 삼키지 않는다 — flush_single 과
+            # 같은 계약(벡터 성공 + doc 성공이어야 ok).
+            doc_failed = 0
+            for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                try:
+                    docs.upsert_source(sid, txt, meta)
+                except Exception as exc3:
+                    doc_failed += 1
+                    err += 1
+                    log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+            ok += len(b_texts) - doc_failed
         b_texts.clear()
         b_ids.clear()
         b_metas.clear()
@@ -895,43 +1097,50 @@ def load_chunks_incremental(
     b_kinds: list[str]  = []      # "new" | "txt" — flush 후 c_new/c_txt 반영용
 
     def flush_single(sid: str, txt: str, meta: dict, kind: str) -> None:
-        """청크 1건 upsert(재임베딩). 성공 시 kind에 따라 c_new/c_txt 반영."""
+        """청크 1건 upsert(재임베딩). doc 쓰기까지 성공해야 kind 에 따라
+        c_new/c_txt 반영한다(불변식 ①, [Δ r11 P2] — 형제 `flush()` 와 동일)."""
         nonlocal c_new, c_txt, err
         try:
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
-            try:
-                docs.upsert_source(sid, txt, meta)
-            except Exception:
-                pass
-            if kind == "new":
-                c_new += 1
-            else:
-                c_txt += 1
         except Exception as exc2:
             err += 1
             log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc2)
+            return
+        try:
+            docs.upsert_source(sid, txt, meta)
+        except Exception as exc3:
+            err += 1
+            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+            return
+        if kind == "new":
+            c_new += 1
+        else:
+            c_txt += 1
 
     def flush() -> None:
-        nonlocal c_new, c_txt
+        nonlocal c_new, c_txt, err
         if not b_texts:
             return
         try:
             vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
-            for sid, txt, meta in zip(b_ids, b_texts, b_metas):
-                try:
-                    docs.upsert_source(sid, txt, meta)
-                except Exception:
-                    pass
-            for kind in b_kinds:
-                if kind == "new":
-                    c_new += 1
-                else:
-                    c_txt += 1
         except Exception as exc:
             # 배치 실패 시 건별 재시도 (1건 결함이 배치 전체를 날리지 않게)
             log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
             for sid, txt, meta, kind in zip(b_ids, b_texts, b_metas, b_kinds):
                 flush_single(sid, txt, meta, kind)
+        else:
+            # [Δ r11 P2] doc 쓰기 실패를 더 이상 삼키지 않는다.
+            for sid, txt, meta, kind in zip(b_ids, b_texts, b_metas, b_kinds):
+                try:
+                    docs.upsert_source(sid, txt, meta)
+                except Exception as exc3:
+                    err += 1
+                    log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+                    continue
+                if kind == "new":
+                    c_new += 1
+                else:
+                    c_txt += 1
         b_texts.clear()
         b_ids.clear()
         b_metas.clear()
@@ -1013,6 +1222,8 @@ def incremental_finalize(
            "doc_orphan_del":…}
     """
     require_live_data("incremental_finalize")
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
     live_nodes  = live["nodes"]
     live_chunks = live["chunks"]
     live_edges  = live["edges"]
@@ -1108,22 +1319,29 @@ def incremental_finalize(
 
     # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
     chunk_del_list = list(chunk_del_candidates)
+    doc_sources_table = docs._table("doc_sources")
     for batch in _batched(chunk_del_list):
-        placeholders = ",".join("?" * len(batch))
+        placeholders, in_params = _in_names("cid", batch)
+        if not placeholders:                          # 도달 불가 — 방어(위 _in_names 주석)
+            continue
         try:
-            cur = docs._conn.execute(
-                f"DELETE FROM doc_sources WHERE source_id IN ({placeholders})", batch
+            chunk_del += docs._exec_write(
+                f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
+                in_params,
             )
-            chunk_del += cur.rowcount
         except Exception as exc:
             log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-        try:
-            docs._conn.execute(
-                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})", batch
-            )
-        except Exception as exc:
-            log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
-    docs._conn.commit()
+        # [Δ r11 P1] delete_pack 과 동일 — sqlite 전용 방언 게이트만, 순서·삼킴은
+        # 현행 유지(고아 FTS 는 keyword_search INNER JOIN 기준 무해, 재적재가
+        # 자가 치유 — 위 delete_pack 의 상세 주석 참고).
+        if docs._dialect.name == "sqlite":
+            try:
+                docs._exec_write(
+                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
+                    in_params,
+                )
+            except Exception as exc:
+                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
     if chunk_del_list:
         # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
         # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
@@ -1146,19 +1364,22 @@ def incremental_finalize(
         stale_edges = set()
     else:
         stale_edges = live_edges - applied_edges
+    # per-edge `_exec_write` 유지(집합화 안 함) — 스테일 엣지는 평시 소량이고,
+    # 아래 rowcount 이중 계상 방지 계약이 행 단위 카운트에 걸려 있다. 대량
+    # 스테일 시 row-value IN 배치가 업그레이드 경로다(한계, 별건 — v6 검수).
+    edges_table = graph._table("graph_edges")
+    edge_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
     for (f_id, r, t_id) in stale_edges:
         try:
-            cur = graph._conn.execute(
-                "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?"
-                " AND json_extract(properties,'$.pack_id')=?",
-                (f_id, r, t_id, pack_name),
-            )
             # rowcount로 센다 — 무조건 +=1이면 노드 삭제의 cascade가 이미 지운
             # 엣지까지 여기서 다시 세어 **이중 계상**한다.
-            edge_del += cur.rowcount
+            edge_del += graph._exec_write(
+                f"DELETE FROM {edges_table} WHERE from_id=:f AND relation=:r AND to_id=:t"
+                f" AND {edge_pack_pred}",
+                {"f": f_id, "r": r, "t": t_id, "pack": pack_name},
+            )
         except Exception as exc:
             log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
-    graph._conn.commit()
 
     # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
     # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
