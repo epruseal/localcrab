@@ -30,16 +30,20 @@ _REMOTE = Principal(user_id="remote-1", is_local=False, disabled=False)
 
 
 class TestToolsForPrincipal:
-    def test_local_principal_sees_all_16(self):
+    def test_local_principal_sees_the_whole_registry(self):
+        """Derived from _REGISTRY rather than a hardcoded count -- #146's
+        pack_publish made the literal-16 version stale, and any future
+        tool would do it again. The invariant is "local sees everything",
+        not any particular size."""
         with principal_scope(_LOCAL):
             names = {t["name"] for t in tools_for_principal(current_principal())}
-        assert len(names) == 16
+        assert names == set(_REGISTRY)
         assert _ADMIN_TOOL_NAMES <= names
 
     def test_remote_principal_does_not_see_admin_tools(self):
         with principal_scope(_REMOTE):
             names = {t["name"] for t in tools_for_principal(current_principal())}
-        assert len(names) == 13
+        assert names == set(_REGISTRY) - _ADMIN_TOOL_NAMES
         assert names.isdisjoint(_ADMIN_TOOL_NAMES)
 
     def test_remote_list_is_a_strict_subset_of_local_list(self):

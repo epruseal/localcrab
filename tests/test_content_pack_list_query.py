@@ -28,7 +28,7 @@ _PRINCIPAL = Principal(user_id="u1", is_local=True, disabled=False)
 
 
 def _reg(pack_id, title="", description="", owner_id="u1", visibility="private"):
-    """A ``list_packs_for`` row shape (opencrab.packs.registry._row_to_dict)."""
+    """A ``list_packs_for`` row shape (opencrab.pack.ownership._row_to_dict)."""
     return {
         "pack_id": pack_id,
         "owner_id": owner_id,
@@ -76,7 +76,7 @@ def _call(
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
-        patch("opencrab.packs.registry.list_packs_for") as mock_list_for,
+        patch("opencrab.pack.ownership.list_packs_for") as mock_list_for,
     ):
         mock_ctx.return_value = _ctx(_graph(agg_rows, available=graph_available, raises=graph_raises))
         mock_reg.return_value = list(manifest)
@@ -238,7 +238,7 @@ def test_manifest_registry_is_loaded_once_per_call():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
-        patch("opencrab.packs.registry.list_packs_for") as mock_list_for,
+        patch("opencrab.pack.ownership.list_packs_for") as mock_list_for,
     ):
         mock_ctx.return_value = _ctx(_graph(agg))
         mock_reg.return_value = []
@@ -254,7 +254,7 @@ def test_manifest_failure_degrades_to_graph_only():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
-        patch("opencrab.packs.registry.list_packs_for") as mock_list_for,
+        patch("opencrab.pack.ownership.list_packs_for") as mock_list_for,
     ):
         mock_ctx.return_value = _ctx(_graph(agg))
         mock_reg.side_effect = OSError("boom")
@@ -313,7 +313,7 @@ def test_min_nodes_filters_against_registry_candidates_not_the_store_call():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
-        patch("opencrab.packs.registry.list_packs_for") as mock_list_for,
+        patch("opencrab.pack.ownership.list_packs_for") as mock_list_for,
     ):
         mock_ctx.return_value = _ctx(graph)
         mock_reg.return_value = []
@@ -396,7 +396,7 @@ def test_list_packs_for_called_with_real_principal_and_sql():
     with (
         patch("opencrab.mcp.tools._get_context") as mock_ctx,
         patch("opencrab.ontology.pack_registry.load_pack_registry") as mock_reg,
-        patch("opencrab.packs.registry.list_packs_for") as mock_list_for,
+        patch("opencrab.pack.ownership.list_packs_for") as mock_list_for,
     ):
         mock_ctx.return_value = {"neo4j": _graph([_agg("p1", 1)]), "sql": sql_sentinel}
         mock_reg.return_value = []

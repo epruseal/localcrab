@@ -67,7 +67,7 @@ def _writable_ctx(pack_id, owner="test-user", **overrides):
     registry row for ``pack_id`` owned by ``owner`` -- #146 D: pack_ingest's
     existence/ownership check is ``assert_writable`` against the real
     ``packs`` table now, not a mocked ``content_pack_list()``."""
-    from opencrab.packs.registry import create_pack as _register_pack
+    from opencrab.pack.ownership import create_pack as _register_pack
     from opencrab.stores.sql_store import SQLStore
 
     sql = SQLStore("sqlite:///:memory:")
@@ -82,7 +82,7 @@ def _writable_ctx(pack_id, owner="test-user", **overrides):
 
 
 def _reg_row(pack_id, title="", description=""):
-    """A ``list_packs_for`` row shape (opencrab.packs.registry._row_to_dict)
+    """A ``list_packs_for`` row shape (opencrab.pack.ownership._row_to_dict)
     -- see tests/test_content_pack_list_query.py for the full query/ranking
     contract; this module's tests only cover the plumbing (title-stripping,
     fallback, the #146 registry-is-the-source join)."""
@@ -107,7 +107,7 @@ class TestContentPackList:
         ]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("biomed")]),
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("biomed")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list(min_nodes=1)
@@ -124,7 +124,7 @@ class TestContentPackList:
         graph.list_packs.return_value = [{"pack_id": "p1", "node_count": 2, "sample_title": ""}]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("p1")]),
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("p1")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
@@ -142,7 +142,7 @@ class TestContentPackList:
         ]
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("mine")]),
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("mine")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
@@ -157,7 +157,7 @@ class TestContentPackList:
         graph.available = False
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.packs.registry.list_packs_for", return_value=[_reg_row("mine")]),
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("mine")]),
         ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
@@ -688,7 +688,7 @@ class TestPackCreate:
         someone else owns that exact slug). See tests/test_packs_registry.py
         for the full registry-level collision/ownership contract."""
         from opencrab.auth import Principal, principal_scope
-        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.pack.ownership import create_pack as _register_pack
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
@@ -901,7 +901,7 @@ class TestPackCreateCompensatingDelete:
         return SQLStore("sqlite:///:memory:")
 
     def test_a1_anchor_exception_deletes_compensating_registry_row(self):
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -919,7 +919,7 @@ class TestPackCreateCompensatingDelete:
     def test_a2i_graph_available_write_failed_deletes_compensating_registry_row(self):
         """graph available but the write reports an "error: ..." status
         (not raised) -- same compensation as the exception path."""
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -939,7 +939,7 @@ class TestPackCreateCompensatingDelete:
     def test_a2ii_graph_unavailable_deletes_compensating_registry_row(self):
         """graph unavailable is also "did not land", distinct from an
         "error: ..." status but compensated the same way."""
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -961,7 +961,7 @@ class TestPackCreateCompensatingDelete:
         unreachable -- an optional-store-only failure (docs here) must
         leave the registry row in place, never compensate-delete a pack
         that really exists."""
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -985,7 +985,7 @@ class TestPackCreateCompensatingDelete:
         B) whose anchor then fails -- the compensating delete must remove
         only Bob's own row, never touch Alice's, in either creation order."""
         from opencrab.auth import Principal, principal_scope
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         # Order 1: Alice succeeds first, then Bob's attempt fails & compensates.
         sql = self._sql()
@@ -1051,7 +1051,7 @@ class TestPackCreateCompensatingDelete:
         orphaned registry row can be found operationally."""
         import logging
 
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1060,7 +1060,7 @@ class TestPackCreateCompensatingDelete:
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
             patch(
-                "opencrab.packs.registry.delete_pack_row",
+                "opencrab.pack.ownership.delete_pack_row",
                 side_effect=RuntimeError("db exploded"),
             ),
             caplog.at_level(logging.WARNING),

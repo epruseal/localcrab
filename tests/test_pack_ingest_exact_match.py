@@ -15,7 +15,7 @@ import pytest
 
 from opencrab.auth import Principal
 from opencrab.mcp.tools import pack_ingest
-from opencrab.packs.registry import create_pack, set_visibility
+from opencrab.pack.ownership import create_pack, set_visibility
 from opencrab.stores.sql_store import SQLStore
 
 # #145: pack_create/pack_ingest now call current_principal() internally;

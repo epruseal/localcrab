@@ -549,7 +549,7 @@ class TestToolDispatch:
     def test_pack_ingest_text_creates_evidence_node(self):
         """pack_ingest with text materialises an evidence/TextUnit node via builder.add_node."""
         from opencrab.mcp.tools import dispatch_tool
-        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.pack.ownership import create_pack as _register_pack
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
@@ -605,7 +605,7 @@ class TestToolDispatch:
     def test_pack_ingest_text_as_node_false_legacy(self):
         """pack_ingest with text_as_node=False uses legacy vector-only path."""
         from opencrab.mcp.tools import dispatch_tool
-        from opencrab.packs.registry import create_pack as _register_pack
+        from opencrab.pack.ownership import create_pack as _register_pack
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")

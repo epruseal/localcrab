@@ -124,7 +124,7 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
     the ``assume_pack_id`` default) also gets a registry row -- a fresh
     ``graph.list_packs()`` call here sees whatever the backfill step just
     wrote (in --apply mode) or would have found unchanged (dry-run)."""
-    from opencrab.packs.registry import _insert_pack
+    from opencrab.pack.ownership import _insert_pack
 
     if not getattr(graph, "available", False):
         print("  graph store unavailable -- skipping pack-id enumeration")
@@ -164,7 +164,7 @@ def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> tuple[str, boo
     when the default pack row did NOT already exist at the start of this
     call (dry-run or --apply alike), so callers can tell "nothing to do"
     from "found something" without re-querying."""
-    from opencrab.packs.registry import _insert_pack, get_pack
+    from opencrab.pack.ownership import _insert_pack, get_pack
 
     existing = get_pack(sql, DEFAULT_PACK_ID)
     if existing is not None:

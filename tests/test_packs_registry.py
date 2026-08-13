@@ -1,4 +1,4 @@
-"""opencrab.packs.registry (#146, execution 3 of #143) + the MCP tools that
+"""opencrab.pack.ownership (#146, execution 3 of #143) + the MCP tools that
 build on it: pack_create's slug-collision handling and the new pack_publish
 tool.
 
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from opencrab.auth import Principal, create_user, principal_scope
-from opencrab.packs.registry import (
+from opencrab.pack.ownership import (
     PackForbiddenError,
     PackNotFoundError,
     _insert_pack,
@@ -98,7 +98,7 @@ class TestCreatePack:
         """B1: forces the exact retry path -- first candidate taken, the
         very next random draw succeeds -- and pins that _insert_pack is
         called exactly twice (no sequential attempts in between)."""
-        import opencrab.packs.registry as registry_mod
+        import opencrab.pack.ownership as registry_mod
 
         create_pack(sql, alice, "coffee")
         monkeypatch.setattr(registry_mod.secrets, "token_hex", lambda n: "aaaa0000")
@@ -124,7 +124,7 @@ class TestCreatePack:
         RuntimeError, and the registry ends up with no new row for the
         failed call (only the pre-seeded "coffee" and "coffee-deadbeef"
         rows exist)."""
-        import opencrab.packs.registry as registry_mod
+        import opencrab.pack.ownership as registry_mod
 
         create_pack(sql, alice, "coffee")
         create_pack(sql, alice, "coffee-deadbeef")  # pre-occupy every future random candidate
@@ -242,7 +242,7 @@ class TestInsertPackClassification:
         from sqlalchemy import text
         from sqlalchemy.exc import IntegrityError
 
-        import opencrab.packs.registry as registry_mod
+        import opencrab.pack.ownership as registry_mod
 
         # sql's engine uses SQLAlchemy's SingletonThreadPool for
         # sqlite:///:memory: (one physical connection per thread, reused

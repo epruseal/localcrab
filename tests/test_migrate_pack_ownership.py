@@ -110,7 +110,7 @@ class TestDryRun:
         assert migrate.main([]) == 0
 
         from opencrab.config import get_settings
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
@@ -152,7 +152,7 @@ class TestApply:
         assert rc == 0
 
         from opencrab.config import get_settings
-        from opencrab.packs.registry import get_pack
+        from opencrab.pack.ownership import get_pack
         from opencrab.stores.factory import make_sql_store
         from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore

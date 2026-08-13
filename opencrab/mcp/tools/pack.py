@@ -371,7 +371,7 @@ def content_pack_list(
     List content packs the caller can see, per the ``packs`` ownership/
     visibility registry.
 
-    #146: the registry (``opencrab.packs.registry.list_packs_for`` — the
+    #146: the registry (``opencrab.pack.ownership.list_packs_for`` — the
     caller's own packs plus every non-private one, #143 invariant 3) is now
     the SOURCE of this list, not ``graph.list_packs()``'s node-count
     aggregation (#143 acceptance criteria: "graph.list_packs()를 팩 목록의
@@ -421,7 +421,7 @@ def content_pack_list(
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
-    from opencrab.packs.registry import list_packs_for
+    from opencrab.pack.ownership import list_packs_for
 
     ctx = _get_context()
     graph = ctx["neo4j"]
@@ -651,8 +651,8 @@ def pack_create(
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
-    from opencrab.packs.registry import create_pack as _register_pack
-    from opencrab.packs.registry import delete_pack_row
+    from opencrab.pack.ownership import create_pack as _register_pack
+    from opencrab.pack.ownership import delete_pack_row
 
     principal = current_principal()
     tenant_id = "default"
@@ -888,7 +888,7 @@ def pack_ingest(
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
-    from opencrab.packs.registry import PackForbiddenError, PackNotFoundError, assert_writable
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, assert_writable
 
     principal = current_principal()
     tenant_id = "default"
@@ -977,6 +977,10 @@ def pack_ingest(
         },
     },
     order=16,
+    # WRITE, not ADMIN: publishing is an owner-scoped operation on the
+    # caller's own pack (assert_writable gates it) -- remote principals
+    # must be able to publish what they own (#150's tier semantics).
+    access=AccessTier.WRITE,
     writes=True,
 )
 def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
@@ -995,8 +999,8 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
-    from opencrab.packs.registry import PackForbiddenError, PackNotFoundError
-    from opencrab.packs.registry import set_visibility as _set_visibility
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError
+    from opencrab.pack.ownership import set_visibility as _set_visibility
 
     ctx = _get_context()
     principal = current_principal()
