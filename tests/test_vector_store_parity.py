@@ -69,6 +69,19 @@ class TestVectorStoreContract:
         assert store.count() == 1
         assert store.get_by_id("x")["document"] == "world"
 
+    def test_upsert_replaces_metadata_not_merges(self, store):
+        """[#175] upsert_texts on an existing id must fully REPLACE
+        document+metadata, not merge the new metadata into the old — a stale
+        key dropped by the caller's canonical transform must not survive.
+        (chromadb's native upsert()/update() merge; this store's contract is
+        replace, matching sqlite-vec's DELETE+INSERT and pgvector's
+        ON CONFLICT DO UPDATE SET metadata = EXCLUDED.metadata.)"""
+        store.upsert_texts(texts=["v1"], metadatas=[{"old": "1", "keep": "k"}], ids=["r"])
+        store.upsert_texts(texts=["v2"], metadatas=[{"new": "2"}], ids=["r"])
+        hit = store.get_by_id("r")
+        assert hit["document"] == "v2"
+        assert hit["metadata"] == {"new": "2"}
+
     def test_get_by_id(self, store):
         _load(store)
         hit = store.get_by_id("n3")

@@ -154,7 +154,20 @@ class ChromaStore:
         metadatas: list[dict[str, Any]] | None = None,
         ids: list[str] | None = None,
     ) -> list[str]:
-        """Upsert (add or update) text chunks."""
+        """Upsert (add or update) text chunks — full replace semantics.
+
+        [#175] chromadb's native ``collection.upsert()`` MERGES metadata into
+        any existing record (verified empirically against chromadb 1.5.7/1.5.9:
+        both ``update()`` and ``upsert()`` merge, only delete+add replaces) —
+        so a stale key dropped by the caller's canonical transform would
+        survive forever under a plain upsert call. sqlite-vec
+        (DELETE-then-INSERT) and pgvector (``ON CONFLICT ... DO UPDATE SET
+        metadata = EXCLUDED.metadata``) both give full-replace semantics, so
+        this store's ``upsert_texts`` contract is: existing ids are fully
+        replaced (document + metadata), not merged. delete()-then-add()
+        restores that contract here; delete() on ids that don't exist yet is
+        a no-op (verified), so this is safe for the add-or-update case too.
+        """
         self._require_available()
 
         if ids is None:
@@ -163,7 +176,10 @@ class ChromaStore:
             metadatas = [{} for _ in texts]
 
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
-        self._collection_handle().upsert(documents=texts, metadatas=clean_meta, ids=ids)
+        handle = self._collection_handle()
+        handle.delete(ids=ids)
+        handle.add(documents=texts, metadatas=clean_meta, ids=ids)
+        logger.debug("ChromaDB: upserted (delete+add) %d documents", len(texts))
         return ids
 
     # ------------------------------------------------------------------
