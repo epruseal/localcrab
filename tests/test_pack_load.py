@@ -2364,6 +2364,20 @@ class TestSqlAlchemyBackendBranches:
         assert ok is False
 
 
+class TestSqlalchemyMetaUpdateSql:
+    """`_sqlalchemy_meta_update_sql` — PG 에서는 스토어 관례(::jsonb 캐스트)와
+    일치해야 하고(codex 리뷰 차단 지적), 테스트 더블이 쓰는 sqlite dialect 에는
+    `::` 구문이 없으므로 무캐스트여야 한다."""
+
+    def test_postgresql_dialect_uses_the_stores_jsonb_cast_convention(self):
+        sql = pack_load._sqlalchemy_meta_update_sql("vectors", "postgresql")
+        assert "(:meta)::jsonb" in sql
+
+    def test_other_dialects_get_no_pg_only_cast_syntax(self):
+        sql = pack_load._sqlalchemy_meta_update_sql("vectors", "sqlite")
+        assert "::" not in sql
+
+
 class TestVecBackendKindsCoverage:
     """`_vec_backend()` 가 낼 수 있는 kind 전부를 `_vec_meta_update()` 가 분기하는지
     소스 수준에서 대사한다(#172 요건 3 — "백엔드가 늘 때마다 이 함수를 고쳐야

@@ -370,6 +370,17 @@ def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     return vec_ids
 
 
+def _sqlalchemy_meta_update_sql(table: str, dialect_name: str) -> str:
+    """sqlalchemy(pgvector) 분기의 UPDATE 문. PostgreSQL 에서는 `(:meta)::jsonb`
+    명시 캐스트 — PgVectorStore 자신의 INSERT/UPSERT 가 이 컬럼에 쓰는 것과 같은
+    관례다. psycopg2 는 unknown 리터럴을 대입 캐스트로 우연히 통과시키지만
+    드라이버 의존이고(psycopg3 는 타입 오류) 스토어 관례와도 어긋난다.
+    다른 dialect(테스트 더블의 sqlite 등)에는 `::` 구문이 없으므로 무캐스트."""
+    if dialect_name == "postgresql":
+        return f"UPDATE {table} SET metadata = (:meta)::jsonb WHERE node_id = :id"  # noqa: S608
+    return f"UPDATE {table} SET metadata = :meta WHERE node_id = :id"  # noqa: S608
+
+
 def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     """벡터 레코드의 **메타데이터만** 갱신. 성공하면 True.
 
@@ -460,8 +471,8 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
             from sqlalchemy import text as _sa_text
             with handle.begin() as _c:
                 cur = _c.execute(
-                    _sa_text(f"UPDATE {table} SET metadata = :meta WHERE node_id = :id"),
-                    {"meta": _json.dumps(meta, ensure_ascii=False), "id": chunk_id},
+                    _sa_text(_sqlalchemy_meta_update_sql(table, handle.dialect.name)),
+                    {"meta": _json.dumps(meta), "id": chunk_id},
                 )
                 # sql 분기와 동일 계약: rowcount == 0(node_id 가 벡터 테이블에 없음)
                 # 이면 False — 조용히 True 를 내면 doc 기준만 옮겨가고 벡터는 옛
