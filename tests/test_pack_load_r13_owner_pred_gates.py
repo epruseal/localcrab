@@ -31,7 +31,6 @@ from opencrab.stores._sql_dialect import POSTGRES, SQLITE
 from tests.test_pack_load import _NoVec, live  # noqa: F401 — 실 스토어 픽스처 재사용
 from tests.test_pack_load_r11_pg_gates import _NoVecFake, _pg_fakes
 
-
 # ───────────────────────── 게이트 ⓐ: 혼합 형태 e2e ─────────────────────────
 
 class TestMixedFormOwnershipE2E:

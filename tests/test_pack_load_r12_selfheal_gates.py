@@ -23,18 +23,15 @@ from __future__ import annotations
 import json
 import sqlite3
 
-import pytest
-
 from opencrab.pack import load as pack_load
 from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 재사용
+    _node,
     _NoVec,
     _RecordingVec,
-    _node,
     _write_jsonl,
     live,
 )
 from tests.test_pack_load_r11_pg_gates import _pg_fakes
-
 
 # ───────────────────────── R1 전용 더블 ─────────────────────────
 

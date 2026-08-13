@@ -386,7 +386,7 @@ class TestSetDeleteEquivalence:
 # 구분성(PG 는 구분·sqlite 는 ASCII 무시)까지는 재현하지 못한다 — 그 성질은
 # 게이트 ④ 의 텍스트 형태 검사로만 확인한다(위 참고).
 
-class _PgShapeViolation(AssertionError):
+class _PgShapeViolationError(AssertionError):
     """PG형 fake 가 sqlite 방언 누출·bare 테이블명·qmark·FTS 문장을 검출했을 때."""
 
 
@@ -395,16 +395,16 @@ _KNOWN_TABLES = ("graph_nodes", "graph_edges", "doc_nodes", "doc_sources", "doc_
 
 def _validate_pg_shape(sql: str, schema: str) -> None:
     if "?" in sql:
-        raise _PgShapeViolation(f"qmark(?) 파라미터가 섞였다(named(:name) 이어야 한다): {sql!r}")
+        raise _PgShapeViolationError(f"qmark(?) 파라미터가 섞였다(named(:name) 이어야 한다): {sql!r}")
     if "json_extract(" in sql or " GLOB " in sql:
-        raise _PgShapeViolation(f"sqlite 전용 방언(json_extract/GLOB)이 섞였다: {sql!r}")
+        raise _PgShapeViolationError(f"sqlite 전용 방언(json_extract/GLOB)이 섞였다: {sql!r}")
     if "fts" in sql.lower():
-        raise _PgShapeViolation(f"FTS 문장이 PG 스토어에 도달했다(PG 는 FTS5 그림자가 없다): {sql!r}")
+        raise _PgShapeViolationError(f"FTS 문장이 PG 스토어에 도달했다(PG 는 FTS5 그림자가 없다): {sql!r}")
     for name in _KNOWN_TABLES:
         bare_hit = re.search(rf'(?<!\.)\b{re.escape(name)}\b', sql)
         qualified = f'"{schema}".{name}' in sql
         if bare_hit and not qualified:
-            raise _PgShapeViolation(f"스키마 프리픽스 없는 bare 테이블명 '{name}': {sql!r}")
+            raise _PgShapeViolationError(f"스키마 프리픽스 없는 bare 테이블명 '{name}': {sql!r}")
 
 
 # r13(#142 재리뷰): `_doc_owner_pred` 의 "pack_id 없음" 판정은
@@ -665,23 +665,23 @@ class TestPgShapedFakeStores:
 
     def test_qmark_leak_raises(self):
         graph, _docs = _pg_fakes()
-        with pytest.raises(_PgShapeViolation):
+        with pytest.raises(_PgShapeViolationError):
             graph._fetch_all("SELECT 1 FROM t WHERE x = ?", {})
 
     def test_bare_table_name_raises(self):
         graph, _docs = _pg_fakes()
-        with pytest.raises(_PgShapeViolation):
+        with pytest.raises(_PgShapeViolationError):
             graph._fetch_all("SELECT * FROM graph_nodes", {})
 
     def test_sqlite_dialect_leak_raises(self):
         graph, _docs = _pg_fakes()
-        with pytest.raises(_PgShapeViolation):
+        with pytest.raises(_PgShapeViolationError):
             graph._fetch_all(
                 'SELECT * FROM "pgfake".graph_nodes WHERE'
                 " json_extract(properties,'$.x')=:p", {"p": "x"})
 
     def test_fts_statement_sent_directly_raises(self):
         _graph, docs = _pg_fakes()
-        with pytest.raises(_PgShapeViolation):
+        with pytest.raises(_PgShapeViolationError):
             docs._exec_write(
                 'DELETE FROM "pgfake".doc_sources_fts WHERE source_id IN (:a)', {"a": "x"})
