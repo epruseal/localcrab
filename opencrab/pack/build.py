@@ -268,7 +268,7 @@ class Pack:
             ok = label in _ALLOWED.get((ss, tt), ()) or _KEEP.get((ss, tt)) == label
             if not ok:
                 viol[(ss, tt, label)] += 1
-            src_label = e.get('properties', {}).get('source_label')
+            src_label = (e.get('properties') or {}).get('source_label')
             if src_label and src_label != label:
                 fixed[(ss, tt, src_label, label)] += 1
         if viol:
