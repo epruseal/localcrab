@@ -85,6 +85,44 @@ def _json_str_eq(dialect: SqlDialect, col: str, key: str, param: str) -> str:
     return f"jsonb_typeof({col}->'{key}') = 'string' AND {col}->>'{key}' = :{param}"
 
 
+def _doc_owner_pred(dialect: SqlDialect) -> str:
+    """`doc_sources`(청크) 소유 판정 정본(r13, #142 재리뷰) — 3자리(대사 카운트·
+    `delete_pack`·`live_pack_state`) 공용 단일 헬퍼. `pack_id` 가 소유 정본이고
+    `source` 는 `pack_id` 가 없을 때만 폴백으로 본다:
+
+        ({pack_id 문자열 매치}) OR ({pack_id 없음} AND {source 문자열 매치})
+
+    **종전엔 무조건 OR**(`pack_id == :pack OR source == :pack`)였다 — 혼합
+    태그 문서(`pack_id="B", source="A"`, mcp `_ingest_into_pack` 이 caller
+    metadata 의 `source` 를 보존한 채 `pack_id` 를 독립 설정할 때 생긴다)가
+    A 쪽 대사·삭제·증분 분류 세 자리 모두에서 A 소유로 오포섭됐다 — A 를
+    `delete_pack` 하면 실제로는 B 소유인 문서가 함께, 영구히 지워졌다.
+    노드/엣지 축은 같은 클래스를 이미 `pack_id` 단일 소유 키로 좁혀 고쳤다
+    (:295 `_json_str_eq` 근거 주석·:495 회수 술어) — docs 축만 넓은 OR 로
+    남아 있었다.
+
+    **"pack_id 없음" 판정은 그래프 축 소유 판정(`_SqlGraphStoreBase._pack_where`)
+    과 같은 정본을 재사용한다**: `SqlDialect.json_truthy_text` 는 부재·JSON
+    null 뿐 아니라 `""`/`false`/`0` 도 "없음"으로 본다(이슈 #62 cluster 5).
+    그 값들을 가진 레거시 문서(`pack_id` 가 존재하되 falsy)는 여전히 `source`
+    폴백으로 잡힌다(현행 소유 보존) — `COALESCE(json_type,...)='null'` 류의
+    안은 `pack_id: ""` 행을 폴백에서 빠뜨려 고아로 만들므로 쓰지 않는다.
+
+    **`pack_id` 존재·non-falsy 비문자열**(정수·불리언·object·array 등 — 현재
+    라이브 데이터에는 없다, 2026-08-05 실측 전량 문자열/부재. 단 apps/api 가
+    caller metadata 를 검증 없이 그대로 저장하므로 도달 자체가 불가능하지는
+    않다)은 문자열 매치도 폴백도 불발해 비소유로 본다 — r11 의 "문자열
+    전용은 정의된 비지원"(`_json_str_eq` docstring) 정책과 일관된 선택이다.
+
+    반환은 바깥 괄호로 감싼다 — 호출부가 나중에 `AND {pred}` 로 결합해도
+    OR 우선순위가 안 깨진다.
+    """
+    pack_match = _json_str_eq(dialect, "metadata", "pack_id", "pack")
+    source_match = _json_str_eq(dialect, "metadata", "source", "pack")
+    pack_absent = f"{dialect.json_truthy_text('metadata', 'pack_id')} IS NULL"
+    return f"(({pack_match}) OR ({pack_absent} AND ({source_match})))"
+
+
 def _in_names(prefix: str, seq: list[str]) -> tuple[str, dict[str, str]]:
     """`IN (...)` 목록을 named 플레이스홀더로 전개 — `_sql_graph_base.py:717-723`
     의 `_SqlGraphStoreBase._in_placeholders`(스토어 정적 메서드)와 같은 형태다.
@@ -141,8 +179,10 @@ def build_count_sql(
     edge_pred = _json_str_eq(dialect, "properties", "pack_id", "pack")
     # docs 는 **두 형태**로 태그돼 있다(pack_id·source) — 한쪽만 세면 조용히
     # 적게 나온다(실측: 5벌 사본 중 하나가 이 함정에 걸렸다, 2026-08-11).
-    doc_pred = (f"{_json_str_eq(dialect, 'metadata', 'pack_id', 'pack')}"
-                f" OR {_json_str_eq(dialect, 'metadata', 'source', 'pack')}")
+    # 소유 우선순위: `pack_id` 가 정본, `source` 는 `pack_id` 가 없을 때만
+    # 폴백이다(무조건 OR 이면 혼합 태그 문서가 남의 팩에 오계수된다, r13
+    # #142 재리뷰) — `_doc_owner_pred` 참고.
+    doc_pred = _doc_owner_pred(dialect)
     return {
         "nodes": f"SELECT COUNT(*) AS n FROM {gt('graph_nodes')} WHERE {node_pred}",
         "edges": f"SELECT COUNT(*) AS n FROM {gt('graph_edges')} WHERE {edge_pred}",
@@ -163,7 +203,13 @@ def _as_json_dict(value) -> dict:
     return dict(value)
 
 
-_NAMED_TOKEN_RE = re.compile(r":[A-Za-z_]\w*")
+#  `(?<!:)` — 앞 문자가 `:` 가 아니어야 매치. PG `expr::numeric` 캐스트의
+# 두 번째 `:` 를 named 토큰으로 오인하지 않는다(r13 #142 재리뷰): 이 패턴
+# 없이는 `::numeric` 이 `:numeric` 을 named 파라미터로 잡아 `?` 로 치환하고,
+# 그러면 `_named_to_qmark` 가 실제로 존재하지 않는 PG 캐스트 파라미터를
+# 만들어 파생 SQL 이 깨진다. `json_truthy_text` 의 PG 산출물(숫자 분기)이
+# `(col->'key')::numeric` 을 쓰므로 이 지뢰가 처음으로 실사거리에 들어왔다.
+_NAMED_TOKEN_RE = re.compile(r"(?<!:):[A-Za-z_]\w*")
 
 
 def _assert_no_named_token_in_string_literals(sql: str) -> None:
@@ -547,10 +593,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
     )
     node_del += doc_node_extra_del
 
-    # ── doc_sources (청크): metadata.source == pack_name 또는 metadata.pack_id == pack_name
-    # (실제 레코드는 source가 아니라 pack_id 필드에만 팩 식별자를 갖는 경우가 있음)
-    src_pred = (f"{_json_str_eq(docs._dialect, 'metadata', 'source', 'pack')}"
-                f" OR {_json_str_eq(docs._dialect, 'metadata', 'pack_id', 'pack')}")
+    # ── doc_sources (청크): metadata.pack_id == pack_name 이 소유 정본이고,
+    # metadata.source 는 pack_id 가 없을 때만 폴백으로 본다(레거시 source-만
+    # 문서 지원). 무조건 OR 이면 혼합 태그 문서(pack_id="B", source="A")가
+    # A 삭제에 함께 지워진다(r13 #142 재리뷰) — `_doc_owner_pred` 참고.
+    src_pred = _doc_owner_pred(docs._dialect)
     src_rows = docs._fetch_all(
         f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
         {"pack": pack_name},
@@ -659,8 +706,10 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     ):
         nodes[node_id] = (node_type, space_id, _as_json_dict(properties))
 
-    chunk_pred = (f"{_json_str_eq(docs._dialect, 'metadata', 'pack_id', 'pack')}"
-                  f" OR {_json_str_eq(docs._dialect, 'metadata', 'source', 'pack')}")
+    # 소유 우선순위는 delete_pack/build_count_sql 과 같은 정본(`_doc_owner_pred`)
+    # 을 쓴다 — 무조건 OR 로 갈리면 혼합 태그 문서가 다른 팩의 증분 분류에
+    # 오포섭돼 finalize 삭제 후보가 된다(r13 #142 재리뷰).
+    chunk_pred = _doc_owner_pred(docs._dialect)
     chunks: dict[str, tuple[str, dict]] = {}
     for row in docs._fetch_all(
         f"""

@@ -407,11 +407,30 @@ def _validate_pg_shape(sql: str, schema: str) -> None:
             raise _PgShapeViolation(f"스키마 프리픽스 없는 bare 테이블명 '{name}': {sql!r}")
 
 
+# r13(#142 재리뷰): `_doc_owner_pred` 의 "pack_id 없음" 판정은
+# `SqlDialect.json_truthy_text('metadata', 'pack_id')` 를 쓴다 — PG 산출물은
+# `jsonb_typeof(...)` 를 CASE 서브젝트로(단독, `= 'string'` 접미사 없이) 쓰고
+# `::numeric` 캐스트도 있어 아래 두 regex(둘 다 `= 'string'` 접미사나 `->>'`
+# 형만 잡는다) 사각지대다 — sqlite 는 jsonb_typeof/`::` 캐스트가 없어 그대로
+# 실행하면 구문 오류로 죽는다.
+#
+# 통짜 CASE 블록을 sqlite 산출물로 치환한다 — PG·sqlite `json_truthy_text`
+# 는 WHEN 분기 자체가 다르므로(PG: null/boolean/string/number, sqlite:
+# null/false/true/text/integer/real) 함수명만 바꾸는 조각 치환으로는 분기가
+# 하나도 안 맞아 항상 ELSE 로 빠진다(의미가 바뀐다). 실사용 호출은
+# `metadata`/`pack_id` 하나뿐이라(`_doc_owner_pred`) 그 리터럴 산출물만
+# 정확히 치환한다 — 없는 다른 col/key 조합까지 일반화하지 않는다.
+_JSON_TRUTHY_TEXT_PG_METADATA_PACK_ID = POSTGRES.json_truthy_text("metadata", "pack_id")
+_JSON_TRUTHY_TEXT_SQLITE_METADATA_PACK_ID = SQLITE.json_truthy_text("metadata", "pack_id")
+
+
 def _translate_for_sqlite_execution(sql: str, schema: str) -> str:
     """검증을 통과한 PG 방언 SQL 을 fake 의 sqlite3 저장소에서 실행 가능하게
     번역한다 — "PG 다움 검증"은 위 `_validate_pg_shape` 가 이미 끝냈으므로 이
     함수는 실행 가능성만 책임진다."""
     out = sql.replace(f'"{schema}".', "")
+    out = out.replace(_JSON_TRUTHY_TEXT_PG_METADATA_PACK_ID,
+                       _JSON_TRUTHY_TEXT_SQLITE_METADATA_PACK_ID)
     out = re.sub(r"jsonb_typeof\((\w+)->'(\w+)'\)\s*=\s*'string'",
                  r"json_type(\1, '$.\2') = 'text'", out)
     out = re.sub(r"(\w+)->>'(\w+)'", r"json_extract(\1, '$.\2')", out)
