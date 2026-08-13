@@ -1050,6 +1050,18 @@ class TestIntegrityToleratesNullMetadataAndMissingSource:
             "metadata: null 이 AttributeError 로 채점 전체를 죽였다"
         assert any("evidence_index 미부여" in g for g in r["gaps"])
 
+    def test_non_dict_metadata_does_not_crash_the_grader(self, tmp_path):
+        """`"metadata": "oops"` 처럼 dict 도 None 도 아닌 값은 truthy 라
+        `or {}` 를 통과해 버리므로(2026-08-13 잔여 리뷰, 이슈 #176-3) dict 여부를
+        직접 검사해야 한다 — 그렇지 않으면 `.get()` 이 str 에서 AttributeError."""
+        nodes = _base(resource=1)
+        chunks = [{"id": "evidence0", "document_id": "resource0", "source": "resource0",
+                   "metadata": "oops"}]  # dict 도 None 도 아니다
+        r = grade_pack(_pack(tmp_path / "bad-meta", nodes, [], chunks))
+        assert r is not None and isinstance(r["total"], int), \
+            "metadata: <str> 이 AttributeError 로 채점 전체를 죽였다"
+        assert any("evidence_index 미부여" in g for g in r["gaps"])
+
     def test_missing_source_chunks_fall_back_to_document_id_for_grouping(self, tmp_path):
         """source 없는 청크 2개가 각기 다른 resource 의 document_id 로 폴백되면,
         각자 [1]짜리 독립 연속 그룹이라 위반이 없어야 한다.

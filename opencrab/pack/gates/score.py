@@ -165,8 +165,12 @@ def grade_pack(pack_dir: Path | str, expected_sources: int | None = None) -> dic
     for c in chunks:
         # 명시적 `"metadata": null` 이면 `.get("metadata", {})` 의 기본값은 적용되지
         # 않는다(키가 존재하므로) — 그대로 `.get()` 을 부르면 `AttributeError` 로
-        # 채점 전체가 죽는다(2026-08-13 리뷰 지적). `or {}` 로 None 도 흡수한다.
-        ei = (c.get("metadata") or {}).get("evidence_index")
+        # 채점 전체가 죽는다(2026-08-13 리뷰 지적). `or {}` 로 None 도 흡수하지만
+        # dict 도 None 도 아닌 값(문자열 등)은 truthy 라 `or {}` 를 통과해 버려
+        # 여전히 AttributeError 로 죽는다(2026-08-13 리뷰 지적 #2) — dict 여부를
+        # 직접 검사한다("어떤 팩 모양에도 리포트를 낸다" 계약).
+        _meta = c.get("metadata")
+        ei = (_meta if isinstance(_meta, dict) else {}).get("evidence_index")
         if ei is None:
             missing_idx += 1
             continue
