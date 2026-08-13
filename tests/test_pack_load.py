@@ -21,6 +21,7 @@ import pytest
 
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
+from opencrab.pack.normalize import transform_chunk_meta
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
@@ -1797,37 +1798,147 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
 
 
 class _FakeChromaCollection:
-    """`.get(where=...)`/`.delete(ids=...)`/`.update(ids=..., metadatas=...)` 만
-    흉내내는 최소 Chroma 컬렉션 더블.
+    """`.get`/`.delete`/`.add`/`.update`/`.upsert` 를 흉내내는 Chroma 컬렉션 더블.
+
+    계약은 **실측**(chromadb 1.5.7, `EphemeralClient` 위에서 프로브 스크립트로 확인,
+    2026-08-12)에서 그대로 베꼈다 — 산문으로 짐작하지 않는다:
+
+      · `update`/`upsert` 는 메타데이터를 **병합**한다(겹치는 키만 덮어쓰고 그 외
+        키는 존속). 실측: `update(ids=["c1"], metadatas=[{"a": 99}])` 를 `{"a": 1,
+        "b": 2}` 위에 부르면 결과가 `{"a": 99, "b": 2}` — "b"가 살아남는다.
+      · `update` 를 존재하지 않는 id 에 부르면 **예외 없이 no-op** 이다(실측:
+        `col.update(ids=["nope"], ...)` 가 조용히 통과한다).
+      · `upsert` 로 `uris` 를 안 주면 기존 uri 가 **보존**된다(실측: uri 를 준
+        레코드에 `uris=` 없이 upsert 해도 `get(include=["uris"])` 가 그대로
+        돌려준다).
+      · `delete` + `add` 는 **치환**이다 — `add` 가 레코드를 처음부터 다시 짓는다
+        (실측: delete 뒤 다른 메타로 add 하면 옛 키가 전부 사라진다).
+      · `get(ids=..., include=[...])` 는 요청한 축만 채워 돌려준다. `uris` 가
+        없는 레코드는 그 자리가 `None` 이다.
 
     `_NoVec`(available=False)만 쓰던 판은 `delete_pack`/`pack_live_counts`/
     `live_pack_state`/`_vec_meta_update` 의 Chroma 분기가 **한 번도 실행되지
     않았다** — 그 경로는 영원히 미검증이었다(#pgvector 실측과 같은 클래스, F5).
+
+    **결함 주입 축**(R1 게이트 ⑥~⑭ 전용). 프로덕션 계약과 무관한 테스트 전용 표면
+    이다 — 기본값(빈 set)에서는 아무것도 바꾸지 않는다.
+
+      · `fail_get_calls`: `get(ids=...)` 호출 **순번**(1부터) 이 이 집합에 있으면
+        예외를 던진다 — `_vec_meta_update` 는 get 을 선(존재확인)·후(검증) 두 번
+        부르므로 순번으로 어느 쪽을 실패시킬지 고른다.
+      · `fail_delete_ids` / `fail_add_ids`: 그 id 에 대한 `delete`/`add` 호출이
+        예외를 던진다(둘 다 상태 변형 **전에** 던져 "실패=무변형"을 흉내낸다).
+      · `lossy_add_ids`: `add` 가 예외 없이 "성공"하지만 메타만 쓰고 임베딩·문서는
+        비워 둔다 — v11 검수가 잡은 "메타만 남는 lossy add" 를 재현한다.
     """
 
     def __init__(self, rows):
         self._rows: dict[str, str] = dict(rows)       # {node_id: pack_id}
+        self.embeddings: dict[str, list[float]] = {}
+        self.documents: dict[str, str] = {}
         self.metas: dict[str, dict] = {}
-        self.get_calls: list[dict | None] = []
+        self.uris: dict[str, str] = {}
+        self.get_calls: list[dict | None] = []             # where= 호출 로그(하위호환)
+        self.get_by_ids_calls: list[tuple[list[str], list[str] | None]] = []
         self.delete_calls: list[list[str]] = []
         self.update_calls: list[tuple[list[str], list[dict]]] = []
+        self.upsert_calls: list[dict] = []
+        self.add_calls: list[dict] = []
+        # 결함 주입(기본값: 무해) — docstring 참고
+        self.fail_get_calls: set[int] = set()
+        self.fail_delete_ids: set[str] = set()
+        self.fail_add_ids: set[str] = set()
+        self.lossy_add_ids: set[str] = set()
+        self._get_by_ids_call_count = 0
 
-    def get(self, where=None):
+    def seed(self, node_id, pack_id="pack-1", embedding=(0.1, 0.2, 0.3),
+             document="본문", metadata=None, uri=None):
+        """편의 헬퍼 — id 하나에 4축(embedding/document/metadata/uri)을 한 번에 채운다."""
+        self._rows[node_id] = pack_id
+        self.embeddings[node_id] = list(embedding)
+        self.documents[node_id] = document
+        self.metas[node_id] = dict(metadata) if metadata is not None else {}
+        if uri is not None:
+            self.uris[node_id] = uri
+        return node_id
+
+    def get(self, ids=None, where=None, include=None):
+        if ids is not None:
+            self._get_by_ids_call_count += 1
+            self.get_by_ids_calls.append((list(ids), list(include) if include else None))
+            if self._get_by_ids_call_count in self.fail_get_calls:
+                raise RuntimeError(f"simulated get failure (call #{self._get_by_ids_call_count})")
+            found = [i for i in ids if i in self._rows]
+            out: dict = {"ids": found}
+            inc = include or []
+            if "embeddings" in inc:
+                out["embeddings"] = [self.embeddings.get(i) for i in found]
+            if "documents" in inc:
+                out["documents"] = [self.documents.get(i) for i in found]
+            if "metadatas" in inc:
+                out["metadatas"] = [self.metas.get(i, {}) for i in found]
+            if "uris" in inc:
+                out["uris"] = [self.uris.get(i) for i in found]
+            return out
+        # where= 호출 (delete_pack/pack_live_counts/live_pack_state 기존 계약)
         self.get_calls.append(where)
         pid = (where or {}).get("pack_id")
-        ids = [i for i, p in self._rows.items() if p == pid]
-        return {"ids": ids}
+        ids_ = [i for i, p in self._rows.items() if p == pid]
+        return {"ids": ids_}
 
     def delete(self, ids):
+        if any(i in self.fail_delete_ids for i in ids):
+            raise RuntimeError("simulated delete failure")   # 상태 변형 전에 던진다
         self.delete_calls.append(list(ids))
         for i in ids:
             self._rows.pop(i, None)
+            self.embeddings.pop(i, None)
+            self.documents.pop(i, None)
             self.metas.pop(i, None)
+            self.uris.pop(i, None)
+
+    def add(self, ids, embeddings=None, documents=None, metadatas=None, uris=None):
+        self.add_calls.append({"ids": list(ids)})            # 실패해도 시도는 기록
+        if any(i in self.fail_add_ids for i in ids):
+            raise RuntimeError("simulated add failure")
+        for idx, i in enumerate(ids):
+            if i in self.lossy_add_ids:
+                # "성공"하지만 메타만 쓴다 — 레코드 자체는 존재하되(ids 는 조회되되)
+                # 임베딩·문서는 비워 둔 채(v11 검수가 잡은 lossy add 재현).
+                self._rows.setdefault(i, "pack-1")
+                if metadatas is not None:
+                    self.metas[i] = dict(metadatas[idx])
+                continue
+            self._rows.setdefault(i, "pack-1")
+            if embeddings is not None:
+                self.embeddings[i] = list(embeddings[idx])
+            if documents is not None:
+                self.documents[i] = documents[idx]
+            if metadatas is not None:
+                self.metas[i] = dict(metadatas[idx])          # add 는 치환 — 새로 짓는다
+            if uris is not None:
+                self.uris[i] = uris[idx]
 
     def update(self, ids, metadatas):
         self.update_calls.append((list(ids), list(metadatas)))
         for i, m in zip(ids, metadatas):
-            self.metas[i] = dict(m)
+            if i not in self._rows:            # 실측: 부재 id 는 예외 없이 no-op
+                continue
+            self.metas.setdefault(i, {}).update(m)            # 병합
+
+    def upsert(self, ids, embeddings=None, documents=None, metadatas=None, uris=None):
+        self.upsert_calls.append({"ids": list(ids)})
+        for idx, i in enumerate(ids):
+            self._rows.setdefault(i, "pack-1")
+            if embeddings is not None:
+                self.embeddings[i] = list(embeddings[idx])
+            if documents is not None:
+                self.documents[i] = documents[idx]
+            if metadatas is not None:
+                self.metas.setdefault(i, {}).update(metadatas[idx])   # 병합
+            if uris is not None:
+                self.uris[i] = uris[idx]
+            # uris 를 안 주면 기존 uri 를 손대지 않는다 — 보존 실측.
 
 
 class _FakeChromaVec:
@@ -1837,6 +1948,15 @@ class _FakeChromaVec:
 
     def __init__(self, rows):
         self._collection = _FakeChromaCollection(rows)
+
+    def upsert_texts(self, texts, ids=None, metadatas=None):
+        """실 `ChromaVecStore.upsert_texts` 위임 계약을 그대로 흉내낸다 — 임베딩은
+        안 넘기고(컬렉션이 문서에서 자동 계산하는 자리) documents/metadatas/ids 만
+        `.upsert()` 로 넘긴다. `load_chunks_incremental` 의 재임베딩 폴백 경로가
+        이 메서드를 통해서만 벡터스토어에 닿으므로, R1 통합 게이트(⑫⑭)가 이 메서드를
+        거친다."""
+        self._collection.upsert(ids=ids, documents=list(texts), metadatas=metadatas)
+        return list(ids) if ids is not None else []
 
 
 class TestChromaBackendBranches:
@@ -1876,16 +1996,250 @@ class TestChromaBackendBranches:
         assert state["vec_ids"] == {"n1", "고아"}, state["vec_ids"]
         assert vec._collection.get_calls[-1] == {"pack_id": "pack-1"}
 
-    def test_vec_meta_update_calls_collection_update(self):
-        vec = _FakeChromaVec({"c1": "pack-1"})
-        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
-        assert ok is True
-        assert vec._collection.metas.get("c1") == {"쪽": "99"}, (
-            "메타 갱신이 컬렉션에 실제로 반영되지 않았다")
-
     def _seed_node(self, builder, tmp_path, node_id):
         f = _write_jsonl(tmp_path / f"{node_id}.jsonl", [_node(id=node_id)])
         pack_load.load_nodes("pack-1", f, builder, {})
+
+
+class TestVecMetaUpdateChromaReplace:
+    """`_vec_meta_update` 의 chroma 분기 — get→delete→add 치환 + 4축 후검증(R1, 2026-08-13).
+
+    2026-08-13 이전엔 이 분기가 `handle.update(ids=..., metadatas=...)` 하나였다
+    (`TestChromaBackendBranches.test_vec_meta_update_calls_collection_update`,
+    이 클래스로 대체). chromadb 의 `update` 는 **병합**이라 스키마가 줄어든 메타의
+    스테일 키를 못 지웠다(실측, `_FakeChromaCollection` docstring) — 그래서
+    delete+add 치환으로 바꿨고, 그 대가로 늘어난 실패 표면(get 2회·delete·add)을
+    아래에서 개별로 건다. 번호는 v18 설계의 게이트 번호와 대응한다.
+    """
+
+    # ① 부재 → False
+    def test_missing_record_returns_false(self):
+        vec = _FakeChromaVec({})
+        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1})
+        assert ok is False
+        assert vec._collection.delete_calls == []
+        assert vec._collection.add_calls == []
+
+    # ② 존재+스테일 키 → True + 메타 정확 일치(스테일 소멸)
+    def test_replaces_and_drops_stale_metadata_keys(self):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1, 0.2, 0.3], document="본문",
+                              metadata={"stale": "old", "쪽": "1"})
+        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
+        assert ok is True
+        assert vec._collection.metas["c1"] == {"쪽": "99"}, (
+            "치환이 아니라 병합이면 'stale' 키가 살아남는다")
+        assert vec._collection.delete_calls == [["c1"]]
+        assert vec._collection.add_calls[-1]["ids"] == ["c1"]
+
+    # ③ 임베딩 보존(+ 허용오차 값 비교 — v16 검수)
+    def test_embedding_is_preserved_exactly(self):
+        vec = _FakeChromaVec({})
+        emb = [0.11111, -0.22222, 0.33333]
+        vec._collection.seed("c1", embedding=emb, document="본문", metadata={"a": 1})
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        assert ok is True
+        assert vec._collection.embeddings["c1"] == emb
+
+    def test_embedding_within_float_tolerance_still_passes(self):
+        """float32 왕복 오차 수준(허용오차 1e-6 rel+abs)은 실패로 잡지 않는다."""
+        vec = _FakeChromaVec({})
+        emb = [1.0, 2.0, 3.0]
+        vec._collection.seed("c1", embedding=emb, document="본문", metadata={"a": 1})
+        real_add = vec._collection.add
+
+        def add_with_epsilon(ids, embeddings=None, documents=None, metadatas=None, uris=None):
+            if embeddings is not None:
+                embeddings = [[v + 1e-9 for v in row] for row in embeddings]
+            return real_add(ids, embeddings, documents, metadatas, uris)
+        vec._collection.add = add_with_epsilon
+
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        assert ok is True, "허용오차 이내 부동소수 미세오차까지 실패로 잡았다"
+
+    def test_embedding_value_drift_beyond_tolerance_fails_post_check(self):
+        """차원은 같지만 **값**이 달라지면 후검증이 잡는다(v16 검수 결함 재발 방지).
+
+        차원만 보는 후검증이었다면 이 케이스가 조용히 통과했다 — 임베딩 전체가
+        바뀌어도 True 가 나왔을 것이다.
+        """
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[1.0, 2.0, 3.0], document="본문", metadata={"a": 1})
+        real_add = vec._collection.add
+
+        def add_with_wrong_values(ids, embeddings=None, documents=None, metadatas=None, uris=None):
+            if embeddings is not None:
+                embeddings = [[v + 1.0 for v in row] for row in embeddings]  # 값 자체가 다르다
+            return real_add(ids, embeddings, documents, metadatas, uris)
+        vec._collection.add = add_with_wrong_values
+
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        assert ok is False, "임베딩 값이 전부 바뀌었는데 후검증을 통과했다"
+
+    # ⑥ URI 레코드 → delete 미호출 + False + warning + (fake upsert 후) URI 보존
+    def test_uri_record_is_not_replaced_and_returns_false(self, caplog):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문",
+                              metadata={"y": "1"}, uri="http://example.com/c1")
+        with caplog.at_level("WARNING"):
+            ok = pack_load._vec_meta_update(vec, "c1", {"y": "99"})
+        assert ok is False
+        assert vec._collection.delete_calls == [], "URI 레코드인데 delete 가 불렸다"
+        assert vec._collection.add_calls == []
+        assert any("URI" in r.message for r in caplog.records), "URI 우회 경고가 안 남았다"
+
+    def test_uri_is_preserved_when_caller_falls_back_to_upsert(self):
+        """False 를 받은 호출자가 실제로 재임베딩(`upsert_texts`)으로 우회하면
+        URI 는 보존되고 메타는 병합된다 — `load_chunks_incremental` 전체 경로로 확인."""
+        vec = _FakeChromaVec({})
+        old_row = _chunk_row("c1", "본문A", y="1")
+        new_row = _chunk_row("c1", "본문A", y="99")
+        old_meta = transform_chunk_meta("pack-1", old_row)
+        vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문A",
+                              metadata=old_meta, uri="http://example.com/c1")
+        live_chunks = {"c1": ("본문A", old_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+
+        assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
+        assert c_txt == 1, "재임베딩(텍스트) 경로로 카운트돼야 한다"
+        assert vec._collection.delete_calls == [], "URI 레코드는 delete 가 불리면 안 된다"
+        assert vec._collection.uris.get("c1") == "http://example.com/c1", "URI 가 사라졌다"
+
+    # ⑦ delete 실패 fake → False(예외 비전파) + warning
+    def test_delete_failure_returns_false_without_propagating(self, caplog):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.fail_delete_ids = {"c1"}
+        with caplog.at_level("WARNING"):
+            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+        assert ok is False
+        assert vec._collection.add_calls == [], "delete 가 실패했는데 add 를 시도했다"
+        assert "c1" in vec._collection._rows, "delete 실패 후에도 원본이 남아 있어야 한다"
+        assert any("치환 실패" in r.message for r in caplog.records)
+
+    # ⑧ add 실패 → 복구 add 미호출(부재 유지) + False
+    def test_add_failure_leaves_record_absent_without_recovery_add(self, caplog):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.fail_add_ids = {"c1"}
+        with caplog.at_level("WARNING"):
+            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        assert ok is False
+        assert vec._collection.delete_calls == [["c1"]], "delete 는 실제로 실행돼야 한다"
+        assert len(vec._collection.add_calls) == 1, (
+            "add 실패 후 복구용 재-add 를 시도했다 — 설계는 '부재 유지'를 요구한다")
+        assert "c1" not in vec._collection._rows, "add 실패 후 레코드가 부재 상태로 남아야 한다"
+
+    # ⑩ add 무동작(lossy 포함) fake → 후검증 False
+    def test_lossy_add_that_drops_embedding_fails_post_check(self):
+        """add 가 예외 없이 '성공'하지만 메타만 쓰고 임베딩·문서를 비우면
+        (v11 검수가 잡은 lossy add) 후검증이 잡아야 한다."""
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문", metadata={"a": 1})
+        vec._collection.lossy_add_ids = {"c1"}
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        assert ok is False, "메타만 남기고 임베딩을 비운 lossy add 를 후검증이 못 잡았다"
+        # lossy 경로라도 메타 자체는 반영됐을 수 있다 — 그래도 함수는 False 를 내야
+        # 호출자가 재임베딩으로 우회해 임베딩 손실을 복구한다.
+        assert vec._collection.embeddings.get("c1") is None
+
+    # ⑫ add 실패 후 호출자 재임베딩 경로 — 최종 메타 정확 일치(스테일 무잔존)
+    def test_add_failure_then_caller_reembed_leaves_no_stale_keys(self):
+        """add 가 실패하면 delete 로 이미 레코드가 지워진 상태다(⑧) — 호출자가
+        재임베딩(upsert_texts)으로 우회하면 그 upsert 는 **부재 위에서** 실행되므로
+        병합할 옛 메타가 없다. 최종 메타가 새 메타와 정확히 같아야 한다(스테일 무잔존).
+        """
+        vec = _FakeChromaVec({})
+        old_row = _chunk_row("c1", "본문A", stale="old", x="1")
+        new_row = _chunk_row("c1", "본문A", x="99")   # 텍스트 불변, 메타만 변경(stale 제거)
+        old_meta = transform_chunk_meta("pack-1", old_row)
+        new_meta = transform_chunk_meta("pack-1", new_row)
+        vec._collection.seed("c1", embedding=[0.1], document="본문A", metadata=old_meta)
+        vec._collection.fail_add_ids = {"c1"}
+        live_chunks = {"c1": ("본문A", old_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+
+        assert err == 0
+        assert c_txt == 1, "add 실패 → 재임베딩 경로로 떨어져야 한다"
+        assert vec._collection.metas["c1"] == new_meta, (
+            f"재임베딩 후에도 스테일 키가 남았다: {vec._collection.metas.get('c1')}")
+
+    # ⑬ get(선·후) 예외 fake → False(비전파)
+    def test_pre_get_exception_returns_false_without_propagating(self):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.fail_get_calls = {1}      # 선(존재확인) get
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+        assert ok is False
+        assert vec._collection.delete_calls == [], "선-get 이 실패했는데 delete 로 진행했다"
+
+    def test_post_get_exception_returns_false_without_propagating(self):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.fail_get_calls = {2}      # 후(검증) get
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+        assert ok is False
+        assert vec._collection.delete_calls == [["c1"]], "후-get 실패 전까지는 delete+add 가 진행돼야 한다"
+
+    # ⑭ delete 실패 통합 시나리오 — 겹치는 키 갱신 + 여분 스테일 키 잔존(#175 창)
+    def test_delete_failure_then_caller_upsert_merges_and_leaves_stale_window(self):
+        """delete 가 실패하면 레코드가 원본 그대로 남는다(⑦) — 호출자가 재임베딩
+        (upsert_texts→upsert)으로 우회하면 그 upsert 는 **기존 레코드 위에서 병합**된다.
+        겹치는 키("x")는 새 값으로 갱신되지만 스테일 키("stale")는 살아남는다 —
+        이것이 localcrab#175 로 등록된, 아직 닫지 않은 창이다. 창의 존재와 정확한
+        범위를 여기서 못박아 소리 없이 넓어지지 않게 한다.
+        """
+        vec = _FakeChromaVec({})
+        old_row = _chunk_row("c1", "본문A", stale="old", x="1")
+        new_row = _chunk_row("c1", "본문A", x="99")
+        old_meta = transform_chunk_meta("pack-1", old_row)
+        expected_meta = dict(old_meta, x="99")   # 겹치는 키 갱신 + stale 잔존(#175)
+        vec._collection.seed("c1", embedding=[0.1], document="본문A", metadata=old_meta)
+        vec._collection.fail_delete_ids = {"c1"}
+        live_chunks = {"c1": ("본문A", old_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+
+        assert err == 0
+        assert c_txt == 1
+        assert vec._collection.metas["c1"] == expected_meta, (
+            f"#175 창의 정확한 모양이 바뀌었다(겹치는 키 갱신 + 스테일 잔존): "
+            f"{vec._collection.metas.get('c1')}")
+
+
+def _chunk_row(chunk_id, text, **metadata):
+    """`load_chunks_incremental` 이 읽는 청크 행 하나. `metadata` 키워드는
+    `transform_chunk_meta` 가 읽는 중첩 `metadata` 서브딕트로 들어간다 — 최상위에
+    얹으면 무시된다(정본: `opencrab/pack/normalize.py:transform_chunk_meta`)."""
+    return {"id": chunk_id, "text": text, "document_id": chunk_id, "metadata": metadata}
+
+
+def _write_jsonl_chunks_tmp(rows):
+    """`load_chunks_incremental` 용 임시 chunks.jsonl — `_chunk_row` 로 지은 행들을 쓴다."""
+    import tempfile
+    d = pathlib.Path(tempfile.mkdtemp(prefix="vecmeta_"))
+    f = d / "chunks.jsonl"
+    return _write_jsonl(f, rows)
+
+
+class _NullDocs:
+    """`docs.upsert_source` 만 흉내내는 무해 더블 — `load_chunks_incremental` 은
+    이 호출을 `try/except: pass` 로 감싸므로 존재만 하면 충분하다(R1 통합 게이트는
+    벡터 축만 본다)."""
+
+    def upsert_source(self, *a, **kw):
+        pass
 
 
 class _SqlAlchemyVecLike:

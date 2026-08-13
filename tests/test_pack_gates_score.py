@@ -35,6 +35,16 @@ None 과 저품질이 구분되는가, 추적 타깃이 evidence 뿐인가, 비�
    그래서 이 파일의 수치는 **(값, 그 값을 낸 커밋, 재현 명령)** 셋을 함께 적는다.
    커밋을 적는 순간 중간 측정치는 기준선으로 쓸 수 없게 된다.
 
+.. note::
+
+   **2026-08-13 R2** 가 `score.py` 소스 커버리지 섹션(`document_id` 폴백,
+   `TestSourceCoverageResourceFallback` 참고)을 고쳤다 — 위 326/317/9 와 아래
+   L-번호 표는 그 수정 **이전** 커밋의 측정이라 지금 소스의 줄 번호와 정확히
+   맞지 않는다(L100→120, L189→209 로 물리 이동). 값 자체(9 종 등가)는 이 라운드가
+   건드리지 않은 축이라 여전히 유효할 가능성이 높지만, 못박힌 사실이 아니라
+   **재확인 대상**이다 — `TestProvenEquivalences` 가 갈리면 여기서 먼저 드러난다.
+   재측정은 위 명령을 지금 HEAD 에 대해 다시 돌리면 된다.
+
 ===========================  ===  ===================================================
 잔존 변이                    수   등가 근거
 ===========================  ===  ===================================================
@@ -220,6 +230,73 @@ class TestExpectedSourcesOverride:
 
         assert r_auto["sections"]["source"] < 20, "resource 3개 기준이면 미달이어야 정상"
         assert r_forced["sections"]["source"] == 20, "expected_sources=1 을 무시했다"
+
+
+class TestSourceCoverageResourceFallback:
+    """소스 커버리지(3번)의 `document_id` 검증형 폴백(2026-08-13, R2).
+
+    종전엔 `{c.get("source") for c in chunks}` 가 source 없는 청크의 `None` 을
+    그대로 집합에 넣어 "소스 1개"로 잘못 세었다 — `document_id` 로만 소스를
+    표현하는 팩(source 필드를 안 쓰는 생산자)이 커버리지 0으로 억울하게
+    감점됐다. 결측(None)·빈 문자열은 **절대 source 로 계수되지 않는다** — 유효한
+    resource `document_id` 가 있을 때만 그 resource 를 폴백으로 계수하고, 무관한
+    (resource 가 아닌) `document_id` 는 여전히 미계수다(합성 반례 0점 유지).
+    """
+
+    def test_missing_source_with_unrelated_document_id_scores_zero(self, tmp_path):
+        """①: 기대 1 + source 결측 + document_id 가 어느 resource 도 아님 → 0."""
+        nodes = [_n("r1", space="resource")]
+        chunks = [{"id": "c1", "document_id": "ghost-doc"}]  # source 키 자체가 없다
+        r = grade_pack(_pack(tmp_path, nodes, [], chunks))
+        assert r["sections"]["source"] == 0, r["sections"]
+        assert any("청크 보유 소스 0/1" in g for g in r["gaps"])
+
+    def test_missing_source_with_valid_resource_document_id_falls_back(self, tmp_path):
+        """②: source 결측 + document_id 가 유효 resource → 그 resource 를 계수."""
+        nodes = [_n("r1", space="resource")]
+        chunks = [{"id": "c1", "document_id": "r1"}]  # source 키 자체가 없다
+        r = grade_pack(_pack(tmp_path, nodes, [], chunks))
+        assert r["sections"]["source"] == 20, r["sections"]
+
+    def test_empty_string_source_is_treated_as_missing_not_as_a_source(self, tmp_path):
+        """③: 빈 문자열은 source 문자열로 계수되지 않는다 — None 과 동일 취급.
+
+        무관 document_id 면 0, 유효 document_id 면 폴백 계수 — ①·②와 대칭이다.
+        """
+        nodes = [_n("r1", space="resource")]
+        d_bad = _pack(tmp_path / "bad",
+                      nodes, [], [{"id": "c1", "document_id": "ghost-doc", "source": ""}])
+        d_ok = _pack(tmp_path / "ok",
+                     nodes, [], [{"id": "c1", "document_id": "r1", "source": ""}])
+        assert grade_pack(d_bad)["sections"]["source"] == 0
+        assert grade_pack(d_ok)["sections"]["source"] == 20
+
+    def test_non_empty_source_still_counts_directly_regardless_of_document_id(self, tmp_path):
+        """대조군 — source 가 있으면(무관한 값이라도) 종전처럼 그대로 계수된다.
+
+        이 축은 R2 가 건드리지 않는다: 폴백은 source **결측**일 때만 켜진다.
+        """
+        nodes = [_n("r1", space="resource")]
+        chunks = [{"id": "c1", "document_id": "ghost-doc", "source": "아무-소스"}]
+        r = grade_pack(_pack(tmp_path, nodes, [], chunks))
+        assert r["sections"]["source"] == 20, "무관 document_id 라도 source 문자열 자체는 유효하다"
+
+    def test_direct_source_and_fallback_source_dedupe_on_collision(self, tmp_path):
+        """source 문자열이 우연히 resource id 와 같으면 같은 원소로 뭉친다(과소 방향).
+
+        한 청크가 `source="r1"` 로 직접 세고, 다른 청크가 결측+`document_id="r1"`
+        로 폴백 세면 둘 다 `"r1"` 이라 집합에서 **하나로 합쳐진다** — 과다 계수(2)가
+        아니라 과소 방향(1)으로만 틀어진다는 설계 계약을 고정한다.
+        """
+        nodes = [_n("r1", space="resource"), _n("r2", space="resource")]
+        chunks = [
+            {"id": "c1", "document_id": "r1", "source": "r1"},
+            {"id": "c2", "document_id": "r1"},  # source 결측, 폴백도 "r1" — 충돌
+        ]
+        r = grade_pack(_pack(tmp_path, nodes, [], chunks), expected_sources=2)
+        assert r["sections"]["source"] == 10, (
+            "충돌이 합쳐지지 않고 과다 계수됐다면 20 이 나온다 — 실제는 1/2 커버리지"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -689,9 +766,13 @@ class TestStructKeySetIsExactlyNine:
         거는 것은 원리적으로 불가능하다 — 비회원을 전수 열거해야 하기 때문이다.
         그래서 **집합 자체**를 본다.
 
-        소스를 AST 로 읽는 이유: `score.py` 는 이번 라운드에서 **무수정**이다(이관
-        무결성 증거를 보존한다). 모듈 상수로 노출하면 더 깔끔하지만 그건 소스 변경이다.
-        기대값은 리터럴이라 자기참조가 아니다 — 생산 집합이 바뀌면 여기서 깨진다.
+        소스를 AST 로 읽는 이유: `struct_keys` 는 이관 라운드(2026-08-11)에서
+        **무수정**이었다(이관 무결성 증거를 보존하려고 모듈 상수로 노출하는 대신
+        AST 를 택했다). **2026-08-13 R2 는 `score.py` 를 수정한다**(소스 커버리지
+        섹션의 `document_id` 폴백, `TestSourceCoverageResourceFallback` 참고) —
+        `struct_keys` 자체는 그 변경 범위 밖이라 이 리터럴 대사 방식은 여전히
+        유효하다. 기대값은 리터럴이라 자기참조가 아니다 — 생산 집합이 바뀌면
+        여기서 깨진다.
         """
         src = pathlib.Path(gs.__file__).read_text(encoding="utf-8")
         found = None

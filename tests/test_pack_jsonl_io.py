@@ -256,20 +256,32 @@ class TestShardBoundaries:
     """경계 조건. 전부 2026-08-04 적대 검증에서 **생존한 돌연변이**를 닫는 검사다."""
 
     def test_shard_index_limit_is_enforced_at_the_boundary(self, p):
-        """`assert idx < _MAX_SHARDS` 를 `<=` 로 바꿔도 아무 테스트가 안 죽었다.
+        """`idx < _MAX_SHARDS` 검사를 완화해도 아무 테스트가 안 죽었었다(2026-08-04).
 
-        idx=100 이면 `chunks.100.jsonl` 이 만들어지는데 `shard_paths` 의 glob 은
-        `[0-9][0-9]` 라 그 파일을 **못 본다**. 즉 데이터가 조용히 사라진다.
-        이 assert 가 유일한 방어선이므로 경계 양쪽을 못박는다.
+        `assert` 였던 시절엔 `python -O` 가 이 검사 자체를 통째로 지워
+        idx=100 인 `chunks.100.jsonl` 을 조용히 만들 수 있었다(2026-08-13 리뷰
+        지적으로 `RuntimeError` 로 교체 — `TestOptimizedModeDoesNotDisableTheGuard`
+        가 `-O` 축을 따로 건다). 이 경계가 유일한 생산 방어선이므로 양쪽을 못박는다.
         """
         assert _shard_path(p, _MAX_SHARDS - 1).name == "chunks.99.jsonl"
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError, match="상한"):
             _shard_path(p, _MAX_SHARDS)
 
-    def test_glob_cannot_see_three_digit_shards(self, p):
-        """위 assert 가 왜 유일한 방어선인지 — 규칙 자체를 고정한다."""
+    def test_three_digit_shard_name_is_a_loud_failure_not_invisible(self, p):
+        """`chunks.100.jsonl` 은 더 이상 조용히 사라지지 않는다(2026-08-13, R3).
+
+        구 `Path.glob(f"{stem}.[0-9][0-9]{suffix}")` 는 이 파일을 패턴에 안 걸려
+        아예 못 봤다 — `shard_paths` 가 `[]` 를 돌려주고 호출자는 "shard 없음"으로
+        읽어 데이터가 조용히 사라졌다. 신 구현은 `scandir` + 정규식으로 **먼저 넓게
+        찾고**(`\\d+`) 두 자리가 아니면 stray 로 잡아 `RuntimeError` 를 낸다 — 같은
+        입력이 이제는 시끄럽게 죽는다. 옛 테스트 이름(`test_glob_cannot_see_
+        three_digit_shards`)이 그 구 동작(못 봄=안전)을 계약처럼 읽히게 했던
+        것이 바로 이 클래스의 다른 검사가 고정하려던 문제(2026-08-11 리뷰
+        지적)와 같은 결의 사고였다.
+        """
         p.with_name("chunks.100.jsonl").write_text('{"id":0}\n', encoding="utf-8")
-        assert shard_paths(p) == []
+        with pytest.raises(RuntimeError, match="지원 밖 shard 이름"):
+            shard_paths(p)
 
     def test_appender_shards_never_exceed_limit(self, tmp_path):
         """append writer 가 만든 shard 는 전부 limit 이하다.
@@ -321,6 +333,102 @@ class TestShardBoundaries:
     def test_default_shard_limit_is_forty_megabytes(self):
         """테스트가 늘 limit 을 주입해서 기본값 자체는 무검증이었다(변이 생존)."""
         assert SHARD_LIMIT == 40 * 1024 * 1024
+
+
+class TestOptimizedModeDoesNotDisableTheGuard:
+    """`python -O` 는 `assert` 문을 바이트코드에서 통째로 지운다.
+
+    `_shard_path` 의 상한 검사가 `assert` 였던 시절엔, `-O` 로 실행되는 어떤
+    프로세스에서도(예: 최적화 플래그로 배포되는 운영 스크립트) 이 검사가 조용히
+    사라져 `chunks.100.jsonl` 같은 3자리 shard 가 만들어질 수 있었다(2026-08-13
+    리뷰 지적). `raise RuntimeError` 로 바꾼 뒤에는 `-O` 여부와 무관하게 항상
+    걸린다 — 인메모리 몽키패치로는 바이트코드 최적화 자체를 재현할 수 없으므로
+    실제 `-O` 인터프리터를 서브프로세스로 띄워 확인한다.
+    """
+
+    def test_dash_o_still_raises_past_the_shard_limit(self):
+        root = Path(jsonl_io_mod.__file__).resolve().parents[2]
+        code = (
+            "import opencrab.pack.jsonl_io as m\n"
+            "from pathlib import Path\n"
+            "try:\n"
+            "    m._shard_path(Path('x/chunks.jsonl'), m._MAX_SHARDS)\n"
+            "except RuntimeError:\n"
+            "    print('RAISED')\n"
+            "else:\n"
+            "    print('NOT-RAISED')\n"
+        )
+        r = subprocess.run(
+            [sys.executable, "-O", "-c", code],
+            cwd=root, env={**os.environ, "PYTHONPATH": str(root)},
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "RAISED", (
+            "-O 모드에서 상한 가드가 사라졌다(assert 잔재 의심): "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}")
+
+
+class TestShardPathsSingleScandirPass:
+    """`shard_paths` 의 발견·stray 판정이 `glob` 없는 단일 `scandir` 패스인가(R3, 2026-08-13).
+
+    발견(`re.escape(stem) + r"\\.(\\d+)" + ...`)과 stray 판정(`[0-9]{2}` fullmatch)이
+    **같은 정규식의 캡처 그룹**에서 갈리므로 둘이 따로 어긋날 수 없다는 것이 이
+    설계의 요점이다. 아래는 그 경계에서 실제로 갈리는 입력들이다.
+    """
+
+    def test_two_digit_and_three_digit_coexist_raises(self, p):
+        """`.00`(정상) 과 `.100`(stray) 이 같은 디렉터리에 있으면 전체가 죽는다.
+
+        정상 shard 가 하나 있다고 해서 stray 를 눈감아 주면 안 된다 — stray 판정은
+        정상 shard 존재 여부와 무관하게 독립으로 걸려야 한다.
+        """
+        p.with_name("chunks.00.jsonl").write_text('{"id":0}\n', encoding="utf-8")
+        p.with_name("chunks.100.jsonl").write_text('{"id":1}\n', encoding="utf-8")
+        with pytest.raises(RuntimeError, match="지원 밖 shard 이름"):
+            shard_paths(p)
+
+    @pytest.mark.parametrize("digit_name", ["chunks.１２.jsonl", "chunks.٠١.jsonl"],
+                             ids=["fullwidth", "arabic-indic"])
+    def test_non_ascii_digit_tail_raises(self, p, digit_name):
+        """`\\d` 는 유니코드 숫자도 매치한다 — ASCII 두 자리가 아니면 stray 다.
+
+        전각 숫자·아랍-인도 숫자 모두 `str.isdigit()` 이 참이라 사람 눈에는 "숫자
+        같은" shard 이름이지만, 이 스킴은 ASCII `[0-9]{2}` 만 지원한다. 매치는
+        넓게 잡아 이런 이름도 **발견**하고, 판정에서 좁혀 stray 로 떨어뜨린다 —
+        구현이 아예 못 보는 것과 봤는데 거부하는 것은 다른 안전성이다.
+        """
+        p.with_name(digit_name).write_text('{"id":0}\n', encoding="utf-8")
+        with pytest.raises(RuntimeError, match="지원 밖 shard 이름"):
+            shard_paths(p)
+
+    def test_glob_metacharacter_in_stem_is_found_via_scandir(self, tmp_path):
+        """`Path.glob` 이 메타문자 stem 에서 실패하던 자리를 정규식이 대신한다.
+
+        `foo[bar].jsonl` 의 stem `foo[bar]` 는 glob 문법에서 문자 클래스로 읽힌다
+        — 구 `path.parent.glob(f"{stem}.[0-9][0-9]{suffix}")` 는 이 stem 을 가진
+        shard 를 **찾지 못했다**(HEAD 잔재, 2026-08-11 검수 실증). `re.escape(stem)`
+        은 메타문자를 리터럴로 고정하므로 정상 발견된다.
+        """
+        q = tmp_path / "foo[bar].jsonl"
+        q.with_name("foo[bar].00.jsonl").write_text('{"id":0}\n', encoding="utf-8")
+        q.with_name("foo[bar].01.jsonl").write_text('{"id":1}\n', encoding="utf-8")
+        found = shard_paths(q)
+        assert [f.name for f in found] == ["foo[bar].00.jsonl", "foo[bar].01.jsonl"], found
+        assert [r["id"] for r in iter_jsonl(q)] == [0, 1]
+
+    @pytest.mark.parametrize("gz_name", ["chunks.jsonl.gz", "chunks.00.jsonl.gz"],
+                             ids=["base-gz", "shard-gz"])
+    def test_gz_adjacent_file_is_stray_not_silently_ignored(self, p, gz_name):
+        """`.gz` 인접 파일은 읽기 미지원이지만 **존재를 무시하지 않는다**.
+
+        압축만 남고 평문 shard 가 하나도 없는 팩은, gz 를 무시하면 `shard_paths`
+        가 `[]` 를 돌려줘 "정상 부재"와 "손상(압축만 남음)"이 구분되지 않는다
+        (2026-08-13 검수 지적). base-gz(`chunks.jsonl.gz`)와 shard-gz
+        (`chunks.00.jsonl.gz`) 두 이름 형태를 각각 잡는다.
+        """
+        p.with_name(gz_name).write_bytes(b"\x1f\x8b")  # gzip 매직 바이트, 내용은 무관
+        with pytest.raises(RuntimeError, match="지원 밖 shard 이름"):
+            shard_paths(p)
 
 
 class TestTwoWritersHoldTheSameContract:
@@ -607,10 +715,14 @@ class TestModuleLevelConstants:
     """
 
     def test_max_shards_is_two_digits_worth(self):
-        """`_MAX_SHARDS` 는 glob 패턴 `[0-9][0-9]` 와 **짝** 이다.
+        """`_MAX_SHARDS` 는 `shard_paths` 의 ASCII 두 자리 판정(`[0-9]{2}` fullmatch)과
+        **짝** 이다(2026-08-13, R3 — 종전엔 glob 패턴 `[0-9][0-9]` 와 짝이었다).
 
-        100 이상이면 `chunks.100.jsonl` 이 만들어지는데 glob 이 그 파일을 못 봐서
-        데이터가 조용히 사라진다. 두 값은 따로 못 움직인다.
+        100 이상이면 `chunks.100.jsonl` 이 만들어진다. 옛 glob 은 이 파일을 패턴에
+        못 걸어 조용히 사라지게 뒀지만, 신 구현은 `scandir`+정규식으로 이 파일을
+        **찾아낸 뒤** 두 자리가 아니므로 stray 로 거부한다(`RuntimeError`,
+        `TestShardPathsSingleScandirPass` 가 그 축을 건다) — 조용한 소실에서
+        시끄러운 거부로 바뀌었을 뿐, 두 값이 따로 못 움직이는 것은 여전하다.
         """
         assert _MAX_SHARDS == 100
         assert _shard_path(Path("x/chunks.jsonl"), _MAX_SHARDS - 1).name == "chunks.99.jsonl"
