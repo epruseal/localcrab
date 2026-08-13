@@ -315,8 +315,12 @@ class TestLoadNodesIncremental:
         live_nodes = state["nodes"]
         assert "n1" in live_nodes, "적재한 노드가 라이브 상태에 안 보인다"
 
+        # doc_node_spaces 도 live_pack_state 산출물을 그대로 쓴다(R2, #142
+        # 재리뷰) — 손으로 `{}` 를 지어내면 실제로 존재하는 doc 행을 "없다"로
+        # 오판하게 만들어 same 이 chg 로 흘러 이 테스트 자체가 R2 검사를
+        # 못 지나간다(위 docstring 의 "라이브를 실제로 읽는다" 원칙과 같은 이유).
         n_new, n_chg, n_same, skip, err, ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, {})
+            "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             "라이브와 동일한 행이 same 으로 판정되지 않았다 — 매 증분마다 전량 재적재된다")
         assert ids == {"n1"}

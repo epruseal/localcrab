@@ -264,6 +264,57 @@ def _vec_backend(vec):
     return (None, None, None)
 
 
+def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
+    """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
+    기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
+    (kind `None`, `available=True`)를 "가용하지만 벡터 0건"과 구분 못 하고,
+    그 둘을 섞어 빈 집합을 돌려주면 호출자가 "벡터가 없다"로 오인해 **존재하는
+    벡터까지 매번 재임베딩**하게 된다(2026-08-13 재리뷰 R1). kind 가 `None`
+    이면(미가용·미인식 공히) **`None`** 을 돌려줘 호출자가 검사 자체를 skip
+    하게 한다 — `0`(세어보니 없다)과 "모른다"를 섞지 않는다.
+
+    `live_pack_state` 와 `load_chunks_incremental` 이 이 헬퍼 하나를 공유한다
+    (사본 금지 — 갈리면 한쪽만 고쳐진다, `_vec_backend` 자신의 교훈과 동일).
+
+    **한계**: 공유-id 팩(evidence 노드 id == 청크 id)에서는 노드 벡터와 청크
+    벡터가 같은 슬롯(`pack_id` 컬럼의 같은 `node_id`)을 쓴다 — 이 함수는 그
+    슬롯 충돌 자체를 고치지 않는다(기존 한계, `load.py` 상단 주석 참고).
+    이 함수는 **존재 검사**만 한다: 슬롯이 있으면(누가 채웠든) 존재로 본다.
+    """
+    vec_ids: set[str] = set()
+    kind, handle, table = _vec_backend(vec)
+    if kind == "sql":
+        for (node_id,) in handle.execute(
+            f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
+        ).fetchall():
+            vec_ids.add(node_id)
+    elif kind == "chroma":
+        # F6 이후 delete_pack 의 회수 술어와 동일하게 pack_id 단일 키로 좁혔다.
+        # 이 vec_ids 는 incremental_finalize 에서 그대로
+        # `vec_orphans = live_vecids - (bypack_node_ids | bypack_chunk_ids)` 로
+        # 이어져 **삭제를 만든다** — source 까지 넓게 매치하면 pack_id 가 다른
+        # 팩인 벡터 행(레거시 source 만 이 팩명과 같은 행)이 고아 후보에 섞여
+        # 지워진다. F6 가 SQL 쪽에서 닫은 것과 같은 교차팩 삭제 경로다.
+        got = handle.get(where={"pack_id": pack_name})
+        vec_ids.update(got.get("ids", []))
+    elif kind == "sqlalchemy":
+        from sqlalchemy import text as _sa_text
+        with handle.connect() as _c:
+            for (node_id,) in _c.execute(
+                _sa_text(f"SELECT node_id FROM {table} WHERE pack_id = :p"), {"p": pack_name}):
+                vec_ids.add(node_id)
+    else:
+        if getattr(vec, "available", False):
+            # 가용하지만 열거를 지원 안 하는 백엔드 — 빈 집합은 "벡터가 없다"로
+            # 읽힌다. 그러면 증분이 고아 임베딩을 **영영 못 지운다**(delete_pack
+            # 축 교훈과 동일) 또는 존재하는 벡터를 매번 재임베딩한다(R1). 모른다는
+            # 것을 말한다.
+            log.warning("벡터 ID 열거 미지원 백엔드(%s) — 벡터 존재를 판정할 수 없다",
+                        type(vec).__name__)
+        return None
+    return vec_ids
+
+
 def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     """벡터 레코드의 **메타데이터만** 갱신. 성공하면 True.
 
@@ -636,33 +687,14 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     ):
         edges.add((from_id, relation, to_id))
 
-    vec_ids: set[str] = set()
-    kind, handle, table = _vec_backend(vec)
-    if kind == "sql":
-        for (node_id,) in handle.execute(
-            f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
-        ).fetchall():
-            vec_ids.add(node_id)
-    elif kind == "chroma":
-        # F6 이후 delete_pack 의 회수 술어와 동일하게 pack_id 단일 키로 좁혔다.
-        # 이 vec_ids 는 incremental_finalize 에서 그대로
-        # `vec_orphans = live_vecids - (bypack_node_ids | bypack_chunk_ids)` 로
-        # 이어져 **삭제를 만든다** — source 까지 넓게 매치하면 pack_id 가 다른
-        # 팩인 벡터 행(레거시 source 만 이 팩명과 같은 행)이 고아 후보에 섞여
-        # 지워진다. F6 가 SQL 쪽에서 닫은 것과 같은 교차팩 삭제 경로다.
-        got = handle.get(where={"pack_id": pack_name})
-        vec_ids.update(got.get("ids", []))
-    elif kind == "sqlalchemy":
-        from sqlalchemy import text as _sa_text
-        with handle.connect() as _c:
-            for (node_id,) in _c.execute(
-                _sa_text(f"SELECT node_id FROM {table} WHERE pack_id = :p"), {"p": pack_name}):
-                vec_ids.add(node_id)
-    elif getattr(vec, "available", False):
-        # 빈 집합은 "벡터가 없다"로 읽힌다. 그러면 증분이 고아 임베딩을 **영영 못 지운다** —
-        # 삭제된 노드의 벡터가 의미검색에 계속 뜬다. 모른다는 것을 말한다.
-        log.warning("벡터 ID 열거 미지원 백엔드(%s) — 고아 임베딩을 판정할 수 없다",
-                    type(vec).__name__)
+    # `_live_vec_ids` 가 kind 판별·3분기 열거를 전담한다(R1, #142 재리뷰 —
+    # `load_chunks_incremental` 과 이 헬퍼를 공유해 사본이 갈리지 않게 한다).
+    # 이 함수의 기존 계약은 "vec_ids 는 항상 set"이다 — 헬퍼가 kind 미가용·
+    # 미인식이면 None 을 돌려주므로(호출자가 검사를 skip 하도록) 여기서 빈
+    # 집합으로 되접어 호환을 유지한다(게이트 ㉱: 이 함수의 vec_ids 결과 불변).
+    vec_ids = _live_vec_ids(vec, pack_name)
+    if vec_ids is None:
+        vec_ids = set()
 
     # doc_node_spaces (F4-b): 노드축 **대사(reconcile)** 술어(pack_id 단일 키) —
     # 위 nodes 조회와 동일한 폭이다. 회수(4키) 술어를 쓰면 `pack` 으로만 태그된
@@ -729,6 +761,35 @@ def load_nodes(
     return ok, skip, err
 
 
+def _dup_type_node_rows(graph, pack_name: str) -> dict[str, set[str]]:
+    """이 팩의 `graph_nodes` 를 node_id 로 묶어 **어떤 타입 행들이 실재하는가**를
+    낸다(R3, #142 재리뷰). 컬럼 2개(`node_type`, `node_id`)짜리 팩 스코프 1회
+    조회 — `live_pack_state` nodes 축과 같은 술어(`_json_str_eq`, r11 중립 훅)를
+    쓴다.
+
+    `live_pack_state` 는 node_id 로 **collapse** 한다(:609 부근) — 한 node_id 에
+    타입이 둘 이상이면 하나만 남기고 나머지는 조회 결과에서 보이지 않는다.
+    이 함수는 그 collapse **이전**의 raw 집합을 낸다 — 구 타입 행 스윕(아래
+    `load_nodes_incremental` 말미)이 collapse 뒤에서는 볼 수 없는 중복을
+    찾는 유일한 자리다. PG 형 fake 로 직접 단위 검사할 수 있도록 독립
+    함수로 뺐다(전체 `load_nodes_incremental` 은 OntologyBuilder 배선이
+    필요해 PG fake 만으로는 못 돌린다).
+    """
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
+    by_node: dict[str, set[str]] = {}
+    for node_type, node_id in graph._fetch_all(
+        f"""
+        SELECT node_type, node_id
+        FROM {graph._table('graph_nodes')}
+        WHERE {pred}
+        """,
+        {"pack": pack_name},
+    ):
+        by_node.setdefault(node_id, set()).add(node_type)
+    return by_node
+
+
 def load_nodes_incremental(
     pack_name: str,
     nodes_file: Path,
@@ -760,6 +821,10 @@ def load_nodes_incremental(
     require_live_data("load_nodes_incremental")
     n_new = n_chg = n_same = skip = err = 0
     bypack_ids: set[str] = set()
+    # R3(#142 재리뷰): 파일이 확정한 노드별 최종 타입 — 루프 말미의 구 타입
+    # 행 스윕이 대조 기준으로 쓴다. same-continue **앞**에서 수집해야 same
+    # 판정 노드(정확히 목표 상태)도 스윕이 놓치지 않는다.
+    file_types: dict[str, str] = {}
 
     def _cleanup_stale_doc_spaces(node_id: str, space: str) -> None:
         """이 node_id 가 이번에 `space` 로 확정됐다 — doc_node_spaces 에 기록된
@@ -787,6 +852,7 @@ def load_nodes_incremental(
             space, node_type, node_id, props = transform_node(pack_name, row)
             id_map[node_id] = (space, node_type)
             bypack_ids.add(node_id)  # add 성공 여부와 무관하게 항상(엣지 endpoint·삭제 대조용)
+            file_types[node_id] = node_type  # same-continue 앞 — same 판정 노드도 스윕 대상에 든다
 
             live = live_nodes.get(node_id)
             if live is not None:
@@ -797,15 +863,29 @@ def load_nodes_incremental(
                 # "스토어가 넣는 것"이라는 축으로 묶는다.
                 live_props = {k: v for k, v in live[2].items() if k not in STORE_INJECTED_KEYS}
                 if live[0] == node_type and live_props == props:
-                    n_same += 1
-                    # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
-                    # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
-                    # same 경로도 확인한다.
-                    _cleanup_stale_doc_spaces(node_id, space)
-                    done = n_new + n_chg + n_same + skip + err
-                    if done % 500 == 0:
-                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
-                    continue
+                    # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
+                    # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
+                    # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
+                    # 전진해 다음 런이 same 으로만 본다, doc 행 영구 유실).
+                    # 앵커는 doc_node_spaces 에 애초에 없다(F4-b 가 뺀다) — 검사하면
+                    # 앵커마다 매 런 오탐 재적재 루프가 열린다.
+                    doc_row_missing = (
+                        not _is_anchor_node(node_id, props)
+                        and space not in doc_node_spaces.get(node_id, set())
+                    )
+                    if not doc_row_missing:
+                        n_same += 1
+                        # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
+                        # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
+                        # same 경로도 확인한다.
+                        _cleanup_stale_doc_spaces(node_id, space)
+                        done = n_new + n_chg + n_same + skip + err
+                        if done % 500 == 0:
+                            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+                        continue
+                    log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
+                    # same 으로 안 잡고 아래 chg 경로로 낙하한다 — live[0]==node_type
+                    # 이므로 stale_typed 는 자연히 None(구 타입 삭제 로직 미개입).
 
             # 타입이 바뀐 구 행은 **새 노드가 실제로 저장된 뒤에** 지운다(아래).
             #
@@ -832,6 +912,12 @@ def load_nodes_incremental(
                         try:
                             graph.delete_node(stale_typed[0], node_id)
                         except Exception as exc:
+                            # R3(#142 재리뷰): 즉시 신호 — 이 실패는 warning 만 남기고
+                            # err 미계수였다. live_pack_state 는 node_id 로 collapse
+                            # 하므로(신 행이 이겨 구 행을 가린다) 다음 런이 same 으로
+                            # 보고 재시도하지 않아 구 행 + cascade 엣지가 영구 잔존했다
+                            # — err+1 은 즉시 신호, 루프 말미 스윕(아래)이 구조적 회수다.
+                            err += 1
                             log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
                                         node_id, stale_typed[0], exc)
                         # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
@@ -867,6 +953,37 @@ def load_nodes_incremental(
             done = n_new + n_chg + n_same + skip + err
             if done % 500 == 0:
                 print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+
+    # ── R3(#142 재리뷰): 구 타입 행 구조적 회수(매 런) ──────────────────────
+    # 위 저장-후-삭제 순서 안에서 `graph.delete_node` 가 실패하면(경합·스토어
+    # 일시 오류) 구 타입 행이 warning(+err, 위)만 남기고 그 실행에서는 못
+    # 지워진다. `live_pack_state` 는 node_id 로 collapse 해 신 행이 구 행을
+    # 가리므로 다음 런이 same 으로 보고 재시도하지 않는다 — 매 런 팩 스코프로
+    # 훑어 파일이 확정한 타입 행이 실재하는 노드의 나머지 타입 행을 지운다
+    # (cascade 엣지 포함). 즉시 err 계수(위)와 별개로 **다음 런까지 남지
+    # 않게** 하는 구조적 안전망이다.
+    def _is_anchor(node_id: str) -> bool:
+        return _is_anchor_node(node_id, live_nodes.get(node_id, (None, None, {}))[2])
+
+    for node_id, types in _dup_type_node_rows(graph, pack_name).items():
+        if len(types) < 2:
+            continue                        # 중복 타입 없음 — 스윕 대상 아님
+        file_type = file_types.get(node_id)
+        if file_type is None or file_type not in types:
+            # 이번 적재 밖이거나(입력에 없는 node_id) 파일 타입 행이 아직
+            # 없다(= add_node 실패 상태) — **보존**(:816 현상 유지 원칙과 동일
+            # 근거: 파일 타입 행마저 없는데 구 행을 지우면 영구 소실이다).
+            continue
+        if _is_anchor(node_id):
+            continue                        # 실데이터 도달 불가지만 다른 삭제 지점과 일관
+        for stale_type in types - {file_type}:
+            try:
+                graph.delete_node(stale_type, node_id)
+            except Exception as exc:
+                err += 1
+                log.warning("구 타입 행 스윕 삭제 실패 %s(%s): %s", node_id, stale_type, exc)
+            else:
+                log.warning("구 타입 행 스윕 삭제(%s) %s(%s)", pack_name, node_id, stale_type)
 
     return n_new, n_chg, n_same, skip, err, bypack_ids
 
@@ -1096,6 +1213,12 @@ def load_chunks_incremental(
     b_metas: list[dict] = []
     b_kinds: list[str]  = []      # "new" | "txt" — flush 후 c_new/c_txt 반영용
 
+    # R1(#142 재리뷰): text·meta 가 라이브와 동일해도 **벡터만** 유실됐을 수
+    # 있다(부분 복원·백엔드 삭제). c_same 판정 앞에서 벡터 존재를 확인해 그
+    # 경우 txt 경로로 재임베딩시킨다 — 1회 계산, None 이면(벡터 축 없는 배포)
+    # 검사 전체를 skip 한다(현행 동작 보존).
+    vec_set = _live_vec_ids(vec, pack_name)
+
     def flush_single(sid: str, txt: str, meta: dict, kind: str) -> None:
         """청크 1건 upsert(재임베딩). doc 쓰기까지 성공해야 kind 에 따라
         c_new/c_txt 반영한다(불변식 ①, [Δ r11 P2] — 형제 `flush()` 와 동일)."""
@@ -1193,6 +1316,16 @@ def load_chunks_incremental(
                 except Exception as exc:
                     err += 1
                     log.warning("청크 메타갱신 오류(%s) %s: %s", pack_name, chunk_id[:8], exc)
+            elif vec_set is not None and chunk_id not in vec_set:
+                # R1: 텍스트·메타 모두 라이브와 동일하지만 벡터가 없다(부분 복원·
+                # 백엔드 삭제로 유실). same 으로 넘기면 다음 증분도 텍스트·메타가
+                # 여전히 같으니 또 same — **영구 부재**다. 기존 txt 배치 경로로
+                # 재임베딩시켜 회수한다(doc 재쓰기는 내용이 같아 무해).
+                b_ids.append(chunk_id)
+                b_texts.append(row["text"])
+                b_metas.append(meta)
+                b_kinds.append("txt")
+                log.warning("벡터 유실 회수(%s) %s", pack_name, chunk_id[:8])
             else:
                 c_same += 1
 
