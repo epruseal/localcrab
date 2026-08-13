@@ -141,6 +141,66 @@ def resolve_backfill_dry_run(
     return True, None
 
 
+def resolve_row_pack_id(
+    props_raw: Any, row: Any, assume_pack_id: str | None
+) -> tuple[str | None, str]:
+    """Decide the pack_id one ``graph_nodes``/``graph_edges`` row should
+    carry, using the EXACT precedence ``_process`` (below) has always
+    applied. Extracted as a module-level function (#146 M P1-1) so the
+    migration script's dry-run prediction and its post-apply verification
+    call this SAME logic instead of re-deriving it -- a divergence between
+    graph pack_id assignment and vector pack_id assignment becomes
+    structurally impossible.
+
+    ``row`` must support ``row.keys()`` and ``row[key]`` (a ``sqlite3.Row``
+    from the same ``SELECT <key_cols>, properties FROM <table>`` query
+    ``_process`` runs) -- only its ``*_id``-suffixed columns are consulted,
+    as a last-resort inference source after ``props``'s own
+    source_path/source_id/id keys.
+
+    Returns ``(pack_id, reason)``:
+      - ``(existing, "existing")`` -- ``props`` already carries a pack_id.
+      - ``(inferred, "inferred")`` -- found via ``infer_pack_id_from_path``
+        on props' source_path/source_id/id, or a ``row`` column ending in
+        ``_id``.
+      - ``(assume_pack_id, "assumed")`` -- nothing inferable; ``assume_pack_id``
+        was given.
+      - ``(None, "skipped-non-dict")`` -- ``props_raw`` parsed to a non-dict
+        (malformed JSON is treated as ``{}``, which IS a dict -- this only
+        fires when the column holds valid JSON that isn't an object, e.g. a
+        bare string or array).
+      - ``(None, "skipped-unresolvable")`` -- valid dict, no pack_id,
+        nothing inferable, and no ``assume_pack_id`` given.
+    """
+    try:
+        props = json.loads(props_raw) if props_raw else {}
+    except (TypeError, ValueError):
+        props = {}
+    if not isinstance(props, dict):
+        return None, "skipped-non-dict"
+
+    existing = props.get("pack_id")
+    if existing:
+        return str(existing), "existing"
+
+    for candidate_key in ("source_path", "source_id", "id"):
+        value = props.get(candidate_key)
+        if value:
+            inferred = infer_pack_id_from_path(str(value))
+            if inferred:
+                return inferred, "inferred"
+
+    for key in row.keys():
+        if key.endswith("_id"):
+            inferred = infer_pack_id_from_path(str(row[key]))
+            if inferred:
+                return inferred, "inferred"
+
+    if assume_pack_id:
+        return assume_pack_id, "assumed"
+    return None, "skipped-unresolvable"
+
+
 def _backfill_pack_ids_unlocked(
     db_path: str | Path,
     *,
@@ -176,38 +236,21 @@ def _backfill_pack_ids_unlocked(
             cur.execute(f"SELECT {', '.join(key_cols)}, properties FROM {table}")
             rows = cur.fetchall()
             for row in rows:
+                pack_id, reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
+                if reason == "existing":
+                    continue
+                if reason in ("skipped-non-dict", "skipped-unresolvable"):
+                    summary[f"{table.split('_')[1]}_skipped"] += 1
+                    continue
+                # reason is "inferred" or "assumed" -- re-parse to get the
+                # full props dict to write back (resolve_row_pack_id only
+                # returns the decided pack_id, not the dict it came from).
                 try:
                     props = json.loads(row["properties"]) if row["properties"] else {}
                 except (TypeError, ValueError):
                     props = {}
-                if not isinstance(props, dict):
-                    summary[f"{table.split('_')[1]}_skipped"] += 1
-                    continue
-                if props.get("pack_id"):
-                    continue
-                inferred: str | None = None
-                for candidate_key in ("source_path", "source_id", "id"):
-                    value = props.get(candidate_key)
-                    if value:
-                        inferred = infer_pack_id_from_path(str(value))
-                        if inferred:
-                            break
-                if not inferred:
-                    # node_id column from the row itself
-                    for key in key_cols:
-                        if key.endswith("_id"):
-                            inferred = infer_pack_id_from_path(str(row[key]))
-                            if inferred:
-                                break
-                if inferred:
-                    props["pack_id"] = inferred
-                    summary[f"{table.split('_')[1]}_inferred"] += 1
-                elif assume_pack_id:
-                    props["pack_id"] = assume_pack_id
-                    summary[f"{table.split('_')[1]}_assumed"] += 1
-                else:
-                    summary[f"{table.split('_')[1]}_skipped"] += 1
-                    continue
+                props["pack_id"] = pack_id
+                summary[f"{table.split('_')[1]}_{reason}"] += 1
                 if not dry_run:
                     set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
                     values = [json.dumps(props)] + [row[c] for c in key_cols]

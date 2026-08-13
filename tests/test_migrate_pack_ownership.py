@@ -461,6 +461,64 @@ class TestRegisterGraphPacksFromEdges:
 
 
 # ---------------------------------------------------------------------------
+# node-pack-map builders: dry-run prediction vs. post-apply ground truth
+# (#146 M P1-1, gate R5)
+# ---------------------------------------------------------------------------
+
+
+class TestNodePackMapPredictionMatchesActual:
+    def test_prediction_matches_post_apply_actual(self, bootstrapped_owner, env):
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node(
+                "Entity", "n-inferred", {"source_path": "/data/packs/pack-a/x.md"}, space_id="concept"
+            )
+            store.upsert_node("Entity", "n-assumed", {"note": "nothing to infer"}, space_id="concept")
+        finally:
+            store.close()
+
+        db_path = env / "graph.db"
+        node_ids = ["n-inferred", "n-assumed"]
+
+        predicted = migrate._predict_node_pack_map(db_path, node_ids, migrate.DEFAULT_PACK_ID)
+        assert predicted == {"n-inferred": "pack-a", "n-assumed": migrate.DEFAULT_PACK_ID}
+
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+
+        actual = migrate._read_actual_node_pack_ids(db_path, node_ids)
+        assert actual == predicted
+
+    def test_skipped_non_dict_row_excluded_from_both_maps(self, bootstrapped_owner, env):
+        import json
+        import sqlite3
+
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        store.close()  # tables created, no rows
+
+        db_path = env / "graph.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO graph_nodes (node_type, node_id, space_id, properties) "
+                "VALUES ('Entity', 'n-non-dict', 'concept', ?)",
+                (json.dumps("just a string"),),
+            )
+
+        predicted = migrate._predict_node_pack_map(db_path, ["n-non-dict"], migrate.DEFAULT_PACK_ID)
+        assert predicted == {}
+
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+
+        actual = migrate._read_actual_node_pack_ids(db_path, ["n-non-dict"])
+        assert actual == {}
+
+
+# ---------------------------------------------------------------------------
 # Structured per-stage outcomes + exit codes (#146 M)
 # ---------------------------------------------------------------------------
 
@@ -616,7 +674,7 @@ class _FakeVectorStore:
 class TestBackfillVector:
     def test_dry_run_reports_without_writing(self):
         store = _FakeVectorStore({"n1": {"document": "d1", "metadata": {}}})
-        stats = migrate._backfill_vector(store, ["n1"], "default", apply=False)
+        stats = migrate._backfill_vector(store, ["n1"], {"n1": "default"}, apply=False)
         assert stats == {"checked": 1, "missing": 1, "updated": 0}
         assert store.upserts == []
 
@@ -627,25 +685,63 @@ class TestBackfillVector:
                 "n2": {"document": "d2", "metadata": {"pack_id": "already-tagged"}},
             }
         )
-        stats = migrate._backfill_vector(store, ["n1", "n2"], "default", apply=True)
+        stats = migrate._backfill_vector(
+            store, ["n1", "n2"], {"n1": "default", "n2": "default"}, apply=True
+        )
         assert stats == {"checked": 2, "missing": 1, "updated": 1}
         assert store.upserts == [("n1", {"pack_id": "default"})]
         assert store._rows["n2"]["metadata"]["pack_id"] == "already-tagged"
 
     def test_unknown_node_id_is_skipped_not_an_error(self):
         store = _FakeVectorStore({})
-        stats = migrate._backfill_vector(store, ["ghost"], "default", apply=True)
+        stats = migrate._backfill_vector(store, ["ghost"], {"ghost": "default"}, apply=True)
         assert stats == {"checked": 1, "missing": 0, "updated": 0}
 
     def test_store_without_get_by_id_is_skipped(self):
         class NoGetById:
             available = True
 
-        stats = migrate._backfill_vector(NoGetById(), ["n1"], "default", apply=True)
+        stats = migrate._backfill_vector(NoGetById(), ["n1"], {"n1": "default"}, apply=True)
         assert stats == {"checked": 0, "missing": 0, "updated": 0}
 
     def test_unavailable_store_is_skipped(self):
         store = _FakeVectorStore({"n1": {"document": "d1", "metadata": {}}})
         store.available = False
-        stats = migrate._backfill_vector(store, ["n1"], "default", apply=True)
+        stats = migrate._backfill_vector(store, ["n1"], {"n1": "default"}, apply=True)
         assert stats == {"checked": 0, "missing": 0, "updated": 0}
+
+    # -- #146 M P1-1: vector must follow node_pack_map, never a fixed default --
+
+    def test_node_id_absent_from_map_gets_no_upsert(self):
+        """A node_id graph itself could not attribute a pack_id to (absent
+        from node_pack_map -- the "skipped" resolve_row_pack_id path) must
+        not get vector-tagged with a guess: zero get_by_id/upsert_texts
+        activity for it (gate R5 v3)."""
+        store = _FakeVectorStore({"n-skipped": {"document": "d", "metadata": {}}})
+        stats = migrate._backfill_vector(store, ["n-skipped"], {}, apply=True)
+        assert stats == {"checked": 1, "missing": 0, "updated": 0}
+        assert store.upserts == []
+
+    def test_each_node_gets_its_own_mapped_pack_id_not_a_blanket_default(self):
+        """gate R5 v3: existing/path-inferred/assumed each land in the
+        vector row exactly as node_pack_map says -- never squashed to a
+        single default_pack_id regardless of the graph's real resolution."""
+        store = _FakeVectorStore(
+            {
+                "n-existing": {"document": "d1", "metadata": {}},
+                "n-inferred": {"document": "d2", "metadata": {}},
+                "n-assumed": {"document": "d3", "metadata": {}},
+            }
+        )
+        node_pack_map = {
+            "n-existing": "already-set-pack",
+            "n-inferred": "pack-x",
+            "n-assumed": "default",
+        }
+        stats = migrate._backfill_vector(
+            store, ["n-existing", "n-inferred", "n-assumed"], node_pack_map, apply=True
+        )
+        assert stats == {"checked": 3, "missing": 3, "updated": 3}
+        assert store._rows["n-existing"]["metadata"]["pack_id"] == "already-set-pack"
+        assert store._rows["n-inferred"]["metadata"]["pack_id"] == "pack-x"
+        assert store._rows["n-assumed"]["metadata"]["pack_id"] == "default"

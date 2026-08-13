@@ -352,6 +352,18 @@ def _graph_missing_node_ids(graph: Any) -> list[str]:
     ]
 
 
+def _local_graph_db_path(settings: Any) -> Path | None:
+    """The local ``graph.db`` path, or ``None`` when out of the local-mode-
+    only SCOPE this migration's SQLite-specific graph helpers share (a
+    non-local ``storage_mode``, or the file not existing yet) -- shared by
+    ``_backfill_graph`` and the node-pack-map builders below (#146 M P1-1)
+    so the same guard isn't duplicated with a chance to drift."""
+    if settings.storage_mode != "local":
+        return None
+    db_path = Path(settings.local_data_dir) / "graph.db"
+    return db_path if db_path.exists() else None
+
+
 def _backfill_graph(settings: Any, default_pack_id: str, apply: bool) -> dict[str, Any]:
     """Delegates to the EXISTING ``opencrab.ontology.pack_provenance.
     backfill_pack_ids`` (same function ``opencrab packs backfill-pack-id``
@@ -359,21 +371,91 @@ def _backfill_graph(settings: Any, default_pack_id: str, apply: bool) -> dict[st
     module docstring SCOPE for why this is local-mode-only."""
     from opencrab.ontology.pack_provenance import backfill_pack_ids
 
-    if settings.storage_mode != "local":
-        print(
-            f"  storage_mode={settings.storage_mode!r} has no SQLite graph.db -- "
-            "skipping graph node/edge pack_id backfill (see module docstring SCOPE)."
-        )
-        return {"skipped": True}
-
-    db_path = Path(settings.local_data_dir) / "graph.db"
-    if not db_path.exists():
-        print(f"  {db_path} does not exist -- skipping.")
+    db_path = _local_graph_db_path(settings)
+    if db_path is None:
+        if settings.storage_mode != "local":
+            print(
+                f"  storage_mode={settings.storage_mode!r} has no SQLite graph.db -- "
+                "skipping graph node/edge pack_id backfill (see module docstring SCOPE)."
+            )
+        else:
+            print(f"  {Path(settings.local_data_dir) / 'graph.db'} does not exist -- skipping.")
         return {"skipped": True}
 
     summary = backfill_pack_ids(db_path, assume_pack_id=default_pack_id, dry_run=not apply)
     print(f"  graph.db backfill_pack_ids: {summary}")
     return summary
+
+
+def _predict_node_pack_map(
+    db_path: Path, node_ids: list[str], assume_pack_id: str
+) -> dict[str, str]:
+    """dry-run prediction (#146 M P1-1): for each ``node_id`` (read at its
+    CURRENT, pre-backfill state), resolve its would-be pack_id via
+    ``pack_provenance.resolve_row_pack_id`` -- the SAME helper the real
+    backfill (``_process``) uses, so a divergence between this prediction
+    and what actually gets written is structurally impossible. A node_id
+    that resolves to ``None`` (``skipped-non-dict``/``skipped-unresolvable``
+    -- backfill_pack_ids could not attribute it either) is excluded: vector
+    backfill must not write a guessed pack_id for a row the graph backfill
+    itself left unattributed.
+    """
+    import sqlite3
+
+    from opencrab.ontology.pack_provenance import resolve_row_pack_id
+
+    if not node_ids:
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        placeholders = ", ".join("?" for _ in node_ids)
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+            node_ids,
+        )
+        result: dict[str, str] = {}
+        for row in cur.fetchall():
+            pack_id, _reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
+            if pack_id is not None:
+                result[row["node_id"]] = pack_id
+        return result
+    finally:
+        conn.close()
+
+
+def _read_actual_node_pack_ids(db_path: Path, node_ids: list[str]) -> dict[str, str]:
+    """apply-path ground truth (#146 M P1-1): a direct re-query of
+    ``graph_nodes`` for ``node_ids``' CURRENT pack_id, called AFTER
+    ``backfill_pack_ids`` has run -- real measurement, not a
+    ``resolve_row_pack_id`` prediction. A node_id still lacking pack_id
+    (left unattributed by the backfill) is simply absent from the result,
+    matching ``_predict_node_pack_map``'s own exclusion of such rows."""
+    import json
+    import sqlite3
+
+    if not node_ids:
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        placeholders = ", ".join("?" for _ in node_ids)
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+            node_ids,
+        )
+        result: dict[str, str] = {}
+        for node_id, raw in cur.fetchall():
+            try:
+                props = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                props = {}
+            if isinstance(props, dict) and props.get("pack_id"):
+                result[node_id] = str(props["pack_id"])
+        return result
+    finally:
+        conn.close()
 
 
 def _backfill_doc(docs: Any, default_pack_id: str, apply: bool) -> dict[str, Any]:
@@ -422,7 +504,19 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 
-def _backfill_vector(vector: Any, node_ids: list[str], default_pack_id: str, apply: bool) -> dict[str, int]:
+def _backfill_vector(
+    vector: Any, node_ids: list[str], node_pack_map: dict[str, str], apply: bool
+) -> dict[str, int]:
+    """``node_pack_map`` (built by ``_predict_node_pack_map``/
+    ``_read_actual_node_pack_ids``) supplies each node_id's ACTUAL graph
+    pack_id (#146 M P1-1) -- a node that graph backfill path-inferred into
+    ``pack-x`` must have its vector row tagged ``pack-x`` too, not a
+    blanket ``default_pack_id``, or graph and vector end up in different
+    packs for the same row. A node_id absent from the map (graph itself
+    could not attribute a pack_id to it) is skipped entirely: no vector
+    upsert is issued for it, since guessing here would only disagree with
+    graph's own "unattributed" verdict.
+    """
     if not (hasattr(vector, "get_by_id") and hasattr(vector, "upsert_texts")):
         print("  vector store has no get_by_id/upsert_texts -- skipping (out of scope, see module docstring).")
         return {"checked": 0, "missing": 0, "updated": 0}
@@ -432,6 +526,8 @@ def _backfill_vector(vector: Any, node_ids: list[str], default_pack_id: str, app
 
     missing_ids: list[str] = []
     for node_id in node_ids:
+        if node_id not in node_pack_map:
+            continue
         doc = vector.get_by_id(node_id)
         if doc is None:
             continue
@@ -447,7 +543,7 @@ def _backfill_vector(vector: Any, node_ids: list[str], default_pack_id: str, app
             if doc is None:
                 continue
             meta = dict(doc.get("metadata") or {})
-            meta["pack_id"] = default_pack_id
+            meta["pack_id"] = node_pack_map[node_id]
             vector.upsert_texts([doc.get("document") or ""], [meta], [node_id])
             updated += 1
         if updated != len(missing_ids):
@@ -608,7 +704,33 @@ def main(argv: list[str] | None = None) -> int:
 
         print("\n2) Backfilling graph rows with no pack_id...")
         node_ids_needing_check = _graph_missing_node_ids(graph)
+        local_db_path = _local_graph_db_path(settings)
+        # Predicted BEFORE the backfill writes anything -- resolve_row_pack_id
+        # applied to each node's pre-backfill state (#146 M P1-1).
+        node_pack_map = (
+            _predict_node_pack_map(local_db_path, node_ids_needing_check, default_pack_id)
+            if local_db_path is not None
+            else {}
+        )
         graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
+        if args.apply and local_db_path is not None:
+            # Ground truth AFTER the write -- verifies the prediction above
+            # actually matches what backfill_pack_ids wrote, and is what
+            # vector backfill (step 5) uses from here on: real measurement
+            # beats prediction whenever both exist.
+            actual_pack_map = _read_actual_node_pack_ids(local_db_path, node_ids_needing_check)
+            diverged = {
+                nid
+                for nid in set(node_pack_map) | set(actual_pack_map)
+                if node_pack_map.get(nid) != actual_pack_map.get(nid)
+            }
+            if diverged:
+                print(
+                    f"  WARNING: predicted vs actual pack_id diverged for "
+                    f"{len(diverged)} node(s) -- resolve_row_pack_id/"
+                    f"backfill_pack_ids contract mismatch: {sorted(diverged)}"
+                )
+            node_pack_map = actual_pack_map
         graph_outcome, graph_reason = _stage_outcome(
             graph_stats,
             ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
@@ -670,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
             and hasattr(vector, "upsert_texts")
             and getattr(vector, "available", False)
         )
-        vector_stats = _backfill_vector(vector, node_ids_needing_check, default_pack_id, args.apply)
+        vector_stats = _backfill_vector(vector, node_ids_needing_check, node_pack_map, args.apply)
         if not vector_in_scope:
             vector_outcome, vector_reason = (
                 "skipped",

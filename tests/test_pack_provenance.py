@@ -11,6 +11,7 @@ from opencrab.ontology.pack_provenance import (
     infer_pack_id_from_path,
     matches_pack_filter,
     resolve_backfill_dry_run,
+    resolve_row_pack_id,
 )
 
 
@@ -257,3 +258,56 @@ class TestBackfillPackIds:
         assert summary["nodes_inferred"] == 0
         assert summary["edges_inferred"] == 0
         assert summary["nodes_skipped"] == 1  # n-unresolvable, still no hint
+
+
+# ---------------------------------------------------------------------------
+# resolve_row_pack_id (#146 M P1-1, gate R4: each of the helper's outcomes,
+# directly -- the SAME helper _process (above) and the migration script's
+# node-pack-map builders call, so a divergence between them is structurally
+# impossible)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRowPackId:
+    def test_existing_pack_id_wins_over_everything_else(self) -> None:
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id(
+            json.dumps({"pack_id": "already-set", "source_path": "/packs/other/x.md"}),
+            row,
+            "fallback-pack",
+        )
+        assert (pid, reason) == ("already-set", "existing")
+
+    def test_inferred_from_props_source_path(self) -> None:
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id(
+            json.dumps({"source_path": "/data/packs/pack-a/x.md"}), row, None
+        )
+        assert (pid, reason) == ("pack-a", "inferred")
+
+    def test_inferred_from_row_id_column_when_props_have_no_hint(self) -> None:
+        row = {"node_type": "Agent", "node_id": "/abs/packs/pack-y/x"}
+        pid, reason = resolve_row_pack_id(json.dumps({}), row, None)
+        assert (pid, reason) == ("pack-y", "inferred")
+
+    def test_assumed_fallback_when_nothing_inferable(self) -> None:
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id(json.dumps({}), row, "fallback-pack")
+        assert (pid, reason) == ("fallback-pack", "assumed")
+
+    def test_skipped_non_dict_valid_json(self) -> None:
+        """Valid JSON that isn't an object (a bare string here) -- distinct
+        from malformed JSON, which is treated as ``{}`` (still a dict)."""
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id(json.dumps("just a string"), row, "fallback-pack")
+        assert (pid, reason) == (None, "skipped-non-dict")
+
+    def test_skipped_unresolvable_when_no_assume_pack_id(self) -> None:
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id(json.dumps({}), row, None)
+        assert (pid, reason) == (None, "skipped-unresolvable")
+
+    def test_malformed_json_treated_as_empty_dict(self) -> None:
+        row = {"node_type": "Agent", "node_id": "n1"}
+        pid, reason = resolve_row_pack_id("not-json{{{", row, None)
+        assert (pid, reason) == (None, "skipped-unresolvable")
