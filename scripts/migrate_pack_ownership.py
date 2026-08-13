@@ -79,6 +79,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -115,7 +116,40 @@ def _registered_pack_ids(sql: Any) -> set[str]:
     return {r[0] for r in rows}
 
 
-def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> dict[str, int]:
+def _graph_edge_pack_ids(graph: Any) -> tuple[set[str], bool]:
+    """Distinct pack_id found in ``graph_edges.properties`` (#146 M P1-2).
+
+    Uses a raw ``SELECT properties`` + Python ``json.loads`` per row, NOT
+    SQL ``json_extract`` -- ``json_extract`` raises on malformed JSON,
+    while ``pack_provenance._process`` (the actual backfill) already
+    tolerates malformed JSON via a ``json.loads`` try/except. Enumeration
+    must use the same defense or it would disagree with the backfill about
+    which edges even have a pack_id.
+
+    Returns ``(pack_ids, enumerable)``. ``enumerable`` is False when
+    ``graph`` has no ``_table``/``_fetch_all`` (a non-SQL-backed wrapper,
+    e.g. Kuzu/Neo4j) -- re-implementing edge enumeration for a Cypher-style
+    backend is #182 scope, not this migration's; callers must not treat an
+    empty set as "no edge pack_ids" in that case.
+    """
+    if not (hasattr(graph, "_table") and hasattr(graph, "_fetch_all")):
+        return set(), False
+    table = graph._table("graph_edges")
+    rows = graph._fetch_all(f"SELECT properties FROM {table}", {})  # noqa: S608
+    pack_ids: set[str] = set()
+    for (raw,) in rows:
+        try:
+            props = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            props = {}
+        if isinstance(props, dict):
+            pid = props.get("pack_id")
+            if pid:
+                pack_ids.add(str(pid))
+    return pack_ids, True
+
+
+def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> dict[str, Any]:
     """One registry row per distinct graph pack_id not already registered.
 
     Uses the exact pack_id via ``_insert_pack`` (no quiet-suffixing --
@@ -123,29 +157,42 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
     pack_id ``backfill_pack_ids`` recovered via path-inference (not just
     the ``assume_pack_id`` default) also gets a registry row -- a fresh
     ``graph.list_packs()`` call here sees whatever the backfill step just
-    wrote (in --apply mode) or would have found unchanged (dry-run)."""
+    wrote (in --apply mode) or would have found unchanged (dry-run).
+
+    Candidates are the UNION of node pack_ids (``graph.list_packs()``, a
+    GROUP BY over ``graph_nodes``) and edge pack_ids
+    (``_graph_edge_pack_ids``, a raw ``graph_edges`` scan, #146 M P1-2) --
+    an edge whose endpoints are unpacked or foreign-packed but whose OWN
+    properties carry a pack_id would otherwise never reach the registry,
+    and #147's read-path scoping would then make it vanish silently.
+    """
     from opencrab.pack.ownership import _insert_pack
 
     if not getattr(graph, "available", False):
         print("  graph store unavailable -- skipping pack-id enumeration")
-        return {"graph_distinct_packs": 0, "unregistered": 0, "created": 0}
+        return {"graph_distinct_packs": 0, "unregistered": 0, "created": 0, "edges_enumerable": True}
 
     already = _registered_pack_ids(sql)
     rows = graph.list_packs(min_nodes=1)
-    candidates = [r for r in rows if r.get("pack_id") and r["pack_id"] not in already]
+    node_meta = {r["pack_id"]: r for r in rows if r.get("pack_id")}
+    edge_pack_ids, edges_enumerable = _graph_edge_pack_ids(graph)
+    all_pack_ids = set(node_meta) | edge_pack_ids
+    candidates = sorted(pid for pid in all_pack_ids if pid not in already)
     print(
-        f"  graph distinct pack_id: {len(rows)} total, "
+        f"  graph distinct pack_id: {len(all_pack_ids)} total "
+        f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}), "
         f"{len(candidates)} not yet in the registry"
     )
     created = 0
     if apply:
-        for r in candidates:
+        for pid in candidates:
+            meta = node_meta.get(pid)
             if _insert_pack(
                 sql,
-                r["pack_id"],
+                pid,
                 owner_id,
-                r.get("sample_title") or None,
-                r.get("sample_description") or None,
+                (meta.get("sample_title") or None) if meta else None,
+                (meta.get("sample_description") or None) if meta else None,
                 None,
             ):
                 created += 1
@@ -156,7 +203,12 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
                 "have raced this script; re-run to confirm before trusting "
                 "the registry."
             )
-    return {"graph_distinct_packs": len(rows), "unregistered": len(candidates), "created": created}
+    return {
+        "graph_distinct_packs": len(all_pack_ids),
+        "unregistered": len(candidates),
+        "created": created,
+        "edges_enumerable": edges_enumerable,
+    }
 
 
 def _ensure_default_pack(sql: Any, owner_id: str, apply: bool) -> tuple[str, bool]:
@@ -592,6 +644,13 @@ def main(argv: list[str] | None = None) -> int:
             registry_outcome, registry_reason = (
                 "skipped",
                 "graph unavailable -- pack_id enumeration skipped (default-pack registration still ran)",
+            )
+        elif not registry_stats.get("edges_enumerable", True):
+            registry_outcome, registry_reason = (
+                "skipped",
+                "graph_edges could not be scanned for pack_id on this backend "
+                "(no _table/_fetch_all -- e.g. Kuzu/Neo4j, #182 scope) -- an "
+                "edge-only pack_id may exist unregistered",
             )
         elif registry_pending == 0:
             registry_outcome, registry_reason = "clean", "nothing to do"

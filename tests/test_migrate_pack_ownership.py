@@ -399,6 +399,68 @@ class TestDefaultPackOwnerMatchesBootstrap:
 
 
 # ---------------------------------------------------------------------------
+# _register_graph_packs edge-only pack_id enumeration (#146 M P1-2)
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterGraphPacksFromEdges:
+    """gate R3: real LocalGraphStore + real graph_edges.properties (no
+    mocked ``list_packs``) -- an edge whose endpoints carry no pack_id of
+    their own, but whose OWN properties do, must still reach the registry."""
+
+    def test_edge_only_pack_id_is_registered(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node("Entity", "e1", {"name": "no pack"}, space_id="concept")
+            store.upsert_node("Entity", "e2", {"name": "no pack"}, space_id="concept")
+            store.upsert_edge(
+                "concept", "e1", "related_to", "concept", "e2", {"pack_id": "edge-only-pack"}
+            )
+        finally:
+            store.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        sql = make_sql_store(get_settings())
+        assert get_pack(sql, "edge-only-pack") is not None
+
+    def test_malformed_edge_json_does_not_crash_enumeration(self, bootstrapped_owner, env):
+        import sqlite3
+
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node("Entity", "e1", {"name": "x"}, space_id="concept")
+            store.upsert_node("Entity", "e2", {"name": "y"}, space_id="concept")
+            store.upsert_edge(
+                "concept", "e1", "related_to", "concept", "e2", {"pack_id": "good-pack"}
+            )
+        finally:
+            store.close()
+        with sqlite3.connect(str(env / "graph.db")) as conn:
+            conn.execute(
+                "INSERT INTO graph_edges (from_type, from_id, relation, to_type, to_id, properties) "
+                "VALUES ('Entity', 'e1', 'broken_rel', 'Entity', 'e2', ?)",
+                ("not-json{{{",),
+            )
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        sql = make_sql_store(get_settings())
+        assert get_pack(sql, "good-pack") is not None
+
+
+# ---------------------------------------------------------------------------
 # Structured per-stage outcomes + exit codes (#146 M)
 # ---------------------------------------------------------------------------
 
