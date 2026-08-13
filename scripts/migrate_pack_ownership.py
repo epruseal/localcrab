@@ -387,6 +387,26 @@ def _backfill_graph(settings: Any, default_pack_id: str, apply: bool) -> dict[st
     return summary
 
 
+def _split_ambiguous(
+    seen: dict[str, set[str]],
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """The graph PK is ``(node_type, node_id)``, so several graph rows may
+    legally share one node_id -- but the vector store's identity is node_id
+    ALONE (``upsert_texts(ids=[node_id])``), so when those rows resolve to
+    DIFFERENT pack_ids there is no single correct value a vector row could
+    carry (#146 M P1-1 review round 2). Such node_ids are excluded from the
+    map (= no vector upsert) and reported as ambiguous; agreeing duplicates
+    collapse to their one shared value."""
+    resolved: dict[str, str] = {}
+    ambiguous: dict[str, list[str]] = {}
+    for node_id, packs in seen.items():
+        if len(packs) == 1:
+            resolved[node_id] = next(iter(packs))
+        else:
+            ambiguous[node_id] = sorted(packs)
+    return resolved, ambiguous
+
+
 def _predict_node_pack_map(
     db_path: Path, node_ids: list[str], assume_pack_id: str
 ) -> dict[str, str]:
@@ -405,7 +425,7 @@ def _predict_node_pack_map(
     from opencrab.ontology.pack_provenance import resolve_row_pack_id
 
     if not node_ids:
-        return {}
+        return {}, {}
     conn = sqlite3.connect(db_path)
     try:
         conn.row_factory = sqlite3.Row
@@ -415,12 +435,12 @@ def _predict_node_pack_map(
             f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
             node_ids,
         )
-        result: dict[str, str] = {}
+        seen: dict[str, set[str]] = {}
         for row in cur.fetchall():
             pack_id, _reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
             if pack_id is not None:
-                result[row["node_id"]] = pack_id
-        return result
+                seen.setdefault(row["node_id"], set()).add(pack_id)
+        return _split_ambiguous(seen)
     finally:
         conn.close()
 
@@ -436,7 +456,7 @@ def _read_actual_node_pack_ids(db_path: Path, node_ids: list[str]) -> dict[str, 
     import sqlite3
 
     if not node_ids:
-        return {}
+        return {}, {}
     conn = sqlite3.connect(db_path)
     try:
         placeholders = ", ".join("?" for _ in node_ids)
@@ -445,15 +465,15 @@ def _read_actual_node_pack_ids(db_path: Path, node_ids: list[str]) -> dict[str, 
             f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
             node_ids,
         )
-        result: dict[str, str] = {}
+        seen: dict[str, set[str]] = {}
         for node_id, raw in cur.fetchall():
             try:
                 props = json.loads(raw) if raw else {}
             except (TypeError, ValueError):
                 props = {}
             if isinstance(props, dict) and props.get("pack_id"):
-                result[node_id] = str(props["pack_id"])
-        return result
+                seen.setdefault(node_id, set()).add(str(props["pack_id"]))
+        return _split_ambiguous(seen)
     finally:
         conn.close()
 
@@ -703,14 +723,17 @@ def main(argv: list[str] | None = None) -> int:
         default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
 
         print("\n2) Backfilling graph rows with no pack_id...")
-        node_ids_needing_check = _graph_missing_node_ids(graph)
+        # dict.fromkeys: dedupe while keeping order -- duplicate node_ids
+        # (legal: the graph PK is (node_type, node_id)) must not trigger
+        # duplicate vector upserts.
+        node_ids_needing_check = list(dict.fromkeys(_graph_missing_node_ids(graph)))
         local_db_path = _local_graph_db_path(settings)
         # Predicted BEFORE the backfill writes anything -- resolve_row_pack_id
         # applied to each node's pre-backfill state (#146 M P1-1).
-        node_pack_map = (
+        node_pack_map, ambiguous_nodes = (
             _predict_node_pack_map(local_db_path, node_ids_needing_check, default_pack_id)
             if local_db_path is not None
-            else {}
+            else ({}, {})
         )
         graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
         if args.apply and local_db_path is not None:
@@ -718,7 +741,9 @@ def main(argv: list[str] | None = None) -> int:
             # actually matches what backfill_pack_ids wrote, and is what
             # vector backfill (step 5) uses from here on: real measurement
             # beats prediction whenever both exist.
-            actual_pack_map = _read_actual_node_pack_ids(local_db_path, node_ids_needing_check)
+            actual_pack_map, actual_ambiguous = _read_actual_node_pack_ids(
+                local_db_path, node_ids_needing_check
+            )
             diverged = {
                 nid
                 for nid in set(node_pack_map) | set(actual_pack_map)
@@ -730,7 +755,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"{len(diverged)} node(s) -- resolve_row_pack_id/"
                     f"backfill_pack_ids contract mismatch: {sorted(diverged)}"
                 )
-            node_pack_map = actual_pack_map
+            if set(ambiguous_nodes) != set(actual_ambiguous):
+                print(
+                    f"  WARNING: predicted vs actual AMBIGUOUS sets diverged "
+                    f"(predicted {sorted(ambiguous_nodes)}, actual "
+                    f"{sorted(actual_ambiguous)})"
+                )
+            node_pack_map, ambiguous_nodes = actual_pack_map, actual_ambiguous
+        for nid, packs in sorted(ambiguous_nodes.items()):
+            print(
+                f"  WARNING: node_id {nid!r} maps to CONFLICTING pack_ids "
+                f"{packs} across its graph rows -- the vector store's "
+                f"identity is node_id alone, so no single value is correct; "
+                f"excluded from vector backfill (vector_ambiguous)."
+            )
         graph_outcome, graph_reason = _stage_outcome(
             graph_stats,
             ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
@@ -793,6 +831,9 @@ def main(argv: list[str] | None = None) -> int:
             and getattr(vector, "available", False)
         )
         vector_stats = _backfill_vector(vector, node_ids_needing_check, node_pack_map, args.apply)
+        vector_stats["ambiguous"] = len(ambiguous_nodes)
+        if ambiguous_nodes:
+            print(f"  vector_ambiguous={len(ambiguous_nodes)} (see WARNINGs above)")
         if not vector_in_scope:
             vector_outcome, vector_reason = (
                 "skipped",

@@ -483,13 +483,17 @@ class TestNodePackMapPredictionMatchesActual:
         db_path = env / "graph.db"
         node_ids = ["n-inferred", "n-assumed"]
 
-        predicted = migrate._predict_node_pack_map(db_path, node_ids, migrate.DEFAULT_PACK_ID)
+        predicted, pred_ambiguous = migrate._predict_node_pack_map(
+            db_path, node_ids, migrate.DEFAULT_PACK_ID
+        )
         assert predicted == {"n-inferred": "pack-a", "n-assumed": migrate.DEFAULT_PACK_ID}
+        assert pred_ambiguous == {}
 
         backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
 
-        actual = migrate._read_actual_node_pack_ids(db_path, node_ids)
+        actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
         assert actual == predicted
+        assert act_ambiguous == {}
 
     def test_skipped_non_dict_row_excluded_from_both_maps(self, bootstrapped_owner, env):
         import json
@@ -509,13 +513,102 @@ class TestNodePackMapPredictionMatchesActual:
                 (json.dumps("just a string"),),
             )
 
-        predicted = migrate._predict_node_pack_map(db_path, ["n-non-dict"], migrate.DEFAULT_PACK_ID)
+        predicted, _ = migrate._predict_node_pack_map(db_path, ["n-non-dict"], migrate.DEFAULT_PACK_ID)
         assert predicted == {}
 
         backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
 
-        actual = migrate._read_actual_node_pack_ids(db_path, ["n-non-dict"])
+        actual, _ = migrate._read_actual_node_pack_ids(db_path, ["n-non-dict"])
         assert actual == {}
+
+
+class TestDuplicateNodeIdAmbiguity:
+    """#146 M P1-1 review round 2 (M4 gates): the graph PK is
+    (node_type, node_id), so one node_id may legally map to several rows.
+    The vector store's identity is node_id ALONE -- rows resolving to
+    DIFFERENT packs have no single correct vector value and must be
+    excluded (ambiguous), never last-row-wins."""
+
+    def _seed_dup(self, env, pack_b: str | None):
+        """TypeA/dup with a path inferring pack-a; TypeB/dup either inferring
+        ``pack_b`` or left bare (-> assumed default)."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node(
+                "TypeA", "dup", {"source_path": "/packs/pack-a/doc.md"}, space_id="concept"
+            )
+            props_b = {"source_path": f"/packs/{pack_b}/doc.md"} if pack_b else {"note": "bare"}
+            store.upsert_node("TypeB", "dup", props_b, space_id="concept")
+        finally:
+            store.close()
+        return env / "graph.db"
+
+    def test_conflicting_duplicate_is_ambiguous_not_last_row_wins(self, bootstrapped_owner, env):
+        """M4-1 (codex repro): TypeA/dup -> pack-a, TypeB/dup -> assumed
+        default. Conflict -> excluded from the map, reported ambiguous."""
+        db_path = self._seed_dup(env, pack_b=None)
+        resolved, ambiguous = migrate._predict_node_pack_map(
+            db_path, ["dup"], migrate.DEFAULT_PACK_ID
+        )
+        assert resolved == {}
+        assert ambiguous == {"dup": sorted({"pack-a", migrate.DEFAULT_PACK_ID})}
+
+    def test_agreeing_duplicates_collapse_to_the_shared_value(self, bootstrapped_owner, env):
+        """M4-2: both rows resolve to pack-a -> one map entry, no ambiguity,
+        and _backfill_vector upserts exactly once for the deduped id."""
+        db_path = self._seed_dup(env, pack_b="pack-a")
+        resolved, ambiguous = migrate._predict_node_pack_map(
+            db_path, ["dup", "dup"], migrate.DEFAULT_PACK_ID
+        )
+        assert resolved == {"dup": "pack-a"}
+        assert ambiguous == {}
+
+        class _SpyVec:
+            available = True
+
+            def __init__(self):
+                self.upserts = []
+
+            def get_by_id(self, node_id):
+                return {"id": node_id, "document": "d", "metadata": {}}
+
+            def upsert_texts(self, texts, metadatas=None, ids=None):
+                self.upserts.append(list(ids or []))
+                return list(ids or [])
+
+        vec = _SpyVec()
+        # deduped list -- main() dedupes via dict.fromkeys before this call
+        migrate._backfill_vector(vec, ["dup"], resolved, apply=True)
+        assert vec.upserts == [["dup"]]
+
+    def test_ambiguous_node_gets_no_vector_upsert_and_is_counted(self, bootstrapped_owner, env, capsys):
+        """M4-1 end-to-end through main(): ambiguous node -> vector upsert 0,
+        vector_ambiguous count + WARNING with node_id and both packs."""
+        self._seed_dup(env, pack_b=None)
+        _seed_doc(env)
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "vector_ambiguous=1" in out
+        assert "'dup'" in out and "pack-a" in out
+        assert "CONFLICTING pack_ids" in out
+
+    def test_prediction_and_actual_agree_on_the_ambiguous_set(self, bootstrapped_owner, env):
+        """M4-3: predicted ambiguous set == actual ambiguous set after a real
+        backfill (values and keys)."""
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+
+        db_path = self._seed_dup(env, pack_b=None)
+        predicted, pred_amb = migrate._predict_node_pack_map(
+            db_path, ["dup"], migrate.DEFAULT_PACK_ID
+        )
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        actual, act_amb = migrate._read_actual_node_pack_ids(db_path, ["dup"])
+        assert predicted == actual == {}
+        assert set(pred_amb) == set(act_amb) == {"dup"}
+        assert pred_amb["dup"] == act_amb["dup"]
 
 
 # ---------------------------------------------------------------------------
