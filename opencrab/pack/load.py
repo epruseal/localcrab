@@ -310,6 +310,15 @@ def _vec_backend(vec):
     return (None, None, None)
 
 
+# `_vec_backend()`가 실제로 내는 kind 전체(`None` 제외) — 새 백엔드가 추가되면
+# 이 목록과, kind 를 분기하는 모든 소비자(`_live_vec_ids`/`pack_live_counts`/
+# `delete_pack`/`_vec_meta_update`)를 함께 갱신해야 한다. 한쪽만 고치면 그 kind가
+# 새 소비자에서 조용히 미지원 취급으로 떨어진다(pgvector 가 `_vec_meta_update` 에서
+# 그랬다, #172) — `tests/test_pack_load.py::TestVecBackendKindsCoverage` 가 소스를
+# AST 로 대사해 어긋나면 실패한다.
+_VEC_BACKEND_KINDS = ("sql", "chroma", "sqlalchemy")
+
+
 def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
@@ -380,6 +389,13 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     우회하게 한다(아래 참고). ③ **스테일 키 병합 창**(delete 실패 시 호출자가
     upsert 로 병합 갱신하면 겹치는 키는 새 값, 그 외 옛 키는 그대로 남는다)은
     닫지 않는다 — 그 창은 `localcrab#175` 로 등록돼 있다.
+
+    **sqlalchemy(pgvector) 분기가 chroma 분기와 다른 이유**: chroma 는 `update`/
+    `upsert` 가 메타를 병합만 하고 치환을 못 해(위 참고) delete+add 로 우회해야
+    한다. pgvector 의 `metadata` 는 보통의 PostgreSQL 테이블 컬럼(JSONB)이라
+    `UPDATE ... SET metadata = ...` 가 그 컬럼만 원자적으로 **치환**한다 — sql(vec0)
+    분기의 `+metadata` 보조 컬럼과 동일하게, delete+add 의 TOCTOU 창이나 URI
+    보존 예외 없이 실컬럼 UPDATE 로 충분하다.
     """
     # 백엔드가 전용 API 를 내놓으면 그것을 쓴다 — 내부 속성을 뒤지는 것보다 낫고,
     # 테스트 더블도 이 축으로 실계약을 흉내낼 수 있다.
@@ -440,6 +456,17 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
                 log.warning("치환 후검증 실패(%s) — 재임베딩으로 우회한다", chunk_id)
                 return False
             return True
+        if kind == "sqlalchemy":
+            from sqlalchemy import text as _sa_text
+            with handle.begin() as _c:
+                cur = _c.execute(
+                    _sa_text(f"UPDATE {table} SET metadata = :meta WHERE node_id = :id"),
+                    {"meta": _json.dumps(meta, ensure_ascii=False), "id": chunk_id},
+                )
+                # sql 분기와 동일 계약: rowcount == 0(node_id 가 벡터 테이블에 없음)
+                # 이면 False — 조용히 True 를 내면 doc 기준만 옮겨가고 벡터는 옛
+                # 메타로 영구히 남는다(위 sql 분기 주석과 동일 근거).
+                return bool(cur.rowcount)
     except Exception as exc:                                  # noqa: BLE001
         log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
     return False

@@ -2266,20 +2266,42 @@ class _SqlAlchemyVecLike:
         self._engine = create_engine("sqlite:///:memory:")
         with self._engine.begin() as conn:
             conn.execute(text(
-                f"CREATE TABLE {self._table} (node_id TEXT PRIMARY KEY, pack_id TEXT)"))
+                f"CREATE TABLE {self._table} "
+                "(node_id TEXT PRIMARY KEY, pack_id TEXT, metadata TEXT)"))
 
     def seed(self, pack, ids):
         from sqlalchemy import text
         with self._engine.begin() as conn:
             for i in ids:
-                conn.execute(text(f"INSERT INTO {self._table} VALUES (:i, :p)"),
-                             {"i": i, "p": pack})
+                conn.execute(
+                    text(f"INSERT INTO {self._table} (node_id, pack_id) VALUES (:i, :p)"),
+                    {"i": i, "p": pack})
 
     def rows(self):
         from sqlalchemy import text
         with self._engine.connect() as conn:
             return {(r[0], r[1]) for r in conn.execute(
                 text(f"SELECT node_id, pack_id FROM {self._table}"))}
+
+    def set_meta(self, node_id, meta):
+        """`_vec_meta_update` 의 sqlalchemy 분기가 실제로 실행할 UPDATE 를 테스트가
+        검증할 수 있게 씨앗 메타를 심는다."""
+        import json as _json
+
+        from sqlalchemy import text
+        with self._engine.begin() as conn:
+            conn.execute(text(f"UPDATE {self._table} SET metadata = :m WHERE node_id = :i"),
+                         {"m": _json.dumps(meta), "i": node_id})
+
+    def meta_of(self, node_id):
+        import json as _json
+
+        from sqlalchemy import text
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT metadata FROM {self._table} WHERE node_id = :i"),
+                {"i": node_id}).fetchone()
+        return _json.loads(row[0]) if row and row[0] else None
 
 
 class TestSqlAlchemyBackendBranches:
@@ -2319,16 +2341,77 @@ class TestSqlAlchemyBackendBranches:
         state = pack_load.live_pack_state("pack-1", graph, docs, vec)
         assert state["vec_ids"] == {"n1", "고아"}, state["vec_ids"]
 
-    def test_vec_meta_update_has_no_dedicated_branch_and_falls_back_to_false(self):
-        """`_vec_meta_update` 는 `"sql"`/`"chroma"` 두 종류만 분기하고 `"sqlalchemy"`
-        분기가 없다 — pgvector 형태는 예외 없이 `False` 로 떨어져 호출자가
-        재임베딩으로 우회한다. 분기가 새로 생기면 이 테스트가 깨져 알려준다."""
+    def test_vec_meta_update_sqlalchemy_branch_updates_metadata_in_place(self):
+        """pgvector(`"sqlalchemy"`) 형태에서 `_vec_meta_update` 가 실제로 metadata
+        컬럼만 UPDATE 하고 True 를 돌려줘야 한다(#172 — 종전엔 분기가 없어 항상
+        False 로 떨어졌고 호출자가 매번 재임베딩으로 우회했다)."""
         vec = _SqlAlchemyVecLike()
         vec.seed("pack-1", ["c1"])
-        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
-        assert ok is False, (
-            "sqlalchemy 형태에 메타 갱신 전용 분기가 새로 생겼다 — 이 테스트를 "
-            "그 분기에 맞게 다시 써야 한다")
+        vec.set_meta("c1", {"document_id": "doc-A"})
+
+        ok = pack_load._vec_meta_update(vec, "c1", {"document_id": "doc-B", "쪽": "99"})
+
+        assert ok is True, "메타 갱신을 지원하는 백엔드인데 False 로 떨어졌다"
+        assert vec.meta_of("c1") == {"document_id": "doc-B", "쪽": "99"}, (
+            "UPDATE 가 실제로 반영되지 않았다")
+
+    def test_vec_meta_update_sqlalchemy_branch_returns_false_when_row_absent(self):
+        """node_id 가 벡터 테이블에 없으면(rowcount 0) False — 조용히 True 를 내면
+        호출자가 doc 기준을 옮기고 벡터는 갱신 안 된 채로 영구히 남는다(sql 분기와
+        동일 계약, load.py `_vec_meta_update` sql 분기 주석 참고)."""
+        vec = _SqlAlchemyVecLike()
+        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1})
+        assert ok is False
+
+
+class TestVecBackendKindsCoverage:
+    """`_vec_backend()` 가 낼 수 있는 kind 전부를 `_vec_meta_update()` 가 분기하는지
+    소스 수준에서 대사한다(#172 요건 3 — "백엔드가 늘 때마다 이 함수를 고쳐야
+    하는데 그것을 강제하는 장치가 없다"). 이슈 재현 스크립트와 같은 AST 기법을
+    영구 회귀 테스트로 승격했다 — kind 하나가 어느 한쪽에만 있으면 이 테스트가 깬다.
+    """
+
+    @staticmethod
+    def _kind_eq_literals(func_name: str) -> set:
+        src = inspect.getsource(pack_load)
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == func_name)
+        literals: set = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "kind":
+                for op, cmp in zip(n.ops, n.comparators):
+                    if isinstance(op, ast.Eq) and isinstance(cmp, ast.Constant):
+                        literals.add(cmp.value)
+        return literals
+
+    def test_vec_backend_kinds_constant_matches_actual_return_literals(self):
+        """`_VEC_BACKEND_KINDS` 가 `_vec_backend()` 의 실제 반환 리터럴과 어긋나면
+        (새 kind 추가를 상수에 반영 안 함) 아래 대사 자체가 무의미해진다."""
+        src = inspect.getsource(pack_load)
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_vec_backend")
+        returned: set = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple):
+                first = n.value.elts[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    returned.add(first.value)
+        assert returned == set(pack_load._VEC_BACKEND_KINDS), (
+            f"_VEC_BACKEND_KINDS {pack_load._VEC_BACKEND_KINDS} 가 _vec_backend() 의 "
+            f"실제 반환 kind {returned} 와 다르다")
+
+    @pytest.mark.parametrize("func_name", [
+        "_live_vec_ids", "pack_live_counts", "delete_pack", "_vec_meta_update",
+    ])
+    def test_every_vec_backend_kind_is_branched_on(self, func_name):
+        backend_kinds = set(pack_load._VEC_BACKEND_KINDS)
+        handled = self._kind_eq_literals(func_name)
+        missing = backend_kinds - handled
+        assert not missing, (
+            f"_vec_backend() 가 내는 kind {missing} 를 {func_name}() 가 분기하지 "
+            "않는다 — 그 백엔드는 이 함수에서 미지원으로 조용히 떨어진다(#172)")
 
 
 class TestStubsMatchTheRealStoreContract:
