@@ -246,7 +246,18 @@ def assemble_pack_v1(
     pack_id: str,
     title: str | None = None,
 ) -> dict[str, Any]:
-    """Build an OpenCrab Pack v1 ZIP from a pack staging directory."""
+    """Build an OpenCrab Pack v1 ZIP from a pack staging directory.
+
+    **소비자: 로컬 그래프 스토어 재적재 · neo4j 임포트 경로.** manifest 키는
+    `format_version`, 값은 `"opencrab-pack-v1"`(`-cloud-` 없음). 입력은
+    `neo4j/opencrab_ingest.jsonl`(또는 `graph/`+`evidence/` 분리 파일)을 갖춘
+    스테이징 디렉터리이고, 산출물에는 neo4j 아티팩트·해시·품질 리포트가 포함된다.
+
+    **`opencrab.pack.cloud.build_zip` 과는 별개 산출물이다 — 혼동 금지.** 그쪽
+    소비자는 OpenCrab Cloud 업로드 파이프라인이고, manifest 키는 `format`,
+    값은 `"opencrab-cloud-pack-v1"`, 입력은 nodes/edges/chunks.jsonl 3파일 평면
+    디렉터리다. 교차 참조 0건 — 통합하지 마라.
+    """
     if not _PACK_ID_RE.fullmatch(pack_id) or ".." in pack_id:
         raise ValueError(f"invalid pack_id: {pack_id!r}")
     source = Path(source_dir).expanduser().resolve()

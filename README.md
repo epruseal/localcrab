@@ -432,6 +432,8 @@ community_reports.json
 
 포맷 상세: [OpenCrab Pack v1 ZIP 형식](./docs/opencrab-pack-v1.md)
 
+`opencrab/pack/`(팩 빌드·검증·적재·내보내기 공용 라이브러리) 모듈 지도와 설계 원칙은 [팩 계약 계층](./docs/pack-contract-layer.md) 참고.
+
 ### CrabHarness
 
 [`crabharness/`](./crabharness/)는 대규모 수집·파싱 작업을 위한 미션 기반 증거 수집 제어판입니다. 크롤 대상·범위·성공 기준을 미션으로 동결하고, 증거 번들을 검증한 뒤 PromotionPackage를 생성합니다. 상세는 [CrabHarness README](./crabharness/README.md) 참고.

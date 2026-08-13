@@ -114,6 +114,11 @@ ignore = ["E501"]
 "scripts/bench_graph_backends.py" = ["E402"]
 # Math/QA-notation matrix-style variable names (N, M, C, K) — deliberate, not identifiers to rename.
 "tests/test_store_concurrency.py" = ["N806"]
+# pytest fixture re-export (`live` imported from tests/test_pack_load, then injected as a
+# test parameter) — F811 is a false positive for this standard pytest pattern.
+"tests/test_pack_load_r11_pg_gates.py" = ["F811"]
+"tests/test_pack_load_r12_selfheal_gates.py" = ["F811"]
+"tests/test_pack_load_r13_owner_pred_gates.py" = ["F811"]
 "tests/test_vector_store_parity.py" = ["N806"]
 "scripts/qa/bench_vector_backend.py" = ["N806"]
 

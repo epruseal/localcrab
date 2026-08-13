@@ -851,3 +851,82 @@ class TestExtract:
         assert result.exit_code == 0
         assert result.exception is None
         assert "nodes=1 edges=1" in result.output
+
+
+# ---------------------------------------------------------------------------
+# export-neo4j-pack / assemble-pack-v1 — opencrab.pack 소비 배선
+# ---------------------------------------------------------------------------
+
+
+class TestPackCommandWiring:
+    """CLI 가 `opencrab.pack` 을 **올바른 인자로** 부르는지.
+
+    이 두 커맨드가 `opencrab.pack` 의 유일한 프로덕션 소비자인데(실측: cli.py 2곳 외에는
+    `scripts/export_pack_graph_from_neo4j.py` 뿐), 그 배선이 무검사였다.
+
+    export 표면 자체(`from opencrab.pack import ...`)는 pack 테스트들이 덮는다. 여기서
+    닫는 것은 **CLI 배선**이다 — 옵션이 어느 파라미터로 가는지, 기본값이 무엇인지.
+    전체 스위트를 다 돌려도 이 줄들이 커버되지 않아 "다 통과했으니 안전하다"가
+    거짓 안심이었다(2026-08-06 커버리지 실측: cli.py:710·736 미커버).
+    """
+
+    # --- Normal ---
+    def test_export_neo4j_pack_passes_options_through(self, cli_env, runner):
+        with patch("opencrab.pack.export_neo4j_opencrab_ingest") as fake:
+            fake.return_value = {"nodes": 0, "edges": 0}
+            result = runner.invoke(main, [
+                "export-neo4j-pack", "-o", str(cli_env / "out.jsonl"),
+                "--pack-id", "p1", "--node-limit", "7", "--edge-limit", "9",
+            ])
+
+        assert result.exit_code == 0, result.output
+        _store, output = fake.call_args.args
+        assert output == str(cli_env / "out.jsonl")
+        assert fake.call_args.kwargs == {
+            "pack_id": "p1", "node_limit": 7, "edge_limit": 9}
+
+    def test_export_neo4j_pack_defaults(self, cli_env, runner):
+        """기본값이 조용히 바뀌면 운영 산출물의 크기 상한이 달라진다."""
+        with patch("opencrab.pack.export_neo4j_opencrab_ingest") as fake:
+            fake.return_value = {}
+            result = runner.invoke(
+                main, ["export-neo4j-pack", "-o", str(cli_env / "o.jsonl")])
+
+        assert result.exit_code == 0, result.output
+        assert fake.call_args.kwargs == {
+            "pack_id": None, "node_limit": 500_000, "edge_limit": 1_000_000}
+
+    def test_assemble_pack_v1_passes_options_through(self, cli_env, runner):
+        src = cli_env / "staging"
+        src.mkdir()
+        with patch("opencrab.pack.assemble_pack_v1") as fake:
+            fake.return_value = {"pack_id": "p1"}
+            result = runner.invoke(main, [
+                "assemble-pack-v1", str(src),
+                "-o", str(cli_env / "p.zip"), "--pack-id", "p1", "--title", "제목",
+            ])
+
+        assert result.exit_code == 0, result.output
+        source_dir, output = fake.call_args.args
+        assert (source_dir, output) == (str(src), str(cli_env / "p.zip"))
+        assert fake.call_args.kwargs == {"pack_id": "p1", "title": "제목"}
+
+    def test_assemble_pack_v1_title_defaults_to_none(self, cli_env, runner):
+        src = cli_env / "staging2"
+        src.mkdir()
+        with patch("opencrab.pack.assemble_pack_v1") as fake:
+            fake.return_value = {}
+            result = runner.invoke(main, [
+                "assemble-pack-v1", str(src), "-o", str(cli_env / "q.zip"),
+                "--pack-id", "p2"])
+
+        assert result.exit_code == 0, result.output
+        assert fake.call_args.kwargs == {"pack_id": "p2", "title": None}
+
+    # --- Error ---
+    def test_assemble_pack_v1_rejects_missing_source_dir(self, cli_env, runner):
+        result = runner.invoke(main, [
+            "assemble-pack-v1", str(cli_env / "없는디렉터리"),
+            "-o", str(cli_env / "x.zip"), "--pack-id", "p"])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
