@@ -99,7 +99,23 @@ def grade_pack(pack_dir: Path | str, expected_sources: int | None = None) -> dic
 
     # ── 3. 소스 커버리지 (20) — 청크 보유 소스 / 기대 소스 수 ──
     expected_src = force_src if force_src else max(1, len(res_ids))
-    src_with_chunk = {c.get("source") for c in chunks}
+    # 결측(None)·빈 문자열은 source 문자열로서 절대 계수되지 않는다(2026-08-13
+    # 리뷰 결함 폐쇄) — 종전엔 `{c.get("source") for c in chunks}` 가 source 없는
+    # 청크의 None 을 그대로 집합에 넣어 "소스 1개"로 잘못 세었다(document_id
+    # 필드로만 소스를 표현하는 팩이 커버리지 0으로 억울하게 감점됨). 그 청크에
+    # 유효한 resource `document_id` 가 있으면(무관 id 는 제외 — 합성 반례 0점
+    # 유지) 폴백으로 그 resource 를 계수한다. source 문자열과 resource ID 가
+    # 우연히 충돌하면 같은 원소로 뭉쳐 dedup 이 과소 방향으로만 틀어진다(과다
+    # 계수는 없다).
+    src_with_chunk = set()
+    for c in chunks:
+        s = c.get("source")
+        if s:
+            src_with_chunk.add(s)
+        else:
+            d_id = c.get("document_id")
+            if d_id in res_ids:               # resource 소속 검증형 폴백
+                src_with_chunk.add(d_id)
     got = len(src_with_chunk)
     cov = min(1.0, got / expected_src)
     s3 = round(20 * cov)

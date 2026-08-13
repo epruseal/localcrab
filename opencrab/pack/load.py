@@ -137,6 +137,19 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     텍스트가 안 바뀌었으니 임베딩은 그대로 두고 메타만 맞춘다. 백엔드가 그 연산을
     지원하지 않으면 **False 를 돌려 호출자가 재임베딩으로 우회**하게 한다 —
     조용히 True 를 내면 그 어긋남이 영구히 남는다(다음 증분이 "동일"로 판정하므로).
+
+    **chroma 분기의 한계(2026-08-13 실측 근거)**: chromadb 1.5.7 의 `update`/`upsert`
+    는 메타를 **병합**하고(겹치는 키만 갱신, 그 외 키는 존속) `delete`+`add` 만
+    **치환**한다. 스테일 키(청크 스키마가 축소되어 없어진 옛 메타 키)를 없애려면
+    치환이 필요해 이 분기는 delete+add 를 쓴다. 그 대가로 세 한계를 그대로 안는다:
+    ① **단일 작성자 전제** — delete 와 add 사이의 창에서 동시 writer 가 같은
+    레코드를 건드리면(TOCTOU) 그 갱신이 사라질 수 있다. 이 함수의 모든 호출자는
+    단일 프로세스 순차 적재이므로 이 창은 실측상 열리지 않지만, 코드 자체가 그것을
+    보장하지는 않는다. ② **URI 보존은 이 함수의 성공 조건이 아니다** — URI 가 붙은
+    레코드를 만나면 치환하지 않고 False 로 물러나 호출자가 upsert 병합으로
+    우회하게 한다(아래 참고). ③ **스테일 키 병합 창**(delete 실패 시 호출자가
+    upsert 로 병합 갱신하면 겹치는 키는 새 값, 그 외 옛 키는 그대로 남는다)은
+    닫지 않는다 — 그 창은 `localcrab#175` 로 등록돼 있다.
     """
     # 백엔드가 전용 API 를 내놓으면 그것을 쓴다 — 내부 속성을 뒤지는 것보다 낫고,
     # 테스트 더블도 이 축으로 실계약을 흉내낼 수 있다.
@@ -161,7 +174,41 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
             # 넘어간다(영구 불일치). rowcount를 봐야 재임베딩 경로로 보낼 수 있다.
             return bool(cur.rowcount)
         if kind == "chroma":
-            handle.update(ids=[chunk_id], metadatas=[meta])
+            got = handle.get(ids=[chunk_id],
+                             include=["embeddings", "documents", "uris", "metadatas"])
+            if not got["ids"]:
+                return False                      # 부재 — 재임베딩(upsert=add, 정확 메타)
+            if got.get("uris") and got["uris"][0] is not None:
+                # URI 레코드는 이 시스템이 생산하지 않는다(uris API 사용 전수 검색 0).
+                # 외부 기록으로 보고 파괴적 치환을 하지 않는다. False → upsert 병합:
+                # URI 보존·값 갱신 실측. 여분 스테일 키 창은 localcrab#175.
+                log.warning("URI 벡터 레코드(%s) — 치환 대신 병합 갱신으로 우회한다", chunk_id)
+                return False
+            try:
+                handle.delete(ids=[chunk_id])      # delete 도 try 안 — 예외는 False 로 수렴
+                handle.add(ids=[chunk_id], embeddings=got["embeddings"],
+                           documents=got["documents"], metadatas=[meta])
+            except Exception as exc:               # noqa: BLE001
+                # 원상복구는 하지 않는다(v11 검수 실증: 복구로 레코드가 남으면 호출자
+                # upsert 가 구 메타와 병합해 스테일 키가 영구화된다). 이 분기에 오는
+                # 레코드는 URI 없는 시스템 생산분뿐이라 **부재가 정확 치유 상태**다 —
+                # 재임베딩 upsert=add 가 임베딩·문서·메타를 전부 정본에서 재생성한다.
+                # 재임베딩마저 실패하면 청크가 실패로 기록되고 기준선이 안 전진해
+                # 다음 실행이 재시도한다(기존 TestVectorTotalLoss 경로).
+                log.warning("벡터 치환 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
+                return False
+            post = handle.get(ids=[chunk_id],       # 후상태 3축 검증
+                              include=["embeddings", "documents", "metadatas"])
+            ok = (post["ids"] == [chunk_id]          # ID 동일성까지 (v14 검수)
+                  and post["metadatas"][0] == meta
+                  and post["documents"][0] == got["documents"][0]
+                  and post["embeddings"] is not None and post["embeddings"][0] is not None
+                  and len(post["embeddings"][0]) == len(got["embeddings"][0])
+                  and all(abs(float(a) - float(b)) <= 1e-6 + 1e-6 * abs(float(b))
+                          for a, b in zip(post["embeddings"][0], got["embeddings"][0])))
+            if not ok:
+                log.warning("치환 후검증 실패(%s) — 재임베딩으로 우회한다", chunk_id)
+                return False
             return True
     except Exception as exc:                                  # noqa: BLE001
         log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,7 +46,10 @@ def now_iso() -> str:
 # ── shard 경로 계층 ──────────────────────────────────────────
 
 def _shard_path(path: Path, idx: int) -> Path:
-    assert idx < _MAX_SHARDS, f"shard 개수 한도 초과({idx}) — 상한/스킴 재검토 필요: {path}"
+    if idx >= _MAX_SHARDS:
+        # `python -O` 는 `assert` 문 전체를 바이트코드에서 제거한다 — 이 한도가 방어선의
+        # 전부이므로(TestShardBoundaries 참고) 최적화 플래그로 조용히 무력화되면 안 된다.
+        raise RuntimeError(f"shard 개수 한도 초과({idx}) — 상한/스킴 재검토 필요: {path}")
     return path.with_name(f"{path.stem}.{idx:02d}{path.suffix}")
 
 
@@ -59,9 +63,46 @@ def shard_paths(path: Path | str) -> list[Path]:
     전송 중단이나 실수 삭제로 `.01` 이 없으면 적재기가 **불완전한 팩을 오류 없이 삼킨다** —
     같은 클래스의 사고를 같은 파일이 한쪽만 막고 있었던 것이다(2026-08-11 리뷰 지적,
     재현: `.00`·`.02` 만 두면 2행이 그대로 읽혔다).
+
+    **수집과 판정을 한 `scandir` 패스로 한다. `glob` 은 쓰지 않는다**(2026-08-13
+    리뷰 지적). 기존 `Path.glob(f"{stem}.[0-9][0-9]{suffix}")` 은 `stem` 자체에
+    `[`·`*` 같은 glob 메타문자가 있으면 그것을 패턴으로 오해해 실재하는 shard 를
+    못 찾는다(HEAD 잔재, 재현: `foo[bar].00.jsonl` 미발견). 여기서는 `re.escape(stem)`
+    으로 지은 정규식 **하나**로 발견과 stray 판정을 같이 하므로 둘이 갈릴 수 없다.
+
+    **매치는 넓게(`\\d+`, 유니코드 숫자 포함), 판정은 좁게(정확히 두 자리 ASCII
+    숫자)** 한다. `.100`·`.1`·비ASCII 숫자로 끝나는 이름은 전부 "shard 형태이지만
+    이 스킴이 지원하지 않는 이름"(stray)으로 잡아 `RuntimeError` 를 낸다 — 구
+    glob 은 `[0-9][0-9]` 밖의 숫자 꼬리를 아예 못 봐서 조용히 무시했다(같은
+    silent-partial-read 클래스). **`.gz` 로 끝나는 인접 파일**(`{stem}{suffix}.gz`
+    도 `{stem}.<숫자>{suffix}.gz` 도)도 stray 로 잡는다 — 이 모듈은 읽기를
+    지원하지 않지만(생산 경로 0), 존재를 조용히 무시하면 gz 만 남은 팩이 "부재"로
+    읽힌다(2026-08-13 리뷰 지적). 그 외 압축 포맷은 이 함수의 범위 밖이다.
     """
     path = Path(path)
-    shards = sorted(path.parent.glob(f"{path.stem}.[0-9][0-9]{path.suffix}"))
+    stem_re = re.escape(path.stem)
+    suffix_re = re.escape(path.suffix)
+    pat = re.compile(stem_re + r"\.(\d+)" + suffix_re + r"$")
+    gz_pat = re.compile(stem_re + r"(?:\.\d+)?" + suffix_re + r"\.gz$")
+    shards: list[Path] = []
+    stray: list[str] = []
+    if path.parent.exists():
+        for entry in os.scandir(path.parent):
+            if gz_pat.match(entry.name):
+                stray.append(entry.name)          # gz 인접 — 읽기 미지원, 무언 무시 금지
+                continue
+            m = pat.match(entry.name)
+            if not m:
+                continue
+            if re.fullmatch(r"[0-9]{2}", m.group(1)):
+                shards.append(path.parent / entry.name)
+            else:
+                stray.append(entry.name)
+    if stray:
+        raise RuntimeError(
+            f"지원 밖 shard 이름 발견: {sorted(stray)} — "
+            f"이 스킴은 `{path.stem}.NN{path.suffix}`(두 자리 zero-pad)만 shard 로 읽는다: {path}")
+    shards.sort()
     if path.exists() and shards:
         raise RuntimeError(f"base와 shard가 동시에 존재(부분 마이그레이션/롤백 잔재): {path}")
     if path.exists():
