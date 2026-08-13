@@ -409,7 +409,7 @@ def _split_ambiguous(
 
 def _predict_node_pack_map(
     db_path: Path, node_ids: list[str], assume_pack_id: str
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, list[str]]]:
     """dry-run prediction (#146 M P1-1): for each ``node_id`` (read at its
     CURRENT, pre-backfill state), resolve its would-be pack_id via
     ``pack_provenance.resolve_row_pack_id`` -- the SAME helper the real
@@ -445,7 +445,9 @@ def _predict_node_pack_map(
         conn.close()
 
 
-def _read_actual_node_pack_ids(db_path: Path, node_ids: list[str]) -> dict[str, str]:
+def _read_actual_node_pack_ids(
+    db_path: Path, node_ids: list[str]
+) -> tuple[dict[str, str], dict[str, list[str]]]:
     """apply-path ground truth (#146 M P1-1): a direct re-query of
     ``graph_nodes`` for ``node_ids``' CURRENT pack_id, called AFTER
     ``backfill_pack_ids`` has run -- real measurement, not a
