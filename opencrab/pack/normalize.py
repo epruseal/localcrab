@@ -18,7 +18,11 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from opencrab.grammar.manifest import SPACES as _GRAMMAR_SPACES
-from opencrab.pack.schema import NODE_STRUCT_KEYS, NODE_TYPE_OVERRIDE, SPACE_DEFAULT_TYPE
+from opencrab.pack.schema import (
+    NODE_TYPE_OVERRIDE,
+    SPACE_DEFAULT_TYPE,
+    absorb_legacy_top_level,
+)
 
 # grammar에서 허용 node_type 집합 동적 생성 (하드코딩 없이 manifest 기준)
 _GRAMMAR_NODE_TYPES: frozenset[str] = frozenset(
@@ -280,25 +284,15 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     original_type = node_type
     space, node_type = resolve_node_space_type(space, node_type)
 
-    props     = flatten_props(row.get("properties") or {})
     # 레거시 호환: 2026-08-03 이전 생산자는 커스텀 필드를 노드 최상위에 펼쳤고
     # 이 함수가 중첩 "properties"만 읽어 그 필드들이 라이브에 하나도 실리지 않았다
     # (약 120개 팩, 실측 확인). 재빌드 없이 회수하려면 최상위도 흡수해야 한다.
-    # 중첩 값이 우선한다 — 정본 위치가 중첩이기 때문이다.
-    # statement 폴백은 흡수 전 값으로만 판단한다(아래 사유). **사본**인 것이 중요하다.
-    #
-    # 지금 이 dict() 를 지우고 별칭으로 둬도 동작은 같다 — 적대 검증이 128팩 238,987 노드로
-    # 실측했다(characterization sha256 불변, 2026-08-04). 흡수가 props 를 in-place 로 바꾸지
-    # 않고 새 dict 로 **재바인딩**하고, 사본 시점과 아래 폴백 사이에 statement/text/description
-    # 을 쓰는 코드가 없기 때문이다. 즉 등가성은 코드 순서라는 깨지기 쉬운 전제에 얹혀 있다.
-    # 그 전제가 깨지는 순간 이미 적재된 Claim 2,039건(59팩)의 statement 가 조용히 바뀌므로
-    # 사본을 유지한다. 테스트로는 못 잡는 종류라 여기에 남긴다.
-    _nested_only = dict(props)
-    _stray = {k: v for k, v in row.items() if k not in NODE_STRUCT_KEYS}
-    if _stray:
-        _merged = flatten_props(_stray)
-        _merged.update(props)
-        props = _merged
+    # 중첩 값이 우선한다 — 정본 위치가 중첩이기 때문이다(schema.absorb_legacy_top_level 정본,
+    # cloud.py 도 같은 함수를 쓴다 — 22c82c6). flatten_props 는 값 단위 변환(nested
+    # dict/list/None → 스칼라)이라 흡수 전/후 어느 시점에 적용해도 최종 승자 값은 같다.
+    # statement 폴백은 흡수 전 값(_nested_only)만 본다(아래 사유).
+    _nested_only = flatten_props(row.get("properties") or {})
+    props = flatten_props(absorb_legacy_top_level(row))
     # 원본 타입 보존 (오버라이드된 경우)
     # 흡수분이 로더가 계산한 original_type을 덮지 않도록, 레거시 값이 있어도 실제 원본 타입을 쓴다.
     if original_type != node_type:
