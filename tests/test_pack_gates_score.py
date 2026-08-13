@@ -1025,3 +1025,57 @@ class TestGraderNeverCrashesOnValidPackShapes:
     def test_single_node_pack_gets_a_report(self, tmp_path):
         r = grade_pack(_pack(tmp_path / "one", [_gn("a", "concept")], [], []))
         assert r is not None and isinstance(r["total"], int)
+
+
+class TestIntegrityToleratesNullMetadataAndMissingSource:
+    """참조 무결성(5번, evidence_index 연속성)의 두 함정(PR 리뷰 N3, 2026-08-13).
+
+    ① 명시적 `"metadata": null`이면 `.get("metadata", {})`의 기본값이 적용되지
+    않는다(키 자체는 존재하므로) — 그대로 `.get()`을 부르면 `AttributeError`로
+    채점 전체가 죽는다. `TestGraderNeverCrashesOnValidPackShapes`가 세운 "채점기는
+    어떤 팩 모양에도 리포트를 낸다"는 계약의 또 다른 축이다.
+
+    ② source 결측 청크를 전부 같은 `None` 키로 묶으면 서로 무관한 청크들이 한
+    그룹으로 뭉쳐 evidence_index 연속성을 오판한다. 3번(소스 커버리지)의
+    `document_id` 검증형 폴백(`TestSourceCoverageResourceFallback`)과 같은 규칙을
+    5번의 그룹 키에도 적용해야 한다.
+    """
+
+    def test_explicit_null_metadata_does_not_crash_the_grader(self, tmp_path):
+        nodes = _base(resource=1)
+        chunks = [{"id": "evidence0", "document_id": "resource0", "source": "resource0",
+                   "metadata": None}]  # 명시적 null — {} 가 아니다
+        r = grade_pack(_pack(tmp_path / "null-meta", nodes, [], chunks))
+        assert r is not None and isinstance(r["total"], int), \
+            "metadata: null 이 AttributeError 로 채점 전체를 죽였다"
+        assert any("evidence_index 미부여" in g for g in r["gaps"])
+
+    def test_missing_source_chunks_fall_back_to_document_id_for_grouping(self, tmp_path):
+        """source 없는 청크 2개가 각기 다른 resource 의 document_id 로 폴백되면,
+        각자 [1]짜리 독립 연속 그룹이라 위반이 없어야 한다.
+
+        옛 코드는 둘 다 `None` 키 하나로 묶여 `[1, 1]`이 되고,
+        `sorted([1, 1]) != [1, 2]`라 '불연속' 위반으로 오판했다.
+        """
+        nodes = _base(resource=2)
+        chunks = [
+            {"id": "evidence0", "document_id": "resource0",
+             "metadata": {"evidence_index": 1}},   # source 키 자체가 없다
+            {"id": "evidence1", "document_id": "resource1",
+             "metadata": {"evidence_index": 1}},   # source 키 자체가 없다
+        ]
+        r = grade_pack(_pack(tmp_path / "missing-src", nodes, [], chunks))
+        assert not any("evidence_index 불연속" in g for g in r["gaps"]), \
+            f"무관한 청크들이 None 키로 뭉쳐 연속성이 오판됐다: {r['gaps']}"
+
+    def test_missing_source_without_valid_document_id_is_excluded_not_falsely_grouped(self, tmp_path):
+        """source도 없고 document_id도 어느 resource도 아니면, 어느 그룹에도
+        들어가지 않는다(귀속 불가능한 청크를 억지로 묶지 않는다) — 3번 섹션의
+        폴백 실패 케이스(①)와 대칭이다."""
+        nodes = _base(resource=1)
+        chunks = [
+            {"id": "evidence0", "document_id": "ghost-doc",
+             "metadata": {"evidence_index": 5}},   # source 없음 + document_id 무관
+        ]
+        r = grade_pack(_pack(tmp_path / "orphan-src", nodes, [], chunks))
+        assert not any("evidence_index 불연속" in g for g in r["gaps"]), r["gaps"]

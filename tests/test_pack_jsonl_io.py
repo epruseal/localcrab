@@ -615,6 +615,34 @@ class TestStaleShardCleanup:
         assert len(list(iter_jsonl(p))) == 2
 
 
+class TestStaleShardCleanupWithMetacharacterStem:
+    """rewrite(`write_jsonl_sharded`)의 구 shard 정리가 `foo[bar]` 처럼 glob
+    메타문자가 든 stem 에서도 동작하는가(PR 리뷰 N2, 2026-08-13).
+
+    `shard_paths`(R3, `TestShardPathsSingleScandirPass.
+    test_glob_metacharacter_in_stem_is_found_via_scandir`)가 이미 읽기 쪽에서 닫은
+    함정의 **writer 쪽 형제**였다 — rewrite 의 구 shard 정리는 여전히
+    `path.parent.glob(f"{stem}.[0-9][0-9]{suffix}")` 를 썼고, `stem` 안의 `[bar]`
+    를 glob 문자 클래스로 오해해 실재하는 구 shard 를 못 찾아 정리에서 빠뜨렸다.
+    """
+
+    def test_rewrite_cleans_up_stale_shards_with_glob_metacharacter_stem(self, tmp_path):
+        q = tmp_path / "foo[bar].jsonl"
+        q.with_name("foo[bar].00.jsonl").write_text('{"id":0}\n', encoding="utf-8")
+        q.with_name("foo[bar].01.jsonl").write_text('{"id":1}\n', encoding="utf-8")
+
+        out = write_jsonl_sharded(q, [{"id": 9}], limit=10_000)  # 축소 rewrite -> base 단일 파일
+
+        assert out == [q]
+        assert not q.with_name("foo[bar].00.jsonl").exists(), \
+            "메타문자 stem의 구 shard 00이 정리되지 않고 남았다"
+        assert not q.with_name("foo[bar].01.jsonl").exists(), \
+            "메타문자 stem의 구 shard 01이 정리되지 않고 남았다"
+        assert shard_paths(q) == [q], \
+            "구 shard가 남으면 base+shard 공존으로 손상 판정된다"
+        assert list(iter_jsonl(q)) == [{"id": 9}]
+
+
 class TestAppenderClosesItsFile:
     """`__exit__` 이 `close()` 대신 `flush()` 를 불러도 22 건이 전부 통과했다.
 

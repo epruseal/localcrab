@@ -53,33 +53,23 @@ def _shard_path(path: Path, idx: int) -> Path:
     return path.with_name(f"{path.stem}.{idx:02d}{path.suffix}")
 
 
-def shard_paths(path: Path | str) -> list[Path]:
-    """논리 경로 → 실제 물리 파일 목록.
-    base만 → [base] / shards만 → 정렬된 shard들 / 둘 다 → RuntimeError / 없음 → [].
+def _scan_shard_candidates(path: Path) -> tuple[list[Path], list[str]]:
+    """`path.parent` 를 **한 번** `scandir` 해서 (2자리 zero-pad shard, stray 이름) 로 분류한다.
 
-    **번호가 `00` 부터 연속이 아니면 죽는다.** 이 모듈의 존재 이유는 "부분만 읽고
-    조용히 넘어가는 것"을 막는 것인데(base 를 단일 `open()` 하면 `FileNotFoundError` 로
-    즉사시키는 설계), 정작 **조각이 중간에 빠진 경우**는 남은 것을 이어붙여 통과시켰다.
-    전송 중단이나 실수 삭제로 `.01` 이 없으면 적재기가 **불완전한 팩을 오류 없이 삼킨다** —
-    같은 클래스의 사고를 같은 파일이 한쪽만 막고 있었던 것이다(2026-08-11 리뷰 지적,
-    재현: `.00`·`.02` 만 두면 2행이 그대로 읽혔다).
+    발견(`re.escape(stem) + r"\\.(\\d+)" + ...`)과 stray 판정(`[0-9]{2}` fullmatch)이
+    같은 정규식의 캡처 그룹에서 갈리므로 둘이 따로 어긋날 수 없다. `Path.glob` 은 쓰지
+    않는다 — `stem` 자체에 `[`·`*` 같은 glob 메타문자가 있으면 그것을 패턴으로 오해해
+    실재하는 shard 를 못 찾는다(재현: `foo[bar].00.jsonl` 미발견).
 
-    **수집과 판정을 한 `scandir` 패스로 한다. `glob` 은 쓰지 않는다**(2026-08-13
-    리뷰 지적). 기존 `Path.glob(f"{stem}.[0-9][0-9]{suffix}")` 은 `stem` 자체에
-    `[`·`*` 같은 glob 메타문자가 있으면 그것을 패턴으로 오해해 실재하는 shard 를
-    못 찾는다(HEAD 잔재, 재현: `foo[bar].00.jsonl` 미발견). 여기서는 `re.escape(stem)`
-    으로 지은 정규식 **하나**로 발견과 stray 판정을 같이 하므로 둘이 갈릴 수 없다.
+    :func:`shard_paths`(읽기, stray 를 즉시 `RuntimeError` 로 거부)와
+    :func:`write_jsonl_sharded`(rewrite 의 구 shard 정리, stray 는 무시하고 2자리
+    shard 목록만 필요)가 이 열거 로직 **하나**를 공용한다(2026-08-13 리뷰 지적) —
+    write 쪽이 예전처럼 `glob(f"{stem}.[0-9][0-9]{suffix}")` 를 따로 쓰면 stem
+    메타문자 함정이 그쪽에서 재발한다.
 
-    **매치는 넓게(`\\d+`, 유니코드 숫자 포함), 판정은 좁게(정확히 두 자리 ASCII
-    숫자)** 한다. `.100`·`.1`·비ASCII 숫자로 끝나는 이름은 전부 "shard 형태이지만
-    이 스킴이 지원하지 않는 이름"(stray)으로 잡아 `RuntimeError` 를 낸다 — 구
-    glob 은 `[0-9][0-9]` 밖의 숫자 꼬리를 아예 못 봐서 조용히 무시했다(같은
-    silent-partial-read 클래스). **`.gz` 로 끝나는 인접 파일**(`{stem}{suffix}.gz`
-    도 `{stem}.<숫자>{suffix}.gz` 도)도 stray 로 잡는다 — 이 모듈은 읽기를
-    지원하지 않지만(생산 경로 0), 존재를 조용히 무시하면 gz 만 남은 팩이 "부재"로
-    읽힌다(2026-08-13 리뷰 지적). 그 외 압축 포맷은 이 함수의 범위 밖이다.
+    stray 판정 자체(무엇을 거부하는가)는 여기서 내리지 않는다 — 호출부가 무엇을 할지
+    (죽을지 무시할지)를 정한다. 이 함수는 분류만 한다.
     """
-    path = Path(path)
     stem_re = re.escape(path.stem)
     suffix_re = re.escape(path.suffix)
     pat = re.compile(stem_re + r"\.(\d+)" + suffix_re + r"$")
@@ -98,6 +88,31 @@ def shard_paths(path: Path | str) -> list[Path]:
                 shards.append(path.parent / entry.name)
             else:
                 stray.append(entry.name)
+    return shards, stray
+
+
+def shard_paths(path: Path | str) -> list[Path]:
+    """논리 경로 → 실제 물리 파일 목록.
+    base만 → [base] / shards만 → 정렬된 shard들 / 둘 다 → RuntimeError / 없음 → [].
+
+    **번호가 `00` 부터 연속이 아니면 죽는다.** 이 모듈의 존재 이유는 "부분만 읽고
+    조용히 넘어가는 것"을 막는 것인데(base 를 단일 `open()` 하면 `FileNotFoundError` 로
+    즉사시키는 설계), 정작 **조각이 중간에 빠진 경우**는 남은 것을 이어붙여 통과시켰다.
+    전송 중단이나 실수 삭제로 `.01` 이 없으면 적재기가 **불완전한 팩을 오류 없이 삼킨다** —
+    같은 클래스의 사고를 같은 파일이 한쪽만 막고 있었던 것이다(2026-08-11 리뷰 지적,
+    재현: `.00`·`.02` 만 두면 2행이 그대로 읽혔다).
+
+    **매치는 넓게(`\\d+`, 유니코드 숫자 포함), 판정은 좁게(정확히 두 자리 ASCII
+    숫자)** 한다(`_scan_shard_candidates` 참고). `.100`·`.1`·비ASCII 숫자로 끝나는
+    이름은 전부 "shard 형태이지만 이 스킴이 지원하지 않는 이름"(stray)으로 잡아
+    `RuntimeError` 를 낸다 — 구 glob 은 `[0-9][0-9]` 밖의 숫자 꼬리를 아예 못 봐서
+    조용히 무시했다(같은 silent-partial-read 클래스). **`.gz` 로 끝나는 인접
+    파일**(`{stem}{suffix}.gz` 도 `{stem}.<숫자>{suffix}.gz` 도)도 stray 로 잡는다 —
+    이 모듈은 읽기를 지원하지 않지만(생산 경로 0), 존재를 조용히 무시하면 gz 만 남은
+    팩이 "부재"로 읽힌다(2026-08-13 리뷰 지적). 그 외 압축 포맷은 이 함수의 범위 밖이다.
+    """
+    path = Path(path)
+    shards, stray = _scan_shard_candidates(path)
     if stray:
         raise RuntimeError(
             f"지원 밖 shard 이름 발견: {sorted(stray)} — "
@@ -233,8 +248,12 @@ def write_jsonl_sharded(path: Path | str, records, limit: int = None) -> list[Pa
     path = Path(path)
     limit = limit if limit is not None else SHARD_LIMIT
     path.parent.mkdir(parents=True, exist_ok=True)
-    old = set(path.parent.glob(f"{path.stem}.[0-9][0-9]{path.suffix}")) | (
-        {path} if path.exists() else set())
+    # stem 을 glob 에 보간하지 않는다 — `foo[bar]` 처럼 메타문자가 있으면 실재하는
+    # 구 shard 를 못 찾아 정리에서 빠진다(shard_paths 와 같은 함정의 형제, 2026-08-13
+    # 리뷰 지적). shard_paths 와 같은 scandir+정규식 열거를 공유하되, 여기서는 stray
+    # 를 거부하지 않고(rewrite 정리는 raise 할 이유가 없다) 2자리 shard 집합만 쓴다.
+    _old_shards, _ = _scan_shard_candidates(path)
+    old = set(_old_shards) | ({path} if path.exists() else set())
 
     written: list[Path] = []
     cur, size, f = path, 0, None

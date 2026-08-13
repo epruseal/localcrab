@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from opencrab.pack.jsonl_io import iter_jsonl, jsonl_exists
+from opencrab.pack.schema import absorb_legacy_top_level
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -96,7 +97,12 @@ def build_zip(pack_dir: str | Path, out_path: str | Path, pack_id: str = "", tit
             continue
         if n.get("node_type") == "TextUnit":
             continue  # Q&A 청크는 cloud/chunks.jsonl로 충분
-        props = n.get("properties", {})
+        # 레거시 호환: 2026-08-03 이전 생산자는 커스텀 필드(url·source_url 등)를
+        # 노드 최상위에 펼쳤다. 로더(opencrab.pack.normalize.transform_node)와 같은
+        # 정본 흡수 규칙(opencrab.pack.schema.absorb_legacy_top_level)을 써야
+        # 두 소비자가 같은 노드에서 다른 필드를 보는 일이 없다 — 규칙을 여기서
+        # 다시 선언하지 않는다. 중첩 properties 가 우선(정본 위치)한다.
+        props = absorb_legacy_top_level(n)
         cloud_documents.append({
             "id":         n["id"],
             "title":      n.get("label", ""),

@@ -722,6 +722,62 @@ class TestAbsentOptionalFieldsBecomeNoneNotMissing:
         assert "created_at" in doc and doc["created_at"] is None
 
 
+class TestLegacyTopLevelPropsAbsorbed:
+    """레거시 호환: 2026-08-03 이전 생산자는 커스텀 필드(url·source_url 등)를 노드
+    최상위에 펼쳤다. 이 모듈은 종전엔 `n.get("properties", {})`만 읽어 그 필드들이
+    documents.jsonl 에 조용히 실리지 않았다(PR 리뷰 N1, 2026-08-13). 로더
+    (`opencrab.pack.normalize.transform_node`)와 같은 정본 흡수 규칙
+    (`opencrab.pack.schema.absorb_legacy_top_level`)을 재사용해야 한다."""
+
+    def test_legacy_top_level_url_reaches_source_and_source_url(self, tmp_path):
+        n = {"id": "d1", "label": "L1", "node_type": "Document", "space": "resource",
+             "url": "http://legacy-top-level/doc"}  # properties 키 자체가 없다
+        d = _pack(tmp_path, "p", [n], edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            doc = json.loads(zf.read("cloud/documents.jsonl").decode().strip())
+        assert doc["source_url"] == "http://legacy-top-level/doc", \
+            "최상위 url이 흡수되지 않았다 — 로더의 레거시 흡수 규칙과 어긋난다"
+        assert doc["source"] == "http://legacy-top-level/doc"
+        assert doc["properties"]["url"] == "http://legacy-top-level/doc", \
+            "흡수된 필드가 출력 properties에도 실려야 한다"
+
+    def test_nested_properties_win_over_legacy_top_level_on_key_collision(self, tmp_path):
+        """정본 위치는 중첩이다 — 최상위와 중첩에 같은 키가 있으면 중첩이 이긴다."""
+        n = {"id": "d1", "label": "L1", "node_type": "Document", "space": "resource",
+             "url": "http://top-level",                    # 최상위(레거시)
+             "properties": {"url": "http://nested"}}        # 중첩(정본)
+        d = _pack(tmp_path, "p", [n], edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            doc = json.loads(zf.read("cloud/documents.jsonl").decode().strip())
+        assert doc["properties"]["url"] == "http://nested"
+        assert doc["source_url"] == "http://nested"
+
+    def test_existing_nested_only_layout_is_byte_identical(self, tmp_path):
+        """스트라이(최상위 커스텀 필드)가 없는 기존 레이아웃은 흡수 로직 도입
+        **이전과 바이트 단위로 동일**해야 한다 — 회귀 방지."""
+        n = {
+            "id": "doc1", "label": "My Title", "node_type": "Report", "space": "resource",
+            "created_at": "2026-01-01T00:00:00Z",
+            "properties": {"source": "official-site", "url": "http://x", "source_url": "http://x/direct"},
+        }
+        d = _pack(tmp_path, "p", [n], edges=[], chunks=[_c("c1", "hi")])
+        out = tmp_path / "out.zip"
+        manifest = build_zip(d, out)
+        with zipfile.ZipFile(out) as zf:
+            raw = zf.read("cloud/documents.jsonl")
+        expected = json.dumps({
+            "id": "doc1", "title": "My Title", "source": "official-site",
+            "source_url": "http://x/direct", "space": "resource", "node_type": "Report",
+            "pack_id": manifest["pack_id"], "created_at": "2026-01-01T00:00:00Z",
+            "properties": n["properties"],
+        }, ensure_ascii=False).encode() + b"\n"
+        assert raw == expected, "스트라이 없는 노드의 출력 바이트가 흡수 로직 도입으로 바뀌었다"
+
+
 class TestNodeIdFiltering:
     """이 불변식(falsy id는 `graph_nodes`/`node_ids`에 결코 들어가지 않는다)이
     모듈 docstring에 적어 둔 등가 변이 4종의 전제다 — dangling edge 판정의

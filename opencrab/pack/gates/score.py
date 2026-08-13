@@ -163,11 +163,27 @@ def grade_pack(pack_dir: Path | str, expected_sources: int | None = None) -> dic
     by_src = defaultdict(list)
     missing_idx = 0
     for c in chunks:
-        ei = c.get("metadata", {}).get("evidence_index")
+        # 명시적 `"metadata": null` 이면 `.get("metadata", {})` 의 기본값은 적용되지
+        # 않는다(키가 존재하므로) — 그대로 `.get()` 을 부르면 `AttributeError` 로
+        # 채점 전체가 죽는다(2026-08-13 리뷰 지적). `or {}` 로 None 도 흡수한다.
+        ei = (c.get("metadata") or {}).get("evidence_index")
         if ei is None:
             missing_idx += 1
-        else:
-            by_src[c.get("source")].append(ei)
+            continue
+        src = c.get("source")
+        if not src:
+            # source 결측 청크를 전부 같은 None 키로 묶으면 서로 무관한 청크들이
+            # 한 그룹으로 뭉쳐 evidence_index 연속성을 오판한다(2026-08-13 리뷰
+            # 지적). 섹션 3(소스 커버리지)과 같은 검증형 폴백을 쓴다 — source 가
+            # 없으면 document_id 가 실제 resource 일 때만 그 resource 를 그룹 키로
+            # 쓴다. 폴백도 안 되면(무관 document_id) 어느 그룹에도 넣지 않는다 —
+            # 귀속 불가능한 청크를 억지로 묶는 것보다 연속성 판정에서 제외하는
+            # 편이 안전하다.
+            d_id = c.get("document_id")
+            if d_id in res_ids:
+                src = d_id
+        if src:
+            by_src[src].append(ei)
     if missing_idx:
         viol += 1
         details.append(f'evidence_index 미부여 {missing_idx}건')
