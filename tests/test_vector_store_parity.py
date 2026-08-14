@@ -184,6 +184,130 @@ class TestVectorStoreContract:
 
 
 # ---------------------------------------------------------------------------
+# [#175 v2] Chroma-only: ids that already carry a chromadb ``uri`` are routed
+# through native upsert() (merge) instead of delete()+add() (replace) — see
+# ChromaStore.upsert_texts docstring. Real chromadb only (no mocks/doubles):
+# the merge-vs-replace split under test IS chromadb's own upsert()/add()
+# behavior, so a double would just assert against itself.
+# ---------------------------------------------------------------------------
+
+
+class TestChromaUriPreservation:
+    def _seed_uri_record(self, store, doc_id, document, metadata, uri, embedding=None):
+        """Seed a uri-bearing record directly on the raw collection.
+        chromadb's add(uris=...) raises ValueError without an explicit
+        embedding on a collection with no data_loader (verified against
+        chromadb 1.5.9), so this bypasses store.upsert_texts()/add_texts()."""
+        emb = embedding or [0.1] * 32
+        store._collection.add(
+            ids=[doc_id], embeddings=[emb], documents=[document],
+            metadatas=[metadata], uris=[uri],
+        )
+
+    def test_u1_uri_record_upsert_preserves_uri_and_updates_values(self, tmp_path):
+        # U1: uri record → upsert_texts → uri kept, document/meta updated,
+        # stale meta keys survive (merge semantics via native upsert()).
+        store = build_vector_store("chroma", tmp_path)
+        self._seed_uri_record(
+            store, "r1", "doc v1", {"old": "1", "keep": "k"}, "http://example.com/r1"
+        )
+
+        store.upsert_texts(texts=["doc v2"], metadatas=[{"new": "2"}], ids=["r1"])
+
+        got = store._collection.get(ids=["r1"], include=["documents", "metadatas", "uris"])
+        assert got["uris"][0] == "http://example.com/r1", "uri 가 사라졌다"
+        assert got["documents"][0] == "doc v2", "document 이 갱신되지 않았다"
+        assert got["metadatas"][0] == {"old": "1", "keep": "k", "new": "2"}, (
+            f"메타 병합 결과가 다르다(스테일 키 존속 + 새 키 반영): {got['metadatas'][0]}"
+        )
+
+    def test_u1b_mixed_batch_routes_each_id_through_the_right_path(self, tmp_path):
+        # U1b: uri record + plain existing record + brand-new id in ONE
+        # upsert_texts call → each must land on its correct path, and the
+        # underlying collection calls must show it (uri id via upsert() only,
+        # the other two via delete()+add()).
+        store = build_vector_store("chroma", tmp_path)
+        self._seed_uri_record(
+            store, "uri1", "u-doc-v1", {"stale": "old", "keep": "k"},
+            "http://example.com/uri1",
+        )
+        store.upsert_texts(texts=["plain-doc-v1"], metadatas=[{"stale": "old2"}], ids=["plain1"])
+        # "new1" intentionally never seeded — brand-new id in the mixed batch.
+
+        calls: dict[str, list[list[str]]] = {"upsert": [], "delete": [], "add": []}
+        real_upsert = store._collection.upsert
+        real_delete = store._collection.delete
+        real_add = store._collection.add
+
+        def wrap_upsert(**kw):
+            calls["upsert"].append(list(kw.get("ids", [])))
+            return real_upsert(**kw)
+
+        def wrap_delete(**kw):
+            calls["delete"].append(list(kw.get("ids", [])))
+            return real_delete(**kw)
+
+        def wrap_add(**kw):
+            calls["add"].append(list(kw.get("ids", [])))
+            return real_add(**kw)
+
+        store._collection.upsert = wrap_upsert
+        store._collection.delete = wrap_delete
+        store._collection.add = wrap_add
+
+        store.upsert_texts(
+            texts=["u-doc-v2", "plain-doc-v2", "new-doc-v1"],
+            metadatas=[{"new": "u2"}, {"new": "p2"}, {"new": "n1"}],
+            ids=["uri1", "plain1", "new1"],
+        )
+
+        assert calls["upsert"] == [["uri1"]], (
+            f"uri 레코드가 native upsert() 경로를 안 탔다: {calls}"
+        )
+        assert calls["delete"] and set(calls["delete"][0]) == {"plain1", "new1"}, (
+            f"일반/신규 id 가 delete+add(치환) 경로를 안 탔다: {calls}"
+        )
+        assert calls["add"] and set(calls["add"][0]) == {"plain1", "new1"}, calls
+
+        got = store._collection.get(
+            ids=["uri1", "plain1", "new1"], include=["documents", "metadatas", "uris"]
+        )
+        by_id = dict(zip(got["ids"], zip(got["documents"], got["metadatas"], got["uris"])))
+
+        uri_doc, uri_meta, uri_uri = by_id["uri1"]
+        assert uri_uri == "http://example.com/uri1", "uri 레코드의 uri 가 사라졌다"
+        assert uri_doc == "u-doc-v2"
+        assert uri_meta == {"stale": "old", "keep": "k", "new": "u2"}, (
+            f"uri 레코드는 병합이어야 한다(스테일 키 존속): {uri_meta}"
+        )
+
+        plain_doc, plain_meta, plain_uri = by_id["plain1"]
+        assert plain_uri is None
+        assert plain_doc == "plain-doc-v2"
+        assert plain_meta == {"new": "p2"}, (
+            f"일반 레코드는 치환이어야 한다(스테일 키 소멸): {plain_meta}"
+        )
+
+        new_doc, new_meta, new_uri = by_id["new1"]
+        assert new_uri is None
+        assert new_doc == "new-doc-v1"
+        assert new_meta == {"new": "n1"}
+
+    def test_u2_plain_record_upsert_replaces_document_and_drops_stale_keys(self, tmp_path):
+        # U2: no uri anywhere → unchanged replace contract (delete+add):
+        # document replaced, stale meta keys dropped. Strengthens the
+        # existing cross-backend parity test with an explicit uris=None check.
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["v1"], metadatas=[{"old": "1", "keep": "k"}], ids=["p1"])
+        store.upsert_texts(texts=["v2"], metadatas=[{"new": "2"}], ids=["p1"])
+
+        got = store._collection.get(ids=["p1"], include=["documents", "metadatas", "uris"])
+        assert got["documents"][0] == "v2"
+        assert got["metadatas"][0] == {"new": "2"}, "스테일 키가 살아남았다 — 치환이 아니다"
+        assert got["uris"][0] is None
+
+
+# ---------------------------------------------------------------------------
 # Cross-backend equivalence (Chroma vs sqlite-vec, same EF/data → same results)
 # ---------------------------------------------------------------------------
 

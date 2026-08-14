@@ -61,7 +61,14 @@ CONTRACT — ``upsert_texts(texts, metadatas, ids)`` full-replace semantics
         delete-then-add replaces). Prior to #175 this store called
         ``upsert()`` directly, breaking the cross-backend contract — a stale
         key dropped by the caller's canonical metadata transform would
-        survive forever. Fixed to delete()-then-add().
+        survive forever. Fixed to delete()-then-add(). EXCEPTION [#175 v2]:
+        an id that already carries a chromadb uri (never produced by this
+        codebase, so always externally written) is routed through native
+        ``upsert()`` (merge) instead, because delete()+add() cannot carry the
+        uri over without an embedding/document mismatch — see
+        chroma_store.py's ``upsert_texts`` docstring for the full argument;
+        this matches the fallback ``opencrab/pack/load.py``'s
+        ``_vec_meta_update`` already documents for its own uri branch.
     Callers (opencrab/ontology/builder.py, opencrab/ontology/query.py,
     opencrab/pack/load.py) all pass the full canonical metadata dict on every
     upsert_texts call, i.e. they already assume replace semantics — the

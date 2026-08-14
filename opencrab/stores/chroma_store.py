@@ -154,19 +154,44 @@ class ChromaStore:
         metadatas: list[dict[str, Any]] | None = None,
         ids: list[str] | None = None,
     ) -> list[str]:
-        """Upsert (add or update) text chunks — full replace semantics.
+        """Upsert (add or update) text chunks — full replace semantics, with
+        one exception carved out for uri-bearing records.
 
-        [#175] chromadb's native ``collection.upsert()`` MERGES metadata into
-        any existing record (verified empirically against chromadb 1.5.7/1.5.9:
-        both ``update()`` and ``upsert()`` merge, only delete+add replaces) —
-        so a stale key dropped by the caller's canonical transform would
-        survive forever under a plain upsert call. sqlite-vec
+        [#175] Default contract: full REPLACE. chromadb's native
+        ``collection.upsert()``/``update()`` MERGE metadata into any existing
+        record (verified empirically against chromadb 1.5.7/1.5.9) — a stale
+        key dropped by the caller's canonical metadata transform would
+        survive forever under a plain ``upsert()``. sqlite-vec
         (DELETE-then-INSERT) and pgvector (``ON CONFLICT ... DO UPDATE SET
         metadata = EXCLUDED.metadata``) both give full-replace semantics, so
-        this store's ``upsert_texts`` contract is: existing ids are fully
-        replaced (document + metadata), not merged. delete()-then-add()
-        restores that contract here; delete() on ids that don't exist yet is
-        a no-op (verified), so this is safe for the add-or-update case too.
+        for ids with no uri this store replaces too: delete()-then-add().
+        delete() on ids that don't exist yet is a no-op (verified), so this
+        is safe for the add-or-update case too.
+
+        EXCEPTION — uri-bearing records: this store never produces a record
+        carrying a uri (no code path here calls ``add(uris=...)``), so any id
+        that already has one was written by something external. Silently
+        replacing it would drop the uri, and there is no safe way to carry it
+        over through delete()+add(): ``add(uris=...)`` raises ValueError
+        without an accompanying embedding on a collection with no
+        ``data_loader`` (verified against chromadb 1.5.9), and reusing the
+        record's *old* embedding while the document text changes would leave
+        the embedding out of sync with the new document. So ids that already
+        carry a uri are routed through native ``upsert()`` instead — merge
+        semantics (document and embedding are recomputed from the new text;
+        metadata is merged, so stale keys on these records can persist).
+        This is not a regression: it is the same fallback contract
+        ``opencrab/pack/load.py``'s ``_vec_meta_update`` already documents for
+        its own chroma/uri branch ("URI 레코드는 치환하지 않고 upsert 병합으로
+        우회") — this method now honors that contract directly instead of
+        clobbering it.
+
+        Non-atomicity (replace path only): if the process dies between
+        delete() and add(), the row is lost until the same chunk id reappears
+        in a later incremental load and gets re-added via the
+        ``_live_vec_ids`` diff; if it never reappears, the row stays lost.
+        The merge (upsert) path has no such window — it's a single native
+        call.
         """
         self._require_available()
 
@@ -177,9 +202,47 @@ class ChromaStore:
 
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         handle = self._collection_handle()
-        handle.delete(ids=ids)
-        handle.add(documents=texts, metadatas=clean_meta, ids=ids)
-        logger.debug("ChromaDB: upserted (delete+add) %d documents", len(texts))
+
+        # Split the batch by whether the id already carries a uri — those go
+        # through merge (upsert), everything else through replace
+        # (delete+add). See docstring for why.
+        existing = handle.get(ids=ids, include=["uris"])
+        uri_ids = {
+            doc_id
+            for doc_id, uri in zip(existing["ids"], existing.get("uris") or [])
+            if uri is not None
+        }
+
+        if not uri_ids:
+            handle.delete(ids=ids)
+            handle.add(documents=texts, metadatas=clean_meta, ids=ids)
+        else:
+            merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
+            replace_pos = [i for i, doc_id in enumerate(ids) if doc_id not in uri_ids]
+            if merge_pos:
+                handle.upsert(
+                    documents=[texts[i] for i in merge_pos],
+                    metadatas=[clean_meta[i] for i in merge_pos],
+                    ids=[ids[i] for i in merge_pos],
+                )
+                logger.warning(
+                    "ChromaDB: %d uri-bearing record(s) upserted via merge "
+                    "(uri preserved, stale metadata keys may persist): %s",
+                    len(merge_pos), [ids[i] for i in merge_pos],
+                )
+            if replace_pos:
+                replace_ids = [ids[i] for i in replace_pos]
+                handle.delete(ids=replace_ids)
+                handle.add(
+                    documents=[texts[i] for i in replace_pos],
+                    metadatas=[clean_meta[i] for i in replace_pos],
+                    ids=replace_ids,
+                )
+
+        logger.debug(
+            "ChromaDB: upserted %d documents (%d replaced, %d merged for uri)",
+            len(ids), len(ids) - len(uri_ids), len(uri_ids),
+        )
         return ids
 
     # ------------------------------------------------------------------
