@@ -946,6 +946,25 @@ class TestDiagnosticsReportRealNumbers:
             "집계가 중간에 죽거나 src_label 을 못 읽으면 이 검사는 공허하다"
         assert "grammar 위반" not in out
 
+    def test_edge_with_explicit_none_properties_does_not_crash_aggregation(self, pack, capsys):
+        """`e.get('properties', {})` 는 키가 **존재**하고 값이 `None` 이면 기본값을
+        적용하지 않는다 — `None.get(...)` 로 AttributeError (이슈 #176-1, build.py:271).
+
+        키 자체가 없는 경우는 위 테스트가 이미 지킨다. 이 테스트는 값이 명시적으로
+        `None` 인 다른 클래스를 지킨다. 비공허성은 위와 같은 패턴(FIX 치환 엣지 병치)으로 보증한다.
+        """
+        pack.node("r", "R", "Document", "resource")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("r", "e", "contains")
+        pack.edges[0]["properties"] = None               # properties 키는 있으나 값이 None
+        pack.node("a", "A", "Concept", "concept")
+        pack.edge("a", "e", "정합불가라벨")               # FIX 치환 -> 집계에 잡혀야 한다
+        pack.validate()
+        out = capsys.readouterr().out
+        assert "자동치환(FIX) 엣지 1건" in out, \
+            "집계가 중간에 죽거나 src_label 을 못 읽으면 이 검사는 공허하다"
+        assert "grammar 위반" not in out
+
     def test_fix_count_ignores_source_label_equal_to_label(self, pack, capsys):
         """`if src_label and src_label != label` — 같으면 치환이 아니므로 세지 않는다.
 
