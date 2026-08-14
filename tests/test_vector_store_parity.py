@@ -193,6 +193,23 @@ class TestVectorStoreContract:
 
 
 class TestChromaUriPreservation:
+    def test_mismatched_batch_on_nonempty_collection_destroys_nothing(self, tmp_path):
+        """리뷰 P1: 길이 불일치 배치가 delete 를 먼저 수행한 뒤 add 검증에서
+        죽으면 기존 레코드가 소실된다 — 종전 native upsert 는 무파괴로
+        거부했다. 검증은 어떤 변이보다도 먼저여야 한다. 기존 mismatch
+        테스트는 빈 컬렉션이라 이 파괴성을 못 봤다."""
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["keep me"], metadatas=[{"pack_id": "p"}], ids=["survivor"])
+        assert store.count() == 1
+        with pytest.raises(ValueError):
+            store.upsert_texts(
+                texts=["a", "b"], metadatas=[{"pack_id": "p"}], ids=["survivor", "x"]
+            )
+        # 기존 레코드가 그대로 남아 있어야 한다 (delete 가 선행되지 않았음)
+        assert store.count() == 1
+        got = store.get_by_id("survivor")
+        assert got is not None and got["document"] == "keep me"
+
     def _seed_uri_record(self, store, doc_id, document, metadata, uri, embedding=None):
         """Seed a uri-bearing record directly on the raw collection.
         chromadb's add(uris=...) raises ValueError without an explicit

@@ -200,6 +200,16 @@ class ChromaStore:
         if metadatas is None:
             metadatas = [{} for _ in texts]
 
+        # Validate the batch shape BEFORE touching the store (review P1):
+        # the replace path deletes matching records first, so a mismatched
+        # batch must be rejected here -- native upsert() used to reject it
+        # without erasing anything, and delete-then-crash would lose rows.
+        if len(ids) != len(texts) or len(metadatas) != len(texts):
+            raise ValueError(
+                f"upsert_texts: mismatched batch -- texts={len(texts)}, "
+                f"ids={len(ids)}, metadatas={len(metadatas)}"
+            )
+
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         handle = self._collection_handle()
 
