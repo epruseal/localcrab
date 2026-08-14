@@ -149,7 +149,14 @@ def _graph_edge_pack_ids(graph: Any) -> tuple[set[str], bool]:
     return pack_ids, True
 
 
-def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> dict[str, Any]:
+def _register_graph_packs(
+    sql: Any,
+    graph: Any,
+    owner_id: str,
+    apply: bool,
+    node_pack_map: dict[str, str] | None = None,
+    ambiguous_nodes: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     """One registry row per distinct graph pack_id not already registered.
 
     Uses the exact pack_id via ``_insert_pack`` (no quiet-suffixing --
@@ -160,9 +167,31 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
     wrote (in --apply mode) or would have found unchanged (dry-run).
 
     Candidates are the UNION of node pack_ids (``graph.list_packs()``, a
-    GROUP BY over ``graph_nodes``) and edge pack_ids
-    (``_graph_edge_pack_ids``, a raw ``graph_edges`` scan, #146 M P1-2) --
-    an edge whose endpoints are unpacked or foreign-packed but whose OWN
+    GROUP BY over ``graph_nodes``), edge pack_ids (``_graph_edge_pack_ids``,
+    a raw ``graph_edges`` scan, #146 M P1-2), and -- #177 review round 2,
+    "C v2" -- every pack_id ``node_pack_map``/``ambiguous_nodes`` predicts
+    or resolves for the CALLER's node_ids. In dry-run mode this last part
+    is load-bearing: ``graph.list_packs()`` only sees pack_ids already
+    written to ``graph_nodes``, so a node whose pack_id would be
+    PATH-INFERRED by the (not-yet-run, dry-run) backfill is otherwise
+    invisible to this enumeration -- the caller's dry-run report would then
+    under-count ``unregistered``. In --apply mode ``node_pack_map`` is the
+    POST-backfill ground truth (see main()), so every value in it is
+    already present in ``graph.list_packs()`` too and this union is a
+    no-op there. Ambiguous node_ids contribute BOTH of their conflicting
+    pack_ids (not just one) -- ``_backfill_vector`` excludes the node_id
+    itself from any vector write, but ``_backfill_graph`` still writes a
+    pack_id to EACH of that node_id's rows individually, so both values do
+    land in the registry on a real apply.
+
+    LIMITATION (documented in the dry-run report, not silently accepted):
+    this only covers NODE path-inference (``_predict_node_pack_map``) --
+    there is no equivalent predictor for EDGE path-inference, so a dry-run
+    still cannot foresee a pack_id an edge would only acquire once the real
+    backfill runs (#182 scope, same edge-inference gap ``_graph_edge_pack_ids``
+    already documents for its OWN enumeration).
+
+    An edge whose endpoints are unpacked or foreign-packed but whose OWN
     properties carry a pack_id would otherwise never reach the registry,
     and #147's read-path scoping would then make it vanish silently.
     """
@@ -176,13 +205,24 @@ def _register_graph_packs(sql: Any, graph: Any, owner_id: str, apply: bool) -> d
     rows = graph.list_packs(min_nodes=1)
     node_meta = {r["pack_id"]: r for r in rows if r.get("pack_id")}
     edge_pack_ids, edges_enumerable = _graph_edge_pack_ids(graph)
-    all_pack_ids = set(node_meta) | edge_pack_ids
+    predicted_pack_ids: set[str] = set((node_pack_map or {}).values())
+    for pids in (ambiguous_nodes or {}).values():
+        predicted_pack_ids.update(pids)
+    all_pack_ids = set(node_meta) | edge_pack_ids | predicted_pack_ids
     candidates = sorted(pid for pid in all_pack_ids if pid not in already)
     print(
         f"  graph distinct pack_id: {len(all_pack_ids)} total "
-        f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}), "
+        f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}, "
+        f"predicted={len(predicted_pack_ids)}), "
         f"{len(candidates)} not yet in the registry"
     )
+    if not apply:
+        print(
+            "  note: edge-inferred pack_id (path-inference on graph_edges, "
+            "no predictor exists for it -- see this function's docstring "
+            "LIMITATION) is not visible to this dry-run report; it is only "
+            "registered once a real --apply backfill has run."
+        )
     created = 0
     if apply:
         for pid in candidates:
@@ -794,7 +834,14 @@ def main(argv: list[str] | None = None) -> int:
         stage_outcomes["graph_backfill"] = {"outcome": graph_outcome, "reason": graph_reason}
 
         print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
-        registry_stats = _register_graph_packs(sql, graph, owner_id, args.apply)
+        registry_stats = _register_graph_packs(
+            sql,
+            graph,
+            owner_id,
+            args.apply,
+            node_pack_map=node_pack_map,
+            ambiguous_nodes=ambiguous_nodes,
+        )
         graph_available_for_enum = getattr(graph, "available", False)
         registry_pending = default_pending + int(registry_stats.get("unregistered") or 0)
         if not graph_available_for_enum:

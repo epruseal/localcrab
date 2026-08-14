@@ -665,6 +665,114 @@ class TestDuplicateNodeIdAmbiguity:
 
 
 # ---------------------------------------------------------------------------
+# dry-run enumeration sees path-inferred/ambiguous pack_ids (#177 review
+# round 2, design "C v2" / gate X): _predict_node_pack_map already computes
+# what backfill_pack_ids WOULD write, but a dry-run's graph.list_packs()
+# call only sees pack_ids already ON DISK -- a node whose pack_id would be
+# path-inferred is invisible to enumeration until this union is applied.
+# ---------------------------------------------------------------------------
+
+
+class TestDryRunEnumerationSeesPredictedPacks:
+    def _seed(self, env):
+        """n-solo infers "pack-solo" cleanly; "dup" is one node_id shared
+        by two rows (legal PK: (node_type, node_id)) that infer DIFFERENT
+        packs -- both "pack-a" and "pack-b" must still reach enumeration
+        even though the node_id itself is excluded as ambiguous."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node(
+                "Entity", "n-solo", {"source_path": "/packs/pack-solo/x.md"}, space_id="concept"
+            )
+            store.upsert_node(
+                "TypeA", "dup", {"source_path": "/packs/pack-a/x.md"}, space_id="concept"
+            )
+            store.upsert_node(
+                "TypeB", "dup", {"source_path": "/packs/pack-b/x.md"}, space_id="concept"
+            )
+        finally:
+            store.close()
+
+    def test_x1_predicted_and_ambiguous_packs_counted_unregistered(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_graph_store, make_sql_store
+
+        self._seed(env)
+        db_path = env / "graph.db"
+        predicted, ambiguous = migrate._predict_node_pack_map(
+            db_path, ["n-solo", "dup"], migrate.DEFAULT_PACK_ID
+        )
+        assert predicted == {"n-solo": "pack-solo"}
+        assert ambiguous == {"dup": sorted(["pack-a", "pack-b"])}
+
+        sql = make_sql_store(get_settings())
+        graph = make_graph_store(get_settings())
+        try:
+            stats = migrate._register_graph_packs(
+                sql,
+                graph,
+                bootstrapped_owner,
+                apply=False,
+                node_pack_map=predicted,
+                ambiguous_nodes=ambiguous,
+            )
+        finally:
+            graph.close()
+        # pack-solo + pack-a + pack-b -- none of them written to
+        # graph_nodes yet (dry-run backfill never runs), so
+        # graph.list_packs() alone would report 0 here.
+        assert stats["graph_distinct_packs"] == 3
+        assert stats["unregistered"] == 3
+
+    def test_non_vacuous_undercounts_without_the_union(self, bootstrapped_owner, env):
+        """비공허성: the SAME seed with node_pack_map/ambiguous_nodes
+        omitted (the pre-C-v2 call shape) undercounts to 0 -- proving the
+        dry-run report really was blind to path-inferred/ambiguous pack_ids
+        before this fix."""
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_graph_store, make_sql_store
+
+        self._seed(env)
+        sql = make_sql_store(get_settings())
+        graph = make_graph_store(get_settings())
+        try:
+            stats = migrate._register_graph_packs(sql, graph, bootstrapped_owner, apply=False)
+        finally:
+            graph.close()
+        assert stats["unregistered"] == 0
+
+    def test_x2_dry_run_report_matches_apply_result(self, bootstrapped_owner, env, capsys):
+        """set + count + outcome-label triple-check between dry-run and a
+        real --apply over the identical seed."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+
+        self._seed(env)
+
+        rc_dry = migrate.main([])
+        out_dry = capsys.readouterr().out
+        assert rc_dry == 0
+        assert "3 not yet in the registry" in out_dry
+        assert "registry_enumeration: applied (4 row(s) needed registering)" in out_dry
+        assert "edge-inferred pack_id" in out_dry  # apply-only-limitation note
+
+        rc_apply = migrate.main(["--apply", "--skip-backup"])
+        out_apply = capsys.readouterr().out
+        assert rc_apply == 0
+        assert "3 not yet in the registry" in out_apply
+        assert "registry_enumeration: applied (4 row(s) needed registering)" in out_apply
+
+        sql = make_sql_store(get_settings())
+        for pid in ("pack-solo", "pack-a", "pack-b", migrate.DEFAULT_PACK_ID):
+            assert get_pack(sql, pid) is not None
+
+
+# ---------------------------------------------------------------------------
 # Structured per-stage outcomes + exit codes (#146 M)
 # ---------------------------------------------------------------------------
 
