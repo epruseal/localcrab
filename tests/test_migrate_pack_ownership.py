@@ -399,6 +399,165 @@ class TestDefaultPackOwnerMatchesBootstrap:
 
 
 # ---------------------------------------------------------------------------
+# _register_graph_packs foreign-owner overlap guard (#177 review round 2,
+# design "B v2" / gate W v3): a graph pack_id that already has REGISTRY
+# content but is owned by someone other than the bootstrap owner must abort
+# by default -- silently skipping it (the pre-fix behaviour) would hand
+# whoever squatted that slug the legacy graph content it already carries.
+# ---------------------------------------------------------------------------
+
+
+class TestForeignOwnedPackOverlap:
+    def _seed_foreign_overlap(self, env, sql):
+        """Registry row for "foreign-pack" owned by someone else, PLUS
+        graph content already tagged with that exact pack_id -- the
+        "legacy content silently reassigned to a squatter" scenario."""
+        from opencrab.pack.ownership import _insert_pack
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        assert _insert_pack(sql, "foreign-pack", "someone-else-owner", None, None, None)
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node(
+                "Dataset",
+                "dataset:foreign",
+                {"pack_id": "foreign-pack", "title": "Foreign"},
+                space_id="resource",
+            )
+        finally:
+            store.close()
+
+    def test_w1_dry_run_aborts_with_state_fully_unchanged(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        self._seed_foreign_overlap(env, sql)
+        before_packs = _packs_snapshot(sql)
+        graph_path = env / "graph.db"
+        before_graph = (graph_path.stat().st_size, graph_path.stat().st_mtime_ns)
+
+        rc = migrate.main([])
+
+        assert rc == 1
+        assert _packs_snapshot(sql) == before_packs
+        assert (graph_path.stat().st_size, graph_path.stat().st_mtime_ns) == before_graph
+
+    def test_w1_apply_aborts_with_default_and_backfill_already_run(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """W v3's explicit non-atomicity: stages BEFORE the foreign-owner
+        check (default-pack registration, graph backfill) already ran --
+        both are self-contained/harmless (bootstrap-owned) -- while
+        enumeration's own registration and every stage after it did not.
+        The summary must show which is which."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        self._seed_foreign_overlap(env, sql)
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 1
+
+        default = get_pack(sql, migrate.DEFAULT_PACK_ID)
+        assert default is not None
+        assert default["owner_id"] == bootstrapped_owner  # stage 1 ran
+        foreign = get_pack(sql, "foreign-pack")
+        assert foreign["owner_id"] == "someone-else-owner"  # untouched by enumeration
+
+        out = capsys.readouterr().out
+        assert "graph_backfill: clean" in out  # stage 2 ran (nothing to backfill here)
+        assert "registry_enumeration: failed" in out  # stage 3 aborted here
+        assert "docs_backfill: failed" in out  # never reached
+        assert "vector_backfill: failed" in out  # never reached
+
+    def test_error_message_names_packs_owners_and_flag(self, bootstrapped_owner, env, capsys):
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        self._seed_foreign_overlap(env, sql)
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
+        err = capsys.readouterr().err
+        assert "foreign-pack" in err
+        assert "someone-else-owner" in err
+        assert "--accept-foreign-owned-packs" in err
+
+    def test_w1b_flag_skips_and_proceeds(self, bootstrapped_owner, env, capsys):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        self._seed_foreign_overlap(env, sql)
+
+        rc = migrate.main(["--apply", "--skip-backup", "--accept-foreign-owned-packs"])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "skipping 1 graph pack_id" in out
+        assert "foreign-pack" in out
+        assert "someone-else-owner" in out
+        foreign = get_pack(sql, "foreign-pack")
+        assert foreign["owner_id"] == "someone-else-owner"  # left alone, not reassigned
+
+    def test_w2_bootstrap_owned_rerun_is_unaffected(self, bootstrapped_owner, env):
+        """A pack_id already registered to the BOOTSTRAP owner (the normal
+        re-run case) is not foreign-owned -- no abort, unchanged from
+        before this guard existed, and a second re-run stays idempotent."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, "existing-pack", bootstrapped_owner, None, None, None)
+        store = LocalGraphStore(str(env / "graph.db"))
+        try:
+            store.upsert_node(
+                "Dataset",
+                "dataset:existing",
+                {"pack_id": "existing-pack", "title": "E"},
+                space_id="resource",
+            )
+        finally:
+            store.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+        assert migrate.main(["--apply", "--skip-backup"]) == 0  # idempotent re-run
+
+    def test_non_vacuous_old_candidate_formula_would_have_silently_skipped_it(
+        self, bootstrapped_owner, env
+    ):
+        """비공허성: reproduces the PRE-fix candidate formula (``pid not in
+        already`` with no owner check, exactly what ``_register_graph_packs``
+        used before this guard) directly against the same seed -- proving
+        "foreign-pack" really would have been silently excluded from
+        ``candidates`` (0 unregistered -> stage reports "clean") instead of
+        aborting. The new function instead raises for this exact scenario
+        (see test_w1_dry_run_aborts_with_state_fully_unchanged)."""
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_graph_store, make_sql_store
+
+        sql = make_sql_store(get_settings())
+        self._seed_foreign_overlap(env, sql)
+        graph = make_graph_store(get_settings())
+        try:
+            already = migrate._registered_pack_ids(sql)
+            rows = graph.list_packs(min_nodes=1)
+            node_meta = {r["pack_id"]: r for r in rows if r.get("pack_id")}
+            old_candidates = [pid for pid in node_meta if pid not in already]
+        finally:
+            graph.close()
+        assert "foreign-pack" in already
+        assert "foreign-pack" in node_meta
+        assert old_candidates == []
+
+
+# ---------------------------------------------------------------------------
 # _register_graph_packs edge-only pack_id enumeration (#146 M P1-2)
 # ---------------------------------------------------------------------------
 

@@ -116,6 +116,20 @@ def _registered_pack_ids(sql: Any) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _registered_pack_owners(sql: Any) -> dict[str, str]:
+    """Every registered ``pack_id -> owner_id`` -- ``_registered_pack_ids``
+    only reports which slugs are taken, not by whom; the foreign-owner
+    overlap check in ``_register_graph_packs`` (#177 review round 2, gate
+    W v3) needs the owner to tell "bootstrap re-run" (silently skip, same
+    as before) from "someone else already holds this exact slug" (abort by
+    default -- see that function's docstring)."""
+    from sqlalchemy import text
+
+    with sql._engine.connect() as conn:
+        rows = conn.execute(text("SELECT pack_id, owner_id FROM packs")).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def _graph_edge_pack_ids(graph: Any) -> tuple[set[str], bool]:
     """Distinct pack_id found in ``graph_edges.properties`` (#146 M P1-2).
 
@@ -156,6 +170,7 @@ def _register_graph_packs(
     apply: bool,
     node_pack_map: dict[str, str] | None = None,
     ambiguous_nodes: dict[str, list[str]] | None = None,
+    accept_foreign_owned_packs: bool = False,
 ) -> dict[str, Any]:
     """One registry row per distinct graph pack_id not already registered.
 
@@ -194,14 +209,34 @@ def _register_graph_packs(
     An edge whose endpoints are unpacked or foreign-packed but whose OWN
     properties carry a pack_id would otherwise never reach the registry,
     and #147's read-path scoping would then make it vanish silently.
+
+    Foreign-owner overlap guard (#177 review round 2, "B v2"): a graph
+    pack_id ALREADY registered to someone other than ``owner_id`` is
+    ambiguous after the fact -- it looks identical whether that row is a
+    legitimate user pack (created after this migration first ran, no
+    conflict) or a slug that got squatted before this migration ever ran
+    (the legacy graph content now silently belongs to the squatter once
+    this function just skips it as "already registered"). This function
+    cannot tell those two apart, so it does not guess: by default it
+    raises (dry-run AND --apply alike) so an operator decides.
+    ``accept_foreign_owned_packs=True`` is that explicit operator decision
+    -- it downgrades the raise to a printed warning and proceeds exactly
+    as before (the foreign-owned pack_id is left alone, same as any other
+    already-registered pack_id).
     """
     from opencrab.pack.ownership import _insert_pack
 
     if not getattr(graph, "available", False):
         print("  graph store unavailable -- skipping pack-id enumeration")
-        return {"graph_distinct_packs": 0, "unregistered": 0, "created": 0, "edges_enumerable": True}
+        return {
+            "graph_distinct_packs": 0,
+            "unregistered": 0,
+            "created": 0,
+            "edges_enumerable": True,
+            "foreign_owned": [],
+        }
 
-    already = _registered_pack_ids(sql)
+    already_owners = _registered_pack_owners(sql)
     rows = graph.list_packs(min_nodes=1)
     node_meta = {r["pack_id"]: r for r in rows if r.get("pack_id")}
     edge_pack_ids, edges_enumerable = _graph_edge_pack_ids(graph)
@@ -209,7 +244,35 @@ def _register_graph_packs(
     for pids in (ambiguous_nodes or {}).values():
         predicted_pack_ids.update(pids)
     all_pack_ids = set(node_meta) | edge_pack_ids | predicted_pack_ids
-    candidates = sorted(pid for pid in all_pack_ids if pid not in already)
+
+    foreign_owned = sorted(
+        pid
+        for pid in all_pack_ids
+        if pid in already_owners and already_owners[pid] != owner_id
+    )
+    if foreign_owned:
+        detail = ", ".join(f"{pid!r} (owner={already_owners[pid]!r})" for pid in foreign_owned)
+        if not accept_foreign_owned_packs:
+            raise RuntimeError(
+                f"{len(foreign_owned)} graph pack_id(s) already exist in the "
+                f"graph store's content but are registered to a DIFFERENT "
+                f"owner than the bootstrap owner {owner_id!r}: {detail}. "
+                "This can happen if remote pack registration was opened "
+                "before this migration ran (someone else claimed one of "
+                "these exact slugs first) -- or, more benignly, a re-run "
+                "colliding with a genuinely new user pack. This script "
+                "cannot tell those apart automatically -- it needs a human "
+                "to verify. If these rows are confirmed to be legitimate "
+                "(e.g. a safe re-run, or the owner is expected to hold this "
+                "legacy content), re-run with --accept-foreign-owned-packs "
+                "to skip them and proceed with everything else unchanged."
+            )
+        print(
+            f"  ! --accept-foreign-owned-packs: skipping {len(foreign_owned)} "
+            f"graph pack_id(s) already registered to a different owner: {detail}"
+        )
+
+    candidates = sorted(pid for pid in all_pack_ids if pid not in already_owners)
     print(
         f"  graph distinct pack_id: {len(all_pack_ids)} total "
         f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}, "
@@ -248,6 +311,7 @@ def _register_graph_packs(
         "unregistered": len(candidates),
         "created": created,
         "edges_enumerable": edges_enumerable,
+        "foreign_owned": foreign_owned,
     }
 
 
@@ -706,6 +770,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="Perform writes. Without this flag the script is dry-run.")
     parser.add_argument("--backup-to", default=None, help="Directory to copy local SQLite files into before writing (required with --apply unless --skip-backup).")
     parser.add_argument("--skip-backup", action="store_true", help="Explicitly skip the mandatory pre-migration backup (required for non-SQLite deployments, since this script cannot back those up itself).")
+    parser.add_argument(
+        "--accept-foreign-owned-packs",
+        action="store_true",
+        help=(
+            "Explicit operator override (#177 review round 2 gate W v3): "
+            "without it, a graph pack_id that already has registry content "
+            "AND is registered to someone other than the bootstrap owner "
+            "aborts the run (rc 1, dry-run and --apply alike) rather than "
+            "silently skipping it -- see _register_graph_packs' docstring "
+            "for why this can't be decided automatically. Pass this once "
+            "you have confirmed the foreign-owned pack_id(s) are legitimate "
+            "(e.g. a safe re-run after remote pack registration opened)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from opencrab.config import get_settings
@@ -841,6 +919,7 @@ def main(argv: list[str] | None = None) -> int:
             args.apply,
             node_pack_map=node_pack_map,
             ambiguous_nodes=ambiguous_nodes,
+            accept_foreign_owned_packs=args.accept_foreign_owned_packs,
         )
         graph_available_for_enum = getattr(graph, "available", False)
         registry_pending = default_pending + int(registry_stats.get("unregistered") or 0)
