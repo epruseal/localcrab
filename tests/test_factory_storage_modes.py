@@ -6,6 +6,8 @@ STORAGE_MODE value, and that Settings.is_local behaves correctly.
 
 from __future__ import annotations
 
+import pytest
+
 
 def test_settings_local_is_local_true() -> None:
     from opencrab.config import Settings
@@ -41,6 +43,8 @@ def test_factory_local_returns_local_graph_store(tmp_path) -> None:
 
 
 def test_factory_kuzu_returns_kuzu_graph_store(tmp_path) -> None:
+    pytest.importorskip("ladybug")
+
     from opencrab.config import Settings
     from opencrab.stores.factory import make_graph_store
     from opencrab.stores.kuzu_graph_store import KuzuGraphStore
