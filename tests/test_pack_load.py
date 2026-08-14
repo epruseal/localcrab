@@ -2019,7 +2019,7 @@ class TestVecMetaUpdateChromaReplace:
     # ① 부재 → False
     def test_missing_record_returns_false(self):
         vec = _FakeChromaVec({})
-        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1})
+        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1}, "pack-1")
         assert ok is False
         assert vec._collection.delete_calls == []
         assert vec._collection.add_calls == []
@@ -2028,8 +2028,8 @@ class TestVecMetaUpdateChromaReplace:
     def test_replaces_and_drops_stale_metadata_keys(self):
         vec = _FakeChromaVec({})
         vec._collection.seed("c1", embedding=[0.1, 0.2, 0.3], document="본문",
-                              metadata={"stale": "old", "쪽": "1"})
-        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"})
+                              metadata={"pack_id": "pack-1", "stale": "old", "쪽": "1"})
+        ok = pack_load._vec_meta_update(vec, "c1", {"쪽": "99"}, "pack-1")
         assert ok is True
         assert vec._collection.metas["c1"] == {"쪽": "99"}, (
             "치환이 아니라 병합이면 'stale' 키가 살아남는다")
@@ -2040,8 +2040,9 @@ class TestVecMetaUpdateChromaReplace:
     def test_embedding_is_preserved_exactly(self):
         vec = _FakeChromaVec({})
         emb = [0.11111, -0.22222, 0.33333]
-        vec._collection.seed("c1", embedding=emb, document="본문", metadata={"a": 1})
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        vec._collection.seed("c1", embedding=emb, document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")
         assert ok is True
         assert vec._collection.embeddings["c1"] == emb
 
@@ -2049,7 +2050,8 @@ class TestVecMetaUpdateChromaReplace:
         """float32 왕복 오차 수준(허용오차 1e-6 rel+abs)은 실패로 잡지 않는다."""
         vec = _FakeChromaVec({})
         emb = [1.0, 2.0, 3.0]
-        vec._collection.seed("c1", embedding=emb, document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=emb, document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         real_add = vec._collection.add
 
         def add_with_epsilon(ids, embeddings=None, documents=None, metadatas=None, uris=None):
@@ -2058,7 +2060,7 @@ class TestVecMetaUpdateChromaReplace:
             return real_add(ids, embeddings, documents, metadatas, uris)
         vec._collection.add = add_with_epsilon
 
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")
         assert ok is True, "허용오차 이내 부동소수 미세오차까지 실패로 잡았다"
 
     def test_embedding_value_drift_beyond_tolerance_fails_post_check(self):
@@ -2068,7 +2070,8 @@ class TestVecMetaUpdateChromaReplace:
         바뀌어도 True 가 나왔을 것이다.
         """
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[1.0, 2.0, 3.0], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[1.0, 2.0, 3.0], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         real_add = vec._collection.add
 
         def add_with_wrong_values(ids, embeddings=None, documents=None, metadatas=None, uris=None):
@@ -2077,16 +2080,16 @@ class TestVecMetaUpdateChromaReplace:
             return real_add(ids, embeddings, documents, metadatas, uris)
         vec._collection.add = add_with_wrong_values
 
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")
         assert ok is False, "임베딩 값이 전부 바뀌었는데 후검증을 통과했다"
 
     # ⑥ URI 레코드 → delete 미호출 + False + warning + (fake upsert 후) URI 보존
     def test_uri_record_is_not_replaced_and_returns_false(self, caplog):
         vec = _FakeChromaVec({})
         vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문",
-                              metadata={"y": "1"}, uri="http://example.com/c1")
+                              metadata={"pack_id": "pack-1", "y": "1"}, uri="http://example.com/c1")
         with caplog.at_level("WARNING"):
-            ok = pack_load._vec_meta_update(vec, "c1", {"y": "99"})
+            ok = pack_load._vec_meta_update(vec, "c1", {"y": "99"}, "pack-1")
         assert ok is False
         assert vec._collection.delete_calls == [], "URI 레코드인데 delete 가 불렸다"
         assert vec._collection.add_calls == []
@@ -2116,10 +2119,11 @@ class TestVecMetaUpdateChromaReplace:
     # ⑦ delete 실패 fake → False(예외 비전파) + warning
     def test_delete_failure_returns_false_without_propagating(self, caplog):
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[0.1], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         vec._collection.fail_delete_ids = {"c1"}
         with caplog.at_level("WARNING"):
-            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")  # 예외가 새면 여기서 죽는다
         assert ok is False
         assert vec._collection.add_calls == [], "delete 가 실패했는데 add 를 시도했다"
         assert "c1" in vec._collection._rows, "delete 실패 후에도 원본이 남아 있어야 한다"
@@ -2128,10 +2132,11 @@ class TestVecMetaUpdateChromaReplace:
     # ⑧ add 실패 → 복구 add 미호출(부재 유지) + False
     def test_add_failure_leaves_record_absent_without_recovery_add(self, caplog):
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[0.1], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         vec._collection.fail_add_ids = {"c1"}
         with caplog.at_level("WARNING"):
-            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+            ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")
         assert ok is False
         assert vec._collection.delete_calls == [["c1"]], "delete 는 실제로 실행돼야 한다"
         assert len(vec._collection.add_calls) == 1, (
@@ -2143,9 +2148,10 @@ class TestVecMetaUpdateChromaReplace:
         """add 가 예외 없이 '성공'하지만 메타만 쓰고 임베딩·문서를 비우면
         (v11 검수가 잡은 lossy add) 후검증이 잡아야 한다."""
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[0.1, 0.2], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         vec._collection.lossy_add_ids = {"c1"}
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")
         assert ok is False, "메타만 남기고 임베딩을 비운 lossy add 를 후검증이 못 잡았다"
         # lossy 경로라도 메타 자체는 반영됐을 수 있다 — 그래도 함수는 False 를 내야
         # 호출자가 재임베딩으로 우회해 임베딩 손실을 복구한다.
@@ -2179,17 +2185,19 @@ class TestVecMetaUpdateChromaReplace:
     # ⑬ get(선·후) 예외 fake → False(비전파)
     def test_pre_get_exception_returns_false_without_propagating(self):
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[0.1], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         vec._collection.fail_get_calls = {1}      # 선(존재확인) get
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")  # 예외가 새면 여기서 죽는다
         assert ok is False
         assert vec._collection.delete_calls == [], "선-get 이 실패했는데 delete 로 진행했다"
 
     def test_post_get_exception_returns_false_without_propagating(self):
         vec = _FakeChromaVec({})
-        vec._collection.seed("c1", embedding=[0.1], document="본문", metadata={"a": 1})
+        vec._collection.seed("c1", embedding=[0.1], document="본문",
+                              metadata={"pack_id": "pack-1", "a": 1})
         vec._collection.fail_get_calls = {2}      # 후(검증) get
-        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2})  # 예외가 새면 여기서 죽는다
+        ok = pack_load._vec_meta_update(vec, "c1", {"a": 2}, "pack-1")  # 예외가 새면 여기서 죽는다
         assert ok is False
         assert vec._collection.delete_calls == [["c1"]], "후-get 실패 전까지는 delete+add 가 진행돼야 한다"
 
@@ -2267,7 +2275,7 @@ class _SqlAlchemyVecLike:
         with self._engine.begin() as conn:
             conn.execute(text(
                 f"CREATE TABLE {self._table} "
-                "(node_id TEXT PRIMARY KEY, pack_id TEXT, metadata TEXT)"))
+                "(node_id TEXT PRIMARY KEY, pack_id TEXT, document TEXT, metadata TEXT)"))
 
     def seed(self, pack, ids):
         from sqlalchemy import text
@@ -2302,6 +2310,45 @@ class _SqlAlchemyVecLike:
                 text(f"SELECT metadata FROM {self._table} WHERE node_id = :i"),
                 {"i": node_id}).fetchone()
         return _json.loads(row[0]) if row and row[0] else None
+
+    def full_row(self, node_id):
+        """(pack_id, document, metadata) 3축 — #172 V1/V2 게이트가 "완전한 행"을
+        단언하는 데 쓴다."""
+        import json as _json
+
+        from sqlalchemy import text
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT pack_id, document, metadata FROM {self._table} "
+                     "WHERE node_id = :i"),
+                {"i": node_id}).fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1], _json.loads(row[2]) if row[2] else None)
+
+    def upsert_texts(self, texts, metadatas=None, ids=None):
+        """실 `PgVectorStore.upsert_texts` 의 `INSERT ... ON CONFLICT (node_id)
+        DO UPDATE SET pack_id = EXCLUDED.pack_id, ... ` 계약(전 컬럼 덮어쓰기)을
+        이 더블의 축소 스키마(embedding 컬럼 없음)로 흉내낸다 — `load_chunks_incremental`
+        의 재임베딩 폴백이 실제로 부르는 메서드라 이 더블에도 있어야 그 경로가
+        지나간다(#172 V1 게이트: fast-path False 이후의 실제 호출자 경로)."""
+        import json as _json
+
+        from sqlalchemy import text
+        ids = list(ids or [])
+        texts = list(texts)
+        metadatas = list(metadatas) if metadatas is not None else [{}] * len(texts)
+        with self._engine.begin() as conn:
+            for _id, txt, meta in zip(ids, texts, metadatas):
+                conn.execute(text(
+                    f"INSERT INTO {self._table} (node_id, pack_id, document, metadata) "
+                    "VALUES (:i, :p, :d, :m) "
+                    "ON CONFLICT (node_id) DO UPDATE SET "
+                    "pack_id = excluded.pack_id, document = excluded.document, "
+                    "metadata = excluded.metadata"),
+                    {"i": _id, "p": str(meta.get("pack_id", "")), "d": txt,
+                     "m": _json.dumps(meta, ensure_ascii=False)})
+        return ids
 
 
 class TestSqlAlchemyBackendBranches:
@@ -2349,7 +2396,8 @@ class TestSqlAlchemyBackendBranches:
         vec.seed("pack-1", ["c1"])
         vec.set_meta("c1", {"document_id": "doc-A"})
 
-        ok = pack_load._vec_meta_update(vec, "c1", {"document_id": "doc-B", "쪽": "99"})
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"document_id": "doc-B", "쪽": "99"}, "pack-1")
 
         assert ok is True, "메타 갱신을 지원하는 백엔드인데 False 로 떨어졌다"
         assert vec.meta_of("c1") == {"document_id": "doc-B", "쪽": "99"}, (
@@ -2360,8 +2408,244 @@ class TestSqlAlchemyBackendBranches:
         호출자가 doc 기준을 옮기고 벡터는 갱신 안 된 채로 영구히 남는다(sql 분기와
         동일 계약, load.py `_vec_meta_update` sql 분기 주석 참고)."""
         vec = _SqlAlchemyVecLike()
-        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1})
+        ok = pack_load._vec_meta_update(vec, "ghost", {"a": 1}, "pack-1")
         assert ok is False
+
+
+class _SqlVecMetaLike:
+    """sqlite-vec(vec0) 형태 — node_id/pack_id/document/metadata 컬럼(임베딩 컬럼은
+    이 더블의 관심사 밖이라 생략한다).
+
+    `_SqliteVecLike`(delete_pack 축 더블, `document`/`metadata` 컬럼이 없다)와는
+    별도로 둔다 — `_vec_meta_update`/`load_chunks_incremental` 의 sql(vec0) 분기를
+    직접 태우려면 그 두 컬럼이 필요하다(#172 재리뷰 V1/V2 게이트: "완전한 행"
+    대사에 document·metadata 값 검증까지 필요해서 `_SqliteVecLike` 로는 부족했다 —
+    이 축은 종전에 `_vec_meta_update` 의 sql 분기 전용 단위 테스트가 아예 없었다).
+    """
+
+    _table = "vectors_kure"
+
+    def __init__(self):
+        import sqlite3
+        self.available = True
+        self._conn = sqlite3.connect(":memory:")
+        self._conn.execute(
+            f"CREATE TABLE {self._table} "
+            "(node_id TEXT PRIMARY KEY, pack_id TEXT, document TEXT, metadata TEXT)")
+        self._conn.commit()
+
+    def seed(self, node_id, pack_id, document, meta):
+        import json as _json
+        self._conn.execute(
+            f"INSERT INTO {self._table} (node_id, pack_id, document, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (node_id, pack_id, document, _json.dumps(meta, ensure_ascii=False)))
+        self._conn.commit()
+
+    def row(self, node_id):
+        """(pack_id, document, metadata) 3축 — 부재면 None."""
+        import json as _json
+        r = self._conn.execute(
+            f"SELECT pack_id, document, metadata FROM {self._table} WHERE node_id = ?",
+            (node_id,)).fetchone()
+        if r is None:
+            return None
+        return (r[0], r[1], _json.loads(r[2]) if r[2] else None)
+
+    def upsert_texts(self, texts, metadatas=None, ids=None):
+        """실 `SqliteVecStore.upsert_texts`(vec0)의 DELETE-then-INSERT 계약을
+        흉내낸다 — vec0 는 네이티브 UPSERT 가 없어 id 별 DELETE 뒤 INSERT 다.
+        **DELETE 는 `node_id` 술어뿐, pack 무관**이다(실 스토어와 동일 — `_vector_base.py`
+        모듈 docstring 의 CONTRACT 절, "last-writer-wins 슬롯 정체성" 참고) — 남의
+        팩 행이라도 지우고 현재 팩 값으로 새로 짓는다. `load_chunks_incremental`
+        의 재임베딩 폴백이 실제로 부르는 메서드라 이 더블에도 있어야 그 경로가
+        지나간다(#172 V1 게이트: fast-path False 이후의 실제 호출자 경로)."""
+        import json as _json
+        ids = list(ids or [])
+        texts = list(texts)
+        metadatas = list(metadatas) if metadatas is not None else [{}] * len(texts)
+        for _id, txt, meta in zip(ids, texts, metadatas):
+            self._conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
+            self._conn.execute(
+                f"INSERT INTO {self._table} (node_id, pack_id, document, metadata) "
+                "VALUES (?, ?, ?, ?)",
+                (_id, str(meta.get("pack_id", "")), txt, _json.dumps(meta, ensure_ascii=False)))
+        self._conn.commit()
+        return ids
+
+
+class TestVecMetaUpdatePackScope:
+    """`_vec_meta_update` 의 pack 스코프(#172 재리뷰 P1) — 세 백엔드 각각.
+
+    V1: 공유 node_id 를 다른 팩이 먼저 차지한 상태에서 fast-path 는 **False** 로
+    물러나야 하고(부분 오염 금지), 그 이후 **실제 호출자 경로**(`load_chunks_incremental`
+    의 재임베딩 폴백 → `upsert_texts`)까지 실행하면 슬롯이 "현재 팩의 완전한
+    행"(pack_id/document/metadata 전부 현재 팩 값)으로 넘어가야 한다 — fast-path
+    단독 검사만으로는 공허하다(codex 재리뷰 지적, `_vec_meta_update` docstring의
+    "last-writer-wins 슬롯 정체성" 절 참고).
+    V2: 자기 팩 소유 행은 종전대로 메타만 갱신되고 True.
+    """
+
+    # ── sql(vec0) ──────────────────────────────────────────────────────
+    def test_sql_vec0_cross_pack_fast_path_is_false_and_leaves_foreign_row_untouched(self):
+        vec = _SqlVecMetaLike()
+        a_meta = {"pack_id": "pack-a", "document_id": "docA"}
+        vec.seed("c1", "pack-a", "본문A", a_meta)
+
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"pack_id": "pack-b", "document_id": "docB"}, "pack-b")
+
+        assert ok is False, "남의 팩(vec0) 행에 fast-path 가 True 를 냈다"
+        assert vec.row("c1") == ("pack-a", "본문A", a_meta), (
+            "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
+
+    def test_sql_vec0_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+        vec = _SqlVecMetaLike()
+        vec.seed("c1", "pack-a", "본문", {"pack_id": "pack-a", "document_id": "docA"})
+
+        # `tag`(임의 메타 키)로 메타를 갈린다 — `document_id`는 `_chunk_row` 가 최상위
+        # `document_id=chunk_id` 로 고정 덮어써서 `transform_chunk_meta` 가 그 값으로
+        # 다시 갈아치우므로(정본 `normalize.py:396-397`) old/new 를 구분 못 한다.
+        old_row = _chunk_row("c1", "본문", tag="B-old")
+        new_row = _chunk_row("c1", "본문", tag="B-new")  # 텍스트 불변, 메타만 변경
+        old_b_meta = transform_chunk_meta("pack-b", old_row)  # pack-b 자신의 과거 doc 기준선
+        live_chunks = {"c1": ("본문", old_b_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+
+        assert err == 0
+        assert (c_txt, c_meta) == (1, 0), (
+            "cross-pack fast-path 는 False 여야 하고 재임베딩(txt) 경로로 우회해야 한다 "
+            f"(실제 c_txt={c_txt} c_meta={c_meta})")
+        got = vec.row("c1")
+        new_b_meta = transform_chunk_meta("pack-b", new_row)
+        assert got == ("pack-b", "본문", new_b_meta), (
+            f"최종 상태가 '팩 B 의 완전한 행'이 아니다(부분 오염): {got}")
+
+    def test_sql_vec0_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
+        vec = _SqlVecMetaLike()
+        old_meta = {"pack_id": "pack-b", "document_id": "docB-old"}
+        vec.seed("c1", "pack-b", "본문", old_meta)
+        new_meta = {"pack_id": "pack-b", "document_id": "docB-new"}
+
+        ok = pack_load._vec_meta_update(vec, "c1", new_meta, "pack-b")
+
+        assert ok is True
+        assert vec.row("c1") == ("pack-b", "본문", new_meta), (
+            "자기 팩 갱신인데 메타가 반영 안 됐거나 document/pack_id 가 바뀌었다")
+
+    # ── sqlalchemy(pgvector) ───────────────────────────────────────────
+    def test_pgvector_cross_pack_fast_path_is_false_and_leaves_foreign_row_untouched(self):
+        from sqlalchemy import text as _sa_text
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-a", ["c1"])
+        a_meta = {"pack_id": "pack-a", "document_id": "docA"}
+        vec.set_meta("c1", a_meta)
+        with vec._engine.begin() as conn:  # seed() 는 document 를 안 채운다
+            conn.execute(_sa_text(f"UPDATE {vec._table} SET document = :d WHERE node_id = :i"),
+                         {"d": "본문A", "i": "c1"})
+
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"pack_id": "pack-b", "document_id": "docB"}, "pack-b")
+
+        assert ok is False, "남의 팩(pgvector) 행에 fast-path 가 True 를 냈다"
+        assert vec.full_row("c1") == ("pack-a", "본문A", a_meta), (
+            "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
+
+    def test_pgvector_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-a", ["c1"])
+        vec.set_meta("c1", {"pack_id": "pack-a", "document_id": "docA"})
+
+        # `document_id` 대신 `tag` 로 메타를 갈린다(위 sql(vec0) 케이스의 주석 참고).
+        old_row = _chunk_row("c1", "본문", tag="B-old")
+        new_row = _chunk_row("c1", "본문", tag="B-new")
+        old_b_meta = transform_chunk_meta("pack-b", old_row)
+        live_chunks = {"c1": ("본문", old_b_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+
+        assert err == 0
+        assert (c_txt, c_meta) == (1, 0)
+        got = vec.full_row("c1")
+        new_b_meta = transform_chunk_meta("pack-b", new_row)
+        assert got == ("pack-b", "본문", new_b_meta), (
+            f"최종 상태가 '팩 B 의 완전한 행'이 아니다(부분 오염): {got}")
+
+    def test_pgvector_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
+        from sqlalchemy import text as _sa_text
+        vec = _SqlAlchemyVecLike()
+        vec.seed("pack-b", ["c1"])
+        old_meta = {"pack_id": "pack-b", "document_id": "docB-old"}
+        vec.set_meta("c1", old_meta)
+        with vec._engine.begin() as conn:
+            conn.execute(_sa_text(f"UPDATE {vec._table} SET document = :d WHERE node_id = :i"),
+                         {"d": "본문", "i": "c1"})
+        new_meta = {"pack_id": "pack-b", "document_id": "docB-new"}
+
+        ok = pack_load._vec_meta_update(vec, "c1", new_meta, "pack-b")
+
+        assert ok is True
+        assert vec.full_row("c1") == ("pack-b", "본문", new_meta)
+
+    # ── chroma ─────────────────────────────────────────────────────────
+    def test_chroma_cross_pack_fast_path_is_false_and_leaves_foreign_row_untouched(self):
+        vec = _FakeChromaVec({})
+        a_meta = {"pack_id": "pack-a", "document_id": "docA"}
+        vec._collection.seed("c1", pack_id="pack-a", embedding=[0.1, 0.2],
+                              document="본문A", metadata=a_meta)
+
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"pack_id": "pack-b", "document_id": "docB"}, "pack-b")
+
+        assert ok is False, "남의 팩(chroma) 행에 fast-path 가 True 를 냈다"
+        assert vec._collection.delete_calls == [], "fast-path False 인데도 delete 가 불렸다"
+        assert vec._collection.metas["c1"] == a_meta, (
+            "fast-path False 인데도 남의 행 메타가 건드려졌다 — 부분 오염")
+        assert vec._collection.documents["c1"] == "본문A"
+
+    def test_chroma_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+        vec = _FakeChromaVec({})
+        vec._collection.seed("c1", pack_id="pack-a", embedding=[0.1, 0.2], document="본문",
+                              metadata={"pack_id": "pack-a", "document_id": "docA"})
+
+        # `document_id` 대신 `tag` 로 메타를 갈린다(위 sql(vec0) 케이스의 주석 참고).
+        old_row = _chunk_row("c1", "본문", tag="B-old")
+        new_row = _chunk_row("c1", "본문", tag="B-new")
+        old_b_meta = transform_chunk_meta("pack-b", old_row)
+        live_chunks = {"c1": ("본문", old_b_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+
+        assert err == 0
+        assert (c_txt, c_meta) == (1, 0)
+        new_b_meta = transform_chunk_meta("pack-b", new_row)
+        assert vec._collection.metas["c1"] == new_b_meta, (
+            f"최종 메타가 팩 B 완전한 값이 아니다: {vec._collection.metas.get('c1')}")
+        assert vec._collection.documents["c1"] == "본문", (
+            "최종 document 가 팩 B 값이 아니다")
+
+    def test_chroma_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
+        vec = _FakeChromaVec({})
+        old_meta = {"pack_id": "pack-b", "document_id": "docB-old"}
+        vec._collection.seed("c1", pack_id="pack-b", embedding=[0.1, 0.2], document="본문",
+                              metadata=old_meta)
+        new_meta = {"pack_id": "pack-b", "document_id": "docB-new"}
+
+        ok = pack_load._vec_meta_update(vec, "c1", new_meta, "pack-b")
+
+        assert ok is True
+        assert vec._collection.metas["c1"] == new_meta
+        assert vec._collection.documents["c1"] == "본문"
 
 
 class TestSqlalchemyMetaUpdateSql:

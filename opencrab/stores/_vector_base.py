@@ -18,6 +18,36 @@ DESIGN CHOICE (plain functions, not a base class): the three stores keep
     plain functions keep each store's adopter change to "call this instead of
     inlining it," which is the mechanical-dedup goal.
 
+CONTRACT — slot identity is node_id alone (last-writer-wins across packs):
+    All three stores key their vector row/record by ``node_id`` — none of
+    ``add_texts``/``upsert_texts`` qualifies that key by ``pack_id``. When two
+    packs produce the same ``node_id`` (shared evidence/chunk id), the second
+    writer's ``upsert_texts`` silently takes over the slot: vec0's
+    ``upsert_texts`` does ``DELETE FROM {table} WHERE node_id = ?`` with no
+    pack predicate (any pack's row at that id is deleted) then re-INSERTs the
+    caller's pack/document/embedding/metadata; pgvector's ``upsert_texts`` does
+    ``INSERT ... ON CONFLICT (node_id) DO UPDATE SET pack_id = EXCLUDED.pack_id,
+    embedding = EXCLUDED.embedding, document = EXCLUDED.document, metadata =
+    EXCLUDED.metadata`` (every column overwritten); Chroma's ``upsert`` merges
+    the metadata dict but replaces document/embedding, and every caller in
+    this codebase always passes a *complete* metadata dict (see
+    ``opencrab/pack/normalize.py:transform_chunk_meta``), so the merge still
+    lands the slot fully on the current pack's values.
+
+    The upshot: going through ``upsert_texts`` never leaves a **partially**
+    contaminated row (mixed pack A/B fields) — whichever caller writes last
+    owns the whole slot. What it does NOT provide is pack-qualified identity:
+    nothing stops a second pack from taking over a slot a first pack already
+    owns, because there is no per-pack namespacing of ``node_id`` at this
+    layer. Metadata-only update paths (``opencrab/pack/load.py:_vec_meta_update``)
+    must not bypass this — they check the existing row's ``pack_id`` before
+    patching only the metadata column/field, and fall back to
+    ``upsert_texts`` (full-slot rewrite) on any mismatch, so the only surface
+    that could otherwise partially contaminate a foreign pack's row (edit
+    metadata in place while document/embedding/pack_id stay foreign) is
+    closed. See ``_vec_meta_update``'s docstring for the exact reasoning and
+    the open follow-up (pack-qualified slot identity, localcrab#172/#182).
+
 INTER-COPY FINDINGS:
     - ID generation is IDENTICAL in all three: add-path uses
       ``sha256(f"{text}{time.time_ns()}")[:16]`` (time-salted, so repeated
