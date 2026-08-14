@@ -583,30 +583,83 @@ class TestDuplicateNodeIdAmbiguity:
         migrate._backfill_vector(vec, ["dup"], resolved, apply=True)
         assert vec.upserts == [["dup"]]
 
-    def test_ambiguous_node_gets_no_vector_upsert_and_is_counted(self, bootstrapped_owner, env, capsys):
-        """M4-1 end-to-end through main(): ambiguous node -> vector upsert 0,
-        vector_ambiguous count + WARNING with node_id and both packs."""
+    class _SpyVec:
+        """available vector store double: records every upsert so the e2e
+        gates can observe "0 upserts" / "exactly one deduped upsert" as
+        real calls, not as an inference from the count line."""
+
+        available = True
+
+        def __init__(self):
+            self.upserts = []
+
+        def get_by_id(self, node_id):
+            return {"id": node_id, "document": "d", "metadata": {}}
+
+        def upsert_texts(self, texts, metadatas=None, ids=None):
+            self.upserts.append((list(ids or []), [dict(m) for m in metadatas or []]))
+            return list(ids or [])
+
+    def test_ambiguous_node_gets_no_vector_upsert_and_is_counted(
+        self, bootstrapped_owner, env, capsys, monkeypatch
+    ):
+        """M4-1 end-to-end through main(): ambiguous node -> vector upsert
+        **observed 0 via a spy store** (not inferred), vector_ambiguous
+        count + WARNING with node_id and both packs."""
         self._seed_dup(env, pack_b=None)
         _seed_doc(env)
+        spy = self._SpyVec()
+        monkeypatch.setattr("opencrab.stores.factory.make_vector_store", lambda settings: spy)
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
         assert rc == 0
         assert "vector_ambiguous=1" in out
         assert "'dup'" in out and "pack-a" in out
         assert "CONFLICTING pack_ids" in out
+        assert spy.upserts == []
+
+    def test_agreeing_duplicates_upsert_exactly_once_through_main(
+        self, bootstrapped_owner, env, monkeypatch
+    ):
+        """M4-2 through main(): the graph naturally yields the duplicate
+        node_id twice from _graph_missing_node_ids (two rows share it), and
+        main's dict.fromkeys dedupe must collapse that to EXACTLY ONE vector
+        upsert carrying the shared pack."""
+        self._seed_dup(env, pack_b="pack-a")
+        _seed_doc(env)
+        spy = self._SpyVec()
+        monkeypatch.setattr("opencrab.stores.factory.make_vector_store", lambda settings: spy)
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+        assert len(spy.upserts) == 1
+        ids, metas = spy.upserts[0]
+        assert ids == ["dup"]
+        assert metas[0]["pack_id"] == "pack-a"
 
     def test_prediction_and_actual_agree_on_the_ambiguous_set(self, bootstrapped_owner, env):
         """M4-3: predicted ambiguous set == actual ambiguous set after a real
         backfill (values and keys)."""
         from opencrab.ontology.pack_provenance import backfill_pack_ids
+        from opencrab.stores.local_graph_store import LocalGraphStore
 
         db_path = self._seed_dup(env, pack_b=None)
+        # 같은 시나리오에 비ambiguous 노드도 넣는다 -- ambiguous 집합만이
+        # 아니라 resolved 값과 카운트도 predict==actual 이어야 한다 (M4-3).
+        store = LocalGraphStore(str(db_path))
+        try:
+            store.upsert_node(
+                "Entity", "plain", {"source_path": "/packs/pack-c/x.md"}, space_id="concept"
+            )
+        finally:
+            store.close()
+        node_ids = ["dup", "plain"]
         predicted, pred_amb = migrate._predict_node_pack_map(
-            db_path, ["dup"], migrate.DEFAULT_PACK_ID
+            db_path, node_ids, migrate.DEFAULT_PACK_ID
         )
         backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
-        actual, act_amb = migrate._read_actual_node_pack_ids(db_path, ["dup"])
-        assert predicted == actual == {}
+        actual, act_amb = migrate._read_actual_node_pack_ids(db_path, node_ids)
+        assert predicted == actual == {"plain": "pack-c"}
+        assert len(predicted) == len(actual) == 1
         assert set(pred_amb) == set(act_amb) == {"dup"}
         assert pred_amb["dup"] == act_amb["dup"]
 
