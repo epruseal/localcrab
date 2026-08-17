@@ -759,7 +759,15 @@ def _graph_twin_pack_map(
             if not pack_id:
                 continue
             exact_seen.setdefault((space_id, node_id), set()).add(pack_id)
-            fallback_seen.setdefault(node_id, set()).add(pack_id)
+            # ONLY blank-space_id rows feed the node_id-only fallback. A row
+            # that HAS a space_id can always be matched exactly, so letting
+            # it into the fallback would attribute a doc row in space X to a
+            # graph node living in space Y purely because they share a
+            # node_id -- they are different rows, not twins (doc_nodes' PK is
+            # (space, node_id)), and that is the same wrong-pack/wrong-
+            # visibility outcome this whole fix exists to prevent.
+            if not space_id:
+                fallback_seen.setdefault(node_id, set()).add(pack_id)
 
     exact_map, ambiguous = _split_ambiguous(exact_seen)  # type: ignore[arg-type]
     fallback_map = {

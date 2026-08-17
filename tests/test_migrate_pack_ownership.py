@@ -1205,11 +1205,12 @@ class TestGraphTwinDocBackfill:
         finally:
             graph.close()
         assert exact == {("concept", "n1"): "pack-a"}
-        # fallback_map is a node_id-only aggregate built from every matched
-        # row regardless of space -- with a single graph row for "n1" it
-        # naturally agrees with exact_map too (exact_map still wins on
-        # lookup; see test_5 for the case where only fallback resolves).
-        assert fallback == {"n1": "pack-a"}
+        # fallback_map carries ONLY blank-space_id graph rows (see test_5).
+        # This row has a real space_id, so the exact key can always match a
+        # doc row's space and the node_id-only fallback must stay empty --
+        # otherwise a doc row in a DIFFERENT space would inherit this pack
+        # just for sharing a node_id (see test_5b).
+        assert fallback == {}
         assert ambiguous == {}
 
         assert migrate.main(["--apply", "--skip-backup"]) == 0
@@ -1321,6 +1322,56 @@ class TestGraphTwinDocBackfill:
         finally:
             docs.close()
         assert not row["properties"].get("pack_id")
+
+    def test_5b_nonblank_cross_space_graph_row_is_not_a_fallback_twin(
+        self, bootstrapped_owner, env
+    ):
+        """A graph node in space X must NOT attribute a doc row in space Y.
+
+        `doc_nodes`' PK is `(space, node_id)`, so `(concept, same)` and
+        `(evidence, same)` are DIFFERENT rows, not twins. An earlier build
+        put every matched graph row into the node_id-only fallback, so the
+        concept doc row inherited the evidence node's pack -- the exact
+        wrong-pack/wrong-visibility outcome P1(b) exists to prevent. Only
+        blank-space_id rows may feed the fallback.
+        """
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node(
+                "Evidence", "same", {"pack_id": "pack-a"}, space_id="evidence"
+            )
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            # No graph twin at (concept, same), and nothing inferable from
+            # the doc row's own properties.
+            docs.upsert_node_doc("concept", "Entity", "same", {"note": "unrelated"})
+        finally:
+            docs.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            exact, fallback, _ambiguous = migrate._graph_twin_pack_map(
+                graph, ["same"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+        assert exact == {("evidence", "same"): "pack-a"}
+        assert fallback == {}
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "same")
+        finally:
+            docs.close()
+        # Falls through to the catch-all, NOT to the unrelated space's pack.
+        assert row["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
 
     def test_5_blank_graph_space_id_uses_fallback_map(self, bootstrapped_owner, env):
         from opencrab.stores.local_graph_store import LocalGraphStore
@@ -1599,8 +1650,21 @@ class TestPgDictPropertiesAndTwinDictStrEquivalence:
             dict_store, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
         )
         assert exact_str == exact_dict == {("concept", "n1"): "pack-a"}
-        assert fb_str == fb_dict == {"n1": "pack-a"}
+        # Nonblank space_id -> exact key always matchable -> no fallback.
+        assert fb_str == fb_dict == {}
         assert amb_str == amb_dict == {}
+
+        # The fallback branch itself must agree across str/dict too, so run
+        # the blank-space_id variant through both representations as well.
+        blank_str = self._FakeGraphTwinStore("n1", "", "pack-a", as_dict=False)
+        blank_dict = self._FakeGraphTwinStore("n1", "", "pack-a", as_dict=True)
+        _, blank_fb_str, _ = migrate._graph_twin_pack_map(
+            blank_str, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
+        )
+        _, blank_fb_dict, _ = migrate._graph_twin_pack_map(
+            blank_dict, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
+        )
+        assert blank_fb_str == blank_fb_dict == {"n1": "pack-a"}
 
         for exact, fallback, ambiguous in (
             (exact_str, fb_str, amb_str),
