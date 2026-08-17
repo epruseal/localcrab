@@ -196,6 +196,11 @@ class TestCliExtractReceiptPath:
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
         assert "Done with store failures" in result.output
+        # 카운트만 보면 정규화를 지운 구현도 통과한다: store_write_failures("oops") 가
+        # AttributeError 를 내고 바깥 except 가 그것을 잡아 같은 실패 수를 만들기 때문이다.
+        # 정규화 경로를 지난 영수증만 이 문구를 낸다.
+        assert "not stored: no store confirmed the write" in result.output
+        assert "object has no attribute" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +343,11 @@ class TestSeedOntology:
             monkeypatch, tmp_path, add_node_receipt=MALFORMED_RECEIPT, add_edge_receipt=OK_RECEIPT
         )
         assert f"Nodes: 0 ok, {n_nodes} failed" in output
+        # 카운트만 보면 정규화를 지운 구현도 통과한다: store_write_failures("oops") 가
+        # AttributeError 를 내고 바깥 except 가 그것을 잡아 같은 실패 수를 만들기 때문이다.
+        # 정규화 경로를 지난 영수증만 이 문구를 낸다.
+        assert "no store confirmed the write" in output
+        assert "object has no attribute" not in output
 
 
 # ---------------------------------------------------------------------------
