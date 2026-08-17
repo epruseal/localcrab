@@ -237,12 +237,19 @@ class TestCrossUserIsolation:
             "Document", "shared-doc", "relates_to", "Document", "b-secret", {}
         )
 
+        # One edge alice CAN see, so the loop below actually runs. Without
+        # it `edges` is empty and the assertion holds for a build that
+        # returns nothing at all.
+        graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
+
         with _as(ctx, seeded["alice"]):
             edges = ontology_list_edges()["edges"]
 
-        # Neither edge may appear: the first has both endpoints in pack-b,
-        # the second has one. An edge row carries BOTH endpoints' full
-        # properties, so a single unreadable endpoint discloses that node.
+        assert edges, "no readable edge came back; the check below would be vacuous"
+        # Neither pack-b edge may appear: the first has both endpoints in
+        # pack-b, the second has one. An edge row carries BOTH endpoints'
+        # full properties, so a single unreadable endpoint discloses that
+        # node.
         for e in edges:
             for side in ("source_props", "target_props"):
                 assert (e.get(side) or {}).get("pack_id") != PACK_B
@@ -594,7 +601,12 @@ class TestScopedStorePredicates:
         assert _ids(graph.search_nodes("title", pack_ids=big, limit=50)) == _ids(
             graph.search_nodes("title", pack_ids=sorted({PACK_A, PACK_PUBLIC}), limit=50)
         )
-        assert graph.find_neighbors("a-secret", pack_ids=big) == graph.find_neighbors(
+        # An edge must exist or both sides are [] and the comparison proves
+        # only that no exception was raised.
+        graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
+        big_hops = graph.find_neighbors("a-secret", pack_ids=big)
+        assert big_hops
+        assert big_hops == graph.find_neighbors(
             "a-secret", pack_ids=sorted({PACK_A, PACK_PUBLIC})
         )
 
@@ -717,6 +729,30 @@ class TestRetrievalPipelineScoping:
         assert "b-secret" not in got
         assert got == {"a-secret", "shared-doc"}
         assert hybrid.keyword_search("title", pack_ids=[], limit=50) == []
+
+
+class TestPgDocStorePredicateIsPresent:
+    """A source-level pin for the PostgreSQL doc-store pack predicate.
+
+    Its SQLite twin is covered by real queries, but the PG tests all skip
+    without a server, so mutation testing showed this predicate could be
+    deleted with the suite green. Asserting on the SQL text is weaker than
+    running it -- it cannot prove the clause is CORRECT -- but it does prove
+    the clause is still THERE, in both the tsvector branch and the
+    short-token ILIKE fallback, which is what silently disappearing would
+    look like.
+    """
+
+    def test_both_query_branches_carry_the_pack_clause(self):
+        import inspect
+
+        from opencrab.stores.pg_doc_store import PgDocStore
+
+        src = inspect.getsource(PgDocStore.keyword_search)
+        # One clause per branch (short-token ILIKE + tsvector), plus the
+        # empty-scope short-circuit.
+        assert src.count("{pack_where}") >= 2 or src.count("pack_frag") >= 2
+        assert "if not pack_ids" in src
 
 
 class TestCanonicalIdsScoping:

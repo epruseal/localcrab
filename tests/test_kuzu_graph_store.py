@@ -478,6 +478,84 @@ def test_search_nodes_is_scoped_to_the_readable_packs(store) -> None:
     assert store.search_nodes("shared", pack_ids=[], limit=10) == []
 
 
+def test_export_nodes_scoped_returns_only_readable_packs(store) -> None:
+    """#147: the authorization predicate for `ontology_list_nodes(pack_id=...)`
+    and `GET /api/nodes` on a Kuzu deployment.
+
+    Kuzu keeps properties as a JSON blob, so unlike the SQL backends this
+    filter is a Python membership test over an unlimited scan rather than a
+    WHERE clause -- a separate implementation that needs its own tests
+    rather than inheriting the SQL ones. The MCP handlers pass this result
+    straight into the response without re-filtering, so this method is the
+    ONLY thing standing between two users here.
+    """
+    store.upsert_node("X", "mine", {"name": "m", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "o"})
+
+    got = {n["props"]["id"] for n in store.export_nodes_scoped(["p-mine"], limit=100)}
+    assert got == {"mine"}
+    # Unattributed rows are outside every scope, and an empty scope means
+    # nothing readable rather than no filter.
+    assert store.export_nodes_scoped([], limit=100) == []
+
+
+def test_count_exported_nodes_scoped_counts_only_readable_packs(store) -> None:
+    """`total` is a separate query from the page, so it needs its own pin --
+    an unscoped count leaks the size of other users' data even when the rows
+    themselves are correctly withheld."""
+    store.upsert_node("X", "mine", {"name": "m", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "o"})
+
+    assert store.count_exported_nodes_scoped(["p-mine"]) == 1
+    assert store.count_exported_nodes_scoped([]) == 0
+
+
+def test_get_node_by_id_scoped_withholds_nodes_outside_the_scope(store) -> None:
+    """`ontology_get_node`'s only access check on a Kuzu deployment.
+
+    Deliberately NOT a homonym test, unlike the SQL backend's version of
+    this: ``_NODE_DDL`` keys ``OntologyNode`` on ``node_id`` ALONE, so a
+    second write with the same id upserts over the first and two packs can
+    never hold the same id here. (That is also why this backend's
+    no-``LIMIT 1`` rule is defensive rather than load-bearing -- see the
+    method's docstring.) What IS testable, and what the handler depends on,
+    is that a node in a pack the caller cannot read comes back as None,
+    indistinguishable from a node that does not exist.
+    """
+    store.upsert_node("X", "mine", {"name": "mine", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "theirs", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "orphan"})
+
+    assert store.get_node_by_id_scoped("mine", ["p-mine"])["pack_id"] == "p-mine"
+    assert store.get_node_by_id_scoped("theirs", ["p-mine"]) is None
+    assert store.get_node_by_id_scoped("no-such-node", ["p-mine"]) is None
+    # Unattributed rows are outside every scope, and an empty scope reads
+    # nothing rather than everything.
+    assert store.get_node_by_id_scoped("orphan", ["p-mine"]) is None
+    assert store.get_node_by_id_scoped("mine", []) is None
+
+
+def test_export_edges_scoped_requires_both_endpoints(store) -> None:
+    """An edge row carries BOTH endpoints' full properties, so one
+    unreadable endpoint would disclose that node -- hence AND, not the
+    OR-any-endpoint rule the pack-export path uses."""
+    store.upsert_node("X", "a", {"name": "a", "pack_id": "p-mine"})
+    store.upsert_node("X", "b", {"name": "b", "pack_id": "p-mine"})
+    store.upsert_node("X", "t", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_edge("X", "a", "relates_to", "X", "b", {"pack_id": "p-mine"})
+    store.upsert_edge("X", "a", "relates_to", "X", "t", {"pack_id": "p-mine"})
+
+    edges = store.export_edges_scoped(["p-mine"], limit=100)
+    pairs = {
+        (e["source_props"].get("id"), e["target_props"].get("id")) for e in edges
+    }
+    assert ("a", "b") in pairs
+    assert ("a", "t") not in pairs
+    assert store.export_edges_scoped([], limit=100) == []
+
+
 def test_find_neighbors_empty_scope_returns_nothing(store) -> None:
     """#147: the empty-set flip on the Kuzu traversal.
 

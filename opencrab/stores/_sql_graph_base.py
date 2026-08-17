@@ -548,6 +548,14 @@ class _SqlGraphStoreBase(abc.ABC):
                 if not other_pass:
                     continue
                 edge_props = _as_dict(edge_props_raw)
+                # The `True` here says "the anchor side already passed". That
+                # holds for the anchor this call was given, but NOT for a
+                # same-node_id row in another pack: the edge fetch matches on
+                # from_id/to_id alone (the PK is (node_type, node_id)), so an
+                # unreadable twin's edges can reach this point. Confidentiality
+                # is preserved by the fetch's own JOIN, which pack-filters the
+                # OTHER endpoint in SQL -- not by _edge_passes. See
+                # _pack_where's docstring; #147 section 8 records the residue.
                 from_pass, to_pass = (True, other_pass) if is_out else (other_pass, True)
                 if not _edge_passes(edge_props, from_pass, to_pass, pack_set):
                     continue
@@ -777,13 +785,27 @@ class _SqlGraphStoreBase(abc.ABC):
         ``PGGraphStore._batch_frontier_edges`` call this one method, so a
         future change to the policy cannot silently diverge between them.
 
-        Only valid for a candidate edge whose "current" endpoint has ALREADY
-        passed ``_node_passes`` (true for every caller in this file's BFS —
-        the anchor is checked once up front, and any other node only ever
-        reaches ``_prefetch_frontier`` after passing that same check in
-        ``_expand``). Under that invariant, ``_edge_passes``' ``src_passes``
-        is always True, which is what lets this reduce to two independent
-        clauses instead of a full min/max reproduction of ``_edge_passes``.
+        Written for a candidate edge whose "current" endpoint has already
+        passed ``_node_passes``, which is what lets this reduce to two
+        independent clauses instead of a full min/max reproduction of
+        ``_edge_passes`` (``src_passes`` is then always True).
+
+        THAT ASSUMPTION IS NOT GUARANTEED, and an earlier version of this
+        docstring asserted it as one. The anchor is resolved by
+        ``_fetch_node_props_by_id``, whose SQL matches ``node_id`` alone
+        even though the PK is ``(node_type, node_id)``, while
+        ``_fetch_edges_for_node`` matches ``from_id``/``to_id`` alone too --
+        so when one ``node_id`` exists in two packs under different types,
+        edges belonging to the unreadable twin do enter the traversal.
+        What actually keeps that from disclosing anything is NOT
+        ``_edge_passes``: it is the JOIN in ``_fetch_edges_for_node`` and
+        ``PGGraphStore._batch_frontier_edges``, which pack-filters the OTHER
+        endpoint in SQL, so every row that comes back is one the caller may
+        read. Do not remove that JOIN clause on the grounds that
+        ``_edge_passes`` will catch it -- it will not. The residue is a
+        correctness defect (neighbours attributed to the wrong node), not a
+        confidentiality one; issue #147 section 8 records it and opens a
+        follow-up for making traversal match on the full key.
 
         Uses ``json_truthy_text`` (not the bare ``json_get`` extraction) for
         both sides: a raw JSON extraction is non-NULL for ``""``/``0``/
