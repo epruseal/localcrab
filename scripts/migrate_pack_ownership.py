@@ -1627,6 +1627,15 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
     dest_dir = Path(backup_to)
     dest_dir.mkdir(parents=True, exist_ok=True)
     backed_up = []
+    # Canonical paths of the sources the core loop actually copied. The vector
+    # branch below consults this instead of only checking whether its
+    # destination exists: VECTOR_DB_FILE may legitimately name one of these
+    # core files (a co-located SQLite layout -- neither the config layer nor
+    # the store factory rejects it), in which case the "destination already
+    # exists" state means "the very same source is already backed up", not a
+    # conflict. Treating it as a conflict made `--apply --backup-to` fail
+    # unconditionally on that layout (PR #177 review round 9).
+    copied_sources: set[Path] = set()
     for name in ("opencrab.db", "graph.db", "doc_store.db"):
         src = Path(local_data_dir) / name
         if not src.is_file():
@@ -1644,27 +1653,38 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
             src_conn.close()
         print(f"  backed up {src} -> {dst}")
         backed_up.append(str(dst))
+        copied_sources.add(src.resolve())
 
     if settings.vector_backend_resolved == "sqlite-vec":
         vec_name = settings.vector_db_file
         vec_src = Path(local_data_dir) / vec_name
         if vec_src.is_file():
             vec_dst = dest_dir / vec_name
-            if vec_dst.exists():
+            if vec_src.resolve() in copied_sources:
+                # Same file, already copied above -- reuse that backup rather
+                # than reporting an overwrite conflict. resolve() (not a string
+                # compare) so "./graph.db", an absolute path, or a symlink
+                # alias all match the canonical core path.
+                print(
+                    f"  vector db {vec_src} is one of the core files -- already "
+                    f"backed up as {vec_dst}, not copying twice"
+                )
+            elif vec_dst.exists():
                 print(
                     f"! backup target already exists, refusing to overwrite: {vec_dst}",
                     file=sys.stderr,
                 )
                 raise SystemExit(2)
-            src_conn = sqlite3.connect(str(vec_src))
-            dst_conn = sqlite3.connect(str(vec_dst))
-            try:
-                src_conn.backup(dst_conn)
-            finally:
-                dst_conn.close()
-                src_conn.close()
-            print(f"  backed up {vec_src} -> {vec_dst}")
-            backed_up.append(str(vec_dst))
+            else:
+                src_conn = sqlite3.connect(str(vec_src))
+                dst_conn = sqlite3.connect(str(vec_dst))
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+                    src_conn.close()
+                print(f"  backed up {vec_src} -> {vec_dst}")
+                backed_up.append(str(vec_dst))
     else:
         not_backed_up = (
             str(Path(local_data_dir) / "chroma")

@@ -3156,3 +3156,96 @@ class TestNodePackMapSmallInputUnchanged:
         actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
         assert actual == predicted
         assert act_ambiguous == {}
+
+
+class TestColocatedVectorDbReusesCoreBackup:
+    """PR #177 review round 9: VECTOR_DB_FILE may legitimately name one of the
+    core files (a co-located SQLite layout -- neither the config layer nor the
+    store factory rejects it). Round 8's vector branch only checked whether the
+    destination existed, so in that layout the core loop's own copy looked like
+    an overwrite conflict and `--apply --backup-to` died with SystemExit(2)
+    every time, even though the vector data was already backed up.
+    """
+
+    def _settings(self, monkeypatch, **env_overrides):
+        from opencrab.config import get_settings
+
+        for key, value in env_overrides.items():
+            monkeypatch.setenv(key, value)
+        get_settings.cache_clear()
+        return get_settings()
+
+    @pytest.mark.parametrize("core_name", ["opencrab.db", "graph.db", "doc_store.db"])
+    def test_colocated_vector_db_does_not_abort_and_is_listed_once(
+        self, env, tmp_path, monkeypatch, capsys, core_name
+    ):
+        """Tests 1-3: every core filename, not just one."""
+        import sqlite3
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE=core_name
+        )
+        assert settings.vector_backend_resolved == "sqlite-vec"
+        assert settings.vector_db_file == core_name
+
+        src = env / core_name
+        conn = sqlite3.connect(str(src))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (7)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        # Must NOT raise SystemExit.
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / core_name
+        assert dst.is_file()
+        # Listed exactly once -- the core loop added it; the vector branch must
+        # not append a duplicate.
+        assert backed_up.count(str(dst)) == 1
+
+        # Test 2: the skip is announced, not silent.
+        out = capsys.readouterr().out
+        assert "already backed up as" in out
+
+        # The copy really is the vector data.
+        conn = sqlite3.connect(str(dst))
+        try:
+            assert conn.execute("SELECT id FROM t").fetchall() == [(7,)]
+        finally:
+            conn.close()
+
+    def test_main_completes_with_colocated_vector_db(self, bootstrapped_owner, env, tmp_path, monkeypatch):
+        """The end-to-end symptom the review named: `--apply --backup-to`
+        could not run at all in this layout."""
+        self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE="graph.db")
+        _seed_graph(env)
+
+        rc = migrate.main(["--apply", "--backup-to", str(tmp_path / "bk")])
+
+        assert rc == 0
+        assert (tmp_path / "bk" / "graph.db").is_file()
+
+    def test_distinct_vector_source_still_refuses_to_overwrite(
+        self, env, tmp_path, monkeypatch
+    ):
+        """Test 4: the real conflict guard survives -- a vector file that is
+        NOT one of the core files must still refuse an existing target."""
+        import sqlite3
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        assert settings.vector_db_file not in ("opencrab.db", "graph.db", "doc_store.db")
+
+        conn = sqlite3.connect(str(env / settings.vector_db_file))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir(parents=True)
+        (backup_dir / settings.vector_db_file).write_text("pre-existing", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+        assert exc.value.code == 2
