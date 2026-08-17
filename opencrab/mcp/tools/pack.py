@@ -221,6 +221,7 @@ def _ingest_into_pack(
         When False, the legacy path is used: vector-only embedding via
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
+    from opencrab.grammar.validator import validate_edge, validate_node
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
@@ -250,6 +251,16 @@ def _ingest_into_pack(
             item_space = _clean_str(item.get("space", ""))
             item_node_type = _clean_str(item.get("node_type", ""))
             item_node_id = _clean_str(item.get("node_id", ""))
+            # Grammar validation BEFORE the probes, not just inside
+            # builder.add_node afterwards. The probes pass node_type to
+            # graph.get_node, and Neo4jStore.get_node interpolates it into
+            # Cypher as a label (f"MATCH (n:{node_type} ...)"). Before the
+            # identity guard existed, every caller-supplied node_type reached
+            # a store only after this whitelist check; keeping that ordering
+            # is what stops an unvalidated label from being interpolated.
+            # validate_node is a pure membership test against the 9-space
+            # manifest, so builder.add_node re-running it costs nothing.
+            validate_node(item_space, item_node_type).raise_if_invalid()
             reason = _foreign_pack(
                 pack_id, _node_probes(ctx, item_space, item_node_type, item_node_id)
             )
@@ -291,6 +302,11 @@ def _ingest_into_pack(
             item_relation = _clean_str(item.get("relation", ""))
             item_to_space = _clean_str(item.get("to_space", ""))
             item_to_id = _clean_str(item.get("to_id", ""))
+            # Same ordering rule as the node loop above: the edge probe passes
+            # `relation` to graph.get_edge, and Neo4jStore.get_edge
+            # interpolates it into Cypher (-[r:{relation}]->), so it must
+            # clear the whitelist before any store sees it.
+            validate_edge(item_from_space, item_to_space, item_relation).raise_if_invalid()
 
             # Endpoint types resolved the same way builder.add_edge resolves
             # them (graph.lookup_node_type) -- if either is unresolvable the

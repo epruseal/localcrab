@@ -425,3 +425,202 @@ def test_pack_create_graph_unavailable_blocks_before_registry_row(tmp_path):
     assert result == {"error": "graph store unavailable"}
     assert get_pack(sql, "unavail-pack") is None
     builder.add_node.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 15-16. Grammar validation runs BEFORE any store probe.
+#
+# The probes hand node_type/relation to graph.get_node/get_edge, and
+# Neo4jStore interpolates both into Cypher as identifiers
+# (f"MATCH (n:{node_type} ...)", "-[r:{relation}]->"). Before this guard
+# existed, a caller-supplied node_type/relation reached a store only after
+# builder.add_node/add_edge had run the 9-space whitelist check, so an
+# unvalidated identifier could never be interpolated. These tests pin that
+# ordering: an item whose node_type/relation is not in the manifest must be
+# rejected with ZERO probe calls, so no crafted identifier is ever passed to
+# a store method at all.
+# ---------------------------------------------------------------------------
+
+
+_CYPHER_INJECTION_NODE_TYPE = "X) DETACH DELETE (n) //"
+_CYPHER_INJECTION_RELATION = "R]->() WITH 1 AS z MATCH (n) DETACH DELETE n //"
+
+
+def _spy_graph():
+    """An available graph store that records every probe call. Returns real
+    endpoint types from lookup_node_type so the EDGE test cannot pass for the
+    wrong reason -- with the default None the edge probe is skipped even
+    without validation, which would make the assertion vacuous."""
+    graph = MagicMock()
+    graph.available = True
+    graph.get_node.return_value = None
+    graph.get_node_by_id.return_value = None
+    graph.get_edge.return_value = None
+    graph.lookup_node_type.return_value = "Entity"
+    return graph
+
+
+def test_invalid_node_type_rejected_before_any_probe():
+    graph = _spy_graph()
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            nodes=[
+                {
+                    "space": "concept",
+                    "node_type": _CYPHER_INJECTION_NODE_TYPE,
+                    "node_id": "n1",
+                }
+            ],
+        )
+
+    graph.get_node.assert_not_called()
+    graph.get_node_by_id.assert_not_called()
+    ctx["mongo"].get_node_doc.assert_not_called()
+    ctx["chroma"].get_by_id.assert_not_called()
+    ctx["builder"].add_node.assert_not_called()
+    assert result["added_nodes"] == 0
+    assert len(result["node_errors"]) == 1
+    assert result["status"] == "partial"
+
+
+def test_invalid_relation_rejected_before_any_probe():
+    graph = _spy_graph()
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": _CYPHER_INJECTION_RELATION,
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    # lookup_node_type also takes caller ids; validation gates the whole
+    # block, so not even the endpoint resolution runs.
+    graph.lookup_node_type.assert_not_called()
+    graph.get_edge.assert_not_called()
+    ctx["builder"].add_edge.assert_not_called()
+    assert result["added_edges"] == 0
+    assert len(result["edge_errors"]) == 1
+    assert result["status"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# 17. The grammar rejection keeps the PRE-guard response contract: the error
+#     lands in node_errors/edge_errors (not as a top-level failure) and names
+#     the grammar problem, exactly as builder's own ValueError used to.
+# ---------------------------------------------------------------------------
+
+
+def test_grammar_rejection_reports_grammar_error_not_ownership(graph):
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            nodes=[{"space": "concept", "node_type": "NotAType", "node_id": "n1"}],
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": "not_a_relation",
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    assert len(result["node_errors"]) == 1
+    assert len(result["edge_errors"]) == 1
+    assert "NotAType" in result["node_errors"][0]
+    assert "not_a_relation" in result["edge_errors"][0]
+    # NOT the ownership/unverifiable wording -- a grammar problem must not be
+    # reported as an identity conflict.
+    assert "attributed to a different pack" not in result["node_errors"][0]
+    assert "cannot verify existing ownership" not in result["node_errors"][0]
+
+
+# ---------------------------------------------------------------------------
+# 18. Valid items still go through untouched (the ordering change must not
+#     cost anything on the happy path).
+# ---------------------------------------------------------------------------
+
+
+def test_valid_items_still_pass_after_validation_moved_earlier(graph):
+    graph.upsert_node("Entity", "a", {"pack_id": "my-pack"})
+    graph.upsert_node("Entity", "b", {"pack_id": "my-pack"})
+
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            nodes=[{"space": "concept", "node_type": "Entity", "node_id": "c"}],
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": "related_to",
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    assert result["node_errors"] == []
+    assert result["edge_errors"] == []
+    assert result["added_nodes"] == 1
+    assert result["added_edges"] == 1
+    assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# 19. pack_create's anchor identity conflict takes the existing "anchor
+#     failed" branch: compensating delete_pack_row, error response, and NO
+#     registry row left behind.
+# ---------------------------------------------------------------------------
+
+
+def test_pack_create_anchor_identity_conflict_compensates_registry(graph):
+    from opencrab.mcp.tools import pack_create
+    from opencrab.pack.ownership import get_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    # A pre-existing anchor node for the slug pack_create is about to take,
+    # attributed to a pack the caller does not own.
+    graph.upsert_node("Dataset", "dataset:anchor-pack", {"pack_id": "other-pack"})
+    before = graph.get_node("Dataset", "dataset:anchor-pack")
+
+    sql = SQLStore("sqlite:///:memory:")
+    ctx = _ctx(graph, sql=sql)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = pack_create(title="Anchor Pack", pack_id="anchor-pack")
+
+    assert "error" in result
+    assert "attributed to a different pack" in result["error"]
+    # The compensating delete ran: no orphaned registry row pointing at an
+    # anchor that was never written.
+    assert get_pack(sql, "anchor-pack") is None
+    ctx["builder"].add_node.assert_not_called()
+    assert graph.get_node("Dataset", "dataset:anchor-pack") == before
+
+
+# ---------------------------------------------------------------------------
+# 20. SQL get_edge keys on all five columns: a wrong endpoint TYPE misses,
+#     the same way a wrong relation or reversed direction does.
+# ---------------------------------------------------------------------------
+
+
+def test_sql_get_edge_wrong_endpoint_type_returns_none(graph):
+    graph.upsert_node("Entity", "a", {})
+    graph.upsert_node("Entity", "b", {})
+    graph.upsert_edge("Entity", "a", "relates_to", "Entity", "b", {"pack_id": "p"})
+
+    assert graph.get_edge("Entity", "a", "relates_to", "Entity", "b") == {"pack_id": "p"}
+    assert graph.get_edge("Concept", "a", "relates_to", "Entity", "b") is None
+    assert graph.get_edge("Entity", "a", "relates_to", "Concept", "b") is None
