@@ -546,13 +546,21 @@ def test_export_edges_scoped_requires_both_endpoints(store) -> None:
     store.upsert_node("X", "t", {"name": "t", "pack_id": "p-theirs"})
     store.upsert_edge("X", "a", "relates_to", "X", "b", {"pack_id": "p-mine"})
     store.upsert_edge("X", "a", "relates_to", "X", "t", {"pack_id": "p-mine"})
+    # unreadable SOURCE, and an edge whose OWN pack is unreadable: three
+    # separate clauses, so all three need a case or two of them can be
+    # deleted with the suite green.
+    store.upsert_edge("X", "t", "relates_to", "X", "b", {"pack_id": "p-mine"})
+    store.upsert_edge("X", "a", "mentions", "X", "b", {"pack_id": "p-theirs"})
 
     edges = store.export_edges_scoped(["p-mine"], limit=100)
-    pairs = {
-        (e["source_props"].get("id"), e["target_props"].get("id")) for e in edges
+    triples = {
+        (e["source_props"].get("id"), e["target_props"].get("id"), e.get("relation"))
+        for e in edges
     }
-    assert ("a", "b") in pairs
-    assert ("a", "t") not in pairs
+    assert ("a", "b", "relates_to") in triples
+    assert ("a", "t", "relates_to") not in triples
+    assert ("t", "b", "relates_to") not in triples
+    assert ("a", "b", "mentions") not in triples
     assert store.export_edges_scoped([], limit=100) == []
 
 

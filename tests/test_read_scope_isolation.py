@@ -539,17 +539,44 @@ class TestScopedStorePredicates:
         assert graph.get_node_by_id_scoped("dup", [PACK_PUBLIC]) is None
 
     def test_edge_predicate_requires_both_endpoints(self, graph, docs, seeded):
+        """All THREE clauses, not just the target one.
+
+        The predicate is ``source in scope AND target in scope AND (edge has
+        no pack_id OR it is in scope)``. An earlier version of this test
+        seeded only an unreadable TARGET, so the source clause and the edge
+        clause could each be deleted with the whole suite green -- and each
+        deletion put a foreign node's or edge's full properties into the
+        response, with nothing underneath to stop it.
+        """
         _node(graph, docs, PACK_A, "a-other")
         graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "a-other", {})
+        # unreadable TARGET
         graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "b-secret", {})
+        # unreadable SOURCE
+        graph.upsert_edge("Document", "b-secret", "relates_to", "Document", "a-other", {})
+        # both endpoints readable, but the EDGE belongs to another pack
+        graph.upsert_edge(
+            "Document", "a-secret", "mentions", "Document", "a-other",
+            {"pack_id": PACK_B, "secret_note": "bob-only"},
+        )
 
         edges = graph.export_edges_scoped([PACK_A], limit=100)
         pairs = {
-            ((e["source_props"] or {}).get("node_id"), (e["target_props"] or {}).get("node_id"))
+            (
+                (e["source_props"] or {}).get("node_id"),
+                (e["target_props"] or {}).get("node_id"),
+                e.get("relation"),
+            )
             for e in edges
         }
-        assert ("a-secret", "a-other") in pairs
-        assert ("a-secret", "b-secret") not in pairs
+        assert ("a-secret", "a-other", "relates_to") in pairs
+        assert ("a-secret", "b-secret", "relates_to") not in pairs
+        assert ("b-secret", "a-other", "relates_to") not in pairs
+        assert ("a-secret", "a-other", "mentions") not in pairs
+        # and nothing foreign rode along in any properties bag
+        for e in edges:
+            for side in ("source_props", "target_props", "rel_props"):
+                assert (e.get(side) or {}).get("pack_id") != PACK_B
 
     def test_edge_spanning_two_readable_packs_is_returned(self, graph, docs, seeded):
         """A cross-pack edge inside one scope must survive.
@@ -736,11 +763,11 @@ class TestPgDocStorePredicateIsPresent:
 
     Its SQLite twin is covered by real queries, but the PG tests all skip
     without a server, so mutation testing showed this predicate could be
-    deleted with the suite green. Asserting on the SQL text is weaker than
-    running it -- it cannot prove the clause is CORRECT -- but it does prove
-    the clause is still THERE, in both the tsvector branch and the
-    short-token ILIKE fallback, which is what silently disappearing would
-    look like.
+    deleted with the suite green. Asserting on the SQL text is much weaker
+    than running it: it cannot show the clause is CORRECT, only that a
+    clause is still applied in each of the two branches. That is the
+    specific failure -- silent disappearance -- this pin is for, and it is
+    not a substitute for running the query against PostgreSQL.
     """
 
     def test_both_query_branches_carry_the_pack_clause(self):
@@ -749,9 +776,13 @@ class TestPgDocStorePredicateIsPresent:
         from opencrab.stores.pg_doc_store import PgDocStore
 
         src = inspect.getsource(PgDocStore.keyword_search)
-        # One clause per branch (short-token ILIKE + tsvector), plus the
-        # empty-scope short-circuit.
-        assert src.count("{pack_where}") >= 2 or src.count("pack_frag") >= 2
+        # Count the APPLIED clause, not the identifier: `pack_frag` also
+        # appears where it is built, so a `>= 2` count on the bare name
+        # stayed satisfied with one branch's clause deleted.
+        assert src.count("AND {pack_frag}") == 2, (
+            "expected the pack clause in both the tsvector branch and the "
+            "short-token ILIKE fallback"
+        )
         assert "if not pack_ids" in src
 
 

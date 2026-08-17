@@ -118,8 +118,10 @@ class ImpactEngine:
             REQUIRED (#147). The caller's readable pack scope. The anchor is
             resolved WITHIN it and the traversal is bounded BY it.
 
-            An anchor outside the scope produces a response byte-identical
-            to one for a node that does not exist (#143 invariant 7). That
+            An anchor outside the scope produces the same response a node
+            that does not exist produces, apart from the node_id echoed
+            back -- the caller's own input, which tells them nothing they
+            did not supply (#143 invariant 7). That
             falls out of the two lookups rather than from a special branch:
             ``get_node_by_id_scoped`` returns None for both, and
             ``find_neighbors`` returns [] for both (its anchor must pass the

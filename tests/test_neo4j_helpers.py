@@ -376,3 +376,38 @@ class TestNeo4jStoreEdgeCases:
         mock_session.run.return_value = []
 
         assert store.run_cypher("MATCH (n) RETURN n") == []
+
+
+def test_find_neighbors_empty_scope_returns_nothing_without_querying() -> None:
+    """#147: on Neo4j this short-circuit is the ONLY thing enforcing an
+    empty read scope.
+
+    The SQL and Kuzu backends filter every visited node again in Python
+    (``_node_passes``), so removing their short-circuit still yields no
+    rows. Neo4j returns Cypher records straight through, and
+    ``_build_neighbors_cypher`` folds an empty ``pack_ids`` into "no pack
+    clause at all" -- so without this guard a principal who may read no
+    pack would traverse the whole graph. Asserting the session is never
+    opened pins the guard itself rather than a downstream effect that does
+    not exist here.
+    """
+    store, _driver, session = _make_connected_store()
+    # _make_connected_store's own connectivity probe already ran a query.
+    session.run.reset_mock()
+
+    assert store.find_neighbors("n1", pack_ids=[]) == []
+    session.run.assert_not_called()
+
+
+def test_build_neighbors_cypher_has_no_pack_clause_for_an_empty_scope() -> None:
+    """Why the guard above cannot be dropped: the builder itself cannot
+    express "match nothing". This is the failure mode, pinned so nobody
+    concludes the builder is defensive on its own."""
+    store, _driver, _session = _make_connected_store()
+
+    cypher, params = store._build_neighbors_cypher(
+        "n1", "both", 1, 5, pack_ids=[], include_unpackaged=False, spaces=None
+    )
+    assert "pack_id" not in cypher
+    assert "pack_ids" not in params
+
