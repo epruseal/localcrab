@@ -38,8 +38,22 @@ def ctx(sql):
     hybrid = MagicMock()
     mongo = MagicMock()
     mongo.available = False
+    mongo.get_node_doc.return_value = None
+    mongo.get_source.return_value = None
     graph = MagicMock()
     graph.available = True
+    # #146 P1(a): identity-ownership probes -- see _base_ctx's comment in
+    # tests/test_tools_handlers_direct.py for why these must be explicit
+    # ("no conflicting store" is this suite's original implicit
+    # assumption). This ctx deliberately has NO "chroma" key at all -- a
+    # real reduced context shape (see opencrab/mcp/tools/pack.py's
+    # _node_probes/_source_probes, which use ctx.get(...) for exactly this
+    # reason) -- so the vector probe is always skipped here, not just
+    # unavailable.
+    graph.get_node.return_value = None
+    graph.get_node_by_id.return_value = None
+    graph.get_edge.return_value = None
+    graph.lookup_node_type.return_value = None
     return {
         "builder": builder,
         "hybrid": hybrid,

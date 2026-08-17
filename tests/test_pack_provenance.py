@@ -311,3 +311,32 @@ class TestResolveRowPackId:
         row = {"node_type": "Agent", "node_id": "n1"}
         pid, reason = resolve_row_pack_id("not-json{{{", row, None)
         assert (pid, reason) == (None, "skipped-unresolvable")
+
+    def test_v3_defect7_json_string_and_already_parsed_dict_agree(self) -> None:
+        """#146 P1(b), PR #177 review round 3 v3 결함 7: a PostgreSQL JSONB
+        column (psycopg2 hands back an already-decoded dict) must resolve
+        IDENTICALLY to the exact same properties given as a JSON string
+        (what SQLite always stores) -- a dict input must not fall through
+        to ``json.loads(dict)`` raising ``TypeError`` -> swallowed to
+        ``{}`` -> "skipped-unresolvable"/"default", the defect this
+        equivalence test exists to catch."""
+        row = {"node_id": "n1"}
+        props = {"source_path": "/packs/pack-a/docs/n1"}
+        as_string = resolve_row_pack_id(json.dumps(props), row, None)
+        as_dict = resolve_row_pack_id(props, row, None)
+        assert as_string == as_dict == ("pack-a", "inferred")
+
+    def test_v3_defect7_dict_input_with_existing_pack_id(self) -> None:
+        """Same equivalence for the "existing" branch, not just "inferred"
+        -- a dict ``props_raw`` whose pack_id is already set must be read
+        directly, not require a str round-trip first."""
+        row = {"node_id": "n1"}
+        props = {"pack_id": "already-set"}
+        assert resolve_row_pack_id(props, row, None) == ("already-set", "existing")
+
+    def test_v3_defect7_dict_input_that_is_falsy_empty_dict(self) -> None:
+        """An empty dict ``{}`` is falsy in Python -- must not be
+        misrouted into the ``json.loads`` branch (where ``if props_raw``
+        would also treat it as "nothing to parse")."""
+        row = {"node_id": "n1"}
+        assert resolve_row_pack_id({}, row, "fallback-pack") == ("fallback-pack", "assumed")

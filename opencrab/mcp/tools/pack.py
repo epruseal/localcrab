@@ -59,6 +59,137 @@ def _nine_space_hint() -> str:
 _NINE_SPACE_HINT: str = _nine_space_hint()
 
 
+# ---------------------------------------------------------------------------
+# Cross-pack identity-ownership guard (#146 P1(a))
+#
+# _ingest_into_pack/pack_create write into several stores keyed by an
+# identity the CALLER supplies (node_id / edge endpoints / source_id), not a
+# server-generated key. Without this guard, a caller could silently
+# overwrite a slot already attributed to a DIFFERENT pack simply by naming
+# the same identity from inside their own (writable) destination pack -- an
+# upsert with no ownership check (#143 invariant 4). The functions below
+# probe every store slot a write will actually touch, using EACH store's own
+# conflict key (see GraphStore.get_edge's docstring for why that key differs
+# by backend), and refuse the whole item if any slot already belongs to a
+# different pack.
+#
+# Judged on pack_id ALONE -- no owner/visibility lookup (no 3-way OR), and a
+# same-owner different pack is refused too (no implicit re-attribution).
+# Unavailable stores are skipped (nothing gets written there either, so
+# "checked" == "written"); a missing probe method, a raised exception, or a
+# non-dict return is fail-closed ("unverifiable"), never silently treated as
+# "no conflict". A falsy/absent pack_id at the extracted path is
+# unattributed legacy data and passes through untouched -- blocking it would
+# break ordinary ingest into packs that predate this guard.
+#
+# Rejection messages never include the OTHER pack's id, owner, or visibility
+# (#143 invariant 7): the only bit that leaks is "this identity is not your
+# destination pack's", the same class of leak `pack_create`'s slug-suffix
+# collision handling already accepts (see design doc "노출 표면" section).
+# ---------------------------------------------------------------------------
+
+_Probe = tuple[Any, str, tuple[Any, ...], tuple[str, ...]]
+# (store, method_name, call_args, path-to-pack_id-in-result)
+
+
+def _node_probes(
+    ctx: dict[str, Any], space: str, node_type: str, node_id: str
+) -> list[_Probe]:
+    """Probes for a graph node write: graph (2 lookup keys), docs, vector.
+
+    Used verbatim for the evidence/TextUnit node (space="evidence",
+    node_type="TextUnit", node_id=source_id) and the pack_create anchor node
+    (space="resource", node_type="Dataset") too, so all three share one
+    definition of "what counts as this node's slots" and cannot drift apart.
+    """
+    graph = ctx.get("neo4j")
+    docs = ctx.get("mongo")
+    vector = ctx.get("chroma")
+    return [
+        (graph, "get_node", (node_type, node_id), ("pack_id",)),
+        (graph, "get_node_by_id", (node_id,), ("pack_id",)),
+        (docs, "get_node_doc", (space, node_id), ("properties", "pack_id")),
+        (vector, "get_by_id", (node_id,), ("metadata", "pack_id")),
+    ]
+
+
+def _source_probes(ctx: dict[str, Any], source_id: str) -> list[_Probe]:
+    """Probes for the legacy (text_as_node=False) text path: doc_sources +
+    vector, keyed by source_id alone -- there is no graph node here."""
+    docs = ctx.get("mongo")
+    vector = ctx.get("chroma")
+    return [
+        (docs, "get_source", (source_id,), ("metadata", "pack_id")),
+        (vector, "get_by_id", (source_id,), ("metadata", "pack_id")),
+    ]
+
+
+def _edge_probes(
+    ctx: dict[str, Any],
+    from_type: str,
+    from_id: str,
+    relation: str,
+    to_type: str,
+    to_id: str,
+) -> list[_Probe]:
+    """Probe for a graph edge write, keyed by each backend's own upsert
+    conflict key (see GraphStore.get_edge). Edge sql-registry/audit-log
+    writes have no pack_id column to guard (see design doc slot table)."""
+    graph = ctx.get("neo4j")
+    return [
+        (graph, "get_edge", (from_type, from_id, relation, to_type, to_id), ("pack_id",)),
+    ]
+
+
+def _foreign_pack(pack_id: str, probes: list[_Probe]) -> str | None:
+    """Check every probe's store slot against ``pack_id``.
+
+    Returns ``None`` when no conflict is found (including when every probe
+    was skipped because its store is ``None``/unavailable). Returns
+    ``"unverifiable"`` (fail-closed) when a store's probe method is
+    missing, raises, or returns something other than ``dict``/``None`` --
+    an inability to check must never be silently treated as "no conflict".
+    Returns ``"foreign"`` when an extracted value is truthy and differs
+    from ``pack_id``; a falsy extracted value (unattributed legacy data)
+    passes through as no-conflict.
+    """
+    for store, method_name, args, path in probes:
+        if store is None or not getattr(store, "available", False):
+            continue
+        method = getattr(store, method_name, None)
+        if method is None:
+            return "unverifiable"
+        try:
+            result = method(*args)
+        except Exception:
+            return "unverifiable"
+        if result is None:
+            continue
+        if not isinstance(result, dict):
+            return "unverifiable"
+        value: Any = result
+        for key in path:
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(key)
+        if value and value != pack_id:
+            return "foreign"
+    return None
+
+
+def _identity_reject_message(kind: str, ident: str, reason: str) -> str:
+    """Fixed-wording rejection message -- #143 invariant 7 means this must
+    NEVER include the other pack's id, owner, title, or visibility."""
+    if reason == "unverifiable":
+        return f"{ident}: cannot verify existing ownership on this backend"
+    if kind == "edge":
+        return f"{ident}: edge identity is already attributed to a different pack"
+    if kind == "source":
+        return f"{ident}: source identity is already attributed to a different pack"
+    return f"{ident}: identity is already attributed to a different pack"
+
+
 def _ingest_into_pack(
     pack_id: str,
     *,
@@ -116,12 +247,23 @@ def _ingest_into_pack(
 
     for item in nodes or []:
         try:
+            item_space = _clean_str(item.get("space", ""))
+            item_node_type = _clean_str(item.get("node_type", ""))
+            item_node_id = _clean_str(item.get("node_id", ""))
+            reason = _foreign_pack(
+                pack_id, _node_probes(ctx, item_space, item_node_type, item_node_id)
+            )
+            if reason:
+                node_errors.append(
+                    _identity_reject_message("node", item_node_id, reason)
+                )
+                continue
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
             node_result = ctx["builder"].add_node(
-                space=_clean_str(item.get("space", "")),
-                node_type=_clean_str(item.get("node_type", "")),
-                node_id=_clean_str(item.get("node_id", "")),
+                space=item_space,
+                node_type=item_node_type,
+                node_id=item_node_id,
                 properties=props,
                 subject_id=subject_id,
             )
@@ -144,14 +286,43 @@ def _ingest_into_pack(
 
     for item in edges or []:
         try:
+            item_from_space = _clean_str(item.get("from_space", ""))
+            item_from_id = _clean_str(item.get("from_id", ""))
+            item_relation = _clean_str(item.get("relation", ""))
+            item_to_space = _clean_str(item.get("to_space", ""))
+            item_to_id = _clean_str(item.get("to_id", ""))
+
+            # Endpoint types resolved the same way builder.add_edge resolves
+            # them (graph.lookup_node_type) -- if either is unresolvable the
+            # endpoint node doesn't exist, add_edge will refuse the graph
+            # write on its own (missing node), and there is nothing to check
+            # a conflicting pack_id against, so the identity check is
+            # skipped rather than guessed at.
+            graph_store = ctx.get("neo4j")
+            lookup = getattr(graph_store, "lookup_node_type", None) if graph_store is not None else None
+            from_type = lookup(item_from_id) if lookup is not None else None
+            to_type = lookup(item_to_id) if lookup is not None else None
+            if from_type is not None and to_type is not None:
+                reason = _foreign_pack(
+                    pack_id,
+                    _edge_probes(ctx, from_type, item_from_id, item_relation, to_type, item_to_id),
+                )
+                if reason:
+                    edge_errors.append(
+                        _identity_reject_message(
+                            "edge", f"{item_from_id}->{item_to_id}", reason
+                        )
+                    )
+                    continue
+
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id
             edge_result = ctx["builder"].add_edge(
-                from_space=_clean_str(item.get("from_space", "")),
-                from_id=_clean_str(item.get("from_id", "")),
-                relation=_clean_str(item.get("relation", "")),
-                to_space=_clean_str(item.get("to_space", "")),
-                to_id=_clean_str(item.get("to_id", "")),
+                from_space=item_from_space,
+                from_id=item_from_id,
+                relation=item_relation,
+                to_space=item_to_space,
+                to_id=item_to_id,
                 properties=props,
                 subject_id=subject_id,
             )
@@ -201,63 +372,76 @@ def _ingest_into_pack(
             # embedding internally, so we skip hybrid.ingest / mongo.upsert_source
             # to avoid duplicate writes under the same source_id.
             try:
-                node_props: dict[str, Any] = {
-                    "pack_id": pack_id,
-                    "text": text,
-                }
-                if meta.get("title"):
-                    node_props["title"] = meta["title"]
-                if meta.get("source"):
-                    node_props["source"] = meta["source"]
-                evidence_result = ctx["builder"].add_node(
-                    space="evidence",
-                    node_type="TextUnit",
-                    node_id=source_id,
-                    properties=node_props,
-                    subject_id=subject_id,
+                reason = _foreign_pack(
+                    pack_id, _node_probes(ctx, "evidence", "TextUnit", source_id)
                 )
-                # Same store-map inspection as the node/edge loops above —
-                # a per-store failure here would otherwise still count as a
-                # successful evidence node.
-                evidence_stores = (
-                    evidence_result.get("stores")
-                    if isinstance(evidence_result, dict)
-                    else None
-                )
-                failures = store_write_failures(evidence_stores or {})
-                if failures:
-                    node_errors.append(
-                        f"{source_id} (evidence/TextUnit): " + "; ".join(failures)
-                    )
-                    stores["evidence_node"] = "; ".join(failures)
+                if reason:
+                    msg = _identity_reject_message("node", source_id, reason)
+                    node_errors.append(msg)
+                    stores["evidence_node"] = msg
                 else:
-                    evidence_node = source_id
-                    added_nodes += 1
-                    stores["evidence_node"] = "ok"
-                if store_write_succeeded(evidence_stores or {}, "graph"):
-                    billable_write = True
+                    node_props: dict[str, Any] = {
+                        "pack_id": pack_id,
+                        "text": text,
+                    }
+                    if meta.get("title"):
+                        node_props["title"] = meta["title"]
+                    if meta.get("source"):
+                        node_props["source"] = meta["source"]
+                    evidence_result = ctx["builder"].add_node(
+                        space="evidence",
+                        node_type="TextUnit",
+                        node_id=source_id,
+                        properties=node_props,
+                        subject_id=subject_id,
+                    )
+                    # Same store-map inspection as the node/edge loops above —
+                    # a per-store failure here would otherwise still count as a
+                    # successful evidence node.
+                    evidence_stores = (
+                        evidence_result.get("stores")
+                        if isinstance(evidence_result, dict)
+                        else None
+                    )
+                    failures = store_write_failures(evidence_stores or {})
+                    if failures:
+                        node_errors.append(
+                            f"{source_id} (evidence/TextUnit): " + "; ".join(failures)
+                        )
+                        stores["evidence_node"] = "; ".join(failures)
+                    else:
+                        evidence_node = source_id
+                        added_nodes += 1
+                        stores["evidence_node"] = "ok"
+                    if store_write_succeeded(evidence_stores or {}, "graph"):
+                        billable_write = True
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
                 stores["evidence_node"] = f"error: {exc}"
+            text_ingested = True
         else:
             # Legacy path: vector-only embedding + doc_sources record.
-            try:
-                vector_result = ctx["hybrid"].ingest(
-                    text=text, source_id=source_id, metadata=meta
-                )
-                stores.update(vector_result.get("stores", {}))
-            except Exception as exc:
-                stores["chromadb"] = f"error: {exc}"
-            if ctx["mongo"].available:
-                try:
-                    ctx["mongo"].upsert_source(source_id, text, meta)
-                    stores["mongodb"] = "ok"
-                except Exception as exc:
-                    stores["mongodb"] = f"error: {exc}"
+            reason = _foreign_pack(pack_id, _source_probes(ctx, source_id))
+            if reason:
+                node_errors.append(_identity_reject_message("source", source_id, reason))
             else:
-                stores["mongodb"] = "unavailable"
+                try:
+                    vector_result = ctx["hybrid"].ingest(
+                        text=text, source_id=source_id, metadata=meta
+                    )
+                    stores.update(vector_result.get("stores", {}))
+                except Exception as exc:
+                    stores["chromadb"] = f"error: {exc}"
+                if ctx["mongo"].available:
+                    try:
+                        ctx["mongo"].upsert_source(source_id, text, meta)
+                        stores["mongodb"] = "ok"
+                    except Exception as exc:
+                        stores["mongodb"] = f"error: {exc}"
+                else:
+                    stores["mongodb"] = "unavailable"
 
-        text_ingested = True
+                text_ingested = True
 
     # #66 codex re-review, findings [4]/[6]: the billing gate must be
     # provably driven by store_write_succeeded() ALONE, not by
@@ -662,6 +846,17 @@ def pack_create(
         return {"error": "Could not derive a valid pack_id from title."}
 
     ctx = _get_context()
+    graph = ctx["neo4j"]
+    # #146 P1(a): reject before the registry row is created -- if the graph
+    # (system of record for pack content, and where the identity-ownership
+    # probes below read from) is down, there is nothing safe to register.
+    # Same precondition pack_ingest already enforces; doing it here too
+    # means graph-unavailable can never leave a registry row pointing at a
+    # pack that was never actually written (docs/sql/vector/audit partial
+    # state with no compensating delete needed, because nothing was
+    # registered in the first place).
+    if not getattr(graph, "available", False):
+        return {"error": "graph store unavailable"}
 
     # #146: the registry (packs table), not a full content_pack_list() scan,
     # is now the single authority for "is this slug taken". A collision is
@@ -684,21 +879,30 @@ def pack_create(
     anchor_node_id = f"dataset:{slug}"
     anchor_result: dict[str, Any] | None = None
     anchor_exc: Exception | None = None
-    try:
-        anchor_result = ctx["builder"].add_node(
-            space="resource",
-            node_type="Dataset",
-            node_id=anchor_node_id,
-            properties={
-                "pack_id": slug,
-                "title": _clean_str(title),
-                "description": _clean_str(description or ""),
-                "created_by": "localcrab-mcp",
-            },
-            subject_id=subject_id,
-        )
-    except Exception as exc:
-        anchor_exc = exc
+    # #146 P1(a): the slug is only assigned above (registry may have
+    # suffixed it on collision), so the anchor identity probe -- same
+    # _node_probes 3-way check the node/edge loops use -- has to run here,
+    # AFTER registration but BEFORE builder.add_node, so no store is ever
+    # written to when the anchor identity is already someone else's.
+    anchor_probe_reason = _foreign_pack(
+        slug, _node_probes(ctx, "resource", "Dataset", anchor_node_id)
+    )
+    if anchor_probe_reason is None:
+        try:
+            anchor_result = ctx["builder"].add_node(
+                space="resource",
+                node_type="Dataset",
+                node_id=anchor_node_id,
+                properties={
+                    "pack_id": slug,
+                    "title": _clean_str(title),
+                    "description": _clean_str(description or ""),
+                    "created_by": "localcrab-mcp",
+                },
+                subject_id=subject_id,
+            )
+        except Exception as exc:
+            anchor_exc = exc
 
     # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
     # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
@@ -707,7 +911,11 @@ def pack_create(
     # store_write_succeeded() check is the single source of truth for
     # whether the anchor actually landed -- not just "no error reported".
     anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
-    graph_landed = anchor_exc is None and store_write_succeeded(anchor_stores or {}, "graph")
+    graph_landed = (
+        anchor_probe_reason is None
+        and anchor_exc is None
+        and store_write_succeeded(anchor_stores or {}, "graph")
+    )
 
     if not graph_landed:
         # The registry row created above now points at an anchor that
@@ -715,8 +923,13 @@ def pack_create(
         # (#146 follow-up #170: this undoes ONLY the registry insert, never
         # any store the anchor write itself may have partially landed in;
         # once graph.add_node has actually succeeded this branch is
-        # unreachable, so there is nothing to undo past this point).
-        if anchor_exc is not None:
+        # unreachable, so there is nothing to undo past this point). The
+        # identity-conflict branch reuses this exact same compensating path
+        # -- builder.add_node was never called, so there is nothing else to
+        # undo either.
+        if anchor_probe_reason is not None:
+            error_msg = _identity_reject_message("node", anchor_node_id, anchor_probe_reason)
+        elif anchor_exc is not None:
             error_msg = f"anchor node failed: {anchor_exc}"
         else:
             graph_failures = [

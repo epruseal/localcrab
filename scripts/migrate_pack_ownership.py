@@ -33,7 +33,23 @@ SCOPE (#146's time-box -- read before assuming a backend is covered):
   - Doc: SQL-backed (local/kuzu/pg) via each store's own
     ``_table``/``_fetch_one``/``_exec_write`` hooks (shared by
     LocalSQLDocStore and PgDocStore, see _sql_doc_base.py), or Mongo
-    (docker) via a native ``update_many``.
+    (docker) via a native ``update_many``. A ``doc_nodes`` row missing
+    pack_id is backfilled with priority graph-twin(exact) ->
+    graph-twin(fallback) -> self path-inference -> ``default`` (#146 P1(b),
+    PR #177 review round 3) -- it does NOT unconditionally default the way
+    an earlier version of this script did. GRAPH-TWIN CONSISTENCY (a doc
+    row landing in the SAME pack_id its graph_nodes counterpart resolved
+    to) is only GUARANTEED in a mode where the graph stage above is itself
+    in SCOPE (STORAGE_MODE=local, SQLite graph.db) -- in every other mode
+    (pg/kuzu/docker) there is no SQLite graph.db for the twin lookup to
+    read, ``_backfill_graph`` already skips there, and that skip already
+    demotes ``graph_backfill`` to rc 3 (see SAFETY below), which #147 is
+    already documented to refuse to deploy against. A doc row still left
+    without ANY resolvable pack_id (its graph twin, if any, is ambiguous
+    across spaces, or its own properties/metadata is valid JSON but not an
+    object) is excluded from the write and reported -- never silently
+    defaulted -- and demotes ``docs_backfill`` to ``skipped`` (rc 3) in its
+    own right, same discipline as the graph stage's row-level skips below.
   - Vector: BEST-EFFORT ONLY. Neither SqliteVecStore nor PgVectorStore
     exposes a "list every row" primitive (only ``get_by_id`` / KNN
     ``query``), so this script can only re-tag vector rows whose node_id
@@ -390,55 +406,203 @@ def _missing_and_set_sql(col: str, is_pg: bool) -> tuple[str, str]:
     return missing, set_expr
 
 
-def _backfill_sql_table(
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    """Split ``items`` into ``size``-sized slices, preserving order -- shared
+    by the graph-twin lookup and the PK-based group UPDATE below (#146
+    P1(b)) so neither trips a backend's bound-parameter limit on a large
+    migration."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, Any]]:
+    """Manually expand an ``IN (...)`` list into numbered named
+    placeholders (same technique as ``_SqlGraphStoreBase._in_placeholders``,
+    duplicated here because this script calls store hooks directly rather
+    than importing a store-internal helper)."""
+    names = [f"{prefix}{i}" for i in range(len(values))]
+    return ", ".join(f":{n}" for n in names), dict(zip(names, values, strict=True))
+
+
+def _pk_predicate(
+    pk_cols: tuple[str, ...], rows_pk: list[tuple[Any, ...]], prefix: str
+) -> tuple[str, dict[str, Any]]:
+    """Build a doc table's REAL-PK predicate for a group of rows headed to
+    the same target pack_id (#146 P1(b), PR #177 review round 2 v2 결함 6)
+    -- deliberately never a shared ``node_id IN (...)``, which would also
+    match an EXCLUDED row sharing that same node_id under a different
+    ``(space, node_id)`` key (or a different ``doc_sources`` row that
+    happens to share nothing at all -- ``source_id`` IS the whole PK there,
+    so this degenerates to a plain ``IN`` for that table)."""
+    if len(pk_cols) == 1:
+        placeholders, params = _in_clause(prefix, [str(r[0]) for r in rows_pk])
+        return f"{pk_cols[0]} IN ({placeholders})", params
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    for i, values in enumerate(rows_pk):
+        col_clauses = []
+        for col, val in zip(pk_cols, values, strict=True):
+            key = f"{prefix}{col}{i}"
+            col_clauses.append(f"{col}=:{key}")
+            params[key] = val
+        clauses.append("(" + " AND ".join(col_clauses) + ")")
+    return " OR ".join(clauses), params
+
+
+_DOC_BACKFILL_CHUNK_SIZE = 200
+
+
+def _backfill_doc_table(
     store: Any,
     table_name: str,
     prop_col: str,
-    id_col: str | None,
+    pk_cols: tuple[str, ...],
+    id_col: str,
     default_pack_id: str,
     apply: bool,
+    *,
+    twin_exact: dict[tuple[str, str], str] | None = None,
+    twin_fallback: dict[str, str] | None = None,
+    twin_ambiguous: dict[tuple[str, str], list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Bulk-backfill missing pack_id on one JSON-properties table via the
-    store's own ``_table``/``_fetch_one``/``_fetch_all``/``_exec_write``
-    hooks (shared by every SQL-backed graph/doc store -- see
-    ``_sql_graph_base.py`` / ``_sql_doc_base.py``), so this works
-    identically on SQLite and PostgreSQL without touching either store's
-    connection machinery directly.
+    """Bulk-backfill missing pack_id on ONE doc-store JSON-properties table
+    (``doc_nodes``/``doc_sources``) via the store's own
+    ``_table``/``_fetch_one``/``_fetch_all``/``_exec_write`` hooks (shared
+    by LocalSQLDocStore and PgDocStore, see ``_sql_doc_base.py``).
 
-    ``id_col=None`` (graph_edges has no single-column identifier -- its PK
-    is the 5-column tuple from_type/from_id/relation/to_type/to_id) skips
-    collecting per-row ids and just counts; used by callers (vector
-    backfill) that need the affected ids from OTHER tables only.
+    Replaces the earlier ``_backfill_sql_table``'s unconditional "every
+    missing row -> ``default_pack_id``" write (#146 P1(b), PR #177 review
+    round 3): each row's target pack_id is resolved individually, with
+    priority graph-twin(exact) -> graph-twin(fallback) -> self
+    path-inference -> ``default_pack_id``.
+
+    ``twin_exact``/``twin_fallback``/``twin_ambiguous`` come from
+    ``_graph_twin_pack_map`` and are ``None`` for ``doc_sources`` (it is
+    not a graph node twin -- a legacy ``text_as_node=False`` row -- see
+    module docstring SCOPE; only self path-inference -> default applies to
+    it). When given, a row's twin lookup key is ``(space, node_id)``
+    (``space``/``node_id`` are always the first two of ``pk_cols`` for
+    ``doc_nodes``); ``twin_ambiguous`` hitting that key EXCLUDES the row
+    (no single graph pack_id is correct for it) rather than falling through
+    to self-inference or default -- writing a guess over a row whose own
+    graph twin disagrees with itself would be worse than leaving it alone.
+
+    A row whose own ``prop_col`` is valid JSON but not an object
+    (``resolve_row_pack_id``'s ``"skipped-non-dict"``) is likewise EXCLUDED,
+    never defaulted -- same "don't guess over an unreadable row" reasoning.
+    Both exclusion classes are counted in the returned ``excluded`` total
+    and reported so ``_docs_stage_outcome`` can demote this stage (a row
+    still missing pack_id after this call violates invariant 5 exactly like
+    the graph stage's own row-level skips do).
+
+    Every actual write is grouped by TARGET pack_id and predicated on the
+    table's REAL primary key -- see ``_pk_predicate`` -- chunked at
+    ``_DOC_BACKFILL_CHUNK_SIZE`` rows per UPDATE. Each chunk's expected
+    matching row count is re-``SELECT COUNT(*)``'d with the identical
+    predicate immediately before its UPDATE and compared against the
+    UPDATE's own rowcount; a mismatch aborts (``RuntimeError``) rather than
+    trusting a partial write, same discipline every other write in this
+    script already follows.
     """
+    from opencrab.ontology.pack_provenance import resolve_row_pack_id
+
+    check_twin = twin_exact is not None
     table = store._table(table_name)
     is_pg = _is_pg_dialect(store)
     missing_where, set_expr = _missing_and_set_sql(prop_col, is_pg)
 
     total = store._fetch_one(f"SELECT COUNT(*) FROM {table}", {})[0]  # noqa: S608
-    if id_col:
-        missing_ids = [
-            r[0]
-            for r in store._fetch_all(f"SELECT {id_col} FROM {table} WHERE {missing_where}", {})  # noqa: S608
-        ]
-        missing = len(missing_ids)
-    else:
-        missing_ids = []
-        missing = store._fetch_one(f"SELECT COUNT(*) FROM {table} WHERE {missing_where}", {})[0]  # noqa: S608
-    print(f"  {table_name}: total={total} missing_pack_id={missing}")
+    select_cols = ", ".join((*pk_cols, prop_col))
+    rows = store._fetch_all(
+        f"SELECT {select_cols} FROM {table} WHERE {missing_where}", {}  # noqa: S608
+    )
+    missing = len(rows)
+
+    by_pack: dict[str, list[tuple[Any, ...]]] = {}
+    excluded: dict[str, int] = {"ambiguous-twin": 0, "non-dict": 0}
+    resolution_counts: dict[str, int] = {}
+    for row in rows:
+        pk_values = tuple(row[i] for i in range(len(pk_cols)))
+        prop_raw = row[len(pk_cols)]
+        id_value = pk_values[-1]  # node_id for doc_nodes, source_id for doc_sources
+        space_value = pk_values[0] if len(pk_cols) > 1 else None
+
+        pack_id: str | None = None
+        reason = ""
+        if check_twin:
+            twin_key = (space_value, id_value)
+            if twin_key in (twin_ambiguous or {}):
+                excluded["ambiguous-twin"] += 1
+                continue
+            exact = (twin_exact or {}).get(twin_key)
+            if exact:
+                pack_id, reason = exact, "graph-twin-exact"
+            else:
+                fb = (twin_fallback or {}).get(id_value)
+                if fb:
+                    pack_id, reason = fb, "graph-twin-fallback"
+        if pack_id is None:
+            inferred, infer_reason = resolve_row_pack_id(prop_raw, {id_col: id_value}, None)
+            if infer_reason == "skipped-non-dict":
+                excluded["non-dict"] += 1
+                continue
+            if inferred:
+                pack_id, reason = inferred, "self-inferred"
+        if pack_id is None:
+            pack_id, reason = default_pack_id, "default"
+
+        by_pack.setdefault(pack_id, []).append(pk_values)
+        resolution_counts[reason] = resolution_counts.get(reason, 0) + 1
+
+    by_pack_summary = ", ".join(f"{p}: {len(r)}" for p, r in sorted(by_pack.items()))
+    print(
+        f"  {table_name}: total={total} missing_pack_id={missing} "
+        f"by_pack={{{by_pack_summary}}} excluded={excluded} resolution={resolution_counts}"
+    )
 
     updated = 0
-    if apply and missing:
-        updated = store._exec_write(
-            f"UPDATE {table} SET {prop_col} = {set_expr} WHERE {missing_where}",  # noqa: S608
-            {"pid": default_pack_id},
-        )
-        if updated != missing:
-            raise RuntimeError(
-                f"{table_name}: expected to backfill {missing} rows, actually "
-                f"updated {updated} -- aborting rather than trusting a "
-                "partial write."
-            )
-    return {"total": total, "missing": missing, "updated": updated, "missing_ids": missing_ids}
+    if apply:
+        for pack_id, pk_rows in by_pack.items():
+            for chunk in _chunked(pk_rows, _DOC_BACKFILL_CHUNK_SIZE):
+                pred, pred_params = _pk_predicate(pk_cols, chunk, "bf")
+                # missing_where is an unparenthesized "A IS NULL OR A = ''"
+                # -- AND binds tighter than OR in SQL, so combining it bare
+                # with "AND (pred)" would parse as "(A IS NULL) OR (A = ''
+                # AND pred)", letting ANY row with a NULL properties.pack_id
+                # match regardless of the PK predicate (silently reopening
+                # v2 결함 6 despite the PK-based predicate above). Both
+                # halves of missing_where must be grouped first.
+                where = f"({missing_where}) AND ({pred})"
+                expected = store._fetch_one(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where}", pred_params  # noqa: S608
+                )[0]
+                if expected != len(chunk):
+                    raise RuntimeError(
+                        f"{table_name}: expected {len(chunk)} row(s) matching this "
+                        f"chunk's PK predicate, found {expected} -- aborting rather "
+                        "than trusting a partial write (a concurrent writer may have "
+                        "changed a row's pack_id between selection and update)."
+                    )
+                params = {**pred_params, "pid": pack_id}
+                rc = store._exec_write(
+                    f"UPDATE {table} SET {prop_col} = {set_expr} WHERE {where}",  # noqa: S608
+                    params,
+                )
+                if rc != len(chunk):
+                    raise RuntimeError(
+                        f"{table_name}: expected to backfill {len(chunk)} row(s) "
+                        f"(pack_id={pack_id!r}), actually updated {rc} -- aborting "
+                        "rather than trusting a partial write."
+                    )
+                updated += rc
+
+    return {
+        "total": total,
+        "missing": missing,
+        "updated": updated,
+        "excluded": sum(excluded.values()),
+        "excluded_breakdown": excluded,
+        "by_pack": {pid: len(pk_rows) for pid, pk_rows in by_pack.items()},
+    }
 
 
 def _graph_missing_node_ids(graph: Any) -> list[str]:
@@ -509,6 +673,99 @@ def _split_ambiguous(
         else:
             ambiguous[node_id] = sorted(packs)
     return resolved, ambiguous
+
+
+_GRAPH_TWIN_CHUNK_SIZE = 500
+
+
+def _graph_twin_pack_map(
+    graph: Any,
+    node_ids: list[str],
+    assume_pack_id: str | None,
+    *,
+    actual: bool,
+) -> tuple[dict[tuple[str, str], str], dict[str, str], dict[tuple[str, str], list[str]]]:
+    """Resolve each ``doc_nodes`` row's GRAPH TWIN pack_id (#146 P1(b), PR
+    #177 review round 3): for every node_id a doc row was found MISSING
+    pack_id on, look up that SAME node_id's ``graph_nodes`` row(s) and read
+    (``actual=True``, an apply-time re-query AFTER the graph backfill has
+    already written something) or predict (``actual=False``, a dry-run
+    resolution via the SAME ``resolve_row_pack_id`` the real graph backfill
+    itself uses) what pack_id it carries.
+
+    ``node_ids`` is the DOC-side missing-id set, NOT the graph-side missing
+    set -- a graph node that ALREADY has a pack_id (nothing for the graph
+    backfill to do) but whose doc twin is still bare is exactly half of the
+    inconsistency this closes; it would be invisible if this only looked at
+    graph's own missing rows.
+
+    Keyed by ``(space_id, node_id)`` -- the graph PK is ``(node_type,
+    node_id)``, so one node_id can legally carry DIFFERENT pack_ids across
+    types/spaces (PR #177 review round 2 v2 결함 5's exact scenario: a
+    ``(TypeA, shared, space=concept, pack-a)`` + ``(TypeB, shared,
+    space=evidence, pack-b)`` pair is NOT ambiguous for a doc row keyed
+    ``(concept, shared)`` -- it resolves cleanly to ``pack-a``; only rows
+    sharing the SAME ``(space_id, node_id)`` with different pack_ids are
+    truly ambiguous). ``exact_map`` only carries entries where every graph
+    row sharing that ``(space_id, node_id)`` pair agrees; disagreement is
+    reported via ``ambiguous`` (reusing ``_split_ambiguous`` -- its
+    ``dict[str, ...]`` type hint is written for the vector-side str key,
+    but the function itself is a plain key->set(values) splitter with no
+    str-specific behavior, so a tuple key works identically) and excluded
+    from both maps. ``fallback_map`` is a node_id-ONLY aggregate (used when
+    a doc row's graph twin has no/blank ``space_id``, so the exact key can
+    never match a real doc ``space``) and only carries a value when every
+    graph row sharing that BARE node_id agrees too.
+
+    ``actual=True`` and ``actual=False`` share ONE normalization path for
+    the properties column (``pack_provenance._normalize_props``, via
+    ``resolve_row_pack_id`` for the dry-run branch and directly for the
+    apply-time branch) -- v5 결함 8: the apply-time branch reads RAW
+    ``_fetch_all`` rows, where SQLite hands back a JSON **string** and
+    PostgreSQL's JSONB decodes straight to a **dict**; duplicating that
+    dict-or-string handling in a second place here (instead of importing
+    the shared helper) would give the two modes a chance to silently
+    disagree about a PG-only row.
+
+    Returns ``({}, {}, {})`` when ``graph`` exposes no ``_table``/
+    ``_fetch_all`` hooks (Kuzu/Neo4j) -- that backend's SCOPE gap already
+    forces ``graph_backfill`` to ``skipped`` (rc 3, see module docstring
+    SAFETY), so callers must not treat an empty map here as "no twins
+    exist" (see module docstring's new SCOPE note on doc/graph twin
+    consistency).
+    """
+    if not node_ids or not (hasattr(graph, "_table") and hasattr(graph, "_fetch_all")):
+        return {}, {}, {}
+
+    from opencrab.ontology.pack_provenance import _normalize_props, resolve_row_pack_id
+
+    table = graph._table("graph_nodes")
+    exact_seen: dict[tuple[str, str], set[str]] = {}
+    fallback_seen: dict[str, set[str]] = {}
+    for chunk in _chunked(sorted(set(node_ids)), _GRAPH_TWIN_CHUNK_SIZE):
+        placeholders, params = _in_clause("twn", chunk)
+        rows = graph._fetch_all(
+            f"SELECT node_id, space_id, properties FROM {table} WHERE node_id IN ({placeholders})",  # noqa: S608
+            params,
+        )
+        for node_id, space_id, props_raw in rows:
+            if actual:
+                props = _normalize_props(props_raw)
+                pack_id = str(props["pack_id"]) if props and props.get("pack_id") else None
+            else:
+                pack_id, _reason = resolve_row_pack_id(
+                    props_raw, {"node_id": node_id}, assume_pack_id
+                )
+            if not pack_id:
+                continue
+            exact_seen.setdefault((space_id, node_id), set()).add(pack_id)
+            fallback_seen.setdefault(node_id, set()).add(pack_id)
+
+    exact_map, ambiguous = _split_ambiguous(exact_seen)  # type: ignore[arg-type]
+    fallback_map = {
+        nid: next(iter(packs)) for nid, packs in fallback_seen.items() if len(packs) == 1
+    }
+    return exact_map, fallback_map, ambiguous
 
 
 def _predict_node_pack_map(
@@ -584,13 +841,56 @@ def _read_actual_node_pack_ids(
         conn.close()
 
 
-def _backfill_doc(docs: Any, default_pack_id: str, apply: bool) -> dict[str, Any]:
+def _doc_missing_node_ids(docs: Any) -> list[str]:
+    """node_ids currently missing pack_id in ``doc_nodes`` -- feeds the
+    graph-twin lookup (#146 P1(b)) BEFORE ``_backfill_doc_table`` does its
+    own (identically-predicated) SELECT of the same rows. A row gaining a
+    pack_id between this call and that one (a concurrent writer) is not a
+    new risk: ``_backfill_doc_table``'s own rowcount-assertion discipline
+    already guards every write it performs, regardless of what this
+    pre-pass saw."""
+    table = docs._table("doc_nodes")
+    is_pg = _is_pg_dialect(docs)
+    missing_where, _ = _missing_and_set_sql("properties", is_pg)
+    rows = docs._fetch_all(f"SELECT node_id FROM {table} WHERE {missing_where}", {})  # noqa: S608
+    return [r[0] for r in rows]
+
+
+def _backfill_doc(docs: Any, graph: Any, default_pack_id: str, apply: bool) -> dict[str, Any]:
+    """``graph`` (#146 P1(b)) supplies the graph-twin lookup
+    ``_graph_twin_pack_map`` needs for ``doc_nodes`` -- ``doc_sources`` gets
+    no twin map (it is not a graph node twin, see module docstring SCOPE).
+    ``actual=apply``: by the time this stage runs (main()'s step 4, AFTER
+    step 2's graph backfill), a real ``--apply`` run has ALREADY written the
+    graph's pack_ids for real, so the twin lookup must read that ACTUAL
+    state; a dry-run left the graph untouched, so the twin lookup must
+    PREDICT via the same ``resolve_row_pack_id`` the graph stage itself
+    would use -- exactly the same apply/dry-run split ``_predict_node_pack_map``
+    / ``_read_actual_node_pack_ids`` already use for the vector stage below.
+    """
     if not getattr(docs, "available", True):
         print("  doc store unavailable -- skipping.")
         return {"skipped": True}
     if hasattr(docs, "_dialect"):
-        nodes = _backfill_sql_table(docs, "doc_nodes", "properties", "node_id", default_pack_id, apply)
-        sources = _backfill_sql_table(docs, "doc_sources", "metadata", "source_id", default_pack_id, apply)
+        missing_node_ids = _doc_missing_node_ids(docs)
+        twin_exact, twin_fallback, twin_ambiguous = _graph_twin_pack_map(
+            graph, missing_node_ids, default_pack_id, actual=apply
+        )
+        nodes = _backfill_doc_table(
+            docs,
+            "doc_nodes",
+            "properties",
+            ("space", "node_id"),
+            "node_id",
+            default_pack_id,
+            apply,
+            twin_exact=twin_exact,
+            twin_fallback=twin_fallback,
+            twin_ambiguous=twin_ambiguous,
+        )
+        sources = _backfill_doc_table(
+            docs, "doc_sources", "metadata", ("source_id",), "source_id", default_pack_id, apply
+        )
         return {"doc_nodes": nodes, "doc_sources": sources}
     if hasattr(docs, "_db"):
         return _backfill_mongo(docs._db, default_pack_id, apply)
@@ -599,8 +899,28 @@ def _backfill_doc(docs: Any, default_pack_id: str, apply: bool) -> dict[str, Any
 
 
 def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any]:
+    """#146 P1(b): applies the SAME existing -> inferred -> assumed
+    priority ``resolve_row_pack_id`` gives ``graph_nodes``/``graph_edges``
+    to every missing Mongo document's own ``properties``/``metadata``,
+    instead of the earlier version's unconditional
+    ``$set: {...pack_id: default_pack_id}``. Mongo (docker mode) has no
+    SQLite graph.db for a twin lookup (module docstring SCOPE) -- only the
+    row's own path-inference, then default, exactly the doc self-inference
+    step the SQL-backed path also falls through to.
+
+    ``resolve_row_pack_id`` is called with ``assume_pack_id=default_pack_id``
+    directly (unlike the SQL-backed path's two-step self-inference-then-
+    default) since Mongo has no separate excluded-row bookkeeping to keep
+    distinct from "assumed" -- the helper's own "assumed" fallback already
+    performs exactly the "no hint -> default" step this stage needs.
+    """
+    from opencrab.ontology.pack_provenance import resolve_row_pack_id
+
     results: dict[str, Any] = {}
-    for collection, field_root in (("nodes", "properties"), ("sources", "metadata")):
+    for collection, field_root, id_field in (
+        ("nodes", "properties", "node_id"),
+        ("sources", "metadata", "source_id"),
+    ):
         coll = db[collection]
         total = coll.estimated_document_count()
         missing_q = {
@@ -610,17 +930,29 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
                 {f"{field_root}.pack_id": ""},
             ]
         }
-        missing = coll.count_documents(missing_q)
-        print(f"  mongo.{collection}: total={total} missing_pack_id={missing}")
+        missing_docs = list(coll.find(missing_q))
+        missing = len(missing_docs)
+        by_pack: dict[str, list[Any]] = {}
+        for doc in missing_docs:
+            field = doc.get(field_root) or {}
+            id_value = doc.get(id_field, "")
+            pack_id, _reason = resolve_row_pack_id(field, {id_field: id_value}, default_pack_id)
+            by_pack.setdefault(pack_id or default_pack_id, []).append(doc["_id"])
+        by_pack_summary = ", ".join(f"{p}: {len(ids)}" for p, ids in sorted(by_pack.items()))
+        print(f"  mongo.{collection}: total={total} missing_pack_id={missing} by_pack={{{by_pack_summary}}}")
         updated = 0
-        if apply and missing:
-            result = coll.update_many(missing_q, {"$set": {f"{field_root}.pack_id": default_pack_id}})
-            updated = result.modified_count
-            if updated != missing:
-                raise RuntimeError(
-                    f"mongo.{collection}: expected to backfill {missing} docs, "
-                    f"actually updated {updated} -- aborting."
+        if apply:
+            for pack_id, ids in by_pack.items():
+                result = coll.update_many(
+                    {"_id": {"$in": ids}}, {"$set": {f"{field_root}.pack_id": pack_id}}
                 )
+                if result.modified_count != len(ids):
+                    raise RuntimeError(
+                        f"mongo.{collection}: expected to backfill {len(ids)} docs "
+                        f"(pack_id={pack_id!r}), actually updated {result.modified_count} "
+                        "-- aborting."
+                    )
+                updated += result.modified_count
         results[collection] = {"total": total, "missing": missing, "updated": updated}
     return results
 
@@ -749,12 +1081,30 @@ def _docs_stage_outcome(stats: dict[str, Any]) -> tuple[str, str]:
     """Like ``_stage_outcome`` but for ``_backfill_doc``'s nested shape
     (``{"doc_nodes": {...}, "doc_sources": {...}}`` for SQL-backed stores,
     ``{"nodes": {...}, "sources": {...}}`` for Mongo -- both are dicts of
-    sub-dicts carrying their own "missing" count)."""
+    sub-dicts carrying their own "missing" count).
+
+    #146 P1(b): a sub-dict carrying a non-zero ``excluded`` count (only
+    ``_backfill_doc_table``'s SQL-backed sub-dicts have this key -- an
+    ``(space, node_id)`` the graph-twin map reports ambiguous, or a row
+    whose own properties/metadata is valid JSON but not an object) demotes
+    this stage to ``skipped`` regardless of ``missing`` -- those rows are
+    left WITHOUT any pack_id by design (never guessed-and-defaulted, see
+    ``_backfill_doc_table``'s docstring), which violates invariant 5 the
+    exact same way the graph stage's own row-level ``nodes_skipped``/
+    ``edges_skipped`` demotion (``main()``) does, so it must gate the exit
+    code too."""
     if stats.get("skipped"):
         return "skipped", "doc store unavailable or not SQL/Mongo-backed"
-    pending = sum(
-        int(sub.get("missing") or 0) for sub in stats.values() if isinstance(sub, dict)
-    )
+    subs = [sub for sub in stats.values() if isinstance(sub, dict)]
+    pending = sum(int(sub.get("missing") or 0) for sub in subs)
+    excluded = sum(int(sub.get("excluded") or 0) for sub in subs)
+    if excluded:
+        return (
+            "skipped",
+            f"{excluded} row(s) left unattributed after resolution (ambiguous "
+            "graph twin or non-dict properties/metadata) -- was: "
+            f"{'clean' if pending == 0 else f'{pending} row(s) needed backfilling'}",
+        )
     if pending == 0:
         return "clean", "nothing to do"
     return "applied", f"{pending} row(s) needed backfilling"
@@ -947,7 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
         stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
 
         print("\n4) Backfilling doc rows with no pack_id...")
-        doc_stats = _backfill_doc(docs, default_pack_id, args.apply)
+        doc_stats = _backfill_doc(docs, graph, default_pack_id, args.apply)
         stage_outcomes["docs_backfill"] = dict(
             zip(("outcome", "reason"), _docs_stage_outcome(doc_stats), strict=True)
         )

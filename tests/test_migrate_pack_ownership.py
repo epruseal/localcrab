@@ -204,8 +204,14 @@ class TestApply:
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
-            nodes_stats = migrate._backfill_sql_table(docs, "doc_nodes", "properties", "node_id", migrate.DEFAULT_PACK_ID, apply=False)
-            sources_stats = migrate._backfill_sql_table(docs, "doc_sources", "metadata", "source_id", migrate.DEFAULT_PACK_ID, apply=False)
+            nodes_stats = migrate._backfill_doc_table(
+                docs, "doc_nodes", "properties", ("space", "node_id"), "node_id",
+                migrate.DEFAULT_PACK_ID, apply=False,
+            )
+            sources_stats = migrate._backfill_doc_table(
+                docs, "doc_sources", "metadata", ("source_id",), "source_id",
+                migrate.DEFAULT_PACK_ID, apply=False,
+            )
         finally:
             docs.close()
         assert nodes_stats["missing"] == 0
@@ -1158,3 +1164,516 @@ class TestBackfillVector:
         assert store._rows["n-existing"]["metadata"]["pack_id"] == "already-set-pack"
         assert store._rows["n-inferred"]["metadata"]["pack_id"] == "pack-x"
         assert store._rows["n-assumed"]["metadata"]["pack_id"] == "default"
+
+
+# ---------------------------------------------------------------------------
+# #146 P1(b) (PR #177 review round 3): doc backfill dropping inferred
+# pack_id -- design v5's 15-item reproduction list.
+# ---------------------------------------------------------------------------
+
+
+class TestGraphTwinDocBackfill:
+    """gates 1/2/3/5/6/7/9/10/12: the priority graph-twin(exact) ->
+    graph-twin(fallback) -> self path-inference -> default, exercised
+    through real LocalGraphStore/LocalSQLDocStore files and ``main()``."""
+
+    def test_1_both_graph_and_doc_twin_missing_source_path_gives_pack_not_default(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node(
+                "Entity", "n1", {"source_path": "/packs/pack-a/x.md"}, space_id="concept"
+            )
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "n1", {})
+        finally:
+            docs.close()
+
+        # dry-run prediction, BEFORE any write.
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            exact, fallback, ambiguous = migrate._graph_twin_pack_map(
+                graph, ["n1"], migrate.DEFAULT_PACK_ID, actual=False
+            )
+        finally:
+            graph.close()
+        assert exact == {("concept", "n1"): "pack-a"}
+        # fallback_map is a node_id-only aggregate built from every matched
+        # row regardless of space -- with a single graph row for "n1" it
+        # naturally agrees with exact_map too (exact_map still wins on
+        # lookup; see test_5 for the case where only fallback resolves).
+        assert fallback == {"n1": "pack-a"}
+        assert ambiguous == {}
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "n1")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-a"
+
+    def test_2_graph_already_packed_doc_twin_missing_gets_the_same_pack(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "n2", {"pack_id": "pack-b"}, space_id="concept")
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "n2", {})
+        finally:
+            docs.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "n2")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-b"
+
+    def test_3_codex_counterexample_same_node_id_different_space_resolves_exact(
+        self, bootstrapped_owner, env
+    ):
+        """v2 결함 5's exact-key scenario: TypeA/shared in space "concept"
+        (pack-a) and TypeB/shared in space "evidence" (pack-b) do NOT
+        collide -- a doc row keyed (concept, shared) resolves cleanly to
+        pack-a, it is not excluded as ambiguous."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("TypeA", "shared", {"pack_id": "pack-a"}, space_id="concept")
+            graph.upsert_node("TypeB", "shared", {"pack_id": "pack-b"}, space_id="evidence")
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "TypeA", "shared", {})
+        finally:
+            docs.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            exact, _fallback, ambiguous = migrate._graph_twin_pack_map(
+                graph, ["shared"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+        assert exact[("concept", "shared")] == "pack-a"
+        assert ("concept", "shared") not in ambiguous
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "shared")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-a"
+
+    def test_4_true_ambiguous_twin_excluded_docs_skipped_rc3(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """same (space, node_id) resolving to two DIFFERENT pack_ids across
+        graph rows is genuinely ambiguous -- excluded, reported, and demotes
+        docs_backfill to skipped (rc 3)."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("TypeA", "dup", {"pack_id": "pack-a"}, space_id="concept")
+            graph.upsert_node("TypeB", "dup", {"pack_id": "pack-b"}, space_id="concept")
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "TypeA", "dup", {})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+        assert rc == 3
+        assert "docs_backfill: skipped" in out
+        assert "left unattributed" in out
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "dup")
+        finally:
+            docs.close()
+        assert not row["properties"].get("pack_id")
+
+    def test_5_blank_graph_space_id_uses_fallback_map(self, bootstrapped_owner, env):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "legacy1", {"pack_id": "pack-legacy"}, space_id=None)
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "legacy1", {})
+        finally:
+            docs.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            exact, fallback, _ambiguous = migrate._graph_twin_pack_map(
+                graph, ["legacy1"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+        # exact is keyed (None, "legacy1") -- never matches a real doc space,
+        # so only the node_id-only fallback closes the gap.
+        assert exact == {(None, "legacy1"): "pack-legacy"}
+        assert fallback == {"legacy1": "pack-legacy"}
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "legacy1")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-legacy"
+
+    def test_6_doc_self_path_inference_without_graph_twin(self, bootstrapped_owner, env):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "solo-doc", {"source_path": "/packs/pack-c/x.md"}
+            )
+        finally:
+            docs.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "solo-doc")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-c"
+
+    def test_7_no_evidence_at_all_gets_default(self, bootstrapped_owner, env):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "no-hint", {"note": "nothing to infer"})
+        finally:
+            docs.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "no-hint")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
+
+    def test_8_pk_predicate_leaves_non_dict_row_untouched_when_sharing_node_id(
+        self, bootstrapped_owner, env
+    ):
+        """v2 결함 6 反례 in the P1(b) context: ONE node_id ("shared-id")
+        shared by a resolvable row (space=concept) and a non-dict row
+        (space=evidence). A ``node_id IN (...)`` predicate would touch
+        both; the real PK predicate must only touch the resolvable one."""
+        import json
+        import sqlite3
+
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "shared-id", {"source_path": "/packs/pack-z/x.md"}
+            )
+        finally:
+            docs.close()
+        with sqlite3.connect(str(env / "doc_store.db")) as conn:
+            conn.execute(
+                "INSERT INTO doc_nodes (space, node_id, node_type, properties, updated_at) "
+                "VALUES ('evidence', 'shared-id', 'Entity', ?, datetime('now'))",
+                (json.dumps("just a string"),),
+            )
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 3  # the non-dict row remains unattributed -- correct
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            resolvable = docs.get_node_doc("concept", "shared-id")
+        finally:
+            docs.close()
+        assert resolvable["properties"]["pack_id"] == "pack-z"
+
+        with sqlite3.connect(str(env / "doc_store.db")) as conn:
+            raw = conn.execute(
+                "SELECT properties FROM doc_nodes WHERE space='evidence' AND node_id='shared-id'"
+            ).fetchone()[0]
+        assert raw == json.dumps("just a string")  # untouched, not overwritten
+
+    def test_9_doc_sources_self_inference_and_default(self, bootstrapped_owner, env):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_source("src-inferred", "text", {"source_path": "/packs/pack-s/doc.md"})
+            docs.upsert_source("src-bare", "text", {"title": "nothing to infer"})
+        finally:
+            docs.close()
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            inferred = docs.get_source("src-inferred")
+            bare = docs.get_source("src-bare")
+        finally:
+            docs.close()
+        assert inferred["metadata"]["pack_id"] == "pack-s"
+        assert bare["metadata"]["pack_id"] == migrate.DEFAULT_PACK_ID
+
+    def test_10_dry_run_by_pack_distribution_matches_apply_actual(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "twin-a", {"pack_id": "pack-a"}, space_id="concept")
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "twin-a", {})
+            docs.upsert_node_doc(
+                "concept", "Entity", "self-b", {"source_path": "/packs/pack-b/x.md"}
+            )
+            docs.upsert_node_doc("concept", "Entity", "none-c", {"note": "nada"})
+        finally:
+            docs.close()
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            missing = migrate._doc_missing_node_ids(docs)
+            exact, fallback, ambiguous = migrate._graph_twin_pack_map(
+                graph, missing, migrate.DEFAULT_PACK_ID, actual=False
+            )
+            dry = migrate._backfill_doc_table(
+                docs,
+                "doc_nodes",
+                "properties",
+                ("space", "node_id"),
+                "node_id",
+                migrate.DEFAULT_PACK_ID,
+                apply=False,
+                twin_exact=exact,
+                twin_fallback=fallback,
+                twin_ambiguous=ambiguous,
+            )
+        finally:
+            docs.close()
+            graph.close()
+        assert dry["by_pack"] == {"pack-a": 1, "pack-b": 1, migrate.DEFAULT_PACK_ID: 1}
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            actual_dist: dict[str, int] = {}
+            for nid in ("twin-a", "self-b", "none-c"):
+                pid = docs.get_node_doc("concept", nid)["properties"]["pack_id"]
+                actual_dist[pid] = actual_dist.get(pid, 0) + 1
+        finally:
+            docs.close()
+        assert actual_dist == dry["by_pack"]
+
+    def test_12_normal_run_with_doc_twin_backfill_still_exits_0(
+        self, bootstrapped_owner, env
+    ):
+        """regression: the P1(b) rewrite must not break the ordinary
+        clean-completion exit code."""
+        _seed_graph(env)
+        _seed_doc(env)
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+
+class _FakeSingleRowDocStore:
+    """Minimal doc-store double with exactly ONE row -- only supports the
+    query shapes ``_backfill_doc_table`` issues (unconditional total COUNT,
+    the missing-rows SELECT, the per-chunk expected-count recheck, and the
+    grouped UPDATE), used to probe the PG-JSONB-dict-properties path (v3
+    결함 7) without standing up a real PostgreSQL dependency."""
+
+    def __init__(self, space: str, node_id: str, properties):
+        self._space = space
+        self._node_id = node_id
+        self._properties = properties
+        self.written_pack_id: str | None = None
+
+    def _table(self, name: str) -> str:
+        return name
+
+    def _fetch_one(self, sql, params):
+        return (1,)  # single-row fixture: total COUNT and the per-chunk
+        # expected-count recheck both always match exactly 1.
+
+    def _fetch_all(self, sql, params):
+        return [(self._space, self._node_id, self._properties)]
+
+    def _exec_write(self, sql, params):
+        self.written_pack_id = params["pid"]
+        return 1
+
+
+class TestPgDictPropertiesAndTwinDictStrEquivalence:
+    """gates 14/15 (v3 결함 7 / v5 결함 8): PostgreSQL's psycopg2 hands back
+    an already-decoded ``dict`` for a JSONB column, not a JSON string --
+    both the doc row's OWN self-inference (14) and the graph-twin lookup's
+    apply-time ground-truth read (15) must treat that dict identically to
+    the JSON string SQLite always stores."""
+
+    def test_14_pg_style_dict_properties_get_inferred_not_default(self):
+        store = _FakeSingleRowDocStore("concept", "pg-node", {"source_path": "/packs/pack-p/x.md"})
+
+        stats = migrate._backfill_doc_table(
+            store, "doc_nodes", "properties", ("space", "node_id"), "node_id",
+            migrate.DEFAULT_PACK_ID, apply=True,
+        )
+
+        assert stats["by_pack"] == {"pack-p": 1}
+        assert stats["excluded"] == 0
+        assert store.written_pack_id == "pack-p"
+
+    class _FakeGraphTwinStore:
+        def __init__(self, node_id: str, space_id: str, pack_id: str, *, as_dict: bool):
+            import json
+
+            self._node_id = node_id
+            self._space_id = space_id
+            props = {"pack_id": pack_id}
+            self._properties = props if as_dict else json.dumps(props)
+
+        def _table(self, name: str) -> str:
+            return name
+
+        def _fetch_all(self, sql, params):
+            return [(self._node_id, self._space_id, self._properties)]
+
+    def test_15_twin_map_actual_branch_dict_and_str_properties_agree(self):
+        str_store = self._FakeGraphTwinStore("n1", "concept", "pack-a", as_dict=False)
+        dict_store = self._FakeGraphTwinStore("n1", "concept", "pack-a", as_dict=True)
+
+        exact_str, fb_str, amb_str = migrate._graph_twin_pack_map(
+            str_store, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
+        )
+        exact_dict, fb_dict, amb_dict = migrate._graph_twin_pack_map(
+            dict_store, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
+        )
+        assert exact_str == exact_dict == {("concept", "n1"): "pack-a"}
+        assert fb_str == fb_dict == {"n1": "pack-a"}
+        assert amb_str == amb_dict == {}
+
+        for exact, fallback, ambiguous in (
+            (exact_str, fb_str, amb_str),
+            (exact_dict, fb_dict, amb_dict),
+        ):
+            doc_store = _FakeSingleRowDocStore("concept", "n1", {})
+            stats = migrate._backfill_doc_table(
+                doc_store, "doc_nodes", "properties", ("space", "node_id"), "node_id",
+                migrate.DEFAULT_PACK_ID, apply=True,
+                twin_exact=exact, twin_fallback=fallback, twin_ambiguous=ambiguous,
+            )
+            assert stats["by_pack"] == {"pack-a": 1}
+            assert doc_store.written_pack_id == "pack-a"
+
+
+class TestBackfillMongoPathInference:
+    """gate 11: Mongo (docker mode) applies the same existing -> inferred ->
+    assumed priority to its own documents' properties/metadata instead of
+    an unconditional blanket default."""
+
+    class _FakeMongoUpdateResult:
+        def __init__(self, modified_count: int):
+            self.modified_count = modified_count
+
+    class _FakeMongoCollection:
+        def __init__(self, docs: list[dict]):
+            self._docs = {d["_id"]: dict(d) for d in docs}
+
+        def estimated_document_count(self) -> int:
+            return len(self._docs)
+
+        def find(self, query):
+            field_root = next(iter(query["$or"][0])).split(".")[0]
+            results = []
+            for doc in self._docs.values():
+                field = doc.get(field_root) or {}
+                if not field.get("pack_id"):
+                    results.append(dict(doc))
+            return results
+
+        def update_many(self, filt, update):
+            ids = set(filt["_id"]["$in"])
+            set_ops = update["$set"]
+            count = 0
+            for _id, doc in self._docs.items():
+                if _id not in ids:
+                    continue
+                for path, value in set_ops.items():
+                    root, key = path.split(".", 1)
+                    doc.setdefault(root, {})[key] = value
+                count += 1
+            return TestBackfillMongoPathInference._FakeMongoUpdateResult(count)
+
+    class _FakeMongoDb:
+        def __init__(self, nodes: list[dict], sources: list[dict]):
+            self._colls = {
+                "nodes": TestBackfillMongoPathInference._FakeMongoCollection(nodes),
+                "sources": TestBackfillMongoPathInference._FakeMongoCollection(sources),
+            }
+
+        def __getitem__(self, name):
+            return self._colls[name]
+
+    def test_11_mongo_uses_path_inference_not_blanket_default(self):
+        nodes = [
+            {"_id": 1, "node_id": "m1", "properties": {"source_path": "/packs/pack-m/x.md"}},
+            {"_id": 2, "node_id": "m2", "properties": {"note": "nothing to infer"}},
+        ]
+        db = self._FakeMongoDb(nodes, sources=[])
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        assert db._colls["nodes"]._docs[1]["properties"]["pack_id"] == "pack-m"
+        assert db._colls["nodes"]._docs[2]["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
+        assert results["nodes"]["missing"] == 2
+        assert results["nodes"]["updated"] == 2

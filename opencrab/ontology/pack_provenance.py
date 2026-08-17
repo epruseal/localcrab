@@ -141,22 +141,65 @@ def resolve_backfill_dry_run(
     return True, None
 
 
+def _normalize_props(props_raw: Any) -> dict[str, Any] | None:
+    """Normalize a properties/metadata column value to a ``dict``, or
+    ``None`` if it is valid-but-not-an-object (#146 P1(b), PR #177 review
+    round 3 v3 결함 7 / v5 결함 8).
+
+    Accepts either a JSON **string** (what every SQLite-backed column --
+    ``graph_nodes``/``graph_edges``/``doc_nodes``/``doc_sources`` -- always
+    stores) or an **already-parsed ``dict``** (what PostgreSQL's JSONB
+    columns hand back via psycopg2, and what every Mongo document field
+    already is natively). Malformed JSON is treated the same as "empty" --
+    ``{}`` -- matching this module's long-standing tolerance for corrupt
+    rows; only a value that parses/normalizes to something that is not a
+    ``dict`` at all (a bare JSON string, number, or array) returns ``None``.
+
+    Extracted as its own function so ``resolve_row_pack_id`` (below, the
+    ``graph_nodes``/``graph_edges``/doc self-inference path) and
+    ``scripts/migrate_pack_ownership.py``'s ``_graph_twin_pack_map`` (which
+    reads RAW ``_fetch_all`` rows straight off a graph store's own
+    ``properties`` column, bypassing ``resolve_row_pack_id`` entirely for
+    its ``actual=True`` ground-truth branch) share ONE normalization
+    routine -- duplicating this dict-or-string handling in both places
+    would give SQLite vs. PostgreSQL JSONB a chance to silently disagree
+    between the two call sites.
+    """
+    if isinstance(props_raw, dict):
+        return props_raw
+    try:
+        props = json.loads(props_raw) if props_raw else {}
+    except (TypeError, ValueError):
+        props = {}
+    return props if isinstance(props, dict) else None
+
+
 def resolve_row_pack_id(
     props_raw: Any, row: Any, assume_pack_id: str | None
 ) -> tuple[str | None, str]:
-    """Decide the pack_id one ``graph_nodes``/``graph_edges`` row should
-    carry, using the EXACT precedence ``_process`` (below) has always
-    applied. Extracted as a module-level function (#146 M P1-1) so the
-    migration script's dry-run prediction and its post-apply verification
-    call this SAME logic instead of re-deriving it -- a divergence between
-    graph pack_id assignment and vector pack_id assignment becomes
-    structurally impossible.
+    """Decide the pack_id one ``graph_nodes``/``graph_edges``-shaped row
+    should carry, using the EXACT precedence ``_process`` (below) has
+    always applied. Extracted as a module-level function (#146 M P1-1) so
+    the migration script's dry-run prediction and its post-apply
+    verification call this SAME logic instead of re-deriving it -- a
+    divergence between graph pack_id assignment and vector pack_id
+    assignment becomes structurally impossible.
+
+    ``props_raw`` may be a JSON **string** (SQLite storage -- always) OR an
+    already-parsed **dict** (PostgreSQL JSONB via psycopg2, or a Mongo
+    document's field, both handed to this same helper by #146 P1(b)'s doc
+    backfill) -- see ``_normalize_props`` above for the exact contract.
+    Both dry-run prediction and --apply's own writes go through this one
+    normalization, so a divergence between the two modes over a dict vs.
+    string input is structurally impossible.
 
     ``row`` must support ``row.keys()`` and ``row[key]`` (a ``sqlite3.Row``
     from the same ``SELECT <key_cols>, properties FROM <table>`` query
-    ``_process`` runs) -- only its ``*_id``-suffixed columns are consulted,
-    as a last-resort inference source after ``props``'s own
-    source_path/source_id/id keys.
+    ``_process`` runs, or an equivalent mapping-like object -- the doc
+    backfill passes a plain ``{"node_id": ...}``/``{"source_id": ...}``
+    dict, which supports the same ``.keys()``/``[key]`` protocol) -- only
+    its ``*_id``-suffixed columns are consulted, as a last-resort inference
+    source after ``props``'s own source_path/source_id/id keys.
 
     Returns ``(pack_id, reason)``:
       - ``(existing, "existing")`` -- ``props`` already carries a pack_id.
@@ -165,18 +208,15 @@ def resolve_row_pack_id(
         ``_id``.
       - ``(assume_pack_id, "assumed")`` -- nothing inferable; ``assume_pack_id``
         was given.
-      - ``(None, "skipped-non-dict")`` -- ``props_raw`` parsed to a non-dict
-        (malformed JSON is treated as ``{}``, which IS a dict -- this only
-        fires when the column holds valid JSON that isn't an object, e.g. a
-        bare string or array).
+      - ``(None, "skipped-non-dict")`` -- ``props_raw`` normalized to a
+        non-dict (malformed JSON is treated as ``{}``, which IS a dict --
+        this only fires when the column holds valid JSON that isn't an
+        object, e.g. a bare string or array).
       - ``(None, "skipped-unresolvable")`` -- valid dict, no pack_id,
         nothing inferable, and no ``assume_pack_id`` given.
     """
-    try:
-        props = json.loads(props_raw) if props_raw else {}
-    except (TypeError, ValueError):
-        props = {}
-    if not isinstance(props, dict):
+    props = _normalize_props(props_raw)
+    if props is None:
         return None, "skipped-non-dict"
 
     existing = props.get("pack_id")

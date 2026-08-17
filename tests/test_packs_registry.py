@@ -424,6 +424,18 @@ def _base_ctx(sql, **overrides):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
+    # #146 P1(a): identity-ownership probes (pack_create's anchor-node
+    # check) -- see tests/test_tools_handlers_direct.py's _base_ctx for why
+    # these must be explicit ("no conflicting store" is this suite's
+    # original implicit assumption; a bare MagicMock lookup returns a
+    # truthy non-dict, which the probe treats as fail-closed/unverifiable).
+    ctx["neo4j"].get_node.return_value = None
+    ctx["neo4j"].get_node_by_id.return_value = None
+    ctx["neo4j"].get_edge.return_value = None
+    ctx["neo4j"].lookup_node_type.return_value = None
+    ctx["mongo"].get_node_doc.return_value = None
+    ctx["mongo"].get_source.return_value = None
+    ctx["chroma"].get_by_id.return_value = None
     ctx.update(overrides)
     return ctx
 

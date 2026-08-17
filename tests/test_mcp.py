@@ -563,6 +563,13 @@ class TestToolDispatch:
             mongo.available = False
             graph = MagicMock()
             graph.available = True
+            # #146 P1(a): identity-ownership probes -- see _base_ctx's
+            # comment in tests/test_tools_handlers_direct.py for why these
+            # must be explicit ("no conflicting store" is this suite's
+            # original implicit assumption). mongo.available is False above
+            # so its own probe is already skipped; only graph needs it here.
+            graph.get_node.return_value = None
+            graph.get_node_by_id.return_value = None
             mock_ctx.return_value = {
                 "neo4j": graph,
                 "sql": sql,

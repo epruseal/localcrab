@@ -58,6 +58,19 @@ def _base_ctx(**overrides):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
+    # #146 P1(a): a MagicMock lookup returns a truthy MagicMock, not None,
+    # so the identity-ownership probes in _ingest_into_pack/pack_create
+    # would otherwise treat every item as unverifiable (fail-closed) and
+    # reject it. These defaults spell out this suite's original implicit
+    # assumption -- "no conflicting store" -- explicitly; tests that DO
+    # want to exercise a conflict override these return_values themselves.
+    ctx["neo4j"].get_node.return_value = None
+    ctx["neo4j"].get_node_by_id.return_value = None
+    ctx["neo4j"].get_edge.return_value = None
+    ctx["neo4j"].lookup_node_type.return_value = None  # edge probe skip path
+    ctx["mongo"].get_node_doc.return_value = None
+    ctx["mongo"].get_source.return_value = None
+    ctx["chroma"].get_by_id.return_value = None
     ctx.update(overrides)
     return ctx
 
@@ -449,6 +462,7 @@ class TestIngestIntoPack:
         hybrid.ingest.side_effect = RuntimeError("embed failed")
         mongo = MagicMock()
         mongo.available = True
+        mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
             result = _ingest_into_pack(
@@ -466,6 +480,7 @@ class TestIngestIntoPack:
         hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
         mongo = MagicMock()
         mongo.available = True
+        mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
