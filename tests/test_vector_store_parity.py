@@ -590,6 +590,49 @@ class TestChromaUpsertSafety:
         assert by_id["plain1"][0] == "plain 원본"
         assert by_id["plain1"][2] is None
 
+    def test_rollback_restores_records_that_had_no_metadata(self, tmp_path):
+        # 스토어에 이미 있는 레코드는 metadata 가 없을 수 있다 — chroma 는 그걸
+        # None(메타 없이 add) 또는 {}(외부가 쓴 uri 레코드)로 돌려준다. 스냅샷을
+        # 그대로 replay 하면 롤백의 add 가 빈 dict 규칙에 걸려 죽고, 구하려던
+        # 레코드까지 잃는다.
+        store = build_vector_store("chroma", tmp_path)
+        store._collection.add(
+            ids=["nometa"], embeddings=[[0.2] * 32], documents=["메타 없는 문서"],
+        )
+        store._collection.add(
+            ids=["urinometa"], embeddings=[[0.3] * 32], documents=["uri 문서"],
+            uris=["http://example.com/urinometa"],
+        )
+        store.upsert_texts(texts=["보통 문서"], metadatas=[{"k": "1"}], ids=["plain"])
+
+        real_add = store._collection.add
+
+        def fail_forward_only(**kw):
+            if "embeddings" in kw:      # 복구 경로는 통과시킨다
+                return real_add(**kw)
+            raise RuntimeError("전진 add 실패")
+
+        store._collection.add = fail_forward_only
+        with pytest.raises(RuntimeError):
+            store.upsert_texts(
+                texts=["새1", "새2", "새3"],
+                metadatas=[{"k": "n1"}, {"k": "n2"}, {"k": "n3"}],
+                ids=["nometa", "urinometa", "plain"],
+            )
+        store._collection.add = real_add
+
+        assert store.count() == 3, "메타 없는 레코드 때문에 롤백이 실패했다"
+        got = store._collection.get(
+            ids=["nometa", "urinometa", "plain"],
+            include=["documents", "metadatas", "uris"],
+        )
+        by_id = dict(zip(got["ids"], zip(got["documents"], got["metadatas"], got["uris"])))
+        assert by_id["nometa"][0] == "메타 없는 문서"
+        assert not by_id["nometa"][1], f"없던 메타가 생겼다: {by_id['nometa'][1]}"
+        assert by_id["urinometa"][0] == "uri 문서"
+        assert by_id["urinometa"][2] == "http://example.com/urinometa", "uri 가 사라졌다"
+        assert by_id["plain"] == ("보통 문서", {"k": "1"}, None)
+
     def test_same_collection_stores_share_one_lock(self, tmp_path):
         # 인스턴스가 하나뿐이라는 보장이 없으므로(_get_context 는 초기화를 잠그지
         # 않는다) 락은 인스턴스가 아니라 컬렉션 단위여야 한다.

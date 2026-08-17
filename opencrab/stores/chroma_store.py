@@ -362,10 +362,12 @@ class ChromaStore:
                             ids=replace_ids,
                         )
             except Exception:
-                # The delete already ran, so the caller's records are gone
-                # unless we put them back (review round 4). Rolls the WHOLE
-                # batch back, not just the replace ids: a merge that already
-                # succeeded would otherwise leave the batch half-written.
+                # The mutation may be partially applied at this point -- some
+                # ids deleted, some rewritten, some never touched (a uri-only
+                # batch can die inside upsert() before any delete runs) --
+                # which is exactly why the rollback clears the whole batch
+                # before replaying the snapshot, rather than trusting which
+                # step got that far (review round 4).
                 try:
                     _rollback(handle, ids, existing)
                 except Exception as rollback_exc:  # noqa: BLE001
@@ -494,6 +496,14 @@ def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> No
 
     Membership is read off ``snapshot["ids"]`` only. ``snapshot["embeddings"]``
     is a NumPy array, and testing an array for truthiness raises.
+
+    Records already in the store may carry no metadata at all — chroma hands
+    those back as ``None`` (added without a ``metadatas`` argument) or as
+    ``{}`` (an externally written uri record) — and replaying either verbatim
+    would make this very add() fail on chroma's non-empty-dict rule, losing
+    the records the rollback exists to save. Both spellings are normalised to
+    ``None``, chroma's own "no metadata here" value, per record so that a
+    mixed batch still goes back in one call.
     """
     handle.delete(ids=batch_ids)
     if not snapshot["ids"]:
@@ -502,7 +512,7 @@ def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> No
         ids=snapshot["ids"],
         embeddings=snapshot["embeddings"],
         documents=snapshot["documents"],
-        metadatas=snapshot["metadatas"],
+        metadatas=[meta if meta else None for meta in snapshot["metadatas"]],
         uris=snapshot.get("uris"),
     )
 
