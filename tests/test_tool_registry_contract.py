@@ -334,3 +334,24 @@ class TestAccessTierClassification:
 
         for name in GOLDEN_TOOL_NAMES:
             assert isinstance(_REGISTRY[name].access, AccessTier), name
+
+
+def test_every_registered_tool_is_importable_from_the_package():
+    """PR #177 review round 12: `pack_publish` was registered (so MCP dispatch
+    worked, and every dispatch test passed) but never re-exported from
+    `opencrab.mcp.tools`, so `from opencrab.mcp.tools import pack_publish`
+    raised ImportError. Pin the invariant for ALL handlers rather than that one
+    name -- the next new tool would regress the same way, and dispatch tests
+    structurally cannot catch it (importing the module runs the decorator)."""
+    import opencrab.mcp.tools as tools_pkg
+    from opencrab.mcp.tools._registry import _REGISTRY
+
+    missing_attr = sorted(name for name in _REGISTRY if not hasattr(tools_pkg, name))
+    assert missing_attr == [], (
+        f"registered tools not importable from opencrab.mcp.tools: {missing_attr}"
+    )
+
+    missing_all = sorted(name for name in _REGISTRY if name not in tools_pkg.__all__)
+    assert missing_all == [], (
+        f"registered tools missing from opencrab.mcp.tools.__all__: {missing_all}"
+    )

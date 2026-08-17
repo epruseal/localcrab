@@ -258,6 +258,7 @@ from .pack import (  # noqa: E402
     content_pack_list,
     pack_create,
     pack_ingest,
+    pack_publish,
 )
 from .query import ontology_impact, ontology_lever_simulate, ontology_query  # noqa: E402
 from .schema import (  # noqa: E402
@@ -299,6 +300,7 @@ __all__ = [
     "ontology_query",
     "pack_create",
     "pack_ingest",
+    "pack_publish",
     "schema_pack_install",
     "schema_pack_list",
     "schema_pack_uninstall",
