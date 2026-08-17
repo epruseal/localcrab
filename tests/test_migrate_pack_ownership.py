@@ -3335,3 +3335,72 @@ class TestColocatedVectorDbReusesCoreBackup:
         assert "actual.sqlite" not in reported, (
             f"message reconstructed the name from the resolved source: {reported}"
         )
+
+    @pytest.mark.parametrize(
+        ("configured", "expected_rel"),
+        [
+            ("shards/vectors.db", "shards/vectors.db"),  # subdir: parent must be created
+            ("../escape.db", "escape.db"),               # traversal: flattened
+        ],
+    )
+    def test_subpath_vector_db_file_lands_under_the_backup_dir(
+        self, env, tmp_path, monkeypatch, configured, expected_rel
+    ):
+        """PR #177 review round 11: a relative subpath needs its parent created
+        (sqlite3.connect fails otherwise, making the mandatory backup
+        impossible), and a traversal must not escape the backup directory."""
+        import sqlite3
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE=configured
+        )
+        vec_src = env / configured
+        vec_src.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(vec_src))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (5)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / expected_rel
+        assert dst.is_file(), f"expected backup at {dst}; got {backed_up}"
+        assert str(dst) in backed_up
+        # Never escapes the backup directory.
+        assert backup_dir.resolve() in dst.resolve().parents
+        conn = sqlite3.connect(str(dst))
+        try:
+            assert conn.execute("SELECT id FROM t").fetchall() == [(5,)]
+        finally:
+            conn.close()
+
+    def test_absolute_vector_db_file_is_not_written_back_over_the_live_file(
+        self, env, tmp_path, monkeypatch
+    ):
+        """An absolute VECTOR_DB_FILE made `dest_dir / vec_name` discard the
+        backup dir entirely, pointing the 'backup' at the live database."""
+        import sqlite3
+
+        live = tmp_path / "live" / "vectors.db"
+        live.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(live))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (9)")
+        conn.commit()
+        conn.close()
+        before = live.read_bytes()
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE=str(live)
+        )
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / "vectors.db"
+        assert dst.is_file()
+        assert str(dst) in backed_up
+        assert backup_dir.resolve() in dst.resolve().parents
+        # The live file is untouched -- it was the SOURCE, never the target.
+        assert live.read_bytes() == before

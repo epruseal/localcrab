@@ -1667,7 +1667,19 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
         vec_name = settings.vector_db_file
         vec_src = Path(local_data_dir) / vec_name
         if vec_src.is_file():
-            vec_dst = dest_dir / vec_name
+            # VECTOR_DB_FILE may be a relative subpath ("shards/vectors.db") or
+            # even an absolute path -- the factory accepts both (os.path.join
+            # discards the base on an absolute). Neither survives a naive
+            # `dest_dir / vec_name`: pathlib DISCARDS dest_dir for an absolute
+            # name (the "backup" would point back at the live database), and a
+            # subpath needs its parent created or sqlite3.connect raises
+            # OperationalError, making the mandatory backup impossible
+            # (PR #177 review round 11). Normalise to a path that is always
+            # beneath dest_dir, then create that parent.
+            vec_rel = Path(vec_name)
+            if vec_rel.is_absolute() or ".." in vec_rel.parts:
+                vec_rel = Path(vec_rel.name)
+            vec_dst = dest_dir / vec_rel
             existing_dst = copied_backups.get(vec_src.resolve())
             if existing_dst is not None:
                 # Same file, already copied above -- reuse that backup rather
@@ -1689,6 +1701,7 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
                 )
                 raise SystemExit(2)
             else:
+                vec_dst.parent.mkdir(parents=True, exist_ok=True)
                 src_conn = sqlite3.connect(str(vec_src))
                 dst_conn = sqlite3.connect(str(vec_dst))
                 try:
