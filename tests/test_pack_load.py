@@ -2273,9 +2273,20 @@ class TestVecMetaUpdateChromaUriRealBackend:
     def test_vec_meta_update_returns_false_for_real_uri_record(self, tmp_path):
         from _vec_helpers import build_vector_store
         vec = build_vector_store("chroma", tmp_path)
-        self._seed_uri_record(vec, "c1", "본문", {"y": "1"}, "http://example.com/c1")
+        # pack_id 를 심고 같은 값으로 호출한다 — chroma 분기는 uri 검사보다 팩 소유
+        # 검사가 앞서므로(#172), 팩을 일치시켜야 False 의 원인이 URI 분기임이 확정된다.
+        self._seed_uri_record(
+            vec, "c1", "본문", {"pack_id": "pack-1", "y": "1"}, "http://example.com/c1"
+        )
+        # 대조군: uri 만 없는 같은 조건의 레코드는 True 여야 한다.
+        vec.upsert_texts(texts=["본문"], metadatas=[{"pack_id": "pack-1", "y": "1"}], ids=["c2"])
+        assert pack_load._vec_meta_update(
+            vec, "c2", {"pack_id": "pack-1", "y": "99"}, "pack-1"
+        ) is True, "대조군(uri 없음)이 False — False 의 원인이 URI 분기가 아니다"
 
-        ok = pack_load._vec_meta_update(vec, "c1", {"y": "99"})
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"pack_id": "pack-1", "y": "99"}, "pack-1"
+        )
 
         assert ok is False, "실 chroma URI 레코드에서 _vec_meta_update 가 True 를 냈다"
         got = vec._collection.get(ids=["c1"], include=["uris"])
