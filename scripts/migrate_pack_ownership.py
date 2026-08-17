@@ -1694,7 +1694,21 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
             # beneath dest_dir, then create that parent.
             vec_rel = Path(vec_name)
             if vec_rel.is_absolute() or ".." in vec_rel.parts:
-                vec_rel = Path(vec_rel.name)
+                # Flattening to the bare basename is NOT enough: an external
+                # source whose basename happens to be a core filename (e.g.
+                # VECTOR_DB_FILE=/srv/vector/graph.db alongside
+                # LOCAL_DATA_DIR/graph.db) would target the core loop's own
+                # destination. The sources differ, so the reuse lookup below
+                # misses and the existence guard aborts EVERY mandatory
+                # --apply --backup-to run (PR #177 review round 14).
+                #
+                # Park external sources under a reserved SUBDIRECTORY instead
+                # of renaming them: core destinations sit directly in
+                # dest_dir, so a different directory cannot collide with them
+                # within one run, and leaving the basename alone keeps the
+                # name recognisable AND avoids the filename-length ceiling a
+                # prefix would risk on a long basename.
+                vec_rel = Path("external-vector") / vec_rel.name
             vec_dst = dest_dir / vec_rel
             existing_dst = copied_backups.get(vec_src.resolve())
             if existing_dst is not None:

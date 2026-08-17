@@ -3340,7 +3340,8 @@ class TestColocatedVectorDbReusesCoreBackup:
         ("configured", "expected_rel"),
         [
             ("shards/vectors.db", "shards/vectors.db"),  # subdir: parent must be created
-            ("../escape.db", "escape.db"),               # traversal: flattened
+            # traversal: parked under the reserved external-vector/ subdir
+            ("../escape.db", "external-vector/escape.db"),
         ],
     )
     def test_subpath_vector_db_file_lands_under_the_backup_dir(
@@ -3398,9 +3399,105 @@ class TestColocatedVectorDbReusesCoreBackup:
         backup_dir = tmp_path / "backups"
         backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
 
-        dst = backup_dir / "vectors.db"
+        # An absolute source is external, so it lands under the reserved subdir.
+        dst = backup_dir / "external-vector" / "vectors.db"
         assert dst.is_file()
         assert str(dst) in backed_up
         assert backup_dir.resolve() in dst.resolve().parents
         # The live file is untouched -- it was the SOURCE, never the target.
         assert live.read_bytes() == before
+
+    @pytest.mark.parametrize("configured_kind", ["absolute", "traversal"])
+    def test_external_vector_with_core_basename_does_not_abort(
+        self, env, tmp_path, monkeypatch, configured_kind
+    ):
+        """PR #177 review round 14: an EXTERNAL vector source whose basename is
+        a core filename used to target the core loop's own destination. The
+        sources differ, so the reuse lookup missed and the existence guard
+        aborted every mandatory --apply --backup-to run.
+
+        Both copies must survive with their OWN contents -- distinct rows prove
+        they were not conflated.
+        """
+        import sqlite3
+
+        # Core graph.db with its own row.
+        core = env / "graph.db"
+        conn = sqlite3.connect(str(core))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (100)")
+        conn.commit()
+        conn.close()
+
+        # A DIFFERENT file that also happens to be named graph.db. It must live
+        # OUTSIDE LOCAL_DATA_DIR (== tmp_path here) or the "traversal" variant
+        # would not actually traverse.
+        outside = tmp_path.parent / f"ext-{tmp_path.name}"
+        outside.mkdir(exist_ok=True)
+        external = outside / "graph.db"
+        conn = sqlite3.connect(str(external))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (200)")
+        conn.commit()
+        conn.close()
+
+        if configured_kind == "absolute":
+            configured = str(external)
+        else:
+            # A parent-traversing relative path reaching that same external file.
+            import os.path
+
+            configured = os.path.relpath(external, start=env)
+            assert configured.startswith(".."), configured
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE=configured
+        )
+        backup_dir = tmp_path / "backups"
+        # Must NOT raise SystemExit.
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        core_dst = backup_dir / "graph.db"
+        ext_dst = backup_dir / "external-vector" / "graph.db"
+        assert core_dst.is_file(), backed_up
+        assert ext_dst.is_file(), backed_up
+        assert str(core_dst) in backed_up
+        assert str(ext_dst) in backed_up
+        # Neither escapes the backup directory.
+        for d in (core_dst, ext_dst):
+            assert backup_dir.resolve() in d.resolve().parents
+
+        # Contents were NOT conflated.
+        for dst, expected in ((core_dst, 100), (ext_dst, 200)):
+            conn = sqlite3.connect(str(dst))
+            try:
+                assert conn.execute("SELECT id FROM t").fetchall() == [(expected,)]
+            finally:
+                conn.close()
+
+    def test_existing_external_vector_target_with_distinct_source_still_aborts(
+        self, env, tmp_path, monkeypatch
+    ):
+        """The real conflict guard must survive inside the reserved subdir too.
+        The source is deliberately EXTERNAL (not a core file) so the reuse
+        branch cannot mask the guard."""
+        import sqlite3
+
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        external = outside / "vectors.db"
+        conn = sqlite3.connect(str(external))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE=str(external)
+        )
+        backup_dir = tmp_path / "backups"
+        (backup_dir / "external-vector").mkdir(parents=True)
+        (backup_dir / "external-vector" / "vectors.db").write_text("prior", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+        assert exc.value.code == 2
