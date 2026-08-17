@@ -1875,7 +1875,18 @@ class TestBackfillMongoPathInference:
         def estimated_document_count(self) -> int:
             return len(self._docs)
 
-        def find(self, query):
+        def find(self, query=None):
+            # ``query=None`` (#177 review round 6 P1): a FULL-COLLECTION
+            # scan, as issued by ``_mongo_existing_pack_ids`` -- it no
+            # longer filters via ``$exists``/``$ne`` (see that function's
+            # docstring for why: those operators match ARRAY ELEMENTS in
+            # real MongoDB, which silently mis-classified a document like
+            # ``{"pack_id": [""]}``). This double is a records store, not a
+            # query engine, so it does not attempt to interpret every
+            # possible Mongo operator -- it only understands the exact
+            # shapes this script's own functions issue.
+            if query is None:
+                return [dict(doc) for doc in self._docs.values()]
             field_root = next(iter(query["$or"][0])).split(".")[0]
             results = []
             for doc in self._docs.values():
@@ -1889,9 +1900,30 @@ class TestBackfillMongoPathInference:
                 # here crashed on a non-empty list/string with AttributeError
                 # since a list/str has no ``.get``).
                 field = doc.get(field_root, None)
-                if not isinstance(field, dict) or not field.get("pack_id"):
+                if not isinstance(field, dict) or self._pack_id_missing(field):
                     results.append(dict(doc))
             return results
+
+        @staticmethod
+        def _pack_id_missing(field: dict) -> bool:
+            """Whether ``field["pack_id"]`` satisfies missing_q's ``$or``
+            (absent / ``None`` / ``""``) -- INCLUDING real MongoDB's dotted-
+            equality-matches-array-elements quirk (#177 review round 6 P1):
+            ``{"pack_id": [""]}`` or ``{"pack_id": [None]}`` also counts as
+            "missing" here, even though the value itself is a truthy list,
+            because a dotted ``{"field.pack_id": ""}``/``None`` query in
+            real MongoDB matches when ANY array element equals the target.
+            This is exactly what pulls such a document into
+            ``_backfill_mongo``'s ``missing_docs`` despite its pack_id being
+            malformed rather than genuinely missing -- the pre-resolver
+            ``_classify_pack_id`` check inside ``_backfill_mongo`` is what
+            then correctly excludes it instead of fabricating a pack_id."""
+            if "pack_id" not in field:
+                return True
+            value = field["pack_id"]
+            if not value:  # None / "" / [] / 0 / {} -- matches the old falsy rule
+                return True
+            return isinstance(value, list) and (None in value or "" in value)
 
         def update_many(self, filt, update):
             ids = set(filt["_id"]["$in"])
@@ -2268,7 +2300,14 @@ class TestDocDerivedPackIdRegistration:
         backfill (it is NOT "missing" by the SQL definition). A
         present-but-EMPTY-STRING pack_id, by contrast, IS "missing" by that
         same SQL definition -- it must fall through to the ordinary
-        resolver (-> default here), not be excluded as malformed."""
+        resolver (-> default here), not be excluded as malformed.
+
+        PR #177 review round 6 P1: a nonzero malformed count must demote
+        ``registry_enumeration`` to ``skipped`` (rc 3) -- before this round,
+        malformed values were warned about but no stage ever demoted, so
+        this exact scenario used to exit 0 while the malformed row still
+        pointed at no registry entry (see module docstring / round 6 fix
+        design for the full bug)."""
         from opencrab.config import get_settings
         from opencrab.pack.ownership import get_pack
         from opencrab.stores.factory import make_sql_store
@@ -2282,10 +2321,11 @@ class TestDocDerivedPackIdRegistration:
             docs.close()
 
         rc = migrate.main(["--apply", "--skip-backup"])
-        assert rc == 0
+        assert rc == 3
 
         out = capsys.readouterr().out
         assert "malformed" in out
+        assert "registry_enumeration: skipped" in out
 
         sql = make_sql_store(get_settings())
         assert get_pack(sql, "12345") is None
@@ -2454,3 +2494,267 @@ class TestRoundFiveReviewConformance:
 
         sql = make_sql_store(get_settings())
         assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID}
+
+
+# ---------------------------------------------------------------------------
+# PR #177 review round 6 P1: a truthy non-string pack_id (e.g.
+# {"pack_id": 12345}) is malformed -- neither "missing" (SQL's predicate
+# only matches NULL/'') nor safely coercible to a string (PG's JSONB ->>
+# could make it collide with a foreign-owned string pack_id). Before this
+# round no stage ever demoted on a nonzero malformed count, so a run left
+# real content pointing at no registry row and still exited 0. See
+# scripts/migrate_pack_ownership.py's _classify_pack_id and the round 6 fix
+# design doc for the full bug and its Mongo array-matching codex counter-
+# example.
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyPackId:
+    """Table-based unit test for the one shared classifier (regression
+    test 8 of the round 6 fix design)."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (migrate._MISSING, "missing"),
+            (None, "missing"),
+            ("", "missing"),
+            ("pack-a", "valid"),
+            (12345, "malformed"),
+            ([""], "malformed"),
+            ({"a": 1}, "malformed"),
+            (True, "malformed"),
+            (False, "malformed"),
+        ],
+    )
+    def test_classification_table(self, raw, expected):
+        assert migrate._classify_pack_id(raw) == expected
+
+    def test_bool_is_malformed_not_confused_with_int(self):
+        """Explicit regression: ``isinstance(True, int)`` is ``True`` in
+        Python, so a naive numeric-first check would misclassify a bool.
+        ``_classify_pack_id`` must check ``isinstance(raw, str)`` before any
+        numeric-shaped branch so ``True``/``False`` fall through to
+        malformed like any other non-string truthy value."""
+        assert migrate._classify_pack_id(True) == "malformed"
+        assert migrate._classify_pack_id(False) == "malformed"
+
+
+class TestMalformedPackIdDemotesRegistryEnumeration:
+    """Regression tests 1-6 of the round 6 fix design: a truthy non-string
+    pack_id anywhere in doc storage must demote registry_enumeration to
+    skipped (-> rc 3), never silently pass with rc 0."""
+
+    def test_1_doc_nodes_truthy_numeric_pack_id_demotes_to_rc3(
+        self, bootstrapped_owner, env, capsys
+    ):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "malformed-node", {"pack_id": 12345})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+
+        assert rc == 3
+        assert "registry_enumeration: skipped" in out
+        assert "1 document-derived pack_id value(s) were malformed" in out
+
+    def test_2_doc_nodes_row_left_unchanged_by_step_4(self, bootstrapped_owner, env, capsys):
+        """Pins the fix's premise 2: the malformed row is NOT "missing" by
+        the SQL definition, so step 4 must never touch it -- it is not a
+        backfill target, only an operator-visible registration gap."""
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "malformed-node", {"pack_id": 12345})
+        finally:
+            docs.close()
+
+        migrate.main(["--apply", "--skip-backup"])
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "malformed-node")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == 12345  # untouched, still a raw int
+
+    def test_3_doc_sources_metadata_truthy_list_pack_id_demotes_to_rc3(
+        self, bootstrapped_owner, env, capsys
+    ):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_source("malformed-source", "some text", {"pack_id": ["a", "b"]})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+
+        assert rc == 3
+        assert "registry_enumeration: skipped" in out
+        assert "1 document-derived pack_id value(s) were malformed" in out
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_source("malformed-source")
+        finally:
+            docs.close()
+        assert row["metadata"]["pack_id"] == ["a", "b"]  # untouched
+
+    def test_4_no_malformed_values_stays_rc0(self, bootstrapped_owner, env, capsys):
+        """Over-demotion guard: a run with zero malformed values must keep
+        exiting 0, same as before this round."""
+        _seed_graph(env)
+        _seed_doc(env)
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "malformed" not in out
+        assert "registry_enumeration: skipped" not in out
+
+    def test_5_existing_skip_reason_is_preserved_not_overwritten(
+        self, bootstrapped_owner, env, monkeypatch, capsys
+    ):
+        """When registry_enumeration is ALREADY skipped for a more specific
+        reason (graph wrapper unavailable, same setup as
+        test_exit_code_3_when_wrapper_unavailable_but_graph_db_readable),
+        the malformed reason must be appended, never replace it."""
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        class _UnavailableGraph:
+            available = False
+
+        _seed_graph(env)
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "malformed-node", {"pack_id": 12345})
+        finally:
+            docs.close()
+        monkeypatch.setattr(
+            "opencrab.stores.factory.make_graph_store", lambda settings: _UnavailableGraph()
+        )
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+
+        assert rc == 3
+        assert "registry_enumeration: skipped" in out
+        # Original, more specific reason survives...
+        assert "graph unavailable -- pack_id enumeration skipped" in out
+        # ...with the malformed reason appended, not replacing it.
+        assert "1 document-derived pack_id value(s) were malformed" in out
+
+    def test_6_empty_string_pack_id_still_treated_as_missing_not_malformed(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """Existing round 5 contract regression guard: an empty-string
+        pack_id is "missing", backfilled normally to default, and must
+        NEVER be counted toward malformed_excluded."""
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "empty-string-node", {"pack_id": ""})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "malformed" not in out
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "empty-string-node")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
+
+
+class TestMongoMalformedArrayPackIdCodexCounterexample:
+    """Regression test 7 of the round 6 fix design -- the exact codex
+    counterexample from the design-verification loop: MongoDB's dotted
+    equality matches ARRAY ELEMENTS, so a document like
+    ``{"properties": {"pack_id": [""]}}`` used to be invisible to BOTH
+    ``_mongo_existing_pack_ids``'s ``$ne`` filter (excluded because one
+    array element does equal ``""``) and (before this round) any
+    pre-resolver check in ``_backfill_mongo`` -- letting
+    ``resolve_row_pack_id`` stringify the truthy list into a FABRICATED
+    pack_id like ``"['']"``."""
+
+    class _FakeMongoUpdateResult:
+        def __init__(self, modified_count: int):
+            self.modified_count = modified_count
+
+    class _FakeMongoCollection(TestBackfillMongoPathInference._FakeMongoCollection):
+        """Reuses the existing fake's find()/update_many() -- see that
+        class for the query-shape support this double implements."""
+
+    class _FakeMongoDb:
+        def __init__(self, nodes: list[dict], sources: list[dict]):
+            self._colls = {
+                "nodes": TestMongoMalformedArrayPackIdCodexCounterexample._FakeMongoCollection(nodes),
+                "sources": TestMongoMalformedArrayPackIdCodexCounterexample._FakeMongoCollection(sources),
+            }
+
+        def __getitem__(self, name):
+            return self._colls[name]
+
+    def test_a_array_pack_id_counted_as_malformed_by_existing_scan(self):
+        nodes = [{"_id": 1, "node_id": "arr-empty", "properties": {"pack_id": [""]}}]
+        sources = [{"_id": 2, "source_id": "arr-none", "metadata": {"pack_id": [None]}}]
+        db = self._FakeMongoDb(nodes, sources)
+
+        pack_ids, malformed = migrate._mongo_existing_pack_ids(db)
+
+        assert pack_ids == set()
+        assert malformed == 2
+
+    def test_b_update_many_never_called_for_array_pack_id(self):
+        """update_many is only invoked (via the fake's own bookkeeping) for
+        ids present in `by_pack` -- the malformed doc's `_id` must never
+        land there, so `_docs[...]` stays byte-for-byte unchanged."""
+        nodes = [{"_id": 1, "node_id": "arr-empty", "properties": {"pack_id": [""]}}]
+        db = self._FakeMongoDb(nodes, sources=[])
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        # Untouched -- no $set was ever attempted against this document.
+        assert db._colls["nodes"]._docs[1]["properties"]["pack_id"] == [""]
+        assert results["nodes"]["excluded"] == 1
+        assert results["nodes"]["updated"] == 0
+
+    def test_c_no_fabricated_string_key_in_by_pack(self):
+        """Before this round, resolve_row_pack_id's ``str(existing)`` on a
+        truthy list would fabricate a by_pack key like ``"['']"`` -- assert
+        that key structurally cannot appear now that the pre-resolver check
+        excludes the row before the resolver is ever called."""
+        nodes = [{"_id": 1, "node_id": "arr-empty", "properties": {"pack_id": [""]}}]
+        db = self._FakeMongoDb(nodes, sources=[])
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        assert "['']" not in results["nodes"]["by_pack"]
+        assert results["nodes"]["by_pack"] == {}
+
+    def test_d_sources_metadata_array_none_pack_id_also_excluded(self):
+        sources = [{"_id": 1, "source_id": "arr-none", "metadata": {"pack_id": [None]}}]
+        db = self._FakeMongoDb(nodes=[], sources=sources)
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        assert db._colls["sources"]._docs[1]["metadata"]["pack_id"] == [None]
+        assert results["sources"]["excluded"] == 1
+        assert results["sources"]["updated"] == 0
+        assert "[None]" not in results["sources"]["by_pack"]

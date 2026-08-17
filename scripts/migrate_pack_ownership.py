@@ -112,6 +112,43 @@ DEFAULT_PACK_TITLE = "Default pack (pre-#146 legacy data)"
 _MISSING = object()
 
 
+def _classify_pack_id(raw: Any) -> str:
+    """Classify a raw ``pack_id`` value into ``"missing"`` / ``"valid"`` /
+    ``"malformed"`` -- the ONE predicate every pack_id-value-inspecting
+    caller in this script shares (#146 P1(b), PR #177 review round 6 P1),
+    so a value's classification cannot drift between callers the way it did
+    before this function existed: ``_mongo_existing_pack_ids`` counted a
+    truthy non-string pack_id one way (via a ``$ne`` query), step 4's
+    missing predicate (``_missing_and_set_sql``) another way (a SQL ``NULL``
+    / ``''`` check), and neither one agreed with the other about a document
+    like ``{"pack_id": 12345}`` -- it fell through every check uncounted.
+
+    - absent (the ``_MISSING`` sentinel), ``None``, or ``""`` -> ``"missing"``
+      -- a normal backfill target, indistinguishable from "key never
+      existed" for every purpose this migration cares about.
+    - a non-empty ``str`` -> ``"valid"``.
+    - anything else (int, float, list, dict, and -- EXPLICITLY, since
+      ``isinstance(True, int)`` is true in Python -- ``bool``) ->
+      ``"malformed"``: a truthy non-string value this script must neither
+      treat as missing (writing over it would risk clobbering data a human
+      put there on purpose) nor silently coerce to a string (on PostgreSQL,
+      JSONB's ``->>`` operator converts a number to text, so a numeric
+      pack_id could silently collide with an unrelated string pack_id owned
+      by someone else -- see the module's registration gates for why an
+      automatic guess here is never safe).
+
+    ``isinstance(raw, str)`` is checked BEFORE any other branch so a
+    ``bool`` (an ``int`` subtype in Python -- ``isinstance(True, int)`` is
+    ``True``) falls through to ``"malformed"`` rather than being mistaken
+    for a numeric special case that might otherwise seem "falsy-safe".
+    """
+    if raw is _MISSING or raw is None:
+        return "missing"
+    if isinstance(raw, str):
+        return "valid" if raw else "missing"
+    return "malformed"
+
+
 # ---------------------------------------------------------------------------
 # Registry bootstrap
 # ---------------------------------------------------------------------------
@@ -494,6 +531,22 @@ def _is_pg_dialect(store: Any) -> bool:
 
 
 def _missing_and_set_sql(col: str, is_pg: bool) -> tuple[str, str]:
+    """The SQL-backed "missing" predicate (``NULL`` or ``''``) and this
+    module's ``_classify_pack_id`` MUST always agree on exactly the same
+    set of rows: both say a pack_id is ``"missing"`` iff it is absent/NULL
+    or an empty string, and NOTHING else (a truthy non-string value like a
+    JSON number is neither "missing" here nor to ``_classify_pack_id`` --
+    it is "malformed", excluded from both the missing-row backfill below
+    AND the existing-pack_id registration in ``_sql_table_existing_pack_ids``).
+    This is why the SQL-backed backfill path (``_backfill_doc_table``) needs
+    NO extra ``_classify_pack_id`` call of its own -- its missing predicate
+    already IS that classification, expressed in SQL instead of Python. If
+    this predicate and ``_classify_pack_id`` are ever allowed to drift (e.g.
+    treating a JSON ``false``/``0`` as missing here but not there), PR #177
+    review round 6's malformed-pack_id bug reopens on the SQL-backed doc
+    tables (it originally only reproduced via Mongo's array-matching
+    semantics, but nothing about that bug's root cause -- a truthy
+    non-string value slipping past every check -- is Mongo-specific)."""
     if is_pg:
         missing = f"({col}->>'pack_id') IS NULL OR ({col}->>'pack_id') = ''"
         set_expr = f"COALESCE({col}, '{{}}'::jsonb) || jsonb_build_object('pack_id', :pid)"
@@ -1137,6 +1190,23 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
                 excluded += 1
                 continue
             field = raw if raw is not _MISSING else {}
+            # PR #177 review round 6 P1: classify the pack_id VALUE itself
+            # BEFORE ever calling the resolver. missing_q's dotted-equality
+            # $or clauses match ARRAY ELEMENTS (real MongoDB semantics), so
+            # a document like {"properties": {"pack_id": [""]}} lands in
+            # missing_docs even though its pack_id is a truthy list, not a
+            # missing value. Without this check, resolve_row_pack_id's own
+            # ``existing = props.get("pack_id"); if existing: return
+            # str(existing), "existing"`` would stringify that list into a
+            # FABRICATED pack_id like "['']" and write it via update_many
+            # below -- exactly the bug this round closes. Skipping BOTH the
+            # resolver call and update_many for a malformed value keeps this
+            # function's contract identical to the SQL-backed path's, where
+            # _missing_and_set_sql's predicate already excludes such rows
+            # from ever reaching the backfill in the first place.
+            if _classify_pack_id(field.get("pack_id", _MISSING)) == "malformed":
+                excluded += 1
+                continue
             id_value = doc.get(id_field, "")
             pack_id, _reason = resolve_row_pack_id(field, {id_field: id_value}, default_pack_id)
             if pack_id is None:
@@ -1200,7 +1270,11 @@ def _sql_table_existing_pack_ids(store: Any, table_name: str, prop_col: str) -> 
     value that is not a non-empty JSON **string** (a number, list, object,
     bool, or ``null`` some other process wrote) is malformed and excluded,
     counted separately so the caller can warn rather than silently register
-    it as-is or silently drop it.
+    it as-is or silently drop it. Uses ``_classify_pack_id`` (#177 review
+    round 6 P1) rather than a locally re-derived ``isinstance(pid, str) and
+    pid`` check -- the two used to say the same thing by coincidence;
+    keeping the rule in ONE place means it cannot silently diverge from
+    ``_mongo_existing_pack_ids``'s counterpart check again.
     """
     from opencrab.ontology.pack_provenance import _normalize_props
 
@@ -1215,9 +1289,15 @@ def _sql_table_existing_pack_ids(store: Any, table_name: str, prop_col: str) -> 
     for (raw,) in rows:
         props = _normalize_props(raw) or {}
         pid = props.get("pack_id")
-        if isinstance(pid, str) and pid:
+        if _classify_pack_id(pid) == "valid":
             pack_ids.add(pid)
         else:
+            # SQL already filtered to NOT missing_where, so "missing" here
+            # should be structurally unreachable -- if it ever happens
+            # (some future encoding mismatch between the SQL predicate and
+            # Python's json.loads), counting it as malformed (not silently
+            # dropping it) keeps this function's defensive posture the same
+            # as before this change.
             malformed += 1
     return pack_ids, malformed
 
@@ -1227,24 +1307,31 @@ def _mongo_existing_pack_ids(db: Any) -> tuple[set[str], int]:
     every DISTINCT pack_id already present in either collection's own
     field, across BOTH ``nodes``/``properties`` and ``sources``/
     ``metadata`` -- see ``_sql_table_existing_pack_ids`` for the SQL-backed
-    counterpart and why this matters."""
+    counterpart and why this matters.
+
+    FULL-COLLECTION SCAN (#177 review round 6 P1), not the earlier
+    ``$exists``/``$ne`` query -- MongoDB's dotted equality matches ARRAY
+    ELEMENTS, so a document like ``{"properties": {"pack_id": [""]}}``
+    FAILS a ``{"properties.pack_id": {"$ne": ""}}`` filter (one of its
+    array elements DOES equal ``""``) even though the pack_id itself is a
+    truthy list, not an empty string -- the query-based version silently
+    dropped exactly this shape from BOTH the existing-pack_id set AND the
+    malformed count. Reading every document's actual BSON value and
+    classifying it directly via ``_classify_pack_id`` sidesteps Mongo's
+    array-matching semantics entirely -- the classification no longer
+    depends on how a query operator happens to treat a list.
+    """
     pack_ids: set[str] = set()
     malformed = 0
     for collection, field_root in (("nodes", "properties"), ("sources", "metadata")):
         coll = db[collection]
-        existing_q = {
-            "$and": [
-                {f"{field_root}.pack_id": {"$exists": True}},
-                {f"{field_root}.pack_id": {"$ne": None}},
-                {f"{field_root}.pack_id": {"$ne": ""}},
-            ]
-        }
-        for doc in coll.find(existing_q):
+        for doc in coll.find():
             field = doc.get(field_root)
-            pid = field.get("pack_id") if isinstance(field, dict) else None
-            if isinstance(pid, str) and pid:
-                pack_ids.add(pid)
-            else:
+            raw = field.get("pack_id", _MISSING) if isinstance(field, dict) else _MISSING
+            cls = _classify_pack_id(raw)
+            if cls == "valid":
+                pack_ids.add(raw)
+            elif cls == "malformed":
                 malformed += 1
     return pack_ids, malformed
 
@@ -1808,6 +1895,35 @@ def main(argv: list[str] | None = None) -> int:
                     f"(default+graph-derived={graph_registry_pending}, "
                     f"doc-derived={doc_unregistered})",
                 )
+
+        # PR #177 review round 6 P1: a malformed document-derived pack_id
+        # value (present, truthy, but not a non-empty string -- e.g.
+        # {"pack_id": 12345}) is excluded from registration by step 3.5
+        # above (see _register_doc_packs) and is NEVER backfilled by step 4
+        # either (_missing_and_set_sql's predicate only matches NULL/''), so
+        # no stage's own outcome computation would otherwise notice it --
+        # the run would exit 0 while that row still points at no registry
+        # entry, which is exactly the invariant-5 violation this whole
+        # exit-code discipline exists to catch. Demote registry_enumeration
+        # here, AFTER its own outcome is fully computed above, so this
+        # demotion always wins over a later "clean"/"applied" recomputation.
+        malformed_excluded = int(doc_registry_stats.get("malformed_excluded") or 0)
+        if malformed_excluded:
+            malformed_reason = (
+                f"{malformed_excluded} document-derived pack_id value(s) "
+                "were malformed (present but not a non-empty string) and "
+                "excluded from registration -- the row(s) they came from "
+                "still point at no registry entry and were left unchanged "
+                "by step 4 (an operator must resolve them manually; this "
+                "migration never guesses a malformed pack_id's correct "
+                "value)"
+            )
+            if registry_outcome == "skipped":
+                # Don't clobber a more specific existing skip reason (graph
+                # unavailable, edges not enumerable) -- append instead.
+                registry_reason = f"{registry_reason}; also: {malformed_reason}"
+            else:
+                registry_outcome, registry_reason = "skipped", malformed_reason
         stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
 
         print("\n4) Backfilling doc rows with no pack_id...")
