@@ -617,6 +617,20 @@ class TestScopedStorePredicates:
         }
         assert ("a-secret", "shared-doc") in pairs
 
+    def test_count_is_scoped_independently_of_the_returned_page(self, graph, docs, seeded):
+        """`total` is a second query, so it needs its own assertion.
+
+        An unscoped count leaks how much data other users hold even when
+        the rows themselves are correctly withheld -- and the page-level
+        assertions elsewhere in this file cannot see it.
+        """
+        assert graph.count_exported_nodes_scoped([PACK_A]) == 1
+        assert graph.count_exported_nodes_scoped([PACK_A, PACK_PUBLIC]) == 2
+        assert graph.count_exported_nodes_scoped([]) == 0
+        # The store really does hold bob's row; the counts above are the
+        # predicate refusing it, not an empty table.
+        assert graph.count_exported_nodes_scoped([PACK_B]) == 1
+
     def test_unattributed_rows_are_excluded_by_the_scoped_predicate(self, graph, docs, seeded):
         graph.upsert_node("Document", "orphan", {"node_id": "orphan"}, space_id="resource")
         docs.upsert_node_doc("resource", "Document", "orphan", {"node_id": "orphan"})
@@ -807,6 +821,42 @@ class TestPgDocStorePredicateIsPresent:
             "short-token ILIKE fallback"
         )
         assert "if not pack_ids" in src
+
+
+class TestMongoDocStoreScoping:
+    """MongoStore's scoped listing, which no fixture here can reach.
+
+    `docker` mode is the only deployment that uses it and there is no Mongo
+    server in this environment, so the pack filter could be deleted with the
+    whole suite green -- the same shape of gap Kuzu and PostgreSQL had.
+    A collection double is enough: the thing to pin is that the filter
+    reaches the query at all, since `list_nodes_scoped` does not re-filter
+    what the driver returns.
+    """
+
+    def _store(self, rows):
+        from opencrab.stores.mongo_store import MongoStore
+
+        store = MongoStore.__new__(MongoStore)
+        store._available = True
+        cursor = MagicMock()
+        cursor.limit.return_value = rows
+        collection = MagicMock()
+        collection.find.return_value = cursor
+        store._db = {"nodes": collection}
+        return store, collection
+
+    def test_query_carries_the_pack_filter(self):
+        store, collection = self._store([])
+        store.list_nodes_scoped([PACK_A, PACK_PUBLIC], limit=10)
+
+        query = collection.find.call_args[0][0]
+        assert query["properties.pack_id"] == {"$in": [PACK_A, PACK_PUBLIC]}
+
+    def test_empty_scope_never_queries(self):
+        store, collection = self._store([])
+        assert store.list_nodes_scoped([], limit=10) == []
+        collection.find.assert_not_called()
 
 
 class TestNeo4jKeywordCypher:
