@@ -114,14 +114,28 @@ _MISSING = object()
 
 def _classify_pack_id(raw: Any) -> str:
     """Classify a raw ``pack_id`` value into ``"missing"`` / ``"valid"`` /
-    ``"malformed"`` -- the ONE predicate every pack_id-value-inspecting
-    caller in this script shares (#146 P1(b), PR #177 review round 6 P1),
-    so a value's classification cannot drift between callers the way it did
-    before this function existed: ``_mongo_existing_pack_ids`` counted a
-    truthy non-string pack_id one way (via a ``$ne`` query), step 4's
-    missing predicate (``_missing_and_set_sql``) another way (a SQL ``NULL``
-    / ``''`` check), and neither one agreed with the other about a document
-    like ``{"pack_id": 12345}`` -- it fell through every check uncounted.
+    ``"malformed"`` (#146 P1(b), PR #177 review round 6 P1).
+
+    SCOPE -- read this before assuming a call site is covered. Three
+    DOCUMENT-side callers share this predicate: ``_backfill_mongo``,
+    ``_sql_table_existing_pack_ids``, and ``_mongo_existing_pack_ids``.
+    That is what round 6 asked for and no more. NOT converted, deliberately
+    out of scope here: ``_graph_edge_pack_ids`` still does
+    ``if pid: pack_ids.add(str(pid))`` -- it can therefore still coin a
+    graph-side pack_id like ``"12345"`` from a numeric value (tracked as a
+    follow-up; its worst case, colliding with a foreign-owned string slug,
+    is caught by ``_assert_no_foreign_owned``'s default raise), and
+    ``_doc_predicted_pack_ids`` keeps a local ``isinstance(pid, str) and
+    pid``. Do not read this docstring as "every pack_id check in this file
+    now agrees".
+
+    What it does fix: before this function existed,
+    ``_mongo_existing_pack_ids`` judged a truthy non-string pack_id one way
+    (via a ``$ne`` query, which on Mongo matches ARRAY ELEMENTS, so
+    ``{"pack_id": [""]}`` escaped it) while step 4's missing predicate
+    (``_missing_and_set_sql``) judged it another (a SQL ``NULL`` / ``''``
+    check). Neither agreed about a document like ``{"pack_id": 12345}`` --
+    it fell through every check uncounted and the run still exited 0.
 
     - absent (the ``_MISSING`` sentinel), ``None``, or ``""`` -> ``"missing"``
       -- a normal backfill target, indistinguishable from "key never
@@ -1272,9 +1286,10 @@ def _sql_table_existing_pack_ids(store: Any, table_name: str, prop_col: str) -> 
     counted separately so the caller can warn rather than silently register
     it as-is or silently drop it. Uses ``_classify_pack_id`` (#177 review
     round 6 P1) rather than a locally re-derived ``isinstance(pid, str) and
-    pid`` check -- the two used to say the same thing by coincidence;
-    keeping the rule in ONE place means it cannot silently diverge from
-    ``_mongo_existing_pack_ids``'s counterpart check again.
+    pid`` check -- the two said the same thing by coincidence, and sharing
+    the predicate keeps this collector and ``_mongo_existing_pack_ids``/
+    ``_backfill_mongo`` from diverging again. See ``_classify_pack_id``'s
+    SCOPE note for the call sites deliberately NOT converted.
     """
     from opencrab.ontology.pack_provenance import _normalize_props
 
