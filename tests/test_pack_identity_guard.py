@@ -745,3 +745,64 @@ def test_resolvable_edge_endpoints_no_conflict_passes():
     assert result["added_edges"] == 1
     assert result["edge_errors"] == []
     assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# 21-22. The identity guard is a read-then-write pair. It is only race-free
+#     because dispatch_tool holds the cross-process write lock around the
+#     WHOLE handler call, so a concurrent ingest of the same previously-absent
+#     identity cannot observe "no row" twice. That safety rests entirely on
+#     these two facts, neither of which is visible from pack.py itself:
+#       - pack_create/pack_ingest are registered with writes=True
+#       - dispatch_tool wraps writes=True handlers in _write_lock()
+#     Pin both, so dropping the flag (or the lock) fails here instead of
+#     silently making the guard racy. See PR #177 review round 5.
+# ---------------------------------------------------------------------------
+
+
+def test_pack_write_tools_declare_writes_so_dispatch_locks_them():
+    from opencrab.mcp.tools._registry import _REGISTRY
+
+    for name in ("pack_create", "pack_ingest", "pack_publish"):
+        assert _REGISTRY[name].writes is True, (
+            f"{name} must stay writes=True: the cross-pack identity guard is a "
+            "read-then-write pair and relies on dispatch_tool's write lock"
+        )
+
+
+def test_dispatch_tool_holds_the_write_lock_around_pack_ingest():
+    """The lock must be HELD while the handler runs, not merely acquired
+    somewhere -- assert the handler observes it as entered."""
+    from contextlib import contextmanager
+
+    from opencrab.mcp.tools import dispatch_tool
+
+    state = {"depth": 0, "seen_inside": None}
+
+    @contextmanager
+    def _spy_lock():
+        state["depth"] += 1
+        try:
+            yield
+        finally:
+            state["depth"] -= 1
+
+    sql = MagicMock()
+    graph = MagicMock()
+    graph.available = True
+
+    def _record_and_fail(*args, **kwargs):
+        # Runs inside the handler: capture whether the lock is held right now.
+        state["seen_inside"] = state["depth"]
+        raise RuntimeError("stop here -- lock observation is all this test needs")
+
+    with (
+        patch("opencrab.mcp.tools._write_lock", _spy_lock),
+        patch("opencrab.mcp.tools._get_context", return_value=_ctx(graph, sql=sql)),
+        patch("opencrab.pack.ownership.assert_writable", side_effect=_record_and_fail),
+    ):
+        with pytest.raises(RuntimeError):
+            dispatch_tool("pack_ingest", {"pack_id": "p", "nodes": []})
+
+    assert state["seen_inside"] == 1, "handler ran outside the write lock"
+    assert state["depth"] == 0, "write lock was not released"

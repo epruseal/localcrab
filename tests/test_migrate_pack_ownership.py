@@ -923,14 +923,23 @@ class TestDryRunEnumerationSeesPredictedPacks:
         out_dry = capsys.readouterr().out
         assert rc_dry == 0
         assert "3 not yet in the registry" in out_dry
-        assert "registry_enumeration: applied (4 row(s) needed registering)" in out_dry
+        # R5-B (PR #177 review round 5): registry_enumeration's reason now
+        # folds in step 3.5's doc-derived count too (0 here -- no doc
+        # content seeded by this test).
+        assert (
+            "registry_enumeration: applied (4 row(s) needed registering "
+            "(graph-derived=4, doc-derived=0))" in out_dry
+        )
         assert "edge-inferred pack_id" in out_dry  # apply-only-limitation note
 
         rc_apply = migrate.main(["--apply", "--skip-backup"])
         out_apply = capsys.readouterr().out
         assert rc_apply == 0
         assert "3 not yet in the registry" in out_apply
-        assert "registry_enumeration: applied (4 row(s) needed registering)" in out_apply
+        assert (
+            "registry_enumeration: applied (4 row(s) needed registering "
+            "(graph-derived=4, doc-derived=0))" in out_apply
+        )
 
         sql = make_sql_store(get_settings())
         for pid in ("pack-solo", "pack-a", "pack-b", migrate.DEFAULT_PACK_ID):
@@ -1980,3 +1989,336 @@ class TestBackfillMongoPathInference:
         outcome, reason = migrate._docs_stage_outcome(stats)
         assert outcome == "skipped"
         assert "4 row(s) left unattributed" in reason
+
+
+# ---------------------------------------------------------------------------
+# R5-B (PR #177 review round 5 P1): a pack_id that ONLY exists in doc
+# storage (self path-inference, or a value an interrupted prior run already
+# stamped) with NO graph content of its own is invisible to step 3's
+# graph-only enumeration -- main()'s new step 3.5 (``_register_doc_packs``)
+# must register it BEFORE step 4 writes it onto any doc row, or the
+# migration exits 0 having attributed content to an unregistered pack_id.
+# ---------------------------------------------------------------------------
+
+
+class TestDocDerivedPackIdRegistration:
+    def test_1_doc_node_self_path_only_pack_gets_registered(self, bootstrapped_owner, env):
+        """No graph content for "pack-s" at all -- only step 3.5's
+        doc-derived preflight can find and register it."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "solo-doc", {"source_path": "/packs/pack-s/x.md"}
+            )
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        sql = make_sql_store(get_settings())
+        pack = get_pack(sql, "pack-s")
+        assert pack is not None
+        assert pack["owner_id"] == bootstrapped_owner
+
+    def test_2_doc_source_self_path_only_pack_gets_registered(self, bootstrapped_owner, env):
+        """Same as test 1 but inferred from doc_sources' metadata.source_path
+        (the OTHER SQL-backed doc table, no graph twin lookup involved)."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_source("src-t", "some text", {"source_path": "/packs/pack-t/doc.md"})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        sql = make_sql_store(get_settings())
+        pack = get_pack(sql, "pack-t")
+        assert pack is not None
+        assert pack["owner_id"] == bootstrapped_owner
+
+    def test_3_dry_run_preview_finds_candidate_and_writes_nothing(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        seed = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            seed.upsert_node_doc(
+                "concept", "Entity", "solo-doc", {"source_path": "/packs/pack-s/x.md"}
+            )
+        finally:
+            seed.close()
+
+        settings = get_settings()
+        sql = make_sql_store(settings)
+        docs = make_doc_store(settings)
+        graph = make_graph_store(settings)
+        try:
+            preview = migrate._register_doc_packs(
+                sql,
+                docs,
+                graph,
+                bootstrapped_owner,
+                migrate.DEFAULT_PACK_ID,
+                apply=False,
+                accept_foreign_owned_packs=False,
+            )
+        finally:
+            docs.close()
+            graph.close()
+        assert preview["doc_distinct_packs"] == 1
+        assert preview["unregistered"] == 1
+        assert preview["created"] == 0  # dry-run: nothing actually inserted
+        assert get_pack(sql, "pack-s") is None
+
+        doc_path = env / "doc_store.db"
+        before = (doc_path.stat().st_size, doc_path.stat().st_mtime_ns)
+
+        rc = migrate.main([])  # full dry-run
+
+        assert rc == 0
+        after = (doc_path.stat().st_size, doc_path.stat().st_mtime_ns)
+        assert before == after
+        assert get_pack(sql, "pack-s") is None
+
+    def test_4_rerun_self_heals_pack_id_already_stamped_but_unregistered(
+        self, bootstrapped_owner, env
+    ):
+        """Simulates an INTERRUPTED prior run: the doc row already carries
+        pack_id="pack-s" (so a plain missing-row rescan would never see it
+        again), but the registry has no "pack-s" row -- the exact state an
+        old run stopping between step 4 and a (nonexistent, pre-fix) doc
+        registration step would leave behind."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "already-stamped", {"pack_id": "pack-s"})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        sql = make_sql_store(get_settings())
+        pack = get_pack(sql, "pack-s")
+        assert pack is not None
+        assert pack["owner_id"] == bootstrapped_owner
+
+    def test_5_foreign_owned_doc_pack_id_aborts_before_any_doc_write(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """"pack-foreign-doc" has NO graph content anywhere in this test
+        (graph.db is never seeded) -- if this still aborts, it proves step
+        3.5's OWN gate caught it, not step 3's graph-derived one."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack, get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, "pack-foreign-doc", "someone-else-owner", None, None, None)
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "solo-doc", {"source_path": "/packs/pack-foreign-doc/x.md"}
+            )
+        finally:
+            docs.close()
+
+        doc_path = env / "doc_store.db"
+        before_size_mtime = (doc_path.stat().st_size, doc_path.stat().st_mtime_ns)
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            before_row = docs.get_node_doc("concept", "solo-doc")
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 1
+
+        after_size_mtime = (doc_path.stat().st_size, doc_path.stat().st_mtime_ns)
+        assert before_size_mtime == after_size_mtime  # the file itself is untouched
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            after_row = docs.get_node_doc("concept", "solo-doc")
+        finally:
+            docs.close()
+        assert after_row == before_row
+        assert after_row["properties"].get("pack_id") is None  # never backfilled
+
+        foreign = get_pack(sql, "pack-foreign-doc")
+        assert foreign["owner_id"] == "someone-else-owner"  # untouched
+
+        captured = capsys.readouterr()
+        assert "pack-foreign-doc" in captured.err
+        assert "someone-else-owner" in captured.err
+        assert "--accept-foreign-owned-packs" in captured.err
+        assert "registry_enumeration: failed" in captured.out
+
+    def test_5b_accept_foreign_owned_packs_flag_lets_doc_registration_proceed(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import _insert_pack, get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        sql = make_sql_store(get_settings())
+        assert _insert_pack(sql, "pack-foreign-doc-2", "someone-else-owner", None, None, None)
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept",
+                "Entity",
+                "solo-doc-2",
+                {"source_path": "/packs/pack-foreign-doc-2/x.md"},
+            )
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup", "--accept-foreign-owned-packs"])
+        assert rc == 0
+
+        foreign = get_pack(sql, "pack-foreign-doc-2")
+        assert foreign["owner_id"] == "someone-else-owner"  # left alone, not reassigned
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "solo-doc-2")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-foreign-doc-2"  # step 4 still ran
+
+    def test_6_all_default_doc_rows_create_no_extra_registrations(self, bootstrapped_owner, env):
+        """Existing-contract regression: nothing in doc storage resolves to
+        anything but "default" -- step 3.5 must not manufacture spurious
+        registrations."""
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "no-hint-1", {"note": "nothing to infer"})
+            docs.upsert_source("no-hint-src", "some text", {"title": "nothing to infer"})
+        finally:
+            docs.close()
+
+        sql = make_sql_store(get_settings())
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        assert _packs_snapshot(sql) == [(migrate.DEFAULT_PACK_ID, bootstrapped_owner)]
+
+    def test_7_registry_equals_default_union_graph_union_doc(self, bootstrapped_owner, env):
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node(
+                "Dataset", "d1", {"pack_id": "pack-graph-only"}, space_id="resource"
+            )
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "solo-doc", {"source_path": "/packs/pack-doc-only/x.md"}
+            )
+        finally:
+            docs.close()
+
+        sql = make_sql_store(get_settings())
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        registered = {pid for pid, _owner in _packs_snapshot(sql)}
+        assert registered == {migrate.DEFAULT_PACK_ID, "pack-graph-only", "pack-doc-only"}
+
+    def test_8_malformed_existing_pack_id_excluded_empty_string_treated_as_missing(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """A present-but-non-string existing pack_id (a JSON number here) is
+        malformed -- excluded from registration AND left untouched by the
+        backfill (it is NOT "missing" by the SQL definition). A
+        present-but-EMPTY-STRING pack_id, by contrast, IS "missing" by that
+        same SQL definition -- it must fall through to the ordinary
+        resolver (-> default here), not be excluded as malformed."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "bad-type-existing", {"pack_id": 12345})
+            docs.upsert_node_doc("concept", "Entity", "empty-string-existing", {"pack_id": ""})
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 0
+
+        out = capsys.readouterr().out
+        assert "malformed" in out
+
+        sql = make_sql_store(get_settings())
+        assert get_pack(sql, "12345") is None
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            bad_row = docs.get_node_doc("concept", "bad-type-existing")
+            empty_row = docs.get_node_doc("concept", "empty-string-existing")
+        finally:
+            docs.close()
+        assert bad_row["properties"]["pack_id"] == 12345  # untouched, not overwritten
+        assert empty_row["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID  # backfilled normally
+
+    def test_9_step_3_5_failure_overwrites_registry_enumeration_to_failed(
+        self, bootstrapped_owner, env, monkeypatch, capsys
+    ):
+        """Step 3 (graph enumeration) succeeds and records something other
+        than "failed" for registry_enumeration BEFORE step 3.5 runs -- this
+        proves the explicit overwrite (not the outer exception handler's
+        setdefault, which would otherwise preserve step 3's value and hide
+        this failure)."""
+        _seed_graph(env)
+        _seed_doc(env)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("simulated doc-registry failure")
+
+        monkeypatch.setattr(migrate, "_register_doc_packs", _boom)
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        assert rc == 1
+
+        out = capsys.readouterr().out
+        assert "registry_enumeration: failed" in out
+        assert "simulated doc-registry failure" in out
+        # step 3's own outcome text must NOT survive into the summary.
+        assert "registry_enumeration: applied" not in out
+        assert "registry_enumeration: clean" not in out

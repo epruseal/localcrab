@@ -187,6 +187,94 @@ def _graph_edge_pack_ids(graph: Any) -> tuple[set[str], bool]:
     return pack_ids, True
 
 
+def _register_pack_id_candidates(
+    sql: Any,
+    owner_id: str,
+    apply: bool,
+    all_pack_ids: set[str],
+    already_owners: dict[str, str],
+    accept_foreign_owned_packs: bool,
+    *,
+    context: str,
+    meta_by_pack_id: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Foreign-owner gate + ``_insert_pack`` registration loop, extracted
+    out of the original ``_register_graph_packs`` (#146 M / #177 review
+    round 2 "B v2"/"W v3") so it can be shared verbatim by the DOC-derived
+    preflight pass (step 3.5, R5-B, PR #177 review round 5) -- design v2's
+    explicit requirement is "same function, same rules, no new
+    registration path": a pack_id's PROVENANCE (graph vs. document) must
+    not change whether an already-foreign-owned slug aborts the run, nor
+    how a new one gets inserted.
+
+    ``context`` (e.g. ``"graph"`` / ``"document-derived"``) only affects
+    log/error text describing which provenance the caller is reporting
+    about -- the gate and insert logic themselves are provenance-agnostic.
+
+    Foreign-owner overlap guard: a pack_id in ``all_pack_ids`` ALREADY
+    registered to someone other than ``owner_id`` is ambiguous after the
+    fact -- it looks identical whether that row is a legitimate user pack
+    (created after this migration first ran, no conflict) or a slug that
+    got squatted before this migration ever ran (the legacy content now
+    silently belongs to the squatter once this function just skips it as
+    "already registered"). This function cannot tell those two apart, so
+    it does not guess: by default it raises (dry-run AND --apply alike) so
+    an operator decides. ``accept_foreign_owned_packs=True`` is that
+    explicit operator decision -- it downgrades the raise to a printed
+    warning and proceeds exactly as before (the foreign-owned pack_id is
+    left alone, same as any other already-registered pack_id).
+    """
+    from opencrab.pack.ownership import _insert_pack
+
+    foreign_owned = sorted(
+        pid for pid in all_pack_ids if pid in already_owners and already_owners[pid] != owner_id
+    )
+    if foreign_owned:
+        detail = ", ".join(f"{pid!r} (owner={already_owners[pid]!r})" for pid in foreign_owned)
+        if not accept_foreign_owned_packs:
+            raise RuntimeError(
+                f"{len(foreign_owned)} {context} pack_id(s) already exist in "
+                f"{context} content but are registered to a DIFFERENT owner "
+                f"than the bootstrap owner {owner_id!r}: {detail}. This can "
+                "happen if remote pack registration was opened before this "
+                "migration ran (someone else claimed one of these exact "
+                "slugs first) -- or, more benignly, a re-run colliding with "
+                "a genuinely new user pack. This script cannot tell those "
+                "apart automatically -- it needs a human to verify. If "
+                "these rows are confirmed to be legitimate (e.g. a safe "
+                "re-run, or the owner is expected to hold this legacy "
+                "content), re-run with --accept-foreign-owned-packs to skip "
+                "them and proceed with everything else unchanged."
+            )
+        print(
+            f"  ! --accept-foreign-owned-packs: skipping {len(foreign_owned)} "
+            f"{context} pack_id(s) already registered to a different owner: {detail}"
+        )
+
+    candidates = sorted(pid for pid in all_pack_ids if pid not in already_owners)
+    created = 0
+    if apply:
+        for pid in candidates:
+            meta = (meta_by_pack_id or {}).get(pid)
+            if _insert_pack(
+                sql,
+                pid,
+                owner_id,
+                (meta.get("sample_title") or None) if meta else None,
+                (meta.get("sample_description") or None) if meta else None,
+                None,
+            ):
+                created += 1
+        if created != len(candidates):
+            raise RuntimeError(
+                f"expected to register {len(candidates)} {context} pack_ids, "
+                f"actually registered {created} -- a concurrent writer may "
+                "have raced this script; re-run to confirm before trusting "
+                "the registry."
+            )
+    return {"candidates": candidates, "foreign_owned": foreign_owned, "created": created}
+
+
 def _register_graph_packs(
     sql: Any,
     graph: Any,
@@ -248,8 +336,6 @@ def _register_graph_packs(
     as before (the foreign-owned pack_id is left alone, same as any other
     already-registered pack_id).
     """
-    from opencrab.pack.ownership import _insert_pack
-
     if not getattr(graph, "available", False):
         print("  graph store unavailable -- skipping pack-id enumeration")
         return {
@@ -269,39 +355,11 @@ def _register_graph_packs(
         predicted_pack_ids.update(pids)
     all_pack_ids = set(node_meta) | edge_pack_ids | predicted_pack_ids
 
-    foreign_owned = sorted(
-        pid
-        for pid in all_pack_ids
-        if pid in already_owners and already_owners[pid] != owner_id
-    )
-    if foreign_owned:
-        detail = ", ".join(f"{pid!r} (owner={already_owners[pid]!r})" for pid in foreign_owned)
-        if not accept_foreign_owned_packs:
-            raise RuntimeError(
-                f"{len(foreign_owned)} graph pack_id(s) already exist in the "
-                f"graph store's content but are registered to a DIFFERENT "
-                f"owner than the bootstrap owner {owner_id!r}: {detail}. "
-                "This can happen if remote pack registration was opened "
-                "before this migration ran (someone else claimed one of "
-                "these exact slugs first) -- or, more benignly, a re-run "
-                "colliding with a genuinely new user pack. This script "
-                "cannot tell those apart automatically -- it needs a human "
-                "to verify. If these rows are confirmed to be legitimate "
-                "(e.g. a safe re-run, or the owner is expected to hold this "
-                "legacy content), re-run with --accept-foreign-owned-packs "
-                "to skip them and proceed with everything else unchanged."
-            )
-        print(
-            f"  ! --accept-foreign-owned-packs: skipping {len(foreign_owned)} "
-            f"graph pack_id(s) already registered to a different owner: {detail}"
-        )
-
-    candidates = sorted(pid for pid in all_pack_ids if pid not in already_owners)
     print(
         f"  graph distinct pack_id: {len(all_pack_ids)} total "
         f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}, "
         f"predicted={len(predicted_pack_ids)}), "
-        f"{len(candidates)} not yet in the registry"
+        f"{sum(1 for pid in all_pack_ids if pid not in already_owners)} not yet in the registry"
     )
     if not apply:
         print(
@@ -310,32 +368,22 @@ def _register_graph_packs(
             "LIMITATION) is not visible to this dry-run report; it is only "
             "registered once a real --apply backfill has run."
         )
-    created = 0
-    if apply:
-        for pid in candidates:
-            meta = node_meta.get(pid)
-            if _insert_pack(
-                sql,
-                pid,
-                owner_id,
-                (meta.get("sample_title") or None) if meta else None,
-                (meta.get("sample_description") or None) if meta else None,
-                None,
-            ):
-                created += 1
-        if created != len(candidates):
-            raise RuntimeError(
-                f"expected to register {len(candidates)} graph pack_ids, "
-                f"actually registered {created} -- a concurrent writer may "
-                "have raced this script; re-run to confirm before trusting "
-                "the registry."
-            )
+    result = _register_pack_id_candidates(
+        sql,
+        owner_id,
+        apply,
+        all_pack_ids,
+        already_owners,
+        accept_foreign_owned_packs,
+        context="graph",
+        meta_by_pack_id=node_meta,
+    )
     return {
         "graph_distinct_packs": len(all_pack_ids),
-        "unregistered": len(candidates),
-        "created": created,
+        "unregistered": len(result["candidates"]),
+        "created": result["created"],
         "edges_enumerable": edges_enumerable,
-        "foreign_owned": foreign_owned,
+        "foreign_owned": result["foreign_owned"],
     }
 
 
@@ -1074,8 +1122,220 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
             "missing": missing,
             "updated": updated,
             "excluded": excluded,
+            # R5-B (PR #177 review round 5): same shape
+            # _backfill_doc_table's SQL-backed sub-dicts already carry --
+            # ``_register_doc_packs``'s step-3.5 preflight (main()) reads
+            # this to preview which pack_ids a dry-run of this function
+            # would assign, BEFORE step 4 writes anything for real.
+            "by_pack": {pid: len(ids) for pid, ids in by_pack.items()},
         }
     return results
+
+
+# ---------------------------------------------------------------------------
+# R5-B (PR #177 review round 5 P1): document-derived pack_id registration
+# preflight (main()'s step 3.5) -- registers a pack_id that ONLY exists in
+# doc storage (no graph content of its own, so step 3's graph-only
+# enumeration never sees it) BEFORE step 4 writes it onto any doc row. See
+# module docstring / fix design R5-B for the bug this closes.
+# ---------------------------------------------------------------------------
+
+
+def _sql_table_existing_pack_ids(store: Any, table_name: str, prop_col: str) -> tuple[set[str], int]:
+    """(a) of ``_register_doc_packs``'s collection, ONE SQL-backed doc
+    table: every DISTINCT pack_id already present (non-missing) in
+    ``prop_col`` right now -- NOT the resolver's predicted assignment for a
+    still-missing row (that is (b), see ``_doc_predicted_pack_ids``).
+
+    This is what gives a resumed re-run self-healing: an interrupted prior
+    ``--apply`` run may have already stamped a pack_id on some rows without
+    this migration ever having registered it (a plain re-scan of MISSING
+    rows would never see those rows again -- they are not missing).
+
+    Returns ``(valid_pack_ids, malformed_count)`` -- a present pack_id
+    value that is not a non-empty JSON **string** (a number, list, object,
+    bool, or ``null`` some other process wrote) is malformed and excluded,
+    counted separately so the caller can warn rather than silently register
+    it as-is or silently drop it.
+    """
+    from opencrab.ontology.pack_provenance import _normalize_props
+
+    is_pg = _is_pg_dialect(store)
+    missing_where, _ = _missing_and_set_sql(prop_col, is_pg)
+    table = store._table(table_name)
+    rows = store._fetch_all(
+        f"SELECT {prop_col} FROM {table} WHERE NOT ({missing_where})", {}  # noqa: S608
+    )
+    pack_ids: set[str] = set()
+    malformed = 0
+    for (raw,) in rows:
+        props = _normalize_props(raw) or {}
+        pid = props.get("pack_id")
+        if isinstance(pid, str) and pid:
+            pack_ids.add(pid)
+        else:
+            malformed += 1
+    return pack_ids, malformed
+
+
+def _mongo_existing_pack_ids(db: Any) -> tuple[set[str], int]:
+    """(a) of ``_register_doc_packs``'s collection, Mongo (docker mode):
+    every DISTINCT pack_id already present in either collection's own
+    field, across BOTH ``nodes``/``properties`` and ``sources``/
+    ``metadata`` -- see ``_sql_table_existing_pack_ids`` for the SQL-backed
+    counterpart and why this matters."""
+    pack_ids: set[str] = set()
+    malformed = 0
+    for collection, field_root in (("nodes", "properties"), ("sources", "metadata")):
+        coll = db[collection]
+        existing_q = {
+            "$and": [
+                {f"{field_root}.pack_id": {"$exists": True}},
+                {f"{field_root}.pack_id": {"$ne": None}},
+                {f"{field_root}.pack_id": {"$ne": ""}},
+            ]
+        }
+        for doc in coll.find(existing_q):
+            field = doc.get(field_root)
+            pid = field.get("pack_id") if isinstance(field, dict) else None
+            if isinstance(pid, str) and pid:
+                pack_ids.add(pid)
+            else:
+                malformed += 1
+    return pack_ids, malformed
+
+
+def _doc_existing_pack_ids(docs: Any) -> tuple[set[str], int]:
+    """(a) of ``_register_doc_packs``'s collection, dispatched across
+    whichever doc backend ``docs`` is (SQL-backed local/pg, Mongo, or
+    unavailable/unknown -- same dispatch ``_backfill_doc`` itself uses)."""
+    if not getattr(docs, "available", True):
+        return set(), 0
+    if hasattr(docs, "_dialect"):
+        pack_ids: set[str] = set()
+        malformed = 0
+        for table_name, prop_col in (("doc_nodes", "properties"), ("doc_sources", "metadata")):
+            pids, mal = _sql_table_existing_pack_ids(docs, table_name, prop_col)
+            pack_ids |= pids
+            malformed += mal
+        return pack_ids, malformed
+    if hasattr(docs, "_db"):
+        return _mongo_existing_pack_ids(docs._db)
+    return set(), 0
+
+
+def _doc_predicted_pack_ids(stats: dict[str, Any]) -> tuple[set[str], int]:
+    """(b) of ``_register_doc_packs``'s collection: every pack_id key of a
+    ``_backfill_doc(..., apply=False)`` preview's ``by_pack`` sub-dicts.
+    Works uniformly for the SQL-backed ``{"doc_nodes": {...}, "doc_sources":
+    {...}}`` shape and the Mongo ``{"nodes": {...}, "sources": {...}}``
+    shape -- both now carry ``by_pack`` (see ``_backfill_doc_table`` and
+    ``_backfill_mongo``). ``{"skipped": True}`` (doc store unavailable, or
+    neither SQL- nor Mongo-backed) contributes nothing.
+
+    A key here being malformed should be structurally impossible --
+    everything that populates a ``by_pack`` dict already stores a resolved
+    non-empty ``str`` (a graph-twin value, a self-inferred value, or the
+    ``default_pack_id`` constant) -- this check is a defensive second net
+    matching this function's ``(a)`` counterpart, not an expected path.
+    """
+    if stats.get("skipped"):
+        return set(), 0
+    pack_ids: set[str] = set()
+    malformed = 0
+    for sub in stats.values():
+        if not isinstance(sub, dict):
+            continue
+        for pid in sub.get("by_pack", {}):
+            if isinstance(pid, str) and pid:
+                pack_ids.add(pid)
+            else:
+                malformed += 1
+    return pack_ids, malformed
+
+
+def _register_doc_packs(
+    sql: Any,
+    docs: Any,
+    graph: Any,
+    owner_id: str,
+    default_pack_id: str,
+    apply: bool,
+    accept_foreign_owned_packs: bool,
+) -> dict[str, Any]:
+    """R5-B (PR #177 review round 5 P1) preflight: register every
+    DOCUMENT-derived pack_id BEFORE step 4 (main()) writes a single doc
+    row.
+
+    THE BUG THIS CLOSES: without this step, a ``doc_nodes``/``doc_sources``
+    row that step 4's OWN self path-inference (or a value already stamped
+    by an interrupted prior run) resolves to a pack_id with NO graph
+    content of its own is invisible to step 3's graph-only enumeration
+    (``_register_graph_packs`` only ever looks at ``graph_nodes``/
+    ``graph_edges``/predicted graph twins). The migration would then exit 0
+    having attributed real doc content to a pack_id the registry never
+    heard of -- #147's registry-based read authorization can then never
+    expose that content. This is a bug THIS PR introduced: before doc
+    self-path-inference existed, a doc row missing pack_id always fell
+    through to ``default_pack_id``, which step 1 always registers.
+
+    READ-ONLY against doc storage: the only write this function performs
+    is to the ``packs`` registry (via ``_register_pack_id_candidates``,
+    the SAME gate+insert function step 3 uses -- no second registration
+    code path). Nothing is written to ``doc_nodes``/``doc_sources``/Mongo
+    here, so an abort from the foreign-owner gate below leaves every doc
+    row provably untouched -- that is WHY this runs before step 4, not
+    after.
+
+    Collection = union of:
+      (a) ``_doc_existing_pack_ids``: every DISTINCT pack_id already
+          present (non-missing) in doc storage today -- gives a resumed
+          re-run self-healing (see that function's docstring).
+      (b) ``_doc_predicted_pack_ids`` of a forced ``_backfill_doc(...,
+          apply=False)`` preview -- the SAME resolver step 4 will use for
+          real, so this prediction and step 4's actual assignment cannot
+          structurally diverge (same discipline as ``_predict_node_pack_map``
+          / ``_read_actual_node_pack_ids`` already apply on the graph/vector
+          side).
+
+    Malformed pack_id values (not a non-empty string) found in either half
+    are excluded from registration and reported via ``malformed_excluded``
+    -- never registered as-is, never silently dropped without a trace.
+    """
+    doc_ids, existing_malformed = _doc_existing_pack_ids(docs)
+    preview = _backfill_doc(docs, graph, default_pack_id, apply=False)
+    predicted_ids, predicted_malformed = _doc_predicted_pack_ids(preview)
+    malformed = existing_malformed + predicted_malformed
+    all_pack_ids = doc_ids | predicted_ids
+
+    if malformed:
+        print(
+            f"  ! {malformed} document-derived pack_id value(s) were "
+            "malformed (present but not a non-empty string) -- excluded "
+            "from registration, see _register_doc_packs' docstring."
+        )
+    already_owners = _registered_pack_owners(sql)
+    print(
+        f"  doc-derived distinct pack_id: {len(all_pack_ids)} total "
+        f"(already-present={len(doc_ids)}, predicted={len(predicted_ids)}), "
+        f"{sum(1 for pid in all_pack_ids if pid not in already_owners)} not yet in the registry"
+    )
+    result = _register_pack_id_candidates(
+        sql,
+        owner_id,
+        apply,
+        all_pack_ids,
+        already_owners,
+        accept_foreign_owned_packs,
+        context="document-derived",
+    )
+    return {
+        "doc_distinct_packs": len(all_pack_ids),
+        "unregistered": len(result["candidates"]),
+        "created": result["created"],
+        "foreign_owned": result["foreign_owned"],
+        "malformed_excluded": malformed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1678,58 @@ def main(argv: list[str] | None = None) -> int:
             registry_outcome, registry_reason = "clean", "nothing to do"
         else:
             registry_outcome, registry_reason = "applied", f"{registry_pending} row(s) needed registering"
+
+        # 3.5) R5-B (PR #177 review round 5 P1): register every DOC-derived
+        # pack_id too -- BEFORE step 4 writes a single doc row -- so a
+        # pack_id step 4's OWN self-path-inference (or graph-twin lookup, or
+        # a value an interrupted prior run already stamped) would assign,
+        # but that has NO graph content of its own (invisible to step 3's
+        # graph-only enumeration above), still gets a registry row before
+        # any content is attributed to it. See _register_doc_packs'
+        # docstring. Folded into "registry_enumeration" rather than a new
+        # stage (module docstring SAFETY documents exactly four stages) --
+        # this is the SAME responsibility ("has every real pack_id reached
+        # the registry") executed in two passes over two provenances.
+        print("\n3.5) Registering document-derived pack_ids (preflight before doc backfill writes)...")
+        try:
+            doc_registry_stats = _register_doc_packs(
+                sql,
+                docs,
+                graph,
+                owner_id,
+                default_pack_id,
+                args.apply,
+                args.accept_foreign_owned_packs,
+            )
+        except Exception as exc:
+            # The outer `except Exception as exc:` below uses setdefault,
+            # which would otherwise PRESERVE whatever step 3 just recorded
+            # above (e.g. "clean"/"applied") and hide this failure entirely.
+            # Must overwrite explicitly (design v2 R5-B point 5).
+            stage_outcomes["registry_enumeration"] = {
+                "outcome": "failed",
+                "reason": f"document-derived pack_id registration (step 3.5) failed: {exc}",
+            }
+            raise
+
+        doc_unregistered = int(doc_registry_stats.get("unregistered") or 0)
+        if registry_outcome == "skipped":
+            # A graph-side scope gap (unavailable graph/edges) is unrelated
+            # to doc-derived registration progress -- stays authoritative
+            # regardless of what step 3.5 just did.
+            pass
+        else:
+            graph_registry_pending = registry_pending
+            registry_pending += doc_unregistered
+            if registry_pending == 0:
+                registry_outcome, registry_reason = "clean", "nothing to do"
+            else:
+                registry_outcome, registry_reason = (
+                    "applied",
+                    f"{registry_pending} row(s) needed registering "
+                    f"(graph-derived={graph_registry_pending}, "
+                    f"doc-derived={doc_unregistered})",
+                )
         stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
 
         print("\n4) Backfilling doc rows with no pack_id...")

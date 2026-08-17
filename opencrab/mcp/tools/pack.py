@@ -86,6 +86,19 @@ _NINE_SPACE_HINT: str = _nine_space_hint()
 # (#143 invariant 7): the only bit that leaks is "this identity is not your
 # destination pack's", the same class of leak `pack_create`'s slug-suffix
 # collision handling already accepts (see design doc "노출 표면" section).
+#
+# RACE-FREEDOM DEPENDS ON THE DISPATCH WRITE LOCK. This is a read-then-write
+# pair, so two callers ingesting the same previously-absent identity into
+# different packs must not both observe "no row". They cannot: dispatch_tool
+# runs every `writes=True` handler inside `_write_lock()` (an exclusive flock
+# on <data_dir>/write.lock), so the probe and the builder call sit in one
+# critical section and the second caller sees the first caller's row. Both
+# halves of that -- the writes=True flag and the lock actually being held
+# around the handler -- are pinned by tests in tests/test_pack_identity_guard.py
+# (PR #177 review round 5); do not drop either without replacing this with a
+# conditional/CAS upsert. Residual, unchanged by this guard and shared with
+# every other check-then-write here: a file lock does not span hosts, so a
+# multi-host deployment against one remote DB is still racy.
 # ---------------------------------------------------------------------------
 
 _Probe = tuple[Any, str, tuple[Any, ...], tuple[str, ...]]
