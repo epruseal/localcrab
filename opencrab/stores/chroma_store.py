@@ -228,15 +228,15 @@ class ChromaStore:
 
         What that lock does NOT cover, stated so callers do not over-trust it:
 
-        - Other processes. This class enforces nothing across them; writes are
-          serialised only where the *caller* holds ``opencrab/locking.py``'s
-          ``write.lock``. Every vector-writing entry point in this repository
-          does so — MCP write tools (around the whole handler), the CLI, the
-          ingest and migration scripts under ``scripts/``, and the REST app's
-          write endpoints — but that is caller discipline, not an invariant
-          this class enforces: a direct ChromaStore user outside those paths
-          holds nothing, and ``chroma.lock`` is no substitute (it is a SHARED
-          lock and MCP-only, issue #140).
+        - Other processes. This class enforces nothing across them: writes are
+          serialised only where the *caller* itself holds
+          ``opencrab/locking.py``'s ``write.lock``, and nothing here can check
+          that it did. Most write paths (MCP tools, the CLI, the REST app's
+          write endpoints) do take it, but treat that as caller discipline to
+          verify at the call site rather than a property of this store — an
+          enumeration here goes stale the moment a new writer lands, and one
+          already has. ``chroma.lock`` is no substitute either: it is a SHARED
+          lock and MCP-only (issue #140).
         - The collection handle. Only the lock is shared between instances;
           each keeps its own handle, so a ``reset_collection()`` on one
           instance leaves another's handle pointing at the deleted collection
