@@ -3280,20 +3280,16 @@ class TestColocatedVectorDbReusesCoreBackup:
         assert (backup_dir / "graph.db").is_file()
         assert backed_up.count(str(backup_dir / "graph.db")) == 1
 
-        # The message must point at a file that EXISTS.
+        # The message must name the destination that actually holds the bytes.
+        # Parse it out exactly -- an earlier version filtered tokens by
+        # extension BEFORE stripping the trailing comma, so the wrong path
+        # ("...,") was silently dropped and the assertion passed even against
+        # the buggy implementation (PR #177 review round 10).
         out = capsys.readouterr().out
-        assert "already backed up as" in out
-        named = [
-            tok
-            for line in out.splitlines()
-            if "already backed up as" in line
-            for tok in line.split()
-            if tok.endswith(".db")
-        ]
-        assert named, out
-        assert any(Path(tok.rstrip(",")).is_file() for tok in named), (
-            f"skip message names a path that does not exist: {named}"
-        )
+        skip_line = next(ln for ln in out.splitlines() if "already backed up as" in ln)
+        reported = skip_line.split("already backed up as", 1)[1].split(",")[0].strip()
+        assert reported == str(backup_dir / "graph.db"), skip_line
+        assert Path(reported).is_file(), f"reported path does not exist: {reported}"
 
     def test_symlinked_core_source_reports_the_destination_actually_written(
         self, env, tmp_path, monkeypatch, capsys

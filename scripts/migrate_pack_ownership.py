@@ -1627,19 +1627,21 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
     dest_dir = Path(backup_to)
     dest_dir.mkdir(parents=True, exist_ok=True)
     backed_up = []
-    # Canonical paths of the sources the core loop actually copied. The vector
-    # branch below consults this instead of only checking whether its
-    # destination exists: VECTOR_DB_FILE may legitimately name one of these
+    # {resolved source path: the destination the core loop ACTUALLY wrote}.
+    #
+    # The vector branch below consults this instead of only checking whether
+    # its destination exists: VECTOR_DB_FILE may legitimately name one of the
     # core files (a co-located SQLite layout -- neither the config layer nor
-    # the store factory rejects it), in which case the "destination already
-    # exists" state means "the very same source is already backed up", not a
+    # the store factory rejects it), in which case "destination already
+    # exists" means "the very same source is already backed up", not a
     # conflict. Treating it as a conflict made `--apply --backup-to` fail
     # unconditionally on that layout (PR #177 review round 9).
-    # resolved source path -> the destination the core loop ACTUALLY wrote.
-    # Recording the real destination (rather than reconstructing a name from
-    # the source later) is what keeps the reuse message correct when a core
-    # source is itself a symlink: the core loop names its copy after the CORE
-    # filename, so `graph.db -> actual.sqlite` still lands in backup/graph.db
+    #
+    # It maps to the real destination rather than just recording which sources
+    # were copied, because the reuse message must name a path that EXISTS:
+    # the core loop names its copy after the CORE filename, so with
+    # `graph.db -> actual.sqlite` the bytes land in backup/graph.db and any
+    # name rebuilt from the resolved source would point nowhere
     # (PR #177 review round 10).
     copied_backups: dict[Path, Path] = {}
     for name in ("opencrab.db", "graph.db", "doc_store.db"):
