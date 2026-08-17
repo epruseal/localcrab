@@ -3294,3 +3294,49 @@ class TestColocatedVectorDbReusesCoreBackup:
         assert any(Path(tok.rstrip(",")).is_file() for tok in named), (
             f"skip message names a path that does not exist: {named}"
         )
+
+    def test_symlinked_core_source_reports_the_destination_actually_written(
+        self, env, tmp_path, monkeypatch, capsys
+    ):
+        """PR #177 review round 10: when the CORE source is itself a symlink
+        (graph.db -> actual.sqlite) the core loop still writes backup/graph.db,
+        because it names the copy after the core filename. Reconstructing the
+        name from the resolved source produced backup/actual.sqlite -- a path
+        that was never created. The reported path must come from what the core
+        loop recorded."""
+        import sqlite3
+
+        real = env / "actual.sqlite"
+        conn = sqlite3.connect(str(real))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (11)")
+        conn.commit()
+        conn.close()
+        (env / "graph.db").symlink_to(real)
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE="graph.db"
+        )
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        # The core loop names its copy after the CORE filename.
+        assert (backup_dir / "graph.db").is_file()
+        assert not (backup_dir / "actual.sqlite").exists()
+        assert backed_up.count(str(backup_dir / "graph.db")) == 1
+
+        out = capsys.readouterr().out
+        named = [
+            tok.rstrip(",")
+            for line in out.splitlines()
+            if "already backed up as" in line
+            for tok in line.split()
+            if tok.endswith((".db", ".sqlite"))
+        ]
+        assert named, out
+        assert any(Path(tok).is_file() for tok in named), (
+            f"skip message names a path that does not exist: {named}"
+        )
+        assert not any(tok.endswith("actual.sqlite") for tok in named), (
+            f"message reconstructed the name from the resolved source: {named}"
+        )

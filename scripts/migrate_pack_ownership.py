@@ -1635,7 +1635,13 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
     # exists" state means "the very same source is already backed up", not a
     # conflict. Treating it as a conflict made `--apply --backup-to` fail
     # unconditionally on that layout (PR #177 review round 9).
-    copied_sources: set[Path] = set()
+    # resolved source path -> the destination the core loop ACTUALLY wrote.
+    # Recording the real destination (rather than reconstructing a name from
+    # the source later) is what keeps the reuse message correct when a core
+    # source is itself a symlink: the core loop names its copy after the CORE
+    # filename, so `graph.db -> actual.sqlite` still lands in backup/graph.db
+    # (PR #177 review round 10).
+    copied_backups: dict[Path, Path] = {}
     for name in ("opencrab.db", "graph.db", "doc_store.db"):
         src = Path(local_data_dir) / name
         if not src.is_file():
@@ -1653,25 +1659,23 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
             src_conn.close()
         print(f"  backed up {src} -> {dst}")
         backed_up.append(str(dst))
-        copied_sources.add(src.resolve())
+        copied_backups[src.resolve()] = dst
 
     if settings.vector_backend_resolved == "sqlite-vec":
         vec_name = settings.vector_db_file
         vec_src = Path(local_data_dir) / vec_name
         if vec_src.is_file():
             vec_dst = dest_dir / vec_name
-            if vec_src.resolve() in copied_sources:
+            existing_dst = copied_backups.get(vec_src.resolve())
+            if existing_dst is not None:
                 # Same file, already copied above -- reuse that backup rather
                 # than reporting an overwrite conflict. resolve() (not a string
                 # compare) so "./graph.db", an absolute path, or a symlink
-                # alias all match the canonical core path.
-                #
-                # Name the destination that actually HOLDS THE BYTES, which is
-                # keyed by the resolved core filename -- for a symlink alias
-                # (vectors.db -> graph.db) `vec_dst` would name a file that was
-                # never created, sending whoever restores this backup to a
-                # missing path (PR #177 review round 9 follow-up).
-                existing_dst = dest_dir / vec_src.resolve().name
+                # alias all match the canonical core path. The reported path is
+                # the destination the core loop RECORDED, never one rebuilt
+                # from the source name -- either end of the pair can be a
+                # symlink, and both spellings would send whoever restores this
+                # backup to a file that was never created.
                 print(
                     f"  vector db {vec_src} is one of the core files -- already "
                     f"backed up as {existing_dst}, not copying twice"
