@@ -33,10 +33,10 @@ class TestToolDispatch:
     def test_tools_list_not_empty(self):
         from opencrab.mcp.tools import TOOLS
 
-        # 16 exposed tools after reorder + dedup + 3 new READ tools.
+        # 17 exposed tools after reorder + dedup + 3 new READ tools + #146's pack_publish.
         # 비노출(주석처리): query_bm25, rebac, workflow×2, approval, billing×2,
         #   identity×5, canonicalize×2, promotion×4, ontology_extract, ontology_ingest
-        assert len(TOOLS) == 16
+        assert len(TOOLS) == 17
         names = [t["name"] for t in TOOLS]
         # Core exposed
         assert "ontology_manifest" in names
@@ -48,6 +48,7 @@ class TestToolDispatch:
         assert "harness_promotion_apply" in names
         assert "pack_create" in names
         assert "pack_ingest" in names
+        assert "pack_publish" in names
         assert "content_pack_list" in names
         # New READ tools
         assert "ontology_get_node" in names
@@ -548,17 +549,30 @@ class TestToolDispatch:
     def test_pack_ingest_text_creates_evidence_node(self):
         """pack_ingest with text materialises an evidence/TextUnit node via builder.add_node."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
 
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "test-user", "test-pack")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             hybrid = MagicMock()
             hybrid.invalidate_bm25_cache = MagicMock()
             mongo = MagicMock()
             mongo.available = False
+            graph = MagicMock()
+            graph.available = True
+            # #146 P1(a): identity-ownership probes -- see _base_ctx's
+            # comment in tests/test_tools_handlers_direct.py for why these
+            # must be explicit ("no conflicting store" is this suite's
+            # original implicit assumption). mongo.available is False above
+            # so its own probe is already skipped; only graph needs it here.
+            graph.get_node.return_value = None
+            graph.get_node_by_id.return_value = None
             mock_ctx.return_value = {
+                "neo4j": graph,
+                "sql": sql,
                 "builder": builder,
                 "hybrid": hybrid,
                 "mongo": mongo,
@@ -566,7 +580,6 @@ class TestToolDispatch:
                 "impact": MagicMock(),
                 "billing": MagicMock(),
             }
-            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
 
             result = dispatch_tool("pack_ingest", {
                 "pack_id": "test-pack",
@@ -599,18 +612,24 @@ class TestToolDispatch:
     def test_pack_ingest_text_as_node_false_legacy(self):
         """pack_ingest with text_as_node=False uses legacy vector-only path."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
 
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "test-user", "test-pack")
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             hybrid = MagicMock()
             hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
             hybrid.invalidate_bm25_cache = MagicMock()
             mongo = MagicMock()
             mongo.available = False
+            graph = MagicMock()
+            graph.available = True
             mock_ctx.return_value = {
+                "neo4j": graph,
+                "sql": sql,
                 "builder": builder,
                 "hybrid": hybrid,
                 "mongo": mongo,
@@ -618,7 +637,6 @@ class TestToolDispatch:
                 "impact": MagicMock(),
                 "billing": MagicMock(),
             }
-            mock_list.return_value = {"packs": [{"pack_id": "test-pack", "title": "Test"}]}
 
             result = dispatch_tool("pack_ingest", {
                 "pack_id": "test-pack",
@@ -825,7 +843,7 @@ class TestMCPServer:
         assert response["id"] == 2
         assert "tools" in response["result"]
         tools = response["result"]["tools"]
-        assert len(tools) == 16  # 재정렬 후 16개 (비노출 주석처리 + READ 3개 신규)
+        assert len(tools) == 17  # 재정렬 후 16개 + #146 pack_publish (비노출 주석처리 + READ 3개 신규)
 
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({

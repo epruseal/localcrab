@@ -58,13 +58,62 @@ def _base_ctx(**overrides):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
+    # #146 P1(a): a MagicMock lookup returns a truthy MagicMock, not None,
+    # so the identity-ownership probes in _ingest_into_pack/pack_create
+    # would otherwise treat every item as unverifiable (fail-closed) and
+    # reject it. These defaults spell out this suite's original implicit
+    # assumption -- "no conflicting store" -- explicitly; tests that DO
+    # want to exercise a conflict override these return_values themselves.
+    ctx["neo4j"].get_node.return_value = None
+    ctx["neo4j"].get_node_by_id.return_value = None
+    ctx["neo4j"].get_edge.return_value = None
+    # #177 R4-A: an unresolvable endpoint type is now fail-closed (rejected),
+    # not skipped, so the default here must be a real type -- "endpoints
+    # exist on this backend" -- matching get_edge.return_value = None above
+    # ("no conflict found"). Tests that want the reject-on-None path set
+    # this back to None themselves.
+    ctx["neo4j"].lookup_node_type.return_value = "Entity"
+    ctx["mongo"].get_node_doc.return_value = None
+    ctx["mongo"].get_source.return_value = None
+    ctx["chroma"].get_by_id.return_value = None
     ctx.update(overrides)
     return ctx
+
+
+def _writable_ctx(pack_id, owner="test-user", **overrides):
+    """A ``_base_ctx()`` with a real in-memory SQLStore carrying one packs
+    registry row for ``pack_id`` owned by ``owner`` -- #146 D: pack_ingest's
+    existence/ownership check is ``assert_writable`` against the real
+    ``packs`` table now, not a mocked ``content_pack_list()``."""
+    from opencrab.pack.ownership import create_pack as _register_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore("sqlite:///:memory:")
+    _register_pack(sql, owner, pack_id)
+    overrides.setdefault("sql", sql)
+    return _base_ctx(**overrides)
 
 
 # ---------------------------------------------------------------------------
 # content_pack_list
 # ---------------------------------------------------------------------------
+
+
+def _reg_row(pack_id, title="", description=""):
+    """A ``list_packs_for`` row shape (opencrab.pack.ownership._row_to_dict)
+    -- see tests/test_content_pack_list_query.py for the full query/ranking
+    contract; this module's tests only cover the plumbing (title-stripping,
+    fallback, the #146 registry-is-the-source join)."""
+    return {
+        "pack_id": pack_id,
+        "owner_id": "test-user",
+        "visibility": "private",
+        "title": title,
+        "description": description,
+        "forked_from": None,
+        "created_at": None,
+        "updated_at": None,
+    }
 
 
 class TestContentPackList:
@@ -74,11 +123,16 @@ class TestContentPackList:
         graph.list_packs.return_value = [
             {"pack_id": "biomed", "node_count": 5, "sample_title": "Biomed ontology pack"},
         ]
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("biomed")]),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list(min_nodes=1)
         assert result == {
             "total": 1,
+            "node_count_known": True,
+            "min_nodes_applied": True,
             "packs": [{"pack_id": "biomed", "node_count": 5, "title": "Biomed"}],
         }
 
@@ -86,18 +140,49 @@ class TestContentPackList:
         graph = MagicMock()
         graph.available = True
         graph.list_packs.return_value = [{"pack_id": "p1", "node_count": 2, "sample_title": ""}]
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("p1")]),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
         assert result["packs"][0]["title"] == "p1"
 
-    def test_edge_graph_unavailable_returns_error(self):
+    def test_normal_scopes_to_registry_rows(self):
+        """#146 C: candidates come from ``list_packs_for`` (the registry),
+        not graph.list_packs() -- a pack_id the registry didn't return never
+        appears, even though it's loaded in the graph with real nodes."""
         graph = MagicMock()
-        graph.available = False
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+        graph.available = True
+        graph.list_packs.return_value = [
+            {"pack_id": "mine", "node_count": 1, "sample_title": ""},
+            {"pack_id": "not-mine", "node_count": 1, "sample_title": ""},
+        ]
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("mine")]),
+        ):
             mock_ctx.return_value = _base_ctx(neo4j=graph)
             result = content_pack_list()
-        assert result == {"error": "graph store unavailable"}
+        assert [p["pack_id"] for p in result["packs"]] == ["mine"]
+
+    def test_edge_graph_unavailable_returns_unknown_counts_not_error(self):
+        """#146 C: graph unavailable no longer short-circuits to a
+        top-level "error" -- registry-readable packs are still listed, with
+        node_count_known/min_nodes_applied false and every node_count
+        null (see test_content_pack_list_query.py for the full contract)."""
+        graph = MagicMock()
+        graph.available = False
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.pack.ownership.list_packs_for", return_value=[_reg_row("mine")]),
+        ):
+            mock_ctx.return_value = _base_ctx(neo4j=graph)
+            result = content_pack_list()
+        assert "error" not in result
+        assert result["node_count_known"] is False
+        assert result["min_nodes_applied"] is False
+        assert result["packs"] == [{"pack_id": "mine", "node_count": None, "title": "mine"}]
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +467,7 @@ class TestIngestIntoPack:
         hybrid.ingest.side_effect = RuntimeError("embed failed")
         mongo = MagicMock()
         mongo.available = True
+        mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
             result = _ingest_into_pack(
@@ -399,6 +485,7 @@ class TestIngestIntoPack:
         hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
         mongo = MagicMock()
         mongo.available = True
+        mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
@@ -564,6 +651,7 @@ class TestIngestIntoPack:
 class TestPackCreate:
     def test_normal_creates_anchor_with_no_content(self):
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -613,15 +701,31 @@ class TestPackCreate:
             pack_create(title="My Pack", pack_id="my-pack")
         assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
 
-    def test_error_pack_already_exists(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
-            result = pack_create(title="Existing", pack_id="existing-pack")
-        assert result == {
-            "error": "pack already exists",
-            "pack_id": "existing-pack",
-            "hint": "use pack_ingest to add more content",
-        }
+    def test_taken_slug_is_quietly_suffixed_not_an_error(self):
+        """#146: the registry (packs table), not a content_pack_list() scan,
+        now decides slug collisions -- and a collision is never an error
+        (#143 invariant 7: an "already exists" error would tell the caller
+        someone else owns that exact slug). See tests/test_packs_registry.py
+        for the full registry-level collision/ownership contract."""
+        from opencrab.auth import Principal, principal_scope
+        from opencrab.pack.ownership import create_pack as _register_pack
+        from opencrab.stores.sql_store import SQLStore
+
+        sql = SQLStore("sqlite:///:memory:")
+        _register_pack(sql, "someone-else", "existing-pack", title="Existing")
+
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            with principal_scope(Principal(user_id="test-user", is_local=True, disabled=False)):
+                result = pack_create(title="Existing", pack_id="existing-pack")
+        # #146 B: random suffix on collision, not sequential -2.
+        assert "error" not in result
+        assert result["pack_id"] != "existing-pack"
+        assert result["pack_id"].startswith("existing-pack-")
+        assert result["pack_id"] != "existing-pack-2"
+        assert result["anchor_node"] == f"dataset:{result['pack_id']}"
 
     def test_error_anchor_node_write_failure(self):
         builder = MagicMock()
@@ -694,8 +798,10 @@ class TestPackCreate:
         assert result["status"] == "partial"
         assert result["anchor_errors"] == ["docs: error: mongo down"]
 
+
     def test_normal_with_text_materialises_evidence_node(self):
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
         hybrid = MagicMock()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -788,18 +894,209 @@ class TestPackCreate:
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "error: disk down"}}
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder, billing=billing)
             result = pack_ingest(
                 "existing-pack",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
             )
         assert result["added_nodes"] == 0
         billing.on_ingest.assert_not_called()
+
+
+class TestPackCreateCompensatingDelete:
+    """#146 A: a failed anchor write must not leave a phantom registry row
+    behind (create_pack already inserted the packs row before the anchor is
+    attempted). Uses a real in-memory SQLStore -- not the MagicMock ``sql``
+    the class above uses -- so the registry-row-gone assertion actually
+    exercises ``delete_pack_row``'s SQL, not just the response shape."""
+
+    @staticmethod
+    def _ctx(sql, builder):
+        return _base_ctx(builder=builder, sql=sql)
+
+    def _sql(self):
+        from opencrab.stores.sql_store import SQLStore
+
+        return SQLStore("sqlite:///:memory:")
+
+    def test_a1_anchor_exception_deletes_compensating_registry_row(self):
+        from opencrab.pack.ownership import get_pack
+
+        sql = self._sql()
+        builder = MagicMock()
+        builder.add_node.side_effect = RuntimeError("graph down")
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Broken", pack_id="broken-pack")
+        assert result == {"error": "anchor node failed: graph down"}
+        assert get_pack(sql, "broken-pack") is None
+
+    def test_a2i_graph_available_write_failed_deletes_compensating_registry_row(self):
+        """graph available but the write reports an "error: ..." status
+        (not raised) -- same compensation as the exception path."""
+        from opencrab.pack.ownership import get_pack
+
+        sql = self._sql()
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Broken Store", pack_id="broken-store-pack")
+        assert result == {"error": "anchor node failed: graph: error: disk I/O"}
+        assert get_pack(sql, "broken-store-pack") is None
+
+    def test_a2ii_graph_unavailable_deletes_compensating_registry_row(self):
+        """graph unavailable is also "did not land", distinct from an
+        "error: ..." status but compensated the same way."""
+        from opencrab.pack.ownership import get_pack
+
+        sql = self._sql()
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "unavailable", "docs": "ok", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="No Graph", pack_id="no-graph-pack")
+        assert result == {"error": "anchor node failed: graph: unavailable"}
+        assert get_pack(sql, "no-graph-pack") is None
+
+    def test_a_graph_success_keeps_registry_row_even_with_optional_failure(self):
+        """Once graph.add_node has actually succeeded the branch is
+        unreachable -- an optional-store-only failure (docs here) must
+        leave the registry row in place, never compensate-delete a pack
+        that really exists."""
+        from opencrab.pack.ownership import get_pack
+
+        sql = self._sql()
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "ok", "docs": "error: mongo down", "sql": "ok"}
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Partial Store", pack_id="partial-store-pack")
+        assert "error" not in result
+        assert get_pack(sql, "partial-store-pack") is not None
+
+    def test_a6_failed_bob_compensation_never_touches_alices_row(self):
+        """#146 A6: delete_pack_row's WHERE clause requires BOTH pack_id and
+        owner_id to match. Alice successfully owns "shared-pack"; Bob's
+        later attempt at the same title gets a random-suffixed slug (#146
+        B) whose anchor then fails -- the compensating delete must remove
+        only Bob's own row, never touch Alice's, in either creation order."""
+        from opencrab.auth import Principal, principal_scope
+        from opencrab.pack.ownership import get_pack
+
+        # Order 1: Alice succeeds first, then Bob's attempt fails & compensates.
+        sql = self._sql()
+        good_builder = MagicMock()
+        good_builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, good_builder)
+            mock_list.return_value = {"packs": []}
+            with principal_scope(Principal(user_id="alice", is_local=True, disabled=False)):
+                alice_result = pack_create(title="Shared", pack_id="shared-pack")
+        assert "error" not in alice_result
+        assert alice_result["pack_id"] == "shared-pack"
+
+        bad_builder = MagicMock()
+        bad_builder.add_node.side_effect = RuntimeError("graph down")
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql, bad_builder)
+            mock_list.return_value = {"packs": []}
+            with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
+                bob_result = pack_create(title="Shared", pack_id="shared-pack")
+        assert "error" in bob_result
+        # Alice's real row survives Bob's failed+compensated attempt.
+        assert get_pack(sql, "shared-pack")["owner_id"] == "alice"
+
+        # Order 2 (independent sql/registry): Bob fails first, then Alice
+        # creates successfully at the exact requested slug -- Bob's failed
+        # compensated attempt must not have poisoned the slug for Alice.
+        sql2 = self._sql()
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql2, bad_builder)
+            mock_list.return_value = {"packs": []}
+            with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
+                bob_first = pack_create(title="Shared", pack_id="shared-pack")
+        assert "error" in bob_first
+        assert get_pack(sql2, "shared-pack") is None  # compensated away
+
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+        ):
+            mock_ctx.return_value = self._ctx(sql2, good_builder)
+            mock_list.return_value = {"packs": []}
+            with principal_scope(Principal(user_id="alice", is_local=True, disabled=False)):
+                alice_after = pack_create(title="Shared", pack_id="shared-pack")
+        assert "error" not in alice_after
+        assert alice_after["pack_id"] == "shared-pack"
+        assert get_pack(sql2, "shared-pack")["owner_id"] == "alice"
+
+    def test_a7_compensating_delete_failure_returns_original_error_and_warns(self, caplog):
+        """#146 A7: SQL fault injection on the compensating delete itself --
+        delete_pack_row raising must not mask the real anchor failure with a
+        confusing delete-layer exception; the original error is still
+        returned, and the delete failure is logged as a WARNING so an
+        orphaned registry row can be found operationally."""
+        import logging
+
+        from opencrab.pack.ownership import get_pack
+
+        sql = self._sql()
+        builder = MagicMock()
+        builder.add_node.side_effect = RuntimeError("graph down")
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+            patch(
+                "opencrab.pack.ownership.delete_pack_row",
+                side_effect=RuntimeError("db exploded"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            mock_ctx.return_value = self._ctx(sql, builder)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="Broken", pack_id="broken-pack")
+        assert result == {"error": "anchor node failed: graph down"}
+        assert any(
+            "compensating delete failed" in rec.message and "db exploded" in rec.message
+            for rec in caplog.records
+        )
+        # The delete never actually ran (it was replaced with a raise), so
+        # the orphaned row is still there -- documents the real-world
+        # consequence of a failed compensation, not asserting it's "fine".
+        assert get_pack(sql, "broken-pack") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -809,8 +1106,10 @@ class TestPackCreate:
 
 class TestPackIngestErrors:
     def test_error_pack_not_found(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": []}
+        from opencrab.stores.sql_store import SQLStore
+
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(sql=SQLStore("sqlite:///:memory:"))
             result = pack_ingest("nonexistent-pack", text="hello")
         assert result == {
             "error": "pack not found; use pack_create first",
@@ -818,8 +1117,8 @@ class TestPackIngestErrors:
         }
 
     def test_error_no_content_provided(self):
-        with patch("opencrab.mcp.tools.content_pack_list") as mock_list:
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack")
             result = pack_ingest("existing-pack")
         assert result == {
             "error": "no content provided: supply at least one of nodes, edges, or text"
@@ -834,12 +1133,8 @@ class TestPackIngestErrors:
         builder.add_node.return_value = {
             "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
         }
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder)
             result = pack_ingest(
                 "existing-pack",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
@@ -859,12 +1154,10 @@ class TestPackIngestErrors:
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx(
+                "existing-pack", owner="u1", builder=builder, billing=billing
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 pack_ingest(
                     "existing-pack",
@@ -882,12 +1175,8 @@ class TestPackIngestErrors:
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         billing.on_ingest.return_value = {"ok": False, "error": "database is locked"}
-        with (
-            patch("opencrab.mcp.tools._get_context") as mock_ctx,
-            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
-        ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
-            mock_list.return_value = {"packs": [{"pack_id": "existing-pack"}]}
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _writable_ctx("existing-pack", builder=builder, billing=billing)
             with caplog.at_level(logging.WARNING):
                 result = pack_ingest(
                     "existing-pack",
@@ -1239,7 +1528,11 @@ class TestGetContextRealWiring:
         tools_mod._context.clear()
         try:
             result = tools_mod.dispatch_tool("content_pack_list", {})
-            assert result == {"total": 0, "packs": []}
+            # #146 C: a fresh LOCAL_DATA_DIR has no `packs` registry rows,
+            # so the registry-sourced candidate list is empty regardless of
+            # the (real, available) graph store's own state.
+            assert result["total"] == 0
+            assert result["packs"] == []
             assert set(tools_mod._context.keys()) == {
                 "neo4j", "chroma", "mongo", "sql",
                 "builder", "rebac", "impact", "hybrid", "billing",

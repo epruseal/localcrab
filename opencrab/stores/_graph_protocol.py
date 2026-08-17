@@ -32,6 +32,7 @@ of each store module):
     lookup_node_type      yes     yes     yes     yes
     delete_node           yes     yes     yes     yes
     upsert_edge           yes     yes     yes     yes
+    get_edge              yes     yes     yes     yes
     run_cypher            yes     yes     yes     yes
     find_neighbors        yes     yes     yes     yes
     find_path             yes     yes     yes     yes
@@ -183,6 +184,42 @@ class GraphStore(Protocol):
         already exist (Neo4j: MATCH fails silently to no record -> False;
         SQL backends: FK-less schema, so a dangling edge is written and
         later reads of a missing endpoint return None as its properties).
+        """
+        ...
+
+    def get_edge(
+        self,
+        from_type: str,
+        from_id: str,
+        relation: str,
+        to_type: str,
+        to_id: str,
+    ) -> dict[str, Any] | None:
+        """Fetch one edge's properties by THIS backend's own upsert conflict
+        key; None if absent.
+
+        There is no single-edge read among ``upsert_edge``/``export_edges``/
+        ``upsert_edges_batch`` — ``export_edges`` is a full scan and
+        ``find_neighbors`` truncates via ``limit``, neither an exact probe.
+        This method exists for #146's identity-ownership check (a probe read
+        before a write), not general traversal.
+
+        The contract is deliberately "match THIS backend's own conflict
+        key", not a uniform 5-argument predicate: SQL backends (Local/PG)
+        and Neo4j key an edge on all 5 arguments (matching ``upsert_edge``'s
+        ``conflict_cols``/MATCH-by-type), but ``KuzuGraphStore``'s
+        ``upsert_edge`` MERGEs on ``(from_id, relation, to_id)`` alone (no
+        type predicate — Kuzu's ``OntologyEdge`` has no type column). Kuzu's
+        ``get_edge`` therefore accepts ``from_type``/``to_type`` for
+        signature parity with the other three backends but does not use
+        them in its MATCH; passing the wrong type there still finds the
+        same edge ``upsert_edge`` would have upserted.
+
+        Always returns a parsed ``dict``, never a raw JSON blob — the
+        properties column/property is JSON-serialized text on Local/PG/Kuzu
+        (SQLite/Kuzu store JSON strings; see each backend's ``upsert_edge``)
+        and this method decodes it before returning, the same way
+        ``get_node`` does for node properties.
         """
         ...
 

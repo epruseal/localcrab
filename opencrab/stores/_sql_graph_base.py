@@ -362,6 +362,34 @@ class _SqlGraphStoreBase(abc.ABC):
         )
         return True
 
+    def get_edge(
+        self,
+        from_type: str,
+        from_id: str,
+        relation: str,
+        to_type: str,
+        to_id: str,
+    ) -> dict[str, Any] | None:
+        """Same 5-column WHERE as ``upsert_edge``'s ``conflict_cols`` — see
+        ``GraphStore.get_edge``'s docstring for the cross-backend contract."""
+        self._require_available()
+        sql = (
+            f"SELECT properties FROM {self._table('graph_edges')}"
+            " WHERE from_type=:from_type AND from_id=:from_id"
+            " AND relation=:relation AND to_type=:to_type AND to_id=:to_id"
+        )
+        row = self._fetch_one(
+            sql,
+            {
+                "from_type": from_type,
+                "from_id": from_id,
+                "relation": relation,
+                "to_type": to_type,
+                "to_id": to_id,
+            },
+        )
+        return _as_dict(row[0]) if row else None
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------

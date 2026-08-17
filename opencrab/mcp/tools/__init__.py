@@ -21,7 +21,7 @@ Exposed tools (16):
   8.  ontology_impact           — I1–I7 impact analysis
   9.  ontology_lever_simulate   — predict outcome changes from lever movement
   ── Pack management ────────────────────────────────────────────────────
-  10. content_pack_list         — list loaded packs (pack_id, node count, title)
+  10. content_pack_list         — list readable packs (pack_id, node count, title)
   11. schema_pack_list          — list available schema packs
   12. schema_pack_install       — install a domain schema pack
   13. schema_pack_uninstall     — uninstall a schema pack
@@ -258,6 +258,7 @@ from .pack import (  # noqa: E402
     content_pack_list,
     pack_create,
     pack_ingest,
+    pack_publish,
 )
 from .query import ontology_impact, ontology_lever_simulate, ontology_query  # noqa: E402
 from .schema import (  # noqa: E402
@@ -299,6 +300,7 @@ __all__ = [
     "ontology_query",
     "pack_create",
     "pack_ingest",
+    "pack_publish",
     "schema_pack_install",
     "schema_pack_list",
     "schema_pack_uninstall",

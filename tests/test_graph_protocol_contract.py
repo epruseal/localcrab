@@ -613,6 +613,117 @@ class TestExtendedMethodsEdge:
 
 
 # ---------------------------------------------------------------------------
+# get_edge (#146 P1(a)) -- probe read using each backend's own upsert
+# conflict key; see GraphStore.get_edge's docstring for the cross-backend
+# contract (SQL/Neo4j key on all 5 args, Kuzu keys on from_id/relation/to_id
+# alone). Design doc reproduction test #14: SQL via the real local/pg
+# `backend` fixture, Kuzu via importorskip, Neo4j via mocked session.
+# ---------------------------------------------------------------------------
+
+
+class TestGetEdgeContract:
+    def test_existing_edge_returns_parsed_properties_dict(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {"weight": 3})
+
+        edge = store.get_edge("Doc", "a0", "rel", "Doc", "a1")
+
+        assert isinstance(edge, dict)
+        assert edge["weight"] == 3
+
+    def test_absent_edge_returns_none(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+
+        assert store.get_edge("Doc", "a0", "rel", "Doc", "a1") is None
+
+    def test_wrong_relation_key_returns_none(self, backend):
+        """A different relation is a different conflict key on every
+        backend -- proves get_edge does not match on endpoints alone."""
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel-a", "Doc", "a1", {})
+
+        assert store.get_edge("Doc", "a0", "rel-b", "Doc", "a1") is None
+
+    def test_reversed_endpoints_returns_none(self, backend):
+        """Directionality matters -- get_edge must not match the reverse edge."""
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+
+        assert store.get_edge("Doc", "a1", "rel", "Doc", "a0") is None
+
+
+class TestGetEdgeKuzuJsonParsing:
+    """v2 결함 2 반례: Kuzu's ``e.properties`` column is a JSON-serialized
+    string -- get_edge must return a parsed dict, never the raw string, or
+    the same-pack re-ingest path (which reads ``pack_id`` back out of it)
+    would fail-closed on every re-ingest against a Kuzu backend."""
+
+    def test_properties_returned_as_dict_not_json_string(self, tmp_path):
+        pytest.importorskip("ladybug")
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+
+        store = KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu_edge"))
+        try:
+            store.upsert_node("Doc", "a0", {})
+            store.upsert_node("Doc", "a1", {})
+            store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {"pack_id": "pack-a"})
+
+            edge = store.get_edge("Doc", "a0", "rel", "Doc", "a1")
+
+            assert isinstance(edge, dict)
+            assert edge["pack_id"] == "pack-a"
+        finally:
+            store.close()
+
+    def test_type_arguments_accepted_but_not_matched_on(self, tmp_path):
+        """Kuzu's MERGE key is (from_id, relation, to_id) alone -- passing
+        the WRONG from_type/to_type must still find the edge (upsert_edge's
+        own MERGE never wrote a type predicate either)."""
+        pytest.importorskip("ladybug")
+        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+
+        store = KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu_edge2"))
+        try:
+            store.upsert_node("Doc", "a0", {})
+            store.upsert_node("Doc", "a1", {})
+            store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {"pack_id": "pack-a"})
+
+            edge = store.get_edge("WrongType", "a0", "rel", "AlsoWrong", "a1")
+
+            assert edge is not None
+            assert edge["pack_id"] == "pack-a"
+        finally:
+            store.close()
+
+
+class TestGetEdgeNeo4j:
+    def test_existing_edge_returns_properties(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = {"props": {"pack_id": "pack-a"}}
+
+        edge = store.get_edge("Doc", "a0", "rel", "Doc", "a1")
+
+        assert edge == {"pack_id": "pack-a"}
+        cypher = mock_session.run.call_args[0][0]
+        assert "-[r:rel]->" in cypher
+        assert mock_session.run.call_args[1] == {"from_id": "a0", "to_id": "a1"}
+
+    def test_absent_edge_returns_none(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value.single.return_value = None
+
+        assert store.get_edge("Doc", "a0", "rel", "Doc", "a1") is None
+
+
+# ---------------------------------------------------------------------------
 # export_* must carry `space` inside props (regression: space_id column dropped)
 #
 # The SQL and Kuzu backends keep space in a dedicated `space_id` column while

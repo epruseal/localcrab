@@ -225,6 +225,27 @@ class Neo4jStore:
             result = session.run(cypher, **params)
             return result.single() is not None
 
+    def get_edge(
+        self,
+        from_type: str,
+        from_id: str,
+        relation: str,
+        to_type: str,
+        to_id: str,
+    ) -> dict[str, Any] | None:
+        """Same label/relation-type MATCH shape as ``upsert_edge`` -- see
+        ``GraphStore.get_edge``'s docstring for the cross-backend contract."""
+        self._require_available()
+
+        cypher = f"""
+            MATCH (a:{from_type} {{id: $from_id}})-[r:{relation}]->(b:{to_type} {{id: $to_id}})
+            RETURN properties(r) AS props
+        """
+        with self._session() as session:
+            result = session.run(cypher, from_id=from_id, to_id=to_id)
+            record = result.single()
+            return dict(record["props"]) if record else None
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------

@@ -47,6 +47,7 @@ GOLDEN_TOOL_NAMES = [
     "pack_create",
     "pack_ingest",
     "harness_promotion_apply",
+    "pack_publish",
 ]
 
 
@@ -163,6 +164,7 @@ class TestWriteLockCoverage:
         "pack_create",
         "pack_ingest",
         "harness_promotion_apply",
+        "pack_publish",
     }
 
     def test_write_tools_matches_golden_list(self):
@@ -332,3 +334,33 @@ class TestAccessTierClassification:
 
         for name in GOLDEN_TOOL_NAMES:
             assert isinstance(_REGISTRY[name].access, AccessTier), name
+
+
+def test_every_registered_tool_is_importable_from_the_package():
+    """PR #177 review round 12: `pack_publish` was registered (so MCP dispatch
+    worked, and every dispatch test passed) but never re-exported from
+    `opencrab.mcp.tools`, so `from opencrab.mcp.tools import pack_publish`
+    raised ImportError. Pin the invariant for ALL handlers rather than that one
+    name -- the next new tool would regress the same way, and dispatch tests
+    structurally cannot catch it (importing the module runs the decorator)."""
+    import opencrab.mcp.tools as tools_pkg
+    from opencrab.mcp.tools._registry import _REGISTRY
+
+    missing_attr = sorted(name for name in _REGISTRY if not hasattr(tools_pkg, name))
+    assert missing_attr == [], (
+        f"registered tools not importable from opencrab.mcp.tools: {missing_attr}"
+    )
+
+    missing_all = sorted(name for name in _REGISTRY if name not in tools_pkg.__all__)
+    assert missing_all == [], (
+        f"registered tools missing from opencrab.mcp.tools.__all__: {missing_all}"
+    )
+
+    # hasattr alone would pass if some unrelated object were re-exported under
+    # the tool's name; pin that the exported object IS the registered handler.
+    wrong_object = sorted(
+        name for name in _REGISTRY if getattr(tools_pkg, name) is not _REGISTRY[name].fn
+    )
+    assert wrong_object == [], (
+        f"package exports a different object than the registered handler: {wrong_object}"
+    )

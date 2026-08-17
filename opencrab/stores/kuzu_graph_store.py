@@ -220,6 +220,32 @@ class KuzuGraphStore:
             logger.warning("KuzuGraphStore upsert_edge error: %s", exc)
             return False
 
+    def get_edge(
+        self,
+        from_type: str,
+        from_id: str,
+        relation: str,
+        to_type: str,
+        to_id: str,
+    ) -> dict[str, Any] | None:
+        """Kuzu's ``OntologyEdge`` MERGE key is ``(from_id, relation, to_id)``
+        alone (see ``upsert_edge`` above -- no type predicate exists on this
+        backend's schema). ``from_type``/``to_type`` are accepted for
+        signature parity with the other 3 backends but not used in the
+        MATCH -- see ``GraphStore.get_edge``'s docstring for the
+        cross-backend contract. ``e.properties`` is a JSON-serialized
+        string here (same as node ``props``), so it is parsed via
+        ``_parse()`` before returning -- never a raw JSON blob."""
+        self._require_available()
+        r = self._conn.execute(
+            "MATCH (a:OntologyNode {node_id: $fid})-[e:OntologyEdge {relation: $rel}]->"
+            "(b:OntologyNode {node_id: $tid}) RETURN e.properties LIMIT 1",
+            {"fid": from_id, "rel": relation, "tid": to_id},
+        )
+        if r.has_next():
+            return _parse(r.get_next()[0])
+        return None
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------
