@@ -2403,6 +2403,14 @@ class TestRoundFiveReviewConformance:
         # default + pack-shared == 2 distinct rows, counted once each.
         assert "2 row(s) needed registering" in out_dry
         assert "doc-derived=0" in out_dry
+        # The step 3.5 stage line must agree with that summary: pack-shared
+        # was already planned by step 3, so step 3.5 has nothing left to
+        # register. (Pins the stage print's own de-duplication, not just the
+        # summed total.)
+        assert (
+            "doc-derived distinct pack_id: 1 total "
+            "(already-present=0, predicted=1), 0 not yet in the registry" in out_dry
+        )
 
         rc_apply = migrate.main(["--apply", "--skip-backup"])
         out_apply = capsys.readouterr().out
