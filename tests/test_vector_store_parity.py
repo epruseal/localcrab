@@ -650,6 +650,46 @@ class TestChromaUpsertSafety:
         assert by_id["urinometa"][2] == "http://example.com/urinometa", "uri 가 사라졌다"
         assert by_id["plain"] == ("보통 문서", {"k": "1", "버릴키": "1"}, None)
 
+    def test_rollback_restores_records_that_have_no_document(self, tmp_path):
+        """레코드는 document 없이도 존재할 수 있다(임베딩만, 또는 uri 만 들고
+        외부가 기록한 경우). 스냅샷의 그 None 을 되돌려 쓰는 것이 chromadb 에서
+        거부되면 롤백이 죽고 레코드까지 잃는다 — 현재(1.5.9)는 거부하지 않으며,
+        이 테스트가 그 전제를 고정한다."""
+        store = build_vector_store("chroma", tmp_path)
+        store._collection.add(ids=["nodoc"], embeddings=[[0.2] * 32], metadatas=[{"k": "1"}])
+        store._collection.add(
+            ids=["urinodoc"], embeddings=[[0.3] * 32],
+            uris=["http://example.com/urinodoc"],
+        )
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "p", "버릴키": "1"}], ids=["plain"])
+
+        real_add = store._collection.add
+
+        def fail_forward_only(**kw):
+            if "embeddings" in kw:      # 복구 경로는 통과시킨다
+                return real_add(**kw)
+            raise RuntimeError("전진 add 실패")
+
+        store._collection.add = fail_forward_only
+        with pytest.raises(RuntimeError):
+            store.upsert_texts(
+                texts=["새1", "새2", "새3"],
+                metadatas=[{"k": "n1"}, {"k": "n2"}, {"k": "n3"}],
+                ids=["nodoc", "urinodoc", "plain"],
+            )
+        store._collection.add = real_add
+
+        assert store.count() == 3, "document 없는 레코드 때문에 롤백이 실패했다"
+        got = store._collection.get(
+            ids=["nodoc", "urinodoc", "plain"],
+            include=["documents", "metadatas", "uris"],
+        )
+        by_id = dict(zip(got["ids"], zip(got["documents"], got["metadatas"], got["uris"])))
+        assert by_id["nodoc"] == (None, {"k": "1"}, None)
+        assert by_id["urinodoc"][0] is None
+        assert by_id["urinodoc"][2] == "http://example.com/urinodoc", "uri 가 사라졌다"
+        assert by_id["plain"][0] == "원본"
+
     def test_upsert_without_stale_keys_never_deletes(self, tmp_path):
         """[리뷰 라운드5] 버려질 키가 없으면 병합 결과가 곧 치환 결과다. 그때는
         원자적 native upsert 로 가야 한다 — delete 창이 없어야 reader 가 살아
