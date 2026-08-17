@@ -28,7 +28,7 @@ def _collection_lock(key: str) -> threading.Lock:
     Per-instance locking is not enough: nothing guarantees a single store
     instance per collection — ``opencrab/mcp/tools/__init__.py:_get_context()``
     memoises its stores but does not guard the initialisation itself, so two
-    concurrent first calls each build their own. Mirrors the per-path registry
+    concurrent first calls each build their own (localcrab#192). Mirrors the per-path registry
     in ``opencrab/locking.py:_process_lock``, including its no-eviction
     property (bounded by the collections this process opens).
 
@@ -256,6 +256,14 @@ class ChromaStore:
         tell that an n+1-th hit was momentarily missing. Note this window is
         only reachable for an upsert that actually drops a metadata key; the
         ordinary full-dict upsert takes the atomic path above.
+
+        That remaining window is an accepted limit, not an oversight: chroma
+        offers no primitive that replaces a record's metadata wholesale in one
+        operation, so dropping a key costs a delete and an add. UPGRADE PATH:
+        if chroma ever gains such a primitive (a replace/put that does not
+        merge, or a transaction around the pair), route the key-dropping ids
+        through it and delete this branch along with ``_rollback`` — both
+        exist only to make the two-step safe.
 
         What that lock does NOT cover, stated so callers do not over-trust it:
 
