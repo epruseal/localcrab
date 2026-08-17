@@ -1665,9 +1665,16 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
                 # than reporting an overwrite conflict. resolve() (not a string
                 # compare) so "./graph.db", an absolute path, or a symlink
                 # alias all match the canonical core path.
+                #
+                # Name the destination that actually HOLDS THE BYTES, which is
+                # keyed by the resolved core filename -- for a symlink alias
+                # (vectors.db -> graph.db) `vec_dst` would name a file that was
+                # never created, sending whoever restores this backup to a
+                # missing path (PR #177 review round 9 follow-up).
+                existing_dst = dest_dir / vec_src.resolve().name
                 print(
                     f"  vector db {vec_src} is one of the core files -- already "
-                    f"backed up as {vec_dst}, not copying twice"
+                    f"backed up as {existing_dst}, not copying twice"
                 )
             elif vec_dst.exists():
                 print(

@@ -3249,3 +3249,48 @@ class TestColocatedVectorDbReusesCoreBackup:
         with pytest.raises(SystemExit) as exc:
             migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
         assert exc.value.code == 2
+
+    def test_symlink_alias_matches_via_resolve_and_names_the_real_backup(
+        self, env, tmp_path, monkeypatch, capsys
+    ):
+        """The resolve() normalisation (not a string compare) is what makes a
+        symlink alias match the core file -- and the skip message must name the
+        destination that actually holds the bytes, not the alias name that was
+        never created."""
+        import sqlite3
+
+        core = env / "graph.db"
+        conn = sqlite3.connect(str(core))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (42)")
+        conn.commit()
+        conn.close()
+
+        alias = env / "vectors.db"
+        alias.symlink_to(core)
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE="vectors.db"
+        )
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        # No abort, and no second copy under the alias name.
+        assert not (backup_dir / "vectors.db").exists()
+        assert (backup_dir / "graph.db").is_file()
+        assert backed_up.count(str(backup_dir / "graph.db")) == 1
+
+        # The message must point at a file that EXISTS.
+        out = capsys.readouterr().out
+        assert "already backed up as" in out
+        named = [
+            tok
+            for line in out.splitlines()
+            if "already backed up as" in line
+            for tok in line.split()
+            if tok.endswith(".db")
+        ]
+        assert named, out
+        assert any(Path(tok.rstrip(",")).is_file() for tok in named), (
+            f"skip message names a path that does not exist: {named}"
+        )
