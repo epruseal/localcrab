@@ -137,7 +137,10 @@ def test_someone_elses_public_pack_is_rejected_as_not_writable(sql, ctx):
     assert result == {
         "error": "PACK_NOT_WRITABLE: not the pack owner",
         "pack_id": "shared-pack",
-        "hint": "use pack_fork to copy this pack into your own",
+        "hint": (
+            "this pack is readable but not writable by you; "
+            "create your own with pack_create and ingest into that"
+        ),
     }
     ctx["builder"].add_node.assert_not_called()
 

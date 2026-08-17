@@ -1173,7 +1173,15 @@ def pack_ingest(
         return {
             "error": "PACK_NOT_WRITABLE: not the pack owner",
             "pack_id": pack_id,
-            "hint": "use pack_fork to copy this pack into your own",
+            # No fork tool exists yet (PR #177 review round 7): naming one
+            # here sent callers straight into an unknown-tool error. Point at
+            # the workflow that actually works today -- this pack stays
+            # READABLE (it is public), so a caller can query it and build
+            # their own pack from what they need.
+            "hint": (
+                "this pack is readable but not writable by you; "
+                "create your own with pack_create and ingest into that"
+            ),
         }
 
     if not (nodes or edges or text):
@@ -1271,7 +1279,15 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
         return {
             "error": "not the pack owner",
             "pack_id": pack_id,
-            "hint": "use pack_fork to copy this pack into your own",
+            # No fork tool exists yet (PR #177 review round 7): naming one
+            # here sent callers straight into an unknown-tool error. Point at
+            # the workflow that actually works today -- this pack stays
+            # READABLE (it is public), so a caller can query it and build
+            # their own pack from what they need.
+            "hint": (
+                "this pack is readable but not writable by you; "
+                "create your own with pack_create and ingest into that"
+            ),
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"pack_publish failed: {exc}"}
