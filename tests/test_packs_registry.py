@@ -498,6 +498,57 @@ class TestPackPublish:
         assert "error" in result
         assert get_pack(sql, "alice-pack")["visibility"] == "private"
 
+    def test_non_owner_publish_of_a_visible_pack_says_not_the_owner(self, sql):
+        """The PackForbiddenError branch, which had no coverage at all
+        (PR #177 review round 7 follow-up): test_non_owner_publish_rejected
+        above uses a PRIVATE pack, so it takes the PackNotFoundError path and
+        its bare `"error" in result` cannot tell the two apart.
+
+        #143 invariant 7 makes the distinction deliberate: a private pack owned
+        by someone else must be indistinguishable from one that never existed,
+        but a PUBLIC pack's existence is already observable (content_pack_list),
+        so that branch may say more. Pin both wordings, and pin that the hint
+        names no tool that does not exist (the round-7 defect).
+        """
+        from opencrab.mcp.tools import dispatch_tool
+        from opencrab.mcp.tools._registry import _REGISTRY
+
+        create_pack(sql, "alice", "alice-pack")
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(sql)
+            with principal_scope(Principal(user_id="alice", is_local=True, disabled=False)):
+                dispatch_tool(
+                    "pack_publish", {"pack_id": "alice-pack", "visibility": "public-read"}
+                )
+            # Now it IS visible, so bob takes the FORBIDDEN branch, not NOT_FOUND.
+            with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
+                visible = dispatch_tool(
+                    "pack_publish", {"pack_id": "alice-pack", "visibility": "private"}
+                )
+            # A pack bob cannot see at all still reports "not found".
+            with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
+                hidden = dispatch_tool(
+                    "pack_publish", {"pack_id": "no-such-pack", "visibility": "private"}
+                )
+
+        assert visible["error"] == "not the pack owner"
+        assert hidden["error"] == "pack not found"
+        assert visible["error"] != hidden["error"], (
+            "the visible-but-foreign and never-existed branches must stay distinct"
+        )
+        # bob's attempt changed nothing.
+        assert get_pack(sql, "alice-pack")["visibility"] == "public-read"
+
+        # The recovery hint must not name a tool that is not registered.
+        import re
+
+        for token in re.findall(r"\b[a-z]+_[a-z_]+\b", visible.get("hint", "")):
+            if token.startswith(("pack_", "ontology_", "content_")):
+                assert token in _REGISTRY, (
+                    f"hint names an unregistered tool {token!r}: following it "
+                    f"would give every caller an unknown-tool error"
+                )
+
     def test_invalid_visibility_rejected(self, sql):
         from opencrab.mcp.tools import dispatch_tool
 

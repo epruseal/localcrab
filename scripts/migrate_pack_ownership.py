@@ -64,6 +64,22 @@ SCOPE (#146's time-box -- read before assuming a backend is covered):
 
 SAFETY:
   - Defaults to dry-run. Pass --apply to write anything.
+  - WHY the backup is MANDATORY (not merely advised): the kuzu backend
+    requires a SINGLE database connection, and a reader can be live
+    alongside the writer, so there is no safe way to recover in place if
+    this migration's writes go wrong -- the copy taken up front is the only
+    rollback. Other backends (SQLite/PG) tolerate multiple writers, so for
+    them a backup is strongly RECOMMENDED rather than strictly required.
+    The gate below is deliberately uniform across backends anyway: relaxing
+    it per-backend is a behaviour change tracked as a follow-up, not
+    something to slip into this migration. Recorded here so the next reader
+    does not "simplify" the gate away without knowing what it protects.
+    PROVENANCE: this constraint is operator-supplied domain knowledge, not
+    something this repository states anywhere -- nothing under
+    opencrab/stores/ or docs/ asserts it. Re-confirm it against the kuzu
+    driver's own documentation BEFORE acting on it (in particular before
+    relaxing the gate for other backends); do not treat this paragraph as
+    the source of truth.
   - --apply requires --backup-to <dir> unless --skip-backup is passed
     explicitly (the only option for pg/docker mode, where there is no
     single file this script can safely copy -- take a pg_dump/snapshot

@@ -1220,9 +1220,10 @@ def pack_ingest(
             "Set a content pack's visibility. Owner-only. `visibility` is one of: "
             "private (default — only the owner can see or use it), "
             "public-read (anyone can read/query it), or "
-            "public-fork (same read access as public-read; it additionally RECORDS "
-            "that you permit forking, but no fork tool exists yet -- see "
-            "pack_publish's docstring)."
+            "public-fork (same read access as public-read today; it additionally "
+            "RECORDS that you permit forking. The fork tool itself is not "
+            "available yet -- it is planned in issue #148, so until then this "
+            "value expresses intent and grants nothing beyond public-read)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1265,12 +1266,16 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
     grant the SAME access. There is no fork tool -- ``packs.forked_from``
     exists as a column and ``VISIBILITIES`` carries the value, but nothing
     reads it to copy a pack. ``public-fork`` therefore records the owner's
-    INTENT to allow forking, to be honoured once a fork tool lands; it does
-    not currently do anything a caller can observe beyond public-read. The
-    round-7 review found the old wording (and the "not the pack owner" hint)
-    advertising a fork tool that does not exist, which sent callers into an
-    unknown-tool error -- do not reintroduce a fork promise here or in any
-    response string until the tool is actually registered.
+    INTENT to allow forking, to be honoured once the fork tool lands (planned
+    in issue #148); it does not currently do anything a caller can observe
+    beyond public-read.
+
+    The value STAYS in ``VISIBILITIES`` -- it is part of the parent auth
+    design's data model, not a dead enum to be pruned. What round 7 found was
+    the WORDING: the old description (and the "not the pack owner" hint)
+    advertised a fork tool that does not exist, sending callers into an
+    unknown-tool error. Do not reintroduce a fork promise here or in any
+    response string until that tool is actually registered.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
