@@ -310,6 +310,15 @@ def _vec_backend(vec):
     return (None, None, None)
 
 
+# `_vec_backend()`가 실제로 내는 kind 전체(`None` 제외) — 새 백엔드가 추가되면
+# 이 목록과, kind 를 분기하는 모든 소비자(`_live_vec_ids`/`pack_live_counts`/
+# `delete_pack`/`_vec_meta_update`)를 함께 갱신해야 한다. 한쪽만 고치면 그 kind가
+# 새 소비자에서 조용히 미지원 취급으로 떨어진다(pgvector 가 `_vec_meta_update` 에서
+# 그랬다, #172) — `tests/test_pack_load.py::TestVecBackendKindsCoverage` 가 소스를
+# AST 로 대사해 어긋나면 실패한다.
+_VEC_BACKEND_KINDS = ("sql", "chroma", "sqlalchemy")
+
+
 def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
@@ -361,12 +370,54 @@ def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     return vec_ids
 
 
-def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
+def _sqlalchemy_meta_update_sql(table: str, dialect_name: str) -> str:
+    """sqlalchemy(pgvector) 분기의 UPDATE 문. PostgreSQL 에서는 `(:meta)::jsonb`
+    명시 캐스트 — PgVectorStore 자신의 INSERT/UPSERT 가 이 컬럼에 쓰는 것과 같은
+    관례다. psycopg2 는 unknown 리터럴을 대입 캐스트로 우연히 통과시키지만
+    드라이버 의존이고(psycopg3 는 타입 오류) 스토어 관례와도 어긋난다.
+    다른 dialect(테스트 더블의 sqlite 등)에는 `::` 구문이 없으므로 무캐스트.
+
+    `WHERE` 절은 `node_id`뿐 아니라 `pack_id`도 건다(#172 재리뷰 P1) — 아래
+    `_vec_meta_update` docstring 의 "fast-path pack 스코프" 참고."""
+    if dialect_name == "postgresql":
+        return (f"UPDATE {table} SET metadata = (:meta)::jsonb "
+                 "WHERE node_id = :id AND pack_id = :pid")  # noqa: S608
+    return (f"UPDATE {table} SET metadata = :meta "
+            "WHERE node_id = :id AND pack_id = :pid")  # noqa: S608
+
+
+def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
     """벡터 레코드의 **메타데이터만** 갱신. 성공하면 True.
 
     텍스트가 안 바뀌었으니 임베딩은 그대로 두고 메타만 맞춘다. 백엔드가 그 연산을
     지원하지 않으면 **False 를 돌려 호출자가 재임베딩으로 우회**하게 한다 —
     조용히 True 를 내면 그 어긋남이 영구히 남는다(다음 증분이 "동일"로 판정하므로).
+
+    **`pack_id` 는 호출자(현재 처리 중인 팩)를 명시한다(#172 재리뷰 P1).** 세
+    분기(sql/sqlalchemy/chroma) 전부 이 값과 실제 레코드 소유 팩이 다르면
+    매칭 0건(= 매칭 안 됨)으로 취급해 **False** 를 돌려준다 — 매칭 0건은
+    이 함수의 기존 계약(부재)과 동일하게 재임베딩 우회로 이어진다.
+
+    **왜 필요한가**: 공유 evidence/chunk id 가 같은 vector 슬롯(`node_id`)을
+    재사용하면(다른 팩이 먼저 그 id 로 벡터를 썼으면), pack 스코프 없는
+    `WHERE node_id = ?` 는 **남의 행의 metadata 만** 갈아치우고 성공을
+    반환한다 — 남의 `pack_id`·`document`·`embedding` 은 그대로인 채(부분
+    오염) 호출자는 doc 기준을 전진시킨다. False 로 물러나면 호출자가
+    `upsert_texts` 재임베딩으로 우회하고, 그 우회는 아래 **"last-writer-wins
+    슬롯 정체성"** 계약에 따라 슬롯 전체를 현재 팩 값으로 일관되게 넘긴다.
+
+    **"last-writer-wins 슬롯 정체성" (닫지 않은 경계, `_vector_base.py`
+    모듈 docstring 의 CONTRACT 절 참고)**: 이 함수의 pack 스코프는 **메타
+    전용 fast-path 의 부분 오염만** 막는다. vector 계층의 슬롯 정체성 자체는
+    **`node_id` 단독**이라(pack-qualified 가 아니다), False 이후 호출자의
+    `upsert_texts`(vec0 `DELETE WHERE node_id`=전 팩, pgvector
+    `ON CONFLICT(node_id)`=pack_id 덮음, chroma 동일 id upsert)는 그 슬롯을
+    **누가 마지막에 썼든** 그 팩 값으로 통째로 재작성한다 — 부분 오염은
+    아니지만(관찰 가능한 모든 축이 현재 팩과 일관된다), pack-qualified 슬롯
+    정체성 재설계 없이는 "슬롯 자체를 남의 팩이 차지하는 것"은 막지 못한다.
+    후속 이슈: "vector 슬롯 정체성이 node_id 단독이라 팩 간 공유 id 는
+    last-writer-wins — pack-qualified 정체성 필요 여부"(localcrab, m4 의
+    vector_ambiguous·#182 상호 참조).
 
     **chroma 분기의 한계(2026-08-13 실측 근거)**: chromadb 1.5.7 의 `update`/`upsert`
     는 메타를 **병합**하고(겹치는 키만 갱신, 그 외 키는 존속) `delete`+`add` 만
@@ -380,9 +431,20 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     우회하게 한다(아래 참고). ③ **스테일 키 병합 창**(delete 실패 시 호출자가
     upsert 로 병합 갱신하면 겹치는 키는 새 값, 그 외 옛 키는 그대로 남는다)은
     닫지 않는다 — 그 창은 `localcrab#175` 로 등록돼 있다.
+
+    **sqlalchemy(pgvector) 분기가 chroma 분기와 다른 이유**: chroma 는 `update`/
+    `upsert` 가 메타를 병합만 하고 치환을 못 해(위 참고) delete+add 로 우회해야
+    한다. pgvector 의 `metadata` 는 보통의 PostgreSQL 테이블 컬럼(JSONB)이라
+    `UPDATE ... SET metadata = ...` 가 그 컬럼만 원자적으로 **치환**한다 — sql(vec0)
+    분기의 `+metadata` 보조 컬럼과 동일하게, delete+add 의 TOCTOU 창이나 URI
+    보존 예외 없이 실컬럼 UPDATE 로 충분하다.
     """
     # 백엔드가 전용 API 를 내놓으면 그것을 쓴다 — 내부 속성을 뒤지는 것보다 낫고,
-    # 테스트 더블도 이 축으로 실계약을 흉내낼 수 있다.
+    # 테스트 더블도 이 축으로 실계약을 흉내낼 수 있다. **주의**: 이 지름길은
+    # `pack_id` 를 전달하지 않는다 — 현재 어떤 실 스토어도 `update_metadata` 를
+    # 구현하지 않는다(전부 아래 kind 분기를 탄다). 장차 이 훅을 구현하는
+    # 백엔드가 생기면 **그 구현 자신이** pack 스코프를 책임져야 한다(위
+    # docstring 의 fast-path pack 스코프 계약과 동일한 의무).
     updater = getattr(vec, "update_metadata", None)
     if callable(updater):
         try:
@@ -395,19 +457,28 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
     import json as _json
     try:
         if kind == "sql":
-            cur = handle.execute(f"UPDATE {table} SET metadata = ? WHERE node_id = ?",
-                                  (_json.dumps(meta, ensure_ascii=False), chunk_id))
+            cur = handle.execute(
+                f"UPDATE {table} SET metadata = ? WHERE node_id = ? AND pack_id = ?",
+                (_json.dumps(meta, ensure_ascii=False), chunk_id, pack_id))
             handle.commit()
             # rowcount == 0이면 UPDATE가 아무 행도 못 건드린 것이다(node_id가 벡터
-            # 테이블에 없음 등) — 그런데도 True를 돌려주면 호출자가 "메타를 고쳤다"고
-            # 믿고 doc 기준을 옮기고, 벡터는 옛 메타 그대로 남아 다음 증분이 c_same으로
-            # 넘어간다(영구 불일치). rowcount를 봐야 재임베딩 경로로 보낼 수 있다.
+            # 테이블에 없음, 또는 있어도 다른 팩 소유 — #172 재리뷰) — 그런데도
+            # True를 돌려주면 호출자가 "메타를 고쳤다"고 믿고 doc 기준을 옮기고,
+            # 벡터는 옛 메타 그대로(자기 팩) 또는 남의 메타 그대로(남의 팩) 남아
+            # 다음 증분이 c_same으로 넘어간다(영구 불일치). rowcount를 봐야
+            # 재임베딩 경로로 보낼 수 있다.
             return bool(cur.rowcount)
         if kind == "chroma":
             got = handle.get(ids=[chunk_id],
                              include=["embeddings", "documents", "uris", "metadatas"])
             if not got["ids"]:
                 return False                      # 부재 — 재임베딩(upsert=add, 정확 메타)
+            if got["metadatas"][0].get("pack_id") != pack_id:
+                # 남의 팩 소유 슬롯(공유 node_id 재사용) — 치환하면 남의
+                # document/embedding 은 그대로 두고 metadata 만 갈아치우는
+                # 부분 오염이 된다(#172 재리뷰). False → 호출자의 upsert_texts
+                # 재임베딩이 슬롯 전체를 현재 팩 값으로 재작성한다.
+                return False
             if got.get("uris") and got["uris"][0] is not None:
                 # URI 레코드는 이 시스템이 생산하지 않는다(uris API 사용 전수 검색 0).
                 # 외부 기록으로 보고 파괴적 치환을 하지 않는다. False → upsert 병합:
@@ -440,6 +511,18 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict) -> bool:
                 log.warning("치환 후검증 실패(%s) — 재임베딩으로 우회한다", chunk_id)
                 return False
             return True
+        if kind == "sqlalchemy":
+            from sqlalchemy import text as _sa_text
+            with handle.begin() as _c:
+                cur = _c.execute(
+                    _sa_text(_sqlalchemy_meta_update_sql(table, handle.dialect.name)),
+                    {"meta": _json.dumps(meta), "id": chunk_id, "pid": pack_id},
+                )
+                # sql 분기와 동일 계약: rowcount == 0(node_id 가 벡터 테이블에 없음,
+                # 또는 있어도 다른 팩 소유)이면 False — 조용히 True 를 내면 doc
+                # 기준만 옮겨가고 벡터는 옛/남의 메타로 영구히 남는다(위 sql 분기
+                # 주석과 동일 근거).
+                return bool(cur.rowcount)
     except Exception as exc:                                  # noqa: BLE001
         log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
     return False
@@ -1352,7 +1435,7 @@ def load_chunks_incremental(
                 # 텍스트 경로로 보내 재임베딩시킨다 — 이때 doc은 옛 메타 그대로 두어
                 # 재시도 가능성을 보존한다(비교 기준을 섣불리 옮기지 않는다).
                 try:
-                    if _vec_meta_update(vec, chunk_id, meta):
+                    if _vec_meta_update(vec, chunk_id, meta, pack_name):
                         docs.upsert_source(chunk_id, row["text"], meta)
                         c_meta += 1
                     else:
