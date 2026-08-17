@@ -925,10 +925,12 @@ class TestDryRunEnumerationSeesPredictedPacks:
         assert "3 not yet in the registry" in out_dry
         # R5-B (PR #177 review round 5): registry_enumeration's reason now
         # folds in step 3.5's doc-derived count too (0 here -- no doc
-        # content seeded by this test).
+        # content seeded by this test). The first number counts the default
+        # pack alongside the graph-derived ones, which is why it is labelled
+        # "default+graph-derived" rather than "graph-derived".
         assert (
             "registry_enumeration: applied (4 row(s) needed registering "
-            "(graph-derived=4, doc-derived=0))" in out_dry
+            "(default+graph-derived=4, doc-derived=0))" in out_dry
         )
         assert "edge-inferred pack_id" in out_dry  # apply-only-limitation note
 
@@ -938,7 +940,7 @@ class TestDryRunEnumerationSeesPredictedPacks:
         assert "3 not yet in the registry" in out_apply
         assert (
             "registry_enumeration: applied (4 row(s) needed registering "
-            "(graph-derived=4, doc-derived=0))" in out_apply
+            "(default+graph-derived=4, doc-derived=0))" in out_apply
         )
 
         sql = make_sql_store(get_settings())
@@ -2300,11 +2302,19 @@ class TestDocDerivedPackIdRegistration:
     def test_9_step_3_5_failure_overwrites_registry_enumeration_to_failed(
         self, bootstrapped_owner, env, monkeypatch, capsys
     ):
-        """Step 3 (graph enumeration) succeeds and records something other
-        than "failed" for registry_enumeration BEFORE step 3.5 runs -- this
-        proves the explicit overwrite (not the outer exception handler's
-        setdefault, which would otherwise preserve step 3's value and hide
-        this failure)."""
+        """A step 3.5 failure must surface as registry_enumeration: failed
+        with rc 1, and must not let step 3's own outcome text reach the
+        summary.
+
+        NOTE on what this does and does not prove: today the
+        stage_outcomes["registry_enumeration"] assignment happens AFTER step
+        3.5, so the outer handler's setdefault would already produce
+        "failed" here on its own -- the outcome assertions below therefore
+        pin the CONTRACT, not the explicit overwrite. What is specific to
+        the explicit overwrite is the reason text: the outer handler writes
+        a bare str(exc), so the "(step 3.5) failed:" prefix appears only if
+        the explicit overwrite ran. That is asserted separately below.
+        """
         _seed_graph(env)
         _seed_doc(env)
 
@@ -2322,3 +2332,86 @@ class TestDocDerivedPackIdRegistration:
         # step 3's own outcome text must NOT survive into the summary.
         assert "registry_enumeration: applied" not in out
         assert "registry_enumeration: clean" not in out
+        # Only the explicit overwrite produces this prefix -- the outer
+        # handler's setdefault would write a bare str(exc) instead.
+        assert "document-derived pack_id registration (step 3.5) failed" in out
+
+
+class TestRoundFiveReviewConformance:
+    """PR #177 review round 5 follow-ups: the step 3.5 extraction must not
+    have changed step 3's observable behaviour, and the dry-run registry
+    count must stay a count of DISTINCT ids."""
+
+    def test_graph_foreign_owner_gate_aborts_before_printing_the_summary(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """The gate sat before the "graph distinct pack_id" summary before
+        step 3.5 was extracted. On an abort the operator must still see the
+        error and NO summary line for a run that is stopping."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "n1", {"pack_id": "squatted"}, space_id="concept")
+        finally:
+            graph.close()
+        sql = make_sql_store(get_settings())
+        create_pack(sql, "someone-else", "squatted", title="Not yours")
+
+        rc = migrate.main([])
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+
+        assert rc == 1
+        # Original wording, byte-for-byte with the pre-refactor message.
+        assert "already exist in the graph store's content" in combined
+        # ...and no summary line for the aborted enumeration. That line IS
+        # printed on a normal run (see test_x2_dry_run_report_matches_apply_result,
+        # which asserts its "N not yet in the registry" tail), so its absence
+        # here really does pin the gate-before-summary ordering.
+        assert "graph distinct pack_id:" not in combined
+
+    def test_dry_run_does_not_double_count_a_pack_in_both_graph_and_docs(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """A pack_id present in BOTH graph and doc content is ONE registry
+        row. In a dry-run nothing is inserted, so step 3.5's re-read of the
+        registry would report it as unregistered a second time unless step
+        3's planned ids are folded in."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "g1", {"pack_id": "pack-shared"}, space_id="concept")
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "d1", {"source_path": "/packs/pack-shared/x.md"}
+            )
+        finally:
+            docs.close()
+
+        rc_dry = migrate.main([])
+        out_dry = capsys.readouterr().out
+        assert rc_dry == 0
+        # default + pack-shared == 2 distinct rows, counted once each.
+        assert "2 row(s) needed registering" in out_dry
+        assert "doc-derived=0" in out_dry
+
+        rc_apply = migrate.main(["--apply", "--skip-backup"])
+        out_apply = capsys.readouterr().out
+        assert rc_apply == 0
+        # The apply run must report the SAME total the dry-run predicted.
+        assert "2 row(s) needed registering" in out_apply
+
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID, "pack-shared"}

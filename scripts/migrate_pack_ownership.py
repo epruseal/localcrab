@@ -187,13 +187,65 @@ def _graph_edge_pack_ids(graph: Any) -> tuple[set[str], bool]:
     return pack_ids, True
 
 
+def _assert_no_foreign_owned(
+    owner_id: str,
+    all_pack_ids: set[str],
+    already_owners: dict[str, str],
+    accept_foreign_owned_packs: bool,
+    *,
+    context: str,
+    content_label: str,
+) -> list[str]:
+    """The foreign-owner gate, split out of ``_register_pack_id_candidates``
+    so each caller can fire it at the exact point in its own output where
+    it belongs.
+
+    ``_register_graph_packs`` must run this BEFORE printing its
+    "graph distinct pack_id: ..." summary, which is where it sat before the
+    step-3.5 refactor -- on an abort the operator previously saw the error
+    and no summary, and that ordering is part of step 3's preserved
+    behaviour (PR #177 review round 5). ``context`` labels the provenance in
+    the message; ``content_label`` names where that content lives, kept as a
+    separate argument so the graph wording stays byte-identical to what it
+    was before the refactor.
+
+    Returns the foreign-owned ids (empty unless ``accept_foreign_owned_packs``
+    downgraded the raise to a warning).
+    """
+    foreign_owned = sorted(
+        pid for pid in all_pack_ids if pid in already_owners and already_owners[pid] != owner_id
+    )
+    if foreign_owned:
+        detail = ", ".join(f"{pid!r} (owner={already_owners[pid]!r})" for pid in foreign_owned)
+        if not accept_foreign_owned_packs:
+            raise RuntimeError(
+                f"{len(foreign_owned)} {context} pack_id(s) already exist in "
+                f"{content_label} but are registered to a DIFFERENT "
+                f"owner than the bootstrap owner {owner_id!r}: {detail}. "
+                "This can happen if remote pack registration was opened "
+                "before this migration ran (someone else claimed one of "
+                "these exact slugs first) -- or, more benignly, a re-run "
+                "colliding with a genuinely new user pack. This script "
+                "cannot tell those apart automatically -- it needs a human "
+                "to verify. If these rows are confirmed to be legitimate "
+                "(e.g. a safe re-run, or the owner is expected to hold this "
+                "legacy content), re-run with --accept-foreign-owned-packs "
+                "to skip them and proceed with everything else unchanged."
+            )
+        print(
+            f"  ! --accept-foreign-owned-packs: skipping {len(foreign_owned)} "
+            f"{context} pack_id(s) already registered to a different owner: {detail}"
+        )
+    return foreign_owned
+
+
 def _register_pack_id_candidates(
     sql: Any,
     owner_id: str,
     apply: bool,
     all_pack_ids: set[str],
     already_owners: dict[str, str],
-    accept_foreign_owned_packs: bool,
+    foreign_owned: list[str],
     *,
     context: str,
     meta_by_pack_id: dict[str, dict[str, Any]] | None = None,
@@ -225,31 +277,6 @@ def _register_pack_id_candidates(
     left alone, same as any other already-registered pack_id).
     """
     from opencrab.pack.ownership import _insert_pack
-
-    foreign_owned = sorted(
-        pid for pid in all_pack_ids if pid in already_owners and already_owners[pid] != owner_id
-    )
-    if foreign_owned:
-        detail = ", ".join(f"{pid!r} (owner={already_owners[pid]!r})" for pid in foreign_owned)
-        if not accept_foreign_owned_packs:
-            raise RuntimeError(
-                f"{len(foreign_owned)} {context} pack_id(s) already exist in "
-                f"{context} content but are registered to a DIFFERENT owner "
-                f"than the bootstrap owner {owner_id!r}: {detail}. This can "
-                "happen if remote pack registration was opened before this "
-                "migration ran (someone else claimed one of these exact "
-                "slugs first) -- or, more benignly, a re-run colliding with "
-                "a genuinely new user pack. This script cannot tell those "
-                "apart automatically -- it needs a human to verify. If "
-                "these rows are confirmed to be legitimate (e.g. a safe "
-                "re-run, or the owner is expected to hold this legacy "
-                "content), re-run with --accept-foreign-owned-packs to skip "
-                "them and proceed with everything else unchanged."
-            )
-        print(
-            f"  ! --accept-foreign-owned-packs: skipping {len(foreign_owned)} "
-            f"{context} pack_id(s) already registered to a different owner: {detail}"
-        )
 
     candidates = sorted(pid for pid in all_pack_ids if pid not in already_owners)
     created = 0
@@ -355,6 +382,18 @@ def _register_graph_packs(
         predicted_pack_ids.update(pids)
     all_pack_ids = set(node_meta) | edge_pack_ids | predicted_pack_ids
 
+    # Gate BEFORE the summary print -- that is where it sat before step 3.5
+    # was extracted, and on an abort the operator must not see a summary
+    # line for a run that is about to stop (PR #177 review round 5).
+    foreign_owned = _assert_no_foreign_owned(
+        owner_id,
+        all_pack_ids,
+        already_owners,
+        accept_foreign_owned_packs,
+        context="graph",
+        content_label="the graph store's content",
+    )
+
     print(
         f"  graph distinct pack_id: {len(all_pack_ids)} total "
         f"(nodes={len(node_meta)}, edges={len(edge_pack_ids)}, "
@@ -374,7 +413,7 @@ def _register_graph_packs(
         apply,
         all_pack_ids,
         already_owners,
-        accept_foreign_owned_packs,
+        foreign_owned,
         context="graph",
         meta_by_pack_id=node_meta,
     )
@@ -384,6 +423,11 @@ def _register_graph_packs(
         "created": result["created"],
         "edges_enumerable": edges_enumerable,
         "foreign_owned": result["foreign_owned"],
+        # Step 3.5 needs these to avoid double-counting a pack_id that lives
+        # in BOTH graph and doc content: in a dry-run nothing was inserted,
+        # so its re-read of the registry would otherwise report the same id
+        # as "not yet registered" a second time.
+        "candidates": result["candidates"],
     }
 
 
@@ -1262,6 +1306,7 @@ def _register_doc_packs(
     default_pack_id: str,
     apply: bool,
     accept_foreign_owned_packs: bool,
+    already_planned_pack_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """R5-B (PR #177 review round 5 P1) preflight: register every
     DOCUMENT-derived pack_id BEFORE step 4 (main()) writes a single doc
@@ -1315,18 +1360,36 @@ def _register_doc_packs(
             "from registration, see _register_doc_packs' docstring."
         )
     already_owners = _registered_pack_owners(sql)
+    # In a dry-run nothing was actually inserted by step 1 or step 3, so the
+    # registry snapshot re-read here still lacks every pack_id those steps
+    # only PLANNED to create. Counting those again would make the dry-run
+    # report claim more registrations than a real --apply would perform (a
+    # pack_id present in BOTH graph and doc content would be counted twice,
+    # and `default` on top of that). Fold them in as if they existed, so the
+    # summed "N row(s) needed registering" stays a count of DISTINCT ids in
+    # both modes. Under --apply they are already in `already_owners`, so this
+    # is a no-op there. (PR #177 review round 5.)
+    already_registered = set(already_owners) | set(already_planned_pack_ids or ())
+    foreign_owned = _assert_no_foreign_owned(
+        owner_id,
+        all_pack_ids,
+        already_owners,
+        accept_foreign_owned_packs,
+        context="document-derived",
+        content_label="document content",
+    )
     print(
         f"  doc-derived distinct pack_id: {len(all_pack_ids)} total "
         f"(already-present={len(doc_ids)}, predicted={len(predicted_ids)}), "
-        f"{sum(1 for pid in all_pack_ids if pid not in already_owners)} not yet in the registry"
+        f"{sum(1 for pid in all_pack_ids if pid not in already_registered)} not yet in the registry"
     )
     result = _register_pack_id_candidates(
         sql,
         owner_id,
         apply,
-        all_pack_ids,
+        all_pack_ids - set(already_planned_pack_ids or ()),
         already_owners,
-        accept_foreign_owned_packs,
+        foreign_owned,
         context="document-derived",
     )
     return {
@@ -1700,12 +1763,18 @@ def main(argv: list[str] | None = None) -> int:
                 default_pack_id,
                 args.apply,
                 args.accept_foreign_owned_packs,
+                already_planned_pack_ids={default_pack_id, *registry_stats.get("candidates", ())},
             )
         except Exception as exc:
-            # The outer `except Exception as exc:` below uses setdefault,
-            # which would otherwise PRESERVE whatever step 3 just recorded
-            # above (e.g. "clean"/"applied") and hide this failure entirely.
-            # Must overwrite explicitly (design v2 R5-B point 5).
+            # Defensive, and deliberately so: today the
+            # stage_outcomes["registry_enumeration"] assignment happens BELOW
+            # this block, so the outer handler's setdefault would already
+            # record "failed" on its own. Writing it explicitly here keeps
+            # that true if the assignment is ever moved back above step 3.5
+            # (where it lived before this step existed) -- at which point
+            # setdefault would silently preserve step 3's "clean"/"applied"
+            # and hide this failure. The reason string below is also more
+            # specific than the outer handler's bare str(exc).
             stage_outcomes["registry_enumeration"] = {
                 "outcome": "failed",
                 "reason": f"document-derived pack_id registration (step 3.5) failed: {exc}",
@@ -1727,7 +1796,7 @@ def main(argv: list[str] | None = None) -> int:
                 registry_outcome, registry_reason = (
                     "applied",
                     f"{registry_pending} row(s) needed registering "
-                    f"(graph-derived={graph_registry_pending}, "
+                    f"(default+graph-derived={graph_registry_pending}, "
                     f"doc-derived={doc_unregistered})",
                 )
         stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
