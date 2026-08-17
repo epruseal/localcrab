@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
                 },
                 "include_unpackaged": {
                     "type": "boolean",
-                    "description": "Include items with no pack_id when pack filtering is active.",
+                    "description": ("IGNORED (#147). Reads are always scoped to the packs you can read, and data belonging to no pack is outside every scope. Passing true returns a warning, not unpackaged rows."),
                     "default": False,
                 },
                 "include_pack_provenance": {

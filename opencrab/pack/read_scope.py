@@ -142,6 +142,19 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     ``count_nodes`` spans labels ``list_packs`` does not), and the log
     text says so. They are not a refusal basis.
 
+    Known imprecision, recorded rather than papered over: the graph side of
+    the comparison comes from ``list_packs``, which stringifies whatever the
+    ``pack_id`` property holds. A row whose pack_id is the JSON number ``0``
+    or the boolean ``false`` therefore arrives here as ``"0"`` / ``"false"``
+    and can trigger a refusal, even though the Python rule
+    (``_node_pack_id`` / ``scope_pack_id``) treats those as "no pack_id" and
+    would never have made the row readable. The refusal is still actionable
+    -- the migration registers exactly the ids ``list_packs`` reports, so
+    re-running it clears the condition -- but the row stays invisible
+    afterwards. Distinguishing the two would need a backend primitive that
+    applies the Python falsy rule in SQL/Cypher on all four stores; the
+    measured population of such rows is zero, so that is not built here.
+
     Skipped entirely when the graph store is unavailable: the pack_id set
     cannot be enumerated, so the check cannot run. Skipping does not widen
     anyone's read scope -- that stays the registry-derived set either way.

@@ -305,9 +305,12 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     scope = _current_read_scope(ctx)
     result = graph.get_node_by_id_scoped(node_id, sorted(scope))
 
-    # A node outside the scope returns the response an absent node returns,
-    # byte for byte (#143 invariant 7) -- there is no second branch here to
-    # tell the two apart, which is the point.
+    # A node outside the scope returns the response an absent node returns.
+    # Identical apart from the node_id echoed back, which is the caller's own
+    # input and carries no information they did not already have (#143
+    # invariant 7). There is no second branch here to tell the two cases
+    # apart, which is the point -- a distinct "not permitted" path would be
+    # free to drift into a distinguishable one.
     if result is None:
         return {"found": False, "node_id": node_id}
     return {"found": True, "node_id": node_id, "node": result}
@@ -357,9 +360,17 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
+    #147: every branch is pack-scoped now, and the calls below are the
+    ``*_scoped`` variants -- ``count_exported_nodes_scoped`` /
+    ``export_nodes_scoped`` (graph) and ``list_nodes_scoped`` (doc store).
+    They take the caller's readable pack set and match on ``pack_id``
+    ALONE; the older ``export_nodes``/``count_exported_nodes`` also matched
+    ``source``/``source_id``, which are caller-written and therefore
+    unusable for an access decision (#143).
+
     WITH pack_id: this calls (in this order, matching the code below) the
-    graph store's count_exported_nodes(pack_id=..., space=..., no LIMIT)
-    first for ``total``, THEN export_nodes(pack_id=..., space=..., limit=...)
+    graph store's count_exported_nodes_scoped(pack_ids, space=..., no LIMIT)
+    first for ``total``, THEN export_nodes_scoped(pack_ids, space=..., limit=...)
     for the displayed page. All three concrete backends (SQL-backed
     local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j, ``pack_id``
     too) into their native query ahead of ``limit`` — see each backend's
@@ -519,11 +530,13 @@ def ontology_list_edges(
 ) -> dict[str, Any]:
     """List edges, optionally filtered by pack_id.
 
-    All four backends implement export_edges() natively (wide shape:
-    source_props/source_labels/target_props/target_labels/rel_props/relation
-    — see opencrab/stores/_graph_protocol.py). pack_id matches either
-    endpoint's pack_id/source/source_id, or the edge's own — the backend
-    owns that filter, not this function.
+    #147: routed through ``export_edges_scoped``, not ``export_edges``.
+    The scoped predicate requires BOTH endpoints to be in the caller's
+    readable set (plus the edge's own pack_id, when it has one) -- an edge
+    row carries both endpoints' full properties, so one unreadable endpoint
+    would disclose that node. ``export_edges``'s OR-any-endpoint matching,
+    which also accepted caller-written ``source``/``source_id``, remains for
+    pack export and is not an access decision.
     """
     from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
     from opencrab.pack.read_scope import narrow

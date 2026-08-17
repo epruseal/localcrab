@@ -706,7 +706,7 @@ def extract(
     "--include-unpackaged",
     is_flag=True,
     default=False,
-    help="Include items with no pack_id (legacy data). Only meaningful with --pack-id.",
+    help=("Ignored (#147): reads are always scoped to the packs you can read. Passing it prints a warning instead of including unpackaged rows.")
 )
 @click.option(
     "--show-pack/--hide-pack",
@@ -757,7 +757,14 @@ def query(
     # reconciliation, not just the 4 server entry points -- this command
     # bypasses those entry points entirely and would otherwise silently
     # return 0 results for an unmigrated deployment instead of refusing.
-    assert_registry_covers_graph(sql, neo4j)
+    # Same operator-facing shape as `serve`: the refusal is a
+    # deployment problem with an actionable message, so print it and
+    # exit 1 rather than showing a traceback.
+    try:
+        assert_registry_covers_graph(sql, neo4j)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
 
     space_filter = [s.strip() for s in spaces.split(",")] if spaces else None
 
@@ -998,7 +1005,14 @@ def export_neo4j_pack(
     cfg = get_settings()
     stores = _make_stores(cfg, graph=True, sql=True)
     graph, sql = stores.graph, stores.sql
-    assert_registry_covers_graph(sql, graph)
+    # Same operator-facing shape as `serve`: the refusal is a
+    # deployment problem with an actionable message, so print it and
+    # exit 1 rather than showing a traceback.
+    try:
+        assert_registry_covers_graph(sql, graph)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
     scope = read_scope(sql, principal)
     status = export_neo4j_opencrab_ingest(
         graph,
@@ -1066,7 +1080,14 @@ def packs_list() -> None:
     # entry points entirely -- without its own call here, an unmigrated
     # deployment would just silently list an empty/partial registry instead
     # of refusing to start.
-    assert_registry_covers_graph(sql, graph)
+    # Same operator-facing shape as `serve`: the refusal is a
+    # deployment problem with an actionable message, so print it and
+    # exit 1 rather than showing a traceback.
+    try:
+        assert_registry_covers_graph(sql, graph)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
     scope = read_scope(sql, principal)
     registry = [p for p in load_pack_registry(cfg.local_data_dir) if p.pack_id in scope]
     if not registry:
@@ -1113,7 +1134,14 @@ def packs_show(pack_id: str) -> None:
     cfg = get_settings()
     stores = _make_stores(cfg, graph=True, sql=True)
     graph, sql = stores.graph, stores.sql
-    assert_registry_covers_graph(sql, graph)
+    # Same operator-facing shape as `serve`: the refusal is a
+    # deployment problem with an actionable message, so print it and
+    # exit 1 rather than showing a traceback.
+    try:
+        assert_registry_covers_graph(sql, graph)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
     scope = read_scope(sql, principal)
 
     pack = get_pack(cfg.local_data_dir, pack_id)

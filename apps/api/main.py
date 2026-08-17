@@ -60,7 +60,7 @@ class QueryRequest(BaseModel):
     graph_depth: int = Field(default=1, ge=1, le=4, description="Neighborhood expansion depth.")
     pack_ids: list[str] | None = Field(default=None, description="Restrict search to these content packs.")
     auto_pack: bool = Field(default=False, description="Auto-select the best-matching pack for the question.")
-    include_unpackaged: bool = Field(default=False, description="Also include unpackaged nodes when a pack filter is active.")
+    include_unpackaged: bool = Field(default=False, description=("IGNORED (#147). Reads are always scoped to the packs you can read; data belonging to no pack is outside every scope. Passing true returns a warning, not unpackaged rows."))
 
 
 class ImpactRequest(BaseModel):

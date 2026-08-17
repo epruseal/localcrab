@@ -257,7 +257,8 @@ class TestNoExistenceLeak:
             foreign_edges = ontology_list_edges(pack_id=PACK_B)
             absent_edges = ontology_list_edges(pack_id="no-such-pack-at-all")
 
-        # Byte-identical apart from the echoed filter the caller supplied.
+        # Identical apart from the pack_id echoed back, which is the
+        # caller's own input.
         assert foreign_nodes["nodes"] == absent_nodes["nodes"] == []
         assert foreign_nodes["total"] == absent_nodes["total"] == 0
         assert foreign_edges["edges"] == absent_edges["edges"] == []
@@ -275,12 +276,30 @@ class TestNoExistenceLeak:
         assert absent == {"found": False, "node_id": "no-such-node"}
         assert set(foreign) == set(absent)
 
-    def test_impact_on_foreign_node_matches_a_nonexistent_node(self, ctx, seeded):
+    def test_impact_on_foreign_node_matches_a_nonexistent_node(
+        self, ctx, graph, docs, seeded
+    ):
+        """The foreign anchor must have REAL neighbours.
+
+        Without them the traversal returns empty regardless of the pack
+        filter, and `find_neighbors(pack_ids=...)` can be reverted to
+        unscoped with this test still green (found by mutation).
+        """
         from opencrab.mcp.tools import ontology_impact
+
+        _node(graph, docs, PACK_B, "b-child")
+        graph.upsert_edge("Document", "b-secret", "relates_to", "Document", "b-child", {})
 
         with _as(ctx, seeded["alice"]):
             foreign = ontology_impact("b-secret")
             absent = ontology_impact("no-such-node")
+        assert foreign["affected_nodes"] == []
+
+        # Bob reaches the same neighbour, so the empty list above is the
+        # scope and not an empty graph.
+        with _as(ctx, seeded["bob"]):
+            owned = ontology_impact("b-secret")
+        assert owned["affected_nodes"] != []
 
         def _shape(r):
             # summary embeds the node_id the CALLER supplied, so normalise
@@ -294,14 +313,33 @@ class TestNoExistenceLeak:
     def test_lever_simulate_on_foreign_lever_matches_an_unknown_lever(
         self, ctx, graph, docs, seeded
     ):
+        """The foreign lever must have REAL relations for this to prove anything.
+
+        A lever with no out-edges answers with empty lists whether or not
+        any scoping exists, so a fixture without them lets the entire
+        anchor gate and post-filter be deleted with this test still green
+        (found by mutation).
+        """
         from opencrab.mcp.tools import ontology_lever_simulate
 
         _node(graph, docs, PACK_B, "b-lever")
+        _node(graph, docs, PACK_B, "b-outcome")
+        _node(graph, docs, PACK_B, "b-concept")
+        graph.upsert_edge("Document", "b-lever", "raises", "Document", "b-outcome", {})
+        graph.upsert_edge("Document", "b-lever", "affects", "Document", "b-concept", {})
+
         with _as(ctx, seeded["alice"]):
             foreign = ontology_lever_simulate("b-lever", "raises", 0.5)
             absent = ontology_lever_simulate("no-such-lever", "raises", 0.5)
         assert foreign["predicted_outcome_changes"] == absent["predicted_outcome_changes"] == []
         assert foreign["affected_concepts"] == absent["affected_concepts"] == []
+
+        # The other direction: bob DOES see them, so the emptiness above is
+        # the scope talking and not an inert fixture.
+        with _as(ctx, seeded["bob"]):
+            owned = ontology_lever_simulate("b-lever", "raises", 0.5)
+        assert [o["node_id"] for o in owned["predicted_outcome_changes"]] == ["b-outcome"]
+        assert [c["node_id"] for c in owned["affected_concepts"]] == ["b-concept"]
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +439,11 @@ class TestStoreLevelEmptyScope:
         assert docs.list_nodes_scoped([], limit=100) == []
 
     def test_find_neighbors_returns_nothing_for_an_empty_scope(self, graph, seeded):
+        # An edge has to exist, or this passes against the pre-#147
+        # fail-open too: a node with no neighbours returns [] either way.
+        graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
         assert graph.find_neighbors("a-secret", pack_ids=[]) == []
+        assert graph.find_neighbors("a-secret", pack_ids=[PACK_A, PACK_PUBLIC]) != []
 
     def test_node_and_edge_pass_helpers_distinguish_none_from_empty(self):
         from opencrab.stores._graph_common import _edge_passes, _node_passes
@@ -494,7 +536,9 @@ class TestScopedStorePredicates:
         assert _ids(docs.list_nodes_scoped(big, limit=500)) == _ids(
             docs.list_nodes_scoped(sorted({PACK_A, PACK_PUBLIC}), limit=500)
         )
-        assert graph.search_nodes("title", pack_ids=big, limit=50) is not None
+        assert _ids(graph.search_nodes("title", pack_ids=big, limit=50)) == _ids(
+            graph.search_nodes("title", pack_ids=sorted({PACK_A, PACK_PUBLIC}), limit=50)
+        )
         assert graph.find_neighbors("a-secret", pack_ids=big) == graph.find_neighbors(
             "a-secret", pack_ids=sorted({PACK_A, PACK_PUBLIC})
         )
@@ -512,6 +556,114 @@ class TestScopedStorePredicates:
             )
         got = _ids(graph.export_nodes_scoped(sorted({PACK_A, "", "0", "false", "False"}), limit=100))
         assert got == {"a-secret"}
+
+
+class TestRetrievalPipelineScoping:
+    """HybridQuery itself, against real stores.
+
+    The list tools and the pipeline reach the data through different code,
+    and only the pipeline is what ``ontology_query`` / ``POST /api/query``
+    actually run. Mutation testing showed the rest of this file never called
+    ``query()`` or any leg with an empty scope, so every empty-scope guard in
+    ``opencrab/ontology/query.py`` could be deleted with the suite green.
+    """
+
+    @pytest.fixture
+    def hybrid(self, graph, docs):
+        from opencrab.ontology.query import HybridQuery
+
+        h = HybridQuery(MagicMock(available=False), graph)
+        h._doc_store = docs
+        return h
+
+    def test_query_returns_nothing_for_an_empty_scope(self, hybrid, seeded):
+        # Data exists; only the scope is empty. Asserting on an empty store
+        # would prove nothing.
+        assert hybrid.query("title", pack_ids=[]).results == []
+
+    def test_query_returns_own_and_public_only(self, hybrid, sql, seeded):
+        alice = sorted(read_scope(sql, seeded["alice"]))
+        got = {r.node_id for r in hybrid.query("title", pack_ids=alice).results}
+        assert "b-secret" not in got
+        assert got & {"a-secret", "shared-doc"}
+
+    @pytest.mark.parametrize(
+        "leg", ["_bm25_search", "_fts_search", "_vector_search", "_graph_expand"]
+    )
+    def test_every_leg_is_empty_for_an_empty_scope(self, hybrid, graph, seeded, leg):
+        graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
+        fn = getattr(hybrid, leg)
+        if leg == "_graph_expand":
+            assert fn(["a-secret"], 1, 10, pack_ids=[]) == []
+        else:
+            assert fn("title", None, 10, pack_ids=[]) == []
+
+    def test_vector_leg_is_empty_for_an_empty_scope_even_with_hits_available(
+        self, graph, docs, seeded
+    ):
+        """The vector leg is the one that genuinely needs query.py's guard.
+
+        `_build_chroma_where` cannot express "match nothing" -- with no
+        clauses it returns None, which the vector store reads as "no
+        filter". So unlike the SQL-backed legs, this one has no second line
+        of defence underneath it: remove the empty-scope short-circuit and
+        an empty scope becomes an unfiltered similarity search. A store
+        double that is `available` and returns hits is required to show it;
+        an unavailable one short-circuits earlier and proves nothing.
+        """
+        from opencrab.ontology.query import HybridQuery
+
+        chroma = MagicMock(available=True)
+        chroma.query.return_value = [
+            {"id": "b-secret", "document": "leak", "distance": 0.1,
+             "metadata": {"node_id": "b-secret", "pack_id": PACK_B}},
+        ]
+        h = HybridQuery(chroma, graph)
+        h._doc_store = docs
+
+        assert h._vector_search("q", None, 10, pack_ids=[]) == []
+        # And the store was never even asked -- the scope is answered before
+        # a where-clause that cannot express "nothing" is ever built.
+        chroma.query.assert_not_called()
+
+        # Same double, non-empty scope: hits do flow, so the emptiness above
+        # is the scope and not a broken double.
+        assert h._vector_search("q", None, 10, pack_ids=[PACK_B]) != []
+
+    def test_graph_expand_is_not_empty_when_the_scope_allows_it(
+        self, hybrid, graph, sql, seeded
+    ):
+        """Pins that the empty-scope assertions above are about the scope."""
+        graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
+        alice = sorted(read_scope(sql, seeded["alice"]))
+        assert hybrid._graph_expand(["a-secret"], 1, 10, pack_ids=alice) != []
+
+    def test_keyword_search_fallback_is_scoped(self, hybrid, sql, seeded):
+        """The REST zero-result fallback. Its store method had no pack
+        parameter at all before #147."""
+        alice = sorted(read_scope(sql, seeded["alice"]))
+        got = {
+            (r.get("node") or {}).get("node_id")
+            for r in hybrid.keyword_search("title", pack_ids=alice, limit=50)
+        }
+        assert "b-secret" not in got
+        assert got == {"a-secret", "shared-doc"}
+        assert hybrid.keyword_search("title", pack_ids=[], limit=50) == []
+
+
+class TestSearchNodesScoping:
+    """``search_nodes`` directly: the predicate the fallback above depends on."""
+
+    def test_search_nodes_excludes_other_users_rows(self, graph, sql, seeded):
+        alice = sorted(read_scope(sql, seeded["alice"]))
+        got = _ids(graph.search_nodes("title", pack_ids=alice, limit=50))
+        assert got == {"a-secret", "shared-doc"}
+
+        bob = sorted(read_scope(sql, seeded["bob"]))
+        assert _ids(graph.search_nodes("title", pack_ids=bob, limit=50)) == {
+            "b-secret",
+            "shared-doc",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +773,33 @@ class TestPackSelectionScoping:
 
         for text in list(ps._MCP_WARNINGS.values()) + list(ps._CLI_WARNINGS.values()):
             assert "full-store" not in text
+
+    def test_client_facing_include_unpackaged_descriptions_say_it_is_ignored(self):
+        """The warning wording was fixed; the parameter descriptions must be too.
+
+        A caller reads the parameter description, not the warning map. Three
+        interfaces expose this flag and all three used to promise it would
+        surface unpackaged rows -- a response that describes a filter the
+        server never applied.
+        """
+        from opencrab.mcp.tools import TOOL_SCHEMAS
+
+        mcp_desc = TOOL_SCHEMAS["ontology_query"]["inputSchema"]["properties"][
+            "include_unpackaged"
+        ]["description"]
+        assert "IGNORED" in mcp_desc
+
+        from apps.api.main import QueryRequest
+
+        rest_desc = QueryRequest.model_fields["include_unpackaged"].description
+        assert "IGNORED" in rest_desc
+
+        from opencrab.cli import query as cli_query
+
+        cli_help = next(
+            p.help for p in cli_query.params if p.name == "include_unpackaged"
+        )
+        assert "Ignored" in cli_help
 
 
 # ---------------------------------------------------------------------------

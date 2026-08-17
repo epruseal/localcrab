@@ -189,12 +189,16 @@ class BM25Index:
         limit:
             Maximum results.
         pack_ids:
-            Optional pack_id filter. Docs whose inferred pack_id is not in
-            this set are skipped. Docs with no inferable pack_id are dropped
-            unless ``include_unpackaged`` is True.
+            The readable pack scope (#147). Docs whose pack_id is not in it
+            are skipped, and so are docs with no pack_id. An EMPTY set means
+            nothing matches -- it is not "no filter". This index is a
+            process-wide singleton holding every user's nodes, so this
+            filter is the only thing separating them; there is no per-user
+            index.
         include_unpackaged:
-            When ``pack_ids`` is set, also pass docs that have no detectable
-            pack_id (legacy data).
+            IGNORED (#147). Kept for signature compatibility. Data belonging
+            to no pack is outside every read scope (#143 invariant 5), so
+            passing True does not surface legacy rows.
         """
         q_tokens = _tokenize(query)
         if not q_tokens or not self._docs:
