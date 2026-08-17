@@ -2254,6 +2254,76 @@ class _NullDocs:
         pass
 
 
+class TestVecMetaUpdateChromaUriRealBackend:
+    """[U3, #175 v2] Same scenario as
+    ``TestVecMetaUpdateChromaReplace.test_uri_is_preserved_when_caller_falls_back_to_upsert``
+    (⑥), but against a REAL ``ChromaStore``/chromadb collection instead of the
+    ``_FakeChromaVec`` double — proves ``_vec_meta_update``'s uri branch (False
+    return) plus the caller's ``upsert_texts`` fallback (now merge-routed for
+    uri ids, see ``ChromaStore.upsert_texts``) actually preserve the uri
+    end-to-end through production code on *both* sides of the seam, not just
+    against a double that encodes the same assumption twice."""
+
+    def _seed_uri_record(self, vec, doc_id, document, metadata, uri):
+        vec._collection.add(
+            ids=[doc_id], embeddings=[[0.1] * 32], documents=[document],
+            metadatas=[metadata], uris=[uri],
+        )
+
+    def test_vec_meta_update_returns_false_for_real_uri_record(self, tmp_path):
+        from _vec_helpers import build_vector_store
+        vec = build_vector_store("chroma", tmp_path)
+        # pack_id 를 심고 같은 값으로 호출한다 — chroma 분기는 uri 검사보다 팩 소유
+        # 검사가 앞서므로(#172), 팩을 일치시켜야 False 의 원인이 URI 분기임이 확정된다.
+        self._seed_uri_record(
+            vec, "c1", "본문", {"pack_id": "pack-1", "y": "1"}, "http://example.com/c1"
+        )
+        # 대조군: uri 만 없는 같은 조건의 레코드는 True 여야 한다.
+        vec.upsert_texts(texts=["본문"], metadatas=[{"pack_id": "pack-1", "y": "1"}], ids=["c2"])
+        assert pack_load._vec_meta_update(
+            vec, "c2", {"pack_id": "pack-1", "y": "99"}, "pack-1"
+        ) is True, "대조군(uri 없음)이 False — False 의 원인이 URI 분기가 아니다"
+
+        ok = pack_load._vec_meta_update(
+            vec, "c1", {"pack_id": "pack-1", "y": "99"}, "pack-1"
+        )
+
+        assert ok is False, "실 chroma URI 레코드에서 _vec_meta_update 가 True 를 냈다"
+        got = vec._collection.get(ids=["c1"], include=["uris"])
+        assert got["uris"][0] == "http://example.com/c1", (
+            "False 반환 자체가 (재임베딩 우회 전에) URI 를 건드렸다")
+
+    def test_uri_preserved_end_to_end_through_load_chunks_incremental(self, tmp_path):
+        """_vec_meta_update → False → load_chunks_incremental 의 재임베딩
+        폴백(upsert_texts, 이제 uri id 는 merge 경로) 경유 → URI 잔존 +
+        document/meta 갱신 + 성공 카운터(c_txt) 단언."""
+        from _vec_helpers import build_vector_store
+        vec = build_vector_store("chroma", tmp_path)
+
+        old_row = _chunk_row("c1", "본문A", y="1")
+        new_row = _chunk_row("c1", "본문A", y="99")   # 텍스트 불변, 메타만 변경
+        old_meta = transform_chunk_meta("pack-1", old_row)
+        new_meta = transform_chunk_meta("pack-1", new_row)
+
+        self._seed_uri_record(vec, "c1", "본문A", old_meta, "http://example.com/c1")
+        live_chunks = {"c1": ("본문A", old_meta)}
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        stats = pack_load.load_chunks_incremental(
+            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+
+        assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
+        assert c_txt == 1, "재임베딩(텍스트) 경로로 카운트돼야 한다"
+
+        got = vec._collection.get(
+            ids=["c1"], include=["documents", "metadatas", "uris"])
+        assert got["uris"][0] == "http://example.com/c1", "URI 가 사라졌다"
+        assert got["documents"][0] == "본문A"
+        assert got["metadatas"][0] == new_meta, (
+            f"메타가 새 값으로 갱신되지 않았다: {got['metadatas'][0]}")
+
+
 class _SqlAlchemyVecLike:
     """pgvector 형태 흉내 — `_engine`/`_table` 만 노출한다(실 SQLAlchemy 엔진, in-memory
     SQLite 위에서 돈다).

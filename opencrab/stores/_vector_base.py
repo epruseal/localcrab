@@ -28,11 +28,9 @@ CONTRACT — slot identity is node_id alone (last-writer-wins across packs):
     caller's pack/document/embedding/metadata; pgvector's ``upsert_texts`` does
     ``INSERT ... ON CONFLICT (node_id) DO UPDATE SET pack_id = EXCLUDED.pack_id,
     embedding = EXCLUDED.embedding, document = EXCLUDED.document, metadata =
-    EXCLUDED.metadata`` (every column overwritten); Chroma's ``upsert`` merges
-    the metadata dict but replaces document/embedding, and every caller in
-    this codebase always passes a *complete* metadata dict (see
-    ``opencrab/pack/normalize.py:transform_chunk_meta``), so the merge still
-    lands the slot fully on the current pack's values.
+    EXCLUDED.metadata`` (every column overwritten); Chroma's ``upsert_texts``
+    deletes the existing record and re-adds it (see the full-replace contract
+    below), so it too lands the whole slot on the caller's values.
 
     The upshot: going through ``upsert_texts`` never leaves a **partially**
     contaminated row (mixed pack A/B fields) — whichever caller writes last
@@ -47,6 +45,39 @@ CONTRACT — slot identity is node_id alone (last-writer-wins across packs):
     metadata in place while document/embedding/pack_id stay foreign) is
     closed. See ``_vec_meta_update``'s docstring for the exact reasoning and
     the open follow-up (pack-qualified slot identity, localcrab#172/#182).
+
+CONTRACT — ``upsert_texts(texts, metadatas, ids)`` full-replace semantics
+    [#175]: for an id that already exists, the store MUST replace the
+    document/metadata wholesale, not merge the new metadata into the old.
+    Verified per backend:
+      - sqlite_vec_store.py: DELETE-then-INSERT per id (vec0 has no native
+        UPSERT) — replace by construction.
+      - pg_vector_store.py: ``INSERT ... ON CONFLICT (node_id) DO UPDATE SET
+        metadata = EXCLUDED.metadata`` (whole-column assignment, not a jsonb
+        merge) — replace.
+      - chroma_store.py: chromadb's native ``collection.upsert()`` MERGES
+        metadata into the existing record (empirically verified against
+        chromadb 1.5.7/1.5.9 — ``update()`` and ``upsert()`` both merge; only
+        delete-then-add replaces). Prior to #175 this store called
+        ``upsert()`` directly, breaking the cross-backend contract — a stale
+        key dropped by the caller's canonical metadata transform would
+        survive forever. Fixed by delete()-then-add() for exactly the ids
+        that would lose a key; where the existing metadata's keys are a
+        subset of the new one's (every brand-new id, and every caller that
+        passes the full canonical dict) the merge already equals a replace,
+        so those go through the single atomic ``upsert()`` — same observable
+        contract, no delete window. EXCEPTION [#175 v2]:
+        an id that already carries a chromadb uri (never produced by this
+        codebase, so always externally written) is routed through native
+        ``upsert()`` (merge) instead, because delete()+add() cannot carry the
+        uri over without an embedding/document mismatch — see
+        chroma_store.py's ``upsert_texts`` docstring for the full argument;
+        this matches the fallback ``opencrab/pack/load.py``'s
+        ``_vec_meta_update`` already documents for its own uri branch.
+    Callers (opencrab/ontology/builder.py, opencrab/ontology/query.py,
+    opencrab/pack/load.py) all pass the full canonical metadata dict on every
+    upsert_texts call, i.e. they already assume replace semantics — the
+    chroma fix makes actual behavior match what callers assumed all along.
 
 INTER-COPY FINDINGS:
     - ID generation is IDENTICAL in all three: add-path uses
