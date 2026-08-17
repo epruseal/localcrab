@@ -1719,7 +1719,16 @@ def main(argv: list[str] | None = None) -> int:
             accept_foreign_owned_packs=args.accept_foreign_owned_packs,
         )
         graph_available_for_enum = getattr(graph, "available", False)
-        registry_pending = default_pending + int(registry_stats.get("unregistered") or 0)
+        # `default` can legitimately appear among the GRAPH candidates too --
+        # a packless graph row makes step 2 predict `default` for it, and in a
+        # dry-run step 1 has not actually inserted the row yet, so step 3 still
+        # sees it as unregistered. Adding that to `default_pending` would count
+        # the one `default` row twice, making the dry-run report a bigger total
+        # than the --apply run (where step 1's real insert removes it from the
+        # graph candidates). Count DISTINCT rows: `default_pending` owns the
+        # `default` row, so drop it from the graph side. (PR #177 review round 5.)
+        graph_candidates = set(registry_stats.get("candidates") or ()) - {default_pack_id}
+        registry_pending = default_pending + len(graph_candidates)
         if not graph_available_for_enum:
             # Unconditional: registering the default pack is NOT the same
             # thing as having enumerated the graph's pack_ids.  (An earlier

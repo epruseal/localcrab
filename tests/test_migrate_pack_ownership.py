@@ -2415,3 +2415,34 @@ class TestRoundFiveReviewConformance:
 
         sql = make_sql_store(get_settings())
         assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID, "pack-shared"}
+
+    def test_dry_run_does_not_double_count_default_from_graph_prediction(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """A packless graph row makes step 2 predict `default` for it, so in a
+        dry-run (where step 1 has not really inserted the row) `default` shows
+        up BOTH in default_pending and in the graph candidates. Counting it
+        twice made the dry-run total exceed the --apply total."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("Entity", "packless", {"name": "no pack"}, space_id="concept")
+        finally:
+            graph.close()
+
+        assert migrate.main([]) == 0
+        out_dry = capsys.readouterr().out
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+        out_apply = capsys.readouterr().out
+
+        # Exactly one distinct row (`default`) needs registering in both modes.
+        assert "1 row(s) needed registering" in out_dry
+        assert "1 row(s) needed registering" in out_apply
+
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID}
