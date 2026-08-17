@@ -392,11 +392,16 @@ def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
     scan boundary are still found. Seeds 60 non-matching nodes first, then
     5 matching nodes last."""
     for i in range(60):
-        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}"})
+        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}", "pack_id": "p"})
     for i in range(5):
-        store.upsert_node("X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+        store.upsert_node(
+            "X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}", "pack_id": "p"}
+        )
 
-    rows = store.search_nodes("needle", limit=10)
+    # #147: search_nodes is an authorization-bearing read path now, so it
+    # takes the caller's readable pack set and the fixture rows have to
+    # belong to a pack to be reachable at all.
+    rows = store.search_nodes("needle", pack_ids=["p"], limit=10)
 
     assert len(rows) == 5
     assert all("needle" in r["props"]["name"] for r in rows)
@@ -405,10 +410,14 @@ def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
 def test_search_nodes_space_filter_pushed_into_cypher(store) -> None:
     """spaces is pushed into the Cypher WHERE clause (space_id is a real
     column), narrowing the scan before the Python keyword filter runs."""
-    store.upsert_node("X", "n-claim", {"name": "shared term"}, space_id="claim")
-    store.upsert_node("X", "n-policy", {"name": "shared term"}, space_id="policy")
+    store.upsert_node(
+        "X", "n-claim", {"name": "shared term", "pack_id": "p"}, space_id="claim"
+    )
+    store.upsert_node(
+        "X", "n-policy", {"name": "shared term", "pack_id": "p"}, space_id="policy"
+    )
 
-    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+    rows = store.search_nodes("shared", pack_ids=["p"], spaces=["claim"], limit=10)
 
     assert len(rows) == 1
     assert rows[0]["props"]["space"] == "claim"
@@ -422,11 +431,11 @@ def test_search_nodes_limit_zero_and_negative_return_empty(store) -> None:
     ``results`` list's length, 0, is never `>=` a negative number until
     AFTER the first append). Neither is "caller wants nothing back" (the
     same class of surprise issue #120 flagged for Mongo's ``.limit(0)``)."""
-    store.upsert_node("X", "n1", {"name": "matches everything"})
-    store.upsert_node("X", "n2", {"name": "matches everything"})
+    store.upsert_node("X", "n1", {"name": "matches everything", "pack_id": "p"})
+    store.upsert_node("X", "n2", {"name": "matches everything", "pack_id": "p"})
 
-    assert store.search_nodes("matches", limit=0) == []
-    assert store.search_nodes("matches", limit=-1) == []
+    assert store.search_nodes("matches", pack_ids=["p"], limit=0) == []
+    assert store.search_nodes("matches", pack_ids=["p"], limit=-1) == []
 
 
 def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
@@ -436,18 +445,52 @@ def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
     still raise the SAME ``ValueError`` it does on the SQL backends, not be
     silently accepted, so a caller can't get three different behaviors out
     of one method depending on which backend happens to be active."""
-    store.upsert_node("X", "n1", {"name": "irrelevant"})
+    store.upsert_node("X", "n1", {"name": "irrelevant", "pack_id": "p"})
 
     with pytest.raises(ValueError, match="fields"):
-        store.search_nodes("irrelevant", fields=("not_a_real_field",))
+        store.search_nodes("irrelevant", pack_ids=["p"], fields=("not_a_real_field",))
 
 
 def test_search_nodes_empty_fields_returns_empty(store) -> None:
     """Empty ``fields`` means "nothing can ever match" on every backend,
     including Kuzu -- matches the SQL backends' contract."""
-    store.upsert_node("X", "n1", {"name": "anything"})
+    store.upsert_node("X", "n1", {"name": "anything", "pack_id": "p"})
 
-    assert store.search_nodes("anything", fields=()) == []
+    assert store.search_nodes("anything", pack_ids=["p"], fields=()) == []
+
+
+def test_search_nodes_is_scoped_to_the_readable_packs(store) -> None:
+    """#147: the pack predicate, on the Kuzu backend specifically.
+
+    Kuzu keeps properties as a JSON blob, so this filter is a Python
+    membership test over an unlimited scan rather than a Cypher WHERE
+    clause -- a different implementation from the SQL backends and
+    therefore one that needs its own test rather than inheriting theirs.
+    """
+    store.upsert_node("X", "mine", {"name": "shared term", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "shared term", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "shared term"})
+
+    rows = store.search_nodes("shared", pack_ids=["p-mine"], limit=10)
+    assert [r["props"]["id"] for r in rows] == ["mine"]
+
+    # An empty scope means "nothing readable", not "no filter".
+    assert store.search_nodes("shared", pack_ids=[], limit=10) == []
+
+
+def test_find_neighbors_empty_scope_returns_nothing(store) -> None:
+    """#147: the empty-set flip on the Kuzu traversal.
+
+    Before this change ``pack_ids=[]`` collapsed to ``None`` and skipped the
+    filter entirely, so a principal who could read no pack saw the whole
+    graph. An edge has to exist or this passes for the wrong reason.
+    """
+    store.upsert_node("X", "a", {"name": "a", "pack_id": "p"})
+    store.upsert_node("X", "b", {"name": "b", "pack_id": "p"})
+    store.upsert_edge("X", "a", "relates_to", "X", "b", {"pack_id": "p"})
+
+    assert store.find_neighbors("a", pack_ids=[]) == []
+    assert store.find_neighbors("a", pack_ids=["p"]) != []
 
 
 # ------------------------------------------------------------------

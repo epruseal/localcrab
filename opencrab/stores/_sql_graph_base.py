@@ -827,11 +827,28 @@ class _SqlGraphStoreBase(abc.ABC):
     ) -> tuple[str, Callable[[list[str]], Any]]:
         """SINGLE SOURCE for the new pack_id-ONLY, index-friendly scope
         predicate the ``*_scoped`` methods below share (issue #147 §3.4(b)) --
-        deliberately NOT ``_pack_where`` (the ``find_neighbors``/BFS predicate
-        above): that one also matches ``source``/``source_id`` via the
-        3-rule policy and supports ``include_unpackaged``; this one is
-        strict pack_id-only with no unpackaged escape hatch, because it
-        backs AUTHORIZATION reads (issue #147 invariant 5), not traversal.
+        deliberately NOT ``_pack_where`` (the ``find_neighbors``/BFS
+        predicate above). Both look at ``pack_id`` alone, but that one
+        implements the 3-rule edge policy and supports
+        ``include_unpackaged``; this one has no unpackaged escape hatch at
+        all, because it backs AUTHORIZATION reads and data outside every
+        pack is outside every read scope (#143 invariant 5). Neither of them
+        touches ``source``/``source_id`` -- that is ``_export_nodes_where``,
+        the pack-EXPORT predicate, whose 3-way OR is unusable for an access
+        decision because those two properties are caller-written.
+
+        TYPE PARITY, stated precisely (it is not uniform, and an earlier
+        draft of this docstring overclaimed it): for a pack_id that is a
+        JSON string -- the only form ``pack_create`` and the ``packs``
+        registry produce -- SQL and Python agree exactly. For non-string
+        JSON values they do not, and they disagree in OPPOSITE directions
+        by layer: SQLite's ``json_extract`` preserves the native type, so a
+        JSON number ``1`` never equals the bound TEXT ``'1'`` and the row is
+        EXCLUDED here, while Python's ``_node_pack_id`` does ``str(1)`` and
+        would INCLUDE it (so ``find_neighbors``/BM25 match it). Neither
+        direction crosses a user boundary -- a match still requires the id
+        to be in the caller's own scope -- so what remains is a recall
+        difference between backends, not a leak.
 
         Two-clause AND, both clauses load-bearing for different reasons:
           1. ``json_get(col,'pack_id') IN <array bind>`` -- uses the BARE

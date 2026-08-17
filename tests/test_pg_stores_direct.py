@@ -350,9 +350,11 @@ class TestPgDocKoreanKeywordSearch:
         schema = f"t{uuid.uuid4().hex[:12]}_krn"
         store = PgDocStore(pg_engine, schema=schema)
         try:
-            store.upsert_source("kr1", "인공지능 기계학습 연구 문서", {"node_id": "d1"})
-            store.upsert_source("kr2", "데이터베이스 트랜잭션 설명", {"node_id": "d2"})
-            hits = store.keyword_search("인공지능 연구", limit=10)
+            # #147: rows must belong to a pack to be reachable, and the
+            # caller must name the scope they are reading.
+            store.upsert_source("kr1", "인공지능 기계학습 연구 문서", {"node_id": "d1", "pack_id": "p"})
+            store.upsert_source("kr2", "데이터베이스 트랜잭션 설명", {"node_id": "d2", "pack_id": "p"})
+            hits = store.keyword_search("인공지능 연구", pack_ids=["p"], limit=10)
             assert {h["source_id"] for h in hits} == {"kr1"}
         finally:
             store.close()
@@ -362,9 +364,9 @@ class TestPgDocKoreanKeywordSearch:
         schema = f"t{uuid.uuid4().hex[:12]}_kre"
         store = PgDocStore(pg_engine, schema=schema)
         try:
-            store.upsert_source("kr1", "인공지능 연구", {"node_id": "d1"})
+            store.upsert_source("kr1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
             store._kw_ok = False  # simulate pg_trgm/index unavailable
-            assert store.keyword_search("인공지능", limit=10) == []
+            assert store.keyword_search("인공지능", pack_ids=["p"], limit=10) == []
         finally:
             store.close()
             _drop_schema(pg_engine, schema)
@@ -377,9 +379,9 @@ class TestPgDocKoreanKeywordSearch:
         schema = f"t{uuid.uuid4().hex[:12]}_krs"
         store = PgDocStore(pg_engine, schema=schema)
         try:
-            store.upsert_source("kr1", "AI 인공지능 연구 문서입니다", {"node_id": "d1"})
-            store.upsert_source("kr2", "무관한 다른 내용입니다", {"node_id": "d2"})
-            hits = store.keyword_search("AI", limit=10)
+            store.upsert_source("kr1", "AI 인공지능 연구 문서입니다", {"node_id": "d1", "pack_id": "p"})
+            store.upsert_source("kr2", "무관한 다른 내용입니다", {"node_id": "d2", "pack_id": "p"})
+            hits = store.keyword_search("AI", pack_ids=["p"], limit=10)
             assert {h["source_id"] for h in hits} == {"kr1"}
         finally:
             store.close()

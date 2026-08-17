@@ -411,8 +411,12 @@ class TestDocParity:
         matches the task's 'top-set overlap' acceptance bar."""
         local, pg = doc_pair
         for query in ["postgresql database", "kubernetes container", "machine learning"]:
-            local_hits = local.keyword_search(query, limit=10)
-            pg_hits = pg.keyword_search(query, limit=10)
+            # #147: keyword_search takes the caller's readable pack set now.
+            # The fixture tags its sources packA/packB/packC, so the parity
+            # question ("do both backends rank the same corpus alike") is
+            # only asked when all three are in scope.
+            local_hits = local.keyword_search(query, pack_ids=["packA", "packB", "packC"], limit=10)
+            pg_hits = pg.keyword_search(query, pack_ids=["packA", "packB", "packC"], limit=10)
             assert local_hits and pg_hits
             local_ids = {h["source_id"] for h in local_hits}
             pg_ids = {h["source_id"] for h in pg_hits}
@@ -426,8 +430,8 @@ class TestDocParity:
         ILIKE + pg_trgm fallback leg (the tsvector leg only matches whole
         normalised lexemes). Both backends must still return packC docs."""
         local, pg = doc_pair
-        local_hits = local.keyword_search("AI", limit=10)
-        pg_hits = pg.keyword_search("AI", limit=10)
+        local_hits = local.keyword_search("AI", pack_ids=["packA", "packB", "packC"], limit=10)
+        pg_hits = pg.keyword_search("AI", pack_ids=["packA", "packB", "packC"], limit=10)
         assert local_hits and pg_hits
         assert all(h["metadata"]["pack_id"] == "packC" for h in local_hits)
         assert all(h["metadata"]["pack_id"] == "packC" for h in pg_hits)
@@ -452,16 +456,18 @@ class TestDocParity:
         pg = PgDocStore(pg_engine, schema=schema)
         try:
             docs = [
-                ("kr_src0", "인공지능 기계학습 자연어처리 연구 문서", {"node_id": "kr_d0"}),
-                ("kr_src1", "인공지능 딥러닝 신경망 모델 학습", {"node_id": "kr_d1"}),
-                ("kr_src2", "데이터베이스 트랜잭션 격리 수준 설명", {"node_id": "kr_d2"}),
+                # #147: pack_id is required for a row to be reachable by any
+                # read at all, so the corpus has to carry one.
+                ("kr_src0", "인공지능 기계학습 자연어처리 연구 문서", {"node_id": "kr_d0", "pack_id": "packKR"}),
+                ("kr_src1", "인공지능 딥러닝 신경망 모델 학습", {"node_id": "kr_d1", "pack_id": "packKR"}),
+                ("kr_src2", "데이터베이스 트랜잭션 격리 수준 설명", {"node_id": "kr_d2", "pack_id": "packKR"}),
             ]
             for sid, text_, meta in docs:
                 local.upsert_source(sid, text_, meta)
                 pg.upsert_source(sid, text_, meta)
 
-            local_hits = local.keyword_search("인공지능 학습", limit=10)
-            pg_hits = pg.keyword_search("인공지능 학습", limit=10)
+            local_hits = local.keyword_search("인공지능 학습", pack_ids=["packKR"], limit=10)
+            pg_hits = pg.keyword_search("인공지능 학습", pack_ids=["packKR"], limit=10)
             assert local_hits and pg_hits
             local_ids = {h["source_id"] for h in local_hits}
             pg_ids = {h["source_id"] for h in pg_hits}

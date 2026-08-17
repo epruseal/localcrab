@@ -106,6 +106,14 @@ def _node(graph, docs, pack_id: str, node_id: str, *, extra: dict[str, Any] | No
     props.update(extra or {})
     graph.upsert_node("Document", node_id, dict(props), space_id="resource")
     docs.upsert_node_doc("resource", "Document", node_id, dict(props))
+    # doc_sources too (and thus the FTS shadow table). Without it the FTS leg
+    # is empty for everyone and any assertion about it is vacuous -- the
+    # earlier version of this helper wrote only doc_nodes.
+    docs.upsert_source(
+        f"src-{node_id}",
+        f"title of {node_id} body text",
+        {"pack_id": pack_id, "node_id": node_id, "space": "resource"},
+    )
 
 
 @pytest.fixture
@@ -340,6 +348,53 @@ class TestNoExistenceLeak:
             owned = ontology_lever_simulate("b-lever", "raises", 0.5)
         assert [o["node_id"] for o in owned["predicted_outcome_changes"]] == ["b-outcome"]
         assert [c["node_id"] for c in owned["affected_concepts"]] == ["b-concept"]
+
+    def test_unreadable_lever_pointing_at_a_readable_outcome_still_answers_empty(
+        self, ctx, graph, docs, seeded
+    ):
+        """Isolates the ANCHOR gate.
+
+        When the lever is unreadable but its outcome is not, the
+        ``in_pack_scope`` post-filter passes the outcome through -- only the
+        anchor gate stops the call. With both layers present the previous
+        test passes either way, so deleting the gate alone went unnoticed
+        (found by mutation): alice naming bob's private lever got a
+        non-empty answer while naming an unknown id got an empty one, which
+        is the existence leak invariant 7 forbids.
+        """
+        from opencrab.mcp.tools import ontology_lever_simulate
+
+        _node(graph, docs, PACK_B, "b-lever2")
+        _node(graph, docs, PACK_PUBLIC, "pub-outcome")
+        graph.upsert_edge("Document", "b-lever2", "raises", "Document", "pub-outcome", {})
+
+        with _as(ctx, seeded["alice"]):
+            foreign = ontology_lever_simulate("b-lever2", "raises", 0.5)
+            absent = ontology_lever_simulate("no-such-lever", "raises", 0.5)
+        assert foreign["predicted_outcome_changes"] == absent["predicted_outcome_changes"] == []
+
+    def test_readable_lever_pointing_at_an_unreadable_node_hides_it(
+        self, ctx, graph, docs, seeded
+    ):
+        """Isolates the POST-FILTER.
+
+        The mirror of the test above: the anchor is alice's own, so the
+        anchor gate passes and only the per-result scope check can keep
+        bob's node out of the response. Deleting that check alone leaked
+        bob's node_id and node_type (found by mutation).
+        """
+        from opencrab.mcp.tools import ontology_lever_simulate
+
+        _node(graph, docs, PACK_A, "a-lever")
+        _node(graph, docs, PACK_B, "b-outcome2")
+        _node(graph, docs, PACK_B, "b-concept2")
+        graph.upsert_edge("Document", "a-lever", "raises", "Document", "b-outcome2", {})
+        graph.upsert_edge("Document", "a-lever", "affects", "Document", "b-concept2", {})
+
+        with _as(ctx, seeded["alice"]):
+            got = ontology_lever_simulate("a-lever", "raises", 0.5)
+        assert got["predicted_outcome_changes"] == []
+        assert got["affected_concepts"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -587,9 +642,10 @@ class TestRetrievalPipelineScoping:
         assert "b-secret" not in got
         assert got & {"a-secret", "shared-doc"}
 
-    @pytest.mark.parametrize(
-        "leg", ["_bm25_search", "_fts_search", "_vector_search", "_graph_expand"]
-    )
+    # _vector_search is NOT here: this fixture's chroma double is
+    # unavailable, so that leg returns early for a reason unrelated to the
+    # scope. It gets its own test below, with an available double.
+    @pytest.mark.parametrize("leg", ["_bm25_search", "_fts_search", "_graph_expand"])
     def test_every_leg_is_empty_for_an_empty_scope(self, hybrid, graph, seeded, leg):
         graph.upsert_edge("Document", "a-secret", "relates_to", "Document", "shared-doc", {})
         fn = getattr(hybrid, leg)
@@ -638,6 +694,18 @@ class TestRetrievalPipelineScoping:
         alice = sorted(read_scope(sql, seeded["alice"]))
         assert hybrid._graph_expand(["a-secret"], 1, 10, pack_ids=alice) != []
 
+    def test_fts_leg_excludes_other_users_sources(self, hybrid, sql, seeded):
+        """Both directions, now that doc_sources actually has rows."""
+        alice = sorted(read_scope(sql, seeded["alice"]))
+        got = {h["metadata"].get("node_id") for h in hybrid._fts_search("title", None, 20, pack_ids=alice)}
+        assert got == {"a-secret", "shared-doc"}
+
+        bob = sorted(read_scope(sql, seeded["bob"]))
+        assert {
+            h["metadata"].get("node_id")
+            for h in hybrid._fts_search("title", None, 20, pack_ids=bob)
+        } == {"b-secret", "shared-doc"}
+
     def test_keyword_search_fallback_is_scoped(self, hybrid, sql, seeded):
         """The REST zero-result fallback. Its store method had no pack
         parameter at all before #147."""
@@ -649,6 +717,37 @@ class TestRetrievalPipelineScoping:
         assert "b-secret" not in got
         assert got == {"a-secret", "shared-doc"}
         assert hybrid.keyword_search("title", pack_ids=[], limit=50) == []
+
+
+class TestCanonicalIdsScoping:
+    """The canonical re-lookup, which happens AFTER the query legs are scoped.
+
+    Scoping retrieval is not enough on its own: this module re-reads the
+    graph by node_id to build the ``canonical`` block, and the unscoped
+    lookup matched node_id alone even though the PK is
+    (node_type, node_id). A readable hit whose id also exists in someone
+    else's pack under another type would have had that row's
+    pack_id/space/document_id attached to it.
+    """
+
+    def test_homonym_in_another_pack_resolves_as_not_found(self, graph, sql, seeded):
+        from opencrab.services.canonical_ids import enrich
+
+        graph.upsert_node(
+            "Concept", "dup2", {"pack_id": PACK_B, "node_id": "dup2"}, space_id="concept"
+        )
+        alice = sorted(read_scope(sql, seeded["alice"]))
+
+        out = enrich(graph, [{"node_id": "dup2", "metadata": {}}], pack_ids=alice)
+        assert out[0]["canonical"]["resolved"] is False
+        assert out[0]["canonical"]["reason"] == "node_not_found"
+
+        # Bob resolves it, so the miss above is the scope and not a broken
+        # lookup.
+        bob = sorted(read_scope(sql, seeded["bob"]))
+        out_bob = enrich(graph, [{"node_id": "dup2", "metadata": {}}], pack_ids=bob)
+        assert out_bob[0]["canonical"]["resolved"] is True
+        assert out_bob[0]["canonical"]["pack_id"] == PACK_B
 
 
 class TestSearchNodesScoping:
