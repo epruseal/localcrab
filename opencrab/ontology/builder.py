@@ -492,6 +492,87 @@ def graph_write_failed(stores: dict[str, Any]) -> bool:
     return not store_write_succeeded(stores, "graph")
 
 
+# ---------------------------------------------------------------------------
+# Per-operation required stores (issue #163)
+# ---------------------------------------------------------------------------
+
+# Which stores a write of each kind must POSITIVELY land in before a caller
+# may count it as written. Issue #163: ``store_write_succeeded()`` judges one
+# receipt but never declared which store an operation actually requires, so
+# every caller re-invented that decision (or skipped it).
+#
+# CHANGING THIS TABLE IS A CROSS-FILE DECISION: the billing gates in
+# opencrab/mcp/tools/graph.py, opencrab/mcp/tools/harness.py,
+# opencrab/mcp/tools/pack.py and crabharness/crabharness/apply.py hardcode the
+# equivalent "graph" policy via graph_write_failed()/store_write_succeeded(...,
+# "graph") and are deliberately NOT routed through here (see #163: "전역 기본
+# 의미는 바꾸지 않는다 — 다른 소비자(과금 등)에 영향이 있다"). The two policies
+# are pinned as equivalent by tests/test_store_receipt_callers.py; edit this
+# table only together with a decision about those four call sites.
+REQUIRED_STORES: dict[str, frozenset[str]] = {
+    "node": frozenset({"graph"}),
+    "edge": frozenset({"graph"}),
+    # HybridQuery.ingest() (opencrab/ontology/query.py) ONLY — pack/load.py's
+    # chunk loading is a separate (ok, err) contract that requires both the
+    # vector and the doc store, so this mapping does not apply there.
+    "chunk": frozenset({"chromadb"}),
+}
+
+NOT_APPLICABLE_STATUSES: frozenset[str] = frozenset({"audited"})
+
+
+def is_not_applicable_status(status: Any) -> bool:
+    """True for a status that is neither a failure nor a confirmed write.
+
+    Today that is exactly ``"audited"`` — ``add_edge``'s Mongo audit-log
+    entry above: the ``log_event`` succeeded, but an audit entry is not a
+    stored copy of the edge, so it can never stand in for the edge's own
+    write confirmation.
+
+    SCOPE (deliberate, narrow): this classifies a status on a store OUTSIDE
+    the operation's required set, for reports that want three buckets
+    (landed / not-applicable / failed) instead of two.
+    ``store_write_succeeded_for()`` does NOT consult it: an ``"audited"``
+    status on a REQUIRED store is not success, and treating it as one is
+    exactly the confusion issue #163 reports (``graph_ok=True,
+    docs_audited=False, all_required_graph_docs=False``). Non-str input
+    returns False.
+    """
+    return isinstance(status, str) and status in NOT_APPLICABLE_STATUSES
+
+
+def store_write_succeeded_for(stores: Any, kind: str) -> bool:
+    """POSITIVE confirmation that a ``kind`` write landed in EVERY store that
+    kind requires (``REQUIRED_STORES``). Thin, fail-closed composition over
+    ``store_write_succeeded(stores, key)`` — it inherits that function's
+    "exactly 'ok' or 'ok (...)'" success contract, including its safety on
+    non-str statuses (None/int/dict all read as not-confirmed).
+
+    kind:
+        A key of ``REQUIRED_STORES``. Anything else — an unknown string, or a
+        non-str (incl. unhashable list/dict, which would otherwise raise
+        TypeError from the dict lookup) — raises ``ValueError``. A typo'd
+        kind must never silently read as either success or failure.
+
+    Returns False (never raises) when ``stores`` is not a dict, matching
+    ``store_write_succeeded``'s treatment of malformed receipts.
+
+    A kind whose required set is empty returns False (fail-closed).
+    Unreachable with today's table; pinned by test so a future empty entry
+    cannot become a free "yes".
+    """
+    if not isinstance(kind, str) or kind not in REQUIRED_STORES:
+        raise ValueError(
+            f"unknown write kind: {kind!r} (known: {sorted(REQUIRED_STORES)})"
+        )
+    required = REQUIRED_STORES[kind]
+    if not required:
+        return False
+    if not isinstance(stores, dict):
+        return False
+    return all(store_write_succeeded(stores, key) for key in required)
+
+
 def _space_to_default_type(space_id: str) -> str:
     """Return a default node type label for a space when the real type is unknown."""
     from opencrab.grammar.manifest import SPACES

@@ -757,6 +757,14 @@ def _make_extraction_result(source_id: str):
                 space="subject", node_type="Agent", node_id="alex_agent",
                 properties={"name": "Alex"},
             ),
+            # Both endpoints of the edge below must exist, or add_edge returns
+            # "no match (missing node: demo_project)" and the edge is never
+            # written. Before issue #158 the CLI did not read that receipt, so
+            # this fixture reported "edges=1" for an edge that never landed.
+            ExtractedNode(
+                space="resource", node_type="Project", node_id="demo_project",
+                properties={"name": "Demo Project"},
+            ),
         ],
         edges=[
             ExtractedEdge(
@@ -787,8 +795,10 @@ class TestExtract:
             )
 
         assert result.exit_code == 0
-        assert "nodes=1 edges=1 errors=0" in result.output
-        assert "nodes=1 edges=1" in result.output.split("Done")[-1]
+        assert "nodes=2 edges=1 errors=0" in result.output
+        assert "nodes=2 edges=1" in result.output.split("Done")[-1]
+        # #158: the summary must not claim a write the receipts did not confirm.
+        assert "not stored" not in result.output
 
         from opencrab.stores.local_graph_store import LocalGraphStore
 
@@ -850,7 +860,7 @@ class TestExtract:
 
         assert result.exit_code == 0
         assert result.exception is None
-        assert "nodes=1 edges=1" in result.output
+        assert "nodes=2 edges=1" in result.output
 
 
 # ---------------------------------------------------------------------------

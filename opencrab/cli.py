@@ -519,7 +519,11 @@ def extract(
     from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
-    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.ontology.builder import (
+        OntologyBuilder,
+        store_write_failures,
+        store_write_succeeded_for,
+    )
     from opencrab.ontology.extractor import LLMExtractor
 
     if not api_key:
@@ -566,6 +570,8 @@ def extract(
     total_nodes = 0
     total_edges = 0
     total_errors = 0
+    total_node_write_failures = 0
+    total_edge_write_failures = 0
 
     for file in files:
         console.print(f"\n[bold]{file.name}[/bold]")
@@ -582,19 +588,27 @@ def extract(
                 with write_lock():
                     for node in result.nodes:
                         try:
-                            builder.add_node(
+                            res = builder.add_node(
                                 space=node.space,
                                 node_type=node.node_type,
                                 node_id=node.node_id,
                                 properties=node.properties,
                                 subject_id=principal.user_id,
                             )
+                            stores = res.get("stores") if isinstance(res, dict) else None
+                            if not isinstance(stores, dict):
+                                stores = {}
+                            if not store_write_succeeded_for(stores, "node"):
+                                detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                                console.print(f"    [red]node {node.node_id} not stored: {detail}[/red]")
+                                total_node_write_failures += 1
                         except Exception as exc:
                             console.print(f"    [red]node {node.node_id}: {exc}[/red]")
+                            total_node_write_failures += 1
 
                     for edge in result.edges:
                         try:
-                            builder.add_edge(
+                            res = builder.add_edge(
                                 from_space=edge.from_space,
                                 from_id=edge.from_id,
                                 relation=edge.relation,
@@ -603,8 +617,16 @@ def extract(
                                 properties=edge.properties,
                                 subject_id=principal.user_id,
                             )
+                            stores = res.get("stores") if isinstance(res, dict) else None
+                            if not isinstance(stores, dict):
+                                stores = {}
+                            if not store_write_succeeded_for(stores, "edge"):
+                                detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                                console.print(f"    [red]edge {edge.from_id}→{edge.to_id} not stored: {detail}[/red]")
+                                total_edge_write_failures += 1
                         except Exception as exc:
                             console.print(f"    [yellow]edge {edge.from_id}→{edge.to_id}: {exc}[/yellow]")
+                            total_edge_write_failures += 1
 
             total_nodes += len(result.nodes)
             total_edges += len(result.edges)
@@ -613,10 +635,20 @@ def extract(
             total_errors += 1
 
     mode_label = "[dim](dry-run)[/dim]" if dry_run else ""
-    console.print(
-        f"\n[bold green]Done {mode_label}[/bold green] — "
-        f"nodes={total_nodes} edges={total_edges} errors={total_errors}"
-    )
+    if total_node_write_failures == 0 and total_edge_write_failures == 0:
+        console.print(
+            f"\n[bold green]Done {mode_label}[/bold green] — "
+            f"nodes={total_nodes} edges={total_edges} errors={total_errors}",
+            soft_wrap=True,
+        )
+    else:
+        console.print(
+            f"\n[bold red]Done with store failures {mode_label}[/bold red] — "
+            f"nodes={total_nodes} attempted ({total_node_write_failures} not stored) "
+            f"edges={total_edges} attempted ({total_edge_write_failures} not stored) "
+            f"errors={total_errors}",
+            soft_wrap=True,
+        )
 
 
 # ---------------------------------------------------------------------------
