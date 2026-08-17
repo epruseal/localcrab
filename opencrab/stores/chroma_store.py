@@ -570,7 +570,17 @@ def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> No
     would make this very add() fail on chroma's non-empty-dict rule, losing
     the records the rollback exists to save. Both spellings are normalised to
     ``None``, chroma's own "no metadata here" value, per record so that a
-    mixed batch still goes back in one call.
+    mixed batch still goes back in one call. ``None`` itself is accepted at
+    both ends of the supported range: 0.5.0's ``validate_metadata`` returns
+    early for it and only rejects an empty dict, and 1.5.9 does the same.
+
+    A record can equally carry no document (embedding-only, or an externally
+    written uri record), so the replayed ``documents`` list can hold ``None``
+    too. That is legal because this call always supplies ``embeddings`` from
+    the snapshot: chroma validates documents with ``nullable=(embeddings is
+    not None)``, and 0.5.0 does not validate document elements at all. Keep
+    the embeddings argument if this is ever refactored — dropping it would
+    turn every documentless record into a rollback failure.
     """
     handle.delete(ids=batch_ids)
     if not snapshot["ids"]:
