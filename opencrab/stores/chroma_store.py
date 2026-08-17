@@ -172,7 +172,12 @@ class ChromaStore:
         # Sanitize metadata — ChromaDB requires string/int/float/bool values
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
 
-        self._collection_handle().add(documents=texts, metadatas=clean_meta, ids=ids)
+        # Under the store lock like every other writer here, so this cannot
+        # land inside another thread's replace window. Snapshot the handle
+        # inside the block -- _collection_handle() takes this same
+        # non-reentrant lock.
+        with self._lock:
+            self._collection.add(documents=texts, metadatas=clean_meta, ids=ids)
         logger.debug("ChromaDB: added %d documents", len(texts))
         return ids
 
@@ -490,9 +495,17 @@ class ChromaStore:
             return _read_one(self._collection, doc_id)
 
     def delete(self, ids: list[str]) -> None:
-        """Delete documents by their IDs."""
+        """Delete documents by their IDs.
+
+        Held under the store lock so it cannot land between a concurrent
+        replace's delete() and add() — where its removal would simply be
+        undone by that add, or by the rollback replaying the snapshot.
+        Note ``opencrab/pack/load.py`` mutates the raw chroma handle directly
+        in places and so stays outside this lock; that is tracked separately.
+        """
         self._require_available()
-        self._collection_handle().delete(ids=ids)
+        with self._lock:
+            self._collection.delete(ids=ids)
 
     def count(self) -> int:
         """Return the number of documents in the collection."""

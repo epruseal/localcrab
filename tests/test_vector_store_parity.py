@@ -776,6 +776,79 @@ class TestChromaUpsertSafety:
         assert seen and seen[0] is not None, "살아 있는 레코드를 부재로 보고했다"
         assert seen[0]["document"] == "새"
 
+    def _park_replace_and_run(self, store, victim_call):
+        """치환 창(delete~add) 안에서 victim_call 을 실행시킨다.
+
+        노출되는 인터리빙은 "핸들을 이미 스냅샷한 writer"다 —
+        _collection_handle() 은 같은 락을 잡으므로 그냥 부르면 창을 아예 못 본다.
+        스냅샷 직후 선점된 상황을 주입해 그 형태를 재현한다.
+        """
+        real_add = store._collection.add
+        in_window = threading.Event()
+        release = threading.Event()
+
+        parked = []
+
+        def park_then_add(**kw):
+            # 창을 여는 것은 writer 의 첫 전진 add 뿐이다. victim 의 add 까지
+            # 세우면 락이 없어도 멈춰 보여 테스트가 거짓 통과한다.
+            if "embeddings" not in kw and not parked:
+                parked.append(True)
+                in_window.set()
+                assert release.wait(timeout=10)
+            return real_add(**kw)
+
+        store._collection.add = park_then_add
+        real_handle = store._collection_handle
+        # 락을 잡기 전에 이미 확보해 둔 핸들 — 선점된 writer 가 손에 쥔 것과
+        # 같은 상태다. 여기서 real_handle() 을 부르면 그 호출 자체가 락에
+        # 걸려, 수정 전 코드에서도 창을 못 보고 테스트가 무의미해진다.
+        pre_handle = store._collection
+        store._collection_handle = lambda: pre_handle
+        writer = threading.Thread(
+            target=store.upsert_texts,
+            kwargs=dict(texts=["새"], metadatas=[{"k": "2"}], ids=["r1"]),
+        )
+        writer.start()
+        assert in_window.wait(timeout=10), "치환 창에 진입하지 못했다"
+
+        victim = threading.Thread(target=victim_call)
+        victim.start()
+        victim.join(timeout=0.5)
+        still_blocked = victim.is_alive()
+
+        release.set()
+        writer.join(timeout=10)
+        victim.join(timeout=10)
+        store._collection.add = real_add
+        store._collection_handle = real_handle
+        return still_blocked
+
+    def test_delete_waits_for_an_in_flight_replace(self, tmp_path):
+        """[리뷰 라운드7] delete 가 치환 창 안에 떨어지면 그 삭제는 뒤이은 add
+        (또는 롤백의 스냅샷 replay)에 덮여 되살아난다. 다른 writer 와 같은
+        락 아래 있어야 한다."""
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1", "버릴키": "1"}], ids=["r1"])
+
+        blocked = self._park_replace_and_run(store, lambda: store.delete(["r1"]))
+
+        assert blocked, "delete 가 치환 창 안에서 그대로 진행됐다"
+        assert store.get_by_id("r1") is None, "delete 가 치환 뒤에 반영되지 않았다"
+
+    def test_add_texts_waits_for_an_in_flight_replace(self, tmp_path):
+        # add_texts 도 같은 이유로 창 밖이어야 한다.
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1", "버릴키": "1"}], ids=["r1"])
+
+        blocked = self._park_replace_and_run(
+            store,
+            lambda: store.add_texts(texts=["다른 문서"], metadatas=[{"k": "x"}], ids=["other"]),
+        )
+
+        assert blocked, "add_texts 가 치환 창 안에서 그대로 진행됐다"
+        assert store.get_by_id("other") is not None
+
     def test_same_collection_stores_share_one_lock(self, tmp_path):
         # 인스턴스가 하나뿐이라는 보장이 없으므로(_get_context 는 초기화를 잠그지
         # 않는다) 락은 인스턴스가 아니라 컬렉션 단위여야 한다.
