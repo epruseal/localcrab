@@ -432,7 +432,10 @@ def _base_ctx(sql, **overrides):
     ctx["neo4j"].get_node.return_value = None
     ctx["neo4j"].get_node_by_id.return_value = None
     ctx["neo4j"].get_edge.return_value = None
-    ctx["neo4j"].lookup_node_type.return_value = None
+    # #177 R4-A: an unresolvable endpoint type is fail-closed (rejected), not
+    # skipped, so the default must be a real type ("endpoints exist on this
+    # backend"), matching get_edge.return_value = None above ("no conflict").
+    ctx["neo4j"].lookup_node_type.return_value = "Entity"
     ctx["mongo"].get_node_doc.return_value = None
     ctx["mongo"].get_source.return_value = None
     ctx["chroma"].get_by_id.return_value = None

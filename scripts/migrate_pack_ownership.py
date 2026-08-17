@@ -103,6 +103,14 @@ from typing import Any
 DEFAULT_PACK_ID = "default"
 DEFAULT_PACK_TITLE = "Default pack (pre-#146 legacy data)"
 
+# Sentinel distinguishing "key absent" from "key present with a None/falsy
+# value" (#146 P1(b), PR #177 review round 4 R4-C) -- ``dict.get(k) or {}``
+# collapses both, which is exactly the bug: a present-but-non-dict Mongo
+# field (empty list, non-empty list/string, or JSON null) must be EXCLUDED,
+# while an absent key must still fall through to the resolver (a dotted
+# ``$set`` creates the nested document fine when the key never existed).
+_MISSING = object()
+
 
 # ---------------------------------------------------------------------------
 # Registry bootstrap
@@ -463,6 +471,7 @@ def _backfill_doc_table(
     twin_exact: dict[tuple[str, str], str] | None = None,
     twin_fallback: dict[str, str] | None = None,
     twin_ambiguous: dict[tuple[str, str], list[str]] | None = None,
+    twin_fallback_ambiguous: set[str] | None = None,
 ) -> dict[str, Any]:
     """Bulk-backfill missing pack_id on ONE doc-store JSON-properties table
     (``doc_nodes``/``doc_sources``) via the store's own
@@ -475,16 +484,33 @@ def _backfill_doc_table(
     priority graph-twin(exact) -> graph-twin(fallback) -> self
     path-inference -> ``default_pack_id``.
 
-    ``twin_exact``/``twin_fallback``/``twin_ambiguous`` come from
-    ``_graph_twin_pack_map`` and are ``None`` for ``doc_sources`` (it is
-    not a graph node twin -- a legacy ``text_as_node=False`` row -- see
-    module docstring SCOPE; only self path-inference -> default applies to
-    it). When given, a row's twin lookup key is ``(space, node_id)``
+    ``twin_exact``/``twin_fallback``/``twin_ambiguous``/``twin_fallback_ambiguous``
+    come from ``_graph_twin_pack_map`` and are ``None`` for ``doc_sources``
+    (it is not a graph node twin -- a legacy ``text_as_node=False`` row --
+    see module docstring SCOPE; only self path-inference -> default applies
+    to it). When given, a row's twin lookup key is ``(space, node_id)``
     (``space``/``node_id`` are always the first two of ``pk_cols`` for
     ``doc_nodes``); ``twin_ambiguous`` hitting that key EXCLUDES the row
     (no single graph pack_id is correct for it) rather than falling through
     to self-inference or default -- writing a guess over a row whose own
     graph twin disagrees with itself would be worse than leaving it alone.
+
+    Lookup order (#146 P1(b), PR #177 review round 4 R4-B): exact
+    ambiguous -> EXCLUDE; exact hit -> apply; only when exact MISSES ->
+    fallback ambiguous -> EXCLUDE; fallback hit -> apply; self path-
+    inference; default. ``twin_fallback_ambiguous`` is a bare ``node_id``
+    set (not keyed by ``(space, node_id)`` like ``twin_ambiguous`` --
+    blank-``space_id`` graph rows that disagree on a shared node_id have no
+    real space to key on) built by ``_graph_twin_pack_map`` from
+    blank-``space_id`` graph rows that disagree with each other on a shared
+    node_id; a doc row whose EXACT key misses but whose node_id is in this
+    set is excluded rather than silently inheriting one of the disagreeing
+    fallback values (or falling through to self-inference/default, which
+    would be an equally arbitrary guess). It is consulted ONLY on an exact
+    miss -- an exact hit already resolves the row correctly regardless of
+    what unrelated blank-space rows disagree about, since the exact key's
+    ``space`` component is more specific than the fallback's node_id-alone
+    key.
 
     A row whose own ``prop_col`` is valid JSON but not an object
     (``resolve_row_pack_id``'s ``"skipped-non-dict"``) is likewise EXCLUDED,
@@ -518,7 +544,11 @@ def _backfill_doc_table(
     missing = len(rows)
 
     by_pack: dict[str, list[tuple[Any, ...]]] = {}
-    excluded: dict[str, int] = {"ambiguous-twin": 0, "non-dict": 0}
+    excluded: dict[str, int] = {
+        "ambiguous-twin": 0,
+        "ambiguous-twin-fallback": 0,
+        "non-dict": 0,
+    }
     resolution_counts: dict[str, int] = {}
     for row in rows:
         pk_values = tuple(row[i] for i in range(len(pk_cols)))
@@ -536,6 +566,13 @@ def _backfill_doc_table(
             exact = (twin_exact or {}).get(twin_key)
             if exact:
                 pack_id, reason = exact, "graph-twin-exact"
+            elif id_value in (twin_fallback_ambiguous or set()):
+                # Exact missed AND the blank-space fallback disagrees with
+                # itself for this node_id -- neither side gives a single
+                # correct answer, so exclude rather than fall through to
+                # self-inference/default (#146 P1(b), R4-B).
+                excluded["ambiguous-twin-fallback"] += 1
+                continue
             else:
                 fb = (twin_fallback or {}).get(id_value)
                 if fb:
@@ -684,7 +721,12 @@ def _graph_twin_pack_map(
     assume_pack_id: str | None,
     *,
     actual: bool,
-) -> tuple[dict[tuple[str, str], str], dict[str, str], dict[tuple[str, str], list[str]]]:
+) -> tuple[
+    dict[tuple[str, str], str],
+    dict[str, str],
+    dict[tuple[str, str], list[str]],
+    set[str],
+]:
     """Resolve each ``doc_nodes`` row's GRAPH TWIN pack_id (#146 P1(b), PR
     #177 review round 3): for every node_id a doc row was found MISSING
     pack_id on, look up that SAME node_id's ``graph_nodes`` row(s) and read
@@ -717,6 +759,22 @@ def _graph_twin_pack_map(
     never match a real doc ``space``) and only carries a value when every
     graph row sharing that BARE node_id agrees too.
 
+    ``fallback_ambiguous`` (#146 P1(b), PR #177 review round 4 R4-B) is the
+    node_id-ONLY counterpart of ``ambiguous`` for the fallback path: several
+    blank-``space_id`` graph rows sharing one node_id but resolving to
+    DIFFERENT pack_ids. The plain dict-comprehension that builds
+    ``fallback_map`` silently DROPS such a node_id (``len(packs) == 1``
+    excludes it) -- correct for ``fallback_map`` itself, but that drop was
+    previously invisible to the caller: ``fallback_map`` is keyed by bare
+    node_id while ``ambiguous`` is keyed by ``(space_id, node_id)``, so a
+    doc row's ``(document_space, node_id)`` lookup never collided with
+    either dict and the row silently fell through to self-inference or
+    ``default`` instead of being excluded. Reported SEPARATELY from
+    ``ambiguous`` (not merged into one dict) because the two live in
+    different key spaces -- merging them would force every caller to branch
+    on key shape again, recreating the exact "key doesn't match, silently
+    passes" bug this closes.
+
     ``actual=True`` and ``actual=False`` share ONE normalization path for
     the properties column (``pack_provenance._normalize_props``, via
     ``resolve_row_pack_id`` for the dry-run branch and directly for the
@@ -727,7 +785,7 @@ def _graph_twin_pack_map(
     the shared helper) would give the two modes a chance to silently
     disagree about a PG-only row.
 
-    Returns ``({}, {}, {})`` when ``graph`` exposes no ``_table``/
+    Returns ``({}, {}, {}, set())`` when ``graph`` exposes no ``_table``/
     ``_fetch_all`` hooks (Kuzu/Neo4j) -- that backend's SCOPE gap already
     forces ``graph_backfill`` to ``skipped`` (rc 3, see module docstring
     SAFETY), so callers must not treat an empty map here as "no twins
@@ -735,7 +793,7 @@ def _graph_twin_pack_map(
     consistency).
     """
     if not node_ids or not (hasattr(graph, "_table") and hasattr(graph, "_fetch_all")):
-        return {}, {}, {}
+        return {}, {}, {}, set()
 
     from opencrab.ontology.pack_provenance import _normalize_props, resolve_row_pack_id
 
@@ -770,10 +828,14 @@ def _graph_twin_pack_map(
                 fallback_seen.setdefault(node_id, set()).add(pack_id)
 
     exact_map, ambiguous = _split_ambiguous(exact_seen)  # type: ignore[arg-type]
-    fallback_map = {
-        nid: next(iter(packs)) for nid, packs in fallback_seen.items() if len(packs) == 1
-    }
-    return exact_map, fallback_map, ambiguous
+    fallback_map: dict[str, str] = {}
+    fallback_ambiguous: set[str] = set()
+    for nid, packs in fallback_seen.items():
+        if len(packs) == 1:
+            fallback_map[nid] = next(iter(packs))
+        else:
+            fallback_ambiguous.add(nid)
+    return exact_map, fallback_map, ambiguous, fallback_ambiguous
 
 
 def _predict_node_pack_map(
@@ -881,7 +943,7 @@ def _backfill_doc(docs: Any, graph: Any, default_pack_id: str, apply: bool) -> d
         return {"skipped": True}
     if hasattr(docs, "_dialect"):
         missing_node_ids = _doc_missing_node_ids(docs)
-        twin_exact, twin_fallback, twin_ambiguous = _graph_twin_pack_map(
+        twin_exact, twin_fallback, twin_ambiguous, twin_fallback_ambiguous = _graph_twin_pack_map(
             graph, missing_node_ids, default_pack_id, actual=apply
         )
         nodes = _backfill_doc_table(
@@ -895,6 +957,7 @@ def _backfill_doc(docs: Any, graph: Any, default_pack_id: str, apply: bool) -> d
             twin_exact=twin_exact,
             twin_fallback=twin_fallback,
             twin_ambiguous=twin_ambiguous,
+            twin_fallback_ambiguous=twin_fallback_ambiguous,
         )
         sources = _backfill_doc_table(
             docs, "doc_sources", "metadata", ("source_id",), "source_id", default_pack_id, apply
@@ -916,11 +979,45 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
     row's own path-inference, then default, exactly the doc self-inference
     step the SQL-backed path also falls through to.
 
-    ``resolve_row_pack_id`` is called with ``assume_pack_id=default_pack_id``
-    directly (unlike the SQL-backed path's two-step self-inference-then-
-    default) since Mongo has no separate excluded-row bookkeeping to keep
-    distinct from "assumed" -- the helper's own "assumed" fallback already
-    performs exactly the "no hint -> default" step this stage needs.
+    Type judgment happens BEFORE ``resolve_row_pack_id`` is ever called
+    (#146 P1(b), PR #177 review round 4 R4-C): Mongo fields are NATIVE BSON
+    values, not JSON strings like every SQLite-backed column, so
+    ``resolve_row_pack_id``'s own non-dict detection (which normalizes via
+    ``json.loads``) never fires the way it does for SQL rows -- a native
+    Python list or str raises inside ``json.loads`` and is silently
+    swallowed to ``{}`` (a valid, empty dict) by ``_normalize_props``'s
+    malformed-JSON tolerance, so the row is treated as "no pack_id hint"
+    and ends up ``assumed`` -> ``default_pack_id`` instead of excluded.
+    ``["bad"]``/``"bad"`` would therefore still reach a dotted ``$set``
+    under the OLDER "trust the reason string" design -- this function
+    checks ``isinstance(raw, dict)`` itself first so it never asks
+    ``resolve_row_pack_id`` to judge a type it cannot see correctly:
+
+      - the field key is ABSENT (``_MISSING``) -- NOT excluded; a dotted
+        ``$set`` happily creates the nested document, so this still goes
+        through the resolver (-> self path-inference -> default), exactly
+        as before. Excluding an absent key would be over-exclusion.
+      - the field is PRESENT and a ``dict`` -- goes through the resolver
+        normally.
+      - the field is PRESENT and NOT a ``dict`` (``None``, ``""``, ``[]``,
+        a non-empty list/string, ...) -- EXCLUDED, no resolver call, no
+        ``$set`` attempted. This also covers the documented MongoDB
+        failure mode of a dotted ``$set`` under a JSON ``null`` field
+        (``{"properties": null}`` -> "Cannot create field 'pack_id' in
+        element {properties: null}"), which the old code would have
+        walked straight into.
+
+    A resolver-returned ``None`` (the true ``skipped-non-dict``/
+    ``skipped-unresolvable`` case -- unreachable here in practice since
+    ``assume_pack_id=default_pack_id`` is always given, kept as a
+    defensive second net) is also counted as excluded rather than silently
+    dropped.
+
+    Each collection's result dict carries its own ``excluded`` count (like
+    ``_backfill_doc_table``'s SQL-backed sub-dicts already do) so
+    ``_docs_stage_outcome``'s existing demote-to-``skipped`` rule (-> rc 3)
+    reaches Mongo too -- a row left without ANY pack_id violates invariant
+    5 the same way regardless of which backend it lives in.
     """
     from opencrab.ontology.pack_provenance import resolve_row_pack_id
 
@@ -941,13 +1038,24 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
         missing_docs = list(coll.find(missing_q))
         missing = len(missing_docs)
         by_pack: dict[str, list[Any]] = {}
+        excluded = 0
         for doc in missing_docs:
-            field = doc.get(field_root) or {}
+            raw = doc.get(field_root, _MISSING)
+            if raw is not _MISSING and not isinstance(raw, dict):
+                excluded += 1
+                continue
+            field = raw if raw is not _MISSING else {}
             id_value = doc.get(id_field, "")
             pack_id, _reason = resolve_row_pack_id(field, {id_field: id_value}, default_pack_id)
-            by_pack.setdefault(pack_id or default_pack_id, []).append(doc["_id"])
+            if pack_id is None:
+                excluded += 1
+                continue
+            by_pack.setdefault(pack_id, []).append(doc["_id"])
         by_pack_summary = ", ".join(f"{p}: {len(ids)}" for p, ids in sorted(by_pack.items()))
-        print(f"  mongo.{collection}: total={total} missing_pack_id={missing} by_pack={{{by_pack_summary}}}")
+        print(
+            f"  mongo.{collection}: total={total} missing_pack_id={missing} "
+            f"by_pack={{{by_pack_summary}}} excluded={excluded}"
+        )
         updated = 0
         if apply:
             for pack_id, ids in by_pack.items():
@@ -961,7 +1069,12 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
                         "-- aborting."
                     )
                 updated += result.modified_count
-        results[collection] = {"total": total, "missing": missing, "updated": updated}
+        results[collection] = {
+            "total": total,
+            "missing": missing,
+            "updated": updated,
+            "excluded": excluded,
+        }
     return results
 
 
@@ -1091,16 +1204,19 @@ def _docs_stage_outcome(stats: dict[str, Any]) -> tuple[str, str]:
     ``{"nodes": {...}, "sources": {...}}`` for Mongo -- both are dicts of
     sub-dicts carrying their own "missing" count).
 
-    #146 P1(b): a sub-dict carrying a non-zero ``excluded`` count (only
-    ``_backfill_doc_table``'s SQL-backed sub-dicts have this key -- an
-    ``(space, node_id)`` the graph-twin map reports ambiguous, or a row
-    whose own properties/metadata is valid JSON but not an object) demotes
-    this stage to ``skipped`` regardless of ``missing`` -- those rows are
-    left WITHOUT any pack_id by design (never guessed-and-defaulted, see
-    ``_backfill_doc_table``'s docstring), which violates invariant 5 the
-    exact same way the graph stage's own row-level ``nodes_skipped``/
-    ``edges_skipped`` demotion (``main()``) does, so it must gate the exit
-    code too."""
+    #146 P1(b): a sub-dict carrying a non-zero ``excluded`` count (BOTH
+    ``_backfill_doc_table``'s SQL-backed sub-dicts -- an ``(space, node_id)``
+    the graph-twin map reports ambiguous on either the exact or the
+    blank-space fallback key, or a row whose own properties/metadata is
+    valid JSON but not an object -- AND, since PR #177 review round 4
+    R4-C, ``_backfill_mongo``'s sub-dicts too -- a document whose
+    properties/metadata field is present but a native non-dict BSON value)
+    demotes this stage to ``skipped`` regardless of ``missing`` -- those
+    rows are left WITHOUT any pack_id by design (never guessed-and-
+    defaulted, see ``_backfill_doc_table``'s and ``_backfill_mongo``'s
+    docstrings), which violates invariant 5 the exact same way the graph
+    stage's own row-level ``nodes_skipped``/``edges_skipped`` demotion
+    (``main()``) does, so it must gate the exit code too."""
     if stats.get("skipped"):
         return "skipped", "doc store unavailable or not SQL/Mongo-backed"
     subs = [sub for sub in stats.values() if isinstance(sub, dict)]

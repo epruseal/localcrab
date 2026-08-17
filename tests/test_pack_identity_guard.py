@@ -624,3 +624,124 @@ def test_sql_get_edge_wrong_endpoint_type_returns_none(graph):
     assert graph.get_edge("Entity", "a", "relates_to", "Entity", "b") == {"pack_id": "p"}
     assert graph.get_edge("Concept", "a", "relates_to", "Entity", "b") is None
     assert graph.get_edge("Entity", "a", "relates_to", "Concept", "b") is None
+
+
+# ---------------------------------------------------------------------------
+# 21. #177 R4-A: an unresolvable edge endpoint type (lookup_node_type
+#     returning None) must REJECT the edge, not skip the ownership probe.
+#     `None` from lookup_node_type is ambiguous -- "node doesn't exist" and
+#     "the lookup query itself failed" (Neo4jStore.lookup_node_type
+#     swallows transient errors and returns None for both) look identical.
+#     Treating it as "no conflict, skip the check" let a transient failure
+#     that clears before builder.add_edge's own lookup runs slip a foreign
+#     edge through with no pack_id check at all.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolvable_edge_endpoint_type_rejected():
+    graph = MagicMock()
+    graph.available = True
+    graph.get_node.return_value = None
+    graph.get_edge.return_value = None
+    graph.lookup_node_type.return_value = None  # every lookup "fails"
+
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": "related_to",
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    ctx["builder"].add_edge.assert_not_called()
+    assert result["added_edges"] == 0
+    assert result["edge_errors"] == [
+        "a->b: cannot verify existing ownership on this backend"
+    ]
+    assert result["status"] == "partial"
+
+
+def test_unresolvable_edge_endpoint_race_still_rejected():
+    """Reproduces the race the review flagged: lookup_node_type fails
+    (returns None) on its first call, then "recovers" and returns a valid
+    type on every call after -- exactly what a transient query error that
+    clears mid-request would look like. Before this fix, the endpoint
+    probe skipped on the first None, then builder.add_edge ran its OWN
+    lookup_node_type call, which by then returned a valid type, resolved
+    both endpoints, and let the write through with no pack_id check at all.
+    The fix must reject on the FIRST unresolved lookup, before add_edge
+    ever gets a chance to re-resolve and let it through."""
+    call_count = {"n": 0}
+
+    def flaky_lookup(node_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return "Entity"
+
+    graph = MagicMock()
+    graph.available = True
+    graph.get_node.return_value = None
+    graph.get_edge.return_value = None
+    graph.lookup_node_type.side_effect = flaky_lookup
+
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": "related_to",
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    ctx["builder"].add_edge.assert_not_called()
+    assert result["added_edges"] == 0
+    assert result["edge_errors"] == [
+        "a->b: cannot verify existing ownership on this backend"
+    ]
+    assert result["status"] == "partial"
+
+
+def test_resolvable_edge_endpoints_no_conflict_passes():
+    """Regression guard: when both endpoints resolve to a real type and
+    there is no conflicting pack_id, the edge still goes through -- the
+    fail-closed-on-None change must not reject edges whose endpoints DO
+    resolve."""
+    graph = MagicMock()
+    graph.available = True
+    graph.get_node.return_value = None
+    graph.get_edge.return_value = None
+    graph.lookup_node_type.return_value = "Entity"
+
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            edges=[
+                {
+                    "from_space": "concept",
+                    "from_id": "a",
+                    "relation": "related_to",
+                    "to_space": "concept",
+                    "to_id": "b",
+                }
+            ],
+        )
+
+    ctx["builder"].add_edge.assert_called_once()
+    assert result["added_edges"] == 1
+    assert result["edge_errors"] == []
+    assert result["status"] == "ok"

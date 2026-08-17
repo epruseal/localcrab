@@ -308,28 +308,40 @@ def _ingest_into_pack(
             # clear the whitelist before any store sees it.
             validate_edge(item_from_space, item_to_space, item_relation).raise_if_invalid()
 
-            # Endpoint types resolved the same way builder.add_edge resolves
-            # them (graph.lookup_node_type) -- if either is unresolvable the
-            # endpoint node doesn't exist, add_edge will refuse the graph
-            # write on its own (missing node), and there is nothing to check
-            # a conflicting pack_id against, so the identity check is
-            # skipped rather than guessed at.
+            # Endpoint types are resolved the same way builder.add_edge
+            # resolves them (graph.lookup_node_type). A `None` result is
+            # ambiguous -- it means either "node doesn't exist" or "the
+            # lookup query itself failed" (Neo4jStore.lookup_node_type
+            # swallows transient query errors and returns None either way).
+            # Those two cases cannot be told apart from here, and treating
+            # an unresolvable endpoint as "no conflict, skip the probe" is
+            # unsafe: if the underlying error is transient and clears
+            # before builder.add_edge runs its own lookup, the endpoints
+            # resolve there and the write proceeds with no pack_id check at
+            # all. So an unresolvable endpoint fails closed (rejected) here,
+            # exactly like the other "cannot verify" cases in _foreign_pack.
             graph_store = ctx.get("neo4j")
             lookup = getattr(graph_store, "lookup_node_type", None) if graph_store is not None else None
             from_type = lookup(item_from_id) if lookup is not None else None
             to_type = lookup(item_to_id) if lookup is not None else None
-            if from_type is not None and to_type is not None:
-                reason = _foreign_pack(
-                    pack_id,
-                    _edge_probes(ctx, from_type, item_from_id, item_relation, to_type, item_to_id),
-                )
-                if reason:
-                    edge_errors.append(
-                        _identity_reject_message(
-                            "edge", f"{item_from_id}->{item_to_id}", reason
-                        )
+            if from_type is None or to_type is None:
+                edge_errors.append(
+                    _identity_reject_message(
+                        "edge", f"{item_from_id}->{item_to_id}", "unverifiable"
                     )
-                    continue
+                )
+                continue
+            reason = _foreign_pack(
+                pack_id,
+                _edge_probes(ctx, from_type, item_from_id, item_relation, to_type, item_to_id),
+            )
+            if reason:
+                edge_errors.append(
+                    _identity_reject_message(
+                        "edge", f"{item_from_id}->{item_to_id}", reason
+                    )
+                )
+                continue
 
             props = dict(_clean_meta(item.get("properties") or {}))
             props["pack_id"] = pack_id

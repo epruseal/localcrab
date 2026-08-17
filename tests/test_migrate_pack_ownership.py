@@ -1199,7 +1199,7 @@ class TestGraphTwinDocBackfill:
         # dry-run prediction, BEFORE any write.
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
-            exact, fallback, ambiguous = migrate._graph_twin_pack_map(
+            exact, fallback, ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
                 graph, ["n1"], migrate.DEFAULT_PACK_ID, actual=False
             )
         finally:
@@ -1212,6 +1212,7 @@ class TestGraphTwinDocBackfill:
         # just for sharing a node_id (see test_5b).
         assert fallback == {}
         assert ambiguous == {}
+        assert fallback_ambiguous == set()
 
         assert migrate.main(["--apply", "--skip-backup"]) == 0
 
@@ -1272,7 +1273,7 @@ class TestGraphTwinDocBackfill:
 
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
-            exact, _fallback, ambiguous = migrate._graph_twin_pack_map(
+            exact, _fallback, ambiguous, _fallback_ambiguous = migrate._graph_twin_pack_map(
                 graph, ["shared"], migrate.DEFAULT_PACK_ID, actual=True
             )
         finally:
@@ -1355,7 +1356,7 @@ class TestGraphTwinDocBackfill:
 
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
-            exact, fallback, _ambiguous = migrate._graph_twin_pack_map(
+            exact, fallback, _ambiguous, _fallback_ambiguous = migrate._graph_twin_pack_map(
                 graph, ["same"], migrate.DEFAULT_PACK_ID, actual=True
             )
         finally:
@@ -1390,7 +1391,7 @@ class TestGraphTwinDocBackfill:
 
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
-            exact, fallback, _ambiguous = migrate._graph_twin_pack_map(
+            exact, fallback, _ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
                 graph, ["legacy1"], migrate.DEFAULT_PACK_ID, actual=True
             )
         finally:
@@ -1399,6 +1400,7 @@ class TestGraphTwinDocBackfill:
         # so only the node_id-only fallback closes the gap.
         assert exact == {(None, "legacy1"): "pack-legacy"}
         assert fallback == {"legacy1": "pack-legacy"}
+        assert fallback_ambiguous == set()
 
         assert migrate.main(["--apply", "--skip-backup"]) == 0
 
@@ -1535,7 +1537,7 @@ class TestGraphTwinDocBackfill:
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
             missing = migrate._doc_missing_node_ids(docs)
-            exact, fallback, ambiguous = migrate._graph_twin_pack_map(
+            exact, fallback, ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
                 graph, missing, migrate.DEFAULT_PACK_ID, actual=False
             )
             dry = migrate._backfill_doc_table(
@@ -1549,6 +1551,7 @@ class TestGraphTwinDocBackfill:
                 twin_exact=exact,
                 twin_fallback=fallback,
                 twin_ambiguous=ambiguous,
+                twin_fallback_ambiguous=fallback_ambiguous,
             )
         finally:
             docs.close()
@@ -1575,6 +1578,169 @@ class TestGraphTwinDocBackfill:
         _seed_graph(env)
         _seed_doc(env)
         assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+
+class TestGraphTwinFallbackAmbiguity:
+    """PR #177 review round 4 R4-B: several blank-space_id graph rows
+    sharing ONE node_id but resolving to DIFFERENT pack_ids must not have
+    that disagreement silently disappear through the fallback_map dict
+    comprehension -- the ambiguity has to reach ``_backfill_doc_table`` via
+    the dedicated ``fallback_ambiguous`` set so the affected doc row gets
+    EXCLUDED, not silently defaulted or self-inferred."""
+
+    def test_r4b_4_disagreeing_blank_space_rows_populate_fallback_ambiguous(
+        self, bootstrapped_owner, env
+    ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("TypeA", "dup-blank", {"pack_id": "pack-x"}, space_id=None)
+            graph.upsert_node("TypeB", "dup-blank", {"pack_id": "pack-y"}, space_id=None)
+        finally:
+            graph.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            _exact, fallback, _ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
+                graph, ["dup-blank"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+
+        assert "dup-blank" in fallback_ambiguous
+        assert "dup-blank" not in fallback  # dropped from fallback_map, not averaged/guessed
+
+    def test_r4b_5_exact_miss_and_fallback_ambiguous_excludes_not_default_not_self_inferred(
+        self, bootstrapped_owner, env, capsys
+    ):
+        """The core R4-B repro: (blank_space, node_id) ambiguity must not
+        leak past the (document_space, node_id) lookup key mismatch into
+        self-inference or default. A resolvable self-inference path is
+        deliberately present on the doc row's own properties to prove the
+        row is EXCLUDED outright, not merely "happened to land on the
+        right answer via self-inference" -- if fallback_ambiguous were not
+        consulted, this doc row would fall through past the exact miss
+        straight to that self-inferred pack (or, absent even that, to
+        ``default``)."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("TypeA", "same", {"pack_id": "pack-x"}, space_id=None)
+            graph.upsert_node("TypeB", "same", {"pack_id": "pack-y"}, space_id=None)
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc(
+                "concept", "Entity", "same", {"source_path": "/packs/pack-self/x.md"}
+            )
+        finally:
+            docs.close()
+
+        rc = migrate.main(["--apply", "--skip-backup"])
+        out = capsys.readouterr().out
+        assert rc == 3
+        assert "docs_backfill: skipped" in out
+        assert "left unattributed" in out
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "same")
+        finally:
+            docs.close()
+        pack_id = row["properties"].get("pack_id")
+        assert not pack_id  # neither default...
+        assert pack_id != migrate.DEFAULT_PACK_ID
+        assert pack_id != "pack-self"  # ...nor self-inferred
+
+    def test_r4b_6_agreeing_blank_space_rows_still_apply_fallback(
+        self, bootstrapped_owner, env
+    ):
+        """Not over-exclusion: TWO blank-space_id rows that AGREE on the
+        same pack_id still land in fallback_map (not fallback_ambiguous)
+        and the doc row is still backfilled -- same discipline as the
+        single-row case (test_5_blank_graph_space_id_uses_fallback_map)."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node("TypeA", "agree", {"pack_id": "pack-legacy"}, space_id=None)
+            graph.upsert_node("TypeB", "agree", {"pack_id": "pack-legacy"}, space_id=None)
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "agree", {})
+        finally:
+            docs.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            _exact, fallback, _ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
+                graph, ["agree"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+        assert fallback == {"agree": "pack-legacy"}
+        assert "agree" not in fallback_ambiguous
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "agree")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-legacy"
+
+    def test_r4b_6b_exact_hit_passes_through_despite_fallback_ambiguous(
+        self, bootstrapped_owner, env
+    ):
+        """Exact takes priority over fallback ambiguity: a doc row whose
+        graph twin has an EXACT (space, node_id) match must apply that
+        value even when OTHER, unrelated blank-space_id rows sharing the
+        same bare node_id disagree with each other -- the more specific
+        exact row is correct regardless of what the space-less rows think."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            graph.upsert_node(
+                "Entity", "shared-id", {"pack_id": "pack-exact"}, space_id="concept"
+            )
+            graph.upsert_node("TypeA", "shared-id", {"pack_id": "pack-x"}, space_id=None)
+            graph.upsert_node("TypeB", "shared-id", {"pack_id": "pack-y"}, space_id=None)
+        finally:
+            graph.close()
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            docs.upsert_node_doc("concept", "Entity", "shared-id", {})
+        finally:
+            docs.close()
+
+        graph = LocalGraphStore(str(env / "graph.db"))
+        try:
+            exact, _fallback, _ambiguous, fallback_ambiguous = migrate._graph_twin_pack_map(
+                graph, ["shared-id"], migrate.DEFAULT_PACK_ID, actual=True
+            )
+        finally:
+            graph.close()
+        assert exact[("concept", "shared-id")] == "pack-exact"
+        assert "shared-id" in fallback_ambiguous
+
+        assert migrate.main(["--apply", "--skip-backup"]) == 0
+
+        docs = LocalSQLDocStore(str(env / "doc_store.db"))
+        try:
+            row = docs.get_node_doc("concept", "shared-id")
+        finally:
+            docs.close()
+        assert row["properties"]["pack_id"] == "pack-exact"
 
 
 class _FakeSingleRowDocStore:
@@ -1643,38 +1809,40 @@ class TestPgDictPropertiesAndTwinDictStrEquivalence:
         str_store = self._FakeGraphTwinStore("n1", "concept", "pack-a", as_dict=False)
         dict_store = self._FakeGraphTwinStore("n1", "concept", "pack-a", as_dict=True)
 
-        exact_str, fb_str, amb_str = migrate._graph_twin_pack_map(
+        exact_str, fb_str, amb_str, famb_str = migrate._graph_twin_pack_map(
             str_store, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
         )
-        exact_dict, fb_dict, amb_dict = migrate._graph_twin_pack_map(
+        exact_dict, fb_dict, amb_dict, famb_dict = migrate._graph_twin_pack_map(
             dict_store, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
         )
         assert exact_str == exact_dict == {("concept", "n1"): "pack-a"}
         # Nonblank space_id -> exact key always matchable -> no fallback.
         assert fb_str == fb_dict == {}
         assert amb_str == amb_dict == {}
+        assert famb_str == famb_dict == set()
 
         # The fallback branch itself must agree across str/dict too, so run
         # the blank-space_id variant through both representations as well.
         blank_str = self._FakeGraphTwinStore("n1", "", "pack-a", as_dict=False)
         blank_dict = self._FakeGraphTwinStore("n1", "", "pack-a", as_dict=True)
-        _, blank_fb_str, _ = migrate._graph_twin_pack_map(
+        _, blank_fb_str, _, _ = migrate._graph_twin_pack_map(
             blank_str, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
         )
-        _, blank_fb_dict, _ = migrate._graph_twin_pack_map(
+        _, blank_fb_dict, _, _ = migrate._graph_twin_pack_map(
             blank_dict, ["n1"], migrate.DEFAULT_PACK_ID, actual=True
         )
         assert blank_fb_str == blank_fb_dict == {"n1": "pack-a"}
 
-        for exact, fallback, ambiguous in (
-            (exact_str, fb_str, amb_str),
-            (exact_dict, fb_dict, amb_dict),
+        for exact, fallback, ambiguous, fallback_ambiguous in (
+            (exact_str, fb_str, amb_str, famb_str),
+            (exact_dict, fb_dict, amb_dict, famb_dict),
         ):
             doc_store = _FakeSingleRowDocStore("concept", "n1", {})
             stats = migrate._backfill_doc_table(
                 doc_store, "doc_nodes", "properties", ("space", "node_id"), "node_id",
                 migrate.DEFAULT_PACK_ID, apply=True,
                 twin_exact=exact, twin_fallback=fallback, twin_ambiguous=ambiguous,
+                twin_fallback_ambiguous=fallback_ambiguous,
             )
             assert stats["by_pack"] == {"pack-a": 1}
             assert doc_store.written_pack_id == "pack-a"
@@ -1700,8 +1868,17 @@ class TestBackfillMongoPathInference:
             field_root = next(iter(query["$or"][0])).split(".")[0]
             results = []
             for doc in self._docs.values():
-                field = doc.get(field_root) or {}
-                if not field.get("pack_id"):
+                # Real MongoDB dotted-path traversal into a non-document
+                # field (missing key, None, a list, a bare string, ...)
+                # never finds "<field>.pack_id" either -- it just doesn't
+                # exist, same as an absent key -- so $exists:False matches
+                # it too. A non-dict field must NOT be treated as "has a
+                # pack_id" by calling .get() on it (#146 P1(b), PR #177
+                # review round 4 R4-C -- the old ``doc.get(field_root) or {}``
+                # here crashed on a non-empty list/string with AttributeError
+                # since a list/str has no ``.get``).
+                field = doc.get(field_root, None)
+                if not isinstance(field, dict) or not field.get("pack_id"):
                     results.append(dict(doc))
             return results
 
@@ -1741,3 +1918,65 @@ class TestBackfillMongoPathInference:
         assert db._colls["nodes"]._docs[2]["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
         assert results["nodes"]["missing"] == 2
         assert results["nodes"]["updated"] == 2
+
+    def test_r4c_7_native_non_dict_properties_excluded_not_defaulted(self):
+        """PR #177 review round 4 R4-C: Mongo fields are NATIVE BSON, not
+        JSON strings -- ``resolve_row_pack_id``'s own non-dict detection
+        (built for a JSON-string column) never fires for these; the OLDER
+        design (trusting its ``reason`` string) would have silently
+        defaulted every one of these 4 types instead of excluding them.
+        Type judgment must happen in ``_backfill_mongo`` itself, before the
+        resolver is ever called."""
+        nodes = [
+            {"_id": 1, "node_id": "list-bad", "properties": ["bad"]},
+            {"_id": 2, "node_id": "str-bad", "properties": "bad"},
+            {"_id": 3, "node_id": "empty-list", "properties": []},
+            {"_id": 4, "node_id": "null-props", "properties": None},
+            {"_id": 5, "node_id": "resolvable", "properties": {"source_path": "/packs/pack-m/x.md"}},
+        ]
+        db = self._FakeMongoDb(nodes, sources=[])
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        # None of the 4 non-dict docs were touched by update_many -- their
+        # raw properties value is byte-for-byte unchanged (no dotted $set
+        # was ever attempted against them).
+        assert db._colls["nodes"]._docs[1]["properties"] == ["bad"]
+        assert db._colls["nodes"]._docs[2]["properties"] == "bad"
+        assert db._colls["nodes"]._docs[3]["properties"] == []
+        assert db._colls["nodes"]._docs[4]["properties"] is None
+        # The one genuinely resolvable doc still gets backfilled normally.
+        assert db._colls["nodes"]._docs[5]["properties"]["pack_id"] == "pack-m"
+        assert results["nodes"]["missing"] == 5
+        assert results["nodes"]["updated"] == 1
+        assert results["nodes"]["excluded"] == 4
+
+    def test_r4c_7b_missing_properties_key_not_excluded_gets_default(self):
+        """The over-exclusion guard: a document where the properties key is
+        ENTIRELY ABSENT (not merely non-dict) must NOT be excluded -- a
+        dotted ``$set`` happily creates the nested document, so this still
+        goes through the resolver (-> assumed -> default), exactly as
+        before R4-C."""
+        nodes = [{"_id": 1, "node_id": "no-props-key"}]
+        db = self._FakeMongoDb(nodes, sources=[])
+
+        results = migrate._backfill_mongo(db, migrate.DEFAULT_PACK_ID, apply=True)
+
+        assert db._colls["nodes"]._docs[1]["properties"]["pack_id"] == migrate.DEFAULT_PACK_ID
+        assert results["nodes"]["missing"] == 1
+        assert results["nodes"]["updated"] == 1
+        assert results["nodes"]["excluded"] == 0
+
+    def test_r4c_8_mongo_excluded_count_demotes_docs_stage_to_skipped_rc3(self):
+        """#146 P1(b): _docs_stage_outcome's existing excluded-count
+        demotion rule (-> skipped -> rc 3, see TestStageOutcomesAndExitCodes
+        for the generic docs_backfill-skipped-gates-rc3 wiring) must reach
+        the Mongo-shaped stats dict too, not just the SQL-backed
+        doc_nodes/doc_sources shape."""
+        stats = {
+            "nodes": {"total": 5, "missing": 5, "updated": 1, "excluded": 4},
+            "sources": {"total": 0, "missing": 0, "updated": 0, "excluded": 0},
+        }
+        outcome, reason = migrate._docs_stage_outcome(stats)
+        assert outcome == "skipped"
+        assert "4 row(s) left unattributed" in reason
