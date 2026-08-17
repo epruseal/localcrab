@@ -327,6 +327,32 @@ class TestChromaUriPreservation:
         assert got["uris"][0] is None
 
 
+class _FlakyEF(MockEF):
+    """MockEF that starts raising once armed — stands in for an embedding
+    backend (remote + local fallback) that is down. Counts its calls so a test
+    can prove the rollback path does not depend on it."""
+
+    def __init__(self, dim: int = 32):
+        super().__init__(dim)
+        self.armed = False
+        self.calls = 0
+
+    def __call__(self, input):  # noqa: A002 - chroma's EF protocol names it `input`
+        self.calls += 1
+        if self.armed:
+            raise RuntimeError("embedding backend unavailable")
+        return super().__call__(input)
+
+
+def _chroma_store_with_ef(tmp_path, ef):
+    from opencrab.stores.chroma_store import ChromaStore
+
+    return ChromaStore(
+        host="localhost", port=0, collection_name="vtest", local_mode=True,
+        local_path=str(tmp_path / "chroma"), embedding_function=ef,
+    )
+
+
 class _TrackingLock:
     """Wraps a store's lock and signals every acquire ATTEMPT *before* it can
     block, so a thread waiting on the critical section is observable instead
@@ -452,6 +478,117 @@ class TestChromaUpsertSafety:
         assert [c[0] for c in col.calls] == [
             "get", "delete", "add", "add-end", "get", "delete", "add", "add-end",
         ], col.calls
+
+    def test_embedding_failure_leaves_the_existing_record_intact(self, tmp_path):
+        """[리뷰 라운드4] chroma 는 add() 안에서 임베딩한다. 임베딩 백엔드가 죽으면
+        add 가 던지는데 그 시점엔 치환 경로의 delete 가 이미 끝나 기존 레코드가
+        영구 소실된다. 종전 native upsert() 는 같은 실패에서 레코드를 보존했다."""
+        ef = _FlakyEF()
+        store = _chroma_store_with_ef(tmp_path, ef)
+        store.upsert_texts(texts=["원본 문서"], metadatas=[{"pack_id": "p"}], ids=["r1"])
+
+        ef.armed = True
+        with pytest.raises(Exception):
+            store.upsert_texts(texts=["새 문서"], metadatas=[{"pack_id": "p"}], ids=["r1"])
+
+        ef.armed = False
+        assert store.count() == 1, "임베딩 실패가 기존 레코드를 지웠다"
+        got = store.get_by_id("r1")
+        assert got is not None and got["document"] == "원본 문서"
+        assert got["metadata"] == {"pack_id": "p"}
+
+    def test_rollback_after_embedding_failure_does_not_call_the_embedding_function(
+        self, tmp_path
+    ):
+        # 복구가 방금 실패한 그것(EF)에 의존하면 정작 필요할 때 못 돈다.
+        # 저장된 임베딩을 명시로 넘기므로 EF 호출이 늘어선 안 된다.
+        ef = _FlakyEF()
+        store = _chroma_store_with_ef(tmp_path, ef)
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1"}], ids=["r1"])
+        before = store._collection.get(ids=["r1"], include=["embeddings"])
+
+        ef.armed = True
+        calls_before = ef.calls
+        with pytest.raises(Exception):
+            store.upsert_texts(texts=["새"], metadatas=[{"k": "2"}], ids=["r1"])
+
+        assert ef.calls == calls_before + 1, (
+            f"복구가 EF 를 다시 호출했다(실패한 백엔드 의존): {ef.calls - calls_before}회"
+        )
+        ef.armed = False
+        after = store._collection.get(ids=["r1"], include=["embeddings"])
+        assert [list(map(float, v)) for v in after["embeddings"]] == [
+            list(map(float, v)) for v in before["embeddings"]
+        ], "복구된 임베딩이 원본과 다르다"
+
+    def test_partially_applied_add_is_rolled_back(self, tmp_path):
+        # add 가 일부만 반영하고 죽는 경우. 복구가 delete 를 선행하지 않으면
+        # (chroma 의 add 는 기존 id 에 대해 조용한 no-op 이므로) 반쯤 쓰인
+        # 새 레코드가 그대로 살아남는다.
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["A 원본"], metadatas=[{"k": "a"}], ids=["a"])
+        store.upsert_texts(texts=["B 원본"], metadatas=[{"k": "b"}], ids=["b"])
+
+        real_add = store._collection.add
+
+        def half_then_fail(**kw):
+            # 복구용 add 는 embeddings 를 명시로 넘긴다(EF 를 타지 않는다) —
+            # 전진 경로만 실패시키고 복구는 통과시킨다.
+            if "embeddings" in kw:
+                return real_add(**kw)
+            real_add(ids=kw["ids"][:1], documents=kw["documents"][:1],
+                     metadatas=kw["metadatas"][:1])
+            raise RuntimeError("add 가 일부만 반영하고 죽었다")
+
+        store._collection.add = half_then_fail
+        with pytest.raises(RuntimeError):
+            store.upsert_texts(
+                texts=["A 새", "B 새", "C 신규"],
+                metadatas=[{"k": "a2"}, {"k": "b2"}, {"k": "c"}],
+                ids=["a", "b", "new"],
+            )
+        store._collection.add = real_add
+
+        assert store.get_by_id("a")["document"] == "A 원본", "부분 반영분이 살아남았다"
+        assert store.get_by_id("b")["document"] == "B 원본"
+        assert store.get_by_id("new") is None, "호출 전에 없던 id 가 남았다"
+        assert store.count() == 2
+
+    def test_uri_merge_is_rolled_back_when_a_later_replace_fails(self, tmp_path):
+        # 분기 경로에서 merge 가 먼저 성공한 뒤 replace 가 죽으면 배치가 반만
+        # 쓰인 채 남는다 — 롤백은 배치 전체를 호출 전 상태로 되돌려야 한다.
+        store = build_vector_store("chroma", tmp_path)
+        store._collection.add(
+            ids=["uri1"], embeddings=[[0.1] * 32], documents=["uri 원본"],
+            metadatas=[{"k": "u"}], uris=["http://example.com/uri1"],
+        )
+        store.upsert_texts(texts=["plain 원본"], metadatas=[{"k": "p"}], ids=["plain1"])
+
+        real_add = store._collection.add
+
+        def fail_forward_only(**kw):
+            if "embeddings" in kw:      # 복구 경로는 통과시킨다
+                return real_add(**kw)
+            raise RuntimeError("replace 단계 실패")
+
+        store._collection.add = fail_forward_only
+        with pytest.raises(RuntimeError):
+            store.upsert_texts(
+                texts=["uri 새", "plain 새"],
+                metadatas=[{"k": "u2"}, {"k": "p2"}],
+                ids=["uri1", "plain1"],
+            )
+        store._collection.add = real_add
+
+        got = store._collection.get(
+            ids=["uri1", "plain1"], include=["documents", "metadatas", "uris"]
+        )
+        by_id = dict(zip(got["ids"], zip(got["documents"], got["metadatas"], got["uris"])))
+        assert by_id["uri1"] == (
+            "uri 원본", {"k": "u"}, "http://example.com/uri1"
+        ), f"성공한 merge 가 롤백되지 않았다: {by_id['uri1']}"
+        assert by_id["plain1"][0] == "plain 원본"
+        assert by_id["plain1"][2] is None
 
     def test_same_collection_stores_share_one_lock(self, tmp_path):
         # 인스턴스가 하나뿐이라는 보장이 없으므로(_get_context 는 초기화를 잠그지

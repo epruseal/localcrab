@@ -243,6 +243,22 @@ class ChromaStore:
           (chroma then raises NotFoundError — loud, not silent). Pre-existing
           behavior, unchanged here.
 
+        Failure rollback: chroma embeds inside add(), so an embedding backend
+        that is down makes add() raise *after* the replace path has already
+        deleted the old records. The parent implementation's native upsert()
+        left them intact on such a failure, so this method takes a snapshot
+        (documents, metadata, embeddings, uris) in the same get() that probes
+        for uris, and on any exception from the mutation it deletes the batch
+        and re-adds that snapshot — pre-call state, whole batch, merge branch
+        included. Replaying stored embeddings means the rollback never calls
+        the embedding function, so it works precisely when the embedding
+        backend is the thing that failed. Note the guarantee is about
+        PRE-SUBMIT failures (embedding, validation); a failure after chroma
+        has begun applying a call carries no such promise here or in the
+        native upsert() this replaced, which is why the rollback deletes
+        before it re-adds. COST: every upsert now also reads the existing
+        records' documents, metadata and vectors.
+
         Non-atomicity (replace path only): if the process dies between
         delete() and add(), the row is lost until the same chunk id reappears
         in a later incremental load and gets re-added via the
@@ -304,43 +320,61 @@ class ChromaStore:
             # same non-reentrant lock and would deadlock here.
             handle = self._collection
 
-            # Split the batch by whether the id already carries a uri — those
-            # go through merge (upsert), everything else through replace
-            # (delete+add). See docstring for why.
-            existing = handle.get(ids=ids, include=["uris"])
+            # One read serves two purposes: it splits the batch by whether the
+            # id already carries a uri (those go through merge (upsert),
+            # everything else through replace (delete+add) — see docstring),
+            # and it is the rollback snapshot for the mutation below.
+            existing = handle.get(
+                ids=ids, include=["uris", "documents", "metadatas", "embeddings"]
+            )
             uri_ids = {
                 doc_id
                 for doc_id, uri in zip(existing["ids"], existing.get("uris") or [])
                 if uri is not None
             }
 
-            if not uri_ids:
-                handle.delete(ids=ids)
-                handle.add(documents=texts, metadatas=clean_meta, ids=ids)
-            else:
-                merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
-                replace_pos = [
-                    i for i, doc_id in enumerate(ids) if doc_id not in uri_ids
-                ]
-                if merge_pos:
-                    handle.upsert(
-                        documents=[texts[i] for i in merge_pos],
-                        metadatas=[clean_meta[i] for i in merge_pos],
-                        ids=[ids[i] for i in merge_pos],
+            try:
+                if not uri_ids:
+                    handle.delete(ids=ids)
+                    handle.add(documents=texts, metadatas=clean_meta, ids=ids)
+                else:
+                    merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
+                    replace_pos = [
+                        i for i, doc_id in enumerate(ids) if doc_id not in uri_ids
+                    ]
+                    if merge_pos:
+                        handle.upsert(
+                            documents=[texts[i] for i in merge_pos],
+                            metadatas=[clean_meta[i] for i in merge_pos],
+                            ids=[ids[i] for i in merge_pos],
+                        )
+                        logger.warning(
+                            "ChromaDB: %d uri-bearing record(s) upserted via merge "
+                            "(uri preserved, stale metadata keys may persist): %s",
+                            len(merge_pos), [ids[i] for i in merge_pos],
+                        )
+                    if replace_pos:
+                        replace_ids = [ids[i] for i in replace_pos]
+                        handle.delete(ids=replace_ids)
+                        handle.add(
+                            documents=[texts[i] for i in replace_pos],
+                            metadatas=[clean_meta[i] for i in replace_pos],
+                            ids=replace_ids,
+                        )
+            except Exception:
+                # The delete already ran, so the caller's records are gone
+                # unless we put them back (review round 4). Rolls the WHOLE
+                # batch back, not just the replace ids: a merge that already
+                # succeeded would otherwise leave the batch half-written.
+                try:
+                    _rollback(handle, ids, existing)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.error(
+                        "ChromaDB: rollback after a failed upsert also failed "
+                        "(%s) -- these ids may now be missing: %s",
+                        rollback_exc, ids,
                     )
-                    logger.warning(
-                        "ChromaDB: %d uri-bearing record(s) upserted via merge "
-                        "(uri preserved, stale metadata keys may persist): %s",
-                        len(merge_pos), [ids[i] for i in merge_pos],
-                    )
-                if replace_pos:
-                    replace_ids = [ids[i] for i in replace_pos]
-                    handle.delete(ids=replace_ids)
-                    handle.add(
-                        documents=[texts[i] for i in replace_pos],
-                        metadatas=[clean_meta[i] for i in replace_pos],
-                        ids=replace_ids,
-                    )
+                raise
 
         logger.debug(
             "ChromaDB: upserted %d documents (%d replaced, %d merged for uri)",
@@ -441,6 +475,36 @@ class ChromaStore:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> None:
+    """Put the collection back the way it was before a failed upsert batch.
+
+    Deletes every id in the batch, then re-adds the records that existed
+    beforehand — brand-new ids therefore end up absent, which IS their
+    pre-call state. Deleting first is required: add() on an id that already
+    exists is a silent no-op in chroma, so a partially applied add would
+    otherwise survive the rollback untouched.
+
+    Everything is replayed from the snapshot, so the re-add passes embeddings
+    explicitly and chroma never calls the embedding function — the rollback
+    still works when a dead embedding backend is what caused the failure
+    (measured: zero EF calls, embedding restored exactly). uris ride along in
+    mixed and all-None shapes alike.
+
+    Membership is read off ``snapshot["ids"]`` only. ``snapshot["embeddings"]``
+    is a NumPy array, and testing an array for truthiness raises.
+    """
+    handle.delete(ids=batch_ids)
+    if not snapshot["ids"]:
+        return
+    handle.add(
+        ids=snapshot["ids"],
+        embeddings=snapshot["embeddings"],
+        documents=snapshot["documents"],
+        metadatas=snapshot["metadatas"],
+        uris=snapshot.get("uris"),
+    )
 
 
 def _sanitize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
