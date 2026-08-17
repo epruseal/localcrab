@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,10 +14,35 @@ from typing import Any
 from opencrab.common.ids import stable_id
 from opencrab.common.text import slugify as _common_slugify
 from opencrab.locking import write_lock
-from opencrab.ontology.builder import OntologyBuilder
+from opencrab.ontology.builder import (
+    OntologyBuilder,
+    store_write_failures,
+    store_write_succeeded_for,
+)
 from opencrab.stores.local_doc_store import LocalDocStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _WriteTally:
+    kind: str  # "node" | "edge"
+    written: int = 0
+    failed: int = 0
+
+    def record(self, receipt: Any, label: str) -> None:
+        stores = receipt.get("stores") if isinstance(receipt, dict) else None
+        if not isinstance(stores, dict):  # truthy non-dict 도 여기서 걸러야 한다:
+            stores = {}  # store_write_failures() 는 .items() 를 바로 부른다
+        if store_write_succeeded_for(stores, self.kind):
+            self.written += 1
+            return
+        self.failed += 1
+        detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+        logger.warning("%s %s not stored: %s", self.kind, label, detail)
+
 
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 TAG_RE = re.compile(r"(?<!\w)#([A-Za-z0-9_가-힣\-/]+)")
@@ -196,8 +223,8 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
     sql = SQLStore(f"sqlite:///{local_data_dir / 'opencrab.db'}")
     builder = OntologyBuilder(graph, docs, sql)
 
-    node_count = 0
-    edge_count = 0
+    nodes = _WriteTally("node")
+    edges = _WriteTally("edge")
     edge_props = {
         "source": "obsidian",
         "workspace_id": workspace_id,
@@ -219,67 +246,75 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
 
     for folder_path in sorted(folder_paths):
         name = folder_path.split("/")[-1]
-        builder.add_node(
-            space="concept",
-            node_type="Topic",
-            node_id=folder_topic_id(workspace_id, folder_path),
-            properties={
-                "name": name,
-                "source": "obsidian",
-                "workspace_id": workspace_id,
-                "workspace_label": vault_root.name,
-                "obsidian_path": folder_path,
-                "viz_theme": topic_theme(folder_path),
-                "viz_color": theme_color(topic_theme(folder_path)),
-            },
+        nodes.record(
+            builder.add_node(
+                space="concept",
+                node_type="Topic",
+                node_id=folder_topic_id(workspace_id, folder_path),
+                properties={
+                    "name": name,
+                    "source": "obsidian",
+                    "workspace_id": workspace_id,
+                    "workspace_label": vault_root.name,
+                    "obsidian_path": folder_path,
+                    "viz_theme": topic_theme(folder_path),
+                    "viz_color": theme_color(topic_theme(folder_path)),
+                },
+            ),
+            folder_path,
         )
-        node_count += 1
         parent = folder_path.rsplit("/", 1)[0] if "/" in folder_path else None
         if parent:
-            builder.add_edge(
-                "concept",
-                folder_topic_id(workspace_id, folder_path),
-                "part_of",
-                "concept",
-                folder_topic_id(workspace_id, parent),
-                properties=edge_props,
+            edges.record(
+                builder.add_edge(
+                    "concept",
+                    folder_topic_id(workspace_id, folder_path),
+                    "part_of",
+                    "concept",
+                    folder_topic_id(workspace_id, parent),
+                    properties=edge_props,
+                ),
+                f"{folder_path}-[part_of]->{parent}",
             )
-            edge_count += 1
 
     for tag in sorted(tag_names):
-        builder.add_node(
-            space="concept",
-            node_type="Topic",
-            node_id=tag_topic_id(workspace_id, tag),
-            properties={
-                "name": tag,
-                "source": "obsidian",
-                "workspace_id": workspace_id,
-                "workspace_label": vault_root.name,
-                "obsidian_kind": "tag",
-                "viz_theme": topic_theme(tag),
-                "viz_color": theme_color(topic_theme(tag)),
-            },
+        nodes.record(
+            builder.add_node(
+                space="concept",
+                node_type="Topic",
+                node_id=tag_topic_id(workspace_id, tag),
+                properties={
+                    "name": tag,
+                    "source": "obsidian",
+                    "workspace_id": workspace_id,
+                    "workspace_label": vault_root.name,
+                    "obsidian_kind": "tag",
+                    "viz_theme": topic_theme(tag),
+                    "viz_color": theme_color(topic_theme(tag)),
+                },
+            ),
+            tag,
         )
-        node_count += 1
 
     for link in sorted(unresolved_links):
-        builder.add_node(
-            space="concept",
-            node_type="Topic",
-            node_id=unresolved_link_topic_id(workspace_id, link),
-            properties={
-                "name": Path(link).name,
-                "source": "obsidian",
-                "workspace_id": workspace_id,
-                "workspace_label": vault_root.name,
-                "obsidian_kind": "wikilink_stub",
-                "obsidian_target": link,
-                "viz_theme": topic_theme(link),
-                "viz_color": theme_color(topic_theme(link)),
-            },
+        nodes.record(
+            builder.add_node(
+                space="concept",
+                node_type="Topic",
+                node_id=unresolved_link_topic_id(workspace_id, link),
+                properties={
+                    "name": Path(link).name,
+                    "source": "obsidian",
+                    "workspace_id": workspace_id,
+                    "workspace_label": vault_root.name,
+                    "obsidian_kind": "wikilink_stub",
+                    "obsidian_target": link,
+                    "viz_theme": topic_theme(link),
+                    "viz_color": theme_color(topic_theme(link)),
+                },
+            ),
+            link,
         )
-        node_count += 1
 
     for note in notes:
         theme = note_theme(note)
@@ -288,62 +323,68 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
         title = note.title
         mtime = int(note.path.stat().st_mtime)
 
-        builder.add_node(
-            space="resource",
-            node_type="Document",
-            node_id=note.note_doc_id,
-            properties={
-                "name": title,
-                "title": title,
-                "source": "obsidian",
-                "source_path": note.rel_path,
-                "workspace_label": vault_root.name,
-                "workspace_id": workspace_id,
-                "summary": text_excerpt[:400],
-                "obsidian_rel_path": note.rel_path,
-                "obsidian_theme": theme,
-                "viz_theme": theme,
-                "viz_color": color,
-            },
+        nodes.record(
+            builder.add_node(
+                space="resource",
+                node_type="Document",
+                node_id=note.note_doc_id,
+                properties={
+                    "name": title,
+                    "title": title,
+                    "source": "obsidian",
+                    "source_path": note.rel_path,
+                    "workspace_label": vault_root.name,
+                    "workspace_id": workspace_id,
+                    "summary": text_excerpt[:400],
+                    "obsidian_rel_path": note.rel_path,
+                    "obsidian_theme": theme,
+                    "viz_theme": theme,
+                    "viz_color": color,
+                },
+            ),
+            note.rel_path,
         )
-        node_count += 1
 
-        builder.add_node(
-            space="evidence",
-            node_type="TextUnit",
-            node_id=note.note_text_id,
-            properties={
-                "title": title,
-                "text": text_excerpt,
-                "source": "obsidian",
-                "source_path": note.rel_path,
-                "workspace_label": vault_root.name,
-                "workspace_id": workspace_id,
-                "obsidian_rel_path": note.rel_path,
-                "char_count": len(note.text),
-                "modified_at": mtime,
-                "viz_theme": theme,
-                "viz_color": color,
-            },
+        nodes.record(
+            builder.add_node(
+                space="evidence",
+                node_type="TextUnit",
+                node_id=note.note_text_id,
+                properties={
+                    "title": title,
+                    "text": text_excerpt,
+                    "source": "obsidian",
+                    "source_path": note.rel_path,
+                    "workspace_label": vault_root.name,
+                    "workspace_id": workspace_id,
+                    "obsidian_rel_path": note.rel_path,
+                    "char_count": len(note.text),
+                    "modified_at": mtime,
+                    "viz_theme": theme,
+                    "viz_color": color,
+                },
+            ),
+            note.rel_path,
         )
-        node_count += 1
 
-        builder.add_node(
-            space="concept",
-            node_type="Topic",
-            node_id=note.note_topic_id,
-            properties={
-                "name": title,
-                "source": "obsidian",
-                "workspace_label": vault_root.name,
-                "workspace_id": workspace_id,
-                "obsidian_kind": "note",
-                "obsidian_rel_path": note.rel_path,
-                "viz_theme": theme,
-                "viz_color": color,
-            },
+        nodes.record(
+            builder.add_node(
+                space="concept",
+                node_type="Topic",
+                node_id=note.note_topic_id,
+                properties={
+                    "name": title,
+                    "source": "obsidian",
+                    "workspace_label": vault_root.name,
+                    "workspace_id": workspace_id,
+                    "obsidian_kind": "note",
+                    "obsidian_rel_path": note.rel_path,
+                    "viz_theme": theme,
+                    "viz_color": color,
+                },
+            ),
+            note.rel_path,
         )
-        node_count += 1
 
         docs.upsert_source(
             source_id=str(note.path.resolve()),
@@ -359,47 +400,55 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
             },
         )
 
-        builder.add_edge(
-            "resource",
-            note.note_doc_id,
-            "contains",
-            "evidence",
-            note.note_text_id,
-            properties={**edge_props, "source_path": note.rel_path},
+        edges.record(
+            builder.add_edge(
+                "resource",
+                note.note_doc_id,
+                "contains",
+                "evidence",
+                note.note_text_id,
+                properties={**edge_props, "source_path": note.rel_path},
+            ),
+            f"{note.rel_path}-[contains]",
         )
-        edge_count += 1
-        builder.add_edge(
-            "evidence",
-            note.note_text_id,
-            "describes",
-            "concept",
-            note.note_topic_id,
-            properties={**edge_props, "source_path": note.rel_path},
-        )
-        edge_count += 1
-
-        for depth in range(1, len(note.folders) + 1):
-            folder_path = "/".join(note.folders[:depth])
+        edges.record(
             builder.add_edge(
                 "evidence",
                 note.note_text_id,
                 "describes",
                 "concept",
-                folder_topic_id(workspace_id, folder_path),
+                note.note_topic_id,
                 properties={**edge_props, "source_path": note.rel_path},
+            ),
+            f"{note.rel_path}-[describes]->topic",
+        )
+
+        for depth in range(1, len(note.folders) + 1):
+            folder_path = "/".join(note.folders[:depth])
+            edges.record(
+                builder.add_edge(
+                    "evidence",
+                    note.note_text_id,
+                    "describes",
+                    "concept",
+                    folder_topic_id(workspace_id, folder_path),
+                    properties={**edge_props, "source_path": note.rel_path},
+                ),
+                f"{note.rel_path}-[describes]->{folder_path}",
             )
-            edge_count += 1
 
         for tag in note.tags:
-            builder.add_edge(
-                "evidence",
-                note.note_text_id,
-                "mentions",
-                "concept",
-                tag_topic_id(workspace_id, tag),
-                properties={**edge_props, "source_path": note.rel_path},
+            edges.record(
+                builder.add_edge(
+                    "evidence",
+                    note.note_text_id,
+                    "mentions",
+                    "concept",
+                    tag_topic_id(workspace_id, tag),
+                    properties={**edge_props, "source_path": note.rel_path},
+                ),
+                f"{note.rel_path}-[mentions]->{tag}",
             )
-            edge_count += 1
 
         for link in note.wikilinks:
             target = note_by_rel.get(link)
@@ -408,20 +457,24 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                 target_topic_id = basename_matches[0].note_topic_id if len(basename_matches) == 1 else unresolved_link_topic_id(workspace_id, link)
             else:
                 target_topic_id = target.note_topic_id
-            builder.add_edge(
-                "concept",
-                note.note_topic_id,
-                "related_to",
-                "concept",
-                target_topic_id,
-                properties={**edge_props, "source_path": note.rel_path},
+            edges.record(
+                builder.add_edge(
+                    "concept",
+                    note.note_topic_id,
+                    "related_to",
+                    "concept",
+                    target_topic_id,
+                    properties={**edge_props, "source_path": note.rel_path},
+                ),
+                f"{note.rel_path}-[related_to]->{link}",
             )
-            edge_count += 1
 
     return {
         "notes": len(notes),
-        "nodes_written": node_count,
-        "edges_written": edge_count,
+        "nodes_written": nodes.written,
+        "edges_written": edges.written,
+        "node_write_failures": nodes.failed,
+        "edge_write_failures": edges.failed,
         "folder_topics": len(folder_paths),
         "tag_topics": len(tag_names),
         "unresolved_link_topics": len(unresolved_links),
@@ -456,6 +509,12 @@ def main() -> None:
         local_data_dir=Path(args.local_data_dir),
     )
     print(result)
+    if result["node_write_failures"] or result["edge_write_failures"]:
+        print(
+            f"WARNING: {result['node_write_failures']} node and "
+            f"{result['edge_write_failures']} edge writes did not reach every required store",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

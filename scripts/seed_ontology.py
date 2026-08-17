@@ -184,7 +184,11 @@ def seed() -> None:
 
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
-    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.ontology.builder import (
+        OntologyBuilder,
+        store_write_failures,
+        store_write_succeeded_for,
+    )
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
     from opencrab.stores.factory import (
@@ -234,8 +238,16 @@ def seed() -> None:
         for space, node_type, node_id, props in NODES:
             try:
                 with write_lock(cfg.local_data_dir):
-                    builder.add_node(space, node_type, node_id, props)
-                node_ok += 1
+                    result = builder.add_node(space, node_type, node_id, props)
+                stores = result.get("stores") if isinstance(result, dict) else None
+                if not isinstance(stores, dict):
+                    stores = {}
+                if store_write_succeeded_for(stores, "node"):
+                    node_ok += 1
+                else:
+                    detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                    console.print(f"  [red]FAIL[/red] {node_id}: {detail}")
+                    node_fail += 1
             except Exception as exc:
                 console.print(f"  [red]FAIL[/red] {node_id}: {exc}")
                 node_fail += 1
@@ -252,8 +264,16 @@ def seed() -> None:
         for from_space, from_id, relation, to_space, to_id in EDGES:
             try:
                 with write_lock(cfg.local_data_dir):
-                    builder.add_edge(from_space, from_id, relation, to_space, to_id)
-                edge_ok += 1
+                    result = builder.add_edge(from_space, from_id, relation, to_space, to_id)
+                stores = result.get("stores") if isinstance(result, dict) else None
+                if not isinstance(stores, dict):
+                    stores = {}
+                if store_write_succeeded_for(stores, "edge"):
+                    edge_ok += 1
+                else:
+                    detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                    console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {detail}")
+                    edge_fail += 1
             except Exception as exc:
                 console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {exc}")
                 edge_fail += 1
