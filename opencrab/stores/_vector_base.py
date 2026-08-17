@@ -61,7 +61,12 @@ CONTRACT — ``upsert_texts(texts, metadatas, ids)`` full-replace semantics
         delete-then-add replaces). Prior to #175 this store called
         ``upsert()`` directly, breaking the cross-backend contract — a stale
         key dropped by the caller's canonical metadata transform would
-        survive forever. Fixed to delete()-then-add(). EXCEPTION [#175 v2]:
+        survive forever. Fixed by delete()-then-add() for exactly the ids
+        that would lose a key; where the existing metadata's keys are a
+        subset of the new one's (every brand-new id, and every caller that
+        passes the full canonical dict) the merge already equals a replace,
+        so those go through the single atomic ``upsert()`` — same observable
+        contract, no delete window. EXCEPTION [#175 v2]:
         an id that already carries a chromadb uri (never produced by this
         codebase, so always externally written) is routed through native
         ``upsert()`` (merge) instead, because delete()+add() cannot carry the

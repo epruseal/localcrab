@@ -210,9 +210,10 @@ class ChromaStore:
         the path that normally runs; delete()+add() is reserved for a genuine
         key drop.
 
-        EXCEPTION — uri-bearing records: this store never produces a record
-        carrying a uri (no code path here calls ``add(uris=...)``), so any id
-        that already has one was written by something external. Silently
+        EXCEPTION — uri-bearing records: this store never produces a uri of
+        its own (the only ``add(uris=...)`` here is ``_rollback`` replaying
+        uris it just read back), so any id that already carries one was
+        written by something external. Silently
         replacing it would drop the uri, and there is no safe way to carry it
         over through delete()+add(): ``add(uris=...)`` raises ValueError
         without an accompanying embedding on a collection with no
