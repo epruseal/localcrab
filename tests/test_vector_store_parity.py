@@ -8,6 +8,9 @@ equivalence test. Uses tmp_path only (no real data) and a deterministic MockEF
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from _vec_helpers import MockEF, build_vector_store
 
@@ -322,6 +325,143 @@ class TestChromaUriPreservation:
         assert got["documents"][0] == "v2"
         assert got["metadatas"][0] == {"new": "2"}, "스테일 키가 살아남았다 — 치환이 아니다"
         assert got["uris"][0] is None
+
+
+class _TrackingLock:
+    """Wraps a store's lock and signals every acquire ATTEMPT *before* it can
+    block, so a thread waiting on the critical section is observable instead
+    of being inferred from elapsed time."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.attempts = threading.Semaphore(0)
+
+    def acquire(self, *args, **kwargs):
+        self.attempts.release()
+        return self._inner.acquire(*args, **kwargs)
+
+    def release(self):
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+class _BlockingCollection:
+    """Collection double whose add() parks inside the critical section."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, list[str]]] = []
+        self.inside_add = threading.Event()
+        self.release = threading.Event()
+
+    def get(self, ids, include=None):
+        self.calls.append(("get", list(ids)))
+        return {"ids": [], "uris": []}
+
+    def delete(self, ids):
+        self.calls.append(("delete", list(ids)))
+
+    def add(self, documents, metadatas, ids):
+        self.calls.append(("add", list(ids)))
+        self.inside_add.set()
+        assert self.release.wait(timeout=10), "테스트 하네스가 add 를 풀어주지 않았다"
+        self.calls.append(("add-end", list(ids)))
+
+    def upsert(self, **kw):
+        self.calls.append(("upsert", list(kw["ids"])))
+
+
+class TestChromaUpsertSafety:
+    """[#175 리뷰 라운드3] 변이 전 검증(P1)과 동일 id 직렬화(P2)."""
+
+    def test_omitted_metadata_on_nonempty_collection_destroys_nothing(self, tmp_path):
+        """P1: metadatas 를 생략하면 [{}] 가 되는데 chroma 는 빈 dict 를 거부한다.
+        치환 경로는 delete 를 먼저 하므로, 검증이 변이 뒤에 오면 기존 레코드가
+        영구 소실된다. 종전 native upsert 는 같은 입력을 무파괴로 거부했다."""
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["keep me"], metadatas=[{"pack_id": "p"}], ids=["survivor"])
+
+        with pytest.raises(ValueError):
+            store.upsert_texts(texts=["replacement"], ids=["survivor"])
+
+        assert store.count() == 1
+        got = store.get_by_id("survivor")
+        assert got is not None and got["document"] == "keep me"
+        assert got["metadata"] == {"pack_id": "p"}
+
+    def test_mixed_batch_with_one_empty_metadata_destroys_nothing(self, tmp_path):
+        # 배치 중 하나만 빈 dict 여도 마찬가지 — 전량이 변이 전에 거부돼야 한다.
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["v1"], metadatas=[{"pack_id": "p"}], ids=["a"])
+
+        with pytest.raises(ValueError):
+            store.upsert_texts(
+                texts=["a2", "b2"], metadatas=[{"pack_id": "p"}, {}], ids=["a", "b"]
+            )
+
+        assert store.count() == 1
+        got = store.get_by_id("a")
+        assert got is not None and got["document"] == "v1"
+
+    def test_same_id_upserts_are_serialised(self, tmp_path):
+        """P2: 동일 id 동시 upsert 가 get→delete/add 구간에서 교차하면, 두 번째
+        add 가 chroma 에서 조용히 무시되어(1.5.9 실측: 예외 없이 먼저 쓴 쪽이 이김)
+        나중 기록자의 문서가 성공 보고와 함께 유실된다."""
+        store = build_vector_store("chroma", tmp_path)
+        col = _BlockingCollection()
+        store._collection = col
+        lock = _TrackingLock(store._lock)
+        store._lock = lock
+
+        errors: list[BaseException] = []
+
+        def upsert(text, val):
+            try:
+                store.upsert_texts(texts=[text], metadatas=[{"w": val}], ids=["same"])
+            except BaseException as exc:  # noqa: BLE001 - 아래에서 다시 단언한다
+                errors.append(exc)
+
+        t1 = threading.Thread(target=upsert, args=("a", "1"))
+        t1.start()
+        assert col.inside_add.wait(timeout=10), "T1 이 임계구역에 진입하지 못했다"
+        assert lock.attempts.acquire(timeout=10), "T1 의 락 획득이 기록되지 않았다"
+
+        t2 = threading.Thread(target=upsert, args=("b", "2"))
+        t2.start()
+        assert lock.attempts.acquire(timeout=10), (
+            "T2 가 락 획득을 시도조차 하지 않았다 — 임계구역이 직렬화되지 않았다"
+        )
+        # 여기서 T2 는 T1 이 쥔 락 위에서 acquire 중임이 관측됐으므로 컬렉션 호출을
+        # 냈을 수 없다. 이 단언에는 대기 시간이 개입하지 않는다.
+        t1_only = [("get", ["same"]), ("delete", ["same"]), ("add", ["same"])]
+        assert col.calls == t1_only, col.calls
+        time.sleep(0.5)  # 락이 없다면 T2 는 마이크로초 단위로 세 호출을 끝낸다
+        assert col.calls == t1_only, f"T1 이 임계구역을 쥔 채로 T2 가 진행했다: {col.calls}"
+
+        col.release.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert not errors, errors
+        assert [c[0] for c in col.calls] == [
+            "get", "delete", "add", "add-end", "get", "delete", "add", "add-end",
+        ], col.calls
+
+    def test_same_collection_stores_share_one_lock(self, tmp_path):
+        # 인스턴스가 하나뿐이라는 보장이 없으므로(_get_context 는 초기화를 잠그지
+        # 않는다) 락은 인스턴스가 아니라 컬렉션 단위여야 한다.
+        a = build_vector_store("chroma", tmp_path)
+        b = build_vector_store("chroma", tmp_path)
+        other = build_vector_store("chroma", tmp_path / "elsewhere")
+
+        assert a._lock is b._lock, "같은 컬렉션인데 임계구역이 분리돼 있다"
+        assert other._lock is not a._lock, "다른 컬렉션까지 직렬화하고 있다"
 
 
 # ---------------------------------------------------------------------------

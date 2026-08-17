@@ -9,12 +9,35 @@ LocalCrab factory always selects persistent local mode.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 
 from opencrab.stores._vector_base import generate_add_ids, generate_upsert_ids
 
 logger = logging.getLogger(__name__)
+
+_COLLECTION_LOCKS: dict[str, threading.Lock] = {}
+_COLLECTION_LOCKS_GUARD = threading.Lock()
+
+
+def _collection_lock(key: str) -> threading.Lock:
+    """One lock per (client target, collection name), shared by every
+    ChromaStore in this process that points at the same collection.
+
+    Per-instance locking is not enough: nothing guarantees a single store
+    instance per collection — ``opencrab/mcp/tools/__init__.py:_get_context()``
+    memoises its stores but does not guard the initialisation itself, so two
+    concurrent first calls each build their own. Mirrors the per-path registry
+    in ``opencrab/locking.py:_process_lock``, including its no-eviction
+    property (bounded by the collections this process opens).
+
+    The key deliberately excludes ``embedding_function``: instances over one
+    collection may legitimately carry different EFs, and sharing a *lock*
+    between them is harmless where sharing state would not be.
+    """
+    with _COLLECTION_LOCKS_GUARD:
+        return _COLLECTION_LOCKS.setdefault(key, threading.Lock())
 
 
 class ChromaStore:
@@ -42,11 +65,16 @@ class ChromaStore:
         self._client: Any = None
         self._collection: Any = None
         self._available = False
-        # Chroma 자체는 프로세스 내 스레드 안전(공식 System Constraints)이라 add/upsert/
-        # delete 에는 별도 락이 불필요하다. 이 락은 앱 레벨 공유 상태인 self._collection
-        # 핸들 교체(reset_collection)를 원자화하고, 읽기/쓰기가 교체 도중의 핸들을 보지
-        # 않도록 짧게 스냅샷하기 위한 것이다.
-        self._lock = threading.Lock()
+        # Chroma 자체는 개별 호출 단위로만 스레드 안전하다(공식 System Constraints).
+        # 이 락의 용도는 두 가지다. (1) 앱 레벨 공유 상태인 self._collection 핸들 교체
+        # (reset_collection)를 원자화하고 읽기/쓰기가 교체 도중의 핸들을 보지 않도록
+        # 짧게 스냅샷한다. (2) upsert_texts 의 get→delete/add 는 한 슬롯에 대한
+        # read-modify-write 라 호출 단위 안전성만으로는 부족하므로 그 구간 전체를
+        # 직렬화한다(#175 리뷰 P2). 같은 컬렉션을 가리키는 인스턴스끼리 공유한다.
+        self._lock = _collection_lock(
+            f"{os.path.abspath(local_path) if local_mode else f'{host}:{port}'}"
+            f"\x00{collection_name}"
+        )
         self._connect()
 
     # ------------------------------------------------------------------
@@ -186,6 +214,33 @@ class ChromaStore:
         우회") — this method now honors that contract directly instead of
         clobbering it.
 
+        Empty metadata is rejected before anything is touched: chromadb
+        refuses an empty dict in ``add()`` exactly as it does in ``upsert()``,
+        so the replace path would otherwise delete the old record and only
+        then fail. Omitting ``metadatas`` altogether is the call shape that
+        hits this — it becomes ``[{}, ...]`` here.
+
+        Concurrency: the uri check and the delete/add it selects run under the
+        store's lock — shared by every ChromaStore in this process that
+        targets the same collection, and the same lock ``reset_collection()``
+        takes — so same-id concurrent upserts inside one process cannot
+        interleave into a lost update.
+
+        What that lock does NOT cover, stated so callers do not over-trust it:
+
+        - Other processes. There is no chroma-wide cross-process exclusion
+          here; writes are serialised only where a caller explicitly holds
+          ``opencrab/locking.py``'s ``write.lock`` (MCP write tools take it
+          around the whole handler, the CLI ingest paths around their load
+          calls). A direct ChromaStore user, the REST app and the migration
+          script hold nothing — ``chroma.lock`` is a SHARED lock and MCP-only
+          (issue #140).
+        - The collection handle. Only the lock is shared between instances;
+          each keeps its own handle, so a ``reset_collection()`` on one
+          instance leaves another's handle pointing at the deleted collection
+          (chroma then raises NotFoundError — loud, not silent). Pre-existing
+          behavior, unchanged here.
+
         Non-atomicity (replace path only): if the process dies between
         delete() and add(), the row is lost until the same chunk id reappears
         in a later incremental load and gets re-added via the
@@ -211,43 +266,79 @@ class ChromaStore:
             )
 
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
-        handle = self._collection_handle()
 
-        # Split the batch by whether the id already carries a uri — those go
-        # through merge (upsert), everything else through replace
-        # (delete+add). See docstring for why.
-        existing = handle.get(ids=ids, include=["uris"])
-        uri_ids = {
-            doc_id
-            for doc_id, uri in zip(existing["ids"], existing.get("uris") or [])
-            if uri is not None
-        }
+        # Reject empty metadata BEFORE any mutation (review P1): chromadb
+        # rejects an empty dict in add() just as it does in upsert(), so a
+        # batch carrying one would fail only AFTER the replace path had
+        # deleted the old record -- erasing it for good. The parent commit's
+        # native upsert() rejected the same input without deleting anything;
+        # this keeps that non-destructive contract. Note metadatas=None became
+        # [{} ...] above, so the documented "omit metadatas" call shape lands
+        # here rather than in the store. _sanitize_metadata never drops keys,
+        # so checking clean_meta is equivalent to checking the caller's dicts.
+        empty_pos = [i for i, meta in enumerate(clean_meta) if not meta]
+        if empty_pos:
+            raise ValueError(
+                "upsert_texts: chromadb rejects empty metadata dicts "
+                f"(positions {empty_pos}, ids {[ids[i] for i in empty_pos]}); "
+                "pass at least one metadata key per text"
+            )
 
-        if not uri_ids:
-            handle.delete(ids=ids)
-            handle.add(documents=texts, metadatas=clean_meta, ids=ids)
-        else:
-            merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
-            replace_pos = [i for i, doc_id in enumerate(ids) if doc_id not in uri_ids]
-            if merge_pos:
-                handle.upsert(
-                    documents=[texts[i] for i in merge_pos],
-                    metadatas=[clean_meta[i] for i in merge_pos],
-                    ids=[ids[i] for i in merge_pos],
-                )
-                logger.warning(
-                    "ChromaDB: %d uri-bearing record(s) upserted via merge "
-                    "(uri preserved, stale metadata keys may persist): %s",
-                    len(merge_pos), [ids[i] for i in merge_pos],
-                )
-            if replace_pos:
-                replace_ids = [ids[i] for i in replace_pos]
-                handle.delete(ids=replace_ids)
-                handle.add(
-                    documents=[texts[i] for i in replace_pos],
-                    metadatas=[clean_meta[i] for i in replace_pos],
-                    ids=replace_ids,
-                )
+        # Serialise the whole check-then-act (review P2): the uri probe and
+        # the delete/add it selects are one read-modify-write on a shared
+        # slot, while chroma only makes each individual call thread-safe and
+        # the native upsert() this path replaced was a single operation.
+        # Unserialised, two threads upserting the same id both pass get(),
+        # both delete(), and then the second add() is SILENTLY IGNORED
+        # (verified on chromadb 1.5.9: add() on an existing id neither raises
+        # nor overwrites -- the first record wins), so the later writer's
+        # document is lost while it reports success.
+        # COST: chroma embeds inside add()/upsert(), so concurrent upserts on
+        # one collection now serialise on that too. Accepted for correctness;
+        # shard into per-id locks if it ever shows up as a bottleneck (the
+        # invariant only needs same-id mutual exclusion).
+        with self._lock:
+            # Snapshot the handle directly -- _collection_handle() takes this
+            # same non-reentrant lock and would deadlock here.
+            handle = self._collection
+
+            # Split the batch by whether the id already carries a uri — those
+            # go through merge (upsert), everything else through replace
+            # (delete+add). See docstring for why.
+            existing = handle.get(ids=ids, include=["uris"])
+            uri_ids = {
+                doc_id
+                for doc_id, uri in zip(existing["ids"], existing.get("uris") or [])
+                if uri is not None
+            }
+
+            if not uri_ids:
+                handle.delete(ids=ids)
+                handle.add(documents=texts, metadatas=clean_meta, ids=ids)
+            else:
+                merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
+                replace_pos = [
+                    i for i, doc_id in enumerate(ids) if doc_id not in uri_ids
+                ]
+                if merge_pos:
+                    handle.upsert(
+                        documents=[texts[i] for i in merge_pos],
+                        metadatas=[clean_meta[i] for i in merge_pos],
+                        ids=[ids[i] for i in merge_pos],
+                    )
+                    logger.warning(
+                        "ChromaDB: %d uri-bearing record(s) upserted via merge "
+                        "(uri preserved, stale metadata keys may persist): %s",
+                        len(merge_pos), [ids[i] for i in merge_pos],
+                    )
+                if replace_pos:
+                    replace_ids = [ids[i] for i in replace_pos]
+                    handle.delete(ids=replace_ids)
+                    handle.add(
+                        documents=[texts[i] for i in replace_pos],
+                        metadatas=[clean_meta[i] for i in replace_pos],
+                        ids=replace_ids,
+                    )
 
         logger.debug(
             "ChromaDB: upserted %d documents (%d replaced, %d merged for uri)",
