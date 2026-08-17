@@ -2758,3 +2758,401 @@ class TestMongoMalformedArrayPackIdCodexCounterexample:
         assert results["sources"]["excluded"] == 1
         assert results["sources"]["updated"] == 0
         assert "[None]" not in results["sources"]["by_pack"]
+
+
+# ---------------------------------------------------------------------------
+# R8-A (PR #177 review round 8 P2): _backup_sqlite_files must also back up
+# the sqlite-vec vector file before _backfill_vector rewrites it in place
+# (delete+reinsert, unrecoverable -- upsert_texts RE-EMBEDS), and must warn,
+# with the actual path, when the resolved local vector backend is NOT a
+# single SQLite file this online-.backup()-based helper can copy.
+# ---------------------------------------------------------------------------
+
+
+class TestBackupIncludesVectorFile:
+    def _settings(self, monkeypatch, **env_overrides):
+        from opencrab.config import get_settings
+
+        for key, value in env_overrides.items():
+            monkeypatch.setenv(key, value)
+        get_settings.cache_clear()
+        return get_settings()
+
+    def test_sqlite_vec_file_is_backed_up_and_returned(self, env, tmp_path, monkeypatch):
+        """Test 1: helper called DIRECTLY (main() never returns/uses the
+        backed_up list, so this is the only way to observe it)."""
+        import sqlite3
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        assert settings.vector_backend_resolved == "sqlite-vec"
+        vec_path = env / settings.vector_db_file
+        conn = sqlite3.connect(str(vec_path))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / settings.vector_db_file
+        assert str(dst) in backed_up
+        assert dst.is_file()
+
+    def test_backup_content_matches_source_plain_sqlite_table(self, env, tmp_path, monkeypatch):
+        """Test 2, non-skip half: a plain SQLite table's rows survive the
+        online .backup() copy identically, regardless of whether sqlite_vec
+        is installed in this environment."""
+        import sqlite3
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        vec_path = env / settings.vector_db_file
+        conn = sqlite3.connect(str(vec_path))
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        conn.executemany("INSERT INTO t (id, val) VALUES (?, ?)", [(1, "a"), (2, "b"), (3, "c")])
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / settings.vector_db_file
+        dst_conn = sqlite3.connect(str(dst))
+        try:
+            rows = dst_conn.execute("SELECT id, val FROM t ORDER BY id").fetchall()
+        finally:
+            dst_conn.close()
+        assert rows == [(1, "a"), (2, "b"), (3, "c")]
+
+    def test_backup_content_matches_source_real_vec0_table(self, env, tmp_path, monkeypatch):
+        """Test 2, vec0 half (skipped if sqlite_vec is not installed): this
+        change's actual premise is that a plain sqlite3.connect() + .backup()
+        copies the vec0 SHADOW TABLES too, not just the virtual table's own
+        rows -- prove it by round-tripping real vec0 content, not an empty
+        file."""
+        pytest.importorskip("sqlite_vec")
+        from _vec_helpers import MockEF
+
+        from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        vec_path = env / settings.vector_db_file
+        store = SqliteVecStore(
+            db_path=str(vec_path),
+            embedding_function=MockEF(16),
+            dim=16,
+            collection_name=settings.vector_collection,
+        )
+        if not store.available:
+            pytest.skip("sqlite-vec가 이 환경에서 초기화되지 않음")
+        try:
+            store.upsert_texts(
+                ["hello world", "goodbye"],
+                [{"pack_id": "pack-a"}, {"pack_id": "pack-b"}],
+                ["v1", "v2"],
+            )
+        finally:
+            store.close()
+
+        backup_dir = tmp_path / "backups"
+        migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        dst = backup_dir / settings.vector_db_file
+        restored = SqliteVecStore(
+            db_path=str(dst),
+            embedding_function=MockEF(16),
+            dim=16,
+            collection_name=settings.vector_collection,
+        )
+        try:
+            assert restored.count() == 2
+            doc1 = restored.get_by_id("v1")
+            doc2 = restored.get_by_id("v2")
+        finally:
+            restored.close()
+        assert doc1 is not None
+        assert doc1["document"] == "hello world"
+        assert doc1["metadata"]["pack_id"] == "pack-a"
+        assert doc2 is not None
+        assert doc2["document"] == "goodbye"
+        assert doc2["metadata"]["pack_id"] == "pack-b"
+
+    def test_vector_db_file_env_override_uses_that_name(self, env, tmp_path, monkeypatch):
+        """Test 3: VECTOR_DB_FILE renamed -- the backup must follow the
+        configured name, never a hardcoded "vectors.db"."""
+        import sqlite3
+
+        settings = self._settings(
+            monkeypatch, VECTOR_BACKEND="sqlite-vec", VECTOR_DB_FILE="custom_vectors.db"
+        )
+        assert settings.vector_db_file == "custom_vectors.db"
+        vec_path = env / "custom_vectors.db"
+        conn = sqlite3.connect(str(vec_path))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+
+        assert (backup_dir / "custom_vectors.db").is_file()
+        assert not (backup_dir / "vectors.db").exists()
+        assert str(backup_dir / "custom_vectors.db") in backed_up
+
+    def test_missing_vector_file_is_silently_skipped(self, env, tmp_path, monkeypatch):
+        """Test 4: no vectors.db on disk -> quietly skipped, same rule the
+        three pre-existing files already follow."""
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+        assert backed_up == []
+        assert not (backup_dir / settings.vector_db_file).exists()
+
+    def test_existing_vector_backup_target_raises_system_exit_2(self, env, tmp_path, monkeypatch):
+        """Test 5: the pre-existing "refuse to overwrite" discipline applies
+        to the vector file too -- SystemExit(2), not a plain return."""
+        import sqlite3
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="sqlite-vec")
+        vec_path = env / settings.vector_db_file
+        conn = sqlite3.connect(str(vec_path))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir(parents=True)
+        (backup_dir / settings.vector_db_file).write_bytes(b"pre-existing")
+
+        with pytest.raises(SystemExit) as exc_info:
+            migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+        assert exc_info.value.code == 2
+
+    def test_non_sqlite_vec_local_backend_warns_with_path_and_still_backs_up_three_files(
+        self, env, tmp_path, monkeypatch, capsys
+    ):
+        """Test 6: local chroma (VECTOR_BACKEND=chroma, is_local) is a
+        DIRECTORY (<local_data_dir>/chroma, PersistentClient), not a single
+        SQLite file -- warn with that exact path, do not abort, and the
+        three SQLite files still back up normally."""
+        import sqlite3
+
+        settings = self._settings(monkeypatch, VECTOR_BACKEND="chroma")
+        assert settings.vector_backend_resolved == "chroma"
+        assert settings.is_local
+
+        conn = sqlite3.connect(str(env / "opencrab.db"))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backed_up = migrate._backup_sqlite_files(str(env), str(backup_dir), settings)
+        out = capsys.readouterr().out
+
+        expected_chroma_path = str(env / "chroma")
+        assert expected_chroma_path in out
+        assert (backup_dir / "opencrab.db").is_file()
+        assert str(backup_dir / "opencrab.db") in backed_up
+
+
+# ---------------------------------------------------------------------------
+# R8-B (PR #177 review round 8 P2): _predict_node_pack_map and
+# _read_actual_node_pack_ids must chunk their node_id IN (...) query at
+# _GRAPH_TWIN_CHUNK_SIZE, same as _graph_twin_pack_map already does --
+# otherwise a large unattributed-node-id set can exceed SQLite's
+# bound-parameter limit and even dry-run fails outright.
+# ---------------------------------------------------------------------------
+
+
+class TestNodePackMapChunking:
+    def _seed_many(self, env, n: int):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        db_path = env / "graph.db"
+        store = LocalGraphStore(str(db_path))
+        node_ids: list[str] = []
+        try:
+            for i in range(n):
+                nid = f"n{i}"
+                # A realistic mix: every 5th node path-infers a distinct
+                # pack, the rest fall through to the assumed default.
+                props = (
+                    {"source_path": f"/packs/pack-{i % 3}/x.md"}
+                    if i % 5 == 0
+                    else {"note": "nothing to infer"}
+                )
+                store.upsert_node("Entity", nid, props, space_id="concept")
+                node_ids.append(nid)
+        finally:
+            store.close()
+        return db_path, node_ids
+
+    def test_predict_survives_low_bind_limit_with_over_500_ids(self, env, monkeypatch):
+        """Test 7 (predict half): SQLITE_LIMIT_VARIABLE_NUMBER lowered to
+        exactly the chunk size (500) via a monkeypatched sqlite3.connect --
+        each function opens its OWN connection, so patching the connect
+        constructor (not a pre-existing connection) is the only way to make
+        the limit apply to it. 501 node_ids means an unchunked single IN
+        (...) query would fail with "too many SQL variables"; the chunked
+        implementation must complete and match a chunk-safe (one id at a
+        time) oracle -- never the unbounded/unlimited query result."""
+        import sqlite3
+
+        from opencrab.ontology.pack_provenance import resolve_row_pack_id
+
+        db_path, node_ids = self._seed_many(env, 501)
+        assert len(node_ids) > migrate._GRAPH_TWIN_CHUNK_SIZE
+
+        # Chunk-safe oracle, built over a normal connection BEFORE the
+        # connect() monkeypatch below is installed.
+        expected: dict[str, str] = {}
+        oracle = sqlite3.connect(str(db_path))
+        oracle.row_factory = sqlite3.Row
+        try:
+            cur = oracle.cursor()
+            for nid in node_ids:
+                cur.execute(
+                    "SELECT node_id, properties FROM graph_nodes WHERE node_id = ?", (nid,)
+                )
+                row = cur.fetchone()
+                pid, _reason = resolve_row_pack_id(row["properties"], row, migrate.DEFAULT_PACK_ID)
+                if pid is not None:
+                    expected[row["node_id"]] = pid
+        finally:
+            oracle.close()
+
+        orig_connect = sqlite3.connect
+
+        def _limited_connect(*a, **kw):
+            conn = orig_connect(*a, **kw)
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, migrate._GRAPH_TWIN_CHUNK_SIZE)
+            return conn
+
+        monkeypatch.setattr(sqlite3, "connect", _limited_connect)
+
+        predicted, ambiguous = migrate._predict_node_pack_map(
+            db_path, node_ids, migrate.DEFAULT_PACK_ID
+        )
+        assert predicted == expected
+        assert ambiguous == {}
+
+    def test_read_actual_survives_low_bind_limit_with_over_500_ids(self, env, monkeypatch):
+        """Test 7 (read-actual half): same limit-lowering technique, applied
+        AFTER a real backfill_pack_ids run, against _read_actual_node_pack_ids."""
+        import json
+        import sqlite3
+
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+
+        db_path, node_ids = self._seed_many(env, 501)
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+
+        # Chunk-safe oracle over the POST-backfill state, one id at a time,
+        # built BEFORE the connect() monkeypatch below is installed.
+        expected: dict[str, str] = {}
+        oracle = sqlite3.connect(str(db_path))
+        try:
+            cur = oracle.cursor()
+            for nid in node_ids:
+                cur.execute(
+                    "SELECT node_id, properties FROM graph_nodes WHERE node_id = ?", (nid,)
+                )
+                node_id, raw = cur.fetchone()
+                try:
+                    props = json.loads(raw) if raw else {}
+                except (TypeError, ValueError):
+                    props = {}
+                if isinstance(props, dict) and props.get("pack_id"):
+                    expected[node_id] = str(props["pack_id"])
+        finally:
+            oracle.close()
+
+        orig_connect = sqlite3.connect
+
+        def _limited_connect(*a, **kw):
+            conn = orig_connect(*a, **kw)
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, migrate._GRAPH_TWIN_CHUNK_SIZE)
+            return conn
+
+        monkeypatch.setattr(sqlite3, "connect", _limited_connect)
+
+        actual, ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
+        assert actual == expected
+        assert ambiguous == {}
+
+
+class TestNodePackMapChunkingSemanticAmbiguity:
+    """Test 8: a semantic ambiguity -- same node_id, two DIFFERENT
+    node_types, disagreeing pack_ids -- must still be classified ambiguous
+    by BOTH functions after the R8-B chunking change. This does not depend
+    on chunk boundaries at all (see the R8-B inline comment in
+    migrate_pack_ownership.py: the query chunks the node_id VALUE LIST, not
+    graph rows, and the caller already deduped node_ids, so a given id's
+    graph_nodes rows are always returned together by whichever single chunk
+    contains that id) -- this is the same invariant
+    TestDuplicateNodeIdAmbiguity already covers pre-round-8; repeated here
+    scoped to both chunked functions as the round-8 fix design's explicit
+    regression item."""
+
+    def test_different_node_type_same_node_id_disagreeing_packs_is_ambiguous(self, env):
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        db_path = env / "graph.db"
+        store = LocalGraphStore(str(db_path))
+        try:
+            store.upsert_node(
+                "TypeA", "shared", {"source_path": "/packs/pack-a/x.md"}, space_id="concept"
+            )
+            store.upsert_node(
+                "TypeB", "shared", {"source_path": "/packs/pack-b/x.md"}, space_id="concept"
+            )
+        finally:
+            store.close()
+
+        predicted, pred_ambiguous = migrate._predict_node_pack_map(
+            db_path, ["shared"], migrate.DEFAULT_PACK_ID
+        )
+        assert predicted == {}
+        assert pred_ambiguous == {"shared": sorted(["pack-a", "pack-b"])}
+
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+
+        actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, ["shared"])
+        assert actual == {}
+        assert act_ambiguous == {"shared": sorted(["pack-a", "pack-b"])}
+
+
+class TestNodePackMapSmallInputUnchanged:
+    """Test 9: a small (<500) input's result is unchanged by chunking --
+    _chunked([...], 500) on a short list yields exactly one chunk, so this
+    is byte-for-byte the same query as the pre-round-8 unchunked version."""
+
+    def test_small_input_result_unchanged(self, env):
+        from opencrab.ontology.pack_provenance import backfill_pack_ids
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        db_path = env / "graph.db"
+        store = LocalGraphStore(str(db_path))
+        try:
+            store.upsert_node(
+                "Entity",
+                "n-inferred",
+                {"source_path": "/data/packs/pack-a/x.md"},
+                space_id="concept",
+            )
+            store.upsert_node("Entity", "n-assumed", {"note": "nothing to infer"}, space_id="concept")
+        finally:
+            store.close()
+
+        node_ids = ["n-inferred", "n-assumed"]
+        predicted, pred_ambiguous = migrate._predict_node_pack_map(
+            db_path, node_ids, migrate.DEFAULT_PACK_ID
+        )
+        assert predicted == {"n-inferred": "pack-a", "n-assumed": migrate.DEFAULT_PACK_ID}
+        assert pred_ambiguous == {}
+
+        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
+        assert actual == predicted
+        assert act_ambiguous == {}

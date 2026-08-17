@@ -64,12 +64,18 @@ SCOPE (#146's time-box -- read before assuming a backend is covered):
 
 SAFETY:
   - Defaults to dry-run. Pass --apply to write anything.
-  - --apply requires --backup-to <dir> (local/kuzu SQLite files are copied
-    there via the same online .backup() pattern as
-    migrate_add_binary_quantization.py) unless --skip-backup is passed
+  - --apply requires --backup-to <dir> unless --skip-backup is passed
     explicitly (the only option for pg/docker mode, where there is no
     single file this script can safely copy -- take a pg_dump/snapshot
-    yourself first).
+    yourself first). What --backup-to actually copies, via the same online
+    .backup() pattern as migrate_add_binary_quantization.py: opencrab.db,
+    graph.db, doc_store.db, AND (only when the resolved vector backend is
+    sqlite-vec) the configured vector db file -- step 5 rewrites vector
+    rows by re-embedding them, which is not reversible without that copy
+    (PR #177 review round 8). A local Chroma store is a DIRECTORY
+    (<local_data_dir>/chroma via PersistentClient), not a SQLite file, so
+    it is NOT covered; the run warns and names the uncovered path rather
+    than reporting a backup that silently omits it.
   - Every write is COUNTED before it runs (an expected-count assertion),
     and re-checked against the actual rowcount afterwards -- a mismatch
     aborts immediately rather than silently under- or over-writing.
@@ -80,9 +86,10 @@ SAFETY:
     clean (nothing to do) / applied (found and, in --apply mode, wrote
     something) / skipped (backend out of SCOPE above) / failed (raised --
     the run stops there, later stages do not run). Exit code: 1 if any
-    stage failed; else 3 if graph_backfill or docs_backfill was skipped
-    (#147 must NOT deploy against a code-3 run -- one of the two backends
-    #147's read-path scoping depends on was never even inspected);
+    stage failed; else 3 if graph_backfill, docs_backfill OR
+    registry_enumeration was skipped (#147 must NOT deploy against a
+    code-3 run -- something #147's read-path scoping depends on was never
+    inspected, or a real pack_id never reached the registry);
     vector_backfill's skip does NOT gate the exit code -- it is
     best-effort FOREVER per the Vector SCOPE note above, regardless of
     store availability, never a completeness guarantee; else 0.
@@ -1019,17 +1026,33 @@ def _predict_node_pack_map(
     conn = sqlite3.connect(db_path)
     try:
         conn.row_factory = sqlite3.Row
-        placeholders = ", ".join("?" for _ in node_ids)
         cur = conn.cursor()
-        cur.execute(
-            f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
-            node_ids,
-        )
         seen: dict[str, set[str]] = {}
-        for row in cur.fetchall():
-            pack_id, _reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
-            if pack_id is not None:
-                seen.setdefault(row["node_id"], set()).add(pack_id)
+        # Chunked at _GRAPH_TWIN_CHUNK_SIZE (shared with _graph_twin_pack_map
+        # -- same store, same kind of query, no reason for a second constant
+        # to drift from it) so a large unattributed-node-id set does not trip
+        # SQLite's bound-parameter limit (#146 P1(b), PR #177 review round 8
+        # R8-B) -- without this, a single unchunked ``IN (...)`` over every
+        # node_id could fail dry-run itself with "too many SQL variables"
+        # before any real backfill even ran. ``seen`` accumulates across
+        # chunks and ``_split_ambiguous`` runs ONCE at the end, after the
+        # loop -- not because splitting per-chunk would be wrong (it
+        # wouldn't: this query chunks the NODE_ID VALUE LIST, not graph rows,
+        # and the caller already deduped node_ids, so whichever chunk a given
+        # node_id lands in, that chunk's query returns ALL of that node_id's
+        # graph_nodes rows -- an id never gets split across chunks). It is
+        # done this way only because it mirrors ``_graph_twin_pack_map``'s
+        # shape, so both functions read as the same pattern.
+        for chunk in _chunked(node_ids, _GRAPH_TWIN_CHUNK_SIZE):
+            placeholders = ", ".join("?" for _ in chunk)
+            cur.execute(
+                f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+                chunk,
+            )
+            for row in cur.fetchall():
+                pack_id, _reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
+                if pack_id is not None:
+                    seen.setdefault(row["node_id"], set()).add(pack_id)
         return _split_ambiguous(seen)
     finally:
         conn.close()
@@ -1051,20 +1074,25 @@ def _read_actual_node_pack_ids(
         return {}, {}
     conn = sqlite3.connect(db_path)
     try:
-        placeholders = ", ".join("?" for _ in node_ids)
         cur = conn.cursor()
-        cur.execute(
-            f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
-            node_ids,
-        )
         seen: dict[str, set[str]] = {}
-        for node_id, raw in cur.fetchall():
-            try:
-                props = json.loads(raw) if raw else {}
-            except (TypeError, ValueError):
-                props = {}
-            if isinstance(props, dict) and props.get("pack_id"):
-                seen.setdefault(node_id, set()).add(str(props["pack_id"]))
+        # Chunked at _GRAPH_TWIN_CHUNK_SIZE, seen accumulated across chunks,
+        # _split_ambiguous run once at the end -- same reasoning and same
+        # constant as _predict_node_pack_map above (#146 P1(b), PR #177
+        # review round 8 R8-B); see that function's inline comment.
+        for chunk in _chunked(node_ids, _GRAPH_TWIN_CHUNK_SIZE):
+            placeholders = ", ".join("?" for _ in chunk)
+            cur.execute(
+                f"SELECT node_id, properties FROM graph_nodes WHERE node_id IN ({placeholders})",  # noqa: S608
+                chunk,
+            )
+            for node_id, raw in cur.fetchall():
+                try:
+                    props = json.loads(raw) if raw else {}
+                except (TypeError, ValueError):
+                    props = {}
+                if isinstance(props, dict) and props.get("pack_id"):
+                    seen.setdefault(node_id, set()).add(str(props["pack_id"]))
         return _split_ambiguous(seen)
     finally:
         conn.close()
@@ -1563,7 +1591,37 @@ def _backfill_vector(
 # ---------------------------------------------------------------------------
 
 
-def _backup_sqlite_files(local_data_dir: str, backup_to: str) -> list[str]:
+def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> list[str]:
+    """Copies the registry/graph/doc SQLite files, plus -- (R8-A, PR #177
+    review round 8 P2) -- the sqlite-vec vector file, into ``backup_to`` via
+    the same online ``.backup()`` used for the other three, BEFORE
+    ``_backfill_vector`` (main()'s step 5) later re-writes ``vectors.db`` in
+    place via delete+reinsert (``upsert_texts`` RE-EMBEDS the row -- an
+    unrecoverable write). Without this, ``--apply --backup-to`` advertised a
+    complete pre-migration backup while silently excluding the one store a
+    later stage could irreversibly rewrite.
+
+    The vector file is only ever a plain SQLite file when
+    ``settings.vector_backend_resolved == "sqlite-vec"`` (see
+    ``stores/factory.py``) -- its name is never hardcoded, it is always
+    ``settings.vector_db_file`` (default ``"vectors.db"``, overridable via
+    ``VECTOR_DB_FILE``), so a renamed vector file is still backed up under
+    its real name.
+
+    Any OTHER local vector backend is NOT silently left out of the
+    "backup complete" impression: a local ``chroma`` store persists to a
+    DIRECTORY (``<local_data_dir>/chroma``, ``PersistentClient`` --
+    ``chroma_store.py``), not a single SQLite file this function's online
+    ``.backup()`` technique can copy, so this warns and names that exact
+    path rather than silently omitting it. This does not abort -- doing so
+    would turn ``--backup-to``'s existing "local SQLite files only" contract
+    into a hard requirement it never had, out of scope for this round (see
+    module docstring SCOPE for chroma/pgvector's backup being out of scope
+    entirely). This branch is only ever reached for local/kuzu deployments:
+    ``main()`` already rejects ``--backup-to`` with rc 2 for any deployment
+    where ``not settings.is_local`` (pg/docker), so pgvector never reaches
+    here either.
+    """
     import sqlite3
 
     dest_dir = Path(backup_to)
@@ -1586,6 +1644,40 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str) -> list[str]:
             src_conn.close()
         print(f"  backed up {src} -> {dst}")
         backed_up.append(str(dst))
+
+    if settings.vector_backend_resolved == "sqlite-vec":
+        vec_name = settings.vector_db_file
+        vec_src = Path(local_data_dir) / vec_name
+        if vec_src.is_file():
+            vec_dst = dest_dir / vec_name
+            if vec_dst.exists():
+                print(
+                    f"! backup target already exists, refusing to overwrite: {vec_dst}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            src_conn = sqlite3.connect(str(vec_src))
+            dst_conn = sqlite3.connect(str(vec_dst))
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+                src_conn.close()
+            print(f"  backed up {vec_src} -> {vec_dst}")
+            backed_up.append(str(vec_dst))
+    else:
+        not_backed_up = (
+            str(Path(local_data_dir) / "chroma")
+            if settings.vector_backend_resolved == "chroma"
+            else f"vector backend {settings.vector_backend_resolved!r}"
+        )
+        print(
+            f"! vector backend {settings.vector_backend_resolved!r} is not a "
+            f"single SQLite file this backup can copy -- {not_backed_up} is "
+            "NOT included in this backup. _backfill_vector's writes to it "
+            "cannot be restored from --backup-to; take your own snapshot "
+            "first if you need one."
+        )
     return backed_up
 
 
@@ -1708,7 +1800,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
             print("Backing up local SQLite files...")
-            _backup_sqlite_files(settings.local_data_dir, args.backup_to)
+            _backup_sqlite_files(settings.local_data_dir, args.backup_to, settings)
         elif args.skip_backup:
             print("! --skip-backup passed: proceeding WITHOUT a backup.")
         else:
