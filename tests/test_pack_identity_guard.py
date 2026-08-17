@@ -806,3 +806,54 @@ def test_dispatch_tool_holds_the_write_lock_around_pack_ingest():
 
     assert state["seen_inside"] == 1, "handler ran outside the write lock"
     assert state["depth"] == 0, "write lock was not released"
+
+
+# ---------------------------------------------------------------------------
+# 23. No user-facing pack string may name a tool that is not registered.
+#
+# Round 7 of review found `hint: "use pack_fork to copy this pack into your
+# own"` on two error paths -- there is no pack_fork handler, so every caller
+# who followed the advertised recovery path got an unknown-tool error. A
+# hand-fixed string can regress the same way, so pin the invariant instead of
+# the wording: every `<name>_<name>`-shaped tool reference appearing in
+# pack.py's user-facing strings must exist in _REGISTRY.
+# ---------------------------------------------------------------------------
+
+
+def test_pack_tool_strings_never_name_an_unregistered_tool():
+    import re
+
+    from opencrab.mcp.tools import _registry
+    from opencrab.mcp.tools._registry import _REGISTRY
+
+    source = __import__("pathlib").Path(_registry.__file__).parent.joinpath("pack.py").read_text(
+        encoding="utf-8"
+    )
+    # Tool-name shaped tokens this package actually uses as prefixes.
+    candidates = set(re.findall(r"\b(?:pack|ontology|content|schema|harness)_[a-z_]+\b", source))
+    # Not tool names: private helpers, dict keys, and store/attr names.
+    ignored_prefixes = ("pack_id", "pack_ids", "pack_provenance", "ontology_builder")
+    referenced = {
+        name
+        for name in candidates
+        if not name.startswith(ignored_prefixes)
+        and not name.startswith("_")
+    }
+    # Anything left that LOOKS like a tool must either be registered or be a
+    # module-level helper defined in this package (not advertised to callers).
+    unknown = {
+        name
+        for name in referenced
+        if name not in _REGISTRY and not hasattr(_registry, name)
+    }
+    # Whitelist of non-tool identifiers that share the prefix shape.
+    unknown -= {
+        "pack_registry",
+        "pack_create_or_ingest",
+        "content_pack_list_query",
+    }
+    assert unknown == set(), (
+        f"pack.py references tool-shaped names that are not registered tools: "
+        f"{sorted(unknown)} -- if one is a recovery hint, it will produce an "
+        f"unknown-tool error for every caller who follows it"
+    )

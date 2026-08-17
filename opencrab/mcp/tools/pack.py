@@ -1220,7 +1220,9 @@ def pack_ingest(
             "Set a content pack's visibility. Owner-only. `visibility` is one of: "
             "private (default — only the owner can see or use it), "
             "public-read (anyone can read/query it), or "
-            "public-fork (anyone can read/query it and fork it into their own pack)."
+            "public-fork (same read access as public-read; it additionally RECORDS "
+            "that you permit forking, but no fork tool exists yet -- see "
+            "pack_publish's docstring)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1258,6 +1260,17 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
     else returns a distinct "not the pack owner" error instead, since that
     pack's existence is already observable to anyone (e.g. via
     content_pack_list).
+
+    ``public-fork`` vs ``public-read`` (PR #177 review round 7): today these
+    grant the SAME access. There is no fork tool -- ``packs.forked_from``
+    exists as a column and ``VISIBILITIES`` carries the value, but nothing
+    reads it to copy a pack. ``public-fork`` therefore records the owner's
+    INTENT to allow forking, to be honoured once a fork tool lands; it does
+    not currently do anything a caller can observe beyond public-read. The
+    round-7 review found the old wording (and the "not the pack owner" hint)
+    advertising a fork tool that does not exist, which sent callers into an
+    unknown-tool error -- do not reintroduce a fork promise here or in any
+    response string until the tool is actually registered.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
