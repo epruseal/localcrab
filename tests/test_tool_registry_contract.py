@@ -355,3 +355,12 @@ def test_every_registered_tool_is_importable_from_the_package():
     assert missing_all == [], (
         f"registered tools missing from opencrab.mcp.tools.__all__: {missing_all}"
     )
+
+    # hasattr alone would pass if some unrelated object were re-exported under
+    # the tool's name; pin that the exported object IS the registered handler.
+    wrong_object = sorted(
+        name for name in _REGISTRY if getattr(tools_pkg, name) is not _REGISTRY[name].fn
+    )
+    assert wrong_object == [], (
+        f"package exports a different object than the registered handler: {wrong_object}"
+    )
