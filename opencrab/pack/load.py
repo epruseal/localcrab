@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -319,6 +320,83 @@ def _vec_backend(vec):
 _VEC_BACKEND_KINDS = ("sql", "chroma", "sqlalchemy")
 
 
+def _confirmed_rowcount(rc) -> int | None:
+    """드라이버가 **실제로 센 삭제 행 수**일 때만 그 값, 아니면 `None`(미확인).
+
+    삭제 카운트에서 "세어보니 0"과 "드라이버가 안 세어줬다"는 다른 사실이다. 종전엔
+    `sql` 분기가 미보고(`rowcount < 0`)를 `0` 으로 접고, `sqlalchemy` 분기는
+    `r.rowcount or 0` 로 `-1` 을 그대로 통과시켜 **음수 카운트**를 냈다(#165). 두
+    분기를 이 한 자리로 통일한다.
+
+    `bool` 을 먼저 배제한다 — `isinstance(True, int)` 가 참이라 안 막으면 `True` 가
+    "1건 삭제"로 발행된다. `int` 아닌 정수형(`numpy.int64`·`Decimal`)도 미확인으로
+    떨어진다: 이 자리에서는 틀린 수보다 미확인이 안전하고, 그런 드라이버가 실제로
+    나타나면 "미확인"이 신호로 보인다(조용히 틀리지 않는다).
+    """
+    if isinstance(rc, bool) or not isinstance(rc, int) or rc < 0:
+        return None
+    return rc
+
+
+def _id_set(got) -> set[str] | None:
+    """chroma 조회 응답에서 **믿을 수 있는 id 집합**만 꺼낸다. 아니면 `None`(판독 불가).
+
+    관대한 판독의 실패 방향이 하필 **"전량 삭제"** 라서 엄격해야 한다(#165).
+      · 재조회를 `got.get("ids", [])` 로 읽으면 응답이 깨졌을 때 생존 0 = 전량 삭제.
+      · 바깥 타입만 보면 `{"ids": [None]}` 이 통과하고, 교집합이 비어 역시 전량 삭제.
+      · `ids` 가 문자열이면 `delete(ids="abcd")` 는 chroma 계약상 **단일 id 삭제**인데
+        `len("abcd")` 는 4다 — 1건 삭제를 4건으로 보고한다.
+    그래서 삭제 전 조회와 재조회가 **이 판독기 하나를 공유**한다(사본 금지).
+    """
+    if not isinstance(got, dict):
+        return None
+    ids = got.get("ids")
+    if not isinstance(ids, list):                 # chroma GetResult: ids 는 List[str]
+        return None
+    if not all(isinstance(i, str) for i in ids):
+        return None
+    out = set(ids)
+    if len(out) != len(ids):                      # 중복 = 유효한 id 집합이 아니다
+        return None
+    return out
+
+
+@contextlib.contextmanager
+def _chroma_locked_handle(vec, fallback):
+    """`ChromaStore` 가 add/upsert/delete 에 쓰는 **그 공유 락**(있으면) 아래에서
+    조회→삭제→재조회를 한 덩어리로 돌리고, **락 안에서 컬렉션 핸들을 다시 읽어**
+    yield 한다. 락이 없는 형태(테스트 더블·타 백엔드)면 받은 핸들 그대로 no-op.
+
+    그 락은 인스턴스 락이 아니라 (client target, collection) 당 하나씩 프로세스
+    전역 레지스트리가 나눠 주는 공유 락이다(`chroma_store.py` 의 `_collection_lock`).
+    이 자리는 원시 핸들을 쓰므로 종전엔 락 밖이었다 — `ChromaStore.delete` 의
+    docstring 이 "load.py mutates the raw chroma handle directly in places and so
+    stays outside this lock" 로 기록한 그 성질이다. 삭제 수를 **재조회로 확인**하게
+    되면서 조회·삭제·재조회 셋이 한 덩어리여야 의미가 있으므로 이 블록만 락 아래로
+    넣는다(다른 원시 핸들 사용처는 그대로 락 밖이다).
+
+    **핸들을 락 안에서 다시 읽는 이유**: `_vec_backend` 가 준 핸들은 락을 잡기 **전**
+    스냅샷인데 `reset_collection()` 이 같은 락 아래에서 `_collection` 을 교체한다 —
+    그 사이에 끼면 락을 잡고도 폐기된 컬렉션에 조회·삭제를 날린다.
+
+    교착 없음: 이 구간은 원시 컬렉션 메서드만 부르고 `ChromaStore` 공개 메서드를
+    부르지 않으므로 비재진입 락을 두 번 잡지 않는다.
+
+    **남는 창**: 같은 컬렉션을 보는 **다른** `ChromaStore` 인스턴스가 reset 하면
+    우리 `_collection` 은 락 안에서 다시 읽어도 폐기된 것을 가리킨다. 닫지 않는다 —
+    그 결과가 안전한 방향이기 때문이다. 폐기 핸들의 `get`/`delete` 는 예외가 되고,
+    삭제 전이면 카운트는 `0`(실제로 0건 지웠다 — 참), 삭제 후면 `None`(미확인)이다.
+    어느 쪽도 오보고가 아니다. 닫으려면 `ChromaStore` 가 인스턴스 간에 현재 핸들을
+    공표해야 하는데 그것은 스토어 계층 변경이다.
+    """
+    lock = getattr(vec, "_lock", None)
+    if lock is None:
+        yield fallback
+    else:
+        with lock:
+            yield getattr(vec, "_collection", fallback)
+
+
 def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
@@ -606,8 +684,22 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
     return {"nodes": g, "edges": e, "docs": d, "vectors": v}
 
 
-def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
-    """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)"""
+def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]:
+    """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)
+
+    **`chunk_vec_del` 은 `int | None` 이다.** `0` 은 "0건 지웠다"(대상이 없었거나 삭제를
+    시도하지 않았다), `None` 은 **"몇 개가 지워졌는지 확인할 수 없다"** 다 — 같은 모듈의
+    `pack_live_counts()["vectors"]`·`_live_vec_ids()` 와 같은 어휘다. 이 둘을 섞으면
+    일부만 지워진 삭제가 "전량 삭제"로 보고된다(#165). 소비자는 `None` 을 수로 쓰지 말고
+    재조회하거나 수동 확인해야 한다.
+
+    **이 함수는 벡터 스토어에 대한 배타 접근을 전제한다.** 동시 writer 가 있으면 삭제
+    자체가 이미 불완전하고(첫 조회 이후 들어온 벡터는 삭제 목록에 없다), 그때는 chroma
+    분기의 확인 수도 양방향으로 틀릴 수 있다(다른 writer 가 우리 대상을 먼저 지우면
+    과대, 우리가 지운 id 를 되살리면 과소). 프로세스 **안**의 `ChromaStore` writer 와의
+    창은 `_chroma_locked_handle` 이 닫고, 프로세스 **간** 창은 호출자가 flock 으로
+    막는다(ops 로더의 `chroma.lock`).
+    """
     require_live_data("delete_pack")
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
@@ -719,42 +811,85 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int]:
                 log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 벡터 삭제: SqliteVecStore(KURE, pack_id 컬럼) 우선, Chroma(_collection) 폴백 ──
-    chunk_vec_del = 0
+    #
+    # **카운트 규율(#165)**: `chunk_vec_del` 은 `int | None` 이고 `None` 은 "몇 개가
+    # 지워졌는지 확인할 수 없다"다(`pack_live_counts` 의 `vectors` 와 같은 어휘).
+    # 두 규칙으로 "확인 안 한 수를 카운트로 내지 않는다"를 지킨다.
+    #   R1. 각 분기에서 **첫 파괴적 호출 직전에** `None` 으로 떨어뜨린다.
+    #   R2. 숫자 발행은 그 백엔드의 쓰기가 **완결된 뒤**(commit·컨텍스트 종료 뒤)에만.
+    # 그래서 아래 `except` 는 카운트를 손대지 않아도 된다 — 쓰기 도중 예외로 빠져나오면
+    # 값은 이미 `None` 이다. 어느 예외가 어느 값으로 가는지를 핸들러에서 판독하려
+    # 들면 다음 사람이 못 읽는다.
+    chunk_vec_del: int | None = 0
+    kind = None                      # 판별 실패해도 아래 요약이 읽을 수 있게 선초기화
+    chroma_unreadable = False        # 락 안에서는 플래그만, warning 은 락 밖에서
     if vec.available:
         try:
+            # `_vec_backend` 호출은 이 `try` 안에 둔다 — 밖으로 올리면 판별 자체의
+            # 예외가 흡수되지 않고 `delete_pack` 밖으로 터져 기존 계약이 바뀐다.
             kind, handle, table = _vec_backend(vec)
             if kind == "sql":
+                chunk_vec_del = None                                   # R1
                 cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
+                rc = cur.rowcount                     # 담아만 둔다 — 아직 발행 안 한다
                 handle.commit()
-                chunk_vec_del = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                chunk_vec_del = _confirmed_rowcount(rc)                # R2
             elif kind == "chroma":
                 # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
                 # 근거와 동일: source 는 소유 키가 아니다).
-                result = handle.get(where={"pack_id": pack_name})
-                ids_to_del = result.get("ids", [])
-                if ids_to_del:
-                    handle.delete(ids=ids_to_del)
-                    # Chroma의 delete()는 삭제 건수를 돌려주지 않는다 — 이 값은
-                    # "요청 수"이지 확인된 삭제 수가 아니다.
-                    chunk_vec_del = len(ids_to_del)
+                with _chroma_locked_handle(vec, handle) as col:
+                    requested = _id_set(col.get(where={"pack_id": pack_name}))
+                    if requested is None:
+                        # 지울 대상을 모른다 — 삭제하지 않는다. 카운트는 0(0건 삭제가 참).
+                        chroma_unreadable = True
+                    elif requested:
+                        chunk_vec_del = None                           # R1
+                        col.delete(ids=list(requested))
+                        # Chroma 의 delete 는 삭제 건수를 알려주지 않는다. 1.5.9 의
+                        # `DeleteResult` 는 `{'deleted': N}` 을 내지만 그 N 은 **요청
+                        # 수**다(부재 id 3개를 지워도 3을 보고한다, 실측). 재조회만이
+                        # 확인 수단이다 — 같은 술어로 다시 읽어 생존자를 센다.
+                        # `include=[]` 로 id 만 받는다(대형 팩에서 문서·메타를 한 번
+                        # 더 끌어오지 않는다). 교집합을 쓰는 이유: 삭제와 재조회 사이에
+                        # 같은 pack_id 로 들어온 **새** 레코드는 우리가 요청한 것이
+                        # 아니므로 생존자로 세면 안 된다.
+                        survivors = _id_set(
+                            col.get(where={"pack_id": pack_name}, include=[]))
+                        if survivors is not None:
+                            chunk_vec_del = len(requested) - len(requested & survivors)  # R2
             elif kind == "sqlalchemy":
                 from sqlalchemy import text as _sa_text
+                chunk_vec_del = None                                   # R1
                 with handle.begin() as _c:
-                    r = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
-                                   {"p": pack_name})
-                    chunk_vec_del = r.rowcount or 0
+                    rc = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
+                                    {"p": pack_name}).rowcount
+                chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
             else:
                 # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
                 # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
+                # (여기서 카운트가 `0` 인 것은 맞다 — 삭제를 **시도하지 않았으므로**
+                # 0건 삭제가 확인된 사실이다. `None`(모른다)과 섞지 않는다.)
                 log.warning(
                     "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
                     "수동 정리가 필요하다", type(vec).__name__, pack_name)
         except Exception as e:
             log.warning("벡터 delete 오류(%s): %s", pack_name, e)
+    if chroma_unreadable:
+        log.warning(
+            "벡터 조회 응답을 id 집합으로 읽을 수 없다(%s) — 삭제를 시도하지 않았다. "
+            "팩 %s 의 벡터가 남는다", type(vec).__name__, pack_name)
 
+    # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
+    # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로
+    # 쓰고 표시명 매핑표를 만들지 않는다: `sql` 은 `_conn` 을 노출하는 아무 스토어나,
+    # `sqlalchemy` 는 `_engine` 을 노출하는 아무 스토어나 잡으므로 sqlite-vec/pgvector
+    # 로 옮겨 적는 순간 거짓이 될 수 있고, `_VEC_BACKEND_KINDS` 주석이 경고하는
+    # "kind 를 분기하는 소비자"가 하나 더 느는 것이다.
+    vec_backend = kind or ("미지원" if vec.available else "미가용")
+    vec_shown = chunk_vec_del if chunk_vec_del is not None else "미확인"
     print(
         f"  [{pack_name}] 삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
-        f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터(sqlite-vec) {chunk_vec_del}개",
+        f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터({vec_backend}) {vec_shown}개",
         flush=True,
     )
     return node_del, chunk_sql_del, chunk_vec_del
@@ -1655,6 +1790,10 @@ def incremental_finalize(
         try:
             # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
             # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
+            # **이 자리는 #161(적재 완료 판정 계약)이 소유한다.** `delete_pack` 의 같은
+            # 결함은 #165 에서 재조회 확인으로 닫혔지만, 여기(와 위 청크 벡터 삭제)는
+            # 원장·처분 계약과 함께 바뀌어야 해서 그대로 남겨 뒀다. 고칠 때는 #165 가
+            # 세운 어휘를 쓴다: 확인된 수만 숫자로 내고 미확인은 `None`.
             vec.delete(batch)
             vec_orphan_del += len(batch)
         except Exception as exc:

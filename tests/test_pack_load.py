@@ -14,8 +14,11 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 import pathlib
+import re
 from collections import Counter
+from decimal import Decimal
 
 import pytest
 
@@ -1834,6 +1837,16 @@ class _FakeChromaCollection:
         예외를 던진다(둘 다 상태 변형 **전에** 던져 "실패=무변형"을 흉내낸다).
       · `lossy_add_ids`: `add` 가 예외 없이 "성공"하지만 메타만 쓰고 임베딩·문서는
         비워 둔다 — v11 검수가 잡은 "메타만 남는 lossy add" 를 재현한다.
+
+    **#165 축** (`delete_pack` 의 chroma 카운트 확인 경로 — 조회→삭제→재조회):
+      · `fail_get_wheres`: `where=` 조회의 **순번**(1부터)이 이 집합에 있으면 예외.
+        삭제 전 조회가 1번, 재조회가 2번이다.
+      · `malformed_get_wheres`: 그 순번의 `where=` 조회가 여기 담긴 **이상 응답**을
+        그대로 돌려준다(`ids` 키 없음 / 비 list / 비문자열 원소 / 중복 / 문자열).
+      · `lossy_delete_ids`: `delete` 가 **예외 없이** 그 id 를 안 지운다(부분 삭제).
+      · `insert_after_delete`: `delete` 직후 `{id: pack_id}` 를 삽입한다(동시 writer).
+      · `lock_probe`/`lock_depth_log`: 호출 시점의 락 보유 깊이를 기록한다 — 실제
+        스레드 경합 없이 "락 아래에서 돌았는가"를 결정적으로 단언한다.
     """
 
     def __init__(self, rows):
@@ -1843,6 +1856,7 @@ class _FakeChromaCollection:
         self.metas: dict[str, dict] = {}
         self.uris: dict[str, str] = {}
         self.get_calls: list[dict | None] = []             # where= 호출 로그(하위호환)
+        self.get_where_calls: list[tuple[dict | None, list[str] | None]] = []
         self.get_by_ids_calls: list[tuple[list[str], list[str] | None]] = []
         self.delete_calls: list[list[str]] = []
         self.update_calls: list[tuple[list[str], list[dict]]] = []
@@ -1854,6 +1868,14 @@ class _FakeChromaCollection:
         self.fail_add_ids: set[str] = set()
         self.lossy_add_ids: set[str] = set()
         self._get_by_ids_call_count = 0
+        # #165 축 — `delete_pack` 의 chroma 카운트 확인(조회→삭제→재조회)을 태운다.
+        self.fail_get_wheres: set[int] = set()            # where= 조회 순번(1부터) 실패
+        self.malformed_get_wheres: dict[int, object] = {}  # 그 순번이 돌려줄 이상 응답
+        self.lossy_delete_ids: set[str] = set()           # 예외 없이 안 지워지는 id
+        self.insert_after_delete: dict[str, str] = {}     # delete 직후 삽입(동시 writer)
+        self._get_where_call_count = 0
+        self.lock_probe = None                            # 보유 깊이를 읽을 락(있으면)
+        self.lock_depth_log: list[int | None] = []        # 호출 시점의 보유 깊이
 
     def seed(self, node_id, pack_id="pack-1", embedding=(0.1, 0.2, 0.3),
              document="본문", metadata=None, uri=None):
@@ -1885,21 +1907,37 @@ class _FakeChromaCollection:
                 out["uris"] = [self.uris.get(i) for i in found]
             return out
         # where= 호출 (delete_pack/pack_live_counts/live_pack_state 기존 계약)
+        self.lock_depth_log.append(getattr(self.lock_probe, "depth", None))
         self.get_calls.append(where)
+        self.get_where_calls.append((where, list(include) if include is not None else None))
+        self._get_where_call_count += 1
+        n = self._get_where_call_count
+        if n in self.fail_get_wheres:
+            raise RuntimeError(f"simulated where-get failure (call #{n})")
+        if n in self.malformed_get_wheres:
+            return self.malformed_get_wheres[n]
         pid = (where or {}).get("pack_id")
         ids_ = [i for i, p in self._rows.items() if p == pid]
         return {"ids": ids_}
 
     def delete(self, ids):
+        self.lock_depth_log.append(getattr(self.lock_probe, "depth", None))
         if any(i in self.fail_delete_ids for i in ids):
             raise RuntimeError("simulated delete failure")   # 상태 변형 전에 던진다
         self.delete_calls.append(list(ids))
         for i in ids:
+            if i in self.lossy_delete_ids:
+                # 예외 없이 "성공"하지만 실제로는 안 지운다 — 부분 삭제 재현(#165 G1).
+                continue
             self._rows.pop(i, None)
             self.embeddings.pop(i, None)
             self.documents.pop(i, None)
             self.metas.pop(i, None)
             self.uris.pop(i, None)
+        for _id, _pack in self.insert_after_delete.items():
+            # 삭제 직후 같은 pack_id 로 들어온 새 레코드(동시 writer) — 재조회에는
+            # 잡히지만 **우리가 요청한 것이 아니므로** 생존자로 세면 안 된다(G12).
+            self._rows[_id] = _pack
 
     def add(self, ids, embeddings=None, documents=None, metadatas=None, uris=None):
         self.add_calls.append({"ids": list(ids)})            # 실패해도 시도는 기록
@@ -2003,6 +2041,495 @@ class TestChromaBackendBranches:
     def _seed_node(self, builder, tmp_path, node_id):
         f = _write_jsonl(tmp_path / f"{node_id}.jsonl", [_node(id=node_id)])
         pack_load.load_nodes("pack-1", f, builder, {})
+
+
+class _RecordingLock:
+    """보유 깊이를 세는 락 더블. `__enter__` 시 훅을 불러 `reset_collection` 같은
+    핸들 교체를 **결정적으로** 재현할 수 있게 한다(실 스레드 경합 없이)."""
+
+    def __init__(self, on_acquire=None):
+        self.depth = 0
+        self.acquires = 0
+        self._on_acquire = on_acquire
+
+    def __enter__(self):
+        self.depth += 1
+        self.acquires += 1
+        if self._on_acquire is not None:
+            self._on_acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.depth -= 1
+        return False
+
+
+class _LockedChromaVec:
+    """`_lock` 을 노출하는 chroma 형태 — 실 `ChromaStore` 가 add/upsert/delete 에
+    쓰는 그 공유 락과 같은 자리다. `swap_rows` 를 주면 **락을 잡는 순간** `_collection`
+    을 다른 컬렉션으로 바꿔치기해 `reset_collection()` 을 재현한다."""
+
+    available = True
+
+    def __init__(self, rows, swap_rows=None):
+        self._collection = _FakeChromaCollection(rows)
+        self._swap_to = (_FakeChromaCollection(swap_rows) if swap_rows is not None else None)
+        self._lock = _RecordingLock(on_acquire=self._maybe_swap)
+        self.pre_lock_collection = self._collection
+        for col in (self._collection, self._swap_to):
+            if col is not None:
+                col.lock_probe = self._lock
+
+    def _maybe_swap(self):
+        if self._swap_to is not None:
+            self._collection, self._swap_to = self._swap_to, None
+
+
+class _StubCursor:
+    def __init__(self, rowcount):
+        self.rowcount = rowcount
+
+
+class _StubSqlVec:
+    """`_vec_backend` 가 `"sql"` 로 인식하는 최소 형태. 진짜 sqlite 로는 `rowcount` 를
+    위조하거나 commit 을 실패시킬 수 없어서 이 축 전용 더블을 둔다(#165 G8/G17/G18)."""
+
+    available = True
+    _table = "vectors_kure"
+
+    def __init__(self, rowcount=1, fail_execute=False, fail_commit=False):
+        self._conn = self                       # `_vec_backend` 의 sql 판별 훅
+        self.rowcount = rowcount
+        self.fail_execute = fail_execute
+        self.fail_commit = fail_commit
+        self.executed: list[tuple] = []
+        self.commits = 0
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if self.fail_execute:
+            raise RuntimeError("simulated execute failure")
+        return _StubCursor(self.rowcount)
+
+    def commit(self):
+        self.commits += 1
+        if self.fail_commit:
+            raise RuntimeError("simulated commit failure")
+
+
+class _StubSaResult:
+    def __init__(self, rowcount):
+        self.rowcount = rowcount
+
+
+class _StubSaConn:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def execute(self, stmt, params=None):
+        self._owner.executed.append(params)
+        if self._owner.fail_execute:
+            raise RuntimeError("simulated execute failure")
+        return _StubSaResult(self._owner.rowcount)
+
+
+class _StubSaBegin:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __enter__(self):
+        if self._owner.fail_begin:
+            raise RuntimeError("simulated begin failure")
+        return _StubSaConn(self._owner)
+
+    def __exit__(self, exc_type, exc, tb):
+        # 정상 종료에서만 commit 이 돈다 — 그 commit 이 실패하는 축(G13).
+        if exc_type is None and self._owner.fail_commit:
+            raise RuntimeError("simulated commit failure")
+        return False
+
+
+class _StubSaEngine:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def begin(self):
+        return _StubSaBegin(self._owner)
+
+
+class _StubSaVec:
+    """`_vec_backend` 가 `"sqlalchemy"` 로 인식하는 최소 형태. `_SqlAlchemyVecLike` 는
+    진짜 엔진이라 rowcount 위조·commit 실패를 못 만든다(#165 G9/G13/G19/G24)."""
+
+    available = True
+    _table = "vectors"
+
+    def __init__(self, rowcount=1, fail_begin=False, fail_execute=False, fail_commit=False):
+        self._engine = _StubSaEngine(self)
+        self.rowcount = rowcount
+        self.fail_begin = fail_begin
+        self.fail_execute = fail_execute
+        self.fail_commit = fail_commit
+        self.executed: list = []
+
+
+class _ExplodingVec:
+    """`_vec_backend` 의 판별 자체가 예외를 내는 형태(#165 G23). `getattr(..., None)`
+    은 `AttributeError` 만 삼키므로 이 프로퍼티의 `RuntimeError` 는 그대로 나간다."""
+
+    available = True
+
+    @property
+    def _conn(self):
+        raise RuntimeError("simulated discrimination failure")
+
+
+def _vec_line(capsys):
+    """`delete_pack` 요약 줄에서 `벡터(...) ...개` 조각만 꺼낸다."""
+    out = capsys.readouterr().out
+    m = re.search(r"벡터\((?P<backend>[^)]*)\) (?P<count>\S+)개", out)
+    assert m is not None, f"요약 줄에 벡터 조각이 없다: {out!r}"
+    return m.group("backend"), m.group("count")
+
+
+class TestDeletePackVectorCountIsConfirmedNotRequested:
+    """`delete_pack` 의 벡터 삭제 카운트는 **확인된 수**여야 한다 (#165).
+
+    종전 chroma 분기는 `len(ids_to_del)`(요청 수)를 삭제 수로 냈다 — 일부만 지워져도
+    전량 삭제로 보고됐다. 같은 블록에 같은 클래스의 위반이 셋 더 있었다: 쓰기 도중
+    예외가 나도 `except` 가 카운트를 안 건드려 "확인된 N건"이 남았고(`sqlalchemy` 는
+    commit 실패 시 실제로 숫자가 남았다), `sql` 은 미보고 `rowcount` 를 `0` 으로
+    접었고, `sqlalchemy` 는 `r.rowcount or 0` 로 **-1 을 그대로** 냈다.
+
+    계약: `0` 은 "0건 지웠다", `None` 은 "몇 개인지 확인할 수 없다".
+    """
+
+    # ── chroma: 재조회로 확인한다 ────────────────────────────────────────
+    def test_partial_delete_reports_the_confirmed_count_not_the_request_count(self, live):
+        """G1 — delete 가 예외 없이 일부만 지우면 지워진 수만 센다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "a3": "pack-a"})
+        vec._collection.lossy_delete_ids = {"a2", "a3"}      # 요청 3, 실제 삭제 1
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 1, (
+            f"요청 3건 중 실제로 지워진 것은 1건인데 {chunk_vec_del} 로 보고했다 — "
+            "요청 수를 삭제 수로 내면 이 단언이 깨진다")
+
+    def test_delete_failure_reports_unconfirmed_not_zero(self, live):
+        """G2 — delete 가 예외면 어디까지 지워졌는지 모른다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
+        vec._collection.fail_delete_ids = {"a1"}
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"삭제가 예외로 끝났는데 {chunk_vec_del!r} 를 확정 카운트로 냈다")
+
+    def test_readback_failure_reports_unconfirmed(self, live):
+        """G3 — 삭제는 됐는데 재조회가 예외면 확인 불가다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
+        vec._collection.fail_get_wheres = {2}                # 2번째 where= 조회 = 재조회
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"재조회로 확인하지 못했는데 {chunk_vec_del!r} 를 냈다")
+        assert vec._collection.delete_calls, "삭제 자체는 시도됐어야 한다"
+
+    def test_full_delete_still_reports_every_row_and_reads_back_ids_only(self, live):
+        """G4(회귀) — 정상 경로는 여전히 전량을 세고, 재조회는 id 만 받는다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "b1": "pack-b"})
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
+        assert set(vec._collection._rows) == {"b1"}
+        where_calls = vec._collection.get_where_calls
+        assert len(where_calls) == 2, f"조회→삭제→재조회 2회여야 한다: {where_calls}"
+        assert where_calls[0] == ({"pack_id": "pack-a"}, None)
+        assert where_calls[1] == ({"pack_id": "pack-a"}, []), (
+            f"재조회는 id 만 받아야 한다(include=[]): {where_calls[1]}")
+
+    def test_failure_before_any_write_reports_zero_not_unconfirmed(self, live):
+        """G5 — 삭제 시도 **전** 조회가 실패하면 0건 삭제가 확인된 사실이다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a"})
+        vec._collection.fail_get_wheres = {1}                # 1번째 = 삭제 전 조회
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 0, (
+            f"아직 아무것도 안 지웠는데 {chunk_vec_del!r} 를 냈다 — 미확인이 아니라 0이다")
+        assert not vec._collection.delete_calls, "삭제를 시도하면 안 된다"
+
+    def test_concurrent_insert_of_a_new_id_is_not_counted_as_a_survivor(self, live):
+        """G12 — 재조회에 잡힌 **새** id 는 우리가 요청한 것이 아니다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
+        vec._collection.insert_after_delete = {"a9": "pack-a"}   # 삭제 직후 유입
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2, (
+            f"요청 2건이 모두 지워졌는데 {chunk_vec_del} 로 보고했다 — 재조회 결과를 "
+            "요청 집합과 교집합하지 않으면 새로 들어온 a9 가 생존자로 잡힌다")
+
+    @pytest.mark.parametrize("bad", [
+        {"no_ids_key": []},                  # ids 키 없음
+        {"ids": "a1"},                       # list 가 아니다(문자열)
+        {"ids": ["a1", None]},               # 원소가 문자열이 아니다
+        {"ids": ["a1", "a1"]},               # 중복 id
+        "그냥 문자열",                          # dict 도 아니다
+    ])
+    def test_unreadable_readback_reports_unconfirmed(self, live, bad):
+        """G15 — 재조회 응답을 id 집합으로 못 읽으면 `None`.
+
+        관대하게 읽으면(`got.get("ids", [])`) 생존자 0 = **전량 삭제**로 접힌다 —
+        이 이슈가 닫으려는 바로 그 과대보고다.
+        """
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
+        vec._collection.malformed_get_wheres = {2: bad}
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"재조회 응답 {bad!r} 를 믿고 {chunk_vec_del!r} 를 냈다")
+
+    @pytest.mark.parametrize("bad", [
+        {"no_ids_key": []},
+        {"ids": "a1a2"},                     # 문자열: delete(ids="a1a2") 는 단일 id 다
+        {"ids": ["a1", None]},
+        {"ids": ["a1", "a1"]},
+    ])
+    def test_unreadable_pre_delete_query_deletes_nothing_and_reports_zero(
+            self, live, bad, caplog):
+        """G22 — 삭제 **전** 조회를 못 읽으면 지울 대상을 모른다: 삭제하지 않는다.
+
+        문자열을 그대로 쓰면 `delete(ids="a1a2")` 는 chroma 계약상 **단일 id 삭제**인데
+        `len("a1a2")` 는 4다 — 1건 삭제를 4건으로 보고하게 된다.
+        """
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
+        vec._collection.malformed_get_wheres = {1: bad}
+
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 0, f"안 지웠으면 0이다 (실제 {chunk_vec_del!r})"
+        assert not vec._collection.delete_calls, (
+            f"판독 불가 응답으로 삭제를 날렸다: {vec._collection.delete_calls}")
+        assert any("id 집합으로 읽을 수 없다" in r.getMessage() for r in caplog.records), (
+            f"조용히 지나가면 안 된다: {[r.getMessage() for r in caplog.records]}")
+
+    def test_zero_target_reports_zero_without_calling_delete(self, live):
+        """G21(회귀) — 대상이 0건이면 0이고, 빈 목록으로 delete 를 부르지 않는다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"b1": "pack-b"})
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 0, f"지울 것이 없었으니 0이다 (실제 {chunk_vec_del!r})"
+        assert not vec._collection.delete_calls
+
+    # ── chroma: 스토어 락 아래에서 한 덩어리로 돈다 ──────────────────────
+    def test_query_delete_readback_all_run_under_the_store_lock(self, live):
+        """G16 ⓐⓑ — 세 호출 전부 락 보유 중이고, 끝나면 풀린다."""
+        _builder, graph, docs = live
+        vec = _LockedChromaVec({"a1": "pack-a", "a2": "pack-a"})
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 2
+        depths = vec._collection.lock_depth_log
+        assert depths and all(d == 1 for d in depths), (
+            f"조회·삭제·재조회가 락 밖에서 돌았다: {depths}")
+        assert vec._lock.depth == 0, "정상 종료 후 락이 안 풀렸다"
+
+    def test_the_lock_is_released_when_the_delete_raises(self, live):
+        """G16 ⓑ — 예외 경로에서도 락이 풀린다(경고는 락 밖에서 찍힌다)."""
+        _builder, graph, docs = live
+        vec = _LockedChromaVec({"a1": "pack-a"})
+        vec._collection.fail_delete_ids = {"a1"}
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None
+        assert vec._lock.depth == 0, "예외로 빠져나오며 락을 쥔 채 남았다"
+
+    def test_the_collection_handle_is_re_read_after_taking_the_lock(self, live):
+        """G16 ⓒ — 락 획득 뒤의 `_collection` 을 쓴다.
+
+        `reset_collection()` 은 같은 락 아래에서 컬렉션을 교체한다. 락 전 스냅샷을
+        그대로 쓰면 **폐기된 컬렉션**에 조회·삭제를 날린다.
+        """
+        _builder, graph, docs = live
+        vec = _LockedChromaVec({"a1": "pack-a", "a2": "pack-a"},
+                               swap_rows={"n1": "pack-a"})
+        old = vec.pre_lock_collection
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 1, (
+            "교체된 컬렉션(1건)이 아니라 옛 핸들(2건)을 봤다 — 락 안에서 핸들을 "
+            f"다시 안 읽으면 이 값이 2가 된다 (실제 {chunk_vec_del!r})")
+        assert not old.delete_calls, "폐기된 컬렉션에 삭제를 날렸다"
+        assert vec._collection.delete_calls == [["n1"]]
+
+    # ── sql / sqlalchemy: rowcount 를 곧이곧대로 믿지 않는다 ─────────────
+    @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
+    def test_sql_unreported_rowcount_is_unconfirmed(self, live, rowcount):
+        """G8 — 드라이버가 안 세어준 값은 `0` 이 아니라 `None` 이다.
+
+        `bool` 이 섞여 있는 이유: `isinstance(True, int)` 가 참이라 안 막으면
+        `True` 가 "1건 삭제"로 발행된다.
+        """
+        _builder, graph, docs = live
+        vec = _StubSqlVec(rowcount=rowcount)
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"rowcount={rowcount!r} 는 확인된 삭제 수가 아닌데 {chunk_vec_del!r} 를 냈다")
+
+    @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
+    def test_sqlalchemy_unreported_rowcount_is_unconfirmed(self, live, rowcount):
+        """G9 — 같은 계약. 종전엔 `r.rowcount or 0` 이라 `-1` 이 그대로 나갔다."""
+        _builder, graph, docs = live
+        vec = _StubSaVec(rowcount=rowcount)
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"rowcount={rowcount!r} 인데 {chunk_vec_del!r} 를 냈다")
+
+    @pytest.mark.parametrize("vec_factory", [
+        pytest.param(lambda: _StubSqlVec(rowcount=0), id="sql"),
+        pytest.param(lambda: _StubSaVec(rowcount=0), id="sqlalchemy"),
+    ])
+    def test_rowcount_zero_stays_zero(self, live, vec_factory):
+        """G20(회귀) — "세어보니 0" 은 확인된 사실이다. 미확인으로 접지 않는다."""
+        _builder, graph, docs = live
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec_factory())
+
+        assert chunk_vec_del == 0, f"0건 삭제는 확인된 0이다 (실제 {chunk_vec_del!r})"
+
+    def test_sql_execute_failure_is_unconfirmed(self, live):
+        """G17."""
+        _builder, graph, docs = live
+        _n, _c, chunk_vec_del = pack_load.delete_pack(
+            "pack-a", graph, docs, _StubSqlVec(fail_execute=True))
+        assert chunk_vec_del is None
+
+    def test_sql_commit_failure_is_unconfirmed(self, live):
+        """G18 — 쓰기의 완결점은 execute 가 아니라 commit 이다."""
+        _builder, graph, docs = live
+        vec = _StubSqlVec(rowcount=7, fail_commit=True)
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"commit 이 실패했는데 {chunk_vec_del!r} 를 확정 카운트로 냈다")
+
+    def test_sqlalchemy_execute_failure_is_unconfirmed(self, live):
+        """G19."""
+        _builder, graph, docs = live
+        _n, _c, chunk_vec_del = pack_load.delete_pack(
+            "pack-a", graph, docs, _StubSaVec(fail_execute=True))
+        assert chunk_vec_del is None
+
+    def test_sqlalchemy_commit_failure_is_unconfirmed(self, live):
+        """G13 — 숫자를 `with` 블록 **안**에서 발행하면 이 단언이 깨진다."""
+        _builder, graph, docs = live
+        vec = _StubSaVec(rowcount=7, fail_commit=True)
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"컨텍스트 종료(commit)가 실패했는데 {chunk_vec_del!r} 를 냈다")
+
+    def test_sqlalchemy_begin_failure_is_unconfirmed(self, live):
+        """G24 — 트랜잭션 진입 자체가 실패한 경우."""
+        _builder, graph, docs = live
+        _n, _c, chunk_vec_del = pack_load.delete_pack(
+            "pack-a", graph, docs, _StubSaVec(fail_begin=True))
+        assert chunk_vec_del is None
+
+
+class TestDeletePackSummaryNamesTheActualBackend:
+    """요약 문구의 백엔드 이름은 `_vec_backend` 판별 결과에서 온다 (#165).
+
+    종전엔 `벡터(sqlite-vec) N개` 고정이라 chroma·pgvector 로 돌아도 sqlite-vec 라고
+    찍혔다. 카운트가 `None`(미확인)일 때 `None개` 로 찍히지도 않아야 한다.
+    """
+
+    def test_chroma_is_named_chroma(self, live, capsys):
+        """G6."""
+        _builder, graph, docs = live
+        pack_load.delete_pack("pack-a", graph, docs,
+                              _FakeChromaVec({"a1": "pack-a"}))
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("chroma", "1"), f"{backend=} {count=}"
+
+    def test_sql_is_named_sql(self, live, capsys):
+        """G6."""
+        _builder, graph, docs = live
+        pack_load.delete_pack("pack-a", graph, docs, _StubSqlVec(rowcount=3))
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("sql", "3"), f"{backend=} {count=}"
+
+    def test_sqlalchemy_is_named_sqlalchemy(self, live, capsys):
+        """G6."""
+        _builder, graph, docs = live
+        pack_load.delete_pack("pack-a", graph, docs, _StubSaVec(rowcount=2))
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("sqlalchemy", "2"), f"{backend=} {count=}"
+
+    def test_unsupported_backend_says_so(self, live, capsys):
+        """G6 — kind 가 `None` 인데 가용한 형태."""
+        _builder, graph, docs = live
+
+        class _AvailableButUnknown:
+            available = True
+
+        pack_load.delete_pack("pack-a", graph, docs, _AvailableButUnknown())
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
+
+    def test_unavailable_backend_is_distinguished_from_unsupported(self, live, capsys):
+        """G14 — 미가용과 미지원은 운영자에게 다른 사실이다."""
+        _builder, graph, docs = live
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("미가용", "0"), f"{backend=} {count=}"
+
+    def test_unconfirmed_count_prints_as_unconfirmed(self, live, capsys):
+        """G7 — `None` 을 그대로 포맷하면 `None개` 가 된다."""
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a"})
+        vec._collection.fail_delete_ids = {"a1"}
+
+        pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("chroma", "미확인"), f"{backend=} {count=}"
+
+    def test_discrimination_failure_is_absorbed_and_labelled(self, live, capsys):
+        """G23 — 판별 자체가 예외여도 밖으로 안 새고, 표기는 판별 결과를 따른다."""
+        _builder, graph, docs = live
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack(
+            "pack-a", graph, docs, _ExplodingVec())
+
+        assert chunk_vec_del == 0, "판별 실패는 현행대로 흡수 + 0건이다"
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
 
 class TestVecMetaUpdateChromaReplace:
