@@ -62,13 +62,20 @@ def test_t8_bm25_search_filters_by_pack_id() -> None:
 
 
 def test_t8_bm25_include_unpackaged_passes_legacy() -> None:
+    """issue #147 §3.6: BM25Index.search's pack filter is now unconditional
+    (``if not in_pack_scope(doc, pack_set): continue``, no more
+    ``if pack_ids and ...`` guard) and ``include_unpackaged`` is accepted
+    only for call-site signature compatibility -- it no longer has any
+    effect. A row with no detectable pack_id is outside every read scope
+    (#143 invariant 5) and is excluded even when the caller passes
+    ``include_unpackaged=True``."""
     index = BM25Index.build([
         _node("a", pack_id="A", text="alpha"),
         _node("legacy", pack_id=None, text="alpha"),
     ])
     hits = index.search("alpha", pack_ids=["A"], include_unpackaged=True, limit=5)
     ids = {h["node_id"] for h in hits}
-    assert ids == {"a", "legacy"}
+    assert ids == {"a"}
 
 
 def _hybrid(doc_store) -> HybridQuery:
@@ -108,13 +115,13 @@ def test_t8_background_rebuild_on_fingerprint_change() -> None:
     hybrid = _hybrid(doc_store)
     try:
         # First search: cold synchronous build from the 1-node list.
-        hybrid._bm25_search("alpha", spaces=None, limit=5)
+        hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["A"])
         fp_first = hybrid._bm25_cache.fingerprint
         assert fp_first == (1, "")
 
         # Second search: probe (2,"") != cached (1,"") → schedule bg rebuild,
         # return the stale cache without blocking.
-        hybrid._bm25_search("alpha", spaces=None, limit=5)
+        hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["A"])
 
         # Background worker rebuilds from the 2-node list and atomically swaps.
         assert _wait_until(lambda: hybrid._bm25_cache.fingerprint == (2, ""))
@@ -159,7 +166,7 @@ def _seed_ordered(ds, count: int, space: str = "s1") -> None:
     ``updated_at`` so cap selection (ORDER BY updated_at DESC) is
     predictable rather than depending on ``datetime.now()`` call spacing."""
     for i in range(count):
-        ds.upsert_node_doc(space, "T", f"n{i}", {"name": "alpha"})
+        ds.upsert_node_doc(space, "T", f"n{i}", {"name": "alpha", "pack_id": "p1"})
         ds._conn.execute(
             "UPDATE doc_nodes SET updated_at=? WHERE node_id=?",
             (f"2026-01-01T00:00:{i:02d}", f"n{i}"),
@@ -195,7 +202,7 @@ def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
     if not getattr(ds, "_available", False):
         pytest.skip("LocalSQLDocStore unavailable")
     for i in range(5):
-        ds.upsert_node_doc("s1", "T", f"n{i}", {"name": "alpha"})
+        ds.upsert_node_doc("s1", "T", f"n{i}", {"name": "alpha", "pack_id": "p1"})
 
     monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 100)  # no cap pressure here
 
@@ -207,16 +214,19 @@ def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
         # (call #1 in the fixed order), before list_nodes (call #2) returns.
         if not injected["done"]:
             injected["done"] = True
-            ds.upsert_node_doc("s1", "T", "race", {"name": "alpha"})
+            ds.upsert_node_doc("s1", "T", "race", {"name": "alpha", "pack_id": "p1"})
         return real_list_nodes(*args, **kwargs)
 
     ds.list_nodes = racy_list_nodes
 
     hybrid = _hybrid(ds)
     try:
-        hybrid._bm25_search("alpha", spaces=None, limit=25)  # cold build
+        hybrid._bm25_search("alpha", spaces=None, limit=25, pack_ids=["p1"])  # cold build
 
-        indexed_ids = {h["node_id"] for h in hybrid._bm25_cache.search("alpha", limit=25)}
+        indexed_ids = {
+            h["node_id"]
+            for h in hybrid._bm25_cache.search("alpha", limit=25, pack_ids=["p1"])
+        }
         assert "race" in indexed_ids, "the race write must already be in the index"
 
         live_fp = ds.bm25_fingerprint()
@@ -228,7 +238,7 @@ def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
 
         # Next query: probe diverges from the stale stamp → one more
         # (harmless) rebuild → fingerprint converges.
-        hybrid._bm25_search("alpha", spaces=None, limit=25)
+        hybrid._bm25_search("alpha", spaces=None, limit=25, pack_ids=["p1"])
         assert _wait_until(lambda: hybrid._bm25_cache.fingerprint == ds.bm25_fingerprint())
     finally:
         hybrid.shutdown_bm25()
@@ -255,11 +265,11 @@ def test_t8_no_rebuild_scheduled_when_over_cap_and_unchanged(tmp_path, monkeypat
     list_nodes_spy = MagicMock(wraps=ds.list_nodes)
     ds.list_nodes = list_nodes_spy
     try:
-        hybrid._bm25_search("alpha", spaces=None, limit=5)  # cold build
+        hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["p1"])  # cold build
         calls_after_cold = list_nodes_spy.call_count
 
         for _ in range(5):
-            hybrid._bm25_search("alpha", spaces=None, limit=5)
+            hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["p1"])
         time.sleep(0.2)  # let any (incorrectly) scheduled rebuild run
 
         assert list_nodes_spy.call_count == calls_after_cold, (
@@ -286,8 +296,12 @@ def test_t8_rebuild_scheduled_when_row_outside_cap_updated(tmp_path, monkeypatch
 
     hybrid = _hybrid(ds)
     try:
-        hybrid._bm25_search("alpha", spaces=None, limit=25)  # cold build: top 10 (n10..n19)
-        indexed_ids = {h["node_id"] for h in hybrid._bm25_cache.search("alpha", limit=25)}
+        # cold build: top 10 (n10..n19)
+        hybrid._bm25_search("alpha", spaces=None, limit=25, pack_ids=["p1"])
+        indexed_ids = {
+            h["node_id"]
+            for h in hybrid._bm25_cache.search("alpha", limit=25, pack_ids=["p1"])
+        }
         assert "n5" not in indexed_ids
 
         ds._conn.execute(
@@ -296,10 +310,11 @@ def test_t8_rebuild_scheduled_when_row_outside_cap_updated(tmp_path, monkeypatch
         )
         ds._conn.commit()
 
-        hybrid._bm25_search("alpha", spaces=None, limit=25)  # probe now diverges
+        # probe now diverges
+        hybrid._bm25_search("alpha", spaces=None, limit=25, pack_ids=["p1"])
 
         def _n5_indexed() -> bool:
-            hits = hybrid._bm25_cache.search("alpha", limit=25)
+            hits = hybrid._bm25_cache.search("alpha", limit=25, pack_ids=["p1"])
             return "n5" in {h["node_id"] for h in hits}
 
         assert _wait_until(_n5_indexed)

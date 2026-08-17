@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,15 +12,54 @@ from opencrab.ontology.query import QueryOutcome, QueryResult
 # bind_test_principal for why this is opt-in per module, not autouse).
 pytestmark = pytest.mark.usefixtures("bind_test_principal")
 
+# The fixed user_id conftest.py's bind_test_principal binds for every test
+# in this module.
+_TEST_USER_ID = "test-user"
 
-def _stub_context(hybrid_mock: MagicMock) -> dict:
+
+def _real_sql_with_owned_pack(*pack_ids: str) -> Any:
+    """A real in-memory SQLStore with each of ``pack_ids`` registry-owned by
+    ``_TEST_USER_ID``.
+
+    Issue #147 §3.7: ontology_query now derives its read scope from
+    ``ctx["sql"]`` + ``current_principal()`` (``opencrab.pack.read_scope
+    .read_scope`` -> ``ownership.readable_pack_ids``), which runs a real SQL
+    query against the ``packs``/``users`` tables -- a bare ``MagicMock`` sql
+    double can't satisfy that, so the derived scope comes back empty and
+    every requested pack_id is reported out-of-scope regardless of what the
+    test intends to exercise. Mirrors tests/test_packs_registry.py's
+    real-SQLStore + create_pack pattern; the owning user row is inserted
+    directly (rather than via ``create_user``, which mints a random id)
+    because the FK target must match bind_test_principal's fixed user_id
+    for ``readable_pack_ids``'s ``owner_id = :uid`` predicate to find it.
+    """
+    from sqlalchemy import text
+
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore("sqlite:///:memory:")
+    with sql._engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (user_id, display_name, is_local) "
+                "VALUES (:uid, :dn, :loc)"
+            ),
+            {"uid": _TEST_USER_ID, "dn": "Test User", "loc": True},
+        )
+    for pack_id in pack_ids:
+        create_pack(sql, _TEST_USER_ID, pack_id, title=pack_id)
+    return sql
+
+
+def _stub_context(hybrid_mock: MagicMock, sql: Any = None) -> dict:
     billing = MagicMock()
     billing.on_query = MagicMock()
     return {
         "neo4j": MagicMock(),
         "chroma": MagicMock(),
         "mongo": MagicMock(),
-        "sql": MagicMock(),
+        "sql": sql if sql is not None else MagicMock(),
         "builder": MagicMock(),
         "rebac": MagicMock(),
         "impact": MagicMock(),
@@ -52,8 +92,9 @@ def test_t10_ontology_query_includes_envelope_fields():
 
     hybrid = MagicMock()
     hybrid.query = MagicMock(return_value=_outcome("pack-a"))
+    sql = _real_sql_with_owned_pack("pack-a")
 
-    with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
+    with patch.object(tools, "_get_context", return_value=_stub_context(hybrid, sql=sql)):
         response = tools.ontology_query(
             question="alpha",
             pack_ids=["pack-a"],
@@ -87,8 +128,9 @@ def test_t10_pack_ids_take_priority_over_auto_pack():
 
     hybrid = MagicMock()
     hybrid.query = MagicMock(return_value=_outcome("pack-a"))
+    sql = _real_sql_with_owned_pack("pack-a")
 
-    with patch.object(tools, "_get_context", return_value=_stub_context(hybrid)):
+    with patch.object(tools, "_get_context", return_value=_stub_context(hybrid, sql=sql)):
         response = tools.ontology_query(
             question="alpha",
             pack_ids=["pack-a"],

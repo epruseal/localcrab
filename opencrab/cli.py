@@ -269,6 +269,35 @@ def serve(
             console.print(f"[red]{exc}[/red]")
             raise SystemExit(1) from exc
 
+        # #147 §3.11: this command instantiates MCPServer directly rather than
+        # going through opencrab.mcp.server.main() (which has its own copy of
+        # this check for the `python -m opencrab.mcp.server` entry point), so
+        # it needs its own call -- otherwise `opencrab serve` would be the one
+        # documented server entry point that skips the registry/graph
+        # reconciliation guard. Built via the store factory directly (not
+        # _get_context, which also loads the vector/doc/billing stores this
+        # check does not need) and closed again immediately after.
+        from opencrab.config import get_settings
+        from opencrab.pack.read_scope import assert_registry_covers_graph
+        from opencrab.stores.factory import make_graph_store, make_sql_store
+
+        cfg = get_settings()
+        startup_sql = make_sql_store(cfg)
+        startup_graph = make_graph_store(cfg)
+        try:
+            assert_registry_covers_graph(startup_sql, startup_graph)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
+        finally:
+            for store in (startup_sql, startup_graph):
+                close = getattr(store, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
         # #145: stdio serves exactly one local principal for its whole
         # lifetime (there is no per-request identity over stdio) -- bind it
         # once around the entire blocking run loop so every tools/call
@@ -702,25 +731,44 @@ def query(
     json_envelope: bool,
 ) -> None:
     """Run a hybrid query and print results."""
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.ontology.query import HybridQuery
+    from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
     from opencrab.services.pack_selection import cli_warning_text, resolve_packs
 
+    # #147: CLI query is a read entry point like the MCP/REST ones and must
+    # derive its filter from the same readable-pack scope -- previously this
+    # command bound no principal at all and had no filter to derive.
+    try:
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+
     cfg = get_settings()
-    stores = _make_stores(cfg, graph=True, vector=True, doc=True)
-    chroma, neo4j, docs = stores.vector, stores.graph, stores.doc
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
+    chroma, neo4j, docs, sql = stores.vector, stores.graph, stores.doc, stores.sql
     hybrid = HybridQuery(chroma, neo4j)
     if docs.available:
         hybrid._doc_store = docs  # noqa: SLF001 — same wiring tools.py uses
 
+    # #147 §3.11: every CLI command that reads data checks the registry/graph
+    # reconciliation, not just the 4 server entry points -- this command
+    # bypasses those entry points entirely and would otherwise silently
+    # return 0 results for an unmigrated deployment instead of refusing.
+    assert_registry_covers_graph(sql, neo4j)
+
     space_filter = [s.strip() for s in spaces.split(",")] if spaces else None
 
+    scope = read_scope(sql, principal)
     selection = resolve_packs(
         question,
         list(pack_ids) if pack_ids else None,
         auto_pack,
         include_unpackaged,
         cfg.local_data_dir,
+        scope=scope,
         raise_on_error=True,
     )
     effective_pack_ids = selection.effective_pack_ids
@@ -740,7 +788,6 @@ def query(
         spaces=space_filter,
         limit=limit,
         pack_ids=effective_pack_ids,
-        include_unpackaged=include_unpackaged,
     )
     results = outcome.results
     # #51: spaces 필터의 과도기 경고(백필 전 기존 벡터 제외)를 pack 경고와 동일하게 echo.
@@ -761,7 +808,7 @@ def query(
             "pack_filter": {
                 "pack_ids": effective_pack_ids,
                 "auto_pack": bool(auto_pack),
-                "include_unpackaged": bool(include_unpackaged),
+                "include_unpackaged": selection.include_unpackaged_effective,
             },
             "selected_packs": selected_packs,
             "total": len(results),
@@ -933,17 +980,33 @@ def export_neo4j_pack(
 
     Works with all storage modes (local/kuzu/docker/pg) via STORAGE_MODE env var.
     """
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.pack import export_neo4j_opencrab_ingest
+    from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+
+    # #147: this command used to dump the whole graph store with no principal
+    # bound and no scope applied at all -- #143 rules out an "admin bypass"
+    # exemption for CLI tools, so it is scoped like every other read entry
+    # point, not left as a bulk-export escape hatch.
+    try:
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
 
     cfg = get_settings()
-    graph = _make_stores(cfg, graph=True).graph
+    stores = _make_stores(cfg, graph=True, sql=True)
+    graph, sql = stores.graph, stores.sql
+    assert_registry_covers_graph(sql, graph)
+    scope = read_scope(sql, principal)
     status = export_neo4j_opencrab_ingest(
         graph,
         output,
         pack_id=pack_id,
         node_limit=node_limit,
         edge_limit=edge_limit,
+        scope=scope,
     )
     console.print_json(json.dumps(status, ensure_ascii=False))
 
@@ -979,11 +1042,33 @@ def packs() -> None:
 @packs.command("list")
 def packs_list() -> None:
     """List packs found under <local_data_dir>/packs/."""
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.ontology.pack_registry import load_pack_registry
+    from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+
+    # #147: the same on-disk manifest registry is already filtered by scope
+    # for auto_pack candidate selection (pack_selection.resolve_packs) --
+    # leaving this command unfiltered would be self-contradictory (a pack
+    # this command would refuse to auto-select is still listed here with its
+    # title, node/edge counts and path exposed) and, per invariant 7, would
+    # leak the existence of someone else's private pack.
+    try:
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
 
     cfg = get_settings()
-    registry = load_pack_registry(cfg.local_data_dir)
+    stores = _make_stores(cfg, graph=True, sql=True)
+    graph, sql = stores.graph, stores.sql
+    # #147 §3.11: this is a read entry point that bypasses the 4 server
+    # entry points entirely -- without its own call here, an unmigrated
+    # deployment would just silently list an empty/partial registry instead
+    # of refusing to start.
+    assert_registry_covers_graph(sql, graph)
+    scope = read_scope(sql, principal)
+    registry = [p for p in load_pack_registry(cfg.local_data_dir) if p.pack_id in scope]
     if not registry:
         console.print(f"[yellow]No packs under {cfg.local_data_dir}/packs/[/yellow]")
         return
@@ -1014,12 +1099,30 @@ def packs_list() -> None:
 @click.argument("pack_id")
 def packs_show(pack_id: str) -> None:
     """Show full manifest summary for one pack."""
+    from opencrab.auth import require_local_principal
     from opencrab.config import get_settings
     from opencrab.ontology.pack_registry import get_pack
+    from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+
+    try:
+        principal = require_local_principal()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
 
     cfg = get_settings()
+    stores = _make_stores(cfg, graph=True, sql=True)
+    graph, sql = stores.graph, stores.sql
+    assert_registry_covers_graph(sql, graph)
+    scope = read_scope(sql, principal)
+
     pack = get_pack(cfg.local_data_dir, pack_id)
-    if pack is None:
+    # #147: a pack outside the caller's scope must produce the SAME "not
+    # found" message and exit code as a pack_id that does not exist at all
+    # (#143 invariant 7) -- so the scope check happens in this one `is None`
+    # branch, not a separate "forbidden" branch that would let the two cases
+    # be told apart from the outside.
+    if pack is None or pack_id not in scope:
         console.print(f"[red]Pack '{pack_id}' not found under {cfg.local_data_dir}/packs/[/red]")
         raise SystemExit(1)
 

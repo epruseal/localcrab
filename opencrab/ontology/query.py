@@ -20,7 +20,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from opencrab.ontology.pack_provenance import infer_pack_id
+from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
 from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_QUERY_CUES
 from opencrab.stores.chroma_store import ChromaStore
@@ -192,6 +192,38 @@ def _build_chroma_where(
     if len(clauses) == 1:
         return clauses[0]
     return {"$and": clauses}
+
+
+def _neo4j_keyword_cypher(*, with_spaces: bool) -> str:
+    """Cypher for the Neo4j keyword leg, with the OR group PARENTHESISED.
+
+    Split out as a pure string builder so the grouping can be asserted in a
+    unit test. It has to be, because getting it wrong is silent: Cypher binds
+    AND tighter than OR, so appending a filter to the end of a bare OR chain
+    produces
+
+        name-match OR description-match OR (text-match AND <filter>)
+
+    and every row that matched on ``name`` or ``description`` skips the
+    filter entirely while the query still looks filtered. The pack predicate
+    added here (#147) is an authorization boundary, so it cannot go into a
+    boolean structure with that shape.
+
+    The pre-existing ``spaces`` filter was appended exactly that way and had
+    the same hole (a recall bug there rather than an authorization one).
+    Parenthesising the OR group fixes both at once -- they cannot be
+    separated, since the fix IS the grouping.
+    """
+    space_filter = "\n              AND n.space IN $spaces" if with_spaces else ""
+    return f"""
+        MATCH (n)
+        WHERE ( toLower(n.name) CONTAINS $kw
+             OR toLower(n.description) CONTAINS $kw
+             OR toLower(n.text) CONTAINS $kw )
+          AND n.pack_id IN $pack_ids{space_filter}
+        RETURN properties(n) AS props, labels(n)[0] AS label
+        LIMIT $limit
+    """
 
 
 def _property_text(props: dict[str, Any], relation_type: str = "") -> str:
@@ -403,14 +435,14 @@ class HybridQuery:
     def query(
         self,
         question: str,
+        *,
+        pack_ids: list[str],
         spaces: list[str] | None = None,
         limit: int = 10,
         graph_depth: int = 1,
         subject_id: str | None = None,
         use_bm25: bool = True,
         use_rerank: bool = True,
-        pack_ids: list[str] | None = None,
-        include_unpackaged: bool = False,
         use_fts: bool = True,
     ) -> QueryOutcome:
         """
@@ -433,6 +465,22 @@ class HybridQuery:
             Include BM25 keyword results in the merge (default True).
         use_rerank:
             Apply RRF + BM25 cross-score reranking (default True).
+        pack_ids:
+            REQUIRED (#147). The caller's readable pack scope, already
+            resolved -- see ``opencrab.pack.read_scope``. There is no
+            default and no ``None``: a default would be a way to spell
+            "search everything", the state #143 invariant 3 requires to be
+            unrepresentable. An EMPTY list means the caller may read
+            nothing and is answered with zero results without touching a
+            store, which is also what keeps an empty scope from reaching
+            the leg filters -- several of them read an empty pack set as
+            "no filter, pass everything".
+
+            ``include_unpackaged`` is gone. Rows belonging to no pack are
+            outside every read scope (#143 invariant 5), so the only thing
+            the parameter could still do was widen a scope past what the
+            principal may read. The legs keep their own parameter for
+            non-authorization callers; this method passes False.
 
         Returns
         -------
@@ -442,6 +490,7 @@ class HybridQuery:
         that only care about results are unaffected.
         """
         result_lists: list[list[dict[str, Any]]] = []
+        include_unpackaged = False
         profile = _profile_for_query(question, limit, graph_depth)
 
         # #51: 벡터 store 는 "space" 키가 없는 메타데이터를 매치 실패로 처리한다(무시가
@@ -452,6 +501,17 @@ class HybridQuery:
         # 상태(self.*)는 프로세스 수명 싱글턴 + 스레드풀 실행 환경에서 요청 간 경합이
         # 생기므로 쓰지 않는다(BM25/FTS 레그는 영향 없음).
         warnings: list[str] = []
+
+        # #147: an empty scope is answered here, before any store call. Two
+        # reasons it has to be this early rather than inside each leg:
+        # `_build_chroma_where` has no way to express "match nothing" (it
+        # returns None, i.e. no filter, when it has no clauses), and the
+        # graph/BM25 helpers historically read an empty pack set as "no
+        # filter". Returning first makes both unreachable with an empty
+        # scope instead of relying on each of them to be defensive.
+        if not pack_ids:
+            return QueryOutcome([], warnings)
+
         if spaces:
             warnings.append(
                 "spaces filter: vectors ingested before this fix carry no 'space' "
@@ -557,7 +617,11 @@ class HybridQuery:
         for item in merged[:limit]:
             metadata = dict(item.get("metadata") or {})
             if "pack_id" not in metadata:
-                pid = infer_pack_id(item)
+                # #147: scope_pack_id, not infer_pack_id. Every result here
+                # already passed a strict pack check; reporting an id derived
+                # by the looser path-inference rule would surface a value no
+                # access decision was made on.
+                pid = scope_pack_id(item)
                 if pid:
                     metadata["pack_id"] = pid
             results.append(QueryResult(
@@ -616,7 +680,8 @@ class HybridQuery:
         question: str,
         spaces: list[str] | None,
         limit: int,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
         """Run BM25 search against doc store nodes, using a cached index.
@@ -629,6 +694,8 @@ class HybridQuery:
         process) that never called ``invalidate_bm25_cache()``; on mismatch we
         schedule a background rebuild and keep serving the current index.
         """
+        if not pack_ids:
+            return []
         try:
             BM25Index = _get_bm25()  # noqa: N806
 
@@ -674,7 +741,8 @@ class HybridQuery:
         question: str,
         spaces: list[str] | None,
         limit: int,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
         """FTS5 키워드 검색 레그(본문 다중어/약어/표준번호 정확매칭).
@@ -689,6 +757,8 @@ class HybridQuery:
         """
         ds = self._doc_store
         if ds is None or not getattr(ds, "supports_keyword", False):
+            return []
+        if not pack_ids:
             return []
         try:
             hits = ds.keyword_search(
@@ -751,7 +821,8 @@ class HybridQuery:
         question: str,
         spaces: list[str] | None,
         limit: int,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
     ) -> list[QueryResult]:
         """Run ChromaDB semantic similarity search.
@@ -765,6 +836,8 @@ class HybridQuery:
         """
         if not self._chroma.available:
             logger.debug("ChromaDB unavailable, skipping vector search.")
+            return []
+        if not pack_ids:
             return []
 
         try:
@@ -802,11 +875,15 @@ class HybridQuery:
             for hit in hits:
                 meta = hit.get("metadata") or {}
                 if effective_pack_filter is not None:
-                    pid = infer_pack_id({"metadata": meta, **hit})
-                    if pid is None:
-                        if not include_unpackaged:
-                            continue
-                    elif pid not in set(effective_pack_filter):
+                    # #147: in_pack_scope, not infer_pack_id. The latter
+                    # will read a pack id out of source_path/source_id when
+                    # pack_id is absent, and those are caller-written — an
+                    # authorization predicate must not be forgeable by the
+                    # data it judges. Same defect class as the 3-way OR in
+                    # _export_nodes_where (#143).
+                    if not in_pack_scope(
+                        {"metadata": meta, **hit}, set(effective_pack_filter)
+                    ):
                         continue
                 # Convert cosine distance to similarity score (1 - distance)
                 distance = hit.get("distance") or 0.0
@@ -830,7 +907,8 @@ class HybridQuery:
         anchor_ids: list[str],
         depth: int,
         limit: int,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
         spaces: list[str] | None = None,
     ) -> list[QueryResult]:
@@ -848,6 +926,10 @@ class HybridQuery:
         each store's ``find_neighbors`` docstring).
         """
         if not self._neo4j.available:
+            return []
+        # #147: an empty scope means nothing is readable, and find_neighbors
+        # would have to be trusted to agree. Answer it here instead.
+        if not pack_ids:
             return []
 
         expanded: list[QueryResult] = []
@@ -867,10 +949,16 @@ class HybridQuery:
                 # kuzu_graph_store.py / neo4j_store.py), so there is no
                 # "older stub" left to protect — a stub that still lacks it
                 # is a test double that should be fixed, not accommodated.
-                extra: dict[str, Any] = {"spaces": spaces}
-                if pack_ids:
-                    extra["pack_ids"] = pack_ids
-                    extra["include_unpackaged"] = include_unpackaged
+                # #147: forwarded UNCONDITIONALLY. The old `if pack_ids:`
+                # guard is exactly the shape the comment above warns about
+                # — with a required scope, skipping the kwarg would hand
+                # find_neighbors its `pack_ids=None` default, which means
+                # "no filter" and would drop the caller's scope on the floor.
+                extra: dict[str, Any] = {
+                    "spaces": spaces,
+                    "pack_ids": pack_ids,
+                    "include_unpackaged": include_unpackaged,
+                }
                 neighbours = self._neo4j.find_neighbors(
                     node_id=anchor_id,
                     direction="both",
@@ -974,6 +1062,8 @@ class HybridQuery:
     def keyword_search(
         self,
         keyword: str,
+        *,
+        pack_ids: list[str],
         spaces: list[str] | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
@@ -984,12 +1074,20 @@ class HybridQuery:
         ----------
         keyword:
             Search term.
+        pack_ids:
+            REQUIRED (#147). The caller's readable pack scope. This leg used
+            to have no pack parameter at all -- it was the "no pack predicate
+            anywhere" row of the read-path audit -- so a keyword fallback
+            returned matches from every user's data. Empty means nothing is
+            readable and short-circuits.
         spaces:
             Optional list of spaces to filter.
         limit:
             Max results.
         """
         if not self._neo4j.available:
+            return []
+        if not pack_ids:
             return []
 
         # --- 로컬/PG/Kuzu 모드: 이 세 백엔드는 run_cypher()가 no-op이므로
@@ -1010,28 +1108,23 @@ class HybridQuery:
         from opencrab.stores.local_graph_store import LocalGraphStore  # noqa: PLC0415
         from opencrab.stores.pg_graph_store import PGGraphStore  # noqa: PLC0415
         if isinstance(self._neo4j, (LocalGraphStore, KuzuGraphStore, PGGraphStore)):
-            rows = self._neo4j.search_nodes(keyword, spaces=spaces, limit=limit)
+            rows = self._neo4j.search_nodes(
+                keyword, pack_ids=pack_ids, spaces=spaces, limit=limit
+            )
             return [
                 {"node": row.get("props", {}), "label": (row.get("labels") or [""])[0]}
                 for row in rows
             ]
 
         # --- Neo4j(Docker) 모드: 기존 Cypher 경로 유지
-        space_filter = ""
-        params: dict[str, Any] = {"kw": keyword.lower(), "limit": limit}
+        params: dict[str, Any] = {
+            "kw": keyword.lower(),
+            "limit": limit,
+            "pack_ids": list(pack_ids),
+        }
         if spaces:
-            space_filter = "AND n.space IN $spaces"
             params["spaces"] = spaces
-
-        cypher = f"""
-            MATCH (n)
-            WHERE toLower(n.name) CONTAINS $kw
-               OR toLower(n.description) CONTAINS $kw
-               OR toLower(n.text) CONTAINS $kw
-               {space_filter}
-            RETURN properties(n) AS props, labels(n)[0] AS label
-            LIMIT $limit
-        """
+        cypher = _neo4j_keyword_cypher(with_spaces=bool(spaces))
         try:
             rows = self._neo4j.run_cypher(cypher, params)
             return [

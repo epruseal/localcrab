@@ -145,7 +145,7 @@ def ontology_query(
     """
     from opencrab.auth import current_principal
     from opencrab.config import get_settings
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _current_read_scope, _get_context
     from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
@@ -153,12 +153,14 @@ def ontology_query(
     cfg = get_settings()
     principal = current_principal()
     tenant_id = "default"
+    scope = _current_read_scope(ctx)
     selection = resolve_packs(
         question,
         list(pack_ids) if pack_ids else None,
         auto_pack,
         include_unpackaged,
         cfg.local_data_dir,
+        scope=scope,
         raise_on_error=False,
     )
     effective_pack_ids = selection.effective_pack_ids
@@ -175,7 +177,6 @@ def ontology_query(
             use_rerank=use_rerank,
             use_fts=use_fts,
             pack_ids=effective_pack_ids,
-            include_unpackaged=include_unpackaged,
         )
         results = outcome.results
         # This is a store write (billing_events INSERT), but ontology_query stays
@@ -209,7 +210,10 @@ def ontology_query(
         if include_canonical_ids:
             # .get: a context without a graph store (test doubles, degraded
             # deployments) must not turn a good query into an error.
-            enrich_canonical(ctx.get("neo4j"), result_dicts)
+            # #147: the FULL readable scope, not effective_pack_ids. See
+            # enrich()'s docstring -- canonical identity must not change
+            # depending on which packs a particular query searched.
+            enrich_canonical(ctx.get("neo4j"), result_dicts, pack_ids=sorted(scope))
         response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
@@ -230,7 +234,7 @@ def ontology_query(
             response["pack_filter"] = {
                 "pack_ids": effective_pack_ids,
                 "auto_pack": bool(auto_pack),
-                "include_unpackaged": bool(include_unpackaged),
+                "include_unpackaged": selection.include_unpackaged_effective,
             }
             if pack_filter_warnings:
                 response["pack_filter"]["warnings"] = pack_filter_warnings
@@ -282,11 +286,15 @@ def ontology_impact(
         Nature of the change: create, update, delete, permission_change,
         relationship_add, relationship_remove, bulk_import.
     """
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _current_read_scope, _get_context
 
     ctx = _get_context()
     try:
-        result = ctx["impact"].analyse(node_id=node_id, change_type=change_type)
+        result = ctx["impact"].analyse(
+            node_id=node_id,
+            change_type=change_type,
+            pack_ids=sorted(_current_read_scope(ctx)),
+        )
         return result.to_dict()
     except Exception as exc:
         logger.error("ontology_impact failed: %s", exc)
@@ -339,7 +347,7 @@ def ontology_lever_simulate(
     magnitude:
         Strength of the lever movement (recommended 0.0–1.0).
     """
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _current_read_scope, _get_context
 
     ctx = _get_context()
     try:
@@ -347,6 +355,7 @@ def ontology_lever_simulate(
             lever_id=lever_id,
             direction=direction,
             magnitude=float(magnitude),
+            pack_ids=sorted(_current_read_scope(ctx)),
         )
     except ValueError as exc:
         return {"error": str(exc)}

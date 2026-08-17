@@ -84,10 +84,12 @@ class TestPackFilterError:
 
 
 class TestPackFilterEdge:
-    def test_empty_pack_ids_set_treated_as_no_filter(self):
-        # empty set is falsy -> `if not pack_set` -> always passes
-        assert _node_passes({"pack_id": "p1"}, set(), False) is True
-        assert _edge_passes({"pack_id": "p1"}, False, False, set()) is True
+    def test_empty_pack_ids_set_treated_as_nothing_passes(self):
+        # issue #147 §3.4(a): None ("no filter") and an empty set ("nothing
+        # is visible") no longer collapse to the same "always passes"
+        # behaviour -- an empty pack_set now excludes everything.
+        assert _node_passes({"pack_id": "p1"}, set(), False) is False
+        assert _edge_passes({"pack_id": "p1"}, False, False, set()) is False
 
     def test_none_props_node_passes(self):
         assert _node_passes({}, {"p1"}, True) is True

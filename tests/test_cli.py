@@ -487,7 +487,7 @@ class TestIngest:
 class TestQuery:
     # --- Normal ---
     def test_human_output_no_results_on_empty_store(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         result = runner.invoke(main, ["query", "anything at all"])
         assert result.exit_code == 0
@@ -496,8 +496,23 @@ class TestQuery:
     def test_human_output_finds_ingested_result(
         self, bootstrapped, cli_env, runner, mock_vector_store
     ):
+        # #147: reads are scoped to packs the caller owns/may read (DESIGN.md
+        # §3.2/§3.10, invariant 5) -- a pack-less ingest ("effective_pack"
+        # None, per opencrab/cli.py::ingest) is now invisible to every read
+        # scope, including the ingester's own, until #148 assigns write
+        # ownership. To keep exercising "ingest then find it via query" (the
+        # thing this test is actually about) rather than the now-orthogonal
+        # "unpackaged data is invisible" behaviour, ingest into a pack the
+        # bootstrapped principal owns.
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        create_pack(make_sql_store(get_settings()), bootstrapped, "pack-a", title="Pack A")
         (cli_env / "doc.txt").write_text("the quick brown fox jumps")
-        assert runner.invoke(main, ["ingest", str(cli_env / "doc.txt")]).exit_code == 0
+        assert runner.invoke(
+            main, ["ingest", str(cli_env / "doc.txt"), "--pack-id", "pack-a"]
+        ).exit_code == 0
 
         result = runner.invoke(main, ["query", "the quick brown fox jumps"])
         assert result.exit_code == 0
@@ -505,7 +520,7 @@ class TestQuery:
 
     # --- Edge: three output formats / legacy shape contract ---
     def test_legacy_json_output_is_a_bare_list(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         """Contract per code comment (cli.py ~496): --json-output alone must
         stay a bare JSON list (legacy shape), never wrapped in an envelope."""
@@ -515,7 +530,7 @@ class TestQuery:
         assert isinstance(parsed, list)
         assert parsed == []
 
-    def test_json_envelope_shape(self, cli_env, runner, mock_vector_store):
+    def test_json_envelope_shape(self, bootstrapped, cli_env, runner, mock_vector_store):
         result = runner.invoke(main, ["query", "zzz no match", "--json-envelope"])
         assert result.exit_code == 0
         envelope = json.loads(result.output)
@@ -530,7 +545,7 @@ class TestQuery:
         assert envelope["total"] == 0
 
     def test_json_envelope_takes_priority_over_json_output(
-        self, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, runner, mock_vector_store
     ):
         """When both flags are given, --json-envelope wins (envelope dict,
         not a bare list) per the ``if json_output and not json_envelope``
@@ -570,20 +585,42 @@ class TestManifest:
 
 class TestPacksListShow:
     # --- Normal ---
-    def test_list_shows_registered_packs(self, cli_env, runner):
+    def test_list_shows_registered_packs(self, bootstrapped, cli_env, runner):
         _write_pack_manifest(
             cli_env, "demo-pack", title="Demo Pack", version="1.0.0",
             counts={"nodes": 3, "edges": 2},
         )
+        # #147: `packs list` now filters the on-disk manifest registry down
+        # to the caller's readable scope, so writing the manifest alone is
+        # no longer sufficient -- the bootstrapped principal must also own
+        # this pack_id in the `packs` ownership registry, or it is filtered
+        # out exactly like someone else's private pack would be.
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        create_pack(sql, bootstrapped, "demo-pack", title="Demo Pack")
+
         result = runner.invoke(main, ["packs", "list"])
         assert result.exit_code == 0
         assert "demo-pack" in result.output
         assert "Demo Pack" in result.output
 
-    def test_show_prints_manifest_json(self, cli_env, runner):
+    def test_show_prints_manifest_json(self, bootstrapped, cli_env, runner):
         _write_pack_manifest(
             cli_env, "demo-pack", title="Demo Pack", version="1.0.0",
         )
+        # #147: `packs show` treats a pack outside the caller's scope the
+        # same as a nonexistent one, so the bootstrapped principal must own
+        # this pack_id for the show to succeed.
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        create_pack(sql, bootstrapped, "demo-pack", title="Demo Pack")
+
         result = runner.invoke(main, ["packs", "show", "demo-pack"])
         assert result.exit_code == 0
         info = json.loads(result.output)
@@ -591,13 +628,13 @@ class TestPacksListShow:
         assert info["title"] == "Demo Pack"
 
     # --- Edge ---
-    def test_list_empty_registry_reports_none_found(self, cli_env, runner):
+    def test_list_empty_registry_reports_none_found(self, bootstrapped, cli_env, runner):
         result = runner.invoke(main, ["packs", "list"])
         assert result.exit_code == 0
         assert "No packs under" in result.output
 
     # --- Error ---
-    def test_show_unknown_pack_id_exits_nonzero(self, cli_env, runner):
+    def test_show_unknown_pack_id_exits_nonzero(self, bootstrapped, cli_env, runner):
         result = runner.invoke(main, ["packs", "show", "nonexistent-pack"])
         assert result.exit_code != 0
         assert "not found" in result.output
@@ -881,7 +918,7 @@ class TestPackCommandWiring:
     """
 
     # --- Normal ---
-    def test_export_neo4j_pack_passes_options_through(self, cli_env, runner):
+    def test_export_neo4j_pack_passes_options_through(self, bootstrapped, cli_env, runner):
         with patch("opencrab.pack.export_neo4j_opencrab_ingest") as fake:
             fake.return_value = {"nodes": 0, "edges": 0}
             result = runner.invoke(main, [
@@ -892,10 +929,14 @@ class TestPackCommandWiring:
         assert result.exit_code == 0, result.output
         _store, output = fake.call_args.args
         assert output == str(cli_env / "out.jsonl")
+        # #147: export-neo4j-pack now derives the bootstrapped principal's
+        # readable scope and passes it through as a required `scope` kwarg.
+        # This principal owns no packs, so its scope is the empty frozenset.
         assert fake.call_args.kwargs == {
-            "pack_id": "p1", "node_limit": 7, "edge_limit": 9}
+            "pack_id": "p1", "node_limit": 7, "edge_limit": 9,
+            "scope": frozenset()}
 
-    def test_export_neo4j_pack_defaults(self, cli_env, runner):
+    def test_export_neo4j_pack_defaults(self, bootstrapped, cli_env, runner):
         """기본값이 조용히 바뀌면 운영 산출물의 크기 상한이 달라진다."""
         with patch("opencrab.pack.export_neo4j_opencrab_ingest") as fake:
             fake.return_value = {}
@@ -904,7 +945,8 @@ class TestPackCommandWiring:
 
         assert result.exit_code == 0, result.output
         assert fake.call_args.kwargs == {
-            "pack_id": None, "node_limit": 500_000, "edge_limit": 1_000_000}
+            "pack_id": None, "node_limit": 500_000, "edge_limit": 1_000_000,
+            "scope": frozenset()}
 
     def test_assemble_pack_v1_passes_options_through(self, cli_env, runner):
         src = cli_env / "staging"

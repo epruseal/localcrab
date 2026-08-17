@@ -66,6 +66,7 @@ from collections.abc import Callable
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
+from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._vector_base import (
     default_metadatas,
     embed_and_validate,
@@ -495,6 +496,25 @@ def _build_where_sql(
                 if op == "$in":
                     if not operand:
                         clauses.append("FALSE")
+                    elif key == "pack_id":
+                        # issue #147 §3.4(c): pack_id's $in is where
+                        # readable_pack_ids(principal) — every non-private
+                        # pack in the deployment, unbounded by anything the
+                        # caller controls — actually lands, via
+                        # _build_chroma_where. The generic per-value `IN
+                        # (:w1, :w2, ...)` branch below would bind one
+                        # parameter per pack; at deployment scale that risks
+                        # the same "too many bind parameters" failure mode
+                        # the graph/doc stores' `in_string_array` conversion
+                        # exists to avoid (see _sql_dialect.py). One array
+                        # bind (`= ANY(CAST(:w AS text[]))`) sidesteps it
+                        # regardless of scope size — reusing
+                        # POSTGRES.in_string_array for the SQL text keeps
+                        # this in sync with the graph/doc stores' identical
+                        # array-bind form instead of hand-duplicating it.
+                        name = bind([str(v) for v in operand])
+                        frag, _transform = POSTGRES.in_string_array(expr, name)
+                        clauses.append(frag)
                     else:
                         names = [bv(v) for v in operand]
                         clauses.append(f"{expr} IN ({', '.join(names)})")

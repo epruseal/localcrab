@@ -101,6 +101,62 @@ def infer_pack_id(item: dict[str, Any] | None) -> str | None:
     return None
 
 
+def scope_pack_id(item: dict[str, Any] | None) -> str | None:
+    """The pack_id an item ACTUALLY carries, with no inference (#147).
+
+    Strictly ``metadata.pack_id`` -> ``properties.pack_id`` -> ``pack_id``.
+    Unlike ``infer_pack_id`` it never falls back to reading a pack id out
+    of ``source_path`` / ``source_id`` / ``node_id`` via the
+    ``/packs/<id>/`` pattern, because those fields are user-written and an
+    authorization predicate must not be something the caller can author.
+    That is the same class of trap as the ``pack_id = X OR source = X OR
+    source_id = X`` predicate in ``_sql_graph_base._export_nodes_where``,
+    which #143 records as unusable for authorization for exactly this
+    reason.
+
+    Falsy values (``""``, ``0``, ``False``) are "no pack_id", matching
+    ``opencrab/stores/_graph_common.py``'s ``_node_pack_id`` and the SQL
+    side's ``json_truthy_text`` so the three agree row for row.
+    """
+    if not item:
+        return None
+    for container in ("metadata", "properties"):
+        value = item.get(container) if isinstance(item, dict) else None
+        if isinstance(value, dict):
+            pid = value.get("pack_id")
+            if pid:
+                return str(pid)
+    pid = item.get("pack_id") if isinstance(item, dict) else None
+    return str(pid) if pid else None
+
+
+def in_pack_scope(
+    item: dict[str, Any] | None,
+    allowed: set[str] | frozenset[str],
+) -> bool:
+    """Authorization-grade membership test for a read result (#147).
+
+    The Python counterpart of the scoped SQL predicate, and the only pack
+    check a read path may use. Three rules, none of which
+    ``matches_pack_filter`` implements:
+
+    1. An EMPTY ``allowed`` means nothing passes. ``matches_pack_filter``
+       reads an empty filter as "no filter, pass everything", which for a
+       principal who may read no pack would expose the whole corpus.
+    2. An item with no pack_id never passes. Data belonging to no pack is
+       outside every read scope (#143 invariant 5); there is no
+       ``include_unpackaged`` escape here on purpose.
+    3. The pack_id is read with ``scope_pack_id``, so a caller cannot
+       forge membership through ``source_id``.
+    """
+    if not allowed:
+        return False
+    pid = scope_pack_id(item)
+    if pid is None:
+        return False
+    return pid in allowed
+
+
 def matches_pack_filter(
     item: dict[str, Any] | None,
     pack_ids: list[str] | tuple[str, ...] | set[str] | None,
@@ -111,6 +167,14 @@ def matches_pack_filter(
     - If ``pack_ids`` is empty/None, always pass.
     - Otherwise, the inferred pack_id must be in the set.
     - Items with no inferable pack_id only pass when ``include_unpackaged`` is True.
+
+    NOT AN AUTHORIZATION CHECK -- use ``in_pack_scope`` on any read path
+    (#147). This function fails open on an empty filter and resolves the
+    pack id through ``infer_pack_id``, which will read one out of
+    caller-written ``source_id`` / ``source_path``. Both properties are
+    fine for its remaining users (pack export and backfill, which are
+    asking "does this row belong to the pack I am packaging", not "may
+    this caller see it") and disqualifying for a permission decision.
     """
     if not pack_ids:
         return True

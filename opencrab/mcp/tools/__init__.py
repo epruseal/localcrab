@@ -164,6 +164,30 @@ def _clean_meta(meta: dict[str, Any]) -> dict[str, Any]:
 # These are populated by _get_context() which is called on first tool use.
 # This design avoids importing heavy dependencies at module load time.
 
+def _current_read_scope(ctx: dict[str, Any]) -> frozenset[str]:
+    """The calling principal's readable pack set, for this request (#147).
+
+    One line, but it lives here rather than being inlined in each handler
+    for the same reason ``_get_context`` does: every read tool must derive
+    its filter from the SAME place, and a handler that grew its own
+    variation is how "this one entry point forgot to scope" happens.
+
+    Deliberately not cached. Scope is per principal and reflects pack
+    visibility at call time; a stale entry would keep serving a pack after
+    it was un-published.
+
+    Exceptions propagate. A handler that cannot determine its scope must
+    fail its call -- there is no safe default here, since the two
+    candidates are "show nothing" (hides the caller's own data behind what
+    reads as a permission decision) and "show everything" (the fail-open
+    this whole execution exists to close).
+    """
+    from opencrab.auth import current_principal
+    from opencrab.pack.read_scope import read_scope
+
+    return read_scope(ctx["sql"], current_principal())
+
+
 _context: dict[str, Any] = {}
 
 
@@ -280,6 +304,7 @@ __all__ = [
     "_clean_meta",
     "_clean_str",
     "_context",
+    "_current_read_scope",
     "_get_context",
     "_ingest_into_pack",
     "_lock_data_dir",

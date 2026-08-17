@@ -79,6 +79,15 @@ _CHANGE_TYPE_IMPACTS: dict[str, list[str]] = {
 }
 
 
+class _LeverOutOfScopeError(Exception):
+    """Internal control-flow signal: the lever is outside the read scope.
+
+    Raised and caught inside ``lever_simulate`` only. Its whole job is to
+    reach the same empty-result state an unknown lever_id reaches, without a
+    parallel branch that could later be given different behaviour.
+    """
+
+
 class ImpactEngine:
     """Analyses the blast radius of ontology changes."""
 
@@ -91,6 +100,8 @@ class ImpactEngine:
         node_id: str,
         change_type: str = "update",
         depth: int = 2,
+        *,
+        pack_ids: list[str],
     ) -> ImpactResult:
         """
         Compute the impact of a change to *node_id*.
@@ -103,6 +114,18 @@ class ImpactEngine:
             Nature of the change (create, update, delete, permission_change, etc.).
         depth:
             Graph traversal depth for finding affected neighbours.
+        pack_ids:
+            REQUIRED (#147). The caller's readable pack scope. The anchor is
+            resolved WITHIN it and the traversal is bounded BY it.
+
+            An anchor outside the scope produces a response byte-identical
+            to one for a node that does not exist (#143 invariant 7). That
+            falls out of the two lookups rather than from a special branch:
+            ``get_node_by_id_scoped`` returns None for both, and
+            ``find_neighbors`` returns [] for both (its anchor must pass the
+            same pack filter). A dedicated "not permitted" branch would be a
+            second code path free to drift from the "not found" one -- and
+            drift here is exactly how existence leaks back in.
 
         Returns
         -------
@@ -123,7 +146,14 @@ class ImpactEngine:
         # fallback). See opencrab/stores/_graph_protocol.py.
         if self._neo4j.available:
             try:
-                node = self._neo4j.get_node_by_id(node_id)
+                # #147: the scoped lookup, not get_node_by_id + a Python
+                # check afterwards. get_node_by_id matches on node_id alone
+                # (the PK is (node_type, node_id)), so a homonym in another
+                # pack can be the row it returns -- filtering after the fact
+                # would then answer "no such node" for a node the caller
+                # really does have. The pack predicate has to run before the
+                # LIMIT, not after it.
+                node = self._neo4j.get_node_by_id_scoped(node_id, pack_ids)
                 if node:
                     result.node_type = node.get("node_type")
                     result.space = (
@@ -159,6 +189,8 @@ class ImpactEngine:
                     direction="both",
                     depth=depth,
                     limit=50,
+                    pack_ids=pack_ids,
+                    include_unpackaged=False,
                 )
                 result.affected_nodes = neighbours[:20]  # cap output size
 
@@ -214,6 +246,8 @@ class ImpactEngine:
         lever_id: str,
         direction: str,
         magnitude: float,
+        *,
+        pack_ids: list[str],
     ) -> dict[str, Any]:
         """
         Simulate the downstream effects of moving a lever.
@@ -226,10 +260,19 @@ class ImpactEngine:
             "raises", "lowers", "stabilizes", or "optimizes".
         magnitude:
             Numeric strength of the lever action (0.0–1.0 scale recommended).
+        pack_ids:
+            REQUIRED (#147). The caller's readable pack scope. A lever
+            outside it is treated as absent, producing the same empty
+            outcome/concept lists an unknown lever_id produces.
 
-        Returns
-        -------
-        dict describing predicted outcome changes.
+            ``find_by_relations`` has no pack parameter and matches on
+            node_id alone, so its results are filtered here in Python. That
+            is applied AFTER the store's LIMIT, which costs recall (a lever
+            with more than 20 out-edges may lose readable ones to
+            unreadable ones ahead of them) but cannot leak: every surviving
+            row passed the scope check. #143 classifies this
+            limit-then-filter shape as a recall defect, not an
+            authorization one.
         """
         valid_directions = {"raises", "lowers", "stabilizes", "optimizes"}
         if direction not in valid_directions:
@@ -250,10 +293,22 @@ class ImpactEngine:
         # `labels(o)[0]` value exactly). See opencrab/stores/_graph_protocol.py.
         if self._neo4j.available:
             try:
+                from opencrab.ontology.pack_provenance import in_pack_scope
+
+                pack_set = set(pack_ids)
+                # #147: gate on the anchor first. An unreadable lever must
+                # look exactly like an absent one, and an absent one reaches
+                # the same empty lists by returning no relations.
+                anchor = self._neo4j.get_node_by_id_scoped(lever_id, pack_ids)
+                if anchor is None:
+                    raise _LeverOutOfScopeError
+
                 # Outcome 탐색: lever → (raises|lowers|stabilizes|optimizes) → outcome
                 _lever_relations = ["raises", "lowers", "stabilizes", "optimizes"]
                 for r in self._neo4j.find_by_relations(lever_id, _lever_relations, "out", 20):
                     props = r.get("properties") or {}
+                    if not in_pack_scope({"properties": props}, pack_set):
+                        continue
                     rel = r.get("relation_type", "")
                     outcomes.append({
                         "node_id": props.get("id", "?"),
@@ -265,10 +320,16 @@ class ImpactEngine:
                 # Concept 탐색: lever → affects → concept
                 for r in self._neo4j.find_by_relations(lever_id, ["affects"], "out", 10):
                     props = r.get("properties") or {}
+                    if not in_pack_scope({"properties": props}, pack_set):
+                        continue
                     concepts.append({
                         "node_id": props.get("id", "?"),
                         "node_type": (r.get("labels") or ["Concept"])[0],
                     })
+            except _LeverOutOfScopeError:
+                # Not an error: the lever is not readable, so it has no
+                # readable relations. Same state as an unknown lever_id.
+                pass
             except Exception as exc:
                 logger.debug("Lever simulation graph query error: %s", exc)
 

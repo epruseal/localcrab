@@ -14,6 +14,14 @@ import pytest
 
 from opencrab.services.canonical_ids import enrich
 
+# #147: enrich()/_Resolver now require a pack_ids scope and route lookups
+# through get_node_by_id_scoped(node_id, pack_ids) instead of
+# get_node_by_id(node_id). FakeGraph is a plain id->props stub (it doesn't
+# implement scope filtering itself), so the exact contents of PACK_IDS don't
+# matter to these tests -- only that a scope is supplied, matching the new
+# call shape.
+PACK_IDS = ["p1"]
+
 
 class FakeGraph:
     """node_id -> props 매핑만 갖는 최소 store 스텁."""
@@ -23,7 +31,7 @@ class FakeGraph:
         self._nodes = nodes
         self.calls: list[str] = []
 
-    def get_node_by_id(self, node_id):
+    def get_node_by_id_scoped(self, node_id, pack_ids):
         self.calls.append(node_id)
         return self._nodes.get(node_id)
 
@@ -51,7 +59,7 @@ DOCUMENT = {
 def test_existing_node_resolves_to_store_values():
     graph = FakeGraph({"claude/tdm/abc": TEXT_UNIT})
     results = [{"source": "vector", "node_id": "claude/tdm/abc", "metadata": {}}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"] == {
         "resolved": True,
         "node_id": "claude/tdm/abc",
@@ -67,7 +75,7 @@ def test_missing_node_is_unresolved_not_substituted():
     """store에 유사한 id가 있어도 절대 치환하지 않는다."""
     graph = FakeGraph({"claude/tdm/abc": TEXT_UNIT})
     results = [{"source": "vector", "node_id": "claude/tdm/ab", "metadata": {}}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"] == {
         "resolved": False,
         "reason": "node_not_found",
@@ -82,7 +90,7 @@ def test_missing_node_is_unresolved_not_substituted():
 def test_missing_node_id_is_reported(empty):
     graph = FakeGraph({})
     results = [{"source": "bm25", "node_id": empty}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"] == {"resolved": False, "reason": "missing_node_id"}
     assert graph.calls == []
 
@@ -91,7 +99,7 @@ def test_document_id_comes_from_props_only():
     node = {**TEXT_UNIT, "source_id": "resource:session:1", "source": "/tmp/x.md"}
     graph = FakeGraph({"claude/tdm/abc": node})
     results = [{"node_id": "claude/tdm/abc"}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     canonical = results[0]["canonical"]
     assert canonical["document_id"] == "resource:session:1"
     assert "unresolved_fields" not in canonical
@@ -101,7 +109,7 @@ def test_file_path_source_is_not_promoted_to_document_id():
     node = {**TEXT_UNIT, "source": "/home/asdf/docs/x.md"}
     graph = FakeGraph({"claude/tdm/abc": node})
     results = [{"node_id": "claude/tdm/abc"}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"]["document_id"] is None
     assert results[0]["canonical"]["unresolved_fields"] == ["document_id"]
 
@@ -110,7 +118,7 @@ def test_missing_pack_id_is_flagged():
     node = {"id": "legacy", "node_type": "Concept", "space": "concept"}
     graph = FakeGraph({"legacy": node})
     results = [{"node_id": "legacy"}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"]["pack_id"] is None
     assert "pack_id" in results[0]["canonical"]["unresolved_fields"]
 
@@ -138,7 +146,7 @@ def test_edge_endpoints_resolve_source_relation_target():
     item = _graph_result(
         1, {"from_id": "resource:session:1", "to_id": "claude/tdm/abc"}
     )
-    enrich(graph, [item])
+    enrich(graph, [item], pack_ids=PACK_IDS)
     edge = item["graph_context"]["edge"]
     assert edge["resolved"] is True
     assert edge["relation"] == "contains"
@@ -156,7 +164,7 @@ def test_edge_at_depth_two_does_not_use_anchor_as_source():
         {"from_id": "resource:session:1", "to_id": "claude/tdm/abc"},
         anchor="some:other:anchor",
     )
-    enrich(graph, [item])
+    enrich(graph, [item], pack_ids=PACK_IDS)
     edge = item["graph_context"]["edge"]
     assert edge["source"]["node_id"] == "resource:session:1"
     assert edge["source"]["node_id"] != item["graph_context"]["anchor_id"]
@@ -165,7 +173,7 @@ def test_edge_at_depth_two_does_not_use_anchor_as_source():
 def test_edge_without_store_endpoints_is_unresolved():
     graph = FakeGraph({"claude/tdm/abc": TEXT_UNIT})
     item = _graph_result(1)
-    enrich(graph, [item])
+    enrich(graph, [item], pack_ids=PACK_IDS)
     assert item["graph_context"]["edge"] == {
         "resolved": False,
         "reason": "edge_endpoints_unavailable",
@@ -175,7 +183,7 @@ def test_edge_without_store_endpoints_is_unresolved():
 def test_edge_with_dangling_endpoint_is_unresolved():
     graph = FakeGraph({"claude/tdm/abc": TEXT_UNIT})
     item = _graph_result(1, {"from_id": "ghost:1", "to_id": "claude/tdm/abc"})
-    enrich(graph, [item])
+    enrich(graph, [item], pack_ids=PACK_IDS)
     edge = item["graph_context"]["edge"]
     assert edge["resolved"] is False
     assert edge["reason"] == "endpoint_not_found"
@@ -185,7 +193,7 @@ def test_edge_with_dangling_endpoint_is_unresolved():
 def test_resolve_edges_false_skips_edge_block():
     graph = FakeGraph({"claude/tdm/abc": TEXT_UNIT})
     item = _graph_result(1, {"from_id": "claude/tdm/abc", "to_id": "claude/tdm/abc"})
-    enrich(graph, [item], resolve_edges=False)
+    enrich(graph, [item], resolve_edges=False, pack_ids=PACK_IDS)
     assert "edge" not in item["graph_context"]
     assert item["canonical"]["resolved"] is True
 
@@ -205,7 +213,7 @@ def test_existing_keys_are_untouched():
         "relation_type": item["graph_context"]["relation_type"],
         "depth": item["graph_context"]["depth"],
     }
-    enrich(graph, [item])
+    enrich(graph, [item], pack_ids=PACK_IDS)
     assert item["source"] == before["source"]
     assert item["node_id"] == before["node_id"]
     assert item["graph_context"]["anchor_id"] == before["anchor_id"]
@@ -219,7 +227,7 @@ def test_lookups_are_memoised_per_call():
         _graph_result(1, {"from_id": "resource:session:1", "to_id": "claude/tdm/abc"})
         for _ in range(5)
     ]
-    enrich(graph, items)
+    enrich(graph, items, pack_ids=PACK_IDS)
     assert sorted(set(graph.calls)) == ["claude/tdm/abc", "resource:session:1"]
     assert len(graph.calls) == 2
 
@@ -227,7 +235,7 @@ def test_lookups_are_memoised_per_call():
 def test_unavailable_graph_is_a_noop():
     graph = FakeGraph({}, available=False)
     results = [{"node_id": "claude/tdm/abc"}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results == [{"node_id": "claude/tdm/abc"}]
     assert graph.calls == []
 
@@ -235,9 +243,9 @@ def test_unavailable_graph_is_a_noop():
 def test_store_exception_degrades_to_unresolved():
     graph = MagicMock()
     graph.available = True
-    graph.get_node_by_id.side_effect = RuntimeError("store down")
+    graph.get_node_by_id_scoped.side_effect = RuntimeError("store down")
     results = [{"node_id": "claude/tdm/abc"}]
-    enrich(graph, results)
+    enrich(graph, results, pack_ids=PACK_IDS)
     assert results[0]["canonical"]["reason"] == "node_not_found"
 
 

@@ -245,7 +245,8 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     def keyword_search(
         self,
         query: str,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
         limit: int = 20,
         spaces: list[str] | None = None,
@@ -260,17 +261,52 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         ``spaces`` (issue #52): strict space-membership filter pushed into
         the SQL WHERE clause (``json_extract(s.metadata, '$.space')``, via
         ``self._dialect.json_get`` — the same extractor the graph store's
-        pack filter uses), not a Python post-filter. ``doc_sources`` has no
-        dedicated ``space`` column (only ``doc_nodes`` does), so this reads
-        it out of the JSON ``metadata`` blob the same way ``pack_id`` is
-        currently read there — but unlike the pack filter below (a Python
-        post-filter over an overfetched candidate set, an established,
-        pre-existing pattern in this method), ``spaces`` is applied ahead of
-        ``LIMIT`` to avoid the same limit-before-filter starvation class
-        issue #62 fixed for the graph store. No "include unspaced" mode,
-        matching the BM25/vector legs' strict semantics.
+        pack filter uses), not a Python post-filter.
+
+        PACK FILTER (issue #147 §3.6, rewritten from a Python post-filter to
+        SQL): the OLD implementation lazily imported
+        ``opencrab.ontology.pack_provenance.matches_pack_filter`` inside this
+        method, applied it AFTER an overfetch (``max(1, limit) * 5`` rows),
+        and treated an import failure as "no filter" (``matches_pack_filter
+        = None`` → every overfetched row passed) -- a fail-OPEN fallback on
+        top of a filter (``matches_pack_filter``/``infer_pack_id``) that
+        also inferred ``pack_id`` from ``source_path``/``source_id`` regex
+        matches, which is spoofable by anything that can set its own
+        metadata. Both are gone: the predicate is now
+        ``json_truthy_text(s.metadata,'pack_id') IN <array bind>`` (via
+        ``self._dialect.in_string_array`` -- ``_sql_dialect.py``), pushed
+        into the SAME WHERE clause as ``spaces``, ahead of ``LIMIT`` -- so
+        the ``* 5`` overfetch is also gone: every row that reaches ``LIMIT``
+        already matched every filter, nothing needs a second Python pass.
+
+        ``pack_ids`` has NO DEFAULT (every authorized caller must supply a
+        concrete scope) -- empty ``pack_ids`` returns ``[]`` WITHOUT
+        querying, never "everything". ``include_unpackaged`` is ACCEPTED but
+        IGNORED under this predicate: ``json_truthy_text`` returns SQL NULL
+        for a missing/falsy pack_id, and NULL never satisfies ``IN``
+        membership on any dialect -- there is no "OR pack_id IS NULL" branch
+        to gate, because an authorized read-scope caller must never see
+        unpackaged rows regardless (invariant 5; the old post-filter's
+        escape hatch has no equivalent once that post-filter is gone). Kept
+        in the signature only so an existing caller passing it does not
+        immediately ``TypeError``.
+
+        ERROR PROPAGATION (issue #147 §3.4(c)): unlike the old version, a
+        failure in this query is NOT swallowed. The old broad
+        ``except Exception: logger.warning(...); return []`` existed for a
+        malformed FTS5 MATCH expression, but the MATCH text here is built
+        exclusively from ``\\w+``-only tokens (see above) -- it can never
+        contain an FTS5 operator or unescaped quote, so that failure mode
+        was never actually reachable through this method's public
+        parameters. Removing the swallow means a genuine pack-predicate/bind
+        error (a bug) surfaces as an exception instead of silently becoming
+        an empty search leg -- the same class of "oh no exception → 0
+        results, unnoticed" swallow issue #147 §3.4(c) closes for the
+        vector/graph legs.
         """
         if not self._available or not self._fts_ok or not self._conn:
+            return []
+        if not pack_ids:
             return []
         import re
 
@@ -285,29 +321,21 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             placeholders = ",".join("?" for _ in spaces)
             where_sql += f" AND {space_expr} IN ({placeholders})"
             params.extend(spaces)
-        params.append(max(1, limit) * 5)  # pack 필터 대비 overfetch
-        try:
-            rows = self._conn.execute(
-                "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
-                "bm25(doc_sources_fts) AS rank "
-                "FROM doc_sources_fts f JOIN doc_sources s ON s.source_id = f.source_id "
-                f"{where_sql} ORDER BY rank LIMIT ?",
-                params,
-            ).fetchall()
-        except Exception as exc:
-            logger.warning("keyword_search failed: %s", exc)
-            return []
-        try:
-            from opencrab.ontology.pack_provenance import matches_pack_filter
-        except Exception:
-            matches_pack_filter = None  # type: ignore
+        pack_expr = self._dialect.json_truthy_text("s.metadata", "pack_id")
+        pack_frag, transform = self._dialect.in_string_array(pack_expr, "?")
+        where_sql += f" AND {pack_frag}"
+        params.append(transform(sorted(set(pack_ids))))
+        params.append(max(1, limit))  # avoid binding a non-positive LIMIT
+        rows = self._conn.execute(
+            "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
+            "bm25(doc_sources_fts) AS rank "
+            "FROM doc_sources_fts f JOIN doc_sources s ON s.source_id = f.source_id "
+            f"{where_sql} ORDER BY rank LIMIT ?",
+            params,
+        ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             meta = json.loads(r["meta"]) if r["meta"] else {}
-            if matches_pack_filter is not None and not matches_pack_filter(
-                {"metadata": meta}, pack_ids, include_unpackaged
-            ):
-                continue
             out.append({
                 "source_id": r["sid"],
                 "node_id": meta.get("node_id") or r["sid"],

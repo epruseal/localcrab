@@ -34,14 +34,25 @@ def hybrid(local_store: LocalGraphStore) -> HybridQuery:
     return HybridQuery(chroma, local_store)
 
 
+_PACK_ID = "p1"  # single shared pack across this file's fixtures (issue #147:
+# search_nodes now requires a concrete, non-empty pack_ids scope and only
+# returns rows whose properties carry a matching pack_id -- these tests are
+# about keyword matching / case-insensitivity / space filtering / limit, not
+# about pack scoping, so every inserted node is tagged with the same pack and
+# every keyword_search call passes that pack's id, keeping the pack predicate
+# a true no-op for the behaviour under test instead of leaving pack_ids
+# required-but-untested.
+
+
 def _insert_node(
     store: LocalGraphStore,
     node_type: str,
     node_id: str,
     props: dict,
     space_id: str | None = None,
+    pack_id: str = _PACK_ID,
 ) -> None:
-    store.upsert_node(node_type, node_id, props, space_id=space_id)
+    store.upsert_node(node_type, node_id, {**props, "pack_id": pack_id}, space_id=space_id)
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +65,7 @@ def test_keyword_match_name_field(hybrid: HybridQuery, local_store: LocalGraphSt
     _insert_node(local_store, "Concept", "node-1", {"name": "machine learning", "description": "AI subfield"})
     _insert_node(local_store, "Concept", "node-2", {"name": "deep sea fishing"})
 
-    results = hybrid.keyword_search("machine learning")
+    results = hybrid.keyword_search("machine learning", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     assert results[0]["node"]["name"] == "machine learning"
@@ -66,7 +77,7 @@ def test_keyword_match_description_field(hybrid: HybridQuery, local_store: Local
     _insert_node(local_store, "Doc", "doc-1", {"name": "alpha", "description": "contains the term ontology"})
     _insert_node(local_store, "Doc", "doc-2", {"name": "beta", "description": "irrelevant content"})
 
-    results = hybrid.keyword_search("ontology")
+    results = hybrid.keyword_search("ontology", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     assert results[0]["node"]["name"] == "alpha"
@@ -78,12 +89,12 @@ def test_keyword_case_insensitive(hybrid: HybridQuery, local_store: LocalGraphSt
     _insert_node(local_store, "Entity", "e-2", {"name": "vector store"})
 
     # 소문자로 검색해도 대소문자 혼합 name 노드가 일치해야 함
-    results_lower = hybrid.keyword_search("graphdatabase")
+    results_lower = hybrid.keyword_search("graphdatabase", pack_ids=[_PACK_ID])
     assert len(results_lower) == 1
     assert results_lower[0]["node"]["name"] == "GraphDatabase"
 
     # 대문자로 검색해도 소문자 name 노드가 일치해야 함
-    results_upper = hybrid.keyword_search("VECTOR")
+    results_upper = hybrid.keyword_search("VECTOR", pack_ids=[_PACK_ID])
     assert len(results_upper) == 1
     assert results_upper[0]["node"]["name"] == "vector store"
 
@@ -94,7 +105,7 @@ def test_keyword_space_filter(hybrid: HybridQuery, local_store: LocalGraphStore)
     _insert_node(local_store, "Node", "n-policy", {"name": "policy node", "space": "policy"}, space_id="policy")
 
     # "node" 키워드는 두 노드 모두 매칭되지만 space="claim"으로 필터
-    results = hybrid.keyword_search("node", spaces=["claim"])
+    results = hybrid.keyword_search("node", pack_ids=[_PACK_ID], spaces=["claim"])
 
     assert len(results) == 1
     assert results[0]["node"]["space"] == "claim"
@@ -106,7 +117,7 @@ def test_keyword_space_filter_multiple_spaces(hybrid: HybridQuery, local_store: 
     _insert_node(local_store, "Node", "n-b", {"name": "beta item", "space": "policy"}, space_id="policy")
     _insert_node(local_store, "Node", "n-c", {"name": "gamma item", "space": "other"}, space_id="other")
 
-    results = hybrid.keyword_search("item", spaces=["claim", "policy"])
+    results = hybrid.keyword_search("item", pack_ids=[_PACK_ID], spaces=["claim", "policy"])
 
     returned_spaces = {r["node"]["space"] for r in results}
     assert returned_spaces == {"claim", "policy"}
@@ -118,7 +129,7 @@ def test_keyword_limit(hybrid: HybridQuery, local_store: LocalGraphStore) -> Non
     for i in range(10):
         _insert_node(local_store, "Item", f"item-{i}", {"name": f"target item {i}"})
 
-    results = hybrid.keyword_search("target", limit=3)
+    results = hybrid.keyword_search("target", pack_ids=[_PACK_ID], limit=3)
 
     assert len(results) == 3
 
@@ -127,14 +138,14 @@ def test_keyword_no_match(hybrid: HybridQuery, local_store: LocalGraphStore) -> 
     """일치하는 노드가 없으면 빈 리스트를 반환한다."""
     _insert_node(local_store, "Node", "x-1", {"name": "completely unrelated"})
 
-    results = hybrid.keyword_search("zzz_nonexistent_keyword_zzz")
+    results = hybrid.keyword_search("zzz_nonexistent_keyword_zzz", pack_ids=[_PACK_ID])
 
     assert results == []
 
 
 def test_keyword_empty_store(hybrid: HybridQuery, local_store: LocalGraphStore) -> None:
     """노드가 없으면 빈 리스트를 반환한다."""
-    results = hybrid.keyword_search("anything")
+    results = hybrid.keyword_search("anything", pack_ids=[_PACK_ID])
 
     assert results == []
 
@@ -144,7 +155,7 @@ def test_keyword_match_text_field(hybrid: HybridQuery, local_store: LocalGraphSt
     _insert_node(local_store, "Doc", "d-1", {"name": "unrelated", "text": "The ontology defines concepts."})
     _insert_node(local_store, "Doc", "d-2", {"name": "also unrelated", "text": "No matching content here."})
 
-    results = hybrid.keyword_search("defines concepts")
+    results = hybrid.keyword_search("defines concepts", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     assert results[0]["node"]["text"] == "The ontology defines concepts."
@@ -173,7 +184,7 @@ def test_keyword_search_finds_matches_beyond_any_node_scan_cap(
     for i in range(5):
         _insert_node(local_store, "Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
 
-    results = hybrid.keyword_search("needle", limit=10)
+    results = hybrid.keyword_search("needle", pack_ids=[_PACK_ID], limit=10)
 
     assert len(results) == 5
     assert all("needle" in r["node"]["name"] for r in results)
@@ -193,7 +204,7 @@ def test_keyword_search_matches_non_ascii_case_insensitively(
     _insert_node(local_store, "Doc", "d-1", {"name": "Grundgesetz FÜR die Bundesrepublik"})
     _insert_node(local_store, "Doc", "d-2", {"name": "unrelated"})
 
-    results = hybrid.keyword_search("für")
+    results = hybrid.keyword_search("für", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     assert results[0]["node"]["name"] == "Grundgesetz FÜR die Bundesrepublik"
@@ -215,7 +226,7 @@ def test_keyword_search_tolerates_non_string_property_values(
     _insert_node(local_store, "Item", "n-float", {"name": 3.14159})
     _insert_node(local_store, "Item", "n-str", {"name": "unrelated text"})
 
-    results = hybrid.keyword_search("123")
+    results = hybrid.keyword_search("123", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     assert results[0]["node"]["name"] == 12345
@@ -225,7 +236,7 @@ def test_keyword_result_format(hybrid: HybridQuery, local_store: LocalGraphStore
     """반환 결과의 형식이 {'node': dict, 'label': str} 이어야 한다."""
     _insert_node(local_store, "Concept", "c-1", {"name": "knowledge graph"})
 
-    results = hybrid.keyword_search("knowledge")
+    results = hybrid.keyword_search("knowledge", pack_ids=[_PACK_ID])
 
     assert len(results) == 1
     result = results[0]

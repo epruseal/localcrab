@@ -163,6 +163,27 @@ class MongoStore:
         cursor = self._db["nodes"].find(query, {"_id": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
 
+    def list_nodes_scoped(
+        self, pack_ids: list[str], space: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped counterpart to ``list_nodes`` (issue #147
+        §3.5) -- see ``_SqlDocStoreBase.list_nodes_scoped``'s docstring for
+        the full rationale (same contract, Mongo query form). No ``.sort()``
+        here, matching ``list_nodes``' own lack of one -- this method does
+        not add an ordering guarantee ``list_nodes`` never had.
+
+        Empty ``pack_ids`` -> ``[]`` WITHOUT querying. ``limit <= 0`` ->
+        ``[]``, same guard ``list_nodes`` uses (issue #120 follow-up)."""
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+
+        query: dict[str, Any] = {"properties.pack_id": {"$in": list(pack_ids)}}
+        if space:
+            query["space"] = space
+        cursor = self._db["nodes"].find(query, {"_id": 0}).limit(limit)
+        return [dict(doc) for doc in cursor]
+
     def delete_node_doc(self, space: str, node_id: str) -> bool:
         """Delete a node document. Returns True if deleted."""
         self._require_available()

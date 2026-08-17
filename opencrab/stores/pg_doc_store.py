@@ -189,17 +189,45 @@ class PgDocStore(_SqlDocStoreBase):
     def keyword_search(
         self,
         query: str,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
         limit: int = 20,
         spaces: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """``spaces`` (issue #52): strict space-membership filter pushed into
-        the WHERE clause (``metadata->>'space' IN (...)``) ahead of LIMIT —
-        see ``LocalSQLDocStore.keyword_search``'s docstring for why this
-        differs from the pack filter below (an established Python
-        post-filter over an overfetched set)."""
+        the WHERE clause (``metadata->>'space' IN (...)``) ahead of LIMIT.
+
+        PACK FILTER (issue #147 §3.6, rewritten from a Python post-filter to
+        SQL -- mirrors ``LocalSQLDocStore.keyword_search``'s identical
+        rewrite; see its docstring for the full rationale). The OLD
+        implementation lazily imported ``matches_pack_filter``, applied it
+        AFTER an ``overfetch = max(1, limit) * 5`` rows, and fell back to
+        "no filter" on import failure. Both are gone: the predicate is now
+        ``json_truthy_text(metadata,'pack_id') = ANY(CAST(:packs AS
+        text[]))`` (via ``self._dialect.in_string_array``), pushed into the
+        SAME WHERE clause as ``spaces``, in BOTH query branches below
+        (short-token ILIKE and tsvector), ahead of ``LIMIT`` -- so the ``*
+        5`` overfetch is also gone; every row that reaches ``LIMIT`` already
+        matched every filter.
+
+        ``pack_ids`` has NO DEFAULT -- empty ``pack_ids`` returns ``[]``
+        WITHOUT querying. ``include_unpackaged`` is ACCEPTED but IGNORED:
+        ``json_truthy_text`` returns SQL NULL for a missing/falsy pack_id,
+        and NULL never satisfies ``= ANY(...)`` membership -- there is no
+        "OR pack_id IS NULL" branch to gate (same reasoning as
+        ``LocalSQLDocStore.keyword_search``). Kept in the signature only so
+        an existing caller passing it does not immediately ``TypeError``.
+
+        ERROR PROPAGATION: the OLD broad ``except Exception:
+        logger.warning(...); return []`` around the whole query is REMOVED
+        (issue #147 §3.4(c)) -- it used to swallow a genuine pack-predicate/
+        bind error into a silent empty search leg, the same "exception → 0
+        results, unnoticed" class closed for the vector/graph legs. A
+        real query error now propagates."""
         if not self._available or not self._kw_ok:
+            return []
+        if not pack_ids:
             return []
 
         toks = re.findall(r"\w+", query or "", flags=re.UNICODE)
@@ -207,7 +235,6 @@ class PgDocStore(_SqlDocStoreBase):
             return []
 
         short_token = any(len(t) < 3 for t in toks)
-        overfetch = max(1, limit) * 5
         table = self._table("doc_sources")
 
         space_where = ""
@@ -217,56 +244,51 @@ class PgDocStore(_SqlDocStoreBase):
             space_where = f" AND metadata->>'space' IN ({placeholders})"
             space_params = {f"sp{i}": s for i, s in enumerate(spaces)}
 
-        try:
-            with self._conn() as conn:
-                if short_token:
-                    conditions = " OR ".join(f"text ILIKE :t{i}" for i in range(len(toks)))
-                    params: dict[str, Any] = {
-                        f"t{i}": f"%{t}%" for i, t in enumerate(toks)
-                    }
-                    params.update({"qraw": query, "lim": overfetch, **space_params})
-                    rows = conn.execute(
-                        self._text(
-                            f"""
-                            SELECT source_id, text, metadata, similarity(text, :qraw) AS rank
-                            FROM {table}
-                            WHERE ({conditions}){space_where}
-                            ORDER BY rank DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        params,
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        self._text(
-                            f"""
-                            SELECT source_id, text, metadata,
-                                   ts_rank(to_tsvector('simple', text), plainto_tsquery('simple', :q)) AS rank
-                            FROM {table}
-                            WHERE to_tsvector('simple', text) @@ plainto_tsquery('simple', :q){space_where}
-                            ORDER BY rank DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"q": query, "lim": overfetch, **space_params},
-                    ).fetchall()
-        except Exception as exc:
-            logger.warning("keyword_search failed: %s", exc)
-            return []
+        pack_expr = self._dialect.json_truthy_text("metadata", "pack_id")
+        pack_frag, transform = self._dialect.in_string_array(pack_expr, ":packs")
+        pack_params = {"packs": transform(sorted(set(pack_ids)))}
+        # avoid binding a non-positive LIMIT (PG errors on a negative LIMIT
+        # literal; see _graph_protocol.py's export_nodes docstring for the
+        # cross-dialect version of this same footgun)
+        lim = max(1, limit)
 
-        try:
-            from opencrab.ontology.pack_provenance import matches_pack_filter
-        except Exception:
-            matches_pack_filter = None  # type: ignore
+        with self._conn() as conn:
+            if short_token:
+                conditions = " OR ".join(f"text ILIKE :t{i}" for i in range(len(toks)))
+                params: dict[str, Any] = {
+                    f"t{i}": f"%{t}%" for i, t in enumerate(toks)
+                }
+                params.update({"qraw": query, "lim": lim, **space_params, **pack_params})
+                rows = conn.execute(
+                    self._text(
+                        f"""
+                        SELECT source_id, text, metadata, similarity(text, :qraw) AS rank
+                        FROM {table}
+                        WHERE ({conditions}){space_where} AND {pack_frag}
+                        ORDER BY rank DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    params,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    self._text(
+                        f"""
+                        SELECT source_id, text, metadata,
+                               ts_rank(to_tsvector('simple', text), plainto_tsquery('simple', :q)) AS rank
+                        FROM {table}
+                        WHERE to_tsvector('simple', text) @@ plainto_tsquery('simple', :q){space_where} AND {pack_frag}
+                        ORDER BY rank DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"q": query, "lim": lim, **space_params, **pack_params},
+                ).fetchall()
 
         out: list[dict[str, Any]] = []
         for source_id, text, meta_raw, rank in rows:
             meta = _as_dict(meta_raw)
-            if matches_pack_filter is not None and not matches_pack_filter(
-                {"metadata": meta}, pack_ids, include_unpackaged
-            ):
-                continue
             out.append({
                 "source_id": source_id,
                 "node_id": meta.get("node_id") or source_id,

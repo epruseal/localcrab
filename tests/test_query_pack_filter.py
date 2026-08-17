@@ -107,6 +107,13 @@ def test_t12_vector_search_fallback_on_exception() -> None:
 
 
 def test_t12_vector_search_post_filter_when_unpackaged() -> None:
+    """issue #147 §3.3/§3.6: the Python post-filter now uses ``in_pack_scope``
+    instead of ``infer_pack_id``, and ``in_pack_scope`` never admits an item
+    with no detectable pack_id (#143 invariant 5) -- ``include_unpackaged``
+    can no longer widen a scope to include unpackaged rows, since doing so
+    would let a caller read data no pack grants them access to. Only the
+    hit whose pack_id is actually IN the caller's scope survives; the
+    orphan (no pack_id) and the foreign-pack hit are both excluded."""
     hit_a = {
         "id": "v1",
         "document": "alpha",
@@ -131,12 +138,12 @@ def test_t12_vector_search_post_filter_when_unpackaged() -> None:
         "x", spaces=None, limit=5,
         pack_ids=["pack-a"], include_unpackaged=True,
     )
-    # Server-side where dropped pack_ids; Python post-filter keeps pack-a
-    # and unpackaged but rejects foreign pack-b.
+    # Server-side where dropped pack_ids; Python post-filter keeps only
+    # pack-a and rejects both the unpackaged orphan and foreign pack-b.
     kwargs = query_mock.call_args.kwargs
     assert kwargs["where"] is None
     ids = sorted(r.node_id for r in results)
-    assert ids == ["n1", "n2"]
+    assert ids == ["n1"]
 
 
 def test_t12_post_filter_overfetch_n_results() -> None:
@@ -186,13 +193,19 @@ def test_t12_no_overfetch_server_side_path() -> None:
 
 
 def test_51_vector_search_forwards_spaces_where_clause() -> None:
-    """_vector_search asks the backend for the 'space' where clause it built."""
+    """_vector_search asks the backend for the 'space' where clause it built.
+
+    ``pack_ids`` is now a required kwarg (issue #147); with a single pack
+    scope and no ``include_unpackaged``, the server-side where clause
+    combines the spaces AND pack predicates via ``_build_chroma_where``'s
+    ``$and`` form -- the spaces predicate is still exactly what's asserted,
+    just alongside the now-mandatory pack predicate rather than alone."""
     hit = {"id": "v1", "document": "a", "metadata": {"space": "claim", "node_id": "n1"}, "distance": 0.1}
     query_mock = MagicMock(return_value=[hit])
     hybrid = _make_hybrid_with_chroma(query_mock)
-    results = hybrid._vector_search("x", spaces=["claim"], limit=5)
+    results = hybrid._vector_search("x", spaces=["claim"], limit=5, pack_ids=["pack-a"])
     kwargs = query_mock.call_args.kwargs
-    assert kwargs["where"] == {"space": "claim"}
+    assert kwargs["where"] == {"$and": [{"space": "claim"}, {"pack_id": "pack-a"}]}
     assert [r.node_id for r in results] == ["n1"]
 
 
@@ -213,7 +226,10 @@ def test_51_query_sets_transitional_warning_when_spaces_filter_used() -> None:
     chroma.available = True
     chroma.query = MagicMock(return_value=[])
     hybrid = HybridQuery(chroma, MagicMock(available=False))
-    outcome = hybrid.query("q", spaces=["claim"], use_rerank=False, use_bm25=False, use_fts=False)
+    outcome = hybrid.query(
+        "q", pack_ids=["pack-a"], spaces=["claim"],
+        use_rerank=False, use_bm25=False, use_fts=False,
+    )
     assert outcome.warnings
     assert "space" in outcome.warnings[0]
 
@@ -224,7 +240,10 @@ def test_51_query_no_warning_when_spaces_not_used() -> None:
     chroma.available = True
     chroma.query = MagicMock(return_value=[])
     hybrid = HybridQuery(chroma, MagicMock(available=False))
-    outcome = hybrid.query("q", spaces=None, use_rerank=False, use_bm25=False, use_fts=False)
+    outcome = hybrid.query(
+        "q", pack_ids=["pack-a"], spaces=None,
+        use_rerank=False, use_bm25=False, use_fts=False,
+    )
     assert outcome.warnings == []
 
 
@@ -236,7 +255,9 @@ def test_51_query_outcome_still_iterates_len_and_indexes_like_a_list() -> None:
     chroma.available = True
     chroma.query = MagicMock(return_value=[hit])
     hybrid = HybridQuery(chroma, MagicMock(available=False))
-    outcome = hybrid.query("q", use_rerank=False, use_bm25=False, use_fts=False)
+    outcome = hybrid.query(
+        "q", pack_ids=["pack-a"], use_rerank=False, use_bm25=False, use_fts=False,
+    )
     assert len(outcome) == 1
     assert [r.node_id for r in outcome] == ["n1"]
     assert outcome[0].node_id == "n1"

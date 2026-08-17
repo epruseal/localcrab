@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from opencrab.ontology.impact import ImpactEngine
 
+# #147: pack_ids is now a required keyword on analyse()/lever_simulate() and
+# is threaded straight through to get_node_by_id_scoped()/find_neighbors().
+# FakeGraphStore doesn't implement scope filtering itself (it's a plain
+# id->value stub), so the exact contents don't matter to these tests -- only
+# that a scope is supplied, matching the new call shape.
+PACK_IDS = ["p1"]
+
 
 class FakeGraphStore:
     """impact.py가 소비하는 정확한 3개 메서드 형태만 흉내낸다."""
@@ -25,12 +32,20 @@ class FakeGraphStore:
         self._raise_on_find_neighbors = False
         self._raise_on_find_by_relations = False
 
-    def get_node_by_id(self, node_id):
+    def get_node_by_id_scoped(self, node_id, pack_ids):
         if self._raise_on_get_node:
             raise RuntimeError("node lookup boom")
         return self._node
 
-    def find_neighbors(self, node_id, direction="both", depth=1, limit=50):
+    def find_neighbors(
+        self,
+        node_id,
+        direction="both",
+        depth=1,
+        limit=50,
+        pack_ids=None,
+        include_unpackaged=False,
+    ):
         if self._raise_on_find_neighbors:
             raise RuntimeError("neighbor traversal boom")
         return self._neighbors
@@ -87,7 +102,7 @@ class TestAnalyseNormal:
         sql = FakeSQLStore(available=True)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.analyse("pol-1", change_type="update", depth=2)
+        result = engine.analyse("pol-1", change_type="update", depth=2, pack_ids=PACK_IDS)
 
         assert result.space == "policy"
         assert result.node_type == "Policy"
@@ -101,15 +116,22 @@ class TestAnalyseNormal:
         assert sql.saved_impacts == [("pol-1", "update", result.to_dict())]
 
     def test_lever_simulate_builds_outcomes_and_concepts_with_predicted_delta(self):
+        # #147: lever_simulate now gates on get_node_by_id_scoped(lever_id, ...)
+        # before touching find_by_relations, and post-filters the relation
+        # results through in_pack_scope() -- so both the anchor and each
+        # related node need a pack_id inside PACK_IDS for this "found and
+        # in-scope" test to actually exercise the outcome/concept building
+        # code (not the #147 out-of-scope short-circuit).
         outcomes_raw = [
-            {"properties": {"id": "out-1"}, "labels": ["Outcome"], "relation_type": "raises"},
-            {"properties": {"id": "out-2"}, "labels": ["KPI"], "relation_type": "lowers"},
+            {"properties": {"id": "out-1", "pack_id": "p1"}, "labels": ["Outcome"], "relation_type": "raises"},
+            {"properties": {"id": "out-2", "pack_id": "p1"}, "labels": ["KPI"], "relation_type": "lowers"},
         ]
         concepts_raw = [
-            {"properties": {"id": "c-1"}, "labels": ["Concept"], "relation_type": "affects"},
+            {"properties": {"id": "c-1", "pack_id": "p1"}, "labels": ["Concept"], "relation_type": "affects"},
         ]
         graph = FakeGraphStore(
             available=True,
+            node={"id": "lev-1", "node_type": "Lever", "pack_id": "p1"},
             relations={
                 ("raises", "lowers", "stabilizes", "optimizes"): outcomes_raw,
                 ("affects",): concepts_raw,
@@ -118,7 +140,7 @@ class TestAnalyseNormal:
         sql = FakeSQLStore(available=True)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.lever_simulate("lev-1", direction="raises", magnitude=0.5)
+        result = engine.lever_simulate("lev-1", direction="raises", magnitude=0.5, pack_ids=PACK_IDS)
 
         assert result["predicted_outcome_changes"] == [
             {"node_id": "out-1", "node_type": "Outcome", "relation": "raises", "predicted_delta": 0.5},
@@ -139,7 +161,7 @@ class TestAnalyseAndSimulateErrors:
         sql = FakeSQLStore(available=True, raise_on_save_impact=True)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.analyse("n-1", change_type="update")
+        result = engine.analyse("n-1", change_type="update", pack_ids=PACK_IDS)
 
         assert result.node_id == "n-1"
         assert sql.saved_impacts == []  # raised before append -> nothing persisted
@@ -149,7 +171,7 @@ class TestAnalyseAndSimulateErrors:
         sql = FakeSQLStore(available=True, raise_on_save_simulation=True)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.lever_simulate("lev-1", direction="lowers", magnitude=0.3)
+        result = engine.lever_simulate("lev-1", direction="lowers", magnitude=0.3, pack_ids=PACK_IDS)
 
         assert result["lever_id"] == "lev-1"
         assert sql.saved_simulations == []
@@ -164,7 +186,7 @@ class TestAnalyseAndSimulateErrors:
         sql = FakeSQLStore(available=False)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.analyse("n-1")
+        result = engine.analyse("n-1", pack_ids=PACK_IDS)
 
         assert result.space is None
         assert result.node_type is None
@@ -175,19 +197,22 @@ class TestAnalyseAndSimulateErrors:
         sql = FakeSQLStore(available=False)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.analyse("n-1")
+        result = engine.analyse("n-1", pack_ids=PACK_IDS)
 
         assert result.space == "lever"
         assert result.affected_nodes == []
         assert result.affected_spaces == []
 
     def test_lever_simulate_degrades_when_find_by_relations_raises(self):
-        graph = FakeGraphStore(available=True)
+        # #147: the anchor must resolve (in-scope) first, otherwise the new
+        # _LeverOutOfScopeError short-circuit -- not find_by_relations raising
+        # -- would be what actually produces the empty lists below.
+        graph = FakeGraphStore(available=True, node={"id": "lev-1", "node_type": "Lever"})
         graph._raise_on_find_by_relations = True
         sql = FakeSQLStore(available=False)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.lever_simulate("lev-1", direction="raises", magnitude=0.5)
+        result = engine.lever_simulate("lev-1", direction="raises", magnitude=0.5, pack_ids=PACK_IDS)
 
         assert result["predicted_outcome_changes"] == []
         assert result["affected_concepts"] == []
@@ -205,7 +230,7 @@ class TestAnalyseAndSimulateEdges:
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
         # unmapped change_type exercises the ["I1", "I2"] default (line ~144)
-        result = engine.analyse("missing-node", change_type="unmapped_change")
+        result = engine.analyse("missing-node", change_type="unmapped_change", pack_ids=PACK_IDS)
 
         assert result.space is None
         assert result.node_type is None
@@ -214,11 +239,15 @@ class TestAnalyseAndSimulateEdges:
         assert {t["id"] for t in result.triggered} == {"I1", "I2"}
 
     def test_lever_simulate_no_matching_relations(self):
-        graph = FakeGraphStore(available=True, relations={})
+        # #147: the anchor must resolve (in-scope) so this exercises "no
+        # matching relations" rather than the anchor-missing short-circuit.
+        graph = FakeGraphStore(
+            available=True, node={"id": "lev-1", "node_type": "Lever"}, relations={}
+        )
         sql = FakeSQLStore(available=True)
         engine = ImpactEngine(neo4j=graph, sql=sql)
 
-        result = engine.lever_simulate("lev-1", direction="optimizes", magnitude=0.2)
+        result = engine.lever_simulate("lev-1", direction="optimizes", magnitude=0.2, pack_ids=PACK_IDS)
 
         assert result["predicted_outcome_changes"] == []
         assert result["affected_concepts"] == []

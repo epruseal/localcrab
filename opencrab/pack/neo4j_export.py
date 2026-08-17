@@ -205,26 +205,48 @@ def export_neo4j_opencrab_ingest(
     pack_id: str | None = None,
     node_limit: int = 500_000,
     edge_limit: int = 1_000_000,
+    scope: frozenset[str],
 ) -> dict[str, Any]:
     """Export Neo4j's loaded graph into OpenCrab Pack v1 ingest JSONL.
 
     The output is meant to be stored at `neo4j/opencrab_ingest.jsonl` inside a
     pack. It is derived from Neo4j after import/check, so the pack contains the
     actual graph state that passed graph verification.
+
+    ``scope`` is REQUIRED (#147) -- the caller's readable pack set
+    (``opencrab.pack.read_scope.read_scope``). With ``pack_id`` given, the
+    export is narrowed to that one id via ``opencrab.pack.read_scope.narrow``
+    (so a scope-less id behaves exactly like an unknown one -- an empty
+    export, not an error that would confirm the id exists). Without a
+    ``pack_id`` the export covers the caller's whole scope.
+
+    Uses ``export_nodes_scoped``/``export_edges_scoped``, never
+    ``export_nodes``/``export_edges``: the plain pair matches on a 3/5-way OR
+    across ``pack_id``/``source``/``source_id`` that exists for bulk pack
+    export/fork, not authorization -- it is exactly as forgeable as the
+    predicate #147 closed off everywhere else, so it cannot be used to decide
+    what a caller is allowed to export (design #147 §3.4b).
     """
     if not getattr(neo4j_store, "available", False):
         raise RuntimeError("Neo4j store is not available.")
 
+    from opencrab.pack.read_scope import narrow
+
+    if pack_id is not None:
+        effective_pack_ids, _dropped = narrow(scope, [pack_id])
+    else:
+        effective_pack_ids = sorted(scope)
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # All four backends implement export_nodes()/export_edges() natively —
-    # Neo4jStore's Cypher for both is copied verbatim from this module's
-    # former _node_query()/_edge_query() helpers (now removed), so this call
-    # produces byte-identical rows to the hand-rolled run_cypher() calls it
-    # replaces. See opencrab/stores/_graph_protocol.py.
-    node_rows = neo4j_store.export_nodes(pack_id, node_limit)
-    edge_rows = neo4j_store.export_edges(pack_id, edge_limit)
+    # export_nodes_scoped()/export_edges_scoped() are declared on all four
+    # backends (opencrab/stores/_graph_protocol.py) with the same row shape
+    # as export_nodes()/export_edges(), so the JSONL this produces stays
+    # byte-identical in shape to the pre-#147 export -- only which rows are
+    # eligible changes.
+    node_rows = neo4j_store.export_nodes_scoped(effective_pack_ids, node_limit)
+    edge_rows = neo4j_store.export_edges_scoped(effective_pack_ids, edge_limit)
 
     node_count = 0
     edge_count = 0

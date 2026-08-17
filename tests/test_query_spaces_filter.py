@@ -69,7 +69,7 @@ def test_fts_search_forwards_spaces_to_keyword_search():
     fake = _FakeDocStoreCapturesSpaces()
     hq._doc_store = fake
 
-    hq._fts_search("JASO M345", ["A"], 10)
+    hq._fts_search("JASO M345", ["A"], 10, pack_ids=["p1"])
 
     assert fake.received_spaces == [["A"]]
 
@@ -85,7 +85,22 @@ class _FakeGraphCapturesSpaces:
     def __init__(self) -> None:
         self.received_spaces: list[list[str] | None] = []
 
-    def find_neighbors(self, node_id, direction="both", depth=1, limit=50, spaces=None):
+    def find_neighbors(
+        self,
+        node_id,
+        direction="both",
+        depth=1,
+        limit=50,
+        spaces=None,
+        pack_ids=None,
+        include_unpackaged=False,
+    ):
+        # #147: _graph_expand now forwards pack_ids/include_unpackaged
+        # unconditionally alongside spaces (see query.py's _graph_expand
+        # docstring) -- this double must accept them or the real call raises
+        # TypeError, which _graph_expand's try/except would silently
+        # swallow and this test's assertion would never see received_spaces
+        # populated.
         self.received_spaces.append(spaces)
         return []
 
@@ -96,7 +111,7 @@ def test_graph_expand_accepts_and_forwards_spaces():
     argument) since the parameter didn't exist."""
     hq = HybridQuery(MagicMock(), _FakeGraphCapturesSpaces())
 
-    hq._graph_expand(["anchor"], depth=1, limit=10, spaces=["A"])
+    hq._graph_expand(["anchor"], depth=1, limit=10, pack_ids=["p1"], spaces=["A"])
 
     assert hq._neo4j.received_spaces == [["A"]]
 
@@ -116,11 +131,11 @@ def doc_store(tmp_path):
 def _seed_two_spaces(store):
     store.upsert_source(
         "src-a", "JASO M345 apple oil standard text",
-        {"space": "A", "node_id": "n-a"},
+        {"space": "A", "node_id": "n-a", "pack_id": "p1"},
     )
     store.upsert_source(
         "src-b", "JASO M345 banana oil standard text",
-        {"space": "B", "node_id": "n-b"},
+        {"space": "B", "node_id": "n-b", "pack_id": "p1"},
     )
 
 
@@ -129,7 +144,7 @@ def test_local_sql_doc_store_keyword_search_space_filter(doc_store):
         pytest.skip("FTS5 unavailable in this SQLite build")
     _seed_two_spaces(doc_store)
 
-    hits = doc_store.keyword_search("JASO M345", spaces=["A"], limit=10)
+    hits = doc_store.keyword_search("JASO M345", pack_ids=["p1"], spaces=["A"], limit=10)
 
     assert hits, "space A 문서가 검색돼야 함"
     assert all(h["metadata"].get("space") == "A" for h in hits)
@@ -142,7 +157,7 @@ def test_local_sql_doc_store_keyword_search_no_spaces_is_unfiltered(doc_store):
         pytest.skip("FTS5 unavailable in this SQLite build")
     _seed_two_spaces(doc_store)
 
-    hits = doc_store.keyword_search("JASO M345", limit=10)
+    hits = doc_store.keyword_search("JASO M345", pack_ids=["p1"], limit=10)
 
     ids = {h["source_id"] for h in hits}
     assert {"src-a", "src-b"} <= ids
@@ -230,26 +245,33 @@ def test_hybrid_query_spaces_filter_end_to_end(hybrid):
     if not doc.supports_keyword:
         pytest.skip("FTS5 unavailable in this SQLite build")
 
-    # FTS anchor: space A only fires on the exact query text below.
+    # FTS anchor: space A only fires on the exact query text below. All rows
+    # (doc + graph) share one pack ("p1") since #147's pack_ids is now
+    # required and this test targets the SPACE filter, not pack scoping --
+    # a shared pack keeps the pack predicate a no-op so a leak on either leg
+    # can only be explained by the space filter, matching this test's intent.
     doc.upsert_source(
         "src-anchor-a",
         "JASO M345 apple oil standard classification",
-        {"space": "A", "node_id": "anchor-a"},
+        {"space": "A", "node_id": "anchor-a", "pack_id": "p1"},
     )
     doc.upsert_source(
         "src-anchor-b",
         "JASO M345 banana oil standard classification",
-        {"space": "B", "node_id": "anchor-b"},
+        {"space": "B", "node_id": "anchor-b", "pack_id": "p1"},
     )
 
     # Graph: anchor-a (space A) has neighbours in BOTH spaces.
-    graph.upsert_node("Claim", "anchor-a", {"title": "anchor-a"}, space_id="A")
-    graph.upsert_node("Claim", "neigh-a", {"title": "neigh-a"}, space_id="A")
-    graph.upsert_node("Claim", "neigh-b", {"title": "neigh-b"}, space_id="B")
+    graph.upsert_node("Claim", "anchor-a", {"title": "anchor-a", "pack_id": "p1"}, space_id="A")
+    graph.upsert_node("Claim", "neigh-a", {"title": "neigh-a", "pack_id": "p1"}, space_id="A")
+    graph.upsert_node("Claim", "neigh-b", {"title": "neigh-b", "pack_id": "p1"}, space_id="B")
     graph.upsert_edge("Claim", "anchor-a", "rel", "Claim", "neigh-a", {})
     graph.upsert_edge("Claim", "anchor-a", "rel", "Claim", "neigh-b", {})
 
-    outcome = hq.query("JASO M345 apple oil standard classification", spaces=["A"], limit=10)
+    outcome = hq.query(
+        "JASO M345 apple oil standard classification",
+        pack_ids=["p1"], spaces=["A"], limit=10,
+    )
     result_ids = {r.node_id for r in outcome}
 
     assert "anchor-b" not in result_ids, "FTS leg leaked space B"
@@ -288,10 +310,14 @@ def test_fts_leg_pre_backfill_legacy_row_excluded_until_backfill(doc_store):
         {"pack_id": "oil-standards-auto-moto", "node_id": "n-untagged"},
     )
 
-    unfiltered = doc_store.keyword_search("JASO M345", limit=10)
+    unfiltered = doc_store.keyword_search(
+        "JASO M345", pack_ids=["oil-standards-auto-moto"], limit=10
+    )
     assert unfiltered, "unfiltered search must still find real, untagged legacy data"
 
-    filtered = doc_store.keyword_search("JASO M345", spaces=["A"], limit=10)
+    filtered = doc_store.keyword_search(
+        "JASO M345", pack_ids=["oil-standards-auto-moto"], spaces=["A"], limit=10
+    )
     assert filtered == [], (
         "documents the pre-backfill gap: untagged doc_sources rows are "
         "strictly excluded by any spaces filter until backfilled — "
@@ -330,12 +356,14 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
             text_as_node=False,
         )
 
-    hits = doc.keyword_search("JASO M345", spaces=["evidence"], limit=10)
+    hits = doc.keyword_search("JASO M345", pack_ids=["pack-a"], spaces=["evidence"], limit=10)
     assert any(h["source_id"] == "src-real-ingest" for h in hits), (
         "data ingested via the real production legacy path must be "
         "findable through a spaces-filtered FTS query"
     )
-    assert doc.keyword_search("JASO M345", spaces=["other-space"], limit=10) == []
+    assert doc.keyword_search(
+        "JASO M345", pack_ids=["pack-a"], spaces=["other-space"], limit=10
+    ) == []
 
 
 def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
@@ -367,8 +395,10 @@ def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
             text_as_node=False,
         )
 
-    assert doc.keyword_search("JASO M345", spaces=["resource"], limit=10)
-    assert doc.keyword_search("JASO M345", spaces=["evidence"], limit=10) == []
+    assert doc.keyword_search("JASO M345", pack_ids=["pack-a"], spaces=["resource"], limit=10)
+    assert doc.keyword_search(
+        "JASO M345", pack_ids=["pack-a"], spaces=["evidence"], limit=10
+    ) == []
 
 
 def test_hybrid_query_warns_about_fts_space_gap(hybrid):
@@ -381,7 +411,10 @@ def test_hybrid_query_warns_about_fts_space_gap(hybrid):
         {"pack_id": "oil-standards-auto-moto", "node_id": "n-untagged"},
     )
 
-    outcome = hq.query("JASO M345 apple oil standard classification", spaces=["A"], limit=10)
+    outcome = hq.query(
+        "JASO M345 apple oil standard classification",
+        pack_ids=["oil-standards-auto-moto"], spaces=["A"], limit=10,
+    )
 
     assert "n-untagged" not in {r.node_id for r in outcome}
     assert any("FTS/keyword leg" in w for w in outcome.warnings), (

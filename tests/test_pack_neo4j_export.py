@@ -9,18 +9,21 @@ from opencrab.pack.neo4j_export import _normalise_edge, _normalise_node
 
 
 class FakeNeo4jStore:
-    """Stands in for a real Neo4jStore — export_nodes()/export_edges() are
-    the GraphStoreExtended methods export_neo4j_opencrab_ingest() now calls
-    directly (see opencrab/stores/_graph_protocol.py); this fake mirrors
-    their Cypher-native return shape rather than a run_cypher() call."""
+    """Stands in for a real Neo4jStore — export_nodes_scoped()/
+    export_edges_scoped() are the GraphStoreExtended methods
+    export_neo4j_opencrab_ingest() now calls directly (issue #147 §3.4(b):
+    the plain export_nodes()/export_edges() pair's 3/5-way OR predicate is
+    forgeable and is no longer used for authorization -- see
+    opencrab/stores/_graph_protocol.py); this fake mirrors the ``_scoped``
+    methods' Cypher-native return shape rather than a run_cypher() call."""
 
     available = True
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str | None, int]] = []
+        self.calls: list[tuple[str, list[str], int]] = []
 
-    def export_nodes(self, pack_id: str | None, limit: int):
-        self.calls.append(("export_nodes", pack_id, limit))
+    def export_nodes_scoped(self, pack_ids: list[str], limit: int):
+        self.calls.append(("export_nodes_scoped", pack_ids, limit))
         return [
             {
                 "props": {
@@ -35,8 +38,8 @@ class FakeNeo4jStore:
             }
         ]
 
-    def export_edges(self, pack_id: str | None, limit: int):
-        self.calls.append(("export_edges", pack_id, limit))
+    def export_edges_scoped(self, pack_ids: list[str], limit: int):
+        self.calls.append(("export_edges_scoped", pack_ids, limit))
         return [
             {
                 "source_props": {"id": "node:material", "space": "concept", "node_type": "Entity"},
@@ -51,7 +54,9 @@ class FakeNeo4jStore:
 
 def test_export_neo4j_opencrab_ingest_writes_nodes_edges_and_status(tmp_path) -> None:
     output = tmp_path / "neo4j" / "opencrab_ingest.jsonl"
-    status = export_neo4j_opencrab_ingest(FakeNeo4jStore(), output, pack_id="bench-pack")
+    status = export_neo4j_opencrab_ingest(
+        FakeNeo4jStore(), output, pack_id="bench-pack", scope=frozenset({"bench-pack"}),
+    )
 
     assert status["nodes"] == 1
     assert status["edges"] == 1
@@ -70,7 +75,7 @@ def test_export_neo4j_opencrab_ingest_requires_available_store(tmp_path) -> None
         available = False
 
     with pytest.raises(RuntimeError, match="Neo4j store is not available"):
-        export_neo4j_opencrab_ingest(Unavailable(), tmp_path / "out.jsonl")
+        export_neo4j_opencrab_ingest(Unavailable(), tmp_path / "out.jsonl", scope=frozenset())
 
 
 # --- preset= convenience: matches the equivalent individual-flag combination ---

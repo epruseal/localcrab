@@ -226,6 +226,54 @@ class _SqlDocStoreBase(abc.ABC):
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
+    def list_nodes_scoped(
+        self, pack_ids: list[str], space: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped counterpart to ``list_nodes`` (issue #147
+        §3.5) -- ``ontology_list_nodes``'s pack-UNSPECIFIED branch (the only
+        production caller this exists for, see §3.5's 7-caller table for
+        why ``list_nodes`` itself stays untouched: its other 6 callers are
+        BM25/index-build paths, not user-response paths).
+
+        Same ``ORDER BY updated_at DESC, space, node_id`` tie-breaker as
+        ``list_nodes`` (issue #63 -- unordered ``LIMIT`` has no
+        SQL-standard-guaranteed row selection), PLUS
+        ``json_truthy_text(properties,'pack_id') IN <array bind>``. A
+        SINGLE clause is enough here (unlike the graph store's
+        ``_scoped_node_where``, which ANDs a second ``IS NOT NULL`` clause
+        onto a bare ``json_get`` membership test for index reasons) --
+        ``doc_nodes`` has no pack_id index to preserve (see
+        ``DOC_STORE_SCHEMA``'s index list), and ``json_truthy_text``
+        already returns SQL NULL for a missing/falsy pack_id, which never
+        satisfies ``IN``/``= ANY(...)`` membership on either dialect -- so
+        an unpackaged row is excluded by the SAME clause that does the
+        scope check, with nothing extra to add.
+
+        Empty ``pack_ids`` -> ``[]`` WITHOUT querying (nothing is in scope,
+        so there is nothing to fetch) -- unlike ``list_nodes``, which has
+        no scope concept and returns everything up to ``limit`` for
+        ``space=None``. ``limit <= 0`` -> ``[]``, same guard ``list_nodes``
+        uses (issue #120 follow-up)."""
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+        table = self._table("doc_nodes")
+        pid_expr = self._dialect.json_truthy_text("properties", "pack_id")
+        pack_frag, transform = self._dialect.in_string_array(pid_expr, ":sc_packs")
+        where_parts = [pack_frag]
+        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
+        if space:
+            where_parts.append("space=:space")
+            params["space"] = space
+        params["lim"] = limit
+        sql = (
+            f"SELECT space, node_id, node_type, properties, updated_at"
+            f" FROM {table} WHERE {' AND '.join(where_parts)}"
+            f" ORDER BY updated_at DESC, space, node_id LIMIT :lim"
+        )
+        rows = self._fetch_all(sql, params)
+        return [self._row_to_node(r) for r in rows]
+
     def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
         """Cheap ``(COUNT(*), MAX(updated_at))`` staleness probe over the WHOLE
         ``doc_nodes`` table — deliberately independent of ``limit`` (#63).

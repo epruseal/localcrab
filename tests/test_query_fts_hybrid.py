@@ -54,7 +54,11 @@ def test_keyword_multiterm_outranks_single(store):
     if not store.supports_keyword:
         pytest.skip("FTS5 unavailable in this SQLite build")
     _seed(store)
-    hits = store.keyword_search("JASO M345 detergency smoke lubricity FB FC", limit=10)
+    hits = store.keyword_search(
+        "JASO M345 detergency smoke lubricity FB FC",
+        pack_ids=["oil-standards-auto-moto", "moto-catalog-husqvarna"],
+        limit=10,
+    )
     ids = [h["source_id"] for h in hits]
     assert "src-oil-m345" in ids, "다중어 문서가 검색돼야 함"
     if "src-husq-fc" in ids:
@@ -71,7 +75,7 @@ def test_keyword_standard_number(store):
     if not store.supports_keyword:
         pytest.skip("FTS5 unavailable")
     _seed(store)
-    hits = store.keyword_search("M345", limit=5)
+    hits = store.keyword_search("M345", pack_ids=["oil-standards-auto-moto"], limit=5)
     assert any(h["source_id"] == "src-oil-m345" for h in hits)
 
 
@@ -93,7 +97,9 @@ def test_keyword_special_chars_no_crash(store, q):
     if not store.supports_keyword:
         pytest.skip("FTS5 unavailable")
     _seed(store)
-    out = store.keyword_search(q, limit=5)  # 예외 발생하면 실패
+    out = store.keyword_search(
+        q, pack_ids=["oil-standards-auto-moto", "moto-catalog-husqvarna"], limit=5
+    )  # 예외 발생하면 실패
     assert isinstance(out, list)
 
 
@@ -102,9 +108,10 @@ def test_keyword_empty_and_nomatch(store):
     if not store.supports_keyword:
         pytest.skip("FTS5 unavailable")
     _seed(store)
-    assert store.keyword_search("", limit=5) == []
-    assert store.keyword_search("   ", limit=5) == []
-    assert store.keyword_search("zzzznonexistenttoken", limit=5) == []
+    pack_ids = ["oil-standards-auto-moto", "moto-catalog-husqvarna"]
+    assert store.keyword_search("", pack_ids=pack_ids, limit=5) == []
+    assert store.keyword_search("   ", pack_ids=pack_ids, limit=5) == []
+    assert store.keyword_search("zzzznonexistenttoken", pack_ids=pack_ids, limit=5) == []
 
 
 # ── 동기화: upsert_source 후 FTS 갱신 ──
@@ -112,12 +119,12 @@ def test_keyword_sync_on_upsert(store):
     if not store.supports_keyword:
         pytest.skip("FTS5 unavailable")
     store.upsert_source("s1", "alpha bravo charlie", {"pack_id": "p"})
-    assert any(h["source_id"] == "s1" for h in store.keyword_search("bravo"))
+    assert any(h["source_id"] == "s1" for h in store.keyword_search("bravo", pack_ids=["p"]))
     # 본문 교체 → 옛 토큰 사라지고 새 토큰 검색됨
     store.upsert_source("s1", "delta echo foxtrot", {"pack_id": "p"})
-    assert store.keyword_search("bravo") == [] or all(
-        h["source_id"] != "s1" for h in store.keyword_search("bravo"))
-    assert any(h["source_id"] == "s1" for h in store.keyword_search("echo"))
+    assert store.keyword_search("bravo", pack_ids=["p"]) == [] or all(
+        h["source_id"] != "s1" for h in store.keyword_search("bravo", pack_ids=["p"]))
+    assert any(h["source_id"] == "s1" for h in store.keyword_search("echo", pack_ids=["p"]))
 
 
 # ── 엣지: limit 준수 ──
@@ -126,7 +133,7 @@ def test_keyword_limit(store):
         pytest.skip("FTS5 unavailable")
     for i in range(15):
         store.upsert_source(f"m{i}", "common token here", {"pack_id": "p"})
-    assert len(store.keyword_search("common", limit=5)) <= 5
+    assert len(store.keyword_search("common", pack_ids=["p"], limit=5)) <= 5
 
 
 # ── HybridQuery._fts_search capability 게이팅·폴백 ──
@@ -161,19 +168,19 @@ def _hybrid():
 def test_fts_leg_unsupported_backend_fallback():
     hq = _hybrid()
     hq._doc_store = _FakeStoreNoKeyword()
-    assert hq._fts_search("q", None, 10) == []   # 폴백, 크래시 없음
+    assert hq._fts_search("q", None, 10, pack_ids=["p"]) == []   # 폴백, 크래시 없음
 
 
 def test_fts_leg_backend_error_graceful():
     hq = _hybrid()
     hq._doc_store = _FakeStoreRaises()
-    assert hq._fts_search("q", None, 10) == []   # 예외 흡수
+    assert hq._fts_search("q", None, 10, pack_ids=["p"]) == []   # 예외 흡수
 
 
 def test_fts_leg_ok_returns_keyword_source():
     hq = _hybrid()
     hq._doc_store = _FakeStoreOK()
-    out = hq._fts_search("JASO M345", None, 10)
+    out = hq._fts_search("JASO M345", None, 10, pack_ids=["oil-standards-auto-moto"])
     assert out and out[0].get("source") == "keyword"
     assert out[0]["metadata"]["pack_id"] == "oil-standards-auto-moto"
 
@@ -181,4 +188,4 @@ def test_fts_leg_ok_returns_keyword_source():
 def test_fts_leg_no_doc_store():
     hq = _hybrid()
     hq._doc_store = None
-    assert hq._fts_search("q", None, 10) == []
+    assert hq._fts_search("q", None, 10, pack_ids=["p"]) == []
