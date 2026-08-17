@@ -118,6 +118,14 @@ def _node(graph, docs, pack_id: str, node_id: str, *, extra: dict[str, Any] | No
 
 @pytest.fixture
 def seeded(graph, docs, users):
+    """Three nodes, no edges.
+
+    Kept edge-free on purpose: several tests below assert on exact id sets,
+    and every test that cares about edges seeds its own. The trap to avoid
+    is the opposite one -- asserting "no foreign edge came back" against an
+    edge table that is empty for everyone. Tests that make that assertion
+    must seed a positive control, and the ones here do.
+    """
     _node(graph, docs, PACK_A, "a-secret")
     _node(graph, docs, PACK_B, "b-secret")
     _node(graph, docs, PACK_PUBLIC, "shared-doc")
@@ -262,9 +270,19 @@ class TestCrossUserIsolation:
 
 class TestNoExistenceLeak:
     def test_foreign_private_pack_reads_identically_to_a_nonexistent_one(
-        self, ctx, seeded
+        self, ctx, graph, docs, seeded
     ):
         from opencrab.mcp.tools import ontology_list_edges, ontology_list_nodes
+
+        # A real edge inside pack-b, so the edge assertions below are about
+        # the scope rather than about an empty edge table. Without it the
+        # `narrow()` call in ontology_list_edges can be deleted outright
+        # with the whole suite still green.
+        _node(graph, docs, PACK_B, "b-second")
+        graph.upsert_edge(
+            "Document", "b-secret", "relates_to", "Document", "b-second",
+            {"edge_secret": "bob-only"},
+        )
 
         with _as(ctx, seeded["alice"]):
             foreign_nodes = ontology_list_nodes(pack_id=PACK_B)
@@ -278,6 +296,11 @@ class TestNoExistenceLeak:
         assert foreign_nodes["total"] == absent_nodes["total"] == 0
         assert foreign_edges["edges"] == absent_edges["edges"] == []
         assert foreign_edges["total"] == absent_edges["total"] == 0
+        # Positive control: pack-b really does hold an edge, so the two
+        # empties above are the scope refusing and not an empty edge table.
+        with _as(ctx, seeded["bob"]):
+            owned_edges = ontology_list_edges(pack_id=PACK_B)
+        assert owned_edges["total"] == 1
 
     def test_get_node_foreign_id_reads_identically_to_a_nonexistent_id(
         self, ctx, seeded
@@ -784,6 +807,73 @@ class TestPgDocStorePredicateIsPresent:
             "short-token ILIKE fallback"
         )
         assert "if not pack_ids" in src
+
+
+class TestNeo4jKeywordCypher:
+    """The Neo4j branch of `HybridQuery.keyword_search`, which no fixture reaches.
+
+    `keyword_search` routes Local/PG/Kuzu stores to `search_nodes` and only
+    falls through to raw Cypher for Neo4j, so the isolation tests above --
+    which all use a LocalGraphStore -- never execute this Cypher. Its pack
+    clause and its parenthesisation could both be deleted with the whole
+    suite green. The builder was split out as a pure function precisely so
+    it could be asserted without a server; these are the assertions that
+    claim was written for.
+    """
+
+    def test_pack_clause_is_present_and_the_or_group_is_closed(self):
+        from opencrab.ontology.query import _neo4j_keyword_cypher
+
+        for with_spaces in (False, True):
+            cypher = _neo4j_keyword_cypher(with_spaces=with_spaces)
+            assert "n.pack_id IN $pack_ids" in cypher
+
+            # The three CONTAINS terms must sit inside ONE parenthesised
+            # group that closes BEFORE the first AND. Cypher binds AND
+            # tighter than OR, so appending a filter to a bare OR chain
+            # yields `a OR b OR (c AND filter)` -- every row matching on
+            # name or description then skips the filter entirely while the
+            # query still reads as filtered.
+            where = cypher.split("WHERE", 1)[1]
+            # Match parentheses properly: the OR terms contain their own
+            # `toLower(...)` calls, so splitting on the first ")" would cut
+            # the group open in the wrong place.
+            start = where.index("(")
+            depth = 0
+            for i, ch in enumerate(where[start:], start):
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0:
+                    end = i
+                    break
+            group = where[start : end + 1]
+            assert group.count("CONTAINS $kw") == 3
+            assert "AND" not in group
+            # ...and the pack filter is outside that group, i.e. ANDed with
+            # the whole disjunction rather than with its last term.
+            assert "AND" in where[end + 1 :]
+
+    def test_empty_scope_short_circuits_before_the_cypher_branch(self):
+        """The Neo4j branch has no Python re-filter under it."""
+        from opencrab.ontology.query import HybridQuery
+
+        neo4j = MagicMock(available=True)
+        hybrid = HybridQuery(MagicMock(available=False), neo4j)
+
+        assert hybrid.keyword_search("anything", pack_ids=[], limit=10) == []
+        neo4j.run_cypher.assert_not_called()
+
+    def test_non_empty_scope_reaches_the_cypher_with_the_pack_parameter(self):
+        """Positive control for the test above."""
+        from opencrab.ontology.query import HybridQuery
+
+        neo4j = MagicMock(available=True)
+        neo4j.run_cypher.return_value = []
+        hybrid = HybridQuery(MagicMock(available=False), neo4j)
+
+        hybrid.keyword_search("anything", pack_ids=[PACK_A], limit=10)
+        cypher, params = neo4j.run_cypher.call_args[0]
+        assert params["pack_ids"] == [PACK_A]
+        assert "n.pack_id IN $pack_ids" in cypher
 
 
 class TestCanonicalIdsScoping:

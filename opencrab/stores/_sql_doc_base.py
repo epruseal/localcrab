@@ -5,12 +5,13 @@ upsert_source, keyword_search, get_source, list_sources, log_event,
 get_audit_log, collection_stats, ping), parameterised by a ``SqlDialect``
 (SQLITE or POSTGRES from ``_sql_dialect.py``).
 
-STAGE 6a STATUS: this base is authored and unit-tested standalone. It is NOT
-yet wired into LocalSQLDocStore / PgDocStore — that migration is Stage 6a's
-F1 (SQLite) / F2 (PG) adopter follow-up, done as separate, individually
-reviewable changes given how risky this refactor class is. factory.py, the
-two stores' public class names, and their module paths are all unchanged by
-this file's existence.
+STATUS: wired. LocalSQLDocStore and PgDocStore both subclass this base --
+the Stage 6a "F1 (SQLite) / F2 (PG) adopter follow-up" this paragraph used
+to describe as pending has since landed, and the claim that it is "NOT yet
+wired" was stale (noticed while adding the pack-scoped read methods here in
+#147, since one of them is an authorization path and a reader needs to know
+it actually runs). factory.py, the two stores' public class names, and their
+module paths are unchanged by this file's existence.
 
 ADOPTION CONTRACT — a subclass must:
   1. Set ``self._dialect = SQLITE`` or ``POSTGRES`` before any base method

@@ -982,3 +982,65 @@ class TestPackCommandWiring:
             "-o", str(cli_env / "x.zip"), "--pack-id", "p"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+
+
+class TestPacksCommandsAreScoped:
+    """#147: `packs list` / `packs show` read the on-disk manifest registry,
+    which has no notion of ownership.
+
+    Both were unprotected through four review rounds: the scope filter in
+    `packs list` and the scope check in `packs show` could each be deleted
+    with the whole suite green, printing another user's pack id, title,
+    counts and path -- or its entire manifest -- to anyone. Nothing below
+    these commands re-filters, because the manifest scan is the data source.
+    """
+
+    @staticmethod
+    def _manifest(root, pack_id: str) -> None:
+        import json
+
+        d = root / "packs" / pack_id / "stage"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "manifest.json").write_text(
+            json.dumps({"pack_id": pack_id, "title": f"{pack_id} title", "version": "1"}),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture()
+    def two_packs(self, cli_env, bootstrapped):
+        """One pack the local user owns, one owned by somebody else."""
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        create_pack(sql, bootstrapped, "mine", title="mine")
+        create_pack(sql, "user_someone_else", "theirs", title="theirs")
+        self._manifest(cli_env, "mine")
+        self._manifest(cli_env, "theirs")
+        return cli_env
+
+    def test_packs_list_hides_another_users_pack(self, runner, two_packs):
+        result = runner.invoke(main, ["packs", "list"])
+        assert result.exit_code == 0
+        # Both directions: mine is listed, theirs is not. Asserting only the
+        # absence would pass on a build that listed nothing at all.
+        assert "mine" in result.output
+        assert "theirs" not in result.output
+
+    def test_packs_show_treats_another_users_pack_as_nonexistent(
+        self, runner, two_packs
+    ):
+        foreign = runner.invoke(main, ["packs", "show", "theirs"])
+        absent = runner.invoke(main, ["packs", "show", "no-such-pack-at-all"])
+
+        assert foreign.exit_code == absent.exit_code == 1
+        # Same message shape, differing only by the id the caller supplied.
+        assert foreign.output.replace("theirs", "<id>") == absent.output.replace(
+            "no-such-pack-at-all", "<id>"
+        )
+        # Positive control: the owned pack really is showable.
+        owned = runner.invoke(main, ["packs", "show", "mine"])
+        assert owned.exit_code == 0
+        assert "mine" in owned.output
+

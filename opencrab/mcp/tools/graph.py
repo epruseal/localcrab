@@ -287,10 +287,16 @@ def ontology_add_edge(
     access=AccessTier.READ,
 )
 def ontology_get_node(node_id: str) -> dict[str, Any]:
-    """Fetch a single node by node_id regardless of type.
+    """Fetch a single node by node_id regardless of type, within the
+    caller's readable pack scope.
 
-    All four storage backends implement get_node_by_id() natively (type-
-    agnostic, single SQL/Cypher LIMIT 1) — see opencrab/stores/_graph_protocol.py.
+    #147: this calls ``get_node_by_id_scoped``, not ``get_node_by_id``. The
+    unscoped version matches ``node_id`` alone even though the PK is
+    ``(node_type, node_id)``, so filtering its result afterwards would
+    answer "not found" for a node the caller does own whenever another pack
+    holds the same id under a different type. All four backends implement
+    the scoped form (see opencrab/stores/_graph_protocol.py); note that
+    Kuzu's deliberately does NOT use ``LIMIT 1``, for the same reason.
     """
     from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
 
