@@ -281,13 +281,15 @@ class TestChromaUriPreservation:
             ids=["uri1", "plain1", "new1"],
         )
 
-        assert calls["upsert"] == [["uri1"]], (
-            f"uri 레코드가 native upsert() 경로를 안 탔다: {calls}"
+        # uri1 은 uri 를 들고 있어서, new1 은 기존 키가 없어서(따라서 스테일이
+        # 생길 수 없어서) 원자적 upsert 로 간다. plain1 만 키를 버리므로 치환이다.
+        assert calls["upsert"] and set(calls["upsert"][0]) == {"uri1", "new1"}, (
+            f"스테일 키가 없는 id 가 원자적 upsert 경로를 안 탔다: {calls}"
         )
-        assert calls["delete"] and set(calls["delete"][0]) == {"plain1", "new1"}, (
-            f"일반/신규 id 가 delete+add(치환) 경로를 안 탔다: {calls}"
+        assert calls["delete"] and set(calls["delete"][0]) == {"plain1"}, (
+            f"키를 버리는 id 가 delete+add(치환) 경로를 안 탔다: {calls}"
         )
-        assert calls["add"] and set(calls["add"][0]) == {"plain1", "new1"}, calls
+        assert calls["add"] and set(calls["add"][0]) == {"plain1"}, calls
 
         got = store._collection.get(
             ids=["uri1", "plain1", "new1"], include=["documents", "metadatas", "uris"]
@@ -388,7 +390,16 @@ class _BlockingCollection:
 
     def get(self, ids, include=None):
         self.calls.append(("get", list(ids)))
-        return {"ids": [], "uris": []}
+        # 기존 레코드가 있고 그 메타 키를 새 메타가 버리는 형태로 보고한다 —
+        # 그래야 치환(delete+add) 경로가 돌고 add 의 barrier 가 발동한다.
+        # 스냅샷 필드도 함께 줘야 스토어의 롤백 준비가 성립한다.
+        return {
+            "ids": list(ids),
+            "uris": [None for _ in ids],
+            "documents": ["기존" for _ in ids],
+            "metadatas": [{"stale": "1"} for _ in ids],
+            "embeddings": [[0.1] * 32 for _ in ids],
+        }
 
     def delete(self, ids):
         self.calls.append(("delete", list(ids)))
@@ -485,7 +496,9 @@ class TestChromaUpsertSafety:
         영구 소실된다. 종전 native upsert() 는 같은 실패에서 레코드를 보존했다."""
         ef = _FlakyEF()
         store = _chroma_store_with_ef(tmp_path, ef)
-        store.upsert_texts(texts=["원본 문서"], metadatas=[{"pack_id": "p"}], ids=["r1"])
+        store.upsert_texts(
+            texts=["원본 문서"], metadatas=[{"pack_id": "p", "버릴키": "1"}], ids=["r1"]
+        )
 
         ef.armed = True
         with pytest.raises(Exception):
@@ -495,7 +508,7 @@ class TestChromaUpsertSafety:
         assert store.count() == 1, "임베딩 실패가 기존 레코드를 지웠다"
         got = store.get_by_id("r1")
         assert got is not None and got["document"] == "원본 문서"
-        assert got["metadata"] == {"pack_id": "p"}
+        assert got["metadata"] == {"pack_id": "p", "버릴키": "1"}
 
     def test_rollback_after_embedding_failure_does_not_call_the_embedding_function(
         self, tmp_path
@@ -504,7 +517,7 @@ class TestChromaUpsertSafety:
         # 저장된 임베딩을 명시로 넘기므로 EF 호출이 늘어선 안 된다.
         ef = _FlakyEF()
         store = _chroma_store_with_ef(tmp_path, ef)
-        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1"}], ids=["r1"])
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1", "버릴키": "1"}], ids=["r1"])
         before = store._collection.get(ids=["r1"], include=["embeddings"])
 
         ef.armed = True
@@ -526,8 +539,8 @@ class TestChromaUpsertSafety:
         # (chroma 의 add 는 기존 id 에 대해 조용한 no-op 이므로) 반쯤 쓰인
         # 새 레코드가 그대로 살아남는다.
         store = build_vector_store("chroma", tmp_path)
-        store.upsert_texts(texts=["A 원본"], metadatas=[{"k": "a"}], ids=["a"])
-        store.upsert_texts(texts=["B 원본"], metadatas=[{"k": "b"}], ids=["b"])
+        store.upsert_texts(texts=["A 원본"], metadatas=[{"k": "a", "버릴키": "1"}], ids=["a"])
+        store.upsert_texts(texts=["B 원본"], metadatas=[{"k": "b", "버릴키": "1"}], ids=["b"])
 
         real_add = store._collection.add
 
@@ -562,7 +575,9 @@ class TestChromaUpsertSafety:
             ids=["uri1"], embeddings=[[0.1] * 32], documents=["uri 원본"],
             metadatas=[{"k": "u"}], uris=["http://example.com/uri1"],
         )
-        store.upsert_texts(texts=["plain 원본"], metadatas=[{"k": "p"}], ids=["plain1"])
+        store.upsert_texts(
+            texts=["plain 원본"], metadatas=[{"k": "p", "버릴키": "1"}], ids=["plain1"]
+        )
 
         real_add = store._collection.add
 
@@ -603,7 +618,9 @@ class TestChromaUpsertSafety:
             ids=["urinometa"], embeddings=[[0.3] * 32], documents=["uri 문서"],
             uris=["http://example.com/urinometa"],
         )
-        store.upsert_texts(texts=["보통 문서"], metadatas=[{"k": "1"}], ids=["plain"])
+        store.upsert_texts(
+            texts=["보통 문서"], metadatas=[{"k": "1", "버릴키": "1"}], ids=["plain"]
+        )
 
         real_add = store._collection.add
 
@@ -631,7 +648,93 @@ class TestChromaUpsertSafety:
         assert not by_id["nometa"][1], f"없던 메타가 생겼다: {by_id['nometa'][1]}"
         assert by_id["urinometa"][0] == "uri 문서"
         assert by_id["urinometa"][2] == "http://example.com/urinometa", "uri 가 사라졌다"
-        assert by_id["plain"] == ("보통 문서", {"k": "1"}, None)
+        assert by_id["plain"] == ("보통 문서", {"k": "1", "버릴키": "1"}, None)
+
+    def test_upsert_without_stale_keys_never_deletes(self, tmp_path):
+        """[리뷰 라운드5] 버려질 키가 없으면 병합 결과가 곧 치환 결과다. 그때는
+        원자적 native upsert 로 가야 한다 — delete 창이 없어야 reader 가 살아
+        있는 레코드를 부재로 읽지 않는다."""
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["v1"], metadatas=[{"a": "1"}], ids=["r1"])
+
+        calls: dict[str, list[list[str]]] = {"upsert": [], "delete": [], "add": []}
+        for name in calls:
+            real = getattr(store._collection, name)
+
+            def wrap(_real=real, _name=name, **kw):
+                calls[_name].append(list(kw.get("ids", [])))
+                return _real(**kw)
+
+            setattr(store._collection, name, wrap)
+
+        store.upsert_texts(texts=["v2"], metadatas=[{"a": "2", "b": "3"}], ids=["r1"])
+
+        assert calls["delete"] == [], f"버릴 키가 없는데 삭제했다: {calls}"
+        assert calls["upsert"] == [["r1"]], f"원자적 경로를 안 탔다: {calls}"
+        got = store._collection.get(ids=["r1"], include=["documents", "metadatas"])
+        assert got["documents"][0] == "v2"
+        assert got["metadatas"][0] == {"a": "2", "b": "3"}
+
+    def test_upsert_dropping_a_key_still_replaces(self, tmp_path):
+        # #175 본래 계약: 호출자가 버린 키는 실제로 사라져야 한다. 라우팅이
+        # 원래 버그를 삼키지 않는지 지킨다.
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["v1"], metadatas=[{"a": "1", "stale": "x"}], ids=["r1"])
+        store.upsert_texts(texts=["v2"], metadatas=[{"a": "2"}], ids=["r1"])
+
+        got = store._collection.get(ids=["r1"], include=["documents", "metadatas"])
+        assert got["documents"][0] == "v2"
+        assert got["metadatas"][0] == {"a": "2"}, "스테일 키가 살아남았다"
+
+    def test_get_by_id_rechecks_under_the_lock_on_a_miss(self, tmp_path):
+        """치환 중(delete~add 사이)에 읽어도 살아 있는 레코드를 부재로 보고하면
+        안 된다. pack 정체성 검사가 None 을 '충돌 없음'으로 읽기 때문이다."""
+        store = build_vector_store("chroma", tmp_path)
+        store.upsert_texts(texts=["원본"], metadatas=[{"k": "1", "버릴키": "1"}], ids=["r1"])
+
+        real_add = store._collection.add
+        in_window = threading.Event()
+        release = threading.Event()
+
+        def park_then_add(**kw):
+            if "embeddings" not in kw:      # 전진 경로의 add 에서만 멈춘다
+                in_window.set()
+                assert release.wait(timeout=10)
+            return real_add(**kw)
+
+        store._collection.add = park_then_add
+
+        # 노출되는 인터리빙은 "핸들을 이미 스냅샷한 reader"다. 스냅샷 직후
+        # 선점된 상황을 주입한다 — 그냥 읽으면 _collection_handle() 이 같은
+        # 락에 걸려 창을 아예 못 보고, 테스트가 무의미해진다.
+        real_handle = store._collection_handle
+
+        def snapshot_then_wait():
+            handle = real_handle()
+            assert in_window.wait(timeout=10), "치환 창에 진입하지 못했다"
+            return handle
+
+        store._collection_handle = snapshot_then_wait
+
+        seen = []
+        reader = threading.Thread(target=lambda: seen.append(store.get_by_id("r1")))
+        reader.start()
+        writer = threading.Thread(
+            target=store.upsert_texts,
+            kwargs=dict(texts=["새"], metadatas=[{"k": "2"}], ids=["r1"]),
+        )
+        writer.start()
+        assert in_window.wait(timeout=10), "치환 창에 진입하지 못했다"
+        # 이 시점에 레코드는 delete 됐고 add 는 아직이다.
+        assert store._collection.get(ids=["r1"])["ids"] == [], "창 재현 실패"
+
+        release.set()
+        writer.join(timeout=10)
+        reader.join(timeout=10)
+        store._collection.add = real_add
+        store._collection_handle = real_handle
+        assert seen and seen[0] is not None, "살아 있는 레코드를 부재로 보고했다"
+        assert seen[0]["document"] == "새"
 
     def test_same_collection_stores_share_one_lock(self, tmp_path):
         # 인스턴스가 하나뿐이라는 보장이 없으므로(_get_context 는 초기화를 잠그지

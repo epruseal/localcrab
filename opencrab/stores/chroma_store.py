@@ -192,9 +192,23 @@ class ChromaStore:
         survive forever under a plain ``upsert()``. sqlite-vec
         (DELETE-then-INSERT) and pgvector (``ON CONFLICT ... DO UPDATE SET
         metadata = EXCLUDED.metadata``) both give full-replace semantics, so
-        for ids with no uri this store replaces too: delete()-then-add().
-        delete() on ids that don't exist yet is a no-op (verified), so this
-        is safe for the add-or-update case too.
+        this store replaces too, via delete()-then-add(). delete() on ids that
+        don't exist yet is a no-op (verified), so that is safe for the
+        add-or-update case as well.
+
+        Which ids actually need it: only those that would LOSE a metadata key.
+        A merge and a replace differ solely in what happens to keys the caller
+        no longer passes, so when the existing metadata's keys are a subset of
+        the new one's, native ``upsert()`` lands exactly the caller's metadata
+        (measured: seeding ``{'a','b'}`` then upserting ``{'a','b','c'}`` reads
+        back as exactly the new dict, document and embedding replaced). Those
+        ids — including every brand-new id, which has no existing keys at all
+        — take the single atomic call, which cannot expose a delete window to
+        a concurrent reader and has no half-applied state to roll back. Every
+        caller in this repository passes the complete canonical metadata dict
+        on every call (see ``opencrab/stores/_vector_base.py``), so this is
+        the path that normally runs; delete()+add() is reserved for a genuine
+        key drop.
 
         EXCEPTION — uri-bearing records: this store never produces a record
         carrying a uri (no code path here calls ``add(uris=...)``), so any id
@@ -220,11 +234,22 @@ class ChromaStore:
         then fail. Omitting ``metadatas`` altogether is the call shape that
         hits this — it becomes ``[{}, ...]`` here.
 
-        Concurrency: the uri check and the delete/add it selects run under the
+        Concurrency: the routing read and the writes it selects run under the
         store's lock — shared by every ChromaStore in this process that
         targets the same collection, and the same lock ``reset_collection()``
         takes — so same-id concurrent upserts inside one process cannot
         interleave into a lost update.
+
+        Readers and the replace path: between its delete() and add() the
+        record does not exist, and a reader that snapshotted the collection
+        handle just before the write started can read in that gap.
+        ``get_by_id`` re-checks a miss under the lock and so never reports a
+        live record as absent; ``query`` does not, deliberately — closing it
+        means holding this lock across every search, parking searches behind
+        an in-flight ingest's embedding computation, and a search cannot even
+        tell that an n+1-th hit was momentarily missing. Note this window is
+        only reachable for an upsert that actually drops a metadata key; the
+        ordinary full-dict upsert takes the atomic path above.
 
         What that lock does NOT cover, stated so callers do not over-trust it:
 
@@ -320,10 +345,10 @@ class ChromaStore:
             # same non-reentrant lock and would deadlock here.
             handle = self._collection
 
-            # One read serves two purposes: it splits the batch by whether the
-            # id already carries a uri (those go through merge (upsert),
-            # everything else through replace (delete+add) — see docstring),
-            # and it is the rollback snapshot for the mutation below.
+            # One read serves three purposes: it finds which ids carry a uri,
+            # it says which ids would lose a metadata key (the only reason to
+            # replace rather than merge — see docstring), and it is the
+            # rollback snapshot for the mutation below.
             existing = handle.get(
                 ids=ids, include=["uris", "documents", "metadatas", "embeddings"]
             )
@@ -332,35 +357,42 @@ class ChromaStore:
                 for doc_id, uri in zip(existing["ids"], existing.get("uris") or [])
                 if uri is not None
             }
+            existing_meta = dict(zip(existing["ids"], existing["metadatas"]))
+
+            def _is_atomic(pos: int) -> bool:
+                doc_id = ids[pos]
+                if doc_id in uri_ids:
+                    return True
+                # No existing key can go stale => native upsert()'s merge lands
+                # exactly the caller's metadata, so the atomic call is a full
+                # replace and there is no delete window to expose.
+                return set(existing_meta.get(doc_id) or {}).issubset(clean_meta[pos])
+
+            merge_pos = [i for i in range(len(ids)) if _is_atomic(i)]
+            replace_pos = [i for i in range(len(ids)) if not _is_atomic(i)]
 
             try:
-                if not uri_ids:
-                    handle.delete(ids=ids)
-                    handle.add(documents=texts, metadatas=clean_meta, ids=ids)
-                else:
-                    merge_pos = [i for i, doc_id in enumerate(ids) if doc_id in uri_ids]
-                    replace_pos = [
-                        i for i, doc_id in enumerate(ids) if doc_id not in uri_ids
-                    ]
-                    if merge_pos:
-                        handle.upsert(
-                            documents=[texts[i] for i in merge_pos],
-                            metadatas=[clean_meta[i] for i in merge_pos],
-                            ids=[ids[i] for i in merge_pos],
-                        )
+                if merge_pos:
+                    handle.upsert(
+                        documents=[texts[i] for i in merge_pos],
+                        metadatas=[clean_meta[i] for i in merge_pos],
+                        ids=[ids[i] for i in merge_pos],
+                    )
+                    merged_uri = [ids[i] for i in merge_pos if ids[i] in uri_ids]
+                    if merged_uri:
                         logger.warning(
                             "ChromaDB: %d uri-bearing record(s) upserted via merge "
                             "(uri preserved, stale metadata keys may persist): %s",
-                            len(merge_pos), [ids[i] for i in merge_pos],
+                            len(merged_uri), merged_uri,
                         )
-                    if replace_pos:
-                        replace_ids = [ids[i] for i in replace_pos]
-                        handle.delete(ids=replace_ids)
-                        handle.add(
-                            documents=[texts[i] for i in replace_pos],
-                            metadatas=[clean_meta[i] for i in replace_pos],
-                            ids=replace_ids,
-                        )
+                if replace_pos:
+                    replace_ids = [ids[i] for i in replace_pos]
+                    handle.delete(ids=replace_ids)
+                    handle.add(
+                        documents=[texts[i] for i in replace_pos],
+                        metadatas=[clean_meta[i] for i in replace_pos],
+                        ids=replace_ids,
+                    )
             except Exception:
                 # The mutation may be partially applied at this point -- some
                 # ids deleted, some rewritten, some never touched (a uri-only
@@ -379,8 +411,8 @@ class ChromaStore:
                 raise
 
         logger.debug(
-            "ChromaDB: upserted %d documents (%d replaced, %d merged for uri)",
-            len(ids), len(ids) - len(uri_ids), len(uri_ids),
+            "ChromaDB: upserted %d documents (%d replaced, %d merged atomically)",
+            len(ids), len(replace_pos), len(merge_pos),
         )
         return ids
 
@@ -435,17 +467,26 @@ class ChromaStore:
         return hits
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
-        """Retrieve a document by its ID."""
+        """Retrieve a document by its ID.
+
+        A miss is re-checked under the store lock. A key-dropping upsert
+        replaces via delete()+add(), and a reader that snapshotted the handle
+        just before that write started can land between the two and see an
+        existing record as absent. Callers act on that absence: the identity
+        probe behind ``pack_create``/``pack_ingest``
+        (``opencrab/mcp/tools/pack.py:_foreign_pack``) reads None as "no
+        conflict" in an otherwise fail-closed check, so a transient miss would
+        let a foreign pack's slot be overwritten. The re-check costs one lock
+        acquisition on the miss path and blocks only while some thread is
+        mid-write on this collection.
+        """
         self._require_available()
 
-        result = self._collection_handle().get(ids=[doc_id])
-        if result["ids"]:
-            return {
-                "id": result["ids"][0],
-                "document": result["documents"][0],
-                "metadata": result["metadatas"][0] if result["metadatas"] else {},
-            }
-        return None
+        hit = _read_one(self._collection_handle(), doc_id)
+        if hit is not None:
+            return hit
+        with self._lock:
+            return _read_one(self._collection, doc_id)
 
     def delete(self, ids: list[str]) -> None:
         """Delete documents by their IDs."""
@@ -477,6 +518,18 @@ class ChromaStore:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_one(handle: Any, doc_id: str) -> dict[str, Any] | None:
+    """Point lookup shaped for this store's callers, or None when absent."""
+    result = handle.get(ids=[doc_id])
+    if not result["ids"]:
+        return None
+    return {
+        "id": result["ids"][0],
+        "document": result["documents"][0],
+        "metadata": result["metadatas"][0] if result["metadatas"] else {},
+    }
 
 
 def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> None:
