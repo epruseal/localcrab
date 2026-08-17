@@ -88,7 +88,14 @@ SAFETY:
     graph.db, doc_store.db, AND (only when the resolved vector backend is
     sqlite-vec) the configured vector db file -- step 5 rewrites vector
     rows by re-embedding them, which is not reversible without that copy
-    (PR #177 review round 8). A local Chroma store is a DIRECTORY
+    (PR #177 review round 8). WHERE TO FIND THE VECTOR COPY when restoring:
+    a VECTOR_DB_FILE that is a plain name or a relative subpath keeps its
+    layout under the backup dir (vectors.db -> <backup>/vectors.db,
+    shards/v.db -> <backup>/shards/v.db), but one given as an ABSOLUTE or
+    parent-traversing path is placed in <backup>/external-vector/<basename>
+    so it cannot collide with the three core destinations above. If the
+    configured path resolves to one of the core files, no second copy is
+    made -- the core copy IS the vector backup, and the run says so. A local Chroma store is a DIRECTORY
     (<local_data_dir>/chroma via PersistentClient), not a SQLite file, so
     it is NOT covered; the run warns and names the uncovered path rather
     than reporting a backup that silently omits it.
@@ -1702,12 +1709,19 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
                 # misses and the existence guard aborts EVERY mandatory
                 # --apply --backup-to run (PR #177 review round 14).
                 #
-                # Park external sources under a reserved SUBDIRECTORY instead
-                # of renaming them: core destinations sit directly in
-                # dest_dir, so a different directory cannot collide with them
-                # within one run, and leaving the basename alone keeps the
-                # name recognisable AND avoids the filename-length ceiling a
-                # prefix would risk on a long basename.
+                # Park external sources in a SUBDIRECTORY instead of renaming
+                # them: core destinations sit directly in dest_dir, so a
+                # different directory cannot collide with them within one run,
+                # and leaving the basename alone keeps the name recognisable
+                # AND avoids the filename-length ceiling a prefix would risk
+                # on a long basename.
+                #
+                # "external-vector" is a CONVENTION, not an enforced
+                # reservation: a relative VECTOR_DB_FILE spelled literally
+                # "external-vector/x.db" lands here too. That is harmless --
+                # one run has exactly one vector file, and a leftover from an
+                # earlier run is a different source, which the existence
+                # guard below correctly refuses to overwrite.
                 vec_rel = Path("external-vector") / vec_rel.name
             vec_dst = dest_dir / vec_rel
             existing_dst = copied_backups.get(vec_src.resolve())
