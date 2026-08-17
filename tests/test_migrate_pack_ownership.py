@@ -3326,17 +3326,16 @@ class TestColocatedVectorDbReusesCoreBackup:
         assert backed_up.count(str(backup_dir / "graph.db")) == 1
 
         out = capsys.readouterr().out
-        named = [
-            tok.rstrip(",")
-            for line in out.splitlines()
-            if "already backed up as" in line
-            for tok in line.split()
-            if tok.endswith((".db", ".sqlite"))
-        ]
-        assert named, out
-        assert any(Path(tok).is_file() for tok in named), (
-            f"skip message names a path that does not exist: {named}"
-        )
-        assert not any(tok.endswith("actual.sqlite") for tok in named), (
-            f"message reconstructed the name from the resolved source: {named}"
+        skip_line = next(ln for ln in out.splitlines() if "already backed up as" in ln)
+        reported = skip_line.split("already backed up as", 1)[1].strip().rstrip(",")
+        reported = reported.split(",")[0].strip()
+
+        # The reported restore source must be the destination the core loop
+        # actually created...
+        assert reported == str(backup_dir / "graph.db"), skip_line
+        assert Path(reported).is_file(), f"reported path does not exist: {reported}"
+        # ...and must NOT be a name rebuilt from the resolved source, which is
+        # what the pre-fix implementation produced.
+        assert "actual.sqlite" not in reported, (
+            f"message reconstructed the name from the resolved source: {reported}"
         )
