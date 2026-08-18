@@ -679,6 +679,58 @@ def _target_only_auth(pg_engine: Any, sqlite_path: str) -> dict[str, list[str]]:
         conn.close()
 
 
+def check_reverse_preflight(
+    pg_engine: Any, sqlite_path: str, *, allow_target_only_auth: bool
+) -> None:
+    """쓰기 이전에 답해야 하는 인증 질문을 한자리에서 묻는다.
+
+    ``_run`` 과 ``migrate_sql`` 양쪽에서 부른다. ``_run`` 쪽이 그래프·문서·벡터보다
+    먼저 돌아야 실제로 아무것도 안 쓴 상태에서 멈추고, ``migrate_sql`` 쪽은 이 함수를
+    직접 호출하는 경로를 보호한다.
+    """
+    if not os.path.exists(sqlite_path):
+        return
+
+    conflict = _local_identity_conflict(pg_engine, sqlite_path)
+    if conflict:
+        src_user, dst_user = conflict
+        # 면제가 타깃 로컬 사용자를 target-only 목록에서 빼주므로 아래 검사로는
+        # 안 걸린다. 그런데 소스 로컬 사용자를 복사하는 순간 partial unique index
+        # 위반이 나므로, 여기서 멈추지 않으면 그래프·문서·벡터를 다 쓴 뒤에야 실패한다.
+        raise mt.MigrationError(
+            f"소스와 타깃이 서로 다른 로컬 사용자를 갖고 있다 "
+            f"(소스={src_user}, 타깃={dst_user}) -- "
+            + mt.CONSTRAINT_REMEDIES["idx_users_single_local"]
+        )
+
+    if not allow_target_only_auth:
+        target_only = _target_only_auth(pg_engine, sqlite_path)
+        if target_only:
+            raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
+
+
+def _local_identity_conflict(pg_engine: Any, sqlite_path: str) -> tuple[str, str] | None:
+    """소스와 타깃이 서로 다른 로컬 사용자를 가지면 (소스, 타깃) 아이디."""
+    from sqlalchemy import inspect, text  # type: ignore[import]
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        target_tables = {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        dst_user, _ = mt.local_identity(conn, target_tables)
+    finally:
+        conn.close()
+    if dst_user is None or not inspect(pg_engine).has_table("users"):
+        return None
+    with pg_engine.connect() as pg_conn:
+        rows = pg_conn.execute(text("SELECT user_id FROM users WHERE is_local")).fetchall()
+    src_users = {r[0] for r in rows}
+    if src_users and dst_user not in src_users:
+        return sorted(src_users)[0], dst_user
+    return None
+
+
 def migrate_sql(
     pg_url: str,
     sqlite_path: str,
@@ -725,10 +777,9 @@ def migrate_sql(
     )
 
     # 복사 전에 검사한다. 다 쓴 뒤에 중단하면 종료 코드만 바뀌고 타깃은 이미 오염된다.
-    if not allow_target_only_auth:
-        target_only = _target_only_auth(pg_engine, sqlite_path)
-        if target_only:
-            raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
+    check_reverse_preflight(
+        pg_engine, sqlite_path, allow_target_only_auth=allow_target_only_auth
+    )
 
     table_results: dict[str, dict[str, Any]] = {}
 
@@ -1033,12 +1084,12 @@ def _run(args: argparse.Namespace) -> int:
 
     # 자격증명 가드는 어떤 스토어보다 먼저 돈다. Step 2~4 가 그래프·문서·벡터를 먼저
     # 쓰므로, migrate_sql 안에서만 중단하면 이미 세 스토어를 고친 뒤의 종료 코드가 된다.
-    if not args.skip_sql and not args.allow_target_only_auth:
-        sqlite_path = os.path.join(local_data_dir, "opencrab.db")
-        if os.path.exists(sqlite_path):
-            target_only = _target_only_auth(preflight_result["pg_engine"], sqlite_path)
-            if target_only:
-                raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
+    if not args.skip_sql:
+        check_reverse_preflight(
+            preflight_result["pg_engine"],
+            os.path.join(local_data_dir, "opencrab.db"),
+            allow_target_only_auth=args.allow_target_only_auth,
+        )
 
     # Step 1 — 백업
     with file_lock("write.lock", local_data_dir):

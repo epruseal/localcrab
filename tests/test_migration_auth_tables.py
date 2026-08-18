@@ -990,10 +990,9 @@ class TestIndependentlyInitialisedTarget:
     def test_reverse_reports_a_row_dropped_by_another_constraint(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
     ) -> None:
-        """INSERT OR IGNORE discards a row for any constraint, not just the
-        conflict key, and says nothing. One local user on each side keeps the
-        counts equal, so only a key comparison notices the source user is gone.
-        """
+        """One local user on each side is a realistic round trip once another
+        installation has been migrated forward. The counts stay equal either
+        way, so nothing downstream would have noticed on its own."""
         import logging
 
         src_db = str(tmp_path / "source.db")
@@ -1015,16 +1014,40 @@ class TestIndependentlyInitialisedTarget:
                 "VALUES ('u-target-local', 'Target Local', 1, 0, '2026-01-01 00:00:00')"
             )
 
-        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
-        stats = result["tables"]["users"]
-        assert stats["target"] == stats["source"] == 1, "the count must match, or this proves nothing"
-        assert stats["missing_keys"] == 1
-        assert rev._row_preservation_mismatches(result) == ["users"]
-        # The summary and the exit code must not disagree: judging the table by
-        # count alone renders it green while the run exits 5, pointing the
-        # operator at numbers that do not explain the failure.
+        # Two different local users cannot coexist: idx_users_single_local
+        # rejects the source row. That used to surface only after the copy had
+        # started, so it is refused up front now -- the reverse pipeline writes
+        # graph, doc and vector data before the SQL step would have noticed.
+        with pytest.raises(mt.MigrationError) as excinfo:
+            rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        message = str(excinfo.value)
+        assert "u-source-local" in message and "u-target-local" in message
+        assert mt.CONSTRAINT_REMEDIES["idx_users_single_local"] in message
+        with sqlite3.connect(back_db) as conn:
+            assert conn.execute("SELECT count(*) FROM api_tokens").fetchone()[0] == 0
+
+
+class TestSummaryAgreesWithExitCode:
+    """The summary table and the exit code must not disagree. Judging a table by
+    row count alone renders it green while the run exits non-zero, pointing the
+    operator at numbers that do not explain the failure."""
+
+    @pytest.mark.parametrize(
+        "stats",
+        [
+            {"source": 1, "target": 1, "missing_keys": 1, "failed_rows": 0},
+            {"source": 1, "target": 1, "missing_keys": 0, "failed_rows": 1},
+            {"source": 2, "target": 1, "missing_keys": 0, "failed_rows": 0},
+        ],
+    )
+    def test_a_failing_table_is_never_green(self, stats: dict) -> None:
+        assert rev._preservation_failure(stats) is not None
         assert "MISMATCH" in rev._sql_status(stats)
-        assert "missing_keys" in rev._sql_status(stats)
+
+    def test_a_healthy_table_is_green(self) -> None:
+        stats = {"source": 2, "target": 2, "missing_keys": 0, "failed_rows": 0}
+        assert rev._preservation_failure(stats) is None
+        assert "OK" in rev._sql_status(stats)
 
 
 class TestPreflightCounts:
