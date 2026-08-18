@@ -20,6 +20,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
 from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_QUERY_CUES
@@ -1036,6 +1037,12 @@ class HybridQuery:
         """
         meta = metadata or {}
         meta["source_id"] = source_id
+        # Ownership-tag invariant (#171). Deliberately ABOVE both the
+        # unavailable-store early return and the broad try below: inside the try
+        # the ValueError would be swallowed into a store-status string, and after
+        # the early return the check would silently switch off on deployments
+        # with no vector store.
+        canonicalize_pack_alias(meta)
 
         result: dict[str, Any] = {"source_id": source_id, "stores": {}}
 

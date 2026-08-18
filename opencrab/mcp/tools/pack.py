@@ -17,6 +17,7 @@ import hashlib
 import logging
 from typing import Any
 
+from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.common.text import slugify
 
 from ._registry import AccessTier, tool
@@ -203,6 +204,21 @@ def _identity_reject_message(kind: str, ident: str, reason: str) -> str:
     return f"{ident}: identity is already attributed to a different pack"
 
 
+def _warn_dropped_alias(dropped: str | None, kind: str, ident: str) -> None:
+    """Surface a retired `pack` alias that disagreed with the destination pack.
+
+    Caller-facing boundary, so the drop is not silent (#171). It is not an
+    error: pack_id is authoritative here by construction, and refusing the
+    whole write over a redundant legacy key would be a worse trade.
+    """
+    if dropped is None:
+        return
+    logger.warning(
+        "%s %s: dropped retired 'pack' alias %r that disagreed with the "
+        "destination pack_id", kind, ident, dropped,
+    )
+
+
 def _ingest_into_pack(
     pack_id: str,
     *,
@@ -283,7 +299,7 @@ def _ingest_into_pack(
                 )
                 continue
             props = dict(_clean_meta(item.get("properties") or {}))
-            props["pack_id"] = pack_id
+            _warn_dropped_alias(apply_pack_tag(props, pack_id), "node", item_node_id)
             node_result = ctx["builder"].add_node(
                 space=item_space,
                 node_type=item_node_type,
@@ -357,7 +373,7 @@ def _ingest_into_pack(
                 continue
 
             props = dict(_clean_meta(item.get("properties") or {}))
-            props["pack_id"] = pack_id
+            _warn_dropped_alias(apply_pack_tag(props, pack_id), "edge", item.get("id") or "?")
             edge_result = ctx["builder"].add_edge(
                 from_space=item_from_space,
                 from_id=item_from_id,
@@ -390,7 +406,7 @@ def _ingest_into_pack(
     if text and source_id:
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
-        meta["pack_id"] = pack_id
+        _warn_dropped_alias(apply_pack_tag(meta, pack_id), "source", source_id)
         # issue #52 follow-up: the legacy branch below (text_as_node=False)
         # writes this same `meta` into both the vector store (hybrid.ingest)
         # and doc_sources (mongo.upsert_source) with no `space` tag, so

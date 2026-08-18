@@ -27,6 +27,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.locking import write_lock
 
 _PACK_RE = re.compile(r"/packs/([^/]+)/")
@@ -353,7 +354,7 @@ def _backfill_pack_ids_unlocked(
                     props = json.loads(row["properties"]) if row["properties"] else {}
                 except (TypeError, ValueError):
                     props = {}
-                props["pack_id"] = pack_id
+                apply_pack_tag(props, pack_id)   # 폐기 별칭도 함께 정리한다(#171)
                 summary[f"{table.split('_')[1]}_{reason}"] += 1
                 if not dry_run:
                     set_clauses = " AND ".join(f"{c}=?" for c in key_cols)

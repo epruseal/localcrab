@@ -37,6 +37,7 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
+from opencrab.common.pack_tags import RETIRED_KEYS, apply_pack_tag, strip_retired_keys
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
 from opencrab.pack.jsonl_io import iter_jsonl
 from opencrab.pack.live_data import require_live_data
@@ -58,6 +59,13 @@ log = logging.getLogger(__name__)
 # `space` 도 주입하게 됐고(#125) 그 순간 동일한 행이 전부 chg 로 판정됐다.
 # 이름을 하나 더 적는 대신 "스토어가 넣는 것"이라는 축으로 묶는다.
 STORE_INJECTED_KEYS = frozenset({"id", "space"})
+
+# 증분 비교에서 빼는 키 = 스토어가 넣는 것 + `#159` 가 폐기한 것(`pack`).
+# 폐기 키를 빼지 않으면 그 키를 가진 라이브 행이 **매 증분 전량 chg** 로 잡힌다.
+# 재기록으로 지워지지도 않는다 — neo4j 의 upsert 는 전달된 키만 SET 하므로
+# `pack` 없는 dict 를 써도 기존 속성이 남고, 그래서 그 재기록이 영구히 반복된다.
+# 남아 있어도 읽는 코드가 0곳이라 무해하다(`common/pack_tags.py` 참고).
+INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
 
 
 # ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
@@ -1204,7 +1212,8 @@ def load_nodes_incremental(
                 # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
                 # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
                 # "스토어가 넣는 것"이라는 축으로 묶는다.
-                live_props = {k: v for k, v in live[2].items() if k not in STORE_INJECTED_KEYS}
+                live_props = {k: v for k, v in live[2].items()
+                              if k not in INCREMENTAL_IGNORED_KEYS}
                 if live[0] == node_type and live_props == props:
                     # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                     # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
@@ -1400,7 +1409,7 @@ def load_edges(
             # 'openclaw-conversations-local'로 오염됐던 사례; 원본은 origin_pack_id로 보존)
             if props.get("pack_id") and props["pack_id"] != pack_name:
                 props["origin_pack_id"] = props["pack_id"]
-            props["pack_id"] = pack_name
+            apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
 
             try:
                 res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props)
@@ -1634,7 +1643,7 @@ def load_chunks_incremental(
                 b_texts.append(row["text"])
                 b_metas.append(meta)
                 b_kinds.append("txt")
-            elif live[1] != meta:
+            elif strip_retired_keys(live[1]) != meta:
                 # 텍스트 불변, 메타만 변경 — 임베딩은 재계산하지 않는다(텍스트가 같으므로).
                 #
                 # **벡터를 먼저 고치고, 성공했을 때만 doc 기준을 옮긴다.** 형제(flush·

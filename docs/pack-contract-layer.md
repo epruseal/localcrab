@@ -102,22 +102,38 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
     PYTHONPATH=<이 리포> python -c "from opencrab.pack.normalize import transform_node; \
       print(transform_node('owner', {'id':'n1','properties':{'source':'foreign'}})[3])"
 
-### `pack` 도 회수 키가 아니다
+### `pack` 은 폐기됐다 (#159, #171)
 
-생산자가 `pack` 을 `pack_id` 와 **같은 값으로만** 쓰므로(`normalize.transform_node`)
-회수 범위를 한 행도 넓히지 못한다. 반면 `rename_pack_ids` 는 `pack_id` 만 갱신하므로,
-회수가 `pack` 을 보면 rename 이 남긴 옛 이름이 회수 판정에 끼어든다. 이득 0, 위험만 는다.
+`properties.pack` 은 `pack_id` 의 **사본**이었다. 생산자가 언제나 같은 값으로 썼고,
+읽는 자리는 `ontology.builder.add_node` 가 노드 벡터 메타의 `source` 를 만들 때 하나뿐이었다.
+그런데 `pack_id` 만 덮고 `pack` 은 보존하는 writer 들이 있어 한 행이 서로 다른 두 소유
+태그를 갖는 상태가 생길 수 있었고, 그 행이 builder 를 지나면 벡터 `source` 가 **옛 이름**
+으로 찍혔다. 축 자체를 없앴다.
 
-다만 **`pack` 은 죽은 키가 아니다** — `ontology.builder.add_node` 가 노드 벡터의 메타를
-만들 때 이것을 읽는다:
+- **벡터 `source` 는 `pack_id` 에서 나온다.** `pack_id` 가 없는 행은 빈 문자열이다 —
+  그 행에 source 를 주던 유일한 근거가 그 별칭이었다.
+- **소유 태그를 쓰는 자리는 `opencrab/common/pack_tags.py` 를 지난다.** 팩 권위 writer
+  (`normalize`, `load_edges`, mcp 팩 스탬핑, provenance backfill, 이관 스크립트)는
+  `apply_pack_tag` 로 정규화하고, 범용 진입점(`builder.add_node`/`add_edge`,
+  `HybridQuery.ingest`)은 `canonicalize_pack_alias` 로 **불일치를 `ValueError` 로 거부**한다.
+  한 행이 `pack` 과 truthy `pack_id` 를 동시에 갖고 값이 다를 수 없다는 것이 그 불변식이다.
+- **`pack` 만 있고 `pack_id` 가 없는 행은 보존한다.** 모순이 아니고, 임의 속성을 그대로
+  저장한다는 진입점 계약을 깰 이유가 없다. 읽는 코드가 0곳이라 무해하다.
+- **증분 대조는 `pack` 을 무시한다**(`load.INCREMENTAL_IGNORED_KEYS`, 노드축·청크축 둘 다).
+  빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로 잡히는데, neo4j 의 upsert 는
+  전달된 키만 SET 하므로 재기록해도 사라지지 않아 그 재기록이 영구히 반복된다.
+- **라이브 잔여분은 청소하지 않는다.** 읽는 코드가 없어 무해하다. 확인하고 싶으면
+  실행 중인 백엔드에 대해 읽기 전용으로 센다(아래는 로컬 SQLite 예시 — 다른 백엔드·다른
+  축은 같은 형태로 각자 질의해야 한다):
 
-```python
-"source": str(props.get("pack") or props.get("pack_id") or ""),
+```sql
+-- graph.db
+SELECT COUNT(*) FROM graph_nodes WHERE json_extract(properties,'$.pack') IS NOT NULL;
+SELECT COUNT(*) FROM graph_nodes
+ WHERE json_extract(properties,'$.pack') IS NOT NULL
+   AND json_extract(properties,'$.pack_id') IS NOT NULL
+   AND json_extract(properties,'$.pack') <> json_extract(properties,'$.pack_id');
 ```
-
-즉 노드 벡터의 `source` 가 `properties.pack` 에서 나온다. 회수가 그 `source` 를 더는 안 보므로
-지금은 무해하지만, `pack` 을 건드리는 변경은 **벡터 메타까지 함께 봐야 한다.**
-`pack` 자체를 없애는 것이 정본 해법이다(localcrab #159).
 
 ### 통일하려는 시도를 조심하라
 

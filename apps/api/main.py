@@ -548,7 +548,12 @@ def ingest_text(
 
     with write_lock():
         _enforce_ingest_limits(ctx, auth, source_id)
-        result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
+        try:
+            result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
+        except ValueError as exc:
+            # Ownership-tag invariant violation (#171) — a client error, not a 500.
+            # Same disposition the node/edge endpoints already give ValueError.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
         if source_doc_id:

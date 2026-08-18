@@ -851,6 +851,10 @@ def test_pack_tool_strings_never_name_an_unregistered_tool():
         "pack_registry",
         "pack_create_or_ingest",
         "content_pack_list_query",
+        # opencrab.common.pack_tags -- the ownership-tag canonicalizer module
+        # this file imports (#159/#171). A module path, not a tool name, same
+        # category as pack_registry above.
+        "pack_tags",
     }
     assert unknown == set(), (
         f"pack.py references tool-shaped names that are not registered tools: "

@@ -224,8 +224,9 @@ def test_absorbed_value_cannot_overwrite_original_type():
 
 
 def test_pack_id_is_forced_to_the_argument():
+    """`pack_id` 는 인자로 고정되고, 폐기 별칭 `pack` 은 남지 않는다(#159)."""
     _s, _t, _i, props = N.transform_node("내팩", _node(properties={"pack_id": "남의팩"}))
-    assert props["pack_id"] == "내팩" and props["pack"] == "내팩"
+    assert props["pack_id"] == "내팩" and "pack" not in props
 
 
 def test_statement_fallback_reads_nested_only():

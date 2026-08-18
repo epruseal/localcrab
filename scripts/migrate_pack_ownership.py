@@ -591,15 +591,26 @@ def _missing_and_set_sql(col: str, is_pg: bool) -> tuple[str, str]:
     tables (it originally only reproduced via Mongo's array-matching
     semantics, but nothing about that bug's root cause -- a truthy
     non-string value slipping past every check -- is Mongo-specific)."""
+    # The set expression also DROPS the retired `pack` alias (#159/#171): this
+    # backfill only touches rows with no pack_id, so a row carrying `pack` alone
+    # would otherwise come out with the two ownership tags disagreeing -- exactly
+    # the state #171 forbids. Both operators are no-ops when the key is absent,
+    # and neither touches the WHERE clause, the selected rows, or the rowcount,
+    # so this function's per-chunk expected-count assertion is unaffected.
     if is_pg:
         missing = f"({col}->>'pack_id') IS NULL OR ({col}->>'pack_id') = ''"
-        set_expr = f"COALESCE({col}, '{{}}'::jsonb) || jsonb_build_object('pack_id', :pid)"
+        set_expr = (
+            f"(COALESCE({col}, '{{}}'::jsonb) || jsonb_build_object('pack_id', :pid))"
+            " - 'pack'"
+        )
     else:
         missing = (
             f"json_extract({col}, '$.pack_id') IS NULL "
             f"OR json_extract({col}, '$.pack_id') = ''"
         )
-        set_expr = f"json_set(COALESCE({col}, '{{}}'), '$.pack_id', :pid)"
+        set_expr = (
+            f"json_remove(json_set(COALESCE({col}, '{{}}'), '$.pack_id', :pid), '$.pack')"
+        )
     return missing, set_expr
 
 
@@ -1286,8 +1297,18 @@ def _backfill_mongo(db: Any, default_pack_id: str, apply: bool) -> dict[str, Any
         updated = 0
         if apply:
             for pack_id, ids in by_pack.items():
+                # `$unset` also drops the retired `pack` alias (#159/#171) -- this
+                # backfill only selects docs with no pack_id, so a doc carrying the
+                # alias alone would otherwise come out with the two tags
+                # disagreeing. `$unset` on an absent field is a no-op and `$set`
+                # still changes the doc, so the modified_count assertion below
+                # holds unchanged.
                 result = coll.update_many(
-                    {"_id": {"$in": ids}}, {"$set": {f"{field_root}.pack_id": pack_id}}
+                    {"_id": {"$in": ids}},
+                    {
+                        "$set": {f"{field_root}.pack_id": pack_id},
+                        "$unset": {f"{field_root}.pack": ""},
+                    },
                 )
                 if result.modified_count != len(ids):
                     raise RuntimeError(
@@ -1572,6 +1593,7 @@ def _backfill_vector(
     upsert is issued for it, since guessing here would only disagree with
     graph's own "unattributed" verdict.
     """
+    from opencrab.common.pack_tags import apply_pack_tag
     if not (hasattr(vector, "get_by_id") and hasattr(vector, "upsert_texts")):
         print("  vector store has no get_by_id/upsert_texts -- skipping (out of scope, see module docstring).")
         return {"checked": 0, "missing": 0, "updated": 0}
@@ -1598,7 +1620,12 @@ def _backfill_vector(
             if doc is None:
                 continue
             meta = dict(doc.get("metadata") or {})
-            meta["pack_id"] = node_pack_map[node_id]
+            # Also drops the retired `pack` alias (#159/#171). LIMIT: ChromaStore's
+            # upsert_texts MERGES metadata for uri-bearing records (a deliberate
+            # exception so the uri survives), so on those the stored alias stays.
+            # Same best-effort scope this stage already declares; a leftover alias
+            # has no reader left, so it is hygiene rather than correctness.
+            apply_pack_tag(meta, node_pack_map[node_id])
             vector.upsert_texts([doc.get("document") or ""], [meta], [node_id])
             updated += 1
         if updated != len(missing_ids):
