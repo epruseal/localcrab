@@ -43,6 +43,23 @@ class MigrationError(Exception):
     """
 
 
+class TargetOnlyAuthError(MigrationError):
+    """The target holds credentials the source does not.
+
+    Its own class so the forward script can map it to the same exit code as
+    #144's guard -- both refuse before any work happens, and both mean "the
+    operator has to decide", not "the migration broke".
+    """
+
+
+# Credentials only. `packs` is ownership metadata rather than a credential, and
+# a local install legitimately has its own packs, so checking it would fire on
+# the ordinary path. `rebac_policies` grants do widen access, but that table was
+# migrated long before this change, so a target-only grant surviving is a
+# pre-existing defect rather than one this work makes newly reachable.
+AUTH_CREDENTIAL_TABLES: tuple[str, ...] = ("users", "api_tokens")
+
+
 @dataclass(frozen=True)
 class SqlTableSpec:
     """One SQL-store table, in the order it must be copied.
@@ -403,3 +420,52 @@ def safe_error_text(exc: BaseException, *, table: str | None = None, key: str | 
     if key:
         parts.append(f"key={key}")
     return " ".join(parts)
+
+
+def local_identity(sqlite_conn: Any) -> tuple[str | None, set[str]]:
+    """The local user id and its token ids in a local-mode database.
+
+    Local mode needs exactly one ``is_local`` user to bind stdio/CLI to, so that
+    row is this installation's own identity rather than a credential the source
+    failed to account for. ``opencrab init`` creates it together with a token,
+    which is why both are recognised here.
+
+    Compared with ``= 1``, not truthiness: a database created before the CHECK
+    constraint can hold ``is_local = 2``, and ``verify_token`` compares against
+    1 exactly, so such a row is not the local identity and must not be treated
+    as one.
+    """
+    rows = sqlite_conn.execute("SELECT user_id FROM users WHERE is_local = 1").fetchall()
+    if len(rows) > 1:
+        # Unreachable through SQLStore, whose DDL creates idx_users_single_local
+        # alongside the table -- kept for a database built without that index.
+        raise TargetOnlyAuthError(
+            f"target has {len(rows)} is_local users; expected at most one -- "
+            "resolve which one is this installation before migrating"
+        )
+    if not rows:
+        return None, set()
+    user_id = rows[0][0]
+    tokens = sqlite_conn.execute(
+        "SELECT token_id FROM api_tokens WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    return user_id, {r[0] for r in tokens}
+
+
+def target_only_report(target_only: dict[str, list[str]]) -> str:
+    """Abort text for credentials present only in the target.
+
+    Natural keys only -- ``token_hash`` is not a conflict_key of any table, so
+    nothing secret reaches this message (see :func:`safe_error_text`).
+    """
+    parts = [
+        f"{table}: {len(keys)} row(s) e.g. {sorted(keys)[:3]}"
+        for table, keys in sorted(target_only.items())
+        if keys
+    ]
+    return (
+        "target holds credentials the source does not -- completing would leave "
+        "them working while the source does not know about them (" + "; ".join(parts) + "). "
+        "Remove the listed rows from the target and re-run, or pass "
+        "--allow-target-only-auth to keep them."
+    )

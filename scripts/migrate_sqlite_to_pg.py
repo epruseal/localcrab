@@ -351,8 +351,41 @@ def _missing_source_keys(
     return src_keys - dst_keys
 
 
+def _target_only_auth(engine: Any, text: Any, src: Any, source_tables: set[str]) -> dict[str, list[str]]:
+    """Credential keys the PostgreSQL target has that the source does not.
+
+    No local-identity exemption on this side: the target is a PostgreSQL
+    deployment, not the source installation's own identity store, so an
+    ``is_local`` user sitting there is exactly the credential this refuses to
+    silently keep -- its tokens would authenticate as a local principal.
+
+    ``users``/``api_tokens`` are checked even when the source lacks the table
+    entirely; a source that does not know a table cannot vouch for rows in it.
+    """
+    found: dict[str, list[str]] = {}
+    for table in mt.AUTH_CREDENTIAL_TABLES:
+        key = mt.SPEC_BY_NAME[table].conflict_key
+        assert key is not None
+        col = ", ".join(key)
+        src_keys: set[tuple] = set()
+        if table in source_tables:
+            src_keys = {tuple(r) for r in src.execute(f"SELECT {col} FROM {table}")}
+        with engine.begin() as conn:
+            dst_keys = {tuple(r) for r in conn.execute(text(f"SELECT {col} FROM {table}"))}
+        extra = dst_keys - src_keys
+        if extra:
+            found[table] = [",".join(str(v) for v in k) for k in extra]
+    return found
+
+
 def migrate_sql(
-    db_path: str, engine: Any, pg_url: str, batch: int, limit: int | None, dry_run: bool
+    db_path: str,
+    engine: Any,
+    pg_url: str,
+    batch: int,
+    limit: int | None,
+    dry_run: bool,
+    allow_target_only_auth: bool = False,
 ) -> dict[str, int | None]:
     from sqlalchemy import text
 
@@ -401,6 +434,14 @@ def migrate_sql(
     store = SQLStore(url=pg_url)  # idempotent ensure-schema (own engine; PG DDL)
     if not store.available:
         raise mt.MigrationError("SQLStore is not available (connection failed).")
+
+    # Before the first INSERT, like the #144 guard and the corruption scan: a
+    # target holding credentials the source never had would otherwise be left
+    # working, with every source key present so the key comparison passes.
+    if not allow_target_only_auth:
+        target_only = _target_only_auth(engine, text, src, source_tables)
+        if target_only:
+            raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
 
     # Column lists and boolean/timestamp membership are derived once per table
     # here and reused for both the pre-scan and the copy below — deriving them
@@ -638,6 +679,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true", help="assert PG row counts == source after run")
     ap.add_argument(
+        "--allow-target-only-auth",
+        action="store_true",
+        help="proceed even though the target holds users/api_tokens rows the "
+        "source does not; without this flag such a target aborts the run, so a "
+        "credential the source does not know about cannot silently keep working",
+    )
+    ap.add_argument(
         "--allow-unmigrated",
         action="store_true",
         help="proceed even though the source has SQLStore-owned table(s) this "
@@ -664,6 +712,10 @@ def main() -> int:
     print(f"# pg-url   : {pg_url}")
     print(f"# only     : {sorted(only)}")
     print(f"# dry-run  : {args.dry_run}")
+    if args.dry_run:
+        # The target-only credential guard needs the target catalogue, which a
+        # dry run never opens -- its PASS does not cover that check.
+        print("# note     : dry-run does not check for target-only credentials")
 
     unmigrated: list[str] = []
     if "sql" in only and os.path.exists(sql_db):
@@ -696,7 +748,13 @@ def main() -> int:
             )
         if "sql" in only:
             source_counts["sql"] = migrate_sql(
-                sql_db, engine, pg_url, args.batch, args.limit, args.dry_run
+                sql_db,
+                engine,
+                pg_url,
+                args.batch,
+                args.limit,
+                args.dry_run,
+                args.allow_target_only_auth,
             )
         if "vector" in only:
             source_counts["vector"] = migrate_vector(
@@ -710,6 +768,11 @@ def main() -> int:
                 args.limit,
                 args.dry_run,
             )
+    except mt.TargetOnlyAuthError as exc:
+        # Same exit code as the #144 guard: both refuse before doing any work,
+        # and both need an operator decision rather than a bug report.
+        print(f"! {mt.safe_error_text(exc)}")
+        return 2
     except Exception as exc:
         # Constraint names and SQLSTATE only: a driver message can quote the
         # row that failed, and one of those rows is a token hash.

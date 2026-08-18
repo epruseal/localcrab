@@ -666,7 +666,12 @@ class TestForwardAgainstPostgres:
             ), {"h": SECRET_HASH})
         engine.dispose()
 
-        rc = _run_forward(monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn)
+        # The squatter rows are target-only by construction; the guard would
+        # stop the run before the unique violation this test exists to provoke.
+        rc = _run_forward(
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn,
+            "--allow-target-only-auth",
+        )
         captured = capsys.readouterr()
         assert rc != 0
         for stream in (captured.out, captured.err):
@@ -722,8 +727,12 @@ class TestForwardAgainstPostgres:
             ))
         engine.dispose()
 
+        # The source has no users table at all, so u-preexisting is by
+        # definition a credential it cannot vouch for -- opted out here because
+        # this test is about absent-table verification, not that guard.
         rc = _run_forward(
-            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn, "--verify"
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn,
+            "--allow-target-only-auth", "--verify",
         )
         out = capsys.readouterr().out
         assert rc == 0
@@ -968,8 +977,12 @@ class TestIndependentlyInitialisedTarget:
             ))
         engine.dispose()
 
+        # --allow-target-only-auth because u-target is a credential the source
+        # does not have; this test is about the skip, so that guard is opted out
+        # of deliberately and its own behaviour is pinned separately below.
         rc = _run_forward(
-            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn, "--verify"
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn,
+            "--allow-target-only-auth", "--verify",
         )
         assert rc == 0
         assert _pg_rows(pg_schema_dsn, "users", ["user_id"]) == {("u-source",), ("u-target",)}
@@ -1122,3 +1135,234 @@ class TestStaleLocalAuthState:
         assert stats["failed_rows"] == 1
         assert rev._row_preservation_mismatches(result) == ["users"]
         assert "failed_rows" in rev._sql_status(stats)
+
+
+class TestTargetOnlyCredentials:
+    """A credential the source does not have survives the migration untouched,
+    and the key comparison cannot see it -- every source key did arrive. The
+    run then reports success while `verify_token` keeps accepting a token the
+    source never knew about."""
+
+    @staticmethod
+    def _seed_pg_users(dsn: str, rows: list[tuple[str, bool]]) -> None:
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(dsn)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE users (user_id VARCHAR(64) PRIMARY KEY, "
+                "display_name VARCHAR(256) NOT NULL, is_local BOOLEAN NOT NULL DEFAULT FALSE, "
+                "disabled BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ)"
+            ))
+            for user_id, is_local in rows:
+                conn.execute(
+                    text("INSERT INTO users (user_id, display_name, is_local) "
+                         "VALUES (:u, :d, :l)"),
+                    {"u": user_id, "d": user_id, "l": is_local},
+                )
+        engine.dispose()
+
+    def test_forward_aborts_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        _seed_auth_rows(db)
+        self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+
+        rc = _run_forward(monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn)
+        out = capsys.readouterr().out
+        assert rc == 2, "same class as the #144 guard: refused before doing any work"
+        assert "u-stranger" in out
+        # Refused before the copy, so no source row reached the target.
+        assert _pg_count(pg_schema_dsn, "users") == 1
+        assert _pg_count(pg_schema_dsn, "api_tokens") == 0
+
+    def test_forward_flag_allows_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        _seed_auth_rows(db)
+        self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+
+        rc = _run_forward(
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn,
+            "--allow-target-only-auth",
+        )
+        assert rc == 0
+        assert ("u-stranger",) in _pg_rows(pg_schema_dsn, "users", ["user_id"])
+
+    def test_forward_does_not_exempt_a_local_user(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """The reverse direction exempts the local identity because the target
+        is this installation's own database. A PostgreSQL target is not, and an
+        `is_local` user planted there would authenticate as a local principal --
+        the sharpest version of the very thing being refused."""
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        self._seed_pg_users(pg_schema_dsn, [("u-planted-local", True)])
+
+        rc = _run_forward(monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn)
+        assert rc == 2
+
+    def test_reverse_aborts_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, display_name, is_local, disabled, created_at) "
+                "VALUES ('u-stranger', 'Stranger', 0, 0, '2026-01-01 00:00:00')"
+            )
+
+        with pytest.raises(mt.TargetOnlyAuthError) as excinfo:
+            rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        assert "u-stranger" in str(excinfo.value)
+        with sqlite3.connect(back_db) as conn:
+            assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 1, (
+                "refused before the copy -- no source row may have been written"
+            )
+
+    def test_reverse_exempts_the_local_bootstrap_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """`opencrab init` creates a local user and its token together, so every
+        bootstrapped install has them. Refusing on that would fire on the
+        ordinary migration and teach operators to paste the flag."""
+        import logging
+
+        from opencrab.auth import bootstrap_local_user
+        from opencrab.stores.sql_store import SQLStore
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        # No local user in the source: two different local users, one on each
+        # side, collide on idx_users_single_local, and that loud failure is
+        # correct but unrelated to what the exemption is being tested for.
+        with sqlite3.connect(src_db) as conn:
+            conn.execute("UPDATE users SET is_local = 0 WHERE is_local = 1")
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        store = SQLStore(url=f"sqlite:///{back_db}")
+        bootstrap_local_user(store)
+        store._engine.dispose()
+
+        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        assert result["tables"]["users"]["missing_keys"] == 0
+
+    def test_reverse_does_not_exempt_a_non_binary_is_local(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """`verify_token` compares is_local against 1 exactly, and a database
+        predating the CHECK can hold 2. Treating truthiness as the local
+        identity would exempt such a row -- it is not the identity local mode
+        binds to, so it is a target-only credential."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute("DROP TABLE users")
+            conn.execute(
+                "CREATE TABLE users (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+                "is_local INTEGER NOT NULL DEFAULT 0, disabled INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT)"
+            )
+            conn.execute("INSERT INTO users VALUES ('u-two', 'Two', 2, 0, '2026-01-01 00:00:00')")
+
+        with pytest.raises(mt.TargetOnlyAuthError):
+            rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+
+    def test_a_target_only_token_alone_aborts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """The user is in the source, so only the token is target-only. Without
+        checking api_tokens the whole thing passes on the users comparison."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        _seed_auth_rows(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "INSERT INTO api_tokens (token_id, user_id, token_hash, created_at) "
+                "VALUES ('t-extra', 'u-remote', ?, '2026-01-01 00:00:00')",
+                (SECRET_HASH,),
+            )
+
+        with pytest.raises(mt.TargetOnlyAuthError) as excinfo:
+            rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        message = str(excinfo.value)
+        assert "t-extra" in message
+        assert SECRET_HASH not in message, "the message carries natural keys, never a hash"
+
+    def test_flag_does_not_mask_a_real_preservation_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """The flag waives target-only rows and nothing else -- a row that never
+        arrived must still fail the run."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "CREATE TABLE users (user_id TEXT PRIMARY KEY CHECK (user_id <> 'u-local'), "
+                "display_name TEXT NOT NULL, is_local INTEGER NOT NULL DEFAULT 0, "
+                "disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO users VALUES ('u-stranger', 'Stranger', 0, 0, '2026-01-01 00:00:00')"
+            )
+
+        result = rev.migrate_sql(
+            pg_schema_dsn, back_db, logging.getLogger(__name__), allow_target_only_auth=True
+        )
+        assert result["tables"]["users"]["missing_keys"] >= 1
+        assert "users" in rev._row_preservation_mismatches(result)
+
+    def test_reverse_flag_is_wired_through_main(self) -> None:
+        """The unit tests call migrate_sql directly, so a missing argparse
+        wiring would not show up in any of them."""
+        import inspect as _inspect
+
+        source = _inspect.getsource(rev._run)
+        assert "allow_target_only_auth" in source
+        assert "--allow-target-only-auth" in _inspect.getsource(rev._parse_args)

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from typing import Any
@@ -106,6 +107,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--chroma-collection", default="opencrab_vectors", metavar="COL")
     p.add_argument("--pg-url",
                    default="postgresql://opencrab:opencrab@localhost:5432/opencrab", metavar="U")
+    p.add_argument("--allow-target-only-auth", action="store_true",
+                   help="타깃에만 있는 users/api_tokens 행이 있어도 진행합니다. 이 플래그가 "
+                        "없으면 중단합니다 -- 소스가 모르는 자격증명이 조용히 계속 유효해지는 "
+                        "것을 막습니다 (로컬 바인딩 사용자와 그 토큰은 원래 면제됩니다).")
     p.add_argument("--allow-unmigrated", action="store_true",
                    help="SQLStore 가 만들지만 이 이관이 복사하지 않는 테이블이 소스에 있어도 "
                         "마이그레이션하지 않고 진행합니다 (요약에 제외 목록 표시). "
@@ -628,10 +633,48 @@ def migrate_vectors(
 # Step 5 — SQL 마이그레이션 (PostgreSQL → SQLite)
 # ---------------------------------------------------------------------------
 
+def _target_only_auth(pg_engine: Any, sqlite_path: str) -> dict[str, list[str]]:
+    """로컬 타깃에만 있는 자격증명 -- 이 설치 자신의 신원은 뺀다.
+
+    로컬 모드는 바인딩할 ``is_local`` 사용자가 정확히 하나 있어야 하므로, 그 사용자와
+    그가 가진 토큰은 소스가 미처 챙기지 못한 남의 자격증명이 아니라 이 설치의 신원이다.
+    ``opencrab init`` 이 둘을 함께 만들기 때문에 토큰도 함께 면제한다.
+
+    정방향에는 이 면제가 없다. 그쪽 타깃은 PG 배포본이지 소스 설치의 신원 보관소가
+    아니어서, 거기 놓인 ``is_local`` 사용자야말로 막아야 할 자격증명이다.
+    """
+    from sqlalchemy import inspect, text  # type: ignore[import]
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        local_user, local_tokens = mt.local_identity(conn)
+        exempt = {"users": {local_user} if local_user else set(), "api_tokens": local_tokens}
+        insp = inspect(pg_engine)
+        found: dict[str, list[str]] = {}
+        for table in mt.AUTH_CREDENTIAL_TABLES:
+            key = mt.SPEC_BY_NAME[table].conflict_key
+            assert key is not None
+            col = ", ".join(key)
+            src_keys: set[tuple] = set()
+            if insp.has_table(table):
+                with pg_engine.connect() as pg_conn:
+                    src_keys = {
+                        tuple(r) for r in pg_conn.execute(text(f"SELECT {col} FROM {table}"))  # noqa: S608
+                    }
+            dst_keys = {tuple(r) for r in conn.execute(f"SELECT {col} FROM {table}")}  # noqa: S608
+            extra = {k for k in dst_keys - src_keys if k[0] not in exempt[table]}
+            if extra:
+                found[table] = [",".join(str(v) for v in k) for k in extra]
+        return found
+    finally:
+        conn.close()
+
+
 def migrate_sql(
     pg_url: str,
     sqlite_path: str,
     log: logging.Logger,
+    allow_target_only_auth: bool = False,
 ) -> dict[str, Any]:
     """
     목적: PostgreSQL의 SQL-store 테이블 행을 SQLite로 복사한다.
@@ -671,6 +714,12 @@ def migrate_sql(
     sq_engine = create_engine(
         f"sqlite:///{sqlite_path}", hide_parameters=True, connect_args={"timeout": 5.0}
     )
+
+    # 복사 전에 검사한다. 다 쓴 뒤에 중단하면 종료 코드만 바뀌고 타깃은 이미 오염된다.
+    if not allow_target_only_auth:
+        target_only = _target_only_auth(pg_engine, sqlite_path)
+        if target_only:
+            raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
 
     table_results: dict[str, dict[str, Any]] = {}
 
@@ -1046,7 +1095,9 @@ def _run(args: argparse.Namespace) -> int:
         console.rule("[bold blue]Step 5 — SQL 마이그레이션 (PostgreSQL → SQLite)")
         sqlite_path = os.path.join(local_data_dir, "opencrab.db")
         with file_lock("write.lock", local_data_dir):
-            sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
+            sql_result = migrate_sql(
+                args.pg_url, sqlite_path, logger, args.allow_target_only_auth
+            )
         report["results"]["sql"] = sql_result
         total_rows = sum(t["copied"] for t in sql_result["tables"].values())
         console.print(f"  [green]완료[/green] total rows={total_rows:,}")
