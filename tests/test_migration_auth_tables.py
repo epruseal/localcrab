@@ -1358,6 +1358,37 @@ class TestTargetOnlyCredentials:
         assert result["tables"]["users"]["missing_keys"] >= 1
         assert "users" in rev._row_preservation_mismatches(result)
 
+    def test_flag_does_not_mask_a_silently_dropped_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """A row can vanish without raising -- a BEFORE INSERT trigger using
+        RAISE(IGNORE) returns rowcount 0 and no exception. Write failures do not
+        see that, so the key comparison is what catches it."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "CREATE TRIGGER swallow BEFORE INSERT ON users "
+                "WHEN NEW.user_id = 'u-remote' BEGIN SELECT RAISE(IGNORE); END"
+            )
+
+        result = rev.migrate_sql(
+            pg_schema_dsn, back_db, logging.getLogger(__name__), allow_target_only_auth=True
+        )
+        stats = result["tables"]["users"]
+        assert stats["failed_rows"] == 0, "nothing raised, so only the key gap can show this"
+        assert stats["missing_keys"] == 1
+        assert "users" in rev._row_preservation_mismatches(result)
+
     def test_reverse_flag_is_wired_through_main(self) -> None:
         """The unit tests call migrate_sql directly, so a missing argparse
         wiring would not show up in any of them."""
