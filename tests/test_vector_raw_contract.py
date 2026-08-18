@@ -372,6 +372,9 @@ class TestValidation:
             ([_one(embedding=[1e40] + [0.1] * 31)], "finite float32"),
             ([_one(document=7)], "document must be str or None"),
             ([_one(metadata={7: "x"})], "non-str key"),
+            ([_one(embedding=[True] * 32)], "finite float32"),
+            ([_one(metadata={"pack_id": ""})], "disagrees with the declared target"),
+            ([_one(uris=7)], "uris"),
         ],
     )
     def test_a_bad_batch_is_refused_without_touching_the_store(
@@ -420,25 +423,31 @@ class TestValidation:
 
     def test_validation_runs_before_the_store_is_reached(self, store):
         """A rejected batch must fail in validation, not on the way into the
-        backend -- otherwise the error depends on the backend and a partially
+        backend -- otherwise the error depends on the backend and a partly
         applied write becomes possible.
+
+        The store is left ``available`` but pointed at storage that cannot
+        work, so reaching it would raise something other than the
+        ``ValueError`` asserted here. Making it unavailable instead would
+        trip the RuntimeError guard first and prove nothing.
         """
         if store._test_backend == "chroma":
             records = [_one(id="a"), _one(id="b", embedding=[0.1] * 31)]
+            broken = object()  # any attribute access on it raises
+            original = store._collection
+            store._collection = broken
+            restore = lambda: setattr(store, "_collection", original)  # noqa: E731
         else:
             records = [_one(embedding=[0.1] * 8)]
-        store._available = False
-        store._available = True  # keep availability, break the storage instead
-        broken = "no_such_table_for_import"
-        original = getattr(store, "_table", None)
-        if original is not None:
-            store._table = broken
+            original = store._table
+            store._table = "no_such_table_for_import"
+            restore = lambda: setattr(store, "_table", original)  # noqa: E731
         try:
+            assert store.available
             with pytest.raises(ValueError):
                 store.import_vectors(records, pack_id=DST_PACK)
         finally:
-            if original is not None:
-                store._table = original
+            restore()
 
 
 class TestAvailability:
@@ -451,6 +460,78 @@ class TestAvailability:
                 store.import_vectors([_one()], pack_id=DST_PACK)
         finally:
             store._available = True
+
+
+class TestFieldsWithNoNaturalFixture:
+    """Shapes the seeded corpus cannot produce, but the contract still names."""
+
+    def test_a_document_less_record_round_trips(self, store):
+        """``document`` is ``str | None`` in the contract, but nothing that
+        goes through ``upsert_texts`` can produce ``None`` -- only an import
+        can. Without this the None branch of every export is unexercised.
+        """
+        store.import_vectors(
+            [{"id": "silent", "embedding": [0.7] * 32, "document": None,
+              "metadata": {"space": "s1"}}],
+            pack_id=DST_PACK,
+        )
+
+        assert store.export_pack_vectors(DST_PACK)[0]["document"] is None
+
+    def test_a_uri_is_refused_where_it_cannot_be_stored(self, store):
+        """Dropping it silently would lose data, so the backends that have
+        nowhere to put it say so. chroma, which does, keeps it (below).
+        """
+        if store._test_backend == "chroma":
+            pytest.skip("chroma stores uris; see test_a_uri_round_trips")
+        before = store.count()
+
+        with pytest.raises(ValueError, match="cannot store them"):
+            store.import_vectors(
+                [{"id": "with-uri", "embedding": [0.1] * 32, "document": "d",
+                  "metadata": {}, "uris": "file:///a.png"}],
+                pack_id=DST_PACK,
+            )
+
+        assert store.count() == before
+
+    def test_export_omits_uris_where_the_backend_has_none(self, store):
+        if store._test_backend == "chroma":
+            pytest.skip("chroma always reports the key")
+        _seed(store)
+
+        assert all(
+            "uris" not in record for record in store.export_pack_vectors(SRC_PACK)
+        )
+
+    def test_a_uri_round_trips_on_chroma(self, store):
+        """This codebase never writes a uri, but chroma's upsert path already
+        promises to preserve one an external writer left, so a fork must not
+        be the thing that drops it.
+        """
+        if store._test_backend != "chroma":
+            pytest.skip("uris are a chroma-only field")
+        store.import_vectors(
+            [{"id": "with-uri", "embedding": [0.1] * 32, "document": "d",
+              "metadata": {"space": "s1"}, "uris": "file:///a.png"}],
+            pack_id=DST_PACK,
+        )
+
+        assert store.export_pack_vectors(DST_PACK)[0]["uris"] == "file:///a.png"
+
+    def test_export_is_not_truncated_at_scale(self, store):
+        """The seeded corpus is far too small to catch a stray LIMIT that only
+        bites past a page boundary.
+        """
+        count = 250
+        store.import_vectors(
+            [{"id": f"bulk{i}", "embedding": [(i % 89) / 100.0] * 32,
+              "document": f"doc {i}", "metadata": {"seq": i}}
+             for i in range(count)],
+            pack_id=SRC_PACK,
+        )
+
+        assert len(store.export_pack_vectors(SRC_PACK)) == count
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +781,49 @@ class TestChromaRaceDetection:
             chroma.import_vectors(records, pack_id=SRC_PACK)
 
 
+class TestChromaMetadataHandling:
+    def test_non_scalar_metadata_is_sanitised_like_add_texts(self, chroma):
+        """chroma rejects a non-str metadata KEY outright and stores whatever
+        it is handed for a value, so ``add_texts`` runs everything through
+        ``_sanitize_metadata`` first. Import must do the same or the two write
+        paths produce different rows for the same input.
+        """
+        chroma.import_vectors(
+            [{"id": "shaped", "embedding": [0.1] * 32, "document": "d",
+              "metadata": {"tags": ["a", "b"], "space": "s1"}}],
+            pack_id=DST_PACK,
+        )
+
+        stored = chroma.export_pack_vectors(DST_PACK)[0]["metadata"]
+        assert stored["tags"] == str(["a", "b"])
+        assert stored["space"] == "s1"
+
+
+class TestSqliteVecNullMetadata:
+    def test_export_survives_a_null_metadata_column(self, tmp_path):
+        """Externally written rows can leave the aux metadata column NULL;
+        ``get_by_id`` and the KNN path both guard it, so export must too.
+        """
+        pytest.importorskip("sqlite_vec")
+        store = build_vector_store("sqlite-vec", tmp_path, 32)
+        try:
+            import sqlite_vec
+
+            with store._tx() as conn:
+                conn.execute(
+                    f"INSERT INTO {store._table}"
+                    "(node_id, pack_id, embedding, document, metadata)"
+                    " VALUES (?, ?, ?, ?, NULL)",
+                    ("raw", SRC_PACK, sqlite_vec.serialize_float32([0.1] * 32), "d"),
+                )
+
+            record = store.export_pack_vectors(SRC_PACK)[0]
+
+            assert record["metadata"] == {}
+        finally:
+            store.close()
+
+
 class TestChromaResultShapes:
     def test_verification_does_not_assume_the_returned_order(self, chroma):
         """chroma makes no promise that get() returns ids in the requested
@@ -742,10 +866,11 @@ class TestChromaResultShapes:
                 return getattr(inner, name)
 
             def get(self, **kwargs):
+                # chroma can null the whole container, not just the entries.
                 return {
                     "ids": ["odd"],
                     "embeddings": np.array([[0.5] * 32], dtype=np.float64),
-                    "documents": [None],
+                    "documents": None,
                     "metadatas": [None],
                     "uris": None,
                 }

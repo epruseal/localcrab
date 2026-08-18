@@ -522,9 +522,10 @@ class ChromaStore:
         allow, all normalised here: ``embeddings`` is an ndarray of float64
         ndarrays (not ``list[float]``), a record's ``metadatas`` entry is
         ``None`` when it was added without any, and ``documents`` entries are
-        ``None`` for embedding-only records. Note the batch is assembled by
-        ID, never by position -- chroma does not promise the returned order
-        matches anything.
+        ``None`` for embedding-only records. The parallel arrays of a single
+        ``get()`` do line up with each other, so they are zipped by position
+        here; it is a SEPARATE result being compared against a request that
+        must be matched by id instead (see ``_assert_landed``).
 
         WARNING for callers comparing round-trips: on a ``hnsw:space=cosine``
         collection -- the only kind this store creates -- an embedding read

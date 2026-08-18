@@ -138,6 +138,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import struct
 import time
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -202,28 +204,32 @@ def embed_and_validate(
 # Keys a vector record may carry. ``uris`` is chroma-only (see
 # ``validate_import_records``'s ``allow_uris``); everything else is shared.
 _RECORD_KEYS = frozenset({"id", "embedding", "document", "metadata", "uris"})
-_METADATA_VALUE_TYPES = (str, int, float, bool)
-
-# float32's finite range. Values outside it do NOT raise on the way in --
-# ``struct.pack("f", 1e40)`` saturates to ``inf`` silently (measured), and
-# ``sqlite_vec.serialize_float32`` is that same call -- so sqlite-vec would
-# store ``inf`` where chroma and pgvector reject the row outright. Checking
-# representability here is what keeps the three backends on one domain.
-_FLOAT32_MAX = 3.4028235e38
 
 
 def _float32_representable(value: object) -> bool:
-    """True when ``value`` is a real number that survives a float32 round-trip
-    as a finite value (rejects NaN, +/-inf, and anything that saturates)."""
+    """True when ``value`` is a real number that stays finite through a float32
+    round-trip.
+
+    Out-of-range values do NOT raise on the way in: ``struct.pack("f", 1e40)``
+    saturates to ``inf`` silently (measured), and
+    ``sqlite_vec.serialize_float32`` is that same call -- so sqlite-vec would
+    store ``inf`` for a row chroma and pgvector reject outright. Doing the
+    round-trip here is what keeps the three backends on one domain, and it
+    puts the boundary exactly where float32 puts it rather than at a
+    hand-written constant.
+
+    ``bool`` is excluded deliberately: it is an ``int`` subclass, so
+    ``[True, False, ...]`` would otherwise sail through as ``1.0``/``0.0`` and
+    store a vector the caller never meant to write.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
         as_float = float(value)
     except (TypeError, ValueError, OverflowError):
         return False
-    if as_float != as_float or as_float in (float("inf"), float("-inf")):
-        return False
-    return -_FLOAT32_MAX <= as_float <= _FLOAT32_MAX
+    round_tripped = struct.unpack("f", struct.pack("f", as_float))[0]
+    return math.isfinite(round_tripped)
 
 
 def validate_import_records(
