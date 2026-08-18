@@ -29,6 +29,10 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+# scripts/ 는 패키지가 아니라 sys.path[0] (스크립트 직접 실행 시) 또는 테스트의
+# sys.path.insert(0, scripts/) 로 노출된다 -- #151 단일 정본 모듈.
+import _migration_tables as mt
+
 # rich 는 pyproject.toml 의존성에 포함돼 있음
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -40,23 +44,12 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# #144 fail-closed guard — migrate_sql() below (and preflight's own table
-# list) predate #144's users/api_tokens/packs tables and don't copy them. A
-# run that completes without them silently drops every user and every issued
-# token while still reporting success. Detect this in preflight (before any
-# work happens, dry-run included) via a fresh information_schema query — not
-# the hard-coded 5-table list used elsewhere in this script — and require an
-# explicit opt-in to proceed.
+# SQLStore 가 만드는 테이블 중 이 스크립트가 복사하지 않는 것이 소스에 있으면
+# fail-closed 로 중단한다 (#144 의 users/api_tokens/packs 가 최초 사례). #151 은
+# 그 셋을 실제로 이관하므로 현재 스키마에서는 가드가 발동하지 않지만, 아홉 번째
+# SQLStore 테이블이 생기면 즉시 잡아내야 하므로 목록은 _migration_tables.py 에서
+# 파생한다(``mt.unmigrated_tables``) — 하드코딩 리터럴을 다시 두지 않는다.
 # ---------------------------------------------------------------------------
-
-_AUTH_TABLES = ("users", "api_tokens", "packs")
-
-
-def _filter_auth_tables(table_names: Any) -> list[str]:
-    """Pure decision logic (kept separate from the DB call so it can be
-    tested without a live PostgreSQL instance): which #144 auth tables are
-    present in an arbitrary iterable of table names."""
-    return sorted(set(table_names) & set(_AUTH_TABLES))
 
 
 def _pg_table_names(pg_engine: Any) -> set[str]:
@@ -114,8 +107,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--pg-url",
                    default="postgresql://opencrab:opencrab@localhost:5432/opencrab", metavar="U")
     p.add_argument("--allow-unmigrated", action="store_true",
-                   help="소스에 users/api_tokens/packs(#144)가 있어도 마이그레이션하지 않고 "
-                        "진행합니다 (요약에 제외 목록 표시). 이 플래그 없이는 중단됩니다.")
+                   help="SQLStore 가 만들지만 이 이관이 복사하지 않는 테이블이 소스에 있어도 "
+                        "마이그레이션하지 않고 진행합니다 (요약에 제외 목록 표시). "
+                        "이 플래그 없이는 중단됩니다.")
     return p.parse_args()
 
 
@@ -197,13 +191,15 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     console.print("  PostgreSQL 연결 중...", end=" ")
     try:
         from sqlalchemy import create_engine, text  # type: ignore[import]
-        pg_engine = create_engine(args.pg_url, connect_args={"connect_timeout": 5})
+        pg_engine = create_engine(
+            args.pg_url, connect_args={"connect_timeout": 5}, hide_parameters=True
+        )
         with pg_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        # 테이블 존재 여부에 따라 카운트
+        # 테이블 존재 여부에 따라 카운트 -- 목록은 _migration_tables.py 의 단일 정본에서
+        # 파생한다 (더 이상 5테이블 리터럴을 여기 두지 않는다).
         sql_counts: dict[str, int] = {}
-        tables = ["ontology_nodes", "ontology_edges", "impact_records",
-                  "lever_simulations", "rebac_policies"]
+        tables = [s.name for s in mt.SQL_TABLE_SPECS]
         with pg_engine.connect() as conn:
             for tbl in tables:
                 try:
@@ -217,24 +213,25 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         console.print(f"[green]OK[/green] (total rows={total_pg:,})")
 
         if not args.skip_sql:
-            excluded_auth_tables = _filter_auth_tables(_pg_table_names(pg_engine))
+            excluded_auth_tables = mt.unmigrated_tables(_pg_table_names(pg_engine))
             if excluded_auth_tables and args.allow_unmigrated:
                 console.print(
-                    f"  [yellow]--allow-unmigrated[/yellow]: 인증 테이블 {excluded_auth_tables} "
-                    "제외하고 진행합니다 (#144)"
+                    f"  [yellow]--allow-unmigrated[/yellow]: 이관 대상이 아닌 SQLStore 테이블 "
+                    f"{excluded_auth_tables} 제외하고 진행합니다"
                 )
                 result["excluded_auth_tables"] = excluded_auth_tables
             elif excluded_auth_tables:
                 console.print(
-                    f"  [red]FAIL[/red]: 소스에 이 스크립트가 복사하지 않는 인증 테이블 "
-                    f"{excluded_auth_tables} 이(가) 있습니다 (#144)"
+                    f"  [red]FAIL[/red]: 소스에 이 스크립트가 복사하지 않는 SQLStore 테이블 "
+                    f"{excluded_auth_tables} 이(가) 있습니다"
                 )
                 errors.append(
-                    f"PostgreSQL: auth table(s) {excluded_auth_tables} present but not migrated "
-                    "(#144); pass --allow-unmigrated to proceed anyway — completing without them "
-                    "silently drops every user and every issued token while still reporting success"
+                    f"PostgreSQL: SQLStore table(s) {excluded_auth_tables} present but not "
+                    "migrated; pass --allow-unmigrated to proceed anyway — completing without "
+                    "them silently drops that data while still reporting success"
                 )
     except Exception as exc:
+        # 연결 진단은 행 값을 담지 않으므로 default-deny 대상이 아니다 (#151 7절 예외).
         console.print(f"[red]FAIL[/red]: {exc}")
         errors.append(f"PostgreSQL: {exc}")
 
@@ -618,75 +615,114 @@ def migrate_sql(
     log: logging.Logger,
 ) -> dict[str, Any]:
     """
-    목적: PostgreSQL의 모든 테이블 행을 SQLite로 복사한다.
-    소스: PostgreSQL — ontology_nodes, ontology_edges, impact_records,
-                       lever_simulations, rebac_policies
-    대상: SQLite (opencrab.db) — SQLStore._create_tables() 로 스키마 초기화
+    목적: PostgreSQL의 SQL-store 테이블 행을 SQLite로 복사한다.
+    소스/순서: ``_migration_tables.SQL_TABLE_SPECS`` (users 가 FK 참조 대상이라 먼저).
+               #151 이전에는 5테이블 리터럴이 이 함수와 ``preflight()`` 양쪽에 따로
+               하드코딩돼 있었다 -- 이제 단일 정본에서 파생한다.
+    대상: SQLite (opencrab.db) — SQLStore 생성자가 스키마만 만들고, INSERT 는 별도
+          write engine 을 쓴다(#151 7-4: private ``sql_store._engine`` 접근 제거).
     주의:
-      - SERIAL/TIMESTAMPTZ는 SQLite에서 INTEGER/TEXT로 매핑됨
-      - id 컬럼(auto increment)은 제외하고 나머지 컬럼만 INSERT
-      - ON CONFLICT DO NOTHING 으로 중복 허용
-    반환: {"tables": {table_name: row_count, ...}}
+      - 복사 컬럼은 테이블당 PG/SQLite 카탈로그에서 1회만 파생한다(``mt.resolve_columns``).
+      - boolean/timestamp 는 PG 카탈로그가 정본이며, 값은 행 단위로 변환한다. PG
+        BOOLEAN 은 타입이 도메인을 강제하므로(허용값은 psycopg2 가 bool/None 만 반환)
+        정방향과 달리 별도 오염 전수 스캔은 두지 않는다 — 스캔이 있어도 절대 걸리지
+        않는 죽은 코드가 된다(#151 설계 4절).
+      - 스키마 검증(``mt.resolve_columns``)과 값 변환(``mt.to_sqlite_bool`` /
+        ``mt.to_sqlite_timestamp``) 실패는 :class:`_migration_tables.MigrationError` 로
+        테이블 단위 try/except 를 통과해 전체 실행을 중단시킨다 — 예전처럼 조용히
+        ``count=0`` 으로 삼키지 않는다. 개별 행의 INSERT 실패(제약 위반 등)만 경고로
+        남기고 계속한다.
+    반환: {"tables": {table_name: {"copied": int, "source": int|None, "target": int|None}}}
+          ``source`` 는 PG 원본 행 수, ``target`` 은 복사 후 다시 센 SQLite 행 수.
+          소스에 테이블이 없으면 ``source``/``target`` 모두 ``None`` (absent, 복사 단계에
+          진입하지 않는다).
     """
     from sqlalchemy import create_engine, inspect, text  # type: ignore[import]
 
-    # SQLite 스키마 초기화 (SQLStore 생성자가 처리)
+    # SQLite 스키마 초기화 (SQLStore 생성자가 처리) — 이 store 는 스키마 생성용으로만
+    # 쓰고, 쓰기는 아래 별도 engine 으로 한다.
     from opencrab.stores.sql_store import SQLStore
     sql_store = SQLStore(url=f"sqlite:///{sqlite_path}")
     if not sql_store.available:
-        raise RuntimeError(f"SQLite 초기화 실패: {sqlite_path}")
+        raise mt.MigrationError(f"SQLite 초기화 실패: {sqlite_path}")
 
-    pg_engine = create_engine(pg_url, connect_args={"connect_timeout": 5})
-    sq_engine = sql_store._engine
+    pg_engine = create_engine(pg_url, connect_args={"connect_timeout": 5}, hide_parameters=True)
+    # sql_store.py 가 SQLite 커넥션에 두던 timeout 핀을 승계한다 -- write.lock 이
+    # 걸린 동안 다른 프로세스의 파일 잠금 대기가 무한정 걸리지 않게 하기 위함.
+    sq_engine = create_engine(
+        f"sqlite:///{sqlite_path}", hide_parameters=True, connect_args={"timeout": 5.0}
+    )
 
-    tables = ["ontology_nodes", "ontology_edges", "impact_records",
-              "lever_simulations", "rebac_policies"]
-
-    table_counts: dict[str, int] = {}
+    table_results: dict[str, dict[str, Any]] = {}
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                   TextColumn("{task.completed} rows"), console=console) as progress:
-        for tbl in tables:
+        for spec in mt.SQL_TABLE_SPECS:
+            tbl = spec.name
             task = progress.add_task(f"  {tbl}", total=None)
-            count = 0
+
+            if not inspect(pg_engine).has_table(tbl):
+                log.warning("소스 테이블 '%s' 없음, 스킵 (absent)", tbl)
+                console.print(f"  [yellow]{tbl}[/yellow]: 소스에 없음 (absent)")
+                table_results[tbl] = {"copied": 0, "source": None, "target": None}
+                continue
+
+            # 컬럼 목록은 테이블당 1회만 파생해 이 뒤의 SELECT/INSERT 양쪽에 그대로
+            # 쓴다(#151 3절) -- 사전검증과 복사가 서로 다른 목록을 볼 여지를 없앤다.
+            pg_columns, pg_bool_cols, pg_ts_cols = mt.pg_typed_columns(pg_engine, tbl)
+            sq_raw = sq_engine.raw_connection()
             try:
-                # PostgreSQL에서 컬럼 이름 조회 (id 제외)
-                insp = inspect(pg_engine)
-                cols_info = insp.get_columns(tbl)
-                col_names = [c["name"] for c in cols_info if c["name"] != "id"]
+                sqlite_cols = mt.sqlite_columns(sq_raw, tbl)
+            finally:
+                sq_raw.close()
+            col_names = mt.resolve_columns(spec, pg_columns, sqlite_cols)
 
-                if not col_names:
-                    log.warning("테이블 '%s' 컬럼 정보 없음, 스킵", tbl)
-                    table_counts[tbl] = 0
-                    continue
+            cols_sql = ", ".join(col_names)
+            placeholders = ", ".join(f":{c}" for c in col_names)
+            bool_cols = pg_bool_cols & set(col_names)
+            ts_cols = pg_ts_cols & set(col_names)
 
-                cols_sql = ", ".join(col_names)
-                placeholders = ", ".join(f":{c}" for c in col_names)
+            with pg_engine.connect() as pg_conn:
+                source_row = pg_conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
+                source_count = int(source_row[0]) if source_row else 0
+                rows = pg_conn.execute(text(f"SELECT {cols_sql} FROM {tbl}")).fetchall()  # noqa: S608
 
-                with pg_engine.connect() as pg_conn:
-                    rows = pg_conn.execute(text(f"SELECT {cols_sql} FROM {tbl}")).fetchall()  # noqa: S608
+            count = 0
+            with sq_engine.begin() as sq_conn:
+                for row in rows:
+                    row_dict = dict(zip(col_names, row))
+                    # conflict_key 로 선언된 자연 키만 로그에 남긴다 -- token_hash 같은
+                    # 비밀은 어느 테이블의 conflict_key 도 아니므로 여기 오지 않는다.
+                    key = (
+                        ",".join(str(row_dict.get(k)) for k in spec.conflict_key)
+                        if spec.conflict_key
+                        else None
+                    )
+                    for col in bool_cols:
+                        row_dict[col] = mt.to_sqlite_bool(row_dict[col], table=tbl, column=col, key=key)
+                    for col in ts_cols:
+                        row_dict[col] = mt.to_sqlite_timestamp(row_dict[col])
+                    try:
+                        result = sq_conn.execute(
+                            text(f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"),  # noqa: S608
+                            row_dict,
+                        )
+                        count += result.rowcount  # 실제 삽입된 행 수(0 또는 1)만 증가
+                    except Exception as row_exc:
+                        log.warning("행 삽입 실패: %s", mt.safe_error_text(row_exc, table=tbl, key=key))
+                    progress.update(task, completed=count)
 
-                with sq_engine.begin() as sq_conn:
-                    for row in rows:
-                        row_dict = dict(zip(col_names, row))
-                        try:
-                            result = sq_conn.execute(
-                                text(f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"),  # noqa: S608
-                                row_dict,
-                            )
-                            count += result.rowcount  # 실제 삽입된 행 수(0 또는 1)만 증가
-                        except Exception as row_exc:
-                            log.warning("행 삽입 실패 (%s): %s", tbl, row_exc)
-                        progress.update(task, completed=count)
+            with sq_engine.connect() as sq_conn:
+                target_row = sq_conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
+                target_count = int(target_row[0]) if target_row else 0
 
-                table_counts[tbl] = count
-                console.print(f"  [green]{tbl}[/green]: {count:,}행")
-            except Exception as exc:
-                log.warning("테이블 '%s' 마이그레이션 오류: %s", tbl, exc)
-                console.print(f"  [yellow]{tbl}: 오류 — {exc}[/yellow]")
-                table_counts[tbl] = 0
+            table_results[tbl] = {"copied": count, "source": source_count, "target": target_count}
+            console.print(
+                f"  [green]{tbl}[/green]: {count:,}행 복사 "
+                f"(source={source_count:,}, target={target_count:,})"
+            )
 
-    return {"tables": table_counts}
+    return {"tables": table_results}
 
 
 # ---------------------------------------------------------------------------
@@ -752,27 +788,64 @@ def print_summary(report: dict[str, Any]) -> None:
         table.add_row("벡터", _fmt(src_v), _fmt(v.get("vectors", 0)),
                       _status(src_v, v.get("vectors", 0)) if isinstance(src_v, int) else "-")
 
-    # SQL
+    # SQL — #151: 반환 형태가 {"copied","source","target"} 로 바뀌어 전용 상태
+    # 판정을 쓴다. absent 테이블(source is None)은 OK/MISMATCH 판정에서 제외한다.
     if "sql" in results:
-        for tbl, cnt in results["sql"].get("tables", {}).items():
-            src_cnt = counts.get("pg_tables", {}).get(tbl, "N/A")
-            table.add_row(f"SQL:{tbl}", _fmt(src_cnt), _fmt(cnt),
-                          _status(src_cnt, cnt) if isinstance(src_cnt, int) else "-")
+        for tbl, t in results["sql"].get("tables", {}).items():
+            src_val: Any = "absent" if t["source"] is None else t["source"]
+            dst_val: Any = "absent" if t["target"] is None else t["target"]
+            table.add_row(f"SQL:{tbl}", _fmt(src_val), _fmt(dst_val), _sql_status(t))
 
     console.print(table)
+
+
+def _sql_status(t: dict[str, Any]) -> str:
+    """OK/MISMATCH 판정 -- absent 테이블은 비교 대상이 없으므로 판정에서 뺀다."""
+    if t["source"] is None:
+        return "-"
+    if t["target"] >= t["source"]:
+        return "[green]OK[/green]"
+    return f"[red]MISMATCH ({t['target']}/{t['source']})[/red]"
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def _row_preservation_mismatches(sql_result: dict[str, Any] | None) -> list[str]:
+    """target < source 인 테이블 이름 목록 -- #151 6절 행 보존 판정.
+
+    absent 테이블(``source is None``)은 비교 대상이 없으므로 제외한다. 자연 키가
+    없는 ``impact_records``/``lever_simulations`` 는 재실행 시 ``target > source``
+    가 될 수 있지만 이 판정은 ``target < source`` 만 보므로 오탐하지 않는다(그
+    중복 자체는 #151 범위 밖의 기존 결함).
+    """
+    if not sql_result:
+        return []
+    return [
+        name
+        for name, t in sql_result["tables"].items()
+        if t["source"] is not None and t["target"] < t["source"]
+    ]
+
+
+def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = _parse_args()
+    try:
+        return _run(args)
+    except Exception as exc:  # noqa: BLE001 - 최상위 default-deny 경계 (#151 7-2)
+        # traceback.print_exc()/logging.exception()/rich 의 print_exception() 은
+        # __cause__ 체인을 렌더링해 MigrationError 뒤에 감춘 드라이버 예외 원문을
+        # 그대로 stderr 에 남긴다(실측 확인) -- safe_error_text() 결과만 찍는다.
+        console.print(f"\n[bold red]! 마이그레이션 실패[/bold red]: {mt.safe_error_text(exc)}")
+        return 1
 
+
+def _run(args: argparse.Namespace) -> int:
     # 로컬 데이터 디렉토리 결정
     local_data_dir = (
         args.local_data_dir
@@ -796,7 +869,7 @@ def main() -> None:
         _print_counts_table(source_counts)
         if excluded_auth_tables:
             console.print(f"[yellow]--allow-unmigrated: 제외된 테이블 {excluded_auth_tables}[/yellow]")
-        return
+        return 0
 
     # Step 1 — 백업
     with file_lock("write.lock", local_data_dir):
@@ -882,7 +955,7 @@ def main() -> None:
         with file_lock("write.lock", local_data_dir):
             sql_result = migrate_sql(args.pg_url, sqlite_path, logger)
         report["results"]["sql"] = sql_result
-        total_rows = sum(sql_result["tables"].values())
+        total_rows = sum(t["copied"] for t in sql_result["tables"].values())
         console.print(f"  [green]완료[/green] total rows={total_rows:,}")
     else:
         console.print("[yellow]SQL 마이그레이션 건너뜀[/yellow]")
@@ -895,7 +968,18 @@ def main() -> None:
     print_summary(report)
     if excluded_auth_tables:
         console.print(f"[yellow]제외된 테이블 (--allow-unmigrated): {excluded_auth_tables}[/yellow]")
+
+    # #151 6절: 행 보존 실패는 비영 종료(5, 정방향 --verify 불일치와 동일 코드)
+    mismatches = _row_preservation_mismatches(report["results"].get("sql"))
+    if mismatches:
+        console.print(
+            f"\n[bold red]! 행 보존 실패 (MISMATCH)[/bold red]: {mismatches} "
+            "(target < source — 위 요약 표 참고)"
+        )
+        return 5
+
     console.print("\n[bold green]마이그레이션 완료![/bold green]")
+    return 0
 
 
 def _print_counts_table(counts: dict[str, Any]) -> None:
@@ -916,4 +1000,4 @@ def _print_counts_table(counts: dict[str, Any]) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
