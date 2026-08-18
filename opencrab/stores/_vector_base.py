@@ -382,8 +382,12 @@ def validate_import_records(
                 f"import_vectors: record {pos} metadata has non-str key(s) "
                 f"{bad_keys!r}"
             )
-        declared = metadata.get("pack_id")
-        if declared is not None and declared != pack_id:
+        # "absent or equal -> assign, present and different -> reject". A
+        # present ``pack_id`` of None is DIFFERENT, not absent: the key is
+        # there and does not name the target pack, so it is rejected like any
+        # other mismatch rather than quietly overwritten.
+        declared = metadata["pack_id"] if "pack_id" in metadata else pack_id
+        if declared != pack_id:
             raise ValueError(
                 f"import_vectors: record {pos} metadata pack_id {declared!r} "
                 f"disagrees with the declared target pack {pack_id!r}; rewrite "

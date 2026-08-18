@@ -534,8 +534,10 @@ graph/doc 쪽을 그대로 두면 다음 적재에서 임포트한 벡터가 전
 
 ### 8.4 chroma 의 한계
 
-- **원자적이지 않다.** 트랜잭션이 없고, 클라이언트의 `get_max_batch_size()`(이 환경 5461)를
-  넘는 배치는 스토어가 나눠 넣으므로 중간 실패 시 앞 청크가 남는다. 보상은 호출자 몫이다
+- **원자적이지 않다.** 트랜잭션이 없고, 클라이언트의 `get_max_batch_size()` 를 넘는 배치는
+  스토어가 나눠 넣으므로 중간 실패 시 앞 청크가 남는다(상한값은 클라이언트·버전마다 다르다 —
+  `python3 -c "import chromadb,tempfile;print(chromadb.PersistentClient(path=tempfile.mkdtemp()).get_max_batch_size())"`
+  로 지금 값을 확인한다). 보상은 호출자 몫이다
   (`sqlite-vec` 은 `_tx()`, `pgvector` 는 `engine.begin()` 단일 트랜잭션이라 전량 롤백된다).
 - **선검사와 실제 쓰기 사이 창이 남는다.** 프로세스 안의 `ChromaStore` 공개 쓰기끼리만
   직렬화되고, 프로세스 간은 호출자의 `write.lock` 규율이다. 그 창을 완전히 닫지는 못하므로

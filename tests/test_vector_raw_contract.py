@@ -374,6 +374,7 @@ class TestValidation:
             ([_one(metadata={7: "x"})], "non-str key"),
             ([_one(embedding=[True] * 32)], "finite float32"),
             ([_one(metadata={"pack_id": ""})], "disagrees with the declared target"),
+            ([_one(metadata={"pack_id": None})], "disagrees with the declared target"),
             ([_one(uris=7)], "uris"),
         ],
     )
