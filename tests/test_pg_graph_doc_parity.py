@@ -593,20 +593,32 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in edges[0]["rel_props"]
             assert edges[0]["rel_props"]["shared"] == "new"
 
-    def test_find_neighbors_empty_pack_ids_equals_none(self, graph_pair):
-        """``pack_ids=[]`` (empty list) must behave identically to
-        ``pack_ids=None`` on both backends — both are falsy in Python, so the
-        BFS's ``pack_set = set(pack_ids) if pack_ids else None`` guard treats
-        them the same (no filtering applied)."""
+    def test_find_neighbors_empty_pack_ids_is_not_none_and_both_backends_agree(
+        self, graph_pair
+    ):
+        """``pack_ids=[]`` and ``pack_ids=None`` are DIFFERENT, identically so
+        on both backends (#147, contract flip).
+
+        This test previously pinned the opposite: both were falsy in Python
+        and the BFS collapsed them into "no filter". That collapse was the
+        fail-open #147 exists to close -- a principal who may read no pack
+        would have traversed the whole graph. ``None`` still means "no
+        filter" for the legacy non-authorization callers; ``[]`` now means
+        "nothing is readable". What this parity test still guarantees is
+        that Local and PG agree about each of them.
+        """
         local, pg = graph_pair
         kwargs_common = dict(direction="both", depth=1, limit=1000)
         local_none = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
         local_empty = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
         pg_none = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
         pg_empty = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
-        assert local_none == local_empty
-        assert pg_none == pg_empty
+        assert local_empty == pg_empty == []
+        # The unfiltered result is non-empty, so the two above are the empty
+        # scope refusing rather than an anchor with no neighbours.
+        assert local_none
         assert local_none == pg_none
+        assert local_none != local_empty
 
     # ------------------------------------------------------------------
     # Doc-store equivalents of the graph-store typed-properties/NULL/

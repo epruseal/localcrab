@@ -228,10 +228,18 @@ class TestBuildWhereSqlOperators:
         assert sql == f"(metadata ->> :w1) {frag} :w2"
         assert params == {"w1": "score", "w2": "5"}
 
-    def test_in_with_values_matches_and_binds_each(self) -> None:
+    def test_in_with_values_binds_one_array_not_one_bind_per_value(self) -> None:
+        """#147 (contract flip): pack_id membership is ONE array bind.
+
+        It used to expand to ``IN (:w1, :w2)``, a bind per value. Read
+        scoping now hands this the caller's entire readable pack set, which
+        can exceed PostgreSQL's parameter limit and, on the SQLite side of
+        the same change, SQLite's much lower one -- so every pack predicate
+        in the tree binds a single array instead.
+        """
         sql, params = _build_where_sql({"pack_id": {"$in": ["a", "b"]}})
-        assert sql == "pack_id IN (:w1, :w2)"
-        assert params == {"w1": "a", "w2": "b"}
+        assert sql == "pack_id = ANY(CAST(:w1 AS text[]))"
+        assert params == {"w1": ["a", "b"]}
 
     def test_in_empty_list_is_conservative_false(self) -> None:
         sql, params = _build_where_sql({"pack_id": {"$in": []}})
