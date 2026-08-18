@@ -476,53 +476,60 @@ class KuzuGraphStore:
         direction: str = "out",
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """See GraphStore.find_by_relations_scoped. ``props`` is a JSON blob
-        here, so anchor/endpoint/edge are checked in Python -- but over an
-        UNLIMITED scan, with collection stopping once ``limit`` matches are
-        found, so the filter still precedes truncation."""
+        """See GraphStore.find_by_relations_scoped.
+
+        The anchor and the relation allow-list ARE pushed into Cypher (same
+        shape ``find_by_relations`` below uses); only the pack rule is
+        applied in Python, because ``props`` is a JSON blob Cypher cannot
+        index into. Pushing the first two matters: without them every call
+        deserialises every edge in the database, twice per
+        ``ontology_lever_simulate`` request, however few relations the lever
+        actually has.
+
+        No database-side ``LIMIT``: truncating there would cut before the
+        pack filter and starve in-scope rows behind out-of-scope ones.
+        Collection stops once ``limit`` matches are found, so the filter
+        still precedes truncation.
+        """
         self._require_available()
         if not relations or not pack_ids or limit <= 0:
             return []
         pack_set = frozenset(pack_ids)
-        rel_set = set(relations)
         results: list[dict[str, Any]] = []
-        r = self._conn.execute(
-            "MATCH (a:OntologyNode)-[e:OntologyEdge]->(b:OntologyNode) "
-            "RETURN a.node_id, a.props, b.node_type, b.node_id, b.props, "
-            "e.relation, e.properties"
+
+        def _fetch(query: str) -> None:
+            r = self._conn.execute(query, {"id": node_id, "rels": list(relations)})
+            while r.has_next() and len(results) < limit:
+                nid, ntype, props_raw, rel, m_space, e_props, anchor_props = r.get_next()
+                # Anchor, other endpoint and the edge itself -- the same
+                # three-part rule export_edges_scoped applies.
+                if _node_pack_id(_parse(anchor_props) or {}) not in pack_set:
+                    continue
+                props = dict(_merge_space(_parse(props_raw), m_space))
+                if _node_pack_id(props) not in pack_set:
+                    continue
+                edge_pid = _node_pack_id(_parse(e_props) or {})
+                if edge_pid is not None and edge_pid not in pack_set:
+                    continue
+                props.setdefault("id", nid)
+                results.append(
+                    {"properties": props, "labels": [ntype], "relation_type": rel}
+                )
+
+        _cols = (
+            "RETURN m.node_id, m.node_type, m.props, e.relation, m.space_id, "
+            "e.properties, n.props"
         )
-        while r.has_next():
-            a_id, a_props, b_type, b_id, b_props, rel, e_props = r.get_next()
-            if rel not in rel_set:
-                continue
-            out_leg = a_id == node_id
-            in_leg = b_id == node_id
-            if direction == "out" and not out_leg:
-                continue
-            if direction == "in" and not in_leg:
-                continue
-            if direction == "both" and not (out_leg or in_leg):
-                continue
-            anchor_props = _parse(a_props if out_leg else b_props) or {}
-            other_props = _parse(b_props if out_leg else a_props) or {}
-            other_type = b_type if out_leg else None
-            if _node_pack_id(anchor_props) not in pack_set:
-                continue
-            if _node_pack_id(other_props) not in pack_set:
-                continue
-            edge_pid = _node_pack_id(_parse(e_props) or {})
-            if edge_pid is not None and edge_pid not in pack_set:
-                continue
-            props = dict(other_props)
-            results.append(
-                {
-                    "properties": props,
-                    "labels": [other_type or props.get("node_type", "")],
-                    "relation_type": rel,
-                }
+        if direction in ("out", "both"):
+            _fetch(
+                "MATCH (n:OntologyNode {node_id: $id})-[e:OntologyEdge]->(m:OntologyNode) "
+                f"WHERE e.relation IN $rels {_cols}"
             )
-            if len(results) >= limit:
-                break
+        if direction in ("in", "both") and len(results) < limit:
+            _fetch(
+                "MATCH (n:OntologyNode {node_id: $id})<-[e:OntologyEdge]-(m:OntologyNode) "
+                f"WHERE e.relation IN $rels {_cols}"
+            )
         return results
 
     def find_by_relations(
