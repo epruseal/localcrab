@@ -354,13 +354,22 @@ def _id_set(got) -> set[str] | None:
       · `ids` 가 문자열이면 `delete(ids="abcd")` 는 chroma 계약상 **단일 id 삭제**인데
         `len("abcd")` 는 4다 — 1건 삭제를 4건으로 보고한다.
     그래서 삭제 전 조회와 재조회가 **이 판독기 하나를 공유**한다(사본 금지).
+
+    **정확히 내장 `dict`/`list`/`str`** 여야 한다. `isinstance` 로는 서브클래스가
+    산술을 오염시킨다 — 실측 반례 둘: ⓐ `{"ids": ["real"]}` 를 담고도 `.get("ids")`
+    가 `["ghost"]` 를 돌려주는 `dict` 서브클래스면, ghost 삭제는 no-op 이고 재조회엔
+    real 만 남아 `1 - 0 = 1` 이 발행된다(실제 삭제 0). ⓑ `__hash__`/`__eq__` 를
+    조작한 `str` 서브클래스도 교집합을 비껴간다(적대 검증이 `(0, 0, 1)` 로 실증).
+    실 chroma 는 세 자리 모두 평범한 내장형이다(1.5.9 실측, `GetResult` 는 TypedDict
+    라 런타임에 평 `dict`). 어떤 버전이 서브클래스를 내면 이 함수가 `None` 을 내고
+    카운트는 미확인으로 떨어진다 — 보이는 실패이지 틀린 수가 아니다.
     """
-    if not isinstance(got, dict):
+    if type(got) is not dict:
         return None
     ids = got.get("ids")
-    if not isinstance(ids, list):                 # chroma GetResult: ids 는 List[str]
+    if type(ids) is not list:                     # chroma GetResult: ids 는 List[str]
         return None
-    if not all(isinstance(i, str) for i in ids):
+    if not all(type(i) is str for i in ids):
         return None
     out = set(ids)
     if len(out) != len(ids):                      # 중복 = 유효한 id 집합이 아니다
@@ -829,10 +838,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
     # 들면 다음 사람이 못 읽는다.
     chunk_vec_del: int | None = 0
     kind = None                      # 판별 실패해도 아래 요약이 읽을 수 있게 선초기화
-    chroma_unreadable = False        # 락 안에서는 플래그만, warning 은 락 밖에서
-    # `available` 은 **한 번만** 읽는다. 아래 요약이 이 값을 다시 읽으면 그 접근은
-    # `try` 밖이라, 상태를 가진 property 가 나중 접근에서 던질 때 `delete_pack` 밖으로
-    # 예외가 샌다 — 종전엔 없던 탈출 경로다(적대 검증 실증).
+    chroma_unreadable = ""           # 락 안에서는 사유만, warning 은 락 밖에서
+    # `available` 을 캐시해 아래 요약이 **다시 읽지 않게** 한다. 요약은 `try` 밖이라,
+    # 상태를 가진 property 가 나중 접근에서 던지면 `delete_pack` 밖으로 예외가 샌다 —
+    # 종전엔 없던 탈출 경로다(적대 검증 실증). 이 캐시로 `try` **밖** 접근은 아래 한
+    # 번뿐이고(base 와 같은 횟수), `_vec_backend` 안의 접근은 `try` 가 흡수한다.
     vec_available = vec.available
     if vec_available:
         try:
@@ -852,7 +862,7 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                     requested = _id_set(col.get(where={"pack_id": pack_name}))
                     if requested is None:
                         # 지울 대상을 모른다 — 삭제하지 않는다. 카운트는 0(0건 삭제가 참).
-                        chroma_unreadable = True
+                        chroma_unreadable = "삭제 대상을 모른다 — 삭제를 시도하지 않았다"
                     elif requested:
                         chunk_vec_del = None                           # R1
                         col.delete(ids=list(requested))
@@ -866,7 +876,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                         # 아니므로 생존자로 세면 안 된다.
                         survivors = _id_set(
                             col.get(where={"pack_id": pack_name}, include=[]))
-                        if survivors is not None:
+                        if survivors is None:
+                            # 카운트는 이미 None(R1). 요약의 "미확인"만으로는 원인을
+                            # 못 찾으므로 사유를 남긴다 — 삭제는 실제로 날아갔다.
+                            chroma_unreadable = "삭제 후 재조회를 판독할 수 없다 — 삭제 수 미확인"
+                        else:
                             chunk_vec_del = len(requested) - len(requested & survivors)  # R2
             elif kind == "sqlalchemy":
                 from sqlalchemy import text as _sa_text
@@ -886,9 +900,8 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
         except Exception as e:
             log.warning("벡터 delete 오류(%s): %s", pack_name, e)
     if chroma_unreadable:
-        log.warning(
-            "벡터 조회 응답을 id 집합으로 읽을 수 없다(%s) — 삭제를 시도하지 않았다. "
-            "팩 %s 의 벡터가 남는다", type(vec).__name__, pack_name)
+        log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
+                    type(vec).__name__, pack_name, chroma_unreadable)
 
     # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
     # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로

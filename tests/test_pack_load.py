@@ -2259,7 +2259,11 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             f"재조회는 id 만 받아야 한다(include=[]): {where_calls[1]}")
 
     def test_failure_before_any_write_reports_zero_not_unconfirmed(self, live):
-        """G5 — 삭제 시도 **전** 조회가 실패하면 0건 삭제가 확인된 사실이다."""
+        """G5 — 삭제 시도 **전** 조회가 실패하면 0건 삭제가 확인된 사실이다.
+
+        **회귀 게이트다**: 원 결함에서도 통과한다(base 도 이 경우 0을 낸다). 이
+        자리가 장차 "미확인"으로 과교정되는 것을 막는다 — 그 변이에서는 FAIL 한다.
+        """
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a"})
         vec._collection.fail_get_wheres = {1}                # 1번째 = 삭제 전 조회
@@ -2341,8 +2345,52 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert any("id 집합으로 읽을 수 없다" in r.getMessage() for r in caplog.records), (
             f"조용히 지나가면 안 된다: {[r.getMessage() for r in caplog.records]}")
 
+    @pytest.mark.parametrize("hostile", [
+        pytest.param("dict", id="dict-subclass-returns-ghost-ids"),
+        pytest.param("str", id="str-subclass-lies-in-eq-and-hash"),
+    ])
+    def test_subclassed_response_shapes_are_unconfirmed(self, live, hostile):
+        """G27 — 응답이 **정확히 내장** dict/list/str 이 아니면 카운트를 안 낸다.
+
+        `isinstance` 로 읽으면 서브클래스가 산술을 오염시킨다: 실제 내용과 다른
+        id 를 `.get("ids")` 로 돌려주는 dict, 그리고 교집합을 비껴가는 str.
+        둘 다 **0건 삭제를 1건으로** 보고하게 만든다(적대 검증 실증).
+        """
+        _builder, graph, docs = live
+
+        if hostile == "dict":
+            class _GhostDict(dict):
+                def get(self, key, default=None):
+                    return ["ghost"] if key == "ids" else super().get(key, default)
+
+            bad = _GhostDict({"ids": ["a1"]})
+        else:
+            class _LiarStr(str):
+                def __eq__(self, other):
+                    return False        # 교집합에서 자신을 못 찾게 만든다
+
+                def __hash__(self):
+                    return id(self)
+
+            bad = {"ids": [_LiarStr("a1")]}
+
+        vec = _FakeChromaVec({"a1": "pack-a"})
+        vec._collection.malformed_get_wheres = {1: bad}
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == 0, (
+            f"삭제를 시도하지 않았는데 {chunk_vec_del!r} 를 냈다")
+        assert not vec._collection.delete_calls, (
+            f"서브클래스 응답을 믿고 삭제를 날렸다: {vec._collection.delete_calls}")
+
     def test_zero_target_reports_zero_without_calling_delete(self, live):
-        """G21(회귀) — 대상이 0건이면 0이고, 빈 목록으로 delete 를 부르지 않는다."""
+        """G21 — 대상이 0건이면 0이고, 빈 목록으로 delete 를 부르지 않는다.
+
+        **회귀 게이트다**: 원 결함(요청 수 보고)에서도 통과한다. "확인된 0" 이
+        장차 `None` 으로 과교정되는 것을 막는 것이 목적이고, 그 과교정 변이에서는
+        실제로 FAIL 한다.
+        """
         _builder, graph, docs = live
         vec = _FakeChromaVec({"b1": "pack-b"})
 
@@ -2446,7 +2494,11 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         pytest.param(lambda: _StubSaVec(rowcount=0), id="sqlalchemy"),
     ])
     def test_rowcount_zero_stays_zero(self, live, vec_factory):
-        """G20(회귀) — "세어보니 0" 은 확인된 사실이다. 미확인으로 접지 않는다."""
+        """G20 — "세어보니 0" 은 확인된 사실이다. 미확인으로 접지 않는다.
+
+        **회귀 게이트다**: 원 결함에서도 통과한다. 목적은 `None`(미확인) 도입이
+        "확인된 0"까지 삼키지 않게 고정하는 것이다.
+        """
         _builder, graph, docs = live
 
         _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec_factory())
