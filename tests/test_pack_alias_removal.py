@@ -208,6 +208,8 @@ def _mcp_ctx(graph):
 @pytest.mark.usefixtures("bind_test_principal")
 def test_t4_mcp_ingest_normalises_every_axis(tmp_path, caplog):
     """노드·엣지·텍스트 메타 3축 모두 별칭을 버리고, 불일치는 경고로 드러난다."""
+    from sqlalchemy import text as _t
+
     from opencrab.mcp.tools import _ingest_into_pack
 
     graph = LocalGraphStore(str(tmp_path / "graph.db"))
@@ -215,7 +217,23 @@ def test_t4_mcp_ingest_normalises_every_axis(tmp_path, caplog):
     # 거부된다). builder 가 MagicMock 이라 노드 쓰기가 라이브에 안 남으므로 직접 심는다.
     graph.upsert_node("Entity", "e1", {"pack_id": "my-pack"})
     graph.upsert_node("Entity", "e2", {"pack_id": "my-pack"})
+
+    # #148: 텍스트 축은 이제 write_source 를 지나며 진짜 authorize 를 건다 --
+    # ctx["sql"] 이 MagicMock 이면 소유권을 확인할 수 없어 그 자리에서
+    # PackForbiddenError 로 죽는다. bind_test_principal 이 묶는 고정 principal
+    # (test-user) 이 "my-pack" 을 소유하도록 실제 등록부를 심는다.
+    sql = SQLStore(f"sqlite:///{tmp_path}/o.db")
+    with sql._engine.begin() as conn:
+        conn.execute(
+            _t("INSERT INTO users (user_id, display_name, is_local) "
+               "VALUES (:u, :n, 0)"),
+            {"u": "test-user", "n": "test-user"},
+        )
+    assigned = create_pack(sql, "test-user", "my-pack")
+    assert assigned == "my-pack", "collided with a pre-existing pack of the same id"
+
     ctx = _mcp_ctx(graph)
+    ctx["sql"] = sql
     try:
         with caplog.at_level("WARNING"), patch(
                 "opencrab.mcp.tools._get_context", return_value=ctx):
@@ -509,16 +527,42 @@ def test_t13_hybrid_ingest_rejects_before_the_store_try_and_before_early_return(
                       metadata={"pack": "A", "pack_id": "B"})
 
 
-def test_t13b_rest_ingest_maps_the_invariant_violation_to_422(monkeypatch):
-    """노드 엔드포인트가 이미 ValueError 에 주는 것과 같은 처분이다."""
+def test_t13b_rest_ingest_maps_the_invariant_violation_to_422(monkeypatch, tmp_path):
+    """노드 엔드포인트가 이미 ValueError 에 주는 것과 같은 처분이다.
+
+    #148: ``ingest_text`` 이제 ``write_source`` 를 지나며 진짜 ``authorize``/
+    ``source_identity_conflict`` 를 건다 -- ``ctx.sql`` 이 순수 MagicMock 이면
+    소유권을 확인할 수 없어 그 자리에서 ``PackForbiddenError`` 로 먼저 죽고,
+    이 테스트가 실제로 노리는 "hybrid.ingest 의 ValueError -> 422" 를 결코
+    exercise 하지 못한다. 그래서 ``ctx.sql`` 은 실제 등록부(u1 이 소유한
+    기본 팩)로 바꾸고, 정체성 가드가 확인 불가로 fail-closed 되지 않도록
+    doc/vector 더블의 프로브 메서드에 명시적으로 "그 슬롯 비어있음"(None)을
+    준다."""
     from fastapi import HTTPException
+    from sqlalchemy import text as _t
 
     from apps.api import main as api
+    from opencrab.auth import Principal
 
     monkeypatch.setattr(api, "_enforce_ingest_limits", lambda *a, **kw: None)
+
+    sql = SQLStore(f"sqlite:///{tmp_path}/o.db")
+    with sql._engine.begin() as conn:
+        conn.execute(
+            _t("INSERT INTO users (user_id, display_name, is_local) "
+               "VALUES (:u, :n, 0)"),
+            {"u": "u1", "n": "u1"},
+        )
+
     ctx = MagicMock()
+    ctx.sql = sql
+    ctx.docs.available = True
+    ctx.docs.get_source.return_value = None
+    ctx.vector.available = True
+    ctx.vector.get_by_id.return_value = None
     ctx.hybrid.ingest.side_effect = ValueError("properties.pack is a retired alias")
     auth = MagicMock(user_id="u1", tier="pro")
+    auth.principal = Principal(user_id="u1", is_local=False, disabled=False)
 
     with pytest.raises(HTTPException) as exc:
         api.ingest_text(api.IngestRequest(text="본문", source_id="s1"), auth, ctx)

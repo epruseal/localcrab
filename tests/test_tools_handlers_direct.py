@@ -504,7 +504,9 @@ class TestIngestIntoPack:
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         mongo.upsert_source.return_value = "src-2"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 result = _ingest_into_pack(
                     "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
@@ -530,7 +532,9 @@ class TestIngestIntoPack:
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 result = _ingest_into_pack(
                     "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
@@ -554,7 +558,10 @@ class TestIngestIntoPack:
         mongo = MagicMock()
         mongo.available = False  # -> stores["documents"] = "unavailable"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+                billing=billing,
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 result = _ingest_into_pack(
                     "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
@@ -577,7 +584,12 @@ class TestIngestIntoPack:
         silently stopped billing every legacy vector-only success in
         production — the fixture was shaped to match the implementation
         instead of the real contract, so it could not catch that regression.
-        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns."""
+        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns.
+
+        #148: no explicit principal_scope here -- this test relies on the
+        module-wide ``bind_test_principal`` fixture, which binds
+        ``user_id="test-user"``, ``_writable_ctx``'s own default owner, so
+        the registry ownership lines up without having to pass one."""
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
@@ -585,7 +597,9 @@ class TestIngestIntoPack:
         mongo = MagicMock()
         mongo.available = False
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", builder=builder, hybrid=hybrid, mongo=mongo, billing=billing,
+            )
             _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
         billing.on_ingest.assert_called_once_with("default", None, "src-5")
 
@@ -602,11 +616,18 @@ class TestIngestIntoPack:
         chroma = MagicMock()
         chroma.available = True
         chroma.upsert_texts.return_value = ["vec-real-1"]
+        # #148: write_source's identity guard probes vector.get_by_id
+        # before this test's HybridQuery.ingest() ever runs -- explicit
+        # None means the slot is empty, not "cannot verify".
+        chroma.get_by_id.return_value = None
         hybrid = HybridQuery(chroma=chroma, neo4j=MagicMock(available=False))
         mongo = MagicMock()
         mongo.available = False
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", builder=builder, hybrid=hybrid, mongo=mongo,
+                billing=billing, chroma=chroma,
+            )
             result = _ingest_into_pack(
                 "pack-a", text="legacy text", source_id="src-6", text_as_node=False,
             )

@@ -25,7 +25,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from opencrab.pack.write_gate import SOURCE_STAMPED, stamp
+from opencrab.pack.write_gate import (
+    SOURCE_STAMPED,
+    authorize,
+    identity_reject_message,
+    source_identity_conflict,
+    stamp,
+)
 
 # Sources carry no space of their own, and the FTS space filter drops anything
 # without one. Only the pack ingest path used to fill this in, so REST-ingested
@@ -39,8 +45,10 @@ def _docs_available(docs: Any) -> bool:
 
 
 def write_source(
+    sql: Any,
     hybrid: Any,
     docs: Any,
+    vector: Any,
     *,
     text: str,
     source_id: str,
@@ -63,7 +71,24 @@ def write_source(
     not a failure, and refusing there would break vector-only deployments the
     same way the earlier vector-first ordering broke doc-only ones.
     """
-    meta = stamp(metadata, principal=_principal(), pack_id=pack_id, keys=SOURCE_STAMPED)
+    principal = _principal()
+
+    # Owner-only (#143 invariant 4). `sql` is a REQUIRED positional, not an
+    # optional one: an authorize that runs "when the caller happens to pass a
+    # store" is fail-open, which is the pattern this work already had to walk
+    # back once (see pack/load.py's _require_bound_principal).
+    authorize(sql, principal, pack_id)
+
+    # A source_id is a global slot on both sinks -- the doc store upserts on
+    # source_id with no pack predicate, and every vector store keys on the id
+    # alone -- so writing someone else's id silently takes their row.
+    reason = source_identity_conflict(
+        docs, vector, source_id=source_id, pack_id=pack_id
+    )
+    if reason:
+        raise ValueError(identity_reject_message("source", source_id, reason))
+
+    meta = stamp(metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED)
     meta.setdefault("space", _DEFAULT_SPACE)
 
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}

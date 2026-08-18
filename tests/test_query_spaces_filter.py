@@ -48,6 +48,32 @@ from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
 _INGESTOR = Principal(user_id="user_ingestor", is_local=False, disabled=False)
 
+
+def _registry_owning_pack_a(tmp_path):
+    """A real pack registry with ``_INGESTOR`` as the owner of "pack-a".
+
+    #148: ``_ingest_into_pack``'s legacy text path now runs through
+    ``write_source``, which calls ``authorize(sql, principal, pack_id)`` --
+    a bare ``MagicMock()`` "sql" can't answer a real ownership query and
+    fails closed with ``PackForbiddenError`` before the write ever reaches
+    the space-tagging logic under test here.
+    """
+    from sqlalchemy import text as _t
+
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore(f"sqlite:///{tmp_path}/registry.db")
+    with sql._engine.begin() as conn:
+        conn.execute(
+            _t("INSERT INTO users (user_id, display_name, is_local) "
+               "VALUES (:u, :n, 0)"),
+            {"u": _INGESTOR.user_id, "n": _INGESTOR.user_id},
+        )
+    assigned = create_pack(sql, _INGESTOR.user_id, "pack-a")
+    assert assigned == "pack-a", "collided with a pre-existing pack of the same id"
+    return sql
+
 # ---------------------------------------------------------------------------
 # Leg 1 — HybridQuery._fts_search must forward `spaces` to keyword_search
 # ---------------------------------------------------------------------------
@@ -344,7 +370,7 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
         "neo4j": MagicMock(available=False),
         "chroma": MagicMock(available=False),
         "mongo": doc,
-        "sql": MagicMock(),
+        "sql": _registry_owning_pack_a(tmp_path),
         "builder": MagicMock(),
         "rebac": MagicMock(),
         "impact": MagicMock(),
@@ -382,7 +408,7 @@ def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
         "neo4j": MagicMock(available=False),
         "chroma": MagicMock(available=False),
         "mongo": doc,
-        "sql": MagicMock(),
+        "sql": _registry_owning_pack_a(tmp_path),
         "builder": MagicMock(),
         "rebac": MagicMock(),
         "impact": MagicMock(),

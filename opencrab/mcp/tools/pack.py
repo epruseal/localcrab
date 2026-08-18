@@ -424,7 +424,8 @@ def _ingest_into_pack(
                 from opencrab.pack.source_writer import write_source
 
                 write_result = write_source(
-                    ctx["hybrid"], ctx["mongo"], text=text, source_id=source_id,
+                    ctx["sql"], ctx["hybrid"], ctx["mongo"], ctx["chroma"],
+                    text=text, source_id=source_id,
                     metadata=meta, pack_id=pack_id,
                 )
                 stores.update(write_result.get("stores", {}))

@@ -469,6 +469,12 @@ class TestIngest:
     def test_ingest_pack_id_inferred_from_path(
         self, bootstrapped, cli_env, runner, mock_vector_store
     ):
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        create_pack(make_sql_store(get_settings()), bootstrapped, "demo-pack")
+
         pack_dir = cli_env / "packs" / "demo-pack" / "stage"
         pack_dir.mkdir(parents=True)
         (pack_dir / "doc.txt").write_text("packed content")

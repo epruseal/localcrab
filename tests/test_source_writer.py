@@ -1,4 +1,4 @@
-"""writer 2: one stamp, doc row first, vector second (#148)."""
+"""writer 2: authorize, guard the slot, one stamp, doc first, vector second (#148)."""
 
 from __future__ import annotations
 
@@ -7,16 +7,19 @@ from typing import Any
 import pytest
 
 from opencrab.auth import Principal, principal_scope
+from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, create_pack
 from opencrab.pack.source_writer import write_source
 from opencrab.pack.write_gate import ClientIdentityFieldError
 
 ALICE = Principal(user_id="user_alice", is_local=False, disabled=False)
+BOB = Principal(user_id="user_bob", is_local=False, disabled=False)
 
 
 class _Docs:
-    def __init__(self, available=True, raises=False):
+    def __init__(self, available=True, raises=False, existing=None):
         self.available = available
         self._raises = raises
+        self._existing = existing
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def upsert_source(self, source_id, text, metadata):
@@ -24,6 +27,9 @@ class _Docs:
             raise RuntimeError("doc store exploded")
         self.calls.append((source_id, text, dict(metadata)))
         return source_id
+
+    def get_source(self, source_id):  # noqa: ARG002
+        return self._existing
 
 
 class _Hybrid:
@@ -36,48 +42,154 @@ class _Hybrid:
         return {"source_id": source_id, "stores": {"chromadb": self._status}}
 
 
-def _write(docs, hybrid, **kw):
-    with principal_scope(ALICE):
+class _Vec:
+    available = True
+
+    def __init__(self, row=None):
+        self._row = row
+
+    def get_by_id(self, doc_id):  # noqa: ARG002
+        return self._row
+
+
+@pytest.fixture
+def sql(tmp_path):
+    """Real registry: alice owns pack-a, bob owns nothing."""
+    from sqlalchemy import text as _t
+
+    from opencrab.stores.sql_store import SQLStore
+
+    store = SQLStore(f"sqlite:///{tmp_path}/o.db")
+    with store._engine.begin() as conn:
+        for p in (ALICE, BOB):
+            conn.execute(
+                _t("INSERT INTO users (user_id, display_name, is_local) "
+                   "VALUES (:u, :n, 0)"),
+                {"u": p.user_id, "n": p.user_id},
+            )
+    create_pack(store, ALICE.user_id, "pack-a")
+    return store
+
+
+def _write(sql, docs=None, hybrid=None, vector=None, principal=ALICE,
+           pack_id="pack-a", **kw):
+    with principal_scope(principal):
         return write_source(
-            hybrid, docs, text="t", source_id="s1", pack_id="pack-a", **kw
+            sql, hybrid or _Hybrid(), docs or _Docs(), vector or _Vec(),
+            text="t", source_id="s1", pack_id=pack_id, **kw
         )
 
 
-def test_stamps_pack_and_user_on_both_writes():
+# ---------------------------------------------------------------------------
+# Authorization -- the hole an adversarial review found in the first cut
+# ---------------------------------------------------------------------------
+
+
+def test_non_owner_cannot_write_into_a_visible_pack(sql):
+    from opencrab.pack.ownership import set_visibility
+
+    set_visibility(sql, ALICE, "pack-a", "public-read")
+    with pytest.raises(PackForbiddenError):
+        _write(sql, principal=BOB)
+
+
+def test_non_owner_gets_not_found_for_a_private_pack(sql):
+    """#143 invariant 7: someone else's private pack must look like no pack."""
+    with pytest.raises(PackNotFoundError):
+        _write(sql, principal=BOB)
+
+
+def test_missing_pack_is_the_same_error_as_a_foreign_private_one(sql):
+    with pytest.raises(PackNotFoundError):
+        _write(sql, pack_id="no-such-pack")
+
+
+def test_owner_may_write(sql):
+    receipt = _write(sql)
+    assert receipt["stores"]["documents"].startswith("ok")
+
+
+def test_registry_unavailable_fails_closed(sql):
+    class Down:
+        available = False
+
+    with pytest.raises(RuntimeError, match="registry unavailable"):
+        _write(Down())
+
+
+# ---------------------------------------------------------------------------
+# Identity slot -- source_id is a global key on both sinks
+# ---------------------------------------------------------------------------
+
+
+def test_source_id_owned_by_another_pack_is_refused(sql):
+    docs = _Docs(existing={"metadata": {"pack_id": "someone-elses"}})
+    with pytest.raises(ValueError, match="already attributed"):
+        _write(sql, docs=docs)
+    assert docs.calls == [], "the foreign row must not be overwritten"
+
+
+def test_vector_slot_owned_by_another_pack_is_refused(sql):
+    vec = _Vec({"metadata": {"pack_id": "someone-elses"}})
+    with pytest.raises(ValueError, match="already attributed"):
+        _write(sql, vector=vec)
+
+
+def test_own_source_id_may_be_rewritten(sql):
+    docs = _Docs(existing={"metadata": {"pack_id": "pack-a"}})
+    assert _write(sql, docs=docs)["stores"]["documents"].startswith("ok")
+
+
+def test_unverifiable_probe_fails_closed(sql):
+    class Bare:
+        available = True
+
+    with pytest.raises(ValueError, match="cannot verify"):
+        _write(sql, vector=Bare())
+
+
+# ---------------------------------------------------------------------------
+# Stamping
+# ---------------------------------------------------------------------------
+
+
+def test_stamps_pack_and_user_on_both_writes(sql):
     docs, hybrid = _Docs(), _Hybrid()
-    receipt = _write(docs, hybrid)
+    receipt = _write(sql, docs=docs, hybrid=hybrid)
     assert receipt["metadata"]["pack_id"] == "pack-a"
     assert receipt["metadata"]["user_id"] == "user_alice"
     # The doc row and the vector must carry the SAME stamp, not two copies
     # that can drift.
     assert docs.calls[0][2]["pack_id"] == "pack-a"
-    assert hybrid.calls[0]["metadata"]["pack_id"] == "pack-a"
     assert hybrid.calls[0]["metadata"]["user_id"] == "user_alice"
 
 
-def test_user_id_is_assigned_not_merely_defaulted():
+def test_user_id_is_assigned_not_merely_defaulted(sql):
     """The free-tier quota counts on this key; a caller must not own it."""
     with pytest.raises(ClientIdentityFieldError):
-        _write(_Docs(), _Hybrid(), metadata={"user_id": "someone_else"})
+        _write(sql, metadata={"user_id": "someone_else"})
 
 
-def test_matching_user_id_passes():
-    receipt = _write(_Docs(), _Hybrid(), metadata={"user_id": "user_alice"})
+def test_matching_user_id_passes(sql):
+    receipt = _write(sql, metadata={"user_id": "user_alice"})
     assert receipt["metadata"]["user_id"] == "user_alice"
 
 
-def test_default_space_is_filled():
+def test_default_space_is_filled(sql):
     """Without it the FTS space filter silently drops the source (#52/#110)."""
-    receipt = _write(_Docs(), _Hybrid())
-    assert receipt["metadata"]["space"] == "evidence"
+    assert _write(sql)["metadata"]["space"] == "evidence"
 
 
-def test_caller_space_is_kept():
-    receipt = _write(_Docs(), _Hybrid(), metadata={"space": "resource"})
-    assert receipt["metadata"]["space"] == "resource"
+def test_caller_space_is_kept(sql):
+    assert _write(sql, metadata={"space": "resource"})["metadata"]["space"] == "resource"
 
 
-def test_doc_row_is_written_before_the_vector():
+# ---------------------------------------------------------------------------
+# Ordering
+# ---------------------------------------------------------------------------
+
+
+def test_doc_row_is_written_before_the_vector(sql):
     order: list[str] = []
 
     class Docs(_Docs):
@@ -90,45 +202,44 @@ def test_doc_row_is_written_before_the_vector():
             order.append("vector")
             return super().ingest(text, source_id, metadata)
 
-    _write(Docs(), Hybrid())
+    _write(sql, docs=Docs(), hybrid=Hybrid())
     assert order == ["doc", "vector"]
 
 
-def test_vector_unavailable_still_records_the_source():
-    """The regression an earlier vector-first draft would have shipped: on a
+def test_vector_unavailable_still_records_the_source(sql):
+    """The regression a vector-first ordering would have shipped: on a
     deployment with no vector store, ingest became a silent no-op."""
     docs = _Docs()
-    receipt = _write(docs, _Hybrid(status="unavailable"))
+    receipt = _write(sql, docs=docs, hybrid=_Hybrid(status="unavailable"))
     assert docs.calls, "the source row must be written even with no vector store"
-    assert receipt["stores"]["documents"].startswith("ok")
     assert receipt["stores"]["chromadb"] == "unavailable"
 
 
-def test_doc_error_stops_the_vector_write():
+def test_doc_error_stops_the_vector_write(sql):
     """A vector row for a source that failed to record is an orphan."""
     hybrid = _Hybrid()
-    receipt = _write(_Docs(raises=True), hybrid)
+    receipt = _write(sql, docs=_Docs(raises=True), hybrid=hybrid)
     assert receipt["stores"]["documents"].startswith("error:")
     assert receipt["stores"]["chromadb"] == "skipped (source record failed)"
     assert hybrid.calls == []
 
 
-def test_doc_unavailable_does_not_stop_the_vector_write():
+def test_doc_unavailable_does_not_stop_the_vector_write(sql):
     """Unavailable is a deployment shape, not a failure."""
     hybrid = _Hybrid()
-    receipt = _write(_Docs(available=False), hybrid)
+    receipt = _write(sql, docs=_Docs(available=False), hybrid=hybrid)
     assert receipt["stores"]["documents"] == "unavailable"
     assert hybrid.calls, "vector-only deployments must still ingest"
 
 
-def test_pack_id_is_required():
-    with pytest.raises(TypeError):
-        with principal_scope(ALICE):
-            write_source(_Hybrid(), _Docs(), text="t", source_id="s1")
+def test_pack_id_is_required(sql):
+    with pytest.raises(TypeError), principal_scope(ALICE):
+        write_source(sql, _Hybrid(), _Docs(), _Vec(), text="t", source_id="s1")
 
 
-def test_requires_a_bound_principal():
+def test_requires_a_bound_principal(sql):
     with pytest.raises(LookupError):
         write_source(
-            _Hybrid(), _Docs(), text="t", source_id="s1", pack_id="pack-a"
+            sql, _Hybrid(), _Docs(), _Vec(),
+            text="t", source_id="s1", pack_id="pack-a",
         )

@@ -499,7 +499,8 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
 
             with principal_scope(principal), write_lock():
                 receipt = write_source(
-                    hybrid, mongo, text=text, source_id=source_id,
+                    stores.sql, hybrid, mongo, chroma,
+                    text=text, source_id=source_id,
                     metadata=meta, pack_id=target_pack_id,
                 )
                 # write_source reports per-store failures in the receipt

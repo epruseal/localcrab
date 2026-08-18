@@ -691,12 +691,21 @@ class TestToolDispatch:
             mongo.available = False
             graph = MagicMock()
             graph.available = True
+            # #148: the legacy text path now runs write_source's identity
+            # guard, which probes vector.get_by_id(source_id) -- an
+            # unconfigured MagicMock would answer with another MagicMock
+            # (not None), which is unrecognised and fails closed
+            # ("cannot verify"). Explicit None means the slot is empty.
+            chroma = MagicMock()
+            chroma.available = True
+            chroma.get_by_id.return_value = None
             mock_ctx.return_value = {
                 "neo4j": graph,
                 "sql": sql,
                 "builder": builder,
                 "hybrid": hybrid,
                 "mongo": mongo,
+                "chroma": chroma,
                 "rebac": MagicMock(),
                 "impact": MagicMock(),
                 "billing": MagicMock(),

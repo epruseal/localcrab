@@ -564,7 +564,7 @@ def ingest_text(
         try:
             with principal_scope(auth.principal):
                 receipt = write_source(
-                    ctx.hybrid, ctx.docs,
+                    ctx.sql, ctx.hybrid, ctx.docs, ctx.vector,
                     text=payload.text, source_id=source_id,
                     metadata=metadata, pack_id=target_pack_id,
                 )
