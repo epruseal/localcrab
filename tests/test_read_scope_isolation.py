@@ -1139,4 +1139,27 @@ class TestStartupCheck:
         assert_registry_covers_graph(sql, graph) is None
 
     def test_skips_when_the_graph_store_is_unavailable(self, sql):
-        assert_registry_covers_graph(sql, MagicMock(available=False)) is None
+        assert assert_registry_covers_graph(sql, MagicMock(available=False)) is None
+
+    def test_every_read_serving_entry_point_calls_it(self):
+        """The check only helps where it is wired in.
+
+        Each call site can be deleted individually with the rest of the
+        suite green, because the tests above call the function directly.
+        Asserting on the source keeps the wiring pinned -- weaker than
+        booting each entry point, but it is the difference between "the
+        guard exists" and "the guard runs".
+        """
+        import inspect
+
+        from apps.api import main as api_main
+        from opencrab import cli
+        from opencrab.mcp import http_app, server
+
+        for module in (api_main, cli, http_app, server):
+            src = inspect.getsource(module)
+            assert "assert_registry_covers_graph(" in src, module.__name__
+
+        # ...and in the CLI on every command that serves reads, not only
+        # `serve`: those bypass the server entry points entirely.
+        assert inspect.getsource(cli).count("assert_registry_covers_graph(") >= 5
