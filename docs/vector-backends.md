@@ -543,6 +543,10 @@ graph/doc 쪽을 그대로 두면 다음 적재에서 임포트한 벡터가 전
   직렬화되고, 프로세스 간은 호출자의 `write.lock` 규율이다. 그 창을 완전히 닫지는 못하므로
   import 는 **쓰기 후 되읽어** 전 id 의 존재와 metadata·document·uri 일치를 확인한다 —
   조용한 누락을 예외로 승격시키는 장치다. 임베딩은 대조하지 않는다(비용 + 8.1 의 ULP).
+- **import 하는 동안 그 컬렉션의 읽기가 밀린다.** 선검사부터 사후 확인까지 스토어 락을 쥐므로
+  같은 컬렉션의 `query`·`count`·`get_by_id`(miss 재확인)가 그 시간만큼 대기한다. 대형 배치에서는
+  초 단위다. `upsert_texts` 가 세운 기존 패턴의 연장이고 정확성 문제는 아니지만, fork 를 서빙
+  중에 돌리면 검색 지연으로 보인다.
 - **metadata 값은 그대로 보존되지 않는다.** `_sanitize_metadata` 가 비스칼라를 `str()` 로
   바꾸고, NaN/Inf 값은 키째 사라지며, 매우 큰 int 는 float 로 강등된다. 전부 `add_texts` 의
   기존 관례와 같고 export→import 경로에서는 도달하지 않는다(export 값은 이미 chroma 가 저장한
