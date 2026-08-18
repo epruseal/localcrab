@@ -70,7 +70,7 @@ def apply_promotion_package(
 
     # Import OpenCrab components — optional dependency
     try:
-        from opencrab.auth import principal_scope, require_local_principal
+        from opencrab.auth import current_principal
         from opencrab.config import Settings
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.pack.ownership import resolve_write_pack
@@ -124,57 +124,61 @@ def apply_promotion_package(
     sql = make_sql_store(settings)
     builder = OntologyBuilder(neo4j=graph, mongo=docs, sql=sql)
 
-    # #148: builder.add_node/add_edge now require a bound principal (they
-    # call current_principal() internally) and a pack_id. This is a
-    # standalone process entry point (crabharness CLI), so no principal_scope
-    # is open yet -- bind the local user, same as opencrab.cli's write paths.
-    principal = require_local_principal()
+    # #148: builder.add_node/add_edge require a bound principal (they call
+    # current_principal() internally) and a pack_id.
+    #
+    # This function does NOT bind one itself. Picking require_local_principal()
+    # here would be fail-open on identity: any caller that forgets to bind --
+    # a server surface where the principal differs per request, say -- would
+    # not fail, it would silently attribute the writes to the LOCAL user
+    # instead of the requester. Binding is the entry point's job (the
+    # crabharness CLI does it); a library call refuses instead.
+    principal = current_principal()
     target_pack_id = resolve_write_pack(sql, principal, pack_id)
 
-    with principal_scope(principal):
-        for node in package.nodes:
-            try:
-                result = builder.add_node(
-                    space=node.space,
-                    node_type=node.node_type,
-                    node_id=node.node_id,
-                    properties=node.properties or {},
-                    pack_id=target_pack_id,
-                )
-                node_receipts.append({
-                    "node_id": node.node_id,
-                    "space": node.space,
-                    "node_type": node.node_type,
-                    "receipt_id": result.get("receipt_id"),
-                    "receipt_ts": result.get("receipt_ts"),
-                    "stores": result.get("stores"),
-                })
-            except Exception as exc:
-                errors.append({"node_id": node.node_id, "error": str(exc)})
+    for node in package.nodes:
+        try:
+            result = builder.add_node(
+                space=node.space,
+                node_type=node.node_type,
+                node_id=node.node_id,
+                properties=node.properties or {},
+                pack_id=target_pack_id,
+            )
+            node_receipts.append({
+                "node_id": node.node_id,
+                "space": node.space,
+                "node_type": node.node_type,
+                "receipt_id": result.get("receipt_id"),
+                "receipt_ts": result.get("receipt_ts"),
+                "stores": result.get("stores"),
+            })
+        except Exception as exc:
+            errors.append({"node_id": node.node_id, "error": str(exc)})
 
-        for edge in package.edges:
-            try:
-                result = builder.add_edge(
-                    from_space=edge.from_space,
-                    from_id=edge.from_id,
-                    relation=edge.relation,
-                    to_space=edge.to_space,
-                    to_id=edge.to_id,
-                    pack_id=target_pack_id,
-                )
-                edge_receipts.append({
-                    "from_id": edge.from_id,
-                    "relation": edge.relation,
-                    "to_id": edge.to_id,
-                    "receipt_id": result.get("receipt_id"),
-                    "receipt_ts": result.get("receipt_ts"),
-                    "stores": result.get("stores"),
-                })
-            except Exception as exc:
-                errors.append({
-                    "edge": f"{edge.from_id} -[{edge.relation}]-> {edge.to_id}",
-                    "error": str(exc),
-                })
+    for edge in package.edges:
+        try:
+            result = builder.add_edge(
+                from_space=edge.from_space,
+                from_id=edge.from_id,
+                relation=edge.relation,
+                to_space=edge.to_space,
+                to_id=edge.to_id,
+                pack_id=target_pack_id,
+            )
+            edge_receipts.append({
+                "from_id": edge.from_id,
+                "relation": edge.relation,
+                "to_id": edge.to_id,
+                "receipt_id": result.get("receipt_id"),
+                "receipt_ts": result.get("receipt_ts"),
+                "stores": result.get("stores"),
+            })
+        except Exception as exc:
+            errors.append({
+                "edge": f"{edge.from_id} -[{edge.relation}]-> {edge.to_id}",
+                "error": str(exc),
+            })
 
     # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
     # module docstring) — bill it the same way harness_promotion_apply (the

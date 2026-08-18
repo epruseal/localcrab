@@ -259,6 +259,18 @@ def _run_seed(monkeypatch, tmp_path, *, add_node_receipt, add_edge_receipt):
 
     get_settings.cache_clear()
 
+    # #148: seed() now calls require_local_principal() itself (bind a local
+    # user, same as opencrab.cli's write paths) -- bootstrap one against the
+    # real on-disk SQLStore BEFORE opencrab.stores.factory.make_sql_store
+    # gets patched to the in-test fake_sql below. require_local_principal()
+    # opens its own SQLStore straight off settings.local_data_dir (see its
+    # docstring), independent of that patch, so this is the only way for it
+    # to find a bootstrapped user.
+    from opencrab.auth import bootstrap_local_user
+    from opencrab.stores.factory import make_sql_store
+
+    bootstrap_local_user(make_sql_store(get_settings()))
+
     seed_mod = _load_module_from_path(
         "_o163_seed_ontology", SCRIPTS_DIR / "seed_ontology.py"
     )
@@ -358,7 +370,14 @@ class TestSeedOntology:
 def _run_import(tmp_path, monkeypatch, *, add_node_receipt, add_edge_receipt):
     """``_import_vault_unlocked`` 를 노트 1건(폴더/태그/위키링크 없음)으로 직접
     호출한다. 이 노트 하나로 add_node 3건(Document/TextUnit/Topic), add_edge 2건
-    (contains/describes)이 정확히 나온다 — 폴더·태그·미해결링크 루프는 전부 0건."""
+    (contains/describes)이 정확히 나온다 — 폴더·태그·미해결링크 루프는 전부 0건.
+
+    #148: ``_import_vault_unlocked`` now calls ``current_principal()``
+    itself (its docstring: the normal caller, ``import_vault``, opens
+    ``principal_scope`` around it -- a direct test caller must open its own)
+    -- this helper binds a fixed principal via ``principal_scope`` for the
+    duration of the call.
+    """
     note_path = tmp_path / "note.md"
     note_path.write_text("Just a plain note with no links or tags.", encoding="utf-8")
 
@@ -380,12 +399,15 @@ def _run_import(tmp_path, monkeypatch, *, add_node_receipt, add_edge_receipt):
     monkeypatch.setattr(import_mod, "LocalDocStore", MagicMock())
     monkeypatch.setattr(import_mod, "SQLStore", MagicMock())
 
-    return import_mod._import_vault_unlocked(
-        vault_root=tmp_path,
-        neo4j_uri="bolt://x", neo4j_user="u", neo4j_password="p", neo4j_database="d",
-        local_data_dir=tmp_path,
-        notes=[note],
-    )
+    from opencrab.auth import Principal, principal_scope
+
+    with principal_scope(Principal(user_id="test-user", is_local=True, disabled=False)):
+        return import_mod._import_vault_unlocked(
+            vault_root=tmp_path,
+            neo4j_uri="bolt://x", neo4j_user="u", neo4j_password="p", neo4j_database="d",
+            local_data_dir=tmp_path,
+            notes=[note],
+        )
 
 
 # ---------------------------------------------------------------------------

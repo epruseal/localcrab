@@ -381,22 +381,57 @@ class TestMongoStoreEdgeCases:
 
 
 class _StubGraphOrSqlStore:
-    """Minimal stand-in for Neo4jStore/SQLStore — reports unavailable so
-    add_edge's graph/sql branches take the simple 'unavailable' path and
-    only the mongo audit branch under test is exercised."""
+    """Minimal stand-in for Neo4jStore — reports unavailable. NOT used for
+    ``sql`` anymore (see ``_make_builder``'s docstring): authorize() needs a
+    real, queryable SQL store now."""
 
     available = False
 
 
-def _make_builder(mongo: MagicMock):
-    from opencrab.ontology.builder import OntologyBuilder
+class _AvailableGraphStub:
+    """Minimal stand-in for Neo4jStore that reports available -- so
+    add_edge/add_node's #148-point-6 "graph unavailable -> refuse the whole
+    write" early exit does not fire before the mongo-specific branch under
+    test in this class ever runs. Deliberately has no upsert_node/
+    upsert_edge/lookup_node_type methods: the resulting AttributeError is
+    caught by add_node/add_edge's own try/except and reported as
+    "graph": "error: ..." -- irrelevant to what this class is testing (the
+    docs/mongo marker)."""
 
-    return OntologyBuilder(
-        neo4j=_StubGraphOrSqlStore(), mongo=mongo, sql=_StubGraphOrSqlStore()
-    )
+    available = True
+
+
+def _make_builder(mongo: MagicMock) -> tuple:
+    """Returns ``(builder, pack_id)``.
+
+    #148: add_node/add_edge now call current_principal() and
+    authorize(sql, principal, pack_id) internally, and authorize() requires
+    a REAL, queryable SQL store (it fails closed -- RuntimeError -- when
+    ``sql.available`` is falsy, and assert_writable() issues real queries
+    against it) -- the old always-unavailable stub can no longer stand in
+    for ``sql`` here. ``neo4j`` is also switched from "always unavailable"
+    to ``_AvailableGraphStub`` for the same #148-point-6 reason (see that
+    class's docstring): this class's whole point is exercising the mongo
+    docs-marker branch, which point 6 never reaches while the graph store
+    reports unavailable.
+    """
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore("sqlite:///:memory:")
+    pack_id = create_pack(sql, "test-user", "mongo-audit-test-pack")
+    builder = OntologyBuilder(neo4j=_AvailableGraphStub(), mongo=mongo, sql=sql)
+    return builder, pack_id
 
 
 class TestOntologyBuilderMongoAuditContract:
+    # #148: add_node/add_edge now call current_principal() internally --
+    # bind a fixed test principal for every test in this class (see
+    # conftest.py's bind_test_principal; scoped to this class only, not the
+    # whole module, since the rest of this file doesn't need it).
+    pytestmark = pytest.mark.usefixtures("bind_test_principal")
+
     def test_add_edge_docs_marker_unchanged_on_success(self):
         # Success-path marker stays the literal "audited" — pinned as a
         # public API shape by test_service_paths_characterization.py's
@@ -404,9 +439,9 @@ class TestOntologyBuilderMongoAuditContract:
         # error path changes in this fix.
         mongo = MagicMock(available=True)
         mongo.log_event.return_value = "ev-1"
-        builder = _make_builder(mongo)
+        builder, pack_id = _make_builder(mongo)
 
-        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
 
         assert result["stores"]["docs"] == "audited"
 
@@ -416,17 +451,17 @@ class TestOntologyBuilderMongoAuditContract:
         # branch (graph/sql) and like add_node's mongo block.
         mongo = MagicMock(available=True)
         mongo.log_event.side_effect = RuntimeError("insert failed")
-        builder = _make_builder(mongo)
+        builder, pack_id = _make_builder(mongo)
 
-        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
 
         assert result["stores"]["docs"] == "error: insert failed"
 
     def test_add_edge_docs_marker_unavailable_when_mongo_unavailable(self):
         mongo = MagicMock(available=False)
-        builder = _make_builder(mongo)
+        builder, pack_id = _make_builder(mongo)
 
-        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
 
         assert result["stores"]["docs"] == "unavailable"
         mongo.log_event.assert_not_called()
@@ -438,11 +473,12 @@ class TestOntologyBuilderMongoAuditContract:
         mongo = MagicMock(available=True)
         mongo.upsert_node_doc.return_value = "node-doc-1"
         mongo.log_event.return_value = "ev-2"
-        builder = _make_builder(mongo)
+        builder, pack_id = _make_builder(mongo)
 
         result = builder.add_node(
             "subject", "User", "u1",
             {"name": "Alice", "email": "a@ex.com", "role": "admin"},
+            pack_id=pack_id,
         )
 
         assert result["stores"]["docs"] == "ok (id=node-doc-1)"

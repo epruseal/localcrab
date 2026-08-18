@@ -22,9 +22,11 @@ from decimal import Decimal
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
 from opencrab.pack.normalize import transform_chunk_meta
+from opencrab.pack.ownership import create_pack
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
@@ -142,6 +144,17 @@ class TestBatched:
 
 # ───────────────────────── 행동: 진짜 3스토어 ─────────────────────────
 
+# #148: OntologyBuilder.add_node/add_edge now authorize via current_principal()
+# (assert_writable) before every write -- no bound principal means LookupError,
+# and a pack_id with no packs-registry row means PackNotFoundError even with a
+# principal bound. This suite exercises many pack_id literals ("pack-1",
+# "pack-a", ...) through `live`'s builder, so `live` pre-registers every one
+# of them (owned by the same fixed test principal) instead of making each
+# test call create_pack for itself.
+_LIVE_TEST_USER = "test-user"
+_LIVE_TEST_PACKS = ("pack-1", "pack-a", "pack-b", "own-pack", "다른팩", "p")
+
+
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     """진짜 SQLite 3스토어 + LOCAL_DATA_DIR 실재. 외부 의존 0."""
@@ -150,7 +163,11 @@ def live(tmp_path, monkeypatch):
     docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
     sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
     assert graph.available
-    yield OntologyBuilder(graph, docs, sql), graph, docs
+    principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+    for pack_id in _LIVE_TEST_PACKS:
+        create_pack(sql, principal.user_id, pack_id)
+    with principal_scope(principal):
+        yield OntologyBuilder(graph, docs, sql), graph, docs
     graph.close()
     docs.close()
 

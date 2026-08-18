@@ -85,6 +85,8 @@ class TestEmptyArgumentsDispatch:
 
 class TestErrorEnvelopeContract:
     def _ctx_with_builder_raising(self, exc: Exception) -> dict:
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.side_effect = exc
         builder.add_edge.side_effect = exc
@@ -95,6 +97,10 @@ class TestErrorEnvelopeContract:
             "hybrid": MagicMock(),
             "mongo": MagicMock(),
             "billing": MagicMock(),
+            # #148: the handler resolves a pack_id (resolve_write_pack) from
+            # ctx["sql"] before ever calling the (mocked) builder -- needs a
+            # real SQLStore, not a MagicMock, so ensure_default_pack succeeds.
+            "sql": SQLStore("sqlite:///:memory:"),
         }
 
     def test_add_node_generic_exception_caught_internally(self):

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.common.pack_tags import (
     RETIRED_KEYS,
     apply_pack_tag,
@@ -32,11 +33,23 @@ from opencrab.common.pack_tags import (
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
 from opencrab.pack import normalize as pack_normalize
+from opencrab.pack.ownership import create_pack
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _owned_principal(sql, pack_id: str) -> Principal:
+    """A real registered user who owns exactly ``pack_id`` (#148: every
+    ``builder.add_node``/``add_edge`` call now runs through the write gate,
+    which requires a bound principal AND real ownership of the target pack
+    -- see ``opencrab.pack.write_gate.authorize``)."""
+    user_id = create_user(sql, "tester")
+    assigned = create_pack(sql, user_id, pack_id)
+    assert assigned == pack_id, "collided with a pre-existing pack of the same id"
+    return Principal(user_id=user_id, is_local=True, disabled=False)
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +135,26 @@ def _vector_meta_for(props: dict, live_stores) -> dict:
     chokepoint 가 생긴 뒤로는 `add_node` 로 불일치 props 를 넣을 수 없다. 여기서
     검증하려는 것은 그 게이트가 아니라 "게이트를 통과한 props 로 메타를 만들 때
     어느 키를 보는가" 이므로, 게이트만 무력화하고 나머지 경로는 실물로 돌린다.
+
+    #148: `add_node` 이제 그 chokepoint 앞에 두 단이 더 있다 -- `authorize`
+    (실 레지스트리 소유권 판정, 이 헬퍼의 `sql` 은 `MagicMock(available=False)`
+    라 무조건 거부한다) 와 `stamp` (payload 에 없던 `pack_id` 도 무조건 채워
+    넣는다, T3b 가 겨냥하는 "pack_id 자체가 없는 행"을 이 헬퍼 안에서 원천적으로
+    지워버린다). 이 두 단도 이 테스트의 대상이 아니므로 같은 방식으로 무력화한다
+    -- 실물로 두면 T3b 의 "pack_id 없음"이라는 전제 자체가 stamp 단계에서
+    사라진다.
     """
     _builder, graph, docs = live_stores
     vec = _CapturingVec()
     builder = OntologyBuilder(graph, docs, MagicMock(available=False), vec=vec)
-    with patch("opencrab.ontology.builder.canonicalize_pack_alias", lambda tags: None):
-        builder.add_node("resource", "Document", "n1", dict(props))
+    principal = Principal(user_id="test-user", is_local=True, disabled=False)
+    with (
+        patch("opencrab.ontology.builder.canonicalize_pack_alias", lambda tags: None),
+        patch("opencrab.ontology.builder.authorize", lambda *a, **kw: None),
+        patch("opencrab.ontology.builder.stamp", lambda payload, **kw: dict(payload or {})),
+        principal_scope(principal),
+    ):
+        builder.add_node("resource", "Document", "n1", dict(props), pack_id="unused-gate-is-nulled")
     assert vec.metadatas, "벡터 메타가 안 만들어졌다 — 이 테스트의 전제가 깨졌다"
     return vec.metadatas[0]
 
@@ -255,14 +282,19 @@ def test_t5_provenance_backfill_drops_the_alias(tmp_path):
 
 def test_t6_load_edges_drops_the_alias(live, tmp_path):
     builder, graph, _docs = live
-    _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
-    pack_load.load_nodes("pack-1", tmp_path / "n.jsonl", builder, {})
-    ef = _write_jsonl(tmp_path / "e.jsonl", [{
-        "from_id": "n1", "to_id": "n2", "relation": "cites",
-        "properties": {"pack": "old"},
-    }])
-    pack_load.load_edges("pack-1", ef, builder, {"n1": ("resource", "Document"),
-                                                 "n2": ("resource", "Document")})
+    # #148: load_nodes/load_edges require a bound principal that actually
+    # owns "pack-1" -- both call builder.add_node/add_edge internally,
+    # which now runs through the real write gate (see _owned_principal).
+    principal = _owned_principal(builder._sql, "pack-1")
+    with principal_scope(principal):
+        _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", tmp_path / "n.jsonl", builder, {})
+        ef = _write_jsonl(tmp_path / "e.jsonl", [{
+            "from_id": "n1", "to_id": "n2", "relation": "cites",
+            "properties": {"pack": "old"},
+        }])
+        pack_load.load_edges("pack-1", ef, builder, {"n1": ("resource", "Document"),
+                                                     "n2": ("resource", "Document")})
 
     row = graph._fetch_one(
         "SELECT properties FROM graph_edges WHERE from_id=:f", {"f": "n1"})
@@ -284,12 +316,16 @@ def test_t7_live_alias_does_not_make_every_node_changed(live, tmp_path):
     영구히 반복된다.
     """
     builder, graph, docs = live
+    # #148: load_nodes_incremental also requires a bound principal that
+    # owns "pack-1" -- see test_t6's comment / _owned_principal.
+    principal = _owned_principal(builder._sql, "pack-1")
     f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
     _s, _t, _i, props = pack_normalize.transform_node("pack-1", _node(id="n1"))
     live_nodes = {"n1": ("Document", "resource", {**props, "pack": "pack-1"})}
 
-    n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-        "pack-1", f, builder, {}, live_nodes, graph, docs, {"n1": {"resource"}})
+    with principal_scope(principal):
+        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {"n1": {"resource"}})
     assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
         "폐기 별칭 하나 때문에 동일한 행이 chg 로 잡혔다 — 매 증분 전량 재기록된다")
 
@@ -403,31 +439,58 @@ def test_t10_doc_owner_predicate_never_looks_at_the_retired_key():
 
 
 def test_t11_builder_rejects_disagreeing_ownership_tags(live):
-    """소유 권위가 없는 진입점에서 두 태그가 다르면 거부한다(#171)."""
+    """소유 권위가 없는 진입점에서 두 태그가 다르면 거부한다(#171).
+
+    #148: `add_node`/`add_edge` 는 이제 이 검사 앞에 실 소유권 게이트가 있다
+    -- `pack_id` 파라미터로 넘긴 값과 payload 의 `pack_id` 가 (여기서는 "B"로)
+    일치해야 `stamp` 를 무사히 지나 이 검사( canonicalize_pack_alias )에 실제로
+    도달한다. `_owned_principal` 로 "B" 를 실제 소유해야 하는 이유가 그것이다.
+    """
     builder, _graph, _docs = live
-    with pytest.raises(ValueError, match="retired alias"):
-        builder.add_node("resource", "Document", "n1",
-                         {"pack": "A", "pack_id": "B", "title": "t"})
-    with pytest.raises(ValueError, match="retired alias"):
-        builder.add_edge("resource", "n1", "cites", "resource", "n2",
-                         properties={"pack": "A", "pack_id": "B"})
+    principal = _owned_principal(builder._sql, "B")
+    with principal_scope(principal):
+        with pytest.raises(ValueError, match="retired alias"):
+            builder.add_node("resource", "Document", "n1",
+                             {"pack": "A", "pack_id": "B", "title": "t"}, pack_id="B")
+        with pytest.raises(ValueError, match="retired alias"):
+            builder.add_edge("resource", "n1", "cites", "resource", "n2",
+                             properties={"pack": "A", "pack_id": "B"}, pack_id="B")
 
 
 def test_t12_builder_normalises_the_redundant_alias_and_keeps_a_lone_one(live):
-    """(a) 값이 같으면 중복 별칭만 버린다. (b) `pack_id` 없는 단독 별칭은 보존한다."""
+    """(a) 값이 같으면 중복 별칭만 버린다.
+
+    (b) 는 #148 로 전제가 무너졌다: 원래는 "`pack_id` 를 아예 안 준 쓰기는
+    `pack` 별칭이 임의 속성으로 그대로 남는다"였다. 그런데 #148 의 `stamp`
+    (write_gate.py) 는 `add_node`/`add_edge` 의 이제-필수인 `pack_id` 키워드
+    인자를 모든 쓰기에 무조건 못박는다 -- payload 에 `pack_id` 가 없었어도
+    `stamp` 가 강제로 채워 넣는다. 그 결과 "쓰기 대상 팩이 없는 채로 `pack`
+    별칭만 있는 행"은 이제 `add_node` 진입점을 통해서는 **만들 수 없는 상태**
+    다: 채워지는 `pack_id` 가 별칭 값과 같으면 (a)와 동일하게 중복 제거되고,
+    다르면 T11 처럼 거부된다 -- 그 사이의 "보존" 경로가 없다. 이 서브케이스는
+    같은 파일의 T3b 가 겪은 것과 같은 종류의 계약 변화라 fake 로 우회하지
+    않고, 실제로 지금 일어나는 일(= (a)와 합류)을 pin 한다."""
     builder, graph, _docs = live
+    principal = _owned_principal(builder._sql, "A")
 
-    props_same = {"pack": "A", "pack_id": "A", "title": "t"}
-    builder.add_node("resource", "Document", "same", props_same)
-    stored_same = graph.get_node("Document", "same")
-    assert stored_same["pack_id"] == "A" and "pack" not in stored_same
+    with principal_scope(principal):
+        props_same = {"pack": "A", "pack_id": "A", "title": "t"}
+        builder.add_node("resource", "Document", "same", props_same, pack_id="A")
+        stored_same = graph.get_node("Document", "same")
+        assert stored_same["pack_id"] == "A" and "pack" not in stored_same
 
-    props_lone = {"pack": "A", "title": "t"}
-    builder.add_node("resource", "Document", "lone", props_lone)
-    stored_lone = graph.get_node("Document", "lone")
-    assert stored_lone.get("pack") == "A", (
-        "소유 태그가 없는 단독 별칭까지 지웠다 — 임의 속성을 그대로 저장한다는 "
-        "진입점 계약을 깬다. 모순이 아닌 상태이고 읽는 코드도 없다")
+        # (b): no explicit `pack_id` in the payload, but #148 makes the
+        # add_node `pack_id=` kwarg mandatory for every write, and `stamp`
+        # fills it into props unconditionally. Naming the SAME pack this
+        # write already targets ("A") makes it land exactly like (a) once
+        # `stamp` has run -- confirming there is no third "preserved,
+        # untouched" outcome left.
+        props_lone = {"pack": "A", "title": "t"}
+        builder.add_node("resource", "Document", "lone", props_lone, pack_id="A")
+        stored_lone = graph.get_node("Document", "lone")
+        assert stored_lone["pack_id"] == "A" and "pack" not in stored_lone, (
+            "#148 이후 pack_id 없는 단독 별칭 쓰기는 stamp 가 채운 pack_id 와 "
+            "합쳐져 (a)와 같은 중복-제거 경로로 합류해야 한다")
 
 
 def test_t13_hybrid_ingest_rejects_before_the_store_try_and_before_early_return():

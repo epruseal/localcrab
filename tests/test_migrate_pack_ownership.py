@@ -220,9 +220,21 @@ class TestApply:
     def test_acceptance_registry_row_count(self, bootstrapped_owner, env):
         """Acceptance criterion: the registry's pack_id set equals the
         graph's distinct pack_id set exactly (set equality, not a "+1 for
-        the default pack" arithmetic formula -- the default pack_id is
-        itself one of the graph's distinct pack_ids once backfilled rows
-        carry it, so a separate "+1" would double-count it)."""
+        the default pack" arithmetic formula -- the legacy `default` pack_id
+        is itself one of the graph's distinct pack_ids once backfilled rows
+        carry it, so a separate "+1" would double-count it), MODULO the
+        one extra row #148 puts in the registry that the migration script
+        does not own: `bootstrap_local_user` (the `bootstrapped_owner`
+        fixture) creates its own `is_default=TRUE` pack
+        (`default-{random}`, via `ensure_default_pack`) in the SAME
+        transaction as the user row, before this migration ever runs. That
+        pack is a different thing from `migrate.DEFAULT_PACK_ID` (the
+        legacy catch-all literally named "default") -- see this module's
+        TestDefaultPackOwnerMismatch/Matches classes, which pin that
+        distinction -- and no graph content is ever tagged with its random
+        id, so it can never appear in `distinct_pack_ids`."""
+        from opencrab.pack.ownership import ensure_default_pack
+
         _seed_graph(env)
         assert migrate.main(["--apply", "--skip-backup"]) == 0
 
@@ -238,11 +250,13 @@ class TestApply:
 
         sql = make_sql_store(get_settings())
         registered = migrate._registered_pack_ids(sql)
+        owner_default_pack = ensure_default_pack(sql, bootstrapped_owner)
         # distinct_pack_ids already includes "default" (backfilled rows now
-        # carry it) -- registry must have exactly that many rows, no more,
-        # no fewer.
+        # carry it) -- registry must have exactly that many rows plus the
+        # bootstrap owner's #148 default pack, no more, no fewer.
         assert migrate.DEFAULT_PACK_ID in distinct_pack_ids
-        assert registered == distinct_pack_ids
+        assert owner_default_pack not in distinct_pack_ids
+        assert registered == distinct_pack_ids | {owner_default_pack}
 
     def test_apply_is_idempotent(self, bootstrapped_owner, env):
         _seed_graph(env)
@@ -2246,8 +2260,17 @@ class TestDocDerivedPackIdRegistration:
     def test_6_all_default_doc_rows_create_no_extra_registrations(self, bootstrapped_owner, env):
         """Existing-contract regression: nothing in doc storage resolves to
         anything but "default" -- step 3.5 must not manufacture spurious
-        registrations."""
+        registrations.
+
+        #148: `bootstrapped_owner` (via `bootstrap_local_user`) already owns
+        its own `is_default=TRUE` pack (`default-{random}`, a DIFFERENT row
+        from the legacy `migrate.DEFAULT_PACK_ID == "default"` this script
+        creates/reuses) before the migration ever runs -- that row is a
+        legitimate baseline registration, not one this test is about, so it
+        is included explicitly rather than the assertion being loosened.
+        """
         from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
         from opencrab.stores.factory import make_sql_store
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
@@ -2259,13 +2282,20 @@ class TestDocDerivedPackIdRegistration:
             docs.close()
 
         sql = make_sql_store(get_settings())
+        owner_default_pack = ensure_default_pack(sql, bootstrapped_owner)
         rc = migrate.main(["--apply", "--skip-backup"])
         assert rc == 0
 
-        assert _packs_snapshot(sql) == [(migrate.DEFAULT_PACK_ID, bootstrapped_owner)]
+        assert _packs_snapshot(sql) == sorted(
+            [
+                (migrate.DEFAULT_PACK_ID, bootstrapped_owner),
+                (owner_default_pack, bootstrapped_owner),
+            ]
+        )
 
     def test_7_registry_equals_default_union_graph_union_doc(self, bootstrapped_owner, env):
         from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
         from opencrab.stores.factory import make_sql_store
         from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
@@ -2286,11 +2316,19 @@ class TestDocDerivedPackIdRegistration:
             docs.close()
 
         sql = make_sql_store(get_settings())
+        # #148: created at bootstrap time, before this migration runs --
+        # see test_6's docstring for why it belongs in the expected set.
+        owner_default_pack = ensure_default_pack(sql, bootstrapped_owner)
         rc = migrate.main(["--apply", "--skip-backup"])
         assert rc == 0
 
         registered = {pid for pid, _owner in _packs_snapshot(sql)}
-        assert registered == {migrate.DEFAULT_PACK_ID, "pack-graph-only", "pack-doc-only"}
+        assert registered == {
+            migrate.DEFAULT_PACK_ID,
+            "pack-graph-only",
+            "pack-doc-only",
+            owner_default_pack,
+        }
 
     def test_8_malformed_existing_pack_id_excluded_empty_string_treated_as_missing(
         self, bootstrapped_owner, env, capsys
@@ -2455,14 +2493,24 @@ class TestRoundFiveReviewConformance:
         rc_apply = migrate.main(["--apply", "--skip-backup"])
         out_apply = capsys.readouterr().out
         assert rc_apply == 0
-        # The apply run must report the SAME total the dry-run predicted.
+        # The apply run must report the SAME total the dry-run predicted --
+        # this counts what the migration itself needed to register, and
+        # #148's bootstrap-time owner default pack (below) was already
+        # registered before migrate.main ever ran, so it is not part of
+        # this count.
         assert "2 row(s) needed registering" in out_apply
 
         from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
-        assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID, "pack-shared"}
+        owner_default_pack = ensure_default_pack(sql, bootstrapped_owner)
+        assert migrate._registered_pack_ids(sql) == {
+            migrate.DEFAULT_PACK_ID,
+            "pack-shared",
+            owner_default_pack,
+        }
 
     def test_dry_run_does_not_double_count_default_from_graph_prediction(
         self, bootstrapped_owner, env, capsys
@@ -2485,15 +2533,20 @@ class TestRoundFiveReviewConformance:
         assert migrate.main(["--apply", "--skip-backup"]) == 0
         out_apply = capsys.readouterr().out
 
-        # Exactly one distinct row (`default`) needs registering in both modes.
+        # Exactly one distinct row (`default`) needs registering in both modes
+        # -- #148's bootstrap-time owner default pack (below) was already
+        # registered before migrate.main ever ran, so it is not part of
+        # this count.
         assert "1 row(s) needed registering" in out_dry
         assert "1 row(s) needed registering" in out_apply
 
         from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
-        assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID}
+        owner_default_pack = ensure_default_pack(sql, bootstrapped_owner)
+        assert migrate._registered_pack_ids(sql) == {migrate.DEFAULT_PACK_ID, owner_default_pack}
 
 
 # ---------------------------------------------------------------------------

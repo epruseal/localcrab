@@ -931,10 +931,17 @@ class TestPackCommandWiring:
         assert output == str(cli_env / "out.jsonl")
         # #147: export-neo4j-pack now derives the bootstrapped principal's
         # readable scope and passes it through as a required `scope` kwarg.
-        # This principal owns no packs, so its scope is the empty frozenset.
+        # #148: bootstrap_local_user always creates a default pack in the
+        # same transaction as the user row, so this principal's scope is
+        # never truly empty -- it owns no NAMED pack, but does own that one.
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
+        from opencrab.stores.factory import make_sql_store
+
+        default_pack_id = ensure_default_pack(make_sql_store(get_settings()), bootstrapped)
         assert fake.call_args.kwargs == {
             "pack_id": "p1", "node_limit": 7, "edge_limit": 9,
-            "scope": frozenset()}
+            "scope": frozenset({default_pack_id})}
 
     def test_export_neo4j_pack_defaults(self, bootstrapped, cli_env, runner):
         """기본값이 조용히 바뀌면 운영 산출물의 크기 상한이 달라진다."""
@@ -944,9 +951,14 @@ class TestPackCommandWiring:
                 main, ["export-neo4j-pack", "-o", str(cli_env / "o.jsonl")])
 
         assert result.exit_code == 0, result.output
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
+        from opencrab.stores.factory import make_sql_store
+
+        default_pack_id = ensure_default_pack(make_sql_store(get_settings()), bootstrapped)
         assert fake.call_args.kwargs == {
             "pack_id": None, "node_limit": 500_000, "edge_limit": 1_000_000,
-            "scope": frozenset()}
+            "scope": frozenset({default_pack_id})}
 
     def test_assemble_pack_v1_passes_options_through(self, cli_env, runner):
         src = cli_env / "staging"

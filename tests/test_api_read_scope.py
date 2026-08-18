@@ -21,7 +21,7 @@ import pytest
 
 from apps.api import main as api
 from opencrab.auth import Principal, create_user
-from opencrab.pack.ownership import create_pack, set_visibility
+from opencrab.pack.ownership import create_pack, ensure_default_pack, set_visibility
 
 PACK_A = "pack-a"
 PACK_B = "pack-b"
@@ -143,15 +143,19 @@ class TestStatusAndUsage:
 
 class TestImpactAndQueryPassTheCallersScope:
     def test_impact_passes_the_readable_scope(self, ctx, world):
+        # #148: create_user gave alice her own default pack in the same
+        # transaction as her user row -- her readable scope always includes it.
+        alice_default = ensure_default_pack(ctx.sql, world["alice"].user_id)
         api.analyse_impact(
             payload=api.ImpactRequest(node_id="a-doc"),
             auth=_auth(world["alice"]),
             ctx=ctx,
         )
         kwargs = ctx.impact.analyse.call_args.kwargs
-        assert set(kwargs["pack_ids"]) == {PACK_A, PACK_PUBLIC}
+        assert set(kwargs["pack_ids"]) == {PACK_A, PACK_PUBLIC, alice_default}
 
     def test_query_passes_the_readable_scope_to_both_legs(self, ctx, world):
+        bob_default = ensure_default_pack(ctx.sql, world["bob"].user_id)
         ctx.hybrid.query.return_value = MagicMock(results=[], warnings=[])
         ctx.hybrid.keyword_search.return_value = []
         api.query_ontology(
@@ -159,9 +163,14 @@ class TestImpactAndQueryPassTheCallersScope:
             auth=_auth(world["bob"]),
             ctx=ctx,
         )
-        assert set(ctx.hybrid.query.call_args.kwargs["pack_ids"]) == {PACK_B, PACK_PUBLIC}
+        assert set(ctx.hybrid.query.call_args.kwargs["pack_ids"]) == {
+            PACK_B,
+            PACK_PUBLIC,
+            bob_default,
+        }
         # The zero-result fallback is a second read path and needs it too.
         assert set(ctx.hybrid.keyword_search.call_args.kwargs["pack_ids"]) == {
             PACK_B,
             PACK_PUBLIC,
+            bob_default,
         }

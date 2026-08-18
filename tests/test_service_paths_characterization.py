@@ -476,7 +476,7 @@ class TestPackSelectionCLI:
         return user_id
 
     def test_cli_envelope_empty_store_shape(self, local_env):
-        self._bootstrap_cli_user()
+        user_id = self._bootstrap_cli_user()
         result, env = self._run_envelope(["query", "zzz no match here", "--json-envelope"])
         assert result.exit_code == 0
         # 빈 store → 결정적으로 빈 결과. envelope 키 집합 박제.
@@ -493,10 +493,19 @@ class TestPackSelectionCLI:
         assert env["total"] == 0
         assert env["results"] == []
         assert env["selected_packs"] == []
-        # #147: effective_pack_ids is never None -- an owner of no packs has
-        # a concrete, empty readable scope, not "no filter".
+        # #147: effective_pack_ids is never None -- an owner of no NAMED packs
+        # still has a concrete readable scope, not "no filter". #148: that
+        # scope is never truly empty either -- bootstrap_local_user always
+        # creates a default pack in the same transaction as the user row, so
+        # it is part of this principal's readable scope from the start.
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import ensure_default_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        default_pack_id = ensure_default_pack(sql, user_id)
         assert env["pack_filter"] == {
-            "pack_ids": [],
+            "pack_ids": [default_pack_id],
             "auto_pack": False,
             "include_unpackaged": False,
         }
@@ -684,7 +693,7 @@ class TestQueryResponseMCP:
 
 
 class TestQueryResponseHTTP:
-    def test_empty_store_shape(self, http_client, http_auth):
+    def test_empty_store_shape(self, http_client, http_auth, local_principal, local_stores):
         resp = http_client.post(
             "/api/query", json={"question": "zzz_no_match_keyword_zzz"}, headers=http_auth
         )
@@ -710,9 +719,16 @@ class TestQueryResponseHTTP:
         assert body["selected_packs"] == []
         # #147: effective_pack_ids is never None -- the http_auth principal
         # (a freshly bootstrapped local user, see local_principal fixture)
-        # owns no packs, so its readable scope is a concrete empty list.
+        # owns no NAMED packs, so its readable scope has no named pack in it.
+        # #148: that scope is never truly empty either -- bootstrap_local_user
+        # (which local_principal calls) always creates a default pack in the
+        # same transaction as the user row.
+        from opencrab.pack.ownership import ensure_default_pack
+
+        user_id, _secret = local_principal
+        default_pack_id = ensure_default_pack(local_stores["sql"], user_id)
         assert body["pack_filter"] == {
-            "pack_ids": [],
+            "pack_ids": [default_pack_id],
             "auto_pack": False,
             "include_unpackaged": False,
         }

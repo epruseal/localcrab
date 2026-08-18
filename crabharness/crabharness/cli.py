@@ -96,7 +96,17 @@ def _cmd_promotion_stub(args: argparse.Namespace) -> int:
 
 
 def _cmd_promotion_apply(args: argparse.Namespace) -> int:
-    result = apply_promotion_package(args.package, dry_run=args.dry_run)
+    # #148: apply_promotion_package refuses to pick a principal for itself
+    # (that would attribute writes to the local user no matter who asked).
+    # This IS the entry point, so binding happens here. --dry-run writes
+    # nothing and so needs no principal.
+    if args.dry_run:
+        result = apply_promotion_package(args.package, dry_run=True)
+    else:
+        from opencrab.auth import principal_scope, require_local_principal
+
+        with principal_scope(require_local_principal()):
+            result = apply_promotion_package(args.package, dry_run=False)
     _write(result)
     summary = result.get("summary") or {}
     if result.get("dry_run"):

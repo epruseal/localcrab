@@ -70,6 +70,26 @@ def _write_package(tmp_path: Path, package: dict) -> str:
     return str(path)
 
 
+def _bound_principal(tmp_path: Path, monkeypatch):
+    """#148: ``apply_promotion_package`` requires a bound principal and refuses
+    to pick one itself (a library call that reached for the LOCAL user would
+    attribute writes to the wrong actor on any per-request surface). Binding is
+    the entry point's job, so these tests -- which call the library function
+    directly -- bind it themselves.
+
+    The user has to actually exist: ``resolve_write_pack`` creates the caller's
+    default pack, and ``packs.owner_id`` is a foreign key into ``users``.
+    """
+    from opencrab.auth import Principal, create_user, principal_scope
+    from opencrab.stores.sql_store import SQLStore
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    sql = SQLStore(f"sqlite:///{tmp_path}/opencrab.db")
+    user_id = create_user(sql, "harness-test-actor")
+    return principal_scope(Principal(user_id=user_id, is_local=False, disabled=False))
+
+
 def _patch_factories(builder_add_node_return):
     """Patch the three store factories apply_promotion_package calls plus
     BillingHooks, and configure the mocked OntologyBuilder's add_node."""
@@ -98,7 +118,16 @@ class TestApplyPromotionPackageSubjectIdAudit:
     reached on_harness_apply (billing) but not builder.add_node/add_edge
     (audit) in its promotion loop."""
 
-    def test_normal_subject_id_reaches_both_node_and_edge_write(self, tmp_path):
+    def test_normal_pack_id_reaches_both_node_and_edge_write(self, tmp_path, monkeypatch):
+        """#148: builder.add_node/add_edge no longer take a `subject_id`
+        kwarg at all -- the real OntologyBuilder derives the writing
+        principal internally via current_principal() (bound here by
+        require_local_principal(), see _bootstrap_local_user). The
+        consistency invariant issue #119 pinned (every write in one
+        promotion apply shares the same actor) now lives in `pack_id`
+        instead: apply_promotion_package resolves it once and reuses the
+        same value for every node/edge write in the loop -- pin that."""
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         )
@@ -107,6 +136,7 @@ class TestApplyPromotionPackageSubjectIdAudit:
         }
         package_path = _write_package(tmp_path, _VALID_PACKAGE_WITH_EDGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
@@ -122,10 +152,17 @@ class TestApplyPromotionPackageSubjectIdAudit:
             from crabharness.crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False, tenant_id="acme", subject_id="u1")
-        assert builder_instance.add_node.call_args.kwargs["subject_id"] == "u1"
-        assert builder_instance.add_edge.call_args.kwargs["subject_id"] == "u1"
+        node_pack_id = builder_instance.add_node.call_args.kwargs["pack_id"]
+        assert node_pack_id is not None
+        assert builder_instance.add_edge.call_args.kwargs["pack_id"] == node_pack_id
 
-    def test_normal_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
+    def test_normal_omitted_subject_id_only_affects_billing(self, tmp_path, monkeypatch):
+        """#148: subject_id no longer reaches builder.add_node/add_edge at
+        all (see test_normal_pack_id_reaches_both_node_and_edge_write above)
+        -- it exclusively feeds the on_harness_apply billing event now. Pin
+        the part of this contract that still exists: an omitted subject_id
+        reaches on_harness_apply as None, unchanged from before."""
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         )
@@ -134,6 +171,7 @@ class TestApplyPromotionPackageSubjectIdAudit:
         }
         package_path = _write_package(tmp_path, _VALID_PACKAGE_WITH_EDGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
@@ -149,17 +187,20 @@ class TestApplyPromotionPackageSubjectIdAudit:
             from crabharness.crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False)
-        assert builder_instance.add_node.call_args.kwargs["subject_id"] is None
-        assert builder_instance.add_edge.call_args.kwargs["subject_id"] is None
+        assert "subject_id" not in builder_instance.add_node.call_args.kwargs
+        assert "subject_id" not in builder_instance.add_edge.call_args.kwargs
+        billing_instance.on_harness_apply.assert_called_once_with("default", None, "pkg-1", 1)
 
 
 class TestApplyPromotionPackageBilling:
-    def test_normal_bills_harness_apply_event(self, tmp_path):
+    def test_normal_bills_harness_apply_event(self, tmp_path, monkeypatch):
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         )
         package_path = _write_package(tmp_path, _VALID_PACKAGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
@@ -179,7 +220,7 @@ class TestApplyPromotionPackageBilling:
         billing_instance.on_harness_apply.assert_called_once_with("acme", "u1", "pkg-1", 1)
         assert result["billing"] == {"billed_node_count": 1, "ok": True}
 
-    def test_normal_billing_persist_failure_is_visible_in_result_not_just_a_log(self, tmp_path, caplog):
+    def test_normal_billing_persist_failure_is_visible_in_result_not_just_a_log(self, tmp_path, monkeypatch, caplog):
         """#66 codex re-review, finding [4]: apply_promotion_package's outer
         try/except only catches raised exceptions — on_harness_apply()
         itself never raises (it returns {"ok": False, ...} on a failed
@@ -191,12 +232,14 @@ class TestApplyPromotionPackageBilling:
         output) — a log alone is what #105 already flagged as insufficient."""
         import logging
 
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         )
         billing_instance.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
         package_path = _write_package(tmp_path, _VALID_PACKAGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
@@ -220,15 +263,17 @@ class TestApplyPromotionPackageBilling:
         assert any("harness_apply" in rec.message and "database is locked" in rec.message
                     for rec in caplog.records)
 
-    def test_error_graph_write_failure_does_not_bill(self, tmp_path):
+    def test_error_graph_write_failure_does_not_bill(self, tmp_path, monkeypatch):
         """Same accuracy fix as harness.py: OntologyBuilder.add_node() doesn't
         raise for a per-store failure, so a graph "error: ..." status must not
         be billed even though node_receipts still records the attempt."""
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "error: disk down"}}
         )
         package_path = _write_package(tmp_path, _VALID_PACKAGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),
@@ -247,15 +292,17 @@ class TestApplyPromotionPackageBilling:
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
         billing_instance.on_harness_apply.assert_not_called()
 
-    def test_error_malformed_receipt_does_not_bill(self, tmp_path):
+    def test_error_malformed_receipt_does_not_bill(self, tmp_path, monkeypatch):
         """Fail-closed pin (#66 codex re-review, finding [3]): a "stores" map
         with no "graph" key at all must not bill — an unrecognized receipt
         shape is not a positive success signal."""
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
         graph, docs, sql, builder_instance, billing_instance = _patch_factories(
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
         )
         package_path = _write_package(tmp_path, _VALID_PACKAGE)
         with (
+            _principal_ctx,
             patch("opencrab.stores.factory.make_graph_store", return_value=graph),
             patch("opencrab.stores.factory.make_doc_store", return_value=docs),
             patch("opencrab.stores.factory.make_sql_store", return_value=sql),

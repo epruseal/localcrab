@@ -1075,19 +1075,27 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     }
 
 
-def _principal_scope_if_unbound():
-    """`builder.add_node`/`add_edge` 이제 내부에서 `current_principal()`을
-    요구한다(#148) — principal_scope 없이 부르면 LookupError. 이 로더들은
-    독립 호출도 가능해야 하므로, 호출자가 이미 principal_scope를 열어 뒀으면
-    그 값을 그대로 쓰고(no-op), 아니면 로컬 principal을 새로 바인딩한다.
+def _require_bound_principal() -> None:
+    """이 로더들은 principal 을 **스스로 바인딩하지 않는다**(#148).
+
+    한때 "미바인딩이면 로컬 principal 을 바인딩한다" 로 만들었다가 되돌렸다.
+    그 폴백은 신원에 대해 fail-open 이다 — HTTP 처럼 요청마다 principal 이
+    다른 표면에서 어느 진입점이 바인딩을 빠뜨리면, 쓰기가 실패하는 대신
+    **요청자가 아니라 로컬 사용자에게 조용히 귀속된다.** 그건 이 설계가
+    없애려는 사칭 그 자체다(#143 불변식 2: principal 은 서버가 유도한다).
+
+    그래서 여기서는 없으면 거부만 한다. 바인딩은 진입점(도구 디스패처, CLI,
+    스크립트)의 책임이다.
     """
-    from opencrab.auth import current_principal, principal_scope, require_local_principal
+    from opencrab.auth import current_principal
 
     try:
         current_principal()
-        return contextlib.nullcontext()
     except LookupError:
-        return principal_scope(require_local_principal())
+        raise RuntimeError(
+            "pack load requires a bound principal; open principal_scope(...) at "
+            "the entry point (the loader does not pick one for you)"
+        ) from None
 
 
 def load_nodes(
@@ -1100,33 +1108,33 @@ def load_nodes(
     require_live_data("load_nodes")
     ok = skip = err = 0
 
-    with _principal_scope_if_unbound():
-        for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림(단일/분할 투명)
-            space, node_type, node_id, props = transform_node(pack_name, row)
-            id_map[node_id] = (space, node_type)
+    _require_bound_principal()
+    for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림(단일/분할 투명)
+        space, node_type, node_id, props = transform_node(pack_name, row)
+        id_map[node_id] = (space, node_type)
 
-            try:
-                res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
-                # **영수증을 본다.** `add_node`는 스토어 실패를 예외로 올리지 않고 반환
-                # dict에 적는다 — `builder.store_write_failures()`의 docstring이
-                # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
-                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
-                if fails:
-                    err += 1
-                    log.warning("노드 저장 실패 %s (%s/%s): %s",
-                                node_id, space, node_type, "; ".join(fails))
-                else:
-                    ok += 1
-            except ValueError as ve:
-                skip += 1
-                log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
-            except Exception as exc:
+        try:
+            res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
+            # **영수증을 본다.** `add_node`는 스토어 실패를 예외로 올리지 않고 반환
+            # dict에 적는다 — `builder.store_write_failures()`의 docstring이
+            # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
+            fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+            if fails:
                 err += 1
-                log.warning("노드 오류 %s: %s", node_id, exc)
+                log.warning("노드 저장 실패 %s (%s/%s): %s",
+                            node_id, space, node_type, "; ".join(fails))
+            else:
+                ok += 1
+        except ValueError as ve:
+            skip += 1
+            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
+        except Exception as exc:
+            err += 1
+            log.warning("노드 오류 %s: %s", node_id, exc)
 
-            done = ok + skip + err
-            if done % 500 == 0:
-                print(f"    …노드 {done} (ok={ok} skip={skip} err={err})", flush=True)
+        done = ok + skip + err
+        if done % 500 == 0:
+            print(f"    …노드 {done} (ok={ok} skip={skip} err={err})", flush=True)
 
     return ok, skip, err
 
@@ -1218,113 +1226,113 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
-    with _principal_scope_if_unbound():
-        for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
-            space, node_type, node_id, props = transform_node(pack_name, row)
-            id_map[node_id] = (space, node_type)
-            bypack_ids.add(node_id)  # add 성공 여부와 무관하게 항상(엣지 endpoint·삭제 대조용)
-            file_types[node_id] = node_type  # same-continue 앞 — same 판정 노드도 스윕 대상에 든다
+    _require_bound_principal()
+    for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
+        space, node_type, node_id, props = transform_node(pack_name, row)
+        id_map[node_id] = (space, node_type)
+        bypack_ids.add(node_id)  # add 성공 여부와 무관하게 항상(엣지 endpoint·삭제 대조용)
+        file_types[node_id] = node_type  # same-continue 앞 — same 판정 노드도 스윕 대상에 든다
 
-            live = live_nodes.get(node_id)
-            if live is not None:
-                # **스토어가 주입하는 키는 비교에서 뺀다.** 한동안 `id` 하나만 뺐는데,
-                # upstream 이 `space_id`/`properties[space]` 우선순위를 통합하면서
-                # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
-                # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
-                # "스토어가 넣는 것"이라는 축으로 묶는다.
-                live_props = {k: v for k, v in live[2].items()
-                              if k not in INCREMENTAL_IGNORED_KEYS}
-                if live[0] == node_type and live_props == props:
-                    # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
-                    # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
-                    # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
-                    # 전진해 다음 런이 same 으로만 본다, doc 행 영구 유실).
-                    # 앵커는 doc_node_spaces 에 애초에 없다(F4-b 가 뺀다) — 검사하면
-                    # 앵커마다 매 런 오탐 재적재 루프가 열린다.
-                    doc_row_missing = (
-                        not _is_anchor_node(node_id, props)
-                        and space not in doc_node_spaces.get(node_id, set())
-                    )
-                    if not doc_row_missing:
-                        n_same += 1
-                        # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
-                        # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
-                        # same 경로도 확인한다.
-                        _cleanup_stale_doc_spaces(node_id, space)
-                        done = n_new + n_chg + n_same + skip + err
-                        if done % 500 == 0:
-                            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
-                        continue
-                    log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
-                    # same 으로 안 잡고 아래 chg 경로로 낙하한다 — live[0]==node_type
-                    # 이므로 stale_typed 는 자연히 None(구 타입 삭제 로직 미개입).
-
-            # 타입이 바뀐 구 행은 **새 노드가 실제로 저장된 뒤에** 지운다(아래).
-            #
-            # 종전에는 `add_node` **전에** 지웠다. 그러면 저장이 실패했을 때 구 노드와
-            # cascade 엣지가 이미 없어 **재시도로도 복구되지 않는다** — 다음 증분은
-            # `live is None` 으로 보고 다시 시도하다 같은 이유로 또 실패한다. 영구 소실이다.
-            # 노드 키가 `(node_type, node_id)` 라 타입이 다르면 잠시 공존할 수 있으므로
-            # 이 순서가 가능하다. 저장이 실패하면 구 행이 남아 **현상 유지**가 된다.
-            stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
-
-            try:
-                res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
-                # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
-                # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
-                # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
-                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
-                if fails:
-                    err += 1
-                    log.warning("노드 저장 실패 %s (%s/%s): %s",
-                                node_id, space, node_type, "; ".join(fails))
-                else:
-                    if stale_typed is not None:
-                        # 새 행이 저장된 뒤에만 구 타입 행을 지운다.
-                        try:
-                            graph.delete_node(stale_typed[0], node_id)
-                        except Exception as exc:
-                            # R3(#142 재리뷰): 즉시 신호 — 이 실패는 warning 만 남기고
-                            # err 미계수였다. live_pack_state 는 node_id 로 collapse
-                            # 하므로(신 행이 이겨 구 행을 가린다) 다음 런이 same 으로
-                            # 보고 재시도하지 않아 구 행 + cascade 엣지가 영구 잔존했다
-                            # — err+1 은 즉시 신호, 루프 말미 스윕(아래)이 구조적 회수다.
-                            err += 1
-                            log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
-                                        node_id, stale_typed[0], exc)
-                        # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
-                        # PK 는 `(space, node_id)` 로 타입을 안 담는다. space 가 같으면
-                        # 위 `add_node` 의 `upsert_node_doc` 이 **같은 행을 이미 신 값으로
-                        # 갱신**했으므로 지울 구 행이 없다 — 여기서 지우면 방금 갱신한
-                        # 행이 사라진다(2026-08-12 실측: doc 행 0 소실). space 가 다를
-                        # 때만 구 space 행이 별도로 남아 삭제 대상이다. 원본(이관 전)은
-                        # 삭제가 add_node **앞**이라 이 문제가 없었고, 저장 실패 시 영구
-                        # 소실을 막으려 저장-후-삭제로 순서를 바꾼 것(위 주석)이 이 가드를
-                        # 필요하게 만들었다.
-                        if stale_typed[1] != space:
-                            try:
-                                docs.delete_node_doc(stale_typed[1], node_id)
-                            except Exception as exc:
-                                log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
-                                            node_id, stale_typed[1], exc)
-                    # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
-                    # doc 행을 정리한다. stale_typed 삭제와는 별개다 — 저건 "타입이
-                    # 바뀐 구 행"이고 이건 "같은 노드가 다른 space 로도 찍혀 있던 것"이다.
+        live = live_nodes.get(node_id)
+        if live is not None:
+            # **스토어가 주입하는 키는 비교에서 뺀다.** 한동안 `id` 하나만 뺐는데,
+            # upstream 이 `space_id`/`properties[space]` 우선순위를 통합하면서
+            # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
+            # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
+            # "스토어가 넣는 것"이라는 축으로 묶는다.
+            live_props = {k: v for k, v in live[2].items()
+                          if k not in INCREMENTAL_IGNORED_KEYS}
+            if live[0] == node_type and live_props == props:
+                # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
+                # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
+                # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
+                # 전진해 다음 런이 same 으로만 본다, doc 행 영구 유실).
+                # 앵커는 doc_node_spaces 에 애초에 없다(F4-b 가 뺀다) — 검사하면
+                # 앵커마다 매 런 오탐 재적재 루프가 열린다.
+                doc_row_missing = (
+                    not _is_anchor_node(node_id, props)
+                    and space not in doc_node_spaces.get(node_id, set())
+                )
+                if not doc_row_missing:
+                    n_same += 1
+                    # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
+                    # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
+                    # same 경로도 확인한다.
                     _cleanup_stale_doc_spaces(node_id, space)
-                    if live is None:
-                        n_new += 1
-                    else:
-                        n_chg += 1
-            except ValueError as ve:
-                skip += 1
-                log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
-            except Exception as exc:
-                err += 1
-                log.warning("노드 오류 %s: %s", node_id, exc)
+                    done = n_new + n_chg + n_same + skip + err
+                    if done % 500 == 0:
+                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+                    continue
+                log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
+                # same 으로 안 잡고 아래 chg 경로로 낙하한다 — live[0]==node_type
+                # 이므로 stale_typed 는 자연히 None(구 타입 삭제 로직 미개입).
 
-            done = n_new + n_chg + n_same + skip + err
-            if done % 500 == 0:
-                print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+        # 타입이 바뀐 구 행은 **새 노드가 실제로 저장된 뒤에** 지운다(아래).
+        #
+        # 종전에는 `add_node` **전에** 지웠다. 그러면 저장이 실패했을 때 구 노드와
+        # cascade 엣지가 이미 없어 **재시도로도 복구되지 않는다** — 다음 증분은
+        # `live is None` 으로 보고 다시 시도하다 같은 이유로 또 실패한다. 영구 소실이다.
+        # 노드 키가 `(node_type, node_id)` 라 타입이 다르면 잠시 공존할 수 있으므로
+        # 이 순서가 가능하다. 저장이 실패하면 구 행이 남아 **현상 유지**가 된다.
+        stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
+
+        try:
+            res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
+            # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
+            # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
+            # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
+            fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+            if fails:
+                err += 1
+                log.warning("노드 저장 실패 %s (%s/%s): %s",
+                            node_id, space, node_type, "; ".join(fails))
+            else:
+                if stale_typed is not None:
+                    # 새 행이 저장된 뒤에만 구 타입 행을 지운다.
+                    try:
+                        graph.delete_node(stale_typed[0], node_id)
+                    except Exception as exc:
+                        # R3(#142 재리뷰): 즉시 신호 — 이 실패는 warning 만 남기고
+                        # err 미계수였다. live_pack_state 는 node_id 로 collapse
+                        # 하므로(신 행이 이겨 구 행을 가린다) 다음 런이 same 으로
+                        # 보고 재시도하지 않아 구 행 + cascade 엣지가 영구 잔존했다
+                        # — err+1 은 즉시 신호, 루프 말미 스윕(아래)이 구조적 회수다.
+                        err += 1
+                        log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
+                                    node_id, stale_typed[0], exc)
+                    # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
+                    # PK 는 `(space, node_id)` 로 타입을 안 담는다. space 가 같으면
+                    # 위 `add_node` 의 `upsert_node_doc` 이 **같은 행을 이미 신 값으로
+                    # 갱신**했으므로 지울 구 행이 없다 — 여기서 지우면 방금 갱신한
+                    # 행이 사라진다(2026-08-12 실측: doc 행 0 소실). space 가 다를
+                    # 때만 구 space 행이 별도로 남아 삭제 대상이다. 원본(이관 전)은
+                    # 삭제가 add_node **앞**이라 이 문제가 없었고, 저장 실패 시 영구
+                    # 소실을 막으려 저장-후-삭제로 순서를 바꾼 것(위 주석)이 이 가드를
+                    # 필요하게 만들었다.
+                    if stale_typed[1] != space:
+                        try:
+                            docs.delete_node_doc(stale_typed[1], node_id)
+                        except Exception as exc:
+                            log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
+                                        node_id, stale_typed[1], exc)
+                # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
+                # doc 행을 정리한다. stale_typed 삭제와는 별개다 — 저건 "타입이
+                # 바뀐 구 행"이고 이건 "같은 노드가 다른 space 로도 찍혀 있던 것"이다.
+                _cleanup_stale_doc_spaces(node_id, space)
+                if live is None:
+                    n_new += 1
+                else:
+                    n_chg += 1
+        except ValueError as ve:
+            skip += 1
+            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
+        except Exception as exc:
+            err += 1
+            log.warning("노드 오류 %s: %s", node_id, exc)
+
+        done = n_new + n_chg + n_same + skip + err
+        if done % 500 == 0:
+            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
 
     # ── R3(#142 재리뷰): 구 타입 행 구조적 회수(매 런) ──────────────────────
     # 위 저장-후-삭제 순서 안에서 `graph.delete_node` 가 실패하면(경합·스토어
@@ -1382,78 +1390,78 @@ def load_edges(
     if reasons is None:
         reasons = Counter()
 
-    with _principal_scope_if_unbound():
-        for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
-            raw_label = row.get("label") or row.get("relation") or ""
-            src_id    = row.get("source_id") or row.get("from_id") or ""
-            tgt_id    = row.get("target_id") or row.get("to_id")   or ""
+    _require_bound_principal()
+    for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
+        raw_label = row.get("label") or row.get("relation") or ""
+        src_id    = row.get("source_id") or row.get("from_id") or ""
+        tgt_id    = row.get("target_id") or row.get("to_id")   or ""
 
-            # endpoint space 조회 (통합 맵)
-            src_info = id_map.get(src_id)
-            tgt_info = id_map.get(tgt_id)
-            if src_info is None or tgt_info is None:
-                skip += 1
-                miss = 'src' if src_info is None else ''
-                miss += ('+' if miss and tgt_info is None else '') + ('tgt' if tgt_info is None else '')
-                reasons[('endpoint 미존재', raw_label, miss, '')] += 1
-                log.debug("엣지 endpoint 미존재 skip: %s->%s (%s)", src_id[:8], tgt_id[:8], raw_label)
-                continue
+        # endpoint space 조회 (통합 맵)
+        src_info = id_map.get(src_id)
+        tgt_info = id_map.get(tgt_id)
+        if src_info is None or tgt_info is None:
+            skip += 1
+            miss = 'src' if src_info is None else ''
+            miss += ('+' if miss and tgt_info is None else '') + ('tgt' if tgt_info is None else '')
+            reasons[('endpoint 미존재', raw_label, miss, '')] += 1
+            log.debug("엣지 endpoint 미존재 skip: %s->%s (%s)", src_id[:8], tgt_id[:8], raw_label)
+            continue
 
-            from_space = src_info[0]
-            to_space   = tgt_info[0]
+        from_space = src_info[0]
+        to_space   = tgt_info[0]
 
-            # 라벨/공간 해석은 normalize.resolve_edge 가 정본이다(게이트와 공용).
-            # 반전이면 space 는 이미 뒤바뀐 값이 오므로 endpoint 도 함께 바꾼다.
-            # 어느 표에도 없으면 lowercase 로 귀착 — 원본 라벨은 아래 source_label 로 보존된다.
-            from_space, relation, to_space, _reversed = resolve_edge(
-                raw_label, from_space, to_space)
-            if _reversed:
-                src_id, tgt_id = tgt_id, src_id
+        # 라벨/공간 해석은 normalize.resolve_edge 가 정본이다(게이트와 공용).
+        # 반전이면 space 는 이미 뒤바뀐 값이 오므로 endpoint 도 함께 바꾼다.
+        # 어느 표에도 없으면 lowercase 로 귀착 — 원본 라벨은 아래 source_label 로 보존된다.
+        from_space, relation, to_space, _reversed = resolve_edge(
+            raw_label, from_space, to_space)
+        if _reversed:
+            src_id, tgt_id = tgt_id, src_id
 
-            if applied is not None:
-                # **성공/실패와 무관하게 넣는다.** 이 시점에서 (src_id, relation, tgt_id)는
-                # 반전까지 반영된 최종 형태로 확정됐다 — 이 행이 파일에 있다는 사실 자체가
-                # "고아가 아니다"의 근거다. 저장이 실패해도 여기 안 넣으면, 이전 증분에서
-                # 이미 라이브에 들어가 있는 동일 엣지가 `incremental_finalize`의
-                # `stale_edges = live_edges - applied_edges`에 걸려 **삭제**된다
-                # (재현: live_edges={('f','r','t')}, applied_edges=set() →
-                # stale_delete_would_run=True, 2026-08-11 적대 검증).
-                applied.add((src_id, relation, tgt_id))
+        if applied is not None:
+            # **성공/실패와 무관하게 넣는다.** 이 시점에서 (src_id, relation, tgt_id)는
+            # 반전까지 반영된 최종 형태로 확정됐다 — 이 행이 파일에 있다는 사실 자체가
+            # "고아가 아니다"의 근거다. 저장이 실패해도 여기 안 넣으면, 이전 증분에서
+            # 이미 라이브에 들어가 있는 동일 엣지가 `incremental_finalize`의
+            # `stale_edges = live_edges - applied_edges`에 걸려 **삭제**된다
+            # (재현: live_edges={('f','r','t')}, applied_edges=set() →
+            # stale_delete_would_run=True, 2026-08-11 적대 검증).
+            applied.add((src_id, relation, tgt_id))
 
-            props: dict = {}
-            props["source_label"] = raw_label   # 원본 라벨 보존
-            if row.get("properties"):
-                props.update({k: str(v) if not isinstance(v, (str, int, float, bool)) else v
-                              for k, v in row["properties"].items()})
-            # pack_id는 row properties 병합 "후" 강제 — 덤프에 내장된 원본 pack_id가
-            # 덮어쓰는 버그 방지 (2026-07-05 openclaw: 엣지 216,711건이
-            # 'openclaw-conversations-local'로 오염됐던 사례; 원본은 origin_pack_id로 보존)
-            if props.get("pack_id") and props["pack_id"] != pack_name:
-                props["origin_pack_id"] = props["pack_id"]
-            apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
+        props: dict = {}
+        props["source_label"] = raw_label   # 원본 라벨 보존
+        if row.get("properties"):
+            props.update({k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                          for k, v in row["properties"].items()})
+        # pack_id는 row properties 병합 "후" 강제 — 덤프에 내장된 원본 pack_id가
+        # 덮어쓰는 버그 방지 (2026-07-05 openclaw: 엣지 216,711건이
+        # 'openclaw-conversations-local'로 오염됐던 사례; 원본은 origin_pack_id로 보존)
+        if props.get("pack_id") and props["pack_id"] != pack_name:
+            props["origin_pack_id"] = props["pack_id"]
+        apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
 
-            try:
-                res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props, pack_id=pack_name)
-                # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
-                # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
-                # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).
-                fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
-                if fails:
-                    err += 1
-                    reasons[('저장 실패', f'{raw_label}→{relation}', from_space, to_space)] += 1
-                    log.warning("엣지 저장 실패 %s->%s [%s→%s]: %s",
-                                src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
-                else:
-                    ok += 1
-            except ValueError as ve:
-                skip += 1
-                reasons[('grammar 위반', f'{raw_label}→{relation}', from_space, to_space)] += 1
-                log.debug("엣지 문법위반 skip %s->%s [%s→%s]: %s", src_id[:8], tgt_id[:8], raw_label, relation, ve)
-            except Exception as exc:
+        try:
+            res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props, pack_id=pack_name)
+            # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
+            # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
+            # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).
+            fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
+            if fails:
                 err += 1
-                # err도 사유를 남긴다 — skip만 집계하면 예외 경로가 감시 밖에 남는다
-                reasons[('예외', f'{raw_label}: {type(exc).__name__}', from_space, to_space)] += 1
-                log.warning("엣지 오류 %s->%s: %s", src_id[:8], tgt_id[:8], exc)
+                reasons[('저장 실패', f'{raw_label}→{relation}', from_space, to_space)] += 1
+                log.warning("엣지 저장 실패 %s->%s [%s→%s]: %s",
+                            src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
+            else:
+                ok += 1
+        except ValueError as ve:
+            skip += 1
+            reasons[('grammar 위반', f'{raw_label}→{relation}', from_space, to_space)] += 1
+            log.debug("엣지 문법위반 skip %s->%s [%s→%s]: %s", src_id[:8], tgt_id[:8], raw_label, relation, ve)
+        except Exception as exc:
+            err += 1
+            # err도 사유를 남긴다 — skip만 집계하면 예외 경로가 감시 밖에 남는다
+            reasons[('예외', f'{raw_label}: {type(exc).__name__}', from_space, to_space)] += 1
+            log.warning("엣지 오류 %s->%s: %s", src_id[:8], tgt_id[:8], exc)
 
     if skip or err:
         # 사유는 log.debug라 조작자에게 보이지 않는다 — 상위 사유를 노출한다.

@@ -92,6 +92,8 @@ class TestToolDispatch:
         # Clear context so it re-initialises with mocked stores
         _context.clear()
 
+        from opencrab.stores.sql_store import SQLStore
+
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             builder.add_node.side_effect = ValueError("Unknown space 'badspace'.")
@@ -102,6 +104,7 @@ class TestToolDispatch:
                 "hybrid": MagicMock(),
                 "mongo": MagicMock(),
                 "billing": MagicMock(),
+                "sql": SQLStore("sqlite:///:memory:"),
             }
 
             result = dispatch_tool("ontology_add_node", {
@@ -112,6 +115,7 @@ class TestToolDispatch:
 
     def test_ontology_add_node_success(self):
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -123,7 +127,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -141,13 +145,25 @@ class TestToolDispatch:
     def test_ontology_add_node_forwards_principal_to_builder_audit(self):
         """Issue #119 sibling check, inverted for #145: ontology_add_node
         already forwarded subject_id to builder.add_node (unlike
-        ontology_add_edge, which did not). Pin that the SAME subject_id
+        ontology_add_edge, which did not). Pin that the SAME principal
         reaches both builder.add_node (audit) and on_node_write (billing) --
         now sourced from the caller's server-derived principal instead of a
-        client-supplied argument."""
+        client-supplied argument.
+
+        #148: builder.add_node no longer takes a `subject_id` kwarg at all
+        (it derives the principal internally via current_principal()) --
+        the channel this test can observe from outside the (mocked) builder
+        is `pack_id`, which the handler resolves from the SAME principal via
+        `resolve_write_pack`. Pinning that pack_id equals the principal's own
+        resolved default pack is the #148-shaped equivalent of the old
+        subject_id pin.
+        """
         from opencrab.auth import Principal, principal_scope
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -155,13 +171,17 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": sql,
             }
-            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            actor = Principal(user_id="actor-1", is_local=True, disabled=False)
+            with principal_scope(actor):
                 dispatch_tool("ontology_add_node", {
                     "space": "subject", "node_type": "User", "node_id": "u1",
                 })
-            assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+                # resolve_write_pack is idempotent for the same owner -- this
+                # recomputes, it does not just echo back the handler's own call.
+                expected_pack_id = resolve_write_pack(sql, actor, None)
+            assert builder.add_node.call_args.kwargs["pack_id"] == expected_pack_id
             billing.on_node_write.assert_called_once_with("default", "actor-1", "subject", "User")
 
     def test_ontology_add_node_rejects_client_subject_id(self):
@@ -184,6 +204,7 @@ class TestToolDispatch:
         per-store failure — the exact same silent-failure shape already
         fixed on ontology_add_edge, just never applied to this sibling."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -194,7 +215,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -209,6 +230,7 @@ class TestToolDispatch:
         code doesn't recognize, not a positive success signal. Fail-closed:
         unrecognized must not bill, only a literal "graph": "ok" does."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -217,7 +239,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -225,8 +247,12 @@ class TestToolDispatch:
             billing.on_node_write.assert_not_called()
 
     def test_ontology_add_edge_success(self):
+        from opencrab.auth import current_principal
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -239,7 +265,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": sql,
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -247,8 +273,11 @@ class TestToolDispatch:
                 "to_space": "resource", "to_id": "doc1",
             })
             assert result["relation"] == "owns"
-            # subject_id is the bind_test_principal fixture's principal
-            # (#145: no longer a client argument).
+            # #148: builder.add_edge no longer takes `subject_id` (the
+            # principal is derived internally via current_principal()) --
+            # the handler instead forwards `pack_id`, resolved from the
+            # bind_test_principal fixture's principal ("test-user").
+            expected_pack_id = resolve_write_pack(sql, current_principal(), None)
             builder.add_edge.assert_called_once_with(
                 from_space="subject",
                 from_id="u1",
@@ -256,7 +285,7 @@ class TestToolDispatch:
                 to_space="resource",
                 to_id="doc1",
                 properties={},
-                subject_id="test-user",
+                pack_id=expected_pack_id,
             )
             # #66: on_edge_write had zero callers repo-wide before this fix —
             # every edge write went unbilled. Pin the call with the caller's
@@ -269,12 +298,21 @@ class TestToolDispatch:
         on_edge_write but never forwarded to builder.add_edge, so the edge's
         audit event (builder.py's mongo.log_event("edge_upsert",
         subject_id=...)) recorded a null actor even though the billing row
-        named one. Pin that the SAME subject_id -- now the caller's
+        named one. Pin that the SAME principal -- now the caller's
         server-derived principal, not a client-supplied argument -- reaches
-        both builder.add_edge (audit) and on_edge_write (billing)."""
+        both builder.add_edge (audit) and on_edge_write (billing).
+
+        #148: builder.add_edge no longer takes `subject_id` at all (the
+        principal is derived internally via current_principal()) -- the
+        observable channel from outside the (mocked) builder is `pack_id`,
+        resolved from the same principal via `resolve_write_pack`.
+        """
         from opencrab.auth import Principal, principal_scope
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -282,15 +320,17 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": sql,
             }
-            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            actor = Principal(user_id="actor-1", is_local=True, disabled=False)
+            with principal_scope(actor):
                 dispatch_tool("ontology_add_edge", {
                     "from_space": "subject", "from_id": "u1",
                     "relation": "owns",
                     "to_space": "resource", "to_id": "doc1",
                 })
-            assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+                expected_pack_id = resolve_write_pack(sql, actor, None)
+            assert builder.add_edge.call_args.kwargs["pack_id"] == expected_pack_id
             billing.on_edge_write.assert_called_once_with("default", "actor-1", "owns")
 
     def test_ontology_add_edge_rejects_client_tenant_and_subject_id(self):
@@ -315,6 +355,7 @@ class TestToolDispatch:
         "stores" map missing the "graph" key entirely must not bill — an
         unrecognized receipt shape is not a positive success signal."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -323,7 +364,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -340,6 +381,7 @@ class TestToolDispatch:
         import logging
 
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -349,7 +391,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             with caplog.at_level(logging.WARNING):
                 result = dispatch_tool("ontology_add_edge", {
@@ -366,6 +408,7 @@ class TestToolDispatch:
         ontology_add_node's on_node_write, which only fires after a
         successful builder.add_edge call."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -374,7 +417,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -392,6 +435,7 @@ class TestToolDispatch:
         common) silent-failure branch that codex's adversarial review
         flagged as still billing a write that never landed."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -403,7 +447,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -418,6 +462,7 @@ class TestToolDispatch:
         edge exists and is queryable, so this must still bill — matching
         pack_create's own graph-is-system-of-record split."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -429,7 +474,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing,
+                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -440,6 +485,7 @@ class TestToolDispatch:
 
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
@@ -447,7 +493,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": MagicMock(), "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -951,54 +997,85 @@ class TestMCPServer:
 
 class TestOntologyBuilder:
     @pytest.fixture
-    def builder(self, fast_mongo_timeout):
+    def sql(self):
+        from opencrab.stores.sql_store import SQLStore
+
+        return SQLStore("sqlite:///:memory:")
+
+    @pytest.fixture
+    def builder(self, fast_mongo_timeout, sql):
         # fast_mongo_timeout (tests/conftest.py) 는 이 fixture 재구성 시마다
         # MongoStore가 실제로 5s씩 기다리던 연결 실패를 ~100ms로 단축한다
         # (Neo4jStore는 DNS 실패로 이미 빠름, 병목이 아니었음).
         from opencrab.ontology.builder import OntologyBuilder
         from opencrab.stores.mongo_store import MongoStore
         from opencrab.stores.neo4j_store import Neo4jStore
-        from opencrab.stores.sql_store import SQLStore
 
         neo4j = Neo4jStore("bolt://invalid:7687", "neo4j", "pw")
         mongo = MongoStore("mongodb://invalid:27017", "db")
-        sql = SQLStore("sqlite:///:memory:")
         return OntologyBuilder(neo4j, mongo, sql)
 
-    def test_add_node_valid(self, builder):
+    @pytest.fixture
+    def pack_id(self, sql):
+        # #148: add_node/add_edge now call current_principal() and
+        # authorize(sql, principal, pack_id) internally -- the pack must be
+        # registered and owned by the module's bound principal ("test-user",
+        # see the module-level bind_test_principal usefixtures mark) before
+        # any write reaches grammar validation.
+        from opencrab.pack.ownership import create_pack
+
+        return create_pack(sql, "test-user", "builder-test-pack")
+
+    def test_add_node_valid(self, builder, pack_id):
         result = builder.add_node("subject", "User", "u1", {
             "name": "Alice", "email": "alice@example.com", "role": "admin"
-        })
+        }, pack_id=pack_id)
         assert result["node_id"] == "u1"
         assert result["space"] == "subject"
         assert result["node_type"] == "User"
         assert "stores" in result
-        # neo4j and mongo are unavailable, but the SQL registry should be ok.
-        # stores keys are role-based (graph/docs/sql/vector) since §1.3.
-        assert result["stores"]["sql"] == "ok"
+        # #148 point 6: neo4j (the graph store, system of record) is
+        # unavailable, so the builder now refuses the whole fan-out instead
+        # of still writing the SQL registry -- a doc/sql row with no graph
+        # node would be invisible to every pack-scoped read.
+        assert result["stores"] == {
+            "graph": "unavailable",
+            "docs": "skipped (graph unavailable)",
+            "sql": "skipped (graph unavailable)",
+            "vector": "skipped (graph unavailable)",
+        }
 
-    def test_add_node_invalid_space(self, builder):
+    def test_add_node_invalid_space(self, builder, pack_id):
         with pytest.raises(ValueError, match="badspace"):
-            builder.add_node("badspace", "User", "u1")
+            builder.add_node("badspace", "User", "u1", pack_id=pack_id)
 
-    def test_add_node_invalid_type(self, builder):
+    def test_add_node_invalid_type(self, builder, pack_id):
         with pytest.raises(ValueError, match="Document"):
-            builder.add_node("subject", "Document", "u1")
+            builder.add_node("subject", "Document", "u1", pack_id=pack_id)
 
-    def test_add_edge_valid(self, builder):
-        builder.add_node("subject", "User", "u1", {"name": "Alice", "email": "a@ex.com", "role": "admin"})
-        builder.add_node("resource", "Project", "p1", {"name": "Project X"})
-        result = builder.add_edge("subject", "u1", "owns", "resource", "p1")
+    def test_add_edge_valid(self, builder, pack_id):
+        builder.add_node(
+            "subject", "User", "u1", {"name": "Alice", "email": "a@ex.com", "role": "admin"},
+            pack_id=pack_id,
+        )
+        builder.add_node("resource", "Project", "p1", {"name": "Project X"}, pack_id=pack_id)
+        result = builder.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
         assert result["relation"] == "owns"
-        assert result["stores"]["sql"] == "ok"
+        # #148 point 6: same graph-unavailable refusal as add_node above --
+        # the edge fan-out never reaches the SQL registry either.
+        assert result["stores"] == {
+            "graph": "unavailable",
+            "docs": "skipped (graph unavailable)",
+            "sql": "skipped (graph unavailable)",
+        }
 
-    def test_add_edge_invalid_relation(self, builder):
+    def test_add_edge_invalid_relation(self, builder, pack_id):
         with pytest.raises(ValueError):
-            builder.add_edge("subject", "u1", "mentions", "resource", "p1")
+            builder.add_edge("subject", "u1", "mentions", "resource", "p1", pack_id=pack_id)
 
-    def test_add_edge_invalid_space_pair(self, builder):
+    def test_add_edge_invalid_space_pair(self, builder, pack_id):
         with pytest.raises(ValueError):
-            builder.add_edge("outcome", "o1", "owns", "subject", "u1")
+            builder.add_edge("outcome", "o1", "owns", "subject", "u1", pack_id=pack_id)
 
 
 # ---------------------------------------------------------------------------

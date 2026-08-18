@@ -256,8 +256,17 @@ class TestPrincipalIsServerDerived:
         never anything the client could smuggle in -- since subject_id is
         rejected outright (see above), the only way it could reach the
         builder is via current_principal(), which resolves to the real
-        bootstrapped user_id from the presented token."""
+        bootstrapped user_id from the presented token.
+
+        #148: builder.add_node no longer takes a `subject_id` kwarg at all
+        (the real OntologyBuilder derives the principal internally via
+        current_principal()) -- the channel observable on the mocked builder
+        is `pack_id`, resolved from the SAME principal via
+        resolve_write_pack. Pin that it matches the token owner's own
+        resolved default pack, not some other principal's."""
+        from opencrab.auth import Principal
         from opencrab.mcp import tools as tools_pkg
+        from opencrab.pack.ownership import resolve_write_pack
 
         sql, user_id, secret = bootstrapped
         builder = MagicMock()
@@ -278,7 +287,10 @@ class TestPrincipalIsServerDerived:
                 headers=_auth(secret),
             )
         assert resp.status_code == 200
-        assert builder.add_node.call_args.kwargs["subject_id"] == user_id
+        expected_pack_id = resolve_write_pack(
+            sql, Principal(user_id=user_id, is_local=True, disabled=False), None
+        )
+        assert builder.add_node.call_args.kwargs["pack_id"] == expected_pack_id
 
 
 # ---------------------------------------------------------------------------
