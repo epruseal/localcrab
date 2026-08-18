@@ -131,8 +131,10 @@ def test_source_id_owned_by_another_pack_is_refused(sql):
 
 def test_vector_slot_owned_by_another_pack_is_refused(sql):
     vec = _Vec({"metadata": {"pack_id": "someone-elses"}})
+    docs = _Docs()
     with pytest.raises(ValueError, match="already attributed"):
-        _write(sql, vector=vec)
+        _write(sql, docs=docs, vector=vec)
+    assert docs.calls == [], "refused on the vector slot, so no doc row either"
 
 
 def test_own_source_id_may_be_rewritten(sql):

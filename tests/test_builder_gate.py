@@ -169,6 +169,34 @@ def test_add_edge_authorizes_too(builder):
         builder.add_edge("resource", "a", "cites", "resource", "b", pack_id="pack-a")
 
 
+def test_an_edge_may_not_straddle_two_packs(builder, sql):
+    """The cross-pack edge guard is a live refusal, so it needs a live test.
+
+    An edge whose endpoints sit in different packs is a row its own pack's
+    readers can never see -- export_edges_scoped requires BOTH endpoints in
+    scope. Refusing it is the point; a guard nothing exercises is a guard
+    that can be deleted by accident.
+    """
+    create_pack(sql, ALICE.user_id, "pack-b")
+    _add(builder, node_id="a", pack_id="pack-a")
+    _add(builder, node_id="b", pack_id="pack-b")
+    with pytest.raises(ValueError, match="already attributed"), principal_scope(ALICE):
+        builder.add_edge("resource", "a", "cites", "resource", "b", pack_id="pack-a")
+    assert builder._neo4j.edges == [], "refused, so nothing may have been written"
+
+
+def test_an_unattributed_endpoint_is_allowed(builder):
+    """Legacy nodes carry no pack_id and the seed scripts still make them;
+    refusing those would block edges over data not yet migrated."""
+    _add(builder, node_id="a")
+    builder._neo4j.nodes[("Document", "legacy")] = {"title": "t", "space": "resource"}
+    with principal_scope(ALICE):
+        out = builder.add_edge(
+            "resource", "a", "cites", "resource", "legacy", pack_id="pack-a"
+        )
+    assert out["stores"]["graph"] == "ok"
+
+
 # ---------------------------------------------------------------------------
 # Stamping -- the builder is the authority for these values
 # ---------------------------------------------------------------------------
