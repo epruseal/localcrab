@@ -117,6 +117,32 @@ def _parse_args() -> argparse.Namespace:
 # Step 0 — Pre-flight 연결 확인
 # ---------------------------------------------------------------------------
 
+def _pg_sql_counts(pg_engine: Any) -> tuple[dict[str, int], list[str]]:
+    """행 수를 세되, 존재하는 테이블만 센다. 반환: (카운트, 없는 테이블 목록).
+
+    테이블별 try/except 로 감싸면 안 된다. PostgreSQL 은 실패한 문장이 트랜잭션 전체를
+    중단시키므로, 없는 테이블 하나 때문에 뒤따르는 모든 카운트가 예외가 되어 0 으로
+    보고된다 -- pre-#144 스키마에서 목록 앞쪽의 `users` 가 실패하면 실존하는 ontology
+    테이블까지 0 이 된다. ``SQLStore.table_counts`` 가 같은 이유로 같은 방식을 쓴다.
+
+    없는 테이블은 카운트 dict 에 넣지 않는다. 마커 값을 섞으면 호출부의 합계와 천단위
+    포맷이 깨지고, 0 행과 부재도 구분되지 않는다.
+    """
+    from sqlalchemy import text  # type: ignore[import]
+
+    existing = _pg_table_names(pg_engine)
+    counts: dict[str, int] = {}
+    absent: list[str] = []
+    with pg_engine.connect() as conn:
+        for spec in mt.SQL_TABLE_SPECS:
+            if spec.name not in existing:
+                absent.append(spec.name)
+                continue
+            row = conn.execute(text(f"SELECT COUNT(*) FROM {spec.name}")).fetchone()  # noqa: S608
+            counts[spec.name] = int(row[0]) if row else 0
+    return counts, absent
+
+
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     """
     목적: 모든 소스 서비스에 연결하고 데이터 규모를 보고한다.
@@ -196,21 +222,14 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         )
         with pg_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        # 테이블 존재 여부에 따라 카운트 -- 목록은 _migration_tables.py 의 단일 정본에서
-        # 파생한다 (더 이상 5테이블 리터럴을 여기 두지 않는다).
-        sql_counts: dict[str, int] = {}
-        tables = [s.name for s in mt.SQL_TABLE_SPECS]
-        with pg_engine.connect() as conn:
-            for tbl in tables:
-                try:
-                    row = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
-                    sql_counts[tbl] = int(row[0]) if row else 0
-                except Exception:
-                    sql_counts[tbl] = 0
+        sql_counts, absent_tables = _pg_sql_counts(pg_engine)
         counts["pg_tables"] = sql_counts
+        counts["pg_absent_tables"] = absent_tables
         result["pg_engine"] = pg_engine
         total_pg = sum(sql_counts.values())
         console.print(f"[green]OK[/green] (total rows={total_pg:,})")
+        if absent_tables:
+            console.print(f"  소스에 없는 테이블: {absent_tables}")
 
         if not args.skip_sql:
             excluded_auth_tables = mt.unmigrated_tables(_pg_table_names(pg_engine))
@@ -688,6 +707,7 @@ def migrate_sql(
                 rows = pg_conn.execute(text(f"SELECT {cols_sql} FROM {tbl}")).fetchall()  # noqa: S608
 
             count = 0
+            source_keys: set[tuple] = set()
             with sq_engine.begin() as sq_conn:
                 for row in rows:
                     row_dict = dict(zip(col_names, row))
@@ -702,6 +722,8 @@ def migrate_sql(
                         row_dict[col] = mt.to_sqlite_bool(row_dict[col], table=tbl, column=col, key=key)
                     for col in ts_cols:
                         row_dict[col] = mt.to_sqlite_timestamp(row_dict[col])
+                    if spec.conflict_key:
+                        source_keys.add(tuple(row_dict[c] for c in spec.conflict_key))
                     try:
                         result = sq_conn.execute(
                             text(f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"),  # noqa: S608
@@ -716,11 +738,41 @@ def migrate_sql(
                 target_row = sq_conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
                 target_count = int(target_row[0]) if target_row else 0
 
-            table_results[tbl] = {"copied": count, "source": source_count, "target": target_count}
+                # INSERT OR IGNORE drops a row for ANY constraint, not just the
+                # conflict key -- a source user with is_local=1 is discarded
+                # when the local database already holds a different one, and
+                # nothing is raised. The counts then match and the copy looks
+                # preserved while the source identity is gone, so presence is
+                # judged by key. Tuples, not a joined string: ('a,b','c') and
+                # ('a','b,c') would collide. Every conflict_key column is
+                # VARCHAR on PostgreSQL and TEXT on SQLite, so both sides come
+                # back as str and need no coercion.
+                missing_sample: list[Any] = []
+                if spec.conflict_key:
+                    key_cols = ", ".join(spec.conflict_key)
+                    target_keys = {
+                        tuple(r)
+                        for r in sq_conn.execute(text(f"SELECT {key_cols} FROM {tbl}"))  # noqa: S608
+                    }
+                    missing_sample = sorted(source_keys - target_keys)
+
+            table_results[tbl] = {
+                "copied": count,
+                "source": source_count,
+                "target": target_count,
+                "missing_keys": len(missing_sample),
+            }
             console.print(
                 f"  [green]{tbl}[/green]: {count:,}행 복사 "
                 f"(source={source_count:,}, target={target_count:,})"
             )
+            if missing_sample:
+                # IGNORE raises nothing, so which constraint rejected the row is
+                # not knowable here -- only which keys never arrived.
+                console.print(
+                    f"  [red]{tbl}: 소스 행 {len(missing_sample):,}건이 타깃에 없다[/red] "
+                    f"(예: {missing_sample[:3]})"
+                )
 
     return {"tables": table_results}
 
@@ -813,19 +865,25 @@ def _sql_status(t: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _row_preservation_mismatches(sql_result: dict[str, Any] | None) -> list[str]:
-    """target < source 인 테이블 이름 목록 -- #151 6절 행 보존 판정.
+    """보존에 실패한 테이블 이름 목록 -- #151 6절 행 보존 판정.
 
-    absent 테이블(``source is None``)은 비교 대상이 없으므로 제외한다. 자연 키가
-    없는 ``impact_records``/``lever_simulations`` 는 재실행 시 ``target > source``
-    가 될 수 있지만 이 판정은 ``target < source`` 만 보므로 오탐하지 않는다(그
-    중복 자체는 #151 범위 밖의 기존 결함).
+    자연 키가 있는 테이블은 도착하지 않은 키가 판정 기준이다. 행 수만 보면 타깃이
+    자기 행을 하나 갖고 있을 때 소스 행이 버려져도 총계가 같아 통과한다.
+    자연 키가 없는 ``impact_records``/``lever_simulations`` 는 대조할 키가 없어
+    ``target < source`` 로만 판정한다. 그 둘은 재실행 시 ``target > source`` 가
+    될 수 있으나 이 조건에 걸리지 않는다(중복 자체는 #151 범위 밖의 기존 결함).
+
+    absent 테이블(``source is None``)은 비교 대상이 없으므로 제외한다.
+
+    한계: 같은 키에 내용이 다른 행은 IGNORE 되어도 키가 존재하므로 통과한다.
     """
     if not sql_result:
         return []
     return [
         name
         for name, t in sql_result["tables"].items()
-        if t["source"] is not None and t["target"] < t["source"]
+        if t["source"] is not None
+        and (t["target"] < t["source"] or t.get("missing_keys", 0) > 0)
     ]
 
 

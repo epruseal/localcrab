@@ -925,3 +925,116 @@ class TestReverseAgainstPostgres:
             assert SECRET_HASH not in stream
             assert SECRET_HASH[:16] not in stream
         assert "table users: copy failed" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Review findings on PR #203
+# ---------------------------------------------------------------------------
+
+
+class TestIndependentlyInitialisedTarget:
+    """A target that already holds its own rows is the case where equal row
+    counts stop meaning equal rows -- and for these tables an unnoticed
+    substitution means the wrong credentials survive."""
+
+    def test_forward_does_not_skip_a_same_sized_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """One source user, one different target user: the count matched, so the
+        copy was skipped entirely and --verify agreed."""
+        from sqlalchemy import create_engine, text
+
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, display_name, is_local, disabled, created_at) "
+                "VALUES ('u-source', 'From Source', 0, 0, '2026-01-01 00:00:00')"
+            )
+
+        engine = create_engine(pg_schema_dsn)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE users (user_id VARCHAR(64) PRIMARY KEY, "
+                "display_name VARCHAR(256) NOT NULL, is_local BOOLEAN NOT NULL DEFAULT FALSE, "
+                "disabled BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ)"
+            ))
+            # is_local=0 deliberately: two local users would collide on
+            # idx_users_single_local and fail this test for the wrong reason.
+            conn.execute(text(
+                "INSERT INTO users (user_id, display_name) VALUES ('u-target', 'Already Here')"
+            ))
+        engine.dispose()
+
+        rc = _run_forward(
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn, "--verify"
+        )
+        assert rc == 0
+        assert _pg_rows(pg_schema_dsn, "users", ["user_id"]) == {("u-source",), ("u-target",)}
+
+    def test_reverse_reports_a_row_dropped_by_another_constraint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """INSERT OR IGNORE discards a row for any constraint, not just the
+        conflict key, and says nothing. One local user on each side keeps the
+        counts equal, so only a key comparison notices the source user is gone.
+        """
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        with sqlite3.connect(src_db) as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, display_name, is_local, disabled, created_at) "
+                "VALUES ('u-source-local', 'Source Local', 1, 0, '2026-01-01 00:00:00')"
+            )
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, display_name, is_local, disabled, created_at) "
+                "VALUES ('u-target-local', 'Target Local', 1, 0, '2026-01-01 00:00:00')"
+            )
+
+        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        stats = result["tables"]["users"]
+        assert stats["target"] == stats["source"] == 1, "the count must match, or this proves nothing"
+        assert stats["missing_keys"] == 1
+        assert rev._row_preservation_mismatches(result) == ["users"]
+
+
+class TestPreflightCounts:
+    def test_absent_table_does_not_zero_the_rest(self, pg_schema_dsn: str) -> None:
+        """PostgreSQL aborts a transaction on a failed statement, so counting
+        table by table inside one connection turns the first missing table into
+        zeros for everything after it. Ordering `users` first made a pre-#144
+        source report its existing ontology rows as empty."""
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(pg_schema_dsn)
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE ontology_nodes (id SERIAL PRIMARY KEY, space VARCHAR(64), "
+                    "node_type VARCHAR(64), node_id VARCHAR(256), created_at TIMESTAMPTZ, "
+                    "updated_at TIMESTAMPTZ)"
+                ))
+                conn.execute(text(
+                    "INSERT INTO ontology_nodes (space, node_type, node_id) "
+                    "VALUES ('s', 'T', 'n1')"
+                ))
+            counts, absent = rev._pg_sql_counts(engine)
+        finally:
+            engine.dispose()
+
+        assert counts["ontology_nodes"] == 1
+        assert set(AUTH_TABLES).issubset(absent)
+        # Absent stays out of the counts entirely: a marker value would break
+        # the caller's sum() and thousands formatting, and would not be
+        # distinguishable from a table that is present and empty.
+        for table in AUTH_TABLES:
+            assert table not in counts

@@ -18,19 +18,28 @@ ever opens the source SQLite files with plain SELECT statements — it never
 issues a single write against them. The originals are guaranteed unmodified
 by construction; there is deliberately no --backup-to flag here. Instead,
 pass --verify to have the script assert (exit non-zero on mismatch) that the
-PostgreSQL row counts equal the SQLite source counts after loading.
+target holds what the source did after loading. SQL-store tables with a natural
+key are checked by key rather than by count, because upserting into a target
+that already held rows of its own makes it a superset — a count comparison
+would call that a failure, while a genuine drop offset by a pre-existing row
+would pass. Everything else is still compared by count.
 
-IDEMPOTENCY: each table is skipped (no-op) if it already exists in Postgres
-AND its row count already equals the source count — safe to re-run after an
-interruption. Tables with natural unique keys (graph_nodes/graph_edges,
-doc_nodes/doc_sources/audit_log, rebac_policies, the vector table) additionally
-upsert row-by-row (``ON CONFLICT DO UPDATE/NOTHING``) so a partial prior run
-does not duplicate rows. ``ontology_nodes``/``impact_records``/
-``lever_simulations`` have no natural unique key (SERIAL id only, not
-FK-referenced elsewhere) — for these three, a *partial* target (count > 0 but
-!= source count) is left untouched and reported instead of blindly
-re-inserting (which would duplicate history); operators should inspect and
-clear the table manually before re-running in that specific edge case.
+IDEMPOTENCY: re-running is safe, but how differs by table.
+
+SQL-store tables with a natural key upsert every row on every run
+(``ON CONFLICT DO UPDATE``). They are deliberately NOT skipped when the target
+row count already equals the source count: equal counts do not mean equal rows,
+and a target initialised independently with one different user would otherwise
+keep its own row while the source user is never copied — silently preserving
+the wrong credentials. ``impact_records``/``lever_simulations`` have no natural
+key (SERIAL id only, not FK-referenced elsewhere) so they cannot upsert; for
+those two a *partial* target (count > 0 but != source count) is left untouched
+and reported rather than blindly re-inserted, which would duplicate history.
+Operators should inspect and clear them manually before re-running in that edge
+case.
+
+The graph/doc/vector migrations still skip on equal counts. Their rows are not
+credentials, and reworking them is outside this script's SQL-store scope.
 
 SCHEMA CREATION: this script does not hand-roll target DDL for graph/doc —
 it imports and instantiates PGGraphStore/PgDocStore (their constructors run
@@ -319,6 +328,29 @@ def _row_key(spec: mt.SqlTableSpec, row: sqlite3.Row) -> str | None:
     return ",".join(str(row[c]) for c in spec.conflict_key)
 
 
+def _missing_source_keys(
+    sql_db_path: str, engine: Any, text: Any, spec: mt.SqlTableSpec
+) -> set[tuple]:
+    """Source natural keys the target does not have.
+
+    Compared as tuples, not as a joined string: ``('a,b', 'c')`` and
+    ``('a', 'b,c')`` would collide and hide a real gap. Both key sets are read
+    whole and diffed in Python rather than probing key by key -- one statement
+    instead of one per row, and SQL equality would not match NULLs if a key
+    column ever became nullable. Every conflict_key column is VARCHAR on
+    PostgreSQL and TEXT on SQLite, so both sides come back as ``str``.
+    """
+    cols = ", ".join(spec.conflict_key or ())
+    src = _sqlite_conn(sql_db_path)
+    try:
+        src_keys = {tuple(r) for r in src.execute(f"SELECT {cols} FROM {spec.name}")}
+    finally:
+        src.close()
+    with engine.begin() as conn:
+        dst_keys = {tuple(r) for r in conn.execute(text(f"SELECT {cols} FROM {spec.name}"))}
+    return src_keys - dst_keys
+
+
 def migrate_sql(
     db_path: str, engine: Any, pg_url: str, batch: int, limit: int | None, dry_run: bool
 ) -> dict[str, int | None]:
@@ -420,7 +452,7 @@ def migrate_sql(
         conflict_key = ", ".join(spec.conflict_key) if spec.conflict_key else None
         with engine.begin() as conn:
             existing = _pg_count(conn, text, table)
-        if existing == counts[table] and counts[table] > 0:
+        if conflict_key is None and existing == counts[table] and counts[table] > 0:
             print(f"# [sql] {table} already has {existing} rows == source — skip.")
             return 0
         if existing > 0 and existing != counts[table] and conflict_key is None:
@@ -716,6 +748,20 @@ def main() -> int:
                                 f"target already has {pg_n} row(s)"
                             )
                         continue
+                    spec = mt.SPEC_BY_NAME.get(table) if group == "sql" else None
+                    if spec is not None and spec.conflict_key:
+                        # Upserting into a target that held rows of its own
+                        # makes it a superset, so the count is informational
+                        # here and the key set is what decides.
+                        gap = _missing_source_keys(sql_db, engine, text, spec)
+                        status = "OK" if not gap else "MISMATCH"
+                        print(
+                            f"#   {group}.{table}: source={src_n} pg={pg_n} "
+                            f"missing_keys={len(gap)} [{status}]"
+                        )
+                        if gap:
+                            mismatches.append((group, table, src_n, pg_n))
+                        continue
                     status = "OK" if pg_n == src_n else "MISMATCH"
                     print(f"#   {group}.{table}: source={src_n} pg={pg_n} [{status}]")
                     if pg_n != src_n:
@@ -723,7 +769,7 @@ def main() -> int:
         if mismatches:
             print(f"RESULT: FAIL ({len(mismatches)} mismatches)")
             return 5
-        print(f"RESULT: PASS (all row counts match){excluded_note}")
+        print(f"RESULT: PASS (source rows are all present in the target){excluded_note}")
         return 0
 
     print(f"RESULT: PASS (migration complete; pass --verify to assert row-count parity){excluded_note}")
