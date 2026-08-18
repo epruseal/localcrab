@@ -1451,7 +1451,6 @@ class TestTargetOnlyCredentials:
         predating these tables has neither to read. Reading them unconditionally
         would abort before the backup for exactly the old databases that absent
         handling exists to support."""
-        import logging
 
         src_db = str(tmp_path / "source.db")
         _sqlite_source(src_db)
@@ -1460,20 +1459,28 @@ class TestTargetOnlyCredentials:
             monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
         ) == 0
 
-        back_db = str(tmp_path / "back.db")
-        _sqlite_source(back_db, tables=tuple(
-            s.name for s in mt.SQL_TABLE_SPECS if s.name not in AUTH_TABLES
-        ))
-        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
-        assert result["tables"]["users"]["target"] == result["tables"]["users"]["source"]
+        # Through main(), not migrate_sql: only there does the guard precede
+        # SQLStore's ensure-schema, which is what makes the tables missing.
+        from sqlalchemy import create_engine
 
-        # users present but api_tokens still missing is the other half of it.
-        half_db = str(tmp_path / "half.db")
-        _sqlite_source(half_db, tables=tuple(
-            s.name for s in mt.SQL_TABLE_SPECS if s.name != "api_tokens"
-        ))
-        result = rev.migrate_sql(pg_schema_dsn, half_db, logging.getLogger(__name__))
-        assert result["tables"]["api_tokens"]["target"] == result["tables"]["api_tokens"]["source"]
+        for missing in (AUTH_TABLES, ("api_tokens",)):
+            data_dir = tmp_path / f"local-{len(missing)}"
+            data_dir.mkdir()
+            _sqlite_source(str(data_dir / "opencrab.db"), tables=tuple(
+                s.name for s in mt.SQL_TABLE_SPECS if s.name not in missing
+            ))
+            engine = create_engine(pg_schema_dsn)
+            monkeypatch.setattr(
+                rev, "preflight", lambda _a, _e=engine: {"counts": {}, "pg_engine": _e}
+            )
+            monkeypatch.setattr(sys, "argv", [
+                "migrate_to_local.py", "--skip-graph", "--skip-docs", "--skip-vectors",
+                "--local-data-dir", str(data_dir), "--pg-url", pg_schema_dsn,
+            ])
+            try:
+                assert rev.main() == 0, f"missing {missing} must not abort the run"
+            finally:
+                engine.dispose()
 
     def test_forward_guard_failure_stops_before_any_store(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
