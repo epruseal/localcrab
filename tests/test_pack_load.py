@@ -4298,9 +4298,11 @@ class TestDocAxisDenominatorAndMutationGuards:
     def test_doc_node_spaces_reconcile_predicate_is_pack_id_only_not_four_key(
             self, live, tmp_path):
         """`live_pack_state` 의 doc_node_spaces 대사(reconcile) 술어는 `pack_id`
-        단일 키다(F4-b) — `delete_pack` 의 회수(4키: pack_id/source/source_id/pack)
-        와 폭이 다르다. 4키로 넓히면 `pack` 으로만 태그된 행(pack_id 없음)이 후보에
-        섞여, 그래프는 안 바뀌었는데 doc 만 지워지는 새 비대칭이 생긴다."""
+        단일 키다(F4-b). 종전 서술은 `delete_pack` 의 회수를 4키(pack_id/source/
+        source_id/pack)라고 적었는데 #142 이후 사실이 아니다 — 회수도 `pack_id`
+        단일 키다. 이 대사 술어를 4키로 넓히면 `pack` 으로만 태그된 행(pack_id
+        없음)이 후보에 섞여, 그래프는 안 바뀌었는데 doc 만 지워지는 새 비대칭이
+        생긴다."""
         builder, graph, docs = live
         docs.upsert_node_doc("resource", "Document", "n-legacy-pack-tag-only",
                               {"pack": "pack-1"})   # pack_id 없음, legacy pack 필드만
