@@ -150,10 +150,13 @@ def test_each_writer_authorizes(writer):
     without authorizing, and no test noticed.
 
     This is a name-presence check, so a dead ``authorize`` reference would slip
-    past it -- deliberately left that way rather than made clever. The real
-    guard against that is behavioural: tests/test_source_writer.py asserts a
-    non-owner is actually refused, and a mutation that only keeps the name
-    fails there.
+    past it -- deliberately left that way rather than made clever. The guard
+    against that is behavioural, and it has to exist for BOTH writers:
+    tests/test_builder_gate.py and tests/test_source_writer.py each assert a
+    non-owner is actually refused. Measured: neutering `authorize` inside the
+    builder while keeping the name kills 6 tests in the first file. An earlier
+    version of this docstring claimed the source-writer tests covered the
+    builder too; they did not, and the mutation walked through.
     """
     module, func = writer
     tree = ast.parse((REPO / module).read_text(encoding="utf-8"))

@@ -243,3 +243,32 @@ def test_requires_a_bound_principal(sql):
             sql, _Hybrid(), _Docs(), _Vec(),
             text="t", source_id="s1", pack_id="pack-a",
         )
+
+
+# ---------------------------------------------------------------------------
+# Rejections must land before any write; store failures must stay in the receipt
+# ---------------------------------------------------------------------------
+
+
+def test_alias_violation_rejects_before_the_doc_row_is_written(sql):
+    """`HybridQuery.ingest` raises this one too, but only after the doc row is
+    committed -- an earlier cut returned 422 to the client with the row
+    already persisted. Check it here, before anything is written."""
+    docs = _Docs()
+    with pytest.raises(ValueError, match="retired alias"):
+        _write(sql, docs=docs, metadata={"pack": "something-else"})
+    assert docs.calls == [], "nothing may be written when the payload is rejected"
+
+
+def test_vector_exception_stays_in_the_receipt(sql):
+    """The receipt contract (#158) says store failures are reported, not
+    raised. `ingest` can raise -- its alias check sits outside its own try on
+    purpose -- so this function must absorb it."""
+    class Boom(_Hybrid):
+        def ingest(self, text, source_id, metadata=None):
+            raise RuntimeError("embed failed")
+
+    docs = _Docs()
+    receipt = _write(sql, docs=docs, hybrid=Boom())
+    assert receipt["stores"]["chromadb"] == "error: embed failed"
+    assert docs.calls, "the doc row stands; only the vector leg failed"

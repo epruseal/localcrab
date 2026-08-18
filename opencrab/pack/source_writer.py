@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
     authorize,
@@ -58,9 +59,18 @@ def write_source(
     """Write one source's doc row and its vector under one ownership stamp.
 
     Returns a receipt shaped like the builder's: ``{"source_id", "metadata",
-    "stores": {"documents": ..., "chromadb": ...}}``. Per-store failures are
+    "stores": {"documents": ..., "chromadb": ...}}``. *Store* failures are
     reported in ``stores`` rather than raised, matching the #158 contract that
     callers read the receipt.
+
+    Rejections are different and DO raise: a caller who is not the pack owner,
+    a source_id already attributed elsewhere, or a payload that violates the
+    ownership-tag invariant. Those happen before anything is written, so the
+    caller gets an exception and no partial row -- which is why the alias check
+    below runs here rather than being left to ``HybridQuery.ingest``. That
+    method raises it too, but it runs AFTER the doc row is committed, and an
+    earlier version of this function let exactly that through: a 422 to the
+    client with the doc row already persisted.
 
     ``pack_id`` is keyword-REQUIRED. A source with no pack is outside every
     pack-scoped read (#143 invariant 5), so "no pack" must not be expressible.
@@ -91,6 +101,12 @@ def write_source(
     meta = stamp(metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED)
     meta.setdefault("space", _DEFAULT_SPACE)
 
+    # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
+    # not a reserved boundary key, so a client can still send it; leaving the
+    # check to the vector leg means the doc row is already committed when it
+    # fires.
+    canonicalize_pack_alias(meta)
+
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}
 
     doc_failed = False
@@ -111,7 +127,11 @@ def write_source(
     # `ingest` mutates the mapping it is handed (it sets `source_id` on it), so
     # the doc row above and the vector below deliberately share one dict: the
     # two must not drift apart.
-    vector_result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+    try:
+        vector_result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+    except Exception as exc:  # noqa: BLE001 -- store failure, reported (#158)
+        receipt["stores"]["chromadb"] = f"error: {exc}"
+        return receipt
     receipt["stores"].update(vector_result.get("stores") or {})
     if "vector_id" in vector_result:
         receipt["vector_id"] = vector_result["vector_id"]

@@ -560,12 +560,25 @@ def test_t13b_rest_ingest_maps_the_invariant_violation_to_422(monkeypatch, tmp_p
     ctx.docs.get_source.return_value = None
     ctx.vector.available = True
     ctx.vector.get_by_id.return_value = None
-    ctx.hybrid.ingest.side_effect = ValueError("properties.pack is a retired alias")
     auth = MagicMock(user_id="u1", tier="pro")
     auth.principal = Principal(user_id="u1", is_local=False, disabled=False)
 
+    # #148: trigger the REAL violation instead of stubbing `hybrid.ingest` to
+    # raise it. The check moved ahead of the first write -- the vector leg used
+    # to be where it fired, which meant the doc row was already committed when
+    # the client got its 422. Stubbing the old layer would now pass while the
+    # actual path went unchecked.
     with pytest.raises(HTTPException) as exc:
-        api.ingest_text(api.IngestRequest(text="본문", source_id="s1"), auth, ctx)
+        api.ingest_text(
+            api.IngestRequest(
+                text="본문", source_id="s1", metadata={"pack": "다른팩"}
+            ),
+            auth,
+            ctx,
+        )
+    assert not ctx.docs.upsert_source.called, (
+        "거부인데 doc 행이 이미 쓰였다 — 부분 쓰기"
+    )
     assert exc.value.status_code == 422, (
         f"불변식 위반이 클라이언트 오류가 아니라 {exc.value.status_code} 로 나갔다")
 

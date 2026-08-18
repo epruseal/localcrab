@@ -442,7 +442,7 @@ def _ingest_into_pack(
     # legacy branch never touches `graph` at all (vector-only embedding + a
     # doc_sources record), so its own signal is store_write_succeeded(stores)
     # with no key — positive confirmation that at least one of
-    # chromadb/mongodb actually came back a recognized "ok"-prefixed status
+    # chromadb/documents actually came back a recognized "ok"-prefixed status
     # (see that function's docstring in builder.py for the full success-value
     # inventory this is based on, and why "unavailable" alone must not bill).
     text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
@@ -463,7 +463,9 @@ def _ingest_into_pack(
 
     # Partial failure = any node/edge write error, or any leftover "error:"/
     # "no match" status sitting in the legacy text-path `stores` dict (chromadb/
-    # mongodb). pack_create/pack_ingest both build their response as
+    # documents; the key was renamed from "mongodb" in #148 to match the
+    # name the source writer and REST already use). pack_create/pack_ingest
+    # both build their response as
     # {"status": "ok", ..., **ingest_result} — since ingest_result is spread
     # last, this "status" wins over their literal "ok" and callers get an
     # accurate top-level signal instead of an unconditional "ok".
