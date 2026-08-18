@@ -2384,6 +2384,47 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert not vec._collection.delete_calls, (
             f"서브클래스 응답을 믿고 삭제를 날렸다: {vec._collection.delete_calls}")
 
+    @pytest.mark.parametrize("position", ["pre", "readback"])
+    def test_a_hostile_key_cannot_redirect_the_ids_lookup(self, live, position):
+        """G28 — dict 가 정확한 내장형이어도 **키**가 적대적이면 조회가 리디렉션된다.
+
+        dict 조회는 해시가 맞으면 저장된 키의 `__eq__` 를 부른다. 그래서
+        `hash("ids")` 에 충돌하고 `__eq__` 가 참을 거짓말하는 키를 심으면
+        `.get("ids")` 가 그 키의 값을 돌려준다 — 값·원소는 정확한 내장형이라
+        나머지 검사를 전부 통과한다. 적대 검증이 이 경로로 **삭제 0건을 1건으로**
+        발행시켰다.
+        """
+        class _EvilKey(str):
+            def __hash__(self):
+                return hash("ids")
+
+            def __eq__(self, other):
+                return True
+
+            def __ne__(self, other):
+                return False
+
+        _builder, graph, docs = live
+        vec = _FakeChromaVec({"a1": "pack-a"})
+
+        if position == "pre":
+            bad = {}
+            bad[_EvilKey("zzz")] = ["ghost"]          # 삭제 대상을 고스트로 바꿔치기
+            vec._collection.malformed_get_wheres = {1: bad}
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            assert chunk_vec_del == 0, (
+                f"고스트 id 를 지운 척하고 {chunk_vec_del!r} 를 발행했다")
+            assert not vec._collection.delete_calls, (
+                f"적대적 키 응답을 믿고 삭제를 날렸다: {vec._collection.delete_calls}")
+        else:
+            bad = {}
+            bad[_EvilKey("zzz")] = []                 # 생존 0으로 위장
+            vec._collection.lossy_delete_ids = {"a1"}  # 실제로는 하나도 안 지워진다
+            vec._collection.malformed_get_wheres = {2: bad}
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            assert chunk_vec_del is None, (
+                f"생존자를 확인하지 못했는데 {chunk_vec_del!r} 를 발행했다")
+
     def test_zero_target_reports_zero_without_calling_delete(self, live):
         """G21 — 대상이 0건이면 0이고, 빈 목록으로 delete 를 부르지 않는다.
 
@@ -2632,6 +2673,78 @@ class TestDeletePackSummaryNamesTheActualBackend:
         vec = _StatefulAvailable()
 
         got = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert got == (0, 0, 0), f"흡수되고 0건이어야 한다 (실제 {got!r})"
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
+
+    def test_a_hostile_class_name_does_not_escape_from_the_warning(self, live, capsys):
+        """G29 — 경고의 인자 평가가 `try` 밖이면 적대적 메타클래스가 예외를 밖으로
+        내보낸다. base 에는 없던 탈출 경로다."""
+        class _EvilName(type):
+            def __getattribute__(cls, name):
+                if name == "__name__":
+                    raise RuntimeError("hostile metaclass blocked __name__")
+                return super().__getattribute__(name)
+
+        class _EvilVec(metaclass=_EvilName):
+            available = True
+
+            def __init__(self):
+                self._collection = _FakeChromaCollection({"a1": "pack-a"})
+                self._collection.malformed_get_wheres = {1: {"no_ids": []}}
+
+        _builder, graph, docs = live
+        vec = _EvilVec()
+
+        got = pack_load.delete_pack("pack-a", graph, docs, vec)   # 예외가 새면 여기서 터진다
+
+        assert got == (0, 0, 0), f"삭제 미시도이므로 0이다 (실제 {got!r})"
+        assert not vec._collection.delete_calls
+
+    def test_a_hostile_rowcount_does_not_mask_the_reason(self, live, caplog):
+        """G30 — 미확인 사유 로그가 적대적 rowcount 의 속성 접근에서 터지면, 바깥
+        핸들러가 그것을 일반 벡터 오류로 다시 적어 **진짜 원인을 가린다**."""
+        class _EvilName(type):
+            def __getattribute__(cls, name):
+                if name == "__name__":
+                    raise RuntimeError("hostile metaclass blocked __name__")
+                return super().__getattribute__(name)
+
+        class _EvilRowcount(metaclass=_EvilName):
+            pass
+
+        _builder, graph, docs = live
+        vec = _StubSqlVec(rowcount=_EvilRowcount())
+
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("삭제 수 미확인" in m for m in msgs), (
+            f"원인이 가려졌다 — 남은 로그: {msgs}")
+
+    def test_summary_survives_a_stateful_available(self, live, capsys):
+        """G31 — `available` 을 정확한 `bool` 로 캐시하지 않으면 `if` 와 요약이 각각
+        `__bool__` 을 불러, 두 번째 호출이 `try` 밖에서 터진다."""
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def __bool__(self):
+                self.calls += 1
+                if self.calls >= 2:
+                    raise RuntimeError("available flipped")
+                return True
+
+        class _FlakyVec:
+            def __init__(self):
+                self.available = _Flaky()
+
+        _builder, graph, docs = live
+
+        got = pack_load.delete_pack("pack-a", graph, docs, _FlakyVec())
 
         assert got == (0, 0, 0), f"흡수되고 0건이어야 한다 (실제 {got!r})"
         backend, count = _vec_line(capsys)

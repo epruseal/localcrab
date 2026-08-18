@@ -360,13 +360,27 @@ def _id_set(got) -> set[str] | None:
     가 `["ghost"]` 를 돌려주는 `dict` 서브클래스면, ghost 삭제는 no-op 이고 재조회엔
     real 만 남아 `1 - 0 = 1` 이 발행된다(실제 삭제 0). ⓑ `__hash__`/`__eq__` 를
     조작한 `str` 서브클래스도 교집합을 비껴간다(적대 검증이 `(0, 0, 1)` 로 실증).
-    실 chroma 는 세 자리 모두 평범한 내장형이다(1.5.9 실측, `GetResult` 는 TypedDict
-    라 런타임에 평 `dict`). 어떤 버전이 서브클래스를 내면 이 함수가 `None` 을 내고
-    카운트는 미확인으로 떨어진다 — 보이는 실패이지 틀린 수가 아니다.
+    **키도 본다.** dict 조회는 해시가 맞으면 **저장된 키**의 `__eq__` 를 부르므로,
+    dict 자체가 정확한 내장형이어도 `hash("ids")` 에 충돌하고 `__eq__` 가 참을
+    거짓말하는 `str` 서브클래스 **키**가 있으면 `.get("ids")` 가 그 키의 값(고스트
+    id)을 돌려준다 — 값과 원소가 정확한 내장형이라 뒤 검사도 전부 통과한다(적대
+    검증이 삭제 0건을 1건으로 발행시켜 실증). 그래서 한 번의 순회로 **모든 키가
+    정확한 `str` 인지 확인하면서 그 자리에서 값을 집는다** — 검증과 조회 사이의
+    창도 없앤다.
+
+    실 chroma 는 네 자리(컨테이너·키·리스트·원소) 모두 평범한 내장형이다(1.5.9
+    실측, `GetResult` 는 TypedDict 라 런타임에 평 `dict`). 어느 자리든 서브클래스가
+    오면 이 함수가 `None` 을 내고 카운트는 미확인으로 떨어진다 — 보이는 실패이지
+    틀린 수가 아니다.
     """
     if type(got) is not dict:
         return None
-    ids = got.get("ids")
+    ids = None
+    for k, v in got.items():
+        if type(k) is not str:
+            return None
+        if k == "ids":                            # 정확한 str 끼리의 비교라 정직하다
+            ids = v
     if type(ids) is not list:                     # chroma GetResult: ids 는 List[str]
         return None
     if not all(type(i) is str for i in ids):
@@ -838,12 +852,14 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
     # 들면 다음 사람이 못 읽는다.
     chunk_vec_del: int | None = 0
     kind = None                      # 판별 실패해도 아래 요약이 읽을 수 있게 선초기화
-    chroma_unreadable = ""           # 락 안에서는 사유만, warning 은 락 밖에서
+    chroma_unreadable = ""           # 락 안에서는 사유만, 로깅은 락을 푼 뒤
     # `available` 을 캐시해 아래 요약이 **다시 읽지 않게** 한다. 요약은 `try` 밖이라,
     # 상태를 가진 property 가 나중 접근에서 던지면 `delete_pack` 밖으로 예외가 샌다 —
-    # 종전엔 없던 탈출 경로다(적대 검증 실증). 이 캐시로 `try` **밖** 접근은 아래 한
-    # 번뿐이고(base 와 같은 횟수), `_vec_backend` 안의 접근은 `try` 가 흡수한다.
-    vec_available = vec.available
+    # 종전엔 없던 탈출 경로다(적대 검증 실증). **정확한 `bool` 로 변환해** 캐시하는
+    # 것이 요점이다 — 원시 객체를 담아 두면 `if` 와 요약이 각각 `__bool__` 을 불러
+    # 두 번째 호출이 `try` 밖에서 터진다. 이 한 줄 뒤로 `try` 밖에서 도는 사용자
+    # 코드는 없다(`_vec_backend` 안의 접근은 `try` 가 흡수한다).
+    vec_available = bool(vec.available)
     if vec_available:
         try:
             # `_vec_backend` 호출은 이 `try` 안에 둔다 — 밖으로 올리면 판별 자체의
@@ -859,7 +875,7 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                     # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
                     # 어느 백엔드가 무엇을 안 세어줬는지 알 수 없다.
                     log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
-                                kind, pack_name, rc, type(rc).__name__)
+                                kind, pack_name, rc, type(rc))
             elif kind == "chroma":
                 # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
                 # 근거와 동일: source 는 소유 키가 아니다).
@@ -887,6 +903,13 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                             chroma_unreadable = "삭제 후 재조회를 판독할 수 없다 — 삭제 수 미확인"
                         else:
                             chunk_vec_del = len(requested) - len(requested & survivors)  # R2
+                if chroma_unreadable:
+                    # 락은 위 `with` 가 이미 풀었다 — 락을 쥔 채 로깅하지 않으면서도
+                    # 인자 평가가 `try` 안이라, 적대적 `vec` 이 여기서 던져도 흡수된다.
+                    # `type(vec)` 은 타입 슬롯을 읽어 가로챌 수 없다(`__name__` 은
+                    # 메타클래스가 가로챌 수 있는 속성 접근이다).
+                    log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
+                                type(vec), pack_name, chroma_unreadable)
             elif kind == "sqlalchemy":
                 from sqlalchemy import text as _sa_text
                 chunk_vec_del = None                                   # R1
@@ -896,7 +919,7 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                 chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
                 if chunk_vec_del is None:
                     log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
-                                kind, pack_name, rc, type(rc).__name__)
+                                kind, pack_name, rc, type(rc))
             else:
                 # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
                 # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
@@ -907,9 +930,6 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                     "수동 정리가 필요하다", type(vec).__name__, pack_name)
         except Exception as e:
             log.warning("벡터 delete 오류(%s): %s", pack_name, e)
-    if chroma_unreadable:
-        log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
-                    type(vec).__name__, pack_name, chroma_unreadable)
 
     # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
     # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로
