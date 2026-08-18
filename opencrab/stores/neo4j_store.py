@@ -475,6 +475,32 @@ class Neo4jStore:
             props["node_type"] = record["lbl"]
             return props
 
+    def get_nodes_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """Plural counterpart to ``get_node_by_id`` -- returns EVERY node for
+        ``node_id`` instead of the single arbitrary one ``LIMIT 1`` picks.
+
+        The same ``id`` can exist under more than one label (Neo4j's ``id``
+        UNIQUE constraint is per-label, matching the SQL backends'
+        ``(node_type, node_id)`` PK), so a caller that needs to reason about
+        pack ownership across ALL matches cannot rely on
+        ``get_node_by_id``'s non-deterministic single pick (pinned supported
+        shape: ``tests/test_read_scope_isolation.py``'s "Same node_id in two
+        packs under two node_types" case). ``ORDER BY lbl`` makes the row
+        order deterministic; ``[]`` when nothing matches."""
+        self._require_available()
+        cypher = (
+            "MATCH (n {id: $id}) RETURN properties(n) AS props, labels(n)[0] AS lbl "
+            "ORDER BY lbl"
+        )
+        with self._session() as session:
+            result = session.run(cypher, id=node_id)
+            results = []
+            for record in result:
+                props = dict(record["props"])
+                props["node_type"] = record["lbl"]
+                results.append(props)
+            return results
+
     def list_pack_ids(self) -> set[str]:
         """See GraphStore.list_pack_ids.
 

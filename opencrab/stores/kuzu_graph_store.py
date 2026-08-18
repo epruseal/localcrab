@@ -171,6 +171,31 @@ class KuzuGraphStore:
         props.setdefault("id", node_id)
         return props
 
+    def get_nodes_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """Plural counterpart to ``get_node_by_id`` -- returns EVERY row for
+        ``node_id`` instead of the single arbitrary one ``LIMIT 1`` picks.
+        The same ``node_id`` can exist under more than one ``node_type``
+        (``tests/test_read_scope_isolation.py``'s "Same node_id in two packs
+        under two node_types" case is a pinned supported shape), so callers
+        that need to reason about pack ownership across ALL rows cannot rely
+        on ``get_node_by_id``'s non-deterministic single pick. ``ORDER BY
+        n.node_type`` makes the row order deterministic; ``[]`` when nothing
+        matches."""
+        self._require_available()
+        r = self._conn.execute(
+            "MATCH (n:OntologyNode {node_id: $id}) "
+            "RETURN n.node_type, n.props, n.space_id ORDER BY n.node_type",
+            {"id": node_id},
+        )
+        results = []
+        while r.has_next():
+            row = r.get_next()
+            props = dict(_merge_space(_parse(row[1]), row[2]))
+            props["node_type"] = row[0]
+            props.setdefault("id", node_id)
+            results.append(props)
+        return results
+
     def lookup_node_type(self, node_id: str) -> str | None:
         """builder.add_edge duck-typing 인터페이스 — LocalGraphStore·Neo4jStore와 동일 시그니처."""
         info = self.get_node_by_id(node_id)

@@ -39,6 +39,7 @@ of each store module):
     count_nodes           yes     yes     yes     yes
     -------------------- ------- ------- ------- -------
     get_node_by_id        yes     yes     yes     yes
+    get_nodes_by_id       yes     yes     yes     yes
     list_packs            yes     yes     yes     yes
     find_by_relations     yes     yes     yes     yes
     export_nodes          yes     yes     yes     yes
@@ -386,6 +387,23 @@ class GraphStoreExtended(Protocol):
         (e.g. ``{"id": ..., "node_type": "Lever", ...}``). Neo4j callers use
         a Cypher ``MATCH (n {id: $id}) RETURN properties(n), labels(n)[0]``
         fallback for this today (see opencrab/mcp/tools.py:ontology_get_node).
+        """
+        ...
+
+    def get_nodes_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """Plural counterpart to ``get_node_by_id`` -- returns EVERY row for
+        ``node_id``, not just whichever one ``get_node_by_id``'s unordered
+        ``LIMIT 1`` happens to pick.
+
+        The SQL backends' ``graph_nodes`` PK is ``(node_type, node_id)`` and
+        Neo4j's ``id`` uniqueness is per-label, so the same ``node_id`` can
+        legitimately exist more than once under different types (pinned
+        supported shape: ``tests/test_read_scope_isolation.py``'s "Same
+        node_id in two packs under two node_types" case). Callers that need
+        to reason about pack ownership across ALL matching rows -- rather
+        than accept a non-deterministic single pick -- use this instead.
+        Rows are ordered by node_type/label for a deterministic result;
+        ``[]`` when nothing matches.
         """
         ...
 
