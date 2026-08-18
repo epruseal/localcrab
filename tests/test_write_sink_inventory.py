@@ -78,10 +78,6 @@ def _call_sites() -> dict[tuple[str, str], set[str]]:
     for root in SCANNED_ROOTS:
         for path in sorted((REPO / root).rglob("*.py")):
             rel = path.relative_to(REPO).as_posix()
-            # The store classes implement these methods; they are the sink,
-            # not a call site.
-            if "/stores/" in f"/{rel}":
-                continue
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8"))
             except SyntaxError:  # pragma: no cover -- would fail collection anyway
@@ -99,8 +95,15 @@ def _call_sites() -> dict[tuple[str, str], set[str]]:
                 def visit_Call(self, node):
                     func = node.func
                     if isinstance(func, ast.Attribute) and func.attr in WATCHED_METHODS:
-                        key = (rel, enclosing[-1] if enclosing else "<module>")
-                        sites.setdefault(key, set()).add(func.attr)
+                        here = enclosing[-1] if enclosing else "<module>"
+                        # A store implementing `upsert_node` may delegate to a
+                        # peer's `upsert_node`; that is the sink itself, not a
+                        # call site. Exempting by function name rather than by
+                        # file path keeps a NEW call site inside a store module
+                        # visible (an earlier draft skipped `stores/` wholesale
+                        # and a mutation test walked right through it).
+                        if here not in WATCHED_METHODS:
+                            sites.setdefault((rel, here), set()).add(func.attr)
                     self.generic_visit(node)
 
             Visitor().visit(tree)
@@ -145,6 +148,12 @@ def test_each_writer_authorizes(writer):
 
     Pinned because the shipped-and-reviewed version of write_source stamped
     without authorizing, and no test noticed.
+
+    This is a name-presence check, so a dead ``authorize`` reference would slip
+    past it -- deliberately left that way rather than made clever. The real
+    guard against that is behavioural: tests/test_source_writer.py asserts a
+    non-owner is actually refused, and a mutation that only keeps the name
+    fails there.
     """
     module, func = writer
     tree = ast.parse((REPO / module).read_text(encoding="utf-8"))
