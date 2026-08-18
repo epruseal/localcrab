@@ -647,16 +647,18 @@ def _target_only_auth(pg_engine: Any, sqlite_path: str) -> dict[str, list[str]]:
 
     conn = sqlite3.connect(sqlite_path)
     try:
-        local_user, local_tokens = mt.local_identity(conn)
-        exempt = {"users": {local_user} if local_user else set(), "api_tokens": local_tokens}
-        insp = inspect(pg_engine)
+        # 무엇이 있는지부터 센다. 가드가 SQLStore 의 ensure-schema 보다 먼저 돌므로
+        # pre-#144 로컬 DB 에는 users 도 api_tokens 도 없을 수 있고, 존재를 가정하고
+        # SELECT 하면 바로 그 오래된 DB 에서 백업 이전에 죽는다 -- absent 처리가
+        # 지원하려던 대상이 정확히 그 DB 다.
         target_tables = {
             r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
+        local_user, local_tokens = mt.local_identity(conn, target_tables)
+        exempt = {"users": {local_user} if local_user else set(), "api_tokens": local_tokens}
+        insp = inspect(pg_engine)
         found: dict[str, list[str]] = {}
         for table in mt.AUTH_CREDENTIAL_TABLES:
-            # 타깃에 아직 없는 테이블은 아무것도 담을 수 없다. 가드가 SQLStore 의
-            # ensure-schema 보다 먼저 돌 수 있으므로 존재를 가정하지 않는다.
             if table not in target_tables:
                 continue
             key = mt.SPEC_BY_NAME[table].conflict_key

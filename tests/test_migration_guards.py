@@ -305,12 +305,15 @@ class TestForwardMainGuard:
     def test_pre144_non_dry_run_reaches_past_counts_stage(
         self, pre144_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
-        """Same counts computation as above, but through the non-dry-run
-        branch (identical code, executed before the dry_run check) -- proves
-        the fix isn't dry-run-only. No live PostgreSQL is available, so this
-        points --pg-url at an unassigned local port to get a fast, hermetic
-        connection-refused *after* the counts line, instead of hanging or
-        reaching out over the network. Unchanged by #151."""
+        """Same source, through the non-dry-run branch. No live PostgreSQL is
+        available, so --pg-url points at an unassigned local port for a fast,
+        hermetic connection-refused.
+
+        #151 moved the target-only credential guard ahead of every store, so
+        an unreachable target now fails there rather than inside migrate_sql --
+        earlier than before, and deliberately so, since a guard that cannot run
+        must not let the stores be written. What this pins either way is that a
+        source predating users/api_tokens/packs never dies on "no such table"."""
         monkeypatch.setattr(
             sys,
             "argv",
@@ -326,10 +329,9 @@ class TestForwardMainGuard:
         )
         rc = fwd.main()
         out = capsys.readouterr().out
-        assert rc == 1  # fails later at the PG connection, not at counting
+        assert rc == 1  # the PG connection, not a missing source table
         assert "no such table" not in out.lower()
-        assert "source rows:" in out  # counts succeeded before the PG failure
-        assert "migration failed" in out
+        assert "guard could not run" in out
 
     def test_missing_sql_db_file_is_not_an_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

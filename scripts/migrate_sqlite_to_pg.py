@@ -783,11 +783,14 @@ def main() -> int:
         except mt.TargetOnlyAuthError as exc:
             print(f"! {mt.safe_error_text(exc)}")
             return 2
-        except Exception:
-            # Anything else here (an unreachable target, most likely) is left to
-            # the migration below, which reports it through the same sanitised
-            # path instead of two competing error messages.
-            pass
+        except Exception as exc:
+            # Not swallowed: a guard that cannot complete leaves the question
+            # unanswered, and continuing would let migrate_graph/migrate_doc
+            # write before migrate_sql re-runs the check -- exactly the partial
+            # write this hoist exists to prevent. Failing here costs nothing,
+            # since an unreachable target would fail on the next statement too.
+            print(f"! credential guard could not run: {mt.safe_error_text(exc)}")
+            return 1
 
     source_counts: dict[str, dict[str, int | None]] = {}
     try:

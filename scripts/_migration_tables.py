@@ -422,7 +422,7 @@ def safe_error_text(exc: BaseException, *, table: str | None = None, key: str | 
     return " ".join(parts)
 
 
-def local_identity(sqlite_conn: Any) -> tuple[str | None, set[str]]:
+def local_identity(sqlite_conn: Any, existing_tables: Any) -> tuple[str | None, set[str]]:
     """The local user id and its token ids in a local-mode database.
 
     Local mode needs exactly one ``is_local`` user to bind stdio/CLI to, so that
@@ -435,6 +435,9 @@ def local_identity(sqlite_conn: Any) -> tuple[str | None, set[str]]:
     1 exactly, so such a row is not the local identity and must not be treated
     as one.
     """
+    if "users" not in existing_tables:
+        # A database predating those tables has no local identity to recognise.
+        return None, set()
     rows = sqlite_conn.execute("SELECT user_id FROM users WHERE is_local = 1").fetchall()
     if len(rows) > 1:
         # Unreachable through SQLStore, whose DDL creates idx_users_single_local
@@ -446,6 +449,8 @@ def local_identity(sqlite_conn: Any) -> tuple[str | None, set[str]]:
     if not rows:
         return None, set()
     user_id = rows[0][0]
+    if "api_tokens" not in existing_tables:
+        return user_id, set()
     tokens = sqlite_conn.execute(
         "SELECT token_id FROM api_tokens WHERE user_id = ?", (user_id,)
     ).fetchall()

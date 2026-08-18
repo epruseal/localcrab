@@ -1444,6 +1444,75 @@ class TestTargetOnlyCredentials:
         assert stats["missing_keys"] == 1
         assert "users" in rev._row_preservation_mismatches(result)
 
+    def test_reverse_guard_tolerates_a_pre144_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """The guard runs before SQLStore creates anything, so a local database
+        predating these tables has neither to read. Reading them unconditionally
+        would abort before the backup for exactly the old databases that absent
+        handling exists to support."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db, tables=tuple(
+            s.name for s in mt.SQL_TABLE_SPECS if s.name not in AUTH_TABLES
+        ))
+        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        assert result["tables"]["users"]["target"] == result["tables"]["users"]["source"]
+
+        # users present but api_tokens still missing is the other half of it.
+        half_db = str(tmp_path / "half.db")
+        _sqlite_source(half_db, tables=tuple(
+            s.name for s in mt.SQL_TABLE_SPECS if s.name != "api_tokens"
+        ))
+        result = rev.migrate_sql(pg_schema_dsn, half_db, logging.getLogger(__name__))
+        assert result["tables"]["api_tokens"]["target"] == result["tables"]["api_tokens"]["source"]
+
+    def test_forward_guard_failure_stops_before_any_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """A guard that cannot finish leaves the question unanswered. Carrying on
+        would let the graph and doc stores be written before migrate_sql repeats
+        the check -- the partial write the hoist exists to prevent."""
+        from sqlalchemy import create_engine, inspect
+
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        _seed_auth_rows(db)
+        graph_db = str(tmp_path / "graph.db")
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(db_path=graph_db)
+        graph.upsert_node("Person", "n1", {"name": "x"})
+        graph.close()
+
+        def _boom(_engine: object, _path: str) -> None:
+            raise RuntimeError("catalogue unreadable")
+
+        monkeypatch.setattr(fwd, "check_target_only_auth", _boom)
+        schema = pg_schema_dsn.rsplit("%3D", 1)[1]
+        rc = _run_forward(
+            monkeypatch,
+            "--sql-db", db,
+            "--graph-db", graph_db,
+            "--only", "graph,sql",
+            "--pg-url", pg_schema_dsn,
+            "--pg-schema", schema,
+        )
+        assert rc != 0
+        engine = create_engine(pg_schema_dsn)
+        try:
+            assert not inspect(engine).has_table("graph_nodes", schema=schema)
+        finally:
+            engine.dispose()
+
     def test_reverse_flag_is_wired_through_main(self) -> None:
         """The unit tests call migrate_sql directly, so a missing argparse
         wiring would not show up in any of them."""
