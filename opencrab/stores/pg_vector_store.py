@@ -72,6 +72,7 @@ from opencrab.stores._vector_base import (
     embed_and_validate,
     generate_add_ids,
     generate_upsert_ids,
+    validate_import_records,
     validate_lengths,
 )
 
@@ -87,6 +88,21 @@ def _to_pgvector_literal(vec: list[float]) -> str:
     엔진 주입 방식(공유 엔진 포함) 어디서나 이식성 있게 동작한다.
     """
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+def _from_pgvector_literal(literal: str) -> list[float]:
+    """Parse pgvector's ``'[v1,v2,...]'`` text output back to floats.
+
+    NOT ``json.loads``: pgvector renders negative zero as ``-0``, which JSON
+    parses as the integer ``0`` and loses the sign (measured). Per-token
+    ``float()`` keeps it -- ``float("-0")`` is ``-0.0``. Subnormals survive
+    either way. Callers only ever see finite values here, because
+    ``validate_import_records`` rejects anything else on the way in.
+    """
+    body = literal.strip()[1:-1].strip()
+    if not body:
+        return []
+    return [float(token) for token in body.split(",")]
 
 
 class PgVectorStore:
@@ -439,6 +455,84 @@ class PgVectorStore:
         if not isinstance(meta, dict):
             meta = json.loads(meta) if meta else {}
         return {"id": row.node_id, "document": row.document, "metadata": meta}
+
+    # ------------------------------------------------------------------
+    # 팩 단위 raw export/import (#200)
+    # ------------------------------------------------------------------
+
+    def export_pack_vectors(self, pack_id: str) -> list[dict[str, Any]]:
+        """이 팩이 소유한 벡터 전량(임베딩 포함). 계약은 ``_vector_base.py`` 의
+        "pack-scoped raw vector export/import" 절 참고.
+
+        팩 술어는 ``pack_id`` 컬럼 — ``pack/load.py`` 의 ``_live_vec_ids`` /
+        ``pack_live_counts`` 가 쓰는 것과 같다. LIMIT 을 걸지 않는다: 소비자
+        (``pack_fork``)는 전량이 필요하고, 잘린 export 는 조용히 불완전한 사본을
+        만든다.
+
+        metadata 는 이 스토어의 ``query``/``get_by_id`` 와 같은 방어를 쓴다
+        (드라이버가 jsonb 를 dict 로 주지 않는 경우 대비).
+        """
+        self._require_available()
+        from sqlalchemy import text
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT node_id, embedding::text AS embedding, document, metadata "
+                    f"FROM {self._table} WHERE pack_id = :pack"
+                ),
+                {"pack": pack_id},
+            ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            meta = row.metadata
+            if not isinstance(meta, dict):
+                meta = json.loads(meta) if meta else {}
+            records.append(
+                {
+                    "id": row.node_id,
+                    "embedding": _from_pgvector_literal(row.embedding),
+                    "document": row.document,
+                    "metadata": meta,
+                }
+            )
+        return records
+
+    def import_vectors(
+        self, records: list[dict[str, Any]], *, pack_id: str
+    ) -> list[str]:
+        """export 한 레코드를 재임베딩 없이 ``pack_id`` 로 넣는다.
+
+        ADD 의미론 — 이미 있는 ``node_id`` 는 PK 위반으로 raise 한다(node_id 는
+        팩과 무관한 전역 키라, 존재한다는 것은 남의 팩 슬롯이라는 뜻이다).
+        ``engine.begin()`` 단일 트랜잭션이므로 중간 충돌은 전량 롤백된다.
+        INSERT 는 ``add_texts`` 와 같은 문장이고 임베딩만 레코드에서 온다 —
+        ``_embed`` 를 타지 않는다.
+        """
+        self._require_available()
+        clean = validate_import_records(records, pack_id=pack_id, dim=self._dim)
+        if not clean:
+            return []
+        from sqlalchemy import text
+
+        sql = text(
+            f"INSERT INTO {self._table} (node_id, pack_id, embedding, document, metadata) "
+            "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb)"
+        )
+        with self._engine.begin() as conn:
+            for record in clean:
+                meta = record["metadata"]
+                conn.execute(
+                    sql,
+                    {
+                        "node_id": record["id"],
+                        "pack_id": str(meta.get("pack_id", "")),
+                        "embedding": _to_pgvector_literal(record["embedding"]),
+                        "document": record["document"],
+                        "metadata": json.dumps(meta),
+                    },
+                )
+        return [record["id"] for record in clean]
 
     def count(self) -> int:
         if not self._available:

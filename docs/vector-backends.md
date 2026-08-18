@@ -454,3 +454,119 @@ opencrab serve
 | `EMBED_COLLECTION` | `opencrab_vectors_kure` | openai 백엔드 전용 Chroma 컬렉션명(`VECTOR_BACKEND=chroma`일 때) |
 | `CHROMA_HOST` / `CHROMA_PORT` | `localhost` / `8000` | docker 모드 Chroma HTTP 서버 주소 |
 | `CHROMA_COLLECTION` | `opencrab_vectors` | minilm(local) 임베딩 전용 Chroma 컬렉션명 |
+
+---
+
+## 8. 팩 단위 raw 벡터 export/import 계약 (#200)
+
+세 벡터 스토어(`chroma` / `sqlite-vec` / `pgvector`)는 **재임베딩 없이 한 팩의 벡터를 통째로
+복제**하는 두 메서드를 공개한다. 소비자는 `pack_fork`(#201)다.
+
+```python
+store.export_pack_vectors(pack_id) -> list[record]
+store.import_vectors(records, *, pack_id) -> list[str]
+
+record = {"id": str, "embedding": list[float],
+          "document": str | None, "metadata": dict,
+          "uris": str | None}      # chroma 전용
+```
+
+계약 본문(왜 그렇게 정했는지)은 `opencrab/stores/_vector_base.py` 모듈 docstring 의
+"pack-scoped raw vector export/import" 절이 정본이다. 여기에는 **백엔드별로 다른 것**만 적는다.
+
+### 8.1 왕복 충실도 — 백엔드마다 다르다
+
+| 백엔드 | 임베딩 왕복 | 확인 방법 |
+|---|---|---|
+| `sqlite-vec` (float-only, `ann=binary` 공히) | **바이트 동일** | 저장된 blob 을 직접 대조 |
+| `pgvector` | **정확히 동일** | pgvector `=` 연산자 |
+| `chroma` | **동일하지 않다 — 성분당 최대 1 float32 ULP** | 성분별 ULP 허용오차 + KNN 순서 동일 |
+
+**chroma 가 어긋나는 이유는 `hnsw:space` 다.** `ChromaStore` 는 언제나 `cosine` 으로 컬렉션을
+만드는데, 그 공간에서는 정확히 float32 인 입력조차 되읽으면 일부 성분이 1 ULP 이동한다
+(`l2`/`ip` 는 바이트 동일). 결정적이고 재오픈에도 안정하며 KNN 순서는 보존되지만, **멱등은
+아니다** — 이미 저장된 값을 다시 넣어도 또 이동할 수 있다. 그래서 이 축을 "해시 동일"로
+검증하면 안 된다. 세 백엔드에 같은 해시 게이트를 걸 수 없다는 것이 이 표의 요지다.
+
+`sqlite-vec`/`pgvector` 축이 "backend raw 표현(저장된 blob·컬럼) 동일"인 반면 `chroma` 축은
+그 수준을 달성할 수 없어 **canonical float32 허용오차**로 판정한다.
+
+재현: `tests/test_vector_raw_contract.py::TestRoundTrip::test_embedding_survives_the_round_trip`
+(`sqlite-vec` 축은 확장 모듈이 없으면 skip 된다 — 아래 8.5).
+
+### 8.2 정체성 제약 — `node_id` 단독 전역 유일 (#197 정합)
+
+슬롯 키는 `node_id` 하나이고 **팩으로 한정되지 않는다.**
+
+| 백엔드 | 다른 팩에 같은 `node_id` 를 add | 동작 |
+|---|---|---|
+| `sqlite-vec` | vec0 TEXT PRIMARY KEY | 거부(`UNIQUE constraint failed`) |
+| `pgvector` | PK | 거부(`UniqueViolation`) |
+| `chroma` | — | **거부하지 않는다. 조용히 무시된다** — 기존 레코드가 이긴다 |
+
+chroma 만 fail-open 이라 `ChromaStore.import_vectors` 가 **스토어 안에서** 중복을 선검사해
+거부한다. 그래서 "이미 있는 id 는 예외"는 세 백엔드에서 모두 성립한다. **예외 타입은 통일하지
+않는다**(각 백엔드의 것이 그대로 올라온다) — 호출자는 타입으로 분기하지 말고 "예외 = 이 배치
+실패"로 다루고 보상한다.
+
+**따라서 fork 는 id 재매핑이 필수다.** 근본 해소는 #197(pack-qualified identity)이다.
+
+### 8.3 호출자가 재작성해야 하는 것
+
+계약이 스탬프하는 metadata 키는 **`pack_id` 하나뿐**이다(없거나 같으면 대입, 다르면 거부).
+폐기 별칭 `pack` 은 버린다(#159/#171 — 남기면 새 팩에 남의 팩명이 다시 심긴다).
+
+원본 팩의 id-space 를 가리키는 나머지 키는 **호출자가 재작성한다**:
+
+| 키 | 재작성 안 하면 |
+|---|---|
+| `node_id` | 벡터 히트의 노드 정체성을 이 키로 먼저 해석하므로, 사본 팩 히트가 **원본 팩 노드 id** 를 가리킨다 |
+| `source_id` / `document_id` | 소스·문서 참조가 원본을 가리킨다 |
+| `source` | 사본이 **원본 팩명**을 달고 산다(벡터 축 소유 판정은 `pack_id` 단독이라 오늘은 무해하나 doc 축은 이 키를 폴백으로 본다) |
+
+계약이 `node_id` 등식(`metadata["node_id"] == id`)을 **강제하지 않는 것은 의도**다. 그 등식은
+노드 벡터에서만 성립하고, 청크 벡터는 이 키로 **소유 노드를 가리키는 것이 정상**이라 강제하면
+정상 팩의 fork 가 막힌다.
+
+**추가 불변식**: 벡터 id 는 그 팩의 노드·청크 id 와 같아야 한다. `pack/load.py` 의 증분 적재가
+`live_vec_ids - (노드 id | 청크 id)` 를 고아로 보고 **실제로 삭제**하므로, 벡터만 재매핑하고
+graph/doc 쪽을 그대로 두면 다음 적재에서 임포트한 벡터가 전량 사라진다.
+
+### 8.4 chroma 의 한계
+
+- **원자적이지 않다.** 트랜잭션이 없고, 클라이언트의 `get_max_batch_size()` 를 넘는 배치는
+  스토어가 나눠 넣으므로 중간 실패 시 앞 청크가 남는다(상한값은 클라이언트·버전마다 다르다 —
+  `python3 -c "import chromadb,tempfile;print(chromadb.PersistentClient(path=tempfile.mkdtemp()).get_max_batch_size())"`
+  로 지금 값을 확인한다). 보상은 호출자 몫이다
+  (`sqlite-vec` 은 `_tx()`, `pgvector` 는 `engine.begin()` 단일 트랜잭션이라 전량 롤백된다).
+- **선검사와 실제 쓰기 사이 창이 남는다.** 프로세스 안의 `ChromaStore` 공개 쓰기끼리만
+  직렬화되고, 프로세스 간은 호출자의 `write.lock` 규율이다. 그 창을 완전히 닫지는 못하므로
+  import 는 **쓰기 후 되읽어** 전 id 의 존재와 metadata·document·uri 일치를 확인한다 —
+  조용한 누락을 예외로 승격시키는 장치다. 임베딩은 대조하지 않는다(비용 + 8.1 의 ULP).
+- **import 하는 동안 그 컬렉션의 읽기가 밀린다.** 선검사부터 사후 확인까지 스토어 락을 쥐므로
+  같은 컬렉션의 `query`·`count`·`get_by_id`(miss 재확인)가 그 시간만큼 대기한다. 대형 배치에서는
+  초 단위다. `upsert_texts` 가 세운 기존 패턴의 연장이고 정확성 문제는 아니지만, fork 를 서빙
+  중에 돌리면 검색 지연으로 보인다.
+- **metadata 값은 그대로 보존되지 않는다.** `_sanitize_metadata` 가 비스칼라를 `str()` 로
+  바꾸고, NaN/Inf 값은 키째 사라지며, 매우 큰 int 는 float 로 강등된다. 전부 `add_texts` 의
+  기존 관례와 같고 export→import 경로에서는 도달하지 않는다(export 값은 이미 chroma 가 저장한
+  것이다). 반면 `pgvector` 는 중첩 metadata 를 jsonb 로 그대로 보존하므로, 계약은 **metadata
+  값 타입을 좁히지 않는다**(좁히면 그런 pg 팩의 fork 가 막힌다).
+
+### 8.5 검증 실행
+
+```
+# 3백엔드 계약 전량 (sqlite-vec 확장이 없으면 그 축은 skip)
+PYTHONPATH=. python3 -m pytest -q tests/test_vector_raw_contract.py
+
+# sqlite-vec 축까지 태우려면 확장을 격리 설치해 PYTHONPATH 에 얹는다
+#   pip install --target ./vecpkg sqlite-vec      (공용 환경에 설치하지 말 것)
+PYTHONPATH=.:./vecpkg python3 -m pytest -q tests/test_vector_raw_contract.py
+
+# pgvector 축은 *_test DB 를 가리키는 DSN 이 있어야 돈다(없으면 skip)
+OPENCRAB_PG_TEST_URL=postgresql://.../opencrab_test PYTHONPATH=. \
+  python3 -m pytest -q tests/test_vector_raw_contract.py
+```
+
+세 축 모두 **skip 이면 아무것도 증명하지 않는다** — 백엔드를 실제로 태운 결과인지 `-rs` 로
+확인할 것.

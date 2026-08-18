@@ -13,7 +13,11 @@ import os
 import threading
 from typing import Any
 
-from opencrab.stores._vector_base import generate_add_ids, generate_upsert_ids
+from opencrab.stores._vector_base import (
+    generate_add_ids,
+    generate_upsert_ids,
+    validate_import_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -502,6 +506,156 @@ class ChromaStore:
         with self._lock:
             return _read_one(self._collection, doc_id)
 
+    # ------------------------------------------------------------------
+    # Pack-scoped raw export/import (#200)
+    # ------------------------------------------------------------------
+
+    def export_pack_vectors(self, pack_id: str) -> list[dict[str, Any]]:
+        """Every vector this pack owns, embeddings included. See
+        ``_vector_base.py``'s "pack-scoped raw vector export/import" contract.
+
+        The pack predicate is ``where={"pack_id": ...}`` -- the same one
+        ``pack/load.py``'s ``_live_vec_ids`` and ``pack_live_counts`` use.
+        No ``limit`` is passed, so this is the whole match set.
+
+        Three shapes chroma hands back that the record contract does not
+        allow, all normalised here: ``embeddings`` is an ndarray of float64
+        ndarrays (not ``list[float]``), a record's ``metadatas`` entry is
+        ``None`` when it was added without any, and ``documents`` entries are
+        ``None`` for embedding-only records. The parallel arrays of a single
+        ``get()`` do line up with each other, so they are zipped by position
+        here; it is a SEPARATE result being compared against a request that
+        must be matched by id instead (see ``_assert_landed``).
+
+        WARNING for callers comparing round-trips: on a ``hnsw:space=cosine``
+        collection -- the only kind this store creates -- an embedding read
+        back is NOT bit-identical to the one written. It differs by at most
+        one float32 ULP per component (deterministic, stable across reopen,
+        and KNN order is preserved); ``l2``/``ip`` collections are exact.
+        Compare with a per-element ULP tolerance, not a hash.
+        """
+        self._require_available()
+        got = self._collection_handle().get(
+            where={"pack_id": pack_id},
+            include=["embeddings", "documents", "metadatas", "uris"],
+        )
+        ids = got["ids"]
+        # Every parallel array is indexed by position within THIS result, so
+        # they are zipped with ids rather than looked up by id.
+        embeddings = got["embeddings"]
+        documents = got["documents"] or [None] * len(ids)
+        metadatas = got["metadatas"] or [None] * len(ids)
+        uris = got.get("uris") or [None] * len(ids)
+        records: list[dict[str, Any]] = []
+        for pos, doc_id in enumerate(ids):
+            records.append(
+                {
+                    "id": doc_id,
+                    "embedding": [float(x) for x in embeddings[pos]],
+                    "document": documents[pos],
+                    "metadata": dict(metadatas[pos]) if metadatas[pos] else {},
+                    "uris": uris[pos],
+                }
+            )
+        return records
+
+    def import_vectors(
+        self, records: list[dict[str, Any]], *, pack_id: str
+    ) -> list[str]:
+        """Add exported records to ``pack_id`` without re-embedding.
+
+        Passing ``embeddings=`` explicitly is what keeps the embedding
+        function out of this path entirely (measured: zero calls), so a fork
+        works even while the embedding backend is down.
+
+        ADD semantics, enforced HERE rather than by chroma: ``add()`` on an id
+        that already exists neither raises nor overwrites -- the existing
+        record simply wins and the caller is told nothing (verified on 1.5.9).
+        Every other backend rejects that at the storage layer, so this store
+        pre-checks the ids under the collection lock and refuses the whole
+        batch if any exist. Without it chroma would be the one backend where a
+        fork silently drops vectors.
+
+        Chunking is required, not an optimisation: a single ``add()`` larger
+        than the client's ``get_max_batch_size()`` (5461 here) is rejected
+        outright, and a fork of a large pack exceeds that easily.
+
+        The write is followed by a read-back that checks every id is present
+        and that its metadata, document and uri are what we submitted. The
+        pre-check cannot close the window on its own -- it only serialises
+        against this class's own writers in this process (``pack/load.py``
+        mutates the raw handle outside this lock, and other processes are the
+        caller's ``write.lock`` discipline) -- and counting rows would prove
+        nothing, because an id another writer took is still an id that exists.
+        Comparing payloads is what turns a silent loss into an exception.
+        Embeddings are deliberately not compared: it would mean re-reading
+        every vector on every import, and the cosine-space ULP drift above
+        means the comparison would need a tolerance anyway. So a writer that
+        wins the race with identical metadata, document and uri but a
+        different embedding still goes undetected.
+
+        Not atomic. Chroma has no transaction and this chunks, so a failure
+        partway leaves earlier chunks in place. Compensation belongs to the
+        caller (``pack_fork``), which is already tracking the ids it inserted
+        in order to unwind a partial fork; duplicating it here would mean two
+        layers trying to undo the same write.
+        """
+        self._require_available()
+        clean = validate_import_records(
+            records, pack_id=pack_id, allow_uris=True
+        )
+        if not clean:
+            return []
+
+        ids = [record["id"] for record in clean]
+        embeddings = [record["embedding"] for record in clean]
+        documents = [record["document"] for record in clean]
+        metadatas = [_sanitize_metadata(record["metadata"]) for record in clean]
+        uris = [record["uris"] for record in clean]
+
+        try:
+            max_batch = int(self._client.get_max_batch_size())
+        except Exception:  # noqa: BLE001 - older clients have no such method
+            max_batch = len(ids)
+        max_batch = max(1, max_batch)
+
+        with self._lock:
+            # Snapshot the handle directly -- _collection_handle() takes this
+            # same non-reentrant lock and would deadlock here.
+            handle = self._collection
+
+            existing = handle.get(ids=ids)
+            if existing["ids"]:
+                raise ValueError(
+                    "import_vectors: refusing to import, "
+                    f"{len(existing['ids'])} id(s) already exist in this "
+                    f"collection: {sorted(existing['ids'])[:10]}"
+                )
+
+            for start in range(0, len(ids), max_batch):
+                stop = start + max_batch
+                kwargs: dict[str, Any] = {
+                    "ids": ids[start:stop],
+                    "embeddings": embeddings[start:stop],
+                    "documents": documents[start:stop],
+                    "metadatas": metadatas[start:stop],
+                }
+                chunk_uris = uris[start:stop]
+                if any(uri is not None for uri in chunk_uris):
+                    kwargs["uris"] = chunk_uris
+                handle.add(**kwargs)
+
+            landed = handle.get(
+                ids=ids, include=["metadatas", "documents", "uris"]
+            )
+
+        _assert_landed(landed, ids, metadatas, documents, uris)
+        logger.debug(
+            "ChromaDB: imported %d vectors into pack %s (%d chunk(s))",
+            len(ids), pack_id, (len(ids) + max_batch - 1) // max_batch,
+        )
+        return ids
+
     def delete(self, ids: list[str]) -> None:
         """Delete documents by their IDs.
 
@@ -600,6 +754,55 @@ def _rollback(handle: Any, batch_ids: list[str], snapshot: dict[str, Any]) -> No
         metadatas=[meta if meta else None for meta in snapshot["metadatas"]],
         uris=snapshot.get("uris"),
     )
+
+
+def _assert_landed(
+    landed: dict[str, Any],
+    ids: list[str],
+    metadatas: list[dict[str, Any]],
+    documents: list[str | None],
+    uris: list[str | None],
+) -> None:
+    """Raise unless every submitted id came back carrying what we submitted.
+
+    Two distinct failures are checked, and both are reachable: an id can be
+    MISSING (another writer deleted it, or a chunk never applied), or it can
+    be present but hold someone else's payload (another writer took the id
+    between the pre-check and the add, making our add a silent no-op). A
+    count would catch neither -- the foreign record occupies the id just as
+    ours would have.
+
+    Results are matched by id, never by position: chroma does not promise the
+    returned order matches the requested one.
+    """
+    by_id = {
+        doc_id: pos for pos, doc_id in enumerate(landed["ids"])
+    }
+    missing = [doc_id for doc_id in ids if doc_id not in by_id]
+    if missing:
+        raise RuntimeError(
+            f"import_vectors: {len(missing)} id(s) are missing after the "
+            f"write, so this import did not fully land: {missing[:10]}"
+        )
+    got_meta = landed["metadatas"] or [None] * len(landed["ids"])
+    got_docs = landed["documents"] or [None] * len(landed["ids"])
+    got_uris = landed.get("uris") or [None] * len(landed["ids"])
+    mismatched: list[str] = []
+    for pos, doc_id in enumerate(ids):
+        at = by_id[doc_id]
+        stored_meta = dict(got_meta[at]) if got_meta[at] else {}
+        if (
+            stored_meta != metadatas[pos]
+            or got_docs[at] != documents[pos]
+            or got_uris[at] != uris[pos]
+        ):
+            mismatched.append(doc_id)
+    if mismatched:
+        raise RuntimeError(
+            f"import_vectors: {len(mismatched)} id(s) hold a different "
+            "payload than the one submitted, so a concurrent writer owns "
+            f"them: {mismatched[:10]}"
+        )
 
 
 def _sanitize_metadata(meta: dict[str, Any]) -> dict[str, Any]:

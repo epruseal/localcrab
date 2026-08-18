@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -99,6 +100,7 @@ from opencrab.stores._vector_base import (
     embed_and_validate,
     generate_add_ids,
     generate_upsert_ids,
+    validate_import_records,
     validate_lengths,
 )
 from opencrab.stores.chroma_store import _sanitize_metadata
@@ -133,6 +135,19 @@ _VEC0_K_MAX = 4096
 # tests/test_stores.py's vector-latency case referenced in the issue #147
 # design doc, §6.2 "벡터 지연").
 _PACK_KNN_MAX = 32
+
+
+def _decode_metadata(raw: Any) -> dict[str, Any]:
+    """Stored metadata as a dict, whatever the column actually holds.
+
+    Both an SQL NULL and the JSON text ``null`` are reachable on rows written
+    outside this store, and the contract promises callers a dict they can
+    spread into a new one.
+    """
+    if not raw:
+        return {}
+    decoded = json.loads(raw)
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _sign_bits(vec: list[float]) -> bytes:
@@ -897,6 +912,84 @@ class SqliteVecStore(_SqliteConnMixin):
             )
         scored.sort(key=lambda x: x["distance"])
         return scored
+
+    # ------------------------------------------------------------------
+    # Pack-scoped raw export/import (#200)
+    # ------------------------------------------------------------------
+
+    def export_pack_vectors(self, pack_id: str) -> list[dict[str, Any]]:
+        """Every vector this pack owns, embeddings included. See
+        ``_vector_base.py``'s "pack-scoped raw vector export/import" contract.
+
+        The pack predicate is the ``pack_id`` PARTITION KEY column -- the same
+        one ``pack/load.py``'s ``_live_vec_ids`` and ``pack_live_counts`` use,
+        so this cannot drift from what those two consider the pack's rows.
+
+        No LIMIT: the consumer (``pack_fork``) needs the whole pack, and a
+        capped export would hand it a silently truncated copy. Bounding the
+        size is the caller's job.
+
+        The stored blob is unpacked to ``list[float]`` here rather than handed
+        out opaque. float32 -> Python float -> float32 is exact, so a
+        re-import lands byte-identical rows (measured, both the float-only and
+        the ``embedding_bit`` table shapes), and it keeps ``embedding`` the
+        same type across all three backends.
+        """
+        self._require_available()
+        rows = self._conn.execute(
+            f"SELECT node_id, embedding, document, metadata FROM {self._table}"
+            " WHERE pack_id = ?",
+            (pack_id,),
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            blob = bytes(row["embedding"])
+            records.append(
+                {
+                    "id": row["node_id"],
+                    "embedding": list(struct.unpack(f"{len(blob) // 4}f", blob)),
+                    "document": row["document"],
+                    # NULL metadata is reachable for externally written rows
+                    # (get_by_id/_knn guard it the same way), and so is the
+                    # literal JSON ``null``, which decodes to None rather than
+                    # a dict and would break every caller that spreads this.
+                    "metadata": _decode_metadata(row["metadata"]),
+                }
+            )
+        return records
+
+    def import_vectors(
+        self, records: list[dict[str, Any]], *, pack_id: str
+    ) -> list[str]:
+        """Insert exported records into ``pack_id`` without re-embedding.
+
+        ADD semantics: an id that already exists raises (vec0's TEXT PRIMARY
+        KEY is global, so an existing id means another pack's slot). The whole
+        batch runs inside one ``_tx()``, so a collision partway through rolls
+        the earlier rows back -- verified against vec0 for both table shapes,
+        not assumed from sqlite3's general behaviour.
+
+        Writing goes through ``_insert_sql``/``_insert_params``, the very path
+        ``add_texts`` uses, so the partition value, the float32 serialisation
+        and the ``embedding_bit`` re-derivation all stay in one place. Nothing
+        here calls ``_embed``.
+        """
+        self._require_available()
+        clean = validate_import_records(records, pack_id=pack_id, dim=self._dim)
+        if not clean:
+            return []
+        insert_sql = self._insert_sql()
+        with self._tx() as conn:
+            for record in clean:
+                meta = _sanitize_metadata(record["metadata"])
+                conn.execute(
+                    insert_sql,
+                    self._insert_params(
+                        record["id"], record["document"], meta, record["embedding"]
+                    ),
+                )
+        self._ann_cache = None  # in-process write -> invalidate ANN cache
+        return [record["id"] for record in clean]
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
         self._require_available()

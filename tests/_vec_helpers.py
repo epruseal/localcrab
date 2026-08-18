@@ -50,13 +50,20 @@ class MockEF:
 
 
 def build_vector_store(
-    backend: str, tmp_path: Any, dim: int = 32, **kwargs: Any
+    backend: str, tmp_path: Any, dim: int = 32, *, ef: Any = None, **kwargs: Any
 ) -> Any:
     """Construct a vector store for the given backend with the shared MockEF.
 
     Extra kwargs are forwarded to the store constructor (e.g. ``ann="binary"``,
-    ``ann_coarse_k=...`` for SqliteVecStore's §3.7 2-stage path)."""
-    ef = MockEF(dim)
+    ``ann_coarse_k=...`` for SqliteVecStore's §3.7 2-stage path).
+
+    ``ef`` swaps in a different embedding function -- a counting wrapper, say,
+    for tests that assert a path never embeds (issue #200). Keyword-only, and
+    ``None`` keeps the default ``MockEF(dim)``, so existing callers are
+    unaffected. Going through this helper rather than calling a constructor
+    directly is what keeps the pg branch's env-skip and per-test table name."""
+    if ef is None:
+        ef = MockEF(dim)
     if backend == "chroma":
         from opencrab.stores.chroma_store import ChromaStore
 
