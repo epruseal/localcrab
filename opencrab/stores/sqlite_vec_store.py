@@ -137,6 +137,19 @@ _VEC0_K_MAX = 4096
 _PACK_KNN_MAX = 32
 
 
+def _decode_metadata(raw: Any) -> dict[str, Any]:
+    """Stored metadata as a dict, whatever the column actually holds.
+
+    Both an SQL NULL and the JSON text ``null`` are reachable on rows written
+    outside this store, and the contract promises callers a dict they can
+    spread into a new one.
+    """
+    if not raw:
+        return {}
+    decoded = json.loads(raw)
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def _sign_bits(vec: list[float]) -> bytes:
     """Pack the sign bits of a float vector into bytes (binary quantization).
 
@@ -936,9 +949,11 @@ class SqliteVecStore(_SqliteConnMixin):
                     "id": row["node_id"],
                     "embedding": list(struct.unpack(f"{len(blob) // 4}f", blob)),
                     "document": row["document"],
-                    # NULL metadata is reachable for externally written rows;
-                    # get_by_id/_knn guard it the same way.
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                    # NULL metadata is reachable for externally written rows
+                    # (get_by_id/_knn guard it the same way), and so is the
+                    # literal JSON ``null``, which decodes to None rather than
+                    # a dict and would break every caller that spreads this.
+                    "metadata": _decode_metadata(row["metadata"]),
                 }
             )
         return records

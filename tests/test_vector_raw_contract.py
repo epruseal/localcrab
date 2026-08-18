@@ -592,6 +592,44 @@ class TestSqliteVecBinaryShape:
 # ---------------------------------------------------------------------------
 
 
+class TestBatchRollback:
+    """A collision partway through must leave nothing behind.
+
+    #201's compensation assumes an import either lands whole or not at all on
+    the transactional backends, so it only has to unwind chroma. Without this
+    the ``_tx()`` / ``engine.begin()`` scope could be narrowed to one record
+    at a time and nothing would notice.
+    """
+
+    @pytest.mark.parametrize("backend", ["sqlite-vec", "sqlite-vec-binary", "pg"])
+    def test_a_collision_partway_through_rolls_the_batch_back(
+        self, backend, tmp_path
+    ):
+        store = _make(backend, tmp_path)
+        try:
+            store.import_vectors(
+                [{"id": "occupied", "embedding": [0.9] * 32, "document": "held",
+                  "metadata": {}}],
+                pack_id=OTHER_PACK,
+            )
+            batch = [
+                {"id": f"roll{i}", "embedding": [(i + 1) / 10.0] * 32,
+                 "document": f"d{i}", "metadata": {}}
+                for i in range(5)
+            ]
+            batch.append({"id": "occupied", "embedding": [0.1] * 32,
+                          "document": "clash", "metadata": {}})
+
+            with pytest.raises(Exception):
+                store.import_vectors(batch, pack_id=DST_PACK)
+
+            assert store.export_pack_vectors(DST_PACK) == []
+        finally:
+            _drop_pg(backend, store)
+            if hasattr(store, "close"):
+                store.close()
+
+
 class TestPgVectorLiteral:
     def test_negative_zero_keeps_its_sign(self, tmp_path):
         """pgvector renders -0.0 as ``-0``; ``json.loads`` would read that as
@@ -821,6 +859,32 @@ class TestSqliteVecNullMetadata:
             record = store.export_pack_vectors(SRC_PACK)[0]
 
             assert record["metadata"] == {}
+        finally:
+            store.close()
+
+    def test_export_survives_a_json_null_metadata_column(self, tmp_path):
+        """Distinct from an SQL NULL: the text ``null`` decodes to ``None``,
+        which is not a dict, and every caller spreads this value.
+        """
+        pytest.importorskip("sqlite_vec")
+        store = build_vector_store("sqlite-vec", tmp_path, 32)
+        try:
+            store.import_vectors(
+                [{"id": "jnull", "embedding": [0.1] * 32, "document": "d",
+                  "metadata": {}}],
+                pack_id=SRC_PACK,
+            )
+            with store._tx() as conn:
+                conn.execute(
+                    f"UPDATE {store._table} SET metadata = 'null'"
+                    " WHERE node_id = ?",
+                    ("jnull",),
+                )
+
+            record = store.export_pack_vectors(SRC_PACK)[0]
+
+            assert record["metadata"] == {}
+            assert {**record["metadata"], "pack_id": DST_PACK}
         finally:
             store.close()
 
