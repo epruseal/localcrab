@@ -1005,6 +1005,11 @@ class TestIndependentlyInitialisedTarget:
         assert stats["target"] == stats["source"] == 1, "the count must match, or this proves nothing"
         assert stats["missing_keys"] == 1
         assert rev._row_preservation_mismatches(result) == ["users"]
+        # The summary and the exit code must not disagree: judging the table by
+        # count alone renders it green while the run exits 5, pointing the
+        # operator at numbers that do not explain the failure.
+        assert "MISMATCH" in rev._sql_status(stats)
+        assert "missing_keys" in rev._sql_status(stats)
 
 
 class TestPreflightCounts:

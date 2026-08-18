@@ -851,13 +851,30 @@ def print_summary(report: dict[str, Any]) -> None:
     console.print(table)
 
 
+def _preservation_failure(t: dict[str, Any]) -> str | None:
+    """이 테이블이 보존에 실패한 사유, 성공이면 None.
+
+    요약 표와 종료 코드가 같은 함수를 보게 한다. 둘로 나뉘어 있을 때 카운트만 보는
+    쪽이 초록 OK 를 찍고 키를 보는 쪽이 5 로 끝내, 운영자가 실패 원인을 설명하지
+    못하는 카운트를 들여다보게 됐다.
+
+    absent 테이블(``source is None``)은 비교 대상이 없으므로 판정에서 뺀다.
+    """
+    if t["source"] is None:
+        return None
+    missing = t.get("missing_keys", 0)
+    if missing:
+        return f"missing_keys={missing}"
+    if t["target"] < t["source"]:
+        return f"{t['target']}/{t['source']}"
+    return None
+
+
 def _sql_status(t: dict[str, Any]) -> str:
-    """OK/MISMATCH 판정 -- absent 테이블은 비교 대상이 없으므로 판정에서 뺀다."""
     if t["source"] is None:
         return "-"
-    if t["target"] >= t["source"]:
-        return "[green]OK[/green]"
-    return f"[red]MISMATCH ({t['target']}/{t['source']})[/red]"
+    failure = _preservation_failure(t)
+    return "[green]OK[/green]" if failure is None else f"[red]MISMATCH ({failure})[/red]"
 
 
 # ---------------------------------------------------------------------------
@@ -873,17 +890,12 @@ def _row_preservation_mismatches(sql_result: dict[str, Any] | None) -> list[str]
     ``target < source`` 로만 판정한다. 그 둘은 재실행 시 ``target > source`` 가
     될 수 있으나 이 조건에 걸리지 않는다(중복 자체는 #151 범위 밖의 기존 결함).
 
-    absent 테이블(``source is None``)은 비교 대상이 없으므로 제외한다.
-
     한계: 같은 키에 내용이 다른 행은 IGNORE 되어도 키가 존재하므로 통과한다.
     """
     if not sql_result:
         return []
     return [
-        name
-        for name, t in sql_result["tables"].items()
-        if t["source"] is not None
-        and (t["target"] < t["source"] or t.get("missing_keys", 0) > 0)
+        name for name, t in sql_result["tables"].items() if _preservation_failure(t) is not None
     ]
 
 
