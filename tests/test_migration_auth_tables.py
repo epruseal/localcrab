@@ -789,8 +789,9 @@ class TestReverseAgainstPostgres:
     def test_rerun_preserves_rows_without_recopying(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
     ) -> None:
-        """copied=0 on a second run is correct, not a partial migration -- which
-        is exactly what the old insert-count return could not distinguish."""
+        """A second run rewrites the same rows rather than skipping them: the
+        natural-key tables upsert, so the source stays authoritative instead of
+        a stale local row surviving. What must not change is the row count."""
         import logging
 
         src_db = str(tmp_path / "source.db")
@@ -807,8 +808,9 @@ class TestReverseAgainstPostgres:
 
         for table in AUTH_TABLES:
             assert first["tables"][table]["copied"] > 0, table
-            assert second["tables"][table]["copied"] == 0, table
-            assert second["tables"][table]["target"] == second["tables"][table]["source"], table
+            assert second["tables"][table]["copied"] == second["tables"][table]["source"], table
+            assert second["tables"][table]["target"] == first["tables"][table]["target"], table
+            assert second["tables"][table]["failed_rows"] == 0, table
         assert rev._row_preservation_mismatches(second) == []
 
     def test_row_failure_log_carries_no_driver_text(
@@ -1043,3 +1045,80 @@ class TestPreflightCounts:
         # distinguishable from a table that is present and empty.
         for table in AUTH_TABLES:
             assert table not in counts
+
+
+class TestStaleLocalAuthState:
+    """The reverse script migrates PostgreSQL into local mode -- the source is
+    authoritative. Leaving an existing local row alone means a credential
+    revoked in PostgreSQL keeps working locally, which `verify_token` cannot
+    tell apart from a live one (it matches on `revoked_at IS NULL` and
+    `disabled`)."""
+
+    def test_existing_rows_are_refreshed_from_the_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        # Revoke a token and disable a user in what will become the PG source.
+        with sqlite3.connect(src_db) as conn:
+            conn.execute(
+                "UPDATE api_tokens SET revoked_at = '2026-05-01 00:00:00' WHERE token_id = 't-bare'"
+            )
+            conn.execute("UPDATE users SET disabled = 1 WHERE user_id = 'u-remote'")
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        # The local database still holds the pre-revocation state.
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        _seed_auth_rows(back_db)
+        assert _dump(back_db, "api_tokens", ["token_id", "revoked_at"]) != _dump(
+            src_db, "api_tokens", ["token_id", "revoked_at"]
+        ), "the fixture must start out stale, or this proves nothing"
+
+        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+
+        # Full rows, not just the two columns that motivated this: an
+        # implementation that refreshed only revoked_at/disabled would pass a
+        # narrower assertion while leaving every other column stale.
+        for table in AUTH_TABLES:
+            cols = _cols(mt.SPEC_BY_NAME[table])
+            assert _dump(back_db, table, cols) == _dump(src_db, table, cols), table
+            assert result["tables"][table]["failed_rows"] == 0, table
+        assert rev._row_preservation_mismatches(result) == []
+
+    def test_a_failed_update_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """An upsert whose UPDATE is rejected leaves the row stale, and the key
+        is already in the target, so the key comparison cannot see it. Without
+        counting the failure this is the same silent staleness by another
+        route."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        _seed_auth_rows(back_db)
+        with sqlite3.connect(back_db) as conn:
+            conn.execute(
+                "CREATE TRIGGER block_user_update BEFORE UPDATE ON users "
+                "WHEN NEW.user_id = 'u-local' BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+            )
+
+        result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
+        stats = result["tables"]["users"]
+        assert stats["missing_keys"] == 0, "the key is present, so only failed_rows can catch this"
+        assert stats["failed_rows"] == 1
+        assert rev._row_preservation_mismatches(result) == ["users"]
+        assert "failed_rows" in rev._sql_status(stats)

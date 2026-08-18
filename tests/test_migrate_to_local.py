@@ -640,9 +640,9 @@ class TestMigrateSQL:
         assert node1["copied"] >= 1
         assert node1["target"] == node1["source"]
 
-        # 두 번째 호출: 중복이므로 INSERT OR IGNORE → rowcount=0 → copied=0
-        # 이지만, target(재조회한 실제 행 수)은 여전히 source 와 같다 -- 행이
-        # 보존됐다는 뜻이지 아무 일도 안 했다는 뜻이 아니다.
+        # 두 번째 호출: 자연 키가 있는 테이블은 업서트하므로 같은 행을 다시 쓴다
+        # (copied 는 쓴 행 수이지 새로 삽입된 행 수가 아니다). 중복되지 않는다는 것은
+        # target 이 그대로라는 사실로 확인한다.
         node2 = result2["tables"]["ontology_nodes"]
-        assert node2["copied"] == 0
-        assert node2["target"] == node2["source"]
+        assert node2["copied"] == node2["source"]
+        assert node2["target"] == node1["target"]

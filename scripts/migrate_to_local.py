@@ -700,6 +700,23 @@ def migrate_sql(
             placeholders = ", ".join(f":{c}" for c in col_names)
             bool_cols = pg_bool_cols & set(col_names)
             ts_cols = pg_ts_cols & set(col_names)
+            # 자연 키가 있으면 업서트한다. INSERT OR IGNORE 는 키가 이미 있을 때 기존 로컬
+            # 행을 남기는데, 이 스크립트는 병합이 아니라 이관이므로 소스가 정본이다.
+            # 남겨 두면 PG 에서 폐기한 토큰의 로컬 행이 revoked_at NULL 로 살아남아
+            # verify_token() 이 계속 통과시킨다(opencrab/auth.py 의 revoked_at IS NULL
+            # AND disabled 조건). 정방향도 같은 이유로 업서트한다.
+            # 자연 키가 없는 impact_records/lever_simulations 는 갱신할 대상을 지목할 수
+            # 없으므로 OR IGNORE 를 유지한다 -- 재실행 중복을 막는 유일한 수단이다.
+            if spec.conflict_key:
+                updates = ", ".join(
+                    f"{c} = excluded.{c}" for c in col_names if c not in spec.conflict_key
+                )
+                insert_sql = (
+                    f"INSERT INTO {tbl} ({cols_sql}) VALUES ({placeholders}) "
+                    f"ON CONFLICT ({', '.join(spec.conflict_key)}) DO UPDATE SET {updates}"
+                )
+            else:
+                insert_sql = f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"
 
             with pg_engine.connect() as pg_conn:
                 source_row = pg_conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
@@ -707,6 +724,7 @@ def migrate_sql(
                 rows = pg_conn.execute(text(f"SELECT {cols_sql} FROM {tbl}")).fetchall()  # noqa: S608
 
             count = 0
+            failed_rows = 0
             source_keys: set[tuple] = set()
             with sq_engine.begin() as sq_conn:
                 for row in rows:
@@ -725,28 +743,25 @@ def migrate_sql(
                     if spec.conflict_key:
                         source_keys.add(tuple(row_dict[c] for c in spec.conflict_key))
                     try:
-                        result = sq_conn.execute(
-                            text(f"INSERT OR IGNORE INTO {tbl} ({cols_sql}) VALUES ({placeholders})"),  # noqa: S608
-                            row_dict,
-                        )
-                        count += result.rowcount  # 실제 삽입된 행 수(0 또는 1)만 증가
+                        result = sq_conn.execute(text(insert_sql), row_dict)  # noqa: S608
+                        # 업서트는 갱신에도 rowcount 1 을 준다 -- 쓴 행 수이지 새로 삽입된
+                        # 행 수가 아니다. 재실행하면 source 와 같아지는 것이 정상이다.
+                        count += result.rowcount
                     except Exception as row_exc:
-                        log.warning("행 삽입 실패: %s", mt.safe_error_text(row_exc, table=tbl, key=key))
+                        # SQLite 는 문장 실패로 트랜잭션을 중단시키지 않으므로 계속 진행한다.
+                        failed_rows += 1
+                        log.warning("행 쓰기 실패: %s", mt.safe_error_text(row_exc, table=tbl, key=key))
                     progress.update(task, completed=count)
 
             with sq_engine.connect() as sq_conn:
                 target_row = sq_conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).fetchone()  # noqa: S608
                 target_count = int(target_row[0]) if target_row else 0
 
-                # INSERT OR IGNORE drops a row for ANY constraint, not just the
-                # conflict key -- a source user with is_local=1 is discarded
-                # when the local database already holds a different one, and
-                # nothing is raised. The counts then match and the copy looks
-                # preserved while the source identity is gone, so presence is
-                # judged by key. Tuples, not a joined string: ('a,b','c') and
-                # ('a','b,c') would collide. Every conflict_key column is
-                # VARCHAR on PostgreSQL and TEXT on SQLite, so both sides come
-                # back as str and need no coercion.
+                # 행 수로는 보존을 판정할 수 없다. 타깃이 자기 행을 하나 갖고 있으면
+                # 소스 행이 거부돼도 총계가 같아 통과한다. 키로 판정한다.
+                # 문자열 join 이 아니라 튜플인 이유: ('a,b','c') 와 ('a','b,c') 가
+                # 충돌한다. conflict_key 컬럼은 PG VARCHAR / SQLite TEXT 라 양쪽 다
+                # str 로 돌아와 강제 변환이 필요 없다.
                 missing_sample: list[Any] = []
                 if spec.conflict_key:
                     key_cols = ", ".join(spec.conflict_key)
@@ -761,18 +776,19 @@ def migrate_sql(
                 "source": source_count,
                 "target": target_count,
                 "missing_keys": len(missing_sample),
+                "failed_rows": failed_rows,
             }
             console.print(
                 f"  [green]{tbl}[/green]: {count:,}행 복사 "
                 f"(source={source_count:,}, target={target_count:,})"
             )
             if missing_sample:
-                # IGNORE raises nothing, so which constraint rejected the row is
-                # not knowable here -- only which keys never arrived.
                 console.print(
                     f"  [red]{tbl}: 소스 행 {len(missing_sample):,}건이 타깃에 없다[/red] "
                     f"(예: {missing_sample[:3]})"
                 )
+            if failed_rows:
+                console.print(f"  [red]{tbl}: 행 쓰기 실패 {failed_rows:,}건[/red]")
 
     return {"tables": table_results}
 
@@ -865,6 +881,11 @@ def _preservation_failure(t: dict[str, Any]) -> str | None:
     missing = t.get("missing_keys", 0)
     if missing:
         return f"missing_keys={missing}"
+    failed = t.get("failed_rows", 0)
+    if failed:
+        # 갱신 실패는 키가 이미 타깃에 있으므로 missing_keys 로 안 걸린다. 그런데 행은
+        # 갱신되지 않은 채 남으므로, 이것을 세지 않으면 stale 인증 상태가 조용히 통과한다.
+        return f"failed_rows={failed}"
     if t["target"] < t["source"]:
         return f"{t['target']}/{t['source']}"
     return None
@@ -890,7 +911,9 @@ def _row_preservation_mismatches(sql_result: dict[str, Any] | None) -> list[str]
     ``target < source`` 로만 판정한다. 그 둘은 재실행 시 ``target > source`` 가
     될 수 있으나 이 조건에 걸리지 않는다(중복 자체는 #151 범위 밖의 기존 결함).
 
-    한계: 같은 키에 내용이 다른 행은 IGNORE 되어도 키가 존재하므로 통과한다.
+    자연 키 테이블은 업서트하므로 같은 키의 내용 불일치는 남지 않는다. 업서트가 다른 제약
+    으로 실패한 경우는 ``failed_rows`` 가 잡는다. 자연 키가 없는 두 테이블은 여전히
+    ``INSERT OR IGNORE`` 이므로 같은 키의 내용 불일치가 통과한다.
     """
     if not sql_result:
         return []
