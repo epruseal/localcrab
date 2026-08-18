@@ -1380,12 +1380,20 @@ class TestTargetOnlyCredentials:
                 "CREATE TRIGGER swallow BEFORE INSERT ON users "
                 "WHEN NEW.user_id = 'u-remote' BEGIN SELECT RAISE(IGNORE); END"
             )
+            # One row the source does not have, so the final count matches even
+            # though a source row went missing -- otherwise the row-count check
+            # would notice and the key comparison would not be the only witness.
+            conn.execute(
+                "INSERT INTO users (user_id, display_name, is_local, disabled, created_at) "
+                "VALUES ('u-stranger', 'Stranger', 0, 0, '2026-01-01 00:00:00')"
+            )
 
         result = rev.migrate_sql(
             pg_schema_dsn, back_db, logging.getLogger(__name__), allow_target_only_auth=True
         )
         stats = result["tables"]["users"]
-        assert stats["failed_rows"] == 0, "nothing raised, so only the key gap can show this"
+        assert stats["failed_rows"] == 0, "nothing raised, so a write failure cannot show this"
+        assert stats["target"] >= stats["source"], "counts match, so they cannot show it either"
         assert stats["missing_keys"] == 1
         assert "users" in rev._row_preservation_mismatches(result)
 
