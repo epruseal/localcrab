@@ -732,32 +732,41 @@ def migrate_sql(
 
     table_results: dict[str, dict[str, Any]] = {}
 
+    # 스키마 검증은 첫 쓰기 이전에 전 테이블에 대해 한 번에 끝낸다. 테이블마다 검증하고
+    # 바로 복사하면, 뒤쪽 테이블의 구스키마(예: owner_id 없는 packs)가 users 와
+    # api_tokens 를 이미 커밋한 뒤에야 걸려 인증 데이터가 반쯤 갱신된 채로 남는다.
+    # 정방향이 이미 같은 이유로 전수 사전검증을 한다.
+    resolved: dict[str, tuple[list[str], set[str], set[str]]] = {}
+    present: list[mt.SqlTableSpec] = []
+    for spec in mt.SQL_TABLE_SPECS:
+        if not inspect(pg_engine).has_table(spec.name):
+            continue
+        pg_columns, pg_bool_cols, pg_ts_cols = mt.pg_typed_columns(pg_engine, spec.name)
+        sq_raw = sq_engine.raw_connection()
+        try:
+            sqlite_cols = mt.sqlite_columns(sq_raw, spec.name)
+        finally:
+            sq_raw.close()
+        cols = mt.resolve_columns(spec, pg_columns, sqlite_cols)
+        resolved[spec.name] = (cols, pg_bool_cols & set(cols), pg_ts_cols & set(cols))
+        present.append(spec)
+
     with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                   TextColumn("{task.completed} rows"), console=console) as progress:
         for spec in mt.SQL_TABLE_SPECS:
             tbl = spec.name
             task = progress.add_task(f"  {tbl}", total=None)
 
-            if not inspect(pg_engine).has_table(tbl):
+            if spec not in present:
                 log.warning("소스 테이블 '%s' 없음, 스킵 (absent)", tbl)
                 console.print(f"  [yellow]{tbl}[/yellow]: 소스에 없음 (absent)")
                 table_results[tbl] = {"copied": 0, "source": None, "target": None}
                 continue
 
-            # 컬럼 목록은 테이블당 1회만 파생해 이 뒤의 SELECT/INSERT 양쪽에 그대로
-            # 쓴다(#151 3절) -- 사전검증과 복사가 서로 다른 목록을 볼 여지를 없앤다.
-            pg_columns, pg_bool_cols, pg_ts_cols = mt.pg_typed_columns(pg_engine, tbl)
-            sq_raw = sq_engine.raw_connection()
-            try:
-                sqlite_cols = mt.sqlite_columns(sq_raw, tbl)
-            finally:
-                sq_raw.close()
-            col_names = mt.resolve_columns(spec, pg_columns, sqlite_cols)
+            col_names, bool_cols, ts_cols = resolved[tbl]
 
             cols_sql = ", ".join(col_names)
             placeholders = ", ".join(f":{c}" for c in col_names)
-            bool_cols = pg_bool_cols & set(col_names)
-            ts_cols = pg_ts_cols & set(col_names)
             # 자연 키가 있으면 업서트한다. INSERT OR IGNORE 는 키가 이미 있을 때 기존 로컬
             # 행을 남기는데, 이 스크립트는 병합이 아니라 이관이므로 소스가 정본이다.
             # 남겨 두면 PG 에서 폐기한 토큰의 로컬 행이 revoked_at NULL 로 살아남아

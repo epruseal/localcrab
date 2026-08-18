@@ -1520,6 +1520,45 @@ class TestTargetOnlyCredentials:
         finally:
             engine.dispose()
 
+    def test_reverse_validates_every_schema_before_writing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """A stale schema in a later table used to be found only after the
+        earlier ones had each been committed, leaving authentication data half
+        updated behind a non-zero exit. `packs` is last of the three, so an
+        outdated `packs` must stop the run before `users` is touched."""
+        import logging
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        back_db = str(tmp_path / "back.db")
+        _sqlite_source(back_db)
+        with sqlite3.connect(back_db) as conn:
+            # description, not owner_id: SQLStore's own CREATE INDEX on owner_id
+            # would fail first and the run would never reach column validation.
+            conn.execute("DROP TABLE packs")
+            conn.execute(
+                "CREATE TABLE packs (pack_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, "
+                "visibility TEXT NOT NULL, title TEXT, forked_from TEXT, "
+                "created_at TEXT, updated_at TEXT)"
+            )
+
+        with pytest.raises(mt.MigrationError) as excinfo:
+            rev.migrate_sql(
+                pg_schema_dsn, back_db, logging.getLogger(__name__),
+                allow_target_only_auth=True,
+            )
+        assert "description" in str(excinfo.value)
+        with sqlite3.connect(back_db) as conn:
+            assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0, (
+                "users must not have been committed before the packs schema was checked"
+            )
+
     def test_reverse_flag_is_wired_through_main(self) -> None:
         """The unit tests call migrate_sql directly, so a missing argparse
         wiring would not show up in any of them."""
