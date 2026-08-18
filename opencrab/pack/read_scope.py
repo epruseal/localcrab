@@ -103,14 +103,20 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     one condition, the one the issue names: a ``pack_id`` exists on graph
     data but has no ``packs`` row, so read scoping will drop it while the
     operator has no way to see that from the outside. Re-running
-    ``scripts/migrate_pack_ownership.py --apply`` genuinely fixes this on
-    every backend: its registry stage enumerates the graph's packs and
-    registers what it finds, so re-running it clears the condition. That is
-    what makes the refusal message actionable rather than a dead end.
-    (The script enumerates via ``list_packs``, so on Neo4j it shares that
-    method's label restriction -- see below. An imported pack this guard now
-    reports may therefore need the manual registration the deployment
-    checklist describes rather than a bare re-run.)
+    ``scripts/migrate_pack_ownership.py --apply`` clears this in the
+    ordinary case: its registry stage enumerates the graph's packs and
+    registers what it finds. That is what keeps the refusal message
+    actionable rather than a dead end.
+
+    ONE EXCEPTION, stated here rather than left for the operator to
+    discover: the script still enumerates via ``list_packs``, which on
+    Neo4j matches only the ``OpenCrabNode`` label. This guard uses
+    ``list_pack_ids`` and so also sees packs imported under their own
+    domain labels -- which is the point -- but the script will not register
+    those, so re-running it does NOT clear such a case. Those need the
+    manual registration the deployment checklist describes. Bringing the
+    script onto ``list_pack_ids`` would close the gap and is a follow-up,
+    not something this guard can do for itself.
 
     WHAT THIS DOES NOT DO, and why not (two earlier designs tried and both
     were wrong):

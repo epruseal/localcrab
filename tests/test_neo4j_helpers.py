@@ -523,11 +523,22 @@ class TestScopedRelationLookup:
 
     def test_list_pack_ids_enumerates_edges_too(self) -> None:
         """An edge may carry a pack_id no node has; the startup guard has to
-        see it or that pack starts unregistered and its edges vanish."""
-        store, _driver, session = _make_connected_store()
-        session.run.return_value = []
+        see it or that pack starts unregistered and its edges vanish.
 
-        store.list_pack_ids()
+        Asserts on the RESULT, not just on the query text: a mutation that
+        keeps the edge query but drops its rows would satisfy a text-only
+        check while the guard went blind to edge-only packs.
+        """
+        store, _driver, session = _make_connected_store()
+
+        def _rows(cypher, **_kw):
+            if "-[r]->" in cypher:
+                return [{"pid": "p-edge-only"}]
+            return [{"pid": "p-node"}]
+
+        session.run.side_effect = _rows
+
+        assert store.list_pack_ids() == {"p-node", "p-edge-only"}
 
         queries = [c[0][0] for c in session.run.call_args_list]
         assert any("MATCH (n)" in q and "n.pack_id" in q for q in queries)

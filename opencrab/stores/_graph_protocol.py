@@ -339,8 +339,17 @@ class GraphStore(Protocol):
 
 @runtime_checkable
 class GraphStoreExtended(Protocol):
-    """The 7 methods LocalGraphStore/PGGraphStore/KuzuGraphStore share that
-    Neo4jStore currently lacks (D3's Stage-4 R5 worklist).
+    """The 7 methods this Protocol was carved out for -- originally the ones
+    LocalGraphStore/PGGraphStore/KuzuGraphStore had and Neo4jStore did not
+    (D3's Stage-4 R5 worklist).
+
+    That gap has since been closed: ``test_graph_protocol_contract.py::
+    test_neo4j_satisfies_graph_store_extended`` asserts
+    ``isinstance(neo4j_store, GraphStoreExtended)`` and passes, so the
+    sentence above describes why this Protocol is SEPARATE from
+    ``GraphStore``, not a live difference between the backends. It stays
+    separate because the split is what lets the assertion be a real parity
+    check rather than a tautology.
 
     ``search_nodes`` (issue #86, see the GAP TABLE above) is deliberately
     NOT declared as an 8th member here, even though it fits this Protocol's

@@ -132,8 +132,11 @@ def ontology_query(
         When True (and pack_ids is empty), pick the most relevant pack from
         the local registry using deterministic keyword scoring.
     include_unpackaged:
-        When pack filtering is active, also surface items with no pack_id
-        (legacy data). Endpoint-failed edges are still suppressed.
+        IGNORED (#147). Kept as an argument so existing callers do not
+        break, but it is never honoured: data belonging to no pack is
+        outside every read scope (#143 invariant 5), so the only thing this
+        could still do is widen a scope past what the principal may read.
+        Passing True adds a warning to the response instead.
     include_pack_provenance:
         Embed ``metadata.pack_id`` and ``selected_packs``/``pack_filter`` in
         the response (default True). Set to False for the bare legacy shape.

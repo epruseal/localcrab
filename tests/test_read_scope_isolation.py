@@ -637,6 +637,36 @@ class TestScopedStorePredicates:
             for side in ("source_props", "target_props", "rel_props"):
                 assert (e.get(side) or {}).get("pack_id") != PACK_B
 
+    def test_find_by_relations_scoped_rejects_a_foreign_same_id_anchor(
+        self, graph, docs, seeded
+    ):
+        """The anchor clause, isolated.
+
+        `find_by_relations_scoped` joins and scopes THREE rows. The other
+        endpoint and the edge are covered above; this covers the anchor.
+        It needs a homonym to bite: the anchor is matched by `node_id` in
+        the WHERE, so without the join a same-id row in another pack
+        supplies its edges, and the caller's own gate cannot catch that --
+        that gate passes as soon as ANY row with the id is readable.
+        """
+        # bob's "twin" shares alice's node_id under a different node_type.
+        graph.upsert_node(
+            "Concept", "twin", {"pack_id": PACK_B, "node_id": "twin"}, space_id="concept"
+        )
+        _node(graph, docs, PACK_PUBLIC, "twin-target")
+        graph.upsert_edge("Concept", "twin", "raises", "Document", "twin-target", {})
+
+        alice_scope = sorted({PACK_A, PACK_PUBLIC})
+        # Alice has no row with this id at all, so nothing may come back --
+        # bob's twin must not supply its edges just because the far end is
+        # a public node she can read.
+        assert graph.find_by_relations_scoped("twin", ["raises"], alice_scope, "out", 20) == []
+
+        # Positive control: bob, who owns the anchor, does see it.
+        bob_scope = sorted({PACK_B, PACK_PUBLIC})
+        got = graph.find_by_relations_scoped("twin", ["raises"], bob_scope, "out", 20)
+        assert [r["properties"]["node_id"] for r in got] == ["twin-target"]
+
     def test_edge_spanning_two_readable_packs_is_returned(self, graph, docs, seeded):
         """A cross-pack edge inside one scope must survive.
 
