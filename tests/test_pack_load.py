@@ -441,7 +441,7 @@ class TestLoadEdges:
         # 같은 (from, relation, to) 는 upsert 로 덮이므로 **순차로** 확인한다.
         seen = []
         for f, raw in ((lower, "cites"), (upper, "CITES")):
-            ok, skip, err = pack_load.load_edges("p", f, builder, id_map)
+            ok, skip, err = pack_load.load_edges("pack-1", f, builder, id_map)
             assert (ok, skip, err) == (1, 0, 0), f"{raw}: ok={ok} skip={skip} err={err}"
             rel, props = graph._conn.execute(
                 "SELECT relation, properties FROM graph_edges WHERE from_id = ?",
@@ -1471,14 +1471,22 @@ class TestIncrementalFinalizeActuallyDeletes:
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
         id_map: dict = {}
         pack_load.load_nodes("pack-1", nf, builder, id_map)
-        pack_load.load_nodes("다른팩", nf, builder, id_map)
         ef = _write_jsonl(tmp_path / "e.jsonl",
                           [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
         pack_load.load_edges("pack-1", ef, builder, id_map)
 
         state = self._live(graph, docs)                 # ① pack-1 상태 포착
         assert state["edges"], "전제: 포착 시점에 pack-1 이 그 엣지를 갖는다"
-        pack_load.load_edges("다른팩", ef, builder, id_map)   # ② 다른 팩이 같은 triple 을 가져간다
+        # ② 다른 팩이 같은 triple 을 가져간다.
+        # 이 인수는 #148 이후 **로더로는 만들 수 없다** — 엣지 끝점 규칙이 남의 팩
+        # 노드를 끝점으로 하는 엣지를 거부한다. 그래도 `graph_edges` PK 가 pack_id 를
+        # 담지 않는다는 사실은 그대로이고(마이그레이션 전 데이터, 스토어 직접 쓰기,
+        # 다른 백엔드 경로), 이 테스트가 고정하는 것은 **정리 필터**이지 로더가 그
+        # 상태를 만들어 주느냐가 아니다. 그래서 전제를 스토어에 직접 쓴다.
+        graph._conn.execute(
+            "UPDATE graph_edges SET properties = json_set(properties, '$.pack_id', ?)",
+            ("다른팩",))
+        graph._conn.commit()
         owner = json.loads(graph._conn.execute(
             "SELECT properties FROM graph_edges").fetchone()[0]).get("pack_id")
         assert owner == "다른팩", f"전제: 소유가 넘어가야 한다 (현재 {owner})"

@@ -23,6 +23,8 @@ from opencrab.pack.write_gate import (
     EDGE_STAMPED,
     NODE_STAMPED,
     authorize,
+    edge_identity_conflict,
+    endpoint_pack_conflict,
     identity_reject_message,
     node_identity_conflict,
     stamp,
@@ -305,6 +307,23 @@ class OntologyBuilder:
             "receipt_ts": receipt_ts,
             "stores": {},
         }
+
+        # #148: an edge may not straddle packs. export_edges_scoped needs
+        # BOTH endpoints in scope, so a cross-pack edge is a row its own pack's
+        # readers can never see -- refuse it instead of writing it. Unattributed
+        # endpoints pass (legacy data predates pack attribution).
+        for endpoint_id in (from_id, to_id):
+            reason = endpoint_pack_conflict(self._neo4j, endpoint_id, pack_id)
+            if reason:
+                raise ValueError(identity_reject_message("edge", endpoint_id, reason))
+
+        # The edge's own slot, keyed by the backend's upsert conflict key.
+        reason = edge_identity_conflict(
+            self._neo4j, from_type=from_space, from_id=from_id, relation=relation,
+            to_type=to_space, to_id=to_id, pack_id=pack_id,
+        )
+        if reason:
+            raise ValueError(identity_reject_message("edge", from_id, reason))
 
         # See add_node: graph down means the whole write is refused, not
         # fanned out to the optional stores (#146 follow-up).

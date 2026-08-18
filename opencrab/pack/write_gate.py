@@ -360,3 +360,32 @@ def identity_reject_message(kind: str, ident: str, reason: str) -> str:
     if kind == "source":
         return f"{ident}: source identity is already attributed to a different pack"
     return f"{ident}: identity is already attributed to a different pack"
+
+
+def endpoint_pack_conflict(graph: Any, node_id: str, pack_id: str) -> str | None:
+    """Is this edge endpoint attributed to a pack other than ``pack_id``?
+
+    An edge whose endpoints straddle two packs is invisible to its own pack's
+    readers: ``export_edges_scoped`` requires BOTH endpoints to be in scope, so
+    the row exists and never appears. Rather than write that, refuse it.
+
+    Unattributed endpoints pass. Legacy nodes carry no pack_id and the seed
+    scripts still create them; a rule that rejected those would refuse edges
+    over data this repo has not finished migrating (the ``default`` pack in
+    scripts/migrate_pack_ownership.py exists precisely because such rows are
+    still around).
+    """
+    if graph is None or not getattr(graph, "available", False):
+        return None
+    method = getattr(graph, "get_nodes_by_id", None)
+    if method is None:
+        return CONFLICT_UNVERIFIABLE
+    try:
+        rows = method(node_id)
+    except Exception:  # noqa: BLE001
+        return CONFLICT_UNVERIFIABLE
+    try:
+        verdict = classify_by_id_rows(rows, pack_id)
+    except TypeError:
+        return CONFLICT_UNVERIFIABLE
+    return CONFLICT_FOREIGN if verdict == "foreign" else None

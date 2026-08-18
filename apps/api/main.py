@@ -26,6 +26,7 @@ from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
 from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+from opencrab.pack.write_gate import reject_boundary_identity
 from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 from opencrab.stores.factory import (
     make_doc_store,
@@ -535,6 +536,17 @@ def ingest_text(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"metadata": payload.metadata})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     from opencrab.auth import principal_scope
     from opencrab.pack.ownership import resolve_write_pack
     from opencrab.pack.source_writer import write_source
@@ -702,6 +714,17 @@ def add_node(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"properties": payload.properties})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Route through the shared OntologyBuilder so HTTP and MCP writes converge:
     # deep grammar + required-field validation, receipt stamping, role-based
     # store keys and audit are all produced once. owner_id/pack_id are now
@@ -741,6 +764,17 @@ def add_edge(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"properties": payload.properties})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Shared OntologyBuilder path (see add_node). The builder resolves real node
     # types via the graph store's lookup_node_type, validates the relation, and
     # produces a receipt + role-based store keys + audit in one place.

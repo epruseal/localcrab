@@ -408,6 +408,9 @@ class _AvailableGraphStub:
     def get_nodes_by_id(self, node_id):  # noqa: ARG002
         return []
 
+    def get_edge(self, *args):  # noqa: ARG002
+        return None
+
 
     available = True
 
