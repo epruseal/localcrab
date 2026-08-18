@@ -118,18 +118,21 @@ def ontology_add_node(
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import graph_write_failed
-    from opencrab.ontology.tenant import TenantContext, stamp_properties
     from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
 
     ctx = _get_context()
     principal = current_principal()
+    # Billing identifiers only -- NOT stamps. The builder writes the ownership
+    # keys; these two just label the metering event.
     tenant_id = "default"
     subject_id = principal.user_id
     space = _clean_str(space)
     node_type = _clean_str(node_type)
     node_id = _clean_str(node_id)
-    tenant_ctx = TenantContext(tenant_id=tenant_id, subject_id=subject_id)
-    props = stamp_properties(_clean_meta(properties or {}), tenant_ctx)
+    # #148: no stamping here. The builder is the single stamper -- a second
+    # one in this handler is why the same node written over MCP carried
+    # tenant_id/created_by and the same node written over REST did not.
+    props = _clean_meta(properties or {})
     target_pack_id = resolve_write_pack(ctx["sql"], principal, _clean_str(pack_id) if pack_id else None)
     try:
         result = ctx["builder"].add_node(

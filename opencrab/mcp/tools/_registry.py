@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from opencrab.pack.write_gate import boundary_identity_violations
+
 if TYPE_CHECKING:
     from opencrab.auth import Principal
 
@@ -230,42 +232,12 @@ def tools_for_principal(principal: Principal) -> list[dict[str, Any]]:
 _FORBIDDEN_ARGS = ("tenant_id", "subject_id")
 
 # The same identities can also arrive INSIDE a payload, and rejecting only the
-# top-level arguments would leave the door beside the gate wide open:
-# `ontology_add_node(properties={"tenant_id": "other", "created_by": "victim"})`
-# reached the store because `stamp_properties` uses setdefault and keeps a
-# caller-provided value. `ontology_add_edge` does not stamp at all, so anything
-# passed straight through. `owner_id` is here too: the Mongo store mirrors
-# `properties.owner_id` to a top-level column that REST reads as ownership.
-_RESERVED_IDENTITY_KEYS = ("tenant_id", "subject_id", "created_by", "owner_id", "user_id")
-
-# Payload dicts whose contents are caller-authored and end up persisted.
-_PAYLOAD_KEYS = ("properties", "metadata")
-
-
-def _reserved_identity_violations(value: Any, path: str = "") -> list[str]:
-    """Find reserved identity keys inside any nested properties/metadata dict.
-
-    Walks the whole argument structure rather than checking the handful of
-    call sites that exist today. Those sites are six and counting -- add_node,
-    add_edge, pack_create's nodes and edges, pack_ingest's source metadata and
-    text node, harness_promotion_apply's package -- and enumerating them by
-    hand is exactly the mistake this change kept making: every hand-written
-    list of "places to guard" in this work missed at least one. A walk cannot
-    miss a site it has never heard of.
-    """
-    found: list[str] = []
-    if isinstance(value, dict):
-        for key, sub in value.items():
-            here = f"{path}.{key}" if path else str(key)
-            if key in _PAYLOAD_KEYS and isinstance(sub, dict):
-                found += [
-                    f"{here}.{k}" for k in _RESERVED_IDENTITY_KEYS if k in sub
-                ]
-            found += _reserved_identity_violations(sub, here)
-    elif isinstance(value, list):
-        for i, item in enumerate(value):
-            found += _reserved_identity_violations(item, f"{path}[{i}]")
-    return found
+# top-level arguments would leave the door beside the gate wide open. That walk
+# now lives in opencrab/pack/write_gate.py so REST enforces the SAME rule from
+# the SAME code (#148): keeping a second copy here meant a key added on one
+# side would silently diverge from the other, which is the failure mode this
+# work is supposed to remove.
+_reserved_identity_violations = boundary_identity_violations
 
 
 def _envelope(fn: Callable[..., Any]) -> Callable[..., Any]:
