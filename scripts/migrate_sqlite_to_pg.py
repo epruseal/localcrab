@@ -679,7 +679,10 @@ def main() -> int:
                 args.dry_run,
             )
     except Exception as exc:
+        # Constraint names and SQLSTATE only: a driver message can quote the
+        # row that failed, and one of those rows is a token hash.
         print(f"! migration failed: {mt.safe_error_text(exc)}")
+        print("! the driver's own message is withheld — reproduce against the source to see it")
         return 1
 
     excluded_note = f" (excluded: {unmigrated})" if unmigrated else ""

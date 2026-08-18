@@ -192,6 +192,17 @@ class TestTableSpecs:
         there fails here instead of being dropped by a migration."""
         assert mt.MIGRATED_TABLES == mt.sqlstore_owned_tables()
 
+    def test_drift_reference_is_measured_not_restated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards the guard: if `sqlstore_owned_tables` ever came from the spec
+        list, the comparison above would be true by construction and would never
+        detect anything. Emptying the spec list must not change what it reports.
+        """
+        monkeypatch.setattr(mt, "MIGRATED_TABLES", frozenset())
+        monkeypatch.setattr(mt, "SQL_TABLE_SPECS", ())
+        assert "users" in mt.sqlstore_owned_tables()
+
     def test_users_is_copied_before_its_dependents(self) -> None:
         """api_tokens.user_id and packs.owner_id reference users, and
         PostgreSQL enforces that even though SQLite does not."""
@@ -401,6 +412,36 @@ class TestSafeErrorText:
         assert SECRET_HASH[:16] not in out
         assert type(exc).__name__ in out or "_StubOrigError" in out
 
+    @pytest.mark.parametrize(
+        ("sqlstate", "column"),
+        [("23502", "user_id"), ("23503", "user_id"), ("22007", None), ("42804", "is_local")],
+    )
+    def test_other_sqlstates_emit_identifiers_only(
+        self, sqlstate: str, column: str | None
+    ) -> None:
+        """23505 alone is not enough coverage: an implementation that adds a
+        free-text diag field only for one other sqlstate would pass a
+        23505-only suite while leaking. A not-null violation is the worst case
+        -- its DETAIL is the entire failing row."""
+
+        class _Diag(_StubDiag):
+            pass
+
+        _Diag.sqlstate = sqlstate
+        _Diag.column_name = column
+        _Diag.constraint_name = None
+
+        class _OrigError(Exception):
+            diag = _Diag()
+
+        class _WrappedError(Exception):
+            orig = _OrigError()
+
+        out = mt.safe_error_text(_WrappedError(), table="api_tokens", key="t-full")
+        assert SECRET_HASH not in out
+        assert SECRET_HASH[:16] not in out
+        assert sqlstate in out
+
     def test_migration_error_passes_through(self) -> None:
         """Provenance, not content: this class's message is contractually built
         from identifiers, and swallowing it would leave the operator with a bare
@@ -410,10 +451,27 @@ class TestSafeErrorText:
 
     def test_known_constraint_gets_remedy_text(self) -> None:
         """The sanitizer can surface a constraint name but cannot invent the fix
-        for it, so the guidance is a static mapping."""
-        out = mt.safe_error_text(_StubWrapperError())
-        assert "remedy" not in out  # this constraint has none
-        assert "idx_users_single_local" in mt.CONSTRAINT_REMEDIES
+        for it, so the guidance is a static mapping. An upsert on user_id cannot
+        absorb a partial-index conflict, so this is the one failure an operator
+        cannot diagnose from the constraint name alone."""
+
+        class _Diag(_StubDiag):
+            constraint_name = "idx_users_single_local"
+
+        class _OrigError(Exception):
+            diag = _Diag()
+
+        class _WrappedError(Exception):
+            orig = _OrigError()
+
+        out = mt.safe_error_text(_WrappedError(), table="users")
+        assert mt.CONSTRAINT_REMEDIES["idx_users_single_local"] in out
+        assert SECRET_HASH not in out
+
+    def test_unknown_constraint_gets_no_remedy(self) -> None:
+        assert mt.CONSTRAINT_REMEDIES["idx_users_single_local"] not in mt.safe_error_text(
+            _StubWrapperError()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +696,44 @@ class TestForwardAgainstPostgres:
         assert "RESULT: PASS" in out
         assert "MISMATCH" not in out
         assert _pg_count(pg_schema_dsn, "ontology_nodes") == 1
+
+    def test_verify_marks_absent_tables_skip_not_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """--verify assumed every source count was an integer. Mapping absent to
+        0 instead of skipping it would still pass a run where the target is also
+        empty, so the target is given a row first: only a real skip survives it.
+        """
+        from sqlalchemy import create_engine, text
+
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db, tables=tuple(s.name for s in mt.SQL_TABLE_SPECS if s.name not in AUTH_TABLES))
+
+        engine = create_engine(pg_schema_dsn)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE users (user_id VARCHAR(64) PRIMARY KEY, "
+                "display_name VARCHAR(256) NOT NULL, is_local BOOLEAN NOT NULL DEFAULT FALSE, "
+                "disabled BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ)"
+            ))
+            conn.execute(text(
+                "INSERT INTO users (user_id, display_name) VALUES ('u-preexisting', 'Kept')"
+            ))
+        engine.dispose()
+
+        rc = _run_forward(
+            monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn, "--verify"
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "RESULT: PASS" in out
+        assert "MISMATCH" not in out
+        assert "[SKIP]" in out
+        # An absent source table over a non-empty target is not a migration
+        # failure, but it is not something to pass over in silence either.
+        assert "target already has" in out
+        assert _pg_count(pg_schema_dsn, "users") == 1
 
     def test_source_file_is_not_modified(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
