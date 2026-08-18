@@ -724,12 +724,21 @@ class _SqlGraphStoreBase(abc.ABC):
         made the startup guard refuse over rows no read can reach."""
         self._require_available()
         pid = self._dialect.json_truthy_text("properties", "pack_id")
-        rows = self._fetch_all(
-            f"SELECT DISTINCT {pid} FROM {self._table('graph_nodes')} "  # noqa: S608
-            f"WHERE {pid} IS NOT NULL",
-            {},
-        )
-        return {str(r[0]) for r in rows if r[0]}
+        out: set[str] = set()
+        # Nodes AND edges. An edge can carry a pack_id that appears on no
+        # node, and the migration's own registry enumeration unions the two
+        # for exactly that reason -- so leaving edges out here would let a
+        # deployment start with that pack unregistered, after which scoped
+        # traversal and export drop the edge because the caller's scope,
+        # derived from the registry, cannot contain its pack.
+        for table in ("graph_nodes", "graph_edges"):
+            rows = self._fetch_all(
+                f"SELECT DISTINCT {pid} FROM {self._table(table)} "  # noqa: S608
+                f"WHERE {pid} IS NOT NULL",
+                {},
+            )
+            out |= {str(r[0]) for r in rows if r[0]}
+        return out
 
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """pack_id is unified to ``str`` on BOTH backends (Stage 6b Deliverable
@@ -1091,6 +1100,78 @@ class _SqlGraphStoreBase(abc.ABC):
         props = dict(_merge_space(_as_dict(row[1]), row[2]))
         props["node_type"] = row[0]
         return props
+
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped ``find_by_relations`` (issue #147).
+
+        Constrains the ANCHOR, the OTHER endpoint and the EDGE ITSELF,
+        all before ``LIMIT``. Post-filtering the destination properties --
+        which is what the caller used to do -- is not enough on three
+        counts, each of which lets something out of scope through:
+
+        - The edge's own ``pack_id`` is never returned by
+          ``find_by_relations``, so a relationship belonging to a pack the
+          caller cannot read still contributes its ``relation_type`` (and,
+          for lever simulation, a prediction derived from it).
+        - The anchor is matched on ``node_id`` alone, so a same-id node in
+          another pack supplies its edges.
+        - Filtering after ``LIMIT`` starves in-scope rows behind
+          out-of-scope ones.
+
+        Edge rule matches ``export_edges_scoped``: both endpoints in scope,
+        and the edge's own pack_id either absent or in scope. Empty
+        ``pack_ids`` or ``relations`` returns ``[]`` without querying.
+        """
+        self._require_available()
+        if not relations or not pack_ids or limit <= 0:
+            return []
+        edges = self._table("graph_edges")
+        nodes = self._table("graph_nodes")
+        placeholders, rel_params = self._in_placeholders(relations, "rel")
+        anchor_where, transform = self._scoped_node_where("anchor.properties", "sc_packs")
+        other_where, _ = self._scoped_node_where("other.properties", "sc_packs")
+        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+        edge_membership, _ = self._dialect.in_string_array(
+            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
+        )
+        edge_cond = f"({edge_truthy} IS NULL OR ({edge_membership} AND {edge_truthy} IS NOT NULL))"
+        results: list[dict[str, Any]] = []
+
+        def leg(anchor_col: str, anchor_type: str, other_col: str, other_type: str, lim: int):
+            sql = (
+                f"SELECT other.node_type, other.node_id, e.relation FROM {edges} e"
+                f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
+                f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
+                f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
+                f" AND {anchor_where} AND {other_where} AND {edge_cond} LIMIT :lim"
+            )
+            params = {
+                "nid": node_id,
+                "lim": lim,
+                "sc_packs": transform(sorted(set(pack_ids))),
+                **rel_params,
+            }
+            for other_ntype, other_nid, relation in self._fetch_all(sql, params):
+                props = self.get_node(other_ntype, other_nid)
+                if props:
+                    results.append(
+                        {"properties": props, "labels": [other_ntype], "relation_type": relation}
+                    )
+
+        if direction in ("out", "both"):
+            leg("from_id", "from_type", "to_id", "to_type", limit)
+        if direction in ("in", "both"):
+            remaining = limit - len(results)
+            if remaining > 0:
+                leg("to_id", "to_type", "from_id", "from_type", remaining)
+        return results
 
     def find_by_relations(
         self,

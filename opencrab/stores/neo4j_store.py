@@ -485,9 +485,15 @@ class Neo4jStore:
         guard exists to refuse.
         """
         self._require_available()
-        cypher = "MATCH (n) WHERE n.pack_id IS NOT NULL RETURN DISTINCT n.pack_id AS pid"
+        # Nodes and relationships both: an edge may carry a pack_id no node
+        # has, and the migration unions the two when it builds the registry.
+        node_cypher = "MATCH (n) WHERE n.pack_id IS NOT NULL RETURN DISTINCT n.pack_id AS pid"
+        edge_cypher = "MATCH ()-[r]->() WHERE r.pack_id IS NOT NULL RETURN DISTINCT r.pack_id AS pid"
+        out: set[str] = set()
         with self._session() as session:
-            return {str(r["pid"]) for r in session.run(cypher) if r["pid"]}
+            for cypher in (node_cypher, edge_cypher):
+                out |= {str(rec["pid"]) for rec in session.run(cypher) if rec["pid"]}
+        return out
 
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """Aggregate node counts per pack_id; packs below min_nodes omitted.
@@ -521,6 +527,46 @@ class Neo4jStore:
         with self._session() as session:
             result = session.run(cypher, min_nodes=min_nodes)
             return [dict(record) for record in result]
+
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """See GraphStore.find_by_relations_scoped. Anchor, other endpoint
+        and relationship are all constrained in the Cypher WHERE, ahead of
+        LIMIT."""
+        self._require_available()
+        if not relations or not pack_ids or limit <= 0:
+            return []
+        arrow = {
+            "out": "(a {id: $id})-[r]->(b)",
+            "in": "(b)-[r]->(a {id: $id})",
+        }.get(direction, "(a {id: $id})-[r]-(b)")
+        cypher = f"""
+            MATCH {arrow}
+            WHERE type(r) IN $relations
+              AND a.pack_id IN $pack_ids
+              AND b.pack_id IN $pack_ids
+              AND (r.pack_id IS NULL OR r.pack_id IN $pack_ids)
+            RETURN properties(b) AS props, labels(b) AS labels, type(r) AS relation
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(
+                cypher, id=node_id, relations=list(relations), pack_ids=list(pack_ids)
+            )
+            return [
+                {
+                    "properties": dict(rec["props"]),
+                    "labels": list(rec["labels"]),
+                    "relation_type": rec["relation"],
+                }
+                for rec in result
+            ]
 
     def find_by_relations(
         self,

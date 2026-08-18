@@ -295,9 +295,6 @@ class ImpactEngine:
         # `labels(o)[0]` value exactly). See opencrab/stores/_graph_protocol.py.
         if self._neo4j.available:
             try:
-                from opencrab.ontology.pack_provenance import in_pack_scope
-
-                pack_set = set(pack_ids)
                 # #147: gate on the anchor first. An unreadable lever must
                 # look exactly like an absent one, and an absent one reaches
                 # the same empty lists by returning no relations.
@@ -307,10 +304,10 @@ class ImpactEngine:
 
                 # Outcome 탐색: lever → (raises|lowers|stabilizes|optimizes) → outcome
                 _lever_relations = ["raises", "lowers", "stabilizes", "optimizes"]
-                for r in self._neo4j.find_by_relations(lever_id, _lever_relations, "out", 20):
+                for r in self._neo4j.find_by_relations_scoped(
+                    lever_id, _lever_relations, pack_ids, "out", 20
+                ):
                     props = r.get("properties") or {}
-                    if not in_pack_scope({"properties": props}, pack_set):
-                        continue
                     rel = r.get("relation_type", "")
                     outcomes.append({
                         "node_id": props.get("id", "?"),
@@ -320,10 +317,10 @@ class ImpactEngine:
                     })
 
                 # Concept 탐색: lever → affects → concept
-                for r in self._neo4j.find_by_relations(lever_id, ["affects"], "out", 10):
+                for r in self._neo4j.find_by_relations_scoped(
+                    lever_id, ["affects"], pack_ids, "out", 10
+                ):
                     props = r.get("properties") or {}
-                    if not in_pack_scope({"properties": props}, pack_set):
-                        continue
                     concepts.append({
                         "node_id": props.get("id", "?"),
                         "node_type": (r.get("labels") or ["Concept"])[0],

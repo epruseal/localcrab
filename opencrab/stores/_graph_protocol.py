@@ -394,6 +394,24 @@ class GraphStoreExtended(Protocol):
         """
         ...
 
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped ``find_by_relations`` (#147).
+
+        Same shape, but the anchor, the other endpoint AND the edge itself
+        must all be in ``pack_ids``, and all three are constrained before
+        ``LIMIT``. ``find_by_relations`` never returns edge properties, so a
+        caller cannot reproduce the edge half of that rule by post-filtering
+        its results. Empty ``pack_ids`` or ``relations`` -> ``[]``.
+        """
+        ...
+
     def find_by_relations(
         self,
         node_id: str,

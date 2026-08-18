@@ -403,6 +403,40 @@ class TestNoExistenceLeak:
             absent = ontology_lever_simulate("no-such-lever", "raises", 0.5)
         assert foreign["predicted_outcome_changes"] == absent["predicted_outcome_changes"] == []
 
+    def test_lever_relation_in_a_foreign_pack_is_not_reported(
+        self, ctx, graph, docs, seeded
+    ):
+        """Both endpoints readable, but the EDGE belongs to another pack.
+
+        `find_by_relations` never returns edge properties, so post-filtering
+        its results cannot see this case at all -- the relation type, and
+        the prediction derived from it, came back from a relationship the
+        caller may not read. Closed by moving to a scoped relation lookup
+        that constrains the edge before LIMIT.
+        """
+        from opencrab.mcp.tools import ontology_lever_simulate
+
+        _node(graph, docs, PACK_A, "a-lever3")
+        _node(graph, docs, PACK_A, "a-outcome3")
+        graph.upsert_edge(
+            "Document", "a-lever3", "raises", "Document", "a-outcome3",
+            {"pack_id": PACK_B, "secret_note": "bob-only"},
+        )
+
+        with _as(ctx, seeded["alice"]):
+            got = ontology_lever_simulate("a-lever3", "raises", 0.5)
+        assert got["predicted_outcome_changes"] == []
+
+        # Positive control: the same shape with an in-scope edge IS reported,
+        # so the emptiness above is the edge's pack and not the lookup.
+        graph.upsert_edge(
+            "Document", "a-lever3", "raises", "Document", "a-outcome3",
+            {"pack_id": PACK_A},
+        )
+        with _as(ctx, seeded["alice"]):
+            ok = ontology_lever_simulate("a-lever3", "raises", 0.5)
+        assert [o["node_id"] for o in ok["predicted_outcome_changes"]] == ["a-outcome3"]
+
     def test_readable_lever_pointing_at_an_unreadable_node_hides_it(
         self, ctx, graph, docs, seeded
     ):
@@ -1166,6 +1200,22 @@ class TestStartupCheck:
         neo4j_body = inspect.getsource(Neo4jStore.list_pack_ids).split('"""', 2)[-1]
         assert "MATCH (n)" in neo4j_body
         assert "OpenCrabNode" not in neo4j_body
+
+    def test_edge_only_pack_ids_are_enumerated(self, sql, graph, seeded):
+        """An edge can carry a pack_id that appears on no node.
+
+        The migration's registry enumeration unions node and edge pack_ids,
+        so a guard that scans only nodes lets that pack go unregistered --
+        after which scoped traversal and export drop the edge, because the
+        caller's registry-derived scope cannot contain its pack.
+        """
+        graph.upsert_edge(
+            "Document", "a-secret", "relates_to", "Document", "shared-doc",
+            {"pack_id": "edge-only-pack"},
+        )
+        assert "edge-only-pack" in graph.list_pack_ids()
+        with pytest.raises(RegistryGraphMismatchError):
+            assert_registry_covers_graph(sql, graph)
 
     def test_falsy_pack_ids_are_not_reported_as_packs(self, sql, graph, seeded):
         """A row whose pack_id is `""`/`0`/`false` is unattributed to every

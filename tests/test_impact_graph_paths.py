@@ -55,6 +55,30 @@ class FakeGraphStore:
             raise RuntimeError("relation query boom")
         return self._relations.get(tuple(relations), [])
 
+    def find_by_relations_scoped(
+        self, node_id, relations, pack_ids, direction="out", limit=20
+    ):
+        """#147: what `lever_simulate` calls now.
+
+        The real implementations constrain anchor, other endpoint AND the
+        edge itself in the query, before LIMIT -- the edge half in
+        particular cannot be reproduced by a caller, because
+        `find_by_relations` never returns edge properties. This double
+        applies the endpoint half to its canned rows so that a fixture with
+        out-of-scope rows still exercises the scoped path; the edge half is
+        the store's own and is covered by the store tests.
+        """
+        if self._raise_on_find_by_relations:
+            raise RuntimeError("relation query boom")
+        if not pack_ids or not relations:
+            return []
+        allowed = set(pack_ids)
+        return [
+            r
+            for r in self._relations.get(tuple(relations), [])
+            if (r.get("properties") or {}).get("pack_id") in allowed
+        ][:limit]
+
 
 class FakeSQLStore:
     def __init__(self, available=True, raise_on_save_impact=False, raise_on_save_simulation=False):
