@@ -35,6 +35,7 @@ class _Graph:
 
     def __init__(self):
         self.nodes: dict[tuple[str, str], dict] = {}
+        self.edges: list[dict] = []
 
     def get_node(self, node_type, node_id):
         return self.nodes.get((node_type, node_id))
@@ -55,8 +56,12 @@ class _Graph:
                 return t
         return None
 
-    def upsert_edge(self, *a, **kw):  # noqa: ARG002
-        return {}
+    def upsert_edge(self, from_type, from_id, relation, to_type, to_id, properties):  # noqa: ARG002
+        # Records the properties it is handed. A double that discarded them
+        # made the stamping assertion below vacuous -- removing edge stamping
+        # from the builder killed nothing.
+        self.edges.append(dict(properties))
+        return True
 
 
 class _Docs:
@@ -187,8 +192,12 @@ def test_a_matching_client_value_passes(builder):
 
 
 def test_edge_is_stamped_with_its_pack(builder):
+    """The edge's own pack_id is a read-scoping predicate, not decoration --
+    `export_edges_scoped` reads it. Losing the stamp silently narrows scoping
+    to the endpoint checks alone."""
     _add(builder, node_id="a")
     _add(builder, node_id="b")
     with principal_scope(ALICE):
         out = builder.add_edge("resource", "a", "cites", "resource", "b", pack_id="pack-a")
-    assert out["stores"]["graph"] != "unavailable"
+    assert out["stores"]["graph"] == "ok"
+    assert builder._neo4j.edges[-1]["pack_id"] == "pack-a"
