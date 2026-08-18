@@ -650,8 +650,15 @@ def _target_only_auth(pg_engine: Any, sqlite_path: str) -> dict[str, list[str]]:
         local_user, local_tokens = mt.local_identity(conn)
         exempt = {"users": {local_user} if local_user else set(), "api_tokens": local_tokens}
         insp = inspect(pg_engine)
+        target_tables = {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
         found: dict[str, list[str]] = {}
         for table in mt.AUTH_CREDENTIAL_TABLES:
+            # 타깃에 아직 없는 테이블은 아무것도 담을 수 없다. 가드가 SQLStore 의
+            # ensure-schema 보다 먼저 돌 수 있으므로 존재를 가정하지 않는다.
+            if table not in target_tables:
+                continue
             key = mt.SPEC_BY_NAME[table].conflict_key
             assert key is not None
             col = ", ".join(key)
@@ -1012,6 +1019,15 @@ def _run(args: argparse.Namespace) -> int:
         if excluded_auth_tables:
             console.print(f"[yellow]--allow-unmigrated: 제외된 테이블 {excluded_auth_tables}[/yellow]")
         return 0
+
+    # 자격증명 가드는 어떤 스토어보다 먼저 돈다. Step 2~4 가 그래프·문서·벡터를 먼저
+    # 쓰므로, migrate_sql 안에서만 중단하면 이미 세 스토어를 고친 뒤의 종료 코드가 된다.
+    if not args.skip_sql and not args.allow_target_only_auth:
+        sqlite_path = os.path.join(local_data_dir, "opencrab.db")
+        if os.path.exists(sqlite_path):
+            target_only = _target_only_auth(preflight_result["pg_engine"], sqlite_path)
+            if target_only:
+                raise mt.TargetOnlyAuthError(mt.target_only_report(target_only))
 
     # Step 1 — 백업
     with file_lock("write.lock", local_data_dir):

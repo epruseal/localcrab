@@ -1175,9 +1175,51 @@ class TestTargetOnlyCredentials:
         out = capsys.readouterr().out
         assert rc == 2, "same class as the #144 guard: refused before doing any work"
         assert "u-stranger" in out
-        # Refused before the copy, so no source row reached the target.
-        assert _pg_count(pg_schema_dsn, "users") == 1
-        assert _pg_count(pg_schema_dsn, "api_tokens") == 0
+        # Refused before anything ran, so the target still holds only its own
+        # row and the tables the migration would have created do not exist.
+        assert _pg_rows(pg_schema_dsn, "users", ["user_id"]) == {("u-stranger",)}
+        from sqlalchemy import create_engine, inspect
+
+        engine = create_engine(pg_schema_dsn)
+        try:
+            assert not inspect(engine).has_table("api_tokens")
+        finally:
+            engine.dispose()
+
+    def test_forward_refuses_before_any_store_is_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """With the default --only the graph and doc stores are copied first, so
+        a refusal raised inside migrate_sql would arrive after two target stores
+        had already been modified -- and nothing backs the target up here."""
+        from sqlalchemy import create_engine, inspect
+
+        db = str(tmp_path / "opencrab.db")
+        _sqlite_source(db)
+        _seed_auth_rows(db)
+        graph_db = str(tmp_path / "graph.db")
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(db_path=graph_db)
+        graph.upsert_node("Person", "n1", {"name": "x"})
+        graph.close()
+        self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+
+        rc = _run_forward(
+            monkeypatch,
+            "--sql-db", db,
+            "--graph-db", graph_db,
+            "--only", "graph,sql",
+            "--pg-url", pg_schema_dsn,
+        )
+        assert rc == 2
+        engine = create_engine(pg_schema_dsn)
+        try:
+            assert not inspect(engine).has_table("graph_nodes"), (
+                "the graph store must not have been written before the refusal"
+            )
+        finally:
+            engine.dispose()
 
     def test_forward_flag_allows_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str

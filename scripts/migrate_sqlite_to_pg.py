@@ -351,6 +351,47 @@ def _missing_source_keys(
     return src_keys - dst_keys
 
 
+def check_target_only_auth(engine: Any, sql_db_path: str) -> None:
+    """Refuse a target holding credentials the source does not, before any write.
+
+    Called from ``main()`` ahead of every per-store migration, not just from
+    ``migrate_sql``: with the default ``--only`` the graph and doc stores are
+    copied first, so a refusal raised inside ``migrate_sql`` would arrive after
+    two target stores had already been modified -- and unlike the reverse
+    direction, nothing here backs the target up.
+
+    A target table that does not exist yet cannot hold anything, so its absence
+    is simply not a finding.
+    """
+    from sqlalchemy import inspect, text
+
+    if not os.path.exists(sql_db_path):
+        return
+    insp = inspect(engine)
+    src = _sqlite_conn(sql_db_path)
+    try:
+        source_tables = _sqlite_table_names(sql_db_path)
+        found: dict[str, list[str]] = {}
+        for table in mt.AUTH_CREDENTIAL_TABLES:
+            if not insp.has_table(table):
+                continue
+            spec = mt.SPEC_BY_NAME[table]
+            assert spec.conflict_key is not None
+            col = ", ".join(spec.conflict_key)
+            src_keys: set[tuple] = set()
+            if table in source_tables:
+                src_keys = {tuple(r) for r in src.execute(f"SELECT {col} FROM {table}")}
+            with engine.begin() as conn:
+                dst_keys = {tuple(r) for r in conn.execute(text(f"SELECT {col} FROM {table}"))}
+            extra = dst_keys - src_keys
+            if extra:
+                found[table] = [",".join(str(v) for v in k) for k in extra]
+    finally:
+        src.close()
+    if found:
+        raise mt.TargetOnlyAuthError(mt.target_only_report(found))
+
+
 def _target_only_auth(engine: Any, text: Any, src: Any, source_tables: set[str]) -> dict[str, list[str]]:
     """Credential keys the PostgreSQL target has that the source does not.
 
@@ -735,6 +776,18 @@ def main() -> int:
     from sqlalchemy import create_engine
 
     engine = create_engine(pg_url, pool_pre_ping=True, hide_parameters=True) if not args.dry_run else None
+
+    if engine is not None and "sql" in only and not args.allow_target_only_auth:
+        try:
+            check_target_only_auth(engine, sql_db)
+        except mt.TargetOnlyAuthError as exc:
+            print(f"! {mt.safe_error_text(exc)}")
+            return 2
+        except Exception:
+            # Anything else here (an unreachable target, most likely) is left to
+            # the migration below, which reports it through the same sanitised
+            # path instead of two competing error messages.
+            pass
 
     source_counts: dict[str, dict[str, int | None]] = {}
     try:
