@@ -135,12 +135,12 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     init`` -- tracked as a follow-up, and #148 removes the ongoing source
     of pack-less rows anyway.
 
-    Everything else is a WARNING line, below. The counts in it come from
-    the two queries this function already runs, they are approximate
-    across backends (each ``list_packs`` implementation disagrees about
-    whether a falsy pack_id counts as attributed, and Neo4j's
-    ``count_nodes`` spans labels ``list_packs`` does not), and the log
-    text says so. They are not a refusal basis.
+    Everything else is a WARNING line, below: an empty registry alongside a
+    graph store in use. It carries no counts -- the per-backend
+    ``list_packs`` implementations disagree about whether a falsy pack_id
+    counts as attributed, so any number printed here would be a different
+    quantity depending on the store, and a number nobody can compare is
+    worse than none.
 
     Known imprecision, recorded rather than papered over: the graph side of
     the comparison comes from ``list_packs``, which stringifies whatever the
@@ -159,8 +159,7 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     cannot be enumerated, so the check cannot run. Skipping does not widen
     anyone's read scope -- that stays the registry-derived set either way.
 
-    Cost: one full-scan ``GROUP BY`` over the node table plus one count,
-    once per process (or per one-shot CLI command), not per request. It is
+    Cost: one full-scan ``GROUP BY`` over the node table, once per process (or per one-shot CLI command), not per request. It is
     not cheap: the same store measured a JSON-expression scan at ~439ms
     over 250k rows.
     """
@@ -199,7 +198,7 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
             "Pack registry is empty while the graph store is in use. If this "
             "deployment has existing data, it has not been attributed yet and "
             "will be invisible to every user -- run "
-            "'python scripts/migrate_pack_ownership.py --apply'. Counts here are "
-            "approximate and backend-dependent, and are NOT what this check "
-            "refuses on."
+            "'python scripts/migrate_pack_ownership.py --apply'. This is a "
+            "warning, not the condition this check refuses on -- see its "
+            "docstring for why that state cannot be safely refused."
         )

@@ -898,6 +898,13 @@ class HybridQuery:
                     )
                 )
             return results
+        except (MemoryError, RecursionError):
+            # #147 §3.4(c): a scope-sized blow-up must not be absorbed as
+            # "no results". The vector leg receives the caller's whole
+            # readable scope now, so an oversized query fails loudly rather
+            # than looking like an empty corpus. Two doc-store docstrings
+            # cite this leg as having the swallow closed; it is closed here.
+            raise
         except Exception as exc:
             logger.warning("Vector search error: %s", exc)
             return []

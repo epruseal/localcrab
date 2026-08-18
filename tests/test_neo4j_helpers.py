@@ -411,3 +411,63 @@ def test_build_neighbors_cypher_has_no_pack_clause_for_an_empty_scope() -> None:
     assert "pack_id" not in cypher
     assert "pack_ids" not in params
 
+
+class TestScopedReadPredicates:
+    """#147: the three scoped read methods, whose Cypher no other test runs.
+
+    On a docker (Neo4j) deployment these are the ONLY authorization point
+    behind `ontology_list_nodes`, `ontology_list_edges`, `ontology_get_node`,
+    `GET /api/nodes` and `GET /api/edges` -- the handlers pass their results
+    into the response without re-filtering. `tests/test_pack_neo4j_export.py`
+    uses a fake store, so it never executes these bodies either. Mock-session
+    assertions are weaker than a live query (they cannot show the Cypher is
+    semantically right) but they do pin that the pack clause is applied and
+    the parameter bound, which is what silent removal looks like.
+    """
+
+    def test_export_nodes_scoped_filters_on_pack_id(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.export_nodes_scoped(["p1", "p2"], limit=10)
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1", "p2"]
+
+    def test_export_edges_scoped_requires_both_endpoints_and_the_edge(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.export_edges_scoped(["p1"], limit=10)
+
+        cypher = session.run.call_args[0][0]
+        # Both endpoints AND the edge's own pack: an edge row carries both
+        # endpoints' full properties, so one unreadable endpoint discloses
+        # that node. OR-any-endpoint is the pack-export rule, not this one.
+        assert "a.pack_id IN $pack_ids" in cypher
+        assert "b.pack_id IN $pack_ids" in cypher
+        assert "r.pack_id IS NULL OR r.pack_id IN $pack_ids" in cypher
+
+    def test_get_node_by_id_scoped_filters_on_pack_id(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value.single.return_value = None
+
+        store.get_node_by_id_scoped("n1", ["p1"])
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+
+    def test_empty_scope_never_reaches_the_session(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.reset_mock()
+
+        assert store.export_nodes_scoped([], limit=10) == []
+        assert store.export_edges_scoped([], limit=10) == []
+        assert store.count_exported_nodes_scoped([]) == 0
+        assert store.get_node_by_id_scoped("n1", []) is None
+        session.run.assert_not_called()
+

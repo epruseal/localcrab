@@ -129,3 +129,49 @@ def test_normalise_edge_lenient_preset_matches_bare_defaults():
         "target_labels": [],
     }
     assert _normalise_edge(erow, preset="lenient") == _normalise_edge(erow)
+
+
+def test_requested_pack_outside_the_scope_exports_nothing(tmp_path) -> None:
+    """#147: the `narrow()` intersection inside the exporter.
+
+    Deleting it let `--pack-id <someone else's pack>` export that pack's
+    nodes and edges: the scoped store methods trust the list they are given,
+    so this intersection is the only thing between the caller's request and
+    the data. The pre-existing wiring test asserts `scope=frozenset()` is
+    passed through, which cannot catch this -- an empty scope narrows
+    everything away no matter what the code does.
+    """
+    from opencrab.pack import export_neo4j_opencrab_ingest
+
+    store = FakeNeo4jStore()
+    out = tmp_path / "ingest.jsonl"
+
+    export_neo4j_opencrab_ingest(
+        store, out, pack_id="pack-theirs", scope=frozenset({"pack-mine"})
+    )
+
+    # The assertion is on what reached the store, not on the row count:
+    # FakeNeo4jStore returns canned rows regardless of its argument, which
+    # is exactly why the count cannot show whether the filter was applied.
+    # A real store returns nothing for an empty list.
+    assert store.calls, "the exporter did not call the store at all"
+    for _name, pack_ids, _limit in store.calls:
+        assert pack_ids == [], "the caller's pack_id was not intersected with the scope"
+
+
+def test_requested_pack_inside_the_scope_exports_it(tmp_path) -> None:
+    """Positive control: the emptiness above is the intersection refusing."""
+    from opencrab.pack import export_neo4j_opencrab_ingest
+
+    store = FakeNeo4jStore()
+    out = tmp_path / "ingest.jsonl"
+
+    status = export_neo4j_opencrab_ingest(
+        store, out, pack_id="pack-mine", scope=frozenset({"pack-mine"})
+    )
+
+    assert status["nodes"] > 0
+    for _name, pack_ids, _limit in store.calls:
+        assert pack_ids == ["pack-mine"]
+    assert out.read_text(encoding="utf-8").strip()
+

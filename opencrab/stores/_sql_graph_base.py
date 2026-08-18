@@ -899,9 +899,11 @@ class _SqlGraphStoreBase(abc.ABC):
         ``value_transform`` to its ``list[str]`` and bind the result under
         ``bind_name`` (this is a callable, not a pre-applied value, exactly
         like ``_pack_where``'s ``transform`` -- kept as a callable here too
-        so ``export_edges_scoped`` can call this once per endpoint alias
-        and apply the transform exactly once for the one array bind all
-        three clauses share, instead of re-deriving it per call).
+        so ``export_edges_scoped`` can call this once per endpoint alias --
+        twice, not three times: the edge's own clause is assembled
+        separately because it must also admit a NULL pack_id, which this
+        two-clause node form does not. All the clauses still share ONE
+        array bind, and the transform is applied to it exactly once).
         """
         membership_expr = self._dialect.json_get(col, "pack_id")
         frag, transform = self._dialect.in_string_array(membership_expr, f":{bind_name}")
