@@ -2464,7 +2464,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             f"거짓말하는 int 서브클래스가 카운트로 발행됐다: {chunk_vec_del!r}")
 
     @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
-    def test_sql_unreported_rowcount_is_unconfirmed(self, live, rowcount):
+    def test_sql_unreported_rowcount_is_unconfirmed(self, live, rowcount, caplog):
         """G8 — 드라이버가 안 세어준 값은 `0` 이 아니라 `None` 이다.
 
         `bool` 이 섞여 있는 이유: `isinstance(True, int)` 가 참이라 안 막으면
@@ -2473,10 +2473,13 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         _builder, graph, docs = live
         vec = _StubSqlVec(rowcount=rowcount)
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
 
         assert chunk_vec_del is None, (
             f"rowcount={rowcount!r} 는 확인된 삭제 수가 아닌데 {chunk_vec_del!r} 를 냈다")
+        assert any("삭제 수 미확인" in r.getMessage() for r in caplog.records), (
+            "미확인은 보이는 실패여야 한다 — 사유 로그가 없으면 요약의 '미확인'만 남는다")
 
     @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
     def test_sqlalchemy_unreported_rowcount_is_unconfirmed(self, live, rowcount):
@@ -2605,8 +2608,7 @@ class TestDeletePackSummaryNamesTheActualBackend:
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("chroma", "미확인"), f"{backend=} {count=}"
 
-    def test_available_is_read_once_so_a_stateful_property_cannot_escape(
-            self, live, capsys):
+    def test_summary_does_not_reread_available(self, live, capsys):
         """G25 — 요약이 `available` 을 다시 읽으면 그 접근은 `try` 밖이라, 나중
         접근에서 던지는 property 가 `delete_pack` 밖으로 샌다(종전엔 없던 경로).
 

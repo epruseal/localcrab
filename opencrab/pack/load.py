@@ -855,6 +855,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                 rc = cur.rowcount                     # 담아만 둔다 — 아직 발행 안 한다
                 handle.commit()
                 chunk_vec_del = _confirmed_rowcount(rc)                # R2
+                if chunk_vec_del is None:
+                    # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
+                    # 어느 백엔드가 무엇을 안 세어줬는지 알 수 없다.
+                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
+                                kind, pack_name, rc, type(rc).__name__)
             elif kind == "chroma":
                 # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
                 # 근거와 동일: source 는 소유 키가 아니다).
@@ -889,6 +894,9 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                     rc = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
                                     {"p": pack_name}).rowcount
                 chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
+                if chunk_vec_del is None:
+                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
+                                kind, pack_name, rc, type(rc).__name__)
             else:
                 # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
                 # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
