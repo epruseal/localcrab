@@ -16,6 +16,7 @@ import logging
 import uuid
 from typing import Any
 
+from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 from opencrab.stores.mongo_store import MongoStore
@@ -77,6 +78,13 @@ class OntologyBuilder:
             If the space/node_type combination is invalid.
         """
         props = properties or {}
+
+        # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
+        # `pack_id` with different values. This is the funnel every graph/doc/vector
+        # node write reaches (MCP, REST, pack ingest, pack loader), so the check
+        # belongs here rather than in each entry point. Mutates `props` in place,
+        # which is what lets a caller's own dict stay canonical for its later writes.
+        canonicalize_pack_alias(props)
 
         # Grammar validation (raises ValueError on failure)
         result = validate_node(space, node_type)
@@ -157,7 +165,11 @@ class OntologyBuilder:
                 if text.strip():
                     meta = {
                         "pack_id": str(props.get("pack_id") or ""),
-                        "source": str(props.get("pack") or props.get("pack_id") or ""),
+                        # `pack_id` 단일 소유 키. 종전엔 폐기 별칭 `properties.pack` 을
+                        # 먼저 봤는데, 그 별칭이 stale 이면 벡터 `source` 가 옛 팩 이름으로
+                        # 찍혔다(#159). `pack_id` 없는 행은 빈 문자열이 된다 — 그 행에
+                        # source 를 주던 유일한 근거가 지금 없애는 별칭이었다.
+                        "source": str(props.get("pack_id") or ""),
                         "node_id": node_id,
                         # #51 루트 픽스: space where-필터(query.py._build_chroma_where)가
                         # 매치할 키가 벡터 메타데이터에 없어 항상 0건이었다. 신규 벡터부터
@@ -227,6 +239,7 @@ class OntologyBuilder:
         edge_result.raise_if_invalid()
 
         props = properties or {}
+        canonicalize_pack_alias(props)          # #171 — see add_node
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
 
