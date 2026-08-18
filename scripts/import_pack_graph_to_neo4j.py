@@ -19,6 +19,7 @@ from typing import Any
 from neo4j import GraphDatabase
 
 from opencrab.common.neo4j_driver import make_driver
+from opencrab.common.pack_tags import apply_pack_tag
 
 PACK_ID = "nvidia-nemotron-personas-korea"
 SPACE_TO_LABEL = {
@@ -68,6 +69,10 @@ def prepare_node(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "source_id": props.get("source_id") or PACK_ID,
         "evidence_refs": row.get("evidence_refs") or props.get("evidence_refs") or [],
     })
+    # pack_id is synthesised here from the pack file's own properties, so an input
+    # carrying the retired `pack` alias would land a row where the two disagree
+    # (#171). Drop it -- pack_id above is authoritative for this import.
+    apply_pack_tag(props, props["pack_id"])
     return label, {"id": row["id"], "props": props}
 
 
@@ -85,6 +90,7 @@ def prepare_edge(row: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
         "to_id": row.get("to_id"),
         "evidence_refs": row.get("evidence_refs") or props.get("evidence_refs") or [],
     })
+    apply_pack_tag(props, props["pack_id"])          # see prepare_node
     return from_label, rel, to_label, {"from_id": row["from_id"], "to_id": row["to_id"], "props": props}
 
 
