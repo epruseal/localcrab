@@ -65,8 +65,11 @@ class FakeGraphStore:
         particular cannot be reproduced by a caller, because
         `find_by_relations` never returns edge properties. This double
         applies the endpoint half to its canned rows so that a fixture with
-        out-of-scope rows still exercises the scoped path; the edge half is
-        the store's own and is covered by the store tests.
+        out-of-scope rows still exercises the scoped path. The edge half is
+        each store's own; it is pinned per backend (SQL by the isolation
+        suite, Kuzu by tests/test_kuzu_graph_store.py, Neo4j by the
+        mock-session tests in tests/test_neo4j_helpers.py) rather than
+        here.
         """
         if self._raise_on_find_by_relations:
             raise RuntimeError("relation query boom")
@@ -140,12 +143,12 @@ class TestAnalyseNormal:
         assert sql.saved_impacts == [("pol-1", "update", result.to_dict())]
 
     def test_lever_simulate_builds_outcomes_and_concepts_with_predicted_delta(self):
-        # #147: lever_simulate now gates on get_node_by_id_scoped(lever_id, ...)
-        # before touching find_by_relations, and post-filters the relation
-        # results through in_pack_scope() -- so both the anchor and each
-        # related node need a pack_id inside PACK_IDS for this "found and
-        # in-scope" test to actually exercise the outcome/concept building
-        # code (not the #147 out-of-scope short-circuit).
+        # #147: lever_simulate gates on get_node_by_id_scoped(lever_id, ...)
+        # and then reads relations through find_by_relations_scoped, which
+        # constrains anchor/endpoint/edge in the store. So both the anchor
+        # and each related node need a pack_id inside PACK_IDS for this
+        # "found and in-scope" test to reach the outcome/concept building
+        # code rather than the out-of-scope short-circuit.
         outcomes_raw = [
             {"properties": {"id": "out-1", "pack_id": "p1"}, "labels": ["Outcome"], "relation_type": "raises"},
             {"properties": {"id": "out-2", "pack_id": "p1"}, "labels": ["KPI"], "relation_type": "lowers"},

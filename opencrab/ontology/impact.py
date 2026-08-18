@@ -267,14 +267,14 @@ class ImpactEngine:
             outside it is treated as absent, producing the same empty
             outcome/concept lists an unknown lever_id produces.
 
-            ``find_by_relations`` has no pack parameter and matches on
-            node_id alone, so its results are filtered here in Python. That
-            is applied AFTER the store's LIMIT, which costs recall (a lever
-            with more than 20 out-edges may lose readable ones to
-            unreadable ones ahead of them) but cannot leak: every surviving
-            row passed the scope check. #143 classifies this
-            limit-then-filter shape as a recall defect, not an
-            authorization one.
+            Relations are read through ``find_by_relations_scoped``,
+            which constrains the anchor, the other endpoint AND the edge
+            itself inside the query, ahead of ``LIMIT``. There is no Python
+            post-filter here any more, and there cannot be a useful one:
+            ``find_by_relations`` never returns edge properties, so a caller
+            has no way to see that an edge belongs to a pack it may not
+            read. Moving the whole rule into the store also removed the
+            limit-then-filter recall loss the post-filter had.
         """
         valid_directions = {"raises", "lowers", "stabilizes", "optimizes"}
         if direction not in valid_directions:

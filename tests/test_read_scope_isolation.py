@@ -384,13 +384,15 @@ class TestNoExistenceLeak:
     ):
         """Isolates the ANCHOR gate.
 
-        When the lever is unreadable but its outcome is not, the
-        ``in_pack_scope`` post-filter passes the outcome through -- only the
-        anchor gate stops the call. With both layers present the previous
-        test passes either way, so deleting the gate alone went unnoticed
-        (found by mutation): alice naming bob's private lever got a
-        non-empty answer while naming an unknown id got an empty one, which
-        is the existence leak invariant 7 forbids.
+        Alice naming bob's private lever must answer exactly as naming an
+        unknown id does; anything else is the existence leak invariant 7
+        forbids.
+
+        Two layers now enforce this -- the anchor gate here and the store's
+        own anchor clause in ``find_by_relations_scoped`` -- so this test no
+        longer isolates either one by itself. Each layer is pinned where it
+        lives (the store clause in the per-backend store suites); what this
+        one guarantees is the end-to-end contract at the entry point.
         """
         from opencrab.mcp.tools import ontology_lever_simulate
 

@@ -471,3 +471,64 @@ class TestScopedReadPredicates:
         assert store.get_node_by_id_scoped("n1", []) is None
         session.run.assert_not_called()
 
+
+
+class TestScopedRelationLookup:
+    """`find_by_relations_scoped`, which `lever_simulate` now relies on alone.
+
+    That handler dropped its Python post-filter when this method arrived, so
+    on a docker deployment these three Cypher clauses are the whole of the
+    authorization for `ontology_lever_simulate` -- nothing below re-checks.
+    Same mock-session strength as `TestScopedReadPredicates`: it cannot show
+    the Cypher is semantically right, but it does show each clause is still
+    applied and the parameters bound.
+    """
+
+    def test_constrains_anchor_endpoint_and_edge(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.find_by_relations_scoped("lev-1", ["raises"], ["p1"], "out", 20)
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "a.pack_id IN $pack_ids" in cypher
+        assert "b.pack_id IN $pack_ids" in cypher
+        assert "r.pack_id IS NULL OR r.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+        assert params["relations"] == ["raises"]
+        # The relation-type filter must be in the query, not applied after.
+        assert "type(r) IN $relations" in cypher
+
+    def test_empty_scope_or_relations_never_reaches_the_session(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.reset_mock()
+
+        assert store.find_by_relations_scoped("lev-1", ["raises"], [], "out", 20) == []
+        assert store.find_by_relations_scoped("lev-1", [], ["p1"], "out", 20) == []
+        session.run.assert_not_called()
+
+    def test_count_exported_nodes_scoped_filters_on_pack_id(self) -> None:
+        """`total` is a separate query from the page: an unscoped count leaks
+        how much data other users hold even when their rows are withheld."""
+        store, _driver, session = _make_connected_store()
+        session.run.return_value.single.return_value = None
+
+        store.count_exported_nodes_scoped(["p1"])
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+
+    def test_list_pack_ids_enumerates_edges_too(self) -> None:
+        """An edge may carry a pack_id no node has; the startup guard has to
+        see it or that pack starts unregistered and its edges vanish."""
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.list_pack_ids()
+
+        queries = [c[0][0] for c in session.run.call_args_list]
+        assert any("MATCH (n)" in q and "n.pack_id" in q for q in queries)
+        assert any("-[r]->" in q and "r.pack_id" in q for q in queries)

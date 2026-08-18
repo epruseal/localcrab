@@ -739,3 +739,55 @@ def test_rebac_denied_when_no_edge(store) -> None:
 
     decision = engine.check("user1", "view", "res1")
     assert decision.granted is False
+
+
+def test_find_by_relations_scoped_constrains_anchor_endpoint_and_edge(store) -> None:
+    """#147: all three authorization clauses, each with a positive control.
+
+    `lever_simulate` no longer post-filters in Python -- authorization for
+    `ontology_lever_simulate` on a Kuzu deployment rests entirely on this
+    method, and nothing below it re-checks. Kuzu keeps properties as a JSON
+    blob, so these are Python membership tests over an unlimited scan rather
+    than a Cypher WHERE: a separate implementation from the SQL backend's
+    and therefore one that needs its own test rather than inheriting it.
+    """
+    store.upsert_node("Lever", "mine-lever", {"name": "l", "pack_id": "p-mine"})
+    store.upsert_node("Outcome", "mine-out", {"name": "o", "pack_id": "p-mine"})
+    store.upsert_node("Lever", "their-lever", {"name": "l2", "pack_id": "p-theirs"})
+    store.upsert_node("Outcome", "their-out", {"name": "o2", "pack_id": "p-theirs"})
+
+    # in scope end to end
+    store.upsert_edge("Lever", "mine-lever", "raises", "Outcome", "mine-out", {"pack_id": "p-mine"})
+    # unreadable OTHER endpoint
+    store.upsert_edge("Lever", "mine-lever", "raises", "Outcome", "their-out", {"pack_id": "p-mine"})
+    # unreadable ANCHOR
+    store.upsert_edge("Lever", "their-lever", "raises", "Outcome", "mine-out", {"pack_id": "p-mine"})
+    # both endpoints readable, EDGE in another pack
+    store.upsert_edge("Lever", "mine-lever", "lowers", "Outcome", "mine-out", {"pack_id": "p-theirs"})
+
+    got = store.find_by_relations_scoped("mine-lever", ["raises"], ["p-mine"], "out", 20)
+    assert [r["properties"]["id"] for r in got] == ["mine-out"]
+
+    # anchor clause: querying the unreadable lever yields nothing even though
+    # its destination is readable.
+    assert store.find_by_relations_scoped("their-lever", ["raises"], ["p-mine"], "out", 20) == []
+
+    # edge clause: same endpoints, foreign edge pack.
+    assert store.find_by_relations_scoped("mine-lever", ["lowers"], ["p-mine"], "out", 20) == []
+    # positive control for the edge clause -- with that pack readable it IS returned.
+    owned = store.find_by_relations_scoped(
+        "mine-lever", ["lowers"], ["p-mine", "p-theirs"], "out", 20
+    )
+    assert [r["properties"]["id"] for r in owned] == ["mine-out"]
+
+    assert store.find_by_relations_scoped("mine-lever", ["raises"], [], "out", 20) == []
+
+
+def test_list_pack_ids_includes_edge_only_packs(store) -> None:
+    """An edge may carry a pack_id no node has; the migration's registry
+    enumeration unions the two, so the startup guard must as well."""
+    store.upsert_node("X", "n1", {"name": "a", "pack_id": "p-node"})
+    store.upsert_node("X", "n2", {"name": "b", "pack_id": "p-node"})
+    store.upsert_edge("X", "n1", "relates_to", "X", "n2", {"pack_id": "p-edge-only"})
+
+    assert store.list_pack_ids() == {"p-node", "p-edge-only"}

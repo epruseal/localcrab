@@ -165,7 +165,8 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     cannot be enumerated, so the check cannot run. Skipping does not widen
     anyone's read scope -- that stays the registry-derived set either way.
 
-    Cost: one full-scan ``GROUP BY`` over the node table, once per process (or per one-shot CLI command), not per request. It is
+    Cost: a ``SELECT DISTINCT`` over the node table and another over the
+    edge table (or their per-backend equivalents), once per process (or per one-shot CLI command), not per request. It is
     not cheap: the same store measured a JSON-expression scan at ~439ms
     over 250k rows.
     """
