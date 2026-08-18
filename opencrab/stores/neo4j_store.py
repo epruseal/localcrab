@@ -475,6 +475,20 @@ class Neo4jStore:
             props["node_type"] = record["lbl"]
             return props
 
+    def list_pack_ids(self) -> set[str]:
+        """See GraphStore.list_pack_ids.
+
+        ``MATCH (n)`` with NO label, unlike ``list_packs``' ``(n:OpenCrabNode)``.
+        ``scripts/import_pack_graph_to_neo4j.py`` MERGEs each node under its
+        own domain label, so a label-restricted scan misses whole imported
+        packs -- and missing them is precisely the state #147's startup
+        guard exists to refuse.
+        """
+        self._require_available()
+        cypher = "MATCH (n) WHERE n.pack_id IS NOT NULL RETURN DISTINCT n.pack_id AS pid"
+        with self._session() as session:
+            return {str(r["pid"]) for r in session.run(cypher) if r["pid"]}
+
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """Aggregate node counts per pack_id; packs below min_nodes omitted.
 

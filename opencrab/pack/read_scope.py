@@ -104,9 +104,13 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     data but has no ``packs`` row, so read scoping will drop it while the
     operator has no way to see that from the outside. Re-running
     ``scripts/migrate_pack_ownership.py --apply`` genuinely fixes this on
-    every backend, because that script's registry stage reads the same
-    ``graph.list_packs()`` this check does -- which is what makes the
-    refusal message actionable rather than a dead end.
+    every backend: its registry stage enumerates the graph's packs and
+    registers what it finds, so re-running it clears the condition. That is
+    what makes the refusal message actionable rather than a dead end.
+    (The script enumerates via ``list_packs``, so on Neo4j it shares that
+    method's label restriction -- see below. An imported pack this guard now
+    reports may therefore need the manual registration the deployment
+    checklist describes rather than a bare re-run.)
 
     WHAT THIS DOES NOT DO, and why not (two earlier designs tried and both
     were wrong):
@@ -136,24 +140,26 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     of pack-less rows anyway.
 
     Everything else is a WARNING line, below: an empty registry alongside a
-    graph store in use. It carries no counts -- the per-backend
-    ``list_packs`` implementations disagree about whether a falsy pack_id
-    counts as attributed, so any number printed here would be a different
-    quantity depending on the store, and a number nobody can compare is
-    worse than none.
+    graph store in use. It carries no counts -- a count of "rows this
+    deployment cannot see" has no single definition across the backends, and
+    a number nobody can compare is worse than none.
 
-    Known imprecision, recorded rather than papered over: the graph side of
-    the comparison comes from ``list_packs``, which stringifies whatever the
-    ``pack_id`` property holds. A row whose pack_id is the JSON number ``0``
-    or the boolean ``false`` therefore arrives here as ``"0"`` / ``"false"``
-    and can trigger a refusal, even though the Python rule
-    (``_node_pack_id`` / ``scope_pack_id``) treats those as "no pack_id" and
-    would never have made the row readable. The refusal is still actionable
-    -- the migration registers exactly the ids ``list_packs`` reports, so
-    re-running it clears the condition -- but the row stays invisible
-    afterwards. Distinguishing the two would need a backend primitive that
-    applies the Python falsy rule in SQL/Cypher on all four stores; the
-    measured population of such rows is zero, so that is not built here.
+    The graph side comes from ``graph.list_pack_ids()``, NOT from
+    ``list_packs``. Two reasons, both of which made the earlier
+    ``list_packs``-based version wrong:
+
+    - ``Neo4jStore.list_packs`` matches ``(n:OpenCrabNode)``, but
+      ``scripts/import_pack_graph_to_neo4j.py`` MERGEs each node under its
+      own domain label. A whole imported pack missing from the registry was
+      therefore absent from the comparison, the guard stayed silent, and
+      scoped reads hid the pack -- exactly the outcome this exists to
+      prevent.
+    - ``list_packs`` groups by the bare JSON extraction, so a pack_id of
+      ``""``/``0``/``false`` surfaced as a pack named ``"0"`` and could
+      trigger a refusal over rows no read can reach.
+      ``list_pack_ids`` applies the same truthiness rule as
+      ``_node_pack_id``/``scope_pack_id``, so the set compared here is
+      exactly the set scoped reads can resolve.
 
     Skipped entirely when the graph store is unavailable: the pack_id set
     cannot be enumerated, so the check cannot run. Skipping does not widen
@@ -176,7 +182,7 @@ def assert_registry_covers_graph(sql: Any, graph: Any) -> None:
     with sql._engine.connect() as conn:
         registered = {r[0] for r in conn.execute(text("SELECT pack_id FROM packs")).fetchall()}
 
-    graph_packs = {row["pack_id"] for row in graph.list_packs(0) if row.get("pack_id")}
+    graph_packs = graph.list_pack_ids()
     missing = sorted(graph_packs - registered)
 
     if missing:

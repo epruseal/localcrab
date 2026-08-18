@@ -1141,6 +1141,43 @@ class TestStartupCheck:
     def test_skips_when_the_graph_store_is_unavailable(self, sql):
         assert assert_registry_covers_graph(sql, MagicMock(available=False)) is None
 
+    def test_enumeration_is_label_agnostic_not_list_packs(self):
+        """The guard must not inherit `list_packs`' narrowing.
+
+        `Neo4jStore.list_packs` matches one label, but the documented Neo4j
+        import path MERGEs nodes under their own domain labels -- so a whole
+        imported pack missing from the registry was absent from the
+        comparison and the guard stayed silent while scoped reads hid it.
+        Pinned at the source level because the backend that has the
+        restriction has no server here.
+        """
+        import inspect
+
+        from opencrab.pack import read_scope as rs
+        from opencrab.stores.neo4j_store import Neo4jStore
+
+        src = inspect.getsource(rs.assert_registry_covers_graph)
+        # Strip the docstring: it discusses list_packs at length, explaining
+        # why this function must not call it.
+        body = src.split('"""', 2)[-1]
+        assert "graph.list_pack_ids()" in body
+        assert "list_packs(" not in body
+        # ...and the method it now uses really is label-agnostic.
+        neo4j_body = inspect.getsource(Neo4jStore.list_pack_ids).split('"""', 2)[-1]
+        assert "MATCH (n)" in neo4j_body
+        assert "OpenCrabNode" not in neo4j_body
+
+    def test_falsy_pack_ids_are_not_reported_as_packs(self, sql, graph, seeded):
+        """A row whose pack_id is `""`/`0`/`false` is unattributed to every
+        read, so reporting it as a pack would refuse startup over rows
+        nothing can reach."""
+        for node_id, pid in (("empty", ""), ("zero", 0), ("false", False)):
+            graph.upsert_node(
+                "Document", node_id, {"pack_id": pid, "node_id": node_id}, space_id="resource"
+            )
+        assert graph.list_pack_ids() == {PACK_A, PACK_B, PACK_PUBLIC}
+        assert_registry_covers_graph(sql, graph) is None
+
     def test_every_read_serving_entry_point_calls_it(self):
         """The check only helps where it is wired in.
 

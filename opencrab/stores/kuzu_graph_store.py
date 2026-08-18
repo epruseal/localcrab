@@ -560,6 +560,19 @@ class KuzuGraphStore:
     # Extended operations (LocalGraphStore interface parity)
     # ------------------------------------------------------------------
 
+    def list_pack_ids(self) -> set[str]:
+        """See GraphStore.list_pack_ids. ``props`` is a JSON blob here, so
+        this scans and applies ``_node_pack_id`` -- the same truthiness rule
+        the scoped reads use, rather than ``list_packs``' own inline check."""
+        self._require_available()
+        r = self._conn.execute("MATCH (n:OntologyNode) RETURN n.props")
+        out: set[str] = set()
+        while r.has_next():
+            pid = _node_pack_id(_parse(r.get_next()[0]) or {})
+            if pid:
+                out.add(pid)
+        return out
+
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         self._require_available()
         r = self._conn.execute(

@@ -715,6 +715,22 @@ class _SqlGraphStoreBase(abc.ABC):
     # Extended operations
     # ------------------------------------------------------------------
 
+    def list_pack_ids(self) -> set[str]:
+        """See GraphStore.list_pack_ids. Uses ``json_truthy_text`` rather
+        than the bare extraction ``list_packs`` groups by, so a row whose
+        pack_id is ``""``/``0``/``false`` is reported as unattributed here
+        exactly as the Python and scoped-SQL predicates treat it -- reusing
+        ``list_packs`` would have surfaced those as packs named ``"0"`` and
+        made the startup guard refuse over rows no read can reach."""
+        self._require_available()
+        pid = self._dialect.json_truthy_text("properties", "pack_id")
+        rows = self._fetch_all(
+            f"SELECT DISTINCT {pid} FROM {self._table('graph_nodes')} "  # noqa: S608
+            f"WHERE {pid} IS NOT NULL",
+            {},
+        )
+        return {str(r[0]) for r in rows if r[0]}
+
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """pack_id is unified to ``str`` on BOTH backends (Stage 6b Deliverable
         2 — see module docstring's "PACK_ID TYPE UNIFICATION")."""

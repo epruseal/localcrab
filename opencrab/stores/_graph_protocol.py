@@ -311,6 +311,27 @@ class GraphStore(Protocol):
         """
         ...
 
+    def list_pack_ids(self) -> set[str]:
+        """Every distinct pack_id present on graph data.
+
+        Deliberately NOT ``{r["pack_id"] for r in list_packs(0)}``. That
+        aggregation exists to report per-pack node counts and titles for a
+        UI, and each backend narrows it accordingly -- Neo4j to the
+        ``OpenCrabNode`` label, which the documented
+        ``scripts/import_pack_graph_to_neo4j.py`` path does not apply (it
+        MERGEs each node under its own domain label). Reusing it to answer
+        "which packs exist here" therefore under-reports, and the one caller
+        that asks that question is #147's startup reconciliation: an
+        under-report there means the guard stays silent while scoped reads
+        hide the pack.
+
+        Uses the same truthiness rule as ``_graph_common._node_pack_id`` and
+        ``pack_provenance.scope_pack_id`` -- ``""``/``0``/``false`` are "no
+        pack_id" -- so the set returned here is exactly the set of packs
+        that scoped reads can resolve.
+        """
+        ...
+
     def count_nodes(self, node_type: str | None = None) -> int:
         """Count nodes, optionally filtered by exact node_type; 0 if empty."""
         ...
