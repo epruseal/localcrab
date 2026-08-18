@@ -856,3 +856,72 @@ class TestReverseAgainstPostgres:
         assert "table=api_tokens" in caplog.text
         assert "key=t-bare" in caplog.text
         assert result["tables"]["api_tokens"]["target"] == 0
+
+    def test_main_exits_nonzero_on_row_loss(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+    ) -> None:
+        """main() returned None and the entrypoint discarded it, so "the reverse
+        migration fails loudly" was unreachable no matter what migrate_sql
+        found. preflight needs Neo4j/Mongo/Chroma, so it is stubbed to reach the
+        SQL step -- the exit path itself is what is under test."""
+        from sqlalchemy import create_engine
+
+        src_db = str(tmp_path / "source.db")
+        _sqlite_source(src_db)
+        _seed_auth_rows(src_db)
+        assert _run_forward(
+            monkeypatch, "--sql-db", src_db, "--only", "sql", "--pg-url", pg_schema_dsn
+        ) == 0
+
+        data_dir = tmp_path / "local"
+        data_dir.mkdir()
+        with sqlite3.connect(str(data_dir / "opencrab.db")) as conn:
+            conn.execute(
+                "CREATE TABLE users (user_id TEXT PRIMARY KEY CHECK (user_id <> 'u-local'), "
+                "display_name TEXT NOT NULL, is_local INTEGER NOT NULL DEFAULT 0, "
+                "disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT)"
+            )
+
+        engine = create_engine(pg_schema_dsn)
+        monkeypatch.setattr(
+            rev, "preflight", lambda _args: {"counts": {}, "pg_engine": engine}
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "migrate_to_local.py",
+                "--skip-graph",
+                "--skip-docs",
+                "--skip-vectors",
+                "--local-data-dir",
+                str(data_dir),
+                "--pg-url",
+                pg_schema_dsn,
+            ],
+        )
+        try:
+            assert rev.main() == 5
+        finally:
+            engine.dispose()
+
+    def test_main_sanitises_an_escaping_exception(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """An uncaught exception prints its __cause__ chain, so the driver text a
+        MigrationError was raised *from* would reach stderr anyway."""
+
+        def _boom(_args: object) -> int:
+            try:
+                raise RuntimeError(f"DETAIL:  Key (token_hash)=({SECRET_HASH}) already exists.")
+            except RuntimeError as exc:
+                raise mt.MigrationError("table users: copy failed") from exc
+
+        monkeypatch.setattr(rev, "_run", _boom)
+        monkeypatch.setattr(sys, "argv", ["migrate_to_local.py", "--dry-run"])
+        assert rev.main() == 1
+        captured = capsys.readouterr()
+        for stream in (captured.out, captured.err):
+            assert SECRET_HASH not in stream
+            assert SECRET_HASH[:16] not in stream
+        assert "table users: copy failed" in captured.out
