@@ -366,10 +366,11 @@ def test_t9_no_writer_outside_pack_tags_assigns_the_retired_key():
     스캔이 못 잡는다. 진짜 강제는 범용 진입점의 불변식(T11~T13)이다. 여기서 잡는
     것은 "누가 리터럴 대입으로 별칭을 다시 쓰기 시작했다"는 가장 흔한 재발 형태다.
     `tests/` 는 스캔 대상이 아니다 — 반례 테스트가 그 픽스처를 정당하게 만든다.
+    쓰기 코드가 사는 나머지 루트는 전부 본다.
     """
     allowed = REPO_ROOT / "opencrab" / "common" / "pack_tags.py"
     offenders = []
-    for root in ("opencrab", "apps", "scripts"):
+    for root in ("opencrab", "apps", "scripts", "server", "crabharness"):
         for path in (REPO_ROOT / root).rglob("*.py"):
             if path == allowed:
                 continue
