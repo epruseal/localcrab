@@ -225,10 +225,14 @@ def _float32_representable(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
-        as_float = float(value)
+        round_tripped = struct.unpack("f", struct.pack("f", float(value)))[0]
     except (TypeError, ValueError, OverflowError):
+        # On this platform ``struct.pack`` saturates an out-of-range value to
+        # inf rather than raising (measured), and the isfinite check below
+        # catches that. It only raises where CPython falls back to its generic
+        # float packing, so the OverflowError arm is portability cover -- and
+        # an overflow means exactly "not representable", the same answer.
         return False
-    round_tripped = struct.unpack("f", struct.pack("f", as_float))[0]
     return math.isfinite(round_tripped)
 
 

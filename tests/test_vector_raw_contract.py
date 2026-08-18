@@ -520,6 +520,29 @@ class TestFieldsWithNoNaturalFixture:
 
         assert store.export_pack_vectors(DST_PACK)[0]["uris"] == "file:///a.png"
 
+    def test_a_pack_mixing_uri_and_uri_less_records_round_trips(self, store):
+        """A real pack is not uniform: an externally written uri record can sit
+        next to ordinary ones, so the batch handed to the backend carries both
+        strings and None. chroma accepts that mixture and reads it back
+        per-record (measured); this pins it so the import path is never
+        "simplified" into dropping or splitting on the None entries.
+        """
+        if store._test_backend != "chroma":
+            pytest.skip("uris are a chroma-only field")
+        store.import_vectors(
+            [{"id": "plain", "embedding": [0.1] * 32, "document": "a",
+              "metadata": {"space": "s1"}, "uris": None},
+             {"id": "carried", "embedding": [0.2] * 32, "document": "b",
+              "metadata": {"space": "s1"}, "uris": "file:///b.png"},
+             {"id": "plain2", "embedding": [0.3] * 32, "document": "c",
+              "metadata": {"space": "s1"}, "uris": None}],
+            pack_id=DST_PACK,
+        )
+
+        got = {r["id"]: r["uris"] for r in store.export_pack_vectors(DST_PACK)}
+
+        assert got == {"plain": None, "carried": "file:///b.png", "plain2": None}
+
     def test_export_is_not_truncated_at_scale(self, store):
         """The seeded corpus is far too small to catch a stray LIMIT that only
         bites past a page boundary.
