@@ -558,7 +558,17 @@ class TestMigrateSQL:
         return src_engine
 
     def test_migrate_sql_inserts_rows(self, tmp_path: Path) -> None:
-        """PostgreSQL 테이블 데이터를 SQLite로 복사한다."""
+        """PostgreSQL 테이블 데이터를 SQLite로 복사한다.
+
+        #151: migrate_sql 의 반환 형태가 ``{"tables": {name: int}}`` 에서
+        ``{"tables": {name: {"copied": int, "source": int|None, "target": int|None}}}``
+        로 바뀌었다(역방향 실제 행 보존 검증, 설계 6절) — 중첩 구조로 갱신한다.
+        이 patch 는 "postgresql" URL 요청에 SQLite 엔진을 대신 물리는데, ``**kw``
+        를 그대로 전달하므로 #151 이 새로 붙인 ``hide_parameters=True`` 도 그냥
+        통과하고, 컬럼 조회가 ``inspect()`` 기반이라 SQLite 카탈로그에서는
+        boolean/timestamp 타입이 검출되지 않아(무변환 통과) 이 테스트는 여전히
+        유효하다.
+        """
         import logging
 
         import sqlalchemy
@@ -586,12 +596,23 @@ class TestMigrateSQL:
             row = conn.execute(t("SELECT COUNT(*) FROM ontology_nodes")).fetchone()
         assert row[0] >= 1
 
-        # 반환값 구조 확인
+        # 반환값 구조 확인 -- 중첩 딕셔너리로 copied/source/target 을 각각 담는다.
         assert "tables" in result
-        assert result["tables"].get("ontology_nodes", 0) >= 1
+        node = result["tables"]["ontology_nodes"]
+        assert node["copied"] >= 1
+        assert node["source"] == 1
+        assert node["target"] == node["source"]
 
     def test_migrate_sql_duplicate_rows_not_counted(self, tmp_path: Path) -> None:
-        """중복 행은 count에 포함되지 않아야 한다 (INSERT OR IGNORE + rowcount)."""
+        """중복 행은 copied 에 포함되지 않지만, target 은 여전히 source 와 같아야 한다.
+
+        #151 이전에는 두 번째 실행에서 count(=copied) 가 0 이라는 것만 확인했다.
+        새 반환 형태의 요점은 삽입 카운트가 아니라 "행이 실제로 보존됐는가"이므로
+        (설계 6절), 이 테스트를 그 주장까지 검증하도록 강화한다: INSERT OR IGNORE
+        로 두 번째 실행의 copied 는 0 이 되지만, 재조회한 target(SQLite 실제 행 수)
+        은 source(PostgreSQL 행 수)와 여전히 같아야 한다 -- 중복이 조용히 행을
+        잃어버리지 않았다는 뜻이다.
+        """
         import logging
 
         import sqlalchemy
@@ -614,7 +635,14 @@ class TestMigrateSQL:
                 "postgresql://x/x", dst_path, logging.getLogger()
             )
 
-        # 첫 번째 호출: 1개 삽입
-        assert result1["tables"].get("ontology_nodes", 0) >= 1
-        # 두 번째 호출: 중복이므로 INSERT OR IGNORE → rowcount=0 → count=0
-        assert result2["tables"].get("ontology_nodes", 0) == 0
+        # 첫 번째 호출: 1개 삽입, target == source
+        node1 = result1["tables"]["ontology_nodes"]
+        assert node1["copied"] >= 1
+        assert node1["target"] == node1["source"]
+
+        # 두 번째 호출: 자연 키가 있는 테이블은 업서트하므로 같은 행을 다시 쓴다
+        # (copied 는 쓴 행 수이지 새로 삽입된 행 수가 아니다). 중복되지 않는다는 것은
+        # target 이 그대로라는 사실로 확인한다.
+        node2 = result2["tables"]["ontology_nodes"]
+        assert node2["copied"] == node2["source"]
+        assert node2["target"] == node1["target"]
