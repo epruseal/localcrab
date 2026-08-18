@@ -1205,17 +1205,22 @@ class TestTargetOnlyCredentials:
         graph.close()
         self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
 
+        # --pg-schema too: graph/doc take a schema argument while the SQL store
+        # writes through the connection's search_path, so without it the graph
+        # tables would land in public -- shared with every other test.
+        schema = pg_schema_dsn.rsplit("%3D", 1)[1]
         rc = _run_forward(
             monkeypatch,
             "--sql-db", db,
             "--graph-db", graph_db,
             "--only", "graph,sql",
             "--pg-url", pg_schema_dsn,
+            "--pg-schema", schema,
         )
         assert rc == 2
         engine = create_engine(pg_schema_dsn)
         try:
-            assert not inspect(engine).has_table("graph_nodes"), (
+            assert not inspect(engine, raiseerr=True).has_table("graph_nodes", schema=schema), (
                 "the graph store must not have been written before the refusal"
             )
         finally:
