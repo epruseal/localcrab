@@ -19,6 +19,7 @@ from typing import Any
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
+from opencrab.pack.write_gate import EDGE_STAMPED, NODE_STAMPED, authorize, stamp
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
@@ -52,7 +53,7 @@ class OntologyBuilder:
         node_id: str,
         properties: dict[str, Any] | None = None,
         *,
-        subject_id: str | None = None,
+        pack_id: str,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -77,13 +78,24 @@ class OntologyBuilder:
         ValueError
             If the space/node_type combination is invalid.
         """
-        props = properties or {}
+        from opencrab.auth import current_principal
+
+        # The gate, in this order and no other (#148). Stamping must run
+        # BEFORE canonicalize_pack_alias: that helper rewrites pack tags in
+        # place, so a stamp running after it can no longer see what the caller
+        # actually asked for and a forged pack_id would pass silently.
+        # `stamp` returns a NEW dict -- unlike the pre-#148 code this no longer
+        # mutates the caller's properties.
+        principal = current_principal()
+        authorize(self._sql, principal, pack_id)
+        props = stamp(
+            properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED
+        )
 
         # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
         # `pack_id` with different values. This is the funnel every graph/doc/vector
         # node write reaches (MCP, REST, pack ingest, pack loader), so the check
-        # belongs here rather than in each entry point. Mutates `props` in place,
-        # which is what lets a caller's own dict stay canonical for its later writes.
+        # belongs here rather than in each entry point.
         canonicalize_pack_alias(props)
 
         # Grammar validation (raises ValueError on failure)
@@ -106,6 +118,21 @@ class OntologyBuilder:
             "receipt_ts": receipt_ts,
             "stores": {},
         }
+
+        # Graph is the system of record. When it is down, refuse the whole
+        # write instead of fanning out to the optional stores (#146 follow-up):
+        # a doc/vector row with no graph node is invisible to every pack-scoped
+        # read and has to be reconciled by hand later. Returned as a receipt
+        # rather than raised so the #158 contract ("callers read the receipt")
+        # keeps holding.
+        if not self._neo4j.available:
+            output["stores"] = {
+                "graph": "unavailable",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+                "vector": "skipped (graph unavailable)",
+            }
+            return output
 
         # --- Neo4j write ---
         if self._neo4j.available:
@@ -137,7 +164,7 @@ class OntologyBuilder:
                 output["stores"]["docs"] = f"ok (id={mongo_id})"
                 self._mongo.log_event(
                     "node_upsert",
-                    subject_id=subject_id,
+                    subject_id=principal.user_id,
                     details={"space": space, "node_type": node_type, "node_id": node_id},
                 )
             except Exception as exc:
@@ -203,7 +230,7 @@ class OntologyBuilder:
         to_id: str,
         properties: dict[str, Any] | None = None,
         *,
-        subject_id: str | None = None,
+        pack_id: str,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -238,7 +265,14 @@ class OntologyBuilder:
         edge_result = validate_edge(from_space, to_space, relation)
         edge_result.raise_if_invalid()
 
-        props = properties or {}
+        from opencrab.auth import current_principal
+
+        # See add_node: gate first, alias normalisation second (#148).
+        principal = current_principal()
+        authorize(self._sql, principal, pack_id)
+        props = stamp(
+            properties, principal=principal, pack_id=pack_id, keys=EDGE_STAMPED
+        )
         canonicalize_pack_alias(props)          # #171 — see add_node
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
@@ -251,6 +285,16 @@ class OntologyBuilder:
             "receipt_ts": receipt_ts,
             "stores": {},
         }
+
+        # See add_node: graph down means the whole write is refused, not
+        # fanned out to the optional stores (#146 follow-up).
+        if not self._neo4j.available:
+            output["stores"] = {
+                "graph": "unavailable",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+            }
+            return output
 
         # Resolve real node types from whichever graph store is available.
         # All four backends expose lookup_node_type(node_id) (see
@@ -329,7 +373,7 @@ class OntologyBuilder:
             try:
                 self._mongo.log_event(
                     "edge_upsert",
-                    subject_id=subject_id,
+                    subject_id=principal.user_id,
                     details={
                         "from_space": from_space,
                         "from_id": from_id,

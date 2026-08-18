@@ -58,7 +58,10 @@ log = logging.getLogger(__name__)
 # 한동안 `id` 하나만 뺐는데, 상류가 `space_id`/`properties[space]` 우선순위를 통합하면서
 # `space` 도 주입하게 됐고(#125) 그 순간 동일한 행이 전부 chg 로 판정됐다.
 # 이름을 하나 더 적는 대신 "스토어가 넣는 것"이라는 축으로 묶는다.
-STORE_INJECTED_KEYS = frozenset({"id", "space"})
+# `owner_id` joined the set in #148: the write gate stamps the principal onto
+# every node's properties, so it is present on live rows and absent from the
+# source dump -- the same shape `space` had in #125.
+STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
 
 # 증분 비교에서 빼는 키 = 스토어가 넣는 것 + `#159` 가 폐기한 것(`pack`).
 # 폐기 키를 빼지 않으면 그 키를 가진 라이브 행이 **매 증분 전량 chg** 로 잡힌다.
@@ -1072,6 +1075,21 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     }
 
 
+def _principal_scope_if_unbound():
+    """`builder.add_node`/`add_edge` 이제 내부에서 `current_principal()`을
+    요구한다(#148) — principal_scope 없이 부르면 LookupError. 이 로더들은
+    독립 호출도 가능해야 하므로, 호출자가 이미 principal_scope를 열어 뒀으면
+    그 값을 그대로 쓰고(no-op), 아니면 로컬 principal을 새로 바인딩한다.
+    """
+    from opencrab.auth import current_principal, principal_scope, require_local_principal
+
+    try:
+        current_principal()
+        return contextlib.nullcontext()
+    except LookupError:
+        return principal_scope(require_local_principal())
+
+
 def load_nodes(
     pack_name: str,
     nodes_file: Path,
@@ -1082,12 +1100,13 @@ def load_nodes(
     require_live_data("load_nodes")
     ok = skip = err = 0
 
-    for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림(단일/분할 투명)
+    with _principal_scope_if_unbound():
+        for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림(단일/분할 투명)
             space, node_type, node_id, props = transform_node(pack_name, row)
             id_map[node_id] = (space, node_type)
 
             try:
-                res = builder.add_node(space, node_type, node_id, properties=props)
+                res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
                 # **영수증을 본다.** `add_node`는 스토어 실패를 예외로 올리지 않고 반환
                 # dict에 적는다 — `builder.store_write_failures()`의 docstring이
                 # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
@@ -1199,7 +1218,8 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
-    for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
+    with _principal_scope_if_unbound():
+        for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
             space, node_type, node_id, props = transform_node(pack_name, row)
             id_map[node_id] = (space, node_type)
             bypack_ids.add(node_id)  # add 성공 여부와 무관하게 항상(엣지 endpoint·삭제 대조용)
@@ -1249,7 +1269,7 @@ def load_nodes_incremental(
             stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
             try:
-                res = builder.add_node(space, node_type, node_id, properties=props)
+                res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
                 # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
                 # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
                 # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
@@ -1362,7 +1382,8 @@ def load_edges(
     if reasons is None:
         reasons = Counter()
 
-    for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
+    with _principal_scope_if_unbound():
+        for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
             raw_label = row.get("label") or row.get("relation") or ""
             src_id    = row.get("source_id") or row.get("from_id") or ""
             tgt_id    = row.get("target_id") or row.get("to_id")   or ""
@@ -1412,7 +1433,7 @@ def load_edges(
             apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
 
             try:
-                res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props)
+                res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props, pack_id=pack_name)
                 # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
                 # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
                 # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).

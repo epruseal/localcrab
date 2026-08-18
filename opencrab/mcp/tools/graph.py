@@ -73,6 +73,10 @@ def ontology_manifest() -> dict[str, Any]:
                     "type": "object",
                     "description": "Optional key/value properties.",
                 },
+                "pack_id": {
+                    "type": "string",
+                    "description": "Optional destination pack_id. Defaults to the caller's default pack.",
+                },
             },
             "required": ["space", "node_type", "node_id"],
         },
@@ -86,6 +90,7 @@ def ontology_add_node(
     node_type: str,
     node_id: str,
     properties: dict[str, Any] | None = None,
+    pack_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add or update a node in the MetaOntology graph.
@@ -100,6 +105,9 @@ def ontology_add_node(
         Stable unique identifier.
     properties:
         Key/value properties for the node.
+    pack_id:
+        Optional destination pack_id. Defaults to the caller's default pack
+        (``resolve_write_pack``).
 
     The writing subject is never a client-supplied argument (#145, #143
     invariant 2) -- it is the caller's server-derived ``current_principal()``,
@@ -111,6 +119,7 @@ def ontology_add_node(
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import graph_write_failed
     from opencrab.ontology.tenant import TenantContext, stamp_properties
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
 
     ctx = _get_context()
     principal = current_principal()
@@ -121,13 +130,14 @@ def ontology_add_node(
     node_id = _clean_str(node_id)
     tenant_ctx = TenantContext(tenant_id=tenant_id, subject_id=subject_id)
     props = stamp_properties(_clean_meta(properties or {}), tenant_ctx)
+    target_pack_id = resolve_write_pack(ctx["sql"], principal, _clean_str(pack_id) if pack_id else None)
     try:
         result = ctx["builder"].add_node(
             space=space,
             node_type=node_type,
             node_id=node_id,
             properties=props,
-            subject_id=subject_id,
+            pack_id=target_pack_id,
         )
         # #66 codex re-review (finding [8]): this sibling of
         # ontology_add_edge had the exact same fail-open bug — add_node()
@@ -152,6 +162,24 @@ def ontology_add_node(
         return result
     except ValueError as exc:
         return {"error": str(exc), "valid": False}
+    except PackNotFoundError:
+        # #148: same wording/contract as pack_ingest (opencrab/mcp/tools/pack.py)
+        # -- #143 invariant 7 folds "doesn't exist" and "someone else's
+        # private pack" into one indistinguishable response.
+        return {"error": "pack not found; use pack_create first", "pack_id": target_pack_id}
+    except PackForbiddenError:
+        # A visible (public) pack owned by someone else -- existence is
+        # already observable, so this can safely say more than "not found".
+        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
+        # naming one here would send callers into an unknown-tool error.
+        return {
+            "error": "PACK_NOT_WRITABLE: not the pack owner",
+            "pack_id": target_pack_id,
+            "hint": (
+                "this pack is readable but not writable by you; "
+                "create your own with pack_create and ingest into that"
+            ),
+        }
     except Exception as exc:
         logger.error("ontology_add_node failed: %s", exc)
         return {"error": str(exc)}
@@ -173,6 +201,10 @@ def ontology_add_node(
                 "to_space": {"type": "string", "description": "Target node space."},
                 "to_id": {"type": "string", "description": "Target node ID."},
                 "properties": {"type": "object", "description": "Optional edge properties."},
+                "pack_id": {
+                    "type": "string",
+                    "description": "Optional destination pack_id. Defaults to the caller's default pack.",
+                },
             },
             "required": ["from_space", "from_id", "relation", "to_space", "to_id"],
         },
@@ -188,6 +220,7 @@ def ontology_add_edge(
     to_space: str,
     to_id: str,
     properties: dict[str, Any] | None = None,
+    pack_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Add a directed edge between two ontology nodes.
@@ -209,6 +242,9 @@ def ontology_add_edge(
         ID of the target node.
     properties:
         Optional edge properties.
+    pack_id:
+        Optional destination pack_id. Defaults to the caller's default pack
+        (``resolve_write_pack``).
 
     The writing subject is never a client-supplied argument (#145) -- it is
     the caller's server-derived ``current_principal()``. tenant_id stays
@@ -217,6 +253,7 @@ def ontology_add_edge(
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import graph_write_failed
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
 
     ctx = _get_context()
     principal = current_principal()
@@ -225,6 +262,7 @@ def ontology_add_edge(
     from_id = _clean_str(from_id)
     to_id = _clean_str(to_id)
     relation = _clean_str(relation)
+    target_pack_id = resolve_write_pack(ctx["sql"], principal, _clean_str(pack_id) if pack_id else None)
     try:
         result = ctx["builder"].add_edge(
             from_space=_clean_str(from_space),
@@ -233,7 +271,7 @@ def ontology_add_edge(
             to_space=_clean_str(to_space),
             to_id=to_id,
             properties=_clean_meta(properties or {}),
-            subject_id=subject_id,
+            pack_id=target_pack_id,
         )
         # #66 hardening: builder.add_edge() never raises for a per-store
         # failure (missing endpoint / store down all come back as a string
@@ -261,6 +299,24 @@ def ontology_add_edge(
         return result
     except ValueError as exc:
         return {"error": str(exc), "valid": False}
+    except PackNotFoundError:
+        # #148: same wording/contract as pack_ingest (opencrab/mcp/tools/pack.py)
+        # -- #143 invariant 7 folds "doesn't exist" and "someone else's
+        # private pack" into one indistinguishable response.
+        return {"error": "pack not found; use pack_create first", "pack_id": target_pack_id}
+    except PackForbiddenError:
+        # A visible (public) pack owned by someone else -- existence is
+        # already observable, so this can safely say more than "not found".
+        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
+        # naming one here would send callers into an unknown-tool error.
+        return {
+            "error": "PACK_NOT_WRITABLE: not the pack owner",
+            "pack_id": target_pack_id,
+            "hint": (
+                "this pack is readable but not writable by you; "
+                "create your own with pack_create and ingest into that"
+            ),
+        }
     except Exception as exc:
         logger.error("ontology_add_edge failed: %s", exc)
         return {"error": str(exc)}

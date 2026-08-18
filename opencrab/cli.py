@@ -536,6 +536,12 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
 @click.option("--model", default="claude-haiku-4-5-20251001", show_default=True, help="Claude model for extraction.")
 @click.option("--dry-run", is_flag=True, default=False, help="Extract but do not write to stores.")
 @click.option("--api-key", default=None, envvar="ANTHROPIC_API_KEY", help="Anthropic API key.")
+@click.option(
+    "--pack-id",
+    "pack_id",
+    default=None,
+    help="Destination pack_id. Defaults to the caller's default pack.",
+)
 def extract(
     path: str,
     recursive: bool,
@@ -543,9 +549,10 @@ def extract(
     model: str,
     dry_run: bool,
     api_key: str | None,
+    pack_id: str | None,
 ) -> None:
     """LLM-extract ontology nodes/edges from files and write to the graph."""
-    from opencrab.auth import require_local_principal
+    from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
     from opencrab.ontology.builder import (
@@ -554,6 +561,7 @@ def extract(
         store_write_succeeded_for,
     )
     from opencrab.ontology.extractor import LLMExtractor
+    from opencrab.pack.ownership import resolve_write_pack
 
     if not api_key:
         import os
@@ -581,6 +589,7 @@ def extract(
     graph, doc, sql = stores.graph, stores.doc, stores.sql
     builder = OntologyBuilder(graph, doc, sql)
     extractor = LLMExtractor(api_key=api_key, model=model)
+    target_pack_id = resolve_write_pack(sql, principal, pack_id) if principal else None
 
     extensions = [e.strip() for e in extension.split(",")]
     root = Path(path)
@@ -614,7 +623,7 @@ def extract(
                 console.print()
 
             if not dry_run:
-                with write_lock():
+                with principal_scope(principal), write_lock():
                     for node in result.nodes:
                         try:
                             res = builder.add_node(
@@ -622,7 +631,7 @@ def extract(
                                 node_type=node.node_type,
                                 node_id=node.node_id,
                                 properties=node.properties,
-                                subject_id=principal.user_id,
+                                pack_id=target_pack_id,
                             )
                             stores = res.get("stores") if isinstance(res, dict) else None
                             if not isinstance(stores, dict):
@@ -644,7 +653,7 @@ def extract(
                                 to_space=edge.to_space,
                                 to_id=edge.to_id,
                                 properties=edge.properties,
-                                subject_id=principal.user_id,
+                                pack_id=target_pack_id,
                             )
                             stores = res.get("stores") if isinstance(res, dict) else None
                             if not isinstance(stores, dict):

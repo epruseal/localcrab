@@ -209,7 +209,7 @@ def _collect_notes(vault_root: Path) -> list[NoteRecord]:
     return [build_note_record(vault_root, path) for path in sorted(vault_root.rglob("*.md"))]
 
 
-def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path, notes: list[NoteRecord] | None = None) -> dict[str, int]:
+def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path, notes: list[NoteRecord] | None = None, pack_id: str | None = None) -> dict[str, int]:
     notes = notes if notes is not None else _collect_notes(vault_root)
     workspace_id = vault_workspace_id(vault_root)
 
@@ -222,6 +222,15 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
     docs = LocalDocStore(str(local_data_dir / "docs"))
     sql = SQLStore(f"sqlite:///{local_data_dir / 'opencrab.db'}")
     builder = OntologyBuilder(graph, docs, sql)
+
+    # #148: builder.add_node/add_edge now require a bound principal + pack_id.
+    # The caller (import_vault) opens principal_scope around this call, so
+    # current_principal() resolves here -- this function does not bind one
+    # itself (its direct callers, e.g. tests, are expected to bind their own).
+    from opencrab.auth import current_principal
+    from opencrab.pack.ownership import resolve_write_pack
+
+    target_pack_id = resolve_write_pack(sql, current_principal(), pack_id)
 
     nodes = _WriteTally("node")
     edges = _WriteTally("edge")
@@ -260,6 +269,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": topic_theme(folder_path),
                     "viz_color": theme_color(topic_theme(folder_path)),
                 },
+                pack_id=target_pack_id,
             ),
             folder_path,
         )
@@ -273,6 +283,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "concept",
                     folder_topic_id(workspace_id, parent),
                     properties=edge_props,
+                    pack_id=target_pack_id,
                 ),
                 f"{folder_path}-[part_of]->{parent}",
             )
@@ -292,6 +303,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": topic_theme(tag),
                     "viz_color": theme_color(topic_theme(tag)),
                 },
+                pack_id=target_pack_id,
             ),
             tag,
         )
@@ -312,6 +324,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": topic_theme(link),
                     "viz_color": theme_color(topic_theme(link)),
                 },
+                pack_id=target_pack_id,
             ),
             link,
         )
@@ -341,6 +354,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": theme,
                     "viz_color": color,
                 },
+                pack_id=target_pack_id,
             ),
             note.rel_path,
         )
@@ -363,6 +377,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": theme,
                     "viz_color": color,
                 },
+                pack_id=target_pack_id,
             ),
             note.rel_path,
         )
@@ -382,6 +397,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "viz_theme": theme,
                     "viz_color": color,
                 },
+                pack_id=target_pack_id,
             ),
             note.rel_path,
         )
@@ -408,6 +424,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                 "evidence",
                 note.note_text_id,
                 properties={**edge_props, "source_path": note.rel_path},
+                pack_id=target_pack_id,
             ),
             f"{note.rel_path}-[contains]",
         )
@@ -419,6 +436,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                 "concept",
                 note.note_topic_id,
                 properties={**edge_props, "source_path": note.rel_path},
+                pack_id=target_pack_id,
             ),
             f"{note.rel_path}-[describes]->topic",
         )
@@ -433,6 +451,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "concept",
                     folder_topic_id(workspace_id, folder_path),
                     properties={**edge_props, "source_path": note.rel_path},
+                    pack_id=target_pack_id,
                 ),
                 f"{note.rel_path}-[describes]->{folder_path}",
             )
@@ -446,6 +465,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "concept",
                     tag_topic_id(workspace_id, tag),
                     properties={**edge_props, "source_path": note.rel_path},
+                    pack_id=target_pack_id,
                 ),
                 f"{note.rel_path}-[mentions]->{tag}",
             )
@@ -465,6 +485,7 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
                     "concept",
                     target_topic_id,
                     properties={**edge_props, "source_path": note.rel_path},
+                    pack_id=target_pack_id,
                 ),
                 f"{note.rel_path}-[related_to]->{link}",
             )
@@ -481,12 +502,18 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
     }
 
 
-def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path) -> dict[str, int]:
+def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path, pack_id: str | None = None) -> dict[str, int]:
     """Import one vault under the same cross-process write boundary as APIs."""
+    from opencrab.auth import principal_scope, require_local_principal
+
     notes = _collect_notes(vault_root)
-    with write_lock(str(local_data_dir)):
+    # #148: builder.add_node/add_edge now require a bound principal -- this
+    # is a standalone process entry point, so bind the local user here (same
+    # as opencrab.cli's write paths) rather than assume one is already bound.
+    principal = require_local_principal()
+    with write_lock(str(local_data_dir)), principal_scope(principal):
         return _import_vault_unlocked(
-            vault_root, neo4j_uri, neo4j_user, neo4j_password, neo4j_database, local_data_dir, notes
+            vault_root, neo4j_uri, neo4j_user, neo4j_password, neo4j_database, local_data_dir, notes, pack_id=pack_id
         )
 
 
@@ -498,6 +525,12 @@ def main() -> None:
     parser.add_argument("--neo4j-password", default=os.environ.get("NEO4J_PASSWORD", "opencrab"))
     parser.add_argument("--neo4j-database", default=os.environ.get("NEO4J_DATABASE", "opencrab"))
     parser.add_argument("--local-data-dir", default=os.environ.get("LOCAL_DATA_DIR", "./opencrab_data"))
+    parser.add_argument(
+        "--pack-id",
+        dest="pack_id",
+        default=None,
+        help="Destination pack_id. Defaults to the local user's default pack.",
+    )
     args = parser.parse_args()
 
     result = import_vault(
@@ -507,6 +540,7 @@ def main() -> None:
         neo4j_password=args.neo4j_password,
         neo4j_database=args.neo4j_database,
         local_data_dir=Path(args.local_data_dir),
+        pack_id=args.pack_id,
     )
     print(result)
     if result["node_write_failures"] or result["edge_write_failures"]:

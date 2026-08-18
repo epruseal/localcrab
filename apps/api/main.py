@@ -74,6 +74,7 @@ class NodeRequest(BaseModel):
     node_type: str = Field(..., min_length=1)
     node_id: str = Field(..., min_length=1)
     properties: dict[str, Any] = Field(default_factory=dict)
+    pack_id: str | None = Field(default=None, description="Optional destination pack_id. Defaults to the caller's default pack.")
 
 
 class EdgeRequest(BaseModel):
@@ -83,6 +84,7 @@ class EdgeRequest(BaseModel):
     to_space: str = Field(..., min_length=1)
     to_id: str = Field(..., min_length=1)
     properties: dict[str, Any] = Field(default_factory=dict)
+    pack_id: str | None = Field(default=None, description="Optional destination pack_id. Defaults to the caller's default pack.")
 
 
 @dataclass(frozen=True)
@@ -698,25 +700,33 @@ def add_node(
 ) -> dict[str, Any]:
     # Route through the shared OntologyBuilder so HTTP and MCP writes converge:
     # deep grammar + required-field validation, receipt stamping, role-based
-    # store keys and audit are all produced once. owner_id is stamped before the
-    # write so it stays consistent with backfill_owner_id.py's expectations.
-    properties = dict(payload.properties)
-    properties.setdefault("owner_id", auth.user_id)
+    # store keys and audit are all produced once. owner_id/pack_id are now
+    # stamped by the builder itself (#148) -- no caller-side setdefault here.
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
 
+    target_pack_id = resolve_write_pack(ctx.sql, auth.principal, payload.pack_id)
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        with write_lock():
+        with principal_scope(auth.principal), write_lock():
             response = builder.add_node(
                 payload.space,
                 payload.node_type,
                 payload.node_id,
-                properties,
-                subject_id=auth.user_id,
+                dict(payload.properties),
+                pack_id=target_pack_id,
             )
             _meter_call(ctx, auth, "/api/nodes")
     except ValueError as exc:
         # Grammar / required-field validation failure — a client error, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PackNotFoundError:
+        # #143 invariant 7: identical response for "doesn't exist at all" and
+        # "exists but it's someone else's private pack" -- the response body
+        # must not hint at which case this is.
+        raise HTTPException(status_code=404, detail="pack not found; use pack_create first") from None
+    except PackForbiddenError:
+        raise HTTPException(status_code=403, detail="PACK_NOT_WRITABLE: not the pack owner") from None
 
     return response
 
@@ -730,9 +740,13 @@ def add_edge(
     # Shared OntologyBuilder path (see add_node). The builder resolves real node
     # types via the graph store's lookup_node_type, validates the relation, and
     # produces a receipt + role-based store keys + audit in one place.
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
+
+    target_pack_id = resolve_write_pack(ctx.sql, auth.principal, payload.pack_id)
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        with write_lock():
+        with principal_scope(auth.principal), write_lock():
             response = builder.add_edge(
                 payload.from_space,
                 payload.from_id,
@@ -740,11 +754,15 @@ def add_edge(
                 payload.to_space,
                 payload.to_id,
                 payload.properties,
-                subject_id=auth.user_id,
+                pack_id=target_pack_id,
             )
             _meter_call(ctx, auth, "/api/edges")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PackNotFoundError:
+        raise HTTPException(status_code=404, detail="pack not found; use pack_create first") from None
+    except PackForbiddenError:
+        raise HTTPException(status_code=403, detail="PACK_NOT_WRITABLE: not the pack owner") from None
 
     return response
 
