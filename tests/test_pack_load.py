@@ -2750,6 +2750,52 @@ class TestDeletePackSummaryNamesTheActualBackend:
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
+    @pytest.mark.parametrize("path", ["chroma", "sql", "sqlalchemy"])
+    def test_the_reason_log_survives_a_hostile_object(self, live, caplog, path):
+        """G32 — 사유 로그가 적대적 객체의 **포맷팅**에서 사라지면 안 된다.
+
+        인자 평가가 안전해도(`type()` 은 타입 슬롯 읽기) 포맷 단계는 메타클래스
+        `__str__` 과 `__repr__` 을 돌린다. 거기서 예외가 나면 `logging` 이 레코드를
+        통째로 버려 **사유가 흔적 없이 사라진다**(적대 검증이 두 경로에서 실증).
+        rowcount 경고는 sql·sqlalchemy 두 자리에 각각 있으므로 둘 다 태운다.
+        """
+        class _EvilStr(type):
+            def __str__(cls):
+                raise RuntimeError("hostile metaclass blocked __str__")
+
+            def __repr__(cls):
+                raise RuntimeError("hostile metaclass blocked __repr__")
+
+        class _Hostile(metaclass=_EvilStr):
+            def __repr__(self):
+                raise RuntimeError("hostile __repr__")
+
+        _builder, graph, docs = live
+
+        if path == "chroma":
+            class _HostileChromaVec(metaclass=_EvilStr):
+                available = True
+
+                def __init__(self):
+                    self._collection = _FakeChromaCollection({"a1": "pack-a"})
+                    self._collection.malformed_get_wheres = {1: {"no_ids": []}}
+
+            vec, expected, needle = _HostileChromaVec(), 0, "id 집합으로 읽을 수 없다"
+        elif path == "sql":
+            vec, expected, needle = _StubSqlVec(rowcount=_Hostile()), None, "삭제 수 미확인"
+        else:
+            vec, expected, needle = _StubSaVec(rowcount=_Hostile()), None, "삭제 수 미확인"
+
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del == expected, f"카운트가 틀렸다: {chunk_vec_del!r}"
+        rendered = []
+        for r in caplog.records:
+            rendered.append(r.getMessage())        # 실제 렌더링까지 해본다
+        assert any(needle in m for m in rendered), (
+            f"사유 로그가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
+
     def test_discrimination_failure_is_absorbed_and_labelled(self, live, capsys):
         """G23 — 판별 자체가 예외여도 밖으로 안 새고, 표기는 판별 결과를 따른다."""
         _builder, graph, docs = live

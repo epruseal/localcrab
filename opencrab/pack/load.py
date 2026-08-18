@@ -345,6 +345,26 @@ def _confirmed_rowcount(rc) -> int | None:
     return rc
 
 
+def _rowcount_reason(rc) -> str:
+    """`_confirmed_rowcount(rc) is None` 일 때 **왜** 미확인인지 한 단어로.
+
+    **이 함수는 그 조건에서만 불린다** — `"음수"` 분기는 `type(rc) is int` 가
+    참일 때만 도달하므로 진짜 음수만 남는다.
+
+    분류는 `is` 와 `type()` 만 쓴다. 적대적 객체의 메서드를 부르지 않으려는 것이다 —
+    로그 인자로 원시 rowcount 나 그 타입을 넘기면 **포맷 단계**에서 `__repr__`·
+    메타클래스 `__str__` 이 돌고, 거기서 터지면 `logging` 이 레코드를 통째로
+    버려 사유가 사라진다(적대 검증 실증). 그래서 원시값 대신 이 분류만 남긴다.
+    """
+    if rc is None:
+        return "없음"
+    if type(rc) is bool:
+        return "bool"
+    if type(rc) is not int:
+        return "정수아님"
+    return "음수"
+
+
 def _id_set(got) -> set[str] | None:
     """chroma 조회 응답에서 **믿을 수 있는 id 집합**만 꺼낸다. 아니면 `None`(판독 불가).
 
@@ -874,8 +894,8 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                 if chunk_vec_del is None:
                     # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
                     # 어느 백엔드가 무엇을 안 세어줬는지 알 수 없다.
-                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
-                                kind, pack_name, rc, type(rc))
+                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
+                                kind, pack_name, _rowcount_reason(rc))
             elif kind == "chroma":
                 # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
                 # 근거와 동일: source 는 소유 키가 아니다).
@@ -906,10 +926,14 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                 if chroma_unreadable:
                     # 락은 위 `with` 가 이미 풀었다 — 락을 쥔 채 로깅하지 않으면서도
                     # 인자 평가가 `try` 안이라, 적대적 `vec` 이 여기서 던져도 흡수된다.
-                    # `type(vec)` 은 타입 슬롯을 읽어 가로챌 수 없다(`__name__` 은
-                    # 메타클래스가 가로챌 수 있는 속성 접근이다).
+                    # **진단 객체는 포맷하지 않는다**: 인자 평가가 안전해도(`type()` 은
+                    # 타입 슬롯 읽기라 가로챌 수 없다) 포맷 단계가 메타클래스 `__str__`
+                    # 을 돌리고, 거기서 터지면 `logging` 이 레코드를 버려 사유가 통째로
+                    # 사라진다(적대 검증 실증). `kind` 는 `_vec_backend` 가 내는 리터럴,
+                    # 뒤는 우리가 쓴 문자열이다. (`pack_name` 은 이 함수의 기존 로그·요약이
+                    # 이미 포맷하는 값 — 이 변경이 새로 만든 노출이 아니다.)
                     log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
-                                type(vec), pack_name, chroma_unreadable)
+                                kind, pack_name, chroma_unreadable)
             elif kind == "sqlalchemy":
                 from sqlalchemy import text as _sa_text
                 chunk_vec_del = None                                   # R1
@@ -918,8 +942,8 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                                     {"p": pack_name}).rowcount
                 chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
                 if chunk_vec_del is None:
-                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount=%r(%s)",
-                                kind, pack_name, rc, type(rc))
+                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
+                                kind, pack_name, _rowcount_reason(rc))
             else:
                 # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
                 # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
