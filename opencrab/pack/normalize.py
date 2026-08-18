@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 
+from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.grammar.manifest import SPACES as _GRAMMAR_SPACES
 from opencrab.pack.schema import (
     NODE_TYPE_OVERRIDE,
@@ -298,9 +299,10 @@ def transform_node(pack_name: str, row: dict) -> tuple[str, str, str, dict]:
     if original_type != node_type:
         props["original_type"] = original_type
 
-    # 일관 태깅
-    props["pack_id"] = pack_name
-    props["pack"]    = pack_name
+    # 일관 태깅. `pack_id` 가 유일한 소유 키다 — 폐기 별칭 `pack` 은 여기서 버린다
+    # (#159/#171). 이 자리는 `pack_name` 이 구성상 권위이므로 입력에 실려 온 다른
+    # 값은 낡은 값이고, 예외를 던지면 그 노드가 로더의 skip 으로 유실된다.
+    apply_pack_tag(props, pack_name)
     props.setdefault("degree", row.get("degree", 0))
     label = row.get("label") or node_id
     # schema 필수 필드 자동 채움
@@ -390,8 +392,10 @@ def transform_chunk_meta(pack_name: str, row: dict) -> dict:
     # 원본 문서 경로는 source_doc 으로 보존(아래 source=pack_name 과 충돌 방지)
     if "source" in meta:
         meta["source_doc"] = meta.pop("source")
-    # 권위 필드는 항상 pack_name 으로 고정(기존 적재분과 의미 일치 — pack 필터/삭제 호환)
-    meta["pack_id"] = pack_name
+    # 권위 필드는 항상 pack_name 으로 고정(기존 적재분과 의미 일치 — pack 필터/삭제 호환).
+    # `source` 는 doc 축의 레거시 폴백 소유 태그라 유지한다(`load._doc_owner_pred`).
+    # 폐기 별칭 `pack` 은 버린다(#159/#171).
+    apply_pack_tag(meta, pack_name)
     meta["source"]  = pack_name
     if row.get("document_id"):
         meta["document_id"] = row["document_id"]
