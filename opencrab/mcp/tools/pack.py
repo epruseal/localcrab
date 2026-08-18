@@ -477,26 +477,21 @@ def _ingest_into_pack(
                 stores["evidence_node"] = f"error: {exc}"
             text_ingested = True
         else:
-            # Legacy path: vector-only embedding + doc_sources record.
+            # Legacy path: vector-only embedding + doc_sources record, now
+            # through the write_source chokepoint (#148) instead of two
+            # independent calls -- see opencrab/pack/source_writer.py for why
+            # (doc row first, one ownership stamp for both).
             reason = _foreign_pack(pack_id, _source_probes(ctx, source_id))
             if reason:
                 node_errors.append(_identity_reject_message("source", source_id, reason))
             else:
-                try:
-                    vector_result = ctx["hybrid"].ingest(
-                        text=text, source_id=source_id, metadata=meta
-                    )
-                    stores.update(vector_result.get("stores", {}))
-                except Exception as exc:
-                    stores["chromadb"] = f"error: {exc}"
-                if ctx["mongo"].available:
-                    try:
-                        ctx["mongo"].upsert_source(source_id, text, meta)
-                        stores["mongodb"] = "ok"
-                    except Exception as exc:
-                        stores["mongodb"] = f"error: {exc}"
-                else:
-                    stores["mongodb"] = "unavailable"
+                from opencrab.pack.source_writer import write_source
+
+                write_result = write_source(
+                    ctx["hybrid"], ctx["mongo"], text=text, source_id=source_id,
+                    metadata=meta, pack_id=pack_id,
+                )
+                stores.update(write_result.get("stores", {}))
 
                 text_ingested = True
 

@@ -439,11 +439,14 @@ def status() -> None:
 )
 def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
-    from opencrab.auth import require_local_principal
+    from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
+    from opencrab.ontology.builder import store_write_failures
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
+    from opencrab.pack.ownership import resolve_write_pack
+    from opencrab.pack.source_writer import write_source
 
     # #145: a CLI write is attributed to the local user, and resolving the
     # principal happens BEFORE any store is opened or written -- a missing
@@ -457,7 +460,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
         raise SystemExit(1) from exc
 
     cfg = get_settings()
-    stores = _make_stores(cfg, graph=True, vector=True, doc=True)
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
     chroma, neo4j, mongo = stores.vector, stores.graph, stores.doc
     hybrid = HybridQuery(chroma, neo4j)
 
@@ -482,29 +485,39 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             if not text.strip():
                 continue
             source_id = str(file.resolve())
-            # user_id is the audit actor for this source row. Set from the
-            # server-resolved principal, never from anything the caller typed.
             meta = {
                 "source_path": str(file),
                 "extension": file.suffix,
-                "user_id": principal.user_id,
             }
 
+            # write_source requires a non-optional pack_id (#143 invariant 5:
+            # "no pack" must not be expressible) -- prefer the path-inferred
+            # pack like before, and fall back to the principal's default pack
+            # instead of leaving a file unpacked.
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-            if effective_pack:
-                meta["pack_id"] = effective_pack
+            target_pack_id = effective_pack or resolve_write_pack(stores.sql, principal, None)
 
-            with write_lock():
-                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+            with principal_scope(principal), write_lock():
+                receipt = write_source(
+                    hybrid, mongo, text=text, source_id=source_id,
+                    metadata=meta, pack_id=target_pack_id,
+                )
+                # write_source reports per-store failures in the receipt
+                # rather than raising (#158 contract) -- unlike the old
+                # unguarded hybrid.ingest()/mongo.upsert_source() calls this
+                # replaces, a failure here would otherwise be swallowed and
+                # counted as an "OK" file.
+                failures = store_write_failures(receipt["stores"])
+                if failures:
+                    raise RuntimeError("; ".join(failures))
 
                 if mongo.available:
-                    mongo.upsert_source(source_id, text, meta)
                     # Audit row carries the same actor as the source metadata.
                     try:
                         mongo.log_event(
                             "ingest",
                             subject_id=principal.user_id,
-                            details={"source_id": source_id, "pack_id": effective_pack},
+                            details={"source_id": source_id, "pack_id": target_pack_id},
                         )
                     except Exception as exc:  # noqa: BLE001
                         # Audit is best-effort by contract: a failed audit row
@@ -516,8 +529,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                         )
 
             ok_count += 1
-            tag = f" pack={effective_pack}" if effective_pack else ""
-            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
+            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars) pack={target_pack_id}")
         except Exception as exc:
             console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 

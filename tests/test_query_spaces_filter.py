@@ -41,9 +41,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.ontology.query import HybridQuery
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+_INGESTOR = Principal(user_id="user_ingestor", is_local=False, disabled=False)
 
 # ---------------------------------------------------------------------------
 # Leg 1 — HybridQuery._fts_search must forward `spaces` to keyword_search
@@ -348,7 +351,7 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
-    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
         _ingest_into_pack(
             "pack-a",
             text="JASO M345 apple oil standard classification",
@@ -386,7 +389,7 @@ def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
-    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
         _ingest_into_pack(
             "pack-a",
             text="JASO M345 banana oil standard classification",

@@ -209,14 +209,6 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
 
 
-def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, Any]) -> str | None:
-    if not _docs_available(docs):
-        return None
-
-    created = docs.upsert_source(source_id, text, metadata)
-    return created or source_id
-
-
 def _count_user_nodes(docs: Any, user_id: str) -> CountResult:
     if not _docs_available(docs):
         return CountResult(value=0, status="unavailable")
@@ -543,27 +535,39 @@ def ingest_text(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import resolve_write_pack
+    from opencrab.pack.source_writer import write_source
+
     source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
     metadata = dict(payload.metadata)
-    metadata.setdefault("user_id", auth.user_id)
     metadata.setdefault("source_id", source_id)
 
     with write_lock():
         _enforce_ingest_limits(ctx, auth, source_id)
+        # IngestRequest carries no pack_id field, so every REST ingest lands
+        # in the caller's default pack (unlike /api/nodes /api/edges, which
+        # accept an explicit one).
+        target_pack_id = resolve_write_pack(ctx.sql, auth.principal, None)
         try:
-            result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
+            with principal_scope(auth.principal):
+                receipt = write_source(
+                    ctx.hybrid, ctx.docs,
+                    text=payload.text, source_id=source_id,
+                    metadata=metadata, pack_id=target_pack_id,
+                )
         except ValueError as exc:
             # Ownership-tag invariant violation (#171) — a client error, not a 500.
             # Same disposition the node/edge endpoints already give ValueError.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
-        if source_doc_id:
-            result["stores"]["documents"] = f"ok (id={source_doc_id})"
-        elif _docs_available(ctx.docs):
-            result["stores"]["documents"] = "ok"
-        else:
-            result["stores"]["documents"] = "unavailable"
+        # Adapter: keep the pre-#148 envelope (source_id/stores/vector_id at
+        # the top level, no receipt "metadata") rather than handing the
+        # write_source receipt back verbatim -- this shape is a pinned
+        # response contract.
+        result: dict[str, Any] = {"source_id": source_id, "stores": dict(receipt["stores"])}
+        if "vector_id" in receipt:
+            result["vector_id"] = receipt["vector_id"]
 
         _log_event(
             ctx.docs,

@@ -476,26 +476,43 @@ class TestIngestIntoPack:
         assert result["stores"]["evidence_node"] == "error: vector store down"
 
     def test_error_legacy_path_hybrid_ingest_failure_recorded(self):
-        """text_as_node=False legacy path: hybrid.ingest() raising is caught
-        and recorded as stores['chromadb'], not propagated."""
+        """text_as_node=False legacy path (now routed through
+        opencrab.pack.source_writer.write_source, #148): an embed failure is
+        reported in stores['chromadb'], not propagated. hybrid.ingest() is
+        given its REAL contract's failure shape (a returned "error: ..."
+        status) rather than a raised exception -- HybridQuery.ingest()
+        (opencrab/ontology/query.py) never raises in production, it always
+        returns a stores dict, so write_source (unlike the two independent
+        try/excepts this replaced) does not wrap that call in its own
+        try/except."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         hybrid = MagicMock()
-        hybrid.ingest.side_effect = RuntimeError("embed failed")
+        hybrid.ingest.return_value = {"stores": {"chromadb": "error: embed failed"}}
         mongo = MagicMock()
         mongo.available = True
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
+        mongo.upsert_source.return_value = "src-2"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
-            )
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
+                )
         assert result["stores"]["chromadb"] == "error: embed failed"
-        assert result["stores"]["mongodb"] == "ok"
+        assert result["stores"]["documents"] == "ok (id=src-2)"
         assert result["text_ingested"] is True
 
     def test_error_legacy_path_mongo_upsert_failure_recorded(self):
         """text_as_node=False legacy path: mongo.upsert_source() raising is
-        caught and recorded as stores['mongodb'], not propagated."""
+        caught by write_source and recorded as stores['documents'], not
+        propagated. write_source's doc-first contract also means the vector
+        write is skipped after a doc-store failure (opencrab/pack/
+        source_writer.py: "a vector row pointing at a source that failed to
+        record is an orphan no read path can hydrate")."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         hybrid = MagicMock()
         hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
@@ -505,10 +522,11 @@ class TestIngestIntoPack:
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
-            )
-        assert result["stores"]["mongodb"] == "error: mongo down"
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
+                )
+        assert result["stores"]["documents"] == "error: mongo down"
 
     def test_error_legacy_path_both_stores_unavailable_does_not_bill(self):
         """#66 codex re-review (3rd round): the legacy text_as_node=False
@@ -518,18 +536,21 @@ class TestIngestIntoPack:
         the "graph" store, and this path never sets that key), so a legacy
         ingest where BOTH the vector store and the doc store are unavailable
         — nothing written anywhere — still fired on_ingest. Pin: it must not."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
         hybrid.ingest.return_value = {"stores": {"chromadb": "unavailable"}}
         mongo = MagicMock()
-        mongo.available = False  # -> stores["mongodb"] = "unavailable"
+        mongo.available = False  # -> stores["documents"] = "unavailable"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
-            )
-        assert result["stores"] == {"chromadb": "unavailable", "mongodb": "unavailable"}
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+                )
+        assert result["stores"] == {"chromadb": "unavailable", "documents": "unavailable"}
         assert result["text_ingested"] is True  # the attempt was made
         billing.on_ingest.assert_not_called()  # but nothing actually landed
 
