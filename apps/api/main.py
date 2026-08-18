@@ -18,12 +18,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / "apps" / ".env", override=False)
 load_dotenv(REPO_ROOT / ".env", override=False)
 
+from opencrab.auth import Principal
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
 from opencrab.locking import write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
+from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
 from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 from opencrab.stores.factory import (
     make_doc_store,
@@ -58,7 +60,7 @@ class QueryRequest(BaseModel):
     graph_depth: int = Field(default=1, ge=1, le=4, description="Neighborhood expansion depth.")
     pack_ids: list[str] | None = Field(default=None, description="Restrict search to these content packs.")
     auto_pack: bool = Field(default=False, description="Auto-select the best-matching pack for the question.")
-    include_unpackaged: bool = Field(default=False, description="Also include unpackaged nodes when a pack filter is active.")
+    include_unpackaged: bool = Field(default=False, description=("IGNORED (#147). Reads are always scoped to the packs you can read; data belonging to no pack is outside every scope. Passing true returns a warning, not unpackaged rows."))
 
 
 class ImpactRequest(BaseModel):
@@ -87,6 +89,14 @@ class EdgeRequest(BaseModel):
 class AuthContext:
     user_id: str
     tier: str
+    # #147: the verified Principal, so every scoped read on this request can
+    # derive its pack filter from opencrab.pack.read_scope.read_scope(sql,
+    # principal) instead of a second, ad-hoc identity. `user_id` stays a
+    # separate field (== principal.user_id) rather than being removed,
+    # because ~30 existing reads of `auth.user_id` in this module (owner
+    # stamping, ingest quota checks, audit attribution, /api/usage) must not
+    # all change at once for an unrelated reason.
+    principal: Principal
 
 
 @dataclass(frozen=True)
@@ -288,32 +298,6 @@ def _count_user_queries(docs: Any, user_id: str) -> CountResult:
     return CountResult(value=matched, status="ok")
 
 
-def _count_total_queries(docs: Any) -> CountResult:
-    if not _docs_available(docs):
-        return CountResult(value=0, status="unavailable")
-
-    if hasattr(docs, "_db"):
-        try:
-            value = int(
-                docs._db["audit_log"].count_documents(
-                    {"event_type": {"$in": list(QUERY_EVENTS)}}
-                )
-            )
-            return CountResult(value=value, status="ok")
-        except Exception as exc:
-            return _classify_count_exc(exc)
-
-    try:
-        rows = docs.get_audit_log(limit=1000)
-    except TypeError:
-        rows = docs.get_audit_log()
-    except Exception as exc:
-        return _classify_count_exc(exc)
-
-    matched = sum(1 for row in rows if row.get("event_type") in QUERY_EVENTS)
-    return CountResult(value=matched, status="ok")
-
-
 def _recent_activity(docs: Any, user_id: str, limit: int = 8) -> list[dict[str, Any]]:
     if not _docs_available(docs):
         return []
@@ -407,6 +391,11 @@ async def lifespan(app: FastAPI) -> Any:
 
     refuse_stale_shared_secret_env()
     app.state.context = _build_context()
+    # #147: the registry/graph reconciliation guard needs a live sql + graph
+    # store, so it cannot run before _build_context() the way
+    # refuse_stale_shared_secret_env() does -- there is nothing to check
+    # against yet at that point.
+    assert_registry_covers_graph(app.state.context.sql, app.state.context.graph)
     try:
         yield
     finally:
@@ -473,7 +462,7 @@ def require_auth(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return AuthContext(user_id=principal.user_id, tier=_tier())
+    return AuthContext(user_id=principal.user_id, tier=_tier(), principal=principal)
 
 
 def _enforce_ingest_limits(ctx: ApiContext, auth: AuthContext, source_id: str) -> None:
@@ -505,8 +494,26 @@ def _enforce_ingest_limits(ctx: ApiContext, auth: AuthContext, source_id: str) -
         )
 
 
+@app.get("/healthz")
+def healthz() -> dict[str, Any]:
+    """Auth-exempt liveness probe (#147).
+
+    Locking /api/status behind require_auth (below) removes this app's only
+    unauthenticated probe -- monitoring and cloudflared health checks would
+    have nothing to poll. This endpoint intentionally carries none of
+    /api/status's payload: no storage_mode, no per-store availability. Those
+    fields are exactly what #147 is closing off from unauthenticated callers,
+    so a "trimmed" /api/status here would still leak them. Mirrors
+    opencrab/mcp/http_app.py's own auth-exempt /healthz.
+    """
+    return {"ok": True}
+
+
 @app.get("/api/status")
-def get_status(ctx: ApiContext = Depends(get_context)) -> dict[str, Any]:
+def get_status(
+    auth: AuthContext = Depends(require_auth),
+    ctx: ApiContext = Depends(get_context),
+) -> dict[str, Any]:
     return {
         "ok": True,
         "service": "opencrab-api",
@@ -581,12 +588,14 @@ def query_ontology(
     # Pack selection shares the MCP/CLI service so the three query surfaces agree
     # on the resolved filter and warning vocabulary (auto_pack failures degrade
     # gracefully rather than failing the search).
+    scope = read_scope(ctx.sql, auth.principal)
     selection = resolve_packs(
         payload.question,
         payload.pack_ids,
         payload.auto_pack,
         payload.include_unpackaged,
         ctx.settings.local_data_dir,
+        scope=scope,
         raise_on_error=False,
     )
 
@@ -596,22 +605,28 @@ def query_ontology(
         limit=payload.limit,
         graph_depth=payload.graph_depth,
         pack_ids=selection.effective_pack_ids,
-        include_unpackaged=payload.include_unpackaged,
     )
     results = outcome.results
 
     keyword_fallback: list[dict[str, Any]] = []
     if not results:
+        # #147: the CALLER'S FULL readable scope, not selection.effective_pack_ids.
+        # This fallback only fires when the primary (pack-filtered) search came
+        # up empty, and its job is to widen the search -- narrowing it to the
+        # same effective_pack_ids the primary leg already tried would make it
+        # search the identical space and always come up empty too. Widening
+        # stops at the caller's own read scope, never past it.
         keyword_fallback = ctx.hybrid.keyword_search(
             keyword=payload.question,
             spaces=payload.spaces,
             limit=payload.limit,
+            pack_ids=sorted(scope),
         )
 
     pack_filter: dict[str, Any] = {
         "pack_ids": selection.effective_pack_ids,
         "auto_pack": selection.auto_pack_active,
-        "include_unpackaged": bool(payload.include_unpackaged),
+        "include_unpackaged": selection.include_unpackaged_effective,
     }
     if selection.warnings:
         pack_filter["warnings"] = [mcp_warning_text(w) for w in selection.warnings]
@@ -655,6 +670,7 @@ def analyse_impact(
             node_id=payload.node_id,
             change_type=payload.change_type,
             depth=payload.depth,
+            pack_ids=sorted(read_scope(ctx.sql, auth.principal)),
         ).to_dict()
         _log_event(
             ctx.docs,
@@ -742,17 +758,19 @@ def get_usage(
         "sources": sources_count.to_dict(),
         "queries": _count_user_queries(ctx.docs, auth.user_id).to_dict(),
     }
-    system = {
-        "nodes": _safe_count(ctx.graph.count_nodes).to_dict(),
-        "vectors": _safe_count(ctx.vector.count).to_dict(),
-        "queries": _count_total_queries(ctx.docs).to_dict(),
-    }
+    # #147: the `system` block (all-user audit-event count, whole-graph node
+    # count, whole-vector-store count) is gone. All three counters were
+    # cross-user aggregates with no per-caller filter, on an endpoint whose
+    # entire contract is "your own usage" -- removing one and keeping the
+    # other two would leave the remaining ones no more scoped than the one
+    # that got cut, so keeping any of them is not a smaller version of this
+    # fix, it is a different fix that does not address the reason this one
+    # exists.
     return {
         "user_id": auth.user_id,
         "tier": auth.tier,
         "limits": _limits_for_tier(auth.tier),
         "usage": usage,
-        "system": system,
         "recent_activity": _recent_activity(ctx.docs, auth.user_id),
     }
 
@@ -788,19 +806,20 @@ def list_nodes(
     "N links" labels should describe what is on screen. Callers needing true
     degree must count edges themselves.
     """
-    # export_nodes/export_edges are part of the graph-store protocol
-    # (opencrab/stores/_graph_protocol.py) and every backend implements them.
-    # The previous implementation called ctx.graph.run_query(<Cypher>), which is
-    # defined by no store in this repo -- it raised AttributeError on the SQL
-    # backends and would have hit the no-op run_cypher() stub even if renamed.
-    # This mirrors the normalisation ontology_list_nodes already uses.
+    # export_nodes_scoped/export_edges_scoped are the #147 authorization-scoped
+    # counterparts of export_nodes/export_edges (opencrab/stores/_graph_protocol.py)
+    # -- the plain export_* methods use a 3/5-way OR predicate meant for pack
+    # export/fork, which would let a node outside the caller's scope through via
+    # source/source_id inference (design #147 §3.4b). Every backend implements
+    # the _scoped pair.
+    scope_list = sorted(read_scope(ctx.sql, auth.principal))
     try:
-        raw = ctx.graph.export_nodes(limit=NODE_VIZ_LIMIT)
+        raw = ctx.graph.export_nodes_scoped(scope_list, limit=NODE_VIZ_LIMIT)
 
         # Computed from the same edge set the graph view renders, so the two
         # endpoints stay consistent with each other.
         degree_in_view: dict[str, int] = {}
-        for item in ctx.graph.export_edges(limit=EDGE_VIZ_LIMIT):
+        for item in ctx.graph.export_edges_scoped(scope_list, limit=EDGE_VIZ_LIMIT):
             for side in ("source_props", "target_props"):
                 nid = _viz_node_id(item.get(side) or {})
                 if nid:
@@ -834,7 +853,8 @@ def list_edges(
 ) -> dict[str, Any]:
     """Return all edges for graph visualization."""
     try:
-        raw = ctx.graph.export_edges(limit=EDGE_VIZ_LIMIT)
+        scope_list = sorted(read_scope(ctx.sql, auth.principal))
+        raw = ctx.graph.export_edges_scoped(scope_list, limit=EDGE_VIZ_LIMIT)
         edges = []
         for item in (raw or []):
             src = item.get("source_props") or {}

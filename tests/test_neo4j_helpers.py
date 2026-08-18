@@ -376,3 +376,170 @@ class TestNeo4jStoreEdgeCases:
         mock_session.run.return_value = []
 
         assert store.run_cypher("MATCH (n) RETURN n") == []
+
+
+def test_find_neighbors_empty_scope_returns_nothing_without_querying() -> None:
+    """#147: on Neo4j this short-circuit is the ONLY thing enforcing an
+    empty read scope.
+
+    The SQL and Kuzu backends filter every visited node again in Python
+    (``_node_passes``), so removing their short-circuit still yields no
+    rows. Neo4j returns Cypher records straight through, and
+    ``_build_neighbors_cypher`` folds an empty ``pack_ids`` into "no pack
+    clause at all" -- so without this guard a principal who may read no
+    pack would traverse the whole graph. Asserting the session is never
+    opened pins the guard itself rather than a downstream effect that does
+    not exist here.
+    """
+    store, _driver, session = _make_connected_store()
+    # _make_connected_store's own connectivity probe already ran a query.
+    session.run.reset_mock()
+
+    assert store.find_neighbors("n1", pack_ids=[]) == []
+    session.run.assert_not_called()
+
+
+def test_build_neighbors_cypher_has_no_pack_clause_for_an_empty_scope() -> None:
+    """Why the guard above cannot be dropped: the builder itself cannot
+    express "match nothing". This is the failure mode, pinned so nobody
+    concludes the builder is defensive on its own."""
+    store, _driver, _session = _make_connected_store()
+
+    cypher, params = store._build_neighbors_cypher(
+        "n1", "both", 1, 5, pack_ids=[], include_unpackaged=False, spaces=None
+    )
+    assert "pack_id" not in cypher
+    assert "pack_ids" not in params
+
+
+class TestScopedReadPredicates:
+    """#147: the three scoped read methods, whose Cypher no other test runs.
+
+    On a docker (Neo4j) deployment these are the ONLY authorization point
+    behind `ontology_list_nodes`, `ontology_list_edges`, `ontology_get_node`,
+    `GET /api/nodes` and `GET /api/edges` -- the handlers pass their results
+    into the response without re-filtering. `tests/test_pack_neo4j_export.py`
+    uses a fake store, so it never executes these bodies either. Mock-session
+    assertions are weaker than a live query (they cannot show the Cypher is
+    semantically right) but they do pin that the pack clause is applied and
+    the parameter bound, which is what silent removal looks like.
+    """
+
+    def test_export_nodes_scoped_filters_on_pack_id(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.export_nodes_scoped(["p1", "p2"], limit=10)
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1", "p2"]
+
+    def test_export_edges_scoped_requires_both_endpoints_and_the_edge(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.export_edges_scoped(["p1"], limit=10)
+
+        cypher = session.run.call_args[0][0]
+        # Both endpoints AND the edge's own pack: an edge row carries both
+        # endpoints' full properties, so one unreadable endpoint discloses
+        # that node. OR-any-endpoint is the pack-export rule, not this one.
+        assert "a.pack_id IN $pack_ids" in cypher
+        assert "b.pack_id IN $pack_ids" in cypher
+        assert "r.pack_id IS NULL OR r.pack_id IN $pack_ids" in cypher
+
+    def test_get_node_by_id_scoped_filters_on_pack_id(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value.single.return_value = None
+
+        store.get_node_by_id_scoped("n1", ["p1"])
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+
+    def test_empty_scope_never_reaches_the_session(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.reset_mock()
+
+        assert store.export_nodes_scoped([], limit=10) == []
+        assert store.export_edges_scoped([], limit=10) == []
+        assert store.count_exported_nodes_scoped([]) == 0
+        assert store.get_node_by_id_scoped("n1", []) is None
+        session.run.assert_not_called()
+
+
+
+class TestScopedRelationLookup:
+    """`find_by_relations_scoped`, which `lever_simulate` now relies on alone.
+
+    That handler dropped its Python post-filter when this method arrived, so
+    on a docker deployment these three Cypher clauses are the whole of the
+    authorization for `ontology_lever_simulate` -- nothing below re-checks.
+    Same mock-session strength as `TestScopedReadPredicates`: it cannot show
+    the Cypher is semantically right, but it does show each clause is still
+    applied and the parameters bound.
+    """
+
+    def test_constrains_anchor_endpoint_and_edge(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.return_value = []
+
+        store.find_by_relations_scoped("lev-1", ["raises"], ["p1"], "out", 20)
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "a.pack_id IN $pack_ids" in cypher
+        assert "b.pack_id IN $pack_ids" in cypher
+        assert "r.pack_id IS NULL OR r.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+        assert params["relations"] == ["raises"]
+        # The relation-type filter must be in the query, not applied after.
+        assert "type(r) IN $relations" in cypher
+
+    def test_empty_scope_or_relations_never_reaches_the_session(self) -> None:
+        store, _driver, session = _make_connected_store()
+        session.run.reset_mock()
+
+        assert store.find_by_relations_scoped("lev-1", ["raises"], [], "out", 20) == []
+        assert store.find_by_relations_scoped("lev-1", [], ["p1"], "out", 20) == []
+        session.run.assert_not_called()
+
+    def test_count_exported_nodes_scoped_filters_on_pack_id(self) -> None:
+        """`total` is a separate query from the page: an unscoped count leaks
+        how much data other users hold even when their rows are withheld."""
+        store, _driver, session = _make_connected_store()
+        session.run.return_value.single.return_value = None
+
+        store.count_exported_nodes_scoped(["p1"])
+
+        cypher = session.run.call_args[0][0]
+        params = session.run.call_args[1]
+        assert "n.pack_id IN $pack_ids" in cypher
+        assert params["pack_ids"] == ["p1"]
+
+    def test_list_pack_ids_enumerates_edges_too(self) -> None:
+        """An edge may carry a pack_id no node has; the startup guard has to
+        see it or that pack starts unregistered and its edges vanish.
+
+        Asserts on the RESULT, not just on the query text: a mutation that
+        keeps the edge query but drops its rows would satisfy a text-only
+        check while the guard went blind to edge-only packs.
+        """
+        store, _driver, session = _make_connected_store()
+
+        def _rows(cypher, **_kw):
+            if "-[r]->" in cypher:
+                return [{"pid": "p-edge-only"}]
+            return [{"pid": "p-node"}]
+
+        session.run.side_effect = _rows
+
+        assert store.list_pack_ids() == {"p-node", "p-edge-only"}
+
+        queries = [c[0][0] for c in session.run.call_args_list]
+        assert any("MATCH (n)" in q and "n.pack_id" in q for q in queries)
+        assert any("-[r]->" in q and "r.pack_id" in q for q in queries)

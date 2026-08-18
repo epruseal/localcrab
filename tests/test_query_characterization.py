@@ -46,7 +46,11 @@ def _node(node_id: str, text: str = "alpha beta", updated_at: str | None = None)
         "node_id": node_id,
         "space": "claim",
         "node_type": "Claim",
-        "properties": {"name": text},
+        # #147: BM25Index.search() now unconditionally filters on
+        # in_pack_scope(doc, pack_set) (opencrab/ontology/bm25.py) -- a doc
+        # with no pack_id never passes, regardless of pack_ids. "pack-a" is
+        # the pack_ids scope every _bm25_search() call in this file passes.
+        "properties": {"name": text, "pack_id": "pack-a"},
     }
     if updated_at:
         doc["updated_at"] = updated_at
@@ -84,7 +88,7 @@ class TestBm25WorkerNormal:
             hybrid.invalidate_bm25_cache()
             assert _wait_until(lambda: hybrid._bm25_cache is not None)
             assert _wait_until(lambda: hybrid._bm25_cache_size == 2)
-            hits = hybrid._bm25_search("alpha", spaces=None, limit=5)
+            hits = hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["pack-a"])
             assert {h["node_id"] for h in hits} == {"a", "b"}
         finally:
             hybrid.shutdown_bm25()
@@ -97,7 +101,7 @@ class TestBm25WorkerNormal:
         doc_store.list_nodes = MagicMock(return_value=[_node("a")])
         hybrid = _hybrid_with_doc_store(doc_store)
         try:
-            hybrid._bm25_search("x", spaces=None, limit=5)  # cold synchronous build
+            hybrid._bm25_search("x", spaces=None, limit=5, pack_ids=["pack-a"])  # cold synchronous build
             first_cache = hybrid._bm25_cache
             hybrid.invalidate_bm25_cache()  # corpus unchanged -> "nothing changed" leg
             assert _wait_until(lambda: doc_store.list_nodes.call_count >= 2)
@@ -138,7 +142,12 @@ class TestBm25WorkerError:
         doc_store.list_nodes = MagicMock(side_effect=RuntimeError("boom"))
         hybrid = _hybrid_with_doc_store(doc_store)
         try:
-            assert hybrid._bm25_search("q", spaces=None, limit=5) == []
+            # pack_ids must be non-empty here -- an empty scope short-circuits
+            # to [] before list_nodes() is ever called (see _bm25_search's
+            # `if not pack_ids: return []` guard), which would make this
+            # assertion pass without ever exercising the exception path this
+            # test is about.
+            assert hybrid._bm25_search("q", spaces=None, limit=5, pack_ids=["pack-a"]) == []
         finally:
             hybrid.shutdown_bm25()
 
@@ -306,7 +315,7 @@ class TestKeywordSearchNeo4jPath:
         neo4j = MagicMock()
         neo4j.available = False
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        assert hybrid.keyword_search("x") == []
+        assert hybrid.keyword_search("x", pack_ids=["pack-a"]) == []
 
     def test_cypher_path_returns_rows_and_forwards_params(self) -> None:
         neo4j = MagicMock()
@@ -315,7 +324,7 @@ class TestKeywordSearchNeo4jPath:
             return_value=[{"props": {"name": "n1"}, "label": "Concept"}]
         )
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        results = hybrid.keyword_search("term", spaces=["s1"], limit=5)
+        results = hybrid.keyword_search("term", spaces=["s1"], limit=5, pack_ids=["pack-a"])
         assert results == [{"node": {"name": "n1"}, "label": "Concept"}]
         _cypher, params = neo4j.run_cypher.call_args.args
         assert params["kw"] == "term"
@@ -327,7 +336,7 @@ class TestKeywordSearchNeo4jPath:
         neo4j.available = True
         neo4j.run_cypher = MagicMock(side_effect=RuntimeError("boom"))
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        assert hybrid.keyword_search("x") == []
+        assert hybrid.keyword_search("x", pack_ids=["pack-a"]) == []
 
 
 class TestKeywordSearchPgRouting:
@@ -353,10 +362,11 @@ class TestKeywordSearchPgRouting:
         )
         hybrid = HybridQuery(MagicMock(available=False), pg)
 
-        results = hybrid.keyword_search("term", spaces=["s1"], limit=5)
+        results = hybrid.keyword_search("term", spaces=["s1"], limit=5, pack_ids=["pack-a"])
 
         assert results == [{"node": {"name": "n1"}, "label": "Concept"}]
-        pg.search_nodes.assert_called_once_with("term", spaces=["s1"], limit=5)
+        # #147: search_nodes() now takes a required pack_ids kwarg too.
+        pg.search_nodes.assert_called_once_with("term", pack_ids=["pack-a"], spaces=["s1"], limit=5)
         pg.run_cypher.assert_not_called()
 
 
@@ -399,7 +409,7 @@ class TestPolicyFilter:
 class TestGraphExpand:
     def test_neo4j_unavailable_returns_empty(self) -> None:
         hybrid = _inert_hybrid()
-        assert hybrid._graph_expand(["a"], depth=1, limit=10) == []
+        assert hybrid._graph_expand(["a"], depth=1, limit=10, pack_ids=["pack-a"]) == []
 
     def test_pack_ids_forwarded_only_when_active(self) -> None:
         neo4j = MagicMock()
@@ -415,9 +425,16 @@ class TestGraphExpand:
         assert kwargs["include_unpackaged"] is True
 
         neo4j.find_neighbors.reset_mock()
-        hybrid._graph_expand(["anchor1"], depth=1, limit=10, pack_ids=None)
-        kwargs = neo4j.find_neighbors.call_args.kwargs
-        assert "pack_ids" not in kwargs
+        # #147: pack_ids is required and an empty/falsy scope now means
+        # "nothing is readable" -- _graph_expand answers that itself with []
+        # BEFORE ever calling find_neighbors (opencrab/ontology/query.py's
+        # `if not pack_ids: return []` guard), rather than calling it with
+        # pack_ids simply omitted from the kwargs as it used to. So "forwarded
+        # only when active" now means find_neighbors is not called at all
+        # when pack_ids is inactive, not that it's called without the kwarg.
+        result = hybrid._graph_expand(["anchor1"], depth=1, limit=10, pack_ids=None)
+        assert result == []
+        neo4j.find_neighbors.assert_not_called()
 
     def test_exception_for_one_anchor_does_not_abort_others(self) -> None:
         def side_effect(node_id, **kwargs):
@@ -436,7 +453,7 @@ class TestGraphExpand:
         neo4j.available = True
         neo4j.find_neighbors = MagicMock(side_effect=side_effect)
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        results = hybrid._graph_expand(["bad", "good"], depth=1, limit=10)
+        results = hybrid._graph_expand(["bad", "good"], depth=1, limit=10, pack_ids=["pack-a"])
         assert len(results) == 1
         assert results[0].node_id == "good_n"
 
@@ -452,7 +469,7 @@ class TestGraphExpand:
             "to_id": "n2",
         }])
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        ctx = hybrid._graph_expand(["anchor"], depth=2, limit=10)[0].graph_context
+        ctx = hybrid._graph_expand(["anchor"], depth=2, limit=10, pack_ids=["pack-a"])[0].graph_context
         assert ctx["edge_endpoints"] == {"from_id": "n1", "to_id": "n2"}
         # anchor_id는 그대로 유지되어야 한다(호환), 다만 edge source가 아니다.
         assert ctx["anchor_id"] == "anchor"
@@ -467,7 +484,7 @@ class TestGraphExpand:
             "depth": 1,
         }])
         hybrid = HybridQuery(MagicMock(available=False), neo4j)
-        ctx = hybrid._graph_expand(["anchor"], depth=1, limit=10)[0].graph_context
+        ctx = hybrid._graph_expand(["anchor"], depth=1, limit=10, pack_ids=["pack-a"])[0].graph_context
         assert "edge_endpoints" not in ctx
 
 
@@ -528,11 +545,24 @@ class TestQueryOrchestrationBranches:
         )
         hybrid = HybridQuery(chroma, MagicMock(available=False))
         results = hybrid.query(
-            "q", use_rerank=False, use_bm25=False, use_fts=False
+            "q", pack_ids=["pack-a"], use_rerank=False, use_bm25=False, use_fts=False
         )
         assert [r.node_id for r in results] == ["n2", "n1"]
 
-    def test_infer_pack_id_added_when_missing_from_metadata(self) -> None:
+    # #147 INTENTIONALLY FLIPPED PIN (see DESIGN.md §3.3 -- listed in the PR
+    # body's flipped-pin list): this call site's infer_pack_id() (which read
+    # a pack_id out of source_path via the /packs/<id>/ pattern -- a
+    # caller-written, forgeable value) is replaced by scope_pack_id() (strict
+    # metadata.pack_id -> properties.pack_id -> item.pack_id only, no path
+    # inference -- opencrab/ontology/pack_provenance.py + query.py line ~624).
+    # query()'s merged items only ever carry a "metadata" key, and this
+    # fixture's metadata has no "pack_id", so scope_pack_id() cannot resolve
+    # one -- by design, since trusting a path-derived id here is exactly the
+    # authorization hole #147 closes (same defect class as the 3-way OR in
+    # _export_nodes_where, #143). The old contract ("a path-inferred pack_id
+    # gets backfilled into metadata") is no longer true; the new contract is
+    # that an unresolvable pack_id is left absent, never guessed.
+    def test_pack_id_stays_absent_when_not_in_metadata_no_path_inference(self) -> None:
         chroma = MagicMock()
         chroma.available = True
         chroma.query = MagicMock(
@@ -546,8 +576,10 @@ class TestQueryOrchestrationBranches:
             ]
         )
         hybrid = HybridQuery(chroma, MagicMock(available=False))
-        results = hybrid.query("q", use_rerank=False, use_bm25=False, use_fts=False)
-        assert results[0].metadata["pack_id"] == "packZ"
+        results = hybrid.query(
+            "q", pack_ids=["packZ"], use_rerank=False, use_bm25=False, use_fts=False
+        )
+        assert "pack_id" not in results[0].metadata
 
     def test_subject_id_and_rebac_triggers_policy_filter(self) -> None:
         chroma = MagicMock()
@@ -566,7 +598,8 @@ class TestQueryOrchestrationBranches:
             )
         )
         results = hybrid.query(
-            "q", subject_id="u1", use_rerank=False, use_bm25=False, use_fts=False
+            "q", pack_ids=["pack-a"], subject_id="u1",
+            use_rerank=False, use_bm25=False, use_fts=False
         )
         assert [r.node_id for r in results] == ["n1"]
 

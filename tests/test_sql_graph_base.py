@@ -522,11 +522,13 @@ def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap():
     corpus size."""
     store = _store()
     for i in range(60):
-        store.upsert_node("Item", f"noise{i:03d}", {"name": f"unrelated {i}"})
+        store.upsert_node("Item", f"noise{i:03d}", {"name": f"unrelated {i}", "pack_id": "p1"})
     for i in range(5):
-        store.upsert_node("Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+        store.upsert_node(
+            "Item", f"hit{i:02d}", {"name": f"needle-in-haystack {i}", "pack_id": "p1"}
+        )
 
-    rows = store.search_nodes("needle", limit=10)
+    rows = store.search_nodes("needle", pack_ids=["p1"], limit=10)
 
     assert len(rows) == 5
     assert all("needle" in r["props"]["name"] for r in rows)
@@ -536,10 +538,14 @@ def test_search_nodes_space_filter_pushed_ahead_of_limit():
     """spaces is pushed into the same WHERE clause as the keyword predicate
     (both ahead of LIMIT), mirroring export_nodes' space pushdown (#54)."""
     store = _store()
-    store.upsert_node("Item", "n-claim", {"name": "shared term"}, space_id="claim")
-    store.upsert_node("Item", "n-policy", {"name": "shared term"}, space_id="policy")
+    store.upsert_node(
+        "Item", "n-claim", {"name": "shared term", "pack_id": "p1"}, space_id="claim"
+    )
+    store.upsert_node(
+        "Item", "n-policy", {"name": "shared term", "pack_id": "p1"}, space_id="policy"
+    )
 
-    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+    rows = store.search_nodes("shared", pack_ids=["p1"], spaces=["claim"], limit=10)
 
     assert len(rows) == 1
     assert rows[0]["props"]["space"] == "claim"
@@ -550,10 +556,10 @@ def test_search_nodes_escapes_like_wildcards():
     not interpreted as a SQL LIKE wildcard -- otherwise a keyword like
     "50%" would match every row instead of only rows containing "50%"."""
     store = _store()
-    store.upsert_node("Item", "n-1", {"name": "discount 50% today"})
-    store.upsert_node("Item", "n-2", {"name": "discount fifty percent today"})
+    store.upsert_node("Item", "n-1", {"name": "discount 50% today", "pack_id": "p1"})
+    store.upsert_node("Item", "n-2", {"name": "discount fifty percent today", "pack_id": "p1"})
 
-    rows = store.search_nodes("50%", limit=10)
+    rows = store.search_nodes("50%", pack_ids=["p1"], limit=10)
 
     assert len(rows) == 1
     assert rows[0]["props"]["name"] == "discount 50% today"
@@ -569,9 +575,9 @@ def test_search_nodes_limit_zero_returns_empty_not_unbounded():
     neither a full unbounded scan nor a SQL error can happen."""
     store = _store()
     for i in range(5):
-        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything", "pack_id": "p1"})
 
-    assert store.search_nodes("matches", limit=0) == []
+    assert store.search_nodes("matches", pack_ids=["p1"], limit=0) == []
 
 
 def test_search_nodes_negative_limit_returns_empty_not_unbounded_scan():
@@ -583,9 +589,9 @@ def test_search_nodes_negative_limit_returns_empty_not_unbounded_scan():
     are trivially distinguishable."""
     store = _store()
     for i in range(20):
-        store.upsert_node("Item", f"n{i}", {"name": "matches everything"})
+        store.upsert_node("Item", f"n{i}", {"name": "matches everything", "pack_id": "p1"})
 
-    assert store.search_nodes("matches", limit=-1) == []
+    assert store.search_nodes("matches", pack_ids=["p1"], limit=-1) == []
 
 
 def test_search_nodes_field_injection_cannot_bypass_limit_or_leak_all_rows():
@@ -605,7 +611,7 @@ def test_search_nodes_field_injection_cannot_bypass_limit_or_leak_all_rows():
 
     payload = ("x')) LIKE '%' OR 1=1) --",)
     with pytest.raises(ValueError, match="fields"):
-        store.search_nodes("nomatch", limit=2, fields=payload)
+        store.search_nodes("nomatch", pack_ids=["p1"], limit=2, fields=payload)
 
 
 def test_search_nodes_rejects_field_with_apostrophe():
@@ -618,7 +624,7 @@ def test_search_nodes_rejects_field_with_apostrophe():
     store.upsert_node("Item", "n1", {"o'clock": "irrelevant"})
 
     with pytest.raises(ValueError, match="fields"):
-        store.search_nodes("irrelevant", fields=("o'clock",))
+        store.search_nodes("irrelevant", pack_ids=["p1"], fields=("o'clock",))
 
 
 def test_search_nodes_empty_fields_returns_empty_not_a_sql_error():
@@ -628,7 +634,7 @@ def test_search_nodes_empty_fields_returns_empty_not_a_sql_error():
     store = _store()
     store.upsert_node("Item", "n1", {"name": "anything"})
 
-    assert store.search_nodes("anything", fields=()) == []
+    assert store.search_nodes("anything", pack_ids=["p1"], fields=()) == []
 
 
 def test_upsert_nodes_batch_and_edges_batch():

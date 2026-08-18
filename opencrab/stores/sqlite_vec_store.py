@@ -92,6 +92,7 @@ from collections.abc import Callable
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
+from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sqlite_base import _SqliteConnMixin
 from opencrab.stores._vector_base import (
     default_metadatas,
@@ -109,6 +110,29 @@ logger = logging.getLogger(__name__)
 # down to the partition key so the common filters stay exact at any scale; only
 # residual constraints (e.g. `space`) fall back to a bounded post-filter.
 _VEC0_K_MAX = 4096
+
+# Threshold (issue #147 §3.4(c)) separating "cheap exact per-pack KNN" from
+# "single unpartitioned KNN + Python pack post-filter, approximate beyond
+# _VEC0_K_MAX". `query()`'s per-pack partitioned path below (one vec0 KNN
+# call per pack in `pack_values`, each ~8ms per this module's own preflight
+# measurement — see the module docstring's "WHY IN-PROCESS") stays exact and
+# keeps this store's existing performance/recall for a scope at or under this
+# size. Above it, a readable-pack scope this large (issue #147: every
+# non-private pack in the whole deployment, plus the caller's own — NOT a
+# small hand-typed filter, unbounded by anything the caller controls) would
+# issue that many serial vec0 KNN calls on every single query; see `query()`'s
+# large-scope fallback for the alternative this threshold switches to.
+#
+# INITIAL VALUE, NOT YET RE-MEASURED ON A LIVE DEPLOYMENT'S CORPUS -- issue
+# #147 design v6 flags this explicitly ("구현 시 실측으로 확정", "confirm by
+# measurement at implementation time"). 32 packs × ~8ms/pack ≈ 256ms is the
+# rough worst case this keeps on the exact per-pack path; this module has no
+# live corpus available at authoring time to benchmark the actual crossover
+# against the large-scope fallback's cost, so 32 is a conservative starting
+# point, not a measured one. Revisit with a real p95 once available (see
+# tests/test_stores.py's vector-latency case referenced in the issue #147
+# design doc, §6.2 "벡터 지연").
+_PACK_KNN_MAX = 32
 
 
 def _sign_bits(vec: list[float]) -> bytes:
@@ -446,6 +470,38 @@ class SqliteVecStore(_SqliteConnMixin):
         # actually pushable (eq/$in). Otherwise a residual post-filter is needed.
         pack_only = _is_pack_only(where) and pack_values is not None
 
+        # issue #147 §3.4(c): large-scope fallback. `pack_values` here can be
+        # `readable_pack_ids(principal)` — every non-private pack in the
+        # deployment, not a small caller-authored filter — so above
+        # `_PACK_KNN_MAX` the per-pack partitioned path below would issue
+        # that many serial vec0 KNN calls on EVERY query. Switch to ONE
+        # unpartitioned KNN instead, with pack membership enforced by
+        # `predicate` (already built above from the same `where`, which
+        # still carries the pack $in clause) as a post-filter.
+        #
+        # `pack_only` MUST be forced False in the SAME branch that clears
+        # `pack_values` — READ THIS TWICE, this coupling is the actual bug
+        # class this fallback exists to avoid, not a stylistic nicety.
+        # `pack_only` is what decides `fetch_k` just below: if `pack_values`
+        # were cleared here (so `_select_query_mode` can no longer partition)
+        # while `pack_only` were left True (still reflecting the ORIGINAL,
+        # now-inapplicable pushed-down-pack-filter case), `fetch_k` would
+        # stay `n_results`-sized (e.g. 10) while the actual query underneath
+        # becomes a GLOBAL unpartitioned KNN — so the Python pack
+        # post-filter would only ever see the 10 globally-nearest rows,
+        # across the WHOLE corpus, not the caller's pack(s). A caller whose
+        # own data is not among the global top-10 gets zero matches, with
+        # no exception raised anywhere — the store just returns fewer
+        # results than exist, silently. Forcing `pack_only = False` here
+        # makes the `if predicate is None or pack_only:` check below take
+        # the ELSE branch, which sets `fetch_k = _VEC0_K_MAX` (4096) — a
+        # bounded, approximate, but non-empty candidate pool.
+        pack_scope: frozenset[str] | None = None
+        if pack_values is not None and len(pack_values) > _PACK_KNN_MAX:
+            pack_scope = frozenset(pack_values)
+            pack_values = None
+            pack_only = False
+
         # No filter / fully pushed-down pack filter → k = n_results is exact.
         # Residual (non-pack) post-filter → scan up to vec0's k cap for best-effort
         # recall: the residual field is filtered in Python, so matches beyond the
@@ -456,13 +512,19 @@ class SqliteVecStore(_SqliteConnMixin):
         # key = _MISSING = no match, replicating Chroma's missing-key semantics) —
         # query.py surfaces a transitional warning for this until a backfill runs.
         # The residual path itself is a correctness safety net, not a hot path.
+        #
+        # The large-scope pack fallback above is a DELIBERATE, DOCUMENTED
+        # approximation (issue #147 §3.4(c), same character as #143's
+        # "overfetch then filter", not a leak): a caller whose matching rows
+        # sort past the global top-`_VEC0_K_MAX` nearest neighbours misses
+        # them, compared to today's exact per-pack KNN below the threshold.
         if predicate is None or pack_only:
             fetch_k = min(max(int(n_results), 1), _VEC0_K_MAX)
         else:
             fetch_k = _VEC0_K_MAX
 
         rows = self._select_query_mode(
-            qvec, pack_values, predicate, fetch_k, n_results
+            qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
         )
 
         hits: list[dict[str, Any]] = []
@@ -507,6 +569,8 @@ class SqliteVecStore(_SqliteConnMixin):
         predicate: Callable[[dict[str, Any]], bool] | None,
         fetch_k: int,
         n_results: int,
+        *,
+        pack_scope: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Pick which KNN strategy serves this query, and run it.
 
@@ -515,14 +579,23 @@ class SqliteVecStore(_SqliteConnMixin):
           Pack-scoped search stays EXACT even under ``ann="binary"`` — the
           partition pre-filter already makes it fast (~8ms measured), so
           §3.7 keeps exact as the safe default here.
-        - no pack constraint, ``ann="binary"`` eligible (bit column present)
-          and no residual filter → PURE-GLOBAL binary 2-stage ANN (§3.7):
-          in-RAM bit-hamming coarse → int8 rerank → exact float refinement of
-          the top ~3n. This is the 868ms hot path being accelerated. Queries
-          WITH residual (non-pack) filters fall back to the exact scan so the
-          Python post-filter keeps its full 4096-candidate pool (unchanged
-          semantics). On any cache failure the helper returns None → exact
-          fallback.
+        - no pack constraint, ``ann="binary"`` eligible (bit column present),
+          and EITHER no residual filter at all OR the residual filter is
+          exactly the large-scope pack fallback (``pack_scope`` set, issue
+          #147 §3.4(c) — ``query()`` clears ``pack_values`` above
+          ``_PACK_KNN_MAX`` but the caller is still, structurally, pack-only)
+          → binary 2-stage ANN (§3.7): in-RAM bit-hamming coarse → int8
+          rerank → exact float refinement of the top ~3n. ``pack_scope``, when
+          given, is ALSO applied at the coarse-candidate stage (see
+          ``_knn_bit_rerank``) — without that, every query above
+          ``_PACK_KNN_MAX`` would take the float brute-force exact path
+          instead (``predicate is not None`` there), which this module's own
+          preflight measured at ~868ms p95 (vs ~8ms for the partition path)
+          — for EVERY over-threshold query, not occasionally. Queries with
+          any OTHER (non-pack) residual filter still fall back to the exact
+          scan so the Python post-filter keeps its full 4096-candidate pool
+          (unchanged semantics). On any cache failure the helper returns
+          None → exact fallback.
         - otherwise → plain exact brute-force KNN.
         """
         if pack_values:
@@ -531,9 +604,11 @@ class SqliteVecStore(_SqliteConnMixin):
                 rows.extend(self._knn(qvec, fetch_k, pack=pk))
             rows.sort(key=lambda r: r["distance"])
             return rows
-        if self._ann == "binary" and self._has_bit_column and predicate is None:
+        if self._ann == "binary" and self._has_bit_column and (
+            predicate is None or pack_scope is not None
+        ):
             rows_ann = self._knn_bit_rerank(
-                qvec, max(self._ann_coarse_k, fetch_k), n_results
+                qvec, max(self._ann_coarse_k, fetch_k), n_results, pack_scope=pack_scope
             )
             if rows_ann is not None:
                 return rows_ann
@@ -667,12 +742,24 @@ class SqliteVecStore(_SqliteConnMixin):
             return cache
 
     def _knn_bit_rerank(
-        self, qvec: list[float], coarse_k: int, n_results: int
+        self,
+        qvec: list[float],
+        coarse_k: int,
+        n_results: int,
+        *,
+        pack_scope: frozenset[str] | None = None,
     ) -> list[dict[str, Any]] | None:
         """Binary 2-stage global KNN (§3.7) over the in-process cache.
 
         1. coarse : hamming(sign(qvec), bit matrix) via numpy XOR+bitwise_count
            → top ``coarse_k`` candidates (~16ms at 179k).
+        1b. (issue #147 §3.4(c)) if ``pack_scope`` is given, the coarse
+            candidates are further restricted to those whose pack_id is in
+            ``pack_scope`` (see ``_filter_candidates_by_pack``) BEFORE the
+            rerank stage — narrowing the refinement pool to rows the caller
+            can actually see, instead of spending the whole 3n refinement
+            budget on candidates that would fail the outer `predicate`
+            post-filter in ``query()`` anyway.
         2. rerank : int8-dequantized cosine over the C candidates (RAM, ~5ms),
            keep the top R = max(3n, n+20).
         3. refine : EXACT float cosine + document/metadata for those R rows via
@@ -701,8 +788,48 @@ class SqliteVecStore(_SqliteConnMixin):
             return []
 
         cand = self._ann_coarse_candidates(cache, qvec, coarse_k)
+        if pack_scope is not None:
+            cand = self._filter_candidates_by_pack(cand, cache, pack_scope)
+            if len(cand) == 0:
+                return []
         refine_ids = self._ann_rerank_candidates(cache, cand, qvec, n_results)
         return self._ann_refine_exact(qvec, refine_ids)
+
+    def _filter_candidates_by_pack(
+        self, cand: Any, cache: _AnnCache, pack_scope: frozenset[str]
+    ) -> Any:
+        """Restrict coarse-candidate row-indices (``cand``, into ``cache``) to
+        those whose ``pack_id`` is in ``pack_scope`` — ONE bounded SQL query
+        over just the (already coarse_k-capped, so at most a few thousand)
+        candidate ids, not a scan of the whole corpus and not one query per
+        pack (the very per-pack cost this large-scope fallback exists to
+        avoid — see ``query()``'s docstring note).
+
+        ``_AnnCache`` itself does not carry ``pack_id`` — adding it would
+        grow the in-RAM cache (built for every store using ``ann="binary"``,
+        not just ones that ever take this large-scope path) for a field only
+        this fallback needs, so it is looked up fresh here, scoped to just
+        this call's candidate pool. Both the candidate-id list and the pack
+        scope are bound as arrays (``SqlDialect.in_string_array``, SQLite
+        form) rather than one placeholder per value — ``pack_scope`` can be
+        exactly the large scope this whole path exists for (issue #147
+        §3.4(c)), so a per-value bind here would reintroduce the same
+        "too many SQL variables" risk this fallback is supposed to avoid.
+        """
+        import numpy as np
+
+        ids = [cache.ids[i] for i in cand]
+        if not ids:
+            return cand
+        id_frag, id_transform = SQLITE.in_string_array("node_id", "?")
+        pack_frag, pack_transform = SQLITE.in_string_array("pack_id", "?")
+        rows = self._conn.execute(
+            f"SELECT node_id FROM {self._table} WHERE {id_frag} AND {pack_frag}",
+            [id_transform(ids), pack_transform(sorted(pack_scope))],
+        ).fetchall()
+        allowed = {r["node_id"] for r in rows}
+        keep = [i for i in cand if cache.ids[i] in allowed]
+        return np.array(keep, dtype=cand.dtype) if keep else np.array([], dtype=cand.dtype)
 
     def _ann_coarse_candidates(
         self, cache: _AnnCache, qvec: list[float], coarse_k: int

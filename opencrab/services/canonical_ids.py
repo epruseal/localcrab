@@ -48,15 +48,28 @@ class _Resolver:
     — a miss must not be retried.
     """
 
-    def __init__(self, graph: Any) -> None:
+    def __init__(self, graph: Any, pack_ids: list[str]) -> None:
         self._graph = graph
+        self._pack_ids = pack_ids
         self._cache: dict[str, dict[str, Any] | None] = {}
 
     def props(self, node_id: str) -> dict[str, Any] | None:
         if node_id in self._cache:
             return self._cache[node_id]
         try:
-            found = self._graph.get_node_by_id(node_id)
+            # #147: the SCOPED lookup. Scoping the query legs is not enough
+            # on its own -- this module re-reads the graph by node_id to
+            # build the canonical block, and the unscoped lookup matched on
+            # node_id alone even though the PK is (node_type, node_id). A
+            # readable result whose id also exists in someone else's pack
+            # under a different node_type could therefore have had that
+            # row's pack_id/space/document_id attached to it.
+            found = self._graph.get_node_by_id_scoped(node_id, self._pack_ids)
+        except AttributeError:
+            # A backend without the scoped method is a wiring defect, not a
+            # miss. Swallowing it here would mark every result
+            # "node_not_found" and look like a clean, empty enrichment.
+            raise
         except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
             logger.debug("canonical lookup failed for %s: %s", node_id, exc)
             found = None
@@ -131,17 +144,34 @@ def enrich(
     graph: Any,
     results: list[dict[str, Any]],
     resolve_edges: bool = True,
+    *,
+    pack_ids: list[str],
 ) -> list[dict[str, Any]]:
     """Attach canonical ids to ``results`` in place; returns the same list.
 
     ``results`` are ``QueryResult.to_dict()`` shapes. A store that is missing
     or unavailable is a no-op, not an error: enrichment never degrades the
     query it decorates.
+
+    ``pack_ids`` is REQUIRED (#147) and bounds every lookup this makes,
+    including both endpoints of an edge. A node outside it resolves to the
+    module's existing ``node_not_found`` shape -- the same one a genuinely
+    absent id gets -- so rule 1 of this module ("exact match only, a miss is
+    declared as a miss") already covers the out-of-scope case without a
+    second branch to keep in sync.
+
+    Pass the caller's FULL readable scope, not the pack filter that
+    produced these results. Canonical identity is "what is this id", not
+    "what did this query search": narrowing it to the query filter would
+    make the same node resolve in one query and report ``node_not_found``
+    in another, which defeats the stable-address contract this module
+    exists for. Authorization is unaffected either way -- the query filter
+    is always a subset of the scope.
     """
     if graph is None or not getattr(graph, "available", False) or not results:
         return results
 
-    resolver = _Resolver(graph)
+    resolver = _Resolver(graph, pack_ids)
     for item in results:
         item["canonical"] = _canonical_for(resolver, item)
         context = item.get("graph_context")

@@ -127,9 +127,12 @@ class TestError:
 
     def test_doc_store_keyword_search_soft_guard_returns_empty(self, doc_store):
         """keyword_search() returns [] rather than raising when unavailable
-        (mirrors its own fts_ok-unavailable fallback)."""
+        (mirrors its own fts_ok-unavailable fallback). The availability
+        guard is checked before the (issue #147, now-required) ``pack_ids``
+        short-circuit, so an unavailable store returns [] regardless of
+        scope."""
         doc_store._available = False
-        assert doc_store.keyword_search("query") == []
+        assert doc_store.keyword_search("query", pack_ids=["p1"]) == []
 
 
 # ---------------------------------------------------------------------------

@@ -392,11 +392,16 @@ def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
     scan boundary are still found. Seeds 60 non-matching nodes first, then
     5 matching nodes last."""
     for i in range(60):
-        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}"})
+        store.upsert_node("X", f"noise{i:03d}", {"name": f"unrelated {i}", "pack_id": "p"})
     for i in range(5):
-        store.upsert_node("X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}"})
+        store.upsert_node(
+            "X", f"hit{i:02d}", {"name": f"needle-in-haystack {i}", "pack_id": "p"}
+        )
 
-    rows = store.search_nodes("needle", limit=10)
+    # #147: search_nodes is an authorization-bearing read path now, so it
+    # takes the caller's readable pack set and the fixture rows have to
+    # belong to a pack to be reachable at all.
+    rows = store.search_nodes("needle", pack_ids=["p"], limit=10)
 
     assert len(rows) == 5
     assert all("needle" in r["props"]["name"] for r in rows)
@@ -405,10 +410,14 @@ def test_search_nodes_keyword_pushed_ahead_of_any_scan_cap(store) -> None:
 def test_search_nodes_space_filter_pushed_into_cypher(store) -> None:
     """spaces is pushed into the Cypher WHERE clause (space_id is a real
     column), narrowing the scan before the Python keyword filter runs."""
-    store.upsert_node("X", "n-claim", {"name": "shared term"}, space_id="claim")
-    store.upsert_node("X", "n-policy", {"name": "shared term"}, space_id="policy")
+    store.upsert_node(
+        "X", "n-claim", {"name": "shared term", "pack_id": "p"}, space_id="claim"
+    )
+    store.upsert_node(
+        "X", "n-policy", {"name": "shared term", "pack_id": "p"}, space_id="policy"
+    )
 
-    rows = store.search_nodes("shared", spaces=["claim"], limit=10)
+    rows = store.search_nodes("shared", pack_ids=["p"], spaces=["claim"], limit=10)
 
     assert len(rows) == 1
     assert rows[0]["props"]["space"] == "claim"
@@ -422,11 +431,11 @@ def test_search_nodes_limit_zero_and_negative_return_empty(store) -> None:
     ``results`` list's length, 0, is never `>=` a negative number until
     AFTER the first append). Neither is "caller wants nothing back" (the
     same class of surprise issue #120 flagged for Mongo's ``.limit(0)``)."""
-    store.upsert_node("X", "n1", {"name": "matches everything"})
-    store.upsert_node("X", "n2", {"name": "matches everything"})
+    store.upsert_node("X", "n1", {"name": "matches everything", "pack_id": "p"})
+    store.upsert_node("X", "n2", {"name": "matches everything", "pack_id": "p"})
 
-    assert store.search_nodes("matches", limit=0) == []
-    assert store.search_nodes("matches", limit=-1) == []
+    assert store.search_nodes("matches", pack_ids=["p"], limit=0) == []
+    assert store.search_nodes("matches", pack_ids=["p"], limit=-1) == []
 
 
 def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
@@ -436,18 +445,138 @@ def test_search_nodes_rejects_field_not_in_whitelist(store) -> None:
     still raise the SAME ``ValueError`` it does on the SQL backends, not be
     silently accepted, so a caller can't get three different behaviors out
     of one method depending on which backend happens to be active."""
-    store.upsert_node("X", "n1", {"name": "irrelevant"})
+    store.upsert_node("X", "n1", {"name": "irrelevant", "pack_id": "p"})
 
     with pytest.raises(ValueError, match="fields"):
-        store.search_nodes("irrelevant", fields=("not_a_real_field",))
+        store.search_nodes("irrelevant", pack_ids=["p"], fields=("not_a_real_field",))
 
 
 def test_search_nodes_empty_fields_returns_empty(store) -> None:
     """Empty ``fields`` means "nothing can ever match" on every backend,
     including Kuzu -- matches the SQL backends' contract."""
-    store.upsert_node("X", "n1", {"name": "anything"})
+    store.upsert_node("X", "n1", {"name": "anything", "pack_id": "p"})
 
-    assert store.search_nodes("anything", fields=()) == []
+    assert store.search_nodes("anything", pack_ids=["p"], fields=()) == []
+
+
+def test_search_nodes_is_scoped_to_the_readable_packs(store) -> None:
+    """#147: the pack predicate, on the Kuzu backend specifically.
+
+    Kuzu keeps properties as a JSON blob, so this filter is a Python
+    membership test over an unlimited scan rather than a Cypher WHERE
+    clause -- a different implementation from the SQL backends and
+    therefore one that needs its own test rather than inheriting theirs.
+    """
+    store.upsert_node("X", "mine", {"name": "shared term", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "shared term", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "shared term"})
+
+    rows = store.search_nodes("shared", pack_ids=["p-mine"], limit=10)
+    assert [r["props"]["id"] for r in rows] == ["mine"]
+
+    # An empty scope means "nothing readable", not "no filter".
+    assert store.search_nodes("shared", pack_ids=[], limit=10) == []
+
+
+def test_export_nodes_scoped_returns_only_readable_packs(store) -> None:
+    """#147: the authorization predicate for `ontology_list_nodes(pack_id=...)`
+    and `GET /api/nodes` on a Kuzu deployment.
+
+    Kuzu keeps properties as a JSON blob, so unlike the SQL backends this
+    filter is a Python membership test over an unlimited scan rather than a
+    WHERE clause -- a separate implementation that needs its own tests
+    rather than inheriting the SQL ones. The MCP handlers pass this result
+    straight into the response without re-filtering, so this method is the
+    ONLY thing standing between two users here.
+    """
+    store.upsert_node("X", "mine", {"name": "m", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "o"})
+
+    got = {n["props"]["id"] for n in store.export_nodes_scoped(["p-mine"], limit=100)}
+    assert got == {"mine"}
+    # Unattributed rows are outside every scope, and an empty scope means
+    # nothing readable rather than no filter.
+    assert store.export_nodes_scoped([], limit=100) == []
+
+
+def test_count_exported_nodes_scoped_counts_only_readable_packs(store) -> None:
+    """`total` is a separate query from the page, so it needs its own pin --
+    an unscoped count leaks the size of other users' data even when the rows
+    themselves are correctly withheld."""
+    store.upsert_node("X", "mine", {"name": "m", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "o"})
+
+    assert store.count_exported_nodes_scoped(["p-mine"]) == 1
+    assert store.count_exported_nodes_scoped([]) == 0
+
+
+def test_get_node_by_id_scoped_withholds_nodes_outside_the_scope(store) -> None:
+    """`ontology_get_node`'s only access check on a Kuzu deployment.
+
+    Deliberately NOT a homonym test, unlike the SQL backend's version of
+    this: ``_NODE_DDL`` keys ``OntologyNode`` on ``node_id`` ALONE, so a
+    second write with the same id upserts over the first and two packs can
+    never hold the same id here. (That is also why this backend's
+    no-``LIMIT 1`` rule is defensive rather than load-bearing -- see the
+    method's docstring.) What IS testable, and what the handler depends on,
+    is that a node in a pack the caller cannot read comes back as None,
+    indistinguishable from a node that does not exist.
+    """
+    store.upsert_node("X", "mine", {"name": "mine", "pack_id": "p-mine"})
+    store.upsert_node("X", "theirs", {"name": "theirs", "pack_id": "p-theirs"})
+    store.upsert_node("X", "orphan", {"name": "orphan"})
+
+    assert store.get_node_by_id_scoped("mine", ["p-mine"])["pack_id"] == "p-mine"
+    assert store.get_node_by_id_scoped("theirs", ["p-mine"]) is None
+    assert store.get_node_by_id_scoped("no-such-node", ["p-mine"]) is None
+    # Unattributed rows are outside every scope, and an empty scope reads
+    # nothing rather than everything.
+    assert store.get_node_by_id_scoped("orphan", ["p-mine"]) is None
+    assert store.get_node_by_id_scoped("mine", []) is None
+
+
+def test_export_edges_scoped_requires_both_endpoints(store) -> None:
+    """An edge row carries BOTH endpoints' full properties, so one
+    unreadable endpoint would disclose that node -- hence AND, not the
+    OR-any-endpoint rule the pack-export path uses."""
+    store.upsert_node("X", "a", {"name": "a", "pack_id": "p-mine"})
+    store.upsert_node("X", "b", {"name": "b", "pack_id": "p-mine"})
+    store.upsert_node("X", "t", {"name": "t", "pack_id": "p-theirs"})
+    store.upsert_edge("X", "a", "relates_to", "X", "b", {"pack_id": "p-mine"})
+    store.upsert_edge("X", "a", "relates_to", "X", "t", {"pack_id": "p-mine"})
+    # unreadable SOURCE, and an edge whose OWN pack is unreadable: three
+    # separate clauses, so all three need a case or two of them can be
+    # deleted with the suite green.
+    store.upsert_edge("X", "t", "relates_to", "X", "b", {"pack_id": "p-mine"})
+    store.upsert_edge("X", "a", "mentions", "X", "b", {"pack_id": "p-theirs"})
+
+    edges = store.export_edges_scoped(["p-mine"], limit=100)
+    triples = {
+        (e["source_props"].get("id"), e["target_props"].get("id"), e.get("relation"))
+        for e in edges
+    }
+    assert ("a", "b", "relates_to") in triples
+    assert ("a", "t", "relates_to") not in triples
+    assert ("t", "b", "relates_to") not in triples
+    assert ("a", "b", "mentions") not in triples
+    assert store.export_edges_scoped([], limit=100) == []
+
+
+def test_find_neighbors_empty_scope_returns_nothing(store) -> None:
+    """#147: the empty-set flip on the Kuzu traversal.
+
+    Before this change ``pack_ids=[]`` collapsed to ``None`` and skipped the
+    filter entirely, so a principal who could read no pack saw the whole
+    graph. An edge has to exist or this passes for the wrong reason.
+    """
+    store.upsert_node("X", "a", {"name": "a", "pack_id": "p"})
+    store.upsert_node("X", "b", {"name": "b", "pack_id": "p"})
+    store.upsert_edge("X", "a", "relates_to", "X", "b", {"pack_id": "p"})
+
+    assert store.find_neighbors("a", pack_ids=[]) == []
+    assert store.find_neighbors("a", pack_ids=["p"]) != []
 
 
 # ------------------------------------------------------------------
@@ -610,3 +739,55 @@ def test_rebac_denied_when_no_edge(store) -> None:
 
     decision = engine.check("user1", "view", "res1")
     assert decision.granted is False
+
+
+def test_find_by_relations_scoped_constrains_anchor_endpoint_and_edge(store) -> None:
+    """#147: all three authorization clauses, each with a positive control.
+
+    `lever_simulate` no longer post-filters in Python -- authorization for
+    `ontology_lever_simulate` on a Kuzu deployment rests entirely on this
+    method, and nothing below it re-checks. Kuzu keeps properties as a JSON
+    blob, so these are Python membership tests over an unlimited scan rather
+    than a Cypher WHERE: a separate implementation from the SQL backend's
+    and therefore one that needs its own test rather than inheriting it.
+    """
+    store.upsert_node("Lever", "mine-lever", {"name": "l", "pack_id": "p-mine"})
+    store.upsert_node("Outcome", "mine-out", {"name": "o", "pack_id": "p-mine"})
+    store.upsert_node("Lever", "their-lever", {"name": "l2", "pack_id": "p-theirs"})
+    store.upsert_node("Outcome", "their-out", {"name": "o2", "pack_id": "p-theirs"})
+
+    # in scope end to end
+    store.upsert_edge("Lever", "mine-lever", "raises", "Outcome", "mine-out", {"pack_id": "p-mine"})
+    # unreadable OTHER endpoint
+    store.upsert_edge("Lever", "mine-lever", "raises", "Outcome", "their-out", {"pack_id": "p-mine"})
+    # unreadable ANCHOR
+    store.upsert_edge("Lever", "their-lever", "raises", "Outcome", "mine-out", {"pack_id": "p-mine"})
+    # both endpoints readable, EDGE in another pack
+    store.upsert_edge("Lever", "mine-lever", "lowers", "Outcome", "mine-out", {"pack_id": "p-theirs"})
+
+    got = store.find_by_relations_scoped("mine-lever", ["raises"], ["p-mine"], "out", 20)
+    assert [r["properties"]["id"] for r in got] == ["mine-out"]
+
+    # anchor clause: querying the unreadable lever yields nothing even though
+    # its destination is readable.
+    assert store.find_by_relations_scoped("their-lever", ["raises"], ["p-mine"], "out", 20) == []
+
+    # edge clause: same endpoints, foreign edge pack.
+    assert store.find_by_relations_scoped("mine-lever", ["lowers"], ["p-mine"], "out", 20) == []
+    # positive control for the edge clause -- with that pack readable it IS returned.
+    owned = store.find_by_relations_scoped(
+        "mine-lever", ["lowers"], ["p-mine", "p-theirs"], "out", 20
+    )
+    assert [r["properties"]["id"] for r in owned] == ["mine-out"]
+
+    assert store.find_by_relations_scoped("mine-lever", ["raises"], [], "out", 20) == []
+
+
+def test_list_pack_ids_includes_edge_only_packs(store) -> None:
+    """An edge may carry a pack_id no node has; the migration's registry
+    enumeration unions the two, so the startup guard must as well."""
+    store.upsert_node("X", "n1", {"name": "a", "pack_id": "p-node"})
+    store.upsert_node("X", "n2", {"name": "b", "pack_id": "p-node"})
+    store.upsert_edge("X", "n1", "relates_to", "X", "n2", {"pack_id": "p-edge-only"})
+
+    assert store.list_pack_ids() == {"p-node", "p-edge-only"}

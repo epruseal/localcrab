@@ -120,6 +120,7 @@ import abc
 import json
 import logging
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 from opencrab.stores._graph_common import (
@@ -547,6 +548,14 @@ class _SqlGraphStoreBase(abc.ABC):
                 if not other_pass:
                     continue
                 edge_props = _as_dict(edge_props_raw)
+                # The `True` here says "the anchor side already passed". That
+                # holds for the anchor this call was given, but NOT for a
+                # same-node_id row in another pack: the edge fetch matches on
+                # from_id/to_id alone (the PK is (node_type, node_id)), so an
+                # unreadable twin's edges can reach this point. Confidentiality
+                # is preserved by the fetch's own JOIN, which pack-filters the
+                # OTHER endpoint in SQL -- not by _edge_passes. See
+                # _pack_where's docstring; #147 section 8 records the residue.
                 from_pass, to_pass = (True, other_pass) if is_out else (other_pass, True)
                 if not _edge_passes(edge_props, from_pass, to_pass, pack_set):
                     continue
@@ -587,7 +596,15 @@ class _SqlGraphStoreBase(abc.ABC):
         JSON property. No "include unspaced" escape hatch, matching the
         BM25/vector legs' strict semantics."""
         self._require_available()
-        pack_set: set[str] | None = set(pack_ids) if pack_ids else None
+        # issue #147 §3.4(a): `pack_ids=[]` must NOT collapse into `pack_set
+        # = None` ("no filter") the way `set(pack_ids) if pack_ids else
+        # None` did -- that collapse is exactly what let a principal with
+        # zero readable packs see the whole graph. `[]` now means "nothing
+        # passes" and short-circuits before even the anchor lookup (the
+        # store is never touched for a caller who can read nothing).
+        pack_set: set[str] | None = None if pack_ids is None else set(pack_ids)
+        if pack_set is not None and not pack_set:
+            return []
         space_set: set[str] | None = set(spaces) if spaces else None
 
         if pack_set is not None or space_set is not None:
@@ -698,6 +715,31 @@ class _SqlGraphStoreBase(abc.ABC):
     # Extended operations
     # ------------------------------------------------------------------
 
+    def list_pack_ids(self) -> set[str]:
+        """See GraphStore.list_pack_ids. Uses ``json_truthy_text`` rather
+        than the bare extraction ``list_packs`` groups by, so a row whose
+        pack_id is ``""``/``0``/``false`` is reported as unattributed here
+        exactly as the Python and scoped-SQL predicates treat it -- reusing
+        ``list_packs`` would have surfaced those as packs named ``"0"`` and
+        made the startup guard refuse over rows no read can reach."""
+        self._require_available()
+        pid = self._dialect.json_truthy_text("properties", "pack_id")
+        out: set[str] = set()
+        # Nodes AND edges. An edge can carry a pack_id that appears on no
+        # node, and the migration's own registry enumeration unions the two
+        # for exactly that reason -- so leaving edges out here would let a
+        # deployment start with that pack unregistered, after which scoped
+        # traversal and export drop the edge because the caller's scope,
+        # derived from the registry, cannot contain its pack.
+        for table in ("graph_nodes", "graph_edges"):
+            rows = self._fetch_all(
+                f"SELECT DISTINCT {pid} FROM {self._table(table)} "  # noqa: S608
+                f"WHERE {pid} IS NOT NULL",
+                {},
+            )
+            out |= {str(r[0]) for r in rows if r[0]}
+        return out
+
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """pack_id is unified to ``str`` on BOTH backends (Stage 6b Deliverable
         2 — see module docstring's "PACK_ID TYPE UNIFICATION")."""
@@ -768,13 +810,27 @@ class _SqlGraphStoreBase(abc.ABC):
         ``PGGraphStore._batch_frontier_edges`` call this one method, so a
         future change to the policy cannot silently diverge between them.
 
-        Only valid for a candidate edge whose "current" endpoint has ALREADY
-        passed ``_node_passes`` (true for every caller in this file's BFS —
-        the anchor is checked once up front, and any other node only ever
-        reaches ``_prefetch_frontier`` after passing that same check in
-        ``_expand``). Under that invariant, ``_edge_passes``' ``src_passes``
-        is always True, which is what lets this reduce to two independent
-        clauses instead of a full min/max reproduction of ``_edge_passes``.
+        Written for a candidate edge whose "current" endpoint has already
+        passed ``_node_passes``, which is what lets this reduce to two
+        independent clauses instead of a full min/max reproduction of
+        ``_edge_passes`` (``src_passes`` is then always True).
+
+        THAT ASSUMPTION IS NOT GUARANTEED, and an earlier version of this
+        docstring asserted it as one. The anchor is resolved by
+        ``_fetch_node_props_by_id``, whose SQL matches ``node_id`` alone
+        even though the PK is ``(node_type, node_id)``, while
+        ``_fetch_edges_for_node`` matches ``from_id``/``to_id`` alone too --
+        so when one ``node_id`` exists in two packs under different types,
+        edges belonging to the unreadable twin do enter the traversal.
+        What actually keeps that from disclosing anything is NOT
+        ``_edge_passes``: it is the JOIN in ``_fetch_edges_for_node`` and
+        ``PGGraphStore._batch_frontier_edges``, which pack-filters the OTHER
+        endpoint in SQL, so every row that comes back is one the caller may
+        read. Do not remove that JOIN clause on the grounds that
+        ``_edge_passes`` will catch it -- it will not. The residue is a
+        correctness defect (neighbours attributed to the wrong node), not a
+        confidentiality one; issue #147 section 8 records it and opens a
+        follow-up for making traversal match on the full key.
 
         Uses ``json_truthy_text`` (not the bare ``json_get`` extraction) for
         both sides: a raw JSON extraction is non-NULL for ``""``/``0``/
@@ -782,15 +838,340 @@ class _SqlGraphStoreBase(abc.ABC):
         (falsy). Without this, those values would be wrongly excluded here
         — before ``LIMIT`` even runs — instead of being governed by
         ``include_unpackaged`` like ``_node_passes`` does.
+
+        ARRAY BIND, NOT PER-VALUE (issue #147 §3.4(c), mandatory not
+        optional): ``_graph_expand``/``ImpactEngine`` now call
+        ``find_neighbors(pack_ids=sorted(readable_scope))`` with the
+        caller's FULL readable-pack scope -- every non-private pack in the
+        deployment, not a small hand-typed filter -- on every BFS frontier
+        query this method's callers (``_fetch_edges_for_node``,
+        ``pg_graph_store.py::_batch_frontier_edges``) issue. The old
+        ``_in_placeholders``-per-value expansion would blow past SQLite's
+        bind-variable cap at that scale ("too many SQL variables"), and the
+        callers that could hit it (``impact.py::analyse``'s bare
+        ``except Exception: logger.debug``, ``query.py::_graph_expand``'s
+        anchor-loop ``try``) SWALLOW that exception -- so a scope over the
+        limit would not error, it would silently return zero neighbours.
+        ``self._dialect.in_string_array`` (``_sql_dialect.py``) binds the
+        whole pack set as ONE array parameter instead, reused for both the
+        node and edge membership tests below (same value, same bind name,
+        referenced twice -- valid with named params on both dialects).
         """
-        placeholders, params = self._in_placeholders(sorted(pack_set), prefix)
+        bind_name = f"{prefix}_packs"
         node_pid = self._dialect.json_truthy_text(node_col, "pack_id")
         edge_pid = self._dialect.json_truthy_text(edge_col, "pack_id")
-        node_cond = f"{node_pid} IN ({placeholders})"
+        membership_frag, transform = self._dialect.in_string_array(node_pid, f":{bind_name}")
+        node_cond = membership_frag
         if include_unpackaged:
             node_cond = f"({node_cond} OR {node_pid} IS NULL)"
-        edge_cond = f"({edge_pid} IS NULL OR {edge_pid} IN ({placeholders}))"
+        edge_membership_frag, _ = self._dialect.in_string_array(edge_pid, f":{bind_name}")
+        edge_cond = f"({edge_pid} IS NULL OR {edge_membership_frag})"
+        params = {bind_name: transform(sorted(pack_set))}
         return f"{node_cond} AND {edge_cond}", params
+
+    def _scoped_node_where(
+        self, col: str, bind_name: str
+    ) -> tuple[str, Callable[[list[str]], Any]]:
+        """SINGLE SOURCE for the new pack_id-ONLY, index-friendly scope
+        predicate the ``*_scoped`` methods below share (issue #147 §3.4(b)) --
+        deliberately NOT ``_pack_where`` (the ``find_neighbors``/BFS
+        predicate above). Both look at ``pack_id`` alone, but that one
+        implements the 3-rule edge policy and supports
+        ``include_unpackaged``; this one has no unpackaged escape hatch at
+        all, because it backs AUTHORIZATION reads and data outside every
+        pack is outside every read scope (#143 invariant 5). Neither of them
+        touches ``source``/``source_id`` -- that is ``_export_nodes_where``,
+        the pack-EXPORT predicate, whose 3-way OR is unusable for an access
+        decision because those two properties are caller-written.
+
+        TYPE PARITY, stated precisely (it is not uniform, and an earlier
+        draft of this docstring overclaimed it): for a pack_id that is a
+        JSON string -- the only form ``pack_create`` and the ``packs``
+        registry produce -- SQL and Python agree exactly. For non-string
+        JSON values they do not, and they disagree in OPPOSITE directions
+        by layer: SQLite's ``json_extract`` preserves the native type, so a
+        JSON number ``1`` never equals the bound TEXT ``'1'`` and the row is
+        EXCLUDED here, while Python's ``_node_pack_id`` does ``str(1)`` and
+        would INCLUDE it (so ``find_neighbors``/BM25 match it). Neither
+        direction crosses a user boundary -- a match still requires the id
+        to be in the caller's own scope -- so what remains is a recall
+        difference between backends, not a leak.
+
+        Two-clause AND, both clauses load-bearing for different reasons:
+          1. ``json_get(col,'pack_id') IN <array bind>`` -- uses the BARE
+             extraction, not ``json_truthy_text``, because
+             ``GRAPH_STORE_SCHEMA``'s only pack index (``idx_nodes_pack``)
+             is built on ``json_get`` (a plain function-call expression);
+             a CASE-expression predicate (what ``json_truthy_text`` is)
+             cannot use that index on either dialect. Authorization is now
+             the primary read path, so silently losing the one pack index
+             here would be a real regression, not a style choice.
+          2. ``json_truthy_text(col,'pack_id') IS NOT NULL`` -- closes a
+             real fail-open gap the bare ``json_get`` clause alone leaves:
+             on PostgreSQL, a JSON number ``0``/boolean ``false`` extracts
+             via ``->>`` as the TEXT ``'0'``/``'false'``, which is non-NULL
+             and could equal a real pack_id string in the caller's scope
+             (a pack literally named ``"0"``) -- so a row that Python's
+             ``_node_pack_id``/``in_pack_scope`` treat as "has no pack_id"
+             (falsy) could otherwise satisfy clause 1 and leak into an
+             authorized caller's results. This second clause reproduces
+             the same falsy-exclusion ``json_truthy_text`` already applies
+             elsewhere (see its own docstring), closing that gap. Cost is
+             bounded to rows already narrowed by the indexed clause above.
+
+        Returns ``(where_fragment, value_transform)`` -- same contract as
+        ``SqlDialect.in_string_array``: the caller must still apply
+        ``value_transform`` to its ``list[str]`` and bind the result under
+        ``bind_name`` (this is a callable, not a pre-applied value, exactly
+        like ``_pack_where``'s ``transform`` -- kept as a callable here too
+        so ``export_edges_scoped`` can call this once per endpoint alias --
+        twice, not three times: the edge's own clause is assembled
+        separately because it must also admit a NULL pack_id, which this
+        two-clause node form does not. All the clauses still share ONE
+        array bind, and the transform is applied to it exactly once).
+        """
+        membership_expr = self._dialect.json_get(col, "pack_id")
+        frag, transform = self._dialect.in_string_array(membership_expr, f":{bind_name}")
+        truthy = self._dialect.json_truthy_text(col, "pack_id")
+        return f"{frag} AND {truthy} IS NOT NULL", transform
+
+    def export_nodes_scoped(
+        self, pack_ids: list[str], limit: int, space: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped node export (issue #147 §3.4(b)) -- the
+        ``export_nodes``/``count_exported_nodes`` counterpart for a READ
+        path caller instead of a pack-export/fork tool. Differs from
+        ``export_nodes`` in exactly the ways that matter for authorization:
+        pack_id ONLY (never ``source``/``source_id`` -- ``export_nodes``'s
+        3-way OR is deliberately loose for its bulk-export use case, but
+        loose enough to let a node claim membership in a pack it was never
+        actually written into, which is a real gap for a permission check),
+        and ``pack_ids`` is REQUIRED with no default -- there is no "export
+        everything" mode here, because "everything" is exactly what an
+        authorization-scoped read must never mean. ``export_nodes`` itself
+        is left untouched (see its own docstring / issue #147 §8's
+        "intentionally not fixed" list) -- this is a new, separate method,
+        not a signature change to that one.
+
+        Empty ``pack_ids`` -> ``[]`` WITHOUT querying (a principal who can
+        read nothing is not a reason to touch the store), matching every
+        other ``*_scoped`` method's contract in this file. ``limit <= 0``
+        -> ``[]``, same rule ``export_nodes`` already applies (issue #120).
+        """
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+        table = self._table("graph_nodes")
+        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
+        where_parts = [where_sql]
+        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
+        if space:
+            where_parts.append("space_id = :space")
+            params["space"] = space
+        params["lim"] = limit
+        sql = (
+            f"SELECT node_type, space_id, properties FROM {table} "
+            f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
+        )
+        rows = self._fetch_all(sql, params)
+        return [
+            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            for node_type, space_id, properties in rows
+        ]
+
+    def count_exported_nodes_scoped(
+        self, pack_ids: list[str], space: str | None = None
+    ) -> int:
+        """Exact ``COUNT(*)`` counterpart to ``export_nodes_scoped``, same
+        predicate, no LIMIT (issue #54's "total must not be capped by a
+        display limit" reasoning, applied to the scoped predicate). Empty
+        ``pack_ids`` -> ``0`` without querying."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        table = self._table("graph_nodes")
+        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
+        where_parts = [where_sql]
+        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
+        if space:
+            where_parts.append("space_id = :space")
+            params["space"] = space
+        row = self._fetch_one(
+            f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where_parts)}", params  # noqa: S608
+        )
+        return int(row[0]) if row else 0
+
+    def export_edges_scoped(self, pack_ids: list[str], limit: int) -> list[dict[str, Any]]:
+        """Authorization-scoped edge export (issue #147 §3.4(b)) -- AND
+        rule, the exact OPPOSITE of ``export_edges``'s 5-way OR:
+        ``a.pack_id in scope AND b.pack_id in scope AND (e.pack_id IS NULL
+        OR e.pack_id in scope)``. The response embeds BOTH endpoints' full
+        ``properties`` (see this method's return shape below), so an OR
+        across endpoints (like ``export_edges`` uses) would expose a node
+        outside the caller's scope whenever the OTHER endpoint happened to
+        be in-scope -- the exact class of leak this predicate exists to
+        close. This is the same rule ``_graph_common._edge_passes`` already
+        enforces for ``find_neighbors``' 3-rule policy; this SQL form is
+        just that same rule pushed ahead of LIMIT for a bulk query instead
+        of applied node-by-node during BFS.
+
+        Built from ``_scoped_node_where`` (the same helper
+        ``export_nodes_scoped``/``get_node_by_id_scoped`` use, not a new
+        predicate builder) called once per endpoint alias plus once more
+        for the edge's own pack_id, all three reusing ONE array bind
+        (``sc_packs``, same value bound once, referenced three times --
+        valid with named params, mirrors ``_pack_where``'s same trick).
+
+        Empty ``pack_ids`` -> ``[]`` without querying. ``limit <= 0`` ->
+        ``[]``, matching ``export_edges``' contract."""
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+        nodes = self._table("graph_nodes")
+        edges = self._table("graph_edges")
+        a_where, transform = self._scoped_node_where("a.properties", "sc_packs")
+        b_where, _ = self._scoped_node_where("b.properties", "sc_packs")
+        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+        e_membership, _ = self._dialect.in_string_array(
+            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
+        )
+        edge_cond = f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
+        sql = f"""
+            SELECT
+                a.node_type AS from_type, a.properties AS source_props,
+                b.node_type AS to_type,   b.properties AS target_props,
+                e.properties AS rel_props, e.relation,
+                a.space_id AS from_space_id, b.space_id AS to_space_id
+            FROM {edges} e
+            JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
+            JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+            WHERE {a_where} AND {b_where} AND {edge_cond}
+            LIMIT :lim
+        """
+        params = {"sc_packs": transform(sorted(set(pack_ids))), "lim": limit}
+        rows = self._fetch_all(sql, params)
+        return [
+            {
+                "source_props": _merge_space(_as_dict(r[1]), r[6]), "source_labels": [r[0]],
+                "target_props": _merge_space(_as_dict(r[3]), r[7]), "target_labels": [r[2]],
+                "rel_props": _as_dict(r[4]), "relation": r[5],
+            }
+            for r in rows
+        ]
+
+    def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
+        """Type-agnostic, SCOPE-FILTERED node lookup (issue #147 §1.2-6b,
+        §3.4(b)) -- replaces a Python post-filter over ``get_node_by_id``,
+        which cannot be made safe by filtering after the fact:
+        ``get_node_by_id``'s ``WHERE node_id=:nid LIMIT 1`` has no
+        ``node_type`` predicate, and ``graph_nodes``' real PK is
+        ``(node_type, node_id)`` -- the same ``node_id`` CAN exist under a
+        different ``node_type`` in a pack the caller cannot read. A
+        post-filter on whichever single row SQL's ``LIMIT 1`` happened to
+        pick would then answer "not found" even when the caller's OWN pack
+        genuinely has that id under a different type -- a real (if narrow)
+        recall bug on top of the leak. Pushing the pack predicate ahead of
+        ``LIMIT 1`` picks a row already known to be in-scope, so it can
+        never reject a row the caller is actually entitled to see.
+
+        Scope-INTERNAL homonym collisions (two DIFFERENT node_types, both
+        inside the caller's own readable scope, sharing one node_id) are
+        NOT resolved by this predicate -- which of the two rows ``LIMIT 1``
+        returns is still arbitrary. Deliberately out of scope for issue
+        #147 (a data-integrity question, not a confidentiality one -- see
+        issue #147 §8's homonym-limits section); the real fix is giving
+        neighbour-traversal a ``(node_type, node_id)`` matching key, tracked
+        as a follow-up issue there.
+
+        Empty ``pack_ids`` -> ``None`` without querying (nothing is in
+        scope, so there is nothing to find)."""
+        self._require_available()
+        if not pack_ids:
+            return None
+        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
+        sql = (
+            f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
+            f" WHERE node_id=:nid AND {where_sql} LIMIT 1"
+        )
+        params = {"nid": node_id, "sc_packs": transform(sorted(set(pack_ids)))}
+        row = self._fetch_one(sql, params)
+        if not row:
+            return None
+        props = dict(_merge_space(_as_dict(row[1]), row[2]))
+        props["node_type"] = row[0]
+        return props
+
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped ``find_by_relations`` (issue #147).
+
+        Constrains the ANCHOR, the OTHER endpoint and the EDGE ITSELF,
+        all before ``LIMIT``. Post-filtering the destination properties --
+        which is what the caller used to do -- is not enough on three
+        counts, each of which lets something out of scope through:
+
+        - The edge's own ``pack_id`` is never returned by
+          ``find_by_relations``, so a relationship belonging to a pack the
+          caller cannot read still contributes its ``relation_type`` (and,
+          for lever simulation, a prediction derived from it).
+        - The anchor is matched on ``node_id`` alone, so a same-id node in
+          another pack supplies its edges.
+        - Filtering after ``LIMIT`` starves in-scope rows behind
+          out-of-scope ones.
+
+        Edge rule matches ``export_edges_scoped``: both endpoints in scope,
+        and the edge's own pack_id either absent or in scope. Empty
+        ``pack_ids`` or ``relations`` returns ``[]`` without querying.
+        """
+        self._require_available()
+        if not relations or not pack_ids or limit <= 0:
+            return []
+        edges = self._table("graph_edges")
+        nodes = self._table("graph_nodes")
+        placeholders, rel_params = self._in_placeholders(relations, "rel")
+        anchor_where, transform = self._scoped_node_where("anchor.properties", "sc_packs")
+        other_where, _ = self._scoped_node_where("other.properties", "sc_packs")
+        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+        edge_membership, _ = self._dialect.in_string_array(
+            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
+        )
+        edge_cond = f"({edge_truthy} IS NULL OR ({edge_membership} AND {edge_truthy} IS NOT NULL))"
+        results: list[dict[str, Any]] = []
+
+        def leg(anchor_col: str, anchor_type: str, other_col: str, other_type: str, lim: int):
+            sql = (
+                f"SELECT other.node_type, other.node_id, e.relation FROM {edges} e"
+                f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
+                f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
+                f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
+                f" AND {anchor_where} AND {other_where} AND {edge_cond} LIMIT :lim"
+            )
+            params = {
+                "nid": node_id,
+                "lim": lim,
+                "sc_packs": transform(sorted(set(pack_ids))),
+                **rel_params,
+            }
+            for other_ntype, other_nid, relation in self._fetch_all(sql, params):
+                props = self.get_node(other_ntype, other_nid)
+                if props:
+                    results.append(
+                        {"properties": props, "labels": [other_ntype], "relation_type": relation}
+                    )
+
+        if direction in ("out", "both"):
+            leg("from_id", "from_type", "to_id", "to_type", limit)
+        if direction in ("in", "both"):
+            remaining = limit - len(results)
+            if remaining > 0:
+                leg("to_id", "to_type", "from_id", "from_type", remaining)
+        return results
 
     def find_by_relations(
         self,
@@ -920,6 +1301,8 @@ class _SqlGraphStoreBase(abc.ABC):
     def search_nodes(
         self,
         keyword: str,
+        *,
+        pack_ids: list[str],
         spaces: list[str] | None = None,
         limit: int = 10,
         fields: tuple[str, ...] = KEYWORD_SEARCH_FIELDS,
@@ -966,11 +1349,25 @@ class _SqlGraphStoreBase(abc.ABC):
         dropped. An empty ``fields`` tuple returns ``[]`` immediately --
         an empty WHERE-clause OR-group is invalid SQL (``WHERE ()``), and
         "search zero fields" has only one sane meaning: no field can ever
-        match, so there is nothing to search for."""
+        match, so there is nothing to search for.
+
+        ``pack_ids`` (issue #147 §3.4(b)/item 5, required -- no default):
+        the same strict pack_id-ONLY predicate ``export_nodes_scoped``/
+        ``get_node_by_id_scoped`` use (via ``_scoped_node_where`` --
+        ``json_get(...) IN <array bind> AND json_truthy_text(...) IS NOT
+        NULL``), pushed into the SAME WHERE clause as the keyword/space
+        predicates, ahead of ``LIMIT`` -- this method's only caller
+        (``HybridQuery.keyword_search``, the graph leg of the hybrid
+        keyword search) is a read-path caller, so there is no "unfiltered"
+        mode here the way ``export_nodes``' ``pack_id=None`` has one.
+        Empty ``pack_ids`` -> ``[]`` without querying, same as every other
+        ``*_scoped`` contract in this file."""
         self._require_available()
         if limit <= 0:
             return []
         if not fields:
+            return []
+        if not pack_ids:
             return []
         _validate_search_fields(fields)
         table = self._table("graph_nodes")
@@ -981,7 +1378,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 for f in fields
             ) + ")"
         ]
-        params: dict[str, Any] = {"kw": f"%{kw}%"}
+        pack_where, transform = self._scoped_node_where("properties", "sc_packs")
+        where_parts.append(pack_where)
+        params: dict[str, Any] = {
+            "kw": f"%{kw}%",
+            "sc_packs": transform(sorted(set(pack_ids))),
+        }
         if spaces:
             placeholders = ", ".join(f":space{i}" for i in range(len(spaces)))
             where_parts.append(f"space_id IN ({placeholders})")

@@ -60,7 +60,8 @@ of the unification.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -235,6 +236,63 @@ class SqlDialect:
         """
         expr = self.json_get(col, key)
         return f"({expr})" if self.name == "postgres" else expr
+
+    def in_string_array(
+        self, expr: str, placeholder: str
+    ) -> tuple[str, Callable[[list[str]], Any]]:
+        """Array-bind membership test: ``expr`` IN a caller-supplied list,
+        using exactly ONE bind parameter no matter how many values are in
+        the list -- NOT ``_SqlGraphStoreBase._in_placeholders``'s
+        one-bind-per-value expansion.
+
+        WHY THIS EXISTS (issue #147 §3.4(c)): the read-scoping this method
+        was added for pushes ``readable_pack_ids(principal)`` into a WHERE
+        clause -- a set that legitimately spans every non-private pack in
+        the deployment, unbounded by anything the caller authored (unlike
+        the small, hand-typed ``pack_ids`` filters ``_pack_where`` and
+        ``_export_nodes_where`` were originally sized for). One bind per
+        value blows past SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` (as low as
+        999 on some builds) with "too many SQL variables" once the scope
+        is large. Chunking the ``IN`` list instead was considered and
+        rejected at the design stage: an edge predicate that requires BOTH
+        endpoints' pack_id to match (see ``_pack_where``'s AND-of-two-
+        clauses shape) drops any edge whose two endpoints land in
+        different chunks, permanently, independent of ``limit`` -- see
+        issue #147 design §3.4(c). One array bind has none of that
+        failure mode: exactly one placeholder, independent of scope size.
+
+        ``placeholder`` IS AN ARGUMENT, not hardcoded to ``":packs"``,
+        because the two callers in this codebase use DIFFERENT bind
+        styles for the SAME dialect: ``_sql_graph_base.py`` /
+        ``pg_graph_store.py`` bind NAMED (``:name``) throughout, but
+        ``local_sql_doc_store.py``'s ``keyword_search`` executes raw
+        ``sqlite3`` with POSITIONAL (``?``) placeholders and a
+        ``params: list`` -- mixing qmark and named placeholders in one
+        SQLite statement raises ``sqlite3.ProgrammingError``. A hardcoded
+        ``:packs`` would compile fine here in isolation and only break at
+        the SQL-execution boundary of that one caller, far from this
+        function -- so the placeholder token is threaded through instead.
+
+        Returns ``(sql_fragment, value_transform)``. ``value_transform``
+        is what the caller must apply to its Python ``list[str]`` BEFORE
+        binding it as ``placeholder``'s value:
+          - SQLite: ``json_each(...)`` is a table-valued function that
+            reads a JSON array TEXT value, not a Python list object, so
+            the transform is ``json.dumps``.
+          - PostgreSQL: ``ANY(CAST(... AS text[]))`` binds a Python list
+            directly -- the driver (psycopg2, via SQLAlchemy) adapts it to
+            a PG array literal -- so the transform is the identity
+            (``list``, which also defensively copies rather than aliasing
+            the caller's list). This mirrors the existing
+            ``pg_graph_store.py::_batch_frontier_edges`` /
+            ``_batch_node_props_multi`` precedent of binding a Python list
+            straight into ``CAST(:ids AS text[])`` for ``unnest(...)`` --
+            reusing that established pattern rather than introducing a
+            second PG array-binding convention.
+        """
+        if self.name == "sqlite":
+            return f"{expr} IN (SELECT value FROM json_each({placeholder}))", json.dumps
+        return f"{expr} = ANY(CAST({placeholder} AS text[]))", list
 
     # ------------------------------------------------------------------
     # INSERT / UPSERT

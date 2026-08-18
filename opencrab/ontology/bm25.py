@@ -16,7 +16,7 @@ import math
 from collections import Counter
 from typing import Any
 
-from opencrab.ontology.pack_provenance import infer_pack_id, matches_pack_filter
+from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import tokenize as _tokenize
 
 logger = logging.getLogger(__name__)
@@ -189,16 +189,26 @@ class BM25Index:
         limit:
             Maximum results.
         pack_ids:
-            Optional pack_id filter. Docs whose inferred pack_id is not in
-            this set are skipped. Docs with no inferable pack_id are dropped
-            unless ``include_unpackaged`` is True.
+            The readable pack scope (#147). Docs whose pack_id is not in it
+            are skipped, and so are docs with no pack_id. An EMPTY set means
+            nothing matches -- it is not "no filter". This index is a
+            process-wide singleton holding every user's nodes, so this
+            filter is the only thing separating them; there is no per-user
+            index.
         include_unpackaged:
-            When ``pack_ids`` is set, also pass docs that have no detectable
-            pack_id (legacy data).
+            IGNORED (#147). Kept for signature compatibility. Data belonging
+            to no pack is outside every read scope (#143 invariant 5), so
+            passing True does not surface legacy rows.
         """
         q_tokens = _tokenize(query)
         if not q_tokens or not self._docs:
             return []
+
+        # #147: an empty scope means "nothing is readable", never "no filter".
+        # include_unpackaged is accepted for signature compatibility but is
+        # not honoured -- rows outside every pack are outside every read
+        # scope (#143 invariant 5).
+        _pack_set: set[str] = set(pack_ids or ())
 
         scores: list[tuple[int, float]] = []
 
@@ -206,8 +216,12 @@ class BM25Index:
             # Space filter
             if spaces and doc.get("space") not in spaces:
                 continue
-            # Pack filter
-            if pack_ids and not matches_pack_filter(doc, pack_ids, include_unpackaged):
+            # Pack filter (#147). Unconditional: the old `if pack_ids and`
+            # guard made an EMPTY pack set mean "no filter", so a principal
+            # who may read no pack would have matched every document in the
+            # index. The index itself is a process-wide singleton holding
+            # every user's nodes -- isolation rests entirely on this line.
+            if not in_pack_scope(doc, _pack_set):
                 continue
 
             dl = len(toks)
@@ -231,7 +245,11 @@ class BM25Index:
         results = []
         for idx, score in scores[:limit]:
             doc = self._docs[idx]
-            pid = infer_pack_id(doc)
+            # #147: the same strict rule the filter above used. Reporting a
+            # pack_id derived by a looser rule than the one that admitted the
+            # row would put a value in the response that no access decision
+            # was ever made on.
+            pid = scope_pack_id(doc)
             results.append({
                 "node_id": doc.get("node_id"),
                 "space": doc.get("space"),

@@ -42,6 +42,7 @@ single-process only.
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
@@ -289,6 +290,49 @@ def install_mcp_no_store(app: FastAPI) -> None:
     app.add_exception_handler(Exception, _no_store_on_error)
 
 
+@asynccontextmanager
+async def _startup_registry_check(app: FastAPI) -> Any:
+    """#147 §3.11: refuse ASGI startup when the graph holds pack_ids the
+    ``packs`` registry has never heard of.
+
+    Deliberately an ASGI ``lifespan``, not code that runs inline in
+    ``create_app()``: this app's stores are otherwise built lazily
+    (``mcp_router()``'s tool dispatch builds its own via
+    ``opencrab.mcp.tools._get_context`` on the first ``tools/call``, and its
+    own auth lookup store is separately lazy too -- see
+    ``TestAuthDoesNoWorkForAnonymousCallers`` in tests/test_auth_boundary.py,
+    which pins that constructing this app and rejecting an unauthenticated
+    caller must not touch disk). Building sql/graph stores directly inside
+    ``create_app()`` would run this check -- and create graph.db/opencrab.db
+    -- every time a test merely calls ``create_app()`` to get an app object,
+    which is exactly the "authenticating does work on the caller's behalf"
+    failure mode that boundary exists to prevent. An ASGI lifespan instead
+    only fires when the app is actually served: real ``uvicorn.run()``
+    traffic, or a test that opts in via ``with TestClient(app) as client:``.
+    Built directly via the store factory (not ``_get_context``, which also
+    loads the vector/doc/billing stores this check does not need) and closed
+    again immediately after.
+    """
+    from opencrab.config import get_settings
+    from opencrab.pack.read_scope import assert_registry_covers_graph
+    from opencrab.stores.factory import make_graph_store, make_sql_store
+
+    cfg = get_settings()
+    startup_sql = make_sql_store(cfg)
+    startup_graph = make_graph_store(cfg)
+    try:
+        assert_registry_covers_graph(startup_sql, startup_graph)
+    finally:
+        for store in (startup_sql, startup_graph):
+            close = getattr(store, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+    yield
+
+
 def create_app(*, allow_query_token: bool = False) -> FastAPI:
     """Lightweight FastAPI app for ``serve --transport http`` — MCP router + healthz."""
     refuse_stale_shared_secret_env()
@@ -300,7 +344,8 @@ def create_app(*, allow_query_token: bool = False) -> FastAPI:
             "issue a separate token per client so one leak revokes one client. "
             "See docs/mcp-client-auth.md."
         )
-    app = FastAPI(docs_url=None, redoc_url=None)
+
+    app = FastAPI(docs_url=None, redoc_url=None, lifespan=_startup_registry_check)
     app.include_router(mcp_router(allow_query_token=allow_query_token))
     install_mcp_no_store(app)
 

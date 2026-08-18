@@ -299,6 +299,35 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 
+    # #147 §3.11: refuse to start when the graph holds pack_ids the `packs`
+    # registry has never heard of -- read scoping resolves against the
+    # registry, so an unregistered pack_id would be silently invisible to
+    # every caller, including its own owner. Built directly via the store
+    # factory (not opencrab.mcp.tools._get_context) so this standalone
+    # entry point does not pay for the vector/doc/billing stores tool
+    # dispatch doesn't need yet, and closed again immediately after -- the
+    # first tools/call still builds its own long-lived stores lazily.
+    from opencrab.config import get_settings
+    from opencrab.pack.read_scope import assert_registry_covers_graph
+    from opencrab.stores.factory import make_graph_store, make_sql_store
+
+    cfg = get_settings()
+    startup_sql = make_sql_store(cfg)
+    startup_graph = make_graph_store(cfg)
+    try:
+        assert_registry_covers_graph(startup_sql, startup_graph)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
+    finally:
+        for store in (startup_sql, startup_graph):
+            close = getattr(store, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
     with principal_scope(principal):
         MCPServer().run()
 

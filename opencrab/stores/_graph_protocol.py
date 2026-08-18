@@ -311,6 +311,27 @@ class GraphStore(Protocol):
         """
         ...
 
+    def list_pack_ids(self) -> set[str]:
+        """Every distinct pack_id present on graph data.
+
+        Deliberately NOT ``{r["pack_id"] for r in list_packs(0)}``. That
+        aggregation exists to report per-pack node counts and titles for a
+        UI, and each backend narrows it accordingly -- Neo4j to the
+        ``OpenCrabNode`` label, which the documented
+        ``scripts/import_pack_graph_to_neo4j.py`` path does not apply (it
+        MERGEs each node under its own domain label). Reusing it to answer
+        "which packs exist here" therefore under-reports, and the one caller
+        that asks that question is #147's startup reconciliation: an
+        under-report there means the guard stays silent while scoped reads
+        hide the pack.
+
+        Uses the same truthiness rule as ``_graph_common._node_pack_id`` and
+        ``pack_provenance.scope_pack_id`` -- ``""``/``0``/``false`` are "no
+        pack_id" -- so the set returned here is exactly the set of packs
+        that scoped reads can resolve.
+        """
+        ...
+
     def count_nodes(self, node_type: str | None = None) -> int:
         """Count nodes, optionally filtered by exact node_type; 0 if empty."""
         ...
@@ -318,8 +339,17 @@ class GraphStore(Protocol):
 
 @runtime_checkable
 class GraphStoreExtended(Protocol):
-    """The 7 methods LocalGraphStore/PGGraphStore/KuzuGraphStore share that
-    Neo4jStore currently lacks (D3's Stage-4 R5 worklist).
+    """The 7 methods this Protocol was carved out for -- originally the ones
+    LocalGraphStore/PGGraphStore/KuzuGraphStore had and Neo4jStore did not
+    (D3's Stage-4 R5 worklist).
+
+    That gap has since been closed: ``test_graph_protocol_contract.py::
+    test_neo4j_satisfies_graph_store_extended`` asserts
+    ``isinstance(neo4j_store, GraphStoreExtended)`` and passes, so the
+    sentence above describes why this Protocol is SEPARATE from
+    ``GraphStore``, not a live difference between the backends. It stays
+    separate because the split is what lets the assertion be a real parity
+    check rather than a tautology.
 
     ``search_nodes`` (issue #86, see the GAP TABLE above) is deliberately
     NOT declared as an 8th member here, even though it fits this Protocol's
@@ -370,6 +400,24 @@ class GraphStoreExtended(Protocol):
         else ``""`` — it is projected inside this same aggregation so
         pack-relevance scoring (``content_pack_list(query=...)``) needs no
         per-pack follow-up lookup.
+        """
+        ...
+
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped ``find_by_relations`` (#147).
+
+        Same shape, but the anchor, the other endpoint AND the edge itself
+        must all be in ``pack_ids``, and all three are constrained before
+        ``LIMIT``. ``find_by_relations`` never returns edge properties, so a
+        caller cannot reproduce the edge half of that rule by post-filtering
+        its results. Empty ``pack_ids`` or ``relations`` -> ``[]``.
         """
         ...
 
@@ -564,5 +612,100 @@ class GraphStoreExtended(Protocol):
         row in one executemany/INSERT batch is assumed to succeed; Kuzu's
         port loops calling ``upsert_edge`` per item and only counts the
         ones that returned True.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Scoped (authorization) surface — issue #147 read-path scoping.
+    #
+    # These 4 methods exist BECAUSE the 4 above (``get_node_by_id``,
+    # ``export_nodes``, ``count_exported_nodes``, ``export_edges``) are
+    # unsafe for an authorization read path and are deliberately left
+    # unchanged for their existing bulk-export/fork use case (see issue
+    # #147 §3.4(b)/§8): ``export_nodes``'s pack_id/source/source_id 3-way OR
+    # lets a node claim membership in a pack it was never actually written
+    # into, and ``get_node_by_id``'s bare ``WHERE node_id=:nid LIMIT 1`` has
+    # no ``node_type`` predicate even though ``graph_nodes``' real PK is
+    # ``(node_type, node_id)`` -- either gap is fine for a pack-export tool
+    # (the caller already owns the whole pack) but not for a permission
+    # check. This is a NEW, separate surface, not a signature change to the
+    # 4 existing methods above.
+    #
+    # Declared on ALL FOUR backends (Local/PG via ``_sql_graph_base.py``,
+    # Kuzu, Neo4j) -- unlike ``search_nodes`` above, Neo4j is NOT exempt
+    # here: Neo4j's node/edge properties are native (not a JSON blob like
+    # Kuzu's), so pushing a pack predicate into Cypher is not the
+    # capability gap ``search_nodes`` has there.
+    # ------------------------------------------------------------------
+
+    def export_nodes_scoped(
+        self, pack_ids: list[str], limit: int, space: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Authorization-scoped node export -- ``export_nodes``, but with
+        ``pack_id`` REQUIRED (no "everything" mode) and matched STRICTLY
+        (only a node's own ``pack_id`` property counts; never ``source``/
+        ``source_id``). Return shape identical to ``export_nodes``.
+
+        Empty ``pack_ids`` -> ``[]`` WITHOUT querying (nothing is in scope,
+        so there is nothing to fetch). ``limit <= 0`` -> ``[]``, same
+        contract as ``export_nodes`` (issue #120).
+        """
+        ...
+
+    def count_exported_nodes_scoped(
+        self, pack_ids: list[str], space: str | None = None
+    ) -> int:
+        """Exact ``COUNT`` counterpart to ``export_nodes_scoped``, same
+        predicate, unbounded by any LIMIT (issue #54's reasoning, applied
+        to the scoped predicate). Empty ``pack_ids`` -> ``0`` without
+        querying.
+        """
+        ...
+
+    def export_edges_scoped(self, pack_ids: list[str], limit: int) -> list[dict[str, Any]]:
+        """Authorization-scoped edge export -- AND rule, the opposite of
+        ``export_edges``' 5-way OR: BOTH endpoints' ``pack_id`` must be in
+        ``pack_ids``, AND the edge's own ``pack_id`` (if it has one) must
+        also be in ``pack_ids``. Required because ``export_edges``' OR would
+        expose a node outside the caller's scope via the OTHER endpoint's
+        membership -- the response embeds both endpoints' full properties,
+        so an OR-across-endpoints predicate is a leak here, not just a
+        looser filter (see ``_graph_common._edge_passes``, the same 3-rule
+        policy this reproduces as SQL/Cypher). Return shape identical to
+        ``export_edges``.
+
+        Empty ``pack_ids`` -> ``[]`` without querying. ``limit <= 0`` ->
+        ``[]``, matching ``export_edges``' contract.
+        """
+        ...
+
+    def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
+        """Type-agnostic, SCOPE-FILTERED node lookup -- ``get_node_by_id``,
+        but with the pack predicate applied BEFORE any row-limiting
+        operation (never a Python post-filter over a single already-picked
+        row). This matters because ``graph_nodes``' real PK is
+        ``(node_type, node_id)``: the same ``node_id`` can exist under a
+        DIFFERENT ``node_type`` in a pack the caller cannot read, and
+        filtering after an unscoped ``LIMIT 1`` would sometimes answer "not
+        found" even when the caller's OWN pack genuinely has that id under
+        a different type -- a false-negative on top of the leak a naive
+        post-filter would still have to prevent. Concrete backend
+        requirements differ because of this:
+          - SQL (Local/PG): the pack predicate is pushed into the SQL WHERE
+            clause AHEAD of ``LIMIT 1``.
+          - Kuzu: no ``LIMIT 1`` in the underlying query AT ALL (its
+            properties are a JSON-blob column, so the pack predicate can't
+            be pushed into Cypher) -- every ``node_id``-matching row is
+            fetched and the scope filter picks among them in Python.
+          - Neo4j: native properties, so ``n.pack_id IN $pack_ids`` is
+            pushed straight into the Cypher WHERE, same as SQL.
+
+        Scope-INTERNAL homonym collisions (two different node_types, BOTH
+        inside the caller's own readable scope, sharing one node_id) are
+        NOT resolved by any backend here -- which row is returned in that
+        case is unspecified. Out of scope for issue #147 (a data-integrity
+        question, not a confidentiality one; see its §8).
+
+        Empty ``pack_ids`` -> ``None`` without querying.
         """
         ...

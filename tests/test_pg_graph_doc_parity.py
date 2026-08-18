@@ -411,8 +411,12 @@ class TestDocParity:
         matches the task's 'top-set overlap' acceptance bar."""
         local, pg = doc_pair
         for query in ["postgresql database", "kubernetes container", "machine learning"]:
-            local_hits = local.keyword_search(query, limit=10)
-            pg_hits = pg.keyword_search(query, limit=10)
+            # #147: keyword_search takes the caller's readable pack set now.
+            # The fixture tags its sources packA/packB/packC, so the parity
+            # question ("do both backends rank the same corpus alike") is
+            # only asked when all three are in scope.
+            local_hits = local.keyword_search(query, pack_ids=["packA", "packB", "packC"], limit=10)
+            pg_hits = pg.keyword_search(query, pack_ids=["packA", "packB", "packC"], limit=10)
             assert local_hits and pg_hits
             local_ids = {h["source_id"] for h in local_hits}
             pg_ids = {h["source_id"] for h in pg_hits}
@@ -426,8 +430,8 @@ class TestDocParity:
         ILIKE + pg_trgm fallback leg (the tsvector leg only matches whole
         normalised lexemes). Both backends must still return packC docs."""
         local, pg = doc_pair
-        local_hits = local.keyword_search("AI", limit=10)
-        pg_hits = pg.keyword_search("AI", limit=10)
+        local_hits = local.keyword_search("AI", pack_ids=["packA", "packB", "packC"], limit=10)
+        pg_hits = pg.keyword_search("AI", pack_ids=["packA", "packB", "packC"], limit=10)
         assert local_hits and pg_hits
         assert all(h["metadata"]["pack_id"] == "packC" for h in local_hits)
         assert all(h["metadata"]["pack_id"] == "packC" for h in pg_hits)
@@ -452,16 +456,18 @@ class TestDocParity:
         pg = PgDocStore(pg_engine, schema=schema)
         try:
             docs = [
-                ("kr_src0", "인공지능 기계학습 자연어처리 연구 문서", {"node_id": "kr_d0"}),
-                ("kr_src1", "인공지능 딥러닝 신경망 모델 학습", {"node_id": "kr_d1"}),
-                ("kr_src2", "데이터베이스 트랜잭션 격리 수준 설명", {"node_id": "kr_d2"}),
+                # #147: pack_id is required for a row to be reachable by any
+                # read at all, so the corpus has to carry one.
+                ("kr_src0", "인공지능 기계학습 자연어처리 연구 문서", {"node_id": "kr_d0", "pack_id": "packKR"}),
+                ("kr_src1", "인공지능 딥러닝 신경망 모델 학습", {"node_id": "kr_d1", "pack_id": "packKR"}),
+                ("kr_src2", "데이터베이스 트랜잭션 격리 수준 설명", {"node_id": "kr_d2", "pack_id": "packKR"}),
             ]
             for sid, text_, meta in docs:
                 local.upsert_source(sid, text_, meta)
                 pg.upsert_source(sid, text_, meta)
 
-            local_hits = local.keyword_search("인공지능 학습", limit=10)
-            pg_hits = pg.keyword_search("인공지능 학습", limit=10)
+            local_hits = local.keyword_search("인공지능 학습", pack_ids=["packKR"], limit=10)
+            pg_hits = pg.keyword_search("인공지능 학습", pack_ids=["packKR"], limit=10)
             assert local_hits and pg_hits
             local_ids = {h["source_id"] for h in local_hits}
             pg_ids = {h["source_id"] for h in pg_hits}
@@ -587,20 +593,32 @@ class TestTypedPropertiesAndNullSemantics:
             assert "first_only" not in edges[0]["rel_props"]
             assert edges[0]["rel_props"]["shared"] == "new"
 
-    def test_find_neighbors_empty_pack_ids_equals_none(self, graph_pair):
-        """``pack_ids=[]`` (empty list) must behave identically to
-        ``pack_ids=None`` on both backends — both are falsy in Python, so the
-        BFS's ``pack_set = set(pack_ids) if pack_ids else None`` guard treats
-        them the same (no filtering applied)."""
+    def test_find_neighbors_empty_pack_ids_is_not_none_and_both_backends_agree(
+        self, graph_pair
+    ):
+        """``pack_ids=[]`` and ``pack_ids=None`` are DIFFERENT, identically so
+        on both backends (#147, contract flip).
+
+        This test previously pinned the opposite: both were falsy in Python
+        and the BFS collapsed them into "no filter". That collapse was the
+        fail-open #147 exists to close -- a principal who may read no pack
+        would have traversed the whole graph. ``None`` still means "no
+        filter" for the legacy non-authorization callers; ``[]`` now means
+        "nothing is readable". What this parity test still guarantees is
+        that Local and PG agree about each of them.
+        """
         local, pg = graph_pair
         kwargs_common = dict(direction="both", depth=1, limit=1000)
         local_none = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
         local_empty = sorted_neighbors(local.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
         pg_none = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=None, **kwargs_common))
         pg_empty = sorted_neighbors(pg.find_neighbors("packA_n0", pack_ids=[], **kwargs_common))
-        assert local_none == local_empty
-        assert pg_none == pg_empty
+        assert local_empty == pg_empty == []
+        # The unfiltered result is non-empty, so the two above are the empty
+        # scope refusing rather than an anchor with no neighbours.
+        assert local_none
         assert local_none == pg_none
+        assert local_none != local_empty
 
     # ------------------------------------------------------------------
     # Doc-store equivalents of the graph-store typed-properties/NULL/

@@ -33,12 +33,19 @@ export interface QueryResult {
 export type SourceType = 'obsidian' | 'notion' | 'gdrive' | 'github'
 
 /* ── Status ──────────────────────────────────────────────── */
+// #147: /api/status now requires a bearer token. This call is unauthenticated
+// (no apiKey param) and is used purely as a connection indicator -- dashboard
+// page.tsx reads only `ok.ok` -- so it points at /healthz instead, the
+// auth-exempt probe apps/api/main.py added alongside locking /api/status
+// down. /healthz returns only {"ok": true}, no storage_mode/store-state
+// payload, so `version`/`vectorCount` are never populated; they stay in the
+// return type as optional so callers reading them do not break.
 export async function getStatus(): Promise<{ ok: boolean; version?: string; vectorCount?: number }> {
   try {
-    const r = await fetch(`${BASE}/api/status`, { cache: 'no-store' })
+    const r = await fetch(`${BASE}/healthz`, { cache: 'no-store' })
     if (!r.ok) return { ok: false }
     const d = await r.json()
-    return { ok: true, version: d.version }
+    return { ok: Boolean(d.ok) }
   } catch { return { ok: false } }
 }
 

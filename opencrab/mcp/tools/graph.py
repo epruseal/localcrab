@@ -287,18 +287,36 @@ def ontology_add_edge(
     access=AccessTier.READ,
 )
 def ontology_get_node(node_id: str) -> dict[str, Any]:
-    """Fetch a single node by node_id regardless of type.
+    """Fetch a single node by node_id regardless of type, within the
+    caller's readable pack scope.
 
-    All four storage backends implement get_node_by_id() natively (type-
-    agnostic, single SQL/Cypher LIMIT 1) — see opencrab/stores/_graph_protocol.py.
+    #147: this calls ``get_node_by_id_scoped``, not ``get_node_by_id``. The
+    unscoped version matches ``node_id`` alone even though the PK is
+    ``(node_type, node_id)``, so filtering its result afterwards would
+    answer "not found" for a node the caller does own whenever another pack
+    holds the same id under a different type. All four backends implement
+    the scoped form (see opencrab/stores/_graph_protocol.py); note that
+    Kuzu's deliberately does NOT use ``LIMIT 1``, for the same reason.
     """
-    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
 
     ctx = _get_context()
     graph = ctx["neo4j"]
     node_id = _clean_str(node_id)
-    result = graph.get_node_by_id(node_id)
+    # #147: scoped at the store, not filtered afterwards. The unscoped
+    # lookup matches on node_id alone even though the PK is
+    # (node_type, node_id), so a post-filter would answer "not found" for a
+    # node the caller does own whenever someone else's pack happens to hold
+    # the same id under a different type.
+    scope = _current_read_scope(ctx)
+    result = graph.get_node_by_id_scoped(node_id, sorted(scope))
 
+    # A node outside the scope returns the response an absent node returns.
+    # Identical apart from the node_id echoed back, which is the caller's own
+    # input and carries no information they did not already have (#143
+    # invariant 7). There is no second branch here to tell the two cases
+    # apart, which is the point -- a distinct "not permitted" path would be
+    # free to drift into a distinguishable one.
     if result is None:
         return {"found": False, "node_id": node_id}
     return {"found": True, "node_id": node_id, "node": result}
@@ -348,9 +366,17 @@ def ontology_list_nodes(
 ) -> dict[str, Any]:
     """List nodes filtered by space and/or pack_id.
 
+    #147: every branch is pack-scoped now, and the calls below are the
+    ``*_scoped`` variants -- ``count_exported_nodes_scoped`` /
+    ``export_nodes_scoped`` (graph) and ``list_nodes_scoped`` (doc store).
+    They take the caller's readable pack set and match on ``pack_id``
+    ALONE; the older ``export_nodes``/``count_exported_nodes`` also matched
+    ``source``/``source_id``, which are caller-written and therefore
+    unusable for an access decision (#143).
+
     WITH pack_id: this calls (in this order, matching the code below) the
-    graph store's count_exported_nodes(pack_id=..., space=..., no LIMIT)
-    first for ``total``, THEN export_nodes(pack_id=..., space=..., limit=...)
+    graph store's count_exported_nodes_scoped(pack_ids, space=..., no LIMIT)
+    first for ``total``, THEN export_nodes_scoped(pack_ids, space=..., limit=...)
     for the displayed page. All three concrete backends (SQL-backed
     local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j, ``pack_id``
     too) into their native query ahead of ``limit`` — see each backend's
@@ -411,11 +437,19 @@ def ontology_list_nodes(
     current state). Callers must not assume ``total`` and ``len(nodes)``
     are always perfectly reconciled under concurrent writes.
     """
-    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
+    from opencrab.pack.read_scope import narrow
 
     ctx = _get_context()
     pack_id = _clean_str(pack_id) if pack_id else None
     cleaned_space = _clean_str(space) if space else None
+
+    # #147: pack_id=None no longer means "no filter" -- it means "every pack
+    # I can read". A named pack_id is intersected with that set, so naming
+    # someone else's private pack lands on the same empty list as naming a
+    # pack_id that was never created (#143 invariant 7).
+    scope = _current_read_scope(ctx)
+    effective, _ = narrow(scope, [pack_id] if pack_id else None)
 
     nodes: list[dict[str, Any]] = []
     total = 0
@@ -424,11 +458,11 @@ def ontology_list_nodes(
         graph_store = ctx["neo4j"]
         # True match count, independent of `limit` (issue #54's core
         # requirement -- see this function's docstring).
-        total = graph_store.count_exported_nodes(pack_id=pack_id, space=cleaned_space)
+        total = graph_store.count_exported_nodes_scoped(effective, space=cleaned_space)
         # Graph store: indexed/native pack_id + space filter → correct rows
         # before limit (all three backends implement the same contract, see
         # _graph_protocol.py#export_nodes).
-        raw = graph_store.export_nodes(pack_id=pack_id, limit=limit, space=cleaned_space)
+        raw = graph_store.export_nodes_scoped(effective, limit=limit, space=cleaned_space)
         # export_nodes returns [{"props": dict, "labels": [str]}, ...]
         # normalise to same shape as doc store list_nodes. The space check
         # below is now redundant with the backend's own filter (kept as
@@ -449,8 +483,13 @@ def ontology_list_nodes(
                 "properties": props,
             })
     else:
-        # Doc store fallback (no pack_id filter requested)
-        nodes = ctx["mongo"].list_nodes(space=cleaned_space, limit=limit)
+        # Doc store fallback (no pack_id named). #147: still scoped -- the
+        # doc store gets the readable set explicitly rather than the
+        # unfiltered list_nodes it used to call. Data source is unchanged on
+        # purpose: switching this branch to the graph store would also change
+        # which rows and which `total` semantics callers see, and that is not
+        # what this issue is for.
+        nodes = ctx["mongo"].list_nodes_scoped(effective, space=cleaned_space, limit=limit)
         total = len(nodes)
 
     return {
@@ -497,27 +536,38 @@ def ontology_list_edges(
 ) -> dict[str, Any]:
     """List edges, optionally filtered by pack_id.
 
-    All four backends implement export_edges() natively (wide shape:
-    source_props/source_labels/target_props/target_labels/rel_props/relation
-    — see opencrab/stores/_graph_protocol.py). pack_id matches either
-    endpoint's pack_id/source/source_id, or the edge's own — the backend
-    owns that filter, not this function.
+    #147: routed through ``export_edges_scoped``, not ``export_edges``.
+    The scoped predicate requires BOTH endpoints to be in the caller's
+    readable set (plus the edge's own pack_id, when it has one) -- an edge
+    row carries both endpoints' full properties, so one unreadable endpoint
+    would disclose that node. ``export_edges``'s OR-any-endpoint matching,
+    which also accepted caller-written ``source``/``source_id``, remains for
+    pack export and is not an access decision.
     """
-    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
+    from opencrab.pack.read_scope import narrow
 
     ctx = _get_context()
     graph = ctx["neo4j"]
     pack_id = _clean_str(pack_id) if pack_id else None
 
-    if hasattr(graph, "export_edges"):
-        try:
-            edges = graph.export_edges(pack_id=pack_id, limit=limit)
-            return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
-        except Exception as exc:
-            # Report the real failure instead of falling through to the
-            # generic "unavailable" message, which would otherwise mask an
-            # operational error as if the store didn't exist at all.
-            logger.warning("export_edges failed: %s", exc)
-            return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
+    scope = _current_read_scope(ctx)
+    effective, _ = narrow(scope, [pack_id] if pack_id else None)
 
-    return {"edges": [], "total": 0, "error": "graph store unavailable", "pack_id_filter": pack_id}
+    # #147: no hasattr() guard around export_edges_scoped, deliberately. The
+    # old guard around export_edges was harmless because its fallback was a
+    # plain "unavailable" message; here a fallback would mean quietly
+    # reverting to the unscoped 5-way-OR path. A backend missing the method
+    # is a wiring defect and must surface as one, so AttributeError is
+    # re-raised rather than folded into the operational-error branch below.
+    try:
+        edges = graph.export_edges_scoped(effective, limit=limit)
+        return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
+    except AttributeError:
+        raise
+    except Exception as exc:
+        # Report the real failure instead of falling through to the
+        # generic "unavailable" message, which would otherwise mask an
+        # operational error as if the store didn't exist at all.
+        logger.warning("export_edges_scoped failed: %s", exc)
+        return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}

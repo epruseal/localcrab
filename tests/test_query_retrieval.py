@@ -12,6 +12,7 @@ def test_bm25_handles_korean_relation_questions() -> None:
             "space": "claim",
             "node_type": "Claim",
             "properties": {
+                "pack_id": "p1",
                 "title": "가구표면 방염 변경 사유",
                 "description": "방염공사 시 가구표면 방염으로 변경된 이유와 사내 기준 배경.",
             },
@@ -21,6 +22,7 @@ def test_bm25_handles_korean_relation_questions() -> None:
             "space": "resource",
             "node_type": "Document",
             "properties": {
+                "pack_id": "p1",
                 "title": "발코니 바닥 방수 시공 기준",
                 "description": "난방 발코니의 방수 시공 기준과 체크사항.",
             },
@@ -29,6 +31,7 @@ def test_bm25_handles_korean_relation_questions() -> None:
 
     hits = BM25Index.build(nodes).search(
         "방염공사 시 가구표면 방염으로 변경된 이유 알려줘",
+        pack_ids=["p1"],
         limit=2,
     )
 
@@ -49,6 +52,7 @@ def test_hybrid_query_expands_graph_from_bm25_anchor_for_relation_intent() -> No
                     "space": "claim",
                     "node_type": "Claim",
                     "properties": {
+                        "pack_id": "p1",
                         "title": "Rock Panel 적용 불가 사유",
                         "description": "Rock Panel을 우리회사에서 적용 불가능한 이유와 관련 기준.",
                     },
@@ -84,7 +88,9 @@ def test_hybrid_query_expands_graph_from_bm25_anchor_for_relation_intent() -> No
     hybrid = HybridQuery(FakeChroma(), graph)  # type: ignore[arg-type]
     hybrid._doc_store = FakeDocStore()
 
-    results = hybrid.query("Rock Panel을 우리회사에서 적용 불가능한 이유 알려줘", limit=3)
+    results = hybrid.query(
+        "Rock Panel을 우리회사에서 적용 불가능한 이유 알려줘", pack_ids=["p1"], limit=3,
+    )
 
     assert graph.calls
     assert graph.calls[0]["node_id"] == "rock-panel"

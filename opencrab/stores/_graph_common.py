@@ -120,8 +120,27 @@ def _node_passes(
     pack_set: set[str] | None,
     include_unpackaged: bool,
 ) -> bool:
-    if not pack_set:
+    """``pack_set`` empty-vs-absent (issue #147 §3.4(a)): ``None`` and an
+    empty ``set()``/``frozenset()`` used to be treated identically ("no
+    filter", both returned True unconditionally) -- that collapse is
+    exactly the read-path authorization gap issue #147 closes. The two
+    values now mean opposite things:
+      - ``pack_set is None``: no filter at all. Reserved for the small set
+        of PRE-AUTHORIZATION callers this module still has (e.g.
+        ``rebac.py``'s policy traversal, #143-frozen) -- an authorized
+        read-path caller always passes a concrete (possibly empty)
+        collection, so ``None`` is never reachable from an authorized
+        caller.
+      - ``pack_set`` is an empty collection: a principal who cannot read
+        ANY pack. Must return False for every node, not True -- the old
+        ``if not pack_set: return True`` fail-open behaviour is exactly
+        what let a brand-new user with zero readable packs see the entire
+        graph.
+    """
+    if pack_set is None:
         return True
+    if not pack_set:
+        return False
     pid = _node_pack_id(props)
     if pid is None:
         return include_unpackaged
@@ -140,9 +159,15 @@ def _edge_passes(
       1. edge.pack_id in pack_set        -> pass (endpoints still must pass)
       2. edge.pack_id not in pack_set    -> always exclude
       3. edge has no pack_id             -> only pass when both endpoints pass
+
+    ``pack_set`` empty-vs-absent: see ``_node_passes``'s docstring -- the
+    same ``None`` (no filter) vs empty-collection (nothing passes)
+    distinction applies here (issue #147 §3.4(a)).
     """
-    if not pack_set:
+    if pack_set is None:
         return True
+    if not pack_set:
+        return False
     edge_pid = _node_pack_id(edge_props) if isinstance(edge_props, dict) else None
     if edge_pid is not None:
         if edge_pid not in pack_set:

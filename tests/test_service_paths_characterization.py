@@ -181,12 +181,27 @@ def _make_query_result(node_id: str = "n1", pack_id: str | None = "pack-a") -> Q
     return QueryResult(source="vector", node_id=node_id, score=0.9, text="alpha", metadata=meta)
 
 
-def _mock_query_ctx(results):
+def _mock_query_ctx(results, sql=None):
     """ontology_query envelope 분기 박제용: hybrid만 MagicMock, 나머지는 stub.
 
     #51: HybridQuery.query()는 QueryOutcome(results, warnings)을 반환한다
     (더 이상 bare list가 아님) — 실제 계약과 맞춰 mock한다.
+
+    #147: ontology_query now derives its read scope from
+    ``ctx["sql"]`` + ``current_principal()`` (opencrab.mcp.tools._current_read_scope
+    -> opencrab.pack.read_scope.read_scope -> ownership.readable_pack_ids),
+    which issues a real SQL query. A bare MagicMock() here would either
+    TypeError or silently answer "everything readable" via mock attribute
+    access, which is exactly the fail-open this execution closes -- so
+    ``ctx["sql"]`` must be a real (in-memory) SQLStore. Callers that need the
+    bound test principal ("test-user", see conftest.py's bind_test_principal)
+    to own a pack pass their own ``sql`` (already populated via
+    ``opencrab.pack.ownership.create_pack``) instead of relying on the default.
     """
+    if sql is None:
+        from opencrab.stores.sql_store import SQLStore
+
+        sql = SQLStore("sqlite:///:memory:")
     hybrid = MagicMock()
     hybrid.query.return_value = QueryOutcome(results=results, warnings=[])
     billing = MagicMock()
@@ -195,13 +210,29 @@ def _mock_query_ctx(results):
         "neo4j": MagicMock(),
         "chroma": MagicMock(),
         "mongo": MagicMock(),
-        "sql": MagicMock(),
+        "sql": sql,
         "builder": MagicMock(),
         "rebac": MagicMock(),
         "impact": MagicMock(),
         "hybrid": hybrid,
         "billing": billing,
     }
+
+
+def _owned_sql(*pack_ids):
+    """Real in-memory SQLStore with each pack_id owned by "test-user" (the
+    fixed principal ``bind_test_principal`` binds for this whole module) --
+    so it lands inside ``read_scope``'s output and this module's MCP-level
+    pack-selection tests keep exercising the SAME scenario they always did
+    (an owned pack a query can actually resolve/select), not an accidentally-
+    always-empty scope."""
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    sql = SQLStore("sqlite:///:memory:")
+    for pack_id in pack_ids:
+        create_pack(sql, "test-user", pack_id)
+    return sql
 
 
 def _write_pack_manifest(data_dir: Path, pack_id: str, **fields) -> None:
@@ -269,7 +300,13 @@ class TestPackSelectionMCP:
         )
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([_make_query_result(pack_id="nemotron-pack")])
+        # #147: nemotron-pack must be owned by the bound principal ("test-user")
+        # or auto_pack's candidate list is filtered to empty BEFORE scoring
+        # (resolve_packs filters the disk registry to `p.pack_id in scope`
+        # before choose_packs runs) regardless of how well the query matches.
+        ctx = _mock_query_ctx(
+            [_make_query_result(pack_id="nemotron-pack")], sql=_owned_sql("nemotron-pack")
+        )
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("tell me about nemotron", auto_pack=True)
 
@@ -289,7 +326,10 @@ class TestPackSelectionMCP:
     def test_pack_ids_take_priority_over_auto_pack(self, local_env):
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([_make_query_result(pack_id="pack-a")])
+        # #147: pack-a must be in the caller's read scope, or resolve_packs's
+        # narrow() drops it and the result is PACK_IDS_OUT_OF_SCOPE instead of
+        # the override-auto-pack warning this test pins.
+        ctx = _mock_query_ctx([_make_query_result(pack_id="pack-a")], sql=_owned_sql("pack-a"))
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("q", pack_ids=["pack-a"], auto_pack=True)
 
@@ -309,52 +349,96 @@ class TestPackSelectionMCP:
         )
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([])
+        # #147: own nemotron-pack so it survives resolve_packs's scope filter
+        # and reaches choose_packs -- this test's whole point is that the
+        # KEYWORD MATCH is what falls short, not the scope filter.
+        ctx = _mock_query_ctx([], sql=_owned_sql("nemotron-pack"))
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("totally unrelated random words", auto_pack=True)
 
         assert resp["selected_packs"] == []
-        assert resp["pack_filter"]["pack_ids"] is None
+        # #147: effective_pack_ids is never None -- "no explicit pack_ids"
+        # resolves to the caller's whole readable scope, which here is
+        # exactly the one owned pack (auto_pack couldn't select FROM it, but
+        # the fallback filter is still "everything you may read", not "no
+        # filter").
+        assert resp["pack_filter"]["pack_ids"] == ["nemotron-pack"]
         assert resp["pack_filter"]["auto_pack"] is True
+        # #147: wording changed -- there is no more "full-store search" state
+        # to fall back to; the fallback is the caller's own readable scope.
         assert resp["pack_filter"]["warnings"] == [
             "auto_pack could not select a pack above the score threshold; "
-            "falling back to full-store search"
+            "searching all packs you can read"
         ]
 
     def test_auto_pack_no_registry_falls_back(self, local_env):
         """packs 디렉토리가 없으면 (registry 비어 있음) 임계값 미달과 동일하게 fallback."""
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([])
+        # No pack owned either -- scope is empty, same as an empty disk registry.
+        ctx = _mock_query_ctx([], sql=_owned_sql())
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("anything", auto_pack=True)
 
         assert resp["selected_packs"] == []
-        assert resp["pack_filter"]["pack_ids"] is None
+        # #147: never None -- an empty readable scope is a concrete empty list.
+        assert resp["pack_filter"]["pack_ids"] == []
         assert "warnings" in resp["pack_filter"]
 
     def test_include_unpackaged_without_pack_filter_warns(self, local_env):
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([])
+        ctx = _mock_query_ctx([], sql=_owned_sql())
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("q", include_unpackaged=True)
 
-        assert resp["pack_filter"]["include_unpackaged"] is True
+        # #147: the echoed value is PackSelection.include_unpackaged_effective,
+        # which is hardcoded False everywhere (DESIGN.md §3.2) -- it reports
+        # what was actually honoured, not the caller's raw request. Echoing
+        # the caller's input back as "True" here would tell them the flag
+        # took effect when it categorically never does.
+        assert resp["pack_filter"]["include_unpackaged"] is False
+        # #147: wording changed -- include_unpackaged is unconditionally
+        # unhonoured now (reads are always pack-scoped), not merely "no
+        # effect without pack_ids/auto_pack".
         assert resp["pack_filter"]["warnings"] == [
-            "include_unpackaged has no effect without pack_ids/auto_pack"
+            "include_unpackaged is not honoured: reads are always scoped to "
+            "the packs you can read"
         ]
 
-    def test_include_unpackaged_with_pack_ids_no_warning(self, local_env):
+    # #147 INTENTIONALLY FLIPPED PIN (see DESIGN.md §3.2, listed in the PR
+    # body's flipped-pin list): INCLUDE_UNPACKAGED_NOOP used to fire only
+    # when "include_unpackaged and not effective" (no pack filter active).
+    # opencrab/services/pack_selection.py::resolve_packs now fires it
+    # whenever `include_unpackaged` is truthy, full stop -- because leaving
+    # it conditional on pack_ids would tell a caller who explicitly asked for
+    # unpackaged rows AND named packs that their request had no effect "for
+    # lack of pack_ids", which is false. The scenario this test's old name
+    # promised ("no warning when pack_ids is given") no longer exists.
+    # HybridQuery.query() also no longer takes an include_unpackaged
+    # parameter at all (DESIGN.md §3.3) -- ontology_query() never forwards
+    # it -- so the old `ctx["hybrid"].query.call_args.kwargs["include_unpackaged"]
+    # is True` assertion pins a kwarg that is never sent anymore; replaced
+    # with a lock on its absence.
+    def test_include_unpackaged_with_pack_ids_still_warns_and_is_not_forwarded(
+        self, local_env
+    ):
         from opencrab.mcp import tools
 
-        ctx = _mock_query_ctx([_make_query_result(pack_id="pack-a")])
+        ctx = _mock_query_ctx(
+            [_make_query_result(pack_id="pack-a")], sql=_owned_sql("pack-a")
+        )
         with patch.object(tools, "_get_context", return_value=ctx):
             resp = tools.ontology_query("q", pack_ids=["pack-a"], include_unpackaged=True)
 
-        assert resp["pack_filter"]["include_unpackaged"] is True
-        assert "warnings" not in resp["pack_filter"]
-        assert ctx["hybrid"].query.call_args.kwargs["include_unpackaged"] is True
+        # #147: always the effective (hardcoded False) value, not the
+        # caller's raw request -- see the sibling test above.
+        assert resp["pack_filter"]["include_unpackaged"] is False
+        assert resp["pack_filter"]["warnings"] == [
+            "include_unpackaged is not honoured: reads are always scoped to "
+            "the packs you can read"
+        ]
+        assert "include_unpackaged" not in ctx["hybrid"].query.call_args.kwargs
 
 
 class TestPackSelectionCLI:
@@ -373,7 +457,26 @@ class TestPackSelectionCLI:
         envelope = json.loads(out[brace:])
         return result, envelope
 
+    def _bootstrap_cli_user(self, *own_pack_ids):
+        """#147: CLI `query` now calls require_local_principal() first and
+        derives its pack filter from that principal's readable scope -- a
+        command that used to run with no principal bound at all now needs
+        one bootstrapped first, and (for tests that name --pack-id/expect
+        auto_pack to find a pack) that principal must own the pack_ids the
+        test cares about, or resolve_packs's scope-intersection drops them."""
+        from opencrab.auth import bootstrap_local_user
+        from opencrab.config import get_settings
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        user_id, _secret = bootstrap_local_user(sql)
+        for pack_id in own_pack_ids:
+            create_pack(sql, user_id, pack_id)
+        return user_id
+
     def test_cli_envelope_empty_store_shape(self, local_env):
+        self._bootstrap_cli_user()
         result, env = self._run_envelope(["query", "zzz no match here", "--json-envelope"])
         assert result.exit_code == 0
         # 빈 store → 결정적으로 빈 결과. envelope 키 집합 박제.
@@ -390,13 +493,16 @@ class TestPackSelectionCLI:
         assert env["total"] == 0
         assert env["results"] == []
         assert env["selected_packs"] == []
+        # #147: effective_pack_ids is never None -- an owner of no packs has
+        # a concrete, empty readable scope, not "no filter".
         assert env["pack_filter"] == {
-            "pack_ids": None,
+            "pack_ids": [],
             "auto_pack": False,
             "include_unpackaged": False,
         }
 
     def test_cli_auto_pack_selects_and_emits_info(self, local_env):
+        self._bootstrap_cli_user("nemotron-pack")
         _write_pack_manifest(
             local_env,
             "nemotron-pack",
@@ -415,6 +521,7 @@ class TestPackSelectionCLI:
         assert env["selected_packs"][0]["pack_id"] == "nemotron-pack"
 
     def test_cli_pack_id_priority_warns_to_stderr(self, local_env):
+        self._bootstrap_cli_user("pack-a")
         result, env = self._run_envelope(
             ["query", "q", "--pack-id", "pack-a", "--auto-pack", "--json-envelope"]
         )
@@ -429,6 +536,7 @@ class TestPackSelectionCLI:
 
         from opencrab.cli import main
 
+        self._bootstrap_cli_user()
         runner = CliRunner()
         result = runner.invoke(main, ["query", "zzz no match", "--json-output"])
         assert result.exit_code == 0
@@ -452,8 +560,12 @@ class TestResolvePacksErrorPolicy:
         monkeypatch.setattr(
             "opencrab.ontology.pack_registry.load_pack_registry", self._boom
         )
-        sel = resolve_packs("q", None, True, False, "/tmp", raise_on_error=False)
-        assert sel.effective_pack_ids is None
+        sel = resolve_packs(
+            "q", None, True, False, "/tmp", scope=frozenset(), raise_on_error=False
+        )
+        # #147: effective_pack_ids is never None -- no requested pack_ids
+        # resolves to the caller's (here empty) readable scope, a concrete list.
+        assert sel.effective_pack_ids == []
         assert sel.selected_packs == []
         assert [w.code for w in sel.warnings] == [AUTO_PACK_FAILED]
         assert sel.warnings[0].detail == "kaboom"
@@ -465,7 +577,9 @@ class TestResolvePacksErrorPolicy:
             "opencrab.ontology.pack_registry.load_pack_registry", self._boom
         )
         with pytest.raises(RuntimeError):
-            resolve_packs("q", None, True, False, "/tmp", raise_on_error=True)
+            resolve_packs(
+                "q", None, True, False, "/tmp", scope=frozenset(), raise_on_error=True
+            )
 
     def test_pack_ids_override_does_not_touch_registry(self, monkeypatch):
         # pack_ids 가 있으면 auto_pack 은 무력화되어 registry 를 건드리지 않는다
@@ -475,7 +589,12 @@ class TestResolvePacksErrorPolicy:
         monkeypatch.setattr(
             "opencrab.ontology.pack_registry.load_pack_registry", self._boom
         )
-        sel = resolve_packs("q", ["pack-a"], True, False, "/tmp", raise_on_error=True)
+        # scope must include "pack-a" or narrow() drops it and adds an extra
+        # PACK_IDS_OUT_OF_SCOPE warning this test isn't about.
+        sel = resolve_packs(
+            "q", ["pack-a"], True, False, "/tmp",
+            scope=frozenset({"pack-a"}), raise_on_error=True,
+        )
         assert sel.effective_pack_ids == ["pack-a"]
         assert sel.auto_pack_active is False
         assert [w.code for w in sel.warnings] == [PACK_IDS_OVERRIDE_AUTO]
@@ -589,8 +708,11 @@ class TestQueryResponseHTTP:
         assert body["results"] == []
         assert body["keyword_fallback"] == []
         assert body["selected_packs"] == []
+        # #147: effective_pack_ids is never None -- the http_auth principal
+        # (a freshly bootstrapped local user, see local_principal fixture)
+        # owns no packs, so its readable scope is a concrete empty list.
         assert body["pack_filter"] == {
-            "pack_ids": None,
+            "pack_ids": [],
             "auto_pack": False,
             "include_unpackaged": False,
         }

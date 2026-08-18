@@ -297,6 +297,16 @@ class Neo4jStore:
         """
         self._require_available()
 
+        # issue #147 §3.4(a): `pack_ids=[]` must return `[]` WITHOUT
+        # querying, not fall through to `_build_neighbors_cypher`'s
+        # `if pack_ids:` (which treats `[]` the same as `None` -- "no
+        # filter" -- since both are falsy in Python). See
+        # _sql_graph_base.py's identical fix for the full rationale;
+        # `None` (no filter at all) is left to reach the Cypher builder
+        # unchanged -- it is not reachable from an authorized caller.
+        if pack_ids is not None and not pack_ids:
+            return []
+
         cypher, params = self._build_neighbors_cypher(
             node_id=node_id,
             direction=direction,
@@ -465,6 +475,26 @@ class Neo4jStore:
             props["node_type"] = record["lbl"]
             return props
 
+    def list_pack_ids(self) -> set[str]:
+        """See GraphStore.list_pack_ids.
+
+        ``MATCH (n)`` with NO label, unlike ``list_packs``' ``(n:OpenCrabNode)``.
+        ``scripts/import_pack_graph_to_neo4j.py`` MERGEs each node under its
+        own domain label, so a label-restricted scan misses whole imported
+        packs -- and missing them is precisely the state #147's startup
+        guard exists to refuse.
+        """
+        self._require_available()
+        # Nodes and relationships both: an edge may carry a pack_id no node
+        # has, and the migration unions the two when it builds the registry.
+        node_cypher = "MATCH (n) WHERE n.pack_id IS NOT NULL RETURN DISTINCT n.pack_id AS pid"
+        edge_cypher = "MATCH ()-[r]->() WHERE r.pack_id IS NOT NULL RETURN DISTINCT r.pack_id AS pid"
+        out: set[str] = set()
+        with self._session() as session:
+            for cypher in (node_cypher, edge_cypher):
+                out |= {str(rec["pid"]) for rec in session.run(cypher) if rec["pid"]}
+        return out
+
     def list_packs(self, min_nodes: int = 1) -> list[dict[str, Any]]:
         """Aggregate node counts per pack_id; packs below min_nodes omitted.
 
@@ -497,6 +527,46 @@ class Neo4jStore:
         with self._session() as session:
             result = session.run(cypher, min_nodes=min_nodes)
             return [dict(record) for record in result]
+
+    def find_by_relations_scoped(
+        self,
+        node_id: str,
+        relations: list[str],
+        pack_ids: list[str],
+        direction: str = "out",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """See GraphStore.find_by_relations_scoped. Anchor, other endpoint
+        and relationship are all constrained in the Cypher WHERE, ahead of
+        LIMIT."""
+        self._require_available()
+        if not relations or not pack_ids or limit <= 0:
+            return []
+        arrow = {
+            "out": "(a {id: $id})-[r]->(b)",
+            "in": "(b)-[r]->(a {id: $id})",
+        }.get(direction, "(a {id: $id})-[r]-(b)")
+        cypher = f"""
+            MATCH {arrow}
+            WHERE type(r) IN $relations
+              AND a.pack_id IN $pack_ids
+              AND b.pack_id IN $pack_ids
+              AND (r.pack_id IS NULL OR r.pack_id IN $pack_ids)
+            RETURN properties(b) AS props, labels(b) AS labels, type(r) AS relation
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(
+                cypher, id=node_id, relations=list(relations), pack_ids=list(pack_ids)
+            )
+            return [
+                {
+                    "properties": dict(rec["props"]),
+                    "labels": list(rec["labels"]),
+                    "relation_type": rec["relation"],
+                }
+                for rec in result
+            ]
 
     def find_by_relations(
         self,
@@ -596,6 +666,123 @@ class Neo4jStore:
             result = session.run(cypher, pack_id=pack_id, space=space)
             record = result.single()
             return int(record["total"]) if record else 0
+
+    # ------------------------------------------------------------------
+    # Scoped (authorization) surface — issue #147 §3.4(b). See
+    # _graph_protocol.py::GraphStoreExtended's "Scoped (authorization)
+    # surface" section for why these are separate from get_node_by_id/
+    # export_nodes/count_exported_nodes/export_edges (unchanged, kept for
+    # the bulk pack-export/fork use case). Neo4j's properties are native
+    # (not a JSON blob like Kuzu's), so every predicate here pushes
+    # straight into Cypher -- there is no Python post-filter path needed.
+    # ------------------------------------------------------------------
+
+    def export_nodes_scoped(
+        self, pack_ids: list[str], limit: int, space: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Strict pack_id-only counterpart to ``export_nodes`` (never
+        ``source``/``source_id``). Empty ``pack_ids`` -> ``[]`` without
+        issuing a query. ``limit <= 0`` -> ``[]``, same guard
+        ``export_nodes`` uses (issue #120)."""
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+        cypher = f"""
+            MATCH (n)
+            WHERE n.pack_id IN $pack_ids
+              AND ($space IS NULL OR n.space = $space)
+            RETURN properties(n) AS props, labels(n) AS labels
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_ids=list(pack_ids), space=space)
+            return [
+                {"props": dict(record["props"]), "labels": list(record["labels"])}
+                for record in result
+            ]
+
+    def count_exported_nodes_scoped(
+        self, pack_ids: list[str], space: str | None = None
+    ) -> int:
+        """Exact ``count(n)`` counterpart to ``export_nodes_scoped``, same
+        predicate, unbounded by any LIMIT. Empty ``pack_ids`` -> ``0``
+        without querying."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        cypher = """
+            MATCH (n)
+            WHERE n.pack_id IN $pack_ids
+              AND ($space IS NULL OR n.space = $space)
+            RETURN count(n) AS total
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_ids=list(pack_ids), space=space)
+            record = result.single()
+            return int(record["total"]) if record else 0
+
+    def export_edges_scoped(self, pack_ids: list[str], limit: int) -> list[dict[str, Any]]:
+        """AND rule (issue #147 §3.4(b)) -- BOTH endpoints' ``pack_id``
+        must be in ``pack_ids``, AND the edge's own ``pack_id`` (if it has
+        one) must also be in ``pack_ids`` -- the opposite of
+        ``export_edges``' OR-across-endpoints predicate, for the same
+        reason ``_sql_graph_base.py::export_edges_scoped`` gives: the
+        response embeds both endpoints' full properties, so an OR would
+        expose an out-of-scope node via the OTHER endpoint's membership.
+
+        Empty ``pack_ids`` -> ``[]`` without querying. ``limit <= 0`` ->
+        ``[]``."""
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+        cypher = f"""
+            MATCH (a)-[r]->(b)
+            WHERE a.pack_id IN $pack_ids AND b.pack_id IN $pack_ids
+              AND (r.pack_id IS NULL OR r.pack_id IN $pack_ids)
+            RETURN properties(a) AS source_props, labels(a) AS source_labels,
+                   properties(b) AS target_props, labels(b) AS target_labels,
+                   properties(r) AS rel_props, type(r) AS relation
+            LIMIT {int(limit)}
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_ids=list(pack_ids))
+            return [
+                {
+                    "source_props": dict(record["source_props"]),
+                    "source_labels": list(record["source_labels"]),
+                    "target_props": dict(record["target_props"]),
+                    "target_labels": list(record["target_labels"]),
+                    "rel_props": dict(record["rel_props"]),
+                    "relation": record["relation"],
+                }
+                for record in result
+            ]
+
+    def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
+        """Pack predicate pushed into the Cypher WHERE ahead of ``LIMIT
+        1`` -- unlike Kuzu's version of this method, Neo4j's native
+        properties let the predicate reach Cypher directly, so (unlike
+        Kuzu) a ``LIMIT 1`` here is safe: only already-in-scope rows are
+        candidates by the time ``LIMIT`` runs, so it can never pick an
+        out-of-scope row the way an unscoped ``LIMIT 1`` followed by a
+        Python post-filter could.
+
+        Empty ``pack_ids`` -> ``None`` without querying."""
+        self._require_available()
+        if not pack_ids:
+            return None
+        cypher = (
+            "MATCH (n {id: $id}) WHERE n.pack_id IN $pack_ids "
+            "RETURN properties(n) AS props, labels(n)[0] AS lbl LIMIT 1"
+        )
+        with self._session() as session:
+            result = session.run(cypher, id=node_id, pack_ids=list(pack_ids))
+            record = result.single()
+            if not record:
+                return None
+            props = dict(record["props"])
+            props["node_type"] = record["lbl"]
+            return props
 
     def export_edges(
         self, pack_id: str | None = None, limit: int = 1_000_000

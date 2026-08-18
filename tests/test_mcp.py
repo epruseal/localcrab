@@ -460,6 +460,7 @@ class TestToolDispatch:
     def test_ontology_query_returns_results(self):
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.ontology.query import QueryResult
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             from opencrab.ontology.query import QueryOutcome
@@ -470,10 +471,15 @@ class TestToolDispatch:
             hybrid = MagicMock()
             # #51: query() returns QueryOutcome(results, warnings), not a bare list.
             hybrid.query.return_value = QueryOutcome(results=[mock_result], warnings=[])
+            # #147: ontology_query derives its read scope from ctx["sql"] via
+            # current_principal() -- must be a real SQLStore, not a mock.
+            # hybrid/impact are mocked here, so no pack needs to be registered:
+            # the effective_pack_ids value that flows through them is opaque
+            # to a MagicMock and does not affect the fixed return_value above.
             mock_ctx.return_value = {
                 "builder": MagicMock(), "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": hybrid, "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": MagicMock(), "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_query", {"question": "What is a lever?"})
             assert "results" in result
@@ -483,6 +489,7 @@ class TestToolDispatch:
     def test_ontology_impact_returns_analysis(self):
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.ontology.impact import ImpactResult
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_impact = ImpactResult(
@@ -492,10 +499,14 @@ class TestToolDispatch:
             )
             impact_engine = MagicMock()
             impact_engine.analyse.return_value = mock_impact
+            # #147: ontology_impact derives pack_ids from ctx["sql"]'s read
+            # scope before calling impact_engine.analyse -- needs a real
+            # SQLStore. impact_engine itself is mocked so no pack registration
+            # is needed (the pack_ids value passed through is opaque to it).
             mock_ctx.return_value = {
                 "builder": MagicMock(), "rebac": MagicMock(),
                 "impact": impact_engine, "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": MagicMock(), "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_impact", {"node_id": "n1", "change_type": "update"})
             assert result["node_id"] == "n1"
@@ -512,6 +523,7 @@ class TestToolDispatch:
 
     def test_ontology_lever_simulate(self):
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             impact_engine = MagicMock()
@@ -519,10 +531,11 @@ class TestToolDispatch:
                 "lever_id": "lev1", "direction": "raises", "magnitude": 0.8,
                 "predicted_outcome_changes": [], "confidence": 0.86,
             }
+            # #147: same read-scope derivation as ontology_impact above.
             mock_ctx.return_value = {
                 "builder": MagicMock(), "rebac": MagicMock(),
                 "impact": impact_engine, "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(),
+                "billing": MagicMock(), "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_lever_simulate", {
                 "lever_id": "lev1", "direction": "raises", "magnitude": 0.8
@@ -654,10 +667,15 @@ class TestToolDispatch:
     def test_ontology_get_node_found(self):
         """ontology_get_node returns found=True when graph store returns a node."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             graph = MagicMock()
-            graph.get_node_by_id.return_value = {
+            # #147: ontology_get_node now calls get_node_by_id_scoped(node_id,
+            # sorted(scope)), not get_node_by_id. graph is a MagicMock, so the
+            # scope value passed through is opaque to it -- no pack needs to
+            # be registered for this fixed return_value to come back.
+            graph.get_node_by_id_scoped.return_value = {
                 "node_id": "dataset:test", "node_type": "Dataset",
                 "space": "resource", "pack_id": "test",
             }
@@ -665,6 +683,7 @@ class TestToolDispatch:
                 "neo4j": graph, "builder": MagicMock(), "hybrid": MagicMock(),
                 "mongo": MagicMock(), "rebac": MagicMock(),
                 "impact": MagicMock(), "billing": MagicMock(),
+                "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_get_node", {"node_id": "dataset:test"})
             assert result["found"] is True
@@ -674,14 +693,16 @@ class TestToolDispatch:
     def test_ontology_get_node_not_found(self):
         """ontology_get_node returns found=False when node does not exist."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             graph = MagicMock()
-            graph.get_node_by_id.return_value = None
+            graph.get_node_by_id_scoped.return_value = None
             mock_ctx.return_value = {
                 "neo4j": graph, "builder": MagicMock(), "hybrid": MagicMock(),
                 "mongo": MagicMock(), "rebac": MagicMock(),
                 "impact": MagicMock(), "billing": MagicMock(),
+                "sql": SQLStore("sqlite:///:memory:"),
             }
             result = dispatch_tool("ontology_get_node", {"node_id": "nonexistent"})
             assert result["found"] is False
@@ -689,15 +710,22 @@ class TestToolDispatch:
     def test_ontology_list_nodes_pack_filter(self):
         """ontology_list_nodes filters by pack_id via the graph store."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            # pack_id 있을 때는 graph.export_nodes(pack_id=..., space=...) 경로 사용
-            # (limit-before-filter 버그 회피용 인덱스 쿼리, issue #54: space 도
-            # 서버 쪽에서 함께 걸린다 -- 아래 assert_called_once_with 의 space=None
-            # 이 그 계약을 검증한다). total 은 별도로 count_exported_nodes 에서 온다.
+            # #147: pack_id 있을 때는 graph.export_nodes_scoped(effective, ...)
+            # 경로 사용 -- effective 는 narrow(read_scope(sql, principal), [pack_id])
+            # 로 실제 계산되므로, "pack-a" 가 test-user 소유로 등록돼 있어야
+            # narrow() 가 그 값을 살려 보낸다 (limit-before-filter 버그 회피용
+            # 인덱스 쿼리, issue #54: space 도 서버 쪽에서 함께 걸린다 -- 아래
+            # assert_called_once_with 의 space=None 이 그 계약을 검증한다).
+            # total 은 별도로 count_exported_nodes_scoped 에서 온다.
+            sql = SQLStore("sqlite:///:memory:")
+            create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
-            graph.count_exported_nodes.return_value = 2
-            graph.export_nodes.return_value = [
+            graph.count_exported_nodes_scoped.return_value = 2
+            graph.export_nodes_scoped.return_value = [
                 {"props": {"node_id": "n1", "pack_id": "pack-a", "space": "evidence"}, "labels": ["TextUnit"]},
                 {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
             ]
@@ -705,69 +733,78 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "neo4j": graph, "mongo": mongo, "builder": MagicMock(),
                 "hybrid": MagicMock(), "rebac": MagicMock(),
-                "impact": MagicMock(), "billing": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(), "sql": sql,
             }
             result = dispatch_tool("ontology_list_nodes", {"pack_id": "pack-a"})
             assert result["total"] == 2
             assert result["pack_id_filter"] == "pack-a"
-            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=100, space=None)
-            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space=None)
+            graph.export_nodes_scoped.assert_called_once_with(["pack-a"], limit=100, space=None)
+            graph.count_exported_nodes_scoped.assert_called_once_with(["pack-a"], space=None)
             mongo.list_nodes.assert_not_called()  # doc store는 pack_id 있을 때 사용 안 함
 
     def test_ontology_list_nodes_pack_and_space_filter_pushes_space_kwarg(self):
         """issue #54 contract: when both pack_id and space are given,
-        ontology_list_nodes MUST forward space= to export_nodes (and to
-        count_exported_nodes) so the backend can push it into its native
+        ontology_list_nodes MUST forward space= to export_nodes_scoped (and to
+        count_exported_nodes_scoped) so the backend can push it into its native
         query ahead of limit — a regression that silently drops the kwarg
         (e.g. reverting to a Python-only post-filter) is caught here via
         assert_called_once_with, not just by the return value."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            sql = SQLStore("sqlite:///:memory:")
+            create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
-            graph.count_exported_nodes.return_value = 1
+            graph.count_exported_nodes_scoped.return_value = 1
             # Mock stands in for a backend that already pushed the space
             # filter server-side -- only matching rows come back.
-            graph.export_nodes.return_value = [
+            graph.export_nodes_scoped.return_value = [
                 {"props": {"node_id": "n3", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]},
             ]
             mongo = MagicMock()
             mock_ctx.return_value = {
                 "neo4j": graph, "mongo": mongo, "builder": MagicMock(),
                 "hybrid": MagicMock(), "rebac": MagicMock(),
-                "impact": MagicMock(), "billing": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(), "sql": sql,
             }
             result = dispatch_tool(
                 "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
             )
             assert result["total"] == 1
             assert result["nodes"][0]["space"] == "concept"
-            graph.export_nodes.assert_called_once_with(pack_id="pack-a", limit=10, space="concept")
-            graph.count_exported_nodes.assert_called_once_with(pack_id="pack-a", space="concept")
+            graph.export_nodes_scoped.assert_called_once_with(["pack-a"], limit=10, space="concept")
+            graph.count_exported_nodes_scoped.assert_called_once_with(["pack-a"], space="concept")
 
     def test_ontology_list_nodes_total_not_capped_by_limit(self):
         """issue #54's actual complaint: `total` must report the TRUE match
         count even when it is larger than `limit` (i.e. more rows match than
         the page returned). Before this fix, total was len(nodes) -- capped
-        at whatever page export_nodes(limit=...) returned, so this exact
-        case (3000 real matches, only 10 returned) silently reported
+        at whatever page export_nodes_scoped(limit=...) returned, so this
+        exact case (3000 real matches, only 10 returned) silently reported
         total=10 instead of 3000."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            sql = SQLStore("sqlite:///:memory:")
+            create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
-            # count_exported_nodes (no LIMIT) sees the true total; export_nodes
-            # (LIMIT 10) returns only a page of it -- the two are intentionally
-            # different sizes here to prove `total` is NOT derived from `nodes`.
-            graph.count_exported_nodes.return_value = 3000
-            graph.export_nodes.return_value = [
+            # count_exported_nodes_scoped (no LIMIT) sees the true total;
+            # export_nodes_scoped (LIMIT 10) returns only a page of it -- the
+            # two are intentionally different sizes here to prove `total` is
+            # NOT derived from `nodes`.
+            graph.count_exported_nodes_scoped.return_value = 3000
+            graph.export_nodes_scoped.return_value = [
                 {"props": {"node_id": f"n{i}", "pack_id": "pack-a", "space": "concept"}, "labels": ["Entity"]}
                 for i in range(10)
             ]
             mock_ctx.return_value = {
                 "neo4j": graph, "mongo": MagicMock(), "builder": MagicMock(),
                 "hybrid": MagicMock(), "rebac": MagicMock(),
-                "impact": MagicMock(), "billing": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(), "sql": sql,
             }
             result = dispatch_tool(
                 "ontology_list_nodes", {"pack_id": "pack-a", "space": "concept", "limit": 10}
@@ -776,23 +813,27 @@ class TestToolDispatch:
             assert len(result["nodes"]) == 10
 
     def test_ontology_list_edges_local_backend(self):
-        """ontology_list_edges uses export_edges on Local/Kuzu backends."""
+        """ontology_list_edges uses export_edges_scoped on Local/Kuzu backends."""
         from opencrab.mcp.tools import dispatch_tool
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.sql_store import SQLStore
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            sql = SQLStore("sqlite:///:memory:")
+            create_pack(sql, "test-user", "test-pack")
             graph = MagicMock()
-            graph.export_edges.return_value = [
+            graph.export_edges_scoped.return_value = [
                 {"from_id": "n1", "relation": "related_to", "to_id": "n2"},
             ]
             mock_ctx.return_value = {
                 "neo4j": graph, "mongo": MagicMock(), "builder": MagicMock(),
                 "hybrid": MagicMock(), "rebac": MagicMock(),
-                "impact": MagicMock(), "billing": MagicMock(),
+                "impact": MagicMock(), "billing": MagicMock(), "sql": sql,
             }
             result = dispatch_tool("ontology_list_edges", {"pack_id": "test-pack"})
             assert result["total"] == 1
             assert result["pack_id_filter"] == "test-pack"
-            graph.export_edges.assert_called_once_with(pack_id="test-pack", limit=200)
+            graph.export_edges_scoped.assert_called_once_with(["test-pack"], limit=200)
 
 
 # ---------------------------------------------------------------------------
@@ -1022,38 +1063,45 @@ class TestImpactEngine:
         sql = SQLStore("sqlite:///:memory:")
         return ImpactEngine(neo4j, sql)
 
+    # #147: pack_ids is now a required keyword-only argument on both
+    # analyse() and lever_simulate(). Every test in this class builds its
+    # ImpactEngine on a Neo4jStore pointed at "bolt://invalid:7687"
+    # (self._neo4j.available is False), so the pack-scoped branches inside
+    # analyse()/lever_simulate() (anchor lookup, neighbour traversal) never
+    # execute -- pack_ids=[] is passed for call-shape only and does not
+    # change any of these tests' observed behaviour.
     def test_analyse_returns_impact_result(self, engine):
         from opencrab.ontology.impact import ImpactResult
 
-        result = engine.analyse("n1", "update")
+        result = engine.analyse("n1", "update", pack_ids=[])
         assert isinstance(result, ImpactResult)
         assert result.node_id == "n1"
         assert result.change_type == "update"
         assert len(result.triggered) > 0
 
     def test_analyse_always_triggers_i1(self, engine):
-        result = engine.analyse("n2", "create")
+        result = engine.analyse("n2", "create", pack_ids=[])
         triggered_ids = {t["id"] for t in result.triggered}
         assert "I1" in triggered_ids
 
     def test_analyse_delete_triggers_multiple(self, engine):
-        result = engine.analyse("n3", "delete")
+        result = engine.analyse("n3", "delete", pack_ids=[])
         triggered_ids = {t["id"] for t in result.triggered}
         # Delete should trigger data, relation, and logic impacts
         assert len(triggered_ids) >= 3
 
     def test_analyse_persists_to_sql(self, engine):
 
-        engine.analyse("n4", "update")
+        engine.analyse("n4", "update", pack_ids=[])
         records = engine._sql.get_impacts("n4")
         assert len(records) >= 1
 
     def test_lever_simulate_invalid_direction(self, engine):
         with pytest.raises(ValueError, match="invalid_dir"):
-            engine.lever_simulate("lev1", "invalid_dir", 0.5)
+            engine.lever_simulate("lev1", "invalid_dir", 0.5, pack_ids=[])
 
     def test_lever_simulate_returns_dict(self, engine):
-        result = engine.lever_simulate("lev1", "raises", 0.7)
+        result = engine.lever_simulate("lev1", "raises", 0.7, pack_ids=[])
         assert result["lever_id"] == "lev1"
         assert result["direction"] == "raises"
         assert result["magnitude"] == 0.7
