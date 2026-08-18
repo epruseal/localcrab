@@ -511,6 +511,47 @@ def test_t14b_chroma_uri_records_keep_the_alias_documented_limit():
         "한계 주석과 이 테스트의 서술을 함께 갱신해야 한다")
 
 
+class _FullReplaceVec:
+    """`upsert_texts` 가 메타를 **통째로 교체**하는 벡터 스토어(sqlite-vec/pgvector,
+    그리고 uri 없는 chroma 레코드의 동작). uri 보유 chroma 레코드의 merge 예외는
+    T14b 가 따로 고정한다 — 두 성질을 한 스텁에 섞으면 어느 쪽이 깨졌는지 못 읽는다."""
+
+    available = True
+
+    def __init__(self, stored: dict[str, dict]) -> None:
+        self.stored = stored
+
+    def get_by_id(self, node_id):
+        row = self.stored.get(node_id)
+        return None if row is None else {"document": "본문", "metadata": dict(row)}
+
+    def upsert_texts(self, documents, metadatas, ids):    # noqa: ARG002
+        for node_id, meta in zip(ids, metadatas, strict=True):
+            self.stored[node_id] = dict(meta)
+
+
+def test_t16_vector_backfill_drops_the_alias():
+    """벡터 축 backfill 도 별칭을 남기지 않는다.
+
+    이 축은 SQL set 식(T14)과도, chroma 한계(T14b)와도 다른 세 번째 경로다 —
+    파이썬 dict 를 읽어 고쳐 되쓴다.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_mpo_vec", REPO_ROOT / "scripts" / "migrate_pack_ownership.py")
+    mpo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mpo)
+
+    vec = _FullReplaceVec({"n1": {"pack": "A"}})
+    summary = mpo._backfill_vector(vec, ["n1"], {"n1": "B"}, apply=True)
+
+    assert summary == {"checked": 1, "missing": 1, "updated": 1}, (
+        f"backfill 이 이 행을 처리하지 않았다 — 단언이 무의미해진다: {summary}")
+    assert vec.stored["n1"] == {"pack_id": "B"}, (
+        "벡터 메타에 폐기 별칭이 남았다 — pack_id 와 어긋난 혼합 행이다")
+
+
 def test_t15_neo4j_import_script_does_not_synthesise_a_mixed_row():
     """`prepare_node`/`prepare_edge` 는 팩 파일 properties 에 `pack_id` 를 합성한다 —
     입력이 별칭을 달고 있으면 두 태그가 어긋난 행이 나간다."""
