@@ -1876,6 +1876,7 @@ class _FakeChromaCollection:
         self._get_where_call_count = 0
         self.lock_probe = None                            # 보유 깊이를 읽을 락(있으면)
         self.lock_depth_log: list[int | None] = []        # 호출 시점의 보유 깊이
+        self.op_log: list[str] = []                       # 호출 순서(재조회가 삭제 뒤인가)
 
     def seed(self, node_id, pack_id="pack-1", embedding=(0.1, 0.2, 0.3),
              document="본문", metadata=None, uri=None):
@@ -1908,6 +1909,7 @@ class _FakeChromaCollection:
             return out
         # where= 호출 (delete_pack/pack_live_counts/live_pack_state 기존 계약)
         self.lock_depth_log.append(getattr(self.lock_probe, "depth", None))
+        self.op_log.append("get")
         self.get_calls.append(where)
         self.get_where_calls.append((where, list(include) if include is not None else None))
         self._get_where_call_count += 1
@@ -1922,6 +1924,7 @@ class _FakeChromaCollection:
 
     def delete(self, ids):
         self.lock_depth_log.append(getattr(self.lock_probe, "depth", None))
+        self.op_log.append("delete")
         if any(i in self.fail_delete_ids for i in ids):
             raise RuntimeError("simulated delete failure")   # 상태 변형 전에 던진다
         self.delete_calls.append(list(ids))
@@ -2268,7 +2271,12 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert not vec._collection.delete_calls, "삭제를 시도하면 안 된다"
 
     def test_concurrent_insert_of_a_new_id_is_not_counted_as_a_survivor(self, live):
-        """G12 — 재조회에 잡힌 **새** id 는 우리가 요청한 것이 아니다."""
+        """G12 — 재조회에 잡힌 **새** id 는 우리가 요청한 것이 아니다.
+
+        카운트만 단언하면 이 게이트는 **원 결함(요청 수 보고)에서도 통과한다** —
+        여기서는 요청 수와 확인 수가 우연히 같다. 그래서 "삭제 **뒤에** 재조회를
+        실제로 했는가"까지 단언한다(적대 검증 지적).
+        """
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
         vec._collection.insert_after_delete = {"a9": "pack-a"}   # 삭제 직후 유입
@@ -2278,6 +2286,12 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert chunk_vec_del == 2, (
             f"요청 2건이 모두 지워졌는데 {chunk_vec_del} 로 보고했다 — 재조회 결과를 "
             "요청 집합과 교집합하지 않으면 새로 들어온 a9 가 생존자로 잡힌다")
+        assert vec._collection.op_log == ["get", "delete", "get"], (
+            f"삭제 뒤 재조회로 확인해야 한다: {vec._collection.op_log}")
+        assert vec._collection.get_where_calls[1] == ({"pack_id": "pack-a"}, []), (
+            f"재조회가 같은 술어로 id 만 받아야 한다: {vec._collection.get_where_calls}")
+        assert "a9" in vec._collection._rows, (
+            "전제: 새로 들어온 a9 는 재조회에 잡혀 있어야 한다(그런데도 안 세는 것이 계약)")
 
     @pytest.mark.parametrize("bad", [
         {"no_ids_key": []},                  # ids 키 없음
@@ -2382,6 +2396,25 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert vec._collection.delete_calls == [["n1"]]
 
     # ── sql / sqlalchemy: rowcount 를 곧이곧대로 믿지 않는다 ─────────────
+    def test_an_int_subclass_that_lies_in_comparisons_is_unconfirmed(self, live):
+        """G26 — `isinstance` 검사는 비교를 거짓말하는 `int` 서브클래스를 통과시켜
+        **음수 카운트**를 발행한다. 카운트는 정확히 내장 `int` 일 때만 발행한다."""
+
+        class _LiarInt(int):
+            def __lt__(self, other):
+                return False            # `rc < 0` 검사를 무력화한다
+
+            def __ge__(self, other):
+                return True
+
+        _builder, graph, docs = live
+        vec = _StubSqlVec(rowcount=_LiarInt(-7))
+
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert chunk_vec_del is None, (
+            f"거짓말하는 int 서브클래스가 카운트로 발행됐다: {chunk_vec_del!r}")
+
     @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
     def test_sql_unreported_rowcount_is_unconfirmed(self, live, rowcount):
         """G8 — 드라이버가 안 세어준 값은 `0` 이 아니라 `None` 이다.
@@ -2519,6 +2552,36 @@ class TestDeletePackSummaryNamesTheActualBackend:
 
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("chroma", "미확인"), f"{backend=} {count=}"
+
+    def test_available_is_read_once_so_a_stateful_property_cannot_escape(
+            self, live, capsys):
+        """G25 — 요약이 `available` 을 다시 읽으면 그 접근은 `try` 밖이라, 나중
+        접근에서 던지는 property 가 `delete_pack` 밖으로 샌다(종전엔 없던 경로).
+
+        이 더블은 **2번째 접근부터** 던진다. 1번은 진입 판정(`try` 밖, base 와 같은
+        자리), 2번은 `_vec_backend` 안(`try` 안 — 흡수된다). 요약이 3번째로 읽으면
+        그것은 흡수되지 않는다.
+        """
+        _builder, graph, docs = live
+
+        class _StatefulAvailable:
+            def __init__(self):
+                self.reads = 0
+
+            @property
+            def available(self):
+                self.reads += 1
+                if self.reads >= 2:
+                    raise RuntimeError("available changed")
+                return True
+
+        vec = _StatefulAvailable()
+
+        got = pack_load.delete_pack("pack-a", graph, docs, vec)
+
+        assert got == (0, 0, 0), f"흡수되고 0건이어야 한다 (실제 {got!r})"
+        backend, count = _vec_line(capsys)
+        assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
     def test_discrimination_failure_is_absorbed_and_labelled(self, live, capsys):
         """G23 — 판별 자체가 예외여도 밖으로 안 새고, 표기는 판별 결과를 따른다."""

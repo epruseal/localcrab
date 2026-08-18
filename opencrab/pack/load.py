@@ -333,7 +333,14 @@ def _confirmed_rowcount(rc) -> int | None:
     떨어진다: 이 자리에서는 틀린 수보다 미확인이 안전하고, 그런 드라이버가 실제로
     나타나면 "미확인"이 신호로 보인다(조용히 틀리지 않는다).
     """
-    if isinstance(rc, bool) or not isinstance(rc, int) or rc < 0:
+    # **정확히 내장 `int`** 여야 한다. `isinstance` 로는 두 가지가 새 나간다:
+    # `bool`(`isinstance(True, int)` 이 참이라 `True` 가 "1건 삭제"로 발행된다)과
+    # 비교 연산을 거짓말하는 `int` 서브클래스(`rc < 0` 검사를 통과해 **음수 카운트**가
+    # 발행된다, 적대 검증 실증). 실 드라이버는 평 `int` 를 낸다 — sqlite3·psycopg2 의
+    # DELETE `rowcount` 도, 그것을 그대로 전달하는 SQLAlchemy `CursorResult.rowcount`
+    # 도 그렇다. `numpy.int64`·`Decimal` 같은 것이 오면 미확인으로 떨어지는데, 이
+    # 자리에서는 그쪽이 안전한 방향이다.
+    if type(rc) is not int or rc < 0:
         return None
     return rc
 
@@ -823,7 +830,11 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
     chunk_vec_del: int | None = 0
     kind = None                      # 판별 실패해도 아래 요약이 읽을 수 있게 선초기화
     chroma_unreadable = False        # 락 안에서는 플래그만, warning 은 락 밖에서
-    if vec.available:
+    # `available` 은 **한 번만** 읽는다. 아래 요약이 이 값을 다시 읽으면 그 접근은
+    # `try` 밖이라, 상태를 가진 property 가 나중 접근에서 던질 때 `delete_pack` 밖으로
+    # 예외가 샌다 — 종전엔 없던 탈출 경로다(적대 검증 실증).
+    vec_available = vec.available
+    if vec_available:
         try:
             # `_vec_backend` 호출은 이 `try` 안에 둔다 — 밖으로 올리면 판별 자체의
             # 예외가 흡수되지 않고 `delete_pack` 밖으로 터져 기존 계약이 바뀐다.
@@ -885,7 +896,7 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
     # `sqlalchemy` 는 `_engine` 을 노출하는 아무 스토어나 잡으므로 sqlite-vec/pgvector
     # 로 옮겨 적는 순간 거짓이 될 수 있고, `_VEC_BACKEND_KINDS` 주석이 경고하는
     # "kind 를 분기하는 소비자"가 하나 더 느는 것이다.
-    vec_backend = kind or ("미지원" if vec.available else "미가용")
+    vec_backend = kind or ("미지원" if vec_available else "미가용")
     vec_shown = chunk_vec_del if chunk_vec_del is not None else "미확인"
     print(
         f"  [{pack_name}] 삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
