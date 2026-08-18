@@ -19,7 +19,14 @@ from typing import Any
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
-from opencrab.pack.write_gate import EDGE_STAMPED, NODE_STAMPED, authorize, stamp
+from opencrab.pack.write_gate import (
+    EDGE_STAMPED,
+    NODE_STAMPED,
+    authorize,
+    identity_reject_message,
+    node_identity_conflict,
+    stamp,
+)
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
@@ -97,6 +104,19 @@ class OntologyBuilder:
         # node write reaches (MCP, REST, pack ingest, pack loader), so the check
         # belongs here rather than in each entry point.
         canonicalize_pack_alias(props)
+
+
+        # Identity slot guard (#146, promoted to the gate in #148). Node
+        # identity is not qualified by pack on any backend, so writing an id
+        # that already lives in another pack takes that pack's slot. Checked
+        # here rather than at each entry point because every one of them --
+        # MCP, REST, CLI, the loader, crabharness -- lands on this call.
+        reason = node_identity_conflict(
+            self._neo4j, self._mongo, self._vec,
+            space=space, node_type=node_type, node_id=node_id, pack_id=pack_id,
+        )
+        if reason:
+            raise ValueError(identity_reject_message("node", node_id, reason))
 
         # Grammar validation (raises ValueError on failure)
         result = validate_node(space, node_type)

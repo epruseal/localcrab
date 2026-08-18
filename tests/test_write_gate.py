@@ -194,3 +194,114 @@ def test_classify_rejects_non_list():
 def test_classify_rejects_non_mapping_row():
     with pytest.raises(TypeError):
         classify_by_id_rows(["pack-a"], "pack-a")
+
+
+# ---------------------------------------------------------------------------
+# Promoted identity guard (#146 -> #148)
+# ---------------------------------------------------------------------------
+
+
+class _Graph:
+    """Graph double honouring the slot contract the guard probes."""
+
+    available = True
+
+    def __init__(self, exact=None, by_id=None, edge=None):
+        self._exact = exact
+        self._by_id = by_id or []
+        self._edge = edge
+
+    def get_node(self, node_type, node_id):  # noqa: ARG002
+        return self._exact
+
+    def get_nodes_by_id(self, node_id):  # noqa: ARG002
+        return list(self._by_id)
+
+    def get_edge(self, *args):  # noqa: ARG002
+        return self._edge
+
+
+class _Slot:
+    """docs/vector double: one optional row keyed however the guard asks."""
+
+    available = True
+
+    def __init__(self, row=None):
+        self._row = row
+
+    def get_node_doc(self, space, node_id):  # noqa: ARG002
+        return self._row
+
+    def get_by_id(self, doc_id):  # noqa: ARG002
+        return self._row
+
+    def get_source(self, source_id):  # noqa: ARG002
+        return self._row
+
+
+def _node_conflict(graph=None, docs=None, vector=None, pack_id="pack-a"):
+    from opencrab.pack.write_gate import node_identity_conflict
+
+    return node_identity_conflict(
+        graph or _Graph(), docs or _Slot(), vector or _Slot(),
+        space="subject", node_type="User", node_id="u1", pack_id=pack_id,
+    )
+
+
+def test_free_identity_passes():
+    assert _node_conflict() is None
+
+
+def test_exact_graph_slot_owned_elsewhere_is_rejected():
+    assert _node_conflict(graph=_Graph(exact={"pack_id": "pack-b"})) == "foreign"
+
+
+def test_doc_slot_owned_elsewhere_is_rejected():
+    """Knowing the graph slot is free proves nothing about the doc slot --
+    the builder overwrites both in the same call."""
+    docs = _Slot({"properties": {"pack_id": "pack-b"}})
+    assert _node_conflict(docs=docs) == "foreign"
+
+
+def test_vector_slot_owned_elsewhere_is_rejected():
+    """The vector store keys on node_id alone, with no pack predicate."""
+    vector = _Slot({"metadata": {"pack_id": "pack-b"}})
+    assert _node_conflict(vector=vector) == "foreign"
+
+
+def test_by_id_axis_rejects_a_foreign_row_under_another_type():
+    assert _node_conflict(graph=_Graph(by_id=[{"pack_id": "pack-b"}])) == "foreign"
+
+
+def test_by_id_axis_passes_the_owners_own_row():
+    graph = _Graph(exact={"pack_id": "pack-a"}, by_id=[{"pack_id": "pack-a"}])
+    assert _node_conflict(graph=graph) is None
+
+
+def test_missing_probe_method_is_fail_closed():
+    class Bare:
+        available = True
+
+    assert _node_conflict(graph=Bare()) == "unverifiable"
+
+
+def test_by_id_returning_a_non_list_is_fail_closed():
+    class Weird(_Graph):
+        def get_nodes_by_id(self, node_id):  # noqa: ARG002
+            return {"pack_id": "pack-a"}
+
+    assert _node_conflict(graph=Weird()) == "unverifiable"
+
+
+def test_unavailable_store_is_skipped_not_failed():
+    class Down:
+        available = False
+
+    assert _node_conflict(docs=Down(), vector=Down()) is None
+
+
+def test_reject_message_never_names_the_other_pack():
+    from opencrab.pack.write_gate import identity_reject_message
+
+    msg = identity_reject_message("node", "u1", "foreign")
+    assert "pack-b" not in msg and "u1" in msg

@@ -286,7 +286,12 @@ def test_51_builder_writes_space_into_vector_metadata() -> None:
     vec = MagicMock()
     vec.available = True
     vec.upsert_texts = MagicMock()
+    vec.get_by_id.return_value = None
     graph = MagicMock(available=True)
+    # #148 identity guard: a MagicMock answers every probe with another
+    # MagicMock, which is an unrecognised shape and so fail-closed.
+    graph.get_node.return_value = None
+    graph.get_nodes_by_id.return_value = []
     docs = MagicMock(available=False)
     sql = SQLStore("sqlite:///:memory:")
     pack_id = create_pack(sql, "test-user", "pack-a")

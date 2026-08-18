@@ -629,6 +629,11 @@ class TestToolDispatch:
             # so its own probe is already skipped; only graph needs it here.
             graph.get_node.return_value = None
             graph.get_node_by_id.return_value = None
+            # #148: the by-id axis (write_gate._check_by_id_axis) calls
+            # get_nodes_by_id, the plural, ALL-rows counterpart to
+            # get_node_by_id above -- consistent with it: no row for this
+            # id.
+            graph.get_nodes_by_id.return_value = []
             mock_ctx.return_value = {
                 "neo4j": graph,
                 "sql": sql,

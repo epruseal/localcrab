@@ -66,6 +66,15 @@ def _base_ctx(**overrides):
     # want to exercise a conflict override these return_values themselves.
     ctx["neo4j"].get_node.return_value = None
     ctx["neo4j"].get_node_by_id.return_value = None
+    # #148: the by-id axis probe (write_gate._check_by_id_axis) calls
+    # get_nodes_by_id(node_id), the plural counterpart to get_node_by_id
+    # above -- ALL rows sharing node_id, not just one. A bare MagicMock
+    # lookup returns a truthy MagicMock, not a list, so classify_by_id_rows
+    # would raise TypeError and the probe would fail closed
+    # ("unverifiable"). Kept consistent with get_node_by_id's None above:
+    # no row for this id -- see GraphStoreExtended.get_nodes_by_id's
+    # contract in opencrab/stores/_graph_protocol.py.
+    ctx["neo4j"].get_nodes_by_id.return_value = []
     ctx["neo4j"].get_edge.return_value = None
     # #177 R4-A: an unresolvable endpoint type is now fail-closed (rejected),
     # not skipped, so the default here must be a real type -- "endpoints

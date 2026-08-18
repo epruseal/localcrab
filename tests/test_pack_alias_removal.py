@@ -69,6 +69,12 @@ class _CapturingVec:
         self.metadatas.extend(metadatas)
         return list(ids)
 
+    def get_by_id(self, doc_id):  # noqa: ARG002
+        # #148: the identity guard probes the vector slot before writing.
+        # No method at all reads as "cannot verify" (fail-closed) and the
+        # write never happens, which would make this stub silently useless.
+        return None
+
 
 class _NoVec:
     available = False

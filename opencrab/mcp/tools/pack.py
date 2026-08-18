@@ -19,6 +19,12 @@ from typing import Any
 
 from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.common.text import slugify
+from opencrab.pack.write_gate import (
+    edge_identity_conflict,
+    identity_reject_message,
+    node_identity_conflict,
+    source_identity_conflict,
+)
 
 from ._registry import AccessTier, tool
 
@@ -102,106 +108,37 @@ _NINE_SPACE_HINT: str = _nine_space_hint()
 # multi-host deployment against one remote DB is still racy.
 # ---------------------------------------------------------------------------
 
-_Probe = tuple[Any, str, tuple[Any, ...], tuple[str, ...]]
-# (store, method_name, call_args, path-to-pack_id-in-result)
+# #148: the identity guard now lives in opencrab/pack/write_gate.py so the
+# builder and the source writer enforce it too -- this module only had it
+# because #146 built it here first. These stay as thin adapters because the
+# call sites below pass a ctx dict, and because the by-id axis moved from
+# `get_node_by_id` (LIMIT 1, no ORDER BY -- undefined which row won) to the
+# all-rows classification inside the gate.
 
 
-def _node_probes(
-    ctx: dict[str, Any], space: str, node_type: str, node_id: str
-) -> list[_Probe]:
-    """Probes for a graph node write: graph (2 lookup keys), docs, vector.
-
-    Used verbatim for the evidence/TextUnit node (space="evidence",
-    node_type="TextUnit", node_id=source_id) and the pack_create anchor node
-    (space="resource", node_type="Dataset") too, so all three share one
-    definition of "what counts as this node's slots" and cannot drift apart.
-    """
-    graph = ctx.get("neo4j")
-    docs = ctx.get("mongo")
-    vector = ctx.get("chroma")
-    return [
-        (graph, "get_node", (node_type, node_id), ("pack_id",)),
-        (graph, "get_node_by_id", (node_id,), ("pack_id",)),
-        (docs, "get_node_doc", (space, node_id), ("properties", "pack_id")),
-        (vector, "get_by_id", (node_id,), ("metadata", "pack_id")),
-    ]
+def _node_probe_conflict(ctx: dict[str, Any], space: str, node_type: str, node_id: str,
+                         pack_id: str) -> str | None:
+    return node_identity_conflict(
+        ctx.get("neo4j"), ctx.get("mongo"), ctx.get("chroma"),
+        space=space, node_type=node_type, node_id=node_id, pack_id=pack_id,
+    )
 
 
-def _source_probes(ctx: dict[str, Any], source_id: str) -> list[_Probe]:
-    """Probes for the legacy (text_as_node=False) text path: doc_sources +
-    vector, keyed by source_id alone -- there is no graph node here."""
-    docs = ctx.get("mongo")
-    vector = ctx.get("chroma")
-    return [
-        (docs, "get_source", (source_id,), ("metadata", "pack_id")),
-        (vector, "get_by_id", (source_id,), ("metadata", "pack_id")),
-    ]
+def _source_probe_conflict(ctx: dict[str, Any], source_id: str, pack_id: str) -> str | None:
+    return source_identity_conflict(
+        ctx.get("mongo"), ctx.get("chroma"), source_id=source_id, pack_id=pack_id
+    )
 
 
-def _edge_probes(
-    ctx: dict[str, Any],
-    from_type: str,
-    from_id: str,
-    relation: str,
-    to_type: str,
-    to_id: str,
-) -> list[_Probe]:
-    """Probe for a graph edge write, keyed by each backend's own upsert
-    conflict key (see GraphStore.get_edge). Edge sql-registry/audit-log
-    writes have no pack_id column to guard (see design doc slot table)."""
-    graph = ctx.get("neo4j")
-    return [
-        (graph, "get_edge", (from_type, from_id, relation, to_type, to_id), ("pack_id",)),
-    ]
+def _edge_probe_conflict(ctx: dict[str, Any], from_type: str, from_id: str, relation: str,
+                         to_type: str, to_id: str, pack_id: str) -> str | None:
+    return edge_identity_conflict(
+        ctx.get("neo4j"), from_type=from_type, from_id=from_id, relation=relation,
+        to_type=to_type, to_id=to_id, pack_id=pack_id,
+    )
 
 
-def _foreign_pack(pack_id: str, probes: list[_Probe]) -> str | None:
-    """Check every probe's store slot against ``pack_id``.
-
-    Returns ``None`` when no conflict is found (including when every probe
-    was skipped because its store is ``None``/unavailable). Returns
-    ``"unverifiable"`` (fail-closed) when a store's probe method is
-    missing, raises, or returns something other than ``dict``/``None`` --
-    an inability to check must never be silently treated as "no conflict".
-    Returns ``"foreign"`` when an extracted value is truthy and differs
-    from ``pack_id``; a falsy extracted value (unattributed legacy data)
-    passes through as no-conflict.
-    """
-    for store, method_name, args, path in probes:
-        if store is None or not getattr(store, "available", False):
-            continue
-        method = getattr(store, method_name, None)
-        if method is None:
-            return "unverifiable"
-        try:
-            result = method(*args)
-        except Exception:
-            return "unverifiable"
-        if result is None:
-            continue
-        if not isinstance(result, dict):
-            return "unverifiable"
-        value: Any = result
-        for key in path:
-            if not isinstance(value, dict):
-                value = None
-                break
-            value = value.get(key)
-        if value and value != pack_id:
-            return "foreign"
-    return None
-
-
-def _identity_reject_message(kind: str, ident: str, reason: str) -> str:
-    """Fixed-wording rejection message -- #143 invariant 7 means this must
-    NEVER include the other pack's id, owner, title, or visibility."""
-    if reason == "unverifiable":
-        return f"{ident}: cannot verify existing ownership on this backend"
-    if kind == "edge":
-        return f"{ident}: edge identity is already attributed to a different pack"
-    if kind == "source":
-        return f"{ident}: source identity is already attributed to a different pack"
-    return f"{ident}: identity is already attributed to a different pack"
+_identity_reject_message = identity_reject_message
 
 
 def _warn_dropped_alias(dropped: str | None, kind: str, ident: str) -> None:
@@ -290,8 +227,8 @@ def _ingest_into_pack(
             # validate_node is a pure membership test against the 9-space
             # manifest, so builder.add_node re-running it costs nothing.
             validate_node(item_space, item_node_type).raise_if_invalid()
-            reason = _foreign_pack(
-                pack_id, _node_probes(ctx, item_space, item_node_type, item_node_id)
+            reason = _node_probe_conflict(
+                ctx, item_space, item_node_type, item_node_id, pack_id
             )
             if reason:
                 node_errors.append(
@@ -360,9 +297,8 @@ def _ingest_into_pack(
                     )
                 )
                 continue
-            reason = _foreign_pack(
-                pack_id,
-                _edge_probes(ctx, from_type, item_from_id, item_relation, to_type, item_to_id),
+            reason = _edge_probe_conflict(
+                ctx, from_type, item_from_id, item_relation, to_type, item_to_id, pack_id
             )
             if reason:
                 edge_errors.append(
@@ -429,8 +365,8 @@ def _ingest_into_pack(
             # embedding internally, so we skip hybrid.ingest / mongo.upsert_source
             # to avoid duplicate writes under the same source_id.
             try:
-                reason = _foreign_pack(
-                    pack_id, _node_probes(ctx, "evidence", "TextUnit", source_id)
+                reason = _node_probe_conflict(
+                    ctx, "evidence", "TextUnit", source_id, pack_id
                 )
                 if reason:
                     msg = _identity_reject_message("node", source_id, reason)
@@ -481,7 +417,7 @@ def _ingest_into_pack(
             # through the write_source chokepoint (#148) instead of two
             # independent calls -- see opencrab/pack/source_writer.py for why
             # (doc row first, one ownership stamp for both).
-            reason = _foreign_pack(pack_id, _source_probes(ctx, source_id))
+            reason = _source_probe_conflict(ctx, source_id, pack_id)
             if reason:
                 node_errors.append(_identity_reject_message("source", source_id, reason))
             else:
@@ -936,8 +872,8 @@ def pack_create(
     # _node_probes 3-way check the node/edge loops use -- has to run here,
     # AFTER registration but BEFORE builder.add_node, so no store is ever
     # written to when the anchor identity is already someone else's.
-    anchor_probe_reason = _foreign_pack(
-        slug, _node_probes(ctx, "resource", "Dataset", anchor_node_id)
+    anchor_probe_reason = _node_probe_conflict(
+        ctx, "resource", "Dataset", anchor_node_id, slug
     )
     if anchor_probe_reason is None:
         try:

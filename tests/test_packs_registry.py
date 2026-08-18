@@ -441,6 +441,10 @@ def _base_ctx(sql, **overrides):
     # truthy non-dict, which the probe treats as fail-closed/unverifiable).
     ctx["neo4j"].get_node.return_value = None
     ctx["neo4j"].get_node_by_id.return_value = None
+    # #148: the by-id axis (write_gate._check_by_id_axis) calls
+    # get_nodes_by_id, the plural, ALL-rows counterpart to get_node_by_id
+    # above -- consistent with it: no row for this id.
+    ctx["neo4j"].get_nodes_by_id.return_value = []
     ctx["neo4j"].get_edge.return_value = None
     # #177 R4-A: an unresolvable endpoint type is fail-closed (rejected), not
     # skipped, so the default must be a real type ("endpoints exist on this

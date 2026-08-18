@@ -222,3 +222,141 @@ def normalize_tags(tags: MutableMapping[str, Any]) -> None:
     from opencrab.common.pack_tags import canonicalize_pack_alias
 
     canonicalize_pack_alias(tags)
+
+
+# ---------------------------------------------------------------------------
+# Identity slot guard
+# ---------------------------------------------------------------------------
+#
+# Promoted here from opencrab/mcp/tools/pack.py, where #146 first built it for
+# pack_create/pack_ingest only. #148 gives every write an explicit pack_id --
+# including ontology_add_node and REST /api/nodes, which had none before -- and
+# that opens a re-attribution path the moment the guard is missing: node
+# identity is NOT qualified by pack on any backend (Kuzu's primary key is
+# node_id alone; every vector store keys on node_id globally; sqlite-vec's
+# upsert deletes by node_id with no pack predicate), so writing a node_id that
+# already lives in someone else's pack silently takes their slot.
+#
+# A probe is (store, method, args, path-to-pack_id-in-result).
+
+_Probe = tuple[Any, str, tuple[Any, ...], tuple[str, ...]]
+
+CONFLICT_FOREIGN = "foreign"
+CONFLICT_UNVERIFIABLE = "unverifiable"
+
+
+def _extract(result: Any, path: tuple[str, ...]) -> Any:
+    value: Any = result
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _check_probes(pack_id: str, probes: list[_Probe]) -> str | None:
+    """Every probe's slot against ``pack_id``.
+
+    ``None`` when no conflict (including probes skipped because their store is
+    absent/unavailable). ``"unverifiable"`` -- fail-closed -- when a probe
+    method is missing, raises, or returns a shape we do not recognise: being
+    unable to check must never read as "no conflict". ``"foreign"`` when a
+    truthy extracted value differs from ``pack_id``; a falsy one is
+    unattributed legacy data and passes.
+    """
+    for store, method_name, args, path in probes:
+        if store is None or not getattr(store, "available", False):
+            continue
+        method = getattr(store, method_name, None)
+        if method is None:
+            return CONFLICT_UNVERIFIABLE
+        try:
+            result = method(*args)
+        except Exception:  # noqa: BLE001 -- any failure is "cannot verify"
+            return CONFLICT_UNVERIFIABLE
+        if result is None:
+            continue
+        if not isinstance(result, Mapping):
+            return CONFLICT_UNVERIFIABLE
+        value = _extract(result, path)
+        if value and value != pack_id:
+            return CONFLICT_FOREIGN
+    return None
+
+
+def _check_by_id_axis(graph: Any, node_id: str, pack_id: str) -> str | None:
+    """The type-agnostic axis, over ALL rows sharing ``node_id``.
+
+    Deliberately NOT ``get_node_by_id``: its query is ``LIMIT 1`` with no
+    ``ORDER BY``, and a node_id held under two node_types is a shape this
+    codebase supports and pins. Which row that returned was undefined, so an
+    unattributed row winning the draw waved a foreign one through.
+    """
+    if graph is None or not getattr(graph, "available", False):
+        return None
+    method = getattr(graph, "get_nodes_by_id", None)
+    if method is None:
+        return CONFLICT_UNVERIFIABLE
+    try:
+        rows = method(node_id)
+    except Exception:  # noqa: BLE001
+        return CONFLICT_UNVERIFIABLE
+    try:
+        verdict = classify_by_id_rows(rows, pack_id)
+    except TypeError:
+        return CONFLICT_UNVERIFIABLE
+    return CONFLICT_FOREIGN if verdict == "foreign" else None
+
+
+def node_identity_conflict(
+    graph: Any, docs: Any, vector: Any, *, space: str, node_type: str,
+    node_id: str, pack_id: str,
+) -> str | None:
+    """Would writing this node take a slot attributed to another pack?
+
+    Four slots, all mandatory. The exact ``(node_type, node_id)`` graph slot
+    keeps the strict rule; only the type-agnostic axis uses the all-rows
+    classification. Knowing the graph slot is ours proves nothing about the
+    doc and vector slots -- the builder overwrites those in the same call,
+    keyed by ``(space, node_id)`` and by ``node_id`` alone.
+    """
+    reason = _check_probes(pack_id, [
+        (graph, "get_node", (node_type, node_id), ("pack_id",)),
+        (docs, "get_node_doc", (space, node_id), ("properties", "pack_id")),
+        (vector, "get_by_id", (node_id,), ("metadata", "pack_id")),
+    ])
+    return reason or _check_by_id_axis(graph, node_id, pack_id)
+
+
+def edge_identity_conflict(
+    graph: Any, *, from_type: str, from_id: str, relation: str, to_type: str,
+    to_id: str, pack_id: str,
+) -> str | None:
+    """Keyed by the backend's own upsert conflict key (see GraphStore.get_edge).
+    Edge sql-registry and audit rows have no pack_id column to guard."""
+    return _check_probes(pack_id, [
+        (graph, "get_edge", (from_type, from_id, relation, to_type, to_id), ("pack_id",)),
+    ])
+
+
+def source_identity_conflict(
+    docs: Any, vector: Any, *, source_id: str, pack_id: str
+) -> str | None:
+    """The legacy (text_as_node=False) text path: doc_sources + vector, keyed
+    by source_id alone -- there is no graph node here."""
+    return _check_probes(pack_id, [
+        (docs, "get_source", (source_id,), ("metadata", "pack_id")),
+        (vector, "get_by_id", (source_id,), ("metadata", "pack_id")),
+    ])
+
+
+def identity_reject_message(kind: str, ident: str, reason: str) -> str:
+    """Fixed wording -- #143 invariant 7 means this must NEVER name the other
+    pack's id, owner, title, or visibility."""
+    if reason == CONFLICT_UNVERIFIABLE:
+        return f"{ident}: cannot verify existing ownership on this backend"
+    if kind == "edge":
+        return f"{ident}: edge identity is already attributed to a different pack"
+    if kind == "source":
+        return f"{ident}: source identity is already attributed to a different pack"
+    return f"{ident}: identity is already attributed to a different pack"

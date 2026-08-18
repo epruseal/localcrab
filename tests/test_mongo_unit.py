@@ -398,6 +398,17 @@ class _AvailableGraphStub:
     "graph": "error: ..." -- irrelevant to what this class is testing (the
     docs/mongo marker)."""
 
+    # #148: the identity guard probes these before any write. A stub that
+    # lacks them is "cannot verify", which is fail-closed and refuses the
+    # write -- so the mongo branch under test would never be reached. Empty
+    # answers = "this id is free", which is what this class assumes.
+    def get_node(self, node_type, node_id):  # noqa: ARG002
+        return None
+
+    def get_nodes_by_id(self, node_id):  # noqa: ARG002
+        return []
+
+
     available = True
 
 
@@ -438,6 +449,9 @@ class TestOntologyBuilderMongoAuditContract:
         # TestNodeEdgeWriteMCP/HTTP::test_add_edge_success_shape. Only the
         # error path changes in this fix.
         mongo = MagicMock(available=True)
+        # #148: the identity guard probes the doc slot; a bare MagicMock
+        # answers with another MagicMock, which is fail-closed.
+        mongo.get_node_doc.return_value = None
         mongo.log_event.return_value = "ev-1"
         builder, pack_id = _make_builder(mongo)
 
@@ -450,6 +464,9 @@ class TestOntologyBuilderMongoAuditContract:
         # entirely instead of degrading gracefully like every other store
         # branch (graph/sql) and like add_node's mongo block.
         mongo = MagicMock(available=True)
+        # #148: the identity guard probes the doc slot; a bare MagicMock
+        # answers with another MagicMock, which is fail-closed.
+        mongo.get_node_doc.return_value = None
         mongo.log_event.side_effect = RuntimeError("insert failed")
         builder, pack_id = _make_builder(mongo)
 
@@ -471,6 +488,9 @@ class TestOntologyBuilderMongoAuditContract:
         # try/except-protected) continues to report "ok (id=<mongo_id>)"
         # now that log_event returns a str instead of None.
         mongo = MagicMock(available=True)
+        # #148: the identity guard probes the doc slot; a bare MagicMock
+        # answers with another MagicMock, which is fail-closed.
+        mongo.get_node_doc.return_value = None
         mongo.upsert_node_doc.return_value = "node-doc-1"
         mongo.log_event.return_value = "ev-2"
         builder, pack_id = _make_builder(mongo)
