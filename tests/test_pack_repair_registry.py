@@ -869,3 +869,48 @@ class TestNegativeThresholdIsRejected:
         )
         assert result.exit_code != 0
         assert "-1" in result.output  # click names the offending value
+
+
+class TestPromoteRejectsNonPartialTargets:
+    """A dry-run's plan must be the operation `--apply` would perform.
+
+    `promote_partial_pack` only matches a `partial` row, so announcing
+    "promote" for any other status advertises something that cannot happen --
+    and under `--apply` the operator is then told `applied: false` after being
+    told the opposite. The status is therefore checked before the plan is
+    emitted, in both modes."""
+
+    @pytest.mark.parametrize("status", [PACK_STATUS_READY, PACK_STATUS_CREATING])
+    def test_dry_run_and_apply_agree_on_rejecting(self, sql, alice, status):
+        pid = begin_pack_creation(sql, alice, f"nonpartial-{status}")
+        if status == PACK_STATUS_READY:
+            mark_pack_ready(sql, pid, alice)
+        # Anchor present, so the ONLY thing standing in the way is the status.
+        graph = FakeGraph(present_ids={anchor_node_id(pid)})
+
+        dry = repair_incomplete_packs(
+            sql, graph, FakeDocs(), FakeVector(), apply=False, promote=pid
+        )
+        wet = repair_incomplete_packs(
+            sql, graph, FakeDocs(), FakeVector(), apply=True, promote=pid
+        )
+
+        for result in (dry, wet):
+            assert result["promote_result"]["action"] == "rejected (not a partial pack)"
+            assert status in result["promote_result"]["reason"]
+        # And apply changed nothing.
+        assert get_pack(sql, pid)["status"] == status
+
+    def test_a_partial_target_is_still_promoted(self, sql, alice):
+        """The rejection must not swallow the case --promote exists for."""
+        pid = begin_pack_creation(sql, alice, "genuinely-partial")
+        mark_pack_partial(sql, pid, alice)
+        graph = FakeGraph(present_ids={anchor_node_id(pid)})
+
+        result = repair_incomplete_packs(
+            sql, graph, FakeDocs(), FakeVector(), apply=True, promote=pid
+        )
+
+        assert result["promote_result"]["action"] == "promote"
+        assert result["promote_result"]["applied"] is True
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_READY

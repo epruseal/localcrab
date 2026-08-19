@@ -418,6 +418,28 @@ def repair_incomplete_packs(
         promote_result = {"pack_id": promote, "probes": probes}
         if target is None:
             promote_result["action"] = "rejected (no such pack)"
+        elif target["status"] != PACK_STATUS_PARTIAL:
+            # Checked BEFORE planning, in both modes, because the plan a
+            # dry-run prints has to be the operation an --apply would perform.
+            # `promote_partial_pack`'s WHERE only matches `partial`, so
+            # announcing "promote" for a `ready` or `creating` target would
+            # advertise something that could never happen -- and in apply mode
+            # the operator would get `applied: false` after being told the
+            # opposite. A `creating` target is not a near-miss to nudge along
+            # either: the unattended pass promotes those on its own when their
+            # anchor is confirmed, and `--promote` exists for `partial` rows
+            # precisely because those are the ones it refuses to touch.
+            promote_result["action"] = "rejected (not a partial pack)"
+            promote_result["reason"] = (
+                f"--promote only promotes a {PACK_STATUS_PARTIAL!r} row; this "
+                f"one is {target['status']!r}"
+                + (
+                    " -- the unattended pass promotes a confirmed 'creating' "
+                    "row without being asked"
+                    if target["status"] == PACK_STATUS_CREATING
+                    else ""
+                )
+            )
         elif probes.get("graph") != PROBE_PRESENT:
             promote_result["action"] = "rejected (graph anchor not confirmed present)"
             promote_result["reason"] = (

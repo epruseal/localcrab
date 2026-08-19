@@ -28,6 +28,7 @@ pack's anchor node is in the graph".
 from __future__ import annotations
 
 import secrets
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -235,16 +236,54 @@ def _negotiate_pack_id(
     copies of that loop would be free to drift from each other. The only
     thing that differs between the two callers is the ``status`` the row is
     inserted with.
+
+    An INSERT that raises is reconciled here rather than propagated -- see the
+    ``except`` below for why an unknown outcome must not be read as "no row".
     """
-    if _insert_pack(sql, pack_id, owner_id, title, description, forked_from, status=status):
-        return pack_id
-    for _ in range(_MAX_RANDOM_ATTEMPTS):
-        candidate = f"{pack_id}-{secrets.token_hex(4)}"
-        if _insert_pack(
-            sql, candidate, owner_id, title, description, forked_from, status=status
-        ):
+    for candidate in _pack_id_candidates(pack_id):
+        try:
+            landed = _insert_pack(
+                sql, candidate, owner_id, title, description, forked_from, status=status
+            )
+        except Exception:
+            # An INSERT that raises means the OUTCOME is unknown, not that no
+            # row exists: a commit can succeed and its acknowledgement still
+            # fail. Propagating blind would strand a committed row under an id
+            # NOBODY holds -- on a collision this function chose a random
+            # suffix the caller never sees, and while the row is `creating` it
+            # is absent from that owner's every listing, so nothing could
+            # reach it again. Re-read this candidate; if it is ours with the
+            # status we asked for, that IS the successful outcome.
+            if _row_is_ours(sql, candidate, owner_id, status):
+                return candidate
+            raise
+        if landed:
             return candidate
     raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
+
+
+def _pack_id_candidates(pack_id: str) -> Iterator[str]:
+    """The requested slug, then random-suffixed retries (see ``create_pack``
+    for why the suffix is random rather than sequential)."""
+    yield pack_id
+    for _ in range(_MAX_RANDOM_ATTEMPTS):
+        yield f"{pack_id}-{secrets.token_hex(4)}"
+
+
+def _row_is_ours(sql: Any, pack_id: str, owner_id: str, status: str) -> bool:
+    """Did the INSERT whose answer we lost actually land as ours?
+
+    Ownership AND status must both match. A row under this id belonging to
+    someone else, or carrying a different status, is not the one this call was
+    making, and returning it would hand the caller a pack they do not own. A
+    re-read that itself fails answers ``False``: still unknown, so the original
+    exception stands.
+    """
+    try:
+        row = get_pack(sql, pack_id)
+    except Exception:  # noqa: BLE001 -- unknown stays unknown
+        return False
+    return bool(row and row["owner_id"] == owner_id and row["status"] == status)
 
 
 def create_pack(

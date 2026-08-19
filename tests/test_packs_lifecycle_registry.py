@@ -448,3 +448,66 @@ def test_write_gate_authorize_forwards_allowed_statuses(sql, alice):
         gate_authorize(sql, _p(alice), pid)
     row = gate_authorize(sql, _p(alice), pid, allowed_statuses=(PACK_STATUS_CREATING,))
     assert row["status"] == PACK_STATUS_CREATING
+
+
+class TestAmbiguousRegistryInsert:
+    """An INSERT that raises means the outcome is UNKNOWN, not that no row
+    exists (#170 PR review): a commit can succeed while its acknowledgement
+    fails. Propagating blind would strand a committed row under an id nobody
+    holds -- on a collision the id is a random suffix the caller never sees,
+    and a `creating` row is absent from its owner's every listing, so nothing
+    could reach it again."""
+
+    def test_a_committed_row_is_recovered_from_a_raising_insert(self, sql, alice):
+        """The row landed; only the answer was lost. That id must come back."""
+        from unittest.mock import patch
+
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.ownership import PACK_STATUS_CREATING, begin_pack_creation, get_pack
+
+        real_insert = ownership_mod._insert_pack
+
+        def _land_then_raise(sql_, pack_id, *args, **kwargs):
+            real_insert(sql_, pack_id, *args, **kwargs)
+            raise RuntimeError("connection dropped while acknowledging COMMIT")
+
+        with patch.object(ownership_mod, "_insert_pack", side_effect=_land_then_raise):
+            assigned = begin_pack_creation(sql, alice, "ambiguous")
+
+        assert assigned == "ambiguous"
+        row = get_pack(sql, assigned)
+        assert row is not None
+        assert row["owner_id"] == alice
+        assert row["status"] == PACK_STATUS_CREATING
+
+    def test_a_genuinely_failed_insert_still_raises(self, sql, alice):
+        """Nothing landed, so the outcome is not 'unknown but fine' -- the
+        caller must still see the failure rather than an id for no row."""
+        from unittest.mock import patch
+
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.ownership import begin_pack_creation, get_pack
+
+        with patch.object(
+            ownership_mod, "_insert_pack", side_effect=RuntimeError("registry is down")
+        ):
+            with pytest.raises(RuntimeError, match="registry is down"):
+                begin_pack_creation(sql, alice, "never-landed")
+
+        assert get_pack(sql, "never-landed") is None
+
+    def test_a_foreign_row_under_that_id_is_not_claimed(self, sql, alice, bob):
+        """The re-read must not hand back somebody else's row just because it
+        occupies the id this call was trying for."""
+        from unittest.mock import patch
+
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.ownership import begin_pack_creation
+
+        begin_pack_creation(sql, bob, "contested")
+
+        with patch.object(
+            ownership_mod, "_insert_pack", side_effect=RuntimeError("lost the answer")
+        ):
+            with pytest.raises(RuntimeError, match="lost the answer"):
+                begin_pack_creation(sql, alice, "contested")
