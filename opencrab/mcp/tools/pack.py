@@ -1147,11 +1147,20 @@ def pack_create(
                         ctx["sql"], slug, subject_id, _clean_str(title),
                         _clean_str(description or ""), None, status=PACK_STATUS_READY,
                     )
+                    if not reregistered:
+                        # PK conflict: some other row already holds this slug.
+                        # Server-side only -- the response below must not say
+                        # so (see its comment).
+                        logger.warning(
+                            "pack_create: re-registration of orphaned anchor "
+                            "pack_id=%s did not land; the slug is already "
+                            "held by another row", slug,
+                        )
                 except Exception:
                     reregistered = False
                     logger.warning(
                         "pack_create: re-registration of orphaned anchor "
-                        "pack_id=%s failed", slug,
+                        "pack_id=%s raised", slug, exc_info=True,
                     )
             # Either way: no ingest. This call cannot safely attribute the
             # missing row to its own control flow, so it never proceeds as
@@ -1166,9 +1175,16 @@ def pack_create(
                         "re-registered as ready since its graph anchor is "
                         "confirmed present, but "
                         if reregistered
+                        # Deliberately silent on WHY it did not land. The
+                        # two causes are a PK conflict and a raised insert,
+                        # and naming the first would report that the slug is
+                        # occupied -- the one fact slug negotiation exists to
+                        # keep out of responses (#143 invariant 7). Saying it
+                        # for the raised case would also assert a cause never
+                        # checked. Both are distinguished in the server log.
                         else "re-registration was attempted (its graph anchor "
-                        "is confirmed present) but did not land -- the slug "
-                        "is held by another row; "
+                        "is confirmed present) but did not land -- see the "
+                        "server log; "
                         if anchor_confirmed
                         else "NOT re-registered because its graph anchor could "
                         "not be confirmed present, and "

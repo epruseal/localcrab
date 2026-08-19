@@ -603,3 +603,45 @@ class TestFailureResponseNamesTheRetainedPack:
         assert squatted is not None
         assert squatted["owner_id"] == "mallory"
         assert squatted["status"] == "creating"
+
+    def test_a_failed_reregistration_never_says_the_slug_is_taken(self, sql, caplog):
+        """The re-registration message may not report occupancy.
+
+        Two things can stop the PK-safe re-insert: another row already holds
+        the slug, or the insert raised. Naming the first in the response would
+        report that the slug is taken -- the one fact slug negotiation is
+        built to keep out of responses (#143 invariant 7) -- and saying it for
+        the second would assert a cause nobody checked. The response therefore
+        says only that it did not land; the two are separated in the log,
+        which the caller never sees."""
+        import logging
+
+        def _vanish(sql_, pack_id, owner_id):
+            delete_pack_row(sql_, pack_id, owner_id)
+            return False
+
+        def _squat_then_confirm_anchor(graph, docs, vector, pack_id):
+            """The slug is taken during the window AND the anchor is
+            confirmed, so the branch attempts the re-insert and loses."""
+            begin_pack_creation(sql, "mallory", pack_id)
+            return {"graph": "present", "docs": "absent", "vector": "absent"}
+
+        ctx = _base_ctx(sql)
+
+        import opencrab.pack.lifecycle as lifecycle_mod
+        import opencrab.pack.ownership as ownership_mod
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch.object(ownership_mod, "mark_pack_ready", side_effect=_vanish),
+            patch.object(lifecycle_mod, "probe_anchor", side_effect=_squat_then_confirm_anchor),
+        ):
+            result = _create(ctx, title="Contested", pack_id="contested-pack")
+
+        error = result["error"]
+        assert "did not land" in error
+        for leak in ("held by another", "already", "taken", "occupied", "mallory"):
+            assert leak not in error, f"response discloses occupancy via {leak!r}"
+        assert result["registry_status"] is None  # mallory's row, withheld
+        # The operator still gets the real cause, server-side.
+        assert any("already " in r.message or "already" in str(r.args) for r in caplog.records)
