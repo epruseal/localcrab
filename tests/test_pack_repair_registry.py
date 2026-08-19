@@ -555,37 +555,45 @@ class TestProbeShapeHandling:
 def test_probe_methods_exist_on_every_real_store_backend():
     from opencrab.pack import lifecycle
 
+    # (module, class, third-party driver roots whose absence may legitimately
+    # skip this backend). An EMPTY driver set means "importable in every
+    # environment" -- stdlib and in-package modules only, verified through the
+    # shared bases -- so an ImportError there is breakage, never a missing
+    # driver. Naming the drivers per backend, rather than accepting any
+    # non-`opencrab` module name, is what makes the skip a POSITIVE
+    # identification: a typo'd `import neo4jx`, or a stdlib module going
+    # missing, is not on anyone's list and fails instead of quietly shrinking
+    # what this test covers.
+    #
+    # Measured, so the granularity below is not read as more than it is: every
+    # one of these backends imports cleanly in an environment with NO drivers
+    # installed, because each defers its driver import to first use. The skip
+    # branch therefore does not fire here at all (`checked` reaches the full
+    # list). It is a guard against a future backend that imports its driver
+    # eagerly, not a path this suite exercises. Note also that
+    # `opencrab/stores/__init__.py` imports the chroma, mongo and neo4j stores
+    # eagerly, so importing ANY store submodule pulls those three in -- if one
+    # of them ever did need its driver at import time, the failure would
+    # surface on whichever backend this loop reached first rather than on the
+    # entry whose driver set names it.
     graph_backends = [
-        ("opencrab.stores.local_graph_store", "LocalGraphStore"),
-        ("opencrab.stores.pg_graph_store", "PGGraphStore"),
-        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore"),
-        ("opencrab.stores.neo4j_store", "Neo4jStore"),
+        ("opencrab.stores.local_graph_store", "LocalGraphStore", frozenset()),
+        ("opencrab.stores.pg_graph_store", "PGGraphStore", frozenset({"psycopg", "psycopg2"})),
+        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore", frozenset({"kuzu"})),
+        ("opencrab.stores.neo4j_store", "Neo4jStore", frozenset({"neo4j"})),
     ]
     doc_backends = [
-        ("opencrab.stores.local_doc_store", "LocalDocStore"),
-        ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore"),
-        ("opencrab.stores.pg_doc_store", "PgDocStore"),
-        ("opencrab.stores.mongo_store", "MongoStore"),
+        ("opencrab.stores.local_doc_store", "LocalDocStore", frozenset()),
+        ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore", frozenset()),
+        ("opencrab.stores.pg_doc_store", "PgDocStore", frozenset({"psycopg", "psycopg2"})),
+        ("opencrab.stores.mongo_store", "MongoStore", frozenset({"pymongo", "bson"})),
     ]
     vector_backends = [
-        ("opencrab.stores.chroma_store", "ChromaStore"),
-        ("opencrab.stores.sqlite_vec_store", "SqliteVecStore"),
-        ("opencrab.stores.pg_vector_store", "PgVectorStore"),
+        ("opencrab.stores.chroma_store", "ChromaStore", frozenset({"chromadb"})),
+        ("opencrab.stores.sqlite_vec_store", "SqliteVecStore", frozenset({"sqlite_vec"})),
+        ("opencrab.stores.pg_vector_store", "PgVectorStore",
+         frozenset({"psycopg", "psycopg2", "pgvector"})),
     ]
-
-    # Backends that pull in no third-party driver at import time (stdlib and
-    # in-package modules only, checked through their shared bases). These are
-    # importable in EVERY environment, so a failure to import one is never
-    # "driver not installed" -- it is breakage, and the loop below refuses to
-    # skip them. Without this split, a blanket `except ImportError` lets an
-    # in-package breakage silently shrink what the test covers, which is the
-    # same class of quiet-shrink defect that made the first version of this
-    # test miss a backend outright.
-    always_importable = {
-        "opencrab.stores.local_graph_store",
-        "opencrab.stores.local_doc_store",
-        "opencrab.stores.local_sql_doc_store",
-    }
 
     import importlib
 
@@ -595,7 +603,7 @@ def test_probe_methods_exist_on_every_real_store_backend():
         (doc_backends, "get_node_doc"),
         (vector_backends, "get_by_id"),
     ):
-        for mod_name, cls_name in group:
+        for mod_name, cls_name, drivers in group:
             try:
                 mod = importlib.import_module(mod_name)
             except ImportError as exc:
@@ -612,16 +620,13 @@ def test_probe_methods_exist_on_every_real_store_backend():
                 # it here deliberately rather than letting the blanket
                 # swallow it.
                 missing = getattr(exc, "name", None) or ""
-                assert mod_name not in always_importable, (
-                    f"{mod_name} needs no third-party driver but failed to "
-                    f"import ({exc!r}) -- this is breakage, not a missing "
-                    f"driver, and must not shrink this test's coverage"
-                )
-                assert missing and not missing.startswith("opencrab"), (
-                    f"{mod_name} failed to import ({exc!r}); missing module "
-                    f"{missing!r} is not identifiable as a third-party "
-                    f"driver, so this backend is NOT being skipped -- an "
-                    f"unidentifiable import failure must not shrink coverage"
+                root = missing.split(".")[0]
+                assert root in drivers, (
+                    f"{mod_name} failed to import ({exc!r}); the missing "
+                    f"module {missing!r} is not one of this backend's optional "
+                    f"drivers ({sorted(drivers) or 'it has none'}), so this is "
+                    f"breakage rather than an uninstalled driver -- refusing "
+                    f"to skip it and shrink this test's coverage"
                 )
                 continue
             cls = getattr(mod, cls_name, None)
