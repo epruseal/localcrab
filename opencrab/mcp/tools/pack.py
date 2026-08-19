@@ -822,12 +822,41 @@ def pack_create(
     The ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
     stays fixed at 'default'.
+
+    Registry lifecycle (#170, design v4 §3.5): the pack_id is reserved
+    ``creating`` before any content is written, promoted to ``ready`` once
+    its graph anchor is confirmed, and demoted to ``partial`` (never
+    deleted) on any failure that happens AFTER the first content writer
+    call. The ONE exception -- the ONLY branch anywhere in this function
+    that deletes the registry row -- is an anchor identity conflict caught
+    BEFORE ``builder.add_node`` is ever called, where "no content exists
+    for this pack" is proven by control flow rather than by probing a
+    store a slow remote commit could still be about to fill. See that
+    branch's own comment, and design v4 §3.0, for why every later failure
+    ends in a demotion instead.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
-    from opencrab.pack.ownership import create_pack as _register_pack
-    from opencrab.pack.ownership import delete_pack_row
+    from opencrab.pack.lifecycle import (
+        ANCHOR_ABSENT,
+        ANCHOR_GRAPH,
+        ANCHOR_OPTIONAL_ONLY,
+        PROBE_PRESENT,
+        anchor_verdict,
+        probe_anchor,
+    )
+    from opencrab.pack.ownership import (
+        PACK_STATUS_CREATING,
+        PACK_STATUS_READY,
+        _insert_pack,
+        anchor_node_id,
+        begin_pack_creation,
+        delete_pack_row,
+        get_pack,
+        mark_pack_partial,
+        mark_pack_ready,
+    )
 
     principal = current_principal()
     tenant_id = "default"
@@ -838,26 +867,31 @@ def pack_create(
 
     ctx = _get_context()
     graph = ctx["neo4j"]
+    docs = ctx["mongo"]
+    vector = ctx["chroma"]
     # #146 P1(a): reject before the registry row is created -- if the graph
     # (system of record for pack content, and where the identity-ownership
     # probes below read from) is down, there is nothing safe to register.
     # Same precondition pack_ingest already enforces; doing it here too
     # means graph-unavailable can never leave a registry row pointing at a
     # pack that was never actually written (docs/sql/vector/audit partial
-    # state with no compensating delete needed, because nothing was
+    # state with no compensating action needed, because nothing was
     # registered in the first place).
     if not getattr(graph, "available", False):
         return {"error": "graph store unavailable"}
 
-    # #146: the registry (packs table), not a full content_pack_list() scan,
-    # is now the single authority for "is this slug taken". A collision is
-    # NEVER reported as an error (#143 invariant 7 — that would tell the
-    # caller someone else already owns the exact slug they guessed): the
-    # registry quietly appends a random suffix instead, so `slug` below may
+    # #170: two-phase creation. The slug is reserved status='creating' --
+    # NOT immediately ready -- so every read path (readable_pack_ids/
+    # list_packs_for filter on status='ready') and every write path but the
+    # anchor write itself (write_gate's default allowed_statuses excludes
+    # 'creating') treats this pack as if it does not exist yet, until it is
+    # promoted or demoted below. Same slug-collision negotiation as
+    # create_pack (see begin_pack_creation's docstring): a collision is
+    # NEVER reported as an error (#143 invariant 7), so `slug` below may
     # differ from the caller's requested pack_id. The actually-assigned
     # pack_id is always in the response.
     try:
-        slug = _register_pack(
+        slug = begin_pack_creation(
             ctx["sql"],
             owner_id=subject_id,
             pack_id=slug,
@@ -867,86 +901,257 @@ def pack_create(
     except Exception as exc:
         return {"error": f"pack registration failed: {exc}"}
 
-    anchor_node_id = f"dataset:{slug}"
-    anchor_result: dict[str, Any] | None = None
-    anchor_exc: Exception | None = None
+    anchor_id = anchor_node_id(slug)
+
     # #146 P1(a): the slug is only assigned above (registry may have
     # suffixed it on collision), so the anchor identity probe -- same
     # _node_probes 3-way check the node/edge loops use -- has to run here,
     # AFTER registration but BEFORE builder.add_node, so no store is ever
     # written to when the anchor identity is already someone else's.
-    anchor_probe_reason = _node_probe_conflict(
-        ctx, "resource", "Dataset", anchor_node_id, slug
-    )
-    if anchor_probe_reason is None:
+    anchor_probe_reason = _node_probe_conflict(ctx, "resource", "Dataset", anchor_id, slug)
+    if anchor_probe_reason is not None:
+        # THE ONLY DELETE IN THIS FUNCTION (#170, design v4 §3.0):
+        # builder.add_node has not been called yet -- not here, not on any
+        # earlier iteration, because this is the first and only anchor
+        # write attempt this call makes -- so "no content was written for
+        # this pack_id" is proven by control flow, no probe needed. The
+        # slug was also reserved by begin_pack_creation a few lines above,
+        # in THIS call, so no other request can have written under it
+        # either. Both of those stop holding the instant builder.add_node
+        # is actually called below, which is why no later branch in this
+        # function deletes anything.
+        error_msg = _identity_reject_message("node", anchor_id, anchor_probe_reason)
         try:
-            anchor_result = ctx["builder"].add_node(
-                space="resource",
-                node_type="Dataset",
-                node_id=anchor_node_id,
-                properties={
-                    "pack_id": slug,
-                    "title": _clean_str(title),
-                    "description": _clean_str(description or ""),
-                    "created_by": "localcrab-mcp",
-                },
-                pack_id=slug,
+            deleted = delete_pack_row(
+                ctx["sql"], slug, subject_id, only_status=(PACK_STATUS_CREATING,)
             )
-        except Exception as exc:
-            anchor_exc = exc
-
-    # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
-    # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
-    # inside the returned stores map. graph is the system of record (the
-    # "anchor missing = no pack" contract), so the positive
-    # store_write_succeeded() check is the single source of truth for
-    # whether the anchor actually landed -- not just "no error reported".
-    anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
-    graph_landed = (
-        anchor_probe_reason is None
-        and anchor_exc is None
-        and store_write_succeeded(anchor_stores or {}, "graph")
-    )
-
-    if not graph_landed:
-        # The registry row created above now points at an anchor that
-        # doesn't exist -- a phantom pack. Compensate by deleting that row
-        # (#146 follow-up #170: this undoes ONLY the registry insert, never
-        # any store the anchor write itself may have partially landed in;
-        # once graph.add_node has actually succeeded this branch is
-        # unreachable, so there is nothing to undo past this point). The
-        # identity-conflict branch reuses this exact same compensating path
-        # -- builder.add_node was never called, so there is nothing else to
-        # undo either.
-        if anchor_probe_reason is not None:
-            error_msg = _identity_reject_message("node", anchor_node_id, anchor_probe_reason)
-        elif anchor_exc is not None:
-            error_msg = f"anchor node failed: {anchor_exc}"
-        else:
-            graph_failures = [
-                f for f in store_write_failures(anchor_stores or {}) if f.startswith("graph:")
-            ]
-            error_msg = "anchor node failed: " + (
-                "; ".join(graph_failures) or "graph write did not succeed"
-            )
-        try:
-            deleted = delete_pack_row(ctx["sql"], slug, subject_id)
-            if not deleted:
+        except Exception:
+            deleted = False
+        if not deleted:
+            # Delete failed outright, or matched zero rows (something else
+            # moved this row out of 'creating' between begin_pack_creation
+            # and here -- e.g. an operator's manual intervention, since no
+            # other code path touches a 'creating' row before the writer
+            # runs). Leaving it behind would strand a phantom 'creating'
+            # row forever, so demote it instead: a 'partial' row is at
+            # least visible to `packs repair-registry`'s reporting, where a
+            # stuck 'creating' row is not (repair only acts on rows older
+            # than its threshold, but reports both).
+            try:
+                mark_pack_partial(ctx["sql"], slug, subject_id)
+            except Exception:
                 logger.warning(
-                    "pack_create compensating delete found no matching row "
-                    "(pack_id=%s owner=%s)",
-                    slug, subject_id,
+                    "pack_create: could not demote pack_id=%s after a failed "
+                    "compensating delete (identity-conflict branch)", slug,
                 )
-        except Exception as del_exc:
-            logger.warning(
-                "pack_create compensating delete failed (pack_id=%s owner=%s): %s",
-                slug, subject_id, del_exc,
-            )
         return {"error": error_msg}
 
-    # Graph landed -> the pack really exists. Anything left here is
-    # optional-store-only (graph already confirmed above).
-    anchor_optional_failures = store_write_failures(anchor_stores or {})
+    anchor_result: dict[str, Any] | None = None
+    anchor_exc: Exception | None = None
+    try:
+        anchor_result = ctx["builder"].add_node(
+            space="resource",
+            node_type="Dataset",
+            node_id=anchor_id,
+            properties={
+                "pack_id": slug,
+                "title": _clean_str(title),
+                "description": _clean_str(description or ""),
+                "created_by": "localcrab-mcp",
+            },
+            pack_id=slug,
+            pack_anchor=True,
+        )
+    except Exception as exc:
+        anchor_exc = exc
+
+    # ------------------------------------------------------------------
+    # PAST THIS POINT, NOTHING IN THIS FUNCTION DELETES THE REGISTRY ROW
+    # (#170, design v4 §3.0 -- the rule is stated once, at the top of this
+    # function, and enforced here by simply never calling delete_pack_row
+    # again). Two reasons a probe-based delete would be unsafe from here
+    # on, both measured against this codebase rather than assumed:
+    #   (1) opencrab/pack/load.py's chunk loader writes docs/vector content
+    #       OUTSIDE write_gate.authorize (a known gap owned by #205, pinned
+    #       in tests/test_write_sink_inventory.py) -- so "the anchor probe
+    #       came back absent" never implied "this pack has zero content".
+    #   (2) store_write_succeeded() is fail-closed: a commit followed by a
+    #       dropped connection reads as "not landed" even when it landed,
+    #       and a slow remote graph backend can still be about to commit
+    #       after this function has already decided to act. Deleting on
+    #       that ambiguity would delete the registry row out from under a
+    #       pack whose anchor lands a moment later -- a graph ORPHAN with
+    #       no registry row, exactly the state
+    #       read_scope.assert_registry_covers_graph refuses to boot with.
+    # Every failure from here on is a 'partial' demotion instead.
+    # ------------------------------------------------------------------
+    anchor_stores = anchor_result.get("stores") if isinstance(anchor_result, dict) else None
+    # Same per-store inspection as _ingest_into_pack: add_node doesn't raise
+    # for a per-store failure, it reports "error: ..."/"unavailable" (graph)
+    # inside the returned stores map. graph is the system of record, so the
+    # positive store_write_succeeded() check is the single source of truth
+    # for whether the anchor actually landed -- not just "no error
+    # reported".
+    graph_landed = anchor_exc is None and store_write_succeeded(anchor_stores or {}, "graph")
+
+    if anchor_exc is not None:
+        write_detail = f"anchor node write raised: {anchor_exc}"
+    else:
+        graph_failures = [
+            f for f in store_write_failures(anchor_stores or {}) if f.startswith("graph:")
+        ]
+        write_detail = "anchor node write did not confirm in graph: " + (
+            "; ".join(graph_failures) or "graph write did not succeed"
+        )
+
+    if not graph_landed:
+        # store_write_succeeded()'s fail-closed reading may simply be
+        # wrong -- re-probe the stores directly (the #146 follow-up's
+        # "애매한 커밋 후 재조회") before believing "not landed".
+        verdict = anchor_verdict(probe_anchor(graph, docs, vector, slug))
+        if verdict == ANCHOR_GRAPH:
+            # The ambiguous commit actually landed. Join the normal success
+            # path below exactly as if store_write_succeeded had said so
+            # the first time.
+            graph_landed = True
+        else:
+            # optional-only / absent / unverifiable all take the SAME
+            # registry action (mark_pack_partial, never delete) but must
+            # give the operator a DISTINGUISHABLE reason (design v4 §3.5).
+            if verdict == ANCHOR_OPTIONAL_ONLY:
+                probe_detail = (
+                    "re-probe found the anchor in an optional store (docs/vector) "
+                    "but NOT in graph -- by this system's definition the pack does "
+                    "not exist yet"
+                )
+            elif verdict == ANCHOR_ABSENT:
+                probe_detail = "re-probe found the anchor in no store at all"
+            else:  # ANCHOR_UNVERIFIABLE
+                probe_detail = (
+                    "the anchor's landing status could not be verified (graph "
+                    "unavailable, or the re-probe itself failed)"
+                )
+            try:
+                mark_pack_partial(ctx["sql"], slug, subject_id)
+            except Exception:
+                logger.warning(
+                    "pack_create: could not demote pack_id=%s after an "
+                    "unconfirmed anchor write (verdict=%s)", slug, verdict,
+                )
+            return {
+                "error": (
+                    f"{write_detail}. {probe_detail}. Pack '{slug}' marked "
+                    f"partial, not deleted -- see #170 design v4 §3.0."
+                )
+            }
+
+    # graph_landed is True here, either from the direct check above or from
+    # the re-probe's ANCHOR_GRAPH verdict.
+    if not mark_pack_ready(ctx["sql"], slug, subject_id):
+        # mark_pack_ready only matches a row that is STILL 'creating' and
+        # STILL owned by subject_id (see its own docstring). No branch
+        # above this point has deleted or reassigned this row, so every
+        # sub-case below is reachable only through an operator's manual SQL
+        # or a repair-pass race, never through this function's own control
+        # flow (design v4 §3.5).
+        try:
+            row = get_pack(ctx["sql"], slug)
+        except Exception as exc:
+            return {"error": f"could not reconcile pack '{slug}' after anchor write: {exc}"}
+
+        if row is None:
+            # No delete branch in this design reaches this point (see the
+            # comment block above) -- only a manual `DELETE FROM packs` can
+            # produce it. The anchor write above may still have landed in
+            # graph, so re-register (status='ready') to avoid leaving a
+            # graph ORPHAN with no registry row -- but ONLY when the graph
+            # anchor is POSITIVELY confirmed for THIS slug; an unconfirmed
+            # anchor must not be re-registered on a guess.
+            try:
+                anchor_confirmed = (
+                    probe_anchor(graph, docs, vector, slug).get("graph") == PROBE_PRESENT
+                )
+            except Exception:
+                anchor_confirmed = False
+            if anchor_confirmed:
+                try:
+                    # PK-safe: if someone else's row already occupies this
+                    # exact slug, _insert_pack returns False instead of
+                    # overwriting it -- this call never writes into another
+                    # subject's pack.
+                    _insert_pack(
+                        ctx["sql"], slug, subject_id, _clean_str(title),
+                        _clean_str(description or ""), None, status=PACK_STATUS_READY,
+                    )
+                except Exception:
+                    logger.warning(
+                        "pack_create: re-registration of orphaned anchor "
+                        "pack_id=%s failed", slug,
+                    )
+            # Either way: no ingest. This call cannot safely attribute the
+            # missing row to its own control flow, so it never proceeds as
+            # if it had succeeded.
+            return {
+                "error": (
+                    f"pack '{slug}'s registry row was missing when finalizing "
+                    f"the anchor write (not caused by this call -- see #170 "
+                    f"design v4 §3.5); "
+                    + (
+                        "re-registered as ready since its graph anchor is "
+                        "confirmed present, but "
+                        if anchor_confirmed
+                        else "NOT re-registered because its graph anchor could "
+                        "not be confirmed present, and "
+                    )
+                    + "this call did not ingest -- retry pack_ingest separately."
+                )
+            }
+
+        if row["owner_id"] != subject_id:
+            # Someone else now owns this pack_id row -- never write into
+            # it, never demote it (it may be their perfectly healthy pack),
+            # never ingest.
+            return {
+                "error": (
+                    f"pack '{slug}' is no longer owned by this caller after "
+                    f"the anchor write; refusing to finalize or ingest."
+                )
+            }
+
+        if row["status"] != PACK_STATUS_READY:
+            # Still ours but not 'ready'. mark_pack_ready not matching, plus
+            # ownership matching, means this can only be 'partial' already
+            # (a 'creating' row owned by us would have matched
+            # mark_pack_ready's WHERE). Some other actor -- a repair-pass
+            # demotion racing in, or an operator -- made that call with
+            # information this function does not have; design v4 §9
+            # (fable r3 P3-3) rejected self-promotion here on purpose, so
+            # this confirms/keeps the demotion rather than overruling it.
+            try:
+                mark_pack_partial(ctx["sql"], slug, subject_id)
+            except Exception:
+                pass
+            return {
+                "error": (
+                    f"pack '{slug}' was moved to status={row['status']!r} by "
+                    f"another process before this call could finalize it; "
+                    f"ingest skipped."
+                )
+            }
+
+        # row["status"] == "ready" and it is ours: a repair pass (or an
+        # operator's --promote) already promoted it between our anchor
+        # write and this check. Join the success path exactly as if
+        # mark_pack_ready had returned True itself.
+
+    # The pack is 'ready' here, either because mark_pack_ready just
+    # transitioned it or because the reconciliation above found it already
+    # there. Anything left in anchor_stores is optional-store-only --
+    # filtered to exclude any stale "graph:" entry from an earlier ambiguous
+    # attempt the re-probe above has since confirmed actually landed.
+    anchor_optional_failures = [
+        f for f in store_write_failures(anchor_stores or {}) if not f.startswith("graph:")
+    ]
 
     source_id: str | None = None
     if text:
@@ -971,7 +1176,7 @@ def pack_create(
         "status": "ok",
         "pack_id": slug,
         "title": _clean_str(title),
-        "anchor_node": anchor_node_id,
+        "anchor_node": anchor_id,
         **ingest_result,
     }
     if anchor_optional_failures:
