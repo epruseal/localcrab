@@ -611,6 +611,17 @@ def mark_pack_partial(sql: Any, pack_id: str, owner_id: str) -> bool:
         return result.rowcount > 0
 
 
+# #201 §4-F fix 2: the reason string `promote_partial_pack` raises for a
+# forked `partial` row, and (fix 3) the SAME string `repair_incomplete_packs`
+# plans its `--promote` rejection with -- one constant so the two call sites
+# (an operator calling this function directly, and the dry-run/apply planner
+# in lifecycle.py) can never drift apart and print two different reasons for
+# the same refusal.
+FORKED_PARTIAL_PROMOTE_REFUSAL = (
+    "forked partial rows cannot be promoted; use delete_pack + re-fork"
+)
+
+
 def promote_partial_pack(sql: Any, pack_id: str, owner_id: str) -> bool:
     """``partial`` -> ``ready``. Returns True iff a row actually
     transitioned.
@@ -624,7 +635,48 @@ def promote_partial_pack(sql: Any, pack_id: str, owner_id: str) -> bool:
     ``status = 'partial'`` means a ``creating`` row can never be
     accidentally promoted by this call -- only a row someone already gave
     up on.
+
+    **A forked partial row is refused outright, by raising ``ValueError``
+    (#201 §4-F fix 2).** ``pack_fork`` reserves its destination as
+    ``creating``, lands the graph anchor FIRST, and only then copies
+    content -- so the anchor-probe evidence a caller is expected to have
+    confirmed before calling this function is vacuous for a fork: an
+    INCOMPLETE fork copy has a present anchor exactly as often as a
+    complete one does. There is no positive completeness check available
+    from here either -- that would mean re-running the fork's own H4
+    post-copy verification, which needs the source pack_id and the
+    id-remap salt, and neither survives outside the ``pack_fork`` call that
+    generated them. So this never guesses; it refuses.
+
+    This is a hard ``ValueError``, not a quiet ``False``, on purpose: the
+    WHERE clause below could instead be narrowed to
+    ``AND (forked_from IS NULL)`` and the effect on THIS function's return
+    value would look the same (no row transitions). But
+    ``repair_incomplete_packs``'s own fallback path already has a generic
+    reason for "no row transitioned" ("--promote requires a partial row
+    owned by the same owner"), which says nothing about ``forked_from`` and
+    would mislead an operator staring at a promotion that silently no-opped.
+    Raising with an explicit, named reason -- reused verbatim by
+    ``repair_incomplete_packs``'s own ``--promote`` planning branch via
+    :data:`FORKED_PARTIAL_PROMOTE_REFUSAL` -- means every caller either gets
+    the real reason or never reaches this function in the first place.
+
+    Recovery for a failed fork is NOT promotion: an operator removes the
+    stranded content with ops ``delete_pack`` and the caller re-forks. See
+    ``repair_incomplete_packs``'s docstring for that procedure's exact
+    limits (the registry row survives ``delete_pack`` and keeps occupying
+    the preferred slug; the age threshold used to detect a dead fork must
+    stay clear of a healthy fork's expected duration).
     """
+    row = get_pack(sql, pack_id)
+    if (
+        row is not None
+        and row["owner_id"] == owner_id
+        and row["status"] == PACK_STATUS_PARTIAL
+        and row.get("forked_from")
+    ):
+        raise ValueError(FORKED_PARTIAL_PROMOTE_REFUSAL)
+
     from sqlalchemy import text
 
     from opencrab.execution._sql import now_expr

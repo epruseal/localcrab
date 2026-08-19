@@ -246,6 +246,55 @@ class MongoStore:
         cursor = self._db["sources"].find({}, {"_id": 0, "text": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
 
+    def list_sources_scoped(self, pack_ids: list[str], limit: int = 100) -> list[dict[str, Any]]:
+        """Authorization-scoped counterpart to ``list_sources`` (issue #201
+        §4-B) -- see ``_SqlDocStoreBase.list_sources_scoped``'s docstring
+        for the full rationale (same contract, Mongo query form) and
+        ``_doc_owner_pred_scoped`` (same module) for the ownership
+        predicate this replicates.
+
+        No Mongo-native canon exists to reuse or diverge from here:
+        ``opencrab/pack/load.py``'s ``delete_pack`` never branches for a
+        Mongo ``docs`` store (it calls ``docs._dialect`` directly, which
+        MongoStore has no equivalent of) -- Mongo is a `docker`-mode-only
+        backend with no existing doc_sources ownership logic anywhere in
+        the codebase for this method to drift from. This is that logic's
+        first appearance for Mongo, expressed in Mongo's own idiom:
+        ``pack_id`` matches the scope list (and is a real BSON string, not
+        a same-spelled number/bool -- ``$type`` mirrors the SQL side's
+        ``json_type='text'`` strictness) OR ``pack_id`` is absent/falsy AND
+        ``source`` matches. Mongo's ``$in`` already treats a bound ``None``
+        as matching both "missing" and "null" (unlike a bare equality
+        check), so the falsy-list below needs no separate ``$exists``
+        clause.
+
+        Empty ``pack_ids`` -> ``[]`` WITHOUT querying. ``limit <= 0`` ->
+        ``[]``, same guard ``list_nodes_scoped`` uses (issue #120 follow-up).
+
+        FAIL-CLOSED ON UNAVAILABLE (design §5-1 step 3, issue #201): raises
+        via ``_require_available()`` rather than returning ``[]`` -- see the
+        SQL sibling's docstring for why a down store must not look like an
+        empty pack to ``pack_fork``'s orphan-vector detection.
+        """
+        self._require_available()
+        if not pack_ids or limit <= 0:
+            return []
+
+        ids = list(pack_ids)
+        query: dict[str, Any] = {
+            "$or": [
+                {"metadata.pack_id": {"$in": ids, "$type": "string"}},
+                {
+                    "$and": [
+                        {"metadata.pack_id": {"$in": [None, "", 0, 0.0, False]}},
+                        {"metadata.source": {"$in": ids, "$type": "string"}},
+                    ]
+                },
+            ]
+        }
+        cursor = self._db["sources"].find(query, {"_id": 0, "text": 0}).limit(limit)
+        return [dict(doc) for doc in cursor]
+
     # ------------------------------------------------------------------
     # Audit log
     # ------------------------------------------------------------------

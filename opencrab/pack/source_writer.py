@@ -23,12 +23,13 @@ store leads in the builder.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
     authorize,
+    authorize_fork_copy,
     identity_reject_message,
     source_identity_conflict,
     stamp,
@@ -55,6 +56,9 @@ def write_source(
     source_id: str,
     metadata: Mapping[str, Any] | None = None,
     pack_id: str,
+    origin: Literal["client", "server"] = "client",
+    fork_copy: bool = False,
+    write_vector: bool = True,
 ) -> dict[str, Any]:
     """Write one source's doc row and its vector under one ownership stamp.
 
@@ -75,6 +79,26 @@ def write_source(
     ``pack_id`` is keyword-REQUIRED. A source with no pack is outside every
     pack-scoped read (#143 invariant 5), so "no pack" must not be expressible.
 
+    ``origin="server"`` (design v7 §4-C-1) is for the same reason ``add_node``
+    has it: a copied source carries the ORIGINAL owner's ``user_id`` and the
+    SOURCE pack's ``pack_id`` in its metadata, both of which differ from the
+    forker's own values -- ``origin="client"`` (the default) would reject
+    that as forged identity. ``pack_fork`` is the only intended caller.
+
+    ``fork_copy`` (design v7 §4-C-2) routes authorization through
+    ``write_gate.authorize_fork_copy`` instead of ``authorize``, widening the
+    allowed status to a pack's own fork-reserved ``creating`` window -- see
+    that function's docstring. Everything else, including the identity guard
+    and the stamp, is unchanged.
+
+    ``write_vector`` (design v7 §4-C-3), default True, skips the vector leg
+    entirely when False and records ``"skipped (raw copy)"`` under
+    ``stores["chromadb"]`` -- NOT ``stores["vector"]``; that key differs from
+    ``OntologyBuilder.add_node``'s because this function's receipt already
+    used ``chromadb`` for the vector leg before this parameter existed. Fork
+    sets this False because ``hybrid.ingest`` re-embeds, which issue #200
+    forbids for a fork; the original vector is imported raw elsewhere instead.
+
     A doc-store *error* stops the vector write: a vector row pointing at a
     source that failed to record is an orphan no read path can hydrate. A doc
     store that is merely *unavailable* does not -- that is a deployment shape,
@@ -87,7 +111,10 @@ def write_source(
     # optional one: an authorize that runs "when the caller happens to pass a
     # store" is fail-open, which is the pattern this work already had to walk
     # back once (see pack/load.py's _require_bound_principal).
-    authorize(sql, principal, pack_id)
+    if fork_copy:
+        authorize_fork_copy(sql, principal, pack_id)
+    else:
+        authorize(sql, principal, pack_id)
 
     # A source_id is a global slot on both sinks -- the doc store upserts on
     # source_id with no pack predicate, and every vector store keys on the id
@@ -98,7 +125,10 @@ def write_source(
     if reason:
         raise ValueError(identity_reject_message("source", source_id, reason))
 
-    meta = stamp(metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED)
+    meta = stamp(
+        metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED,
+        origin=origin,
+    )
     meta.setdefault("space", _DEFAULT_SPACE)
 
     # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
@@ -122,6 +152,15 @@ def write_source(
 
     if doc_failed:
         receipt["stores"]["chromadb"] = "skipped (source record failed)"
+        return receipt
+
+    if not write_vector:
+        # design v7 §4-C-3: fork imports the original vector raw elsewhere;
+        # re-embedding it here would violate #200. Recorded explicitly so
+        # `_fork_leg_ok` (opencrab/pack/fork.py) can require exactly this
+        # value rather than treating an untouched "unavailable" as
+        # equivalent.
+        receipt["stores"]["chromadb"] = "skipped (raw copy)"
         return receipt
 
     # `ingest` mutates the mapping it is handed (it sets `source_id` on it), so

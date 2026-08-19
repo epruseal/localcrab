@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Literal
 
-from opencrab.pack.ownership import PACK_STATUS_READY
+from opencrab.pack.ownership import PACK_STATUS_CREATING, PACK_STATUS_READY
 
 if TYPE_CHECKING:
     from opencrab.auth import Principal
@@ -184,6 +184,38 @@ def authorize(
     from opencrab.pack.ownership import assert_writable
 
     return assert_writable(sql, principal, pack_id, allowed_statuses=allowed_statuses)
+
+
+def authorize_fork_copy(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:
+    """``pack_fork``'s bulk copy into a ``creating`` pack -- the ONE widening
+    of the write gate this design makes (design v7 §4-C-2).
+
+    Same owner-only rule as :func:`authorize`, with ``allowed_statuses``
+    widened to ``('creating',)`` alone: content must land inside the
+    reservation window, because "raise to ready first, then write" is wrong
+    twice over -- it makes an observably partial copy visible in between,
+    and once ``ready`` the row can no longer be demoted (``mark_pack_partial``
+    is ``WHERE status='creating'``).
+
+    That widening alone would also let any owner write into ANY ``creating``
+    pack of their own -- including one ``pack_create`` still has in flight.
+    Requiring ``forked_from`` closes that: ``pack_create``'s ``creating``
+    rows never carry it, only rows ``begin_pack_creation(..., forked_from=src)``
+    reserved by a fork do. This is what stops the widening from becoming a
+    general "write into any creating pack" door.
+
+    Raises ``ValueError``, NOT ``PackNotFoundError``: everyone who reaches
+    this line has already passed ``authorize``'s owner check, so there is
+    nothing left to hide from them -- answering "pack not found" about the
+    caller's own pack they just reserved would mislead debugging instead of
+    protecting anything.
+    """
+    row = authorize(sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
+    if not row.get("forked_from"):
+        raise ValueError(
+            "fork_copy is permitted only on a pack reserved by pack_fork"
+        )
+    return row
 
 
 # ---------------------------------------------------------------------------
