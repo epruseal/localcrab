@@ -64,6 +64,7 @@ class OntologyBuilder:
         *,
         pack_id: str,
         origin: str = "client",
+        pack_anchor: bool = False,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -75,6 +76,20 @@ class OntologyBuilder:
         rejects the node and silently drops it from the reload. Server-origin
         overwrites it with the importing principal instead. Every
         client-reachable path keeps the default.
+
+        ``pack_anchor`` (#170, design v4 §3.4) opts into the ONE write a
+        ``creating`` pack may receive: its own graph anchor node, written by
+        ``pack_create`` while the pack is still incomplete. When True, the
+        call must ALSO be shaped exactly like that anchor write --
+        ``space == "resource"``, ``node_type == "Dataset"``, and
+        ``node_id == ownership.anchor_node_id(pack_id)`` -- or it raises
+        ``ValueError`` before authorization even runs. This parameter opens
+        nothing else: not a second node in the same ``creating`` pack, not
+        any node in a ``partial`` or ``ready`` pack (those never reach this
+        branch's ``allowed_statuses``). The only call site that should ever
+        pass ``pack_anchor=True`` is ``pack_create``'s anchor write.
+        Everything else -- including the pack loader and every ordinary
+        ``ontology_add_node``/REST call -- leaves it at the default False.
 
         Parameters
         ----------
@@ -94,9 +109,12 @@ class OntologyBuilder:
         Raises
         ------
         ValueError
-            If the space/node_type combination is invalid.
+            If the space/node_type combination is invalid, or (when
+            ``pack_anchor=True``) the call does not match the pack's own
+            anchor shape.
         """
         from opencrab.auth import current_principal
+        from opencrab.pack.ownership import PACK_STATUS_CREATING, anchor_node_id
 
         # The gate, in this order and no other (#148). Stamping must run
         # BEFORE canonicalize_pack_alias: that helper rewrites pack tags in
@@ -105,7 +123,28 @@ class OntologyBuilder:
         # `stamp` returns a NEW dict -- unlike the pre-#148 code this no longer
         # mutates the caller's properties.
         principal = current_principal()
-        authorize(self._sql, principal, pack_id)
+        if pack_anchor:
+            # Shape check BEFORE authorize (#170): a caller whose request
+            # doesn't even look like an anchor write must not learn anything
+            # about the pack's authorization state first. Checked against
+            # this call's OWN pack_id only -- never another pack's -- so the
+            # error message cannot leak anything about a different pack.
+            expected_node_id = anchor_node_id(pack_id)
+            mismatches = []
+            if space != "resource":
+                mismatches.append(f"space must be 'resource', got {space!r}")
+            if node_type != "Dataset":
+                mismatches.append(f"node_type must be 'Dataset', got {node_type!r}")
+            if node_id != expected_node_id:
+                mismatches.append("node_id does not match this pack's anchor id")
+            if mismatches:
+                raise ValueError(
+                    "pack_anchor=True requires this pack's own anchor node "
+                    "shape: " + "; ".join(mismatches)
+                )
+            authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
+        else:
+            authorize(self._sql, principal, pack_id)
         props = stamp(
             properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED,
             origin=origin,
