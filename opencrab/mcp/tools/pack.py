@@ -1105,13 +1105,33 @@ def pack_create(
 
     # graph_landed is True here, either from the direct check above or from
     # the re-probe's ANCHOR_GRAPH verdict.
-    if not mark_pack_ready(ctx["sql"], slug, subject_id):
+    try:
+        finalized = mark_pack_ready(ctx["sql"], slug, subject_id)
+    except Exception:
+        # The registry can be briefly unreachable (locked SQLite, a dropped
+        # connection) with the graph anchor already committed. Letting that
+        # propagate would abandon the call OUTSIDE this function's response
+        # contract: the caller would get an exception instead of the
+        # assigned pack_id -- which after slug suffixing they cannot
+        # reconstruct -- while the row sits in 'creating'. Fall into the
+        # reconciliation below instead, which re-reads the row and is
+        # already written for exactly this question ("the transition's
+        # outcome is unknown, what IS the row now?"). If the UPDATE did land
+        # before the raise, the re-read sees 'ready' and this call continues
+        # normally.
+        logger.warning(
+            "pack_create: finalizing pack_id=%s raised; reconciling", slug,
+            exc_info=True,
+        )
+        finalized = False
+
+    if not finalized:
         # mark_pack_ready only matches a row that is STILL 'creating' and
-        # STILL owned by subject_id (see its own docstring). No branch
-        # above this point has deleted or reassigned this row, so every
-        # sub-case below is reachable only through an operator's manual SQL
-        # or a repair-pass race, never through this function's own control
-        # flow (design v4 §3.5).
+        # STILL owned by subject_id (see its own docstring). Reaching here
+        # therefore means either that call raised (above) or another actor
+        # moved the row -- no branch above this point deletes or reassigns
+        # it, so this function's own control flow never produces the
+        # sub-cases below (design v4 §3.5).
         try:
             row = get_pack(ctx["sql"], slug)
         except Exception as exc:
@@ -1212,23 +1232,40 @@ def pack_create(
             )
 
         if row["status"] != PACK_STATUS_READY:
-            # Still ours but not 'ready'. mark_pack_ready not matching, plus
-            # ownership matching, means this can only be 'partial' already
-            # (a 'creating' row owned by us would have matched
-            # mark_pack_ready's WHERE). Some other actor -- a repair-pass
-            # demotion racing in, or an operator -- made that call with
-            # information this function does not have; design v4 §9
-            # (fable r3 P3-3) rejected self-promotion here on purpose, so
-            # this confirms/keeps the demotion rather than overruling it.
-            try:
-                mark_pack_partial(ctx["sql"], slug, subject_id)
-            except Exception:
-                pass
+            # Still ours but not 'ready', and WHICH not-ready decides the
+            # action -- the two get here for opposite reasons.
+            #
+            # 'creating' and ours is the state mark_pack_ready's own WHERE
+            # matches, so it cannot be a rejection: the attempt above raised
+            # before landing. Nobody else has said anything about this pack,
+            # and the anchor is confirmed in graph, so the repair pass will
+            # promote it on its next run. Demoting it here would trade that
+            # self-healing row for a 'partial' one, which repair deliberately
+            # never touches -- turning a transient registry blip into work
+            # that waits for a human. Leave it and say so.
+            #
+            # 'partial' means some other actor -- a repair-pass demotion, an
+            # operator -- reached a conclusion with information this call
+            # does not have. Design v4 §9 rejected self-promotion here on
+            # purpose, so that conclusion is confirmed rather than overruled.
+            if row["status"] != PACK_STATUS_CREATING:
+                try:
+                    mark_pack_partial(ctx["sql"], slug, subject_id)
+                except Exception:
+                    pass
+                detail = (
+                    f"was moved to status={row['status']!r} by another "
+                    f"process before this call could finalize it"
+                )
+            else:
+                detail = (
+                    "could not be marked ready (the registry write did not "
+                    "go through); its graph anchor is confirmed, so "
+                    "'packs repair-registry' will promote it"
+                )
             return _pack_error(
                 ctx, slug, subject_id,
-                f"pack '{slug}' was moved to status={row['status']!r} by "
-                f"another process before this call could finalize it; "
-                f"ingest skipped.",
+                f"pack '{slug}' {detail}; ingest skipped.",
             )
 
         # row["status"] == "ready" and it is ours: a repair pass (or an

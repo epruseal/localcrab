@@ -648,3 +648,61 @@ class TestFailureResponseNamesTheRetainedPack:
         assert result["registry_status"] is None  # mallory's row, withheld
         # The operator still gets the real cause, server-side.
         assert any("already " in r.message or "already" in str(r.args) for r in caplog.records)
+
+    def test_a_raising_finalize_still_answers_and_leaves_the_row_promotable(self, sql):
+        """A registry blip while finalizing must not abandon the response.
+
+        The graph anchor is already committed when ``mark_pack_ready`` runs,
+        so a locked or briefly unreachable registry raises with the pack half
+        made. Letting that propagate would hand the caller an exception
+        instead of the assigned id -- which after slug suffixing they cannot
+        reconstruct -- and leave the row in ``creating`` with nothing said
+        about it.
+
+        The row is deliberately NOT demoted here. It is still ``creating``
+        and still ours, its anchor is confirmed, and that is exactly what the
+        repair pass promotes on its own; demoting would swap a self-healing
+        row for a ``partial`` one that repair never touches, so a transient
+        blip would become work waiting on a human."""
+        ctx = _base_ctx(sql)
+
+        import opencrab.pack.ownership as ownership_mod
+
+        with patch.object(
+            ownership_mod, "mark_pack_ready", side_effect=RuntimeError("database is locked")
+        ):
+            result = _create(ctx, title="Blip", pack_id="blip-pack")
+
+        # Answered, not raised -- and the id is in the answer.
+        assert result["pack_id"] == "blip-pack"
+        assert result["registry_status"] == "creating"
+        assert "repair-registry" in result["error"]
+        assert "ingest skipped" in result["error"]
+
+        # Left promotable rather than demoted.
+        assert get_pack(sql, "blip-pack")["status"] == "creating"
+
+    def test_a_finalize_that_raised_after_landing_is_reconciled_as_success(self, sql):
+        """The other half of the same unknown: the UPDATE went through and
+        the raise came after. The re-read finds 'ready', so the call carries
+        on as if the transition had reported success -- which it did."""
+        ctx = _base_ctx(sql)
+
+        def _land_then_raise(sql_, pack_id, owner_id):
+            from sqlalchemy import text
+
+            with sql_._engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE packs SET status = 'ready' WHERE pack_id = :p"),
+                    {"p": pack_id},
+                )
+            raise RuntimeError("connection dropped after commit")
+
+        import opencrab.pack.ownership as ownership_mod
+
+        with patch.object(ownership_mod, "mark_pack_ready", side_effect=_land_then_raise):
+            result = _create(ctx, title="Landed", pack_id="landed-pack")
+
+        assert "error" not in result, result
+        assert result["pack_id"] == "landed-pack"
+        assert get_pack(sql, "landed-pack")["status"] == PACK_STATUS_READY
