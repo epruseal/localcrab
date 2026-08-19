@@ -599,20 +599,29 @@ def test_probe_methods_exist_on_every_real_store_backend():
             try:
                 mod = importlib.import_module(mod_name)
             except ImportError as exc:
-                # The only tolerated miss: a third-party driver this env does
-                # not have. A driver-gated backend failing on one of OUR OWN
-                # modules is breakage wearing the same exception, so the
-                # missing module's name decides, not the exception type.
+                # Skipping is allowed only when the miss is POSITIVELY
+                # identified as a third-party driver: a named module that is
+                # not one of ours. Everything else fails, including an
+                # ImportError carrying no `name` at all -- "I could not tell
+                # what was missing" must not read as "an optional driver was
+                # missing", the same fail-closed rule `_probe_one` applies to
+                # an attribution it cannot read. `raise ImportError` without a
+                # name appears nowhere in this package and the import
+                # machinery always sets one, so this costs nothing today; if
+                # some driver ever raises a bare ImportError of its own, add
+                # it here deliberately rather than letting the blanket
+                # swallow it.
                 missing = getattr(exc, "name", None) or ""
                 assert mod_name not in always_importable, (
                     f"{mod_name} needs no third-party driver but failed to "
                     f"import ({exc!r}) -- this is breakage, not a missing "
                     f"driver, and must not shrink this test's coverage"
                 )
-                assert not missing.startswith("opencrab"), (
-                    f"{mod_name} failed to import because {missing!r} is "
-                    f"missing -- that is one of our own modules, not an "
-                    f"optional driver"
+                assert missing and not missing.startswith("opencrab"), (
+                    f"{mod_name} failed to import ({exc!r}); missing module "
+                    f"{missing!r} is not identifiable as a third-party "
+                    f"driver, so this backend is NOT being skipped -- an "
+                    f"unidentifiable import failure must not shrink coverage"
                 )
                 continue
             cls = getattr(mod, cls_name, None)
