@@ -379,8 +379,10 @@ def repair_incomplete_packs(
             else:
                 entry["action"] = "skipped (unverifiable)"
                 entry["reason"] = (
-                    "graph store probe was inconclusive (unavailable, missing "
-                    "method, or raised) -- fail-closed, no action taken"
+                    "graph store probe was inconclusive (store unavailable, "
+                    "probe method missing, the call raised, or a row was "
+                    "returned whose pack_id could not be read) -- fail-closed, "
+                    "no action taken"
                 )
                 counts["skipped"] += 1
         else:
@@ -421,17 +423,22 @@ def repair_incomplete_packs(
                 if applied:
                     promote_result["status"] = PACK_STATUS_READY
                 else:
-                    # promote_partial_pack's WHERE only matches `partial`, so
-                    # a `creating` target (or one that changed underneath us)
-                    # comes back False with nothing to show for it. Report the
-                    # status we actually observed rather than asserting what it
-                    # must have been -- the row can move between the read above
-                    # and the UPDATE, and a fixed "it was not partial" would
-                    # then be a claim we never checked.
+                    # promote_partial_pack's WHERE pins both `partial` and the
+                    # owner, so False means one of those did not hold. Which
+                    # one is not knowable from the return value, and the row
+                    # may have moved again since -- so report the status read
+                    # BEFORE the update and the status now, separately
+                    # labelled, instead of asserting a cause. A fixed "it was
+                    # not partial" would be a claim never checked, and quoting
+                    # only the earlier read would misdescribe a row that has
+                    # since changed.
+                    current = get_pack(sql, promote)
                     promote_result["reason"] = (
-                        f"no row transitioned: --promote only promotes a "
-                        f"{PACK_STATUS_PARTIAL!r} row, and this one read as "
-                        f"{target['status']!r} just before the update"
+                        f"no row transitioned: --promote requires a "
+                        f"{PACK_STATUS_PARTIAL!r} row owned by the same owner. "
+                        f"Status read before the update: {target['status']!r}; "
+                        f"status now: "
+                        f"{(current or {}).get('status', '<row gone>')!r}"
                     )
 
     return {

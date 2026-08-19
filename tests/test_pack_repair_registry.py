@@ -557,13 +557,14 @@ def test_probe_methods_exist_on_every_real_store_backend():
 
     graph_backends = [
         ("opencrab.stores.local_graph_store", "LocalGraphStore"),
-        ("opencrab.stores.pg_graph_store", "PgGraphStore"),
+        ("opencrab.stores.pg_graph_store", "PGGraphStore"),
         ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore"),
         ("opencrab.stores.neo4j_store", "Neo4jStore"),
     ]
     doc_backends = [
         ("opencrab.stores.local_doc_store", "LocalDocStore"),
         ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore"),
+        ("opencrab.stores.pg_doc_store", "PgDocStore"),
         ("opencrab.stores.mongo_store", "MongoStore"),
     ]
     vector_backends = [
@@ -574,13 +575,6 @@ def test_probe_methods_exist_on_every_real_store_backend():
 
     import importlib
 
-    def _resolve(mod_name, cls_name):
-        try:
-            mod = importlib.import_module(mod_name)
-        except ImportError:  # optional driver not installed in this env
-            return None
-        return getattr(mod, cls_name, None)
-
     checked = 0
     for group, method in (
         (graph_backends, "get_node"),
@@ -588,18 +582,32 @@ def test_probe_methods_exist_on_every_real_store_backend():
         (vector_backends, "get_by_id"),
     ):
         for mod_name, cls_name in group:
-            cls = _resolve(mod_name, cls_name)
-            if cls is None:
+            try:
+                mod = importlib.import_module(mod_name)
+            except ImportError:
+                # The only tolerated miss: an optional driver this env does
+                # not have installed. Anything else below is a real signal.
                 continue
+            cls = getattr(mod, cls_name, None)
+            # A missing class on a module that DID import is a rename, which
+            # is exactly what this test exists to catch -- so it fails here
+            # rather than skipping. Skipping is how the first version of this
+            # test quietly stopped checking one backend while staying green.
+            assert cls is not None, (
+                f"{mod_name} imported but has no {cls_name} -- renamed? "
+                f"(module defines: "
+                f"{sorted(n for n in vars(mod) if n[:1].isupper())})"
+            )
             assert callable(getattr(cls, method, None)), (
                 f"{cls_name}.{method} is gone -- opencrab.pack.lifecycle."
                 f"probe_anchor calls it and would silently degrade every "
                 f"re-probe to 'unknown'"
             )
             checked += 1
-    # Guard against the loop above quietly checking nothing (every import
-    # failing, a renamed module) and reporting success.
-    assert checked >= 6, f"only {checked} backends resolved; the contract went unchecked"
+    # Backstop for the whole list going unresolvable (a package rename making
+    # every import fail). The floor is the count of backends that need no
+    # optional driver: local graph, local doc, local SQL doc.
+    assert checked >= 3, f"only {checked} backends resolved; the contract went unchecked"
     assert lifecycle.probe_anchor is not None
 
 
