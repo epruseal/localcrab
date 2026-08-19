@@ -1268,6 +1268,108 @@ def packs_backfill_pack_id(
         )
 
 
+def _optional_store(cfg: Any, kind: str) -> Any:
+    """Build one content store for ``packs repair-registry``, or ``None``.
+
+    Construction itself can raise (a vector backend whose embedding backend
+    does not match it, a driver that is not installed). For this command that
+    must not be fatal: every probe treats a missing store as "cannot tell",
+    which the repair pass reports as a skip, so a store that will not open
+    costs precision rather than the whole run. Returning ``None`` says exactly
+    what happened -- there is no store to ask.
+    """
+    try:
+        return getattr(_make_stores(cfg, **{kind: True}), kind)
+    except Exception as exc:  # noqa: BLE001 -- a store we cannot build is one we cannot ask
+        console.print(
+            f"[yellow]{kind} store unavailable ({type(exc).__name__}); "
+            f"rows needing it will be reported as unverifiable.[/yellow]"
+        )
+        return None
+
+
+@packs.command("repair-registry")
+@click.option(
+    "--older-than",
+    "older_than_seconds",
+    # Non-negative only. A negative threshold is not a wider window, it is NO
+    # window: every row that is not dated in the future compares as older, so
+    # the pass would act on a `creating` row that a pack_create is holding
+    # right now and demote a pack mid-creation. That threshold is the only
+    # thing keeping this pass off in-flight rows, and a typed minus sign
+    # should not be able to remove it.
+    type=click.IntRange(min=0),
+    default=3600,
+    show_default=True,
+    help=(
+        "Only act on incomplete rows whose updated_at is at least this many "
+        "seconds old. 0 acts on every incomplete row regardless of age, "
+        "including any a pack_create is holding right now -- use it only with "
+        "pack writes stopped."
+    ),
+)
+@click.option(
+    "--promote",
+    "promote_pack_id",
+    default=None,
+    help="Promote exactly this one partial pack to ready (requires a positive graph-anchor probe).",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply changes. Without this flag the command runs in dry-run mode.",
+)
+def packs_repair_registry(
+    older_than_seconds: int,
+    promote_pack_id: str | None,
+    apply_changes: bool,
+) -> None:
+    """Repair stale ``creating``/``partial`` registry rows (default dry-run).
+
+    Never deletes a registry row (#170, design v4 §3.0): a stale
+    ``creating`` row is promoted to ``ready`` when its graph anchor probes
+    present, demoted to ``partial`` when the anchor probes positively
+    absent, or left alone when the graph store cannot be asked. ``partial``
+    rows get no automatic action -- only ``--promote PACK_ID`` can move one,
+    exactly one at a time, and only when its graph anchor is confirmed
+    present. See ``opencrab.pack.lifecycle.repair_incomplete_packs`` for the
+    full policy and its rationale.
+    """
+    from opencrab.config import get_settings
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    cfg = get_settings()
+    # The registry itself is this command's subject, so a store it cannot open
+    # is a hard failure. The three content stores are not: they only feed
+    # `probe_anchor`, which already answers `unknown` for a store it cannot
+    # ask, and `repair_incomplete_packs` turns that into "skipped". Building
+    # them eagerly would make the recovery command refuse to start in exactly
+    # the degraded state it exists for -- a vector backend that raises on
+    # construction (a mismatched embedding backend, an uninstalled driver)
+    # would block a repair whose decision rests only on the graph probe.
+    sql = _make_stores(cfg, sql=True).sql
+    graph = _optional_store(cfg, "graph")
+    doc = _optional_store(cfg, "doc")
+    vector = _optional_store(cfg, "vector")
+    summary = repair_incomplete_packs(
+        sql,
+        graph,
+        doc,
+        vector,
+        older_than_seconds=older_than_seconds,
+        apply=apply_changes,
+        promote=promote_pack_id,
+    )
+
+    console.print_json(json.dumps(summary, ensure_ascii=False, default=str))
+    if not apply_changes:
+        console.print(
+            "[dim]Dry-run only. Re-run with --apply to persist these changes.[/dim]"
+        )
+
+
 @packs.command("reindex-bm25")
 def packs_reindex_bm25() -> None:
     """Rebuild the BM25 cache once (escape hatch; lazy rebuild is the default)."""

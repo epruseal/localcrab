@@ -33,6 +33,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Literal
 
+from opencrab.pack.ownership import PACK_STATUS_READY
+
 if TYPE_CHECKING:
     from opencrab.auth import Principal
 
@@ -143,14 +145,33 @@ def stamp(
     return out
 
 
-def authorize(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:
+def authorize(
+    sql: Any,
+    principal: Principal,
+    pack_id: str,
+    *,
+    allowed_statuses: tuple[str, ...] = (PACK_STATUS_READY,),
+) -> dict[str, Any]:
     """Owner-only write authorization for ``pack_id``.
 
     Thin pass-through to ``assert_writable`` so writers depend on the gate
     rather than reaching into the registry themselves. Raises
-    ``PackNotFoundError`` for a missing pack AND for someone else's private
-    pack (#143 invariant 7 -- the two must be indistinguishable), and
-    ``PackForbiddenError`` for a visible pack owned by someone else.
+    ``PackNotFoundError`` for a missing pack, for a pack whose ``status`` is
+    not in ``allowed_statuses`` (#170), AND for someone else's private pack
+    (#143 invariant 7 -- all three must be indistinguishable), and
+    ``PackForbiddenError`` for a visible, status-eligible pack owned by
+    someone else.
+
+    ``allowed_statuses`` defaults to ready-only. Lifecycle-readiness
+    checking lives HERE, at the gate, rather than at each tool boundary
+    (``pack_ingest``, ``ontology_add_node``, REST ``/api/nodes``, ...) --
+    this module's own docstring already records why: a hand-maintained list
+    of "places to guard" has missed one every time this codebase tried it.
+    Putting the default here means every writer that goes through
+    ``authorize`` is ready-only unless it explicitly widens the set (today,
+    only ``OntologyBuilder.add_node``'s ``pack_anchor`` path does, and only
+    to ``('creating',)``), instead of depending on every future call site
+    remembering to check status itself.
 
     Fails closed when the registry is unreachable: without it there is no
     way to decide ownership, and "cannot check" must never mean "allowed".
@@ -162,7 +183,7 @@ def authorize(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:
         )
     from opencrab.pack.ownership import assert_writable
 
-    return assert_writable(sql, principal, pack_id)
+    return assert_writable(sql, principal, pack_id, allowed_statuses=allowed_statuses)
 
 
 # ---------------------------------------------------------------------------

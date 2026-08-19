@@ -12,11 +12,23 @@ Function signatures mirror ``opencrab/auth.py``'s: every function takes
 ``sql`` (a ``SQLStore``) as its first argument and issues its own
 short-lived connection/transaction -- no ORM session to thread through
 call sites, same as every other ``opencrab.auth`` function.
+
+**``status == 'ready'`` is NOT proof an anchor exists (#170, design v4
+§3.2).** ``ready`` has two different producers with two different meanings:
+a pack that went through the ``creating`` -> ``ready`` (or ``partial`` ->
+``ready``) lifecycle really does have a graph anchor node, but a pack
+registered by ``ensure_default_pack`` (the default pack) or by the
+ownership-migration script never goes through that lifecycle at all -- it
+is inserted straight into ``ready`` because those registrations have no
+anchor concept to begin with (see each of those two functions' own
+docstrings). No code anywhere may treat ``status == 'ready'`` as "this
+pack's anchor node is in the graph".
 """
 
 from __future__ import annotations
 
 import secrets
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -24,10 +36,29 @@ if TYPE_CHECKING:
 
 VISIBILITIES = ("private", "public-read", "public-fork")
 
+# Registry lifecycle states (#170, design v4 §3.2). ``ready`` is the
+# absorbing state: nothing transitions out of it, and nothing transitions
+# back into ``creating``. See ``begin_pack_creation``/``mark_pack_ready``/
+# ``mark_pack_partial``/``promote_partial_pack`` for the three transitions
+# that exist.
+PACK_STATUS_CREATING = "creating"
+PACK_STATUS_PARTIAL = "partial"
+PACK_STATUS_READY = "ready"
+PACK_STATUSES = (PACK_STATUS_CREATING, PACK_STATUS_PARTIAL, PACK_STATUS_READY)
+
 _SELECT_COLS = (
     "pack_id, owner_id, visibility, title, description, forked_from, "
-    "is_default, created_at, updated_at"
+    "is_default, status, created_at, updated_at"
 )
+
+
+def anchor_node_id(pack_id: str) -> str:
+    """The graph anchor node id convention for ``pack_id``'s existence.
+
+    팩의 존재 기준이 되는 graph 앵커 노드의 id 규약. ``pack_create`` 와 회수
+    작업이 같은 것을 보게 하려고 여기에 둔다.
+    """
+    return f"dataset:{pack_id}"
 
 # #148: default-pack id prefix + random suffix, mirroring create_pack's
 # collision-suffix shape -- never `default-{user_id}` (that string-convention
@@ -72,8 +103,9 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         # a real boolean -- normalize both to bool so callers never branch
         # on backend.
         "is_default": bool(row[6]),
-        "created_at": str(row[7]) if row[7] is not None else None,
-        "updated_at": str(row[8]) if row[8] is not None else None,
+        "status": row[7],
+        "created_at": str(row[8]) if row[8] is not None else None,
+        "updated_at": str(row[9]) if row[9] is not None else None,
     }
 
 
@@ -133,6 +165,7 @@ def _insert_pack(
     forked_from: str | None,
     *,
     conn: Any = None,
+    status: str = PACK_STATUS_READY,
 ) -> bool:
     """Attempt one INSERT. True on success, False if pack_id is already
     taken (PK violation). A plain SELECT-then-INSERT would race two
@@ -149,13 +182,22 @@ def _insert_pack(
     ``ensure_default_pack`` compose this into a caller-supplied transaction
     (e.g. ``create_user``'s single users+packs transaction) instead of
     committing on its own.
+
+    ``status`` (#170) is always named explicitly in the INSERT, never left
+    to the column's ``DEFAULT 'ready'``. The default has to stay
+    fail-open-shaped for the reverse-migration case (#151: an old source row
+    with no ``status`` column resolves to the target's default), which means
+    every *production* INSERT must say what it means instead of leaning on
+    that default -- see ``tests/test_packs_lifecycle_registry.py``'s INSERT
+    contract test.
     """
     from sqlalchemy import text
     from sqlalchemy.exc import IntegrityError
 
     stmt = text(
-        "INSERT INTO packs (pack_id, owner_id, visibility, title, description, forked_from) "
-        "VALUES (:pid, :oid, 'private', :title, :desc, :forked)"
+        "INSERT INTO packs (pack_id, owner_id, visibility, title, description, "
+        "forked_from, status) "
+        "VALUES (:pid, :oid, 'private', :title, :desc, :forked, :status)"
     )
     params = {
         "pid": pack_id,
@@ -163,6 +205,7 @@ def _insert_pack(
         "title": title,
         "desc": description,
         "forked": forked_from,
+        "status": status,
     }
     try:
         if conn is not None:
@@ -177,6 +220,111 @@ def _insert_pack(
         raise
 
 
+def _negotiate_pack_id(
+    sql: Any,
+    owner_id: str,
+    pack_id: str,
+    title: str | None,
+    description: str | None,
+    forked_from: str | None,
+    *,
+    status: str,
+) -> str:
+    """Shared slug-collision retry for ``create_pack``/``begin_pack_creation``
+    (#170) -- both need EXACTLY the same negotiation (see ``create_pack``'s
+    docstring for why the retry suffix is random, not sequential), and two
+    copies of that loop would be free to drift from each other. The only
+    thing that differs between the two callers is the ``status`` the row is
+    inserted with.
+
+    An INSERT that raises is reconciled here rather than propagated -- see the
+    ``except`` below for why an unknown outcome must not be read as "no row".
+    """
+    for candidate in _pack_id_candidates(pack_id):
+        # Evidence gathered BEFORE the attempt, because afterwards it cannot
+        # be. If the INSERT's outcome is lost, the only way to tell "my row
+        # landed" from "a row was already sitting here" is to know the id was
+        # free a moment ago -- owner and status alone cannot: a row this same
+        # owner left behind earlier, in this same status, matches both. See
+        # the except below for what adopting one would cost.
+        #
+        # This is a read-then-write pair, and what keeps it from racing is the
+        # same thing that keeps `pack_create`'s identity probe from racing:
+        # every `writes=True` MCP handler runs inside `dispatch_tool`'s
+        # exclusive `_write_lock()`, so a second creation cannot slip a commit
+        # between this read and the insert below. `pack_create` carries that
+        # flag, and both halves -- the flag and the lock actually being held
+        # around the handler -- are pinned in tests/test_pack_identity_guard.py.
+        # The residual is the same one that guard documents and does not
+        # solve: a file lock does not span hosts, so a multi-host deployment
+        # against one registry can still interleave here. Closing THAT would
+        # need per-attempt evidence the row itself carries (a creation token
+        # column), which is a schema change, not a tightening of this check.
+        was_absent = _row_absent(sql, candidate)
+        try:
+            landed = _insert_pack(
+                sql, candidate, owner_id, title, description, forked_from, status=status
+            )
+        except Exception:
+            # An INSERT that raises means the OUTCOME is unknown, not that no
+            # row exists: a commit can succeed and its acknowledgement still
+            # fail. Propagating blind would strand a committed row under an id
+            # NOBODY holds -- on a collision this function chose a random
+            # suffix the caller never sees, and while the row is `creating` it
+            # is absent from that owner's every listing, so nothing could
+            # reach it again.
+            #
+            # So re-read -- but only trust the answer where the id was free
+            # beforehand. Without that, a row the same owner had already left
+            # at this id in this same status would answer "ours" and be
+            # adopted, and the cost is not a wrong id in a message: the caller
+            # would go on to write this creation's anchor and content into
+            # that OLD pack, which keeps its old title and description, when
+            # it should have negotiated a suffixed slug and got a pack of its
+            # own.
+            if was_absent and _row_is_ours(sql, candidate, owner_id, status):
+                return candidate
+            raise
+        if landed:
+            return candidate
+    raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
+
+
+def _pack_id_candidates(pack_id: str) -> Iterator[str]:
+    """The requested slug, then random-suffixed retries (see ``create_pack``
+    for why the suffix is random rather than sequential)."""
+    yield pack_id
+    for _ in range(_MAX_RANDOM_ATTEMPTS):
+        yield f"{pack_id}-{secrets.token_hex(4)}"
+
+
+def _row_absent(sql: Any, pack_id: str) -> bool:
+    """Was this id free just now? ``False`` when a row is there OR when the
+    lookup itself failed -- an unreadable registry is not evidence of absence,
+    and this value's only job is to license a later claim.
+    """
+    try:
+        return get_pack(sql, pack_id) is None
+    except Exception:  # noqa: BLE001 -- no evidence is not evidence of absence
+        return False
+
+
+def _row_is_ours(sql: Any, pack_id: str, owner_id: str, status: str) -> bool:
+    """Did the INSERT whose answer we lost actually land as ours?
+
+    Ownership AND status must both match. A row under this id belonging to
+    someone else, or carrying a different status, is not the one this call was
+    making, and returning it would hand the caller a pack they do not own. A
+    re-read that itself fails answers ``False``: still unknown, so the original
+    exception stands.
+    """
+    try:
+        row = get_pack(sql, pack_id)
+    except Exception:  # noqa: BLE001 -- unknown stays unknown
+        return False
+    return bool(row and row["owner_id"] == owner_id and row["status"] == status)
+
+
 def create_pack(
     sql: Any,
     owner_id: str,
@@ -185,9 +333,16 @@ def create_pack(
     description: str | None = None,
     forked_from: str | None = None,
 ) -> str:
-    """Insert a new pack registry row owned by ``owner_id``. Returns the
-    pack_id actually assigned -- which may differ from the requested
-    ``pack_id``.
+    """Insert a new pack registry row owned by ``owner_id``, immediately
+    ``ready``. Returns the pack_id actually assigned -- which may differ
+    from the requested ``pack_id``.
+
+    For registering an ALREADY-COMPLETE pack that has no lifecycle to run
+    (the default pack, an ownership-migration row): there is no anchor to
+    wait for, so the row is ``ready`` from the moment it exists. A pack
+    that needs to run the ``creating`` -> ``ready``/``partial`` lifecycle
+    (anything with a graph anchor to land first) uses ``begin_pack_creation``
+    instead.
 
     When ``pack_id`` is already taken (by anyone, including another user),
     this quietly appends a random 8-hex-char suffix and retries rather than
@@ -204,13 +359,36 @@ def create_pack(
     saturated keyspace) and raises ``RuntimeError`` rather than looping
     forever -- no row is left behind by a failed call.
     """
-    if _insert_pack(sql, pack_id, owner_id, title, description, forked_from):
-        return pack_id
-    for _ in range(_MAX_RANDOM_ATTEMPTS):
-        candidate = f"{pack_id}-{secrets.token_hex(4)}"
-        if _insert_pack(sql, candidate, owner_id, title, description, forked_from):
-            return candidate
-    raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
+    return _negotiate_pack_id(
+        sql, owner_id, pack_id, title, description, forked_from, status=PACK_STATUS_READY
+    )
+
+
+def begin_pack_creation(
+    sql: Any,
+    owner_id: str,
+    pack_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    forked_from: str | None = None,
+) -> str:
+    """Reserve a pack_id in ``status='creating'`` -- the start of the
+    two-phase creation lifecycle (#170, design v4 §3.2/§3.5): the slug is
+    claimed here, before the caller has written the pack's graph anchor.
+    Until the anchor lands and the row is promoted (``mark_pack_ready``) or
+    the attempt is given up on (``mark_pack_partial``), the row is invisible
+    to every read path (``readable_pack_ids``/``list_packs_for`` filter on
+    ``status = 'ready'``) and unwritable through anything but the anchor
+    write itself (``write_gate.authorize``'s default ``allowed_statuses``
+    excludes ``creating``).
+
+    Same slug negotiation as ``create_pack`` (see its docstring) -- this is
+    the ``status='creating'`` sibling of that call, for a pack whose
+    completeness isn't known yet.
+    """
+    return _negotiate_pack_id(
+        sql, owner_id, pack_id, title, description, forked_from, status=PACK_STATUS_CREATING
+    )
 
 
 def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
@@ -226,6 +404,12 @@ def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
     collision suffix, and uniqueness-per-owner is enforced by
     ``idx_packs_one_default`` (the partial unique index migrated in
     ``sql_store.py``), not by anything in this function.
+
+    Registered ``status='ready'`` immediately (#170): the default pack has
+    no anchor-node lifecycle to run -- it is not a pack a caller "finishes
+    creating", it is the account's always-there pack -- so ``ready`` here
+    means only "visible and writable", not "this pack's anchor landed in
+    the graph" (see module docstring).
 
     ``conn`` (#148): when given (e.g. by ``opencrab.auth.create_user``, which
     must create the user row and its default pack in ONE transaction because
@@ -266,14 +450,14 @@ def _ensure_default_pack_on(sql: Any, owner_id: str, conn: Any) -> str:
     # arbiter. Keep these two predicates in sync if either ever changes.
     if sql._is_sqlite:
         insert_default = text(
-            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default) "
-            "VALUES (:pid, :oid, 'private', :title, 1) "
+            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default, status) "
+            "VALUES (:pid, :oid, 'private', :title, 1, 'ready') "
             "ON CONFLICT (owner_id) WHERE is_default = 1 DO NOTHING"
         )
     else:
         insert_default = text(
-            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default) "
-            "VALUES (:pid, :oid, 'private', :title, TRUE) "
+            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default, status) "
+            "VALUES (:pid, :oid, 'private', :title, TRUE, 'ready') "
             "ON CONFLICT (owner_id) WHERE is_default = TRUE DO NOTHING"
         )
 
@@ -325,41 +509,176 @@ def resolve_write_pack(sql: Any, principal: Principal, requested: str | None) ->
     return ensure_default_pack(sql, principal.user_id)
 
 
-def delete_pack_row(sql: Any, pack_id: str, owner_id: str) -> bool:
+def delete_pack_row(
+    sql: Any,
+    pack_id: str,
+    owner_id: str,
+    *,
+    only_status: tuple[str, ...] | None = None,
+) -> bool:
     """Delete ONE row from the ``packs`` registry table -- ``pack_id`` AND
     ``owner_id`` must both match (an owner can only ever remove their own
     row; this is not a general admin delete). Returns True iff a row was
     actually removed.
 
     Registry row only -- does NOT touch any graph/doc/sql/vector content
-    tagged with this pack_id. Currently used only as ``pack_create``'s
-    compensating delete when the anchor node it just registered a slug for
-    fails to actually land in the graph (#146, follow-up #170): a
-    registry row with no anchor would be a phantom pack. A full
-    ``pack_delete`` (removing content too) is a separate, not-yet-built
-    tool.
+    tagged with this pack_id. Used only as ``pack_create``'s compensating
+    delete for the ONE branch in this design that deletes at all (#170,
+    design v4 §3.0): an anchor identity conflict caught BEFORE
+    ``builder.add_node`` is ever called, where "no content exists" is
+    proven by control flow, not by a probe. After that first writer call,
+    a pack whose anchor cannot be confirmed is demoted with
+    ``mark_pack_partial`` instead -- never deleted. (Failures past a
+    CONFIRMED anchor -- an optional store rejecting it, or per-item ingest
+    errors -- leave the row ``ready`` and are reported only in the tool
+    response; see ``pack_create``'s docstring for that distinction.)
+    A full ``pack_delete`` (removing content too) is a separate,
+    not-yet-built tool.
+
+    ``only_status`` (#170): when given, the DELETE only matches rows whose
+    ``status`` is in this set -- ``AND status IN (...)``. Callers that
+    delete the ``creating`` row they themselves just reserved pass
+    ``('creating',)`` so a state change that raced in underneath them
+    (e.g. an operator's ``--promote``) is never clobbered by a stale
+    compensating delete. Omitted (``None``) keeps the old status-blind
+    behaviour.
     """
     from sqlalchemy import text
 
+    where = "pack_id = :pid AND owner_id = :oid"
+    params: dict[str, Any] = {"pid": pack_id, "oid": owner_id}
+    if only_status is not None:
+        placeholders = ", ".join(f":st{i}" for i in range(len(only_status)))
+        where += f" AND status IN ({placeholders})"
+        for i, st in enumerate(only_status):
+            params[f"st{i}"] = st
+
     with sql._engine.begin() as conn:
         result = conn.execute(
-            text("DELETE FROM packs WHERE pack_id = :pid AND owner_id = :oid"),
+            text(f"DELETE FROM packs WHERE {where}"),  # noqa: S608 -- where is a fixed shape, values are bound
+            params,
+        )
+        return result.rowcount > 0
+
+
+def mark_pack_ready(sql: Any, pack_id: str, owner_id: str) -> bool:
+    """``creating`` -> ``ready``. Returns True iff a row actually
+    transitioned.
+
+    The WHERE clause pins the FROM state (``status = 'creating'``) as well
+    as the TO state -- not just ``pack_id``/``owner_id`` -- so this can never
+    silently re-promote a row a concurrent ``mark_pack_partial`` (or an
+    operator's manual demotion) already moved out of ``creating``. That is
+    enforced by the predicate, not by caller discipline: a caller that races
+    this against another transition gets ``False``, not a corrupted state.
+    """
+    from sqlalchemy import text
+
+    from opencrab.execution._sql import now_expr
+
+    with sql._engine.begin() as conn:
+        result = conn.execute(
+            text(
+                f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
+                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
+            ),
             {"pid": pack_id, "oid": owner_id},
         )
         return result.rowcount > 0
 
 
-def readable_pack_ids(sql: Any, principal: Principal) -> set[str]:
-    """``{owner_id = principal} ∪ {visibility != 'private'}`` (#143
-    invariant 3). Always a concrete set -- there is no way to call this
-    and get back "everything, unfiltered"; that state must be
-    unrepresentable.
+def mark_pack_partial(sql: Any, pack_id: str, owner_id: str) -> bool:
+    """``creating`` -> ``partial``. Returns True iff a row actually
+    transitioned.
+
+    Same reasoning as ``mark_pack_ready``: the WHERE clause requires
+    ``status = 'creating'`` so an already-``ready`` row can never be
+    demoted by this call -- a stale/late compensating call landing after
+    the pack already finished successfully is a no-op, not a regression.
+    """
+    from sqlalchemy import text
+
+    from opencrab.execution._sql import now_expr
+
+    with sql._engine.begin() as conn:
+        result = conn.execute(
+            text(
+                f"UPDATE packs SET status = 'partial', updated_at = {now_expr(sql)} "
+                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
+            ),
+            {"pid": pack_id, "oid": owner_id},
+        )
+        return result.rowcount > 0
+
+
+def promote_partial_pack(sql: Any, pack_id: str, owner_id: str) -> bool:
+    """``partial`` -> ``ready``. Returns True iff a row actually
+    transitioned.
+
+    Operator-explicit-action only (the ``packs repair-registry --promote``
+    CLI path) -- the CALLER must confirm the graph anchor positively exists
+    for this pack before calling this. This function only performs the
+    status flip; it does not (and cannot, from here) verify the anchor.
+
+    Same WHERE-pins-the-FROM-state reasoning as the other two transitions:
+    ``status = 'partial'`` means a ``creating`` row can never be
+    accidentally promoted by this call -- only a row someone already gave
+    up on.
+    """
+    from sqlalchemy import text
+
+    from opencrab.execution._sql import now_expr
+
+    with sql._engine.begin() as conn:
+        result = conn.execute(
+            text(
+                f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
+                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'partial'"
+            ),
+            {"pid": pack_id, "oid": owner_id},
+        )
+        return result.rowcount > 0
+
+
+def list_incomplete_packs(sql: Any) -> list[dict[str, Any]]:
+    """Every registry row whose ``status`` is not ``ready`` -- the
+    ``packs repair-registry`` CLI's candidate set. Unscoped by owner (this
+    is an operator tool, not a principal-facing read path) and expected to
+    be structurally tiny: a healthy deployment never accumulates more than
+    a handful of ``creating``/``partial`` rows at once.
     """
     from sqlalchemy import text
 
     with sql._engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT pack_id FROM packs WHERE owner_id = :uid OR visibility != 'private'"),
+            text(f"SELECT {_SELECT_COLS} FROM packs WHERE status <> 'ready'")  # noqa: S608
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def readable_pack_ids(sql: Any, principal: Principal) -> set[str]:
+    """``{status = 'ready'} ∩ ({owner_id = principal} ∪ {visibility != 'private'})``
+    (#143 invariant 3, narrowed by #170). Always a concrete set -- there is
+    no way to call this and get back "everything, unfiltered"; that state
+    must be unrepresentable.
+
+    The parentheses around the owner/visibility disjunction are load-bearing,
+    not stylistic: SQL's ``AND`` binds tighter than ``OR``, so
+    ``status = 'ready' AND owner_id = :uid OR visibility != 'private'``
+    (no parens) would parse as
+    ``(status = 'ready' AND owner_id = :uid) OR (visibility != 'private')``
+    -- every public pack leaking through regardless of its status, a
+    fail-open hole in exactly the row class (``creating``/``partial``) this
+    filter exists to hide.
+    """
+    from sqlalchemy import text
+
+    with sql._engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT pack_id FROM packs "
+                "WHERE status = 'ready' AND (owner_id = :uid OR visibility != 'private')"
+            ),
             {"uid": principal.user_id},
         ).fetchall()
     return {r[0] for r in rows}
@@ -369,6 +688,10 @@ def list_packs_for(sql: Any, principal: Principal) -> list[dict[str, Any]]:
     """Full registry rows readable by ``principal`` -- same predicate as
     ``readable_pack_ids``, kept as one query instead of N ``get_pack``
     round-trips.
+
+    See ``readable_pack_ids`` for why the parentheses around the
+    owner/visibility disjunction are load-bearing (operator precedence,
+    not style).
     """
     from sqlalchemy import text
 
@@ -376,27 +699,57 @@ def list_packs_for(sql: Any, principal: Principal) -> list[dict[str, Any]]:
         rows = conn.execute(
             text(
                 f"SELECT {_SELECT_COLS} FROM packs "  # noqa: S608
-                "WHERE owner_id = :uid OR visibility != 'private'"
+                "WHERE status = 'ready' AND (owner_id = :uid OR visibility != 'private')"
             ),
             {"uid": principal.user_id},
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
-def assert_writable(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:
-    """Raise unless ``principal`` owns ``pack_id``. Returns the pack row on
-    success (saves the caller a second ``get_pack`` call).
+def assert_writable(
+    sql: Any,
+    principal: Principal,
+    pack_id: str,
+    *,
+    allowed_statuses: tuple[str, ...] = (PACK_STATUS_READY,),
+) -> dict[str, Any]:
+    """Raise unless ``principal`` owns ``pack_id`` AND its ``status`` is one
+    of ``allowed_statuses``. Returns the pack row on success (saves the
+    caller a second ``get_pack`` call).
 
-    - No such row, OR a private row owned by someone else -> ``PackNotFoundError``.
-      The two must be indistinguishable to the caller (#143 invariant 7).
-    - A visible (public-read/public-fork) row owned by someone else ->
-      ``PackForbiddenError``. Safe to distinguish from "not found" because the
-      pack's existence is already observable to anyone (it shows up in
-      ``content_pack_list``).
-    - Owned by ``principal`` (any visibility) -> returns the row.
+    The status check runs FIRST -- immediately after the ``pack is None``
+    check, before the owner/visibility branches -- and on failure raises
+    ``PackNotFoundError`` regardless of ownership (#170, design v4 §3.3). An
+    incomplete pack (``creating``/``partial``) must be unobservable, full
+    stop: if it instead raised ``PackForbiddenError`` for a non-owner it
+    would confirm the pack's existence to someone who has no business
+    knowing a slug is in use (#143 invariant 7, "존재 누출 금지" -- the same
+    invariant that already folds "no such row" and "someone else's private
+    row" into one exception below).
+
+    ``allowed_statuses`` is a set, not a boolean flag, because the one path
+    that needs anything other than the default is narrow: only the pack's
+    own anchor write, while the pack is ``creating``
+    (``allowed_statuses=('creating',)`` -- see
+    ``OntologyBuilder.add_node``'s ``pack_anchor`` parameter). A boolean
+    "allow incomplete too" would also open the door for ``partial``, which
+    must stay closed to every writer including the owner.
+
+    - No such row, OR its status is not in ``allowed_statuses``, OR it is a
+      private row owned by someone else -> ``PackNotFoundError``. All three
+      must be indistinguishable to the caller (#143 invariant 7).
+    - A ``ready``-eligible visible (public-read/public-fork) row owned by
+      someone else -> ``PackForbiddenError``. Safe to distinguish from "not
+      found" because the pack's existence is already observable to anyone
+      (it shows up in ``content_pack_list``, which only ever lists ``ready``
+      rows).
+    - Owned by ``principal`` (any visibility) and status-eligible -> returns
+      the row.
     """
     pack = get_pack(sql, pack_id)
     if pack is None:
+        raise PackNotFoundError(pack_id)
+    if pack["status"] not in allowed_statuses:
         raise PackNotFoundError(pack_id)
     if pack["owner_id"] == principal.user_id:
         return pack

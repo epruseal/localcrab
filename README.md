@@ -177,6 +177,9 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
 | `opencrab packs backfill-pack-id` | 노드·엣지에 `pack_id` 역보충 |
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
+| `opencrab packs repair-registry` | 생성이 끝나지 않은 팩 등록부 행을 판정·해소 (`--older-than`, `--promote`, `--apply`)[^repair] |
+
+[^repair]: 등록부 행과 팩 콘텐츠는 한 트랜잭션이 아니라, 그 사이에서 프로세스가 죽으면 `ready` 에 도달하지 못한 행이 남습니다. 이 명령은 graph 앵커를 실제로 조회해 판정합니다: 앵커가 있으면 `ready` 로 승격하고, 앵커가 없음이 확인되면 `partial` 로 강등하며, 스토어를 조회할 수 없으면 아무것도 하지 않습니다. **어떤 경우에도 등록부 행을 지우지 않습니다** — 콘텐츠가 실제로 안착한 팩의 행을 지우면 `assert_registry_covers_graph` 가 다음 기동을 거부하기 때문입니다. `--apply` 없이는 계획만 출력합니다. `partial` 행은 자동으로 손대지 않고, 운영자가 `--promote <pack_id> --apply` 로 지목해야 승격하며 이때도 graph 앵커가 확인될 때만 승격합니다.
 
 [^media]: easyocr/torch는 기본 pip extra에 포함되지 않습니다. 별도 설치 필요: `pip install -r requirements/localcrab-media.txt`.
 

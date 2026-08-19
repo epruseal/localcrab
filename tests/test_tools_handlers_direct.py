@@ -717,13 +717,22 @@ class TestIngestIntoPack:
 
 class TestPackCreate:
     def test_normal_creates_anchor_with_no_content(self):
+        """#170: mark_pack_ready/mark_pack_partial/delete_pack_row all read
+        ``result.rowcount > 0`` on the connection they get from ``ctx["sql"]``
+        -- a bare ``MagicMock()`` cannot satisfy that comparison (``TypeError:
+        '>' not supported between instances of 'MagicMock' and 'int'``), so
+        this now needs a real in-memory SQLStore, same as the sibling tests
+        below that already used one for a different reason (#148)."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="My Pack", pack_id="my-pack")
         assert result["status"] == "ok"
@@ -823,16 +832,31 @@ class TestPackCreate:
         assert result["anchor_node"] == f"dataset:{result['pack_id']}"
 
     def test_error_anchor_node_write_failure(self):
+        """#170: an exception from the anchor write no longer deletes the
+        registry row -- it re-probes (finds nothing, since nothing ever
+        wrote) and demotes to 'partial'. The message text changed shape
+        (verdict-based, see pack.py's ANCHOR_* branch), so this now checks
+        substrings instead of full equality; the row-survives-as-partial
+        half is covered explicitly by TestPackCreatePostWriterFailureDemotion
+        below, kept out of this class to keep this one focused on the
+        response shape."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.side_effect = RuntimeError("graph down")
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert result == {"error": "anchor node failed: graph down"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write raised: graph down" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
 
     def test_error_anchor_node_store_failure_without_raising(self):
         """The anchor node write can also fail the way _ingest_into_pack's
@@ -840,34 +864,52 @@ class TestPackCreate:
         "error: ..." status inside stores. A missing/broken anchor means the
         pack doesn't really exist, so this must be a hard error, not a
         reported-as-created pack."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {
             "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
         }
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken Store", pack_id="broken-store-pack")
-        assert result == {"error": "anchor node failed: graph: error: disk I/O"}
+        # #170: verdict-based message, demoted not deleted -- see the
+        # write-failure test above for the full rationale.
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write did not confirm in graph: graph: error: disk I/O" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
 
     def test_error_anchor_node_graph_unavailable(self):
         """graph unavailable for the anchor write is also a failure — the
         anchor would land nowhere that counts even if docs/sql wrote."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {
             "stores": {"graph": "unavailable", "docs": "ok", "sql": "ok"}
         }
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="No Graph", pack_id="no-graph-pack")
-        assert result == {"error": "anchor node failed: graph: unavailable"}
+        # #170: verdict-based message, demoted not deleted -- see
+        # test_error_anchor_node_write_failure above for the full rationale.
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write did not confirm in graph: graph: unavailable" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
 
     def test_normal_anchor_optional_store_failure_still_reports_created(self):
         """graph write for the anchor succeeded but an optional store
@@ -876,15 +918,18 @@ class TestPackCreate:
         "partial" and the failed store surfaced in anchor_errors — not
         downgraded to the hard "anchor node failed" error, which would tell
         the caller to retry into a "pack already exists" dead end."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {
             "stores": {"graph": "ok", "docs": "error: mongo down", "sql": "ok"}
         }
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Partial Store", pack_id="partial-store-pack")
         assert "error" not in result
@@ -895,14 +940,17 @@ class TestPackCreate:
 
 
     def test_normal_with_text_materialises_evidence_node(self):
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         hybrid = MagicMock()
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid)
+            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Doc Pack", pack_id="doc-pack", text="some content")
         assert result["status"] == "ok"
@@ -928,15 +976,17 @@ class TestPackCreate:
         caller's server-derived principal (bound here via principal_scope
         instead of passed as a kwarg)."""
         from opencrab.auth import Principal, principal_scope
+        from opencrab.stores.sql_store import SQLStore
 
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing, sql=sql)
             mock_list.return_value = {"packs": []}
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 result = pack_create(
@@ -949,14 +999,17 @@ class TestPackCreate:
         to pack_id (its signature requires a non-None string). subject_id is
         the bind_test_principal fixture's principal (#145: no longer a
         client argument)."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing, sql=sql)
             mock_list.return_value = {"packs": []}
             pack_create(
                 title="Node Pack", pack_id="node-pack",
@@ -968,14 +1021,28 @@ class TestPackCreate:
         """#66/#105 review: a pack_create with no nodes/edges/text creates
         only the anchor node (a separate write, outside _ingest_into_pack) —
         there is nothing for _ingest_into_pack itself to have ingested, so it
-        must not fire a phantom on_ingest event for zero content."""
+        must not fire a phantom on_ingest event for zero content.
+
+        #170: a real SQLStore is used here too now (previously this test
+        happened to still pass with the default MagicMock sql only because
+        the unconfigured `builder` mock's add_node returns a bare MagicMock,
+        which is not a dict, so the anchor write is treated as unconfirmed,
+        triggers a re-probe, finds nothing, and tries to demote via
+        mark_pack_partial -- which raised TypeError on the mock sql and was
+        silently swallowed by pack_create's own try/except around that call.
+        The billing assertion below never depended on that swallowed
+        exception, but leaving it on a MagicMock sql made this test pass by
+        accident rather than by exercising real registry semantics)."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         billing = MagicMock()
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing, sql=sql)
             mock_list.return_value = {"packs": []}
             pack_create(title="Empty Pack", pack_id="empty-pack")
         billing.on_ingest.assert_not_called()
@@ -999,12 +1066,38 @@ class TestPackCreate:
         billing.on_ingest.assert_not_called()
 
 
-class TestPackCreateCompensatingDelete:
-    """#146 A: a failed anchor write must not leave a phantom registry row
-    behind (create_pack already inserted the packs row before the anchor is
-    attempted). Uses a real in-memory SQLStore -- not the MagicMock ``sql``
-    the class above uses -- so the registry-row-gone assertion actually
-    exercises ``delete_pack_row``'s SQL, not just the response shape."""
+class TestPackCreatePostWriterFailureDemotion:
+    """#146 A, rewritten for #170's two-phase lifecycle (design v4 §3.0):
+    once the anchor writer (builder.add_node) has actually been called, NO
+    failure of any kind deletes the registry row any more. A pack whose
+    anchor cannot be confirmed after that point ends in mark_pack_partial
+    instead.
+
+    The reason is timing, not enumeration: store_write_succeeded is
+    fail-closed, so a commit whose acknowledgement is lost reads as "not
+    landed", and a slow backend can still be about to commit when this
+    function has already decided. Deleting on that ambiguity orphans a
+    graph anchor that lands a moment later. (An earlier draft leaned on a
+    second reason -- that load.py's chunk loader wrote outside the write
+    gate, so "no anchor" never implied "pack is empty". #205 closed that
+    one; the timing reason is the one probing cannot close.)
+
+    "Cannot be confirmed" is the whole trigger, and it is narrower than
+    "something went wrong". Once the anchor IS confirmed the row goes to
+    ready and stays there; an optional store (docs/vector) rejecting the
+    anchor, or per-item ingest errors, only set the RESPONSE's own
+    "status" field to "partial". Two different fields, one word --
+    test_a_graph_success_keeps_registry_row_even_with_optional_failure
+    below pins both halves so the two cannot be conflated.
+
+    This class used to be named TestPackCreateCompensatingDelete
+    and asserted the opposite (row deleted) -- renamed and rewritten in
+    place rather than kept alongside a superseded twin, since the old
+    assertions describe behaviour that no longer exists.
+
+    Uses a real in-memory SQLStore -- not the MagicMock ``sql`` the class
+    above uses -- so the registry-row-state assertions actually exercise
+    mark_pack_partial's SQL, not just the response shape."""
 
     @staticmethod
     def _ctx(sql, builder):
@@ -1015,8 +1108,8 @@ class TestPackCreateCompensatingDelete:
 
         return SQLStore("sqlite:///:memory:")
 
-    def test_a1_anchor_exception_deletes_compensating_registry_row(self):
-        from opencrab.pack.ownership import get_pack
+    def test_a1_anchor_exception_demotes_registry_row_to_partial(self):
+        from opencrab.pack.ownership import PACK_STATUS_PARTIAL, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1028,13 +1121,19 @@ class TestPackCreateCompensatingDelete:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert result == {"error": "anchor node failed: graph down"}
-        assert get_pack(sql, "broken-pack") is None
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write raised: graph down" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
+        row = get_pack(sql, "broken-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_PARTIAL
 
-    def test_a2i_graph_available_write_failed_deletes_compensating_registry_row(self):
+    def test_a2i_graph_available_write_failed_demotes_registry_row_to_partial(self):
         """graph available but the write reports an "error: ..." status
-        (not raised) -- same compensation as the exception path."""
-        from opencrab.pack.ownership import get_pack
+        (not raised) -- same demotion as the exception path."""
+        from opencrab.pack.ownership import PACK_STATUS_PARTIAL, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1048,13 +1147,19 @@ class TestPackCreateCompensatingDelete:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken Store", pack_id="broken-store-pack")
-        assert result == {"error": "anchor node failed: graph: error: disk I/O"}
-        assert get_pack(sql, "broken-store-pack") is None
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write did not confirm in graph: graph: error: disk I/O" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
+        row = get_pack(sql, "broken-store-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_PARTIAL
 
-    def test_a2ii_graph_unavailable_deletes_compensating_registry_row(self):
+    def test_a2ii_graph_unavailable_demotes_registry_row_to_partial(self):
         """graph unavailable is also "did not land", distinct from an
-        "error: ..." status but compensated the same way."""
-        from opencrab.pack.ownership import get_pack
+        "error: ..." status but demoted the same way."""
+        from opencrab.pack.ownership import PACK_STATUS_PARTIAL, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1068,15 +1173,27 @@ class TestPackCreateCompensatingDelete:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="No Graph", pack_id="no-graph-pack")
-        assert result == {"error": "anchor node failed: graph: unavailable"}
-        assert get_pack(sql, "no-graph-pack") is None
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write did not confirm in graph: graph: unavailable" in result["error"]
+        assert "marked partial, not deleted" in result["error"]
+        row = get_pack(sql, "no-graph-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_PARTIAL
 
     def test_a_graph_success_keeps_registry_row_even_with_optional_failure(self):
-        """Once graph.add_node has actually succeeded the branch is
-        unreachable -- an optional-store-only failure (docs here) must
-        leave the registry row in place, never compensate-delete a pack
-        that really exists."""
-        from opencrab.pack.ownership import get_pack
+        """A confirmed graph anchor makes the pack real, so an
+        optional-store-only failure (docs here) must not move the registry
+        off 'ready' -- and must still surface in the RESPONSE as
+        status="partial".
+
+        Both halves are asserted because they are the pair the shared word
+        invites conflating. Asserting only that the row survives would let
+        a wrong mark_pack_partial through: the row would still be there,
+        and the response would still say "partial", just for the wrong
+        reason and with the pack now invisible to every read."""
+        from opencrab.pack.ownership import PACK_STATUS_READY, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1091,18 +1208,37 @@ class TestPackCreateCompensatingDelete:
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Partial Store", pack_id="partial-store-pack")
         assert "error" not in result
-        assert get_pack(sql, "partial-store-pack") is not None
+        # The response reports the optional-store damage...
+        assert result["status"] == "partial"
+        assert result["anchor_errors"] == ["docs: error: mongo down"]
+        # ...while the registry keeps the pack usable and visible.
+        row = get_pack(sql, "partial-store-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_READY
 
-    def test_a6_failed_bob_compensation_never_touches_alices_row(self):
-        """#146 A6: delete_pack_row's WHERE clause requires BOTH pack_id and
-        owner_id to match. Alice successfully owns "shared-pack"; Bob's
-        later attempt at the same title gets a random-suffixed slug (#146
-        B) whose anchor then fails -- the compensating delete must remove
-        only Bob's own row, never touch Alice's, in either creation order."""
+    def test_a6_failed_bobs_row_demotes_and_never_touches_alices_row(self):
+        """#146 A6, rewritten for #170: mark_pack_partial's WHERE clause
+        requires BOTH pack_id and owner_id to match (same guard shape
+        delete_pack_row used to have), so Bob's demotion still can only ever
+        touch his own row, never Alice's, in either creation order.
+
+        Order 2's "Bob fails first" half also changes under the new
+        contract: previously the compensating delete freed "shared-pack"
+        back up so Alice could claim that exact slug afterwards. Now
+        nothing deletes Bob's row -- it survives as 'partial' and keeps
+        occupying "shared-pack" -- so Alice's later attempt at the same
+        pack_id collides and gets a suffixed slug instead (#146 B's
+        quiet-suffix behaviour, same as any other taken slug). This is the
+        accepted tradeoff design v4 §3.0 names explicitly: a failed
+        'creating' attempt now consumes its slug, since nothing compensates
+        it away any more."""
+        from sqlalchemy import text as sa_text
+
         from opencrab.auth import Principal, principal_scope
-        from opencrab.pack.ownership import get_pack
+        from opencrab.pack.ownership import PACK_STATUS_PARTIAL, PACK_STATUS_READY, get_pack
 
-        # Order 1: Alice succeeds first, then Bob's attempt fails & compensates.
+        # Order 1: Alice succeeds first, then Bob's attempt (suffixed slug,
+        # since "shared-pack" is already taken) fails & demotes.
         sql = self._sql()
         good_builder = MagicMock()
         good_builder.add_node.return_value = {"stores": {"graph": "ok"}}
@@ -1128,12 +1264,24 @@ class TestPackCreateCompensatingDelete:
             with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
                 bob_result = pack_create(title="Shared", pack_id="shared-pack")
         assert "error" in bob_result
-        # Alice's real row survives Bob's failed+compensated attempt.
-        assert get_pack(sql, "shared-pack")["owner_id"] == "alice"
+        # Alice's real row survives Bob's failed+demoted attempt untouched.
+        alice_row = get_pack(sql, "shared-pack")
+        assert alice_row["owner_id"] == "alice"
+        assert alice_row["status"] == PACK_STATUS_READY
+        # Bob's own row is not deleted -- it exists, demoted, under whichever
+        # (suffixed) slug the collision negotiation gave him, never
+        # "shared-pack" itself.
+        with sql._engine.connect() as conn:
+            bob_rows = conn.execute(
+                sa_text("SELECT pack_id, status FROM packs WHERE owner_id = 'bob'")
+            ).fetchall()
+        assert len(bob_rows) == 1
+        assert bob_rows[0][0] != "shared-pack"
+        assert bob_rows[0][1] == PACK_STATUS_PARTIAL
 
-        # Order 2 (independent sql/registry): Bob fails first, then Alice
-        # creates successfully at the exact requested slug -- Bob's failed
-        # compensated attempt must not have poisoned the slug for Alice.
+        # Order 2 (independent sql/registry): Bob fails first and, with no
+        # prior collision, holds "shared-pack" itself -- demoted to
+        # 'partial' but NOT deleted, so it keeps occupying the slug.
         sql2 = self._sql()
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -1144,7 +1292,10 @@ class TestPackCreateCompensatingDelete:
             with principal_scope(Principal(user_id="bob", is_local=True, disabled=False)):
                 bob_first = pack_create(title="Shared", pack_id="shared-pack")
         assert "error" in bob_first
-        assert get_pack(sql2, "shared-pack") is None  # compensated away
+        bob_row = get_pack(sql2, "shared-pack")
+        assert bob_row is not None, "no delete past the writer call (#170 §3.0) -- the slug stays claimed"
+        assert bob_row["owner_id"] == "bob"
+        assert bob_row["status"] == PACK_STATUS_PARTIAL
 
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
@@ -1155,18 +1306,29 @@ class TestPackCreateCompensatingDelete:
             with principal_scope(Principal(user_id="alice", is_local=True, disabled=False)):
                 alice_after = pack_create(title="Shared", pack_id="shared-pack")
         assert "error" not in alice_after
-        assert alice_after["pack_id"] == "shared-pack"
-        assert get_pack(sql2, "shared-pack")["owner_id"] == "alice"
+        # Bob's stranded partial row still occupies "shared-pack" -- Alice
+        # is quietly suffixed instead of erroring (#143 invariant 7 / #146 B),
+        # same as any other collision.
+        assert alice_after["pack_id"] != "shared-pack"
+        assert alice_after["pack_id"].startswith("shared-pack-")
+        assert get_pack(sql2, "shared-pack")["owner_id"] == "bob"  # untouched
+        assert get_pack(sql2, alice_after["pack_id"])["owner_id"] == "alice"
 
-    def test_a7_compensating_delete_failure_returns_original_error_and_warns(self, caplog):
-        """#146 A7: SQL fault injection on the compensating delete itself --
-        delete_pack_row raising must not mask the real anchor failure with a
-        confusing delete-layer exception; the original error is still
-        returned, and the delete failure is logged as a WARNING so an
-        orphaned registry row can be found operationally."""
+    def test_a7_demotion_failure_returns_original_error_and_warns(self, caplog):
+        """#146 A7, rewritten for #170: the post-writer failure path calls
+        mark_pack_partial, not delete_pack_row (see this class's docstring)
+        -- delete_pack_row is only ever called from the pre-writer identity
+        conflict branch now (covered directly by
+        TestIdentityConflictDeletion in tests/test_pack_create_lifecycle.py),
+        so the SQL fault injection belongs on mark_pack_partial here
+        instead. mark_pack_partial raising must not
+        mask the real anchor failure with a confusing housekeeping
+        exception; the original error is still returned, and the demotion
+        failure is logged as a WARNING so a stuck 'creating' row can be
+        found operationally (by the repair pass or an operator)."""
         import logging
 
-        from opencrab.pack.ownership import get_pack
+        from opencrab.pack.ownership import PACK_STATUS_CREATING, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1175,7 +1337,7 @@ class TestPackCreateCompensatingDelete:
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
             patch(
-                "opencrab.pack.ownership.delete_pack_row",
+                "opencrab.pack.ownership.mark_pack_partial",
                 side_effect=RuntimeError("db exploded"),
             ),
             caplog.at_level(logging.WARNING),
@@ -1183,15 +1345,22 @@ class TestPackCreateCompensatingDelete:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert result == {"error": "anchor node failed: graph down"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
+        assert "anchor node write raised: graph down" in result["error"]
         assert any(
-            "compensating delete failed" in rec.message and "db exploded" in rec.message
+            "could not demote" in rec.message and "broken-pack" in rec.message
             for rec in caplog.records
         )
-        # The delete never actually ran (it was replaced with a raise), so
-        # the orphaned row is still there -- documents the real-world
-        # consequence of a failed compensation, not asserting it's "fine".
-        assert get_pack(sql, "broken-pack") is not None
+        # The demotion never actually ran (it was replaced with a raise), so
+        # the row is still stuck in 'creating' -- documents the real-world
+        # consequence of a failed demotion, not asserting it's "fine". A
+        # stuck 'creating' row is exactly what the repair pass surfaces to
+        # an operator.
+        row = get_pack(sql, "broken-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_CREATING
 
 
 # ---------------------------------------------------------------------------

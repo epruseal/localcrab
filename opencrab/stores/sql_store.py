@@ -116,6 +116,8 @@ _TABLES_SQL = [
         description  TEXT,
         forked_from  VARCHAR(256),
         is_default   BOOLEAN      NOT NULL DEFAULT FALSE,
+        status       VARCHAR(32)  NOT NULL DEFAULT 'ready'
+                     CHECK (status IN ('creating', 'partial', 'ready')),
         created_at   TIMESTAMPTZ  DEFAULT NOW(),
         updated_at   TIMESTAMPTZ  DEFAULT NOW()
     )
@@ -223,6 +225,8 @@ _TABLES_SQL_SQLITE = [
         description  TEXT,
         forked_from  TEXT,
         is_default   INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+        status       TEXT NOT NULL DEFAULT 'ready'
+                     CHECK (status IN ('creating', 'partial', 'ready')),
         created_at   TEXT DEFAULT (datetime('now')),
         updated_at   TEXT DEFAULT (datetime('now'))
     )
@@ -305,6 +309,7 @@ class SQLStore:
                 conn.execute(text(ddl))
         logger.debug("SQL tables ensured.")
         self._migrate_packs_is_default()
+        self._migrate_packs_status()
 
     def _migrate_packs_is_default(self) -> None:
         """Additive migration for pre-#148 ``packs`` tables that predate the
@@ -401,6 +406,152 @@ class SQLStore:
                         "ON packs (owner_id) WHERE is_default = TRUE"
                     )
                 )
+
+    def _migrate_packs_status(self) -> None:
+        """Additive migration for pre-#170 ``packs`` tables that predate the
+        ``status`` column, run right after :meth:`_migrate_packs_is_default`
+        for the same reason that one runs after the static DDL loop: a
+        from-scratch DB already has the column (the CREATE TABLE above
+        covers it) so this is a cheap no-op there, and only an existing DB
+        needs the ALTER.
+
+        Shape mirrors ``_migrate_packs_is_default`` exactly and for the same
+        reasons -- see that method's docstring for the TOCTOU-absorbing
+        try/except around the ALTER and for why it runs inside a
+        ``conn.begin_nested()`` SAVEPOINT (on PostgreSQL a failed statement
+        aborts the whole transaction; rolling back to the savepoint leaves a
+        usable one for the CREATE INDEX that follows). The index is built
+        here rather than in the static DDL lists for the same reason
+        ``idx_packs_one_default`` is: on an existing DB the ALTER above runs
+        first in this same call, but a static "CREATE INDEX ... (status)"
+        statement would run BEFORE any ALTER on a first pass across an old
+        DB and raise "no such column".
+
+        ``DEFAULT 'ready'`` (not ``'creating'``) for two reasons. First, this
+        migration must land every *existing* row as ``ready`` (nothing about
+        an already-registered pack is "in progress"), and SQLite cannot
+        ``ADD COLUMN`` a ``NOT NULL`` column without a default in the first
+        place -- so the column default does both jobs by itself, no UPDATE
+        pass needed. Second, and the reason it stays ``'ready'`` rather than
+        anything else that also satisfies the first requirement: the forward
+        migration (old SQLite -> new PostgreSQL,
+        ``scripts/_migration_tables.py::resolve_columns``) drops a column
+        from the copy list when the *source* table doesn't have it and lets
+        the *target* column's default fill it in instead. A pre-#170 source
+        has no ``status`` column at all, so every pack copied from it would
+        land with whatever this default is. If that default were
+        ``'creating'``, every pack that ever went through a forward
+        migration would land invisible, and nothing would reliably bring it
+        back: ``opencrab packs repair-registry`` promotes a ``creating`` row
+        only when it can positively find that pack's graph anchor, and a
+        legacy pack migrated from a pre-anchor era generally has none -- so
+        the repair pass would demote it to ``partial``, which is exactly the
+        state that requires a human to decide. ``'ready'`` is the correct
+        reading instead: a migrated pre-#170 row never had a lifecycle state
+        to lose, so it keeps behaving as it did before #170.
+
+        That fail-open default is safe only because production INSERTs into
+        ``packs`` are required to name ``status`` explicitly rather than
+        rely on this default -- ``_insert_pack``/``_ensure_default_pack_on``
+        in ``opencrab/pack/ownership.py`` do this; this default exists for
+        the migration path only.
+
+        ROLLING THIS BACK. The column is additive, so reverting the code
+        leaves an older build reading this DB without complaint (every
+        SELECT names its columns). What an older build does NOT do is
+        honour ``status``: it has no such filter, so any ``creating`` or
+        ``partial`` row becomes visible and writable again the moment it
+        starts. Counting those rows is not enough on its own either -- a
+        ``pack_create`` landing between the count and the restart makes a
+        fresh one. The procedure is:
+
+        1. stop or drain pack writes,
+        2. with the graph store reachable, run
+           ``opencrab packs repair-registry --apply`` (with the graph down
+           it can only skip, and its ``--promote`` refusals then mean
+           "could not check" rather than "no anchor"),
+        3. re-run ``SELECT count(*) FROM packs WHERE status <> 'ready'``
+           while writes are still stopped,
+        4. at zero, start the older build and check once more,
+        5. above zero, classify what is left from step 2's report rather
+           than treating it as one kind of leftover.
+
+        Step 2 does not touch ``partial`` rows at all -- it only resolves
+        ``creating`` ones -- so the remainder is a mix, and each part needs
+        a different move:
+
+        - a ``partial`` row whose graph probe says ``present``: promote it
+          with ``--promote <pack_id> --apply``. It has a real anchor.
+        - a ``partial`` row whose graph probe says ``absent``: this is the
+          only leftover confirmed to have no anchor, and the only one a
+          human should resolve directly in SQL.
+        - a row whose graph probe says ``unknown``: NOT known to be
+          anchorless. Deleting it can orphan an anchor that a later probe
+          would have found, which is the state #147's startup check
+          refuses. Restore the graph store and go back to step 2.
+        - a ``creating`` row skipped for age: ``too recent`` clears by
+          lowering ``--older-than`` and re-running step 2 (with writes
+          stopped, no new ones appear). ``unknown age`` does not -- it
+          means ``updated_at`` is absent, unparseable, or in the future, so
+          the age gate never applies; inspect that column and decide by
+          hand.
+
+        Then return to step 3.
+        """
+        from sqlalchemy import text
+        from sqlalchemy.exc import DBAPIError
+
+        with self._engine.begin() as conn:
+            if self._is_sqlite:
+                cols = {row[1] for row in conn.execute(text("PRAGMA table_info(packs)"))}
+            else:
+                cols = {
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            # Scoped to the active schema for the same reason
+                            # as the is_default migration's equivalent query
+                            # above: unscoped, a packs.status visible in
+                            # ANOTHER schema makes this skip the ALTER while
+                            # the unqualified CREATE INDEX below still
+                            # targets the active schema's legacy table.
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'packs' "
+                            "AND table_schema = current_schema()"
+                        )
+                    )
+                }
+            if "status" not in cols:
+                # Same TOCTOU/SAVEPOINT rationale as the is_default ALTER
+                # above: two processes can race to open the same DB and both
+                # see the column missing, so the loser's "duplicate column"
+                # is absorbed rather than crashing it, and the SAVEPOINT
+                # keeps PostgreSQL's transaction usable afterwards either way.
+                try:
+                    with conn.begin_nested():
+                        if self._is_sqlite:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN status TEXT "
+                                    "NOT NULL DEFAULT 'ready' "
+                                    "CHECK (status IN ('creating', 'partial', 'ready'))"
+                                )
+                            )
+                        else:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN status VARCHAR(32) "
+                                    "NOT NULL DEFAULT 'ready' "
+                                    "CHECK (status IN ('creating', 'partial', 'ready'))"
+                                )
+                            )
+                except DBAPIError as exc:
+                    message = str(getattr(exc, "orig", exc)).lower()
+                    if "duplicate column" not in message and "already exists" not in message:
+                        logger.error("packs.status migration failed: %s", exc)
+                        raise
+
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_packs_status ON packs (status)"))
 
     @property
     def available(self) -> bool:

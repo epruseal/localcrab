@@ -855,6 +855,11 @@ def test_pack_tool_strings_never_name_an_unregistered_tool():
         # this file imports (#159/#171). A module path, not a tool name, same
         # category as pack_registry above.
         "pack_tags",
+        # builder.add_node(..., pack_anchor=True)'s keyword argument name
+        # (#170, design v4 §3.5) -- an opt-in flag for writing a pack's own
+        # anchor node while its registry row is still 'creating', not a tool
+        # name. Same category as pack_registry/pack_tags above.
+        "pack_anchor",
     }
     assert unknown == set(), (
         f"pack.py references tool-shaped names that are not registered tools: "

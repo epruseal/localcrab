@@ -106,9 +106,9 @@ class TestCreatePack:
         calls: list[str] = []
         real_insert = registry_mod._insert_pack
 
-        def _counting_insert(sql_, pack_id, *rest):
+        def _counting_insert(sql_, pack_id, *rest, **kwargs):
             calls.append(pack_id)
-            return real_insert(sql_, pack_id, *rest)
+            return real_insert(sql_, pack_id, *rest, **kwargs)
 
         monkeypatch.setattr(registry_mod, "_insert_pack", _counting_insert)
 
