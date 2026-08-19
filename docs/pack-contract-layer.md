@@ -403,4 +403,10 @@ PYTHONPATH=. python scripts/qa/mutate_module.py . opencrab/pack/load.py \
 1. **빌드**: 호출자의 빌더가 `build.Pack`으로 `{nodes,edges,chunks}.jsonl` 3파일을 생성.
 2. **게이트**: `gates.dangling` / `gates.grammar_fit` / `gates.score`로 구조를 검증(호출자가 이 판정 위에 CLI 출력·종료코드를 얹는다).
 3. **적재**: `load`의 함수들로 4스토어에 반영. 재적재 대비 삭제(`delete_pack`), 증분 적재(`load_nodes_incremental`/`load_chunks_incremental`) 경로도 포함.
+
+   **적재 호출자의 계약(#148, #205).** 적재는 인가를 지난다. 진입점에서 `principal_scope(...)`를 열어야 하고(로더는 principal을 스스로 고르지 않는다), 청크 로더 두 개는 등록부 스토어를 **키워드 전용 필수 인자 `sql`**로 받는다. 노드·엣지는 `OntologyBuilder` 안에서 인가되므로 별도 인자가 없다.
+
+   `sql` 없이 부른 구 호출은 첫 호출에서 `TypeError`로 죽는다 — 아무것도 쓰기 전이다. 등록부를 들 수 없는 원격 도구의 경로는 서버측에서 인가가 도는 `pack_ingest_chunks` MCP 도구이며(`[[ingestion-via-mcp-plan]]`), 아직 구현되지 않았다.
+
+   재현: `pytest tests/test_pack_load_chunk_authz.py`(비소유자 거부와 원본 팩 불변), `pytest tests/test_write_sink_inventory.py`(스토어 쓰기 지점 전량이 writer이거나 선언된 예외인지).
 4. **배포(선택)**: 목적에 따라 `cloud.build_zip` 또는 `assembler.assemble_pack_v1`으로 ZIP 조립.

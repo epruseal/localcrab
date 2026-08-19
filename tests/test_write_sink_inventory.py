@@ -50,11 +50,20 @@ ALLOWED: dict[tuple[str, str], str] = {
         "vector leg of writer 2; reachable only through write_source, which "
         "authorizes and stamps before calling it"
     ),
-    # --- bulk pack loader: principal enforced, pack authorization is a known gap ---
-    ("opencrab/pack/load.py", "flush"): "bulk loader; see design section 13.9",
-    ("opencrab/pack/load.py", "flush_single"): "bulk loader; see design section 13.9",
+    # --- writer 3: the bulk chunk loader ---
+    # These write to the stores directly rather than through write_source: the
+    # loader batches one embedding call per `batch_size` chunks, and
+    # write_source is one `hybrid.ingest` per source. What #205 closed is the
+    # authorization, not the direct write -- `load_chunks` and
+    # `load_chunks_incremental` call the gate's `authorize` on entry, before
+    # the first store call, so the nested flush/flush_single below run inside
+    # an already-authorized call. Reproduce: the parametrized
+    # `test_each_writer_authorizes` covers both loaders, and
+    # tests/test_pack_load_chunk_authz.py refuses a non-owner behaviourally.
+    ("opencrab/pack/load.py", "flush"): "writer 3 -- gate runs at loader entry",
+    ("opencrab/pack/load.py", "flush_single"): "writer 3 -- gate runs at loader entry",
     ("opencrab/pack/load.py", "load_chunks_incremental"): (
-        "bulk loader; see design section 13.9"
+        "writer 3 -- gate runs at loader entry"
     ),
     # --- explicitly out of scope (issue #148 acceptance narrowed to pack
     #     content writes; these are operator tools run locally, not client
@@ -142,6 +151,8 @@ def test_the_scan_actually_finds_the_writers():
     ("opencrab/ontology/builder.py", "add_node"),
     ("opencrab/ontology/builder.py", "add_edge"),
     ("opencrab/pack/source_writer.py", "write_source"),
+    ("opencrab/pack/load.py", "load_chunks"),
+    ("opencrab/pack/load.py", "load_chunks_incremental"),
 ])
 def test_each_writer_authorizes(writer):
     """The writers must call the gate's authorize, not merely stamp.
@@ -151,12 +162,13 @@ def test_each_writer_authorizes(writer):
 
     This is a name-presence check, so a dead ``authorize`` reference would slip
     past it -- deliberately left that way rather than made clever. The guard
-    against that is behavioural, and it has to exist for BOTH writers:
-    tests/test_builder_gate.py and tests/test_source_writer.py each assert a
-    non-owner is actually refused. Measured: neutering `authorize` inside the
-    builder while keeping the name kills 6 tests in the first file. An earlier
-    version of this docstring claimed the source-writer tests covered the
-    builder too; they did not, and the mutation walked through.
+    against that is behavioural, and it has to exist for EVERY writer listed
+    here: tests/test_builder_gate.py, tests/test_source_writer.py and
+    tests/test_pack_load_chunk_authz.py each assert a non-owner is actually
+    refused. Measured: neutering `authorize` inside the builder while keeping
+    the name kills 6 tests in the first file. An earlier version of this
+    docstring claimed the source-writer tests covered the builder too; they did
+    not, and the mutation walked through.
     """
     module, func = writer
     tree = ast.parse((REPO / module).read_text(encoding="utf-8"))

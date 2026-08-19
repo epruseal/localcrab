@@ -6,6 +6,22 @@
 어느 게이트도 잡지 못했다. 계약(`schema`)·생산자(`build`)·정규화(`normalize`)·소비자(여기)를
 한 패키지에 모아 빌드에서 적재까지 한 스위트로 왕복 검증할 수 있게 하는 것이 이 이관이다.
 
+**쓰기 함수는 인가를 지난다(#148, #205).** 노드·엣지는 `OntologyBuilder` 안에서 게이트를
+지나고, 청크는 `load_chunks`/`load_chunks_incremental` 이 진입에서 직접
+`write_gate.authorize` 를 부른다 — 청크 축만 배치 임베딩 때문에 두 writer 어느 쪽도
+지나지 않고 스토어를 직접 부르기 때문이다(그 예외는 `tests/test_write_sink_inventory.py`
+의 ALLOWED 에 선언돼 있다).
+
+그래서 두 청크 로더는 등록부 스토어를 **키워드 전용 필수 인자 `sql`** 로 받는다. 저장소
+밖 적재 도구의 이관 경로는 셋이다.
+
+1. 구 호출(`sql` 없음)은 `TypeError` 로 **첫 호출 즉시, 아무것도 쓰기 전에** 죽는다.
+   조용한 fail-open 대신 조용하지 않은 fail-closed 다.
+2. 같은 프로세스에서 도는 도구는 등록부 `SQLStore` 를 `sql=` 로 넘기고 진입점에서
+   `principal_scope(...)` 를 연다(노드·엣지 축이 이미 요구하던 조건과 같다).
+3. 등록부를 들 수 없는 원격 도구는 서버측에서 인가가 도는 `pack_ingest_chunks` MCP
+   도구가 경로다(`docs/ingestion-via-mcp-plan.md`). 미구현이다.
+
 **쓰기 함수는 각자 `require_live_data()` 를 부른다.** 진입점에서 한 번 부르는 방식은
 진입점을 안 거치고 이 함수들을 직접 호출하는 경로에서 통째로 빠진다(실측: 그런 호출
 스크립트가 3종 있었다). 계약은 `tests/test_pack_load.py` 가 AST 로 건다.
@@ -46,6 +62,7 @@ from opencrab.pack.normalize import (
     transform_chunk_meta,
     transform_node,
 )
+from opencrab.pack.write_gate import authorize
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect
 
 # 로거 이름은 `__name__` 이다. 이관 전에는 호출자 스크립트 파일명으로 고정돼 있었는데
@@ -1075,8 +1092,9 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     }
 
 
-def _require_bound_principal() -> None:
-    """이 로더들은 principal 을 **스스로 바인딩하지 않는다**(#148).
+def _require_bound_principal():
+    """바인딩된 principal 을 돌려준다. 이 로더들은 principal 을 **스스로
+    바인딩하지 않는다**(#148).
 
     한때 "미바인딩이면 로컬 principal 을 바인딩한다" 로 만들었다가 되돌렸다.
     그 폴백은 신원에 대해 fail-open 이다 — HTTP 처럼 요청마다 principal 이
@@ -1086,11 +1104,15 @@ def _require_bound_principal() -> None:
 
     그래서 여기서는 없으면 거부만 한다. 바인딩은 진입점(도구 디스패처, CLI,
     스크립트)의 책임이다.
+
+    반환값은 청크 로더가 `write_gate.authorize` 에 넘길 principal 이다(#205).
+    노드·엣지 로더는 종전대로 문장으로만 부른다 — 그쪽 인가는 builder 안에서
+    일어난다.
     """
     from opencrab.auth import current_principal
 
     try:
-        current_principal()
+        return current_principal()
     except LookupError:
         raise RuntimeError(
             "pack load requires a bound principal; open principal_scope(...) at "
@@ -1493,9 +1515,31 @@ def load_chunks(
     vec,
     docs,
     batch_size: int = 256,
+    *,
+    sql,
 ) -> tuple[int, int]:
-    """청크 적재. 반환: (ok, err)"""
+    """청크 적재. 반환: (ok, err)
+
+    `sql`(등록부 스토어)은 **키워드 전용 필수 인자**다(#205). 기본값을 주는 순간
+    "주어지면 인가한다" 가 되는데, 그건 #204 에서 신원 축에서 되돌린 fail-open 과
+    같은 형태다. 빠뜨린 호출은 본문에 들어오지도 못하고 `TypeError` 로 죽는다 —
+    아무것도 쓰기 전에.
+
+    인가는 호출당 1회이고 대상은 `pack_name` 이다. 행마다 인가하는
+    `OntologyBuilder` 와 달리 **긴 배치가 도는 동안 소유권이 바뀌는 창**이 남는다.
+    의도한 모서리다: 대량 적재에서 행당 등록부 조회는 비용 축이 다르고, 이 경로의
+    입력은 이미 한 팩으로 고정돼 있다.
+
+    예외: 미바인딩 principal 은 `RuntimeError`, 남의 팩(비공개)은
+    `PackNotFoundError`, 남의 공개 팩은 `PackForbiddenError`, 등록부 미가용은
+    `RuntimeError`. 전부 첫 쓰기 이전에 난다.
+    """
     require_live_data("load_chunks")
+    principal = _require_bound_principal()
+    # 소유자 검사는 `vec.available` 단락보다 **앞**이다. 뒤에 두면 벡터 없는
+    # 배포에서 비소유자 호출이 거부 대신 "0건 성공" 으로 보인다 — 거부 여부가
+    # 배포 형태에 좌우돼선 안 된다.
+    authorize(sql, principal, pack_name)
     if not vec.available:
         print(f"  [{pack_name}] Chroma 미가용 → 청크 skip", flush=True)
         return 0, 0
@@ -1583,12 +1627,19 @@ def load_chunks_incremental(
     docs,
     live_chunks: dict[str, tuple[str, dict]],
     batch_size: int = 256,
+    *,
+    sql,
 ) -> tuple[int, int, int, int, int, set]:
     """청크 증분 적재. 텍스트 불변·메타만 변경된 행은 임베딩 없이 upsert_source만 호출.
 
     반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids)
+
+    `sql` 과 인가 계약은 `load_chunks` 와 같다(#205) — 키워드 전용 필수 인자,
+    호출당 1회 소유자 검사, 첫 쓰기 이전 거부. 그쪽 docstring 이 정본이다.
     """
     require_live_data("load_chunks_incremental")
+    principal = _require_bound_principal()
+    authorize(sql, principal, pack_name)
     c_new = c_txt = c_meta = c_same = err = 0
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     bypack_ids: set[str] = set()
