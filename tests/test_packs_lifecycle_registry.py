@@ -511,3 +511,21 @@ class TestAmbiguousRegistryInsert:
         ):
             with pytest.raises(RuntimeError, match="lost the answer"):
                 begin_pack_creation(sql, alice, "contested")
+
+    def test_a_row_of_ours_in_a_different_status_is_not_claimed(self, sql, alice):
+        """Ownership is not enough: the status has to match what this call was
+        inserting. A `ready` row of ours under that id is some earlier pack,
+        not the `creating` one this call was making, and returning it would
+        report a pack that already had a life of its own."""
+        from unittest.mock import patch
+
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.ownership import begin_pack_creation, create_pack
+
+        create_pack(sql, alice, "settled")  # ours, but 'ready'
+
+        with patch.object(
+            ownership_mod, "_insert_pack", side_effect=RuntimeError("lost the answer")
+        ):
+            with pytest.raises(RuntimeError, match="lost the answer"):
+                begin_pack_creation(sql, alice, "settled")
