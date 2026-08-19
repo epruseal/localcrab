@@ -1268,6 +1268,26 @@ def packs_backfill_pack_id(
         )
 
 
+def _optional_store(cfg: Any, kind: str) -> Any:
+    """Build one content store for ``packs repair-registry``, or ``None``.
+
+    Construction itself can raise (a vector backend whose embedding backend
+    does not match it, a driver that is not installed). For this command that
+    must not be fatal: every probe treats a missing store as "cannot tell",
+    which the repair pass reports as a skip, so a store that will not open
+    costs precision rather than the whole run. Returning ``None`` says exactly
+    what happened -- there is no store to ask.
+    """
+    try:
+        return getattr(_make_stores(cfg, **{kind: True}), kind)
+    except Exception as exc:  # noqa: BLE001 -- a store we cannot build is one we cannot ask
+        console.print(
+            f"[yellow]{kind} store unavailable ({type(exc).__name__}); "
+            f"rows needing it will be reported as unverifiable.[/yellow]"
+        )
+        return None
+
+
 @packs.command("repair-registry")
 @click.option(
     "--older-than",
@@ -1321,12 +1341,23 @@ def packs_repair_registry(
     from opencrab.pack.lifecycle import repair_incomplete_packs
 
     cfg = get_settings()
-    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
+    # The registry itself is this command's subject, so a store it cannot open
+    # is a hard failure. The three content stores are not: they only feed
+    # `probe_anchor`, which already answers `unknown` for a store it cannot
+    # ask, and `repair_incomplete_packs` turns that into "skipped". Building
+    # them eagerly would make the recovery command refuse to start in exactly
+    # the degraded state it exists for -- a vector backend that raises on
+    # construction (a mismatched embedding backend, an uninstalled driver)
+    # would block a repair whose decision rests only on the graph probe.
+    sql = _make_stores(cfg, sql=True).sql
+    graph = _optional_store(cfg, "graph")
+    doc = _optional_store(cfg, "doc")
+    vector = _optional_store(cfg, "vector")
     summary = repair_incomplete_packs(
-        stores.sql,
-        stores.graph,
-        stores.doc,
-        stores.vector,
+        sql,
+        graph,
+        doc,
+        vector,
         older_than_seconds=older_than_seconds,
         apply=apply_changes,
         promote=promote_pack_id,

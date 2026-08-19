@@ -914,3 +914,58 @@ class TestPromoteRejectsNonPartialTargets:
         assert result["promote_result"]["action"] == "promote"
         assert result["promote_result"]["applied"] is True
         assert get_pack(sql, pid)["status"] == PACK_STATUS_READY
+
+
+class TestRepairSurvivesUnbuildableStores:
+    """The recovery command must start in the degraded state it exists for.
+
+    Only the registry is this command's subject. The three content stores
+    feed `probe_anchor`, which already answers `unknown` for a store it
+    cannot ask -- so a store whose CONSTRUCTION raises (a vector backend
+    mismatched with its embedding backend, an uninstalled driver) should cost
+    precision, not the whole run. Building them eagerly would make repair
+    unavailable exactly when a broken store is what put a pack in this state."""
+
+    def test_probe_treats_a_missing_store_as_unknown(self):
+        from opencrab.pack.lifecycle import PROBE_UNKNOWN, probe_anchor
+
+        probes = probe_anchor(None, None, None, "p1")
+        assert probes == {
+            "graph": PROBE_UNKNOWN,
+            "docs": PROBE_UNKNOWN,
+            "vector": PROBE_UNKNOWN,
+        }
+
+    def test_pass_runs_and_skips_when_every_content_store_is_none(self, sql, alice):
+        pid = begin_pack_creation(sql, alice, "no-stores")
+        _stale(sql, pid)
+        before = _row_count(sql)
+
+        result = repair_incomplete_packs(sql, None, None, None, apply=True)
+
+        assert _row_for(result, pid)["action"] == "skipped (unverifiable)"
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_CREATING
+        assert _row_count(sql) == before
+
+    def test_cli_still_runs_when_a_content_store_cannot_be_built(self, monkeypatch, tmp_path):
+        """The command reports rather than crashing when a store constructor
+        raises -- the failure mode the eager build had."""
+        from click.testing import CliRunner
+
+        import opencrab.cli as cli_mod
+        from opencrab.cli import main
+
+        real = cli_mod._make_stores
+
+        def _explode_on_vector(cfg, **kinds):
+            if kinds.get("vector"):
+                raise RuntimeError("sqlite-vec needs a matching embedding backend")
+            return real(cfg, **kinds)
+
+        monkeypatch.setattr(cli_mod, "_make_stores", _explode_on_vector)
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+
+        result = CliRunner().invoke(main, ["packs", "repair-registry"])
+
+        assert result.exit_code == 0, result.output
+        assert "vector store unavailable" in result.output
