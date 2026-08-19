@@ -639,8 +639,11 @@ class TestFailureResponseNamesTheRetainedPack:
             result = _create(ctx, title="Contested", pack_id="contested-pack")
 
         error = result["error"]
-        assert "did not land" in error
-        for leak in ("held by another", "already", "taken", "occupied", "mallory"):
+        assert "not confirmed to land" in error
+        for leak in (
+            "held by another", "already", "taken", "occupied", "mallory",
+            "another row", "exists", "in use", "duplicate", "conflict", "unique",
+        ):
             assert leak not in error, f"response discloses occupancy via {leak!r}"
         assert result["registry_status"] is None  # mallory's row, withheld
         # The operator still gets the real cause, server-side.

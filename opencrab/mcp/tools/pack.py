@@ -1175,7 +1175,14 @@ def pack_create(
                         "re-registered as ready since its graph anchor is "
                         "confirmed present, but "
                         if reregistered
-                        # Deliberately silent on WHY it did not land. The
+                        # "not confirmed to land" rather than "did not
+                        # land": one of the two causes is a raised insert,
+                        # and an insert that raises after committing DID
+                        # land. Same rule the anchor probe and the registry
+                        # status already follow here -- not knowing is its
+                        # own answer, never the negative one.
+                        #
+                        # Deliberately silent on WHY, too. The
                         # two causes are a PK conflict and a raised insert,
                         # and naming the first would report that the slug is
                         # occupied -- the one fact slug negotiation exists to
@@ -1183,8 +1190,8 @@ def pack_create(
                         # for the raised case would also assert a cause never
                         # checked. Both are distinguished in the server log.
                         else "re-registration was attempted (its graph anchor "
-                        "is confirmed present) but did not land -- see the "
-                        "server log; "
+                        "is confirmed present) but was not confirmed to land "
+                        "-- see the server log; "
                         if anchor_confirmed
                         else "NOT re-registered because its graph anchor could "
                         "not be confirmed present, and "
