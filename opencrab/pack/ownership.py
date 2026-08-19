@@ -247,6 +247,19 @@ def _negotiate_pack_id(
         # free a moment ago -- owner and status alone cannot: a row this same
         # owner left behind earlier, in this same status, matches both. See
         # the except below for what adopting one would cost.
+        #
+        # This is a read-then-write pair, and what keeps it from racing is the
+        # same thing that keeps `pack_create`'s identity probe from racing:
+        # every `writes=True` MCP handler runs inside `dispatch_tool`'s
+        # exclusive `_write_lock()`, so a second creation cannot slip a commit
+        # between this read and the insert below. `pack_create` carries that
+        # flag, and both halves -- the flag and the lock actually being held
+        # around the handler -- are pinned in tests/test_pack_identity_guard.py.
+        # The residual is the same one that guard documents and does not
+        # solve: a file lock does not span hosts, so a multi-host deployment
+        # against one registry can still interleave here. Closing THAT would
+        # need per-attempt evidence the row itself carries (a creation token
+        # column), which is a schema change, not a tightening of this check.
         was_absent = _row_absent(sql, candidate)
         try:
             landed = _insert_pack(
