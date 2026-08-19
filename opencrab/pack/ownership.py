@@ -241,6 +241,13 @@ def _negotiate_pack_id(
     ``except`` below for why an unknown outcome must not be read as "no row".
     """
     for candidate in _pack_id_candidates(pack_id):
+        # Evidence gathered BEFORE the attempt, because afterwards it cannot
+        # be. If the INSERT's outcome is lost, the only way to tell "my row
+        # landed" from "a row was already sitting here" is to know the id was
+        # free a moment ago -- owner and status alone cannot: a row this same
+        # owner left behind earlier, in this same status, matches both. See
+        # the except below for what adopting one would cost.
+        was_absent = _row_absent(sql, candidate)
         try:
             landed = _insert_pack(
                 sql, candidate, owner_id, title, description, forked_from, status=status
@@ -252,9 +259,17 @@ def _negotiate_pack_id(
             # NOBODY holds -- on a collision this function chose a random
             # suffix the caller never sees, and while the row is `creating` it
             # is absent from that owner's every listing, so nothing could
-            # reach it again. Re-read this candidate; if it is ours with the
-            # status we asked for, that IS the successful outcome.
-            if _row_is_ours(sql, candidate, owner_id, status):
+            # reach it again.
+            #
+            # So re-read -- but only trust the answer where the id was free
+            # beforehand. Without that, a row the same owner had already left
+            # at this id in this same status would answer "ours" and be
+            # adopted, and the cost is not a wrong id in a message: the caller
+            # would go on to write this creation's anchor and content into
+            # that OLD pack, which keeps its old title and description, when
+            # it should have negotiated a suffixed slug and got a pack of its
+            # own.
+            if was_absent and _row_is_ours(sql, candidate, owner_id, status):
                 return candidate
             raise
         if landed:
@@ -268,6 +283,17 @@ def _pack_id_candidates(pack_id: str) -> Iterator[str]:
     yield pack_id
     for _ in range(_MAX_RANDOM_ATTEMPTS):
         yield f"{pack_id}-{secrets.token_hex(4)}"
+
+
+def _row_absent(sql: Any, pack_id: str) -> bool:
+    """Was this id free just now? ``False`` when a row is there OR when the
+    lookup itself failed -- an unreadable registry is not evidence of absence,
+    and this value's only job is to license a later claim.
+    """
+    try:
+        return get_pack(sql, pack_id) is None
+    except Exception:  # noqa: BLE001 -- no evidence is not evidence of absence
+        return False
 
 
 def _row_is_ours(sql: Any, pack_id: str, owner_id: str, status: str) -> bool:

@@ -529,3 +529,30 @@ class TestAmbiguousRegistryInsert:
         ):
             with pytest.raises(RuntimeError, match="lost the answer"):
                 begin_pack_creation(sql, alice, "settled")
+
+    def test_a_pre_existing_row_of_ours_is_never_adopted(self, sql, alice):
+        """Owner and status alone cannot identify OUR insert.
+
+        A row this same owner left at this id earlier, in this same status,
+        matches both. Adopting it would not merely report a wrong id: the
+        caller goes on to write this creation's anchor and content into that
+        OLD pack, which keeps its old title and description, instead of
+        negotiating a suffixed slug and getting a pack of its own. So the id
+        having been free just beforehand is required evidence."""
+        from unittest.mock import patch
+
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.ownership import begin_pack_creation, get_pack
+
+        # An earlier attempt of alice's, same id, same status, own title.
+        begin_pack_creation(sql, alice, "recycled", title="The first one")
+
+        with patch.object(
+            ownership_mod, "_insert_pack", side_effect=RuntimeError("transient lock")
+        ):
+            with pytest.raises(RuntimeError, match="transient lock"):
+                begin_pack_creation(sql, alice, "recycled", title="A different pack")
+
+        # The old row is untouched, and no second pack was invented for it.
+        row = get_pack(sql, "recycled")
+        assert row["title"] == "The first one"
