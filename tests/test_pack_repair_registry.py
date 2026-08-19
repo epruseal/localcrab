@@ -573,6 +573,20 @@ def test_probe_methods_exist_on_every_real_store_backend():
         ("opencrab.stores.pg_vector_store", "PgVectorStore"),
     ]
 
+    # Backends that pull in no third-party driver at import time (stdlib and
+    # in-package modules only, checked through their shared bases). These are
+    # importable in EVERY environment, so a failure to import one is never
+    # "driver not installed" -- it is breakage, and the loop below refuses to
+    # skip them. Without this split, a blanket `except ImportError` lets an
+    # in-package breakage silently shrink what the test covers, which is the
+    # same class of quiet-shrink defect that made the first version of this
+    # test miss a backend outright.
+    always_importable = {
+        "opencrab.stores.local_graph_store",
+        "opencrab.stores.local_doc_store",
+        "opencrab.stores.local_sql_doc_store",
+    }
+
     import importlib
 
     checked = 0
@@ -584,9 +598,22 @@ def test_probe_methods_exist_on_every_real_store_backend():
         for mod_name, cls_name in group:
             try:
                 mod = importlib.import_module(mod_name)
-            except ImportError:
-                # The only tolerated miss: an optional driver this env does
-                # not have installed. Anything else below is a real signal.
+            except ImportError as exc:
+                # The only tolerated miss: a third-party driver this env does
+                # not have. A driver-gated backend failing on one of OUR OWN
+                # modules is breakage wearing the same exception, so the
+                # missing module's name decides, not the exception type.
+                missing = getattr(exc, "name", None) or ""
+                assert mod_name not in always_importable, (
+                    f"{mod_name} needs no third-party driver but failed to "
+                    f"import ({exc!r}) -- this is breakage, not a missing "
+                    f"driver, and must not shrink this test's coverage"
+                )
+                assert not missing.startswith("opencrab"), (
+                    f"{mod_name} failed to import because {missing!r} is "
+                    f"missing -- that is one of our own modules, not an "
+                    f"optional driver"
+                )
                 continue
             cls = getattr(mod, cls_name, None)
             # A missing class on a module that DID import is a rename, which
