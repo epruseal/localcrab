@@ -512,10 +512,16 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                 # any deployment without an embedding backend. Treating that as
                 # fatal aborted the whole file and skipped the audit row below
                 # -- the ingest looked successful and left no actor trail.
-                if not store_write_succeeded(receipt["stores"], "documents"):
-                    raise RuntimeError(
-                        f"source record failed: {receipt['stores'].get('documents')}"
-                    )
+                doc_status = receipt["stores"].get("documents")
+                doc_ok = store_write_succeeded(receipt["stores"], "documents")
+                vector_ok = store_write_succeeded(receipt["stores"], "chromadb")
+                # A doc-less deployment is a supported shape: `write_source`
+                # deliberately keeps going and the vector leg carries the
+                # ingest. Requiring the doc row there would report a file as
+                # failed AFTER its vector was persisted, and skip the audit
+                # row on the way out. Fatal only when nothing landed.
+                if not doc_ok and not (doc_status == "unavailable" and vector_ok):
+                    raise RuntimeError(f"source record failed: {doc_status}")
                 vector_status = receipt["stores"].get("chromadb")
                 if vector_status and str(vector_status).startswith("error"):
                     console.print(

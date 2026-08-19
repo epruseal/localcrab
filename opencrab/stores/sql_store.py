@@ -332,8 +332,16 @@ class SQLStore:
                     row[0]
                     for row in conn.execute(
                         text(
+                            # Scoped to the active schema, like the table
+                            # introspection later in this module. Unscoped, a
+                            # `packs.is_default` visible in ANOTHER schema
+                            # makes this skip the ALTER while the unqualified
+                            # CREATE INDEX below still targets the active
+                            # schema's legacy table -- which then fails and
+                            # takes the whole SQL store down.
                             "SELECT column_name FROM information_schema.columns "
-                            "WHERE table_name = 'packs'"
+                            "WHERE table_name = 'packs' "
+                            "AND table_schema = current_schema()"
                         )
                     )
                 }

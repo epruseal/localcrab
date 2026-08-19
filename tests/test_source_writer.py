@@ -274,3 +274,19 @@ def test_vector_exception_stays_in_the_receipt(sql):
     receipt = _write(sql, docs=docs, hybrid=Boom())
     assert receipt["stores"]["chromadb"] == "error: embed failed"
     assert docs.calls, "the doc row stands; only the vector leg failed"
+
+
+def test_doc_unavailable_with_a_healthy_vector_is_a_successful_ingest(sql):
+    """A doc-less deployment is supported: the vector leg carries the ingest.
+
+    Review finding: the CLI treated `documents="unavailable"` as fatal and
+    reported the file failed AFTER the vector had been persisted, skipping the
+    audit row. The writer's own contract is what that check has to read.
+    """
+    from opencrab.ontology.builder import store_write_succeeded
+
+    receipt = _write(sql, docs=_Docs(available=False), hybrid=_Hybrid())
+    assert receipt["stores"]["documents"] == "unavailable"
+    assert store_write_succeeded(receipt["stores"], "chromadb"), (
+        "the vector leg must still land, and be readable as success"
+    )
