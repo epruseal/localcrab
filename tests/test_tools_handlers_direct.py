@@ -1069,12 +1069,18 @@ class TestPackCreate:
 class TestPackCreatePostWriterFailureDemotion:
     """#146 A, rewritten for #170's two-phase lifecycle (design v4 §3.0):
     once the anchor writer (builder.add_node) has actually been called, NO
-    failure of any kind deletes the registry row any more -- a delayed
-    commit landing after a compensating delete would orphan the graph, and
-    the chunk loader's write path (#205) means "no anchor" never implies
-    "pack is empty" (there can be graph content beyond the anchor node
-    itself). A pack whose anchor cannot be confirmed after that point ends
-    in mark_pack_partial instead.
+    failure of any kind deletes the registry row any more. A pack whose
+    anchor cannot be confirmed after that point ends in mark_pack_partial
+    instead.
+
+    The reason is timing, not enumeration: store_write_succeeded is
+    fail-closed, so a commit whose acknowledgement is lost reads as "not
+    landed", and a slow backend can still be about to commit when this
+    function has already decided. Deleting on that ambiguity orphans a
+    graph anchor that lands a moment later. (An earlier draft leaned on a
+    second reason -- that load.py's chunk loader wrote outside the write
+    gate, so "no anchor" never implied "pack is empty". #205 closed that
+    one; the timing reason is the one probing cannot close.)
 
     "Cannot be confirmed" is the whole trigger, and it is narrower than
     "something went wrong". Once the anchor IS confirmed the row goes to
