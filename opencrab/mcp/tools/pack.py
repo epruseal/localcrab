@@ -824,16 +824,23 @@ def pack_create(
     stays fixed at 'default'.
 
     Registry lifecycle (#170, design v4 §3.5): the pack_id is reserved
-    ``creating`` before any content is written, promoted to ``ready`` once
-    its graph anchor is confirmed, and demoted to ``partial`` (never
-    deleted) on any failure that happens AFTER the first content writer
-    call. The ONE exception -- the ONLY branch anywhere in this function
-    that deletes the registry row -- is an anchor identity conflict caught
-    BEFORE ``builder.add_node`` is ever called, where "no content exists
-    for this pack" is proven by control flow rather than by probing a
-    store a slow remote commit could still be about to fill. See that
-    branch's own comment, and design v4 §3.0, for why every later failure
-    ends in a demotion instead.
+    ``creating`` before any content is written and promoted to ``ready``
+    once its graph anchor is confirmed. If the anchor cannot be confirmed
+    after ``builder.add_node`` has run, the row is demoted to ``partial``
+    -- never deleted. The ONE exception -- the ONLY branch anywhere in this
+    function that deletes the registry row -- is an anchor identity
+    conflict caught BEFORE ``builder.add_node`` is ever called, where "no
+    content exists for this pack" is proven by control flow rather than by
+    probing a store a slow remote commit could still be about to fill. See
+    that branch's own comment, and design v4 §3.0, for why every later
+    failure demotes instead.
+
+    Only the ANCHOR's fate moves the registry. Once the anchor is
+    confirmed the row stays ``ready`` even if an optional store (docs or
+    vector) rejected the anchor, or if individual nodes/edges fail during
+    the ingest below; those are reported in the RESPONSE's ``status``
+    field as ``"partial"``, which is a different thing from the registry
+    status of the same name.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context

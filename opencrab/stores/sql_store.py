@@ -473,10 +473,30 @@ class SQLStore:
         3. re-run ``SELECT count(*) FROM packs WHERE status <> 'ready'``
            while writes are still stopped,
         4. at zero, start the older build and check once more,
-        5. above zero, the remainder are anchorless ``partial`` rows that
-           ``--promote`` refuses by design. Deciding those is a human call;
-           handle them directly in SQL and return to step 3 rather than
-           holding the rollback indefinitely.
+        5. above zero, classify what is left from step 2's report rather
+           than treating it as one kind of leftover.
+
+        Step 2 does not touch ``partial`` rows at all -- it only resolves
+        ``creating`` ones -- so the remainder is a mix, and each part needs
+        a different move:
+
+        - a ``partial`` row whose graph probe says ``present``: promote it
+          with ``--promote <pack_id> --apply``. It has a real anchor.
+        - a ``partial`` row whose graph probe says ``absent``: this is the
+          only leftover confirmed to have no anchor, and the only one a
+          human should resolve directly in SQL.
+        - a row whose graph probe says ``unknown``: NOT known to be
+          anchorless. Deleting it can orphan an anchor that a later probe
+          would have found, which is the state #147's startup check
+          refuses. Restore the graph store and go back to step 2.
+        - a ``creating`` row skipped for age: ``too recent`` clears by
+          lowering ``--older-than`` and re-running step 2 (with writes
+          stopped, no new ones appear). ``unknown age`` does not -- it
+          means ``updated_at`` is absent, unparseable, or in the future, so
+          the age gate never applies; inspect that column and decide by
+          hand.
+
+        Then return to step 3.
         """
         from sqlalchemy import text
         from sqlalchemy.exc import DBAPIError

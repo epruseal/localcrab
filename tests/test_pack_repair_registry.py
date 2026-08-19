@@ -115,6 +115,23 @@ class FakeVector:
         return None
 
 
+class FixedGraph:
+    """``get_node`` double that returns one caller-chosen value verbatim.
+
+    ``FakeGraph`` above can only produce well-formed hits and clean misses,
+    which is exactly the space in which the malformed-shape bug hid. This
+    one hands back whatever it was given so the probe's shape handling can
+    be driven directly."""
+
+    available = True
+
+    def __init__(self, value):
+        self._value = value
+
+    def get_node(self, node_type, node_id):  # noqa: ARG002
+        return self._value
+
+
 def _row_for(result: dict, pack_id: str) -> dict:
     return next(r for r in result["rows"] if r["pack_id"] == pack_id)
 
@@ -435,6 +452,155 @@ def test_apply_false_changes_nothing_across_the_whole_pass(sql, alice):
     actions = {r["pack_id"]: r["action"] for r in result["rows"]}
     assert actions[pid_a] == "promote"
     assert actions[pid_b] == "demote"
+
+
+# ---------------------------------------------------------------------------
+# Probe shape handling. `absent` is a POSITIVE claim -- the repair pass acts
+# on it -- so it may only come from a store that actually answered. Anything
+# the probe could not read has to land in `unknown` instead, or a pack whose
+# anchor may well have landed gets demoted with no way back (promotion needs
+# `present`, which an unreadable attribution can never produce).
+# ---------------------------------------------------------------------------
+
+
+class TestProbeShapeHandling:
+    @pytest.mark.parametrize(
+        ("shape", "why"),
+        [
+            ({}, "row exists, pack_id key absent"),
+            ({"pack_id": None}, "explicit null attribution"),
+            ({"pack_id": ""}, "empty-string attribution"),
+            ({"pack_id": 123}, "non-string truthy: shape error, not another pack"),
+            ({"pack_id": {"foreign": True}}, "nested truthy"),
+            ({"pack_id": ["x"]}, "list truthy"),
+            ({"pack_id": True}, "bool truthy"),
+            ("not a mapping", "non-mapping result"),
+        ],
+    )
+    def test_unreadable_attribution_is_unknown_not_absent(self, shape, why):
+        from opencrab.pack.lifecycle import (
+            ANCHOR_UNVERIFIABLE,
+            PROBE_UNKNOWN,
+            anchor_verdict,
+            probe_anchor,
+        )
+
+        probes = probe_anchor(FixedGraph(shape), FakeDocs(), FakeVector(), "p1")
+        assert probes["graph"] == PROBE_UNKNOWN, why
+        assert anchor_verdict(probes) == ANCHOR_UNVERIFIABLE, why
+
+    @pytest.mark.parametrize(
+        "shape",
+        [{}, {"pack_id": None}, {"pack_id": ""}, {"pack_id": 123}, {"pack_id": ["x"]}],
+    )
+    def test_repair_leaves_the_row_untouched_on_an_unreadable_shape(
+        self, sql, alice, shape
+    ):
+        """The consequence that makes the classification matter: reading any
+        of these as `absent` would demote a live pack, and `--promote` would
+        then refuse it forever because the same read can never say
+        `present`."""
+        pid = begin_pack_creation(sql, alice, "shape-guard")
+        _stale(sql, pid)
+        before = _row_count(sql)
+
+        result = repair_incomplete_packs(
+            sql, FixedGraph(shape), FakeDocs(), FakeVector(), apply=True
+        )
+
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_CREATING
+        assert _row_for(result, pid)["action"] == "skipped (unverifiable)"
+        assert _row_count(sql) == before
+
+    def test_a_readable_foreign_attribution_is_still_absent(self, sql, alice):
+        """The other side of the same gate: a non-empty string naming some
+        OTHER pack is a real answer -- our anchor is not in that slot -- so
+        it must keep demoting. Widening `unknown` must not swallow it."""
+        pid = begin_pack_creation(sql, alice, "foreign-slot")
+        _stale(sql, pid)
+
+        result = repair_incomplete_packs(
+            sql,
+            FixedGraph({"pack_id": "somebody-elses-pack"}),
+            FakeDocs(),
+            FakeVector(),
+            apply=True,
+        )
+
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_PARTIAL
+        assert _row_for(result, pid)["action"] == "demote"
+
+    def test_no_row_at_all_is_still_absent(self, sql, alice):
+        """And the ordinary empty-pack case (`get_node` -> None) must keep
+        resolving, or a genuinely failed pack_create would never clear."""
+        pid = begin_pack_creation(sql, alice, "really-empty")
+        _stale(sql, pid)
+
+        result = repair_incomplete_packs(
+            sql, FixedGraph(None), FakeDocs(), FakeVector(), apply=True
+        )
+
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_PARTIAL
+        assert _row_for(result, pid)["action"] == "demote"
+
+
+# ---------------------------------------------------------------------------
+# The probe's store contract. Every method below is optional at runtime (a
+# missing one reads as `unknown`, fail-closed), which is precisely why a
+# rename would be silent: re-probing would degrade to "cannot tell" on every
+# backend at once and nothing would fail. Pinned against the real classes.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_methods_exist_on_every_real_store_backend():
+    from opencrab.pack import lifecycle
+
+    graph_backends = [
+        ("opencrab.stores.local_graph_store", "LocalGraphStore"),
+        ("opencrab.stores.pg_graph_store", "PgGraphStore"),
+        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore"),
+        ("opencrab.stores.neo4j_store", "Neo4jStore"),
+    ]
+    doc_backends = [
+        ("opencrab.stores.local_doc_store", "LocalDocStore"),
+        ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore"),
+        ("opencrab.stores.mongo_store", "MongoStore"),
+    ]
+    vector_backends = [
+        ("opencrab.stores.chroma_store", "ChromaStore"),
+        ("opencrab.stores.sqlite_vec_store", "SqliteVecStore"),
+        ("opencrab.stores.pg_vector_store", "PgVectorStore"),
+    ]
+
+    import importlib
+
+    def _resolve(mod_name, cls_name):
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:  # optional driver not installed in this env
+            return None
+        return getattr(mod, cls_name, None)
+
+    checked = 0
+    for group, method in (
+        (graph_backends, "get_node"),
+        (doc_backends, "get_node_doc"),
+        (vector_backends, "get_by_id"),
+    ):
+        for mod_name, cls_name in group:
+            cls = _resolve(mod_name, cls_name)
+            if cls is None:
+                continue
+            assert callable(getattr(cls, method, None)), (
+                f"{cls_name}.{method} is gone -- opencrab.pack.lifecycle."
+                f"probe_anchor calls it and would silently degrade every "
+                f"re-probe to 'unknown'"
+            )
+            checked += 1
+    # Guard against the loop above quietly checking nothing (every import
+    # failing, a renamed module) and reporting success.
+    assert checked >= 6, f"only {checked} backends resolved; the contract went unchecked"
+    assert lifecycle.probe_anchor is not None
 
 
 # ---------------------------------------------------------------------------

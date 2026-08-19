@@ -22,8 +22,17 @@ ONE RULE GOVERNS THIS MODULE, and it is why none of the above has to prove a
 completeness lemma: **nothing here deletes a registry row.** The only deletion
 in the whole lifecycle is ``pack_create``'s branch that fails BEFORE the
 content writer is ever called, where "no content exists" follows from control
-flow rather than from a probe. Every failure after the writer has run ends in
-a ``partial`` demotion.
+flow rather than from a probe. Once the writer has run, a pack that cannot be
+finalised is demoted to ``partial`` instead.
+
+"Finalised" is narrower than "everything went well", and the two ``status``
+fields in play make that easy to misread. A pack becomes ``ready`` the moment
+its graph anchor is confirmed; failures AFTER that point -- an optional store
+(docs/vector) rejecting the anchor, or individual nodes and edges failing
+during ingest -- leave the registry at ``ready`` and are reported in the
+*response*'s own ``status`` field as ``"partial"``. That response field and
+this module's registry status are different things that happen to share a
+word. Only a failure to confirm the anchor itself demotes the row.
 
 That rule is not fastidiousness. Probing cannot support deletion here:
 ``opencrab/pack/load.py``'s chunk loader writes to the doc and vector stores
@@ -62,9 +71,32 @@ def _probe_one(store: Any, method_name: str, args: tuple[Any, ...],
 
     Mirrors ``write_gate._check_probes``' handling of malformed and missing
     stores, but answers a different question: that one asks "is this slot
-    someone else's", this one asks "is this pack's own anchor here". A row
-    found under a DIFFERENT pack_id answers the second question with "no" --
-    it is not our anchor -- which is ``absent``, not ``unknown``.
+    someone else's", this one asks "is this pack's own anchor here".
+
+    Only two answers are ever positive knowledge, and both require having
+    actually READ a non-empty string attribution:
+
+    - it equals ``pack_id`` -> ``present``, this is our anchor
+    - it is some other pack's -> ``absent``, our anchor is not in this slot
+
+    Everything else is ``unknown``, including the case that looks most like
+    an answer: a row that exists but carries no ``pack_id`` (a missing key,
+    ``None``, ``""``). That is an UNATTRIBUTED row sitting at our anchor's
+    identity, and whether it is ours is exactly what cannot be told. This is
+    where the contrast with ``_check_probes`` matters -- that function reads
+    the same falsy attribution as "unattributed legacy data, no conflict,
+    let the write through", which is the fail-closed answer to ITS question
+    and the fail-OPEN answer to this one. Reading it as ``absent`` here
+    would demote a pack whose anchor may well have landed, and since
+    promotion requires ``present``, nothing would ever bring it back.
+
+    A truthy value that is not a string (``123``, a dict, a list) is a shape
+    error, not evidence of another pack, so it lands in ``unknown`` too.
+
+    ``result is None`` -- the store answering "no such row" rather than
+    handing back a row -- is the one ``absent`` that needs no attribution
+    read. Every graph backend returns exactly that on a miss, which is what
+    keeps a genuinely empty ``creating`` pack resolvable by the repair pass.
     """
     if store is None or not getattr(store, "available", False):
         return PROBE_UNKNOWN
@@ -84,6 +116,8 @@ def _probe_one(store: Any, method_name: str, args: tuple[Any, ...],
         if not isinstance(value, Mapping):
             return PROBE_UNKNOWN
         value = value.get(key)
+    if not isinstance(value, str) or not value:
+        return PROBE_UNKNOWN
     return PROBE_PRESENT if value == pack_id else PROBE_ABSENT
 
 
@@ -386,6 +420,19 @@ def repair_incomplete_packs(
                 promote_result["applied"] = applied
                 if applied:
                     promote_result["status"] = PACK_STATUS_READY
+                else:
+                    # promote_partial_pack's WHERE only matches `partial`, so
+                    # a `creating` target (or one that changed underneath us)
+                    # comes back False with nothing to show for it. Report the
+                    # status we actually observed rather than asserting what it
+                    # must have been -- the row can move between the read above
+                    # and the UPDATE, and a fixed "it was not partial" would
+                    # then be a claim we never checked.
+                    promote_result["reason"] = (
+                        f"no row transitioned: --promote only promotes a "
+                        f"{PACK_STATUS_PARTIAL!r} row, and this one read as "
+                        f"{target['status']!r} just before the update"
+                    )
 
     return {
         "older_than_seconds": older_than_seconds,

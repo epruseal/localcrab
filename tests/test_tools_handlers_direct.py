@@ -1067,8 +1067,18 @@ class TestPackCreatePostWriterFailureDemotion:
     commit landing after a compensating delete would orphan the graph, and
     the chunk loader's write path (#205) means "no anchor" never implies
     "pack is empty" (there can be graph content beyond the anchor node
-    itself). Every post-writer failure now ends in mark_pack_partial
-    instead. This class used to be named TestPackCreateCompensatingDelete
+    itself). A pack whose anchor cannot be confirmed after that point ends
+    in mark_pack_partial instead.
+
+    "Cannot be confirmed" is the whole trigger, and it is narrower than
+    "something went wrong". Once the anchor IS confirmed the row goes to
+    ready and stays there; an optional store (docs/vector) rejecting the
+    anchor, or per-item ingest errors, only set the RESPONSE's own
+    "status" field to "partial". Two different fields, one word --
+    test_a_graph_success_keeps_registry_row_even_with_optional_failure
+    below pins both halves so the two cannot be conflated.
+
+    This class used to be named TestPackCreateCompensatingDelete
     and asserted the opposite (row deleted) -- renamed and rewritten in
     place rather than kept alongside a superseded twin, since the old
     assertions describe behaviour that no longer exists.
@@ -1155,11 +1165,17 @@ class TestPackCreatePostWriterFailureDemotion:
         assert row["status"] == PACK_STATUS_PARTIAL
 
     def test_a_graph_success_keeps_registry_row_even_with_optional_failure(self):
-        """Once graph.add_node has actually succeeded the branch is
-        unreachable -- an optional-store-only failure (docs here) must
-        leave the registry row in place, never compensate-delete a pack
-        that really exists."""
-        from opencrab.pack.ownership import get_pack
+        """A confirmed graph anchor makes the pack real, so an
+        optional-store-only failure (docs here) must not move the registry
+        off 'ready' -- and must still surface in the RESPONSE as
+        status="partial".
+
+        Both halves are asserted because they are the pair the shared word
+        invites conflating. Asserting only that the row survives would let
+        a wrong mark_pack_partial through: the row would still be there,
+        and the response would still say "partial", just for the wrong
+        reason and with the pack now invisible to every read."""
+        from opencrab.pack.ownership import PACK_STATUS_READY, get_pack
 
         sql = self._sql()
         builder = MagicMock()
@@ -1174,7 +1190,13 @@ class TestPackCreatePostWriterFailureDemotion:
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Partial Store", pack_id="partial-store-pack")
         assert "error" not in result
-        assert get_pack(sql, "partial-store-pack") is not None
+        # The response reports the optional-store damage...
+        assert result["status"] == "partial"
+        assert result["anchor_errors"] == ["docs: error: mongo down"]
+        # ...while the registry keeps the pack usable and visible.
+        row = get_pack(sql, "partial-store-pack")
+        assert row is not None
+        assert row["status"] == PACK_STATUS_READY
 
     def test_a6_failed_bobs_row_demotes_and_never_touches_alices_row(self):
         """#146 A6, rewritten for #170: mark_pack_partial's WHERE clause

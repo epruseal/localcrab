@@ -448,8 +448,12 @@ def delete_pack_row(
     delete for the ONE branch in this design that deletes at all (#170,
     design v4 §3.0): an anchor identity conflict caught BEFORE
     ``builder.add_node`` is ever called, where "no content exists" is
-    proven by control flow, not by a probe. Every failure after the first
-    writer call ends in ``mark_pack_partial`` instead -- never a delete.
+    proven by control flow, not by a probe. After that first writer call,
+    a pack whose anchor cannot be confirmed is demoted with
+    ``mark_pack_partial`` instead -- never deleted. (Failures past a
+    CONFIRMED anchor -- an optional store rejecting it, or per-item ingest
+    errors -- leave the row ``ready`` and are reported only in the tool
+    response; see ``pack_create``'s docstring for that distinction.)
     A full ``pack_delete`` (removing content too) is a separate,
     not-yet-built tool.
 
