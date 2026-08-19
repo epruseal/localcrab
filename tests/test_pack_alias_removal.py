@@ -356,14 +356,20 @@ def test_t7_live_alias_does_not_make_every_node_changed(live, tmp_path):
 
 def test_t7b_live_alias_does_not_make_every_chunk_meta_changed(live, tmp_path):
     """청크 축은 별도 비교 로직이라 노드축 제외가 자동 적용되지 않는다."""
-    _b, _g, docs = live
+    builder, _g, docs = live
     row = {"id": "c1", "document_id": "n1", "text": "본문"}
     f = _write_jsonl(tmp_path / "chunks.jsonl", [row])
     meta = pack_normalize.transform_chunk_meta("pack-1", row)
     live_chunks = {"c1": ("본문", {**meta, "pack": "pack-1"})}
 
-    c_new, c_txt, c_meta, c_same, err, _ids = pack_load.load_chunks_incremental(
-        "pack-1", f, _NoVec(), docs, live_chunks)
+    # #205: load_chunks_incremental 이 이제 sql= 로 팩 소유권 인가를 건다 --
+    # 이 파일의 T6/T7/T11/T12 와 같은 관례(builder._sql, _owned_principal)를
+    # 따른다: live 픽스처가 별도 sql 픽스처를 노출하지 않으므로 builder._sql 로
+    # 접근하고, "pack-1" 을 실제로 소유하는 principal 을 등록해 묶는다.
+    principal = _owned_principal(builder._sql, "pack-1")
+    with principal_scope(principal):
+        c_new, c_txt, c_meta, c_same, err, _ids = pack_load.load_chunks_incremental(
+            "pack-1", f, _NoVec(), docs, live_chunks, sql=builder._sql)
     assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
         "폐기 별칭 하나 때문에 청크가 meta 갱신 경로로 흘렀다")
 

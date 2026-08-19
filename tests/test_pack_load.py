@@ -156,18 +156,30 @@ _LIVE_TEST_PACKS = ("pack-1", "pack-a", "pack-b", "own-pack", "다른팩", "p")
 
 
 @pytest.fixture
-def live(tmp_path, monkeypatch):
+def pack_sql(tmp_path):
+    """등록부 `SQLStore` — `_LIVE_TEST_PACKS` 전량을 `_LIVE_TEST_USER` 소유로
+    등록해 반환한다(#205). `load_chunks`/`load_chunks_incremental` 이 이제
+    `sql=` 키워드 인자로 요구하는 등록부이고, `live` 도 이 fixture 위에 선다 —
+    같은 테스트 함수가 `live` 와 `pack_sql` 을 둘 다 요청하면 pytest 의
+    함수 스코프 캐싱이 같은 인스턴스를 준다(등록부와 그래프/문서 스토어가
+    같은 `tmp_path` 를 공유해야 하므로 별개 인스턴스면 안 된다).
+    """
+    sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+    for pack_id in _LIVE_TEST_PACKS:
+        create_pack(sql, _LIVE_TEST_USER, pack_id)
+    return sql
+
+
+@pytest.fixture
+def live(tmp_path, monkeypatch, pack_sql):
     """진짜 SQLite 3스토어 + LOCAL_DATA_DIR 실재. 외부 의존 0."""
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     graph = LocalGraphStore(str(tmp_path / "graph.db"))
     docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
-    sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
     assert graph.available
     principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
-    for pack_id in _LIVE_TEST_PACKS:
-        create_pack(sql, principal.user_id, pack_id)
     with principal_scope(principal):
-        yield OntologyBuilder(graph, docs, sql), graph, docs
+        yield OntologyBuilder(graph, docs, pack_sql), graph, docs
     graph.close()
     docs.close()
 
@@ -207,7 +219,7 @@ class TestCustomPropertiesSurvive:
             "최상위 커스텀 필드가 라이브에 도달하지 못했다 — 91만 필드 사고와 같은 형태다")
         assert props.get("중첩") == "값", "중첩 properties 가 유실됐다"
 
-    def test_every_row_kind_carries_pack_id_into_the_store(self, live, tmp_path):
+    def test_every_row_kind_carries_pack_id_into_the_store(self, live, tmp_path, pack_sql):
         """**축 전체를 닫는다** — 노드 하나만 걸던 판은 엣지·청크가 통째로 무방비였다.
 
         앞선 판은 `test_top_level_custom_field_reaches_the_store` 로 **노드만** 걸었다.
@@ -241,7 +253,7 @@ class TestCustomPropertiesSurvive:
         cf = _write_jsonl(tmp_path / "chunks.jsonl",
                           [{"id": "c1", "document_id": "n1", "text": "본문",
                             "metadata": {"쪽": "3"}}])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
 
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         assert set(state["nodes"]) == {"n1", "n2"}, "노드가 pack_id 로 안 찾아진다"
@@ -616,45 +628,45 @@ def _expect_doc_ratio_msg(pack, doc_cand, doc_denominator):
 
 
 class TestLoadChunks:
-    def test_chunks_reach_both_vector_and_doc_stores(self, live, tmp_path):
+    def test_chunks_reach_both_vector_and_doc_stores(self, live, tmp_path, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "chunks.jsonl", [_chunk(1), _chunk(2)])
         vec = _RecordingVec()
-        ok, err = pack_load.load_chunks("pack-1", f, vec, docs)
+        ok, err = pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
         assert (ok, err) == (2, 0)
         assert vec.ids == ["c1", "c2"]
         row = docs._conn.execute(
             "SELECT text FROM doc_sources WHERE source_id = ?", ("c1",)).fetchone()
         assert row is not None, "벡터에는 들어갔는데 문서 스토어에는 없다"
 
-    def test_unavailable_vector_store_skips_without_error(self, live, tmp_path):
+    def test_unavailable_vector_store_skips_without_error(self, live, tmp_path, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "chunks.jsonl", [_chunk(1)])
-        assert pack_load.load_chunks("pack-1", f, _NoVec(), docs) == (0, 0)
+        assert pack_load.load_chunks("pack-1", f, _NoVec(), docs, sql=pack_sql) == (0, 0)
 
-    def test_duplicate_ids_keep_only_the_first(self, live, tmp_path):
+    def test_duplicate_ids_keep_only_the_first(self, live, tmp_path, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "chunks.jsonl",
                          [_chunk(1, "처음"), _chunk(1, "나중"), _chunk(2)])
         vec = _RecordingVec()
-        ok, err = pack_load.load_chunks("pack-1", f, vec, docs)
+        ok, err = pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
         assert (ok, err) == (2, 0), "중복 ID 가 dedup 되지 않았다"
         assert vec.ids == ["c1", "c2"]
 
-    def test_batch_boundary_flushes(self, live, tmp_path):
+    def test_batch_boundary_flushes(self, live, tmp_path, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "chunks.jsonl", [_chunk(i) for i in range(5)])
         vec = _RecordingVec()
-        pack_load.load_chunks("pack-1", f, vec, docs, batch_size=2)
+        pack_load.load_chunks("pack-1", f, vec, docs, batch_size=2, sql=pack_sql)
         assert [n for n, _ in vec.calls] == [2, 2, 1], (
             f"배치 경계에서 flush 되지 않았다: {[n for n, _ in vec.calls]}")
 
-    def test_failed_batch_retries_one_by_one(self, live, tmp_path):
+    def test_failed_batch_retries_one_by_one(self, live, tmp_path, pack_sql):
         """배치 1건의 결함이 배치 전체를 날리면 안 된다 — 건별 재시도 폴백."""
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "chunks.jsonl", [_chunk(i) for i in range(3)])
         vec = _RecordingVec(fail_batches_larger_than=1)
-        ok, err = pack_load.load_chunks("pack-1", f, vec, docs)
+        ok, err = pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
         assert (ok, err) == (3, 0), "배치 실패 후 건별 재시도가 전부 살리지 못했다"
         assert [n for n, _ in vec.calls] == [3, 1, 1, 1], (
             f"배치 1회 실패 후 건별 3회여야 한다: {[n for n, _ in vec.calls]}")
@@ -670,38 +682,38 @@ class TestChunksIncremental:
     카운터만 보면 안 갈린다 — **임베딩 호출 여부**와 **doc_sources 실제 갱신**을 본다.
     """
 
-    def test_identical_chunk_is_skipped_without_re_embedding(self, live, tmp_path):
+    def test_identical_chunk_is_skipped_without_re_embedding(self, live, tmp_path, pack_sql):
         _b, _g, docs = live
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1, "본문")])
         vec = _RecordingVec()
-        pack_load.load_chunks("pack-1", f, vec, docs)
+        pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
         live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
             "SELECT source_id, text, metadata FROM doc_sources")}
 
         vec2 = _RecordingVec()
         c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
-            "pack-1", f, vec2, docs, live_chunks)
+            "pack-1", f, vec2, docs, live_chunks, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
             f"동일 청크가 same 이 아니다: new={c_new} txt={c_txt} meta={c_meta} same={c_same}")
         assert vec2.calls == [], (
             "동일 청크인데 임베딩을 다시 호출했다 — 매 증분마다 전량 재임베딩된다")
         assert ids == {"c1"}
 
-    def test_text_change_triggers_re_embedding(self, live, tmp_path):
+    def test_text_change_triggers_re_embedding(self, live, tmp_path, pack_sql):
         _b, _g, docs = live
         f1 = _write_jsonl(tmp_path / "c1.jsonl", [_chunk(1, "처음")])
-        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs, sql=pack_sql)
         live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
             "SELECT source_id, text, metadata FROM doc_sources")}
 
         f2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문")])
         vec = _RecordingVec()
         _n, c_txt, _m, c_same, _e, _i = pack_load.load_chunks_incremental(
-            "pack-1", f2, vec, docs, live_chunks)
+            "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
         assert (c_txt, c_same) == (1, 0), f"텍스트 변경이 txt 로 안 세어졌다 ({c_txt},{c_same})"
         assert vec.ids == ["c1"], "텍스트가 바뀌었는데 재임베딩하지 않았다"
 
-    def test_metadata_only_change_updates_the_store_without_re_embedding(self, live, tmp_path):
+    def test_metadata_only_change_updates_the_store_without_re_embedding(self, live, tmp_path, pack_sql):
         """메타만 바뀌면 재임베딩은 생략하되 **문서 스토어는 실제로 갱신**해야 한다.
 
         카운터만 보는 테스트는 "meta 로 세고 아무것도 안 하는" 변이를 통과시킨다.
@@ -711,7 +723,7 @@ class TestChunksIncremental:
         f1 = _write_jsonl(tmp_path / "c1.jsonl",
                           [{"id": "c1", "document_id": "n1", "text": "본문",
                             "metadata": {"쪽": "3"}}])
-        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs, sql=pack_sql)
         live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
             "SELECT source_id, text, metadata FROM doc_sources")}
 
@@ -720,7 +732,7 @@ class TestChunksIncremental:
                             "metadata": {"쪽": "99"}}])
         vec = _RecordingVec()
         _n, _t, c_meta, c_same, _e, _i = pack_load.load_chunks_incremental(
-            "pack-1", f2, vec, docs, live_chunks)
+            "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
         assert (c_meta, c_same) == (1, 0), f"메타 변경이 meta 로 안 세어졌다 ({c_meta},{c_same})"
         assert vec.calls == [], "메타만 바뀌었는데 재임베딩했다"
         stored = json.loads(docs._conn.execute(
@@ -763,7 +775,7 @@ class TestIncrementalFinalizeSafetyPins:
         assert "by-pack 파일 누락 의심" in str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
-    def test_zero_bypack_chunks_aborts_too(self, live, tmp_path):
+    def test_zero_bypack_chunks_aborts_too(self, live, tmp_path, pack_sql):
         """0-항목 핀은 **노드와 청크 둘**이다. 노드만 걸면 청크 핀이 무방비다.
 
         노드 핀만 테스트하던 판은 청크 핀을 통째로 통과시키는 변이가 46 passed 를
@@ -773,7 +785,7 @@ class TestIncrementalFinalizeSafetyPins:
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
-        pack_load.load_chunks("pack-1", f, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", f, _RecordingVec(), docs, sql=pack_sql)
         state = self._live(graph, docs)
         assert state["chunks"], "전제: 라이브에 청크가 있어야 한다"
         with pytest.raises(SystemExit) as ei:
@@ -886,7 +898,7 @@ class TestIncrementalFinalize:
 
     # ── 1. 0-item 안전핀 (근거: TestIncrementalFinalizeSafetyPins) ────────
 
-    def test_zero_item_pin_fires_for_nodes_and_chunks(self, live, tmp_path):
+    def test_zero_item_pin_fires_for_nodes_and_chunks(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         state = self._live(graph, docs)
@@ -897,7 +909,7 @@ class TestIncrementalFinalize:
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 노드가 지워졌다"
 
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state2 = self._live(graph, docs)
         with pytest.raises(SystemExit):
             pack_load.incremental_finalize(
@@ -988,7 +1000,7 @@ class TestIncrementalFinalize:
         assert res["edge_del"] == 0, (
             f"실제로 존재하지 않던 엣지인데 edge_del 을 세었다: {res}")
 
-    def test_vec_orphan_del_does_not_count_a_failed_batch(self, live, tmp_path):
+    def test_vec_orphan_del_does_not_count_a_failed_batch(self, live, tmp_path, pack_sql):
         """벡터 삭제가 예외를 던진 배치는 `vec_orphan_del`에 들어가면 안 된다.
 
         `vec.delete()`에는 실제 삭제를 확인할 API가 없어 성공 시엔 "요청 수"를 셀
@@ -997,7 +1009,7 @@ class TestIncrementalFinalize:
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path, n=1)
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
 
         class _VecThatAlwaysFailsDelete(_NoVec):
             available = True
@@ -1106,10 +1118,10 @@ class TestRatioPinAxisIsolation:
 
     # ── 청크 축 격리 (노드·doc 축 전부 비움 — 노드를 아예 안 심는다) ──────
 
-    def test_chunk_only_exactly_thirty_percent_is_not_aborted(self, live, tmp_path):
+    def test_chunk_only_exactly_thirty_percent_is_not_aborted(self, live, tmp_path, pack_sql):
         _builder, graph, docs = live
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(10)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state = self._live(graph, docs)
         assert state["nodes"] == {} and state["doc_node_spaces"] == {}, (
             "전제(자기 단언): 노드·doc 축이 완전히 비어 있어야 청크 축만 격리된다")
@@ -1120,10 +1132,10 @@ class TestRatioPinAxisIsolation:
             set(), keep_chunks, set(), False, 0, len(keep_chunks))
         assert res["chunk_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
 
-    def test_chunk_only_over_thirty_percent_aborts(self, live, tmp_path):
+    def test_chunk_only_over_thirty_percent_aborts(self, live, tmp_path, pack_sql):
         _builder, graph, docs = live
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(10)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state = self._live(graph, docs)
         assert state["nodes"] == {} and state["doc_node_spaces"] == {}, (
             "전제(자기 단언): 노드·doc 축이 완전히 비어 있어야 청크 축만 격리된다")
@@ -1256,10 +1268,10 @@ class TestPinRemovalIsNeutralAcrossSinks:
         assert ("n1", "cites", "n2") in left, (
             "저장 실패한 엣지(e1)가 지워졌다 — applied 보호 집합에 있어 안 지워져야 한다")
 
-    def test_chunk_write_failure_does_not_block_stale_chunk_cleanup(self, live, tmp_path):
+    def test_chunk_write_failure_does_not_block_stale_chunk_cleanup(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1, "본문1"), _chunk(2, "본문2")])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
             "SELECT source_id, text, metadata FROM doc_sources")}
         assert set(live_chunks) == {"c1", "c2"}
@@ -1280,7 +1292,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         # 파일에서 아예 빠졌다 — c1 의 실패와 무관한 stale 후보다.
         cf2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문1")])
         c_new, c_txt, c_meta, c_same, err, bypack_ids = pack_load.load_chunks_incremental(
-            "pack-1", cf2, _VecFailsOn("c1"), docs, live_chunks)
+            "pack-1", cf2, _VecFailsOn("c1"), docs, live_chunks, sql=pack_sql)
         assert err == 1, f"저장 실패가 err 로 안 잡혔다: c_txt={c_txt} err={err}"
         assert bypack_ids == {"c1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
 
@@ -1429,7 +1441,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         return pack_load.live_pack_state(pack, graph, docs, vec or _NoVec())
 
     def test_chunk_deletion_is_committed_and_visible_to_another_connection(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """삭제가 **별도 커넥션에서도** 보여야 한다 — `commit` 누락이 갈리는 지점이다.
 
         같은 커넥션으로만 확인하면 미커밋 삭제가 통과한다(N10). 그리고 카운트만 맞추고
@@ -1441,7 +1453,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         # 청크 4개 중 1개만 삭제 후보 = 25% — 30% 핀에 안 걸리게 한다.
         # (핀은 별도 테스트가 건다. 여기서 보는 것은 **핀을 통과한 뒤**의 삭제다.)
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(1, 5)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state = self._live(graph, docs)
         assert set(state["chunks"]) == {"c1", "c2", "c3", "c4"}
 
@@ -1537,7 +1549,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         left = set(self._live(graph, docs)["nodes"])
         assert "dataset:앵커" in left, f"앵커를 지웠다 — 남은 노드 {left}, node_del={res['node_del']}"
 
-    def test_vector_orphan_cleanup_excludes_this_run(self, live, tmp_path):
+    def test_vector_orphan_cleanup_excludes_this_run(self, live, tmp_path, pack_sql):
         """이번 적재의 노드·청크 id 는 벡터 고아 삭제에서 **둘 다** 빠져야 한다.
 
         하나만 빼면 살아있는 쪽의 벡터가 지워진다(N4·N6).
@@ -1545,7 +1557,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         builder, graph, docs = live
         self._seed_nodes(builder, tmp_path, ["n1"])
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
 
         class _VecWithIds(_NoVec):
             available = True
@@ -1570,7 +1582,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         assert "c1" not in vec.deleted, f"살아있는 청크의 벡터를 지웠다: {vec.deleted}"
 
     def test_chunk_deletion_batches_correctly_across_the_500_item_boundary(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """`_batched` 기본 크기(500)를 실제로 넘는 입력으로 배치 경계를 강제한다.
 
         한 배치만 도는 입력으로는 `chunk_del += cur.rowcount` 를 `= cur.rowcount`
@@ -1581,7 +1593,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         self._seed_nodes(builder, tmp_path, ["n1"])
         n = 620   # 500 경계를 넘겨 배치 2개(500+120)를 강제한다
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(i) for i in range(n)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state = self._live(graph, docs)
         assert len(state["chunks"]) == n
 
@@ -1608,7 +1620,7 @@ class TestIncrementalFinalizePositiveDeletionAcrossAllFourAxes:
     """
 
     def test_stale_node_chunk_edge_and_vector_orphan_are_all_actually_removed(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         import sqlite3
         builder, graph, docs = live
 
@@ -1620,7 +1632,7 @@ class TestIncrementalFinalizePositiveDeletionAcrossAllFourAxes:
                           [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
         pack_load.load_edges("pack-1", ef, builder, id_map)
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
 
         vec = _SqliteVecLike()
         vec.seed("pack-1", ["c1", "고아-벡터"])
@@ -1796,7 +1808,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         assert "c2" in after, f"무관 행이 delete_pack 의 FTS 삭제에 함께 지워졌다: {after}"
 
     def test_incremental_finalize_removes_the_fts_shadow_row_and_leaves_unrelated_row(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """`incremental_finalize` 경로의 FTS 삭제(load.py:1063) — `delete_pack` 과는
         **독립된 코드 경로**라 별도로 걸어야 한다. 행 단위 독립 readback."""
         builder, graph, docs = live
@@ -1806,7 +1818,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
         pack_load.load_nodes("pack-1", nf, builder, {})
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
-        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs)
+        pack_load.load_chunks("pack-1", cf, _RecordingVec(), docs, sql=pack_sql)
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         assert set(state["chunks"]) == {"c1", "c2"}, "전제: 삭제 전 대상이 live 에 있어야 한다"
 
@@ -2923,7 +2935,7 @@ class TestVecMetaUpdateChromaReplace:
         assert vec._collection.add_calls == []
         assert any("URI" in r.message for r in caplog.records), "URI 우회 경고가 안 남았다"
 
-    def test_uri_is_preserved_when_caller_falls_back_to_upsert(self):
+    def test_uri_is_preserved_when_caller_falls_back_to_upsert(self, pack_sql):
         """False 를 받은 호출자가 실제로 재임베딩(`upsert_texts`)으로 우회하면
         URI 는 보존되고 메타는 병합된다 — `load_chunks_incremental` 전체 경로로 확인."""
         vec = _FakeChromaVec({})
@@ -2935,8 +2947,10 @@ class TestVecMetaUpdateChromaReplace:
         live_chunks = {"c1": ("본문A", old_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
 
         assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
@@ -2986,7 +3000,7 @@ class TestVecMetaUpdateChromaReplace:
         assert vec._collection.embeddings.get("c1") is None
 
     # ⑫ add 실패 후 호출자 재임베딩 경로 — 최종 메타 정확 일치(스테일 무잔존)
-    def test_add_failure_then_caller_reembed_leaves_no_stale_keys(self):
+    def test_add_failure_then_caller_reembed_leaves_no_stale_keys(self, pack_sql):
         """add 가 실패하면 delete 로 이미 레코드가 지워진 상태다(⑧) — 호출자가
         재임베딩(upsert_texts)으로 우회하면 그 upsert 는 **부재 위에서** 실행되므로
         병합할 옛 메타가 없다. 최종 메타가 새 메타와 정확히 같아야 한다(스테일 무잔존).
@@ -3001,8 +3015,10 @@ class TestVecMetaUpdateChromaReplace:
         live_chunks = {"c1": ("본문A", old_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
 
         assert err == 0
@@ -3030,7 +3046,7 @@ class TestVecMetaUpdateChromaReplace:
         assert vec._collection.delete_calls == [["c1"]], "후-get 실패 전까지는 delete+add 가 진행돼야 한다"
 
     # ⑭ delete 실패 통합 시나리오 — 겹치는 키 갱신 + 여분 스테일 키 잔존(#175 창)
-    def test_delete_failure_then_caller_upsert_merges_and_leaves_stale_window(self):
+    def test_delete_failure_then_caller_upsert_merges_and_leaves_stale_window(self, pack_sql):
         """delete 가 실패하면 레코드가 원본 그대로 남는다(⑦) — 호출자가 재임베딩
         (upsert_texts→upsert)으로 우회하면 그 upsert 는 **기존 레코드 위에서 병합**된다.
         겹치는 키("x")는 새 값으로 갱신되지만 스테일 키("stale")는 살아남는다 —
@@ -3047,8 +3063,10 @@ class TestVecMetaUpdateChromaReplace:
         live_chunks = {"c1": ("본문A", old_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
 
         assert err == 0
@@ -3121,7 +3139,7 @@ class TestVecMetaUpdateChromaUriRealBackend:
         assert got["uris"][0] == "http://example.com/c1", (
             "False 반환 자체가 (재임베딩 우회 전에) URI 를 건드렸다")
 
-    def test_uri_preserved_end_to_end_through_load_chunks_incremental(self, tmp_path):
+    def test_uri_preserved_end_to_end_through_load_chunks_incremental(self, tmp_path, pack_sql):
         """_vec_meta_update → False → load_chunks_incremental 의 재임베딩
         폴백(upsert_texts, 이제 uri id 는 merge 경로) 경유 → URI 잔존 +
         document/meta 갱신 + 성공 카운터(c_txt) 단언."""
@@ -3137,8 +3155,10 @@ class TestVecMetaUpdateChromaUriRealBackend:
         live_chunks = {"c1": ("본문A", old_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-1", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
 
         assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
@@ -3397,7 +3417,7 @@ class TestVecMetaUpdatePackScope:
         assert vec.row("c1") == ("pack-a", "본문A", a_meta), (
             "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
 
-    def test_sql_vec0_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+    def test_sql_vec0_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
         vec = _SqlVecMetaLike()
         vec.seed("c1", "pack-a", "본문", {"pack_id": "pack-a", "document_id": "docA"})
 
@@ -3410,8 +3430,10 @@ class TestVecMetaUpdatePackScope:
         live_chunks = {"c1": ("본문", old_b_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
         assert err == 0
@@ -3453,7 +3475,7 @@ class TestVecMetaUpdatePackScope:
         assert vec.full_row("c1") == ("pack-a", "본문A", a_meta), (
             "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
 
-    def test_pgvector_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+    def test_pgvector_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
         vec = _SqlAlchemyVecLike()
         vec.seed("pack-a", ["c1"])
         vec.set_meta("c1", {"pack_id": "pack-a", "document_id": "docA"})
@@ -3465,8 +3487,10 @@ class TestVecMetaUpdatePackScope:
         live_chunks = {"c1": ("본문", old_b_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
         assert err == 0
@@ -3508,7 +3532,7 @@ class TestVecMetaUpdatePackScope:
             "fast-path False 인데도 남의 행 메타가 건드려졌다 — 부분 오염")
         assert vec._collection.documents["c1"] == "본문A"
 
-    def test_chroma_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self):
+    def test_chroma_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
         vec = _FakeChromaVec({})
         vec._collection.seed("c1", pack_id="pack-a", embedding=[0.1, 0.2], document="본문",
                               metadata={"pack_id": "pack-a", "document_id": "docA"})
@@ -3520,8 +3544,10 @@ class TestVecMetaUpdatePackScope:
         live_chunks = {"c1": ("본문", old_b_meta)}
         chunks_file = _write_jsonl_chunks_tmp([new_row])
 
-        stats = pack_load.load_chunks_incremental(
-            "pack-b", chunks_file, vec, _NullDocs(), live_chunks)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
         assert err == 0
@@ -3666,9 +3692,16 @@ class TestGuardActuallyFires:
     def test_write_function_aborts_without_live_data(self, name, monkeypatch, tmp_path):
         monkeypatch.delenv("LOCAL_DATA_DIR", raising=False)
         fn = getattr(pack_load, name)
-        n = len(inspect.signature(fn).parameters)
+        # #205: load_chunks/load_chunks_incremental 의 `sql` 은 키워드 전용
+        # 필수 인자다 — 전량을 위치 인자로 밀어 넣으면 TypeError 가 먼저 난다
+        # (그러면 이 테스트가 노리는 "LOCAL_DATA_DIR 가드가 인자 내용과
+        # 무관하게 제일 먼저 막는다"는 것 자체를 검증할 수 없다). 인자 종류별로
+        # 갈라 여전히 전 인자를 None 으로 채우되, 키워드 전용은 키워드로 준다.
+        params = inspect.signature(fn).parameters.values()
+        args = [None for p in params if p.kind != inspect.Parameter.KEYWORD_ONLY]
+        kwargs = {p.name: None for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY}
         with pytest.raises(SystemExit) as ei:
-            fn(*([None] * n))
+            fn(*args, **kwargs)
         assert "LOCAL_DATA_DIR" in str(ei.value)
         assert f"[{name}]" in str(ei.value), "어느 함수가 걸렸는지 말해야 한다"
 
@@ -3814,30 +3847,30 @@ class TestVectorMetadataFollowsDocMetadata:
         return _write_jsonl(tmp_path / "c.jsonl", [
             {"id": "c1", "text": "고정된 본문", "document_id": doc_id, "source": "p"}])
 
-    def test_metadata_change_reaches_the_vector_store(self, live, tmp_path):
+    def test_metadata_change_reaches_the_vector_store(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         vec = _RecordingVec()
-        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs)
+        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs, sql=pack_sql)
         state = pack_load.live_pack_state("p", graph, docs, _NoVec())
 
         c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
-            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"])
+            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"], sql=pack_sql)
         assert (c_meta, c_txt, c_same) == (1, 0, 0), (
             f"메타만 바뀐 청크가 meta 로 안 세어졌다 ({c_meta},{c_txt},{c_same})")
         assert vec.meta_updates, "벡터 메타 갱신이 호출되지 않았다 — doc 만 고쳐졌다"
         assert vec.metas["c1"]["document_id"] == "doc-B", (
             "벡터에 도달한 메타가 옛 값이다 — 의미검색이 계속 옛 메타를 돌려준다")
 
-    def test_unsupported_backend_falls_back_to_re_embedding(self, live, tmp_path):
+    def test_unsupported_backend_falls_back_to_re_embedding(self, live, tmp_path, pack_sql):
         """메타 갱신을 못 하는 백엔드면 **재임베딩으로라도** 맞춘다."""
         builder, graph, docs = live
         vec = _RecordingVec(supports_meta_update=False)
-        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs)
+        pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs, sql=pack_sql)
         state = pack_load.live_pack_state("p", graph, docs, _NoVec())
         before = len(vec.ids)
 
         c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
-            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"])
+            "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"], sql=pack_sql)
         assert c_meta == 0 and c_txt == 1, (
             f"미지원 백엔드인데 meta 로 세었다 ({c_meta},{c_txt}) — 벡터가 옛 메타로 남는다")
         assert len(vec.ids) > before, "재임베딩이 안 일어났다"
@@ -3874,18 +3907,18 @@ class _VecMetaAlwaysFailsAndReembedAlsoFails:
 class TestFailedVectorMetaUpdateDoesNotMoveTheDocBaseline:
     """① 벡터 갱신 실패 주입 시 doc 기준이 안 옮겨가고, 다음 증분이 c_same 이 아니어야 한다."""
 
-    def test_doc_metadata_stays_old_and_next_increment_reprocesses(self, live, tmp_path):
+    def test_doc_metadata_stays_old_and_next_increment_reprocesses(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         f1 = _write_jsonl(tmp_path / "c1.jsonl",
                           [{"id": "c1", "text": "고정된 본문", "document_id": "doc-A", "source": "p"}])
-        pack_load.load_chunks("p", f1, _RecordingVec(), docs)
+        pack_load.load_chunks("p", f1, _RecordingVec(), docs, sql=pack_sql)
         state = pack_load.live_pack_state("p", graph, docs, _NoVec())
 
         f2 = _write_jsonl(tmp_path / "c2.jsonl",
                           [{"id": "c1", "text": "고정된 본문", "document_id": "doc-B", "source": "p"}])
         broken = _VecMetaAlwaysFailsAndReembedAlsoFails()
         c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
-            "p", f2, broken, docs, state["chunks"])
+            "p", f2, broken, docs, state["chunks"], sql=pack_sql)
         assert err == 1 and c_meta == 0, (
             f"벡터가 완전히 죽었는데 성공으로 세었다 (c_meta={c_meta} err={err})")
 
@@ -3901,7 +3934,7 @@ class TestFailedVectorMetaUpdateDoesNotMoveTheDocBaseline:
         state2 = pack_load.live_pack_state("p", graph, docs, _NoVec())
         working_vec = _RecordingVec()
         c_new2, c_txt2, c_meta2, c_same2, err2, _ = pack_load.load_chunks_incremental(
-            "p", f2, working_vec, docs, state2["chunks"])
+            "p", f2, working_vec, docs, state2["chunks"], sql=pack_sql)
         assert c_same2 == 0, (
             "doc 기준이 안 옮겨갔어야 하는데 다음 증분이 same 으로 판정했다 — 영구 불일치")
         assert working_vec.metas.get("c1", {}).get("document_id") == "doc-B", (

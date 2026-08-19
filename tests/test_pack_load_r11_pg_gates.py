@@ -41,6 +41,7 @@ from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 �
     _RecordingVec,
     _write_jsonl,
     live,
+    pack_sql,
 )
 
 LOAD_SRC = pathlib.Path(pack_load.__file__).read_text(encoding="utf-8")
@@ -142,7 +143,7 @@ class TestP2DocWriteFailurePropagates:
     """
 
     def test_load_chunks_batch_path_counts_err_not_ok_and_baseline_does_not_advance(
-            self, live, tmp_path, monkeypatch, caplog):
+            self, live, tmp_path, monkeypatch, caplog, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
         vec = _RecordingVec()
@@ -157,7 +158,7 @@ class TestP2DocWriteFailurePropagates:
         monkeypatch.setattr(docs, "upsert_source", _boom)
 
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
-            ok, err = pack_load.load_chunks("pack-1", f, vec, docs)
+            ok, err = pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
 
         assert (ok, err) == (1, 1), (ok, err)
         assert vec.ids == ["c1", "c2"], "벡터는 doc 실패와 무관하게 둘 다 써졌어야 한다"
@@ -170,7 +171,7 @@ class TestP2DocWriteFailurePropagates:
         assert any("주입된 doc 쓰기 실패" in m and "c1" in m for m in msgs), msgs
 
     def test_load_chunks_flush_single_path_after_batch_vec_fallback_propagates_doc_failure(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         """배치 vec 실패 → 건별 재시도(`flush_single`) 경로에서도 doc 실패가 err."""
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
@@ -180,12 +181,12 @@ class TestP2DocWriteFailurePropagates:
             docs, "upsert_source",
             lambda sid, txt, meta: (_ for _ in ()).throw(RuntimeError("주입된 doc 쓰기 실패")))
 
-        ok, err = pack_load.load_chunks("pack-1", f, vec, docs)
+        ok, err = pack_load.load_chunks("pack-1", f, vec, docs, sql=pack_sql)
         assert (ok, err) == (0, 2), (ok, err)
         assert vec.ids == ["c1", "c2"], "건별 재시도에서 벡터는 둘 다 성공했어야 한다"
 
     def test_load_chunks_incremental_batch_path_propagates_doc_failure_and_keeps_bypack_ids(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
         vec = _RecordingVec()
@@ -194,14 +195,14 @@ class TestP2DocWriteFailurePropagates:
             lambda sid, txt, meta: (_ for _ in ()).throw(RuntimeError("boom")))
 
         c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
-            "pack-1", f, vec, docs, {})
+            "pack-1", f, vec, docs, {}, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 0, 2), (
             c_new, c_txt, c_meta, c_same, err)
         assert ids == {"c1", "c2"}, (
             "bypack_ids 가 doc 실패로 축소됐다 — 파일 유래 전량이어야 한다(불변식 ④)")
 
     def test_load_chunks_incremental_flush_single_path_propagates_doc_failure(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         _builder, _graph, docs = live
         f = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1), _chunk(2)])
         vec = _RecordingVec(fail_batches_larger_than=1)
@@ -210,7 +211,7 @@ class TestP2DocWriteFailurePropagates:
             lambda sid, txt, meta: (_ for _ in ()).throw(RuntimeError("boom")))
 
         c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
-            "pack-1", f, vec, docs, {})
+            "pack-1", f, vec, docs, {}, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 0, 2), (
             c_new, c_txt, c_meta, c_same, err)
         assert ids == {"c1", "c2"}
