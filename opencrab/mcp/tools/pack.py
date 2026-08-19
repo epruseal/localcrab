@@ -31,6 +31,58 @@ from ._registry import AccessTier, tool
 logger = logging.getLogger(__name__)
 
 
+def _pack_error(ctx: dict[str, Any], slug: str, subject_id: str, message: str,
+                *, disclose_status: bool = True) -> dict[str, Any]:
+    """A ``pack_create`` failure response that still names the pack (#170).
+
+    Several failure branches deliberately KEEP the registry row (design v4
+    §3.0 -- past the first content write, a pack that cannot be finalised is
+    demoted, never deleted). The caller needs the id of what was kept, and it
+    cannot derive it: ``create_pack``'s slug negotiation may have appended a
+    random suffix, so the assigned id can differ from the one requested. That
+    is why the success path already returns ``pack_id`` -- a failure that
+    leaves something behind owes the same.
+
+    ``registry_status`` is READ BACK rather than assumed. These branches have
+    just tried a transition that may not have applied (a demotion whose UPDATE
+    matched nothing, a re-registration that lost a PK race), and reporting the
+    intended status instead of the actual one would hand the caller a claim
+    this function never checked.
+
+    The status is disclosed ONLY for a row this caller owns, and ownership is
+    checked against what the read back just returned -- not against what the
+    branch believed a moment earlier. Every branch that lands here is a
+    concurrent-actor branch, so the row occupying this slug at read time can
+    be someone else's: the caller's own row went missing and another subject
+    claimed the slug, say. Reporting that row's status would disclose a
+    stranger's pack, and a ``creating`` one is invisible to every read path,
+    so the field would confirm precisely what slug negotiation exists to hide
+    -- that the slug is taken (#143 invariant 7). ``get_pack`` is unscoped by
+    design, so this is the check that has to make it scoped.
+
+    ``disclose_status=False`` short-circuits that for the branch that already
+    established the row is foreign; it changes nothing about the result, only
+    the wasted read.
+
+    The status is ``None`` rather than an absent key whenever it is withheld,
+    so every failure response from here has one shape. "We could not read it",
+    "it is not yours", and "there is no row" are all simply no information,
+    and a caller branching on the key's presence would be reading a
+    distinction that must not exist.
+    """
+    from opencrab.pack.ownership import get_pack
+
+    status: str | None = None
+    if disclose_status:
+        try:
+            row = get_pack(ctx["sql"], slug)
+        except Exception:  # noqa: BLE001 -- an error path must still answer
+            row = None
+        if row is not None and row["owner_id"] == subject_id:
+            status = row["status"]
+    return {"error": message, "pack_id": slug, "registry_status": status}
+
+
 def _slugify(text: str) -> str:
     """Generate a URL-safe pack_id slug from a title string.
 
@@ -951,7 +1003,7 @@ def pack_create(
                     "pack_create: could not demote pack_id=%s after a failed "
                     "compensating delete (identity-conflict branch)", slug,
                 )
-        return {"error": error_msg}
+        return _pack_error(ctx, slug, subject_id, error_msg)
 
     anchor_result: dict[str, Any] | None = None
     anchor_exc: Exception | None = None
@@ -1045,12 +1097,11 @@ def pack_create(
                     "pack_create: could not demote pack_id=%s after an "
                     "unconfirmed anchor write (verdict=%s)", slug, verdict,
                 )
-            return {
-                "error": (
-                    f"{write_detail}. {probe_detail}. Pack '{slug}' marked "
-                    f"partial, not deleted -- see #170 design v4 §3.0."
-                )
-            }
+            return _pack_error(
+                ctx, slug, subject_id,
+                f"{write_detail}. {probe_detail}. Pack '{slug}' marked "
+                f"partial, not deleted -- see #170 design v4 §3.0.",
+            )
 
     # graph_landed is True here, either from the direct check above or from
     # the re-probe's ANCHOR_GRAPH verdict.
@@ -1064,7 +1115,10 @@ def pack_create(
         try:
             row = get_pack(ctx["sql"], slug)
         except Exception as exc:
-            return {"error": f"could not reconcile pack '{slug}' after anchor write: {exc}"}
+            return _pack_error(
+                ctx, slug, subject_id,
+                f"could not reconcile pack '{slug}' after anchor write: {exc}",
+            )
 
         if row is None:
             # No delete branch in this design reaches this point (see the
@@ -1080,17 +1134,21 @@ def pack_create(
                 )
             except Exception:
                 anchor_confirmed = False
+            reregistered = False
             if anchor_confirmed:
                 try:
                     # PK-safe: if someone else's row already occupies this
                     # exact slug, _insert_pack returns False instead of
                     # overwriting it -- this call never writes into another
-                    # subject's pack.
-                    _insert_pack(
+                    # subject's pack. That False is kept, not discarded:
+                    # "we tried" and "it landed" are different claims and the
+                    # message below makes one of them.
+                    reregistered = _insert_pack(
                         ctx["sql"], slug, subject_id, _clean_str(title),
                         _clean_str(description or ""), None, status=PACK_STATUS_READY,
                     )
                 except Exception:
+                    reregistered = False
                     logger.warning(
                         "pack_create: re-registration of orphaned anchor "
                         "pack_id=%s failed", slug,
@@ -1098,32 +1156,37 @@ def pack_create(
             # Either way: no ingest. This call cannot safely attribute the
             # missing row to its own control flow, so it never proceeds as
             # if it had succeeded.
-            return {
-                "error": (
+            return _pack_error(
+                ctx, slug, subject_id,
+                (
                     f"pack '{slug}'s registry row was missing when finalizing "
                     f"the anchor write (not caused by this call -- see #170 "
                     f"design v4 §3.5); "
                     + (
                         "re-registered as ready since its graph anchor is "
                         "confirmed present, but "
+                        if reregistered
+                        else "re-registration was attempted (its graph anchor "
+                        "is confirmed present) but did not land -- the slug "
+                        "is held by another row; "
                         if anchor_confirmed
                         else "NOT re-registered because its graph anchor could "
                         "not be confirmed present, and "
                     )
                     + "this call did not ingest -- retry pack_ingest separately."
-                )
-            }
+                ),
+            )
 
         if row["owner_id"] != subject_id:
             # Someone else now owns this pack_id row -- never write into
             # it, never demote it (it may be their perfectly healthy pack),
             # never ingest.
-            return {
-                "error": (
-                    f"pack '{slug}' is no longer owned by this caller after "
-                    f"the anchor write; refusing to finalize or ingest."
-                )
-            }
+            return _pack_error(
+                ctx, slug, subject_id,
+                f"pack '{slug}' is no longer owned by this caller after "
+                f"the anchor write; refusing to finalize or ingest.",
+                disclose_status=False,
+            )
 
         if row["status"] != PACK_STATUS_READY:
             # Still ours but not 'ready'. mark_pack_ready not matching, plus
@@ -1138,13 +1201,12 @@ def pack_create(
                 mark_pack_partial(ctx["sql"], slug, subject_id)
             except Exception:
                 pass
-            return {
-                "error": (
-                    f"pack '{slug}' was moved to status={row['status']!r} by "
-                    f"another process before this call could finalize it; "
-                    f"ingest skipped."
-                )
-            }
+            return _pack_error(
+                ctx, slug, subject_id,
+                f"pack '{slug}' was moved to status={row['status']!r} by "
+                f"another process before this call could finalize it; "
+                f"ingest skipped.",
+            )
 
         # row["status"] == "ready" and it is ours: a repair pass (or an
         # operator's --promote) already promoted it between our anchor

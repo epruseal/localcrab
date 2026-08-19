@@ -477,3 +477,129 @@ class TestNoDeletionAfterWriterInvariant:
         with patch("opencrab.pack.ownership.mark_pack_ready", side_effect=_demote_underneath):
             _create(ctx, title="P", pack_id="inv-demoted")
         assert get_pack(sql, "inv-demoted") is not None
+
+
+class TestFailureResponseNamesTheRetainedPack:
+    """A failure that keeps the registry row has to say WHICH row (#170 PR
+    review, P2).
+
+    The caller cannot work it out. ``create_pack``'s slug negotiation
+    silently appends a random suffix when the requested id is taken (#143
+    invariant 7 -- an "already exists" error would confirm someone else holds
+    that exact slug), so the id that got reserved, demoted, and left behind
+    may be nothing the caller ever named. Without it in the response there is
+    no way to reach that row again: not to promote it with
+    ``packs repair-registry --promote``, not to ingest into it after the
+    stores recover, not even to recognise it in a later listing.
+
+    ``registry_status`` comes back as read, not as intended -- the demotion
+    these branches attempt can itself match no row."""
+
+    def test_suffixed_slug_is_returned_when_the_anchor_write_fails(self, sql):
+        """The case the id actually matters in: the requested slug was taken,
+        so what got retained is a suffixed id the caller never supplied."""
+        squatter = begin_pack_creation(sql, "someone-else", "coffee")
+        assert squatter == "coffee"  # the plain slug is now occupied
+
+        ctx = _base_ctx(sql)
+        ctx["builder"].add_node.side_effect = RuntimeError("graph down")
+        result = _create(ctx, title="Coffee", pack_id="coffee")
+
+        assigned = result["pack_id"]
+        assert assigned != "coffee", "the taken slug cannot have been reused"
+        assert assigned.startswith("coffee-")
+        assert result["registry_status"] == PACK_STATUS_PARTIAL
+
+        # The id is usable: it resolves to the retained row, and that row is
+        # ours rather than the squatter's.
+        row = get_pack(sql, assigned)
+        assert row is not None
+        assert row["owner_id"] == "alice"
+        assert row["status"] == PACK_STATUS_PARTIAL
+        # ...and the squatter's pack was left exactly as it was.
+        assert get_pack(sql, "coffee")["owner_id"] == "someone-else"
+
+    def test_status_is_read_back_not_assumed(self, sql):
+        """When the demotion itself fails to apply, the response must report
+        what the row IS, not what the branch tried to make it."""
+        ctx = _base_ctx(sql)
+        ctx["builder"].add_node.side_effect = RuntimeError("graph down")
+
+        import opencrab.pack.ownership as ownership_mod
+
+        with patch.object(
+            ownership_mod, "mark_pack_partial", side_effect=RuntimeError("update lost")
+        ):
+            result = _create(ctx, title="Stuck", pack_id="stuck-pack")
+
+        assert result["pack_id"] == "stuck-pack"
+        # The demotion never landed, so the row is still 'creating' -- and
+        # that, not 'partial', is what the caller is told.
+        assert result["registry_status"] == "creating"
+        assert get_pack(sql, "stuck-pack")["status"] == "creating"
+
+    def test_a_foreign_row_yields_its_id_but_not_its_status(self, sql):
+        """#143 invariant 7: the id is the caller's own, but another owner's
+        lifecycle state is not theirs to see."""
+        ctx = _base_ctx(sql)
+
+        import opencrab.pack.ownership as ownership_mod
+
+        with patch.object(
+            ownership_mod,
+            "mark_pack_ready",
+            side_effect=lambda s, p, o: _steal_owner(s, p, o),
+        ):
+            result = _create(ctx, title="Taken", pack_id="taken-pack")
+
+        assert result["pack_id"] == "taken-pack"
+        assert result["registry_status"] is None
+        assert get_pack(sql, "taken-pack")["owner_id"] == "mallory"
+
+    def test_a_row_that_became_foreign_during_the_read_back_stays_silent(self, sql):
+        """The leak the first version of this response shape had.
+
+        The window is narrow and specific: ``pack_create`` finds its own row
+        GONE, and by the time the response reads the registry back to report a
+        status, another subject has claimed the slug. The status read there
+        belongs to a stranger -- and a ``creating`` one is invisible to every
+        read path, so reporting it would confirm exactly what slug negotiation
+        exists to hide, that the slug is taken (#143 invariant 7).
+
+        The squat is timed inside the anchor re-probe, which the row-missing
+        branch runs between its own ``get_pack`` and the response. That is the
+        real window, not a stand-in for it: ``get_pack`` is unscoped by design,
+        so the ownership check has to live where the value enters the response.
+        """
+
+        def _vanish(sql_, pack_id, owner_id):
+            """``mark_pack_ready`` stand-in: the caller's row disappears."""
+            delete_pack_row(sql_, pack_id, owner_id)
+            return False
+
+        def _squat_then_report_absent(graph, docs, vector, pack_id):
+            """``probe_anchor`` stand-in: another subject takes the slug during
+            the probe, and the anchor is reported absent so the branch does not
+            attempt a re-registration (that path is covered elsewhere)."""
+            begin_pack_creation(sql, "mallory", pack_id)
+            return {"graph": "absent", "docs": "absent", "vector": "absent"}
+
+        ctx = _base_ctx(sql)
+
+        import opencrab.pack.lifecycle as lifecycle_mod
+        import opencrab.pack.ownership as ownership_mod
+
+        with (
+            patch.object(ownership_mod, "mark_pack_ready", side_effect=_vanish),
+            patch.object(lifecycle_mod, "probe_anchor", side_effect=_squat_then_report_absent),
+        ):
+            result = _create(ctx, title="Vanish", pack_id="vanish-pack")
+
+        assert result["pack_id"] == "vanish-pack"
+        assert result["registry_status"] is None, "a foreign row's status must not be reported"
+        # The row really is there and really is mallory's -- so the None above
+        # is a withheld value, not an absent row.
+        squatted = get_pack(sql, "vanish-pack")
+        assert squatted is not None
+        assert squatted["owner_id"] == "mallory"
+        assert squatted["status"] == "creating"

@@ -852,7 +852,9 @@ class TestPackCreate:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write raised: graph down" in result["error"]
         assert "marked partial, not deleted" in result["error"]
 
@@ -878,7 +880,9 @@ class TestPackCreate:
             result = pack_create(title="Broken Store", pack_id="broken-store-pack")
         # #170: verdict-based message, demoted not deleted -- see the
         # write-failure test above for the full rationale.
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write did not confirm in graph: graph: error: disk I/O" in result["error"]
         assert "marked partial, not deleted" in result["error"]
 
@@ -901,7 +905,9 @@ class TestPackCreate:
             result = pack_create(title="No Graph", pack_id="no-graph-pack")
         # #170: verdict-based message, demoted not deleted -- see
         # test_error_anchor_node_write_failure above for the full rationale.
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write did not confirm in graph: graph: unavailable" in result["error"]
         assert "marked partial, not deleted" in result["error"]
 
@@ -1109,7 +1115,9 @@ class TestPackCreatePostWriterFailureDemotion:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write raised: graph down" in result["error"]
         assert "marked partial, not deleted" in result["error"]
         row = get_pack(sql, "broken-pack")
@@ -1133,7 +1141,9 @@ class TestPackCreatePostWriterFailureDemotion:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken Store", pack_id="broken-store-pack")
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write did not confirm in graph: graph: error: disk I/O" in result["error"]
         assert "marked partial, not deleted" in result["error"]
         row = get_pack(sql, "broken-store-pack")
@@ -1157,7 +1167,9 @@ class TestPackCreatePostWriterFailureDemotion:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="No Graph", pack_id="no-graph-pack")
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write did not confirm in graph: graph: unavailable" in result["error"]
         assert "marked partial, not deleted" in result["error"]
         row = get_pack(sql, "no-graph-pack")
@@ -1327,7 +1339,9 @@ class TestPackCreatePostWriterFailureDemotion:
             mock_ctx.return_value = self._ctx(sql, builder)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="Broken", pack_id="broken-pack")
-        assert set(result) == {"error"}
+        # #170 review: a failure that RETAINS the registry row must name it,
+        # since slug negotiation can have suffixed the requested id.
+        assert set(result) == {"error", "pack_id", "registry_status"}
         assert "anchor node write raised: graph down" in result["error"]
         assert any(
             "could not demote" in rec.message and "broken-pack" in rec.message
