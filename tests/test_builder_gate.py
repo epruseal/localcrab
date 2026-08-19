@@ -282,3 +282,27 @@ def test_edge_slot_probe_uses_resolved_types_not_spaces(builder, sql):
     with pytest.raises(ValueError, match="already attributed"), principal_scope(ALICE):
         builder.add_edge("resource", "x", "cites", "resource", "y", pack_id="pack-a")
     assert graph.edges == [], "refused, so the foreign edge must be untouched"
+
+
+def test_endpoint_check_uses_the_resolved_row_not_any_same_id_row(builder, sql):
+    """Review finding: the endpoint check passed as soon as it saw ANY row with
+    the id in the target pack, while the unordered `lookup_node_type` could
+    still resolve to the OTHER pack's row -- attaching the edge to an endpoint
+    outside its own pack, which scoped export then hides.
+
+    Homonym shape: `dup` exists as Concept in pack-a and as Document in pack-b.
+    The lookup resolves Document (pack-b), so the write must be refused even
+    though a pack-a row with that id exists.
+    """
+    create_pack(sql, ALICE.user_id, "pack-b")
+    graph = builder._neo4j
+    _add(builder, node_id="anchor")
+    # Insertion order decides what the unordered lookup returns; put the
+    # FOREIGN row first so the resolved endpoint is pack-b's.
+    graph.nodes[("Document", "dup")] = {"pack_id": "pack-b", "space": "resource"}
+    graph.nodes[("Concept", "dup")] = {"pack_id": "pack-a", "space": "resource"}
+    assert graph.lookup_node_type("dup") == "Document", "precondition"
+
+    with pytest.raises(ValueError, match="already attributed"), principal_scope(ALICE):
+        builder.add_edge("resource", "anchor", "cites", "resource", "dup",
+                         pack_id="pack-a")

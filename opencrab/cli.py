@@ -442,7 +442,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
-    from opencrab.ontology.builder import store_write_failures
+    from opencrab.ontology.builder import store_write_succeeded
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.ownership import resolve_write_pack
@@ -504,13 +504,24 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                     metadata=meta, pack_id=target_pack_id,
                 )
                 # write_source reports per-store failures in the receipt
-                # rather than raising (#158 contract) -- unlike the old
-                # unguarded hybrid.ingest()/mongo.upsert_source() calls this
-                # replaces, a failure here would otherwise be swallowed and
-                # counted as an "OK" file.
-                failures = store_write_failures(receipt["stores"])
-                if failures:
-                    raise RuntimeError("; ".join(failures))
+                # rather than raising (#158 contract), so the receipt has to be
+                # read or a failure is counted as an "OK" file.
+                #
+                # Only the doc row is fatal. It is the system of record for a
+                # source; the vector leg is optional and fails on its own in
+                # any deployment without an embedding backend. Treating that as
+                # fatal aborted the whole file and skipped the audit row below
+                # -- the ingest looked successful and left no actor trail.
+                if not store_write_succeeded(receipt["stores"], "documents"):
+                    raise RuntimeError(
+                        f"source record failed: {receipt['stores'].get('documents')}"
+                    )
+                vector_status = receipt["stores"].get("chromadb")
+                if vector_status and str(vector_status).startswith("error"):
+                    console.print(
+                        f"  [yellow]vector leg failed for {source_id}: "
+                        f"{vector_status}[/yellow]"
+                    )
 
                 if mongo.available:
                     # Audit row carries the same actor as the source metadata.

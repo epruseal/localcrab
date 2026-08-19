@@ -362,6 +362,24 @@ def identity_reject_message(kind: str, ident: str, reason: str) -> str:
     return f"{ident}: identity is already attributed to a different pack"
 
 
+def resolved_endpoint_pack_conflict(
+    graph: Any, node_type: str, node_id: str, pack_id: str
+) -> str | None:
+    """Is the endpoint row the writer will actually attach to foreign?
+
+    Checks the exact ``(node_type, node_id)`` row -- the one the caller's
+    ``lookup_node_type`` just resolved -- rather than "any row with this id".
+    The by-id form below passes as soon as it sees a row in the target pack,
+    but with the same id held under two node_types (a supported shape) the
+    unordered lookup can still select the OTHER pack's row, and the edge then
+    attaches to an endpoint outside its own pack. Scoped edge export requires
+    both endpoints in scope, so that edge is written and immediately invisible.
+    """
+    return _check_probes(pack_id, [
+        (graph, "get_node", (node_type, node_id), ("pack_id",)),
+    ])
+
+
 def endpoint_pack_conflict(graph: Any, node_id: str, pack_id: str) -> str | None:
     """Is this edge endpoint attributed to a pack other than ``pack_id``?
 

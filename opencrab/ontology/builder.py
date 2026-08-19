@@ -24,9 +24,9 @@ from opencrab.pack.write_gate import (
     NODE_STAMPED,
     authorize,
     edge_identity_conflict,
-    endpoint_pack_conflict,
     identity_reject_message,
     node_identity_conflict,
+    resolved_endpoint_pack_conflict,
     stamp,
 )
 from opencrab.stores.mongo_store import MongoStore
@@ -118,6 +118,20 @@ class OntologyBuilder:
         canonicalize_pack_alias(props)
 
 
+        # Grammar validation FIRST -- before any probe. `node_type` is
+        # caller-controlled on the REST /api/nodes and MCP ontology_add_node
+        # paths, and Neo4jStore.get_node interpolates it directly into
+        # `MATCH (n:{node_type} ...)`. Probing before validating let an
+        # authenticated caller run mutating Cypher (e.g. a label of
+        # `X) DETACH DELETE n //`) even though the request was rejected a few
+        # lines later. Validation is pure and cheap; it belongs in front.
+        result = validate_node(space, node_type)
+        result.raise_if_invalid()
+
+        # Schema property validation (raises ValueError on failure)
+        prop_result = validate_node_properties(node_type, props)
+        prop_result.raise_if_invalid()
+
         # Identity slot guard (#146, promoted to the gate in #148). Node
         # identity is not qualified by pack on any backend, so writing an id
         # that already lives in another pack takes that pack's slot. Checked
@@ -129,14 +143,6 @@ class OntologyBuilder:
         )
         if reason:
             raise ValueError(identity_reject_message("node", node_id, reason))
-
-        # Grammar validation (raises ValueError on failure)
-        result = validate_node(space, node_type)
-        result.raise_if_invalid()
-
-        # Schema property validation (raises ValueError on failure)
-        prop_result = validate_node_properties(node_type, props)
-        prop_result.raise_if_invalid()
 
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
@@ -327,15 +333,6 @@ class OntologyBuilder:
             "stores": {},
         }
 
-        # #148: an edge may not straddle packs. export_edges_scoped needs
-        # BOTH endpoints in scope, so a cross-pack edge is a row its own pack's
-        # readers can never see -- refuse it instead of writing it. Unattributed
-        # endpoints pass (legacy data predates pack attribution).
-        for endpoint_id in (from_id, to_id):
-            reason = endpoint_pack_conflict(self._neo4j, endpoint_id, pack_id)
-            if reason:
-                raise ValueError(identity_reject_message("edge", endpoint_id, reason))
-
         # See add_node: graph down means the whole write is refused, not
         # fanned out to the optional stores (#146 follow-up).
         if not self._neo4j.available:
@@ -383,6 +380,25 @@ class OntologyBuilder:
             from_type = _space_to_default_type(from_space)
             to_type = _space_to_default_type(to_space)
             missing = []
+
+        # #148: an edge may not straddle packs. export_edges_scoped needs BOTH
+        # endpoints in scope, so a cross-pack edge is a row its own pack's
+        # readers can never see -- refuse it instead of writing it.
+        # Unattributed endpoints pass (legacy data predates pack attribution).
+        #
+        # Checked on the RESOLVED (type, id) rows, not on "any row with this
+        # id": with one id held under two node_types the by-id form passes as
+        # soon as it sees the target pack's row, while the unordered lookup
+        # above can still have picked the other pack's row to attach to.
+        if not missing:
+            for endpoint_type, endpoint_id in ((from_type, from_id), (to_type, to_id)):
+                reason = resolved_endpoint_pack_conflict(
+                    self._neo4j, endpoint_type, endpoint_id, pack_id
+                )
+                if reason:
+                    raise ValueError(
+                        identity_reject_message("edge", endpoint_id, reason)
+                    )
 
         # The edge's own slot, keyed by the backend's upsert conflict key --
         # which is (from_type, from_id, relation, to_type, to_id), the REAL
