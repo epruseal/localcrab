@@ -24,7 +24,16 @@ if TYPE_CHECKING:
 
 VISIBILITIES = ("private", "public-read", "public-fork")
 
-_SELECT_COLS = "pack_id, owner_id, visibility, title, description, forked_from, created_at, updated_at"
+_SELECT_COLS = (
+    "pack_id, owner_id, visibility, title, description, forked_from, "
+    "is_default, created_at, updated_at"
+)
+
+# #148: default-pack id prefix + random suffix, mirroring create_pack's
+# collision-suffix shape -- never `default-{user_id}` (that string-convention
+# design was rejected: it exposes user_id, couples the pack_id format to the
+# user_id format, and can't stop a second process from racing to the same id).
+_DEFAULT_PACK_ID_PREFIX = "default-"
 
 # On a pack_id collision, create_pack retries this many random-suffixed
 # candidates before giving up (see create_pack).
@@ -59,8 +68,12 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         "title": row[3],
         "description": row[4],
         "forked_from": row[5],
-        "created_at": str(row[6]) if row[6] is not None else None,
-        "updated_at": str(row[7]) if row[7] is not None else None,
+        # SQLite stores this as 0/1 (INTEGER, no native BOOLEAN type), PG as
+        # a real boolean -- normalize both to bool so callers never branch
+        # on backend.
+        "is_default": bool(row[6]),
+        "created_at": str(row[7]) if row[7] is not None else None,
+        "updated_at": str(row[8]) if row[8] is not None else None,
     }
 
 
@@ -118,6 +131,8 @@ def _insert_pack(
     title: str | None,
     description: str | None,
     forked_from: str | None,
+    *,
+    conn: Any = None,
 ) -> bool:
     """Attempt one INSERT. True on success, False if pack_id is already
     taken (PK violation). A plain SELECT-then-INSERT would race two
@@ -128,25 +143,33 @@ def _insert_pack(
     Only a pack_id collision (see ``_is_pack_id_conflict``) is swallowed
     into ``False`` -- any other ``IntegrityError`` (FK, CHECK, ...) is
     re-raised rather than misreported as "slug taken".
+
+    ``conn`` (#148): when given, the INSERT runs on that connection instead
+    of opening its own ``sql._engine.begin()`` transaction -- lets
+    ``ensure_default_pack`` compose this into a caller-supplied transaction
+    (e.g. ``create_user``'s single users+packs transaction) instead of
+    committing on its own.
     """
     from sqlalchemy import text
     from sqlalchemy.exc import IntegrityError
 
+    stmt = text(
+        "INSERT INTO packs (pack_id, owner_id, visibility, title, description, forked_from) "
+        "VALUES (:pid, :oid, 'private', :title, :desc, :forked)"
+    )
+    params = {
+        "pid": pack_id,
+        "oid": owner_id,
+        "title": title,
+        "desc": description,
+        "forked": forked_from,
+    }
     try:
-        with sql._engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO packs (pack_id, owner_id, visibility, title, description, forked_from) "
-                    "VALUES (:pid, :oid, 'private', :title, :desc, :forked)"
-                ),
-                {
-                    "pid": pack_id,
-                    "oid": owner_id,
-                    "title": title,
-                    "desc": description,
-                    "forked": forked_from,
-                },
-            )
+        if conn is not None:
+            conn.execute(stmt, params)
+        else:
+            with sql._engine.begin() as owned_conn:
+                owned_conn.execute(stmt, params)
         return True
     except IntegrityError as exc:
         if _is_pack_id_conflict(exc):
@@ -188,6 +211,118 @@ def create_pack(
         if _insert_pack(sql, candidate, owner_id, title, description, forked_from):
             return candidate
     raise RuntimeError(f"could not allocate a unique pack_id for {pack_id!r}")
+
+
+def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
+    """Return ``owner_id``'s default pack (``is_default=TRUE/1``), creating
+    it on first call. Idempotent: every subsequent call for the same
+    ``owner_id`` returns the same pack_id without inserting anything.
+
+    This is the ONLY way a pack gets ``is_default=TRUE`` -- the id is never
+    a string convention like ``default-{user_id}`` (rejected design: leaks
+    user_id, couples the pack_id format to the user_id format, and can't
+    stop two processes from racing to the same id). Instead the id is a
+    random ``default-{8 hex}`` slug, same shape as ``create_pack``'s
+    collision suffix, and uniqueness-per-owner is enforced by
+    ``idx_packs_one_default`` (the partial unique index migrated in
+    ``sql_store.py``), not by anything in this function.
+
+    ``conn`` (#148): when given (e.g. by ``opencrab.auth.create_user``, which
+    must create the user row and its default pack in ONE transaction because
+    ``packs.owner_id`` FK-references ``users.user_id``), this runs on that
+    connection and does not open or commit its own transaction -- the caller
+    owns the commit/rollback. When omitted, this opens its own
+    ``sql._engine.begin()`` transaction.
+    """
+    if conn is not None:
+        return _ensure_default_pack_on(sql, owner_id, conn)
+    with sql._engine.begin() as owned_conn:
+        return _ensure_default_pack_on(sql, owner_id, owned_conn)
+
+
+def _ensure_default_pack_on(sql: Any, owner_id: str, conn: Any) -> str:
+    """``ensure_default_pack``'s body, given an already-open ``conn``."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    select_existing = text(
+        "SELECT pack_id FROM packs WHERE owner_id = :oid AND is_default = :is_default"
+    )
+    # A Python bool binds correctly on both drivers here: pysqlite treats
+    # bool as an int subclass (True -> 1) against the INTEGER column, and
+    # psycopg binds it to a real boolean -- no per-dialect branch needed for
+    # this parameterized comparison (unlike the INSERT/ON CONFLICT text
+    # below, which is NOT parameterized because its literal spelling must
+    # match the partial index's predicate character-for-character).
+    row = conn.execute(select_existing, {"oid": owner_id, "is_default": True}).fetchone()
+    if row is not None:
+        return row[0]
+
+    # Measured (#148 round-5 verification): "ON CONFLICT (owner_id) WHERE
+    # is_default" (the shorthand PostgreSQL/SQLite upsert examples usually
+    # show) fails with "ON CONFLICT clause does not match any PRIMARY KEY or
+    # UNIQUE constraint" -- only the fully-spelled `= 1` / `= TRUE` predicate,
+    # matching idx_packs_one_default's own DDL text, is accepted as the
+    # arbiter. Keep these two predicates in sync if either ever changes.
+    if sql._is_sqlite:
+        insert_default = text(
+            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default) "
+            "VALUES (:pid, :oid, 'private', :title, 1) "
+            "ON CONFLICT (owner_id) WHERE is_default = 1 DO NOTHING"
+        )
+    else:
+        insert_default = text(
+            "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default) "
+            "VALUES (:pid, :oid, 'private', :title, TRUE) "
+            "ON CONFLICT (owner_id) WHERE is_default = TRUE DO NOTHING"
+        )
+
+    for _ in range(_MAX_RANDOM_ATTEMPTS):
+        candidate = f"{_DEFAULT_PACK_ID_PREFIX}{secrets.token_hex(8)}"
+        try:
+            # Measured (#148 round-5 verification): a pack_id PK collision on
+            # this INSERT surfaces as an IntegrityError, NOT rowcount 0 --
+            # the targeted ON CONFLICT arbiter above is idx_packs_one_default
+            # (owner_id), so it only absorbs an owner_id conflict; a pack_id
+            # collision (this random candidate happening to match some
+            # unrelated existing pack) isn't that arbiter's conflict to
+            # swallow. Without begin_nested()'s SAVEPOINT, that IntegrityError
+            # would abort the WHOLE outer transaction on PostgreSQL (not just
+            # this statement), taking down anything else conn is doing (e.g.
+            # create_user's users INSERT).
+            with conn.begin_nested():
+                result = conn.execute(
+                    insert_default, {"pid": candidate, "oid": owner_id, "title": "Default pack"}
+                )
+        except IntegrityError as exc:
+            if _is_pack_id_conflict(exc):
+                continue
+            raise
+        if result.rowcount > 0:
+            return candidate
+        # rowcount 0: the ON CONFLICT DO NOTHING fired, meaning another
+        # process/thread already holds owner_id's default pack -- go read it.
+        row = conn.execute(select_existing, {"oid": owner_id, "is_default": True}).fetchone()
+        assert row is not None  # the DO NOTHING branch means one must exist
+        return row[0]
+    raise RuntimeError(f"could not allocate a unique default pack_id for owner {owner_id!r}")
+
+
+def resolve_write_pack(sql: Any, principal: Principal, requested: str | None) -> str:
+    """The pack_id a write should target: ``requested`` if the caller named
+    one, else ``principal``'s default pack.
+
+    Authorization is NOT this function's job -- a caller-supplied
+    ``requested`` is returned as-is, and it's on the caller to run it through
+    ``assert_writable`` (this keeps ``resolve_write_pack`` usable in read
+    paths too, where "may I write here" doesn't apply). This exists so no
+    write path can leave ``pack_id`` unset: every write lands in a pack, one
+    way or another (see module docstring / #143 "팩 없는 쓰기 경로를 남기지
+    않는다").
+    """
+    if requested:
+        return requested
+    return ensure_default_pack(sql, principal.user_id)
 
 
 def delete_pack_row(sql: Any, pack_id: str, owner_id: str) -> bool:

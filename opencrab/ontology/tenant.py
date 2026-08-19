@@ -22,14 +22,14 @@ TenantContext is a thin dataclass passed through the call stack.
 headers/arguments (``extract_tenant_context``, ``filter_by_tenant``, and
 ``TenantContext.allowed_spaces`` were deleted — zero production callers, and
 the identity they carried is now the server-derived ``opencrab.auth``
-Principal instead, see #143's "principal" definition). Only
-``stamp_properties`` is still live, called from
-``opencrab.mcp.tools.graph.ontology_add_node`` with a ``TenantContext`` built
-from ``tenant_id="default"`` and the caller's ``current_principal().user_id``.
+Principal instead, see #143's "principal" definition).
 
-Usage:
-    ctx = TenantContext(tenant_id="default", subject_id=current_principal().user_id)
-    stamp_properties(properties, ctx)
+``stamp_properties`` has **no production callers left** (#148). It used to be
+called from ``opencrab.mcp.tools.graph.ontology_add_node``, which made the
+same node carry ``tenant_id``/``created_by`` over MCP and not over REST --
+two stampers disagreeing. Ownership stamping now happens in one place,
+``opencrab.pack.write_gate.stamp``, which every writer calls. What remains
+here is referenced only by tests and is a deletion candidate.
 """
 
 from __future__ import annotations

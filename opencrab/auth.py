@@ -105,13 +105,25 @@ def hash_token(secret: str) -> str:
 
 
 def create_user(sql: Any, display_name: str, is_local: bool = False) -> str:
-    """Insert a new user row. Returns the generated user_id.
+    """Insert a new user row and its default pack, in ONE transaction.
+    Returns the generated user_id.
 
     Raises the underlying driver's IntegrityError if ``is_local=True`` and a
     local user already exists -- ``idx_users_single_local`` (sql_store.py)
     enforces at most one at the DB level, so there's nothing to check here.
+
+    #148: every user needs a default pack to write into when a write omits
+    ``pack_id`` (see ``opencrab.pack.ownership.ensure_default_pack``), and
+    ``packs.owner_id`` FK-references ``users.user_id`` -- so the pack insert
+    must happen AFTER the user row lands, and in the SAME transaction: a
+    crash between two separate transactions would leave a user with no
+    default pack that ``resolve_write_pack`` could hand out (the "legacy
+    user" case is recovered lazily there, but there's no reason to create
+    that state on the happy path).
     """
     from sqlalchemy import text
+
+    from opencrab.pack.ownership import ensure_default_pack
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     with sql._engine.begin() as conn:
@@ -122,6 +134,7 @@ def create_user(sql: Any, display_name: str, is_local: bool = False) -> str:
             ),
             {"user_id": user_id, "display_name": display_name, "is_local": is_local},
         )
+        ensure_default_pack(sql, user_id, conn=conn)
     return user_id
 
 
@@ -243,18 +256,25 @@ def issue_token(sql: Any, user_id: str, name: str | None = None) -> tuple[str, s
 def bootstrap_local_user(
     sql: Any, *, display_name: str = "local", token_name: str | None = "bootstrap"
 ) -> tuple[str, str]:
-    """Create the local user and issue its first token in ONE transaction.
-    Returns ``(user_id, secret)``.
+    """Create the local user, its default pack, and issue its first token,
+    all in ONE transaction. Returns ``(user_id, secret)``.
 
     Used only by ``opencrab init``'s bootstrap path (see cli.py's
     ``_bootstrap_local_user``): ``create_user`` + ``issue_token`` run as two
     separate transactions, so a crash between them could leave a local user
     with no token that could ever verify -- and since ``idx_users_single_local``
     caps ``is_local=1`` at one row, that user could never be recreated either.
-    Wrapping both inserts in a single ``begin()`` means a failure of either
-    rolls back both, leaving no partial state.
+    Wrapping every insert in a single ``begin()`` means a failure of any one
+    rolls back all of them, leaving no partial state.
+
+    #148: the default-pack insert is here (not a call to ``create_user``,
+    which would open its own transaction) for the same all-or-nothing reason
+    -- see ``create_user``'s docstring for why the pack must exist before
+    any write can omit ``pack_id``, and after the users row (FK).
     """
     from sqlalchemy import text
+
+    from opencrab.pack.ownership import ensure_default_pack
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
@@ -267,6 +287,7 @@ def bootstrap_local_user(
             ),
             {"user_id": user_id, "display_name": display_name, "is_local": True},
         )
+        ensure_default_pack(sql, user_id, conn=conn)
         conn.execute(
             text(
                 "INSERT INTO api_tokens (token_id, user_id, token_hash, name) "

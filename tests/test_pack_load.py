@@ -22,9 +22,11 @@ from decimal import Decimal
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
 from opencrab.pack.normalize import transform_chunk_meta
+from opencrab.pack.ownership import create_pack
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
@@ -142,6 +144,17 @@ class TestBatched:
 
 # ───────────────────────── 행동: 진짜 3스토어 ─────────────────────────
 
+# #148: OntologyBuilder.add_node/add_edge now authorize via current_principal()
+# (assert_writable) before every write -- no bound principal means LookupError,
+# and a pack_id with no packs-registry row means PackNotFoundError even with a
+# principal bound. This suite exercises many pack_id literals ("pack-1",
+# "pack-a", ...) through `live`'s builder, so `live` pre-registers every one
+# of them (owned by the same fixed test principal) instead of making each
+# test call create_pack for itself.
+_LIVE_TEST_USER = "test-user"
+_LIVE_TEST_PACKS = ("pack-1", "pack-a", "pack-b", "own-pack", "다른팩", "p")
+
+
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     """진짜 SQLite 3스토어 + LOCAL_DATA_DIR 실재. 외부 의존 0."""
@@ -150,7 +163,11 @@ def live(tmp_path, monkeypatch):
     docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
     sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
     assert graph.available
-    yield OntologyBuilder(graph, docs, sql), graph, docs
+    principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+    for pack_id in _LIVE_TEST_PACKS:
+        create_pack(sql, principal.user_id, pack_id)
+    with principal_scope(principal):
+        yield OntologyBuilder(graph, docs, sql), graph, docs
     graph.close()
     docs.close()
 
@@ -424,7 +441,7 @@ class TestLoadEdges:
         # 같은 (from, relation, to) 는 upsert 로 덮이므로 **순차로** 확인한다.
         seen = []
         for f, raw in ((lower, "cites"), (upper, "CITES")):
-            ok, skip, err = pack_load.load_edges("p", f, builder, id_map)
+            ok, skip, err = pack_load.load_edges("pack-1", f, builder, id_map)
             assert (ok, skip, err) == (1, 0, 0), f"{raw}: ok={ok} skip={skip} err={err}"
             rel, props = graph._conn.execute(
                 "SELECT relation, properties FROM graph_edges WHERE from_id = ?",
@@ -1454,14 +1471,22 @@ class TestIncrementalFinalizeActuallyDeletes:
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
         id_map: dict = {}
         pack_load.load_nodes("pack-1", nf, builder, id_map)
-        pack_load.load_nodes("다른팩", nf, builder, id_map)
         ef = _write_jsonl(tmp_path / "e.jsonl",
                           [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
         pack_load.load_edges("pack-1", ef, builder, id_map)
 
         state = self._live(graph, docs)                 # ① pack-1 상태 포착
         assert state["edges"], "전제: 포착 시점에 pack-1 이 그 엣지를 갖는다"
-        pack_load.load_edges("다른팩", ef, builder, id_map)   # ② 다른 팩이 같은 triple 을 가져간다
+        # ② 다른 팩이 같은 triple 을 가져간다.
+        # 이 인수는 #148 이후 **로더로는 만들 수 없다** — 엣지 끝점 규칙이 남의 팩
+        # 노드를 끝점으로 하는 엣지를 거부한다. 그래도 `graph_edges` PK 가 pack_id 를
+        # 담지 않는다는 사실은 그대로이고(마이그레이션 전 데이터, 스토어 직접 쓰기,
+        # 다른 백엔드 경로), 이 테스트가 고정하는 것은 **정리 필터**이지 로더가 그
+        # 상태를 만들어 주느냐가 아니다. 그래서 전제를 스토어에 직접 쓴다.
+        graph._conn.execute(
+            "UPDATE graph_edges SET properties = json_set(properties, '$.pack_id', ?)",
+            ("다른팩",))
+        graph._conn.commit()
         owner = json.loads(graph._conn.execute(
             "SELECT properties FROM graph_edges").fetchone()[0]).get("pack_id")
         assert owner == "다른팩", f"전제: 소유가 넘어가야 한다 (현재 {owner})"
@@ -4444,3 +4469,28 @@ class TestLoadLogsInsteadOfSwallowing:
         assert any("주입된 노드 삭제 실패" in r.getMessage() for r in caplog.records), (
             "노드 삭제 실패가 로그에 안 남았다: "
             f"{[r.getMessage() for r in caplog.records]}")
+
+
+class TestLoaderReplaysServerStampedIdentity:
+    """The loader restores dumps this server wrote, so a historical `owner_id`
+    in the dump is server data being replayed -- not a client forging identity.
+
+    Review finding (#204): without `origin="server"` the gate calls that value
+    forged, the node is refused, and it disappears from the reload counted only
+    as a skip. Pinned here because the wiring itself had no coverage: removing
+    `origin="server"` from every loader call site killed nothing in the suite.
+    """
+
+    def test_a_dump_carrying_a_past_owner_id_still_loads(self, live, tmp_path):
+        builder, graph, _ = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [
+            _node(id="replayed", owner_id="user_from_a_past_life"),
+        ])
+        ok, skip, err = pack_load.load_nodes("pack-1", nf, builder, {})
+        assert (ok, skip, err) == (1, 0, 0), (
+            f"replayed owner_id was rejected: ok={ok} skip={skip} err={err}"
+        )
+        row = graph.get_node("Document", "replayed")
+        assert row["owner_id"] == _LIVE_TEST_USER, (
+            "the importing principal must own the reloaded row, not the dump's author"
+        )

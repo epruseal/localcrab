@@ -40,7 +40,7 @@ import pytest
 
 from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
-from opencrab.pack.ownership import create_pack, set_visibility
+from opencrab.pack.ownership import create_pack, ensure_default_pack, set_visibility
 from opencrab.pack.read_scope import (
     RegistryGraphMismatchError,
     assert_registry_covers_graph,
@@ -200,11 +200,17 @@ def _ids(nodes: list[dict[str, Any]]) -> set[str]:
 
 class TestCrossUserIsolation:
     def test_scope_is_exactly_owned_plus_public(self, sql, seeded):
-        assert read_scope(sql, seeded["alice"]) == frozenset({PACK_A, PACK_PUBLIC})
-        assert read_scope(sql, seeded["bob"]) == frozenset({PACK_B, PACK_PUBLIC})
-        # Carol owns nothing, so she sees exactly the public pack and no
-        # more -- "owns nothing" is not the same as "reads nothing".
-        assert read_scope(sql, seeded["carol"]) == frozenset({PACK_PUBLIC})
+        # #148: create_user gives every user a default pack in the same
+        # transaction, so each principal's own scope always includes it too.
+        alice_default = ensure_default_pack(sql, seeded["alice"].user_id)
+        bob_default = ensure_default_pack(sql, seeded["bob"].user_id)
+        carol_default = ensure_default_pack(sql, seeded["carol"].user_id)
+        assert read_scope(sql, seeded["alice"]) == frozenset({PACK_A, PACK_PUBLIC, alice_default})
+        assert read_scope(sql, seeded["bob"]) == frozenset({PACK_B, PACK_PUBLIC, bob_default})
+        # Carol owns nothing beyond her own default pack, so she sees
+        # exactly the public pack plus that -- "owns nothing named" is not
+        # the same as "reads nothing".
+        assert read_scope(sql, seeded["carol"]) == frozenset({PACK_PUBLIC, carol_default})
 
     def test_list_nodes_without_pack_id_shows_own_and_public_only(self, ctx, seeded):
         from opencrab.mcp.tools import ontology_list_nodes
@@ -516,14 +522,35 @@ class TestEmptyScopeFailsClosed:
     def test_user_with_no_packs_sees_nothing_through_the_read_tools(
         self, ctx, sql, seeded
     ):
+        from sqlalchemy import text
+
         from opencrab.mcp.tools import ontology_get_node, ontology_list_edges, ontology_list_nodes
 
-        # A genuinely empty scope needs no public pack to exist either --
-        # otherwise carol still reads that one, correctly.
-        set_visibility(sql, seeded["alice"], PACK_PUBLIC, "private")
-        assert read_scope(sql, seeded["carol"]) == frozenset()
+        # #148: create_user always makes a default pack in the same
+        # transaction, so a principal made that way can no longer have a
+        # truly empty scope -- carol (from the `seeded` fixture) now reads
+        # her own default pack. To still pin the fail-closed behaviour for a
+        # GENUINELY empty scope, insert the users row directly (bypassing
+        # create_user), the same "legacy user, no default pack yet" shape
+        # ownership.ensure_default_pack's docstring and
+        # tests/test_default_pack.py's TestEnsureDefaultPack pin as still
+        # reachable (a pre-#148 row, or one not yet lazily recovered).
+        with sql._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (user_id, display_name, is_local) "
+                    "VALUES (:uid, :name, :is_local)"
+                ),
+                {"uid": "packless-dave", "name": "Dave", "is_local": False},
+            )
+        packless = Principal(user_id="packless-dave", is_local=False, disabled=False)
 
-        with _as(ctx, seeded["carol"]):
+        # A genuinely empty scope needs no public pack to exist either --
+        # otherwise packless-dave still reads that one, correctly.
+        set_visibility(sql, seeded["alice"], PACK_PUBLIC, "private")
+        assert read_scope(sql, packless) == frozenset()
+
+        with _as(ctx, packless):
             assert ontology_list_nodes()["nodes"] == []
             assert ontology_list_nodes()["total"] == 0
             assert ontology_list_edges()["edges"] == []

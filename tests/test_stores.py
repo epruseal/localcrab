@@ -443,7 +443,9 @@ class TestLocalGraphStore:
         Neo4jStore), the builder now resolves the actual node_type from the
         store and writes typed edges in either mode.
         """
+        from opencrab.auth import Principal, principal_scope
         from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.pack.ownership import create_pack
         from opencrab.stores.local_doc_store import LocalDocStore
         from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.sql_store import SQLStore
@@ -453,18 +455,24 @@ class TestLocalGraphStore:
         sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
         builder = OntologyBuilder(graph, doc, sql)
 
-        builder.add_node(
-            space="subject", node_type="Team", node_id="team_alpha",
-            properties={"name": "Team Alpha"},
-        )
-        builder.add_node(
-            space="resource", node_type="Document", node_id="doc_42",
-            properties={"title": "Sample Doc"},
-        )
-        builder.add_edge(
-            from_space="subject", from_id="team_alpha", relation="owns",
-            to_space="resource", to_id="doc_42",
-        )
+        # #148: add_node/add_edge now authorize the write via
+        # current_principal() (assert_writable) -- a principal must be bound
+        # and the target pack_id must exist in the packs registry first.
+        principal = Principal(user_id="test-user", is_local=True, disabled=False)
+        create_pack(sql, principal.user_id, "pack-1")
+        with principal_scope(principal):
+            builder.add_node(
+                space="subject", node_type="Team", node_id="team_alpha",
+                properties={"name": "Team Alpha"}, pack_id="pack-1",
+            )
+            builder.add_node(
+                space="resource", node_type="Document", node_id="doc_42",
+                properties={"title": "Sample Doc"}, pack_id="pack-1",
+            )
+            builder.add_edge(
+                from_space="subject", from_id="team_alpha", relation="owns",
+                to_space="resource", to_id="doc_42", pack_id="pack-1",
+            )
 
         # The edge should carry the real node_types (Team / Document),
         # not the per-space defaults (User / Project).
@@ -479,14 +487,28 @@ class TestLocalGraphStore:
 
 
 class TestBuilderSubjectIdAudit:
-    """Issue #119: subject_id passed to OntologyBuilder.add_node/add_edge must
-    reach the doc store's audit log (log_event), not just billing. These tests
-    exercise the REAL LocalDocStore (not a mock) so the audit trail is checked
-    end to end: builder call -> log_event -> get_audit_log.
+    """Issue #119: the caller's identity must reach the doc store's audit log
+    (log_event), not just billing.
+
+    #148 changed how that identity gets to the builder: ``subject_id`` is no
+    longer an ``add_node``/``add_edge`` keyword argument -- the builder now
+    derives it internally from the BOUND PRINCIPAL
+    (``opencrab.auth.current_principal()``, via ``write_gate.stamp``) and
+    always logs ``principal.user_id`` as ``subject_id``. It can no longer be
+    ``None``: a principal is now mandatory (``add_node``/``add_edge`` raise
+    ``LookupError`` with none bound), so the old "omitted subject_id keeps
+    existing behaviour (None)" case no longer exists as a callable shape.
+    These tests replace it with "a different bound principal's writes are
+    attributed to THAT principal, not the first" -- the same non-hardcoded
+    plumbing guarantee the old pair of tests gave, adapted to the new
+    mechanism. They exercise the REAL LocalDocStore (not a mock) so the
+    audit trail is checked end to end: bound principal -> builder call ->
+    log_event -> get_audit_log.
     """
 
     def _builder(self, tmp_path):
         from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.pack.ownership import create_pack
         from opencrab.stores.local_doc_store import LocalDocStore
         from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.sql_store import SQLStore
@@ -494,60 +516,81 @@ class TestBuilderSubjectIdAudit:
         graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
         doc = LocalDocStore(data_dir=str(tmp_path / "docs"))
         sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
+        # Each principal below needs its own owned pack to write into
+        # (add_node/add_edge authorize via assert_writable, #148).
+        create_pack(sql, "actor-1", "pack-1")
+        create_pack(sql, "actor-2", "pack-2")
         return OntologyBuilder(graph, doc, sql), doc
 
-    def test_add_node_subject_id_reaches_audit_log(self, tmp_path):
+    def test_add_node_subject_id_is_the_bound_principals_user_id(self, tmp_path):
+        from opencrab.auth import Principal, principal_scope
+
         builder, doc = self._builder(tmp_path)
-        builder.add_node(
-            space="subject", node_type="User", node_id="u1",
-            properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
-            subject_id="actor-1",
-        )
+        with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            builder.add_node(
+                space="subject", node_type="User", node_id="u1",
+                properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+                pack_id="pack-1",
+            )
         entries = doc.get_audit_log(event_type="node_upsert")
         assert len(entries) == 1
         assert entries[0]["subject_id"] == "actor-1"
 
-    def test_add_node_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
-        builder, doc = self._builder(tmp_path)
-        builder.add_node(
-            space="subject", node_type="User", node_id="u1",
-            properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
-        )
-        entries = doc.get_audit_log(event_type="node_upsert")
-        assert len(entries) == 1
-        assert entries[0]["subject_id"] is None
+    def test_add_node_subject_id_follows_a_different_bound_principal(self, tmp_path):
+        from opencrab.auth import Principal, principal_scope
 
-    def test_add_edge_subject_id_reaches_audit_log(self, tmp_path):
         builder, doc = self._builder(tmp_path)
-        builder.add_node(
-            space="subject", node_type="Team", node_id="team_alpha", properties={"name": "Alpha"}
-        )
-        builder.add_node(
-            space="resource", node_type="Document", node_id="doc_42", properties={"title": "Doc"}
-        )
-        builder.add_edge(
-            from_space="subject", from_id="team_alpha", relation="owns",
-            to_space="resource", to_id="doc_42", subject_id="actor-2",
-        )
-        entries = doc.get_audit_log(event_type="edge_upsert")
+        with principal_scope(Principal(user_id="actor-2", is_local=True, disabled=False)):
+            builder.add_node(
+                space="subject", node_type="User", node_id="u1",
+                properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+                pack_id="pack-2",
+            )
+        entries = doc.get_audit_log(event_type="node_upsert")
         assert len(entries) == 1
         assert entries[0]["subject_id"] == "actor-2"
 
-    def test_add_edge_omitted_subject_id_keeps_existing_behaviour(self, tmp_path):
+    def test_add_edge_subject_id_is_the_bound_principals_user_id(self, tmp_path):
+        from opencrab.auth import Principal, principal_scope
+
         builder, doc = self._builder(tmp_path)
-        builder.add_node(
-            space="subject", node_type="Team", node_id="team_alpha", properties={"name": "Alpha"}
-        )
-        builder.add_node(
-            space="resource", node_type="Document", node_id="doc_42", properties={"title": "Doc"}
-        )
-        builder.add_edge(
-            from_space="subject", from_id="team_alpha", relation="owns",
-            to_space="resource", to_id="doc_42",
-        )
+        with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            builder.add_node(
+                space="subject", node_type="Team", node_id="team_alpha",
+                properties={"name": "Alpha"}, pack_id="pack-1",
+            )
+            builder.add_node(
+                space="resource", node_type="Document", node_id="doc_42",
+                properties={"title": "Doc"}, pack_id="pack-1",
+            )
+            builder.add_edge(
+                from_space="subject", from_id="team_alpha", relation="owns",
+                to_space="resource", to_id="doc_42", pack_id="pack-1",
+            )
         entries = doc.get_audit_log(event_type="edge_upsert")
         assert len(entries) == 1
-        assert entries[0]["subject_id"] is None
+        assert entries[0]["subject_id"] == "actor-1"
+
+    def test_add_edge_subject_id_follows_a_different_bound_principal(self, tmp_path):
+        from opencrab.auth import Principal, principal_scope
+
+        builder, doc = self._builder(tmp_path)
+        with principal_scope(Principal(user_id="actor-2", is_local=True, disabled=False)):
+            builder.add_node(
+                space="subject", node_type="Team", node_id="team_alpha",
+                properties={"name": "Alpha"}, pack_id="pack-2",
+            )
+            builder.add_node(
+                space="resource", node_type="Document", node_id="doc_42",
+                properties={"title": "Doc"}, pack_id="pack-2",
+            )
+            builder.add_edge(
+                from_space="subject", from_id="team_alpha", relation="owns",
+                to_space="resource", to_id="doc_42", pack_id="pack-2",
+            )
+        entries = doc.get_audit_log(event_type="edge_upsert")
+        assert len(entries) == 1
+        assert entries[0]["subject_id"] == "actor-2"
 
 
 @INTEGRATION

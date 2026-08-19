@@ -24,6 +24,7 @@ def apply_promotion_package(
     dry_run: bool = False,
     tenant_id: str = "default",
     subject_id: str | None = None,
+    pack_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a PromotionPackage to OpenCrab.
@@ -41,6 +42,9 @@ def apply_promotion_package(
         CLI usage is left for a follow-up (see opencrab issue #66's PR).
     subject_id:
         Optional actor for the same billing event.
+    pack_id:
+        Optional destination pack_id for the writes below. Defaults to the
+        local principal's default pack (``resolve_write_pack``).
 
     Returns
     -------
@@ -66,8 +70,10 @@ def apply_promotion_package(
 
     # Import OpenCrab components — optional dependency
     try:
+        from opencrab.auth import current_principal
         from opencrab.config import Settings
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
+        from opencrab.pack.ownership import resolve_write_pack
         from opencrab.stores.factory import (
             make_billing_sql_store,
             make_doc_store,
@@ -118,6 +124,18 @@ def apply_promotion_package(
     sql = make_sql_store(settings)
     builder = OntologyBuilder(neo4j=graph, mongo=docs, sql=sql)
 
+    # #148: builder.add_node/add_edge require a bound principal (they call
+    # current_principal() internally) and a pack_id.
+    #
+    # This function does NOT bind one itself. Picking require_local_principal()
+    # here would be fail-open on identity: any caller that forgets to bind --
+    # a server surface where the principal differs per request, say -- would
+    # not fail, it would silently attribute the writes to the LOCAL user
+    # instead of the requester. Binding is the entry point's job (the
+    # crabharness CLI does it); a library call refuses instead.
+    principal = current_principal()
+    target_pack_id = resolve_write_pack(sql, principal, pack_id)
+
     for node in package.nodes:
         try:
             result = builder.add_node(
@@ -125,7 +143,7 @@ def apply_promotion_package(
                 node_type=node.node_type,
                 node_id=node.node_id,
                 properties=node.properties or {},
-                subject_id=subject_id,
+                pack_id=target_pack_id,
             )
             node_receipts.append({
                 "node_id": node.node_id,
@@ -146,7 +164,7 @@ def apply_promotion_package(
                 relation=edge.relation,
                 to_space=edge.to_space,
                 to_id=edge.to_id,
-                subject_id=subject_id,
+                pack_id=target_pack_id,
             )
             edge_receipts.append({
                 "from_id": edge.from_id,

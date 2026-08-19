@@ -66,6 +66,15 @@ def _base_ctx(**overrides):
     # want to exercise a conflict override these return_values themselves.
     ctx["neo4j"].get_node.return_value = None
     ctx["neo4j"].get_node_by_id.return_value = None
+    # #148: the by-id axis probe (write_gate._check_by_id_axis) calls
+    # get_nodes_by_id(node_id), the plural counterpart to get_node_by_id
+    # above -- ALL rows sharing node_id, not just one. A bare MagicMock
+    # lookup returns a truthy MagicMock, not a list, so classify_by_id_rows
+    # would raise TypeError and the probe would fail closed
+    # ("unverifiable"). Kept consistent with get_node_by_id's None above:
+    # no row for this id -- see GraphStoreExtended.get_nodes_by_id's
+    # contract in opencrab/stores/_graph_protocol.py.
+    ctx["neo4j"].get_nodes_by_id.return_value = []
     ctx["neo4j"].get_edge.return_value = None
     # #177 R4-A: an unresolvable endpoint type is now fail-closed (rejected),
     # not skipped, so the default here must be a real type -- "endpoints
@@ -368,14 +377,20 @@ class TestIngestIntoPack:
         assert result["edge_errors"] == []
         hybrid.invalidate_bm25_cache.assert_called_once()
 
-    def test_normal_subject_id_reaches_every_write_in_the_batch(self):
+    def test_normal_pack_id_reaches_every_write_in_the_batch(self):
         """Issue #119: _ingest_into_pack's node loop, edge loop, and
-        evidence-node write each call builder.add_node/add_edge separately —
-        subject_id was billed once for the whole call but never forwarded to
-        any of these three write sites' own audit event. Pin that ALL THREE
-        receive the same subject_id (a partial fix — e.g. only the node loop
-        fixed — would make the audit trail inconsistent within one call,
-        which is worse than the original all-anonymous bug)."""
+        evidence-node write each call builder.add_node/add_edge separately.
+        Pin that ALL THREE receive the same pack_id (a partial fix — e.g.
+        only the node loop fixed — would make the writes land in
+        inconsistent packs within one call).
+
+        #148: builder.add_node/add_edge no longer take a `subject_id` kwarg
+        at all (the real OntologyBuilder derives the writing principal
+        internally via current_principal()) -- _ingest_into_pack's own
+        `subject_id` parameter now feeds only the `on_ingest` billing event
+        (see test_normal_bills_one_ingest_event_using_source_id and
+        friends), not these three write sites. `pack_id` is the channel
+        that must reach all three now."""
         builder = MagicMock()
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder)
@@ -391,14 +406,23 @@ class TestIngestIntoPack:
             )
         # First add_node call is the "nodes=" loop entry, second is the
         # evidence/TextUnit node from the text= branch.
-        assert builder.add_node.call_args_list[0].kwargs["subject_id"] == "actor-1"
-        assert builder.add_node.call_args_list[1].kwargs["subject_id"] == "actor-1"
-        assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+        assert builder.add_node.call_args_list[0].kwargs["pack_id"] == "pack-a"
+        assert builder.add_node.call_args_list[1].kwargs["pack_id"] == "pack-a"
+        assert builder.add_edge.call_args.kwargs["pack_id"] == "pack-a"
 
-    def test_normal_omitted_subject_id_keeps_existing_behaviour(self):
+    def test_normal_omitted_subject_id_only_affects_billing(self):
+        """#148: subject_id no longer reaches builder.add_node/add_edge at
+        all (see test_normal_pack_id_reaches_every_write_in_the_batch above)
+        -- it is exclusively an on_ingest billing argument now, so "omitted"
+        vs "given" has nothing left to distinguish on the builder calls.
+        Pin the part of this contract that still exists: an omitted
+        subject_id reaches on_ingest as None, unchanged from before."""
         builder = MagicMock()
+        billing = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"stores": {"graph": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
             _ingest_into_pack(
                 "pack-a",
                 nodes=[{"space": "concept", "node_type": "Entity", "node_id": "e1"}],
@@ -408,9 +432,10 @@ class TestIngestIntoPack:
                 }],
                 text="hello world", source_id="src-1",
             )
-        assert builder.add_node.call_args_list[0].kwargs["subject_id"] is None
-        assert builder.add_node.call_args_list[1].kwargs["subject_id"] is None
-        assert builder.add_edge.call_args.kwargs["subject_id"] is None
+        assert "subject_id" not in builder.add_node.call_args_list[0].kwargs
+        assert "subject_id" not in builder.add_node.call_args_list[1].kwargs
+        assert "subject_id" not in builder.add_edge.call_args.kwargs
+        billing.on_ingest.assert_called_once_with("default", None, "src-1")
 
     def test_error_node_write_failure_recorded_without_aborting(self):
         builder = MagicMock()
@@ -460,26 +485,45 @@ class TestIngestIntoPack:
         assert result["stores"]["evidence_node"] == "error: vector store down"
 
     def test_error_legacy_path_hybrid_ingest_failure_recorded(self):
-        """text_as_node=False legacy path: hybrid.ingest() raising is caught
-        and recorded as stores['chromadb'], not propagated."""
+        """text_as_node=False legacy path (now routed through
+        opencrab.pack.source_writer.write_source, #148): an embed failure is
+        reported in stores['chromadb'], not propagated. hybrid.ingest() is
+        given its REAL contract's failure shape (a returned "error: ..."
+        status) rather than a raised exception -- HybridQuery.ingest()
+        (opencrab/ontology/query.py) never raises in production, it always
+        returns a stores dict, so write_source (unlike the two independent
+        try/excepts this replaced) does not wrap that call in its own
+        try/except."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         hybrid = MagicMock()
-        hybrid.ingest.side_effect = RuntimeError("embed failed")
+        hybrid.ingest.return_value = {"stores": {"chromadb": "error: embed failed"}}
         mongo = MagicMock()
         mongo.available = True
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
+        mongo.upsert_source.return_value = "src-2"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
             )
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
+                )
         assert result["stores"]["chromadb"] == "error: embed failed"
-        assert result["stores"]["mongodb"] == "ok"
+        assert result["stores"]["documents"] == "ok (id=src-2)"
         assert result["text_ingested"] is True
 
     def test_error_legacy_path_mongo_upsert_failure_recorded(self):
         """text_as_node=False legacy path: mongo.upsert_source() raising is
-        caught and recorded as stores['mongodb'], not propagated."""
+        caught by write_source and recorded as stores['documents'], not
+        propagated. write_source's doc-first contract also means the vector
+        write is skipped after a doc-store failure (opencrab/pack/
+        source_writer.py: "a vector row pointing at a source that failed to
+        record is an orphan no read path can hydrate")."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         hybrid = MagicMock()
         hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
@@ -488,11 +532,14 @@ class TestIngestIntoPack:
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
             )
-        assert result["stores"]["mongodb"] == "error: mongo down"
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
+                )
+        assert result["stores"]["documents"] == "error: mongo down"
 
     def test_error_legacy_path_both_stores_unavailable_does_not_bill(self):
         """#66 codex re-review (3rd round): the legacy text_as_node=False
@@ -502,18 +549,24 @@ class TestIngestIntoPack:
         the "graph" store, and this path never sets that key), so a legacy
         ingest where BOTH the vector store and the doc store are unavailable
         — nothing written anywhere — still fired on_ingest. Pin: it must not."""
+        from opencrab.auth import Principal, principal_scope
+
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
         hybrid.ingest.return_value = {"stores": {"chromadb": "unavailable"}}
         mongo = MagicMock()
-        mongo.available = False  # -> stores["mongodb"] = "unavailable"
+        mongo.available = False  # -> stores["documents"] = "unavailable"
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
-            result = _ingest_into_pack(
-                "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+                billing=billing,
             )
-        assert result["stores"] == {"chromadb": "unavailable", "mongodb": "unavailable"}
+            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                result = _ingest_into_pack(
+                    "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+                )
+        assert result["stores"] == {"chromadb": "unavailable", "documents": "unavailable"}
         assert result["text_ingested"] is True  # the attempt was made
         billing.on_ingest.assert_not_called()  # but nothing actually landed
 
@@ -531,7 +584,12 @@ class TestIngestIntoPack:
         silently stopped billing every legacy vector-only success in
         production — the fixture was shaped to match the implementation
         instead of the real contract, so it could not catch that regression.
-        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns."""
+        This mock is now the actual shape ``ctx["hybrid"].ingest()`` returns.
+
+        #148: no explicit principal_scope here -- this test relies on the
+        module-wide ``bind_test_principal`` fixture, which binds
+        ``user_id="test-user"``, ``_writable_ctx``'s own default owner, so
+        the registry ownership lines up without having to pass one."""
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
@@ -539,7 +597,9 @@ class TestIngestIntoPack:
         mongo = MagicMock()
         mongo.available = False
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", builder=builder, hybrid=hybrid, mongo=mongo, billing=billing,
+            )
             _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
         billing.on_ingest.assert_called_once_with("default", None, "src-5")
 
@@ -556,11 +616,18 @@ class TestIngestIntoPack:
         chroma = MagicMock()
         chroma.available = True
         chroma.upsert_texts.return_value = ["vec-real-1"]
+        # #148: write_source's identity guard probes vector.get_by_id
+        # before this test's HybridQuery.ingest() ever runs -- explicit
+        # None means the slot is empty, not "cannot verify".
+        chroma.get_by_id.return_value = None
         hybrid = HybridQuery(chroma=chroma, neo4j=MagicMock(available=False))
         mongo = MagicMock()
         mongo.available = False
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, hybrid=hybrid, mongo=mongo, billing=billing)
+            mock_ctx.return_value = _writable_ctx(
+                "pack-a", builder=builder, hybrid=hybrid, mongo=mongo,
+                billing=billing, chroma=chroma,
+            )
             result = _ingest_into_pack(
                 "pack-a", text="legacy text", source_id="src-6", text_as_node=False,
             )
@@ -671,35 +738,63 @@ class TestPackCreate:
         builder.add_node call separate from _ingest_into_pack's own
         node/edge/evidence loops) had the same gap — subject_id reached the
         ingest billing event but not this write's own audit event. Pin that
-        it now reaches builder.add_node -- sourced from the caller's
+        the SAME principal now governs it -- sourced from the caller's
         server-derived principal (pack_create takes no subject_id argument
-        at all anymore, #145)."""
+        at all anymore, #145).
+
+        #148: builder.add_node no longer takes a `subject_id` kwarg at all
+        (the real OntologyBuilder derives the principal internally via
+        current_principal()) -- with a mocked builder there is nothing left
+        to inspect on that call directly. The principal instead now governs
+        WHO OWNS THE REGISTERED PACK the anchor node is stamped into
+        (opencrab.pack.ownership.create_pack(owner_id=subject_id, ...)), so
+        this uses a real SQLStore (not the class default MagicMock) and
+        checks the registry row's owner_id."""
         from opencrab.auth import Principal, principal_scope
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.sql_store import SQLStore
 
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
-                pack_create(title="My Pack", pack_id="my-pack")
-        assert builder.add_node.call_args.kwargs["subject_id"] == "actor-1"
+                result = pack_create(title="My Pack", pack_id="my-pack")
+        assert builder.add_node.call_args.kwargs["pack_id"] == result["pack_id"]
+        pack_row = get_pack(sql, result["pack_id"])
+        assert pack_row is not None
+        assert pack_row["owner_id"] == "actor-1"
 
     def test_normal_uses_bound_principal_by_default(self):
         """#145: there is no "omitted subject_id" state anymore -- pack_create
         always uses whatever current_principal() resolves to (bound here by
-        the bind_test_principal fixture)."""
+        the bind_test_principal fixture).
+
+        #148: see test_normal_forwards_principal_to_anchor_node_audit above
+        for why this now checks the registered pack's owner_id via a real
+        SQLStore rather than a `subject_id` kwarg on the mocked builder."""
+        from opencrab.pack.ownership import get_pack
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
         ):
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
-            pack_create(title="My Pack", pack_id="my-pack")
-        assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
+            result = pack_create(title="My Pack", pack_id="my-pack")
+        assert builder.add_node.call_args.kwargs["pack_id"] == result["pack_id"]
+        pack_row = get_pack(sql, result["pack_id"])
+        assert pack_row is not None
+        assert pack_row["owner_id"] == "test-user"
 
     def test_taken_slug_is_quietly_suffixed_not_an_error(self):
         """#146: the registry (packs table), not a content_pack_list() scan,
@@ -1252,6 +1347,8 @@ class TestHarnessPromotionApply:
             sys.modules.update(removed)
 
     def test_normal_apply_writes_nodes_and_edges(self):
+        from opencrab.stores.sql_store import SQLStore
+
         package = dict(_VALID_PACKAGE, edges=[{
             "from_space": "resource", "from_id": "ds1", "relation": "related_to",
             "to_space": "resource", "to_id": "ds2",
@@ -1260,7 +1357,12 @@ class TestHarnessPromotionApply:
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"sql": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            # #148: harness_promotion_apply now resolves/authorizes a
+            # pack_id (assert_writable) before writing -- needs a real
+            # SQLStore so resolve_write_pack's ensure_default_pack call
+            # actually creates and owns a pack for the bound principal
+            # instead of hitting a MagicMock's opaque comparisons.
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=SQLStore("sqlite:///:memory:"))
             result = harness_promotion_apply(package, dry_run=False)
         assert result["package_id"] == "pkg-1"
         assert result["dry_run"] is False
@@ -1281,25 +1383,35 @@ class TestHarnessPromotionApply:
         from the caller's server-derived principal (bound here via
         principal_scope)."""
         from opencrab.auth import Principal, principal_scope
+        from opencrab.stores.sql_store import SQLStore
 
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(
+                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+            )
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         billing.on_harness_apply.assert_called_once_with("default", "u1", "pkg-1", 1)
 
-    def test_normal_subject_id_reaches_every_node_and_edge_write(self):
+    def test_normal_pack_id_reaches_every_node_and_edge_write(self):
         """Issue #119: subject_id reached on_harness_apply (billing) but never
         builder.add_node/add_edge (audit) in the promotion loop — every write
         in a promotion was audited with a null actor while the billing row
-        named one. Pin BOTH the node and edge write receive it, for every
-        item in the loop (a partial fix across a multi-write op is worse than
-        the original bug). #145: subject_id is now the caller's
-        server-derived principal, bound via principal_scope, not a kwarg."""
+        named one.
+
+        #148: builder.add_node/add_edge no longer take `subject_id` at all
+        (the real OntologyBuilder derives the principal internally via
+        current_principal()) -- the channel this loop now forwards
+        consistently to every node and edge write is `pack_id`, resolved
+        once from the SAME principal via resolve_write_pack. Pin BOTH the
+        node and edge writes receive the SAME pack_id (a partial fix across
+        a multi-write op is worse than the original bug)."""
         from opencrab.auth import Principal, principal_scope
+        from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.stores.sql_store import SQLStore
 
         package = dict(_VALID_PACKAGE, nodes=[
             {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
@@ -1311,18 +1423,30 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder)
-            with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            actor = Principal(user_id="actor-1", is_local=True, disabled=False)
+            with principal_scope(actor):
                 harness_promotion_apply(package, dry_run=False)
+                expected_pack_id = resolve_write_pack(sql, actor, None)
         for call in builder.add_node.call_args_list:
-            assert call.kwargs["subject_id"] == "actor-1"
-        assert builder.add_edge.call_args.kwargs["subject_id"] == "actor-1"
+            assert call.kwargs["pack_id"] == expected_pack_id
+        assert builder.add_edge.call_args.kwargs["pack_id"] == expected_pack_id
 
     def test_normal_uses_bound_principal_by_default(self):
         """#145: there is no "omitted subject_id" state anymore --
         harness_promotion_apply always uses whatever current_principal()
-        resolves to (bound here by the bind_test_principal fixture)."""
+        resolves to (bound here by the bind_test_principal fixture).
+
+        #148: see test_normal_pack_id_reaches_every_node_and_edge_write
+        above for why this checks `pack_id` (resolved from the bound
+        principal) rather than a `subject_id` kwarg that no longer exists
+        on builder.add_node/add_edge."""
+        from opencrab.auth import current_principal
+        from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.stores.sql_store import SQLStore
+
         package = dict(_VALID_PACKAGE, edges=[{
             "from_space": "resource", "from_id": "ds1", "relation": "related_to",
             "to_space": "resource", "to_id": "ds2",
@@ -1330,22 +1454,28 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             harness_promotion_apply(package, dry_run=False)
-        assert builder.add_node.call_args.kwargs["subject_id"] == "test-user"
-        assert builder.add_edge.call_args.kwargs["subject_id"] == "test-user"
+            expected_pack_id = resolve_write_pack(sql, current_principal(), None)
+        assert builder.add_node.call_args.kwargs["pack_id"] == expected_pack_id
+        assert builder.add_edge.call_args.kwargs["pack_id"] == expected_pack_id
 
     def test_error_malformed_receipt_does_not_bill(self):
         """#66 codex re-review, finding [3]: a "stores" map with no "graph"
         key at all (e.g. only optional stores reported) is a receipt shape
         this code doesn't recognize — fail-closed means that must NOT bill,
         not fall through to "no known failure -> bill it"."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(
+                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+            )
             result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
         billing.on_harness_apply.assert_not_called()
@@ -1356,12 +1486,16 @@ class TestHarnessPromotionApply:
         fail the (already-applied) promotion package."""
         import logging
 
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         billing.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(
+                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+            )
             with caplog.at_level(logging.WARNING):
                 result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         assert result["summary"]["errors"] == 0
@@ -1381,13 +1515,17 @@ class TestHarnessPromotionApply:
         (builder.py's module docstring). node_receipts still gets an entry
         (unchanged contract), but billing must not count it: no exception was
         raised, yet nothing actually landed in the graph."""
+        from opencrab.stores.sql_store import SQLStore
+
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {
             "receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "error: disk down"}
         }
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(
+                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+            )
             result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
         billing.on_harness_apply.assert_not_called()
@@ -1396,6 +1534,8 @@ class TestHarnessPromotionApply:
         """Mixed batch: one node write succeeds, one fails at the store
         level. Billing must count only the successful one, not
         len(node_receipts) (which would be 2)."""
+        from opencrab.stores.sql_store import SQLStore
+
         package = dict(_VALID_PACKAGE, nodes=[
             {"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}},
             {"space": "resource", "node_type": "Dataset", "node_id": "ds2", "properties": {}},
@@ -1407,7 +1547,9 @@ class TestHarnessPromotionApply:
             {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "error: disk down"}},
         ]
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing)
+            mock_ctx.return_value = _base_ctx(
+                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+            )
             result = harness_promotion_apply(package, dry_run=False)
         assert len(result["node_receipts"]) == 2
         billing.on_harness_apply.assert_called_once_with("default", "test-user", "pkg-1", 1)
@@ -1416,6 +1558,8 @@ class TestHarnessPromotionApply:
         """Real (non-dry-run) write failures for both nodes and edges are
         collected into errors without aborting the loop — mirrors the
         dry_run error-collection contract but for the actual write path."""
+        from opencrab.stores.sql_store import SQLStore
+
         package = dict(_VALID_PACKAGE, edges=[{
             "from_space": "resource", "from_id": "ds1", "relation": "related_to",
             "to_space": "resource", "to_id": "ds2",
@@ -1424,7 +1568,7 @@ class TestHarnessPromotionApply:
         builder.add_node.side_effect = RuntimeError("node write failed")
         builder.add_edge.side_effect = RuntimeError("edge write failed")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder)
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=SQLStore("sqlite:///:memory:"))
             result = harness_promotion_apply(package, dry_run=False)
         assert result["node_receipts"] == []
         assert result["edge_receipts"] == []
@@ -1484,9 +1628,11 @@ class TestHarnessPromotionApply:
         assert "Invalid PromotionPackage" in result["error"]
 
     def test_edge_empty_package_apply(self):
+        from opencrab.stores.sql_store import SQLStore
+
         empty = {"package_id": "pkg-e", "mission_id": "mis-e", "run_id": "run-e"}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx()
+            mock_ctx.return_value = _base_ctx(sql=SQLStore("sqlite:///:memory:"))
             result = harness_promotion_apply(empty, dry_run=False)
         assert result["node_receipts"] == []
         assert result["edge_receipts"] == []

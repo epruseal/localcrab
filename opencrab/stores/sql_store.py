@@ -115,6 +115,7 @@ _TABLES_SQL = [
         title        VARCHAR(512),
         description  TEXT,
         forked_from  VARCHAR(256),
+        is_default   BOOLEAN      NOT NULL DEFAULT FALSE,
         created_at   TIMESTAMPTZ  DEFAULT NOW(),
         updated_at   TIMESTAMPTZ  DEFAULT NOW()
     )
@@ -221,6 +222,7 @@ _TABLES_SQL_SQLITE = [
         title        TEXT,
         description  TEXT,
         forked_from  TEXT,
+        is_default   INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
         created_at   TEXT DEFAULT (datetime('now')),
         updated_at   TEXT DEFAULT (datetime('now'))
     )
@@ -302,6 +304,103 @@ class SQLStore:
             for ddl in tables:
                 conn.execute(text(ddl))
         logger.debug("SQL tables ensured.")
+        self._migrate_packs_is_default()
+
+    def _migrate_packs_is_default(self) -> None:
+        """Additive migration for pre-#148 ``packs`` tables that predate the
+        ``is_default`` column (the CREATE TABLE above only fires for a
+        brand-new table -- IF NOT EXISTS is a no-op against an existing
+        one). Runs after the static DDL loop so a from-scratch DB (which
+        already has the column) is a cheap no-op here.
+
+        The partial unique index (at most one is_default=TRUE/1 row per
+        owner_id) is built here too, not in the static DDL lists: on an
+        existing DB the ALTER below runs first in this same call, but if
+        the index were a static DDL statement it would run BEFORE any
+        ALTER on a first _create_tables() pass across an old DB, and
+        "CREATE ... WHERE is_default = ..." against a table that doesn't
+        yet have that column raises "no such column".
+        """
+        from sqlalchemy import text
+        from sqlalchemy.exc import DBAPIError
+
+        with self._engine.begin() as conn:
+            if self._is_sqlite:
+                cols = {row[1] for row in conn.execute(text("PRAGMA table_info(packs)"))}
+            else:
+                cols = {
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            # Scoped to the active schema, like the table
+                            # introspection later in this module. Unscoped, a
+                            # `packs.is_default` visible in ANOTHER schema
+                            # makes this skip the ALTER while the unqualified
+                            # CREATE INDEX below still targets the active
+                            # schema's legacy table -- which then fails and
+                            # takes the whole SQL store down.
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'packs' "
+                            "AND table_schema = current_schema()"
+                        )
+                    )
+                }
+            if "is_default" not in cols:
+                # SQLite has no `ADD COLUMN IF NOT EXISTS` (measured: "near
+                # "EXISTS": syntax error") so the existence check above is
+                # the only guard -- and it's a TOCTOU: two processes racing
+                # to open the same DB can both see the column missing and
+                # both ALTER. The try/except absorbs the loser's "duplicate
+                # column" error as success rather than crashing it.
+                # The ALTER runs inside a SAVEPOINT. On PostgreSQL, catching
+                # the loser's error is not enough: the failed statement leaves
+                # the whole transaction aborted, so the CREATE INDEX below
+                # would raise InFailedSqlTransaction and this replica's SQL
+                # store would be marked unavailable. Rolling back to the
+                # savepoint restores a usable transaction. SQLite does not need
+                # this but tolerates it, so there is one code path.
+                try:
+                    with conn.begin_nested():
+                        if self._is_sqlite:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN is_default INTEGER "
+                                    "NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1))"
+                                )
+                            )
+                        else:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN is_default BOOLEAN "
+                                    "NOT NULL DEFAULT FALSE"
+                                )
+                            )
+                except DBAPIError as exc:
+                    message = str(getattr(exc, "orig", exc)).lower()
+                    if "duplicate column" not in message and "already exists" not in message:
+                        logger.error("packs.is_default migration failed: %s", exc)
+                        raise
+
+            # The ON CONFLICT target in ownership.ensure_default_pack must
+            # name this index's predicate LITERALLY (measured: an
+            # "ON CONFLICT (owner_id) WHERE is_default" shorthand fails
+            # with "does not match any PRIMARY KEY or UNIQUE constraint";
+            # only the fully-written `= 1` / `= TRUE` form matches) -- keep
+            # the two in sync if this predicate ever changes.
+            if self._is_sqlite:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_packs_one_default "
+                        "ON packs (owner_id) WHERE is_default = 1"
+                    )
+                )
+            else:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_packs_one_default "
+                        "ON packs (owner_id) WHERE is_default = TRUE"
+                    )
+                )
 
     @property
     def available(self) -> bool:

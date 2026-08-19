@@ -1226,6 +1226,33 @@ class _SqlGraphStoreBase(abc.ABC):
         props["node_type"] = row[0]
         return props
 
+    def get_nodes_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """Plural counterpart to ``get_node_by_id`` -- returns EVERY row for
+        ``node_id``, not just whichever one ``LIMIT 1`` happens to pick.
+
+        ``graph_nodes``' real PK is ``(node_type, node_id)``, so the same
+        ``node_id`` can legitimately exist under more than one ``node_type``
+        (pinned by ``tests/test_read_scope_isolation.py``'s "Same node_id in
+        two packs under two node_types" case). ``get_node_by_id``'s bare
+        ``WHERE node_id=:nid LIMIT 1`` is then non-deterministic about which
+        row it returns -- fine for a single best-effort lookup, but unsafe
+        for callers that need to reason about pack ownership across ALL rows
+        (a packless row could be picked ahead of a foreign one). ``ORDER BY
+        node_type`` makes the row order deterministic; empty list, not
+        ``None``, when nothing matches."""
+        self._require_available()
+        sql = (
+            f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
+            " WHERE node_id=:nid ORDER BY node_type"
+        )
+        rows = self._fetch_all(sql, {"nid": node_id})
+        results = []
+        for node_type, properties, space_id in rows:
+            props = dict(_merge_space(_as_dict(properties), space_id))
+            props["node_type"] = node_type
+            results.append(props)
+        return results
+
     def _export_nodes_where(
         self, pack_id: str | None, space: str | None
     ) -> tuple[str, dict[str, Any]]:

@@ -417,6 +417,40 @@ def test_get_node_by_id():
     assert store.get_node_by_id("nope") is None
 
 
+def test_get_nodes_by_id_returns_every_row_for_a_shared_id():
+    # Same node_id under two different node_types (PK is (node_type,
+    # node_id)) -- the exact shape test_read_scope_isolation.py pins as
+    # supported, and the reason get_node_by_id's unordered LIMIT 1 is unsafe
+    # for pack-ownership decisions.
+    store = _store()
+    store.upsert_node("Document", "dup", {"pack_id": "packA"})
+    store.upsert_node("Concept", "dup", {"pack_id": "packB"})
+
+    nodes = store.get_nodes_by_id("dup")
+
+    assert len(nodes) == 2
+    assert [n["node_type"] for n in nodes] == ["Concept", "Document"]
+    assert nodes[0]["pack_id"] == "packB"
+    assert nodes[1]["pack_id"] == "packA"
+
+
+def test_get_nodes_by_id_missing_returns_empty_list():
+    store = _store()
+    assert store.get_nodes_by_id("nope") == []
+
+
+def test_get_nodes_by_id_row_shape_matches_get_node_by_id():
+    store = _store()
+    store.upsert_node("Person", "p1", {"name": "Alice"}, space_id="resource")
+
+    [node] = store.get_nodes_by_id("p1")
+    single = store.get_node_by_id("p1")
+
+    assert node == single
+    assert node["node_type"] == "Person"
+    assert node["space"] == "resource"
+
+
 def test_export_nodes_and_edges_with_pack_filter():
     store = _store()
     store.upsert_node("Item", "a", {"pack_id": "p1"})

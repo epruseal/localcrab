@@ -10,6 +10,7 @@ Requires all services to be running (docker-compose up -d).
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -178,10 +179,11 @@ INGEST_TEXTS: list[tuple[str, str, dict]] = [
 # ---------------------------------------------------------------------------
 
 
-def seed() -> None:
+def seed(pack_id: str | None = None) -> None:
     console.print("\n[bold magenta]OpenCrab Seed Script[/bold magenta]")
     console.print("[dim]Populating example analytics platform ontology...[/dim]\n")
 
+    from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
     from opencrab.ontology.builder import (
@@ -191,6 +193,7 @@ def seed() -> None:
     )
     from opencrab.ontology.query import HybridQuery
     from opencrab.ontology.rebac import ReBACEngine
+    from opencrab.pack.ownership import resolve_write_pack
     from opencrab.stores.factory import (
         make_doc_store,
         make_graph_store,
@@ -223,6 +226,12 @@ def seed() -> None:
     rebac = ReBACEngine(neo4j, sql)
     hybrid = HybridQuery(chroma, neo4j)
 
+    # #148: builder.add_node/add_edge now require a bound principal + pack_id.
+    # This script is a standalone entry point, so bind the local user here
+    # (same as opencrab.cli's write paths) rather than assume one is already bound.
+    principal = require_local_principal()
+    target_pack_id = resolve_write_pack(sql, principal, pack_id)
+
     # Ensure constraints
     if neo4j.available:
         with write_lock(cfg.local_data_dir):
@@ -233,12 +242,12 @@ def seed() -> None:
     console.print(f"\n[bold]Seeding {len(NODES)} nodes...[/bold]")
     node_ok = 0
     node_fail = 0
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+    with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         task = progress.add_task("Adding nodes...", total=len(NODES))
         for space, node_type, node_id, props in NODES:
             try:
                 with write_lock(cfg.local_data_dir):
-                    result = builder.add_node(space, node_type, node_id, props)
+                    result = builder.add_node(space, node_type, node_id, props, pack_id=target_pack_id)
                 stores = result.get("stores") if isinstance(result, dict) else None
                 if not isinstance(stores, dict):
                     stores = {}
@@ -259,12 +268,12 @@ def seed() -> None:
     console.print(f"\n[bold]Seeding {len(EDGES)} edges...[/bold]")
     edge_ok = 0
     edge_fail = 0
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+    with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         task = progress.add_task("Adding edges...", total=len(EDGES))
         for from_space, from_id, relation, to_space, to_id in EDGES:
             try:
                 with write_lock(cfg.local_data_dir):
-                    result = builder.add_edge(from_space, from_id, relation, to_space, to_id)
+                    result = builder.add_edge(from_space, from_id, relation, to_space, to_id, pack_id=target_pack_id)
                 stores = result.get("stores") if isinstance(result, dict) else None
                 if not isinstance(stores, dict):
                     stores = {}
@@ -346,4 +355,12 @@ def seed() -> None:
 
 
 if __name__ == "__main__":
-    seed()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pack-id",
+        dest="pack_id",
+        default=None,
+        help="Destination pack_id. Defaults to the local user's default pack.",
+    )
+    args = parser.parse_args()
+    seed(pack_id=args.pack_id)

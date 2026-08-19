@@ -27,6 +27,7 @@ from opencrab.pack.ownership import (
     _is_pack_id_conflict,
     assert_writable,
     create_pack,
+    ensure_default_pack,
     get_pack,
     list_packs_for,
     readable_pack_ids,
@@ -278,12 +279,17 @@ class TestReadablePackIds:
     def test_owner_sees_own_private_pack(self, sql, alice):
         create_pack(sql, alice, "mine")
         principal = Principal(user_id=alice, is_local=False, disabled=False)
-        assert readable_pack_ids(sql, principal) == {"mine"}
+        # #148: create_user already gave alice a default pack in the same
+        # transaction -- ensure_default_pack is idempotent, so this just
+        # reads back the id it already assigned.
+        assert readable_pack_ids(sql, principal) == {"mine", ensure_default_pack(sql, alice)}
 
     def test_non_owner_does_not_see_private_pack(self, sql, alice, bob):
         create_pack(sql, alice, "mine")
         principal = Principal(user_id=bob, is_local=False, disabled=False)
-        assert readable_pack_ids(sql, principal) == set()
+        # bob owns nothing of alice's, but bob does own his own default pack
+        # (created alongside his user row) -- that's still "his".
+        assert readable_pack_ids(sql, principal) == {ensure_default_pack(sql, bob)}
 
     def test_non_owner_sees_public_read_pack(self, sql, alice, bob):
         create_pack(sql, alice, "shared")
@@ -291,7 +297,7 @@ class TestReadablePackIds:
             sql, Principal(user_id=alice, is_local=False, disabled=False), "shared", "public-read"
         )
         principal = Principal(user_id=bob, is_local=False, disabled=False)
-        assert readable_pack_ids(sql, principal) == {"shared"}
+        assert readable_pack_ids(sql, principal) == {"shared", ensure_default_pack(sql, bob)}
 
     def test_non_owner_sees_public_fork_pack(self, sql, alice, bob):
         create_pack(sql, alice, "forkable")
@@ -299,7 +305,7 @@ class TestReadablePackIds:
             sql, Principal(user_id=alice, is_local=False, disabled=False), "forkable", "public-fork"
         )
         principal = Principal(user_id=bob, is_local=False, disabled=False)
-        assert readable_pack_ids(sql, principal) == {"forkable"}
+        assert readable_pack_ids(sql, principal) == {"forkable", ensure_default_pack(sql, bob)}
 
     def test_mixed_visibility_scoping(self, sql, alice, bob):
         create_pack(sql, alice, "alice-private")
@@ -313,7 +319,11 @@ class TestReadablePackIds:
         create_pack(sql, bob, "bob-private")
 
         bob_principal = Principal(user_id=bob, is_local=False, disabled=False)
-        assert readable_pack_ids(sql, bob_principal) == {"alice-public", "bob-private"}
+        assert readable_pack_ids(sql, bob_principal) == {
+            "alice-public",
+            "bob-private",
+            ensure_default_pack(sql, bob),
+        }
 
     def test_list_packs_for_matches_readable_pack_ids(self, sql, alice, bob):
         create_pack(sql, alice, "alice-private")
@@ -327,7 +337,7 @@ class TestReadablePackIds:
         bob_principal = Principal(user_id=bob, is_local=False, disabled=False)
         rows = list_packs_for(sql, bob_principal)
         assert {r["pack_id"] for r in rows} == readable_pack_ids(sql, bob_principal)
-        assert {r["pack_id"] for r in rows} == {"alice-public"}
+        assert {r["pack_id"] for r in rows} == {"alice-public", ensure_default_pack(sql, bob)}
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +441,10 @@ def _base_ctx(sql, **overrides):
     # truthy non-dict, which the probe treats as fail-closed/unverifiable).
     ctx["neo4j"].get_node.return_value = None
     ctx["neo4j"].get_node_by_id.return_value = None
+    # #148: the by-id axis (write_gate._check_by_id_axis) calls
+    # get_nodes_by_id, the plural, ALL-rows counterpart to get_node_by_id
+    # above -- consistent with it: no row for this id.
+    ctx["neo4j"].get_nodes_by_id.return_value = []
     ctx["neo4j"].get_edge.return_value = None
     # #177 R4-A: an unresolvable endpoint type is fail-closed (rejected), not
     # skipped, so the default must be a real type ("endpoints exist on this

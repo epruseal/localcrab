@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
                     "description": "Validate without writing to stores.",
                     "default": False,
                 },
+                "pack_id": {
+                    "type": "string",
+                    "description": "Optional destination pack_id. Defaults to the caller's default pack. Ignored when dry_run=true.",
+                },
             },
             "required": ["package"],
         },
@@ -52,6 +56,7 @@ logger = logging.getLogger(__name__)
 def harness_promotion_apply(
     package: dict[str, Any],
     dry_run: bool = False,
+    pack_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Apply a CrabHarness PromotionPackage directly to the OpenCrab ontology stores.
@@ -67,6 +72,9 @@ def harness_promotion_apply(
         A serialised PromotionPackage object (from CrabHarness promotion-stub output).
     dry_run:
         If True, validate grammar + schema without writing to any store.
+    pack_id:
+        Optional destination pack_id. Defaults to the caller's default pack
+        (``resolve_write_pack``). Not read at all when dry_run=True.
 
     The apply's subject is the caller's server-derived ``current_principal()``
     (#145) -- never a client argument; tenant_id stays fixed at 'default'.
@@ -116,12 +124,40 @@ def harness_promotion_apply(
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _get_context
     from opencrab.ontology.builder import graph_write_failed
+    from opencrab.pack.ownership import (
+        PackForbiddenError,
+        PackNotFoundError,
+        assert_writable,
+        resolve_write_pack,
+    )
 
     ctx = _get_context()
     builder = ctx["builder"]
     principal = current_principal()
     tenant_id = "default"
     subject_id = principal.user_id
+    target_pack_id = resolve_write_pack(ctx["sql"], principal, pack_id)
+
+    # Fail the whole apply up front rather than once per node/edge below --
+    # every item targets the same pack_id, so a bad pack_id fails identically
+    # for all of them. Same wording as pack_ingest (opencrab/mcp/tools/pack.py)
+    # -- #143 invariant 7 folds "doesn't exist" and "someone else's private
+    # pack" into one indistinguishable response.
+    try:
+        assert_writable(ctx["sql"], principal, target_pack_id)
+    except PackNotFoundError:
+        return {"error": "pack not found; use pack_create first", "pack_id": target_pack_id}
+    except PackForbiddenError:
+        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
+        # naming one here would send callers into an unknown-tool error.
+        return {
+            "error": "PACK_NOT_WRITABLE: not the pack owner",
+            "pack_id": target_pack_id,
+            "hint": (
+                "this pack is readable but not writable by you; "
+                "create your own with pack_create and ingest into that"
+            ),
+        }
 
     for node in promo.nodes:
         try:
@@ -130,7 +166,7 @@ def harness_promotion_apply(
                 node_type=node.node_type,
                 node_id=node.node_id,
                 properties=node.properties or {},
-                subject_id=subject_id,
+                pack_id=target_pack_id,
             )
             node_receipts.append({
                 "node_id": node.node_id,
@@ -149,7 +185,7 @@ def harness_promotion_apply(
                 relation=edge.relation,
                 to_space=edge.to_space,
                 to_id=edge.to_id,
-                subject_id=subject_id,
+                pack_id=target_pack_id,
             )
             edge_receipts.append({
                 "from_id": edge.from_id,

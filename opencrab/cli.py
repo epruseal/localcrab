@@ -439,11 +439,14 @@ def status() -> None:
 )
 def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> None:
     """Ingest files from PATH into the ontology vector store."""
-    from opencrab.auth import require_local_principal
+    from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
+    from opencrab.ontology.builder import store_write_succeeded
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
+    from opencrab.pack.ownership import resolve_write_pack
+    from opencrab.pack.source_writer import write_source
 
     # #145: a CLI write is attributed to the local user, and resolving the
     # principal happens BEFORE any store is opened or written -- a missing
@@ -457,7 +460,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
         raise SystemExit(1) from exc
 
     cfg = get_settings()
-    stores = _make_stores(cfg, graph=True, vector=True, doc=True)
+    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
     chroma, neo4j, mongo = stores.vector, stores.graph, stores.doc
     hybrid = HybridQuery(chroma, neo4j)
 
@@ -482,29 +485,57 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             if not text.strip():
                 continue
             source_id = str(file.resolve())
-            # user_id is the audit actor for this source row. Set from the
-            # server-resolved principal, never from anything the caller typed.
             meta = {
                 "source_path": str(file),
                 "extension": file.suffix,
-                "user_id": principal.user_id,
             }
 
+            # write_source requires a non-optional pack_id (#143 invariant 5:
+            # "no pack" must not be expressible) -- prefer the path-inferred
+            # pack like before, and fall back to the principal's default pack
+            # instead of leaving a file unpacked.
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-            if effective_pack:
-                meta["pack_id"] = effective_pack
+            target_pack_id = effective_pack or resolve_write_pack(stores.sql, principal, None)
 
-            with write_lock():
-                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+            with principal_scope(principal), write_lock():
+                receipt = write_source(
+                    stores.sql, hybrid, mongo, chroma,
+                    text=text, source_id=source_id,
+                    metadata=meta, pack_id=target_pack_id,
+                )
+                # write_source reports per-store failures in the receipt
+                # rather than raising (#158 contract), so the receipt has to be
+                # read or a failure is counted as an "OK" file.
+                #
+                # Only the doc row is fatal. It is the system of record for a
+                # source; the vector leg is optional and fails on its own in
+                # any deployment without an embedding backend. Treating that as
+                # fatal aborted the whole file and skipped the audit row below
+                # -- the ingest looked successful and left no actor trail.
+                doc_status = receipt["stores"].get("documents")
+                doc_ok = store_write_succeeded(receipt["stores"], "documents")
+                vector_ok = store_write_succeeded(receipt["stores"], "chromadb")
+                # A doc-less deployment is a supported shape: `write_source`
+                # deliberately keeps going and the vector leg carries the
+                # ingest. Requiring the doc row there would report a file as
+                # failed AFTER its vector was persisted, and skip the audit
+                # row on the way out. Fatal only when nothing landed.
+                if not doc_ok and not (doc_status == "unavailable" and vector_ok):
+                    raise RuntimeError(f"source record failed: {doc_status}")
+                vector_status = receipt["stores"].get("chromadb")
+                if vector_status and str(vector_status).startswith("error"):
+                    console.print(
+                        f"  [yellow]vector leg failed for {source_id}: "
+                        f"{vector_status}[/yellow]"
+                    )
 
                 if mongo.available:
-                    mongo.upsert_source(source_id, text, meta)
                     # Audit row carries the same actor as the source metadata.
                     try:
                         mongo.log_event(
                             "ingest",
                             subject_id=principal.user_id,
-                            details={"source_id": source_id, "pack_id": effective_pack},
+                            details={"source_id": source_id, "pack_id": target_pack_id},
                         )
                     except Exception as exc:  # noqa: BLE001
                         # Audit is best-effort by contract: a failed audit row
@@ -516,8 +547,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                         )
 
             ok_count += 1
-            tag = f" pack={effective_pack}" if effective_pack else ""
-            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars){tag}")
+            console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars) pack={target_pack_id}")
         except Exception as exc:
             console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 
@@ -536,6 +566,12 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
 @click.option("--model", default="claude-haiku-4-5-20251001", show_default=True, help="Claude model for extraction.")
 @click.option("--dry-run", is_flag=True, default=False, help="Extract but do not write to stores.")
 @click.option("--api-key", default=None, envvar="ANTHROPIC_API_KEY", help="Anthropic API key.")
+@click.option(
+    "--pack-id",
+    "pack_id",
+    default=None,
+    help="Destination pack_id. Defaults to the caller's default pack.",
+)
 def extract(
     path: str,
     recursive: bool,
@@ -543,9 +579,10 @@ def extract(
     model: str,
     dry_run: bool,
     api_key: str | None,
+    pack_id: str | None,
 ) -> None:
     """LLM-extract ontology nodes/edges from files and write to the graph."""
-    from opencrab.auth import require_local_principal
+    from opencrab.auth import principal_scope, require_local_principal
     from opencrab.config import get_settings
     from opencrab.locking import write_lock
     from opencrab.ontology.builder import (
@@ -554,6 +591,7 @@ def extract(
         store_write_succeeded_for,
     )
     from opencrab.ontology.extractor import LLMExtractor
+    from opencrab.pack.ownership import resolve_write_pack
 
     if not api_key:
         import os
@@ -581,6 +619,7 @@ def extract(
     graph, doc, sql = stores.graph, stores.doc, stores.sql
     builder = OntologyBuilder(graph, doc, sql)
     extractor = LLMExtractor(api_key=api_key, model=model)
+    target_pack_id = resolve_write_pack(sql, principal, pack_id) if principal else None
 
     extensions = [e.strip() for e in extension.split(",")]
     root = Path(path)
@@ -614,7 +653,7 @@ def extract(
                 console.print()
 
             if not dry_run:
-                with write_lock():
+                with principal_scope(principal), write_lock():
                     for node in result.nodes:
                         try:
                             res = builder.add_node(
@@ -622,7 +661,7 @@ def extract(
                                 node_type=node.node_type,
                                 node_id=node.node_id,
                                 properties=node.properties,
-                                subject_id=principal.user_id,
+                                pack_id=target_pack_id,
                             )
                             stores = res.get("stores") if isinstance(res, dict) else None
                             if not isinstance(stores, dict):
@@ -644,7 +683,7 @@ def extract(
                                 to_space=edge.to_space,
                                 to_id=edge.to_id,
                                 properties=edge.properties,
-                                subject_id=principal.user_id,
+                                pack_id=target_pack_id,
                             )
                             stores = res.get("stores") if isinstance(res, dict) else None
                             if not isinstance(stores, dict):

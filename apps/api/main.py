@@ -26,6 +26,7 @@ from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
 from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+from opencrab.pack.write_gate import reject_boundary_identity
 from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 from opencrab.stores.factory import (
     make_doc_store,
@@ -74,6 +75,7 @@ class NodeRequest(BaseModel):
     node_type: str = Field(..., min_length=1)
     node_id: str = Field(..., min_length=1)
     properties: dict[str, Any] = Field(default_factory=dict)
+    pack_id: str | None = Field(default=None, description="Optional destination pack_id. Defaults to the caller's default pack.")
 
 
 class EdgeRequest(BaseModel):
@@ -83,6 +85,7 @@ class EdgeRequest(BaseModel):
     to_space: str = Field(..., min_length=1)
     to_id: str = Field(..., min_length=1)
     properties: dict[str, Any] = Field(default_factory=dict)
+    pack_id: str | None = Field(default=None, description="Optional destination pack_id. Defaults to the caller's default pack.")
 
 
 @dataclass(frozen=True)
@@ -205,14 +208,6 @@ def _log_event(docs: Any, event_type: str, user_id: str, details: dict[str, Any]
         docs.log_event(event_type, payload=details, actor=user_id)
     except Exception as exc:
         logger.debug("Audit log write failed for %s: %s", event_type, exc)
-
-
-def _write_source_doc(docs: Any, source_id: str, text: str, metadata: dict[str, Any]) -> str | None:
-    if not _docs_available(docs):
-        return None
-
-    created = docs.upsert_source(source_id, text, metadata)
-    return created or source_id
 
 
 def _count_user_nodes(docs: Any, user_id: str) -> CountResult:
@@ -541,27 +536,50 @@ def ingest_text(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"metadata": payload.metadata})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import resolve_write_pack
+    from opencrab.pack.source_writer import write_source
+
     source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
     metadata = dict(payload.metadata)
-    metadata.setdefault("user_id", auth.user_id)
     metadata.setdefault("source_id", source_id)
 
     with write_lock():
         _enforce_ingest_limits(ctx, auth, source_id)
+        # IngestRequest carries no pack_id field, so every REST ingest lands
+        # in the caller's default pack (unlike /api/nodes /api/edges, which
+        # accept an explicit one).
+        target_pack_id = resolve_write_pack(ctx.sql, auth.principal, None)
         try:
-            result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
+            with principal_scope(auth.principal):
+                receipt = write_source(
+                    ctx.sql, ctx.hybrid, ctx.docs, ctx.vector,
+                    text=payload.text, source_id=source_id,
+                    metadata=metadata, pack_id=target_pack_id,
+                )
         except ValueError as exc:
             # Ownership-tag invariant violation (#171) — a client error, not a 500.
             # Same disposition the node/edge endpoints already give ValueError.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
-        if source_doc_id:
-            result["stores"]["documents"] = f"ok (id={source_doc_id})"
-        elif _docs_available(ctx.docs):
-            result["stores"]["documents"] = "ok"
-        else:
-            result["stores"]["documents"] = "unavailable"
+        # Adapter: keep the pre-#148 envelope (source_id/stores/vector_id at
+        # the top level, no receipt "metadata") rather than handing the
+        # write_source receipt back verbatim -- this shape is a pinned
+        # response contract.
+        result: dict[str, Any] = {"source_id": source_id, "stores": dict(receipt["stores"])}
+        if "vector_id" in receipt:
+            result["vector_id"] = receipt["vector_id"]
 
         _log_event(
             ctx.docs,
@@ -696,27 +714,46 @@ def add_node(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"properties": payload.properties})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Route through the shared OntologyBuilder so HTTP and MCP writes converge:
     # deep grammar + required-field validation, receipt stamping, role-based
-    # store keys and audit are all produced once. owner_id is stamped before the
-    # write so it stays consistent with backfill_owner_id.py's expectations.
-    properties = dict(payload.properties)
-    properties.setdefault("owner_id", auth.user_id)
+    # store keys and audit are all produced once. owner_id/pack_id are now
+    # stamped by the builder itself (#148) -- no caller-side setdefault here.
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
 
+    target_pack_id = resolve_write_pack(ctx.sql, auth.principal, payload.pack_id)
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        with write_lock():
+        with principal_scope(auth.principal), write_lock():
             response = builder.add_node(
                 payload.space,
                 payload.node_type,
                 payload.node_id,
-                properties,
-                subject_id=auth.user_id,
+                dict(payload.properties),
+                pack_id=target_pack_id,
             )
             _meter_call(ctx, auth, "/api/nodes")
     except ValueError as exc:
         # Grammar / required-field validation failure — a client error, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PackNotFoundError:
+        # #143 invariant 7: identical response for "doesn't exist at all" and
+        # "exists but it's someone else's private pack" -- the response body
+        # must not hint at which case this is.
+        raise HTTPException(status_code=404, detail="pack not found; use pack_create first") from None
+    except PackForbiddenError:
+        raise HTTPException(status_code=403, detail="PACK_NOT_WRITABLE: not the pack owner") from None
 
     return response
 
@@ -727,12 +764,27 @@ def add_edge(
     auth: AuthContext = Depends(require_auth),
     ctx: ApiContext = Depends(get_context),
 ) -> dict[str, Any]:
+    # #148: refuse caller-supplied identity BEFORE any server default is
+    # filled in -- run it later and the server's own value is what gets
+    # rejected. The MCP dispatcher has done this since #145; REST had no
+    # equivalent, so the two surfaces disagreed on the same keys. Ahead of
+    # resolve_write_pack too: that creates the caller's default pack, and an
+    # invalid request must not leave a registry row behind.
+    try:
+        reject_boundary_identity({"properties": payload.properties})
+    except ValueError as exc:
+        # Client error, not a 500 -- same shape the grammar failures below use.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Shared OntologyBuilder path (see add_node). The builder resolves real node
     # types via the graph store's lookup_node_type, validates the relation, and
     # produces a receipt + role-based store keys + audit in one place.
+    from opencrab.auth import principal_scope
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, resolve_write_pack
+
+    target_pack_id = resolve_write_pack(ctx.sql, auth.principal, payload.pack_id)
     builder = OntologyBuilder(ctx.graph, ctx.docs, ctx.sql, vec=ctx.vector)
     try:
-        with write_lock():
+        with principal_scope(auth.principal), write_lock():
             response = builder.add_edge(
                 payload.from_space,
                 payload.from_id,
@@ -740,11 +792,15 @@ def add_edge(
                 payload.to_space,
                 payload.to_id,
                 payload.properties,
-                subject_id=auth.user_id,
+                pack_id=target_pack_id,
             )
             _meter_call(ctx, auth, "/api/edges")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PackNotFoundError:
+        raise HTTPException(status_code=404, detail="pack not found; use pack_create first") from None
+    except PackForbiddenError:
+        raise HTTPException(status_code=403, detail="PACK_NOT_WRITABLE: not the pack owner") from None
 
     return response
 

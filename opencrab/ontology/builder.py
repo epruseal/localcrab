@@ -19,6 +19,16 @@ from typing import Any
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
+from opencrab.pack.write_gate import (
+    EDGE_STAMPED,
+    NODE_STAMPED,
+    authorize,
+    edge_identity_conflict,
+    identity_reject_message,
+    node_identity_conflict,
+    resolved_endpoint_pack_conflict,
+    stamp,
+)
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
@@ -52,10 +62,19 @@ class OntologyBuilder:
         node_id: str,
         properties: dict[str, Any] | None = None,
         *,
-        subject_id: str | None = None,
+        pack_id: str,
+        origin: str = "client",
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
+
+        ``origin="server"`` is for replaying data this server previously wrote
+        -- the pack loader restoring its own dump. A dump can carry an
+        ``owner_id`` stamped by a past server (or by the same server before a
+        re-init under a new user); treating that as a forged client value
+        rejects the node and silently drops it from the reload. Server-origin
+        overwrites it with the importing principal instead. Every
+        client-reachable path keeps the default.
 
         Parameters
         ----------
@@ -77,22 +96,53 @@ class OntologyBuilder:
         ValueError
             If the space/node_type combination is invalid.
         """
-        props = properties or {}
+        from opencrab.auth import current_principal
+
+        # The gate, in this order and no other (#148). Stamping must run
+        # BEFORE canonicalize_pack_alias: that helper rewrites pack tags in
+        # place, so a stamp running after it can no longer see what the caller
+        # actually asked for and a forged pack_id would pass silently.
+        # `stamp` returns a NEW dict -- unlike the pre-#148 code this no longer
+        # mutates the caller's properties.
+        principal = current_principal()
+        authorize(self._sql, principal, pack_id)
+        props = stamp(
+            properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED,
+            origin=origin,
+        )
 
         # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
         # `pack_id` with different values. This is the funnel every graph/doc/vector
         # node write reaches (MCP, REST, pack ingest, pack loader), so the check
-        # belongs here rather than in each entry point. Mutates `props` in place,
-        # which is what lets a caller's own dict stay canonical for its later writes.
+        # belongs here rather than in each entry point.
         canonicalize_pack_alias(props)
 
-        # Grammar validation (raises ValueError on failure)
+
+        # Grammar validation FIRST -- before any probe. `node_type` is
+        # caller-controlled on the REST /api/nodes and MCP ontology_add_node
+        # paths, and Neo4jStore.get_node interpolates it directly into
+        # `MATCH (n:{node_type} ...)`. Probing before validating let an
+        # authenticated caller run mutating Cypher (e.g. a label of
+        # `X) DETACH DELETE n //`) even though the request was rejected a few
+        # lines later. Validation is pure and cheap; it belongs in front.
         result = validate_node(space, node_type)
         result.raise_if_invalid()
 
         # Schema property validation (raises ValueError on failure)
         prop_result = validate_node_properties(node_type, props)
         prop_result.raise_if_invalid()
+
+        # Identity slot guard (#146, promoted to the gate in #148). Node
+        # identity is not qualified by pack on any backend, so writing an id
+        # that already lives in another pack takes that pack's slot. Checked
+        # here rather than at each entry point because every one of them --
+        # MCP, REST, CLI, the loader, crabharness -- lands on this call.
+        reason = node_identity_conflict(
+            self._neo4j, self._mongo, self._vec,
+            space=space, node_type=node_type, node_id=node_id, pack_id=pack_id,
+        )
+        if reason:
+            raise ValueError(identity_reject_message("node", node_id, reason))
 
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
@@ -106,6 +156,21 @@ class OntologyBuilder:
             "receipt_ts": receipt_ts,
             "stores": {},
         }
+
+        # Graph is the system of record. When it is down, refuse the whole
+        # write instead of fanning out to the optional stores (#146 follow-up):
+        # a doc/vector row with no graph node is invisible to every pack-scoped
+        # read and has to be reconciled by hand later. Returned as a receipt
+        # rather than raised so the #158 contract ("callers read the receipt")
+        # keeps holding.
+        if not self._neo4j.available:
+            output["stores"] = {
+                "graph": "unavailable",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+                "vector": "skipped (graph unavailable)",
+            }
+            return output
 
         # --- Neo4j write ---
         if self._neo4j.available:
@@ -137,7 +202,7 @@ class OntologyBuilder:
                 output["stores"]["docs"] = f"ok (id={mongo_id})"
                 self._mongo.log_event(
                     "node_upsert",
-                    subject_id=subject_id,
+                    subject_id=principal.user_id,
                     details={"space": space, "node_type": node_type, "node_id": node_id},
                 )
             except Exception as exc:
@@ -203,7 +268,8 @@ class OntologyBuilder:
         to_id: str,
         properties: dict[str, Any] | None = None,
         *,
-        subject_id: str | None = None,
+        pack_id: str,
+        origin: str = "client",
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -225,6 +291,13 @@ class OntologyBuilder:
             Target node's ID.
         properties:
             Optional edge properties.
+        origin:
+            See add_node. "server" is for the pack loader replaying its own
+            dump. Today it is a no-op on this path -- EDGE_STAMPED is only
+            ("pack_id",) and pack/normalize.py's apply_pack_tag has already
+            overwritten that value upstream, so the client rule passes anyway.
+            Passed for symmetry, and so the meaning does not change silently
+            if owner_id is ever added to EDGE_STAMPED.
 
         Returns
         -------
@@ -238,7 +311,15 @@ class OntologyBuilder:
         edge_result = validate_edge(from_space, to_space, relation)
         edge_result.raise_if_invalid()
 
-        props = properties or {}
+        from opencrab.auth import current_principal
+
+        # See add_node: gate first, alias normalisation second (#148).
+        principal = current_principal()
+        authorize(self._sql, principal, pack_id)
+        props = stamp(
+            properties, principal=principal, pack_id=pack_id, keys=EDGE_STAMPED,
+            origin=origin,
+        )
         canonicalize_pack_alias(props)          # #171 — see add_node
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
@@ -251,6 +332,16 @@ class OntologyBuilder:
             "receipt_ts": receipt_ts,
             "stores": {},
         }
+
+        # See add_node: graph down means the whole write is refused, not
+        # fanned out to the optional stores (#146 follow-up).
+        if not self._neo4j.available:
+            output["stores"] = {
+                "graph": "unavailable",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+            }
+            return output
 
         # Resolve real node types from whichever graph store is available.
         # All four backends expose lookup_node_type(node_id) (see
@@ -289,6 +380,40 @@ class OntologyBuilder:
             from_type = _space_to_default_type(from_space)
             to_type = _space_to_default_type(to_space)
             missing = []
+
+        # #148: an edge may not straddle packs. export_edges_scoped needs BOTH
+        # endpoints in scope, so a cross-pack edge is a row its own pack's
+        # readers can never see -- refuse it instead of writing it.
+        # Unattributed endpoints pass (legacy data predates pack attribution).
+        #
+        # Checked on the RESOLVED (type, id) rows, not on "any row with this
+        # id": with one id held under two node_types the by-id form passes as
+        # soon as it sees the target pack's row, while the unordered lookup
+        # above can still have picked the other pack's row to attach to.
+        if not missing:
+            for endpoint_type, endpoint_id in ((from_type, from_id), (to_type, to_id)):
+                reason = resolved_endpoint_pack_conflict(
+                    self._neo4j, endpoint_type, endpoint_id, pack_id
+                )
+                if reason:
+                    raise ValueError(
+                        identity_reject_message("edge", endpoint_id, reason)
+                    )
+
+        # The edge's own slot, keyed by the backend's upsert conflict key --
+        # which is (from_type, from_id, relation, to_type, to_id), the REAL
+        # node types. This probe must therefore run AFTER the lookup above.
+        # An earlier version passed the ontology *spaces* ("resource") where
+        # the types ("Document") belong, so `get_edge` matched nothing, the
+        # probe passed, and the write below -- which uses the resolved types --
+        # could overwrite an existing edge and reattribute it to another pack.
+        if not missing:
+            reason = edge_identity_conflict(
+                self._neo4j, from_type=from_type, from_id=from_id,
+                relation=relation, to_type=to_type, to_id=to_id, pack_id=pack_id,
+            )
+            if reason:
+                raise ValueError(identity_reject_message("edge", from_id, reason))
 
         # --- Neo4j write ---
         if missing:
@@ -329,7 +454,7 @@ class OntologyBuilder:
             try:
                 self._mongo.log_event(
                     "edge_upsert",
-                    subject_id=subject_id,
+                    subject_id=principal.user_id,
                     details={
                         "from_space": from_space,
                         "from_id": from_id,

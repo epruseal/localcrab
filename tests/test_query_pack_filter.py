@@ -267,18 +267,40 @@ def test_51_query_outcome_still_iterates_len_and_indexes_like_a_list() -> None:
 def test_51_builder_writes_space_into_vector_metadata() -> None:
     """Root fix: OntologyBuilder.add_node must write 'space' into vector metadata
     so the where-clause SqliteVecStore/_build_chroma_where builds actually has a
-    key to match against, for nodes ingested from here on."""
+    key to match against, for nodes ingested from here on.
+
+    #148: add_node now calls current_principal() and authorize(sql,
+    principal, pack_id) internally, both BEFORE the vector-store branch this
+    test inspects -- needs a bound principal and a real, queryable SQL store
+    with a pack it owns (authorize() fails closed -- RuntimeError -- when
+    sql.available is falsy). #148 point 6 also means graph must report
+    available=True: a graph-unavailable node write now refuses the whole
+    fan-out (including the vector write), where this test used to rely on
+    graph=unavailable being harmless to the vector-only path it cares about.
+    """
+    from opencrab.auth import Principal, principal_scope
     from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores.sql_store import SQLStore
 
     vec = MagicMock()
     vec.available = True
     vec.upsert_texts = MagicMock()
-    graph = MagicMock(available=False)
+    vec.get_by_id.return_value = None
+    graph = MagicMock(available=True)
+    # #148 identity guard: a MagicMock answers every probe with another
+    # MagicMock, which is an unrecognised shape and so fail-closed.
+    graph.get_node.return_value = None
+    graph.get_nodes_by_id.return_value = []
     docs = MagicMock(available=False)
-    sql = MagicMock(available=False)
+    sql = SQLStore("sqlite:///:memory:")
+    pack_id = create_pack(sql, "test-user", "pack-a")
     builder = OntologyBuilder(graph, docs, sql, vec=vec)
 
-    builder.add_node("resource", "Document", "n1", {"title": "hello world", "pack_id": "pack-a"})
+    with principal_scope(Principal(user_id="test-user", is_local=True, disabled=False)):
+        builder.add_node(
+            "resource", "Document", "n1", {"title": "hello world"}, pack_id=pack_id
+        )
 
     kwargs = vec.upsert_texts.call_args.kwargs
     assert kwargs["metadatas"][0]["space"] == "resource"
