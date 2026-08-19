@@ -344,21 +344,29 @@ class SQLStore:
                 # to open the same DB can both see the column missing and
                 # both ALTER. The try/except absorbs the loser's "duplicate
                 # column" error as success rather than crashing it.
+                # The ALTER runs inside a SAVEPOINT. On PostgreSQL, catching
+                # the loser's error is not enough: the failed statement leaves
+                # the whole transaction aborted, so the CREATE INDEX below
+                # would raise InFailedSqlTransaction and this replica's SQL
+                # store would be marked unavailable. Rolling back to the
+                # savepoint restores a usable transaction. SQLite does not need
+                # this but tolerates it, so there is one code path.
                 try:
-                    if self._is_sqlite:
-                        conn.execute(
-                            text(
-                                "ALTER TABLE packs ADD COLUMN is_default INTEGER "
-                                "NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1))"
+                    with conn.begin_nested():
+                        if self._is_sqlite:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN is_default INTEGER "
+                                    "NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1))"
+                                )
                             )
-                        )
-                    else:
-                        conn.execute(
-                            text(
-                                "ALTER TABLE packs ADD COLUMN is_default BOOLEAN "
-                                "NOT NULL DEFAULT FALSE"
+                        else:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE packs ADD COLUMN is_default BOOLEAN "
+                                    "NOT NULL DEFAULT FALSE"
+                                )
                             )
-                        )
                 except DBAPIError as exc:
                     message = str(getattr(exc, "orig", exc)).lower()
                     if "duplicate column" not in message and "already exists" not in message:

@@ -1114,7 +1114,8 @@ def load_nodes(
         id_map[node_id] = (space, node_type)
 
         try:
-            res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
+            res = builder.add_node(space, node_type, node_id, properties=props,
+                                     pack_id=pack_name, origin="server")
             # **영수증을 본다.** `add_node`는 스토어 실패를 예외로 올리지 않고 반환
             # dict에 적는다 — `builder.store_write_failures()`의 docstring이
             # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
@@ -1277,7 +1278,8 @@ def load_nodes_incremental(
         stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
         try:
-            res = builder.add_node(space, node_type, node_id, properties=props, pack_id=pack_name)
+            res = builder.add_node(space, node_type, node_id, properties=props,
+                                     pack_id=pack_name, origin="server")
             # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
             # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
             # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
@@ -1441,7 +1443,8 @@ def load_edges(
         apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
 
         try:
-            res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id, properties=props, pack_id=pack_name)
+            res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id,
+                                     properties=props, pack_id=pack_name, origin="server")
             # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
             # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
             # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).

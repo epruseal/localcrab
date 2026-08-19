@@ -170,3 +170,22 @@ def test_each_writer_authorizes(writer):
             assert "authorize" in called, f"{module}::{func} does not call authorize()"
             return
     pytest.fail(f"{func} not found in {module}")
+
+
+def test_the_packs_migration_uses_a_savepoint():
+    """Weak guard, deliberately: a name-presence pin on a fix CI cannot reach.
+
+    The `is_default` ALTER runs inside `conn.begin_nested()` because on
+    PostgreSQL a failed statement aborts the whole transaction -- catching the
+    loser's duplicate-column error is not enough, the following CREATE INDEX
+    then dies with InFailedSqlTransaction and the store is marked unavailable.
+    SQLite does not need the savepoint and passes either way, so no behavioural
+    test in this environment can hold the line; this at least fails loudly if
+    someone deletes it. A real PG-marked test would supersede this.
+    """
+    src = (REPO / "opencrab/stores/sql_store.py").read_text(encoding="utf-8")
+    migration = src[src.index("def _migrate_packs_is_default"):]
+    migration = migration[: migration.index("\n    def ")]
+    assert "begin_nested()" in migration, (
+        "the ALTER must run in a savepoint; see this test's docstring"
+    )

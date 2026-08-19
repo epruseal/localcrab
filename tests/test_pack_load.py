@@ -4469,3 +4469,28 @@ class TestLoadLogsInsteadOfSwallowing:
         assert any("주입된 노드 삭제 실패" in r.getMessage() for r in caplog.records), (
             "노드 삭제 실패가 로그에 안 남았다: "
             f"{[r.getMessage() for r in caplog.records]}")
+
+
+class TestLoaderReplaysServerStampedIdentity:
+    """The loader restores dumps this server wrote, so a historical `owner_id`
+    in the dump is server data being replayed -- not a client forging identity.
+
+    Review finding (#204): without `origin="server"` the gate calls that value
+    forged, the node is refused, and it disappears from the reload counted only
+    as a skip. Pinned here because the wiring itself had no coverage: removing
+    `origin="server"` from every loader call site killed nothing in the suite.
+    """
+
+    def test_a_dump_carrying_a_past_owner_id_still_loads(self, live, tmp_path):
+        builder, graph, _ = live
+        nf = _write_jsonl(tmp_path / "n.jsonl", [
+            _node(id="replayed", owner_id="user_from_a_past_life"),
+        ])
+        ok, skip, err = pack_load.load_nodes("pack-1", nf, builder, {})
+        assert (ok, skip, err) == (1, 0, 0), (
+            f"replayed owner_id was rejected: ok={ok} skip={skip} err={err}"
+        )
+        row = graph.get_node("Document", "replayed")
+        assert row["owner_id"] == _LIVE_TEST_USER, (
+            "the importing principal must own the reloaded row, not the dump's author"
+        )

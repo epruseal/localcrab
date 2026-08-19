@@ -63,9 +63,18 @@ class OntologyBuilder:
         properties: dict[str, Any] | None = None,
         *,
         pack_id: str,
+        origin: str = "client",
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
+
+        ``origin="server"`` is for replaying data this server previously wrote
+        -- the pack loader restoring its own dump. A dump can carry an
+        ``owner_id`` stamped by a past server (or by the same server before a
+        re-init under a new user); treating that as a forged client value
+        rejects the node and silently drops it from the reload. Server-origin
+        overwrites it with the importing principal instead. Every
+        client-reachable path keeps the default.
 
         Parameters
         ----------
@@ -98,7 +107,8 @@ class OntologyBuilder:
         principal = current_principal()
         authorize(self._sql, principal, pack_id)
         props = stamp(
-            properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED
+            properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED,
+            origin=origin,
         )
 
         # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
@@ -253,6 +263,7 @@ class OntologyBuilder:
         properties: dict[str, Any] | None = None,
         *,
         pack_id: str,
+        origin: str = "client",
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -274,6 +285,13 @@ class OntologyBuilder:
             Target node's ID.
         properties:
             Optional edge properties.
+        origin:
+            See add_node. "server" is for the pack loader replaying its own
+            dump. Today it is a no-op on this path -- EDGE_STAMPED is only
+            ("pack_id",) and pack/normalize.py's apply_pack_tag has already
+            overwritten that value upstream, so the client rule passes anyway.
+            Passed for symmetry, and so the meaning does not change silently
+            if owner_id is ever added to EDGE_STAMPED.
 
         Returns
         -------
@@ -293,7 +311,8 @@ class OntologyBuilder:
         principal = current_principal()
         authorize(self._sql, principal, pack_id)
         props = stamp(
-            properties, principal=principal, pack_id=pack_id, keys=EDGE_STAMPED
+            properties, principal=principal, pack_id=pack_id, keys=EDGE_STAMPED,
+            origin=origin,
         )
         canonicalize_pack_alias(props)          # #171 — see add_node
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
@@ -316,14 +335,6 @@ class OntologyBuilder:
             reason = endpoint_pack_conflict(self._neo4j, endpoint_id, pack_id)
             if reason:
                 raise ValueError(identity_reject_message("edge", endpoint_id, reason))
-
-        # The edge's own slot, keyed by the backend's upsert conflict key.
-        reason = edge_identity_conflict(
-            self._neo4j, from_type=from_space, from_id=from_id, relation=relation,
-            to_type=to_space, to_id=to_id, pack_id=pack_id,
-        )
-        if reason:
-            raise ValueError(identity_reject_message("edge", from_id, reason))
 
         # See add_node: graph down means the whole write is refused, not
         # fanned out to the optional stores (#146 follow-up).
@@ -372,6 +383,21 @@ class OntologyBuilder:
             from_type = _space_to_default_type(from_space)
             to_type = _space_to_default_type(to_space)
             missing = []
+
+        # The edge's own slot, keyed by the backend's upsert conflict key --
+        # which is (from_type, from_id, relation, to_type, to_id), the REAL
+        # node types. This probe must therefore run AFTER the lookup above.
+        # An earlier version passed the ontology *spaces* ("resource") where
+        # the types ("Document") belong, so `get_edge` matched nothing, the
+        # probe passed, and the write below -- which uses the resolved types --
+        # could overwrite an existing edge and reattribute it to another pack.
+        if not missing:
+            reason = edge_identity_conflict(
+                self._neo4j, from_type=from_type, from_id=from_id,
+                relation=relation, to_type=to_type, to_id=to_id, pack_id=pack_id,
+            )
+            if reason:
+                raise ValueError(identity_reject_message("edge", from_id, reason))
 
         # --- Neo4j write ---
         if missing:

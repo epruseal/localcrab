@@ -43,8 +43,15 @@ class _Graph:
     def get_nodes_by_id(self, node_id):
         return [v for (_t, i), v in sorted(self.nodes.items()) if i == node_id]
 
-    def get_edge(self, *args):  # noqa: ARG002
-        return None
+    existing_edge = None
+
+    def get_edge(self, from_type, from_id, relation, to_type, to_id):  # noqa: ARG002
+        # Keyed on the REAL node types, like every backend's upsert conflict
+        # key. A double that ignored its arguments would hide a probe called
+        # with the wrong ones.
+        if from_type != "Document" or to_type != "Document":
+            return None
+        return self.existing_edge
 
     def upsert_node(self, node_type, node_id, properties, space_id):
         self.nodes[(node_type, node_id)] = {**properties, "space": space_id}
@@ -113,10 +120,12 @@ def builder(sql):
     return OntologyBuilder(_Graph(), _Docs(), sql, vec=_Vec())
 
 
-def _add(builder, principal=ALICE, pack_id="pack-a", node_id="n1", props=None):
+def _add(builder, principal=ALICE, pack_id="pack-a", node_id="n1", props=None,
+         origin="client"):
     with principal_scope(principal):
         return builder.add_node(
-            "resource", "Document", node_id, props or {"title": "t"}, pack_id=pack_id
+            "resource", "Document", node_id, props or {"title": "t"},
+            pack_id=pack_id, origin=origin,
         )
 
 
@@ -229,3 +238,47 @@ def test_edge_is_stamped_with_its_pack(builder):
         out = builder.add_edge("resource", "a", "cites", "resource", "b", pack_id="pack-a")
     assert out["stores"]["graph"] == "ok"
     assert builder._neo4j.edges[-1]["pack_id"] == "pack-a"
+
+
+# ---------------------------------------------------------------------------
+# Loader replay (#148 review P2)
+# ---------------------------------------------------------------------------
+
+
+def test_server_origin_overwrites_a_replayed_owner(builder):
+    """A pack dump can carry an owner_id a past server stamped -- restoring it
+    after a re-init under a new user, say. Client-origin would call that forged
+    and drop the node from the reload; server-origin overwrites it."""
+    out = _add(builder, props={"title": "t", "owner_id": "user_from_a_past_life"},
+               origin="server")
+    assert out["properties"]["owner_id"] == "user_alice"
+
+
+def test_client_origin_still_refuses_the_same_value(builder):
+    """The exemption is for replay only; the client path must stay strict."""
+    with pytest.raises(ClientIdentityFieldError):
+        _add(builder, props={"title": "t", "owner_id": "user_from_a_past_life"})
+
+
+def test_edge_slot_probe_uses_resolved_types_not_spaces(builder, sql):
+    """Review finding: the edge slot probe was keyed on ontology *spaces*.
+
+    The upsert conflict key is (from_type, from_id, relation, to_type, to_id)
+    with the REAL node types, so probing with "resource" instead of "Document"
+    matched nothing and the write below reattributed an existing edge to
+    another pack. Measured before the fix: the takeover succeeded and the
+    edge's pack_id flipped.
+
+    Reached through UNATTRIBUTED endpoints on purpose -- those pass the
+    endpoint guard by design (legacy data), which leaves this probe as the
+    only thing standing.
+    """
+    create_pack(sql, ALICE.user_id, "pack-b")
+    graph = builder._neo4j
+    graph.nodes[("Document", "x")] = {"title": "t", "space": "resource"}
+    graph.nodes[("Document", "y")] = {"title": "t", "space": "resource"}
+    graph.existing_edge = {"pack_id": "pack-b"}
+
+    with pytest.raises(ValueError, match="already attributed"), principal_scope(ALICE):
+        builder.add_edge("resource", "x", "cites", "resource", "y", pack_id="pack-a")
+    assert graph.edges == [], "refused, so the foreign edge must be untouched"
