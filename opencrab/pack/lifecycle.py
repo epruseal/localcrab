@@ -34,13 +34,18 @@ during ingest -- leave the registry at ``ready`` and are reported in the
 this module's registry status are different things that happen to share a
 word. Only a failure to confirm the anchor itself demotes the row.
 
-That rule is not fastidiousness. Probing cannot support deletion here:
-``opencrab/pack/load.py``'s chunk loader writes to the doc and vector stores
-without passing ``write_gate.authorize`` (a known gap, pinned in
-``tests/test_write_sink_inventory.py`` and owned by #205), so "the anchor is
-absent" never implied "the pack is empty"; and even a complete emptiness check
-would be a statement about one instant, which a slow remote commit landing a
-moment later would invalidate. Demotion is safe under both.
+That rule is not fastidiousness. It was reached by trying the alternative:
+an earlier draft deleted on probe evidence and justified it with "the write
+gate lets nothing but the anchor into a pack that is not ready", which was
+false at the time -- ``opencrab/pack/load.py``'s chunk loader wrote to the doc
+and vector stores outside ``write_gate.authorize``. #205 has since closed that
+particular hole (the loader now authorizes on entry), but the rule stays,
+because the reason that outlives it is the one probing cannot fix: any
+emptiness check is a statement about ONE INSTANT, and a slow remote commit
+landing a moment later invalidates it. Restoring a probe-based delete would
+mean re-proving completeness against every writer that exists at that moment,
+and then still being wrong about the next millisecond. Demotion needs no such
+proof.
 """
 
 from __future__ import annotations

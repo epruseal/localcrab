@@ -1030,10 +1030,13 @@ def pack_create(
     # function, and enforced here by simply never calling delete_pack_row
     # again). Two reasons a probe-based delete would be unsafe from here
     # on, both measured against this codebase rather than assumed:
-    #   (1) opencrab/pack/load.py's chunk loader writes docs/vector content
-    #       OUTSIDE write_gate.authorize (a known gap owned by #205, pinned
-    #       in tests/test_write_sink_inventory.py) -- so "the anchor probe
-    #       came back absent" never implied "this pack has zero content".
+    #   (1) "the anchor probe came back absent" has never implied "this
+    #       pack has zero content". When this was written the standing
+    #       counterexample was load.py's chunk loader writing docs/vector
+    #       outside write_gate.authorize; #205 closed that one, but the
+    #       implication only ever held as long as EVERY writer was known
+    #       and gated, which is a property a future writer can quietly
+    #       take away without touching this file.
     #   (2) store_write_succeeded() is fail-closed: a commit followed by a
     #       dropped connection reads as "not landed" even when it landed,
     #       and a slow remote graph backend can still be about to commit
