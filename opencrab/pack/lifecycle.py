@@ -302,6 +302,17 @@ def repair_incomplete_packs(
     codex r2 P2-3). ``apply=False`` (the default) reports the plan without
     calling it.
     """
+    if older_than_seconds < 0:
+        # Not a wider window -- no window. Every row not dated in the future
+        # compares as older than a negative threshold, so the pass would act
+        # on a `creating` row a pack_create is holding right now and demote a
+        # pack mid-creation. The age gate is the only thing keeping this pass
+        # off in-flight rows. Checked here as well as in the CLI because the
+        # CLI is not the only caller this function can ever have.
+        raise ValueError(
+            f"older_than_seconds must be >= 0, got {older_than_seconds}"
+        )
+
     from opencrab.pack.ownership import (
         PACK_STATUS_CREATING,
         PACK_STATUS_PARTIAL,

@@ -1272,10 +1272,21 @@ def packs_backfill_pack_id(
 @click.option(
     "--older-than",
     "older_than_seconds",
-    type=int,
+    # Non-negative only. A negative threshold is not a wider window, it is NO
+    # window: every row that is not dated in the future compares as older, so
+    # the pass would act on a `creating` row that a pack_create is holding
+    # right now and demote a pack mid-creation. That threshold is the only
+    # thing keeping this pass off in-flight rows, and a typed minus sign
+    # should not be able to remove it.
+    type=click.IntRange(min=0),
     default=3600,
     show_default=True,
-    help="Only act on incomplete rows whose updated_at is at least this many seconds old.",
+    help=(
+        "Only act on incomplete rows whose updated_at is at least this many "
+        "seconds old. 0 acts on every incomplete row regardless of age, "
+        "including any a pack_create is holding right now -- use it only with "
+        "pack writes stopped."
+    ),
 )
 @click.option(
     "--promote",

@@ -835,3 +835,37 @@ class TestCLIRepairRegistry:
         assert payload["apply"] is False
         assert "Dry-run only" in result.output
         assert get_pack(sql, pid)["status"] == "creating"
+
+
+# ---------------------------------------------------------------------------
+# The age gate is the ONLY thing keeping this pass off rows a pack_create is
+# holding right now, so it must not be removable by a typo.
+# ---------------------------------------------------------------------------
+
+
+class TestNegativeThresholdIsRejected:
+    def test_library_refuses_a_negative_threshold(self, sql, alice):
+        """A negative threshold is not a wider window, it is no window:
+        nothing is dated in the future, so every row compares as older and
+        the pass would act on rows still being created."""
+        pid = begin_pack_creation(sql, alice, "in-flight")  # fresh, in-flight
+        before = get_pack(sql, pid)["status"]
+
+        with pytest.raises(ValueError, match="older_than_seconds must be >= 0"):
+            repair_incomplete_packs(
+                sql, FakeGraph(), FakeDocs(), FakeVector(),
+                older_than_seconds=-1, apply=True,
+            )
+
+        assert get_pack(sql, pid)["status"] == before, "nothing may have been acted on"
+
+    def test_cli_rejects_a_negative_threshold(self):
+        from click.testing import CliRunner
+
+        from opencrab.cli import main
+
+        result = CliRunner().invoke(
+            main, ["packs", "repair-registry", "--older-than", "-1", "--apply"]
+        )
+        assert result.exit_code != 0
+        assert "-1" in result.output  # click names the offending value
