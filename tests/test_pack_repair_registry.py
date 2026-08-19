@@ -563,7 +563,10 @@ def test_probe_methods_exist_on_every_real_store_backend():
     # non-`opencrab` module name, is what makes the skip a POSITIVE
     # identification: a typo'd `import neo4jx`, or a stdlib module going
     # missing, is not on anyone's list and fails instead of quietly shrinking
-    # what this test covers.
+    # what this test covers. Each set names what its module actually imports,
+    # read off the import statements themselves -- the PostgreSQL backends
+    # carry an empty set because they reach their driver through SQLAlchemy at
+    # connect time and import nothing driver-specific of their own.
     #
     # Measured, so the granularity below is not read as more than it is: every
     # one of these backends imports cleanly in an environment with NO drivers
@@ -578,21 +581,22 @@ def test_probe_methods_exist_on_every_real_store_backend():
     # entry whose driver set names it.
     graph_backends = [
         ("opencrab.stores.local_graph_store", "LocalGraphStore", frozenset()),
-        ("opencrab.stores.pg_graph_store", "PGGraphStore", frozenset({"psycopg", "psycopg2"})),
-        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore", frozenset({"kuzu"})),
+        ("opencrab.stores.pg_graph_store", "PGGraphStore", frozenset()),
+        # `ladybug`, not `kuzu`: the driver was rebranded and the import
+        # follows the new name (see kuzu_graph_store's own import comment).
+        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore", frozenset({"ladybug"})),
         ("opencrab.stores.neo4j_store", "Neo4jStore", frozenset({"neo4j"})),
     ]
     doc_backends = [
         ("opencrab.stores.local_doc_store", "LocalDocStore", frozenset()),
         ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore", frozenset()),
-        ("opencrab.stores.pg_doc_store", "PgDocStore", frozenset({"psycopg", "psycopg2"})),
-        ("opencrab.stores.mongo_store", "MongoStore", frozenset({"pymongo", "bson"})),
+        ("opencrab.stores.pg_doc_store", "PgDocStore", frozenset()),
+        ("opencrab.stores.mongo_store", "MongoStore", frozenset({"pymongo"})),
     ]
     vector_backends = [
         ("opencrab.stores.chroma_store", "ChromaStore", frozenset({"chromadb"})),
         ("opencrab.stores.sqlite_vec_store", "SqliteVecStore", frozenset({"sqlite_vec"})),
-        ("opencrab.stores.pg_vector_store", "PgVectorStore",
-         frozenset({"psycopg", "psycopg2", "pgvector"})),
+        ("opencrab.stores.pg_vector_store", "PgVectorStore", frozenset()),
     ]
 
     import importlib
