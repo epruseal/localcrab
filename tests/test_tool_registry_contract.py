@@ -48,6 +48,7 @@ GOLDEN_TOOL_NAMES = [
     "pack_ingest",
     "harness_promotion_apply",
     "pack_publish",
+    "pack_fork",
 ]
 
 
@@ -165,6 +166,7 @@ class TestWriteLockCoverage:
         "pack_ingest",
         "harness_promotion_apply",
         "pack_publish",
+        "pack_fork",
     }
 
     def test_write_tools_matches_golden_list(self):

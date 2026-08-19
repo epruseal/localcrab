@@ -281,6 +281,7 @@ from .pack import (  # noqa: E402
     _slugify,
     content_pack_list,
     pack_create,
+    pack_fork,
     pack_ingest,
     pack_publish,
 )
@@ -325,6 +326,7 @@ __all__ = [
     "ontology_query",
     "pack_create",
     "pack_ingest",
+    "pack_fork",
     "pack_publish",
     "schema_pack_install",
     "schema_pack_list",

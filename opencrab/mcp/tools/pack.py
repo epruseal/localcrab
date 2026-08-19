@@ -1460,11 +1460,13 @@ def pack_ingest(
         return {
             "error": "PACK_NOT_WRITABLE: not the pack owner",
             "pack_id": pack_id,
-            # No fork tool exists yet (PR #177 review round 7): naming one
-            # here sent callers straight into an unknown-tool error. Point at
-            # the workflow that actually works today -- this pack stays
-            # READABLE (it is public), so a caller can query it and build
-            # their own pack from what they need.
+            # Ingest itself has no fork-aware variant -- forking (pack_fork,
+            # #201) always lands in a brand-new pack the caller owns, it
+            # does not let a non-owner ingest into someone else's existing
+            # pack. So the hint below still points at the same workflow it
+            # always has: this pack stays READABLE (it is public), so a
+            # caller can query it and build their own pack from what they
+            # need.
             "hint": (
                 "this pack is readable but not writable by you; "
                 "create your own with pack_create and ingest into that"
@@ -1549,20 +1551,16 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
     pack's existence is already observable to anyone (e.g. via
     content_pack_list).
 
-    ``public-fork`` vs ``public-read`` (PR #177 review round 7): today these
-    grant the SAME access. There is no fork tool -- ``packs.forked_from``
-    exists as a column and ``VISIBILITIES`` carries the value, but nothing
-    reads it to copy a pack. ``public-fork`` therefore records the owner's
-    INTENT to allow forking, to be honoured once the fork tool lands (planned
-    in issue #148); it does not currently do anything a caller can observe
-    beyond public-read.
+    ``public-fork`` vs ``public-read`` (PR #177 review round 7, updated for
+    #201): ``public-fork`` RECORDS the owner's intent to allow forking and
+    is what ``pack_fork`` checks (a non-owner caller can only fork a pack
+    whose visibility is exactly ``public-fork``, not merely
+    ``public-read``). Setting it does not itself change read access -- both
+    values grant the same read scope; forking is what ``public-fork``
+    additionally unlocks, via the ``pack_fork`` tool (issue #201).
 
     The value STAYS in ``VISIBILITIES`` -- it is part of the parent auth
-    design's data model, not a dead enum to be pruned. What round 7 found was
-    the WORDING: the old description (and the "not the pack owner" hint)
-    advertised a fork tool that does not exist, sending callers into an
-    unknown-tool error. Do not reintroduce a fork promise here or in any
-    response string until that tool is actually registered.
+    design's data model, not a dead enum to be pruned.
     """
     from opencrab.auth import current_principal
     from opencrab.mcp.tools import _clean_str, _get_context
@@ -1584,13 +1582,14 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
         return {
             "error": "not the pack owner",
             "pack_id": pack_id,
-            # No fork tool exists yet (PR #177 review round 7): naming one
-            # here sent callers straight into an unknown-tool error. Point at
-            # the workflow that actually works today -- this pack stays
-            # READABLE (it is public), so a caller can query it and build
-            # their own pack from what they need.
+            # This pack stays READABLE (it is public) even though the
+            # caller cannot change its visibility. If it is also
+            # public-fork, pack_fork is the workflow that actually applies
+            # here; otherwise the caller can query it and build their own
+            # pack from what they need.
             "hint": (
                 "this pack is readable but not writable by you; "
+                "fork it with pack_fork if it is public-fork, or "
                 "create your own with pack_create and ingest into that"
             ),
         }
@@ -1598,3 +1597,115 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
         return {"error": f"pack_publish failed: {exc}"}
 
     return {"status": "ok", "pack_id": pack["pack_id"], "visibility": pack["visibility"]}
+
+
+@tool(
+    "pack_fork",
+    {
+        "description": (
+            "Copy a public-fork-enabled pack's nodes, edges, sources, and "
+            "vectors into a brand-new pack you own. Vectors are copied raw "
+            "(never re-embedded). Two documented limitations: (1) NOT "
+            "idempotent -- retrying a call that already succeeded creates a "
+            "SECOND pack, it does not resume or dedupe the first; (2) "
+            "reference rewriting only covers exact top-level scalar "
+            "references (e.g. a node's own 'id', a doc's 'source_id'), not "
+            "references nested in a list/dict or held in a non-standard "
+            "key -- anything else is left as-is and counted in the "
+            "response's `unverified_refs`, not silently rewritten. On "
+            "success or partial completion, response is `{\"status\": "
+            "\"ok\"|\"partial\", \"pack_id\", \"forked_from\", "
+            "\"visibility\", \"copied\", \"skipped\", \"errors\", "
+            "\"unverified_refs\"}`; `\"partial\"` additionally carries an "
+            "\"error\" describing what stopped the write phase, with "
+            "\"copied\" reporting actual progress made before that point."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack_id": {
+                    "type": "string",
+                    "description": "Existing pack_id to fork from. Must be your own pack, or another owner's pack published with visibility=public-fork.",
+                },
+                "new_pack_id": {
+                    "type": "string",
+                    "description": "Optional explicit pack_id slug for the new pack. Auto-derived from pack_id (as \"{pack_id}-fork\") if omitted. Unlike pack_create, an explicitly supplied value that is too long is rejected rather than truncated.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional title for the new pack. Defaults to the source pack's own title if omitted.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional description for the new pack. Defaults to the source pack's own description if omitted.",
+                },
+            },
+            "required": ["pack_id"],
+        },
+    },
+    order=17,
+    access=AccessTier.WRITE,
+    writes=True,
+)
+def pack_fork(
+    pack_id: str,
+    new_pack_id: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """
+    Fork ``pack_id`` into a brand-new pack owned by the caller (#201).
+
+    ``pack_id`` must be readable AND fork-enabled: either the caller's own
+    pack, or someone else's published with ``visibility="public-fork"``.
+    #143 invariant 7 applies exactly as it does elsewhere in this module --
+    a nonexistent ``pack_id`` and someone else's PRIVATE pack return the
+    identical "pack not found" error. A pack that IS visible
+    (public-read/public-fork) but simply not fork-enabled (public-read
+    only) returns its own, more specific error, since that pack's existence
+    is already observable via content_pack_list.
+
+    The new pack always starts ``visibility="private"`` (the same default
+    every ``pack_create`` call gets) regardless of the source pack's own
+    visibility -- forking does not inherit or propagate visibility.
+
+    Two limitations, also stated in the tool description surfaced to
+    callers:
+
+    - **Not idempotent.** Every call mints a fresh id-remapping salt and,
+      on success, a fresh ``pack_id``. Retrying a call that already
+      succeeded creates a SECOND, independent pack -- it never resumes or
+      dedupes the first. There is no ``operation_id`` idempotency key.
+    - **Reference rewriting is best-effort.** Only exact top-level scalar
+      values under a small fixed set of reference-shaped keys (id/source_id/
+      document_id/etc.) are remapped to the new pack's id-space. A
+      reference nested inside a list or dict, held under a non-standard
+      key, or already pointing outside the source pack, is left untouched
+      and counted in the response's ``unverified_refs`` instead of being
+      (possibly wrongly) rewritten.
+
+    See ``opencrab.pack.fork.fork_pack`` for the full write-phase contract
+    (two-tier error model, completeness floor, H4 post-write verification).
+    """
+    from opencrab.auth import current_principal
+    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.pack import fork as _fork
+
+    principal = current_principal()
+    pack_id = _clean_str(pack_id)
+    # Only clean an explicitly-supplied value -- None must stay None so
+    # fork_pack can tell "not supplied, inherit from source" apart from
+    # "supplied as an explicit empty override" (design §3).
+    new_pack_id = _clean_str(new_pack_id) if new_pack_id else None
+    title = _clean_str(title) if title is not None else None
+    description = _clean_str(description) if description is not None else None
+
+    ctx = _get_context()
+    return _fork.fork_pack(
+        ctx["sql"], ctx["neo4j"], ctx["mongo"], ctx["chroma"], ctx["hybrid"], ctx["builder"],
+        principal=principal,
+        src_pack_id=pack_id,
+        new_pack_id=new_pack_id,
+        title=title,
+        description=description,
+    )
