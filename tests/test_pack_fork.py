@@ -2770,3 +2770,112 @@ class TestSourceTextFallback:
         assert len(copied) == 1, copied
         assert copied[0]["text"] == original_text, copied[0]
         assert set(original_id_calls) == original_ids, original_id_calls
+
+
+# ---------------------------------------------------------------------------
+# T97 -- design §16: the count-then-export cap race. `_count_pack_vectors`
+# (step 4) and `export_pack_vectors` (step 6b) read the source pack's
+# vectors TWICE, not once -- a concurrent writer landing between the two can
+# grow the actual export past a cap the count already cleared, and nothing
+# re-compares the export's own length against `FORK_MAX_VECTORS`.
+# ---------------------------------------------------------------------------
+
+
+class TestVectorExportLengthRecheck:
+    def test_t97_export_length_rechecked_against_cap_after_count_passes(
+        self, stack, monkeypatch,
+    ):
+        """T97 (design §16-6): `FORK_MAX_VECTORS` lowered to 2 and the
+        source pack seeded with exactly 2 REAL vectors -- the anchor's own
+        plus one surviving content node's -- so step 4's
+        `_count_pack_vectors` measures 2 and clears the cap honestly (no
+        undercounting trick). A second surviving content node is seeded
+        with `write_vector=False`, so it has no real vector of its own.
+        `export_pack_vectors` is then replaced, pass-through style (T96's
+        pattern), with a version that -- ONLY when called for the SOURCE
+        pack id -- appends a third, synthetic, fully valid record for that
+        second (vector-less) survivor's id: this is what a concurrent
+        writer landing between step 4's count and step 6b's export would
+        produce, count says 2, export hands back 3. All three records are
+        real mapped ids with a uniform embedding dimension and valid shape,
+        so nothing but the export-length recheck can reject this fork on
+        cap grounds (design §16-6 note 1: any other classification-loop
+        rejection would make the reverse-mutation pass for the wrong
+        reason). The injection is scoped to `pack_id == src` (design §16-6
+        note 2) so the destination-side H4 re-read
+        (`export_pack_vectors(dst)`) is never touched by it and cannot
+        itself demote the fork to `partial`. T90's reservation/write spy
+        pattern proves the rejection fires before ANY store write.
+        Reverse-mutation: the export-length recheck removed -- fork
+        completes `ok` instead of being rejected, and the exact-string
+        error assertion below fails."""
+        monkeypatch.setattr(fork_mod, "FORK_MAX_VECTORS", 2, raising=True)
+        src = _seed_pack(
+            stack, ALICE, "src-t97", node_count=1, with_edge=False, with_source=False,
+        )
+        second_survivor_id = f"{src}-n1"
+        with principal_scope(ALICE):
+            stack["builder"].add_node(
+                space="resource", node_type="Document", node_id=second_survivor_id,
+                properties={"title": "doc 1"}, pack_id=src, write_vector=False,
+            )
+
+        real_export = type(stack["vector"]).export_pack_vectors
+        actual_count = len(real_export(stack["vector"], src))
+        assert actual_count == 2, (
+            "fixture must seed exactly 2 real vectors (anchor + one "
+            "surviving node) so the step-4 pre-count clears the "
+            "monkeypatched cap of 2 honestly"
+        )
+
+        def _inject_third_survivor(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            anchor_rec = next(r for r in records if r["id"] == anchor_node_id(src))
+            synthetic = dict(anchor_rec)
+            synthetic["id"] = second_survivor_id
+            synthetic["metadata"] = {"pack_id": src}
+            return [*records, synthetic]
+
+        monkeypatch.setattr(
+            type(stack["vector"]), "export_pack_vectors", _inject_third_survivor, raising=True,
+        )
+
+        reservations: list[str] = []
+        writes: list[str] = []
+        real_begin = fork_mod.begin_pack_creation
+        real_write_source = fork_mod.write_source
+        real_add_node = stack["builder"].add_node
+        real_add_edge = stack["builder"].add_edge
+        real_import = stack["vector"].import_vectors
+
+        def _spy(name, fn):
+            def wrapped(*a, **kw):
+                writes.append(name)
+                return fn(*a, **kw)
+            return wrapped
+
+        def spy_begin(*a, **kw):
+            reservations.append("begin_pack_creation")
+            return real_begin(*a, **kw)
+
+        try:
+            fork_mod.begin_pack_creation = spy_begin
+            fork_mod.write_source = _spy("write_source", real_write_source)
+            stack["builder"].add_node = _spy("add_node", real_add_node)
+            stack["builder"].add_edge = _spy("add_edge", real_add_edge)
+            stack["vector"].import_vectors = _spy("import_vectors", real_import)
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            fork_mod.begin_pack_creation = real_begin
+            fork_mod.write_source = real_write_source
+            stack["builder"].add_node = real_add_node
+            stack["builder"].add_edge = real_add_edge
+            stack["vector"].import_vectors = real_import
+
+        assert "error" in out and "status" not in out, out
+        assert out["error"] == "pack too large to fork: more than 2 vectors", out
+        assert _forked_row_count(stack, src) == 0, out
+        assert reservations == [], reservations
+        assert writes == [], writes

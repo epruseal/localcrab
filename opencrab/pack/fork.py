@@ -822,6 +822,21 @@ def _fork_pack_inner(
     #      see the 2-pass block right after this loop).
     #   6. otherwise: survives, remapped, added to the import batch.
     exported_vectors = vector.export_pack_vectors(src_pack_id)
+    # design §16-3: step 4's pre-count and this export are two SEPARATE
+    # reads of the source pack's vectors, not one atomic read -- a
+    # concurrent writer (another service instance, or any normal write
+    # path landing between the two) can grow the actual export past a cap
+    # the count already cleared. Re-checking the export's own length here
+    # closes that window; the message matches step 4's cap rejection
+    # verbatim since the only contract a caller needs is "the pack is too
+    # large to fork" -- the race is this comment's business, not theirs.
+    # Limitation: this cannot stop the export call itself from
+    # materializing an over-cap batch (the length is only known once the
+    # read is done) -- doing that would need a `limit` parameter on every
+    # vector backend's `export_pack_vectors`, which is out of this issue's
+    # scope; an operator hitting this in practice is the upgrade signal.
+    if len(exported_vectors) > FORK_MAX_VECTORS:
+        raise _reject(f"pack too large to fork: more than {FORK_MAX_VECTORS} vectors")
     vector_errors: list[str] = []
     skipped_anchor_vector = 0
     skipped_vector_orphans = 0
