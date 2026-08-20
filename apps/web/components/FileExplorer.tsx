@@ -26,12 +26,17 @@ interface Props {
   onNodeSelect: (id: string) => void
   onIngestClick: () => void
   connected: boolean
-  apiKey: string
-  onApiKeyChange: (key: string) => void
+  // Shows tokenInput (the live-edited value), not the debounced activeToken
+  // -- #149 design 4.3.
+  authToken: string
+  onAuthTokenChange: (token: string) => void
+  // useTokenSession's storage write/delete-failure and dual-key-mismatch
+  // notice (design 4.2), surfaced here next to the token box.
+  storageNotice: string | null
 }
 
 export default function FileExplorer({
-  nodes, selectedId, onNodeSelect, onIngestClick, connected, apiKey, onApiKeyChange,
+  nodes, selectedId, onNodeSelect, onIngestClick, connected, authToken, onAuthTokenChange, storageNotice,
 }: Props) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ '03_Resources': true })
   const [showKey, setShowKey] = useState(false)
@@ -59,7 +64,10 @@ export default function FileExplorer({
     <div style={{
       width: 260, minWidth: 260, background: '#1a1a1a',
       borderRight: '1px solid rgba(248,197,55,0.15)',
-      display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden',
+      // flex/minHeight (not height:'100%') so this shrinks to make room for
+      // PackPanel, mounted as a sibling below it in the same sidebar column
+      // (page.tsx, #149 design 5.6).
+      display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden',
     }}>
       {/* Header */}
       <div style={{ padding: '12px 14px 8px', borderBottom: '1px solid rgba(248,197,55,0.15)' }}>
@@ -76,15 +84,15 @@ export default function FileExplorer({
             <span style={{ fontSize: 10, color: '#7c6f64' }}>{connected ? 'connected' : 'offline'}</span>
           </div>
         </div>
-        {/* API Key */}
+        {/* User token */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ fontSize: 12, color: '#7c6f64' }}>🔑</span>
           <input
             type={showKey ? 'text' : 'password'}
             className="input-dark mono"
-            value={apiKey}
-            onChange={e => onApiKeyChange(e.target.value)}
-            placeholder="API Key…"
+            value={authToken}
+            onChange={e => onAuthTokenChange(e.target.value)}
+            placeholder="사용자 토큰…"
             style={{ fontSize: 11, padding: '4px 8px' }}
           />
           <button
@@ -94,6 +102,11 @@ export default function FileExplorer({
             {showKey ? '🙈' : '👁'}
           </button>
         </div>
+        {storageNotice && (
+          <div style={{ fontSize: 10, color: '#fabd2f', marginTop: 6, lineHeight: 1.4 }}>
+            {storageNotice}
+          </div>
+        )}
       </div>
 
       {/* Ingest button */}
