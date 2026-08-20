@@ -178,7 +178,7 @@ export async function setPackVisibility(
   visibility: PackVisibility,
   signal?: AbortSignal
 ): Promise<OcPack> {
-  return requestJson(`/api/packs/${packId}/visibility`, {
+  return requestJson(`/api/packs/${encodeURIComponent(packId)}/visibility`, {
     method: 'POST',
     authToken,
     body: { visibility },

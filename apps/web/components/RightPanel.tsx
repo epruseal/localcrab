@@ -3,13 +3,25 @@
 import { useEffect, useState } from 'react'
 import type { MutableRefObject } from 'react'
 import type { OcNode, SourceType } from '../lib/api'
-import { query, ingestSource, UnauthorizedError } from '../lib/api'
+import { query, ingestSource, UnauthorizedError, ApiError } from '../lib/api'
 import type { AuthState } from '../hooks/useDataChannel'
 
 const SPACES = ['subject','resource','concept','evidence','outcome','lever','policy','claim','community']
 const SPACE_COLOR: Record<string, string> = {
   subject:'#f8c537', resource:'#83a598', concept:'#b8bb26', evidence:'#bdae93',
   outcome:'#fb4934', lever:'#d3869b', policy:'#fabd2f', claim:'#fe8019', community:'#8ec07c',
+}
+
+// §149 F1: the fetch-level AbortError is caught and re-wrapped into
+// ApiError('Request aborted') inside api.ts's shared requestJson (so every
+// caller sees one error taxonomy, not fetch's raw DOMException). The
+// DOMException/`name === 'AbortError'` checks are kept too so this still
+// recognizes an abort if it ever reaches here unwrapped.
+function isAbortError(e: unknown): boolean {
+  if (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError') return true
+  if (e instanceof Error && e.name === 'AbortError') return true
+  if (e instanceof ApiError && e.message === 'Request aborted') return true
+  return false
 }
 
 interface GraphControls {
@@ -34,6 +46,11 @@ interface Props {
   // response from an identity that has since changed is discarded (design
   // 4.4: "모든 응답 처리에 epoch가드를 건다").
   authEpochRef: MutableRefObject<number>
+  // §149 F1: acquires a 10s-timeout AbortController for one action request
+  // (query or ingest), registered in useDataChannel's actionControllersRef
+  // so an epoch rise aborts it too. Stable identity (useCallback in the
+  // hook).
+  acquireRequestController: () => { signal: AbortSignal; release: () => void }
   // §3.4's "401 판정" transition, reached here the same way a data-channel
   // 401 reaches it, since query/ingest are outside that bundle.
   onUnauthorized: () => void
@@ -45,7 +62,7 @@ interface Props {
 
 export default function RightPanel({
   selectedNode, controls, onControlChange,
-  authToken, authState, tokenPending, authEpochRef, onUnauthorized, onMutationSuccess,
+  authToken, authState, tokenPending, authEpochRef, acquireRequestController, onUnauthorized, onMutationSuccess,
 }: Props) {
   const [tab, setTab] = useState<'detail' | 'query' | 'ingest'>('detail')
   const [queryText, setQueryText] = useState('')
@@ -71,25 +88,28 @@ export default function RightPanel({
   async function handleQuery() {
     if (!queryText.trim() || actionsBlocked) return
     const myEpoch = authEpochRef.current
+    const { signal, release } = acquireRequestController()
     setQuerying(true)
     try {
-      const res = await query(authToken, queryText)
+      const res = await query(authToken, queryText, undefined, signal)
       if (myEpoch !== authEpochRef.current) return // stale identity, discard silently
       // Support both response formats
       setQueryResults(res.results ?? res.hits ?? res.chunks ?? [])
     } catch (e) {
       if (myEpoch !== authEpochRef.current) return
       if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+      if (isAbortError(e)) { showToast('요청 시간 초과 또는 취소', 'error'); return }
       showToast(String(e), 'error')
-    } finally { setQuerying(false) }
+    } finally { setQuerying(false); release() }
   }
 
   async function handleIngest() {
     if (!ingestToken.trim() || actionsBlocked) return
     const myEpoch = authEpochRef.current
+    const { signal, release } = acquireRequestController()
     setIngesting(true)
     try {
-      await ingestSource(authToken, ingestSourceType, ingestToken, { query: ingestQuery || undefined })
+      await ingestSource(authToken, ingestSourceType, ingestToken, { query: ingestQuery || undefined }, signal)
       if (myEpoch !== authEpochRef.current) return
       showToast('인제스트 완료!')
       setIngestToken('')
@@ -98,8 +118,9 @@ export default function RightPanel({
     } catch (e) {
       if (myEpoch !== authEpochRef.current) return
       if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+      if (isAbortError(e)) { showToast('요청 시간 초과 또는 취소', 'error'); return }
       showToast(String(e), 'error')
-    } finally { setIngesting(false) }
+    } finally { setIngesting(false); release() }
   }
 
   function toggleSpace(space: string) {

@@ -21,13 +21,17 @@ interface Props {
   packs: OcPack[]
   loading: boolean
   error: string | null
+  // §149 F2: same block condition as query/ingest (authState !== 'ok' ||
+  // tokenPending) -- a visibility change fired while the token is still
+  // debouncing would launch under the old activeToken (design-fix-v3.1 F2).
+  mutationsBlocked: boolean
   // Parent owns the central data channel (design #149 §3.7/§5.6: mutationSeq,
   // single-flight, epoch guard) -- this component only asks it to perform the
   // change and reports success/failure back to the caller.
   onVisibilityChange: (packId: string, visibility: PackVisibility) => Promise<void>
 }
 
-export default function PackPanel({ packs, loading, error, onVisibilityChange }: Props) {
+export default function PackPanel({ packs, loading, error, mutationsBlocked, onVisibilityChange }: Props) {
   // Per-row pending/error state, local to display -- not the packError this
   // panel's `error` prop carries (that one is for the list fetch itself).
   const [pending, setPending] = useState<Record<string, boolean>>({})
@@ -105,7 +109,7 @@ export default function PackPanel({ packs, loading, error, onVisibilityChange }:
                   <select
                     className="input-dark"
                     value={pack.visibility}
-                    disabled={!!pending[pack.pack_id]}
+                    disabled={!!pending[pack.pack_id] || mutationsBlocked}
                     onChange={e => handleChange(pack.pack_id, e.target.value as PackVisibility)}
                     style={{ fontSize: 10, padding: '2px 4px', flex: 1 }}
                   >

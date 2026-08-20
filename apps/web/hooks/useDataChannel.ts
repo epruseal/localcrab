@@ -44,6 +44,11 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
   const roundIdRef = useRef(0)
   const inFlightRoundRef = useRef<number | null>(null)
   const dataControllersRef = useRef<Set<AbortController>>(new Set())
+  // Separate from dataControllersRef: query/ingest/pack-visibility actions
+  // (#149 F1), not the polled data channel. Kept apart so a mutation
+  // success (notifyMutationSuccess) never aborts an in-flight *action* --
+  // only the epoch-rising path below aborts both sets together.
+  const actionControllersRef = useRef<Set<AbortController>>(new Set())
   const healthInFlightRef = useRef(false)
 
   useEffect(() => { authStateRef.current = authState }, [authState])
@@ -74,6 +79,14 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
     authEpochRef.current += 1
     dataControllersRef.current.forEach(c => c.abort())
     dataControllersRef.current.clear()
+    // §3.7/F1: identity changing aborts in-flight actions too, not just the
+    // polled data channel -- a query/ingest/visibility change made under an
+    // identity that just moved on has nothing valid to land. markInvalid and
+    // notifyMutationSuccess deliberately do NOT touch this set (design-fix-v3.1
+    // F1): killing actions on those paths would abort an unrelated in-flight
+    // POST/query that has nothing to do with the change that just succeeded.
+    actionControllersRef.current.forEach(c => c.abort())
+    actionControllersRef.current.clear()
     inFlightRoundRef.current = null
     setNodes([])
     setEdges([])
@@ -197,22 +210,46 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
     fetchData({ skipInFlightCheck: true })
   }, [fetchData])
 
+  // §3.5/F1: acquired by any action request (query, ingest, pack-visibility
+  // change) -- registers its controller in actionControllersRef (kept apart
+  // from the data channel's dataControllersRef, see the ref declaration
+  // above) and arms a REQUEST_TIMEOUT_MS abort timer. `release` clears the
+  // timer and removes the controller from the set; it is safe to call more
+  // than once (guarded by `released`) since both the success path and a
+  // `finally` block call it.
+  const acquireRequestController = useCallback((): { signal: AbortSignal; release: () => void } => {
+    const ctl = new AbortController()
+    actionControllersRef.current.add(ctl)
+    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS)
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      clearTimeout(timer)
+      actionControllersRef.current.delete(ctl)
+    }
+    return { signal: ctl.signal, release }
+  }, [])
+
   // §5.6 pack visibility change: goes through set_visibility, replaces the
   // row with the server's response, then follows the same mutation-success
   // procedure as any other change.
   const changePackVisibility = useCallback(async (packId: string, visibility: PackVisibility) => {
     const myEpoch = authEpochRef.current
+    const { signal, release } = acquireRequestController()
     let updated: OcPack
     try {
-      updated = await setPackVisibility(activeToken, packId, visibility)
+      updated = await setPackVisibility(activeToken, packId, visibility, signal)
     } catch (err) {
       if (err instanceof UnauthorizedError) markInvalid()
       throw err
+    } finally {
+      release()
     }
     if (myEpoch !== authEpochRef.current) return // identity moved on, discard silently
     setPacks(prev => prev.map(p => (p.pack_id === packId ? updated : p)))
     notifyMutationSuccess()
-  }, [activeToken, markInvalid, notifyMutationSuccess])
+  }, [activeToken, markInvalid, notifyMutationSuccess, acquireRequestController])
 
   // §3.5: the health probe is unauthenticated and runs on its own timer
   // regardless of authState, so the connection dot does not freeze when
@@ -251,6 +288,7 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
     refresh: fetchData,
     notifyMutationSuccess,
     changePackVisibility,
+    acquireRequestController,
     markInvalid,
     authEpochRef,
   }

@@ -41,6 +41,13 @@ export default function DashboardPage() {
   })
   const [showIngest, setShowIngest] = useState(false)
 
+  // §149 F2: shared with RightPanel's own (equivalent) actionsBlocked calc --
+  // both read authState/tokenPending, computed once here for PackPanel since
+  // dashboard page did not previously own this value at all (RightPanel
+  // computes its own copy internally from the same two props it already
+  // receives; left alone rather than threading a prop through it too).
+  const mutationsBlocked = dataChannel.authState !== 'ok' || tokenSession.tokenPending
+
   const visibleNodes = useMemo(
     () => dataChannel.nodes.filter(n => !controls.hiddenSpaces.includes(n.space)),
     [dataChannel.nodes, controls.hiddenSpaces]
@@ -83,6 +90,7 @@ export default function DashboardPage() {
           packs={dataChannel.packs}
           loading={dataChannel.authState === 'checking'}
           error={dataChannel.packError}
+          mutationsBlocked={mutationsBlocked}
           onVisibilityChange={dataChannel.changePackVisibility}
         />
       </div>
@@ -214,6 +222,7 @@ export default function DashboardPage() {
         authState={dataChannel.authState}
         tokenPending={tokenSession.tokenPending}
         authEpochRef={dataChannel.authEpochRef}
+        acquireRequestController={dataChannel.acquireRequestController}
         onUnauthorized={dataChannel.markInvalid}
         onMutationSuccess={dataChannel.notifyMutationSuccess}
       />

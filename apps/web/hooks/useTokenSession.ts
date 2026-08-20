@@ -34,6 +34,11 @@ export function useTokenSession() {
   const [storageNotice, setStorageNotice] = useState<string | null>(null)
 
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // §149 F4: set by the input handler (the user's actual edit entry point),
+  // never by the hydration migration write below -- distinguishes "user
+  // typed this" from "hydration wrote this on the user's behalf" so the
+  // same-value branch in the debounce effect below only fires for real edits.
+  const userEditedRef = useRef(false)
 
   // Commits a confirmed token value to both storage keys (or clears both),
   // per-key try/catch so one failing does not mask the other, and reports
@@ -84,9 +89,28 @@ export function useTokenSession() {
   // edits. This is the only place activeToken changes after hydration, and
   // it is also the only place that persists -- so a hydration-time mismatch
   // between the two keys is left alone until the user actually edits.
+  //
+  // storageNotice is in the deps array because the equal-value branch below
+  // reads it (§149 F4). That only matters while tokenInput === activeToken;
+  // when they differ (the timer branch), a storageNotice change just before
+  // this effect re-runs is a no-op re-run -- pending timer is cleared and an
+  // identical one is set again, with the same tokenInput/activeToken still
+  // driving it.
   useEffect(() => {
     if (!hydrated) return
-    if (tokenInput === activeToken) return
+    if (tokenInput === activeToken) {
+      // Same-value re-entry (design-fix-v3.1 F4): activeToken is not
+      // changing, so the timer branch below would never fire for a retyped
+      // value identical to activeToken, leaving a stale two-keys-differ
+      // notice stuck even after the user "fixes" it by retyping A. Only
+      // resolve it when the user actually edited (not the hydration
+      // migration write) and a notice is currently showing. No timer --
+      // activeToken isn't moving, so there is nothing to debounce.
+      // persist() itself clears storageNotice on success and sets a failure
+      // notice on failure (§4.2 contract); do not set it here.
+      if (storageNotice && userEditedRef.current) persist(tokenInput)
+      return
+    }
     debounceTimer.current = setTimeout(() => {
       setActiveToken(tokenInput)
       persist(tokenInput)
@@ -94,7 +118,7 @@ export function useTokenSession() {
     return () => {
       if (debounceTimer.current) clearTimeout(debounceTimer.current)
     }
-  }, [tokenInput, activeToken, hydrated, persist])
+  }, [tokenInput, activeToken, hydrated, storageNotice, persist])
 
   const tokenPending = hydrated && tokenInput !== activeToken
 
@@ -104,6 +128,9 @@ export function useTokenSession() {
     activeToken,
     tokenPending,
     storageNotice,
-    onTokenInputChange: setTokenInput,
+    onTokenInputChange: useCallback((value: string) => {
+      userEditedRef.current = true
+      setTokenInput(value)
+    }, []),
   }
 }

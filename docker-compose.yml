@@ -158,9 +158,10 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
-      # NEXT_PUBLIC_OPENCRAB_API_KEY removed (#145): NEXT_PUBLIC_* is compiled
-      # into the browser bundle, so it can never hold a credential. The web UI
-      # takes a per-user token from the operator (#149).
+      # The former NEXT_PUBLIC credential env var was removed in #145:
+      # NEXT_PUBLIC_* values are compiled into the browser bundle and can
+      # never hold a secret. The web UI takes a per-user token from the
+      # operator (#149).
     depends_on:
       api:
         condition: service_started
