@@ -2444,3 +2444,224 @@ class TestRemappedIdLengthRejection:
             )
             for col, width in found[table].items():
                 assert width == _PACK_ID_COLUMN_LIMIT, (table, col, width)
+
+
+# ---------------------------------------------------------------------------
+# T87-T93 -- design §14: the pack-id / content-id namespace guard.
+#
+# `_remap_reference_keys` resolves ONE string against TWO namespaces (the
+# mapping's keys = content ids, and `src_pack` = the pack-id space) with a
+# fixed branch precedence. Nothing forced those spaces to be disjoint. When
+# they overlap, the precedence silently picks one meaning and `_h4_scan`
+# cannot see the mistake -- the written value is a mapping VALUE, matching
+# neither "still a mapping key" nor "still == src_pack". Neither branch order
+# is right (§14-3), so the guard removes the overlap instead of ranking the
+# meanings: reject before the reservation on the source side, and compensate
+# the reservation on the destination side (where the value does not exist any
+# earlier).
+#
+# NOTE ON THE ORACLE: as with the length rows above, nothing here asserts "the
+# write failed" -- the assertions are on rejection reasons, registry row
+# counts, and spy call records.
+# ---------------------------------------------------------------------------
+
+
+def _add_node_with_props(stack, pack_id: str, node_id: str, props: dict, *, owner=ALICE) -> None:
+    with principal_scope(owner):
+        stack["builder"].add_node(
+            space="resource", node_type="Document", node_id=node_id,
+            properties=props, pack_id=pack_id,
+        )
+
+
+def _pack_row_count(stack, pack_id: str) -> int:
+    with stack["sql"]._engine.connect() as conn:
+        return conn.execute(
+            _sql_text("SELECT COUNT(*) FROM packs WHERE pack_id = :p"),
+            {"p": pack_id},
+        ).scalar_one()
+
+
+class TestPackIdContentIdNamespaceGuard:
+    def test_t87_node_id_equal_to_pack_id_rejects_whole_fork(self, stack):
+        """T87 (design §14-5, §14-9): a content node whose id IS the pack id
+        makes that string a mapping key, so the pack-valued position on
+        another node (`source == <pack id>`) would be rewritten to
+        `{src}~{salt}` instead of the destination pack. Reject before the
+        reservation instead. The `source` property is seeded explicitly
+        because no fixture produces one -- `write_source` stamps only
+        `pack_id`/`user_id` -- and without it the reverse-mutation oracle
+        below would have nothing to go wrong. Reverse-mutation: the step 6c
+        guard was removed -- the fork completed `ok` and the copied node's
+        `source` came back as `{src}~{salt}` rather than the new pack id,
+        failing both the `error` assertion and the row-count assertion."""
+        src = _seed_pack(stack, ALICE, "src-t87", node_count=2, with_source=False)
+        _add_node(stack, src, src)
+        _add_node_with_props(stack, src, f"{src}-tagged", {"title": "t", "source": src})
+
+        before = _node_snapshot(stack, src)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert "error" in out, out
+        assert src in out["error"], out["error"]
+        assert "#197" in out["error"], out["error"]
+        assert _forked_row_count(stack, src) == 0, out
+        # Rejection declines to create; it does not remove.
+        assert _node_snapshot(stack, src) == before
+
+    def test_t88_source_id_equal_to_pack_id_rejects_whole_fork(self, stack):
+        """T88 (design §14-6): the guard's domain is BOTH axes, because
+        `build_mapping` takes its content keys from both. A source id equal
+        to the pack id poisons the same branch identically even when every
+        node id is clean. Reverse-mutation: the source axis was dropped from
+        the guard's domain tuple -- this pack forked cleanly and the `error`
+        assertion failed."""
+        src = _seed_pack(stack, ALICE, "src-t88", node_count=2, with_source=True)
+        with principal_scope(ALICE):
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="a source whose id collides with the pack id",
+                source_id=src, pack_id=src,
+            )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert "error" in out, out
+        assert src in out["error"], out["error"]
+        assert "source" in out["error"], out["error"]
+        assert _forked_row_count(stack, src) == 0, out
+
+    def test_t89_colliding_id_that_fails_tier_1_is_only_a_drop(self, stack):
+        """T89 (design §14-6): the guard runs only on ids that actually
+        SURVIVE Tier 1, on both axes -- an id that is never copied never
+        becomes a mapping key, so rejecting the whole fork over it would be
+        over-rejection (the same rule §13-9's length check follows, T82).
+        Both Tier 1 filters are exercised: a grammar-invalid node and an
+        alias-conflicted source, each carrying the colliding id. Reverse-
+        mutation: the guard was moved ahead of the grammar check / the alias
+        canonicalization -- this pack, whose colliding ids are dropped
+        anyway, was rejected outright and the `status == 'ok'` assertion
+        failed."""
+        src = _seed_pack(stack, ALICE, "src-t89", node_count=15, with_edge=False,
+                         with_source=False)
+        _add_node(stack, src, src)
+        stack["graph"]._exec_write(
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
+            "WHERE node_id = :nid",
+            {"v": "not-a-real-space", "nid": src},
+        )
+        with principal_scope(ALICE):
+            for i in range(10):
+                write_source(
+                    stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                    text=f"ordinary source {i}", source_id=f"{src}-s{i}", pack_id=src,
+                )
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="alias-conflicted source", source_id=src, pack_id=src,
+            )
+        stack["docs"]._exec_write(
+            "UPDATE doc_sources SET metadata = json_set(metadata, '$.pack', :v) "
+            "WHERE source_id = :sid",
+            {"v": "some-other-pack-entirely", "sid": src},
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        assert any(
+            "failed grammar validation" in msg for msg in out["errors"]["nodes"]
+        ), out["errors"]["nodes"]
+        assert out["skipped"]["sources_alias_conflict"] == 1, out
+        assert src not in _fork_node_ids(stack, out["pack_id"]), out
+
+    def test_t90_guard_precedes_the_reservation_and_every_writer(self, stack):
+        """T90 (design §14-6): the guard's placement claim is that NOTHING
+        has happened yet when it fires -- no reservation and no store write
+        on any of the five write paths (anchor, node, edge, source, vector).
+        A registry row count alone cannot prove that: a compensating delete
+        would leave the same zero. Spies prove the calls were never reached.
+        Reverse-mutation: the guard was disabled at step 6c and re-raised
+        after `begin_pack_creation` as a compensating rejection -- this
+        test's reservation list recorded the call that the placement claim
+        says can never happen."""
+        src = _seed_pack(stack, ALICE, "src-t90", node_count=2, with_source=True)
+        _add_node(stack, src, src)
+
+        reservations: list[str] = []
+        writes: list[str] = []
+        real_begin = fork_mod.begin_pack_creation
+        real_write_source = fork_mod.write_source
+        real_add_node = stack["builder"].add_node
+        real_add_edge = stack["builder"].add_edge
+        real_import = stack["vector"].import_vectors
+
+        def _spy(name, fn):
+            def wrapped(*a, **kw):
+                writes.append(name)
+                return fn(*a, **kw)
+            return wrapped
+
+        def spy_begin(*a, **kw):
+            reservations.append("begin_pack_creation")
+            return real_begin(*a, **kw)
+
+        try:
+            fork_mod.begin_pack_creation = spy_begin
+            fork_mod.write_source = _spy("write_source", real_write_source)
+            stack["builder"].add_node = _spy("add_node", real_add_node)
+            stack["builder"].add_edge = _spy("add_edge", real_add_edge)
+            stack["vector"].import_vectors = _spy("import_vectors", real_import)
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            fork_mod.begin_pack_creation = real_begin
+            fork_mod.write_source = real_write_source
+            stack["builder"].add_node = real_add_node
+            stack["builder"].add_edge = real_add_edge
+            stack["vector"].import_vectors = real_import
+
+        assert "error" in out, out
+        assert reservations == [], reservations
+        assert writes == [], writes
+
+    def test_t92_both_axes_are_named_in_the_rejection(self, stack):
+        """T92 (design §14-6): the rejection says WHICH axis collided, and
+        when both do it says both -- a caller who fixes only the node id
+        would otherwise hit the same rejection again with no new
+        information. Reverse-mutation: the message was narrowed to the first
+        colliding axis -- `source` disappeared from the reason and this
+        assertion failed."""
+        src = _seed_pack(stack, ALICE, "src-t92", node_count=2, with_source=True)
+        _add_node(stack, src, src)
+        with principal_scope(ALICE):
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="collides on the source axis too", source_id=src, pack_id=src,
+            )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert "error" in out, out
+        assert "node/source" in out["error"], out["error"]
+
+    def test_t93_destination_pack_id_equal_to_a_content_id_is_compensated(self, stack):
+        """T93 (design §14-6b): the destination half of the same collision.
+        `dst` does not exist until the reservation, so it cannot be checked
+        in preflight -- but if a content id equals it, that string is a
+        mapping KEY, and `_h4_scan`'s "still a mapping key" predicate then
+        fires on a value rule 3 rewrote CORRECTLY to `dst`, demoting a clean
+        fork to `partial` on a false positive. Reachable because
+        `new_pack_id` is caller-supplied. Reverse-mutation: the `dst in
+        mapping` check was removed -- the fork came back `partial` with an
+        H4 hit naming the correctly-rewritten `source` value, so the
+        `error`/`_pack_row_count == 0` assertions failed."""
+        src = _seed_pack(stack, ALICE, "src-t93", node_count=2, with_source=False)
+        collide = f"{src}-n0"
+        _add_node_with_props(stack, src, f"{src}-tagged", {"title": "t", "source": src})
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=collide)
+
+        assert "error" in out, out
+        assert collide in out["error"], out["error"]
+        assert _pack_row_count(stack, collide) == 0, out
+        assert _forked_row_count(stack, src) == 0, out

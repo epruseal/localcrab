@@ -40,6 +40,15 @@
      넣는 자리다)
    - 둘 다 아니면 그대로 두고 **unverified 로 집계**(원본에서 이미 팩 밖을
      가리키던 참조를 새로 만들어 낼 근거가 없다)
+
+   **앞의 두 갈래가 서로소라는 것은 호출자가 세우는 전제다**(설계 §14). 콘텐츠
+   id 하나가 `src_pack` 문자열과 같으면 그것이 매핑 키가 되어 두 갈래가 같은
+   값에 걸리고, 그때는 어느 순서도 옳지 않다 — 첫 갈래를 앞에 두면 pack 태그
+   자리가 재매핑 id 를 받고, 뒤에 두면 그 노드를 가리키던 진짜 참조가 팩 id 를
+   받는다. 사후 검증(H4)은 둘 중 어느 쪽도 못 본다(쓰인 값이 매핑의 **값**이라
+   "매핑 키가 남았다"에도 "`src_pack` 이 남았다"에도 안 걸린다). 그래서
+   `pack_fork` 의 preflight 가 그런 팩을 아예 거부하고(§5-1 step 6c), 목적지
+   쪽 짝은 예약 직후에 본다(step 10). 그 두 가드가 이 규칙의 전제조건이다.
    값이 `dict`/`list` 면 재귀하지 않고 그대로 두되 **똑같이 unverified 로
    집계**한다(pgvector 는 중첩 JSON metadata 를 그대로 보존하므로 실제로 도달
    가능한 형상이다). 합성 문자열(`"node:" + old_id`)은 값 전체가 매핑 키와
@@ -177,6 +186,9 @@ def _remap_reference_keys(
         if value in mapping:
             new_props[key] = mapping[value]
         elif value == src_pack:
+            # 이 두 갈래의 순서는 `src_pack` 이 매핑 키가 아닐 때만 무의미하다
+            # (모듈 docstring 규칙 3). 그 전제는 `pack_fork` 의 preflight 가
+            # 세운다 — 여기서 재판정하지 않는다.
             new_props[key] = dst_pack
         else:
             # 원본에서 이미 팩 밖을 가리키던 참조(또는 "node:"+old_id 같은

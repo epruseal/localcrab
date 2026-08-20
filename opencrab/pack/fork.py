@@ -751,6 +751,37 @@ def _fork_pack_inner(
         surviving_sources.append(record)
         surviving_source_ids_set.add(source_id)
 
+    # ---------------- §5-1 step 6c: pack-id / content-id namespace guard ----------------
+    # Design §14: `_remap_reference_keys` resolves ONE string against TWO
+    # namespaces -- the content-id space (the mapping's keys) and the pack-id
+    # space (`src_pack`) -- with a fixed branch precedence. Nothing forces
+    # those two spaces to be disjoint, and when they are not, the precedence
+    # silently picks one meaning. Neither order is right: with mapping-first
+    # a legacy pack tag (`metadata["source"] == src_pack`, the shape
+    # `load._doc_owner_pred`'s own fallback leg selects on) becomes
+    # `{src}~{salt}`; with src_pack-first a genuine reference TO the
+    # colliding node becomes the destination pack id. `_h4_scan` cannot see
+    # either mistake -- the written value is a mapping VALUE, so it matches
+    # neither "still a mapping key" nor "still == src_pack".
+    #
+    # So remove the premise instead of ranking the meanings: reject the whole
+    # fork here, before the reservation, leaving no registry row. Past this
+    # point `src_pack_id not in mapping` holds and the two branches are
+    # provably disjoint. Checked after Tier 1 and the anchor interception for
+    # both axes (an id that will not be copied never becomes a mapping key,
+    # so rejecting on it would be over-rejection -- same rule §13-9's length
+    # check follows), and O(1) rather than a scan because `src_pack_id` is
+    # the only value whose presence as a key changes a rewrite's meaning.
+    collides = [
+        axis for axis, ids in (("node", surviving_node_ids), ("source", surviving_source_ids_set))
+        if src_pack_id in ids
+    ]
+    if collides:
+        raise _declared_limit_reject(
+            f"{'/'.join(collides)} id {src_pack_id!r} is identical to the pack's own id, so "
+            "the fork id remap cannot tell a reference to that content from the pack tag itself"
+        )
+
     # ---------------- §5-1 step 7 (built here; §6b's mapping-before- ----------------
     # ---------------- classification note applies to VECTOR classification, ----------------
     # ---------------- which needs this mapping and therefore runs after it) ----------------
@@ -1063,6 +1094,22 @@ def _fork_pack_inner(
         # a dict assignment), but the boundary itself is what this aligns).
         dst_anchor = anchor_node_id(dst)
         mapping[src_anchor] = dst_anchor
+
+        # step 10 (cont'd): the destination half of §14's namespace guard.
+        # §5-1 step 6c cleared `src_pack_id`; `dst` could not be checked
+        # there because it does not exist until the reservation above. If a
+        # content id equals it, that string is a mapping KEY, and then
+        # `_h4_scan`'s "still a mapping key" predicate fires on a value that
+        # rule 3 rewrote CORRECTLY to `dst` -- a clean fork demoted to
+        # `partial` on a false positive. Reachable: `new_pack_id` is caller-
+        # supplied and `begin_pack_creation` keeps an uncontested slug
+        # verbatim. Compensate the reservation rather than demote, so the
+        # caller gets the real reason and no row is left behind.
+        if dst in mapping:
+            raise _compensate_reservation(
+                f"the negotiated pack id {dst!r} is identical to a content id in "
+                "the source pack; choose a different new_pack_id"
+            )
 
         # step 10 (cont'd): the anchor fix-up above must not have collided
         # with any other mapping value -- design §12-3's four preflight

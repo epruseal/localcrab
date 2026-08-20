@@ -109,6 +109,23 @@ def test_remap_props_rewrites_source_field_from_src_pack_to_dst_pack():
     assert unverified == 0
 
 
+def test_t91_pack_id_as_a_content_key_makes_the_two_branches_ambiguous():
+    # T91 (설계 §14-3): 이 모듈은 값 하나를 두 네임스페이스(매핑 키 = 콘텐츠 id,
+    # `src_pack` = 팩 id)에 대고 고정 순서로 해석한다. 두 공간이 겹치면 첫 갈래가
+    # 이겨서 pack 값 자리가 `dst_pack` 이 아니라 재매핑 id 를 받는다. 그 오작동을
+    # 여기 고정해 두는 이유는, 이것이 `fork_pack` 이 그런 팩을 아예 거부하는
+    # (§14-5 step 6c) 근거이기 때문이다. 갈래 순서를 뒤집는 변경은 이 행을 죽여
+    # §14-3 의 양방향 반례를 다시 검토하게 만든다 — 뒤집으면 반대로 충돌 노드를
+    # 가리키는 진짜 참조가 팩 id 를 가리키게 되므로 그쪽도 옳지 않다.
+    mapping = _mapping(SRC_PACK)
+    props, unverified = remap_props(
+        {"source": SRC_PACK}, mapping, src_pack=SRC_PACK, dst_pack=DST_PACK
+    )
+    assert props["source"] == mapping[SRC_PACK]
+    assert props["source"] != DST_PACK
+    assert unverified == 0
+
+
 def test_remap_props_rewrites_id_key_via_mapping():
     # REFERENCE_KEYS 의 다섯 번째 키. `upsert_node` 가 항상 주입하는
     # `props["id"]` 자리(설계 §1 실측)를 커버한다.
