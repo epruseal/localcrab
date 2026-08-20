@@ -406,6 +406,18 @@ def _declared_limit_reject(detail: str) -> _RejectedError:
     )
 
 
+def _store_contract_violation_reject(detail: str) -> _RejectedError:
+    """A preflight rejection for a shape that should be UNREACHABLE via the
+    store's own write path (design §12-11 contract 5) -- unlike
+    ``_declared_limit_reject``, this is NOT "supported by the store but not
+    yet forkable pending #197"; it is a sign the store itself violated its
+    own contract (e.g. a duplicate primary key the doc store's schema should
+    already have prevented from ever being written). Wording says so
+    explicitly rather than reading like an ordinary #197 declared limit.
+    """
+    return _reject(f"{detail}; this indicates a store contract violation (bug signal)")
+
+
 # ---------------------------------------------------------------------------
 # The orchestrator
 # ---------------------------------------------------------------------------
@@ -672,12 +684,14 @@ def _fork_pack_inner(
                 f"source {source_id!r} shares the pack anchor's id"
             )
         if source_id in seen_source_ids:
-            # The doc store's PK is source_id, so this is unreachable via
-            # the normal SQL-backed store -- reaching it at all is a store
-            # contract violation (design §12-3), not original data merely
-            # being messy, hence a rejection rather than a silent Tier 1
-            # drop of the duplicate.
-            raise _declared_limit_reject(
+            # design §12-11 contract 5: the doc store's PK is source_id, so
+            # this is unreachable via the normal SQL-backed store -- reaching
+            # it at all is a store contract violation (a bug signal), not a
+            # #197-declared limit the store itself otherwise accepts, hence
+            # `_store_contract_violation_reject` rather than
+            # `_declared_limit_reject`. The `appears more than once` wording
+            # is kept verbatim (T59 asserts this exact substring).
+            raise _store_contract_violation_reject(
                 f"source {source_id!r} appears more than once in this pack"
             )
         seen_source_ids.add(source_id)
@@ -935,10 +949,6 @@ def _fork_pack_inner(
     except Exception as exc:
         raise _reject(f"pack registration failed: {exc}") from exc
 
-    dst_anchor = anchor_node_id(dst)
-    # step 10: fix up the mapping's anchor entry now that dst is known.
-    mapping[src_anchor] = dst_anchor
-
     def _compensate_reservation(reason: str) -> _RejectedError:
         """Confirmed (never assumed) compensating delete of the just-reserved
         ``creating`` row (design §12-4). Never raises -- even a failed
@@ -965,15 +975,25 @@ def _fork_pack_inner(
             # return value was lost, or another actor removed it first. The
             # goal (no reserved row left behind) is already achieved.
             return _reject(reason)
-        if requery_ok and row is not None and row.get("owner_id") == owner_id:
+        # design §12-11 contract 3: `get_pack` is ownership-unscoped, so a
+        # bare `owner_id` match is not enough to trust this row as OUR
+        # reservation -- a same-owner row from a DIFFERENT fork (a different
+        # `forked_from`) must not leak its status/pack_id into this neutral
+        # cleanup-failure message either.
+        if (
+            requery_ok
+            and row is not None
+            and row.get("owner_id") == owner_id
+            and row.get("forked_from") == src_pack_id
+        ):
             return _reject(
                 f"{reason}; the reserved pack {dst!r} could not be cleaned up "
                 f"(observed status {row.get('status')!r}); operator inspection required"
             )
-        # Someone else's row (should not happen for a fresh reservation, but
-        # #143 invariant 7 forbids exposing another owner's row state
-        # regardless) or the requery itself failed: one neutral message,
-        # no status, no pack_id.
+        # Someone else's row, a same-owner row from a different fork, or the
+        # requery itself failed (should not happen for a fresh reservation,
+        # but #143 invariant 7 forbids exposing another owner's row state
+        # regardless): one neutral message, no status, no pack_id.
         return _reject(
             f"{reason}; reservation cleanup could not be confirmed; operator inspection required"
         )
@@ -990,6 +1010,14 @@ def _fork_pack_inner(
     # "pre-write check failed: ...".
     # =====================================================================
     try:
+        # step 10: fix up the mapping's anchor entry now that dst is known
+        # (design §12-11 contract 1: kept as the R1 `try`'s first statements
+        # so the region boundary matches §12-1's own description of R1 --
+        # both lines are, in practice, incapable of raising (an f-string and
+        # a dict assignment), but the boundary itself is what this aligns).
+        dst_anchor = anchor_node_id(dst)
+        mapping[src_anchor] = dst_anchor
+
         # step 10 (cont'd): the anchor fix-up above must not have collided
         # with any other mapping value -- design §12-3's four preflight
         # rejections already remove every known cause, so a collision here
@@ -1104,14 +1132,46 @@ def _fork_pack_inner(
                 registry_status_observed, registry_transition_confirmed = "unknown", False
             elif row is None:
                 registry_status_observed, registry_transition_confirmed = "missing", False
-            elif row.get("status") == "partial":
-                # Another actor (e.g. an operator's repair_incomplete_packs
-                # age-demotion) already made the same transition.
-                registry_status_observed, registry_transition_confirmed = "partial", True
+            elif row.get("owner_id") == owner_id and row.get("forked_from") == src_pack_id:
+                # design §12-11 contract 3: only OUR row's status is trusted
+                # -- `get_pack` is ownership-unscoped, so without this
+                # predicate a same-slug row another actor now owns (or a
+                # same-owner row from a DIFFERENT fork) could be read back
+                # here and reported as if it were this call's own row.
+                if row.get("status") == "partial":
+                    # Another actor (e.g. an operator's
+                    # repair_incomplete_packs age-demotion) already made the
+                    # same transition.
+                    registry_status_observed, registry_transition_confirmed = "partial", True
+                else:
+                    observed = row.get("status")
+                    registry_status_observed = observed if isinstance(observed, str) else "unknown"
+                    registry_transition_confirmed = False
             else:
-                observed = row.get("status")
-                registry_status_observed = observed if isinstance(observed, str) else "unknown"
-                registry_transition_confirmed = False
+                # The row exists but fails the "is this ours" predicate --
+                # its status is not ours to report (#143 invariant 7).
+                registry_status_observed, registry_transition_confirmed = "unknown", False
+
+        # design §12-11 contract 2: the residual-list computation below reads
+        # `imported_source_payload`/`imported_vector_payload`/`mapping` --
+        # already-in-scope data, not I/O -- but a corrupt entry in either
+        # payload (or a `surviving_source_ids`/`sorted` regression) must not
+        # blow up the whole response. Guarded separately from the registry
+        # re-query above: a demotion that already committed must still come
+        # back as a well-formed partial response, just with this one field
+        # empty and the failure recorded instead of silently dropped.
+        try:
+            sources_without_vectors = sorted(
+                surviving_source_ids(imported_source_payload, mapping)
+                - {p["id"] for p in imported_vector_payload}
+            )
+            demote_source_errors = source_errors
+        except Exception as exc:
+            sources_without_vectors = []
+            demote_source_errors = [
+                *source_errors,
+                f"sources_without_vectors computation failed, reported as empty: {exc!r}",
+            ]
 
         return {
             "status": "partial",
@@ -1134,15 +1194,12 @@ def _fork_pack_inner(
                 "vector_mistagged": skipped_vector_mistagged,
                 "vector_invalid": skipped_vector_invalid,
                 "vector_batch_invalid": skipped_vector_batch_invalid,
-                "sources_without_vectors": sorted(
-                    surviving_source_ids(imported_source_payload, mapping)
-                    - {p["id"] for p in imported_vector_payload}
-                ),
+                "sources_without_vectors": sources_without_vectors,
             },
             "errors": {
                 "nodes": node_errors,
                 "edges": edge_errors,
-                "sources": source_errors,
+                "sources": demote_source_errors,
                 "vectors": vector_errors,
             },
             "unverified_refs": unverified_refs_total,
@@ -1367,7 +1424,19 @@ def _fork_pack_inner(
                     "pack_fork: requery after mark_pack_ready failure raised for "
                     "pack_id=%s: %s", dst, exc,
                 )
-            if not (requery_ok and requery is not None and requery.get("status") == "ready"):
+            # design §12-11 contract 3: `get_pack` is ownership-unscoped, so
+            # a re-read landing on `status == "ready"` is only trustworthy
+            # when the row is confirmed OURS (same owner, same
+            # `forked_from`) -- otherwise a same-slug row another actor now
+            # owns, or a same-owner row from a DIFFERENT fork, could be
+            # misread as this call's own transition landing.
+            if not (
+                requery_ok
+                and requery is not None
+                and requery.get("owner_id") == owner_id
+                and requery.get("forked_from") == src_pack_id
+                and requery.get("status") == "ready"
+            ):
                 return _demote("could not promote to ready after a fully successful write phase")
             # else: the write DID commit and only the response was lost --
             # fall through to the normal "ok" response below.

@@ -6,7 +6,9 @@ helpers -- see design §12-6: "신규 결함 주입형은 tests/test_pack_fork_f
 새 파일에 둔다"). This file owns every "신규 행" of §12-6's test table except
 T51' (owned by ``tests/test_pack_fork.py``): T54, T54b, T55, T55b, T55c,
 T55d, T56, T57, T57b, T57c, T58, T58b, T59, T60, T61, T62, T63, T63b, T63c,
-T63d, T64, T65, T66, T66b, T67, T68.
+T63d, T63e, T64, T65, T66, T66b, T67, T68, T69, T70, T71, T71b, T72, T72b,
+T73 (T63e and T69-T73 added by design §12-11 contract 4, the R2 codex/
+in-process disagreement's follow-up).
 
 Injection discipline (design §12-6, mandatory per row):
   - Tier 1 (the ORIGINAL exported data is already broken -- a shape the real
@@ -317,7 +319,15 @@ def test_t55d_mark_pack_partial_false_requery_already_partial_reports_confirmed(
     def _already_partial_get_pack(sql_, pack_id):
         if pack_id == src:
             return get_pack(sql_, pack_id)
-        return {"pack_id": pack_id, "status": "partial", "owner_id": ALICE.user_id}
+        # design §12-11 contract 3/4: the "our row" predicate also checks
+        # `forked_from == src_pack_id` now, not just `owner_id` -- this fake
+        # row must satisfy BOTH terms (this is the "partial -> (partial,
+        # True)" branch's sole detector under the new predicate) or it would
+        # fall through to the else branch and wrongly report "unknown".
+        return {
+            "pack_id": pack_id, "status": "partial", "owner_id": ALICE.user_id,
+            "forked_from": src,
+        }
 
     monkeypatch.setattr(fork_mod, "get_pack", _already_partial_get_pack)
 
@@ -753,7 +763,17 @@ def test_t63c_delete_false_requery_foreign_owner_reports_neutral_message(stack, 
     def _foreign_get_pack(sql_, pack_id):
         if pack_id == src:
             return get_pack(sql_, pack_id)
-        return {"pack_id": pack_id, "owner_id": "user_mallory_not_the_caller", "status": "creating"}
+        # design §12-11 contract 3/4: the compensation helper's "our row"
+        # predicate is now `owner_id == owner_id AND forked_from ==
+        # src_pack_id` -- this fake row must satisfy `forked_from` (so ONLY
+        # the `owner_id` term is violated) or the combined predicate stays
+        # false for a reason other than the owner mismatch this row exists
+        # to detect, and the T63c-owner-removal mutation below the row
+        # matrix would go uncaught.
+        return {
+            "pack_id": pack_id, "owner_id": "user_mallory_not_the_caller",
+            "status": "creating", "forked_from": src,
+        }
 
     monkeypatch.setattr(fork_mod, "get_pack", _foreign_get_pack)
 
@@ -820,6 +840,40 @@ def test_t63d_identity_conflict_compensates_exactly_once_with_original_wording(s
     assert "error" in out, out
     assert len(delete_calls) == 1, delete_calls
     assert out["error"] == "n0-t63d: identity is already attributed to a different pack", out
+
+
+def test_t63e_delete_true_skips_requery_reports_bare_reason(stack, monkeypatch):
+    """T63e: design §12-11 contract 4. With a step-11 rejection forced,
+    `delete_pack_row` reports True (the compensating delete genuinely
+    committed) -> `_compensate_reservation`'s `if deleted:` short-circuit
+    must return the ORIGINAL bare reason immediately, with NO "could not be
+    cleaned up" suffix, and the requery (`get_pack(sql, dst)`) must never
+    even be called -- confirmed by a spy that raises `AssertionError` for
+    any pack_id other than `src` (the one call `fork_pack` itself makes at
+    its own start, delegated to the real function per design's own note:
+    an unconditional failure would kill the fork before reservation, not
+    exercise this branch at all).
+    """
+    src = _seed_pack(stack, ALICE, "src-t63e", node_count=1, with_edge=False, with_source=False)
+    _force_step11_reject(monkeypatch, stack, src)
+    monkeypatch.setattr(fork_mod, "delete_pack_row", lambda *a, **kw: True)
+
+    get_pack_calls: list[str] = []
+    real_get_pack = fork_mod.get_pack
+
+    def _spy_get_pack(sql_, pack_id):
+        get_pack_calls.append(pack_id)
+        if pack_id == src:
+            return real_get_pack(sql_, pack_id)
+        raise AssertionError(
+            f"requery must not happen once delete_pack_row reports True (pack_id={pack_id!r})"
+        )
+
+    monkeypatch.setattr(fork_mod, "get_pack", _spy_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out == {"error": "pack registry state inconsistent after reservation"}, out
+    assert f"{src}-fork" not in get_pack_calls, get_pack_calls
 
 
 # ---------------------------------------------------------------------------
@@ -1017,3 +1071,287 @@ def _vec_backend_kind(vec: Any) -> str | None:
     here (not imported, it is a private name) purely to decide whether T68
     is meaningful against the fixture's resolved backend."""
     return fork_mod._vec_backend(vec)[0]
+
+
+# ---------------------------------------------------------------------------
+# design §12-11 contract 4 -- `_vec_backend`'s accessor-preference branch
+# (T69), `_demote`'s response-assembly guard (T70), and the "our row"
+# ownership+forked_from predicate's detection matrix across all three sites
+# that use it: `_demote`, R3's verdict-span reconfirmation, and
+# `_compensate_reservation` (T71, T71b, T72, T72b, T73 -- T63c above is the
+# matrix's sixth cell, the `_compensate_reservation`/`owner_id` cell).
+#
+# Detection matrix (design §12-11 contract 4, "2 항 x 3 지점"):
+#   site                      | owner_id term removed | forked_from term removed
+#   `_demote`                 | T71                    | T71b
+#   R3                        | T72                    | T72b
+#   `_compensate_reservation` | T63c (above)           | T73
+# Every fake row below violates EXACTLY ONE term of the combined predicate
+# (`row.owner_id == owner_id and row.forked_from == src_pack_id`) so each
+# column's reverse-mutation (removing just that one term) is caught by
+# exactly the row built to violate it -- a row violating both terms would
+# leave the OTHER column's removal mutation undetected (design's own warning
+# about the pre-fix T63c).
+# ---------------------------------------------------------------------------
+
+
+def test_t69_collection_handle_preferred_over_raw_collection(stack):
+    """T69: design §12-11 contract 4. A fake vector store with
+    `available=True`, no `_conn`/`conn` attribute (so `_vec_backend` does
+    not take the sql/sqlalchemy branch), and a callable `_collection_handle`
+    that returns a DIFFERENT sentinel object than the raw `_collection`
+    attribute -- `_vec_backend` must prefer the accessor's handle, and call
+    the accessor exactly once. Reverse-mutation: the accessor-preference
+    branch (`if callable(collection_handle): return ("chroma",
+    collection_handle(), None)`) was removed, falling through to the raw
+    `if hasattr(vec, "_collection"): return ("chroma", vec._collection,
+    None)` branch instead -- `handle is handle_sentinel` failed (the
+    returned handle became `raw_sentinel`, the UNPROTECTED raw collection
+    object design §12-5 says the accessor's lock does not cover).
+    """
+    handle_sentinel = object()
+    raw_sentinel = object()
+
+    class _FakeVec:
+        available = True
+        _collection = raw_sentinel
+
+        def __init__(self) -> None:
+            self.handle_calls = 0
+
+        def _collection_handle(self):
+            self.handle_calls += 1
+            return handle_sentinel
+
+    fake = _FakeVec()
+    kind, handle, table = fork_mod._vec_backend(fake)
+    assert kind == "chroma", kind
+    assert handle is handle_sentinel, handle
+    assert handle is not raw_sentinel, handle
+    assert fake.handle_calls == 1, fake.handle_calls
+
+
+def test_t70_demote_residual_computation_raises_still_returns_wellformed_partial(stack, monkeypatch):
+    """T70: design §12-11 contract 4 (contract 2's regression test).
+    `_demote`'s OWN registry re-confirmation succeeds normally (real
+    `mark_pack_partial`, left un-patched, genuinely commits), but the
+    SEPARATE residual-list computation right after it
+    (`surviving_source_ids(...)`) is forced to raise -- the response must
+    still be well-formed: `status: "partial"`, `skipped.sources_without_
+    vectors == []`, the failure recorded as an extra `errors.sources` entry
+    (not swallowed), and the confirmation fields (already computed before
+    this guarded block) stay their genuine `("partial", True)`. Reverse-
+    mutation: the `try:`/`except Exception as exc:` wrapping the
+    `sources_without_vectors = sorted(surviving_source_ids(...) - ...)`
+    computation was removed (dedented to run unguarded) -- the injected
+    RuntimeError then propagated out of `_demote`, out of R2's `except
+    Exception as exc: return _demote(...)` handler (which had already fired
+    and cannot re-catch what its own call raises), and out of `_fork()`
+    itself, so `out = _fork(...)` raised `RuntimeError: injected T70
+    surviving_source_ids failure` instead of returning a dict.
+    """
+    src = _seed_pack(stack, ALICE, "src-t70", node_count=1, with_edge=False, with_source=False)
+
+    def _boom_import(self, records, *, pack_id):
+        raise RuntimeError("injected T70 tier2 failure")
+
+    monkeypatch.setattr(type(stack["vector"]), "import_vectors", _boom_import, raising=True)
+
+    def _boom_surviving_source_ids(*a, **kw):
+        raise RuntimeError("injected T70 surviving_source_ids failure")
+
+    monkeypatch.setattr(fork_mod, "surviving_source_ids", _boom_surviving_source_ids)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out["status"] == "partial", out
+    assert out["skipped"]["sources_without_vectors"] == [], out["skipped"]
+    assert any(
+        "injected T70 surviving_source_ids failure" in e for e in out["errors"]["sources"]
+    ), out["errors"]
+    assert out["registry_status_observed"] == "partial", out
+    assert out["registry_transition_confirmed"] is True, out
+
+
+def test_t71_demote_foreign_owner_partial_row_reports_unknown(stack, monkeypatch):
+    """T71: design §12-11 contract 4, detection matrix cell (`_demote`,
+    `owner_id` term). `mark_pack_partial` returns False and the requery
+    finds a row owned by SOMEONE ELSE (`forked_from` DOES match `src`, only
+    `owner_id` is violated, so this row is a pure single-term detector) with
+    `status: "partial"` -- must report `("unknown", False)`, not the
+    foreign row's real status. Reverse-mutation: the combined predicate's
+    `row.get("owner_id") == owner_id and row.get("forked_from") ==
+    src_pack_id` was replaced with just `row.get("forked_from") ==
+    src_pack_id` (dropping the `owner_id` term) -- the foreign row then
+    passed the (weakened) predicate, its `status == "partial"` special case
+    fired, and `out["registry_status_observed"] == "unknown"` failed
+    (became `"partial"`) while `registry_transition_confirmed is False`
+    failed too (became `True`) -- the foreign owner's row was impersonated
+    as our own confirmed transition.
+    """
+    src = _seed_pack(stack, ALICE, "src-t71", node_count=1, with_edge=False, with_source=False)
+
+    def _boom_import(self, records, *, pack_id):
+        raise RuntimeError("injected T71 tier2 failure")
+
+    monkeypatch.setattr(type(stack["vector"]), "import_vectors", _boom_import, raising=True)
+    monkeypatch.setattr(fork_mod, "mark_pack_partial", lambda *a, **kw: False)
+
+    def _foreign_partial_get_pack(sql_, pack_id):
+        if pack_id == src:
+            return get_pack(sql_, pack_id)
+        return {
+            "pack_id": pack_id, "owner_id": "user_mallory_not_the_caller",
+            "status": "partial", "forked_from": src,
+        }
+
+    monkeypatch.setattr(fork_mod, "get_pack", _foreign_partial_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out["status"] == "partial", out
+    assert out["registry_status_observed"] == "unknown", out
+    assert out["registry_transition_confirmed"] is False, out
+
+
+def test_t71b_demote_same_owner_different_forked_from_reports_unknown(stack, monkeypatch):
+    """T71b: design §12-11 contract 4, detection matrix cell (`_demote`,
+    `forked_from` term). `mark_pack_partial` returns False and the requery
+    finds a row owned by the CALLER (`owner_id` matches, only `forked_from`
+    is violated -- a same-owner row from a DIFFERENT fork) with `status:
+    "partial"` -- must report `("unknown", False)`, not treat it as our own
+    transition. Reverse-mutation: the combined predicate's `... and
+    row.get("forked_from") == src_pack_id` term was dropped (left as just
+    `row.get("owner_id") == owner_id`) -- the same-owner-different-fork row
+    then passed the (weakened) predicate, its `status == "partial"` special
+    case fired, and `out["registry_status_observed"] == "unknown"` failed
+    (became `"partial"`) while `registry_transition_confirmed is False`
+    failed too (became `True`) -- a sibling fork's row was impersonated as
+    this call's own confirmed transition.
+    """
+    src = _seed_pack(stack, ALICE, "src-t71b", node_count=1, with_edge=False, with_source=False)
+
+    def _boom_import(self, records, *, pack_id):
+        raise RuntimeError("injected T71b tier2 failure")
+
+    monkeypatch.setattr(type(stack["vector"]), "import_vectors", _boom_import, raising=True)
+    monkeypatch.setattr(fork_mod, "mark_pack_partial", lambda *a, **kw: False)
+
+    def _wrong_fork_source_get_pack(sql_, pack_id):
+        if pack_id == src:
+            return get_pack(sql_, pack_id)
+        return {
+            "pack_id": pack_id, "owner_id": ALICE.user_id,
+            "status": "partial", "forked_from": "some-other-pack-not-src",
+        }
+
+    monkeypatch.setattr(fork_mod, "get_pack", _wrong_fork_source_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out["status"] == "partial", out
+    assert out["registry_status_observed"] == "unknown", out
+    assert out["registry_transition_confirmed"] is False, out
+
+
+def test_t72_r3_foreign_owner_ready_row_demotes_not_ok(stack, monkeypatch):
+    """T72: design §12-11 contract 4, detection matrix cell (R3, `owner_id`
+    term). `mark_pack_ready` raises and R3's own reconfirmation requery
+    finds a row owned by SOMEONE ELSE with `status: "ready"` (`forked_from`
+    DOES match `src`, only `owner_id` is violated) -- must NOT reconfirm as
+    `"ok"`; must demote instead. Reverse-mutation: R3's combined predicate
+    (`requery.get("owner_id") == owner_id and requery.get("forked_from")
+    == src_pack_id and requery.get("status") == "ready"`) had its
+    `owner_id` term dropped -- the foreign `ready` row then satisfied the
+    (weakened) predicate, `out["status"] == "partial"` failed (became
+    `"ok"`), a completely different owner's successful write was
+    impersonated as this call's own.
+    """
+    src = _seed_pack(stack, ALICE, "src-t72", node_count=1, with_edge=False, with_source=False)
+
+    def _boom_mark_ready(sql_, pack_id, owner_id):
+        raise RuntimeError("injected T72 mark_pack_ready failure")
+
+    def _foreign_ready_get_pack(sql_, pack_id):
+        if pack_id == src:
+            return get_pack(sql_, pack_id)
+        return {
+            "pack_id": pack_id, "owner_id": "user_mallory_not_the_caller",
+            "status": "ready", "forked_from": src,
+        }
+
+    monkeypatch.setattr(fork_mod, "mark_pack_ready", _boom_mark_ready)
+    monkeypatch.setattr(fork_mod, "get_pack", _foreign_ready_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out["status"] == "partial", out
+    assert out["error"] == "could not promote to ready after a fully successful write phase", out
+
+
+def test_t72b_r3_same_owner_different_forked_from_ready_row_demotes_not_ok(stack, monkeypatch):
+    """T72b: design §12-11 contract 4, detection matrix cell (R3,
+    `forked_from` term). `mark_pack_ready` raises and R3's own
+    reconfirmation requery finds a row owned by the CALLER (`owner_id`
+    matches, only `forked_from` is violated -- a sibling fork's row) with
+    `status: "ready"` -- must NOT reconfirm as `"ok"`; must demote instead.
+    Reverse-mutation: R3's combined predicate had its `forked_from` term
+    dropped -- the same-owner-different-fork `ready` row then satisfied the
+    (weakened) predicate, `out["status"] == "partial"` failed (became
+    `"ok"`), a sibling fork's successful write was impersonated as this
+    call's own.
+    """
+    src = _seed_pack(stack, ALICE, "src-t72b", node_count=1, with_edge=False, with_source=False)
+
+    def _boom_mark_ready(sql_, pack_id, owner_id):
+        raise RuntimeError("injected T72b mark_pack_ready failure")
+
+    def _wrong_fork_source_ready_get_pack(sql_, pack_id):
+        if pack_id == src:
+            return get_pack(sql_, pack_id)
+        return {
+            "pack_id": pack_id, "owner_id": ALICE.user_id,
+            "status": "ready", "forked_from": "some-other-pack-not-src",
+        }
+
+    monkeypatch.setattr(fork_mod, "mark_pack_ready", _boom_mark_ready)
+    monkeypatch.setattr(fork_mod, "get_pack", _wrong_fork_source_ready_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out["status"] == "partial", out
+    assert out["error"] == "could not promote to ready after a fully successful write phase", out
+
+
+def test_t73_compensate_same_owner_different_forked_from_reports_neutral_message(stack, monkeypatch):
+    """T73: design §12-11 contract 4, detection matrix cell
+    (`_compensate_reservation`, `forked_from` term -- T63c above is this
+    matrix's `owner_id`-term sibling cell). With a step-11 rejection forced,
+    `delete_pack_row` returns False and the requery finds a row owned by
+    the CALLER (`owner_id` matches, only `forked_from` is violated -- a
+    sibling fork's row that happens to occupy the same negotiated slug) --
+    #143 invariant 7 forbids exposing that row's state, so the message must
+    be the same neutral one T63c/T63b use: no status, no pack_id. Reverse-
+    mutation: `_compensate_reservation`'s combined predicate had its
+    `forked_from` term dropped (left as just `row.get("owner_id") ==
+    owner_id`) -- the sibling-fork row then passed the (weakened)
+    predicate and took the status-revealing branch, `out["error"]` gained
+    `"could not be cleaned up (observed status 'creating')"` naming that
+    other fork's row state, so the exact neutral-message assertion failed.
+    """
+    src = _seed_pack(stack, ALICE, "src-t73", node_count=1, with_edge=False, with_source=False)
+    _force_step11_reject(monkeypatch, stack, src)
+    monkeypatch.setattr(fork_mod, "delete_pack_row", lambda *a, **kw: False)
+
+    def _wrong_fork_source_get_pack(sql_, pack_id):
+        if pack_id == src:
+            return get_pack(sql_, pack_id)
+        return {
+            "pack_id": pack_id, "owner_id": ALICE.user_id,
+            "status": "creating", "forked_from": "some-other-pack-not-src",
+        }
+
+    monkeypatch.setattr(fork_mod, "get_pack", _wrong_fork_source_get_pack)
+
+    out = _fork(stack, principal=ALICE, src_pack_id=src)
+    assert out == {
+        "error": (
+            "pack registry state inconsistent after reservation; "
+            "reservation cleanup could not be confirmed; operator inspection required"
+        ),
+    }, out
