@@ -275,6 +275,11 @@ class MongoStore:
         via ``_require_available()`` rather than returning ``[]`` -- see the
         SQL sibling's docstring for why a down store must not look like an
         empty pack to ``pack_fork``'s orphan-vector detection.
+
+        Row shape includes ``text`` (design §15-3), matching the SQL
+        sibling's `SELECT source_id, text, metadata, ingested_at`: this
+        method's only callers are `pack_fork`'s scoped reads, whose step-16
+        copy loop needs each row's `text` as the fork copy payload.
         """
         self._require_available()
         if not pack_ids or limit <= 0:
@@ -292,7 +297,7 @@ class MongoStore:
                 },
             ]
         }
-        cursor = self._db["sources"].find(query, {"_id": 0, "text": 0}).limit(limit)
+        cursor = self._db["sources"].find(query, {"_id": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
 
     # ------------------------------------------------------------------

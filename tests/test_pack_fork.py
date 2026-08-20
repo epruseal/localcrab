@@ -2665,3 +2665,108 @@ class TestPackIdContentIdNamespaceGuard:
         assert collide in out["error"], out["error"]
         assert _pack_row_count(stack, collide) == 0, out
         assert _forked_row_count(stack, src) == 0, out
+
+
+# ---------------------------------------------------------------------------
+# T95-T96 -- design §15: step 16's `docs.get_source` fallback must fire only
+# on a genuinely incomplete row, never on one that already carries `text`.
+#
+# COUNTING DISCIPLINE (design §15-5): `docs.get_source` is not called only
+# by step 16's fallback. `begin_pack_creation`'s post-reservation identity
+# probe (`source_identity_conflict`, once per source) and `write_source`'s
+# own copy of that same probe (once per source) both call it too -- but with
+# the REMAPPED new id, never the original. So for N sources the new-id call
+# count is >= 2N regardless of whether the fallback ever fires, and counting
+# every call conflates the fallback with the identity probes. Both tests
+# below spy on the call ARGUMENTS and count only calls whose argument is a
+# member of the ORIGINAL source id set -- the fallback's own signature.
+# ---------------------------------------------------------------------------
+
+
+class TestSourceTextFallback:
+    def test_t95_no_original_id_lookups_when_rows_already_carry_text(self, stack, monkeypatch):
+        """T95 (design §15-3, §15-5): the local SQL doc store's scoped rows
+        already carry `text` (unlike mongo's old projection), so step 16
+        must never fall back to `get_source` for any of them -- a bulk read
+        plus N avoidable round trips would defeat the point of the scoped
+        read. `_seed_pack`'s default `with_source=True` seeds one non-empty
+        text source ("s0"), satisfying design §15-5's non-empty-text seed
+        requirement. Reverse-mutation (design §15's table, T95 row): step
+        16's `text = record.get("text") or ""` changed to always assign
+        `""` -- fork still completes `ok` via the fallback, but the
+        original-id call count goes from 0 to 1 and this test's
+        `assert original_id_calls == []` fails."""
+        src = _seed_pack(stack, ALICE, "src-t95", node_count=2, with_source=True)
+        original_ids = {"s0"}
+
+        original_id_calls: list[str] = []
+        real_get_source = type(stack["docs"]).get_source
+
+        def _spy(self, source_id):
+            if source_id in original_ids:
+                original_id_calls.append(source_id)
+            return real_get_source(self, source_id)
+
+        monkeypatch.setattr(type(stack["docs"]), "get_source", _spy, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        assert original_id_calls == [], original_id_calls
+
+    def test_t96_fallback_still_recovers_text_from_a_textless_row(self, stack, monkeypatch):
+        """T96 (design §15-3, §15-5): reproduces the OLD mongo row shape
+        (scoped read returns rows with `text` stripped) via a read-boundary
+        monkeypatch matching `tests/test_pack_fork_faults.py`'s
+        `_patch_list_sources_for_src` pattern -- passed through to the real
+        implementation and only stripped when `pack_ids == [src]`, so the
+        `[dst]` emptiness check and the H4 post-write re-read stay real
+        (design §15-5: patching those too would reject the fork before it
+        ever reaches the fallback). Under that shape, step 16's fallback
+        must still recover the original text via `get_source`, and the
+        copied source's text must match the original byte for byte.
+        Reverse-mutation (design §15's table, T96 row): the fallback branch
+        (`if not text: ... fetched = docs.get_source(...)`) deleted --
+        fork still completes `ok`, but the copied source's text comes back
+        empty instead of equal to the original and the text-equality
+        assertion fails."""
+        src = _seed_pack(stack, ALICE, "src-t96", node_count=2, with_source=True)
+        original_ids = {"s0"}
+        original_text = stack["docs"].get_source("s0")["text"]
+        assert original_text, "fixture must seed a non-empty text source"
+
+        real_list_sources_scoped = type(stack["docs"]).list_sources_scoped
+
+        def _strip_text_for_src(self, pack_ids, limit):
+            records = real_list_sources_scoped(self, pack_ids, limit)
+            if pack_ids == [src]:
+                stripped = []
+                for rec in records:
+                    rec = dict(rec)
+                    rec["text"] = ""
+                    stripped.append(rec)
+                return stripped
+            return records
+
+        monkeypatch.setattr(
+            type(stack["docs"]), "list_sources_scoped", _strip_text_for_src, raising=True,
+        )
+
+        original_id_calls: list[str] = []
+        real_get_source = type(stack["docs"]).get_source
+
+        def _spy(self, source_id):
+            if source_id in original_ids:
+                original_id_calls.append(source_id)
+            return real_get_source(self, source_id)
+
+        monkeypatch.setattr(type(stack["docs"]), "get_source", _spy, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        dst = out["pack_id"]
+        copied = stack["docs"].list_sources_scoped([dst], 100)
+        assert len(copied) == 1, copied
+        assert copied[0]["text"] == original_text, copied[0]
+        assert set(original_id_calls) == original_ids, original_id_calls

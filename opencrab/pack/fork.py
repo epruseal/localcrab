@@ -1391,10 +1391,9 @@ def _fork_pack_inner(
                 )
                 text = record.get("text") or ""
                 if not text:
-                    # design flags this as a known mongo_store.list_sources_scoped
-                    # projection gap: its rows omit `text` where the SQL doc
-                    # store's do not. Fall back to a direct fetch before treating
-                    # this source as empty.
+                    # Defense against a backend returning an incomplete row.
+                    # Fall back to a direct fetch before treating this
+                    # source as empty.
                     fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
                     if isinstance(fetched, dict):
                         text = fetched.get("text") or ""

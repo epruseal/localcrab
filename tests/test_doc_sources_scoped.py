@@ -155,6 +155,19 @@ class TestListSourcesScopedMongo:
         fallback = query["$or"][1]["$and"][1]["metadata.source"]
         assert fallback["$in"] == [PACK_A, PACK_B]
 
+    def test_t94_projection_carries_text_matching_the_sql_sibling(self):
+        """T94 (design §15-3): the scoped query's projection must match the
+        SQL sibling's row shape, which includes `text` -- fork's step-16
+        copy loop reads it straight off each row. Reverse-mutation: a
+        `"text": 0` exclusion restored in the projection would leave the
+        `"text" not in projection` assertion failing."""
+        store, collection = self._store([])
+        store.list_sources_scoped([PACK_A, PACK_B], limit=10)
+
+        projection = collection.find.call_args[0][1]
+        assert projection == {"_id": 0}
+        assert "text" not in projection
+
     def test_empty_scope_never_queries(self):
         store, collection = self._store([])
         assert store.list_sources_scoped([], limit=10) == []
