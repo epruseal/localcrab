@@ -489,16 +489,20 @@ def _caller_files(pattern: re.Pattern[str]) -> list[str]:
 
 
 def test_fork_copy_true_has_at_most_one_caller_file_repo_wide():
+    """T22 (strengthened): the orchestrator has landed, so "at most one"
+    tightens to "exactly one, and it is opencrab/pack/fork.py"."""
     files = _caller_files(re.compile(r"fork_copy\s*=\s*True"))
-    assert len(files) <= 1, (
-        f"fork_copy=True must be used from at most one file (the pack_fork "
+    assert files == ["opencrab/pack/fork.py"], (
+        f"fork_copy=True must be used from exactly one file (the pack_fork "
         f"orchestrator): {files}"
     )
 
 
 def test_write_vector_false_has_at_most_one_caller_file_repo_wide():
+    """T22 (strengthened): the orchestrator has landed, so "at most one"
+    tightens to "exactly one, and it is opencrab/pack/fork.py"."""
     files = _caller_files(re.compile(r"write_vector\s*=\s*False"))
-    assert len(files) <= 1, (
-        f"write_vector=False must be used from at most one file (the "
+    assert files == ["opencrab/pack/fork.py"], (
+        f"write_vector=False must be used from exactly one file (the "
         f"pack_fork orchestrator): {files}"
     )

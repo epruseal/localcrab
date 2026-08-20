@@ -31,13 +31,14 @@ in this session are listed in the final delivery report, not repeated
 per-test here.
 
 Coverage: design §8's table has 53 rows (T1-T53); this file owns the
-orchestrator-level subset assigned to this work unit (T1-T6, T8-T18,
-T23-T25, T27-T31, T33-T35, T38-T41, T44-T47, T50-T52) and, within that,
+orchestrator-level subset assigned to this work unit -- as of this
+revision: T1-T6, T8-T18, T23-T41, T43-T47, T49-T52 -- and, within that,
 prioritizes T1-T4, T14-T15, T28, T16/T35/T38/T30/T39 per the task's
-explicit priority order. Rows implemented are named in each test's
-docstring; rows NOT implemented are listed in the module-level
-``# NOT COVERED`` comment at the bottom of this file -- consult that
-before assuming a design behaviour is verified here.
+explicit priority order. Not assigned to this file: T7, T19-T22, T42,
+T48, T53 (owned by ``tests/test_pack_fork_faults.py`` /
+``tests/test_fork_write_gate.py``, written by a different worker in this
+same worktree). Each test's docstring names the design row(s) it covers
+and its reverse-mutation.
 """
 
 from __future__ import annotations
@@ -647,6 +648,35 @@ class TestSlugDerivation:
         assert second["pack_id"] != first["pack_id"]
         assert "error" not in second
 
+    def test_t6_default_slug_collision_against_bare_creating_row_still_negotiates(self, stack):
+        """T6 (design §8 T6, §3, §12-6): the default-slug collision
+        negotiation (T46 above) must be genuinely STATUS-AGNOSTIC -- a raw
+        SQL uniqueness violation in `_negotiate_pack_id`, not a check that
+        only avoids colliding with a completed `ready` pack. Proven here
+        by occupying the exact slug `f'{src}-fork'` with a row still stuck
+        in `creating` (never promoted, so it would never appear in an
+        "existing ready packs" style check a narrower implementation
+        might use instead) before forking -- the fork must still silently
+        negotiate a different pack_id rather than surfacing the sibling
+        `creating` row's mere existence as a fork error (#143 invariant
+        7: a slug collision must never be reported as an error). Reverse-
+        mutation: `begin_pack_creation`'s retry-on-collision loop
+        (`ownership.py`'s `_pack_id_candidates`, which
+        `_negotiate_pack_id` iterates) was replaced with a single
+        non-retrying candidate -- the collision against the bare
+        `creating` row then raised straight through `fork_pack`'s own
+        `except Exception as exc: raise _reject(f'pack registration
+        failed: {exc}')` handler, turning this test's `status == 'ok'`
+        assertion into an `'error' in out` result instead."""
+        src = _seed_pack(stack, ALICE, "src-t6", node_count=1, with_edge=False, with_source=False)
+        with principal_scope(BOB):
+            begin_pack_creation(stack["sql"], BOB.user_id, f"{src}-fork")
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["pack_id"] != f"{src}-fork", out
+        assert "error" not in out
+
 
 # ---------------------------------------------------------------------------
 # T5 -- wrong source id: "pack not found", never a silent zero-content
@@ -1244,49 +1274,727 @@ class TestVectorBatchDecomposition:
     def test_t51_pass2_catches_what_pass1_cannot_and_refuses_whole_preflight(
         self, stack, monkeypatch,
     ):
-        """T51 (design v7 §5-1-6b pass 2): pass 1 only ever looks at `id`
-        and embedding length, so a record with a bad chroma `uris` type
-        (int, not str/None) is invisible to it -- and `_vector_record_invalid`
-        (the per-record pre-check) deliberately never validates `uris`
-        either (see its docstring). That record therefore survives BOTH
-        checks unfiltered and only pass 2's real `validate_import_records`
-        call catches it. Per design, a pass-2 failure is treated as a bug
-        signal in the decomposition itself (NOT a Tier 1 loss): the WHOLE
-        preflight is refused, before `begin_pack_creation` ever runs, so
-        the fork leaves ZERO registry rows -- unlike the pre-fix behaviour,
-        where this same bad record would reach `import_vectors` unfiltered
-        at step 17, raise there for the same reason, and get misclassified
-        a Tier 2 write failure that demotes an already-RESERVED pack to
-        `partial` instead of never reserving one at all."""
+        """T51' (design v7 §12-2/§12-6 rewrite -- supersedes the pre-§12-2
+        T51, now stale): §12-2 made `_vector_record_invalid` delegate to
+        the REAL `validate_import_records`, so the old T51 injection (a
+        bad `uris` type) is now caught at pass 0 (the per-record
+        pre-check) as an ordinary Tier 1 loss, not pass 2 -- an EXPECTED,
+        design-anticipated regression (see `_vector_record_invalid`'s own
+        docstring), not an implementation defect. T51' exercises pass 2
+        directly per §12-6: pass 0 is monkeypatched to unconditionally
+        return `None` (disabled), and an unknown-metadata-key record is
+        injected -- invisible to pass 1's dedup/dim checks (unique `id`,
+        ordinary embedding length), caught only when pass 2 re-runs the
+        real validator over the survivors. A pass-2 failure refuses the
+        WHOLE preflight (zero registry rows), unlike a Tier 1 loss.
+        Reverse-mutation: the pass 2 `if import_batch: ...
+        validate_import_records(...)` block (fork.py, right after the
+        2-pass decomposition) was removed -- the bad record then reached
+        `import_vectors` unfiltered at step 17, which raised for the same
+        reason but AFTER `begin_pack_creation` had already reserved a
+        registry row, misclassifying this as a Tier 2 write failure
+        (`status == 'partial'`, a real row left behind) instead of a
+        clean preflight refusal -- both this test's `'status' not in out`
+        and `get_pack(...) is None` assertions failed."""
         src = _seed_pack(stack, ALICE, "src-t51", node_count=10, with_edge=False, with_source=False)
+
+        monkeypatch.setattr(fork_mod, "_vector_record_invalid", lambda *a, **kw: None, raising=True)
 
         real_export = type(stack["vector"]).export_pack_vectors
 
-        def _inject_bad_uris(self, pack_id):
+        def _inject_unknown_key(self, pack_id):
             records = real_export(self, pack_id)
             for rec in records:
                 if rec["id"] == f"{src}-n0":
-                    rec["uris"] = 12345  # must be str or None; int is a hard reject
+                    rec["not_a_real_field"] = "boom"  # unknown key -- a pass-2-only catch
                     break
             return records
 
         monkeypatch.setattr(
-            type(stack["vector"]), "export_pack_vectors", _inject_bad_uris, raising=True,
+            type(stack["vector"]), "export_pack_vectors", _inject_unknown_key, raising=True,
         )
 
         out = _fork(stack, principal=ALICE, src_pack_id=src)
 
         assert "status" not in out and "error" in out, (
-            "design v7 §5-1-6b pass 2: a batch that still fails the real "
-            f"validator after pass 1 must refuse the WHOLE preflight (bug "
-            f"signal, not a Tier 1 loss), not surface as a fork result; got {out}"
+            "design v7 §12-6 T51': with pass 0 defeated, pass 2 must catch "
+            f"an unknown-key record and refuse the WHOLE preflight; got {out}"
         )
+        assert "vector batch decomposition failed re-validation" in out["error"], out
         dst_slug = f"{src}-fork"
         row = get_pack(stack["sql"], dst_slug)
         assert row is None, (
             "design wants ZERO registry rows for a pass-2 refusal -- a "
             f"preflight rejection must leave nothing behind, got {row}"
         )
+
+
+# ---------------------------------------------------------------------------
+# T25 -- a grammar-invalid node and its dependent edge are excluded
+# together, both Tier 1, not left dangling or escalated to Tier 2.
+# ---------------------------------------------------------------------------
+
+
+class TestGrammarInvalidNodeDropsItsEdgeToo:
+    def test_t25_grammar_invalid_node_and_its_edge_excluded_together(self, stack):
+        """T25 (design §8 T25, §5-1 step 5-6): a node that fails grammar
+        validation (`validate_node`, injected here via a bogus
+        `properties.space`) is excluded as a Tier 1 loss, and -- because
+        preflight's edge-survival check treats "did the endpoint survive
+        preflight" as a single question, independent of WHY it didn't --
+        the edge that names it as an endpoint is excluded right along
+        with it, also Tier 1, not left dangling or promoted to a Tier 2
+        write failure. Reverse-mutation: the grammar-validation call
+        (`validate_node`/`validate_node_properties`, fork.py's node loop)
+        was removed -- the grammar-invalid node then survived preflight
+        and reached the write phase, where `builder.add_node`'s own
+        grammar check rejected it for real, producing a Tier 2 write
+        failure (`status == 'partial'`) instead of a clean Tier 1
+        exclusion, failing this test's `status == 'ok'` assertion."""
+        src = _seed_pack(stack, ALICE, "src-t25", node_count=15, with_edge=False, with_source=False)
+        node_ids = [f"{src}-n{i}" for i in range(15)]
+        with principal_scope(ALICE):
+            for i in range(14):
+                stack["builder"].add_edge(
+                    "resource", node_ids[i], "cites", "resource", node_ids[i + 1], pack_id=src,
+                )
+        stack["graph"]._exec_write(
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
+            "WHERE node_id = :nid",
+            {"v": "not-a-real-space", "nid": node_ids[0]},
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["copied"]["nodes"] == 14, out
+        assert out["copied"]["edges"] == 13, out
+        assert any(
+            "failed grammar validation" in msg for msg in out["errors"]["nodes"]
+        ), out["errors"]["nodes"]
+        assert any(
+            "endpoint did not survive" in msg for msg in out["errors"]["edges"]
+        ), out["errors"]["edges"]
+
+
+# ---------------------------------------------------------------------------
+# T24 -- write order: every node write (step 14) must land before any edge
+# write (step 15) is attempted.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteOrdering:
+    def test_t24_all_nodes_write_before_any_edge_is_attempted(self, stack):
+        """T24 (design §8 T24, §5-3 steps 14-15 write order): every node
+        write (step 14) must complete in full BEFORE any edge write (step
+        15) is attempted -- an edge's remapped endpoints must already
+        exist in dst's graph the moment `add_edge` is called, or the
+        graph leg comes back "no match (missing node: ...)" (the exact
+        write-time failure T29 exercises) and `_fork_leg_ok(kind='edge')`
+        fails, demoting an otherwise-perfectly-good fork to 'partial'.
+        This exercises the REAL write path end to end (no endpoint
+        monkeypatch) precisely so the reverse-mutation below is the thing
+        that actually distinguishes right order from wrong order.
+        Reverse-mutation: fork.py's step 14 (node write loop) and step 15
+        (edge write loop, `if tier2_failure is None: for record in
+        surviving_edges: ...`) were swapped -- edges were then attempted
+        against a dst graph that had no nodes in it yet, every edge write
+        came back "no match (missing node: ...)", and this test's
+        `status == 'ok'` / `copied.edges == 1` assertions both failed
+        (`status` became 'partial', `copied.edges` became 0)."""
+        src = _seed_pack(stack, ALICE, "src-t24", node_count=2, with_edge=True, with_source=False)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["copied"]["nodes"] == 2, out
+        assert out["copied"]["edges"] == 1, out
+
+
+# ---------------------------------------------------------------------------
+# T8 / T32 -- H4 (design §5-4 step 18) is a genuine RE-READ check: it must
+# catch a corrupted export_nodes_scoped/export_edges_scoped RETURN VALUE at
+# verify time even though the underlying write itself is completely healthy.
+# Both are gated on `pack_ids != [src]` so step 11's earlier "dst must be
+# empty" call (also scoped to `[dst]`, but on a still-empty pack) is an
+# unaffected no-op.
+# ---------------------------------------------------------------------------
+
+
+class TestH4CatchesReReadNotWrite:
+    def test_t8_h4_reread_corruption_not_write_time_caught_as_leak(self, stack, monkeypatch):
+        """T8 (design §8 T8, §5-4 step 18, §12-6: 'H4 는 재조회로 판정하므로
+        쓰기가 아니라 export_nodes_scoped 재조회 반환에 미재매핑 참조를 심어야
+        한다'): H4 verification works by RE-READING the just-written dst
+        copy (`graph.export_nodes_scoped`), not by trusting each write's
+        own receipt -- so the injection here corrupts ONLY that re-read's
+        RETURN VALUE (an unmapped source-space id spliced into a
+        REFERENCE_KEYS position of the row H4 sees), while the actual
+        write underneath is completely healthy. This proves H4 is a
+        genuine independent re-read check, not a pass-through of whatever
+        the write phase already believed. Reverse-mutation: `_h4_verify`'s
+        node re-read loop (`for row in graph.export_nodes_scoped(...)`,
+        fork.py) was replaced with a loop over the write-phase's own
+        receipts instead of a fresh re-read -- the corrupted re-read
+        return value was then never consulted at all, and this test's
+        `status == 'partial'` assertion failed (`status` stayed 'ok')."""
+        src = _seed_pack(stack, ALICE, "src-t8", node_count=3, with_edge=False, with_source=False)
+
+        real_export = type(stack["graph"]).export_nodes_scoped
+
+        def _corrupt_reread(self, pack_ids, limit):
+            rows = real_export(self, pack_ids, limit)
+            if pack_ids != [src]:
+                for row in rows:
+                    props = row.get("props") or {}
+                    if props.get("title") == "doc 0":
+                        props["node_id"] = f"{src}-n1"  # unremapped source-space id
+                        break
+            return rows
+
+        monkeypatch.setattr(
+            type(stack["graph"]), "export_nodes_scoped", _corrupt_reread, raising=True,
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert "H4 post-write verification" in out["error"], out
+
+    def test_t32_h4_catches_unmapped_edge_structural_endpoint(self, stack, monkeypatch):
+        """T32 (design §8 T32, §4-A predicate 2 / `_h4_verify`'s edge
+        loop): an edge's STRUCTURAL endpoints (`source_props['id']`/
+        `target_props['id']` -- separate from `rel_props`, which
+        `remap_props`/H3 already cover) are themselves part of H4's
+        re-read verification domain. Injected the same way T8 is (a
+        corrupted `export_edges_scoped` RE-READ return value), leaving
+        the underlying write completely healthy. Reverse-mutation:
+        `_h4_verify`'s `for endpoint_key in ('source_props',
+        'target_props'): ...` block (fork.py) was removed -- the
+        corrupted structural endpoint was then never checked at all, and
+        this test's `status == 'partial'` assertion failed (`status`
+        stayed 'ok')."""
+        src = _seed_pack(stack, ALICE, "src-t32", node_count=2, with_edge=True, with_source=False)
+
+        real_export = type(stack["graph"]).export_edges_scoped
+
+        def _corrupt_reread(self, pack_ids, limit):
+            rows = real_export(self, pack_ids, limit)
+            if pack_ids != [src]:
+                for row in rows:
+                    source_props = dict(row.get("source_props") or {})
+                    source_props["id"] = f"{src}-n0"  # unremapped source-space id
+                    row["source_props"] = source_props
+            return rows
+
+        monkeypatch.setattr(
+            type(stack["graph"]), "export_edges_scoped", _corrupt_reread, raising=True,
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert "H4 post-write verification" in out["error"], out
+
+
+# ---------------------------------------------------------------------------
+# T40 -- a REFERENCE_KEYS value that is itself a nested dict/list is out of
+# the rewrite domain even when it embeds an old id (T33 above only proves
+# this for a nested value WITHOUT an old id, which cannot distinguish "we
+# never recurse" from "we happened to find nothing to rewrite").
+# ---------------------------------------------------------------------------
+
+
+class TestNestedReferenceValueWithOldId:
+    def test_t40_nested_reference_value_containing_old_id_left_untouched(self, stack):
+        """T40 (design §8 T40, §4-A rule 3, fork_remap.py
+        `_remap_reference_keys`): a REFERENCE_KEYS value that is itself a
+        nested list is out of the rewrite domain regardless of what it
+        contains -- proven here with a nested list that DOES embed an old
+        (pre-fork) node id, unlike `TestReferenceRewriteBoundaries`'s
+        existing T33, whose nested list (`["x","y"]`) contains no old id
+        and therefore cannot distinguish "we never recurse into nested
+        values" from "we happened to find nothing worth rewriting
+        inside." The nested old id must survive verbatim in the dst copy
+        (never silently replaced), invisible to H4 (which, like the
+        rewrite rule, only scans top-level string values), and still
+        counted once in `unverified_refs`. Reverse-mutation:
+        `_remap_reference_keys`'s `isinstance(value, dict | list)` branch
+        (fork_remap.py) was changed to rewrite any mapping-key string
+        found INSIDE a nested list before falling through to `unverified
+        += 1; continue` -- the nested old id was then silently replaced
+        with its new id, failing this test's "the nested value is
+        untouched, byte for byte" assertion (T33's own nested-list case,
+        containing no mapping-key string, would NOT have caught this same
+        mutation -- nothing inside it to rewrite)."""
+        src = _seed_pack(stack, ALICE, "src-t40", node_count=2, with_edge=False, with_source=False)
+        old_n0 = f"{src}-n0"
+        stack["graph"]._exec_write(
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.node_id', json(:v)) "
+            "WHERE node_id = :nid",
+            {"v": f'["{old_n0}", "unrelated"]', "nid": f"{src}-n1"},
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["unverified_refs"] >= 1, out
+
+        dst = out["pack_id"]
+        dst_by_title = {
+            n["props"]["title"]: n["props"]
+            for n in stack["graph"].export_nodes_scoped([dst], 10)
+            if n["labels"] != ["Dataset"]
+        }
+        n1_new = dst_by_title["doc 1"]
+        assert n1_new["node_id"] == [old_n0, "unrelated"], (
+            "a nested list under a REFERENCE_KEYS name must be left "
+            "EXACTLY as-is, even though it embeds an old (pre-fork) id "
+            "the rewrite rule could in principle have found"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T41 -- design §5-4-18b's residual report: a source that survives the doc
+# axis but has no corresponding vector must be named in
+# skipped.sources_without_vectors, under its NEW (dst) id.
+# ---------------------------------------------------------------------------
+
+
+class TestSourcesWithoutVectorsResidualReport:
+    def test_t41_source_without_a_vector_reported_in_sources_without_vectors(self, stack):
+        """T41 (design §8 T41, §5-4-18b): a source that survives the doc
+        axis but has NO corresponding vector (written with
+        `write_vector=False` -- the simplest concrete instance of the
+        doc/vector predicate asymmetry `fork_remap.surviving_source_ids`'s
+        own docstring names) must be reported in the fork's own
+        `skipped.sources_without_vectors` residual list, under its NEW
+        (dst) id -- not silently absent from both `copied.vectors` and
+        every loss counter. Reverse-mutation: step 18b's residual
+        computation (`sources_survivor_ids - vectors_survivor_ids`,
+        fork.py, right before `mark_pack_ready`) was replaced with a bare
+        empty list -- this test's "the no-vector source's new id shows up
+        in sources_without_vectors" assertion failed (the list came back
+        empty)."""
+        src = _seed_pack(stack, ALICE, "src-t41", node_count=1, with_edge=False, with_source=False)
+        with principal_scope(ALICE):
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="a source with no vector", source_id="s-no-vec", pack_id=src,
+                write_vector=False,
+            )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["copied"]["sources"] == 1, out
+        residual = out["skipped"]["sources_without_vectors"]
+        assert len(residual) == 1, out["skipped"]
+        assert residual[0].startswith("s-no-vec"), residual
+
+
+# ---------------------------------------------------------------------------
+# T45 -- the CAP+1 vector pre-count (design §5-1 step 4) is genuinely
+# pack-scoped: an unrelated pack's vectors must never count against THIS
+# fork's FORK_MAX_VECTORS check.
+# ---------------------------------------------------------------------------
+
+
+class TestVectorPrecountIsPackScoped:
+    def test_t45_vector_precount_stays_scoped_despite_unrelated_pack_vectors(
+        self, stack, monkeypatch,
+    ):
+        """T45 (design §8 T45, §5-1 step 4 / `_count_pack_vectors`): the
+        CAP+1 vector pre-count is genuinely PACK-SCOPED
+        (`where={'pack_id': pack_id}` on chroma) -- an unrelated pack
+        sitting in the SAME collection with plenty of its own vectors
+        must never push a small, unrelated fork over `FORK_MAX_VECTORS`.
+        `FORK_MAX_VECTORS` is monkeypatched down to a small number so the
+        unrelated pack's vector count alone (seeded well above that
+        number) would trip a naive, unscoped count. Reverse-mutation:
+        `_count_pack_vectors`'s chroma branch (fork.py) had its
+        `where={'pack_id': pack_id}` argument dropped (an unscoped
+        `.get(limit=cap + 1, include=[])`) -- the unrelated pack's
+        vectors were then counted too, `vector_count > FORK_MAX_VECTORS`
+        tripped, and this test's `status == 'ok'` assertion failed
+        (`'error' in out` instead, with a "too large to fork" message)."""
+        monkeypatch.setattr(fork_mod, "FORK_MAX_VECTORS", 3, raising=True)
+
+        # Ten ordinary content-node writes (each producing a real vector via
+        # the normal, non-fork_copy add_node path) plus the anchor's own
+        # vector comfortably exceed the monkeypatched cap of 3 -- but this
+        # pack is never forked; it only exists to pollute the collection.
+        _seed_pack(
+            stack, ALICE, "src-t45-unrelated", node_count=10, with_edge=False, with_source=False,
+        )
+
+        src = _seed_pack(stack, ALICE, "src-t45", node_count=1, with_edge=False, with_source=False)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", (
+            f"an unrelated pack's vectors must never count against THIS "
+            f"fork's pack-scoped precount; got {out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T36 -- a node write whose docs or sql leg fails (graph itself ok) is a
+# Tier 2 failure, caught by _fork_leg_ok(kind="node").
+# ---------------------------------------------------------------------------
+
+
+class TestNodeWriterLegFailures:
+    def test_t36_node_docs_leg_failure_demotes_to_partial(self, stack, monkeypatch):
+        """T36 (design §8 T36, §6-3 kind='node' docs leg, §12-6): a
+        fork-copy node write whose DOCS leg fails must be caught by
+        `_fork_leg_ok(kind='node')` and halt the write phase immediately
+        (Tier 2) -- not silently continue with a missing doc row.
+        Injected at the writer boundary (builder.add_node, gated on
+        `kw.get('fork_copy')` so only fork's own content-node copies are
+        touched, never the seed pack's ordinary writes or the fork's own
+        anchor write, which uses `pack_anchor=True` instead, not
+        `fork_copy`). Reverse-mutation: `_fork_leg_ok`'s `kind == 'node'`
+        branch's `_leg_ok(stores.get('docs'))` conjunct was replaced with
+        `True` -- `status` stayed 'ok' and `copied.nodes` became nonzero
+        despite the injected docs failure, failing both assertions."""
+        src = _seed_pack(stack, ALICE, "src-t36docs", node_count=3, with_edge=False, with_source=False)
+
+        real_add_node = type(stack["builder"]).add_node
+
+        def _fake_add_node(self, space, node_type, node_id, properties=None, *, pack_id, **kw):
+            if kw.get("fork_copy"):
+                return {
+                    "stores": {
+                        "graph": "ok", "docs": "error: injected docs failure",
+                        "sql": "ok", "vector": "skipped (raw copy)",
+                    }
+                }
+            return real_add_node(self, space, node_type, node_id, properties, pack_id=pack_id, **kw)
+
+        monkeypatch.setattr(type(stack["builder"]), "add_node", _fake_add_node, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert out["copied"]["nodes"] == 0, out
+
+    def test_t36_node_sql_leg_failure_demotes_to_partial(self, stack, monkeypatch):
+        """T36 (sql leg, second case): same as above but the fork-copy
+        node write's SQL leg fails instead. Reverse-mutation:
+        `_fork_leg_ok`'s `kind == 'node'` branch's `_leg_ok(stores.get
+        ('sql'))` conjunct was replaced with `True` -- `status` stayed
+        'ok' and `copied.nodes` became nonzero despite the injected sql
+        failure."""
+        src = _seed_pack(stack, ALICE, "src-t36sql", node_count=3, with_edge=False, with_source=False)
+
+        real_add_node = type(stack["builder"]).add_node
+
+        def _fake_add_node(self, space, node_type, node_id, properties=None, *, pack_id, **kw):
+            if kw.get("fork_copy"):
+                return {
+                    "stores": {
+                        "graph": "ok", "docs": "ok (id=x)",
+                        "sql": "error: injected sql failure", "vector": "skipped (raw copy)",
+                    }
+                }
+            return real_add_node(self, space, node_type, node_id, properties, pack_id=pack_id, **kw)
+
+        monkeypatch.setattr(type(stack["builder"]), "add_node", _fake_add_node, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert out["copied"]["nodes"] == 0, out
+
+
+# ---------------------------------------------------------------------------
+# T43 -- the anchor write requires ALL FOUR legs to positively succeed
+# (unlike node/source, the anchor's vector leg is real, not skipped).
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorWriterLegFailures:
+    def test_t43_anchor_docs_leg_failure_demotes_to_partial(self, stack, monkeypatch):
+        """T43 (design §8 T43, §6-3 kind='anchor' docs leg, §12-6): unlike
+        the node/source legs, the anchor write requires ALL FOUR legs
+        (including vector) to positively succeed --
+        `_fork_leg_ok(kind='anchor')` demotes to `partial` immediately if
+        the docs leg fails, before any node/edge/source/vector write is
+        even attempted. Distinguishes the fork's OWN anchor write
+        (`pack_id` == the negotiated dst, always != src) from the SEED
+        pack's own anchor write (`pack_id` == src, same `pack_anchor=True`
+        shape) so `_seed_pack` itself is never corrupted by this
+        monkeypatch. Reverse-mutation: `_fork_leg_ok`'s `kind == 'anchor'`
+        branch's `_leg_ok(stores.get('docs'))` conjunct was replaced with
+        `True` -- `status` stayed 'ok' despite the injected anchor docs
+        failure."""
+        src = _seed_pack(stack, ALICE, "src-t43docs", node_count=3, with_edge=False, with_source=False)
+
+        real_add_node = type(stack["builder"]).add_node
+
+        def _fake_add_node(self, space, node_type, node_id, properties=None, *, pack_id, **kw):
+            if kw.get("pack_anchor") and pack_id != src:
+                return {
+                    "stores": {
+                        "graph": "ok", "docs": "error: injected anchor docs failure",
+                        "sql": "ok", "vector": "ok",
+                    }
+                }
+            return real_add_node(self, space, node_type, node_id, properties, pack_id=pack_id, **kw)
+
+        monkeypatch.setattr(type(stack["builder"]), "add_node", _fake_add_node, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert out["error"] == "anchor write did not confirm across all stores", out
+        assert out["copied"]["nodes"] == 0, out
+
+    def test_t43_anchor_vector_leg_failure_demotes_to_partial(self, stack, monkeypatch):
+        """T43 (vector leg, second case): same as above but the fork's
+        anchor write's VECTOR leg fails instead -- the anchor is the ONE
+        write in the entire fork that does NOT set `write_vector=False`
+        (design §4-C-3: the new pack needs a real anchor embedding), so
+        its vector leg genuinely must succeed too. Reverse-mutation:
+        `_fork_leg_ok`'s `kind == 'anchor'` branch's `stores.get
+        ('vector') == 'ok'` conjunct was replaced with `True` -- `status`
+        stayed 'ok' despite the injected anchor vector failure."""
+        src = _seed_pack(stack, ALICE, "src-t43vec", node_count=3, with_edge=False, with_source=False)
+
+        real_add_node = type(stack["builder"]).add_node
+
+        def _fake_add_node(self, space, node_type, node_id, properties=None, *, pack_id, **kw):
+            if kw.get("pack_anchor") and pack_id != src:
+                return {
+                    "stores": {
+                        "graph": "ok", "docs": "ok (id=x)",
+                        "sql": "ok", "vector": "error: injected anchor vector failure",
+                    }
+                }
+            return real_add_node(self, space, node_type, node_id, properties, pack_id=pack_id, **kw)
+
+        monkeypatch.setattr(type(stack["builder"]), "add_node", _fake_add_node, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert out["error"] == "anchor write did not confirm across all stores", out
+        assert out["copied"]["nodes"] == 0, out
+
+
+# ---------------------------------------------------------------------------
+# T49 -- an edge write whose graph leg succeeds but sql leg fails is still
+# a Tier 2 failure (the docs/audit leg is deliberately excluded from this
+# check -- design §6-3 only names graph+sql for edges).
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeSqlLegFailure:
+    def test_t49_edge_sql_leg_failure_demotes_to_partial(self, stack, monkeypatch):
+        """T49 (design §8 T49, §6-3 kind='edge' sql leg, §12-6): an edge
+        write whose GRAPH leg succeeds but whose SQL leg fails must still
+        be caught -- `_fork_leg_ok(kind='edge')` requires BOTH `graph ==
+        'ok'` and a positive sql leg (T29 already covers the graph-leg
+        failure axis; this pins the sql-leg axis specifically).
+        Reverse-mutation: `_fork_leg_ok`'s `kind == 'edge'` branch's
+        `_leg_ok(stores.get('sql'))` conjunct was replaced with `True` --
+        `status` stayed 'ok' and `copied.edges` became 1 despite the
+        injected sql failure."""
+        src = _seed_pack(stack, ALICE, "src-t49", node_count=2, with_edge=True, with_source=False)
+
+        real_add_edge = type(stack["builder"]).add_edge
+
+        def _fake_add_edge(self, from_space, from_id, relation, to_space, to_id, **kw):
+            if kw.get("fork_copy"):
+                return {"stores": {"graph": "ok", "sql": "error: injected sql failure"}}
+            return real_add_edge(self, from_space, from_id, relation, to_space, to_id, **kw)
+
+        monkeypatch.setattr(type(stack["builder"]), "add_edge", _fake_add_edge, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "partial", out
+        assert out["copied"]["edges"] == 0, out
+
+
+# ---------------------------------------------------------------------------
+# T26 / T50 -- pack_id/slug length budget (design §3): _PACK_ID_BUDGET =
+# 256 (registry column limit) - 9 (begin_pack_creation's worst-case
+# collision suffix) = 247. An explicit new_pack_id over budget is REJECTED
+# (never truncated); the DEFAULT slug is truncated instead so "{src}-fork"
+# always fits.
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitSlugLengthRejection:
+    def test_t26_explicit_new_pack_id_over_budget_rejected_not_truncated(self, stack):
+        """T26 (design §8 T26, §3, §5-1 step 8): an explicitly
+        caller-supplied `new_pack_id` that exceeds the 247-char budget is
+        REJECTED outright -- never silently truncated the way the DEFAULT
+        slug is (design §3: truncating a name the caller chose on purpose
+        would be surprising). Checked across several over-budget lengths
+        (248, the next boundary; 256, the old un-budgeted limit; 300,
+        comfortably past both) to prove this is a real inequality check,
+        not one that only happens to catch a single value. Reverse-
+        mutation: the `if len(requested_slug) > _PACK_ID_BUDGET: raise
+        _reject(...)` branch for the explicit-new_pack_id path (fork.py
+        step 8) was removed -- every one of these calls then proceeded to
+        `begin_pack_creation` instead of being rejected, breaking this
+        test's uniform "always error, never a reserved row" assertion."""
+        src = _seed_pack(stack, ALICE, "src-t26", node_count=1, with_edge=False, with_source=False)
+        for n in (248, 256, 300):
+            new_id = "z" * n
+            out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_id)
+            assert "error" in out and "budget" in out["error"], (n, out)
+            assert get_pack(stack["sql"], new_id) is None, n
+
+
+class TestSlugLengthBoundaries:
+    def test_t50a_default_path_truncation_boundary_242_243(self, stack):
+        """T50(a) (design §8 T50, §3, §5-1 step 8): the DEFAULT slug is
+        `f"{src}-fork"`; when that exceeds the 247-char budget, src_pack_id
+        itself is truncated (not the whole fork rejected) so the "-fork"
+        suffix always fits. The pass/truncate boundary is exactly src
+        length 242 (slug length 247, fits) vs 243 (slug length 248,
+        truncated). Reverse-mutation: `_PACK_ID_BUDGET`'s definition was
+        reverted from `256 - 9` to a bare `256` -- at src length 243 the
+        (un-truncated) slug is only 248 chars, which now fits the wrong
+        budget, so this test's "truncation actually happened" assertion
+        for the 243 case failed."""
+        pad = "a" * (242 - len("src-t50a-"))
+        src_242 = _seed_pack(
+            stack, ALICE, f"src-t50a-{pad}", node_count=1, with_edge=False, with_source=False,
+        )
+        assert len(src_242) == 242, len(src_242)
+        out_242 = _fork(stack, principal=ALICE, src_pack_id=src_242)
+        assert out_242["status"] == "ok", out_242
+        assert out_242["pack_id"] == f"{src_242}-fork", out_242
+        assert len(out_242["pack_id"]) == 247
+
+        pad3 = "a" * (243 - len("src-t50a3-"))
+        src_243 = _seed_pack(
+            stack, ALICE, f"src-t50a3-{pad3}", node_count=1, with_edge=False, with_source=False,
+        )
+        assert len(src_243) == 243, len(src_243)
+        out_243 = _fork(stack, principal=ALICE, src_pack_id=src_243)
+        assert out_243["status"] == "ok", out_243
+        assert out_243["pack_id"] != f"{src_243}-fork", (
+            "a 243-char src's default slug (248 chars) exceeds the 247 "
+            "budget and must be TRUNCATED, not passed through unchanged"
+        )
+        assert out_243["pack_id"].endswith("-fork")
+        assert len(out_243["pack_id"]) <= 247
+        assert out_243["pack_id"].startswith(src_243[:242])
+
+    def test_t50b_explicit_new_pack_id_boundary_247_248(self, stack):
+        """T50(b): an explicit `new_pack_id` at EXACTLY the 247-char
+        budget is accepted verbatim (no truncation, no rejection); one
+        character over (248) is rejected outright (T26 covers the
+        rejection path more broadly; this pins the exact boundary
+        transition). Reverse-mutation: `_PACK_ID_BUDGET` was changed from
+        `256 - 9` to a plain `256` -- the 248-char explicit id, which
+        should be rejected, was instead accepted, and this test's
+        `'error' in out_248` assertion failed."""
+        src = _seed_pack(stack, ALICE, "src-t50b", node_count=1, with_edge=False, with_source=False)
+
+        new_247 = "b" * 247
+        out_247 = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_247)
+        assert out_247["status"] == "ok", out_247
+        assert out_247["pack_id"] == new_247, out_247
+
+        new_248 = "c" * 248
+        out_248 = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_248)
+        assert "error" in out_248 and "budget" in out_248["error"], out_248
+        assert get_pack(stack["sql"], new_248) is None
+
+
+# ---------------------------------------------------------------------------
+# T37 -- repair_incomplete_packs must never auto-promote a stale `creating`
+# row reserved by pack_fork, even with a real anchor already present.
+# ---------------------------------------------------------------------------
+
+
+class TestRepairNeverPromotesForkedRow:
+    def test_t37_repair_incomplete_packs_never_promotes_a_forked_creating_row(self, stack):
+        """T37 (design §8 T37, lifecycle.py's `forked_from` branch, #201
+        §4-F): a stale `creating` row reserved by `pack_fork` (not
+        `pack_create`) must NEVER be auto-promoted by
+        `repair_incomplete_packs`, even with a REAL anchor already
+        sitting in the graph -- fork writes its anchor FIRST, the
+        opposite of `pack_create`'s anchor-write-last completion proof, so
+        an incomplete fork's anchor probes exactly as PRESENT as a
+        complete one's. `older_than_seconds=0` makes the row eligible
+        immediately, with no need to fake its timestamp -- confirming
+        this is the `forked_from` branch's OWN independent rule, not a
+        side effect of the row happening to be old. Reverse-mutation: the
+        `if row.get('forked_from'):` branch (`opencrab/pack/lifecycle.py`,
+        inside `repair_incomplete_packs`) was removed, falling through to
+        the ordinary `elif graph_probe == PROBE_PRESENT:` promote branch
+        -- the real anchor was found PRESENT and the row was promoted
+        straight to `ready`, failing this test's `status == 'partial'`
+        assertion (`status` became `'ready'` instead)."""
+        from opencrab.pack.lifecycle import PROBE_PRESENT, repair_incomplete_packs
+
+        dst = begin_pack_creation(
+            stack["sql"], ALICE.user_id, "src-t37-fork", forked_from="src-t37-original",
+        )
+        anchor_id = anchor_node_id(dst)
+        with principal_scope(ALICE):
+            stack["builder"].add_node(
+                space="resource", node_type="Dataset", node_id=anchor_id,
+                properties={"title": "t", "description": "d", "created_by": "test"},
+                pack_id=dst, pack_anchor=True,
+            )
+
+        result = repair_incomplete_packs(
+            stack["sql"], stack["graph"], stack["docs"], stack["vector"],
+            older_than_seconds=0, apply=True,
+        )
+        row = next(r for r in result["rows"] if r["pack_id"] == dst)
+        assert row["action"] == "demote", row
+        assert row["probes"]["graph"] == PROBE_PRESENT, row
+
+        after = get_pack(stack["sql"], dst)
+        assert after["status"] == "partial", after
+
+
+# ---------------------------------------------------------------------------
+# T52 -- a retired `pack` alias that disagrees with `pack_id` (#171) is a
+# Tier 1 alias-conflict exclusion, not a Tier 2 write failure.
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyAliasConflictExclusion:
+    def test_t52_alias_conflict_node_and_its_edge_excluded_fork_completes_ok(self, stack):
+        """T52 (design §8 T52, §5-1 step 5-6, R6 P2): a node whose
+        properties carry a retired `pack` alias that DISAGREES with its
+        own `pack_id` (a legacy-shape conflict `canonicalize_pack_alias`
+        refuses to silently resolve, #171) is excluded as a Tier 1 alias
+        conflict -- `skipped.nodes_alias_conflict` -- and, since its
+        endpoint no longer survives preflight, its dependent edge is
+        excluded too (Tier 1, "endpoint did not survive"). Every OTHER
+        node/edge is unaffected and the fork still completes `status ==
+        'ok'`. Reverse-mutation: the `try: canonicalize_pack_alias(props)
+        except ValueError: skipped_alias_nodes += 1; continue` node-loop
+        guard (fork.py step 5-6) was removed -- the conflicting node then
+        survived preflight, the write phase's own `canonicalize_pack_alias`
+        call inside `builder.add_node` raised instead, and the fork was
+        wrongly demoted to `partial` (Tier 2) over what should have been a
+        clean Tier 1 exclusion, failing this test's `status == 'ok'` and
+        `copied.edges` count of a *single* dropped edge, in proportion to
+        total edges, does not itself trip `FORK_MAX_LOSS_RATIO` -- a
+        14-edge chain (only the first edge touches the conflicted node)
+        keeps edge loss at 1/14, comfortably under the 10% floor."""
+        src = _seed_pack(stack, ALICE, "src-t52", node_count=15, with_edge=False, with_source=False)
+        node_ids = [f"{src}-n{i}" for i in range(15)]
+        with principal_scope(ALICE):
+            for i in range(14):
+                stack["builder"].add_edge(
+                    "resource", node_ids[i], "cites", "resource", node_ids[i + 1], pack_id=src,
+                )
+        stack["graph"]._exec_write(
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.pack', :v) "
+            "WHERE node_id = :nid",
+            {"v": "some-other-pack-entirely", "nid": node_ids[0]},
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["skipped"]["nodes_alias_conflict"] == 1, out
+        assert out["copied"]["nodes"] == 14, out
+        assert out["copied"]["edges"] == 13, out
+        assert any(
+            "endpoint did not survive" in msg for msg in out["errors"]["edges"]
+        ), out["errors"]["edges"]
 
 
 # ---------------------------------------------------------------------------
@@ -1306,8 +2014,3 @@ class TestToolRegistration:
         from opencrab.mcp.tools import WRITE_TOOLS
 
         assert "pack_fork" in WRITE_TOOLS
-
-
-# NOT COVERED in this file (design §8 rows assigned to this unit but not
-# implemented, due to time budget -- see final delivery report for why
-# each was deprioritized): T6, T8, T24, T25, T40, T41, T45, T50, T52.
