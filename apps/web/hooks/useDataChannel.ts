@@ -163,15 +163,27 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
     }
   }, [activeToken, markInvalid])
 
-  // §3.5: data polling only runs in checking/ok, and restarts (with an
-  // immediate call) whenever authState flips into one of those -- which a
-  // token change always does, so resumption is automatic.
+  // §3.5: data polling only runs in checking/ok. The immediate call fires
+  // only on *entry* into the {checking, ok} zone (unknown/missing/invalid
+  // -> checking, always via the token-change effect above, so resumption
+  // is automatic) or when fetchData itself is recreated (activeToken
+  // change). checking->ok is the result of a bundle completing, not a
+  // reason to requery -- it used to also flip this effect's old
+  // [authState, fetchData] deps, firing an immediate duplicate round right
+  // after the one that just finished. That duplicate round held the
+  // single-flight lock for as long as it ran, which is the root cause of
+  // #149's 17b: a hung nodes leg let the duplicate round occupy the lock
+  // long enough to silently swallow a manual refresh. Keying the effect on
+  // this zone-membership boolean instead of authState itself makes
+  // checking->ok a no-op for the effect (pollingActive stays true, deps
+  // unchanged, no restart).
+  const pollingActive = authState === 'checking' || authState === 'ok'
   useEffect(() => {
-    if (authState !== 'checking' && authState !== 'ok') return
+    if (!pollingActive) return
     fetchData()
     const id = setInterval(() => fetchData(), POLL_INTERVAL_MS)
     return () => clearInterval(id)
-  }, [authState, fetchData])
+  }, [pollingActive, fetchData])
 
   // §3.7: what a successful mutation does, in order -- bump the sequence,
   // abort whatever data request is in flight and free the lock, then

@@ -35,25 +35,10 @@ export function useTokenSession() {
 
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Hydration (runs once). No commit/write happens here -- reading storage
-  // is not "activeToken 확정" (design 4.2), so a pre-existing mismatch
-  // between the two keys is surfaced but not resolved until the user
-  // explicitly edits and the debounce settles.
-  useEffect(() => {
-    const newVal = readKey(NEW_KEY)
-    const oldVal = readKey(OLD_KEY)
-    const initial = newVal || oldVal
-    setTokenInput(initial)
-    setActiveToken(initial)
-    if (newVal && oldVal && newVal !== oldVal) {
-      setStorageNotice('저장된 토큰 값이 두 개 서로 다르게 남아 있어. 아래에서 다시 저장하면 하나로 정리돼.')
-    }
-    setHydrated(true)
-  }, [])
-
   // Commits a confirmed token value to both storage keys (or clears both),
   // per-key try/catch so one failing does not mask the other, and reports
-  // the failure kinds design 4.2 distinguishes (write vs delete).
+  // the failure kinds design 4.2 distinguishes (write vs delete). Declared
+  // above the hydration effect below so that effect can call it directly.
   const persist = useCallback((value: string) => {
     if (value) {
       let failed = false
@@ -71,6 +56,29 @@ export function useTokenSession() {
       )
     }
   }, [])
+
+  // Hydration (runs once). The only write here is the old-key-only
+  // migration case (design 4.2 write rule applied to the hydration-time
+  // setActiveToken): if the new key is empty and the old key has a value,
+  // that value is persisted to both keys so it is not silently lost. The
+  // mismatch case (both keys set, different values) is left alone here --
+  // it is surfaced but not resolved until the user explicitly edits and
+  // the debounce settles, per the §4.2 exception.
+  useEffect(() => {
+    const newVal = readKey(NEW_KEY)
+    const oldVal = readKey(OLD_KEY)
+    const initial = newVal || oldVal
+    setTokenInput(initial)
+    setActiveToken(initial)
+    if (newVal && oldVal && newVal !== oldVal) {
+      setStorageNotice('저장된 토큰 값이 두 개 서로 다르게 남아 있어. 아래에서 다시 저장하면 하나로 정리돼.')
+    } else if (!newVal && oldVal) {
+      persist(oldVal)
+    }
+    setHydrated(true)
+    // persist has a [] useCallback identity, so adding it here does not
+    // change the once-per-mount behavior of this effect.
+  }, [persist])
 
   // Debounce: tokenInput -> activeToken after DEBOUNCE_MS of no further
   // edits. This is the only place activeToken changes after hydration, and
