@@ -1840,6 +1840,27 @@ class TestExplicitSlugLengthRejection:
             assert get_pack(stack["sql"], new_id) is None, n
 
 
+class TestExplicitEmptyNewPackIdRejection:
+    def test_t98_explicit_empty_new_pack_id_is_rejected_not_treated_as_omitted(self, stack):
+        """T98 (design §17-5, §17-3): `new_pack_id=""` is a caller-supplied
+        DECLARATION, not omission -- step 8 must reject it with a remedy
+        pointing at omitting the argument, never fall through to the
+        default `"{src}-fork"` derivation the way plain truthiness does.
+        Reverse-mutation: reverting step 8's branch from `if new_pack_id is
+        not None:` back to `if new_pack_id:` makes `""` indistinguishable
+        from omission again -- the fork completes with `status: "ok"` and
+        `pack_id == f"{src}-fork"` instead of returning an error, and this
+        test's error-only assertions fail."""
+        src = _seed_pack(
+            stack, ALICE, "src-t98", node_count=1, with_edge=False, with_source=False,
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="")
+        assert "error" in out, out
+        assert "omit" in out["error"].lower(), out
+        assert "status" not in out
+        assert get_pack(stack["sql"], f"{src}-fork") is None
+
+
 class TestSlugLengthBoundaries:
     def test_t50a_default_path_truncation_boundary(self, stack):
         """T50(a) / T74 (design §8 T50, §3, §13-3, §5-1 step 8): the DEFAULT

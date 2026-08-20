@@ -1704,7 +1704,7 @@ def pack_fork(
     # Only clean an explicitly-supplied value -- None must stay None so
     # fork_pack can tell "not supplied, inherit from source" apart from
     # "supplied as an explicit empty override" (design §3).
-    new_pack_id = _clean_str(new_pack_id) if new_pack_id else None
+    new_pack_id = _clean_str(new_pack_id) if new_pack_id is not None else None
     title = _clean_str(title) if title is not None else None
     description = _clean_str(description) if description is not None else None
 

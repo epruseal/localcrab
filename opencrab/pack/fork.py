@@ -994,7 +994,19 @@ def _fork_pack_inner(
     # collision suffix -- a pack whose only "fault" is a long name must
     # still be forkable via the default path without the caller having to
     # work around it by hand.
-    if new_pack_id:
+    if new_pack_id is not None:
+        # An explicitly-supplied empty string is a DECLARED override, not
+        # omission -- treating it as "not supplied" would silently fork to
+        # the auto-derived name the caller did not ask for (design §17:
+        # only `None` means "not supplied"; `is not None` is what actually
+        # enforces that, unlike a truthiness check, which conflates "" with
+        # omission).
+        if not new_pack_id:
+            raise _reject(
+                "new_pack_id was supplied as an empty string; omit the "
+                "argument entirely to derive a name from src_pack_id "
+                "instead"
+            )
         requested_slug = new_pack_id
         if len(requested_slug) > _PACK_ID_BUDGET:
             raise _reject(
