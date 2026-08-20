@@ -38,6 +38,11 @@ export default function PackPanel({ packs, loading, error, mutationsBlocked, onV
   const [rowError, setRowError] = useState<Record<string, string>>({})
 
   async function handleChange(packId: string, visibility: PackVisibility) {
+    // v3.2: the disabled attribute stops real users, but a programmatic
+    // dispatchEvent bypasses the browser's disabled-control suppression and
+    // still reaches this handler -- guard here too, mirroring RightPanel's
+    // handleQuery/handleIngest pattern (measured by scenario 24).
+    if (mutationsBlocked || pending[packId]) return
     setPending(p => ({ ...p, [packId]: true }))
     setRowError(p => {
       const next = { ...p }
