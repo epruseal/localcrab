@@ -146,17 +146,21 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* is inlined into the browser bundle at build time, so
+        # this must be a build arg, not a runtime `environment:` entry --
+        # changing it here requires rebuilding the web image, and the
+        # default below only works when the browser and this compose host
+        # are the same machine (#149 design 2 / apps/web/Dockerfile).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001}
     container_name: opencrab-web
     ports:
       - "3000:3000"
     environment:
       PORT: 3000
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001}
       # NEXT_PUBLIC_OPENCRAB_API_KEY removed (#145): NEXT_PUBLIC_* is compiled
       # into the browser bundle, so it can never hold a credential. The web UI
       # takes a per-user token from the operator (#149).
-      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-pk_test_replace_me}
-      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-sk_test_replace_me}
     depends_on:
       api:
         condition: service_started
