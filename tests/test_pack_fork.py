@@ -54,7 +54,7 @@ from opencrab.config import Settings
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.query import HybridQuery
 from opencrab.pack import fork as fork_mod
-from opencrab.pack.fork import fork_pack
+from opencrab.pack.fork import _PACK_ID_BUDGET, _PACK_ID_COLUMN_LIMIT, fork_pack
 from opencrab.pack.ownership import (
     anchor_node_id,
     begin_pack_creation,
@@ -1807,31 +1807,33 @@ class TestEdgeSqlLegFailure:
 
 
 # ---------------------------------------------------------------------------
-# T26 / T50 -- pack_id/slug length budget (design §3): _PACK_ID_BUDGET =
-# 256 (registry column limit) - 9 (begin_pack_creation's worst-case
-# collision suffix) = 247. An explicit new_pack_id over budget is REJECTED
-# (never truncated); the DEFAULT slug is truncated instead so "{src}-fork"
-# always fits.
+# T26 / T50 / T74 -- pack_id/slug length budget (design §3, §13-3):
+# _PACK_ID_BUDGET = 256 (registry column limit) - 9 (begin_pack_creation's
+# worst-case collision suffix) - 8 (the `dataset:` anchor prefix, since the
+# pack's own anchor node id is what actually lands in that column) = 239. An
+# explicit new_pack_id over budget is REJECTED (never truncated); the DEFAULT
+# slug is truncated instead so "{src}-fork" always fits.
 # ---------------------------------------------------------------------------
 
 
 class TestExplicitSlugLengthRejection:
     def test_t26_explicit_new_pack_id_over_budget_rejected_not_truncated(self, stack):
         """T26 (design §8 T26, §3, §5-1 step 8): an explicitly
-        caller-supplied `new_pack_id` that exceeds the 247-char budget is
-        REJECTED outright -- never silently truncated the way the DEFAULT
-        slug is (design §3: truncating a name the caller chose on purpose
-        would be surprising). Checked across several over-budget lengths
-        (248, the next boundary; 256, the old un-budgeted limit; 300,
-        comfortably past both) to prove this is a real inequality check,
-        not one that only happens to catch a single value. Reverse-
-        mutation: the `if len(requested_slug) > _PACK_ID_BUDGET: raise
-        _reject(...)` branch for the explicit-new_pack_id path (fork.py
-        step 8) was removed -- every one of these calls then proceeded to
-        `begin_pack_creation` instead of being rejected, breaking this
-        test's uniform "always error, never a reserved row" assertion."""
+        caller-supplied `new_pack_id` that exceeds the budget is REJECTED
+        outright -- never silently truncated the way the DEFAULT slug is
+        (design §3: truncating a name the caller chose on purpose would be
+        surprising). Checked across several over-budget lengths (240, the
+        next boundary; 248, the pre-§13 budget's boundary; 256, the raw
+        column limit; 300, comfortably past all of them) to prove this is a
+        real inequality check, not one that only happens to catch a single
+        value. Reverse-mutation: the `if len(requested_slug) >
+        _PACK_ID_BUDGET: raise _reject(...)` branch for the
+        explicit-new_pack_id path (fork.py step 8) was removed -- every one
+        of these calls then proceeded to `begin_pack_creation` instead of
+        being rejected, breaking this test's uniform "always error, never a
+        reserved row" assertion."""
         src = _seed_pack(stack, ALICE, "src-t26", node_count=1, with_edge=False, with_source=False)
-        for n in (248, 256, 300):
+        for n in (240, 248, 256, 300):
             new_id = "z" * n
             out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_id)
             assert "error" in out and "budget" in out["error"], (n, out)
@@ -1839,62 +1841,66 @@ class TestExplicitSlugLengthRejection:
 
 
 class TestSlugLengthBoundaries:
-    def test_t50a_default_path_truncation_boundary_242_243(self, stack):
-        """T50(a) (design §8 T50, §3, §5-1 step 8): the DEFAULT slug is
-        `f"{src}-fork"`; when that exceeds the 247-char budget, src_pack_id
+    def test_t50a_default_path_truncation_boundary(self, stack):
+        """T50(a) / T74 (design §8 T50, §3, §13-3, §5-1 step 8): the DEFAULT
+        slug is `f"{src}-fork"`; when that exceeds the budget, src_pack_id
         itself is truncated (not the whole fork rejected) so the "-fork"
-        suffix always fits. The pass/truncate boundary is exactly src
-        length 242 (slug length 247, fits) vs 243 (slug length 248,
-        truncated). Reverse-mutation: `_PACK_ID_BUDGET`'s definition was
-        reverted from `256 - 9` to a bare `256` -- at src length 243 the
-        (un-truncated) slug is only 248 chars, which now fits the wrong
-        budget, so this test's "truncation actually happened" assertion
-        for the 243 case failed."""
-        pad = "a" * (242 - len("src-t50a-"))
-        src_242 = _seed_pack(
+        suffix always fits. The pass/truncate boundary is exactly src length
+        `_PACK_ID_BUDGET - len("-fork")` (slug fits) vs one more (slug over,
+        truncated). Boundaries are DERIVED from `_PACK_ID_BUDGET` rather than
+        spelled as literals so that a mutation to the budget's definition
+        moves the inputs with it and the assertions still discriminate.
+        Reverse-mutation: `_PACK_ID_BUDGET` lost its `_ANCHOR_PREFIX_LEN`
+        term -- at the over-boundary src length the un-truncated slug now fit
+        the wrong budget, so this test's "truncation actually happened"
+        assertion failed."""
+        fits = _PACK_ID_BUDGET - len("-fork")
+        pad = "a" * (fits - len("src-t50a-"))
+        src_fits = _seed_pack(
             stack, ALICE, f"src-t50a-{pad}", node_count=1, with_edge=False, with_source=False,
         )
-        assert len(src_242) == 242, len(src_242)
-        out_242 = _fork(stack, principal=ALICE, src_pack_id=src_242)
-        assert out_242["status"] == "ok", out_242
-        assert out_242["pack_id"] == f"{src_242}-fork", out_242
-        assert len(out_242["pack_id"]) == 247
+        assert len(src_fits) == fits, len(src_fits)
+        out_fits = _fork(stack, principal=ALICE, src_pack_id=src_fits)
+        assert out_fits["status"] == "ok", out_fits
+        assert out_fits["pack_id"] == f"{src_fits}-fork", out_fits
+        assert len(out_fits["pack_id"]) == _PACK_ID_BUDGET
 
-        pad3 = "a" * (243 - len("src-t50a3-"))
-        src_243 = _seed_pack(
+        over = fits + 1
+        pad3 = "a" * (over - len("src-t50a3-"))
+        src_over = _seed_pack(
             stack, ALICE, f"src-t50a3-{pad3}", node_count=1, with_edge=False, with_source=False,
         )
-        assert len(src_243) == 243, len(src_243)
-        out_243 = _fork(stack, principal=ALICE, src_pack_id=src_243)
-        assert out_243["status"] == "ok", out_243
-        assert out_243["pack_id"] != f"{src_243}-fork", (
-            "a 243-char src's default slug (248 chars) exceeds the 247 "
-            "budget and must be TRUNCATED, not passed through unchanged"
+        assert len(src_over) == over, len(src_over)
+        out_over = _fork(stack, principal=ALICE, src_pack_id=src_over)
+        assert out_over["status"] == "ok", out_over
+        assert out_over["pack_id"] != f"{src_over}-fork", (
+            "an over-boundary src's default slug exceeds the budget and must "
+            "be TRUNCATED, not passed through unchanged"
         )
-        assert out_243["pack_id"].endswith("-fork")
-        assert len(out_243["pack_id"]) <= 247
-        assert out_243["pack_id"].startswith(src_243[:242])
+        assert out_over["pack_id"].endswith("-fork")
+        assert len(out_over["pack_id"]) <= _PACK_ID_BUDGET
+        assert out_over["pack_id"].startswith(src_over[:fits])
 
-    def test_t50b_explicit_new_pack_id_boundary_247_248(self, stack):
-        """T50(b): an explicit `new_pack_id` at EXACTLY the 247-char
-        budget is accepted verbatim (no truncation, no rejection); one
-        character over (248) is rejected outright (T26 covers the
-        rejection path more broadly; this pins the exact boundary
-        transition). Reverse-mutation: `_PACK_ID_BUDGET` was changed from
-        `256 - 9` to a plain `256` -- the 248-char explicit id, which
+    def test_t50b_explicit_new_pack_id_boundary(self, stack):
+        """T50(b) / T74: an explicit `new_pack_id` at EXACTLY the budget is
+        accepted verbatim (no truncation, no rejection); one character over
+        is rejected outright (T26 covers the rejection path more broadly;
+        this pins the exact boundary transition). Both lengths are derived
+        from `_PACK_ID_BUDGET`. Reverse-mutation: `_PACK_ID_BUDGET` lost its
+        `_ANCHOR_PREFIX_LEN` term -- the over-boundary explicit id, which
         should be rejected, was instead accepted, and this test's
-        `'error' in out_248` assertion failed."""
+        `'error' in out_over` assertion failed."""
         src = _seed_pack(stack, ALICE, "src-t50b", node_count=1, with_edge=False, with_source=False)
 
-        new_247 = "b" * 247
-        out_247 = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_247)
-        assert out_247["status"] == "ok", out_247
-        assert out_247["pack_id"] == new_247, out_247
+        new_at = "b" * _PACK_ID_BUDGET
+        out_at = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_at)
+        assert out_at["status"] == "ok", out_at
+        assert out_at["pack_id"] == new_at, out_at
 
-        new_248 = "c" * 248
-        out_248 = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_248)
-        assert "error" in out_248 and "budget" in out_248["error"], out_248
-        assert get_pack(stack["sql"], new_248) is None
+        new_over = "c" * (_PACK_ID_BUDGET + 1)
+        out_over = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_over)
+        assert "error" in out_over and "budget" in out_over["error"], out_over
+        assert get_pack(stack["sql"], new_over) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2014,3 +2020,339 @@ class TestToolRegistration:
         from opencrab.mcp.tools import WRITE_TOOLS
 
         assert "pack_fork" in WRITE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# T75-T85 -- the id LENGTH contract (design §13, §13-8, §13-9).
+#
+# The registry's node_id / edge-endpoint columns are VARCHAR(256). Two things
+# push ids at that limit, and this PR introduced both:
+#   - the destination anchor's `dataset:` prefix (covered by the budget, see
+#     T26/T50/T74 above);
+#   - the remap suffix `~{salt}`, which takes a source node id that the store
+#     itself accepts and makes the COPY illegal.
+# The second is NOT a Tier 1 drop: excluding a hub node would take its edges
+# with it while barely moving the node axis's own loss ratio, and the fork
+# would still promote to `ready` having silently lost both. It is a whole-fork
+# rejection, before the reservation, so no registry row is ever created.
+#
+# NOTE ON THE ORACLE: SQLite does not enforce VARCHAR(n), so "the write
+# fails" would be a vacuous assertion here. Every row below asserts on
+# produced id lengths, registry row counts, or the rejection reason instead.
+# ---------------------------------------------------------------------------
+
+_REMAP_GROWTH = len(fork_mod.remap_id("x", fork_mod.new_salt())) - 1
+_ID_AT_LIMIT = _PACK_ID_COLUMN_LIMIT - _REMAP_GROWTH
+_ID_OVER_LIMIT = _ID_AT_LIMIT + 1
+
+
+def _add_node(stack, pack_id: str, node_id: str, *, owner=ALICE) -> None:
+    with principal_scope(owner):
+        stack["builder"].add_node(
+            space="resource", node_type="Document", node_id=node_id,
+            properties={"title": "t"}, pack_id=pack_id,
+        )
+
+
+def _forked_row_count(stack, src_pack_id: str) -> int:
+    with stack["sql"]._engine.connect() as conn:
+        return conn.execute(
+            _sql_text("SELECT COUNT(*) FROM packs WHERE forked_from = :src"),
+            {"src": src_pack_id},
+        ).scalar_one()
+
+
+def _fork_node_ids(stack, pack_id: str) -> set[str]:
+    return {n["props"]["id"] for n in stack["graph"].export_nodes_scoped([pack_id], 500)}
+
+
+def _count_nodes(stack, pack_id: str) -> int:
+    return len(stack["graph"].export_nodes_scoped([pack_id], 500))
+
+
+class TestRemappedIdLengthRejection:
+    def test_t75_over_limit_node_rejects_whole_fork_leaving_nothing(self, stack):
+        """T75 (design §13-8-1, §13-9-3): ONE node whose id the remap would
+        push past the registry column limit rejects the WHOLE fork. The
+        oracle is threefold: no destination registry row exists (counted by
+        `forked_from`, which catches a negotiated slug the caller never
+        named), the rejection reason names the offending id, and the SOURCE
+        pack is untouched -- rejection does not delete anything, it declines
+        to create. Reverse-mutation: the `len(remap_id(node_id, salt)) >
+        _PACK_ID_COLUMN_LIMIT` branch in fork.py's node loop was removed --
+        the fork then succeeded and wrote a node id past the column limit,
+        failing both the `error` assertion and the `forked_row_count == 0`
+        assertion."""
+        src = _seed_pack(stack, ALICE, "src-t75", node_count=2, with_source=False)
+        long_id = "L" * _ID_OVER_LIMIT
+        _add_node(stack, src, long_id)
+        with principal_scope(ALICE):
+            stack["builder"].add_edge(
+                "resource", long_id, "cites", "resource", f"{src}-n0", pack_id=src,
+            )
+
+        before = _count_nodes(stack, src)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert "error" in out, out
+        assert long_id in out["error"], out["error"]
+        assert str(_PACK_ID_COLUMN_LIMIT) in out["error"], out["error"]
+        assert _forked_row_count(stack, src) == 0, out
+        # The source is not touched: rejection declines to create, it does
+        # not remove. The design's earlier draft wrongly claimed the source
+        # edge "does not survive anywhere" -- it does.
+        assert _count_nodes(stack, src) == before
+
+    def test_t76_boundary_at_limit_passes_one_over_rejects(self, stack):
+        """T76 (design §13-9-3): the comparison is `>`, not `>=`. A node id
+        whose REMAPPED length is exactly the column limit is copied; one
+        character longer is rejected. Both lengths are derived from
+        `remap_id` itself, so this pins the boundary rather than a literal.
+        Reverse-mutation: `>` was changed to `>=` -- the at-limit pack, which
+        must fork cleanly, was rejected and this test's `status == 'ok'`
+        assertion failed."""
+        src_ok = _seed_pack(stack, ALICE, "src-t76a", node_count=1, with_edge=False,
+                            with_source=False)
+        at_limit = "A" * _ID_AT_LIMIT
+        _add_node(stack, src_ok, at_limit)
+        out_ok = _fork(stack, principal=ALICE, src_pack_id=src_ok)
+        assert out_ok["status"] == "ok", out_ok
+        copied = _fork_node_ids(stack, out_ok["pack_id"])
+        assert copied, out_ok
+        assert max(len(n) for n in copied) <= _PACK_ID_COLUMN_LIMIT, (
+            sorted((len(n), n) for n in copied)[-1]
+        )
+
+        src_bad = _seed_pack(stack, ALICE, "src-t76b", node_count=1, with_edge=False,
+                             with_source=False)
+        _add_node(stack, src_bad, "B" * _ID_OVER_LIMIT)
+        out_bad = _fork(stack, principal=ALICE, src_pack_id=src_bad)
+        assert "error" in out_bad, out_bad
+
+    def test_t77_over_limit_source_only_id_does_not_reject(self, stack):
+        """T77 (design §13-8-1 domain, §13-9-2): the length check covers
+        NODE ids only. A `source_id` reaches the doc store's `text` column
+        and the vector store's `TEXT` id -- neither is length-constrained --
+        so a source-only content id past the node limit must NOT reject the
+        fork. Reverse-mutation: the source axis was added to the length
+        check's domain -- this perfectly legal pack was then rejected and the
+        `status == 'ok'` assertion failed."""
+        src = _seed_pack(stack, ALICE, "src-t77", node_count=1, with_edge=False,
+                         with_source=False)
+        long_source_id = "S" * _ID_OVER_LIMIT
+        with principal_scope(ALICE):
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="a source-only body", source_id=long_source_id, pack_id=src,
+            )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert out["copied"]["sources"] >= 1, out
+
+    def test_t78_negotiated_anchor_id_stays_within_the_column_limit(self, stack):
+        """T78 (design §13-3, §13-9-3): the behavioural end of contract 1.
+        A slug at EXACTLY the budget that then collides gets
+        `begin_pack_creation`'s 9-char suffix, and the anchor node built from
+        the result must still fit the column. The requested length is derived
+        from `_PACK_ID_BUDGET` so that a mutation to the budget moves this
+        test's input with it. Reverse-mutation: `_PACK_ID_BUDGET` lost its
+        `_ANCHOR_PREFIX_LEN` term -- the negotiated pack_id became 256 chars
+        and its anchor 264, failing the assertion below."""
+        src = _seed_pack(stack, ALICE, "src-t78", node_count=1, with_edge=False,
+                         with_source=False)
+        taken = "t" * _PACK_ID_BUDGET
+        with principal_scope(ALICE):
+            blocker = begin_pack_creation(stack["sql"], ALICE.user_id, taken)
+            mark_pack_ready(stack["sql"], blocker, ALICE.user_id)
+        assert blocker == taken, blocker
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=taken)
+        assert out["status"] == "ok", out
+        assert out["pack_id"] != taken, "the collision must have been negotiated"
+        assert len(anchor_node_id(out["pack_id"])) <= _PACK_ID_COLUMN_LIMIT, (
+            out["pack_id"], len(anchor_node_id(out["pack_id"])),
+        )
+
+    def test_t79_boundary_follows_the_remap_shape_not_a_constant(self, stack):
+        """T79 (design §13-8-1, §13-9-3): the check measures with `remap_id`
+        itself, so changing the remap shape moves the boundary with it. With
+        a longer salt, an id that passes under the real salt must now be
+        rejected. Reverse-mutation: the check was rewritten to compare
+        against a precomputed `243` -- the longer salt no longer moved the
+        boundary, the at-limit pack forked cleanly, and this test's `error`
+        assertion failed."""
+        src = _seed_pack(stack, ALICE, "src-t79", node_count=1, with_edge=False,
+                         with_source=False)
+        _add_node(stack, src, "R" * _ID_AT_LIMIT)
+
+        long_salt = "f" * (_REMAP_GROWTH * 3)
+        original = fork_mod.new_salt
+        try:
+            fork_mod.new_salt = lambda: long_salt
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            fork_mod.new_salt = original
+
+        assert "error" in out, out
+        assert _forked_row_count(stack, src) == 0, out
+
+    def test_t80_over_limit_remapped_source_anchor_does_not_reject(self, stack):
+        """T80 (design §13-8-1 anchor carve-out, §13-9-3): the source pack's
+        OWN anchor is never copied as an ordinary node, so its remapped
+        candidate exceeding the limit is irrelevant. A pack whose id is long
+        enough that `remap_id(anchor)` would overflow -- while its ordinary
+        node ids still fit -- must fork cleanly. Reverse-mutation: the length
+        check was placed BEFORE the anchor intercept (or made to walk the
+        whole mapping) -- the source anchor was then measured, this legal
+        pack was rejected, and the `status == 'ok'` assertion failed."""
+        # anchor = "dataset:" + pack_id, and it must overflow once remapped.
+        src_len = _ID_OVER_LIMIT - len(anchor_node_id(""))
+        pad = "p" * (src_len - len("src-t80-"))
+        src = _seed_pack(stack, ALICE, f"src-t80-{pad}", node_count=1, with_edge=False,
+                         with_source=False)
+        assert len(src) == src_len, len(src)
+        assert len(anchor_node_id(src)) + _REMAP_GROWTH > _PACK_ID_COLUMN_LIMIT
+        # ...while the ordinary node ids this pack seeded still fit.
+        assert len(f"{src}-n0") + _REMAP_GROWTH <= _PACK_ID_COLUMN_LIMIT
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+
+    def test_t81_collision_suffix_is_never_cumulative(self):
+        """T81 (design §13-1 premise 3): the budget subtracts exactly 9 for
+        the collision suffix. That is only the worst case because each retry
+        suffixes the ORIGINAL slug -- if candidates chained onto one another
+        the growth would be unbounded and the 9 would be wrong. Reverse-
+        mutation: `_pack_id_candidates` was changed to build each candidate
+        from the previous one -- the third candidate grew by 18 rather than
+        9 and this assertion failed."""
+        from opencrab.pack.ownership import _pack_id_candidates
+
+        base = "slug"
+        got = []
+        for candidate in _pack_id_candidates(base):
+            got.append(candidate)
+            if len(got) == 4:
+                break
+        assert got[0] == base
+        for candidate in got[1:]:
+            assert candidate.startswith(f"{base}-"), candidate
+            assert len(candidate) - len(base) == 9, candidate
+
+    def test_t82_long_id_that_also_fails_grammar_is_only_a_tier_1_drop(self, stack):
+        """T82 (design §13-9-1): the length check runs only on nodes that
+        have already SURVIVED Tier 1. A node that fails grammar validation is
+        not copied at all, so its length cannot overflow anything -- letting
+        it trigger a whole-fork rejection would be over-rejection. Reverse-
+        mutation: the length check was moved ahead of the grammar check --
+        this pack, whose only over-limit node is grammar-invalid anyway, was
+        rejected outright instead of forking with a Tier 1 drop, failing the
+        `status == 'ok'` assertion."""
+        src = _seed_pack(stack, ALICE, "src-t82", node_count=15, with_edge=False,
+                         with_source=False)
+        long_id = "G" * _ID_OVER_LIMIT
+        _add_node(stack, src, long_id)
+        stack["graph"]._exec_write(
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
+            "WHERE node_id = :nid",
+            {"v": "not-a-real-space", "nid": long_id},
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert out["status"] == "ok", out
+        assert any(
+            "failed grammar validation" in msg for msg in out["errors"]["nodes"]
+        ), out["errors"]["nodes"]
+        copied = _fork_node_ids(stack, out["pack_id"])
+        assert max(len(n) for n in copied) <= _PACK_ID_COLUMN_LIMIT
+
+    def test_t83_rejection_happens_before_any_reservation_or_write(self, stack):
+        """T83 (design §13-9-1): wholesale rejection dissolves the DATA
+        ordering problem, but the TIME ordering is still normative -- the
+        check must precede `begin_pack_creation`, or a `creating` row exists
+        for a window even if something later deletes it. Spies prove the
+        reservation and the writers were never reached at all. Reverse-
+        mutation: the length check was moved below the reservation and paired
+        with a compensating delete -- the registry row count still ended at
+        zero, but the `begin_pack_creation` spy recorded a call and this test
+        failed where the row-count oracle alone would not have."""
+        src = _seed_pack(stack, ALICE, "src-t83", node_count=1, with_edge=False,
+                         with_source=False)
+        _add_node(stack, src, "Z" * _ID_OVER_LIMIT)
+
+        reservations: list[str] = []
+        writes: list[str] = []
+        real_begin = fork_mod.begin_pack_creation
+        real_add_node = stack["builder"].add_node
+
+        def spy_begin(*a, **kw):
+            reservations.append(kw.get("pack_id") or (a[2] if len(a) > 2 else "?"))
+            return real_begin(*a, **kw)
+
+        def spy_add_node(*a, **kw):
+            writes.append(kw.get("node_id", "?"))
+            return real_add_node(*a, **kw)
+
+        try:
+            fork_mod.begin_pack_creation = spy_begin
+            stack["builder"].add_node = spy_add_node
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            fork_mod.begin_pack_creation = real_begin
+            stack["builder"].add_node = real_add_node
+
+        assert "error" in out, out
+        assert reservations == [], reservations
+        assert writes == [], writes
+
+    def test_t84_salt_is_drawn_once_and_shared_with_the_mapping(self, stack):
+        """T84 (design §13-9-1): the salt the length check measures with MUST
+        be the salt the mapping remaps with. Drawing it twice would measure
+        one length and write another, and at the boundary the two disagree.
+        Reverse-mutation: a second `new_salt()` call was reintroduced at the
+        mapping site -- the counter below saw two draws and this assertion
+        failed."""
+        src = _seed_pack(stack, ALICE, "src-t84", node_count=1, with_edge=False,
+                         with_source=False)
+        _add_node(stack, src, "Q" * _ID_AT_LIMIT)
+
+        draws: list[str] = []
+        real_new_salt = fork_mod.new_salt
+
+        def counting_salt():
+            value = real_new_salt()
+            draws.append(value)
+            return value
+
+        try:
+            fork_mod.new_salt = counting_salt
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            fork_mod.new_salt = real_new_salt
+
+        assert out["status"] == "ok", out
+        assert len(draws) == 1, draws
+        copied = _fork_node_ids(stack, out["pack_id"])
+        assert any(n.endswith(draws[0]) for n in copied), (draws, sorted(copied)[:3])
+
+    def test_t85_multiple_over_limit_nodes_reject_with_a_genuine_id(self, stack):
+        """T85 (design §13-9-3): with SEVERAL over-limit nodes the fork is
+        still rejected and the id named in the reason is genuinely one of
+        them -- not, say, a truncated or wrongly-indexed value from an
+        implementation that only inspects the first record. Reverse-mutation:
+        the check was written to inspect only the first exported node --
+        whichever over-limit node `export_nodes_scoped` happened to return
+        later went unnoticed, and on the orderings where a legal node came
+        first the fork succeeded, failing the `error` assertion."""
+        src = _seed_pack(stack, ALICE, "src-t85", node_count=3, with_source=False)
+        over = ["M" * _ID_OVER_LIMIT, "N" * (_ID_OVER_LIMIT + 7), "O" * (_ID_OVER_LIMIT + 20)]
+        for node_id in over:
+            _add_node(stack, src, node_id)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        assert "error" in out, out
+        named = [node_id for node_id in over if node_id in out["error"]]
+        assert len(named) == 1, out["error"][:200]
+        assert len(named[0]) + _REMAP_GROWTH > _PACK_ID_COLUMN_LIMIT
+        assert _forked_row_count(stack, src) == 0

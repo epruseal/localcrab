@@ -64,6 +64,7 @@ from opencrab.pack.fork_remap import (
     REFERENCE_KEYS,
     build_mapping,
     new_salt,
+    remap_id,
     remap_props,
     remap_vector_metadata,
     surviving_source_ids,
@@ -105,13 +106,25 @@ FORK_MAX_VECTORS = 50_000
 # Design v7 §5-1 step 8b / §6, verbatim value.
 FORK_MAX_LOSS_RATIO = 0.10
 
-# Length budget for the new pack_id (design v7 §3): ``begin_pack_creation``'s
-# collision suffix is exactly ``f"{pack_id}-{secrets.token_hex(4)}"`` -- 1
-# (``-``) + 8 (hex) = 9 extra characters -- against the registry column's
-# 256-char limit.
+# Length budget for the new pack_id (design v7 §3, §13-3): the registry's
+# node_id/from_id/to_id columns are VARCHAR(256), and TWO things grow the
+# destination pack_id before it reaches them:
+#   - ``begin_pack_creation``'s collision suffix, exactly
+#     ``f"{pack_id}-{secrets.token_hex(4)}"`` -- 1 (``-``) + 8 (hex) = 9. It
+#     is applied to the ORIGINAL slug on every retry, never cumulatively
+#     (``ownership._pack_id_candidates``), so 9 is the true worst case.
+#   - the anchor prefix, since the pack's own anchor node is written as
+#     ``anchor_node_id(pack_id)``. Derived from the ownership convention
+#     rather than spelling ``"dataset:"`` again here: a second copy of that
+#     string would silently disagree the day the convention changes. No test
+#     can kill a mutation back to the literal 8 -- the two are equal under
+#     today's convention -- which is a property of deriving, not a gap.
 _PACK_ID_COLUMN_LIMIT = 256
 _PACK_ID_COLLISION_SUFFIX_LEN = 9
-_PACK_ID_BUDGET = _PACK_ID_COLUMN_LIMIT - _PACK_ID_COLLISION_SUFFIX_LEN
+_ANCHOR_PREFIX_LEN = len(anchor_node_id(""))
+_PACK_ID_BUDGET = (
+    _PACK_ID_COLUMN_LIMIT - _PACK_ID_COLLISION_SUFFIX_LEN - _ANCHOR_PREFIX_LEN
+)
 _DEFAULT_SLUG_SUFFIX = "-fork"
 
 
@@ -544,6 +557,12 @@ def _fork_pack_inner(
 
     src_anchor = anchor_node_id(src_pack_id)
 
+    # Design §13-9-1: the salt is drawn ONCE, here, because the node loop
+    # below needs it to measure each surviving id's remapped length and
+    # build_mapping must then remap with the SAME salt -- drawing it twice
+    # would measure one length and write another.
+    salt = new_salt()
+
     # ---------------- §5-1 steps 5-6: id recovery + grammar/property + ----------------
     # ---------------- alias-conflict validation (all Tier 1)          ----------------
     node_errors: list[str] = []
@@ -612,6 +631,26 @@ def _fork_pack_inner(
         except ValueError:
             skipped_alias_nodes += 1
             continue
+        # Design §13-8-1 / §13-9-1: the remap suffix can push an id the store
+        # itself accepts past the registry's VARCHAR(256) node_id and
+        # edge-endpoint columns. That overflow is made by OUR transform, not
+        # by a defect in the source data, so it is NOT a Tier 1 drop --
+        # dropping a hub node here would take its edges with it while barely
+        # moving the node axis's own loss ratio, and the fork would still
+        # promote to `ready` having silently lost both. Reject the whole fork
+        # instead, and do it here: before the reservation, so not one registry
+        # row is ever created. Measured with remap_id itself rather than a
+        # precomputed threshold so a change to the remap shape moves this
+        # boundary with it. Checked only for nodes that already survived
+        # Tier 1 -- one dropped for grammar or an alias conflict is not
+        # copied, so its length cannot overflow anything.
+        remapped_len = len(remap_id(node_id, salt))
+        if remapped_len > _PACK_ID_COLUMN_LIMIT:
+            raise _declared_limit_reject(
+                f"node {node_id!r} is {len(node_id)} characters and the fork "
+                f"id remap would make it {remapped_len}, past the registry's "
+                f"{_PACK_ID_COLUMN_LIMIT}-character node_id limit"
+            )
         surviving_nodes_by_id[node_id] = record
         surviving_node_ids.add(node_id)
 
@@ -709,7 +748,8 @@ def _fork_pack_inner(
     # ---------------- §5-1 step 7 (built here; §6b's mapping-before- ----------------
     # ---------------- classification note applies to VECTOR classification, ----------------
     # ---------------- which needs this mapping and therefore runs after it) ----------------
-    salt = new_salt()
+    # `salt` was drawn before the node loop (§13-9-1) -- the same value the
+    # length check there measured with.
     # The anchor entry is a PLACEHOLDER here (self-mapped): the real
     # destination pack_id is not known until begin_pack_creation runs in
     # §5-2 step 9. §6b's classification never actually consults this
