@@ -2404,7 +2404,11 @@ class TestRemappedIdLengthRejection:
         and expectations from it -- so a mutation to the constant itself
         moves all of them together and none of them notices. This row is the
         one place the constant is tied to something outside fork.py: the
-        registry DDL that actually enforces it. Reverse-mutation:
+        registry DDL that actually enforces it. The two tables are named
+        explicitly: `node_id VARCHAR(256)` also appears on `impact_records`,
+        which the fork write path never touches, so an unpinned pattern would
+        keep passing on that column alone even after the columns fork DOES
+        write through stopped declaring a width. Reverse-mutation:
         `_PACK_ID_COLUMN_LIMIT` was changed to 300 -- every other row still
         passed (their arithmetic stayed self-consistent) and only this
         assertion failed."""
@@ -2412,9 +2416,31 @@ class TestRemappedIdLengthRejection:
 
         from opencrab.stores.sql_store import _TABLES_SQL
 
-        ddl = "\n".join(_TABLES_SQL)
-        widths = {
-            int(w) for w in re.findall(r"\b(?:node_id|from_id|to_id)\s+VARCHAR\((\d+)\)", ddl)
+        # The two tables builder.register_node / register_edge write through.
+        wanted = {
+            "ontology_nodes": {"node_id"},
+            "ontology_edges": {"from_id", "to_id"},
         }
-        assert widths, "registry DDL no longer declares VARCHAR ids; the length contract needs revisiting"
-        assert widths == {_PACK_ID_COLUMN_LIMIT}, (widths, _PACK_ID_COLUMN_LIMIT)
+        found: dict[str, dict[str, int]] = {}
+        for stmt in _TABLES_SQL:
+            match = re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", stmt)
+            if not match or match.group(1) not in wanted:
+                continue
+            table = match.group(1)
+            found[table] = {
+                col: int(width)
+                for col, width in re.findall(r"\b(\w+)\s+VARCHAR\((\d+)\)", stmt)
+                if col in wanted[table]
+            }
+
+        assert set(found) == set(wanted), (
+            "the registry DDL no longer declares these tables; the length "
+            f"contract needs revisiting: {sorted(found)}"
+        )
+        for table, columns in wanted.items():
+            assert set(found[table]) == columns, (
+                f"{table} no longer declares a VARCHAR width for {sorted(columns)}; "
+                "the length contract is measuring against nothing"
+            )
+            for col, width in found[table].items():
+                assert width == _PACK_ID_COLUMN_LIMIT, (table, col, width)
