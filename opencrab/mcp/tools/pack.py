@@ -1616,9 +1616,17 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
             "success or partial completion, response is `{\"status\": "
             "\"ok\"|\"partial\", \"pack_id\", \"forked_from\", "
             "\"visibility\", \"copied\", \"skipped\", \"errors\", "
-            "\"unverified_refs\"}`; `\"partial\"` additionally carries an "
-            "\"error\" describing what stopped the write phase, with "
-            "\"copied\" reporting actual progress made before that point."
+            "\"unverified_refs\", \"registry_status_observed\", "
+            "\"registry_transition_confirmed\"}`; `\"partial\"` additionally "
+            "carries an \"error\" describing what stopped the write phase, "
+            "with \"copied\" reporting the number of logical units this "
+            "call itself confirmed every required leg of (not raw row "
+            "counts). `registry_status_observed` is what a post-write "
+            "registry re-read observed (one of \"ready\"/\"partial\"/"
+            "\"creating\"/\"missing\"/\"unknown\"); `registry_transition_"
+            "confirmed` is true only when that matches the status this "
+            "call was trying to leave behind -- false means the outcome "
+            "could not be verified, not that it failed."
         ),
         "inputSchema": {
             "type": "object",

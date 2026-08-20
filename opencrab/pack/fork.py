@@ -16,9 +16,12 @@ ordering is deliberate, not an optimisation target:
                                      behind: zero registry rows, zero graph
                                      anchors.
   §5-2  reservation (steps 9-12) -- ``begin_pack_creation`` claims the new
-                                     slug; the ONLY delete this module ever
-                                     performs (a pre-anchor identity-conflict
-                                     rejection) can still happen here.
+                                     slug. The delete window is exactly
+                                     steps 10-12 (design §12-4): a mapping
+                                     collision, a non-empty ``dst``, or an
+                                     identity conflict all compensate with a
+                                     confirmed DELETE here, before any
+                                     writer has been called.
   §5-3  writes (steps 13-17)     -- anchor, then nodes, edges, sources,
                                      vectors, all via ``fork_copy``/
                                      ``origin="server"``. NOTHING deletes the
@@ -199,6 +202,13 @@ def _vec_backend(vec: Any) -> tuple[str | None, Any, str | None]:
     conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
     if conn is not None:
         return ("sql", conn, getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure"))
+    collection_handle = getattr(vec, "_collection_handle", None)
+    if callable(collection_handle):
+        # design §12-5: chroma_store's own snapshot accessor -- taken under
+        # its lock so a concurrent reset_collection() swap is never
+        # observed half-applied. Prefer it over the raw `_collection`
+        # attribute below, which that lock does not protect.
+        return ("chroma", collection_handle(), None)
     if hasattr(vec, "_collection"):
         return ("chroma", vec._collection, None)
     engine = getattr(vec, "_engine", None)
@@ -341,6 +351,14 @@ def _h4_verify(
 
     if written_sources:
         for row in docs.list_sources_scoped([dst], written_sources + 1):
+            # design §12-3: the row's own STRUCTURAL source_id column, not
+            # just metadata -- a source whose id itself was never remapped
+            # (unlike a node, whose id lives inside props/REFERENCE_KEYS,
+            # a source's id is a top-level column `_h4_scan` never looks
+            # at).
+            row_source_id = row.get("source_id")
+            if isinstance(row_source_id, str) and row_source_id in mapping_keys:
+                hits.append(f"source_id={row_source_id!r} (unremapped source-space id)")
             metadata = row.get("metadata") or {}
             hits.extend(_h4_scan(metadata, mapping_keys, src_pack_id))
 
@@ -370,6 +388,22 @@ def _reject(message: str, *, hint: str | None = None) -> _RejectedError:
     if hint:
         resp["hint"] = hint
     return _RejectedError(resp)
+
+
+def _declared_limit_reject(detail: str) -> _RejectedError:
+    """A #197-declared-limit preflight rejection (design §12-3): every shape
+    this covers is one the store itself already accepts on a normal write
+    path -- it is only FORKING that cannot be made safe for it yet, because
+    identity is not pack-scoped (#197) and the copy would either collide
+    with the destination anchor or lose data non-deterministically. Says so
+    explicitly rather than reading like the source data itself is broken.
+    """
+    return _reject(
+        f"{detail}; this shape is supported by the store but cannot be "
+        "forked until issue #197 (identity is not pack-scoped) is resolved "
+        "-- fix the source data (rename/remove the conflicting id) or wait "
+        "for #197",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +441,32 @@ def fork_pack(
 
     Returns a dict shaped ``{"status": "ok"|"partial", "pack_id": ...,
     "forked_from": ..., "visibility": "private", "copied": {...}, "skipped":
-    {...}, "errors": {...}, "unverified_refs": ...}`` on completion (design
-    §3's schema names both statuses under this one shape -- "partial" adds
-    an "error" key and reports actual progress so far, it does not shrink
-    to a bare error string), or ``{"error": ..., "hint"?: ...}`` on a
+    {...}, "errors": {...}, "unverified_refs": ..., "registry_status_observed":
+    ..., "registry_transition_confirmed": ...}`` on completion (design §3's
+    schema names both statuses under this one shape -- "partial" adds an
+    "error" key and reports actual progress so far, it does not shrink to a
+    bare error string), or ``{"error": ..., "hint"?: ...}`` on a
     preflight/reservation rejection that left nothing behind.
+
+    ``copied`` counts LOGICAL units this call itself confirmed every
+    required leg of, not physical rows (design §12-5) -- a writer that left
+    a leg behind mid-failure, or a chroma batch that partly landed, can
+    leave more actual rows in a store than ``copied`` reports; that residue
+    is not tracked here and its recovery path is the operator ``delete_pack``
+    (design §6-1), not this response.
+
+    ``registry_status_observed``/``registry_transition_confirmed`` (design
+    §12-1) report what a post-write registry re-read OBSERVED at the moment
+    it ran -- not a live guarantee, a concurrent actor can still move the
+    row after this call returns. ``registry_status_observed`` is one of
+    ``"ready"``, ``"partial"``, ``"creating"``, ``"missing"``, or
+    ``"unknown"`` (the last when the confirming re-read itself failed).
+    ``registry_transition_confirmed`` is ``True`` only when that observed
+    value matches what this call was trying to leave behind (``"ready"`` on
+    ``status: "ok"``, ``"partial"`` on ``status: "partial"``). ``False``
+    does not mean the pack is broken -- it means THIS call could not verify
+    the transition landed; the recovery path is the same operator
+    ``delete_pack`` / re-inspection design §6-1 already names.
     """
     # ---------------- §5-1 step 2: source pack authorization ----------------
     # #143 invariant 7: nonexistent pack and someone else's private pack
@@ -489,26 +544,50 @@ def _fork_pack_inner(
     surviving_nodes_by_id: dict[str, dict[str, Any]] = {}
     surviving_node_ids: set[str] = set()
     src_anchor_seen = 0
+    seen_node_types: dict[str, str] = {}
     for record in nodes:
         node_id = _node_id(record)
         if node_id is None:
             node_errors.append("node missing props['id']; skipped (Tier 1)")
             continue
+        props = record["props"]
+        labels = record.get("labels") or []
+        node_type = labels[0] if labels else None
+        space = props.get("space")
         if node_id == src_anchor:
             # The source pack's OWN anchor is never copied as an ordinary
             # node -- the new pack gets its own anchor at step 13. Counted
             # explicitly (not assumed to appear exactly once) so the
             # completeness-floor denominator below stays exact regardless
-            # of whether export_nodes_scoped happens to include it.
-            src_anchor_seen += 1
-            continue
-        props = record["props"]
-        labels = record.get("labels") or []
-        node_type = labels[0] if labels else None
-        space = props.get("space")
+            # of whether export_nodes_scoped happens to include it. Design
+            # §12-3: only a STRUCTURALLY genuine anchor (space="resource",
+            # node_type="Dataset") counts as the intentional exclusion --
+            # anything else sharing this id is a #197-declared-limit
+            # rejection below, not a silent drop, because a wrong-shaped
+            # row here would otherwise be counted as "intentionally
+            # excluded" and vanish from both the copy AND the loss-ratio
+            # denominator.
+            if space == "resource" and node_type == "Dataset":
+                src_anchor_seen += 1
+                continue
+            raise _declared_limit_reject(
+                f"node {node_id!r} shares the pack anchor's id but is not the "
+                "anchor itself (space != 'resource' or node_type != 'Dataset')"
+            )
         if not node_type or not isinstance(space, str):
             node_errors.append(f"node {node_id!r} missing space/type; skipped (Tier 1)")
             continue
+        if node_id in seen_node_types and seen_node_types[node_id] != node_type:
+            # design §12-3: which of the two rows "wins" depends on
+            # export_nodes_scoped's row order, which is undeclared (no
+            # ORDER BY) -- there is no deterministic, lossless way to pick
+            # one, so this is a whole-fork rejection, not a Tier 1 drop of
+            # either row.
+            raise _declared_limit_reject(
+                f"node {node_id!r} appears with more than one node_type "
+                f"({seen_node_types[node_id]!r} and {node_type!r})"
+            )
+        seen_node_types[node_id] = node_type
         grammar = validate_node(space, node_type)
         if grammar.valid:
             prop_result = validate_node_properties(node_type, props)
@@ -577,11 +656,31 @@ def _fork_pack_inner(
 
     surviving_sources: list[dict[str, Any]] = []
     surviving_source_ids_set: set[str] = set()
+    seen_source_ids: set[str] = set()
     for record in sources:
         source_id = _source_id(record)
         if source_id is None:
             source_errors.append("source missing source_id; skipped (Tier 1)")
             continue
+        if source_id == src_anchor:
+            # design §12-3: dropping this source as Tier 1 would silently
+            # lose its vector (excluded by the anchor-id vector rule below)
+            # while the copy still reports "ok"; copying it would make the
+            # copy's source row impersonate the anchor id. Neither is
+            # acceptable, so this rejects the whole fork instead.
+            raise _declared_limit_reject(
+                f"source {source_id!r} shares the pack anchor's id"
+            )
+        if source_id in seen_source_ids:
+            # The doc store's PK is source_id, so this is unreachable via
+            # the normal SQL-backed store -- reaching it at all is a store
+            # contract violation (design §12-3), not original data merely
+            # being messy, hence a rejection rather than a silent Tier 1
+            # drop of the duplicate.
+            raise _declared_limit_reject(
+                f"source {source_id!r} appears more than once in this pack"
+            )
+        seen_source_ids.add(source_id)
         metadata = dict(record.get("metadata") or {})
         try:
             canonicalize_pack_alias(metadata)
@@ -638,7 +737,23 @@ def _fork_pack_inner(
     skipped_vector_mistagged = 0
     skipped_vector_invalid = 0
     import_batch: list[dict[str, Any]] = []
+    # design §12-2: matches what step 17's real `import_vectors` call will
+    # actually pass for THIS backend -- chroma's own `import_vectors` calls
+    # `allow_uris=True`; fixing this to False would reject any record
+    # carrying a non-None `uris` value that a real fork of a chroma-backed
+    # pack must accept.
+    allow_uris = _vec_backend(vector)[0] == "chroma"
     for rec in exported_vectors:
+        # design §12-2: shape check BEFORE any field access -- pgvector's
+        # export can hand back non-dict metadata (see the mistagged check
+        # below), and a non-dict RECORD itself, however unlikely, must not
+        # crash this loop with an AttributeError on `.get`.
+        if not isinstance(rec, dict):
+            skipped_vector_invalid += 1
+            vector_errors.append(
+                f"vector record is not a dict, got {type(rec).__name__}; skipped (Tier 1)"
+            )
+            continue
         rec_id = rec.get("id")
         if rec_id == src_anchor:
             skipped_anchor_vector += 1
@@ -646,12 +761,17 @@ def _fork_pack_inner(
         if not isinstance(rec_id, str) or rec_id not in mapping:
             skipped_vector_orphans += 1
             continue
-        meta = rec.get("metadata") or {}
-        declared = meta.get("pack_id") if isinstance(meta, dict) else None
-        if declared is not None and declared != src_pack_id:
+        meta = rec.get("metadata")
+        # design §12-2: KEY EXISTENCE, not truthiness -- the real validator's
+        # own rule is "a present pack_id of None is DIFFERENT, not absent".
+        # The `isinstance` guard is load-bearing: a non-dict metadata (str,
+        # int -- reachable via pgvector's json.loads of stored jsonb) must
+        # not raise from `"pack_id" in meta` / `meta["pack_id"]` here, this
+        # loop is still pre-reservation and nothing downstream catches it.
+        if isinstance(meta, dict) and "pack_id" in meta and meta["pack_id"] != src_pack_id:
             skipped_vector_mistagged += 1
             continue
-        problem = _vector_record_invalid(rec)
+        problem = _vector_record_invalid(rec, pack_id=src_pack_id, allow_uris=allow_uris)
         if problem:
             skipped_vector_invalid += 1
             vector_errors.append(f"vector {rec_id!r} invalid, skipped (Tier 1): {problem}")
@@ -819,58 +939,113 @@ def _fork_pack_inner(
     # step 10: fix up the mapping's anchor entry now that dst is known.
     mapping[src_anchor] = dst_anchor
 
-    def _delete_reservation() -> None:
+    def _compensate_reservation(reason: str) -> _RejectedError:
+        """Confirmed (never assumed) compensating delete of the just-reserved
+        ``creating`` row (design §12-4). Never raises -- even a failed
+        cleanup still returns a well-formed rejection, it just adds an
+        operator-inspection note instead of silently claiming success. Never
+        promises a later, unguaranteed operator action ("will age-demote").
+        """
         try:
-            delete_pack_row(sql, dst, owner_id, only_status=("creating",))
+            deleted = delete_pack_row(sql, dst, owner_id, only_status=("creating",))
         except Exception:
-            logger.warning("pack_fork: could not delete reserved pack_id=%s after a "
-                            "pre-write rejection", dst)
+            deleted = False
+        if deleted:
+            return _reject(reason)
 
-    # step 11: dst must be genuinely empty (defense in depth -- a freshly
-    # negotiated unique slug should never already have content). Design §5-2
-    # step 11 names all FOUR axes explicitly ("노드·엣지·소스·벡터가 전부
-    # 비어 있을 것") -- the vector check uses the same pack-scoped counter
-    # as §5-1 step 4 (cap=1 is enough: any count other than exactly 0, or an
-    # inability to count at all, is disqualifying here).
-    dst_vector_count = _count_pack_vectors(vector, dst, 1)
-    if (
-        graph.export_nodes_scoped([dst], 1)
-        or graph.export_edges_scoped([dst], 1)
-        or docs.list_sources_scoped([dst], 1)
-        or dst_vector_count != 0
-    ):
-        _delete_reservation()
-        raise _reject("pack registry state inconsistent after reservation")
+        requery_ok = True
+        row: dict[str, Any] | None = None
+        try:
+            row = get_pack(sql, dst)
+        except Exception:
+            requery_ok = False
 
-    # step 12: bulk identity-conflict probe over every REMAPPED id, before
-    # any writer is called -- the last point at which a rejection can still
-    # delete the reservation instead of demoting it (design §6-1: the only
-    # delete exception is this pre-writer span of §5-2).
-    for old_id in surviving_node_ids:
-        new_id = mapping[old_id]
-        record = surviving_nodes_by_id[old_id]
-        props = record["props"]
-        reason = node_identity_conflict(
-            graph, docs, vector,
-            space=props.get("space"), node_type=record["labels"][0],
-            node_id=new_id, pack_id=dst,
+        if requery_ok and row is None:
+            # Already gone -- either the delete above committed and only its
+            # return value was lost, or another actor removed it first. The
+            # goal (no reserved row left behind) is already achieved.
+            return _reject(reason)
+        if requery_ok and row is not None and row.get("owner_id") == owner_id:
+            return _reject(
+                f"{reason}; the reserved pack {dst!r} could not be cleaned up "
+                f"(observed status {row.get('status')!r}); operator inspection required"
+            )
+        # Someone else's row (should not happen for a fresh reservation, but
+        # #143 invariant 7 forbids exposing another owner's row state
+        # regardless) or the requery itself failed: one neutral message,
+        # no status, no pack_id.
+        return _reject(
+            f"{reason}; reservation cleanup could not be confirmed; operator inspection required"
         )
-        if reason:
-            _delete_reservation()
-            raise _reject(identity_reject_message("node", new_id, reason))
-    for old_id in surviving_source_ids_set:
-        new_id = mapping[old_id]
-        reason = source_identity_conflict(docs, vector, source_id=new_id, pack_id=dst)
-        if reason:
-            _delete_reservation()
-            raise _reject(identity_reject_message("source", new_id, reason))
-    anchor_reason = node_identity_conflict(
-        graph, docs, vector, space="resource", node_type="Dataset",
-        node_id=dst_anchor, pack_id=dst,
-    )
-    if anchor_reason:
-        _delete_reservation()
-        raise _reject(identity_reject_message("node", dst_anchor, anchor_reason))
+
+    # =====================================================================
+    # R1 -- steps 10 (cont'd) through 12: reservation exists, no writer has
+    # been called yet, so any rejection here -- expected (mapping collision,
+    # non-empty dst, identity conflict) or unexpected (a store raising) --
+    # compensates with a DELETE, never a demote (design §12-1). The
+    # `except _RejectedError: raise` carve-out matters: every expected
+    # rejection below already compensates itself via `_compensate_reservation`
+    # before raising, so re-catching it in the generic branch would delete
+    # twice and re-wrap `identity_reject_message`'s exact wording into
+    # "pre-write check failed: ...".
+    # =====================================================================
+    try:
+        # step 10 (cont'd): the anchor fix-up above must not have collided
+        # with any other mapping value -- design §12-3's four preflight
+        # rejections already remove every known cause, so a collision here
+        # is a bug signal, not an original-data Tier 1 loss.
+        if len(set(mapping.values())) != len(mapping):
+            raise _compensate_reservation(
+                "internal error: id mapping is not injective after anchor fix-up"
+            )
+
+        # step 11: dst must be genuinely empty (defense in depth -- a
+        # freshly negotiated unique slug should never already have
+        # content). Design §5-2 step 11 names all FOUR axes explicitly
+        # ("노드·엣지·소스·벡터가 전부 비어 있을 것") -- the vector check
+        # uses the same pack-scoped counter as §5-1 step 4 (cap=1 is
+        # enough: any count other than exactly 0, or an inability to count
+        # at all, is disqualifying here).
+        dst_vector_count = _count_pack_vectors(vector, dst, 1)
+        if (
+            graph.export_nodes_scoped([dst], 1)
+            or graph.export_edges_scoped([dst], 1)
+            or docs.list_sources_scoped([dst], 1)
+            or dst_vector_count != 0
+        ):
+            raise _compensate_reservation("pack registry state inconsistent after reservation")
+
+        # step 12: bulk identity-conflict probe over every REMAPPED id,
+        # before any writer is called -- the last point at which a
+        # rejection can still delete the reservation instead of demoting it
+        # (design §6-1: the only delete exception is this pre-writer span
+        # of §5-2, steps 10-12).
+        for old_id in surviving_node_ids:
+            new_id = mapping[old_id]
+            record = surviving_nodes_by_id[old_id]
+            props = record["props"]
+            reason = node_identity_conflict(
+                graph, docs, vector,
+                space=props.get("space"), node_type=record["labels"][0],
+                node_id=new_id, pack_id=dst,
+            )
+            if reason:
+                raise _compensate_reservation(identity_reject_message("node", new_id, reason))
+        for old_id in surviving_source_ids_set:
+            new_id = mapping[old_id]
+            reason = source_identity_conflict(docs, vector, source_id=new_id, pack_id=dst)
+            if reason:
+                raise _compensate_reservation(identity_reject_message("source", new_id, reason))
+        anchor_reason = node_identity_conflict(
+            graph, docs, vector, space="resource", node_type="Dataset",
+            node_id=dst_anchor, pack_id=dst,
+        )
+        if anchor_reason:
+            raise _compensate_reservation(identity_reject_message("node", dst_anchor, anchor_reason))
+    except _RejectedError:
+        raise
+    except Exception as exc:
+        raise _compensate_reservation(f"pre-write check failed: {exc!r}") from exc
 
     # =====================================================================
     # §5-3 writes (steps 13-17) -- NOTHING past this point deletes the
@@ -894,16 +1069,50 @@ def _fork_pack_inner(
     imported_vector_payload: list[dict[str, Any]] = []
 
     def _demote(reason: str) -> dict[str, Any]:
+        """Demote the reservation to ``partial`` and report what the demotion
+        itself could confirm about the registry row (design §12-1-2). Never
+        raises -- its own reconfirmation read is wrapped too, so every
+        caller (R2, R3, and R1's own compensation path is a SEPARATE
+        function, ``_compensate_reservation``) gets back a well-formed dict
+        no matter what the registry does underneath it.
+        """
         try:
             promoted = mark_pack_partial(sql, dst, owner_id)
         except Exception as exc:
             promoted = False
             logger.warning("pack_fork: mark_pack_partial raised for pack_id=%s: %s", dst, exc)
-        if not promoted:
+
+        if promoted:
+            registry_status_observed = "partial"
+            registry_transition_confirmed = True
+        else:
             logger.warning(
                 "pack_fork: mark_pack_partial reported no row updated for pack_id=%s "
                 "(row may have moved out of 'creating' concurrently)", dst,
             )
+            requery_ok = True
+            row: dict[str, Any] | None = None
+            try:
+                row = get_pack(sql, dst)
+            except Exception as exc:
+                requery_ok = False
+                logger.warning(
+                    "pack_fork: requery after mark_pack_partial failure raised for "
+                    "pack_id=%s: %s", dst, exc,
+                )
+            if not requery_ok:
+                registry_status_observed, registry_transition_confirmed = "unknown", False
+            elif row is None:
+                registry_status_observed, registry_transition_confirmed = "missing", False
+            elif row.get("status") == "partial":
+                # Another actor (e.g. an operator's repair_incomplete_packs
+                # age-demotion) already made the same transition.
+                registry_status_observed, registry_transition_confirmed = "partial", True
+            else:
+                observed = row.get("status")
+                registry_status_observed = observed if isinstance(observed, str) else "unknown"
+                registry_transition_confirmed = False
+
         return {
             "status": "partial",
             "pack_id": dst,
@@ -937,272 +1146,332 @@ def _fork_pack_inner(
                 "vectors": vector_errors,
             },
             "unverified_refs": unverified_refs_total,
+            # Design §12-1-2: what the registry was OBSERVED to be at the
+            # moment of this call, not a promise about what it is now -- a
+            # concurrent actor can still move it after this read. "observed"
+            # is deliberately not "actual" in the field name.
+            "registry_status_observed": registry_status_observed,
+            "registry_transition_confirmed": registry_transition_confirmed,
         }
 
-    # step 13: anchor.
-    anchor_receipt = builder.add_node(
-        space="resource", node_type="Dataset", node_id=dst_anchor,
-        properties={
-            "pack_id": dst,
-            "title": fork_title or "",
-            "description": fork_description or "",
-            "created_by": "localcrab-mcp:pack_fork",
-            "forked_from": src_pack_id,
-        },
-        pack_id=dst, pack_anchor=True,
-    )
-    if not _fork_leg_ok(anchor_receipt, "anchor"):
-        return _demote("anchor write did not confirm across all stores")
-
-    # step 14: nodes.
-    for old_id in surviving_node_ids:
-        record = surviving_nodes_by_id[old_id]
-        new_id = mapping[old_id]
-        props, unverified = remap_props(
-            record["props"], mapping, src_pack=src_pack_id, dst_pack=dst,
+    # =====================================================================
+    # R2 -- steps 13-18: the writer span. `_RejectedError` never originates
+    # here (nothing in this span raises it), but the carve-out is kept for
+    # the same reason R1 keeps it: a control-flow signal must never be
+    # reread as a write failure. Any OTHER exception -- builder/write_source
+    # raising, a store going away mid-write -- demotes to `partial` instead
+    # of leaking past this function; the already-written legs are reported
+    # via `written_*`, which live outside this try (design §12-1 R2).
+    # =====================================================================
+    try:
+        # step 13: anchor.
+        anchor_receipt = builder.add_node(
+            space="resource", node_type="Dataset", node_id=dst_anchor,
+            properties={
+                "pack_id": dst,
+                "title": fork_title or "",
+                "description": fork_description or "",
+                "created_by": "localcrab-mcp:pack_fork",
+                "forked_from": src_pack_id,
+            },
+            pack_id=dst, pack_anchor=True,
         )
-        props["id"] = new_id
-        node_type = record["labels"][0]
-        receipt = builder.add_node(
-            space=props.get("space"), node_type=node_type, node_id=new_id,
-            properties=props, pack_id=dst, origin="server", fork_copy=True,
-            write_vector=False,
-        )
-        if not _fork_leg_ok(receipt, "node"):
-            tier2_failure = f"node {old_id!r} -> {new_id!r} write failed"
-            break
-        written_nodes += 1
-        unverified_refs_total += unverified
+        if not _fork_leg_ok(anchor_receipt, "anchor"):
+            return _demote("anchor write did not confirm across all stores")
 
-    # step 15: edges (only if node writes fully succeeded).
-    if tier2_failure is None:
-        for record in surviving_edges:
-            from_id = _node_id({"props": record.get("source_props") or {}})
-            to_id = _node_id({"props": record.get("target_props") or {}})
-            new_from = mapping[from_id]
-            new_to = mapping[to_id]
-            rel_props, unverified = remap_props(
-                record.get("rel_props") or {}, mapping, src_pack=src_pack_id, dst_pack=dst,
-            )
-            # add_edge takes (from_space, to_space), NOT node types --
-            # it resolves the node type itself via internal endpoint
-            # lookup on (space, id). Using source_labels/target_labels
-            # here (node types) would send add_edge the wrong kind of
-            # string entirely and make every edge write fail as
-            # "no match", so this must mirror the same
-            # source_props["space"]/target_props["space"] extraction
-            # already used for the §5-1 step 6 validate_edge() call above.
-            from_space = (record.get("source_props") or {}).get("space")
-            to_space = (record.get("target_props") or {}).get("space")
-            receipt = builder.add_edge(
-                from_space, new_from, record["relation"],
-                to_space, new_to,
-                properties=rel_props, pack_id=dst, origin="server",
-                fork_copy=True,
-            )
-            if not _fork_leg_ok(receipt, "edge"):
-                tier2_failure = f"edge {from_id!r}->{to_id!r} write failed"
-                break
-            written_edges += 1
-            unverified_refs_total += unverified
-
-    # step 16: sources.
-    if tier2_failure is None:
-        for record in surviving_sources:
-            old_id = _source_id(record)
+        # step 14: nodes.
+        for old_id in surviving_node_ids:
+            record = surviving_nodes_by_id[old_id]
             new_id = mapping[old_id]
-            meta, unverified = remap_props(
-                record.get("metadata") or {}, mapping, src_pack=src_pack_id, dst_pack=dst,
+            props, unverified = remap_props(
+                record["props"], mapping, src_pack=src_pack_id, dst_pack=dst,
             )
-            text = record.get("text") or ""
-            if not text:
-                # design flags this as a known mongo_store.list_sources_scoped
-                # projection gap: its rows omit `text` where the SQL doc
-                # store's do not. Fall back to a direct fetch before treating
-                # this source as empty.
-                fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
-                if isinstance(fetched, dict):
-                    text = fetched.get("text") or ""
-            receipt = write_source(
-                sql, hybrid, docs, vector,
-                text=text, source_id=new_id, metadata=meta, pack_id=dst,
-                origin="server", fork_copy=True, write_vector=False,
+            props["id"] = new_id
+            node_type = record["labels"][0]
+            receipt = builder.add_node(
+                space=props.get("space"), node_type=node_type, node_id=new_id,
+                properties=props, pack_id=dst, origin="server", fork_copy=True,
+                write_vector=False,
             )
-            if not _fork_leg_ok(receipt, "source"):
-                tier2_failure = f"source {old_id!r} -> {new_id!r} write failed"
+            if not _fork_leg_ok(receipt, "node"):
+                tier2_failure = f"node {old_id!r} -> {new_id!r} write failed"
                 break
-            written_sources += 1
-            imported_source_payload.append({"source_id": old_id})
+            written_nodes += 1
             unverified_refs_total += unverified
 
-    # step 17: vectors -- one raw import_vectors batch, no re-embedding.
-    if tier2_failure is None and import_batch:
-        records = []
-        vector_meta_unverified = 0
-        for rec in import_batch:
-            new_id = mapping[rec["id"]]
-            meta, unverified = remap_vector_metadata(
-                rec.get("metadata") or {}, mapping,
-                src_pack=src_pack_id, dst_pack=dst, owner_id=owner_id,
-            )
-            vector_meta_unverified += unverified
-            new_rec = dict(rec)
-            new_rec["id"] = new_id
-            new_rec["metadata"] = meta
-            records.append(new_rec)
-        try:
-            landed_ids = vector.import_vectors(records, pack_id=dst)
-        except Exception as exc:
-            tier2_failure = f"vector import failed: {exc}"
-        else:
-            landed_set = set(landed_ids or [])
-            missing = [r["id"] for r in records if r["id"] not in landed_set]
-            if missing:
-                # H5 (§4-A predicate 3, checked here rather than by re-read):
-                # import_vectors is documented as non-atomic; a partial
-                # batch is a Tier 2 failure, not a Tier 1 loss (design
-                # §6-2, §6-1: this module does NOT attempt a compensating
-                # delete of what did land).
-                tier2_failure = f"vector import landed only {len(landed_set)}/{len(records)} records"
+        # step 15: edges (only if node writes fully succeeded).
+        if tier2_failure is None:
+            for record in surviving_edges:
+                from_id = _node_id({"props": record.get("source_props") or {}})
+                to_id = _node_id({"props": record.get("target_props") or {}})
+                new_from = mapping[from_id]
+                new_to = mapping[to_id]
+                rel_props, unverified = remap_props(
+                    record.get("rel_props") or {}, mapping, src_pack=src_pack_id, dst_pack=dst,
+                )
+                # add_edge takes (from_space, to_space), NOT node types --
+                # it resolves the node type itself via internal endpoint
+                # lookup on (space, id). Using source_labels/target_labels
+                # here (node types) would send add_edge the wrong kind of
+                # string entirely and make every edge write fail as
+                # "no match", so this must mirror the same
+                # source_props["space"]/target_props["space"] extraction
+                # already used for the §5-1 step 6 validate_edge() call above.
+                from_space = (record.get("source_props") or {}).get("space")
+                to_space = (record.get("target_props") or {}).get("space")
+                receipt = builder.add_edge(
+                    from_space, new_from, record["relation"],
+                    to_space, new_to,
+                    properties=rel_props, pack_id=dst, origin="server",
+                    fork_copy=True,
+                )
+                if not _fork_leg_ok(receipt, "edge"):
+                    tier2_failure = f"edge {from_id!r}->{to_id!r} write failed"
+                    break
+                written_edges += 1
+                unverified_refs_total += unverified
+
+        # step 16: sources.
+        if tier2_failure is None:
+            for record in surviving_sources:
+                old_id = _source_id(record)
+                new_id = mapping[old_id]
+                meta, unverified = remap_props(
+                    record.get("metadata") or {}, mapping, src_pack=src_pack_id, dst_pack=dst,
+                )
+                text = record.get("text") or ""
+                if not text:
+                    # design flags this as a known mongo_store.list_sources_scoped
+                    # projection gap: its rows omit `text` where the SQL doc
+                    # store's do not. Fall back to a direct fetch before treating
+                    # this source as empty.
+                    fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
+                    if isinstance(fetched, dict):
+                        text = fetched.get("text") or ""
+                receipt = write_source(
+                    sql, hybrid, docs, vector,
+                    text=text, source_id=new_id, metadata=meta, pack_id=dst,
+                    origin="server", fork_copy=True, write_vector=False,
+                )
+                if not _fork_leg_ok(receipt, "source"):
+                    tier2_failure = f"source {old_id!r} -> {new_id!r} write failed"
+                    break
+                written_sources += 1
+                imported_source_payload.append({"source_id": old_id})
+                unverified_refs_total += unverified
+
+        # step 17: vectors -- one raw import_vectors batch, no re-embedding.
+        if tier2_failure is None and import_batch:
+            records = []
+            vector_meta_unverified = 0
+            for rec in import_batch:
+                new_id = mapping[rec["id"]]
+                meta, unverified = remap_vector_metadata(
+                    rec.get("metadata") or {}, mapping,
+                    src_pack=src_pack_id, dst_pack=dst, owner_id=owner_id,
+                )
+                vector_meta_unverified += unverified
+                new_rec = dict(rec)
+                new_rec["id"] = new_id
+                new_rec["metadata"] = meta
+                records.append(new_rec)
+            try:
+                landed_ids = vector.import_vectors(records, pack_id=dst)
+            except Exception as exc:
+                tier2_failure = f"vector import failed: {exc}"
             else:
-                written_vectors = len(records)
-                imported_vector_payload = [{"id": r["id"]} for r in records]
-                # Only counted once the whole batch actually landed --
-                # matches the node/edge/source loops above, which likewise
-                # fold a record's own `unverified` count into the total
-                # only past its own `_fork_leg_ok` check. A batch that
-                # Tier-2-fails here is reported via `_demote()` instead,
-                # whose `unverified_refs_total` correctly excludes it: an
-                # unwritten record's residual-reference count would
-                # misdescribe content that never made it into `copied`.
-                unverified_refs_total += vector_meta_unverified
+                landed_set = set(landed_ids or [])
+                missing = [r["id"] for r in records if r["id"] not in landed_set]
+                if missing:
+                    # H5 (§4-A predicate 3, checked here rather than by re-read):
+                    # import_vectors is documented as non-atomic; a partial
+                    # batch is a Tier 2 failure, not a Tier 1 loss (design
+                    # §6-2, §6-1: this module does NOT attempt a compensating
+                    # delete of what did land).
+                    tier2_failure = f"vector import landed only {len(landed_set)}/{len(records)} records"
+                else:
+                    written_vectors = len(records)
+                    imported_vector_payload = [{"id": r["id"]} for r in records]
+                    # Only counted once the whole batch actually landed --
+                    # matches the node/edge/source loops above, which likewise
+                    # fold a record's own `unverified` count into the total
+                    # only past its own `_fork_leg_ok` check. A batch that
+                    # Tier-2-fails here is reported via `_demote()` instead,
+                    # whose `unverified_refs_total` correctly excludes it: an
+                    # unwritten record's residual-reference count would
+                    # misdescribe content that never made it into `copied`.
+                    unverified_refs_total += vector_meta_unverified
 
-    # step 18: H4 post-write verification (design §5-4 step 18, §4-A
-    # predicates 1-2) -- re-read the copy just written and confirm no
-    # source-space id or literal src_pack string survived in a
-    # REFERENCE_KEYS/pack_id position. A hit here is OUR write attempt
-    # failing to do what it claimed, not an original-data defect -- Tier 2.
-    if tier2_failure is None:
-        leaked = _h4_verify(
-            graph, docs, vector,
-            dst=dst, mapping=mapping,
-            written_nodes=written_nodes, written_edges=written_edges,
-            written_sources=written_sources, written_vectors=written_vectors,
-            src_pack_id=src_pack_id,
-        )
-        if leaked:
-            tier2_failure = f"H4 post-write verification found leaked references: {leaked[:5]}"
+        # step 18: H4 post-write verification (design §5-4 step 18, §4-A
+        # predicates 1-2) -- re-read the copy just written and confirm no
+        # source-space id or literal src_pack string survived in a
+        # REFERENCE_KEYS/pack_id position. A hit here is OUR write attempt
+        # failing to do what it claimed, not an original-data defect -- Tier 2.
+        if tier2_failure is None:
+            leaked = _h4_verify(
+                graph, docs, vector,
+                dst=dst, mapping=mapping,
+                written_nodes=written_nodes, written_edges=written_edges,
+                written_sources=written_sources, written_vectors=written_vectors,
+                src_pack_id=src_pack_id,
+            )
+            if leaked:
+                tier2_failure = f"H4 post-write verification found leaked references: {leaked[:5]}"
 
-    if tier2_failure is not None:
-        return _demote(tier2_failure)
+        if tier2_failure is not None:
+            return _demote(tier2_failure)
+    except _RejectedError:
+        raise
+    except Exception as exc:
+        return _demote(f"write phase raised: {exc!r}")
 
     # =====================================================================
-    # §5-4 verdict (steps 18-20)
+    # R3 -- steps 18b-20: the verdict span. `mark_pack_ready` returning
+    # False or raising does NOT immediately demote -- it commits inside its
+    # own transaction (ownership.py's `with sql._engine.begin()`), so either
+    # signal can mean "committed, only the response was lost" just as easily
+    # as "never committed". A fresh registry read decides which one actually
+    # happened, and that read is itself wrapped: a raise here means the SAME
+    # broken `sql` handle that just made `mark_pack_ready` raise, so it is
+    # folded into "could not confirm" rather than left to escape (design
+    # §12-1 R3). `_demote` never raises, so every return out of this except
+    # clause is well-formed.
     # =====================================================================
-    # step 18b: residual sources-without-vectors report (fork_remap's own
-    # helper, comparing the copied-source id set against the imported-vector
-    # id set -- both already expressed in dst-space ids).
-    sources_survivor_ids = surviving_source_ids(imported_source_payload, mapping)
-    vectors_survivor_ids = {p["id"] for p in imported_vector_payload}
-    sources_without_vectors = sorted(sources_survivor_ids - vectors_survivor_ids)
+    try:
+        # step 18b: residual sources-without-vectors report (fork_remap's own
+        # helper, comparing the copied-source id set against the imported-vector
+        # id set -- both already expressed in dst-space ids).
+        sources_survivor_ids = surviving_source_ids(imported_source_payload, mapping)
+        vectors_survivor_ids = {p["id"] for p in imported_vector_payload}
+        sources_without_vectors = sorted(sources_survivor_ids - vectors_survivor_ids)
 
-    finalized = mark_pack_ready(sql, dst, owner_id)
-    if not finalized:
-        logger.warning(
-            "pack_fork: mark_pack_ready reported no row updated for pack_id=%s "
-            "(row may have moved out of 'creating' concurrently)", dst,
-        )
-        return _demote("could not promote to ready after a fully successful write phase")
-
-    return {
-        "status": "ok",
-        "pack_id": dst,
-        "forked_from": src_pack_id,
-        "visibility": "private",
-        "copied": {
-            "nodes": written_nodes,
-            "edges": written_edges,
-            "sources": written_sources,
-            "vectors": written_vectors,
-        },
-        "skipped": {
-            "nodes_alias_conflict": skipped_alias_nodes,
-            "edges_alias_conflict": skipped_alias_edges,
-            "sources_alias_conflict": skipped_alias_sources,
-            "anchor_vector": skipped_anchor_vector,
-            "vector_orphans": skipped_vector_orphans,
-            "vector_mistagged": skipped_vector_mistagged,
-            "vector_invalid": skipped_vector_invalid,
-            "vector_batch_invalid": skipped_vector_batch_invalid,
-            "sources_without_vectors": sources_without_vectors,
-        },
-        "errors": {
-            "nodes": node_errors,
-            "edges": edge_errors,
-            "sources": source_errors,
-            "vectors": vector_errors,
-        },
-        "unverified_refs": unverified_refs_total,
-    }
-
-
-def _vector_record_invalid(record: dict[str, Any]) -> str | None:
-    """This module's own mirror of a subset of
-    ``opencrab.stores._vector_base.validate_import_records``'s per-record
-    checks, run BEFORE any record is ever handed to ``import_vectors`` --
-    design §5-1 step 6b's 2-pass batch-decomposition algorithm exists so a
-    single already-broken exported record (Tier 1: it was broken before
-    this call ever touched it) cannot raise inside ``import_vectors`` and
-    abort the WHOLE batch, which would turn every other, perfectly good
-    record in that batch into a Tier 2 failure it does not deserve.
-
-    Only the checks that are meaningful for ONE record in isolation are
-    reproduced here (id shape, embedding shape/finiteness, document type,
-    metadata type/key shape); nothing here allows a record through that
-    ``import_vectors`` would reject as a hard error for its OWN independent
-    per-record reasons.
-
-    TWO checks ``validate_import_records`` also performs are deliberately
-    ABSENT from this function, because neither is decidable from a single
-    record: duplicate ``id`` WITHIN the batch, and dimensional uniformity
-    ACROSS the batch. These are not skipped -- they are handled by a
-    SEPARATE, explicit 2-pass step (design §5-1-6b) that this function's
-    caller runs immediately after filtering every candidate record through
-    this function: pass 1 walks the already-per-record-filtered batch in
-    ``export_pack_vectors`` order, keeping the first occurrence of a
-    duplicate id and dropping the rest, and establishing the reference
-    dimension from the first surviving record (dropping any later record
-    whose dimension disagrees); pass 2 re-runs the REAL
-    ``validate_import_records`` over the survivors to confirm the
-    decomposition actually worked. Both pass-1 drops are Tier 1, counted
-    under ``skipped.vector_batch_invalid`` -- NOT deferred to
-    ``import_vectors`` at step 17 the way they used to be, which is what
-    let a single duplicate/mismatched record raise inside the real batch
-    import and get misclassified Tier 2 by the generic `except Exception`
-    there, demoting an otherwise-successful, already-reserved fork to
-    `partial` over an original-data defect that was never our own write
-    failing.
-    """
-    if "id" not in record or not isinstance(record.get("id"), str) or not record["id"]:
-        return "missing/invalid id"
-    embedding = record.get("embedding")
-    if not isinstance(embedding, (list, tuple)) or not embedding:
-        return "missing/empty embedding"
-    for component in embedding:
-        if isinstance(component, bool) or not isinstance(component, (int, float)):
-            return "embedding contains a non-numeric component"
+        # step 19: promote to ready.
         try:
-            import struct
+            finalized = mark_pack_ready(sql, dst, owner_id)
+        except Exception as exc:
+            finalized = False
+            logger.warning("pack_fork: mark_pack_ready raised for pack_id=%s: %s", dst, exc)
 
-            struct.pack("f", float(component))
-        except (OverflowError, ValueError):
-            return "embedding contains a non-float32-representable component"
-    document = record.get("document")
-    if document is not None and not isinstance(document, str):
-        return "document must be str or None"
-    metadata = record.get("metadata")
-    if metadata is not None and not isinstance(metadata, dict):
-        return "metadata must be a dict"
-    if isinstance(metadata, dict) and any(not isinstance(k, str) for k in metadata):
-        return "metadata has a non-str key"
+        if not finalized:
+            logger.warning(
+                "pack_fork: mark_pack_ready reported no row updated for pack_id=%s "
+                "(row may have moved out of 'creating' concurrently)", dst,
+            )
+            requery_ok = True
+            requery: dict[str, Any] | None = None
+            try:
+                requery = get_pack(sql, dst)
+            except Exception as exc:
+                requery_ok = False
+                logger.warning(
+                    "pack_fork: requery after mark_pack_ready failure raised for "
+                    "pack_id=%s: %s", dst, exc,
+                )
+            if not (requery_ok and requery is not None and requery.get("status") == "ready"):
+                return _demote("could not promote to ready after a fully successful write phase")
+            # else: the write DID commit and only the response was lost --
+            # fall through to the normal "ok" response below.
+
+        return {
+            "status": "ok",
+            "pack_id": dst,
+            "forked_from": src_pack_id,
+            "visibility": "private",
+            "copied": {
+                "nodes": written_nodes,
+                "edges": written_edges,
+                "sources": written_sources,
+                "vectors": written_vectors,
+            },
+            "skipped": {
+                "nodes_alias_conflict": skipped_alias_nodes,
+                "edges_alias_conflict": skipped_alias_edges,
+                "sources_alias_conflict": skipped_alias_sources,
+                "anchor_vector": skipped_anchor_vector,
+                "vector_orphans": skipped_vector_orphans,
+                "vector_mistagged": skipped_vector_mistagged,
+                "vector_invalid": skipped_vector_invalid,
+                "vector_batch_invalid": skipped_vector_batch_invalid,
+                "sources_without_vectors": sources_without_vectors,
+            },
+            "errors": {
+                "nodes": node_errors,
+                "edges": edge_errors,
+                "sources": source_errors,
+                "vectors": vector_errors,
+            },
+            "unverified_refs": unverified_refs_total,
+            "registry_status_observed": "ready",
+            "registry_transition_confirmed": True,
+        }
+    except _RejectedError:
+        raise
+    except Exception as exc:
+        return _demote(f"verdict phase raised: {exc!r}")
+
+
+def _vector_record_invalid(record: dict[str, Any], *, pack_id: str, allow_uris: bool) -> str | None:
+    """Per-record validity pre-check, run BEFORE any record is ever handed
+    to ``import_vectors`` -- design §5-1 step 6b's 2-pass batch-decomposition
+    algorithm exists so a single already-broken exported record (Tier 1: it
+    was broken before this call ever touched it) cannot raise inside
+    ``import_vectors`` and abort the WHOLE batch, which would turn every
+    other, perfectly good record in that batch into a Tier 2 failure it does
+    not deserve.
+
+    A THIN WRAPPER (design §12-2) over the real per-record validator,
+    ``opencrab.stores._vector_base.validate_import_records`` -- not a
+    hand-written mirror of its rules. A hand mirror re-diverges from the
+    real validator every time the real one gains a check (this module's
+    previous mirror missed unknown metadata keys and let
+    ``struct.pack("f", 1e40)``'s silent saturation to ``inf`` through, both
+    of which the real validator catches). ``pack_id=pack_id`` -- the caller
+    passes ``src_pack_id``, since at this point in preflight every surviving
+    record's metadata ``pack_id`` is still absent-or-source (anything else
+    was already dropped as ``vector_mistagged`` upstream of this call).
+    ``allow_uris`` mirrors what THIS backend's own ``import_vectors`` will
+    actually pass at step 17 (chroma: True; everything else: False) -- see
+    the caller.
+
+    The four exceptions caught below are exactly the ones a single record's
+    OWN shape can trigger in the real validator: a shape violation is
+    reported as ``ValueError``; ``sorted(unknown)`` over mixed-type keys
+    raises ``TypeError``; ``len(embedding)`` over a huge ``Sequence`` (e.g.
+    ``range(sys.maxsize + 1)``) can raise ``OverflowError``; formatting a
+    deeply-nested value into an error message can raise ``RecursionError``.
+    All four mean "this record's data is malformed" -- Tier 1.
+
+    Anything ELSE (``MemoryError``, a ``RuntimeError`` from a validator
+    regression, ...) is NOT a data defect -- it is the environment or the
+    validator itself breaking -- so it is not folded into a per-record Tier
+    1 skip. It escalates to a pre-reservation whole-fork rejection instead
+    (raised as ``_RejectedError``, caught by ``fork_pack``): the
+    completeness floor exists to absorb systematic original-data loss, not
+    to quietly swallow a sporadic internal failure one record at a time.
+
+    TWO checks the real validator also performs are deliberately not run
+    per-record here, because neither is decidable from a single record:
+    duplicate ``id`` WITHIN the batch, and dimensional uniformity ACROSS the
+    batch. These are handled by a SEPARATE, explicit 2-pass step (design
+    §5-1-6b) that runs immediately after this function's caller filters
+    every candidate record through it: pass 1 walks the already-filtered
+    batch in ``export_pack_vectors`` order, keeping the first occurrence of
+    a duplicate id and dropping the rest, and establishing the reference
+    dimension from the first surviving record (dropping any later record
+    whose dimension disagrees); pass 2 re-runs the real validator over the
+    survivors to confirm the decomposition actually worked. Both pass-1
+    drops are Tier 1, counted under ``skipped.vector_batch_invalid`` -- NOT
+    deferred to ``import_vectors`` at step 17 the way they used to be, which
+    is what let a single duplicate/mismatched record raise inside the real
+    batch import and get misclassified Tier 2 by the generic
+    ``except Exception`` there, demoting an otherwise-successful,
+    already-reserved fork to ``partial`` over an original-data defect that
+    was never our own write failing.
+    """
+    try:
+        validate_import_records([record], pack_id=pack_id, allow_uris=allow_uris)
+    except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+        return str(exc)
+    except Exception as exc:
+        raise _reject(f"internal error: vector record validation raised {exc!r}") from exc
     return None
