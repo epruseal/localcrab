@@ -2071,13 +2071,20 @@ def _count_nodes(stack, pack_id: str) -> int:
 
 
 def _node_snapshot(stack, pack_id: str):
-    """Value-level snapshot of a pack's nodes, order-independent -- for
-    asserting a rejected fork left the SOURCE byte-identical, not merely the
-    same size."""
-    return sorted(
+    """Value-level snapshot of a pack's nodes AND edges, order-independent --
+    for asserting a rejected fork left the SOURCE byte-identical, not merely
+    the same size. Edges are included because the rejection path's whole
+    claim is that it declines to create rather than removing anything, and
+    the edge hanging off the offending node is exactly what a
+    delete-on-reject defect would take with it."""
+    nodes = sorted(
         (n["props"]["id"], repr(sorted(n["props"].items())), repr(n.get("labels")))
         for n in stack["graph"].export_nodes_scoped([pack_id], 500)
     )
+    edges = sorted(
+        repr(sorted(e.items())) for e in stack["graph"].export_edges_scoped([pack_id], 500)
+    )
+    return nodes, edges
 
 
 class TestRemappedIdLengthRejection:
@@ -2390,3 +2397,24 @@ class TestRemappedIdLengthRejection:
         assert len(named) == 1, out["error"][:200]
         assert len(named[0]) + _REMAP_GROWTH > _PACK_ID_COLUMN_LIMIT
         assert _forked_row_count(stack, src) == 0
+
+    def test_t86_column_limit_constant_matches_the_registry_schema(self):
+        """T86: `_PACK_ID_COLUMN_LIMIT` is the number the whole length
+        contract is measured against, and every other row derives its inputs
+        and expectations from it -- so a mutation to the constant itself
+        moves all of them together and none of them notices. This row is the
+        one place the constant is tied to something outside fork.py: the
+        registry DDL that actually enforces it. Reverse-mutation:
+        `_PACK_ID_COLUMN_LIMIT` was changed to 300 -- every other row still
+        passed (their arithmetic stayed self-consistent) and only this
+        assertion failed."""
+        import re
+
+        from opencrab.stores.sql_store import _TABLES_SQL
+
+        ddl = "\n".join(_TABLES_SQL)
+        widths = {
+            int(w) for w in re.findall(r"\b(?:node_id|from_id|to_id)\s+VARCHAR\((\d+)\)", ddl)
+        }
+        assert widths, "registry DDL no longer declares VARCHAR ids; the length contract needs revisiting"
+        assert widths == {_PACK_ID_COLUMN_LIMIT}, (widths, _PACK_ID_COLUMN_LIMIT)
