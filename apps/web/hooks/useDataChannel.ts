@@ -47,26 +47,49 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
   // Separate from dataControllersRef: query/ingest/pack-visibility actions
   // (#149 F1), not the polled data channel. Kept apart so a mutation
   // success (notifyMutationSuccess) never aborts an in-flight *action* --
-  // only the epoch-rising path below aborts both sets together.
+  // only the epoch-raising paths (abortInFlight below) abort both sets
+  // together.
   const actionControllersRef = useRef<Set<AbortController>>(new Set())
   const healthInFlightRef = useRef(false)
 
   useEffect(() => { authStateRef.current = authState }, [authState])
+
+  // v3.3: shared by both epoch-raising paths -- the activeToken-change
+  // effect below and markInvalid. Raising the epoch orphans every
+  // in-flight request, data rounds and actions alike, so both controller
+  // sets are aborted and cleared together. Safe to call from the bundle
+  // processor's own verdict path: fetchData removes its controllers from
+  // the set *before* judging the bundle, so a markInvalid triggered by a
+  // 401 verdict never aborts the round that produced it.
+  // notifyMutationSuccess is NOT an epoch-raising path and deliberately
+  // aborts only the data set (F1): killing actions there would abort an
+  // unrelated in-flight POST/query that has nothing to do with the change
+  // that just succeeded.
+  const abortInFlight = useCallback(() => {
+    dataControllersRef.current.forEach(c => c.abort())
+    dataControllersRef.current.clear()
+    actionControllersRef.current.forEach(c => c.abort())
+    actionControllersRef.current.clear()
+  }, [])
 
   // 401 judged (design 3.4's "401 판정" row, reused by both the bundle
   // processor below and RightPanel's onUnauthorized for query/ingest).
   // graphLoadedAt is deliberately left untouched here -- it is tied to
   // identity (activeToken), not to auth validity (design 3.2), so it is
   // only ever cleared by the activeToken-change effect below.
+  // inFlightRoundRef is deliberately NOT reset here: only the token-change
+  // effect owns that null assignment; the in-flight round it refers to
+  // releases the lock itself (or the §3.7 ownership check skips it).
   const markInvalid = useCallback(() => {
     authEpochRef.current += 1
+    abortInFlight()
     setAuthState('invalid')
     setNodes([])
     setEdges([])
     setPacks([])
     setGraphError(null)
     setPackError(null)
-  }, [])
+  }, [abortInFlight])
 
   // §3.4 "activeToken 변경" rows, folded together with the "하이드레이션(1회)"
   // rows: from this hook's point of view both are just (activeToken,
@@ -77,16 +100,10 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
   useEffect(() => {
     if (!hydrated) return
     authEpochRef.current += 1
-    dataControllersRef.current.forEach(c => c.abort())
-    dataControllersRef.current.clear()
-    // §3.7/F1: identity changing aborts in-flight actions too, not just the
-    // polled data channel -- a query/ingest/visibility change made under an
-    // identity that just moved on has nothing valid to land. markInvalid and
-    // notifyMutationSuccess deliberately do NOT touch this set (design-fix-v3.1
-    // F1): killing actions on those paths would abort an unrelated in-flight
-    // POST/query that has nothing to do with the change that just succeeded.
-    actionControllersRef.current.forEach(c => c.abort())
-    actionControllersRef.current.clear()
+    // §3.7/F1/v3.3: identity changing orphans in-flight data rounds and
+    // actions alike -- abort both sets, shared with markInvalid (the other
+    // epoch-raising path).
+    abortInFlight()
     inFlightRoundRef.current = null
     setNodes([])
     setEdges([])
