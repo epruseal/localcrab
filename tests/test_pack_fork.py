@@ -2070,6 +2070,16 @@ def _count_nodes(stack, pack_id: str) -> int:
     return len(stack["graph"].export_nodes_scoped([pack_id], 500))
 
 
+def _node_snapshot(stack, pack_id: str):
+    """Value-level snapshot of a pack's nodes, order-independent -- for
+    asserting a rejected fork left the SOURCE byte-identical, not merely the
+    same size."""
+    return sorted(
+        (n["props"]["id"], repr(sorted(n["props"].items())), repr(n.get("labels")))
+        for n in stack["graph"].export_nodes_scoped([pack_id], 500)
+    )
+
+
 class TestRemappedIdLengthRejection:
     def test_t75_over_limit_node_rejects_whole_fork_leaving_nothing(self, stack):
         """T75 (design §13-8-1, §13-9-3): ONE node whose id the remap would
@@ -2091,7 +2101,7 @@ class TestRemappedIdLengthRejection:
                 "resource", long_id, "cites", "resource", f"{src}-n0", pack_id=src,
             )
 
-        before = _count_nodes(stack, src)
+        before = _node_snapshot(stack, src)
         out = _fork(stack, principal=ALICE, src_pack_id=src)
 
         assert "error" in out, out
@@ -2100,8 +2110,9 @@ class TestRemappedIdLengthRejection:
         assert _forked_row_count(stack, src) == 0, out
         # The source is not touched: rejection declines to create, it does
         # not remove. The design's earlier draft wrongly claimed the source
-        # edge "does not survive anywhere" -- it does.
-        assert _count_nodes(stack, src) == before
+        # edge "does not survive anywhere" -- it does. Compared by VALUE, not
+        # just by count, so a mutation that rewrites a node in place is caught.
+        assert _node_snapshot(stack, src) == before
 
     def test_t76_boundary_at_limit_passes_one_over_rejects(self, stack):
         """T76 (design §13-9-3): the comparison is `>`, not `>=`. A node id
@@ -2121,6 +2132,11 @@ class TestRemappedIdLengthRejection:
         assert copied, out_ok
         assert max(len(n) for n in copied) <= _PACK_ID_COLUMN_LIMIT, (
             sorted((len(n), n) for n in copied)[-1]
+        )
+        # The at-limit id must actually be PRESENT, not quietly dropped --
+        # "nothing exceeds the limit" alone is satisfiable by copying nothing.
+        assert any(len(n) == _PACK_ID_COLUMN_LIMIT for n in copied), sorted(
+            len(n) for n in copied
         )
 
         src_bad = _seed_pack(stack, ALICE, "src-t76b", node_count=1, with_edge=False,
@@ -2154,11 +2170,14 @@ class TestRemappedIdLengthRejection:
         """T78 (design §13-3, §13-9-3): the behavioural end of contract 1.
         A slug at EXACTLY the budget that then collides gets
         `begin_pack_creation`'s 9-char suffix, and the anchor node built from
-        the result must still fit the column. The requested length is derived
-        from `_PACK_ID_BUDGET` so that a mutation to the budget moves this
-        test's input with it. Reverse-mutation: `_PACK_ID_BUDGET` lost its
-        `_ANCHOR_PREFIX_LEN` term -- the negotiated pack_id became 256 chars
-        and its anchor 264, failing the assertion below."""
+        the result must land on EXACTLY the column limit. The equality is the
+        point: `<=` would only catch a budget that grew, while both reviewers
+        noted that a budget derived into the test's own inputs cannot catch a
+        budget that SHRANK. Anchor length is independent of that derivation --
+        an over-conservative 238 produces a 255-char anchor and fails here
+        just as a too-loose 240 produces 257. Reverse-mutation: `_PACK_ID_BUDGET`
+        lost its `_ANCHOR_PREFIX_LEN` term -- the negotiated pack_id became 256
+        chars and its anchor 264, failing the assertion below."""
         src = _seed_pack(stack, ALICE, "src-t78", node_count=1, with_edge=False,
                          with_source=False)
         taken = "t" * _PACK_ID_BUDGET
@@ -2170,7 +2189,7 @@ class TestRemappedIdLengthRejection:
         out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=taken)
         assert out["status"] == "ok", out
         assert out["pack_id"] != taken, "the collision must have been negotiated"
-        assert len(anchor_node_id(out["pack_id"])) <= _PACK_ID_COLUMN_LIMIT, (
+        assert len(anchor_node_id(out["pack_id"])) == _PACK_ID_COLUMN_LIMIT, (
             out["pack_id"], len(anchor_node_id(out["pack_id"])),
         )
 
@@ -2340,17 +2359,32 @@ class TestRemappedIdLengthRejection:
         """T85 (design §13-9-3): with SEVERAL over-limit nodes the fork is
         still rejected and the id named in the reason is genuinely one of
         them -- not, say, a truncated or wrongly-indexed value from an
-        implementation that only inspects the first record. Reverse-mutation:
-        the check was written to inspect only the first exported node --
-        whichever over-limit node `export_nodes_scoped` happened to return
-        later went unnoticed, and on the orderings where a legal node came
-        first the fork succeeded, failing the `error` assertion."""
+        implementation that only inspects the first record. The export order
+        is PINNED here rather than left to the store: `export_nodes_scoped`'s
+        SQL has no `ORDER BY`, so without this a "checks only the first node"
+        implementation could pass or fail by query plan. Legal nodes are
+        forced to the front, which is the ordering that lets such an
+        implementation slip through. Reverse-mutation: the check was written
+        to inspect only the first exported node -- with legal nodes first it
+        saw nothing wrong, the fork succeeded, and the `error` assertion
+        failed."""
         src = _seed_pack(stack, ALICE, "src-t85", node_count=3, with_source=False)
         over = ["M" * _ID_OVER_LIMIT, "N" * (_ID_OVER_LIMIT + 7), "O" * (_ID_OVER_LIMIT + 20)]
         for node_id in over:
             _add_node(stack, src, node_id)
 
-        out = _fork(stack, principal=ALICE, src_pack_id=src)
+        real_export = stack["graph"].export_nodes_scoped
+
+        def ordered_export(*a, **kw):
+            rows = real_export(*a, **kw)
+            return sorted(rows, key=lambda n: len(n["props"].get("id") or ""))
+
+        try:
+            stack["graph"].export_nodes_scoped = ordered_export
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+        finally:
+            stack["graph"].export_nodes_scoped = real_export
+
         assert "error" in out, out
         named = [node_id for node_id in over if node_id in out["error"]]
         assert len(named) == 1, out["error"][:200]

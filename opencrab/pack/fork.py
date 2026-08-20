@@ -403,19 +403,24 @@ def _reject(message: str, *, hint: str | None = None) -> _RejectedError:
     return _RejectedError(resp)
 
 
-def _declared_limit_reject(detail: str) -> _RejectedError:
+def _declared_limit_reject(detail: str, *, remedy: str = "rename/remove the conflicting id") -> _RejectedError:
     """A #197-declared-limit preflight rejection (design §12-3): every shape
     this covers is one the store itself already accepts on a normal write
     path -- it is only FORKING that cannot be made safe for it yet, because
     identity is not pack-scoped (#197) and the copy would either collide
     with the destination anchor or lose data non-deterministically. Says so
     explicitly rather than reading like the source data itself is broken.
+
+    ``remedy`` names the action that actually clears the rejection. It
+    defaults to the identity-collision wording every caller but one wants;
+    the length branch overrides it because nothing is *colliding* there and
+    "rename the conflicting id" would send the caller looking for a clash
+    that does not exist.
     """
     return _reject(
         f"{detail}; this shape is supported by the store but cannot be "
         "forked until issue #197 (identity is not pack-scoped) is resolved "
-        "-- fix the source data (rename/remove the conflicting id) or wait "
-        "for #197",
+        f"-- fix the source data ({remedy}) or wait for #197",
     )
 
 
@@ -649,7 +654,8 @@ def _fork_pack_inner(
             raise _declared_limit_reject(
                 f"node {node_id!r} is {len(node_id)} characters and the fork "
                 f"id remap would make it {remapped_len}, past the registry's "
-                f"{_PACK_ID_COLUMN_LIMIT}-character node_id limit"
+                f"{_PACK_ID_COLUMN_LIMIT}-character node_id limit",
+                remedy="shorten the id so it still fits once the remap suffix is appended",
             )
         surviving_nodes_by_id[node_id] = record
         surviving_node_ids.add(node_id)
