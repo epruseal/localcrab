@@ -1699,6 +1699,18 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
         if not src.is_file():
             continue
         dst = dest_dir / name
+        # Guard symlink escape for core files as well (issue #212 follow-up):
+        # a dangling symlink like <backup>/opencrab.db -> /outside/file
+        # makes dst.exists() false while sqlite3.connect() still follows it.
+        if dst.is_symlink() or not dst.resolve().is_relative_to(dest_dir.resolve()):
+            print(
+                f"! backup target escapes backup directory: {dst} -> "
+                f"{dst.resolve()} is outside {dest_dir.resolve()}"
+                if not dst.resolve().is_relative_to(dest_dir.resolve())
+                else f"! backup target is a symlink, refusing to overwrite: {dst}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         if dst.exists():
             print(f"! backup target already exists, refusing to overwrite: {dst}", file=sys.stderr)
             raise SystemExit(2)
@@ -1751,6 +1763,21 @@ def _backup_sqlite_files(local_data_dir: str, backup_to: str, settings: Any) -> 
                 # guard below correctly refuses to overwrite.
                 vec_rel = Path("external-vector") / vec_rel.name
             vec_dst = dest_dir / vec_rel
+            # Guard symlink escape: vec_dst must resolve inside dest_dir (issue #212).
+            # `resolve()` follows symlinks for existing parents; without this, a
+            # pre-existing symlink like `<backup>/shards -> /outside` makes
+            # `dest_dir / "shards/vectors.db"` escape the backup dir while still
+            # reporting success. Also reject any file-level symlink to avoid
+            # reporting a symlink path as a successful backup.
+            if vec_dst.is_symlink() or not vec_dst.resolve().is_relative_to(dest_dir.resolve()):
+                print(
+                    f"! backup target escapes backup directory: {vec_dst} -> "
+                    f"{vec_dst.resolve()} is outside {dest_dir.resolve()}"
+                    if not vec_dst.resolve().is_relative_to(dest_dir.resolve())
+                    else f"! backup target is a symlink, refusing to overwrite: {vec_dst}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
             existing_dst = copied_backups.get(vec_src.resolve())
             if existing_dst is not None:
                 # Same file, already copied above -- reuse that backup rather
