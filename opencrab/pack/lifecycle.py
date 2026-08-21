@@ -673,9 +673,6 @@ def repair_missing_anchors(
     Returns ``{"checked": N, "already_present": N, "created": N, "skipped": N,
     "failed": N, "rows": [...]}``. ``apply=False`` is dry-run.
     """
-    from opencrab.pack.ownership import get_pack, list_packs_for
-    from opencrab.auth import Principal
-
     # Determine candidate pack_ids: either explicit list or all ready packs
     # visible to any owner (operator view). Use direct SQL for operator view
     # to avoid needing a principal.
@@ -710,19 +707,23 @@ def repair_missing_anchors(
             )
             continue
 
-        # Need to create
+        # Need to create — use ensure_anchor dry-run for consistent validation
+        # (ensures nonexistent / non-ready packs are reported as skipped, not
+        # would_create, matching the apply path's checks).
         if not apply:
-            counts["skipped"] += 1  # dry-run counts as skipped in terms of writes, but report would_create
-            # Re-use ensure_anchor dry-run for consistent reporting
-            pack = get_pack(sql, pid)
-            rows_out.append(
-                {
-                    "pack_id": pid,
-                    "action": "would_create",
-                    "probes": probes,
-                    "title": (pack.get("title") if pack else pid) if pack else pid,
-                }
+            result = ensure_anchor(
+                sql, builder, graph, docs, vector, pid, apply=False
             )
+            action = result.get("action")
+            if action == "would_create":
+                counts["skipped"] += 1
+            elif action == "already_present":
+                counts["already_present"] += 1
+            elif action == "failed":
+                counts["failed"] += 1
+            else:
+                counts["skipped"] += 1
+            rows_out.append(result)
             continue
 
         if builder is None:

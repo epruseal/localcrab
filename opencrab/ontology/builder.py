@@ -218,7 +218,7 @@ class OntologyBuilder:
         # read and has to be reconciled by hand later. Returned as a receipt
         # rather than raised so the #158 contract ("callers read the receipt")
         # keeps holding.
-        if not self._neo4j.available:
+        if self._neo4j is None or not self._neo4j.available:
             output["stores"] = {
                 "graph": "unavailable",
                 "docs": "skipped (graph unavailable)",
@@ -228,7 +228,7 @@ class OntologyBuilder:
             return output
 
         # --- Neo4j write ---
-        if self._neo4j.available:
+        if self._neo4j is not None and self._neo4j.available:
             try:
                 node_props = self._neo4j.upsert_node(
                     node_type=node_type,
@@ -245,7 +245,7 @@ class OntologyBuilder:
             output["stores"]["graph"] = "unavailable"
 
         # --- MongoDB write ---
-        if self._mongo.available:
+        if self._mongo is not None and self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
                 # store_write_succeeded() (below in this module) only
@@ -267,7 +267,7 @@ class OntologyBuilder:
             output["stores"]["docs"] = "unavailable"
 
         # --- PostgreSQL registry write ---
-        if self._sql.available:
+        if self._sql is not None and self._sql.available:
             try:
                 self._sql.register_node(space, node_type, node_id)
                 output["stores"]["sql"] = "ok"
@@ -390,7 +390,7 @@ class OntologyBuilder:
 
         # See add_node: graph down means the whole write is refused, not
         # fanned out to the optional stores (#146 follow-up).
-        if not self._neo4j.available:
+        if self._neo4j is None or not self._neo4j.available:
             output["stores"] = {
                 "graph": "unavailable",
                 "docs": "skipped (graph unavailable)",
@@ -419,8 +419,10 @@ class OntologyBuilder:
         # lookup_node_type: an unavailable store cannot tell "node absent" from
         # "store down", and it writes nothing anyway, so no wrong-typed row can
         # be created. In that case the space default is kept as before.
-        lookup = getattr(self._neo4j, "lookup_node_type", None)
-        if lookup is not None and self._neo4j.available:
+        lookup = (
+            getattr(self._neo4j, "lookup_node_type", None) if self._neo4j is not None else None
+        )
+        if lookup is not None and self._neo4j is not None and self._neo4j.available:
             from_type = lookup(from_id)
             to_type = lookup(to_id)
             missing = [
@@ -479,7 +481,7 @@ class OntologyBuilder:
             )
             output["stores"]["graph"] = f"no match (missing node: {', '.join(missing)})"
             output["missing_nodes"] = missing
-        elif self._neo4j.available:
+        elif self._neo4j is not None and self._neo4j.available:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
@@ -494,7 +496,7 @@ class OntologyBuilder:
         # up listing an edge the graph does not hold.
         if missing:
             output["stores"]["sql"] = "skipped (missing node)"
-        elif self._sql.available:
+        elif self._sql is not None and self._sql.available:
             try:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)
                 output["stores"]["sql"] = "ok"

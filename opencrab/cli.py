@@ -355,8 +355,13 @@ def status() -> None:
     storage_loc = cfg.local_data_dir
     console.print(f"\n{mode_label} - storage at: {storage_loc}\n")
 
-    stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
-    graph, vector, docs, sql = stores.graph, stores.vector, stores.doc, stores.sql
+    # Use _optional_store for vector/docs so a single optional-store
+    # construction failure (e.g., embedding backend mismatch) does not hide
+    # the health of graph/sql (sibling to repair-anchors P2).
+    sql = _make_stores(cfg, sql=True).sql
+    graph = _optional_store(cfg, "graph")
+    vector = _optional_store(cfg, "vector")
+    docs = _optional_store(cfg, "doc")
 
     # VECTOR_BACKEND 가 조건부 기본값(vector_backend_resolved)을 가지므로 라벨/경로도
     # 하드코딩 대신 실제 선택된 백엔드를 반영한다.
@@ -380,7 +385,7 @@ def status() -> None:
     table.add_column("Status")
 
     for name, url, store in store_rows:
-        if store.available:
+        if store is not None and store.available:
             try:
                 ok = store.ping()
                 status_text = "[green]OK[/green]" if ok else "[yellow]CONNECTED (ping failed)[/yellow]"
@@ -498,6 +503,17 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             target_pack_id = effective_pack or resolve_write_pack(stores.sql, principal, None)
 
             with principal_scope(principal), write_lock():
+                # #194: ensure anchor for ready packs that have lost it (best-effort)
+                try:
+                    from opencrab.ontology.builder import OntologyBuilder
+                    from opencrab.pack.lifecycle import ensure_anchor
+
+                    _builder = OntologyBuilder(neo4j, mongo, stores.sql, vec=chroma)
+                    ensure_anchor(
+                        stores.sql, _builder, neo4j, mongo, chroma, target_pack_id, apply=True
+                    )
+                except Exception:
+                    pass
                 receipt = write_source(
                     stores.sql, hybrid, mongo, chroma,
                     text=text, source_id=source_id,
@@ -1412,22 +1428,28 @@ def packs_repair_anchors(
     # Builder is only needed when actually writing; dry-run can probe without it.
     builder = None
     if apply_changes:
-        # Need a builder that can write the anchor. Reuse the same stores.
-        # _make_stores already built graph/doc/vector/sql above via _optional_store,
-        # but we need them together; rebuild if any were None due to optional handling.
-        # For repair, we want real stores where available, so build them directly.
-        try:
-            stores = _make_stores(cfg, graph=True, doc=True, vector=True, sql=True)
-            # Use the already-probed sql to keep the same connection pool
-            builder = OntologyBuilder(stores.graph, stores.doc, stores.sql, vec=stores.vector)
-            # Use the freshly built stores for probing as well to keep consistency
-            graph = stores.graph
-            doc = stores.doc
-            vector = stores.vector
-            sql = stores.sql
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[yellow]Could not build stores for write: {exc}[/yellow]")
+        # Only graph and SQL are required for anchor creation; doc/vector are
+        # optional fan-out. _optional_store already handles their init failures
+        # as None, so don't let a doc/vector factory failure block the whole
+        # repair when graph/SQL are healthy (P2 review).
+        if graph is None or not getattr(graph, "available", False):
+            console.print(
+                "[yellow]Graph store unavailable, cannot build builder for write.[/yellow]"
+            )
             builder = None
+        elif not sql.available:
+            console.print(
+                "[yellow]SQL store unavailable, cannot build builder for write.[/yellow]"
+            )
+            builder = None
+        else:
+            try:
+                builder = OntologyBuilder(graph, doc, sql, vec=vector)
+            except Exception as exc:  # noqa: BLE001
+                console.print(
+                    f"[yellow]Could not build builder for write: {exc}[/yellow]"
+                )
+                builder = None
 
     pack_ids = [pack_id] if pack_id else None
     summary = repair_missing_anchors(
