@@ -1471,6 +1471,11 @@ def pack_ingest(
             ),
         }
 
+    if not (nodes or edges or text):
+        return {
+            "error": "no content provided: supply at least one of nodes, edges, or text"
+        }
+
     # #194: auto-create anchor if missing for ready packs that have lost it
     # (legacy migration packs, manual deletion, or dumps that never contained
     # dataset:{pack_id}). Best-effort, does not block ingest on failure.
@@ -1488,11 +1493,6 @@ def pack_ingest(
         )
     except Exception:
         pass
-
-    if not (nodes or edges or text):
-        return {
-            "error": "no content provided: supply at least one of nodes, edges, or text"
-        }
 
     sid = source_id
     if text and not sid:

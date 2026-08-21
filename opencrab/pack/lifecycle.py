@@ -670,8 +670,9 @@ def repair_missing_anchors(
     which handles ``creating``/``partial``, this handles drift in ``ready``
     packs.
 
-    Returns ``{"checked": N, "already_present": N, "created": N, "skipped": N,
-    "failed": N, "rows": [...]}``. ``apply=False`` is dry-run.
+    Returns ``{"checked": N, "already_present": N, "would_create": N,
+    "created": N, "skipped": N, "failed": N, "rows": [...]}``.
+    ``apply=False`` is dry-run.
     """
     # Determine candidate pack_ids: either explicit list or all ready packs
     # visible to any owner (operator view). Use direct SQL for operator view
@@ -687,59 +688,32 @@ def repair_missing_anchors(
             rows = conn.execute(text("SELECT pack_id FROM packs WHERE status = 'ready'")).fetchall()
         candidates = [r[0] for r in rows]
 
-    counts = {"checked": 0, "already_present": 0, "created": 0, "skipped": 0, "failed": 0}
+    counts = {
+        "checked": 0,
+        "already_present": 0,
+        "would_create": 0,
+        "created": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
     rows_out: list[dict[str, Any]] = []
 
     for pid in candidates:
         counts["checked"] += 1
-        # For offline repair, we need a builder. If not provided, try to
-        # construct one from the factory if possible, but caller should supply.
-        # We probe first to avoid needing builder for already_present case.
-        probes = probe_anchor(graph, docs, vector, pid)
-        if probes.get("graph") == PROBE_PRESENT:
-            counts["already_present"] += 1
-            rows_out.append({"pack_id": pid, "action": "already_present", "probes": probes})
-            continue
-        if probes.get("graph") == PROBE_UNKNOWN:
-            counts["skipped"] += 1
-            rows_out.append(
-                {"pack_id": pid, "action": "skipped", "reason": "graph probe unverifiable", "probes": probes}
-            )
-            continue
-
-        # Need to create — use ensure_anchor dry-run for consistent validation
-        # (ensures nonexistent / non-ready packs are reported as skipped, not
-        # would_create, matching the apply path's checks).
-        if not apply:
-            result = ensure_anchor(
-                sql, builder, graph, docs, vector, pid, apply=False
-            )
-            action = result.get("action")
-            if action == "would_create":
-                counts["skipped"] += 1
-            elif action == "already_present":
-                counts["already_present"] += 1
-            elif action == "failed":
-                counts["failed"] += 1
-            else:
-                counts["skipped"] += 1
-            rows_out.append(result)
-            continue
-
-        if builder is None:
-            counts["skipped"] += 1
-            rows_out.append(
-                {"pack_id": pid, "action": "skipped", "reason": "builder unavailable", "probes": probes}
-            )
-            continue
-
-        # For offline, synthesize principal from pack owner as ensure_anchor does
-        result = ensure_anchor(sql, builder, graph, docs, vector, pid, apply=True)
+        # Route every candidate through the same registry/status checks in
+        # ensure_anchor. In particular, an explicit target whose graph anchor
+        # happens to be present must still be rejected when the registry row is
+        # missing or is not ready.
+        result = ensure_anchor(
+            sql, builder, graph, docs, vector, pid, apply=apply
+        )
         action = result.get("action")
-        if action == "created":
-            counts["created"] += 1
-        elif action == "already_present":
+        if action == "already_present":
             counts["already_present"] += 1
+        elif action == "would_create":
+            counts["would_create"] += 1
+        elif action == "created":
+            counts["created"] += 1
         elif action == "failed":
             counts["failed"] += 1
         else:

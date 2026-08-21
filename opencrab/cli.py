@@ -1412,6 +1412,15 @@ def packs_repair_anchors(
     packs are considered; ``creating``/``partial`` are handled by
     ``packs repair-registry``.
     """
+    if pack_id is not None:
+        if not pack_id.strip():
+            raise click.BadParameter(
+                "must be non-empty when provided", param_hint="--pack-id"
+            )
+        pack_ids = [pack_id]
+    else:
+        pack_ids = None
+
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.pack.lifecycle import repair_missing_anchors
@@ -1451,7 +1460,6 @@ def packs_repair_anchors(
                 )
                 builder = None
 
-    pack_ids = [pack_id] if pack_id else None
     summary = repair_missing_anchors(
         sql,
         graph,
