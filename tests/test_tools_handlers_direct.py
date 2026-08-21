@@ -1380,13 +1380,28 @@ class TestPackIngestErrors:
             "pack_id": "nonexistent-pack",
         }
 
-    def test_error_no_content_provided(self):
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _writable_ctx("existing-pack")
-            result = pack_ingest("existing-pack")
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{}, {"nodes": [], "edges": [], "text": ""}],
+        ids=["omitted", "explicit-empty"],
+    )
+    def test_error_no_content_provided(self, kwargs):
+        ctx = _writable_ctx("existing-pack")
+        with (
+            patch("opencrab.mcp.tools._get_context", return_value=ctx),
+            patch("opencrab.pack.lifecycle.ensure_anchor") as ensure_anchor,
+        ):
+            result = pack_ingest("existing-pack", **kwargs)
         assert result == {
             "error": "no content provided: supply at least one of nodes, edges, or text"
         }
+        ensure_anchor.assert_not_called()
+        ctx["builder"].add_node.assert_not_called()
+        ctx["builder"].add_edge.assert_not_called()
+        ctx["mongo"].upsert_source.assert_not_called()
+        ctx["hybrid"].ingest.assert_not_called()
+        ctx["hybrid"].invalidate_bm25_cache.assert_not_called()
+        ctx["billing"].on_ingest.assert_not_called()
 
     def test_error_store_partial_failure_propagates_to_top_level_status(self):
         """pack_ingest hardcodes {"status": "ok", ..., **ingest_result} — this

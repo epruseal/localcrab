@@ -29,7 +29,7 @@ from sqlalchemy import text as _sql_text
 
 import opencrab.pack.ownership as ownership_mod
 from opencrab.auth import create_user
-from opencrab.pack.lifecycle import repair_incomplete_packs
+from opencrab.pack.lifecycle import repair_incomplete_packs, repair_missing_anchors
 from opencrab.pack.ownership import (
     PACK_STATUS_CREATING,
     PACK_STATUS_PARTIAL,
@@ -779,6 +779,67 @@ class TestDeterministicInterleaving:
 
 
 # ---------------------------------------------------------------------------
+# Ready-pack anchor repair (#194): registry validation and dry-run accounting.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["missing", "creating", "partial"])
+def test_explicit_anchor_repair_target_must_be_a_ready_registry_row(sql, alice, target):
+    if target == "missing":
+        pack_id = "anchor-target-does-not-exist"
+    else:
+        pack_id = begin_pack_creation(sql, alice, "anchor-target-creating")
+        if target == "partial":
+            assert mark_pack_partial(sql, pack_id, alice) is True
+
+    # The graph anchor alone is not sufficient authority for this command.
+    graph = FakeGraph(present_ids={anchor_node_id(pack_id)})
+    result = repair_missing_anchors(
+        sql,
+        graph,
+        FakeDocs(),
+        FakeVector(),
+        apply=False,
+        pack_ids=[pack_id],
+    )
+
+    row = _row_for(result, pack_id)
+    assert row["action"] == "skipped"
+    assert result["counts"] == {
+        "checked": 1,
+        "already_present": 0,
+        "would_create": 0,
+        "created": 0,
+        "skipped": 1,
+        "failed": 0,
+    }
+
+
+def test_ready_missing_anchor_dry_run_reports_planned_creation_separately(sql, alice):
+    pack_id = begin_pack_creation(sql, alice, "anchor-target-ready")
+    assert mark_pack_ready(sql, pack_id, alice) is True
+
+    result = repair_missing_anchors(
+        sql,
+        FakeGraph(),
+        FakeDocs(),
+        FakeVector(),
+        apply=False,
+        pack_ids=[pack_id],
+    )
+
+    assert _row_for(result, pack_id)["action"] == "would_create"
+    assert result["counts"] == {
+        "checked": 1,
+        "already_present": 0,
+        "would_create": 1,
+        "created": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI: opencrab packs repair-registry (dry-run default, --apply required).
 # ---------------------------------------------------------------------------
 
@@ -835,6 +896,19 @@ class TestCLIRepairRegistry:
         assert payload["apply"] is False
         assert "Dry-run only" in result.output
         assert get_pack(sql, pid)["status"] == "creating"
+
+    @pytest.mark.parametrize("pack_id", ["", " "])
+    def test_repair_anchors_rejects_empty_or_whitespace_target_pack_id(
+        self, cli_env, runner, pack_id
+    ):
+        from opencrab.cli import main
+
+        result = runner.invoke(
+            main, ["packs", "repair-anchors", "--pack-id", pack_id, "--apply"]
+        )
+
+        assert result.exit_code != 0
+        assert "must be non-empty" in result.output
 
 
 # ---------------------------------------------------------------------------
