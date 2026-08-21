@@ -258,6 +258,14 @@ export function useDataChannel(activeToken: string, hydrated: boolean) {
     try {
       updated = await setPackVisibility(activeToken, packId, visibility, signal)
     } catch (err) {
+      // v3.4 F-a: epoch guard first, symmetric with the success path below.
+      // Order matters: if the token changes in the window between the 401
+      // response and this catch, markInvalid-first would let that stale 401
+      // lock the NEW valid token as invalid with no natural recovery (§3.4).
+      // Same contract as RightPanel's handleQuery/handleIngest catch; the
+      // intended difference is that RightPanel consumes errors in-place
+      // (toast) while this hook rethrows so PackPanel owns row display.
+      if (myEpoch !== authEpochRef.current) return // identity moved on, discard like the success path
       if (err instanceof UnauthorizedError) markInvalid()
       throw err
     } finally {

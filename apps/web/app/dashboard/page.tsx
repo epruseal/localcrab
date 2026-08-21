@@ -91,6 +91,7 @@ export default function DashboardPage() {
           loading={dataChannel.authState === 'checking'}
           error={dataChannel.packError}
           mutationsBlocked={mutationsBlocked}
+          authToken={tokenSession.activeToken}
           onVisibilityChange={dataChannel.changePackVisibility}
         />
       </div>

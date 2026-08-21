@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { OcPack, PackVisibility } from '../lib/api'
 
 const VISIBILITY_LABEL: Record<PackVisibility, string> = {
@@ -25,17 +25,27 @@ interface Props {
   // tokenPending) -- a visibility change fired while the token is still
   // debouncing would launch under the old activeToken (design-fix-v3.1 F2).
   mutationsBlocked: boolean
+  // v3.4 F-b: the active identity (same value RightPanel receives) -- a
+  // token change clears per-row errors below, mirroring RightPanel's
+  // authToken effect, so a new identity never sees the old one's rowError.
+  authToken: string
   // Parent owns the central data channel (design #149 §3.7/§5.6: mutationSeq,
   // single-flight, epoch guard) -- this component only asks it to perform the
   // change and reports success/failure back to the caller.
   onVisibilityChange: (packId: string, visibility: PackVisibility) => Promise<void>
 }
 
-export default function PackPanel({ packs, loading, error, mutationsBlocked, onVisibilityChange }: Props) {
+export default function PackPanel({ packs, loading, error, mutationsBlocked, authToken, onVisibilityChange }: Props) {
   // Per-row pending/error state, local to display -- not the packError this
   // panel's `error` prop carries (that one is for the list fetch itself).
   const [pending, setPending] = useState<Record<string, boolean>>({})
   const [rowError, setRowError] = useState<Record<string, string>>({})
+
+  // v3.4 F-b: identity change resets row errors (sibling pattern:
+  // RightPanel clears queryResults on authToken change). pending is NOT
+  // cleared here -- each action's finally owns it, and with F-a a late
+  // rejection still reaches that finally.
+  useEffect(() => { setRowError({}) }, [authToken])
 
   async function handleChange(packId: string, visibility: PackVisibility) {
     // v3.2: the disabled attribute stops real users, but a programmatic
