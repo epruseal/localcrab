@@ -1,13 +1,27 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import type { MutableRefObject } from 'react'
 import type { OcNode, SourceType } from '../lib/api'
-import { query, ingestSource } from '../lib/api'
+import { query, ingestSource, UnauthorizedError, ApiError } from '../lib/api'
+import type { AuthState } from '../hooks/useDataChannel'
 
 const SPACES = ['subject','resource','concept','evidence','outcome','lever','policy','claim','community']
 const SPACE_COLOR: Record<string, string> = {
   subject:'#f8c537', resource:'#83a598', concept:'#b8bb26', evidence:'#bdae93',
   outcome:'#fb4934', lever:'#d3869b', policy:'#fabd2f', claim:'#fe8019', community:'#8ec07c',
+}
+
+// §149 F1: the fetch-level AbortError is caught and re-wrapped into
+// ApiError('Request aborted') inside api.ts's shared requestJson (so every
+// caller sees one error taxonomy, not fetch's raw DOMException). The
+// DOMException/`name === 'AbortError'` checks are kept too so this still
+// recognizes an abort if it ever reaches here unwrapped.
+function isAbortError(e: unknown): boolean {
+  if (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError') return true
+  if (e instanceof Error && e.name === 'AbortError') return true
+  if (e instanceof ApiError && e.message === 'Request aborted') return true
+  return false
 }
 
 interface GraphControls {
@@ -23,11 +37,33 @@ interface Props {
   selectedNode: OcNode | null
   controls: GraphControls
   onControlChange: (c: Partial<GraphControls>) => void
-  apiKey: string
-  onRefresh: () => void
+  // The confirmed token (§149 design 4.4: prop renamed from apiKey, carries
+  // useTokenSession's activeToken -- never the still-debouncing tokenInput).
+  authToken: string
+  authState: AuthState
+  tokenPending: boolean
+  // Not state -- read at call time and re-checked after each await so a
+  // response from an identity that has since changed is discarded (design
+  // 4.4: "모든 응답 처리에 epoch가드를 건다").
+  authEpochRef: MutableRefObject<number>
+  // §149 F1: acquires a 10s-timeout AbortController for one action request
+  // (query or ingest), registered in useDataChannel's actionControllersRef
+  // so an epoch rise aborts it too. Stable identity (useCallback in the
+  // hook).
+  acquireRequestController: () => { signal: AbortSignal; release: () => void }
+  // §3.4's "401 판정" transition, reached here the same way a data-channel
+  // 401 reaches it, since query/ingest are outside that bundle.
+  onUnauthorized: () => void
+  // §3.7's mutation-success procedure (seq++, abort+release, requery) --
+  // NOT a plain refetch, so a successful ingest cannot be raced by a
+  // response the graph poll had already sent before the ingest landed.
+  onMutationSuccess: () => void
 }
 
-export default function RightPanel({ selectedNode, controls, onControlChange, apiKey, onRefresh }: Props) {
+export default function RightPanel({
+  selectedNode, controls, onControlChange,
+  authToken, authState, tokenPending, authEpochRef, acquireRequestController, onUnauthorized, onMutationSuccess,
+}: Props) {
   const [tab, setTab] = useState<'detail' | 'query' | 'ingest'>('detail')
   const [queryText, setQueryText] = useState('')
   const [queryResults, setQueryResults] = useState<{ node_id: string; score: number; text: string }[]>([])
@@ -38,33 +74,53 @@ export default function RightPanel({ selectedNode, controls, onControlChange, ap
   const [ingesting, setIngesting] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
 
+  const actionsBlocked = authState !== 'ok' || tokenPending
+
+  // §3.4: a token change (or a 401 verdict) clears query results too.
+  useEffect(() => { setQueryResults([]) }, [authToken])
+  useEffect(() => { if (authState === 'invalid') setQueryResults([]) }, [authState])
+
   function showToast(msg: string, type: 'success' | 'error' = 'success') {
     setToast({ msg, type })
     setTimeout(() => setToast(null), 3000)
   }
 
   async function handleQuery() {
-    if (!queryText.trim()) return
+    if (!queryText.trim() || actionsBlocked) return
+    const myEpoch = authEpochRef.current
+    const { signal, release } = acquireRequestController()
     setQuerying(true)
     try {
-      const res = await query(apiKey, queryText)
+      const res = await query(authToken, queryText, undefined, signal)
+      if (myEpoch !== authEpochRef.current) return // stale identity, discard silently
       // Support both response formats
       setQueryResults(res.results ?? res.hits ?? res.chunks ?? [])
-    } catch (e) { showToast(String(e), 'error') }
-    finally { setQuerying(false) }
+    } catch (e) {
+      if (myEpoch !== authEpochRef.current) return
+      if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+      if (isAbortError(e)) { showToast('요청 시간 초과 또는 취소', 'error'); return }
+      showToast(String(e), 'error')
+    } finally { setQuerying(false); release() }
   }
 
   async function handleIngest() {
-    if (!ingestToken.trim()) return
+    if (!ingestToken.trim() || actionsBlocked) return
+    const myEpoch = authEpochRef.current
+    const { signal, release } = acquireRequestController()
     setIngesting(true)
     try {
-      await ingestSource(apiKey, ingestSourceType, ingestToken, { query: ingestQuery || undefined })
+      await ingestSource(authToken, ingestSourceType, ingestToken, { query: ingestQuery || undefined }, signal)
+      if (myEpoch !== authEpochRef.current) return
       showToast('인제스트 완료!')
       setIngestToken('')
       setIngestQuery('')
-      onRefresh()
-    } catch (e) { showToast(String(e), 'error') }
-    finally { setIngesting(false) }
+      onMutationSuccess()
+    } catch (e) {
+      if (myEpoch !== authEpochRef.current) return
+      if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+      if (isAbortError(e)) { showToast('요청 시간 초과 또는 취소', 'error'); return }
+      showToast(String(e), 'error')
+    } finally { setIngesting(false); release() }
   }
 
   function toggleSpace(space: string) {
@@ -155,7 +211,7 @@ export default function RightPanel({ selectedNode, controls, onControlChange, ap
               onKeyDown={e => { if (e.key === 'Enter' && e.metaKey) handleQuery() }}
             />
             <button className="btn-gold" style={{ width: '100%', marginBottom: 12 }}
-              onClick={handleQuery} disabled={querying}>
+              onClick={handleQuery} disabled={querying || actionsBlocked}>
               {querying ? '검색 중…' : '쿼리 ↵'}
             </button>
             <div>
@@ -208,7 +264,7 @@ export default function RightPanel({ selectedNode, controls, onControlChange, ap
               />
             </div>
             <button className="btn-gold" style={{ width: '100%' }}
-              onClick={handleIngest} disabled={ingesting || !ingestToken.trim()}>
+              onClick={handleIngest} disabled={ingesting || !ingestToken.trim() || actionsBlocked}>
               {ingesting ? '처리 중…' : '데이터 가져오기'}
             </button>
             <div style={{ marginTop: 8, fontSize: 10, color: '#555', lineHeight: 1.5 }}>

@@ -78,6 +78,10 @@ class NodeRequest(BaseModel):
     pack_id: str | None = Field(default=None, description="Optional destination pack_id. Defaults to the caller's default pack.")
 
 
+class VisibilityRequest(BaseModel):
+    visibility: str = Field(..., min_length=1, description="One of opencrab.pack.ownership.VISIBILITIES.")
+
+
 class EdgeRequest(BaseModel):
     from_space: str = Field(..., min_length=1)
     from_id: str = Field(..., min_length=1)
@@ -934,6 +938,63 @@ def list_edges(
     except Exception as exc:
         logger.exception("list_edges failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _pack_view(row: dict[str, Any], user_id: str) -> dict[str, Any]:
+    """Narrow an ``opencrab.pack.ownership`` registry row to the five-field
+    screen contract (design #149 §5.2/§5.3). ``owner_id``, ``status``,
+    ``description``, ``forked_from`` and the timestamps are never forwarded
+    -- see the design note for why each is excluded. ``title`` falls back to
+    ``pack_id`` when the registry column is NULL/empty so the display-name
+    fallback lives in exactly one place (the server), not in the client.
+    ``is_owner`` is a display-only derivation, not an authorization
+    decision -- ``set_visibility`` below is what actually gates writes.
+    """
+    return {
+        "pack_id": row["pack_id"],
+        "title": row["title"] or row["pack_id"],
+        "visibility": row["visibility"],
+        "is_default": row["is_default"],
+        "is_owner": row["owner_id"] == user_id,
+    }
+
+
+@app.get("/api/packs")
+def list_packs(
+    auth: AuthContext = Depends(require_auth),
+    ctx: ApiContext = Depends(get_context),
+) -> dict[str, Any]:
+    from opencrab.pack.ownership import list_packs_for
+
+    rows = list_packs_for(ctx.sql, auth.principal)
+    packs = sorted((_pack_view(row, auth.user_id) for row in rows), key=lambda p: p["pack_id"])
+    _meter_call(ctx, auth, "/api/packs")
+    return {"packs": packs}
+
+
+@app.post("/api/packs/{pack_id}/visibility")
+def set_pack_visibility(
+    pack_id: str,
+    payload: VisibilityRequest,
+    auth: AuthContext = Depends(require_auth),
+    ctx: ApiContext = Depends(get_context),
+) -> dict[str, Any]:
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, set_visibility
+
+    try:
+        row = set_visibility(ctx.sql, auth.principal, pack_id, payload.visibility)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PackNotFoundError:
+        # #143 invariant 7: identical response for "doesn't exist at all" and
+        # "exists but it's someone else's private pack" -- the response body
+        # must not hint at which case this is.
+        raise HTTPException(status_code=404, detail="pack not found; use pack_create first") from None
+    except PackForbiddenError:
+        raise HTTPException(status_code=403, detail="PACK_NOT_WRITABLE: not the pack owner") from None
+
+    _meter_call(ctx, auth, "/api/packs/{pack_id}/visibility")
+    return _pack_view(row, auth.user_id)
 
 
 ## ─── Remote MCP Server (Streamable HTTP) ────────────────────────────────────
