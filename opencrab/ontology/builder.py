@@ -65,6 +65,7 @@ class OntologyBuilder:
         pack_id: str,
         origin: str = "client",
         pack_anchor: bool = False,
+        _allow_ready_anchor: bool = False,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -85,6 +86,9 @@ class OntologyBuilder:
         ``node_id == ownership.anchor_node_id(pack_id)`` -- or it raises
         ``ValueError`` before authorization even runs. This parameter opens
         nothing else: not a second node in the same ``creating`` pack, not
+        ``_allow_ready_anchor`` (#194) widens the allowed statuses to
+        ``(ready, creating)`` for the anchor auto-creation path on ``ready``
+        packs that have lost their anchor. Only ``ensure_anchor`` may set it.
         any node in a ``partial`` or ``ready`` pack (those never reach this
         branch's ``allowed_statuses``). The only call site that should ever
         pass ``pack_anchor=True`` is ``pack_create``'s anchor write.
@@ -114,7 +118,11 @@ class OntologyBuilder:
             anchor shape.
         """
         from opencrab.auth import current_principal
-        from opencrab.pack.ownership import PACK_STATUS_CREATING, anchor_node_id
+        from opencrab.pack.ownership import (
+            PACK_STATUS_CREATING,
+            PACK_STATUS_READY,
+            anchor_node_id,
+        )
 
         # The gate, in this order and no other (#148). Stamping must run
         # BEFORE canonicalize_pack_alias: that helper rewrites pack tags in
@@ -142,7 +150,15 @@ class OntologyBuilder:
                     "pack_anchor=True requires this pack's own anchor node "
                     "shape: " + "; ".join(mismatches)
                 )
-            authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
+            if _allow_ready_anchor:
+                authorize(
+                    self._sql,
+                    principal,
+                    pack_id,
+                    allowed_statuses=(PACK_STATUS_READY, PACK_STATUS_CREATING),
+                )
+            else:
+                authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
         else:
             authorize(self._sql, principal, pack_id)
         props = stamp(

@@ -1370,6 +1370,83 @@ def packs_repair_registry(
         )
 
 
+@packs.command("repair-anchors")
+@click.option(
+    "--pack-id",
+    default=None,
+    help="Only repair this one pack_id (default: all ready packs).",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply changes. Without this flag the command runs in dry-run mode.",
+)
+def packs_repair_anchors(
+    pack_id: str | None,
+    apply_changes: bool,
+) -> None:
+    """Ensure ready packs have their graph anchor node (#194, default dry-run).
+
+    For every ``ready`` pack whose ``dataset:{pack_id}`` anchor is missing
+    from the graph (legacy migration packs, manual deletion, or dumps that
+    never contained the anchor), create it from the registry's title/
+    description. Idempotent: a present anchor is a no-op. Only ``ready``
+    packs are considered; ``creating``/``partial`` are handled by
+    ``packs repair-registry``.
+    """
+    from opencrab.config import get_settings
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.lifecycle import repair_missing_anchors
+
+    cfg = get_settings()
+    sql = _make_stores(cfg, sql=True).sql
+    if not sql.available:
+        console.print("[red]SQL store unavailable.[/red]")
+        raise SystemExit(1)
+    graph = _optional_store(cfg, "graph")
+    doc = _optional_store(cfg, "doc")
+    vector = _optional_store(cfg, "vector")
+
+    # Builder is only needed when actually writing; dry-run can probe without it.
+    builder = None
+    if apply_changes:
+        # Need a builder that can write the anchor. Reuse the same stores.
+        # _make_stores already built graph/doc/vector/sql above via _optional_store,
+        # but we need them together; rebuild if any were None due to optional handling.
+        # For repair, we want real stores where available, so build them directly.
+        try:
+            stores = _make_stores(cfg, graph=True, doc=True, vector=True, sql=True)
+            # Use the already-probed sql to keep the same connection pool
+            builder = OntologyBuilder(stores.graph, stores.doc, stores.sql, vec=stores.vector)
+            # Use the freshly built stores for probing as well to keep consistency
+            graph = stores.graph
+            doc = stores.doc
+            vector = stores.vector
+            sql = stores.sql
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Could not build stores for write: {exc}[/yellow]")
+            builder = None
+
+    pack_ids = [pack_id] if pack_id else None
+    summary = repair_missing_anchors(
+        sql,
+        graph,
+        doc,
+        vector,
+        builder,
+        apply=apply_changes,
+        pack_ids=pack_ids,
+    )
+
+    console.print_json(json.dumps(summary, ensure_ascii=False, default=str))
+    if not apply_changes:
+        console.print(
+            "[dim]Dry-run only. Re-run with --apply to persist these changes.[/dim]"
+        )
+
+
 @packs.command("reindex-bm25")
 def packs_reindex_bm25() -> None:
     """Rebuild the BM25 cache once (escape hatch; lazy rebuild is the default)."""

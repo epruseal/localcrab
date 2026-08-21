@@ -487,3 +487,267 @@ def repair_incomplete_packs(
         "rows": results,
         "promote_result": promote_result,
     }
+
+
+def ensure_anchor(
+    sql: Any,
+    builder: Any,
+    graph: Any,
+    docs: Any,
+    vector: Any,
+    pack_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    principal: Any | None = None,
+    apply: bool = True,
+) -> dict[str, Any]:
+    """Ensure ``pack_id``'s anchor node exists, creating it if missing (#194).
+
+    For ``ready`` packs that have lost their anchor (legacy migration, manual
+    deletion, or a dump that never contained ``dataset:{pack_id}``). Idempotent:
+    a present anchor is a no-op. Only ``ready`` packs are considered; other
+    statuses are handled by :func:`repair_incomplete_packs`.
+
+    When ``apply`` is False, reports what would be done without writing.
+    Returns ``{"action": "already_present"|"created"|"skipped", ...}`` with
+    ``probes`` for observability. ``graph`` is the system of record;
+    ``unverifiable`` is treated as skipped (fail-closed).
+    """
+    from opencrab.auth import Principal, current_principal, principal_scope
+    from opencrab.pack.ownership import anchor_node_id, get_pack
+
+    pack = get_pack(sql, pack_id)
+    if pack is None:
+        return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
+    if pack["status"] != "ready":
+        return {
+            "action": "skipped",
+            "reason": f"pack status is {pack['status']!r}, not 'ready'",
+            "pack_id": pack_id,
+            "status": pack["status"],
+        }
+
+    probes = probe_anchor(graph, docs, vector, pack_id)
+    if probes.get("graph") == PROBE_PRESENT:
+        return {"action": "already_present", "pack_id": pack_id, "probes": probes}
+    if probes.get("graph") != PROBE_ABSENT:
+        # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
+        # "absent" at graph level; but UNKNOWN means we cannot tell.
+        # optional-only is still "graph absent", so we should create.
+        # Only UNKNOWN is skipped.
+        if probes.get("graph") == PROBE_UNKNOWN:
+            return {
+                "action": "skipped",
+                "reason": "graph probe unverifiable",
+                "pack_id": pack_id,
+                "probes": probes,
+            }
+        # For optional-only, graph is absent, so we fall through to create.
+        # The check above already handled UNKNOWN, so remaining is ABSENT or
+        # optional-only (which is graph absent).
+        pass
+
+    # At this point graph is absent (including optional-only case).
+    # Resolve title/description from explicit args or registry fallback.
+    resolved_title = title if title is not None else (pack.get("title") or pack_id)
+    resolved_description = description if description is not None else (pack.get("description") or "")
+
+    if not apply:
+        return {
+            "action": "would_create",
+            "pack_id": pack_id,
+            "probes": probes,
+            "title": resolved_title,
+        }
+
+    if builder is None or not getattr(builder, "_neo4j", None):
+        return {
+            "action": "skipped",
+            "reason": "builder or graph store unavailable",
+            "pack_id": pack_id,
+            "probes": probes,
+        }
+
+    # Need a principal that owns the pack. Use explicit one if given,
+    # otherwise try current_principal, otherwise synthesize from owner.
+    use_principal = principal
+    if use_principal is None:
+        try:
+            use_principal = current_principal()
+        except LookupError:
+            # Fallback: synthesize a principal for the pack owner. This is
+            # only for offline repair where no request principal exists; the
+            # anchor write is still authorized via ownership, not via the
+            # caller's identity beyond being the owner.
+            # Fetch is_local from users table if possible.
+            try:
+                from sqlalchemy import text
+
+                with sql._engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT is_local FROM users WHERE user_id = :uid"),
+                        {"uid": pack["owner_id"]},
+                    ).fetchone()
+                is_local = bool(row[0]) if row else False
+            except Exception:
+                is_local = False
+            use_principal = Principal(
+                user_id=pack["owner_id"], is_local=is_local, disabled=False
+            )
+
+    # Anchor shape and stamping mirrors pack_create's anchor write.
+    anchor_id = anchor_node_id(pack_id)
+    props = {
+        "pack_id": pack_id,
+        "title": resolved_title,
+        "description": resolved_description,
+        "created_by": "localcrab-mcp",
+    }
+
+    try:
+        with principal_scope(use_principal):
+            result = builder.add_node(
+                space=_ANCHOR_SPACE,
+                node_type=_ANCHOR_NODE_TYPE,
+                node_id=anchor_id,
+                properties=props,
+                pack_id=pack_id,
+                origin="server",
+                pack_anchor=True,
+                _allow_ready_anchor=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "action": "failed",
+            "reason": f"anchor write raised: {exc}",
+            "pack_id": pack_id,
+            "probes": probes,
+        }
+
+    # pack_create's post-write verdict: graph must land.
+    stores = result.get("stores") or {}
+    graph_status = stores.get("graph")
+    if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
+        return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
+    # If graph didn't land but probe now says present (e.g., commit succeeded
+    # but acknowledgement dropped), treat as created as well (same as pack_create).
+    try:
+        reprobe = probe_anchor(graph, docs, vector, pack_id)
+        if reprobe.get("graph") == PROBE_PRESENT:
+            return {
+                "action": "created",
+                "pack_id": pack_id,
+                "probes": probes,
+                "reprobe": reprobe,
+                "stores": stores,
+            }
+    except Exception:
+        pass
+    return {
+        "action": "failed",
+        "reason": f"graph store did not land: {graph_status}",
+        "pack_id": pack_id,
+        "probes": probes,
+        "stores": stores,
+    }
+
+
+def repair_missing_anchors(
+    sql: Any,
+    graph: Any,
+    docs: Any,
+    vector: Any,
+    builder: Any | None = None,
+    *,
+    apply: bool = False,
+    pack_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Offline repair for ``ready`` packs missing their graph anchor (#194).
+
+    Enumerates ``ready`` packs (or a given ``pack_ids`` subset) and ensures
+    each has a ``dataset:{pack_id}`` anchor. Unlike :func:`repair_incomplete_packs`
+    which handles ``creating``/``partial``, this handles drift in ``ready``
+    packs.
+
+    Returns ``{"checked": N, "already_present": N, "created": N, "skipped": N,
+    "failed": N, "rows": [...]}``. ``apply=False`` is dry-run.
+    """
+    from opencrab.pack.ownership import get_pack, list_packs_for
+    from opencrab.auth import Principal
+
+    # Determine candidate pack_ids: either explicit list or all ready packs
+    # visible to any owner (operator view). Use direct SQL for operator view
+    # to avoid needing a principal.
+    candidates: list[str]
+    if pack_ids is not None:
+        candidates = list(pack_ids)
+    else:
+        # Operator view: all ready packs regardless of owner/visibility
+        from sqlalchemy import text
+
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text("SELECT pack_id FROM packs WHERE status = 'ready'")).fetchall()
+        candidates = [r[0] for r in rows]
+
+    counts = {"checked": 0, "already_present": 0, "created": 0, "skipped": 0, "failed": 0}
+    rows_out: list[dict[str, Any]] = []
+
+    for pid in candidates:
+        counts["checked"] += 1
+        # For offline repair, we need a builder. If not provided, try to
+        # construct one from the factory if possible, but caller should supply.
+        # We probe first to avoid needing builder for already_present case.
+        probes = probe_anchor(graph, docs, vector, pid)
+        if probes.get("graph") == PROBE_PRESENT:
+            counts["already_present"] += 1
+            rows_out.append({"pack_id": pid, "action": "already_present", "probes": probes})
+            continue
+        if probes.get("graph") == PROBE_UNKNOWN:
+            counts["skipped"] += 1
+            rows_out.append(
+                {"pack_id": pid, "action": "skipped", "reason": "graph probe unverifiable", "probes": probes}
+            )
+            continue
+
+        # Need to create
+        if not apply:
+            counts["skipped"] += 1  # dry-run counts as skipped in terms of writes, but report would_create
+            # Re-use ensure_anchor dry-run for consistent reporting
+            pack = get_pack(sql, pid)
+            rows_out.append(
+                {
+                    "pack_id": pid,
+                    "action": "would_create",
+                    "probes": probes,
+                    "title": (pack.get("title") if pack else pid) if pack else pid,
+                }
+            )
+            continue
+
+        if builder is None:
+            counts["skipped"] += 1
+            rows_out.append(
+                {"pack_id": pid, "action": "skipped", "reason": "builder unavailable", "probes": probes}
+            )
+            continue
+
+        # For offline, synthesize principal from pack owner as ensure_anchor does
+        result = ensure_anchor(sql, builder, graph, docs, vector, pid, apply=True)
+        action = result.get("action")
+        if action == "created":
+            counts["created"] += 1
+        elif action == "already_present":
+            counts["already_present"] += 1
+        elif action == "failed":
+            counts["failed"] += 1
+        else:
+            counts["skipped"] += 1
+        rows_out.append(result)
+
+    return {
+        "apply": apply,
+        "counts": counts,
+        "rows": rows_out,
+        "checked_at": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+    }

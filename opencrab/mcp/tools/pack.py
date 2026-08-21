@@ -1471,6 +1471,24 @@ def pack_ingest(
             ),
         }
 
+    # #194: auto-create anchor if missing for ready packs that have lost it
+    # (legacy migration packs, manual deletion, or dumps that never contained
+    # dataset:{pack_id}). Best-effort, does not block ingest on failure.
+    try:
+        from opencrab.pack.lifecycle import ensure_anchor
+
+        ensure_anchor(
+            ctx["sql"],
+            ctx["builder"],
+            ctx["neo4j"],
+            ctx["mongo"],
+            ctx["chroma"],
+            pack_id,
+            apply=True,
+        )
+    except Exception:
+        pass
+
     if not (nodes or edges or text):
         return {
             "error": "no content provided: supply at least one of nodes, edges, or text"
