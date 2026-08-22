@@ -58,7 +58,7 @@ import logging
 from typing import Any
 
 from opencrab.auth import Principal
-from opencrab.common.pack_tags import canonicalize_pack_alias
+from opencrab.common.pack_tags import canonicalize_pack_alias, strip_retired_keys
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 from opencrab.pack.fork_remap import (
     REFERENCE_KEYS,
@@ -83,6 +83,7 @@ from opencrab.pack.write_gate import (
     node_identity_conflict,
     source_identity_conflict,
 )
+from opencrab.stores._graph_common import domain_labels
 from opencrab.stores._vector_base import validate_import_records
 
 logger = logging.getLogger(__name__)
@@ -574,6 +575,8 @@ def _fork_pack_inner(
     edge_errors: list[str] = []
     source_errors: list[str] = []
     skipped_alias_nodes = 0
+    # design §18-4: ONE counter for both strip sites (source + edge).
+    retired_alias_dropped = 0
     skipped_alias_sources = 0
     skipped_alias_edges = 0
 
@@ -588,7 +591,28 @@ def _fork_pack_inner(
             continue
         props = record["props"]
         labels = record.get("labels") or []
-        node_type = labels[0] if labels else None
+        # design §18-3: `labels` is not uniform across backends and its order
+        # is undeclared (Neo4j returns the marker plus the domain type from
+        # `labels(n)`; SQL/Kuzu return a single-element `[node_type]`), so the
+        # type is read through `domain_labels` here ONCE and every downstream
+        # consumer reuses the result via `seen_node_types` rather than
+        # re-indexing `labels`.
+        domain = domain_labels(labels)
+        if len(domain) >= 2:
+            # Decided BEFORE the anchor branch below on purpose: a row whose
+            # type cannot be determined cannot be judged "is this the anchor"
+            # either. Deliberately NOT `_declared_limit_reject` -- that helper
+            # is for shapes #197 resolves and prescribes "rename the colliding
+            # id", neither of which applies to a multi-label node.
+            raise _reject(
+                f"node {node_id!r} carries more than one domain label "
+                f"({', '.join(repr(name) for name in domain)}); the fork cannot "
+                "reproduce that shape because a node write stamps exactly one "
+                "node_type, and the export's label order is undeclared so picking "
+                "one of them is not deterministic -- collapse it to a single "
+                "domain label"
+            )
+        node_type = domain[0] if domain else None
         space = props.get("space")
         if node_id == src_anchor:
             # The source pack's OWN anchor is never copied as an ordinary
@@ -636,6 +660,15 @@ def _fork_pack_inner(
         except ValueError:
             skipped_alias_nodes += 1
             continue
+        # design §18-4: NO `strip_retired_keys` on the node axis, unlike the
+        # source and edge sites below. A retired `pack` alias cannot reach
+        # here: `export_nodes_scoped` matches on a node's own TRUTHY
+        # `pack_id` property (strictly -- never `source`/`source_id`), so
+        # every row this loop sees already has the real key and
+        # `canonicalize_pack_alias` above has already reconciled or rejected
+        # any alias beside it. This comment is the tripwire: if that
+        # predicate ever loosens to admit alias-only rows, this axis needs
+        # the same strip the other two got.
         # Design §13-8-1 / §13-9-1: the remap suffix can push an id the store
         # itself accepts past the registry's VARCHAR(256) node_id and
         # edge-endpoint columns. That overflow is made by OUR transform, not
@@ -707,6 +740,16 @@ def _fork_pack_inner(
         except ValueError:
             skipped_alias_edges += 1
             continue
+        # design §18-4: AFTER canonicalize, never before -- the order is the
+        # contract. Canonicalize first is what still classifies "truthy
+        # pack_id + mismatched alias" as the Tier 1 data defect it is; strip
+        # first would swallow that contradiction silently (that IS #171).
+        # Called unconditionally on every surviving row (contract 0); the
+        # counter is derived from this call's own result, never a separate scan.
+        rel_props_before = len(rel_props)
+        rel_props = strip_retired_keys(rel_props)
+        if len(rel_props) != rel_props_before:
+            retired_alias_dropped += 1
         record = dict(record)
         record["rel_props"] = rel_props
         surviving_edges.append(record)
@@ -746,6 +789,11 @@ def _fork_pack_inner(
         except ValueError:
             skipped_alias_sources += 1
             continue
+        # design §18-4: same order contract and same counter as the edge site.
+        metadata_before = len(metadata)
+        metadata = strip_retired_keys(metadata)
+        if len(metadata) != metadata_before:
+            retired_alias_dropped += 1
         record = dict(record)
         record["metadata"] = metadata
         surviving_sources.append(record)
@@ -1039,6 +1087,19 @@ def _fork_pack_inner(
     )
     _check_floor("vector", len(exported_vectors), vectors_dropped)
 
+    # design §18-4 contract 3: exactly once, AFTER all four completeness
+    # floors and BEFORE the reservation below. After the floors because a run
+    # that ends in `_reject` copies nothing, so "dropped" would not be true of
+    # it; before the reservation because this is still the pure-preflight
+    # span. Aggregated rather than per-row: every alias dropped here is by
+    # definition a name other than the destination pack, so a per-row log
+    # would be all noise. `skipped.*` deliberately does not grow a key.
+    if retired_alias_dropped:
+        logger.warning(
+            "pack_fork: dropped %d retired pack alias(es) while copying %s",
+            retired_alias_dropped, src_pack_id,
+        )
+
     # =====================================================================
     # §5-2 reservation (steps 9-12)
     # =====================================================================
@@ -1174,7 +1235,7 @@ def _fork_pack_inner(
             props = record["props"]
             reason = node_identity_conflict(
                 graph, docs, vector,
-                space=props.get("space"), node_type=record["labels"][0],
+                space=props.get("space"), node_type=seen_node_types[old_id],
                 node_id=new_id, pack_id=dst,
             )
             if reason:
@@ -1364,7 +1425,7 @@ def _fork_pack_inner(
                 record["props"], mapping, src_pack=src_pack_id, dst_pack=dst,
             )
             props["id"] = new_id
-            node_type = record["labels"][0]
+            node_type = seen_node_types[old_id]
             receipt = builder.add_node(
                 space=props.get("space"), node_type=node_type, node_id=new_id,
                 properties=props, pack_id=dst, origin="server", fork_copy=True,
