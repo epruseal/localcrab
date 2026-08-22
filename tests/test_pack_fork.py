@@ -43,6 +43,7 @@ and its reverse-mutation.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -2900,3 +2901,589 @@ class TestVectorExportLengthRecheck:
         assert _forked_row_count(stack, src) == 0, out
         assert reservations == [], reservations
         assert writes == [], writes
+
+
+# ---------------------------------------------------------------------------
+# T100-T108 -- review round 6: Neo4j label order (P1) and the lone retired
+# `pack` alias (P2). Design §18.
+#
+# Fixture scale rule (design §18-6): a test that watches a row get dropped
+# needs that axis at 12+, because `_check_floor` rejects the whole fork above
+# 10% loss and the response then carries no counters at all. The rule is
+# GLOBAL, not per-axis: the vector axis's denominator is `export_pack_vectors`
+# in full and `builder.add_node` writes a vector per node, so the node count
+# dominates it. A 2-node fixture makes one dropped source's orphan 1/5 and
+# rejects a correct implementation.
+# ---------------------------------------------------------------------------
+
+MARKER = "OpenCrabNode"
+
+
+def _patch_labels(monkeypatch, stack, src, fn):
+    """Rewrite `labels` on the SOURCE pack's node export only.
+
+    Delegates to the real method and only rewrites when `src` is in scope
+    (design §18-6 monkeypatch rule): fork calls the same method again for the
+    DESTINATION -- the pre-flight empty check and the H4 re-read -- so a patch
+    that answers unconditionally either makes the destination look non-empty
+    (fork never starts) or contaminates the copy's own verification.
+    """
+    real = type(stack["graph"]).export_nodes_scoped
+
+    def _patched(self, pack_ids, limit, space=None):
+        rows = real(self, pack_ids, limit, space)
+        if src not in list(pack_ids):
+            return rows
+        out = []
+        for row in rows:
+            row = dict(row)
+            row["labels"] = fn((row.get("props") or {}).get("id"), list(row.get("labels") or []))
+            out.append(row)
+        return out
+
+    monkeypatch.setattr(type(stack["graph"]), "export_nodes_scoped", _patched, raising=True)
+
+
+def _seed_mixed_types(stack, tag):
+    """12 ordinary nodes alternating Document / File (both valid in `resource`).
+
+    `_seed_pack` only ever writes `Document`, so an implementation that
+    hardcodes that one type would pass a single-type fixture (T100's
+    reverse-mutation needs the second type to kill it).
+    """
+    src = _seed_pack(stack, ALICE, tag, node_count=0, with_edge=False)
+    kinds: dict[str, str] = {}
+    with principal_scope(ALICE):
+        for i in range(12):
+            node_type = "Document" if i % 2 == 0 else "File"
+            nid = f"{tag}-n{i}"
+            stack["builder"].add_node(
+                space="resource", node_type=node_type, node_id=nid,
+                properties={"title": f"x {i}"}, pack_id=src,
+            )
+            kinds[nid] = node_type
+    return src, kinds
+
+
+class TestLabelShapeAndRetiredAlias:
+    @pytest.mark.parametrize("anchor_pos", ["front", "back"])
+    def test_t100_domain_label_read_once_and_reused(self, stack, monkeypatch, anchor_pos):
+        """T100: the marker may sit at ANY position (Neo4j's `labels(n)` order
+        is undeclared) and the domain type must still be read correctly, once,
+        with both downstream consumers reusing that one interpretation.
+
+        Three label shapes are exercised per run -- marker first, marker last,
+        and marker absent (the SQL/Kuzu shape, which really does return a bare
+        `[node_type]`). The anchor row's marker position is parameterized
+        because an implementation that reads `labels[-1]` only in the anchor
+        branch survives a front-only fixture and then rejects real anchors.
+
+        Reverse-mutation: `labels[0]` dies on a marker-first row; `labels[1:]`
+        or `labels[-1]` dies on a marker-last row; "no marker means no domain
+        label" dies on the marker-absent row; hardcoding `Document` dies on a
+        `File` row; leaving the step-12 identity probe on `labels[...]` dies on
+        the probe-argument assertion (nothing else observes it -- the
+        destination ids never collide, so the probe always returns None).
+        """
+        tag = f"t100{anchor_pos}"
+        src, kinds = _seed_mixed_types(stack, tag)
+        anchor = f"dataset:{src}"
+
+        def shape(nid, labels):
+            if nid == anchor:
+                return [MARKER, *labels] if anchor_pos == "front" else [*labels, MARKER]
+            i = int(nid.rsplit("n", 1)[1])
+            if i % 3 == 0:
+                return [MARKER, *labels]
+            if i % 3 == 1:
+                return [*labels, MARKER]
+            return list(labels)
+
+        _patch_labels(monkeypatch, stack, src, shape)
+
+        probe_args: list[tuple[Any, Any]] = []
+        real_probe = fork_mod.node_identity_conflict
+
+        def _probe(*a, **kw):
+            probe_args.append((kw.get("node_id"), kw.get("node_type")))
+            return real_probe(*a, **kw)
+
+        monkeypatch.setattr(fork_mod, "node_identity_conflict", _probe, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=f"{tag}-dst")
+        assert out["status"] == "ok", out
+        dst = out["pack_id"]
+
+        # Re-read the destination WITHOUT the patch: the copy must carry the
+        # domain label alone, with no marker smuggled in.
+        monkeypatch.undo()
+        got = {
+            (r["props"] or {}).get("id"): list(r.get("labels") or [])
+            for r in stack["graph"].export_nodes_scoped([dst], 200)
+        }
+        for nid, node_type in kinds.items():
+            copied = [v for k, v in got.items() if k.startswith(nid + "~")]
+            assert copied and copied[0] == [node_type], (nid, node_type, copied)
+
+        # Step 12's identity probe saw the resolved type for EVERY surviving
+        # row, not just the one whose marker position happens to make a
+        # positional read look right. Ids arrive remapped (`{old}~{salt}`).
+        seen = {
+            pid.rsplit("~", 1)[0]: node_type
+            for pid, node_type in probe_args
+            if pid and "~" in pid
+        }
+        for nid, node_type in kinds.items():
+            assert seen.get(nid) == node_type, (nid, node_type, seen.get(nid))
+
+    _AMBIGUOUS = [
+        ([MARKER, "Document", "File"], "front"),
+        (["Document", "File", MARKER], "back"),
+        (["Document", "File"], "nomarker"),
+        (["Document", "File", "API"], "three"),
+        (["Document", "Weird"], "weird"),
+    ]
+
+    @pytest.mark.parametrize(
+        "labels,ident", _AMBIGUOUS, ids=[i for _, i in _AMBIGUOUS]
+    )
+    def test_t101_two_domain_labels_reject_whole_pack(self, stack, monkeypatch, labels, ident):
+        """T101: a node with two or more domain labels rejects the whole fork,
+        before any registry row exists, with its own wording (NOT the #197
+        declared-limit message, whose remedy -- rename the colliding id -- is
+        wrong here) naming every offending label.
+
+        Reverse-mutation: picking the first domain label completes as "ok";
+        reusing `_declared_limit_reject` reintroduces `#197`; gating the check
+        on the marker's presence survives only until the marker-absent
+        parameter; writing it as `len(domain) == 2` survives only until the
+        three-label parameter; implementing `domain_labels` as "keep the labels
+        the grammar knows" survives only until `Weird`, which it would silently
+        filter down to a single type and copy.
+        """
+        tag = f"t101{ident}"
+        src = _seed_pack(stack, ALICE, tag, node_count=12)
+        target = f"{tag}-n5"
+        _patch_labels(
+            monkeypatch, stack, src,
+            lambda nid, cur: list(labels) if nid == target else cur,
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=f"{tag}-dst")
+        err = str(out.get("error"))
+        assert out.get("status") is None, out
+        assert "more than one domain label" in err, err
+        assert "#197" not in err, err
+        for name in labels:
+            if name != MARKER:
+                assert name in err, (name, err)
+        assert get_pack(stack["sql"], f"{tag}-dst") is None
+
+    def test_t102_marker_only_node_is_missing_type_not_bad_grammar(self, stack, monkeypatch):
+        """T102: a node whose only label is the marker has NO domain type, so
+        it takes the "missing space/type" Tier 1 skip rather than reaching
+        grammar validation with the marker as its type. The target is the last
+        node so the single seeded edge (n0->n1) does not fall with it.
+
+        Reverse-mutation: dropping the marker filter makes the message
+        `failed grammar validation` instead.
+        """
+        src = _seed_pack(stack, ALICE, "t102", node_count=12)
+        target = "t102-n11"
+        _patch_labels(
+            monkeypatch, stack, src,
+            lambda nid, cur: [MARKER] if nid == target else cur,
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t102-dst")
+        assert out["status"] == "ok", out
+        node_errors = (out.get("errors") or {}).get("nodes") or []
+        assert any("missing space/type" in e and target in e for e in node_errors), node_errors
+        assert not any("failed grammar validation" in e for e in node_errors), node_errors
+
+    _ANCHOR_AMBIGUOUS = [
+        ([MARKER, "Dataset", "File"], "front"),
+        (["Dataset", "File", MARKER], "back"),
+        (["Dataset", "File"], "nomarker"),
+    ]
+
+    @pytest.mark.parametrize(
+        "labels,ident", _ANCHOR_AMBIGUOUS, ids=[i for _, i in _ANCHOR_AMBIGUOUS]
+    )
+    def test_t103_ambiguous_anchor_is_ambiguity_not_bad_anchor(self, stack, monkeypatch, labels, ident):
+        """T103: ambiguity is decided BEFORE the anchor branch -- a row whose
+        type cannot be determined cannot be judged to be the anchor either, so
+        the message is T101's, not "wrong shape for an anchor".
+
+        Reverse-mutation: moving the ambiguity check after the anchor branch
+        produces the anchor-shape wording; gating it on the marker's presence
+        dies on the marker-absent parameter; reading the anchor positionally
+        dies on the marker-last parameter.
+        """
+        tag = f"t103{ident}"
+        src = _seed_pack(stack, ALICE, tag, node_count=12)
+        anchor = f"dataset:{src}"
+        _patch_labels(
+            monkeypatch, stack, src,
+            lambda nid, cur: list(labels) if nid == anchor else cur,
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=f"{tag}-dst")
+        err = str(out.get("error"))
+        assert "more than one domain label" in err, err
+        assert "#197" not in err, err
+        assert "anchor" not in err.lower(), err
+
+    # -- T104 family: retired `pack` alias strip + the aggregate signal ------
+    #
+    # Shared fixture, fixed by count so T104b's call totals are determinate
+    # (design §18-6): sources 12 = s0 + 8 fillers + 2 legacy + 1 same-value;
+    # nodes 12 + anchor; edges = 11 chain + 2 injected legacy = 13. Fillers go
+    # in through `upsert_source` (NOT `write_source`) so they carry no vector:
+    # that pins the vector denominator at 14 (12 nodes + anchor + s0), which is
+    # what makes T104c(ii)'s two ghosts land at 2/16, just over the floor.
+
+    @staticmethod
+    def _t104_fixture(stack, tag):
+        src = _seed_pack(stack, ALICE, tag, node_count=12)
+        docs = stack["docs"]
+        docs.upsert_source(f"{tag}-legacy-a", "ba", {"source": src, "pack": src})
+        docs.upsert_source(f"{tag}-legacy-b", "bb", {"source": src, "pack": "other"})
+        # Same-value alias: `canonicalize_pack_alias` removes this one first,
+        # so it must NOT reach the strip site and must NOT be counted.
+        docs.upsert_source(f"{tag}-same", "bs", {"pack_id": src, "pack": src})
+        for i in range(8):
+            docs.upsert_source(f"{tag}-f{i}", f"filler {i}", {"pack_id": src})
+        with principal_scope(ALICE):
+            for i in range(1, 11):
+                stack["builder"].add_edge(
+                    "resource", f"{tag}-n{i}", "cites", "resource", f"{tag}-n{i+1}",
+                    pack_id=src,
+                )
+        return src
+
+    @staticmethod
+    def _inject_legacy_edges(monkeypatch, stack, src, tag):
+        """Two edges carrying only the retired alias (no `pack_id`)."""
+        real = type(stack["graph"]).export_edges_scoped
+
+        def _patched(self, pack_ids, limit):
+            rows = real(self, pack_ids, limit)
+            if src not in list(pack_ids):
+                return rows
+            rows = list(rows)
+            proto = rows[0]
+            for j, alias in enumerate((src, "other")):
+                edge = dict(proto)
+                edge["source_props"] = {**proto["source_props"], "id": f"{tag}-n0"}
+                edge["target_props"] = {**proto["target_props"], "id": f"{tag}-n{2+j}"}
+                edge["rel_props"] = {"pack": alias}
+                rows.append(edge)
+            return rows
+
+        monkeypatch.setattr(type(stack["graph"]), "export_edges_scoped", _patched, raising=True)
+
+    @staticmethod
+    def _alias_warnings(caplog):
+        return [r for r in caplog.records if "retired pack alias" in r.getMessage()]
+
+    def test_t104_strip_both_axes_and_one_aggregate_warning(self, stack, monkeypatch, caplog):
+        """T104: legacy rows on BOTH axes are stripped before copying, and the
+        two strip sites feed ONE counter reported as a single warning.
+
+        Reverse-mutation: removing either strip site turns the fork `partial`
+        (the destination writer rejects the retired key); dropping the alias
+        only when it equals the source pack dies on the third-pack rows;
+        deleting the warning gives 0 records; logging per row gives 4; counting
+        what `canonicalize_pack_alias` already removed makes the argument 5;
+        giving the edge axis its own counter makes it 2.
+        """
+        caplog.set_level(logging.WARNING)
+        src = self._t104_fixture(stack, "t104")
+        self._inject_legacy_edges(monkeypatch, stack, src, "t104")
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t104-dst")
+        assert out["status"] == "ok", out
+        assert out["copied"]["sources"] == 12, out["copied"]
+        assert out["copied"]["edges"] == 13, out["copied"]
+
+        hits = self._alias_warnings(caplog)
+        assert len(hits) == 1, [r.getMessage() for r in hits]
+        assert hits[0].args[0] == 4, hits[0].args
+
+        dst = out["pack_id"]
+        copied = stack["docs"].list_sources_scoped([dst], 200)
+        # Every source made it across, none kept the retired key, and all are
+        # owned by the destination. Asserting the id SET (not just the count)
+        # is what catches an implementation that silently drops a filler row:
+        # 1/13 is under the floor, and the surviving totals would still make
+        # T104b's call counts come out right.
+        expected = {"s0", "t104-legacy-a", "t104-legacy-b", "t104-same"} | {
+            f"t104-f{i}" for i in range(8)
+        }
+        assert {
+            (s.get("source_id") or "").rsplit("~", 1)[0] for s in copied
+        } == expected, [s.get("source_id") for s in copied]
+        metas = [s.get("metadata") or {} for s in copied]
+        assert not any("pack" in m for m in metas), metas
+        assert all(m.get("pack_id") == dst for m in metas), metas
+
+    def test_t104b_warning_and_strip_precede_the_reservation(self, stack, monkeypatch, caplog):
+        """T104b: both the strip and its warning are complete BEFORE
+        `begin_pack_creation` is entered.
+
+        The reservation is the only observable boundary, so the wrapper
+        snapshots state at the moment it is called and then raises. Snapshotting
+        AT the call (rather than reading caplog after the fork returns) is what
+        kills an implementation that wraps the reservation in try/finally and
+        logs in the finally.
+
+        Reverse-mutation: logging after the reservation leaves `warned` False;
+        deferring the strip to just before the writer leaves both counts 0;
+        calling `strip_retired_keys` only on rows that already have the key
+        leaves the total at 4 instead of 25; faking the total with throwaway
+        calls dies on the argument-set assertion.
+        """
+        caplog.set_level(logging.WARNING)
+        src = self._t104_fixture(stack, "t104b")
+        self._inject_legacy_edges(monkeypatch, stack, src, "t104b")
+
+        calls: list[dict[str, Any]] = []
+        changed: list[dict[str, Any]] = []
+        real_strip = fork_mod.strip_retired_keys
+
+        def _strip(tags):
+            out = real_strip(tags)
+            calls.append(dict(tags))
+            if out != dict(tags):
+                changed.append(dict(tags))
+            return out
+
+        monkeypatch.setattr(fork_mod, "strip_retired_keys", _strip, raising=True)
+
+        snap: dict[str, Any] = {}
+        real_begin = fork_mod.begin_pack_creation
+
+        def _boom(*a, **kw):
+            snap["warned"] = bool(self._alias_warnings(caplog))
+            snap["calls"] = len(calls)
+            snap["changed"] = len(changed)
+            snap["rows"] = [dict(t) for t in calls]
+            assert real_begin is not None  # never reached; keeps the ref alive
+            raise RuntimeError("registry down")
+
+        monkeypatch.setattr(fork_mod, "begin_pack_creation", _boom, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t104b-dst")
+        assert "pack registration failed" in str(out.get("error")), out
+        assert snap["warned"] is True, snap
+        assert snap["changed"] == 4, snap
+        # 12 surviving sources + 13 surviving edges, every one of them passed
+        # through the strip site (design §18-4 contract 0: the call is
+        # unconditional, and `canonicalize_pack_alias` is the last gate before
+        # it, so "reached the strip site" and "survived" are the same set).
+        assert snap["calls"] == 25, snap
+        # ... and they were the REAL rows, not padding. An implementation can
+        # otherwise hit 25/4 by calling on the four aliased rows and then
+        # throwing 21 empty dicts at the helper, so the recorded inputs are
+        # checked for substance: none is empty, and both third-pack rows (one
+        # source, one edge) are present.
+        assert all(row for row in snap["rows"]), snap["rows"]
+        assert sum(1 for r in snap["rows"] if r.get("pack") == "other") == 2, snap["rows"]
+        assert sum(1 for r in snap["rows"] if r.get("pack") == src) == 2, snap["rows"]
+
+    # T104c is split across three test methods rather than three branches of
+    # one: `_seed_pack` writes its source under the fixed id "s0" and source
+    # identity is global across packs, so building the fixture twice inside a
+    # single `stack` collides. Each branch therefore takes a fresh stack.
+
+    def test_t104c_i_warning_silent_when_first_axis_floor_rejects(self, stack, monkeypatch, caplog):
+        """T104c(i): the aggregate warning sits AFTER the completeness floors,
+        so a run rejected by the FIRST axis (node) logs nothing -- the copy
+        never happened, so "dropped ... while copying" would not be true of it.
+
+        Reverse-mutation: logging before the floors puts a record here.
+        """
+        caplog.set_level(logging.WARNING)
+
+        # Two of twelve nodes lose their type. The denominator includes the
+        # anchor row, hence 2/13.
+        src_i = self._t104_fixture(stack, "t104ci")
+        self._inject_legacy_edges(monkeypatch, stack, src_i, "t104ci")
+        _patch_labels(
+            monkeypatch, stack, src_i,
+            lambda nid, cur: ["Weird"] if nid in ("t104ci-n0", "t104ci-n1") else cur,
+        )
+        out_i = _fork(stack, principal=ALICE, src_pack_id=src_i, new_pack_id="t104ci-dst")
+        # Pinning the axis name and the ratio, not just "completeness floor":
+        # an implementation that checks a dependent axis first would still say
+        # "completeness floor" while rejecting for the wrong reason.
+        assert "node loss ratio 2/13" in str(out_i.get("error")), out_i
+        assert self._alias_warnings(caplog) == []
+
+    def test_t104c_ii_warning_silent_when_last_axis_floor_rejects(self, stack, monkeypatch, caplog):
+        """T104c(ii): the same, for the LAST of the four axes (vector).
+
+        Checking only the first axis would let an implementation that logs
+        between the node and edge checks through: the node floor rejects before
+        it ever runs. Breaking the vector axis alone is what pins "after ALL
+        four".
+
+        Two ghost vectors point at ids in no mapping, so only the vector axis
+        moves -- 2 orphans over 14 real vectors (12 nodes + anchor + s0; the
+        fillers go in without vectors) plus the 2 ghosts themselves.
+
+        Reverse-mutation: logging anywhere among the four checks puts a record
+        here.
+        """
+        caplog.set_level(logging.WARNING)
+        src_ii = self._t104_fixture(stack, "t104cii")
+        self._inject_legacy_edges(monkeypatch, stack, src_ii, "t104cii")
+        real_export = type(stack["vector"]).export_pack_vectors
+
+        def _ghosts(self_, pack_id, *a, **kw):
+            rows = list(real_export(self_, pack_id, *a, **kw))
+            if pack_id != src_ii:
+                return rows
+            proto = rows[0]
+            for j in range(2):
+                ghost = dict(proto)
+                ghost["id"] = f"ghost-{j}"
+                ghost["metadata"] = dict(proto.get("metadata") or {})
+                rows.append(ghost)
+            return rows
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _ghosts, raising=True)
+        out_ii = _fork(stack, principal=ALICE, src_pack_id=src_ii, new_pack_id="t104cii-dst")
+        assert "vector loss ratio 2/16" in str(out_ii.get("error")), out_ii
+        assert self._alias_warnings(caplog) == []
+
+    def test_t104c_iii_no_warning_when_nothing_was_retired(self, stack, caplog):
+        """T104c(iii): a pack with no retired alias anywhere logs nothing, so
+        the signal does not fire on every healthy fork.
+
+        Reverse-mutation: logging unconditionally puts a record here.
+        """
+        caplog.set_level(logging.WARNING)
+        src_iii = _seed_pack(stack, ALICE, "t104ciii", node_count=12)
+        out_iii = _fork(stack, principal=ALICE, src_pack_id=src_iii, new_pack_id="t104ciii-dst")
+        assert out_iii["status"] == "ok", out_iii
+        assert self._alias_warnings(caplog) == []
+
+    # -- T105-T108: the sibling edge axis, the order contract, falsy pack_id --
+
+    def test_t105_legacy_edges_are_copied_not_rejected(self, stack, monkeypatch):
+        """T105: the edge axis gets the same treatment as the source axis --
+        edges carrying only the retired alias copy across instead of turning
+        the fork partial. (Their contribution to the aggregate count is pinned
+        by T104; this row owns the copy itself.)
+
+        Reverse-mutation: removing the edge strip turns the fork `partial`;
+        dropping the alias only when it equals the source pack dies on the
+        third-pack edge.
+        """
+        src = _seed_pack(stack, ALICE, "t105", node_count=12)
+        with principal_scope(ALICE):
+            for i in range(1, 11):
+                stack["builder"].add_edge(
+                    "resource", f"t105-n{i}", "cites", "resource", f"t105-n{i+1}",
+                    pack_id=src,
+                )
+        before = len(stack["graph"].export_edges_scoped([src], 200))
+        self._inject_legacy_edges(monkeypatch, stack, src, "t105")
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t105-dst")
+        assert out["status"] == "ok", out
+        assert out["copied"]["edges"] == before + 2, (out["copied"], before)
+
+    def test_t106_source_alias_conflict_still_tier1(self, stack):
+        """T106: the strip must NOT swallow a real contradiction. A source that
+        has a truthy `pack_id` AND a different alias beside it is a data
+        defect, and stays the Tier 1 skip it is today -- which is only visible
+        because `canonicalize_pack_alias` runs FIRST.
+
+        The node axis is filled to 12 as well as the source axis: the vector
+        floor's denominator is every exported vector, and nodes carry vectors,
+        so a small node fixture would reject this fork at 1/5 before any
+        counter could be read.
+
+        Reverse-mutation: moving the strip ahead of the canonicalize call makes
+        the conflicting source copy across silently and the counter go to 0.
+        """
+        src = _seed_pack(stack, ALICE, "t106", node_count=12, with_source=False)
+        with principal_scope(ALICE):
+            write_source(
+                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                text="conflict", source_id="t106-conflict", pack_id=src,
+            )
+        stack["docs"].upsert_source(
+            "t106-conflict", "conflict", {"pack_id": src, "pack": "other"},
+        )
+        for i in range(11):
+            stack["docs"].upsert_source(f"t106-f{i}", f"f{i}", {"pack_id": src})
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t106-dst")
+        assert out["status"] == "ok", out
+        assert out["skipped"]["sources_alias_conflict"] == 1, out["skipped"]
+        copied = stack["docs"].list_sources_scoped([out["pack_id"]], 200)
+        assert not any(
+            (s.get("source_id") or "").startswith("t106-conflict") for s in copied
+        ), [s.get("source_id") for s in copied]
+
+    def test_t107_edge_alias_conflict_still_tier1(self, stack, monkeypatch):
+        """T107: the order contract on the sibling axis. Before this row the
+        repository had no assertion on `edges_alias_conflict` at all, so
+        reversing the two calls on the edge side killed nothing.
+
+        Twelve nodes chain into eleven edges (i -> i+1), which is the most a
+        12-node chain yields; 1/11 stays under the floor.
+
+        Reverse-mutation: moving the edge strip ahead of the canonicalize call
+        makes the conflicting edge copy across and the counter go to 0.
+        """
+        src = _seed_pack(stack, ALICE, "t107", node_count=12)
+        with principal_scope(ALICE):
+            for i in range(1, 11):
+                stack["builder"].add_edge(
+                    "resource", f"t107-n{i}", "cites", "resource", f"t107-n{i+1}",
+                    pack_id=src,
+                )
+        real = type(stack["graph"]).export_edges_scoped
+
+        def _patched(self_, pack_ids, limit):
+            rows = real(self_, pack_ids, limit)
+            if src not in list(pack_ids):
+                return rows
+            rows = [dict(r) for r in rows]
+            rows[0]["rel_props"] = {"pack_id": src, "pack": "other"}
+            return rows
+
+        monkeypatch.setattr(type(stack["graph"]), "export_edges_scoped", _patched, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="t107-dst")
+        assert out["status"] == "ok", out
+        assert out["skipped"]["edges_alias_conflict"] == 1, out["skipped"]
+
+    @pytest.mark.parametrize(
+        "falsy", [None, "", False, 0, 0.0], ids=["none", "empty", "false", "zero", "zerofloat"],
+    )
+    def test_t108_falsy_pack_id_with_retired_alias_now_copies(self, stack, falsy):
+        """T108: the intended behaviour change. A source whose `pack_id` is
+        present but falsy is not covered by the ownership predicate's first
+        branch, so today it reaches the writer with the retired alias attached
+        and turns the fork partial. After the strip it copies cleanly.
+
+        All five falsy values are exercised because all five really do survive
+        export (measured); objects and arrays do not export at all and so are
+        out of scope.
+
+        Reverse-mutation: removing the strip makes every parameter `partial`;
+        narrowing the policy to the empty string alone leaves the other four.
+        """
+        tag = f"t108{['none', 'empty', 'false', 'zero', 'zerofloat'][[None, '', False, 0, 0.0].index(falsy)]}"
+        src = _seed_pack(stack, ALICE, tag, node_count=3)
+        stack["docs"].upsert_source(
+            f"{tag}-legacy", "body", {"pack_id": falsy, "source": src, "pack": "other"},
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=f"{tag}-dst")
+        assert out["status"] == "ok", out
+        dst = out["pack_id"]
+        metas = [s.get("metadata") or {} for s in stack["docs"].list_sources_scoped([dst], 200)]
+        assert metas, metas
+        assert not any("pack" in m for m in metas), metas
+        assert all(m.get("pack_id") == dst for m in metas), metas
