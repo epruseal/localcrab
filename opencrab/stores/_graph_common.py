@@ -364,3 +364,38 @@ def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
     if not space_id or _valid_space(props.get("space")):
         return props
     return {**props, "space": space_id}
+
+
+# ---------------------------------------------------------------------------
+# Label shape (design §18-3, issue #201)
+# ---------------------------------------------------------------------------
+
+#: The marker label ``Neo4jStore.upsert_node``'s ``MERGE`` stamps on EVERY node
+#: alongside its domain type -- see the ``MERGE (n:OpenCrabNode:{node_type} ...)``
+#: literal there. It is a storage-layer artefact, never a node's domain type, so
+#: any consumer that wants the type must filter it out (``domain_labels`` below).
+#: Named here rather than in ``neo4j_store`` because the CONSUMERS live outside
+#: that module and this file is already the backend-shared shape helper's home.
+GRAPH_BASE_LABEL = "OpenCrabNode"
+
+
+def domain_labels(labels: Any) -> list[str]:
+    """The domain type labels in *labels*, i.e. everything except
+    :data:`GRAPH_BASE_LABEL`, in the input's own order.
+
+    Exists because ``export_nodes_scoped``'s ``labels`` is NOT uniform across
+    backends: the SQL and Kuzu stores return a single-element ``[node_type]``,
+    while Neo4j returns ``labels(n)`` -- the marker plus the domain type, in an
+    order Cypher does not declare. So neither ``labels[0]`` nor ``labels[-1]``
+    is a correct way to read a node's type, and a consumer that needs the type
+    must ask this function instead.
+
+    Filters the marker ONLY. A label that is not a known node type is still a
+    domain label here (callers decide what to do with an unrecognised type);
+    dropping it would silently turn a two-label node into a one-label node and
+    hide exactly the ambiguity callers need to see.
+
+    Returns a new list; the input is never mutated. A ``None``/empty input
+    yields ``[]``.
+    """
+    return [label for label in (labels or []) if label != GRAPH_BASE_LABEL]

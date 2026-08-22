@@ -23,6 +23,7 @@ from opencrab.pack.write_gate import (
     EDGE_STAMPED,
     NODE_STAMPED,
     authorize,
+    authorize_fork_copy,
     edge_identity_conflict,
     identity_reject_message,
     node_identity_conflict,
@@ -65,6 +66,8 @@ class OntologyBuilder:
         pack_id: str,
         origin: str = "client",
         pack_anchor: bool = False,
+        fork_copy: bool = False,
+        write_vector: bool = True,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -90,6 +93,26 @@ class OntologyBuilder:
         pass ``pack_anchor=True`` is ``pack_create``'s anchor write.
         Everything else -- including the pack loader and every ordinary
         ``ontology_add_node``/REST call -- leaves it at the default False.
+
+        ``fork_copy`` (design v7 §4-C-2) is the second, narrower, opt-in:
+        when True, authorization goes through
+        ``write_gate.authorize_fork_copy`` instead of ``authorize``, which
+        widens the allowed status to the pack's own ``creating`` window
+        (and only when that row was reserved BY a fork -- see that
+        function's docstring). Everything else about the write --
+        identity guard, stamping, grammar validation, the "graph
+        unavailable => write nothing" contract -- is unchanged. The only
+        intended caller is ``opencrab/pack/fork.py``.
+
+        ``write_vector`` (design v7 §4-C-3), default True, is the third:
+        when False the Chroma leg is skipped entirely and the receipt
+        records ``"skipped (raw copy)"`` under ``stores["vector"]`` instead
+        of attempting a write. It exists because this leg unconditionally
+        calls ``upsert_texts`` -- which re-embeds -- and issue #200
+        forbids re-embedding a fork; fork imports the original vectors raw
+        instead and sets this to False only on its own node-copy call
+        (never on the anchor write, which needs a fresh embedding for its
+        own title/description).
 
         Parameters
         ----------
@@ -143,6 +166,8 @@ class OntologyBuilder:
                     "shape: " + "; ".join(mismatches)
                 )
             authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
+        elif fork_copy:
+            authorize_fork_copy(self._sql, principal, pack_id)
         else:
             authorize(self._sql, principal, pack_id)
         props = stamp(
@@ -262,7 +287,15 @@ class OntologyBuilder:
             output["stores"]["sql"] = "unavailable"
 
         # --- Chroma vector write ---
-        if self._vec is not None and self._vec.available:
+        if not write_vector:
+            # design v7 §4-C-3: fork's raw node copy imports the original
+            # embedding itself later (no re-embedding, #200) -- this leg
+            # must not run for that call. Recorded, not silently skipped,
+            # so `_fork_leg_ok` (opencrab/pack/fork.py) can require exactly
+            # this value rather than treating an untouched "unavailable" as
+            # equivalent.
+            output["stores"]["vector"] = "skipped (raw copy)"
+        elif self._vec is not None and self._vec.available:
             try:
                 from opencrab.ontology.bm25 import _node_text
                 text = _node_text({"node_id": node_id, "node_type": node_type, "properties": props})
@@ -309,6 +342,7 @@ class OntologyBuilder:
         *,
         pack_id: str,
         origin: str = "client",
+        fork_copy: bool = False,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -337,6 +371,11 @@ class OntologyBuilder:
             overwritten that value upstream, so the client rule passes anyway.
             Passed for symmetry, and so the meaning does not change silently
             if owner_id is ever added to EDGE_STAMPED.
+        fork_copy:
+            See ``add_node``'s ``fork_copy`` -- same widened authorization
+            (``write_gate.authorize_fork_copy``), same restriction to the
+            pack's own fork-reserved ``creating`` window. There is no
+            vector leg on an edge, so no ``write_vector`` counterpart here.
 
         Returns
         -------
@@ -354,7 +393,10 @@ class OntologyBuilder:
 
         # See add_node: gate first, alias normalisation second (#148).
         principal = current_principal()
-        authorize(self._sql, principal, pack_id)
+        if fork_copy:
+            authorize_fork_copy(self._sql, principal, pack_id)
+        else:
+            authorize(self._sql, principal, pack_id)
         props = stamp(
             properties, principal=principal, pack_id=pack_id, keys=EDGE_STAMPED,
             origin=origin,

@@ -117,6 +117,14 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   `apply_pack_tag` 로 정규화하고, 범용 진입점(`builder.add_node`/`add_edge`,
   `HybridQuery.ingest`)은 `canonicalize_pack_alias` 로 **불일치를 `ValueError` 로 거부**한다.
   한 행이 `pack` 과 truthy `pack_id` 를 동시에 갖고 값이 다를 수 없다는 것이 그 불변식이다.
+- **`pack_fork`(#201)는 doc·엣지 축에서 복사 전에 폐기 별칭을 버린다.** 복사본은 새 팩
+  소유이므로 fork 는 preflight 의 소스·엣지 루프에서 `canonicalize_pack_alias` **다음에**
+  `strip_retired_keys` 를 부른다. 순서가 계약이다 — canonicalize 를 먼저 불러야
+  "truthy `pack_id` + 다른 별칭" 이 지금처럼 Tier 1 데이터 결함으로 잡히고, strip 을 먼저
+  하면 그 모순이 조용히 삼켜진다. 완화를 writer 쪽에 넣지 않는 이유도 같다: 범용 funnel 에서
+  버리면 모든 호출자에 대해 fail-open 이 된다. 벡터 축의 `validate_import_records` 가 같은
+  이유로 이미 같은 선택을 하고 있어, fork 는 그 선례를 doc·엣지 축에 맞춘 것이다. 자세한
+  근거는 `opencrab/pack/fork.py` 모듈 docstring 의 "RETIRED ALIASES" 절에 있다.
 - **`pack` 만 있고 `pack_id` 가 없는 행은 보존한다.** 모순이 아니고, 임의 속성을 그대로
   저장한다는 진입점 계약을 깰 이유가 없다. 읽는 코드가 0곳이라 무해하다.
 - **증분 대조는 `pack` 을 무시한다**(`load.INCREMENTAL_IGNORED_KEYS`, 노드축·청크축 둘 다).
