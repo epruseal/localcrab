@@ -50,6 +50,41 @@ this codebase's history (an incident this function's docstring exists to
 not repeat): a status this module has never seen (a typo, a new backend's
 new string) reads as success under a negative list and as failure here,
 which is the only direction that is safe to be wrong in.
+
+TWO SHAPE CONTRACTS the copy normalises on the way through (issue #201
+review round 6, design §18) -- both live here rather than in the stores
+because fork is the one caller that legitimately re-tags rows to a new
+owner:
+
+  LABELS. ``export_nodes_scoped``'s ``labels`` is not uniform. The Neo4j
+    backend's ``upsert_node`` stamps ``_graph_common.GRAPH_BASE_LABEL``
+    beside the domain type and export hands back ``labels(n)`` verbatim,
+    in an order Cypher does not declare; the SQL and Kuzu backends return
+    a bare ``[node_type]``. So no positional read is correct. This module
+    resolves the type ONCE in the §5-1 node loop via
+    ``_graph_common.domain_labels`` and both later consumers -- the §5-2
+    step 12 identity probe and the §5-3 step 14 write -- reuse that value
+    through ``seen_node_types`` rather than re-indexing ``labels``. A node
+    carrying two or more domain labels rejects the whole fork: the
+    destination write stamps exactly one ``node_type``, so no policy can
+    reproduce that shape, and picking one of them is not deterministic.
+    That judgement runs BEFORE the anchor branch, because a row whose type
+    cannot be determined cannot be judged to be the anchor either.
+
+  RETIRED ALIASES. A legacy row may carry only the retired ``pack`` key
+    with no ``pack_id``. Copied verbatim it reaches the destination writer,
+    which rejects it and turns the whole fork ``partial``. Both preflight
+    sites -- the §5-1 edge loop and source loop -- therefore call
+    ``pack_tags.strip_retired_keys`` AFTER ``canonicalize_pack_alias``.
+    The order is the contract, not a detail: canonicalising first is what
+    still classifies "truthy ``pack_id`` beside a different alias" as the
+    Tier 1 data defect it is, and stripping first would swallow that
+    contradiction -- which is exactly the hole #171 closed. The node axis
+    is deliberately left alone (a retired alias cannot reach it; the
+    comment at that site is the tripwire if that ever changes). How many
+    rows lost an alias is reported as ONE aggregate warning, emitted after
+    all four completeness floors and before the reservation; the response
+    schema does not grow a key for it.
 """
 
 from __future__ import annotations
