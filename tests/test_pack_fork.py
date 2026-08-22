@@ -3144,18 +3144,30 @@ class TestLabelShapeAndRetiredAlias:
     def _t104_fixture(stack, tag):
         src = _seed_pack(stack, ALICE, tag, node_count=12)
         docs = stack["docs"]
-        docs.upsert_source(f"{tag}-legacy-a", "ba", {"source": src, "pack": src})
-        docs.upsert_source(f"{tag}-legacy-b", "bb", {"source": src, "pack": "other"})
+        # Every row that will reach the strip site carries a unique `row` tag,
+        # so T104b can compare the helper's actual arguments against the exact
+        # set of surviving rows rather than just counting them. (`s0`, written
+        # by `_seed_pack`, is the one untagged source -- accounted for by name.)
+        docs.upsert_source(
+            f"{tag}-legacy-a", "ba", {"source": src, "pack": src, "row": "legacy-a"},
+        )
+        docs.upsert_source(
+            f"{tag}-legacy-b", "bb", {"source": src, "pack": "other", "row": "legacy-b"},
+        )
         # Same-value alias: `canonicalize_pack_alias` removes this one first,
         # so it must NOT reach the strip site and must NOT be counted.
-        docs.upsert_source(f"{tag}-same", "bs", {"pack_id": src, "pack": src})
+        docs.upsert_source(
+            f"{tag}-same", "bs", {"pack_id": src, "pack": src, "row": "same"},
+        )
         for i in range(8):
-            docs.upsert_source(f"{tag}-f{i}", f"filler {i}", {"pack_id": src})
+            docs.upsert_source(
+                f"{tag}-f{i}", f"filler {i}", {"pack_id": src, "row": f"src-f{i}"},
+            )
         with principal_scope(ALICE):
             for i in range(1, 11):
                 stack["builder"].add_edge(
                     "resource", f"{tag}-n{i}", "cites", "resource", f"{tag}-n{i+1}",
-                    pack_id=src,
+                    {"row": f"edge-chain-{i}"}, pack_id=src,
                 )
         return src
 
@@ -3174,7 +3186,7 @@ class TestLabelShapeAndRetiredAlias:
                 edge = dict(proto)
                 edge["source_props"] = {**proto["source_props"], "id": f"{tag}-n0"}
                 edge["target_props"] = {**proto["target_props"], "id": f"{tag}-n{2+j}"}
-                edge["rel_props"] = {"pack": alias}
+                edge["rel_props"] = {"pack": alias, "row": f"edge-legacy-{j}"}
                 rows.append(edge)
             return rows
 
@@ -3259,14 +3271,12 @@ class TestLabelShapeAndRetiredAlias:
         monkeypatch.setattr(fork_mod, "strip_retired_keys", _strip, raising=True)
 
         snap: dict[str, Any] = {}
-        real_begin = fork_mod.begin_pack_creation
 
         def _boom(*a, **kw):
             snap["warned"] = bool(self._alias_warnings(caplog))
             snap["calls"] = len(calls)
             snap["changed"] = len(changed)
             snap["rows"] = [dict(t) for t in calls]
-            assert real_begin is not None  # never reached; keeps the ref alive
             raise RuntimeError("registry down")
 
         monkeypatch.setattr(fork_mod, "begin_pack_creation", _boom, raising=True)
@@ -3280,14 +3290,26 @@ class TestLabelShapeAndRetiredAlias:
         # unconditional, and `canonicalize_pack_alias` is the last gate before
         # it, so "reached the strip site" and "survived" are the same set).
         assert snap["calls"] == 25, snap
-        # ... and they were the REAL rows, not padding. An implementation can
-        # otherwise hit 25/4 by calling on the four aliased rows and then
-        # throwing 21 empty dicts at the helper, so the recorded inputs are
-        # checked for substance: none is empty, and both third-pack rows (one
-        # source, one edge) are present.
-        assert all(row for row in snap["rows"]), snap["rows"]
-        assert sum(1 for r in snap["rows"] if r.get("pack") == "other") == 2, snap["rows"]
-        assert sum(1 for r in snap["rows"] if r.get("pack") == src) == 2, snap["rows"]
+        # ... and they were the REAL rows, not padding. Counting alone can be
+        # satisfied by calling on the four aliased rows and then feeding the
+        # helper 21 throwaway dicts, so the recorded arguments are matched
+        # against the exact set of surviving rows by their `row` tags.
+        expected_rows = (
+            {"legacy-a", "legacy-b", "same"}
+            | {f"src-f{i}" for i in range(8)}
+            | {f"edge-chain-{i}" for i in range(1, 11)}
+            | {"edge-legacy-0", "edge-legacy-1"}
+        )
+        seen_rows = {r.get("row") for r in snap["rows"] if r.get("row")}
+        assert seen_rows == expected_rows, (
+            sorted(expected_rows - seen_rows), sorted(seen_rows - expected_rows),
+        )
+        # 25 calls = the 23 tagged rows above plus the two `_seed_pack` writes
+        # that predate this fixture and carry no tag: its `s0` source and its
+        # own n0->n1 edge. Both are still real rows owned by the source pack.
+        untagged = [r for r in snap["rows"] if not r.get("row")]
+        assert len(untagged) == 2, untagged
+        assert all(r.get("pack_id") == src for r in untagged), untagged
 
     # T104c is split across three test methods rather than three branches of
     # one: `_seed_pack` writes its source under the fixed id "s0" and source
@@ -3462,7 +3484,7 @@ class TestLabelShapeAndRetiredAlias:
     @pytest.mark.parametrize(
         "falsy", [None, "", False, 0, 0.0], ids=["none", "empty", "false", "zero", "zerofloat"],
     )
-    def test_t108_falsy_pack_id_with_retired_alias_now_copies(self, stack, falsy):
+    def test_t108_falsy_pack_id_with_retired_alias_now_copies(self, stack, falsy, request):
         """T108: the intended behaviour change. A source whose `pack_id` is
         present but falsy is not covered by the ownership predicate's first
         branch, so today it reaches the writer with the retired alias attached
@@ -3475,7 +3497,11 @@ class TestLabelShapeAndRetiredAlias:
         Reverse-mutation: removing the strip makes every parameter `partial`;
         narrowing the policy to the empty string alone leaves the other four.
         """
-        tag = f"t108{['none', 'empty', 'false', 'zero', 'zerofloat'][[None, '', False, 0, 0.0].index(falsy)]}"
+        # NB `[None, "", False, 0, 0.0].index(falsy)` cannot be used to name
+        # this pack: False == 0 == 0.0 in Python, so three parameters would
+        # collide on one tag. `request.node.callspec.id` is the parameter's own
+        # id and is unique by construction.
+        tag = f"t108{request.node.callspec.id}"
         src = _seed_pack(stack, ALICE, tag, node_count=3)
         stack["docs"].upsert_source(
             f"{tag}-legacy", "body", {"pack_id": falsy, "source": src, "pack": "other"},
