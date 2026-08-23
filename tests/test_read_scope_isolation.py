@@ -944,7 +944,19 @@ class TestMongoDocStoreScoping:
         store.list_nodes_scoped([PACK_A, PACK_PUBLIC], limit=10)
 
         query = collection.find.call_args[0][0]
-        assert query["properties.pack_id"] == {"$in": [PACK_A, PACK_PUBLIC]}
+        # Issue #222: the membership test alone is not enough. `$in` and
+        # `$type` examine array ELEMENTS, and a dotted path traverses an
+        # array of embedded documents, so a bare `$in` matched rows the SQL
+        # twin excludes -- cross-pack visibility on a read scope. The array
+        # exclusions below are what close that; `tests/
+        # test_mongo_owner_equivalence.py` pins the resulting verdicts
+        # against a real SQL store shape by shape.
+        assert query["properties.pack_id"] == {
+            "$in": [PACK_A, PACK_PUBLIC],
+            "$type": "string",
+            "$not": {"$type": "array"},
+        }
+        assert query["properties"] == {"$not": {"$type": "array"}}
 
     def test_empty_scope_never_queries(self):
         store, collection = self._store([])
