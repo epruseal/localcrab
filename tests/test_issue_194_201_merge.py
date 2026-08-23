@@ -1215,3 +1215,106 @@ def test_a_moved_row_is_reported_whole_not_half(sql, alice, monkeypatch):
     assert row["action"] == "skipped (row moved before the lock)"
     assert row["status"] == "partial"
     assert row["owner_id"] == bob, "reported the deleted row's owner"
+
+
+class TestNothingPreLockLeaksIntoTheWindow:
+    """Fifth and sixth of the same family, kept together on purpose.
+
+    Everything this branch got wrong repeatedly had one shape: a value taken
+    before the lock, used for a decision made inside it. The row was the
+    obvious one. The clock and the running tally are the same mistake wearing
+    different clothes.
+    """
+
+    def test_the_clock_is_read_inside_the_window_too(self, sql, alice, monkeypatch):
+        """`now` is stamped before the candidate query.
+
+        Wait long enough on the lock and a legitimately fresh row is dated
+        after that stamp, so the re-read gate calls it "in the future" and
+        reports an unknown age for a row whose age is perfectly knowable.
+        """
+        import contextlib
+        import time
+
+        import opencrab.locking as locking_mod
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+
+        pid = begin_pack_creation(sql, alice, "slow-wait")
+        TestRepairRegistryLockWindows._stale(sql, pid)
+        real_lock = locking_mod.write_lock
+
+        @contextlib.contextmanager
+        def dawdle_then_replace(*a, **kw):
+            time.sleep(1.2)  # outlive the pre-lock clock stamp
+            with sql._engine.begin() as conn:
+                conn.execute(
+                    _sql_text("DELETE FROM packs WHERE pack_id = :p"), {"p": pid}
+                )
+            ownership_mod.begin_pack_creation(sql, alice, pid)
+            with real_lock(*a, **kw):
+                yield
+
+        monkeypatch.setattr(locking_mod, "write_lock", dawdle_then_replace)
+
+        result = repair_incomplete_packs(
+            sql, Graph(), Docs(), Vec(), older_than_seconds=3600, apply=True
+        )
+
+        row = next(r for r in result["rows"] if r["pack_id"] == pid)
+        assert row["action"] == "skipped (too recent)", (
+            "a fresh row was judged against a clock read before the lock"
+        )
+
+    def test_the_status_tally_follows_the_row_that_was_adopted(
+        self, sql, alice, monkeypatch
+    ):
+        """The summary and the row detail have to agree.
+
+        `counts` is bumped from the pre-lock scan. If the re-read adopts a
+        different status, a tally left behind says `creating: 1` about a row
+        the same report calls `partial`.
+        """
+        import contextlib
+
+        import opencrab.locking as locking_mod
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+
+        pid = begin_pack_creation(sql, alice, "tally")
+        TestRepairRegistryLockWindows._stale(sql, pid)
+        real_lock = locking_mod.write_lock
+
+        @contextlib.contextmanager
+        def demote_it(*a, **kw):
+            ownership_mod.mark_pack_partial(sql, pid, alice)
+            with real_lock(*a, **kw):
+                yield
+
+        monkeypatch.setattr(locking_mod, "write_lock", demote_it)
+
+        result = repair_incomplete_packs(
+            sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+        )
+
+        row = next(r for r in result["rows"] if r["pack_id"] == pid)
+        assert row["status"] == "partial"
+        assert result["counts"]["partial"] == 1
+        assert result["counts"]["creating"] == 0
+
+
+def test_sweep_data_dir_reaches_the_lock(sql, alice, rec):
+    """The parameter exists so a caller whose stores are elsewhere can lock
+    the right file. Accepting it and dropping it looks identical from the
+    signature."""
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    TestRepairRegistryLockWindows._stale(sql, begin_pack_creation(sql, alice, "dd"))
+    rec.reset()
+
+    repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(),
+        older_than_seconds=0, apply=True, data_dir="/tmp/o223-sweep",
+    )
+
+    assert rec.dirs and all(d == "/tmp/o223-sweep" for d in rec.dirs)

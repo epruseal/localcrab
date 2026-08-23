@@ -467,6 +467,15 @@ def repair_incomplete_packs(
                         row = fresh
                         owner_id = row["owner_id"]
                         entry["owner_id"] = owner_id
+                        # The status tally was taken from the pre-lock scan.
+                        # If the row moved, move the count with it, or the
+                        # summary says `creating: 1` about a row this same
+                        # report describes as `partial`.
+                        if row["status"] != entry["status"]:
+                            if entry["status"] in counts:
+                                counts[entry["status"]] -= 1
+                            if row["status"] in counts:
+                                counts[row["status"]] += 1
                         entry["status"] = row["status"]
 
                     if fresh is None or fresh["status"] != PACK_STATUS_CREATING:
@@ -488,8 +497,15 @@ def repair_incomplete_packs(
                     # to keep this pass off rows someone is still creating. So
                     # re-run that gate on what was actually read, and refresh
                     # the fields the report will carry.
+                    # Stamp the clock inside the window too. `now` was taken
+                    # before the candidate query, so a lock wait of more than a
+                    # second makes a legitimately fresh row look like it is
+                    # dated in the future. Comparing a value read here against
+                    # a clock read before the lock is the same mistake as
+                    # comparing it against a row read before the lock.
+                    now_locked = datetime.now(UTC)
                     fresh_dt = _parse_updated_at(fresh.get("updated_at"))
-                    if fresh_dt is None or fresh_dt > now:
+                    if fresh_dt is None or fresh_dt > now_locked:
                         entry["action"] = "skipped (unknown age)"
                         entry["reason"] = (
                             "updated_at is missing, unparseable, or in the "
@@ -498,7 +514,7 @@ def repair_incomplete_packs(
                         counts["skipped"] += 1
                         results.append(entry)
                         continue
-                    fresh_age = (now - fresh_dt).total_seconds()
+                    fresh_age = (now_locked - fresh_dt).total_seconds()
                     if fresh_age < older_than_seconds:
                         entry["action"] = "skipped (too recent)"
                         entry["reason"] = (
