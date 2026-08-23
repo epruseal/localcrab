@@ -1172,3 +1172,46 @@ def test_a_slug_reused_under_the_lock_is_not_judged_by_the_old_row_s_age(
     # before the write, so the identity has to be adopted on the way in
     # rather than on the way out.
     assert row["owner_id"] == bob
+
+
+def test_a_moved_row_is_reported_whole_not_half(sql, alice, monkeypatch):
+    """The report must not mix two rows.
+
+    If the slug is re-reserved by someone else and the replacement is not
+    `creating`, this pass bails at the first gate. That gate reports, so it
+    has to report the row that is actually there -- owner and status both.
+    Taking the status from the re-read while leaving the owner from before
+    the lock produces a line describing a pack that never existed.
+    """
+    import contextlib
+
+    import opencrab.locking as locking_mod
+    import opencrab.pack.ownership as ownership_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    pid = begin_pack_creation(sql, alice, "handed-over")
+    TestRepairRegistryLockWindows._stale(sql, pid)
+    bob = create_user(sql, "Bob")
+    real_lock = locking_mod.write_lock
+
+    @contextlib.contextmanager
+    def hand_the_slug_to_bob(*a, **kw):
+        with sql._engine.begin() as conn:
+            conn.execute(
+                _sql_text("DELETE FROM packs WHERE pack_id = :p"), {"p": pid}
+            )
+        ownership_mod.begin_pack_creation(sql, bob, pid)
+        ownership_mod.mark_pack_partial(sql, pid, bob)
+        with real_lock(*a, **kw):
+            yield
+
+    monkeypatch.setattr(locking_mod, "write_lock", hand_the_slug_to_bob)
+
+    result = repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+    )
+
+    row = next(r for r in result["rows"] if r["pack_id"] == pid)
+    assert row["action"] == "skipped (row moved before the lock)"
+    assert row["status"] == "partial"
+    assert row["owner_id"] == bob, "reported the deleted row's owner"

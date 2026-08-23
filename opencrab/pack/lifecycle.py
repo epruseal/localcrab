@@ -451,6 +451,24 @@ def repair_incomplete_packs(
                     # safe. It is what stops the pass from probing, branching,
                     # and reporting on a row that already moved.
                     fresh = get_pack(sql, pack_id)
+
+                    # Adopt first, gate second. Every branch below this point
+                    # reports, and a slug freed and re-reserved during the lock
+                    # wait can come back under a different owner -- so the
+                    # report has to describe the row that is actually there
+                    # before anything decides to return. Splitting adoption
+                    # across the gates is what put a deleted row's owner next
+                    # to a replacement row's status in the same line.
+                    #
+                    # `fresh is None` adopts nothing on purpose: there is no
+                    # row to describe, and the pre-lock values still name the
+                    # row this entry is reporting on.
+                    if fresh is not None:
+                        row = fresh
+                        owner_id = row["owner_id"]
+                        entry["owner_id"] = owner_id
+                        entry["status"] = row["status"]
+
                     if fresh is None or fresh["status"] != PACK_STATUS_CREATING:
                         entry["action"] = "skipped (row moved before the lock)"
                         entry["reason"] = (
@@ -458,21 +476,9 @@ def repair_incomplete_packs(
                             if fresh is None
                             else f"status is now {fresh['status']!r}"
                         )
-                        if fresh is not None:
-                            entry["status"] = fresh["status"]
                         counts["skipped"] += 1
                         results.append(entry)
                         continue
-
-                    # Adopt the fresh row's identity BEFORE anything that can
-                    # return. The gates below report, and a replacement row can
-                    # have a different owner than the one that was deleted, so
-                    # refreshing after them would attribute the replacement to
-                    # the row it replaced.
-                    row = fresh
-                    owner_id = row["owner_id"]
-                    entry["owner_id"] = owner_id
-                    entry["status"] = row["status"]
 
                     # Still `creating` is not the same as still the same row.
                     # A slug freed and re-reserved while this pass waited for
