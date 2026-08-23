@@ -30,6 +30,7 @@ import pathlib
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import text as _sql_text
 
 from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.ontology.builder import OntologyBuilder
@@ -1121,3 +1122,47 @@ def test_sweep_decides_on_the_row_it_reads_inside_the_lock(sql, alice, monkeypat
     row = next(r for r in result["rows"] if r["pack_id"] == pid)
     assert row["action"] == "skipped (row moved before the lock)"
     assert get_pack(sql, pid)["status"] == PACK_STATUS_READY
+
+
+def test_a_slug_reused_under_the_lock_is_not_judged_by_the_old_row_s_age(
+    sql, alice, monkeypatch
+):
+    """Still `creating` is not the same as still the same row.
+
+    If the stale candidate goes away and the slug is re-reserved while this
+    pass waits for the lock, the re-read finds a `creating` row again -- a
+    brand-new one. Judging it with the previous row's timestamp would demote
+    a pack somebody is still creating, which is the exact thing the age gate
+    exists to prevent. So the gate has to run again on what was read.
+    """
+    import contextlib
+
+    import opencrab.locking as locking_mod
+    import opencrab.pack.ownership as ownership_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    pid = begin_pack_creation(sql, alice, "reused-slug")
+    TestRepairRegistryLockWindows._stale(sql, pid)
+    real_lock = locking_mod.write_lock
+
+    @contextlib.contextmanager
+    def swap_the_row(*a, **kw):
+        # Delete the aged row and re-reserve the same id, fresh.
+        with sql._engine.begin() as conn:
+            conn.execute(
+                _sql_text("DELETE FROM packs WHERE pack_id = :p"), {"p": pid}
+            )
+        ownership_mod.begin_pack_creation(sql, alice, pid)
+        with real_lock(*a, **kw):
+            yield
+
+    monkeypatch.setattr(locking_mod, "write_lock", swap_the_row)
+
+    result = repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(), older_than_seconds=3600, apply=True
+    )
+
+    row = next(r for r in result["rows"] if r["pack_id"] == pid)
+    assert row["action"] == "skipped (too recent)"
+    assert "re-read under the lock" in row["reason"]
+    assert get_pack(sql, pid)["status"] == "creating"

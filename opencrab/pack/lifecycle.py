@@ -463,8 +463,40 @@ def repair_incomplete_packs(
                         counts["skipped"] += 1
                         results.append(entry)
                         continue
+
+                    # Still `creating` is not the same as still the same row.
+                    # A slug freed and re-reserved while this pass waited for
+                    # the lock comes back `creating` too, and acting on it with
+                    # the previous row's timestamp would demote or promote a
+                    # pack that is seconds old -- the age gate exists precisely
+                    # to keep this pass off rows someone is still creating. So
+                    # re-run that gate on what was actually read, and refresh
+                    # the fields the report will carry.
+                    fresh_dt = _parse_updated_at(fresh.get("updated_at"))
+                    if fresh_dt is None or fresh_dt > now:
+                        entry["action"] = "skipped (unknown age)"
+                        entry["reason"] = (
+                            "updated_at is missing, unparseable, or in the "
+                            "future when re-read under the lock"
+                        )
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+                    fresh_age = (now - fresh_dt).total_seconds()
+                    if fresh_age < older_than_seconds:
+                        entry["action"] = "skipped (too recent)"
+                        entry["reason"] = (
+                            f"age {fresh_age:.0f}s < threshold "
+                            f"{older_than_seconds}s when re-read under the lock"
+                        )
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+
                     row = fresh
                     owner_id = row["owner_id"]
+                    entry["owner_id"] = owner_id
+                    entry["status"] = row["status"]
 
                 probes = probe_anchor(graph, docs, vector, pack_id)
                 entry["probes"] = probes
