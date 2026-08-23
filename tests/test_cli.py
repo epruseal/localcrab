@@ -439,7 +439,9 @@ class TestIngest:
 
         assert result.exit_code == 0
         assert "Ingested 2/2 files." in result.output
-        assert mock_vector_store.count() == 2
+        # #194: first ingest into a ready pack without anchor (default pack)
+        # auto-creates dataset:{pack_id} anchor, which is also vectorized
+        assert mock_vector_store.count() == 3
 
     # --- Error ---
     def test_ingest_missing_path_exits_nonzero_no_traceback(self, cli_env, runner):
@@ -464,7 +466,8 @@ class TestIngest:
         assert result.exit_code == 0
         assert result.exception is None
         assert "Ingested 1/1 files." in result.output
-        assert mock_vector_store.count() == 1
+        # #194: +1 for auto-created anchor on first ingest into default pack
+        assert mock_vector_store.count() == 2
 
     def test_ingest_pack_id_inferred_from_path(
         self, bootstrapped, cli_env, runner, mock_vector_store
@@ -522,7 +525,11 @@ class TestQuery:
 
         result = runner.invoke(main, ["query", "the quick brown fox jumps"])
         assert result.exit_code == 0
-        assert "Found 1 result(s)" in result.output
+        # #194: ingest auto-creates dataset:pack-a anchor, which is also
+        # vectorized and may be returned as a second hit alongside the doc
+        assert "Found " in result.output and "pack=pack-a" in result.output
+        # At least the ingested doc must be found; anchor may be an extra hit
+        assert "Found 1 result(s)" in result.output or "Found 2 result(s)" in result.output
 
     # --- Edge: three output formats / legacy shape contract ---
     def test_legacy_json_output_is_a_bare_list(

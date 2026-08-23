@@ -944,7 +944,10 @@ def pack_create(
     # list_packs_for filter on status='ready') and every write path but the
     # anchor write itself (write_gate's default allowed_statuses excludes
     # 'creating') treats this pack as if it does not exist yet, until it is
-    # promoted or demoted below. Same slug-collision negotiation as
+    # promoted or demoted below. #201 added a second way into a 'creating'
+    # pack (a fork's bulk copy, via write_gate.authorize_fork_copy), but it
+    # cannot reach THIS row: that path requires forked_from, and the
+    # reservation below leaves it unset. Same slug-collision negotiation as
     # create_pack (see begin_pack_creation's docstring): a collision is
     # NEVER reported as an error (#143 invariant 7), so `slug` below may
     # differ from the caller's requested pack_id. The actually-assigned
@@ -1477,6 +1480,24 @@ def pack_ingest(
         return {
             "error": "no content provided: supply at least one of nodes, edges, or text"
         }
+
+    # #194: auto-create anchor if missing for ready packs that have lost it
+    # (legacy migration packs, manual deletion, or dumps that never contained
+    # dataset:{pack_id}). Best-effort, does not block ingest on failure.
+    try:
+        from opencrab.pack.lifecycle import ensure_anchor
+
+        ensure_anchor(
+            ctx["sql"],
+            ctx["builder"],
+            ctx["neo4j"],
+            ctx["mongo"],
+            ctx["chroma"],
+            pack_id,
+            apply=True,
+        )
+    except Exception:
+        pass
 
     sid = source_id
     if text and not sid:

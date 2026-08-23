@@ -597,3 +597,293 @@ def repair_incomplete_packs(
         "rows": results,
         "promote_result": promote_result,
     }
+
+
+def ensure_anchor(
+    sql: Any,
+    builder: Any,
+    graph: Any,
+    docs: Any,
+    vector: Any,
+    pack_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    principal: Any | None = None,
+    apply: bool = True,
+) -> dict[str, Any]:
+    """Ensure ``pack_id``'s anchor node exists, creating it if missing (#194).
+
+    For ``ready`` packs that have lost their anchor (legacy migration, manual
+    deletion, or a dump that never contained ``dataset:{pack_id}``). Idempotent:
+    a present anchor is a no-op. Only ``ready`` packs are considered; other
+    statuses are handled by :func:`repair_incomplete_packs`.
+
+    When ``apply`` is False, reports what would be done without writing.
+    Returns ``{"action": "already_present"|"created"|"skipped", ...}`` with
+    ``probes`` for observability. ``graph`` is the system of record;
+    ``unverifiable`` is treated as skipped (fail-closed).
+
+    **Only the graph leg decides success.** The optional doc and vector legs
+    are reported in ``stores`` and never make this call fail. That is a
+    weaker bar than ``pack.fork``'s ``_fork_leg_ok("anchor")``, which
+    requires all four legs, and the difference is deliberate: fork's
+    preflight has already established that every store is available before
+    it writes, so a failing leg there means something broke mid-call and the
+    half-built pack is better demoted. This function repairs a pack that is
+    already ``ready``, under whatever deployment shape it finds. Demanding
+    all four legs would make a pack permanently unrepairable whenever the
+    vector store is down, and restoring the graph anchor is strictly better
+    than restoring nothing. Nothing is promoted either way -- this call
+    never touches the registry row's status.
+    """
+    from opencrab.auth import Principal, current_principal, principal_scope
+    from opencrab.pack.ownership import anchor_node_id, get_pack
+
+    pack = get_pack(sql, pack_id)
+    if pack is None:
+        return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
+    if pack["status"] != "ready":
+        return {
+            "action": "skipped",
+            "reason": f"pack status is {pack['status']!r}, not 'ready'",
+            "pack_id": pack_id,
+            "status": pack["status"],
+        }
+
+    probes = probe_anchor(graph, docs, vector, pack_id)
+    if probes.get("graph") == PROBE_PRESENT:
+        return {"action": "already_present", "pack_id": pack_id, "probes": probes}
+    if probes.get("graph") != PROBE_ABSENT:
+        # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
+        # "absent" at graph level; but UNKNOWN means we cannot tell.
+        # optional-only is still "graph absent", so we should create.
+        # Only UNKNOWN is skipped.
+        if probes.get("graph") == PROBE_UNKNOWN:
+            return {
+                "action": "skipped",
+                "reason": "graph probe unverifiable",
+                "pack_id": pack_id,
+                "probes": probes,
+            }
+        # For optional-only, graph is absent, so we fall through to create.
+        # The check above already handled UNKNOWN, so remaining is ABSENT or
+        # optional-only (which is graph absent).
+        pass
+
+    # At this point graph is absent (including optional-only case).
+    # Resolve title/description from explicit args or registry fallback.
+    resolved_title = title if title is not None else (pack.get("title") or pack_id)
+    resolved_description = description if description is not None else (pack.get("description") or "")
+
+    if not apply:
+        return {
+            "action": "would_create",
+            "pack_id": pack_id,
+            "probes": probes,
+            "title": resolved_title,
+        }
+
+    if builder is None or not getattr(builder, "_neo4j", None):
+        return {
+            "action": "skipped",
+            "reason": "builder or graph store unavailable",
+            "pack_id": pack_id,
+            "probes": probes,
+        }
+
+    # Need a principal that owns the pack. Use explicit one if given,
+    # otherwise try current_principal, otherwise synthesize from owner.
+    use_principal = principal
+    if use_principal is None:
+        try:
+            use_principal = current_principal()
+        except LookupError:
+            # Fallback: synthesize a principal for the pack owner. This is
+            # only for offline repair where no request principal exists; the
+            # anchor write is still authorized via ownership, not via the
+            # caller's identity beyond being the owner.
+            # Fetch is_local from users table if possible.
+            try:
+                from sqlalchemy import text
+
+                with sql._engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT is_local FROM users WHERE user_id = :uid"),
+                        {"uid": pack["owner_id"]},
+                    ).fetchone()
+                is_local = bool(row[0]) if row else False
+            except Exception:
+                is_local = False
+            use_principal = Principal(
+                user_id=pack["owner_id"], is_local=is_local, disabled=False
+            )
+
+    # Anchor shape and stamping mirrors pack_create's anchor write -- unless
+    # the registry says this pack came from a fork, in which case it mirrors
+    # pack_fork's anchor write instead (see below).
+    anchor_id = anchor_node_id(pack_id)
+    props = {
+        "pack_id": pack_id,
+        "title": resolved_title,
+        "description": resolved_description,
+        "created_by": "localcrab-mcp",
+    }
+    forked_from = pack.get("forked_from")
+    if forked_from:
+        # A fork stamps two extra provenance values onto its anchor (see
+        # `pack.fork`'s anchor write). Rebuilding without them would quietly
+        # rewrite a forked pack's anchor to look like a natively created
+        # one -- a repair pass must not launder provenance. These are not
+        # invented here: the registry row is the system of record for
+        # `forked_from`, and this restores what it already records.
+        #
+        # `created_by` follows because it records WHICH SHAPE of anchor this
+        # is, not which call ran -- the plain value above is equally a
+        # reconstruction, since no `pack_create` call is running here either.
+        #
+        # Assumption, deliberately narrow: a registry row carrying
+        # `forked_from` came from a fork. `ownership.create_pack` also
+        # accepts the argument, so this is a convention rather than a
+        # constraint; today the only production caller that passes it is
+        # `pack.fork`. Anyone adding a second one should revisit this.
+        #
+        # Title and description are NOT restored to fork's values. They come
+        # from the registry like every other repair, because a rebuilt anchor
+        # should show what this pack is called now, not what it was called
+        # when it was forked.
+        props["created_by"] = "localcrab-mcp:pack_fork"
+        props["forked_from"] = forked_from
+
+    try:
+        with principal_scope(use_principal):
+            result = builder.add_node(
+                space=_ANCHOR_SPACE,
+                node_type=_ANCHOR_NODE_TYPE,
+                node_id=anchor_id,
+                properties=props,
+                pack_id=pack_id,
+                origin="server",
+                pack_anchor=True,
+                _allow_ready_anchor=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "action": "failed",
+            "reason": f"anchor write raised: {exc}",
+            "pack_id": pack_id,
+            "probes": probes,
+        }
+
+    # pack_create's post-write verdict: graph must land.
+    stores = result.get("stores") or {}
+    graph_status = stores.get("graph")
+    if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
+        return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
+    # If graph didn't land but probe now says present (e.g., commit succeeded
+    # but acknowledgement dropped), treat as created as well (same as pack_create).
+    try:
+        reprobe = probe_anchor(graph, docs, vector, pack_id)
+        if reprobe.get("graph") == PROBE_PRESENT:
+            return {
+                "action": "created",
+                "pack_id": pack_id,
+                "probes": probes,
+                "reprobe": reprobe,
+                "stores": stores,
+            }
+    except Exception:
+        pass
+    return {
+        "action": "failed",
+        "reason": f"graph store did not land: {graph_status}",
+        "pack_id": pack_id,
+        "probes": probes,
+        "stores": stores,
+    }
+
+
+def repair_missing_anchors(
+    sql: Any,
+    graph: Any,
+    docs: Any,
+    vector: Any,
+    builder: Any | None = None,
+    *,
+    apply: bool = False,
+    pack_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Offline repair for ``ready`` packs missing their graph anchor (#194).
+
+    Enumerates ``ready`` packs (or a given ``pack_ids`` subset) and ensures
+    each has a ``dataset:{pack_id}`` anchor. Unlike :func:`repair_incomplete_packs`
+    which handles ``creating``/``partial``, this handles drift in ``ready``
+    packs.
+
+    Returns ``{"checked": N, "already_present": N, "would_create": N,
+    "created": N, "skipped": N, "failed": N, "rows": [...]}``.
+    ``apply=False`` is dry-run.
+
+    The candidate query is an operator view: every ``ready`` row, with no
+    owner filter. Authorization is not skipped, it just happens per pack
+    inside :func:`ensure_anchor`, which authorizes as that pack's OWNER --
+    so this pass writes each pack's anchor under that pack's own ownership,
+    never as some ambient superuser. That holds only while no request
+    principal is in scope, which is the case for the one caller today (the
+    ``packs repair-anchors`` CLI command opens no ``principal_scope``).
+    Call this from inside a scope and every pack is instead authorized as
+    that one identity, so other owners' packs come back ``failed`` rather
+    than repaired.
+    """
+    # Determine candidate pack_ids: either explicit list or all ready packs
+    # visible to any owner (operator view). Use direct SQL for operator view
+    # to avoid needing a principal.
+    candidates: list[str]
+    if pack_ids is not None:
+        candidates = list(pack_ids)
+    else:
+        # Operator view: all ready packs regardless of owner/visibility
+        from sqlalchemy import text
+
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text("SELECT pack_id FROM packs WHERE status = 'ready'")).fetchall()
+        candidates = [r[0] for r in rows]
+
+    counts = {
+        "checked": 0,
+        "already_present": 0,
+        "would_create": 0,
+        "created": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+    rows_out: list[dict[str, Any]] = []
+
+    for pid in candidates:
+        counts["checked"] += 1
+        # Route every candidate through the same registry/status checks in
+        # ensure_anchor. In particular, an explicit target whose graph anchor
+        # happens to be present must still be rejected when the registry row is
+        # missing or is not ready.
+        result = ensure_anchor(
+            sql, builder, graph, docs, vector, pid, apply=apply
+        )
+        action = result.get("action")
+        if action == "already_present":
+            counts["already_present"] += 1
+        elif action == "would_create":
+            counts["would_create"] += 1
+        elif action == "created":
+            counts["created"] += 1
+        elif action == "failed":
+            counts["failed"] += 1
+        else:
+            counts["skipped"] += 1
+        rows_out.append(result)
+
+    return {
+        "apply": apply,
+        "counts": counts,
+        "rows": rows_out,
+        "checked_at": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+    }

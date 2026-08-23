@@ -68,6 +68,7 @@ class OntologyBuilder:
         pack_anchor: bool = False,
         fork_copy: bool = False,
         write_vector: bool = True,
+        _allow_ready_anchor: bool = False,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -80,19 +81,38 @@ class OntologyBuilder:
         overwrites it with the importing principal instead. Every
         client-reachable path keeps the default.
 
-        ``pack_anchor`` (#170, design v4 §3.4) opts into the ONE write a
-        ``creating`` pack may receive: its own graph anchor node, written by
-        ``pack_create`` while the pack is still incomplete. When True, the
-        call must ALSO be shaped exactly like that anchor write --
-        ``space == "resource"``, ``node_type == "Dataset"``, and
-        ``node_id == ownership.anchor_node_id(pack_id)`` -- or it raises
-        ``ValueError`` before authorization even runs. This parameter opens
-        nothing else: not a second node in the same ``creating`` pack, not
-        any node in a ``partial`` or ``ready`` pack (those never reach this
-        branch's ``allowed_statuses``). The only call site that should ever
-        pass ``pack_anchor=True`` is ``pack_create``'s anchor write.
+        ``pack_anchor`` (#170, design v4 §3.4) opts into writing ONE
+        specific node: the pack's own graph anchor. When True, the call must
+        ALSO be shaped exactly like that anchor write -- ``space ==
+        "resource"``, ``node_type == "Dataset"``, and ``node_id ==
+        ownership.anchor_node_id(pack_id)`` -- or it raises ``ValueError``
+        before authorization even runs. This parameter opens nothing else:
+        not a second node in the same ``creating`` pack, not any node in a
+        ``partial`` pack (those never reach this branch's
+        ``allowed_statuses``).
+
+        Three call sites pass it, and they do not all write in the same
+        lifecycle window:
+
+        - ``pack_create`` (``opencrab/mcp/tools/pack.py``) -- ``creating``,
+          the anchor write that completes its two-phase creation.
+        - ``fork_pack`` (``opencrab/pack/fork.py``, #201) -- ``creating``
+          too, but FIRST rather than last: a fork lands its anchor before
+          copying content.
+        - ``ensure_anchor`` (``opencrab/pack/lifecycle.py``, #194) --
+          ``ready``, rebuilding an anchor an already-published pack lost.
+          It is the only caller that sets ``_allow_ready_anchor``.
+
         Everything else -- including the pack loader and every ordinary
         ``ontology_add_node``/REST call -- leaves it at the default False.
+
+        ``_allow_ready_anchor`` (#194) is internal, and it does NOT widen
+        the gate: it swaps this branch's ``creating``-only status set for
+        ``authorize``'s own default of ``ready``. It exists so that an
+        anchor write says out loud which lifecycle window it belongs to,
+        rather than reading as an ordinary write that happens to land on an
+        anchor-shaped node. ``ensure_anchor`` gates on ``ready`` before it
+        ever gets here, so no other status is reachable through it.
 
         ``fork_copy`` (design v7 §4-C-2) is the second, narrower, opt-in:
         when True, authorization goes through
@@ -137,7 +157,11 @@ class OntologyBuilder:
             anchor shape.
         """
         from opencrab.auth import current_principal
-        from opencrab.pack.ownership import PACK_STATUS_CREATING, anchor_node_id
+        from opencrab.pack.ownership import (
+            PACK_STATUS_CREATING,
+            PACK_STATUS_READY,
+            anchor_node_id,
+        )
 
         # The gate, in this order and no other (#148). Stamping must run
         # BEFORE canonicalize_pack_alias: that helper rewrites pack tags in
@@ -146,6 +170,28 @@ class OntologyBuilder:
         # `stamp` returns a NEW dict -- unlike the pre-#148 code this no longer
         # mutates the caller's properties.
         principal = current_principal()
+        if pack_anchor and fork_copy:
+            # These two opt-ins are mutually exclusive, and the combination
+            # only became expressible when #194 and #201 landed in the same
+            # function -- nothing has ever exercised it. Refusing beats
+            # picking a winner, because the dispatch below would let the
+            # anchor branch shadow `fork_copy` silently, and the gate it
+            # shadows (`authorize_fork_copy`) is the STRICTER of the two:
+            # it additionally requires the row to carry `forked_from`. A
+            # future caller adding the fork opt-in "for consistency" to
+            # fork's own anchor write would drop that requirement with no
+            # signal at all. The reverse pairing needs no guard: when
+            # `pack_anchor` is False the fork branch wins, and it is the
+            # narrower gate, so what gets dropped fails closed.
+            #
+            # Raised here, before authorization, for the same reason as the
+            # shape check below: a request that does not make sense must not
+            # learn the pack's authorization state first.
+            raise ValueError(
+                "pack_anchor and fork_copy are mutually exclusive: a fork's "
+                "own anchor write goes through the anchor path (#170), its "
+                "content copy through the fork path (#201)"
+            )
         if pack_anchor:
             # Shape check BEFORE authorize (#170): a caller whose request
             # doesn't even look like an anchor write must not learn anything
@@ -165,7 +211,24 @@ class OntologyBuilder:
                     "pack_anchor=True requires this pack's own anchor node "
                     "shape: " + "; ".join(mismatches)
                 )
-            authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
+            if _allow_ready_anchor:
+                # `ready` ONLY -- deliberately not `ready` plus `creating`.
+                # #201 opened `creating` to fork's bulk copy but bolted a
+                # `forked_from` requirement onto it precisely so that the
+                # opening could not become a general "write into any
+                # creating pack of mine" door. Letting this branch accept
+                # `creating` would reopen exactly that door for the anchor
+                # node, with no equivalent requirement, and nothing needs
+                # it: `ensure_anchor` refuses every non-`ready` pack before
+                # it reaches this call.
+                authorize(
+                    self._sql,
+                    principal,
+                    pack_id,
+                    allowed_statuses=(PACK_STATUS_READY,),
+                )
+            else:
+                authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
         elif fork_copy:
             authorize_fork_copy(self._sql, principal, pack_id)
         else:
@@ -227,7 +290,7 @@ class OntologyBuilder:
         # read and has to be reconciled by hand later. Returned as a receipt
         # rather than raised so the #158 contract ("callers read the receipt")
         # keeps holding.
-        if not self._neo4j.available:
+        if self._neo4j is None or not self._neo4j.available:
             output["stores"] = {
                 "graph": "unavailable",
                 "docs": "skipped (graph unavailable)",
@@ -237,7 +300,7 @@ class OntologyBuilder:
             return output
 
         # --- Neo4j write ---
-        if self._neo4j.available:
+        if self._neo4j is not None and self._neo4j.available:
             try:
                 node_props = self._neo4j.upsert_node(
                     node_type=node_type,
@@ -254,7 +317,7 @@ class OntologyBuilder:
             output["stores"]["graph"] = "unavailable"
 
         # --- MongoDB write ---
-        if self._mongo.available:
+        if self._mongo is not None and self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
                 # store_write_succeeded() (below in this module) only
@@ -276,7 +339,7 @@ class OntologyBuilder:
             output["stores"]["docs"] = "unavailable"
 
         # --- PostgreSQL registry write ---
-        if self._sql.available:
+        if self._sql is not None and self._sql.available:
             try:
                 self._sql.register_node(space, node_type, node_id)
                 output["stores"]["sql"] = "ok"
@@ -416,7 +479,7 @@ class OntologyBuilder:
 
         # See add_node: graph down means the whole write is refused, not
         # fanned out to the optional stores (#146 follow-up).
-        if not self._neo4j.available:
+        if self._neo4j is None or not self._neo4j.available:
             output["stores"] = {
                 "graph": "unavailable",
                 "docs": "skipped (graph unavailable)",
@@ -445,8 +508,10 @@ class OntologyBuilder:
         # lookup_node_type: an unavailable store cannot tell "node absent" from
         # "store down", and it writes nothing anyway, so no wrong-typed row can
         # be created. In that case the space default is kept as before.
-        lookup = getattr(self._neo4j, "lookup_node_type", None)
-        if lookup is not None and self._neo4j.available:
+        lookup = (
+            getattr(self._neo4j, "lookup_node_type", None) if self._neo4j is not None else None
+        )
+        if lookup is not None and self._neo4j is not None and self._neo4j.available:
             from_type = lookup(from_id)
             to_type = lookup(to_id)
             missing = [
@@ -505,7 +570,7 @@ class OntologyBuilder:
             )
             output["stores"]["graph"] = f"no match (missing node: {', '.join(missing)})"
             output["missing_nodes"] = missing
-        elif self._neo4j.available:
+        elif self._neo4j is not None and self._neo4j.available:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
@@ -520,7 +585,7 @@ class OntologyBuilder:
         # up listing an edge the graph does not hold.
         if missing:
             output["stores"]["sql"] = "skipped (missing node)"
-        elif self._sql.available:
+        elif self._sql is not None and self._sql.available:
             try:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)
                 output["stores"]["sql"] = "ok"
