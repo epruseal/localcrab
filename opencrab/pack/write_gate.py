@@ -168,10 +168,19 @@ def authorize(
     this module's own docstring already records why: a hand-maintained list
     of "places to guard" has missed one every time this codebase tried it.
     Putting the default here means every writer that goes through
-    ``authorize`` is ready-only unless it explicitly widens the set (today,
-    only ``OntologyBuilder.add_node``'s ``pack_anchor`` path does, and only
-    to ``('creating',)``), instead of depending on every future call site
-    remembering to check status itself.
+    ``authorize`` is ready-only unless it explicitly widens the set,
+    instead of depending on every future call site remembering to check
+    status itself. Exactly two places widen it today, and both narrow the
+    opening back down some other way:
+
+    - ``OntologyBuilder.add_node``'s ``pack_anchor`` path, to
+      ``('creating',)`` -- restricted to that pack's own anchor node by a
+      shape check that runs before this call.
+    - :func:`authorize_fork_copy`, also to ``('creating',)`` -- restricted
+      to rows a fork reserved, by requiring ``forked_from``.
+
+    ``add_node``'s ``_allow_ready_anchor`` is NOT a third: it passes the
+    ready-only default back explicitly rather than widening anything.
 
     Fails closed when the registry is unreachable: without it there is no
     way to decide ownership, and "cannot check" must never mean "allowed".

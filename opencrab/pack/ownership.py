@@ -378,9 +378,14 @@ def begin_pack_creation(
     Until the anchor lands and the row is promoted (``mark_pack_ready``) or
     the attempt is given up on (``mark_pack_partial``), the row is invisible
     to every read path (``readable_pack_ids``/``list_packs_for`` filter on
-    ``status = 'ready'``) and unwritable through anything but the anchor
-    write itself (``write_gate.authorize``'s default ``allowed_statuses``
-    excludes ``creating``).
+    ``status = 'ready'``). It is also unwritable by default --
+    ``write_gate.authorize``'s default ``allowed_statuses`` excludes
+    ``creating`` -- with two opt-in exceptions: the pack's own anchor
+    write, and, for a row this function reserved ON BEHALF OF A FORK
+    (``forked_from`` set, see ``pack.fork``), that fork's bulk content
+    copy through ``write_gate.authorize_fork_copy``. A row reserved by
+    ``pack_create`` carries no ``forked_from`` and so never qualifies for
+    the second one.
 
     Same slug negotiation as ``create_pack`` (see its docstring) -- this is
     the ``status='creating'`` sibling of that call, for a pack whose
@@ -779,11 +784,15 @@ def assert_writable(
     invariant that already folds "no such row" and "someone else's private
     row" into one exception below).
 
-    ``allowed_statuses`` is a set, not a boolean flag, because the one path
-    that needs anything other than the default is narrow: only the pack's
-    own anchor write, while the pack is ``creating``
-    (``allowed_statuses=('creating',)`` -- see
-    ``OntologyBuilder.add_node``'s ``pack_anchor`` parameter). A boolean
+    ``allowed_statuses`` is a set, not a boolean flag, because the paths
+    that need anything other than the default are narrow and few. Two use
+    ``('creating',)``: the pack's own anchor write (see
+    ``OntologyBuilder.add_node``'s ``pack_anchor`` parameter) and a fork's
+    bulk content copy (see ``write_gate.authorize_fork_copy``, which
+    additionally requires the row to carry ``forked_from``, so it reaches
+    only rows a fork reserved). Keep that list in step with
+    ``write_gate.authorize``'s own docstring; they describe the same two
+    openings and must not drift apart. A boolean
     "allow incomplete too" would also open the door for ``partial``, which
     must stay closed to every writer including the owner.
 

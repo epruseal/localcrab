@@ -178,8 +178,11 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab packs backfill-pack-id` | 노드·엣지에 `pack_id` 역보충 |
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
 | `opencrab packs repair-registry` | 생성이 끝나지 않은 팩 등록부 행을 판정·해소 (`--older-than`, `--promote`, `--apply`)[^repair] |
+| `opencrab packs repair-anchors` | `ready` 팩이 잃어버린 graph 앵커를 다시 만듦 (`--pack-id`, `--apply`)[^anchors] |
 
 [^repair]: 등록부 행과 팩 콘텐츠는 한 트랜잭션이 아니라, 그 사이에서 프로세스가 죽으면 `ready` 에 도달하지 못한 행이 남습니다. 이 명령은 graph 앵커를 실제로 조회해 판정합니다: 앵커가 있으면 `ready` 로 승격하고, 앵커가 없음이 확인되면 `partial` 로 강등하며, 스토어를 조회할 수 없으면 아무것도 하지 않습니다. **어떤 경우에도 등록부 행을 지우지 않습니다** — 콘텐츠가 실제로 안착한 팩의 행을 지우면 `assert_registry_covers_graph` 가 다음 기동을 거부하기 때문입니다. `--apply` 없이는 계획만 출력합니다. `partial` 행은 자동으로 손대지 않고, 운영자가 `--promote <pack_id> --apply` 로 지목해야 승격하며 이때도 graph 앵커가 확인될 때만 승격합니다.
+
+[^anchors]: `repair-registry` 의 형제 명령이되 대상이 반대입니다. 저쪽이 `creating`·`partial` 행을 다루는 반면 이쪽은 이미 `ready` 인 팩에서 `dataset:{pack_id}` 앵커만 사라진 경우를 고칩니다(옛 마이그레이션 팩, 수동 삭제, 앵커가 애초에 없던 덤프). 등록부의 title·description 으로 앵커를 다시 만들며, fork 로 생긴 팩이면 그 출처 표식도 함께 되살립니다. 멱등이라 앵커가 이미 있으면 아무것도 하지 않고, **등록부 행의 상태는 어느 경우에도 바꾸지 않습니다.** `--apply` 없이는 계획만 출력하고, `--pack-id` 로 한 팩만 지목할 수 있습니다.
 
 [^media]: easyocr/torch는 기본 pip extra에 포함되지 않습니다. 별도 설치 필요: `pip install -r requirements/localcrab-media.txt`.
 

@@ -623,6 +623,19 @@ def ensure_anchor(
     Returns ``{"action": "already_present"|"created"|"skipped", ...}`` with
     ``probes`` for observability. ``graph`` is the system of record;
     ``unverifiable`` is treated as skipped (fail-closed).
+
+    **Only the graph leg decides success.** The optional doc and vector legs
+    are reported in ``stores`` and never make this call fail. That is a
+    weaker bar than ``pack.fork``'s ``_fork_leg_ok("anchor")``, which
+    requires all four legs, and the difference is deliberate: fork's
+    preflight has already established that every store is available before
+    it writes, so a failing leg there means something broke mid-call and the
+    half-built pack is better demoted. This function repairs a pack that is
+    already ``ready``, under whatever deployment shape it finds. Demanding
+    all four legs would make a pack permanently unrepairable whenever the
+    vector store is down, and restoring the graph anchor is strictly better
+    than restoring nothing. Nothing is promoted either way -- this call
+    never touches the registry row's status.
     """
     from opencrab.auth import Principal, current_principal, principal_scope
     from opencrab.pack.ownership import anchor_node_id, get_pack
@@ -706,7 +719,9 @@ def ensure_anchor(
                 user_id=pack["owner_id"], is_local=is_local, disabled=False
             )
 
-    # Anchor shape and stamping mirrors pack_create's anchor write.
+    # Anchor shape and stamping mirrors pack_create's anchor write -- unless
+    # the registry says this pack came from a fork, in which case it mirrors
+    # pack_fork's anchor write instead (see below).
     anchor_id = anchor_node_id(pack_id)
     props = {
         "pack_id": pack_id,
@@ -714,6 +729,31 @@ def ensure_anchor(
         "description": resolved_description,
         "created_by": "localcrab-mcp",
     }
+    forked_from = pack.get("forked_from")
+    if forked_from:
+        # A fork stamps two extra provenance values onto its anchor (see
+        # `pack.fork`'s anchor write). Rebuilding without them would quietly
+        # rewrite a forked pack's anchor to look like a natively created
+        # one -- a repair pass must not launder provenance. These are not
+        # invented here: the registry row is the system of record for
+        # `forked_from`, and this restores what it already records.
+        #
+        # `created_by` follows because it records WHICH SHAPE of anchor this
+        # is, not which call ran -- the plain value above is equally a
+        # reconstruction, since no `pack_create` call is running here either.
+        #
+        # Assumption, deliberately narrow: a registry row carrying
+        # `forked_from` came from a fork. `ownership.create_pack` also
+        # accepts the argument, so this is a convention rather than a
+        # constraint; today the only production caller that passes it is
+        # `pack.fork`. Anyone adding a second one should revisit this.
+        #
+        # Title and description are NOT restored to fork's values. They come
+        # from the registry like every other repair, because a rebuilt anchor
+        # should show what this pack is called now, not what it was called
+        # when it was forked.
+        props["created_by"] = "localcrab-mcp:pack_fork"
+        props["forked_from"] = forked_from
 
     try:
         with principal_scope(use_principal):
@@ -783,6 +823,17 @@ def repair_missing_anchors(
     Returns ``{"checked": N, "already_present": N, "would_create": N,
     "created": N, "skipped": N, "failed": N, "rows": [...]}``.
     ``apply=False`` is dry-run.
+
+    The candidate query is an operator view: every ``ready`` row, with no
+    owner filter. Authorization is not skipped, it just happens per pack
+    inside :func:`ensure_anchor`, which authorizes as that pack's OWNER --
+    so this pass writes each pack's anchor under that pack's own ownership,
+    never as some ambient superuser. That holds only while no request
+    principal is in scope, which is the case for the one caller today (the
+    ``packs repair-anchors`` CLI command opens no ``principal_scope``).
+    Call this from inside a scope and every pack is instead authorized as
+    that one identity, so other owners' packs come back ``failed`` rather
+    than repaired.
     """
     # Determine candidate pack_ids: either explicit list or all ready packs
     # visible to any owner (operator view). Use direct SQL for operator view

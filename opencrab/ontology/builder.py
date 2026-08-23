@@ -81,22 +81,38 @@ class OntologyBuilder:
         overwrites it with the importing principal instead. Every
         client-reachable path keeps the default.
 
-        ``pack_anchor`` (#170, design v4 §3.4) opts into the ONE write a
-        ``creating`` pack may receive: its own graph anchor node, written by
-        ``pack_create`` while the pack is still incomplete. When True, the
-        call must ALSO be shaped exactly like that anchor write --
-        ``space == "resource"``, ``node_type == "Dataset"``, and
-        ``node_id == ownership.anchor_node_id(pack_id)`` -- or it raises
-        ``ValueError`` before authorization even runs. This parameter opens
-        nothing else: not a second node in the same ``creating`` pack, not
-        ``_allow_ready_anchor`` (#194) widens the allowed statuses to
-        ``(ready, creating)`` for the anchor auto-creation path on ``ready``
-        packs that have lost their anchor. Only ``ensure_anchor`` may set it.
-        any node in a ``partial`` or ``ready`` pack (those never reach this
-        branch's ``allowed_statuses``). The only call site that should ever
-        pass ``pack_anchor=True`` is ``pack_create``'s anchor write.
+        ``pack_anchor`` (#170, design v4 §3.4) opts into writing ONE
+        specific node: the pack's own graph anchor. When True, the call must
+        ALSO be shaped exactly like that anchor write -- ``space ==
+        "resource"``, ``node_type == "Dataset"``, and ``node_id ==
+        ownership.anchor_node_id(pack_id)`` -- or it raises ``ValueError``
+        before authorization even runs. This parameter opens nothing else:
+        not a second node in the same ``creating`` pack, not any node in a
+        ``partial`` pack (those never reach this branch's
+        ``allowed_statuses``).
+
+        Three call sites pass it, and they do not all write in the same
+        lifecycle window:
+
+        - ``pack_create`` (``opencrab/mcp/tools/pack.py``) -- ``creating``,
+          the anchor write that completes its two-phase creation.
+        - ``fork_pack`` (``opencrab/pack/fork.py``, #201) -- ``creating``
+          too, but FIRST rather than last: a fork lands its anchor before
+          copying content.
+        - ``ensure_anchor`` (``opencrab/pack/lifecycle.py``, #194) --
+          ``ready``, rebuilding an anchor an already-published pack lost.
+          It is the only caller that sets ``_allow_ready_anchor``.
+
         Everything else -- including the pack loader and every ordinary
         ``ontology_add_node``/REST call -- leaves it at the default False.
+
+        ``_allow_ready_anchor`` (#194) is internal, and it does NOT widen
+        the gate: it swaps this branch's ``creating``-only status set for
+        ``authorize``'s own default of ``ready``. It exists so that an
+        anchor write says out loud which lifecycle window it belongs to,
+        rather than reading as an ordinary write that happens to land on an
+        anchor-shaped node. ``ensure_anchor`` gates on ``ready`` before it
+        ever gets here, so no other status is reachable through it.
 
         ``fork_copy`` (design v7 §4-C-2) is the second, narrower, opt-in:
         when True, authorization goes through
@@ -154,6 +170,28 @@ class OntologyBuilder:
         # `stamp` returns a NEW dict -- unlike the pre-#148 code this no longer
         # mutates the caller's properties.
         principal = current_principal()
+        if pack_anchor and fork_copy:
+            # These two opt-ins are mutually exclusive, and the combination
+            # only became expressible when #194 and #201 landed in the same
+            # function -- nothing has ever exercised it. Refusing beats
+            # picking a winner, because the dispatch below would let the
+            # anchor branch shadow `fork_copy` silently, and the gate it
+            # shadows (`authorize_fork_copy`) is the STRICTER of the two:
+            # it additionally requires the row to carry `forked_from`. A
+            # future caller adding the fork opt-in "for consistency" to
+            # fork's own anchor write would drop that requirement with no
+            # signal at all. The reverse pairing needs no guard: when
+            # `pack_anchor` is False the fork branch wins, and it is the
+            # narrower gate, so what gets dropped fails closed.
+            #
+            # Raised here, before authorization, for the same reason as the
+            # shape check below: a request that does not make sense must not
+            # learn the pack's authorization state first.
+            raise ValueError(
+                "pack_anchor and fork_copy are mutually exclusive: a fork's "
+                "own anchor write goes through the anchor path (#170), its "
+                "content copy through the fork path (#201)"
+            )
         if pack_anchor:
             # Shape check BEFORE authorize (#170): a caller whose request
             # doesn't even look like an anchor write must not learn anything
@@ -174,11 +212,20 @@ class OntologyBuilder:
                     "shape: " + "; ".join(mismatches)
                 )
             if _allow_ready_anchor:
+                # `ready` ONLY -- deliberately not `ready` plus `creating`.
+                # #201 opened `creating` to fork's bulk copy but bolted a
+                # `forked_from` requirement onto it precisely so that the
+                # opening could not become a general "write into any
+                # creating pack of mine" door. Letting this branch accept
+                # `creating` would reopen exactly that door for the anchor
+                # node, with no equivalent requirement, and nothing needs
+                # it: `ensure_anchor` refuses every non-`ready` pack before
+                # it reaches this call.
                 authorize(
                     self._sql,
                     principal,
                     pack_id,
-                    allowed_statuses=(PACK_STATUS_READY, PACK_STATUS_CREATING),
+                    allowed_statuses=(PACK_STATUS_READY,),
                 )
             else:
                 authorize(self._sql, principal, pack_id, allowed_statuses=(PACK_STATUS_CREATING,))
