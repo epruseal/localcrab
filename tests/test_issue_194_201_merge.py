@@ -1333,3 +1333,47 @@ def test_sweep_data_dir_reaches_the_lock(sql, alice, rec):
     )
 
     assert rec.dirs and all(d == "/tmp/o223-sweep" for d in rec.dirs)
+
+
+def test_a_row_deleted_under_the_lock_is_not_reported_as_present(
+    sql, alice, monkeypatch
+):
+    """When there is no current row, say so rather than showing the old one.
+
+    Two reviewers read the same branch differently -- one called the retained
+    `owner_id`/`status` stale, the other called them an honest description of
+    the row that was examined. Both readings are available because the fields
+    look like present facts either way. Marking them as scan-time settles it,
+    and the status tally drops the row because that bucket counts what the
+    registry holds.
+    """
+    import contextlib
+
+    import opencrab.locking as locking_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    pid = begin_pack_creation(sql, alice, "vanishes")
+    TestRepairRegistryLockWindows._stale(sql, pid)
+    real_lock = locking_mod.write_lock
+
+    @contextlib.contextmanager
+    def delete_it(*a, **kw):
+        with sql._engine.begin() as conn:
+            conn.execute(_sql_text("DELETE FROM packs WHERE pack_id = :p"), {"p": pid})
+        with real_lock(*a, **kw):
+            yield
+
+    monkeypatch.setattr(locking_mod, "write_lock", delete_it)
+
+    result = repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+    )
+
+    row = next(r for r in result["rows"] if r["pack_id"] == pid)
+    assert row["row_gone"] is True
+    assert "status" not in row and "owner_id" not in row
+    assert row["scanned_status"] == "creating"
+    assert row["scanned_owner_id"] == alice
+    # examined, but no longer held by the registry
+    assert result["counts"]["rows_examined"] == 1
+    assert result["counts"]["creating"] == 0

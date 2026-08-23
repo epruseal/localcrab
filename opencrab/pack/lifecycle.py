@@ -510,6 +510,22 @@ def repair_incomplete_packs(
                             if fresh is None
                             else f"status is now {fresh['status']!r}"
                         )
+                        if fresh is None:
+                            # Nothing current to describe, so say that outright
+                            # rather than leaving scan-time `owner_id`/`status`
+                            # to read as present facts. Reviewers split on
+                            # whether those fields were stale or simply
+                            # describing the row that was examined; marking
+                            # them settles it without inventing a row.
+                            entry["row_gone"] = True
+                            entry["scanned_status"] = entry.pop("status")
+                            entry["scanned_owner_id"] = entry.pop("owner_id")
+                            # And take it back out of the status tally: that
+                            # bucket counts rows the registry holds, and this
+                            # one is gone. `rows_examined` still counts it,
+                            # because it was examined.
+                            if entry["scanned_status"] in counts:
+                                counts[entry["scanned_status"]] -= 1
                         counts["skipped"] += 1
                         results.append(entry)
                         continue
