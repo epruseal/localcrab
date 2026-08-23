@@ -332,10 +332,21 @@ def repair_incomplete_packs(
       pass; ``promote``'s single-pack action is counted separately in
       ``promote_result``).
     - ``rows`` -- one entry per incomplete row:
-      ``{pack_id, owner_id, status, action, reason?, probes?, applied?}``.
-      ``status`` reflects the row's status AFTER this call when ``apply`` is
-      true and the transition actually happened; otherwise it is the status
-      the row had going in.
+      ``{pack_id, owner_id, status, action, reason?, probes?, applied?,
+      checked_at?}``. ``status`` reflects the row's status AFTER this call
+      when ``apply`` is true and the transition actually happened; otherwise
+      it is the status the row had going in. ``checked_at`` appears on rows
+      re-read under the lock and is the clock that judged them -- prefer it
+      over the top-level one when reconciling a single decision.
+
+      **One shape is different.** A row that disappeared while this pass
+      waited for its lock carries ``row_gone: true`` and reports its
+      scan-time values as ``scanned_status`` / ``scanned_owner_id``
+      INSTEAD OF ``status`` / ``owner_id``, which are absent. There is no
+      current row to describe, and leaving the old values under the usual
+      keys let two readers disagree about whether they were present facts.
+      Such a row is counted in ``rows_examined`` but not in the status
+      buckets, which count what the registry still holds.
     - ``promote_result`` -- ``None`` unless ``promote`` was given, else the
       single-pack outcome of that targeted promotion (see below).
 

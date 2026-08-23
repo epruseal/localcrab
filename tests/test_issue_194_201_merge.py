@@ -1380,25 +1380,26 @@ def test_a_row_deleted_under_the_lock_is_not_reported_as_present(
 
 
 def test_no_path_returns_before_the_row_is_recorded():
-    """Structural check over the source, not a behaviour test.
+    """Structural check over the source of the sweep's row window.
 
     Eight defects on `repair_incomplete_packs` had one shape, and twice the
     fix was "move the record above the gate" -- once above some gates, once
-    above the rest. A rule that has been broken twice is not enforcement, and
-    the next person adding a gate inside the window will break it again
-    without noticing.
+    above the rest. A rule broken twice is not enforcement, so this asserts
+    the shape instead of trusting it.
 
-    So assert the shape instead of trusting the rule: inside the row lock,
-    nothing may exit before the row has been stamped with when it was read.
-    Add a `continue`, `return`, or `break` above that stamp and this fails,
-    naming the line.
+    Scope, stated plainly because an earlier version of this docstring
+    overclaimed: it guards the SWEEP row window only. `ensure_anchor` and the
+    `--promote` window have no per-row stamp to guard, and the property they
+    do have -- everything after the registry read is inside the lock -- is
+    held by the behaviour tests, not this one.
 
-    The stronger version of this is lifting the window body into a function
-    that only receives the re-read snapshot, which would make the property
-    hold by scope rather than by inspection. That is a large extraction of
-    the exact region these eight defects came from, so it is deliberately
-    left as its own change; see the design notes. This test is what holds the
-    line until then.
+    What it checks, after review found three ways past a weaker version:
+      - exits include `raise`, not just `continue`/`return`/`break`;
+      - ordering is position in the window's own statement list, so a later
+        line inside an earlier branch cannot slip past a line-number compare;
+      - the stamp has to come from the in-window clock. Stamping
+        `scan_started_at` would satisfy "a stamp exists" while reintroducing
+        the exact defect the stamp was added for.
     """
     import ast
     import inspect
@@ -1410,41 +1411,65 @@ def test_no_path_returns_before_the_row_is_recorded():
         n for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
     )
+    window = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.With)
+         and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)),
+        None,
+    )
+    assert window is not None, "sweep row window not found -- renamed?"
 
-    windows = [
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.With)
-        and any(
-            isinstance(i.context_expr, ast.Call)
-            and getattr(i.context_expr.func, "id", "") == "ExitStack"
-            for i in n.items
-        )
-        and any(getattr(t, "id", "") == "_row_lock" for i in n.items
-                for t in ([i.optional_vars] if i.optional_vars else []))
-    ]
-    assert windows, "row lock window not found -- did it get renamed?"
-
-    for w in windows:
-        stamp_line = None
-        for n in ast.walk(w):
-            if (isinstance(n, ast.Assign)
-                    and any(isinstance(t, ast.Subscript)
-                            and getattr(t.value, "id", "") == "entry"
-                            and getattr(getattr(t, "slice", None), "value", None)
-                            == "checked_at"
-                            for t in n.targets)):
-                stamp_line = n.lineno if stamp_line is None else min(stamp_line, n.lineno)
-        assert stamp_line is not None, (
-            "the row lock window never stamps entry['checked_at']"
-        )
-
-        early = [
-            n.lineno for n in ast.walk(w)
-            if isinstance(n, (ast.Continue, ast.Return, ast.Break))
-            and n.lineno < stamp_line
+    def stamps(node):
+        return [
+            n for n in ast.walk(node)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Subscript)
+                    and getattr(t.value, "id", "") == "entry"
+                    and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
+                    for t in n.targets)
         ]
-        assert not early, (
-            f"a path exits the row lock window at line(s) {early} before the row "
-            f"is stamped at line {stamp_line}. Record when the row was read "
-            f"before any branch can report on it."
+
+    def exits(node):
+        return [n for n in ast.walk(node)
+                if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
+
+    # Find the statement list that DIRECTLY contains the stamp, not the
+    # outermost one. A first attempt checked the `with` body and silently
+    # verified nothing, because the stamp lives one level in (inside
+    # `if apply:`) -- so `window.body[:stamp_at]` was empty and the loop had
+    # no statements to reject. Descending to the real block is what makes
+    # "before" mean anything.
+    def enclosing_block(node):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list):
+                continue
+            for idx, st in enumerate(block):
+                if not stamps(st):
+                    continue
+                inner = enclosing_block(st)
+                return inner if inner else (block, idx)
+        return None
+
+    found = enclosing_block(window)
+    assert found is not None, "the row window never stamps entry['checked_at']"
+    block, stamp_at = found
+
+    for st in block[:stamp_at]:
+        bad = exits(st)
+        assert not bad, (
+            f"a path exits the row window at line(s) {[b.lineno for b in bad]} "
+            f"before the row is stamped. Record when the row was read before "
+            f"any branch can report on it."
+        )
+
+    # The stamp must carry the in-window clock, not the scan-time one.
+    for a in stamps(block[stamp_at]):
+        names = {n.id for n in ast.walk(a.value) if isinstance(n, ast.Name)}
+        assert "scan_started_at" not in names, (
+            "the row is stamped with the pre-lock clock, which is the defect "
+            "the stamp exists to prevent"
+        )
+        assert "now_locked" in names, (
+            f"expected the in-window clock in the stamp, got {names}"
         )
