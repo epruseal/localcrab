@@ -1265,6 +1265,16 @@ class TestNothingPreLockLeaksIntoTheWindow:
         assert row["action"] == "skipped (too recent)", (
             "a fresh row was judged against a clock read before the lock"
         )
+        # Deciding by the locked clock is only half of it: the operator has to
+        # be able to reconstruct the decision. The run-level `checked_at` is
+        # the pre-query stamp and here it predates the row's own
+        # `updated_at` -- so the row has to carry the clock that judged it.
+        assert "checked_at" in row, "no per-row clock to reconstruct the decision"
+        assert row["checked_at"] > result["checked_at"], (
+            "row clock should postdate the pass's starting stamp after a wait"
+        )
+        # and it must not predate the row it judged, which was the symptom
+        assert row["checked_at"] >= str(get_pack(sql, pid)["updated_at"])[:10]
 
     def test_the_status_tally_follows_the_row_that_was_adopted(
         self, sql, alice, monkeypatch

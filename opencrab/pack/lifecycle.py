@@ -323,7 +323,10 @@ def repair_incomplete_packs(
     Returns a JSON-serializable dict:
 
     - ``older_than_seconds``, ``apply``, ``checked_at`` -- the run's inputs
-      and the wall-clock time age was judged against.
+      and the wall-clock time the pass started from. Rows re-read under the
+      lock carry their own ``checked_at``: the clock that actually judged
+      them, read inside the window. Prefer the row's when reconciling a
+      single decision, since a lock wait can put it well after this one.
     - ``counts`` -- ``rows_examined``, ``creating``, ``partial``,
       ``promoted``, ``demoted``, ``skipped`` (all over the age-filtered
       pass; ``promote``'s single-pack action is counted separately in
@@ -504,6 +507,14 @@ def repair_incomplete_packs(
                     # a clock read before the lock is the same mistake as
                     # comparing it against a row read before the lock.
                     now_locked = datetime.now(UTC)
+                    # Report it too, not just decide by it. The top-level
+                    # `checked_at` is the pre-query stamp, so after a long lock
+                    # wait it can read EARLIER than the row's own `updated_at`
+                    # while this entry claims a known age -- leaving an
+                    # operator unable to reconstruct how the age was judged.
+                    # The clock that actually decided this row belongs on this
+                    # row.
+                    entry["checked_at"] = now_locked.isoformat()
                     fresh_dt = _parse_updated_at(fresh.get("updated_at"))
                     if fresh_dt is None or fresh_dt > now_locked:
                         entry["action"] = "skipped (unknown age)"
