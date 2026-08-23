@@ -26,6 +26,7 @@ private doubles without silently changing what these tests assert.
 from __future__ import annotations
 
 import json
+import pathlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -433,6 +434,15 @@ def test_pack_ingest_rebuilds_a_forked_anchor_with_its_provenance(bind_test_prin
     builder = MagicMock()
     builder.add_node.return_value = {"stores": {"graph": "ok"}}
     ctx = _base_ctx(sql=sql, builder=builder)
+    # The builder must carry the SAME store handles as the context (#224).
+    # `ensure_anchor` now probes and runs the identity guard through the
+    # builder's stores, because that is where `add_node` will write -- so a
+    # builder holding bare mocks while the context holds configured ones is a
+    # shape production never has, and it makes the probe read an unrelated
+    # store. Mirroring them here keeps the double honest about that.
+    builder._neo4j, builder._mongo, builder._vec = (
+        ctx["neo4j"], ctx["mongo"], ctx["chroma"],
+    )
 
     with patch("opencrab.mcp.tools._get_context", return_value=ctx):
         result = pack_ingest(
@@ -498,7 +508,8 @@ class TestCLIRepairAnchorsApply:
         )
 
         assert result.exit_code == 0, result.output
-        payload = json.loads(result.output[result.output.index("{"):].split("\n\n")[0])
+        brace = result.output.index("{")
+        payload = json.JSONDecoder().raw_decode(result.output[brace:])[0]
         assert payload["apply"] is True
         assert payload["counts"]["created"] == 1
 
@@ -509,3 +520,562 @@ class TestCLIRepairAnchorsApply:
         assert written is not None
         assert written["forked_from"] == "upstream"
         assert get_pack(sql, pack_id)["status"] == PACK_STATUS_READY
+
+
+# ---------------------------------------------------------------------------
+# #223 / #224: the repair commands join the write.lock map, and their plans
+# stop promising writes that apply would refuse.
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """One timeline for lock span, registry read, probe, and write.
+
+    Counting lock acquisitions is not enough to pin either issue. A lock taken
+    and released before the probe satisfies a call count while leaving open
+    the exact window it exists to close, so these tests record enter/exit as
+    events next to the operations and assert containment.
+    """
+
+    def __init__(self):
+        self.events: list[str] = []
+        self.dirs: list = []
+
+    def lock(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm(data_dir=None, **kw):  # noqa: ARG001
+            self.dirs.append(data_dir)
+            self.events.append("lock-enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock-exit")
+
+        return _cm
+
+    def pairs(self) -> int:
+        return self.events.count("lock-enter")
+
+    def reset(self):
+        """Drop setup noise so the timeline starts at the call under test.
+
+        `create_pack` reads the registry too, so without this the first
+        recorded event belongs to fixture setup rather than to the call whose
+        lock window is being asserted.
+        """
+        self.events.clear()
+        self.dirs.clear()
+
+
+@pytest.fixture
+def rec(monkeypatch):
+    import opencrab.locking as locking_mod
+    import opencrab.pack.lifecycle as lifecycle_mod
+    import opencrab.pack.ownership as ownership_mod
+
+    r = _Recorder()
+    monkeypatch.setattr(locking_mod, "write_lock", r.lock())
+
+    real_get_pack, real_probe = ownership_mod.get_pack, lifecycle_mod.probe_anchor
+
+    def spy_get_pack(*a, **kw):
+        r.events.append("get_pack")
+        return real_get_pack(*a, **kw)
+
+    def spy_probe(*a, **kw):
+        r.events.append("probe")
+        return real_probe(*a, **kw)
+
+    monkeypatch.setattr(ownership_mod, "get_pack", spy_get_pack)
+    monkeypatch.setattr(lifecycle_mod, "probe_anchor", spy_probe)
+    return r
+
+
+def _builder(graph, docs=None, vec=None):
+    return OntologyBuilder(graph, docs or Docs(), None, vec=vec or Vec())
+
+
+class TestEnsureAnchorLockWindow:
+    def test_apply_wraps_registry_read_through_write(self, sql, alice, rec):
+        """The window opens at the registry read, not at the probe.
+
+        `repair_missing_anchors` selects candidates with an unlocked query and
+        leaves the status re-check to `ensure_anchor`; if that re-check sat
+        outside the lock, a pack demoted after the select could still be
+        written to.
+        """
+        pack_id = create_pack(sql, alice, "locked")
+        graph = Graph()
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+        real_upsert = graph.upsert_node
+
+        def spy(*a, **kw):
+            rec.events.append("write")
+            return real_upsert(*a, **kw)
+
+        graph.upsert_node = spy
+        rec.reset()
+
+        assert ensure_anchor(
+            sql, b, graph, Docs(), Vec(), pack_id, apply=True
+        )["action"] == "created"
+
+        assert rec.events[0] == "lock-enter"
+        assert rec.events[-1] == "lock-exit"
+        for stage in ("get_pack", "probe", "write"):
+            assert 0 < rec.events.index(stage) < rec.events.index("lock-exit")
+
+    def test_dry_run_takes_no_lock(self, sql, alice, rec):
+        pack_id = create_pack(sql, alice, "planned")
+        graph = Graph()
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+        rec.reset()
+        assert ensure_anchor(
+            sql, b, graph, Docs(), Vec(), pack_id, apply=False
+        )["action"] == "would_create"
+        assert "lock-enter" not in rec.events
+
+    def test_data_dir_reaches_the_lock_through_the_batch(self, sql, alice, rec):
+        """Exposing the argument is not the same as forwarding it.
+
+        `repair_missing_anchors` is the entry point the CLI uses, so an
+        argument it accepts but drops would lock the configured directory
+        while writing somewhere else -- and nothing about the signature
+        would show it.
+        """
+        create_pack(sql, alice, "dirtest")
+        graph = Graph()
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+        rec.reset()
+        repair_missing_anchors(
+            sql, graph, Docs(), Vec(), b, apply=True, data_dir="/tmp/o223-probe"
+        )
+        assert rec.dirs and all(d == "/tmp/o223-probe" for d in rec.dirs)
+
+
+class _ForeignGraph(Graph):
+    """Graph whose anchor slot is held by a DIFFERENT pack.
+
+    `_probe_one` reports that as absent (the value does not match this pack),
+    so the probe alone says "go ahead" -- which is exactly why the plan used
+    to promise a write the identity guard then refused.
+    """
+
+    def __init__(self, node_id, owner_pack):
+        super().__init__()
+        self.nodes[(ANCHOR_TYPE, node_id)] = {"pack_id": owner_pack}
+
+
+class _MuteGraph(Graph):
+    """Available, but cannot answer the type-agnostic axis.
+
+    `_check_by_id_axis` fail-closes that to `unverifiable`, and `add_node`
+    refuses on it just as hard as on `foreign`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        del self.__dict__["nodes"]
+        self.nodes = {}
+
+    get_nodes_by_id = None  # type: ignore[assignment]
+
+
+class TestPlanAndApplyAgree:
+    """#224: the plan has to be a prediction, not a guess.
+
+    Both paths run the same predicate now, so a slot the guard will refuse is
+    reported the same way whether or not `--apply` was passed.
+    """
+
+    def _run(self, sql, owner, graph, pack_id):
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+        dry = ensure_anchor(sql, b, graph, Docs(), Vec(), pack_id, apply=False)
+        wet = ensure_anchor(sql, b, graph, Docs(), Vec(), pack_id, apply=True)
+        return dry, wet
+
+    def test_foreign_slot_is_blocked_in_both_modes(self, sql, alice):
+        pack_id = create_pack(sql, alice, "wants-slot")
+        graph = _ForeignGraph(anchor_node_id(pack_id), "someone-else")
+        dry, wet = self._run(sql, alice, graph, pack_id)
+
+        assert dry["action"] == wet["action"] == "blocked"
+        assert dry["reason"] == wet["reason"] == "foreign"
+
+    def test_unverifiable_slot_is_blocked_in_both_modes(self, sql, alice):
+        """The reason an operator must NOT read as permanent.
+
+        Blocking here is what keeps the plan honest -- apply refuses on
+        `unverifiable` too -- but a retry can legitimately change it, which is
+        why the reason travels with the verdict.
+        """
+        pack_id = create_pack(sql, alice, "cannot-ask")
+        dry, wet = self._run(sql, alice, _MuteGraph(), pack_id)
+
+        assert dry["action"] == wet["action"] == "blocked"
+        assert dry["reason"] == wet["reason"] == "unverifiable"
+
+    def test_blocked_never_calls_add_node(self, sql, alice):
+        """Not merely "nothing was written".
+
+        Before this change apply DID call `add_node` and let it raise, so a
+        no-write assertion passed either way. What the fix buys is not making
+        the call at all.
+        """
+        pack_id = create_pack(sql, alice, "no-attempt")
+        graph = _ForeignGraph(anchor_node_id(pack_id), "other")
+        b = MagicMock()
+        b._neo4j, b._mongo, b._vec = graph, Docs(), Vec()
+
+        result = ensure_anchor(sql, b, graph, Docs(), Vec(), pack_id, apply=True)
+
+        assert result["action"] == "blocked"
+        b.add_node.assert_not_called()
+        assert get_pack(sql, pack_id)["status"] == PACK_STATUS_READY
+
+    def test_batch_counts_blocked_separately_from_skipped(self, sql, alice):
+        """`skipped` means this pass did not look; `blocked` means it looked
+        and the slot is unavailable. Folding them hides the one that needs
+        an operator."""
+        pack_id = create_pack(sql, alice, "counted")
+        graph = _ForeignGraph(anchor_node_id(pack_id), "other")
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+
+        summary = repair_missing_anchors(
+            sql, graph, Docs(), Vec(), b, apply=True, pack_ids=[pack_id]
+        )
+
+        assert summary["counts"]["blocked"] == 1
+        assert summary["counts"]["skipped"] == 0
+        assert summary["counts"]["failed"] == 0
+
+
+class TestBuilderAvailabilityIsDecidedBeforeThePlan:
+    def test_no_builder_gives_the_same_answer_in_both_modes(self, sql, alice):
+        """The other half of #224, and the reason the CLI now builds its
+        builder for dry runs too.
+
+        The graph is deliberately alive here: when it is down the probe
+        already ends both modes at `skipped`, so that shape proves nothing.
+
+        It is also deliberately one that cannot answer the by-id axis. That
+        makes this test pull double duty: it pins the ORDER of the two checks.
+        With the builder check first (as designed) the missing builder decides
+        and both modes say `skipped`. Run the identity predicate first instead
+        and the unanswerable axis fail-closes to `blocked`, so the assertion
+        below catches the reordering. A double that could answer would make
+        both orders agree and prove nothing.
+        """
+        pack_id = create_pack(sql, alice, "no-builder")
+        graph = _MuteGraph()
+
+        dry = ensure_anchor(sql, None, graph, Docs(), Vec(), pack_id, apply=False)
+        wet = ensure_anchor(sql, None, graph, Docs(), Vec(), pack_id, apply=True)
+
+        assert dry["action"] == wet["action"] == "skipped"
+
+    def test_store_choice_follows_the_builder_s_graph_not_just_its_presence(
+        self, sql, alice
+    ):
+        """A builder object whose `_neo4j` is None is not a usable builder.
+
+        Selecting stores on `builder is not None` would probe through that
+        None and fail-close to `skipped`, while the argument stores can answer
+        perfectly well. Both checks have to use the same predicate.
+        """
+        pack_id = create_pack(sql, alice, "hollow-builder")
+        graph = Graph()
+        graph.nodes[(ANCHOR_TYPE, anchor_node_id(pack_id))] = {"pack_id": pack_id}
+        hollow = MagicMock()
+        hollow._neo4j = None
+
+        result = ensure_anchor(
+            sql, hollow, graph, Docs(), Vec(), pack_id, apply=False
+        )
+
+        assert result["action"] == "already_present"
+
+
+class TestRepairRegistryLockWindows:
+    """The sibling command joins the same map.
+
+    Its registry writes are already compare-and-set, so this is map
+    consistency rather than a bug fix -- but a command left outside the map
+    is the next person's surprise, and the probe-to-transition span is still
+    unserialized without it.
+    """
+
+    @staticmethod
+    def _stale(sql, pack_id):
+        from datetime import UTC, datetime, timedelta
+
+        from sqlalchemy import text as _t
+
+        dt = datetime.now(UTC) - timedelta(seconds=7200)
+        with sql._engine.begin() as conn:
+            conn.execute(
+                _t("UPDATE packs SET updated_at = :v WHERE pack_id = :p"),
+                {"v": dt.strftime("%Y-%m-%d %H:%M:%S"), "p": pack_id},
+            )
+
+    def test_one_window_per_row_not_one_around_the_sweep(self, sql, alice, rec):
+        """Per row, deliberately.
+
+        An operator pass over a large registry that held one exclusive lock
+        for its whole duration would stall every writer -- worse than the gap
+        it closes. The unit that must be atomic is one row's probe-to-write.
+        """
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+
+        for name in ("row-a", "row-b"):
+            self._stale(sql, begin_pack_creation(sql, alice, name))
+        rec.reset()
+
+        repair_incomplete_packs(
+            sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+        )
+
+        assert rec.pairs() == 2
+
+    def test_the_row_window_contains_probe_and_the_transition(
+        self, sql, alice, rec, monkeypatch
+    ):
+        """Counting windows is not the same as covering the right code.
+
+        An earlier draft of this change wrapped the wrong branch -- a counter
+        bump a few lines up -- and the per-row COUNT test still passed,
+        because one window per row was opened either way. Nothing was inside
+        it. So assert containment of the two things that matter: the probe
+        the decision reads, and the CAS transition it produces.
+        """
+        import opencrab.pack.ownership as ownership_mod
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+
+        real_mark = ownership_mod.mark_pack_partial
+
+        def spy(*a, **kw):
+            rec.events.append("transition")
+            return real_mark(*a, **kw)
+
+        monkeypatch.setattr(ownership_mod, "mark_pack_partial", spy)
+        self._stale(sql, begin_pack_creation(sql, alice, "contained"))
+        rec.reset()
+
+        repair_incomplete_packs(
+            sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+        )
+
+        enter = rec.events.index("lock-enter")
+        leave = rec.events.index("lock-exit", enter)
+        assert enter < rec.events.index("probe", enter) < leave
+        assert enter < rec.events.index("transition", enter) < leave
+
+    def test_dry_run_takes_no_lock_including_promote(self, sql, alice, rec):
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+        from opencrab.pack.ownership import mark_pack_partial
+
+        pid = begin_pack_creation(sql, alice, "planned-row")
+        self._stale(sql, pid)
+        part = begin_pack_creation(sql, alice, "planned-promote")
+        assert mark_pack_partial(sql, part, alice) is True
+        rec.reset()
+
+        repair_incomplete_packs(
+            sql, Graph(), Docs(), Vec(),
+            older_than_seconds=0, apply=False, promote=part,
+        )
+
+        assert "lock-enter" not in rec.events
+
+    def test_promote_window_starts_at_the_registry_read(self, sql, alice, rec):
+        """Same rule as the anchor path: the block branches on the row it
+        reads, so a re-read left outside the window decides nothing."""
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+        from opencrab.pack.ownership import mark_pack_partial
+
+        part = begin_pack_creation(sql, alice, "to-promote")
+        assert mark_pack_partial(sql, part, alice) is True
+        graph = Graph()
+        graph.nodes[(ANCHOR_TYPE, anchor_node_id(part))] = {"pack_id": part}
+        rec.reset()
+
+        repair_incomplete_packs(
+            sql, graph, Docs(), Vec(),
+            older_than_seconds=0, apply=True, promote=part,
+        )
+
+        # Not absolute positions: the sweep runs first and probes the same
+        # `partial` row on its report-only path, so there is legitimate
+        # activity before the promote window opens. What matters is that the
+        # registry read AND the probe the block branches on both fall inside
+        # the window.
+        enter = rec.events.index("lock-enter")
+        leave = rec.events.index("lock-exit", enter)
+        read = rec.events.index("get_pack", enter)
+        assert enter < read < leave
+        assert read < rec.events.index("probe", read) < leave
+
+
+def _hold_lock_until(data_dir, ready_path, release_path):
+    """Child-process body: take the real flock, then wait to be told to drop it."""
+    import time
+
+    from opencrab.locking import write_lock
+
+    with write_lock(str(data_dir)):
+        pathlib.Path(ready_path).write_text("held")
+        for _ in range(600):
+            if pathlib.Path(release_path).exists():
+                break
+            time.sleep(0.05)
+
+
+class TestTheLockActuallyExcludes:
+    """The gap #223 named: nothing proved the lock excludes anyone.
+
+    The window tests above patch `write_lock` away, so they pin the span
+    without ever taking a real flock. This one takes the real thing from a
+    separate process. It has to be a process, not a thread -- `file_lock` is
+    re-entrant within a thread and guarded by a per-path RLock, so a thread
+    would either pass straight through or block somewhere that proves nothing
+    about cross-process behaviour.
+    """
+
+    def test_apply_waits_for_a_concurrent_holder(self, tmp_path):
+        import multiprocessing as mp
+        import threading
+        import time
+
+        from opencrab.stores.sql_store import SQLStore
+
+        # File-backed, not the in-memory fixture: the attempt runs on another
+        # thread and every `:memory:` connection gets its own private database,
+        # so the worker would not see this pack at all.
+        sql = SQLStore(f"sqlite:///{tmp_path}/registry.db")
+        alice = create_user(sql, "Alice")
+        pack_id = create_pack(sql, alice, "contended")
+        graph = Graph()
+        b = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+
+        # Its own directory, not the suite-wide one: this test blocks a real
+        # lock, and doing that on the shared file would stall other workers.
+        lock_dir = tmp_path / "lockdir"
+        lock_dir.mkdir()
+        ready, release = tmp_path / "ready", tmp_path / "release"
+
+        ctx = mp.get_context("fork")
+        holder = ctx.Process(
+            target=_hold_lock_until, args=(lock_dir, str(ready), str(release))
+        )
+        holder.start()
+        try:
+            for _ in range(200):
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            assert ready.exists(), "child never acquired the lock"
+
+            done = threading.Event()
+
+            def attempt():
+                ensure_anchor(
+                    sql, b, graph, Docs(), Vec(), pack_id,
+                    apply=True, data_dir=str(lock_dir),
+                )
+                done.set()
+
+            # daemon: if the assertion below fails we must not wedge the suite
+            # on a thread parked in an untimed flock.
+            t = threading.Thread(target=attempt, daemon=True)
+            t.start()
+
+            assert not done.wait(timeout=1.0), (
+                "apply proceeded while another process held write.lock"
+            )
+            assert graph.upsert_calls == 0
+
+            release.write_text("go")
+            assert done.wait(timeout=10.0), "apply never resumed after release"
+            assert graph.upsert_calls == 1
+        finally:
+            release.write_text("go")
+            holder.join(timeout=10)
+            if holder.is_alive():  # pragma: no cover - defensive
+                holder.terminate()
+                holder.join(timeout=5)
+
+
+def test_store_unification_follows_the_builder_not_the_arguments(sql, alice):
+    """`ensure_anchor` takes stores AND a builder, and they can differ.
+
+    The write goes through the builder, so the plan has to look there too.
+    Reading the argument stores instead is invisible in production -- the CLI
+    passes the same objects to both -- which is exactly why it needs a test
+    that hands them different ones. Here the builder's graph is the one
+    holding a foreign claim on the slot; a plan that consulted the argument
+    stores would see a clean slot and promise a write the guard refuses.
+    """
+    pack_id = create_pack(sql, alice, "split-view")
+    clean = Graph()
+    conflicted = _ForeignGraph(anchor_node_id(pack_id), "other-pack")
+    builder = OntologyBuilder(conflicted, Docs(), sql, vec=Vec())
+
+    result = ensure_anchor(
+        sql, builder, clean, Docs(), Vec(), pack_id, apply=False
+    )
+
+    assert result["action"] == "blocked"
+    assert result["reason"] == "foreign"
+
+
+class TestCLIDryRunStillPlans:
+    """The CLI half of the builder change (#224).
+
+    Green on an unmodified tree by design -- it exists to catch the CLI
+    reverting to building its builder only under `--apply`, which would turn
+    every dry run into `skipped` and make the command useless for planning.
+    """
+
+    @pytest.fixture()
+    def cli_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("STORAGE_MODE", "local")
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        yield tmp_path
+        get_settings.cache_clear()
+
+    @pytest.fixture()
+    def mock_vector_store(self, tmp_path):
+        from _vec_helpers import build_vector_store
+
+        store = build_vector_store("sqlite-vec", tmp_path, dim=32)
+        with patch("opencrab.stores.factory.make_vector_store", return_value=store):
+            yield store
+
+    def test_dry_run_reports_a_plan_not_skipped(self, cli_env, mock_vector_store):
+        from click.testing import CliRunner
+
+        from opencrab.cli import main
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_sql_store
+
+        sql = make_sql_store(get_settings())
+        owner = create_user(sql, "Operator")
+        pack_id = create_pack(sql, owner, "planme")
+
+        result = CliRunner().invoke(
+            main, ["packs", "repair-anchors", "--pack-id", pack_id]
+        )
+
+        assert result.exit_code == 0, result.output
+        # raw_decode, not loads: the command prints a trailing hint after the
+        # JSON, same as its sibling CLI tests handle.
+        brace = result.output.index("{")
+        payload = json.JSONDecoder().raw_decode(result.output[brace:])[0]
+        assert payload["apply"] is False
+        assert payload["counts"]["would_create"] == 1
+        assert payload["counts"]["skipped"] == 0

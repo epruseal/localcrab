@@ -1434,31 +1434,32 @@ def packs_repair_anchors(
     doc = _optional_store(cfg, "doc")
     vector = _optional_store(cfg, "vector")
 
-    # Builder is only needed when actually writing; dry-run can probe without it.
+    # Built in BOTH modes, deliberately (#224). A dry run is supposed to
+    # predict the apply, and `ensure_anchor` treats "no usable builder" as a
+    # decisive verdict of its own -- so handing the builder to apply but not
+    # to the plan made the two disagree whenever the graph store was down:
+    # the plan said `would_create`, the apply said `skipped`. Construction
+    # only binds the store handles, so doing it for a dry run writes nothing.
+    #
+    # Only graph and SQL are required for anchor creation; doc/vector are
+    # optional fan-out. _optional_store already handles their init failures
+    # as None, so don't let a doc/vector factory failure block the whole
+    # repair when graph/SQL are healthy.
     builder = None
-    if apply_changes:
-        # Only graph and SQL are required for anchor creation; doc/vector are
-        # optional fan-out. _optional_store already handles their init failures
-        # as None, so don't let a doc/vector factory failure block the whole
-        # repair when graph/SQL are healthy (P2 review).
-        if graph is None or not getattr(graph, "available", False):
-            console.print(
-                "[yellow]Graph store unavailable, cannot build builder for write.[/yellow]"
-            )
+    if graph is None or not getattr(graph, "available", False):
+        console.print(
+            "[yellow]Graph store unavailable, cannot build builder.[/yellow]"
+        )
+    elif not sql.available:
+        console.print(
+            "[yellow]SQL store unavailable, cannot build builder.[/yellow]"
+        )
+    else:
+        try:
+            builder = OntologyBuilder(graph, doc, sql, vec=vector)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Could not build builder: {exc}[/yellow]")
             builder = None
-        elif not sql.available:
-            console.print(
-                "[yellow]SQL store unavailable, cannot build builder for write.[/yellow]"
-            )
-            builder = None
-        else:
-            try:
-                builder = OntologyBuilder(graph, doc, sql, vec=vector)
-            except Exception as exc:  # noqa: BLE001
-                console.print(
-                    f"[yellow]Could not build builder for write: {exc}[/yellow]"
-                )
-                builder = None
 
     summary = repair_missing_anchors(
         sql,
