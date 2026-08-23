@@ -154,6 +154,20 @@ class TestListSourcesScopedMongo:
         assert pack_clause["$type"] == "string"
         fallback = query["$or"][1]["$and"][1]["metadata.source"]
         assert fallback["$in"] == [PACK_A, PACK_B]
+        # Issue #222: `$type` on the fallback leg too. All three membership
+        # legs go through one helper, so they move together -- but if anyone
+        # inlines one, this is the assertion that notices.
+        assert fallback["$type"] == "string"
+        # Array exclusions on every leg and on the container. Without them
+        # `$in`/`$type` match array ELEMENTS and the dotted path traverses an
+        # array-valued `metadata`, so rows outside the pack entered fork's
+        # copy range. `tests/test_mongo_owner_equivalence.py` pins the
+        # verdicts these produce against a real SQL store.
+        not_array = {"$type": "array"}
+        assert query["metadata"] == {"$not": not_array}
+        assert pack_clause["$not"] == not_array
+        assert fallback["$not"] == not_array
+        assert query["$or"][1]["$and"][0]["metadata.pack_id"]["$not"] == not_array
 
     def test_t94_projection_carries_text_matching_the_sql_sibling(self):
         """T94 (design §15-3): the scoped query's projection must match the
