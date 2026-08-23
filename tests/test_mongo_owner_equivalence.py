@@ -495,6 +495,15 @@ class TestKnownContractGap:
     knowingly rather than rediscovered, AND pin its direction: every one of
     them must be under-inclusion. If any flips to over-inclusion it is a pack
     boundary leak and this test must fail.
+
+    THIS IS THE INTENDED STATE, NOT A LATENT BUG (issue #222 shipped it
+    deliberately; issue #226 owns the resolution). Deciding the canon for
+    non-string ``pack_id`` -- and enforcing it at write time, without which
+    the shape simply comes back -- is #226's scope, and unifying the SQL side
+    would SHRINK what ``ontology_list_nodes`` returns on the primary backend,
+    which needs its own regression argument. Until then these assertions are
+    the baseline: whatever #226 changes shows up here as a diff instead of a
+    silent behaviour shift.
     """
 
     NON_STRING_SHAPES = [

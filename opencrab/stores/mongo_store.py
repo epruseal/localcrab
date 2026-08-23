@@ -63,16 +63,30 @@ def _scalar_string_in(values: list[str]) -> dict[str, Any]:
     is the defence that keeps a contract-violating non-string entry in
     ``pack_ids`` failing the same way SQL would.
 
-    CONTRACT (issue #222 design §3-4): a non-string ``pack_id`` -- number,
-    boolean, array, object -- is NOT owning under this predicate. The SQL side
-    is not self-consistent here (``opencrab/pack/load.py``'s ``_json_str_eq``,
-    which ``delete_pack`` uses, is string-strict; ``_SqlDocStoreBase.
-    list_nodes_scoped``'s ``json_truthy_text`` stringifies numbers and
-    booleans), so there is no single SQL behaviour to converge on. This
-    predicate follows the string-strict one, which is the policy the
-    repository states in ``_json_str_eq``'s docstring and which
-    ``scripts/migrate_pack_ownership.py``'s ``_classify_pack_id`` enforces.
-    The residual difference is under-inclusion, never a scope leak.
+    CONTRACT -- STRING-ONLY, AND IT DIVERGES FROM ONE SQL PREDICATE ON
+    PURPOSE (issue #222; canon decision tracked in issue #226). A non-string
+    ``pack_id`` -- number, boolean, array, object -- is NOT owning here. Do
+    not "fix" that by widening this predicate: the SQL side is not
+    self-consistent, so there is no single behaviour to converge on.
+    ``opencrab/pack/load.py``'s ``_json_str_eq`` (what ``delete_pack`` uses on
+    both the doc-node and graph axes) is string-strict and its docstring calls
+    a non-string ``pack_id`` defined-unsupported;
+    ``_SqlDocStoreBase.list_nodes_scoped``'s ``json_truthy_text`` stringifies
+    numbers and booleans and so answers differently on the same row. This
+    predicate follows the string-strict one -- the policy the repository
+    states, and the one ``scripts/migrate_pack_ownership.py``'s
+    ``_classify_pack_id`` enforces by classifying such values ``malformed``.
+
+    CONSEQUENCE, ACCEPTED: ``ontology_list_nodes`` can answer differently on
+    a mongo deployment than on a SQL one, for a node whose ``pack_id`` is
+    stored as a non-string. The direction is UNDER-inclusion -- mongo sees
+    less, never more -- so it is fail-closed and cannot move data across a
+    pack boundary, which is the invariant #222 exists to protect. Issue #226
+    decides the canon (string-only everywhere, or promote non-strings) and
+    adds the write-time enforcement that would stop such values being stored
+    at all. ``tests/test_mongo_owner_equivalence.py``'s
+    ``TestKnownContractGap`` pins the current difference class by class so
+    #226 can see in a diff exactly what it changes.
     """
     return {"$in": list(values), "$type": "string", "$not": _array()}
 
