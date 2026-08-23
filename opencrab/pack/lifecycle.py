@@ -464,6 +464,16 @@ def repair_incomplete_packs(
                         results.append(entry)
                         continue
 
+                    # Adopt the fresh row's identity BEFORE anything that can
+                    # return. The gates below report, and a replacement row can
+                    # have a different owner than the one that was deleted, so
+                    # refreshing after them would attribute the replacement to
+                    # the row it replaced.
+                    row = fresh
+                    owner_id = row["owner_id"]
+                    entry["owner_id"] = owner_id
+                    entry["status"] = row["status"]
+
                     # Still `creating` is not the same as still the same row.
                     # A slug freed and re-reserved while this pass waited for
                     # the lock comes back `creating` too, and acting on it with
@@ -492,11 +502,6 @@ def repair_incomplete_packs(
                         counts["skipped"] += 1
                         results.append(entry)
                         continue
-
-                    row = fresh
-                    owner_id = row["owner_id"]
-                    entry["owner_id"] = owner_id
-                    entry["status"] = row["status"]
 
                 probes = probe_anchor(graph, docs, vector, pack_id)
                 entry["probes"] = probes

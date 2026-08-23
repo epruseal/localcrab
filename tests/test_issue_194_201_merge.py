@@ -1143,6 +1143,7 @@ def test_a_slug_reused_under_the_lock_is_not_judged_by_the_old_row_s_age(
 
     pid = begin_pack_creation(sql, alice, "reused-slug")
     TestRepairRegistryLockWindows._stale(sql, pid)
+    bob = create_user(sql, "Bob")
     real_lock = locking_mod.write_lock
 
     @contextlib.contextmanager
@@ -1152,7 +1153,7 @@ def test_a_slug_reused_under_the_lock_is_not_judged_by_the_old_row_s_age(
             conn.execute(
                 _sql_text("DELETE FROM packs WHERE pack_id = :p"), {"p": pid}
             )
-        ownership_mod.begin_pack_creation(sql, alice, pid)
+        ownership_mod.begin_pack_creation(sql, bob, pid)
         with real_lock(*a, **kw):
             yield
 
@@ -1166,3 +1167,8 @@ def test_a_slug_reused_under_the_lock_is_not_judged_by_the_old_row_s_age(
     assert row["action"] == "skipped (too recent)"
     assert "re-read under the lock" in row["reason"]
     assert get_pack(sql, pid)["status"] == "creating"
+    # The report has to describe the row that is actually there. A
+    # replacement can belong to someone else, and the gates above return
+    # before the write, so the identity has to be adopted on the way in
+    # rather than on the way out.
+    assert row["owner_id"] == bob
