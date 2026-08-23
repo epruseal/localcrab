@@ -277,6 +277,48 @@ def repair_incomplete_packs(
     ``pack_delete`` (a separate, not-yet-built tool; see this module's and
     ``delete_pack_row``'s docstrings).
 
+    **A ``creating`` row with ``forked_from`` set follows a different rule
+    (#201 §4-F).** It was reserved by ``pack_fork``, which lands its graph
+    anchor FIRST and copies content after -- the opposite order from
+    ``pack_create``, whose anchor write is its last step and therefore its
+    completion proof. So a stale forked ``creating`` row is demoted to
+    ``partial`` on age ALONE, independent of what the anchor probe says (an
+    incomplete fork copy's anchor probes exactly as PRESENT as a complete
+    one's), and it is never auto-promoted by this pass -- only ``pack_fork``
+    itself ever promotes a fork it is running. The row still appears in
+    ``rows`` either way; this pass never drops a row from the report just
+    because its fate was decided differently.
+
+    **Recovery for a failed fork is NOT promotion.** A ``partial`` row with
+    ``forked_from`` set is refused by ``--promote`` -- and by
+    ``promote_partial_pack`` directly -- with the explicit reason
+    ``opencrab.pack.ownership.FORKED_PARTIAL_PROMOTE_REFUSAL`` names,
+    because there is no anchor-probe (or any other) evidence available here
+    that would make flipping it to ``ready`` sound: an incomplete fork copy
+    and a complete one are indistinguishable by the anchor alone, and
+    re-running the fork's own post-copy verification would need the source
+    pack and the id-remap salt, neither of which outlives the ``pack_fork``
+    call that generated them. The actual recovery procedure is ops
+    ``delete_pack`` (frees the copied content) followed by the caller
+    re-forking. Two limits on that procedure, precisely:
+
+    - ``delete_pack`` (``opencrab/pack/load.py``) takes no ``sql`` handle,
+      so it does not touch the registry -- the stranded ``partial`` row
+      stays, and it keeps occupying the fork's preferred slug (``{src}-fork``
+      by default). A re-fork requesting that same slug does not fail on
+      this; it relies on ``begin_pack_creation``'s existing collision
+      negotiation to land on a suffixed id instead, exactly as any other
+      slug collision would.
+    - ``older_than_seconds`` must be set larger than the longest fork this
+      deployment expects to run. A healthy, still-copying fork whose row
+      crosses that age threshold gets demoted mid-flight by this very pass
+      (the rule two paragraphs up does not distinguish "still running" from
+      "died") -- and if the retry takes just as long, it crosses the same
+      threshold and gets demoted again, so the fork never converges to
+      ``ready`` under a threshold shorter than its own runtime. Raising the
+      threshold above the expected fork duration is what keeps an
+      in-progress row under the age gate long enough to finish.
+
     Returns a JSON-serializable dict:
 
     - ``older_than_seconds``, ``apply``, ``checked_at`` -- the run's inputs
@@ -319,6 +361,7 @@ def repair_incomplete_packs(
         )
 
     from opencrab.pack.ownership import (
+        FORKED_PARTIAL_PROMOTE_REFUSAL,
         PACK_STATUS_CREATING,
         PACK_STATUS_PARTIAL,
         PACK_STATUS_READY,
@@ -376,7 +419,50 @@ def repair_incomplete_packs(
             probes = probe_anchor(graph, docs, vector, pack_id)
             entry["probes"] = probes
             graph_probe = probes.get("graph")
-            if graph_probe == PROBE_PRESENT:
+            if row.get("forked_from"):
+                # #201 §4-F fix 1. This row was reserved by `pack_fork`, not
+                # `pack_create` -- and the two have OPPOSITE relationships
+                # between "anchor present" and "attempt complete".
+                # `pack_create` writes its anchor LAST (after everything
+                # else it needs has been validated), so a landed anchor IS
+                # its completion criterion -- that is what the
+                # PROBE_PRESENT branch below promotes on. `pack_fork`
+                # writes its anchor FIRST and only then copies content, so
+                # for a fork the anchor is merely evidence of the FIRST
+                # write, never of completion. Falling through to the same
+                # PROBE_PRESENT/PROBE_ABSENT branching below would auto-
+                # promote a fork whose copy is still running or died
+                # mid-copy -- and dying right after the anchor lands is
+                # fork's ordinary failure mode, not a corner case, so this
+                # is not a rare mistake to tolerate.
+                #
+                # A guard that only closed the PROBE_PRESENT promote branch
+                # (leaving the PROBE_ABSENT demote branch as the sole
+                # fallback) would still be wrong: a dead fork's anchor is
+                # PRESENT (it was the first thing written), so that row
+                # would never reach the demote branch either and would sit
+                # in `creating` forever -- invisible to every read path,
+                # unrecoverable by any promotion, since nothing but this
+                # pass and `pack_fork` itself ever calls
+                # `mark_pack_ready`/`mark_pack_partial`. So a forked
+                # `creating` row demotes on age ALONE, independent of the
+                # probe outcome, and never auto-promotes here -- promotion
+                # of a fork is owned exclusively by the `pack_fork` call
+                # that is copying it.
+                #
+                # This branch still runs the same demote CALL as the
+                # PROBE_ABSENT branch below (not a `continue`): skipping the
+                # row would drop it from `results` entirely, which makes a
+                # dead fork LESS observable to the operator reading this
+                # pass's report -- the opposite of what finding it is for.
+                entry["action"] = "demote"
+                if apply:
+                    applied = mark_pack_partial(sql, pack_id, owner_id)
+                    entry["applied"] = applied
+                    if applied:
+                        entry["status"] = PACK_STATUS_PARTIAL
+                        counts["demoted"] += 1
+            elif graph_probe == PROBE_PRESENT:
                 entry["action"] = "promote"
                 if apply:
                     applied = mark_pack_ready(sql, pack_id, owner_id)
@@ -445,6 +531,30 @@ def repair_incomplete_packs(
                     else ""
                 )
             )
+        elif target.get("forked_from"):
+            # #201 §4-F fix 3. Checked BEFORE the anchor-probe branch below,
+            # and BEFORE `apply` is consulted, for the same "plan == apply"
+            # reason as the status check above: `promote_partial_pack`
+            # itself refuses a forked `partial` row outright (raises
+            # `ValueError`, see its docstring) because the anchor-probe
+            # gate that licenses every OTHER promotion here is vacuous for
+            # a fork -- `pack_fork` writes its anchor before copying any
+            # content, so an incomplete copy's anchor probes PRESENT just
+            # as reliably as a complete one's does. If this rejection lived
+            # only inside `promote_partial_pack`, a dry-run (`apply=False`)
+            # would still walk past this `elif` chain into the `else`
+            # branch and print action "promote" -- a plan `--apply` could
+            # never actually perform, since the very next call would raise.
+            # `get_pack`'s `_SELECT_COLS` already includes `forked_from`
+            # (see `ownership.py`), so `target` (fetched once, above) has
+            # what is needed here without a second query.
+            #
+            # Reason string is imported from `ownership.py`, not
+            # re-spelled here, so this planning-time rejection and
+            # `promote_partial_pack`'s own runtime rejection can never say
+            # two different things about the same refusal.
+            promote_result["action"] = "rejected (forked partial row)"
+            promote_result["reason"] = FORKED_PARTIAL_PROMOTE_REFUSAL
         elif probes.get("graph") != PROBE_PRESENT:
             promote_result["action"] = "rejected (graph anchor not confirmed present)"
             promote_result["reason"] = (

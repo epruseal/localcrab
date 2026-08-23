@@ -667,6 +667,17 @@ class GraphStoreExtended(Protocol):
         Empty ``pack_ids`` -> ``[]`` WITHOUT querying (nothing is in scope,
         so there is nothing to fetch). ``limit <= 0`` -> ``[]``, same
         contract as ``export_nodes`` (issue #120).
+
+        ``labels`` SHAPE (issue #201): a row's ``labels`` may contain the
+        storage marker ``_graph_common.GRAPH_BASE_LABEL`` at an UNDECLARED
+        position alongside the domain type -- the Neo4j backend returns
+        ``labels(n)`` verbatim and its ``MERGE`` stamps both, while the SQL
+        and Kuzu backends return a single-element ``[node_type]``. A consumer
+        that needs the domain type must therefore filter with
+        ``_graph_common.domain_labels()`` rather than indexing ``labels``.
+        Stated as a fact about the return value, not as a claim about
+        callers: consumers that still index ``labels`` directly exist in this
+        repository.
         """
         ...
 
