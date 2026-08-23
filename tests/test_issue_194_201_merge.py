@@ -1215,6 +1215,11 @@ def test_a_moved_row_is_reported_whole_not_half(sql, alice, monkeypatch):
     assert row["action"] == "skipped (row moved before the lock)"
     assert row["status"] == "partial"
     assert row["owner_id"] == bob, "reported the deleted row's owner"
+    # This verdict is itself a claim about time ("before the lock"), so the
+    # row has to say when it was looked at. Without it the only timestamp is
+    # the pass's opening stamp, which after a wait can predate the very row
+    # it is describing.
+    assert "checked_at" in row, "a time-based verdict with no time on it"
 
 
 class TestNothingPreLockLeaksIntoTheWindow:

@@ -455,6 +455,17 @@ def repair_incomplete_packs(
                     # and reporting on a row that already moved.
                     fresh = get_pack(sql, pack_id)
 
+                    # Record WHEN we looked before recording WHAT we saw, and
+                    # both before anything branches. Every gate below reports,
+                    # and several of them make claims about time -- "moved
+                    # before the lock", "too recent" -- so a row whose only
+                    # timestamp is the pre-query stamp cannot be reconciled
+                    # against its own `updated_at` after a long wait. Putting
+                    # this at the top is the whole fix: there is then no gate
+                    # that can return before the row has both.
+                    now_locked = datetime.now(UTC)
+                    entry["checked_at"] = now_locked.isoformat()
+
                     # Adopt first, gate second. Every branch below this point
                     # reports, and a slug freed and re-reserved during the lock
                     # wait can come back under a different owner -- so the
@@ -500,21 +511,6 @@ def repair_incomplete_packs(
                     # to keep this pass off rows someone is still creating. So
                     # re-run that gate on what was actually read, and refresh
                     # the fields the report will carry.
-                    # Stamp the clock inside the window too. `now` was taken
-                    # before the candidate query, so a lock wait of more than a
-                    # second makes a legitimately fresh row look like it is
-                    # dated in the future. Comparing a value read here against
-                    # a clock read before the lock is the same mistake as
-                    # comparing it against a row read before the lock.
-                    now_locked = datetime.now(UTC)
-                    # Report it too, not just decide by it. The top-level
-                    # `checked_at` is the pre-query stamp, so after a long lock
-                    # wait it can read EARLIER than the row's own `updated_at`
-                    # while this entry claims a known age -- leaving an
-                    # operator unable to reconstruct how the age was judged.
-                    # The clock that actually decided this row belongs on this
-                    # row.
-                    entry["checked_at"] = now_locked.isoformat()
                     fresh_dt = _parse_updated_at(fresh.get("updated_at"))
                     if fresh_dt is None or fresh_dt > now_locked:
                         entry["action"] = "skipped (unknown age)"
