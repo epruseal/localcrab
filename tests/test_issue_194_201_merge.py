@@ -509,3 +509,103 @@ class TestCLIRepairAnchorsApply:
         assert written is not None
         assert written["forked_from"] == "upstream"
         assert get_pack(sql, pack_id)["status"] == PACK_STATUS_READY
+
+
+# ---------------------------------------------------------------------------
+# The applying path must hold the shared write lock; the dry run must not.
+# ---------------------------------------------------------------------------
+
+
+class TestRepairHoldsTheWriteLock:
+    """`repair-anchors --apply` is a write path this PR introduces, so it has
+    to join the `write.lock` ownership map rather than sit outside it.
+
+    Counting lock acquisitions is not enough to pin that. A lock taken and
+    released before the probe would satisfy a call count while leaving the
+    exact window open that the lock exists to close. So these tests record
+    enter/exit as events alongside the registry read, the probe, and the
+    write, and assert the containment.
+    """
+
+    @staticmethod
+    def _instrumented(monkeypatch, sql):
+        """Record lock span, registry read, probe, and write on one timeline."""
+        import contextlib
+
+        import opencrab.locking as locking_mod
+        import opencrab.pack.lifecycle as lifecycle_mod
+        import opencrab.pack.ownership as ownership_mod
+
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(*a, **kw):  # noqa: ARG001
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        real_get_pack = ownership_mod.get_pack
+        real_probe = lifecycle_mod.probe_anchor
+
+        def spy_get_pack(*a, **kw):
+            events.append("get_pack")
+            return real_get_pack(*a, **kw)
+
+        def spy_probe(*a, **kw):
+            events.append("probe")
+            return real_probe(*a, **kw)
+
+        monkeypatch.setattr(locking_mod, "write_lock", recording_lock)
+        monkeypatch.setattr(ownership_mod, "get_pack", spy_get_pack)
+        monkeypatch.setattr(lifecycle_mod, "probe_anchor", spy_probe)
+
+        graph = Graph()
+        real_upsert = graph.upsert_node
+
+        def spy_upsert(*a, **kw):
+            events.append("write")
+            return real_upsert(*a, **kw)
+
+        graph.upsert_node = spy_upsert
+        builder = OntologyBuilder(graph, Docs(), sql, vec=Vec())
+        return events, graph, builder
+
+    def test_apply_wraps_the_whole_read_probe_write_window(self, sql, alice, monkeypatch):
+        """The lock must open before the registry read, not merely before the
+        write.
+
+        The status re-check matters as much as the probe here.
+        `repair_missing_anchors` selects its candidates with an unlocked query
+        and leaves the re-check to `ensure_anchor`; if that re-check sat
+        outside the lock, a pack demoted after the select could still be
+        written to.
+        """
+        pack_id = create_pack(sql, alice, "locked-repair")
+        events, _graph, builder = self._instrumented(monkeypatch, sql)
+
+        result = ensure_anchor(
+            sql, builder, _graph, Docs(), Vec(), pack_id, apply=True
+        )
+
+        assert result["action"] == "created"
+        assert events[0] == "lock-enter"
+        assert events[-1] == "lock-exit"
+        for stage in ("get_pack", "probe", "write"):
+            assert stage in events, f"{stage} never observed: {events}"
+            assert 0 < events.index(stage) < events.index("lock-exit")
+
+    def test_dry_run_takes_no_lock(self, sql, alice, monkeypatch):
+        """A read-only inspection that blocks every writer would be its own
+        defect -- the same reason `backfill_pack_ids` splits on `dry_run`."""
+        pack_id = create_pack(sql, alice, "planned-only")
+        events, _graph, builder = self._instrumented(monkeypatch, sql)
+
+        result = ensure_anchor(
+            sql, builder, _graph, Docs(), Vec(), pack_id, apply=False
+        )
+
+        assert result["action"] == "would_create"
+        assert "lock-enter" not in events
+        assert "write" not in events

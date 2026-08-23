@@ -637,170 +637,204 @@ def ensure_anchor(
     than restoring nothing. Nothing is promoted either way -- this call
     never touches the registry row's status.
     """
+    from contextlib import ExitStack
+
     from opencrab.auth import Principal, current_principal, principal_scope
+    from opencrab.locking import write_lock
     from opencrab.pack.ownership import anchor_node_id, get_pack
 
-    pack = get_pack(sql, pack_id)
-    if pack is None:
-        return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
-    if pack["status"] != "ready":
-        return {
-            "action": "skipped",
-            "reason": f"pack status is {pack['status']!r}, not 'ready'",
-            "pack_id": pack_id,
-            "status": pack["status"],
-        }
+    with ExitStack() as stack:
+        if apply:
+            # Everything from the registry read to the write is one window.
+            #
+            # Two races close here, not one. The obvious one is the probe: a
+            # concurrent writer that lands the anchor between `probe_anchor`
+            # saying "absent" and `add_node` running would have its anchor
+            # overwritten with registry-derived properties. The less obvious
+            # one is the status re-check just below -- `repair_missing_anchors`
+            # picks its candidates with an unlocked `SELECT ... WHERE
+            # status='ready'` and delegates re-checking to this function, so a
+            # pack demoted or deleted after that SELECT would still be written
+            # to unless the re-check itself is inside the window. That is why
+            # the lock starts at `get_pack` rather than at the probe.
+            #
+            # A dry run takes nothing: it writes nothing, and a read-only
+            # inspection that blocks every writer is its own defect. This is
+            # the same split `backfill_pack_ids` makes, for the same reason.
+            #
+            # Locking HERE rather than in the `packs repair-anchors` command
+            # is also deliberate, and again follows `backfill_pack_ids`: the
+            # CLI is one of three callers, and a lock in it would leave the
+            # other two -- and the next one someone adds -- unprotected.
+            # `pack_ingest` (under the MCP write lock) and `cli ingest` (under
+            # `write_lock`) already hold this exact lock when they arrive, and
+            # re-acquiring is safe: `file_lock` is re-entrant within a thread
+            # and names that pattern as its purpose. Across threads it is not
+            # re-entrant -- it would block on the per-path RLock -- so a future
+            # caller on a worker thread must not nest it.
+            stack.enter_context(write_lock())
 
-    probes = probe_anchor(graph, docs, vector, pack_id)
-    if probes.get("graph") == PROBE_PRESENT:
-        return {"action": "already_present", "pack_id": pack_id, "probes": probes}
-    if probes.get("graph") != PROBE_ABSENT:
-        # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
-        # "absent" at graph level; but UNKNOWN means we cannot tell.
-        # optional-only is still "graph absent", so we should create.
-        # Only UNKNOWN is skipped.
-        if probes.get("graph") == PROBE_UNKNOWN:
+        pack = get_pack(sql, pack_id)
+        if pack is None:
+            return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
+        if pack["status"] != "ready":
             return {
                 "action": "skipped",
-                "reason": "graph probe unverifiable",
+                "reason": f"pack status is {pack['status']!r}, not 'ready'",
+                "pack_id": pack_id,
+                "status": pack["status"],
+            }
+
+        probes = probe_anchor(graph, docs, vector, pack_id)
+        if probes.get("graph") == PROBE_PRESENT:
+            return {"action": "already_present", "pack_id": pack_id, "probes": probes}
+        if probes.get("graph") != PROBE_ABSENT:
+            # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
+            # "absent" at graph level; but UNKNOWN means we cannot tell.
+            # optional-only is still "graph absent", so we should create.
+            # Only UNKNOWN is skipped.
+            if probes.get("graph") == PROBE_UNKNOWN:
+                return {
+                    "action": "skipped",
+                    "reason": "graph probe unverifiable",
+                    "pack_id": pack_id,
+                    "probes": probes,
+                }
+            # For optional-only, graph is absent, so we fall through to create.
+            # The check above already handled UNKNOWN, so remaining is ABSENT or
+            # optional-only (which is graph absent).
+            pass
+
+        # At this point graph is absent (including optional-only case).
+        # Resolve title/description from explicit args or registry fallback.
+        resolved_title = title if title is not None else (pack.get("title") or pack_id)
+        resolved_description = description if description is not None else (pack.get("description") or "")
+
+        if not apply:
+            return {
+                "action": "would_create",
+                "pack_id": pack_id,
+                "probes": probes,
+                "title": resolved_title,
+            }
+
+        if builder is None or not getattr(builder, "_neo4j", None):
+            return {
+                "action": "skipped",
+                "reason": "builder or graph store unavailable",
                 "pack_id": pack_id,
                 "probes": probes,
             }
-        # For optional-only, graph is absent, so we fall through to create.
-        # The check above already handled UNKNOWN, so remaining is ABSENT or
-        # optional-only (which is graph absent).
-        pass
 
-    # At this point graph is absent (including optional-only case).
-    # Resolve title/description from explicit args or registry fallback.
-    resolved_title = title if title is not None else (pack.get("title") or pack_id)
-    resolved_description = description if description is not None else (pack.get("description") or "")
-
-    if not apply:
-        return {
-            "action": "would_create",
-            "pack_id": pack_id,
-            "probes": probes,
-            "title": resolved_title,
-        }
-
-    if builder is None or not getattr(builder, "_neo4j", None):
-        return {
-            "action": "skipped",
-            "reason": "builder or graph store unavailable",
-            "pack_id": pack_id,
-            "probes": probes,
-        }
-
-    # Need a principal that owns the pack. Use explicit one if given,
-    # otherwise try current_principal, otherwise synthesize from owner.
-    use_principal = principal
-    if use_principal is None:
-        try:
-            use_principal = current_principal()
-        except LookupError:
-            # Fallback: synthesize a principal for the pack owner. This is
-            # only for offline repair where no request principal exists; the
-            # anchor write is still authorized via ownership, not via the
-            # caller's identity beyond being the owner.
-            # Fetch is_local from users table if possible.
+        # Need a principal that owns the pack. Use explicit one if given,
+        # otherwise try current_principal, otherwise synthesize from owner.
+        use_principal = principal
+        if use_principal is None:
             try:
-                from sqlalchemy import text
+                use_principal = current_principal()
+            except LookupError:
+                # Fallback: synthesize a principal for the pack owner. This is
+                # only for offline repair where no request principal exists; the
+                # anchor write is still authorized via ownership, not via the
+                # caller's identity beyond being the owner.
+                # Fetch is_local from users table if possible.
+                try:
+                    from sqlalchemy import text
 
-                with sql._engine.connect() as conn:
-                    row = conn.execute(
-                        text("SELECT is_local FROM users WHERE user_id = :uid"),
-                        {"uid": pack["owner_id"]},
-                    ).fetchone()
-                is_local = bool(row[0]) if row else False
-            except Exception:
-                is_local = False
-            use_principal = Principal(
-                user_id=pack["owner_id"], is_local=is_local, disabled=False
-            )
+                    with sql._engine.connect() as conn:
+                        row = conn.execute(
+                            text("SELECT is_local FROM users WHERE user_id = :uid"),
+                            {"uid": pack["owner_id"]},
+                        ).fetchone()
+                    is_local = bool(row[0]) if row else False
+                except Exception:
+                    is_local = False
+                use_principal = Principal(
+                    user_id=pack["owner_id"], is_local=is_local, disabled=False
+                )
 
-    # Anchor shape and stamping mirrors pack_create's anchor write -- unless
-    # the registry says this pack came from a fork, in which case it mirrors
-    # pack_fork's anchor write instead (see below).
-    anchor_id = anchor_node_id(pack_id)
-    props = {
-        "pack_id": pack_id,
-        "title": resolved_title,
-        "description": resolved_description,
-        "created_by": "localcrab-mcp",
-    }
-    forked_from = pack.get("forked_from")
-    if forked_from:
-        # A fork stamps two extra provenance values onto its anchor (see
-        # `pack.fork`'s anchor write). Rebuilding without them would quietly
-        # rewrite a forked pack's anchor to look like a natively created
-        # one -- a repair pass must not launder provenance. These are not
-        # invented here: the registry row is the system of record for
-        # `forked_from`, and this restores what it already records.
-        #
-        # `created_by` follows because it records WHICH SHAPE of anchor this
-        # is, not which call ran -- the plain value above is equally a
-        # reconstruction, since no `pack_create` call is running here either.
-        #
-        # Assumption, deliberately narrow: a registry row carrying
-        # `forked_from` came from a fork. `ownership.create_pack` also
-        # accepts the argument, so this is a convention rather than a
-        # constraint; today the only production caller that passes it is
-        # `pack.fork`. Anyone adding a second one should revisit this.
-        #
-        # Title and description are NOT restored to fork's values. They come
-        # from the registry like every other repair, because a rebuilt anchor
-        # should show what this pack is called now, not what it was called
-        # when it was forked.
-        props["created_by"] = "localcrab-mcp:pack_fork"
-        props["forked_from"] = forked_from
+        # Anchor shape and stamping mirrors pack_create's anchor write -- unless
+        # the registry says this pack came from a fork, in which case it mirrors
+        # pack_fork's anchor write instead (see below).
+        anchor_id = anchor_node_id(pack_id)
+        props = {
+            "pack_id": pack_id,
+            "title": resolved_title,
+            "description": resolved_description,
+            "created_by": "localcrab-mcp",
+        }
+        forked_from = pack.get("forked_from")
+        if forked_from:
+            # A fork stamps two extra provenance values onto its anchor (see
+            # `pack.fork`'s anchor write). Rebuilding without them would quietly
+            # rewrite a forked pack's anchor to look like a natively created
+            # one -- a repair pass must not launder provenance. These are not
+            # invented here: the registry row is the system of record for
+            # `forked_from`, and this restores what it already records.
+            #
+            # `created_by` follows because it records WHICH SHAPE of anchor this
+            # is, not which call ran -- the plain value above is equally a
+            # reconstruction, since no `pack_create` call is running here either.
+            #
+            # Assumption, deliberately narrow: a registry row carrying
+            # `forked_from` came from a fork. `ownership.create_pack` also
+            # accepts the argument, so this is a convention rather than a
+            # constraint; today the only production caller that passes it is
+            # `pack.fork`. Anyone adding a second one should revisit this.
+            #
+            # Title and description are NOT restored to fork's values. They come
+            # from the registry like every other repair, because a rebuilt anchor
+            # should show what this pack is called now, not what it was called
+            # when it was forked.
+            props["created_by"] = "localcrab-mcp:pack_fork"
+            props["forked_from"] = forked_from
 
-    try:
-        with principal_scope(use_principal):
-            result = builder.add_node(
-                space=_ANCHOR_SPACE,
-                node_type=_ANCHOR_NODE_TYPE,
-                node_id=anchor_id,
-                properties=props,
-                pack_id=pack_id,
-                origin="server",
-                pack_anchor=True,
-                _allow_ready_anchor=True,
-            )
-    except Exception as exc:  # noqa: BLE001
+        try:
+            with principal_scope(use_principal):
+                result = builder.add_node(
+                    space=_ANCHOR_SPACE,
+                    node_type=_ANCHOR_NODE_TYPE,
+                    node_id=anchor_id,
+                    properties=props,
+                    pack_id=pack_id,
+                    origin="server",
+                    pack_anchor=True,
+                    _allow_ready_anchor=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "action": "failed",
+                "reason": f"anchor write raised: {exc}",
+                "pack_id": pack_id,
+                "probes": probes,
+            }
+
+        # pack_create's post-write verdict: graph must land.
+        stores = result.get("stores") or {}
+        graph_status = stores.get("graph")
+        if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
+            return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
+        # If graph didn't land but probe now says present (e.g., commit succeeded
+        # but acknowledgement dropped), treat as created as well (same as pack_create).
+        try:
+            reprobe = probe_anchor(graph, docs, vector, pack_id)
+            if reprobe.get("graph") == PROBE_PRESENT:
+                return {
+                    "action": "created",
+                    "pack_id": pack_id,
+                    "probes": probes,
+                    "reprobe": reprobe,
+                    "stores": stores,
+                }
+        except Exception:
+            pass
         return {
             "action": "failed",
-            "reason": f"anchor write raised: {exc}",
+            "reason": f"graph store did not land: {graph_status}",
             "pack_id": pack_id,
             "probes": probes,
+            "stores": stores,
         }
-
-    # pack_create's post-write verdict: graph must land.
-    stores = result.get("stores") or {}
-    graph_status = stores.get("graph")
-    if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
-        return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
-    # If graph didn't land but probe now says present (e.g., commit succeeded
-    # but acknowledgement dropped), treat as created as well (same as pack_create).
-    try:
-        reprobe = probe_anchor(graph, docs, vector, pack_id)
-        if reprobe.get("graph") == PROBE_PRESENT:
-            return {
-                "action": "created",
-                "pack_id": pack_id,
-                "probes": probes,
-                "reprobe": reprobe,
-                "stores": stores,
-            }
-    except Exception:
-        pass
-    return {
-        "action": "failed",
-        "reason": f"graph store did not land: {graph_status}",
-        "pack_id": pack_id,
-        "probes": probes,
-        "stores": stores,
-    }
 
 
 def repair_missing_anchors(
