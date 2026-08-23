@@ -379,7 +379,12 @@ def repair_incomplete_packs(
         promote_partial_pack,
     )
 
-    now = datetime.now(UTC)
+    # Named for when it was taken, not for what it is. Eight defects on this
+    # function came from pre-lock values reaching in-lock decisions, so the
+    # scan-time clock and the scan-time row now say so in their names: inside
+    # a `write_lock` block, reading either one is visibly wrong rather than
+    # merely wrong.
+    scan_started_at = datetime.now(UTC)
     rows = list_incomplete_packs(sql)
 
     counts = {
@@ -392,10 +397,16 @@ def repair_incomplete_packs(
     }
     results: list[dict[str, Any]] = []
 
-    for row in rows:
-        pack_id = row["pack_id"]
-        owner_id = row["owner_id"]
-        status = row["status"]
+    for scanned_row in rows:
+        # `row` is what the code below decides on. It starts as the scanned
+        # row -- correct for the dry-run path, which takes no lock and so has
+        # nothing fresher -- and the apply path rebinds it from the in-lock
+        # re-read. `scanned_row` keeps its own name so that reaching for it
+        # from inside a window reads as reaching past that re-read.
+        row = scanned_row
+        pack_id = scanned_row["pack_id"]
+        owner_id = scanned_row["owner_id"]
+        status = scanned_row["status"]
         entry: dict[str, Any] = {
             "pack_id": pack_id,
             "owner_id": owner_id,
@@ -406,15 +417,15 @@ def repair_incomplete_packs(
         elif status == PACK_STATUS_PARTIAL:
             counts["partial"] += 1
 
-        dt = _parse_updated_at(row.get("updated_at"))
-        if dt is None or dt > now:
+        dt = _parse_updated_at(scanned_row.get("updated_at"))
+        if dt is None or dt > scan_started_at:
             entry["action"] = "skipped (unknown age)"
             entry["reason"] = "updated_at is missing, unparseable, or in the future"
             counts["skipped"] += 1
             results.append(entry)
             continue
 
-        age_seconds = (now - dt).total_seconds()
+        age_seconds = (scan_started_at - dt).total_seconds()
         if age_seconds < older_than_seconds:
             entry["action"] = "skipped (too recent)"
             entry["reason"] = f"age {age_seconds:.0f}s < threshold {older_than_seconds}s"
@@ -715,7 +726,7 @@ def repair_incomplete_packs(
     return {
         "older_than_seconds": older_than_seconds,
         "apply": apply,
-        "checked_at": now.isoformat(),
+        "checked_at": scan_started_at.isoformat(),
         "counts": counts,
         "rows": results,
         "promote_result": promote_result,
