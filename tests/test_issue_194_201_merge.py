@@ -421,9 +421,10 @@ def test_pack_ingest_rebuilds_a_forked_anchor_with_its_provenance(bind_test_prin
     `bind_test_principal` binds, and `pack_ingest` authorizes before it gets
     anywhere near the anchor.
     """
+    from test_tools_handlers_direct import _base_ctx
+
     from opencrab.mcp.tools.pack import pack_ingest
     from opencrab.stores.sql_store import SQLStore
-    from test_tools_handlers_direct import _base_ctx
 
     sql = SQLStore("sqlite:///:memory:")
     create_pack(sql, "test-user", "upstream")
