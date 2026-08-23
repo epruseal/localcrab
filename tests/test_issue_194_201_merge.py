@@ -1377,3 +1377,74 @@ def test_a_row_deleted_under_the_lock_is_not_reported_as_present(
     # examined, but no longer held by the registry
     assert result["counts"]["rows_examined"] == 1
     assert result["counts"]["creating"] == 0
+
+
+def test_no_path_returns_before_the_row_is_recorded():
+    """Structural check over the source, not a behaviour test.
+
+    Eight defects on `repair_incomplete_packs` had one shape, and twice the
+    fix was "move the record above the gate" -- once above some gates, once
+    above the rest. A rule that has been broken twice is not enforcement, and
+    the next person adding a gate inside the window will break it again
+    without noticing.
+
+    So assert the shape instead of trusting the rule: inside the row lock,
+    nothing may exit before the row has been stamped with when it was read.
+    Add a `continue`, `return`, or `break` above that stamp and this fails,
+    naming the line.
+
+    The stronger version of this is lifting the window body into a function
+    that only receives the re-read snapshot, which would make the property
+    hold by scope rather than by inspection. That is a large extraction of
+    the exact region these eight defects came from, so it is deliberately
+    left as its own change; see the design notes. This test is what holds the
+    line until then.
+    """
+    import ast
+    import inspect
+
+    from opencrab.pack import lifecycle
+
+    tree = ast.parse(inspect.getsource(lifecycle))
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
+    )
+
+    windows = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and any(
+            isinstance(i.context_expr, ast.Call)
+            and getattr(i.context_expr.func, "id", "") == "ExitStack"
+            for i in n.items
+        )
+        and any(getattr(t, "id", "") == "_row_lock" for i in n.items
+                for t in ([i.optional_vars] if i.optional_vars else []))
+    ]
+    assert windows, "row lock window not found -- did it get renamed?"
+
+    for w in windows:
+        stamp_line = None
+        for n in ast.walk(w):
+            if (isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Subscript)
+                            and getattr(t.value, "id", "") == "entry"
+                            and getattr(getattr(t, "slice", None), "value", None)
+                            == "checked_at"
+                            for t in n.targets)):
+                stamp_line = n.lineno if stamp_line is None else min(stamp_line, n.lineno)
+        assert stamp_line is not None, (
+            "the row lock window never stamps entry['checked_at']"
+        )
+
+        early = [
+            n.lineno for n in ast.walk(w)
+            if isinstance(n, (ast.Continue, ast.Return, ast.Break))
+            and n.lineno < stamp_line
+        ]
+        assert not early, (
+            f"a path exits the row lock window at line(s) {early} before the row "
+            f"is stamped at line {stamp_line}. Record when the row was read "
+            f"before any branch can report on it."
+        )
