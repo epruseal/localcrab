@@ -436,6 +436,36 @@ def repair_incomplete_packs(
                     # and serialises the probe-to-decision span that the CAS
                     # cannot cover.
                     _row_lock.enter_context(write_lock(data_dir))
+
+                    # Re-read inside the window, so the branch below decides on
+                    # what is true now rather than on what `list_incomplete_packs`
+                    # saw before the lock existed. Without this the window
+                    # serialises the probe and the transition but not the
+                    # reading that chooses between them, which is not the same
+                    # thing -- and it leaves this window following a different
+                    # rule from the other two, which both start at their
+                    # registry read.
+                    #
+                    # The CAS below would still refuse a transition the row no
+                    # longer qualifies for, so this is not what makes the write
+                    # safe. It is what stops the pass from probing, branching,
+                    # and reporting on a row that already moved.
+                    fresh = get_pack(sql, pack_id)
+                    if fresh is None or fresh["status"] != PACK_STATUS_CREATING:
+                        entry["action"] = "skipped (row moved before the lock)"
+                        entry["reason"] = (
+                            "no longer present"
+                            if fresh is None
+                            else f"status is now {fresh['status']!r}"
+                        )
+                        if fresh is not None:
+                            entry["status"] = fresh["status"]
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+                    row = fresh
+                    owner_id = row["owner_id"]
+
                 probes = probe_anchor(graph, docs, vector, pack_id)
                 entry["probes"] = probes
                 graph_probe = probes.get("graph")
@@ -650,8 +680,10 @@ def ensure_anchor(
     When ``apply`` is False, reports what would be done without writing.
     Returns ``{"action": "already_present"|"would_create"|"created"|"blocked"
     |"skipped"|"failed", ...}`` with ``probes`` for observability. ``graph``
-    is the system of record; ``unverifiable`` is treated as skipped
-    (fail-closed).
+    is the system of record; a graph probe that cannot be answered at all
+    still ends the call as ``skipped`` (fail-closed). An identity slot that
+    cannot be verified is different -- that is ``blocked`` with reason
+    ``"unverifiable"``, because the write would refuse it too.
 
     ``"blocked"`` (#224) means the anchor's slot is not available to this
     pack -- the identity guard would refuse the write. It is NOT a failure

@@ -1079,3 +1079,45 @@ class TestCLIDryRunStillPlans:
         assert payload["apply"] is False
         assert payload["counts"]["would_create"] == 1
         assert payload["counts"]["skipped"] == 0
+
+
+def test_sweep_decides_on_the_row_it_reads_inside_the_lock(sql, alice, monkeypatch):
+    """The candidate list is gathered before the lock exists.
+
+    So the row a sweep starts with can be out of date by the time it holds the
+    window, and branching on it means probing and reporting against a state
+    that has already moved. The CAS underneath would still refuse a bad
+    transition -- this is not what makes the write safe -- but the window is
+    supposed to cover the reading that picks the transition, not just the
+    transition itself. Re-reading inside is also what makes this window follow
+    the same rule as the other two, which both open at their registry read.
+    """
+    import opencrab.pack.ownership as ownership_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+
+    pid = begin_pack_creation(sql, alice, "moved-row")
+    TestRepairRegistryLockWindows._stale(sql, pid)
+
+    real_write_lock = None
+    import opencrab.locking as locking_mod
+    real_write_lock = locking_mod.write_lock
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def promote_then_lock(*a, **kw):
+        # Simulate a concurrent pack_create finishing in the gap between the
+        # unlocked candidate query and this pass taking the window.
+        ownership_mod.mark_pack_ready(sql, pid, alice)
+        with real_write_lock(*a, **kw):
+            yield
+
+    monkeypatch.setattr(locking_mod, "write_lock", promote_then_lock)
+
+    result = repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+    )
+
+    row = next(r for r in result["rows"] if r["pack_id"] == pid)
+    assert row["action"] == "skipped (row moved before the lock)"
+    assert get_pack(sql, pid)["status"] == PACK_STATUS_READY
