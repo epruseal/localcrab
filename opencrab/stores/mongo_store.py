@@ -14,6 +14,100 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Ownership predicate fragments (issue #222)
+# ---------------------------------------------------------------------------
+# MongoDB's ``$in`` and ``$type`` do NOT test an array value as a whole: if the
+# field holds an array they test its ELEMENTS ("If ``field`` has an array, the
+# ``$in`` operator selects the documents whose ``field`` has an array that
+# contains at least one element that matches a value in the specified array";
+# "For documents where ``field`` is an array, ``$type`` returns documents in
+# which at least one array element matches a type passed to ``$type``"). A
+# dotted path traverses an array of embedded documents the same way. The SQL
+# canon treats none of those shapes as owning, so mongo used to match rows SQL
+# excluded -- a fork copying beyond its pack and a read scope leaking across
+# packs. The array exclusion is built HERE, once, and reused by every leg of
+# both predicates: the two implementations diverged in the first place because
+# each expressed the same meaning in its own words.
+
+
+def _array() -> dict[str, Any]:
+    """``$type: "array"`` -- a FIELD-level test ("Queries for ``$type:
+    'array'`` return documents where the field itself is an array"), so
+    wrapping it in ``$not`` excludes arrays without the element-traversal
+    ambiguity that makes ``$not`` unreliable with comparison operators.
+
+    Returns a fresh dict every call: these fragments end up aliased several
+    times inside one query document, and a shared module-level dict would let
+    a caller mutating the returned query corrupt every later query.
+    """
+    return {"$type": "array"}
+
+
+# Values ``SqlDialect.json_truthy_text`` folds to SQL NULL -- the SQL canon's
+# definition of "this row has no pack_id", which is what opens the legacy
+# ``source`` fallback. Note ``0`` and ``0.0`` are mutually redundant under
+# BSON's by-value numeric comparison; both are kept because this list is
+# transcribed from the SQL side, not re-derived.
+_FALSY_PACK_VALUES: list[Any] = [None, "", 0, 0.0, False]
+
+
+def _scalar_string_in(values: list[str]) -> dict[str, Any]:
+    """Membership that matches ONLY a scalar BSON string (issue #222).
+
+    Mirrors the SQL canon's ``_json_str_in`` (``opencrab/stores/_sql_doc_base``),
+    which requires ``json_type='text'`` / ``jsonb_typeof='string'`` before
+    comparing. ``$type: "string"`` is what carries that requirement across;
+    it is redundant for scalars while ``values`` is a list of ``str`` (BSON
+    equality is type-strict, so a number never matches a bound string), and it
+    is the defence that keeps a contract-violating non-string entry in
+    ``pack_ids`` failing the same way SQL would.
+
+    CONTRACT (issue #222 design §3-4): a non-string ``pack_id`` -- number,
+    boolean, array, object -- is NOT owning under this predicate. The SQL side
+    is not self-consistent here (``opencrab/pack/load.py``'s ``_json_str_eq``,
+    which ``delete_pack`` uses, is string-strict; ``_SqlDocStoreBase.
+    list_nodes_scoped``'s ``json_truthy_text`` stringifies numbers and
+    booleans), so there is no single SQL behaviour to converge on. This
+    predicate follows the string-strict one, which is the policy the
+    repository states in ``_json_str_eq``'s docstring and which
+    ``scripts/migrate_pack_ownership.py``'s ``_classify_pack_id`` enforces.
+    The residual difference is under-inclusion, never a scope leak.
+    """
+    return {"$in": list(values), "$type": "string", "$not": _array()}
+
+
+def _scalar_falsy() -> dict[str, Any]:
+    """"This row has no pack_id" -- the same set ``json_truthy_text(...) IS
+    NULL`` picks out on the SQL side, with arrays excluded.
+
+    Mongo's ``$in`` already treats a bound ``None`` as matching both "missing"
+    and "null", so no separate ``$exists`` clause is needed. The array
+    exclusion matters here on its own: without it ``pack_id: [0]`` or
+    ``[None]`` reads as absent (element traversal finds a falsy element) and
+    wrongly opens the legacy ``source`` fallback, while SQL sees a non-NULL
+    raw JSON text and keeps the row out.
+    """
+    return {"$in": list(_FALSY_PACK_VALUES), "$not": _array()}
+
+
+def _non_array(field: str) -> dict[str, Any]:
+    """Guard for the metadata/properties CONTAINER itself.
+
+    A dotted path traverses an array of embedded documents, so a row shaped
+    ``{"metadata": [{"pack_id": "p"}]}`` matches ``metadata.pack_id`` even
+    though the container is not a document. SQL extracts NULL from such a row
+    and excludes it. Excluding the array container here closes the same class
+    of leak the value-level guards close.
+
+    No ``$type: "object"`` companion: it is redundant (a string/number/missing
+    container leaves the dotted path unresolved, which already fails both
+    legs) and it has no counterpart on the SQL side, where container exclusion
+    falls out of JSON path extraction rather than being written down.
+    """
+    return {field: {"$not": _array()}}
+
+
 class MongoStore:
     """MongoDB adapter for document-oriented ontology storage."""
 
@@ -173,12 +267,31 @@ class MongoStore:
         not add an ordering guarantee ``list_nodes`` never had.
 
         Empty ``pack_ids`` -> ``[]`` WITHOUT querying. ``limit <= 0`` ->
-        ``[]``, same guard ``list_nodes`` uses (issue #120 follow-up)."""
+        ``[]``, same guard ``list_nodes`` uses (issue #120 follow-up).
+
+        SCALAR STRINGS ONLY (issue #222): the bare ``$in`` this used to carry
+        matched a row whose ``properties.pack_id`` was an ARRAY containing a
+        scoped id, and a row whose whole ``properties`` was an array of
+        embedded documents -- SQL excludes both, so the same data landed in
+        different scopes depending on the backend. This is a READ scope
+        (``ontology_list_nodes``'s pack-unspecified branch), so the leak was
+        cross-pack visibility, not only a fork range issue. See
+        ``_scalar_string_in``/``_non_array`` for the shared exclusion and for
+        the documented contract on non-string pack_ids.
+
+        ``space`` stays a plain equality with no array guard: it is a space
+        filter rather than an ownership term, ``upsert_node_doc`` types it
+        ``str``, and the SQL twin stores it in a TEXT column where an array
+        value cannot exist -- so no cross-backend fixture could exercise a
+        guard here and it would be a clause no test could kill."""
         self._require_available()
         if not pack_ids or limit <= 0:
             return []
 
-        query: dict[str, Any] = {"properties.pack_id": {"$in": list(pack_ids)}}
+        query: dict[str, Any] = {
+            **_non_array("properties"),
+            "properties.pack_id": _scalar_string_in(list(pack_ids)),
+        }
         if space:
             query["space"] = space
         cursor = self._db["nodes"].find(query, {"_id": 0}).limit(limit)
@@ -265,8 +378,19 @@ class MongoStore:
         ``json_type='text'`` strictness) OR ``pack_id`` is absent/falsy AND
         ``source`` matches. Mongo's ``$in`` already treats a bound ``None``
         as matching both "missing" and "null" (unlike a bare equality
-        check), so the falsy-list below needs no separate ``$exists``
-        clause.
+        check), so the falsy list needs no separate ``$exists`` clause.
+
+        ARRAYS ARE EXCLUDED AT EVERY LEG (issue #222). ``$in`` and ``$type``
+        test array ELEMENTS rather than the array, and a dotted path
+        traverses an array of embedded documents, so all three legs plus the
+        container used to match rows the SQL predicate rejects -- a
+        ``pack_id`` of ``["p"]`` read as owned, a ``pack_id`` of ``[0]`` read
+        as absent (opening the ``source`` fallback), and a ``metadata`` that
+        is itself an array of documents read through. Since this predicate
+        decides ``pack_fork``'s copy range, those were rows copied outside
+        the fork's pack. The exclusion is built once in
+        ``_scalar_string_in``/``_scalar_falsy``/``_non_array`` (module level)
+        so the legs cannot drift apart again.
 
         Empty ``pack_ids`` -> ``[]`` WITHOUT querying. ``limit <= 0`` ->
         ``[]``, same guard ``list_nodes_scoped`` uses (issue #120 follow-up).
@@ -287,15 +411,16 @@ class MongoStore:
 
         ids = list(pack_ids)
         query: dict[str, Any] = {
+            **_non_array("metadata"),
             "$or": [
-                {"metadata.pack_id": {"$in": ids, "$type": "string"}},
+                {"metadata.pack_id": _scalar_string_in(ids)},
                 {
                     "$and": [
-                        {"metadata.pack_id": {"$in": [None, "", 0, 0.0, False]}},
-                        {"metadata.source": {"$in": ids, "$type": "string"}},
+                        {"metadata.pack_id": _scalar_falsy()},
+                        {"metadata.source": _scalar_string_in(ids)},
                     ]
                 },
-            ]
+            ],
         }
         cursor = self._db["sources"].find(query, {"_id": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
