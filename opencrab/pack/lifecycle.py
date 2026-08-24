@@ -69,6 +69,13 @@ ANCHOR_UNVERIFIABLE = "unverifiable"
 _ANCHOR_SPACE = "resource"
 _ANCHOR_NODE_TYPE = "Dataset"
 
+# The one verdict the sweep reports without touching the registry. It is a
+# constant because two paths have to agree on it: the row that produced it, and
+# the dry-run caller that decides whether to tally a skip. Written twice as a
+# literal, those two drift apart silently -- the tally would stop counting a
+# verdict that still gets reported.
+_UNVERIFIABLE = "skipped (unverifiable)"
+
 
 def _probe_one(store: Any, method_name: str, args: tuple[Any, ...],
                path: tuple[str, ...], pack_id: str) -> str:
@@ -633,7 +640,7 @@ def repair_incomplete_packs(
                             entry["status"] = PACK_STATUS_PARTIAL
                             counts["demoted"] += 1
                 else:
-                    entry["action"] = "skipped (unverifiable)"
+                    entry["action"] = _UNVERIFIABLE
                     entry["reason"] = (
                         "graph store probe was inconclusive (store unavailable, "
                         "probe method missing, the call raised, or a row was "
