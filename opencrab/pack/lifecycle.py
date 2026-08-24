@@ -670,6 +670,13 @@ def repair_incomplete_packs(
             promote_result = {"pack_id": promote, "probes": probes}
             if target is None:
                 promote_result["action"] = "rejected (no such pack)"
+                # The other three rejections all carry one, and the docstring
+                # promises a reason for "no such pack" too. An operator who
+                # gets back only an action has to guess whether the slug was
+                # wrong or the row vanished under the lock.
+                promote_result["reason"] = (
+                    f"no registry row for {promote!r} when read under the lock"
+                )
             elif target["status"] != PACK_STATUS_PARTIAL:
                 # Checked BEFORE planning, in both modes, because the plan a
                 # dry-run prints has to be the operation an --apply would perform.
@@ -1070,8 +1077,12 @@ def repair_missing_anchors(
     which handles ``creating``/``partial``, this handles drift in ``ready``
     packs.
 
-    Returns ``{"checked": N, "already_present": N, "would_create": N,
-    "created": N, "blocked": N, "skipped": N, "failed": N, "rows": [...]}``.
+    Returns ``{"apply": bool, "counts": {...}, "rows": [...], "checked_at":
+    str}``. The per-pack tallies live under ``counts`` -- ``checked``,
+    ``already_present``, ``would_create``, ``created``, ``blocked``,
+    ``skipped``, ``failed`` -- not at the top level; an earlier version of
+    this line promised them flat and callers reading it wrote
+    ``summary["checked"]`` against a dict that never had that key.
     ``apply=False`` is dry-run.
 
     ``blocked`` counts packs whose anchor slot the identity guard will not let

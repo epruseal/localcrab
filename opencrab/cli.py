@@ -1446,13 +1446,12 @@ def packs_repair_anchors(
     # as None, so don't let a doc/vector factory failure block the whole
     # repair when graph/SQL are healthy.
     builder = None
+    # No `sql.available` arm here: the guard above already exits on that, and
+    # `sql` is not rebound in between, so a second check could only ever be
+    # dead code that reads like a live one.
     if graph is None or not getattr(graph, "available", False):
         console.print(
             "[yellow]Graph store unavailable, cannot build builder.[/yellow]"
-        )
-    elif not sql.available:
-        console.print(
-            "[yellow]SQL store unavailable, cannot build builder.[/yellow]"
         )
     else:
         try:
