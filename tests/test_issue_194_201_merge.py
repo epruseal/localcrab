@@ -1407,11 +1407,13 @@ def test_no_path_returns_before_the_row_is_recorded():
     soundness comes from
     `test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read`,
     which runs a pass and reads the result. Nine rounds of adversarial review
-    produced 62 ways past some version of this file's gates; of those, this
-    check is the only thing that catches exactly two -- renaming the window,
-    and opening a third one. Everything else here is caught by the behaviour
-    gate as well, and is kept because a named structural failure is faster to
-    read than a fixture that stopped covering something.
+    produced 62 ways past some version of this file's gates; of those, exactly
+    two need something structural -- renaming the window, and opening a third
+    one. (Renaming also trips the verdict-count tripwire below, which finds
+    the window the same way; what nothing else notices is that the rename
+    happened.) Everything else here is caught by the behaviour gate too, and
+    is kept because a named structural failure is faster to read than a
+    fixture that quietly stopped covering something.
 
     What it does NOT catch (measured, not guessed) -- all of these are killed
     by the behaviour gate instead:
