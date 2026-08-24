@@ -981,40 +981,73 @@ def _fork_pack_inner(
     # pass 1 (this loop): walks `import_batch` -- already in
     # `export_pack_vectors`'s own order, since the loop above only ever
     # appends, never reorders or filters out-of-order -- and applies the
-    # two batch checks in that fixed order. On a duplicate `id`, KEEP THE
-    # FIRST occurrence and drop the later one(s). The reference dimension
-    # is established from the FIRST SURVIVING record (the first record that
-    # was not itself dropped as a duplicate) -- any later record whose
-    # embedding length disagrees with that reference is dropped too. Both
-    # drops are Tier 1 and share one counter, `skipped.vector_batch_invalid`
-    # (mirrors the shape of `vector_orphans`/`vector_mistagged`/
-    # `vector_invalid` above; two backend-real failure modes, one counter,
-    # since both are "this record collided with the rest of the batch," not
-    # two independently meaningful axes).
+    # two batch checks in that fixed order.
+    #
+    # CONTRACT V-KF (#221 design §5, "vector keep-first"): each vector `id`
+    # gets AT MOST ONE slot in the import batch, and the slot goes to the
+    # first record that passes BOTH checks -- that is, the first record
+    # whose embedding length equals the batch reference dimension. A record
+    # dropped here does NOT consume its id: a later record carrying the same
+    # id can still take the slot. The single registration point at the
+    # bottom of this loop is what expresses that -- `seen_vector_ids.add`
+    # runs on the keep path and nowhere else. Do not fold it back into the
+    # branches: #221 was filed because the mere ORDERING of these statements
+    # was the only thing encoding the contract, and the error message that
+    # ordering produced promised a different one.
+    #
+    # V-KF-0 (where the reference dimension comes from): it is the FIRST
+    # record of `import_batch` -- not a majority vote, and not the store's
+    # own `_dim`. The first record always takes a slot, since
+    # `seen_vector_ids` is empty on that iteration and the duplicate branch
+    # cannot fire. See the "intended limit" note after the loop for what
+    # follows when that first record is itself the malformed one.
+    #
+    # V-KF-N (deliberate asymmetry with the real validator -- do NOT
+    # "unify"): `validate_import_records` consumes an id UNCONDITIONALLY,
+    # right after its own duplicate check and before any dimension check --
+    # it is an id-first rule. Pass 1 is not, on purpose. There is no
+    # functional contradiction, because pass 1 hands pass 2 only the
+    # survivors; but making pass 1 id-first "for consistency with the
+    # validator" would re-introduce exactly the rule #221 measured as worse
+    # -- it discards ids that DO have a usable record, and every such
+    # discard is one more Tier 1 loss in step 8b's completeness floor.
+    #
+    # Both drops are Tier 1 and share one counter,
+    # `skipped.vector_batch_invalid` (mirrors the shape of
+    # `vector_orphans`/`vector_mistagged`/`vector_invalid` above; two
+    # backend-real failure modes, one counter, since both are "this record
+    # collided with the rest of the batch," not two independently
+    # meaningful axes).
     skipped_vector_batch_invalid = 0
     seen_vector_ids: set[str] = set()
     reference_dim: int | None = None
     pass1_survivors: list[dict[str, Any]] = []
     for rec in import_batch:
         rec_id = rec["id"]  # guaranteed present/str -- _vector_record_invalid already checked it.
-        if rec_id in seen_vector_ids:
-            skipped_vector_batch_invalid += 1
-            vector_errors.append(
-                f"vector {rec_id!r} duplicate id within export batch, "
-                "skipped (Tier 1): keeping the first occurrence"
-            )
-            continue
         embedding_len = len(rec.get("embedding") or [])
         if reference_dim is None:
+            # V-KF-0: the batch's first record always sets the reference and
+            # always survives -- `seen_vector_ids` is empty here, so the
+            # duplicate branch below cannot fire on this iteration.
             reference_dim = embedding_len
-        elif embedding_len != reference_dim:
-            skipped_vector_batch_invalid += 1
-            vector_errors.append(
-                f"vector {rec_id!r} embedding dim {embedding_len} != batch "
-                f"reference dim {reference_dim} (from the first surviving "
-                "record), skipped (Tier 1)"
+        reason: str | None = None
+        if rec_id in seen_vector_ids:
+            reason = (
+                "duplicate id within export batch, skipped (Tier 1): an "
+                "earlier record already took this id at the batch reference "
+                f"dimension {reference_dim}"
             )
+        elif embedding_len != reference_dim:
+            reason = (
+                f"embedding dim {embedding_len} != batch reference dim "
+                f"{reference_dim} (from the first surviving record), "
+                "skipped (Tier 1)"
+            )
+        if reason is not None:
+            skipped_vector_batch_invalid += 1
+            vector_errors.append(f"vector {rec_id!r} {reason}")
             continue
+        # V-KF: the id is consumed HERE and only here -- on the keep path.
         seen_vector_ids.add(rec_id)
         pass1_survivors.append(rec)
     import_batch = pass1_survivors
@@ -1022,18 +1055,32 @@ def _fork_pack_inner(
     # Intended limit (design §5-1-6b "의도된 한계 (증폭)"): the reference
     # dimension above is always "whatever the first surviving record's
     # embedding length is" -- there is no independently-known correct
-    # dimension to check against instead. Chroma has no app-side table dim
-    # at all (`dim=None` below, always), so if the FIRST surviving record
-    # happens to be the one bad-dimension record, every OTHER, perfectly
-    # good record in the batch is dropped here as "the mismatch" against
-    # that bad reference -- which can push the vector axis past step 8b's
-    # completeness floor and reject the whole fork over a single corrupt
-    # export row. This is deliberate, not a bug to "improve": a
-    # majority-vote reference dimension was considered and rejected by the
-    # design as non-deterministic on a tie, and `validate_import_records`
-    # itself uses the very same "record 0" rule -- picking a different rule
-    # here would make this module's notion of "the" batch dimension diverge
-    # from the real validator's, defeating the whole point of pass 2 below.
+    # dimension to check against instead. The app declares no dimension to
+    # chroma (`dim=None` below, always) -- chroma itself pins a collection's
+    # dimension at its first insert, but this module never learns it. So if
+    # the FIRST record happens to be the one bad-dimension record, every
+    # OTHER, perfectly good record in the batch is dropped here as "the
+    # mismatch" against that bad reference -- which can push the vector axis
+    # past step 8b's completeness floor and reject the whole fork over a
+    # single corrupt export row. This is deliberate, not a bug to "improve",
+    # and #221's T221-8 pins it as contract rather than accident.
+    #
+    # Two alternatives were weighed and rejected (#221 design §8):
+    #   - a MAJORITY-VOTE reference dimension -- non-deterministic on a tie,
+    #     and it would diverge from `validate_import_records`, which applies
+    #     the very same "record 0" uniformity rule that pass 2 below will
+    #     re-run over the survivors;
+    #   - the store's own `getattr(vector, "_dim", None)`. Note this would
+    #     NOT diverge from the validator: when a caller passes `dim`, the
+    #     validator adds an ABSOLUTE table-dim check ON TOP of its record-0
+    #     uniformity check (the two are cumulative, not exclusive), so for
+    #     sqlite-vec/pgvector `_dim` is in fact closer to what pass 2
+    #     enforces. It is rejected here for a different reason: it is a
+    #     behaviour change #221 never asked for, it does nothing for chroma
+    #     (no `_dim` attribute), and the drift it would paper over belongs
+    #     to issue #232 (neither store reconciles a PRE-EXISTING object's
+    #     schema against its own declaration), where it can be fixed at the
+    #     source instead of compensated for here.
     #
     # pass 2: re-run the REAL validator over the decomposed survivors to
     # confirm the decomposition actually worked. `pack_id=src_pack_id` (not
@@ -1739,11 +1786,13 @@ def _vector_record_invalid(record: dict[str, Any], *, pack_id: str, allow_uris: 
     batch. These are handled by a SEPARATE, explicit 2-pass step (design
     §5-1-6b) that runs immediately after this function's caller filters
     every candidate record through it: pass 1 walks the already-filtered
-    batch in ``export_pack_vectors`` order, keeping the first occurrence of
-    a duplicate id and dropping the rest, and establishing the reference
-    dimension from the first surviving record (dropping any later record
-    whose dimension disagrees); pass 2 re-runs the real validator over the
-    survivors to confirm the decomposition actually worked. Both pass-1
+    batch in ``export_pack_vectors`` order and gives each id AT MOST ONE
+    slot, held by the first record that passes both batch checks -- a
+    record dropped by pass 1 does NOT consume its id, so a later record
+    with the same id can still take the slot (contract V-KF, #221). The
+    reference dimension is the first record's (V-KF-0), and any record
+    disagreeing with it is dropped. Pass 2 re-runs the real validator over
+    the survivors to confirm the decomposition actually worked. Both pass-1
     drops are Tier 1, counted under ``skipped.vector_batch_invalid`` -- NOT
     deferred to ``import_vectors`` at step 17 the way they used to be, which
     is what let a single duplicate/mismatched record raise inside the real
