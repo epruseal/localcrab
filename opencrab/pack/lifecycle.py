@@ -226,6 +226,7 @@ def repair_incomplete_packs(
     older_than_seconds: int = 3600,
     apply: bool = False,
     promote: str | None = None,
+    data_dir: str | None = None,
 ) -> dict[str, Any]:
     """Offline repair pass over ``packs`` rows that never reached ``ready``
     (#170, design v4 §3.6) -- the engine behind ``opencrab packs
@@ -322,16 +323,30 @@ def repair_incomplete_packs(
     Returns a JSON-serializable dict:
 
     - ``older_than_seconds``, ``apply``, ``checked_at`` -- the run's inputs
-      and the wall-clock time age was judged against.
+      and the wall-clock time the pass started from. Rows re-read under the
+      lock carry their own ``checked_at``: the clock that actually judged
+      them, read inside the window. Prefer the row's when reconciling a
+      single decision, since a lock wait can put it well after this one.
     - ``counts`` -- ``rows_examined``, ``creating``, ``partial``,
       ``promoted``, ``demoted``, ``skipped`` (all over the age-filtered
       pass; ``promote``'s single-pack action is counted separately in
       ``promote_result``).
     - ``rows`` -- one entry per incomplete row:
-      ``{pack_id, owner_id, status, action, reason?, probes?, applied?}``.
-      ``status`` reflects the row's status AFTER this call when ``apply`` is
-      true and the transition actually happened; otherwise it is the status
-      the row had going in.
+      ``{pack_id, owner_id, status, action, reason?, probes?, applied?,
+      checked_at?}``. ``status`` reflects the row's status AFTER this call
+      when ``apply`` is true and the transition actually happened; otherwise
+      it is the status the row had going in. ``checked_at`` appears on rows
+      re-read under the lock and is the clock that judged them -- prefer it
+      over the top-level one when reconciling a single decision.
+
+      **One shape is different.** A row that disappeared while this pass
+      waited for its lock carries ``row_gone: true`` and reports its
+      scan-time values as ``scanned_status`` / ``scanned_owner_id``
+      INSTEAD OF ``status`` / ``owner_id``, which are absent. There is no
+      current row to describe, and leaving the old values under the usual
+      keys let two readers disagree about whether they were present facts.
+      Such a row is counted in ``rows_examined`` but not in the status
+      buckets, which count what the registry still holds.
     - ``promote_result`` -- ``None`` unless ``promote`` was given, else the
       single-pack outcome of that targeted promotion (see below).
 
@@ -360,6 +375,9 @@ def repair_incomplete_packs(
             f"older_than_seconds must be >= 0, got {older_than_seconds}"
         )
 
+    from contextlib import ExitStack
+
+    from opencrab.locking import write_lock
     from opencrab.pack.ownership import (
         FORKED_PARTIAL_PROMOTE_REFUSAL,
         PACK_STATUS_CREATING,
@@ -372,7 +390,12 @@ def repair_incomplete_packs(
         promote_partial_pack,
     )
 
-    now = datetime.now(UTC)
+    # Named for when it was taken, not for what it is. Eight defects on this
+    # function came from pre-lock values reaching in-lock decisions, so the
+    # scan-time clock and the scan-time row now say so in their names: inside
+    # a `write_lock` block, reading either one is visibly wrong rather than
+    # merely wrong.
+    scan_started_at = datetime.now(UTC)
     rows = list_incomplete_packs(sql)
 
     counts = {
@@ -385,10 +408,16 @@ def repair_incomplete_packs(
     }
     results: list[dict[str, Any]] = []
 
-    for row in rows:
-        pack_id = row["pack_id"]
-        owner_id = row["owner_id"]
-        status = row["status"]
+    for scanned_row in rows:
+        # `row` is what the code below decides on. It starts as the scanned
+        # row -- correct for the dry-run path, which takes no lock and so has
+        # nothing fresher -- and the apply path rebinds it from the in-lock
+        # re-read. `scanned_row` keeps its own name so that reaching for it
+        # from inside a window reads as reaching past that re-read.
+        row = scanned_row
+        pack_id = scanned_row["pack_id"]
+        owner_id = scanned_row["owner_id"]
+        status = scanned_row["status"]
         entry: dict[str, Any] = {
             "pack_id": pack_id,
             "owner_id": owner_id,
@@ -399,15 +428,15 @@ def repair_incomplete_packs(
         elif status == PACK_STATUS_PARTIAL:
             counts["partial"] += 1
 
-        dt = _parse_updated_at(row.get("updated_at"))
-        if dt is None or dt > now:
+        dt = _parse_updated_at(scanned_row.get("updated_at"))
+        if dt is None or dt > scan_started_at:
             entry["action"] = "skipped (unknown age)"
             entry["reason"] = "updated_at is missing, unparseable, or in the future"
             counts["skipped"] += 1
             results.append(entry)
             continue
 
-        age_seconds = (now - dt).total_seconds()
+        age_seconds = (scan_started_at - dt).total_seconds()
         if age_seconds < older_than_seconds:
             entry["action"] = "skipped (too recent)"
             entry["reason"] = f"age {age_seconds:.0f}s < threshold {older_than_seconds}s"
@@ -416,77 +445,202 @@ def repair_incomplete_packs(
             continue
 
         if status == PACK_STATUS_CREATING:
-            probes = probe_anchor(graph, docs, vector, pack_id)
-            entry["probes"] = probes
-            graph_probe = probes.get("graph")
-            if row.get("forked_from"):
-                # #201 §4-F fix 1. This row was reserved by `pack_fork`, not
-                # `pack_create` -- and the two have OPPOSITE relationships
-                # between "anchor present" and "attempt complete".
-                # `pack_create` writes its anchor LAST (after everything
-                # else it needs has been validated), so a landed anchor IS
-                # its completion criterion -- that is what the
-                # PROBE_PRESENT branch below promotes on. `pack_fork`
-                # writes its anchor FIRST and only then copies content, so
-                # for a fork the anchor is merely evidence of the FIRST
-                # write, never of completion. Falling through to the same
-                # PROBE_PRESENT/PROBE_ABSENT branching below would auto-
-                # promote a fork whose copy is still running or died
-                # mid-copy -- and dying right after the anchor lands is
-                # fork's ordinary failure mode, not a corner case, so this
-                # is not a rare mistake to tolerate.
-                #
-                # A guard that only closed the PROBE_PRESENT promote branch
-                # (leaving the PROBE_ABSENT demote branch as the sole
-                # fallback) would still be wrong: a dead fork's anchor is
-                # PRESENT (it was the first thing written), so that row
-                # would never reach the demote branch either and would sit
-                # in `creating` forever -- invisible to every read path,
-                # unrecoverable by any promotion, since nothing but this
-                # pass and `pack_fork` itself ever calls
-                # `mark_pack_ready`/`mark_pack_partial`. So a forked
-                # `creating` row demotes on age ALONE, independent of the
-                # probe outcome, and never auto-promotes here -- promotion
-                # of a fork is owned exclusively by the `pack_fork` call
-                # that is copying it.
-                #
-                # This branch still runs the same demote CALL as the
-                # PROBE_ABSENT branch below (not a `continue`): skipping the
-                # row would drop it from `results` entirely, which makes a
-                # dead fork LESS observable to the operator reading this
-                # pass's report -- the opposite of what finding it is for.
-                entry["action"] = "demote"
+            with ExitStack() as _row_lock:
                 if apply:
-                    applied = mark_pack_partial(sql, pack_id, owner_id)
-                    entry["applied"] = applied
-                    if applied:
-                        entry["status"] = PACK_STATUS_PARTIAL
-                        counts["demoted"] += 1
-            elif graph_probe == PROBE_PRESENT:
-                entry["action"] = "promote"
-                if apply:
-                    applied = mark_pack_ready(sql, pack_id, owner_id)
-                    entry["applied"] = applied
-                    if applied:
-                        entry["status"] = PACK_STATUS_READY
-                        counts["promoted"] += 1
-            elif graph_probe == PROBE_ABSENT:
-                entry["action"] = "demote"
-                if apply:
-                    applied = mark_pack_partial(sql, pack_id, owner_id)
-                    entry["applied"] = applied
-                    if applied:
-                        entry["status"] = PACK_STATUS_PARTIAL
-                        counts["demoted"] += 1
-            else:
-                entry["action"] = "skipped (unverifiable)"
-                entry["reason"] = (
-                    "graph store probe was inconclusive (store unavailable, "
-                    "probe method missing, the call raised, or a row was "
-                    "returned whose pack_id could not be read) -- fail-closed, "
-                    "no action taken"
-                )
-                counts["skipped"] += 1
+                    # #223: the probe and the CAS transition it decides are
+                    # one unit, so the window is per row rather than around
+                    # the sweep. Holding one exclusive lock for a whole
+                    # operator pass would stall every writer for its full
+                    # duration -- worse than the gap it closes. A dry run
+                    # takes nothing, for the same reason as elsewhere here.
+                    #
+                    # The registry writes below are already compare-and-set
+                    # (each pins its FROM status in the WHERE), so this is
+                    # not what makes them safe -- it puts the command inside
+                    # the write.lock ownership map its siblings belong to,
+                    # and serialises the probe-to-decision span that the CAS
+                    # cannot cover.
+                    _row_lock.enter_context(write_lock(data_dir))
+
+                    # Re-read inside the window, so the branch below decides on
+                    # what is true now rather than on what `list_incomplete_packs`
+                    # saw before the lock existed. Without this the window
+                    # serialises the probe and the transition but not the
+                    # reading that chooses between them, which is not the same
+                    # thing -- and it leaves this window following a different
+                    # rule from the other two, which both start at their
+                    # registry read.
+                    #
+                    # The CAS below would still refuse a transition the row no
+                    # longer qualifies for, so this is not what makes the write
+                    # safe. It is what stops the pass from probing, branching,
+                    # and reporting on a row that already moved.
+                    fresh = get_pack(sql, pack_id)
+
+                    # Record WHEN we looked before recording WHAT we saw, and
+                    # both before anything branches. Every gate below reports,
+                    # and several of them make claims about time -- "moved
+                    # before the lock", "too recent" -- so a row whose only
+                    # timestamp is the pre-query stamp cannot be reconciled
+                    # against its own `updated_at` after a long wait. Putting
+                    # this at the top is the whole fix: there is then no gate
+                    # that can return before the row has both.
+                    now_locked = datetime.now(UTC)
+                    entry["checked_at"] = now_locked.isoformat()
+
+                    # Adopt first, gate second. Every branch below this point
+                    # reports, and a slug freed and re-reserved during the lock
+                    # wait can come back under a different owner -- so the
+                    # report has to describe the row that is actually there
+                    # before anything decides to return. Splitting adoption
+                    # across the gates is what put a deleted row's owner next
+                    # to a replacement row's status in the same line.
+                    #
+                    # `fresh is None` adopts nothing on purpose: there is no
+                    # row to describe, and the pre-lock values still name the
+                    # row this entry is reporting on.
+                    if fresh is not None:
+                        row = fresh
+                        owner_id = row["owner_id"]
+                        entry["owner_id"] = owner_id
+                        # The status tally was taken from the pre-lock scan.
+                        # If the row moved, move the count with it, or the
+                        # summary says `creating: 1` about a row this same
+                        # report describes as `partial`.
+                        if row["status"] != entry["status"]:
+                            if entry["status"] in counts:
+                                counts[entry["status"]] -= 1
+                            if row["status"] in counts:
+                                counts[row["status"]] += 1
+                        entry["status"] = row["status"]
+
+                    if fresh is None or fresh["status"] != PACK_STATUS_CREATING:
+                        entry["action"] = "skipped (row moved before the lock)"
+                        entry["reason"] = (
+                            "no longer present"
+                            if fresh is None
+                            else f"status is now {fresh['status']!r}"
+                        )
+                        if fresh is None:
+                            # Nothing current to describe, so say that outright
+                            # rather than leaving scan-time `owner_id`/`status`
+                            # to read as present facts. Reviewers split on
+                            # whether those fields were stale or simply
+                            # describing the row that was examined; marking
+                            # them settles it without inventing a row.
+                            entry["row_gone"] = True
+                            entry["scanned_status"] = entry.pop("status")
+                            entry["scanned_owner_id"] = entry.pop("owner_id")
+                            # And take it back out of the status tally: that
+                            # bucket counts rows the registry holds, and this
+                            # one is gone. `rows_examined` still counts it,
+                            # because it was examined.
+                            if entry["scanned_status"] in counts:
+                                counts[entry["scanned_status"]] -= 1
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+
+                    # Still `creating` is not the same as still the same row.
+                    # A slug freed and re-reserved while this pass waited for
+                    # the lock comes back `creating` too, and acting on it with
+                    # the previous row's timestamp would demote or promote a
+                    # pack that is seconds old -- the age gate exists precisely
+                    # to keep this pass off rows someone is still creating. So
+                    # re-run that gate on what was actually read, and refresh
+                    # the fields the report will carry.
+                    fresh_dt = _parse_updated_at(fresh.get("updated_at"))
+                    if fresh_dt is None or fresh_dt > now_locked:
+                        entry["action"] = "skipped (unknown age)"
+                        entry["reason"] = (
+                            "updated_at is missing, unparseable, or in the "
+                            "future when re-read under the lock"
+                        )
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+                    fresh_age = (now_locked - fresh_dt).total_seconds()
+                    if fresh_age < older_than_seconds:
+                        entry["action"] = "skipped (too recent)"
+                        entry["reason"] = (
+                            f"age {fresh_age:.0f}s < threshold "
+                            f"{older_than_seconds}s when re-read under the lock"
+                        )
+                        counts["skipped"] += 1
+                        results.append(entry)
+                        continue
+
+                probes = probe_anchor(graph, docs, vector, pack_id)
+                entry["probes"] = probes
+                graph_probe = probes.get("graph")
+                if row.get("forked_from"):
+                    # #201 §4-F fix 1. This row was reserved by `pack_fork`, not
+                    # `pack_create` -- and the two have OPPOSITE relationships
+                    # between "anchor present" and "attempt complete".
+                    # `pack_create` writes its anchor LAST (after everything
+                    # else it needs has been validated), so a landed anchor IS
+                    # its completion criterion -- that is what the
+                    # PROBE_PRESENT branch below promotes on. `pack_fork`
+                    # writes its anchor FIRST and only then copies content, so
+                    # for a fork the anchor is merely evidence of the FIRST
+                    # write, never of completion. Falling through to the same
+                    # PROBE_PRESENT/PROBE_ABSENT branching below would auto-
+                    # promote a fork whose copy is still running or died
+                    # mid-copy -- and dying right after the anchor lands is
+                    # fork's ordinary failure mode, not a corner case, so this
+                    # is not a rare mistake to tolerate.
+                    #
+                    # A guard that only closed the PROBE_PRESENT promote branch
+                    # (leaving the PROBE_ABSENT demote branch as the sole
+                    # fallback) would still be wrong: a dead fork's anchor is
+                    # PRESENT (it was the first thing written), so that row
+                    # would never reach the demote branch either and would sit
+                    # in `creating` forever -- invisible to every read path,
+                    # unrecoverable by any promotion, since nothing but this
+                    # pass and `pack_fork` itself ever calls
+                    # `mark_pack_ready`/`mark_pack_partial`. So a forked
+                    # `creating` row demotes on age ALONE, independent of the
+                    # probe outcome, and never auto-promotes here -- promotion
+                    # of a fork is owned exclusively by the `pack_fork` call
+                    # that is copying it.
+                    #
+                    # This branch still runs the same demote CALL as the
+                    # PROBE_ABSENT branch below (not a `continue`): skipping the
+                    # row would drop it from `results` entirely, which makes a
+                    # dead fork LESS observable to the operator reading this
+                    # pass's report -- the opposite of what finding it is for.
+                    entry["action"] = "demote"
+                    if apply:
+                        applied = mark_pack_partial(sql, pack_id, owner_id)
+                        entry["applied"] = applied
+                        if applied:
+                            entry["status"] = PACK_STATUS_PARTIAL
+                            counts["demoted"] += 1
+                elif graph_probe == PROBE_PRESENT:
+                    entry["action"] = "promote"
+                    if apply:
+                        applied = mark_pack_ready(sql, pack_id, owner_id)
+                        entry["applied"] = applied
+                        if applied:
+                            entry["status"] = PACK_STATUS_READY
+                            counts["promoted"] += 1
+                elif graph_probe == PROBE_ABSENT:
+                    entry["action"] = "demote"
+                    if apply:
+                        applied = mark_pack_partial(sql, pack_id, owner_id)
+                        entry["applied"] = applied
+                        if applied:
+                            entry["status"] = PACK_STATUS_PARTIAL
+                            counts["demoted"] += 1
+                else:
+                    entry["action"] = "skipped (unverifiable)"
+                    entry["reason"] = (
+                        "graph store probe was inconclusive (store unavailable, "
+                        "probe method missing, the call raised, or a row was "
+                        "returned whose pack_id could not be read) -- fail-closed, "
+                        "no action taken"
+                    )
+                    counts["skipped"] += 1
         else:
             # PACK_STATUS_PARTIAL (the only other value list_incomplete_packs
             # can hand back, since it selects status <> 'ready'). No
@@ -504,95 +658,109 @@ def repair_incomplete_packs(
 
     promote_result: dict[str, Any] | None = None
     if promote is not None:
-        target = get_pack(sql, promote)
-        probes = probe_anchor(graph, docs, vector, promote)
-        promote_result = {"pack_id": promote, "probes": probes}
-        if target is None:
-            promote_result["action"] = "rejected (no such pack)"
-        elif target["status"] != PACK_STATUS_PARTIAL:
-            # Checked BEFORE planning, in both modes, because the plan a
-            # dry-run prints has to be the operation an --apply would perform.
-            # `promote_partial_pack`'s WHERE only matches `partial`, so
-            # announcing "promote" for a `ready` or `creating` target would
-            # advertise something that could never happen -- and in apply mode
-            # the operator would get `applied: false` after being told the
-            # opposite. A `creating` target is not a near-miss to nudge along
-            # either: the unattended pass promotes those on its own when their
-            # anchor is confirmed, and `--promote` exists for `partial` rows
-            # precisely because those are the ones it refuses to touch.
-            promote_result["action"] = "rejected (not a partial pack)"
-            promote_result["reason"] = (
-                f"--promote only promotes a {PACK_STATUS_PARTIAL!r} row; this "
-                f"one is {target['status']!r}"
-                + (
-                    " -- the unattended pass promotes a confirmed 'creating' "
-                    "row without being asked"
-                    if target["status"] == PACK_STATUS_CREATING
-                    else ""
-                )
-            )
-        elif target.get("forked_from"):
-            # #201 §4-F fix 3. Checked BEFORE the anchor-probe branch below,
-            # and BEFORE `apply` is consulted, for the same "plan == apply"
-            # reason as the status check above: `promote_partial_pack`
-            # itself refuses a forked `partial` row outright (raises
-            # `ValueError`, see its docstring) because the anchor-probe
-            # gate that licenses every OTHER promotion here is vacuous for
-            # a fork -- `pack_fork` writes its anchor before copying any
-            # content, so an incomplete copy's anchor probes PRESENT just
-            # as reliably as a complete one's does. If this rejection lived
-            # only inside `promote_partial_pack`, a dry-run (`apply=False`)
-            # would still walk past this `elif` chain into the `else`
-            # branch and print action "promote" -- a plan `--apply` could
-            # never actually perform, since the very next call would raise.
-            # `get_pack`'s `_SELECT_COLS` already includes `forked_from`
-            # (see `ownership.py`), so `target` (fetched once, above) has
-            # what is needed here without a second query.
-            #
-            # Reason string is imported from `ownership.py`, not
-            # re-spelled here, so this planning-time rejection and
-            # `promote_partial_pack`'s own runtime rejection can never say
-            # two different things about the same refusal.
-            promote_result["action"] = "rejected (forked partial row)"
-            promote_result["reason"] = FORKED_PARTIAL_PROMOTE_REFUSAL
-        elif probes.get("graph") != PROBE_PRESENT:
-            promote_result["action"] = "rejected (graph anchor not confirmed present)"
-            promote_result["reason"] = (
-                f"graph probe returned {probes.get('graph')!r}, not "
-                f"{PROBE_PRESENT!r} -- refusing to flip status without proof "
-                "the anchor exists"
-            )
-        else:
-            promote_result["action"] = "promote"
-            promote_result["owner_id"] = target["owner_id"]
+        with ExitStack() as _promote_lock:
             if apply:
-                applied = promote_partial_pack(sql, promote, target["owner_id"])
-                promote_result["applied"] = applied
-                if applied:
-                    promote_result["status"] = PACK_STATUS_READY
-                else:
-                    # promote_partial_pack's WHERE pins both `partial` and the
-                    # owner, so False means one of those did not hold. Which
-                    # one is not knowable from the return value, and the row
-                    # may have moved again since -- so report the status read
-                    # BEFORE the update and the status now, separately
-                    # labelled, instead of asserting a cause. A fixed "it was
-                    # not partial" would be a claim never checked, and quoting
-                    # only the earlier read would misdescribe a row that has
-                    # since changed.
-                    current = get_pack(sql, promote)
-                    promote_result["reason"] = (
-                        f"no row transitioned: --promote requires a "
-                        f"{PACK_STATUS_PARTIAL!r} row owned by the same owner. "
-                        f"Status read before the update: {target['status']!r}; "
-                        f"status now: "
-                        f"{(current or {}).get('status', '<row gone>')!r}"
+                # Same window rule as the loop above, and it starts at the
+                # `get_pack` below rather than at the probe: this block
+                # branches on `target["status"]` and `target["forked_from"]`,
+                # so a re-read left outside the lock decides nothing.
+                _promote_lock.enter_context(write_lock(data_dir))
+            target = get_pack(sql, promote)
+            probes = probe_anchor(graph, docs, vector, promote)
+            promote_result = {"pack_id": promote, "probes": probes}
+            if target is None:
+                promote_result["action"] = "rejected (no such pack)"
+                # The other three rejections all carry one, and the docstring
+                # promises a reason for "no such pack" too. An operator who
+                # gets back only an action has to guess whether the slug was
+                # wrong or the row vanished under the lock.
+                promote_result["reason"] = (
+                    f"no registry row for {promote!r} when read under the lock"
+                )
+            elif target["status"] != PACK_STATUS_PARTIAL:
+                # Checked BEFORE planning, in both modes, because the plan a
+                # dry-run prints has to be the operation an --apply would perform.
+                # `promote_partial_pack`'s WHERE only matches `partial`, so
+                # announcing "promote" for a `ready` or `creating` target would
+                # advertise something that could never happen -- and in apply mode
+                # the operator would get `applied: false` after being told the
+                # opposite. A `creating` target is not a near-miss to nudge along
+                # either: the unattended pass promotes those on its own when their
+                # anchor is confirmed, and `--promote` exists for `partial` rows
+                # precisely because those are the ones it refuses to touch.
+                promote_result["action"] = "rejected (not a partial pack)"
+                promote_result["reason"] = (
+                    f"--promote only promotes a {PACK_STATUS_PARTIAL!r} row; this "
+                    f"one is {target['status']!r}"
+                    + (
+                        " -- the unattended pass promotes a confirmed 'creating' "
+                        "row without being asked"
+                        if target["status"] == PACK_STATUS_CREATING
+                        else ""
                     )
+                )
+            elif target.get("forked_from"):
+                # #201 §4-F fix 3. Checked BEFORE the anchor-probe branch below,
+                # and BEFORE `apply` is consulted, for the same "plan == apply"
+                # reason as the status check above: `promote_partial_pack`
+                # itself refuses a forked `partial` row outright (raises
+                # `ValueError`, see its docstring) because the anchor-probe
+                # gate that licenses every OTHER promotion here is vacuous for
+                # a fork -- `pack_fork` writes its anchor before copying any
+                # content, so an incomplete copy's anchor probes PRESENT just
+                # as reliably as a complete one's does. If this rejection lived
+                # only inside `promote_partial_pack`, a dry-run (`apply=False`)
+                # would still walk past this `elif` chain into the `else`
+                # branch and print action "promote" -- a plan `--apply` could
+                # never actually perform, since the very next call would raise.
+                # `get_pack`'s `_SELECT_COLS` already includes `forked_from`
+                # (see `ownership.py`), so `target` (fetched once, above) has
+                # what is needed here without a second query.
+                #
+                # Reason string is imported from `ownership.py`, not
+                # re-spelled here, so this planning-time rejection and
+                # `promote_partial_pack`'s own runtime rejection can never say
+                # two different things about the same refusal.
+                promote_result["action"] = "rejected (forked partial row)"
+                promote_result["reason"] = FORKED_PARTIAL_PROMOTE_REFUSAL
+            elif probes.get("graph") != PROBE_PRESENT:
+                promote_result["action"] = "rejected (graph anchor not confirmed present)"
+                promote_result["reason"] = (
+                    f"graph probe returned {probes.get('graph')!r}, not "
+                    f"{PROBE_PRESENT!r} -- refusing to flip status without proof "
+                    "the anchor exists"
+                )
+            else:
+                promote_result["action"] = "promote"
+                promote_result["owner_id"] = target["owner_id"]
+                if apply:
+                    applied = promote_partial_pack(sql, promote, target["owner_id"])
+                    promote_result["applied"] = applied
+                    if applied:
+                        promote_result["status"] = PACK_STATUS_READY
+                    else:
+                        # promote_partial_pack's WHERE pins both `partial` and the
+                        # owner, so False means one of those did not hold. Which
+                        # one is not knowable from the return value, and the row
+                        # may have moved again since -- so report the status read
+                        # BEFORE the update and the status now, separately
+                        # labelled, instead of asserting a cause. A fixed "it was
+                        # not partial" would be a claim never checked, and quoting
+                        # only the earlier read would misdescribe a row that has
+                        # since changed.
+                        current = get_pack(sql, promote)
+                        promote_result["reason"] = (
+                            f"no row transitioned: --promote requires a "
+                            f"{PACK_STATUS_PARTIAL!r} row owned by the same owner. "
+                            f"Status read before the update: {target['status']!r}; "
+                            f"status now: "
+                            f"{(current or {}).get('status', '<row gone>')!r}"
+                        )
 
     return {
         "older_than_seconds": older_than_seconds,
         "apply": apply,
-        "checked_at": now.isoformat(),
+        "checked_at": scan_started_at.isoformat(),
         "counts": counts,
         "rows": results,
         "promote_result": promote_result,
@@ -611,6 +779,7 @@ def ensure_anchor(
     description: str | None = None,
     principal: Any | None = None,
     apply: bool = True,
+    data_dir: str | None = None,
 ) -> dict[str, Any]:
     """Ensure ``pack_id``'s anchor node exists, creating it if missing (#194).
 
@@ -620,9 +789,28 @@ def ensure_anchor(
     statuses are handled by :func:`repair_incomplete_packs`.
 
     When ``apply`` is False, reports what would be done without writing.
-    Returns ``{"action": "already_present"|"created"|"skipped", ...}`` with
-    ``probes`` for observability. ``graph`` is the system of record;
-    ``unverifiable`` is treated as skipped (fail-closed).
+    Returns ``{"action": "already_present"|"would_create"|"created"|"blocked"
+    |"skipped"|"failed", ...}`` with ``probes`` for observability. ``graph``
+    is the system of record; a graph probe that cannot be answered at all
+    still ends the call as ``skipped`` (fail-closed). An identity slot that
+    cannot be verified is different -- that is ``blocked`` with reason
+    ``"unverifiable"``, because the write would refuse it too.
+
+    ``"blocked"`` (#224) means the anchor's slot is not available to this
+    pack -- the identity guard would refuse the write. It is NOT a failure
+    and NOT something a retry fixes on its own; the accompanying ``reason``
+    says which case it is (``"foreign"``: another pack holds the slot;
+    ``"unverifiable"``: a store that claims to be available could not answer).
+    The planning and applying paths reach this verdict through the SAME
+    predicate, so a dry run that says ``blocked`` is a true prediction of
+    what ``apply`` does rather than a guess that ``apply`` later contradicts.
+
+    ``apply=True`` holds the shared ``write.lock`` for the whole window from
+    the registry read to the write (#223); a dry run takes no lock, because a
+    read-only inspection that blocks every writer is its own defect.
+    ``data_dir`` selects which data directory's lock that is, defaulting to
+    the configured one -- pass it when the stores handed in do not belong to
+    the configured directory.
 
     **Only the graph leg decides success.** The optional doc and vector legs
     are reported in ``stores`` and never make this call fail. That is a
@@ -637,170 +825,238 @@ def ensure_anchor(
     than restoring nothing. Nothing is promoted either way -- this call
     never touches the registry row's status.
     """
+    from contextlib import ExitStack
+
     from opencrab.auth import Principal, current_principal, principal_scope
+    from opencrab.locking import write_lock
     from opencrab.pack.ownership import anchor_node_id, get_pack
+    from opencrab.pack.write_gate import node_identity_conflict
 
-    pack = get_pack(sql, pack_id)
-    if pack is None:
-        return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
-    if pack["status"] != "ready":
-        return {
-            "action": "skipped",
-            "reason": f"pack status is {pack['status']!r}, not 'ready'",
-            "pack_id": pack_id,
-            "status": pack["status"],
-        }
+    with ExitStack() as stack:
+        if apply:
+            # #223: the whole window from the registry read to the write.
+            #
+            # Two races close here. The probe one is obvious -- a writer that
+            # lands the anchor between "absent" and `add_node` would have its
+            # anchor overwritten with registry-derived properties. The other
+            # is the status re-check below: `repair_missing_anchors` picks
+            # candidates with an unlocked SELECT and delegates re-checking
+            # here, so a pack demoted after that SELECT would still be written
+            # to unless the re-check is inside the window too. That is why the
+            # lock opens at `get_pack` rather than at the probe.
+            #
+            # A dry run takes nothing -- it writes nothing, and a read-only
+            # inspection that blocks every writer is its own defect. Same
+            # split `backfill_pack_ids` makes, for the same reason. Locking
+            # here rather than in the CLI follows that precedent too: the CLI
+            # is one of three callers.
+            #
+            # Re-acquiring is safe for callers already holding this lock
+            # (`pack_ingest` under the MCP write lock, `cli ingest` under
+            # `write_lock`): `file_lock` is re-entrant within a thread and
+            # names that pattern as its purpose. It is NOT re-entrant across
+            # threads, so a future caller on a worker thread must not nest it.
+            stack.enter_context(write_lock(data_dir))
 
-    probes = probe_anchor(graph, docs, vector, pack_id)
-    if probes.get("graph") == PROBE_PRESENT:
-        return {"action": "already_present", "pack_id": pack_id, "probes": probes}
-    if probes.get("graph") != PROBE_ABSENT:
-        # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
-        # "absent" at graph level; but UNKNOWN means we cannot tell.
-        # optional-only is still "graph absent", so we should create.
-        # Only UNKNOWN is skipped.
-        if probes.get("graph") == PROBE_UNKNOWN:
+        pack = get_pack(sql, pack_id)
+        if pack is None:
+            return {"action": "skipped", "reason": "no such pack", "pack_id": pack_id}
+        if pack["status"] != "ready":
             return {
                 "action": "skipped",
-                "reason": "graph probe unverifiable",
+                "reason": f"pack status is {pack['status']!r}, not 'ready'",
+                "pack_id": pack_id,
+                "status": pack["status"],
+            }
+
+        # #224: the planning path and the applying path must look at the SAME
+        # stores, or they can disagree about a slot for no better reason than
+        # which handles they were given. `add_node` writes through the
+        # builder's stores, so when a builder is usable those are the ones
+        # that count -- for the probe, for the identity predicate, and for the
+        # post-write re-probe alike. The `_neo4j` test is the same one the
+        # availability check below uses; if the two differed, a builder whose
+        # graph is None would leave "which stores?" undefined.
+        _has_builder = builder is not None and getattr(builder, "_neo4j", None)
+        if _has_builder:
+            graph, docs, vector = builder._neo4j, builder._mongo, builder._vec
+
+        probes = probe_anchor(graph, docs, vector, pack_id)
+        if probes.get("graph") == PROBE_PRESENT:
+            return {"action": "already_present", "pack_id": pack_id, "probes": probes}
+        if probes.get("graph") != PROBE_ABSENT:
+            # Includes PROBE_UNKNOWN / PROBE_ABSENT for optional-only is still
+            # "absent" at graph level; but UNKNOWN means we cannot tell.
+            # optional-only is still "graph absent", so we should create.
+            # Only UNKNOWN is skipped.
+            if probes.get("graph") == PROBE_UNKNOWN:
+                return {
+                    "action": "skipped",
+                    "reason": "graph probe unverifiable",
+                    "pack_id": pack_id,
+                    "probes": probes,
+                }
+            # For optional-only, graph is absent, so we fall through to create.
+            # The check above already handled UNKNOWN, so remaining is ABSENT or
+            # optional-only (which is graph absent).
+            pass
+
+        # At this point graph is absent (including optional-only case).
+        # Resolve title/description from explicit args or registry fallback.
+        resolved_title = title if title is not None else (pack.get("title") or pack_id)
+        resolved_description = description if description is not None else (pack.get("description") or "")
+
+        # Checked BEFORE the dry-run return (#224): without a usable builder
+        # this call cannot write whatever it is asked to do, and that verdict
+        # is already decisive. Returning `would_create` here would be a plan
+        # that `--apply` could never carry out -- exactly the misprediction
+        # this issue is about. The CLI builds its builder regardless of
+        # `--apply` so that both modes reach this check with the same answer.
+        if not _has_builder:
+            return {
+                "action": "skipped",
+                "reason": "builder or graph store unavailable",
                 "pack_id": pack_id,
                 "probes": probes,
             }
-        # For optional-only, graph is absent, so we fall through to create.
-        # The check above already handled UNKNOWN, so remaining is ABSENT or
-        # optional-only (which is graph absent).
-        pass
 
-    # At this point graph is absent (including optional-only case).
-    # Resolve title/description from explicit args or registry fallback.
-    resolved_title = title if title is not None else (pack.get("title") or pack_id)
-    resolved_description = description if description is not None else (pack.get("description") or "")
+        anchor_id = anchor_node_id(pack_id)
 
-    if not apply:
-        return {
-            "action": "would_create",
-            "pack_id": pack_id,
-            "probes": probes,
-            "title": resolved_title,
-        }
+        # #224: one predicate, consulted by both paths. `add_node` refuses on
+        # any reason it returns, so a plan that ignored `unverifiable` would
+        # promise a write that apply then refuses. Reported as `blocked` --
+        # not `failed`, because nothing was attempted and nothing broke -- and
+        # the reason rides along, since `foreign` and `unverifiable` call for
+        # different operator responses.
+        conflict = node_identity_conflict(
+            graph, docs, vector,
+            space=_ANCHOR_SPACE, node_type=_ANCHOR_NODE_TYPE,
+            node_id=anchor_id, pack_id=pack_id,
+        )
+        if conflict:
+            return {
+                "action": "blocked",
+                "reason": conflict,
+                "pack_id": pack_id,
+                "probes": probes,
+            }
 
-    if builder is None or not getattr(builder, "_neo4j", None):
-        return {
-            "action": "skipped",
-            "reason": "builder or graph store unavailable",
-            "pack_id": pack_id,
-            "probes": probes,
-        }
+        if not apply:
+            return {
+                "action": "would_create",
+                "pack_id": pack_id,
+                "probes": probes,
+                "title": resolved_title,
+            }
 
-    # Need a principal that owns the pack. Use explicit one if given,
-    # otherwise try current_principal, otherwise synthesize from owner.
-    use_principal = principal
-    if use_principal is None:
-        try:
-            use_principal = current_principal()
-        except LookupError:
-            # Fallback: synthesize a principal for the pack owner. This is
-            # only for offline repair where no request principal exists; the
-            # anchor write is still authorized via ownership, not via the
-            # caller's identity beyond being the owner.
-            # Fetch is_local from users table if possible.
+        # Need a principal that owns the pack. Use explicit one if given,
+        # otherwise try current_principal, otherwise synthesize from owner.
+        use_principal = principal
+        if use_principal is None:
             try:
-                from sqlalchemy import text
+                use_principal = current_principal()
+            except LookupError:
+                # Fallback: synthesize a principal for the pack owner. This is
+                # only for offline repair where no request principal exists; the
+                # anchor write is still authorized via ownership, not via the
+                # caller's identity beyond being the owner.
+                # Fetch is_local from users table if possible.
+                try:
+                    from sqlalchemy import text
 
-                with sql._engine.connect() as conn:
-                    row = conn.execute(
-                        text("SELECT is_local FROM users WHERE user_id = :uid"),
-                        {"uid": pack["owner_id"]},
-                    ).fetchone()
-                is_local = bool(row[0]) if row else False
-            except Exception:
-                is_local = False
-            use_principal = Principal(
-                user_id=pack["owner_id"], is_local=is_local, disabled=False
-            )
+                    with sql._engine.connect() as conn:
+                        row = conn.execute(
+                            text("SELECT is_local FROM users WHERE user_id = :uid"),
+                            {"uid": pack["owner_id"]},
+                        ).fetchone()
+                    is_local = bool(row[0]) if row else False
+                except Exception:
+                    is_local = False
+                use_principal = Principal(
+                    user_id=pack["owner_id"], is_local=is_local, disabled=False
+                )
 
-    # Anchor shape and stamping mirrors pack_create's anchor write -- unless
-    # the registry says this pack came from a fork, in which case it mirrors
-    # pack_fork's anchor write instead (see below).
-    anchor_id = anchor_node_id(pack_id)
-    props = {
-        "pack_id": pack_id,
-        "title": resolved_title,
-        "description": resolved_description,
-        "created_by": "localcrab-mcp",
-    }
-    forked_from = pack.get("forked_from")
-    if forked_from:
-        # A fork stamps two extra provenance values onto its anchor (see
-        # `pack.fork`'s anchor write). Rebuilding without them would quietly
-        # rewrite a forked pack's anchor to look like a natively created
-        # one -- a repair pass must not launder provenance. These are not
-        # invented here: the registry row is the system of record for
-        # `forked_from`, and this restores what it already records.
-        #
-        # `created_by` follows because it records WHICH SHAPE of anchor this
-        # is, not which call ran -- the plain value above is equally a
-        # reconstruction, since no `pack_create` call is running here either.
-        #
-        # Assumption, deliberately narrow: a registry row carrying
-        # `forked_from` came from a fork. `ownership.create_pack` also
-        # accepts the argument, so this is a convention rather than a
-        # constraint; today the only production caller that passes it is
-        # `pack.fork`. Anyone adding a second one should revisit this.
-        #
-        # Title and description are NOT restored to fork's values. They come
-        # from the registry like every other repair, because a rebuilt anchor
-        # should show what this pack is called now, not what it was called
-        # when it was forked.
-        props["created_by"] = "localcrab-mcp:pack_fork"
-        props["forked_from"] = forked_from
+        # Anchor shape and stamping mirrors pack_create's anchor write -- unless
+        # the registry says this pack came from a fork, in which case it mirrors
+        # pack_fork's anchor write instead (see below).
+        props = {
+            "pack_id": pack_id,
+            "title": resolved_title,
+            "description": resolved_description,
+            "created_by": "localcrab-mcp",
+        }
+        forked_from = pack.get("forked_from")
+        if forked_from:
+            # A fork stamps two extra provenance values onto its anchor (see
+            # `pack.fork`'s anchor write). Rebuilding without them would quietly
+            # rewrite a forked pack's anchor to look like a natively created
+            # one -- a repair pass must not launder provenance. These are not
+            # invented here: the registry row is the system of record for
+            # `forked_from`, and this restores what it already records.
+            #
+            # `created_by` follows because it records WHICH SHAPE of anchor this
+            # is, not which call ran -- the plain value above is equally a
+            # reconstruction, since no `pack_create` call is running here either.
+            #
+            # Assumption, deliberately narrow: a registry row carrying
+            # `forked_from` came from a fork. `ownership.create_pack` also
+            # accepts the argument, so this is a convention rather than a
+            # constraint; today the only production caller that passes it is
+            # `pack.fork`. Anyone adding a second one should revisit this.
+            #
+            # Title and description are NOT restored to fork's values. They come
+            # from the registry like every other repair, because a rebuilt anchor
+            # should show what this pack is called now, not what it was called
+            # when it was forked.
+            props["created_by"] = "localcrab-mcp:pack_fork"
+            props["forked_from"] = forked_from
 
-    try:
-        with principal_scope(use_principal):
-            result = builder.add_node(
-                space=_ANCHOR_SPACE,
-                node_type=_ANCHOR_NODE_TYPE,
-                node_id=anchor_id,
-                properties=props,
-                pack_id=pack_id,
-                origin="server",
-                pack_anchor=True,
-                _allow_ready_anchor=True,
-            )
-    except Exception as exc:  # noqa: BLE001
+        try:
+            with principal_scope(use_principal):
+                result = builder.add_node(
+                    space=_ANCHOR_SPACE,
+                    node_type=_ANCHOR_NODE_TYPE,
+                    node_id=anchor_id,
+                    properties=props,
+                    pack_id=pack_id,
+                    origin="server",
+                    pack_anchor=True,
+                    _allow_ready_anchor=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "action": "failed",
+                "reason": f"anchor write raised: {exc}",
+                "pack_id": pack_id,
+                "probes": probes,
+            }
+
+        # pack_create's post-write verdict: graph must land.
+        stores = result.get("stores") or {}
+        graph_status = stores.get("graph")
+        if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
+            return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
+        # If graph didn't land but probe now says present (e.g., commit succeeded
+        # but acknowledgement dropped), treat as created as well (same as pack_create).
+        try:
+            reprobe = probe_anchor(graph, docs, vector, pack_id)
+            if reprobe.get("graph") == PROBE_PRESENT:
+                return {
+                    "action": "created",
+                    "pack_id": pack_id,
+                    "probes": probes,
+                    "reprobe": reprobe,
+                    "stores": stores,
+                }
+        except Exception:
+            pass
         return {
             "action": "failed",
-            "reason": f"anchor write raised: {exc}",
+            "reason": f"graph store did not land: {graph_status}",
             "pack_id": pack_id,
             "probes": probes,
+            "stores": stores,
         }
-
-    # pack_create's post-write verdict: graph must land.
-    stores = result.get("stores") or {}
-    graph_status = stores.get("graph")
-    if graph_status == "ok" or (isinstance(graph_status, str) and graph_status.startswith("ok (")):
-        return {"action": "created", "pack_id": pack_id, "probes": probes, "stores": stores}
-    # If graph didn't land but probe now says present (e.g., commit succeeded
-    # but acknowledgement dropped), treat as created as well (same as pack_create).
-    try:
-        reprobe = probe_anchor(graph, docs, vector, pack_id)
-        if reprobe.get("graph") == PROBE_PRESENT:
-            return {
-                "action": "created",
-                "pack_id": pack_id,
-                "probes": probes,
-                "reprobe": reprobe,
-                "stores": stores,
-            }
-    except Exception:
-        pass
-    return {
-        "action": "failed",
-        "reason": f"graph store did not land: {graph_status}",
-        "pack_id": pack_id,
-        "probes": probes,
-        "stores": stores,
-    }
 
 
 def repair_missing_anchors(
@@ -812,6 +1068,7 @@ def repair_missing_anchors(
     *,
     apply: bool = False,
     pack_ids: list[str] | None = None,
+    data_dir: str | None = None,
 ) -> dict[str, Any]:
     """Offline repair for ``ready`` packs missing their graph anchor (#194).
 
@@ -820,9 +1077,20 @@ def repair_missing_anchors(
     which handles ``creating``/``partial``, this handles drift in ``ready``
     packs.
 
-    Returns ``{"checked": N, "already_present": N, "would_create": N,
-    "created": N, "skipped": N, "failed": N, "rows": [...]}``.
+    Returns ``{"apply": bool, "counts": {...}, "rows": [...], "checked_at":
+    str}``. The per-pack tallies live under ``counts`` -- ``checked``,
+    ``already_present``, ``would_create``, ``created``, ``blocked``,
+    ``skipped``, ``failed`` -- not at the top level; an earlier version of
+    this line promised them flat and callers reading it wrote
+    ``summary["checked"]`` against a dict that never had that key.
     ``apply=False`` is dry-run.
+
+    ``blocked`` counts packs whose anchor slot the identity guard will not let
+    this command take (#224). It is not a failure bucket -- see
+    :func:`ensure_anchor` for what the two reasons mean. ``data_dir`` is
+    passed straight through to :func:`ensure_anchor`, which is what makes it
+    possible to lock the directory the given stores actually live in rather
+    than the configured one.
 
     The candidate query is an operator view: every ``ready`` row, with no
     owner filter. Authorization is not skipped, it just happens per pack
@@ -854,6 +1122,7 @@ def repair_missing_anchors(
         "already_present": 0,
         "would_create": 0,
         "created": 0,
+        "blocked": 0,
         "skipped": 0,
         "failed": 0,
     }
@@ -866,7 +1135,7 @@ def repair_missing_anchors(
         # happens to be present must still be rejected when the registry row is
         # missing or is not ready.
         result = ensure_anchor(
-            sql, builder, graph, docs, vector, pid, apply=apply
+            sql, builder, graph, docs, vector, pid, apply=apply, data_dir=data_dir
         )
         action = result.get("action")
         if action == "already_present":
@@ -875,6 +1144,12 @@ def repair_missing_anchors(
             counts["would_create"] += 1
         elif action == "created":
             counts["created"] += 1
+        elif action == "blocked":
+            # Its own bucket, not `skipped`: the else-branch below means "this
+            # pass did not look at it", while `blocked` means it looked and
+            # found the slot unavailable. Folding them would hide the one an
+            # operator has to act on.
+            counts["blocked"] += 1
         elif action == "failed":
             counts["failed"] += 1
         else:

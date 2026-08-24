@@ -100,6 +100,21 @@ class FakeGraph:
             return {"pack_id": node_id[len("dataset:") :]}
         return None
 
+    def get_nodes_by_id(self, node_id):
+        """The type-agnostic slot `write_gate._check_by_id_axis` probes.
+
+        A double that answers `get_node` but not this one is not a lighter
+        double, it is a store that claims to be available and then cannot
+        answer -- which the identity guard fail-closes to "unverifiable".
+        Anchor repair (#224) consults that guard while planning, so without
+        this method every pack here would plan as `blocked`. Must return a
+        list: `classify_by_id_rows` raises TypeError on anything else and
+        that lands back in the same unverifiable bucket.
+        """
+        if node_id in self._present:
+            return [{"pack_id": node_id[len("dataset:") :]}]
+        return []
+
 
 class FakeDocs:
     available = True
@@ -810,20 +825,37 @@ def test_explicit_anchor_repair_target_must_be_a_ready_registry_row(sql, alice, 
         "already_present": 0,
         "would_create": 0,
         "created": 0,
+        "blocked": 0,
         "skipped": 1,
         "failed": 0,
     }
+
+
+class _PlanBuilder:
+    """Just the three store handles `ensure_anchor` reads off a builder.
+
+    A builder has to be present even for a dry run now (#224): planning
+    consults the identity guard through the builder's own stores, and
+    "no builder" is itself a decisive verdict that apply would repeat. The
+    real `OntologyBuilder` would do here too; this keeps the double small
+    and makes it obvious which three attributes are being relied on.
+    """
+
+    def __init__(self, graph, docs, vector):
+        self._neo4j, self._mongo, self._vec = graph, docs, vector
 
 
 def test_ready_missing_anchor_dry_run_reports_planned_creation_separately(sql, alice):
     pack_id = begin_pack_creation(sql, alice, "anchor-target-ready")
     assert mark_pack_ready(sql, pack_id, alice) is True
 
+    graph, docs, vector = FakeGraph(), FakeDocs(), FakeVector()
     result = repair_missing_anchors(
         sql,
-        FakeGraph(),
-        FakeDocs(),
-        FakeVector(),
+        graph,
+        docs,
+        vector,
+        _PlanBuilder(graph, docs, vector),
         apply=False,
         pack_ids=[pack_id],
     )
@@ -834,6 +866,7 @@ def test_ready_missing_anchor_dry_run_reports_planned_creation_separately(sql, a
         "already_present": 0,
         "would_create": 1,
         "created": 0,
+        "blocked": 0,
         "skipped": 0,
         "failed": 0,
     }
