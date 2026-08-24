@@ -573,7 +573,7 @@ OPENCRAB_PG_TEST_URL=postgresql://.../opencrab_test PYTHONPATH=. \
 
 ### 8.6 fork 소비자 (`opencrab/pack/fork.py`, #201)
 
-이 계약의 실제(유일한) 소비자는 `pack_fork` 다. 오케스트레이터가 이 계약 위에 얹는 것 세 가지만
+이 계약의 실제(유일한) 소비자는 `pack_fork` 다. 오케스트레이터가 이 계약 위에 얹는 것 네 가지만
 여기 적는다 — 나머지 정책(2단 오류 모델, 완전성 하한 등)은 `fork.py` 자체와 이슈 #201 설계
 문서가 정본이다.
 

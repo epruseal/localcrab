@@ -1656,7 +1656,9 @@ class TestVectorBatchDecomposition:
         record is dim-truncated and moved to position 0; every other
         record (the 30 untouched, dim-384 node records) keeps its
         original relative order after it. `import_batch`'s head length
-        (post-anchor-filter) is computed and asserted 384 BEFORE forking.
+        (post-anchor-filter) is captured DURING the export injection --
+        i.e. before pass 1 ever runs -- and asserted 384 ahead of every
+        outcome assertion below.
         Base color: GREEN.
         Reverse-mutation (design §7 T221-7): computing the reference
         dimension from `exported_vectors[0]` (the raw export's own head,
@@ -1706,7 +1708,9 @@ class TestVectorBatchDecomposition:
         deliberately moves the head): `n0` is dim-truncated and moved to
         position 0 of the returned list; every other record (anchor + 29
         other nodes) keeps its original relative order after it. The head
-        length (383) is computed and asserted BEFORE forking. Base color:
+        length (383) is captured DURING the export injection (before
+        pass 1 runs) and asserted ahead of every outcome assertion.
+        Base color:
         GREEN -- this IS the current, confirmed contract (design §4-1's
         measured `29/31` row); design §5 V-KF-0 explicitly names this the
         intended limit fork.py's own "의도된 한계" comment already owns.
