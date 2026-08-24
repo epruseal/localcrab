@@ -1200,20 +1200,30 @@ class TestEdgeWriteFailureHandling:
 
 
 # ---------------------------------------------------------------------------
-# T44 / T51 -- design v7 §5-1-6b's 2-pass vector batch decomposition.
+# T44 / T51 / T221-1..10 -- design v7 §5-1-6b's 2-pass vector batch
+# decomposition, and design #221 v3.1 §5's V-KF (vector keep-first) contract
+# pinning it down precisely.
 # fork.py's preflight now runs the deterministic 2-pass decomposition the
-# design specifies: pass 1 walks the exported batch in order, keeping the
-# first occurrence of a duplicate id and establishing the reference
-# dimension from the first surviving record (dropping anything that
-# disagrees) -- both drops are Tier 1, counted under
+# design specifies: pass 1 gives each vector id at most one slot in the
+# import batch -- the slot goes to the FIRST record in the exported batch
+# that passes BOTH of pass 1's checks (a fresh id, not already claimed, AND
+# an embedding length matching the batch's reference dimension, itself set
+# by the first record pass 1 ever sees). A record dropped by either check
+# does NOT consume its id -- a later record sharing that id can still claim
+# the slot if it is the first to pass both checks (design #221 v3.1 §5,
+# contract V-KF; `tests/test_o221_*` T221-1..10 below pin this down
+# axis-by-axis). Both kinds of drops are Tier 1, counted under
 # `skipped.vector_batch_invalid`; pass 2 re-runs the REAL
 # `validate_import_records` over the survivors to confirm the decomposition
 # actually worked, and refuses the WHOLE preflight (a bug signal, not a
 # Tier 1 loss -- see `_vector_record_invalid`'s docstring and the 2-pass
 # block right after it in fork.py) if it still finds something wrong.
 #
-# T44 exercises pass 1's own normal path: a duplicate id that pass 1 can
-# fully resolve by itself, with pass 2 then confirming a clean pass.
+# T44 exercises pass 1's own normal path: a duplicate id whose SECOND
+# occurrence shares the same embedding dimension as the first, so the id's
+# slot goes to that first occurrence (V-KF's general rule and literal
+# keep-first agree here, since neither record fails the dimension check),
+# with pass 2 then confirming a clean pass.
 # T51 exercises pass 2 as the safety net for something pass 1's dedup/dim
 # checks cannot see: `_vector_record_invalid` (fork.py's per-record
 # pre-check) deliberately does not validate the chroma-only `uris` field
@@ -1229,15 +1239,18 @@ class TestVectorBatchDecomposition:
     def test_t44_duplicate_vector_id_dedups_keep_first_as_tier1_loss(
         self, stack, monkeypatch,
     ):
-        """T44 (design v7 §5-1-6b pass 1): a duplicate id surviving
-        classification is decomposed BEFORE reservation -- pass 1 keeps the
-        first occurrence and drops the second as a Tier 1 loss
-        (`skipped.vector_batch_invalid`), pass 2 confirms the surviving
-        batch now passes the real validator, and the fork completes as
-        `ready`/`ok` with no Tier 2 demotion: nodes that wrote successfully
-        (`copied.nodes == 10`) are NOT dragged down by a duplicate that was
-        always a Tier 1, original-data defect, never one of our own writes
-        failing."""
+        """T44 (design v7 §5-1-6b pass 1; design #221 v3.1 §5 contract
+        V-KF): a duplicate id surviving classification is decomposed
+        BEFORE reservation -- pass 1 gives the id's slot to the FIRST
+        record that passes both its checks, and since the injected
+        duplicate here shares the SAME embedding dimension as the
+        original, that is literally the first occurrence: the second is
+        dropped as a Tier 1 loss (`skipped.vector_batch_invalid`), pass 2
+        confirms the surviving batch now passes the real validator, and
+        the fork completes as `ready`/`ok` with no Tier 2 demotion: nodes
+        that wrote successfully (`copied.nodes == 10`) are NOT dragged
+        down by a duplicate that was always a Tier 1, original-data
+        defect, never one of our own writes failing."""
         src = _seed_pack(stack, ALICE, "src-t44", node_count=10, with_edge=False, with_source=False)
 
         real_export = type(stack["vector"]).export_pack_vectors
@@ -1258,9 +1271,10 @@ class TestVectorBatchDecomposition:
         out = _fork(stack, principal=ALICE, src_pack_id=src)
 
         assert out["status"] == "ok", (
-            "design v7 §5-1-6b pass 1: a duplicate vector id should be "
-            f"deduped (keep-first) as a Tier 1 loss, not demote the fork; "
-            f"got {out}"
+            "design v7 §5-1-6b pass 1 / design #221 v3.1 §5 V-KF: a "
+            "duplicate vector id whose first occurrence already matches "
+            "the batch reference dimension should keep that first "
+            f"occurrence as a Tier 1 loss, not demote the fork; got {out}"
         )
         assert out["skipped"]["vector_batch_invalid"] == 1, out["skipped"]
         assert any(
@@ -1328,6 +1342,488 @@ class TestVectorBatchDecomposition:
             "design wants ZERO registry rows for a pass-2 refusal -- a "
             f"preflight rejection must leave nothing behind, got {row}"
         )
+
+    # -----------------------------------------------------------------------
+    # T221-1..10 -- design #221 v3.1 §7's test table for the V-KF (vector
+    # keep-first) contract: pass 1 gives each vector id at most one slot,
+    # held by the first record in `import_batch` to pass BOTH of pass 1's
+    # checks (fresh id, matching reference dimension); a record dropped by
+    # either check does not consume its id. Injection convention (design
+    # §7): unless a test deliberately moves the batch HEAD (T221-7/T221-8),
+    # the original `n0` record is removed from the export and its variants
+    # are appended at the batch TAIL, so the batch head is always an
+    # untouched, unaffected earlier record. All ten are GREEN on base
+    # (`eae0687`) -- V-KF is the CURRENT behaviour, confirmed by design
+    # §4-1/§4-2's real-stack and brute-force measurements -- so the
+    # discriminating evidence here is reverse-mutation, not RED->GREEN; each
+    # docstring names its own (design #223's reverse-mutation-only
+    # convention).
+    # -----------------------------------------------------------------------
+
+    def test_o221_dim_drop_does_not_consume_the_id(self, stack, monkeypatch):
+        """T221-1 (design #221 v3.1 §5, contract V-KF): a dim-mismatched
+        record does NOT consume its id -- pass 1's duplicate check and its
+        dimension check are independent, so a later record sharing the
+        same id can still take the slot a dimension drop left open.
+        Injection: original `n0` removed, `BAD` (dim 383) then `GOOD`
+        (dim 384, matching the batch's reference dimension set by an
+        earlier, untouched record) appended at the tail. Base color:
+        GREEN.
+        Reverse-mutation (measured, design §4-1): moving
+        `seen_vector_ids.add(rec_id)` in fork.py ahead of the dimension
+        check (option 1 / id-first) makes `n0`'s vector LOST entirely --
+        `copied.vectors` drops from 30 to 29 and no `n0` document
+        survives in dst."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-1", node_count=30, with_edge=False, with_source=False,
+        )
+        real_export = type(stack["vector"]).export_pack_vectors
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            good = dict(base)
+            good["document"] = "GOOD"
+            return rest + [bad, good]
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        assert out["skipped"]["vector_batch_invalid"] == 1, out["skipped"]
+        assert out["copied"]["vectors"] == 30, out["copied"]
+        dst_docs = [
+            r.get("document")
+            for r in stack["vector"].export_pack_vectors(out["pack_id"])
+            if r.get("document") in ("GOOD", "BAD")
+        ]
+        assert dst_docs == ["GOOD"], dst_docs
+
+    def test_o221_keep_first_is_stable_under_head_fixed_permutation(self, stack, monkeypatch):
+        """T221-2 (design #221 v3.1 §5, contract V-KF-2): with the batch
+        HEAD fixed (an untouched earlier node, always dim 384, unaffected
+        by the injection below) and the same multiset of `n0` variants,
+        the surviving id set and `copied.vectors` do not depend on which
+        of the two tail orderings -- `(BAD, GOOD)` or `(GOOD, BAD)` --
+        pass 1 sees. V-KF-2 only promises this when the head is fixed
+        (design §3-4: no backend's export promises an order at all).
+        Injection: original `n0` removed, variants appended at the tail
+        for both orderings. Both orderings' `import_batch` head length is
+        computed and asserted 384 BEFORE comparing the two forks' results
+        -- the premise the rest of this test relies on. Base color:
+        GREEN.
+        Reverse-mutation (measured, design §4-2): the id-first (option 1)
+        mutation makes the two orderings disagree -- 29 vs 30
+        `copied.vectors`."""
+        results: dict[str, tuple[str, int, int]] = {}
+        for order_name, order in (("bad_good", ("bad", "good")), ("good_bad", ("good", "bad"))):
+            src = _seed_pack(
+                stack, ALICE, f"src-t221-2-{order_name}",
+                node_count=30, with_edge=False, with_source=False,
+            )
+            src_anchor = anchor_node_id(src)
+            real_export = type(stack["vector"]).export_pack_vectors
+            captured: dict[str, int] = {}
+
+            def _inject(self, pack_id, _src=src, _anchor=src_anchor, _order=order, _cap=captured):
+                records = real_export(self, pack_id)
+                if pack_id != _src:
+                    return records
+                target = f"{_src}-n0"
+                base = next(r for r in records if r["id"] == target)
+                rest = [r for r in records if r["id"] != target]
+                bad = dict(base)
+                bad["embedding"] = list(base["embedding"])[:-1]
+                bad["document"] = "BAD"
+                good = dict(base)
+                good["document"] = "GOOD"
+                variants = {"good": good, "bad": bad}
+                out_records = rest + [variants[k] for k in _order]
+                head = next(r for r in out_records if r["id"] != _anchor)
+                _cap["head_len"] = len(head["embedding"])
+                return out_records
+
+            monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+            out = _fork(stack, principal=ALICE, src_pack_id=src)
+            monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", real_export, raising=True)
+
+            assert captured["head_len"] == 384, captured  # premise, asserted before comparing
+            results[order_name] = (
+                out["status"], out["copied"]["vectors"], out["skipped"]["vector_batch_invalid"],
+            )
+
+        assert results["bad_good"] == results["good_bad"], results
+        assert results["bad_good"] == ("ok", 30, 1), results
+
+    def test_o221_first_valid_record_wins_among_equals(self, stack, monkeypatch):
+        """T221-3 (design #221 v3.1 §5, literal keep-first among records
+        that all share the batch reference dimension): with three `n0`
+        variants at the tail -- `GOOD2` (384), `BAD` (383), `GOOD` (384)
+        -- pass 1's duplicate check is literal keep-first among the
+        reference-dimension-matching records: `GOOD2` (the first record
+        with BOTH a fresh id and the reference dimension) survives, `BAD`
+        is dropped for dimension and `GOOD` is dropped for duplicate id
+        -- 2 batch-invalid drops. Injection: original `n0` removed, three
+        variants appended at the tail. Base color: GREEN.
+        Reverse-mutation (design §7 T221-3): a last-wins mutation inside
+        the duplicate branch (`pass1_survivors[<existing index>] = rec`
+        instead of `continue`, keeping the counter/message as-is) makes
+        `GOOD` (the LAST reference-dimension record) the survivor instead
+        of `GOOD2`."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-3", node_count=30, with_edge=False, with_source=False,
+        )
+        real_export = type(stack["vector"]).export_pack_vectors
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            good2 = dict(base)
+            good2["document"] = "GOOD2"
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            good = dict(base)
+            good["document"] = "GOOD"
+            return rest + [good2, bad, good]
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        assert out["skipped"]["vector_batch_invalid"] == 2, out["skipped"]
+        assert out["copied"]["vectors"] == 30, out["copied"]
+        dst_docs = [
+            r.get("document")
+            for r in stack["vector"].export_pack_vectors(out["pack_id"])
+            if r.get("document") in ("GOOD", "GOOD2", "BAD")
+        ]
+        assert dst_docs == ["GOOD2"], dst_docs
+
+    def test_o221_rescued_id_stays_under_the_completeness_floor(self, stack, monkeypatch):
+        """T221-4 (design #221 v3.1 §5, contract V-KF-3): rescuing `n0`
+        via a surviving `GOOD` record (instead of losing the id outright,
+        as option 1 would) keeps the loss ratio under the 10% floor on a
+        SMALL pack, where option 1's extra drop would flip the fork to a
+        rejection -- design §4-1's measured row 3: n=10 tail (`BAD`,
+        `GOOD`) is current-code `ok` with `batch_invalid == 1`, but
+        option 1 (id-first) is `fork rejected: vector loss ratio 2/12
+        exceeds the 10% completeness floor`. Injection: original `n0`
+        removed, variants appended at the tail. Base color: GREEN.
+        Reverse-mutation (measured, design §4-1): the option 1 mutation
+        turns this test's `status == 'ok'` into a rejection."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-4", node_count=10, with_edge=False, with_source=False,
+        )
+        real_export = type(stack["vector"]).export_pack_vectors
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            good = dict(base)
+            good["document"] = "GOOD"
+            return rest + [bad, good]
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        assert out["skipped"]["vector_batch_invalid"] == 1, out["skipped"]
+        assert out["copied"]["vectors"] == 10, out["copied"]
+
+    def test_o221_chroma_cannot_hold_two_rows_for_one_id(self, stack):
+        """T221-5 (design #221 v3.1 §3, backend-fact watch -- NOT a guard
+        of our own code): chroma cannot physically hold two rows for one
+        id -- adding to an already-present id neither raises nor
+        overwrites, the EXISTING row simply wins (measured on chromadb
+        1.5.9, via this store's `add_texts`, which calls the raw
+        `collection.add()` directly -- unlike `import_vectors`, which
+        pre-checks ids itself and refuses the whole batch on any
+        pre-existing id, a guard this test deliberately bypasses to reach
+        chroma's own raw semantics). This underwrites design §3's claim
+        that chroma's storage layer already guarantees pass 1's
+        duplicate-id premise for chroma specifically ("no export can ever
+        hand fork.py two rows sharing one id") -- it does not cover
+        sqlite-vec or pgvector (§3's DDL-only checks for those, not
+        reproduced here), nor chroma's dimension guarantee (also §3, a
+        different axis from this test).
+        Reverse-mutation: none (design §7 T221-5: this is a backend fact,
+        not this codebase's own guard -- there is nothing in fork.py or
+        this store to mutate that would flip this result; if chromadb's
+        own ADD semantics ever change, this test goes RED and §3's
+        judgement needs to be redone)."""
+        vector = stack["vector"]
+        pack_id = "o221-t5-pack"
+        doc_id = "o221-t5-dup"
+
+        vector.add_texts(["first text"], metadatas=[{"pack_id": pack_id}], ids=[doc_id])
+        vector.add_texts(["second text, same id"], metadatas=[{"pack_id": pack_id}], ids=[doc_id])
+
+        got = vector.get_by_id(doc_id)
+        assert got is not None and got["document"] == "first text", got
+
+        exported = [r for r in vector.export_pack_vectors(pack_id) if r["id"] == doc_id]
+        assert len(exported) == 1, exported
+        assert exported[0]["document"] == "first text", exported
+
+    def test_o221_pass1_carries_no_state_between_forks(self, stack, monkeypatch):
+        """T221-6 (design #221 v3.1 §5, contract V-KF-1): pass 1's result
+        is a pure function of its own fixed input sequence -- forking the
+        SAME source with the SAME injected sequence TWICE (to two
+        different dst packs) produces identical `copied.vectors`,
+        `skipped.vector_batch_invalid` and surviving document. The
+        injected sequence carries EXACTLY ONE valid variant, `(BAD,
+        GOOD)` (design §7: with two or more valid variants this test
+        would be sensitive to export-order jitter between the two calls,
+        which V-KF-2 does not promise across separately-issued export
+        calls). Injection: original `n0` removed, variants appended at
+        the tail. Base color: GREEN.
+        Reverse-mutation (design §7 T221-6): hoisting `seen_vector_ids`
+        to a module-level set shared across calls makes the SECOND fork's
+        `n0` (both variants already "seen" from the first call) drop
+        entirely, exceeding the loss floor and rejecting the second
+        fork."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-6", node_count=30, with_edge=False, with_source=False,
+        )
+        real_export = type(stack["vector"]).export_pack_vectors
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            good = dict(base)
+            good["document"] = "GOOD"
+            return rest + [bad, good]
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out1 = _fork(stack, principal=ALICE, src_pack_id=src)
+        out2 = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out1["status"] == out2["status"] == "ok", (out1, out2)
+        assert out1["copied"]["vectors"] == out2["copied"]["vectors"] == 30, (out1, out2)
+        assert (
+            out1["skipped"]["vector_batch_invalid"]
+            == out2["skipped"]["vector_batch_invalid"]
+            == 1
+        ), (out1, out2)
+        assert out1["pack_id"] != out2["pack_id"], (out1, out2)
+        docs1 = [
+            r.get("document")
+            for r in stack["vector"].export_pack_vectors(out1["pack_id"])
+            if r.get("document") in ("GOOD", "BAD")
+        ]
+        docs2 = [
+            r.get("document")
+            for r in stack["vector"].export_pack_vectors(out2["pack_id"])
+            if r.get("document") in ("GOOD", "BAD")
+        ]
+        assert docs1 == docs2 == ["GOOD"], (docs1, docs2)
+
+    def test_o221_anchor_does_not_set_the_reference_dim(self, stack, monkeypatch):
+        """T221-7 (design #221 v3.1 §5, contract V-KF-4): the anchor id
+        is excluded from pass 1's batch entirely -- BEFORE the reference
+        dimension is ever established -- so an anchor record with a
+        dim-mismatched embedding placed at the HEAD of the export does
+        NOT poison the reference dimension for the 30 ordinary node
+        records that follow. Injection (exception to the tail-append
+        convention, design §7: T221-7 deliberately moves the head, so it
+        builds the whole returned list explicitly): the anchor's own
+        record is dim-truncated and moved to position 0; every other
+        record (the 30 untouched, dim-384 node records) keeps its
+        original relative order after it. `import_batch`'s head length
+        (post-anchor-filter) is captured DURING the export injection --
+        i.e. before pass 1 ever runs -- and asserted 384 ahead of every
+        outcome assertion below.
+        Base color: GREEN.
+        Reverse-mutation (design §7 T221-7): computing the reference
+        dimension from `exported_vectors[0]` (the raw export's own head,
+        BEFORE the anchor is filtered out) instead of from
+        `import_batch`'s head makes the anchor's dim-383 poison the
+        reference, dropping all 30 dim-384 node records and rejecting the
+        fork with a `30/31` loss ratio."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-7", node_count=30, with_edge=False, with_source=False,
+        )
+        src_anchor = anchor_node_id(src)
+        real_export = type(stack["vector"]).export_pack_vectors
+        captured: dict[str, int] = {}
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            anc = next(r for r in records if r["id"] == src_anchor)
+            rest = [r for r in records if r["id"] != src_anchor]
+            bad_anchor = dict(anc)
+            bad_anchor["embedding"] = list(anc["embedding"])[:-1]
+            out_records = [bad_anchor] + rest
+            head = next(r for r in out_records if r["id"] != src_anchor)
+            captured["head_len"] = len(head["embedding"])
+            return out_records
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert captured["head_len"] == 384, captured  # premise
+        assert out["status"] == "ok", out
+        assert out["copied"]["vectors"] == 30, out["copied"]
+        assert out["skipped"]["vector_batch_invalid"] == 0, out["skipped"]
+        assert out["skipped"]["anchor_vector"] == 1, out["skipped"]
+
+    def test_o221_reference_dim_is_the_first_eligible_record_not_the_majority(
+        self, stack, monkeypatch,
+    ):
+        """T221-8 (design #221 v3.1 §5, contract V-KF-0): the batch
+        reference dimension comes from `import_batch`'s FIRST record,
+        never from a majority vote -- a single dim-383 `n0` record placed
+        at the HEAD of the export (with 29 untouched dim-384 node records
+        after it) makes the fork REJECT with a `29/31` loss ratio, even
+        though 29 of 30 node records agree on dim 384. Injection
+        (exception to the tail-append convention, design §7: T221-8
+        deliberately moves the head): `n0` is dim-truncated and moved to
+        position 0 of the returned list; every other record (anchor + 29
+        other nodes) keeps its original relative order after it. The head
+        length (383) is captured DURING the export injection (before
+        pass 1 runs) and asserted ahead of every outcome assertion.
+        Base color:
+        GREEN -- this IS the current, confirmed contract (design §4-1's
+        measured `29/31` row); design §5 V-KF-0 explicitly names this the
+        intended limit fork.py's own "의도된 한계" comment already owns.
+        Reverse-mutation (design §7 T221-8): computing the reference
+        dimension by majority vote over the batch instead of from the
+        first record makes this fork SUCCEED (384 wins the vote 29-1)
+        instead of rejecting -- the expected rejection message
+        disappears."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-8", node_count=30, with_edge=False, with_source=False,
+        )
+        src_anchor = anchor_node_id(src)
+        real_export = type(stack["vector"]).export_pack_vectors
+        captured: dict[str, int] = {}
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            out_records = [bad] + rest
+            head = next(r for r in out_records if r["id"] != src_anchor)
+            captured["head_len"] = len(head["embedding"])
+            return out_records
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert captured["head_len"] == 383, captured  # premise
+        assert "error" in out, out
+        assert "vector loss ratio 29/31" in out["error"], out
+
+    def test_o221_exactly_ten_percent_loss_is_not_a_rejection(self, stack, monkeypatch):
+        """T221-9 (design #221 v3.1 §5, contract V-KF-3, strict-inequality
+        boundary): with `node_count=8`, the export totals exactly 10
+        vector records (anchor 1 + 8 nodes - 1 replaced `n0` + 2 tail
+        variants), of which exactly 1 (`BAD`) is dropped for dimension --
+        1/10 == exactly 10%. `_check_floor`'s comparison is strict
+        (`dropped / total > FORK_MAX_LOSS_RATIO`), so hitting the floor
+        exactly must PASS, not reject. The export total and the drop
+        count are computed and asserted directly by the test, not
+        assumed. Injection: original `n0` removed, variants appended at
+        the tail. Base color: GREEN.
+        Reverse-mutation (design §7 T221-9): changing `_check_floor`'s
+        `>` to `>=` makes this exact-10% case reject with `fork rejected:
+        vector loss ratio 1/10 exceeds the 10% completeness floor`."""
+        src = _seed_pack(
+            stack, ALICE, "src-t221-9", node_count=8, with_edge=False, with_source=False,
+        )
+        real_export = type(stack["vector"]).export_pack_vectors
+        captured: dict[str, int] = {}
+
+        def _inject(self, pack_id):
+            records = real_export(self, pack_id)
+            if pack_id != src:
+                return records
+            target = f"{src}-n0"
+            base = next(r for r in records if r["id"] == target)
+            rest = [r for r in records if r["id"] != target]
+            bad = dict(base)
+            bad["embedding"] = list(base["embedding"])[:-1]
+            bad["document"] = "BAD"
+            good = dict(base)
+            good["document"] = "GOOD"
+            out_records = rest + [bad, good]
+            captured["total"] = len(out_records)
+            return out_records
+
+        monkeypatch.setattr(type(stack["vector"]), "export_pack_vectors", _inject, raising=True)
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert captured["total"] == 10, captured  # denominator, asserted directly
+        assert out["skipped"]["vector_batch_invalid"] == 1, out["skipped"]  # numerator: exactly 10%
+        assert out["status"] == "ok", out
+        assert out["copied"]["vectors"] == 8, out["copied"]
+
+    def test_o221_validator_consumes_the_id_before_it_checks_dim(self):
+        """T221-10 (design #221 v3.1 §5, contract V-KF-N: the REAL
+        validator's intentional asymmetry against pass 1): unlike pass 1,
+        `validate_import_records` (the real validator `import_vectors`
+        calls at step 17) consumes a record's id UNCONDITIONALLY, before
+        it ever checks that record's embedding dimension -- so two
+        records sharing an id, `[384-dim, 383-dim]`, always raise a
+        DUPLICATE id error, never a dimension error, regardless of
+        whether a `dim` argument is passed. This is the "id-first" rule
+        pass 1 deliberately does NOT mirror (design §5 V-KF-N: pass 1
+        only ever sees survivors, so there is no functional
+        contradiction, but "unify with the validator" is explicitly the
+        wrong fix for pass 1).
+        Reverse-mutation (design §7 T221-10): moving
+        `validate_import_records`'s duplicate-id check to AFTER its
+        dimension check turns this same input's error into `record 1
+        embedding has length 383 but record 0 has 384` instead of a
+        duplicate-id message."""
+        from opencrab.stores._vector_base import validate_import_records
+
+        records = [
+            {"id": "o221-t10-dup", "embedding": [0.0] * 384},
+            {"id": "o221-t10-dup", "embedding": [0.0] * 383},
+        ]
+
+        with pytest.raises(ValueError) as exc_dim:
+            validate_import_records(records, pack_id="o221-t10-pack", dim=384)
+        assert "duplicate id" in str(exc_dim.value), str(exc_dim.value)
+
+        with pytest.raises(ValueError) as exc_none:
+            validate_import_records(records, pack_id="o221-t10-pack", dim=None)
+        assert "duplicate id" in str(exc_none.value), str(exc_none.value)
 
 
 # ---------------------------------------------------------------------------

@@ -573,7 +573,7 @@ OPENCRAB_PG_TEST_URL=postgresql://.../opencrab_test PYTHONPATH=. \
 
 ### 8.6 fork 소비자 (`opencrab/pack/fork.py`, #201)
 
-이 계약의 실제(유일한) 소비자는 `pack_fork` 다. 오케스트레이터가 이 계약 위에 얹는 것 두 가지만
+이 계약의 실제(유일한) 소비자는 `pack_fork` 다. 오케스트레이터가 이 계약 위에 얹는 것 네 가지만
 여기 적는다 — 나머지 정책(2단 오류 모델, 완전성 하한 등)은 `fork.py` 자체와 이슈 #201 설계
 문서가 정본이다.
 
@@ -589,3 +589,24 @@ OPENCRAB_PG_TEST_URL=postgresql://.../opencrab_test PYTHONPATH=. \
   상태 모델과 정합; 근거는 `fork.py`의 §6-1 주석과 이슈 #201 설계 §6-1). `ChromaStore.import_vectors`
   독스트링의 "Compensation belongs to the caller (pack_fork)"라는 문구를 문자 그대로 "fork 가
   삭제로 보상한다"로 읽지 말 것 — 실제 보상은 상태 강등이다.
+- **한 배치 안에서 같은 `id` 는 슬롯을 하나만 갖고, 그 슬롯은 검사를 통과하는 첫 레코드가
+  가진다 (계약 V-KF, #221).** `pack_fork` 는 `import_vectors` 를 부르기 전에 export 배치를
+  2-pass 로 분해한다. pass 1 은 8.2 의 id 유일성과 8.1 의 차원 균일성을 배치 안에서 미리
+  강제하는데, 그때 **버려진 레코드는 자기 id 를 소진하지 않는다.** 같은 id 의 뒤 레코드가
+  여전히 슬롯을 가질 수 있다는 뜻이다. 배치 참조 차원은 pass 1 입력의 **첫 레코드**가 정한다
+  (다수결도 아니고 스토어의 `_dim` 도 아니다). 앵커 레코드는 pass 1 이전에 제외되므로 참조
+  차원을 세우지 않는다. 유의할 비대칭이 하나 있다. `validate_import_records` 자신은 중복 검사
+  직후 무조건 id 를 소진하는 id 우선 규칙이고, pass 1 이 그와 다른 것은 의도다. "검증기와
+  통일"하려고 pass 1 을 고치면 유효 레코드를 가진 id 가 버려져 완전성 하한을 밟는다. 계약
+  조항과 각 조항을 고정하는 테스트는 `tests/test_pack_fork.py` 의
+  `TestVectorBatchDecomposition` 에 있다.
+- **위 두 배치 검사가 실제로 발화하는 조건.** 스토어가 스스로 선언한 정규 스키마가 유지되는
+  인스턴스에서는 세 백엔드의 `export_pack_vectors` 로 중복 id 나 차원 혼재가 나오지 않는다.
+  chroma 는 컬렉션이 id 유일성과 차원을 강제하고, sqlite-vec 은 vec0 선언이, pgvector 는 PK 와
+  `vector(n)` 이 강제하기 때문이다. 도달 경로는 세 가지다. 두 메서드만 요구하는 duck-typed
+  스토어, 테스트의 export monkeypatch, 그리고 **기존 객체의 스키마를 시동 시 대사하지 않아
+  생긴 비정규 스키마**(pgvector 의 기존 테이블, sqlite-vec 의 동명 객체 선점)다. 마지막 축은
+  이슈 #232 가 소유한다. 또한 세 백엔드 어느 것도 export 순서를 약속하지 않는다(어느 export
+  질의에도 `ORDER BY` 가 없다). 따라서 "같은 팩을 두 번 fork 하면 같은 벡터가 복사된다"는
+  성질을 이 계약은 약속하지 않는다. 지금 상태를 직접 확인하려면
+  `grep -n "ORDER BY" opencrab/stores/*_store.py` 와 각 스토어의 스키마 생성 함수를 보라.
