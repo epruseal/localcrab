@@ -1955,13 +1955,28 @@ def test_every_registry_transition_happens_under_a_lock(sql, alice, monkeypatch)
 
 
 def test_the_window_has_no_verdict_the_fixture_never_reaches():
-    """Count the verdicts the row window can produce, so adding one is loud.
+    """Name every verdict the sweep can reach, so adding one is loud.
 
-    The gate above is only as complete as its fixture. This does not enforce
-    that -- three measured ways past it: widening an existing branch's
-    condition keeps the count, writing through an alias is not seen, and code
-    outside the window is out of scope (the structural check counts the lock
-    sites for that). It is a tripwire, and its job is to make someone look.
+    This used to count assignment sites, and counting broke the moment the
+    verdict moved into its own function: extraction adds a copy site and turns
+    a direct write into an indirection, so a correct refactor read as a changed
+    count. What the gate actually cares about is which verdicts exist, and that
+    set does not move when code does.
+
+    A module-level string constant is followed one hop, because pulling a
+    literal into a constant is the ordinary way to make two callers agree on it
+    and must not read as a vanished verdict. One hop only -- two hops is
+    constant propagation, which is not this gate's job. The shapes that hop
+    cannot follow (a constant handed to another constant, a local alias, a
+    conditional expression) are recorded as a known limit: the code here does
+    not use them, and if it ever needs to, open the limit rather than bend the
+    gate around it.
+
+    Still a tripwire, not a proof. Widening an existing branch's condition keeps
+    the set, and so does swapping two verdicts between branches; whether a
+    verdict is reached by the RIGHT row is what
+    `test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read`
+    answers by running the sweep.
     """
     import ast
     import inspect
@@ -1969,37 +1984,71 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
     from opencrab.pack import lifecycle
 
     tree = ast.parse(inspect.getsource(lifecycle))
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
-    )
-    window = next(
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.With)
-        and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)
-    )
-
-    sites = [
-        n for n in ast.walk(window)
+    consts = {
+        t.id: n.value.value
+        for n in tree.body
         if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Subscript)
-                and getattr(t.value, "id", "") == "entry"
-                and getattr(getattr(t, "slice", None), "value", None) == "action"
-                for t in n.targets)
-    ] + [
-        n for n in ast.walk(window)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "attr", "") == "update"
-        and getattr(getattr(n.func, "value", None), "id", "") == "entry"
-        and any(k.arg == "action" for k in n.keywords)
-    ]
-    assert len(sites) == 7, (
-        f"the row window sets `entry['action']` in {len(sites)} places, not 7. "
-        f"If a verdict was added, add a row to "
-        f"`test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read` "
-        f"that reaches it, then update this count."
-    )
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    # every function that can put a string on `action` at this point. Named by
+    # role, not by a count, so a later extraction adds a name here and nothing else.
+    scopes = [fns[name] for name in ("repair_incomplete_packs", "_creating_row_verdict")
+              if name in fns]
 
+    def written_values(node):
+        out = []
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if (isinstance(t, ast.Subscript)
+                        and getattr(t.value, "id", "") in ("entry", "found")
+                        and getattr(getattr(t, "slice", None), "value", None) == "action"):
+                    out.append(node.value)
+                if isinstance(t, ast.Name) and t.id == "action":
+                    out.append(node.value)
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "update"
+                and getattr(getattr(node.func, "value", None), "id", "") in ("entry", "found")):
+            out += [k.value for k in node.keywords if k.arg == "action"]
+        return out
+
+    verdicts, opaque = set(), []
+    for scope in scopes:
+        for node in ast.walk(scope):
+            for value in written_values(node):
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    verdicts.add(value.value)
+                elif isinstance(value, ast.Name) and value.id in consts:
+                    verdicts.add(consts[value.id])          # one hop
+                elif isinstance(value, ast.Name) and value.id == "action":
+                    continue                                 # carrying, not deciding
+                elif isinstance(value, ast.Call) and getattr(value.func, "id", "") in fns:
+                    continue                                 # delegating, not deciding
+                else:
+                    opaque.append(ast.dump(value)[:80])
+
+    assert not opaque, (
+        "a verdict is written from something this gate cannot read: "
+        f"{opaque}. Either write the literal (or a module constant), or open "
+        "the limit in the design instead of widening this reader."
+    )
+    assert verdicts == {
+        "promote",
+        "demote",
+        "skipped (unknown age)",
+        "skipped (too recent)",
+        "skipped (row moved before the lock)",
+        "skipped (unverifiable)",
+        "report only (no automatic remediation)",
+    }, (
+        f"the sweep can now reach these verdicts: {sorted(verdicts)}. "
+        f"If one was added, add a row to "
+        f"`test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read` "
+        f"that reaches it, then name it here."
+    )
 
 def test_promote_says_why_when_there_is_no_such_pack(sql, alice):
     """Every other rejection carries a reason; this one used to carry none.

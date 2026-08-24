@@ -224,6 +224,81 @@ def _parse_updated_at(value: Any) -> datetime | None:
     return dt
 
 
+def _creating_row_verdict(
+    graph: Any, docs: Any, vector: Any, *,
+    pack_id: str, row: Mapping[str, Any], found: dict[str, Any],
+) -> str:
+    """Decide what a `creating` row deserves, and record what the decision saw.
+
+    Both callers reach a verdict the same way because they call the same
+    function: the dry run passes the row it scanned, the locked path passes the
+    row it re-read. That the two agree is what #224 promises operators -- a plan
+    that predicts its own apply -- and it now holds by construction rather than
+    by two branches being edited in step.
+
+    Writes nothing. `found` collects the observation (probes, action, and the
+    reason when nothing could be concluded) in the order a report needs it; the
+    caller owns the registry write and the tally.
+    """
+    probes = probe_anchor(graph, docs, vector, pack_id)
+    found["probes"] = probes
+    graph_probe = probes.get("graph")
+    if row.get("forked_from"):
+        # #201 §4-F fix 1. This row was reserved by `pack_fork`, not
+        # `pack_create` -- and the two have OPPOSITE relationships
+        # between "anchor present" and "attempt complete".
+        # `pack_create` writes its anchor LAST (after everything
+        # else it needs has been validated), so a landed anchor IS
+        # its completion criterion -- that is what the
+        # PROBE_PRESENT branch below promotes on. `pack_fork`
+        # writes its anchor FIRST and only then copies content, so
+        # for a fork the anchor is merely evidence of the FIRST
+        # write, never of completion. Falling through to the same
+        # PROBE_PRESENT/PROBE_ABSENT branching below would auto-
+        # promote a fork whose copy is still running or died
+        # mid-copy -- and dying right after the anchor lands is
+        # fork's ordinary failure mode, not a corner case, so this
+        # is not a rare mistake to tolerate.
+        #
+        # A guard that only closed the PROBE_PRESENT promote branch
+        # (leaving the PROBE_ABSENT demote branch as the sole
+        # fallback) would still be wrong: a dead fork's anchor is
+        # PRESENT (it was the first thing written), so that row
+        # would never reach the demote branch either and would sit
+        # in `creating` forever -- invisible to every read path,
+        # unrecoverable by any promotion, since nothing but this
+        # pass and `pack_fork` itself ever calls
+        # `mark_pack_ready`/`mark_pack_partial`. So a forked
+        # `creating` row demotes on age ALONE, independent of the
+        # probe outcome, and never auto-promotes here -- promotion
+        # of a fork is owned exclusively by the `pack_fork` call
+        # that is copying it.
+        #
+        # This branch still runs the same demote CALL as the
+        # PROBE_ABSENT branch below (not a `continue`): skipping the
+        # row would drop it from `results` entirely, which makes a
+        # dead fork LESS observable to the operator reading this
+        # pass's report -- the opposite of what finding it is for.
+        action = "demote"
+    elif graph_probe == PROBE_PRESENT:
+        action = "promote"
+    elif graph_probe == PROBE_ABSENT:
+        action = "demote"
+    else:
+        action = _UNVERIFIABLE
+        reason = (
+            "graph store probe was inconclusive (store unavailable, "
+            "probe method missing, the call raised, or a row was "
+            "returned whose pack_id could not be read) -- fail-closed, "
+            "no action taken"
+        )
+
+    found["action"] = action
+    if action == _UNVERIFIABLE:
+        found["reason"] = reason
+    return action
+
+
 def repair_incomplete_packs(
     sql: Any,
     graph: Any,
@@ -577,62 +652,18 @@ def repair_incomplete_packs(
                         results.append(entry)
                         continue
 
-                probes = probe_anchor(graph, docs, vector, pack_id)
-                entry["probes"] = probes
-                graph_probe = probes.get("graph")
-                if row.get("forked_from"):
-                    # #201 §4-F fix 1. This row was reserved by `pack_fork`, not
-                    # `pack_create` -- and the two have OPPOSITE relationships
-                    # between "anchor present" and "attempt complete".
-                    # `pack_create` writes its anchor LAST (after everything
-                    # else it needs has been validated), so a landed anchor IS
-                    # its completion criterion -- that is what the
-                    # PROBE_PRESENT branch below promotes on. `pack_fork`
-                    # writes its anchor FIRST and only then copies content, so
-                    # for a fork the anchor is merely evidence of the FIRST
-                    # write, never of completion. Falling through to the same
-                    # PROBE_PRESENT/PROBE_ABSENT branching below would auto-
-                    # promote a fork whose copy is still running or died
-                    # mid-copy -- and dying right after the anchor lands is
-                    # fork's ordinary failure mode, not a corner case, so this
-                    # is not a rare mistake to tolerate.
-                    #
-                    # A guard that only closed the PROBE_PRESENT promote branch
-                    # (leaving the PROBE_ABSENT demote branch as the sole
-                    # fallback) would still be wrong: a dead fork's anchor is
-                    # PRESENT (it was the first thing written), so that row
-                    # would never reach the demote branch either and would sit
-                    # in `creating` forever -- invisible to every read path,
-                    # unrecoverable by any promotion, since nothing but this
-                    # pass and `pack_fork` itself ever calls
-                    # `mark_pack_ready`/`mark_pack_partial`. So a forked
-                    # `creating` row demotes on age ALONE, independent of the
-                    # probe outcome, and never auto-promotes here -- promotion
-                    # of a fork is owned exclusively by the `pack_fork` call
-                    # that is copying it.
-                    #
-                    # This branch still runs the same demote CALL as the
-                    # PROBE_ABSENT branch below (not a `continue`): skipping the
-                    # row would drop it from `results` entirely, which makes a
-                    # dead fork LESS observable to the operator reading this
-                    # pass's report -- the opposite of what finding it is for.
-                    entry["action"] = "demote"
-                    if apply:
-                        applied = mark_pack_partial(sql, pack_id, owner_id)
-                        entry["applied"] = applied
-                        if applied:
-                            entry["status"] = PACK_STATUS_PARTIAL
-                            counts["demoted"] += 1
-                elif graph_probe == PROBE_PRESENT:
-                    entry["action"] = "promote"
+                action = _creating_row_verdict(
+                    graph, docs, vector,
+                    pack_id=pack_id, row=row, found=entry,
+                )
+                if action == "promote":
                     if apply:
                         applied = mark_pack_ready(sql, pack_id, owner_id)
                         entry["applied"] = applied
                         if applied:
                             entry["status"] = PACK_STATUS_READY
                             counts["promoted"] += 1
-                elif graph_probe == PROBE_ABSENT:
-                    entry["action"] = "demote"
+                elif action == "demote":
                     if apply:
                         applied = mark_pack_partial(sql, pack_id, owner_id)
                         entry["applied"] = applied
@@ -640,13 +671,6 @@ def repair_incomplete_packs(
                             entry["status"] = PACK_STATUS_PARTIAL
                             counts["demoted"] += 1
                 else:
-                    entry["action"] = _UNVERIFIABLE
-                    entry["reason"] = (
-                        "graph store probe was inconclusive (store unavailable, "
-                        "probe method missing, the call raised, or a row was "
-                        "returned whose pack_id could not be read) -- fail-closed, "
-                        "no action taken"
-                    )
                     counts["skipped"] += 1
         else:
             # PACK_STATUS_PARTIAL (the only other value list_incomplete_packs
