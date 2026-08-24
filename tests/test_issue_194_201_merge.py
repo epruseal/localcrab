@@ -36,6 +36,7 @@ from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack.lifecycle import ensure_anchor, repair_missing_anchors
 from opencrab.pack.ownership import (
+    PACK_STATUS_PARTIAL,
     PACK_STATUS_READY,
     PackNotFoundError,
     anchor_node_id,
@@ -510,9 +511,13 @@ class TestCLIRepairAnchorsApply:
 
         assert result.exit_code == 0, result.output
         brace = result.output.index("{")
-        payload = json.JSONDecoder().raw_decode(result.output[brace:])[0]
+        payload, end = json.JSONDecoder().raw_decode(result.output[brace:])
         assert payload["apply"] is True
         assert payload["counts"]["created"] == 1
+        # `raw_decode` reads a prefix, so on its own it would ignore anything
+        # printed after the JSON. An apply run prints nothing after it -- the
+        # dry-run hint is the other branch.
+        assert result.output[brace + end:].strip() == ""
 
         from opencrab.cli import _optional_store
 
@@ -1074,12 +1079,15 @@ class TestCLIDryRunStillPlans:
 
         assert result.exit_code == 0, result.output
         # raw_decode, not loads: the command prints a trailing hint after the
-        # JSON, same as its sibling CLI tests handle.
+        # JSON, same as its sibling CLI tests handle. Reading a prefix means
+        # whatever follows goes unread, so say what is allowed to follow.
         brace = result.output.index("{")
-        payload = json.JSONDecoder().raw_decode(result.output[brace:])[0]
+        payload, end = json.JSONDecoder().raw_decode(result.output[brace:])
         assert payload["apply"] is False
         assert payload["counts"]["would_create"] == 1
         assert payload["counts"]["skipped"] == 0
+        rest = result.output[brace + end:].strip()
+        assert rest.startswith("Dry-run only."), rest
 
 
 def test_sweep_decides_on_the_row_it_reads_inside_the_lock(sql, alice, monkeypatch):
@@ -1334,6 +1342,18 @@ def test_sweep_data_dir_reaches_the_lock(sql, alice, rec):
 
     assert rec.dirs and all(d == "/tmp/o223-sweep" for d in rec.dirs)
 
+    # And the default path is the one the CLI actually takes, so pin it too:
+    # passing `None` has to reach the lock as `None`, not as some substitute
+    # directory chosen on the way down.
+    TestRepairRegistryLockWindows._stale(sql, begin_pack_creation(sql, alice, "dd2"))
+    rec.reset()
+
+    repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(), older_than_seconds=0, apply=True
+    )
+
+    assert rec.dirs and all(d is None for d in rec.dirs)
+
 
 def test_a_row_deleted_under_the_lock_is_not_reported_as_present(
     sql, alice, monkeypatch
@@ -1380,26 +1400,566 @@ def test_a_row_deleted_under_the_lock_is_not_reported_as_present(
 
 
 def test_no_path_returns_before_the_row_is_recorded():
-    """Structural check over the source of the sweep's row window.
+    """Structural tripwire over the source of the sweep's row window.
 
-    Eight defects on `repair_incomplete_packs` had one shape, and twice the
-    fix was "move the record above the gate" -- once above some gates, once
-    above the rest. A rule broken twice is not enforcement, so this asserts
-    the shape instead of trusting it.
+    Status, stated plainly because two earlier versions of this docstring
+    overclaimed: this is NOT a proof. It recognises shapes we have seen. The
+    soundness comes from
+    `test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read`,
+    which runs a pass and reads the result. Nine rounds of adversarial review
+    produced 62 ways past some version of this file's gates; of those, this
+    check is the only thing that catches exactly two -- renaming the window,
+    and opening a third one. Everything else here is caught by the behaviour
+    gate as well, and is kept because a named structural failure is faster to
+    read than a fixture that stopped covering something.
 
-    Scope, stated plainly because an earlier version of this docstring
-    overclaimed: it guards the SWEEP row window only. `ensure_anchor` and the
-    `--promote` window have no per-row stamp to guard, and the property they
-    do have -- everything after the registry read is inside the lock -- is
-    held by the behaviour tests, not this one.
+    What it does NOT catch (measured, not guessed) -- all of these are killed
+    by the behaviour gate instead:
+      - writes to `entry` that are not `Assign`: `pop`, `del`, `update`,
+        `AnnAssign`, rebinding `entry`, overwriting inside the `append` call;
+      - laundering the pre-lock clock through an alias or a tuple assignment;
+      - distorting the stamp's VALUE while keeping its shape;
+      - deciding on one clock and reporting another;
+      - deciding with a distorted threshold;
+      - swapping which row a branch reads;
+      - passing the pre-lock owner to a compare-and-set;
+      - releasing the lock just before a transition.
 
-    What it checks, after review found three ways past a weaker version:
-      - exits include `raise`, not just `continue`/`return`/`break`;
-      - ordering is position in the window's own statement list, so a later
-        line inside an earlier branch cannot slip past a line-number compare;
-      - the stamp has to come from the in-window clock. Stamping
-        `scan_started_at` would satisfy "a stamp exists" while reintroducing
-        the exact defect the stamp was added for.
+    Scope: the SWEEP row window. `ensure_anchor` and the `--promote` window
+    have no per-row stamp to guard.
+    """
+    import ast
+    import inspect
+
+    from opencrab.pack import lifecycle
+
+    tree = ast.parse(inspect.getsource(lifecycle))
+    defs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
+    ]
+    assert len(defs) == 1, (
+        f"expected exactly one `repair_incomplete_packs` in the module, found "
+        f"{len(defs)} at lines {[d.lineno for d in defs]} -- a later definition "
+        f"shadows the one this check reads, so it would be checking dead code"
+    )
+    fn = defs[0]
+
+    windows = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)
+    ]
+    assert len(windows) == 1, (
+        f"expected exactly one `_row_lock` window in the function, found "
+        f"{len(windows)}; renaming or duplicating it leaves this check reading "
+        f"the wrong block"
+    )
+    window = windows[0]
+
+    locks = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "write_lock"
+    ]
+    assert len(locks) == 2, (
+        f"expected exactly two `write_lock` call sites in the function -- the "
+        f"sweep row window and the promote window -- found {len(locks)} at "
+        f"lines {[c.lineno for c in locks]}. A third window is a lock nothing "
+        f"here was asked about."
+    )
+
+    def stamps(node):
+        return [
+            n for n in ast.walk(node)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Subscript)
+                    and getattr(t.value, "id", "") == "entry"
+                    and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
+                    for t in n.targets)
+        ]
+
+    all_stamps = stamps(fn)
+    assert len(all_stamps) == 1, (
+        f"expected exactly one `entry['checked_at']` assignment in the "
+        f"function, found {len(all_stamps)} at lines "
+        f"{[a.lineno for a in all_stamps]}. A second one can overwrite the "
+        f"first with a clock read somewhere else."
+    )
+    stamp = all_stamps[0]
+
+    # The stamp has to be a DIRECT statement of the window's `if apply:` body.
+    # Asking instead whether some exit precedes it was the shape three earlier
+    # versions used, and it misses the case with no exit at all: nest the
+    # stamp under any condition and the paths where that condition is false
+    # simply skip it.
+    apply_if = next(
+        (st for st in window.body
+         if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply"),
+        None,
+    )
+    assert apply_if is not None, "the row window no longer opens with `if apply:`"
+    assert not apply_if.orelse, (
+        "`if apply:` grew an else branch -- re-derive this check before "
+        "silencing it"
+    )
+    try:
+        stamp_at = apply_if.body.index(stamp)
+    except ValueError:
+        raise AssertionError(
+            f"the stamp at line {stamp.lineno} is not a direct statement of the "
+            f"window's `if apply:` body. Nesting it under a condition means "
+            f"some path through the window skips recording the row."
+        ) from None
+
+    for st in apply_if.body[:stamp_at]:
+        bad = [
+            n for n in ast.walk(st)
+            if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise, ast.Assert))
+        ]
+        assert not bad, (
+            f"a path exits the row window at line(s) {[b.lineno for b in bad]} "
+            f"before the row is stamped. Record when the row was read before "
+            f"any branch can report on it."
+        )
+
+    names = {n.id for n in ast.walk(stamp.value) if isinstance(n, ast.Name)}
+    assert "scan_started_at" not in names, (
+        "the row is stamped with the pre-lock clock, which is the defect the "
+        "stamp exists to prevent"
+    )
+    assert "now_locked" in names, (
+        f"expected the in-window clock in the stamp, got {names}"
+    )
+
+    # ...and that name has to be a clock read here, not an alias for the
+    # pre-lock one. Checking the stamp expression alone let
+    # `now_locked = scan_started_at` through.
+    binds = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "now_locked" for t in n.targets)
+    ]
+    assert binds, "`now_locked` is never assigned"
+    for b in binds:
+        bn = {n.id for n in ast.walk(b.value) if isinstance(n, ast.Name)}
+        assert "scan_started_at" not in bn, (
+            f"`now_locked` at line {b.lineno} derives from the pre-lock clock"
+        )
+        assert (isinstance(b.value, ast.Call)
+                and getattr(b.value.func, "attr", "") == "now"), (
+            f"`now_locked` at line {b.lineno} is not a fresh clock read"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The gate that carries the rule (#223/#224).
+#
+# Eight defects on `repair_incomplete_packs` had one shape: a value obtained
+# before the lock, used inside it. Four of the eight were introduced by the
+# fix for the previous one. Nine rounds of adversarial review produced 62 ways
+# past the checks written for it, and the family moved outward one layer each
+# time -- what the row REPORTED, then what the decision COMPUTED, then which
+# BRANCH it took, then which ROW it read, then what the WRITE was given, then
+# which of the three write sites, then WHEN the write happened.
+#
+# Asking the source what shape it has could not keep up: there is always
+# another way to write the same defect. Asking a real pass what it DID can,
+# because the fixture plants facts that only become true while the lock is
+# held. Code that reads a pre-lock value takes a different branch, or hands
+# the registry an owner it will not match. Values can be forged; branches and
+# the registry's final state cannot.
+# ---------------------------------------------------------------------------
+
+# Large enough that a PROPORTIONAL distortion of the age threshold exceeds the
+# fixture's 0.75s pinch and changes a verdict. An additive distortion smaller
+# than the pinch still does not -- that is recorded as a limit rather than
+# chased with a sub-second fixture whose result would depend on how fast the
+# machine is.
+_GATE_THRESHOLD = 600
+
+_MOVED = "skipped (row moved before the lock)"
+_UNKNOWN = "skipped (unknown age)"
+_RECENT = "skipped (too recent)"
+_UNVER = "skipped (unverifiable)"
+
+
+class _GraphThatCanFail(Graph):
+    """A graph store that is up, except for the one node named."""
+
+    def __init__(self):
+        super().__init__()
+        self.raise_for: set[str] = set()
+
+    def get_node(self, node_type, node_id):
+        if node_id in self.raise_for:
+            raise RuntimeError("probe cannot be answered for this one")
+        return super().get_node(node_type, node_id)
+
+
+def _write_cols(sql, pack_id, **cols):
+    from sqlalchemy import text as _t
+
+    sets = ", ".join(f"{k} = :{k}" for k in cols)
+    with sql._engine.begin() as conn:
+        conn.execute(
+            _t(f"UPDATE packs SET {sets} WHERE pack_id = :p"), {**cols, "p": pack_id}
+        )
+
+
+def _ts(dt):
+    """Sub-second precision, deliberately.
+
+    A row written during the lock wait has to land strictly between the scan
+    clock and the in-lock clock, and a second-truncated timestamp cannot
+    express that on a pass this fast. `_parse_updated_at` goes through
+    `fromisoformat`, which reads the fractional part.
+    """
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read(
+    sql, alice, monkeypatch
+):
+    """One pass, every window path, and three ways to catch a stale read.
+
+    Each row plants a fact that becomes true only while its lock is held.
+    Reading the scan row instead of the re-read one therefore shows up as a
+    DIFFERENT ACTION, not as a subtly wrong number -- and the compare-and-set
+    that follows shows up as a row the registry never moved.
+
+    Limits, measured rather than assumed:
+      - additive distortion of the in-lock threshold smaller than the 0.75s
+        pinch is invisible here. Its harm is bounded by that same 0.75s, and
+        closing it would need a sub-second fixture that depends on machine
+        speed. A proportional distortion is caught -- that is what the 600s
+        threshold buys.
+      - fields this fixture does not change during the lock wait are not
+        covered. Four such (the anchor probe, the two status tallies, the
+        `status` field, and the promote window's reads) are each caught by
+        tests above; a new one needs the same check.
+      - it does not look at `apply=False`, which takes no lock and re-reads
+        nothing.
+    """
+    import re
+    import time
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text as _t
+
+    import opencrab.pack.lifecycle as lifecycle_mod
+    import opencrab.pack.ownership as ownership_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+    from opencrab.pack.ownership import anchor_node_id
+
+    graph = _GraphThatCanFail()
+    real_get_pack = ownership_mod.get_pack
+
+    # Every clock the pass reads, in order. The stamp has to BE one of these
+    # -- the one taken right after this row's in-lock re-read -- not merely a
+    # value that sorts after it. A bound admits a later or skewed clock.
+    clock_log: list[datetime] = []
+
+    class _LoggedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            t = datetime.now(tz)
+            clock_log.append(t)
+            return t
+
+    monkeypatch.setattr(lifecycle_mod, "datetime", _LoggedClock)
+
+    def stale(pack_id):
+        _write_cols(
+            sql, pack_id,
+            updated_at=_ts(datetime.now(UTC) - timedelta(seconds=7200)),
+        )
+        return pack_id
+
+    def mk(name):
+        return stale(begin_pack_creation(sql, alice, name))
+
+    def with_anchor(pack_id):
+        graph.nodes[(ANCHOR_TYPE, anchor_node_id(pack_id))] = {"pack_id": pack_id}
+        return pack_id
+
+    gone = mk("gone")
+    moved = mk("moved")
+    future = mk("future")
+    garbage = mk("garbage")
+    straddle = mk("straddle")
+    nearfuture = mk("nearfuture")
+    recent_inlock = mk("recentinlock")
+    boundary = with_anchor(mk("boundary"))
+    nearmiss = with_anchor(mk("nearmiss"))
+    forked_late = with_anchor(mk("forkedlate"))
+    bob = create_user(sql, "Bob")
+    owner_promote = with_anchor(mk("ownermoved"))
+    owner_absent = mk("ownerabsent")
+    owner_fork = with_anchor(mk("ownerfork"))
+    forked = mk("forked")
+    _write_cols(sql, forked, forked_from="elsewhere")
+    present = with_anchor(mk("present"))
+    absent = mk("absent")
+    unver = mk("unver")
+    graph.raise_for.add(anchor_node_id(unver))
+
+    # Controls: rows the window never sees.
+    partial_row = stale(begin_pack_creation(sql, alice, "partialrow"))
+    _write_cols(sql, partial_row, status=PACK_STATUS_PARTIAL)
+    too_recent = begin_pack_creation(sql, alice, "toorecent")
+    _write_cols(sql, too_recent, updated_at=_ts(datetime.now(UTC)))
+    no_date = begin_pack_creation(sql, alice, "nodate")
+    _write_cols(sql, no_date, updated_at="not-a-date")
+    controls = {partial_row, too_recent, no_date}
+
+    # What each row's own window must conclude. Compared as a mapping, not as
+    # a set: two paths produce `demote` and two produce the same skip string,
+    # so set equality would let a row take a sibling's branch unnoticed.
+    expected = {
+        gone: _MOVED,
+        moved: _MOVED,
+        future: _UNKNOWN,
+        garbage: _UNKNOWN,
+        # Written after the scan and before the in-lock read: the scan clock
+        # calls it "dated in the future", the in-lock clock calls it new.
+        straddle: _RECENT,
+        # Dated a little ahead: only a gate whose horizon is the in-lock clock
+        # calls this unjudgeable.
+        nearfuture: _UNKNOWN,
+        recent_inlock: _RECENT,
+        # Just under the threshold when written, carried over it by the wait.
+        # Which clock the age gate uses decides between two ACTIONS here.
+        boundary: "promote",
+        # Its twin without the wait. Together they pin the threshold from
+        # both sides: raise it and `boundary` moves, lower it and this does.
+        nearmiss: _RECENT,
+        # Becomes a fork only under the lock. The fork guard has to read the
+        # row it re-read, or it promotes a copy still being made.
+        forked_late: "demote",
+        # Change hands under the lock. Deciding on the re-read row is not
+        # enough -- the transition has to be ATTEMPTED with the owner just
+        # adopted, or the compare-and-set matches nothing. One row would only
+        # cover the promote write; the registry pins the owner in all three.
+        owner_promote: "promote",
+        owner_absent: "demote",
+        owner_fork: "demote",
+        forked: "demote",
+        present: "promote",
+        absent: "demote",
+        unver: _UNVER,
+        partial_row: "report only (no automatic remediation)",
+        too_recent: _RECENT,
+        no_date: _UNKNOWN,
+    }
+
+    def delete(pack_id):
+        with sql._engine.begin() as conn:
+            conn.execute(
+                _t("DELETE FROM packs WHERE pack_id = :p"), {"p": pack_id}
+            )
+
+    # Ages this pass must report for the rows it calls too recent, kept so the
+    # printed number can be recomputed from the clock that judged them.
+    written_at: dict[str, datetime] = {}
+
+    def age_to(pack_id, seconds):
+        t = datetime.now(UTC) - timedelta(seconds=seconds)
+        written_at[pack_id] = t
+        _write_cols(sql, pack_id, updated_at=_ts(t))
+
+    mutations = {
+        gone: lambda: delete(gone),
+        moved: lambda: _write_cols(sql, moved, status=PACK_STATUS_PARTIAL),
+        future: lambda: _write_cols(
+            sql, future, updated_at=_ts(datetime.now(UTC) + timedelta(hours=1))
+        ),
+        garbage: lambda: _write_cols(sql, garbage, updated_at="not-a-date"),
+        straddle: lambda: age_to(straddle, 0),
+        nearfuture: lambda: _write_cols(
+            sql, nearfuture,
+            updated_at=_ts(datetime.now(UTC) + timedelta(seconds=20)),
+        ),
+        recent_inlock: lambda: age_to(recent_inlock, _GATE_THRESHOLD / 2),
+        boundary: lambda: age_to(boundary, _GATE_THRESHOLD - 0.75),
+        nearmiss: lambda: age_to(nearmiss, _GATE_THRESHOLD - 0.75),
+        forked_late: lambda: _write_cols(sql, forked_late, forked_from="elsewhere"),
+        owner_promote: lambda: _write_cols(sql, owner_promote, owner_id=bob),
+        owner_absent: lambda: _write_cols(sql, owner_absent, owner_id=bob),
+        owner_fork: lambda: _write_cols(
+            sql, owner_fork, owner_id=bob, forked_from="elsewhere"
+        ),
+    }
+    # Two waits, for two reasons. `boundary`'s carries it over the threshold
+    # -- 0.8s against a 0.75s shortfall puts the crossing on the sleep floor
+    # rather than on machine speed. `recentinlock`'s opens a gap between the
+    # scan clock and the in-lock one wider than the reason string's rounding,
+    # so an age computed from the wrong clock cannot hide in the tolerance.
+    slow = {boundary: 0.8, recent_inlock: 1.5}
+
+    judged_at = {}
+
+    def spy_get_pack(sql_, pack_id, *a, **kw):
+        run = mutations.pop(pack_id, None)
+        if run is not None:
+            run()
+        time.sleep(slow.get(pack_id, 0.005))
+        out = real_get_pack(sql_, pack_id, *a, **kw)
+        # `now_locked` is the first clock read after this returns, so the
+        # log's length right here names it exactly.
+        judged_at[pack_id] = len(clock_log)
+        return out
+
+    monkeypatch.setattr(ownership_mod, "get_pack", spy_get_pack)
+
+    result = repair_incomplete_packs(
+        sql, graph, Docs(), Vec(), older_than_seconds=_GATE_THRESHOLD, apply=True
+    )
+    rows = {r["pack_id"]: r for r in result["rows"]}
+
+    assert set(rows) == set(expected)
+    assert {p: r.get("action") for p, r in rows.items()} == expected
+
+    # The tally has to agree with the verdicts printed beside it.
+    verdicts = list(expected.values())
+    counts = result["counts"]
+    assert counts["rows_examined"] == len(expected)
+    assert counts["promoted"] == verdicts.count("promote")
+    assert counts["demoted"] == verdicts.count("demote")
+    assert counts["skipped"] == sum(v.startswith("skipped") for v in verdicts)
+
+    # A verdict the pass did not carry out is not a verdict.
+    with sql._engine.begin() as conn:
+        final = dict(conn.execute(_t("SELECT pack_id, status FROM packs")).all())
+    for pack_id, action in expected.items():
+        if action not in ("promote", "demote"):
+            continue
+        assert rows[pack_id].get("applied") is True, (
+            f"row {pack_id} reports {action} with "
+            f"applied={rows[pack_id].get('applied')!r} -- the transition was "
+            f"attempted with something the registry did not match"
+        )
+        want = PACK_STATUS_READY if action == "promote" else PACK_STATUS_PARTIAL
+        assert final[pack_id] == want, (
+            f"row {pack_id} reports {action} but the registry says "
+            f"{final[pack_id]!r}"
+        )
+
+    for pack_id, row in rows.items():
+        if pack_id in controls:
+            assert "checked_at" not in row, (
+                f"{row['action']} row never reached the lock but carries a stamp"
+            )
+            continue
+        assert "checked_at" in row, (
+            f"row {pack_id} ({row['action']}) reached the lock and carries no stamp"
+        )
+        i = judged_at[pack_id]
+        assert i < len(clock_log), (
+            f"row {pack_id} ({row['action']}) read no clock after its in-lock re-read"
+        )
+        judged = clock_log[i]
+        assert row["checked_at"] == judged.isoformat(), (
+            f"row {pack_id} ({row['action']}) reports {row['checked_at']} but "
+            f"the clock read inside its window was {judged.isoformat()}"
+        )
+
+        if row["action"] == _RECENT:
+            printed = float(re.search(r"age (-?\d+)s", row["reason"]).group(1))
+            # A row called too recent must read as too recent. Reporting the
+            # in-lock age beside a verdict reached on another clock produces
+            # "age 601s < threshold 600s".
+            assert printed < _GATE_THRESHOLD, (
+                f"row {pack_id} is called too recent while reporting age "
+                f"{printed}s against threshold {_GATE_THRESHOLD}s -- the verdict "
+                f"and the number beside it came from different clocks"
+            )
+            if pack_id in written_at:
+                from_judging_clock = (judged - written_at[pack_id]).total_seconds()
+                assert abs(printed - from_judging_clock) <= 0.75, (
+                    f"row {pack_id} reported age {printed}s but the clock inside "
+                    f"its window puts it at {from_judging_clock:.2f}s -- the age "
+                    f"gate ran off a different clock than the one that stamped it"
+                )
+
+
+def test_every_registry_transition_happens_under_a_lock(sql, alice, monkeypatch):
+    """Containment for all three writes, not one.
+
+    The first version of this spied `mark_pack_partial` only. That pins the
+    demote branch and leaves the promote CAS and `--promote` free to move
+    outside the window: releasing the lock one line before either of them
+    passed the whole suite. Asserting that all three were REACHED is half the
+    check -- covering one site and calling the axis closed is the mistake this
+    test exists to make impossible.
+    """
+    import contextlib
+
+    import opencrab.locking as locking_mod
+    import opencrab.pack.ownership as ownership_mod
+    from opencrab.pack.lifecycle import repair_incomplete_packs
+    from opencrab.pack.ownership import anchor_node_id
+
+    graph = Graph()
+    events: list[str] = []
+    real_lock = locking_mod.write_lock
+
+    @contextlib.contextmanager
+    def spy_lock(*a, **kw):
+        events.append("lock-enter")
+        with real_lock(*a, **kw):
+            yield
+        events.append("lock-exit")
+
+    monkeypatch.setattr(locking_mod, "write_lock", spy_lock)
+    for name in ("mark_pack_partial", "mark_pack_ready", "promote_partial_pack"):
+        real = getattr(ownership_mod, name)
+
+        def spy(*a, _real=real, _name=name, **kw):
+            events.append(f"write:{_name}")
+            return _real(*a, **kw)
+
+        monkeypatch.setattr(ownership_mod, name, spy)
+
+    to_demote = begin_pack_creation(sql, alice, "demote-me")
+    TestRepairRegistryLockWindows._stale(sql, to_demote)
+    to_promote = begin_pack_creation(sql, alice, "promote-me")
+    TestRepairRegistryLockWindows._stale(sql, to_promote)
+    graph.nodes[(ANCHOR_TYPE, anchor_node_id(to_promote))] = {"pack_id": to_promote}
+    explicit = begin_pack_creation(sql, alice, "explicit")
+    assert ownership_mod.mark_pack_partial(sql, explicit, alice) is True
+    graph.nodes[(ANCHOR_TYPE, anchor_node_id(explicit))] = {"pack_id": explicit}
+    events.clear()
+
+    repair_incomplete_packs(
+        sql, graph, Docs(), Vec(),
+        older_than_seconds=0, apply=True, promote=explicit,
+    )
+
+    depth = 0
+    reached = set()
+    for event in events:
+        if event == "lock-enter":
+            depth += 1
+        elif event == "lock-exit":
+            depth -= 1
+        else:
+            reached.add(event)
+            assert depth > 0, f"{event} ran with no lock held -- events: {events}"
+    assert reached == {
+        "write:mark_pack_partial",
+        "write:mark_pack_ready",
+        "write:promote_partial_pack",
+    }, f"not every transition was exercised, so not every one was checked: {sorted(reached)}"
+
+
+def test_the_window_has_no_verdict_the_fixture_never_reaches():
+    """Count the verdicts the row window can produce, so adding one is loud.
+
+    The gate above is only as complete as its fixture. This does not enforce
+    that -- three measured ways past it: widening an existing branch's
+    condition keeps the count, writing through an alias is not seen, and code
+    outside the window is out of scope (the structural check counts the lock
+    sites for that). It is a tripwire, and its job is to make someone look.
     """
     import ast
     import inspect
@@ -1412,64 +1972,98 @@ def test_no_path_returns_before_the_row_is_recorded():
         if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
     )
     window = next(
-        (n for n in ast.walk(fn)
-         if isinstance(n, ast.With)
-         and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)),
-        None,
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)
     )
-    assert window is not None, "sweep row window not found -- renamed?"
 
-    def stamps(node):
-        return [
-            n for n in ast.walk(node)
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Subscript)
-                    and getattr(t.value, "id", "") == "entry"
-                    and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
-                    for t in n.targets)
-        ]
+    sites = [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Subscript)
+                and getattr(t.value, "id", "") == "entry"
+                and getattr(getattr(t, "slice", None), "value", None) == "action"
+                for t in n.targets)
+    ] + [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "update"
+        and getattr(getattr(n.func, "value", None), "id", "") == "entry"
+        and any(k.arg == "action" for k in n.keywords)
+    ]
+    assert len(sites) == 7, (
+        f"the row window sets `entry['action']` in {len(sites)} places, not 7. "
+        f"If a verdict was added, add a row to "
+        f"`test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read` "
+        f"that reaches it, then update this count."
+    )
 
-    def exits(node):
-        return [n for n in ast.walk(node)
-                if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
 
-    # Find the statement list that DIRECTLY contains the stamp, not the
-    # outermost one. A first attempt checked the `with` body and silently
-    # verified nothing, because the stamp lives one level in (inside
-    # `if apply:`) -- so `window.body[:stamp_at]` was empty and the loop had
-    # no statements to reject. Descending to the real block is what makes
-    # "before" mean anything.
-    def enclosing_block(node):
-        for field in ("body", "orelse", "finalbody"):
-            block = getattr(node, field, None)
-            if not isinstance(block, list):
-                continue
-            for idx, st in enumerate(block):
-                if not stamps(st):
-                    continue
-                inner = enclosing_block(st)
-                return inner if inner else (block, idx)
-        return None
+def test_promote_says_why_when_there_is_no_such_pack(sql, alice):
+    """Every other rejection carries a reason; this one used to carry none.
 
-    found = enclosing_block(window)
-    assert found is not None, "the row window never stamps entry['checked_at']"
-    block, stamp_at = found
+    An operator handed back only `rejected (no such pack)` cannot tell a
+    mistyped slug from a row that went away while the pass waited for its
+    lock -- and those call for opposite next steps.
+    """
+    from opencrab.pack.lifecycle import repair_incomplete_packs
 
-    for st in block[:stamp_at]:
-        bad = exits(st)
-        assert not bad, (
-            f"a path exits the row window at line(s) {[b.lineno for b in bad]} "
-            f"before the row is stamped. Record when the row was read before "
-            f"any branch can report on it."
+    pid = begin_pack_creation(sql, alice, "exists")
+    TestRepairRegistryLockWindows._stale(sql, pid)
+
+    result = repair_incomplete_packs(
+        sql, Graph(), Docs(), Vec(),
+        older_than_seconds=0, apply=False, promote="no-such-slug",
+    )
+
+    assert result["promote_result"]["action"] == "rejected (no such pack)"
+    assert "no-such-slug" in result["promote_result"]["reason"]
+
+
+class TestSweepPlanMatchesApplyForForks:
+    """#224, on the sweep's own fork branch.
+
+    The `--promote` path has its own class for this. The sweep's fork guard
+    did not, and a guard that consults `apply` there would let a dry run
+    print `promote` for a row an `--apply` demotes -- the exact disagreement
+    #224 is about, one branch over from where it was found.
+    """
+
+    @staticmethod
+    def _forked_creating_with_anchor(sql, alice, graph, name):
+        from opencrab.pack.ownership import anchor_node_id
+
+        pid = begin_pack_creation(sql, alice, name)
+        TestRepairRegistryLockWindows._stale(sql, pid)
+        from sqlalchemy import text as _t
+
+        with sql._engine.begin() as conn:
+            conn.execute(
+                _t("UPDATE packs SET forked_from = :f WHERE pack_id = :p"),
+                {"f": "upstream", "p": pid},
+            )
+        graph.nodes[(ANCHOR_TYPE, anchor_node_id(pid))] = {"pack_id": pid}
+        return pid
+
+    def test_a_dry_run_plans_the_demote_an_apply_performs(self, sql, alice):
+        from opencrab.pack.lifecycle import repair_incomplete_packs
+
+        graph = Graph()
+        pid = self._forked_creating_with_anchor(sql, alice, graph, "forkplan")
+
+        planned = repair_incomplete_packs(
+            sql, graph, Docs(), Vec(), older_than_seconds=0, apply=False
         )
+        plan_row = next(r for r in planned["rows"] if r["pack_id"] == pid)
 
-    # The stamp must carry the in-window clock, not the scan-time one.
-    for a in stamps(block[stamp_at]):
-        names = {n.id for n in ast.walk(a.value) if isinstance(n, ast.Name)}
-        assert "scan_started_at" not in names, (
-            "the row is stamped with the pre-lock clock, which is the defect "
-            "the stamp exists to prevent"
+        applied = repair_incomplete_packs(
+            sql, graph, Docs(), Vec(), older_than_seconds=0, apply=True
         )
-        assert "now_locked" in names, (
-            f"expected the in-window clock in the stamp, got {names}"
-        )
+        apply_row = next(r for r in applied["rows"] if r["pack_id"] == pid)
+
+        # A present anchor would say `promote` for any other row. The fork
+        # guard overrides that in BOTH modes or in neither.
+        assert plan_row["action"] == "demote"
+        assert apply_row["action"] == plan_row["action"]
+        assert apply_row["applied"] is True
+        assert get_pack(sql, pid)["status"] == PACK_STATUS_PARTIAL
