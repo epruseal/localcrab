@@ -2171,6 +2171,10 @@ _WINDOW_FN_ALLOWED_GLOBALS = {
     "_repair_creating_row_under_lock": {"_parse_updated_at", "_creating_row_verdict"},
     "_creating_row_verdict": {"probe_anchor", "PROBE_PRESENT", "PROBE_ABSENT",
                               "_UNVERIFIABLE"},
+    # The merge reads no globals at all: everything it touches arrives as an
+    # argument. That empty set is the claim -- the reporting scope has no name
+    # for the scanned row, the scan clock, or the results list.
+    "_merge_window_findings": set(),
 }
 _DENIED_BUILTINS = {
     "__import__", "eval", "exec", "globals", "locals", "vars", "compile",
@@ -2306,6 +2310,26 @@ def test_the_caller_reaches_the_window_with_no_way_around_it():
                     for n in ast.walk(st))]
     assert len(locks) == 1, (
         "the lock is not taken exactly once before the window function runs"
+    )
+
+    # Fragment B, added when the merge became a function of its own. Same
+    # property on the other side of the window: the report is not optional
+    # either, and nothing may return between the verdict and the recording of
+    # it. Kept in this test rather than a new one so the id count does not move
+    # a second time.
+    merges = direct_calls("_merge_window_findings")
+    assert len(merges) == 1, (
+        f"expected exactly one direct call to the merge in the `if apply:` "
+        f"body, found {len(merges)}. Nested under a condition, a row can be "
+        f"judged and then not reported."
+    )
+    merge_at = apply_if.body.index(merges[0])
+    assert merge_at > at, "the merge runs before the window it is merging"
+    between = [n for st in apply_if.body[at + 1:merge_at] for n in ast.walk(st)
+               if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
+    assert not between, (
+        f"something can leave between the verdict and the report, at lines "
+        f"{sorted(n.lineno for n in between)}"
     )
 
 

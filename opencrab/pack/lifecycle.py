@@ -399,6 +399,63 @@ def _repair_creating_row_under_lock(
     return found
 
 
+def _merge_window_findings(
+    entry: dict[str, Any], counts: dict[str, int], found: Mapping[str, Any], *,
+    scanned_status: str,
+) -> None:
+    """Fold what the window found into the row's report and the pass's tally.
+
+    Reporting is where four of #227's eight defects lived, and leaving it in the
+    loop body would have left them in a scope where every pre-lock value is
+    still in reach -- the window would be closed and the report still open. Here
+    the only pre-lock value is the scan-time status, and it arrives as a named
+    argument rather than being read off `entry`, so the same fact is not read
+    through two paths that can disagree.
+
+    Key order is the point of this function, not a side effect: the report is
+    read by operators top to bottom, and the sequence below is the one the
+    pre-refactor code produced.
+
+    Writes into `entry` and `counts` in place; returns nothing.
+    """
+    entry["checked_at"] = found["checked_at"]
+    if "status" in found:
+        # The status tally was taken from the pre-lock scan. If the row moved,
+        # move the count with it, or the summary says `creating: 1` about a row
+        # this same report describes as `partial`.
+        if found["status"] != scanned_status:
+            if scanned_status in counts:
+                counts[scanned_status] -= 1
+            if found["status"] in counts:
+                counts[found["status"]] += 1
+        entry["owner_id"] = found["owner_id"]
+        entry["status"] = found["status"]
+    if "probes" in found:
+        entry["probes"] = found["probes"]
+    entry["action"] = found["action"]
+    if "reason" in found:
+        entry["reason"] = found["reason"]
+    if found.get("gone"):
+        # Nothing current to describe, so say that outright rather than leaving
+        # scan-time fields to read as present facts. Reviewers split on whether
+        # those fields were stale or simply describing the row that was
+        # examined; marking them settles it without inventing a row.
+        entry["row_gone"] = True
+        entry["scanned_status"] = entry.pop("status")
+        entry["scanned_owner_id"] = entry.pop("owner_id")
+        # And take it back out of the status tally: that bucket counts rows the
+        # registry holds, and this one is gone. `rows_examined` still counts it,
+        # because it was examined.
+        if entry["scanned_status"] in counts:
+            counts[entry["scanned_status"]] -= 1
+    if "applied" in found:
+        entry["applied"] = found["applied"]
+    if "final_status" in found:
+        entry["status"] = found["final_status"]
+    if "bucket" in found:
+        counts[found["bucket"]] += 1
+
+
 def repair_incomplete_packs(
     sql: Any,
     graph: Any,
@@ -655,41 +712,9 @@ def repair_incomplete_packs(
                         status_ready=PACK_STATUS_READY,
                     )
 
-                    # Merge what the window found into the report, in the order
-                    # a reader needs it. The only pre-lock value read here is
-                    # the scan-time status, and only to move its tally: that
-                    # bucket was incremented before the lock existed, so if the
-                    # row moved the count has to move with it.
-                    scanned_status = entry["status"]
-                    entry["checked_at"] = found["checked_at"]
-                    if "status" in found:
-                        if found["status"] != scanned_status:
-                            if scanned_status in counts:
-                                counts[scanned_status] -= 1
-                            if found["status"] in counts:
-                                counts[found["status"]] += 1
-                        entry["owner_id"] = found["owner_id"]
-                        entry["status"] = found["status"]
-                    if "probes" in found:
-                        entry["probes"] = found["probes"]
-                    entry["action"] = found["action"]
-                    if "reason" in found:
-                        entry["reason"] = found["reason"]
-                    if found.get("gone"):
-                        # Nothing current to describe, so say that outright
-                        # rather than leaving scan-time fields to read as
-                        # present facts.
-                        entry["row_gone"] = True
-                        entry["scanned_status"] = entry.pop("status")
-                        entry["scanned_owner_id"] = entry.pop("owner_id")
-                        if entry["scanned_status"] in counts:
-                            counts[entry["scanned_status"]] -= 1
-                    if "applied" in found:
-                        entry["applied"] = found["applied"]
-                    if "final_status" in found:
-                        entry["status"] = found["final_status"]
-                    if "bucket" in found:
-                        counts[found["bucket"]] += 1
+                    _merge_window_findings(
+                        entry, counts, found, scanned_status=entry["status"],
+                    )
                 else:
                     # The dry run has no lock and so nothing fresher than the
                     # row it scanned; that is the definition of a dry run, not a
