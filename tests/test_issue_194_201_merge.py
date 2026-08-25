@@ -2180,32 +2180,38 @@ _DENIED_BUILTINS = {
     "__import__", "eval", "exec", "globals", "locals", "vars", "compile",
     "getattr", "setattr", "delattr", "open", "input", "breakpoint",
 }
-# The parameter list of each window function, pinned character for character as
-# `ast.unparse` normalises it. Counting free variables does not close the axis
-# this issue exists to close: a pre-lock value handed in as a NEW PARAMETER has
-# no free variable and no global, so every other assertion here waves it
-# through -- measured, not imagined, and the whole point of the refactor is that
-# the parameter list IS the threat surface. Pinning it means widening that
-# surface is a deliberate edit to this line, not a side effect of one.
+# The parameter list of each window function: (positional, keyword-only), pinned
+# by name and order. Counting free variables does not close the axis this issue
+# exists to close: a pre-lock value handed in as a NEW PARAMETER has no free
+# variable and no global, so every other assertion here waves it through --
+# measured, not imagined, and the whole point of the refactor is that the
+# parameter list IS the threat surface. Pinning it means widening that surface
+# is a deliberate edit to this line, not a side effect of one.
 #
-# Annotations and defaults are inside the pin on purpose. A default is evaluated
-# in module scope at def time, so it can carry a value the function's own scope
-# analysis never sees.
+# Annotations are deliberately NOT pinned. This module uses `from __future__
+# import annotations`, so an annotation is never evaluated and cannot carry a
+# value -- pinning it would buy nothing and would red the gate on a type-hint
+# cleanup. Pinning `ast.unparse` output would also tie the gate to one
+# interpreter's formatting, and the supported range is wider than the one this
+# was written on.
+#
+# Defaults are the opposite case and are handled by an assertion of their own: a
+# default IS evaluated, in module scope at def time, so it is a real way for a
+# value to ride in. The rule is stronger than pinning today's defaults -- there
+# may be none at all, so every argument must come from the caller.
 _WINDOW_FN_PARAMS = {
     "_repair_creating_row_under_lock": (
-        "sql: Any, graph: Any, docs: Any, vector: Any, *, pack_id: str, "
-        "snapshot: Mapping[str, Any] | None, now: datetime, "
-        "older_than_seconds: int, mark_pack_ready: Callable[..., bool], "
-        "mark_pack_partial: Callable[..., bool], status_creating: str, "
-        "status_partial: str, status_ready: str"
+        ("sql", "graph", "docs", "vector"),
+        ("pack_id", "snapshot", "now", "older_than_seconds", "mark_pack_ready",
+         "mark_pack_partial", "status_creating", "status_partial", "status_ready"),
     ),
     "_creating_row_verdict": (
-        "graph: Any, docs: Any, vector: Any, *, pack_id: str, "
-        "row: Mapping[str, Any], found: dict[str, Any]"
+        ("graph", "docs", "vector"),
+        ("pack_id", "row", "found"),
     ),
     "_merge_window_findings": (
-        "entry: dict[str, Any], counts: dict[str, int], "
-        "found: Mapping[str, Any], *, scanned_status: str"
+        ("entry", "counts", "found"),
+        ("scanned_status",),
     ),
 }
 # Two declarations that must name the same functions. Adding a window function
@@ -2292,10 +2298,24 @@ def test_the_window_cannot_name_a_pre_lock_value():
             f"{name} is decorated. A wrapper keeps the wrapped function's source "
             f"and module, so the runtime check below cannot see it."
         )
-        assert ast.unparse(node.args) == _WINDOW_FN_PARAMS[name], (
+        args = node.args
+        actual = (tuple(a.arg for a in args.posonlyargs + args.args),
+                  tuple(a.arg for a in args.kwonlyargs))
+        assert not args.vararg and not args.kwarg, (
+            f"{name} takes *args/**kwargs. A variadic parameter is a parameter "
+            f"list that cannot be pinned, so the threat surface stops being "
+            f"enumerable."
+        )
+        assert not args.defaults and not any(args.kw_defaults), (
+            f"{name} has a parameter with a default. A default is evaluated in "
+            f"module scope when the `def` runs, so it can carry a value this "
+            f"function's own scope analysis never sees -- and nothing has to "
+            f"pass it for that value to arrive."
+        )
+        assert actual == _WINDOW_FN_PARAMS[name], (
             f"{name} does not take the parameters it is pinned to.\n"
             f"  pinned: {_WINDOW_FN_PARAMS[name]}\n"
-            f"  actual: {ast.unparse(node.args)}\n"
+            f"  actual: {actual}\n"
             f"Everything else here asks what the function can REACH FOR. A "
             f"parameter is not reached for -- it is handed in, so it has no "
             f"global and no free variable and passes every other assertion "
@@ -2529,7 +2549,6 @@ match [1]:
         pass
     case [*MATCH_STAR]:
         pass
-type TYPE_ALIAS = int
 def top_fn():
     INNER_NOT_MODULE = 1
 class TopCls:
@@ -2542,8 +2561,15 @@ EXPECT = {
     "WHILE_BODY", "WHILE_ELSE", "FOR_TGT", "FOR_BODY", "FOR_ELSE",
     "TRY_BODY", "EXC_NAME", "EXCEPT_BODY", "TRY_ELSE", "FINALLY_BODY",
     "WITH_TGT", "WITH_BODY", "WALRUS", "MATCH_AS", "MATCH_BODY",
-    "MATCH_REST", "MATCH_STAR", "TYPE_ALIAS", "top_fn", "TopCls",
+    "MATCH_REST", "MATCH_STAR", "top_fn", "TopCls",
 }
+# `type X = ...` is 3.12 syntax and this suite runs on every interpreter the
+# project supports, the oldest of which cannot parse it -- the case source above
+# is parsed unconditionally, so leaving it there turns the whole test into a
+# SyntaxError on the version CI uses. Kept rather than dropped, because a type
+# alias really is a module-level binding the collector once missed; it is simply
+# asked only where the question exists.
+TYPE_ALIAS_SRC = "type TYPE_ALIAS = int"
 
 # these live in their own scope; seeing them here would mean the collector
 # descended into a function or class body, which would make it answer a
@@ -2608,11 +2634,17 @@ def test_the_binding_collector_sees_every_module_level_form():
         Decorators, defaults, annotations and class bases evaluate right here,
         and a walrus in any of them binds at module level.
     """
+    import ast
+
     from _bound_names import bound_name_counts, bound_names
 
-    got = bound_names(SRC)
-    assert not (EXPECT - got), f"collector missed {sorted(EXPECT - got)}"
-    assert not (got - EXPECT), f"collector invented {sorted(got - EXPECT)}"
+    src, expect = SRC, set(EXPECT)
+    if hasattr(ast, "TypeAlias"):
+        src, expect = src + "\n" + TYPE_ALIAS_SRC + "\n", expect | {"TYPE_ALIAS"}
+
+    got = bound_names(src)
+    assert not (expect - got), f"collector missed {sorted(expect - got)}"
+    assert not (got - expect), f"collector invented {sorted(got - expect)}"
     assert not (got & MUST_NOT_LEAK), (
         f"{sorted(got & MUST_NOT_LEAK)} came from inside a function or class "
         f"body; the collector descended into a scope that is not the module's"
