@@ -25,6 +25,7 @@ private doubles without silently changing what these tests assert.
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 from unittest.mock import MagicMock, patch
@@ -2326,6 +2327,47 @@ def test_the_window_cannot_name_a_pre_lock_value():
         )
 
 
+_GUARDED_STMT_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
+def _unconditionally_evaluated(node):
+    """Sub-nodes evaluated every time `node` is reached.
+
+    `ast.walk` answers "is this call written somewhere inside", which is a
+    different question from "does reaching this statement run the call". A call
+    under an `if`, in a `try` body, in a ternary branch, after `and`, or inside a
+    comprehension or lambda is contained but not performed. The gate below claims
+    the apply path cannot reach its end without locking, judging and reporting --
+    a claim about execution -- and measured it with containment, so wrapping any
+    of the three in a condition left the gate green (codex review, PR #234).
+
+    Conservative on purpose: `finally` bodies do always run once the `try` is
+    entered, and a call in one is not counted here. The three statements this
+    guards are flat, so the conservative reading costs nothing today and refuses
+    to guess tomorrow.
+    """
+    yield node
+    if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp)):
+        return                                  # deferred, or per element
+    if isinstance(node, ast.IfExp):
+        yield from _unconditionally_evaluated(node.test)
+        return                                  # both branches are conditional
+    if isinstance(node, ast.BoolOp):
+        yield from _unconditionally_evaluated(node.values[0])
+        return                                  # the rest short-circuits
+    if isinstance(node, ast.stmt):
+        for field, value in ast.iter_fields(node):
+            if field in _GUARDED_STMT_FIELDS:
+                continue                        # another statement's turn to run
+            for child in (value if isinstance(value, list) else [value]):
+                if isinstance(child, ast.AST):
+                    yield from _unconditionally_evaluated(child)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _unconditionally_evaluated(child)
+
+
 def test_the_caller_reaches_the_window_with_no_way_around_it():
     """The window is not optional, and nothing runs between the lock and it.
 
@@ -2351,16 +2393,42 @@ def test_the_caller_reaches_the_window_with_no_way_around_it():
     apply_if = next(st for st in window.body
                     if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply")
 
+    def _calls(node, name):
+        return [n for n in ast.walk(node)
+                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == name]
+
     def direct_calls(name):
+        """Statements that RUN the call, not merely contain it."""
         return [st for st in apply_if.body
                 if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == name
-                       for n in ast.walk(st))]
+                       for n in _unconditionally_evaluated(st))]
 
-    calls = direct_calls("_repair_creating_row_under_lock")
-    assert len(calls) == 1, (
-        f"expected exactly one direct call to the window function in the "
-        f"`if apply:` body, found {len(calls)}. Nested under a condition, some "
-        f"path through the window skips the re-read entirely."
+    def guarded_calls(name):
+        """Occurrences a path can get past: the gap `ast.walk` alone reads as direct."""
+        out = []
+        for st in apply_if.body:
+            runs = {id(n) for n in _unconditionally_evaluated(st)}
+            out += [n for n in _calls(st, name) if id(n) not in runs]
+        return out
+
+    def assert_runs_exactly_once(name, role):
+        guarded = guarded_calls(name)
+        assert not guarded, (
+            f"`{name}` is written in the `if apply:` body but a path gets past "
+            f"it, at lines {sorted(n.lineno for n in guarded)}. {role} "
+            f"Conditioning it is how the apply path keeps this gate green while "
+            f"skipping the step entirely."
+        )
+        runs = direct_calls(name)
+        assert len(runs) == 1, (
+            f"expected `{name}` to run exactly once in the `if apply:` body, "
+            f"found {len(runs)}. {role}"
+        )
+        return runs
+
+    calls = assert_runs_exactly_once(
+        "_repair_creating_row_under_lock",
+        "Every applied row is judged on what the lock re-read.",
     )
     at = apply_if.body.index(calls[0])
     escapes = [n for st in apply_if.body[:at] for n in ast.walk(st)
@@ -2369,9 +2437,17 @@ def test_the_caller_reaches_the_window_with_no_way_around_it():
         f"something can leave the window before the row is judged, at lines "
         f"{sorted(n.lineno for n in escapes)}"
     )
+    guarded_locks = [n for st in apply_if.body[:at]
+                     for n in _calls(st, "write_lock")
+                     if id(n) not in {id(x) for x in _unconditionally_evaluated(st)}]
+    assert not guarded_locks, (
+        f"the lock is taken under a condition, at lines "
+        f"{sorted(n.lineno for n in guarded_locks)} -- so there is a path that "
+        f"reaches the window function without holding it."
+    )
     locks = [st for st in apply_if.body[:at]
              if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "write_lock"
-                    for n in ast.walk(st))]
+                    for n in _unconditionally_evaluated(st))]
     assert len(locks) == 1, (
         "the lock is not taken exactly once before the window function runs"
     )
@@ -2381,11 +2457,9 @@ def test_the_caller_reaches_the_window_with_no_way_around_it():
     # either, and nothing may return between the verdict and the recording of
     # it. Kept in this test rather than a new one so the id count does not move
     # a second time.
-    merges = direct_calls("_merge_window_findings")
-    assert len(merges) == 1, (
-        f"expected exactly one direct call to the merge in the `if apply:` "
-        f"body, found {len(merges)}. Nested under a condition, a row can be "
-        f"judged and then not reported."
+    merges = assert_runs_exactly_once(
+        "_merge_window_findings",
+        "Every judged row is reported and counted.",
     )
     merge_at = apply_if.body.index(merges[0])
     assert merge_at > at, "the merge runs before the window it is merging"
@@ -2608,6 +2682,15 @@ HEADER = [
     ("def f(x=lambda: (INNER := 1)): pass", {"f"}),             # lambda body: not ours
     ("def g(x=lambda y=(OUTER := 2): y): pass", {"g", "OUTER"}),  # lambda default: ours
     ("def n(*a: (VA := int), **k: (KW := str)): pass", {"n", "VA", "KW"}),
+    # A lambda standing in a plain module-level expression, not in a def header.
+    # The header path handled its defaults; the general path skipped the lambda
+    # whole and took the defaults with it, so this shape rebound a module name
+    # while the collector reported one binding (codex review, PR #234). The
+    # runtime source comparison in the gate above rejected the specific bypass,
+    # which is why nothing was let through -- but a count that is wrong is a
+    # count the next assertion cannot lean on.
+    ("BOX = (lambda x=(SHADOW := 1): x,)", {"BOX", "SHADOW"}),
+    ("PAIR = {0: (lambda *, k=(KWD := 3): k)}", {"PAIR", "KWD"}),
 ]
 
 OVER = [

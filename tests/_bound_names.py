@@ -38,14 +38,27 @@ def _walk_own_scope(node):
     Lambda bodies, and the bodies of nested functions and classes, open their own
     scope: a walrus there binds elsewhere and must not be counted. v10 skipped
     lambdas but not nested defs, and over-reported (codex).
+
+    A lambda is not skipped whole, though. Its BODY is deferred, but its
+    parameter DEFAULTS are evaluated right here, the moment the lambda
+    expression is built -- the same property that makes a def's defaults a real
+    channel and put a "no defaults" assertion on the window functions. Skipping
+    the node entirely took the defaults with it, so
+    `BOX = (lambda x=(NAME := replacement): x,)` rebound a module name that this
+    collector then reported as bound once (codex review, PR #234).
     """
     stack = [node]
     while stack:
         cur = stack.pop()
         yield cur
+        if isinstance(cur, ast.Lambda):
+            defaults = list(cur.args.defaults)
+            defaults += [d for d in cur.args.kw_defaults if d is not None]
+            stack.extend(defaults)
+            continue                       # body: own scope, do not descend
         for child in ast.iter_child_nodes(cur):
-            if isinstance(child, (ast.Lambda, ast.FunctionDef,
-                                  ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
                 continue
             stack.append(child)
 
@@ -94,12 +107,11 @@ def _stmt(node, out):
         for expr in header:
             # 기본값 자체가 lambda 면 그 본문은 lambda 스코프다. 헤더에서 이 스코프에
             # 평가되는 것은 lambda 의 *기본값*뿐이다. v11 은 본문까지 들어가 과잉 보고했다.
-            roots = list(expr.args.defaults) + [d for d in expr.args.kw_defaults if d] \
-                if isinstance(expr, ast.Lambda) else [expr]
-            for root in roots:
-                for sub_node in _walk_own_scope(root):
-                    if isinstance(sub_node, ast.NamedExpr):
-                        _targets(sub_node.target, out)
+            # 그 구분은 이제 `_walk_own_scope` 안에 한 번만 있다 -- 여기에 사본을 두었더니
+            # 일반 경로에는 없어서 같은 형태를 놓쳤다 (codex review, PR #234).
+            for sub_node in _walk_own_scope(expr):
+                if isinstance(sub_node, ast.NamedExpr):
+                    _targets(sub_node.target, out)
         return                                    # body: own scope, do not descend
     if isinstance(node, ast.Assign):
         for t in node.targets:
