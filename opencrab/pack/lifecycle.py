@@ -50,7 +50,7 @@ proof.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -299,6 +299,106 @@ def _creating_row_verdict(
     return action
 
 
+def _repair_creating_row_under_lock(
+    sql: Any, graph: Any, docs: Any, vector: Any, *,
+    pack_id: str,
+    snapshot: Mapping[str, Any] | None,
+    now: datetime,
+    older_than_seconds: int,
+    mark_pack_ready: Callable[..., bool],
+    mark_pack_partial: Callable[..., bool],
+    status_creating: str,
+    status_partial: str,
+    status_ready: str,
+) -> dict[str, Any]:
+    """Judge one `creating` row on what the lock re-read, and nothing else.
+
+    #227 found the same defect eight times in this span, always the same shape:
+    a value read before the lock reaching a decision or a report made under it.
+    Naming those values `scanned_*` made each new instance visible, but a
+    convention is something the next editor has to keep. Here they are simply
+    not in scope -- the caller re-reads, hands the snapshot and the clock in,
+    and there is no other row and no other clock to reach for.
+
+    Takes the writers and the status constants as arguments rather than
+    importing them, because the caller binds them once per pass; re-importing
+    per row would change behaviour when a test swaps a module attribute
+    mid-sweep.
+
+    Returns what it learned. It does not touch the caller's entry, counts, or
+    results -- reporting and tallying belong to the caller, and keeping them out
+    of here is what makes the pre-lock names unreachable rather than merely
+    unused.
+    """
+    # Stamp before anything can return. Several gates below make claims about
+    # time, so a row whose only timestamp is the pre-query stamp cannot be
+    # reconciled against its own `updated_at` after a long wait. First
+    # statement, so there is no gate that can return before the row has it.
+    found: dict[str, Any] = {"checked_at": now.isoformat()}
+
+    # Adopt first, gate second. A slug freed and re-reserved during the lock
+    # wait comes back under a different owner, so the report has to describe
+    # the row that is actually there before anything decides to return.
+    # `snapshot is None` adopts nothing on purpose: there is no row to describe.
+    if snapshot is not None:
+        found["owner_id"] = snapshot["owner_id"]
+        found["status"] = snapshot["status"]
+
+    if snapshot is None or snapshot["status"] != status_creating:
+        found["action"] = "skipped (row moved before the lock)"
+        found["reason"] = (
+            "no longer present"
+            if snapshot is None
+            else f"status is now {snapshot['status']!r}"
+        )
+        found["gone"] = snapshot is None
+        found["bucket"] = "skipped"
+        return found
+
+    # Still `creating` is not the same as still the same row. Re-run the age
+    # gate on what was actually read: acting on a re-reserved slug with the
+    # previous row's timestamp would demote or promote a pack seconds old.
+    dt = _parse_updated_at(snapshot.get("updated_at"))
+    if dt is None or dt > now:
+        found["action"] = "skipped (unknown age)"
+        found["reason"] = (
+            "updated_at is missing, unparseable, or in the "
+            "future when re-read under the lock"
+        )
+        found["bucket"] = "skipped"
+        return found
+    age = (now - dt).total_seconds()
+    if age < older_than_seconds:
+        found["action"] = "skipped (too recent)"
+        found["reason"] = (
+            f"age {age:.0f}s < threshold "
+            f"{older_than_seconds}s when re-read under the lock"
+        )
+        found["bucket"] = "skipped"
+        return found
+
+    owner_id = snapshot["owner_id"]
+    action = _creating_row_verdict(
+        graph, docs, vector,
+        pack_id=pack_id, row=snapshot, found=found,
+    )
+    if action == "promote":
+        applied = mark_pack_ready(sql, pack_id, owner_id)
+        found["applied"] = applied
+        if applied:
+            found["final_status"] = status_ready
+            found["bucket"] = "promoted"
+    elif action == "demote":
+        applied = mark_pack_partial(sql, pack_id, owner_id)
+        found["applied"] = applied
+        if applied:
+            found["final_status"] = status_partial
+            found["bucket"] = "demoted"
+    else:
+        found["bucket"] = "skipped"
+    return found
+
+
 def repair_incomplete_packs(
     sql: Any,
     graph: Any,
@@ -491,12 +591,12 @@ def repair_incomplete_packs(
     results: list[dict[str, Any]] = []
 
     for scanned_row in rows:
-        # `row` is what the code below decides on. It starts as the scanned
-        # row -- correct for the dry-run path, which takes no lock and so has
-        # nothing fresher -- and the apply path rebinds it from the in-lock
-        # re-read. `scanned_row` keeps its own name so that reaching for it
-        # from inside a window reads as reaching past that re-read.
-        row = scanned_row
+        # There is no `row` alias any more. It existed so the apply path could
+        # rebind it from the in-lock re-read while the dry run kept the scanned
+        # one; now the re-read lives inside the window function and never comes
+        # back out under a name this loop can reach. `scanned_row` keeps its own
+        # name so that reaching for it from inside a window still reads as
+        # reaching past that re-read -- which is what the gates look for.
         pack_id = scanned_row["pack_id"]
         owner_id = scanned_row["owner_id"]
         status = scanned_row["status"]
@@ -529,149 +629,77 @@ def repair_incomplete_packs(
         if status == PACK_STATUS_CREATING:
             with ExitStack() as _row_lock:
                 if apply:
-                    # #223: the probe and the CAS transition it decides are
-                    # one unit, so the window is per row rather than around
-                    # the sweep. Holding one exclusive lock for a whole
-                    # operator pass would stall every writer for its full
-                    # duration -- worse than the gap it closes. A dry run
-                    # takes nothing, for the same reason as elsewhere here.
-                    #
-                    # The registry writes below are already compare-and-set
-                    # (each pins its FROM status in the WHERE), so this is
-                    # not what makes them safe -- it puts the command inside
-                    # the write.lock ownership map its siblings belong to,
-                    # and serialises the probe-to-decision span that the CAS
-                    # cannot cover.
+                    # #223: the probe and the CAS transition it decides are one
+                    # unit, so the window is per row rather than around the
+                    # sweep. Holding one exclusive lock for a whole operator
+                    # pass would stall every writer for its full duration --
+                    # worse than the gap it closes. A dry run takes nothing.
                     _row_lock.enter_context(write_lock(data_dir))
 
-                    # Re-read inside the window, so the branch below decides on
-                    # what is true now rather than on what `list_incomplete_packs`
-                    # saw before the lock existed. Without this the window
-                    # serialises the probe and the transition but not the
-                    # reading that chooses between them, which is not the same
-                    # thing -- and it leaves this window following a different
-                    # rule from the other two, which both start at their
-                    # registry read.
-                    #
-                    # The CAS below would still refuse a transition the row no
-                    # longer qualifies for, so this is not what makes the write
-                    # safe. It is what stops the pass from probing, branching,
-                    # and reporting on a row that already moved.
-                    fresh = get_pack(sql, pack_id)
+                    # The re-read and the clock are evaluated here, in argument
+                    # position, so "re-read, then look at the clock" is fixed by
+                    # the call syntax: Python evaluates left to right and no
+                    # statement can be slipped between them. Everything the
+                    # window decides on arrives through these arguments, which
+                    # is what keeps the pre-lock names out of its scope.
+                    found = _repair_creating_row_under_lock(
+                        sql, graph, docs, vector,
+                        pack_id=pack_id,
+                        snapshot=get_pack(sql, pack_id),
+                        now=datetime.now(UTC),
+                        older_than_seconds=older_than_seconds,
+                        mark_pack_ready=mark_pack_ready,
+                        mark_pack_partial=mark_pack_partial,
+                        status_creating=PACK_STATUS_CREATING,
+                        status_partial=PACK_STATUS_PARTIAL,
+                        status_ready=PACK_STATUS_READY,
+                    )
 
-                    # Record WHEN we looked before recording WHAT we saw, and
-                    # both before anything branches. Every gate below reports,
-                    # and several of them make claims about time -- "moved
-                    # before the lock", "too recent" -- so a row whose only
-                    # timestamp is the pre-query stamp cannot be reconciled
-                    # against its own `updated_at` after a long wait. Putting
-                    # this at the top is the whole fix: there is then no gate
-                    # that can return before the row has both.
-                    now_locked = datetime.now(UTC)
-                    entry["checked_at"] = now_locked.isoformat()
-
-                    # Adopt first, gate second. Every branch below this point
-                    # reports, and a slug freed and re-reserved during the lock
-                    # wait can come back under a different owner -- so the
-                    # report has to describe the row that is actually there
-                    # before anything decides to return. Splitting adoption
-                    # across the gates is what put a deleted row's owner next
-                    # to a replacement row's status in the same line.
-                    #
-                    # `fresh is None` adopts nothing on purpose: there is no
-                    # row to describe, and the pre-lock values still name the
-                    # row this entry is reporting on.
-                    if fresh is not None:
-                        row = fresh
-                        owner_id = row["owner_id"]
-                        entry["owner_id"] = owner_id
-                        # The status tally was taken from the pre-lock scan.
-                        # If the row moved, move the count with it, or the
-                        # summary says `creating: 1` about a row this same
-                        # report describes as `partial`.
-                        if row["status"] != entry["status"]:
-                            if entry["status"] in counts:
-                                counts[entry["status"]] -= 1
-                            if row["status"] in counts:
-                                counts[row["status"]] += 1
-                        entry["status"] = row["status"]
-
-                    if fresh is None or fresh["status"] != PACK_STATUS_CREATING:
-                        entry["action"] = "skipped (row moved before the lock)"
-                        entry["reason"] = (
-                            "no longer present"
-                            if fresh is None
-                            else f"status is now {fresh['status']!r}"
-                        )
-                        if fresh is None:
-                            # Nothing current to describe, so say that outright
-                            # rather than leaving scan-time `owner_id`/`status`
-                            # to read as present facts. Reviewers split on
-                            # whether those fields were stale or simply
-                            # describing the row that was examined; marking
-                            # them settles it without inventing a row.
-                            entry["row_gone"] = True
-                            entry["scanned_status"] = entry.pop("status")
-                            entry["scanned_owner_id"] = entry.pop("owner_id")
-                            # And take it back out of the status tally: that
-                            # bucket counts rows the registry holds, and this
-                            # one is gone. `rows_examined` still counts it,
-                            # because it was examined.
-                            if entry["scanned_status"] in counts:
-                                counts[entry["scanned_status"]] -= 1
-                        counts["skipped"] += 1
-                        results.append(entry)
-                        continue
-
-                    # Still `creating` is not the same as still the same row.
-                    # A slug freed and re-reserved while this pass waited for
-                    # the lock comes back `creating` too, and acting on it with
-                    # the previous row's timestamp would demote or promote a
-                    # pack that is seconds old -- the age gate exists precisely
-                    # to keep this pass off rows someone is still creating. So
-                    # re-run that gate on what was actually read, and refresh
-                    # the fields the report will carry.
-                    fresh_dt = _parse_updated_at(fresh.get("updated_at"))
-                    if fresh_dt is None or fresh_dt > now_locked:
-                        entry["action"] = "skipped (unknown age)"
-                        entry["reason"] = (
-                            "updated_at is missing, unparseable, or in the "
-                            "future when re-read under the lock"
-                        )
-                        counts["skipped"] += 1
-                        results.append(entry)
-                        continue
-                    fresh_age = (now_locked - fresh_dt).total_seconds()
-                    if fresh_age < older_than_seconds:
-                        entry["action"] = "skipped (too recent)"
-                        entry["reason"] = (
-                            f"age {fresh_age:.0f}s < threshold "
-                            f"{older_than_seconds}s when re-read under the lock"
-                        )
-                        counts["skipped"] += 1
-                        results.append(entry)
-                        continue
-
-                action = _creating_row_verdict(
-                    graph, docs, vector,
-                    pack_id=pack_id, row=row, found=entry,
-                )
-                if action == "promote":
-                    if apply:
-                        applied = mark_pack_ready(sql, pack_id, owner_id)
-                        entry["applied"] = applied
-                        if applied:
-                            entry["status"] = PACK_STATUS_READY
-                            counts["promoted"] += 1
-                elif action == "demote":
-                    if apply:
-                        applied = mark_pack_partial(sql, pack_id, owner_id)
-                        entry["applied"] = applied
-                        if applied:
-                            entry["status"] = PACK_STATUS_PARTIAL
-                            counts["demoted"] += 1
+                    # Merge what the window found into the report, in the order
+                    # a reader needs it. The only pre-lock value read here is
+                    # the scan-time status, and only to move its tally: that
+                    # bucket was incremented before the lock existed, so if the
+                    # row moved the count has to move with it.
+                    scanned_status = entry["status"]
+                    entry["checked_at"] = found["checked_at"]
+                    if "status" in found:
+                        if found["status"] != scanned_status:
+                            if scanned_status in counts:
+                                counts[scanned_status] -= 1
+                            if found["status"] in counts:
+                                counts[found["status"]] += 1
+                        entry["owner_id"] = found["owner_id"]
+                        entry["status"] = found["status"]
+                    if "probes" in found:
+                        entry["probes"] = found["probes"]
+                    entry["action"] = found["action"]
+                    if "reason" in found:
+                        entry["reason"] = found["reason"]
+                    if found.get("gone"):
+                        # Nothing current to describe, so say that outright
+                        # rather than leaving scan-time fields to read as
+                        # present facts.
+                        entry["row_gone"] = True
+                        entry["scanned_status"] = entry.pop("status")
+                        entry["scanned_owner_id"] = entry.pop("owner_id")
+                        if entry["scanned_status"] in counts:
+                            counts[entry["scanned_status"]] -= 1
+                    if "applied" in found:
+                        entry["applied"] = found["applied"]
+                    if "final_status" in found:
+                        entry["status"] = found["final_status"]
+                    if "bucket" in found:
+                        counts[found["bucket"]] += 1
                 else:
-                    counts["skipped"] += 1
+                    # The dry run has no lock and so nothing fresher than the
+                    # row it scanned; that is the definition of a dry run, not a
+                    # stale read. It reaches the same verdict through the same
+                    # function, which is what makes the plan predict the apply.
+                    if _creating_row_verdict(
+                        graph, docs, vector,
+                        pack_id=pack_id, row=scanned_row, found=entry,
+                    ) == _UNVERIFIABLE:
+                        counts["skipped"] += 1
         else:
             # PACK_STATUS_PARTIAL (the only other value list_incomplete_packs
             # can hand back, since it selects status <> 'ready'). No

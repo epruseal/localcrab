@@ -1470,133 +1470,119 @@ def test_no_path_returns_before_the_row_is_recorded():
         f"here was asked about."
     )
 
-    def stamps(node):
-        return [
-            n for n in ast.walk(node)
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Subscript)
-                    and getattr(t.value, "id", "") == "entry"
-                    and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
-                    for t in n.targets)
-        ]
-
-    all_stamps = stamps(fn)
-    assert len(all_stamps) == 1, (
-        f"expected exactly one `entry['checked_at']` assignment in the "
-        f"function, found {len(all_stamps)} at lines "
-        f"{[a.lineno for a in all_stamps]}. A second one can overwrite the "
-        f"first with a clock read somewhere else."
-    )
-    stamp = all_stamps[0]
-
-    # The stamp has to be a DIRECT statement of the window's `if apply:` body.
-    # Asking instead whether some exit precedes it was the shape three earlier
-    # versions used, and it misses the case with no exit at all: nest the
-    # stamp under any condition and the paths where that condition is false
-    # simply skip it.
-    apply_if = next(
-        (st for st in window.body
-         if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply"),
-        None,
-    )
-    assert apply_if is not None, "the row window no longer opens with `if apply:`"
-    assert not apply_if.orelse, (
-        "`if apply:` grew an else branch -- re-derive this check before "
-        "silencing it"
-    )
-    try:
-        stamp_at = apply_if.body.index(stamp)
-    except ValueError:
-        raise AssertionError(
-            f"the stamp at line {stamp.lineno} is not a direct statement of the "
-            f"window's `if apply:` body. Nesting it under a condition means "
-            f"some path through the window skips recording the row."
-        ) from None
-
-    for st in apply_if.body[:stamp_at]:
-        bad = [
-            n for n in ast.walk(st)
-            if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise, ast.Assert))
-        ]
-        assert not bad, (
-            f"a path exits the row window at line(s) {[b.lineno for b in bad]} "
-            f"before the row is stamped. Record when the row was read before "
-            f"any branch can report on it."
-        )
-
-    names = {n.id for n in ast.walk(stamp.value) if isinstance(n, ast.Name)}
-    assert "scan_started_at" not in names, (
-        "the row is stamped with the pre-lock clock, which is the defect the "
-        "stamp exists to prevent"
-    )
-    assert "now_locked" in names, (
-        f"expected the in-window clock in the stamp, got {names}"
-    )
-
-    # ...and that name has to be a clock read here, not an alias for the
-    # pre-lock one. Checking the stamp expression alone let
-    # `now_locked = scan_started_at` through.
-    binds = [
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "now_locked" for t in n.targets)
+    # The stamp moved into the window function when the window became one.
+    # It is still the same property: no path reaches a verdict before the row
+    # has a time on it. What changed is that the property is now readable in one
+    # place instead of across a 200-line loop body.
+    window_fns = [
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_repair_creating_row_under_lock"
     ]
-    assert binds, "`now_locked` is never assigned"
-    for b in binds:
-        bn = {n.id for n in ast.walk(b.value) if isinstance(n, ast.Name)}
-        assert "scan_started_at" not in bn, (
-            f"`now_locked` at line {b.lineno} derives from the pre-lock clock"
-        )
-        assert (isinstance(b.value, ast.Call)
-                and getattr(b.value.func, "attr", "") == "now"), (
-            f"`now_locked` at line {b.lineno} is not a fresh clock read"
-        )
+    assert len(window_fns) == 1, (
+        f"expected exactly one `_repair_creating_row_under_lock`, found "
+        f"{len(window_fns)}; a second definition shadows the one this reads"
+    )
+    window_fn = window_fns[0]
 
+    body = [st for st in window_fn.body if not (
+        isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    first = body[0]
+    assert (isinstance(first, ast.AnnAssign) or isinstance(first, ast.Assign)), (
+        "the window function no longer opens with an assignment; the first "
+        "statement is what puts a time on the row"
+    )
+    target = first.target if isinstance(first, ast.AnnAssign) else first.targets[0]
+    assert getattr(target, "id", "") == "found", (
+        "the window function's first statement no longer builds `found`"
+    )
+    assert isinstance(first.value, ast.Dict) and any(
+        isinstance(k, ast.Constant) and k.value == "checked_at" for k in first.value.keys
+    ), "the first statement no longer stamps `checked_at`"
+    assert any(
+        isinstance(n, ast.Name) and n.id == "now" for n in ast.walk(first.value)
+    ), "the stamp no longer reads the clock it was handed"
 
-# ---------------------------------------------------------------------------
-# The gate that carries the rule (#223/#224).
-#
-# Eight defects on `repair_incomplete_packs` had one shape: a value obtained
-# before the lock, used inside it. Four of the eight were introduced by the
-# fix for the previous one. Nine rounds of adversarial review produced 62 ways
-# past the checks written for it, and the family moved outward one layer each
-# time -- what the row REPORTED, then what the decision COMPUTED, then which
-# BRANCH it took, then which ROW it read, then what the WRITE was given, then
-# which of the three write sites, then WHEN the write happened.
-#
-# Asking the source what shape it has could not keep up: there is always
-# another way to write the same defect. Asking a real pass what it DID can,
-# because the fixture plants facts that only become true while the lock is
-# held. Code that reads a pre-lock value takes a different branch, or hands
-# the registry an owner it will not match. Values can be forged; branches and
-# the registry's final state cannot.
-# ---------------------------------------------------------------------------
+    # Second statement adopts the re-read row's identity, with no gate between.
+    # Adoption after a gate is defect 3 of the eight, and scope does not stop it
+    # -- only the order does, so the order is what this reads.
+    second = body[1]
+    assert isinstance(second, ast.If) and any(
+        isinstance(n, ast.Name) and n.id == "snapshot" for n in ast.walk(second.test)
+    ), (
+        "the second statement is no longer the snapshot adoption; a gate placed "
+        "between the stamp and the adoption is how a row gets judged before its "
+        "identity is refreshed"
+    )
 
-# Large enough that a PROPORTIONAL distortion of the age threshold exceeds the
-# fixture's 0.75s pinch and changes a verdict. An additive distortion smaller
-# than the pinch still does not -- that is recorded as a limit rather than
-# chased with a sub-second fixture whose result would depend on how fast the
-# machine is.
-_GATE_THRESHOLD = 600
+    clock_reads_in_window_fn = [
+        n for n in ast.walk(window_fn)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "now"
+        and getattr(getattr(n.func, "value", None), "id", "") == "datetime"
+    ]
+    assert not clock_reads_in_window_fn, (
+        f"the window function reads a clock at lines "
+        f"{[c.lineno for c in clock_reads_in_window_fn]}. It is handed one; "
+        f"reading another is how the in-lock age gate stops agreeing with the "
+        f"time the row was stamped with."
+    )
 
-_MOVED = "skipped (row moved before the lock)"
-_UNKNOWN = "skipped (unknown age)"
-_RECENT = "skipped (too recent)"
-_UNVER = "skipped (unverifiable)"
+    # The caller's side. The pre-lock names must not appear anywhere under the
+    # window -- including in the argument expressions, which is where the
+    # distortion moves once it cannot live inside.
+    # `scan_started_at` only. `scanned_row` still appears here, in the dry-run
+    # branch, and legitimately: a dry run takes no lock and so has nothing
+    # fresher than the row it scanned. That is the definition of a dry run, not
+    # a stale read. The apply path cannot reach it -- the window function has no
+    # such name in scope, which is what this whole change bought.
+    stale = [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Name) and n.id == "scan_started_at"
+    ]
+    assert not stale, (
+        f"the row window reaches a pre-lock name at lines "
+        f"{sorted({n.lineno for n in stale})}. That is the whole shape this "
+        f"refactor removed; passing it as an argument is the same defect with "
+        f"a longer path."
+    )
 
+    window_clock = [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "now"
+        and getattr(getattr(n.func, "value", None), "id", "") == "datetime"
+    ]
+    assert len(window_clock) == 1, (
+        f"expected exactly one clock read in the row window, found "
+        f"{len(window_clock)} at lines {[c.lineno for c in window_clock]}. Two "
+        f"clocks means the row can be judged by one and reported with another."
+    )
 
-class _GraphThatCanFail(Graph):
-    """A graph store that is up, except for the one node named."""
-
-    def __init__(self):
-        super().__init__()
-        self.raise_for: set[str] = set()
-
-    def get_node(self, node_type, node_id):
-        if node_id in self.raise_for:
-            raise RuntimeError("probe cannot be answered for this one")
-        return super().get_node(node_type, node_id)
-
+    # `checked_at` is written once in the whole module. Counting inside
+    # `repair_incomplete_packs` was what broke when the merge moved out of it.
+    # `.update()` is counted too: it is a write that no `Assign` check sees.
+    writes = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Subscript)
+                and getattr(t.value, "id", "") in ("entry", "found")
+                and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
+                for t in n.targets)
+    ] + [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "update"
+        and getattr(getattr(n.func, "value", None), "id", "") in ("entry", "found")
+        and any(k.arg == "checked_at" for k in n.keywords)
+    ]
+    assert len(writes) == 1, (
+        f"expected exactly one place that writes `checked_at`, found "
+        f"{len(writes)} at lines {sorted(n.lineno for n in writes)}. A second "
+        f"one can overwrite the in-lock stamp with a clock read from before it."
+    )
+    # Known limit, recorded rather than papered over: `__setitem__`,
+    # `setdefault`, and `|=` are writes this reader does not see. Enumerating
+    # write syntax is not a proof, and the behaviour gate is what closes it.
 
 def _write_cols(sql, pack_id, **cols):
     from sqlalchemy import text as _t
@@ -1954,6 +1940,26 @@ def test_every_registry_transition_happens_under_a_lock(sql, alice, monkeypatch)
     }, f"not every transition was exercised, so not every one was checked: {sorted(reached)}"
 
 
+_GATE_THRESHOLD = 600
+_MOVED = "skipped (row moved before the lock)"
+_UNKNOWN = "skipped (unknown age)"
+_RECENT = "skipped (too recent)"
+_UNVER = "skipped (unverifiable)"
+
+
+class _GraphThatCanFail(Graph):
+    """A graph store that is up, except for the one node named."""
+
+    def __init__(self):
+        super().__init__()
+        self.raise_for: set[str] = set()
+
+    def get_node(self, node_type, node_id):
+        if node_id in self.raise_for:
+            raise RuntimeError("probe cannot be answered for this one")
+        return super().get_node(node_type, node_id)
+
+
 def test_the_window_has_no_verdict_the_fixture_never_reaches():
     """Name every verdict the sweep can reach, so adding one is loud.
 
@@ -1994,10 +2000,6 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
         if isinstance(t, ast.Name)
     }
     fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    # every function that can put a string on `action` at this point. Named by
-    # role, not by a count, so a later extraction adds a name here and nothing else.
-    scopes = [fns[name] for name in ("repair_incomplete_packs", "_creating_row_verdict")
-              if name in fns]
 
     def written_values(node):
         out = []
@@ -2015,6 +2017,26 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
             out += [k.value for k in node.keywords if k.arg == "action"]
         return out
 
+    # The functions the sweep can reach, found by following its calls rather
+    # than by listing names: extraction moves verdicts between functions, and a
+    # hardcoded list would have to be edited in step with every move -- which is
+    # the failure this whole change is about. Reachability keeps the scope the
+    # SWEEP's, so `ensure_anchor` and the promote path stay out of it.
+    reachable, frontier = set(), ["repair_incomplete_packs"]
+    while frontier:
+        name = frontier.pop()
+        if name in reachable or name not in fns:
+            continue
+        reachable.add(name)
+        frontier += [
+            getattr(n.func, "id", "")
+            for n in ast.walk(fns[name]) if isinstance(n, ast.Call)
+        ]
+    scopes = [fns[n] for n in sorted(reachable)]
+    assert any(written_values(n) for f in scopes for n in ast.walk(f)), (
+        "no function the sweep reaches assigns a verdict; the reader is lost"
+    )
+
     verdicts, opaque = set(), []
     for scope in scopes:
         for node in ast.walk(scope):
@@ -2027,6 +2049,10 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
                     continue                                 # carrying, not deciding
                 elif isinstance(value, ast.Call) and getattr(value.func, "id", "") in fns:
                     continue                                 # delegating, not deciding
+                elif (isinstance(value, ast.Subscript)
+                      and getattr(value.value, "id", "") in ("entry", "found")
+                      and getattr(getattr(value, "slice", None), "value", None) == "action"):
+                    continue                                 # copying a verdict already counted
                 else:
                     opaque.append(ast.dump(value)[:80])
 
@@ -2035,6 +2061,27 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
         f"{opaque}. Either write the literal (or a module constant), or open "
         "the limit in the design instead of widening this reader."
     )
+    # Fragment B: the count above stays honest only while the verdict function
+    # is still on the path. Stop calling it and leave its assignments behind and
+    # the set is unchanged -- the test name survives while its meaning quietly
+    # goes. So name the callers by role: the window reaches a verdict once, and
+    # the only other caller is the dry run.
+    verdict_calls = [
+        (f.name, n) for f in scopes for n in ast.walk(f)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "id", "") == "_creating_row_verdict"
+    ]
+    callers = sorted({name for name, _ in verdict_calls})
+    assert callers == ["_repair_creating_row_under_lock", "repair_incomplete_packs"], (
+        f"`_creating_row_verdict` is called from {callers}. Plan and apply share "
+        f"a verdict because they share this call; a third caller, or a missing "
+        f"one, is that contract changing."
+    )
+    assert len(verdict_calls) == 2, (
+        f"expected one call from the window and one from the dry run, found "
+        f"{len(verdict_calls)} at lines {[n.lineno for _, n in verdict_calls]}"
+    )
+
     assert verdicts == {
         "promote",
         "demote",
@@ -2118,3 +2165,251 @@ class TestSweepPlanMatchesApplyForForks:
         assert apply_row["action"] == plan_row["action"]
         assert apply_row["applied"] is True
         assert get_pack(sql, pid)["status"] == PACK_STATUS_PARTIAL
+
+
+_WINDOW_FN_ALLOWED_GLOBALS = {
+    "_repair_creating_row_under_lock": {"_parse_updated_at", "_creating_row_verdict"},
+    "_creating_row_verdict": {"probe_anchor", "PROBE_PRESENT", "PROBE_ABSENT",
+                              "_UNVERIFIABLE"},
+}
+_DENIED_BUILTINS = {
+    "__import__", "eval", "exec", "globals", "locals", "vars", "compile",
+    "getattr", "setattr", "delattr", "open", "input", "breakpoint",
+}
+
+
+def test_the_window_cannot_name_a_pre_lock_value():
+    """Ask the compiler which names the window can resolve, and read the answer.
+
+    #227 spent nine rounds asking what the source LOOKS like and found 62 ways
+    past the question. This asks a different one. A module-level function can
+    reach a value through exactly three doors -- parameters, names bound in its
+    own body, and free variables -- and `symtable` enumerates all three from the
+    compiler's own analysis rather than from a pattern we thought of. The
+    pre-lock names are not on any list here; they are simply not reachable.
+
+    What this does NOT close, stated because three versions of it overclaimed:
+      - where a LOCAL binding got its value. `entry = sql.cached_entry` passes
+        every assertion here; the allowed handle's object graph is not limited.
+      - the clock. `now` arrives as a datetime instance and an instance carries
+        its class's constructors, so `now.now(now.tzinfo)` reads a fresh wall
+        clock while naming nothing new. Excluding `datetime` from the allow-list
+        does not close that axis and this no longer claims it does.
+      - which function object actually runs. See the sibling test below.
+    Those belong to the behaviour gate, which runs the sweep and reads results.
+    """
+    import ast
+    import builtins
+    import inspect
+    import symtable
+
+    from opencrab.pack import lifecycle
+
+    src = inspect.getsource(lifecycle)
+    tree = ast.parse(src)
+    table = symtable.symtable(src, "<gate>", "exec")
+    allowed_builtins = set(dir(builtins)) - _DENIED_BUILTINS
+
+    for name, allowed in _WINDOW_FN_ALLOWED_GLOBALS.items():
+        defs = [n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name]
+        assert len(defs) == 1, f"{name}: expected one top-level def, found {len(defs)}"
+        node = defs[0]
+
+        sym = next(c for c in table.get_children() if c.get_name() == name)
+        reached = set(sym.get_globals())
+        # children (comprehensions, lambdas) resolve their free names in this
+        # scope, so their globals count too. Their frees do not: those are this
+        # function's own locals, already enumerated.
+        stack = list(sym.get_children())
+        while stack:
+            child = stack.pop()
+            reached |= set(child.get_globals())
+            stack += child.get_children()
+        stray = reached - allowed - allowed_builtins
+        assert not stray, (
+            f"{name} can reach {sorted(stray)}, which is outside its allow-list. "
+            f"The window decides on what it was handed; a name it can resolve is "
+            f"a value it can reach for."
+        )
+        assert not set(sym.get_frees()), (
+            f"{name} closes over {sorted(sym.get_frees())} -- it must be a "
+            f"top-level function, or the caller's locals come back into scope"
+        )
+
+        imports = [n for n in ast.walk(node)
+                   if isinstance(n, (ast.Import, ast.ImportFrom))]
+        assert not imports, (
+            f"{name} imports inside its body at lines "
+            f"{[i.lineno for i in imports]}. A local import is not a global to "
+            f"`symtable`, so it walks straight past the enumeration above -- and "
+            f"re-importing per row also changes behaviour when a test swaps a "
+            f"module attribute mid-sweep."
+        )
+        dunders = [n for n in ast.walk(node)
+                   if isinstance(n, ast.Attribute) and n.attr.startswith("__")]
+        assert not dunders, (
+            f"{name} touches a dunder attribute at lines "
+            f"{[d.lineno for d in dunders]}; a tripwire, not a proof"
+        )
+        assert not node.decorator_list, (
+            f"{name} is decorated. A wrapper keeps the wrapped function's source "
+            f"and module, so the runtime check below cannot see it."
+        )
+
+
+def test_the_caller_reaches_the_window_with_no_way_around_it():
+    """The window is not optional, and nothing runs between the lock and it.
+
+    The scope gate above governs what happens INSIDE the window function. This
+    is the other half: a caller that skips the window, or returns before it,
+    gets the same outcome as a window that read the wrong row.
+
+    Shape check, and labelled as one. It does not read what `snapshot=` and
+    `now=` are given -- an argument expression that computes its way back to the
+    scanned row passes this and is caught by the behaviour gate instead.
+    """
+    import ast
+    import inspect
+
+    from opencrab.pack import lifecycle
+
+    tree = ast.parse(inspect.getsource(lifecycle))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs")
+    window = next(n for n in ast.walk(fn) if isinstance(n, ast.With)
+                  and any(getattr(i.optional_vars, "id", "") == "_row_lock"
+                          for i in n.items))
+    apply_if = next(st for st in window.body
+                    if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply")
+
+    def direct_calls(name):
+        return [st for st in apply_if.body
+                if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == name
+                       for n in ast.walk(st))]
+
+    calls = direct_calls("_repair_creating_row_under_lock")
+    assert len(calls) == 1, (
+        f"expected exactly one direct call to the window function in the "
+        f"`if apply:` body, found {len(calls)}. Nested under a condition, some "
+        f"path through the window skips the re-read entirely."
+    )
+    at = apply_if.body.index(calls[0])
+    escapes = [n for st in apply_if.body[:at] for n in ast.walk(st)
+               if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
+    assert not escapes, (
+        f"something can leave the window before the row is judged, at lines "
+        f"{sorted(n.lineno for n in escapes)}"
+    )
+    locks = [st for st in apply_if.body[:at]
+             if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "write_lock"
+                    for n in ast.walk(st))]
+    assert len(locks) == 1, (
+        "the lock is not taken exactly once before the window function runs"
+    )
+
+
+def test_the_window_function_that_runs_is_the_one_that_was_checked():
+    """The static checks read source; this reads the object that will be called.
+
+    Known limit, and the reason this is a regression net rather than a proof:
+    a `global` rebinding inside some function body, installing a clone that
+    reuses the same code object with a poisoned `__globals__`, passes every
+    check here. That was measured, not imagined. Rebinding at module top level,
+    and decoration, are what this catches; the rest belongs to the behaviour
+    gate, which sees the wrong answer come out.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from opencrab.pack import lifecycle
+
+    tree = ast.parse(inspect.getsource(lifecycle))
+
+    def module_level_bindings(name):
+        found = 0
+        def walk(node):
+            nonlocal found
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found += node.name == name
+                return
+            if isinstance(node, ast.Assign):
+                found += any(isinstance(t, ast.Name) and t.id == name
+                             for t in node.targets)
+            for field in ("body", "orelse", "finalbody"):
+                for child in getattr(node, field, []) or []:
+                    if isinstance(child, ast.stmt):
+                        walk(child)
+            for h in getattr(node, "handlers", []) or []:
+                for child in h.body:
+                    walk(child)
+        for node in tree.body:
+            walk(node)
+        return found
+
+    for name in _WINDOW_FN_ALLOWED_GLOBALS:
+        assert module_level_bindings(name) == 1, (
+            f"{name} is bound more than once at module level; the definition "
+            f"this test reads is not what the caller would get"
+        )
+        obj = getattr(lifecycle, name)
+        runtime = ast.parse(textwrap.dedent(inspect.getsource(obj))).body[0]
+        static = next(n for n in tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+        assert ast.dump(runtime) == ast.dump(static), (
+            f"{name} at runtime does not match the definition in the source"
+        )
+        assert obj.__module__ == lifecycle.__name__, (
+            f"{name} was injected from {obj.__module__}"
+        )
+
+
+def test_the_in_lock_age_gate_holds_at_the_exact_threshold():
+    """Pin the in-lock age comparison at its boundary, to the microsecond.
+
+    #227 could not kill a mutant that shaved the threshold by half a second:
+    the gate ran on a real clock, so the window where the two versions disagree
+    was never reached by any fixture. Handing the clock in makes the comparison
+    pure arithmetic, and two points a microsecond apart decide it -- any
+    additive distortion that can change a verdict moves one of them.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from opencrab.pack import lifecycle
+
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    threshold = 600
+
+    class _SqlThatMustNotBeTouched:
+        def __getattr__(self, attr):
+            raise AssertionError(
+                f"the age gate reached the registry ({attr}); it returns before "
+                f"any write, so touching sql here means a gate moved"
+            )
+
+    def verdict(age):
+        return lifecycle._repair_creating_row_under_lock(
+            _SqlThatMustNotBeTouched(), None, None, None,
+            pack_id="p",
+            snapshot={
+                "pack_id": "p", "owner_id": "alice", "status": "creating",
+                "updated_at": (now - timedelta(seconds=age)).isoformat(),
+            },
+            now=now,
+            older_than_seconds=threshold,
+            mark_pack_ready=lambda *a, **k: True,
+            mark_pack_partial=lambda *a, **k: True,
+            status_creating="creating",
+            status_partial="partial",
+            status_ready="ready",
+        )["action"]
+
+    just_under = threshold - 1e-6
+    assert verdict(just_under) == "skipped (too recent)", (
+        "a row one microsecond short of the threshold was not held back"
+    )
+    assert verdict(threshold) != "skipped (too recent)", (
+        "a row exactly at the threshold was held back; the comparison is `<`, "
+        "and moving it to `<=` shifts every verdict at the boundary"
+    )
