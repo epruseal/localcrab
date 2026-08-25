@@ -25,6 +25,7 @@ private doubles without silently changing what these tests assert.
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 from unittest.mock import MagicMock, patch
@@ -1470,133 +1471,119 @@ def test_no_path_returns_before_the_row_is_recorded():
         f"here was asked about."
     )
 
-    def stamps(node):
-        return [
-            n for n in ast.walk(node)
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Subscript)
-                    and getattr(t.value, "id", "") == "entry"
-                    and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
-                    for t in n.targets)
-        ]
-
-    all_stamps = stamps(fn)
-    assert len(all_stamps) == 1, (
-        f"expected exactly one `entry['checked_at']` assignment in the "
-        f"function, found {len(all_stamps)} at lines "
-        f"{[a.lineno for a in all_stamps]}. A second one can overwrite the "
-        f"first with a clock read somewhere else."
-    )
-    stamp = all_stamps[0]
-
-    # The stamp has to be a DIRECT statement of the window's `if apply:` body.
-    # Asking instead whether some exit precedes it was the shape three earlier
-    # versions used, and it misses the case with no exit at all: nest the
-    # stamp under any condition and the paths where that condition is false
-    # simply skip it.
-    apply_if = next(
-        (st for st in window.body
-         if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply"),
-        None,
-    )
-    assert apply_if is not None, "the row window no longer opens with `if apply:`"
-    assert not apply_if.orelse, (
-        "`if apply:` grew an else branch -- re-derive this check before "
-        "silencing it"
-    )
-    try:
-        stamp_at = apply_if.body.index(stamp)
-    except ValueError:
-        raise AssertionError(
-            f"the stamp at line {stamp.lineno} is not a direct statement of the "
-            f"window's `if apply:` body. Nesting it under a condition means "
-            f"some path through the window skips recording the row."
-        ) from None
-
-    for st in apply_if.body[:stamp_at]:
-        bad = [
-            n for n in ast.walk(st)
-            if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise, ast.Assert))
-        ]
-        assert not bad, (
-            f"a path exits the row window at line(s) {[b.lineno for b in bad]} "
-            f"before the row is stamped. Record when the row was read before "
-            f"any branch can report on it."
-        )
-
-    names = {n.id for n in ast.walk(stamp.value) if isinstance(n, ast.Name)}
-    assert "scan_started_at" not in names, (
-        "the row is stamped with the pre-lock clock, which is the defect the "
-        "stamp exists to prevent"
-    )
-    assert "now_locked" in names, (
-        f"expected the in-window clock in the stamp, got {names}"
-    )
-
-    # ...and that name has to be a clock read here, not an alias for the
-    # pre-lock one. Checking the stamp expression alone let
-    # `now_locked = scan_started_at` through.
-    binds = [
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "now_locked" for t in n.targets)
+    # The stamp moved into the window function when the window became one.
+    # It is still the same property: no path reaches a verdict before the row
+    # has a time on it. What changed is that the property is now readable in one
+    # place instead of across a 200-line loop body.
+    window_fns = [
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_repair_creating_row_under_lock"
     ]
-    assert binds, "`now_locked` is never assigned"
-    for b in binds:
-        bn = {n.id for n in ast.walk(b.value) if isinstance(n, ast.Name)}
-        assert "scan_started_at" not in bn, (
-            f"`now_locked` at line {b.lineno} derives from the pre-lock clock"
-        )
-        assert (isinstance(b.value, ast.Call)
-                and getattr(b.value.func, "attr", "") == "now"), (
-            f"`now_locked` at line {b.lineno} is not a fresh clock read"
-        )
+    assert len(window_fns) == 1, (
+        f"expected exactly one `_repair_creating_row_under_lock`, found "
+        f"{len(window_fns)}; a second definition shadows the one this reads"
+    )
+    window_fn = window_fns[0]
 
+    body = [st for st in window_fn.body if not (
+        isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    first = body[0]
+    assert (isinstance(first, ast.AnnAssign) or isinstance(first, ast.Assign)), (
+        "the window function no longer opens with an assignment; the first "
+        "statement is what puts a time on the row"
+    )
+    target = first.target if isinstance(first, ast.AnnAssign) else first.targets[0]
+    assert getattr(target, "id", "") == "found", (
+        "the window function's first statement no longer builds `found`"
+    )
+    assert isinstance(first.value, ast.Dict) and any(
+        isinstance(k, ast.Constant) and k.value == "checked_at" for k in first.value.keys
+    ), "the first statement no longer stamps `checked_at`"
+    assert any(
+        isinstance(n, ast.Name) and n.id == "now" for n in ast.walk(first.value)
+    ), "the stamp no longer reads the clock it was handed"
 
-# ---------------------------------------------------------------------------
-# The gate that carries the rule (#223/#224).
-#
-# Eight defects on `repair_incomplete_packs` had one shape: a value obtained
-# before the lock, used inside it. Four of the eight were introduced by the
-# fix for the previous one. Nine rounds of adversarial review produced 62 ways
-# past the checks written for it, and the family moved outward one layer each
-# time -- what the row REPORTED, then what the decision COMPUTED, then which
-# BRANCH it took, then which ROW it read, then what the WRITE was given, then
-# which of the three write sites, then WHEN the write happened.
-#
-# Asking the source what shape it has could not keep up: there is always
-# another way to write the same defect. Asking a real pass what it DID can,
-# because the fixture plants facts that only become true while the lock is
-# held. Code that reads a pre-lock value takes a different branch, or hands
-# the registry an owner it will not match. Values can be forged; branches and
-# the registry's final state cannot.
-# ---------------------------------------------------------------------------
+    # Second statement adopts the re-read row's identity, with no gate between.
+    # Adoption after a gate is defect 3 of the eight, and scope does not stop it
+    # -- only the order does, so the order is what this reads.
+    second = body[1]
+    assert isinstance(second, ast.If) and any(
+        isinstance(n, ast.Name) and n.id == "snapshot" for n in ast.walk(second.test)
+    ), (
+        "the second statement is no longer the snapshot adoption; a gate placed "
+        "between the stamp and the adoption is how a row gets judged before its "
+        "identity is refreshed"
+    )
 
-# Large enough that a PROPORTIONAL distortion of the age threshold exceeds the
-# fixture's 0.75s pinch and changes a verdict. An additive distortion smaller
-# than the pinch still does not -- that is recorded as a limit rather than
-# chased with a sub-second fixture whose result would depend on how fast the
-# machine is.
-_GATE_THRESHOLD = 600
+    clock_reads_in_window_fn = [
+        n for n in ast.walk(window_fn)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "now"
+        and getattr(getattr(n.func, "value", None), "id", "") == "datetime"
+    ]
+    assert not clock_reads_in_window_fn, (
+        f"the window function reads a clock at lines "
+        f"{[c.lineno for c in clock_reads_in_window_fn]}. It is handed one; "
+        f"reading another is how the in-lock age gate stops agreeing with the "
+        f"time the row was stamped with."
+    )
 
-_MOVED = "skipped (row moved before the lock)"
-_UNKNOWN = "skipped (unknown age)"
-_RECENT = "skipped (too recent)"
-_UNVER = "skipped (unverifiable)"
+    # The caller's side. The pre-lock names must not appear anywhere under the
+    # window -- including in the argument expressions, which is where the
+    # distortion moves once it cannot live inside.
+    # `scan_started_at` only. `scanned_row` still appears here, in the dry-run
+    # branch, and legitimately: a dry run takes no lock and so has nothing
+    # fresher than the row it scanned. That is the definition of a dry run, not
+    # a stale read. The apply path cannot reach it -- the window function has no
+    # such name in scope, which is what this whole change bought.
+    stale = [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Name) and n.id == "scan_started_at"
+    ]
+    assert not stale, (
+        f"the row window reaches a pre-lock name at lines "
+        f"{sorted({n.lineno for n in stale})}. That is the whole shape this "
+        f"refactor removed; passing it as an argument is the same defect with "
+        f"a longer path."
+    )
 
+    window_clock = [
+        n for n in ast.walk(window)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "now"
+        and getattr(getattr(n.func, "value", None), "id", "") == "datetime"
+    ]
+    assert len(window_clock) == 1, (
+        f"expected exactly one clock read in the row window, found "
+        f"{len(window_clock)} at lines {[c.lineno for c in window_clock]}. Two "
+        f"clocks means the row can be judged by one and reported with another."
+    )
 
-class _GraphThatCanFail(Graph):
-    """A graph store that is up, except for the one node named."""
-
-    def __init__(self):
-        super().__init__()
-        self.raise_for: set[str] = set()
-
-    def get_node(self, node_type, node_id):
-        if node_id in self.raise_for:
-            raise RuntimeError("probe cannot be answered for this one")
-        return super().get_node(node_type, node_id)
-
+    # `checked_at` is written once in the whole module. Counting inside
+    # `repair_incomplete_packs` was what broke when the merge moved out of it.
+    # `.update()` is counted too: it is a write that no `Assign` check sees.
+    writes = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Subscript)
+                and getattr(t.value, "id", "") in ("entry", "found")
+                and getattr(getattr(t, "slice", None), "value", None) == "checked_at"
+                for t in n.targets)
+    ] + [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", "") == "update"
+        and getattr(getattr(n.func, "value", None), "id", "") in ("entry", "found")
+        and any(k.arg == "checked_at" for k in n.keywords)
+    ]
+    assert len(writes) == 1, (
+        f"expected exactly one place that writes `checked_at`, found "
+        f"{len(writes)} at lines {sorted(n.lineno for n in writes)}. A second "
+        f"one can overwrite the in-lock stamp with a clock read from before it."
+    )
+    # Known limit, recorded rather than papered over: `__setitem__`,
+    # `setdefault`, and `|=` are writes this reader does not see. Enumerating
+    # write syntax is not a proof, and the behaviour gate is what closes it.
 
 def _write_cols(sql, pack_id, **cols):
     from sqlalchemy import text as _t
@@ -1954,14 +1941,49 @@ def test_every_registry_transition_happens_under_a_lock(sql, alice, monkeypatch)
     }, f"not every transition was exercised, so not every one was checked: {sorted(reached)}"
 
 
-def test_the_window_has_no_verdict_the_fixture_never_reaches():
-    """Count the verdicts the row window can produce, so adding one is loud.
+_GATE_THRESHOLD = 600
+_MOVED = "skipped (row moved before the lock)"
+_UNKNOWN = "skipped (unknown age)"
+_RECENT = "skipped (too recent)"
+_UNVER = "skipped (unverifiable)"
 
-    The gate above is only as complete as its fixture. This does not enforce
-    that -- three measured ways past it: widening an existing branch's
-    condition keeps the count, writing through an alias is not seen, and code
-    outside the window is out of scope (the structural check counts the lock
-    sites for that). It is a tripwire, and its job is to make someone look.
+
+class _GraphThatCanFail(Graph):
+    """A graph store that is up, except for the one node named."""
+
+    def __init__(self):
+        super().__init__()
+        self.raise_for: set[str] = set()
+
+    def get_node(self, node_type, node_id):
+        if node_id in self.raise_for:
+            raise RuntimeError("probe cannot be answered for this one")
+        return super().get_node(node_type, node_id)
+
+
+def test_the_window_has_no_verdict_the_fixture_never_reaches():
+    """Name every verdict the sweep can reach, so adding one is loud.
+
+    This used to count assignment sites, and counting broke the moment the
+    verdict moved into its own function: extraction adds a copy site and turns
+    a direct write into an indirection, so a correct refactor read as a changed
+    count. What the gate actually cares about is which verdicts exist, and that
+    set does not move when code does.
+
+    A module-level string constant is followed one hop, because pulling a
+    literal into a constant is the ordinary way to make two callers agree on it
+    and must not read as a vanished verdict. One hop only -- two hops is
+    constant propagation, which is not this gate's job. The shapes that hop
+    cannot follow (a constant handed to another constant, a local alias, a
+    conditional expression) are recorded as a known limit: the code here does
+    not use them, and if it ever needs to, open the limit rather than bend the
+    gate around it.
+
+    Still a tripwire, not a proof. Widening an existing branch's condition keeps
+    the set, and so does swapping two verdicts between branches; whether a
+    verdict is reached by the RIGHT row is what
+    `test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read`
+    answers by running the sweep.
     """
     import ast
     import inspect
@@ -1969,37 +1991,112 @@ def test_the_window_has_no_verdict_the_fixture_never_reaches():
     from opencrab.pack import lifecycle
 
     tree = ast.parse(inspect.getsource(lifecycle))
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs"
-    )
-    window = next(
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.With)
-        and any(getattr(i.optional_vars, "id", "") == "_row_lock" for i in n.items)
-    )
-
-    sites = [
-        n for n in ast.walk(window)
+    consts = {
+        t.id: n.value.value
+        for n in tree.body
         if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Subscript)
-                and getattr(t.value, "id", "") == "entry"
-                and getattr(getattr(t, "slice", None), "value", None) == "action"
-                for t in n.targets)
-    ] + [
-        n for n in ast.walk(window)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "attr", "") == "update"
-        and getattr(getattr(n.func, "value", None), "id", "") == "entry"
-        and any(k.arg == "action" for k in n.keywords)
-    ]
-    assert len(sites) == 7, (
-        f"the row window sets `entry['action']` in {len(sites)} places, not 7. "
-        f"If a verdict was added, add a row to "
-        f"`test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read` "
-        f"that reaches it, then update this count."
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def written_values(node):
+        out = []
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if (isinstance(t, ast.Subscript)
+                        and getattr(t.value, "id", "") in ("entry", "found")
+                        and getattr(getattr(t, "slice", None), "value", None) == "action"):
+                    out.append(node.value)
+                if isinstance(t, ast.Name) and t.id == "action":
+                    out.append(node.value)
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "update"
+                and getattr(getattr(node.func, "value", None), "id", "") in ("entry", "found")):
+            out += [k.value for k in node.keywords if k.arg == "action"]
+        return out
+
+    # The functions the sweep can reach, found by following its calls rather
+    # than by listing names: extraction moves verdicts between functions, and a
+    # hardcoded list would have to be edited in step with every move -- which is
+    # the failure this whole change is about. Reachability keeps the scope the
+    # SWEEP's, so `ensure_anchor` and the promote path stay out of it.
+    reachable, frontier = set(), ["repair_incomplete_packs"]
+    while frontier:
+        name = frontier.pop()
+        if name in reachable or name not in fns:
+            continue
+        reachable.add(name)
+        frontier += [
+            getattr(n.func, "id", "")
+            for n in ast.walk(fns[name]) if isinstance(n, ast.Call)
+        ]
+    scopes = [fns[n] for n in sorted(reachable)]
+    assert any(written_values(n) for f in scopes for n in ast.walk(f)), (
+        "no function the sweep reaches assigns a verdict; the reader is lost"
     )
 
+    verdicts, opaque = set(), []
+    for scope in scopes:
+        for node in ast.walk(scope):
+            for value in written_values(node):
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    verdicts.add(value.value)
+                elif isinstance(value, ast.Name) and value.id in consts:
+                    verdicts.add(consts[value.id])          # one hop
+                elif isinstance(value, ast.Name) and value.id == "action":
+                    continue                                 # carrying, not deciding
+                elif isinstance(value, ast.Call) and getattr(value.func, "id", "") in fns:
+                    continue                                 # delegating, not deciding
+                elif (isinstance(value, ast.Subscript)
+                      and getattr(value.value, "id", "") in ("entry", "found")
+                      and getattr(getattr(value, "slice", None), "value", None) == "action"):
+                    continue                                 # copying a verdict already counted
+                else:
+                    opaque.append(ast.dump(value)[:80])
+
+    assert not opaque, (
+        "a verdict is written from something this gate cannot read: "
+        f"{opaque}. Either write the literal (or a module constant), or open "
+        "the limit in the design instead of widening this reader."
+    )
+    # Fragment B: the count above stays honest only while the verdict function
+    # is still on the path. Stop calling it and leave its assignments behind and
+    # the set is unchanged -- the test name survives while its meaning quietly
+    # goes. So name the callers by role: the window reaches a verdict once, and
+    # the only other caller is the dry run.
+    verdict_calls = [
+        (f.name, n) for f in scopes for n in ast.walk(f)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "id", "") == "_creating_row_verdict"
+    ]
+    callers = sorted({name for name, _ in verdict_calls})
+    assert callers == ["_repair_creating_row_under_lock", "repair_incomplete_packs"], (
+        f"`_creating_row_verdict` is called from {callers}. Plan and apply share "
+        f"a verdict because they share this call; a third caller, or a missing "
+        f"one, is that contract changing."
+    )
+    assert len(verdict_calls) == 2, (
+        f"expected one call from the window and one from the dry run, found "
+        f"{len(verdict_calls)} at lines {[n.lineno for _, n in verdict_calls]}"
+    )
+
+    assert verdicts == {
+        "promote",
+        "demote",
+        "skipped (unknown age)",
+        "skipped (too recent)",
+        "skipped (row moved before the lock)",
+        "skipped (unverifiable)",
+        "report only (no automatic remediation)",
+    }, (
+        f"the sweep can now reach these verdicts: {sorted(verdicts)}. "
+        f"If one was added, add a row to "
+        f"`test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read` "
+        f"that reaches it, then name it here."
+    )
 
 def test_promote_says_why_when_there_is_no_such_pack(sql, alice):
     """Every other rejection carries a reason; this one used to carry none.
@@ -2069,3 +2166,588 @@ class TestSweepPlanMatchesApplyForForks:
         assert apply_row["action"] == plan_row["action"]
         assert apply_row["applied"] is True
         assert get_pack(sql, pid)["status"] == PACK_STATUS_PARTIAL
+
+
+_WINDOW_FN_ALLOWED_GLOBALS = {
+    "_repair_creating_row_under_lock": {"_parse_updated_at", "_creating_row_verdict"},
+    "_creating_row_verdict": {"probe_anchor", "PROBE_PRESENT", "PROBE_ABSENT",
+                              "_UNVERIFIABLE"},
+    # The merge reads no globals at all: everything it touches arrives as an
+    # argument. That empty set is the claim -- the reporting scope has no name
+    # for the scanned row, the scan clock, or the results list.
+    "_merge_window_findings": set(),
+}
+_DENIED_BUILTINS = {
+    "__import__", "eval", "exec", "globals", "locals", "vars", "compile",
+    "getattr", "setattr", "delattr", "open", "input", "breakpoint",
+}
+# The parameter list of each window function: (positional, keyword-only), pinned
+# by name and order. Counting free variables does not close the axis this issue
+# exists to close: a pre-lock value handed in as a NEW PARAMETER has no free
+# variable and no global, so every other assertion here waves it through --
+# measured, not imagined, and the whole point of the refactor is that the
+# parameter list IS the threat surface. Pinning it means widening that surface
+# is a deliberate edit to this line, not a side effect of one.
+#
+# Annotations are deliberately NOT pinned. This module uses `from __future__
+# import annotations`, so an annotation is never evaluated and cannot carry a
+# value -- pinning it would buy nothing and would red the gate on a type-hint
+# cleanup. Pinning `ast.unparse` output would also tie the gate to one
+# interpreter's formatting, and the supported range is wider than the one this
+# was written on.
+#
+# Defaults are the opposite case and are handled by an assertion of their own: a
+# default IS evaluated, in module scope at def time, so it is a real way for a
+# value to ride in. The rule is stronger than pinning today's defaults -- there
+# may be none at all, so every argument must come from the caller.
+_WINDOW_FN_PARAMS = {
+    "_repair_creating_row_under_lock": (
+        ("sql", "graph", "docs", "vector"),
+        ("pack_id", "snapshot", "now", "older_than_seconds", "mark_pack_ready",
+         "mark_pack_partial", "status_creating", "status_partial", "status_ready"),
+    ),
+    "_creating_row_verdict": (
+        ("graph", "docs", "vector"),
+        ("pack_id", "row", "found"),
+    ),
+    "_merge_window_findings": (
+        ("entry", "counts", "found"),
+        ("scanned_status",),
+    ),
+}
+# Two declarations that must name the same functions. Adding a window function
+# to one and forgetting the other is the shape of mistake this span has made
+# repeatedly -- a derived list restated by hand and then left behind.
+assert set(_WINDOW_FN_PARAMS) == set(_WINDOW_FN_ALLOWED_GLOBALS)
+
+
+def test_the_window_cannot_name_a_pre_lock_value():
+    """Ask the compiler which names the window can resolve, and read the answer.
+
+    #227 spent nine rounds asking what the source LOOKS like and found 62 ways
+    past the question. This asks a different one. A module-level function can
+    reach a value through exactly three doors -- parameters, names bound in its
+    own body, and free variables -- and `symtable` enumerates all three from the
+    compiler's own analysis rather than from a pattern we thought of. The
+    pre-lock names are not on any list here; they are simply not reachable.
+
+    What this does NOT close, stated because three versions of it overclaimed:
+      - where a LOCAL binding got its value. `entry = sql.cached_entry` passes
+        every assertion here; the allowed handle's object graph is not limited.
+      - the clock. `now` arrives as a datetime instance and an instance carries
+        its class's constructors, so `now.now(now.tzinfo)` reads a fresh wall
+        clock while naming nothing new. Excluding `datetime` from the allow-list
+        does not close that axis and this no longer claims it does.
+      - which function object actually runs. See the sibling test below.
+    Those belong to the behaviour gate, which runs the sweep and reads results.
+    """
+    import ast
+    import builtins
+    import inspect
+    import symtable
+
+    from opencrab.pack import lifecycle
+
+    src = inspect.getsource(lifecycle)
+    tree = ast.parse(src)
+    table = symtable.symtable(src, "<gate>", "exec")
+    allowed_builtins = set(dir(builtins)) - _DENIED_BUILTINS
+
+    for name, allowed in _WINDOW_FN_ALLOWED_GLOBALS.items():
+        defs = [n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name]
+        assert len(defs) == 1, f"{name}: expected one top-level def, found {len(defs)}"
+        node = defs[0]
+
+        sym = next(c for c in table.get_children() if c.get_name() == name)
+        reached = set(sym.get_globals())
+        # children (comprehensions, lambdas) resolve their free names in this
+        # scope, so their globals count too. Their frees do not: those are this
+        # function's own locals, already enumerated.
+        stack = list(sym.get_children())
+        while stack:
+            child = stack.pop()
+            reached |= set(child.get_globals())
+            stack += child.get_children()
+        stray = reached - allowed - allowed_builtins
+        assert not stray, (
+            f"{name} can reach {sorted(stray)}, which is outside its allow-list. "
+            f"The window decides on what it was handed; a name it can resolve is "
+            f"a value it can reach for."
+        )
+        assert not set(sym.get_frees()), (
+            f"{name} closes over {sorted(sym.get_frees())} -- it must be a "
+            f"top-level function, or the caller's locals come back into scope"
+        )
+
+        imports = [n for n in ast.walk(node)
+                   if isinstance(n, (ast.Import, ast.ImportFrom))]
+        assert not imports, (
+            f"{name} imports inside its body at lines "
+            f"{[i.lineno for i in imports]}. A local import is not a global to "
+            f"`symtable`, so it walks straight past the enumeration above -- and "
+            f"re-importing per row also changes behaviour when a test swaps a "
+            f"module attribute mid-sweep."
+        )
+        dunders = [n for n in ast.walk(node)
+                   if isinstance(n, ast.Attribute) and n.attr.startswith("__")]
+        assert not dunders, (
+            f"{name} touches a dunder attribute at lines "
+            f"{[d.lineno for d in dunders]}; a tripwire, not a proof"
+        )
+        assert not node.decorator_list, (
+            f"{name} is decorated. A wrapper keeps the wrapped function's source "
+            f"and module, so the runtime check below cannot see it."
+        )
+        args = node.args
+        actual = (tuple(a.arg for a in args.posonlyargs + args.args),
+                  tuple(a.arg for a in args.kwonlyargs))
+        assert not args.vararg and not args.kwarg, (
+            f"{name} takes *args/**kwargs. A variadic parameter is a parameter "
+            f"list that cannot be pinned, so the threat surface stops being "
+            f"enumerable."
+        )
+        assert not args.defaults and not any(args.kw_defaults), (
+            f"{name} has a parameter with a default. A default is evaluated in "
+            f"module scope when the `def` runs, so it can carry a value this "
+            f"function's own scope analysis never sees -- and nothing has to "
+            f"pass it for that value to arrive."
+        )
+        assert actual == _WINDOW_FN_PARAMS[name], (
+            f"{name} does not take the parameters it is pinned to.\n"
+            f"  pinned: {_WINDOW_FN_PARAMS[name]}\n"
+            f"  actual: {actual}\n"
+            f"Everything else here asks what the function can REACH FOR. A "
+            f"parameter is not reached for -- it is handed in, so it has no "
+            f"global and no free variable and passes every other assertion "
+            f"above. That makes `def {name}(..., scanned_row)` the cheapest way "
+            f"back to the defect this refactor removes, which is why the list "
+            f"is pinned rather than merely bounded. Widening it is allowed; "
+            f"doing it here, on purpose, is the price."
+        )
+
+
+_GUARDED_STMT_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
+def _unconditionally_evaluated(node):
+    """Sub-nodes evaluated every time `node` is reached.
+
+    `ast.walk` answers "is this call written somewhere inside", which is a
+    different question from "does reaching this statement run the call". A call
+    under an `if`, in a `try` body, in a ternary branch, after `and`, or inside a
+    comprehension or lambda is contained but not performed. The gate below claims
+    the apply path cannot reach its end without locking, judging and reporting --
+    a claim about execution -- and measured it with containment, so wrapping any
+    of the three in a condition left the gate green (codex review, PR #234).
+
+    Conservative on purpose: `finally` bodies do always run once the `try` is
+    entered, and a call in one is not counted here. The three statements this
+    guards are flat, so the conservative reading costs nothing today and refuses
+    to guess tomorrow.
+    """
+    yield node
+    if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp)):
+        return                                  # deferred, or per element
+    if isinstance(node, ast.IfExp):
+        yield from _unconditionally_evaluated(node.test)
+        return                                  # both branches are conditional
+    if isinstance(node, ast.BoolOp):
+        yield from _unconditionally_evaluated(node.values[0])
+        return                                  # the rest short-circuits
+    if isinstance(node, ast.stmt):
+        for field, value in ast.iter_fields(node):
+            if field in _GUARDED_STMT_FIELDS:
+                continue                        # another statement's turn to run
+            for child in (value if isinstance(value, list) else [value]):
+                if isinstance(child, ast.AST):
+                    yield from _unconditionally_evaluated(child)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _unconditionally_evaluated(child)
+
+
+def test_the_caller_reaches_the_window_with_no_way_around_it():
+    """The window is not optional, and nothing runs between the lock and it.
+
+    The scope gate above governs what happens INSIDE the window function. This
+    is the other half: a caller that skips the window, or returns before it,
+    gets the same outcome as a window that read the wrong row.
+
+    Shape check, and labelled as one. It does not read what `snapshot=` and
+    `now=` are given -- an argument expression that computes its way back to the
+    scanned row passes this and is caught by the behaviour gate instead.
+    """
+    import ast
+    import inspect
+
+    from opencrab.pack import lifecycle
+
+    tree = ast.parse(inspect.getsource(lifecycle))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "repair_incomplete_packs")
+    window = next(n for n in ast.walk(fn) if isinstance(n, ast.With)
+                  and any(getattr(i.optional_vars, "id", "") == "_row_lock"
+                          for i in n.items))
+    apply_if = next(st for st in window.body
+                    if isinstance(st, ast.If) and getattr(st.test, "id", "") == "apply")
+
+    def _calls(node, name):
+        return [n for n in ast.walk(node)
+                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == name]
+
+    def direct_calls(name):
+        """Statements that RUN the call, not merely contain it."""
+        return [st for st in apply_if.body
+                if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == name
+                       for n in _unconditionally_evaluated(st))]
+
+    def guarded_calls(name):
+        """Occurrences a path can get past: the gap `ast.walk` alone reads as direct."""
+        out = []
+        for st in apply_if.body:
+            runs = {id(n) for n in _unconditionally_evaluated(st)}
+            out += [n for n in _calls(st, name) if id(n) not in runs]
+        return out
+
+    def assert_runs_exactly_once(name, role):
+        guarded = guarded_calls(name)
+        assert not guarded, (
+            f"`{name}` is written in the `if apply:` body but a path gets past "
+            f"it, at lines {sorted(n.lineno for n in guarded)}. {role} "
+            f"Conditioning it is how the apply path keeps this gate green while "
+            f"skipping the step entirely."
+        )
+        runs = direct_calls(name)
+        assert len(runs) == 1, (
+            f"expected `{name}` to run exactly once in the `if apply:` body, "
+            f"found {len(runs)}. {role}"
+        )
+        return runs
+
+    calls = assert_runs_exactly_once(
+        "_repair_creating_row_under_lock",
+        "Every applied row is judged on what the lock re-read.",
+    )
+    at = apply_if.body.index(calls[0])
+    escapes = [n for st in apply_if.body[:at] for n in ast.walk(st)
+               if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
+    assert not escapes, (
+        f"something can leave the window before the row is judged, at lines "
+        f"{sorted(n.lineno for n in escapes)}"
+    )
+    guarded_locks = [n for st in apply_if.body[:at]
+                     for n in _calls(st, "write_lock")
+                     if id(n) not in {id(x) for x in _unconditionally_evaluated(st)}]
+    assert not guarded_locks, (
+        f"the lock is taken under a condition, at lines "
+        f"{sorted(n.lineno for n in guarded_locks)} -- so there is a path that "
+        f"reaches the window function without holding it."
+    )
+    locks = [st for st in apply_if.body[:at]
+             if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "write_lock"
+                    for n in _unconditionally_evaluated(st))]
+    assert len(locks) == 1, (
+        "the lock is not taken exactly once before the window function runs"
+    )
+
+    # Fragment B, added when the merge became a function of its own. Same
+    # property on the other side of the window: the report is not optional
+    # either, and nothing may return between the verdict and the recording of
+    # it. Kept in this test rather than a new one so the id count does not move
+    # a second time.
+    merges = assert_runs_exactly_once(
+        "_merge_window_findings",
+        "Every judged row is reported and counted.",
+    )
+    merge_at = apply_if.body.index(merges[0])
+    assert merge_at > at, "the merge runs before the window it is merging"
+    between = [n for st in apply_if.body[at + 1:merge_at] for n in ast.walk(st)
+               if isinstance(n, (ast.Continue, ast.Return, ast.Break, ast.Raise))]
+    assert not between, (
+        f"something can leave between the verdict and the report, at lines "
+        f"{sorted(n.lineno for n in between)}"
+    )
+
+
+def test_the_window_function_that_runs_is_the_one_that_was_checked():
+    """The static checks read source; this reads the object that will be called.
+
+    Known limit, and the reason this is a regression net rather than a proof:
+    a `global` rebinding inside some function body, installing a clone that
+    reuses the same code object with a poisoned `__globals__`, passes every
+    check here. That was measured, not imagined. Rebinding at module top level,
+    and decoration, are what this catches; the rest belongs to the behaviour
+    gate, which sees the wrong answer come out.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from _bound_names import bound_name_counts
+
+    from opencrab.pack import lifecycle
+
+    src = inspect.getsource(lifecycle)
+    tree = ast.parse(src)
+
+    # The count comes from the shared collector, not from a walk written here.
+    # This test carried its own for one round and it disagreed with the shared
+    # one: a tuple rebinding (`_repair_creating_row_under_lock, x = shadow, 1`)
+    # counted once instead of twice, which is exactly a shadowed window
+    # function reported as clean. Every private copy of this walk has drifted
+    # the same way, so there is one and its adversarial cases live beside it.
+    counts = bound_name_counts(src)
+
+    for name in _WINDOW_FN_ALLOWED_GLOBALS:
+        assert counts.get(name) == 1, (
+            f"{name} is bound {counts.get(name)} times at module level, not "
+            f"once; the definition this test reads is not what the caller "
+            f"would get"
+        )
+        obj = getattr(lifecycle, name)
+        runtime = ast.parse(textwrap.dedent(inspect.getsource(obj))).body[0]
+        static = next(n for n in tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+        assert ast.dump(runtime) == ast.dump(static), (
+            f"{name} at runtime does not match the definition in the source"
+        )
+        assert obj.__module__ == lifecycle.__name__, (
+            f"{name} was injected from {obj.__module__}"
+        )
+
+
+def test_the_in_lock_age_gate_holds_at_the_exact_threshold():
+    """Pin the in-lock age comparison at its boundary, to the microsecond.
+
+    #227 could not kill a mutant that shaved the threshold by half a second:
+    the gate ran on a real clock, so the window where the two versions disagree
+    was never reached by any fixture. Handing the clock in makes the comparison
+    pure arithmetic, and two points a microsecond apart decide it -- any
+    additive distortion that can change a verdict moves one of them.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from opencrab.pack import lifecycle
+
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    threshold = 600
+
+    class _SqlThatMustNotBeTouched:
+        def __getattr__(self, attr):
+            raise AssertionError(
+                f"the age gate reached the registry ({attr}); it returns before "
+                f"any write, so touching sql here means a gate moved"
+            )
+
+    def verdict(age):
+        return lifecycle._repair_creating_row_under_lock(
+            _SqlThatMustNotBeTouched(), None, None, None,
+            pack_id="p",
+            snapshot={
+                "pack_id": "p", "owner_id": "alice", "status": "creating",
+                "updated_at": (now - timedelta(seconds=age)).isoformat(),
+            },
+            now=now,
+            older_than_seconds=threshold,
+            mark_pack_ready=lambda *a, **k: True,
+            mark_pack_partial=lambda *a, **k: True,
+            status_creating="creating",
+            status_partial="partial",
+            status_ready="ready",
+        )["action"]
+
+    just_under = threshold - 1e-6
+    assert verdict(just_under) == "skipped (too recent)", (
+        "a row one microsecond short of the threshold was not held back"
+    )
+    assert verdict(threshold) != "skipped (too recent)", (
+        "a row exactly at the threshold was held back; the comparison is `<`, "
+        "and moving it to `<=` shifts every verdict at the boundary"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The collector's own adversarial cases, carried in from the design review that
+# built them. Both verification channels broke an earlier collector inside a
+# single round -- one of them built a working shadow through the gap -- and each
+# later round found another form the previous version missed. The collector is
+# repository code now, so its counter-examples are too: a helper whose only
+# proof lives in someone's scratch directory is a helper the next editor will
+# quietly break.
+# ---------------------------------------------------------------------------
+SRC = '''
+import os
+import os.path as OSP
+from collections import OrderedDict
+from collections import deque as DQ
+A = B = 1
+(C, D), *E = (1, 2), 3
+ANN: int = 5
+AUG = 0
+AUG += 1
+if True:
+    IF_BODY = 1
+    import sys
+    def in_if(): pass
+    class InIf: pass
+elif False:
+    ELIF_BODY = 1
+else:
+    ELSE_BODY = 1
+while False:
+    WHILE_BODY = 1
+else:
+    WHILE_ELSE = 1
+for FOR_TGT in ():
+    FOR_BODY = 1
+else:
+    FOR_ELSE = 1
+try:
+    TRY_BODY = 1
+except ValueError as EXC_NAME:
+    EXCEPT_BODY = 1
+else:
+    TRY_ELSE = 1
+finally:
+    FINALLY_BODY = 1
+with open("x") as WITH_TGT:
+    WITH_BODY = 1
+if (WALRUS := 1):
+    pass
+match [1]:
+    case [MATCH_AS]:
+        MATCH_BODY = 1
+    case {"k": 1, **MATCH_REST}:
+        pass
+    case [*MATCH_STAR]:
+        pass
+def top_fn():
+    INNER_NOT_MODULE = 1
+class TopCls:
+    CLASS_ATTR_NOT_MODULE = 1
+'''
+
+EXPECT = {
+    "os", "OSP", "OrderedDict", "DQ", "A", "B", "C", "D", "E", "ANN", "AUG",
+    "IF_BODY", "sys", "in_if", "InIf", "ELIF_BODY", "ELSE_BODY",
+    "WHILE_BODY", "WHILE_ELSE", "FOR_TGT", "FOR_BODY", "FOR_ELSE",
+    "TRY_BODY", "EXC_NAME", "EXCEPT_BODY", "TRY_ELSE", "FINALLY_BODY",
+    "WITH_TGT", "WITH_BODY", "WALRUS", "MATCH_AS", "MATCH_BODY",
+    "MATCH_REST", "MATCH_STAR", "top_fn", "TopCls",
+}
+# `type X = ...` is 3.12 syntax and this suite runs on every interpreter the
+# project supports, the oldest of which cannot parse it -- the case source above
+# is parsed unconditionally, so leaving it there turns the whole test into a
+# SyntaxError on the version CI uses. Kept rather than dropped, because a type
+# alias really is a module-level binding the collector once missed; it is simply
+# asked only where the question exists.
+TYPE_ALIAS_SRC = "type TYPE_ALIAS = int"
+
+# these live in their own scope; seeing them here would mean the collector
+# descended into a function or class body, which would make it answer a
+# different question than the gate asks
+MUST_NOT_LEAK = {"INNER_NOT_MODULE", "CLASS_ATTR_NOT_MODULE"}
+
+# the shadow one verifier actually built: gate GREEN on v8, runtime diverged
+SHADOW = '''
+import functools
+
+def _repair_creating_row_under_lock(sql, *, snapshot, now):
+    return {"checked_at": now}
+
+if True:
+    def _shadow(sql, *, snapshot, now):
+        import sys
+        return {"stolen": sys._getframe(2).f_locals["entry"]}
+    _repair_creating_row_under_lock = functools.wraps(
+        _repair_creating_row_under_lock)(_shadow)
+'''
+
+# Over-reporting cases. v9 passed this test while reporting names that never
+# reach the module namespace -- the test passed because it did not look here,
+# which is the failure mode this project has met at every layer. A collector
+# that over-reports makes the §4-2 difference gate reject a correct build.
+# Header-scope cases. A function/class BODY opens its own scope but its header --
+# decorators, defaults, annotations, bases -- evaluates here. v10 returned at the
+# node and missed these; codex found names reaching the module namespace unseen,
+# and the test passed anyway because it did not look.
+HEADER = [
+    ("def f(x=(HIDDEN := 1)): pass", {"f", "HIDDEN"}),
+    ("@(DEC := staticmethod)\ndef g(): pass", {"g", "DEC"}),
+    ("class C((BASE := object)): pass", {"C", "BASE"}),
+    ("def k() -> (RET := int): pass", {"k", "RET"}),
+    ("def h():\n    def inner(y=(LEAK := 2)): pass", {"h"}),   # nested: not ours
+    ("def f(x=lambda: (INNER := 1)): pass", {"f"}),             # lambda body: not ours
+    ("def g(x=lambda y=(OUTER := 2): y): pass", {"g", "OUTER"}),  # lambda default: ours
+    ("def n(*a: (VA := int), **k: (KW := str)): pass", {"n", "VA", "KW"}),
+    # A lambda standing in a plain module-level expression, not in a def header.
+    # The header path handled its defaults; the general path skipped the lambda
+    # whole and took the defaults with it, so this shape rebound a module name
+    # while the collector reported one binding (codex review, PR #234). The
+    # runtime source comparison in the gate above rejected the specific bypass,
+    # which is why nothing was let through -- but a count that is wrong is a
+    # count the next assertion cannot lean on.
+    ("BOX = (lambda x=(SHADOW := 1): x,)", {"BOX", "SHADOW"}),
+    ("PAIR = {0: (lambda *, k=(KWD := 3): k)}", {"PAIR", "KWD"}),
+]
+
+OVER = [
+    ("x = [lambda: (w := 1)]", {"x"}),                 # walrus in a lambda: lambda scope
+    ("y = [(z := i) for i in range(3)]", {"y", "z"}),  # walrus in a comprehension: enclosing
+    ("global GVAR", set()),                            # declares, binds nothing
+    ("if True:\n    global G2\n    Q = 1", {"Q"}),
+]
+
+
+def test_the_binding_collector_sees_every_module_level_form():
+    """The gate above trusts `bound_name_counts`. This is why it may.
+
+    Four axes, and each one is here because it was missed once:
+      - MISSING: a binding the collector does not see is a rebinding the gate
+        waves through. Compound-statement bodies were the first gap.
+      - EXTRA / LEAKED: over-reporting is not the safe direction. Names from a
+        function or lambda body never reach the module namespace, and reporting
+        them makes the top-level difference check reject a correct build.
+      - SHADOW: the actual bypass a verifier wrote. The target name must be
+        counted TWICE, or the gate reads the clean original definition while
+        the caller gets the wrapper.
+      - HEADER: a function body opens its own scope but its header does not.
+        Decorators, defaults, annotations and class bases evaluate right here,
+        and a walrus in any of them binds at module level.
+    """
+    import ast
+
+    from _bound_names import bound_name_counts, bound_names
+
+    src, expect = SRC, set(EXPECT)
+    if hasattr(ast, "TypeAlias"):
+        src, expect = src + "\n" + TYPE_ALIAS_SRC + "\n", expect | {"TYPE_ALIAS"}
+
+    got = bound_names(src)
+    assert not (expect - got), f"collector missed {sorted(expect - got)}"
+    assert not (got - expect), f"collector invented {sorted(got - expect)}"
+    assert not (got & MUST_NOT_LEAK), (
+        f"{sorted(got & MUST_NOT_LEAK)} came from inside a function or class "
+        f"body; the collector descended into a scope that is not the module's"
+    )
+
+    shadow = bound_name_counts(SHADOW)
+    assert shadow.get("_repair_creating_row_under_lock", 0) >= 2, (
+        f"the shadow rebinding was counted "
+        f"{shadow.get('_repair_creating_row_under_lock', 0)} time(s); at fewer "
+        f"than two the gate cannot tell a definition from a definition that "
+        f"was replaced underneath it"
+    )
+
+    for src, expect in HEADER:
+        assert bound_names(src) == expect, (
+            f"header scope: {src!r} -> {sorted(bound_names(src))}, "
+            f"expected {sorted(expect)}"
+        )
+    for src, expect in OVER:
+        assert bound_names(src) == expect, (
+            f"over-report: {src!r} -> {sorted(bound_names(src))}, "
+            f"expected {sorted(expect)}"
+        )
