@@ -2180,6 +2180,38 @@ _DENIED_BUILTINS = {
     "__import__", "eval", "exec", "globals", "locals", "vars", "compile",
     "getattr", "setattr", "delattr", "open", "input", "breakpoint",
 }
+# The parameter list of each window function, pinned character for character as
+# `ast.unparse` normalises it. Counting free variables does not close the axis
+# this issue exists to close: a pre-lock value handed in as a NEW PARAMETER has
+# no free variable and no global, so every other assertion here waves it
+# through -- measured, not imagined, and the whole point of the refactor is that
+# the parameter list IS the threat surface. Pinning it means widening that
+# surface is a deliberate edit to this line, not a side effect of one.
+#
+# Annotations and defaults are inside the pin on purpose. A default is evaluated
+# in module scope at def time, so it can carry a value the function's own scope
+# analysis never sees.
+_WINDOW_FN_PARAMS = {
+    "_repair_creating_row_under_lock": (
+        "sql: Any, graph: Any, docs: Any, vector: Any, *, pack_id: str, "
+        "snapshot: Mapping[str, Any] | None, now: datetime, "
+        "older_than_seconds: int, mark_pack_ready: Callable[..., bool], "
+        "mark_pack_partial: Callable[..., bool], status_creating: str, "
+        "status_partial: str, status_ready: str"
+    ),
+    "_creating_row_verdict": (
+        "graph: Any, docs: Any, vector: Any, *, pack_id: str, "
+        "row: Mapping[str, Any], found: dict[str, Any]"
+    ),
+    "_merge_window_findings": (
+        "entry: dict[str, Any], counts: dict[str, int], "
+        "found: Mapping[str, Any], *, scanned_status: str"
+    ),
+}
+# Two declarations that must name the same functions. Adding a window function
+# to one and forgetting the other is the shape of mistake this span has made
+# repeatedly -- a derived list restated by hand and then left behind.
+assert set(_WINDOW_FN_PARAMS) == set(_WINDOW_FN_ALLOWED_GLOBALS)
 
 
 def test_the_window_cannot_name_a_pre_lock_value():
@@ -2259,6 +2291,18 @@ def test_the_window_cannot_name_a_pre_lock_value():
         assert not node.decorator_list, (
             f"{name} is decorated. A wrapper keeps the wrapped function's source "
             f"and module, so the runtime check below cannot see it."
+        )
+        assert ast.unparse(node.args) == _WINDOW_FN_PARAMS[name], (
+            f"{name} does not take the parameters it is pinned to.\n"
+            f"  pinned: {_WINDOW_FN_PARAMS[name]}\n"
+            f"  actual: {ast.unparse(node.args)}\n"
+            f"Everything else here asks what the function can REACH FOR. A "
+            f"parameter is not reached for -- it is handed in, so it has no "
+            f"global and no free variable and passes every other assertion "
+            f"above. That makes `def {name}(..., scanned_row)` the cheapest way "
+            f"back to the defect this refactor removes, which is why the list "
+            f"is pinned rather than merely bounded. Widening it is allowed; "
+            f"doing it here, on purpose, is the price."
         )
 
 
@@ -2347,35 +2391,26 @@ def test_the_window_function_that_runs_is_the_one_that_was_checked():
     import inspect
     import textwrap
 
+    from _bound_names import bound_name_counts
+
     from opencrab.pack import lifecycle
 
-    tree = ast.parse(inspect.getsource(lifecycle))
+    src = inspect.getsource(lifecycle)
+    tree = ast.parse(src)
 
-    def module_level_bindings(name):
-        found = 0
-        def walk(node):
-            nonlocal found
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                found += node.name == name
-                return
-            if isinstance(node, ast.Assign):
-                found += any(isinstance(t, ast.Name) and t.id == name
-                             for t in node.targets)
-            for field in ("body", "orelse", "finalbody"):
-                for child in getattr(node, field, []) or []:
-                    if isinstance(child, ast.stmt):
-                        walk(child)
-            for h in getattr(node, "handlers", []) or []:
-                for child in h.body:
-                    walk(child)
-        for node in tree.body:
-            walk(node)
-        return found
+    # The count comes from the shared collector, not from a walk written here.
+    # This test carried its own for one round and it disagreed with the shared
+    # one: a tuple rebinding (`_repair_creating_row_under_lock, x = shadow, 1`)
+    # counted once instead of twice, which is exactly a shadowed window
+    # function reported as clean. Every private copy of this walk has drifted
+    # the same way, so there is one and its adversarial cases live beside it.
+    counts = bound_name_counts(src)
 
     for name in _WINDOW_FN_ALLOWED_GLOBALS:
-        assert module_level_bindings(name) == 1, (
-            f"{name} is bound more than once at module level; the definition "
-            f"this test reads is not what the caller would get"
+        assert counts.get(name) == 1, (
+            f"{name} is bound {counts.get(name)} times at module level, not "
+            f"once; the definition this test reads is not what the caller "
+            f"would get"
         )
         obj = getattr(lifecycle, name)
         runtime = ast.parse(textwrap.dedent(inspect.getsource(obj))).body[0]
@@ -2437,3 +2472,167 @@ def test_the_in_lock_age_gate_holds_at_the_exact_threshold():
         "a row exactly at the threshold was held back; the comparison is `<`, "
         "and moving it to `<=` shifts every verdict at the boundary"
     )
+
+
+# ---------------------------------------------------------------------------
+# The collector's own adversarial cases, carried in from the design review that
+# built them. Both verification channels broke an earlier collector inside a
+# single round -- one of them built a working shadow through the gap -- and each
+# later round found another form the previous version missed. The collector is
+# repository code now, so its counter-examples are too: a helper whose only
+# proof lives in someone's scratch directory is a helper the next editor will
+# quietly break.
+# ---------------------------------------------------------------------------
+SRC = '''
+import os
+import os.path as OSP
+from collections import OrderedDict
+from collections import deque as DQ
+A = B = 1
+(C, D), *E = (1, 2), 3
+ANN: int = 5
+AUG = 0
+AUG += 1
+if True:
+    IF_BODY = 1
+    import sys
+    def in_if(): pass
+    class InIf: pass
+elif False:
+    ELIF_BODY = 1
+else:
+    ELSE_BODY = 1
+while False:
+    WHILE_BODY = 1
+else:
+    WHILE_ELSE = 1
+for FOR_TGT in ():
+    FOR_BODY = 1
+else:
+    FOR_ELSE = 1
+try:
+    TRY_BODY = 1
+except ValueError as EXC_NAME:
+    EXCEPT_BODY = 1
+else:
+    TRY_ELSE = 1
+finally:
+    FINALLY_BODY = 1
+with open("x") as WITH_TGT:
+    WITH_BODY = 1
+if (WALRUS := 1):
+    pass
+match [1]:
+    case [MATCH_AS]:
+        MATCH_BODY = 1
+    case {"k": 1, **MATCH_REST}:
+        pass
+    case [*MATCH_STAR]:
+        pass
+type TYPE_ALIAS = int
+def top_fn():
+    INNER_NOT_MODULE = 1
+class TopCls:
+    CLASS_ATTR_NOT_MODULE = 1
+'''
+
+EXPECT = {
+    "os", "OSP", "OrderedDict", "DQ", "A", "B", "C", "D", "E", "ANN", "AUG",
+    "IF_BODY", "sys", "in_if", "InIf", "ELIF_BODY", "ELSE_BODY",
+    "WHILE_BODY", "WHILE_ELSE", "FOR_TGT", "FOR_BODY", "FOR_ELSE",
+    "TRY_BODY", "EXC_NAME", "EXCEPT_BODY", "TRY_ELSE", "FINALLY_BODY",
+    "WITH_TGT", "WITH_BODY", "WALRUS", "MATCH_AS", "MATCH_BODY",
+    "MATCH_REST", "MATCH_STAR", "TYPE_ALIAS", "top_fn", "TopCls",
+}
+
+# these live in their own scope; seeing them here would mean the collector
+# descended into a function or class body, which would make it answer a
+# different question than the gate asks
+MUST_NOT_LEAK = {"INNER_NOT_MODULE", "CLASS_ATTR_NOT_MODULE"}
+
+# the shadow one verifier actually built: gate GREEN on v8, runtime diverged
+SHADOW = '''
+import functools
+
+def _repair_creating_row_under_lock(sql, *, snapshot, now):
+    return {"checked_at": now}
+
+if True:
+    def _shadow(sql, *, snapshot, now):
+        import sys
+        return {"stolen": sys._getframe(2).f_locals["entry"]}
+    _repair_creating_row_under_lock = functools.wraps(
+        _repair_creating_row_under_lock)(_shadow)
+'''
+
+# Over-reporting cases. v9 passed this test while reporting names that never
+# reach the module namespace -- the test passed because it did not look here,
+# which is the failure mode this project has met at every layer. A collector
+# that over-reports makes the §4-2 difference gate reject a correct build.
+# Header-scope cases. A function/class BODY opens its own scope but its header --
+# decorators, defaults, annotations, bases -- evaluates here. v10 returned at the
+# node and missed these; codex found names reaching the module namespace unseen,
+# and the test passed anyway because it did not look.
+HEADER = [
+    ("def f(x=(HIDDEN := 1)): pass", {"f", "HIDDEN"}),
+    ("@(DEC := staticmethod)\ndef g(): pass", {"g", "DEC"}),
+    ("class C((BASE := object)): pass", {"C", "BASE"}),
+    ("def k() -> (RET := int): pass", {"k", "RET"}),
+    ("def h():\n    def inner(y=(LEAK := 2)): pass", {"h"}),   # nested: not ours
+    ("def f(x=lambda: (INNER := 1)): pass", {"f"}),             # lambda body: not ours
+    ("def g(x=lambda y=(OUTER := 2): y): pass", {"g", "OUTER"}),  # lambda default: ours
+    ("def n(*a: (VA := int), **k: (KW := str)): pass", {"n", "VA", "KW"}),
+]
+
+OVER = [
+    ("x = [lambda: (w := 1)]", {"x"}),                 # walrus in a lambda: lambda scope
+    ("y = [(z := i) for i in range(3)]", {"y", "z"}),  # walrus in a comprehension: enclosing
+    ("global GVAR", set()),                            # declares, binds nothing
+    ("if True:\n    global G2\n    Q = 1", {"Q"}),
+]
+
+
+def test_the_binding_collector_sees_every_module_level_form():
+    """The gate above trusts `bound_name_counts`. This is why it may.
+
+    Four axes, and each one is here because it was missed once:
+      - MISSING: a binding the collector does not see is a rebinding the gate
+        waves through. Compound-statement bodies were the first gap.
+      - EXTRA / LEAKED: over-reporting is not the safe direction. Names from a
+        function or lambda body never reach the module namespace, and reporting
+        them makes the top-level difference check reject a correct build.
+      - SHADOW: the actual bypass a verifier wrote. The target name must be
+        counted TWICE, or the gate reads the clean original definition while
+        the caller gets the wrapper.
+      - HEADER: a function body opens its own scope but its header does not.
+        Decorators, defaults, annotations and class bases evaluate right here,
+        and a walrus in any of them binds at module level.
+    """
+    from _bound_names import bound_name_counts, bound_names
+
+    got = bound_names(SRC)
+    assert not (EXPECT - got), f"collector missed {sorted(EXPECT - got)}"
+    assert not (got - EXPECT), f"collector invented {sorted(got - EXPECT)}"
+    assert not (got & MUST_NOT_LEAK), (
+        f"{sorted(got & MUST_NOT_LEAK)} came from inside a function or class "
+        f"body; the collector descended into a scope that is not the module's"
+    )
+
+    shadow = bound_name_counts(SHADOW)
+    assert shadow.get("_repair_creating_row_under_lock", 0) >= 2, (
+        f"the shadow rebinding was counted "
+        f"{shadow.get('_repair_creating_row_under_lock', 0)} time(s); at fewer "
+        f"than two the gate cannot tell a definition from a definition that "
+        f"was replaced underneath it"
+    )
+
+    for src, expect in HEADER:
+        assert bound_names(src) == expect, (
+            f"header scope: {src!r} -> {sorted(bound_names(src))}, "
+            f"expected {sorted(expect)}"
+        )
+    for src, expect in OVER:
+        assert bound_names(src) == expect, (
+            f"over-report: {src!r} -> {sorted(bound_names(src))}, "
+            f"expected {sorted(expect)}"
+        )
