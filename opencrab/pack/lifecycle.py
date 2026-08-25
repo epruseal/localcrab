@@ -480,6 +480,25 @@ def repair_incomplete_packs(
     definition, one where SOME attempt already ran. The only outcomes here
     are promotion (``ready``), demotion (``partial``), and reporting.
 
+    **The per-row lock window is a function, not a block (#231).** What
+    happens under the lock lives in ``_repair_creating_row_under_lock``,
+    which takes the re-read snapshot and the clock as arguments and has no
+    name in scope for the row this pass scanned, the time it started, the
+    report, or the tally. #227 found the same defect here eight times --
+    always a value read before the lock reaching a decision or a report made
+    under it -- and naming those values ``scanned_*`` made each new instance
+    visible without making it impossible. Now the window cannot reach them:
+    they are not in its scope. The verdict itself is
+    ``_creating_row_verdict``, shared by this function's dry run and its
+    locked path so that a plan predicts its own apply (#224) by
+    construction; the reporting merge is ``_merge_window_findings``, which
+    reads no globals at all. What that does NOT buy is written down in the
+    gates that guard it: the allow-list limits which NAMES the window can
+    resolve, not where a local got its value, and not what an object handed
+    in can be asked for. Those belong to
+    ``test_every_row_the_lock_touched_is_judged_and_written_by_what_it_re_read``,
+    which runs a pass and reads the result.
+
     **Age is judged in Python, not SQL.** ``updated_at`` is SQLite ``TEXT``
     (``datetime('now')``, UTC, naive) on one backend and PostgreSQL
     ``TIMESTAMPTZ`` on the other; a SQL-side age comparison would have to
