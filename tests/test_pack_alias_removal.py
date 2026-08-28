@@ -286,10 +286,16 @@ def _scratch_graph_db(path: Path, props: dict) -> Path:
 
 
 def test_t5_provenance_backfill_drops_the_alias(tmp_path):
-    from opencrab.ontology.pack_provenance import backfill_pack_ids
+    from opencrab.ontology.pack_provenance import inspect_pack_ids
 
-    db = _scratch_graph_db(tmp_path / "graph.db", {"pack": "old"})
-    backfill_pack_ids(db, assume_pack_id="assumed-pack", dry_run=False)
+    db = tmp_path / "graph.db"
+    graph = LocalGraphStore(str(db))
+    try:
+        graph.upsert_node("Document", "n1", {"pack": "old"})
+        plan = inspect_pack_ids(db, assume_pack_id="assumed-pack")
+        graph.backfill_pack_provenance(plan["records"])
+    finally:
+        graph.close()
 
     conn = sqlite3.connect(db)
     props = json.loads(conn.execute("SELECT properties FROM graph_nodes").fetchone()[0])

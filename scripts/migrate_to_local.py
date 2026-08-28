@@ -39,6 +39,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
 from opencrab.locking import file_lock
 
 console = Console()
@@ -335,11 +336,16 @@ def backup_local_data(local_data_dir: str) -> dict[str, str]:
 # Step 2 — 그래프 마이그레이션 (Neo4j → LocalGraphStore)
 # ---------------------------------------------------------------------------
 
-def _extract_node_type(labels: list[str]) -> str:
+def _extract_node_type(labels: list[str], node_type: Any | None = None) -> str:
     """
-    labels 리스트에서 'OpenCrabNode'를 제거하고 첫 번째 나머지 레이블을 반환한다.
-    레이블이 없으면 'Unknown' 반환.
+    Return the explicit graph type, falling back to legacy labels.
+
+    New Neo4j rows carry ``n.node_type`` because ``labels(n)`` order is
+    unspecified. The label fallback remains for pre-Issue-80 exports and the
+    SQLite/Kuzu compatibility shape.
     """
+    if isinstance(node_type, str) and node_type:
+        return node_type
     filtered = [lbl for lbl in labels if lbl != "OpenCrabNode"]
     return filtered[0] if filtered else "Unknown"
 
@@ -361,121 +367,40 @@ def migrate_graph(
       - SKIP/LIMIT 페이징으로 메모리 상한 유지
     반환: {"nodes": N, "edges": M}
     """
-    total_nodes = 0
-    total_edges = 0
+    raise GraphMigrationFixtureOnlyError("graph apply is fixture-only")
 
-    # --- 노드 마이그레이션 ---
-    console.print("  [cyan]노드 마이그레이션...[/cyan]")
-    skip = 0
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed} nodes"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("  노드", total=None)
-        while True:
-            with neo4j_driver.session() as sess:
-                rows = sess.run(
-                    "MATCH (n) RETURN properties(n) AS props, labels(n) AS labels"
-                    " SKIP $skip LIMIT $batch_size",
-                    skip=skip,
-                    batch_size=batch_size,
-                ).data()
 
-            if not rows:
-                break
-
-            batch: list[dict[str, Any]] = []
-            for row in rows:
-                props = dict(row.get("props") or {})
-                labels = list(row.get("labels") or [])
-                node_id = props.get("id")
-                if not node_id:
-                    log.warning("id 없는 노드 스킵 (labels=%s props_keys=%s)", labels, list(props.keys()))
-                    continue
-                node_type = _extract_node_type(labels)
-                space = props.get("space", "")
-                batch.append({
-                    "node_type": node_type,
-                    "node_id": str(node_id),
-                    "space_id": str(space) if space else None,
-                    "properties": props,
-                })
-
-            if batch:
-                local_store.upsert_nodes_batch(batch)
-                total_nodes += len(batch)
-                progress.update(task, completed=total_nodes)
-
-            skip += batch_size
-            if len(rows) < batch_size:
-                break
-
-    console.print(f"  노드 완료: {total_nodes:,}개")
-
-    # --- 엣지 마이그레이션 ---
-    console.print("  [cyan]엣지 마이그레이션...[/cyan]")
-    skip = 0
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed} edges"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("  엣지", total=None)
-        while True:
-            with neo4j_driver.session() as sess:
-                rows = sess.run(
-                    """
-                    MATCH (a)-[r]->(b)
-                    RETURN properties(a).id AS from_id, labels(a) AS from_labels,
-                           type(r) AS relation, properties(r) AS rel_props,
-                           properties(b).id AS to_id, labels(b) AS to_labels
-                    SKIP $skip LIMIT $batch_size
-                    """,
-                    skip=skip,
-                    batch_size=batch_size,
-                ).data()
-
-            if not rows:
-                break
-
-            batch_edges: list[dict[str, Any]] = []
-            for row in rows:
-                from_id = row.get("from_id")
-                to_id   = row.get("to_id")
-                if not from_id or not to_id:
-                    log.warning(
-                        "from_id 또는 to_id 없는 엣지 스킵 (relation=%s)", row.get("relation")
-                    )
-                    continue
-                from_type = _extract_node_type(list(row.get("from_labels") or []))
-                to_type   = _extract_node_type(list(row.get("to_labels") or []))
-                batch_edges.append({
-                    "from_type":  from_type,
-                    "from_id":    str(from_id),
-                    "relation":   str(row.get("relation", "")),
-                    "to_type":    to_type,
-                    "to_id":      str(to_id),
-                    "properties": dict(row.get("rel_props") or {}),
-                })
-
-            if batch_edges:
-                local_store.upsert_edges_batch(batch_edges)
-                total_edges += len(batch_edges)
-                progress.update(task, completed=total_edges)
-
-            skip += batch_size
-            if len(rows) < batch_size:
-                break
-
-    console.print(f"  엣지 완료: {total_edges:,}개")
-    return {"nodes": total_nodes, "edges": total_edges}
+def inspect_graph_source(neo4j_driver: Any) -> dict[str, Any]:
+    """Inspect a Neo4j graph without opening or mutating a target store."""
+    node_rows: list[dict[str, Any]] = []
+    edge_rows: list[dict[str, Any]] = []
+    with neo4j_driver.session() as sess:
+        node_rows = list(sess.run(
+            "MATCH (n) RETURN properties(n) AS props, labels(n) AS labels, "
+            "n.node_type AS node_type"
+        ))
+        edge_rows = list(sess.run(
+            "MATCH (a)-[r]->(b) RETURN properties(a) AS source_props, "
+            "a.node_type AS source_node_type, properties(b) AS target_props, "
+            "b.node_type AS target_node_type, properties(r) AS props, "
+            "type(r) AS relation"
+        ))
+    ids: dict[str, set[str]] = {}
+    for row in node_rows:
+        props = dict(row["props"] or {})
+        if props.get("id") is not None:
+            node_type = row.get("node_type")
+            labels = [label for label in (row.get("labels") or []) if label != "OpenCrabNode"]
+            resolved = _extract_node_type(labels, node_type)
+            ids.setdefault(str(props["id"]), set()).add(resolved)
+    incomplete = []
+    for row in edge_rows:
+        source, target = dict(row.get("source_props") or {}), dict(row.get("target_props") or {})
+        missing = [str(p["id"]) for p in (source, target) if p.get("id") is not None and str(p["id"]) not in ids]
+        if missing:
+            incomplete.append({"relation": row["relation"], "missing": missing})
+    duplicates = [{"node_id": key, "node_types": sorted(types)} for key, types in sorted(ids.items()) if len(types) > 1]
+    return {"nodes": len(node_rows), "edges": len(edge_rows), "duplicates": duplicates, "mapping_required": duplicates, "incomplete_endpoints": incomplete}
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +982,10 @@ def main() -> int:
 
 
 def _run(args: argparse.Namespace) -> int:
+    # Graph migration is intentionally fixture-only.  Refuse before creating
+    # a target directory, opening Neo4j/PostgreSQL, or reading the source.
+    if not args.skip_graph and not args.dry_run:
+        raise GraphMigrationFixtureOnlyError("graph apply is fixture-only")
     # 로컬 데이터 디렉토리 결정
     local_data_dir = (
         args.local_data_dir
@@ -1064,7 +993,8 @@ def _run(args: argparse.Namespace) -> int:
         or "./opencrab_data"
     )
     local_data_dir = os.path.abspath(local_data_dir)
-    os.makedirs(local_data_dir, exist_ok=True)
+    if not args.dry_run:
+        os.makedirs(local_data_dir, exist_ok=True)
 
     console.print("\n[bold]OpenCrab docker → local 마이그레이션[/bold]")
     console.print(f"  로컬 데이터 디렉토리: {local_data_dir}")

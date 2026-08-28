@@ -1,6 +1,6 @@
 """
 R6 characterization contract: pins ``find_neighbors()`` behavior across
-LocalGraphStore, PGGraphStore (env-gated), and KuzuGraphStore (importorskip)
+LocalGraphStore and PGGraphStore (env-gated).
 BEFORE the planned ``_expand`` extraction, so that refactor can be verified
 by re-running this suite unchanged and getting the same green result.
 
@@ -21,8 +21,8 @@ Fixtures follow the project's existing gating conventions:
     - pg: skipped unless OPENCRAB_PG_TEST_URL is set (mirrors
       test_pg_graph_doc_parity.py / test_pg_stores_direct.py), own uuid
       schema per test, dropped in teardown.
-    - kuzu: ``pytest.importorskip("ladybug")`` (mirrors
-      test_graph_pack_filter_kuzu.py).
+    - Kùzu is covered separately by a capability-negative assertion because
+      its transaction owner is not qualified.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import uuid
 
 import pytest
 
-BACKENDS = ["local", "pg", "kuzu"]
+BACKENDS = ["local", "pg"]
 
 
 def _make_local(tmp_path):
@@ -51,16 +51,9 @@ def _make_pg():
     return PGGraphStore(pg_url, schema=schema), pg_url, schema
 
 
-def _make_kuzu(tmp_path):
-    pytest.importorskip("ladybug")
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-    return KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu"))
-
-
 @pytest.fixture(params=BACKENDS)
 def backend(request, tmp_path):
-    """Yields (backend_name, store) for each of local/pg/kuzu.
+    """Yields (backend_name, store) for each of local/pg.
 
     D1/D2 adopting this suite for the _expand extraction only need to keep
     this fixture (or their own equivalent) producing a fresh store per test
@@ -82,10 +75,14 @@ def backend(request, tmp_path):
         with engine.begin() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         engine.dispose()
-    else:
-        store = _make_kuzu(tmp_path)
-        yield name, store
-        store.close()
+
+
+def test_kuzu_find_neighbors_is_capability_negative():
+    from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+    from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
+
+    with pytest.raises(GraphReadCapabilityUnavailable):
+        KuzuUnavailableGraphStore().find_neighbors("n1")
 
 
 # ---------------------------------------------------------------------------

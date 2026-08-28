@@ -82,8 +82,8 @@ class Settings(BaseSettings):
     # Storage mode:
     #   "local"  — no Docker. SQLite(graph/doc/sql) + Chroma/sqlite-vec(vector).
     #   "docker" — full services (Neo4j + MongoDB + Postgres(sql only) + Chroma).
-    #   "kuzu"   — local variant with KuzuGraphStore (ladybug) instead of the
-    #              SQLite adjacency-table graph store; doc/sql/vector stay local.
+    #   "kuzu"   — local document/vector/SQL variant whose graph axis remains
+    #              capability-negative until Ladybug is qualified.
     #   "pg"     — PG-unified: 4스토어(graph/doc/sql/vector) 전부 PostgreSQL 한
     #              서버·SQLAlchemy 공유 엔진으로 통합. MVCC 다중 라이터가 필요한
     #              운영(§9 힌지: MCP 서빙 중 동시 write, 벡터 수백만 스케일)에

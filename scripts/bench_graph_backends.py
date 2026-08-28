@@ -114,80 +114,40 @@ def ingest_to_store(
     ok_nodes = 0
     t0 = time.perf_counter()
 
-    if batched and isinstance(store, LocalGraphStore) and store._conn:
-        # SQLite batched: 모든 upsert를 단일 트랜잭션으로
-        cur = store._conn.cursor()
-        for nd in nodes:
-            props = dict(nd.get("properties") or {})
-            props["id"] = nd["id"]
-            cur.execute(
-                """
-                INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(node_type, node_id) DO UPDATE SET
-                    space_id   = excluded.space_id,
-                    properties = excluded.properties
-                """,
-                (nd.get("node_type", "concept"), nd["id"],
-                 nd.get("space"), json.dumps(props)),
+    for nd in nodes:
+        try:
+            store.upsert_node(
+                node_type=nd.get("node_type", "concept"),
+                node_id=nd["id"],
+                properties=dict(nd.get("properties") or {}),
+                space_id=nd.get("space"),
             )
             ok_nodes += 1
-        store._conn.commit()
-    else:
-        for nd in nodes:
-            try:
-                store.upsert_node(
-                    node_type=nd.get("node_type", "concept"),
-                    node_id=nd["id"],
-                    properties=dict(nd.get("properties") or {}),
-                    space_id=nd.get("space"),
-                )
-                ok_nodes += 1
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     node_elapsed = time.perf_counter() - t0
 
     ok_edges = 0
     t1 = time.perf_counter()
 
-    if batched and isinstance(store, LocalGraphStore) and store._conn:
-        cur = store._conn.cursor()
-        for eg in edges:
-            from_id = eg.get("from_id", "")
-            to_id = eg.get("to_id", "")
-            from_type = node_type_map.get(from_id, "concept")
-            to_type = node_type_map.get(to_id, "concept")
-            cur.execute(
-                """
-                INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
-                    properties = excluded.properties
-                """,
-                (from_type, from_id, eg.get("relation", "related"),
-                 to_type, to_id, json.dumps(dict(eg.get("properties") or {}))),
+    for eg in edges:
+        from_id = eg.get("from_id", "")
+        to_id = eg.get("to_id", "")
+        from_type = node_type_map.get(from_id, "concept")
+        to_type = node_type_map.get(to_id, "concept")
+        try:
+            store.upsert_edge(
+                from_type=from_type,
+                from_id=from_id,
+                relation=eg.get("relation", "related"),
+                to_type=to_type,
+                to_id=to_id,
+                properties=dict(eg.get("properties") or {}),
             )
             ok_edges += 1
-        store._conn.commit()
-    else:
-        for eg in edges:
-            from_id = eg.get("from_id", "")
-            to_id = eg.get("to_id", "")
-            from_type = node_type_map.get(from_id, "concept")
-            to_type = node_type_map.get(to_id, "concept")
-            try:
-                store.upsert_edge(
-                    from_type=from_type,
-                    from_id=from_id,
-                    relation=eg.get("relation", "related"),
-                    to_type=to_type,
-                    to_id=to_id,
-                    properties=dict(eg.get("properties") or {}),
-                )
-                ok_edges += 1
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     edge_elapsed = time.perf_counter() - t1
     return node_elapsed, edge_elapsed, ok_nodes, ok_edges
@@ -527,7 +487,7 @@ def run_readonly_target(target: str, neo4j_uri: str, neo4j_user: str, neo4j_pass
         seeds: list[tuple[str, str]] = []
         try:
             rows = neo4j_store.run_cypher(
-                "MATCH (n) RETURN labels(n)[0] AS t, n.id AS id LIMIT 30"
+                "MATCH (n:OpenCrabNode) RETURN n.node_type AS t, n.id AS id LIMIT 30"
             )
             seeds = [(r.get("t", "concept") or "concept", r["id"]) for r in rows if r.get("id")]
         except Exception:
@@ -630,11 +590,9 @@ def run_bench(
                     # 임시 Neo4j 스토어 (재연결)
                     neo4j_store_for_compare = make_neo4j_store(neo4j_uri, neo4j_user, neo4j_pass)
                     if neo4j_store_for_compare:
-                        # 기존 데이터 정리 (임시 인스턴스이므로 안전)
-                        try:
-                            neo4j_store_for_compare.run_cypher("MATCH (n) DETACH DELETE n")
-                        except Exception:
-                            pass
+                        # Pack reset is an explicit disposable-fixture operation.
+                        # The benchmark never sends mutation Cypher through the
+                        # read-only query surface; use a fresh target database.
                         n_el2, e_el2, ok_n2, ok_e2 = ingest_to_store(
                             neo4j_store_for_compare, nodes, edges, node_type_map, batched=False
                         )
@@ -713,10 +671,6 @@ def run_bench(
                             print("  [Neo4j] 속도 전용: 적재 후 쿼리 측정 중…")
                             neo4j_q_ingest = make_neo4j_store(neo4j_uri, neo4j_user, neo4j_pass)
                             if neo4j_q_ingest:
-                                try:
-                                    neo4j_q_ingest.run_cypher("MATCH (n) DETACH DELETE n")
-                                except Exception:
-                                    pass
                                 n_el3, e_el3, ok_n3, ok_e3 = ingest_to_store(
                                     neo4j_q_ingest, nodes, edges, node_type_map, batched=False
                                 )

@@ -142,19 +142,15 @@ class ImpactEngine:
 
         # --- Discover node space and type ---
         # All four backends implement get_node_by_id() natively (Neo4j's
-        # Cypher is `MATCH (n {id:$id}) RETURN properties(n), labels(n)[0]`,
+        # Cypher returns the authoritative `n.node_type` property,
         # merging "space" from the node's own properties — identical to the
         # `n.space` this call site used to read via a hand-rolled Cypher
         # fallback). See opencrab/stores/_graph_protocol.py.
         if self._neo4j.available:
             try:
-                # #147: the scoped lookup, not get_node_by_id + a Python
-                # check afterwards. get_node_by_id matches on node_id alone
-                # (the PK is (node_type, node_id)), so a homonym in another
-                # pack can be the row it returns -- filtering after the fact
-                # would then answer "no such node" for a node the caller
-                # really does have. The pack predicate has to run before the
-                # LIMIT, not after it.
+                # #147: the scoped lookup, not get_node_by_id plus a Python
+                # check afterwards. The pack predicate has to run in the
+                # store query before its result limit is applied.
                 node = self._neo4j.get_node_by_id_scoped(node_id, pack_ids)
                 if node:
                     result.node_type = node.get("node_type")
@@ -287,12 +283,9 @@ class ImpactEngine:
         concepts: list[dict[str, Any]] = []
 
         # All four backends implement find_by_relations() natively (Neo4j's
-        # Cypher generalises the old hand-rolled
-        # `MATCH (l)-[r:raises|lowers|stabilizes|optimizes]->(o)` /
-        # `MATCH (l)-[:affects]->(c)` patterns this call site used to run via
-        # run_cypher() — same relation-type filter, same unfiltered
-        # `labels(m)` list, so indexing `[0]` below matches the old
-        # `labels(o)[0]` value exactly). See opencrab/stores/_graph_protocol.py.
+        # Cypher generalises the old hand-rolled relation patterns. The store
+        # returns the explicit node_type and keeps labels only as compatibility
+        # metadata. See opencrab/stores/_graph_protocol.py.
         if self._neo4j.available:
             try:
                 # #147: gate on the anchor first. An unreadable lever must
@@ -311,7 +304,7 @@ class ImpactEngine:
                     rel = r.get("relation_type", "")
                     outcomes.append({
                         "node_id": props.get("id", "?"),
-                        "node_type": (r.get("labels") or ["Outcome"])[0],
+                        "node_type": r.get("node_type") or (r.get("labels") or ["Outcome"])[0],
                         "relation": rel,
                         "predicted_delta": _predict_delta(direction, rel, magnitude),
                     })
@@ -323,7 +316,7 @@ class ImpactEngine:
                     props = r.get("properties") or {}
                     concepts.append({
                         "node_id": props.get("id", "?"),
-                        "node_type": (r.get("labels") or ["Concept"])[0],
+                        "node_type": r.get("node_type") or (r.get("labels") or ["Concept"])[0],
                     })
             except _LeverOutOfScopeError:
                 # Not an error: the lever is not readable, so it has no

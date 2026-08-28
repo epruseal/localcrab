@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from opencrab.common.graph_identity import NodeIdentityConflict
+
 from ._registry import AccessTier, tool
 
 logger = logging.getLogger(__name__)
@@ -163,7 +165,7 @@ def ontology_add_node(
                 )
         ctx["hybrid"].invalidate_bm25_cache()
         return result
-    except ValueError as exc:
+    except (ValueError, NodeIdentityConflict) as exc:
         return {"error": str(exc), "valid": False}
     except PackNotFoundError:
         # #148: same wording/contract as pack_ingest (opencrab/mcp/tools/pack.py)
@@ -350,23 +352,16 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     caller's readable pack scope.
 
     #147: this calls ``get_node_by_id_scoped``, not ``get_node_by_id``. The
-    unscoped version matches ``node_id`` alone even though the PK is
-    ``(node_type, node_id)``, so filtering its result afterwards would
-    answer "not found" for a node the caller does own whenever another pack
-    holds the same id under a different type. All four backends implement
-    the scoped form (see opencrab/stores/_graph_protocol.py); note that
-    Kuzu's deliberately does NOT use ``LIMIT 1``, for the same reason.
+    scoped predicate must run in the store query before any result limit.
+    All four backends implement the scoped form (see
+    opencrab/stores/_graph_protocol.py).
     """
     from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
 
     ctx = _get_context()
     graph = ctx["neo4j"]
     node_id = _clean_str(node_id)
-    # #147: scoped at the store, not filtered afterwards. The unscoped
-    # lookup matches on node_id alone even though the PK is
-    # (node_type, node_id), so a post-filter would answer "not found" for a
-    # node the caller does own whenever someone else's pack happens to hold
-    # the same id under a different type.
+    # #147: scope at the store, not after the lookup result has been chosen.
     scope = _current_read_scope(ctx)
     result = graph.get_node_by_id_scoped(node_id, sorted(scope))
 
@@ -498,6 +493,7 @@ def ontology_list_nodes(
     """
     from opencrab.mcp.tools import _clean_str, _current_read_scope, _get_context
     from opencrab.pack.read_scope import narrow
+    from opencrab.stores._graph_common import domain_labels
 
     ctx = _get_context()
     pack_id = _clean_str(pack_id) if pack_id else None
@@ -530,7 +526,8 @@ def ontology_list_nodes(
         for item in raw:
             props = item.get("props") or {}
             labels = item.get("labels") or []
-            node_type = labels[0] if labels else props.get("node_type", "")
+            domains = domain_labels(labels)
+            node_type = props.get("node_type") or (domains[0] if len(domains) == 1 else "")
             n_id = props.get("node_id") or props.get("id", "")
             n_space = props.get("space_id") or props.get("space", "")
             if cleaned_space and n_space != cleaned_space:

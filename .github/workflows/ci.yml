@@ -39,13 +39,45 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,pg]"
 
-      - name: Install ladybug (best-effort, kuzu tests skip if unavailable)
-        run: pip install "ladybug>=0.18" || echo "ladybug unavailable — kuzu tests will skip"
-
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Test
-        env:
-          OPENCRAB_PG_TEST_URL: postgresql://opencrab:opencrab@localhost:5432/opencrab_test
-        run: pytest -q --cov=opencrab -o addopts=''
+        run: |
+          set -Eeuo pipefail
+          neo4j_name="issue80-neo4j-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          neo4j_password="issue80-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          capability_file="$(mktemp)"
+          chmod 600 "$capability_file"
+          trap 'docker rm -f "$neo4j_name" >/dev/null 2>&1 || true; rm -f "$capability_file"' EXIT
+          docker pull docker.io/library/neo4j:5
+          docker run -d --rm --name "$neo4j_name" \
+            --health-cmd="cypher-shell -u neo4j -p $neo4j_password 'RETURN 1'" \
+            --health-interval=2s --health-timeout=5s --health-retries=30 \
+            -e "NEO4J_AUTH=neo4j/$neo4j_password" \
+            --tmpfs /data --tmpfs /logs -p 127.0.0.1::7687 \
+            docker.io/library/neo4j:5
+          neo4j_port=""
+          status=""
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "$neo4j_name")"
+            neo4j_binding="$(docker port "$neo4j_name" 7687/tcp)"
+            case "$neo4j_binding" in
+              127.0.0.1:*) neo4j_port="${neo4j_binding##*:}" ;;
+              *) neo4j_port="" ;;
+            esac
+            if [ "$status" = healthy ] && [ -n "$neo4j_port" ]; then break; fi
+            if [ "$status" = unhealthy ]; then docker logs "$neo4j_name"; exit 1; fi
+            sleep 2
+          done
+          [ "$status" = healthy ] && [ -n "$neo4j_port" ]
+          export OPENCRAB_NEO4J_TEST_URI="bolt://127.0.0.1:$neo4j_port"
+          export OPENCRAB_NEO4J_TEST_USER=neo4j
+          export OPENCRAB_NEO4J_TEST_PASSWORD="$neo4j_password"
+          export OPENCRAB_NEO4J_TEST_DATABASE=neo4j
+          export OPENCRAB_PG_TEST_URL=postgresql://opencrab:opencrab@localhost:5432/opencrab_test
+          python -c 'import json, os, sys; path, uri, port, name, password = sys.argv[1:]; payload = {"schema": "issue80-neo4j-capability-v1", "uri": uri, "port": int(port), "user": "neo4j", "password": password, "database": "neo4j", "run_nonce": os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"], "container_name": name}; handle = open(path, "w", encoding="utf-8"); print(json.dumps(payload, sort_keys=True), file=handle); handle.close(); os.chmod(path, 0o600)' "$capability_file" "$OPENCRAB_NEO4J_TEST_URI" "$neo4j_port" "$neo4j_name" "$neo4j_password"
+          export OPENCRAB_ISSUE80_NEO4J_CAPABILITY_FILE="$capability_file"
+          export OPENCRAB_ISSUE80_NEO4J_DISPOSABLE=1
+          export OPENCRAB_ISSUE80_SERVICE_APPLY=1
+          pytest -q --cov=opencrab -o addopts=''

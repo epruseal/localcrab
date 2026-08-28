@@ -1,25 +1,32 @@
 """
-GraphStore Protocol — the uniform graph-store interface implemented by
-LocalGraphStore, PGGraphStore, KuzuGraphStore, and (partially) Neo4jStore.
+GraphStore Protocol - the uniform graph-store interface implemented by
+LocalGraphStore, PGGraphStore, and Neo4jStore. ``STORAGE_MODE=kuzu`` uses a
+capability-negative facade: its lifecycle surface is present for startup
+plumbing, while graph reads and writes raise capability exceptions until the
+Ladybug transaction/CAS qualification is complete.
 
 Consumers historically decided which methods a graph store supports by
 ``isinstance(store, (LocalGraphStore, KuzuGraphStore))`` (e.g.
 opencrab/mcp/tools.py:1064, opencrab/ontology/impact.py:124,263,
 opencrab/pack/neo4j_export.py:231) or ``hasattr(store, "...")``
 (opencrab/mcp/tools.py:1577,1580,1611,1661,1667). Both patterns exist only
-because Neo4jStore lacks several methods the other three backends share —
+because Neo4jStore once lacked several methods the other backends shared -
 this module names that shared surface as a single ``typing.Protocol`` so new
 consumer code can branch on capability (``isinstance(store, GraphStore)`` or
 a plain ``hasattr``) without enumerating concrete classes.
 
 This module is DECLARATION ONLY: it defines the Protocol and documents each
 method's contract (params, return shape) against the reference
-implementations (LocalGraphStore / PGGraphStore, which are line-for-line
-ports of each other — see pg_graph_store.py's module docstring). It does not
-implement, patch, or monkeypatch anything on the four store classes.
+implementations (LocalGraphStore / PGGraphStore, which share the SQL graph
+base and therefore have line-for-line parity - see pg_graph_store.py's module
+docstring). It does not
+implement, patch, or monkeypatch anything on the store classes.
 
-GAP TABLE — method presence per backend (checked against the current source
-of each store module):
+GAP TABLE - method presence per operational backend (checked against the
+current source of each store module). The Kùzu facade is intentionally
+capability-negative even where ``__getattr__`` supplies a compatibility
+callable, so a table "yes" means only that the protocol shape is reachable,
+not that the operation is supported:
 
     method               Local   PG      Kuzu    Neo4j
     -------------------- ------- ------- ------- -------
@@ -53,9 +60,7 @@ of each store module):
 Neo4j, not stale -- ``HybridQuery.keyword_search`` never needed a
 Neo4jStore.search_nodes because its Cypher ``CONTAINS`` branch already
 pushes the same keyword/space predicate straight into Cypher without going
-through a store method (see query.py's isinstance branch, which routes
-Local/PG/Kuzu to ``search_nodes`` and leaves Neo4j on that pre-existing
-Cypher path).
+through a store method. The Kùzu facade rejects this call until qualification.
 
 CORRECTION (issue #54 audit finding [5], verified by grepping each `def` in
 neo4j_store.py): this table previously marked all 7 "extended" methods NO
@@ -73,8 +78,8 @@ branches) is unverified here and is #64's scope, not #54's — do not treat
 this table's "yes" as a claim about those call sites' current behavior.
 
 ``@runtime_checkable`` is set so ``isinstance(store, GraphStore)`` works as
-a drop-in replacement for the ``isinstance(store, (LocalGraphStore,
-KuzuGraphStore, PGGraphStore))`` tuple checks above; ``GraphStoreExtended``
+a drop-in replacement for capability checks; it does not turn the Kùzu
+facade's rejected methods into operational support. ``GraphStoreExtended``
 below is a separate Protocol consumers can check against independently of
 the base ``GraphStore`` (see #64 for whether that split is still warranted
 now that method presence is at parity).
@@ -84,10 +89,20 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from opencrab.common.graph_identity import (
+    ApplyMigrationRequest,
+    DryRunMigrationRequest,
+    EdgeWriteReceipt,
+    GraphInventory,
+    MigrationReceipt,
+    NodeWriteReceipt,
+    ProvenanceBatchReceipt,
+)
+
 
 @runtime_checkable
 class GraphStore(Protocol):
-    """Core graph-store surface implemented by all four backends today."""
+    """Core graph-store surface for operational backends and the Kùzu facade."""
 
     @property
     def available(self) -> bool:
@@ -120,9 +135,10 @@ class GraphStore(Protocol):
     def ensure_constraints(self) -> None:
         """Create backend-native uniqueness constraints for all node types.
 
-        No-op for the three non-Neo4j backends (their primary keys already
-        cover uniqueness). Degrades to a warning log (does not raise) when
-        the store is unavailable.
+        LocalGraphStore and PGGraphStore need no extra constraint call because
+        their classified target schemas use primary keys. Neo4j creates its
+        native constraints. The Kùzu facade raises a capability exception;
+        an unavailable Neo4j store still degrades to a warning log.
         """
         ...
 
@@ -132,19 +148,20 @@ class GraphStore(Protocol):
         node_id: str,
         properties: dict[str, Any],
         space_id: str | None = None,
-    ) -> dict[str, Any]:
+        *,
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
         """Create or update one node; returns its stored properties dict.
 
-        The returned dict always contains at least ``{"id": node_id, **properties}``
-        (Neo4j additionally injects ``"space": space_id`` into the same dict
-        when ``space_id`` is given — the other backends store ``space_id`` in
-        a separate column and do not merge it into the properties dict).
-        Raises RuntimeError if the store is unavailable.
+        The returned dict always contains at least ``{"id": node_id, **properties}``.
+        SQL backends merge the dedicated space column into the returned shape;
+        the Kùzu facade raises until its writer capability is qualified.
+        Raises an availability or capability exception when unsupported.
         """
         ...
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
-        """Fetch one node's properties by (node_type, node_id); None if absent.
+        """Fetch one node's properties by global node_id and type; None if absent.
 
         Requires the exact type — use ``get_node_by_id`` (extended surface)
         for a type-agnostic lookup by id alone.
@@ -154,9 +171,9 @@ class GraphStore(Protocol):
     def lookup_node_type(self, node_id: str) -> str | None:
         """Best-effort node_type resolution by id alone; None if not found.
 
-        Deliberately lenient: returns None (never raises) even when the
-        store is unavailable — used by OntologyBuilder.add_edge to resolve
-        real node types for edge endpoints.
+        SQL and Neo4j implementations are best-effort and return None when
+        unavailable. The Kùzu facade raises a read-capability exception until
+        qualification, so callers must treat that mode as disabled.
         """
         ...
 
@@ -164,7 +181,7 @@ class GraphStore(Protocol):
         """Delete one node and its incident edges.
 
         Returns True iff the node itself was deleted (i.e. it existed
-        before the call) — unified across all four backends. A node with
+        before the call) across operational backends. A node with
         zero incident edges still returns True. A nonexistent node returns
         False.
         """
@@ -178,13 +195,15 @@ class GraphStore(Protocol):
         to_type: str,
         to_id: str,
         properties: dict[str, Any] | None = None,
-    ) -> bool:
+        *,
+        return_receipt: bool = False,
+    ) -> bool | EdgeWriteReceipt:
         """Create or update a directed (from)->(to) edge; True on success.
 
-        Raises RuntimeError if the store is unavailable. Endpoints must
-        already exist (Neo4j: MATCH fails silently to no record -> False;
-        SQL backends: FK-less schema, so a dangling edge is written and
-        later reads of a missing endpoint return None as its properties).
+        Raises an availability or identity exception when unsupported.
+        Endpoints must already exist. Neo4j reports a missing endpoint as
+        False; qualified SQL writers reject missing endpoints before insertion.
+        The Kùzu facade is capability-negative.
         """
         ...
 
@@ -205,23 +224,71 @@ class GraphStore(Protocol):
         This method exists for #146's identity-ownership check (a probe read
         before a write), not general traversal.
 
-        The contract is deliberately "match THIS backend's own conflict
-        key", not a uniform 5-argument predicate: SQL backends (Local/PG)
-        and Neo4j key an edge on all 5 arguments (matching ``upsert_edge``'s
-        ``conflict_cols``/MATCH-by-type), but ``KuzuGraphStore``'s
-        ``upsert_edge`` MERGEs on ``(from_id, relation, to_id)`` alone (no
-        type predicate — Kuzu's ``OntologyEdge`` has no type column). Kuzu's
-        ``get_edge`` therefore accepts ``from_type``/``to_type`` for
-        signature parity with the other three backends but does not use
-        them in its MATCH; passing the wrong type there still finds the
-        same edge ``upsert_edge`` would have upserted.
+        The contract is deliberately "match this backend's own conflict
+        key". Qualified SQL and Neo4j backends use the global edge key
+        ``(from_id, relation, to_id)`` and verify endpoint type snapshots.
+        The Kùzu facade rejects the read until qualification.
 
-        Always returns a parsed ``dict``, never a raw JSON blob — the
-        properties column/property is JSON-serialized text on Local/PG/Kuzu
-        (SQLite/Kuzu store JSON strings; see each backend's ``upsert_edge``)
-        and this method decodes it before returning, the same way
-        ``get_node`` does for node properties.
+        Always returns a parsed ``dict``, never a raw JSON blob.
         """
+        ...
+
+    def update_node(
+        self, node_id: str, expected_current_digest: str, new_type: str,
+        new_properties: dict[str, Any], new_space_id: str | None = None,
+        *, return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        ...
+
+    def reclassify_node(
+        self,
+        node_id: str,
+        *,
+        expected_current_digest: str,
+        new_type: str,
+        new_space_id: str | None = None,
+        new_properties: dict[str, Any],
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        """Atomically reclassify one global node by expected current digest.
+
+        This CAS has no operation ledger. A second call with the old digest is
+        a stale conflict after the first call succeeds.
+        """
+        ...
+
+    def inspect_graph_identity(self) -> GraphInventory:
+        """Return every typed legacy row and its source fingerprint read-only."""
+        ...
+
+    def migrate_graph_identity(
+        self,
+        request: DryRunMigrationRequest | ApplyMigrationRequest,
+    ) -> MigrationReceipt:
+        """Plan or atomically apply the SQL graph identity migration."""
+        ...
+
+    def delete_edge(self, from_id: str, relation: str, to_id: str, *, owner_pack_id: str) -> bool:
+        ...
+
+    def update_edge(
+        self, from_type: str, from_id: str, relation: str, to_type: str,
+        to_id: str, properties: dict[str, Any] | None = None, *,
+        expected_current_digest: str, owner_pack_id: str,
+        return_receipt: bool = False,
+    ) -> bool | EdgeWriteReceipt:
+        ...
+
+    def get_node_digest(self, node_id: str, *, node_type: str | None = None) -> str | None:
+        ...
+
+    def get_edge_digest(self, from_id: str, relation: str, to_id: str, *, from_type: str | None = None, to_type: str | None = None) -> str | None:
+        ...
+
+    def graph_fingerprint(self) -> str:
+        ...
+
+    def backfill_pack_provenance(self, records: list[dict[str, Any]]) -> ProvenanceBatchReceipt:
         ...
 
     def run_cypher(
@@ -229,9 +296,11 @@ class GraphStore(Protocol):
     ) -> list[dict[str, Any]]:
         """Execute arbitrary Cypher; each result record as one dict.
 
-        Only Neo4jStore and KuzuGraphStore actually run the query.
-        LocalGraphStore and PGGraphStore always return ``[]`` with a
-        logger.warning — this method is NOT a reliable capability probe;
+        Only Neo4jStore runs arbitrary graph queries in the qualified
+        production configuration. The Kùzu facade rejects both read and
+        write queries until its capability is qualified. LocalGraphStore and
+        PGGraphStore always return ``[]`` with a logger.warning — this method
+        is NOT a reliable capability probe;
         use the extended-surface methods (``list_packs``, ``export_nodes``,
         ``find_by_relations``, ...) as the SQL-backend-native replacements
         for the Cypher queries those two backends can't run.
@@ -340,7 +409,7 @@ class GraphStore(Protocol):
 
 @runtime_checkable
 class GraphStoreExtended(Protocol):
-    """The 7 methods this Protocol was carved out for -- originally the ones
+    """The 7 methods this Protocol was carved out for - originally the ones
     LocalGraphStore/PGGraphStore/KuzuGraphStore had and Neo4jStore did not
     (D3's Stage-4 R5 worklist).
 
@@ -384,9 +453,9 @@ class GraphStoreExtended(Protocol):
         """Type-agnostic node lookup by id alone; None if not found.
 
         Returns the node's properties dict with ``"node_type"`` merged in
-        (e.g. ``{"id": ..., "node_type": "Lever", ...}``). Neo4j callers use
-        a Cypher ``MATCH (n {id: $id}) RETURN properties(n), labels(n)[0]``
-        fallback for this today (see opencrab/mcp/tools.py:ontology_get_node).
+        (e.g. ``{"id": ..., "node_type": "Lever", ...}``). Neo4j uses
+        ``OpenCrabNode.node_id`` and the explicit ``node_type`` property.
+        The Kùzu facade rejects this read until qualification.
         """
         ...
 
@@ -395,13 +464,10 @@ class GraphStoreExtended(Protocol):
         ``node_id``, not just whichever one ``get_node_by_id``'s unordered
         ``LIMIT 1`` happens to pick.
 
-        The SQL backends' ``graph_nodes`` PK is ``(node_type, node_id)`` and
-        Neo4j's ``id`` uniqueness is per-label, so the same ``node_id`` can
-        legitimately exist more than once under different types (pinned
-        supported shape: ``tests/test_read_scope_isolation.py``'s "Same
-        node_id in two packs under two node_types" case). Callers that need
-        to reason about pack ownership across ALL matching rows -- rather
-        than accept a non-deterministic single pick -- use this instead.
+        All qualified graph backends use global node_id identity, so a valid
+        target schema has at most one row for an id. The plural method remains
+        available for inspecting legacy or externally corrupted data. Callers
+        that need to reason about every matching row use this instead.
         Rows are ordered by node_type/label for a deterministic result;
         ``[]`` when nothing matches.
         """
@@ -608,7 +674,7 @@ class GraphStoreExtended(Protocol):
         """
         ...
 
-    def upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> int:
+    def upsert_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[NodeWriteReceipt, ...]:
         """Bulk upsert; returns the count processed (``len(nodes)``, or 0
         for the given empty-list edge case — PG/Local short-circuit before
         touching the DB when ``nodes`` is empty).
@@ -621,7 +687,7 @@ class GraphStoreExtended(Protocol):
         """
         ...
 
-    def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
+    def upsert_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
         """Bulk upsert; returns the count processed.
 
         Each item: ``{"from_type": str, "from_id": str, "relation": str,
@@ -633,27 +699,25 @@ class GraphStoreExtended(Protocol):
         """
         ...
 
+    def update_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[NodeWriteReceipt, ...]:
+        ...
+
+    def update_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
+        ...
+
     # ------------------------------------------------------------------
     # Scoped (authorization) surface — issue #147 read-path scoping.
     #
-    # These 4 methods exist BECAUSE the 4 above (``get_node_by_id``,
+    # These 4 methods exist because the 4 above (``get_node_by_id``,
     # ``export_nodes``, ``count_exported_nodes``, ``export_edges``) are
-    # unsafe for an authorization read path and are deliberately left
-    # unchanged for their existing bulk-export/fork use case (see issue
-    # #147 §3.4(b)/§8): ``export_nodes``'s pack_id/source/source_id 3-way OR
-    # lets a node claim membership in a pack it was never actually written
-    # into, and ``get_node_by_id``'s bare ``WHERE node_id=:nid LIMIT 1`` has
-    # no ``node_type`` predicate even though ``graph_nodes``' real PK is
-    # ``(node_type, node_id)`` -- either gap is fine for a pack-export tool
-    # (the caller already owns the whole pack) but not for a permission
-    # check. This is a NEW, separate surface, not a signature change to the
-    # 4 existing methods above.
+    # deliberately broad bulk-export surfaces rather than authorization
+    # predicates. The scoped methods keep their existing pack-export use case
+    # separate from permission checks (see issue #147 §3.4(b)/§8). This is a
+    # new surface, not a signature change to the 4 existing methods above.
     #
-    # Declared on ALL FOUR backends (Local/PG via ``_sql_graph_base.py``,
-    # Kuzu, Neo4j) -- unlike ``search_nodes`` above, Neo4j is NOT exempt
-    # here: Neo4j's node/edge properties are native (not a JSON blob like
-    # Kuzu's), so pushing a pack predicate into Cypher is not the
-    # capability gap ``search_nodes`` has there.
+    # Declared on Local/PG/Neo4j. The Kùzu facade rejects reads until its
+    # capability is qualified, so its compatibility callables are not a
+    # supported scoped-read implementation.
     # ------------------------------------------------------------------
 
     def export_nodes_scoped(
@@ -712,28 +776,19 @@ class GraphStoreExtended(Protocol):
         """Type-agnostic, SCOPE-FILTERED node lookup -- ``get_node_by_id``,
         but with the pack predicate applied BEFORE any row-limiting
         operation (never a Python post-filter over a single already-picked
-        row). This matters because ``graph_nodes``' real PK is
-        ``(node_type, node_id)``: the same ``node_id`` can exist under a
-        DIFFERENT ``node_type`` in a pack the caller cannot read, and
-        filtering after an unscoped ``LIMIT 1`` would sometimes answer "not
-        found" even when the caller's OWN pack genuinely has that id under
-        a different type -- a false-negative on top of the leak a naive
-        post-filter would still have to prevent. Concrete backend
-        requirements differ because of this:
+        row). Graph identity is global ``node_id``; duplicate legacy rows
+        remain a migration condition and must not be hidden by an unscoped
+        ``LIMIT 1``. Concrete backend requirements differ because of this:
           - SQL (Local/PG): the pack predicate is pushed into the SQL WHERE
             clause AHEAD of ``LIMIT 1``.
-          - Kuzu: no ``LIMIT 1`` in the underlying query AT ALL (its
-            properties are a JSON-blob column, so the pack predicate can't
-            be pushed into Cypher) -- every ``node_id``-matching row is
-            fetched and the scope filter picks among them in Python.
+          - Kuzu: the capability-negative facade rejects this read until the
+            transaction/CAS qualification is complete.
           - Neo4j: native properties, so ``n.pack_id IN $pack_ids`` is
             pushed straight into the Cypher WHERE, same as SQL.
 
-        Scope-INTERNAL homonym collisions (two different node_types, BOTH
-        inside the caller's own readable scope, sharing one node_id) are
-        NOT resolved by any backend here -- which row is returned in that
-        case is unspecified. Out of scope for issue #147 (a data-integrity
-        question, not a confidentiality one; see its §8).
+        A valid target cannot contain two node types for one id. A legacy
+        duplicate is therefore a migration condition, not an in-scope
+        authorization result.
 
         Empty ``pack_ids`` -> ``None`` without querying.
         """

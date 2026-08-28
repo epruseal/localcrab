@@ -1,0 +1,132 @@
+{
+  "schema": "issue80-manifest-v1",
+  "repository_root": ".",
+  "kuzu_qualification": {
+    "bundle_id": "kuzu-qualification-v1",
+    "status": "capability-negative",
+    "package": "ladybug",
+    "required_version": "0.19.1",
+    "observed_platform": "macos-arm64-cp314",
+    "qualification_bundle": "tests/fixtures/issue80/qualification/",
+    "negative_probe_ref": "kuzu-capability-negative-v1"
+  },
+  "cases": [
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_inventory_is_read_only_and_duplicate_identity_requires_explicit_mapping",
+      "backend": "sqlite",
+      "phase": "startup",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_malformed_properties_are_lossless_and_rejected_before_dml",
+      "backend": "sqlite",
+      "phase": "startup",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_property_resolution_is_fail_closed_and_valid_plan_has_no_loss",
+      "backend": "sqlite",
+      "phase": "mapping",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_dry_run_has_zero_graph_and_ledger_mutation_and_canonical_plan",
+      "backend": "sqlite",
+      "phase": "mapping",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_apply_cas_cutover_and_reopen_readback",
+      "backend": "sqlite",
+      "phase": "swap",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_migration.py::test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen",
+      "backend": "sqlite",
+      "phase": "swap",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_identity_and_edge_cas_actual",
+      "backend": "sqlite",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_schema_classifier_and_public_gate_actual",
+      "backend": "sqlite",
+      "phase": "startup",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_graph_transaction_boundary_actual",
+      "backend": "sqlite",
+      "phase": "graphtx",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_writer_and_protocol_behavior_actual",
+      "backend": "sqlite",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_graph_apply_refuses_before_target_access",
+      "backend": "unit",
+      "phase": "guards",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_capability_and_writer_ast_inventory_actual",
+      "backend": "kuzu",
+      "phase": "guards",
+      "selection": "capability-negative",
+      "negative_probe_ref": "kuzu-capability-negative-v1"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_capability_negative_actual",
+      "backend": "kuzu",
+      "phase": "runtime",
+      "selection": "capability-negative",
+      "negative_probe_ref": "kuzu-capability-negative-v1"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_identity_and_incident_edge_cas",
+      "backend": "postgresql",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_migration_and_replay",
+      "backend": "postgresql",
+      "phase": "swap",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_provenance_cas",
+      "backend": "postgresql",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_runtime_identity_and_provenance",
+      "backend": "neo4j",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_runtime_concurrent_cas_uses_capability_factory",
+      "backend": "neo4j",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_migration_capability_negative_unit",
+      "backend": "neo4j",
+      "phase": "guards",
+      "selection": "ordinary"
+    }
+  ],
+  "regression_command": "python -m pytest -q"
+}

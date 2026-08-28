@@ -16,7 +16,8 @@ User-facing wrappers and deployment assets should use `localcrab`.
 ## Target full pipeline
 
 1. Core ontology stores and MCP tools — done
-   - local graph store (SQLite by default; `STORAGE_MODE=kuzu` uses Kuzu/ladybug,
+   - local graph store (SQLite by default; `STORAGE_MODE=kuzu` is
+     capability-negative until Ladybug transaction/CAS qualification,
      `STORAGE_MODE=pg` unifies all stores on PostgreSQL)
    - local vector store (sqlite-vec by default; Chroma as an alternate backend,
      pgvector under `STORAGE_MODE=pg`)

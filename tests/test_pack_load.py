@@ -438,13 +438,13 @@ class TestLoadEdges:
         고정한다 — 죽은 변수를 지우는 정리 커밋이 행동을 바꾸지 않았음을 이 테스트가 보장한다.
         """
         builder, graph, _ = live
-        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2"), _node(id="n3")])
         id_map: dict = {}
         pack_load.load_nodes("pack-1", nf, builder, id_map)
         lower = _write_jsonl(tmp_path / "e_lower.jsonl",
                              [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "cites"}])
         upper = _write_jsonl(tmp_path / "e_upper.jsonl",
-                             [{"id": "e2", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+                             [{"id": "e2", "source_id": "n1", "target_id": "n3", "label": "CITES"}])
         # **SUT 대 SUT 비교를 버린다.** 앞선 판은 `load_edges(lower) == load_edges(upper)`
         # 만 봤고, 그래서 양쪽이 똑같이 틀리면 통과했다 — 반전 엣지의 endpoint 교환을
         # 지우는 변이가 35 passed 를 유지했다(적대 검증 실증, 2026-08-10: M17).
@@ -452,13 +452,12 @@ class TestLoadEdges:
         # 둘 다 relation 은 'cites' 로 정규화되고, source_label 은 **원형 그대로** 남는다.
         # 같은 (from, relation, to) 는 upsert 로 덮이므로 **순차로** 확인한다.
         seen = []
-        for f, raw in ((lower, "cites"), (upper, "CITES")):
+        for f, raw, target in ((lower, "cites", "n2"), (upper, "CITES", "n3")):
             ok, skip, err = pack_load.load_edges("pack-1", f, builder, id_map)
             assert (ok, skip, err) == (1, 0, 0), f"{raw}: ok={ok} skip={skip} err={err}"
-            rel, props = graph._conn.execute(
-                "SELECT relation, properties FROM graph_edges WHERE from_id = ?",
-                ("n1",)).fetchone()
-            seen.append((rel, json.loads(props)["source_label"]))
+            edge = graph.get_edge("Document", "n1", "cites", "Document", target)
+            assert edge is not None
+            seen.append((edge["relation"], edge["source_label"]))
         assert [r for r, _ in seen] == ["cites", "cites"], (
             f"대소문자에 따라 relation 이 갈렸다: {seen}")
         assert [lbl for _, lbl in seen] == ["cites", "CITES"], (
@@ -3989,14 +3988,14 @@ class TestFailedEdgeWriteStaysInAppliedProtection:
 
 
 class TestFailedAddNodeLeavesOldTypedRowIntact:
-    """③ 타입 변경에서 `add_node` 저장이 실패하면 구 타입 행이 살아남아야 한다.
+    """③ 타입 변경에서 CAS 저장이 실패하면 구 타입 행이 살아남아야 한다.
 
     새 행이 실제로 저장된 뒤에만 구 타입 행을 지우는 순서(load.py 주석 참조)가
     지켜지지 않으면, 저장 실패 시 구 행과 그 cascade 엣지가 이미 사라진 채로
     다음 증분도 같은 이유로 또 실패해 **영구 소실**된다.
     """
 
-    def test_add_node_store_failure_keeps_the_old_type(self, live, tmp_path, monkeypatch):
+    def test_reclassification_store_failure_keeps_the_old_type(self, live, tmp_path, monkeypatch):
         builder, graph, docs = live
         f_old = _write_jsonl(tmp_path / "old.jsonl", [_node(id="n1", node_type="Document")])
         pack_load.load_nodes("pack-1", f_old, builder, {})
@@ -4004,9 +4003,9 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
 
         live_nodes = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
 
-        def _broken_upsert_node(*a, **kw):
+        def _broken_update_node(*a, **kw):
             raise RuntimeError("주입된 그래프 쓰기 실패")
-        monkeypatch.setattr(graph, "upsert_node", _broken_upsert_node)
+        monkeypatch.setattr(graph, "update_node", _broken_update_node)
 
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])

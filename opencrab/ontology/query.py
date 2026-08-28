@@ -222,7 +222,7 @@ def _neo4j_keyword_cypher(*, with_spaces: bool) -> str:
              OR toLower(n.description) CONTAINS $kw
              OR toLower(n.text) CONTAINS $kw )
           AND n.pack_id IN $pack_ids{space_filter}
-        RETURN properties(n) AS props, labels(n)[0] AS label
+        RETURN properties(n) AS props, n.node_type AS label
         LIMIT $limit
     """
 
@@ -1126,7 +1126,13 @@ class HybridQuery:
                 keyword, pack_ids=pack_ids, spaces=spaces, limit=limit
             )
             return [
-                {"node": row.get("props", {}), "label": (row.get("labels") or [""])[0]}
+                {
+                    "node": row.get("props", {}),
+                    # ``node_type`` is the graph identity.  ``labels`` is
+                    # retained only for rows produced by a pre-issue80
+                    # compatibility implementation.
+                    "label": row.get("node_type") or (row.get("labels") or [""])[0],
+                }
                 for row in rows
             ]
 

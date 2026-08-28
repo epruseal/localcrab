@@ -597,9 +597,9 @@ def test_probe_methods_exist_on_every_real_store_backend():
     graph_backends = [
         ("opencrab.stores.local_graph_store", "LocalGraphStore", frozenset()),
         ("opencrab.stores.pg_graph_store", "PGGraphStore", frozenset()),
-        # `ladybug`, not `kuzu`: the driver was rebranded and the import
-        # follows the new name (see kuzu_graph_store's own import comment).
-        ("opencrab.stores.kuzu_graph_store", "KuzuGraphStore", frozenset({"ladybug"})),
+        # Kùzu is represented by its capability-negative facade. It does not
+        # import an optional driver or open a target during this inventory.
+        ("opencrab.stores.kuzu_graph_store", "KuzuUnavailableGraphStore", frozenset()),
         ("opencrab.stores.neo4j_store", "Neo4jStore", frozenset({"neo4j"})),
     ]
     doc_backends = [
@@ -658,7 +658,8 @@ def test_probe_methods_exist_on_every_real_store_backend():
                 f"(module defines: "
                 f"{sorted(n for n in vars(mod) if n[:1].isupper())})"
             )
-            assert callable(getattr(cls, method, None)), (
+            method_owner = cls() if cls_name == "KuzuUnavailableGraphStore" else cls
+            assert callable(getattr(method_owner, method, None)), (
                 f"{cls_name}.{method} is gone -- opencrab.pack.lifecycle."
                 f"probe_anchor calls it and would silently degrade every "
                 f"re-probe to 'unknown'"

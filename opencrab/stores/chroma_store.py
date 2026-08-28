@@ -128,6 +128,17 @@ class ChromaStore:
         except Exception:
             return False
 
+    def close(self) -> None:
+        """Release the Chroma client and its native database handles."""
+        client = self._client
+        self._client = None
+        self._collection = None
+        self._available = False
+        if client is not None:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
     def _collection_handle(self) -> Any:
         """Return the current collection handle, snapshotted under the lock so a
         concurrent reset_collection() swap is never observed half-applied."""

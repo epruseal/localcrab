@@ -9,17 +9,24 @@ be preserved on every graph object.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
-from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from neo4j import GraphDatabase
-
-from opencrab.common.neo4j_driver import make_driver
+from opencrab.common.graph_identity import (
+    GraphWriteCapabilityUnavailable,
+    canonical_edge_digest,
+    canonical_json_bytes,
+    normalize_edge_properties,
+)
+from opencrab.common.graph_identity import (
+    prepare_node as prepare_graph_node,
+)
 from opencrab.common.pack_tags import apply_pack_tag
+from opencrab.stores.neo4j_store import Neo4jStore
 
 PACK_ID = "nvidia-nemotron-personas-korea"
 SPACE_TO_LABEL = {
@@ -64,7 +71,6 @@ def prepare_node(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "id": row["id"],
         "label": row.get("label"),
         "space": row.get("space"),
-        "node_type": row.get("node_type"),
         "pack_id": props.get("pack_id") or PACK_ID,
         "source_id": props.get("source_id") or PACK_ID,
         "evidence_refs": row.get("evidence_refs") or props.get("evidence_refs") or [],
@@ -73,7 +79,8 @@ def prepare_node(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     # carrying the retired `pack` alias would land a row where the two disagree
     # (#171). Drop it -- pack_id above is authoritative for this import.
     apply_pack_tag(props, props["pack_id"])
-    return label, {"id": row["id"], "props": props}
+    _node_type, props, space_id, digest = prepare_graph_node(label, row["id"], props, row.get("space"))
+    return label, {"id": row["id"], "props": props, "node_type": label, "space_id": space_id, "node_digest": digest}
 
 
 def prepare_edge(row: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
@@ -91,141 +98,67 @@ def prepare_edge(row: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
         "evidence_refs": row.get("evidence_refs") or props.get("evidence_refs") or [],
     })
     apply_pack_tag(props, props["pack_id"])          # see prepare_node
-    return from_label, rel, to_label, {"from_id": row["from_id"], "to_id": row["to_id"], "props": props}
+    props = normalize_edge_properties(row["from_id"], rel, row["to_id"], props)
+    edge_key = hashlib.sha256(canonical_json_bytes([row["from_id"], rel, row["to_id"]])).hexdigest()
+    digest = canonical_edge_digest(row["from_id"], rel, row["to_id"], from_label, to_label, props)
+    return from_label, rel, to_label, {
+        "from_id": row["from_id"], "to_id": row["to_id"], "props": props,
+        "from_type": from_label, "to_type": to_label,
+        "edge_key": edge_key, "edge_digest": digest,
+    }
 
 
-def ensure_schema(session) -> None:
-    for label in sorted(VALID_NODE_LABELS):
-        session.run(f"CREATE CONSTRAINT localcrab_{label.lower()}_id IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE").consume()
-    session.run("CREATE INDEX localcrab_pack_id IF NOT EXISTS FOR (n:Document) ON (n.pack_id)").consume()
-    session.run("CREATE INDEX localcrab_persona_pack_id IF NOT EXISTS FOR (n:Persona) ON (n.pack_id)").consume()
-    session.run("CREATE INDEX localcrab_evidence_pack_id IF NOT EXISTS FOR (n:Evidence) ON (n.pack_id)").consume()
+def ensure_schema(store: Neo4jStore) -> None:
+    store.ensure_constraints()
 
 
-def reset_pack(session) -> None:
-    # Relationship delete first, then nodes. Scoped by pack_id/source_id.
-    session.run(
-        """
-        MATCH ()-[r]->()
-        WHERE r.pack_id = $pack_id OR r.source_id = $pack_id
-        DELETE r
-        """,
-        pack_id=PACK_ID,
-    ).consume()
-    session.run(
-        """
-        MATCH (n)
-        WHERE n.pack_id = $pack_id OR n.source_id = $pack_id
-        DETACH DELETE n
-        """,
-        pack_id=PACK_ID,
-    ).consume()
+def reset_pack(store: Neo4jStore) -> None:
+    """Reset is an administrative fixture operation, not an importer write."""
+    raise GraphWriteCapabilityUnavailable(
+        "pack reset requires an explicitly disposable fixture facade"
+    )
 
 
-def import_nodes(session, nodes_path: Path, batch_size: int) -> int:
+def import_nodes(store: Neo4jStore, nodes_path: Path, batch_size: int) -> int:
     total = 0
-    pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    pending: list[dict[str, Any]] = []
     started = time.time()
-
-    def flush(label: str) -> None:
-        nonlocal total
-        rows = pending[label]
-        if not rows:
-            return
-        query = f"""
-        UNWIND $rows AS row
-        MERGE (n:{label} {{id: row.id}})
-        SET n += row.props
-        """
-        session.run(query, rows=rows).consume()
-        total += len(rows)
-        pending[label] = []
-        if total % 100000 == 0:
-            print(f"imported nodes={total} elapsed={time.time()-started:.1f}s", flush=True)
 
     for row in iter_jsonl(nodes_path):
         label, payload = prepare_node(row)
-        pending[label].append(payload)
-        if len(pending[label]) >= batch_size:
-            flush(label)
-    for label in list(pending):
-        flush(label)
+        pending.append({"node_type": label, "node_id": payload["id"], "properties": payload["props"], "space_id": payload["space_id"]})
+        if len(pending) >= batch_size:
+            total += int(store.upsert_nodes_batch(pending))
+            pending = []
+    if pending:
+        total += int(store.upsert_nodes_batch(pending))
     print(f"imported nodes={total} elapsed={time.time()-started:.1f}s", flush=True)
     return total
 
 
-def import_edges(session, edges_path: Path, batch_size: int) -> int:
+def import_edges(store: Neo4jStore, edges_path: Path, batch_size: int) -> int:
     total = 0
-    pending: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    pending: list[dict[str, Any]] = []
     started = time.time()
-
-    def flush(key: tuple[str, str, str]) -> None:
-        nonlocal total
-        rows = pending[key]
-        if not rows:
-            return
-        from_label, rel, to_label = key
-        query = f"""
-        UNWIND $rows AS row
-        MATCH (a:{from_label} {{id: row.from_id}})
-        MATCH (b:{to_label} {{id: row.to_id}})
-        MERGE (a)-[r:{rel}]->(b)
-        SET r += row.props
-        """
-        session.run(query, rows=rows).consume()
-        total += len(rows)
-        pending[key] = []
-        if total % 100000 == 0:
-            print(f"imported edges={total} elapsed={time.time()-started:.1f}s", flush=True)
 
     for row in iter_jsonl(edges_path):
         from_label, rel, to_label, payload = prepare_edge(row)
-        key = (from_label, rel, to_label)
-        pending[key].append(payload)
-        if len(pending[key]) >= batch_size:
-            flush(key)
-    for key in list(pending):
-        flush(key)
+        pending.append({"from_type": from_label, "from_id": payload["from_id"], "relation": rel, "to_type": to_label, "to_id": payload["to_id"], "properties": payload["props"]})
+        if len(pending) >= batch_size:
+            total += int(store.upsert_edges_batch(pending))
+            pending = []
+    if pending:
+        total += int(store.upsert_edges_batch(pending))
     print(f"imported edges={total} elapsed={time.time()-started:.1f}s", flush=True)
     return total
 
 
 
-def hydrate_evidence(session, evidence_path: Path, batch_size: int) -> int:
+def hydrate_evidence(store: Neo4jStore, evidence_path: Path, batch_size: int) -> int:
     """Attach full evidence text/hash/source metadata to Evidence nodes."""
     total = 0
     pending: list[dict[str, Any]] = []
     started = time.time()
-
-    def flush() -> None:
-        nonlocal total, pending
-        if not pending:
-            return
-        session.run(
-            """
-            UNWIND $rows AS row
-            MATCH (e:Evidence {id: row.node_id})
-            SET e.evidence_id = row.evidence_id,
-                e.hash = row.hash,
-                e.text = row.text,
-                e.source_path = row.source_path,
-                e.source_url = row.source_url,
-                e.source_title = row.source_title,
-                e.source_file_sha256 = row.source_file_sha256,
-                e.parser_status = row.parser_status,
-                e.parser_method = row.parser_method,
-                e.row_index = row.row_index,
-                e.uuid = row.uuid,
-                e.pack_id = $pack_id,
-                e.source_id = $pack_id
-            """,
-            rows=pending,
-            pack_id=PACK_ID,
-        ).consume()
-        total += len(pending)
-        pending = []
-        if total % 100000 == 0:
-            print(f"hydrated evidence={total} elapsed={time.time()-started:.1f}s", flush=True)
 
     for obj in iter_jsonl(evidence_path):
         if obj.get("kind") != "persona_row":
@@ -235,8 +168,8 @@ def hydrate_evidence(session, evidence_path: Path, batch_size: int) -> int:
         uuid = str(source.get("uuid") or obj.get("row", {}).get("uuid") or "")
         if not uuid:
             continue
-        pending.append({
-            "node_id": f"evidence-node:{uuid}",
+        hydrated_props = {
+            "id": f"evidence-node:{uuid}",
             "evidence_id": obj.get("evidence_id"),
             "hash": obj.get("hash"),
             "text": obj.get("text") or "",
@@ -248,73 +181,21 @@ def hydrate_evidence(session, evidence_path: Path, batch_size: int) -> int:
             "parser_method": parser.get("method"),
             "row_index": source.get("row_index"),
             "uuid": uuid,
-        })
+            "pack_id": PACK_ID,
+            "source_id": PACK_ID,
+        }
+        pending.append({"node_id": f"evidence-node:{uuid}", "properties": hydrated_props})
         if len(pending) >= batch_size:
-            flush()
-    flush()
+            total += int(store.hydrate_evidence(pending))
+            pending = []
+    if pending:
+        total += int(store.hydrate_evidence(pending))
     print(f"hydrated evidence={total} elapsed={time.time()-started:.1f}s", flush=True)
     return total
 
 
-def validate(session) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    result["nodes_by_label"] = session.run(
-        """
-        MATCH (n)
-        WHERE n.pack_id = $pack_id OR n.source_id = $pack_id
-        RETURN labels(n)[0] AS label, count(n) AS count
-        ORDER BY label
-        """,
-        pack_id=PACK_ID,
-    ).data()
-    result["edges_by_type"] = session.run(
-        """
-        MATCH ()-[r]->()
-        WHERE r.pack_id = $pack_id OR r.source_id = $pack_id
-        RETURN type(r) AS type, count(r) AS count
-        ORDER BY type
-        """,
-        pack_id=PACK_ID,
-    ).data()
-    result["missing_node_evidence_refs"] = session.run(
-        """
-        MATCH (n)
-        WHERE (n.pack_id = $pack_id OR n.source_id = $pack_id)
-          AND (n:Persona OR n:Evidence)
-          AND (n.evidence_refs IS NULL OR size(n.evidence_refs) = 0)
-        RETURN count(n) AS count
-        """,
-        pack_id=PACK_ID,
-    ).single()["count"]
-    result["missing_edge_evidence_refs"] = session.run(
-        """
-        MATCH ()-[r]->()
-        WHERE (r.pack_id = $pack_id OR r.source_id = $pack_id)
-          AND (r.evidence_refs IS NULL OR size(r.evidence_refs) = 0)
-        RETURN count(r) AS count
-        """,
-        pack_id=PACK_ID,
-    ).single()["count"]
-    result["unhydrated_evidence_nodes"] = session.run(
-        """
-        MATCH (e:Evidence)
-        WHERE (e.pack_id = $pack_id OR e.source_id = $pack_id)
-          AND (e.text IS NULL OR e.hash IS NULL OR e.source_path IS NULL)
-        RETURN count(e) AS count
-        """,
-        pack_id=PACK_ID,
-    ).single()["count"]
-    result["sample"] = session.run(
-        """
-        MATCH (d:Document {id: $dataset_id})-[c:CONTAINS]->(p:Persona)<-[s:SUPPORTS]-(e:Evidence)
-        RETURN p.id AS persona_id, p.evidence_refs AS persona_evidence_refs,
-               e.id AS evidence_node_id, c.evidence_refs AS contains_evidence_refs,
-               s.evidence_refs AS supports_evidence_refs
-        LIMIT 1
-        """,
-        dataset_id=f"dataset:{PACK_ID}",
-    ).data()
-    return result
+def validate(store: Neo4jStore) -> dict[str, Any]:
+    return store.validate_import(PACK_ID)
 
 
 def main() -> int:
@@ -336,20 +217,21 @@ def main() -> int:
     evidence_path = stage / "evidence/index.jsonl"
     status_path = stage.parent / "neo4j_import_status.json"
 
-    with make_driver(GraphDatabase, args.uri, args.user, args.password, max_connection_lifetime=3600) as driver:
-        driver.verify_connectivity()
-        with driver.session() as session:
-            ensure_schema(session)
-            if args.reset and not args.validate_only and not args.hydrate_only:
-                print("resetting existing pack graph in Neo4j", flush=True)
-                reset_pack(session)
-            node_count = edge_count = evidence_hydrated = None
-            if not args.validate_only and not args.hydrate_only:
-                node_count = import_nodes(session, nodes_path, args.batch_size)
-                edge_count = import_edges(session, edges_path, args.batch_size)
-            if args.hydrate_evidence or args.hydrate_only:
-                evidence_hydrated = hydrate_evidence(session, evidence_path, args.batch_size)
-            validation = validate(session)
+    store = Neo4jStore(args.uri, args.user, args.password, database=None)
+    try:
+        ensure_schema(store)
+        if args.reset and not args.validate_only and not args.hydrate_only:
+            print("reset requested; an explicitly disposable fixture facade is required", flush=True)
+            reset_pack(store)
+        node_count = edge_count = evidence_hydrated = None
+        if not args.validate_only and not args.hydrate_only:
+            node_count = import_nodes(store, nodes_path, args.batch_size)
+            edge_count = import_edges(store, edges_path, args.batch_size)
+        if args.hydrate_evidence or args.hydrate_only:
+            evidence_hydrated = hydrate_evidence(store, evidence_path, args.batch_size)
+        validation = validate(store)
+    finally:
+        store.close()
 
     status = {
         "status": "ok",

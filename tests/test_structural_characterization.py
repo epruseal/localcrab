@@ -148,7 +148,7 @@ def test_normalise_node_opencrab_full_row():
             "id": "n1",
             "label": "Doc A",
             "space": "",  # opencrab 은 LABEL_TO_SPACE 를 쓰지 않아 빈 문자열
-            "node_type": "Document",  # labels[0]
+            "node_type": "",  # multiple non-marker labels are ambiguous
             "labels": ["Document", "Thing"],
             "properties": {"id": "n1", "name": "Doc A", "node_type": None},
             "evidence_refs": [],
@@ -206,10 +206,10 @@ def test_normalise_node_evidence_refs_fallback_now_shared():
 
 
 def test_normalise_node_node_type_priority_difference():
-    # labels=["Foo","Evidence"]: opencrab=labels[0]="Foo",
-    # script=LABELS 우선순위로 "Evidence".
+    # labels=["Foo","Evidence"]: opencrab은 다중 domain label을 모호한
+    # 상태로 남기고, script는 LABELS 우선순위로 "Evidence"를 고른다.
     row = {"props": {"id": "n6"}, "labels": ["Foo", "Evidence"]}
-    assert _normalise_node(row)["payload"]["node_type"] == "Foo"
+    assert _normalise_node(row)["payload"]["node_type"] == ""
     assert _expg.normalise_node(row)["payload"]["node_type"] == "Evidence"
 
 
@@ -683,7 +683,7 @@ def test_export_script_driver_args(tmp_path):
 _imp_pkg = _load_module_from_path("imp_pkg_char", "scripts/import_pack_graph_to_neo4j.py")
 
 
-def test_import_script_driver_args(tmp_path):
+def test_import_script_store_args(tmp_path):
     stage = tmp_path / "stage"
     stage.mkdir(parents=True)
     capture: dict = {}
@@ -696,29 +696,32 @@ def test_import_script_driver_args(tmp_path):
         "--batch-size", "55",
         "--validate-only",
     ]
-    fake_gd = _make_capturing_driver(capture)
+    class FakeStore:
+        def __init__(self, uri, user, password, database=None):
+            capture.update(uri=uri, user=user, password=password, database=database)
 
-    def fake_driver(uri, **kwargs):
-        capture["uri"] = uri
-        capture["kwargs"] = kwargs
-        driver = MagicMock()
-        driver.__enter__.return_value = driver
-        driver.__exit__.return_value = False
-        sess = MagicMock()
-        sess.__enter__.return_value = sess
-        sess.__exit__.return_value = False
-        driver.session.return_value = sess
-        return driver
+        def ensure_constraints(self):
+            capture["ensured"] = True
 
-    fake_gd.driver.side_effect = fake_driver
-    with patch.object(_imp_pkg, "GraphDatabase", fake_gd), patch.object(sys, "argv", argv):
+        def validate_import(self, pack_id):
+            capture["validated"] = pack_id
+            return {}
+
+        def close(self):
+            capture["closed"] = True
+
+    with patch.object(_imp_pkg, "Neo4jStore", FakeStore), patch.object(sys, "argv", argv):
         rc = _imp_pkg.main()
 
     assert rc == 0
-    assert capture["uri"] == "bolt://imp:7687"
-    assert capture["kwargs"] == {
-        "auth": ("iu", "ip"),
-        "max_connection_lifetime": 3600,
+    assert capture == {
+        "uri": "bolt://imp:7687",
+        "user": "iu",
+        "password": "ip",
+        "database": None,
+        "ensured": True,
+        "validated": _imp_pkg.PACK_ID,
+        "closed": True,
     }
 
 

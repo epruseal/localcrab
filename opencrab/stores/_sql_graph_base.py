@@ -8,12 +8,9 @@ available/ping/close), parameterised by a ``SqlDialect`` (SQLITE or POSTGRES
 from ``_sql_dialect.py``) — the Stage 6b (graph) counterpart of
 ``_sql_doc_base.py`` (Stage 6a, doc-store).
 
-STAGE 6b STATUS: authored and unit-tested standalone. NOT yet wired into
-LocalGraphStore / PGGraphStore — that migration is Stage 6b's F3 (SQLite) /
-F4 (PG) adopter follow-up, done separately given how risky this refactor
-class is (BFS traversal + hub fan-out perf are load-bearing). factory.py, the
-two stores' public class names, and their module paths are all unchanged by
-this file's existence.
+STAGE 6b STATUS: wired into LocalGraphStore and PGGraphStore. Both adapters
+use the global graph identity declared by ``GRAPH_STORE_SCHEMA`` and retain
+their backend-specific connection, transaction, and lifecycle hooks.
 
 ADOPTION CONTRACT — a subclass must:
   1. Set ``self._dialect = SQLITE`` or ``POSTGRES`` before any base method
@@ -26,18 +23,6 @@ ADOPTION CONTRACT — a subclass must:
        - ``_table(name) -> str``                     table-name qualification
        - ``_fetch_all(sql, params) -> list[tuple]``   SELECT, all rows
        - ``_fetch_one(sql, params) -> tuple | None``  SELECT, first row
-       - ``_exec_write(sql, params) -> int``          one write statement;
-         rowcount; must commit
-       - ``_exec_write_many(statements) -> list[int]``  MULTIPLE write
-         statements in ONE transaction (rowcount per statement) — needed
-         because ``delete_node`` must delete the node row and its incident
-         edges atomically (two DELETEs, one commit), matching both existing
-         stores' current behavior
-       - ``_exec_write_batch(sql, params_list) -> None``  one INSERT/UPSERT
-         statement executed once per params dict, all in one transaction
-         (SQLite: ``executemany`` + one commit; PG: one ``conn.execute(stmt,
-         list_of_dicts)`` — SQLAlchemy expands this to an executemany
-         automatically) — used by ``upsert_nodes_batch``/``upsert_edges_batch``
        - ``_require_available() -> None``             raise if store unavailable
   3. Override the BFS prefetch hooks IF batching matters for that backend
      (see "THE _prefetch_frontier / _batch_node_props HOOKS" below) — the
@@ -99,8 +84,8 @@ THE _prefetch_frontier / _batch_node_props HOOKS (find_neighbors' BFS):
     perf-only, not correctness, gap — but it means adopting LocalGraphStore
     onto this base as-is would slightly loosen (to PG's already-shipped,
     already-benchmarked level) its own historical hub-fanout optimization.
-    F3 should re-run bench_graph_backends.py after adoption before assuming
-    this is a non-issue.
+    The adapters should re-run bench_graph_backends.py after substantial
+    traversal changes because hub fan-out remains load-bearing.
 
 PACK_ID TYPE UNIFICATION (Stage 6b Deliverable 2, user-approved: unify to
     str): ``list_packs()`` projects pack_id via a raw JSON-field extraction.
@@ -117,19 +102,61 @@ PACK_ID TYPE UNIFICATION (Stage 6b Deliverable 2, user-approved: unify to
 from __future__ import annotations
 
 import abc
+import hashlib
 import json
 import logging
+import os
+import re
+import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from opencrab.common.graph_identity import (
+    ApplyMigrationRequest,
+    DryRunMigrationRequest,
+    EdgeIdentityConflict,
+    EdgeWriteReceipt,
+    ExplicitMerge,
+    ExplicitRename,
+    FrozenDict,
+    GraphInventory,
+    GraphMigrationConflict,
+    GraphSchemaMigrationRequired,
+    LegacyEdgeRow,
+    LegacyNodeKey,
+    LegacyNodeRow,
+    MigrationPlanPayload,
+    MigrationReceipt,
+    MigrationReceiptPayload,
+    NodeIdentityConflict,
+    NodeWriteReceipt,
+    PropertyNormalizationIssue,
+    PropertyResolution,
+    ProvenanceBatchReceipt,
+    ProvenanceWriteReceipt,
+    canonical_edge_digest,
+    canonical_json_bytes,
+    canonical_node_digest,
+    canonical_plan_bytes,
+    canonical_receipt_bytes,
+    decode_raw_properties,
+    normalize_edge_properties,
+    parse_properties_object,
+    plan_sha256,
+    prepare_node,
+    receipt_sha256,
+    thaw_json,
+    validate_digest,
+)
 from opencrab.stores._graph_common import (
     KEYWORD_SEARCH_FIELDS,
     _as_dict,
     _edge_passes,
     _merge_space,
     _node_passes,
-    _normalize_space,
     _space_passes,
     _validate_search_fields,
 )
@@ -161,7 +188,7 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
                 Column("space_id", "text", not_null=False),
                 Column("properties", "json", default="{}"),
             ),
-            primary_key=("node_type", "node_id"),
+            primary_key=("node_id",),
         ),
         TableSpec(
             name="graph_edges",
@@ -173,7 +200,7 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
                 Column("to_id", "text"),
                 Column("properties", "json", default="{}"),
             ),
-            primary_key=("from_type", "from_id", "relation", "to_type", "to_id"),
+            primary_key=("from_id", "relation", "to_id"),
         ),
     ),
     indexes=(
@@ -222,6 +249,174 @@ GRAPH_STORE_SCHEMA = SchemaSpec(
 )
 
 
+_GRAPH_SQL_CONTROLS = frozenset({
+    "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ABORT",
+    "SET", "RESET", "DISCARD", "LOCK", "PREPARE", "EXECUTE", "DEALLOCATE", "DECLARE",
+    "FETCH", "MOVE", "CLOSE", "LISTEN", "UNLISTEN", "NOTIFY", "CHECKPOINT",
+    "ATTACH", "DETACH", "VACUUM", "PRAGMA",
+})
+_DOLLAR_TAG = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+
+def validate_graph_sql(sql: str) -> None:
+    """Allow exactly one ordinary SQL statement and reject state controls."""
+    if not isinstance(sql, str):
+        raise ValueError("graph SQL lexical form is invalid")
+    tokens: list[str] = []
+    statement_count = 0
+    saw_effective = False
+    boundary = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i + 2)
+            i = n if end < 0 else end + 1
+            continue
+        if sql.startswith("/*", i):
+            depth = 1
+            i += 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif sql.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise ValueError("graph SQL lexical form is invalid")
+            continue
+        if c == ";":
+            if not saw_effective:
+                raise ValueError("graph SQL must contain exactly one statement")
+            if boundary:
+                raise ValueError("graph SQL must contain exactly one statement")
+            boundary = True
+            i += 1
+            continue
+        if c in ("'", '"', "`", "["):
+            opening = c
+            closing = "]" if c == "[" else c
+            i += 1
+            closed = False
+            while i < n:
+                if sql[i] == closing:
+                    if i + 1 < n and sql[i + 1] == closing:
+                        i += 2
+                        continue
+                    i += 1
+                    closed = True
+                    break
+                if sql[i] == "\\" and opening == "'" and i + 1 < n:
+                    i += 2
+                else:
+                    i += 1
+            if not closed:
+                raise ValueError("graph SQL lexical form is invalid")
+            if boundary:
+                raise ValueError("graph SQL must contain exactly one statement")
+            saw_effective = True
+            continue
+        if c == "$":
+            match = _DOLLAR_TAG.match(sql, i)
+            if match:
+                tag = match.group(0)
+                end = sql.find(tag, match.end())
+                if end < 0:
+                    raise ValueError("graph SQL lexical form is invalid")
+                if boundary:
+                    raise ValueError("graph SQL must contain exactly one statement")
+                saw_effective = True
+                i = end + len(tag)
+                continue
+        if c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            word = sql[i:j].upper()
+            if boundary and word in _GRAPH_SQL_CONTROLS:
+                raise ValueError("graph SQL control statements are forbidden")
+            if boundary:
+                raise ValueError("graph SQL must contain exactly one statement")
+            if not saw_effective:
+                if word in _GRAPH_SQL_CONTROLS:
+                    raise ValueError("graph SQL control statements are forbidden")
+                statement_count += 1
+            saw_effective = True
+            tokens.append(word)
+            i = j
+            continue
+        if boundary:
+            # punctuation after a terminator starts a second statement
+            raise ValueError("graph SQL must contain exactly one statement")
+        saw_effective = True
+        i += 1
+    if not saw_effective or statement_count != 1:
+        raise ValueError("graph SQL must contain exactly one statement")
+
+
+class GraphResult:
+    """Small result facade that prevents cursor/driver objects escaping."""
+
+    def __init__(self, result: Any) -> None:
+        self._result = result
+
+    def fetchone(self) -> Any:
+        return self._result.fetchone()
+
+    def fetchall(self) -> list[Any]:
+        return list(self._result.fetchall())
+
+    @property
+    def rowcount(self) -> int:
+        return int(getattr(self._result, "rowcount", -1))
+
+
+class GraphTx:
+    """Dialect-aware, single-statement transaction callback surface."""
+
+    def __init__(self, connection: Any, dialect: SqlDialect, text_factory: Callable[[str], Any] | None = None) -> None:
+        self._dialect = dialect
+        def execute_impl(sql: str, params: dict[str, Any] | None = None) -> GraphResult:
+            validate_graph_sql(sql)
+            statement = text_factory(sql) if text_factory else sql
+            return GraphResult(connection.execute(statement, params or {}))
+
+        def executemany_impl(sql: str, rows: Iterable[dict[str, Any]]) -> GraphResult:
+            validate_graph_sql(sql)
+            statement = text_factory(sql) if text_factory else sql
+            bound_rows = list(rows)
+            executemany = getattr(connection, "executemany", None)
+            if executemany is not None and text_factory is None:
+                return GraphResult(executemany(statement, bound_rows))
+            return GraphResult(connection.execute(statement, bound_rows))
+
+        self._execute_impl = execute_impl
+        self._executemany_impl = executemany_impl
+
+    def execute(self, sql: str, params: dict[str, Any] | None = None) -> GraphResult:
+        return self._execute_impl(sql, params)
+
+    def executemany(self, sql: str, rows: Iterable[dict[str, Any]]) -> GraphResult:
+        return self._executemany_impl(sql, rows)
+
+    def fetchone(self, sql: str, params: dict[str, Any] | None = None) -> Any:
+        return self.execute(sql, params).fetchone()
+
+    def fetchall(self, sql: str, params: dict[str, Any] | None = None) -> list[Any]:
+        return self.execute(sql, params).fetchall()
+
+    @staticmethod
+    def rowcount(result: GraphResult) -> int:
+        return result.rowcount
+
+
 class _SqlGraphStoreBase(abc.ABC):
     _dialect: SqlDialect
 
@@ -239,23 +434,100 @@ class _SqlGraphStoreBase(abc.ABC):
     def _fetch_one(self, sql: str, params: dict[str, Any]) -> tuple | None: ...
 
     @abc.abstractmethod
-    def _exec_write(self, sql: str, params: dict[str, Any]) -> int: ...
-
-    @abc.abstractmethod
-    def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]: ...
-
-    @abc.abstractmethod
-    def _exec_write_batch(self, sql: str, params_list: list[dict[str, Any]]) -> None: ...
-
-    @abc.abstractmethod
     def _require_available(self) -> None: ...
+
+    def _require_write_available(self) -> None:
+        """Require a classified target schema for graph mutations.
+
+        Legacy and partially classified databases retain their read surface so
+        operators can inspect them, but no mutation may infer that they are
+        safe merely because a connection exists.
+        """
+        self._require_available()
+        state = getattr(self, "_schema_state", "available")
+        if state not in {"target", "available"}:
+            raise GraphSchemaMigrationRequired("graph schema migration required")
+
+    def _graph_tx_is_active(self) -> bool:
+        """Return whether this thread owns a graph transaction callback.
+
+        The store object is shared by the local concurrency callers, while
+        each SQLite worker has its own connection.  A boolean on ``self``
+        therefore made an unrelated thread look like a nested transaction.
+        Keep the marker thread-local; the database connection/transaction
+        remains the authority for the actual boundary.
+        """
+        state = getattr(self, "_graph_tx_state", None)
+        return bool(state is not None and getattr(state, "active", False))
+
+    def _set_graph_tx_active(self, active: bool) -> None:
+        state = getattr(self, "_graph_tx_state", None)
+        if state is None:
+            state = threading.local()
+            self._graph_tx_state = state
+        state.active = active
+
+    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, exclusive: bool = False, snapshot_path: Path | None = None) -> Any:
+        """Run a callback on one connection.
+
+        Concrete adapters override this to supply their native transaction
+        boundary.  The fallback keeps small in-memory test adopters useful.
+        """
+        if self._graph_tx_is_active():
+            raise RuntimeError("nested graph transaction is not allowed")
+        conn = getattr(self, "_conn", None)
+        if conn is None:
+            raise RuntimeError("graph transaction is unavailable")
+        if callable(conn):
+            conn = conn
+        if hasattr(self, "_tx"):
+            self._set_graph_tx_active(True)
+            try:
+                with self._tx(immediate=immediate, exclusive=exclusive) as raw:
+                    return callback(GraphTx(raw, self._dialect, getattr(self, "_text", None)))
+            finally:
+                self._set_graph_tx_active(False)
+        self._set_graph_tx_active(True)
+        try:
+            result = callback(GraphTx(conn, self._dialect, getattr(self, "_text", None)))
+            conn.commit()
+            return result
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            self._set_graph_tx_active(False)
+
+    def _run_mutation_tx(self, callback: Callable[[GraphTx], Any]) -> Any:
+        """Run a mutation with the backend's transaction options.
+
+        SQLite needs ``BEGIN IMMEDIATE`` for its process-local writer lock;
+        PostgreSQL's adapter opens every graph transaction as a write-capable
+        transaction and deliberately rejects SQLite-only options.
+        """
+        return self._run_graph_tx(callback, immediate=self._dialect.name == "sqlite")
+
+    def _lock_graph_rows(
+        self,
+        tx: GraphTx,
+        node_ids: Iterable[str] = (),
+        edge_keys: Iterable[tuple[str, str, str]] = (),
+    ) -> None:
+        """Lock graph rows in the backend's canonical order.
+
+        SQLite already serializes graph writers with ``BEGIN IMMEDIATE`` and
+        therefore needs no row-level operation.  PostgreSQL overrides this
+        hook with ``FOR UPDATE`` reads.  Keeping the calls in the shared
+        mutation bodies makes the lock plan auditable and prevents one SQL
+        adapter from silently skipping a phase when a new writer is added.
+        """
 
     # ------------------------------------------------------------------
     # Schema (no-op for both current backends — PRIMARY KEY covers uniqueness)
     # ------------------------------------------------------------------
 
     def ensure_constraints(self) -> None:
-        pass
+        self._require_write_available()
 
     # ------------------------------------------------------------------
     # Node operations
@@ -267,30 +539,42 @@ class _SqlGraphStoreBase(abc.ABC):
         node_id: str,
         properties: dict[str, Any],
         space_id: str | None = None,
-    ) -> dict[str, Any]:
-        self._require_available()
-        props = {**properties, "id": node_id}
-        # issue #118: reconcile space_id/props["space"] before either lands,
-        # so the SQL predicates below (space_id column) can never disagree
-        # with what _merge_space would report back out on read.
-        props, space_id = _normalize_space(props, space_id)
-        sql = self._dialect.upsert(
-            self._table("graph_nodes"),
-            ["node_type", "node_id", "space_id", "properties"],
-            conflict_cols=["node_type", "node_id"],
-            update_cols=["space_id", "properties"],
-            json_columns=["properties"],
-        )
-        self._exec_write(
-            sql,
-            {
-                "node_type": node_type,
-                "node_id": node_id,
-                "space_id": space_id,
-                "properties": json.dumps(props),
-            },
-        )
-        return props
+        *,
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        self._require_write_available()
+        node_type, props, space_id, digest = prepare_node(node_type, node_id, properties, space_id)
+        table = self._table("graph_nodes")
+        insert_sql = self._dialect.insert(
+            table, ["node_type", "node_id", "space_id", "properties"], json_columns=["properties"]
+        ) + "\nON CONFLICT (node_id) DO NOTHING"
+        params = {"node_type": node_type, "node_id": node_id, "space_id": space_id, "properties": json.dumps(props, ensure_ascii=False)}
+
+        def body(tx: GraphTx) -> dict[str, Any] | NodeWriteReceipt:
+            self._lock_graph_rows(tx, (node_id,))
+            row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {table} WHERE node_id=:nid", {"nid": node_id})
+            operation = "idempotent" if row is not None else "created"
+            if row is None:
+                inserted = tx.execute(insert_sql, params)
+                if tx.rowcount(inserted) == 0:
+                    operation = "idempotent"
+                row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {table} WHERE node_id=:nid", {"nid": node_id})
+            if row is None:
+                raise RuntimeError("graph node insert did not produce a row")
+            stored_type, stored_space, stored_raw = row
+            stored_props = _merge_space(_as_dict(stored_raw), stored_space)
+            try:
+                stored_digest = canonical_node_digest(stored_type, stored_space or stored_props.get("space"), stored_props)
+            except (TypeError, ValueError):
+                stored_digest = ""
+            if stored_digest != digest:
+                raise NodeIdentityConflict(f"node identity conflict: {node_id}")
+            if operation != "created":
+                operation = "idempotent"
+            if return_receipt:
+                return NodeWriteReceipt(operation, node_id, stored_type, stored_space, stored_props, stored_digest)
+            return stored_props
+        return self._run_mutation_tx(body)
 
     def get_node(self, node_type: str, node_id: str) -> dict[str, Any] | None:
         self._require_available()
@@ -308,6 +592,9 @@ class _SqlGraphStoreBase(abc.ABC):
         """No ``_require_available()`` — mirrors both existing stores, which
         return ``None`` on an unavailable store instead of raising (used as a
         best-effort probe by OntologyBuilder)."""
+        # Schema classification gates mutations, not this read probe. A
+        # legacy database is intentionally left inspectable so an operator
+        # can discover the endpoint type before planning its migration.
         if not getattr(self, "_available", False):
             return None
         sql = f"SELECT node_type FROM {self._table('graph_nodes')} WHERE node_id=:node_id LIMIT 1"
@@ -317,17 +604,28 @@ class _SqlGraphStoreBase(abc.ABC):
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """True iff the node itself was deleted (unified B2 contract); the
         incident-edge cleanup is a side effect, not the signal. Both DELETEs
-        run in ONE transaction via ``_exec_write_many`` so a crash between
-        them can never leave orphaned edges."""
-        self._require_available()
-        params = {"nt": node_type, "nid": node_id}
-        node_sql = f"DELETE FROM {self._table('graph_nodes')} WHERE node_type=:nt AND node_id=:nid"
-        edge_sql = (
-            f"DELETE FROM {self._table('graph_edges')}"
-            " WHERE (from_type=:nt AND from_id=:nid) OR (to_type=:nt AND to_id=:nid)"
-        )
-        rowcounts = self._exec_write_many([(node_sql, params), (edge_sql, params)])
-        return rowcounts[0] > 0
+        run in the same managed transaction so a crash between them can never
+        leave orphaned edges."""
+        self._require_write_available()
+        if not isinstance(node_type, str) or not isinstance(node_id, str) or not node_type or not node_id:
+            raise ValueError("graph identity fields must be non-empty strings")
+        nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
+        def body(tx: GraphTx) -> bool:
+            self._lock_graph_rows(tx, (node_id,))
+            incident = tx.fetchall(
+                f"SELECT from_id, relation, to_id FROM {edges} WHERE from_id=:nid OR to_id=:nid",
+                {"nid": node_id},
+            )
+            self._lock_graph_rows(tx, (), ((row[0], row[1], row[2]) for row in incident))
+            row = tx.fetchone(f"SELECT node_type FROM {nodes} WHERE node_id=:nid", {"nid": node_id})
+            if row is None or row[0] != node_type:
+                return False
+            result = tx.execute(f"DELETE FROM {nodes} WHERE node_id=:nid AND node_type=:nt", {"nid": node_id, "nt": node_type})
+            if tx.rowcount(result) != 1:
+                raise RuntimeError("graph node delete rowcount mismatch")
+            tx.execute(f"DELETE FROM {edges} WHERE from_id=:nid OR to_id=:nid", {"nid": node_id})
+            return True
+        return self._run_mutation_tx(body)
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -341,27 +639,51 @@ class _SqlGraphStoreBase(abc.ABC):
         to_type: str,
         to_id: str,
         properties: dict[str, Any] | None = None,
-    ) -> bool:
-        self._require_available()
-        sql = self._dialect.upsert(
-            self._table("graph_edges"),
-            ["from_type", "from_id", "relation", "to_type", "to_id", "properties"],
-            conflict_cols=["from_type", "from_id", "relation", "to_type", "to_id"],
-            update_cols=["properties"],
-            json_columns=["properties"],
-        )
-        self._exec_write(
-            sql,
-            {
-                "from_type": from_type,
-                "from_id": from_id,
-                "relation": relation,
-                "to_type": to_type,
-                "to_id": to_id,
-                "properties": json.dumps(properties or {}),
-            },
-        )
-        return True
+        *,
+        return_receipt: bool = False,
+    ) -> bool | EdgeWriteReceipt:
+        self._require_write_available()
+        for value in (from_type, from_id, relation, to_type, to_id):
+            if not isinstance(value, str) or not value:
+                raise ValueError("graph identity fields must be non-empty strings")
+        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
+        nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
+        insert_sql = self._dialect.insert(edges, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (from_id, relation, to_id) DO NOTHING"
+        params = {"from_type": from_type, "from_id": from_id, "relation": relation, "to_type": to_type, "to_id": to_id, "properties": json.dumps(props, ensure_ascii=False)}
+        def body(tx: GraphTx) -> bool | EdgeWriteReceipt:
+            self._lock_graph_rows(tx, (from_id, to_id), ((from_id, relation, to_id),))
+            endpoint_rows = tx.fetchall(f"SELECT node_id, node_type FROM {nodes} WHERE node_id IN (:fid, :tid)", {"fid": from_id, "tid": to_id})
+            endpoint_map = {r[0]: r[1] for r in endpoint_rows}
+            if from_id not in endpoint_map:
+                return False
+            if to_id not in endpoint_map:
+                return False
+            if endpoint_map[from_id] != from_type:
+                return False
+            if endpoint_map[to_id] != to_type:
+                return False
+            row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
+            operation = "idempotent" if row is not None else "created"
+            if row is None:
+                result = tx.execute(insert_sql, params)
+                if tx.rowcount(result) == 0:
+                    operation = "idempotent"
+                row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
+            if row is None:
+                raise RuntimeError("graph edge insert did not produce a row")
+            stored_ft, stored_tt, stored_raw = row
+            stored_props = normalize_edge_properties(from_id, relation, to_id, _as_dict(stored_raw))
+            try:
+                stored_digest = canonical_edge_digest(from_id, relation, to_id, stored_ft, stored_tt, stored_props)
+            except (TypeError, ValueError):
+                stored_digest = ""
+            if stored_digest != digest:
+                raise EdgeIdentityConflict(f"edge identity conflict: ({from_id}, {relation}, {to_id})")
+            if return_receipt:
+                return EdgeWriteReceipt(operation, from_id, relation, to_id, stored_ft, stored_tt, stored_props, stored_digest)
+            return True
+        return self._run_mutation_tx(body)
 
     def get_edge(
         self,
@@ -375,9 +697,8 @@ class _SqlGraphStoreBase(abc.ABC):
         ``GraphStore.get_edge``'s docstring for the cross-backend contract."""
         self._require_available()
         sql = (
-            f"SELECT properties FROM {self._table('graph_edges')}"
-            " WHERE from_type=:from_type AND from_id=:from_id"
-            " AND relation=:relation AND to_type=:to_type AND to_id=:to_id"
+            f"SELECT from_type, to_type, properties FROM {self._table('graph_edges')}"
+            " WHERE from_id=:from_id AND relation=:relation AND to_id=:to_id"
         )
         row = self._fetch_one(
             sql,
@@ -389,7 +710,1653 @@ class _SqlGraphStoreBase(abc.ABC):
                 "to_id": to_id,
             },
         )
-        return _as_dict(row[0]) if row else None
+        if not row or row[0] != from_type or row[1] != to_type:
+            return None
+        return normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+
+    def get_node_digest(self, node_id: str, *, node_type: str | None = None) -> str | None:
+        self._require_available()
+        sql = f"SELECT node_type, space_id, properties FROM {self._table('graph_nodes')} WHERE node_id=:nid"
+        params: dict[str, Any] = {"nid": node_id}
+        if node_type is not None:
+            sql += " AND node_type=:nt"
+            params["nt"] = node_type
+        row = self._fetch_one(sql, params)
+        if not row:
+            return None
+        props = _merge_space(_as_dict(row[2]), row[1])
+        try:
+            return canonical_node_digest(row[0], row[1] or props.get("space"), props)
+        except (TypeError, ValueError):
+            return None
+
+    def get_edge_digest(
+        self, from_id: str, relation: str, to_id: str, *, from_type: str | None = None, to_type: str | None = None
+    ) -> str | None:
+        self._require_available()
+        row = self._fetch_one(
+            f"SELECT from_type, to_type, properties FROM {self._table('graph_edges')} WHERE from_id=:fid AND relation=:rel AND to_id=:tid",
+            {"fid": from_id, "rel": relation, "tid": to_id},
+        )
+        if not row or (from_type is not None and row[0] != from_type) or (to_type is not None and row[1] != to_type):
+            return None
+        try:
+            props = normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+            return canonical_edge_digest(from_id, relation, to_id, row[0], row[1], props)
+        except (TypeError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Issue 80 legacy inventory, request-independent plan, and cutover
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _raw_property_fingerprint(value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return {"encoding": "bytes", "hex": bytes(value).hex()}
+        return thaw_json(value)
+
+    @staticmethod
+    def _issue(
+        kind: str,
+        source_key: str,
+        field: str,
+        aliases: dict[str, Any],
+        expected: Any,
+        reason: str,
+    ) -> PropertyNormalizationIssue:
+        return PropertyNormalizationIssue(
+            kind, source_key, field,
+            FrozenDict({"aliases": aliases, "expected": expected}), reason,
+        )
+
+    @staticmethod
+    def _same_value(left: Any, right: Any) -> bool:
+        try:
+            return canonical_json_bytes(left) == canonical_json_bytes(right)
+        except (TypeError, ValueError):
+            return left == right
+
+    def _node_inventory_row(self, row: Any) -> LegacyNodeRow:
+        node_type, node_id, space_id, raw_value = row
+        raw, decoded, property_error = decode_raw_properties(
+            raw_value, jsonb=self._dialect.name == "postgres"
+        )
+        issues: list[PropertyNormalizationIssue] = []
+        pack_id: str | None = None
+        normalized: FrozenDict | None = None
+        if decoded is not None:
+            values = decoded.to_dict()
+            source_key = f"{node_type}:{node_id}"
+            aliases = {
+                "id": ("id", "node_id"),
+                "node_type": ("node_type",),
+                "space_id": ("space", "space_id"),
+                "pack_id": ("pack_id",),
+            }
+            reserved = set().union(*aliases.values())
+            for field, names in aliases.items():
+                present = {name: values[name] for name in names if name in values}
+                if not present:
+                    continue
+                expected = node_id if field == "id" else node_type if field == "node_type" else space_id
+                if field == "pack_id":
+                    expected = present.get("pack_id")
+                    pack_id = expected
+                    if expected is not None and (not isinstance(expected, str) or not expected):
+                        issues.append(self._issue("node", source_key, field, present, expected, "malformed_reserved_value"))
+                        continue
+                if field == "space_id":
+                    if any(value is not None and (not isinstance(value, str) or not value) for value in present.values()):
+                        issues.append(self._issue("node", source_key, field, present, space_id, "malformed_reserved_value"))
+                    elif any(not self._same_value(value, space_id) for value in present.values()):
+                        issues.append(self._issue("node", source_key, field, present, space_id, "reserved_value_conflict"))
+                elif field in {"id", "node_type"} and any(not self._same_value(value, expected) for value in present.values()):
+                    issues.append(self._issue("node", source_key, field, present, expected, "reserved_value_conflict"))
+            if "node_digest" in values:
+                # ``prepare_node`` deliberately rejects this compatibility
+                # field.  Report it as an inventory issue instead of carrying
+                # it into a plan that would fail later during serialization.
+                issues.append(self._issue(
+                    "node", source_key, "node_digest",
+                    {"node_digest": values["node_digest"]}, None,
+                    "reserved_field_not_supported",
+                ))
+                reserved.add("node_digest")
+            if not issues:
+                user = {key: value for key, value in values.items() if key not in reserved}
+                normalized = FrozenDict(user)
+                target_props = dict(user)
+                target_props["id"] = node_id
+                if space_id is not None:
+                    target_props["space"] = space_id
+                if pack_id is not None:
+                    target_props["pack_id"] = pack_id
+                try:
+                    digest = canonical_node_digest(node_type, space_id, target_props)
+                except (TypeError, ValueError):
+                    digest = ""
+            else:
+                digest = ""
+        else:
+            digest = ""
+        return LegacyNodeRow(
+            LegacyNodeKey(str(node_type), str(node_id)),
+            space_id,
+            pack_id,
+            raw,
+            normalized,
+            property_error,
+            tuple(issues),
+            digest,
+        )
+
+    def _edge_inventory_row(self, row: Any) -> LegacyEdgeRow:
+        from_type, from_id, relation, to_type, to_id, raw_value = row
+        raw, decoded, property_error = decode_raw_properties(
+            raw_value, jsonb=self._dialect.name == "postgres"
+        )
+        issues: list[PropertyNormalizationIssue] = []
+        normalized: FrozenDict | None = None
+        if decoded is not None:
+            values = decoded.to_dict()
+            source_key = f"{from_type}:{from_id}:{relation}:{to_type}:{to_id}"
+            aliases = {
+                "from_id": ("from_id", "source_id"),
+                "from_type": ("from_type", "source_type"),
+                "to_id": ("to_id", "target_id"),
+                "to_type": ("to_type", "target_type"),
+                "relation": ("relation", "edge_type"),
+            }
+            reserved = set().union(*aliases.values())
+            expected_values = {
+                "from_id": from_id, "from_type": from_type,
+                "to_id": to_id, "to_type": to_type, "relation": relation,
+            }
+            for field, names in aliases.items():
+                present = {name: values[name] for name in names if name in values}
+                if not present:
+                    continue
+                expected = expected_values[field]
+                if any(not self._same_value(value, expected) for value in present.values()):
+                    issues.append(self._issue("edge", source_key, field, present, expected, "reserved_value_conflict"))
+            if "edge_digest" in values:
+                # The SQL target derives the edge digest from its endpoint
+                # snapshots and properties; it has no writable digest field.
+                issues.append(self._issue(
+                    "edge", source_key, "edge_digest",
+                    {"edge_digest": values["edge_digest"]}, None,
+                    "reserved_field_not_supported",
+                ))
+                reserved.add("edge_digest")
+            if not issues:
+                user = {key: value for key, value in values.items() if key not in reserved}
+                normalized = FrozenDict(user)
+                props = dict(user)
+                props.update({"from_id": from_id, "relation": relation, "to_id": to_id})
+                try:
+                    props = normalize_edge_properties(from_id, relation, to_id, props)
+                    digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
+                except (TypeError, ValueError):
+                    property_error = property_error or "malformed_properties"
+                    digest = ""
+            else:
+                digest = ""
+        else:
+            digest = ""
+        return LegacyEdgeRow(
+            LegacyNodeKey(str(from_type), str(from_id)),
+            str(relation),
+            LegacyNodeKey(str(to_type), str(to_id)),
+            raw,
+            normalized,
+            property_error,
+            tuple(issues),
+            digest,
+        )
+
+    def _inventory_from_rows(self, state: str, node_rows: Iterable[Any], edge_rows: Iterable[Any]) -> GraphInventory:
+        nodes = tuple(sorted((self._node_inventory_row(row) for row in node_rows), key=lambda row: (row.key.node_type, row.key.node_id)))
+        edges = tuple(sorted((self._edge_inventory_row(row) for row in edge_rows), key=lambda row: (row.from_key.node_type, row.from_key.node_id, row.relation, row.to_key.node_type, row.to_key.node_id)))
+        issues = tuple(issue for row in nodes + edges for issue in row.normalization_issues)
+        def issue_payload(issue: PropertyNormalizationIssue) -> dict[str, Any]:
+            return {
+                "record_kind": issue.record_kind,
+                "source_key": issue.source_key,
+                "field": issue.field,
+                "raw_values": thaw_json(issue.raw_values),
+                "reason": issue.reason,
+            }
+
+        payload = {
+            "schema_state": state,
+            "nodes": [
+                {
+                    "key": {"node_type": row.key.node_type, "node_id": row.key.node_id},
+                    "space_id": row.space_id,
+                    "pack_id": row.pack_id,
+                    "raw_properties": self._raw_property_fingerprint(row.raw_properties),
+                    "normalized_properties": thaw_json(row.normalized_properties),
+                    "property_error": row.property_error,
+                    "issues": [issue_payload(issue) for issue in row.normalization_issues],
+                }
+                for row in nodes
+            ],
+            "edges": [
+                {
+                    "from": {"node_type": row.from_key.node_type, "node_id": row.from_key.node_id},
+                    "relation": row.relation,
+                    "to": {"node_type": row.to_key.node_type, "node_id": row.to_key.node_id},
+                    "raw_properties": self._raw_property_fingerprint(row.raw_properties),
+                    "normalized_properties": thaw_json(row.normalized_properties),
+                    "property_error": row.property_error,
+                    "issues": [issue_payload(issue) for issue in row.normalization_issues],
+                }
+                for row in edges
+            ],
+        }
+        fingerprint = hashlib.sha256(
+            b"opencrab.issue80.graph-source.v1\0" + canonical_json_bytes(payload)
+        ).hexdigest()
+        return GraphInventory(state, nodes, edges, issues, fingerprint)
+
+    def _schema_kind(self) -> str:
+        state = getattr(self, "_schema_state", "partial_or_unknown")
+        if state == "target":
+            return "target"
+        if state == "legacy_migration_required":
+            return "legacy"
+        if state == "unconfigured":
+            return "fresh"
+        return "partial"
+
+    def _inspect_graph_identity_tx(self, tx: GraphTx, state: str | None = None) -> GraphInventory:
+        kind = state or self._schema_kind()
+        if kind == "fresh":
+            return self._inventory_from_rows(kind, (), ())
+        nodes = self._table("graph_nodes")
+        edges = self._table("graph_edges")
+        node_rows = tx.fetchall(f"SELECT node_type, node_id, space_id, properties FROM {nodes}", {})
+        edge_rows = tx.fetchall(f"SELECT from_type, from_id, relation, to_type, to_id, properties FROM {edges}", {})
+        return self._inventory_from_rows(kind, node_rows, edge_rows)
+
+    def inspect_graph_identity(self) -> GraphInventory:
+        self._require_available()
+        kind = self._schema_kind()
+        if kind == "fresh":
+            return self._inventory_from_rows(kind, (), ())
+        # A partial schema is intentionally inspectable even when one of the
+        # canonical tables is missing.  Expose the rows that still exist so
+        # the operator can see recovery residue; planning remains rejected by
+        # ``_build_migration_plan``.
+        try:
+            node_rows = self._fetch_all(
+                f"SELECT node_type, node_id, space_id, properties FROM {self._table('graph_nodes')}", {}
+            )
+        except Exception as exc:
+            if not re.search(r"(?:no such table|no such column|does not exist)", str(exc), re.I):
+                raise
+            node_rows = []
+        try:
+            edge_rows = self._fetch_all(
+                f"SELECT from_type, from_id, relation, to_type, to_id, properties FROM {self._table('graph_edges')}", {}
+            )
+        except Exception as exc:
+            if not re.search(r"(?:no such table|no such column|does not exist)", str(exc), re.I):
+                raise
+            edge_rows = []
+        return self._inventory_from_rows(kind, node_rows, edge_rows)
+
+    @staticmethod
+    def _mapping_sources(action: ExplicitRename | ExplicitMerge) -> tuple[tuple[LegacyNodeKey, str], ...]:
+        if isinstance(action, ExplicitRename):
+            return ((action.source, action.source_digest),)
+        return tuple(sorted(action.sources, key=lambda item: (item[0].node_type, item[0].node_id)))
+
+    @staticmethod
+    def _action_target(action: ExplicitRename | ExplicitMerge) -> dict[str, Any]:
+        if (
+            not isinstance(action.target_node_id, str)
+            or not action.target_node_id
+            or not isinstance(action.target_node_type, str)
+            or not action.target_node_type
+            or (action.target_space_id is not None and (not isinstance(action.target_space_id, str) or not action.target_space_id))
+            or (action.target_pack_id is not None and (not isinstance(action.target_pack_id, str) or not action.target_pack_id))
+        ):
+            raise GraphMigrationConflict("invalid migration target identity")
+        return {
+            "node_id": action.target_node_id,
+            "node_type": action.target_node_type,
+            "space_id": action.target_space_id,
+            "pack_id": action.target_pack_id,
+        }
+
+    @staticmethod
+    def _resolution_key(resolution: PropertyResolution) -> tuple[LegacyNodeKey, str]:
+        return resolution.source, resolution.source_property
+
+    def _derive_user_properties(
+        self,
+        rows: list[LegacyNodeRow],
+        resolutions: tuple[PropertyResolution, ...],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        fields: list[tuple[LegacyNodeKey, str, Any]] = []
+        for row in rows:
+            if row.property_error or row.normalization_issues or row.normalized_properties is None:
+                raise GraphMigrationConflict("legacy graph properties are not normalizable")
+            fields.extend((row.key, key, value) for key, value in row.normalized_properties.items())
+        fields.sort(key=lambda item: (
+            item[0].node_type.encode("utf-8"), item[0].node_id.encode("utf-8"),
+            item[1].encode("utf-8"), canonical_json_bytes(item[2]),
+        ))
+        by_field: dict[tuple[LegacyNodeKey, str], PropertyResolution] = {}
+        resolved_targets: set[str] = set()
+        reserved = {"id", "node_id", "node_type", "space", "space_id", "pack_id", "node_digest"}
+        field_set = {(source, key): value for source, key, value in fields}
+        for resolution in resolutions:
+            key = self._resolution_key(resolution)
+            if key in by_field:
+                raise GraphMigrationConflict("duplicate property resolution")
+            if resolution.target_property in reserved or not isinstance(resolution.target_property, str) or not resolution.target_property:
+                raise GraphMigrationConflict("property resolution targets a reserved key")
+            if key not in field_set or not self._same_value(field_set[key], resolution.source_value):
+                raise GraphMigrationConflict("property resolution source field mismatch")
+            if resolution.target_property in resolved_targets:
+                raise GraphMigrationConflict("property resolution target key collision")
+            resolved_targets.add(resolution.target_property)
+            by_field[key] = resolution
+        by_name: dict[str, list[tuple[LegacyNodeKey, str, Any]]] = {}
+        for field in fields:
+            by_name.setdefault(field[1], []).append(field)
+        output: dict[str, Any] = {}
+        coverage: list[dict[str, Any]] = []
+        for source, key, value in fields:
+            resolution = by_field.get((source, key))
+            target_key = resolution.target_property if resolution is not None else key
+            if target_key in output and not self._same_value(output[target_key], value):
+                raise GraphMigrationConflict("different source property values target one key")
+            output[target_key] = value
+            coverage.append({
+                "source": {"node_type": source.node_type, "node_id": source.node_id},
+                "property": key,
+                "value": thaw_json(value),
+                "target_property": target_key,
+            })
+        for key, group in by_name.items():
+            values = [value for _source, _key, value in group]
+            if len({canonical_json_bytes(value) for value in values}) > 1:
+                if any((source, key) not in by_field for source, _key, _value in group):
+                    raise GraphMigrationConflict("missing property resolution")
+        return output, coverage
+
+    def _canonical_action(self, action: ExplicitRename | ExplicitMerge) -> dict[str, Any]:
+        return {
+            "kind": "rename" if isinstance(action, ExplicitRename) else "merge",
+            "sources": [
+                {"node_type": source.node_type, "node_id": source.node_id, "digest": digest}
+                for source, digest in self._mapping_sources(action)
+            ],
+            "target": self._action_target(action),
+        }
+
+    def _target_node(self, action: ExplicitRename | ExplicitMerge, rows: list[LegacyNodeRow], resolutions: tuple[PropertyResolution, ...]) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        user, coverage = self._derive_user_properties(rows, resolutions)
+        target = self._action_target(action)
+        try:
+            node_type, props, space_id, digest = prepare_node(
+                target["node_type"], target["node_id"],
+                {**user, **({"pack_id": target["pack_id"]} if target["pack_id"] is not None else {})},
+                target["space_id"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise GraphMigrationConflict("invalid target node payload") from exc
+        result = self._canonical_action(action)
+        result.update({
+            "target": {"node_id": target["node_id"], "node_type": node_type, "space_id": space_id, "pack_id": target["pack_id"]},
+            "properties": thaw_json(props),
+            "digest": digest,
+            "property_fields": coverage,
+        })
+        return result, coverage, digest
+
+    def _build_migration_plan(self, inventory: GraphInventory, request: DryRunMigrationRequest) -> MigrationPlanPayload:
+        try:
+            return self._build_migration_plan_inner(inventory, request)
+        except GraphMigrationConflict:
+            raise
+        except Exception as exc:
+            raise GraphMigrationConflict("malformed migration request") from exc
+
+    def _build_migration_plan_inner(self, inventory: GraphInventory, request: DryRunMigrationRequest) -> MigrationPlanPayload:
+        if inventory.schema_state not in {"legacy", "target"}:
+            raise GraphMigrationConflict("graph schema is not migratable")
+        if inventory.source_fingerprint != request.expected_source_fingerprint:
+            raise GraphMigrationConflict("source fingerprint mismatch")
+        if inventory.normalization_issues or any(row.property_error for row in inventory.nodes + inventory.edges):
+            raise GraphMigrationConflict("graph inventory contains malformed or conflicting properties")
+        rows_by_key = {row.key: row for row in inventory.nodes}
+        groups: dict[str, list[LegacyNodeRow]] = {}
+        for row in inventory.nodes:
+            groups.setdefault(row.key.node_id, []).append(row)
+        actions_by_source: dict[LegacyNodeKey, ExplicitRename | ExplicitMerge] = {}
+        explicit_targets: dict[str, tuple[LegacyNodeKey, ...]] = {}
+        for action in request.mappings:
+            sources = self._mapping_sources(action)
+            if isinstance(action, ExplicitMerge) and len(sources) < 2:
+                raise GraphMigrationConflict("merge requires at least two sources")
+            target = self._action_target(action)
+            if target["node_id"] in explicit_targets:
+                raise GraphMigrationConflict("independent actions collide on target node id")
+            explicit_targets[target["node_id"]] = tuple(source for source, _digest in sources)
+            for source, source_digest in sources:
+                if source in actions_by_source or source not in rows_by_key:
+                    raise GraphMigrationConflict("source mapping is repeated or unknown")
+                if source_digest != rows_by_key[source].digest:
+                    raise GraphMigrationConflict("source digest mismatch")
+                actions_by_source[source] = action
+        for node_id, group in groups.items():
+            if len(group) == 1:
+                row = group[0]
+                if row.key not in actions_by_source:
+                    actions_by_source[row.key] = ExplicitRename(
+                        row.key, row.digest, row.key.node_id, row.key.node_type, row.space_id, row.pack_id
+                    )
+            elif any(row.key not in actions_by_source for row in group):
+                raise GraphMigrationConflict(f"duplicate bare node id requires explicit mapping: {node_id}")
+        resolutions_by_source: dict[LegacyNodeKey, list[PropertyResolution]] = {}
+        for resolution in request.property_resolutions:
+            resolutions_by_source.setdefault(resolution.source, []).append(resolution)
+        node_specs: list[dict[str, Any]] = []
+        source_to_target: dict[LegacyNodeKey, dict[str, Any]] = {}
+        seen_action: set[int] = set()
+        for source in sorted(actions_by_source, key=lambda key: (key.node_type, key.node_id)):
+            action = actions_by_source[source]
+            marker = id(action)
+            if marker in seen_action:
+                continue
+            seen_action.add(marker)
+            sources = [rows_by_key[key] for key, _digest in self._mapping_sources(action)]
+            resolutions = tuple(sorted(
+                (
+                    resolution
+                    for key, _digest in self._mapping_sources(action)
+                    for resolution in resolutions_by_source.get(key, ())
+                ),
+                key=lambda item: (
+                    item.source.node_type, item.source.node_id,
+                    item.source_property, item.target_property,
+                    canonical_json_bytes(item.source_value),
+                ),
+            ))
+            spec, _coverage, _digest = self._target_node(action, sources, resolutions)
+            node_specs.append(spec)
+            for key, _source_digest in self._mapping_sources(action):
+                source_to_target[key] = spec["target"]
+        for resolution in request.property_resolutions:
+            if resolution.source not in actions_by_source:
+                raise GraphMigrationConflict("property resolution source is not mapped")
+        target_ids: dict[str, dict[str, Any]] = {}
+        for spec in node_specs:
+            target_id = spec["target"]["node_id"]
+            if target_id in target_ids:
+                raise GraphMigrationConflict("target node collision")
+            target_ids[target_id] = spec
+        edge_specs: list[dict[str, Any]] = []
+        collision_results: list[FrozenDict] = []
+        dedup_results: list[FrozenDict] = []
+        edge_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in inventory.edges:
+            if row.property_error or row.normalization_issues or row.normalized_properties is None:
+                raise GraphMigrationConflict("edge properties are not normalizable")
+            if row.from_key not in source_to_target or row.to_key not in source_to_target:
+                raise GraphMigrationConflict("edge endpoint mapping is missing")
+            source_from = source_to_target[row.from_key]
+            source_to = source_to_target[row.to_key]
+            props = dict(row.normalized_properties)
+            props = normalize_edge_properties(source_from["node_id"], row.relation, source_to["node_id"], props)
+            digest = canonical_edge_digest(
+                source_from["node_id"], row.relation, source_to["node_id"],
+                source_from["node_type"], source_to["node_type"], props,
+            )
+            spec = {
+                "kind": "edge",
+                "source": {
+                    "from": {"node_type": row.from_key.node_type, "node_id": row.from_key.node_id},
+                    "relation": row.relation,
+                    "to": {"node_type": row.to_key.node_type, "node_id": row.to_key.node_id},
+                    "digest": row.digest,
+                },
+                "target": {
+                    "from_id": source_from["node_id"], "relation": row.relation,
+                    "to_id": source_to["node_id"], "from_type": source_from["node_type"], "to_type": source_to["node_type"],
+                },
+                "properties": thaw_json(props), "digest": digest,
+                "result": "retained",
+                "property_fields": [
+                    {"source": {"from": {"node_type": row.from_key.node_type, "node_id": row.from_key.node_id}, "relation": row.relation, "to": {"node_type": row.to_key.node_type, "node_id": row.to_key.node_id}}, "property": key, "value": thaw_json(value), "target_property": key}
+                    for key, value in sorted(
+                        row.normalized_properties.items(),
+                        key=lambda item: (item[0].encode("utf-8"), canonical_json_bytes(item[1])),
+                    )
+                ],
+            }
+            edge_key = (source_from["node_id"], row.relation, source_to["node_id"])
+            existing = edge_targets.get(edge_key)
+            if existing is not None:
+                if existing["digest"] != digest:
+                    raise GraphMigrationConflict("edge target collision")
+                collision_results.append(FrozenDict({"edge": edge_key, "result": "deduplicated"}))
+                dedup_results.append(FrozenDict({"source": spec["source"], "target": edge_key}))
+                spec["result"] = "deduplicated"
+                edge_specs.append(spec)
+                continue
+            edge_targets[edge_key] = spec
+            edge_specs.append(spec)
+        canonical_mappings = tuple(
+            FrozenDict(spec) for spec in sorted(node_specs + edge_specs, key=lambda item: canonical_json_bytes(item)
+        ))
+        mapping_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.mapping.v1\0" + canonical_json_bytes(thaw_json(canonical_mappings))
+        ).hexdigest()
+        node_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.planned-nodes.v1\0" + canonical_json_bytes(
+                sorted([[spec["target"]["node_id"], spec["digest"]] for spec in node_specs])
+            )
+        ).hexdigest()
+        edge_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.planned-edges.v1\0" + canonical_json_bytes(
+                sorted([[key[0], key[1], key[2], spec["digest"]] for key, spec in edge_targets.items()])
+            )
+        ).hexdigest()
+        return MigrationPlanPayload(
+            inventory.source_fingerprint,
+            mapping_fingerprint,
+            canonical_mappings,
+            node_fingerprint,
+            edge_fingerprint,
+            tuple(collision_results),
+            tuple(dedup_results),
+            0,
+            0,
+        )
+
+    @staticmethod
+    def _plan_from_bytes(plan_bytes: bytes) -> MigrationPlanPayload:
+        try:
+            value = json.loads(bytes(plan_bytes).decode("utf-8"))
+            return MigrationPlanPayload(
+                value["source_fingerprint"], value["mapping_fingerprint"],
+                tuple(FrozenDict(item) for item in value["canonical_mappings"]),
+                value["planned_target_node_fingerprint"], value["planned_target_edge_fingerprint"],
+                tuple(FrozenDict(item) for item in value["collision_results"]),
+                tuple(FrozenDict(item) for item in value["dedup_results"]),
+                int(value["edge_loss"]), int(value["property_loss"]),
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GraphMigrationConflict("malformed migration plan bytes") from exc
+
+    def _validate_decoded_plan(self, inventory: GraphInventory, plan: MigrationPlanPayload, raw_plan: bytes) -> None:
+        try:
+            self._validate_decoded_plan_inner(inventory, plan, raw_plan)
+        except GraphMigrationConflict:
+            raise
+        except Exception as exc:
+            raise GraphMigrationConflict("malformed migration plan") from exc
+
+    def _validate_decoded_plan_inner(self, inventory: GraphInventory, plan: MigrationPlanPayload, raw_plan: bytes) -> None:
+        if plan.source_fingerprint != inventory.source_fingerprint:
+            raise GraphMigrationConflict("source fingerprint changed after dry-run")
+        canonical_bytes = canonical_plan_bytes(plan)
+        if canonical_bytes != bytes(raw_plan) or plan_sha256(raw_plan) != plan_sha256(canonical_bytes):
+            raise GraphMigrationConflict("migration plan bytes are not canonical")
+        if plan.edge_loss != 0 or plan.property_loss != 0:
+            raise GraphMigrationConflict("migration plan reports data loss")
+        expected_mapping_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.mapping.v1\0"
+            + canonical_json_bytes(thaw_json(plan.canonical_mappings))
+        ).hexdigest()
+        if expected_mapping_fingerprint != plan.mapping_fingerprint:
+            raise GraphMigrationConflict("migration plan mapping fingerprint changed")
+        mappings = tuple(plan.canonical_mappings)
+        if mappings != tuple(sorted(mappings, key=canonical_json_bytes)):
+            raise GraphMigrationConflict("migration plan mappings are not canonically ordered")
+        nodes = {row.key: row for row in inventory.nodes}
+        edges = {
+            (row.from_key, row.relation, row.to_key): row
+            for row in inventory.edges
+        }
+        source_seen: set[LegacyNodeKey] = set()
+        target_nodes: dict[str, str] = {}
+        target_edges: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        retained_edge_specs: dict[tuple[str, str, str], dict[str, Any]] = {}
+        seen_edges: set[tuple[LegacyNodeKey, str, LegacyNodeKey]] = set()
+
+        def validate_property_fields(
+            entries: Any,
+            source_rows: list[LegacyNodeRow],
+            target_properties: dict[str, Any],
+            reserved: set[str],
+            *,
+            edge: bool = False,
+        ) -> None:
+            if not isinstance(entries, (list, tuple)):
+                raise GraphMigrationConflict("migration plan property coverage is malformed")
+            source_map = {} if edge else {row.key: row for row in source_rows}
+            expected_keys = set() if edge else {
+                (row.key, key)
+                for row in source_rows
+                for key in row.normalized_properties
+            }
+            seen_keys: set[tuple[LegacyNodeKey, str]] = set()
+            target_values: dict[str, Any] = {}
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "source", "property", "value", "target_property"
+                }:
+                    raise GraphMigrationConflict("migration plan property coverage is malformed")
+                source_value = entry["source"]
+                if edge:
+                    if (
+                        not isinstance(source_value, dict)
+                        or set(source_value) != {"from", "relation", "to"}
+                        or not isinstance(source_value["from"], dict)
+                        or set(source_value["from"]) != {"node_type", "node_id"}
+                        or not isinstance(source_value["to"], dict)
+                        or set(source_value["to"]) != {"node_type", "node_id"}
+                    ):
+                        raise GraphMigrationConflict("migration plan edge property source is malformed")
+                    source_key = (
+                        LegacyNodeKey(source_value["from"]["node_type"], source_value["from"]["node_id"]),
+                        source_value["relation"],
+                        LegacyNodeKey(source_value["to"]["node_type"], source_value["to"]["node_id"]),
+                    )
+                    row = next(
+                        (
+                            candidate for candidate in source_rows
+                            if (candidate.from_key, candidate.relation, candidate.to_key) == source_key
+                        ),
+                        None,
+                    )
+                    field_key: tuple[LegacyNodeKey, str] | None = None
+                else:
+                    if not isinstance(source_value, dict) or set(source_value) != {"node_type", "node_id"}:
+                        raise GraphMigrationConflict("migration plan node property source is malformed")
+                    source_key = LegacyNodeKey(source_value["node_type"], source_value["node_id"])
+                    row = source_map.get(source_key)
+                    field_key = (source_key, entry["property"])
+                if row is None:
+                    raise GraphMigrationConflict("migration plan property source is unknown")
+                property_name = entry["property"]
+                target_name = entry["target_property"]
+                if not isinstance(property_name, str) or not property_name:
+                    raise GraphMigrationConflict("migration plan property name is malformed")
+                if not isinstance(target_name, str) or not target_name or target_name in reserved:
+                    raise GraphMigrationConflict("migration plan property target is reserved or malformed")
+                if edge:
+                    field_key = (row.from_key, property_name)
+                    # Edge source identity is part of the key because one
+                    # property name can legitimately occur on two edges.
+                    edge_field_key = (source_key, property_name)
+                    if edge_field_key in seen_keys:
+                        raise GraphMigrationConflict("migration plan property coverage is duplicated")
+                    seen_keys.add(edge_field_key)
+                    if property_name not in row.normalized_properties:
+                        raise GraphMigrationConflict("migration plan property source field is missing")
+                    expected_value = row.normalized_properties[property_name]
+                else:
+                    if field_key in seen_keys or field_key not in expected_keys:
+                        raise GraphMigrationConflict("migration plan property coverage is duplicated or unknown")
+                    seen_keys.add(field_key)
+                    expected_value = row.normalized_properties[property_name]
+                if not self._same_value(entry["value"], expected_value):
+                    raise GraphMigrationConflict("migration plan property source value changed")
+                if target_name in target_values and not self._same_value(target_values[target_name], expected_value):
+                    raise GraphMigrationConflict("migration plan property target values collide")
+                target_values[target_name] = expected_value
+                if target_name not in target_properties or not self._same_value(target_properties[target_name], expected_value):
+                    raise GraphMigrationConflict("migration plan property target value is not serialized")
+            if edge:
+                expected_edge_keys = {
+                    ((row.from_key, row.relation, row.to_key), key)
+                    for row in source_rows
+                    for key in row.normalized_properties
+                }
+                if seen_keys != expected_edge_keys:
+                    raise GraphMigrationConflict("migration plan does not cover every edge property field")
+            elif seen_keys != expected_keys:
+                raise GraphMigrationConflict("migration plan does not cover every node property field")
+            user_properties = {
+                key: value for key, value in target_properties.items()
+                if key not in reserved
+            }
+            if set(user_properties) != set(target_values) or any(
+                not self._same_value(user_properties[key], value)
+                for key, value in target_values.items()
+            ):
+                raise GraphMigrationConflict("migration plan target properties contain an unplanned field")
+
+        for frozen in plan.canonical_mappings:
+            spec = frozen.to_dict()
+            if spec.get("kind") in {"rename", "merge"}:
+                source_items = spec.get("sources", [])
+                target = spec.get("target", {})
+                kind = spec.get("kind")
+                if not isinstance(source_items, (list, tuple)) or (
+                    kind == "rename" and len(source_items) != 1
+                ) or (kind == "merge" and len(source_items) < 2):
+                    raise GraphMigrationConflict("migration plan node mapping cardinality is invalid")
+                if not isinstance(target, dict) or set(target) != {"node_id", "node_type", "space_id", "pack_id"}:
+                    raise GraphMigrationConflict("migration plan node target is malformed")
+                if (
+                    not isinstance(target.get("node_id"), str)
+                    or not target["node_id"]
+                    or not isinstance(target.get("node_type"), str)
+                    or not target["node_type"]
+                    or (
+                        target.get("space_id") is not None
+                        and (
+                            not isinstance(target["space_id"], str)
+                            or not target["space_id"]
+                        )
+                    )
+                    or (
+                        target.get("pack_id") is not None
+                        and (
+                            not isinstance(target["pack_id"], str)
+                            or not target["pack_id"]
+                        )
+                    )
+                ):
+                    raise GraphMigrationConflict("migration plan node target identity is malformed")
+                for item in source_items:
+                    if not isinstance(item, dict):
+                        raise GraphMigrationConflict("migration plan node source is malformed")
+                    source_type, source_id, source_digest = (
+                        item.get("node_type"), item.get("node_id"), item.get("digest")
+                    )
+                    if not isinstance(source_type, str) or not isinstance(source_id, str):
+                        raise GraphMigrationConflict("migration plan node source identity is malformed")
+                    source = LegacyNodeKey(source_type, source_id)
+                    row = nodes.get(source)
+                    if row is None or row.digest != source_digest or source in source_seen:
+                        raise GraphMigrationConflict("migration plan source no longer matches")
+                    if row.property_error or row.normalization_issues or row.normalized_properties is None:
+                        raise GraphMigrationConflict("migration plan source properties are invalid")
+                    source_seen.add(source)
+                properties = spec.get("properties")
+                if not isinstance(properties, dict) or not isinstance(spec.get("digest"), str):
+                    raise GraphMigrationConflict("migration plan node properties are malformed")
+                try:
+                    _nt, prepared, _space, digest = prepare_node(
+                        target["node_type"], target["node_id"], properties, target.get("space_id")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise GraphMigrationConflict("migration plan node target is invalid") from exc
+                target_pack = target.get("pack_id")
+                if target_pack is None:
+                    if "pack_id" in properties:
+                        raise GraphMigrationConflict("migration plan node pack target changed")
+                elif properties.get("pack_id") != target_pack:
+                    raise GraphMigrationConflict("migration plan node pack target changed")
+                if digest != spec.get("digest") or thaw_json(prepared) != properties:
+                    raise GraphMigrationConflict("migration plan node payload changed")
+                validate_property_fields(
+                    spec.get("property_fields"),
+                    [nodes[source] for source in (
+                        LegacyNodeKey(item["node_type"], item["node_id"])
+                        for item in source_items
+                    )],
+                    properties,
+                    {"id", "node_id", "node_type", "space", "space_id", "pack_id", "node_digest"},
+                )
+                target_id = target.get("node_id")
+                if target_id in target_nodes:
+                    raise GraphMigrationConflict("migration plan target node collision")
+                target_nodes[target_id] = digest
+            elif spec.get("kind") == "edge":
+                source = spec.get("source", {})
+                from_value = source.get("from", {})
+                to_value = source.get("to", {})
+                if not isinstance(from_value, dict) or not isinstance(to_value, dict):
+                    raise GraphMigrationConflict("migration plan edge source is malformed")
+                source_key = (
+                    LegacyNodeKey(from_value.get("node_type"), from_value.get("node_id")),
+                    source.get("relation"),
+                    LegacyNodeKey(to_value.get("node_type"), to_value.get("node_id")),
+                )
+                edge = edges.get(source_key)
+                if edge is None or source_key in seen_edges or edge.digest != source.get("digest") or edge.normalized_properties is None or edge.property_error or edge.normalization_issues:
+                    raise GraphMigrationConflict("migration plan edge source no longer matches")
+                seen_edges.add(source_key)
+                target = spec.get("target", {})
+                if (
+                    not isinstance(target, dict)
+                    or set(target) != {"from_id", "relation", "to_id", "from_type", "to_type"}
+                    or not isinstance(spec.get("properties"), dict)
+                ):
+                    raise GraphMigrationConflict("migration plan edge target is malformed")
+                props = normalize_edge_properties(target["from_id"], target["relation"], target["to_id"], spec.get("properties"))
+                digest = canonical_edge_digest(target["from_id"], target["relation"], target["to_id"], target["from_type"], target["to_type"], props)
+                if digest != spec.get("digest") or thaw_json(props) != spec.get("properties"):
+                    raise GraphMigrationConflict("migration plan edge payload changed")
+                validate_property_fields(
+                    spec.get("property_fields"),
+                    [edge],
+                    props,
+                    {"from_id", "source_id", "from_type", "source_type", "to_id", "target_id", "to_type", "target_type", "relation", "edge_type"},
+                    edge=True,
+                )
+                result = spec.get("result", "retained")
+                target_key = (target["from_id"], target["relation"], target["to_id"])
+                if result not in {"retained", "deduplicated"}:
+                    raise GraphMigrationConflict("migration plan edge result is invalid")
+                target_value = (target["from_type"], target["to_type"], digest)
+                previous_target = target_edges.get(target_key)
+                if previous_target is not None and previous_target != target_value:
+                    raise GraphMigrationConflict("migration plan edge target collision")
+                target_edges[target_key] = target_value
+                if result == "retained":
+                    if target_key in retained_edge_specs:
+                        raise GraphMigrationConflict("migration plan edge target collision")
+                    retained_edge_specs[target_key] = spec
+            else:
+                raise GraphMigrationConflict("unknown migration plan mapping")
+        if source_seen != set(nodes):
+            raise GraphMigrationConflict("migration plan does not cover every source row")
+        if seen_edges != set(edges):
+            raise GraphMigrationConflict("migration plan does not cover every source edge")
+        expected_collisions: list[FrozenDict] = []
+        expected_deduplications: list[FrozenDict] = []
+        specs_by_source: dict[tuple[LegacyNodeKey, str, LegacyNodeKey], dict[str, Any]] = {}
+        for frozen in mappings:
+            spec = frozen.to_dict()
+            if spec.get("kind") != "edge":
+                continue
+            source = spec["source"]
+            specs_by_source[
+                LegacyNodeKey(source["from"]["node_type"], source["from"]["node_id"]),
+                source["relation"],
+                LegacyNodeKey(source["to"]["node_type"], source["to"]["node_id"]),
+            ] = spec
+        for edge in inventory.edges:
+            spec = specs_by_source[edge.from_key, edge.relation, edge.to_key]
+            if spec.get("result", "retained") != "deduplicated":
+                continue
+            target = spec["target"]
+            target_key = (target["from_id"], target["relation"], target["to_id"])
+            expected_collisions.append(FrozenDict({"edge": target_key, "result": "deduplicated"}))
+            expected_deduplications.append(FrozenDict({"source": spec["source"], "target": target_key}))
+        if canonical_json_bytes(plan.collision_results) != canonical_json_bytes(expected_collisions):
+            raise GraphMigrationConflict("migration plan collision results changed")
+        if canonical_json_bytes(plan.dedup_results) != canonical_json_bytes(expected_deduplications):
+            raise GraphMigrationConflict("migration plan deduplication results changed")
+        for key, value in target_edges.items():
+            spec = next(
+                item.to_dict() for item in plan.canonical_mappings
+                if item.get("kind") == "edge"
+                and tuple(item.get("target", {}).get(field) for field in ("from_id", "relation", "to_id")) == key
+                and item.get("digest") == value[2]
+            )
+            if spec.get("result", "retained") == "deduplicated" and key not in retained_edge_specs:
+                raise GraphMigrationConflict("migration plan deduplication has no retained edge")
+        for key, (from_type, to_type, _digest) in target_edges.items():
+            node_from = target_nodes.get(key[0])
+            node_to = target_nodes.get(key[2])
+            if node_from is None or node_to is None:
+                raise GraphMigrationConflict("migration plan edge endpoint is missing")
+            edge_spec = retained_edge_specs.get(key)
+            if edge_spec is not None and (
+                edge_spec["target"]["from_type"] != from_type
+                or edge_spec["target"]["to_type"] != to_type
+            ):
+                raise GraphMigrationConflict("migration plan edge endpoint type changed")
+        node_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.planned-nodes.v1\0"
+            + canonical_json_bytes(sorted([[key, value] for key, value in target_nodes.items()]))
+        ).hexdigest()
+        edge_fingerprint = hashlib.sha256(
+            b"opencrab.issue80.planned-edges.v1\0"
+            + canonical_json_bytes(sorted([[key[0], key[1], key[2], value[2]] for key, value in target_edges.items() if key in retained_edge_specs]))
+        ).hexdigest()
+        if node_fingerprint != plan.planned_target_node_fingerprint or edge_fingerprint != plan.planned_target_edge_fingerprint:
+            raise GraphMigrationConflict("migration plan target fingerprint changed")
+
+    @staticmethod
+    def _request_digest(request: ApplyMigrationRequest) -> str:
+        payload = {
+            "request_id": request.request_id,
+            "phase": "apply",
+            "expected_source_fingerprint": request.expected_source_fingerprint,
+            "plan_sha256": request.plan_sha256,
+            "backup_path": str(Path(request.backup_path)),
+            "backup_sha256": request.backup_sha256,
+        }
+        return hashlib.sha256(
+            b"opencrab.issue80.apply-request.v1\0" + canonical_json_bytes(payload)
+        ).hexdigest()
+
+    @staticmethod
+    def _dry_request_digest(request: DryRunMigrationRequest, mapping_fingerprint: str) -> str:
+        return hashlib.sha256(
+            b"opencrab.issue80.dry-request.v1\0" + canonical_json_bytes({
+                "source_fingerprint": request.expected_source_fingerprint,
+                "mapping_fingerprint": mapping_fingerprint,
+            })
+        ).hexdigest()
+
+    @staticmethod
+    def _make_receipt(
+        *, request_id: str | None, phase: str, request_digest: str,
+        inventory: GraphInventory, plan: MigrationPlanPayload, plan_bytes: bytes,
+        target_before: str, target_after: str,
+    ) -> MigrationReceipt:
+        payload = MigrationReceiptPayload(
+            request_id, phase, request_digest, inventory.source_fingerprint,
+            plan.mapping_fingerprint, plan_sha256(plan_bytes), target_before,
+            target_after, tuple(FrozenDict(item) for item in plan.canonical_mappings),
+            plan.edge_loss, plan.property_loss,
+        )
+        canonical = canonical_receipt_bytes(payload)
+        return MigrationReceipt(
+            request_id, phase, request_digest, inventory.source_fingerprint,
+            plan.mapping_fingerprint, plan_sha256(plan_bytes), bytes(plan_bytes),
+            target_before, target_after, payload.mapping_result, plan.edge_loss,
+            plan.property_loss, receipt_sha256(canonical), canonical,
+        )
+
+    def _ledger_table(self) -> str:
+        return self._table("graph_migration_receipts")
+
+    def _ledger_exists_tx(self, tx: GraphTx) -> bool:
+        """Check ledger existence without provoking a failed-table SELECT."""
+        if self._dialect.name == "sqlite":
+            row = tx.fetchone(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=:name",
+                {"name": "graph_migration_receipts"},
+            )
+        else:
+            row = tx.fetchone(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema=:schema AND table_name=:name",
+                {"schema": self._schema, "name": "graph_migration_receipts"},
+            )
+        return row is not None
+
+    def _ledger_lookup(self, request_id: str) -> Any | None:
+        try:
+            return self._fetch_one(
+                f"SELECT request_id, phase, request_digest, source_fingerprint, mapping_fingerprint, plan_sha256, target_fingerprint_before, target_fingerprint_after, edge_loss, property_loss, receipt_bytes FROM {self._ledger_table()} WHERE request_id=:request_id",
+                {"request_id": request_id},
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _receipt_from_ledger(row: Any) -> MigrationReceipt:
+        try:
+            if len(row) != 11:
+                raise GraphMigrationConflict("migration ledger row is malformed")
+            raw = bytes(row[-1])
+            value = json.loads(raw.decode("utf-8"))
+            required = {
+                "request_id", "phase", "request_digest", "source_fingerprint",
+                "mapping_fingerprint", "plan_sha256", "target_fingerprint_before",
+                "target_fingerprint_after", "mapping_result", "edge_loss", "property_loss",
+            }
+            if not isinstance(value, dict) or set(value) != required or value.get("phase") != "apply":
+                raise GraphMigrationConflict("migration ledger receipt is malformed")
+            columns = (
+                value["request_id"], value["phase"], value["request_digest"],
+                value["source_fingerprint"], value["mapping_fingerprint"],
+                value["plan_sha256"], value["target_fingerprint_before"],
+                value["target_fingerprint_after"], value["edge_loss"], value["property_loss"],
+            )
+            if tuple(row[:10]) != columns:
+                raise GraphMigrationConflict("migration ledger columns do not match receipt")
+            mapping_result = tuple(FrozenDict(item) for item in value["mapping_result"])
+            payload = MigrationReceiptPayload(
+                value["request_id"], value["phase"], value["request_digest"],
+                value["source_fingerprint"], value["mapping_fingerprint"],
+                value["plan_sha256"], value["target_fingerprint_before"],
+                value["target_fingerprint_after"], mapping_result,
+                value["edge_loss"], value["property_loss"],
+            )
+            if canonical_receipt_bytes(payload) != raw:
+                raise GraphMigrationConflict("migration ledger receipt bytes are not canonical")
+            receipt = MigrationReceipt(
+                value["request_id"], value["phase"], value["request_digest"],
+                value["source_fingerprint"], value["mapping_fingerprint"],
+                value["plan_sha256"], b"", value["target_fingerprint_before"],
+                value["target_fingerprint_after"], mapping_result,
+                int(value["edge_loss"]), int(value.get("property_loss", 0)),
+                receipt_sha256(raw), raw,
+            )
+            return receipt
+        except GraphMigrationConflict:
+            raise
+        except Exception as exc:
+            raise GraphMigrationConflict("migration ledger receipt is malformed") from exc
+
+    def _verify_backup(self, request: ApplyMigrationRequest) -> None:
+        try:
+            path = Path(request.backup_path)
+            if not path.is_file() or path.is_symlink():
+                raise GraphMigrationConflict("verified migration backup is required")
+            if self._dialect.name == "sqlite":
+                live_path = Path(self._db_path).resolve()
+                if path.resolve() == live_path or os.path.samefile(path, live_path):
+                    raise GraphMigrationConflict("migration backup must differ from live graph")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest != request.backup_sha256:
+                raise GraphMigrationConflict("migration backup SHA-256 mismatch")
+        except GraphMigrationConflict:
+            raise
+        except Exception as exc:
+            raise GraphMigrationConflict("verified migration backup is required") from exc
+
+    @staticmethod
+    def _validate_apply_request(request: ApplyMigrationRequest) -> None:
+        if (
+            not isinstance(request.request_id, str)
+            or not request.request_id
+            or not isinstance(request.expected_source_fingerprint, str)
+            or not request.expected_source_fingerprint
+            or not isinstance(request.plan_bytes, bytes)
+            or not isinstance(request.plan_sha256, str)
+            or not request.plan_sha256
+            or not isinstance(request.backup_sha256, str)
+            or not request.backup_sha256
+        ):
+            raise GraphMigrationConflict("malformed apply request")
+        try:
+            Path(request.backup_path)
+        except (TypeError, ValueError) as exc:
+            raise GraphMigrationConflict("malformed apply request") from exc
+
+    def _stage_and_cutover(self, tx: GraphTx, plan: MigrationPlanPayload) -> None:
+        json_kind = "JSONB" if self._dialect.name == "postgres" else "TEXT"
+        tx.execute(f"CREATE TEMP TABLE issue80_stage_nodes (node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, space_id TEXT, properties {json_kind} NOT NULL)")
+        tx.execute(f"CREATE TEMP TABLE issue80_stage_edges (from_id TEXT NOT NULL, relation TEXT NOT NULL, to_id TEXT NOT NULL, from_type TEXT NOT NULL, to_type TEXT NOT NULL, properties {json_kind} NOT NULL, PRIMARY KEY (from_id, relation, to_id))")
+        nodes = [spec.to_dict() for spec in plan.canonical_mappings if spec.get("kind") in {"rename", "merge"}]
+        edges = [
+            spec.to_dict()
+            for spec in plan.canonical_mappings
+            if spec.get("kind") == "edge" and spec.get("result", "retained") == "retained"
+        ]
+        for spec in nodes:
+            target = spec["target"]
+            tx.execute("INSERT INTO issue80_stage_nodes (node_id,node_type,space_id,properties) VALUES (:node_id,:node_type,:space_id,:properties)", {"node_id": target["node_id"], "node_type": target["node_type"], "space_id": target.get("space_id"), "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+        for spec in edges:
+            target = spec["target"]
+            tx.execute("INSERT INTO issue80_stage_edges (from_id,relation,to_id,from_type,to_type,properties) VALUES (:from_id,:relation,:to_id,:from_type,:to_type,:properties)", {"from_id": target["from_id"], "relation": target["relation"], "to_id": target["to_id"], "from_type": target["from_type"], "to_type": target["to_type"], "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+        nodes_table = self._table("graph_nodes")
+        edges_table = self._table("graph_edges")
+        tx.execute(f"DROP TABLE IF EXISTS {edges_table}")
+        tx.execute(f"DROP TABLE IF EXISTS {nodes_table}")
+        schema_name = getattr(self, "_schema", None)
+        ddls = self._dialect.render_ddl(GRAPH_STORE_SCHEMA, schema_name=schema_name) if schema_name is not None else self._dialect.render_ddl(GRAPH_STORE_SCHEMA)
+        for ddl in ddls:
+            tx.execute(ddl)
+        insert_node = self._dialect.insert(nodes_table, ["node_type", "node_id", "space_id", "properties"], json_columns=["properties"])
+        insert_edge = self._dialect.insert(edges_table, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"])
+        for spec in nodes:
+            target = spec["target"]
+            tx.execute(insert_node, {"node_type": target["node_type"], "node_id": target["node_id"], "space_id": target.get("space_id"), "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+        for spec in edges:
+            target = spec["target"]
+            tx.execute(insert_edge, {"from_type": target["from_type"], "from_id": target["from_id"], "relation": target["relation"], "to_type": target["to_type"], "to_id": target["to_id"], "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+        tx.execute("DROP TABLE issue80_stage_edges")
+        tx.execute("DROP TABLE issue80_stage_nodes")
+
+    def _target_graph_matches_plan(self, tx: GraphTx, plan: MigrationPlanPayload) -> bool:
+        """Return whether an already-qualified target is an exact plan no-op.
+
+        A target database is not a legacy staging area.  Replacing its tables
+        for an identity-preserving plan would create unnecessary DDL and
+        could invalidate unrelated read snapshots.  Compare the complete
+        canonical row set instead, including endpoint type snapshots, and let
+        the caller reject any non-identical target before graph DML.
+        """
+        expected_nodes: dict[str, dict[str, Any]] = {}
+        expected_edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for frozen in plan.canonical_mappings:
+            spec = frozen.to_dict()
+            if spec.get("kind") in {"rename", "merge"}:
+                target = spec["target"]
+                expected_nodes[target["node_id"]] = spec
+            elif spec.get("kind") == "edge" and spec.get("result", "retained") == "retained":
+                target = spec["target"]
+                expected_edges[(target["from_id"], target["relation"], target["to_id"])] = spec
+
+        nodes = self._table("graph_nodes")
+        actual_nodes = tx.fetchall(
+            f"SELECT node_id, node_type, space_id, properties FROM {nodes}", {}
+        )
+        if len(actual_nodes) != len(expected_nodes):
+            return False
+        for node_id, node_type, space_id, raw_properties in actual_nodes:
+            spec = expected_nodes.get(node_id)
+            if spec is None:
+                return False
+            target = spec["target"]
+            try:
+                properties = _merge_space(_as_dict(raw_properties), space_id)
+                digest = canonical_node_digest(
+                    node_type, space_id or properties.get("space"), properties
+                )
+            except (TypeError, ValueError):
+                return False
+            if (
+                node_type != target["node_type"]
+                or space_id != target.get("space_id")
+                or digest != spec["digest"]
+            ):
+                return False
+
+        edges = self._table("graph_edges")
+        actual_edges = tx.fetchall(
+            f"SELECT from_id, relation, to_id, from_type, to_type, properties FROM {edges}", {}
+        )
+        if len(actual_edges) != len(expected_edges):
+            return False
+        for from_id, relation, to_id, from_type, to_type, raw_properties in actual_edges:
+            key = (from_id, relation, to_id)
+            spec = expected_edges.get(key)
+            if spec is None:
+                return False
+            target = spec["target"]
+            try:
+                properties = normalize_edge_properties(
+                    from_id, relation, to_id, _as_dict(raw_properties)
+                )
+                digest = canonical_edge_digest(
+                    from_id, relation, to_id, from_type, to_type, properties
+                )
+            except (TypeError, ValueError):
+                return False
+            if (
+                from_type != target["from_type"]
+                or to_type != target["to_type"]
+                or digest != spec["digest"]
+            ):
+                return False
+        return True
+
+    def _ensure_ledger(self, tx: GraphTx) -> None:
+        blob = "BYTEA" if self._dialect.name == "postgres" else "BLOB"
+        tx.execute(f"CREATE TABLE IF NOT EXISTS {self._ledger_table()} (request_id TEXT PRIMARY KEY, phase TEXT NOT NULL, request_digest TEXT NOT NULL, source_fingerprint TEXT NOT NULL, mapping_fingerprint TEXT NOT NULL, plan_sha256 TEXT NOT NULL, target_fingerprint_before TEXT NOT NULL, target_fingerprint_after TEXT NOT NULL, edge_loss INTEGER NOT NULL, property_loss INTEGER NOT NULL, receipt_bytes {blob} NOT NULL, created_at TEXT NOT NULL)")
+
+    def _apply_migration(self, request: ApplyMigrationRequest) -> MigrationReceipt:
+        self._require_available()
+        self._validate_apply_request(request)
+        try:
+            request_digest = self._request_digest(request)
+        except Exception as exc:
+            raise GraphMigrationConflict("malformed apply request") from exc
+        existing = self._ledger_lookup(request.request_id)
+        if existing is not None:
+            if existing[2] != request_digest:
+                raise GraphMigrationConflict("apply request ID was reused with different bytes")
+            return self._receipt_from_ledger(existing)
+        self._verify_backup(request)
+        supplied_plan = bytes(request.plan_bytes)
+        if request.plan_sha256 != plan_sha256(supplied_plan):
+            raise GraphMigrationConflict("migration plan SHA-256 mismatch")
+        plan = self._plan_from_bytes(supplied_plan)
+        if self._schema_kind() not in {"legacy", "target"}:
+            raise GraphMigrationConflict("graph schema is not migratable")
+
+        def body(tx: GraphTx) -> MigrationReceipt:
+            # A duplicate caller can have waited for the first exclusive
+            # transaction to commit.  Read the ledger before rechecking the
+            # now-canonical graph so that unknown commit status resolves to
+            # the original immutable receipt instead of a stale-source
+            # conflict.  The table is absent on the first attempt; that is
+            # the only expected SELECT failure here and is handled below by
+            # the create-if-needed path after all validation.
+            if self._ledger_exists_tx(tx):
+                replay_row = tx.fetchone(
+                    f"SELECT request_id, phase, request_digest, source_fingerprint, mapping_fingerprint, plan_sha256, target_fingerprint_before, target_fingerprint_after, edge_loss, property_loss, receipt_bytes FROM {self._ledger_table()} WHERE request_id=:request_id",
+                    {"request_id": request.request_id},
+                )
+                if replay_row is not None:
+                    if replay_row[2] != request_digest:
+                        raise GraphMigrationConflict("apply request ID was reused with different bytes")
+                    return self._receipt_from_ledger(replay_row)
+
+            inventory = self._inspect_graph_identity_tx(tx)
+            if inventory.source_fingerprint != request.expected_source_fingerprint:
+                raise GraphMigrationConflict("source fingerprint changed before apply")
+            self._validate_decoded_plan(inventory, plan, supplied_plan)
+            self._ensure_ledger(tx)
+            try:
+                row = tx.fetchone(f"SELECT request_id, phase, request_digest, source_fingerprint, mapping_fingerprint, plan_sha256, target_fingerprint_before, target_fingerprint_after, edge_loss, property_loss, receipt_bytes FROM {self._ledger_table()} WHERE request_id=:request_id", {"request_id": request.request_id})
+            except Exception as exc:
+                raise GraphMigrationConflict("migration ledger is unavailable") from exc
+            if row is not None:
+                if row[2] != request_digest:
+                    raise GraphMigrationConflict("apply request ID was reused with different bytes")
+                return self._receipt_from_ledger(row)
+            before = self._graph_fingerprint_tx(tx)
+            if self._schema_kind() == "target":
+                if not self._target_graph_matches_plan(tx, plan):
+                    raise GraphMigrationConflict("preexisting target conflicts with migration plan")
+                # The target is already canonical.  Keep its rows and indexes
+                # untouched; this is a receipt-only no-op for a new request.
+                after = before
+            else:
+                self._stage_and_cutover(tx, plan)
+                after = self._graph_fingerprint_tx(tx)
+            receipt = self._make_receipt(
+                request_id=request.request_id, phase="apply", request_digest=request_digest,
+                inventory=inventory, plan=plan, plan_bytes=supplied_plan,
+                target_before=before, target_after=after,
+            )
+            tx.execute(f"INSERT INTO {self._ledger_table()} (request_id,phase,request_digest,source_fingerprint,mapping_fingerprint,plan_sha256,target_fingerprint_before,target_fingerprint_after,edge_loss,property_loss,receipt_bytes,created_at) VALUES (:request_id,:phase,:request_digest,:source_fingerprint,:mapping_fingerprint,:plan_sha256,:target_before,:target_after,:edge_loss,:property_loss,:receipt_bytes,:created_at)", {"request_id": request.request_id, "phase": "apply", "request_digest": request_digest, "source_fingerprint": inventory.source_fingerprint, "mapping_fingerprint": plan.mapping_fingerprint, "plan_sha256": plan_sha256(supplied_plan), "target_before": before, "target_after": after, "edge_loss": plan.edge_loss, "property_loss": plan.property_loss, "receipt_bytes": receipt.canonical_bytes, "created_at": self._dialect.bind_value_for_timestamp(datetime.now(UTC))})
+            return receipt
+
+        receipt = self._run_graph_tx(body, exclusive=self._dialect.name == "sqlite")
+        setattr(self, "_schema_state", "target")
+        return receipt
+
+    def migrate_graph_identity(self, request: DryRunMigrationRequest | ApplyMigrationRequest) -> MigrationReceipt:
+        if isinstance(request, ApplyMigrationRequest):
+            return self._apply_migration(request)
+        if not isinstance(request, DryRunMigrationRequest):
+            raise GraphMigrationConflict("malformed graph migration request")
+        self._require_available()
+        inventory = self.inspect_graph_identity()
+        plan = self._build_migration_plan(inventory, request)
+        encoded = canonical_plan_bytes(plan)
+        return self._make_receipt(
+            request_id=None,
+            phase="dry_run",
+            request_digest=self._dry_request_digest(request, plan.mapping_fingerprint),
+            inventory=inventory,
+            plan=plan,
+            plan_bytes=encoded,
+            target_before=inventory.source_fingerprint,
+            target_after=inventory.source_fingerprint,
+        )
+
+    def reclassify_node(
+        self,
+        node_id: str,
+        *,
+        expected_current_digest: str,
+        new_type: str,
+        new_space_id: str | None = None,
+        new_properties: dict[str, Any],
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        return self.update_node(
+            node_id, expected_current_digest, new_type, new_properties,
+            new_space_id, return_receipt=return_receipt,
+        )
+
+    @staticmethod
+    def _provenance_schema_fingerprint() -> str:
+        schema = {
+            "tables": [
+                {"name": table.name, "columns": [[c.name, c.kind, c.not_null, c.default] for c in table.columns], "primary_key": list(table.primary_key)}
+                for table in GRAPH_STORE_SCHEMA.tables
+            ],
+            "indexes": [[i.name, i.table, i.expr, list(i.json_key) if i.json_key else None] for i in GRAPH_STORE_SCHEMA.indexes],
+        }
+        return hashlib.sha256(
+            b"opencrab.issue80.graph-schema.v1\0" + canonical_json_bytes(schema)
+        ).hexdigest()
+
+    def _graph_fingerprint_tx(self, tx: GraphTx) -> str:
+        """Compute the backend-neutral graph snapshot fingerprint in ``tx``."""
+        nodes = self._table("graph_nodes")
+        edges = self._table("graph_edges")
+        node_items: list[list[str]] = []
+        for node_id, node_type, space_id, raw in tx.fetchall(
+            f"SELECT node_id, node_type, space_id, properties FROM {nodes}", {}
+        ):
+            try:
+                props = _merge_space(parse_properties_object(raw), space_id)
+                digest = canonical_node_digest(node_type, space_id or props.get("space"), props)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"graph pack provenance malformed properties: node {node_id}") from exc
+            node_items.append([node_id, digest])
+        edge_items: list[list[str]] = []
+        for from_id, relation, to_id, from_type, to_type, raw in tx.fetchall(
+            f"SELECT from_id, relation, to_id, from_type, to_type, properties FROM {edges}", {}
+        ):
+            try:
+                props = parse_properties_object(raw)
+                props = normalize_edge_properties(from_id, relation, to_id, props)
+                digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"graph pack provenance malformed properties: edge ({from_id}, {relation}, {to_id})"
+                ) from exc
+            edge_items.append([from_id, relation, to_id, digest])
+        payload = {
+            "schema_fingerprint": self._provenance_schema_fingerprint(),
+            "nodes": sorted(node_items),
+            "edges": sorted(edge_items),
+        }
+        return hashlib.sha256(
+            b"opencrab.issue80.provenance-target.v1\0" + canonical_json_bytes(payload)
+        ).hexdigest()
+
+    def graph_fingerprint(self) -> str:
+        """Return the current graph-owned snapshot fingerprint."""
+        self._require_available()
+
+        def body(tx: GraphTx) -> str:
+            return self._graph_fingerprint_tx(tx)
+
+        return self._run_graph_tx(body)
+
+    @staticmethod
+    def _validate_provenance_record(record: Any) -> tuple[str, dict[str, Any]]:
+        if not isinstance(record, dict):
+            raise ValueError("malformed graph provenance record")
+        common = {
+            "kind", "target_fingerprint", "expected_current_digest", "proposed_pack_id",
+            "reason", "dry_run_evidence_digest", "allowed_properties_delta",
+        }
+        kind = record.get("kind")
+        if kind == "node":
+            required = common | {"node_id", "node_type"}
+        elif kind == "edge":
+            required = common | {"from_id", "relation", "to_id", "from_type", "to_type"}
+        else:
+            raise ValueError("malformed graph provenance record")
+        if set(record) != required:
+            raise ValueError("malformed graph provenance record")
+        for key in ("target_fingerprint", "expected_current_digest", "dry_run_evidence_digest"):
+            validate_digest(record[key], edge=(key == "expected_current_digest" and kind == "edge"))
+        owner = record["proposed_pack_id"]
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("malformed graph provenance owner")
+        if record["reason"] not in {"inferred", "assumed"}:
+            raise ValueError("malformed graph provenance reason")
+        delta = record["allowed_properties_delta"]
+        if not isinstance(delta, dict) or set(delta) != {"set", "remove"} or not isinstance(delta["set"], dict) or not isinstance(delta["remove"], list):
+            raise ValueError("malformed graph provenance delta")
+        if any(not isinstance(k, str) for k in delta["set"]) or any(not isinstance(k, str) for k in delta["remove"]):
+            raise ValueError("malformed graph provenance delta")
+        for key in ("node_id", "node_type") if kind == "node" else ("from_id", "relation", "to_id", "from_type", "to_type"):
+            if not isinstance(record[key], str) or not record[key]:
+                raise ValueError("malformed graph provenance identity")
+        return kind, record
+
+    def backfill_pack_provenance(self, records: Iterable[dict[str, Any]]) -> ProvenanceBatchReceipt:
+        """Apply one frozen, tagged ownership plan as an all-or-none CAS."""
+        self._require_write_available()
+        if isinstance(records, (str, bytes, dict)):
+            raise ValueError("graph provenance records must be a non-empty sequence")
+        try:
+            materialized = list(records)
+        except TypeError as exc:
+            raise ValueError("graph provenance records must be a non-empty sequence") from exc
+        if not materialized:
+            raise ValueError("graph provenance records must be a non-empty sequence")
+        validated: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, Any]] = set()
+        for record in materialized:
+            kind, value = self._validate_provenance_record(record)
+            key = value["node_id"] if kind == "node" else (value["from_id"], value["relation"], value["to_id"])
+            marker = (kind, key)
+            if marker in seen:
+                raise RuntimeError(f"graph pack provenance duplicate key: {kind}:{key}")
+            seen.add(marker)
+            validated.append((kind, value))
+        target = validated[0][1]["target_fingerprint"]
+        if any(value["target_fingerprint"] != target for _kind, value in validated):
+            raise ValueError("graph provenance target fingerprint mismatch")
+
+        def body(tx: GraphTx) -> ProvenanceBatchReceipt:
+            node_ids: set[str] = set()
+            edge_keys: list[tuple[str, str, str]] = []
+            for kind, record in validated:
+                if kind == "node":
+                    node_ids.add(record["node_id"])
+                else:
+                    node_ids.update((record["from_id"], record["to_id"]))
+                    edge_keys.append((record["from_id"], record["relation"], record["to_id"]))
+            self._lock_graph_rows(tx, node_ids, edge_keys)
+            before = self._graph_fingerprint_tx(tx)
+            if before != target:
+                raise RuntimeError("graph pack provenance target fingerprint mismatch")
+            nodes = self._table("graph_nodes")
+            edges = self._table("graph_edges")
+            pending: list[tuple[str, Any, str, str, dict[str, Any], dict[str, Any], str]] = []
+            for kind, record in validated:
+                owner = record["proposed_pack_id"]
+                if kind == "node":
+                    nid = record["node_id"]
+                    row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes} WHERE node_id=:nid", {"nid": nid})
+                    if row is None:
+                        raise RuntimeError(f"graph pack provenance node missing: {nid}")
+                    if row[0] != record["node_type"]:
+                        raise RuntimeError(f"graph pack provenance node snapshot mismatch: {nid}")
+                    try:
+                        raw_current = parse_properties_object(row[2])
+                        current = _merge_space(raw_current, row[1])
+                        digest = canonical_node_digest(row[0], row[1] or current.get("space"), current)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(f"graph pack provenance malformed properties: node {nid}") from exc
+                    if digest != record["expected_current_digest"]:
+                        raise NodeIdentityConflict(f"stale node update: {nid}")
+                    existing = current.get("pack_id")
+                    if existing not in (None, "") and not isinstance(existing, str):
+                        raise RuntimeError(f"graph pack provenance malformed owner: node {nid}")
+                    if isinstance(existing, str) and existing and existing != owner:
+                        raise RuntimeError("graph pack provenance conflict")
+                    if isinstance(existing, str) and existing == owner:
+                        expected_delta = {"set": {}, "remove": ["pack"] if "pack" in current else []}
+                        after_props = dict(raw_current)
+                        after_props.pop("pack", None)
+                        operation = "assigned" if "pack" in current else "idempotent"
+                    else:
+                        expected_delta = {"set": {"pack_id": owner}, "remove": ["pack"] if "pack" in current else []}
+                        # ``space_id`` is a dedicated column.  Keep it out of
+                        # the JSON delta when it was only folded in for the
+                        # digest/read shape.
+                        after_props = dict(raw_current)
+                        after_props.pop("pack", None)
+                        after_props["pack_id"] = owner
+                        operation = "assigned"
+                    if record["allowed_properties_delta"] != expected_delta:
+                        raise RuntimeError("graph pack provenance delta mismatch")
+                    pending.append((kind, nid, digest, operation, current, after_props, record["node_type"]))
+                else:
+                    fid, rel, tid = record["from_id"], record["relation"], record["to_id"]
+                    endpoints = tx.fetchall(f"SELECT node_id, node_type FROM {nodes} WHERE node_id IN (:fid,:tid)", {"fid": fid, "tid": tid})
+                    endpoint_types = {row[0]: row[1] for row in endpoints}
+                    if fid not in endpoint_types or tid not in endpoint_types:
+                        missing = fid if fid not in endpoint_types else tid
+                        raise ValueError(f"edge endpoint does not exist: {missing}")
+                    if endpoint_types[fid] != record["from_type"]:
+                        raise ValueError(f"edge endpoint type mismatch: {fid}")
+                    if endpoint_types[tid] != record["to_type"]:
+                        raise ValueError(f"edge endpoint type mismatch: {tid}")
+                    row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
+                    if row is None:
+                        raise RuntimeError(f"graph pack provenance edge missing: ({fid}, {rel}, {tid})")
+                    try:
+                        raw_current = parse_properties_object(row[2])
+                        current = normalize_edge_properties(fid, rel, tid, raw_current)
+                        digest = canonical_edge_digest(fid, rel, tid, row[0], row[1], current)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(f"graph pack provenance malformed properties: edge ({fid}, {rel}, {tid})") from exc
+                    if digest != record["expected_current_digest"]:
+                        raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
+                    existing = current.get("pack_id")
+                    if existing not in (None, "") and not isinstance(existing, str):
+                        raise RuntimeError(f"graph pack provenance malformed owner: edge ({fid}, {rel}, {tid})")
+                    if isinstance(existing, str) and existing and existing != owner:
+                        raise RuntimeError("graph pack provenance conflict")
+                    if isinstance(existing, str) and existing == owner:
+                        expected_delta = {"set": {}, "remove": ["pack"] if "pack" in current else []}
+                        after_props = dict(raw_current)
+                        after_props.pop("pack", None)
+                        operation = "assigned" if "pack" in current else "idempotent"
+                    else:
+                        expected_delta = {"set": {"pack_id": owner}, "remove": ["pack"] if "pack" in current else []}
+                        after_props = dict(raw_current)
+                        after_props.pop("pack", None)
+                        after_props["pack_id"] = owner
+                        operation = "assigned"
+                    if record["allowed_properties_delta"] != expected_delta:
+                        raise RuntimeError("graph pack provenance delta mismatch")
+                    pending.append((kind, (fid, rel, tid), digest, operation, current, after_props, row[0]))
+
+            receipts: list[ProvenanceWriteReceipt] = []
+            for kind, key, before_digest, operation, current, after_props, _snapshot in pending:
+                if operation == "assigned":
+                    if kind == "node":
+                        result = tx.execute(f"UPDATE {nodes} SET properties=:props WHERE node_id=:nid", {"props": json.dumps(after_props, ensure_ascii=False), "nid": key})
+                    else:
+                        result = tx.execute(f"UPDATE {edges} SET properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"props": json.dumps(after_props, ensure_ascii=False), "fid": key[0], "rel": key[1], "tid": key[2]})
+                    if tx.rowcount(result) != 1:
+                        raise RuntimeError("graph pack provenance rowcount mismatch")
+                # Re-read the changed row through the same transaction and
+                # compute the receipt from the authoritative post-write row.
+                if kind == "node":
+                    row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes} WHERE node_id=:nid", {"nid": key})
+                    props = _merge_space(parse_properties_object(row[2]), row[1])
+                    after_digest = canonical_node_digest(row[0], row[1] or props.get("space"), props)
+                else:
+                    row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": key[0], "rel": key[1], "tid": key[2]})
+                    props = normalize_edge_properties(key[0], key[1], key[2], parse_properties_object(row[2]))
+                    after_digest = canonical_edge_digest(key[0], key[1], key[2], row[0], row[1], props)
+                receipts.append(ProvenanceWriteReceipt(kind, key, operation, before_digest, after_digest, 1 if operation == "assigned" else 0))
+            after = self._graph_fingerprint_tx(tx)
+            return ProvenanceBatchReceipt(before, after, tuple(receipts))
+
+        return self._run_mutation_tx(body)
+
+    def update_node(
+        self, node_id: str, expected_current_digest: str, new_type: str,
+        new_properties: dict[str, Any], new_space_id: str | None = None, *, return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        self._require_write_available()
+        validate_digest(expected_current_digest)
+        new_type, props, space_id, digest = prepare_node(new_type, node_id, new_properties, new_space_id)
+        nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
+        def body(tx: GraphTx) -> dict[str, Any] | NodeWriteReceipt:
+            self._lock_graph_rows(tx, (node_id,))
+            incident = tx.fetchall(
+                f"SELECT from_id, relation, to_id, from_type, to_type, properties FROM {edges} WHERE from_id=:nid OR to_id=:nid",
+                {"nid": node_id},
+            )
+            self._lock_graph_rows(
+                tx,
+                (value for row in incident for value in (row[0], row[2])),
+                ((row[0], row[1], row[2]) for row in incident),
+            )
+            row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes} WHERE node_id=:nid", {"nid": node_id})
+            if row is None:
+                raise NodeIdentityConflict(f"stale node update: {node_id}")
+            current_props = _merge_space(_as_dict(row[2]), row[1])
+            try:
+                current_digest = canonical_node_digest(row[0], row[1] or current_props.get("space"), current_props)
+            except (TypeError, ValueError):
+                current_digest = ""
+            if current_digest != expected_current_digest:
+                raise NodeIdentityConflict(f"stale node update: {node_id}")
+            edge_updates: list[tuple[str, str, str, str, str, str]] = []
+            for from_id, relation, to_id, from_type, to_type, raw_properties in incident:
+                try:
+                    edge_properties = normalize_edge_properties(
+                        from_id, relation, to_id, parse_properties_object(raw_properties)
+                    )
+                    next_from_type = new_type if from_id == node_id else from_type
+                    next_to_type = new_type if to_id == node_id else to_type
+                    edge_digest = canonical_edge_digest(
+                        from_id, relation, to_id, next_from_type, next_to_type,
+                        edge_properties,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise GraphMigrationConflict("incident edge properties are malformed") from exc
+                edge_updates.append((from_id, relation, to_id, next_from_type, next_to_type, edge_digest))
+            result = tx.execute(f"UPDATE {nodes} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": new_type, "sid": space_id, "props": json.dumps(props, ensure_ascii=False), "nid": node_id})
+            if tx.rowcount(result) != 1:
+                raise NodeIdentityConflict(f"stale node update: {node_id}")
+            # Type snapshots are compatibility fields and must follow the node.
+            for from_id, relation, to_id, from_type, to_type, edge_digest in edge_updates:
+                edge_result = tx.execute(
+                    f"UPDATE {edges} SET from_type=:from_type, to_type=:to_type WHERE from_id=:from_id AND relation=:relation AND to_id=:to_id",
+                    {
+                        "from_type": from_type, "to_type": to_type,
+                        "from_id": from_id, "relation": relation, "to_id": to_id,
+                    },
+                )
+                if tx.rowcount(edge_result) != 1:
+                    raise GraphMigrationConflict("incident edge snapshot disappeared")
+                # The edge digest is a stored compatibility field only on
+                # Neo4j; SQL derives it from the row, so no extra column is
+                # written here.  ``edge_digest`` is still computed above to
+                # validate the complete post-reclassification identity.
+                del edge_digest
+            if return_receipt:
+                return NodeWriteReceipt("updated", node_id, new_type, space_id, props, digest)
+            return props
+        return self._run_mutation_tx(body)
+
+    def delete_edge(self, from_id: str, relation: str, to_id: str, *, owner_pack_id: str) -> bool:
+        self._require_write_available()
+        for value in (from_id, relation, to_id, owner_pack_id):
+            if not isinstance(value, str) or not value:
+                raise ValueError("graph identity fields must be non-empty strings")
+        edges = self._table("graph_edges")
+        def body(tx: GraphTx) -> bool:
+            self._lock_graph_rows(tx, (), ((from_id, relation, to_id),))
+            row = tx.fetchone(f"SELECT properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
+            if not row:
+                return False
+            props = _as_dict(row[0])
+            if props.get("pack_id") != owner_pack_id:
+                return False
+            result = tx.execute(f"DELETE FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
+            if tx.rowcount(result) != 1:
+                raise RuntimeError("graph edge delete rowcount mismatch")
+            return True
+        return self._run_mutation_tx(body)
+
+    def update_edge(
+        self, from_type: str, from_id: str, relation: str, to_type: str, to_id: str,
+        properties: dict[str, Any] | None = None, *, expected_current_digest: str, owner_pack_id: str,
+        return_receipt: bool = False,
+    ) -> bool | EdgeWriteReceipt:
+        self._require_write_available()
+        validate_digest(expected_current_digest, edge=True)
+        if not isinstance(owner_pack_id, str) or not owner_pack_id:
+            raise ValueError("graph identity fields must be non-empty strings")
+        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        if props.get("pack_id") != owner_pack_id:
+            raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+        digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
+        nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
+        def body(tx: GraphTx) -> bool | EdgeWriteReceipt:
+            self._lock_graph_rows(tx, (from_id, to_id), ((from_id, relation, to_id),))
+            ends = tx.fetchall(f"SELECT node_id, node_type FROM {nodes} WHERE node_id IN (:fid,:tid)", {"fid": from_id, "tid": to_id})
+            types = {r[0]: r[1] for r in ends}
+            if types.get(from_id) != from_type or types.get(to_id) != to_type:
+                raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+            row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
+            if not row:
+                raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+            current = normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+            if current.get("pack_id") != owner_pack_id:
+                raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+            current_digest = canonical_edge_digest(from_id, relation, to_id, row[0], row[1], current)
+            if current_digest != expected_current_digest:
+                raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+            result = tx.execute(f"UPDATE {edges} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": from_type, "tt": to_type, "props": json.dumps(props, ensure_ascii=False), "fid": from_id, "rel": relation, "tid": to_id})
+            if tx.rowcount(result) != 1:
+                raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
+            if return_receipt:
+                return EdgeWriteReceipt("updated", from_id, relation, to_id, from_type, to_type, props, digest)
+            return True
+        return self._run_mutation_tx(body)
 
     # ------------------------------------------------------------------
     # Query operations
@@ -399,6 +2366,7 @@ class _SqlGraphStoreBase(abc.ABC):
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Not supported by either SQL backend — returns [] with a warning."""
+        self._require_available()
         logger.warning("run_cypher() is not supported in %s mode; returning [].", self._dialect.name)
         return []
 
@@ -551,11 +2519,11 @@ class _SqlGraphStoreBase(abc.ABC):
                 # The `True` here says "the anchor side already passed". That
                 # holds for the anchor this call was given, but NOT for a
                 # same-node_id row in another pack: the edge fetch matches on
-                # from_id/to_id alone (the PK is (node_type, node_id)), so an
-                # unreadable twin's edges can reach this point. Confidentiality
-                # is preserved by the fetch's own JOIN, which pack-filters the
-                # OTHER endpoint in SQL -- not by _edge_passes. See
-                # _pack_where's docstring; #147 section 8 records the residue.
+                # from_id/to_id identify one global edge key, so the fetched
+                # endpoint row is the same graph node selected by the edge.
+                # Confidentiality is preserved by the fetch's own JOIN, which
+                # pack-filters the OTHER endpoint in SQL -- not by
+                # _edge_passes. See _pack_where's docstring.
                 from_pass, to_pass = (True, other_pass) if is_out else (other_pass, True)
                 if not _edge_passes(edge_props, from_pass, to_pass, pack_set):
                     continue
@@ -732,11 +2700,31 @@ class _SqlGraphStoreBase(abc.ABC):
         # traversal and export drop the edge because the caller's scope,
         # derived from the registry, cannot contain its pack.
         for table in ("graph_nodes", "graph_edges"):
-            rows = self._fetch_all(
-                f"SELECT DISTINCT {pid} FROM {self._table(table)} "  # noqa: S608
-                f"WHERE {pid} IS NOT NULL",
-                {},
-            )
+            try:
+                rows = self._fetch_all(
+                    f"SELECT DISTINCT {pid} FROM {self._table(table)} "  # noqa: S608
+                    f"WHERE {pid} IS NOT NULL",
+                    {},
+                )
+            except Exception as exc:
+                # SQLite's JSON expression raises on a single malformed
+                # properties value. Enumeration is an inspection guard, so
+                # retain valid owners while ignoring only that malformed row;
+                # unrelated connection or schema failures must still surface.
+                if "malformed" not in str(exc).lower():
+                    raise
+                rows = []
+                for (raw,) in self._fetch_all(
+                    f"SELECT properties FROM {self._table(table)}",  # noqa: S608
+                    {},
+                ):
+                    try:
+                        props = parse_properties_object(raw)
+                    except ValueError:
+                        continue
+                    value = props.get("pack_id")
+                    if value:
+                        rows.append((value,))
             out |= {str(r[0]) for r in rows if r[0]}
         return out
 
@@ -815,22 +2803,12 @@ class _SqlGraphStoreBase(abc.ABC):
         independent clauses instead of a full min/max reproduction of
         ``_edge_passes`` (``src_passes`` is then always True).
 
-        THAT ASSUMPTION IS NOT GUARANTEED, and an earlier version of this
-        docstring asserted it as one. The anchor is resolved by
-        ``_fetch_node_props_by_id``, whose SQL matches ``node_id`` alone
-        even though the PK is ``(node_type, node_id)``, while
-        ``_fetch_edges_for_node`` matches ``from_id``/``to_id`` alone too --
-        so when one ``node_id`` exists in two packs under different types,
-        edges belonging to the unreadable twin do enter the traversal.
-        What actually keeps that from disclosing anything is NOT
-        ``_edge_passes``: it is the JOIN in ``_fetch_edges_for_node`` and
-        ``PGGraphStore._batch_frontier_edges``, which pack-filters the OTHER
-        endpoint in SQL, so every row that comes back is one the caller may
-        read. Do not remove that JOIN clause on the grounds that
-        ``_edge_passes`` will catch it -- it will not. The residue is a
-        correctness defect (neighbours attributed to the wrong node), not a
-        confidentiality one; issue #147 section 8 records it and opens a
-        follow-up for making traversal match on the full key.
+        The anchor is resolved by ``_fetch_node_props_by_id`` and the edge
+        fetch uses the global endpoint ids. Both queries join the endpoint
+        node when a pack or space filter is active, so the SQL predicate is
+        applied before the traversal limit. Keep that JOIN as the
+        confidentiality boundary; the Python predicate remains defense in
+        depth for malformed composite property values.
 
         Uses ``json_truthy_text`` (not the bare ``json_get`` extraction) for
         both sides: a raw JSON extraction is non-NULL for ``""``/``0``/
@@ -975,7 +2953,11 @@ class _SqlGraphStoreBase(abc.ABC):
         )
         rows = self._fetch_all(sql, params)
         return [
-            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            {
+                "props": _merge_space(_as_dict(properties), space_id),
+                "labels": [node_type],
+                "node_type": node_type,
+            }
             for node_type, space_id, properties in rows
         ]
 
@@ -1063,25 +3045,10 @@ class _SqlGraphStoreBase(abc.ABC):
         """Type-agnostic, SCOPE-FILTERED node lookup (issue #147 §1.2-6b,
         §3.4(b)) -- replaces a Python post-filter over ``get_node_by_id``,
         which cannot be made safe by filtering after the fact:
-        ``get_node_by_id``'s ``WHERE node_id=:nid LIMIT 1`` has no
-        ``node_type`` predicate, and ``graph_nodes``' real PK is
-        ``(node_type, node_id)`` -- the same ``node_id`` CAN exist under a
-        different ``node_type`` in a pack the caller cannot read. A
-        post-filter on whichever single row SQL's ``LIMIT 1`` happened to
-        pick would then answer "not found" even when the caller's OWN pack
-        genuinely has that id under a different type -- a real (if narrow)
-        recall bug on top of the leak. Pushing the pack predicate ahead of
-        ``LIMIT 1`` picks a row already known to be in-scope, so it can
-        never reject a row the caller is actually entitled to see.
-
-        Scope-INTERNAL homonym collisions (two DIFFERENT node_types, both
-        inside the caller's own readable scope, sharing one node_id) are
-        NOT resolved by this predicate -- which of the two rows ``LIMIT 1``
-        returns is still arbitrary. Deliberately out of scope for issue
-        #147 (a data-integrity question, not a confidentiality one -- see
-        issue #147 §8's homonym-limits section); the real fix is giving
-        neighbour-traversal a ``(node_type, node_id)`` matching key, tracked
-        as a follow-up issue there.
+        ``get_node_by_id``'s ``WHERE node_id=:nid LIMIT 1`` is unscoped. The
+        pack predicate must therefore be pushed ahead of ``LIMIT 1`` so the
+        selected row is already known to be readable. Global node identity
+        means one id has one row, so no in-scope homonym remains to resolve.
 
         Empty ``pack_ids`` -> ``None`` without querying (nothing is in
         scope, so there is nothing to find)."""
@@ -1162,7 +3129,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 props = self.get_node(other_ntype, other_nid)
                 if props:
                     results.append(
-                        {"properties": props, "labels": [other_ntype], "relation_type": relation}
+                        {
+                            "properties": props,
+                            "labels": [other_ntype],
+                            "node_type": other_ntype,
+                            "relation_type": relation,
+                        }
                     )
 
         if direction in ("out", "both"):
@@ -1196,7 +3168,12 @@ class _SqlGraphStoreBase(abc.ABC):
             for to_type, to_id, relation in rows:
                 props = self.get_node(to_type, to_id)
                 if props:
-                    results.append({"properties": props, "labels": [to_type], "relation_type": relation})
+                    results.append({
+                        "properties": props,
+                        "labels": [to_type],
+                        "node_type": to_type,
+                        "relation_type": relation,
+                    })
 
         if direction in ("in", "both"):
             remaining = limit - len(results)
@@ -1209,7 +3186,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 for from_type, from_id, relation in rows:
                     props = self.get_node(from_type, from_id)
                     if props:
-                        results.append({"properties": props, "labels": [from_type], "relation_type": relation})
+                        results.append({
+                            "properties": props,
+                            "labels": [from_type],
+                            "node_type": from_type,
+                            "relation_type": relation,
+                        })
 
         return results
 
@@ -1230,16 +3212,11 @@ class _SqlGraphStoreBase(abc.ABC):
         """Plural counterpart to ``get_node_by_id`` -- returns EVERY row for
         ``node_id``, not just whichever one ``LIMIT 1`` happens to pick.
 
-        ``graph_nodes``' real PK is ``(node_type, node_id)``, so the same
-        ``node_id`` can legitimately exist under more than one ``node_type``
-        (pinned by ``tests/test_read_scope_isolation.py``'s "Same node_id in
-        two packs under two node_types" case). ``get_node_by_id``'s bare
-        ``WHERE node_id=:nid LIMIT 1`` is then non-deterministic about which
-        row it returns -- fine for a single best-effort lookup, but unsafe
-        for callers that need to reason about pack ownership across ALL rows
-        (a packless row could be picked ahead of a foreign one). ``ORDER BY
-        node_type`` makes the row order deterministic; empty list, not
-        ``None``, when nothing matches."""
+        Global node identity makes this normally a one-row result, but the
+        plural API remains useful for inspecting legacy or externally
+        corrupted data. ``ORDER BY node_type`` makes any such diagnostic
+        result deterministic; empty list, not ``None``, when nothing
+        matches."""
         self._require_available()
         sql = (
             f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
@@ -1308,7 +3285,11 @@ class _SqlGraphStoreBase(abc.ABC):
         sql = f"SELECT node_type, space_id, properties FROM {table}{where_sql} LIMIT :lim"
         rows = self._fetch_all(sql, params)
         return [
-            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            {
+                "props": _merge_space(_as_dict(properties), space_id),
+                "labels": [node_type],
+                "node_type": node_type,
+            }
             for node_type, space_id, properties in rows
         ]
 
@@ -1422,7 +3403,11 @@ class _SqlGraphStoreBase(abc.ABC):
         )
         rows = self._fetch_all(sql, params)  # noqa: S608
         return [
-            {"props": _merge_space(_as_dict(properties), space_id), "labels": [node_type]}
+            {
+                "props": _merge_space(_as_dict(properties), space_id),
+                "labels": [node_type],
+                "node_type": node_type,
+            }
             for node_type, space_id, properties in rows
         ]
 
@@ -1470,56 +3455,222 @@ class _SqlGraphStoreBase(abc.ABC):
             for r in rows
         ]
 
-    def upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> int:
-        self._require_available()
-        if not nodes:
-            return 0
-        sql = self._dialect.upsert(
-            self._table("graph_nodes"),
-            ["node_type", "node_id", "space_id", "properties"],
-            conflict_cols=["node_type", "node_id"],
-            update_cols=["space_id", "properties"],
-            json_columns=["properties"],
-        )
-        # issue #118: same write shape as upsert_node (a props dict + a
-        # separate space_id column) built inline here instead of delegating
-        # to upsert_node, so it needs the identical _normalize_space
-        # reconciliation applied per node -- otherwise a batch caller could
-        # reintroduce the exact divergence upsert_node no longer allows.
-        params = []
-        for n in nodes:
-            props = {**n.get("properties", {}), "id": n["node_id"]}
-            props, space_id = _normalize_space(props, n.get("space_id"))
-            params.append({
-                "node_type": n["node_type"],
-                "node_id": n["node_id"],
-                "space_id": space_id,
-                "properties": json.dumps(props),
-            })
-        self._exec_write_batch(sql, params)
-        return len(params)
+    def upsert_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
+        self._require_write_available()
+        return self._upsert_nodes_batch_impl(nodes, return_receipt=return_receipt)
 
-    def upsert_edges_batch(self, edges: list[dict[str, Any]]) -> int:
-        self._require_available()
+    def upsert_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
+        self._require_write_available()
+        return self._upsert_edges_batch_impl(edges, return_receipt=return_receipt)
+
+    # Issue 80 batch implementations live below the compatibility bodies
+    # above so downstream subclasses that introspect the historical method
+    # order continue to work.  The public methods return before those bodies.
+    def _upsert_nodes_batch_impl(self, nodes: list[dict[str, Any]], *, return_receipt: bool) -> Any:
+        if not nodes:
+            return () if return_receipt else 0
+        prepared = []
+        seen: set[str] = set()
+        for item in nodes:
+            if not isinstance(item, dict):
+                raise ValueError("malformed graph batch item")
+            try:
+                nt, props, sid, digest = prepare_node(item["node_type"], item["node_id"], item.get("properties", {}), item.get("space_id"))
+            except KeyError as exc:
+                raise ValueError("malformed graph batch item") from exc
+            nid = item["node_id"]
+            if nid in seen:
+                raise ValueError(f"duplicate global graph key in batch: node_id={nid}")
+            seen.add(nid)
+            prepared.append((nt, nid, props, sid, digest))
+        table = self._table("graph_nodes")
+        insert_sql = self._dialect.insert(table, ["node_type", "node_id", "space_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (node_id) DO NOTHING"
+        def body(tx: GraphTx) -> Any:
+            self._lock_graph_rows(tx, (item[1] for item in prepared))
+            rows: dict[str, tuple] = {}
+            for _nt, nid, _props, _sid, _digest in prepared:
+                row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {table} WHERE node_id=:nid", {"nid": nid})
+                if row:
+                    rows[nid] = row
+            for _nt, nid, _props, _sid, digest in prepared:
+                if nid in rows:
+                    row = rows[nid]
+                    stored = _merge_space(_as_dict(row[2]), row[1])
+                    if canonical_node_digest(row[0], row[1] or stored.get("space"), stored) != digest:
+                        raise NodeIdentityConflict(f"node identity conflict: {nid}")
+            receipts = []
+            for nt, nid, props, sid, _digest in prepared:
+                operation = "idempotent" if nid in rows else "created"
+                if nid not in rows:
+                    result = tx.execute(insert_sql, {"node_type": nt, "node_id": nid, "space_id": sid, "properties": json.dumps(props, ensure_ascii=False)})
+                    if tx.rowcount(result) == 0:
+                        operation = "idempotent"
+                    row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {table} WHERE node_id=:nid", {"nid": nid})
+                else:
+                    row = rows[nid]
+                if row is None:
+                    raise RuntimeError("graph node insert did not produce a row")
+                stored = _merge_space(_as_dict(row[2]), row[1])
+                digest = canonical_node_digest(row[0], row[1] or stored.get("space"), stored)
+                if return_receipt:
+                    receipts.append(NodeWriteReceipt(operation, nid, row[0], row[1], stored, digest))
+            return tuple(receipts) if return_receipt else len(prepared)
+        return self._run_mutation_tx(body)
+
+    def update_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
+        self._require_write_available()
+        if not nodes:
+            return () if return_receipt else 0
+        prepared = []
+        seen: set[str] = set()
+        for item in nodes:
+            if not isinstance(item, dict):
+                raise ValueError("malformed graph batch item")
+            nid = item.get("node_id")
+            if not isinstance(nid, str) or nid in seen:
+                raise ValueError(f"duplicate global graph key in batch: node_id={nid}")
+            seen.add(nid)
+            expected = item.get("expected_current_digest")
+            validate_digest(expected)
+            nt = item.get("new_type", item.get("node_type"))
+            props = item.get("new_properties", item.get("properties"))
+            if nt is None or props is None:
+                raise ValueError("malformed graph batch item")
+            nt, props, sid, digest = prepare_node(nt, nid, props, item.get("new_space_id", item.get("space_id")))
+            prepared.append((nid, expected, nt, props, sid, digest))
+        nodes_table, edges_table = self._table("graph_nodes"), self._table("graph_edges")
+        def body(tx: GraphTx) -> Any:
+            target_ids = [item[0] for item in prepared]
+            self._lock_graph_rows(tx, target_ids)
+            if target_ids:
+                placeholders, id_params = self._in_placeholders(target_ids, "incident_")
+                incident = tx.fetchall(
+                    f"SELECT from_id, relation, to_id FROM {edges_table} "
+                    f"WHERE from_id IN ({placeholders}) OR to_id IN ({placeholders})",
+                    id_params,
+                )
+            else:
+                incident = []
+            self._lock_graph_rows(
+                tx,
+                (value for row in incident for value in (row[0], row[2])),
+                ((row[0], row[1], row[2]) for row in incident),
+            )
+            for nid, expected, _nt, _props, _sid, _digest in prepared:
+                row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes_table} WHERE node_id=:nid", {"nid": nid})
+                if row is None:
+                    raise NodeIdentityConflict(f"stale node update: {nid}")
+                current = _merge_space(_as_dict(row[2]), row[1])
+                if canonical_node_digest(row[0], row[1] or current.get("space"), current) != expected:
+                    raise NodeIdentityConflict(f"stale node update: {nid}")
+            receipts = []
+            for nid, _expected, nt, props, sid, digest in prepared:
+                result = tx.execute(f"UPDATE {nodes_table} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": nt, "sid": sid, "props": json.dumps(props, ensure_ascii=False), "nid": nid})
+                if tx.rowcount(result) != 1:
+                    raise NodeIdentityConflict(f"stale node update: {nid}")
+                tx.execute(f"UPDATE {edges_table} SET from_type=:nt WHERE from_id=:nid", {"nt": nt, "nid": nid})
+                tx.execute(f"UPDATE {edges_table} SET to_type=:nt WHERE to_id=:nid", {"nt": nt, "nid": nid})
+                if return_receipt:
+                    receipts.append(NodeWriteReceipt("updated", nid, nt, sid, props, digest))
+            return tuple(receipts) if return_receipt else len(prepared)
+        return self._run_mutation_tx(body)
+
+    def _upsert_edges_batch_impl(self, edges: list[dict[str, Any]], *, return_receipt: bool) -> Any:
         if not edges:
-            return 0
-        sql = self._dialect.upsert(
-            self._table("graph_edges"),
-            ["from_type", "from_id", "relation", "to_type", "to_id", "properties"],
-            conflict_cols=["from_type", "from_id", "relation", "to_type", "to_id"],
-            update_cols=["properties"],
-            json_columns=["properties"],
-        )
-        params = [
-            {
-                "from_type": e["from_type"],
-                "from_id": e["from_id"],
-                "relation": e["relation"],
-                "to_type": e["to_type"],
-                "to_id": e["to_id"],
-                "properties": json.dumps(e.get("properties") or {}),
-            }
-            for e in edges
-        ]
-        self._exec_write_batch(sql, params)
-        return len(params)
+            return () if return_receipt else 0
+        prepared = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in edges:
+            if not isinstance(item, dict):
+                raise ValueError("malformed graph batch item")
+            try:
+                ft, fid, rel, tt, tid = item["from_type"], item["from_id"], item["relation"], item["to_type"], item["to_id"]
+            except KeyError as exc:
+                raise ValueError("malformed graph batch item") from exc
+            key = (fid, rel, tid)
+            if key in seen:
+                raise ValueError(f"duplicate global graph key in batch: edge_key={key}")
+            seen.add(key)
+            props = normalize_edge_properties(fid, rel, tid, item.get("properties"))
+            prepared.append((ft, fid, rel, tt, tid, props, canonical_edge_digest(fid, rel, tid, ft, tt, props)))
+        nodes_table, table = self._table("graph_nodes"), self._table("graph_edges")
+        insert_sql = self._dialect.insert(table, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (from_id, relation, to_id) DO NOTHING"
+        def body(tx: GraphTx) -> Any:
+            self._lock_graph_rows(
+                tx,
+                (value for item in prepared for value in (item[1], item[4])),
+                ((item[1], item[2], item[4]) for item in prepared),
+            )
+            for ft, fid, rel, tt, tid, props, digest in prepared:
+                types = {r[0]: r[1] for r in tx.fetchall(f"SELECT node_id, node_type FROM {nodes_table} WHERE node_id IN (:fid,:tid)", {"fid": fid, "tid": tid})}
+                if fid not in types or tid not in types:
+                    raise ValueError(f"edge endpoint does not exist: {fid if fid not in types else tid}")
+                if types.get(fid) != ft or types.get(tid) != tt:
+                    mismatch = fid if types.get(fid) != ft else tid
+                    raise ValueError(f"edge endpoint type mismatch: {mismatch}")
+                row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
+                if row:
+                    stored = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                    if canonical_edge_digest(fid, rel, tid, row[0], row[1], stored) != digest:
+                        raise EdgeIdentityConflict(f"edge identity conflict: ({fid}, {rel}, {tid})")
+            receipts = []
+            for ft, fid, rel, tt, tid, props, _digest in prepared:
+                row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
+                operation = "idempotent" if row else "created"
+                if row is None:
+                    result = tx.execute(insert_sql, {"from_type": ft, "from_id": fid, "relation": rel, "to_type": tt, "to_id": tid, "properties": json.dumps(props, ensure_ascii=False)})
+                    operation = "created" if tx.rowcount(result) else "idempotent"
+                    row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
+                if row is None:
+                    raise RuntimeError("graph edge insert did not produce a row")
+                if return_receipt:
+                    stored = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                    receipts.append(EdgeWriteReceipt(operation, fid, rel, tid, row[0], row[1], stored, canonical_edge_digest(fid, rel, tid, row[0], row[1], stored)))
+            return tuple(receipts) if return_receipt else len(prepared)
+        return self._run_mutation_tx(body)
+
+    def update_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
+        self._require_write_available()
+        if not edges:
+            return () if return_receipt else 0
+        prepared = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in edges:
+            if not isinstance(item, dict):
+                raise ValueError("malformed graph batch item")
+            key = (item.get("from_id"), item.get("relation"), item.get("to_id"))
+            if key in seen:
+                raise ValueError(f"duplicate global graph key in batch: edge_key={key}")
+            seen.add(key)
+            validate_digest(item.get("expected_current_digest"), edge=True)
+            owner = item.get("owner_pack_id")
+            if not isinstance(owner, str) or not owner:
+                raise ValueError("graph identity fields must be non-empty strings")
+            props = normalize_edge_properties(*key, item.get("properties"))
+            if props.get("pack_id") != owner:
+                raise EdgeIdentityConflict(f"stale edge update: ({key[0]}, {key[1]}, {key[2]})")
+            prepared.append((item["from_type"], key[0], key[1], item["to_type"], key[2], props, item["expected_current_digest"], owner))
+        nodes_table, table = self._table("graph_nodes"), self._table("graph_edges")
+        def body(tx: GraphTx) -> Any:
+            self._lock_graph_rows(
+                tx,
+                (value for item in prepared for value in (item[1], item[4])),
+                ((item[1], item[2], item[4]) for item in prepared),
+            )
+            receipts = []
+            for ft, fid, rel, tt, tid, props, expected, owner in prepared:
+                types = {r[0]: r[1] for r in tx.fetchall(f"SELECT node_id, node_type FROM {nodes_table} WHERE node_id IN (:fid,:tid)", {"fid": fid, "tid": tid})}
+                row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
+                if types.get(fid) != ft or types.get(tid) != tt or row is None:
+                    raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
+                current = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                if current.get("pack_id") != owner or canonical_edge_digest(fid, rel, tid, row[0], row[1], current) != expected:
+                    raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
+                digest = canonical_edge_digest(fid, rel, tid, ft, tt, props)
+                result = tx.execute(f"UPDATE {table} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": ft, "tt": tt, "props": json.dumps(props, ensure_ascii=False), "fid": fid, "rel": rel, "tid": tid})
+                if tx.rowcount(result) != 1:
+                    raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
+                if return_receipt:
+                    receipts.append(EdgeWriteReceipt("updated", fid, rel, tid, ft, tt, props, digest))
+            return tuple(receipts) if return_receipt else len(prepared)
+        return self._run_mutation_tx(body)

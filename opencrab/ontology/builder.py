@@ -16,6 +16,12 @@ import logging
 import uuid
 from typing import Any
 
+from opencrab.common.graph_identity import (
+    EdgeIdentityConflict,
+    GraphSchemaMigrationRequired,
+    GraphWriteUnavailable,
+    NodeIdentityConflict,
+)
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
@@ -52,6 +58,14 @@ class OntologyBuilder:
         self._sql = sql
         self._vec = vec  # Optional ChromaStore — if provided, add_node embeds each node
 
+    @staticmethod
+    def _raise_graph_gate(exc: RuntimeError) -> None:
+        if str(exc) in {
+            "graph schema requires issue80 migration before writes",
+            "graph schema is unavailable: migration required",
+        }:
+            raise exc
+
     # ------------------------------------------------------------------
     # Nodes
     # ------------------------------------------------------------------
@@ -69,6 +83,7 @@ class OntologyBuilder:
         fork_copy: bool = False,
         write_vector: bool = True,
         _allow_ready_anchor: bool = False,
+        _expected_current_digest: str | None = None,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -302,14 +317,34 @@ class OntologyBuilder:
         # --- Neo4j write ---
         if self._neo4j is not None and self._neo4j.available:
             try:
-                node_props = self._neo4j.upsert_node(
-                    node_type=node_type,
-                    node_id=node_id,
-                    properties=props,
-                    space_id=space,
-                )
+                if _expected_current_digest is None:
+                    node_props = self._neo4j.upsert_node(
+                        node_type=node_type,
+                        node_id=node_id,
+                        properties=props,
+                        space_id=space,
+                    )
+                else:
+                    # A pack reload can legitimately reclassify a node owned
+                    # by that same pack.  Global node identity makes
+                    # delete-then-upsert unsafe, so use the graph's CAS
+                    # reclassification primitive while retaining the normal
+                    # document/registry/vector fan-out below.
+                    node_props = self._neo4j.reclassify_node(
+                        node_id,
+                        expected_current_digest=_expected_current_digest,
+                        new_type=node_type,
+                        new_properties=props,
+                        new_space_id=space,
+                    )
                 output["stores"]["graph"] = "ok"
                 output["node_data"] = node_props
+            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable, ValueError):
+                raise
+            except RuntimeError as exc:
+                self._raise_graph_gate(exc)
+                logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
+                output["stores"]["graph"] = f"error: {exc}"
             except Exception as exc:
                 logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
                 output["stores"]["graph"] = f"error: {exc}"
@@ -532,10 +567,9 @@ class OntologyBuilder:
         # readers can never see -- refuse it instead of writing it.
         # Unattributed endpoints pass (legacy data predates pack attribution).
         #
-        # Checked on the RESOLVED (type, id) rows, not on "any row with this
-        # id": with one id held under two node_types the by-id form passes as
-        # soon as it sees the target pack's row, while the unordered lookup
-        # above can still have picked the other pack's row to attach to.
+        # Check the RESOLVED typed rows, not a guessed type-agnostic result.
+        # Global node identity makes each resolved id the only valid endpoint
+        # in a qualified graph target.
         if not missing:
             for endpoint_type, endpoint_id in ((from_type, from_id), (to_type, to_id)):
                 reason = resolved_endpoint_pack_conflict(
@@ -574,6 +608,12 @@ class OntologyBuilder:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
+            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable, ValueError):
+                raise
+            except RuntimeError as exc:
+                self._raise_graph_gate(exc)
+                logger.warning("Neo4j edge write failed: %s", exc)
+                output["stores"]["graph"] = f"error: {exc}"
             except Exception as exc:
                 logger.warning("Neo4j edge write failed: %s", exc)
                 output["stores"]["graph"] = f"error: {exc}"

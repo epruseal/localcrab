@@ -27,15 +27,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
 from opencrab.stores._graph_protocol import GraphStore, GraphStoreExtended
+from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 from opencrab.stores.neo4j_store import Neo4jStore
 
-BACKENDS = ["local", "pg", "kuzu"]
+BACKENDS = ["local", "pg"]
 
 
 # ---------------------------------------------------------------------------
-# Backend fixtures — local/pg/kuzu real stores (same gating as
-# test_find_neighbors_contract.py: pg env-gated, kuzu importorskip)
+# Backend fixtures — local/pg real stores.
 # ---------------------------------------------------------------------------
 
 
@@ -55,16 +56,9 @@ def _make_pg():
     return PGGraphStore(pg_url, schema=schema), pg_url, schema
 
 
-def _make_kuzu(tmp_path):
-    pytest.importorskip("ladybug")
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-    return KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu"))
-
-
 @pytest.fixture(params=BACKENDS)
 def backend(request, tmp_path):
-    """Yields (backend_name, store) for local/pg/kuzu — mirrors
+    """Yields (backend_name, store) for local/pg — mirrors
     test_find_neighbors_contract.py's fixture of the same name/shape."""
     name = request.param
     if name == "local":
@@ -81,12 +75,6 @@ def backend(request, tmp_path):
         with engine.begin() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         engine.dispose()
-    else:
-        store = _make_kuzu(tmp_path)
-        yield name, store
-        store.close()
-
-
 def _make_connected_neo4j() -> tuple[Neo4jStore, MagicMock, MagicMock]:
     """Same mocked-driver shape as test_neo4j_helpers.py's
     ``_make_connected_store`` — duplicated locally (see module docstring)."""
@@ -94,6 +82,7 @@ def _make_connected_neo4j() -> tuple[Neo4jStore, MagicMock, MagicMock]:
     mock_driver = MagicMock(name="driver")
     mock_driver.session.return_value.__enter__.return_value = mock_session
     mock_driver.session.return_value.__exit__.return_value = False
+    mock_session.execute_write.side_effect = lambda callback: callback(mock_session)
 
     with patch("neo4j.GraphDatabase") as mock_gdb:
         mock_gdb.driver.return_value = mock_driver
@@ -302,7 +291,7 @@ class TestExtendedMethodsNeo4jNormal:
 
         assert node == {"id": "lv1", "name": "Lever One", "node_type": "Lever"}
         cypher, kwargs = mock_session.run.call_args[0][0], mock_session.run.call_args[1]
-        assert "labels(n)[0]" in cypher
+        assert "n.node_type AS lbl" in cypher
         assert kwargs == {"id": "lv1"}
 
     def test_list_packs_aggregates_by_pack_id(self):
@@ -408,7 +397,15 @@ class TestExtendedMethodsNeo4jNormal:
     def test_upsert_nodes_batch_writes_all_and_returns_count(self):
         store, _driver, mock_session = _make_connected_neo4j()
         mock_session.run.reset_mock()
-        mock_session.run.return_value.single.return_value = {"props": {"id": "n0"}}
+        mock_session.run.return_value.single.side_effect = [
+            {"epoch": 1},
+            None,
+            {"props": {"id": "n0", "i": 0}, "node_type": "Doc"},
+            None,
+            {"props": {"id": "n1", "i": 1}, "node_type": "Doc"},
+            None,
+            {"props": {"id": "n2", "i": 2}, "node_type": "Doc"},
+        ]
 
         nodes = [
             {"node_type": "Doc", "node_id": f"n{i}", "properties": {"i": i}}
@@ -417,12 +414,17 @@ class TestExtendedMethodsNeo4jNormal:
         count = store.upsert_nodes_batch(nodes)
 
         assert count == 3
-        assert mock_session.run.call_count == 3
+        assert mock_session.execute_write.call_count == 1
+        assert mock_session.run.call_count == 8
 
     def test_upsert_edges_batch_writes_all_and_returns_count(self):
         store, _driver, mock_session = _make_connected_neo4j()
         mock_session.run.reset_mock()
-        mock_session.run.return_value.single.return_value = {"r": "edge"}
+        mock_session.run.return_value.single.side_effect = [
+            {"epoch": 1},
+            {"from_type": "Doc", "to_type": "Doc"}, None, {"props": {}},
+            {"from_type": "Doc", "to_type": "Doc"}, None, {"props": {}},
+        ]
 
         edges = [
             {
@@ -434,14 +436,19 @@ class TestExtendedMethodsNeo4jNormal:
         count = store.upsert_edges_batch(edges)
 
         assert count == 2
-        assert mock_session.run.call_count == 2
+        assert mock_session.execute_write.call_count == 1
+        assert mock_session.run.call_count == 8
 
     def test_upsert_edges_batch_counts_only_successful_upserts(self):
         store, _driver, mock_session = _make_connected_neo4j()
         mock_session.run.reset_mock()
         # First edge's MERGE finds/creates a record (success), second's
         # MATCH on a missing endpoint returns no record (failure).
-        mock_session.run.return_value.single.side_effect = [{"r": "edge"}, None]
+        mock_session.run.return_value.single.side_effect = [
+            {"epoch": 1},
+            {"from_type": "Doc", "to_type": "Doc"}, None, {"props": {}},
+            None,
+        ]
 
         edges = [
             {"from_type": "Doc", "from_id": "n0", "relation": "next", "to_type": "Doc", "to_id": "n1", "properties": {}},
@@ -661,47 +668,17 @@ class TestGetEdgeContract:
 
 
 class TestGetEdgeKuzuJsonParsing:
-    """v2 결함 2 반례: Kuzu's ``e.properties`` column is a JSON-serialized
-    string -- get_edge must return a parsed dict, never the raw string, or
-    the same-pack re-ingest path (which reads ``pack_id`` back out of it)
-    would fail-closed on every re-ingest against a Kuzu backend."""
+    """An unqualified Kùzu backend rejects edge reads before DB access."""
 
     def test_properties_returned_as_dict_not_json_string(self, tmp_path):
-        pytest.importorskip("ladybug")
-        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-        store = KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu_edge"))
-        try:
-            store.upsert_node("Doc", "a0", {})
-            store.upsert_node("Doc", "a1", {})
-            store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {"pack_id": "pack-a"})
-
-            edge = store.get_edge("Doc", "a0", "rel", "Doc", "a1")
-
-            assert isinstance(edge, dict)
-            assert edge["pack_id"] == "pack-a"
-        finally:
-            store.close()
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            KuzuUnavailableGraphStore().get_edge("Doc", "a0", "rel", "Doc", "a1")
 
     def test_type_arguments_accepted_but_not_matched_on(self, tmp_path):
-        """Kuzu's MERGE key is (from_id, relation, to_id) alone -- passing
-        the WRONG from_type/to_type must still find the edge (upsert_edge's
-        own MERGE never wrote a type predicate either)."""
-        pytest.importorskip("ladybug")
-        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-        store = KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu_edge2"))
-        try:
-            store.upsert_node("Doc", "a0", {})
-            store.upsert_node("Doc", "a1", {})
-            store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {"pack_id": "pack-a"})
-
-            edge = store.get_edge("WrongType", "a0", "rel", "AlsoWrong", "a1")
-
-            assert edge is not None
-            assert edge["pack_id"] == "pack-a"
-        finally:
-            store.close()
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            KuzuUnavailableGraphStore().get_edge(
+                "WrongType", "a0", "rel", "AlsoWrong", "a1"
+            )
 
 
 class TestGetEdgeNeo4j:
@@ -711,10 +688,17 @@ class TestGetEdgeNeo4j:
 
         edge = store.get_edge("Doc", "a0", "rel", "Doc", "a1")
 
-        assert edge == {"pack_id": "pack-a"}
+        assert edge == {
+            "from_id": "a0",
+            "relation": "rel",
+            "to_id": "a1",
+            "pack_id": "pack-a",
+        }
         cypher = mock_session.run.call_args[0][0]
-        assert "-[r:rel]->" in cypher
-        assert mock_session.run.call_args[1] == {"from_id": "a0", "to_id": "a1"}
+        assert "-[r:`rel`]->" in cypher
+        assert mock_session.run.call_args[1] == {
+            "from_id": "a0", "to_id": "a1", "from_type": "Doc", "to_type": "Doc"
+        }
 
     def test_absent_edge_returns_none(self):
         store, _driver, mock_session = _make_connected_neo4j()

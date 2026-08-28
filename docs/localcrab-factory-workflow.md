@@ -252,7 +252,7 @@ retrieves the relationship structure that explains why the answer is true.
 
 `VECTOR_BACKEND` 미설정 시 조건부 기본값:
 - `STORAGE_MODE=pg` → `pgvector`
-- `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → `sqlite-vec`
+- `STORAGE_MODE=local`(또는 capability-negative `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → `sqlite-vec`
 - `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → `chroma`
 - 명시 설정은 항상 위 규칙보다 우선한다.
 

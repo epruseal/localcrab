@@ -554,33 +554,39 @@ class TestTypedPropertiesAndNullSemantics:
         assert local.get_node_by_id(node_id)["id"] == node_id
         assert pg.get_node_by_id(node_id)["id"] == node_id
 
-    def test_upsert_conflict_overwrites_not_merges(self, graph_pair):
-        """Second upsert_node() replaces the properties column wholesale
-        (``ON CONFLICT DO UPDATE SET properties = excluded/EXCLUDED``); a key
-        present only in the first write must NOT survive the second."""
+    def test_cas_node_update_replaces_properties_without_merging(self, graph_pair):
+        """A CAS update replaces the properties column wholesale; a key
+        present only in the first write must NOT survive the second write.
+        Re-ingestion through upsert_node is immutable under global identity.
+        """
         local, pg = graph_pair
         for store in (local, pg):
             store.upsert_node("OverwriteProbe", "ow1", {"first_only": "x", "shared": "old"})
-            store.upsert_node("OverwriteProbe", "ow1", {"shared": "new"})
+            digest = store.get_node_digest("ow1")
+            store.update_node(
+                "ow1", digest, "OverwriteProbe", {"shared": "new"}
+            )
         for store in (local, pg):
             node = store.get_node("OverwriteProbe", "ow1")
             assert "first_only" not in node
             assert node["shared"] == "new"
 
-    def test_edge_upsert_conflict_overwrites_not_merges(self, graph_pair):
-        """Second upsert_edge() on the same (from_type, from_id, relation,
-        to_type, to_id) key replaces the properties column wholesale — a key
-        present only in the first write must NOT survive the second, on
-        either backend."""
+    def test_cas_edge_update_replaces_properties_without_merging(self, graph_pair):
+        """A CAS edge update replaces the properties column wholesale. The
+        edge owner is explicit because updates are authorized by pack_id.
+        """
         local, pg = graph_pair
         for store in (local, pg):
             store.upsert_edge(
                 "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
-                {"first_only": "x", "shared": "old"},
+                {"first_only": "x", "shared": "old", "pack_id": "packA"},
             )
-            store.upsert_edge(
+            digest = store.get_edge_digest("packA_n0", "edgeprobe", "packA_n1")
+            store.update_edge(
                 "Person", "packA_n0", "edgeprobe", "Person", "packA_n1",
-                {"shared": "new"},
+                {"shared": "new", "pack_id": "packA"},
+                expected_current_digest=digest,
+                owner_pack_id="packA",
             )
         for store in (local, pg):
             edges = [
@@ -731,17 +737,16 @@ class TestUpsertRowidStability:
     SqlDialect.upsert() must use ``ON CONFLICT (...) DO UPDATE SET ...`` on
     BOTH backends, never SQLite's ``INSERT OR REPLACE`` (a delete+reinsert
     that allocates a new rowid). find_neighbors()/export_*() have no
-    ORDER BY, so their scan order tracks physical row order; re-upserting an
-    already-seen edge must not silently reshuffle that order — a LIMIT-capped
-    hub fan-out must return a *stable* truncated subset across repeated
-    re-ingestion (the everyday reingest-pipeline case), not just an
-    unordered-equivalent one from run to run.
+    ORDER BY, so their scan order tracks physical row order; updating an
+    already-seen edge must not silently reshuffle that order. A LIMIT-capped
+    hub fan-out must return a stable subset after a mutable CAS update, not
+    just an unordered-equivalent one from run to run.
 
     Was RED against the SQLite-adopted _sql_graph_base.py before the fix
-    (INSERT OR REPLACE moved the re-upserted edge to the end of the physical
+    (INSERT OR REPLACE moved the rewritten edge to the end of the physical
     scan order); confirmed green after switching SQLite to ON CONFLICT DO
-    UPDATE (rowid-preserving, matching pre-refactor local_graph_store.py's
-    hand-written SQL and PG's pre-existing behavior)."""
+    UPDATE and routing mutable rewrites through the CAS update path.
+    """
 
     def _neighbor_ids(self, store, anchor: str) -> list[str]:
         return [
@@ -758,23 +763,33 @@ class TestUpsertRowidStability:
                 store.upsert_node("Anchor", "anchor1", {})
                 for i in range(10):
                     store.upsert_node("Leaf", f"leaf{i}", {})
-                    store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", f"leaf{i}", {"v": 1})
+                    store.upsert_edge(
+                        "Anchor", "anchor1", "touches", "Leaf", f"leaf{i}",
+                        {"v": 1, "pack_id": "rowid-pack"},
+                    )
 
             local_before = self._neighbor_ids(local, "anchor1")
             pg_before = self._neighbor_ids(pg, "anchor1")
             assert len(local_before) == 10
             assert len(pg_before) == 10
 
-            # Re-upsert a MIDDLE edge (same conflict key: from/relation/to) with
-            # changed properties — must UPDATE in place, not delete+reinsert.
+            # CAS-update a MIDDLE edge (same conflict key: from/relation/to)
+            # with changed properties. UPDATE must happen in place, not as a
+            # delete+reinsert that changes scan order.
             for store in (local, pg):
-                store.upsert_edge("Anchor", "anchor1", "touches", "Leaf", "leaf5", {"v": 2})
+                digest = store.get_edge_digest("anchor1", "touches", "leaf5")
+                store.update_edge(
+                    "Anchor", "anchor1", "touches", "Leaf", "leaf5",
+                    {"v": 2, "pack_id": "rowid-pack"},
+                    expected_current_digest=digest,
+                    owner_pack_id="rowid-pack",
+                )
 
             local_after = self._neighbor_ids(local, "anchor1")
             pg_after = self._neighbor_ids(pg, "anchor1")
 
             assert local_after == local_before, (
-                "SQLite scan order changed after a same-key edge re-upsert — "
+                "SQLite scan order changed after a same-key edge update — "
                 "rowid was not preserved (INSERT OR REPLACE regression)"
             )
             assert pg_after == pg_before

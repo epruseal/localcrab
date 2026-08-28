@@ -1,0 +1,43 @@
+{
+  "schema": "issue80-kuzu-qualification-v1",
+  "bundle_id": "kuzu-qualification-v1",
+  "status": "capability-negative",
+  "observed_platform": "macos-arm64-cp314",
+  "package": {
+    "name": "ladybug",
+    "version": "0.19.1",
+    "wheel_filename": "ladybug-0.19.1-cp314-cp314-macosx_15_0_arm64.whl",
+    "platform_tag": "macosx_15_0_arm64",
+    "python_tag": "cp314",
+    "abi_tag": "cp314",
+    "wheel_sha256": "cf4239deeadf45252563059a9185b6955f5c80b370c49fc5097bb704da8c821c"
+  },
+  "raw_pypi_metadata": {
+    "release_url": "https://pypi.org/project/ladybug/0.19.1/",
+    "top_level_keys": ["info", "last_serial", "ownership", "urls", "vulnerabilities"],
+    "info_version": "0.19.1",
+    "wheel_filename": "ladybug-0.19.1-cp314-cp314-macosx_15_0_arm64.whl",
+    "wheel_sha256": "cf4239deeadf45252563059a9185b6955f5c80b370c49fc5097bb704da8c821c",
+    "wheel_yanked": false,
+    "vulnerabilities_present": true,
+    "raw_pypi_metadata_path": "tests/fixtures/issue80/qualification/raw_pypi_metadata-ladybug-0.19.1.json",
+    "raw_pypi_metadata_sha256": "6fc4c7e531ef36fb26e5c9fab529c754c0c4dcb0b43f8ecfece06eeace3272a2",
+    "core_metadata_sha256": "f34492aa2ae8bc47281b7529217a2bcac0a388f05ce8fcf3f834639acd06411a"
+  },
+  "files": [
+    {"path": "tests/fixtures/issue80/qualification/qualification_probe.py", "sha256": "71d7d430275739d10020a556e2c87bfc52a9d3d5b8423f4a952014557d55e819"},
+    {"path": "tests/fixtures/issue80/qualification/qualification_probe.raw.json", "sha256": "2669a24338a91c4b76f2106d6870453936c2f7ecd18e415ac86f12c4497d4601"},
+    {"path": "tests/fixtures/issue80/qualification/resolution-reinstall.raw.txt", "sha256": "04c1f93ec40b5a4a7949a873024f316995df154b222350de59ec2caa5f4f5d1d"},
+    {"path": "tests/fixtures/issue80/qualification/raw_pypi_metadata-ladybug-0.19.1.json", "sha256": "6fc4c7e531ef36fb26e5c9fab529c754c0c4dcb0b43f8ecfece06eeace3272a2"}
+  ],
+  "observations": {
+    "module_path": "/private/tmp/issue80-kuzu-qual.br54iM/venv/lib/python3.14/site-packages/ladybug/__init__.py",
+    "module_version": "0.19.1",
+    "global_primary_key": "pass",
+    "single_connection_node_conditional_cas": "pass",
+    "single_connection_edge_conditional_cas": "pass",
+    "single_connection_sql_begin_commit_rollback": "pass",
+    "independent_process_concurrency": "fail",
+    "failed_edge_rollback": "unproven"
+  }
+}

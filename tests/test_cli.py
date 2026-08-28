@@ -668,6 +668,7 @@ def _seed_graph(db_path: Path) -> None:
     store.upsert_node("Agent", "n-unresolvable", {"note": "no path hint"})
     # already has a pack_id -> must be left untouched
     store.upsert_node("Agent", "n-already-set", {"pack_id": "existing-pack"})
+    store.upsert_node("Project", "p-inferable", {"pack_id": "existing-pack"})
     store.upsert_edge(
         "Agent", "n-inferable", "owns", "Project", "p-inferable",
         {"source_path": "/data/packs/pack-a/y.md"},
@@ -1068,4 +1069,3 @@ class TestPacksCommandsAreScoped:
         owned = runner.invoke(main, ["packs", "show", "mine"])
         assert owned.exit_code == 0
         assert "mine" in owned.output
-

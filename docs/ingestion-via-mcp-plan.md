@@ -239,7 +239,8 @@ VECTOR_BACKEND 명시됨?
 - `scripts/migrate_chroma_to_sqlite_vec.py` — chroma → sqlite-vec (로컬 모드 신규 기본값으로 전환).
 - `scripts/migrate_sqlite_to_pg.py` — 4스토어(graph/doc/sql/vector) 1:1 이전, `STORAGE_MODE=pg`로 전환.
 - `scripts/migrate_add_binary_quantization.py` — 기존 sqlite-vec DB에 binary 2단계 양자화 컬럼 백필(`VECTOR_ANN=binary`).
-- `scripts/migrate_graph_to_ladybug.py` — 그래프 스토어 kuzu → ladybug 이전(벡터 백엔드와 무관).
+- `scripts/migrate_graph_to_ladybug.py` — 과거 그래프 스토어 kuzu → ladybug 이전 경로의
+  read-only inspection 포인터. 현재 apply는 qualification 전까지 fixture-only이다.
 
 상세 설계·동시성 결정 힌지는 `docs/pgvector-migration-plan.md` §8-9, 백엔드 조합 매트릭스는 `docs/vector-backends.md` 참고.
 

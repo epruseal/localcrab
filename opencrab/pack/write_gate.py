@@ -238,15 +238,11 @@ def classify_by_id_rows(rows: Any, pack_id: str) -> ByIdVerdict:
     """Classify every row sharing a ``node_id`` against the target pack.
 
     Takes ALL rows (``GraphStoreExtended.get_nodes_by_id``), never one.
-    ``get_node_by_id``'s ``LIMIT 1`` has no ``ORDER BY``, so with a node_id
-    held under two node_types -- a shape this codebase supports and pins --
-    which row it returns is undefined, and an unattributed row winning the
-    draw would wave a foreign one through.
+    A qualified graph target has one row per global node_id; the plural probe
+    still fails closed when it encounters duplicate legacy or corrupt rows.
 
     - any row already in ``pack_id`` -> ``own`` (this is the owner updating
-      their node; on the backends where node_id alone is the primary key an
-      "own plus foreign" state cannot exist, and on the ones where it can,
-      the exact ``(node_type, node_id)`` slot probe stays authoritative)
+      their node; the exact typed slot probe remains authoritative)
     - else any row attributed elsewhere -> ``foreign``, INCLUDING when
       unattributed rows are mixed in (fail-closed: that mix is exactly the
       case ``LIMIT 1`` used to let through)
@@ -294,9 +290,9 @@ def normalize_tags(tags: MutableMapping[str, Any]) -> None:
 # pack_create/pack_ingest only. #148 gives every write an explicit pack_id --
 # including ontology_add_node and REST /api/nodes, which had none before -- and
 # that opens a re-attribution path the moment the guard is missing: node
-# identity is NOT qualified by pack on any backend (Kuzu's primary key is
-# node_id alone; every vector store keys on node_id globally; sqlite-vec's
-# upsert deletes by node_id with no pack predicate), so writing a node_id that
+# identity is NOT qualified by pack on any backend (graph and vector stores
+# key content by global node_id; sqlite-vec's upsert deletes by node_id with
+# no pack predicate), so writing a node_id that
 # already lives in someone else's pack silently takes their slot.
 #
 # A probe is (store, method, args, path-to-pack_id-in-result).
@@ -349,10 +345,9 @@ def _check_probes(pack_id: str, probes: list[_Probe]) -> str | None:
 def _check_by_id_axis(graph: Any, node_id: str, pack_id: str) -> str | None:
     """The type-agnostic axis, over ALL rows sharing ``node_id``.
 
-    Deliberately NOT ``get_node_by_id``: its query is ``LIMIT 1`` with no
-    ``ORDER BY``, and a node_id held under two node_types is a shape this
-    codebase supports and pins. Which row that returned was undefined, so an
-    unattributed row winning the draw waved a foreign one through.
+    Deliberately NOT ``get_node_by_id``: the plural probe can detect duplicate
+    rows left by a legacy or externally corrupted graph, while a single-row
+    lookup cannot. Qualified targets normally return exactly one row.
     """
     if graph is None or not getattr(graph, "available", False):
         return None
@@ -377,8 +372,8 @@ def node_identity_conflict(
     """Would writing this node take a slot attributed to another pack?
 
     Four slots, all mandatory. The exact ``(node_type, node_id)`` graph slot
-    keeps the strict rule; only the type-agnostic axis uses the all-rows
-    classification. Knowing the graph slot is ours proves nothing about the
+    keeps the strict rule; the type-agnostic axis also checks all rows for
+    legacy/corrupt data. Knowing the graph slot is ours proves nothing about the
     doc and vector slots -- the builder overwrites those in the same call,
     keyed by ``(space, node_id)`` and by ``node_id`` alone.
     """
@@ -429,13 +424,10 @@ def resolved_endpoint_pack_conflict(
 ) -> str | None:
     """Is the endpoint row the writer will actually attach to foreign?
 
-    Checks the exact ``(node_type, node_id)`` row -- the one the caller's
-    ``lookup_node_type`` just resolved -- rather than "any row with this id".
-    The by-id form below passes as soon as it sees a row in the target pack,
-    but with the same id held under two node_types (a supported shape) the
-    unordered lookup can still select the OTHER pack's row, and the edge then
-    attaches to an endpoint outside its own pack. Scoped edge export requires
-    both endpoints in scope, so that edge is written and immediately invisible.
+    Checks the exact typed row that the caller's ``lookup_node_type`` resolved.
+    Global node identity makes that row the only valid endpoint in a qualified
+    target; legacy duplicate rows are rejected by the schema gate before a
+    writer can attach an edge.
     """
     return _check_probes(pack_id, [
         (graph, "get_node", (node_type, node_id), ("pack_id",)),

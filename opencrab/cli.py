@@ -1257,7 +1257,7 @@ def packs_backfill_pack_id(
     ``--assume-pack-id X`` fills every still-empty entry with X.
     """
     from opencrab.config import get_settings
-    from opencrab.ontology.pack_provenance import backfill_pack_ids, resolve_backfill_dry_run
+    from opencrab.ontology.pack_provenance import inspect_pack_ids, resolve_backfill_dry_run
 
     cfg = get_settings()
     db_path = Path(cfg.local_data_dir) / "graph.db"
@@ -1269,13 +1269,39 @@ def packs_backfill_pack_id(
     if warning:
         console.print(f"[yellow]{warning}[/yellow]")
 
-    # No write_lock() here on purpose: backfill_pack_ids() takes it itself,
-    # around the write and only when there is one. Locking here as well would
-    # take an exclusive lock for --dry-run, which writes nothing, and would
-    # leave every non-CLI caller of backfill_pack_ids() unprotected.
-    summary = backfill_pack_ids(
-        db_path, assume_pack_id=assume_pack_id, dry_run=effective_dry_run
+    # Keep the historical summary counters in the CLI response while the
+    # graph mutation itself is now driven by a frozen, tagged plan. Both
+    # helpers are read-only here; the target store is the only write path.
+    from opencrab.ontology.pack_provenance import _backfill_pack_ids_unlocked
+
+    counts = _backfill_pack_ids_unlocked(
+        db_path, assume_pack_id=assume_pack_id, dry_run=True
     )
+    plan = inspect_pack_ids(db_path, assume_pack_id=assume_pack_id)
+    if effective_dry_run:
+        summary = {**counts, "dry_run": True, **plan}
+    else:
+        from dataclasses import asdict
+
+        from opencrab.stores.factory import make_graph_store
+
+        graph = make_graph_store(cfg)
+        try:
+            if not graph.available:
+                raise RuntimeError("target graph store is not available")
+            receipt = (
+                graph.backfill_pack_provenance(plan["records"])
+                if plan["records"]
+                else None
+            )
+            summary = {
+                **counts,
+                "dry_run": False,
+                "receipt": asdict(receipt),
+                **plan,
+            }
+        finally:
+            graph.close()
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:

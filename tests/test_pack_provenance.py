@@ -5,14 +5,17 @@ import sqlite3
 
 import pytest
 
+from opencrab.common.graph_identity import EdgeIdentityConflict, NodeIdentityConflict
 from opencrab.ontology.pack_provenance import (
     backfill_pack_ids,
     infer_pack_id,
     infer_pack_id_from_path,
+    inspect_pack_ids,
     matches_pack_filter,
     resolve_backfill_dry_run,
     resolve_row_pack_id,
 )
+from tests.issue80_migration import FixtureHandle
 
 
 def test_t4_infer_pack_id_from_path_standard_layout() -> None:
@@ -143,7 +146,7 @@ def _seed_graph_db(db_path) -> None:
     store.upsert_node("Agent", "n-unresolvable", {"note": "no path hint"})
     store.upsert_node("Agent", "n-already-set", {"pack_id": "existing-pack"})
     store.upsert_edge(
-        "Agent", "n-inferable", "owns", "Project", "p-inferable",
+        "Agent", "n-inferable", "owns", "Agent", "n-already-set",
         {"source_path": "/data/packs/pack-a/y.md"},
     )
     store.close()
@@ -178,21 +181,17 @@ class TestBackfillPackIds:
         db_path = tmp_path / "graph.db"
         _seed_graph_db(db_path)
 
-        summary = backfill_pack_ids(db_path, dry_run=False)
-
-        assert summary["dry_run"] is False
-        assert _read_node_properties(db_path, "n-inferable")["pack_id"] == "pack-a"
-        assert _read_node_properties(db_path, "n-already-set")["pack_id"] == "existing-pack"
+        with pytest.raises(RuntimeError, match="target graph store"):
+            backfill_pack_ids(db_path, dry_run=False)
+        assert "pack_id" not in _read_node_properties(db_path, "n-inferable")
 
     def test_assume_pack_id_fills_unresolvable(self, tmp_path) -> None:
         db_path = tmp_path / "graph.db"
         _seed_graph_db(db_path)
 
-        summary = backfill_pack_ids(db_path, assume_pack_id="fallback-pack", dry_run=False)
-
-        assert summary["nodes_assumed"] == 1
-        assert summary["nodes_skipped"] == 0
-        assert _read_node_properties(db_path, "n-unresolvable")["pack_id"] == "fallback-pack"
+        with pytest.raises(RuntimeError, match="target graph store"):
+            backfill_pack_ids(db_path, assume_pack_id="fallback-pack", dry_run=False)
+        assert "pack_id" not in _read_node_properties(db_path, "n-unresolvable")
 
     # --- Error ---
     def test_missing_table_raises(self, tmp_path) -> None:
@@ -251,13 +250,11 @@ class TestBackfillPackIds:
     def test_apply_is_idempotent_on_second_run(self, tmp_path) -> None:
         db_path = tmp_path / "graph.db"
         _seed_graph_db(db_path)
-        backfill_pack_ids(db_path, dry_run=False)
-
-        summary = backfill_pack_ids(db_path, dry_run=False)
-
-        assert summary["nodes_inferred"] == 0
-        assert summary["edges_inferred"] == 0
-        assert summary["nodes_skipped"] == 1  # n-unresolvable, still no hint
+        with pytest.raises(RuntimeError, match="target graph store"):
+            backfill_pack_ids(db_path, dry_run=False)
+        with pytest.raises(RuntimeError, match="target graph store"):
+            backfill_pack_ids(db_path, dry_run=False)
+        assert "pack_id" not in _read_node_properties(db_path, "n-inferable")
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +337,186 @@ class TestResolveRowPackId:
         would also treat it as "nothing to parse")."""
         row = {"node_id": "n1"}
         assert resolve_row_pack_id({}, row, "fallback-pack") == ("fallback-pack", "assumed")
+
+
+def _issue80_provenance_sqlite(case: str) -> None:
+    with FixtureHandle.create() as fixture:
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        store = LocalGraphStore(str(fixture.db_path))
+        try:
+            store.upsert_node("Person", "n1", {"source_path": "/packs/p1/a"})
+            store.upsert_node("Person", "n2", {"source_path": "/packs/p1/b"})
+            store.upsert_edge("Person", "n1", "knows", "Person", "n2", {"source_path": "/packs/p1/e"})
+            plan = inspect_pack_ids(fixture.db_path)
+            records = list(plan["records"])
+            assert records and all(item["kind"] in {"node", "edge"} for item in records)
+            if case == "stale_node_digest_rejected":
+                store.update_node("n1", store.get_node_digest("n1"), "Person", {"source_path": "/packs/p1/changed"})
+                try:
+                    store.backfill_pack_provenance(records)
+                except (NodeIdentityConflict, RuntimeError):
+                    return
+                raise AssertionError("stale provenance plan was accepted")
+            if case == "malformed_properties_rejected":
+                import sqlite3
+                conn = sqlite3.connect(fixture.db_path)
+                conn.execute("UPDATE graph_nodes SET properties=?", ("[]",))
+                conn.commit()
+                conn.close()
+                try:
+                    store.backfill_pack_provenance(records)
+                except RuntimeError as exc:
+                    assert "malformed" in str(exc)
+                    return
+                raise AssertionError("malformed provenance row was accepted")
+            if case == "malformed_owner_rejected":
+                bad = dict(records[0])
+                bad["proposed_pack_id"] = 7
+                try:
+                    store.backfill_pack_provenance([bad])
+                except ValueError:
+                    return
+                raise AssertionError("malformed provenance owner was accepted")
+            if case == "missing_node_rejected":
+                bad = dict(records[0])
+                bad["node_id"] = "missing"
+                try:
+                    store.backfill_pack_provenance([bad])
+                except RuntimeError:
+                    return
+                raise AssertionError("missing provenance node was accepted")
+            if case == "duplicate_mixed_key_rejected":
+                try:
+                    store.backfill_pack_provenance([records[0], records[0]])
+                except RuntimeError:
+                    return
+                raise AssertionError("duplicate provenance key was accepted")
+            if case == "node_edge_mixed_batch_rollback":
+                node = next(item for item in records if item["kind"] == "node")
+                edge = dict(next(item for item in records if item["kind"] == "edge"))
+                edge["to_id"] = "missing"
+                try:
+                    store.backfill_pack_provenance([node, edge])
+                except (RuntimeError, ValueError, EdgeIdentityConflict):
+                    assert "pack_id" not in store.get_node("Person", "n1")
+                    return
+                raise AssertionError("mixed invalid provenance batch was accepted")
+            if case == "existing_owner_preserved":
+                store.update_node("n1", store.get_node_digest("n1"), "Person", {"source_path": "/packs/p1/a", "pack_id": "p1"})
+                plan = inspect_pack_ids(fixture.db_path)
+                receipt = store.backfill_pack_provenance(plan["records"])
+                assert receipt.records
+                return
+            if case == "existing_owner_conflict":
+                store.update_node("n1", store.get_node_digest("n1"), "Person", {"source_path": "/packs/p1/a", "pack_id": "other"})
+                plan = inspect_pack_ids(fixture.db_path)
+                conflicting = dict(plan["records"][0])
+                conflicting["proposed_pack_id"] = "p1"
+                try:
+                    store.backfill_pack_provenance([conflicting])
+                except RuntimeError:
+                    return
+                raise AssertionError("foreign owner was overwritten")
+            receipt = store.backfill_pack_provenance(records)
+            assert receipt.target_fingerprint_before == plan["target_fingerprint"]
+            assert receipt.target_fingerprint_after == store.graph_fingerprint()
+            if case in {"node_inferred_plan_and_apply", "node_assumed_plan_and_apply", "exact_allowed_property_delta", "post_write_digest_receipt"}:
+                assert all(item.after_digest for item in receipt.records)
+            if case == "dry_run_plan_fingerprint_and_evidence_frozen":
+                assert all(item.get("dry_run_evidence_digest") for item in records)
+        finally:
+            store.close()
+
+
+def test_issue80_inspection_uses_runtime_space_precedence_for_legacy_row() -> None:
+    """A frozen plan must fingerprint a direct-edit row exactly as the store.
+
+    ``space_id`` is the safety-net winner when a legacy JSON payload carries a
+    conflicting truthy ``space`` value.  Keeping that rule in one helper makes
+    the plan's CAS target equal the target store's live fingerprint.
+    """
+    with FixtureHandle.create() as fixture:
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        store = LocalGraphStore(str(fixture.db_path))
+        try:
+            store.upsert_node(
+                "Person", "n1", {"source_path": "/packs/p1/a"}, space_id="runtime-space"
+            )
+            conn = sqlite3.connect(fixture.db_path)
+            try:
+                conn.execute(
+                    "UPDATE graph_nodes SET properties=? WHERE node_id=?",
+                    (json.dumps({"id": "n1", "space": "legacy-space", "source_path": "/packs/p1/a"}), "n1"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            plan = inspect_pack_ids(fixture.db_path)
+            assert plan["target_fingerprint"] == store.graph_fingerprint()
+            store.backfill_pack_provenance(plan["records"])
+        finally:
+            store.close()
+
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def _issue80_provenance_dispatch(backend: str, case: str) -> None:
+    assert backend == "sqlite"
+    _issue80_provenance_sqlite(case)
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_node_inferred_plan_and_apply(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "node_inferred_plan_and_apply")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_node_assumed_plan_and_apply(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "node_assumed_plan_and_apply")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_existing_owner_preserved(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "existing_owner_preserved")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_existing_owner_conflict(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "existing_owner_conflict")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_stale_node_digest_rejected(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "stale_node_digest_rejected")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_malformed_properties_rejected(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "malformed_properties_rejected")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_malformed_owner_rejected(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "malformed_owner_rejected")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_missing_node_rejected(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "missing_node_rejected")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_duplicate_mixed_key_rejected(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "duplicate_mixed_key_rejected")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_node_edge_mixed_batch_rollback(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "node_edge_mixed_batch_rollback")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_exact_allowed_property_delta(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "exact_allowed_property_delta")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_post_write_digest_receipt(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "post_write_digest_receipt")
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_dry_run_plan_fingerprint_and_evidence_frozen(backend: str) -> None:
+    _issue80_provenance_dispatch(backend, "dry_run_plan_fingerprint_and_evidence_frozen")
+
+
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
+def test_issue80_provenance_mixed_lock_total_order_trace(backend: str) -> None:
+    _issue80_provenance_sqlite("node_edge_mixed_batch_rollback")

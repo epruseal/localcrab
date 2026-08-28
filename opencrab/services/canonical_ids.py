@@ -59,11 +59,8 @@ class _Resolver:
         try:
             # #147: the SCOPED lookup. Scoping the query legs is not enough
             # on its own -- this module re-reads the graph by node_id to
-            # build the canonical block, and the unscoped lookup matched on
-            # node_id alone even though the PK is (node_type, node_id). A
-            # readable result whose id also exists in someone else's pack
-            # under a different node_type could therefore have had that
-            # row's pack_id/space/document_id attached to it.
+            # build the canonical block, so the scope predicate must be
+            # applied by the store before the lookup result is returned.
             found = self._graph.get_node_by_id_scoped(node_id, self._pack_ids)
         except AttributeError:
             # A backend without the scoped method is a wiring defect, not a

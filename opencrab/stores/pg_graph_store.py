@@ -65,15 +65,39 @@ LIFECYCLE NOTE: close() disposes the engine only when this store created it
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
+from opencrab.common.graph_identity import GraphSchemaMigrationRequired
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
 from opencrab.stores._graph_common import _as_dict, _merge_space
 from opencrab.stores._sql_dialect import POSTGRES
-from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
+from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, GraphTx, _SqlGraphStoreBase
 
 logger = logging.getLogger(__name__)
+
+
+class _CatalogTxAdapter:
+    """Expose catalog ``execute`` through the guarded ``GraphTx`` surface."""
+
+    def __init__(self, tx: GraphTx) -> None:
+        self._tx = tx
+
+    def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
+        if isinstance(statement, str):
+            sql = statement
+        else:
+            from sqlalchemy.sql.elements import TextClause
+
+            if not isinstance(statement, TextClause):
+                raise TypeError(f"unsupported catalog statement type: {type(statement)!r}")
+            sql = statement.text
+            if not isinstance(sql, str):
+                raise TypeError("TextClause text must be str")
+        return self._tx.execute(sql, params)
 
 
 class PGGraphStore(_SqlGraphStoreBase):
@@ -86,7 +110,9 @@ class PGGraphStore(_SqlGraphStoreBase):
             raise ValueError(f"Invalid schema identifier: {schema!r}")
         self._schema = schema
         self._available = False
+        self._schema_state = "unconfigured"
         self._owns_engine = False
+        self._graph_tx_state = threading.local()
 
         from sqlalchemy import text
         from sqlalchemy.engine import Engine
@@ -128,19 +154,78 @@ class PGGraphStore(_SqlGraphStoreBase):
         with self._conn() as conn:
             return conn.execute(self._text(sql), params).fetchone()
 
-    def _exec_write(self, sql: str, params: dict[str, Any]) -> int:
-        with self._conn(write=True) as conn:
-            return conn.execute(self._text(sql), params).rowcount
+    GRAPH_WRITE_NAMESPACE = 80480
+    GRAPH_WRITE_KEY = 1
 
-    def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]:
-        with self._conn(write=True) as conn:
-            return [conn.execute(self._text(sql), params).rowcount for sql, params in statements]
+    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, exclusive: bool = False, snapshot_path: Path | None = None) -> Any:
+        if immediate or exclusive or snapshot_path is not None:
+            raise ValueError("graph transaction options are SQLite-only")
+        if self._graph_tx_is_active():
+            raise RuntimeError("nested graph transaction is not allowed")
+        self._set_graph_tx_active(True)
+        try:
+            with self._engine.begin() as conn:
+                tx = GraphTx(conn, self._dialect, self._text)
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(:graph_write_namespace, :graph_write_key)",
+                    {"graph_write_namespace": self.GRAPH_WRITE_NAMESPACE, "graph_write_key": self.GRAPH_WRITE_KEY},
+                )
+                return callback(tx)
+        finally:
+            self._set_graph_tx_active(False)
 
-    def _exec_write_batch(self, sql: str, params_list: list[dict[str, Any]]) -> None:
-        with self._conn(write=True) as conn:
-            conn.execute(self._text(sql), params_list)
+    def _lock_graph_rows(
+        self,
+        tx: GraphTx,
+        node_ids: Any = (),
+        edge_keys: Any = (),
+    ) -> None:
+        """Acquire node locks first, then edge locks in canonical order.
+
+        The transaction-scoped admission lock in ``_run_graph_tx`` already
+        serializes graph writers.  These row locks make the required lock
+        phases explicit for PostgreSQL and protect future callers that add
+        reads between enumeration and mutation.
+        """
+        nodes = sorted(set(node_ids), key=lambda value: str(value).encode("utf-8"))
+        if nodes:
+            placeholders, params = self._in_placeholders(nodes, "lock_node_")
+            tx.fetchall(
+                f"SELECT node_id FROM {self._table('graph_nodes')} "
+                # PostgreSQL's database collation is not necessarily byte
+                # order.  Use convert_to so every writer acquires the same
+                # UTF-8 canonical order on every cluster locale.
+                f"WHERE node_id IN ({placeholders}) ORDER BY convert_to(node_id, 'UTF8') FOR UPDATE",
+                params,
+            )
+        edges = sorted(
+            set(edge_keys),
+            key=lambda key: tuple(part.encode("utf-8") for part in key),
+        )
+        if edges:
+            conditions: list[str] = []
+            params: dict[str, str] = {}
+            for index, (from_id, relation, to_id) in enumerate(edges):
+                names = (f"lock_edge_f_{index}", f"lock_edge_r_{index}", f"lock_edge_t_{index}")
+                conditions.append(
+                    f"(from_id=:{names[0]} AND relation=:{names[1]} AND to_id=:{names[2]})"
+                )
+                params.update(dict(zip(names, (from_id, relation, to_id), strict=True)))
+            tx.fetchall(
+                f"SELECT from_id, relation, to_id FROM {self._table('graph_edges')} "
+                f"WHERE {' OR '.join(conditions)} ORDER BY convert_to(from_id, 'UTF8'), convert_to(relation, 'UTF8'), convert_to(to_id, 'UTF8') FOR UPDATE",
+                params,
+            )
 
     def _require_available(self) -> None:
+        if not self._available:
+            raise RuntimeError(f"{type(self).__name__} is not available.")
+
+    def _require_schema_available(self) -> None:
+        if self._schema_state == "legacy_migration_required":
+            raise GraphSchemaMigrationRequired("graph schema requires issue80 migration before writes")
+        if self._schema_state == "partial_or_unknown":
+            raise GraphSchemaMigrationRequired("graph schema is unavailable: migration required")
         if not self._available:
             raise RuntimeError(f"{type(self).__name__} is not available.")
 
@@ -150,16 +235,120 @@ class PGGraphStore(_SqlGraphStoreBase):
 
     def _init_db(self) -> None:
         try:
-            with self._engine.begin() as conn:
-                if self._schema != "public":
-                    conn.execute(self._text(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"'))
-                for ddl in POSTGRES.render_ddl(GRAPH_STORE_SCHEMA, schema_name=self._schema):
-                    conn.execute(self._text(ddl))
-            self._available = True
+            state = self._classify_schema()
+            if state == "fresh":
+                def bootstrap(tx: GraphTx):
+                    # The initial classification was read-only and happened
+                    # before admission. Reclassify on the admitted connection
+                    # so a constructor that lost the race sees target and
+                    # emits no DDL of its own.
+                    state_after_lock = self._classify_schema(tx)
+                    if state_after_lock == "target":
+                        return
+                    if state_after_lock != "fresh":
+                        raise RuntimeError("graph schema is unavailable: migration required")
+                    if self._schema != "public":
+                        tx.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
+                    for ddl in POSTGRES.render_ddl(GRAPH_STORE_SCHEMA, schema_name=self._schema):
+                        tx.execute(ddl)
+                    if self._classify_schema(tx) != "target":
+                        raise RuntimeError("graph schema is unavailable: migration required")
+                self._run_graph_tx(bootstrap)
+                state = self._classify_schema()
+            self._schema_state = "target" if state == "target" else ("legacy_migration_required" if state == "legacy" else "partial_or_unknown")
+            self._available = state in {"target", "legacy", "partial"}
             logger.info("PGGraphStore initialised (schema=%s)", self._schema)
         except Exception as exc:
+            self._schema_state = "partial_or_unknown"
             logger.warning("PGGraphStore init failed: %s", exc)
             self._available = False
+
+    def _classify_schema(self, connection: Any | None = None) -> str:
+        """Read-only startup classification of graph-owned objects."""
+        try:
+            tx_adapter = _CatalogTxAdapter(connection) if isinstance(connection, GraphTx) else None
+            cm = None if connection is not None else self._engine.connect()
+            conn = tx_adapter or connection or cm
+            if cm is not None:
+                conn = cm.__enter__()
+            try:
+                rows = conn.execute(self._text("SELECT table_name FROM information_schema.tables WHERE table_schema=:schema AND (table_name IN ('graph_nodes','graph_edges') OR table_name LIKE 'graph_nodes\\_%' OR table_name LIKE 'graph_edges\\_%')"), {"schema": self._schema}).fetchall()
+                tables = {r[0] for r in rows}
+                if any(name not in {"graph_nodes", "graph_edges"} for name in tables):
+                    return "partial"
+                if not tables:
+                    return "fresh"
+                if tables != {"graph_nodes", "graph_edges"}:
+                    return "partial"
+                cols = {}
+                for table in tables:
+                    cols[table] = conn.execute(self._text("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema=:schema AND table_name=:table ORDER BY ordinal_position"), {"schema": self._schema, "table": table}).fetchall()
+                n_pk = tuple(r[0] for r in conn.execute(self._text("SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema AND tc.table_name=kcu.table_name WHERE tc.table_schema=:schema AND tc.table_name='graph_nodes' AND tc.constraint_type='PRIMARY KEY' ORDER BY kcu.ordinal_position"), {"schema": self._schema}).fetchall())
+                e_pk = tuple(r[0] for r in conn.execute(self._text("SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema AND tc.table_name=kcu.table_name WHERE tc.table_schema=:schema AND tc.table_name='graph_edges' AND tc.constraint_type='PRIMARY KEY' ORDER BY kcu.ordinal_position"), {"schema": self._schema}).fetchall())
+                target_meta_n = [(c.name, "text", "NO" if c.not_null else "YES") for c in GRAPH_STORE_SCHEMA.tables[0].columns]
+                target_meta_e = [(c.name, "text", "NO") for c in GRAPH_STORE_SCHEMA.tables[1].columns]
+                actual_n = [(r[0], r[1], r[2]) for r in cols["graph_nodes"]]
+                actual_e = [(r[0], "jsonb" if r[1] in ("json", "jsonb") else r[1], r[2]) for r in cols["graph_edges"]]
+                # PostgreSQL reports JSONB as ``jsonb`` and all text columns
+                # as ``text`` through information_schema.
+                target_meta_n[-1] = ("properties", "jsonb", "NO")
+                target_meta_e[-1] = ("properties", "jsonb", "NO")
+                if actual_n != target_meta_n or actual_e != target_meta_e:
+                    legacy_n = [("node_type", "text", "NO"), ("node_id", "text", "NO"), ("space_id", "text", "YES"), ("properties", "jsonb", "NO")]
+                    legacy_e = [("from_type", "text", "NO"), ("from_id", "text", "NO"), ("relation", "text", "NO"), ("to_type", "text", "NO"), ("to_id", "text", "NO"), ("properties", "jsonb", "NO")]
+                    if actual_n != legacy_n or actual_e != legacy_e:
+                        return "partial"
+
+                indexes = conn.execute(self._text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname=:schema AND tablename IN ('graph_nodes','graph_edges')"), {"schema": self._schema}).fetchall()
+                secondary = []
+                primary = 0
+                for name, definition in indexes:
+                    normalized = "".join((definition or "").lower().split())
+                    if "_pkey" in str(name).lower() or "primarykey" in normalized:
+                        primary += 1
+                    else:
+                        secondary.append(normalized)
+                if primary != 2 or len(secondary) != 4:
+                    return "partial"
+                required_fragments = ("graph_nodes", "graph_nodes", "graph_edges", "graph_edges")
+                if not all(any(table in definition for definition in secondary) for table in required_fragments):
+                    return "partial"
+                if not any("pack_id" in definition and "properties" in definition for definition in secondary):
+                    return "partial"
+                if not any("space_id" in definition for definition in secondary):
+                    return "partial"
+                if not any("from_id" in definition for definition in secondary):
+                    return "partial"
+                if not any("to_id" in definition for definition in secondary):
+                    return "partial"
+                if conn.execute(self._text("SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname IN ('graph_nodes','graph_edges') AND NOT t.tgisinternal LIMIT 1"), {"schema": self._schema}).fetchone():
+                    return "partial"
+                if conn.execute(self._text("SELECT 1 FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=:schema AND r.relname IN ('graph_nodes','graph_edges') AND c.contype NOT IN ('p','n') LIMIT 1"), {"schema": self._schema}).fetchone():
+                    return "partial"
+                if conn.execute(self._text("SELECT 1 FROM pg_policies WHERE schemaname=:schema AND tablename IN ('graph_nodes','graph_edges') LIMIT 1"), {"schema": self._schema}).fetchone():
+                    return "partial"
+                if conn.execute(self._text("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname IN ('graph_nodes','graph_edges') AND (c.relrowsecurity OR c.relforcerowsecurity) LIMIT 1"), {"schema": self._schema}).fetchone():
+                    return "partial"
+                # A view depends on a table through its rewrite rule.  Join
+                # pg_depend's referenced object (refobjid), not the view's
+                # own objid, so a harmless view mentioning graph_nodes is
+                # classified as partial instead of slipping through.
+                if conn.execute(self._text("SELECT 1 FROM pg_class v JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_rewrite rw ON rw.ev_class=v.oid JOIN pg_depend d ON d.objid=rw.oid JOIN pg_class dep ON dep.oid=d.refobjid JOIN pg_namespace dn ON dn.oid=dep.relnamespace WHERE vn.nspname=:schema AND dn.nspname=:schema AND dep.relname IN ('graph_nodes','graph_edges') AND v.relkind IN ('v','m') AND v.relname NOT IN ('graph_nodes','graph_edges') LIMIT 1"), {"schema": self._schema}).fetchone():
+                    return "partial"
+                if n_pk == ("node_id",) and e_pk == ("from_id", "relation", "to_id"):
+                    return "target"
+                if n_pk == ("node_type", "node_id") and e_pk == ("from_type", "from_id", "relation", "to_type", "to_id"):
+                    return "legacy"
+                return "partial"
+            finally:
+                if cm is not None:
+                    cm.__exit__(None, None, None)
+        except Exception:
+            return "partial"
+
+    @property
+    def schema_state(self) -> str:
+        return self._schema_state
 
     @property
     def available(self) -> bool:

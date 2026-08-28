@@ -39,6 +39,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from opencrab.auth import Principal, create_user, principal_scope
+from opencrab.common.graph_identity import EdgeIdentityConflict, NodeIdentityConflict
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.pack.ownership import create_pack, ensure_default_pack, set_visibility
 from opencrab.pack.read_scope import (
@@ -414,13 +415,15 @@ class TestNoExistenceLeak:
     def test_lever_relation_in_a_foreign_pack_is_not_reported(
         self, ctx, graph, docs, seeded
     ):
-        """Both endpoints readable, but the EDGE belongs to another pack.
+        """An edge with a foreign pack is hidden before relation projection.
 
         `find_by_relations` never returns edge properties, so post-filtering
         its results cannot see this case at all -- the relation type, and
         the prediction derived from it, came back from a relationship the
         caller may not read. Closed by moving to a scoped relation lookup
-        that constrains the edge before LIMIT.
+        that constrains the edge before LIMIT. The global edge key means the
+        positive control uses a different target rather than overwriting the
+        foreign edge with the same `(from_id, relation, to_id)` key.
         """
         from opencrab.mcp.tools import ontology_lever_simulate
 
@@ -435,15 +438,22 @@ class TestNoExistenceLeak:
             got = ontology_lever_simulate("a-lever3", "raises", 0.5)
         assert got["predicted_outcome_changes"] == []
 
+        with pytest.raises(EdgeIdentityConflict):
+            graph.upsert_edge(
+                "Document", "a-lever3", "raises", "Document", "a-outcome3",
+                {"pack_id": PACK_A},
+            )
+
         # Positive control: the same shape with an in-scope edge IS reported,
         # so the emptiness above is the edge's pack and not the lookup.
+        _node(graph, docs, PACK_A, "a-outcome4")
         graph.upsert_edge(
-            "Document", "a-lever3", "raises", "Document", "a-outcome3",
+            "Document", "a-lever3", "raises", "Document", "a-outcome4",
             {"pack_id": PACK_A},
         )
         with _as(ctx, seeded["alice"]):
             ok = ontology_lever_simulate("a-lever3", "raises", 0.5)
-        assert [o["node_id"] for o in ok["predicted_outcome_changes"]] == ["a-outcome3"]
+        assert [o["node_id"] for o in ok["predicted_outcome_changes"]] == ["a-outcome4"]
 
     def test_readable_lever_pointing_at_an_unreadable_node_hides_it(
         self, ctx, graph, docs, seeded
@@ -611,17 +621,19 @@ class TestStoreLevelEmptyScope:
 
 class TestScopedStorePredicates:
     def test_get_node_by_id_scoped_is_homonym_safe(self, graph, docs, seeded):
-        """Same node_id in two packs under two node_types.
+        """Global node identity rejects same-id rows under two node_types.
 
-        The unscoped lookup matches on node_id alone (the PK is
-        (node_type, node_id)), so each caller must get THEIR row -- not a
-        coin flip, and not a false "not found".
+        The old per-type key permitted a same-id homonym and made scoped
+        lookups choose between rows. The global key rejects that ambiguity
+        before it can enter the graph, while a legitimate in-scope lookup
+        remains available.
         """
         graph.upsert_node("Document", "dup", {"pack_id": PACK_A, "node_id": "dup"}, space_id="resource")
-        graph.upsert_node("Concept", "dup", {"pack_id": PACK_B, "node_id": "dup"}, space_id="concept")
+        with pytest.raises(NodeIdentityConflict):
+            graph.upsert_node("Concept", "dup", {"pack_id": PACK_B, "node_id": "dup"}, space_id="concept")
 
         assert graph.get_node_by_id_scoped("dup", [PACK_A])["pack_id"] == PACK_A
-        assert graph.get_node_by_id_scoped("dup", [PACK_B])["pack_id"] == PACK_B
+        assert graph.get_node_by_id_scoped("dup", [PACK_B]) is None
         assert graph.get_node_by_id_scoped("dup", [PACK_PUBLIC]) is None
 
     def test_edge_predicate_requires_both_endpoints(self, graph, docs, seeded):
@@ -1267,10 +1279,11 @@ class TestStartupCheck:
         body = src.split('"""', 2)[-1]
         assert "graph.list_pack_ids()" in body
         assert "list_packs(" not in body
-        # ...and the method it now uses really is label-agnostic.
+        # ...and the method it now uses really scans the common graph label,
+        # not a domain-specific label that an imported node may lack.
         neo4j_body = inspect.getsource(Neo4jStore.list_pack_ids).split('"""', 2)[-1]
-        assert "MATCH (n)" in neo4j_body
-        assert "OpenCrabNode" not in neo4j_body
+        assert "MATCH (n:OpenCrabNode)" in neo4j_body
+        assert "list_packs(" not in neo4j_body
 
     def test_edge_only_pack_ids_are_enumerated(self, sql, graph, seeded):
         """An edge can carry a pack_id that appears on no node.

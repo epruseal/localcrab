@@ -379,6 +379,8 @@ class SqlDialect:
                 line = f"{col.name} {sql_type}"
                 if col.name == single_pk:
                     line += " PRIMARY KEY"
+                    if col.not_null:
+                        line += " NOT NULL"
                 else:
                     if col.not_null:
                         line += " NOT NULL"

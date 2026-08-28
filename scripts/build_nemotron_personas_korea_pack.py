@@ -10,7 +10,6 @@ import argparse
 import hashlib
 import json
 import shutil
-import sqlite3
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -207,73 +206,58 @@ def iter_rows(parquet_path: Path, columns: list[str]):
             yield {k: clean(v) for k, v in row.items()}
 
 
-def init_sqlite_graph(db_path: Path, reset_pack: bool) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS graph_nodes (
-            node_type   TEXT NOT NULL,
-            node_id     TEXT NOT NULL,
-            space_id    TEXT,
-            properties  TEXT NOT NULL DEFAULT '{}',
-            PRIMARY KEY (node_type, node_id)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS graph_edges (
-            from_type   TEXT NOT NULL,
-            from_id     TEXT NOT NULL,
-            relation    TEXT NOT NULL,
-            to_type     TEXT NOT NULL,
-            to_id       TEXT NOT NULL,
-            properties  TEXT NOT NULL DEFAULT '{}',
-            PRIMARY KEY (from_type, from_id, relation, to_type, to_id)
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_to ON graph_edges(to_id)")
+def init_sqlite_graph(db_path: Path, reset_pack: bool):
+    """Open the target graph through its owner, including schema bootstrap."""
+    from opencrab.stores.local_graph_store import LocalGraphStore
+
+    store = LocalGraphStore(str(db_path))
+    if not store.available:
+        raise RuntimeError(f"local graph store is unavailable: {db_path}")
     if reset_pack:
-        like = f"%\"pack_id\": \"{PACK_ID}\"%"
-        conn.execute("DELETE FROM graph_edges WHERE properties LIKE ?", (like,))
-        conn.execute("DELETE FROM graph_nodes WHERE properties LIKE ?", (like,))
-        # Node ids are stable and faster to clear by prefix for this pack.
-        conn.execute("DELETE FROM graph_nodes WHERE node_id = ?", (f"dataset:{PACK_ID}",))
-        conn.execute("DELETE FROM graph_nodes WHERE node_id LIKE 'persona:%'")
-        conn.execute("DELETE FROM graph_nodes WHERE node_id LIKE 'evidence-node:%'")
-        conn.commit()
-    return conn
+        # Use the same ownership-scoped public mutations as normal ingestion.
+        # This avoids a LIKE predicate that could remove another pack whose
+        # metadata merely happens to contain the same text.
+        for edge in store.export_edges(pack_id=PACK_ID, limit=10_000_000):
+            props = edge.get("rel_props") or {}
+            source = edge.get("source_props") or {}
+            target = edge.get("target_props") or {}
+            if props.get("pack_id") == PACK_ID:
+                store.delete_edge(source["id"], edge["relation"], target["id"], owner_pack_id=PACK_ID)
+        for node in store.export_nodes(pack_id=PACK_ID, limit=10_000_000):
+            props = node.get("props") or {}
+            if props.get("pack_id") == PACK_ID and props.get("id"):
+                store.delete_node(
+                    node.get("node_type")
+                    or props.get("node_type")
+                    or (node.get("labels") or ["concept"])[0],
+                    props["id"],
+                )
+    return store
 
 
-def insert_many(conn: sqlite3.Connection, nodes: list[tuple], edges: list[tuple]) -> None:
+def insert_many(store, nodes: list[tuple], edges: list[tuple]) -> None:
     if nodes:
-        conn.executemany(
-            """
-            INSERT INTO graph_nodes(node_type, node_id, space_id, properties)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(node_type, node_id) DO UPDATE SET
-                space_id=excluded.space_id,
-                properties=excluded.properties
-            """,
-            nodes,
-        )
+        store.upsert_nodes_batch([
+            {
+                "node_type": node_type,
+                "node_id": node_id,
+                "space_id": space_id,
+                "properties": json.loads(properties),
+            }
+            for node_type, node_id, space_id, properties in nodes
+        ])
     if edges:
-        conn.executemany(
-            """
-            INSERT INTO graph_edges(from_type, from_id, relation, to_type, to_id, properties)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO UPDATE SET
-                properties=excluded.properties
-            """,
-            edges,
-        )
-    conn.commit()
+        store.upsert_edges_batch([
+            {
+                "from_type": from_type,
+                "from_id": from_id,
+                "relation": relation,
+                "to_type": to_type,
+                "to_id": to_id,
+                "properties": json.loads(properties),
+            }
+            for from_type, from_id, relation, to_type, to_id, properties in edges
+        ])
 
 
 def zip_stage(stage: Path, zip_path: Path) -> str:

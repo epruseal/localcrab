@@ -24,6 +24,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 # this guards writes, and #143's read scoping is a separate contract.
 WATCHED_METHODS = frozenset({
     "upsert_node",
+    "reclassify_node",
     "upsert_node_doc",
     "upsert_edge",
     "upsert_nodes_batch",
@@ -33,6 +34,7 @@ WATCHED_METHODS = frozenset({
     "upsert_texts",
     "register_node",
     "register_edge",
+    "migrate_graph_identity",
 })
 
 SCANNED_ROOTS = ("opencrab", "apps", "scripts", "crabharness")
@@ -44,6 +46,10 @@ ALLOWED: dict[tuple[str, str], str] = {
     # --- writer 1: the ontology builder ---
     ("opencrab/ontology/builder.py", "add_node"): "writer 1 -- gate runs here",
     ("opencrab/ontology/builder.py", "add_edge"): "writer 1 -- gate runs here",
+    ("scripts/migrate_graph_identity.py", "main"): "operator migration tool; explicit apply request",
+    ("opencrab/stores/neo4j_store.py", "write"): (
+        "store-owned transaction callback; the public batch writer already holds the graph gate"
+    ),
     # --- writer 2: the source writer, and the vector leg it drives ---
     ("opencrab/pack/source_writer.py", "write_source"): "writer 2 -- gate runs here",
     ("opencrab/ontology/query.py", "ingest"): (
@@ -69,7 +75,15 @@ ALLOWED: dict[tuple[str, str], str] = {
     #     content writes; these are operator tools run locally, not client
     #     surfaces) ---
     ("scripts/migrate_to_local.py", "migrate_docs"): "migration tool, --apply gated",
-    ("scripts/migrate_to_local.py", "migrate_graph"): "migration tool, --apply gated",
+    ("scripts/build_nemotron_personas_korea_pack.py", "insert_many"): (
+        "operator pack builder; the target graph writer enforces its schema contract"
+    ),
+    ("scripts/import_pack_graph_to_neo4j.py", "import_edges"): (
+        "operator import tool; Neo4jStore owns the graph write capability"
+    ),
+    ("scripts/import_pack_graph_to_neo4j.py", "import_nodes"): (
+        "operator import tool; Neo4jStore owns the graph write capability"
+    ),
     ("scripts/migrate_pack_ownership.py", "_backfill_vector"): (
         "migration tool, --apply gated"
     ),

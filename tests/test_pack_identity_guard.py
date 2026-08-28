@@ -365,33 +365,21 @@ def test_unavailable_store_probe_is_skipped(graph):
 # ---------------------------------------------------------------------------
 
 
-def test_kuzu_same_pack_edge_reingest_passes(tmp_path):
-    pytest.importorskip("ladybug")
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+def test_kuzu_same_pack_edge_reingest_is_capability_negative():
+    from opencrab.common.graph_identity import (
+        GraphReadCapabilityUnavailable,
+        GraphWriteCapabilityUnavailable,
+    )
+    from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 
-    kuzu_graph = KuzuGraphStore(db_path=str(tmp_path / "graph_kuzu_reingest"))
-    try:
-        kuzu_graph.upsert_node("Entity", "a", {"pack_id": "my-pack"})
-        kuzu_graph.upsert_node("Entity", "b", {"pack_id": "my-pack"})
+    kuzu_graph = KuzuUnavailableGraphStore()
+    assert kuzu_graph.available is False
+    with pytest.raises(GraphWriteCapabilityUnavailable):
         kuzu_graph.upsert_edge(
             "Entity", "a", "related_to", "Entity", "b", {"pack_id": "my-pack"}
         )
-
-        ctx = _ctx(kuzu_graph)
-        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
-            result = _ingest_into_pack(
-                "my-pack",
-                edges=[{
-                    "from_space": "concept", "from_id": "a", "relation": "related_to",
-                    "to_space": "concept", "to_id": "b",
-                }],
-            )
-
-        assert result["added_edges"] == 1
-        assert result["edge_errors"] == []
-        ctx["builder"].add_edge.assert_called_once()
-    finally:
-        kuzu_graph.close()
+    with pytest.raises(GraphReadCapabilityUnavailable):
+        kuzu_graph.get_edge("Entity", "a", "related_to", "Entity", "b")
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +609,12 @@ def test_sql_get_edge_wrong_endpoint_type_returns_none(graph):
     graph.upsert_node("Entity", "b", {})
     graph.upsert_edge("Entity", "a", "relates_to", "Entity", "b", {"pack_id": "p"})
 
-    assert graph.get_edge("Entity", "a", "relates_to", "Entity", "b") == {"pack_id": "p"}
+    assert graph.get_edge("Entity", "a", "relates_to", "Entity", "b") == {
+        "from_id": "a",
+        "relation": "relates_to",
+        "to_id": "b",
+        "pack_id": "p",
+    }
     assert graph.get_edge("Concept", "a", "relates_to", "Entity", "b") is None
     assert graph.get_edge("Entity", "a", "relates_to", "Concept", "b") is None
 

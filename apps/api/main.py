@@ -19,6 +19,7 @@ load_dotenv(REPO_ROOT / "apps" / ".env", override=False)
 load_dotenv(REPO_ROOT / ".env", override=False)
 
 from opencrab.auth import Principal
+from opencrab.common.graph_identity import NodeIdentityConflict
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
 from opencrab.locking import write_lock
@@ -748,7 +749,7 @@ def add_node(
                 pack_id=target_pack_id,
             )
             _meter_call(ctx, auth, "/api/nodes")
-    except ValueError as exc:
+    except (ValueError, NodeIdentityConflict) as exc:
         # Grammar / required-field validation failure — a client error, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except PackNotFoundError:

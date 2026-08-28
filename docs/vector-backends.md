@@ -12,7 +12,7 @@
 
 | 축 | 값 | 의미 |
 |----|----|------|
-| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` / `pg` | 그래프·문서·SQL 스토어 위치. `local`/`kuzu`는 `is_local=True`(둘 다 SQLite/임베디드), `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스, `pg`는 4스토어 전부 PostgreSQL(별도 분기, `is_local=False`) |
+| `STORAGE_MODE` | `local`(기본) / `kuzu` / `docker` / `pg` | 그래프·문서·SQL 스토어 위치. `local`은 SQLite 그래프를 쓰고 `kuzu`는 문서·SQL·벡터만 local로 선택하며 그래프는 capability-negative facade를 반환한다. `docker`는 Neo4j/MongoDB/PostgreSQL 외부 서비스, `pg`는 4스토어 전부 PostgreSQL(별도 분기, `is_local=False`)이다. |
 | `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector` | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
 | `EMBEDDING_BACKEND` | `openai`(기본) / `local` | 텍스트를 벡터로 바꾸는 방식. 벡터 백엔드 축과 독립 |
 
@@ -52,7 +52,7 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 
 | STORAGE_MODE | EMBEDDING_BACKEND | VECTOR_BACKEND(명시 안 함) | 해석 결과 | 비고 |
 |---|---|---|---|---|
-| `local`/`kuzu` | `openai`(기본) | _(미설정)_ | **`sqlite-vec`** | 아무 설정 없이 로컬 실행 시 기본 경로 |
+| `local`/`kuzu` | `openai`(기본) | _(미설정)_ | **`sqlite-vec`** | 아무 설정 없이 local 축을 실행할 때 기본 경로이며 `kuzu`의 그래프 capability를 활성화하지 않는다. |
 | `local`/`kuzu` | `local` | _(미설정)_ | `chroma` | minilm 384d, ChromaDB PersistentClient |
 | `docker` | `openai` | _(미설정)_ | `chroma` | docker 모드는 항상 Chroma(HttpClient) — VECTOR_BACKEND 조건에 `is_local` 필요 |
 | `docker` | `local` | _(미설정)_ | `chroma` | 동일 |
