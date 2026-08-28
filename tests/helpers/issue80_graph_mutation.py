@@ -247,6 +247,15 @@ def _edge_row(item: Any) -> tuple[Any, ...]:
     return tuple(item)
 
 
+def _stored_properties(value: Any) -> str | bytes:
+    """Keep raw SQLite bytes raw while encoding structured fixture values."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def seed_graph_rows(
     target: Any,
     nodes: Iterable[Any] = (),
@@ -265,14 +274,14 @@ def seed_graph_rows(
         conn.executemany(
             "INSERT INTO graph_nodes (node_type,node_id,space_id,properties) VALUES (?,?,?,?)",
             [
-                (node_type, node_id, space_id, props if isinstance(props, str) else json.dumps(props, ensure_ascii=False, separators=(",", ":")))
+                (node_type, node_id, space_id, _stored_properties(props))
                 for node_type, node_id, space_id, props in (_node_row(item) for item in nodes)
             ],
         )
         conn.executemany(
             "INSERT INTO graph_edges (from_type,from_id,relation,to_type,to_id,properties) VALUES (?,?,?,?,?,?)",
             [
-                (from_type, from_id, relation, to_type, to_id, props if isinstance(props, str) else json.dumps(props, ensure_ascii=False, separators=(",", ":")))
+                (from_type, from_id, relation, to_type, to_id, _stored_properties(props))
                 for from_type, from_id, relation, to_type, to_id, props in (_edge_row(item) for item in edges)
             ],
         )

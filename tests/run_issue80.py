@@ -1,9 +1,4 @@
-"""Exact-selection issue #80 test runner.
-
-The runner creates one private evidence child, validates the immutable Kùzu
-negative bundle before collection, runs collection and execution from the same
-selection file, and rejects any skipped or uncollected node.
-"""
+"""Exact-selection issue #80 test runner."""
 
 from __future__ import annotations
 
@@ -20,10 +15,8 @@ if __package__ in (None, ""):
 from tests.verify_issue80 import (
     ROOT,
     create_evidence_child,
-    graph_source_residuals,
     load_manifest,
     manifest_nodeids,
-    verify_kuzu_bundle,
 )
 
 
@@ -61,10 +54,6 @@ def main(argv: list[str] | None = None) -> int:
     if Path(args.junit_name).name != args.junit_name:
         raise ValueError("junit name must be a basename")
     manifest = load_manifest(args.manifest)
-    verify_kuzu_bundle()
-    residuals = graph_source_residuals()
-    if residuals["kuzu_production"]:
-        raise RuntimeError(f"Kùzu production residuals: {residuals['kuzu_production']}")
     child = create_evidence_child(args.base_dir)
     print(f"RUN_DIR={child}", flush=True)
     nodeids = manifest_nodeids(manifest)

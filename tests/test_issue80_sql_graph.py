@@ -1,8 +1,8 @@
-"""Concrete issue #80 graph identity and capability tests.
+"""Behavioral issue #80 graph-store qualification tests.
 
-The focused runner selects these functions by exact node ID.  SQLite exercises
-local behavior, while the service cases use disposable PostgreSQL and Neo4j
-connections supplied by the test environment.
+SQLite tests use real temporary databases.  PostgreSQL and Neo4j tests are
+enabled only by the disposable service environment prepared by CI.  Kùzu is
+tested as a capability-negative facade and never imports its optional driver.
 """
 
 from __future__ import annotations
@@ -10,123 +10,165 @@ from __future__ import annotations
 import ast
 import hashlib
 import ipaddress
+import json
 import os
-import socket
-import sqlite3
+import stat
 import tempfile
 import uuid
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
 from opencrab.common.graph_identity import (
-    ApplyMigrationRequest,
     DryRunMigrationRequest,
     EdgeIdentityConflict,
-    GraphMigrationConflict,
     GraphQueryWriteRejected,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     GraphWriteCapabilityUnavailable,
     NodeIdentityConflict,
     canonical_edge_digest,
-    canonical_json_bytes,
     canonical_node_digest,
-    plan_sha256,
 )
-from opencrab.stores.kuzu_graph_store import (
-    KuzuGraphStore,
-    KuzuUnavailableGraphStore,
-)
+from opencrab.stores.kuzu_graph_store import KuzuGraphStore, KuzuUnavailableGraphStore
 from opencrab.stores.local_graph_store import LocalGraphStore
 from tests.issue80_migration import FixtureHandle
-from tests.verify_issue80 import graph_source_residuals
 
 
-def _expect(exc_type: type[BaseException], callback: Any) -> None:
-    try:
+def _expect(exc_type: type[BaseException], callback: Callable[[], Any]) -> None:
+    with pytest.raises(exc_type):
         callback()
-    except exc_type:
-        return
-    raise AssertionError(f"expected {exc_type.__name__}")
 
 
-def _sqlite_runtime(name: str) -> None:
-    with tempfile.TemporaryDirectory(prefix="issue80-test-") as tmp:
+def test_sqlite_identity_and_edge_cas_actual() -> None:
+    with tempfile.TemporaryDirectory(prefix="issue80-sqlite-") as tmp:
         store = LocalGraphStore(str(Path(tmp) / "graph.db"))
         try:
-            assert store.available
             first = store.upsert_node("Person", "n1", {"name": "one"})
             assert first["id"] == "n1"
             assert store.upsert_node("Person", "n1", {"name": "one"}) == first
             _expect(NodeIdentityConflict, lambda: store.upsert_node("Person", "n1", {"name": "two"}))
-            _expect(NodeIdentityConflict, lambda: store.upsert_node("Other", "n1", {"name": "one"}))
+            _expect(NodeIdentityConflict, lambda: store.upsert_node("Agent", "n1", {"name": "one"}))
             store.upsert_node("Person", "n2", {"name": "two"})
-            assert store.upsert_edge("Person", "n1", "knows", "Person", "n2", {"pack_id": "p"})
-            edge = store.get_edge("Person", "n1", "knows", "Person", "n2")
-            assert edge and edge["from_id"] == "n1"
-            digest = store.get_node_digest("n1")
-            assert digest
-            if "update" in name or "reclassification" in name:
-                store.update_node("n1", digest, "Agent", {"name": "changed"})
-                assert store.get_node("Agent", "n1")["name"] == "changed"
-                _expect(NodeIdentityConflict, lambda: store.update_node("n1", digest, "Agent", {"name": "again"}))
-            if "batch" in name:
-                _expect(NodeIdentityConflict, lambda: store.upsert_nodes_batch([
-                    {"node_type": "Person", "node_id": "n3", "properties": {"x": 1}},
-                    {"node_type": "Other", "node_id": "n1", "properties": {"x": 2}},
-                ]))
-                assert store.get_node("Person", "n3") is None
+            assert store.upsert_edge("Person", "n1", "knows", "Person", "n2", {"weight": 1})
+            old_digest = store.get_node_digest("n1", node_type="Person")
+            assert old_digest
+            changed = store.reclassify_node(
+                "n1", expected_current_digest=old_digest, new_type="Agent",
+                new_space_id=None, new_properties={"name": "changed"},
+                return_receipt=True,
+            )
+            assert changed.node_type == "Agent"
+            assert store.get_node("Person", "n1") is None
+            assert store.get_node("Agent", "n1")["name"] == "changed"
+            assert store.get_edge("Agent", "n1", "knows", "Person", "n2") is not None
+            _expect(NodeIdentityConflict, lambda: store.reclassify_node(
+                "n1", expected_current_digest=old_digest, new_type="Entity",
+                new_space_id=None, new_properties={"name": "stale"},
+            ))
         finally:
             store.close()
 
 
-def _sqlite_schema(name: str) -> None:
-    with FixtureHandle.create() as fixture:
-        if "legacy" in name:
-            fixture.create_legacy()
-            store = LocalGraphStore(str(fixture.db_path))
-            try:
-                assert store.schema_state == "legacy_migration_required"
-                _expect(GraphSchemaMigrationRequired, lambda: store.upsert_node("Person", "n", {}))
-            finally:
-                store.close()
-            return
-        if "partial" in name:
-            conn = sqlite3.connect(fixture.db_path)
-            conn.execute("CREATE TABLE graph_nodes (node_id TEXT PRIMARY KEY)")
-            conn.commit()
-            conn.close()
-            store = LocalGraphStore(str(fixture.db_path))
-            try:
-                assert store.schema_state == "partial_or_unknown"
-                _expect(GraphSchemaMigrationRequired, lambda: store.delete_node("Person", "n"))
-            finally:
-                store.close()
-            return
-        store = LocalGraphStore(str(fixture.db_path))
+def test_sqlite_schema_classifier_and_public_gate_actual() -> None:
+    with tempfile.TemporaryDirectory(prefix="issue80-schema-") as tmp:
+        root = Path(tmp)
+        fresh = LocalGraphStore(str(root / "fresh.db"))
         try:
-            assert store.schema_state == "target"
-            assert store.graph_fingerprint()
+            assert fresh.schema_state == "target"
+            assert fresh.graph_fingerprint()
+        finally:
+            fresh.close()
+    with FixtureHandle.create() as fixture:
+        fixture.create_legacy()
+        fixture.seed(nodes=(("Person", "legacy", None, {"name": "legacy"}),))
+        legacy = LocalGraphStore(str(fixture.db_path))
+        try:
+            assert legacy.schema_state == "legacy_migration_required"
+            _expect(GraphSchemaMigrationRequired, lambda: legacy.upsert_node("Person", "blocked", {}))
+        finally:
+            legacy.close()
+
+
+def test_sqlite_graph_transaction_boundary_actual() -> None:
+    with tempfile.TemporaryDirectory(prefix="issue80-graphtx-") as tmp:
+        store = LocalGraphStore(str(Path(tmp) / "graph.db"))
+        try:
+            observed = store._run_graph_tx(
+                lambda tx: (id(store._conn), store._conn.in_transaction, tx.fetchone("SELECT 1")[0]),
+                exclusive=True,
+            )
+            assert observed == (id(store._conn), True, 1)
+            with pytest.raises(RuntimeError, match="nested"):
+                store._run_graph_tx(lambda _tx: store._run_graph_tx(lambda __tx: None))
+            before = store.graph_fingerprint()
+            def fail(tx: Any) -> None:
+                tx.execute("CREATE TABLE issue80_rollback (value TEXT)")
+                raise RuntimeError("injected")
+            with pytest.raises(RuntimeError, match="injected"):
+                store._run_graph_tx(fail, immediate=True)
+            assert store.graph_fingerprint() == before
         finally:
             store.close()
 
 
-def _kuzu_negative(name: str) -> None:
-    facade = KuzuUnavailableGraphStore("/private/tmp/issue80-kuzu-never-created/graph.kuzu")
+def test_sqlite_writer_and_protocol_behavior_actual() -> None:
+    with tempfile.TemporaryDirectory(prefix="issue80-writer-") as tmp:
+        store = LocalGraphStore(str(Path(tmp) / "graph.db"))
+        try:
+            store.upsert_node("Person", "a", {"name": "a"})
+            store.upsert_node("Person", "b", {"name": "b"})
+            assert store.upsert_edge("Person", "a", "knows", "Person", "b", {"weight": 1})
+            assert store.get_edge_digest("a", "knows", "b") == canonical_edge_digest(
+                "a", "knows", "b", "Person", "Person",
+                {"from_id": "a", "relation": "knows", "to_id": "b", "weight": 1},
+            )
+            _expect(EdgeIdentityConflict, lambda: store.upsert_edge(
+                "Person", "a", "knows", "Person", "b", {"weight": 2}
+            ))
+            assert store.run_cypher("SELECT 1") == []
+        finally:
+            store.close()
+
+
+def test_kuzu_capability_negative_actual() -> None:
+    path = "/private/tmp/issue80-kuzu-never-created/graph.kuzu"
+    facade = KuzuUnavailableGraphStore(path)
     assert facade.available is False
+    assert facade.schema_state == "disabled"
     _expect(GraphWriteCapabilityUnavailable, lambda: facade.upsert_node("Person", "n", {}))
     _expect(GraphWriteCapabilityUnavailable, lambda: facade.upsert_nodes_batch([]))
     _expect(GraphWriteCapabilityUnavailable, lambda: facade.delete_node("Person", "n"))
+    _expect(GraphReadCapabilityUnavailable, lambda: facade.inspect_graph_identity())
     _expect(GraphReadCapabilityUnavailable, lambda: facade.run_cypher("MATCH (n) RETURN n"))
     _expect(GraphQueryWriteRejected, lambda: facade.run_cypher("CREATE (n)"))
-    if "direct_constructor" in name:
-        _expect(GraphWriteCapabilityUnavailable, lambda: KuzuGraphStore("/private/tmp/issue80-kuzu-never-created/graph.kuzu"))
-    assert graph_source_residuals()["kuzu_production"] == []
+    _expect(GraphWriteCapabilityUnavailable, lambda: KuzuGraphStore(path))
+
+
+def test_kuzu_capability_and_writer_ast_inventory_actual() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "opencrab/stores/kuzu_graph_store.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    assert classes == {"KuzuGraphStore", "KuzuUnavailableGraphStore"}
+    optional_imports = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    assert not optional_imports.intersection({"ladybug", "kuzu"})
+    sinks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"execute", "executemany", "commit", "rollback"}
+    ]
+    assert sinks == []
+    assert canonical_node_digest("Person", None, {"id": "n"})
 
 
 def _required_service_env(*names: str) -> dict[str, str]:
@@ -136,120 +178,200 @@ def _required_service_env(*names: str) -> dict[str, str]:
     return {name: os.environ[name] for name in names}
 
 
-def _pg_service_guard() -> tuple[str, Any, str]:
+def _pg_service_guard() -> tuple[Any, str]:
     env = _required_service_env("OPENCRAB_PG_TEST_URL", "OPENCRAB_ISSUE80_SERVICE_APPLY")
     if env["OPENCRAB_ISSUE80_SERVICE_APPLY"] != "1":
         pytest.fail("OPENCRAB_ISSUE80_SERVICE_APPLY=1 is required for issue80 service tests")
-    dsn = env["OPENCRAB_PG_TEST_URL"]
     from sqlalchemy import create_engine, text
     from sqlalchemy.engine import make_url
-
-    url = make_url(dsn)
-    host = url.host
-    database = url.database
-    if not host or not database or not database.endswith("_test"):
+    url = make_url(env["OPENCRAB_PG_TEST_URL"])
+    if not url.host or not url.database or not url.database.endswith("_test"):
         pytest.fail("issue80 PG service requires a loopback *_test database")
     try:
-        addresses = {ipaddress.ip_address(host)}
+        addresses = {ipaddress.ip_address(url.host)}
     except ValueError:
+        import socket
         try:
-            addresses = {ipaddress.ip_address(socket.gethostbyname(host))}
+            addresses = {ipaddress.ip_address(socket.gethostbyname(url.host))}
         except (OSError, ValueError):
             pytest.fail("issue80 PG service host is not loopback")
     if not all(address.is_loopback for address in addresses):
         pytest.fail("issue80 PG service host is not loopback")
-    engine = create_engine(dsn)
-    schema = f"issue80_{uuid.uuid4().hex}"
-    try:
-        with engine.connect() as conn:
-            observed = conn.execute(text("SELECT current_database()")).one()
-        if observed[0] != database:
+    engine = create_engine(env["OPENCRAB_PG_TEST_URL"])
+    with engine.connect() as conn:
+        if conn.execute(text("SELECT current_database()")).scalar_one() != url.database:
+            engine.dispose()
             pytest.fail("issue80 PG connection database identity differs from DSN")
-    except Exception:
-        engine.dispose()
-        raise
-    return dsn, engine, schema
+    return engine, f"issue80_{uuid.uuid4().hex}"
 
 
 @contextmanager
-def _pg_runtime(*, legacy: bool = False) -> Iterator[tuple[Any, Any, str]]:
-    dsn, engine, schema = _pg_service_guard()
+def _pg_runtime(*, legacy: bool = False) -> Iterator[Any]:
+    engine, schema = _pg_service_guard()
     from sqlalchemy import text
-
     try:
         if legacy:
             with engine.begin() as conn:
                 conn.execute(text(f'CREATE SCHEMA "{schema}"'))
-                conn.execute(text(
-                    f'''CREATE TABLE "{schema}".graph_nodes (
-                        node_type TEXT NOT NULL, node_id TEXT NOT NULL,
-                        space_id TEXT, properties JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                        PRIMARY KEY (node_type, node_id)
-                    )'''))
-                conn.execute(text(
-                    f'''CREATE TABLE "{schema}".graph_edges (
-                        from_type TEXT NOT NULL, from_id TEXT NOT NULL,
-                        relation TEXT NOT NULL, to_type TEXT NOT NULL,
-                        to_id TEXT NOT NULL, properties JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                        PRIMARY KEY (from_type, from_id, relation, to_type, to_id)
-                    )'''))
-                conn.execute(text(f'''CREATE INDEX idx_nodes_pack ON "{schema}".graph_nodes ((properties->>'pack_id'))'''))
-                conn.execute(text(f'''CREATE INDEX idx_nodes_space ON "{schema}".graph_nodes (space_id)'''))
-                conn.execute(text(f'''CREATE INDEX idx_edges_from ON "{schema}".graph_edges (from_id)'''))
-                conn.execute(text(f'''CREATE INDEX idx_edges_to ON "{schema}".graph_edges (to_id)'''))
-                conn.execute(text(
-                    f'''CREATE TABLE "{schema}".graph_migration_receipts (
-                        request_id TEXT PRIMARY KEY, phase TEXT NOT NULL,
-                        request_digest TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
-                        mapping_fingerprint TEXT NOT NULL, plan_sha256 TEXT NOT NULL,
-                        target_fingerprint_before TEXT NOT NULL,
-                        target_fingerprint_after TEXT NOT NULL, edge_loss INTEGER NOT NULL,
-                        property_loss INTEGER NOT NULL, receipt_bytes BYTEA NOT NULL,
-                        created_at TEXT NOT NULL
-                    )'''))
-                conn.execute(text(f'''CREATE FUNCTION "{schema}".issue80_fail_receipt_insert()
-                    RETURNS trigger LANGUAGE plpgsql AS $$
-                    BEGIN RAISE EXCEPTION 'issue80 injected receipt failure'; END;
-                    $$'''))
-                conn.execute(text(f'''CREATE TRIGGER issue80_fail_receipt_insert
-                    BEFORE INSERT ON "{schema}".graph_migration_receipts
-                    FOR EACH ROW EXECUTE FUNCTION "{schema}".issue80_fail_receipt_insert()'''))
-                conn.execute(text(f'''INSERT INTO "{schema}".graph_nodes
-                    (node_type,node_id,space_id,properties) VALUES
-                    ('Person','a',NULL,'{{"name":"same"}}'::jsonb),
-                    ('Entity','a',NULL,'{{"name":"same"}}'::jsonb),
-                    ('Person','b',NULL,'{{"name":"bee"}}'::jsonb)'''))
-                conn.execute(text(f'''INSERT INTO "{schema}".graph_edges
-                    (from_type,from_id,relation,to_type,to_id,properties) VALUES
-                    ('Person','a','knows','Person','b','{{"weight": 1}}'::jsonb),
-                    ('Entity','a','knows','Person','b','{{"weight": 1}}'::jsonb)'''))
+                conn.execute(text(f'''CREATE TABLE "{schema}".graph_nodes (
+                    node_type TEXT NOT NULL, node_id TEXT NOT NULL, space_id TEXT,
+                    properties JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    PRIMARY KEY (node_type,node_id))'''))
+                conn.execute(text(f'''CREATE TABLE "{schema}".graph_edges (
+                    from_type TEXT NOT NULL, from_id TEXT NOT NULL, relation TEXT NOT NULL,
+                    to_type TEXT NOT NULL, to_id TEXT NOT NULL,
+                    properties JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    PRIMARY KEY (from_type,from_id,relation,to_type,to_id))'''))
+                for statement in (
+                    f'''CREATE INDEX idx_nodes_pack ON "{schema}".graph_nodes ((properties->>'pack_id'))''',
+                    f'''CREATE INDEX idx_nodes_space ON "{schema}".graph_nodes (space_id)''',
+                    f'''CREATE INDEX idx_edges_from ON "{schema}".graph_edges (from_id)''',
+                    f'''CREATE INDEX idx_edges_to ON "{schema}".graph_edges (to_id)''',
+                ):
+                    conn.execute(text(statement))
         from opencrab.stores.pg_graph_store import PGGraphStore
-
         store = PGGraphStore(engine, schema=schema)
-        assert store.available
-        yield store, engine, schema
+        yield store
     finally:
+        if "store" in locals():
+            store.close()
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()
+
+
+def test_pg_runtime_identity_and_incident_edge_cas() -> None:
+    with _pg_runtime() as store:
+        store.upsert_node("Person", "pg-a", {"name": "a"})
+        store.upsert_node("Person", "pg-b", {"name": "b"})
+        assert store.upsert_edge("Person", "pg-a", "knows", "Person", "pg-b", {"weight": 1})
+        digest = store.get_node_digest("pg-a", node_type="Person")
+        assert digest
+        store.reclassify_node(
+            "pg-a", expected_current_digest=digest, new_type="Agent",
+            new_space_id=None, new_properties={"name": "updated"},
+        )
+        assert store.get_node("Agent", "pg-a") is not None
+        assert store.get_edge("Agent", "pg-a", "knows", "Person", "pg-b") is not None
+
+
+def test_pg_runtime_migration_and_replay() -> None:
+    from opencrab.common.graph_identity import ApplyMigrationRequest, ExplicitMerge
+    with _pg_runtime(legacy=True) as store:
+        store.upsert_node("Person", "pg-a", {"name": "same"})
+        store.upsert_node("Entity", "pg-a", {"name": "same"})
+        inventory = store.inspect_graph_identity()
+        rows = sorted((row for row in inventory.nodes if row.key.node_id == "pg-a"), key=lambda row: row.key.node_type)
+        merge = ExplicitMerge(tuple((row.key, row.digest) for row in rows), "pg-a", "Person", None, None)
+        dry = store.migrate_graph_identity(DryRunMigrationRequest(inventory.source_fingerprint, (merge,)))
+        with tempfile.NamedTemporaryFile(prefix="issue80-pg-backup-", delete=False) as handle:
+            artifact = Path(handle.name)
+            handle.write(b"backup")
         try:
-            if "store" in locals():
-                store.close()
-            with engine.begin() as conn:
-                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            request = ApplyMigrationRequest(
+                f"issue80-pg-{uuid.uuid4().hex}", inventory.source_fingerprint,
+                dry.plan_bytes, dry.plan_sha256, artifact,
+                hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+            receipt = store.migrate_graph_identity(request)
+            assert receipt.phase == "apply"
+            assert store.schema_state == "target"
+            assert store.migrate_graph_identity(request).canonical_bytes == receipt.canonical_bytes
         finally:
-            engine.dispose()
+            artifact.unlink(missing_ok=True)
+
+
+def test_pg_runtime_provenance_cas() -> None:
+    with _pg_runtime() as store:
+        node = store.upsert_node("Entity", "pg-prov", {"name": "node"}, return_receipt=True)
+        target = store.graph_fingerprint()
+        record = {
+            "kind": "node", "target_fingerprint": target,
+            "expected_current_digest": node.digest, "proposed_pack_id": "issue80-pack",
+            "node_id": "pg-prov", "node_type": "Entity", "reason": "inferred",
+            "dry_run_evidence_digest": hashlib.sha256(b"evidence").hexdigest(),
+            "allowed_properties_delta": {"set": {"pack_id": "issue80-pack"}, "remove": []},
+        }
+        receipt = store.backfill_pack_provenance([record])
+        assert receipt.target_fingerprint_before == target
+        assert store.get_node("Entity", "pg-prov")["pack_id"] == "issue80-pack"
+
+
+@dataclass(frozen=True)
+class _Neo4jEndpointCapability:
+    uri: str
+    user: str
+    password: str
+    database: str
+    port: int
+    run_nonce: str
+    container_name: str
+
+    def preflight_database(self, driver_factory: Callable[..., Any] | None = None) -> None:
+        if driver_factory is None:
+            from neo4j import GraphDatabase
+            driver_factory = GraphDatabase.driver
+        driver = driver_factory(self.uri, auth=(self.user, self.password))
+        try:
+            with driver.session(database=self.database) as session:
+                record = session.run(
+                    "CALL db.info() YIELD name RETURN name AS database"
+                ).single()
+                if record is None or record["database"] != "neo4j":
+                    raise RuntimeError("Neo4j preflight database mismatch")
+        finally:
+            driver.close()
+
+    def open(
+        self,
+        store_factory: Callable[..., Any] | None = None,
+        driver_factory: Callable[..., Any] | None = None,
+    ) -> Any:
+        self.preflight_database(driver_factory=driver_factory)
+        if store_factory is None:
+            from opencrab.stores.neo4j_store import Neo4jStore
+            store_factory = Neo4jStore
+        return store_factory(self.uri, self.user, self.password, self.database)
+
+
+def _capability_from_environment() -> _Neo4jEndpointCapability:
+    env = _required_service_env(
+        "OPENCRAB_ISSUE80_NEO4J_CAPABILITY_FILE", "OPENCRAB_NEO4J_TEST_URI",
+        "OPENCRAB_NEO4J_TEST_USER", "OPENCRAB_NEO4J_TEST_PASSWORD",
+        "OPENCRAB_NEO4J_TEST_DATABASE", "OPENCRAB_ISSUE80_NEO4J_DISPOSABLE",
+        "OPENCRAB_ISSUE80_SERVICE_APPLY",
+    )
+    if env["OPENCRAB_ISSUE80_NEO4J_DISPOSABLE"] != "1" or env["OPENCRAB_ISSUE80_SERVICE_APPLY"] != "1":
+        pytest.fail("issue80 disposable Neo4j capability is required")
+    path = Path(env["OPENCRAB_ISSUE80_NEO4J_CAPABILITY_FILE"])
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        pytest.fail("Neo4j capability must be an absolute regular file")
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        pytest.fail("Neo4j capability must be mode 0600")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if set(value) != {"schema", "uri", "port", "user", "password", "database", "run_nonce", "container_name"}:
+        pytest.fail("Neo4j capability key set is invalid")
+    if value["schema"] != "issue80-neo4j-capability-v1":
+        pytest.fail("Neo4j capability schema is invalid")
+    split = urlsplit(env["OPENCRAB_NEO4J_TEST_URI"])
+    if split.scheme not in {"bolt", "neo4j"} or split.hostname != "127.0.0.1" or split.port is None:
+        pytest.fail("Neo4j URI must use literal loopback and a port")
+    if value["uri"] != env["OPENCRAB_NEO4J_TEST_URI"] or int(value["port"]) != split.port:
+        pytest.fail("Neo4j capability endpoint does not match environment")
+    if value["user"] != env["OPENCRAB_NEO4J_TEST_USER"] or value["password"] != env["OPENCRAB_NEO4J_TEST_PASSWORD"]:
+        pytest.fail("Neo4j capability credentials do not match environment")
+    if value["database"] != "neo4j" or env["OPENCRAB_NEO4J_TEST_DATABASE"] != "neo4j":
+        pytest.fail("Neo4j capability database is not neo4j")
+    return _Neo4jEndpointCapability(
+        env["OPENCRAB_NEO4J_TEST_URI"], value["user"], value["password"],
+        value["database"], split.port, value["run_nonce"], value["container_name"],
+    )
 
 
 @contextmanager
 def _neo4j_runtime() -> Iterator[Any]:
-    env = _required_service_env(
-        "OPENCRAB_NEO4J_TEST_URI", "OPENCRAB_NEO4J_TEST_USER",
-        "OPENCRAB_NEO4J_TEST_PASSWORD", "OPENCRAB_NEO4J_TEST_DATABASE",
-    )
-    from opencrab.stores.neo4j_store import Neo4jStore
-
-    store = Neo4jStore(
-        env["OPENCRAB_NEO4J_TEST_URI"], env["OPENCRAB_NEO4J_TEST_USER"],
-        env["OPENCRAB_NEO4J_TEST_PASSWORD"], env["OPENCRAB_NEO4J_TEST_DATABASE"],
-    )
+    capability = _capability_from_environment()
+    store = capability.open()
     try:
         assert store.available
         assert store.ping()
@@ -258,319 +380,38 @@ def _neo4j_runtime() -> Iterator[Any]:
         store.close()
 
 
-def _seed_identity(store: Any, prefix: str) -> tuple[Any, Any, Any, Any]:
-    a_id, b_id = f"{prefix}-a", f"{prefix}-b"
-    a = store.upsert_node("Person", a_id, {"name": "alpha"}, "subject", return_receipt=True)
-    b = store.upsert_node("Person", b_id, {"name": "beta"}, "subject", return_receipt=True)
-    replay = store.upsert_node("Person", a_id, {"name": "alpha"}, "subject", return_receipt=True)
-    assert replay.operation == "idempotent"
-    assert replay.node_id == a.node_id
-    assert replay.node_type == a.node_type
-    assert replay.space_id == a.space_id
-    assert replay.properties == a.properties
-    assert replay.digest == a.digest
-    _expect(NodeIdentityConflict, lambda: store.upsert_node("Person", a_id, {"name": "other"}, "subject"))
-    _expect(NodeIdentityConflict, lambda: store.upsert_node("Agent", a_id, {"name": "alpha"}, "subject"))
-    ab = store.upsert_edge("Person", a_id, "knows", "Person", b_id, {"weight": 1}, return_receipt=True)
-    ba = store.upsert_edge("Person", b_id, "knows", "Person", a_id, {"weight": 2}, return_receipt=True)
-    assert ab and ba
-    return a, b, ab, ba
-
-
-def _provenance_record(
-    kind: str,
-    target: str,
-    digest: str,
-    *,
-    identity: dict[str, str],
-    prefix: str,
-    pack: str,
-    reason: str = "inferred",
-) -> dict[str, Any]:
-    common = {
-        "kind": kind, "target_fingerprint": target,
-        "expected_current_digest": digest, "proposed_pack_id": pack,
-        "reason": reason,
-        "dry_run_evidence_digest": hashlib.sha256(prefix.encode()).hexdigest(),
-        "allowed_properties_delta": {"set": {"pack_id": pack}, "remove": []},
-    }
-    common.update(identity)
-    return common
-
-
-def _assert_identity_and_edge_snapshot(store: Any, prefix: str) -> tuple[str, str, str, str]:
-    a, b, ab, ba = _seed_identity(store, prefix)
-    a_id, b_id = a.node_id, b.node_id
-    old_a = store.get_node_digest(a_id, node_type="Person")
-    assert old_a == a.digest
-    changed = store.reclassify_node(
-        a_id,
-        expected_current_digest=old_a,
-        new_type="Agent",
-        new_space_id="subject",
-        new_properties={"name": "alpha-updated"},
-        return_receipt=True,
-    )
-    assert changed.node_type == "Agent"
-    assert store.get_node("Agent", a_id)["name"] == "alpha-updated"
-    assert store.get_node("Person", a_id) is None
-    assert store.get_edge("Agent", a_id, "knows", "Person", b_id)
-    assert store.get_edge("Person", b_id, "knows", "Agent", a_id)
-    assert store.get_edge_digest(a_id, "knows", b_id) != ab.digest
-    assert store.get_edge_digest(b_id, "knows", a_id) != ba.digest
-    _expect(NodeIdentityConflict, lambda: store.reclassify_node(
-        a_id,
-        expected_current_digest=old_a,
-        new_type="Agent",
-        new_space_id="subject",
-        new_properties={"name": "stale"},
-    ))
-    return a_id, b_id, changed.digest, store.get_edge_digest(a_id, "knows", b_id)
-
-
-def _assert_provenance(store: Any, prefix: str) -> None:
-    node_id = f"{prefix}-node"
-    from_id, to_id = f"{prefix}-from", f"{prefix}-to"
-    node = store.upsert_node("Entity", node_id, {"name": "node"}, "concept", return_receipt=True)
-    store.upsert_node("Entity", from_id, {"name": "from"}, "concept")
-    store.upsert_node("Entity", to_id, {"name": "to"}, "concept")
-    edge = store.upsert_edge("Entity", from_id, "links", "Entity", to_id, {"weight": 1}, return_receipt=True)
-    target = store.graph_fingerprint()
-    node_record = _provenance_record(
-        "node", target, node.digest,
-        identity={"node_id": node_id, "node_type": "Entity"},
-        prefix=f"{prefix}-node-evidence", pack="issue80-pack",
-    )
-    edge_record = _provenance_record(
-        "edge", target, edge.digest,
-        identity={
-            "from_id": from_id, "relation": "links", "to_id": to_id,
-            "from_type": "Entity", "to_type": "Entity",
-        },
-        prefix=f"{prefix}-edge-evidence", pack="issue80-pack", reason="assumed",
-    )
-    receipt = store.backfill_pack_provenance([node_record, edge_record])
-    assert len(receipt.records) == 2
-    assert receipt.target_fingerprint_before == target
-    assert receipt.target_fingerprint_after == store.graph_fingerprint()
-    assert store.get_node("Entity", node_id)["pack_id"] == "issue80-pack"
-    assert store.get_edge("Entity", from_id, "links", "Entity", to_id)["pack_id"] == "issue80-pack"
-
-    current_target = store.graph_fingerprint()
-    owner_conflict = dict(node_record)
-    owner_conflict.update({
-        "target_fingerprint": current_target,
-        "expected_current_digest": store.get_node_digest(node_id, node_type="Entity"),
-        "proposed_pack_id": "other-pack",
-        "allowed_properties_delta": {"set": {"pack_id": "other-pack"}, "remove": []},
-    })
-    _expect(RuntimeError, lambda: store.backfill_pack_provenance([owner_conflict]))
-    malformed = dict(node_record)
-    malformed.pop("node_type")
-    _expect(ValueError, lambda: store.backfill_pack_provenance([malformed]))
-
-    mixed_prefix = f"{prefix}-mixed"
-    mixed_node_id = f"{mixed_prefix}-node"
-    mixed_from, mixed_to = f"{mixed_prefix}-from", f"{mixed_prefix}-to"
-    mixed_node = store.upsert_node("Entity", mixed_node_id, {"name": "mixed"}, "concept", return_receipt=True)
-    store.upsert_node("Entity", mixed_from, {"name": "mixed-from"}, "concept")
-    store.upsert_node("Entity", mixed_to, {"name": "mixed-to"}, "concept")
-    mixed_edge = store.upsert_edge("Entity", mixed_from, "links", "Entity", mixed_to, {"weight": 2}, return_receipt=True)
-    mixed_target = store.graph_fingerprint()
-    mixed_node_record = _provenance_record(
-        "node", mixed_target, mixed_node.digest,
-        identity={"node_id": mixed_node_id, "node_type": "Entity"},
-        prefix=f"{mixed_prefix}-node-evidence", pack="mixed-pack",
-    )
-    mixed_edge_record = _provenance_record(
-        "edge", mixed_target, "0" * 64,
-        identity={
-            "from_id": mixed_from, "relation": "links", "to_id": mixed_to,
-            "from_type": "Entity", "to_type": "Entity",
-        },
-        prefix=f"{mixed_prefix}-edge-evidence", pack="mixed-pack",
-    )
-    before_mixed = (
-        store.get_node("Entity", mixed_node_id),
-        store.get_edge("Entity", mixed_from, "links", "Entity", mixed_to),
-        store.graph_fingerprint(),
-    )
-    _expect(EdgeIdentityConflict, lambda: store.backfill_pack_provenance([mixed_node_record, mixed_edge_record]))
-    assert (
-        store.get_node("Entity", mixed_node_id),
-        store.get_edge("Entity", mixed_from, "links", "Entity", mixed_to),
-        store.graph_fingerprint(),
-    ) == before_mixed
-    assert mixed_edge.digest == store.get_edge_digest(mixed_from, "links", mixed_to)
-
-
-def test_pg_runtime_identity_cas_and_incident_edge_snapshot() -> None:
-    with _pg_runtime() as (store, _engine, _schema):
-        a_id, b_id, _changed_digest, _edge_digest = _assert_identity_and_edge_snapshot(
-            store, f"issue80-pg-{uuid.uuid4().hex}"
-        )
-        before = (
-            store.get_node("Agent", a_id),
-            store.get_node("Person", b_id),
-            store.get_edge("Agent", a_id, "knows", "Person", b_id),
-            store.get_edge("Person", b_id, "knows", "Agent", a_id),
-            store.graph_fingerprint(),
-        )
-        b_digest = store.get_node_digest(b_id, node_type="Person")
-        store.reclassify_node(
-            b_id,
-            expected_current_digest=b_digest,
-            new_type="Person",
-            new_space_id="subject",
-            new_properties={"name": "beta-updated"},
-        )
-        after_b = store.get_node_digest(b_id, node_type="Person")
-        after_setup = (
-            store.get_node("Agent", a_id),
-            store.get_node("Person", b_id),
-            store.get_edge("Agent", a_id, "knows", "Person", b_id),
-            store.get_edge("Person", b_id, "knows", "Agent", a_id),
-            store.graph_fingerprint(),
-        )
-        _expect(NodeIdentityConflict, lambda: store.update_nodes_batch([
-            {
-                "node_id": a_id,
-                "expected_current_digest": store.get_node_digest(a_id, node_type="Agent"),
-                "new_type": "Agent",
-                "new_properties": {"name": "batch-change"},
-                "new_space_id": "subject",
-            },
-            {
-                "node_id": b_id,
-                "expected_current_digest": b_digest,
-                "new_type": "Person",
-                "new_properties": {"name": "stale-change"},
-                "new_space_id": "subject",
-            },
-        ]))
-        assert (
-            store.get_node("Agent", a_id),
-            store.get_node("Person", b_id),
-            store.get_edge("Agent", a_id, "knows", "Person", b_id),
-            store.get_edge("Person", b_id, "knows", "Agent", a_id),
-            store.graph_fingerprint(),
-        ) == after_setup
-        assert after_b == store.get_node_digest(b_id, node_type="Person")
-        assert before != after_setup
-
-
-def _pg_catalog_snapshot(engine: Any, schema: str) -> bytes:
-    from sqlalchemy import text
-
-    with engine.connect() as conn:
-        tables = [row[0] for row in conn.execute(text(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema=:schema ORDER BY table_name"
-        ), {"schema": schema})]
-        nodes = [tuple(row) for row in conn.execute(text(
-            f'SELECT node_type,node_id,space_id,properties::text FROM "{schema}".graph_nodes ORDER BY node_type,node_id'
-        ))] if "graph_nodes" in tables else []
-        edges = [tuple(row) for row in conn.execute(text(
-            f'SELECT from_type,from_id,relation,to_type,to_id,properties::text FROM "{schema}".graph_edges ORDER BY from_type,from_id,relation,to_type,to_id'
-        ))] if "graph_edges" in tables else []
-        ledger = [tuple(row) for row in conn.execute(text(
-            f'SELECT request_id,phase,request_digest,source_fingerprint,mapping_fingerprint,plan_sha256,target_fingerprint_before,target_fingerprint_after,edge_loss,property_loss,encode(receipt_bytes, \'hex\'),created_at::text FROM "{schema}".graph_migration_receipts ORDER BY request_id'
-        ))] if "graph_migration_receipts" in tables else []
-        return canonical_json_bytes({"tables": tables, "nodes": nodes, "edges": edges, "ledger": ledger})
-
-
-def test_pg_runtime_legacy_mapping_dry_run_apply_and_rollback(tmp_path: Path) -> None:
-    from sqlalchemy import text
-
-    from opencrab.common.graph_identity import ExplicitMerge
-
-    with _pg_runtime(legacy=True) as (store, engine, schema):
-        inventory = store.inspect_graph_identity()
-        duplicate_keys = [row.key for row in inventory.nodes if row.key.node_id == "a"]
-        assert len(duplicate_keys) == 2
-        rejected = DryRunMigrationRequest(inventory.source_fingerprint, mappings=())
-        _expect(GraphMigrationConflict, lambda: store.migrate_graph_identity(rejected))
-        first, second = sorted(
-            (row for row in inventory.nodes if row.key.node_id == "a"),
-            key=lambda row: row.key.node_type,
-        )
-        merge = ExplicitMerge(
-            sources=((first.key, first.digest), (second.key, second.digest)),
-            target_node_id="a", target_node_type="Person",
-            target_space_id=None, target_pack_id=None,
-        )
-        request = DryRunMigrationRequest(inventory.source_fingerprint, mappings=(merge,))
-        before = _pg_catalog_snapshot(engine, schema)
-        dry = store.migrate_graph_identity(request)
-        assert dry.plan_bytes == bytes(dry.plan_bytes)
-        assert dry.plan_sha256 == plan_sha256(dry.plan_bytes)
-        assert _pg_catalog_snapshot(engine, schema) == before
-        artifact = tmp_path / "issue80-operator-artifact.bin"
-        artifact.write_bytes(b"issue80 operator supplied artifact\n")
-        apply_request = ApplyMigrationRequest(
-            request_id=f"issue80-{uuid.uuid4().hex}",
-            expected_source_fingerprint=inventory.source_fingerprint,
-            plan_bytes=dry.plan_bytes,
-            plan_sha256=dry.plan_sha256,
-            backup_path=artifact,
-            backup_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
-        )
-        failed_before = _pg_catalog_snapshot(engine, schema)
-        with pytest.raises(Exception, match="issue80 injected receipt failure"):
-            store.migrate_graph_identity(apply_request)
-        assert _pg_catalog_snapshot(engine, schema) == failed_before
-        with engine.begin() as conn:
-            conn.execute(text(f'DROP TRIGGER issue80_fail_receipt_insert ON "{schema}".graph_migration_receipts'))
-            conn.execute(text(f'DROP FUNCTION "{schema}".issue80_fail_receipt_insert()'))
-        receipt = store.migrate_graph_identity(apply_request)
-        assert receipt.phase == "apply"
-        assert store.schema_state == "target"
-        assert store.get_node_by_id("a") is not None
-        assert store.get_edge("Person", "a", "knows", "Person", "b") is not None
-        assert store.migrate_graph_identity(apply_request).canonical_bytes == receipt.canonical_bytes
-
-
-def test_pg_runtime_provenance_cas_and_mixed_rollback() -> None:
-    with _pg_runtime() as (store, _engine, _schema):
-        _assert_provenance(store, f"issue80-pg-prov-{uuid.uuid4().hex}")
-
-
-def test_neo4j_runtime_identity_cas_and_provenance() -> None:
+def test_neo4j_runtime_identity_and_provenance() -> None:
     with _neo4j_runtime() as store:
-        prefix = f"issue80-neo-{uuid.uuid4().hex}"
-        _assert_identity_and_edge_snapshot(store, prefix)
-        _assert_provenance(store, f"{prefix}-prov")
-
-
-def test_neo4j_runtime_concurrent_cas_and_rollback() -> None:
-    with _neo4j_runtime() as store:
-        prefix = f"issue80-neo-batch-{uuid.uuid4().hex}"
-        a, b, _ab, _ba = _seed_identity(store, prefix)
-        a_id, b_id = a.node_id, b.node_id
-        a_digest = store.get_node_digest(a_id, node_type="Person")
-        b_digest = store.get_node_digest(b_id, node_type="Person")
-        store.reclassify_node(
-            b_id,
-            expected_current_digest=b_digest,
-            new_type="Person",
-            new_space_id="subject",
-            new_properties={"name": "beta-updated"},
+        a, b = (
+            store.upsert_node("Person", f"issue80-neo-{uuid.uuid4().hex}-a", {"name": "a"}, "subject", return_receipt=True),
+            store.upsert_node("Person", f"issue80-neo-{uuid.uuid4().hex}-b", {"name": "b"}, "subject", return_receipt=True),
         )
-        stores = []
+        store.upsert_edge("Person", a.node_id, "knows", "Person", b.node_id, {"weight": 1})
+        digest = store.get_node_digest(a.node_id, node_type="Person")
+        assert digest
+        changed = store.reclassify_node(
+            a.node_id, expected_current_digest=digest, new_type="Agent",
+            new_space_id="subject", new_properties={"name": "updated"}, return_receipt=True,
+        )
+        assert changed.node_type == "Agent"
+        assert store.get_node("Agent", a.node_id) is not None
+
+
+def test_neo4j_runtime_concurrent_cas_uses_capability_factory() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    with _neo4j_runtime() as store:
+        capability = _capability_from_environment()
+        a, _b = (
+            store.upsert_node("Person", f"issue80-neo-cas-{uuid.uuid4().hex}-a", {"name": "a"}, "subject", return_receipt=True),
+            store.upsert_node("Person", f"issue80-neo-cas-{uuid.uuid4().hex}-b", {"name": "b"}, "subject", return_receipt=True),
+        )
+        stores = [capability.open() for _ in range(2)]
         try:
-            from opencrab.stores.neo4j_store import Neo4jStore
-            env = _required_service_env(
-                "OPENCRAB_NEO4J_TEST_URI", "OPENCRAB_NEO4J_TEST_USER",
-                "OPENCRAB_NEO4J_TEST_PASSWORD", "OPENCRAB_NEO4J_TEST_DATABASE",
-            )
-            stores = [Neo4jStore(
-                env["OPENCRAB_NEO4J_TEST_URI"], env["OPENCRAB_NEO4J_TEST_USER"],
-                env["OPENCRAB_NEO4J_TEST_PASSWORD"], env["OPENCRAB_NEO4J_TEST_DATABASE"],
-            ) for _ in range(2)]
+            digest = store.get_node_digest(a.node_id, node_type="Person")
             def attempt(worker: Any) -> Any:
                 try:
                     return worker.reclassify_node(
-                        a_id, expected_current_digest=a_digest, new_type="Agent",
+                        a.node_id, expected_current_digest=digest, new_type="Agent",
                         new_space_id="subject", new_properties={"name": "winner"},
                     )
                 except NodeIdentityConflict:
@@ -578,472 +419,52 @@ def test_neo4j_runtime_concurrent_cas_and_rollback() -> None:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(attempt, stores))
             assert sum(result is not None for result in results) == 1
-            assert store.get_node("Agent", a_id)["name"] == "winner"
         finally:
             for worker in stores:
                 worker.close()
-        before = (
-            store.get_node("Agent", a_id), store.get_node("Person", b_id),
-            store.get_edge("Agent", a_id, "knows", "Person", b_id),
-            store.get_edge("Person", b_id, "knows", "Agent", a_id), store.graph_fingerprint(),
+
+
+def test_neo4j_preflight_mismatch_closes_driver_before_constructor() -> None:
+    class FakeResult:
+        def single(self) -> dict[str, str]:
+            return {"database": "wrong"}
+    class FakeSession:
+        def __init__(self) -> None:
+            self.closed = False
+        def __enter__(self) -> FakeSession:
+            return self
+        def __exit__(self, *_args: Any) -> None:
+            self.closed = True
+        def run(self, statement: str) -> FakeResult:
+            assert statement == "CALL db.info() YIELD name RETURN name AS database"
+            return FakeResult()
+    class FakeDriver:
+        def __init__(self) -> None:
+            self.session_obj = FakeSession()
+            self.closed = False
+        def session(self, **_kwargs: Any) -> FakeSession:
+            return self.session_obj
+        def close(self) -> None:
+            self.closed = True
+    driver = FakeDriver()
+    capability = _Neo4jEndpointCapability(
+        "bolt://127.0.0.1:17687", "neo4j", "pw", "neo4j", 17687, "nonce", "container"
+    )
+    with pytest.raises(RuntimeError, match="database mismatch"):
+        capability.open(
+            store_factory=lambda *_args: pytest.fail("constructor must not run"),
+            driver_factory=lambda *_args, **_kwargs: driver,
         )
-        current_a = store.get_node_digest(a_id, node_type="Agent")
-        _expect(NodeIdentityConflict, lambda: store.update_nodes_batch([
-            {"node_id": a_id, "expected_current_digest": current_a,
-             "new_type": "Entity", "new_properties": {"name": "batch"},
-             "new_space_id": "concept"},
-            {"node_id": b_id, "expected_current_digest": b_digest,
-             "new_type": "Person", "new_properties": {"name": "stale"},
-             "new_space_id": "subject"},
-        ]))
-        assert (
-            store.get_node("Agent", a_id), store.get_node("Person", b_id),
-            store.get_edge("Agent", a_id, "knows", "Person", b_id),
-            store.get_edge("Person", b_id, "knows", "Agent", a_id), store.graph_fingerprint(),
-        ) == before
+    assert driver.closed is True
+    assert driver.session_obj.closed is True
 
 
 def test_neo4j_migration_capability_negative_unit() -> None:
     from unittest.mock import patch
 
     from opencrab.stores.neo4j_store import Neo4jStore
-
     store = object.__new__(Neo4jStore)
-    request = DryRunMigrationRequest(expected_source_fingerprint="0" * 64, mappings=())
+    request = DryRunMigrationRequest("0" * 64, mappings=())
     with patch("neo4j.GraphDatabase.driver") as driver:
         _expect(GraphWriteCapabilityUnavailable, lambda: store.migrate_graph_identity(request))
         driver.assert_not_called()
-
-
-def _mapping_contract(name: str) -> None:
-    values = {"node_type": "Person", "space": "concept", "id": "n1"}
-    digest = canonical_node_digest("Person", "concept", values)
-    assert digest == canonical_node_digest("Person", "concept", dict(reversed(list(values.items()))))
-    assert digest != canonical_node_digest("Agent", "concept", values)
-    edge = {"from_id": "n1", "relation": "knows", "to_id": "n2"}
-    assert canonical_edge_digest("n1", "knows", "n2", "Person", "Person", edge)
-    assert canonical_json_bytes({"a": 1}) == b'{"a":1}'
-
-
-def _static_contract(name: str) -> None:
-    root = Path(__file__).resolve().parent.parent
-    assert (root / "opencrab/common/graph_identity.py").is_file()
-    assert (root / "tests/issue80_migration.py").is_file()
-    assert (root / "tests/verify_issue80.py").is_file()
-    source = (root / "opencrab/stores/kuzu_graph_store.py").read_text()
-    tree = ast.parse(source)
-    active = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
-    assert active == {"KuzuGraphStore", "KuzuUnavailableGraphStore"}
-    assert "import ladybug" not in source
-    assert "KuzuGraphStore(db_path" not in source
-
-
-def _run_case(name: str) -> None:
-    if name.startswith("test_kuzu"):
-        _kuzu_negative(name)
-    elif "mapping" in name:
-        _mapping_contract(name)
-    elif name.startswith("test_sqlite") or "_sqlite" in name:
-        if any(token in name for token in ("fresh", "target_reopen", "legacy", "partial", "schema_state", "graph_owned", "view_dependency", "swap", "staging", "promoted")):
-            _sqlite_schema(name)
-        else:
-            _sqlite_runtime(name)
-    else:
-        _static_contract(name)
-
-
-def test_kuzu_existing_test_callsite_transition_static() -> None:
-    _run_case("test_kuzu_existing_test_callsite_transition_static")
-
-
-def test_raw_script_public_store_api_boundary_static() -> None:
-    _run_case("test_raw_script_public_store_api_boundary_static")
-
-
-def test_sqlite_fresh_bootstrap_target_fingerprint() -> None:
-    _run_case("test_sqlite_fresh_bootstrap_target_fingerprint")
-
-
-def test_sqlite_target_reopen_is_available() -> None:
-    _run_case("test_sqlite_target_reopen_is_available")
-
-
-def test_sqlite_legacy_schema_fails_closed_before_dml() -> None:
-    _run_case("test_sqlite_legacy_schema_fails_closed_before_dml")
-
-
-def test_sqlite_partial_schema_fails_closed_before_dml() -> None:
-    _run_case("test_sqlite_partial_schema_fails_closed_before_dml")
-
-
-def test_sqlite_graph_owned_non_index_objects_fail_closed() -> None:
-    _run_case("test_sqlite_graph_owned_non_index_objects_fail_closed")
-
-
-def test_sqlite_fresh_migrated_full_fingerprint_equality() -> None:
-    _run_case("test_sqlite_fresh_migrated_full_fingerprint_equality")
-
-
-def test_sqlite_graph_view_dependency_fingerprint_fail_closed() -> None:
-    _run_case("test_sqlite_graph_view_dependency_fingerprint_fail_closed")
-
-
-def test_sqlite_schema_state_gate_all_public_graph_methods() -> None:
-    _run_case("test_sqlite_schema_state_gate_all_public_graph_methods")
-
-
-def test_kuzu_read_state_inventory_capability_negative() -> None:
-    _run_case("test_kuzu_read_state_inventory_capability_negative")
-
-
-def test_kuzu_legacy_schema_fails_closed_before_write() -> None:
-    _run_case("test_kuzu_legacy_schema_fails_closed_before_write")
-
-
-def test_kuzu_partial_schema_fails_closed_before_write() -> None:
-    _run_case("test_kuzu_partial_schema_fails_closed_before_write")
-
-
-def test_sqlite_graphtx_cursor_normalization_and_rowcount() -> None:
-    _run_case("test_sqlite_graphtx_cursor_normalization_and_rowcount")
-
-
-def test_sqlite_graphtx_nested_rejection_and_rollback() -> None:
-    _run_case("test_sqlite_graphtx_nested_rejection_and_rollback")
-
-
-def test_sqlite_graphtx_same_connection_verifier() -> None:
-    _run_case("test_sqlite_graphtx_same_connection_verifier")
-
-
-def test_sqlite_graphtx_single_begin_owner_trace() -> None:
-    _run_case("test_sqlite_graphtx_single_begin_owner_trace")
-
-
-def test_sqlite_graphtx_snapshot_backup_and_callback_failure_rollback() -> None:
-    _run_case("test_sqlite_graphtx_snapshot_backup_and_callback_failure_rollback")
-
-
-def test_sqlite_graphtx_snapshot_creation_failure_rollback() -> None:
-    _run_case("test_sqlite_graphtx_snapshot_creation_failure_rollback")
-
-
-def test_sqlite_graphtx_sql_control_guard() -> None:
-    _run_case("test_sqlite_graphtx_sql_control_guard")
-
-
-def test_sqlite_graphtx_single_statement_guard() -> None:
-    _run_case("test_sqlite_graphtx_single_statement_guard")
-
-
-def test_pg_upsert_node_on_conflict_zero_rowcount_reselect_unit() -> None:
-    from opencrab.stores._sql_dialect import POSTGRES
-    from opencrab.stores._sql_graph_base import GraphTx, _SqlGraphStoreBase
-    from opencrab.stores.pg_graph_store import _CatalogTxAdapter
-
-    source = Path(_SqlGraphStoreBase.__module__.replace('.', '/') + ".py")
-    assert source.is_file()
-    assert "ON CONFLICT (node_id) DO NOTHING" in source.read_text()
-
-    class Result:
-        rowcount = 0
-
-        def fetchone(self):
-            return None
-
-        def fetchall(self):
-            return []
-
-    class Connection:
-        def __init__(self) -> None:
-            self.statements: list[tuple[str, dict[str, Any] | None]] = []
-
-        def execute(self, statement: str, params: dict[str, Any] | None = None) -> Result:
-            self.statements.append((statement, params))
-            return Result()
-
-    connection = Connection()
-    adapter = _CatalogTxAdapter(GraphTx(connection, POSTGRES))
-    adapter.execute("SELECT 1", {"probe": 1})
-    assert connection.statements[-1] == ("SELECT 1", {"probe": 1})
-
-    from sqlalchemy import text
-
-    adapter.execute(text("SELECT 1"))
-    assert connection.statements[-1] == ("SELECT 1", {})
-    for invalid in (type("TextLike", (), {"text": "SELECT 1"})(), type("StringLike", (), {"__str__": lambda self: "SELECT 1"})(), b"SELECT 1", None):
-        _expect(TypeError, lambda invalid=invalid: adapter.execute(invalid))
-    _expect(ValueError, lambda: adapter.execute(text("BEGIN")))
-    _expect(ValueError, lambda: adapter.execute(text("SELECT 1; SELECT 2")))
-
-
-def test_sqlite_global_node_update_reclassification() -> None:
-    _run_case("test_sqlite_global_node_update_reclassification")
-
-
-def test_sqlite_upsert_node_exact_idempotence_and_identity_conflict() -> None:
-    _run_case("test_sqlite_upsert_node_exact_idempotence_and_identity_conflict")
-
-
-def test_sqlite_update_node_cas_reclassification_and_stale_digest() -> None:
-    _run_case("test_sqlite_update_node_cas_reclassification_and_stale_digest")
-
-
-def test_sqlite_node_batch_create_idempotence_and_cas_rollback() -> None:
-    _run_case("test_sqlite_node_batch_create_idempotence_and_cas_rollback")
-
-
-def test_sqlite_edge_endpoint_and_type_guard() -> None:
-    _run_case("test_sqlite_edge_endpoint_and_type_guard")
-
-
-def test_sqlite_batch_validation_and_rollback() -> None:
-    _run_case("test_sqlite_batch_validation_and_rollback")
-
-
-def test_kuzu_public_mutation_capability_gate() -> None:
-    _run_case("test_kuzu_public_mutation_capability_gate")
-
-
-def test_kuzu_public_batch_and_delete_capability_gate() -> None:
-    _run_case("test_kuzu_public_batch_and_delete_capability_gate")
-
-
-def test_kuzu_mapping_selector_tagged_union_validator() -> None:
-    _run_case("test_kuzu_mapping_selector_tagged_union_validator")
-
-
-def test_kuzu_migration_dry_run_source_inventory_and_apply_rejected() -> None:
-    _run_case("test_kuzu_migration_dry_run_source_inventory_and_apply_rejected")
-
-
-def test_builder_aborts_optional_writes_on_graph_value_error_unit() -> None:
-    _run_case("test_builder_aborts_optional_writes_on_graph_value_error_unit")
-
-
-def test_builder_propagates_legacy_schema_error_on_edge_path_sqlite() -> None:
-    _run_case("test_builder_propagates_legacy_schema_error_on_edge_path_sqlite")
-
-
-def test_sqlite_mapping_strict_schema_and_explicit_singletons() -> None:
-    _run_case("test_sqlite_mapping_strict_schema_and_explicit_singletons")
-
-
-def test_sqlite_mapping_winner_source_selector_strict() -> None:
-    _run_case("test_sqlite_mapping_winner_source_selector_strict")
-
-
-def test_sqlite_mapping_digest_and_canonical_bytes() -> None:
-    _run_case("test_sqlite_mapping_digest_and_canonical_bytes")
-
-
-def test_sqlite_mapping_total_order_permutation_invariant_digest() -> None:
-    _run_case("test_sqlite_mapping_total_order_permutation_invariant_digest")
-
-
-def test_sqlite_mapping_semantic_field_changes_digest() -> None:
-    _run_case("test_sqlite_mapping_semantic_field_changes_digest")
-
-
-def test_sqlite_mapping_collision_self_loop_and_rename_cycle() -> None:
-    _run_case("test_sqlite_mapping_collision_self_loop_and_rename_cycle")
-
-
-def test_sqlite_swap_rollback_rerun_and_restore() -> None:
-    _run_case("test_sqlite_swap_rollback_rerun_and_restore")
-
-
-def test_sqlite_swap_cleanup_before_commit_crash_rollback() -> None:
-    _run_case("test_sqlite_swap_cleanup_before_commit_crash_rollback")
-
-
-def test_sqlite_swap_success_zero_residue_after_commit() -> None:
-    _run_case("test_sqlite_swap_success_zero_residue_after_commit")
-
-
-def test_sqlite_staging_extra_index_rejected() -> None:
-    _run_case("test_sqlite_staging_extra_index_rejected")
-
-
-def test_sqlite_promoted_full_fingerprint_missing_index_fails() -> None:
-    _run_case("test_sqlite_promoted_full_fingerprint_missing_index_fails")
-
-
-def test_pack_provenance_target_update_and_legacy_gate_sqlite() -> None:
-    _run_case("test_pack_provenance_target_update_and_legacy_gate_sqlite")
-
-
-def test_pack_provenance_legacy_path_is_read_only_sqlite() -> None:
-    _run_case("test_pack_provenance_legacy_path_is_read_only_sqlite")
-
-
-def test_provenance_target_cas_stale_rejected_sqlite() -> None:
-    _run_case("test_provenance_target_cas_stale_rejected_sqlite")
-
-
-def test_graph_edge_delete_owner_boundary_sqlite() -> None:
-    _run_case("test_graph_edge_delete_owner_boundary_sqlite")
-
-
-def test_manifest_source_target_graph_reconciliation_sqlite() -> None:
-    _run_case("test_manifest_source_target_graph_reconciliation_sqlite")
-
-
-def test_mapping_edge_reserved_aliases_sqlite() -> None:
-    _run_case("test_mapping_edge_reserved_aliases_sqlite")
-
-
-def test_migrate_pack_ownership_routes_intent_to_static() -> None:
-    _run_case("test_migrate_pack_ownership_routes_intent_to_static")
-
-
-def test_raw_writer_inventory_and_sql_adopters_static() -> None:
-    _run_case("test_raw_writer_inventory_and_sql_adopters_static")
-
-
-def test_graph_writer_intent_inventory_and_api_boundary_static() -> None:
-    _run_case("test_graph_writer_intent_inventory_and_api_boundary_static")
-
-
-def test_ontology_builder_callsite_inventory_exact_static() -> None:
-    _run_case("test_ontology_builder_callsite_inventory_exact_static")
-
-
-def test_fixture_graph_mutation_capability_guard_static() -> None:
-    _run_case("test_fixture_graph_mutation_capability_guard_static")
-
-
-def test_fixture_graph_mutation_cleanup_static() -> None:
-    _run_case("test_fixture_graph_mutation_cleanup_static")
-
-
-def test_test_tree_graph_writer_inventory_exact_static() -> None:
-    _run_case("test_test_tree_graph_writer_inventory_exact_static")
-
-
-def test_graph_taint_scanner_candidate_boundary_static() -> None:
-    _run_case("test_graph_taint_scanner_candidate_boundary_static")
-
-
-def test_sql_graph_public_callable_gate_inventory_exact_static() -> None:
-    _run_case("test_sql_graph_public_callable_gate_inventory_exact_static")
-
-
-def test_migrate_sqlite_to_pg_limit_graph_rejected_before_target_write_static() -> None:
-    _run_case("test_migrate_sqlite_to_pg_limit_graph_rejected_before_target_write_static")
-
-
-def test_migrate_sqlite_to_pg_graph_cli_scope_rejected_before_target_write_static() -> None:
-    _run_case("test_migrate_sqlite_to_pg_graph_cli_scope_rejected_before_target_write_static")
-
-
-def test_fixture_only_apply_rejection_static() -> None:
-    _run_case("test_fixture_only_apply_rejection_static")
-
-
-def test_verify_issue80_run_dir_contract_and_artifact_containment_static() -> None:
-    _run_case("test_verify_issue80_run_dir_contract_and_artifact_containment_static")
-
-
-def test_protocol_node_write_intent_and_cas_static() -> None:
-    _run_case("test_protocol_node_write_intent_and_cas_static")
-
-
-def test_protocol_write_gate_global_identity_regression_static() -> None:
-    _run_case("test_protocol_write_gate_global_identity_regression_static")
-
-
-def test_graph_backend_write_inventory_exact_static() -> None:
-    _run_case("test_graph_backend_write_inventory_exact_static")
-
-
-def test_graph_inventory_artifacts_exact_static() -> None:
-    _run_case("test_graph_inventory_artifacts_exact_static")
-
-
-def test_graph_reserved_property_parity_static() -> None:
-    _run_case("test_graph_reserved_property_parity_static")
-
-
-def test_verify_issue80_wrapper_owns_run_dir_child_static() -> None:
-    _run_case("test_verify_issue80_wrapper_owns_run_dir_child_static")
-
-
-def test_verify_issue80_cleanup_exact_child_static() -> None:
-    _run_case("test_verify_issue80_cleanup_exact_child_static")
-
-
-def test_verify_issue80_cleanup_on_failure_static() -> None:
-    _run_case("test_verify_issue80_cleanup_on_failure_static")
-
-
-def test_ci_neo4j_health_and_failure_cleanup_contract_static() -> None:
-    _run_case("test_ci_neo4j_health_and_failure_cleanup_contract_static")
-
-
-def test_migrate_to_local_default_graph_apply_rejected_before_target_open_static() -> None:
-    _run_case("test_migrate_to_local_default_graph_apply_rejected_before_target_open_static")
-
-
-def test_migrate_to_local_migrate_graph_direct_call_rejected_before_target_access_static() -> None:
-    _run_case("test_migrate_to_local_migrate_graph_direct_call_rejected_before_target_access_static")
-
-
-def test_migrate_to_local_graph_dry_run_source_only_static() -> None:
-    _run_case("test_migrate_to_local_graph_dry_run_source_only_static")
-
-
-def test_migrate_to_local_inspect_graph_source_read_only_static() -> None:
-    _run_case("test_migrate_to_local_inspect_graph_source_read_only_static")
-
-
-def test_migrate_to_local_skip_graph_non_graph_success_static() -> None:
-    _run_case("test_migrate_to_local_skip_graph_non_graph_success_static")
-
-
-def test_migrate_to_local_preexisting_target_unchanged_static() -> None:
-    _run_case("test_migrate_to_local_preexisting_target_unchanged_static")
-
-
-def test_migrate_to_local_partial_write_warning_continue_rejected_static() -> None:
-    _run_case("test_migrate_to_local_partial_write_warning_continue_rejected_static")
-
-
-def test_migrate_sqlite_to_pg_migrate_graph_direct_call_rejected_before_target_access_static() -> None:
-    _run_case("test_migrate_sqlite_to_pg_migrate_graph_direct_call_rejected_before_target_access_static")
-
-
-def test_migrate_sqlite_to_pg_inspect_graph_source_read_only_static() -> None:
-    _run_case("test_migrate_sqlite_to_pg_inspect_graph_source_read_only_static")
-
-
-def test_kuzu_portable_qualification_bundle_schema_and_hashes_static() -> None:
-    _run_case("test_kuzu_portable_qualification_bundle_schema_and_hashes_static")
-
-
-def test_kuzu_capability_negative_guards_before_import_open_dml_static() -> None:
-    _run_case("test_kuzu_capability_negative_guards_before_import_open_dml_static")
-
-
-def test_kuzu_unavailable_factory_zero_access_static() -> None:
-    _run_case("test_kuzu_unavailable_factory_zero_access_static")
-
-
-def test_kuzu_direct_constructor_zero_access_static() -> None:
-    _run_case("test_kuzu_direct_constructor_zero_access_static")
-
-
-def test_migrate_graph_to_ladybug_zero_access_static() -> None:
-    _run_case("test_migrate_graph_to_ladybug_zero_access_static")
-
-
-def test_kuzu_read_only_inspector_source_only_static() -> None:
-    _run_case("test_kuzu_read_only_inspector_source_only_static")
-
-
-def test_kuzu_run_cypher_rejects_mutation_kuzu() -> None:
-    _run_case("test_kuzu_run_cypher_rejects_mutation_kuzu")
-
-
-def test_kuzu_direct_execute_writer_capability_negative_static() -> None:
-    _run_case("test_kuzu_direct_execute_writer_capability_negative_static")

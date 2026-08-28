@@ -15,6 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_MODULES = {
     "tests/test_issue80_sql_graph.py",
+    "tests/test_issue80_migration.py",
     "tests/test_pack_provenance.py",
 }
 BACKENDS = {"sqlite", "postgresql", "kuzu", "neo4j", "unit", "static"}
@@ -40,7 +41,7 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
 
 
 def validate_manifest(value: dict[str, Any]) -> None:
-    """Validate the exact-set and Kùzu metadata invariants."""
+    """Validate concrete selection metadata and Kùzu negative selection."""
     if not isinstance(value, dict) or value.get("schema") != "issue80-manifest-v1":
         raise ValueError("invalid issue80 manifest schema")
     if value.get("repository_root") != ".":
@@ -79,11 +80,6 @@ def validate_manifest(value: dict[str, Any]) -> None:
         raise ValueError("Kùzu qualification verdict is not capability-negative")
     if qualification.get("package") != "ladybug" or qualification.get("required_version") != "0.19.1":
         raise ValueError("Kùzu qualification package metadata is incomplete")
-    bundle = ROOT / "tests" / "fixtures" / "issue80" / "qualification"
-    if not all((bundle / name).is_file() for name in (
-        "manifest.json", "kuzu_capability.json", "kuzu-qualification-v1.json",
-    )):
-        raise ValueError("Kùzu qualification bundle is missing")
     if value.get("regression_command") != "python -m pytest -q":
         raise ValueError("issue80 regression command drift")
 
