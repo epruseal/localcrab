@@ -175,6 +175,107 @@ def _pg_count(dsn: str, table: str) -> int:
         engine.dispose()
 
 
+def _sqlite_artifacts(path: str | Path) -> dict[str, dict[str, Any]]:
+    """Capture only SQLite file bytes and hashes, without opening SQLite."""
+    db_path = Path(path)
+    candidates = (
+        db_path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+    )
+    artifacts: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            payload = candidate.read_bytes()
+            artifacts[candidate.name] = {
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        except FileNotFoundError:
+            # A SQLite sidecar may disappear between is_file() and read_bytes().
+            continue
+    return artifacts
+
+
+def _assert_sqlite_artifacts_unchanged(
+    path: str | Path,
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+    *,
+    label: str,
+) -> None:
+    main_name = Path(path).name
+    assert main_name in before, f"{label}: main SQLite DB was absent before the run"
+    assert main_name in after, f"{label}: main SQLite DB disappeared after the run"
+    assert before[main_name] == after[main_name], (
+        f"{label}: main SQLite DB bytes/SHA changed: "
+        f"before={before[main_name]!r} after={after[main_name]!r}"
+    )
+
+    common_sidecars = (set(before) & set(after)) - {main_name}
+    changed_sidecars = {
+        name: {"before": before[name], "after": after[name]}
+        for name in sorted(common_sidecars)
+        if before[name] != after[name]
+    }
+    created = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    if created or removed:
+        print(
+            f"# [{label}] SQLite sidecar raw evidence: "
+            f"created={created!r} removed={removed!r} "
+            "cause=sidecar-set-lifecycle (not a source-write verdict)"
+        )
+    assert not changed_sidecars, (
+        f"{label}: common SQLite sidecar bytes/SHA changed: {changed_sidecars!r}"
+    )
+
+
+def _pg_schema_snapshot(dsn: str) -> dict[str, Any]:
+    """Read the target schema catalog and the seeded auth sentinel only."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(dsn)
+    try:
+        with engine.connect() as conn:
+            relations = tuple(
+                (row[0], row[1])
+                for row in conn.execute(text(
+                    "SELECT c.relname, c.relkind "
+                    "FROM pg_class AS c "
+                    "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = current_schema() "
+                    "ORDER BY c.relkind, c.relname"
+                ))
+            )
+            relation_names = {name for name, _kind in relations}
+            users = None
+            if "users" in relation_names:
+                users = tuple(
+                    tuple(row)
+                    for row in conn.execute(text(
+                        "SELECT user_id, display_name, is_local, disabled, created_at "
+                        "FROM users ORDER BY user_id"
+                    ))
+                )
+            return {"relations": relations, "users": users}
+    finally:
+        engine.dispose()
+
+
+def _assert_pg_schema_unchanged(
+    before: dict[str, Any], after: dict[str, Any], *, label: str
+) -> None:
+    assert after == before, f"{label}: target catalog/users snapshot changed"
+    relation_names = {name for name, _kind in after["relations"]}
+    assert relation_names.isdisjoint(
+        {"api_tokens", "packs", "doc_nodes", "doc_sources", "audit_log"}
+    )
+
+
 def _run_forward(monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
     monkeypatch.setattr(sys, "argv", ["migrate_sqlite_to_pg.py", *argv])
     return fwd.main()
@@ -1210,44 +1311,46 @@ class TestTargetOnlyCredentials:
             engine.dispose()
 
     def test_forward_refuses_before_any_store_is_written(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        pg_schema_dsn: str,
+        capsys: pytest.CaptureFixture,
     ) -> None:
-        """With the default --only the graph and doc stores are copied first, so
-        a refusal raised inside migrate_sql would arrive after two target stores
-        had already been modified -- and nothing backs the target up here."""
-        from sqlalchemy import create_engine, inspect
-
+        """Target-only credentials stop SQL before its downstream migration."""
         db = str(tmp_path / "opencrab.db")
         _sqlite_source(db)
         _seed_auth_rows(db)
-        graph_db = str(tmp_path / "graph.db")
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        graph = LocalGraphStore(db_path=graph_db)
-        graph.upsert_node("Person", "n1", {"name": "x"})
-        graph.close()
+        source_before = _sqlite_artifacts(db)
         self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+        target_before = _pg_schema_snapshot(pg_schema_dsn)
+        sql_calls: list[tuple[Any, ...]] = []
 
-        # --pg-schema too: graph/doc take a schema argument while the SQL store
-        # writes through the connection's search_path, so without it the graph
-        # tables would land in public -- shared with every other test.
-        schema = pg_schema_dsn.rsplit("%3D", 1)[1]
-        rc = _run_forward(
-            monkeypatch,
-            "--sql-db", db,
-            "--graph-db", graph_db,
-            "--only", "graph,sql",
-            "--pg-url", pg_schema_dsn,
-            "--pg-schema", schema,
-        )
+        def _poison_sql(
+            db_path: str,
+            engine: Any,
+            pg_url: str,
+            batch: int,
+            limit: int | None,
+            dry_run: bool,
+            allow_target_only_auth: bool = False,
+        ) -> dict[str, int | None]:
+            sql_calls.append((db_path, engine, pg_url, batch, limit, dry_run, allow_target_only_auth))
+            raise AssertionError("migrate_sql must not run")
+
+        monkeypatch.setattr(fwd, "migrate_sql", _poison_sql)
+
+        rc = _run_forward(monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn)
+        out = capsys.readouterr().out
         assert rc == 2
-        engine = create_engine(pg_schema_dsn)
-        try:
-            assert not inspect(engine, raiseerr=True).has_table("graph_nodes", schema=schema), (
-                "the graph store must not have been written before the refusal"
-            )
-        finally:
-            engine.dispose()
+        assert "u-stranger" in out
+        assert sql_calls == []
+        _assert_sqlite_artifacts_unchanged(
+            db, source_before, _sqlite_artifacts(db), label="target-only SQL guard"
+        )
+        _assert_pg_schema_unchanged(
+            target_before, _pg_schema_snapshot(pg_schema_dsn), label="target-only SQL guard"
+        )
 
     def test_forward_flag_allows_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
@@ -1506,42 +1609,143 @@ class TestTargetOnlyCredentials:
                 engine.dispose()
 
     def test_forward_guard_failure_stops_before_any_store(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        pg_schema_dsn: str,
+        capsys: pytest.CaptureFixture,
     ) -> None:
-        """A guard that cannot finish leaves the question unanswered. Carrying on
-        would let the graph and doc stores be written before migrate_sql repeats
-        the check -- the partial write the hoist exists to prevent."""
-        from sqlalchemy import create_engine, inspect
-
+        """An auth probe error stops all downstream stores before any write."""
         db = str(tmp_path / "opencrab.db")
         _sqlite_source(db)
         _seed_auth_rows(db)
-        graph_db = str(tmp_path / "graph.db")
-        from opencrab.stores.local_graph_store import LocalGraphStore
+        source_before = _sqlite_artifacts(db)
+        self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+        target_before = _pg_schema_snapshot(pg_schema_dsn)
+        auth_calls: list[tuple[Any, ...]] = []
+        sql_calls: list[tuple[Any, ...]] = []
 
-        graph = LocalGraphStore(db_path=graph_db)
-        graph.upsert_node("Person", "n1", {"name": "x"})
-        graph.close()
-
-        def _boom(_engine: object, _path: str) -> None:
+        def _poison_auth(engine: Any, sql_db_path: str) -> None:
+            auth_calls.append((engine, sql_db_path))
             raise RuntimeError("catalogue unreadable")
 
-        monkeypatch.setattr(fwd, "check_target_only_auth", _boom)
+        def _poison_sql(
+            db_path: str,
+            engine: Any,
+            pg_url: str,
+            batch: int,
+            limit: int | None,
+            dry_run: bool,
+            allow_target_only_auth: bool = False,
+        ) -> dict[str, int | None]:
+            sql_calls.append((db_path, engine, pg_url, batch, limit, dry_run, allow_target_only_auth))
+            raise AssertionError("migrate_sql must not run")
+
+        monkeypatch.setattr(fwd, "check_target_only_auth", _poison_auth)
+        monkeypatch.setattr(fwd, "migrate_sql", _poison_sql)
+        rc = _run_forward(monkeypatch, "--sql-db", db, "--only", "sql", "--pg-url", pg_schema_dsn)
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "credential guard could not run" in out
+        assert len(auth_calls) == 1
+        assert sql_calls == []
+        _assert_sqlite_artifacts_unchanged(
+            db, source_before, _sqlite_artifacts(db), label="probe-error SQL guard"
+        )
+        _assert_pg_schema_unchanged(
+            target_before, _pg_schema_snapshot(pg_schema_dsn), label="probe-error SQL guard"
+        )
+
+    @pytest.mark.parametrize("guard_case", ("target-only", "probe-error"))
+    def test_forward_doc_and_sql_guard_stops_before_any_store(
+        self,
+        guard_case: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        pg_schema_dsn: str,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Both selected stores remain untouched when the shared guard stops."""
+        sql_db = str(tmp_path / "opencrab.db")
+        _sqlite_source(sql_db)
+        _seed_auth_rows(sql_db)
+        doc_db = str(tmp_path / "doc_store.db")
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(doc_db)
+        assert docs.available
+        docs.upsert_node_doc("subject", "Person", "doc-1", {"name": "source"})
+        docs.upsert_source("src-1", "source text", {"node_id": "doc-1"})
+        docs.log_event("issue80-fixture", "doc-1", {"source": "fixture"})
+        docs.close()
+        sql_before = _sqlite_artifacts(sql_db)
+        doc_before = _sqlite_artifacts(doc_db)
+        self._seed_pg_users(pg_schema_dsn, [("u-stranger", False)])
+        target_before = _pg_schema_snapshot(pg_schema_dsn)
+        doc_calls: list[tuple[Any, ...]] = []
+        sql_calls: list[tuple[Any, ...]] = []
+
+        def _poison_doc(
+            db_path: str,
+            engine: Any,
+            schema: str,
+            batch: int,
+            limit: int | None,
+            dry_run: bool,
+        ) -> dict[str, int]:
+            doc_calls.append((db_path, engine, schema, batch, limit, dry_run))
+            raise AssertionError("migrate_doc must not run")
+
+        def _poison_sql(
+            db_path: str,
+            engine: Any,
+            pg_url: str,
+            batch: int,
+            limit: int | None,
+            dry_run: bool,
+            allow_target_only_auth: bool = False,
+        ) -> dict[str, int | None]:
+            sql_calls.append((db_path, engine, pg_url, batch, limit, dry_run, allow_target_only_auth))
+            raise AssertionError("migrate_sql must not run")
+
+        monkeypatch.setattr(fwd, "migrate_doc", _poison_doc)
+        monkeypatch.setattr(fwd, "migrate_sql", _poison_sql)
+        auth_calls: list[tuple[Any, ...]] = []
+        if guard_case == "probe-error":
+            def _poison_auth(engine: Any, sql_db_path: str) -> None:
+                auth_calls.append((engine, sql_db_path))
+                raise RuntimeError("catalogue unreadable")
+
+            monkeypatch.setattr(fwd, "check_target_only_auth", _poison_auth)
+
         schema = pg_schema_dsn.rsplit("%3D", 1)[1]
         rc = _run_forward(
             monkeypatch,
-            "--sql-db", db,
-            "--graph-db", graph_db,
-            "--only", "graph,sql",
+            "--doc-db", doc_db,
+            "--sql-db", sql_db,
+            "--only", "doc,sql",
             "--pg-url", pg_schema_dsn,
             "--pg-schema", schema,
         )
-        assert rc != 0
-        engine = create_engine(pg_schema_dsn)
-        try:
-            assert not inspect(engine).has_table("graph_nodes", schema=schema)
-        finally:
-            engine.dispose()
+        out = capsys.readouterr().out
+        expected_rc = 2 if guard_case == "target-only" else 1
+        assert rc == expected_rc
+        if guard_case == "target-only":
+            assert "u-stranger" in out
+        else:
+            assert "credential guard could not run" in out
+            assert len(auth_calls) == 1
+        assert doc_calls == []
+        assert sql_calls == []
+        _assert_sqlite_artifacts_unchanged(
+            sql_db, sql_before, _sqlite_artifacts(sql_db), label=f"{guard_case} SQL source"
+        )
+        _assert_sqlite_artifacts_unchanged(
+            doc_db, doc_before, _sqlite_artifacts(doc_db), label=f"{guard_case} doc source"
+        )
+        _assert_pg_schema_unchanged(
+            target_before, _pg_schema_snapshot(pg_schema_dsn), label=f"{guard_case} target"
+        )
 
     def test_reverse_validates_every_schema_before_writing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str

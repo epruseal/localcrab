@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import stat
+import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator
@@ -27,6 +28,7 @@ import pytest
 from opencrab.common.graph_identity import (
     DryRunMigrationRequest,
     EdgeIdentityConflict,
+    GraphMigrationFixtureOnlyError,
     GraphQueryWriteRejected,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
@@ -39,10 +41,46 @@ from opencrab.stores.kuzu_graph_store import KuzuGraphStore, KuzuUnavailableGrap
 from opencrab.stores.local_graph_store import LocalGraphStore
 from tests.issue80_migration import FixtureHandle
 
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+import migrate_sqlite_to_pg as fwd  # noqa: E402
+
 
 def _expect(exc_type: type[BaseException], callback: Callable[[], Any]) -> None:
     with pytest.raises(exc_type):
         callback()
+
+
+def test_migrate_sqlite_to_pg_graph_apply_refuses_before_target_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Graph apply fails before constructing a target or probing credentials."""
+    import sqlalchemy
+
+    engine_calls: list[tuple[Any, ...]] = []
+    auth_calls: list[tuple[Any, ...]] = []
+
+    def _poison_engine(*args: Any, **kwargs: Any) -> Any:
+        engine_calls.append((args, kwargs))
+        raise AssertionError("create_engine must not run")
+
+    def _poison_auth(engine: Any, sql_db_path: str) -> None:
+        auth_calls.append((engine, sql_db_path))
+        raise AssertionError("check_target_only_auth must not run")
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", _poison_engine)
+    monkeypatch.setattr(fwd, "check_target_only_auth", _poison_auth)
+    monkeypatch.setattr(sys, "argv", [
+        "migrate_sqlite_to_pg.py",
+        "--data-dir", str(tmp_path / "does-not-exist"),
+        "--only", "graph,sql",
+        "--pg-url", "postgresql://127.0.0.1:59999/issue80_test",
+    ])
+
+    with pytest.raises(GraphMigrationFixtureOnlyError, match="fixture-only"):
+        fwd.main()
+    assert engine_calls == []
+    assert auth_calls == []
 
 
 def test_sqlite_identity_and_edge_cas_actual() -> None:

@@ -72,6 +72,12 @@
       "selection": "ordinary"
     },
     {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_graph_apply_refuses_before_target_access",
+      "backend": "unit",
+      "phase": "guards",
+      "selection": "ordinary"
+    },
+    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_capability_and_writer_ast_inventory_actual",
       "backend": "kuzu",
       "phase": "guards",
