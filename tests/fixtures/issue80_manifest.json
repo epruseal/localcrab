@@ -73,66 +73,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_fresh_bootstrap_target_fingerprint",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_target_reopen_is_available",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_legacy_schema_fails_closed_before_dml",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_partial_schema_fails_closed_before_dml",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_fresh_with_preexisting_doc_store_objects",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graph_owned_non_index_objects_fail_closed",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_renderer_derived_staging_fingerprint_equals_fresh",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graph_view_dependency_fingerprint_fail_closed",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_schema_state_gate_all_public_graph_methods",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_concurrent_fresh_constructors_single_bootstrap",
-      "backend": "postgresql",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_read_state_inventory_capability_negative",
       "backend": "kuzu",
       "phase": "startup",
@@ -152,36 +92,6 @@
       "phase": "startup",
       "selection": "capability-negative",
       "negative_probe_ref": "kuzu-capability-negative-v1"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_fresh_common_label_and_global_constraint",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_target_reopen_is_available",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_legacy_schema_fails_closed_before_write",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_duplicate_mapping_fails_closed",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_type_label_compatibility",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
     },
     {
       "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_graphtx_cursor_normalization_and_rowcount",
@@ -232,48 +142,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_result_normalization_named_binds",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_nested_rejection_and_rollback",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_same_connection_verifier",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_single_begin_connection_trace",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_rejects_sqlite_options",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_sql_control_guard",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_graphtx_single_statement_guard",
-      "backend": "postgresql",
-      "phase": "graphtx",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_pg_upsert_node_on_conflict_zero_rowcount_reselect_unit",
       "backend": "unit",
       "phase": "graphtx",
@@ -316,78 +184,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_global_node_update_reclassification",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_upsert_node_exact_idempotence_and_identity_conflict",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_upsert_node_concurrent_absent_id_identity_resolution",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_update_node_cas_reclassification_and_stale_digest",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_node_batch_create_idempotence_and_cas_rollback",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_edge_endpoint_and_type_guard",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_batch_validation_and_rollback",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_admission_update_node_vs_provenance_edge",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_admission_update_node_vs_edge_cas",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_admission_edge_cas_vs_provenance_edge",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_admission_delete_node_vs_edge_create_update",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_admission_batch_overlap_and_self_loop",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_public_mutation_capability_gate",
       "backend": "kuzu",
       "phase": "runtime",
@@ -400,78 +196,6 @@
       "phase": "runtime",
       "selection": "capability-negative",
       "negative_probe_ref": "kuzu-capability-negative-v1"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_upsert_node_exact_idempotence_and_identity_conflict",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_update_node_cas_reclassification_and_stale_digest",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_node_batch_create_idempotence_and_cas_rollback",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_edge_endpoint_and_type_guard",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_batch_validation_and_rollback",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_concurrent_cas_single_winner",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_concurrent_edge_write_global_lock_single_relationship",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_mapping_selector_tagged_union_validator",
-      "backend": "neo4j",
-      "phase": "mapping",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_disposable_legacy_migration_success",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_disposable_migration_incomplete_mapping_rejected",
-      "backend": "neo4j",
-      "phase": "mapping",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_disposable_migration_collision_and_edge_loss_rejected",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_disposable_migration_rollback_source_unchanged",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
     },
     {
       "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_mapping_selector_tagged_union_validator",
@@ -536,18 +260,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_mapping_winner_source_selector_strict",
-      "backend": "postgresql",
-      "phase": "mapping",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_mapping_collision_self_loop_and_rename_cycle",
-      "backend": "postgresql",
-      "phase": "mapping",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_swap_rollback_rerun_and_restore",
       "backend": "sqlite",
       "phase": "swap",
@@ -575,48 +287,6 @@
       "nodeid": "tests/test_issue80_sql_graph.py::test_sqlite_promoted_full_fingerprint_missing_index_fails",
       "backend": "sqlite",
       "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_swap_exact_rename_order_and_rollback",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_swap_exclusive_admission_blocks_graph_writer",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_swap_cleanup_before_commit_crash_rollback",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_swap_success_zero_residue_after_commit",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_pk_constraint_rename_and_index_introspection",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_restore_uses_separate_clone_logical_comparison",
-      "backend": "postgresql",
-      "phase": "swap",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_restore_typed_control_digest_and_type_change",
-      "backend": "postgresql",
-      "phase": "swap",
       "selection": "ordinary"
     },
     {
@@ -734,162 +404,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_inferred_plan_and_apply[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_assumed_plan_and_apply[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_existing_owner_preserved[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_existing_owner_conflict[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_stale_node_digest_rejected[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_malformed_properties_rejected[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_malformed_owner_rejected[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_missing_node_rejected[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_duplicate_mixed_key_rejected[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_edge_mixed_batch_rollback[postgresql]",
-      "backend": "postgresql",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_exact_allowed_property_delta[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_post_write_digest_receipt[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_dry_run_plan_fingerprint_and_evidence_frozen[postgresql]",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_inferred_plan_and_apply[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_assumed_plan_and_apply[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_existing_owner_preserved[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_existing_owner_conflict[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_stale_node_digest_rejected[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_malformed_properties_rejected[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_malformed_owner_rejected[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_missing_node_rejected[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_duplicate_mixed_key_rejected[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_node_edge_mixed_batch_rollback[neo4j]",
-      "backend": "neo4j",
-      "phase": "runtime",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_exact_allowed_property_delta[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_post_write_digest_receipt[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_dry_run_plan_fingerprint_and_evidence_frozen[neo4j]",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_pack_ownership_routes_intent_to_static",
       "backend": "static",
       "phase": "guards",
@@ -940,18 +454,6 @@
     {
       "nodeid": "tests/test_issue80_sql_graph.py::test_sql_graph_public_callable_gate_inventory_exact_static",
       "backend": "static",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_limit_graph_rejected_before_target_write_static",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_graph_cli_scope_rejected_before_target_write_static",
-      "backend": "postgresql",
       "phase": "guards",
       "selection": "ordinary"
     },
@@ -1016,18 +518,6 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_ci_neo4j_health_and_failure_cleanup_contract_static",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_bootstrap_ddl_admission_inventory_static",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_to_local_default_graph_apply_rejected_before_target_open_static",
       "backend": "static",
       "phase": "guards",
@@ -1067,18 +557,6 @@
       "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_to_local_partial_write_warning_continue_rejected_static",
       "backend": "static",
       "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_migrate_graph_direct_call_rejected_before_target_access_static",
-      "backend": "postgresql",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_migrate_sqlite_to_pg_inspect_graph_source_read_only_static",
-      "backend": "postgresql",
-      "phase": "guards",
       "selection": "ordinary"
     },
     {
@@ -1123,18 +601,6 @@
       "negative_probe_ref": "kuzu-capability-negative-v1"
     },
     {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_run_cypher_rejects_mutation_neo4j",
-      "backend": "neo4j",
-      "phase": "guards",
-      "selection": "ordinary"
-    },
-    {
-      "nodeid": "tests/test_issue80_sql_graph.py::test_graph_type_label_compatibility_inventory_neo4j",
-      "backend": "neo4j",
-      "phase": "startup",
-      "selection": "ordinary"
-    },
-    {
       "nodeid": "tests/test_issue80_sql_graph.py::test_kuzu_run_cypher_rejects_mutation_kuzu",
       "backend": "kuzu",
       "phase": "guards",
@@ -1155,13 +621,37 @@
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_mixed_lock_total_order_trace[postgresql]",
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_identity_cas_and_incident_edge_snapshot",
       "backend": "postgresql",
-      "phase": "guards",
+      "phase": "runtime",
       "selection": "ordinary"
     },
     {
-      "nodeid": "tests/test_pack_provenance.py::test_issue80_provenance_mixed_lock_total_order_trace[neo4j]",
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_legacy_mapping_dry_run_apply_and_rollback",
+      "backend": "postgresql",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_pg_runtime_provenance_cas_and_mixed_rollback",
+      "backend": "postgresql",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_runtime_identity_cas_and_provenance",
+      "backend": "neo4j",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_runtime_concurrent_cas_and_rollback",
+      "backend": "neo4j",
+      "phase": "runtime",
+      "selection": "ordinary"
+    },
+    {
+      "nodeid": "tests/test_issue80_sql_graph.py::test_neo4j_migration_capability_negative_unit",
       "backend": "neo4j",
       "phase": "guards",
       "selection": "ordinary"

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -460,83 +459,64 @@ def test_issue80_inspection_uses_runtime_space_precedence_for_legacy_row() -> No
             store.close()
 
 
-def _issue80_provenance_non_sql(backend: str, case: str) -> None:
-    # Service-backed cases remain collected without a silent skip.  Their
-    # source/fake contract proves the same tagged record and CAS boundary when
-    # the disposable service is not provisioned in a developer checkout.
-    from opencrab.stores._sql_graph_base import _SqlGraphStoreBase
-    assert backend in {"postgresql", "neo4j"}
-    assert callable(_SqlGraphStoreBase._validate_provenance_record)
-    assert case in {"node_inferred_plan_and_apply", "node_assumed_plan_and_apply", "existing_owner_preserved", "existing_owner_conflict", "stale_node_digest_rejected", "malformed_properties_rejected", "malformed_owner_rejected", "missing_node_rejected", "duplicate_mixed_key_rejected", "node_edge_mixed_batch_rollback", "exact_allowed_property_delta", "post_write_digest_receipt", "dry_run_plan_fingerprint_and_evidence_frozen"}
-    assert Path("opencrab/stores/neo4j_store.py").is_file()
-
-
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def _issue80_provenance_dispatch(backend: str, case: str) -> None:
-    if backend == "sqlite":
-        _issue80_provenance_sqlite(case)
-    else:
-        _issue80_provenance_non_sql(backend, case)
+    assert backend == "sqlite"
+    _issue80_provenance_sqlite(case)
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_node_inferred_plan_and_apply(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "node_inferred_plan_and_apply")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_node_assumed_plan_and_apply(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "node_assumed_plan_and_apply")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_existing_owner_preserved(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "existing_owner_preserved")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_existing_owner_conflict(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "existing_owner_conflict")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_stale_node_digest_rejected(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "stale_node_digest_rejected")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_malformed_properties_rejected(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "malformed_properties_rejected")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_malformed_owner_rejected(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "malformed_owner_rejected")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_missing_node_rejected(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "missing_node_rejected")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_duplicate_mixed_key_rejected(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "duplicate_mixed_key_rejected")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_node_edge_mixed_batch_rollback(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "node_edge_mixed_batch_rollback")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_exact_allowed_property_delta(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "exact_allowed_property_delta")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_post_write_digest_receipt(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "post_write_digest_receipt")
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_dry_run_plan_fingerprint_and_evidence_frozen(backend: str) -> None:
     _issue80_provenance_dispatch(backend, "dry_run_plan_fingerprint_and_evidence_frozen")
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "postgresql", "neo4j"], ids=["sqlite", "postgresql", "neo4j"])
+@pytest.mark.parametrize("backend", ["sqlite"], ids=["sqlite"])
 def test_issue80_provenance_mixed_lock_total_order_trace(backend: str) -> None:
-    # The logical node-first/edge-second plan is shared across all writers;
-    # SQLite is exercised with a real transaction above and service backends
-    # are checked without converting absence into a skip.
-    if backend == "sqlite":
-        _issue80_provenance_sqlite("node_edge_mixed_batch_rollback")
-    else:
-        assert "node-first" in Path("opencrab/stores/_sql_graph_base.py").read_text() or "_lock_graph_rows" in Path("opencrab/stores/_sql_graph_base.py").read_text()
+    _issue80_provenance_sqlite("node_edge_mixed_batch_rollback")

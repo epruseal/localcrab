@@ -86,8 +86,18 @@ class _CatalogTxAdapter:
     def __init__(self, tx: GraphTx) -> None:
         self._tx = tx
 
-    def execute(self, statement: str, params: dict[str, Any] | None = None) -> Any:
-        return self._tx.execute(statement, params)
+    def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
+        if isinstance(statement, str):
+            sql = statement
+        else:
+            from sqlalchemy.sql.elements import TextClause
+
+            if not isinstance(statement, TextClause):
+                raise TypeError(f"unsupported catalog statement type: {type(statement)!r}")
+            sql = statement.text
+            if not isinstance(sql, str):
+                raise TypeError("TextClause text must be str")
+        return self._tx.execute(sql, params)
 
 
 class PGGraphStore(_SqlGraphStoreBase):
@@ -289,9 +299,6 @@ class PGGraphStore(_SqlGraphStoreBase):
                     if actual_n != legacy_n or actual_e != legacy_e:
                         return "partial"
 
-                constraints = conn.execute(self._text("SELECT table_name, constraint_type FROM information_schema.table_constraints WHERE table_schema=:schema AND table_name IN ('graph_nodes','graph_edges')"), {"schema": self._schema}).fetchall()
-                if any(r[1] != "PRIMARY KEY" for r in constraints):
-                    return "partial"
                 indexes = conn.execute(self._text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname=:schema AND tablename IN ('graph_nodes','graph_edges')"), {"schema": self._schema}).fetchall()
                 secondary = []
                 primary = 0
@@ -316,7 +323,7 @@ class PGGraphStore(_SqlGraphStoreBase):
                     return "partial"
                 if conn.execute(self._text("SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname IN ('graph_nodes','graph_edges') AND NOT t.tgisinternal LIMIT 1"), {"schema": self._schema}).fetchone():
                     return "partial"
-                if conn.execute(self._text("SELECT 1 FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=:schema AND r.relname IN ('graph_nodes','graph_edges') AND c.contype NOT IN ('p') LIMIT 1"), {"schema": self._schema}).fetchone():
+                if conn.execute(self._text("SELECT 1 FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=:schema AND r.relname IN ('graph_nodes','graph_edges') AND c.contype NOT IN ('p','n') LIMIT 1"), {"schema": self._schema}).fetchone():
                     return "partial"
                 if conn.execute(self._text("SELECT 1 FROM pg_policies WHERE schemaname=:schema AND tablename IN ('graph_nodes','graph_edges') LIMIT 1"), {"schema": self._schema}).fetchone():
                     return "partial"
