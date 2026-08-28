@@ -229,6 +229,18 @@ def _pg_runtime(*, legacy: bool = False) -> Iterator[Any]:
                     f'''CREATE INDEX idx_edges_to ON "{schema}".graph_edges (to_id)''',
                 ):
                     conn.execute(text(statement))
+                conn.execute(
+                    text(
+                        f'''INSERT INTO "{schema}".graph_nodes
+                            (node_type,node_id,space_id,properties)
+                            VALUES (:node_type,:node_id,:space_id,
+                                    CAST(:properties AS JSONB))'''
+                    ),
+                    [
+                        {"node_type": "Person", "node_id": "pg-a", "space_id": None, "properties": '{"name":"same"}'},
+                        {"node_type": "Entity", "node_id": "pg-a", "space_id": None, "properties": '{"name":"same"}'},
+                    ],
+                )
         from opencrab.stores.pg_graph_store import PGGraphStore
         store = PGGraphStore(engine, schema=schema)
         yield store
@@ -258,8 +270,6 @@ def test_pg_runtime_identity_and_incident_edge_cas() -> None:
 def test_pg_runtime_migration_and_replay() -> None:
     from opencrab.common.graph_identity import ApplyMigrationRequest, ExplicitMerge
     with _pg_runtime(legacy=True) as store:
-        store.upsert_node("Person", "pg-a", {"name": "same"})
-        store.upsert_node("Entity", "pg-a", {"name": "same"})
         inventory = store.inspect_graph_identity()
         rows = sorted((row for row in inventory.nodes if row.key.node_id == "pg-a"), key=lambda row: row.key.node_type)
         merge = ExplicitMerge(tuple((row.key, row.digest) for row in rows), "pg-a", "Person", None, None)
