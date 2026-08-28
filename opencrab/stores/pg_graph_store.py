@@ -147,8 +147,8 @@ class PGGraphStore(_SqlGraphStoreBase):
     GRAPH_WRITE_NAMESPACE = 80480
     GRAPH_WRITE_KEY = 1
 
-    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, snapshot_path: Path | None = None) -> Any:
-        if immediate or snapshot_path is not None:
+    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, exclusive: bool = False, snapshot_path: Path | None = None) -> Any:
+        if immediate or exclusive or snapshot_path is not None:
             raise ValueError("graph transaction options are SQLite-only")
         if self._graph_tx_is_active():
             raise RuntimeError("nested graph transaction is not allowed")

@@ -65,10 +65,15 @@ class KuzuUnavailableGraphStore:
 
     _WRITE_NAMES = frozenset({
         "upsert_node", "update_node", "upsert_nodes_batch", "update_nodes_batch",
+        "reclassify_node", "migrate_graph_identity",
         "upsert_edge", "update_edge", "upsert_edges_batch", "update_edges_batch",
         "delete_node", "delete_edge", "backfill_pack_provenance", "ensure_constraints",
         "hydrate_evidence",
     })
+
+    def inspect_graph_identity(self):
+        """Inventory is unavailable until the Ladybug read capability is qualified."""
+        raise GraphReadCapabilityUnavailable("graph read capability unavailable")
 
     def __init__(self, db_path: str | None = None) -> None:
         # Retain the configured location for diagnostics and compatibility

@@ -330,8 +330,8 @@ class OntologyBuilder:
                     # delete-then-upsert unsafe, so use the graph's CAS
                     # reclassification primitive while retaining the normal
                     # document/registry/vector fan-out below.
-                    node_props = self._neo4j.update_node(
-                        node_id=node_id,
+                    node_props = self._neo4j.reclassify_node(
+                        node_id,
                         expected_current_digest=_expected_current_digest,
                         new_type=node_type,
                         new_properties=props,

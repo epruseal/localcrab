@@ -106,7 +106,7 @@ class _SqliteConnMixin:
         return conn
 
     @contextlib.contextmanager
-    def _tx(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    def _tx(self, *, immediate: bool = False, exclusive: bool = False) -> Iterator[sqlite3.Connection]:
         """쓰기 트랜잭션 경계. 쓰기 락을 쥔 채 커넥션을 내주고, with 블록이 예외 없이
         끝나면 commit, 예외가 나면 rollback 후 재던진다.
 
@@ -129,10 +129,16 @@ class _SqliteConnMixin:
         with self._lock:
             conn = self._conn
             try:
+                if immediate and exclusive:
+                    raise ValueError("immediate and exclusive transactions are mutually exclusive")
                 if immediate:
                     if conn.in_transaction:
                         raise RuntimeError("nested graph transaction is not allowed")
                     conn.execute("BEGIN IMMEDIATE")
+                elif exclusive:
+                    if conn.in_transaction:
+                        raise RuntimeError("nested graph transaction is not allowed")
+                    conn.execute("BEGIN EXCLUSIVE")
                 yield conn
                 conn.commit()
             except BaseException:

@@ -18,9 +18,12 @@ from contextlib import contextmanager
 from typing import Any
 
 from opencrab.common.graph_identity import (
+    ApplyMigrationRequest,
+    DryRunMigrationRequest,
     EdgeIdentityConflict,
     EdgeWriteReceipt,
     GraphQueryWriteRejected,
+    GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     GraphWriteCapabilityUnavailable,
     NodeIdentityConflict,
@@ -867,6 +870,42 @@ class Neo4jStore:
                 return NodeWriteReceipt("updated", node_id, new_type, space_id, props, digest)
             return props
         return self._run_write(write)
+
+    def reclassify_node(
+        self,
+        node_id: str,
+        *,
+        expected_current_digest: str,
+        new_type: str,
+        new_space_id: str | None = None,
+        new_properties: dict[str, Any],
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        """Atomically reclassify one node through the public CAS surface."""
+        return self.update_node(
+            node_id,
+            expected_current_digest,
+            new_type,
+            new_properties,
+            new_space_id,
+            return_receipt=return_receipt,
+        )
+
+    def inspect_graph_identity(self):
+        """Reject SQL migration inventory until a Neo4j qualification exists."""
+        raise GraphReadCapabilityUnavailable(
+            "graph identity migration inventory is unavailable for Neo4j"
+        )
+
+    def migrate_graph_identity(
+        self,
+        request: DryRunMigrationRequest | ApplyMigrationRequest,
+    ):
+        """Keep the SQL-only migration surface capability-negative on Neo4j."""
+        del request
+        raise GraphWriteCapabilityUnavailable(
+            "graph identity migration is qualified only for SQL graph stores"
+        )
 
     def delete_edge(self, from_id: str, relation: str, to_id: str, *, owner_pack_id: str) -> bool:
         self._require_schema_ready()

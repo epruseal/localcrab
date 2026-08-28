@@ -273,7 +273,7 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         if not self._available:
             raise RuntimeError(f"{type(self).__name__} is not available.")
 
-    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, snapshot_path: Path | None = None) -> Any:
+    def _run_graph_tx(self, callback: Callable[[GraphTx], Any], *, immediate: bool = False, exclusive: bool = False, snapshot_path: Path | None = None) -> Any:
         """Run one graph callback on the writer connection.
 
         A graph snapshot is deliberately an executor concern.  It is made
@@ -283,8 +283,10 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         ``GraphTx`` and therefore cannot accidentally write the destination
         connection or issue transaction controls itself.
         """
-        if snapshot_path is not None and not immediate:
+        if snapshot_path is not None and (not immediate or exclusive):
             raise ValueError("snapshot_path requires immediate=True")
+        if immediate and exclusive:
+            raise ValueError("immediate and exclusive transactions are mutually exclusive")
         if self._graph_tx_is_active():
             raise RuntimeError("nested graph transaction is not allowed")
 
@@ -357,7 +359,7 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
 
         self._set_graph_tx_active(True)
         try:
-            with self._tx(immediate=immediate) as source:
+            with self._tx(immediate=immediate, exclusive=exclusive) as source:
                 return callback(GraphTx(source, self._dialect))
         finally:
             self._set_graph_tx_active(False)

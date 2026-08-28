@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 EXCLUDED_PARTS = frozenset({"generated", "vendor", ".venv", "build"})
 GRAPH_METHODS = frozenset({
     "upsert_node", "update_node", "upsert_nodes_batch", "update_nodes_batch",
+    "reclassify_node", "migrate_graph_identity",
     "upsert_edge", "update_edge", "upsert_edges_batch", "update_edges_batch",
     "delete_node", "delete_edge", "backfill_pack_provenance", "ensure_constraints",
 })

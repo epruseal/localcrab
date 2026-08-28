@@ -231,9 +231,24 @@ DDL, DML을 건드리지 않는다. 그래프 mutation과 read query는 capabili
 
 qualification bundle은 `tests/fixtures/issue80/qualification/`에 있으며
 `python3 -m tests.kuzu_qualification` 명령으로 패키지를 import하지 않고 무결성을
-검사한다. SQLite graph migration의 source inspection은 read-only로 남아 있고
-`--apply` 경로는 `GraphMigrationFixtureOnlyError`를 낸다. raw setup은 전용 marker가
-있는 OS 임시 디렉터리에서만 `tests/helpers/issue80_graph_mutation.py`가 수행한다.
+검사한다. raw graph fixture setup은 전용 marker가 있는 OS 임시 디렉터리에서만
+`tests/helpers/issue80_graph_mutation.py`가 수행한다.
+
+### 4.1 전역 노드 ID 이관
+
+SQL graph의 정본 키는 `node_id` 하나다. 기존 `(node_type, node_id)` 스키마는
+`inspect_graph_identity()`로 모든 typed node와 edge를 읽어 source fingerprint를
+계산한다. `migrate_graph_identity()`의 기본 경로는 read-only dry-run이며
+canonical plan bytes를 반환한다. 운영자가 `scripts/migrate_graph_identity.py
+--apply`를 명시적으로 호출할 때만 저장된 plan bytes, plan SHA-256, backup SHA-256,
+request ID를 함께 검증하고 SQLite는 `BEGIN EXCLUSIVE`, PostgreSQL은 advisory lock
+안에서 staging과 cutover를 수행한다.
+
+dry-run은 graph와 migration ledger를 변경하지 않는다. apply는 성공한 receipt를
+ledger에 한 번만 기록하며 같은 request ID의 재실행은 저장된 receipt를 그대로
+반환한다. 이미 target 스키마인 graph가 plan과 canonical digest까지 일치하면
+table 교체 없이 receipt만 기록하고, 다른 상태는 target conflict로 중단한다.
+Neo4j와 Kuzu에는 이 SQL migration apply capability를 노출하지 않는다.
 
 아래의 기존 Phase 2 기록은 현재 동작을 설명하지 않는 보존 문서다. 현재 지원하는
 production 그래프 경로는 `local`, `pg`, `docker`이며 모두 global `node_id`,

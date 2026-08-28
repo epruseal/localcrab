@@ -24,6 +24,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 # this guards writes, and #143's read scoping is a separate contract.
 WATCHED_METHODS = frozenset({
     "upsert_node",
+    "reclassify_node",
     "upsert_node_doc",
     "upsert_edge",
     "upsert_nodes_batch",
@@ -33,6 +34,7 @@ WATCHED_METHODS = frozenset({
     "upsert_texts",
     "register_node",
     "register_edge",
+    "migrate_graph_identity",
 })
 
 SCANNED_ROOTS = ("opencrab", "apps", "scripts", "crabharness")
@@ -44,6 +46,7 @@ ALLOWED: dict[tuple[str, str], str] = {
     # --- writer 1: the ontology builder ---
     ("opencrab/ontology/builder.py", "add_node"): "writer 1 -- gate runs here",
     ("opencrab/ontology/builder.py", "add_edge"): "writer 1 -- gate runs here",
+    ("scripts/migrate_graph_identity.py", "main"): "operator migration tool; explicit apply request",
     ("opencrab/stores/neo4j_store.py", "write"): (
         "store-owned transaction callback; the public batch writer already holds the graph gate"
     ),

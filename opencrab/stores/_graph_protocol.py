@@ -90,7 +90,11 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 from opencrab.common.graph_identity import (
+    ApplyMigrationRequest,
+    DryRunMigrationRequest,
     EdgeWriteReceipt,
+    GraphInventory,
+    MigrationReceipt,
     NodeWriteReceipt,
     ProvenanceBatchReceipt,
 )
@@ -234,6 +238,34 @@ class GraphStore(Protocol):
         new_properties: dict[str, Any], new_space_id: str | None = None,
         *, return_receipt: bool = False,
     ) -> dict[str, Any] | NodeWriteReceipt:
+        ...
+
+    def reclassify_node(
+        self,
+        node_id: str,
+        *,
+        expected_current_digest: str,
+        new_type: str,
+        new_space_id: str | None = None,
+        new_properties: dict[str, Any],
+        return_receipt: bool = False,
+    ) -> dict[str, Any] | NodeWriteReceipt:
+        """Atomically reclassify one global node by expected current digest.
+
+        This CAS has no operation ledger. A second call with the old digest is
+        a stale conflict after the first call succeeds.
+        """
+        ...
+
+    def inspect_graph_identity(self) -> GraphInventory:
+        """Return every typed legacy row and its source fingerprint read-only."""
+        ...
+
+    def migrate_graph_identity(
+        self,
+        request: DryRunMigrationRequest | ApplyMigrationRequest,
+    ) -> MigrationReceipt:
+        """Plan or atomically apply the SQL graph identity migration."""
         ...
 
     def delete_edge(self, from_id: str, relation: str, to_id: str, *, owner_pack_id: str) -> bool:

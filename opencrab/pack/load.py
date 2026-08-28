@@ -53,6 +53,7 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
+from opencrab.common.graph_identity import GraphMigrationConflict
 from opencrab.common.pack_tags import RETIRED_KEYS, apply_pack_tag, strip_retired_keys
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
 from opencrab.pack.jsonl_io import iter_jsonl
@@ -1033,6 +1034,13 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         """,
         {"pack": pack_name},
     ):
+        if node_id in nodes:
+            # The qualified target is keyed by bare node_id.  Do not silently
+            # choose whichever typed row happened to be returned last if a
+            # legacy or manually corrupted reader exposes both rows.
+            raise GraphMigrationConflict(
+                f"ambiguous graph node identity in pack state: {node_id}"
+            )
         nodes[node_id] = (node_type, space_id, _as_json_dict(properties))
 
     # 소유 우선순위는 delete_pack/build_count_sql 과 같은 정본(`_doc_owner_pred`)
