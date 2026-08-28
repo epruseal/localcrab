@@ -1,0 +1,13 @@
+{
+  "schema_version": "issue80.graph-negative-inventory.v1",
+  "evidence_kind": "known-negative-classification",
+  "source_command": "python3 -m tests.graph_inventory",
+  "required_examples": [
+    {
+      "locator": "opencrab/auth.py:356",
+      "classification": "known non-graph SQL receiver",
+      "expected": "excluded from graph candidate denominator"
+    }
+  ],
+  "drift_gate": "zero"
+}

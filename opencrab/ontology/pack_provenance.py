@@ -21,14 +21,12 @@ Inference order:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any
-
-from opencrab.common.pack_tags import apply_pack_tag
-from opencrab.locking import write_lock
 
 _PACK_RE = re.compile(r"/packs/([^/]+)/")
 
@@ -322,6 +320,9 @@ def _backfill_pack_ids_unlocked(
     untouched. With ``dry_run=True`` (the default) no row is written; the
     returned summary still reflects what *would* change.
     """
+    if not dry_run:
+        raise RuntimeError("pack provenance apply requires a target graph store")
+
     summary: dict[str, Any] = {
         "dry_run": dry_run,
         "nodes_inferred": 0,
@@ -332,7 +333,14 @@ def _backfill_pack_ids_unlocked(
         "edges_skipped": 0,
     }
 
-    conn = sqlite3.connect(db_path)
+    source_path = Path(db_path).absolute()
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    # This helper is an inspection path now.  A normal sqlite3.connect would
+    # create a missing file before the explicit check and would also make the
+    # read-only contract depend on callers never changing this function back
+    # into a writer by accident.
+    conn = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -347,28 +355,11 @@ def _backfill_pack_ids_unlocked(
                 if reason in ("skipped-non-dict", "skipped-unresolvable"):
                     summary[f"{table.split('_')[1]}_skipped"] += 1
                     continue
-                # reason is "inferred" or "assumed" -- re-parse to get the
-                # full props dict to write back (resolve_row_pack_id only
-                # returns the decided pack_id, not the dict it came from).
-                try:
-                    props = json.loads(row["properties"]) if row["properties"] else {}
-                except (TypeError, ValueError):
-                    props = {}
-                apply_pack_tag(props, pack_id)   # 폐기 별칭도 함께 정리한다(#171)
                 summary[f"{table.split('_')[1]}_{reason}"] += 1
-                if not dry_run:
-                    set_clauses = " AND ".join(f"{c}=?" for c in key_cols)
-                    values = [json.dumps(props)] + [row[c] for c in key_cols]
-                    cur.execute(
-                        f"UPDATE {table} SET properties=? WHERE {set_clauses}",
-                        values,
-                    )
 
         _process("graph_nodes", ("node_type", "node_id"))
         _process("graph_edges", ("from_type", "from_id", "relation", "to_type", "to_id"))
 
-        if not dry_run:
-            conn.commit()
     finally:
         conn.close()
 
@@ -381,12 +372,118 @@ def backfill_pack_ids(
     assume_pack_id: str | None = None,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Back-fill pack IDs under the lock for the database being changed."""
-    if dry_run:
-        return _backfill_pack_ids_unlocked(
-            db_path, assume_pack_id=assume_pack_id, dry_run=True
-        )
-    with write_lock(str(Path(db_path).resolve().parent)):
-        return _backfill_pack_ids_unlocked(
-            db_path, assume_pack_id=assume_pack_id, dry_run=False
-        )
+    """Compatibility wrapper for the read-only provenance inspector.
+
+    Graph ownership changes now require a frozen tagged plan and an injected
+    target store's ``backfill_pack_provenance`` method.  A database path is
+    therefore never accepted as a write capability.
+    """
+    if not dry_run:
+        raise RuntimeError("pack provenance apply requires a target graph store")
+    return _backfill_pack_ids_unlocked(
+        db_path, assume_pack_id=assume_pack_id, dry_run=True
+    )
+
+
+def inspect_pack_ids(
+    db_path: str | Path,
+    *,
+    assume_pack_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a frozen, read-only tagged graph ownership plan.
+
+    The returned ``records`` are accepted only by an explicitly configured
+    graph store's ``backfill_pack_provenance`` method.  This function opens
+    SQLite read-only and never issues an UPDATE.
+    """
+    from opencrab.common.graph_identity import (
+        canonical_edge_digest,
+        canonical_json_bytes,
+        canonical_node_digest,
+        normalize_edge_properties,
+        parse_properties_object,
+    )
+    from opencrab.stores._graph_common import _merge_space
+    from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA
+
+    conn = sqlite3.connect(f"file:{Path(db_path).absolute()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        node_items: list[list[str]] = []
+        edge_items: list[list[str]] = []
+        for row in conn.execute("SELECT node_id, node_type, space_id, properties FROM graph_nodes"):
+            props = parse_properties_object(row["properties"])
+            effective = _merge_space(props, row["space_id"])
+            node_items.append([
+                row["node_id"],
+                canonical_node_digest(
+                    row["node_type"], row["space_id"] or effective.get("space"), effective
+                ),
+            ])
+        for row in conn.execute("SELECT from_id, relation, to_id, from_type, to_type, properties FROM graph_edges"):
+            props = normalize_edge_properties(
+                row["from_id"], row["relation"], row["to_id"],
+                parse_properties_object(row["properties"]),
+            )
+            edge_items.append([
+                row["from_id"], row["relation"], row["to_id"],
+                canonical_edge_digest(
+                    row["from_id"], row["relation"], row["to_id"],
+                    row["from_type"], row["to_type"], props,
+                ),
+            ])
+        schema = {
+            "tables": [
+                {"name": table.name, "columns": [[c.name, c.kind, c.not_null, c.default] for c in table.columns], "primary_key": list(table.primary_key)}
+                for table in GRAPH_STORE_SCHEMA.tables
+            ],
+            "indexes": [[i.name, i.table, i.expr, list(i.json_key) if i.json_key else None] for i in GRAPH_STORE_SCHEMA.indexes],
+        }
+        schema_fp = hashlib.sha256(
+            b"opencrab.issue80.graph-schema.v1\0" + canonical_json_bytes(schema)
+        ).hexdigest()
+        target = hashlib.sha256(
+            b"opencrab.issue80.provenance-target.v1\0"
+            + canonical_json_bytes({"schema_fingerprint": schema_fp, "nodes": sorted(node_items), "edges": sorted(edge_items)})
+        ).hexdigest()
+        records: list[dict[str, Any]] = []
+        for row in conn.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes"):
+            props = parse_properties_object(row["properties"])
+            effective = _merge_space(props, row["space_id"])
+            owner, reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
+            if owner is None:
+                continue
+            # Keep the expected digest byte-for-byte identical to the digest
+            # used above for the target fingerprint.  In particular, do not
+            # inject an ``id`` key here: legacy rows may omit it, and adding
+            # it would make a plan that can never pass the target CAS.
+            digest = canonical_node_digest(
+                row["node_type"], row["space_id"] or effective.get("space"), effective
+            )
+            has_alias = "pack" in props
+            records.append({
+                "kind": "node", "target_fingerprint": target,
+                "expected_current_digest": digest, "proposed_pack_id": owner,
+                "reason": "assumed" if reason == "assumed" else ("inferred" if reason == "inferred" else "assumed"),
+                "dry_run_evidence_digest": hashlib.sha256(b"opencrab.issue80.provenance-evidence.v1\0" + canonical_json_bytes({"reason": reason, "row": dict(row)})).hexdigest(),
+                "allowed_properties_delta": {"set": {} if reason == "existing" else {"pack_id": owner}, "remove": (["pack"] if has_alias else [])},
+                "node_id": row["node_id"], "node_type": row["node_type"],
+            })
+        for row in conn.execute("SELECT from_type, from_id, relation, to_type, to_id, properties FROM graph_edges"):
+            props = normalize_edge_properties(row["from_id"], row["relation"], row["to_id"], parse_properties_object(row["properties"]))
+            owner, reason = resolve_row_pack_id(row["properties"], row, assume_pack_id)
+            if owner is None:
+                continue
+            digest = canonical_edge_digest(row["from_id"], row["relation"], row["to_id"], row["from_type"], row["to_type"], props)
+            records.append({
+                "kind": "edge", "target_fingerprint": target,
+                "expected_current_digest": digest, "proposed_pack_id": owner,
+                "reason": "assumed" if reason == "assumed" else ("inferred" if reason == "inferred" else "assumed"),
+                "dry_run_evidence_digest": hashlib.sha256(b"opencrab.issue80.provenance-evidence.v1\0" + canonical_json_bytes({"reason": reason, "row": dict(row)})).hexdigest(),
+                "allowed_properties_delta": {"set": {} if reason == "existing" else {"pack_id": owner}, "remove": (["pack"] if "pack" in props else [])},
+                "from_id": row["from_id"], "relation": row["relation"], "to_id": row["to_id"],
+                "from_type": row["from_type"], "to_type": row["to_type"],
+            })
+        return {"target_fingerprint": target, "records": tuple(records)}
+    finally:
+        conn.close()

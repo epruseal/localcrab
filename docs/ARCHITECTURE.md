@@ -16,20 +16,21 @@
 ## 1. 스토어 구조
 
 LocalCrab은 `STORAGE_MODE` 환경변수로 네 가지 백엔드를 선택한다: `local`(기본),
-`kuzu`(그래프만 KuzuGraphStore, 나머지는 local과 동일), `docker`, `pg`(4스토어
+`kuzu`(그래프 capability-negative, 나머지는 local과 동일), `docker`, `pg`(4스토어
 전부 PostgreSQL 통합).
 
 | 스토어 역할 | local 모드 | kuzu 모드 | pg 모드 | docker 모드 |
 | --- | --- | --- | --- | --- |
-| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `KuzuGraphStore` (`graph.kuzu`, ladybug>=0.18) | `PGGraphStore` (공유 SQLAlchemy 엔진) | `Neo4jStore` (`bolt://localhost:7687`) |
+| 그래프 | `LocalGraphStore` (`graph.db`, SQLite) | `KuzuUnavailableGraphStore` (파일 미생성) | `PGGraphStore` (공유 SQLAlchemy 엔진) | `Neo4jStore` (`bolt://localhost:7687`) |
 | 문서 | `LocalSQLDocStore` (`doc_store.db`, SQLite) | `LocalSQLDocStore` (local과 동일) | `PgDocStore` (공유 엔진) | `MongoStore` (MongoDB) |
 | 벡터 | `SqliteVecStore` (`vectors.db`, 기본) / `ChromaStore` (PersistentClient, `chroma/`, 옵션) | local과 동일 | `PgVectorStore` (공유 엔진, HNSW) | `ChromaStore` (HttpClient) |
 | SQL | `SQLStore` (`opencrab.db`, SQLite) | `SQLStore` (local과 동일) | `SQLStore` (`POSTGRES_URL`, 자체 엔진) | `SQLStore` (PostgreSQL) |
 
-`kuzu` 모드는 `is_local=True`(그래프를 제외한 문서·벡터·SQL 스토어는 `local`과
-동일하게 선택된다). `ladybug`는 KùzuDB의 리브랜딩 패키지명이며
-(https://github.com/LadybugDB/ladybug), `Database`/`Connection` API는 kuzu와
-동일하다. 설치: `pip install ".[kuzu]"`.
+`kuzu` 모드는 `is_local=True`이며 문서·벡터·SQL 스토어만 local과 동일하게 선택된다.
+그래프는 `KuzuUnavailableGraphStore`를 반환한다. Ladybug의 트랜잭션 소유권과
+원자적 CAS를 검증하기 전까지 production constructor는 optional 패키지를 import
+하거나 경로를 만들지 않고 capability 예외를 낸다. qualification bundle은
+`python3 -m tests.kuzu_qualification`으로 읽기 전용 검사한다.
 
 `pg` 모드는 `is_local=False`(별도 분기 — `local`/`kuzu`의 SQLite 변형이 아니다).
 graph/vector/doc 3스토어는 factory가 `POSTGRES_URL`당 1회 생성해 캐시하는 **공유
@@ -58,7 +59,7 @@ _get_pg_engine(url)   # lru_cache(maxsize=8) — 1 Engine per POSTGRES_URL, shar
 
 make_graph_store(settings)
     STORAGE_MODE=pg   → PGGraphStore(_get_pg_engine(POSTGRES_URL))
-    STORAGE_MODE=kuzu → KuzuGraphStore(db_path="<LOCAL_DATA_DIR>/graph.kuzu")
+    STORAGE_MODE=kuzu → KuzuUnavailableGraphStore()  # graph capability-negative
     is_local          → LocalGraphStore(db_path="<LOCAL_DATA_DIR>/graph.db")
     else              → Neo4jStore(uri=NEO4J_URI, ...)
 
@@ -220,13 +221,30 @@ doc 스토어의 핵심 연산(`upsert_node_doc`, `get_node_doc`, `list_nodes LI
 
 ---
 
-## 4. Kuzu(ladybug) 그래프 스토어 — 현황
+## 4. Kuzu(ladybug) 그래프 스토어 - capability 상태
 
-> 과거 이 절은 "LadybugDB Phase 2 로드맵(예정)"으로 서술돼 있었으나, ladybug는
-> 이미 이 브랜치에 **현재 동작하는 opt-in 모드**(`STORAGE_MODE=kuzu`)로 구현되어
-> 있다 — 미래 계획이 아니다. 다만 **기본값은 여전히 `local`**이며, `kuzu`로
-> 전환해도 아래에서 보듯 그래프 상위 로직(ontology query/impact/export/MCP
-> tools)의 우회코드는 제거되지 않았다.
+현재 `STORAGE_MODE=kuzu`는 operational backend가 아니다. `factory.py`는
+`KuzuUnavailableGraphStore`를 반환하며 그래프 DB 경로, optional driver import,
+DDL, DML을 건드리지 않는다. 그래프 mutation과 read query는 capability 예외를
+낸다. Ladybug transaction owner와 node/edge 원자적 CAS를 검증한 qualification
+증거를 추가하기 전까지 production constructor를 활성화하지 않는다.
+
+qualification bundle은 `tests/fixtures/issue80/qualification/`에 있으며
+`python3 -m tests.kuzu_qualification` 명령으로 패키지를 import하지 않고 무결성을
+검사한다. SQLite graph migration의 source inspection은 read-only로 남아 있고
+`--apply` 경로는 `GraphMigrationFixtureOnlyError`를 낸다. raw setup은 전용 marker가
+있는 OS 임시 디렉터리에서만 `tests/helpers/issue80_graph_mutation.py`가 수행한다.
+
+아래의 기존 Phase 2 기록은 현재 동작을 설명하지 않는 보존 문서다. 현재 지원하는
+production 그래프 경로는 `local`, `pg`, `docker`이며 모두 global `node_id`,
+canonical digest, edge key, writer transaction 규율을 따른다. Neo4j는 기동할 때
+OpenCrabNode 관계의 endpoint/type, edge key, digest를 재검증하며 중복이나 불일치가
+있으면 `partial_or_unknown` 상태로 쓰기를 차단한다.
+
+> 다음 내용은 capability-negative 전환 전의 보존된 historical 기록이다. 현재
+> `STORAGE_MODE=kuzu`는 그래프를 초기화하지 않으며 production 경로가 아니다.
+> 아래의 구현 완료, 실행 가능, 동작한다는 표현은 당시 코드의 기록일 뿐 현재
+> 지원 상태를 나타내지 않는다.
 
 ### Phase 전략 (현황 반영)
 
@@ -235,9 +253,9 @@ Phase 1 (완료): Neo4j → LocalGraphStore (SQLite BFS)
     목표: Docker 없이 로컬 실행 가능, 안정성 최우선
     결과: MCP 도구 전체 로컬 동작 확보
 
-Phase 2 (구현 완료, opt-in — 기본 아님): LocalGraphStore → KuzuGraphStore
+Phase 2 (보류, capability qualification 전): LocalGraphStore → KuzuGraphStore
     (런타임 패키지 ladybug>=0.18, STORAGE_MODE=kuzu)
-    실제 결과: run_cypher()는 KuzuGraphStore에서 실동작(ladybug Database/
+    historical 결과: run_cypher()는 KuzuGraphStore에서 실동작(ladybug Database/
     Connection API 사용)하지만, 상위 코드(query.py/impact.py/neo4j_export.py/
     mcp/tools.py)는 여전히 `isinstance(x, (LocalGraphStore, KuzuGraphStore))`로
     두 스토어를 묶어 동일한 우회 메서드 경로(find_by_relations/list_packs/
@@ -258,11 +276,10 @@ migrate_graph_to_ladybug.py의 히스토리 주석으로만 남아 있고, 현�
 코드다. 설치: `pip install ".[kuzu]"` (`ladybug>=0.18`). 기존 `graph.db`
 (SQLite) → `.kuzu` 마이그레이션은 `scripts/migrate_graph_to_ladybug.py`.
 
-### 현재 LocalGraphStore의 한계
+### 보존 기록: 당시 LocalGraphStore의 한계
 
-`LocalGraphStore.run_cypher()`는 영구 no-op이다 (`local_graph_store.py:298`) — 이는
-`local`(기본) 모드에서만 해당하며, `kuzu` 모드의 `KuzuGraphStore.run_cypher()`는
-아래에서 보듯 이미 실동작한다:
+`LocalGraphStore.run_cypher()`는 영구 no-op이었다 (`local_graph_store.py:298`). 다음
+내용은 capability-negative 전환 전의 우회 경로 기록이다:
 
 ```python
 def run_cypher(self, cypher: str, params=None) -> list[dict]:
@@ -287,7 +304,7 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 `query.py`의 policy-aware 필터링이 여전히 호출하는 내부 엔진 `ReBACEngine.check()`
 기준으로 갱신했다.)
 
-코드베이스 전반에 `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기가
+당시 코드베이스 전반에는 `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기가
 존재한다(`ontology/query.py`, `ontology/impact.py`, `pack/neo4j_export.py`,
 `mcp/tools.py`) — `kuzu` 모드 도입 시 이 분기에서 `LocalGraphStore`를
 `KuzuGraphStore`로 **교체**한 것이 아니라 **튜플에 추가**했다. 즉 `KuzuGraphStore`도
@@ -305,18 +322,20 @@ depth>1은 동일한 Python BFS 큐 방식이라(`kuzu_graph_store.py`) Cypher �
 > 즉시 break한다. SQL LIMIT만으로는 pack 필터 통과율이 낮을 때 보완이 안 되므로
 > 두 guard를 병용한다.
 
-### ladybug(kuzu 모드) 도입으로 실제 달성된 것 / 아직 안 된 것
+### 보존 기록: ladybug(kuzu 모드) 도입 당시의 주장
 
-ladybug>=0.18 전환(`kuzu` 모드, opt-in)으로 실제 달성된 것:
+다음 목록은 capability-negative 전환 전에 작성된 기록이다. 현재 production
+경로에서 달성된 기능으로 해석하면 안 된다.
 
 - `pip install ".[kuzu]"`로 설치 가능한 임베디드 컬럼형 그래프 DB(KùzuDB 리브랜딩,
   https://github.com/LadybugDB/ladybug). `Database`/`Connection` API는 kuzu와 동일.
-- `KuzuGraphStore.run_cypher()`는 **실제로 Cypher를 실행**한다(더 이상 no-op) —
+- 당시 `KuzuGraphStore.run_cypher()`가 **실제로 Cypher를 실행**했다는 기록이 있다 —
   `local` 모드의 `LocalGraphStore.run_cypher()`는 여전히 영구 no-op.
 - RPi5 16KB 페이지 커널 madvise 크래시가 업스트림에서 해결되어(`#527`)
   `LD_PRELOAD=madv_noop.so` 우회가 더 이상 필요 없다.
-- `scripts/migrate_graph_to_ladybug.py`로 기존 `graph.db`(SQLite) →
-  `graph.kuzu` 마이그레이션 가능(CSV COPY FROM 배치, `--dry-run` 지원).
+- 당시 `scripts/migrate_graph_to_ladybug.py`로 기존 `graph.db`(SQLite) →
+  `graph.kuzu` 마이그레이션을 시도할 수 있었다는 기록이 있다. 현재 apply는
+  fixture-only이다.
 
 아직 실현되지 않은 것 (당초 "기대 효과"로 적혀 있었으나 현재도 유효한 갭):
 
@@ -338,8 +357,8 @@ ladybug>=0.18 전환(`kuzu` 모드, opt-in)으로 실제 달성된 것:
       값은 하위호환을 위해 그대로 유지.
 - [x] RPi5 16KB 페이지 커널 madvise 크래시 수정 확인(`LadybugDB/ladybug#526`→`#527`,
       v0.18.0에 포함) — 우회 불필요.
-- [x] 기존 `graph.db`(SQLite) → ladybug 마이그레이션 스크립트 작성 완료
-      (`scripts/migrate_graph_to_ladybug.py`).
+- [x] 당시 `graph.db`(SQLite) → ladybug 마이그레이션 스크립트가 작성됐다는 기록
+      (`scripts/migrate_graph_to_ladybug.py`). 현재 apply는 fixture-only이다.
 - [ ] `find_neighbors()` 결과 집합이 Neo4j 모드와 동등한지 검증 (Jaccard 유사도 기준) — 미확인.
 - [ ] MCP 서버 멀티스레드 환경에서 임베디드 DB의 동시 접근 안전성 검증 — 미확인.
 - [ ] 대규모 그래프(430k+ 노드)에서 ladybug 인덱스 빌드 시간 측정 — 미확인.

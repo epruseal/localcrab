@@ -6,8 +6,6 @@ STORAGE_MODE value, and that Settings.is_local behaves correctly.
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_settings_local_is_local_true() -> None:
     from opencrab.config import Settings
@@ -42,18 +40,17 @@ def test_factory_local_returns_local_graph_store(tmp_path) -> None:
     assert isinstance(store, LocalGraphStore)
 
 
-def test_factory_kuzu_returns_kuzu_graph_store(tmp_path) -> None:
-    pytest.importorskip("ladybug")
-
+def test_factory_kuzu_returns_capability_negative_graph_store(tmp_path) -> None:
     from opencrab.config import Settings
     from opencrab.stores.factory import make_graph_store
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+    from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 
     settings = Settings(STORAGE_MODE="kuzu", LOCAL_DATA_DIR=str(tmp_path))
     store = make_graph_store(settings)
     try:
-        assert isinstance(store, KuzuGraphStore)
-        assert store.available is True
+        assert isinstance(store, KuzuUnavailableGraphStore)
+        assert store.available is False
+        assert not (tmp_path / "graph.kuzu").exists()
     finally:
         store.close()
 

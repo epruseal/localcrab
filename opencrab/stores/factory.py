@@ -39,13 +39,13 @@ def _get_pg_engine(url: str) -> Any:
 
 
 def make_graph_store(settings: Settings) -> Any:
-    """Return PGGraphStore (pg), KuzuGraphStore (kuzu), LocalGraphStore (local),
+    """Return PGGraphStore (pg), the disabled Kuzu facade (kuzu), LocalGraphStore (local),
     or Neo4jStore (docker).
 
-    kuzu 모드는 ladybug>=0.18 런타임(리브랜딩된 KùzuDB)을 사용한다. 과거에는
-    RPi5 16KB 페이지 커널에서 구버전 kuzu의 madvise 호출이 크래시해
-    LD_PRELOAD=madv_noop.so 로 우회했으나, ladybug>=0.18 이 이 문제를 자체
-    처리해(LadybugDB/ladybug#527) 우회가 더 이상 필요하지 않다.
+    kuzu 모드는 Ladybug qualification이 끝날 때까지 capability-negative다.
+    RPi5 16KB 페이지 커널의 madvise 문제는 ladybug>=0.18에서 해결됐지만
+    (LadybugDB/ladybug#527), production 경로를 열려면 transaction owner와
+    node/edge 원자적 CAS를 별도로 검증해야 한다.
     """
     if settings.storage_mode == "pg":
         from opencrab.stores.pg_graph_store import PGGraphStore
@@ -53,10 +53,10 @@ def make_graph_store(settings: Settings) -> Any:
         engine = _get_pg_engine(settings.postgres_url)
         return PGGraphStore(engine)
     elif settings.storage_mode == "kuzu":
-        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
+        from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 
         db_path = os.path.join(settings.local_data_dir, "graph.kuzu")
-        return KuzuGraphStore(db_path=db_path)
+        return KuzuUnavailableGraphStore(db_path=db_path)
     elif settings.is_local:
         from opencrab.stores.local_graph_store import LocalGraphStore
 

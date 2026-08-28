@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from opencrab.common.graph_identity import EdgeIdentityConflict, NodeIdentityConflict
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
 
@@ -118,13 +119,13 @@ def test_upsert_and_get_node_roundtrip():
     assert store.get_node("Person", "nope") is None
 
 
-def test_upsert_node_conflict_overwrites_not_merges():
+def test_upsert_node_conflict_is_rejected_without_mutation():
     store = _store()
     store.upsert_node("Person", "p1", {"first_only": "x", "shared": "old"})
-    store.upsert_node("Person", "p1", {"shared": "new"})
+    with pytest.raises(NodeIdentityConflict):
+        store.upsert_node("Person", "p1", {"shared": "new"})
     node = store.get_node("Person", "p1")
-    assert "first_only" not in node
-    assert node["shared"] == "new"
+    assert node == {"first_only": "x", "shared": "old", "id": "p1"}
 
 
 def test_lookup_node_type():
@@ -161,14 +162,15 @@ def test_delete_node_also_removes_incident_edges():
     assert store.find_by_relations("b", ["knows"], direction="in") == []
 
 
-def test_upsert_edge_conflict_overwrites_not_merges():
+def test_upsert_edge_conflict_is_rejected_without_mutation():
     store = _store()
     store.upsert_node("Person", "a", {})
     store.upsert_node("Person", "b", {})
     store.upsert_edge("Person", "a", "knows", "Person", "b", {"since": 2020})
-    store.upsert_edge("Person", "a", "knows", "Person", "b", {"since": 2021})
-    results = store.find_by_relations("a", ["knows"], direction="out")
-    assert len(results) == 1  # no duplicate row from the second upsert
+    with pytest.raises(EdgeIdentityConflict):
+        store.upsert_edge("Person", "a", "knows", "Person", "b", {"since": 2021})
+    edge = store.get_edge("Person", "a", "knows", "Person", "b")
+    assert edge["since"] == 2020
 
 
 def test_run_cypher_is_noop():
@@ -417,21 +419,17 @@ def test_get_node_by_id():
     assert store.get_node_by_id("nope") is None
 
 
-def test_get_nodes_by_id_returns_every_row_for_a_shared_id():
-    # Same node_id under two different node_types (PK is (node_type,
-    # node_id)) -- the exact shape test_read_scope_isolation.py pins as
-    # supported, and the reason get_node_by_id's unordered LIMIT 1 is unsafe
-    # for pack-ownership decisions.
+def test_get_nodes_by_id_returns_the_single_global_identity_row():
+    # A node_id is globally unique, independent of node_type. A second
+    # logical row with the same id is rejected before any ambiguous lookup.
     store = _store()
     store.upsert_node("Document", "dup", {"pack_id": "packA"})
-    store.upsert_node("Concept", "dup", {"pack_id": "packB"})
+    with pytest.raises(NodeIdentityConflict):
+        store.upsert_node("Concept", "dup", {"pack_id": "packB"})
 
     nodes = store.get_nodes_by_id("dup")
 
-    assert len(nodes) == 2
-    assert [n["node_type"] for n in nodes] == ["Concept", "Document"]
-    assert nodes[0]["pack_id"] == "packB"
-    assert nodes[1]["pack_id"] == "packA"
+    assert nodes == [{"pack_id": "packA", "id": "dup", "node_type": "Document"}]
 
 
 def test_get_nodes_by_id_missing_returns_empty_list():

@@ -66,9 +66,11 @@ dev = [
 gguf = [
     "llama-cpp-python>=0.3",
 ]
-# STORAGE_MODE=kuzu (KuzuGraphStore) 에 필요. ladybug는 KùzuDB의 리브랜딩
-# (https://github.com/LadybugDB/ladybug); 0.18 이상은 16KB 페이지 커널
-# (RPi5 등)에서의 madvise 크래시(LadybugDB/ladybug#526/#527)가 수정돼 있다.
+# STORAGE_MODE=kuzu의 선택적 qualification fixture에 필요. production graph
+# facade는 qualification이 끝날 때까지 ladybug를 import하지 않는다. ladybug는
+# KùzuDB의 리브랜딩(https://github.com/LadybugDB/ladybug)이며 0.18 이상은
+# 16KB 페이지 커널(RPi5 등)의 madvise 크래시(LadybugDB/ladybug#526/#527)가
+# 수정돼 있다.
 kuzu = [
     "ladybug>=0.18",
 ]

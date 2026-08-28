@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""1:1 migrate the 4 local SQLite stores (graph/doc/sql/vector) into a
-PostgreSQL PG-unified target (STORAGE_MODE=pg).
+"""Migrate the local SQLite stores into a PostgreSQL PG-unified target.
 
-WHAT THIS DOES: row-for-row copy, widening TEXT-JSON columns to JSONB and
-TEXT timestamps to TIMESTAMPTZ. NO re-embedding — the vector table's raw
+The document, SQL, and vector stores have operational apply paths. The graph
+store is limited to read-only source inspection until its global-identity
+mapping and target writer qualification are complete; a graph apply attempt
+raises ``GraphMigrationFixtureOnlyError`` before opening the target.
+
+WHAT THIS DOES: row-for-row copy for the document, SQL, and vector stores,
+widening TEXT-JSON columns to JSONB and TEXT timestamps to TIMESTAMPTZ. Graph
+selection is inspection-only until its apply qualification is complete. NO
+re-embedding - the vector table's raw
 float32 vectors are copied as-is from the source sqlite-vec (vec0) table via
 ``vec_to_json(embedding)`` (a lossless text serialisation Postgres accepts
 directly as a ``vector`` literal). If the source vec0 table has an
@@ -38,12 +44,12 @@ and reported rather than blindly re-inserted, which would duplicate history.
 Operators should inspect and clear them manually before re-running in that edge
 case.
 
-The graph/doc/vector migrations still skip on equal counts. Their rows are not
+The doc/vector migrations still skip on equal counts. Their rows are not
 credentials, and reworking them is outside this script's SQL-store scope.
 
-SCHEMA CREATION: this script does not hand-roll target DDL for graph/doc —
-it imports and instantiates PGGraphStore/PgDocStore (their constructors run
-ensure-schema idempotently). For the vector table it deliberately does NOT
+SCHEMA CREATION: graph apply does not construct a target store. For the
+document store this script imports and instantiates PgDocStore (its constructor
+runs ensure-schema idempotently). For the vector table it deliberately does NOT
 construct PgVectorStore before the bulk load (that would build the HNSW
 index against an empty table and then maintain it incrementally on every
 INSERT — much slower at scale than a bulk load followed by one index build).
@@ -58,6 +64,10 @@ Usage:
         --data-dir /path/to/localcrab/data --pg-url postgresql://... \\
         [--only graph,doc,sql,vector] [--limit 1000] [--batch 1000] \\
         [--dry-run] [--verify]
+
+    # Graph-only inspection is read-only; graph apply is fixture-only:
+    python scripts/migrate_sqlite_to_pg.py \\
+        --data-dir /path/to/localcrab/data --only graph --dry-run
 
     # Individual file overrides (e.g. ad-hoc backup copies with non-default
     # names) take precedence over --data-dir:
@@ -78,6 +88,8 @@ from collections.abc import Iterator
 from typing import Any
 
 import _migration_tables as mt
+
+from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -169,75 +181,46 @@ def _sqlite_table_names(db_path: str) -> set[str]:
 def migrate_graph(
     db_path: str, engine: Any, schema: str, batch: int, limit: int | None, dry_run: bool
 ) -> dict[str, int]:
-    from sqlalchemy import text
+    raise GraphMigrationFixtureOnlyError("graph apply is fixture-only")
 
-    from opencrab.stores.pg_graph_store import PGGraphStore
 
+def inspect_graph_source(db_path: str) -> dict[str, Any]:
+    """Return a complete, read-only graph source inventory.
+
+    Graph apply is deliberately fixture-only; this helper is the production
+    migration entry point for source inspection and never opens a target.
+    """
     if not os.path.exists(db_path):
-        print(f"# [graph] source not found, skipping: {db_path}")
-        return {}
-
+        return {"nodes": 0, "edges": 0, "duplicates": [], "mapping_required": [], "incomplete_endpoints": []}
     src = _sqlite_conn(db_path)
-    src_nodes = _count(src, "graph_nodes")
-    src_edges = _count(src, "graph_edges")
-    print(f"# [graph] source rows: nodes={src_nodes} edges={src_edges}")
-
-    if dry_run:
-        print(f"# [graph] dry-run: would upsert into \"{schema}\".graph_nodes/graph_edges")
+    try:
+        tables = _sqlite_table_names(db_path)
+        if not {"graph_nodes", "graph_edges"}.issubset(tables):
+            return {"nodes": 0, "edges": 0, "duplicates": [], "mapping_required": [], "incomplete_endpoints": []}
+        nodes = [dict(row) for row in src.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes")]
+        edges = [dict(row) for row in src.execute("SELECT from_type, from_id, relation, to_type, to_id, properties FROM graph_edges")]
+    finally:
         src.close()
-        return {"graph_nodes": src_nodes, "graph_edges": src_edges}
-
-    store = PGGraphStore(engine, schema=schema)  # idempotent ensure-schema
-    if not store.available:
-        raise RuntimeError("PGGraphStore is not available (connection failed).")
-    t = f'"{schema}"'
-
-    with engine.begin() as conn:
-        existing = _pg_count(conn, text, f"{t}.graph_nodes")
-    copied_nodes = 0
-    if existing == src_nodes and src_nodes > 0:
-        print(f"# [graph] graph_nodes already has {existing} rows == source — skip.")
-    else:
-        node_sql = text(
-            f"INSERT INTO {t}.graph_nodes (node_type, node_id, space_id, properties) "
-            "VALUES (:node_type, :node_id, :space_id, (:properties)::jsonb) "
-            "ON CONFLICT (node_type, node_id) DO UPDATE SET "
-            "space_id = EXCLUDED.space_id, properties = EXCLUDED.properties"
-        )
-        for rows in _fetch_batches(src, "SELECT node_type, node_id, space_id, properties FROM graph_nodes", batch, limit):
-            params = [dict(r) for r in rows]
-            with engine.begin() as conn:
-                conn.execute(node_sql, params)
-            copied_nodes += len(params)
-        print(f"#   graph_nodes: {copied_nodes} copied")
-
-    with engine.begin() as conn:
-        existing_e = _pg_count(conn, text, f"{t}.graph_edges")
-    copied_edges = 0
-    if existing_e == src_edges and src_edges > 0:
-        print(f"# [graph] graph_edges already has {existing_e} rows == source — skip.")
-    else:
-        edge_sql = text(
-            f"INSERT INTO {t}.graph_edges (from_type, from_id, relation, to_type, to_id, properties) "
-            "VALUES (:from_type, :from_id, :relation, :to_type, :to_id, (:properties)::jsonb) "
-            "ON CONFLICT (from_type, from_id, relation, to_type, to_id) DO UPDATE SET "
-            "properties = EXCLUDED.properties"
-        )
-        for rows in _fetch_batches(
-            src,
-            "SELECT from_type, from_id, relation, to_type, to_id, properties FROM graph_edges",
-            batch,
-            limit,
-        ):
-            params = [dict(r) for r in rows]
-            with engine.begin() as conn:
-                conn.execute(edge_sql, params)
-            copied_edges += len(params)
-        print(f"#   graph_edges: {copied_edges} copied")
-
-    src.close()
-    store.close()
-    return {"graph_nodes": src_nodes, "graph_edges": src_edges}
+    node_types: dict[str, set[str]] = {}
+    for row in nodes:
+        node_types.setdefault(str(row["node_id"]), set()).add(str(row["node_type"]))
+    edge_types: dict[tuple[str, str, str], set[tuple[str, str]]] = {}
+    for row in edges:
+        key = (str(row["from_id"]), str(row["relation"]), str(row["to_id"]))
+        edge_types.setdefault(key, set()).add((str(row["from_type"]), str(row["to_type"])))
+    ids = set(node_types)
+    duplicate_nodes = [{"node_id": k, "node_types": sorted(v)} for k, v in sorted(node_types.items()) if len(v) > 1]
+    duplicate_edges = [{"edge_key": k, "endpoint_types": sorted(v)} for k, v in sorted(edge_types.items()) if len(v) > 1]
+    incomplete = [
+        {"edge_key": (r["from_id"], r["relation"], r["to_id"]), "missing": [i for i in (str(r["from_id"]), str(r["to_id"])) if i not in ids]}
+        for r in edges if str(r["from_id"]) not in ids or str(r["to_id"]) not in ids
+    ]
+    return {
+        "nodes": len(nodes), "edges": len(edges),
+        "duplicates": duplicate_nodes + duplicate_edges,
+        "mapping_required": duplicate_nodes,
+        "incomplete_endpoints": incomplete,
+    }
 
 
 def migrate_doc(
@@ -747,6 +730,11 @@ def main() -> int:
     vector_src_table = args.vector_src_table or settings.vector_collection
     vector_dst_table = args.vector_dst_table or settings.embed_collection
     only = {s.strip() for s in args.only.split(",") if s.strip()}
+    # Reject graph apply before target construction or credential probes.
+    # Dry-run is read-only and uses ``inspect_graph_source`` below to report
+    # whether an explicit identity mapping is needed.
+    if "graph" in only and not args.dry_run:
+        raise GraphMigrationFixtureOnlyError("graph apply is fixture-only")
     _check_ident(args.pg_schema, "pg-schema")
 
     print(f"# data-dir : {data_dir}")
@@ -795,9 +783,17 @@ def main() -> int:
     source_counts: dict[str, dict[str, int | None]] = {}
     try:
         if "graph" in only:
-            source_counts["graph"] = migrate_graph(
-                graph_db, engine, args.pg_schema, args.batch, args.limit, args.dry_run
-            )
+            if args.dry_run:
+                inventory = inspect_graph_source(graph_db)
+                source_counts["graph"] = {
+                    "graph_nodes": int(inventory["nodes"]),
+                    "graph_edges": int(inventory["edges"]),
+                }
+                print(f"# [graph] dry-run source inventory: {inventory}")
+            else:
+                source_counts["graph"] = migrate_graph(
+                    graph_db, engine, args.pg_schema, args.batch, args.limit, args.dry_run
+                )
         if "doc" in only:
             source_counts["doc"] = migrate_doc(
                 doc_db, engine, args.pg_schema, args.batch, args.limit, args.dry_run

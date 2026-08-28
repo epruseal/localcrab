@@ -1,0 +1,267 @@
+{
+  "api": {
+    "Connection": {
+      "module": "ladybug.connection",
+      "present": true,
+      "public": [
+        "close",
+        "create_arrow_rel_table",
+        "create_arrow_table",
+        "create_function",
+        "drop_arrow_table",
+        "execute",
+        "init_connection",
+        "interrupt",
+        "prepare",
+        "query_as_arrow",
+        "remove_function",
+        "set_max_threads_for_exec",
+        "set_query_timeout"
+      ],
+      "signature": "(database: 'Database', num_threads: 'int' = 0)"
+    },
+    "Database": {
+      "module": "ladybug.database",
+      "present": true,
+      "public": [
+        "check_for_database_close",
+        "close",
+        "get_storage_version",
+        "get_torch_geometric_remote_backend",
+        "get_version",
+        "init_database",
+        "init_pybind_database"
+      ],
+      "signature": "(database_path: 'str | Path | None' = None, *, buffer_pool_size: 'int' = 0, max_num_threads: 'int' = 0, compression: 'bool' = True, lazy_init: 'bool' = False, read_only: 'bool' = False, max_db_size: 'int | None' = None, auto_checkpoint: 'bool' = True, checkpoint_threshold: 'int' = -1, throw_on_wal_replay_failure: 'bool' = True, enable_checksums: 'bool' = True, enable_multi_writes: 'bool' = False, backend: 'str' = 'auto')"
+    },
+    "Transaction": {
+      "module": null,
+      "present": false,
+      "public": [],
+      "signature": null
+    }
+  },
+  "concurrent_independent_process": {
+    "exitcodes": [
+      0,
+      0
+    ],
+    "final": {
+      "ok": true,
+      "rows": [
+        {
+          "n.node_digest": "shared",
+          "n.node_type": "Initial"
+        }
+      ]
+    },
+    "setup": {
+      "node": {
+        "ok": true,
+        "rows": [
+          {
+            "result": "Table Node has been created."
+          }
+        ]
+      },
+      "seed": {
+        "ok": true,
+        "rows": []
+      }
+    },
+    "workers": [
+      {
+        "before_cas": {
+          "ok": true,
+          "rows": [
+            {
+              "n.node_digest": "shared"
+            }
+          ]
+        },
+        "begin_api": "absent from Database/Connection public API",
+        "database_options": {
+          "enable_multi_writes": true
+        },
+        "fatal": "BrokenBarrierError: ",
+        "pid": 83009,
+        "traceback": "Traceback (most recent call last):\n  File \"/private/tmp/issue80-kuzu-qual.br54iM/qualification_probe.py\", line 168, in concurrent_worker\n    barrier.wait(timeout=20)\n    ~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/threading.py\", line 740, in wait\n    self._wait(timeout)\n    ~~~~~~~~~~^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/threading.py\", line 778, in _wait\n    raise BrokenBarrierError\nthreading.BrokenBarrierError\n",
+        "worker": "1"
+      },
+      {
+        "fatal": "RuntimeError: IO exception: Could not set lock on file : /private/tmp/issue80-kuzu-qual.br54iM/probe-db-xoam6n5m/concurrent (Error: Resource temporarily unavailable)\nSee the docs: https://docs.ladybugdb.com/concurrency for more information.",
+        "traceback": "Traceback (most recent call last):\n  File \"/private/tmp/issue80-kuzu-qual.br54iM/qualification_probe.py\", line 159, in concurrent_worker\n    db = ladybug.Database(db_path, enable_multi_writes=True)\n  File \"/private/tmp/issue80-kuzu-qual.br54iM/venv/lib/python3.14/site-packages/ladybug/database.py\", line 136, in __init__\n    self.init_database()\n    ~~~~~~~~~~~~~~~~~~^^\n  File \"/private/tmp/issue80-kuzu-qual.br54iM/venv/lib/python3.14/site-packages/ladybug/database.py\", line 221, in init_database\n    self._database = self.init_pybind_database()\n                     ~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/private/tmp/issue80-kuzu-qual.br54iM/venv/lib/python3.14/site-packages/ladybug/database.py\", line 260, in init_pybind_database\n    self._pybind_database = pybind_module.Database(**kwargs)\n                            ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^\nRuntimeError: IO exception: Could not set lock on file : /private/tmp/issue80-kuzu-qual.br54iM/probe-db-xoam6n5m/concurrent (Error: Resource temporarily unavailable)\nSee the docs: https://docs.ladybugdb.com/concurrency for more information.\n",
+        "worker": "2"
+      }
+    ]
+  },
+  "module": {
+    "file": "/private/tmp/issue80-kuzu-qual.br54iM/venv/lib/python3.14/site-packages/ladybug/__init__.py",
+    "version": "0.19.1"
+  },
+  "platform": {
+    "machine": "arm64",
+    "python": "3.14.6",
+    "system": "Darwin"
+  },
+  "single_connection": {
+    "db_path": "/private/tmp/issue80-kuzu-qual.br54iM/probe-db-xoam6n5m/single",
+    "operations": {
+      "begin_command_2": {
+        "ok": true,
+        "rows": []
+      },
+      "check_commit": {
+        "ok": true,
+        "rows": [
+          {
+            "n.node_id": "commit"
+          }
+        ]
+      },
+      "check_rollback": {
+        "ok": true,
+        "rows": []
+      },
+      "commit": {
+        "ok": true,
+        "rows": []
+      },
+      "conditional_cas": {
+        "ok": true,
+        "rows": [
+          {
+            "n.node_digest": "d4",
+            "n.node_id": "a",
+            "n.node_type": "Account"
+          }
+        ]
+      },
+      "create_edge": {
+        "ok": true,
+        "rows": []
+      },
+      "create_node": {
+        "ok": true,
+        "rows": [
+          {
+            "result": "Table Node has been created."
+          }
+        ]
+      },
+      "duplicate_pk": {
+        "error": "RuntimeError: Runtime exception: Found duplicated primary key value a, which violates the uniqueness constraint of the primary key column.",
+        "ok": false
+      },
+      "edge_conditional_cas": {
+        "ok": true,
+        "rows": [
+          {
+            "r.edge_digest": "e2"
+          }
+        ]
+      },
+      "edge_count_after_failed_write": {
+        "ok": true,
+        "rows": [
+          {
+            "count": 1
+          }
+        ]
+      },
+      "edge_rows_final": {
+        "ok": true,
+        "rows": [
+          {
+            "a.node_id": "c",
+            "b.node_id": "d",
+            "r.edge_digest": "e2",
+            "r.relation": "owns"
+          }
+        ]
+      },
+      "edge_stale_cas": {
+        "ok": true,
+        "rows": []
+      },
+      "failed_edge_absent_after_rollback": {
+        "ok": true,
+        "rows": []
+      },
+      "failed_edge_write": {
+        "ok": true,
+        "rows": []
+      },
+      "failed_edge_write_begin": {
+        "ok": true,
+        "rows": []
+      },
+      "failed_edge_write_rollback": {
+        "error": "RuntimeError: No active transaction for ROLLBACK.",
+        "ok": false
+      },
+      "failed_edge_write_trigger": {
+        "error": "RuntimeError: Runtime exception: Found duplicated primary key value a, which violates the uniqueness constraint of the primary key column.",
+        "ok": false
+      },
+      "insert_a": {
+        "ok": true,
+        "rows": []
+      },
+      "insert_b": {
+        "ok": true,
+        "rows": []
+      },
+      "insert_before_commit": {
+        "ok": true,
+        "rows": []
+      },
+      "insert_before_rollback": {
+        "ok": true,
+        "rows": []
+      },
+      "node_rows_final": {
+        "ok": true,
+        "rows": [
+          {
+            "n.node_digest": "d4",
+            "n.node_id": "a",
+            "n.node_type": "Account"
+          },
+          {
+            "n.node_digest": "d2",
+            "n.node_id": "b",
+            "n.node_type": "Asset"
+          },
+          {
+            "n.node_digest": "d6",
+            "n.node_id": "c",
+            "n.node_type": "Person"
+          },
+          {
+            "n.node_digest": "dc",
+            "n.node_id": "commit",
+            "n.node_type": "Probe"
+          },
+          {
+            "n.node_digest": "d7",
+            "n.node_id": "d",
+            "n.node_type": "Asset"
+          }
+        ]
+      },
+      "rollback": {
+        "ok": true,
+        "rows": []
+      },
+      "rollback_command": {
+        "ok": true,
+        "rows": []
+      },
+      "stale_cas": {
+        "ok": true,
+        "rows": []
+      }
+    }
+  }
+}

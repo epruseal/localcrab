@@ -1,0 +1,13 @@
+{
+  "schema_version": "issue80.qualification.v1",
+  "backend": "kuzu-ladybug",
+  "observed_platform": "macos-arm64-cp314",
+  "runtime_version": "ladybug==0.19.1",
+  "wheel_sha256": "cf4239deeadf45252563059a9185b6955f5c80b370c49fc5097bb704da8c821b",
+  "binary_included": false,
+  "portable_checks": "validate this bundle and source guards without importing Ladybug or opening a database",
+  "live_probe": "evidence only; does not activate writes",
+  "source_guard": "active constructor/facade contain no executable graph mutation sink",
+  "raw_metadata": "raw_pypi_metadata.json",
+  "evidence": ["kuzu_capability.json"]
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": "issue80.kuzu-capability.v1",
+  "backend": "kuzu-ladybug",
+  "observed_platform": "macos-arm64-cp314",
+  "runtime_version": "ladybug==0.19.1",
+  "atomic_write_capability": "unavailable",
+  "node_atomic_cas": false,
+  "edge_atomic_cas": false,
+  "production_constructor": "capability-negative before optional import or path access",
+  "public_mutation_dml": "zero",
+  "migration_apply": "fixture-only",
+  "source_inspection": "read-only"
+}

@@ -250,15 +250,19 @@ class TestLocalGraphStoreConcurrency:
         assert errors == [], f"단건/배치 동시 에러: {errors}"
         assert graph_store.count_nodes("T") == N * 50
 
-    def test_concurrent_same_key_upsert(self, graph_store):
-        """엣지: 동일 키를 여러 스레드가 동시 upsert → last-write-wins, 1개만 존재."""
+    def test_concurrent_same_key_upsert_rejects_conflicting_payloads(self, graph_store):
+        """동일 전역 키의 서로 다른 payload는 경합에서도 충돌로 거부된다."""
 
         def worker(tid: int) -> None:
             for _ in range(100):
                 graph_store.upsert_node("T", "shared", {"tid": tid})
 
         errors = run_threads(worker, 10)
-        assert errors == [], f"동일 키 동시 upsert 에러: {errors}"
+        from opencrab.common.graph_identity import NodeIdentityConflict
+
+        assert errors and all(isinstance(error, NodeIdentityConflict) for error in errors), (
+            f"동일 키 충돌이 예측하지 못한 오류로 끝났다: {errors}"
+        )
         assert graph_store.count_nodes("T") == 1
         assert graph_store.get_node("T", "shared") is not None
 

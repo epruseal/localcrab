@@ -874,7 +874,7 @@ def _backfill_graph(settings: Any, default_pack_id: str, apply: bool) -> dict[st
     backfill_pack_ids`` (same function ``opencrab packs backfill-pack-id``
     already exposes) rather than re-implementing pack_id backfill -- see
     module docstring SCOPE for why this is local-mode-only."""
-    from opencrab.ontology.pack_provenance import backfill_pack_ids
+    from opencrab.ontology.pack_provenance import inspect_pack_ids
 
     db_path = _local_graph_db_path(settings)
     if db_path is None:
@@ -887,18 +887,37 @@ def _backfill_graph(settings: Any, default_pack_id: str, apply: bool) -> dict[st
             print(f"  {Path(settings.local_data_dir) / 'graph.db'} does not exist -- skipping.")
         return {"skipped": True}
 
-    summary = backfill_pack_ids(db_path, assume_pack_id=default_pack_id, dry_run=not apply)
-    print(f"  graph.db backfill_pack_ids: {summary}")
+    plan = inspect_pack_ids(db_path, assume_pack_id=default_pack_id)
+    if not apply:
+        summary = {"dry_run": True, **plan}
+        print(f"  graph.db pack provenance plan: {summary}")
+        return summary
+    from opencrab.stores.factory import make_graph_store
+
+    graph = make_graph_store(settings)
+    try:
+        if not graph.available:
+            raise RuntimeError("target graph store is not available")
+        receipt = (
+            graph.backfill_pack_provenance(plan["records"])
+            if plan["records"]
+            else None
+        )
+    finally:
+        graph.close()
+    summary = {"dry_run": False, "receipt": receipt, **plan}
+    print(f"  graph.db pack provenance receipt: {receipt}")
     return summary
 
 
 def _split_ambiguous(
     seen: dict[str, set[str]],
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """The graph PK is ``(node_type, node_id)``, so several graph rows may
-    legally share one node_id -- but the vector store's identity is node_id
-    ALONE (``upsert_texts(ids=[node_id])``), so when those rows resolve to
-    DIFFERENT pack_ids there is no single correct value a vector row could
+    """Resolve graph-derived ownership for the vector store's global id.
+
+    A qualified graph target has one row per node_id. Legacy or externally
+    corrupted sources can still expose duplicate rows; when those rows resolve
+    to DIFFERENT pack_ids there is no single correct value a vector row could
     carry (#146 M P1-1 review round 2). Such node_ids are excluded from the
     map (= no vector upsert) and reported as ambiguous; agreeing duplicates
     collapse to their one shared value."""
@@ -941,17 +960,13 @@ def _graph_twin_pack_map(
     inconsistency this closes; it would be invisible if this only looked at
     graph's own missing rows.
 
-    Keyed by ``(space_id, node_id)`` -- the graph PK is ``(node_type,
-    node_id)``, so one node_id can legally carry DIFFERENT pack_ids across
-    types/spaces (PR #177 review round 2 v2 결함 5's exact scenario: a
-    ``(TypeA, shared, space=concept, pack-a)`` + ``(TypeB, shared,
-    space=evidence, pack-b)`` pair is NOT ambiguous for a doc row keyed
-    ``(concept, shared)`` -- it resolves cleanly to ``pack-a``; only rows
-    sharing the SAME ``(space_id, node_id)`` with different pack_ids are
-    truly ambiguous). ``exact_map`` only carries entries where every graph
-    row sharing that ``(space_id, node_id)`` pair agrees; disagreement is
-    reported via ``ambiguous`` (reusing ``_split_ambiguous`` -- its
-    ``dict[str, ...]`` type hint is written for the vector-side str key,
+    Keyed by ``(space_id, node_id)`` because that is the document twin's
+    identity. A qualified graph target contributes at most one row for the
+    node_id; duplicate legacy/corrupt rows are grouped here so a conflicting
+    ownership value is reported and excluded rather than guessed. ``exact_map``
+    only carries entries where every graph row sharing that pair agrees;
+    disagreement is reported via ``ambiguous`` (reusing ``_split_ambiguous`` --
+    its ``dict[str, ...]`` type hint is written for the vector-side str key,
     but the function itself is a plain key->set(values) splitter with no
     str-specific behavior, so a tuple key works identically) and excluded
     from both maps. ``fallback_map`` is a node_id-ONLY aggregate (used when
@@ -1978,9 +1993,9 @@ def main(argv: list[str] | None = None) -> int:
         default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
 
         print("\n2) Backfilling graph rows with no pack_id...")
-        # dict.fromkeys: dedupe while keeping order -- duplicate node_ids
-        # (legal: the graph PK is (node_type, node_id)) must not trigger
-        # duplicate vector upserts.
+        # dict.fromkeys: dedupe while keeping order. The qualified graph
+        # schema already enforces one row per node_id; this also keeps a
+        # legacy/corrupt source from generating duplicate vector probes.
         node_ids_needing_check = list(dict.fromkeys(_graph_missing_node_ids(graph)))
         local_db_path = _local_graph_db_path(settings)
         # Predicted BEFORE the backfill writes anything -- resolve_row_pack_id

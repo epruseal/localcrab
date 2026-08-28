@@ -624,7 +624,19 @@ def _fork_pack_inner(
         if node_id is None:
             node_errors.append("node missing props['id']; skipped (Tier 1)")
             continue
-        props = record["props"]
+        raw_props = dict(record["props"] or {})
+        # Neo4j exports include storage metadata alongside user properties.
+        # Read the explicit type before removing those fields, then pass only
+        # writer-safe properties downstream; the graph writer stamps the
+        # identity columns itself.
+        props = {
+            key: value
+            for key, value in raw_props.items()
+            if key not in {"node_type", "node_digest"}
+            and not (key == "node_id" and value == node_id)
+        }
+        record = dict(record)
+        record["props"] = props
         labels = record.get("labels") or []
         # design §18-3: `labels` is not uniform across backends and its order
         # is undeclared (Neo4j returns the marker plus the domain type from
@@ -633,6 +645,14 @@ def _fork_pack_inner(
         # consumer reuses the result via `seen_node_types` rather than
         # re-indexing `labels`.
         domain = domain_labels(labels)
+        # The labels are the portable export shape: SQL/Kùzu return one
+        # domain label, while Neo4j returns that label plus its marker in an
+        # unspecified order.  The optional ``node_type`` field is a storage
+        # compatibility field, not a substitute for resolving the exported
+        # label shape.  In particular, a marker-only row must remain a
+        # missing-type Tier 1 defect instead of silently trusting a stale
+        # explicit column value.
+        node_type = domain[0] if len(domain) == 1 else None
         if len(domain) >= 2:
             # Decided BEFORE the anchor branch below on purpose: a row whose
             # type cannot be determined cannot be judged "is this the anchor"
@@ -647,7 +667,6 @@ def _fork_pack_inner(
                 "one of them is not deterministic -- collapse it to a single "
                 "domain label"
             )
-        node_type = domain[0] if domain else None
         space = props.get("space")
         if node_id == src_anchor:
             # The source pack's OWN anchor is never copied as an ordinary
@@ -769,7 +788,18 @@ def _fork_pack_inner(
         if not grammar.valid:
             edge_errors.append(f"edge {from_id!r}->{to_id!r} failed grammar validation; skipped (Tier 1)")
             continue
-        rel_props = dict(record.get("rel_props") or {})
+        # The target graph writer derives these fields from the endpoint
+        # arguments and stores them in dedicated identity columns.  They are
+        # present in exports from the target schema, but passing the source
+        # values through would make the destination endpoint disagree with
+        # them and fail ``normalize_edge_properties``.  Keep only user-owned
+        # edge properties for the remap/write path, just as the node axis
+        # removes its storage identity fields above.
+        rel_props = {
+            key: value
+            for key, value in (record.get("rel_props") or {}).items()
+            if key not in {"from_id", "relation", "to_id", "edge_key", "from_type", "to_type", "edge_digest"}
+        }
         try:
             canonicalize_pack_alias(rel_props)
         except ValueError:

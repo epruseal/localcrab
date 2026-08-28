@@ -7,8 +7,9 @@ LocalCrab은 **[AlexAI-MCP/OpenCrab](https://github.com/AlexAI-MCP/OpenCrab)** �
 LocalCrab is a standalone local ontology service — by default it runs on a
 single machine without Docker using SQLite for all stores, including vectors
 via sqlite-vec (Chroma remains available as an alternate vector backend);
-`STORAGE_MODE` also supports a Kuzu-graph variant and a unified-PostgreSQL
-mode for heavier deployments. OpenCrab SaaS, available at
+`STORAGE_MODE=kuzu` retains a capability-negative graph facade until the
+Ladybug transaction/CAS qualification is complete. A unified-PostgreSQL mode
+is available for heavier deployments. OpenCrab SaaS, available at
 [opencrab.sh](https://opencrab.sh), is a separate hosted ecosystem where packs are
 ingested, distributed, installed, queried, and shared.
 

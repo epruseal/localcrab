@@ -11,6 +11,7 @@ from typing import Any
 # with byte-identical output.
 from opencrab.common.ids import canonical_json as _stable_json
 from opencrab.common.ids import stable_id as _sha_id
+from opencrab.stores._graph_common import domain_labels
 
 # Named presets for the strict/copy/rel_endpoint_fallback trio below. These are
 # additive sugar on top of the individual flags -- they do NOT replace them.
@@ -63,7 +64,8 @@ def _resolve_node_type(
         for label in labels:
             if label in label_priority:
                 return label
-    return labels[0] if labels else ""
+    domains = domain_labels(labels)
+    return domains[0] if len(domains) == 1 else ""
 
 
 def _resolve_space(
@@ -185,8 +187,8 @@ def _normalise_edge(
     payload = {
         "from_id": _endpoint_id(source_props, rel_props, "from_id", rel_endpoint_fallback=rel_endpoint_fallback),
         "to_id": _endpoint_id(target_props, rel_props, "to_id", rel_endpoint_fallback=rel_endpoint_fallback),
-        "from_space": _resolve_space(source_props, source_labels[0] if source_labels else "", label_to_space=label_to_space),
-        "to_space": _resolve_space(target_props, target_labels[0] if target_labels else "", label_to_space=label_to_space),
+        "from_space": _resolve_space(source_props, _resolve_node_type(source_props, source_labels), label_to_space=label_to_space),
+        "to_space": _resolve_space(target_props, _resolve_node_type(target_props, target_labels), label_to_space=label_to_space),
         "relation": str(relation_raw or rel_props.get("relation") or "").lower(),
         "properties": rel_props,
         "confidence": rel_props.get("confidence"),

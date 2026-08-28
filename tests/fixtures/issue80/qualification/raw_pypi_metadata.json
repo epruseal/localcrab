@@ -1,0 +1,8 @@
+{
+  "schema_version": "issue80.pypi-observation.v1",
+  "project": "ladybug",
+  "version": "0.19.1",
+  "observation_note": "The complete response is retained by the qualification run that produced this bundle.",
+  "wheel_sha256": "cf4239deeadf45252563059a9185b6955f5c80b370c49fc5097bb704da8c821b",
+  "binary_included": false
+}

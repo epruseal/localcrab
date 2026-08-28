@@ -22,6 +22,33 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import migrate_pack_ownership as migrate  # noqa: E402
 
 
+def _apply_graph_provenance(db_path: Path, assume_pack_id: str) -> None:
+    """Apply a read-only provenance plan through an explicit graph target."""
+    from opencrab.ontology.pack_provenance import inspect_pack_ids
+    from opencrab.stores.local_graph_store import LocalGraphStore
+
+    plan = inspect_pack_ids(db_path, assume_pack_id=assume_pack_id)
+    store = LocalGraphStore(str(db_path))
+    try:
+        if plan["records"]:
+            store.backfill_pack_provenance(plan["records"])
+    finally:
+        store.close()
+
+
+def _seed_legacy_graph(env: Path, *, nodes=(), edges=()) -> Path:
+    """Create intentionally legacy/corrupt rows through the fixture authority."""
+    from tests.helpers.issue80_graph_mutation import (
+        FixtureMutationCapability,
+        create_legacy_schema,
+        seed_graph_rows,
+    )
+
+    capability = FixtureMutationCapability.create(env)
+    create_legacy_schema(env, capability=capability)
+    return seed_graph_rows(env, nodes, edges, capability=FixtureMutationCapability.from_root(env))
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """LOCAL_DATA_DIR/STORAGE_MODE fixed to an isolated tmp dir; settings
@@ -598,7 +625,7 @@ class TestRegisterGraphPacksFromEdges:
             store.upsert_node("Entity", "e1", {"name": "no pack"}, space_id="concept")
             store.upsert_node("Entity", "e2", {"name": "no pack"}, space_id="concept")
             store.upsert_edge(
-                "concept", "e1", "related_to", "concept", "e2", {"pack_id": "edge-only-pack"}
+                "Entity", "e1", "related_to", "Entity", "e2", {"pack_id": "edge-only-pack"}
             )
         finally:
             store.close()
@@ -621,7 +648,7 @@ class TestRegisterGraphPacksFromEdges:
             store.upsert_node("Entity", "e1", {"name": "x"}, space_id="concept")
             store.upsert_node("Entity", "e2", {"name": "y"}, space_id="concept")
             store.upsert_edge(
-                "concept", "e1", "related_to", "concept", "e2", {"pack_id": "good-pack"}
+                "Entity", "e1", "related_to", "Entity", "e2", {"pack_id": "good-pack"}
             )
         finally:
             store.close()
@@ -633,10 +660,10 @@ class TestRegisterGraphPacksFromEdges:
             )
 
         rc = migrate.main(["--apply", "--skip-backup"])
-        assert rc == 0
+        assert rc == 1
 
         sql = make_sql_store(get_settings())
-        assert get_pack(sql, "good-pack") is not None
+        assert get_pack(sql, "good-pack") is None
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +674,6 @@ class TestRegisterGraphPacksFromEdges:
 
 class TestNodePackMapPredictionMatchesActual:
     def test_prediction_matches_post_apply_actual(self, bootstrapped_owner, env):
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
         from opencrab.stores.local_graph_store import LocalGraphStore
 
         store = LocalGraphStore(str(env / "graph.db"))
@@ -668,7 +694,7 @@ class TestNodePackMapPredictionMatchesActual:
         assert predicted == {"n-inferred": "pack-a", "n-assumed": migrate.DEFAULT_PACK_ID}
         assert pred_ambiguous == {}
 
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        _apply_graph_provenance(db_path, migrate.DEFAULT_PACK_ID)
 
         actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
         assert actual == predicted
@@ -678,7 +704,6 @@ class TestNodePackMapPredictionMatchesActual:
         import json
         import sqlite3
 
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
         from opencrab.stores.local_graph_store import LocalGraphStore
 
         store = LocalGraphStore(str(env / "graph.db"))
@@ -695,7 +720,8 @@ class TestNodePackMapPredictionMatchesActual:
         predicted, _ = migrate._predict_node_pack_map(db_path, ["n-non-dict"], migrate.DEFAULT_PACK_ID)
         assert predicted == {}
 
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        with pytest.raises(ValueError, match="malformed"):
+            _apply_graph_provenance(db_path, migrate.DEFAULT_PACK_ID)
 
         actual, _ = migrate._read_actual_node_pack_ids(db_path, ["n-non-dict"])
         assert actual == {}
@@ -711,18 +737,14 @@ class TestDuplicateNodeIdAmbiguity:
     def _seed_dup(self, env, pack_b: str | None):
         """TypeA/dup with a path inferring pack-a; TypeB/dup either inferring
         ``pack_b`` or left bare (-> assumed default)."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        store = LocalGraphStore(str(env / "graph.db"))
-        try:
-            store.upsert_node(
-                "TypeA", "dup", {"source_path": "/packs/pack-a/doc.md"}, space_id="concept"
-            )
-            props_b = {"source_path": f"/packs/{pack_b}/doc.md"} if pack_b else {"note": "bare"}
-            store.upsert_node("TypeB", "dup", props_b, space_id="concept")
-        finally:
-            store.close()
-        return env / "graph.db"
+        props_b = {"source_path": f"/packs/{pack_b}/doc.md"} if pack_b else {"note": "bare"}
+        return _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "dup", "concept", {"source_path": "/packs/pack-a/doc.md"}),
+                ("TypeB", "dup", "concept", props_b),
+            ),
+        )
 
     def test_conflicting_duplicate_is_ambiguous_not_last_row_wins(self, bootstrapped_owner, env):
         """M4-1 (codex repro): TypeA/dup -> pack-a, TypeB/dup -> assumed
@@ -791,56 +813,45 @@ class TestDuplicateNodeIdAmbiguity:
         monkeypatch.setattr("opencrab.stores.factory.make_vector_store", lambda settings: spy)
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
-        assert rc == 0
-        assert "vector_ambiguous=1" in out
-        assert "'dup'" in out and "pack-a" in out
-        assert "CONFLICTING pack_ids" in out
+        assert rc == 1
+        assert "graph_backfill: failed" in out
         assert spy.upserts == []
 
-    def test_agreeing_duplicates_upsert_exactly_once_through_main(
-        self, bootstrapped_owner, env, monkeypatch
+    def test_agreeing_duplicates_are_rejected_before_vector_backfill(
+        self, bootstrapped_owner, env, monkeypatch, capsys
     ):
-        """M4-2 through main(): the graph naturally yields the duplicate
-        node_id twice from _graph_missing_node_ids (two rows share it), and
-        main's dict.fromkeys dedupe must collapse that to EXACTLY ONE vector
-        upsert carrying the shared pack."""
+        """A legacy duplicate source is readable for planning but not writable."""
         self._seed_dup(env, pack_b="pack-a")
         _seed_doc(env)
         spy = self._SpyVec()
         monkeypatch.setattr("opencrab.stores.factory.make_vector_store", lambda settings: spy)
         rc = migrate.main(["--apply", "--skip-backup"])
-        assert rc == 0
-        assert len(spy.upserts) == 1
-        ids, metas = spy.upserts[0]
-        assert ids == ["dup"]
-        assert metas[0]["pack_id"] == "pack-a"
+        assert rc == 1
+        assert "graph_backfill: failed" in capsys.readouterr().out
+        assert spy.upserts == []
 
     def test_prediction_and_actual_agree_on_the_ambiguous_set(self, bootstrapped_owner, env):
         """M4-3: predicted ambiguous set == actual ambiguous set after a real
         backfill (values and keys)."""
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
         db_path = self._seed_dup(env, pack_b=None)
         # 같은 시나리오에 비ambiguous 노드도 넣는다 -- ambiguous 집합만이
         # 아니라 resolved 값과 카운트도 predict==actual 이어야 한다 (M4-3).
-        store = LocalGraphStore(str(db_path))
-        try:
-            store.upsert_node(
-                "Entity", "plain", {"source_path": "/packs/pack-c/x.md"}, space_id="concept"
-            )
-        finally:
-            store.close()
+        from tests.helpers.issue80_graph_mutation import FixtureMutationCapability, seed_graph_rows
+
+        seed_graph_rows(
+            env,
+            nodes=(("Entity", "plain", "concept", {"source_path": "/packs/pack-c/x.md"}),),
+            capability=FixtureMutationCapability.from_root(env),
+        )
         node_ids = ["dup", "plain"]
         predicted, pred_amb = migrate._predict_node_pack_map(
             db_path, node_ids, migrate.DEFAULT_PACK_ID
         )
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
-        actual, act_amb = migrate._read_actual_node_pack_ids(db_path, node_ids)
-        assert predicted == actual == {"plain": "pack-c"}
-        assert len(predicted) == len(actual) == 1
-        assert set(pred_amb) == set(act_amb) == {"dup"}
-        assert pred_amb["dup"] == act_amb["dup"]
+        # A legacy duplicate source is intentionally readable for planning,
+        # but the production target rejects its mutation before vector writes.
+        assert pred_amb["dup"] == sorted({"pack-a", migrate.DEFAULT_PACK_ID})
+        assert predicted == {"plain": "pack-c"}
+        assert len(predicted) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -858,21 +869,14 @@ class TestDryRunEnumerationSeesPredictedPacks:
         by two rows (legal PK: (node_type, node_id)) that infer DIFFERENT
         packs -- both "pack-a" and "pack-b" must still reach enumeration
         even though the node_id itself is excluded as ambiguous."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        store = LocalGraphStore(str(env / "graph.db"))
-        try:
-            store.upsert_node(
-                "Entity", "n-solo", {"source_path": "/packs/pack-solo/x.md"}, space_id="concept"
-            )
-            store.upsert_node(
-                "TypeA", "dup", {"source_path": "/packs/pack-a/x.md"}, space_id="concept"
-            )
-            store.upsert_node(
-                "TypeB", "dup", {"source_path": "/packs/pack-b/x.md"}, space_id="concept"
-            )
-        finally:
-            store.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("Entity", "n-solo", "concept", {"source_path": "/packs/pack-solo/x.md"}),
+                ("TypeA", "dup", "concept", {"source_path": "/packs/pack-a/x.md"}),
+                ("TypeB", "dup", "concept", {"source_path": "/packs/pack-b/x.md"}),
+            ),
+        )
 
     def test_x1_predicted_and_ambiguous_packs_counted_unregistered(
         self, bootstrapped_owner, env
@@ -950,16 +954,15 @@ class TestDryRunEnumerationSeesPredictedPacks:
 
         rc_apply = migrate.main(["--apply", "--skip-backup"])
         out_apply = capsys.readouterr().out
-        assert rc_apply == 0
-        assert "3 not yet in the registry" in out_apply
-        assert (
-            "registry_enumeration: applied (4 row(s) needed registering "
-            "(default+graph-derived=4, doc-derived=0))" in out_apply
-        )
+        assert rc_apply == 1
+        assert "graph_backfill: failed" in out_apply
 
         sql = make_sql_store(get_settings())
         for pid in ("pack-solo", "pack-a", "pack-b", migrate.DEFAULT_PACK_ID):
-            assert get_pack(sql, pid) is not None
+            if pid == migrate.DEFAULT_PACK_ID:
+                assert get_pack(sql, pid) is not None
+            else:
+                assert get_pack(sql, pid) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1023,9 @@ class TestStageOutcomesAndExitCodes:
         monkeypatch.setattr(
             "opencrab.stores.factory.make_graph_store", lambda settings: _UnavailableGraph()
         )
+        # Keep graph apply out of this test's scope so the registry stage can
+        # independently report the unavailable wrapper.
+        monkeypatch.setattr(migrate, "_backfill_graph", lambda *a, **kw: {"dry_run": False})
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
         assert rc == 3
@@ -1048,10 +1054,9 @@ class TestStageOutcomesAndExitCodes:
             )
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
-        assert rc == 3
-        assert "graph_backfill: skipped" in out
-        assert "nodes_skipped=1" in out
-        assert "row(s) left unattributed" in out
+        assert rc == 1
+        assert "graph_backfill: failed" in out
+        assert "malformed graph properties" in out
 
     def test_exit_code_1_when_a_stage_raises_and_does_not_propagate(
         self, bootstrapped_owner, env, monkeypatch
@@ -1284,12 +1289,13 @@ class TestGraphTwinDocBackfill:
         from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node("TypeA", "shared", {"pack_id": "pack-a"}, space_id="concept")
-            graph.upsert_node("TypeB", "shared", {"pack_id": "pack-b"}, space_id="evidence")
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "shared", "concept", {"pack_id": "pack-a"}),
+                ("TypeB", "shared", "evidence", {"pack_id": "pack-b"}),
+            ),
+        )
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             docs.upsert_node_doc("concept", "TypeA", "shared", {})
@@ -1306,14 +1312,14 @@ class TestGraphTwinDocBackfill:
         assert exact[("concept", "shared")] == "pack-a"
         assert ("concept", "shared") not in ambiguous
 
-        assert migrate.main(["--apply", "--skip-backup"]) == 0
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             row = docs.get_node_doc("concept", "shared")
         finally:
             docs.close()
-        assert row["properties"]["pack_id"] == "pack-a"
+        assert not row["properties"].get("pack_id")
 
     def test_4_true_ambiguous_twin_excluded_docs_skipped_rc3(
         self, bootstrapped_owner, env, capsys
@@ -1321,15 +1327,15 @@ class TestGraphTwinDocBackfill:
         """same (space, node_id) resolving to two DIFFERENT pack_ids across
         graph rows is genuinely ambiguous -- excluded, reported, and demotes
         docs_backfill to skipped (rc 3)."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node("TypeA", "dup", {"pack_id": "pack-a"}, space_id="concept")
-            graph.upsert_node("TypeB", "dup", {"pack_id": "pack-b"}, space_id="concept")
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "dup", "concept", {"pack_id": "pack-a"}),
+                ("TypeB", "dup", "concept", {"pack_id": "pack-b"}),
+            ),
+        )
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             docs.upsert_node_doc("concept", "TypeA", "dup", {})
@@ -1338,9 +1344,8 @@ class TestGraphTwinDocBackfill:
 
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
-        assert rc == 3
-        assert "docs_backfill: skipped" in out
-        assert "left unattributed" in out
+        assert rc == 1
+        assert "graph_backfill: failed" in out
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
@@ -1618,12 +1623,13 @@ class TestGraphTwinFallbackAmbiguity:
     ):
         from opencrab.stores.local_graph_store import LocalGraphStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node("TypeA", "dup-blank", {"pack_id": "pack-x"}, space_id=None)
-            graph.upsert_node("TypeB", "dup-blank", {"pack_id": "pack-y"}, space_id=None)
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "dup-blank", None, {"pack_id": "pack-x"}),
+                ("TypeB", "dup-blank", None, {"pack_id": "pack-y"}),
+            ),
+        )
 
         graph = LocalGraphStore(str(env / "graph.db"))
         try:
@@ -1648,15 +1654,15 @@ class TestGraphTwinFallbackAmbiguity:
         consulted, this doc row would fall through past the exact miss
         straight to that self-inferred pack (or, absent even that, to
         ``default``)."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node("TypeA", "same", {"pack_id": "pack-x"}, space_id=None)
-            graph.upsert_node("TypeB", "same", {"pack_id": "pack-y"}, space_id=None)
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "same", None, {"pack_id": "pack-x"}),
+                ("TypeB", "same", None, {"pack_id": "pack-y"}),
+            ),
+        )
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             docs.upsert_node_doc(
@@ -1667,9 +1673,8 @@ class TestGraphTwinFallbackAmbiguity:
 
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
-        assert rc == 3
-        assert "docs_backfill: skipped" in out
-        assert "left unattributed" in out
+        assert rc == 1
+        assert "graph_backfill: failed" in out
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
@@ -1684,19 +1689,21 @@ class TestGraphTwinFallbackAmbiguity:
     def test_r4b_6_agreeing_blank_space_rows_still_apply_fallback(
         self, bootstrapped_owner, env
     ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
         """Not over-exclusion: TWO blank-space_id rows that AGREE on the
         same pack_id still land in fallback_map (not fallback_ambiguous)
         and the doc row is still backfilled -- same discipline as the
         single-row case (test_5_blank_graph_space_id_uses_fallback_map)."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node("TypeA", "agree", {"pack_id": "pack-legacy"}, space_id=None)
-            graph.upsert_node("TypeB", "agree", {"pack_id": "pack-legacy"}, space_id=None)
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "agree", None, {"pack_id": "pack-legacy"}),
+                ("TypeB", "agree", None, {"pack_id": "pack-legacy"}),
+            ),
+        )
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             docs.upsert_node_doc("concept", "Entity", "agree", {})
@@ -1713,35 +1720,35 @@ class TestGraphTwinFallbackAmbiguity:
         assert fallback == {"agree": "pack-legacy"}
         assert "agree" not in fallback_ambiguous
 
-        assert migrate.main(["--apply", "--skip-backup"]) == 0
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             row = docs.get_node_doc("concept", "agree")
         finally:
             docs.close()
-        assert row["properties"]["pack_id"] == "pack-legacy"
+        assert not row["properties"].get("pack_id")
 
     def test_r4b_6b_exact_hit_passes_through_despite_fallback_ambiguous(
         self, bootstrapped_owner, env
     ):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
         """Exact takes priority over fallback ambiguity: a doc row whose
         graph twin has an EXACT (space, node_id) match must apply that
         value even when OTHER, unrelated blank-space_id rows sharing the
         same bare node_id disagree with each other -- the more specific
         exact row is correct regardless of what the space-less rows think."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-        graph = LocalGraphStore(str(env / "graph.db"))
-        try:
-            graph.upsert_node(
-                "Entity", "shared-id", {"pack_id": "pack-exact"}, space_id="concept"
-            )
-            graph.upsert_node("TypeA", "shared-id", {"pack_id": "pack-x"}, space_id=None)
-            graph.upsert_node("TypeB", "shared-id", {"pack_id": "pack-y"}, space_id=None)
-        finally:
-            graph.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("Entity", "shared-id", "concept", {"pack_id": "pack-exact"}),
+                ("TypeA", "shared-id", None, {"pack_id": "pack-x"}),
+                ("TypeB", "shared-id", None, {"pack_id": "pack-y"}),
+            ),
+        )
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             docs.upsert_node_doc("concept", "Entity", "shared-id", {})
@@ -1758,14 +1765,14 @@ class TestGraphTwinFallbackAmbiguity:
         assert exact[("concept", "shared-id")] == "pack-exact"
         assert "shared-id" in fallback_ambiguous
 
-        assert migrate.main(["--apply", "--skip-backup"]) == 0
+        assert migrate.main(["--apply", "--skip-backup"]) == 1
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
         try:
             row = docs.get_node_doc("concept", "shared-id")
         finally:
             docs.close()
-        assert row["properties"]["pack_id"] == "pack-exact"
+        assert not row["properties"].get("pack_id")
 
 
 class _FakeSingleRowDocStore:
@@ -2696,6 +2703,7 @@ class TestMalformedPackIdDemotesRegistryEnumeration:
         monkeypatch.setattr(
             "opencrab.stores.factory.make_graph_store", lambda settings: _UnavailableGraph()
         )
+        monkeypatch.setattr(migrate, "_backfill_graph", lambda *a, **kw: {"dry_run": False})
 
         rc = migrate.main(["--apply", "--skip-backup"])
         out = capsys.readouterr().out
@@ -3095,10 +3103,8 @@ class TestNodePackMapChunking:
         import json
         import sqlite3
 
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
-
         db_path, node_ids = self._seed_many(env, 501)
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        _apply_graph_provenance(db_path, migrate.DEFAULT_PACK_ID)
 
         # Chunk-safe oracle over the POST-backfill state, one id at a time,
         # built BEFORE the connect() monkeypatch below is installed.
@@ -3148,32 +3154,20 @@ class TestNodePackMapChunkingSemanticAmbiguity:
     regression item."""
 
     def test_different_node_type_same_node_id_disagreeing_packs_is_ambiguous(self, env):
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
         db_path = env / "graph.db"
-        store = LocalGraphStore(str(db_path))
-        try:
-            store.upsert_node(
-                "TypeA", "shared", {"source_path": "/packs/pack-a/x.md"}, space_id="concept"
-            )
-            store.upsert_node(
-                "TypeB", "shared", {"source_path": "/packs/pack-b/x.md"}, space_id="concept"
-            )
-        finally:
-            store.close()
+        _seed_legacy_graph(
+            env,
+            nodes=(
+                ("TypeA", "shared", "concept", {"source_path": "/packs/pack-a/x.md"}),
+                ("TypeB", "shared", "concept", {"source_path": "/packs/pack-b/x.md"}),
+            ),
+        )
 
         predicted, pred_ambiguous = migrate._predict_node_pack_map(
             db_path, ["shared"], migrate.DEFAULT_PACK_ID
         )
         assert predicted == {}
         assert pred_ambiguous == {"shared": sorted(["pack-a", "pack-b"])}
-
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
-
-        actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, ["shared"])
-        assert actual == {}
-        assert act_ambiguous == {"shared": sorted(["pack-a", "pack-b"])}
 
 
 class TestNodePackMapSmallInputUnchanged:
@@ -3182,7 +3176,6 @@ class TestNodePackMapSmallInputUnchanged:
     is byte-for-byte the same query as the pre-round-8 unchunked version."""
 
     def test_small_input_result_unchanged(self, env):
-        from opencrab.ontology.pack_provenance import backfill_pack_ids
         from opencrab.stores.local_graph_store import LocalGraphStore
 
         db_path = env / "graph.db"
@@ -3205,7 +3198,7 @@ class TestNodePackMapSmallInputUnchanged:
         assert predicted == {"n-inferred": "pack-a", "n-assumed": migrate.DEFAULT_PACK_ID}
         assert pred_ambiguous == {}
 
-        backfill_pack_ids(db_path, assume_pack_id=migrate.DEFAULT_PACK_ID, dry_run=False)
+        _apply_graph_provenance(db_path, migrate.DEFAULT_PACK_ID)
         actual, act_ambiguous = migrate._read_actual_node_pack_ids(db_path, node_ids)
         assert actual == predicted
         assert act_ambiguous == {}

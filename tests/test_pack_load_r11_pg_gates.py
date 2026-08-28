@@ -33,7 +33,7 @@ import pytest
 from opencrab.pack import load as pack_load
 from opencrab.stores._sql_dialect import POSTGRES, SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
-from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
+from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, GraphTx, _SqlGraphStoreBase
 from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 재사용(세 번째 사본 방지)
     _chunk,
     _node,
@@ -449,6 +449,31 @@ class _PgFakeGraphStore(_SqlGraphStoreBase):
         for ddl in SQLITE.render_ddl(GRAPH_STORE_SCHEMA):
             self._raw.execute(ddl)
         self._raw.commit()
+
+    @property
+    def _conn(self):
+        """Expose the fake's transaction connection through the base hook."""
+        return self._raw
+
+    def _run_graph_tx(self, callback, *, immediate=False, snapshot_path=None):
+        if immediate or snapshot_path is not None:
+            raise ValueError("graph transaction options are SQLite-only")
+        if self._graph_tx_is_active():
+            raise RuntimeError("nested graph transaction is not allowed")
+        self._set_graph_tx_active(True)
+        try:
+            result = callback(GraphTx(
+                self._raw,
+                self._dialect,
+                lambda sql: _translate_for_sqlite_execution(sql, self._schema),
+            ))
+            self._raw.commit()
+            return result
+        except BaseException:
+            self._raw.rollback()
+            raise
+        finally:
+            self._set_graph_tx_active(False)
 
     # ── 테스트 전용 시드 헬퍼(load.py 훅을 거치지 않는다 — 순수 픽스처 구성) ──
     def seed_node(self, node_type, node_id, pack_id, space_id="concept", extra=None):

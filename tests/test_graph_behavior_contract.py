@@ -37,6 +37,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.common.graph_identity import (
+    GraphReadCapabilityUnavailable,
+    GraphWriteCapabilityUnavailable,
+)
+from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 from opencrab.stores.local_graph_store import LocalGraphStore
 
 PG_URL = os.environ.get("OPENCRAB_PG_TEST_URL")
@@ -85,13 +90,8 @@ def pg_store(pg_engine):
 
 
 @pytest.fixture
-def kuzu_store(tmp_path):
-    pytest.importorskip("ladybug")
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-    store = KuzuGraphStore(db_path=str(tmp_path / "kuzu_db"))
-    yield store
-    store.close()
+def kuzu_store():
+    return KuzuUnavailableGraphStore()
 
 
 def _make_neo4j_store():
@@ -103,6 +103,7 @@ def _make_neo4j_store():
     mock_driver = MagicMock(name="driver")
     mock_driver.session.return_value.__enter__.return_value = mock_session
     mock_driver.session.return_value.__exit__.return_value = False
+    mock_session.execute_write.side_effect = lambda callback: callback(mock_session)
 
     with patch("neo4j.GraphDatabase") as mock_gdb:
         mock_gdb.driver.return_value = mock_driver
@@ -189,27 +190,23 @@ class TestFindPathPg:
 
 
 class TestFindPathKuzu:
-    """Kuzu is already the reference semantics for B1 -- these pin the
-    contract rather than expect RED, so a regression here is a real bug."""
+    """An unqualified Kùzu backend rejects graph reads before any access."""
 
     def test_path_of_exactly_max_depth_hops_is_found(self, kuzu_store):
-        _make_chain(kuzu_store, 4)
-        path = kuzu_store.find_path("n0", "n4", max_depth=4)
-        assert [step["relation"] for step in path] == ["next"] * 4
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            kuzu_store.find_path("n0", "n4", max_depth=4)
 
     def test_path_requiring_max_depth_plus_one_hops_not_found(self, kuzu_store):
-        _make_chain(kuzu_store, 5)
-        assert kuzu_store.find_path("n0", "n5", max_depth=4) == []
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            kuzu_store.find_path("n0", "n5", max_depth=4)
 
     def test_no_path(self, kuzu_store):
-        kuzu_store.upsert_node("Item", "a", {})
-        kuzu_store.upsert_node("Item", "b", {})
-        assert kuzu_store.find_path("a", "b", max_depth=4) == []
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            kuzu_store.find_path("a", "b", max_depth=4)
 
     def test_unknown_src_or_dst_returns_empty(self, kuzu_store):
-        _make_chain(kuzu_store, 2)
-        assert kuzu_store.find_path("does_not_exist", "n2", max_depth=4) == []
-        assert kuzu_store.find_path("n0", "does_not_exist", max_depth=4) == []
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            kuzu_store.find_path("does_not_exist", "n2", max_depth=4)
 
 
 class TestFindPathNeo4j:
@@ -285,20 +282,16 @@ class TestDeleteNodePg:
 
 class TestDeleteNodeKuzu:
     def test_node_with_edges_deleted_true(self, kuzu_store):
-        kuzu_store.upsert_node("Item", "a", {})
-        kuzu_store.upsert_node("Item", "b", {})
-        kuzu_store.upsert_edge("Item", "a", "next", "Item", "b")
-        assert kuzu_store.delete_node("Item", "a") is True
+        with pytest.raises(GraphWriteCapabilityUnavailable):
+            kuzu_store.delete_node("Item", "a")
 
     def test_node_with_zero_edges_deleted_true(self, kuzu_store):
-        kuzu_store.upsert_node("Item", "lonely", {})
-        assert kuzu_store.delete_node("Item", "lonely") is True
+        with pytest.raises(GraphWriteCapabilityUnavailable):
+            kuzu_store.delete_node("Item", "lonely")
 
     def test_nonexistent_node_false(self, kuzu_store):
-        """RED today: KuzuGraphStore.delete_node returns True whenever no
-        exception was raised -- a DETACH DELETE matching zero nodes does not
-        raise, so a nonexistent node currently (incorrectly) returns True."""
-        assert kuzu_store.delete_node("Item", "never_existed") is False
+        with pytest.raises(GraphWriteCapabilityUnavailable):
+            kuzu_store.delete_node("Item", "never_existed")
 
 
 class TestDeleteNodeTypeMismatch:
@@ -322,9 +315,8 @@ class TestDeleteNodeTypeMismatch:
         assert pg_store.get_node_by_id("a") is not None
 
     def test_kuzu_wrong_type_is_noop(self, kuzu_store):
-        kuzu_store.upsert_node("Item", "a", {})
-        assert kuzu_store.delete_node("WrongType", "a") is False
-        assert kuzu_store.get_node_by_id("a") is not None
+        with pytest.raises(GraphWriteCapabilityUnavailable):
+            kuzu_store.delete_node("WrongType", "a")
 
 
 class TestDeleteNodeNeo4j:

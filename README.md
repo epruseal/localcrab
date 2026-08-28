@@ -53,8 +53,12 @@ opencrab serve
 
 > 벡터 백엔드 기본값은 조건부입니다(`EMBEDDING_BACKEND`·`STORAGE_MODE`에 따라 결정). 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend), [벡터 백엔드 매트릭스](./docs/vector-backends.md).
 
-`STORAGE_MODE=kuzu`로 실행하면 그래프만 `KuzuGraphStore`(ladybug>=0.18, `graph.kuzu`)로
-바뀌고 문서·벡터·SQL 스토어는 local 모드와 동일합니다. 설치: `pip install ".[kuzu]"`.
+`STORAGE_MODE=kuzu`로 실행하면 문서·벡터·SQL 스토어만 local 모드와 동일하게
+선택되고 그래프는 capability-negative facade가 됩니다. `KuzuGraphStore`는
+Ladybug의 원자적 transaction/CAS 능력을 검증하기 전까지 optional 패키지를 import
+하거나 `graph.kuzu` 경로를 만들지 않습니다. 그래프 호출은 capability 예외를
+냅니다. 이 상태의 qualification은 `python3 -m tests.kuzu_qualification`으로
+읽기 전용 실행합니다.
 
 `STORAGE_MODE=pg`로 실행하면 4스토어(graph/doc/sql/vector) 전부가 PostgreSQL 한
 서버(`POSTGRES_URL`)로 통합됩니다 — `PGGraphStore`/`PgDocStore`/`SQLStore(PG)`/
@@ -293,7 +297,7 @@ export EMBEDDING_BACKEND=openai
 임베딩 백엔드(`EMBEDDING_BACKEND`)와 **독립된 축**으로, 벡터를 어디에 저장·검색할지 고릅니다.
 `VECTOR_BACKEND`를 명시하지 않으면 아래 규칙으로 조건부 결정됩니다.
 
-- `STORAGE_MODE=local`(또는 `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → **`sqlite-vec`**
+- `STORAGE_MODE=local`(또는 capability-negative `kuzu`) + `EMBEDDING_BACKEND=openai`(기본) → **`sqlite-vec`**
 - `STORAGE_MODE=pg` → **`pgvector`** (4스토어 PG 통합의 벡터 축)
 - `STORAGE_MODE=docker` 이거나 `EMBEDDING_BACKEND=local`(minilm) → **`chroma`**
 - `VECTOR_BACKEND`를 명시하면 항상 그 값이 우선합니다.
@@ -491,7 +495,7 @@ opencrab/
   schemas/        YAML 타입 스키마, 스키마 팩, 액션 스키마
   ontology/       빌더, 쿼리, identity, 정규화, 승인, ReBAC
   execution/      워크플로·승인 런타임
-  stores/         Local(SQLite)·Kuzu(ladybug)·PG(pgvector)·docker(Neo4j/Mongo/Chroma) 스토어 + 임베딩 EF
+  stores/         Local(SQLite)·Kuzu capability-negative facade·PG(pgvector)·docker(Neo4j/Mongo/Chroma) 스토어 + 임베딩 EF
   mcp/            MCP 서버 및 툴 레지스트리
 crabharness/
   crabharness/    미션 플래너, 런타임, 검증, 프로모션 패키지 빌더

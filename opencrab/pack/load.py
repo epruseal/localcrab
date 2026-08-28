@@ -687,7 +687,10 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
 # graph/doc 두 축이 이 모듈의 SQL 진입점(`pack_live_counts`·`delete_pack`·
 # `live_pack_state`)에 필요로 하는 훅 세트. graph 축엔 `_row_get` 이 없다
 # (`_sql_graph_base.py` 의 계약 — 위치 접근이 정착 관례).
-_GRAPH_SQL_HOOKS = ("_table", "_fetch_all", "_fetch_one", "_exec_write")
+# Graph mutations go through delete_node/delete_edge.  The SQL graph base no
+# longer exposes a raw write hook, so keeping `_exec_write` here would reject
+# every upgraded LocalGraphStore and tempt callers back into direct DML.
+_GRAPH_SQL_HOOKS = ("_table", "_fetch_all", "_fetch_one", "delete_node", "delete_edge")
 _DOC_SQL_HOOKS = ("_table", "_fetch_all", "_fetch_one", "_exec_write", "_row_get")
 
 
@@ -697,6 +700,10 @@ def _require_sql_hooks(store, hooks: tuple[str, ...], label: str) -> None:
     속성 접근이 `AttributeError` 로 죽었다 — 원인이 모호했다. 여기서 명시적으로
     거부해 무엇이 왜 안 되는지 말한다."""
     missing = [h for h in hooks if not hasattr(store, h)]
+    if label == "graph 스토어":
+        dialect = getattr(store, "_dialect", None)
+        if not callable(getattr(dialect, "json_get", None)):
+            missing.append("_dialect")
     if missing:
         raise NotImplementedError(
             f"pack 적재/회수는 SQL 계열 graph/doc 스토어 전용입니다"
@@ -1295,13 +1302,24 @@ def load_nodes_incremental(
         # 종전에는 `add_node` **전에** 지웠다. 그러면 저장이 실패했을 때 구 노드와
         # cascade 엣지가 이미 없어 **재시도로도 복구되지 않는다** — 다음 증분은
         # `live is None` 으로 보고 다시 시도하다 같은 이유로 또 실패한다. 영구 소실이다.
-        # 노드 키가 `(node_type, node_id)` 라 타입이 다르면 잠시 공존할 수 있으므로
-        # 이 순서가 가능하다. 저장이 실패하면 구 행이 남아 **현상 유지**가 된다.
+        # Qualified graph identity is node_id alone, so a type change cannot
+        # briefly coexist with the old row. The explicit graph writer rejects
+        # that identity conflict; this cleanup remains only for legacy rows
+        # observed by a read-only migration or recovery path.
         stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
         try:
+            expected_current_digest = None
+            if stale_typed is not None:
+                get_digest = getattr(graph, "get_node_digest", None)
+                if not callable(get_digest):
+                    raise RuntimeError("graph store cannot CAS-reclassify a node")
+                expected_current_digest = get_digest(node_id, node_type=live[0])
+                if not expected_current_digest:
+                    raise RuntimeError(f"current node digest unavailable: {node_id}")
             res = builder.add_node(space, node_type, node_id, properties=props,
-                                     pack_id=pack_name, origin="server")
+                                     pack_id=pack_name, origin="server",
+                                     _expected_current_digest=expected_current_digest)
             # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
             # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
             # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
@@ -1935,17 +1953,11 @@ def incremental_finalize(
     # per-edge `_exec_write` 유지(집합화 안 함) — 스테일 엣지는 평시 소량이고,
     # 아래 rowcount 이중 계상 방지 계약이 행 단위 카운트에 걸려 있다. 대량
     # 스테일 시 row-value IN 배치가 업그레이드 경로다(한계, 별건 — v6 검수).
-    edges_table = graph._table("graph_edges")
-    edge_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
     for (f_id, r, t_id) in stale_edges:
         try:
-            # rowcount로 센다 — 무조건 +=1이면 노드 삭제의 cascade가 이미 지운
-            # 엣지까지 여기서 다시 세어 **이중 계상**한다.
-            edge_del += graph._exec_write(
-                f"DELETE FROM {edges_table} WHERE from_id=:f AND relation=:r AND to_id=:t"
-                f" AND {edge_pack_pred}",
-                {"f": f_id, "r": r, "t": t_id, "pack": pack_name},
-            )
+            # Ownership-scoped public mutation.  It also handles a cascade
+            # that already removed the row without double-counting it.
+            edge_del += int(graph.delete_edge(f_id, r, t_id, owner_pack_id=pack_name))
         except Exception as exc:
             log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
 

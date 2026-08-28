@@ -118,10 +118,21 @@ def stack(tmp_path):
                 {"u": p.user_id, "n": p.user_id},
             )
 
-    return {
+    stack = {
         "sql": sql, "graph": graph, "docs": docs, "vector": vector,
         "builder": builder, "hybrid": hybrid,
     }
+    try:
+        yield stack
+    finally:
+        # Each test owns four native/database handles.  Chroma keeps file
+        # descriptors open beyond the last collection call, so returning the
+        # dictionary without closing the stores exhausts the process limit
+        # across this 100+ case module.
+        vector.close()
+        graph.close()
+        docs.close()
+        sql._engine.dispose()
 
 
 def _fork(stack, *, principal, src_pack_id, **kw) -> dict[str, Any]:
@@ -131,6 +142,26 @@ def _fork(stack, *, principal, src_pack_id, **kw) -> dict[str, Any]:
             stack["hybrid"], stack["builder"],
             principal=principal, src_pack_id=src_pack_id, **kw,
         )
+
+
+def _test_store_mutation(store: Any, sql: str, params: dict[str, Any], *, immediate: bool = False) -> None:
+    """Apply deliberate corruption through a test-only store transaction.
+
+    These tests model legacy rows that production writers would reject.  The
+    graph store no longer exposes the old single-statement ``_exec_write``
+    hook, so keep the raw mutation authority local to this test module and
+    use the store's transaction boundary to commit it safely.
+    """
+    with store._tx(immediate=immediate) as conn:
+        conn.execute(sql, params)
+
+
+def _test_graph_mutation(stack: dict[str, Any], sql: str, params: dict[str, Any]) -> None:
+    _test_store_mutation(stack["graph"], sql, params, immediate=True)
+
+
+def _test_doc_mutation(stack: dict[str, Any], sql: str, params: dict[str, Any]) -> None:
+    _test_store_mutation(stack["docs"], sql, params)
 
 
 def _seed_pack(
@@ -466,7 +497,7 @@ class TestTierClassification:
         # Directly corrupt the edge's source-endpoint properties in the
         # graph store to strip its "id" -- simulating a legacy row written
         # before "id" was guaranteed to be stamped into properties.
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_remove(properties, '$.id') "
             "WHERE node_id = :nid",
             {"nid": f"{src}-n0"},
@@ -495,7 +526,7 @@ class TestTierClassification:
         src = _seed_pack(stack, ALICE, "src-t35", node_count=10, with_edge=False, with_source=False)
         # Inject a property type violation directly at the store layer
         # (title must be a string per _PROPERTY_TYPE_MAP / schema).
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.title', 12345) "
             "WHERE node_id = :nid",
             {"nid": f"{src}-n0"},
@@ -543,7 +574,7 @@ class TestCompletenessFloor:
         completeness-floor check would let a pack with 100% node loss
         still promote to 'ready' with copied.nodes == 0."""
         src = _seed_pack(stack, ALICE, "src-t30", node_count=1, with_edge=False, with_source=False)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET node_type = 'NotARealType' WHERE node_id = :nid",
             {"nid": f"{src}-n0"},
         )
@@ -565,7 +596,7 @@ class TestCompletenessFloor:
 
         # 10 nodes, drop exactly 1 (10% == floor, must still pass).
         src_ok = _seed_pack(stack, ALICE, "src-t39-ok", node_count=10, with_edge=False, with_source=False)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET node_type = 'Bogus' WHERE node_id = :nid",
             {"nid": f"{src_ok}-n0"},
         )
@@ -575,7 +606,7 @@ class TestCompletenessFloor:
 
         # 10 nodes, drop 2 (20% > 10% floor, must reject before reservation).
         src_bad = _seed_pack(stack, ALICE, "src-t39-bad", node_count=10, with_edge=False, with_source=False)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET node_type = 'Bogus' WHERE node_id IN (:n0, :n1)",
             {"n0": f"{src_bad}-n0", "n1": f"{src_bad}-n1"},
         )
@@ -773,7 +804,7 @@ class TestVectorClassification:
         this test's `new_n0 not in dst_vector_ids` assertion failed -- see
         delivery report."""
         src = _seed_pack(stack, ALICE, "src-t34", node_count=10, with_edge=False, with_source=False)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.source', "
             "'totally-unrelated-pack') WHERE node_id = :nid",
             {"nid": f"{src}-n5"},
@@ -922,7 +953,7 @@ class TestReferenceRewriteBoundaries:
         `status == 'ok'` assertion failed."""
         src = _seed_pack(stack, ALICE, "src-t47", node_count=2, with_edge=False, with_source=False)
         old_n0 = f"{src}-n0"
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.parent_id', :v) "
             "WHERE node_id = :nid",
             {"v": old_n0, "nid": f"{src}-n1"},
@@ -956,13 +987,13 @@ class TestReferenceRewriteBoundaries:
         src = _seed_pack(stack, ALICE, "src-t33", node_count=2, with_edge=False, with_source=False)
         old_n0 = f"{src}-n0"
         composite = f"node:{old_n0}"
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.source', :v) "
             "WHERE node_id = :nid",
             {"v": composite, "nid": f"{src}-n1"},
         )
-        stack["graph"]._exec_write(
-            "UPDATE graph_nodes SET properties = json_set(properties, '$.node_id', json(:v)) "
+        _test_graph_mutation(stack,
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.source_id', json(:v)) "
             "WHERE node_id = :nid",
             {"v": '["x","y"]', "nid": f"{src}-n1"},
         )
@@ -979,7 +1010,7 @@ class TestReferenceRewriteBoundaries:
         }
         n1_new = dst_by_title["doc 1"]
         assert n1_new["source"] == composite, "composite string must be left exactly as-is"
-        assert n1_new["node_id"] == ["x", "y"], "nested list must be left exactly as-is"
+        assert n1_new["source_id"] == ["x", "y"], "nested list must be left exactly as-is"
 
 
 # ---------------------------------------------------------------------------
@@ -1855,7 +1886,7 @@ class TestGrammarInvalidNodeDropsItsEdgeToo:
                 stack["builder"].add_edge(
                     "resource", node_ids[i], "cites", "resource", node_ids[i + 1], pack_id=src,
                 )
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
             "WHERE node_id = :nid",
             {"v": "not-a-real-space", "nid": node_ids[0]},
@@ -2022,8 +2053,8 @@ class TestNestedReferenceValueWithOldId:
         mutation -- nothing inside it to rewrite)."""
         src = _seed_pack(stack, ALICE, "src-t40", node_count=2, with_edge=False, with_source=False)
         old_n0 = f"{src}-n0"
-        stack["graph"]._exec_write(
-            "UPDATE graph_nodes SET properties = json_set(properties, '$.node_id', json(:v)) "
+        _test_graph_mutation(stack,
+            "UPDATE graph_nodes SET properties = json_set(properties, '$.source_id', json(:v)) "
             "WHERE node_id = :nid",
             {"v": f'["{old_n0}", "unrelated"]', "nid": f"{src}-n1"},
         )
@@ -2039,7 +2070,7 @@ class TestNestedReferenceValueWithOldId:
             if n["labels"] != ["Dataset"]
         }
         n1_new = dst_by_title["doc 1"]
-        assert n1_new["node_id"] == [old_n0, "unrelated"], (
+        assert n1_new["source_id"] == [old_n0, "unrelated"], (
             "a nested list under a REFERENCE_KEYS name must be left "
             "EXACTLY as-is, even though it embeds an old (pre-fork) id "
             "the rewrite rule could in principle have found"
@@ -2505,7 +2536,7 @@ class TestLegacyAliasConflictExclusion:
                 stack["builder"].add_edge(
                     "resource", node_ids[i], "cites", "resource", node_ids[i + 1], pack_id=src,
                 )
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.pack', :v) "
             "WHERE node_id = :nid",
             {"v": "some-other-pack-entirely", "nid": node_ids[0]},
@@ -2797,7 +2828,7 @@ class TestRemappedIdLengthRejection:
                          with_source=False)
         long_id = "G" * _ID_OVER_LIMIT
         _add_node(stack, src, long_id)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
             "WHERE node_id = :nid",
             {"v": "not-a-real-space", "nid": long_id},
@@ -3063,7 +3094,7 @@ class TestPackIdContentIdNamespaceGuard:
         src = _seed_pack(stack, ALICE, "src-t89", node_count=15, with_edge=False,
                          with_source=False)
         _add_node(stack, src, src)
-        stack["graph"]._exec_write(
+        _test_graph_mutation(stack,
             "UPDATE graph_nodes SET properties = json_set(properties, '$.space', :v) "
             "WHERE node_id = :nid",
             {"v": "not-a-real-space", "nid": src},
@@ -3078,7 +3109,7 @@ class TestPackIdContentIdNamespaceGuard:
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
                 text="alias-conflicted source", source_id=src, pack_id=src,
             )
-        stack["docs"]._exec_write(
+        _test_doc_mutation(stack,
             "UPDATE doc_sources SET metadata = json_set(metadata, '$.pack', :v) "
             "WHERE source_id = :sid",
             {"v": "some-other-pack-entirely", "sid": src},

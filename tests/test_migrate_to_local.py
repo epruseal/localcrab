@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
+
 # ---------------------------------------------------------------------------
 # 모듈 경로 설정 (scripts/ 는 패키지가 아니므로 직접 import)
 # ---------------------------------------------------------------------------
@@ -39,30 +41,25 @@ def _make_neo4j_session(node_rows: list[dict], edge_rows: list[dict]) -> MagicMo
     두 번째 이후 동일 패턴 호출(EOF 시뮬레이션)에는 [] 를 반환한다.
     """
 
-    def _make_result(data: list[dict]) -> MagicMock:
-        r = MagicMock()
-        r.data.return_value = data
-        return r
-
     node_call_count = [0]
     edge_call_count = [0]
 
-    def _run_side_effect(query: str, **kwargs) -> MagicMock:
+    def _run_side_effect(query: str, **kwargs) -> list[dict]:
         # 노드 쿼리: MATCH (n) RETURN ...
         if "MATCH (n)" in query:
             node_call_count[0] += 1
             # 첫 번째 호출만 데이터 반환, 이후 EOF
             if node_call_count[0] == 1:
-                return _make_result(node_rows)
-            return _make_result([])
+                return node_rows
+            return []
         # 엣지 쿼리: MATCH (a)-[r]->(b) ...
         if "MATCH (a)-[r]->(b)" in query:
             edge_call_count[0] += 1
             if edge_call_count[0] == 1:
-                return _make_result(edge_rows)
-            return _make_result([])
+                return edge_rows
+            return []
         # 기타 쿼리
-        return _make_result([])
+        return []
 
     session = MagicMock()
     session.run.side_effect = _run_side_effect
@@ -79,132 +76,65 @@ def _make_neo4j_session(node_rows: list[dict], edge_rows: list[dict]) -> MagicMo
 # ---------------------------------------------------------------------------
 
 class TestMigrateGraph:
-    def test_migrate_graph_neo4j_to_local(self, tmp_path: Path) -> None:
-        """Neo4j → LocalGraphStore 변환 로직 검증."""
+    def test_migrate_graph_apply_is_fixture_only(self, tmp_path: Path) -> None:
+        """Production Neo4j-to-SQL apply remains closed until qualification."""
         from opencrab.stores.local_graph_store import LocalGraphStore
 
+        driver = _make_neo4j_session([], [])
+        local_store = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+        try:
+            with pytest.raises(GraphMigrationFixtureOnlyError):
+                mig.migrate_graph(driver, local_store, batch_size=100, log=MagicMock())
+            assert local_store.count_nodes() == 0
+        finally:
+            local_store.close()
+
+    def test_inspect_graph_reports_duplicate_node_types_and_missing_endpoints(self) -> None:
         node_rows = [
-            {
-                "props": {"id": "node-1", "name": "Alice", "space": "default"},
-                "labels": ["OpenCrabNode", "Person"],
-            },
-            {
-                "props": {"id": "node-2", "name": "Bob"},
-                "labels": ["OpenCrabNode", "Person"],
-            },
+            {"props": {"id": "node-1"}, "labels": ["OpenCrabNode", "Person"], "node_type": "Person"},
+            {"props": {"id": "node-1"}, "labels": ["OpenCrabNode", "Agent"], "node_type": "Agent"},
         ]
-        edge_rows = [
-            {
-                "from_id": "node-1",
-                "from_labels": ["OpenCrabNode", "Person"],
-                "relation": "KNOWS",
-                "rel_props": {"since": 2020},
-                "to_id": "node-2",
-                "to_labels": ["OpenCrabNode", "Person"],
-            }
-        ]
-        driver = _make_neo4j_session(node_rows, edge_rows)
+        edge_rows = [{
+            "source_props": {"id": "node-1"}, "source_node_type": "Person",
+            "target_props": {"id": "missing"}, "target_node_type": "Person",
+            "props": {}, "relation": "KNOWS",
+        }]
 
-        db_path = str(tmp_path / "graph.db")
-        local_store = LocalGraphStore(db_path=db_path)
-        import logging
-        result = mig.migrate_graph(driver, local_store, batch_size=100, log=logging.getLogger())
+        report = mig.inspect_graph_source(_make_neo4j_session(node_rows, edge_rows))
 
-        assert result["nodes"] == 2
-        assert result["edges"] == 1
+        assert report["nodes"] == 2
+        assert report["edges"] == 1
+        assert report["duplicates"] == [{"node_id": "node-1", "node_types": ["Agent", "Person"]}]
+        assert report["incomplete_endpoints"] == [{"relation": "KNOWS", "missing": ["missing"]}]
 
-        # 실제 DB에 저장됐는지 확인
-        assert local_store.count_nodes() == 2
-        node = local_store.get_node("Person", "node-1")
-        assert node is not None
-        assert node.get("name") == "Alice"
-        local_store.close()
+    def test_inspect_graph_is_read_only_and_uses_explicit_node_type(self) -> None:
+        driver = _make_neo4j_session(
+            [{"props": {"id": "n1"}, "labels": ["OpenCrabNode", "Legacy"], "node_type": "Person"}],
+            [],
+        )
 
-    def test_migrate_graph_skips_node_without_id(self, tmp_path: Path) -> None:
-        """id 없는 노드는 경고만 출력하고 건너뜀."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
+        report = mig.inspect_graph_source(driver)
 
+        assert report["duplicates"] == []
+        session = driver.session.return_value
+        queries = [entry.args[0] for entry in session.run.call_args_list]
+        assert all("MATCH" in query and "RETURN" in query for query in queries)
+        assert mig._extract_node_type(["OpenCrabNode", "Legacy"], "Person") == "Person"
+        assert mig._extract_node_type(["OpenCrabNode", "Legacy"]) == "Legacy"
+
+    def test_inspect_graph_ignores_rows_without_ids_for_identity_checks(self) -> None:
         node_rows = [
-            # id 없음
             {"props": {"name": "NoId"}, "labels": ["OpenCrabNode", "Ghost"]},
-            # id 있음
             {"props": {"id": "valid-1"}, "labels": ["OpenCrabNode", "Valid"]},
         ]
-        driver = _make_neo4j_session(node_rows, [])
 
-        db_path = str(tmp_path / "graph_skip.db")
-        local_store = LocalGraphStore(db_path=db_path)
-        import logging
-        result = mig.migrate_graph(driver, local_store, batch_size=100, log=logging.getLogger())
+        report = mig.inspect_graph_source(_make_neo4j_session(node_rows, []))
 
-        # id 없는 노드는 스킵 → 1개만 저장
-        assert result["nodes"] == 1
-        assert local_store.count_nodes() == 1
-        local_store.close()
+        assert report["nodes"] == 2
+        assert report["duplicates"] == []
 
-    def test_labels_opencrbanode_removed(self, tmp_path: Path) -> None:
-        """labels에서 OpenCrabNode 제거 후 node_type 추출."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        node_rows = [
-            {"props": {"id": "n1"}, "labels": ["OpenCrabNode", "Lever", "ExtraLabel"]},
-        ]
-        driver = _make_neo4j_session(node_rows, [])
-
-        db_path = str(tmp_path / "graph_labels.db")
-        local_store = LocalGraphStore(db_path=db_path)
-        import logging
-        mig.migrate_graph(driver, local_store, batch_size=100, log=logging.getLogger())
-
-        # node_type = 'Lever' (OpenCrabNode 제거 후 첫 번째)
-        node = local_store.get_node("Lever", "n1")
-        assert node is not None
-        local_store.close()
-
-    def test_migrate_graph_skips_edge_without_ids(self, tmp_path: Path) -> None:
-        """from_id 또는 to_id 없는 엣지는 스킵."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        node_rows = [
-            {"props": {"id": "n1"}, "labels": ["Node"]},
-            {"props": {"id": "n2"}, "labels": ["Node"]},
-        ]
-        edge_rows = [
-            # to_id 없음
-            {"from_id": "n1", "from_labels": ["Node"], "relation": "REL",
-             "rel_props": {}, "to_id": None, "to_labels": ["Node"]},
-            # 정상
-            {"from_id": "n1", "from_labels": ["Node"], "relation": "KNOWS",
-             "rel_props": {}, "to_id": "n2", "to_labels": ["Node"]},
-        ]
-        driver = _make_neo4j_session(node_rows, edge_rows)
-
-        db_path = str(tmp_path / "graph_edge_skip.db")
-        local_store = LocalGraphStore(db_path=db_path)
-        import logging
-        result = mig.migrate_graph(driver, local_store, batch_size=100, log=logging.getLogger())
-
-        assert result["edges"] == 1
-        local_store.close()
-
-    def test_migrate_graph_only_opencrabnode_label(self, tmp_path: Path) -> None:
-        """labels가 ['OpenCrabNode'] 뿐이면 node_type='Unknown'으로 저장."""
-        from opencrab.stores.local_graph_store import LocalGraphStore
-
-        node_rows = [
-            {"props": {"id": "only-ocn"}, "labels": ["OpenCrabNode"]},
-        ]
-        driver = _make_neo4j_session(node_rows, [])
-
-        db_path = str(tmp_path / "graph_unknown.db")
-        local_store = LocalGraphStore(db_path=db_path)
-        import logging
-        result = mig.migrate_graph(driver, local_store, batch_size=100, log=logging.getLogger())
-
-        assert result["nodes"] == 1
-        node = local_store.get_node("Unknown", "only-ocn")
-        assert node is not None
-        local_store.close()
+    def test_extract_node_type_falls_back_to_unknown_marker_only(self) -> None:
+        assert mig._extract_node_type(["OpenCrabNode"]) == "Unknown"
 
 
 # ---------------------------------------------------------------------------

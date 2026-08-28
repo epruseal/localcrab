@@ -810,8 +810,8 @@ class TestNodeEdgeWriteMCP:
         assert result["valid"] is False
         assert "Unknown space 'badspace'" in result["error"]
 
-    def test_add_node_duplicate_id_reupserts(self, mcp_local_ctx):
-        """동일 node_id 재쓰기는 에러가 아니라 upsert (ok 응답)."""
+    def test_add_node_duplicate_id_rejects_a_conflicting_payload(self, mcp_local_ctx):
+        """전역 node_id의 다른 payload는 MCP에서 identity conflict로 거부한다."""
         from opencrab.mcp import tools
 
         valid_props = {"name": "Alice", "email": "a@ex.com", "role": "admin"}
@@ -822,9 +822,8 @@ class TestNodeEdgeWriteMCP:
             )
 
         assert first["node_id"] == "u1"
-        assert second["node_id"] == "u1"
-        assert second["stores"]["sql"] == "ok"
-        assert second["properties"]["name"] == "Alice2"
+        assert second["valid"] is False
+        assert "identity conflict" in second["error"]
 
     def test_add_edge_success_shape(self, mcp_local_ctx):
         from opencrab.mcp import tools
@@ -929,7 +928,7 @@ class TestNodeEdgeWriteHTTP:
         )
         assert resp.status_code == 422
 
-    def test_add_node_duplicate_id_reupserts(self, http_client, http_auth):
+    def test_add_node_duplicate_id_rejects_a_conflicting_payload(self, http_client, http_auth):
         payload = {
             "space": "subject",
             "node_type": "User",
@@ -943,8 +942,8 @@ class TestNodeEdgeWriteHTTP:
             headers=http_auth,
         )
         assert first.status_code == 200
-        assert second.status_code == 200
-        assert second.json()["stores"]["graph"] == "ok"
+        assert second.status_code == 422
+        assert "identity conflict" in second.json()["detail"]
 
     def test_add_edge_success_shape(self, http_client, http_auth):
         http_client.post(

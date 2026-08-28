@@ -290,14 +290,20 @@ class TestDupTypeNodeRowsHelper:
     def test_groups_by_node_id_within_the_named_pack_only(self):
         graph, _docs = _pg_fakes()
         graph.seed_node("Document", "n1", "pack-1")
-        graph.seed_node("Concept", "n1", "pack-1")     # 중복 타입 인위 주입
+        # The issue80 graph key is node_id alone, so a second type for the
+        # same id is rejected by the target primary key instead of becoming a
+        # repair candidate.
+        try:
+            graph.seed_node("Concept", "n1", "pack-1")
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("global node_id uniqueness was not enforced")
         graph.seed_node("Document", "n2", "pack-1")    # 중복 없음
-        # 다른 팩 — 안 섞여야 함(PK 가 (node_type,node_id) 전역이라 같은
-        # node_id 를 쓰려면 타입을 달리해야 이 fake 의 UNIQUE 제약과 안 부딪힌다).
-        graph.seed_node("Agent", "n1", "pack-2")
+        graph.seed_node("Agent", "n3", "pack-2")
 
         got = pack_load._dup_type_node_rows(graph, "pack-1")
-        assert got == {"n1": {"Document", "Concept"}, "n2": {"Document"}}
+        assert got == {"n1": {"Document"}, "n2": {"Document"}}
 
     def test_sqlite_backend_agrees(self, live, tmp_path):
         builder, graph, docs = live
@@ -307,82 +313,27 @@ class TestDupTypeNodeRowsHelper:
         assert got == {"n1": {"Document"}}
 
 
-class TestStaleTypeRowSweep:
-    """R3 — 구 타입 행 삭제 실패의 즉시 신호(err+1) + 구조적 회수(매 런 스윕)."""
+class TestTypeReclassification:
+    """A node type change uses the global-id CAS update path."""
 
-    def _seed_duplicate_type_row(self, live_fixture, tmp_path, monkeypatch):
-        """1회차: `graph.delete_node` 를 주입 실패시켜 구 타입 행이 물리적으로
-        남게 만든다(신 타입 행은 정상 저장). **스윕도 이 1회차 동안은
-        무력화한다**(`_dup_type_node_rows`→`{}`) — 안 그러면 같은 런 말미의
-        스윕이 방금 생긴 중복을 즉시 재시도해(같은 delete_node 가 아직
-        깨져 있으므로 또 실패) err 이 "즉시 신호분"과 "스윕 재시도분"으로
-        섞인다. 두 메커니즘을 독립적으로 검사하려고 분리한다 — `File` 은
-        `Document` 와 같은 `resource` space 에서 유효한 타입이다(`Concept`
-        같은 다른 space 전용 타입을 쓰면 그래프 스토어가 조용히
-        `original_type` 으로 강등한다, 2026-08-13 실측).
-        반환: (builder, graph, docs, f_new, err1)."""
-        builder, graph, docs = live_fixture
-        f_old = _write_jsonl(tmp_path / "old.jsonl",
-                             [_node(id="n1", node_type="Document", space="resource")])
-        pack_load.load_nodes("pack-1", f_old, builder, {})
+    def test_reclassification_replaces_the_single_global_row(self, live, tmp_path):
+        builder, graph, docs = live
+        old_file = _write_jsonl(
+            tmp_path / "old.jsonl",
+            [_node(id="n1", node_type="Document", space="resource")],
+        )
+        pack_load.load_nodes("pack-1", old_file, builder, {})
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
 
-        monkeypatch.setattr(graph, "delete_node", lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("주입된 그래프 삭제 실패")))
-        monkeypatch.setattr(pack_load, "_dup_type_node_rows", lambda *a, **kw: {})
+        new_file = _write_jsonl(
+            tmp_path / "new.jsonl",
+            [_node(id="n1", node_type="File", space="resource")],
+        )
+        result = pack_load.load_nodes_incremental(
+            "pack-1", new_file, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"],
+        )
 
-        f_new = _write_jsonl(tmp_path / "new.jsonl",
-                             [_node(id="n1", node_type="File", space="resource")])
-        n_new, n_chg, n_same, skip, err1, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
-
-        assert n_chg == 1, f"타입 변경이 chg 로 안 세어졌다: {n_chg}"
-        assert graph.get_node("Document", "n1") is not None, (
-            "사전조건: 삭제가 실패했으니 구 행이 살아있어야 한다")
-        assert graph.get_node("File", "n1") is not None, "신 행이 저장돼야 한다"
-
-        monkeypatch.undo()  # delete_node·스윕 패치를 함께 되돌린다 — 이후 호출은 실동작
-        return builder, graph, docs, f_new, err1
-
-    def test_delete_failure_is_signaled_as_err_immediately(
-            self, live, tmp_path, monkeypatch):
-        _b, _g, _d, _f, err1 = self._seed_duplicate_type_row(live, tmp_path, monkeypatch)
-        assert err1 == 1, f"삭제 실패가 err 로 즉시 안 잡혔다(즉시 신호, R3): err={err1}"
-
-    def test_sweep_recovers_the_duplicate_on_the_next_run(
-            self, live, tmp_path, monkeypatch):
-        builder, graph, docs, f_new, _err1 = self._seed_duplicate_type_row(
-            live, tmp_path, monkeypatch)
-
-        # collapse 확인 — live_pack_state 는 node_id 로 collapse 해 신 타입만
-        # 보인다(구 타입 행은 라이브 조회에서 안 보이지만 물리적으로는 있다).
-        state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-        assert state2["nodes"]["n1"][0] == "File", "전제: collapse 가 신 타입을 보여준다"
-
-        n_new2, n_chg2, n_same2, skip2, err2, _ids2 = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
-
-        assert n_same2 == 1, f"전제: collapse 뒤 같은 파일 재적재는 same 이어야 한다: {n_same2}"
-        assert err2 == 0, f"복구된 뒤 스윕 삭제가 실패하면 안 된다: {err2}"
-        assert graph.get_node("Document", "n1") is None, (
-            "스윕이 구 타입 행을 회수하지 못했다 — collapse 뒤에 영구 잔존")
-        assert graph.get_node("File", "n1") is not None, (
-            "신 타입 행이 스윕에 휘말려 지워졌다")
-
-    def test_removing_the_sweep_would_leave_the_duplicate_forever(
-            self, live, tmp_path, monkeypatch):
-        """변형(스윕 제거) red 확인 — `_dup_type_node_rows` 를 항상 빈 dict
-        로 되접는 스텁으로 몽키패치해 "스윕 삭제" 상태를 흉내낸다. 그러면
-        collapse 뒤 구 타입 행이 영구 잔존해야 한다(위 회수 테스트가 실제로
-        스윕에 의존한다는 증거 — 즉시 err 신호만으로는 이 케이스를 못
-        고친다)."""
-        builder, graph, docs, f_new, _err1 = self._seed_duplicate_type_row(
-            live, tmp_path, monkeypatch)
-        state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-
-        monkeypatch.setattr(pack_load, "_dup_type_node_rows", lambda *a, **kw: {})
-        pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
-
-        assert graph.get_node("Document", "n1") is not None, (
-            "스윕이 무력화된 변형에서도 구 행이 사라지면 이 테스트가 회귀를 못 잡는다")
+        assert result[:5] == (0, 1, 0, 0, 0)
+        assert graph.get_node("Document", "n1") is None
+        assert graph.get_node("File", "n1") is not None

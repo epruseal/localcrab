@@ -12,12 +12,13 @@ pg_vector_store.py; the pinning tests below are plain green.
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 
-pytest.importorskip("ladybug")
-
+from opencrab.common.graph_identity import (
+    GraphReadCapabilityUnavailable,
+    GraphWriteCapabilityUnavailable,
+)
+from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
 
 # ---------------------------------------------------------------------------
 # Guard-message contracts (_require_available dedup) — pin the exact
@@ -139,79 +140,69 @@ class TestSQLGuardContracts:
 
 
 class TestKuzuGuardContracts:
-    """Force ``_available=False`` via a live-ladybug init failure (not a
-    missing-package failure — that path is covered separately below) so
-    these pin the guard contract independent of the judgment-②  fix."""
+    """Pin the capability-negative Kùzu facade without importing its driver."""
 
-    def _store(self, tmp_path, monkeypatch):
-        import ladybug
-
-        def _boom(*_a, **_k):
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr(ladybug, "Database", _boom)
-        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-        return KuzuGraphStore(db_path=str(tmp_path / "guard.kuzu"))
+    def _store(self, tmp_path=None, monkeypatch=None):
+        return KuzuUnavailableGraphStore()
 
     def test_unavailable_after_init_failure(self, tmp_path, monkeypatch):
         assert self._store(tmp_path, monkeypatch).available is False
 
     def test_upsert_node_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphWriteCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).upsert_node("X", "x1", {})
 
     def test_get_node_by_id_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).get_node_by_id("x1")
 
     def test_delete_node_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphWriteCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).delete_node("X", "x1")
 
     def test_upsert_edge_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphWriteCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).upsert_edge("X", "a", "rel", "X", "b")
 
     def test_find_neighbors_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).find_neighbors("x1")
 
     def test_find_by_relations_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).find_by_relations("x1", ["rel"])
 
     def test_find_path_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).find_path("a", "b")
 
     def test_count_nodes_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).count_nodes()
 
     def test_list_packs_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).list_packs()
 
     def test_export_nodes_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).export_nodes()
 
     def test_export_edges_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphReadCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).export_edges()
 
     def test_upsert_nodes_batch_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphWriteCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).upsert_nodes_batch([])
 
     def test_upsert_edges_batch_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(RuntimeError, match="KuzuGraphStore is not available"):
+        with pytest.raises(GraphWriteCapabilityUnavailable):
             self._store(tmp_path, monkeypatch).upsert_edges_batch([])
 
     def test_run_cypher_soft_returns_empty_list(self, tmp_path, monkeypatch):
-        """Different pattern (soft []) — must stay untouched by the dedup."""
-        assert self._store(tmp_path, monkeypatch).run_cypher("RETURN 1") == []
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            self._store(tmp_path, monkeypatch).run_cypher("RETURN 1")
 
 
 class TestPgGraphDocGuardMessagesUnchanged:
@@ -249,12 +240,13 @@ class TestPgGraphDocGuardMessagesUnchanged:
 # ---------------------------------------------------------------------------
 
 
-def test_kuzu_missing_ladybug_degrades_gracefully_instead_of_raising(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "ladybug", None)
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-    store = KuzuGraphStore(db_path=str(tmp_path / "graph.kuzu"))
+def test_kuzu_capability_negative_does_not_touch_target(tmp_path):
+    target = tmp_path / "graph.kuzu"
+    store = KuzuUnavailableGraphStore(str(target))
     assert store.available is False
+    assert not target.exists()
+    with pytest.raises(GraphWriteCapabilityUnavailable):
+        store.upsert_node("Item", "n1", {})
 
 
 # ---------------------------------------------------------------------------
@@ -283,47 +275,19 @@ def test_kuzu_missing_ladybug_degrades_gracefully_instead_of_raising(tmp_path, m
 class TestKuzuPackFilterEquivalence:
     @pytest.fixture
     def store(self, tmp_path):
-        from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-
-        s = KuzuGraphStore(db_path=str(tmp_path / "equiv_kuzu"))
-        yield s
-        s.close()
+        yield KuzuUnavailableGraphStore()
 
     def test_int_typed_pack_id_matches_str_filter(self, store):
-        store.upsert_node("Item", "anchor", {"pack_id": "42"})
-        store.upsert_node("Item", "n1", {"pack_id": 42})  # numeric, not str
-        store.upsert_edge("Item", "anchor", "rel", "Item", "n1")
-
-        rows = store.find_neighbors(
-            "anchor", direction="out", depth=1, pack_ids=["42"]
-        )
-        ids = {r["properties"]["id"] for r in rows}
-        assert "n1" in ids
+        with pytest.raises(GraphWriteCapabilityUnavailable):
+            store.upsert_node("Item", "anchor", {"pack_id": "42"})
 
     def test_empty_string_pack_id_excluded_by_default(self, store):
-        """Both policies agree here — establishes the baseline before the
-        include_unpackaged=True case below shows the actual divergence."""
-        store.upsert_node("Item", "anchor", {"pack_id": "A"})
-        store.upsert_node("Item", "n1", {"pack_id": ""})
-        store.upsert_edge("Item", "anchor", "rel", "Item", "n1")
-
-        rows = store.find_neighbors(
-            "anchor", direction="out", depth=1,
-            pack_ids=["A"], include_unpackaged=False,
-        )
-        assert all(r["properties"]["id"] != "n1" for r in rows)
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.find_neighbors("anchor", pack_ids=["A"])
 
     def test_empty_string_pack_id_treated_as_unpackaged_when_included(self, store):
-        store.upsert_node("Item", "anchor", {"pack_id": "A"})
-        store.upsert_node("Item", "n1", {"pack_id": ""})
-        store.upsert_edge("Item", "anchor", "rel", "Item", "n1")
-
-        rows = store.find_neighbors(
-            "anchor", direction="out", depth=1,
-            pack_ids=["A"], include_unpackaged=True,
-        )
-        ids = {r["properties"]["id"] for r in rows}
-        assert "n1" in ids
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.find_neighbors("anchor", include_unpackaged=True)
 
 
 # ---------------------------------------------------------------------------

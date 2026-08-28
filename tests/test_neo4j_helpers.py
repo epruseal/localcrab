@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from opencrab.common.graph_identity import canonical_edge_digest, canonical_node_digest
 from opencrab.stores.neo4j_store import Neo4jStore
 
 
@@ -30,6 +31,24 @@ def _make_connected_store() -> tuple[Neo4jStore, MagicMock, MagicMock]:
     with patch("neo4j.GraphDatabase") as mock_gdb:
         mock_gdb.driver.return_value = mock_driver
         store = Neo4jStore("bolt://mock:7687", "neo4j", "pw")
+    def execute_write(callback):
+        transaction = MagicMock(name="transaction")
+        lock_result = MagicMock(name="lock-result")
+        lock_result.single.return_value = {"epoch": 1}
+
+        def run(query, *args, **kwargs):
+            if "SET l.lock_epoch" in query:
+                return lock_result
+            if "SET l.owner_token=null" in query:
+                return MagicMock(name="unlock-result")
+            return mock_session.run(query, *args, **kwargs)
+
+        transaction.run.side_effect = run
+        return callback(transaction)
+
+    mock_session.execute_write.side_effect = execute_write
+    mock_session.run.reset_mock()
+    store._schema_state = "target"
     return store, mock_driver, mock_session
 
 
@@ -38,6 +57,43 @@ def _make_unavailable_store() -> Neo4jStore:
         mock_gdb.driver.side_effect = RuntimeError("no route to host")
         store = Neo4jStore("bolt://mock:7687", "neo4j", "pw")
     return store
+
+
+def _reinitialise_with_edges(store: Neo4jStore, session: MagicMock, edges: list[dict]) -> None:
+    node_props = {"id": "n1"}
+    node_digest = canonical_node_digest("Person", None, node_props)
+    node = {
+        "node_id": "n1",
+        "node_type": "Person",
+        "node_digest": node_digest,
+        "props": node_props,
+        "labels": ["OpenCrabNode", "Person"],
+    }
+    required_constraints = [
+        {"name": "opencrab_node_id_unique"},
+        {"name": "opencrab_write_lock_name_unique"},
+        {"name": "opencrab_migration_lock_name_unique"},
+    ]
+
+    def run(query: str, **_kwargs):
+        if query == "SHOW CONSTRAINTS":
+            return required_constraints
+        if query == "SHOW INDEXES":
+            return []
+        if "MATCH (n:OpenCrabNode) RETURN" in query:
+            return [node]
+        if "MATCH (a)-[r]->(b)" in query:
+            return edges
+        if "any(label IN labels(n)" in query:
+            return []
+        if "OpenCrabWriteLock" in query:
+            return [{"count": 1}]
+        if "OpenCrabMigrationLock" in query:
+            return [{"count": 1}]
+        raise AssertionError(f"unexpected schema query: {query}")
+
+    session.run.side_effect = run
+    store._initialise_schema_state()
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +105,7 @@ class TestNeo4jStoreNormal:
     def test_connect_success_marks_available(self):
         store, mock_driver, mock_session = _make_connected_store()
         assert store.available is True
-        mock_session.run.assert_called_with("RETURN 1")
+        assert store.schema_state == "target"
 
     def test_ping_true_when_available(self):
         store, _driver, _session = _make_connected_store()
@@ -76,27 +132,34 @@ class TestNeo4jStoreNormal:
 
     def test_upsert_node_merges_and_returns_properties(self):
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {
-            "props": {"id": "u1", "name": "Alice"}
-        }
+        props = {"id": "u1", "name": "Alice", "space": "s1"}
+        digest = canonical_node_digest("User", "s1", props)
+        mock_session.run.return_value.single.side_effect = [
+            None,
+            {"props": props, "node_type": "User", "node_digest": digest},
+        ]
 
         result = store.upsert_node("User", "u1", {"name": "Alice"}, space_id="s1")
 
-        assert result == {"id": "u1", "name": "Alice"}
+        assert result == props
         cypher, kwargs = mock_session.run.call_args[0][0], mock_session.run.call_args[1]
-        assert "MERGE (n:OpenCrabNode:User {id: $id})" in cypher
-        assert kwargs["id"] == "u1"
-        assert kwargs["name"] == "Alice"
-        assert kwargs["space"] == "s1"
+        assert "MERGE (n:OpenCrabNode {node_id: $node_id})" in cypher
+        assert kwargs["node_id"] == "u1"
+        assert kwargs["props"] == props
 
     def test_upsert_node_omits_space_when_not_given(self):
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {"props": {"id": "u1"}}
+        props = {"id": "u1"}
+        digest = canonical_node_digest("User", None, props)
+        mock_session.run.return_value.single.side_effect = [
+            None,
+            {"props": props, "node_type": "User", "node_digest": digest},
+        ]
 
         store.upsert_node("User", "u1", {})
 
         kwargs = mock_session.run.call_args[1]
-        assert "space" not in kwargs
+        assert kwargs["props"] == props
 
     def test_upsert_node_space_id_argument_wins_over_conflicting_props_space(self):
         """Issue #118 codex review [2]: upsert_node now goes through the
@@ -106,12 +169,17 @@ class TestNeo4jStoreNormal:
         this (unconditional overwrite) before the shared helper existed --
         this pins that the refactor preserved it exactly."""
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {"props": {"id": "u1"}}
+        props = {"id": "u1", "space": "evidence"}
+        digest = canonical_node_digest("User", "evidence", props)
+        mock_session.run.return_value.single.side_effect = [
+            None,
+            {"props": props, "node_type": "User", "node_digest": digest},
+        ]
 
         store.upsert_node("User", "u1", {"space": "claim"}, space_id="evidence")
 
         kwargs = mock_session.run.call_args[1]
-        assert kwargs["space"] == "evidence"
+        assert kwargs["props"] == props
 
     def test_get_node_returns_none_when_no_record(self):
         store, _driver, mock_session = _make_connected_store()
@@ -126,8 +194,8 @@ class TestNeo4jStoreNormal:
         store.get_node("User", "u1")
 
         cypher = mock_session.run.call_args[0][0]
-        assert "MATCH (n:User {id: $id})" in cypher
-        assert mock_session.run.call_args[1] == {"id": "u1"}
+        assert "MATCH (n:OpenCrabNode {node_id: $id})" in cypher
+        assert mock_session.run.call_args[1] == {"id": "u1", "node_type": "User"}
 
     def test_lookup_node_type_returns_label(self):
         store, _driver, mock_session = _make_connected_store()
@@ -157,7 +225,12 @@ class TestNeo4jStoreNormal:
 
     def test_upsert_edge_builds_merge_with_properties(self):
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {"r": {}}
+        props = {"from_id": "u1", "relation": "OWNS", "to_id": "p1", "since": 2020}
+        mock_session.run.return_value.single.side_effect = [
+            {"from_type": "User", "to_type": "Project"},
+            None,
+            {"props": props},
+        ]
 
         result = store.upsert_edge(
             "User", "u1", "OWNS", "Project", "p1", {"since": 2020}
@@ -166,18 +239,27 @@ class TestNeo4jStoreNormal:
         assert result is True
         cypher = mock_session.run.call_args[0][0]
         kwargs = mock_session.run.call_args[1]
-        assert "MERGE (a)-[r:OWNS]->(b)" in cypher
-        assert "r.since = $since" in cypher
-        assert kwargs == {"from_id": "u1", "to_id": "p1", "since": 2020}
+        assert "MERGE (a)-[r:`OWNS` {edge_key: $edge_key}]->(b)" in cypher
+        assert "r.edge_digest=$edge_digest" in cypher
+        assert kwargs["from_id"] == "u1"
+        assert kwargs["to_id"] == "p1"
+        assert kwargs["props"] == props
 
     def test_upsert_edge_default_created_timestamp_when_no_properties(self):
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {"r": {}}
+        props = {"from_id": "u1", "relation": "OWNS", "to_id": "p1"}
+        digest = canonical_edge_digest("u1", "OWNS", "p1", "User", "Project", props)
+        mock_session.run.return_value.single.side_effect = [
+            {"from_type": "User", "to_type": "Project"},
+            None,
+            {"props": props},
+        ]
 
         store.upsert_edge("User", "u1", "OWNS", "Project", "p1")
 
         cypher = mock_session.run.call_args[0][0]
-        assert "r.created = timestamp()" in cypher
+        assert "r.edge_digest=$edge_digest" in cypher
+        assert mock_session.run.call_args[1]["edge_digest"] == digest
 
     def test_upsert_edge_false_when_no_record(self):
         store, _driver, mock_session = _make_connected_store()
@@ -213,7 +295,8 @@ class TestNeo4jStoreNormal:
 
         assert store.count_nodes("User") == 5
         cypher = mock_session.run.call_args[0][0]
-        assert "MATCH (n:User)" in cypher
+        assert "MATCH (n:OpenCrabNode)" in cypher
+        assert "n.node_type=$node_type" in cypher
 
     def test_count_nodes_without_type_filter(self):
         store, _driver, mock_session = _make_connected_store()
@@ -221,7 +304,7 @@ class TestNeo4jStoreNormal:
 
         assert store.count_nodes() == 9
         cypher = mock_session.run.call_args[0][0]
-        assert cypher == "MATCH (n) RETURN count(n) AS cnt"
+        assert cypher == "MATCH (n:OpenCrabNode) RETURN count(n) AS cnt"
 
     def test_find_neighbors_maps_records_via_build_neighbors_cypher(self):
         store, _driver, mock_session = _make_connected_store()
@@ -257,9 +340,39 @@ class TestNeo4jStoreNormal:
         ):
             store.ensure_constraints()
 
-        calls = [c.args[0] for c in mock_session.run.call_args_list]
-        assert any("FOR (n:User)" in c for c in calls)
-        assert any("FOR (n:Project)" in c for c in calls)
+        assert store.schema_state == "target"
+        mock_session.run.assert_not_called()
+
+
+class TestNeo4jSchemaInventory:
+    @staticmethod
+    def _edge_row(store: Neo4jStore, *, edge_key: str | None = None) -> dict:
+        props = {"from_id": "n1", "relation": "KNOWS", "to_id": "n1"}
+        key = edge_key or store._edge_key("n1", "KNOWS", "n1")
+        digest = canonical_edge_digest("n1", "KNOWS", "n1", "Person", "Person", props)
+        props = {**props, "edge_key": key, "edge_digest": digest, "from_type": "Person", "to_type": "Person"}
+        return {
+            "from_id": "n1", "from_type": "Person", "from_labels": ["OpenCrabNode", "Person"],
+            "to_id": "n1", "to_type": "Person", "to_labels": ["OpenCrabNode", "Person"],
+            "rel_type": "KNOWS", "relation": "KNOWS", "stored_from_id": "n1", "stored_to_id": "n1",
+            "edge_key": key, "edge_digest": digest, "props": props,
+        }
+
+    def test_duplicate_relationship_identity_fails_closed_at_startup(self):
+        store, _driver, session = _make_connected_store()
+        edge = self._edge_row(store)
+
+        _reinitialise_with_edges(store, session, [edge, dict(edge)])
+
+        assert store.schema_state == "partial_or_unknown"
+
+    def test_relationship_edge_key_drift_fails_closed_at_startup(self):
+        store, _driver, session = _make_connected_store()
+        edge = self._edge_row(store, edge_key="wrong-edge-key")
+
+        _reinitialise_with_edges(store, session, [edge])
+
+        assert store.schema_state == "partial_or_unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -338,14 +451,21 @@ class TestNeo4jStoreEdgeCases:
 
         assert store.find_neighbors("a") == []
 
-    def test_upsert_edge_empty_properties_dict_uses_default_timestamp(self):
+    def test_upsert_edge_empty_properties_dict_uses_canonical_identity(self):
         store, _driver, mock_session = _make_connected_store()
-        mock_session.run.return_value.single.return_value = {"r": {}}
+        props = {"from_id": "u1", "relation": "OWNS", "to_id": "p1"}
+        digest = canonical_edge_digest("u1", "OWNS", "p1", "User", "Project", props)
+        mock_session.run.return_value.single.side_effect = [
+            {"from_type": "User", "to_type": "Project"},
+            None,
+            {"props": props},
+        ]
 
         store.upsert_edge("User", "u1", "OWNS", "Project", "p1", {})
 
         cypher = mock_session.run.call_args[0][0]
-        assert "r.created = timestamp()" in cypher
+        assert "r.edge_digest=$edge_digest" in cypher
+        assert mock_session.run.call_args[1]["edge_digest"] == digest
 
     def test_build_neighbors_cypher_depth_zero_boundary(self):
         # depth=0 is a boundary not covered by test_graph_pack_filter.py's
@@ -541,5 +661,5 @@ class TestScopedRelationLookup:
         assert store.list_pack_ids() == {"p-node", "p-edge-only"}
 
         queries = [c[0][0] for c in session.run.call_args_list]
-        assert any("MATCH (n)" in q and "n.pack_id" in q for q in queries)
+        assert any("MATCH (n:OpenCrabNode)" in q and "n.pack_id" in q for q in queries)
         assert any("-[r]->" in q and "r.pack_id" in q for q in queries)

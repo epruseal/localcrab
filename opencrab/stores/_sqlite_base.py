@@ -68,6 +68,10 @@ class _SqliteConnMixin:
         # "API misuse"로 깨진다. 스레드마다 자기 커넥션을 쓰면 WAL이 reader/writer를
         # 격리해 읽기는 락 없이 동시 진행된다.
         self._local = threading.local()
+        # Transaction ownership is per worker thread.  Keeping this beside
+        # the thread-local connection prevents one writer from making every
+        # concurrent writer look like a nested transaction.
+        self._graph_tx_state = threading.local()
         self._conns_lock = threading.Lock()
         self._all_conns = []
 
@@ -102,7 +106,7 @@ class _SqliteConnMixin:
         return conn
 
     @contextlib.contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """쓰기 트랜잭션 경계. 쓰기 락을 쥔 채 커넥션을 내주고, with 블록이 예외 없이
         끝나면 commit, 예외가 나면 rollback 후 재던진다.
 
@@ -125,6 +129,10 @@ class _SqliteConnMixin:
         with self._lock:
             conn = self._conn
             try:
+                if immediate:
+                    if conn.in_transaction:
+                        raise RuntimeError("nested graph transaction is not allowed")
+                    conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 conn.commit()
             except BaseException:

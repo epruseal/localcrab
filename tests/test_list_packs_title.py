@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import pytest
 
+from opencrab.common.graph_identity import GraphWriteCapabilityUnavailable
+from opencrab.stores.kuzu_graph_store import KuzuUnavailableGraphStore
+
 # ---------------------------------------------------------------------------
 # LocalGraphStore
 # ---------------------------------------------------------------------------
@@ -63,53 +66,29 @@ def test_local_list_packs_empty_when_no_anchor_no_pkg_title(local_store):
 
 
 # ---------------------------------------------------------------------------
-# KuzuGraphStore
+# Kuzu capability-negative facade
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def kuzu_store(tmp_path):
-    pytest.importorskip("ladybug")
-    from opencrab.stores.kuzu_graph_store import KuzuGraphStore
-    s = KuzuGraphStore(db_path=str(tmp_path / "test_kuzu"))
-    yield s
-    s.close()
+    yield KuzuUnavailableGraphStore()
 
 
 def test_kuzu_list_packs_uses_anchor_title(kuzu_store):
-    kuzu_store.upsert_node("Dataset", "dataset:mypkg", {"pack_id": "mypkg", "title": "My Package"})
-    kuzu_store.upsert_node("Thing", "t1", {"pack_id": "mypkg", "name": "some thing"})
-
-    rows = kuzu_store.list_packs(min_nodes=1)
-    row = next(r for r in rows if r["pack_id"] == "mypkg")
-    assert row["sample_title"] == "My Package"
+    with pytest.raises(GraphWriteCapabilityUnavailable):
+        kuzu_store.upsert_node("Dataset", "dataset:mypkg", {"pack_id": "mypkg"})
 
 
 def test_kuzu_list_packs_anchor_beats_other_titles(kuzu_store):
-    kuzu_store.upsert_node("Dataset", "dataset:pkg", {"pack_id": "pkg", "title": "Correct Title"})
-    kuzu_store.upsert_node("Part", "p1", {"pack_id": "pkg", "title": "ZZZZZ Wrong Part Title"})
-    kuzu_store.upsert_node("Doc", "d1", {"pack_id": "pkg", "name": "AAAA Wrong Doc Name"})
-
-    rows = kuzu_store.list_packs(min_nodes=1)
-    row = next(r for r in rows if r["pack_id"] == "pkg")
-    assert row["sample_title"] == "Correct Title"
+    with pytest.raises(GraphWriteCapabilityUnavailable):
+        kuzu_store.upsert_node("Dataset", "dataset:pkg", {"pack_id": "pkg"})
 
 
 def test_kuzu_list_packs_falls_back_to_source_package_title(kuzu_store):
-    kuzu_store.upsert_node("Thing", "t1", {
-        "pack_id": "extpkg",
-        "source_package_title": "External Pack",
-        "title": "Random Node Title",
-    })
-
-    rows = kuzu_store.list_packs(min_nodes=1)
-    row = next(r for r in rows if r["pack_id"] == "extpkg")
-    assert row["sample_title"] == "External Pack"
+    with pytest.raises(GraphWriteCapabilityUnavailable):
+        kuzu_store.upsert_node("Thing", "t1", {"pack_id": "extpkg"})
 
 
 def test_kuzu_list_packs_empty_when_no_anchor_no_pkg_title(kuzu_store):
-    kuzu_store.upsert_node("Thing", "t1", {"pack_id": "bare", "title": "Should Not Appear"})
-    kuzu_store.upsert_node("Thing", "t2", {"pack_id": "bare", "name": "Also Should Not"})
-
-    rows = kuzu_store.list_packs(min_nodes=1)
-    row = next(r for r in rows if r["pack_id"] == "bare")
-    assert row["sample_title"] == ""
+    with pytest.raises(GraphWriteCapabilityUnavailable):
+        kuzu_store.upsert_node("Thing", "t1", {"pack_id": "bare"})

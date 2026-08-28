@@ -1,0 +1,15 @@
+{
+  "schema_version": "issue80.graph-inventory.v1",
+  "evidence_kind": "derived-source-inventory",
+  "source_command": "python3 -m tests.graph_inventory",
+  "exclusions": [".venv", "build", "generated", "vendor"],
+  "gates": {
+    "graph_candidate_unclassified": "zero",
+    "owned_graph_writer_set": "equals derived candidate set",
+    "known_negative_classification_drift": "zero",
+    "candidate_identity": "bidirectional locator:owner:sink:query_digest identity"
+  },
+  "candidate_fields": ["candidate_id", "locator", "owner", "sink", "query_digest", "query_kind", "resolved"],
+  "candidates": "recompute with source_command",
+  "negative_classifications": "recompute with source_command"
+}
