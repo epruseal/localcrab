@@ -76,7 +76,7 @@ jobs:
           export OPENCRAB_NEO4J_TEST_PASSWORD="$neo4j_password"
           export OPENCRAB_NEO4J_TEST_DATABASE=neo4j
           export OPENCRAB_PG_TEST_URL=postgresql://opencrab:opencrab@localhost:5432/opencrab_test
-          python -c 'import json, os, sys; path, uri, port, name, password = sys.argv[1:]; payload = {"schema": "issue80-neo4j-capability-v1", "uri": uri, "port": int(port), "user": "neo4j", "password": password, "database": "neo4j", "run_nonce": os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"], "container_name": name}; handle = open(path, "w", encoding="utf-8"); json.dump(payload, handle, sort_keys=True); handle.write("\\n"); handle.close(); os.chmod(path, 0o600)' "$capability_file" "$OPENCRAB_NEO4J_TEST_URI" "$neo4j_port" "$neo4j_name" "$neo4j_password"
+          python -c 'import json, os, sys; path, uri, port, name, password = sys.argv[1:]; payload = {"schema": "issue80-neo4j-capability-v1", "uri": uri, "port": int(port), "user": "neo4j", "password": password, "database": "neo4j", "run_nonce": os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"], "container_name": name}; handle = open(path, "w", encoding="utf-8"); print(json.dumps(payload, sort_keys=True), file=handle); handle.close(); os.chmod(path, 0o600)' "$capability_file" "$OPENCRAB_NEO4J_TEST_URI" "$neo4j_port" "$neo4j_name" "$neo4j_password"
           export OPENCRAB_ISSUE80_NEO4J_CAPABILITY_FILE="$capability_file"
           export OPENCRAB_ISSUE80_NEO4J_DISPOSABLE=1
           export OPENCRAB_ISSUE80_SERVICE_APPLY=1
