@@ -315,6 +315,14 @@ class MCPServer:
         name = params.get("name")
         if not name:
             raise TypeError("'name' is required in tools/call params.")
+        # PR review R2: a PRESENT non-object `arguments` -- explicit JSON null
+        # included, hence the key-presence check (same rationale as
+        # _meta:null) -- is a malformed CallToolRequest: protocol error
+        # -32602, raised BEFORE dispatch_tool so no tool ever runs on it.
+        # An ABSENT key defaults to {}. The legacy path keeps its historical
+        # `or {}` coercion untouched.
+        if "arguments" in params and not isinstance(params["arguments"], dict):
+            raise TypeError("'arguments' must be an object when present")
         arguments = params.get("arguments") or {}
         try:
             result = dispatch_tool(name, arguments)

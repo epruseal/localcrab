@@ -316,6 +316,14 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             if modern_http:
                 fault = _modern_header_fault(request, body)
                 if fault is not None:
+                    if "id" not in body:
+                        # PR review R1: a NOTIFICATION failing header
+                        # validation is rejected at the transport (400) with
+                        # an empty body. The spec leaves the JSON-RPC error
+                        # body optional (MAY) for rejected notifications;
+                        # omitting it keeps this layer consistent with
+                        # handle_request, which never answers a notification.
+                        return Response(status_code=400, headers=_NO_STORE)
                     return JSONResponse(
                         {
                             "jsonrpc": "2.0",
