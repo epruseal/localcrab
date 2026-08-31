@@ -11,10 +11,14 @@ order collisions both raise at import time.
 
 from __future__ import annotations
 
+import copy
 import functools
+import hashlib
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -223,6 +227,48 @@ def tools_for_principal(principal: Principal) -> list[dict[str, Any]]:
         for spec in sorted(_REGISTRY.values(), key=lambda s: s.order)
         if _tool_allowed(spec, principal)
     ]
+
+
+def get_tool_catalog(principal: Principal) -> dict[str, Any]:
+    """Principal-scoped tool catalog snapshot with a content fingerprint (#135).
+
+    Entries mirror ``tools_for_principal``'s visibility exactly (same
+    ``_tool_allowed`` filter, same ``order``-sorted deterministic sequence)
+    but carry the catalog metadata #135 asks for: the ACCESS TIER -- not the
+    ``writes`` flag, which is the cross-process-lock axis and is exposed
+    honestly as ``requires_write_lock`` instead (see ``AccessTier``'s
+    docstring for why the two must not be conflated).
+
+    Raw ``order`` values are deliberately absent from both the entries and
+    the fingerprint input: array position already carries determinism, and
+    integer gaps in a remote caller's view would hint at hidden slots,
+    breaking #150's hidden==unregistered invariant. The fingerprint hashes
+    ONLY the visible entries (canonical JSON, sha256), so a hidden tool's
+    existence, removal, or mutation never moves a remote caller's
+    fingerprint. Entries are deep-copied -- mutating a returned snapshot
+    must not reach the registry or the next snapshot. Computed fresh per
+    call, like ``tools_for_principal`` (no cache to leak across
+    principals). The registry is import-time-static today, so within one
+    process lifetime the fingerprint is constant per view; it exists so a
+    future runtime-mutable registry has a stale-detection primitive ready.
+    """
+    entries = [
+        {
+            "name": spec.name,
+            "description": spec.schema.get("description", ""),
+            "inputSchema": copy.deepcopy(spec.schema.get("inputSchema", {})),
+            "access": spec.access.value,
+            "requires_write_lock": spec.writes,
+        }
+        for spec in sorted(_REGISTRY.values(), key=lambda s: s.order)
+        if _tool_allowed(spec, principal)
+    ]
+    canonical = json.dumps(entries, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "fingerprint": hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+        "tools": entries,
+    }
 
 
 # Client-supplied identity fields dispatch_tool refuses outright. The

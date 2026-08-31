@@ -6,33 +6,16 @@ Each tool is a plain function decorated with ``@tool(name, schema)``
 registry. ``TOOLS`` / ``TOOL_SCHEMAS`` / ``_TOOL_FUNCTIONS`` / ``dispatch_tool``
 / ``UnknownToolError`` are all derived from that registry at import time.
 
-Exposed tools (16):
-  ── Grammar ────────────────────────────────────────────────────────────
-  1.  ontology_manifest         — full grammar as JSON
-  ── Graph write ────────────────────────────────────────────────────────
-  2.  ontology_add_node         — add/update a node (grammar-validated)
-  3.  ontology_add_edge         — add/update an edge (grammar-validated)
-  ── Retrieval / read ───────────────────────────────────────────────────
-  4.  ontology_query            — hybrid vector + BM25 + graph search
-  5.  ontology_get_node         — fetch a single node by node_id
-  6.  ontology_list_nodes       — list nodes filtered by space / pack_id
-  7.  ontology_list_edges       — list edges filtered by pack_id
-  ── Analysis ───────────────────────────────────────────────────────────
-  8.  ontology_impact           — I1–I7 impact analysis
-  9.  ontology_lever_simulate   — predict outcome changes from lever movement
-  ── Pack management ────────────────────────────────────────────────────
-  10. content_pack_list         — list readable packs (pack_id, node count, title)
-  11. schema_pack_list          — list available schema packs
-  12. schema_pack_install       — install a domain schema pack
-  13. schema_pack_uninstall     — uninstall a schema pack
-  14. pack_create               — create a new ontology pack
-  15. pack_ingest               — add content to an existing pack
-  ── Execution / harness ────────────────────────────────────────────────
-  16. harness_promotion_apply   — apply a CrabHarness PromotionPackage
+Exposed tools: the single source of truth is the ``@tool`` registrations in
+the handler submodules (graph.py / query.py / pack.py / schema.py /
+harness.py / catalog.py), pinned by the golden snapshot in
+tests/test_tool_registry_contract.py. Enumerating them here rotted twice
+(#146, #201), so this docstring deliberately carries no count or list —
+query a live server via tools/list or the ``tool_search`` tool (#135).
 
 ── R9 패키지 분해 완료 (Stage 10 — 물리 분할 컷오버) ─────────────────────────
 핸들러 본체는 이제 이 파일이 아니라 graph.py / query.py / pack.py / schema.py /
-harness.py 다섯 개 서브모듈에 물리적으로 산다. 이 파일(``__init__.py``)은
+harness.py / catalog.py 서브모듈에 물리적으로 산다. 이 파일(``__init__.py``)은
 공유 플러밍(``_get_context`` / ``_context`` 딕셔너리 / ``_clean_str`` /
 ``_clean_meta`` / 락 헬퍼 / ``WRITE_TOOLS`` / BillingHooks 배선)만 소유하고,
 서브모듈 임포트로 ``@tool`` 데코레이터를 실행시켜 등록을 트리거한 뒤, 모든
@@ -265,6 +248,7 @@ def _get_context() -> dict[str, Any]:
 # this import sequence).
 # ---------------------------------------------------------------------------
 
+from .catalog import tool_search  # noqa: E402
 from .graph import (  # noqa: E402
     ontology_add_edge,
     ontology_add_node,
@@ -331,6 +315,7 @@ __all__ = [
     "schema_pack_install",
     "schema_pack_list",
     "schema_pack_uninstall",
+    "tool_search",
     "tools_for_principal",
 ]
 
