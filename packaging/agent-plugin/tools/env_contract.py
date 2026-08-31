@@ -28,7 +28,7 @@ opencrab extract 같은 별도 CLI 커맨드 전용 이름이 여기 해당한�
 from __future__ import annotations
 
 ENV_CONTRACT: dict[str, str] = {
-    # --- opencrab/config.py Settings alias (31) ---
+    # --- opencrab/config.py Settings alias (33) ---
     "STORAGE_MODE": "설정 소스 선택",
     "LOCAL_DATA_DIR": "상태 위치",
     "NEO4J_URI": "외부 전송 결정",
@@ -63,6 +63,14 @@ ENV_CONTRACT: dict[str, str] = {
     # "serve 비도달" 접미는 붙이지 않고 튜너블로만 남긴다.
     "MCP_HTTP_HOST": "튜너블",
     "MCP_HTTP_PORT": "튜너블",
+    # #136(#243): dual-era 프로토콜 게이트. 값이 malformed 면(미지 버전,
+    # bare-origin 이 아닌 항목, 빈 항목) 기동을 거부하는 튜너블이다.
+    # MCP_PROTOCOL_VERSIONS 는 MCPServer.__init__(stdio 포함) 경로에서,
+    # MCP_ALLOWED_ORIGINS 는 http transport 조립(install_mcp_origin_guard)
+    # 에서만 읽히지만 MCP_HTTP_HOST 와 같은 이유(같은 serve 커맨드의 다른
+    # 분기)로 "serve 비도달" 접미는 붙이지 않는다.
+    "MCP_PROTOCOL_VERSIONS": "튜너블",
+    "MCP_ALLOWED_ORIGINS": "튜너블",
     "LOG_LEVEL": "튜너블",
     # --- 직접 읽기 (alias 밖, opencrab/·apps/ AST 스캔 실측, 12종) ---
     # opencrab extract CLI 커맨드 전용(cli.py:584,614). opencrab serve 의 도구

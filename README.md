@@ -119,6 +119,8 @@ claude mcp add localcrab -- opencrab serve
 
 `serve --transport http`가 `/mcp` 엔드포인트를 직접 노출한다(supergateway 불필요).
 
+**프로토콜은 dual-era 다(#136).** 2026-07-28 modern 계약(요청별 `_meta`, `server/discover`, 표준 헤더 검증, Origin guard)과 legacy initialize handshake 를 같은 엔드포인트에서 함께 서빙한다. era 판정 규칙·클라이언트 호환성 매트릭스·`MCP_PROTOCOL_VERSIONS`/`MCP_ALLOWED_ORIGINS` 설정은 [docs/mcp-protocol-compat.md](docs/mcp-protocol-compat.md) 를 본다.
+
 **인증은 사용자별 토큰뿐이다(#145).** 무인증 모드와 공유 비밀(`--auth-token-file`, `LOCALCRAB_MCP_TOKEN`, `OPENCRAB_API_KEY`)은 삭제됐다 — 그 환경변수가 남아 있으면 **기동을 거부**한다(효력 없는 변수를 보고 보호받는다고 믿는 상태가 가장 위험하다).
 
 ```bash

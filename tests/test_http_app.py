@@ -202,7 +202,7 @@ class TestAuthErrors:
         _, _, secret = bootstrapped
         resp = client.get("/mcp", headers=_auth(secret))
         assert resp.status_code == 405
-        assert resp.headers["allow"] == "POST, DELETE"
+        assert resp.headers["allow"] == "POST"
 
     def test_get_mcp_without_auth_401_before_405(self, client):
         # auth is checked before the stateless-405 response
@@ -361,10 +361,13 @@ class TestBatchAndNotifications:
         assert len(body) == 1
         assert body[0]["id"] == 1
 
-    def test_delete_mcp_returns_200_with_auth(self, client, bootstrapped):
+    def test_delete_mcp_returns_405_with_auth(self, client, bootstrapped):
+        # #136 -- 2026-07-28 은 GET/DELETE 405, legacy Streamable HTTP 도
+        # 세션 미발급 서버의 DELETE 405 를 허용.
         _, _, secret = bootstrapped
         resp = client.delete("/mcp", headers=_auth(secret))
-        assert resp.status_code == 200
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "POST"
 
 
 # ---------------------------------------------------------------------------

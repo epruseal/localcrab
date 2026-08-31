@@ -23,6 +23,7 @@ from typing import Any
 
 from opencrab.auth import current_principal
 from opencrab.config import get_settings
+from opencrab.mcp import protocol
 from opencrab.mcp.tools import UnknownToolError, dispatch_tool, tools_for_principal
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,15 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+# Shared between the legacy initialize response and the modern server/discover
+# result (#136) -- the text is a static constant, not per-deployment state, so
+# carrying it in both eras contradicts nothing.
+INSTRUCTIONS = (
+    "OpenCrab exposes the MetaOntology OS grammar. "
+    "Use ontology_manifest to explore the full grammar, "
+    "then add nodes/edges and query the ontology."
+)
 
 
 class MCPServer:
@@ -50,6 +60,17 @@ class MCPServer:
         cfg = get_settings()
         self._name = cfg.mcp_server_name
         self._version = cfg.mcp_server_version
+        # #136: dual-era version gates. ValueError -> RuntimeError here so
+        # every entry point (stdio main(), `opencrab serve`, mcp_router()/
+        # create_app, the apps/api import) refuses startup the same way
+        # refuse_stale_shared_secret_env does. getattr keeps MagicMock-based
+        # test settings (which predate the field) on the all-enabled default.
+        try:
+            self._enabled_modern, self._enabled_legacy = protocol.parse_enabled_versions(
+                getattr(cfg, "mcp_protocol_versions", None)
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     # ------------------------------------------------------------------
     # Entry point
@@ -111,6 +132,34 @@ class MCPServer:
 
         params = request.get("params") or {}
 
+        # ── modern era (2026-07-28): per-request _meta (#136) ─────────────
+        if protocol.is_modern_request(method, params):
+            return self._handle_modern(req_id, method, params, is_notification)
+
+        # ── legacy era (initialize handshake; no per-request _meta) ───────
+        if not self._enabled_legacy:
+            # Legacy support switched off via MCP_PROTOCOL_VERSIONS. The
+            # errors name the modern versions: legacy clients have no
+            # fall-forward mechanism, so this message is the only diagnostic
+            # they can surface (spec basic/versioning SHOULD).
+            if is_notification:
+                return None
+            supported = ", ".join(self._enabled_modern) or "none"
+            if method == "initialize":
+                return self._error_response(
+                    req_id,
+                    INVALID_PARAMS,
+                    "The initialize handshake is disabled on this server; send "
+                    f"per-request _meta with a supported protocol version: {supported}",
+                )
+            return self._error_response(
+                req_id,
+                INVALID_PARAMS,
+                "Protocol version metadata is required "
+                f"('{protocol.META_PROTOCOL_VERSION}' in params._meta); "
+                f"supported: {supported}",
+            )
+
         try:
             result = self._dispatch(method, params)
         except KeyError as exc:
@@ -152,6 +201,149 @@ class MCPServer:
             raise KeyError(f"Method not found: '{method}'")
 
     # ------------------------------------------------------------------
+    # Modern era (2026-07-28) -- #136
+    # ------------------------------------------------------------------
+
+    def _handle_modern(
+        self, req_id: Any, method: str, params: Any, is_notification: bool
+    ) -> dict[str, Any] | None:
+        """Serve one modern-era request (per-request ``_meta``; stateless).
+
+        Body-side validation only: the HTTP transport runs its header
+        validation BEFORE handle_request is reached (issue #136 design
+        §4.3.1), and stdio has no header layer, so a metadata-less
+        ``server/discover`` reports -32602 here (stdio) but -32020 at the
+        HTTP layer. Notifications are never answered, whatever the outcome.
+        """
+        fault = protocol.validate_modern(params, self._enabled_modern)
+        if fault is not None:
+            if is_notification:
+                return None
+            return self._error_response(req_id, fault.code, fault.message, fault.data)
+
+        if method.startswith("notifications/"):
+            logger.debug("Received modern notification: %s", method)
+            return None
+
+        try:
+            result = self._dispatch_modern(method, params)
+        except UnknownToolError as exc:
+            # Modern contract (spec server/tools "Error Handling"): an
+            # unknown tool is Invalid Params (-32602). The legacy era keeps
+            # its historical -32601 mapping; #150's hidden-vs-removed
+            # indistinguishability holds in both (same code either way).
+            if is_notification:
+                return None
+            return self._error_response(req_id, INVALID_PARAMS, str(exc))
+        except KeyError as exc:
+            if is_notification:
+                return None
+            return self._error_response(req_id, METHOD_NOT_FOUND, str(exc))
+        except TypeError as exc:
+            if is_notification:
+                return None
+            return self._error_response(req_id, INVALID_PARAMS, f"Invalid params: {exc}")
+        except Exception as exc:
+            logger.exception("Internal error handling modern method '%s': %s", method, exc)
+            if is_notification:
+                return None
+            return self._error_response(req_id, INTERNAL_ERROR, str(exc))
+
+        if is_notification:
+            return None
+        # Per-response identity (spec basic/index: servers SHOULD include
+        # serverInfo in every result's _meta -- results only, never errors).
+        result.setdefault("_meta", {})[protocol.META_SERVER_INFO] = {
+            "name": self._name,
+            "version": self._version,
+        }
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    def _dispatch_modern(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "server/discover":
+            return self._handle_discover()
+        if method == "tools/list":
+            return self._modern_tools_list(params)
+        if method == "tools/call":
+            return self._modern_tools_call(params)
+        # initialize/ping were removed in 2026-07-28 -- they fall through
+        # here and surface as METHOD_NOT_FOUND on the modern era.
+        raise KeyError(f"Method not found: '{method}'")
+
+    def _handle_discover(self) -> dict[str, Any]:
+        """``server/discover`` (2026-07-28: servers MUST implement).
+
+        ``supportedVersions`` lists MODERN versions only: it is the set a
+        client may put into per-request ``_meta``, and a legacy version
+        there would be the exact contradiction validate_modern rejects.
+        Legacy support is discoverable through the initialize path itself.
+        The response is identical for every caller (no user data), so
+        cacheScope is "public".
+        """
+        return {
+            "resultType": "complete",
+            "supportedVersions": list(self._enabled_modern),
+            # No listChanged: the tool registry is import-time-static, so
+            # advertising change notifications would be untrue (#136 scope).
+            "capabilities": {"tools": {}},
+            "instructions": INSTRUCTIONS,
+            "ttlMs": protocol.DISCOVER_TTL_MS,
+            "cacheScope": "public",
+        }
+
+    def _modern_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        """tools/list with the 2026-07-28 CacheableResult contract.
+
+        cacheScope MUST stay "private": #150 scopes the list per principal,
+        and a "public" hint would let a shared cache serve the local
+        principal's admin tools to remote callers. Single page (the registry
+        is small) with no ``nextCursor``; this server never mints a cursor,
+        so any presented cursor is invalid (-32602 via TypeError).
+        """
+        if params.get("cursor") is not None:
+            raise TypeError(
+                "unknown cursor: this server returns the complete tool list in a single page"
+            )
+        return {
+            "resultType": "complete",
+            "tools": tools_for_principal(current_principal()),
+            "ttlMs": protocol.TOOLS_LIST_TTL_MS,
+            "cacheScope": "private",
+        }
+
+    def _modern_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
+        # PR reviews R2/R4/R5: malformed call shape (non-string/empty name,
+        # present non-object arguments -- explicit JSON null included) is a
+        # protocol error (-32602), raised BEFORE dispatch_tool so no tool
+        # ever runs on it. The checks live in
+        # protocol.validate_tools_call_params, shared with the HTTP
+        # notification pre-check; TypeError keeps the historical -32602
+        # mapping and exact message. The legacy path keeps its historical
+        # truthiness-only checks untouched.
+        fault = protocol.validate_tools_call_params(params)
+        if fault is not None:
+            raise TypeError(fault.message)
+        name = params["name"]
+        arguments = params.get("arguments") or {}
+        try:
+            result = dispatch_tool(name, arguments)
+        except UnknownToolError:
+            raise
+        except Exception as exc:
+            logger.warning("Tool '%s' raised: %s", name, exc)
+            result = {"error": str(exc)}
+        # isError covers BOTH error channels the handlers use: raising, and
+        # returning a top-level {"error": ...} dict without raising (e.g.
+        # graph-handler validation failures) -- issue #136 design §4.2.7.
+        is_error = isinstance(result, dict) and "error" in result
+        content_text = json.dumps(result, ensure_ascii=True, default=str)
+        return {
+            "resultType": "complete",
+            "content": [{"type": "text", "text": content_text}],
+            "isError": is_error,
+        }
+
+    # ------------------------------------------------------------------
     # Method handlers
     # ------------------------------------------------------------------
 
@@ -161,11 +353,23 @@ class MCPServer:
 
         Returns server capabilities and protocol version.
         """
+        requested = params.get("protocolVersion")
+        if requested in self._enabled_legacy:
+            # A supported legacy version is honoured verbatim -- the
+            # 2024-11-05 (stdio) and 2025-03-26 (Streamable HTTP) handshakes
+            # keep working unchanged.
+            negotiated = requested
+        elif requested is None and "2024-11-05" in self._enabled_legacy:
+            # Pre-#136 fallback kept for version-less clients.
+            negotiated = "2024-11-05"
+        else:
+            # Unknown (or modern-only) version: never echo blindly (#136
+            # principle 1). Offer the newest legacy version this server
+            # actually serves; per the legacy negotiation rule the client
+            # decides whether to proceed or disconnect.
+            negotiated = self._enabled_legacy[0]
         return {
-            # Echo the client's requested protocol version when present so both
-            # the 2024-11-05 (stdio) and 2025-03-26 (Streamable HTTP) handshakes
-            # are honoured; fall back to the baseline version otherwise.
-            "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+            "protocolVersion": negotiated,
             "capabilities": {
                 "tools": {"listChanged": False},
             },
@@ -173,11 +377,7 @@ class MCPServer:
                 "name": self._name,
                 "version": self._version,
             },
-            "instructions": (
-                "OpenCrab exposes the MetaOntology OS grammar. "
-                "Use ontology_manifest to explore the full grammar, "
-                "then add nodes/edges and query the ontology."
-            ),
+            "instructions": INSTRUCTIONS,
         }
 
     def _handle_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -244,12 +444,15 @@ class MCPServer:
 
     @staticmethod
     def _error_response(
-        req_id: Any, code: int, message: str
+        req_id: Any, code: int, message: str, data: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "error": {"code": code, "message": message},
+            "error": error,
         }
 
 
