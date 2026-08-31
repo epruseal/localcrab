@@ -40,7 +40,7 @@ STORAGE_MODE=local LOCAL_DATA_DIR=<DATA> LOCALCRAB_ENV_FILE=<DATA>/localcrab.env
 
 | | 설치 방식 | stdio | streamable-http | MCP protocol | auth | PLUGIN_ROOT/PLUGIN_DATA |
 |---|---|---|---|---|---|---|
-| **OpenClaw** | 로컬 디렉터리 install, Agent Plugins 번들 네이티브 감지(`Bundle format: agent (Agent Plugins)`) | 지원(공식 문서 근거) | 공식 문서상 프로토콜 자체는 지원되나 이 패키지는 stdio entry 만 출하(아래 사유 참고) | legacy initialize echo(2024-11-05/2025-03-26). 이슈 #136 에서 2026-07-28 협상 방식 전환 예정 | stdio=local principal(#145 근거), http=per-user bearer(패키지 비포함 — 오퍼레이터 문서) | 지원(공식) — 상태 디렉터리 아래 영속 per-plugin 디렉터리를 만들고 args/env/cwd 에 단일 패스로 치환 |
+| **OpenClaw** (2026.8.1 이상) | 로컬 디렉터리 install, Agent Plugins 번들 네이티브 감지(`Bundle format: agent (Agent Plugins)`). 2026.7.x 이하는 Agent Plugins 감지 이전이라 `claude` 로 오분류되어 skills 만 매핑된다(실측) | 지원(공식 문서 근거) | 공식 문서상 프로토콜 자체는 지원되나 이 패키지는 stdio entry 만 출하(아래 사유 참고) | legacy initialize echo(2024-11-05/2025-03-26). 이슈 #136 에서 2026-07-28 협상 방식 전환 예정 | stdio=local principal(#145 근거), http=per-user bearer(패키지 비포함 — 오퍼레이터 문서) | 지원(공식) — 상태 디렉터리 아래 영속 per-plugin 디렉터리를 만들고 args/env/cwd 에 단일 패스로 치환 |
 | **Claude Code** | 1.0.0 매니페스트 네이티브 비호환 — 수동 매핑 필요(아래) | 자체 포맷(`.mcp.json`)으로 재작성해야 동작 | 자체 포맷으로 재작성해야 동작 | 해당 없음(독립 클라이언트 구현) | 해당 없음(이 이슈 범위 밖) | 미지원 — 자체 `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` |
 | **레퍼런스 클라이언트(스모크)** | 해당 없음 — CI 전용 로더(`tools/refclient.py`) | 지원(테스트 대상 경로) | 미구현(entry 를 출하하지 않으므로 대상 아님) | legacy initialize echo(스모크 기준) | 해당 없음(principal 개념 없음) | 지원(테스트가 tmp 경로로 직접 치환) |
 
