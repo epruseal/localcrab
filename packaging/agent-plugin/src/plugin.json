@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "localcrab",
+  "version": "0.1.0",
+  "description": "Local-first MetaOntology knowledge service: hybrid graph/vector/BM25 search over MCP.",
+  "author": { "name": "OpenCrab Contributors" },
+  "repository": "https://github.com/epruseal/localcrab",
+  "license": "MIT",
+  "keywords": ["mcp", "ontology", "knowledge-graph", "hybrid-search"]
+}

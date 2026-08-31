@@ -1,0 +1,91 @@
+name: Agent Plugin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - "tests/test_agent_plugin*"
+      - "scripts/build_agent_plugin.py"
+      - ".github/workflows/agent-plugin.yml"
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "tests/test_agent_plugin*"
+      - "scripts/build_agent_plugin.py"
+      - ".github/workflows/agent-plugin.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" jsonschema
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Test (packaging + smoke)
+        run: pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_smoke.py -q -o addopts=''
+
+      - name: Build package
+        run: python scripts/build_agent_plugin.py --out dist
+
+  wheel-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel
+
+      - name: Assert wheel contains no packaging code
+        run: |
+          python -c "
+          import glob, zipfile
+          whl = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(whl).namelist()
+          leaked = [n for n in names if n.startswith('packaging/') or 'agent_plugin' in n]
+          assert not leaked, (whl, leaked)
+          print('OK: no packaging code in', whl)
+          "
+
+      - name: Install wheel into a fresh venv
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+
+      - name: Assert import resolves outside the repo checkout
+        run: |
+          cd /tmp
+          /tmp/fresh/bin/python -c "
+          import os
+          import opencrab
+          p = opencrab.__file__
+          assert 'site-packages' in p, p
+          ws = os.environ.get('GITHUB_WORKSPACE', '')
+          assert not ws or ws not in p, p
+          print('OK:', p)
+          "
+
+      - name: Install repo dev environment for pytest
+        run: pip install -e ".[dev]" jsonschema
+
+      - name: Smoke test against the wheel-installed opencrab
+        run: OPENCRAB_SMOKE_BIN_DIR=/tmp/fresh/bin pytest tests/test_agent_plugin_smoke.py -q -o addopts=''

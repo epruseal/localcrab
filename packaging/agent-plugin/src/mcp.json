@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "localcrab": {
+      "type": "stdio",
+      "command": "opencrab",
+      "args": ["serve"],
+      "cwd": "${PLUGIN_DATA}",
+      "env": {
+        "STORAGE_MODE": "local",
+        "LOCAL_DATA_DIR": "${PLUGIN_DATA}",
+        "LOCALCRAB_ENV_FILE": "${PLUGIN_DATA}/localcrab.env"
+      }
+    }
+  }
+}
