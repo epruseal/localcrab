@@ -94,7 +94,10 @@ def _modern_body(method: str, params: dict | None = None, id: int | None = 1) ->
     ``id=None`` produces a notification (no ``id`` field at all).
     """
     merged = dict(params or {})
-    merged["_meta"] = MODERN_META
+    # A COPY, not the module constant itself: tests that mutate the body's
+    # _meta (e.g. `del body["params"]["_meta"][...]`) must not poison
+    # MODERN_META for every later test in the run.
+    merged["_meta"] = dict(MODERN_META)
     body: dict = {"jsonrpc": "2.0", "method": method, "params": merged}
     if id is not None:
         body["id"] = id
