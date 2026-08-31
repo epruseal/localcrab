@@ -298,6 +298,16 @@ class Settings(BaseSettings):
     # used to describe was deleted.
     mcp_http_host: str = Field(default="127.0.0.1", alias="MCP_HTTP_HOST")
     mcp_http_port: int = Field(default=8765, alias="MCP_HTTP_PORT")
+    # #136: dual-era protocol gates. MCP_PROTOCOL_VERSIONS restricts the
+    # built-in supported set (comma-separated; subset only -- an unknown
+    # version refuses startup; unset/blank = every built-in version). Turning
+    # every legacy version off is the migration lever for the eventual
+    # legacy-handshake removal. MCP_ALLOWED_ORIGINS allowlists non-loopback
+    # browser Origins for the /mcp Origin guard (bare http(s)://host[:port]
+    # entries; a malformed entry refuses startup). Parsing/validation lives in
+    # opencrab/mcp/protocol.py.
+    mcp_protocol_versions: str | None = Field(default=None, alias="MCP_PROTOCOL_VERSIONS")
+    mcp_allowed_origins: str | None = Field(default=None, alias="MCP_ALLOWED_ORIGINS")
 
     # ------------------------------------------------------------------
     # Logging

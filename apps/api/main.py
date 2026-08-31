@@ -1006,12 +1006,20 @@ def set_pack_visibility(
 # auth_token=None open mount) — the same verification opencrab.mcp.http_app
 # uses standalone, reused here rather than reimplemented.
 
-from opencrab.mcp.http_app import install_mcp_no_store, mcp_router  # noqa: E402
+from opencrab.mcp.http_app import (  # noqa: E402
+    install_mcp_no_store,
+    install_mcp_origin_guard,
+    mcp_router,
+)
 
 app.include_router(mcp_router())
 # Same guarantee as create_app(): /mcp responses this app produces --
 # including framework-generated 405s and validation errors -- must be
-# uncacheable. Two mount points means two installs.
+# uncacheable, and Origin-guarded (#136). Two mount points means two
+# installs each, guard first / no_store second: Starlette places the
+# later-registered middleware outermost, and the no-store invariant must
+# wrap the guard's 403 responses too.
+install_mcp_origin_guard(app)
 install_mcp_no_store(app)
 
 

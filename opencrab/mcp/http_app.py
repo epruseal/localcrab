@@ -55,6 +55,7 @@ from opencrab.auth import (
     refuse_stale_shared_secret_env,
     verify_token,
 )
+from opencrab.mcp import protocol
 from opencrab.mcp.server import MCPServer
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "create_app",
     "install_mcp_no_store",
+    "install_mcp_origin_guard",
     "mcp_router",
     "refuse_stale_shared_secret_env",
 ]
@@ -76,6 +78,81 @@ __all__ = [
 # responses are just as cacheable by an intermediary, and their URLs carry the
 # same secret.
 _NO_STORE = {"Cache-Control": "no-store"}
+
+# #136: HTTP status for JSON-RPC error codes on MODERN single requests only
+# (legacy responses keep the pre-#136 blanket 200). Spec MUSTs: unknown RPC
+# method -> 404; version/header/meta faults -> 400. -32603 stays 200 -- the
+# spec leaves it unspecified, so the deviation from today is kept minimal.
+_MODERN_ERROR_STATUS = {
+    -32700: 400,
+    -32600: 400,
+    -32602: 400,
+    protocol.HEADER_MISMATCH: 400,
+    protocol.MISSING_REQUIRED_CLIENT_CAPABILITY: 400,
+    protocol.UNSUPPORTED_PROTOCOL_VERSION: 400,
+    -32601: 404,
+}
+
+
+def _modern_header_fault(request: Request, body: dict[str, Any]) -> str | None:
+    """Standard-header validation for one modern single request (#136).
+
+    Runs BEFORE the body's own _meta validation (design §4.3.1): a
+    metadata-less ``server/discover`` over HTTP therefore reports the
+    missing MCP-Protocol-Version header (-32020), while the same body over
+    stdio (no header layer) reports -32602 from handle_request.
+    """
+    headers = request.headers
+    params = body.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    header_version = headers.get("mcp-protocol-version")
+    if header_version is None:
+        return "missing required MCP-Protocol-Version header"
+    if header_version != meta.get(protocol.META_PROTOCOL_VERSION):
+        return (
+            "MCP-Protocol-Version header does not match the request body's "
+            f"'{protocol.META_PROTOCOL_VERSION}'"
+        )
+    mcp_method = headers.get("mcp-method")
+    if mcp_method is None:
+        return "missing required Mcp-Method header"
+    if mcp_method != body.get("method"):
+        return "Mcp-Method header does not match the request body's method"
+    if body.get("method") == "tools/call":
+        mcp_name = headers.get("mcp-name")
+        if mcp_name is None:
+            return "missing required Mcp-Name header for tools/call"
+        if protocol.decode_mcp_name(mcp_name) != params.get("name"):
+            return "Mcp-Name header does not match the request body's params.name"
+    return None
+
+
+def _batch_is_modern(request: Request, body: list[Any]) -> bool:
+    """#136: JSON-RPC batch arrays are a legacy-only LocalCrab extension
+    (2026-07-28 Streamable HTTP allows exactly one request or notification
+    per POST body). Per-item processing would bypass header validation and
+    the modern status mapping, so a modern version header on the request, a
+    modern-flagged element (modern _meta or server/discover), or an element
+    whose ``_meta`` is present but not a dict all reject the whole array.
+    Measured legacy consumers (the reingest hook's lc_call, the loader plan)
+    send no ``_meta`` at all, so none of this touches them."""
+    if request.headers.get("mcp-protocol-version") in protocol.MODERN_VERSIONS:
+        return True
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        if item.get("method") == "server/discover":
+            return True
+        params = item.get("params")
+        if isinstance(params, dict) and "_meta" in params:
+            meta = params["_meta"]
+            if not isinstance(meta, dict) or protocol.META_PROTOCOL_VERSION in meta:
+                return True
+    return False
 
 
 def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
@@ -204,16 +281,57 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                     status_code=400,
                     headers=_NO_STORE,
                 )
-            # JSON-RPC batch: collect non-notification responses
+            # JSON-RPC batch: legacy-only LocalCrab extension (#136) --
+            # anything modern-flagged in or on the array is rejected outright.
             if isinstance(body, list):
+                if _batch_is_modern(request, body):
+                    return JSONResponse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {
+                                "code": -32600,
+                                "message": (
+                                    "JSON-RPC batch is a legacy-only extension; modern "
+                                    "(2026-07-28) requests must be sent individually"
+                                ),
+                            },
+                        },
+                        status_code=400,
+                        headers=_NO_STORE,
+                    )
                 out = [r for r in (server.handle_request(item) for item in body) if r is not None]
                 if not out:
                     return Response(status_code=202, headers=_NO_STORE)
                 return JSONResponse(out, headers=_NO_STORE)
+
+            # #136: a single request runs under modern transport rules when
+            # its body is modern-era OR it carries a modern version header --
+            # a modern header on a legacy body must not slip through as
+            # unvalidated legacy traffic (design §4.3.1).
+            modern_http = isinstance(body, dict) and (
+                protocol.is_modern_request(body.get("method"), body.get("params") or {})
+                or request.headers.get("mcp-protocol-version") in protocol.MODERN_VERSIONS
+            )
+            if modern_http:
+                fault = _modern_header_fault(request, body)
+                if fault is not None:
+                    return JSONResponse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": body.get("id"),
+                            "error": {"code": protocol.HEADER_MISMATCH, "message": fault},
+                        },
+                        status_code=400,
+                        headers=_NO_STORE,
+                    )
             resp = server.handle_request(body)
             # Notifications (no id) get no body → 202 Accepted
             if resp is None:
                 return Response(status_code=202, headers=_NO_STORE)
+            if modern_http and "error" in resp:
+                status = _MODERN_ERROR_STATUS.get(resp["error"]["code"], 200)
+                return JSONResponse(resp, status_code=status, headers=_NO_STORE)
             return JSONResponse(resp, headers=_NO_STORE)
 
     @router.get("/mcp")
@@ -224,7 +342,9 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     ):
         _check(request, creds)  # auth is checked before the stateless-405 response
         # Stateless server offers no server→client SSE stream; per spec, 405.
-        return Response(status_code=405, headers={"Allow": "POST, DELETE", **_NO_STORE})
+        # #136: 2026-07-28 removed the GET stream endpoint outright, and
+        # DELETE is no longer allowed either -- Allow shrinks to POST.
+        return Response(status_code=405, headers={"Allow": "POST", **_NO_STORE})
 
     @router.delete("/mcp")
     @router.delete("/mcp/", include_in_schema=False)
@@ -233,8 +353,11 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
         _check(request, creds)
-        # Stateless: no session to terminate. Acknowledge.
-        return Response(status_code=200, headers=_NO_STORE)
+        # #136: 2026-07-28 prescribes 405 for DELETE on the MCP endpoint, and
+        # the legacy Streamable HTTP revisions equally allow 405 from a server
+        # that never minted a session (this one never did). Auth-first is kept
+        # for parity with GET (401 before 405).
+        return Response(status_code=405, headers={"Allow": "POST", **_NO_STORE})
 
     return router
 
@@ -288,6 +411,43 @@ def install_mcp_no_store(app: FastAPI) -> None:
         )
 
     app.add_exception_handler(Exception, _no_store_on_error)
+
+
+def install_mcp_origin_guard(app: FastAPI) -> None:
+    """#136: Origin validation on every ``/mcp`` request (2026-07-28
+    Streamable HTTP "Security & Endpoint" MUST -- DNS-rebinding defence).
+
+    App-level middleware, NOT a route check: framework-generated responses
+    (e.g. the 405 for an unrouted PUT) must also sit behind it, so an
+    invalid Origin gets 403 before routing happens at all. An absent Origin
+    passes -- every measured non-browser consumer (lc_call/curl, Claude
+    Code, server-to-server connector traffic) sends none. A present Origin
+    must be loopback or exactly allowlisted via MCP_ALLOWED_ORIGINS.
+
+    Install this BEFORE install_mcp_no_store on BOTH mounting apps:
+    Starlette places the later-registered middleware outermost, and the
+    no-store invariant must wrap this guard's 403 as well. The 403 also
+    carries _NO_STORE directly, so a future ordering mistake degrades to
+    redundancy rather than cache exposure.
+    """
+    from opencrab.config import get_settings
+
+    try:
+        allowed = protocol.parse_allowed_origins(
+            getattr(get_settings(), "mcp_allowed_origins", None)
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    @app.middleware("http")
+    async def _origin_guard(request: Request, call_next):
+        if _is_mcp(request):
+            origin = request.headers.get("origin")
+            if origin is not None and not protocol.origin_allowed(origin, allowed):
+                return JSONResponse(
+                    {"detail": "Origin not allowed"}, status_code=403, headers=dict(_NO_STORE)
+                )
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -347,6 +507,9 @@ def create_app(*, allow_query_token: bool = False) -> FastAPI:
 
     app = FastAPI(docs_url=None, redoc_url=None, lifespan=_startup_registry_check)
     app.include_router(mcp_router(allow_query_token=allow_query_token))
+    # #136: guard first, no_store second -- the later registration is the
+    # outer middleware, and no-store must wrap the guard's 403 responses.
+    install_mcp_origin_guard(app)
     install_mcp_no_store(app)
 
     @app.get("/healthz")
