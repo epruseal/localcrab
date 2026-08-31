@@ -212,6 +212,31 @@ class TestToolSearchErrors:
         assert set(payload) == {"error"}, payload
 
 
+    def test_invalid_argument_on_modern_call_sets_is_error(self):
+        """수정 설계 2 B-1: modern 경로 실측 -- tool_search 의 입력 검증 실패가
+        modern 봉투에서 isError=true 와 {"error": ...} payload 로 표면화된다."""
+        server = _make_server()
+        with principal_scope(_LOCAL):
+            resp = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "name": "tool_search",
+                        "arguments": {"limit": 0},
+                    },
+                }
+            )
+        assert resp["result"]["isError"] is True
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        assert set(payload) == {"error"}
+
+
 class TestToolSearchNullEquivalence:
     """#135 design [R2-1]: explicit JSON null == omitted, for every optional
     parameter (sibling-handler convention: `x: T | None = None`)."""

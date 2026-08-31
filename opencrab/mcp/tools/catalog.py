@@ -149,4 +149,3 @@ def tool_search(
         "tools": tools_out,
         "note": _NOTE,
     }
-
