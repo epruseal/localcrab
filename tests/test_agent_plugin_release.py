@@ -15,6 +15,7 @@ TDD RED 단계: `packaging/agent-plugin/tools/build.py` 에 `_safe_version`,
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -337,6 +338,10 @@ class TestBuildRelease:
 # ---------------------------------------------------------------------------
 
 
+class _InjectedReplaceError(OSError):
+    """os.replace 주입 실패임을 무관 예외와 구분하기 위한 전용 예외 클래스 (F2 강화)."""
+
+
 class TestBuildReleaseAtomicity:
     """build_release() 게시 원자성: 조립 실패는 기존 게시물을 건드리지 않고, 부분 게시는
     verify_release 에서 fail-closed 로 드러난다."""
@@ -366,6 +371,14 @@ class TestBuildReleaseAtomicity:
 
     @pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5])
     def test_partial_publish_fails_closed(self, tmp_path, monkeypatch, fail_at):
+        """게시 경로의 5개 os.replace 지점 각각에서 주입 실패가 실제로 도달하고,
+        build_release 가 그 원인을 보존한 BuildError 로 래핑하며, 결과 부분 게시 상태가
+        verify_release 에서 fail-closed 로 드러남을 확인한다 (F2 강화).
+
+        `pytest.raises(Exception)` 만으로는 주입과 무관한 예외로도 우연히 통과할 수 있고
+        주입 지점에 실제 도달했는지도 확인하지 않는다 -- 고유 예외 타입 + 도달 카운터 +
+        원인 체인(`__cause__`) 3중 assert 로 이를 막는다.
+        """
         repo = _fake_repo(tmp_path, version="1.0.0")
         out_dir = tmp_path / "dist"
 
@@ -375,15 +388,24 @@ class TestBuildReleaseAtomicity:
         def fake_replace(src, dst, *args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == fail_at:
-                raise OSError(f"injected failure at call {fail_at}")
+                raise _InjectedReplaceError(f"injected failure at call {fail_at}")
             return real_replace(src, dst, *args, **kwargs)
 
         monkeypatch.setattr(b.os, "replace", fake_replace)
 
-        with pytest.raises(Exception):
+        # build_release 의 게시 단계는 os.replace 실패(OSError 계열)를 BuildError 로
+        # 래핑한다(`raise BuildError(...) from exc`) -- 조립 단계에서 발생하는 BuildError
+        # 는 그대로 재던져지지만, 게시 단계는 항상 이 경로를 지난다.
+        with pytest.raises(b.BuildError) as exc_info:
             b.build_release(repo, out_dir)
 
         monkeypatch.undo()
+
+        # 주입 지점(k번째 os.replace 호출)에 실제로 도달했음을 확인한다 -- 예외가 그
+        # 호출에서 발생해 이후 호출은 일어나지 않으므로 카운터는 정확히 fail_at 이어야 한다.
+        assert call_count["n"] == fail_at
+        # 무관한 예외로 우연히 통과하지 않도록 원인 체인의 타입까지 확인한다.
+        assert isinstance(exc_info.value.__cause__, _InjectedReplaceError)
 
         # 부분 게시 상태는 RELEASE 마커 부재/불일치로 반드시 시끄럽게 실패해야 한다.
         with pytest.raises(b.BuildError):
@@ -588,16 +610,66 @@ class TestVerifyRelease:
     def test_full_recompute_set_passes_characterization(self, release):
         """성격규정(characterization) -- 진본성 비보장 경계를 명문화한다.
 
-        아카이브·패키지 사이드카·RELEASE.SHA256SUMS 를 전량 함께 재계산해 세트 내부
-        일관성을 유지한 채로 COMPATIBILITY.md 내용을 임의로 바꿔도 verify_release 는
-        통과한다. 이는 결함이 아니라 verify_release 의 설계된 한계다: 무결성·일관성만
-        검출하고 진본성은 검출하지 않는다. 진본성 대사는 공표 기준값(운영 정책 문서)의
-        몫이다.
+        설계 문구("전량(아카이브+사이드카+RELEASE) 재계산 세트는 통과")를 문자 그대로
+        실증한다: COMPATIBILITY.md 만 바꾸는 게 아니라 **아카이브 멤버 내용
+        (localcrab-plugin/README.md) 을 변조**하고, 그 변조된 아카이브를 빌더
+        (`_deterministic_tar`)와 동일한 결정론 파라미터로 재작성한 뒤(USTAR 포맷,
+        UTF-8 + errors="strict", 정렬된 멤버 순서, REGTYPE, uid=gid=0, uname=gname="",
+        mtime=0, mode=0o644, gzip mtime=0/filename=""/compresslevel=9), 패키지 사이드카의
+        해당 항목 해시와 RELEASE.SHA256SUMS 3항목을 전부 재계산한다. 즉 세 파일 전량을
+        공격자가 다시 계산해 세트 내부를 일관되게 맞춘 뒤에도 verify_release 가 통과함을
+        확인한다. 이는 결함이 아니라 verify_release 의 설계된 한계다: 무결성·일관성만
+        검출하고 진본성은 검출하지 않는다(공격자가 아카이브·사이드카·RELEASE 세 파일을
+        모두 통제하는 경우). 진본성 대사는 공표 기준값(운영 정책 문서)의 몫이다.
         """
-        report = release / "localcrab-plugin-1.0.0.COMPATIBILITY.md"
-        report.write_text("공격자가 전량 재계산해 바꿔치기한 본문\n", encoding="utf-8")
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        sidecar = release / "localcrab-plugin.SHA256SUMS"
+        target_member = f"{b._ARCHIVE_PREFIX}README.md"
+
+        # 1. 기존 tar 를 읽어(닫은 뒤) 멤버 전체 내용을 손에 쥔다. README.md 내용만 변조.
+        with tarfile.open(archive, mode="r:gz") as tar:
+            members = tar.getmembers()
+            contents = {m.name: tar.extractfile(m).read() for m in members if m.isfile()}
+        assert target_member in contents
+        contents[target_member] = "공격자가 전량 재계산해 바꿔치기한 README\n".encode()
+
+        # 2. 빌더(_deterministic_tar)와 동일한 결정론 파라미터로 아카이브를 재작성한다.
+        #    (기존 tar 를 완전히 닫은 뒤 출력을 새로 연다 -- 동시에 열지 않는다.)
+        with open(archive, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="", compresslevel=9) as gz:
+                with tarfile.open(
+                    fileobj=gz,
+                    mode="w",
+                    format=tarfile.USTAR_FORMAT,
+                    encoding="utf-8",
+                    errors="strict",
+                ) as tar:
+                    for name in sorted(contents):
+                        data = contents[name]
+                        info = tarfile.TarInfo(name=name)
+                        info.size = len(data)
+                        info.mtime = 0
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mode = 0o644
+                        info.type = tarfile.REGTYPE
+                        tar.addfile(info, io.BytesIO(data))
+
+        # 3. 패키지 사이드카의 README.md 항목 해시를 재계산한다(다른 항목은 불변이므로 유지).
+        sidecar_entries, sidecar_violations = b._parse_hash_list(
+            sidecar.read_text(encoding="utf-8"), reject_separators=False
+        )
+        assert not sidecar_violations
+        sidecar_entries["README.md"] = hashlib.sha256(contents[target_member]).hexdigest()
+        _rewrite_release_file(sidecar, sidecar_entries)
+
+        # 4. RELEASE.SHA256SUMS 3항목(아카이브·리포트·사이드카)을 전부 재계산한다 -- 사이드카
+        #    내용이 바뀌었으므로 사이드카 해시도, 그 사이드카를 포함하는 RELEASE 도 바뀐다.
         _recompute_release(release, "1.0.0")
-        b.verify_release(release)  # 통과 -- 진본성 비보장의 실증.
+
+        b.verify_release(release)  # 통과 -- 진본성 비보장의 실증(전량 재계산 세트).
 
 
 # ---------------------------------------------------------------------------

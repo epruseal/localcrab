@@ -384,6 +384,11 @@ def _parse_hash_list(text: str, *, reject_separators: bool) -> tuple[dict[str, s
     중복·절대경로·`..` 항목과 포맷 위반 행을 위반 목록에 모아 돌려준다. reject_separators
     가 참이면 경로 구분자(`/`, `\\`) 를 포함한 이름도 거부한다(RELEASE.SHA256SUMS 는 형제
     파일명만 담아야 하고, 패키지 사이드카는 스테이징 트리의 상대경로를 정당하게 담는다).
+
+    위반이 있는 행은 `entries` 에 등록하지 않는다(방어 심도) -- 위반 목록만으로 이미 실패가
+    확정되므로, 등록해서 얻는 이득 없이 절대경로·`..` 항목을 뒤이어 그대로 해싱 대상으로
+    넘기는 부작용(out_dir 밖 경로를 read-only 로 여는 것)만 남기지 않기 위함이다. 중복 항목은
+    최초 유효 항목만 유지한다(이후 동명 행은 위반으로 기록되고 값은 덮어쓰지 않는다).
     """
     entries: dict[str, str] = {}
     violations: list[str] = []
@@ -395,13 +400,18 @@ def _parse_hash_list(text: str, *, reject_separators: bool) -> tuple[dict[str, s
             violations.append(f"라인 포맷 위반: {line!r}")
             continue
         digest, name = match.group(1), match.group(2)
+        line_ok = True
         if name in entries:
             violations.append(f"중복 항목: {name}")
+            line_ok = False
         if os.path.isabs(name) or ".." in Path(name).parts:
             violations.append(f"경로 이탈 항목: {name}")
+            line_ok = False
         if reject_separators and ("/" in name or "\\" in name):
             violations.append(f"경로 구분자 포함 항목: {name}")
-        entries[name] = digest
+            line_ok = False
+        if line_ok:
+            entries[name] = digest
     return entries, violations
 
 
