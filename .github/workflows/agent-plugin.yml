@@ -8,12 +8,14 @@ on:
       - "tests/test_agent_plugin*"
       - "scripts/build_agent_plugin.py"
       - ".github/workflows/agent-plugin.yml"
+      - "pyproject.toml"
   pull_request:
     paths:
       - "packaging/**"
       - "tests/test_agent_plugin*"
       - "scripts/build_agent_plugin.py"
       - ".github/workflows/agent-plugin.yml"
+      - "pyproject.toml"
 
 jobs:
   validate:
@@ -28,7 +30,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]" jsonschema
+        run: pip install -e ".[dev]"
 
       - name: Lint (ruff)
         run: ruff check .
@@ -85,7 +87,7 @@ jobs:
           "
 
       - name: Install repo dev environment for pytest
-        run: pip install -e ".[dev]" jsonschema
+        run: pip install -e ".[dev]"
 
       - name: Smoke test against the wheel-installed opencrab
         run: OPENCRAB_SMOKE_BIN_DIR=/tmp/fresh/bin pytest tests/test_agent_plugin_smoke.py -q -o addopts=''

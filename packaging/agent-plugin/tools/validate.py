@@ -328,6 +328,35 @@ def scan_secrets(text: str, source: str) -> list[str]:
     return errors
 
 
+def env_text_errors(role: str, key, text) -> list[str]:
+    """env 항목의 한쪽(role: "key" | "value") 텍스트를 검사한다 (#248).
+
+    계약: env 키와 값은 UTF-8 로 인코딩 가능한 유니코드 스칼라 문자열(str)이어야
+    한다. bytes 를 포함한 비문자열은 "must be a string" 오류다. POSIX
+    surrogateescape 로 우연히 바이트 왕복이 되는 저역 서로게이트(U+DC80..U+DCFF)도
+    일괄 거부한다: 참조 클라이언트의 목적은 플랫폼 우연 통과가 아니라 결정론적
+    §9.1 계약 시연이고(Windows 에서는 왕복이 성립하지 않는다), 정본 유입원인
+    mcp.json 은 JSON 텍스트라 정당한 비스칼라 값이 없다. 비 UTF-8 호스트
+    경로(surrogateescape 문자열)를 그대로 쓰는 호출자는 이 참조 클라이언트의
+    지원 범위 밖이다. 키 문법('=' 포함 등)은 검사하지 않는다: subprocess 가
+    명시적 ValueError 로 거부하므로 예외 누출 클래스가 아니다.
+    """
+    if not isinstance(text, str):
+        return [f"env {role} for {key!r} must be a string"]
+    errors = []
+    if "\x00" in text:
+        errors.append(f"env {role} for {key!r} must not contain NUL bytes")
+    if any("\ud800" <= ch <= "\udfff" for ch in text):
+        errors.append(f"env {role} for {key!r} must not contain lone surrogates")
+    return errors
+
+
+def env_entry_errors(key, value) -> list[str]:
+    """env 한 항목의 키·값 양쪽을 검사한다 (#248, refclient 원천 검사용)."""
+    return env_text_errors("key", key, key) + env_text_errors("value", key, value)
+
+
+
 # ---------------------------------------------------------------------------
 # canonical JSON Schema 검증 (jsonschema lazy import)
 # ---------------------------------------------------------------------------
@@ -493,9 +522,12 @@ def _validate_server_entry(entry, plugin_root, plugin_data) -> list[str]:
                 for k, v in env.items():
                     if k in _RESERVED_ENV_KEYS:
                         errors.append(f"env must not contain reserved key {k!r}")
+                    # #248: 키는 값 타입과 무관하게 항상 검사한다 (오염 키 가림 금지).
+                    errors.extend(env_text_errors("key", k, k))
                     if not isinstance(v, str):
                         errors.append(f"env.{k} must be a string")
                     else:
+                        errors.extend(env_text_errors("value", k, v))
                         errors.extend(scan_secrets(v, source=f"env.{k}"))
 
         cwd = entry.get("cwd")

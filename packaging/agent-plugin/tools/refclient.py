@@ -15,7 +15,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .validate import MODE_LOADER, expand_placeholders, validate_package
+from .validate import (
+    MODE_LOADER,
+    env_entry_errors,
+    env_text_errors,
+    expand_placeholders,
+    validate_package,
+)
 
 
 class PluginRejectedError(Exception):
@@ -76,7 +82,23 @@ def resolve_command(command: str, path_env: str) -> str | None:
 
 def build_subprocess_env(server_env: dict, plugin_root: str, plugin_data: str, base_env: dict) -> dict:
     """§9.1: base 복사 -> server_env 각 값 expand_placeholders 후 오버레이 ->
-    마지막에 PLUGIN_ROOT/PLUGIN_DATA 강제 설정(순서 고정 -- 덮어쓰기 불가)."""
+    마지막에 PLUGIN_ROOT/PLUGIN_DATA 강제 설정(순서 고정 -- 덮어쓰기 불가).
+
+    #248: 합성 전에 세 원천(강제 변수 값, base_env, server_env 원본)을 전부
+    검사해 비문자열·NUL·고립 서로게이트를 위반 전체 목록의 ValueError 로
+    거부한다 (subprocess/execve 예외 누출 전 명시 거부 -- 계약과 근거는
+    validate.env_text_errors docstring 참조). 합성 결과는 재검사하지 않는다:
+    placeholder 확장은 검증된 스칼라 문자열 안의 ${PLUGIN_ROOT}/${PLUGIN_DATA}
+    를 검증된 스칼라 문자열로 치환한 연접이라 새 위반 문자를 만들 수 없다.
+    """
+    errors = env_text_errors("value", "PLUGIN_ROOT", plugin_root)
+    errors += env_text_errors("value", "PLUGIN_DATA", plugin_data)
+    for key, value in (base_env or {}).items():
+        errors += env_entry_errors(key, value)
+    for key, value in (server_env or {}).items():
+        errors += env_entry_errors(key, value)
+    if errors:
+        raise ValueError("invalid subprocess env: " + "; ".join(errors))
     env = dict(base_env)
     for key, value in (server_env or {}).items():
         env[key] = expand_placeholders(value, plugin_root, plugin_data)
@@ -96,6 +118,11 @@ class JsonRpcStdioClient:
     """
 
     def __init__(self, cmd: list[str], env: dict, cwd: str) -> None:
+        # #248: 합성 함수(build_subprocess_env)를 우회한 직접 생성 경로에서도
+        # Popen(OS 경계) 도달 전에 env 오염을 명시 거부한다.
+        env_errors = [e for k, val in (env or {}).items() for e in env_entry_errors(k, val)]
+        if env_errors:
+            raise ValueError("invalid subprocess env: " + "; ".join(env_errors))
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
