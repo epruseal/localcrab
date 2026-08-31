@@ -313,8 +313,12 @@ class MCPServer:
 
     def _modern_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
-        if not name:
-            raise TypeError("'name' is required in tools/call params.")
+        # PR review R4: a truthy non-string name (e.g. ["tool"]) is malformed
+        # request metadata, not a tool-execution failure -- reject with
+        # -32602 BEFORE dispatch, same rationale as the arguments check
+        # below. The legacy path keeps its historical truthiness-only check.
+        if not isinstance(name, str) or not name:
+            raise TypeError("'name' must be a non-empty string in tools/call params.")
         # PR review R2: a PRESENT non-object `arguments` -- explicit JSON null
         # included, hence the key-presence check (same rationale as
         # _meta:null) -- is a malformed CallToolRequest: protocol error
