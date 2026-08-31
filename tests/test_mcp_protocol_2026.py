@@ -319,6 +319,52 @@ class TestHandleRequestEdge:
         response = server.handle_request({"jsonrpc": "2.0", "id": 18, "method": "server/discover", "params": "abc"})
         assert response["error"]["code"] == INVALID_PARAMS
 
+    @pytest.mark.parametrize("bad_args", [None, [], "", 0, False, "x"])
+    def test_modern_tools_call_non_object_arguments_invalid_params(self, server, bad_args):
+        """PR review R2: a PRESENT non-object `arguments` (explicit null
+        included -- key-presence check, same rationale as _meta:null) is
+        -32602, and the tool is never dispatched."""
+        with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 30,
+                    "method": "tools/call",
+                    "params": {"name": "t1", "arguments": bad_args, "_meta": MODERN_META},
+                }
+            )
+        assert response["error"]["code"] == INVALID_PARAMS
+        mock_dispatch.assert_not_called()
+
+    def test_modern_tools_call_absent_arguments_dispatches_empty_dict(self, server):
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": 1}) as mock_dispatch:
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 31,
+                    "method": "tools/call",
+                    "params": {"name": "t1", "_meta": MODERN_META},
+                }
+            )
+        mock_dispatch.assert_called_once_with("t1", {})
+        assert response["result"]["isError"] is False
+
+    @pytest.mark.parametrize("legacy_args", [None, []])
+    def test_legacy_tools_call_falsey_arguments_unchanged(self, server, legacy_args):
+        """Regression pin: the LEGACY path keeps its historical `or {}`
+        coercion for falsey arguments -- the R2 strictness is modern-only."""
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": 1}) as mock_dispatch:
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 32,
+                    "method": "tools/call",
+                    "params": {"name": "t1", "arguments": legacy_args},
+                }
+            )
+        mock_dispatch.assert_called_once_with("t1", {})
+        assert "error" not in response
+
     def test_null_meta_is_invalid_params(self, server):
         """JSON `"_meta": null` is PRESENT-but-non-dict -- a malformed modern
         marker (-32602), never an absent _meta (which would mean legacy).

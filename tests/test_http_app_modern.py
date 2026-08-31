@@ -533,6 +533,21 @@ class TestMalformedAllowedOriginsConfig:
 
 
 class TestModernEdgeCases:
+    def test_malformed_modern_notification_gets_400_empty_body(self, client, bootstrapped):
+        """PR review R1: a modern NOTIFICATION (no "id") failing header
+        validation is rejected at the transport (400) with an EMPTY body.
+        The spec leaves the JSON-RPC error body optional (MAY) for rejected
+        notifications; the empty body is a consistency choice with
+        handle_request, which never answers a notification either."""
+        _, _, secret = bootstrapped
+        resp = client.post(
+            "/mcp",
+            json=_modern_body("notifications/cancelled", id=None),
+            headers=_auth(secret),  # modern body, no MCP-* headers -> header fault
+        )
+        assert resp.status_code == 400
+        assert resp.content == b""
+
     def test_modern_notification_returns_202_empty_body(self, client, bootstrapped):
         _, _, secret = bootstrapped
         resp = client.post(
