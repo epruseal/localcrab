@@ -370,6 +370,28 @@ class TestHandleRequestEdge:
         assert "error" not in response  # legacy tool-exception envelope, not JSON-RPC error
         assert "unhashable" in response["result"]["content"][0]["text"]
 
+    def test_modern_tools_call_bad_name_error_message_exact(self, server):
+        """Equivalence pin (committed GREEN before the R5 refactor): the
+        exact -32602 message must survive the extraction of the call-shape
+        checks into protocol.validate_tools_call_params -- including that
+        the 'Invalid params: ' prefix appears exactly once."""
+        response = server.handle_request(
+            {"jsonrpc": "2.0", "id": 35, "method": "tools/call",
+             "params": {"name": "", "arguments": {}, "_meta": MODERN_META}}
+        )
+        assert response["error"]["message"] == (
+            "Invalid params: 'name' must be a non-empty string in tools/call params."
+        )
+
+    def test_modern_tools_call_bad_arguments_error_message_exact(self, server):
+        response = server.handle_request(
+            {"jsonrpc": "2.0", "id": 36, "method": "tools/call",
+             "params": {"name": "t1", "arguments": [], "_meta": MODERN_META}}
+        )
+        assert response["error"]["message"] == (
+            "Invalid params: 'arguments' must be an object when present"
+        )
+
     def test_modern_tools_call_absent_arguments_dispatches_empty_dict(self, server):
         with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": 1}) as mock_dispatch:
             response = server.handle_request(

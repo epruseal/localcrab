@@ -580,6 +580,57 @@ class TestModernEdgeCases:
         assert resp.status_code == 400
         assert resp.content == b""
 
+    def test_call_invalid_arguments_modern_notification_gets_400_empty_body(self, client, bootstrapped):
+        """PR review R5: a tools/call NOTIFICATION passing header and _meta
+        validation but carrying malformed arguments must be rejected with
+        the same empty-body 400 as other body-validation faults, without
+        dispatching the tool."""
+        _, _, secret = bootstrapped
+        body = _modern_body(
+            "tools/call", params={"name": "schema_pack_list", "arguments": []}, id=None
+        )
+        with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
+            resp = client.post(
+                "/mcp",
+                json=body,
+                headers=_modern_headers(secret, "tools/call", name="schema_pack_list"),
+            )
+        assert resp.status_code == 400
+        assert resp.content == b""
+        mock_dispatch.assert_not_called()
+
+    def test_call_invalid_empty_name_modern_notification_gets_400_empty_body(self, client, bootstrapped):
+        """An empty-string name with an empty Mcp-Name header is the one
+        malformed-name shape that passes header comparison (a non-string
+        body name can never match the string header) -- it must still be
+        rejected 400/empty at the body precheck."""
+        _, _, secret = bootstrapped
+        body = _modern_body("tools/call", params={"name": "", "arguments": {}}, id=None)
+        resp = client.post(
+            "/mcp",
+            json=body,
+            headers=_modern_headers(secret, "tools/call", name=""),
+        )
+        assert resp.status_code == 400
+        assert resp.content == b""
+
+    def test_valid_tools_call_notification_fire_and_forget_202(self, client, bootstrapped):
+        """Boundary pin: a VALID tools/call notification still executes the
+        tool (fire-and-forget) and returns 202 with no body."""
+        _, _, secret = bootstrapped
+        body = _modern_body(
+            "tools/call", params={"name": "schema_pack_list", "arguments": {}}, id=None
+        )
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": 1}) as mock_dispatch:
+            resp = client.post(
+                "/mcp",
+                json=body,
+                headers=_modern_headers(secret, "tools/call", name="schema_pack_list"),
+            )
+        assert resp.status_code == 202
+        assert resp.content == b""
+        mock_dispatch.assert_called_once_with("schema_pack_list", {})
+
     def test_unknown_method_modern_notification_stays_202(self, client, bootstrapped):
         """Boundary pin for R3: only BODY-VALIDATION faults turn into 400.
         A notification that passes validation but names an unknown method is
