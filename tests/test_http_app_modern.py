@@ -283,6 +283,20 @@ class TestModernHeaderErrors:
         assert resp.status_code == 400
         assert resp.json()["error"]["code"] == -32020
 
+    def test_null_meta_body_is_modern_and_header_checked(self, client, bootstrapped):
+        """A body with `"_meta": null` must not slide into the legacy era:
+        it is a malformed modern marker, so header-first validation reports
+        the missing MCP-Protocol-Version header (-32020/400), never a 200
+        legacy envelope (dual-verification round 1, channel B MAJOR)."""
+        _, _, secret = bootstrapped
+        resp = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": None}},
+            headers=_auth(secret),
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == -32020
+
     def test_modern_headers_with_legacy_body_400(self, client, bootstrapped):
         """[v2/M2] modern MCP-Protocol-Version header + a legacy (no-_meta)
         body must not slip through as legacy -- otherwise header validation
@@ -374,6 +388,60 @@ class TestOriginGuard:
         resp = client.put("/mcp", headers={"Origin": "https://evil.example"})
         assert resp.status_code == 403
 
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://localhost/evil",  # path attached
+            "http://evil@localhost",  # userinfo
+            "http://localhost:",  # empty port
+            "http://localhost:bad",  # non-numeric port
+            "http://localhost:99999",  # out-of-range port
+            "http://[::1",  # malformed IPv6 -- urlsplit itself raises
+        ],
+    )
+    def test_malformed_or_decorated_loopback_origin_403_not_500(self, client, origin):
+        """A present-but-invalid Origin must be 403, never a pass (the
+        loopback hostname does not sanctify a non-bare origin shape) and
+        never a 500 (urlsplit's own ValueError must be contained)."""
+        resp = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={"Origin": origin},
+        )
+        assert resp.status_code == 403
+
+    def test_valid_ipv6_loopback_origin_passes(self, client, bootstrapped):
+        _, _, secret = bootstrapped
+        resp = client.post(
+            "/mcp",
+            json=_modern_body("tools/list"),
+            headers={**_modern_headers(secret, "tools/list"), "Origin": "http://[::1]:8080"},
+        )
+        assert resp.status_code == 200
+
+    def test_ipv6_allowlist_entry_parses_and_passes(self, bootstrapped, tmp_path, monkeypatch):
+        """A bracketed IPv6 allowlist entry must survive the shared
+        bare-origin parser and then admit exactly that Origin."""
+        from opencrab.config import get_settings
+        from opencrab.mcp import tools as tools_pkg
+
+        sql, _user_id, secret = bootstrapped
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("STORAGE_MODE", "local")
+        monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://[2001:db8::1]")
+        get_settings.cache_clear()
+        monkeypatch.setattr(tools_pkg, "_get_context", lambda: _stub_context(sql))
+        try:
+            allowlisted_client = TestClient(create_app())
+            resp = allowlisted_client.post(
+                "/mcp",
+                json=_modern_body("tools/list"),
+                headers={**_modern_headers(secret, "tools/list"), "Origin": "https://[2001:db8::1]"},
+            )
+            assert resp.status_code == 200
+        finally:
+            get_settings.cache_clear()
+
 
 class TestModernBatchBoundary:
     def test_batch_with_modern_meta_element_rejected(self, client, bootstrapped):
@@ -409,7 +477,16 @@ class TestModernBatchBoundary:
 
 
 class TestMalformedAllowedOriginsConfig:
-    @pytest.mark.parametrize("bad_origin", ["https://claude.ai/path", "null", "ftp://x"])
+    @pytest.mark.parametrize(
+        "bad_origin",
+        [
+            "https://claude.ai/path",
+            "null",
+            "ftp://x",
+            "https://a.example,,https://b.example",  # empty entry (stray comma)
+            "https://claude.ai:bad",  # non-numeric port
+        ],
+    )
     def test_create_app_refuses_malformed_origin(self, bad_origin, monkeypatch):
         from opencrab.config import get_settings
 

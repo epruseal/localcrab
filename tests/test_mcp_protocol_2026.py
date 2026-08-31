@@ -319,6 +319,16 @@ class TestHandleRequestEdge:
         response = server.handle_request({"jsonrpc": "2.0", "id": 18, "method": "server/discover", "params": "abc"})
         assert response["error"]["code"] == INVALID_PARAMS
 
+    def test_null_meta_is_invalid_params(self, server):
+        """JSON `"_meta": null` is PRESENT-but-non-dict -- a malformed modern
+        marker (-32602), never an absent _meta (which would mean legacy).
+        Sliding it into the legacy era would bypass modern validation
+        entirely (dual-verification round 1, channel B MAJOR)."""
+        response = server.handle_request(
+            {"jsonrpc": "2.0", "id": 24, "method": "tools/list", "params": {"_meta": None}}
+        )
+        assert response["error"]["code"] == INVALID_PARAMS
+
     def test_notification_with_unsupported_modern_version_returns_none(self, server):
         """A notification (no "id") must get no response of any kind, even
         when the request would otherwise be a protocol-version error."""
