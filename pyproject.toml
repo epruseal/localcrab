@@ -59,6 +59,9 @@ dev = [
     "isort>=5.13",
     "ruff>=0.4",
     "mypy>=1.10",
+    # packaging/agent-plugin 검증기(canonical_validate)의 직접 의존 (#246).
+    # chromadb 전이 의존으로도 설치되지만 직접 사용 의존은 직접 선언한다.
+    "jsonschema>=4",
 ]
 # EMBEDDING_BACKEND=openai 의 로컬 GGUF 폴백(LlamaCppEmbeddingFunction)에 필요.
 # 기본 dependencies 에는 넣지 않음 — OpenAI 호환 서버가 항상 떠 있는 환경에서는
