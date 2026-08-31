@@ -1,6 +1,6 @@
 ---
 name: localcrab-query
-description: Guidance for choosing among LocalCrab's MetaOntology MCP tools (ontology_manifest, ontology_query, ontology_add_node/ontology_add_edge, pack_* and schema_pack_* family, harness_promotion_apply) for hybrid graph/vector/BM25 knowledge work. Use when a task needs to explore LocalCrab's grammar, search or query an existing ontology, ingest nodes/edges/documents, or manage content or schema packs, and the exact tool set for the current connection has not been discovered yet.
+description: Guidance for choosing among LocalCrab's MetaOntology MCP tools (ontology_manifest, ontology_query, ontology_add_node/ontology_add_edge, pack_* and schema_pack_* family, harness_promotion_apply, tool_search) for hybrid graph/vector/BM25 knowledge work. Use when a task needs to explore LocalCrab's grammar, search or query an existing ontology, ingest nodes/edges/documents, or manage content or schema packs, and the exact tool set for the current connection has not been discovered yet.
 license: MIT
 ---
 
@@ -19,7 +19,10 @@ by that connection's `tools/list` response at runtime, not by this document.
 Availability can vary by deployment: for example, some administrative tools
 are hidden for non-local/remote principals. Always treat `tools/list` as the
 source of truth for what is callable. This skill only helps you pick among
-tools you've confirmed exist there.
+tools you've confirmed exist there. Where present, the `tool_search` tool
+searches the current catalog by case-insensitive substring and returns a
+catalog fingerprint (`catalog_version`) for staleness detection; its results
+grant no execution rights.
 
 ## Choosing a tool by task
 
