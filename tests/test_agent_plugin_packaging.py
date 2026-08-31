@@ -166,6 +166,12 @@ class TestValidateCommandToken:
             "../opencrab",  # 상위 이탈 표기
             "opencrab serve",  # 공백(다중 토큰)
             "${PLUGIN_ROOT}/opencrab",  # command 는 비확장 대상 -- placeholder 자체가 무효
+            "./foo bar",  # ./ 분기도 단일 토큰이어야 한다 (PR #244 P2-1)
+            "./${PLUGIN_ROOT}",  # ./ 분기도 placeholder 금지 (PR #244 P2-1)
+            "./",  # 프리픽스뿐인 command (PR #244 P2-1)
+            ".",  # 해석 불가능한 bare 토큰
+            "..",  # 해석 불가능한 bare 토큰
+            "./a\x00b",  # NUL 바이트 — 경로 API 도달 전 거부
             "",
         ],
     )
@@ -196,6 +202,11 @@ class TestValidateCwdForm:
     )
     def test_invalid_forms_fail(self, cwd):
         assert v.validate_cwd_form(cwd) != []
+
+    def test_nul_byte_cwd_fails(self):
+        # NUL 은 JSON 문자열로 유입 가능하고 경로 API 에서 ValueError 를 유발한다 —
+        # 형식 검사 단계에서 거부한다 (PR #244 P2-2 와 같은 예외 누출 클래스).
+        assert v.validate_cwd_form("${PLUGIN_DATA}/a\x00b") != []
 
 
 class TestCheckContainment:
@@ -270,6 +281,7 @@ class TestValidateUrl:
             "https://user:pass@example.com/mcp",  # userinfo 금지
             "https://example.com/mcp#frag",  # fragment 금지
             "ftp://example.com/mcp",  # 허용되지 않는 스킴
+            "http://[::1",  # 비파싱 URL — 예외가 아니라 오류여야 한다 (PR #244 P2-2)
         ],
     )
     def test_invalid_urls_fail(self, url):
@@ -562,6 +574,26 @@ class TestValidateMcpConfig:
 # ---------------------------------------------------------------------------
 # 패키지 통합 검증 (실 src 대상 + 합성 오염 케이스)
 # ---------------------------------------------------------------------------
+
+    def test_unparseable_url_gate_error_loader_skip(self, plugin_root, plugin_data):
+        # PR #244 P2-2 통합: urlsplit ValueError 가 예외로 새지 않고 게이트=오류,
+        # 로더=해당 entry 만 skip 이어야 한다 (§7.2.2).
+        obj = {
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "bad": {"type": "streamable-http", "url": "http://[::1"},
+                "ok": {"type": "stdio", "command": "opencrab"},
+            },
+        }
+        errors, _warnings, servers = v.validate_mcp_config(
+            obj, v.MODE_GATE, plugin_root, plugin_data
+        )
+        assert errors != []
+        _errors, warnings, servers = v.validate_mcp_config(
+            obj, v.MODE_LOADER, plugin_root, plugin_data
+        )
+        assert "bad" not in servers and "ok" in servers
+        assert warnings != []
 
 
 class TestValidatePackage:
