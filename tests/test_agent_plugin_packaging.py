@@ -570,11 +570,6 @@ class TestValidateMcpConfig:
         )
         assert errors != []
 
-
-# ---------------------------------------------------------------------------
-# 패키지 통합 검증 (실 src 대상 + 합성 오염 케이스)
-# ---------------------------------------------------------------------------
-
     def test_unparseable_url_gate_error_loader_skip(self, plugin_root, plugin_data):
         # PR #244 P2-2 통합: urlsplit ValueError 가 예외로 새지 않고 게이트=오류,
         # 로더=해당 entry 만 skip 이어야 한다 (§7.2.2).
@@ -591,6 +586,48 @@ class TestValidateMcpConfig:
         assert errors != []
         _errors, warnings, servers = v.validate_mcp_config(
             obj, v.MODE_LOADER, plugin_root, plugin_data
+        )
+        assert "bad" not in servers and "ok" in servers
+        assert warnings != []
+
+
+# ---------------------------------------------------------------------------
+# 패키지 통합 검증 (실 src 대상 + 합성 오염 케이스)
+# ---------------------------------------------------------------------------
+
+
+class TestPathResolutionExceptionLeaks:
+    """JSON 이스케이프로 유입 가능한 NUL·고립 서로게이트가 경로 해석에서 예외로
+    새지 않아야 한다 (PR #244 P2-3/P2-4). 게이트=오류, 로더=entry skip (§7.2.2).
+    디스크 mcp.json 왕복으로 유입 형태를 재현한다."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("command", "./a\u0000b"),  # NUL — 형식 오류 후에도 containment 로 새면 안 된다
+            ("command", "./\ud800x"),  # 고립 서로게이트 — 형식 검사를 통과하는 입력
+            ("cwd", "./\ud800x"),
+            ("cwd", "${PLUGIN_DATA}/\ud800"),
+        ],
+    )
+    def test_no_exception_gate_error_loader_skip(
+        self, tmp_path, plugin_root, plugin_data, field, value
+    ):
+        entry = {"type": "stdio", "command": "opencrab"}
+        entry[field] = value
+        obj = {
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {"bad": entry, "ok": {"type": "stdio", "command": "opencrab"}},
+        }
+        path = tmp_path / "mcp.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")  # ensure_ascii 라 ASCII 로 기록됨
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        errors, _warnings, _servers = v.validate_mcp_config(
+            loaded, v.MODE_GATE, plugin_root, plugin_data
+        )
+        assert errors != []
+        _errors, warnings, servers = v.validate_mcp_config(
+            loaded, v.MODE_LOADER, plugin_root, plugin_data
         )
         assert "bad" not in servers and "ok" in servers
         assert warnings != []
