@@ -58,7 +58,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 ## 범위 밖 (후속)
 
-- **`subscriptions/listen` / `listChanged`**: 도구 레지스트리가 import 시점에 고정되어 프로세스 수명 동안 목록이 변하지 않으므로, capability 를 선언하지 않는 것이 진실한 선언이다. 목록이 런타임에 변하게 되면 그때 #150 의 principal 별 통지 문제와 함께 설계한다.
+- **`subscriptions/listen` / `listChanged`**: 도구 레지스트리가 import 시점에 고정되어 프로세스 수명 동안 목록이 변하지 않으므로, capability 를 선언하지 않는 것이 진실한 선언이다. 목록이 런타임에 변하게 되면 그때 #150 의 principal 별 통지 문제와 함께 설계한다. #135 가 가시 뷰 기준 카탈로그 fingerprint(`tool_search` 의 `catalog_version`)를 도입했지만 목록은 여전히 불변이므로 이 결정은 유지된다(docs/mcp-tool-catalog.md).
 - **MRTR / tasks extension**: 서버발 요청(roots/sampling/elicitation)이 코드베이스에 없어 적용 대상이 없다.
 - **structuredContent**: 소비자가 생기면 추가한다.
 - **D절 제거(ping·legacy handshake 삭제)**: deprecation 기간 이후 별도 결정. 이행 레버는 `MCP_PROTOCOL_VERSIONS`(legacy 제외 구성)로 이미 존재한다.

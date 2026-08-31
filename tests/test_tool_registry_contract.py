@@ -49,6 +49,7 @@ GOLDEN_TOOL_NAMES = [
     "harness_promotion_apply",
     "pack_publish",
     "pack_fork",
+    "tool_search",
 ]
 
 
