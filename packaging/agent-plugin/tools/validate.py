@@ -122,18 +122,32 @@ def _validate_skill_name(name: str) -> list[str]:
 
 
 def validate_command_token(command: str) -> list[str]:
-    """§7.2.1: bare(경로구분자·공백·placeholder 없음) 또는 './' 시작만 허용."""
+    """§7.2.1: bare(경로구분자·공백·placeholder 없음) 또는 './' 시작만 허용.
+
+    공백·placeholder·NUL 검사는 './' 분기에도 적용한다 — "single executable
+    token" 은 형식 전체에 대한 요구이고, command 는 클라이언트가 placeholder 를
+    확장하지 않는 필드라(§7.2.1) 포함 자체가 저작 오류다 (PR #244 P2-1).
+    공백 파일명을 번들하는 spec-경계 사례보다 단일 토큰 해석의 일관성을 택했다.
+    """
     if not isinstance(command, str) or not command:
         return ["command must be a non-empty string"]
-    if command.startswith("./"):
-        return []  # plugin-relative -- containment 은 check_containment 가 별도 확인
     errors = []
     if any(ch.isspace() for ch in command):
         errors.append("command must be a single token without whitespace")
-    if "/" in command or "\\" in command:
-        errors.append("command must be a bare executable name or a './'-relative path")
+    if "\x00" in command:
+        # NUL 은 JSON 문자열로 유입 가능하고 이후 경로 API 에서 ValueError 를
+        # 유발한다 -- 예외 누출 전에 형식 단계에서 거부한다.
+        errors.append("command must not contain NUL bytes")
     if _PLACEHOLDER_RE.search(command) or "${" in command:
         errors.append("command must not contain placeholder expansion")
+    if command.startswith("./"):
+        if command == "./":
+            errors.append("command './' does not name an executable")
+    else:
+        if "/" in command or "\\" in command:
+            errors.append("command must be a bare executable name or a './'-relative path")
+        elif command in (".", ".."):
+            errors.append("command must name an executable, not a directory reference")
     return errors
 
 
@@ -141,6 +155,9 @@ def validate_cwd_form(cwd: str) -> list[str]:
     """cwd 는 './...' | '${PLUGIN_ROOT}'[/...] | '${PLUGIN_DATA}'[/...] 만 허용."""
     if not isinstance(cwd, str) or not cwd:
         return ["cwd must be a non-empty string"]
+    if "\x00" in cwd:
+        # command 와 같은 이유 -- 경로 API 도달 전 거부 (PR #244 P2-2 클래스).
+        return ["cwd must not contain NUL bytes"]
     if cwd.startswith("./"):
         return []
     if cwd == "${PLUGIN_ROOT}" or cwd.startswith("${PLUGIN_ROOT}/"):
@@ -236,7 +253,13 @@ def validate_url(url) -> list[str]:
     """
     if not isinstance(url, str) or not url:
         return ["url must be a non-empty string"]
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+    except ValueError:
+        # 예: 'http://[::1' (IPv6 괄호 불일치). urlsplit/hostname 의 ValueError 를
+        # 밖으로 내보내면 게이트·빌드 CLI 가 traceback 으로 죽는다 (PR #244 P2-2).
+        return ["url is not a parseable URL"]
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return ["url must be an absolute http(s) URL"]
     errors = []
@@ -244,7 +267,7 @@ def validate_url(url) -> list[str]:
         errors.append("url must not contain userinfo")
     if parts.fragment:
         errors.append("url must not contain a fragment")
-    if parts.scheme == "http" and not _is_loopback_host(parts.hostname):
+    if parts.scheme == "http" and not _is_loopback_host(hostname):
         errors.append("non-loopback url must use https")
     return errors
 
