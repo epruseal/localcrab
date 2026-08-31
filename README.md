@@ -448,6 +448,10 @@ community_reports.json
 
 [`crabharness/`](./crabharness/)는 대규모 수집·파싱 작업을 위한 미션 기반 증거 수집 제어판입니다. 크롤 대상·범위·성공 기준을 미션으로 동결하고, 증거 번들을 검증한 뒤 PromotionPackage를 생성합니다. 상세는 [CrabHarness README](./crabharness/README.md) 참고.
 
+### Agent Plugin 패키징 (선택 기능)
+
+LocalCrab을 Agent Plugins 1.0.0 표준 패키지로 빌드해 OpenClaw 같은 클라이언트가 discovery·설정만으로 stdio MCP 서버를 찾게 할 수 있습니다. 빌드: `python scripts/build_agent_plugin.py`. 상세: [docs/agent-plugin-packaging.md](./docs/agent-plugin-packaging.md).
+
 ---
 
 ## 개발
