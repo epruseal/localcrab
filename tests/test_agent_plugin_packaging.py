@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,7 @@ sys.path.insert(0, str(REPO / "packaging" / "agent-plugin"))
 
 from tools import build as b  # noqa: E402
 from tools import env_contract  # noqa: E402
+from tools import refclient as rc  # noqa: E402
 from tools import validate as v  # noqa: E402
 
 SRC_DIR = REPO / "packaging" / "agent-plugin" / "src"
@@ -1024,3 +1027,169 @@ class TestEnvContractSync:
     def test_config_alias_localcrab_env_file_captured(self):
         discovered, _unresolved = scan_env_contract()
         assert "LOCALCRAB_ENV_FILE" in discovered
+
+
+# ---------------------------------------------------------------------------
+# #248: env 전달 계층 방호 (refclient 원천 검사 + validate 층 키·값 분리 검사)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvGuard:
+    """#248: env 키·값의 비문자열·NUL·고립 서로게이트를 subprocess/execve 예외
+    (ValueError/UnicodeEncodeError/TypeError) 누출 전에 명시 ValueError 로 거부한다.
+
+    원천 3종(강제 변수 값, base_env, server_env 원본)을 placeholder 확장 전에
+    각 1회 검사한다 -- 검증된 스칼라 문자열의 치환 연접은 새 위반 문자를 만들 수
+    없으므로 합성 결과 재검사는 없다 (설계 v4 불변식)."""
+
+    ROOT = "/plugin/root"
+    DATA = "/plugin/data"
+
+    def _base(self):
+        return {"PATH": "/usr/bin", "HOME": "/home/user"}
+
+    # -- 정상 --
+
+    def test_normal_synthesis_unchanged(self):
+        server_env = {"LOCAL_DATA_DIR": "${PLUGIN_DATA}", "PLAIN": "value"}
+        env = rc.build_subprocess_env(server_env, self.ROOT, self.DATA, self._base())
+        assert env["LOCAL_DATA_DIR"] == self.DATA
+        assert env["PLAIN"] == "value"
+        assert env["PLUGIN_ROOT"] == self.ROOT
+        assert env["PLUGIN_DATA"] == self.DATA
+        assert env["PATH"] == "/usr/bin"
+
+    # -- 오류 --
+
+    def test_nul_value_from_json_roundtrip_rejected(self, tmp_path):
+        # JSON NUL 이스케이프로 디스크 왕복해 유입되는 실제 형태를 재현한다.
+        path = tmp_path / "env.json"
+        path.write_text(json.dumps({"API_MODE": "a\x00b"}), encoding="utf-8")
+        server_env = json.loads(path.read_text(encoding="utf-8"))
+        with pytest.raises(ValueError) as exc:
+            rc.build_subprocess_env(server_env, self.ROOT, self.DATA, self._base())
+        assert "API_MODE" in str(exc.value)
+        assert "NUL" in str(exc.value)
+
+    def test_multiple_entries_all_listed(self):
+        with pytest.raises(ValueError) as exc:
+            rc.build_subprocess_env(
+                {"A": "x\x00y", "B": "\udc80"}, self.ROOT, self.DATA, self._base()
+            )
+        msg = str(exc.value)
+        assert "'A'" in msg and "'B'" in msg
+
+    def test_same_entry_key_and_value_violations_both_reported(self):
+        # 키 NUL 과 값 서로게이트가 같은 항목에서 각각 보고된다 (위반 손실 금지).
+        with pytest.raises(ValueError) as exc:
+            rc.build_subprocess_env({"B\x00": "\ud800"}, self.ROOT, self.DATA, self._base())
+        msg = str(exc.value)
+        assert "NUL" in msg
+        assert "surrogate" in msg
+
+    @pytest.mark.parametrize("bad", [5, b"bytes", None, ["x"]])
+    def test_non_string_value_explicit_value_error(self, bad):
+        # expand_placeholders(re.sub) 의 TypeError 누출이 아니라 명시 ValueError 다.
+        with pytest.raises(ValueError, match="must be a string"):
+            rc.build_subprocess_env({"A": bad}, self.ROOT, self.DATA, self._base())
+
+    # -- 엣지 --
+
+    @pytest.mark.parametrize(
+        ("server_env", "base_env", "data"),
+        [
+            ({"A": "\ud800"}, None, DATA),  # 고역 서로게이트 값
+            # 저역: POSIX surrogateescape 로 왕복 가능한 범위지만 정책상 일괄 거부
+            # (결정론적 §9.1 계약 -- 정책 자체를 고정하는 케이스)
+            ({"A": "\udc80"}, None, DATA),
+            ({"A\x00": "v"}, None, DATA),  # server_env 키 NUL
+            (None, {"PATH": "x\x00"}, DATA),  # base_env 값 오염
+            (None, {"P\ud800": "v"}, DATA),  # base_env 키 오염
+            (None, None, "/d\x00"),  # 강제 변수 값(plugin_data) 오염
+        ],
+    )
+    def test_contaminated_sources_rejected(self, server_env, base_env, data):
+        with pytest.raises(ValueError):
+            rc.build_subprocess_env(
+                server_env or {},
+                self.ROOT,
+                data,
+                base_env if base_env is not None else self._base(),
+            )
+
+    @pytest.mark.parametrize("field", ["root", "data"])
+    def test_non_string_forced_value_no_typeerror_leak(self, field):
+        root = Path(self.ROOT) if field == "root" else self.ROOT
+        data = Path(self.DATA) if field == "data" else self.DATA
+        with pytest.raises(ValueError, match="must be a string"):
+            rc.build_subprocess_env({"X": "${PLUGIN_ROOT}/bin"}, root, data, self._base())
+
+    def test_stdio_client_rejects_before_popen(self, monkeypatch):
+        # 합성 함수를 우회한 직접 생성 경로(sink)에서도 Popen 도달 전에 거부된다.
+        calls = []
+        monkeypatch.setattr(rc.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+        with pytest.raises(ValueError):
+            rc.JsonRpcStdioClient(cmd=["prog"], env={"A": "x\x00"}, cwd="/tmp")
+        assert calls == []
+
+
+class TestValidateEnvChokepoint:
+    """#248: mcp.json env 오염은 게이트=오류, 로더=entry skip (§7.2.2).
+    기존 TestPathResolutionExceptionLeaks 와 같은 JSON 디스크 왕복 유입 형태다."""
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"A": "x\x00y"},  # 값 NUL
+            {"A": "\ud800"},  # 값 고립 서로게이트
+            {"A\x00": "v"},  # 키 NUL
+        ],
+    )
+    def test_gate_error_loader_skip(self, tmp_path, plugin_root, plugin_data, env):
+        obj = {
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "bad": {"type": "stdio", "command": "opencrab", "env": env},
+                "ok": {"type": "stdio", "command": "opencrab"},
+            },
+        }
+        path = tmp_path / "mcp.json"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        errors, _warnings, _servers = v.validate_mcp_config(
+            loaded, v.MODE_GATE, plugin_root, plugin_data
+        )
+        assert errors != []
+        _errors, warnings, servers = v.validate_mcp_config(
+            loaded, v.MODE_LOADER, plugin_root, plugin_data
+        )
+        assert "bad" not in servers and "ok" in servers
+        assert warnings != []
+
+    def test_non_string_value_does_not_mask_key_violation(self, plugin_root, plugin_data):
+        # 값이 비문자열이어도 같은 항목의 키 오염이 함께 보고된다 (분리 검사).
+        obj = {
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "bad": {"type": "stdio", "command": "opencrab", "env": {"K\x00": 5}}
+            },
+        }
+        errors, _warnings, _servers = v.validate_mcp_config(
+            obj, v.MODE_GATE, plugin_root, plugin_data
+        )
+        joined = "; ".join(errors)
+        assert "must be a string" in joined
+        assert "NUL" in joined
+
+
+class TestDevExtraContract:
+    """#246: packaging 검증기의 직접 의존(jsonschema)은 dev extra 에 직접 선언한다.
+    chromadb 전이 의존으로 우연히 설치되는 상태는 계약이 아니다."""
+
+    def test_jsonschema_declared_in_dev_extra(self):
+        with open(REPO / "pyproject.toml", "rb") as f:
+            data = tomllib.load(f)
+        dev_deps = data["project"]["optional-dependencies"]["dev"]
+        assert any(
+            re.match(r"jsonschema\s*(\[|>|=|<|!|~|;|$)", d) for d in dev_deps
+        ), dev_deps
