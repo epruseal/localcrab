@@ -336,6 +336,40 @@ class TestHandleRequestEdge:
         assert response["error"]["code"] == INVALID_PARAMS
         mock_dispatch.assert_not_called()
 
+    @pytest.mark.parametrize("bad_name", [["tool"], 123, {"a": 1}, "", None])
+    def test_modern_tools_call_non_string_name_invalid_params(self, server, bad_name):
+        """PR review R4: a non-string (or empty/absent) `name` is malformed
+        request metadata -- protocol error -32602 BEFORE dispatch, never a
+        tool-execution isError envelope. Same rationale as the R2 arguments
+        check."""
+        params = {"arguments": {}, "_meta": MODERN_META}
+        if bad_name is not None:
+            params["name"] = bad_name
+        with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
+            response = server.handle_request(
+                {"jsonrpc": "2.0", "id": 33, "method": "tools/call", "params": params}
+            )
+        assert response["error"]["code"] == INVALID_PARAMS
+        mock_dispatch.assert_not_called()
+
+    def test_legacy_tools_call_non_string_name_unchanged(self, server):
+        """Regression pin: the LEGACY path keeps its historical behaviour for
+        a truthy non-string name (dispatch is entered; the failure surfaces
+        as the legacy error envelope, not -32602) -- R4 strictness is
+        modern-only."""
+        with patch("opencrab.mcp.server.dispatch_tool", side_effect=TypeError("unhashable")) as mock_dispatch:
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 34,
+                    "method": "tools/call",
+                    "params": {"name": ["tool"], "arguments": {}},
+                }
+            )
+        mock_dispatch.assert_called_once()
+        assert "error" not in response  # legacy tool-exception envelope, not JSON-RPC error
+        assert "unhashable" in response["result"]["content"][0]["text"]
+
     def test_modern_tools_call_absent_arguments_dispatches_empty_dict(self, server):
         with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": 1}) as mock_dispatch:
             response = server.handle_request(
