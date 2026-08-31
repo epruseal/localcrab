@@ -149,6 +149,7 @@ class TestAgentPluginSmoke:
             tools_response = client.request("tools/list", {})
             tool_names = [tool["name"] for tool in tools_response["result"]["tools"]]
             assert "ontology_manifest" in tool_names
+            assert "tool_search" in tool_names  # #135: bootstrap 검색 표면은 항상 노출된다
 
             call_response = client.request(
                 "tools/call", {"name": "ontology_manifest", "arguments": {}}
@@ -157,6 +158,15 @@ class TestAgentPluginSmoke:
             # v5 [X2]: describe_grammar() 실제 키는 spaces/meta_edges (하이픈 표기 아님)
             assert "spaces" in payload
             assert "meta_edges" in payload
+
+            # #135: tool_search 왕복 -- 대표 클라이언트 경로에서 카탈로그 검색
+            # 표면(버전 fingerprint + 자기 자신 발견)을 검증한다.
+            search_response = client.request(
+                "tools/call", {"name": "tool_search", "arguments": {"query": "tool_search"}}
+            )
+            search_payload = json.loads(search_response["result"]["content"][0]["text"])
+            assert search_payload["catalog_version"]
+            assert "tool_search" in [t["name"] for t in search_payload["tools"]]
         finally:
             client.close()
 
