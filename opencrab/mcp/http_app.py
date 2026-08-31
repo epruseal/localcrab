@@ -333,6 +333,23 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                         status_code=400,
                         headers=_NO_STORE,
                     )
+                if "id" not in body:
+                    # PR review R3: a NOTIFICATION failing BODY validation
+                    # (unsupported version with matching header, malformed
+                    # _meta shape) must not be 202-acknowledged either.
+                    # handle_request rightly stays silent for notifications,
+                    # so the transport pre-checks the body here and rejects
+                    # with the same empty-body 400 as a header fault.
+                    # validate_modern is pure (no side effects on the second
+                    # call inside handle_request), and a notification that
+                    # PASSES it but names an unknown method stays a silent
+                    # 202 -- JSON-RPC drops unknown-method notifications,
+                    # exactly as the legacy path does.
+                    body_fault = protocol.validate_modern(
+                        body.get("params") or {}, server._enabled_modern
+                    )
+                    if body_fault is not None:
+                        return Response(status_code=400, headers=_NO_STORE)
             resp = server.handle_request(body)
             # Notifications (no id) get no body → 202 Accepted
             if resp is None:
