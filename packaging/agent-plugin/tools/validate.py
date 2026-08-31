@@ -177,8 +177,14 @@ def _check_root_containment(candidate: str, root: str) -> list[str]:
     norm_candidate = posixpath.normpath(candidate)
     if norm_candidate != norm_root and not norm_candidate.startswith(norm_root + "/"):
         return [f"path escapes root after lexical normalization: {candidate!r} not under {norm_root!r}"]
-    real_root = os.path.realpath(root)
-    real_candidate = os.path.realpath(candidate)
+    try:
+        real_root = os.path.realpath(root)
+        real_candidate = os.path.realpath(candidate)
+    except (ValueError, UnicodeError, OSError):
+        # NUL·고립 서로게이트 등 JSON 문자열로 유입 가능한 값이 경로 API 에서
+        # 예외를 낸다 -- §7.2.2 의 entry invalid 로 승격한다 (PR #244 P2-3/P2-4).
+        # kind 3종(command/cwd/file)·두 모드가 전부 이 초크포인트를 지난다.
+        return ["path is not resolvable"]
     if real_candidate != real_root and not (real_candidate + os.sep).startswith(real_root + os.sep):
         return [f"path escapes root after realpath resolution: {candidate!r} resolves outside {real_root!r}"]
     return []
@@ -463,8 +469,15 @@ def _validate_server_entry(entry, plugin_root, plugin_data) -> list[str]:
 
         command = entry.get("command")
         if isinstance(command, str):
-            errors.extend(f"command: {e}" for e in validate_command_token(command))
-            errors.extend(f"command: {e}" for e in check_containment(command, plugin_root, plugin_data, "command"))
+            cmd_form_errors = validate_command_token(command)
+            if cmd_form_errors:
+                # cwd 분기와 동일한 단락 -- 형식 위반 값을 경로 API 에 넘기지 않는다.
+                errors.extend(f"command: {e}" for e in cmd_form_errors)
+            else:
+                errors.extend(
+                    f"command: {e}"
+                    for e in check_containment(command, plugin_root, plugin_data, "command")
+                )
         elif "command" in entry:
             errors.append("command must be a string")
 
