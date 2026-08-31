@@ -548,6 +548,52 @@ class TestModernEdgeCases:
         assert resp.status_code == 400
         assert resp.content == b""
 
+    def test_body_invalid_version_modern_notification_gets_400_empty_body(self, client, bootstrapped):
+        """PR review R3: a modern notification whose headers MATCH the body
+        (so header validation passes) but whose version is unsupported must
+        not be 202-acknowledged -- the transport pre-checks the body and
+        rejects with the same empty-body 400 as a header fault."""
+        _, _, secret = bootstrapped
+        body = _modern_body("notifications/cancelled", id=None)
+        body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = "1900-01-01"
+        resp = client.post(
+            "/mcp",
+            json=body,
+            headers={
+                **_auth(secret),
+                "MCP-Protocol-Version": "1900-01-01",
+                "Mcp-Method": "notifications/cancelled",
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.content == b""
+
+    def test_missing_caps_modern_notification_gets_400_empty_body(self, client, bootstrapped):
+        _, _, secret = bootstrapped
+        body = _modern_body("notifications/cancelled", id=None)
+        del body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+        resp = client.post(
+            "/mcp",
+            json=body,
+            headers=_modern_headers(secret, "notifications/cancelled"),
+        )
+        assert resp.status_code == 400
+        assert resp.content == b""
+
+    def test_unknown_method_modern_notification_stays_202(self, client, bootstrapped):
+        """Boundary pin for R3: only BODY-VALIDATION faults turn into 400.
+        A notification that passes validation but names an unknown method is
+        silently dropped (202), matching the legacy unknown-method-notification
+        contract."""
+        _, _, secret = bootstrapped
+        resp = client.post(
+            "/mcp",
+            json=_modern_body("ping", id=None),
+            headers=_modern_headers(secret, "ping"),
+        )
+        assert resp.status_code == 202
+        assert resp.content == b""
+
     def test_modern_notification_returns_202_empty_body(self, client, bootstrapped):
         _, _, secret = bootstrapped
         resp = client.post(
