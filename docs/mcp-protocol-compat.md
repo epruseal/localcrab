@@ -52,7 +52,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | `MCP_PROTOCOL_VERSIONS` | 쉼표 구분 부분집합으로 지원 버전 제한 (미설정 = 전체). legacy 전부 제외 = handshake 비활성(D절 이행 레버), modern 전부 제외 = legacy 고정 | 빌드가 모르는 버전이 있으면 **기동 거부** |
 | `MCP_ALLOWED_ORIGINS` | 쉼표 구분 Origin allowlist. `http(s)://host[:port]` 형태만, 브라우저가 보내는 형태 그대로(기본 포트 생략) | 경로·쿼리·userinfo 포함, `null`, 비-http 스킴이면 **기동 거부** |
 
-두 설정 모두 standalone(`opencrab serve`)과 apps/api 양쪽에서 서빙 시작 전에 검증된다.
+두 설정 모두 standalone(`opencrab serve`)과 apps/api 양쪽에서 서빙 시작 전에 검증된다. 두 설정 모두 **완전히 빈 값(미설정·빈 문자열)은 기본값**이지만, **구분자·빈 항목만 있는 값(예: `,`, `a,,b`)은 malformed 로 기동 거부**된다 — 오타로 항목이 사라진 채 조용히 뜨는 것을 막는다.
 
 **프로덕션 재기동 주의**: 알려진 소비자는 전부 Origin 헤더를 보내지 않아 기본값으로 안전하다. Origin 을 싣는 새 소비자가 403 을 받으면 코드 원복 없이 `MCP_ALLOWED_ORIGINS` 에 그 Origin 을 추가하고 재기동하면 된다.
 

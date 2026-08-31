@@ -113,17 +113,21 @@ def is_modern_request(method: Any, params: Any) -> bool:
     ``server/discover`` is always modern (it only exists in 2026-07-28, and
     stdio probes rely on it reaching the modern path). Otherwise: a dict
     ``_meta`` carrying the protocolVersion key means modern; a PRESENT but
-    non-dict ``_meta`` is treated as modern too, so its malformed shape is
-    rejected (-32602) instead of silently sliding into the legacy era.
+    non-dict ``_meta`` -- JSON ``null`` included, which is why presence is
+    checked with ``in`` rather than ``.get() is not None`` -- is treated as
+    modern too, so its malformed shape is rejected (-32602) instead of
+    silently sliding into the legacy era unvalidated.
     """
     if method == "server/discover":
         return True
     if not isinstance(params, dict):
         return False
-    meta = params.get("_meta")
+    if "_meta" not in params:
+        return False
+    meta = params["_meta"]
     if isinstance(meta, dict):
         return META_PROTOCOL_VERSION in meta
-    return meta is not None
+    return True
 
 
 def validate_modern(params: Any, enabled_modern: tuple[str, ...]) -> ProtocolFault | None:
@@ -197,15 +201,52 @@ def decode_mcp_name(value: str) -> str:
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _normalize_bare_origin(value: str) -> tuple[str, str] | None:
+    """(normalized ``scheme://netloc``, hostname) for a bare http(s) origin,
+    or None for anything malformed.
+
+    The single validator behind BOTH ``parse_allowed_origins`` (config side)
+    and ``origin_allowed`` (request side), so the allowlist can never hold a
+    shape the request check would not produce. The try wraps ``urlsplit``
+    ITSELF plus the ``hostname``/``port`` accessors: ``urlsplit("http://[::1")``
+    raises ValueError at the call, and a non-numeric or out-of-range port
+    raises at ``.port`` -- every malformed shape must converge on None (the
+    middleware turns that into a 403, never a 500). A trailing-colon netloc
+    (``localhost:`` -- empty port) parses cleanly, so it is rejected by the
+    shape check instead.
+    """
+    try:
+        parts = urlsplit(value.strip())
+        hostname = parts.hostname
+        _ = parts.port  # accessor raises for non-numeric / out-of-range ports
+    except ValueError:
+        return None
+    if (
+        parts.scheme.lower() not in ("http", "https")
+        or not parts.netloc
+        or not hostname
+        or parts.path
+        or parts.query
+        or parts.fragment
+        or "@" in parts.netloc
+        or parts.netloc.endswith(":")
+    ):
+        return None
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}", hostname
+
+
 def parse_allowed_origins(raw: Any) -> frozenset[str]:
     """Validated allowlist from the MCP_ALLOWED_ORIGINS setting.
 
     Entries must be bare web origins -- ``http(s)://host[:port]`` with no
-    path, query, fragment or userinfo; ``null`` and non-http schemes are
-    refused. Comparison is by normalized exact string (scheme and host
-    lowercased, port kept verbatim): browsers omit default ports in the
-    Origin header, so operators write entries exactly as browsers send them.
-    Raises ``ValueError``; entry points wrap into ``RuntimeError``.
+    path, query, fragment or userinfo; ``null``, non-http schemes, invalid
+    ports and EMPTY entries (a stray comma) are refused -- consistent with
+    MCP_PROTOCOL_VERSIONS, where "," also refuses startup while a fully
+    blank value means "unset". Comparison is by normalized exact string
+    (scheme and host lowercased, port kept verbatim): browsers omit default
+    ports in the Origin header, so operators write entries exactly as
+    browsers send them. Raises ``ValueError``; entry points wrap into
+    ``RuntimeError``.
     """
     if not isinstance(raw, str) or not raw.strip():
         return frozenset()
@@ -213,37 +254,37 @@ def parse_allowed_origins(raw: Any) -> frozenset[str]:
     for token in raw.split(","):
         token = token.strip()
         if not token:
-            continue
-        parts = urlsplit(token)
-        if (
-            parts.scheme not in ("http", "https")
-            or not parts.netloc
-            or parts.path
-            or parts.query
-            or parts.fragment
-            or "@" in parts.netloc
-        ):
+            raise ValueError(
+                "MCP_ALLOWED_ORIGINS contains an empty entry (stray comma?) -- "
+                "remove it or unset the variable entirely"
+            )
+        normalized = _normalize_bare_origin(token)
+        if normalized is None:
             raise ValueError(
                 f"MCP_ALLOWED_ORIGINS entry {token!r} is not a bare http(s) origin "
                 "(expected scheme://host[:port] with no path/query/userinfo)"
             )
-        allowed.add(f"{parts.scheme.lower()}://{parts.netloc.lower()}")
+        allowed.add(normalized[0])
     return frozenset(allowed)
 
 
 def origin_allowed(origin: str, allowed: frozenset[str]) -> bool:
     """Whether a PRESENT Origin header value may reach /mcp.
 
-    Loopback origins (any port) always pass -- a DNS-rebinding attack cannot
-    present one, because the attack works precisely by keeping the hostname
-    non-local while rebinding its address. Everything else must be
-    allowlisted exactly. Absent-Origin requests never reach this function
-    (non-browser clients pass unconditionally).
+    A malformed value (path/userinfo attached, bad port, broken IPv6) is
+    refused outright -- a loopback hostname does not sanctify a non-bare
+    origin shape, and real browsers only ever send ``scheme://host[:port]``
+    (RFC 6454), so nothing legitimate is lost. Well-formed loopback origins
+    (any port) always pass: a DNS-rebinding attack cannot present one,
+    because the attack works precisely by keeping the hostname non-local
+    while rebinding its address. Everything else must be allowlisted
+    exactly. Absent-Origin requests never reach this function (non-browser
+    clients pass unconditionally).
     """
-    parts = urlsplit(origin.strip())
-    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+    parsed = _normalize_bare_origin(origin)
+    if parsed is None:
         return False
-    normalized = f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    normalized, hostname = parsed
     if normalized in allowed:
         return True
-    return (parts.hostname or "") in _LOOPBACK_HOSTS
+    return hostname in _LOOPBACK_HOSTS
