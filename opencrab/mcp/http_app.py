@@ -350,6 +350,18 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                     )
                     if body_fault is not None:
                         return Response(status_code=400, headers=_NO_STORE)
+                    # PR review R5: the same courtesy for call-shape faults --
+                    # a tools/call notification with a malformed name or
+                    # arguments would otherwise be swallowed into a 202 by
+                    # handle_request's notification silence. Shared validator,
+                    # tools/call only; a VALID call notification still runs
+                    # fire-and-forget and 202s.
+                    if body.get("method") == "tools/call":
+                        call_fault = protocol.validate_tools_call_params(
+                            body.get("params") or {}
+                        )
+                        if call_fault is not None:
+                            return Response(status_code=400, headers=_NO_STORE)
             resp = server.handle_request(body)
             # Notifications (no id) get no body → 202 Accepted
             if resp is None:

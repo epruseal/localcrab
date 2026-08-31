@@ -170,6 +170,26 @@ def validate_modern(params: Any, enabled_modern: tuple[str, ...]) -> ProtocolFau
     return None
 
 
+def validate_tools_call_params(params: dict[str, Any]) -> ProtocolFault | None:
+    """Call-shape validation for a modern tools/call (#136 reviews R2/R4/R5).
+
+    Shared single source for BOTH the server dispatch path (which raises
+    TypeError(fault.message) to keep its historical -32602 mapping) and the
+    HTTP notification pre-check (which turns a fault into the empty-body 400
+    used for every other body-validation fault on a notification).
+
+    Messages are EXACTLY the historical TypeError strings and carry no
+    "Invalid params: " prefix -- the server's TypeError mapping adds that
+    prefix exactly once.
+    """
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return ProtocolFault(-32602, "'name' must be a non-empty string in tools/call params.")
+    if "arguments" in params and not isinstance(params["arguments"], dict):
+        return ProtocolFault(-32602, "'arguments' must be an object when present")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # HTTP header helpers (Streamable HTTP "Standard Request Headers")
 # ---------------------------------------------------------------------------
