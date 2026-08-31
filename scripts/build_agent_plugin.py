@@ -22,7 +22,11 @@ _TOOLS_PARENT = REPO_ROOT / "packaging" / "agent-plugin"
 if str(_TOOLS_PARENT) not in sys.path:
     sys.path.insert(0, str(_TOOLS_PARENT))
 
-from tools.build import BuildError, build_release, verify_release  # noqa: E402  (sys.path 삽입 후 의도된 임포트 순서)
+from tools.build import (  # noqa: E402  (sys.path 삽입 후 의도된 임포트 순서)
+    BuildError,
+    build_release,
+    verify_release,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
