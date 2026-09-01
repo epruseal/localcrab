@@ -359,15 +359,26 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
     a hand-seeded store: opencrab.mcp.tools._ingest_into_pack's legacy
     branch (text_as_node=False) now defaults space="evidence", so content
     ingested through it is found by a spaces=["evidence"]-filtered FTS
-    query — no manual metadata seeding involved."""
+    query — no manual metadata seeding involved.
+
+    #74: the legacy branch now runs through write_source's graph leg FIRST,
+    and an unavailable graph makes it write NOTHING at all (graph is the
+    system of record -- see tests/test_issue74_ingest_graph_parity.py's
+    test_graph_unavailable_writes_nothing_at_all). This test is about the
+    doc_sources space tag, not the graph leg, so "neo4j" must be a real,
+    AVAILABLE local graph store -- ``MagicMock(available=False)`` would make
+    the whole ingest a silent no-op and the FTS assertion below would fail
+    for the wrong reason (nothing was ever written), not the one this test
+    exists to catch."""
     from opencrab.mcp.tools import _ingest_into_pack
 
     doc = LocalSQLDocStore(str(tmp_path / "doc.db"))
     if not doc.supports_keyword:
         pytest.skip("FTS5 unavailable in this SQLite build")
 
+    graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
     ctx = {
-        "neo4j": MagicMock(available=False),
+        "neo4j": graph,
         "chroma": MagicMock(available=False),
         "mongo": doc,
         "sql": _registry_owning_pack_a(tmp_path),
@@ -377,13 +388,16 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
-    with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
-        _ingest_into_pack(
-            "pack-a",
-            text="JASO M345 apple oil standard classification",
-            source_id="src-real-ingest",
-            text_as_node=False,
-        )
+    try:
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
+            _ingest_into_pack(
+                "pack-a",
+                text="JASO M345 apple oil standard classification",
+                source_id="src-real-ingest",
+                text_as_node=False,
+            )
+    finally:
+        graph.close()
 
     hits = doc.keyword_search("JASO M345", pack_ids=["pack-a"], spaces=["evidence"], limit=10)
     assert any(h["source_id"] == "src-real-ingest" for h in hits), (
@@ -397,15 +411,21 @@ def test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it(tmp_path):
 
 def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
     """apps/api/main.py's ingest_text passes caller metadata straight
-    through — a caller-set "space" must win over the "evidence" default."""
+    through — a caller-set "space" must win over the "evidence" default.
+
+    #74: same real-graph rationale as
+    ``test_ingest_into_pack_legacy_path_tags_space_and_filter_finds_it``
+    above -- an unavailable graph would make write_source skip the
+    doc_sources write this test's assertions depend on."""
     from opencrab.mcp.tools import _ingest_into_pack
 
     doc = LocalSQLDocStore(str(tmp_path / "doc.db"))
     if not doc.supports_keyword:
         pytest.skip("FTS5 unavailable in this SQLite build")
 
+    graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
     ctx = {
-        "neo4j": MagicMock(available=False),
+        "neo4j": graph,
         "chroma": MagicMock(available=False),
         "mongo": doc,
         "sql": _registry_owning_pack_a(tmp_path),
@@ -415,14 +435,17 @@ def test_ingest_into_pack_legacy_path_respects_caller_supplied_space(tmp_path):
         "hybrid": MagicMock(),
         "billing": MagicMock(),
     }
-    with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
-        _ingest_into_pack(
-            "pack-a",
-            text="JASO M345 banana oil standard classification",
-            source_id="src-custom-space",
-            metadata={"space": "resource"},
-            text_as_node=False,
-        )
+    try:
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx), principal_scope(_INGESTOR):
+            _ingest_into_pack(
+                "pack-a",
+                text="JASO M345 banana oil standard classification",
+                source_id="src-custom-space",
+                metadata={"space": "resource"},
+                text_as_node=False,
+            )
+    finally:
+        graph.close()
 
     assert doc.keyword_search("JASO M345", pack_ids=["pack-a"], spaces=["resource"], limit=10)
     assert doc.keyword_search(

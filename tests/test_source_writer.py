@@ -31,6 +31,16 @@ class _Docs:
     def get_source(self, source_id):  # noqa: ARG002
         return self._existing
 
+    # #74: the graph leg's `OntologyBuilder.add_node` runs the node-level
+    # identity guard against this same `docs` double (its `doc_nodes` row,
+    # NOT `get_source`'s `doc_sources` row). `_check_probes` treats a missing
+    # probe method on an `available` store as CONFLICT_UNVERIFIABLE and fails
+    # closed, so this must exist; returning None (unattributed) keeps every
+    # existing source-identity test's own `get_source`-based scenario the
+    # sole source of a conflict.
+    def get_node_doc(self, space, node_id):  # noqa: ARG002
+        return None
+
 
 class _Hybrid:
     def __init__(self, status="ok (id=s1)"):
@@ -52,6 +62,32 @@ class _Vec:
         return self._row
 
 
+# #74: `write_source` now materialises an evidence/TextUnit graph node before
+# doc/vector, and the graph is the system of record -- a doc/vector-only
+# double is no longer enough, `write_source` raises TypeError without a
+# `graph`. This minimal double gives `_graph_leg` -> `OntologyBuilder.add_node`
+# just the surface it actually calls (`available`, `get_node`,
+# `get_nodes_by_id`, `upsert_node`); it has no `get_node_digest`, so every
+# write here takes the plain-insert path rather than the CAS reclassify one,
+# which is fine since no test in this file re-writes the same source_id
+# through more than one graph state.
+class _Graph:
+    available = True
+
+    def __init__(self):
+        self.nodes: dict[tuple[str, str], dict] = {}
+
+    def get_node(self, node_type, node_id):
+        return self.nodes.get((node_type, node_id))
+
+    def get_nodes_by_id(self, node_id):
+        return [v for (t, i), v in sorted(self.nodes.items()) if i == node_id]
+
+    def upsert_node(self, node_type, node_id, properties, space_id):
+        self.nodes[(node_type, node_id)] = {**properties, "space": space_id}
+        return dict(properties)
+
+
 @pytest.fixture
 def sql(tmp_path):
     """Real registry: alice owns pack-a, bob owns nothing."""
@@ -71,11 +107,12 @@ def sql(tmp_path):
     return store
 
 
-def _write(sql, docs=None, hybrid=None, vector=None, principal=ALICE,
+def _write(sql, docs=None, hybrid=None, vector=None, graph=None, principal=ALICE,
            pack_id="pack-a", **kw):
     with principal_scope(principal):
         return write_source(
             sql, hybrid or _Hybrid(), docs or _Docs(), vector or _Vec(),
+            graph=graph if graph is not None else _Graph(),
             text="t", source_id="s1", pack_id=pack_id, **kw
         )
 
@@ -235,14 +272,20 @@ def test_doc_unavailable_does_not_stop_the_vector_write(sql):
 
 
 def test_pack_id_is_required(sql):
+    """`graph` is ALSO keyword-required now (#74), so it must be supplied here
+    -- otherwise a TypeError for the missing `pack_id` this test targets is
+    indistinguishable from one for the missing `graph` this test does not."""
     with pytest.raises(TypeError), principal_scope(ALICE):
-        write_source(sql, _Hybrid(), _Docs(), _Vec(), text="t", source_id="s1")
+        write_source(
+            sql, _Hybrid(), _Docs(), _Vec(), graph=_Graph(),
+            text="t", source_id="s1",
+        )
 
 
 def test_requires_a_bound_principal(sql):
     with pytest.raises(LookupError):
         write_source(
-            sql, _Hybrid(), _Docs(), _Vec(),
+            sql, _Hybrid(), _Docs(), _Vec(), graph=_Graph(),
             text="t", source_id="s1", pack_id="pack-a",
         )
 

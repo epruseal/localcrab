@@ -103,6 +103,25 @@ def _writable_ctx(pack_id, owner="test-user", **overrides):
     return _base_ctx(**overrides)
 
 
+def _real_local_graph(tmp_path):
+    """A real local graph store, for tests that must exercise ``write_source``'s
+    graph leg (#74) for real rather than fake it.
+
+    A bare ``MagicMock`` here would auto-create a truthy ``available`` and an
+    ``upsert_node``/``get_node``/``get_nodes_by_id`` that never raise, so the
+    graph leg would report ``stores["graph"] = "ok"`` without ever exercising
+    ``add_node``'s real identity-probe/write contract -- silently faking the
+    exact defect #74 closed. Mirrors the ``stack`` fixture in
+    tests/test_issue74_ingest_graph_parity.py."""
+    from opencrab.config import Settings
+    from opencrab.stores.factory import make_graph_store
+
+    settings = Settings(
+        STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path), EMBEDDING_BACKEND="local",
+    )
+    return make_graph_store(settings)
+
+
 # ---------------------------------------------------------------------------
 # content_pack_list
 # ---------------------------------------------------------------------------
@@ -484,7 +503,7 @@ class TestIngestIntoPack:
         assert result["node_errors"] == ["src-1 (evidence/TextUnit): vector store down"]
         assert result["stores"]["evidence_node"] == "error: vector store down"
 
-    def test_error_legacy_path_hybrid_ingest_failure_recorded(self):
+    def test_error_legacy_path_hybrid_ingest_failure_recorded(self, tmp_path):
         """text_as_node=False legacy path (now routed through
         opencrab.pack.source_writer.write_source, #148): an embed failure is
         reported in stores['chromadb'], not propagated. hybrid.ingest() is
@@ -493,7 +512,18 @@ class TestIngestIntoPack:
         (opencrab/ontology/query.py) never raises in production, it always
         returns a stores dict, so write_source (unlike the two independent
         try/excepts this replaced) does not wrap that call in its own
-        try/except."""
+        try/except.
+
+        #74: write_source's graph leg runs FIRST now, through a REAL local
+        graph store (see ``_real_local_graph``) rather than the module's
+        usual MagicMock -- a mock would fake graph success and never
+        exercise the write it must land before the doc/vector legs below
+        are allowed to run at all. The graph leg's own identity probe also
+        reads ``docs.get_node_doc`` (the doc_nodes slot, distinct from this
+        test's doc_sources ``get_source``/``upsert_source``), so the mongo
+        double needs both stubbed or the probe fails closed as
+        "unverifiable" and the whole call raises ValueError before any
+        store is touched."""
         from opencrab.auth import Principal, principal_scope
 
         builder = MagicMock()
@@ -502,26 +532,37 @@ class TestIngestIntoPack:
         mongo = MagicMock()
         mongo.available = True
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
+        mongo.get_node_doc.return_value = None  # #74 graph-leg identity probe
         mongo.upsert_source.return_value = "src-2"
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _writable_ctx(
-                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
-            )
-            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
-                result = _ingest_into_pack(
-                    "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
+        graph = _real_local_graph(tmp_path)
+        try:
+            with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+                mock_ctx.return_value = _writable_ctx(
+                    "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+                    neo4j=graph,
                 )
+                with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                    result = _ingest_into_pack(
+                        "pack-a", text="legacy text", source_id="src-2", text_as_node=False,
+                    )
+        finally:
+            graph.close()
         assert result["stores"]["chromadb"] == "error: embed failed"
         assert result["stores"]["documents"] == "ok (id=src-2)"
         assert result["text_ingested"] is True
 
-    def test_error_legacy_path_mongo_upsert_failure_recorded(self):
+    def test_error_legacy_path_mongo_upsert_failure_recorded(self, tmp_path):
         """text_as_node=False legacy path: mongo.upsert_source() raising is
         caught by write_source and recorded as stores['documents'], not
         propagated. write_source's doc-first contract also means the vector
         write is skipped after a doc-store failure (opencrab/pack/
         source_writer.py: "a vector row pointing at a source that failed to
-        record is an orphan no read path can hydrate")."""
+        record is an orphan no read path can hydrate").
+
+        #74: same real-graph rationale as
+        ``test_error_legacy_path_hybrid_ingest_failure_recorded`` above --
+        the graph leg must land for real before write_source ever reaches
+        the doc_sources write this test exercises."""
         from opencrab.auth import Principal, principal_scope
 
         builder = MagicMock()
@@ -530,25 +571,36 @@ class TestIngestIntoPack:
         mongo = MagicMock()
         mongo.available = True
         mongo.get_source.return_value = None  # #146 P1(a): no conflicting slot
+        mongo.get_node_doc.return_value = None  # #74 graph-leg identity probe
         mongo.upsert_source.side_effect = RuntimeError("mongo down")
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _writable_ctx(
-                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
-            )
-            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
-                result = _ingest_into_pack(
-                    "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
+        graph = _real_local_graph(tmp_path)
+        try:
+            with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+                mock_ctx.return_value = _writable_ctx(
+                    "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+                    neo4j=graph,
                 )
+                with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                    result = _ingest_into_pack(
+                        "pack-a", text="legacy text", source_id="src-3", text_as_node=False,
+                    )
+        finally:
+            graph.close()
         assert result["stores"]["documents"] == "error: mongo down"
 
-    def test_error_legacy_path_both_stores_unavailable_does_not_bill(self):
+    def test_error_legacy_path_both_stores_unavailable_does_not_bill(self, tmp_path):
         """#66 codex re-review (3rd round): the legacy text_as_node=False
-        path bypasses added_nodes/added_edges entirely (it never touches
-        `graph`) — its only success signal is the `stores` dict. Before this
-        fix, "unavailable" wasn't treated as a failure there (it only fails
-        the "graph" store, and this path never sets that key), so a legacy
-        ingest where BOTH the vector store and the doc store are unavailable
-        — nothing written anywhere — still fired on_ingest. Pin: it must not."""
+        path's billing signal is pinned to ``documents``/``chromadb`` alone
+        (#74: NOT a keyless "any store ok", now that the graph leg merges
+        `graph`/`docs`/`sql` into the same map -- see the "money gates do
+        not get to change" comment in opencrab/mcp/tools/pack.py). Before
+        this fix, "unavailable" wasn't treated as a failure there (it only
+        fails the "graph" store, and this path never used to set that key),
+        so a legacy ingest where BOTH the vector store and the doc_sources
+        store are unavailable still fired on_ingest. Pin: it must not --
+        even though, with #74's graph leg now real, the source's TextUnit
+        node itself DOES land (``stores["graph"] == "ok"``); that graph
+        write alone must not be enough to bill this branch."""
         from opencrab.auth import Principal, principal_scope
 
         builder = MagicMock()
@@ -557,18 +609,30 @@ class TestIngestIntoPack:
         hybrid.ingest.return_value = {"stores": {"chromadb": "unavailable"}}
         mongo = MagicMock()
         mongo.available = False  # -> stores["documents"] = "unavailable"
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _writable_ctx(
-                "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
-                billing=billing,
-            )
-            with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
-                result = _ingest_into_pack(
-                    "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+        graph = _real_local_graph(tmp_path)
+        try:
+            with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+                mock_ctx.return_value = _writable_ctx(
+                    "pack-a", owner="u1", builder=builder, hybrid=hybrid, mongo=mongo,
+                    billing=billing, neo4j=graph,
                 )
-        assert result["stores"] == {"chromadb": "unavailable", "documents": "unavailable"}
+                with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
+                    result = _ingest_into_pack(
+                        "pack-a", text="legacy text", source_id="src-4", text_as_node=False,
+                    )
+        finally:
+            graph.close()
+        # #74: `graph`/`docs`/`sql` now come from the graph leg's real
+        # TextUnit node write (docs="unavailable" because mongo.available is
+        # False here -- the SAME mongo the graph leg's doc_nodes write also
+        # sees). `chromadb`/`documents` are the two this test is actually
+        # about and are still an exact, not a partial, comparison.
+        assert result["stores"] == {
+            "graph": "ok", "docs": "unavailable", "sql": "ok",
+            "chromadb": "unavailable", "documents": "unavailable",
+        }
         assert result["text_ingested"] is True  # the attempt was made
-        billing.on_ingest.assert_not_called()  # but nothing actually landed
+        billing.on_ingest.assert_not_called()  # but nothing billable landed
 
     def test_normal_legacy_path_vector_only_success_still_bills(self):
         """Positive-confirmation counterpart: chromadb comes back its REAL

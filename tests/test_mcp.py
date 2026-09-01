@@ -673,55 +673,88 @@ class TestToolDispatch:
             # hybrid.ingest must NOT have been called (text_as_node=True skips vector-only path)
             hybrid.ingest.assert_not_called()
 
-    def test_pack_ingest_text_as_node_false_legacy(self):
-        """pack_ingest with text_as_node=False uses legacy vector-only path."""
+    def test_pack_ingest_text_as_node_false_legacy(self, tmp_path):
+        """pack_ingest with text_as_node=False uses the legacy vector+doc path.
+
+        #74: this legacy path now also runs write_source's graph leg
+        (materialising an evidence/TextUnit node), so "neo4j" must be a REAL,
+        available local graph store here, not a MagicMock. A MagicMock's
+        ``get_node``/``get_nodes_by_id`` answer with an unconfigured
+        MagicMock rather than None/[], which write_gate's identity probe
+        reads as "cannot verify" and fails the whole call closed with a
+        ValueError before anything is written -- that used to make this
+        test's ``status`` come back "partial" once #74 landed. And even
+        once stubbed to answer None/[], a MagicMock's ``upsert_node`` would
+        still fake an "ok" graph write with no real store behind it -- the
+        exact class of false-positive #74 exists to close.
+
+        The old ``builder.add_node.assert_not_called()`` assertion is
+        retired: it checked ``ctx["builder"]`` (this test's own outer
+        MagicMock), but write_source's graph leg builds its OWN
+        ``OntologyBuilder(graph, docs, sql, vec=vector)`` internally
+        (opencrab/pack/source_writer.py's ``_graph_leg``) -- ``ctx["builder"]``
+        was never going to be called either way, so the assertion was inert
+        and would keep passing even if the legacy branch silently stopped
+        writing a node at all. In its place: read the real graph store to
+        confirm the legacy branch DOES now materialise the TextUnit node
+        (#74's whole point), while still confirming hybrid.ingest (the
+        vector leg) ran, exactly as before.
+        """
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.pack.ownership import create_pack as _register_pack
+        from opencrab.stores.local_graph_store import LocalGraphStore
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
         _register_pack(sql, "test-user", "test-pack")
 
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            builder = MagicMock()
-            hybrid = MagicMock()
-            hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
-            hybrid.invalidate_bm25_cache = MagicMock()
-            mongo = MagicMock()
-            mongo.available = False
-            graph = MagicMock()
-            graph.available = True
-            # #148: the legacy text path now runs write_source's identity
-            # guard, which probes vector.get_by_id(source_id) -- an
-            # unconfigured MagicMock would answer with another MagicMock
-            # (not None), which is unrecognised and fails closed
-            # ("cannot verify"). Explicit None means the slot is empty.
-            chroma = MagicMock()
-            chroma.available = True
-            chroma.get_by_id.return_value = None
-            mock_ctx.return_value = {
-                "neo4j": graph,
-                "sql": sql,
-                "builder": builder,
-                "hybrid": hybrid,
-                "mongo": mongo,
-                "chroma": chroma,
-                "rebac": MagicMock(),
-                "impact": MagicMock(),
-                "billing": MagicMock(),
-            }
+        graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+        try:
+            with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+                builder = MagicMock()
+                hybrid = MagicMock()
+                hybrid.ingest.return_value = {"stores": {"chromadb": "ok"}}
+                hybrid.invalidate_bm25_cache = MagicMock()
+                mongo = MagicMock()
+                mongo.available = False
+                # #148: the legacy text path now runs write_source's identity
+                # guard, which probes vector.get_by_id(source_id) -- an
+                # unconfigured MagicMock would answer with another MagicMock
+                # (not None), which is unrecognised and fails closed
+                # ("cannot verify"). Explicit None means the slot is empty.
+                chroma = MagicMock()
+                chroma.available = True
+                chroma.get_by_id.return_value = None
+                mock_ctx.return_value = {
+                    "neo4j": graph,
+                    "sql": sql,
+                    "builder": builder,
+                    "hybrid": hybrid,
+                    "mongo": mongo,
+                    "chroma": chroma,
+                    "rebac": MagicMock(),
+                    "impact": MagicMock(),
+                    "billing": MagicMock(),
+                }
 
-            result = dispatch_tool("pack_ingest", {
-                "pack_id": "test-pack",
-                "text": "레거시 벡터 경로 테스트.",
-                "text_as_node": False,
-            })
-
+                result = dispatch_tool("pack_ingest", {
+                    "pack_id": "test-pack",
+                    "text": "레거시 벡터 경로 테스트.",
+                    "text_as_node": False,
+                })
+            # #74: the legacy branch now reports a real evidence_node once the
+            # graph leg lands cleanly (see pack.py's _ingest_into_pack), so
+            # this is no longer None -- it is the auto-generated source_id.
             assert result["status"] == "ok"
-            assert result["evidence_node"] is None
-            # legacy path: hybrid.ingest called, builder.add_node NOT called for text
+            assert result["evidence_node"] is not None
+            node = graph.get_node("TextUnit", result["evidence_node"])
+            assert node is not None, "legacy path must materialise the evidence/TextUnit node (#74)"
+            assert node["text"] == "레거시 벡터 경로 테스트."
+            assert node["pack_id"] == "test-pack"
+            # legacy path: hybrid.ingest (the vector leg) still ran once
             hybrid.ingest.assert_called_once()
-            builder.add_node.assert_not_called()
+        finally:
+            graph.close()
 
 
     def test_ontology_get_node_found(self):

@@ -1042,6 +1042,7 @@ def test_t68_chroma_uri_bearing_record_survives_raw_copy(stack, monkeypatch):
     with principal_scope(ALICE):
         write_source(
             stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+            graph=stack["graph"],
             text="legacy uri-bearing source", source_id="s-t68", pack_id=src,
             write_vector=False,
         )
