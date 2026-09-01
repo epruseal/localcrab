@@ -61,7 +61,12 @@ def _valid_manifest(**overrides) -> dict:
 
 
 def _valid_mcp_obj(**overrides) -> dict:
-    """§4 정본 mcp.json 과 동형인 최소 유효 설정."""
+    """§4 정본 mcp.json 과 동형인 최소 유효 설정.
+
+    이슈 #245(design-v13 §4 항목 4): 정본 env 는 4키다 --
+    OPENCRAB_BOOTSTRAP_ON_EMPTY 가 추가돼 최초 기동 시 빈 데이터 루트를
+    자동 부트스트랩하는 opt-in 을 켠다.
+    """
     obj = {
         "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
         "mcpServers": {
@@ -74,6 +79,7 @@ def _valid_mcp_obj(**overrides) -> dict:
                     "STORAGE_MODE": "local",
                     "LOCAL_DATA_DIR": "${PLUGIN_DATA}",
                     "LOCALCRAB_ENV_FILE": "${PLUGIN_DATA}/localcrab.env",
+                    "OPENCRAB_BOOTSTRAP_ON_EMPTY": "1",
                 },
             }
         },
@@ -1027,6 +1033,42 @@ class TestEnvContractSync:
     def test_config_alias_localcrab_env_file_captured(self):
         discovered, _unresolved = scan_env_contract()
         assert "LOCALCRAB_ENV_FILE" in discovered
+
+
+class TestBootstrapOnEmptyPackagingContract:
+    """이슈 #245(design-v13 §4 항목 4~6): OPENCRAB_BOOTSTRAP_ON_EMPTY 4번째 env 키의
+    패키징·계약 고정.
+
+    TDD RED: 구현 전이라 아래 세 테스트 모두 실패하는 것이 이 시점의 올바른 결과다 --
+    - 실 src/mcp.json 에 아직 4번째 키가 없다(design 항목 4 미반영).
+    - tools/env_contract.py 의 ENV_CONTRACT 에 아직 이름이 등록되지 않았다(design 항목 5).
+    구현이 들어오면 이 클래스가 green 이 되는 것으로 완료를 판정한다.
+    """
+
+    def test_real_mcp_json_has_bootstrap_on_empty_key_value_one(self):
+        # design 항목 4: env 에 정확히 값 "1" 로 존재해야 한다(malformed 값은 기동 거부 대상,
+        # 정본 산출물 자체는 항상 유효한 "1" 이어야 한다).
+        obj = json.loads((SRC_DIR / "mcp.json").read_text(encoding="utf-8"))
+        env = obj["mcpServers"]["localcrab"]["env"]
+        assert env.get("OPENCRAB_BOOTSTRAP_ON_EMPTY") == "1"
+
+    def test_bootstrap_on_empty_value_survives_subprocess_env_synthesis(self):
+        # design 항목 6: refclient.build_subprocess_env 로 placeholder 확장(§9.2)을 거친
+        # 뒤에도 "1" 이 그대로 보존돼야 한다 -- 이 값은 placeholder 를 담지 않으므로 확장은
+        # 항등이어야 하고, 합성 파이프라인이 값을 누락·변형하지 않음을 실 mcp.json 기준으로
+        # 고정한다.
+        obj = json.loads((SRC_DIR / "mcp.json").read_text(encoding="utf-8"))
+        server_env = obj["mcpServers"]["localcrab"]["env"]
+        full_env = rc.build_subprocess_env(
+            server_env, "/plugin/root", "/plugin/data", {"PATH": "/usr/bin"}
+        )
+        assert full_env["OPENCRAB_BOOTSTRAP_ON_EMPTY"] == "1"
+
+    def test_env_contract_registers_bootstrap_on_empty(self):
+        # design 항목 5: tools/env_contract.py 의 ENV_CONTRACT 에 이름이 등록돼 있어야
+        # AST 동기화 가드(TestEnvContractSync)가 opencrab/auth.py 구현 이후에도 green 을
+        # 유지한다. 이 테스트는 그 동기화 가드와 무관하게 등록 사실 자체를 직접 고정한다.
+        assert "OPENCRAB_BOOTSTRAP_ON_EMPTY" in env_contract.ENV_CONTRACT
 
 
 # ---------------------------------------------------------------------------

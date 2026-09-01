@@ -254,18 +254,29 @@ def issue_token(sql: Any, user_id: str, name: str | None = None) -> tuple[str, s
 
 
 def bootstrap_local_user(
-    sql: Any, *, display_name: str = "local", token_name: str | None = "bootstrap"
-) -> tuple[str, str]:
-    """Create the local user, its default pack, and issue its first token,
-    all in ONE transaction. Returns ``(user_id, secret)``.
+    sql: Any,
+    *,
+    display_name: str = "local",
+    token_name: str | None = "bootstrap",
+    issue_token: bool = True,
+) -> tuple[str, str | None]:
+    """Create the local user, its default pack, and (by default) issue its
+    first token, all in ONE transaction. Returns ``(user_id, secret)`` --
+    *secret* is ``None`` when ``issue_token=False``.
 
-    Used only by ``opencrab init``'s bootstrap path (see cli.py's
-    ``_bootstrap_local_user``): ``create_user`` + ``issue_token`` run as two
-    separate transactions, so a crash between them could leave a local user
-    with no token that could ever verify -- and since ``idx_users_single_local``
-    caps ``is_local=1`` at one row, that user could never be recreated either.
-    Wrapping every insert in a single ``begin()`` means a failure of any one
-    rolls back all of them, leaving no partial state.
+    Used by ``opencrab init``'s bootstrap path (see cli.py's
+    ``_bootstrap_local_user``, default ``issue_token=True``) and by the #245
+    stdio auto-bootstrap path (``bootstrap_local_user_idempotent``, called
+    with ``issue_token=False`` -- stdio's trust boundary is the OS process,
+    so no token is ever readable, and issuing one would leave an unusable
+    secret's hash in the DB, see design #245 §3.3).
+
+    ``create_user`` + ``issue_token`` run as two separate transactions, so a
+    crash between them could leave a local user with no token that could
+    ever verify -- and since ``idx_users_single_local`` caps ``is_local=1``
+    at one row, that user could never be recreated either. Wrapping every
+    insert in a single ``begin()`` means a failure of any one rolls back all
+    of them, leaving no partial state.
 
     #148: the default-pack insert is here (not a call to ``create_user``,
     which would open its own transaction) for the same all-or-nothing reason
@@ -277,8 +288,7 @@ def bootstrap_local_user(
     from opencrab.pack.ownership import ensure_default_pack
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
-    secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
-    token_id = f"tok_{uuid.uuid4().hex[:12]}"
+    secret: str | None = None
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -288,18 +298,21 @@ def bootstrap_local_user(
             {"user_id": user_id, "display_name": display_name, "is_local": True},
         )
         ensure_default_pack(sql, user_id, conn=conn)
-        conn.execute(
-            text(
-                "INSERT INTO api_tokens (token_id, user_id, token_hash, name) "
-                "VALUES (:token_id, :user_id, :token_hash, :name)"
-            ),
-            {
-                "token_id": token_id,
-                "user_id": user_id,
-                "token_hash": hash_token(secret),
-                "name": token_name,
-            },
-        )
+        if issue_token:
+            secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
+            token_id = f"tok_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                text(
+                    "INSERT INTO api_tokens (token_id, user_id, token_hash, name) "
+                    "VALUES (:token_id, :user_id, :token_hash, :name)"
+                ),
+                {
+                    "token_id": token_id,
+                    "user_id": user_id,
+                    "token_hash": hash_token(secret),
+                    "name": token_name,
+                },
+            )
     return user_id, secret
 
 
@@ -464,7 +477,11 @@ def require_local_principal() -> Principal:
     settings = get_settings()
     not_bootstrapped = RuntimeError(
         "No local user is bootstrapped. Run 'opencrab init' first -- it "
-        "creates the local user and issues its first token."
+        "creates the local user and issues its first token. (Looked for a "
+        f"local user under {settings.local_data_dir!r}. If this process is "
+        "a stdio MCP server with an explicit LOCAL_DATA_DIR, set "
+        "OPENCRAB_BOOTSTRAP_ON_EMPTY=1 to bootstrap it automatically "
+        "instead of running 'opencrab init' by hand -- see #245.)"
     )
 
     if settings.is_local:
@@ -525,3 +542,286 @@ def _looks_like_missing_table(exc: Exception) -> bool:
     if "users" not in text:
         return False
     return "no such table" in text or "does not exist" in text or "undefined table" in text
+
+
+# ---------------------------------------------------------------------------
+# Opt-in stdio auto-bootstrap (#245)
+#
+# Off by default -- see require_local_principal's docstring for why the
+# default path CREATES NOTHING. This section exists only to let an Agent
+# Plugin's stdio launch (mcp.json already pins LOCAL_DATA_DIR explicitly)
+# skip the manual `opencrab init` step, gated behind an opt-in env var and a
+# stack of layered checks (design #245 v13 §3.1-§3.2) so it can never turn
+# into the 2026-07-07 incident's shape: a missing/blank config silently
+# falling back to a built-in default path and serving an empty store.
+# ---------------------------------------------------------------------------
+
+_NOT_FOUND = object()  # sentinel: no local user yet, caller should proceed
+
+
+def bootstrap_on_empty_requested() -> bool:
+    """G1: parse ``OPENCRAB_BOOTSTRAP_ON_EMPTY``.
+
+    unset / "" / "0" -> False (off, current pre-#245 behaviour, unchanged).
+    "1" -> True. Anything else is a loud RuntimeError -- a mistyped value
+    (``"true"``, ``"yes"``, a stray leading space) must not be silently
+    treated as off, the way ``MCP_PROTOCOL_VERSIONS``-style flags are parsed
+    elsewhere in this codebase.
+    """
+    raw = os.environ.get("OPENCRAB_BOOTSTRAP_ON_EMPTY")
+    if raw is None or raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    raise RuntimeError(
+        "OPENCRAB_BOOTSTRAP_ON_EMPTY must be unset, \"\", \"0\", or \"1\" -- "
+        f"got {raw!r}."
+    )
+
+
+def _probe_local_user(sql: Any) -> Principal | None:
+    """``get_local_user``, but a missing ``users`` table reads as "no user
+    yet" (the store exists but was never bootstrapped, or a prior bootstrap
+    crashed before DDL landed) instead of propagating -- the same exception
+    ``require_local_principal`` tolerates for the same reason."""
+    try:
+        return get_local_user(sql)
+    except Exception as exc:  # noqa: BLE001
+        if _looks_like_missing_table(exc):
+            return None
+        raise
+
+
+def _close_store(sql: Any) -> None:
+    """Best-effort close, mirroring the ``getattr(..., "close", None)``
+    idiom cli.py's ``serve`` command already uses for its startup stores --
+    ``SQLStore`` has no ``close()`` today, so this is currently a no-op, but
+    stays defensive against a future one the way that call site already is.
+    """
+    close = getattr(sql, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _discover_local_user(sql: Any) -> Any:
+    """One no-create-DDL discovery attempt against an already-open store.
+
+    Returns a ``Principal`` for an enabled local user; ``None`` if the store
+    failed to open or the found user is disabled (both must delegate to
+    ``require_local_principal``'s authoritative diagnostics rather than
+    bootstrap proceeding); or the ``_NOT_FOUND`` sentinel if nothing exists
+    yet and the caller should proceed toward the locked creation stage.
+    """
+    if not getattr(sql, "available", False):
+        return None
+    principal = _probe_local_user(sql)
+    if principal is None:
+        return _NOT_FOUND
+    return principal if not principal.disabled else None
+
+
+def bootstrap_local_user_idempotent(
+    sql: Any, *, issue_token: bool = True
+) -> tuple[str, str | None, bool]:
+    """Create the local user if one doesn't exist yet, converging concurrent
+    creators onto a single row. Returns ``(user_id, secret, created)`` --
+    *secret* is ``None`` whenever no token was issued (``issue_token=False``,
+    or a concurrent creator won the race), and *created* is True only for
+    the caller that actually inserted the row.
+
+    Extracted from cli.py's ``_bootstrap_local_user`` (#144) so both it and
+    the #245 stdio auto-bootstrap path (``maybe_bootstrap_on_empty``, which
+    also holds ``bootstrap.lock`` around this call) share one IntegrityError
+    convergence rule instead of two copies drifting apart. The lock makes
+    the race this handles rare in the stdio path, but callers such as
+    ``opencrab init`` against PostgreSQL invoke this with no lock held at
+    all, so the convergence logic must stand on its own.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    existing = get_local_user(sql)
+    if existing is not None:
+        return existing.user_id, None, False
+
+    try:
+        user_id, secret = bootstrap_local_user(sql, issue_token=issue_token)
+    except IntegrityError as exc:
+        # Dialects report this differently: PostgreSQL names the index
+        # ("idx_users_single_local"), SQLite names the column instead
+        # ("users.is_local", confirmed by direct reproduction) -- match
+        # either. Any other IntegrityError is a real failure and must
+        # propagate.
+        orig = str(exc.orig)
+        if "idx_users_single_local" not in orig and "users.is_local" not in orig:
+            raise
+        winner = get_local_user(sql)
+        if winner is None:
+            raise RuntimeError(
+                "Local user bootstrap race detected, but no local user "
+                "exists afterward -- something else is wrong."
+            ) from exc
+        return winner.user_id, None, False
+
+    return user_id, secret, True
+
+
+def maybe_bootstrap_on_empty() -> Principal | None:
+    """Opt-in auto-bootstrap for the two stdio entry points (design #245
+    v13). Returns a ``Principal`` when a local user is found or created,
+    ``None`` when the opt-in is off or the fast path must delegate to
+    ``require_local_principal`` for its authoritative diagnostic -- callers
+    wire this as ``principal = maybe_bootstrap_on_empty() or
+    require_local_principal()``.
+
+    G1-G4 (§3.1) gate every side effect: opt-in must be exactly "1"
+    (``bootstrap_on_empty_requested``), storage mode must be exactly
+    "local" (narrower than ``settings.is_local``, which also allows
+    "kuzu" -- the plugin contract only ever pins a local sqlite store),
+    ``LOCAL_DATA_DIR`` must be explicitly set and non-blank, must not
+    contain "?" (sqlalchemy's sqlite URL parsing truncates there, splitting
+    the checked/locked path from the connected one), and must already
+    exist as a directory (this function never creates one -- PLUGIN_DATA's
+    existence is the client's contract).
+
+    Step 0 (§3.2): before ever taking the lock, mirror
+    ``require_local_principal``'s own no-create precaution (the same
+    ``is_file()`` precheck, since even ``create_tables=False`` still
+    connects and thus creates a missing SQLite file as a side effect) so a
+    pristine directory causes zero filesystem writes when nothing needs
+    bootstrapping, and a lock-acquisition failure afterward truly leaves
+    the directory untouched. An already-bootstrapped enabled user returns
+    its ``Principal`` directly here with the same one-store/one-query cost
+    as calling ``require_local_principal`` alone.
+    """
+    if not bootstrap_on_empty_requested():
+        return None
+
+    import sys
+    from contextlib import ExitStack
+    from pathlib import Path
+
+    from opencrab.config import get_settings
+    from opencrab.locking import file_lock
+    from opencrab.stores.sql_store import SQLStore
+
+    settings = get_settings()
+
+    # G2: exactly "local" -- narrower than settings.is_local (also true for
+    # "kuzu"), since the plugin contract pins a local sqlite store only.
+    if settings.storage_mode != "local":
+        raise RuntimeError(
+            "OPENCRAB_BOOTSTRAP_ON_EMPTY requires STORAGE_MODE=local -- got "
+            f"{settings.storage_mode!r}. Automatic bootstrap only targets "
+            "the plugin's own local SQLite store."
+        )
+
+    # G3: LOCAL_DATA_DIR must be an explicit, non-blank, '?'-free source.
+    if "local_data_dir" not in settings.model_fields_set:
+        raise RuntimeError(
+            "OPENCRAB_BOOTSTRAP_ON_EMPTY requires LOCAL_DATA_DIR to be set "
+            "explicitly -- refusing to auto-bootstrap into a built-in "
+            "default path. Run 'opencrab init' or set LOCAL_DATA_DIR."
+        )
+    data_dir = settings.local_data_dir
+    if not data_dir.strip():
+        raise RuntimeError(
+            "OPENCRAB_BOOTSTRAP_ON_EMPTY requires a non-blank LOCAL_DATA_DIR."
+        )
+    if "?" in data_dir:
+        raise RuntimeError(
+            f"LOCAL_DATA_DIR ({data_dir!r}) contains '?', which SQLAlchemy's "
+            "sqlite URL parsing truncates at -- refusing to auto-bootstrap "
+            "into an ambiguous path."
+        )
+
+    # G4: the directory itself must already exist -- never created here.
+    if not Path(data_dir).is_dir():
+        raise RuntimeError(
+            f"LOCAL_DATA_DIR ({data_dir}) does not exist. Automatic "
+            "bootstrap never creates directories, only the database inside "
+            "one that already exists."
+        )
+
+    db_path = Path(data_dir, "opencrab.db")
+
+    # Step 0: no-create, no-lock fast path.
+    if db_path.is_file():
+        sql = SQLStore(settings.sqlite_url, create_tables=False)
+        try:
+            outcome = _discover_local_user(sql)
+        finally:
+            _close_store(sql)
+        if outcome is not _NOT_FOUND:
+            return outcome  # Principal, or None to delegate.
+
+    with ExitStack() as stack:
+        # Step 1: acquire the cross-process creation lock. Only ACQUISITION
+        # failures convert to RuntimeError -- a body failure (the `try`
+        # covers just `enter_context`) must propagate unconverted, or a real
+        # bug inside the critical section gets misdiagnosed as "couldn't get
+        # the lock".
+        try:
+            stack.enter_context(file_lock("bootstrap.lock", data_dir=data_dir, timeout=30))
+        except (TimeoutError, OSError) as exc:
+            raise RuntimeError(
+                "Could not acquire the automatic-bootstrap lock "
+                f"(bootstrap.lock) under {data_dir} within 30s -- another "
+                "process may be holding it, or the lock file could not be "
+                "opened."
+            ) from exc
+
+        # Step 2: recheck immediately inside the lock -- another process may
+        # have finished bootstrapping while this one waited.
+        probe_sql = SQLStore(settings.sqlite_url, create_tables=False)
+        try:
+            outcome = _discover_local_user(probe_sql)
+        finally:
+            _close_store(probe_sql)
+        if outcome is not _NOT_FOUND:
+            return outcome
+
+        # Step 3: open with DDL (CREATE IF NOT EXISTS is idempotent) and
+        # recheck once more before creating anything.
+        sql = SQLStore(settings.sqlite_url, create_tables=True)
+        try:
+            if not getattr(sql, "available", False):
+                raise RuntimeError(
+                    "Automatic bootstrap could not open the SQL store at "
+                    f"{data_dir} after creating tables -- this is a "
+                    "store-open failure, not a missing 'opencrab init'."
+                )
+
+            principal = _probe_local_user(sql)
+            if principal is not None:
+                return principal if not principal.disabled else None
+
+            # Step 4: create -- no token, stdio's trust boundary is the
+            # process (#145, design #245 §3.3).
+            user_id, _secret, created = bootstrap_local_user_idempotent(
+                sql, issue_token=False
+            )
+
+            # Step 5: stderr-only creation notice, gated on created=True --
+            # a helper that converged onto a concurrent creator's row
+            # (created=False) must print nothing new.
+            if created:
+                print(
+                    f"opencrab: auto-bootstrapped local user {user_id} at "
+                    f"{data_dir}",
+                    file=sys.stderr,
+                )
+
+            # Step 6: final recheck through the same enabled test as every
+            # other discovery branch -- an external process could have
+            # disabled the just-created user between the helper's commit and
+            # this query, and a truthy Principal here would let it slip past
+            # require_local_principal's authoritative disabled check.
+            final = _probe_local_user(sql)
+            if final is None:
+                return None
+            return final if not final.disabled else None
+        finally:
+            _close_store(sql)

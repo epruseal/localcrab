@@ -173,3 +173,67 @@ class TestAgentPluginSmoke:
         # 6. 전후 plugin root 트리 해시 불변 -- 패키지 자체는 건드리지 않았다 [R4]
         after_hash = _tree_hash(plugin_root)
         assert after_hash == before_hash
+
+    def test_auto_bootstrap_stdio_serve_without_manual_init(self, built_plugin, tmp_path):
+        """이슈 #245 받아들임 기준 1(design-v13 §5-1) 고정: 빈 PLUGIN_DATA + mcp.json env
+        그대로의 최초 stdio 기동이 `opencrab init` 프로비저닝 단계 없이 성립해야 한다.
+
+        위 test_reference_client_end_to_end 와 달리 4단계(`opencrab init` 서브프로세스
+        호출)를 생략하고 곧장 serve 를 기동한다 -- mcp.json 의 네 번째 env 키
+        OPENCRAB_BOOTSTRAP_ON_EMPTY(placeholder 확장값 그대로, design-v13 §4 항목 4)가
+        빈 데이터 루트에서 자동 부트스트랩을 트리거함을 검증한다. initialize → tools/list
+        왕복 성립, `<PLUGIN_DATA>/opencrab.db` 생성, plugin root 트리 해시 불변을 확인한다.
+
+        TDD RED: opencrab serve stdio 는 아직 OPENCRAB_BOOTSTRAP_ON_EMPTY 를 보고 빈
+        데이터 루트를 자동 부트스트랩하지 않는다 -- require_local_principal() 이 즉시
+        거부해 exit 1 하므로(opencrab/cli.py) initialize 응답 전에 stdout 이 닫혀
+        JsonRpcStdioClient.request 가 RuntimeError 를 낸다. 구현이 들어오면 이 테스트가
+        green 이 되는 것으로 완료를 판정한다.
+        """
+        plugin_root = built_plugin
+        before_hash = _tree_hash(plugin_root)
+
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+
+        loaded = rc.load_plugin(plugin_root, plugin_data, implemented_namespaces=frozenset())
+        server_cfg = loaded.servers["localcrab"]
+
+        bin_dir = _resolve_bin_dir()
+        opencrab_path = bin_dir / "opencrab"
+        assert opencrab_path.is_file(), f"{opencrab_path} 가 존재하지 않는다"
+        base_env = {"PATH": str(bin_dir), "HOME": str(home_dir)}  # sanitize: PATH·HOME 만 [R3]
+
+        resolved_command = rc.resolve_command(server_cfg["command"], base_env["PATH"])
+        assert resolved_command is not None
+
+        expanded_cwd = v.expand_placeholders(server_cfg["cwd"], str(plugin_root), str(plugin_data))
+        full_env = rc.build_subprocess_env(
+            server_cfg.get("env", {}), str(plugin_root), str(plugin_data), base_env
+        )
+
+        db_path = plugin_data / "opencrab.db"
+        assert not db_path.exists(), (
+            "선행조건 위반: init 생략 시나리오는 완전히 빈 PLUGIN_DATA 에서 시작해야 한다"
+        )
+
+        # init 생략 -- mcp.json env(placeholder 확장값) 그대로 곧장 stdio serve 를 기동한다.
+        client = rc.JsonRpcStdioClient(
+            cmd=[resolved_command, "serve"], env=full_env, cwd=expanded_cwd
+        )
+        try:
+            init_response = client.request("initialize", {"protocolVersion": PROTOCOL_VERSION})
+            assert init_response["result"]["protocolVersion"] == PROTOCOL_VERSION
+
+            tools_response = client.request("tools/list", {})
+            tool_names = [tool["name"] for tool in tools_response["result"]["tools"]]
+            assert "ontology_manifest" in tool_names
+        finally:
+            client.close()
+
+        assert db_path.is_file(), "자동 부트스트랩이 opencrab.db 를 생성하지 않았다"
+
+        after_hash = _tree_hash(plugin_root)
+        assert after_hash == before_hash

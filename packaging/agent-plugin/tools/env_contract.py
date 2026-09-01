@@ -15,6 +15,7 @@ tests/ 의 AST 기반 동기화 가드가 opencrab/+apps/ 를 재스캔해 이 �
     (구현은 tests/test_agent_plugin_packaging.py 의 env 동기화 가드를 참조)
 
 분류 어휘: "설정 소스 선택" | "외부 전송 결정" | "상태 위치" | "기동 거부" | "튜너블"
+| "상태 생성 opt-in"
 (+ ", serve 비도달" 접미 -- opencrab serve 가 실제로 띄우는 stdio MCP 서버
 프로세스의 코드 경로(opencrab/mcp/**)가 임포트하지 않는 모듈에서만 읽히는
 이름. apps/ 의 FastAPI 전용 이름, opencrab/pack/build.py·jsonl_io.py 처럼
@@ -77,6 +78,11 @@ ENV_CONTRACT: dict[str, str] = {
     # 실행 경로(opencrab/mcp/**)는 이 커맨드 함수를 호출하지 않는다.
     "ANTHROPIC_API_KEY": "외부 전송 결정, serve 비도달",
     "LOCALCRAB_ENV_FILE": "설정 소스 선택",
+    # #245: stdio 최초 기동 자동 부트스트랩 opt-in (opencrab/auth.py 가
+    # os.environ.get 리터럴로 읽는다). "1" 이면 빈 데이터 루트에서 로컬 유저와
+    # 빈 스토어를 생성하고, "1"/"0"/빈 값 외의 malformed 값은 기동을 거부한다.
+    # 스토어 생성 여부(상태 생성)를 좌우하므로 전용 분류를 둔다.
+    "OPENCRAB_BOOTSTRAP_ON_EMPTY": "상태 생성 opt-in",
     "PORT": "튜너블, serve 비도달",
     "OPENCRAB_TIER": "설정 소스 선택, serve 비도달",
     "OPENCRAB_CORS_ORIGINS": "튜너블, serve 비도달",

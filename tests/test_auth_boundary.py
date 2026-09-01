@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -190,6 +191,29 @@ def _run_module(env_dir, extra_env=None):
     e.update(extra_env or {})
     return subprocess.run(
         [sys.executable, "-m", "opencrab.mcp.server"],
+        cwd=REPO_ROOT, env=e, input="", capture_output=True, text=True, timeout=90,
+    )
+
+
+def _opencrab_bin() -> Path:
+    """The installed console script, resolved the way issue #245 design v13's
+    item 13 requires: next to the current interpreter, not via PATH lookup
+    (``shutil.which``) -- this must find the venv's own script even when the
+    test runner's PATH points elsewhere."""
+    return Path(sys.executable).parent / "opencrab"
+
+
+def _run_serve_stdio(env_dir, extra_env=None):
+    """Run ``opencrab serve --transport stdio`` as a real console-script
+    subprocess, mirroring ``_run_module`` for the sibling stdio entry point.
+    """
+    e = {**os.environ, "LOCAL_DATA_DIR": str(env_dir), "STORAGE_MODE": "local",
+         "PYTHONDONTWRITEBYTECODE": "1"}
+    for name in ("OPENCRAB_API_KEY", "LOCALCRAB_MCP_TOKEN", "LOCALCRAB_MCP_TOKEN_FILE"):
+        e.pop(name, None)
+    e.update(extra_env or {})
+    return subprocess.run(
+        [str(_opencrab_bin()), "serve", "--transport", "stdio"],
         cwd=REPO_ROOT, env=e, input="", capture_output=True, text=True, timeout=90,
     )
 
@@ -639,3 +663,955 @@ class TestReservedIdentityKeysInPayloads:
             with pytest.raises(ForbiddenArgumentError, match="reserved identity key"):
                 dispatch_tool(tool, arguments)
         assert sorted(os.listdir(env)) == before
+
+
+# ---------------------------------------------------------------------------
+# Issue #245 -- automatic stdio bootstrap on an empty, explicit LOCAL_DATA_DIR
+# (design v13, /home/asdf/orch-scratch/o245/design-v13.md).
+#
+# TDD RED: opencrab.auth.maybe_bootstrap_on_empty, bootstrap_on_empty_requested,
+# bootstrap_local_user_idempotent, and bootstrap_local_user(issue_token=...) do
+# not exist yet. Every test below either imports one of them directly (fails
+# with ImportError/AttributeError) or drives the two stdio entry points
+# end-to-end (fails because the unwired entry points still behave like
+# current main -- unconditional refusal). Both failure shapes are correct RED
+# for this stage; each docstring names the design's acceptance-criteria (AC)
+# item it will pin once green.
+# ---------------------------------------------------------------------------
+
+
+class TestAutoBootstrapHappyPath:
+    def test_python_dash_m_bootstraps_empty_dir(self, env):
+        """AC1: opt-in + explicit LOCAL_DATA_DIR + empty real dir -> `python -m`
+        exits 0 on EOF, creates opencrab.db, one local user, zero tokens (F6),
+        a stderr bootstrap notice, and no stdout output at all."""
+        assert sorted(os.listdir(env)) == []
+        p = _run_module(env, {"OPENCRAB_BOOTSTRAP_ON_EMPTY": "1"})
+        assert p.returncode == 0, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+        assert p.stdout == ""
+        assert "bootstrap" in p.stderr.lower()
+
+        db_path = Path(env) / "opencrab.db"
+        assert db_path.is_file()
+
+        from opencrab.auth import list_tokens, list_users
+
+        users = list_users(_sql())
+        assert len(users) == 1
+        assert users[0]["is_local"] is True
+        assert list_tokens(_sql(), users[0]["user_id"]) == []
+
+
+class TestBootstrapOptInGate:
+    """G1 (design §3.1): malformed values refuse startup; unset/""/"0" leave
+    behaviour completely unchanged (immediate ``None``, no side effects)."""
+
+    @pytest.mark.parametrize("value", ["yes", "true", "TRUE", "on", "2", " 1"])
+    def test_malformed_value_refuses_startup(self, env, monkeypatch, value):
+        """AC4: a value other than unset/""/"0"/"1" is a loud RuntimeError, not
+        a silently-ignored typo."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", value)
+        from opencrab.auth import bootstrap_on_empty_requested
+
+        with pytest.raises(RuntimeError, match=r"must be unset"):
+            bootstrap_on_empty_requested()
+        assert sorted(os.listdir(env)) == []
+
+    @pytest.mark.parametrize("value", [None, "", "0"])
+    def test_off_values_return_false_and_touch_nothing(self, env, monkeypatch, value):
+        """AC2: opt-in unset entirely unchanged -- off means an immediate
+        ``None``/``False``, matching current (pre-#245) behaviour exactly."""
+        if value is None:
+            monkeypatch.delenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", raising=False)
+        else:
+            monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", value)
+        from opencrab.auth import bootstrap_on_empty_requested, maybe_bootstrap_on_empty
+
+        assert bootstrap_on_empty_requested() is False
+        assert maybe_bootstrap_on_empty() is None
+        assert sorted(os.listdir(env)) == []
+
+
+class TestBootstrapStorageModeGate:
+    """G2 (design §3.1, F2): non-local storage modes refuse even with opt-in,
+    so a pg/docker/kuzu deployment can never grow a stray local opencrab.db."""
+
+    @pytest.mark.parametrize("mode", ["docker", "kuzu", "pg"])
+    def test_non_local_storage_mode_refuses(self, env, monkeypatch, mode):
+        """AC3: G2 across its full 3-mode enumeration -- refuse and create no
+        local file."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        monkeypatch.setenv("STORAGE_MODE", mode)
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError, match=r"requires STORAGE_MODE=local"):
+            maybe_bootstrap_on_empty()
+        assert sorted(os.listdir(env)) == []
+
+
+class TestBootstrapDataDirGate:
+    """G3 (design §3.1, F3): LOCAL_DATA_DIR must be explicitly set (present in
+    ``model_fields_set``), non-blank after ``.strip()``, and free of ``?`` --
+    the character that splits sqlalchemy's ``make_url`` check/lock target from
+    its actual connect target (measured 2026-08-31 against the running
+    sqlalchemy version)."""
+
+    def test_unset_local_data_dir_refuses(self, monkeypatch, tmp_path):
+        """AC3 (G3, unspecified source): the built-in default derivation must
+        never be treated as an explicit opt-in target."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        monkeypatch.setenv("STORAGE_MODE", "local")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("LOCAL_DATA_DIR", raising=False)
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        settings = get_settings()
+        assert "local_data_dir" not in settings.model_fields_set, (
+            "test setup invariant: this case must exercise the unspecified-source "
+            "branch, not the explicit one"
+        )
+        # Real the default path *exists* before the call: a mutant that drops
+        # the model_fields_set check would then pass G4 (directory exists)
+        # and go on to create a store in it, which only the post-call
+        # "empty directory" assertion below can catch -- an absent directory
+        # would fail G4 on its own and mask the mutation.
+        default_dir = Path(settings.local_data_dir)
+        default_dir.mkdir(parents=True, exist_ok=True)
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError, match=r"set explicitly"):
+            maybe_bootstrap_on_empty()
+        assert os.listdir(default_dir) == []
+
+    def test_empty_string_local_data_dir_refuses(self, env, monkeypatch):
+        """AC3 (G3, F3 counterexample): an explicit but blank value must not
+        take the ``Path("")`` (cwd) check / ``sqlite:////opencrab.db`` (root)
+        create split -- it is rejected before either is touched."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        monkeypatch.setenv("LOCAL_DATA_DIR", "")
+        # An empty data_dir makes the pre-lock file check resolve against
+        # cwd (``Path("", "opencrab.db")`` == ``Path("opencrab.db")``), so
+        # cwd must be isolated to an empty directory -- otherwise a stray
+        # opencrab.db in whatever directory pytest happens to run from could
+        # change which branch a mutant takes.
+        monkeypatch.chdir(env)
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        settings = get_settings()
+        assert "local_data_dir" in settings.model_fields_set
+        assert settings.local_data_dir.strip() == ""
+
+        # Decisive sentinel (round-2 finding 1): patched at opencrab.locking
+        # because opencrab.auth imports file_lock lazily inside the function
+        # body (`from opencrab.locking import file_lock`), so patching an
+        # attribute on the auth module would never be seen. A mutant that
+        # drops the non-blank check must reach this before raising anything
+        # else -- fail loud rather than let some other guard mask it.
+        import opencrab.locking as locking_mod
+
+        def _forbidden_lock(*a, **kw):
+            raise AssertionError("lock must not be entered")
+
+        monkeypatch.setattr(locking_mod, "file_lock", _forbidden_lock)
+
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError, match=r"non-blank"):
+            maybe_bootstrap_on_empty()
+        assert not Path("/opencrab.db").exists(), "F3 split must never reach the root create"
+
+    def test_question_mark_path_refuses_and_leaves_the_truncated_target_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        """AC3 (G3, round-2 finding 1 counterexample): ``sqlite:///{dir}/opencrab.db``
+        truncates at ``?``, so a real ``a?b`` directory (checked/locked) and its
+        truncated sibling ``a`` (what would actually get connected to) must
+        BOTH remain untouched by the refusal."""
+        real_dir = tmp_path / "a?b"
+        real_dir.mkdir()
+        truncated = tmp_path / "a"
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        monkeypatch.setenv("STORAGE_MODE", "local")
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(real_dir))
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError, match=r"contains '\?'"):
+            maybe_bootstrap_on_empty()
+        assert sorted(os.listdir(real_dir)) == []
+        assert not truncated.exists()
+
+
+class TestBootstrapDirectoryMustExist:
+    """G4 (design §3.1): a missing directory refuses rather than being
+    created -- PLUGIN_DATA's existence is the client's contract, and a typoed
+    path must fail loudly, not spawn a new, wrong, empty store."""
+
+    def test_missing_directory_refuses_and_is_not_created(self, monkeypatch, tmp_path):
+        """AC3 (G4)."""
+        missing = tmp_path / "does-not-exist"
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        monkeypatch.setenv("STORAGE_MODE", "local")
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(missing))
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError):
+            maybe_bootstrap_on_empty()
+        assert not missing.exists()
+
+
+class TestBootstrapIdempotentFastPath:
+    """Design §3.2 step 0: an already-bootstrapped local user is a true no-op
+    fast path -- no new store creation, no lock file, and the same
+    open/query counts as today's ``require_local_principal`` alone."""
+
+    def test_existing_user_counts_unchanged_and_no_lock_file(self, env, monkeypatch):
+        """AC5/AC6: idempotent -- user/token counts unchanged, and fast path
+        does not even create ``bootstrap.lock`` (directory listing identical
+        before/after, design round-8 finding 1)."""
+        user_id, _ = _bootstrap()
+        before_files = sorted(os.listdir(env))
+        sql = _sql()
+        from opencrab.auth import list_tokens, list_users
+
+        users_before = list_users(sql)
+        tokens_before = list_tokens(sql, user_id)
+
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        from opencrab.auth import maybe_bootstrap_on_empty, require_local_principal
+
+        principal = maybe_bootstrap_on_empty() or require_local_principal()
+        assert principal.user_id == user_id
+        assert principal.disabled is False
+
+        after_files = sorted(os.listdir(env))
+        assert after_files == before_files
+        assert "bootstrap.lock" not in after_files
+
+        sql2 = _sql()
+        assert list_users(sql2) == users_before
+        assert list_tokens(sql2, user_id) == tokens_before
+
+    def test_store_and_query_counts_match_require_local_principal_alone(self, env):
+        """AC6 (round-9 finding 1): the ``maybe_bootstrap_on_empty() or
+        require_local_principal()`` wiring opens exactly one store
+        (``create_tables=False``) and queries ``get_local_user`` exactly
+        once -- the same counters as calling ``require_local_principal``
+        by itself, measured with the same counting monkeypatch so the
+        comparison is apples-to-apples."""
+        _bootstrap()
+
+        def _measure(mp, *, opt_in):
+            import opencrab.auth as auth_mod
+            import opencrab.stores.sql_store as store_mod
+
+            calls = {"store": [], "query": 0}
+            real_init = store_mod.SQLStore.__init__
+            real_get_local_user = auth_mod.get_local_user
+
+            def _counting_init(self, url, create_tables=True):  # noqa: FBT002
+                calls["store"].append({"create_tables": create_tables})
+                real_init(self, url, create_tables=create_tables)
+
+            def _counting_get_local_user(sql):
+                calls["query"] += 1
+                return real_get_local_user(sql)
+
+            mp.setattr(store_mod.SQLStore, "__init__", _counting_init)
+            mp.setattr(auth_mod, "get_local_user", _counting_get_local_user)
+            if opt_in:
+                mp.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+                principal = auth_mod.maybe_bootstrap_on_empty() or auth_mod.require_local_principal()
+            else:
+                mp.delenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", raising=False)
+                principal = auth_mod.require_local_principal()
+            return principal, calls
+
+        with pytest.MonkeyPatch.context() as mp:
+            principal_wired, calls_wired = _measure(mp, opt_in=True)
+        with pytest.MonkeyPatch.context() as mp:
+            principal_baseline, calls_baseline = _measure(mp, opt_in=False)
+
+        assert principal_wired.user_id == principal_baseline.user_id
+        assert len(calls_wired["store"]) == 1
+        assert len(calls_baseline["store"]) == 1
+        assert calls_wired["store"][0]["create_tables"] is False
+        assert calls_baseline["store"][0]["create_tables"] is False
+        assert calls_wired["query"] == 1
+        assert calls_baseline["query"] == 1
+
+
+class TestBootstrapFastPathOpenFailure:
+    """Design §3.2 step 0(b): an existing ``opencrab.db`` that fails to open
+    (``available=False``) must delegate -- ``None`` -- rather than raise its
+    own error, so ``require_local_principal``'s existing "did not connect"
+    diagnostic (not "opencrab init") still fires.
+
+    Driven in-process rather than by subprocess: reliably forcing a SQLite
+    open failure from outside (permission bits, a corrupt header) is
+    platform- and CI-environment-dependent and would make this test flaky.
+    Design §3.2 step 0(b) explicitly allows the in-process alternative.
+    """
+
+    def test_open_failure_delegates_none_with_zero_side_effects(self, env, monkeypatch):
+        """AC5 (round-10 finding 1): available=False -> None, zero lock/helper
+        calls, the pre-existing db file untouched (size/mtime), and the
+        eventual diagnostic is "did not connect", never "opencrab init"."""
+        _bootstrap()
+        db_path = Path(env) / "opencrab.db"
+        stat_before = db_path.stat()
+        before_files = sorted(os.listdir(env))
+
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        import opencrab.locking as locking_mod
+        import opencrab.stores.sql_store as store_mod
+
+        real_init = store_mod.SQLStore.__init__
+
+        def _flaky_init(self, url, create_tables=True):  # noqa: FBT002
+            real_init(self, url, create_tables=create_tables)
+            self._available = False
+
+        lock_calls = []
+        real_file_lock = locking_mod.file_lock
+
+        def _counting_file_lock(*a, **kw):
+            lock_calls.append((a, kw))
+            return real_file_lock(*a, **kw)
+
+        helper_calls = []
+
+        def _forbidden_helper(*a, **kw):
+            helper_calls.append((a, kw))
+            raise AssertionError("helper must not run when the store cannot open")
+
+        monkeypatch.setattr(store_mod.SQLStore, "__init__", _flaky_init)
+        monkeypatch.setattr(locking_mod, "file_lock", _counting_file_lock)
+        monkeypatch.setattr(
+            auth_mod, "bootstrap_local_user_idempotent", _forbidden_helper, raising=False
+        )
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result is None
+        assert lock_calls == []
+        assert helper_calls == []
+        assert sorted(os.listdir(env)) == before_files
+        stat_after = db_path.stat()
+        assert (stat_after.st_size, stat_after.st_mtime) == (
+            stat_before.st_size,
+            stat_before.st_mtime,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            result or auth_mod.require_local_principal()
+        assert "did not connect" in str(excinfo.value)
+        assert "opencrab init" not in str(excinfo.value)
+
+
+class TestBootstrapFastPathDisabledUser:
+    """Design §3.2 step 0(c): a disabled local user delegates too -- no
+    reactivation, and the entry point still gets the existing disabled
+    error from ``require_local_principal``."""
+
+    def test_disabled_user_delegates_none_without_reactivating(self, env, monkeypatch):
+        """AC5: same zero-side-effect contract as the (b) branch."""
+        from opencrab.auth import disable_user
+
+        user_id, _ = _bootstrap()
+        sql = _sql()
+        assert disable_user(sql, user_id) is True
+        before_files = sorted(os.listdir(env))
+
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        import opencrab.locking as locking_mod
+
+        lock_calls = []
+        real_file_lock = locking_mod.file_lock
+
+        def _counting_file_lock(*a, **kw):
+            lock_calls.append((a, kw))
+            return real_file_lock(*a, **kw)
+
+        helper_calls = []
+
+        def _forbidden_helper(*a, **kw):
+            helper_calls.append((a, kw))
+            raise AssertionError("helper must not run for a disabled user")
+
+        monkeypatch.setattr(locking_mod, "file_lock", _counting_file_lock)
+        monkeypatch.setattr(
+            auth_mod, "bootstrap_local_user_idempotent", _forbidden_helper, raising=False
+        )
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result is None
+        assert lock_calls == []
+        assert helper_calls == []
+        assert sorted(os.listdir(env)) == before_files
+
+        from opencrab.auth import get_local_user
+
+        assert get_local_user(_sql()).disabled is True, "must not reactivate"
+
+        with pytest.raises(RuntimeError, match="disabled"):
+            result or auth_mod.require_local_principal()
+
+
+class TestBootstrapRecoversPartialState:
+    """Design §3.2 [F4][F5]: the recovery condition is "no local user", not
+    "no db file" -- a half-finished prior run (tables exist, no user row)
+    must self-heal on the next opt-in launch."""
+
+    def test_file_and_tables_without_user_self_heals(self, env, monkeypatch):
+        """AC5 (F4/F5 condition-mutation detector): reverting the condition
+        back to "file absent" makes this fail, because the file already
+        exists here and only the user row is missing."""
+        from opencrab.config import get_settings
+        from opencrab.stores.sql_store import SQLStore
+
+        settings = get_settings()
+        sql = SQLStore(url=settings.sqlite_url, create_tables=True)
+        assert sql.available
+        assert (Path(env) / "opencrab.db").is_file()
+
+        from opencrab.auth import get_local_user
+
+        assert get_local_user(sql) is None
+
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        principal = maybe_bootstrap_on_empty()
+        assert principal is not None
+        assert principal.disabled is False
+
+        sql2 = SQLStore(url=settings.sqlite_url, create_tables=False)
+        from opencrab.auth import list_tokens
+
+        assert get_local_user(sql2).user_id == principal.user_id
+        assert list_tokens(sql2, principal.user_id) == [], "auto stdio path issues no token (F6)"
+
+
+class TestBootstrapLockRecheckFindsUser:
+    """Design §3.2 steps 2-3 (round-10/11 findings): both recheck points --
+    immediately inside the lock, and again after the ``create_tables=True``
+    open -- must return the found Principal directly rather than delegating,
+    and must not reopen or re-query beyond that point."""
+
+    def test_recheck_immediately_after_lock_returns_principal_without_reopen(
+        self, env, monkeypatch
+    ):
+        """AC6: a concurrent finisher discovered right after acquiring the
+        lock skips DDL entirely."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        from opencrab.auth import Principal
+
+        injected = Principal(user_id="user_injected", is_local=True, disabled=False)
+        # The pre-lock fast path (step 0) is file-existence gated (mirrors
+        # require_local_principal's own is_file() precheck, design #245 v13
+        # step 0) and this env has no opencrab.db yet, so it makes zero
+        # get_local_user calls -- the in-lock recheck is the first real call.
+        # (Adjusted from the RED-test author's scripted 2-item sequence,
+        # which assumed the fast path always queries; see worker report for
+        # #245 for why that assumption doesn't hold under design v13 §3.2
+        # step 0 as literally specified, and why items 12/13's "creates
+        # nothing on lock-acquisition failure" filesystem assertions require
+        # the gate.)
+        responses = iter([injected])  # in-lock recheck: found immediately.
+
+        def _scripted_get_local_user(sql):
+            return next(responses, injected)
+
+        def _forbidden_helper(*a, **kw):
+            raise AssertionError("must not create_tables=True or create a user")
+
+        monkeypatch.setattr(auth_mod, "get_local_user", _scripted_get_local_user)
+        monkeypatch.setattr(
+            auth_mod, "bootstrap_local_user_idempotent", _forbidden_helper, raising=False
+        )
+
+        import opencrab.stores.sql_store as store_mod
+
+        real_init = store_mod.SQLStore.__init__
+        store_create_tables_seen = []
+
+        def _tracking_init(self, url, create_tables=True):  # noqa: FBT002
+            store_create_tables_seen.append(create_tables)
+            real_init(self, url, create_tables=create_tables)
+
+        monkeypatch.setattr(store_mod.SQLStore, "__init__", _tracking_init)
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result == injected
+        assert True not in store_create_tables_seen, "no DDL open after the in-lock recheck hit"
+
+    def test_recheck_after_create_tables_open_returns_principal_without_further_reopen(
+        self, env, monkeypatch
+    ):
+        """AC6 (round-11 finding 2): the SECOND recheck point -- after the
+        ``create_tables=True`` open -- must independently return the found
+        Principal; a mutant that returns ``None`` only there is caught here."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        from opencrab.auth import Principal
+
+        injected = Principal(user_id="user_injected2", is_local=True, disabled=False)
+        # fast path is skipped (file absent -> step 0's is_file() gate, see
+        # the sibling test above); in-lock recheck miss, then post-DDL-open
+        # recheck: found.
+        responses = iter([None, injected])
+
+        def _scripted_get_local_user(sql):
+            return next(responses, injected)
+
+        def _forbidden_helper(*a, **kw):
+            raise AssertionError("must not create a user once the post-open recheck finds one")
+
+        monkeypatch.setattr(auth_mod, "get_local_user", _scripted_get_local_user)
+        monkeypatch.setattr(
+            auth_mod, "bootstrap_local_user_idempotent", _forbidden_helper, raising=False
+        )
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result == injected
+
+
+class TestBootstrapLockOccupancyProbe:
+    """Design §3.2 (round-5/6 findings): a decisive, non-racy check that the
+    critical section (store open + user creation) really runs INSIDE the
+    lock. A synchronous probe from a second thread tries to acquire the same
+    ``bootstrap.lock`` (timeout=0.2s) from inside each patched entry point;
+    if the lock truly encloses that point the probe must time out.
+
+    Role separation (deliberately not conflated): this test proves only that
+    the critical section has not leaked outside the lock. It says nothing
+    about single-user convergence CORRECTNESS under real concurrency -- that
+    is TestBootstrapRecoversPartialState (condition mutation) and
+    TestBootstrapLocalUserIdempotentHelper (IntegrityError convergence). The
+    lock is a robustness layer against sqlite contention flakiness; those two
+    tests are what guarantees exactly-one-user.
+    """
+
+    @staticmethod
+    def _probe_from_thread(data_dir):
+        from opencrab.locking import file_lock
+
+        result = {}
+
+        def _try():
+            try:
+                with file_lock("bootstrap.lock", data_dir=data_dir, timeout=0.2):
+                    result["acquired"] = True
+            except TimeoutError:
+                result["timeout"] = True
+
+        t = threading.Thread(target=_try)
+        t.start()
+        t.join(timeout=5)
+        return result
+
+    def test_store_open_point_is_inside_the_lock(self, env, monkeypatch):
+        """AC6: probe point (i) -- the ``create_tables=True`` ``SQLStore``
+        open used by ``maybe_bootstrap_on_empty``."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.stores.sql_store as store_mod
+
+        real_init = store_mod.SQLStore.__init__
+        probe_results = []
+
+        def _probing_init(inner_self, url, create_tables=True):  # noqa: FBT002
+            if create_tables:
+                probe_results.append(self._probe_from_thread(env))
+            real_init(inner_self, url, create_tables=create_tables)
+
+        monkeypatch.setattr(store_mod.SQLStore, "__init__", _probing_init)
+
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        maybe_bootstrap_on_empty()
+
+        assert probe_results, "the create_tables=True open never ran"
+        assert probe_results[0].get("timeout") is True
+        assert "acquired" not in probe_results[0]
+
+    def test_helper_creation_point_is_inside_the_lock(self, env, monkeypatch):
+        """AC6: probe point (ii) -- ``bootstrap_local_user_idempotent``'s own
+        creation work. Opening the store outside the lock but creating the
+        user inside it (or vice versa) is exactly the "weakened mutation"
+        design v13 §3.2 rejects (round-6 finding 1): both points are probed
+        independently, and this one on its own must also fail-closed."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+
+        probe_results = []
+
+        def _probing_helper(sql, *, issue_token=True):
+            probe_results.append(self._probe_from_thread(env))
+            return ("user_fake_helper", None, True)
+
+        monkeypatch.setattr(
+            auth_mod, "bootstrap_local_user_idempotent", _probing_helper, raising=False
+        )
+
+        auth_mod.maybe_bootstrap_on_empty()
+
+        assert probe_results, "the create helper never ran"
+        assert probe_results[0].get("timeout") is True
+        assert "acquired" not in probe_results[0]
+
+
+class TestBootstrapLockAcquisitionErrors:
+    """Design §3.2 step 1 (round-2/3 findings): a lock-acquisition failure
+    converts to a contextual RuntimeError (both stdio entry points only
+    handle RuntimeError, so an uncaught TimeoutError/OSError would leak a
+    traceback) -- but ONLY at acquisition. An OSError raised by the guarded
+    body itself must propagate unconverted, or a real body bug gets
+    misdiagnosed as "couldn't get the lock"."""
+
+    @pytest.mark.parametrize("exc_cls", [TimeoutError, PermissionError])
+    def test_lock_acquisition_failure_is_wrapped_and_creates_nothing(
+        self, env, monkeypatch, exc_cls
+    ):
+        """AC4."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.locking as locking_mod
+
+        def _boom(*a, **kw):
+            raise exc_cls("simulated lock acquisition failure")
+
+        monkeypatch.setattr(locking_mod, "file_lock", _boom)
+
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(RuntimeError) as excinfo:
+            maybe_bootstrap_on_empty()
+        assert not isinstance(excinfo.value, (TimeoutError, PermissionError))
+        assert sorted(os.listdir(env)) == []
+
+    def test_oserror_inside_lock_body_is_not_converted(self, env, monkeypatch):
+        """AC4 (misdiagnosis guard): the real ``file_lock`` runs unpatched
+        here -- only the body (the helper call) raises -- so a conversion
+        that wraps the whole ``with`` block rather than just acquisition
+        would wrongly turn this into a RuntimeError."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+
+        def _boom(*a, **kw):
+            raise OSError("simulated failure inside the critical section, not at acquire")
+
+        monkeypatch.setattr(auth_mod, "bootstrap_local_user_idempotent", _boom, raising=False)
+
+        from opencrab.auth import maybe_bootstrap_on_empty
+
+        with pytest.raises(OSError) as excinfo:
+            maybe_bootstrap_on_empty()
+        assert not isinstance(excinfo.value, RuntimeError)
+
+
+class TestBootstrapLockErrorAtEntryPoints:
+    """Design §3.2 step 1 (round-4 finding 2): with a directory (not a file)
+    already sitting at ``bootstrap.lock``, the lock file open fails with
+    ``IsADirectoryError`` unpatched -- a real injection, not a mock. Both
+    stdio entry points must turn this into exit 1, stderr-only, no
+    traceback, no db file -- exactly like any other lock-acquisition
+    failure (see TestBootstrapLockAcquisitionErrors)."""
+
+    def test_python_dash_m_reports_context_and_exits_1(self, env):
+        """AC4, AC7 (entry-point pinning)."""
+        (Path(env) / "bootstrap.lock").mkdir()
+        p = _run_module(env, {"OPENCRAB_BOOTSTRAP_ON_EMPTY": "1"})
+        assert p.returncode == 1
+        assert p.stdout == ""
+        assert p.stderr.strip() != ""
+        assert "Traceback" not in p.stderr
+        # Pins the lock-specific diagnostic itself, not just "some error
+        # went to stderr" -- a plain unbootstrapped-refusal message (RED
+        # state) contains no such text, so this fails decisively if the
+        # entry-point wiring stops routing through the lock path at all.
+        assert "bootstrap.lock" in p.stderr
+        assert not (Path(env) / "opencrab.db").exists()
+
+    def test_console_script_serve_stdio_reports_context_and_exits_1(self, env):
+        """AC4, AC7 -- the sibling entry point, `opencrab serve --transport
+        stdio`, via the actual installed console script."""
+        (Path(env) / "bootstrap.lock").mkdir()
+        p = _run_serve_stdio(env, {"OPENCRAB_BOOTSTRAP_ON_EMPTY": "1"})
+        assert p.returncode == 1
+        assert p.stdout == ""
+        assert p.stderr.strip() != ""
+        assert "Traceback" not in p.stderr
+        assert "bootstrap.lock" in p.stderr
+        assert not (Path(env) / "opencrab.db").exists()
+
+
+class TestBootstrapLocalUserIdempotentHelper:
+    """Design §3.3/§4 [F6]: the extracted helper's own unit contract --
+    IntegrityError race convergence, the ``created`` flag driving the stderr
+    notice, and ``issue_token=False`` issuing no token."""
+
+    def test_integrity_error_converges_to_existing_user_created_false(self, env, monkeypatch):
+        """AC5: a concurrent creator (e.g. `opencrab init` under pg) winning
+        the race converges to the row that landed, with created=False."""
+        from sqlalchemy.exc import IntegrityError
+
+        from opencrab.auth import bootstrap_local_user_idempotent
+
+        sql = _sql()
+        existing_id, _ = _bootstrap()
+
+        import opencrab.auth as auth_mod
+
+        def _always_conflicts(sql_, *, issue_token=True):
+            raise IntegrityError("INSERT", {}, Exception("idx_users_single_local"))
+
+        monkeypatch.setattr(auth_mod, "bootstrap_local_user", _always_conflicts)
+
+        user_id, secret, created = bootstrap_local_user_idempotent(sql, issue_token=False)
+
+        assert created is False
+        assert user_id == existing_id
+        assert secret is None
+
+    def test_created_false_means_no_bootstrap_notice(self, env, monkeypatch, capsys):
+        """AC5 (design §3.2 step 7): the stderr creation notice is gated on
+        ``created=True`` only -- a helper that converged onto an existing
+        row (created=False) must print nothing new."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        from opencrab.auth import Principal
+
+        injected = Principal(user_id="user_x", is_local=True, disabled=False)
+
+        def _fake_helper(sql, *, issue_token=True):
+            return ("user_x", None, False)
+
+        # fast path is skipped (file absent -> step 0's is_file() gate,
+        # design #245 v13 §3.2 step 0 -- see TestBootstrapLockRecheckFindsUser
+        # for the same adjustment and why it's required); in-lock recheck
+        # miss, post-open recheck miss (-> helper runs, created=False),
+        # final post-helper recheck: found, enabled.
+        responses = iter([None, None, injected])
+
+        def _scripted_get_local_user(sql):
+            return next(responses, injected)
+
+        monkeypatch.setattr(auth_mod, "get_local_user", _scripted_get_local_user)
+        monkeypatch.setattr(auth_mod, "bootstrap_local_user_idempotent", _fake_helper)
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result == injected
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_issue_token_false_creates_zero_tokens(self, env):
+        """AC5 [F6]: the stdio auto path's ``issue_token=False`` really
+        issues nothing -- unlike ``opencrab init``'s default."""
+        from opencrab.auth import bootstrap_local_user_idempotent, list_tokens
+
+        sql = _sql()
+        user_id, secret, created = bootstrap_local_user_idempotent(sql, issue_token=False)
+        assert created is True
+        assert secret is None
+        assert list_tokens(sql, user_id) == []
+
+
+class TestBootstrapDisableRaceAfterCreate:
+    """Design §3.2 step 6 (round-12 finding 1, BLOCKER): the window between
+    the helper's commit and the final post-create recheck is where an
+    external process could disable the just-created user. The final check
+    must apply the same enabled test as every other discovery branch --
+    returning a truthy Principal here would let a disabled user slip past
+    ``require_local_principal``'s authoritative disabled check."""
+
+    def test_disabled_immediately_after_creation_delegates_none(self, env, monkeypatch):
+        """AC5."""
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+
+        import opencrab.auth as auth_mod
+        from opencrab.auth import disable_user
+
+        created_holder = {}
+
+        def _disabling_helper(sql, *, issue_token=True):
+            from opencrab.auth import bootstrap_local_user
+
+            user_id, secret = bootstrap_local_user(sql, issue_token=issue_token)
+            disable_user(sql, user_id)
+            created_holder["user_id"] = user_id
+            return (user_id, secret, True)
+
+        monkeypatch.setattr(auth_mod, "bootstrap_local_user_idempotent", _disabling_helper)
+
+        result = auth_mod.maybe_bootstrap_on_empty()
+
+        assert result is None
+        assert created_holder, "helper never ran"
+
+        with pytest.raises(RuntimeError, match="disabled"):
+            result or auth_mod.require_local_principal()
+
+
+class TestServeStdioRejectionStreams:
+    """Design §4 [F8]: all four `serve --transport stdio` rejection
+    diagnostics go to stderr only (a dedicated ``err_console =
+    Console(stderr=True)``), never to stdout -- the JSON-RPC channel must
+    stay clean even on a rejected startup.
+
+    Per design §4's test plan: the stale-secret and missing-principal cases
+    run as real console-script subprocesses (they were already exercised
+    that way pre-#245); --allow-query-token and the registry violation use
+    a stream-separated CliRunner (Click 8.2+ keeps ``result.stdout`` and
+    ``result.stderr`` genuinely separate, so no subprocess is needed there).
+    """
+
+    def test_stale_secret_rejection_is_stderr_only(self, env):
+        """AC7."""
+        p = _run_serve_stdio(env, {"OPENCRAB_API_KEY": "leftover"})
+        assert p.returncode != 0
+        assert p.stdout == ""
+        assert p.stderr.strip() != ""
+
+    def test_missing_principal_rejection_is_stderr_only(self, env):
+        """AC7."""
+        p = _run_serve_stdio(env)
+        assert p.returncode != 0
+        assert p.stdout == ""
+        assert p.stderr.strip() != ""
+
+    def test_allow_query_token_stdio_rejection_is_stderr_only(self, env):
+        """AC7."""
+        result = CliRunner().invoke(main, ["serve", "--transport", "stdio", "--allow-query-token"])
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        assert result.stderr.strip() != ""
+
+    def test_registry_violation_rejection_is_stderr_only(self, env):
+        """AC7. The violation shape mirrors
+        TestStartupCheck.test_refuses_when_the_graph_holds_an_unregistered_pack_id
+        in test_read_scope_isolation.py: a graph node carrying a pack_id that
+        the ``packs`` registry (opencrab.pack.read_scope) never heard of."""
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_graph_store
+
+        _bootstrap()
+        cfg = get_settings()
+        graph = make_graph_store(cfg)
+        graph.upsert_node(
+            "Document",
+            "ghost-node",
+            {"node_id": "ghost-node", "pack_id": "ghost-pack"},
+            space_id="resource",
+        )
+        close = getattr(graph, "close", None)
+        if callable(close):
+            close()
+
+        result = CliRunner().invoke(main, ["serve", "--transport", "stdio"])
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        assert result.stderr.strip() != ""
+
+
+class TestServeHttpRejectionStreams:
+    """설계 v13 §4 항목 3: serve 거부 진단은 transport 불문 stderr.
+
+    ``refuse_stale_shared_secret_env()`` runs in ``serve`` before the
+    stdio/http branch, so the stale-secret rejection
+    ``TestServeStdioRejectionStreams`` pins for stdio applies identically to
+    ``--transport http`` -- this was already the implementation's behaviour
+    (fix-design-v3 item 4's channel-B rebuttal), only the introducing
+    comment was wrong; this test is the fix-design-v3 item 4 fixture that
+    pins it so a future regression is caught rather than re-argued.
+    """
+
+    def test_stale_secret_rejection_is_stderr_only(self, env, monkeypatch):
+        """AC7's http counterpart. Port-safety tripwire (fix-design-v3 item
+        4, round-2 finding 2): ``uvicorn.run`` is patched to record any call
+        and then fail fast, so no mutation of the rejection path can reach a
+        real bind -- the recorded-empty-calls assertion is decisive even
+        though CliRunner would otherwise swallow the sentinel's own
+        AssertionError into a nonzero exit code."""
+        monkeypatch.setenv("OPENCRAB_API_KEY", "leftover")
+
+        import uvicorn
+
+        calls = []
+
+        def _forbidden_uvicorn_run(*a, **kw):
+            calls.append((a, kw))
+            raise AssertionError("uvicorn.run must not run after a stale-secret rejection")
+
+        monkeypatch.setattr(uvicorn, "run", _forbidden_uvicorn_run)
+
+        result = CliRunner().invoke(main, ["serve", "--transport", "http"])
+
+        assert calls == [], "uvicorn.run must never be reached here"
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        assert result.stderr.strip() != ""
+
+
+class TestConcurrentSubprocessBootstrap:
+    """Design §3.2 (round-2 finding 4(c)): integration evidence, not a
+    mutation detector -- two real `python -m` children racing to bootstrap
+    the same empty directory must both converge cleanly. Correctness
+    (exactly-one-user) is guaranteed by TestBootstrapRecoversPartialState's
+    condition test and TestBootstrapLocalUserIdempotentHelper's
+    IntegrityError-convergence test; the lock (TestBootstrapLockOccupancyProbe)
+    is the robustness layer against sqlite contention flakiness. This test
+    confirms those guarantees actually cooperate across two real processes.
+    """
+
+    def test_two_children_converge_to_one_user(self, env):
+        """AC6."""
+        e = {**os.environ, "LOCAL_DATA_DIR": str(env), "STORAGE_MODE": "local",
+             "PYTHONDONTWRITEBYTECODE": "1", "OPENCRAB_BOOTSTRAP_ON_EMPTY": "1"}
+        for name in ("OPENCRAB_API_KEY", "LOCALCRAB_MCP_TOKEN", "LOCALCRAB_MCP_TOKEN_FILE"):
+            e.pop(name, None)
+
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-m", "opencrab.mcp.server"],
+                cwd=REPO_ROOT, env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(2)
+        ]
+        results = [p.communicate(input="", timeout=90) for p in procs]
+
+        for p, (out, err) in zip(procs, results):
+            assert p.returncode == 0, f"stdout={out!r} stderr={err!r}"
+
+        from opencrab.auth import list_tokens, list_users
+
+        sql = _sql()
+        users = list_users(sql)
+        assert len(users) == 1
+        assert list_tokens(sql, users[0]["user_id"]) == []

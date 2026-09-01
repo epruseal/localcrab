@@ -9,7 +9,8 @@
       "env": {
         "STORAGE_MODE": "local",
         "LOCAL_DATA_DIR": "${PLUGIN_DATA}",
-        "LOCALCRAB_ENV_FILE": "${PLUGIN_DATA}/localcrab.env"
+        "LOCALCRAB_ENV_FILE": "${PLUGIN_DATA}/localcrab.env",
+        "OPENCRAB_BOOTSTRAP_ON_EMPTY": "1"
       }
     }
   }
