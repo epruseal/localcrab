@@ -182,6 +182,45 @@ def test_graph_unavailable_writes_nothing_at_all(stack):
     assert stack["vector"].get_by_id("src-nograph") is None
 
 
+def test_mcp_pack_ingest_rejects_before_write_source_when_graph_unavailable(stack):
+    """설계 §9-2 후반: MCP `pack_ingest` 는 `write_source` 에 도달하지도 않고
+
+    그래프 미가용을 조기 거절해야 한다(현재 동작의 무회귀 고정). 이 조기
+    거절이 사라지면(예: 그래프 가용성 검사를 지우거나 뒤로 미루는 변이)
+    `write_source` 까지 흘러 들어가 위 `test_graph_unavailable_writes_
+    nothing_at_all` 과는 다른 응답 형태(`{"error": ...}` 가 아니라 이 함수의
+    실패 receipt)를 내거나, 최악의 경우 부분 저장을 만든다.
+    """
+    from opencrab.billing.hooks import BillingHooks
+    from opencrab.mcp.tools.pack import pack_ingest
+    from opencrab.ontology.impact import ImpactEngine
+    from opencrab.ontology.rebac import ReBACEngine
+
+    double_graph = _UnavailableGraph()
+    ctx = {
+        "neo4j": double_graph,
+        "chroma": stack["vector"],
+        "mongo": stack["docs"],
+        "sql": stack["sql"],
+        "builder": OntologyBuilder(double_graph, stack["docs"], stack["sql"], vec=stack["vector"]),
+        "rebac": ReBACEngine(double_graph, stack["sql"]),
+        "impact": ImpactEngine(double_graph, stack["sql"]),
+        "hybrid": stack["hybrid"],
+        "billing": BillingHooks(stack["sql"]),
+    }
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = pack_ingest(
+            "pack-a", text="본문", source_id="src-mcp-early-reject", text_as_node=False,
+        )
+
+    assert result == {"error": "graph store unavailable"}, result
+    assert stack["docs"].get_source("src-mcp-early-reject") is None
+    assert stack["vector"].get_by_id("src-mcp-early-reject") is None
+    assert _node(stack, "src-mcp-early-reject") is None
+
+
 # ---------------------------------------------------------------------------
 # 설계 §9 테스트 5·6·6b — 신원 가드가 그래프 축까지 본다
 # ---------------------------------------------------------------------------
@@ -209,6 +248,12 @@ def test_a_graph_only_foreign_node_is_refused_before_any_write(stack):
     # 부분 저장 없음: 어느 스토어에도 행이 생기지 않는다.
     assert stack["docs"].get_source("src-foreign") is None
     assert stack["vector"].get_by_id("src-foreign") is None
+    # 설계 §9-5 는 doc_sources·벡터 두 축만이 아니라 doc_nodes 와 sql
+    # 레지스트리까지 무기록을 요구한다. 거절 뒤 builder.add_node 의 팬아웃
+    # 루프가 조금이라도 돌면(예: 신원 가드를 우회하는 변이) 이 두 축에서
+    # 잔여가 남는다.
+    assert stack["docs"].get_node_doc("evidence", "src-foreign") is None
+    assert not _sql_registry_has(stack, "src-foreign")
 
 
 def test_an_unattributed_legacy_node_is_taken_over_by_the_writing_pack(stack):
@@ -366,6 +411,80 @@ def test_a_probe_that_cannot_say_no_does_not_trigger_the_carve_out(stack, bad):
     over = "D" * (_budget() + 1)
     with pytest.raises(ValueError, match="cannot verify"):
         _write(stack, source_id=over, graph=_NonListProbe(bad))
+    assert stack["docs"].get_source(over) is None
+    assert stack["vector"].get_by_id(over) is None
+
+
+class _AvailableFalseProbe:
+    """§9-12f(a): 예산 초과 id 인데 그래프 자체가 `available=False` 다."""
+
+    available = False
+
+    def get_nodes_by_id(self, node_id):  # noqa: ARG002
+        raise RuntimeError("graph store is not available")
+
+
+class _ProbeRaises:
+    """§9-12f(b): `available=True` 인데 `get_nodes_by_id` 가 예외를 던진다."""
+
+    available = True
+
+    def get_nodes_by_id(self, node_id):  # noqa: ARG002
+        raise RuntimeError("boom during by-id probe")
+
+
+class _ProbeMissingMethod:
+    """§9-12f(c): `available=True` 인데 `get_nodes_by_id` 메서드 자체가 없다."""
+
+    available = True
+
+
+def test_12f_a_over_budget_id_graph_unavailable_does_not_trigger_the_carve_out(stack):
+    """§9-12f(a). 그래프 미가용은 카브아웃(§4.6)이 아니라 §4.1 의 필수 다리
+
+    규칙을 태워야 한다. 실측(격리 스크립트, 프로덕션 미수정): `available=False`
+    에서는 `_existing_node_rows` 가 그래프를 아예 들여다보지 않고 `None` 을
+    돌려주므로(rows==[] 가 아님) 카브아웃이 적용되지 않고, 뒤이어
+    `builder.add_node` 의 그래프-미가용 조기 반환 경로를 타 예외 없이
+    `graph: "unavailable"` 리셉트로 끝난다. 카브아웃을 탔다면 `graph` 상태가
+    "skipped (id exceeds the node id limit after fork remap)"이었을 것이다.
+    """
+    over = "L" * (_budget() + 1)
+    receipt = _write(stack, source_id=over, graph=_AvailableFalseProbe())
+
+    assert receipt["stores"]["graph"] == "unavailable", receipt["stores"]
+    assert receipt["stores"]["documents"] == "skipped (graph write failed)", receipt["stores"]
+    assert receipt["stores"]["chromadb"] == "skipped (graph write failed)", receipt["stores"]
+    assert stack["docs"].get_source(over) is None
+    assert stack["vector"].get_by_id(over) is None
+
+
+def test_12f_b_over_budget_id_probe_exception_does_not_trigger_the_carve_out(stack):
+    """§9-12f(b). `get_nodes_by_id` 가 예외를 던지면 카브아웃 판정이 "확인 불가"로
+
+    fail-closed 된다(§4.6). 실측: 카브아웃을 타지 않고 정상 경로로 진행하면
+    `builder.add_node` 내부의 `node_identity_conflict` -> `_check_by_id_axis`
+    가 같은 프로브를 다시 불러 동일하게 예외를 만나 `CONFLICT_UNVERIFIABLE`
+    로 거절하므로 `ValueError("... cannot verify ...")` 가 그대로 전파된다.
+    카브아웃을 탔다면 이 거절 자체가 나지 않고 receipt 로 조용히 끝났을 것이다.
+    """
+    over = "M" * (_budget() + 1)
+    with pytest.raises(ValueError, match="cannot verify"):
+        _write(stack, source_id=over, graph=_ProbeRaises())
+    assert stack["docs"].get_source(over) is None
+    assert stack["vector"].get_by_id(over) is None
+
+
+def test_12f_c_over_budget_id_probe_method_missing_does_not_trigger_the_carve_out(stack):
+    """§9-12f(c). `get_nodes_by_id` 메서드 자체가 없는 경우도 (b)와 동일하게
+
+    fail-closed 거절이다 — `getattr(graph, "get_nodes_by_id", None) is None`
+    이 두 곳(§4.6 의 카브아웃 프로브, `_check_by_id_axis`) 모두에서
+    `CONFLICT_UNVERIFIABLE`/"cannot tell"로 처리된다.
+    """
+    over = "N" * (_budget() + 1)
+    with pytest.raises(ValueError, match="cannot verify"):
+        _write(stack, source_id=over, graph=_ProbeMissingMethod())
     assert stack["docs"].get_source(over) is None
     assert stack["vector"].get_by_id(over) is None
 
@@ -1010,7 +1129,9 @@ def mcp_ctx(stack):
 # ---------------------------------------------------------------------------
 
 
-def test_rest_ingest_materialises_graph_node_and_all_store_rows(rest_client, rest_module, rest_auth):
+def test_rest_ingest_materialises_graph_node_and_all_store_rows(
+    rest_client, rest_module, rest_auth, rest_principal,
+):
     """REST `/api/ingest` 가 write_source 를 우회하는 변이라면 이 이슈의 결함이
 
     REST 경로에서만 되살아난다 — 그래프 노드 없이 doc/벡터만 쌓인다.
@@ -1042,6 +1163,20 @@ def test_rest_ingest_materialises_graph_node_and_all_store_rows(rest_client, res
             {"n": "src-rest-1"},
         ).fetchone()
     assert row is not None, "sql 레지스트리에 노드 행이 없다"
+
+    # 설계 §9-1(b): `ontology_list_nodes(pack_id=...)` 축에서도 보여야 한다.
+    # get_node 단일조회만 통과하고 목록 조회 경로(export_nodes_scoped 등)가
+    # 빠진 변이는 위 단언들을 다 통과하고도 여기서 잡힌다.
+    from opencrab.mcp.tools.graph import ontology_list_nodes
+    from opencrab.pack.ownership import resolve_write_pack
+
+    user_id, _secret = rest_principal
+    rest_user = Principal(user_id=user_id, is_local=True, disabled=False)
+    default_pack = resolve_write_pack(ctx.sql, rest_user, None)
+    list_ctx = {"neo4j": ctx.graph, "mongo": ctx.docs, "sql": ctx.sql}
+    with principal_scope(rest_user), patch("opencrab.mcp.tools._get_context", return_value=list_ctx):
+        listing = ontology_list_nodes(pack_id=default_pack)
+    assert any(n["node_id"] == "src-rest-1" for n in listing["nodes"]), listing
 
 
 def test_cli_ingest_materialises_graph_node_and_all_store_rows(cli74_bootstrapped, tmp_path):
@@ -1082,6 +1217,18 @@ def test_cli_ingest_materialises_graph_node_and_all_store_rows(cli74_bootstrappe
                 {"n": source_id},
             ).fetchone()
         assert row is not None
+
+        # 설계 §9-1(b): `ontology_list_nodes(pack_id=...)` 축에서도 보여야 한다.
+        from opencrab.mcp.tools.graph import ontology_list_nodes
+        from opencrab.pack.ownership import resolve_write_pack
+
+        cli_principal = Principal(user_id=cli74_bootstrapped, is_local=True, disabled=False)
+        default_pack = resolve_write_pack(sql, cli_principal, None)
+        list_ctx = {"neo4j": graph, "mongo": docs, "sql": sql}
+        with principal_scope(cli_principal), \
+             patch("opencrab.mcp.tools._get_context", return_value=list_ctx):
+            listing = ontology_list_nodes(pack_id=default_pack)
+        assert any(n["node_id"] == source_id for n in listing["nodes"]), listing
     finally:
         graph.close()
         docs.close()
@@ -1105,6 +1252,14 @@ def test_mcp_legacy_ingest_materialises_graph_node(mcp_ctx):
     assert node is not None
     assert node["text"] == "MCP 본문"
     assert node["title"] == "MCP 제목"
+
+    # 설계 §9-1(b): `ontology_list_nodes(pack_id=...)` 축에서도 보여야 한다.
+    from opencrab.mcp.tools.graph import ontology_list_nodes
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx):
+        listing = ontology_list_nodes(pack_id="pack-a")
+    assert any(n["node_id"] == "src-mcp-1" for n in listing["nodes"]), listing
 
 
 # ---------------------------------------------------------------------------
@@ -1252,6 +1407,10 @@ def test_14b_graph_ok_documents_error_does_not_bill(stack, monkeypatch):
             "pack-a", text="본문", source_id="src-14b", text_as_node=False,
         )
     assert result["status"] == "partial", result
+    # 테스트 이름이 전제하는 "그래프는 성공했다"를 직접 단언한다 — 이것 없이는
+    # 그래프 키가 아예 없는(수정 전) 상태에서도 통과해 이름이 거짓 전제를
+    # 깔게 된다.
+    assert result["stores"]["graph"] == "ok", result["stores"]
     assert result["stores"]["documents"].startswith("error:"), result["stores"]
     assert result["stores"]["chromadb"] == "skipped (source record failed)", result["stores"]
     billing.on_ingest.assert_not_called()
@@ -1361,6 +1520,10 @@ def test_16b_a_single_store_error_zeroes_added_nodes_and_marks_partial(stack, mo
         result = _ingest_into_pack(
             "pack-a", text="본문", source_id="src-16b", text_as_node=False,
         )
+    # 테스트 이름이 전제하는 "그래프는 ok" 를 직접 단언한다 — 이것 없이는
+    # 그래프 키가 아예 없는(수정 전) 상태에서도 통과해 이름이 거짓 전제를
+    # 깔게 된다.
+    assert result["stores"]["graph"] == "ok", result["stores"]
     assert result["added_nodes"] == 0, result
     assert result["evidence_node"] is None, result
     assert result["status"] == "partial", result
@@ -1459,13 +1622,24 @@ def test_6_rest_same_id_different_node_type_conflict_is_rejected(
             properties={"pack_id": default_pack, "text": "증거"},
             pack_id=default_pack,
         )
+    # 시딩 자체가 벡터 행을 만든다(add_node 의 write_vector 기본값). 거부된
+    # REST 재적재가 이 행을 건드리지 않았는지 보려면 절대적 부재가 아니라
+    # 시딩 시점 값과의 불변을 비교해야 한다.
+    seeded_vector = ctx.vector.get_by_id("src-6-rest")
+    assert seeded_vector is not None
     resp = rest_client.post(
         "/api/ingest",
         json={"text": "본문", "source_id": "src-6-rest"},
         headers=rest_auth,
     )
-    assert resp.status_code >= 400, resp.text
+    # 설계 §9-6 은 422 를 요구한다(수정 전에는 500). `except (ValueError,
+    # NodeIdentityConflict)` 를 `except ValueError` 로 되돌리는 역변이는
+    # `resp.status_code >= 400` 만으로는 잡히지 않는다 — 500 도 >= 400 이다.
+    assert resp.status_code == 422, resp.text
     assert ctx.docs.get_source("src-6-rest") is None
+    # 설계 §9-6 은 doc_sources 뿐 아니라 벡터 행도 거부된 재적재로 새로
+    # 생기거나 바뀌지 않았는지 요구한다 — 시딩된 값 그대로여야 한다.
+    assert ctx.vector.get_by_id("src-6-rest") == seeded_vector
 
 
 def test_6_mcp_same_id_different_node_type_conflict_is_reported_as_partial(stack):
