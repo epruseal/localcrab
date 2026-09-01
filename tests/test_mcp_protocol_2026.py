@@ -352,12 +352,26 @@ class TestHandleRequestEdge:
         assert response["error"]["code"] == INVALID_PARAMS
         mock_dispatch.assert_not_called()
 
-    def test_legacy_tools_call_non_string_name_unchanged(self, server):
-        """Regression pin: the LEGACY path keeps its historical behaviour for
-        a truthy non-string name (dispatch is entered; the failure surfaces
-        as the legacy error envelope, not -32602) -- R4 strictness is
-        modern-only."""
-        with patch("opencrab.mcp.server.dispatch_tool", side_effect=TypeError("unhashable")) as mock_dispatch:
+    def test_legacy_tools_call_non_string_name_now_matches_modern(self, server):
+        """REPLACES this file's earlier ``..._non_string_name_unchanged`` pin.
+
+        That pin recorded #243's scoping decision: R4's non-string-name
+        strictness was modern-only, and the legacy path kept entering
+        dispatch so the failure surfaced as a legacy tool-exception envelope
+        (a JSON-RPC *result* carrying "unhashable type"). Issue #251 handed
+        that follow-up back explicitly -- "legacy 경로의 name/arguments 형상
+        미검증은 기존 계약 유지 결정이었다 -- D절 이행 시 modern 검증기와
+        정합시킨다" -- so the legacy path now runs the same
+        ``validate_tools_call_params`` before dispatch. This is not a
+        reversal of #243: #243 deferred, #251 executed, and the legacy era
+        itself is NOT removed.
+
+        The two eras still differ on one shape (a falsy non-object
+        ``arguments``, which legacy keeps normalising to ``{}`` because it
+        runs a tool today). tests/test_mcp_legacy_call_shape.py owns that
+        boundary in full; this pin owns the era-parity half.
+        """
+        with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
             response = server.handle_request(
                 {
                     "jsonrpc": "2.0",
@@ -366,9 +380,12 @@ class TestHandleRequestEdge:
                     "params": {"name": ["tool"], "arguments": {}},
                 }
             )
-        mock_dispatch.assert_called_once()
-        assert "error" not in response  # legacy tool-exception envelope, not JSON-RPC error
-        assert "unhashable" in response["result"]["content"][0]["text"]
+        mock_dispatch.assert_not_called()
+        assert "result" not in response
+        assert response["error"]["code"] == INVALID_PARAMS
+        assert response["error"]["message"] == (
+            "Invalid params: 'name' must be a non-empty string in tools/call params."
+        )
 
     def test_modern_tools_call_bad_name_error_message_exact(self, server):
         """Equivalence pin (committed GREEN before the R5 refactor): the
