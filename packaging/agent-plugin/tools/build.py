@@ -294,7 +294,7 @@ def _deterministic_tar(staged_root: Path, archive_path: Path) -> None:
                     tar.addfile(info, io.BytesIO(data))
 
 
-def build_release(repo_root, out_dir) -> Path:
+def build_release(repo_root, out_dir) -> tuple[Path, str]:
     """`build()` 산출물에 결정론 아카이브·compat report·릴리스 해시 세트를 더해 원자적으로
     게시하고 `(staged 디렉터리 경로, version)` 을 돌려준다.
 
