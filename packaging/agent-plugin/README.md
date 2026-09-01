@@ -16,7 +16,7 @@ packaging/agent-plugin/
 ├── schemas/                      # 벤더링한 canonical 1.0.0 스키마 (오프라인 검증용)
 │   ├── plugin.schema.json
 │   └── mcp.schema.json
-├── tools/                        # 빌더·검증기·env 계약 정본 — wheel 에는 포함되지 않는다
+├── tools/                        # 빌더·검증기·env 계약·E2E 하네스 정본 — wheel 에는 포함되지 않는다
 └── README.md                     # 이 문서
 ```
 
@@ -49,6 +49,14 @@ pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_smoke.py
 멱등성·환경 변수 문서-코드 동기화 가드를 다룬다. `test_agent_plugin_smoke.py` 는
 레퍼런스 클라이언트로 빌드 산출물을 실제 기동해 프로비저닝부터 `tools/call` 까지
 확인한다(clean 성격 — sanitize 된 최소 base env 사용).
+
+`tools/openclaw_e2e.py` 는 **실** 클라이언트로 같은 것을 확인하는 하네스다.
+CI 에서 돌지 않는다 — 실 클라이언트 설치를 요구하기 때문이다. 러너는
+`scripts/verify_openclaw_e2e.py`, 절차와 판정 기준의 정본은
+[`docs/agent-plugin-packaging.md`](../../docs/agent-plugin-packaging.md) 의
+"실 클라이언트 검증" 절이다. 그 증거 판정기만
+`tests/test_openclaw_e2e_evidence.py` 가 실제 캡처 픽스처와 역변이로 CI 에서
+회귀를 잡는다.
 
 ## 벤더링 스키마 출처와 무결성
 
