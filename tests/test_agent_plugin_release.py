@@ -607,6 +607,71 @@ class TestVerifyRelease:
         with pytest.raises(b.BuildError):
             b.verify_release(release)
 
+    # -- PR #257 리뷰 P2: 수신자 검증 경로의 읽기 오류 방호 (fix-design-v2) -------------
+
+    def test_release_file_non_utf8_bytes_rejected(self, release):
+        """RELEASE.SHA256SUMS 가 비 UTF-8(손상)이면 UnicodeDecodeError 가 아니라
+        BuildError 로 종료해야 한다(pytest.raises 가 타입을 고정한다)."""
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        data = bytearray(release_path.read_bytes())
+        data[3] = 0xFF
+        release_path.write_bytes(bytes(data))
+        with pytest.raises(b.BuildError):
+            b.verify_release(release)
+
+    def test_release_file_permission_denied_rejected(self, release):
+        """RELEASE.SHA256SUMS 를 읽을 수 없으면(권한) BuildError 로 종료해야 한다."""
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        original_mode = release_path.stat().st_mode
+        os.chmod(release_path, 0o000)
+        try:
+            try:
+                release_path.read_bytes()
+            except OSError:
+                pass
+            else:
+                pytest.skip(
+                    "현재 환경에서 chmod 0o000 이 읽기를 막지 못한다(root 등 권한 강제 미적용) -- 스킵"
+                )
+            with pytest.raises(b.BuildError):
+                b.verify_release(release)
+        finally:
+            os.chmod(release_path, original_mode)
+
+    def test_sidecar_non_utf8_bytes_rejected_with_message(self, release):
+        """패키지 사이드카가 비 UTF-8 이면 BuildError 위반 메시지에 '패키지 사이드카' 와
+        'UTF-8' 이 함께 실려야 한다(다른 분기로 우연히 통과하는 것을 방지)."""
+        sidecar_path = release / "localcrab-plugin.SHA256SUMS"
+        data = bytearray(sidecar_path.read_bytes())
+        data[3] = 0xFF
+        sidecar_path.write_bytes(bytes(data))
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        message = str(exc_info.value)
+        assert "패키지 사이드카" in message
+        assert "UTF-8" in message
+
+    def test_release_entry_file_permission_denied_rejected(self, release):
+        """RELEASE 항목 파일(tar.gz)을 읽을 수 없으면 BuildError 위반 목록에 '읽을 수
+        없다' 가 실려야 한다."""
+        archive_path = release / "localcrab-plugin-1.0.0.tar.gz"
+        original_mode = archive_path.stat().st_mode
+        os.chmod(archive_path, 0o000)
+        try:
+            try:
+                archive_path.read_bytes()
+            except OSError:
+                pass
+            else:
+                pytest.skip(
+                    "현재 환경에서 chmod 0o000 이 읽기를 막지 못한다(root 등 권한 강제 미적용) -- 스킵"
+                )
+            with pytest.raises(b.BuildError) as exc_info:
+                b.verify_release(release)
+            assert "읽을 수 없다" in str(exc_info.value)
+        finally:
+            os.chmod(archive_path, original_mode)
+
     def test_full_recompute_set_passes_characterization(self, release):
         """성격규정(characterization) -- 진본성 비보장 경계를 명문화한다.
 
@@ -726,3 +791,21 @@ class TestCli:
         out_dir = tmp_path / "dist"
         assert cli.main(["--out", str(out_dir)]) == 0
         assert cli.main(["--out", str(out_dir)]) == 0
+
+    def test_verify_flag_non_utf8_release_reports_failure_without_traceback(self, cli, tmp_path, capsys):
+        """PR #257 리뷰 P2: 비 UTF-8 RELEASE.SHA256SUMS 가 traceback 이 아니라 문서화된
+        'release verification failed' 형식 + exit 1 로 종료해야 한다(예외 전파 없음)."""
+        out_dir = tmp_path / "dist"
+        assert cli.main(["--out", str(out_dir)]) == 0
+        capsys.readouterr()
+
+        release_files = list(out_dir.glob("localcrab-plugin-*.RELEASE.SHA256SUMS"))
+        assert len(release_files) == 1
+        data = bytearray(release_files[0].read_bytes())
+        data[3] = 0xFF
+        release_files[0].write_bytes(bytes(data))
+
+        code = cli.main(["--verify", "--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "release verification failed" in captured.err
