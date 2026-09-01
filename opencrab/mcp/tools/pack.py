@@ -231,14 +231,33 @@ def _ingest_into_pack(
     Parameters
     ----------
     text_as_node:
-        When True (default), raw ``text`` is materialised as a 9-space
-        ``evidence/TextUnit`` graph node via ``builder.add_node`` so it
-        becomes a first-class grammar-compliant node (graph + doc + vector,
-        all pack_id-tagged).  ``hybrid.ingest`` and ``mongo.upsert_source``
-        are skipped to avoid duplicate vector writes under the same id.
-        When False, the legacy path is used: vector-only embedding via
-        ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
+        Both branches now produce the same ``evidence/TextUnit`` graph node
+        (#74); the flag no longer decides whether the text is visible to
+        graph-based features. What it still decides is the rest of the shape.
+
+        When True (default), ``text`` goes through ``builder.add_node``
+        directly: graph + doc_nodes + vector, the vector carrying the NODE's
+        assembled text and node-shaped metadata. ``hybrid.ingest`` and
+        ``mongo.upsert_source`` are skipped, so there is no ``doc_sources``
+        row and the source does not appear in source listings or the
+        free-tier source quota.
+
+        When False, the write goes through ``source_writer.write_source``:
+        the same graph node plus a ``doc_sources`` row, and the vector
+        carries the RAW text with source-shaped metadata. That path also
+        declines to create a node for a ``source_id`` too long to survive as
+        a node id through a fork remap -- ``add_node`` above has no such
+        carve-out.
+
+        Collapsing the two into one path would change ``added_nodes`` /
+        ``evidence_node`` and the vector shape for existing callers, so it is
+        deliberately left alone.
     """
+    from opencrab.common.graph_identity import (
+        GraphSchemaMigrationRequired,
+        GraphWriteUnavailable,
+        NodeIdentityConflict,
+    )
     from opencrab.grammar.validator import validate_edge, validate_node
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
@@ -465,24 +484,63 @@ def _ingest_into_pack(
                 stores["evidence_node"] = f"error: {exc}"
             text_ingested = True
         else:
-            # Legacy path: vector-only embedding + doc_sources record, now
-            # through the write_source chokepoint (#148) instead of two
-            # independent calls -- see opencrab/pack/source_writer.py for why
-            # (doc row first, one ownership stamp for both).
+            # Legacy path: through the write_source chokepoint (#148/#74),
+            # which now also materialises an evidence/TextUnit graph node
+            # ahead of the doc_sources row and the vector -- see
+            # opencrab/pack/source_writer.py for why (graph leg first and
+            # required, one ownership stamp shared by all three legs).
             reason = _source_probe_conflict(ctx, source_id, pack_id)
             if reason:
                 node_errors.append(_identity_reject_message("source", source_id, reason))
             else:
                 from opencrab.pack.source_writer import write_source
 
-                write_result = write_source(
-                    ctx["sql"], ctx["hybrid"], ctx["mongo"], ctx["chroma"],
-                    text=text, source_id=source_id,
-                    metadata=meta, pack_id=pack_id,
-                )
-                stores.update(write_result.get("stores", {}))
+                # #74: only these four become a response. NOT `except
+                # Exception` like the evidence branch above -- write_source now
+                # runs the builder, which re-runs `authorize`, and a registry
+                # that went down between the two checks raises a bare
+                # RuntimeError. Absorbing that into `node_errors` would report
+                # an authorization failure as a partial success. Anything
+                # outside this tuple propagates to the dispatcher on purpose.
+                #
+                # The two graph types are defensive only: write_source turns
+                # them into a `stores["graph"]` failure itself, so in the normal
+                # flow they never arrive here.
+                try:
+                    write_result = write_source(
+                        ctx["sql"], ctx["hybrid"], ctx["mongo"], ctx["chroma"],
+                        graph=ctx["neo4j"],
+                        text=text, source_id=source_id,
+                        metadata=meta, pack_id=pack_id,
+                    )
+                except (
+                    ValueError,
+                    NodeIdentityConflict,
+                    GraphSchemaMigrationRequired,
+                    GraphWriteUnavailable,
+                ) as exc:
+                    node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
+                else:
+                    stores.update(write_result.get("stores", {}))
 
-                text_ingested = True
+                    # #74: the legacy branch now materialises the same node the
+                    # text_as_node=True branch does, so the response must stop
+                    # reporting zero. Gated on POSITIVE graph confirmation --
+                    # `store_write_failures` treats neither the long-id
+                    # carve-out's "skipped (...)" nor a missing key as a
+                    # failure, so a negative-list check alone would count a node
+                    # that was never written. The second half mirrors the
+                    # evidence branch's own "no store failed" rule so the two
+                    # `added_nodes` contributions in one response mean the same
+                    # thing.
+                    write_stores = write_result.get("stores") or {}
+                    if store_write_succeeded(write_stores, "graph") and not (
+                        store_write_failures(write_stores)
+                    ):
+                        evidence_node = source_id
+                        added_nodes += 1
+
+                    text_ingested = True
 
     # #66 codex re-review, findings [4]/[6]: the billing gate must be
     # provably driven by store_write_succeeded() ALONE, not by
@@ -491,14 +549,28 @@ def _ingest_into_pack(
     # docstring-comment above the node loop — but must not leak into this
     # decision). billable_write already covers every node/edge/evidence-node
     # write via store_write_succeeded(..., "graph"). The text_as_node=False
-    # legacy branch never touches `graph` at all (vector-only embedding + a
-    # doc_sources record), so its own signal is store_write_succeeded(stores)
-    # with no key — positive confirmation that at least one of
-    # chromadb/documents actually came back a recognized "ok"-prefixed status
+    # legacy branch now writes a graph node too (via write_source, #74), but
+    # this gate deliberately does not look at that key (design v13 §4.9 pins
+    # today's billing meaning) -- its own signal is store_write_succeeded()
+    # against chromadb and documents BY NAME (it used to be the key-less form,
+    # which meant the same thing back when those were the only two keys in the
+    # map; see the block below the gate) — positive confirmation that at least
+    # one of the two actually came back a recognized "ok"-prefixed status
     # (see that function's docstring in builder.py for the full success-value
     # inventory this is based on, and why "unavailable" alone must not bill).
     text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
-    legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
+    # #74 pins the two keys this check has always actually seen. Before the
+    # graph leg existed, `stores` on this branch held exactly `documents` and
+    # `chromadb`, so the key-less form and this one are the SAME predicate
+    # today -- the change preserves the gate rather than altering it. Written
+    # out because the graph leg now merges `graph`/`docs`/`sql` into the same
+    # map, and a key-less "any store came back ok" would start billing a call
+    # whose doc_sources row failed but whose graph node landed. Money gates do
+    # not get to change as a side effect.
+    legacy_text_landed = text_ingested and not text_as_node and (
+        store_write_succeeded(stores, "documents")
+        or store_write_succeeded(stores, "chromadb")
+    )
     wrote_anything = billable_write or legacy_text_landed
     if wrote_anything:
         billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
@@ -845,7 +917,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
+                    "description": "Both settings store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead. One exception: with false, a source_id too long to survive as a node id through a pack fork gets no node (the doc_sources row and vector are still written).",
                 },
             },
             "required": ["title"],
@@ -869,9 +941,15 @@ def pack_create(
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
     pack_id is auto-slugged from title unless explicitly provided.
-    Optional text is materialised as a 9-space evidence/TextUnit graph node
-    (text_as_node=True, default) or embedded as a vector blob only (False).
-    The ``ingest`` billing event's subject is the caller's server-derived
+    Optional text becomes an evidence/TextUnit graph node (#74):
+    text_as_node=True (default) calls the builder directly, embedding the
+    node's own summary text in the vector; text_as_node=False (legacy) goes
+    through write_source instead, which writes the same graph node plus a
+    doc_sources row and embeds the ORIGINAL text in the vector. That path
+    makes no node for a source_id too long to survive a pack fork's id remap
+    (the doc_sources row and vector are still written); text_as_node=True has
+    no such carve-out. The
+    ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
     stays fixed at 'default'.
 
@@ -1377,7 +1455,7 @@ def pack_create(
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged, graph+doc+vector). Set false for legacy vector-only embedding.",
+                    "description": "Both settings store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead. One exception: with false, a source_id too long to survive as a node id through a pack fork gets no node (the doc_sources row and vector are still written).",
                 },
                 "title": {
                     "type": "string",
@@ -1408,9 +1486,14 @@ def pack_ingest(
     Add content into an EXISTING localcrab ontology pack.
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
-    Optional text is materialised as a 9-space evidence/TextUnit graph node
-    (text_as_node=True, default) so it becomes a grammar-compliant first-class
-    node. Set text_as_node=False for legacy vector-only embedding.
+    Optional text becomes an evidence/TextUnit graph node (#74):
+    text_as_node=True (default) calls the builder directly, embedding the
+    node's own summary text in the vector. text_as_node=False (legacy) goes
+    through write_source instead, which writes the same graph node plus a
+    doc_sources row and embeds the ORIGINAL text in the vector. That path
+    makes no node for a source_id too long to survive a pack fork's id remap
+    (the doc_sources row and vector are still written); text_as_node=True has
+    no such carve-out.
     Fails if the pack does not exist — use pack_create first.
     The ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id

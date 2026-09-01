@@ -164,6 +164,40 @@ def _test_doc_mutation(stack: dict[str, Any], sql: str, params: dict[str, Any]) 
     _test_store_mutation(stack["docs"], sql, params)
 
 
+def _seed_colliding_source_bypassing_graph(
+    stack: dict[str, Any], principal: Principal, *, source_id: str, pack_id: str, text: str,
+) -> None:
+    """T89/T92 픽스처 전용: `write_source`를 거치지 않고 doc/vector 스토어에
+    직접 시딩한다.
+
+    두 테스트는 `source_id`와 같은 id의 그래프 노드가 이미 존재하는 상태에서
+    같은 id의 "소스"를 만들어야 한다 -- fork의 node/source 축 id 충돌 가드를
+    치려는 것이다. `write_source`의 기본값(`write_graph=True`)으로 부르면
+    그래프 leg가 진짜 `NodeIdentityConflict`를 던져 픽스처 자체가 죽고,
+    `write_graph=False`는 (#74 가드에 의해) `fork_copy=True` 없이는 이제
+    거부된다 -- 그 조합은 fork의 raw-copy 전용 옵트아웃이지 일반적인 픽스처
+    구성 수단이 아니기 때문이다.
+
+    두 테스트가 검증하는 것은 fork의 `_fork()` 결과(node/source 충돌 가드)
+    이지 소스 쓰기 경로 자체가 아니므로, `write_source`를 지날 이유가 없다.
+    대신 그 함수가 정상 호출됐을 때 doc/vector 스토어에 남겼을 것과 같은
+    형상을 직접 만든다: `source_writer.write_source`의 `stamp(...,
+    keys=SOURCE_STAMPED)`가 채우는 `pack_id`/`user_id`와, 뒤이은
+    `meta.setdefault("space", "evidence")`를 그대로 재현하고, 벡터 쪽에는
+    `HybridQuery.ingest`가 채우는 `source_id` 키까지 맞춘다. `fork_pack`이
+    실제로 읽는 것은 `docs.list_sources_scoped`(pack_id는 metadata의
+    JSON 술어로 스코핑된다)뿐이라 doc 쪽 시딩만으로도 이 두 테스트의
+    어서션은 성립하지만, 원래 픽스처가 두 스토어 모두에 소스를 남기던
+    형상과 어긋나지 않도록 벡터도 함께 심는다.
+    """
+    docs, vector = stack["docs"], stack["vector"]
+    meta = {"pack_id": pack_id, "user_id": principal.user_id, "space": "evidence"}
+    docs.upsert_source(source_id, text, dict(meta))
+    vector_meta = dict(meta)
+    vector_meta["source_id"] = source_id
+    vector.upsert_texts(texts=[text], metadatas=[vector_meta], ids=[source_id])
+
+
 def _seed_pack(
     stack, owner: Principal, pack_id: str, *,
     node_count: int = 2, with_edge: bool = True, with_source: bool = True,
@@ -173,8 +207,9 @@ def _seed_pack(
     matching an ordinary ``pack_create``d pack -- needed for T28) + N
     ordinary content nodes + an edge between the first two (if any) +
     one legacy text source. Returns the actual pack_id assigned."""
-    sql, builder, docs, vector, hybrid = (
+    sql, builder, docs, vector, hybrid, graph = (
         stack["sql"], stack["builder"], stack["docs"], stack["vector"], stack["hybrid"],
+        stack["graph"],
     )
     with principal_scope(owner):
         dst = begin_pack_creation(sql, owner.user_id, pack_id)
@@ -209,7 +244,7 @@ def _seed_pack(
             )
         if with_source:
             write_source(
-                sql, hybrid, docs, vector,
+                sql, hybrid, docs, vector, graph=graph,
                 text="hello world, this is a legacy source", source_id="s0", pack_id=dst,
             )
     if visibility:
@@ -907,6 +942,7 @@ class TestVectorFidelity:
         with principal_scope(ALICE):
             write_source(
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                graph=stack["graph"],
                 text="the quick brown fox jumps over the lazy dog",
                 source_id="s-custom", metadata={"custom_tag": "hello-t13"}, pack_id=src,
             )
@@ -1060,6 +1096,7 @@ class TestCapEnforcement:
             for i in range(4):
                 write_source(
                     stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                    graph=stack["graph"],
                     text=f"chunk {i}", source_id=f"s{i}", pack_id=src_sources,
                 )
         out = _fork(stack, principal=ALICE, src_pack_id=src_sources)
@@ -2103,6 +2140,7 @@ class TestSourcesWithoutVectorsResidualReport:
         with principal_scope(ALICE):
             write_source(
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                graph=stack["graph"],
                 text="a source with no vector", source_id="s-no-vec", pack_id=src,
                 write_vector=False,
             )
@@ -2715,6 +2753,7 @@ class TestRemappedIdLengthRejection:
         with principal_scope(ALICE):
             write_source(
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                graph=stack["graph"],
                 text="a source-only body", source_id=long_source_id, pack_id=src,
             )
 
@@ -3069,6 +3108,7 @@ class TestPackIdContentIdNamespaceGuard:
         with principal_scope(ALICE):
             write_source(
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                graph=stack["graph"],
                 text="a source whose id collides with the pack id",
                 source_id=src, pack_id=src,
             )
@@ -3103,11 +3143,22 @@ class TestPackIdContentIdNamespaceGuard:
             for i in range(10):
                 write_source(
                     stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                    graph=stack["graph"],
                     text=f"ordinary source {i}", source_id=f"{src}-s{i}", pack_id=src,
                 )
-            write_source(
-                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
-                text="alias-conflicted source", source_id=src, pack_id=src,
+            # #74: `src` is already a Document node id (the `_add_node` call
+            # above, corrupted to a bogus space right after). `write_source`
+            # would either raise a real `NodeIdentityConflict` for it
+            # (`write_graph=True`) or -- since #74's own guard now requires
+            # `fork_copy=True` alongside `write_graph=False` -- refuse the
+            # call outright, since that combination is the fork raw-copy
+            # opt-out and not a fixture-construction escape hatch. Seed the
+            # doc/vector stores directly instead so the fixture reaches
+            # `_fork()`, which is what this guard actually tests (the
+            # SOURCE-axis id collision, not the graph write itself).
+            _seed_colliding_source_bypassing_graph(
+                stack, ALICE,
+                source_id=src, pack_id=src, text="alias-conflicted source",
             )
         _test_doc_mutation(stack,
             "UPDATE doc_sources SET metadata = json_set(metadata, '$.pack', :v) "
@@ -3182,11 +3233,18 @@ class TestPackIdContentIdNamespaceGuard:
         assertion failed."""
         src = _seed_pack(stack, ALICE, "src-t92", node_count=2, with_source=True)
         _add_node(stack, src, src)
-        with principal_scope(ALICE):
-            write_source(
-                stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
-                text="collides on the source axis too", source_id=src, pack_id=src,
-            )
+        # #74: see test_t89's identical comment -- `src` is already a
+        # Document node id from `_add_node` above, so `write_source` would
+        # either raise a real `NodeIdentityConflict` (`write_graph=True`) or
+        # be refused outright (`write_graph=False` without `fork_copy=True`
+        # is the fork raw-copy opt-out, not a fixture escape hatch). Seed
+        # the doc/vector stores directly instead of exercising the graph
+        # write, which is not what the fork-level node/source collision
+        # guard this test targets is about.
+        _seed_colliding_source_bypassing_graph(
+            stack, ALICE,
+            source_id=src, pack_id=src, text="collides on the source axis too",
+        )
 
         out = _fork(stack, principal=ALICE, src_pack_id=src)
 
@@ -3477,8 +3535,16 @@ def _seed_mixed_types(stack, tag):
     `_seed_pack` only ever writes `Document`, so an implementation that
     hardcodes that one type would pass a single-type fixture (T100's
     reverse-mutation needs the second type to kill it).
+
+    `with_source=False`: #74 made `_seed_pack`'s default legacy source
+    ("s0") materialise its own evidence/TextUnit graph node, whose id
+    does not match this fixture's `{tag}-n{i}` shape -- T100's own
+    `shape()` helper parses every non-anchor id as `...n<i>` and raises
+    `IndexError` on anything else. This fixture tests label-shape
+    handling, not sources, so the source leg is dropped rather than
+    special-cased in `shape()`.
     """
-    src = _seed_pack(stack, ALICE, tag, node_count=0, with_edge=False)
+    src = _seed_pack(stack, ALICE, tag, node_count=0, with_edge=False, with_source=False)
     kinds: dict[str, str] = {}
     with principal_scope(ALICE):
         for i in range(12):
@@ -3853,7 +3919,10 @@ class TestLabelShapeAndRetiredAlias:
         caplog.set_level(logging.WARNING)
 
         # Two of twelve nodes lose their type. The denominator includes the
-        # anchor row, hence 2/13.
+        # anchor row AND the `s0` source's own evidence/TextUnit node (#74:
+        # `write_source`'s graph leg now materialises every source as a node
+        # too, and that node lands in the same `export_nodes_scoped` count
+        # the node-axis floor divides by), hence 2/14, not 2/13.
         src_i = self._t104_fixture(stack, "t104ci")
         self._inject_legacy_edges(monkeypatch, stack, src_i, "t104ci")
         _patch_labels(
@@ -3864,7 +3933,7 @@ class TestLabelShapeAndRetiredAlias:
         # Pinning the axis name and the ratio, not just "completeness floor":
         # an implementation that checks a dependent axis first would still say
         # "completeness floor" while rejecting for the wrong reason.
-        assert "node loss ratio 2/13" in str(out_i.get("error")), out_i
+        assert "node loss ratio 2/14" in str(out_i.get("error")), out_i
         assert self._alias_warnings(caplog) == []
 
     def test_t104c_ii_warning_silent_when_last_axis_floor_rejects(self, stack, monkeypatch, caplog):
@@ -3959,6 +4028,7 @@ class TestLabelShapeAndRetiredAlias:
         with principal_scope(ALICE):
             write_source(
                 stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
+                graph=stack["graph"],
                 text="conflict", source_id="t106-conflict", pack_id=src,
             )
         stack["docs"].upsert_source(

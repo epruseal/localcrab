@@ -96,6 +96,7 @@ from opencrab.auth import Principal
 from opencrab.common.pack_tags import canonicalize_pack_alias, strip_retired_keys
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 from opencrab.pack.fork_remap import (
+    NODE_ID_COLUMN_LIMIT,
     REFERENCE_KEYS,
     build_mapping,
     new_salt,
@@ -155,7 +156,9 @@ FORK_MAX_LOSS_RATIO = 0.10
 #     string would silently disagree the day the convention changes. No test
 #     can kill a mutation back to the literal 8 -- the two are equal under
 #     today's convention -- which is a property of deriving, not a gap.
-_PACK_ID_COLUMN_LIMIT = 256
+# 정본은 fork_remap 에 있다(issue #74). source_writer 의 노드화 예산이 같은
+# 근거를 써야 해서 옮겼고, 이름은 이 모듈의 기존 참조를 위해 유지한다.
+_PACK_ID_COLUMN_LIMIT = NODE_ID_COLUMN_LIMIT
 _PACK_ID_COLLISION_SUFFIX_LEN = 9
 _ANCHOR_PREFIX_LEN = len(anchor_node_id(""))
 _PACK_ID_BUDGET = (
@@ -1598,9 +1601,16 @@ def _fork_pack_inner(
                     if isinstance(fetched, dict):
                         text = fetched.get("text") or ""
                 receipt = write_source(
-                    sql, hybrid, docs, vector,
+                    sql, hybrid, docs, vector, graph=graph,
                     text=text, source_id=new_id, metadata=meta, pack_id=dst,
                     origin="server", fork_copy=True, write_vector=False,
+                    # #74: step 14 above already copied this source's TextUnit
+                    # node (if it had one) with its ORIGINAL remapped
+                    # properties. Letting the source leg build a fresh node
+                    # here would overwrite that copy. A source the origin pack
+                    # never had a node for stays node-less in the fork too --
+                    # a fork copies, it does not backfill.
+                    write_graph=False,
                 )
                 if not _fork_leg_ok(receipt, "source"):
                     tier2_failure = f"source {old_id!r} -> {new_id!r} write failed"

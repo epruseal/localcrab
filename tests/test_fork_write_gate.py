@@ -34,7 +34,7 @@ reads.
 
 from __future__ import annotations
 
-import re
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -334,6 +334,15 @@ class _SourceDocs:
     def get_source(self, source_id):  # noqa: ARG002
         return self._existing
 
+    # #74: `write_source`'s graph leg runs the node-level identity guard
+    # against this same `docs` double (its `doc_nodes` row, distinct from
+    # `get_source`'s `doc_sources` row). A missing probe method on an
+    # `available` store fails closed as CONFLICT_UNVERIFIABLE, so this must
+    # exist; None (unattributed) keeps every conflict in this class's own
+    # tests coming from `get_source`, as before.
+    def get_node_doc(self, space, node_id):  # noqa: ARG002
+        return None
+
 
 class _Hybrid:
     def __init__(self, status="ok (id=s1)"):
@@ -355,10 +364,12 @@ class _SourceVec:
         return self._row
 
 
-def _write(sql_, *, pack_id, principal=ALICE, docs=None, hybrid=None, vector=None, **kw):
+def _write(sql_, *, pack_id, principal=ALICE, docs=None, hybrid=None, vector=None,
+           graph=None, **kw):
     with principal_scope(principal):
         return write_source(
             sql_, hybrid or _Hybrid(), docs or _SourceDocs(), vector or _SourceVec(),
+            graph=graph if graph is not None else _Graph(),
             text="t", source_id="s1", pack_id=pack_id, **kw
         )
 
@@ -475,23 +486,48 @@ class TestSourceWriterOrigin:
 # unit, so the true file count is 0 today. "At most one" pins the ceiling
 # now; the orchestrator commit tightens this to "exactly one" (asserting the
 # single file IS opencrab/pack/fork.py) once that module exists.
+#
+# #74 adds a SECOND, structurally different caller of `write_vector=False`:
+# `source_writer._graph_leg` passes it on every `write_source` call (fork or
+# not) to keep the node's own vector leg from re-embedding the id that
+# `hybrid.ingest` is about to embed with the source's own metadata -- not an
+# opt-in a client can reach, and not the fork abuse door this contract
+# guards. `fork_copy=True` gets no such second caller: nothing outside the
+# fork orchestrator ever needs to widen the `creating`-pack gate.
 # ---------------------------------------------------------------------------
 
 
-def _caller_files(pattern: re.Pattern[str]) -> list[str]:
+def _caller_files(keyword: str, value: bool) -> list[str]:
+    """Files under ``opencrab/`` that pass ``keyword=value`` in a real call.
+
+    Matched with the AST rather than a regex over the file text (#74). The
+    regex version counted the *definition* file as a caller as soon as its
+    docstring or an error message mentioned the flag by name -- and the
+    guard `write_source` now raises for a `write_graph=False` without
+    `fork_copy=True` says "requires fork_copy=True" in its message, which is
+    prose, not a call. Keyword arguments in `ast.Call` nodes are exactly the
+    thing these tests mean by "caller".
+    """
     root = Path(__file__).resolve().parent.parent / "opencrab"
     files: list[str] = []
     for path in sorted(root.rglob("*.py")):
-        raw = path.read_text(encoding="utf-8")
-        if pattern.search(raw):
-            files.append(str(path.relative_to(root.parent)))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and any(
+                kw.arg == keyword
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is value
+                for kw in node.keywords
+            ):
+                files.append(str(path.relative_to(root.parent)))
+                break
     return files
 
 
 def test_fork_copy_true_has_at_most_one_caller_file_repo_wide():
     """T22 (strengthened): the orchestrator has landed, so "at most one"
     tightens to "exactly one, and it is opencrab/pack/fork.py"."""
-    files = _caller_files(re.compile(r"fork_copy\s*=\s*True"))
+    files = _caller_files("fork_copy", True)
     assert files == ["opencrab/pack/fork.py"], (
         f"fork_copy=True must be used from exactly one file (the pack_fork "
         f"orchestrator): {files}"
@@ -499,10 +535,18 @@ def test_fork_copy_true_has_at_most_one_caller_file_repo_wide():
 
 
 def test_write_vector_false_has_at_most_one_caller_file_repo_wide():
-    """T22 (strengthened): the orchestrator has landed, so "at most one"
-    tightens to "exactly one, and it is opencrab/pack/fork.py"."""
-    files = _caller_files(re.compile(r"write_vector\s*=\s*False"))
-    assert files == ["opencrab/pack/fork.py"], (
-        f"write_vector=False must be used from exactly one file (the "
-        f"pack_fork orchestrator): {files}"
+    """T22 (strengthened once, widened once more by #74).
+
+    The orchestrator landed, tightening "at most one" to "exactly one, and
+    it is opencrab/pack/fork.py" -- and then #74 added `source_writer.py`'s
+    own internal use (see the block comment above): the node leg of every
+    source write must not re-embed the id the source's own vector leg is
+    about to embed. That is not the fork-only abuse door this test guards,
+    so two files is the new, correct ceiling -- not a regression to chase
+    back down to one.
+    """
+    files = _caller_files("write_vector", False)
+    assert files == ["opencrab/pack/fork.py", "opencrab/pack/source_writer.py"], (
+        f"write_vector=False must be used from exactly these two files (the "
+        f"pack_fork orchestrator and source_writer's own node leg): {files}"
     )
