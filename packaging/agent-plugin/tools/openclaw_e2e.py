@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import subprocess
 import threading
 import time
@@ -399,7 +400,8 @@ def write_recorder_shim(shim_dir: str | os.PathLike, real_bin: str, record_dir: 
     py.write_text(body, encoding="utf-8")
 
     launcher = shim_dir / "opencrab"
-    launcher.write_text(f'#!/bin/sh\nexec python3 {py}  "$@"\n', encoding="utf-8")
+    # 경로에 공백이나 셸 메타문자가 있어도 깨지지 않도록 인용한다.
+    launcher.write_text(f'#!/bin/sh\nexec python3 {shlex.quote(str(py))} "$@"\n', encoding="utf-8")
     launcher.chmod(0o755)
     return launcher
 
@@ -582,31 +584,34 @@ def check_persisted(real_bin: str, plugin_data: str | os.PathLike, node_id: str,
         "LOCALCRAB_ENV_FILE": os.path.join(plugin_data, "localcrab.env"),
         "OPENCRAB_BOOTSTRAP_ON_EMPTY": "1",
     }
+    # 세 메시지를 한 번에 보내고 communicate 로 받는다. readline 을 쓰면 서버가
+    # 기동 중 멈췄을 때 timeout 이 걸리지 않아 무한 대기한다.
+    script = "".join(json.dumps(msg) + "\n" for msg in (
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "openclaw-e2e-readback", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": READBACK_TOOL, "arguments": {"node_id": node_id}}},
+    ))
     proc = subprocess.Popen([os.path.abspath(real_bin), "serve"], cwd=plugin_data, env=env,
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
-        def send(obj):
-            proc.stdin.write(json.dumps(obj) + "\n")
-            proc.stdin.flush()
+        out, _ = proc.communicate(input=script, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return {"found": False, "error": f"readback timed out after {timeout}s"}
 
-        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-              "params": {"protocolVersion": "2025-11-25", "capabilities": {},
-                         "clientInfo": {"name": "openclaw-e2e-readback", "version": "1"}}})
-        proc.stdout.readline()
-        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-              "params": {"name": READBACK_TOOL, "arguments": {"node_id": node_id}}})
-        reply = json.loads(proc.stdout.readline())
-    finally:
+    reply = {}
+    for line in out.splitlines():
         try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
+            frame = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(frame, dict) and frame.get("id") == 2:
+            reply = frame
+            break
 
     text = ((reply.get("result") or {}).get("content") or [{}])[0].get("text", "")
     try:

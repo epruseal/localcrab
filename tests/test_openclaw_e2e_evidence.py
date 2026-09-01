@@ -381,6 +381,22 @@ def test_recorder_shim_source_is_syntactically_valid(tmp_path):
     py_compile.compile(str(tmp_path / "shim" / "opencrab_recorder.py"), doraise=True)
 
 
+def test_recorder_launcher_survives_paths_with_spaces(tmp_path):
+    """스크래치 경로에 공백이나 셸 메타문자가 있어도 기록기가 기동해야 한다.
+
+    인용하지 않으면 경로가 여러 인자로 쪼개져 기록기가 뜨지 않고, 증상은 또
+    서버 기동 실패로만 보인다.
+    """
+    import subprocess
+
+    odd = tmp_path / "scratch dir; echo pwned"
+    launcher = write_recorder_shim(odd / "shim", "/bin/true", odd / "rec")
+    # 실제로 실행해 본다. 인용이 깨져 있으면 python3 가 다른 인자를 받아 실패한다.
+    done = subprocess.run([str(launcher)], input="", capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert "pwned" not in done.stdout + done.stderr
+
+
 def test_recorder_shim_bakes_paths_as_constants(tmp_path):
     """기록기는 경로를 환경 변수로 읽으면 안 된다.
 
