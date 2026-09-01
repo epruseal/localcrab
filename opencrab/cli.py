@@ -34,8 +34,12 @@ console = Console()
 # startup rejection diagnostics (stale secret, --allow-query-token, missing
 # principal, registry violation) must never share `console`'s stream -- a
 # rejection message on stdout would corrupt the protocol a client is trying
-# to read from the very same fd. Scoped to those four call sites only; every
-# other command (including `serve --transport http`) keeps using `console`.
+# to read from the very same fd. These four rejection diagnostics go to
+# `err_console` for *both* transports (the stale-secret and registry checks
+# run before the stdio/http branch), since a `serve --transport http`
+# process that fails to start is equally an operator-facing rejection, not
+# JSON-RPC traffic; `serve`'s own normal (non-rejection) output and every
+# other command keep using `console`.
 err_console = Console(stderr=True)
 
 

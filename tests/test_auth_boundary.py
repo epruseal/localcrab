@@ -713,7 +713,7 @@ class TestBootstrapOptInGate:
         monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", value)
         from opencrab.auth import bootstrap_on_empty_requested
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=r"must be unset"):
             bootstrap_on_empty_requested()
         assert sorted(os.listdir(env)) == []
 
@@ -747,7 +747,7 @@ class TestBootstrapStorageModeGate:
         get_settings.cache_clear()
         from opencrab.auth import maybe_bootstrap_on_empty
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=r"requires STORAGE_MODE=local"):
             maybe_bootstrap_on_empty()
         assert sorted(os.listdir(env)) == []
 
@@ -774,11 +774,18 @@ class TestBootstrapDataDirGate:
             "test setup invariant: this case must exercise the unspecified-source "
             "branch, not the explicit one"
         )
+        # Real the default path *exists* before the call: a mutant that drops
+        # the model_fields_set check would then pass G4 (directory exists)
+        # and go on to create a store in it, which only the post-call
+        # "empty directory" assertion below can catch -- an absent directory
+        # would fail G4 on its own and mask the mutation.
+        default_dir = Path(settings.local_data_dir)
+        default_dir.mkdir(parents=True, exist_ok=True)
         from opencrab.auth import maybe_bootstrap_on_empty
 
-        with pytest.raises(RuntimeError, match="LOCAL_DATA_DIR"):
+        with pytest.raises(RuntimeError, match=r"set explicitly"):
             maybe_bootstrap_on_empty()
-        assert not Path(settings.local_data_dir).exists()
+        assert os.listdir(default_dir) == []
 
     def test_empty_string_local_data_dir_refuses(self, env, monkeypatch):
         """AC3 (G3, F3 counterexample): an explicit but blank value must not
@@ -786,15 +793,35 @@ class TestBootstrapDataDirGate:
         create split -- it is rejected before either is touched."""
         monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
         monkeypatch.setenv("LOCAL_DATA_DIR", "")
+        # An empty data_dir makes the pre-lock file check resolve against
+        # cwd (``Path("", "opencrab.db")`` == ``Path("opencrab.db")``), so
+        # cwd must be isolated to an empty directory -- otherwise a stray
+        # opencrab.db in whatever directory pytest happens to run from could
+        # change which branch a mutant takes.
+        monkeypatch.chdir(env)
         from opencrab.config import get_settings
 
         get_settings.cache_clear()
         settings = get_settings()
         assert "local_data_dir" in settings.model_fields_set
         assert settings.local_data_dir.strip() == ""
+
+        # Decisive sentinel (round-2 finding 1): patched at opencrab.locking
+        # because opencrab.auth imports file_lock lazily inside the function
+        # body (`from opencrab.locking import file_lock`), so patching an
+        # attribute on the auth module would never be seen. A mutant that
+        # drops the non-blank check must reach this before raising anything
+        # else -- fail loud rather than let some other guard mask it.
+        import opencrab.locking as locking_mod
+
+        def _forbidden_lock(*a, **kw):
+            raise AssertionError("lock must not be entered")
+
+        monkeypatch.setattr(locking_mod, "file_lock", _forbidden_lock)
+
         from opencrab.auth import maybe_bootstrap_on_empty
 
-        with pytest.raises(RuntimeError, match="LOCAL_DATA_DIR"):
+        with pytest.raises(RuntimeError, match=r"non-blank"):
             maybe_bootstrap_on_empty()
         assert not Path("/opencrab.db").exists(), "F3 split must never reach the root create"
 
@@ -816,7 +843,7 @@ class TestBootstrapDataDirGate:
         get_settings.cache_clear()
         from opencrab.auth import maybe_bootstrap_on_empty
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=r"contains '\?'"):
             maybe_bootstrap_on_empty()
         assert sorted(os.listdir(real_dir)) == []
         assert not truncated.exists()
@@ -1322,6 +1349,11 @@ class TestBootstrapLockErrorAtEntryPoints:
         assert p.stdout == ""
         assert p.stderr.strip() != ""
         assert "Traceback" not in p.stderr
+        # Pins the lock-specific diagnostic itself, not just "some error
+        # went to stderr" -- a plain unbootstrapped-refusal message (RED
+        # state) contains no such text, so this fails decisively if the
+        # entry-point wiring stops routing through the lock path at all.
+        assert "bootstrap.lock" in p.stderr
         assert not (Path(env) / "opencrab.db").exists()
 
     def test_console_script_serve_stdio_reports_context_and_exits_1(self, env):
@@ -1333,6 +1365,7 @@ class TestBootstrapLockErrorAtEntryPoints:
         assert p.stdout == ""
         assert p.stderr.strip() != ""
         assert "Traceback" not in p.stderr
+        assert "bootstrap.lock" in p.stderr
         assert not (Path(env) / "opencrab.db").exists()
 
 
@@ -1501,6 +1534,45 @@ class TestServeStdioRejectionStreams:
             close()
 
         result = CliRunner().invoke(main, ["serve", "--transport", "stdio"])
+        assert result.exit_code != 0
+        assert result.stdout == ""
+        assert result.stderr.strip() != ""
+
+
+class TestServeHttpRejectionStreams:
+    """설계 v13 §4 항목 3: serve 거부 진단은 transport 불문 stderr.
+
+    ``refuse_stale_shared_secret_env()`` runs in ``serve`` before the
+    stdio/http branch, so the stale-secret rejection
+    ``TestServeStdioRejectionStreams`` pins for stdio applies identically to
+    ``--transport http`` -- this was already the implementation's behaviour
+    (fix-design-v3 item 4's channel-B rebuttal), only the introducing
+    comment was wrong; this test is the fix-design-v3 item 4 fixture that
+    pins it so a future regression is caught rather than re-argued.
+    """
+
+    def test_stale_secret_rejection_is_stderr_only(self, env, monkeypatch):
+        """AC7's http counterpart. Port-safety tripwire (fix-design-v3 item
+        4, round-2 finding 2): ``uvicorn.run`` is patched to record any call
+        and then fail fast, so no mutation of the rejection path can reach a
+        real bind -- the recorded-empty-calls assertion is decisive even
+        though CliRunner would otherwise swallow the sentinel's own
+        AssertionError into a nonzero exit code."""
+        monkeypatch.setenv("OPENCRAB_API_KEY", "leftover")
+
+        import uvicorn
+
+        calls = []
+
+        def _forbidden_uvicorn_run(*a, **kw):
+            calls.append((a, kw))
+            raise AssertionError("uvicorn.run must not run after a stale-secret rejection")
+
+        monkeypatch.setattr(uvicorn, "run", _forbidden_uvicorn_run)
+
+        result = CliRunner().invoke(main, ["serve", "--transport", "http"])
+
+        assert calls == [], "uvicorn.run must never be reached here"
         assert result.exit_code != 0
         assert result.stdout == ""
         assert result.stderr.strip() != ""
