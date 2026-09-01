@@ -143,7 +143,7 @@ def build(repo_root, out_dir) -> Path:
 # 이슈 #247: 릴리스 세트(결정론 아카이브 + compat report + RELEASE.SHA256SUMS)
 # ---------------------------------------------------------------------------
 
-_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_VERSION_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 _RELEASE_TMP_DIRNAME = ".release-build-tmp"
 _ARCHIVE_PREFIX = "localcrab-plugin/"
 _HASH_LINE_RE = re.compile(r"([0-9a-f]{64})  (.+)")
@@ -155,7 +155,7 @@ def _safe_version(version: str) -> str:
     경로 구분자·`..` 류 이탈을 막는 파일명 안전성 검사일 뿐이며 PEP 440 전면 검증은 하지
     않는다 -- 이 경계의 책임은 파일명 안전성으로 한정한다.
     """
-    if not isinstance(version, str) or not _VERSION_RE.match(version):
+    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
         raise BuildError(f"버전 문자열이 파일명으로 안전하지 않다: {version!r}")
     return version
 
@@ -644,7 +644,16 @@ def verify_release(out_dir) -> None:
 
     for name, digest in release_entries.items():
         path = out_dir / name
-        if not path.is_file():
+        # v14/v15 [G1]: 이름 사전 거부(NAME_MAX 등) 대신 탐침 자체를 오류 경계로
+        # 편입한다 -- NAME_MAX 는 파일시스템 종속 값이라 상수 검사가 이식성 함정이
+        # 되고, 경계 편입은 ENAMETOOLONG 외 stat 계열 오류 전반을 같은 위반 형식으로
+        # 수렴시킨다.
+        try:
+            is_file = path.is_file()
+        except OSError:
+            violations.append(f"항목 경로를 탐침할 수 없다: {name}")
+            continue
+        if not is_file:
             violations.append(f"파일 없음: {name}")
             continue
         cap = _MAX_SUMS_BYTES if name.endswith(".SHA256SUMS") else _MAX_RELEASE_FILE_BYTES
