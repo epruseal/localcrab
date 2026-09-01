@@ -577,22 +577,59 @@ class SQLStore:
     # ------------------------------------------------------------------
 
     def register_node(self, space: str, node_type: str, node_id: str) -> None:
-        """Insert or update a node registry entry."""
+        """Insert or update a node registry entry.
+
+        Re-registering an existing ``(space, node_id)`` updates the existing
+        row rather than deleting and reinserting it: the row keeps its ``id``
+        and ``created_at``, and only ``node_type`` and ``updated_at`` change.
+        The SQLite branch used to emit SQLite's REPLACE conflict-resolution
+        form, which is a DELETE-then-INSERT — it reallocated the AUTOINCREMENT
+        ``id`` and re-evaluated the ``created_at`` DEFAULT, so "first seen at"
+        silently became "last seen at", while the PG branch preserved both.
+        One ``ON CONFLICT (...) DO UPDATE`` now serves both dialects, which is
+        the same contract ``_sql_dialect.py``'s "ROWID STABILITY" note already
+        fixed for the graph/doc stores (issue #81).
+
+        The shared contract is exactly those two columns. On SQLite the
+        rewrite additionally keeps the row's rowid (``id`` is the rowid alias
+        here), which is what that note is about; PostgreSQL gives no such
+        guarantee — an UPDATE writes a new tuple version under MVCC — and
+        nothing here asks it to.
+
+        That contract is pinned two ways in
+        ``tests/test_sql_store_upsert_parity.py``: the SQL both methods
+        actually execute is captured and checked, and this file's source is
+        searched for the literal two-word spelling of SQLite's conflict-
+        resolution clause (the one named in that same note). The pin greps for
+        those two words adjacent, which is why the prose above never puts them
+        side by side.
+
+        Only the "current time" fragment still comes from the dialect
+        (``datetime('now')`` vs ``NOW()``); the statement itself is shared.
+        ``updated_at`` is written explicitly rather than left to the DDL
+        DEFAULT so the INSERT path keeps the PG branch's exact previous
+        meaning even on a schema whose column has no DEFAULT.
+
+        Assumes the target table carries the ``UNIQUE (space, node_id)``
+        constraint this store's own DDL creates (present since the first
+        commit). A hand-rolled schema without it has never supported this
+        method's upsert semantics — with no constraint to conflict on, the old
+        statement silently appended a duplicate row on every call instead of
+        updating; ``ON CONFLICT`` reports the schema mismatch instead.
+        """
         self._require_available()
 
         from sqlalchemy import text
 
-        if self._is_sqlite:
-            sql = text(
-                "INSERT OR REPLACE INTO ontology_nodes (space, node_type, node_id) "
-                "VALUES (:space, :node_type, :node_id)"
-            )
-        else:
-            sql = text(
-                "INSERT INTO ontology_nodes (space, node_type, node_id, updated_at) "
-                "VALUES (:space, :node_type, :node_id, NOW()) "
-                "ON CONFLICT (space, node_id) DO UPDATE SET node_type=EXCLUDED.node_type, updated_at=NOW()"
-            )
+        from opencrab.stores._sql_dialect import POSTGRES, SQLITE
+
+        now = (SQLITE if self._is_sqlite else POSTGRES).now_expr()
+        sql = text(
+            "INSERT INTO ontology_nodes (space, node_type, node_id, updated_at) "
+            f"VALUES (:space, :node_type, :node_id, {now}) "
+            "ON CONFLICT (space, node_id) DO UPDATE SET "
+            f"node_type = EXCLUDED.node_type, updated_at = {now}"
+        )
 
         with self._engine.begin() as conn:
             conn.execute(sql, {"space": space, "node_type": node_type, "node_id": node_id})
@@ -748,24 +785,28 @@ class SQLStore:
         resource_id: str,
         granted: bool = True,
     ) -> None:
-        """Upsert a ReBAC policy row."""
+        """Upsert a ReBAC policy row.
+
+        Re-setting an existing ``(subject_id, permission, resource_id)``
+        updates the existing row's ``granted`` rather than deleting and
+        reinserting it: the row keeps its ``id`` and ``created_at``. Same fix and same reasoning as ``register_node`` above
+        (issue #81) — the SQLite branch's REPLACE form destroyed both.
+        ``rebac_policies`` has no ``updated_at`` column, so this statement needs
+        no dialect-specific fragment at all and is shared verbatim.
+
+        Assumes the ``UNIQUE (subject_id, permission, resource_id)`` constraint
+        from this store's own DDL; see ``register_node``.
+        """
         self._require_available()
 
         from sqlalchemy import text
 
-        if self._is_sqlite:
-            sql = text(
-                "INSERT OR REPLACE INTO rebac_policies "
-                "(subject_id, permission, resource_id, granted) "
-                "VALUES (:sid, :perm, :rid, :granted)"
-            )
-        else:
-            sql = text(
-                "INSERT INTO rebac_policies (subject_id, permission, resource_id, granted) "
-                "VALUES (:sid, :perm, :rid, :granted) "
-                "ON CONFLICT (subject_id, permission, resource_id) "
-                "DO UPDATE SET granted=EXCLUDED.granted"
-            )
+        sql = text(
+            "INSERT INTO rebac_policies (subject_id, permission, resource_id, granted) "
+            "VALUES (:sid, :perm, :rid, :granted) "
+            "ON CONFLICT (subject_id, permission, resource_id) DO UPDATE SET "
+            "granted = EXCLUDED.granted"
+        )
         with self._engine.begin() as conn:
             conn.execute(
                 sql,

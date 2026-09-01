@@ -155,7 +155,7 @@ SQLite B-tree는 `SELECT ... LIMIT k`로 앞에서 k행만 읽으므로, 테이�
 
 | 연산 | JSON (`LocalDocStore`) | SQLite (`LocalSQLDocStore`) |
 | --- | --- | --- |
-| `upsert_node_doc` | O(N): 전체 재직렬화 | O(log N): `INSERT OR REPLACE` |
+| `upsert_node_doc` | O(N): 전체 재직렬화 | O(log N): `INSERT ... ON CONFLICT DO UPDATE` |
 | `get_node_doc` | O(N): 전체 파싱 + dict.get | O(log N): PK lookup |
 | `delete_node_doc` | O(N): 전체 로드 + 재저장 | O(log N): DELETE by PK |
 | `collection_stats` | O(N): `len(json.load())` | O(1): `COUNT(*)` (B-tree 내부) |
@@ -193,9 +193,10 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_ts ON audit_log(timestamp DESC);
 ```
 
-`properties` / `metadata` / `details`는 JSON TEXT로 저장한다. `json_extract()`
-의존성(SQLite 3.38+)을 피하고 버전 요구사항을 3.9.0+로 유지하기 위해 파싱은
-Python `json.loads()`로 처리한다.
+`properties` / `metadata` / `details`는 JSON TEXT로 저장한다. **컬럼 전체를 왕복할
+때는** 파싱을 SQL이 아니라 Python `json.loads()`로 처리한다. 다만 한 키만 보는
+필터·스코프 질의(`keyword_search()`의 space·pack 필터 등)는 SQL에서 `json_extract()`를
+쓴다. 그 가용성은 버전이 아니라 빌드 옵션에 달려 있다(§7 참조).
 
 ---
 
@@ -522,35 +523,60 @@ opencrab serve
 
 ## 7. SQLite 버전 요구사항
 
-### 최소 버전: SQLite 3.9.0
+### 최소 버전: SQLite 3.24.0 + JSON 함수 활성화 빌드
 
-로컬 모드는 `json_extract()` 함수를 사용한다 (`local_graph_store.py`의 DDL 및
-`list_packs()`, `export_nodes()` 메서드). `json_extract()`는 SQLite 3.9.0
-(2015-10-14 출시)부터 지원된다.
+요구사항은 두 갈래이며 성격이 다르다.
 
-사용처:
+**버전 하한 3.24.0 (2018-06-04)** — SQLite의 UPSERT 절에서 온다.
+`INSERT ... ON CONFLICT (...) DO UPDATE SET`와 `... DO NOTHING`은 둘 다 3.24.0부터
+지원된다. 이 저장소는 두 형태를 모두 쓰며, `SqlDialect.upsert()` 헬퍼를 경유하는
+경로와 헬퍼 없이 문을 직접 조립하는 경로가 함께 있다. **어느 쪽이든 하한은 같다** —
+같은 문법이기 때문이다. 코어 문법이라 버전 숫자만으로 가용성이 보장된다.
+
+**JSON 함수 활성화** — `json_extract()`는 버전으로 보장되지 않는다. JSON1과 함께
+3.9.0(2015-10-14)에 도입됐지만 3.37.2까지는 빌드 옵션(`SQLITE_ENABLE_JSON1`)이었고,
+3.38.0부터 기본 포함이지만 여전히 `SQLITE_OMIT_JSON`으로 제외할 수 있다. 따라서
+버전이 아니라 함수 자체를 확인해야 한다. (3.38.0부터 추가된 `->` / `->>` **연산자**는
+PostgreSQL 분기에서만 쓰이므로 SQLite 경로의 요구사항이 아니다.)
+
+`json_extract()`는 **graph store와 doc store 양쪽**이 필터·스코프 질의에서 쓴다.
+대표 예는 다음 둘이다(전수 목록이 아니다).
 
 ```python
-# local_graph_store.py — DDL
+# 그래프: pack_id 함수 인덱스 DDL과 list_packs() / export_nodes()
 "CREATE INDEX IF NOT EXISTS idx_nodes_pack"
 " ON graph_nodes(json_extract(properties, '$.pack_id'))"
 
-# list_packs() 메서드
-"SELECT json_extract(properties, '$.pack_id') AS pack_id ..."
+# 문서: keyword_search() 의 space·pack 필터 (SqlDialect.json_get /
+#       json_truthy_text 경유, 위치 플레이스홀더 바인딩)
+"... AND json_extract(s.metadata, '$.space') IN (?, ...) ..."
 ```
 
-### 버전 확인
+지금 어디서 쓰는지는 코드에 물어본다. 아래는 **텍스트 후보 검색**이라 docstring·주석·
+부정문("`OR REPLACE`를 쓰지 않는다" 같은 서술)까지 잡는다. 실행 사용처와 같지 않으니
+결과를 걸러 읽어야 한다.
+
+```bash
+grep -rn "ON CONFLICT" --include="*.py" opencrab/ scripts/
+grep -rn "json_get(\|json_truthy_text(" --include="*.py" opencrab/
+```
+
+### 확인
+
+버전 출력만으로는 부족하므로 함수 실행까지 확인한다.
 
 ```bash
 python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+python3 -c 'import sqlite3; print(sqlite3.connect(":memory:").execute("SELECT json_extract(?, ?)", ("{\"pack_id\": \"p1\"}", "$.pack_id")).fetchone()[0])'   # p1 이 출력되면 JSON 함수가 있다
 ```
 
-3.9.0 미만이면 로컬 모드 초기화 시 인덱스 생성이 실패하고 `LocalGraphStore`가
-`available=False`로 설정된다.
+3.24.0 미만이면 upsert가 문법 오류로 실패한다. JSON 함수가 없으면 로컬 모드 초기화 시
+인덱스 생성이 실패하고 `LocalGraphStore`가 `available=False`로 설정된다.
 
-`LocalSQLDocStore`는 `json_extract()`를 사용하지 않으므로 (properties 파싱은
-Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지만 추가 제약은
-없다.
+`LocalSQLDocStore`도 두 요구를 모두 진다. JSON 컬럼 **전체를 왕복할 때는** Python
+`json.loads()`로 파싱하지만, `keyword_search()`의 필터와 공유 베이스의 스코프 술어는
+SQL에서 `json_extract()`를 쓴다. upsert 경로 역시 그대로 타므로 3.24.0 하한도
+적용된다.
 
 ---
 
