@@ -1,36 +1,39 @@
 """
 SqlDialect — a small, frozen value object capturing the SQLite ↔ PostgreSQL
-SQL-text differences exercised by the doc-store 13-method surface
-(local_sql_doc_store.py / pg_doc_store.py).
+SQL-text differences that this codebase's dual-dialect modules share.
+
+WHO USES IT is deliberately not enumerated here. The set has grown steadily
+since this object was introduced, and every list written down went stale on
+the next adopter. Ask the code instead:
+
+    grep -rn "_sql_dialect import\\|self\\._dialect\\." --include="*.py" opencrab/
 
 THIS IS NOT A GENERAL SQL RENDERER. It only reproduces the handful of
-fragments those two stores actually emit today:
+fragments its callers actually need:
     - INSERT (plain) / INSERT-as-upsert (``INSERT ... ON CONFLICT (...) DO
       UPDATE SET ...`` — identical shape on both dialects; SQLite has
       supported this upsert syntax since 3.24 (2018), see "ROWID STABILITY"
       below for why this replaced an earlier ``INSERT OR REPLACE`` SQLite
       branch)
-    - DDL for the three doc-store tables (doc_nodes / doc_sources /
-      audit_log), from one dialect-neutral ``SchemaSpec``
+    - DDL rendered from one dialect-neutral ``SchemaSpec``
     - a couple of small per-value helpers (timestamp bind value, "now"
-      SQL fragment, json_extract-vs-->> for a future graph-store user)
+      SQL fragment, json_extract-vs-->> for per-key JSON access)
 
 WHAT IT DELIBERATELY DOES NOT COVER:
     - keyword_search: FTS5 bm25() vs tsvector/pg_trgm is too divergent for a
-      shared fragment (per Stage 6a instructions) — each store keeps its own
-      full implementation; see local_sql_doc_store.py / pg_doc_store.py.
+      shared fragment (per Stage 6a instructions) — each doc store keeps
+      its own full implementation.
     - schema/table qualification (PG's `"schema".table` prefix): that is
       store-owned state (``self._schema``), not a dialect concern — callers
       pass already-qualified table names into ``insert``/``upsert``.
     - placeholder binding at the call site: both engines accept NAMED
       (``:name``) bind params in practice (sqlite3 supports paramstyle
-      "named" natively, not just "qmark" — see sqlite3 docs), so
-      ``_sql_doc_base.py`` uses ``:name`` uniformly for both dialects. This
-      dialect still records ``placeholder_style`` because it's an accurate
-      *characterization* of what the pre-refactor hand-written SQL in
-      local_sql_doc_store.py (qmark ``?``) and pg_doc_store.py (named
-      ``:x``) emits today — useful for tests/docs, not because the shared
-      base needs two code paths for it.
+      "named" natively, not just "qmark" — see sqlite3 docs), so shared
+      call sites can use ``:name`` uniformly for both dialects. This
+      dialect still records ``placeholder_style`` as an accurate
+      *characterization* of the two dialects' conventional styles (SQLite
+      qmark ``?``, PG named ``:x``) — useful for tests/docs, not because
+      any shared code path branches on it.
 
 DERIVATION: every fragment below was checked against the literal SQL text in
 local_sql_doc_store.py and pg_doc_store.py at Stage 6a authoring time (see
@@ -120,27 +123,33 @@ class SqlDialect:
     def now_expr(self) -> str:
         """SQL-side "current time" fragment.
 
-        NOTE: neither doc store's hand-written SQL actually calls this today
-        — both compute ``datetime.now(UTC)`` in Python so both backends
-        share one wall-clock source of truth instead of trusting the DB
-        server's clock (which could differ from the app server's). Provided
-        for DDL ``DEFAULT`` clauses and for graph-store dialect reuse.
+        Two ways to stamp a timestamp coexist in this codebase, and they are
+        not interchangeable. Computing ``datetime.now(UTC)`` in Python gives
+        both backends one wall-clock source of truth instead of trusting the
+        DB server's clock (which could differ from the app server's); using
+        this fragment puts the clock in the statement, which is what a SET
+        clause needs when there is no Python-side value to bind (e.g. an
+        upsert whose ``updated_at`` must follow the row's DDL DEFAULT
+        format). Also used for DDL ``DEFAULT`` clauses.
         """
         return "datetime('now')" if self.name == "sqlite" else "NOW()"
 
     def bind_value_for_timestamp(self, dt: datetime) -> Any:
-        """Python value to bind for a ``timestamp`` column, matching what
-        each store's current code passes: SQLite binds an ISO-8601 string
-        (TEXT column), PG binds a ``datetime`` object directly (TIMESTAMPTZ,
-        coerced by the driver)."""
+        """Python value to bind for a ``timestamp`` column: SQLite binds an
+        ISO-8601 string (its timestamp columns are TEXT), PG binds a
+        ``datetime`` object directly (TIMESTAMPTZ, coerced by the driver)."""
         return dt.isoformat() if self.name == "sqlite" else dt
 
     def json_get(self, col: str, key: str) -> str:
-        """Per-key JSON field extraction. Not exercised by the doc-store 13
-        methods (they round-trip whole JSON blobs) — provided for the
-        graph-store dialect reuse (``list_packs()``'s
-        ``json_extract(properties, '$.pack_id')`` vs ``properties->>'pack_id'``
-        pattern), which is Stage 6b scope, not this stage's stores."""
+        """Per-key JSON field extraction, e.g.
+        ``json_extract(properties, '$.pack_id')`` vs
+        ``properties->>'pack_id'``.
+
+        This is for reading ONE key inside SQL — filter and scope predicates
+        that must run in the WHERE clause. It is unrelated to round-tripping
+        a whole JSON column, which callers do in Python with ``json.loads``;
+        a store that round-trips blobs in Python still reaches for this the
+        moment it needs to filter on a key."""
         if self.name == "sqlite":
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"
@@ -262,12 +271,10 @@ class SqlDialect:
         failure mode: exactly one placeholder, independent of scope size.
 
         ``placeholder`` IS AN ARGUMENT, not hardcoded to ``":packs"``,
-        because the two callers in this codebase use DIFFERENT bind
-        styles for the SAME dialect: ``_sql_graph_base.py`` /
-        ``pg_graph_store.py`` bind NAMED (``:name``) throughout, but
-        ``local_sql_doc_store.py``'s ``keyword_search`` executes raw
-        ``sqlite3`` with POSITIONAL (``?``) placeholders and a
-        ``params: list`` -- mixing qmark and named placeholders in one
+        because bind style varies by CALL SITE, not by dialect: some call
+        sites bind NAMED (``:name``) throughout, while one that executes
+        raw ``sqlite3`` uses POSITIONAL (``?``) placeholders with a
+        ``params: list`` -- and mixing qmark and named placeholders in one
         SQLite statement raises ``sqlite3.ProgrammingError``. A hardcoded
         ``:packs`` would compile fine here in isolation and only break at
         the SQL-execution boundary of that one caller, far from this
@@ -301,10 +308,10 @@ class SqlDialect:
     def _value_exprs(self, columns: Sequence[str], json_columns: Sequence[str]) -> list[str]:
         """Both dialects render NAMED (``:col``) placeholders here — sqlite3
         accepts paramstyle "named" natively (see module docstring), so using
-        it uniformly lets ``_sql_doc_base.py`` pass one params dict to either
-        backend's execute call. Only PG's JSON columns get the ``CAST(...
-        AS jsonb)`` wrapper; SQLite has no such cast (JSON is stored as
-        plain TEXT)."""
+        it uniformly lets a shared call site pass ONE params dict to either
+        backend's execute call instead of shaping the params twice. Only
+        PG's JSON columns get the ``CAST(... AS jsonb)`` wrapper; SQLite has
+        no such cast (JSON is stored as plain TEXT)."""
         return [
             f"CAST(:{c} AS jsonb)" if (c in json_columns and self.name == "postgres") else f":{c}"
             for c in columns
@@ -360,14 +367,12 @@ class SqlDialect:
         return f"'{default}'"
 
     def render_ddl(self, schema: SchemaSpec, *, schema_name: str | None = None) -> list[str]:
-        """One schema spec -> this dialect's DDL statement list, in the same
-        order LocalSQLDocStore._DDL / pg_doc_store._DDL_TEMPLATE emit them
-        (CREATE TABLE, then that table's indexes, table by table).
+        """One schema spec -> this dialect's DDL statement list, emitted
+        CREATE TABLE first and then that table's indexes, table by table.
 
         ``schema_name`` is only meaningful for PG (qualifies each statement
         with ``"schema".table``); SQLite has no schema concept here and
-        ignores it (mirrors LocalSQLDocStore, which never qualifies table
-        names).
+        ignores it.
         """
         prefix = f'"{schema_name}".' if (self.name == "postgres" and schema_name) else ""
         stmts: list[str] = []

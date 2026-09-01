@@ -24,10 +24,14 @@ SCHEMA DESIGN:
 
     properties / metadata / details are stored as JSON TEXT.  Structured
     columns are avoided because the dict schema is open and varies by caller.
-    Parsing stays caller-side (json.loads) rather than in SQL, so this store
-    never needs json_extract() -- whose availability is a build option, not a
-    version (see pyproject.toml's Runtime SQLite version note). The floor this
-    store does impose is 3.24.0, from the shared upsert path below.
+    Round-tripping a whole JSON column stays caller-side (json.loads) rather
+    than in SQL. That does NOT make this store free of SQL JSON functions:
+    keyword_search()'s space and pack filters, and the shared base's scope
+    predicates, go through SqlDialect.json_get / json_truthy_text, which emit
+    json_extract() on SQLite. So this store requires a build with the JSON
+    functions enabled -- availability is a build option, not a version -- on
+    top of the 3.24.0 floor from the shared upsert path (see pyproject.toml's
+    Runtime SQLite version note).
 
 STAGE 6a (F1): the 13-method surface's SQL text and dict-shaping now live in
     ``_SqlDocStoreBase`` (``_sql_doc_base.py``), parameterised by the SQLite

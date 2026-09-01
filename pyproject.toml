@@ -45,16 +45,24 @@ dependencies = [
 # Runtime SQLite version note:
 #   Local mode requires SQLite >= 3.24.0 (2018-06-04) AND a build with the
 #   JSON functions enabled.
-#     - 3.24.0 is the version floor: the shared upsert path
-#       (SqlDialect.upsert -> "INSERT ... ON CONFLICT (...) DO UPDATE SET")
-#       used by LocalSQLDocStore, LocalGraphStore and SQLStore is core syntax,
-#       so the version number alone guarantees it.
-#     - json_extract() (LocalGraphStore's pack_id index and list_packs/
-#       export_nodes) shipped with JSON1 in 3.9.0, but a version number does
-#       NOT guarantee it: through 3.37.2 JSON1 was a build option
-#       (SQLITE_ENABLE_JSON1), and from 3.38.0 it is built in by default yet
-#       can still be omitted (SQLITE_OMIT_JSON). Probe the function, not the
-#       version.
+#     - 3.24.0 is the version floor: SQLite's UPSERT clause
+#       ("INSERT ... ON CONFLICT (...) DO UPDATE SET" and "... DO NOTHING").
+#       Both forms are used here, some through the SqlDialect.upsert()
+#       helper and some assembled directly -- either way the floor is the
+#       same, and it is core syntax, so the version number alone
+#       guarantees it.
+#     - JSON functions: json_extract() is used by BOTH the graph and doc
+#       stores in filter/scope predicates (a pack_id functional index, a
+#       keyword_search space/pack filter, ...). It shipped with JSON1 in
+#       3.9.0, but a version number does NOT guarantee it: through 3.37.2
+#       JSON1 was a build option (SQLITE_ENABLE_JSON1), and from 3.38.0 it
+#       is built in by default yet can still be omitted (SQLITE_OMIT_JSON).
+#       Probe the function, not the version.
+#   No call-site list is kept here -- it would go stale. Ask the code
+#   (these are TEXT searches: they also match docstrings and comments, so
+#   they are candidates, not confirmed call sites):
+#     grep -rn "ON CONFLICT" --include="*.py" opencrab/ scripts/
+#     grep -rn "json_get(\|json_truthy_text(" --include="*.py" opencrab/
 #   Check both:
 #     python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
 #     python3 -c 'import sqlite3; print(sqlite3.connect(":memory:").execute("SELECT json_extract(?, ?)", ("{\"pack_id\": \"p1\"}", "$.pack_id")).fetchone()[0])'
