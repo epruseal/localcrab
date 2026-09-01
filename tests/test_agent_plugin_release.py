@@ -15,6 +15,7 @@ TDD RED 단계: `packaging/agent-plugin/tools/build.py` 에 `_safe_version`,
 
 from __future__ import annotations
 
+import errno
 import gzip
 import hashlib
 import io
@@ -1706,3 +1707,259 @@ class TestCli:
         captured = capsys.readouterr()
         assert code == 1
         assert "release verification failed" in captured.err
+
+    def test_verify_flag_release_read_error_no_traceback(self, cli, tmp_path, capsys, monkeypatch):
+        """PR #257 리뷰 4차 [S1]: RELEASE 본체를 연 뒤 판독 도중 OSError(EIO) 가 나면 CLI
+        층에서도 raw traceback 이 아니라 문서화된 'release verification failed' 형식 +
+        exit 1 로 끝나야 한다. fix-design-v16.md [A][B] -> v20.md."""
+        out_dir = tmp_path / "dist"
+        assert cli.main(["--out", str(out_dir)]) == 0
+        capsys.readouterr()
+
+        release_files = list(out_dir.glob("localcrab-plugin-*.RELEASE.SHA256SUMS"))
+        assert len(release_files) == 1
+        _inject_read_failure(monkeypatch, release_files[0].name)
+
+        code = cli.main(["--verify", "--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "release verification failed" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_build_out_dir_occupied_by_file_no_traceback(self, cli, tmp_path, capsys):
+        """PR #257 리뷰 4차 형제 경로 [P1]: build_release 의 초기 파일시스템 조작이 예외
+        변환 경계 밖이라 OSError 가 raw traceback 으로 샜다. CLI build 경로에서 문서화된
+        'build failed' 형식 + exit 1 로 끝나야 한다. fix-design-v17.md [P1]."""
+        occupied = tmp_path / "dist"
+        occupied.write_text("not a directory\n", encoding="utf-8")
+
+        code = cli.main(["--out", str(occupied)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "build failed" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_published_manifest_not_reread_after_publish(self, cli, tmp_path, capsys, monkeypatch):
+        """PR #257 리뷰 4차 [T1]: CLI 는 게시 후 plugin.json 을 다시 읽지 않아야 한다.
+        게시 직후(같은 main() 호출 안에서) manifest 를 삭제해도 exit 0 과 경로 출력이
+        정상이어야 한다 -- 재판독이 남아 있으면 이 테스트는 실패한다. fix-design-v20.md."""
+        out_dir = tmp_path / "dist"
+        original = cli.build_release
+
+        def wrapper(repo_root, target_dir):
+            result = original(repo_root, target_dir)
+            staged_root = result[0] if isinstance(result, tuple) else result
+            (staged_root / "plugin.json").unlink()
+            return result
+
+        monkeypatch.setattr(cli, "build_release", wrapper)
+
+        code = cli.main(["--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "Traceback" not in captured.err
+        lines = [ln for ln in captured.out.splitlines() if ln]
+        assert lines[0].startswith("plugin package:")
+        assert lines[1].startswith("sha256sums:")
+        assert len(lines) == 5
+
+    def test_output_paths_match_published_artifacts(self, cli, tmp_path, capsys, monkeypatch):
+        """PR #257 리뷰 4차 [T1]: 출력 경로는 게시된 산출물과 구성적으로 일치해야 한다.
+        게시 직후 manifest 의 version 을 형식상 안전한 다른 값('9.9.9')으로 손상시켜도
+        출력은 실제 게시물을 가리켜야 한다 -- 재판독 판본은 존재하지 않는
+        localcrab-plugin-9.9.9.* 를 출력해 실패한다. fix-design-v20.md 테스트 11."""
+        out_dir = tmp_path / "dist"
+        original = cli.build_release
+
+        def wrapper(repo_root, target_dir):
+            result = original(repo_root, target_dir)
+            staged_root = result[0] if isinstance(result, tuple) else result
+            manifest_path = staged_root / "plugin.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "9.9.9"
+            _write_json(manifest_path, manifest)
+            return result
+
+        monkeypatch.setattr(cli, "build_release", wrapper)
+
+        code = cli.main(["--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "9.9.9" not in captured.out
+
+        # 출력이 지목한 경로 3종이 실재하는 정규 파일이어야 한다.
+        quoted = [ln.split(":", 1)[1].strip() for ln in captured.out.splitlines() if ":" in ln]
+        listed = [Path(value) for value in quoted if value.startswith(str(out_dir))]
+        suffixes = (".tar.gz", ".COMPATIBILITY.md", ".RELEASE.SHA256SUMS")
+        matched = [path for path in listed if path.name.endswith(suffixes)]
+        assert len(matched) == 3
+        for path in matched:
+            assert path.is_file(), path
+
+
+# ---------------------------------------------------------------------------
+# PR #257 리뷰 4차 대응 -- 판독 중 OSError 오류 경계 (fix-design-v16 [A][B][C] -> v20)
+# ---------------------------------------------------------------------------
+
+
+class _ReadFailingProxy:
+    """실제 파일 객체를 감싸 read() 만 OSError 로 실패시킨다(open 은 정상 성공).
+
+    결함 주입은 read 신호 하나뿐이며 릴리스 세트·파일·해시는 전부 실물이다.
+    """
+
+    def __init__(self, wrapped) -> None:
+        self._wrapped = wrapped
+        self.close_count = 0
+
+    def read(self, size: int = -1) -> bytes:
+        raise OSError(errno.EIO, "injected read failure")
+
+    def seek(self, *args, **kwargs):
+        return self._wrapped.seek(*args, **kwargs)
+
+    def close(self) -> None:
+        self.close_count += 1
+        self._wrapped.close()
+
+
+class _CloseFailingProxy:
+    """판독은 전부 정상이고 close() 만 OSError 로 실패시킨다."""
+
+    def __init__(self, wrapped) -> None:
+        self._wrapped = wrapped
+
+    def read(self, size: int = -1) -> bytes:
+        return self._wrapped.read(size)
+
+    def seek(self, *args, **kwargs):
+        return self._wrapped.seek(*args, **kwargs)
+
+    def close(self) -> None:
+        self._wrapped.close()
+        raise OSError(errno.EIO, "injected close failure")
+
+
+def _inject_read_failure(monkeypatch, target_name: str, *, occurrence: int = 1) -> list:
+    """`_open_regular` 를 감싸 target_name 의 occurrence 번째 open 에서만 read 를 실패시킨다.
+
+    fix-design-v17.md [P3]: 사이드카는 RELEASE 항목 해싱(S2)과 사이드카 판독(S3)에서 각각
+    한 번씩 열리므로, 경로만으로 표적하면 두 사이트가 함께 실패해 원인이 격리되지 않는다.
+    호출 순번까지 표적해 한 사이트만 실패시킨다.
+    """
+    original = b._open_regular
+    state = {"count": 0}
+    proxies: list = []
+
+    def patched(path):
+        fileobj = original(path)
+        if Path(path).name == target_name:
+            state["count"] += 1
+            if state["count"] == occurrence:
+                proxy = _ReadFailingProxy(fileobj)
+                proxies.append(proxy)
+                return proxy
+        return fileobj
+
+    monkeypatch.setattr(b, "_open_regular", patched)
+    return proxies
+
+
+class TestVerifyReleaseReadErrorBoundary:
+    """판독 루프가 `_BudgetExceededError` 만 잡아 판독 중 OSError(EIO 등)가 경계 밖으로
+    나가던 결함(PR #257 리뷰 4차 P2). 리뷰어는 RELEASE 본체 1곳만 지목했으나 동일 패턴이
+    3곳이라 전수 대응한다. fix-design-v16.md [A][B] -> v20.md."""
+
+    @pytest.fixture
+    def release(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        b.build_release(repo, out_dir)
+        return out_dir
+
+    def test_release_body_read_error_converges_to_builderror(self, release, monkeypatch):
+        """[S1] RELEASE 본체 판독 실패는 즉시 BuildError 로 수렴한다."""
+        _inject_read_failure(monkeypatch, "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "RELEASE.SHA256SUMS 를 끝까지 읽을 수 없다" in str(exc_info.value)
+
+    def test_entry_read_error_converges_to_builderror(self, release, monkeypatch):
+        """[S2] RELEASE 항목 해싱 중 판독 실패는 위반으로 누적된다. 아카이브를 표적으로
+        삼아 사이드카 판독(S3)과 겹치지 않게 한다."""
+        _inject_read_failure(monkeypatch, "localcrab-plugin-1.0.0.tar.gz")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "파일을 끝까지 읽을 수 없다: localcrab-plugin-1.0.0.tar.gz" in str(exc_info.value)
+
+    def test_entry_read_error_closes_fd(self, release, monkeypatch):
+        """[S2] 판독 실패 분기도 fd 를 닫아야 한다(성공+아카이브 경로에서만 fd 를 살려
+        두는 구조라 with 를 쓸 수 없다)."""
+        proxies = _inject_read_failure(monkeypatch, "localcrab-plugin-1.0.0.tar.gz")
+        with pytest.raises(b.BuildError):
+            b.verify_release(release)
+        assert len(proxies) == 1
+        assert proxies[0].close_count == 1
+
+    def test_sidecar_read_error_converges_to_builderror(self, release, monkeypatch):
+        """[S3] 사이드카 판독 실패는 위반으로 누적된다. 사이드카의 두 번째 open(S3)만
+        표적해 S2 와 격리한다(fix-design-v17.md [P3])."""
+        _inject_read_failure(monkeypatch, "localcrab-plugin.SHA256SUMS", occurrence=2)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        message = str(exc_info.value)
+        assert "패키지 사이드카를 끝까지 읽을 수 없다" in message
+        # S2 는 정상 통과해야 한다 -- 같은 파일의 첫 번째 open 은 실패시키지 않았다.
+        assert "파일을 끝까지 읽을 수 없다: localcrab-plugin.SHA256SUMS" not in message
+
+    def test_close_failure_does_not_break_valid_release(self, release, monkeypatch):
+        """[C] 읽기 전용 fd 의 close() 오류는 검증 결과를 바꿀 무결성 신호가 아니다.
+        손상 없는 릴리스에서 close 만 실패시켜도 검증은 예외 없이 정상 완료해야 한다.
+        fix-design-v17.md [P4]: 'raw OSError 부재'가 아니라 정상 완료 자체를 단언한다."""
+        original = b._open_regular
+
+        def patched(path):
+            return _CloseFailingProxy(original(path))
+
+        monkeypatch.setattr(b, "_open_regular", patched)
+        assert b.verify_release(release) is None
+
+
+class TestBuildReleaseInitialFilesystemBoundary:
+    """`build_release` 의 초기 파일시스템 조작(out_dir mkdir, tmp_dir 정리·생성)이 예외
+    변환용 try 보다 먼저 실행돼 OSError 가 raw 로 전파되던 결함. CLI 는 BuildError 만
+    잡으므로 traceback 이 노출됐다. fix-design-v17.md [P1]. 실제 파일시스템 조건으로
+    유발하며 mock 을 쓰지 않는다."""
+
+    def test_out_dir_occupied_by_regular_file(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        occupied = tmp_path / "dist"
+        occupied.write_text("not a directory\n", encoding="utf-8")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.build_release(repo, occupied)
+        assert "release assembly failed" in str(exc_info.value)
+
+    def test_tmp_dir_occupied_by_regular_file(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        (out_dir / b._RELEASE_TMP_DIRNAME).write_text("not a directory\n", encoding="utf-8")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.build_release(repo, out_dir)
+        assert "release assembly failed" in str(exc_info.value)
+
+
+class TestBuildReleaseReturnsVersion:
+    """[T1] `build_release` 는 게시 시 확정한 version 을 함께 돌려준다 -- CLI 가 게시된
+    manifest 를 다시 읽을 필요 자체를 없앤다. fix-design-v20.md."""
+
+    def test_returns_staged_root_and_version(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        staged_root, version = b.build_release(repo, out_dir)
+        assert staged_root == out_dir / "localcrab-plugin"
+        assert staged_root.is_dir()
+        assert version == "1.0.0"
+        # 반환한 version 이 실제 게시물 이름을 확정한 값과 같아야 한다.
+        assert (out_dir / f"localcrab-plugin-{version}.tar.gz").is_file()
+        assert (out_dir / f"localcrab-plugin-{version}.RELEASE.SHA256SUMS").is_file()
