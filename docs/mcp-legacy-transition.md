@@ -4,13 +4,15 @@
 
 **현재 상태: legacy 세대는 활성이며 제거 일정이 없다.** 아래 조건표의 미지수가 채워지기 전에는 제거를 결정하지 않는다.
 
-## 1. legacy 표면 (제거 대상의 전량)
+## 1. legacy 표면 (제거 대상)
+
+legacy 표면의 정의는 **era 판정 규칙**이고, 그 규칙이 제거 대상을 **빠짐없이** 정의한다. 아래 표는 그 정의가 포괄하는 표면을 이름으로 보인 것이며, 판정이 갈리는 지점은 **표식의 형태**이지 표면 이름이 아니다. 규칙의 정본은 `docs/mcp-protocol-compat.md` 의 era 모델이다.
 
 | 표면 | 내용 |
 |---|---|
 | `initialize` / `notifications/initialized` | handshake 로 세션 의미를 협상. 지원 legacy 버전은 echo, 부재는 `2024-11-05` fallback, 미지·modern 전용 버전은 최신 legacy 제시 |
 | `ping` | modern 에서 제거된 메서드 |
-| `_meta` 없는 `tools/list` / `tools/call` | era 판정이 요청 바디의 `_meta` 부재로 legacy 로 떨어지는 모든 호출 |
+| **modern 표식이 없는** `tools/list` / `tools/call` | `params._meta` 가 **아예 없는** 경우와 **dict 이지만 `io.modelcontextprotocol/protocolVersion` 키가 없는** 경우를 **모두** 포함한다. 반면 `_meta` 가 present 이고 **비-dict**(JSON `null` 포함)이면 **legacy 가 아니다** — malformed 한 modern 표식으로 보아 modern 경로에서 거부한다 |
 | JSON-RPC 배치 배열 | legacy 전용 LocalCrab 확장 (2026-07-28 은 POST 당 요청 1건) |
 
 ## 2. 소비자 compatibility matrix

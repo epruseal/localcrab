@@ -136,7 +136,7 @@ class MCPServer:
         if protocol.is_modern_request(method, params):
             return self._handle_modern(req_id, method, params, is_notification)
 
-        # ── legacy era (initialize handshake; no per-request _meta) ───────
+        # ── legacy era (initialize handshake; no modern version marker) ──
         if not self._enabled_legacy:
             # Legacy support switched off via MCP_PROTOCOL_VERSIONS. The
             # errors name the modern versions: legacy clients have no

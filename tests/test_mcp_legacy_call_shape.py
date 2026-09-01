@@ -277,6 +277,47 @@ class TestLegacyCallShapeEdge:
         assert "ContextVar" not in json.dumps(response)
         assert "result" not in response
 
+    @pytest.mark.parametrize(
+        "meta_params, expect_legacy",
+        [
+            ({}, True),                                   # _meta absent
+            ({"_meta": {}}, True),                        # dict, no version key
+            ({"_meta": {"x": 1}}, True),                  # dict, other keys only
+            ({"_meta": None}, False),                     # present but non-dict
+            ({"_meta": []}, False),                       # present but non-dict
+        ],
+    )
+    def test_meta_shape_decides_the_era_not_meta_presence(
+        self, server, meta_params, expect_legacy
+    ):
+        """PR #265 review: the legacy surface is "no modern MARKER", not "no
+        ``_meta``".
+
+        A dict ``_meta`` that simply lacks
+        ``io.modelcontextprotocol/protocolVersion`` stays LEGACY -- a consumer
+        sending that shape is legacy traffic, and a removal audit that reads
+        the surface as "``_meta`` absent" would miss it. A PRESENT but
+        non-dict ``_meta`` is the opposite case: #136 routes it to the modern
+        path on purpose so its malformed shape is rejected instead of sliding
+        into legacy unvalidated.
+
+        Pinned here because nothing else in the suite covers a dict ``_meta``
+        without the version key, and ``docs/mcp-legacy-transition.md`` §1 now
+        states this rule as the definition of what removal has to cover.
+        """
+        params = {"name": VISIBLE_TOOL, "arguments": {}, **meta_params}
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": True}):
+            response = _call(server, params)
+        if expect_legacy:
+            # Legacy envelope: dispatched, and none of the modern fields.
+            assert "error" not in response, response
+            assert "isError" not in response["result"]
+            assert "resultType" not in response["result"]
+        else:
+            # Modern path: the malformed marker is rejected, never dispatched.
+            assert response["error"]["code"] == INVALID_PARAMS
+            assert "result" not in response
+
     def test_shared_validator_default_still_rejects_falsy_arguments(self):
         """The compatibility exception lives in the legacy call site, NOT in
         the shared validator: called plainly it must stay strict, or the

@@ -15,10 +15,12 @@ outcomes count as a valid RED). Any import of the new module is kept
 local to this file so a missing module cannot break collection of the
 rest of the test suite.
 
-Era determination (see design v4 §4.1): ``method == "server/discover"`` is always
-modern; otherwise a dict ``params["_meta"]`` carrying the
-``io.modelcontextprotocol/protocolVersion`` key means modern, and its
-absence means legacy.
+Era determination (see design v4 §4.1): ``method == "server/discover"`` is
+always modern; a PRESENT but non-dict ``params["_meta"]`` is a malformed
+modern marker and is routed to the modern path too (so it is rejected rather
+than sliding into legacy unvalidated); a dict ``params["_meta"]`` carrying the
+``io.modelcontextprotocol/protocolVersion`` key means modern. Everything else
+is legacy -- including a dict ``_meta`` WITHOUT that key.
 """
 
 from __future__ import annotations
@@ -188,7 +190,9 @@ class TestHandleRequestNormal:
 class TestHandleRequestError:
     def test_modern_meta_with_legacy_version_is_unsupported(self, server):
         """A legacy version number inside a per-request _meta is a
-        contradiction (legacy requests never carry _meta at all)."""
+        contradiction (a legacy request never carries the modern
+        protocolVersion marker -- it may still carry a dict _meta without
+        that key, which stays legacy)."""
         meta = {**MODERN_META, "io.modelcontextprotocol/protocolVersion": "2025-11-25"}
         response = server.handle_request(
             {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {"_meta": meta}}

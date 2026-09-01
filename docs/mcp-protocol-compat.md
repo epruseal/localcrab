@@ -6,7 +6,7 @@ LocalCrab MCP 서버가 어떤 프로토콜 세대를 어떻게 서빙하는지,
 
 | 세대 | 정의 | 판정 규칙 (요청 단위) |
 |---|---|---|
-| **modern** | 2026-07-28 이후. 요청마다 `params._meta` 에 버전·capability 를 싣는 stateless 계약 | `method == "server/discover"` 이거나, `params._meta`(dict)에 `io.modelcontextprotocol/protocolVersion` 키가 있음 |
+| **modern** | 2026-07-28 이후. 요청마다 `params._meta` 에 버전·capability 를 싣는 stateless 계약 | `method == "server/discover"` 이거나, `params._meta` 가 present 이고 **비-dict**(malformed 표식이므로 modern 으로 보내 거부)이거나, `params._meta`(dict)에 `io.modelcontextprotocol/protocolVersion` 키가 있음 |
 | **legacy** | 2025-11-25 이하. `initialize` handshake 로 세션 의미를 협상 | 위에 해당하지 않는 모든 요청 |
 
 era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰지 않는다 — 2025-06-18 legacy 클라이언트도 `MCP-Protocol-Version` 헤더를 보내기 때문이다. 예외 하나: modern 버전 값(`2026-07-28`)의 헤더가 legacy 바디에 붙으면 스펙 위반 조합으로 400(-32020)에 거부된다.
@@ -32,7 +32,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 ## legacy 경로 계약 (호환 계층)
 
-`initialize`/`notifications/initialized` handshake, `ping`, `_meta` 없는 `tools/list`·`tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지·modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
+`initialize`/`notifications/initialized` handshake, `ping`, modern 표식이 없는 `tools/list`·`tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지·modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
 
 **`tools/call` 형상 검증(#251)**: legacy 도 modern 과 **같은** 공유 검증기(`validate_tools_call_params`)를 dispatch 이전에 통과한다 — 비문자열 `name`, truthy 비객체 `arguments`, 비객체 `params` 는 -32602 다. 전에는 이 형상들이 dispatch 안에서 터져 내부 TypeError 가 JSON-RPC **성공 봉투**에 실려 나가거나(-32601 로 갈리거나) -32603 이 됐다. 도구를 실행시키던 입력은 하나도 바뀌지 않았다. 남은 era 차이는 정확히 하나: legacy 는 present + **falsy** 비객체 `arguments`(`null`/`[]`/`0`/`0.0`/`false`/`""`)를 종전대로 `{}` 로 정규화해 **도구를 실행한다**(modern 은 -32602). 그 형상은 오늘 성공하는 호출이므로 D절 제거 시점까지 유지한다 — `docs/mcp-legacy-transition.md` §3.
 
