@@ -204,7 +204,7 @@ class _SpyLimitedReader(getattr(b, "_LimitedReader", object)):
     깨지지 않도록 하기 위함이다(`getattr(b, "_LimitedReader", object)` 는 import 시점에
     평가되므로, RED 커밋 시점에는 이 파일이 `object` 기반으로 정의된다는 뜻이다)."""
 
-    last_instance: "_SpyLimitedReader | None" = None
+    last_instance: _SpyLimitedReader | None = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -1115,18 +1115,45 @@ class TestVerifyReleaseBoundedResources:
         assert calls["n"] == 0
 
     def test_negative_member_size_rejected(self, release, monkeypatch):
-        fake_member = tarfile.TarInfo(name=f"{b._ARCHIVE_PREFIX}bad.bin")
-        fake_member.size = -1
-        state = {"n": 0}
+        """실측(본 세션): tarfile 자신이 헤더 파싱 시점에 `_block(size)` 로 음수
+        오프셋을 즉시 거부하므로(스트림 모드 생성자 자체가 첫 멤버를 미리 파싱한다),
+        디스크상의 진짜 tar.gz 헤더에 음수 크기를 심는 구성은 tarfile.open() 생성자
+        단계에서 ReadError 로 막혀 우리 루프의 음수-크기 체크에 결코 도달하지 못한다
+        (PAX `size` 오버라이드로 우회를 시도해도 pax 처리 경로에서 멤버 자체가
+        누락되는 것으로 실측됨). 따라서 이 테스트는 원본 `next()` 로 진짜 헤더
+        파싱·오프셋 계산을 전부 정상 수행시킨 뒤, 반환된 TarInfo 객체의 `.size` 값만
+        사후에(오프셋 계산이 이미 끝난 뒤) 조작해 우리 자신의 방어 코드 경로만을
+        표적으로 삼는다 -- tarfile 내부 파서를 속이려는 것이 아니라, 우리 코드의
+        음수-크기 체크 자체가 실제로 위반을 기록하고 이후 처리(prefix/extractfile)를
+        생략함을 확인하기 위함이다.
+        """
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        target_name = f"{prefix}bad.bin"
+        _write_plain_tar_gz(archive, [(target_name, b"x")])
+        _recompute_release(release, "1.0.0")
 
-        def fake_next(self):
-            state["n"] += 1
-            return fake_member if state["n"] == 1 else None
+        original_next = tarfile.TarFile.next
 
-        monkeypatch.setattr(tarfile.TarFile, "next", fake_next)
+        def patched_next(self):
+            member = original_next(self)
+            if member is not None and member.name == target_name:
+                member.size = -1
+            return member
+
+        monkeypatch.setattr(tarfile.TarFile, "next", patched_next)
+        calls = {"n": 0}
+        original_extractfile = tarfile.TarFile.extractfile
+
+        def spy_extract(self, *args, **kwargs):
+            calls["n"] += 1
+            return original_extractfile(self, *args, **kwargs)
+
+        monkeypatch.setattr(tarfile.TarFile, "extractfile", spy_extract)
         with pytest.raises(b.BuildError) as exc_info:
             b.verify_release(release)
         assert "아카이브 멤버 크기 위반(음수)" in str(exc_info.value)
+        assert calls["n"] == 0
 
     def test_logical_budget_isolated_from_physical_budget(self, release, monkeypatch):
         """[Z1] 논리 예산이 실제 판독(extractfile 호출) 이전, 헤더의 선언 크기만으로도
@@ -1218,6 +1245,12 @@ class TestVerifyReleaseBoundedResources:
         assert "RELEASE.SHA256SUMS 를 읽을 수 없다" in str(exc_info.value)
 
     def test_compat_report_fifo_rejected_without_blocking(self, release):
+        """실측: 아이템 루프는 `_open_regular` 를 부르기 전에 `Path.is_file()` 로
+        먼저 거르는데, 이는 `os.stat()` 기반(FIFO 에 대해 False)이라 open() 자체를
+        전혀 시도하지 않는다 -- lstat-then-open 규율보다도 더 이른 지점에서 이미
+        블로킹 위험이 없다. 그래도 SIGALRM 안전망을 두어, 이 전제가 향후 리팩터로
+        깨져 실제로 open() 이 시도되고 블록되는 회귀가 생기면 이 테스트가 타임아웃
+        으로 확실히 드러내도록 한다."""
         compat = release / "localcrab-plugin-1.0.0.COMPATIBILITY.md"
         compat.unlink()
         os.mkfifo(compat)
@@ -1233,7 +1266,29 @@ class TestVerifyReleaseBoundedResources:
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
-        assert "파일을 읽을 수 없다: localcrab-plugin-1.0.0.COMPATIBILITY.md" in str(exc_info.value)
+        assert "파일 없음: localcrab-plugin-1.0.0.COMPATIBILITY.md" in str(exc_info.value)
+
+    def test_sidecar_fifo_rejected_without_blocking(self, release):
+        """[Z2]/[V1]/[Q1] 단일 서술자 규율의 실제 표적 -- 패키지 사이드카는 아이템
+        루프의 `is_file()` 사전 필터를 거치지 않고 `_open_regular` 를 곧바로 부르므로,
+        lstat-먼저 순서(FIFO 의 무기한 blocking open() 을 피하기 위함)가 실제로
+        작동함을 이 경로에서 직접 증명한다."""
+        sidecar = release / "localcrab-plugin.SHA256SUMS"
+        sidecar.unlink()
+        os.mkfifo(sidecar)
+
+        def _on_alarm(signum, frame):
+            raise TimeoutError("verify_release 가 FIFO open 에서 블록된 것으로 보인다")
+
+        old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        signal.alarm(5)
+        try:
+            with pytest.raises(b.BuildError) as exc_info:
+                b.verify_release(release)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+        assert "패키지 사이드카를 읽을 수 없다" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
