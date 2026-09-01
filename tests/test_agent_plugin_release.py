@@ -738,6 +738,104 @@ class TestVerifyRelease:
 
 
 # ---------------------------------------------------------------------------
+# TestVerifyReleaseArchiveCorruption
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyReleaseArchiveCorruption:
+    """PR #257 3차 이중 적대검증(채널 B, MED) -- 손상된 tar.gz 가 verify_release 의
+    아카이브 블록에서 EOFError/IndexError/ValueError 등 raw 예외로 누출되지 않고
+    문서화된 BuildError("release verification failed: ...") 로 수렴해야 한다.
+    설계 정본: fix-design-v3.md 를 v4.md 가 개정하고([T1][T2]), v4.md 를 v5.md 가
+    추가 개정한다([U1][U2]) -- v5 가 최우선.
+    """
+
+    @pytest.fixture
+    def release(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        b.build_release(repo, out_dir)
+        return out_dir
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(lambda data: data[:10], id="truncate-10-bytes"),
+            pytest.param(lambda data: data[: len(data) // 2], id="truncate-50-percent"),
+            pytest.param(
+                lambda data: gzip.compress(os.urandom(len(data))), id="gzip-valid-content-garbage"
+            ),
+        ],
+    )
+    def test_corrupted_archive_rejected_without_traceback(self, release, mutate):
+        """절단(10바이트·50%) 및 gzip 자체는 유효하나 내용이 무작위인 아카이브 -- 전부
+        아카이브 블록의 `except Exception` 에서 BuildError 로 수렴해야 한다(EOFError 는
+        절단, 3차 채널 B 실측: /home/asdf/orch-scratch/o247/p2b-repro/before-fix-eoferror.txt).
+        RELEASE.SHA256SUMS 를 손상된 아카이브의 새 해시로 재계산해, 앞선 RELEASE 해시
+        비교 단계가 아니라 이 아카이브 파싱 블록에 실제로 도달함을 보장한다(재계산 없이는
+        해시 불일치가 먼저 걸려 이 테스트가 무의미해진다).
+        """
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        archive.write_bytes(mutate(archive.read_bytes()))
+        _recompute_release(release, "1.0.0")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브를 열 수 없다" in str(exc_info.value)
+
+    def test_pax_sparse_header_value_error_rejected(self, release):
+        """회귀 방지(v5 [U1]): `except Exception` 을 v3 식 열거형
+        `(TarError, OSError, EOFError, zlib.error)` 로 되돌려도 이 테스트 이외의 절단류
+        테스트는 여전히 통과할 수 있다(전부 EOFError/ReadError 클래스이므로). 이 테스트는
+        그 회귀를 잡기 위해 열거형에 없는 `ValueError` 를 던지는 손상 유형(PAX
+        sparse 헤더)을 별도로 고정한다.
+
+        실측(본 세션): `tarfile.PAX_FORMAT` writer 는
+        `pax_headers={"GNU.sparse.map": "a"}` 를 검증 없이 그대로 기록하지만, reader 의
+        `getmembers()` 가 이를 정수로 파싱하려다 `ValueError: invalid literal for int()
+        with base 10: 'a'` 를 던진다(3차 채널 B 실측 클래스와 동일 계열).
+        """
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            info = tarfile.TarInfo(name=f"{b._ARCHIVE_PREFIX}sparse-bomb")
+            data = b"x"
+            info.size = len(data)
+            info.pax_headers = {"GNU.sparse.map": "a"}
+            tar.addfile(info, io.BytesIO(data))
+        tar_bytes = raw.getvalue()
+
+        archive.write_bytes(gzip.compress(tar_bytes))
+        _recompute_release(release, "1.0.0")
+
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        message = str(exc_info.value)
+        assert "아카이브를 열 수 없다" in message
+        assert "ValueError" in message
+
+    def test_truncate_last_byte_without_recompute_caught_by_hash_layer(self, release):
+        """계층 방어 실증(v4 [T2]): 아카이브를 전체-1바이트만 절단하면 실측상 tarfile 이
+        gzip 트레일러(CRC)를 읽지 않고 end-of-archive 영블록에서 조용히 멈춰(design-v4
+        실측), 아카이브 파싱 블록의 `except Exception` 이 침묵할 수 있다. 이 테스트는
+        RELEASE 를 **재계산하지 않음으로써** 그 경우에도 더 앞선 해시 비교 루프가
+        "해시 불일치" 위반으로 여전히 잡아냄을 증명한다 -- 한 계층이 침묵해도 다른
+        계층이 방어선을 유지하는 defense-in-depth.
+        """
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        data = archive.read_bytes()
+        archive.write_bytes(data[:-1])
+        # 의도적으로 _recompute_release 를 호출하지 않는다 -- RELEASE 는 원본 해시를
+        # 그대로 유지하므로 아카이브 파싱 이전의 해시 비교 루프가 먼저 걸려야 한다.
+
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        message = str(exc_info.value)
+        assert "해시 불일치" in message
+        assert "localcrab-plugin-1.0.0.tar.gz" in message
+
+
+# ---------------------------------------------------------------------------
 # TestCli
 # ---------------------------------------------------------------------------
 
@@ -804,6 +902,28 @@ class TestCli:
         data = bytearray(release_files[0].read_bytes())
         data[3] = 0xFF
         release_files[0].write_bytes(bytes(data))
+
+        code = cli.main(["--verify", "--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "release verification failed" in captured.err
+
+    def test_verify_flag_truncated_archive_reports_failure_without_traceback(self, cli, tmp_path, capsys):
+        """3차 이중 적대검증(채널 B, MED): 50% 절단된 tar.gz 가 CLI 층에서도 raw
+        EOFError traceback 이 아니라 문서화된 'release verification failed' 형식 +
+        exit 1 로 종료해야 한다(예외 전파 없음). p2b-repro 재현 절차와 동일한 손상
+        형태를 CLI 경로로 재확인한다."""
+        out_dir = tmp_path / "dist"
+        assert cli.main(["--out", str(out_dir)]) == 0
+        capsys.readouterr()
+
+        release_files = list(out_dir.glob("localcrab-plugin-*.tar.gz"))
+        assert len(release_files) == 1
+        archive = release_files[0]
+        version = archive.name[len("localcrab-plugin-") : -len(".tar.gz")]
+        data = archive.read_bytes()
+        archive.write_bytes(data[: len(data) // 2])
+        _recompute_release(out_dir, version)
 
         code = cli.main(["--verify", "--out", str(out_dir)])
         captured = capsys.readouterr()
