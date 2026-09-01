@@ -307,7 +307,7 @@ class TestBuildRelease:
     def test_release_set_files_exist_and_named(self, tmp_path):
         repo = _fake_repo(tmp_path, version="2.5.1")
         out_dir = tmp_path / "dist"
-        staged_root = b.build_release(repo, out_dir)
+        staged_root, _version = b.build_release(repo, out_dir)
         assert staged_root == out_dir / "localcrab-plugin"
         assert staged_root.is_dir()
         assert (out_dir / "localcrab-plugin.SHA256SUMS").is_file()

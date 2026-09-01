@@ -13,7 +13,6 @@ build_release() 를 호출해 릴리스 세트(staged 디렉터리 + 패키지 �
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -54,20 +53,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        staged_root = build_release(REPO_ROOT, out_dir)
+        staged_root, version = build_release(REPO_ROOT, out_dir)
     except BuildError as exc:
         print(f"build failed: {exc}", file=sys.stderr)
         return 1
 
+    # v20 [T1]: 게시된 manifest 를 다시 읽지 않는다. build_release() 가 게시 시 확정한
+    # version 을 그대로 받아 쓰므로 이 구간에 파일시스템 판독이 0회이고, 출력 경로는 실제
+    # 게시물과 구성적으로 일치한다(사후 대조로 확인하는 방식이 아니다). 재판독하던 판본은
+    # 판독 오류·디코딩 오류·구조 손상·형식은 안전하나 불일치하는 version 을 전부 떠안았다.
     sidecar_path = out_dir / f"{staged_root.name}.SHA256SUMS"
-    print(f"plugin package: {staged_root}")
-    print(f"sha256sums:     {sidecar_path}")
-
-    manifest = json.loads((staged_root / "plugin.json").read_text(encoding="utf-8"))
-    version = manifest["version"]
     archive_path = out_dir / f"localcrab-plugin-{version}.tar.gz"
     report_path = out_dir / f"localcrab-plugin-{version}.COMPATIBILITY.md"
     release_path = out_dir / f"localcrab-plugin-{version}.RELEASE.SHA256SUMS"
+    print(f"plugin package: {staged_root}")
+    print(f"sha256sums:     {sidecar_path}")
     print(f"archive:        {archive_path}")
     print(f"compat report:  {report_path}")
     print(f"release sums:   {release_path}")

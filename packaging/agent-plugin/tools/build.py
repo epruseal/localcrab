@@ -296,7 +296,13 @@ def _deterministic_tar(staged_root: Path, archive_path: Path) -> None:
 
 def build_release(repo_root, out_dir) -> Path:
     """`build()` 산출물에 결정론 아카이브·compat report·릴리스 해시 세트를 더해 원자적으로
-    게시하고 staged 디렉터리 경로를 돌려준다.
+    게시하고 `(staged 디렉터리 경로, version)` 을 돌려준다.
+
+    v20 [T1]: version 을 함께 돌려주는 이유는 호출자가 게시된 manifest 를 **다시 읽지
+    않게** 하기 위함이다. 재판독은 게시 후 판독 오류·디코딩 오류·구조 손상·형식은 안전하나
+    불일치하는 version 이라는 결함군을 통째로 열어 두는데, 여기서 확정한 값을 그대로
+    넘기면 그 결함군이 존재할 수 없고 호출자의 경로 계산이 실제 게시물과 구성적으로
+    일치한다.
 
     단일 작성자를 전제한다 -- 동일 out_dir 에 대한 동시 build_release 호출은 지원하지
     않는다(조립 공간 `out_dir/.release-build-tmp/` 를 공유하므로 경합 시 결과가 정의되지
@@ -315,12 +321,18 @@ def build_release(repo_root, out_dir) -> Path:
     """
     repo_root = Path(repo_root)
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = out_dir / _RELEASE_TMP_DIRNAME
-
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
+    # v17 [P1]: 초기 파일시스템 조작 4건(mkdir/exists/rmtree/mkdir)과 경로 계산 1건은
+    # 아래 조립 try 보다 먼저 실행되던 구간이라 OSError 가 raw 로 전파됐다(CLI 는
+    # BuildError 만 잡으므로 traceback 노출). 기존 조립 실패 문구로 수렴시킨다. 함수
+    # 전체를 감싸지 않는 이유는 이후 단계의 진짜 결함까지 같은 문구로 뭉개지 않기 위함이다.
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = out_dir / _RELEASE_TMP_DIRNAME
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+    except OSError as exc:
+        raise BuildError(f"release assembly failed: {exc}") from exc
 
     try:
         staged_root = build(repo_root, tmp_dir)
@@ -383,7 +395,7 @@ def build_release(repo_root, out_dir) -> Path:
         raise BuildError(f"release publish failed: {exc}") from exc
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return final_staged
+    return final_staged, version
 
 
 def _parse_hash_list(text: str, *, reject_separators: bool) -> tuple[dict[str, str], list[str]]:
@@ -488,6 +500,20 @@ def _open_regular(path: Path):
     except BaseException:
         os.close(fd)
         raise
+
+
+def _close_quietly(fileobj) -> None:
+    """읽기 전용 fileobj 를 닫되 close 시점 `OSError` 는 삼킨다.
+
+    이미 판독을 마친 바이트의 무결성은 close 오류로 바뀌지 않으므로, 이것은 검증 결과를
+    바꿀 무결성 신호가 아니다(쓰기 flush 가 없다). 반대로 삼키지 않으면 판독 오류를
+    `BuildError` 로 수렴시킨 방호를 close 가 그대로 우회해 traceback 이 다시 샌다.
+    fd 재사용 위험 때문에 close 재시도도 안전하지 않다.
+    """
+    try:
+        fileobj.close()
+    except OSError:
+        pass
 
 
 def _read_all_limited(fileobj, *, budget: int) -> bytes:
@@ -604,8 +630,13 @@ def verify_release(out_dir) -> None:
             raise BuildError(
                 f"RELEASE.SHA256SUMS 크기가 허용 상한을 초과했다({_MAX_SUMS_BYTES} 바이트)"
             ) from None
+        # v16 [B] S1: open 성공 뒤 판독 도중 나는 OSError(EIO 등)도 오류 경계로 편입한다.
+        # open 실패 문구와 구별되는 문구를 쓴다(같은 문구면 테스트가 open 경로로도 통과해
+        # 공허해진다).
+        except OSError as exc:
+            raise BuildError(f"RELEASE.SHA256SUMS 를 끝까지 읽을 수 없다: {exc}") from exc
     finally:
-        release_file.close()
+        _close_quietly(release_file)
     try:
         release_text = release_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -666,17 +697,23 @@ def verify_release(out_dir) -> None:
             actual_digest, _consumed = _sha256_stream(entry_file, budget=cap)
         except _BudgetExceededError:
             violations.append(f"파일 크기가 허용 상한을 초과했다: {name}")
-            entry_file.close()
+            _close_quietly(entry_file)
+            continue
+        # v16 [B] S2: 판독 중 OSError 도 위반으로 누적한다. 성공+아카이브 경로에서만 fd 를
+        # 살려 두는 구조라 with 를 쓸 수 없으므로 이 분기에서 직접 닫는다.
+        except OSError:
+            violations.append(f"파일을 끝까지 읽을 수 없다: {name}")
+            _close_quietly(entry_file)
             continue
         if actual_digest != digest:
             violations.append(f"해시 불일치: {name}")
-            entry_file.close()
+            _close_quietly(entry_file)
             continue
         if name == archive_name and archive_line_count == 1:
             archive_confirmed = True
             archive_file = entry_file  # 아래 아카이브 처리부의 finally 에서 닫는다.
         else:
-            entry_file.close()
+            _close_quietly(entry_file)
 
     sidecar_entries: dict[str, str] = {}
     sidecar_path = out_dir / sidecar_name
@@ -693,8 +730,11 @@ def verify_release(out_dir) -> None:
                 violations.append(
                     f"패키지 사이드카 크기가 허용 상한을 초과했다({_MAX_SUMS_BYTES} 바이트)"
                 )
+            # v16 [B] S3: 판독 중 OSError 도 위반으로 누적한다.
+            except OSError as exc:
+                violations.append(f"패키지 사이드카를 끝까지 읽을 수 없다: {exc}")
         finally:
-            sidecar_file.close()
+            _close_quietly(sidecar_file)
         if sidecar_bytes is not None:
             try:
                 sidecar_text = sidecar_bytes.decode("utf-8")
@@ -709,7 +749,7 @@ def verify_release(out_dir) -> None:
     if not archive_confirmed:
         violations.append("아카이브 파싱 생략: 외부 체크섬 미확립")
         if archive_file is not None:  # 방어적: 이 분기는 실제로 도달하지 않는다.
-            archive_file.close()
+            _close_quietly(archive_file)
     else:
         raw_member_names: list[str] = []
         member_hashes: dict[str, str] = {}
@@ -801,7 +841,7 @@ def verify_release(out_dir) -> None:
                 tar.close()
             if gz is not None:
                 gz.close()
-            archive_file.close()
+            _close_quietly(archive_file)
 
     if violations:
         raise BuildError("release verification failed:\n" + "\n".join(f"  - {v}" for v in violations))
