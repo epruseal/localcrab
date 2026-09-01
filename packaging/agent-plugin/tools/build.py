@@ -505,9 +505,17 @@ def verify_release(out_dir) -> None:
         violations.extend(f"사이드카: {v}" for v in sidecar_violations)
 
     archive_path = out_dir / f"localcrab-plugin-{version}.tar.gz"
+    raw_member_names: list[str] = []
+    member_hashes: dict[str, str] = {}
     try:
-        raw_member_names: list[str] = []
-        member_hashes: dict[str, str] = {}
+        # 신뢰 경계(파서 경계): 이 try 는 열기 + getmembers + 멤버 순회(검사·읽기·해시
+        # 수집)까지만 감싼다 -- 손상된 tar.gz 는 tarfile 이 TarError 외에도 EOFError(절단,
+        # /home/asdf/orch-scratch/o247/p2b-repro 실측)·IndexError/ValueError(손상 PAX/
+        # sparse 헤더, 3차 채널 B 실측)·zlib.error 등을 던질 수 있고 그 전수 열거는 CPython
+        # tarfile 파서 버전에 종속돼 유지 불가능하므로 `except Exception` 으로 광역
+        # 수렴한다. trade-off: 이 블록 안 자체 로직(prefix/경로 이탈 검사 등)의 결함도
+        # "아카이브를 열 수 없다"로 가려질 수 있다 -- 집합 대사·해시 비교 등 경계 밖 로직은
+        # try 밖에 유지해 가림 범위를 파서 자체로 최소화한다.
         with tarfile.open(archive_path, mode="r:gz") as tar:
             for member in tar.getmembers():
                 raw_member_names.append(member.name)
@@ -526,7 +534,9 @@ def verify_release(out_dir) -> None:
                 extracted = tar.extractfile(member)
                 data = extracted.read() if extracted is not None else b""
                 member_hashes[rel] = hashlib.sha256(data).hexdigest()
-
+    except Exception as exc:
+        violations.append(f"아카이브를 열 수 없다(손상 가능): {type(exc).__name__}: {exc}")
+    else:
         dup_counts: dict[str, int] = {}
         for member_name in raw_member_names:
             dup_counts[member_name] = dup_counts.get(member_name, 0) + 1
@@ -549,8 +559,6 @@ def verify_release(out_dir) -> None:
             for rel, digest in sidecar_entries.items():
                 if member_hashes.get(rel) != digest:
                     violations.append(f"아카이브 해시 불일치: {rel}")
-    except (tarfile.TarError, OSError) as exc:
-        violations.append(f"아카이브를 열 수 없다: {exc}")
 
     if violations:
         raise BuildError("release verification failed:\n" + "\n".join(f"  - {v}" for v in violations))
