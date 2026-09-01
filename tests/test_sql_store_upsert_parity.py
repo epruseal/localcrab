@@ -215,6 +215,37 @@ class TestUpsertContract:
             "sql_store.py 가 OR REPLACE 로 되돌아갔다 -- rowid 와 created_at 이 파괴된다"
         )
 
+    def test_executed_sql_uses_on_conflict_do_update(self, sql_store):
+        """소스 텍스트 핀보다 강한 실동작 핀: 두 메서드가 엔진에 실제로 넘긴 SQL 을 가로채
+        REPLACE 형태가 아니라 ON CONFLICT DO UPDATE 임을 확인한다. 소스 핀은 docstring 의
+        표현까지 걸리지만 이 핀은 실행 경로만 본다 -- 방언 분기가 되살아나면 SQLite 파라미터에서
+        곧바로 드러난다."""
+        from sqlalchemy import event
+
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        event.listen(sql_store._engine, "before_cursor_execute", _capture)
+        try:
+            sql_store.register_node("subject", "User", "sql-capture")
+            sql_store.set_policy("cap-s", "view", "cap-r", granted=True)
+        finally:
+            event.remove(sql_store._engine, "before_cursor_execute", _capture)
+
+        writes = [
+            stmt
+            for stmt in captured
+            if "ontology_nodes" in stmt or "rebac_policies" in stmt
+        ]
+        assert len(writes) == 2, f"기대한 쓰기 2건이 아니라 {len(writes)}건: {writes}"
+        for stmt in writes:
+            upper = stmt.upper()
+            assert "OR REPLACE" not in upper, f"실행된 SQL 이 REPLACE 형태다: {stmt}"
+            assert "ON CONFLICT" in upper, f"실행된 SQL 에 ON CONFLICT 가 없다: {stmt}"
+            assert "DO UPDATE" in upper, f"실행된 SQL 에 DO UPDATE 가 없다: {stmt}"
+
     def test_reregistration_does_not_add_rows(self, sql_store):
         sql_store.register_node("subject", "User", "dup")
         sql_store.register_node("subject", "User", "dup")
