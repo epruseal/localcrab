@@ -155,7 +155,10 @@ def verify_evidence(
     verdict = Verdict()
     outbound = _parse_frames(client_to_server)
     inbound = _parse_frames(server_to_client)
-    boundary_recorded = bool(outbound)
+    # 어느 방향이든 원문이 있으면 기록기가 개입한 것이다. outbound 만 보면
+    # client_to_server 가 비고 server_to_client 에 잔여 원문이 있는 조합이
+    # "기록기 없음" 으로 새어 나간다.
+    boundary_recorded = bool(outbound) or bool(inbound)
 
     # --- provider 측: 드라이버가 난수를 인자로 실어 보냈는가 ---
     provider_events = []
@@ -204,7 +207,9 @@ def verify_evidence(
     def norm(value: str) -> str:
         return "".join(ch for ch in value if ch.isalnum())
 
-    issued_ids = {norm(c.get("call_id") or "") for c in nonce_calls}
+    # 빈 문자열을 버린다. 남겨 두면 양쪽 id 가 모두 없는 입력에서 "" == "" 로
+    # 맞아떨어져 결속이 공전한다 -- 경계 쪽 None == None 과 같은 결함 유형이다.
+    issued_ids = {norm(c.get("call_id") or "") for c in nonce_calls} - {""}
     tool_msgs = []
     for e in provider_events:
         if e.get("kind") != "request":
@@ -228,7 +233,8 @@ def verify_evidence(
         verdict.add(
             "boundary_recorded_as_expected",
             False,
-            f"기록기를 빼고 돌렸다고 했는데 경계 원문 {len(outbound)}프레임이 있다 -- "
+            f"기록기를 빼고 돌렸다고 했는데 경계 원문이 있다 "
+            f"(client->server {len(outbound)}프레임, server->client {len(inbound)}프레임) -- "
             "이전 실행의 잔여 로그를 읽고 있을 수 있다",
         )
         return verdict
@@ -367,8 +373,10 @@ for t in threads:
     t.join(timeout=5)
 stragglers = [t.name for t in threads if t.is_alive()]
 if stragglers:
-    sys.stderr.write("opencrab-recorder: incomplete capture, threads still running: "
-                     + ", ".join(stragglers) + "\\n")
+    # stderr 로 쓰면 아무 데도 도달하지 않는다 -- 클라이언트가 MCP 서버 자식의
+    # stderr 를 호출자에게 넘겨주지 않는다. 러너가 읽을 수 있도록 파일로 남긴다.
+    with open(os.path.join(OUT, "capture_incomplete"), "a") as fh:
+        fh.write(",".join(stragglers) + "\\n")
 sys.exit(rc)
 '''
 

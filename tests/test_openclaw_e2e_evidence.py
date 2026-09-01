@@ -198,9 +198,55 @@ def test_nonce_in_a_non_node_id_argument_is_rejected():
     assert "boundary_tools_call_carries_nonce" in _failed(verdict)
 
 
-def test_declaring_no_recorder_while_boundary_exists_is_rejected():
-    """기록기를 뺐다고 선언했는데 경계 원문이 있으면 모순이므로 기각한다."""
+def test_call_without_a_jsonrpc_id_cannot_be_matched_to_a_response():
+    """id 가 없는 호출과 id 가 없는 응답이 None == None 으로 짝지어지면 안 된다."""
+    data = _load()
+    out = []
+    for line in data["client_to_server"].splitlines():
+        frame = json.loads(line)
+        if frame.get("method") == "tools/call" and FIXTURE_NONCE in json.dumps(frame):
+            frame.pop("id", None)
+        out.append(json.dumps(frame, ensure_ascii=False))
+    data["client_to_server"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_response_echoes_nonce" in _failed(verdict)
+
+
+def test_receipt_binding_does_not_collapse_when_both_ids_are_absent():
+    """양쪽 id 를 모두 지워도 결속이 공전하면 안 된다.
+
+    빈 문자열끼리 맞아떨어지면 경계 쪽 `None == None` 과 같은 결함이 된다.
+    """
+    data = _load()
+    out = []
+    for line in data["provider_log"].splitlines():
+        event = json.loads(line)
+        payload = event.get("payload") or {}
+        if event.get("kind") == "decision" and FIXTURE_NONCE in (payload.get("args") or ""):
+            payload.pop("call_id", None)
+        for msg in (payload.get("messages") or []):
+            if msg.get("role") == "tool" and FIXTURE_NONCE in str(msg.get("content")):
+                msg.pop("tool_call_id", None)
+        out.append(json.dumps(event, ensure_ascii=False))
+    data["provider_log"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "provider_received_nonce_result" in _failed(verdict)
+
+
+@pytest.mark.parametrize("present", ["both", "outbound_only", "inbound_only"])
+def test_declaring_no_recorder_while_boundary_exists_is_rejected(present):
+    """기록기를 뺐다고 선언했는데 경계 원문이 있으면 모순이므로 기각한다.
+
+    한쪽 방향만 남은 잔여 로그도 잡아야 한다. outbound 만 보면
+    `client_to_server` 가 비고 `server_to_client` 에 잔여가 있는 조합이 새어 나간다.
+    """
     data = _load() | {"expect_boundary": False}
+    if present == "outbound_only":
+        data["server_to_client"] = ""
+    elif present == "inbound_only":
+        data["client_to_server"] = ""
     verdict = verify_evidence(**data)
     assert not verdict.passed, verdict.render()
     assert "boundary_recorded_as_expected" in _failed(verdict)

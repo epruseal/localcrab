@@ -228,6 +228,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: 변경 연산의 부작용이 스토어에 없다: {after}", file=sys.stderr)
         return 1
 
+    # 기록기가 말미 바이트를 회수하지 못했으면 캡처가 불완전하다. stderr 로는
+    # 도달하지 않으므로 파일로 남긴 것을 읽는다.
+    incomplete = record_dir / "capture_incomplete"
+    if incomplete.exists():
+        print(f"FAIL: 경계 캡처가 불완전하다: {incomplete.read_text().strip()}", file=sys.stderr)
+        return 1
+
     print("6/6 증거 판정")
     def read(p: Path) -> str:
         return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
