@@ -22,17 +22,32 @@ python scripts/build_agent_plugin.py
 pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_smoke.py
 ```
 
-1회 프로비저닝(패키지 README 정본 절차, `<DATA>` 는 클라이언트가 만든 `PLUGIN_DATA`
-경로):
+프로비저닝(패키지 README 정본 절차, `<DATA>` 는 클라이언트가 만든 `PLUGIN_DATA`
+경로) — 자동/수동 두 경로가 있다:
+
+**자동(기본 경로)**: 이 패키지의 `mcp.json` 은 `OPENCRAB_BOOTSTRAP_ON_EMPTY=1`
+을 함께 실어 보낸다. 빈 `<DATA>` 에서 mcp.json env 그대로 최초 stdio 기동만
+하면 로컬 유저와 빈 스토어가 자체 생성된다. 게이트(opt-in="1", STORAGE_MODE=local,
+LOCAL_DATA_DIR 명시·비공백·`?` 미포함, `<DATA>` 디렉터리 실재) 중 하나라도
+위반하면 조용한 폴백 대신 전용 오류로 기동을 거부한다. 생성 시 stderr 로
+경로·user_id 1줄 공지가 남는다.
+
+**수동(대체·복구 경로)**: 자동 부트스트랩을 껐거나 위 게이트를 만족시킬 수
+없는 문맥, 또는 HTTP 용 토큰이 필요한 경우(자동 경로는 토큰을 발급하지
+않는다 — 발급하려면 `opencrab token issue <user_id>`) 여전히 아래로 직접
+프로비저닝한다:
 
 ```bash
 cd <DATA>
 STORAGE_MODE=local LOCAL_DATA_DIR=<DATA> LOCALCRAB_ENV_FILE=<DATA>/localcrab.env opencrab init
 ```
 
-첫 기동이 `Run 'opencrab init' first` 로 실패하면 클라이언트가 표시하는
-`PLUGIN_DATA` 경로에서 위 명령을 실행한 뒤 재시도한다 — 이는 결함이 아니라
-미프로비저닝 데이터 디렉터리의 정상 실패 경로다.
+첫 기동이 `Run 'opencrab init' first` 로 실패하면 이번 기동에서 자동
+부트스트랩이 작동하지 않았다는 뜻이다(opt-in 이 꺼져 있거나 위 게이트 중
+하나를 위반) — 오류문 자체가 해석된 데이터 루트 경로와
+`OPENCRAB_BOOTSTRAP_ON_EMPTY=1` opt-in 안내를 함께 낸다. 클라이언트가 표시하는
+`PLUGIN_DATA` 경로에서 위 수동 명령을 실행한 뒤 재시도한다 — 이는 결함이
+아니라 미프로비저닝(또는 opt-in 미충족) 데이터 디렉터리의 정상 실패 경로다.
 
 ## Compatibility matrix
 
@@ -110,15 +125,22 @@ cat packaging/agent-plugin/tools/env_contract.py
 - **기동 거부(안전 실패)**: `OPENCRAB_API_KEY`, `LOCALCRAB_MCP_TOKEN`,
   `LOCALCRAB_MCP_TOKEN_FILE` — 남아 있으면 서버가 기동을 거부한다. 폐기된
   공유 비밀 인증 방식의 안전 실패이며 결함이 아니다.
+- **상태 생성 opt-in**: `OPENCRAB_BOOTSTRAP_ON_EMPTY` — 값이 "1"이면 빈
+  데이터 루트에 로컬 유저와 빈 스토어를 생성한다(#245). unset/""/"0" 은
+  off(기존 동작 불변)이고, 그 외 malformed 값은 기동을 거부한다. 이 패키지의
+  `mcp.json` 이 이 값을 "1"로 명시 공급한다.
 
-이 패키지의 `mcp.json` 은 위 목록 중 어느 것도 설정하지 않는다
-(`STORAGE_MODE`/`LOCAL_DATA_DIR`/`LOCALCRAB_ENV_FILE` 3키뿐). 서버가 실제로
-어디로 나가고 무엇을 거부하는지는 **클라이언트가 서브프로세스에 상속시키는
-ambient 환경**에 달려 있다. 스펙의 base-env 무의존 의무는 이 3키의 명시 공급
-으로 충족되지만, 클라이언트가 ambient env 를 상속하기로 선택하는 것 자체는
-스펙상 client-defined 라 패키지가 통제할 수 없다. 권고: 이 플러그인을 기동
-하는 프로세스의 ambient 환경을 sanitize 하거나, 위 목록의 변수가 의도치 않게
-설정돼 있지 않은지 확인한다.
+이 패키지의 `mcp.json` 은 위 목록 중 **외부 전송 결정**·**기동 거부** 항목은
+어느 것도 설정하지 않는다. **상태 위치**(`LOCAL_DATA_DIR`)와 **상태 생성
+opt-in**(`OPENCRAB_BOOTSTRAP_ON_EMPTY`)은 이 패키지가 의도적으로 설정하는
+4키(`STORAGE_MODE`/`LOCAL_DATA_DIR`/`LOCALCRAB_ENV_FILE`/
+`OPENCRAB_BOOTSTRAP_ON_EMPTY`)에 포함되며, 그 값과 게이트는 위 항목 설명대로다.
+서버가 실제로 어디로 나가고 무엇을 거부하는지는 **클라이언트가 서브프로세스에
+상속시키는 ambient 환경**에 달려 있다. 스펙의 base-env 무의존 의무는 이 4키의
+명시 공급으로 충족되지만, 클라이언트가 ambient env 를 상속하기로 선택하는
+것 자체는 스펙상 client-defined 라 패키지가 통제할 수 없다. 권고: 이 플러그인을
+기동하는 프로세스의 ambient 환경을 sanitize 하거나, 위 목록의 외부 전송·기동
+거부 변수가 의도치 않게 설정돼 있지 않은지 확인한다.
 
 ## 벤더링 스키마 무결성
 
@@ -140,8 +162,12 @@ CI 게이트는 항상 레퍼런스 클라이언트 스모크다(`tests/test_age
 1. **설치** — `openclaw plugins install <dist>/localcrab-plugin`
 2. **발견** — `openclaw plugins list`/`inspect` 로 `Bundle format: agent
    (Agent Plugins)` 및 MCP 서버·skill 감지 확인
-3. **프로비저닝** — OpenClaw 가 만든 `PLUGIN_DATA` 에서 위 정본 명령으로
-   `opencrab init` 실행, `<PLUGIN_DATA>/opencrab.db` 실재 확인
+3. **프로비저닝** — 자동 경로(기본): mcp.json 이 실어 보내는
+   `OPENCRAB_BOOTSTRAP_ON_EMPTY=1` 그대로, OpenClaw 가 만든 빈 `PLUGIN_DATA`
+   에서 최초 stdio 기동만 실행해 `<PLUGIN_DATA>/opencrab.db` 실재와 stderr
+   생성 공지를 확인한다(수동 init 없이 기동만으로 성립). 수동 경로도 병기
+   검증한다: 위 정본 `opencrab init` 명령을 별도의 빈 `PLUGIN_DATA` 에서
+   실행해 같은 `opencrab.db` 실재로 대체 경로가 여전히 유효함을 확인한다
 4. **실행+도구 노출** — `mcp probe`/`mcp list` 또는 embedded agent turn 에서
    도구 목록 확인
 5. **tools/call** — embedded agent turn 에서 `ontology_manifest` 를 **명시
