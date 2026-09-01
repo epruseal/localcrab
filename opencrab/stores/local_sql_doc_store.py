@@ -24,8 +24,10 @@ SCHEMA DESIGN:
 
     properties / metadata / details are stored as JSON TEXT.  Structured
     columns are avoided because the dict schema is open and varies by caller.
-    json_extract() would add SQLite >= 3.38 dependency; caller-side json.loads
-    keeps the version floor at 3.9.0 (same as local_graph_store.py).
+    Parsing stays caller-side (json.loads) rather than in SQL, so this store
+    never needs json_extract() -- whose availability is a build option, not a
+    version (see pyproject.toml's Runtime SQLite version note). The floor this
+    store does impose is 3.24.0, from the shared upsert path below.
 
 STAGE 6a (F1): the 13-method surface's SQL text and dict-shaping now live in
     ``_SqlDocStoreBase`` (``_sql_doc_base.py``), parameterised by the SQLite

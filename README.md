@@ -410,8 +410,14 @@ STORAGE_MODE=docker opencrab serve
 | 벡터 | Chroma HTTP (`CHROMA_HOST:CHROMA_PORT`) |
 | SQL | PostgreSQL (`POSTGRES_URL`) |
 
-> **SQLite 버전 요구사항**: 로컬 모드는 `json_extract()` 사용으로 **SQLite 3.9.0 이상**이 필요합니다.
-> `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"` 로 확인하세요.
+> **SQLite 버전 요구사항**: 로컬 모드는 **SQLite 3.24.0 이상**이면서 **JSON 함수가 활성화된 빌드**가 필요합니다.
+> 하한 3.24.0 은 공유 upsert 경로(`INSERT ... ON CONFLICT (...) DO UPDATE SET`)에서 온다. 이것은 코어 문법이라 버전만으로 보장된다.
+> `json_extract()` 는 JSON1 과 함께 3.9.0 에 도입됐지만 버전만으로는 가용성이 보장되지 않는다. 3.37.2 까지는 빌드 옵션(`SQLITE_ENABLE_JSON1`)이었고 3.38.0 부터 기본 포함이지만 여전히 `SQLITE_OMIT_JSON` 으로 제외할 수 있다. 그래서 버전이 아니라 함수 자체를 확인한다.
+>
+> ```bash
+> python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+> python3 -c 'import sqlite3; print(sqlite3.connect(":memory:").execute("SELECT json_extract(?, ?)", ("{\"pack_id\": \"p1\"}", "$.pack_id")).fetchone()[0])'   # p1 이 출력되면 JSON 함수가 있다
+> ```
 >
 > **로컬 모드 ReBAC 제약**: 그래프 권한 탐색이 Python BFS(`find_neighbors()`)로 동작합니다. 직접 및 전이적(member_of/manages → permission) 경로는 완전 지원. depth 2 초과 복잡한 다중 홉 패턴은 미지원.
 

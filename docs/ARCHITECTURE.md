@@ -155,7 +155,7 @@ SQLite B-tree는 `SELECT ... LIMIT k`로 앞에서 k행만 읽으므로, 테이�
 
 | 연산 | JSON (`LocalDocStore`) | SQLite (`LocalSQLDocStore`) |
 | --- | --- | --- |
-| `upsert_node_doc` | O(N): 전체 재직렬화 | O(log N): `INSERT OR REPLACE` |
+| `upsert_node_doc` | O(N): 전체 재직렬화 | O(log N): `INSERT ... ON CONFLICT DO UPDATE` |
 | `get_node_doc` | O(N): 전체 파싱 + dict.get | O(log N): PK lookup |
 | `delete_node_doc` | O(N): 전체 로드 + 재저장 | O(log N): DELETE by PK |
 | `collection_stats` | O(N): `len(json.load())` | O(1): `COUNT(*)` (B-tree 내부) |
@@ -193,9 +193,9 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_ts ON audit_log(timestamp DESC);
 ```
 
-`properties` / `metadata` / `details`는 JSON TEXT로 저장한다. `json_extract()`
-의존성(SQLite 3.38+)을 피하고 버전 요구사항을 3.9.0+로 유지하기 위해 파싱은
-Python `json.loads()`로 처리한다.
+`properties` / `metadata` / `details`는 JSON TEXT로 저장한다. 파싱을 SQL이 아니라
+Python `json.loads()`로 처리하므로 이 스토어는 `json_extract()`에 의존하지 않는다.
+`json_extract()`의 가용성은 버전이 아니라 빌드 옵션에 달려 있다(§7 참조).
 
 ---
 
@@ -522,11 +522,21 @@ opencrab serve
 
 ## 7. SQLite 버전 요구사항
 
-### 최소 버전: SQLite 3.9.0
+### 최소 버전: SQLite 3.24.0 + JSON 함수 활성화 빌드
 
-로컬 모드는 `json_extract()` 함수를 사용한다 (`local_graph_store.py`의 DDL 및
-`list_packs()`, `export_nodes()` 메서드). `json_extract()`는 SQLite 3.9.0
-(2015-10-14 출시)부터 지원된다.
+요구사항은 두 갈래이며 성격이 다르다.
+
+**버전 하한 3.24.0 (2018-06-04)** — 공유 upsert 경로에서 온다. `SqlDialect.upsert()`가
+내는 `INSERT ... ON CONFLICT (...) DO UPDATE SET`는 SQLite 3.24.0부터 지원되며,
+`LocalSQLDocStore`(`upsert_node_doc` / `upsert_source`), `LocalGraphStore`,
+`SQLStore`(`register_node` / `set_policy`)가 모두 이 경로를 탄다. 코어 문법이므로
+버전 숫자만으로 가용성이 보장된다.
+
+**JSON 함수 활성화** — `json_extract()`는 버전으로 보장되지 않는다. JSON1과 함께
+3.9.0(2015-10-14)에 도입됐지만 3.37.2까지는 빌드 옵션(`SQLITE_ENABLE_JSON1`)이었고,
+3.38.0부터 기본 포함이지만 여전히 `SQLITE_OMIT_JSON`으로 제외할 수 있다. 따라서
+버전이 아니라 함수 자체를 확인해야 한다. (3.38.0부터 추가된 `->` / `->>` **연산자**는
+PostgreSQL 분기에서만 쓰이므로 SQLite 경로의 요구사항이 아니다.)
 
 사용처:
 
@@ -539,18 +549,21 @@ opencrab serve
 "SELECT json_extract(properties, '$.pack_id') AS pack_id ..."
 ```
 
-### 버전 확인
+### 확인
+
+버전 출력만으로는 부족하므로 함수 실행까지 확인한다.
 
 ```bash
 python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+python3 -c 'import sqlite3; print(sqlite3.connect(":memory:").execute("SELECT json_extract(?, ?)", ("{\"pack_id\": \"p1\"}", "$.pack_id")).fetchone()[0])'   # p1 이 출력되면 JSON 함수가 있다
 ```
 
-3.9.0 미만이면 로컬 모드 초기화 시 인덱스 생성이 실패하고 `LocalGraphStore`가
-`available=False`로 설정된다.
+3.24.0 미만이면 upsert가 문법 오류로 실패한다. JSON 함수가 없으면 로컬 모드 초기화 시
+인덱스 생성이 실패하고 `LocalGraphStore`가 `available=False`로 설정된다.
 
-`LocalSQLDocStore`는 `json_extract()`를 사용하지 않으므로 (properties 파싱은
-Python `json.loads()`로 처리) 동일한 3.9.0+ 요구사항이 적용되지만 추가 제약은
-없다.
+`LocalSQLDocStore`는 `json_extract()`를 사용하지 않는다(properties 파싱은 Python
+`json.loads()`로 처리). 다만 공유 upsert 경로를 타므로 3.24.0 하한은 그대로
+적용된다 — 추가 제약이 없는 것이 아니다.
 
 ---
 
