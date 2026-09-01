@@ -156,10 +156,10 @@ def verify_evidence(
     verdict = Verdict()
     outbound = _parse_frames(client_to_server)
     inbound = _parse_frames(server_to_client)
-    # 어느 방향이든 원문이 있으면 기록기가 개입한 것이다. outbound 만 보면
-    # client_to_server 가 비고 server_to_client 에 잔여 원문이 있는 조합이
-    # "기록기 없음" 으로 새어 나간다.
-    boundary_recorded = bool(outbound) or bool(inbound)
+    # 파싱 결과가 아니라 **원문 유무**로 판정한다. 파싱된 프레임으로 판정하면
+    # 잘린 비 JSON 바이트만 남은 캡처가 프레임 0건이 되어 "기록기 없음" 으로
+    # 새어 나간다. 어느 방향이든 바이트가 있으면 기록기가 개입한 것이다.
+    boundary_recorded = bool(client_to_server.strip()) or bool(server_to_client.strip())
 
     # --- provider 측: 드라이버가 난수를 인자로 실어 보냈는가 ---
     provider_events = []
@@ -235,7 +235,8 @@ def verify_evidence(
             "boundary_recorded_as_expected",
             False,
             f"기록기를 빼고 돌렸다고 했는데 경계 원문이 있다 "
-            f"(client->server {len(outbound)}프레임, server->client {len(inbound)}프레임) -- "
+            f"(client->server {len(client_to_server)}바이트, "
+            f"server->client {len(server_to_client)}바이트) -- "
             "이전 실행의 잔여 로그를 읽고 있을 수 있다",
         )
         return verdict
@@ -252,7 +253,8 @@ def verify_evidence(
     verdict.add(
         "boundary_recorded_as_expected",
         True,
-        f"경계 원문 {len(outbound)}프레임 관측",
+        f"경계 원문 관측 (client->server {len(outbound)}프레임, "
+        f"server->client {len(inbound)}프레임)",
     )
 
     # --- 경계: 난수를 실은 tools/call 프레임이 실재하는가 ---
@@ -586,6 +588,12 @@ def check_persisted(real_bin: str, plugin_data: str | os.PathLike, node_id: str,
     }
     # 세 메시지를 한 번에 보내고 communicate 로 받는다. readline 을 쓰면 서버가
     # 기동 중 멈췄을 때 timeout 이 걸리지 않아 무한 대기한다.
+    #
+    # 의도적으로 깎은 모서리: `initialize` 응답을 기다리지 않고 파이프라인으로
+    # 보낸다. 이 서버는 stdin 을 줄 단위로 순차 처리하므로 성립하고 매 실행에서
+    # 성립을 확인한다. 초기화 응답 수신을 엄격히 요구하는 서버를 상대하려면
+    # 순차 읽기(방향별 리더 스레드 + 남은 시간 예산)로 올려야 한다 -- 이 함수는
+    # 범용 MCP 클라이언트가 아니라 같은 저장소 서버에 대한 사후 조회 도구다.
     script = "".join(json.dumps(msg) + "\n" for msg in (
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
          "params": {"protocolVersion": "2025-11-25", "capabilities": {},
@@ -600,7 +608,18 @@ def check_persisted(real_bin: str, plugin_data: str | os.PathLike, node_id: str,
         out, _ = proc.communicate(input=script, timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
+        # communicate() 를 다시 부르면 안 된다. 서버가 자식을 남기고 죽으면 그
+        # 자식이 파이프를 붙들고 있어 EOF 가 오지 않고 또 무한 대기한다.
+        # 파이프를 직접 닫고 죽은 프로세스만 회수한다.
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         return {"found": False, "error": f"readback timed out after {timeout}s"}
 
     reply = {}

@@ -22,7 +22,7 @@ python scripts/build_agent_plugin.py
 pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_smoke.py
 ```
 
-프로비저닝(패키지 README 정본 절차, `<DATA>` 는 클라이언트가 만든 `PLUGIN_DATA`
+프로비저닝(패키지 README 정본 절차, `<DATA>` 는 클라이언트가 서버에 넘기는 `PLUGIN_DATA`
 경로) — 자동/수동 두 경로가 있다:
 
 **자동(기본 경로)**: 이 패키지의 `mcp.json` 은 `OPENCRAB_BOOTSTRAP_ON_EMPTY=1`

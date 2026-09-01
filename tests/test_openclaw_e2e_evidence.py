@@ -235,6 +235,18 @@ def test_receipt_binding_does_not_collapse_when_both_ids_are_absent():
     assert "provider_received_nonce_result" in _failed(verdict)
 
 
+@pytest.mark.parametrize("garbage", ["truncated-non-json", "{partial", "\x00\x01"])
+def test_unparseable_boundary_bytes_still_count_as_recorded(garbage):
+    """파싱되지 않는 바이트만 남은 캡처도 "기록기 없음" 으로 강등되지 않는다.
+
+    프레임 수로 판정하면 잘린 캡처가 프레임 0건이 되어 새어 나간다.
+    """
+    data = _load() | {"client_to_server": "", "server_to_client": garbage, "expect_boundary": False}
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_recorded_as_expected" in _failed(verdict)
+
+
 @pytest.mark.parametrize("present", ["both", "outbound_only", "inbound_only"])
 def test_declaring_no_recorder_while_boundary_exists_is_rejected(present):
     """기록기를 뺐다고 선언했는데 경계 원문이 있으면 모순이므로 기각한다.
@@ -379,6 +391,28 @@ def test_recorder_shim_source_is_syntactically_valid(tmp_path):
 
     write_recorder_shim(tmp_path / "shim", "/opt/somewhere/opencrab", tmp_path / "rec")
     py_compile.compile(str(tmp_path / "shim" / "opencrab_recorder.py"), doraise=True)
+
+
+def test_check_persisted_respects_its_timeout(tmp_path):
+    """응답을 내지 않는 서버를 만나도 시간 한계 안에 실패로 돌아와야 한다.
+
+    blocking readline 을 쓰면 여기서 무한 대기한다.
+    """
+    import time
+
+    from tools.openclaw_e2e import check_persisted
+
+    # 인자를 무시하고 응답도 내지 않는 가짜 서버 -- 기동 후 멈춘 서버의 대역이다.
+    stuck = tmp_path / "stuck-server"
+    stuck.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    stuck.chmod(0o755)
+
+    started = time.monotonic()
+    result = check_persisted(str(stuck), tmp_path, "some-node", timeout=2.0)
+    elapsed = time.monotonic() - started
+    assert result.get("found") is False, result
+    assert "timed out" in result.get("error", ""), result
+    assert elapsed < 30, elapsed
 
 
 def test_recorder_launcher_survives_paths_with_spaces(tmp_path):
