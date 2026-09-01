@@ -634,7 +634,7 @@ class TestIngestIntoPack:
         assert result["text_ingested"] is True  # the attempt was made
         billing.on_ingest.assert_not_called()  # but nothing billable landed
 
-    def test_normal_legacy_path_vector_only_success_still_bills(self):
+    def test_normal_legacy_path_vector_only_success_still_bills(self, tmp_path):
         """Positive-confirmation counterpart: chromadb comes back its REAL
         production shape — "ok (id=...)" (opencrab/ontology/query.py's
         HybridQuery.ingest() decorates the status with the vector id, it
@@ -653,18 +653,32 @@ class TestIngestIntoPack:
         #148: no explicit principal_scope here -- this test relies on the
         module-wide ``bind_test_principal`` fixture, which binds
         ``user_id="test-user"``, ``_writable_ctx``'s own default owner, so
-        the registry ownership lines up without having to pass one."""
+        the registry ownership lines up without having to pass one.
+
+        #74: same real-graph rationale as the three tests above (see
+        ``_real_local_graph``) -- a MagicMock ``neo4j`` here would make its
+        ``upsert_node`` succeed unconditionally, so `stores["graph"] ==
+        "ok"` would be faked rather than exercised, which is exactly the
+        class of false positive #74 closed. ``mongo.available = False``
+        means the identity probe's doc-store leg is skipped (unavailable
+        stores are not probed, see ``write_gate._check_probes``), so no
+        extra ``mongo`` stub is needed for the graph leg to run for real."""
         builder = MagicMock()
         billing = MagicMock()
         hybrid = MagicMock()
         hybrid.ingest.return_value = {"stores": {"chromadb": "ok (id=vec-src-5)"}}
         mongo = MagicMock()
         mongo.available = False
-        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _writable_ctx(
-                "pack-a", builder=builder, hybrid=hybrid, mongo=mongo, billing=billing,
-            )
-            _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
+        graph = _real_local_graph(tmp_path)
+        try:
+            with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+                mock_ctx.return_value = _writable_ctx(
+                    "pack-a", builder=builder, hybrid=hybrid, mongo=mongo,
+                    billing=billing, neo4j=graph,
+                )
+                _ingest_into_pack("pack-a", text="legacy text", source_id="src-5", text_as_node=False)
+        finally:
+            graph.close()
         billing.on_ingest.assert_called_once_with("default", None, "src-5")
 
     def test_normal_real_hybrid_ingest_output_shape_bills(self):

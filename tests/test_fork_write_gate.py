@@ -34,7 +34,7 @@ reads.
 
 from __future__ import annotations
 
-import re
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -497,20 +497,37 @@ class TestSourceWriterOrigin:
 # ---------------------------------------------------------------------------
 
 
-def _caller_files(pattern: re.Pattern[str]) -> list[str]:
+def _caller_files(keyword: str, value: bool) -> list[str]:
+    """Files under ``opencrab/`` that pass ``keyword=value`` in a real call.
+
+    Matched with the AST rather than a regex over the file text (#74). The
+    regex version counted the *definition* file as a caller as soon as its
+    docstring or an error message mentioned the flag by name -- and the
+    guard `write_source` now raises for a `write_graph=False` without
+    `fork_copy=True` says "requires fork_copy=True" in its message, which is
+    prose, not a call. Keyword arguments in `ast.Call` nodes are exactly the
+    thing these tests mean by "caller".
+    """
     root = Path(__file__).resolve().parent.parent / "opencrab"
     files: list[str] = []
     for path in sorted(root.rglob("*.py")):
-        raw = path.read_text(encoding="utf-8")
-        if pattern.search(raw):
-            files.append(str(path.relative_to(root.parent)))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and any(
+                kw.arg == keyword
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is value
+                for kw in node.keywords
+            ):
+                files.append(str(path.relative_to(root.parent)))
+                break
     return files
 
 
 def test_fork_copy_true_has_at_most_one_caller_file_repo_wide():
     """T22 (strengthened): the orchestrator has landed, so "at most one"
     tightens to "exactly one, and it is opencrab/pack/fork.py"."""
-    files = _caller_files(re.compile(r"fork_copy\s*=\s*True"))
+    files = _caller_files("fork_copy", True)
     assert files == ["opencrab/pack/fork.py"], (
         f"fork_copy=True must be used from exactly one file (the pack_fork "
         f"orchestrator): {files}"
@@ -528,7 +545,7 @@ def test_write_vector_false_has_at_most_one_caller_file_repo_wide():
     so two files is the new, correct ceiling -- not a regression to chase
     back down to one.
     """
-    files = _caller_files(re.compile(r"write_vector\s*=\s*False"))
+    files = _caller_files("write_vector", False)
     assert files == ["opencrab/pack/fork.py", "opencrab/pack/source_writer.py"], (
         f"write_vector=False must be used from exactly these two files (the "
         f"pack_fork orchestrator and source_writer's own node leg): {files}"

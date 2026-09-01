@@ -190,6 +190,25 @@ def write_source(
     not a failure, and refusing there would break vector-only deployments the
     same way the earlier vector-first ordering broke doc-only ones.
     """
+    if not write_graph and not fork_copy:
+        # `write_graph=False` is the fork's raw-copy opt-out and nothing else
+        # (#74). Without this guard a single ordinary call re-creates exactly
+        # the defect this work closed: doc_sources row + vector, no graph node,
+        # invisible to every graph-based read. A caller-inventory test can only
+        # spot a literal in this repository -- the invariant has to hold at
+        # runtime, for a value passed in a variable and for callers outside the
+        # tree.
+        #
+        # Raised here, before `authorize`, for the same reason `add_node`
+        # refuses `pack_anchor` with `fork_copy` before its own gate: a request
+        # that does not make sense must not learn the pack's authorization
+        # state first.
+        raise ValueError(
+            "write_graph=False is the fork raw-copy path and requires "
+            "fork_copy=True; an ordinary source write must materialise its "
+            "graph node"
+        )
+
     principal = _principal()
 
     # Owner-only (#143 invariant 4). `sql` is a REQUIRED positional, not an
@@ -380,7 +399,18 @@ def _graph_leg(
             # text_as_node=True branch makes the mirror-image call for the same
             # reason.
             write_vector=False,
-            _expected_current_digest=_node_digest(graph, source_id) if rows else None,
+            # Read the CAS token only for an existing row of THIS type. All
+            # three backends filter `get_node_digest` on node_type, so `if
+            # rows` happens to behave the same today -- narrowed to the shape
+            # the design states so a future backend without that filter cannot
+            # quietly send another type's digest into the update path.
+            _expected_current_digest=(
+                _node_digest(graph, source_id)
+                if rows is not None
+                and len(rows) == 1
+                and rows[0].get("node_type") == _SOURCE_NODE_TYPE
+                else None
+            ),
         )
     except (GraphSchemaMigrationRequired, GraphWriteUnavailable) as exc:
         # Operational failure of the system of record -- reported, not raised,
