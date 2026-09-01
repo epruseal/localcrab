@@ -55,8 +55,21 @@ not that the operation is supported:
     export_edges          yes     yes     yes     yes
     upsert_nodes_batch    yes     yes     yes     yes
     upsert_edges_batch    yes     yes     yes     yes
+    count_dangling_edges  yes     yes     no      no
 
-``search_nodes`` (issue #86) is the one row above that is genuinely "no" for
+``count_dangling_edges`` (issue #84) is the second row that is genuinely
+"no" outside the SQL backends, and like ``search_nodes`` it is deliberately
+not declared as a Protocol member. It counts edges whose endpoint snapshot
+resolves to no node row -- a state only the SQL schema permits, because it
+declares no foreign key. Neo4j cannot hold a relationship without both
+endpoints, and its ``_initialise_schema_state`` already walks every
+OpenCrab-owned relationship and classifies label/type drift as
+partial_or_unknown, which gates writes; the SQL classifiers only inspect DDL
+and column metadata, never rows, so the SQL backends had no equivalent
+signal at all. A Neo4j-side drift diagnostic is tracked separately rather
+than stubbed here -- a constant would be a claim this code cannot make.
+
+``search_nodes`` (issue #86) is the other row above that is genuinely "no" for
 Neo4j, not stale -- ``HybridQuery.keyword_search`` never needed a
 Neo4jStore.search_nodes because its Cypher ``CONTAINS`` branch already
 pushes the same keyword/space predicate straight into Cypher without going
@@ -201,9 +214,19 @@ class GraphStore(Protocol):
         """Create or update a directed (from)->(to) edge; True on success.
 
         Raises an availability or identity exception when unsupported.
-        Endpoints must already exist. Neo4j reports a missing endpoint as
-        False; qualified SQL writers reject missing endpoints before insertion.
+
+        Endpoints must already exist, and must already carry the node_type
+        this call names -- an id that resolves to a row of a DIFFERENT type
+        is refused just like a missing one, since the edge's endpoint
+        snapshot would not resolve either way. Both Neo4j and the qualified
+        SQL writers report that refusal as **False**, and write nothing.
         The Kùzu facade is capability-negative.
+
+        Note the deliberate asymmetry with ``upsert_edges_batch``, which
+        raises instead: a single call has one outcome the caller is already
+        branching on, while a batch has to say WHICH row was bad, and
+        silently returning a lower count would let a partial write pass for
+        a whole one.
         """
         ...
 
@@ -692,10 +715,17 @@ class GraphStoreExtended(Protocol):
 
         Each item: ``{"from_type": str, "from_id": str, "relation": str,
         "to_type": str, "to_id": str, "properties": dict | None}``. On
-        Local/PG this is ``len(edges)`` (or 0 for empty input) since every
-        row in one executemany/INSERT batch is assumed to succeed; Kuzu's
-        port loops calling ``upsert_edge`` per item and only counts the
-        ones that returned True.
+        Local/PG this is ``len(edges)`` (or 0 for empty input); Kuzu's port
+        loops calling ``upsert_edge`` per item and only counts the ones that
+        returned True.
+
+        Local/PG validate EVERY item's endpoints (existence and node_type)
+        in one pass BEFORE the insert loop starts, and raise ``ValueError``
+        on the first offender. So a batch mixing good rows with one bad row
+        writes none of them -- a pre-validation refusal, not a rollback after
+        partial writes. That is why the count can be ``len(edges)``: the call
+        either wrote them all or raised. Contrast ``upsert_edge``, which
+        reports the same condition as False (see its note above).
         """
         ...
 
