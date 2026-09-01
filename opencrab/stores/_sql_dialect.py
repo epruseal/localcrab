@@ -145,11 +145,12 @@ class SqlDialect:
         ``json_extract(properties, '$.pack_id')`` vs
         ``properties->>'pack_id'``.
 
-        This is for reading ONE key inside SQL — filter and scope predicates
-        that must run in the WHERE clause. It is unrelated to round-tripping
-        a whole JSON column, which callers do in Python with ``json.loads``;
-        a store that round-trips blobs in Python still reaches for this the
-        moment it needs to filter on a key."""
+        This is for reading ONE key inside SQL — filter and scope
+        predicates, projections, aggregates, index expressions: anywhere a
+        single key has to be read by the database rather than by the caller.
+        Serializing a whole JSON column and decoding a fetched row are
+        separate, store-level concerns (and they differ per backend); needing
+        this fragment says nothing about how a store handles those."""
         if self.name == "sqlite":
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"

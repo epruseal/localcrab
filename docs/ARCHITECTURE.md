@@ -548,8 +548,8 @@ PostgreSQL 분기에서만 쓰이므로 SQLite 경로의 요구사항이 아니�
 " ON graph_nodes(json_extract(properties, '$.pack_id'))"
 
 # 문서: keyword_search() 의 space·pack 필터 (SqlDialect.json_get /
-#       json_truthy_text 경유)
-"... WHERE json_extract(s.metadata, '$.space') = :space ..."
+#       json_truthy_text 경유, 위치 플레이스홀더 바인딩)
+"... AND json_extract(s.metadata, '$.space') IN (?, ...) ..."
 ```
 
 지금 어디서 쓰는지는 코드에 물어본다. 아래는 **텍스트 후보 검색**이라 docstring·주석·
