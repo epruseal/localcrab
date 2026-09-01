@@ -1,23 +1,39 @@
-"""The source-text writer: the second of the two write chokepoints (#148).
+"""The source-text writer: the second of the two write chokepoints (#148, #74).
 
-``OntologyBuilder`` covers graph node/edge writes. Source text does NOT go
-through it -- ``HybridQuery.ingest`` writes only the vector (its own comment
+``OntologyBuilder`` covers graph node/edge writes. Source text used to bypass
+it entirely -- ``HybridQuery.ingest`` writes only the vector (its own comment
 says so: "Doc-store mutations happen outside ingest() today"), and the
-``doc_sources`` row is a separate ``docs.upsert_source`` call at every site
+``doc_sources`` row was a separate ``docs.upsert_source`` call at every site
 that ingests text: REST ``/api/ingest``, the CLI, ``pack_ingest``'s
-``text_as_node=False`` path, and the pack loader.
+``text_as_node=False`` path, and ``pack_fork``.
 
 Four sites, two calls each, and the ownership stamp landing on only one of
 them is how the free-tier quota came to depend on a key (``metadata.user_id``)
-that no server-side code was responsible for setting. This module makes the
-pair one call with one stamp.
+that no server-side code was responsible for setting. #148 made the pair one
+call with one stamp.
 
-Order matters: the doc row is written FIRST. An earlier draft wrote the vector
-first and skipped the doc row when the vector failed, which silently turned
-ingest into a no-op on any deployment without a vector store -- ``ingest()``
-returns ``{"chromadb": "unavailable"}`` there rather than raising. The doc
-store is the system of record for a source, so it leads, exactly as the graph
-store leads in the builder.
+#74 added the third leg. Text ingested here was reaching the vector and the
+doc store but never the graph, so it was invisible to every graph-based
+feature -- ``ontology_get_node`` answered ``found: false`` for a source the
+same server had just confirmed it stored. Only ``pack_ingest``'s
+``text_as_node=True`` branch materialised the ``evidence/TextUnit`` node, so
+the same data was stored differently depending on which surface wrote it.
+This module now writes that node for every source, which is what makes the
+four sites agree.
+
+Order matters, and it changed with #74. The graph leg runs FIRST and is
+REQUIRED: when the node does not land, neither the doc row nor the vector is
+written. That is ``OntologyBuilder.add_node``'s own rule ("a doc/vector row
+with no graph node is invisible to every pack-scoped read"), and writing the
+optional stores anyway is precisely the half-stored state #74 reports. It also
+has to lead because the builder's ownership guard raises: behind the doc
+write, a rejected node would leave a committed row behind a 422.
+
+Between the two optional legs the doc row still leads. An early #148 draft
+wrote the vector first and skipped the doc row when the vector failed, which
+silently turned ingest into a no-op on any deployment without a vector store
+-- ``ingest()`` returns ``{"chromadb": "unavailable"}`` there rather than
+raising.
 """
 
 from __future__ import annotations

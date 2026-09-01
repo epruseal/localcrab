@@ -231,13 +231,27 @@ def _ingest_into_pack(
     Parameters
     ----------
     text_as_node:
-        When True (default), raw ``text`` is materialised as a 9-space
-        ``evidence/TextUnit`` graph node via ``builder.add_node`` so it
-        becomes a first-class grammar-compliant node (graph + doc + vector,
-        all pack_id-tagged).  ``hybrid.ingest`` and ``mongo.upsert_source``
-        are skipped to avoid duplicate vector writes under the same id.
-        When False, the legacy path is used: vector-only embedding via
-        ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
+        Both branches now produce the same ``evidence/TextUnit`` graph node
+        (#74); the flag no longer decides whether the text is visible to
+        graph-based features. What it still decides is the rest of the shape.
+
+        When True (default), ``text`` goes through ``builder.add_node``
+        directly: graph + doc_nodes + vector, the vector carrying the NODE's
+        assembled text and node-shaped metadata. ``hybrid.ingest`` and
+        ``mongo.upsert_source`` are skipped, so there is no ``doc_sources``
+        row and the source does not appear in source listings or the
+        free-tier source quota.
+
+        When False, the write goes through ``source_writer.write_source``:
+        the same graph node plus a ``doc_sources`` row, and the vector
+        carries the RAW text with source-shaped metadata. That path also
+        declines to create a node for a ``source_id`` too long to survive as
+        a node id through a fork remap -- ``add_node`` above has no such
+        carve-out.
+
+        Collapsing the two into one path would change ``added_nodes`` /
+        ``evidence_node`` and the vector shape for existing callers, so it is
+        deliberately left alone.
     """
     from opencrab.common.graph_identity import (
         GraphSchemaMigrationRequired,
@@ -899,7 +913,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged). Set false for legacy vector-only embedding.",
+                    "description": "Both settings now store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead.",
                 },
             },
             "required": ["title"],
@@ -1431,7 +1445,7 @@ def pack_create(
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "When true (default), text is stored as an evidence/TextUnit graph node (grammar-compliant, pack_id-tagged, graph+doc+vector). Set false for legacy vector-only embedding.",
+                    "description": "Both settings now store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead.",
                 },
                 "title": {
                     "type": "string",
