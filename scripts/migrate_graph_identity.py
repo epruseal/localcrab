@@ -5,10 +5,12 @@ The default action is a read-only dry-run.  This command deliberately knows
 only the public graph-store inventory and migration methods; it never opens a
 database connection to issue graph-table DML itself.
 
-``--mapping-file`` takes a JSON object with two optional list members,
-``mappings`` and ``property_resolutions``.  A legacy node is always addressed
-by a nested ``source`` object holding exactly ``node_type`` and ``node_id``,
-and the digest of that node is carried in a sibling ``source_digest`` field::
+``--mapping-file`` takes a JSON object whose two list members, ``mappings``
+and ``property_resolutions``, are both optional.  A legacy node is addressed
+by a nested ``source`` object holding exactly ``node_type`` and ``node_id``.
+Under ``mappings`` that source is paired with the digest of the node in a
+sibling ``source_digest`` field; a property resolution names the same kind of
+source object but carries no digest::
 
     {
       "mappings": [
@@ -37,9 +39,13 @@ and the digest of that node is carried in a sibling ``source_digest`` field::
       ]
     }
 
-A target additionally accepts optional ``space_id`` and ``pack_id``.  Node
-digests come from a prior dry-run receipt or from the graph inventory; the
-store rejects a mapping whose digest no longer matches the stored row.
+A target additionally accepts optional ``space_id`` and ``pack_id``, and a
+merge needs at least two sources; the store rejects a shorter one.  Node
+digests come from a prior dry-run receipt or from the graph inventory, and the
+store rejects a mapping whose digest no longer matches the stored row.  Read
+the digests out of a receipt rather than pasting its mappings in: a receipt
+reports each source flattened to ``node_type``, ``node_id`` and ``digest``,
+which is not the shape this file accepts.
 """
 
 from __future__ import annotations

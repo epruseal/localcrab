@@ -244,12 +244,14 @@ canonical plan bytes를 반환한다. 운영자가 `scripts/migrate_graph_identi
 request ID를 함께 검증하고 SQLite는 `BEGIN EXCLUSIVE`, PostgreSQL은 advisory lock
 안에서 staging과 cutover를 수행한다.
 
-dry-run 매핑 파일(`--mapping-file`)은 `mappings`와 `property_resolutions` 두 리스트를
-갖는 JSON 객체다. legacy 노드는 언제나 `node_type`과 `node_id`만 담은 중첩 `source`
-객체로 지목하고 그 노드의 digest는 형제 필드 `source_digest`로 적는다. `rename` 항목은
-`source`와 `source_digest`를 직접 갖고, `merge` 항목은 `sources` 리스트의 각 원소가 같은
-두 필드를 갖는다. 형식 전문과 예시는 `scripts/migrate_graph_identity.py`의 모듈
-docstring에 있다.
+dry-run 매핑 파일(`--mapping-file`)은 JSON 객체이며 `mappings`와
+`property_resolutions` 두 리스트 멤버는 모두 선택이다. legacy 노드는 `node_type`과
+`node_id`만 담은 중첩 `source` 객체로 지목한다. `mappings` 안에서는 그 노드의 digest를
+형제 필드 `source_digest`로 함께 적어서, `rename` 항목은 `source`와 `source_digest`를
+직접 갖고 `merge` 항목은 `sources` 리스트의 각 원소가 같은 두 필드를 갖는다.
+`property_resolutions` 항목의 `source`는 같은 2키 객체지만 digest를 요구하지 않는다.
+receipt가 보고하는 source는 세 필드를 평탄화한 별개 모양이므로 매핑 파일에 그대로 옮겨
+쓸 수 없다. 형식 전문과 예시는 `scripts/migrate_graph_identity.py`의 모듈 docstring에 있다.
 
 dry-run은 graph와 migration ledger를 변경하지 않는다. apply는 성공한 receipt를
 ledger에 한 번만 기록하며 같은 request ID의 재실행은 저장된 receipt를 그대로

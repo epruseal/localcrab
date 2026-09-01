@@ -25,6 +25,7 @@ from opencrab.common.graph_identity import (
     DryRunMigrationRequest,
     ExplicitMerge,
     ExplicitRename,
+    GraphMigrationConflict,
     LegacyNodeKey,
     PropertyResolution,
 )
@@ -145,7 +146,11 @@ def test_merge_mapping_file_runs_as_a_process(graph: _Graph, tmp_path: Path) -> 
     assert proc.returncode == 0, proc.stderr
     receipt = json.loads(proc.stdout)
     assert receipt["phase"] == "dry_run"
-    assert [entry["kind"] for entry in receipt["mapping_result"]].count("merge") == 1
+    merges = [entry for entry in receipt["mapping_result"] if entry["kind"] == "merge"]
+    assert len(merges) == 1
+    # A receipt flattens each source, so its mappings are not a mapping file:
+    # pasting one back in is what issue #258 was about.
+    assert all(set(source) == {"node_type", "node_id", "digest"} for source in merges[0]["sources"])
     assert plan_out.read_bytes() == graph.plan_bytes((graph.merge(),))
 
 
@@ -203,6 +208,30 @@ def test_rename_only_mapping_file_does_not_regress(graph: _Graph, tmp_path: Path
         ExplicitRename(PERSON_A, graph.digests[PERSON_A], "a", "Person", None, None),
     ))
     assert _cli_plan_bytes(graph, mapping, tmp_path) == expected
+
+
+def test_mapping_file_members_are_optional(tmp_path: Path) -> None:
+    """Both list members may be absent; the parser then plans nothing explicit."""
+    assert cli._mapping_file(_write(tmp_path, {})) == ((), ())
+
+
+def test_single_source_merge_is_left_for_the_store_to_reject(
+    graph: _Graph, tmp_path: Path
+) -> None:
+    """The parser accepts merge cardinality and the store owns the rule."""
+    mapping = _write(tmp_path, {"mappings": [{
+        "kind": "merge",
+        "sources": [{"source": _key_json(AGENT_A), "source_digest": graph.digests[AGENT_A]}],
+        "target": {"node_id": "a", "node_type": "Person"},
+    }]})
+    mappings, resolutions = cli._mapping_file(mapping)
+    assert resolutions == ()
+    assert len(mappings[0].sources) == 1
+    with pytest.raises(GraphMigrationConflict, match="merge requires at least two sources"):
+        cli.main([
+            "--db-path", str(graph.db_path),
+            "--mapping-file", str(mapping),
+        ])
 
 
 _SOURCE_ENTRY = "merge source must contain exactly source and source_digest"
