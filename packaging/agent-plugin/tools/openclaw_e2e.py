@@ -198,6 +198,13 @@ def verify_evidence(
     verdict.add("provider_call_is_the_mutating_tool", bound, detail)
 
     # --- provider 측: 도구 결과가 난수를 담아 되돌아왔는가 ---
+    # 발행한 호출의 call_id 와 묶는다. 아무 role=tool 본문에 난수가 있는지만 보면
+    # 다른 호출의 결과가 그 자리를 대신해도 통과한다. 클라이언트가 id 에서 비영숫자를
+    # 지우는 경우가 있으므로 정규화해서 비교한다.
+    def norm(value: str) -> str:
+        return "".join(ch for ch in value if ch.isalnum())
+
+    issued_ids = {norm(c.get("call_id") or "") for c in nonce_calls}
     tool_msgs = []
     for e in provider_events:
         if e.get("kind") != "request":
@@ -208,14 +215,23 @@ def verify_evidence(
             content = msg.get("content")
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
-            tool_msgs.append(content)
-    hits = sum(1 for c in tool_msgs if nonce in c)
+            tool_msgs.append((norm(msg.get("tool_call_id") or ""), content))
+    matched = [c for (cid, c) in tool_msgs if cid in issued_ids and nonce in c]
     verdict.add(
         "provider_received_nonce_result",
-        hits >= 1,
-        f"난수를 담은 role=tool 메시지 {hits}건 (기대 1건 이상, 전체 {len(tool_msgs)}건)",
+        len(matched) >= 1,
+        f"발행한 call_id 에 대응하면서 난수를 담은 role=tool 메시지 {len(matched)}건 "
+        f"(기대 1건 이상, 전체 {len(tool_msgs)}건)",
     )
 
+    if boundary_recorded and not expect_boundary:
+        verdict.add(
+            "boundary_recorded_as_expected",
+            False,
+            f"기록기를 빼고 돌렸다고 했는데 경계 원문 {len(outbound)}프레임이 있다 -- "
+            "이전 실행의 잔여 로그를 읽고 있을 수 있다",
+        )
+        return verdict
     if not boundary_recorded:
         verdict.add(
             "boundary_recorded_as_expected",
@@ -233,21 +249,26 @@ def verify_evidence(
     )
 
     # --- 경계: 난수를 실은 tools/call 프레임이 실재하는가 ---
+    # 난수가 arguments 어딘가에 있는 것으로는 부족하다. 정확히 node_id 여야
+    # provider 쪽 결속과 대칭이 되고, 엉뚱한 필드에 난수를 실은 호출이 걸러진다.
     nonce_frames = [
         f
         for f in outbound
         if f.get("method") == "tools/call"
-        and nonce in json.dumps((f.get("params") or {}).get("arguments") or {}, ensure_ascii=False)
+        and isinstance((f.get("params") or {}).get("arguments"), dict)
+        and (f["params"]["arguments"] or {}).get("node_id") == nonce
     ]
     verdict.add(
         "boundary_tools_call_carries_nonce",
         len(nonce_frames) == 1,
-        f"난수를 실은 tools/call 프레임 {len(nonce_frames)}건 (기대 1건)",
+        f"node_id 가 정확히 난수인 tools/call 프레임 {len(nonce_frames)}건 (기대 1건)",
     )
 
     # --- 경계: 그 호출에 대응하는 서버 응답이 난수를 되돌려주는가 ---
-    if nonce_frames:
-        call_id = nonce_frames[0].get("id")
+    call_rpc_id = nonce_frames[0].get("id") if nonce_frames else None
+    if nonce_frames and call_rpc_id is not None:
+        call_id = call_rpc_id
+        # id 가 None 인 프레임끼리 None == None 으로 짝지어지면 안 된다.
         replies = [f for f in inbound if f.get("id") == call_id and "result" in f]
         echoed = [r for r in replies if nonce in json.dumps(r.get("result"), ensure_ascii=False)]
         verdict.add(
@@ -257,6 +278,11 @@ def verify_evidence(
         )
         called_name = (nonce_frames[0].get("params") or {}).get("name")
     else:
+        verdict.add(
+            "boundary_response_echoes_nonce",
+            False,
+            "난수를 실은 tools/call 프레임이 없거나 JSON-RPC id 가 없어 응답을 짝지을 수 없다",
+        )
         called_name = None
 
     # --- 경계: 호출한 도구가 tools/list 로 광고된 것인가 ---
@@ -334,9 +360,15 @@ for t in threads:
     t.start()
 rc = proc.wait()
 # 양방향 모두 회수한다. 서버->클라이언트만 join 하면 클라이언트->서버 말미
-# 바이트가 잘려 부분 캡처가 남는다.
+# 바이트가 잘려 부분 캡처가 남는다. join 은 timeout 을 넘겨도 조용히 돌아오므로
+# 살아남은 스레드가 있으면 캡처가 불완전하다고 알린다 -- 판정기가 이 실행을
+# 통과시키면 안 된다.
 for t in threads:
     t.join(timeout=5)
+stragglers = [t.name for t in threads if t.is_alive()]
+if stragglers:
+    sys.stderr.write("opencrab-recorder: incomplete capture, threads still running: "
+                     + ", ".join(stragglers) + "\\n")
 sys.exit(rc)
 '''
 

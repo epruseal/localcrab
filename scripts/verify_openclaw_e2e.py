@@ -155,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     print("     번들 감지 확인 (MCP 서버 선언 포함)")
 
+    # 데이터 루트는 러너가 **빈 디렉터리로** 만든다. 실측으로 확인한 제약이다:
+    # 신선한 HOME 에서 이 디렉터리가 없으면 클라이언트의 최초 stdio 기동이
+    # `failed to start server ... Connection closed` 로 실패한다(서버는 자기
+    # 데이터 디렉터리를 만들지 않고, 클라이언트도 최초 기동 전에는 만들지 않는다).
+    #
+    # 따라서 이 러너는 "클라이언트가 PLUGIN_DATA 를 만든다"를 관측하지 않는다.
+    # 관측하는 것은 그 다음 단계다: 빈 디렉터리에 대해 클라이언트의 최초 기동만으로
+    # 스토어가 생기는가(수동 init 없이). 그것이 자동 부트스트랩 opt-in 의 계약이다.
     plugin_data = home / ".openclaw" / "plugin-data" / "localcrab"
     plugin_data.mkdir(parents=True, exist_ok=True)
 
@@ -166,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         # "클라이언트의 최초 stdio 기동이 프로비저닝한다"(문서 3단계)는 관측 대상을
         # 없앤다. 대신 데이터 루트가 비었음을 확인한다 -- 스토어가 없으면 난수 노드도
         # 있을 수 없으므로 부재 확인으로 충분하고, 자동 부트스트랩 관측은 남는다.
-        print("3/6 프로비저닝 -- 데이터 루트가 비었는지 확인하고 자동 부트스트랩을 관측한다")
+        print("3/6 프로비저닝 -- 빈 데이터 루트에서 자동 부트스트랩이 되는지 본다")
         leftover = sorted(p.name for p in plugin_data.iterdir())
         if leftover:
             print(f"FAIL: 데이터 루트가 비어 있지 않다: {leftover}", file=sys.stderr)
@@ -190,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
              "--session-key", "agent:main:openclaw-e2e",
              "--model", f"vllm/{MODEL_ID}",
              "-m", "Call the LocalCrab tools as instructed."],
-            env=run_env(home, tmpdir, run_path), capture_output=True, text=True, timeout=600,
+            env=run_env(home, tmpdir, run_path), cwd=cwd,
+            capture_output=True, text=True, timeout=600,
         )
         (scratch / "agent.json").write_text(proc.stdout, encoding="utf-8")
         (scratch / "agent.err").write_text(proc.stderr, encoding="utf-8")
@@ -204,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # 문서 3단계: 수동 init 없이 클라이언트의 최초 기동만으로 스토어가 생겼는가.
+    # 서버가 stderr 로 내는 생성 공지는 여기서 관측할 수 없다 -- 클라이언트가 MCP 서버
+    # 자식의 stderr 를 호출자에게 넘겨주지 않는다. 관측 가능한 증거는 생성된 파일이다.
     db = plugin_data / "opencrab.db"
     print(f"     자동 프로비저닝: {db.name} 실재={db.exists()}")
     if not db.exists():

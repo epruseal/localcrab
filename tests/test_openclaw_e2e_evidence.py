@@ -129,8 +129,12 @@ def test_corrupting_the_nonce_fails_the_matching_boundary_check(artifact, expect
     assert expected_failure in _failed(verdict)
 
 
-def test_provider_issue_check_is_detected_independently():
-    """decision 이벤트만 훼손한다 -- 수신 검사는 건드리지 않는다."""
+def test_provider_issue_check_mutation_cascades_by_design():
+    """decision 이벤트를 훼손하면 발행 검사가 실패하고, 수신 검사도 따라 실패한다.
+
+    수신 검사가 발행한 `call_id` 에 묶여 있으므로 이 연쇄는 설계된 의존이다.
+    수신 검사의 **독립** 검출력은 아래 역방향 변이가 따로 증명한다.
+    """
     data = _load()
     out = []
     for line in data["provider_log"].splitlines():
@@ -142,11 +146,14 @@ def test_provider_issue_check_is_detected_independently():
     verdict = verify_evidence(**data)
     failed = _failed(verdict)
     assert "provider_issued_nonce_call" in failed
-    assert "provider_received_nonce_result" not in failed, "수신 검사가 함께 훼손됐다 -- 독립 검출이 아니다"
+    assert "provider_received_nonce_result" in failed, "call_id 결속이 끊겼다"
 
 
 def test_provider_receipt_check_is_detected_independently():
-    """role=tool 본문만 훼손한다 -- 발행 검사는 건드리지 않는다."""
+    """role=tool 본문만 훼손한다 -- 발행 검사는 건드리지 않는다.
+
+    이 방향이 수신 검사의 독립 검출력을 증명한다.
+    """
     data = _load()
     out = []
     for line in data["provider_log"].splitlines():
@@ -162,6 +169,41 @@ def test_provider_receipt_check_is_detected_independently():
     failed = _failed(verdict)
     assert "provider_received_nonce_result" in failed
     assert "provider_issued_nonce_call" not in failed, "발행 검사가 함께 훼손됐다 -- 독립 검출이 아니다"
+
+
+def test_tool_result_from_a_different_call_is_rejected():
+    """난수를 담았어도 발행한 call_id 에 대응하지 않는 tool 결과는 인정하지 않는다."""
+    data = _load()
+    out = []
+    for line in data["provider_log"].splitlines():
+        event = json.loads(line)
+        for msg in ((event.get("payload") or {}).get("messages") or []):
+            if msg.get("role") == "tool" and FIXTURE_NONCE in str(msg.get("content")):
+                msg["tool_call_id"] = "some-unrelated-call-id"
+        out.append(json.dumps(event, ensure_ascii=False))
+    data["provider_log"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "provider_received_nonce_result" in _failed(verdict)
+
+
+def test_nonce_in_a_non_node_id_argument_is_rejected():
+    """난수가 arguments 어딘가에 있기만 한 호출은 인정하지 않는다."""
+    data = _load()
+    data["client_to_server"] = data["client_to_server"].replace(
+        f'"node_id":"{FIXTURE_NONCE}"', f'"node_id":"other","note":"{FIXTURE_NONCE}"'
+    )
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_tools_call_carries_nonce" in _failed(verdict)
+
+
+def test_declaring_no_recorder_while_boundary_exists_is_rejected():
+    """기록기를 뺐다고 선언했는데 경계 원문이 있으면 모순이므로 기각한다."""
+    data = _load() | {"expect_boundary": False}
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_recorded_as_expected" in _failed(verdict)
 
 
 def test_synthesized_result_without_a_real_call_is_rejected():
@@ -277,6 +319,20 @@ def test_new_nonce_is_unique_and_node_id_safe():
     a, b = new_nonce(), new_nonce()
     assert a != b
     assert all(ch.isalnum() or ch == "-" for ch in a), a
+
+
+def test_recorder_shim_source_is_syntactically_valid(tmp_path):
+    """생성한 기록기가 실제로 컴파일되는지 확인한다.
+
+    기록기는 클라이언트가 서버로 띄우는 실행 파일이다. 여기서 나는 어떤 오류든
+    `failed to start server ... Connection closed` 라는 **서버 기동 실패로만**
+    보이므로, 원인이 하네스에 있다는 사실이 증상에 전혀 드러나지 않는다.
+    이 단위에서 두 번(환경 변수 접근, 소스 이스케이프) 실제로 겪은 함정이다.
+    """
+    import py_compile
+
+    write_recorder_shim(tmp_path / "shim", "/opt/somewhere/opencrab", tmp_path / "rec")
+    py_compile.compile(str(tmp_path / "shim" / "opencrab_recorder.py"), doraise=True)
 
 
 def test_recorder_shim_bakes_paths_as_constants(tmp_path):
