@@ -129,21 +129,72 @@ CI 게이트는 항상 레퍼런스 클라이언트 스모크다(`tests/test_age
 1회**, 격리 계약(scratch `HOME` + scratch `CWD` + 명시 임시 포트, `--profile` 은
 라이브 상태를 마이그레이션하므로 금지) 아래 사다리로 도달 지점을 기록한다:
 
-1. **설치** — `openclaw plugins install <dist>/localcrab-plugin`
-2. **발견** — `openclaw plugins list`/`inspect` 로 `Bundle format: agent
-   (Agent Plugins)` 및 MCP 서버·skill 감지 확인
+1. **설치** — 두 플래그가 **모두** 필요하다. `--force` 는 ClawHub 외부 로컬
+   경로라서, `--accept-capabilities` 는 MCP 를 선언한 번들이라서 요구된다.
+   후자를 빠뜨리면 설치는 진행되지만 그 뒤 **CLI 기동 자체가 막힌다**
+   (`requires capability consent`).
+
+   ```bash
+   openclaw plugins install --force --accept-capabilities <dist>/localcrab-plugin
+   ```
+
+2. **발견** — `openclaw plugins inspect <plugin.json 의 name>` 출력에
+   `Bundle format: agent (Agent Plugins)`, `Bundle capabilities` 의
+   `mcpServers`, 그리고 `MCP servers:` 목록의 서버 이름이 모두 있어야 한다.
+   조회 식별자는 설치 디렉터리명이 아니라 `plugin.json` 의 `name` 이다.
 3. **프로비저닝** — 자동 경로(기본): mcp.json 이 실어 보내는
-   `OPENCRAB_BOOTSTRAP_ON_EMPTY=1` 그대로, OpenClaw 가 만든 빈 `PLUGIN_DATA`
+   `OPENCRAB_BOOTSTRAP_ON_EMPTY=1` 그대로, 클라이언트가 만든 빈 `PLUGIN_DATA`
    에서 최초 stdio 기동만 실행해 `<PLUGIN_DATA>/opencrab.db` 실재와 stderr
    생성 공지를 확인한다(수동 init 없이 기동만으로 성립). 수동 경로도 병기
    검증한다: 위 정본 `opencrab init` 명령을 별도의 빈 `PLUGIN_DATA` 에서
    실행해 같은 `opencrab.db` 실재로 대체 경로가 여전히 유효함을 확인한다
-4. **실행+도구 노출** — `mcp probe`/`mcp list` 또는 embedded agent turn 에서
-   도구 목록 확인
-5. **tools/call** — embedded agent turn 에서 `ontology_manifest` 를 **명시
-   호출**한 사건과, 그 호출에 대응하는 결과에서 `spaces`/`meta_edges` 키
-   실재를 전사(또는 원시 MCP 로그)로 확인했을 때만 충족으로 기록한다. 도구
-   노출 확인(4단계)만으로는 호출 충족으로 기록하지 않는다.
+4. **실행+도구 노출** — **embedded agent turn 으로만 확인한다.**
+   `mcp list`/`mcp probe` 는 쓰지 않는다: 두 명령은 설정 파일의 관리형
+   `mcp.servers` 항목만 읽으므로, 번들이 공급한 MCP 서버는 감지·기동이 모두
+   성공한 상태에서도 "configured 된 서버가 없다"로 나온다. 이것을 실패 신호로
+   읽으면 오진한다.
+5. **tools/call** — 아래 네 조건을 **모두** 만족했을 때만 충족으로 기록한다.
+   도구 노출 확인(4단계)만으로는 호출 충족으로 기록하지 않는다.
+
+   1. 클라이언트와 서버 사이 stdio 경계에서 JSON-RPC **원문**을 관측한다.
+   2. 실행별 난수를 인자로 받는 **변경 연산**을 최소 1회 호출한다. 정적 무인자
+      도구만 호출하면 "결과를 합성해 넣었다"는 반례를 배제하지 못한다 — 결과가
+      프로세스 간 결정론적이라 어디서 온 값인지 구별되지 않기 때문이다.
+   3. 그 난수가 provider 요청의 assistant tool call 인자, 경계 원문의
+      `tools/call.params.arguments`, 서버 응답, provider 가 되받은 `role=tool`
+      메시지에 **연속으로** 나타난다.
+   4. turn 종료 후 **별도 프로세스**가 같은 스토어에 새 stdio 세션을 열어 그
+      변경의 부작용이 실재함을 확인한다.
+
+   인과를 가장 강하게 보이려면 경계 기록기를 **빼고** 한 번 더 돌린다. 기동
+   경로에 하네스 코드가 남지 않으므로, 부작용이 생겼다는 사실 자체가
+   클라이언트의 실제 호출을 증명한다.
+
+**함정: 경계에 래퍼를 끼울 때.** 클라이언트는 MCP 서버 자식 프로세스에 환경을
+**소독해서** 넘긴다 — 자식이 받는 변수는 극소수다. 따라서 경계 기록기가 자기
+설정(실제 바이너리 경로 등)을 환경 변수로 받으려 하면 자식에서 즉사하고, 증상은
+`failed to start server ... Connection closed` 라는 **서버 기동 실패로만** 보인다.
+기록기는 경로를 소스에 상수로 박아야 한다. 또 기록기는 아무것도 파싱하지 않는
+바이트 tee 여야 한다 — 프레임을 해석하면 그 기록은 독립 관측이 아니게 된다.
+
+### 재현 수단
+
+위 사다리는 러너로 실행할 수 있다. 수작업으로 하면 재현 수단이 남지 않고,
+그러면 다음 사람이 도달 지점을 대사할 수 없다.
+
+```bash
+python scripts/verify_openclaw_e2e.py \
+    --plugin-dist <dist>/localcrab-plugin \
+    --opencrab-bin "$(command -v opencrab)" \
+    --client-bin "$(command -v openclaw)" \
+    --scratch <스크래치 루트>
+```
+
+러너는 격리 계약(스크래치 `HOME`, 허용목록 환경, 임시 루프백 포트)을 스스로
+지키고 1~5단계를 순서대로 수행한 뒤 판정을 낸다. `--no-recorder` 를 주면 경계
+기록기 없이 돈다. 증거 판정기는 `tests/test_openclaw_e2e_evidence.py` 가 실제
+실행에서 캡처한 픽스처와 역변이로 회귀를 잡는다(CI 에서 돈다). 러너 자체는 실
+클라이언트 설치를 요구하므로 CI 게이트가 아니다.
 
 모델 자격증명 부재로 agent turn 자체가 성립하지 않으면(새 자격증명 발급이나
 비용 발생은 하지 않는다), 도달한 단까지만 **부분 충족**으로 명시하고 어느
