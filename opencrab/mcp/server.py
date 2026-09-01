@@ -136,7 +136,7 @@ class MCPServer:
         if protocol.is_modern_request(method, params):
             return self._handle_modern(req_id, method, params, is_notification)
 
-        # ── legacy era (initialize handshake; no per-request _meta) ───────
+        # ── legacy era (initialize handshake; no modern version marker) ──
         if not self._enabled_legacy:
             # Legacy support switched off via MCP_PROTOCOL_VERSIONS. The
             # errors name the modern versions: legacy clients have no
@@ -318,8 +318,10 @@ class MCPServer:
         # ever runs on it. The checks live in
         # protocol.validate_tools_call_params, shared with the HTTP
         # notification pre-check; TypeError keeps the historical -32602
-        # mapping and exact message. The legacy path keeps its historical
-        # truthiness-only checks untouched.
+        # mapping and exact message. #251 pointed the legacy path at this
+        # same validator (it used to run a bare truthiness check on `name`);
+        # the eras now differ only in legacy's falsy-`arguments` carve-out,
+        # which lives in _handle_tools_call, never in the validator.
         fault = protocol.validate_tools_call_params(params)
         if fault is not None:
             raise TypeError(fault.message)
@@ -405,11 +407,41 @@ class MCPServer:
         Execute a tool and return the result.
 
         Expected params: {"name": "tool_name", "arguments": {...}}
-        """
-        name = params.get("name")
-        if not name:
-            raise TypeError("'name' is required in tools/call params.")
 
+        #251: the call shape goes through the SAME
+        ``protocol.validate_tools_call_params`` the modern era uses, with
+        exactly one carve-out (below). Before this, the only check was a
+        bare ``if not name``, so a non-string name and a non-object
+        ``arguments`` travelled into ``dispatch_tool`` and died there --
+        an unhashable registry key, or ``**`` on a non-mapping -- and the
+        generic ``except Exception`` below wrapped that internal TypeError
+        into a JSON-RPC *success* envelope. The safety rule this alignment
+        obeys: no input that currently makes a tool RUN changes behaviour.
+        The rejected shapes never reached a tool body.
+        """
+        # The carve-out: a present but FALSY non-object ``arguments``
+        # (null/[]/0/0.0/false/"") is normalised to {} and the tool runs
+        # today, so a client serialising an absent optional as JSON null
+        # keeps working. Aligning that would break a call that works, and
+        # is deferred to the D-clause removal (#251). Normalising here (on
+        # a copy -- the caller's dict is never mutated) rather than
+        # flagging the shared validator keeps opencrab/mcp/protocol.py the
+        # single strict source for the modern era.
+        if not isinstance(params, dict):
+            raise TypeError("params must be an object in tools/call.")
+        if (
+            "arguments" in params
+            and not isinstance(params["arguments"], dict)
+            and not params["arguments"]
+        ):
+            params = {**params, "arguments": {}}
+        fault = protocol.validate_tools_call_params(params)
+        if fault is not None:
+            # TypeError keeps handle_request's historical -32602 mapping and
+            # its single "Invalid params: " prefix, same as _modern_tools_call.
+            raise TypeError(fault.message)
+
+        name = params["name"]
         arguments = params.get("arguments") or {}
 
         try:
