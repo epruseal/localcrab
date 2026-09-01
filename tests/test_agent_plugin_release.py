@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import signal
 import sys
 import tarfile
 from pathlib import Path
@@ -176,6 +177,63 @@ def _recompute_release(out_dir: Path, version: str) -> None:
     ]
     entries = {name: _sha256(out_dir / name) for name in names}
     _rewrite_release_file(release_path, entries)
+
+
+def _count_tarfile_open_calls(monkeypatch) -> dict[str, int]:
+    """PR #257 리뷰 라운드 2 [X1] 게이트 검증용: `tarfile.open` 호출 횟수를 계측한다
+    (`build.py` 는 `import tarfile` 을 통해 모듈 전역으로 부르므로 `b.tarfile.open` 을
+    패치하면 verify_release 내부 호출까지 그대로 계측된다)."""
+    calls = {"n": 0}
+    original = tarfile.open
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(b.tarfile, "open", spy)
+    return calls
+
+
+class _SpyLimitedReader(getattr(b, "_LimitedReader", object)):
+    """[Y1] 전개 예산 계측용 감시 래퍼 -- 마지막으로 생성된 인스턴스를 클래스 변수에
+    남겨, verify_release 종료 후에도 소비량(`consumed`)을 테스트에서 확인할 수 있게
+    한다. `b._LimitedReader` 를 그대로 상속하므로 동작은 실제 클래스와 동일하다.
+
+    RED 단계(구현 전)에는 `b._LimitedReader` 가 아직 없으므로 `object` 를 기반으로
+    삼는다 -- 이 클래스를 실제로 쓰는 테스트만 개별적으로 실패하고, 모듈 수집 자체가
+    깨지지 않도록 하기 위함이다(`getattr(b, "_LimitedReader", object)` 는 import 시점에
+    평가되므로, RED 커밋 시점에는 이 파일이 `object` 기반으로 정의된다는 뜻이다)."""
+
+    last_instance: "_SpyLimitedReader | None" = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        type(self).last_instance = self
+
+
+def _write_plain_tar_gz(archive_path: Path, members: list[tuple[str, bytes]]) -> None:
+    """단순 멤버 목록으로 tar.gz 를 새로 작성한다(표준 GNU 포맷, 압축 wrap)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    archive_path.write_bytes(gzip.compress(buf.getvalue()))
+
+
+def _write_sparse_bomb_tar_gz(archive_path: Path, name: str, realsize: int) -> None:
+    """PAX `GNU.sparse.map`/`GNU.sparse.realsize` 헤더를 직접 주입해, 물리 크기는
+    작지만 reader 관점에서 `issparse()==True` 이고 `member.size==realsize` 인 멤버를
+    담은 tar.gz 를 만든다(본 세션 실측 기법 -- 실제 파일시스템 sparse 지원 불필요)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        info = tarfile.TarInfo(name=name)
+        data = b"x"
+        info.size = len(data)
+        info.pax_headers = {"GNU.sparse.map": "0,1", "GNU.sparse.realsize": str(realsize)}
+        tar.addfile(info, io.BytesIO(data))
+    archive_path.write_bytes(gzip.compress(buf.getvalue()))
 
 
 # ---------------------------------------------------------------------------
@@ -815,12 +873,19 @@ class TestVerifyReleaseArchiveCorruption:
         assert "ValueError" in message
 
     def test_truncate_last_byte_without_recompute_caught_by_hash_layer(self, release):
-        """계층 방어 실증(v4 [T2]): 아카이브를 전체-1바이트만 절단하면 실측상 tarfile 이
-        gzip 트레일러(CRC)를 읽지 않고 end-of-archive 영블록에서 조용히 멈춰(design-v4
-        실측), 아카이브 파싱 블록의 `except Exception` 이 침묵할 수 있다. 이 테스트는
-        RELEASE 를 **재계산하지 않음으로써** 그 경우에도 더 앞선 해시 비교 루프가
-        "해시 불일치" 위반으로 여전히 잡아냄을 증명한다 -- 한 계층이 침묵해도 다른
-        계층이 방어선을 유지하는 defense-in-depth.
+        """계층 방어 실증(v4 [T2], PR #257 리뷰 라운드 2 [X1] 반영으로 독스트링 갱신):
+        아카이브를 전체-1바이트만 절단하면 실측상 tarfile 이 gzip 트레일러(CRC)를 읽지
+        않고 end-of-archive 영블록에서 조용히 멈춰(design-v4 실측), 과거(라운드 1)
+        구조에서는 아카이브 파싱 블록의 `except Exception` 이 침묵할 수 있었다. 이
+        테스트는 RELEASE 를 **재계산하지 않음으로써** 그 경우에도 더 앞선 해시 비교
+        루프가 "해시 불일치" 위반으로 여전히 잡아냄을 증명한다.
+
+        [X1] 긍정 확립 게이트 도입 이후에는 방어가 한 단계 더 강해진다 -- 해시가
+        불일치하는 순간 게이트가 파싱 자체를 아예 생략하므로("아카이브 파싱 생략"
+        위반이 함께 추가됨), 이 테스트가 원래 우려했던 "파싱 블록이 침묵하는 경우"는
+        이제 발생 조건 자체가 없다(파싱을 시도하지 않으므로). assertion 은 변경하지
+        않는다 -- 해시 비교 루프가 여전히 "해시 불일치" 로 잡아낸다는 사실 자체는
+        그대로 유지되기 때문이다.
         """
         archive = release / "localcrab-plugin-1.0.0.tar.gz"
         data = archive.read_bytes()
@@ -833,6 +898,342 @@ class TestVerifyReleaseArchiveCorruption:
         message = str(exc_info.value)
         assert "해시 불일치" in message
         assert "localcrab-plugin-1.0.0.tar.gz" in message
+
+
+class TestSha256StreamAndLimitedReader:
+    """PR #257 리뷰 라운드 2 [W1] 대응 -- 경계 없는 `extracted.read()` 를 청크 단위
+    스트리밍으로 바꾼 핵심 헬퍼(`_LimitedReader`/`_sha256_stream`) 자체의 단위 테스트.
+    설계 정본: fix-design-v6.md ~ v11.md(v11 최종)."""
+
+    def test_matches_hashlib_baseline_empty(self):
+        digest, consumed = b._sha256_stream(io.BytesIO(b""), budget=100)
+        assert digest == hashlib.sha256(b"").hexdigest()
+        assert consumed == 0
+
+    def test_matches_hashlib_baseline_exact_chunk_multiple(self):
+        data = os.urandom(b._VERIFY_CHUNK_BYTES * 3)
+        digest, consumed = b._sha256_stream(io.BytesIO(data), budget=len(data))
+        assert digest == hashlib.sha256(data).hexdigest()
+        assert consumed == len(data)
+
+    def test_matches_hashlib_baseline_with_remainder(self):
+        data = os.urandom(b._VERIFY_CHUNK_BYTES + 123)
+        digest, consumed = b._sha256_stream(io.BytesIO(data), budget=len(data))
+        assert digest == hashlib.sha256(data).hexdigest()
+        assert consumed == len(data)
+
+    def test_sha256_stream_raises_on_budget_overrun(self):
+        data = os.urandom(1000)
+        with pytest.raises(b._BudgetExceededError):
+            b._sha256_stream(io.BytesIO(data), budget=10)
+
+    def test_limited_reader_clamps_underlying_request_size_and_raises_on_overrun(self):
+        """핵심 메모리 상한 증거: 호출자가 아무리 큰 size 를 요청해도(1000만 바이트),
+        `_LimitedReader` 가 내부 fileobj 에 실제로 요청하는 크기는 budget+1 로
+        clamp 된다 -- 압축률 높은 멀티 GB 멤버라도 이 clamp 덕에 단 한 번의 read 로
+        전체를 메모리에 적재하는 일이 없다([W1] 핵심)."""
+
+        class _RequestSizeSpy:
+            def __init__(self) -> None:
+                self.last_request: int | None = None
+
+            def read(self, size: int = -1) -> bytes:
+                self.last_request = size
+                return b"\x00" * size
+
+        budget = 100
+        spy = _RequestSizeSpy()
+        limited = b._LimitedReader(spy, budget)
+        with pytest.raises(b._BudgetExceededError):
+            limited.read(10_000_000)
+        assert spy.last_request == budget + 1
+        assert limited.consumed == budget + 1
+
+
+class TestVerifyReleaseBoundedResources:
+    """PR #257 리뷰 라운드 2 [W1] 대응 -- verify_release() 의 경계 자원(청크 해싱,
+    [X1] 긍정 확립 게이트, [Y1] 전개 예산, [Z1] sparse/음수크기 거부, [Z2]/[V1]/[Q1]
+    단일 서술자 규율)을 실제 release 세트를 통해 검증한다.
+    설계 정본: fix-design-v6.md ~ v11.md(v11 최종)."""
+
+    @pytest.fixture
+    def release(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        b.build_release(repo, out_dir)
+        return out_dir
+
+    # -- 실사용 수준 증거: 극단적으로 작은 청크 크기에서도 결과가 동일해야 한다. --
+
+    def test_small_chunk_size_still_verifies_correctly(self, release, monkeypatch):
+        monkeypatch.setattr(b, "_VERIFY_CHUNK_BYTES", 7)
+        b.verify_release(release)  # 예외 없어야 함
+
+    # -- [X1] 긍정 확립 게이트: 부정 4종 + 긍정 1종, 전부 tarfile.open 호출 횟수로 확인 --
+
+    def test_gate_missing_archive_entry_skips_parsing(self, release, monkeypatch):
+        calls = _count_tarfile_open_calls(monkeypatch)
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        lines = [ln for ln in release_path.read_text(encoding="utf-8").splitlines() if ln]
+        kept = [ln for ln in lines if "tar.gz" not in ln]
+        release_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 파싱 생략" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_gate_format_violated_archive_line_skips_parsing(self, release, monkeypatch):
+        calls = _count_tarfile_open_calls(monkeypatch)
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        mutated = []
+        for ln in release_path.read_text(encoding="utf-8").splitlines():
+            if ln.endswith("localcrab-plugin-1.0.0.tar.gz"):
+                digest, name = ln.split("  ", 1)
+                mutated.append("g" + digest[1:] + "  " + name)  # 비-hex 문자 -> 포맷 위반
+            else:
+                mutated.append(ln)
+        release_path.write_text("\n".join(mutated) + "\n", encoding="utf-8")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 파싱 생략" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_gate_duplicate_archive_entry_skips_parsing(self, release, monkeypatch):
+        calls = _count_tarfile_open_calls(monkeypatch)
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        digest = _sha256(release / "localcrab-plugin-1.0.0.tar.gz")
+        line = f"{digest}  localcrab-plugin-1.0.0.tar.gz"
+        text = release_path.read_text(encoding="utf-8").rstrip("\n") + "\n" + line + "\n"
+        release_path.write_text(text, encoding="utf-8")
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 파싱 생략" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_gate_hash_mismatch_skips_parsing(self, release, monkeypatch):
+        calls = _count_tarfile_open_calls(monkeypatch)
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        data = bytearray(archive.read_bytes())
+        data[-1] ^= 0xFF
+        archive.write_bytes(bytes(data))
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 파싱 생략" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_gate_positive_establishment_parses_exactly_once(self, release, monkeypatch):
+        calls = _count_tarfile_open_calls(monkeypatch)
+        b.verify_release(release)  # 예외 없어야 함
+        assert calls["n"] == 1
+
+    # -- [Y1] 전개 예산: 서로 다른 3가지 경로로 물리 계층에 도달함을 보인다 --
+
+    def test_expansion_budget_reachable_via_normal_member_hashing(self, release, monkeypatch):
+        """정상적으로 선언된 큰 멤버를 실제로 해싱하는 도중 물리 예산이 걸린다."""
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        _write_plain_tar_gz(
+            archive,
+            [(f"{prefix}small.txt", b"hi"), (f"{prefix}big.bin", b"\x00" * 200_000)],
+        )
+        _recompute_release(release, "1.0.0")
+        budget = 32_768
+        monkeypatch.setattr(b, "_MAX_ARCHIVE_EXPANDED_BYTES", budget)
+        monkeypatch.setattr(b, "_LimitedReader", _SpyLimitedReader)
+        _SpyLimitedReader.last_instance = None
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 전개 크기 상한 초과" in str(exc_info.value)
+        spy = _SpyLimitedReader.last_instance
+        assert spy is not None
+        assert spy.consumed <= budget + 65_536
+
+    def test_expansion_budget_reachable_via_pure_header_overhead(self, release, monkeypatch):
+        """[Y1] 이 [Z1] 논리 계층과 독립임을 보인다 -- 멤버 전부가 크기 0(선언 크기
+        합계가 예산을 전혀 건드리지 않음)이어도, tar 헤더 블록 자체의 누적 물리
+        판독량(멤버당 512바이트)만으로 예산을 초과시킨다."""
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        members = [(f"{prefix}f{i}.txt", b"") for i in range(150)]
+        _write_plain_tar_gz(archive, members)
+        _recompute_release(release, "1.0.0")
+        budget = 32_768
+        monkeypatch.setattr(b, "_MAX_ARCHIVE_EXPANDED_BYTES", budget)
+        monkeypatch.setattr(b, "_LimitedReader", _SpyLimitedReader)
+        _SpyLimitedReader.last_instance = None
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 전개 크기 상한 초과" in str(exc_info.value)
+        spy = _SpyLimitedReader.last_instance
+        assert spy is not None
+        assert spy.consumed <= budget + 65_536
+
+    def test_expansion_budget_reachable_via_pax_extended_header(self, release, monkeypatch):
+        """[Y1] 이 tarfile 의 헤더 파싱 단계(멤버가 순회 루프에 나오기도 전)에서도
+        작동함을 보인다 -- PAX 확장 헤더에 큰 임의 필드를 실어, `member.size` 로는
+        전혀 드러나지 않는 물리 판독량으로 예산을 넘긴다."""
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            info = tarfile.TarInfo(name=f"{prefix}small.txt")
+            data = b"hi"
+            info.size = len(data)
+            info.pax_headers = {"comment": "x" * 100_000}
+            tar.addfile(info, io.BytesIO(data))
+        archive.write_bytes(gzip.compress(buf.getvalue()))
+        _recompute_release(release, "1.0.0")
+        budget = 32_768
+        monkeypatch.setattr(b, "_MAX_ARCHIVE_EXPANDED_BYTES", budget)
+        monkeypatch.setattr(b, "_LimitedReader", _SpyLimitedReader)
+        _SpyLimitedReader.last_instance = None
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 전개 크기 상한 초과" in str(exc_info.value)
+        spy = _SpyLimitedReader.last_instance
+        assert spy is not None
+        assert spy.consumed <= budget + 65_536
+
+    # -- [Z1] sparse 거부(무조건, extractfile 미호출) + 음수 크기 거부 --
+
+    def test_sparse_member_rejected_without_extractfile_call(self, release, monkeypatch):
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        _write_sparse_bomb_tar_gz(archive, f"{prefix}sparse-bomb", realsize=10**9)
+        _recompute_release(release, "1.0.0")
+        calls = {"n": 0}
+        original_extractfile = tarfile.TarFile.extractfile
+
+        def spy_extract(self, *args, **kwargs):
+            calls["n"] += 1
+            return original_extractfile(self, *args, **kwargs)
+
+        monkeypatch.setattr(tarfile.TarFile, "extractfile", spy_extract)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 sparse 멤버 거부" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_negative_member_size_rejected(self, release, monkeypatch):
+        fake_member = tarfile.TarInfo(name=f"{b._ARCHIVE_PREFIX}bad.bin")
+        fake_member.size = -1
+        state = {"n": 0}
+
+        def fake_next(self):
+            state["n"] += 1
+            return fake_member if state["n"] == 1 else None
+
+        monkeypatch.setattr(tarfile.TarFile, "next", fake_next)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 멤버 크기 위반(음수)" in str(exc_info.value)
+
+    def test_logical_budget_isolated_from_physical_budget(self, release, monkeypatch):
+        """[Z1] 논리 예산이 실제 판독(extractfile 호출) 이전, 헤더의 선언 크기만으로도
+        단독 작동함을 보인다 -- 물리 계층이 아직 그 멤버의 바이트를 전혀 읽지 않은
+        시점에 이미 거부되어야 한다."""
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        _write_plain_tar_gz(archive, [(f"{prefix}big.bin", b"\x00" * 5000)])
+        _recompute_release(release, "1.0.0")
+        monkeypatch.setattr(b, "_MAX_ARCHIVE_EXPANDED_BYTES", 1000)
+        calls = {"n": 0}
+        original_extractfile = tarfile.TarFile.extractfile
+
+        def spy_extract(self, *args, **kwargs):
+            calls["n"] += 1
+            return original_extractfile(self, *args, **kwargs)
+
+        monkeypatch.setattr(tarfile.TarFile, "extractfile", spy_extract)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 전개 크기 상한 초과" in str(exc_info.value)
+        assert calls["n"] == 0
+
+    def test_member_count_cap_enforced(self, release, monkeypatch):
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        prefix = b._ARCHIVE_PREFIX
+        members = [(f"{prefix}f{i}.txt", f"data{i}".encode()) for i in range(5)]
+        _write_plain_tar_gz(archive, members)
+        _recompute_release(release, "1.0.0")
+        monkeypatch.setattr(b, "_MAX_MEMBERS", 3)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "아카이브 멤버 수 상한 초과: 3" in str(exc_info.value)
+
+    # -- 역할별 크기 상한(RELEASE/사이드카/아이템 파일), 서로 격리해 확인 --
+
+    def test_release_file_oversize_raises_immediately(self, release, monkeypatch):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        cap = release_path.stat().st_size - 1
+        monkeypatch.setattr(b, "_MAX_SUMS_BYTES", cap)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "RELEASE.SHA256SUMS 크기가 허용 상한을 초과했다" in str(exc_info.value)
+
+    def test_sidecar_oversize_recorded_as_violation(self, release, monkeypatch):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        sidecar_path = release / "localcrab-plugin.SHA256SUMS"
+        cap = release_path.stat().st_size + 10
+        assert sidecar_path.stat().st_size > cap, (
+            "픽스처 전제 위반: 사이드카가 RELEASE+10 바이트보다 작아 이 테스트가 "
+            "RELEASE 대신 사이드카만 걸리게 격리되지 않는다"
+        )
+        monkeypatch.setattr(b, "_MAX_SUMS_BYTES", cap)
+        calls = []
+        original_parse = b._parse_hash_list
+
+        def spy_parse(*args, **kwargs):
+            calls.append(args)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(b, "_parse_hash_list", spy_parse)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "패키지 사이드카 크기가 허용 상한을 초과했다" in str(exc_info.value)
+        assert len(calls) == 1  # RELEASE 파싱 1회뿐 -- 사이드카는 크기 단계에서 걸려 파싱에 못 감
+
+    def test_item_file_oversize_recorded_as_violation(self, release, monkeypatch):
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        compat = release / "localcrab-plugin-1.0.0.COMPATIBILITY.md"
+        cap = archive.stat().st_size + 5000
+        compat.write_bytes(b"x" * (cap + 1000))
+        _recompute_release(release, "1.0.0")
+        monkeypatch.setattr(b, "_MAX_RELEASE_FILE_BYTES", cap)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        message = str(exc_info.value)
+        assert "파일 크기가 허용 상한을 초과했다: localcrab-plugin-1.0.0.COMPATIBILITY.md" in message
+
+    # -- [Z2]/[V1]/[Q1] 단일 서술자 규율: symlink 즉시 거부, FIFO 논블로킹 거부 --
+
+    def test_release_file_symlink_rejected(self, release, tmp_path):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        real_target = tmp_path / "real-release-content.txt"
+        real_target.write_bytes(release_path.read_bytes())
+        release_path.unlink()
+        release_path.symlink_to(real_target)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "RELEASE.SHA256SUMS 를 읽을 수 없다" in str(exc_info.value)
+
+    def test_compat_report_fifo_rejected_without_blocking(self, release):
+        compat = release / "localcrab-plugin-1.0.0.COMPATIBILITY.md"
+        compat.unlink()
+        os.mkfifo(compat)
+
+        def _on_alarm(signum, frame):
+            raise TimeoutError("verify_release 가 FIFO open 에서 블록된 것으로 보인다")
+
+        old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        signal.alarm(5)
+        try:
+            with pytest.raises(b.BuildError) as exc_info:
+                b.verify_release(release)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+        assert "파일을 읽을 수 없다: localcrab-plugin-1.0.0.COMPATIBILITY.md" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
