@@ -4,6 +4,48 @@
 The default action is a read-only dry-run.  This command deliberately knows
 only the public graph-store inventory and migration methods; it never opens a
 database connection to issue graph-table DML itself.
+
+``--mapping-file`` takes a JSON object whose two list members, ``mappings``
+and ``property_resolutions``, are both optional.  A legacy node is addressed
+by a nested ``source`` object holding exactly ``node_type`` and ``node_id``.
+Under ``mappings`` that source is paired with the digest of the node in a
+sibling ``source_digest`` field; a property resolution names the same kind of
+source object but carries no digest::
+
+    {
+      "mappings": [
+        {
+          "kind": "rename",
+          "source": {"node_type": "Agent", "node_id": "a"},
+          "source_digest": "<node digest>",
+          "target": {"node_id": "agent-a", "node_type": "Agent"}
+        },
+        {
+          "kind": "merge",
+          "sources": [
+            {"source": {"node_type": "Agent", "node_id": "b"}, "source_digest": "..."},
+            {"source": {"node_type": "Person", "node_id": "b"}, "source_digest": "..."}
+          ],
+          "target": {"node_id": "b", "node_type": "Person"}
+        }
+      ],
+      "property_resolutions": [
+        {
+          "source": {"node_type": "Agent", "node_id": "b"},
+          "source_property": "name",
+          "source_value": "Ada",
+          "target_property": "alias"
+        }
+      ]
+    }
+
+A target additionally accepts optional ``space_id`` and ``pack_id``, and a
+merge needs at least two sources; the store rejects a shorter one.  Node
+digests come from a prior dry-run receipt or from the graph inventory, and the
+store rejects a mapping whose digest no longer matches the stored row.  Read
+the digests out of a receipt rather than pasting its mappings in: a receipt
+reports the sources of a mapping flattened to ``node_type``, ``node_id`` and
+``digest``, which is not the shape this file accepts.
 """
 
 from __future__ import annotations
@@ -69,6 +111,25 @@ def _node_key(value: Any) -> LegacyNodeKey:
     return LegacyNodeKey(value["node_type"], value["node_id"])
 
 
+def _source_digest(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("source_digest must be a non-empty string")
+    return value
+
+
+def _source_entry(value: Any) -> tuple[LegacyNodeKey, str]:
+    if not isinstance(value, dict) or set(value) != {"source", "source_digest"}:
+        raise ValueError("merge source must contain exactly source and source_digest")
+    return _node_key(value["source"]), _source_digest(value["source_digest"])
+
+
+def _items(value: dict[str, Any], key: str) -> list[Any]:
+    items = value.get(key, [])
+    if not isinstance(items, list):
+        raise ValueError(f"{key} must be a list")
+    return items
+
+
 def _target(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("mapping target must be an object")
@@ -88,20 +149,18 @@ def _mapping_file(path: Path) -> tuple[tuple[ExplicitRename | ExplicitMerge, ...
     if not isinstance(value, dict):
         raise ValueError("mapping file must contain an object")
     mappings: list[ExplicitRename | ExplicitMerge] = []
-    for item in value.get("mappings", []):
+    for item in _items(value, "mappings"):
         if not isinstance(item, dict):
             raise ValueError("mapping must be an object")
         target = _target(item.get("target"))
         kind = item.get("kind")
         if kind == "rename":
             mappings.append(ExplicitRename(
-                _node_key(item.get("source")), item["source_digest"],
+                _node_key(item.get("source")), _source_digest(item.get("source_digest")),
                 target["node_id"], target["node_type"], target["space_id"], target["pack_id"],
             ))
         elif kind == "merge":
-            sources = tuple((
-                _node_key(source), source["digest"]
-            ) for source in item.get("sources", []))
+            sources = tuple(_source_entry(source) for source in _items(item, "sources"))
             mappings.append(ExplicitMerge(
                 sources, target["node_id"], target["node_type"],
                 target["space_id"], target["pack_id"],
@@ -109,7 +168,7 @@ def _mapping_file(path: Path) -> tuple[tuple[ExplicitRename | ExplicitMerge, ...
         else:
             raise ValueError("mapping kind must be rename or merge")
     resolutions: list[PropertyResolution] = []
-    for item in value.get("property_resolutions", []):
+    for item in _items(value, "property_resolutions"):
         if not isinstance(item, dict) or set(item) != {"source", "source_property", "source_value", "target_property"}:
             raise ValueError("property resolution fields are invalid")
         resolutions.append(PropertyResolution(
