@@ -25,7 +25,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 ### Streamable HTTP 전송 (modern 단일 요청)
 
 - 표준 헤더 필수: `MCP-Protocol-Version`(바디 `_meta` 값과 일치), `Mcp-Method`(바디 method 와 일치), `tools/call` 은 `Mcp-Name`(바디 `params.name` 과 일치, `=?base64?…?=` sentinel 디코딩 지원). 위반 → 400 + **-32020**. **헤더 검증이 바디 검증보다 먼저다**: `_meta` 없는 `server/discover` 는 HTTP 에서 -32020, stdio(헤더 계층 없음)에서 -32602.
-- 상태 매핑: 미지 메서드 -32601 → **404**, 검증 계열(-32700/-32600/-32602/-32020/-32021/-32022) → **400**, 그 외(-32603 포함)는 종전대로 200 (스펙 무규정 — 최소 이탈).
+- 상태 매핑: 미지 메서드 -32601 → **404**, 검증 계열(-32700/-32600/-32602/-32020/-32021/-32022) → **400**, 그 외(-32603 포함)는 종전대로 200 (스펙 무규정 — 최소 이탈). **legacy 비활성(modern-only) 구성에서는 이 매핑이 모든 단일 요청에 적용된다(#250)**: legacy 형상 요청의 거부도 400 이고 오류 봉투는 dual 구성과 동일하다. 같은 구성에서 배열 바디(빈 배열 포함)와 비객체 바디는 400 + -32600 단일 오류 객체로, legacy 형상 알림은 400 빈 바디로 거부된다.
 - JSON-RPC **배치 배열은 legacy 전용 LocalCrab 확장**이다 (2026-07-28 은 POST 당 요청 1건). modern 표식(원소의 modern `_meta`·`server/discover`·비-dict `_meta`, 또는 modern 버전 헤더)이 있는 배열은 400 + -32600.
 - `GET /mcp`·`DELETE /mcp` → **405** (`Allow: POST`). 2026-07-28 규정이며 legacy Streamable HTTP 도 세션 미발급 서버의 405 를 허용한다. (변경 전 DELETE 는 200 ack 였다.)
 - **Origin 검증**(모든 `/mcp` 요청, 라우팅·인증보다 앞): Origin 헤더 부재 → 통과(비브라우저 클라이언트). loopback(`localhost`/`127.0.0.1`/`[::1]`, 임의 포트) → 통과. `MCP_ALLOWED_ORIGINS` 정확 일치 → 통과. 그 외 → **403**(no-store). DNS rebinding 방어의 스펙 MUST.
@@ -49,7 +49,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 | env | 의미 | 오류 시 |
 |---|---|---|
-| `MCP_PROTOCOL_VERSIONS` | 쉼표 구분 부분집합으로 지원 버전 제한 (미설정 = 전체). legacy 전부 제외 = handshake 비활성(D절 이행 레버), modern 전부 제외 = legacy 고정 | 빌드가 모르는 버전이 있으면 **기동 거부** |
+| `MCP_PROTOCOL_VERSIONS` | 쉼표 구분 부분집합으로 지원 버전 제한 (미설정 = 전체). legacy 전부 제외 = handshake 비활성(D절 이행 레버 — 이 modern-only 구성의 transport 오류 status 는 위 "상태 매핑" 참조), modern 전부 제외 = legacy 고정 | 빌드가 모르는 버전이 있으면 **기동 거부** |
 | `MCP_ALLOWED_ORIGINS` | 쉼표 구분 Origin allowlist. `http(s)://host[:port]` 형태만, 브라우저가 보내는 형태 그대로(기본 포트 생략) | 경로·쿼리·userinfo 포함, `null`, 비-http 스킴이면 **기동 거부** |
 
 두 설정 모두 standalone(`opencrab serve`)과 apps/api 양쪽에서 서빙 시작 전에 검증된다. 두 설정 모두 **완전히 빈 값(미설정·빈 문자열)은 기본값**이지만, **구분자·빈 항목만 있는 값(예: `,`, `a,,b`)은 malformed 로 기동 거부**된다 — 오타로 항목이 사라진 채 조용히 뜨는 것을 막는다.
@@ -67,8 +67,8 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 ## 재현 명령 (살아 있는 상태 확인)
 
 ```bash
-# 계약 테스트 전체
-.venv/bin/pytest tests/test_mcp_protocol_2026.py tests/test_http_app_modern.py -q
+# 계약 테스트 전체 (modern-only·dual·legacy-only 구성 분리 계약 포함)
+.venv/bin/pytest tests/test_mcp_protocol_2026.py tests/test_http_app_modern.py tests/test_http_app_modern_only.py -q
 
 # discover 를 stdio 계층에서 직접 확인 (테스트 서버 불필요)
 .venv/bin/python - <<'EOF'
