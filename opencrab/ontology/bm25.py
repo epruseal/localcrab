@@ -100,7 +100,7 @@ class BM25Index:
 
     Usage:
         index = BM25Index.build(doc_store.list_nodes(limit=10000))
-        results = index.search("machine learning", limit=10)
+        results = index.search("machine learning", pack_ids=["my-pack"], limit=10)
     """
 
     def __init__(self) -> None:
@@ -174,7 +174,8 @@ class BM25Index:
         query: str,
         spaces: list[str] | None = None,
         limit: int = 10,
-        pack_ids: list[str] | None = None,
+        *,
+        pack_ids: list[str],
         include_unpackaged: bool = False,
     ) -> list[dict[str, Any]]:
         """
@@ -189,12 +190,18 @@ class BM25Index:
         limit:
             Maximum results.
         pack_ids:
-            The readable pack scope (#147). Docs whose pack_id is not in it
-            are skipped, and so are docs with no pack_id. An EMPTY set means
-            nothing matches -- it is not "no filter". This index is a
+            REQUIRED (#256). The readable pack scope (#147). Docs whose
+            pack_id is not in it are skipped, and so are docs with no
+            pack_id. An EMPTY list means nothing matches -- it is not "no
+            filter" (#147 contract, unchanged). This index is a
             process-wide singleton holding every user's nodes, so this
             filter is the only thing separating them; there is no per-user
-            index.
+            index. There used to be a ``None`` default here, which made an
+            unscoped call like ``search(query, limit=10)`` compile fine and
+            silently search nothing -- a trap that #256 removes by making
+            the parameter keyword-only with no default, so an omitted
+            ``pack_ids`` now raises ``TypeError`` at the call site instead
+            of returning an empty result.
         include_unpackaged:
             IGNORED (#147). Kept for signature compatibility. Data belonging
             to no pack is outside every read scope (#143 invariant 5), so
