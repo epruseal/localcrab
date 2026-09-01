@@ -388,6 +388,39 @@ def test_a_carved_out_id_that_already_has_a_node_is_not_skipped(stack):
     assert _node(stack, over)["text"] == "새 본문"
 
 
+def test_a_carved_out_id_with_a_rejected_graph_update_leaves_doc_and_vector_at_old_values(stack):
+    """설계 §9-12ex 후반. 카브아웃 대상 id 에 이미 노드가 있고 그래프 갱신
+
+    자체가 실패하는 더블에서는, doc_sources·벡터가 옛값 그대로여야 한다.
+    갱신 성공만 보면 그래프 실패 + doc/벡터만 새 값이라는, §4.1 이 막으려는
+    바로 그 발산을 검출하지 못한다. 파일에 이미 있는
+    `_GraphThatRejectsTheWrite` 더블을 재사용한다.
+    """
+    over = "C" * (_budget() + 1)
+    with principal_scope(ALICE):
+        stack["builder"].add_node(
+            space="evidence", node_type="TextUnit", node_id=over,
+            properties={"pack_id": "pack-a", "text": "옛 본문"}, pack_id="pack-a",
+        )
+    # 실제 그래프/doc/벡터에 "옛 본문"을 실제로 심어 둔다 — 그래야 그 값이
+    # 갱신 실패 뒤에도 "그대로"인지를 의미 있게 검사할 수 있다.
+    _write(stack, text="옛 본문", source_id=over)
+
+    existing_rows = stack["graph"].get_nodes_by_id(over)
+    digest = stack["graph"].get_node_digest(over, node_type="TextUnit")
+    reject_double = _GraphThatRejectsTheWrite(
+        NodeIdentityConflict("graph update rejected"),
+        existing_rows=existing_rows, digest=digest,
+    )
+
+    with pytest.raises(NodeIdentityConflict):
+        _write(stack, text="새 본문", source_id=over, graph=reject_double)
+
+    assert _node(stack, over)["text"] == "옛 본문"
+    assert stack["docs"].get_source(over)["text"] == "옛 본문"
+    assert stack["vector"].get_by_id(over)["document"] == "옛 본문"
+
+
 class _NonListProbe:
     """"없음"과 "확인 불가"를 뭉개는 반환값. `if not rows:` 구현을 잡는다."""
 
@@ -575,30 +608,59 @@ def test_vector_upsert_texts_is_called_exactly_once_per_source_write(stack, monk
     assert len(calls) == 1, calls
 
 
+def test_vector_metadata_preserves_source_identity_and_carries_no_node_shape(stack):
+    """설계 §9-15. `space` 하나가 아니라 `user_id`/`source_id`/`space` 가 모두
+
+    보존되고, 빌더의 노드 형상 키인 `node_id` 는 섞이지 않아야 한다. 현재
+    코드에서도 통과하므로 검출력은 `write_vector=False` → `True` 역변이로
+    증명한다(빌더의 벡터 다리는 `{pack_id, source, node_id, space}` 형상의
+    다른 메타데이터를 같은 id 에 덮어쓴다).
+    """
+    _write(stack, text="본문", source_id="src-vecmeta")
+
+    row = stack["vector"].get_by_id("src-vecmeta")
+    assert row is not None
+    meta = row["metadata"]
+    assert meta["user_id"] == ALICE.user_id, meta
+    assert meta["source_id"] == "src-vecmeta", meta
+    assert meta["space"] == "evidence", meta
+    assert "node_id" not in meta, meta
+
+
 # ---------------------------------------------------------------------------
 # 설계 §9 테스트 3·3b — 그래프가 있지만 쓰기 자체를 거절한다
 # ---------------------------------------------------------------------------
 
 
 class _GraphThatRejectsTheWrite:
-    """`available=True` 인데 실제 쓰기(`upsert_node`)에서만 거부한다.
+    """`available=True` 인데 실제 쓰기(`upsert_node`/`reclassify_node`)에서만 거부한다.
 
     신원 프로브(`get_node`/`get_nodes_by_id`)는 통과시켜 실패 지점을
-    `add_node` 의 쓰기 시도 한 곳으로 정확히 좁힌다.
+    `add_node` 의 쓰기 시도 한 곳으로 정확히 좁힌다. `existing_rows`/`digest`
+    는 기본값(빈 목록/`None`)이면 "신규 삽입" 형상이고, 값을 채우면 "이미
+    노드가 있어 CAS 갱신 경로를 타는" 형상을 흉내낸다(§9-12ex 후반).
     """
 
     available = True
 
-    def __init__(self, exc: Exception):
+    def __init__(self, exc: Exception, *, existing_rows=None, digest=None):
         self._exc = exc
+        self._existing_rows = [] if existing_rows is None else existing_rows
+        self._digest = digest
 
     def get_node(self, node_type, node_id):  # noqa: ARG002
         return None
 
     def get_nodes_by_id(self, node_id):  # noqa: ARG002
-        return []
+        return self._existing_rows
+
+    def get_node_digest(self, node_id, node_type=None):  # noqa: ARG002
+        return self._digest
 
     def upsert_node(self, **kwargs):  # noqa: ARG002
+        raise self._exc
+
+    def reclassify_node(self, *args, **kwargs):  # noqa: ARG002
         raise self._exc
 
 
@@ -661,6 +723,23 @@ def test_generic_runtime_error_from_graph_write_leaves_doc_and_sql_residue(stack
     assert stack["vector"].get_by_id("src-generic-reject") is None
     assert stack["docs"].get_node_doc("evidence", "src-generic-reject") is not None
     assert _sql_registry_has(stack, "src-generic-reject")
+
+
+def test_a_probe_exception_on_a_normal_length_id_leaves_all_four_axes_empty(stack):
+    """설계 §9-3. 예산 초과 id 의 프로브 예외(§9-12f)와는 다른 축이다 — 이 id 는
+
+    카브아웃 대상조차 아닌 보통 길이라서, 카브아웃 로직을 전혀 거치지 않고
+    바로 `node_identity_conflict` 의 `CONFLICT_UNVERIFIABLE` fail-closed
+    거절로 들어가야 한다. 거절 뒤 doc_sources·벡터·doc_nodes·sql 레지스트리
+    네 축 모두 비어 있어야 한다.
+    """
+    with pytest.raises(ValueError, match="cannot verify"):
+        _write(stack, source_id="src-normal-probe-raises", graph=_ProbeRaises())
+
+    assert stack["docs"].get_source("src-normal-probe-raises") is None
+    assert stack["vector"].get_by_id("src-normal-probe-raises") is None
+    assert stack["docs"].get_node_doc("evidence", "src-normal-probe-raises") is None
+    assert not _sql_registry_has(stack, "src-normal-probe-raises")
 
 
 class _UnavailableWithSchemaStateDistractor:
@@ -1157,6 +1236,10 @@ def test_rest_ingest_materialises_graph_node_and_all_store_rows(
 
     assert ctx.docs.get_source("src-rest-1") is not None
     assert ctx.vector.get_by_id("src-rest-1") is not None
+    # 설계 §9-1: doc_nodes 축(빌더가 쓰는 슬롯, 이 위의 doc_sources 와는 다른
+    # 슬롯)도 확인해야 한다. doc_sources 만 보면 그래프 다리가 doc_nodes 를
+    # 남기지 않는 변이를 놓친다.
+    assert ctx.docs.get_node_doc("evidence", "src-rest-1") is not None
     with ctx.sql._engine.begin() as conn:
         row = conn.execute(
             _sql_text("SELECT node_id FROM ontology_nodes WHERE node_id=:n"),
@@ -1211,6 +1294,8 @@ def test_cli_ingest_materialises_graph_node_and_all_store_rows(cli74_bootstrappe
         assert node["text"] == "CLI 본문"
         assert docs.get_source(source_id) is not None
         assert vector.get_by_id(source_id) is not None
+        # 설계 §9-1: doc_nodes 축도 확인한다(doc_sources 와는 다른 슬롯).
+        assert docs.get_node_doc("evidence", source_id) is not None
         with sql._engine.begin() as conn:
             row = conn.execute(
                 _sql_text("SELECT node_id FROM ontology_nodes WHERE node_id=:n"),
@@ -1253,6 +1338,12 @@ def test_mcp_legacy_ingest_materialises_graph_node(mcp_ctx):
     assert node["text"] == "MCP 본문"
     assert node["title"] == "MCP 제목"
 
+    # 설계 §9-1: doc_sources·doc_nodes·sql 레지스트리·벡터 네 축 모두 확인한다.
+    assert mcp_ctx["mongo"].get_source("src-mcp-1") is not None
+    assert mcp_ctx["mongo"].get_node_doc("evidence", "src-mcp-1") is not None
+    assert mcp_ctx["chroma"].get_by_id("src-mcp-1") is not None
+    assert _sql_registry_has({"sql": mcp_ctx["sql"]}, "src-mcp-1")
+
     # 설계 §9-1(b): `ontology_list_nodes(pack_id=...)` 축에서도 보여야 한다.
     from opencrab.mcp.tools.graph import ontology_list_nodes
 
@@ -1287,6 +1378,10 @@ def test_rest_ingest_reports_failure_receipt_when_graph_write_is_rejected(
     assert body["stores"]["graph"].startswith("error:"), body["stores"]
     assert body["stores"]["documents"] == "skipped (graph write failed)", body["stores"]
     assert body["stores"]["chromadb"] == "skipped (graph write failed)", body["stores"]
+    # 설계 §9-2/§9-4: 리셉트만이 아니라 doc_sources·벡터에 실제로 아무것도
+    # 없는지도 확인한다.
+    assert ctx.docs.get_source("src-rest-fail") is None
+    assert ctx.vector.get_by_id("src-rest-fail") is None
 
 
 def test_cli_ingest_reports_fail_and_zero_successes_when_graph_write_is_rejected(
@@ -1309,6 +1404,21 @@ def test_cli_ingest_reports_fail_and_zero_successes_when_graph_write_is_rejected
     assert result.exit_code == 0, result.output
     assert "Ingested 0/1 files." in result.output, result.output
     assert "FAIL" in result.output, result.output
+
+    # 설계 §9-2/§9-4: doc_sources·벡터에 실제로 아무것도 없는지 확인한다.
+    from opencrab.config import get_settings
+    from opencrab.stores.factory import make_doc_store, make_vector_store
+
+    cfg = get_settings()
+    docs = make_doc_store(cfg)
+    vector = make_vector_store(cfg)
+    try:
+        source_id = str(src.resolve())
+        assert docs.get_source(source_id) is None
+        assert vector.get_by_id(source_id) is None
+    finally:
+        docs.close()
+        vector.close()
 
 
 def test_mcp_legacy_ingest_reports_partial_when_graph_write_is_rejected(stack):
@@ -1338,6 +1448,11 @@ def test_mcp_legacy_ingest_reports_partial_when_graph_write_is_rejected(stack):
         )
 
     assert result["status"] == "partial", result
+    # 설계 §9-16: 그래프 노드가 안착하지 않았으므로 카운터도 0/None 이어야
+    # 한다. `status` 만 보면 그래프 실패에서도 노드가 생겼다고 우기는
+    # 카운터 구현이 통과한다.
+    assert result.get("added_nodes") == 0, result
+    assert result.get("evidence_node") is None, result
 
 
 # ---------------------------------------------------------------------------

@@ -536,11 +536,17 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                 # rather than raising (#158 contract), so the receipt has to be
                 # read or a failure is counted as an "OK" file.
                 #
-                # Only the doc row is fatal. It is the system of record for a
-                # source; the vector leg is optional and fails on its own in
-                # any deployment without an embedding backend. Treating that as
-                # fatal aborted the whole file and skipped the audit row below
-                # -- the ingest looked successful and left no actor trail.
+                # write_source (#74) already makes the GRAPH leg the required
+                # bridge: it refuses the doc row and the vector outright when
+                # the graph node does not land, so a graph failure already
+                # surfaces here as doc_status == "skipped (graph write
+                # failed)" and is caught by doc_ok below. Of the two legs
+                # write_source still attempts, only the doc row is fatal at
+                # this CLI layer; the vector leg is optional and fails on its
+                # own in any deployment without an embedding backend. Treating
+                # that as fatal aborted the whole file and skipped the audit
+                # row below -- the ingest looked successful and left no actor
+                # trail.
                 doc_status = receipt["stores"].get("documents")
                 doc_ok = store_write_succeeded(receipt["stores"], "documents")
                 vector_ok = store_write_succeeded(receipt["stores"], "chromadb")

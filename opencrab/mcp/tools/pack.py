@@ -484,10 +484,11 @@ def _ingest_into_pack(
                 stores["evidence_node"] = f"error: {exc}"
             text_ingested = True
         else:
-            # Legacy path: vector-only embedding + doc_sources record, now
-            # through the write_source chokepoint (#148) instead of two
-            # independent calls -- see opencrab/pack/source_writer.py for why
-            # (doc row first, one ownership stamp for both).
+            # Legacy path: through the write_source chokepoint (#148/#74),
+            # which now also materialises an evidence/TextUnit graph node
+            # ahead of the doc_sources row and the vector -- see
+            # opencrab/pack/source_writer.py for why (graph leg first and
+            # required, one ownership stamp shared by all three legs).
             reason = _source_probe_conflict(ctx, source_id, pack_id)
             if reason:
                 node_errors.append(_identity_reject_message("source", source_id, reason))
@@ -548,8 +549,10 @@ def _ingest_into_pack(
     # docstring-comment above the node loop — but must not leak into this
     # decision). billable_write already covers every node/edge/evidence-node
     # write via store_write_succeeded(..., "graph"). The text_as_node=False
-    # legacy branch never touches `graph` at all (vector-only embedding + a
-    # doc_sources record), so its own signal is store_write_succeeded(stores)
+    # legacy branch now writes a graph node too (via write_source, #74), but
+    # this gate deliberately does not look at that key (design v13 §4.9 pins
+    # today's billing meaning) -- its own signal stays
+    # store_write_succeeded(stores)
     # with no key — positive confirmation that at least one of
     # chromadb/documents actually came back a recognized "ok"-prefixed status
     # (see that function's docstring in builder.py for the full success-value
@@ -937,9 +940,12 @@ def pack_create(
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
     pack_id is auto-slugged from title unless explicitly provided.
-    Optional text is materialised as a 9-space evidence/TextUnit graph node
-    (text_as_node=True, default) or embedded as a vector blob only (False).
-    The ``ingest`` billing event's subject is the caller's server-derived
+    Optional text always becomes an evidence/TextUnit graph node (#74):
+    text_as_node=True (default) calls the builder directly, embedding the
+    node's own summary text in the vector; text_as_node=False (legacy) goes
+    through write_source instead, which writes the same graph node plus a
+    doc_sources row and embeds the ORIGINAL text in the vector. The
+    ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
     stays fixed at 'default'.
 
@@ -1476,9 +1482,11 @@ def pack_ingest(
     Add content into an EXISTING localcrab ontology pack.
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
-    Optional text is materialised as a 9-space evidence/TextUnit graph node
-    (text_as_node=True, default) so it becomes a grammar-compliant first-class
-    node. Set text_as_node=False for legacy vector-only embedding.
+    Optional text always becomes an evidence/TextUnit graph node (#74):
+    text_as_node=True (default) calls the builder directly, embedding the
+    node's own summary text in the vector. text_as_node=False (legacy) goes
+    through write_source instead, which writes the same graph node plus a
+    doc_sources row and embeds the ORIGINAL text in the vector.
     Fails if the pack does not exist — use pack_create first.
     The ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
