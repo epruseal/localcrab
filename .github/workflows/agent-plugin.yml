@@ -8,14 +8,18 @@ on:
       - "tests/test_agent_plugin*"
       - "scripts/build_agent_plugin.py"
       - ".github/workflows/agent-plugin.yml"
+      - "docs/agent-plugin-compatibility.md"
       - "pyproject.toml"
+      - "LICENSE"
   pull_request:
     paths:
       - "packaging/**"
       - "tests/test_agent_plugin*"
       - "scripts/build_agent_plugin.py"
       - ".github/workflows/agent-plugin.yml"
+      - "docs/agent-plugin-compatibility.md"
       - "pyproject.toml"
+      - "LICENSE"
 
 jobs:
   validate:
@@ -36,10 +40,52 @@ jobs:
         run: ruff check .
 
       - name: Test (packaging + smoke)
-        run: pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_smoke.py -q -o addopts=''
+        run: pytest tests/test_agent_plugin_packaging.py tests/test_agent_plugin_release.py tests/test_agent_plugin_smoke.py -q -o addopts=''
 
       - name: Build package
         run: python scripts/build_agent_plugin.py --out dist
+
+      - name: Reproducibility check (clean clone)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$GITHUB_WORKSPACE" /tmp/clean-src
+          (cd /tmp/clean-src && python scripts/build_agent_plugin.py --out /tmp/clean-src/dist)
+          cmp "dist/localcrab-plugin.SHA256SUMS" "/tmp/clean-src/dist/localcrab-plugin.SHA256SUMS"
+          for pattern in "localcrab-plugin-*.tar.gz" "localcrab-plugin-*.COMPATIBILITY.md" "localcrab-plugin-*.RELEASE.SHA256SUMS"; do
+            # 비인용 글롭 대신 위치 파라미터로 확장한다: 0개 매치면(nullglob 미사용) 글롭이
+            # 리터럴 문자열 그대로 남으므로 -f 검사로 즉시 걸러지고, 2개 이상이면 $# 검사로
+            # 걸러진다 -- 정확히 1개 매치만 통과시킨다.
+            set -- dist/$pattern
+            [ "$#" -eq 1 ] && [ -f "$1" ] || {
+              echo "expected exactly 1 match for dist/$pattern, got: $*" >&2
+              exit 1
+            }
+            a="$1"
+            set -- /tmp/clean-src/dist/$pattern
+            [ "$#" -eq 1 ] && [ -f "$1" ] || {
+              echo "expected exactly 1 match for /tmp/clean-src/dist/$pattern, got: $*" >&2
+              exit 1
+            }
+            b="$1"
+            cmp "$a" "$b"
+          done
+          echo "OK: release set byte-identical across clean clones"
+
+      - name: Verify release set
+        run: python scripts/build_agent_plugin.py --verify --out dist
+
+      - name: Verify checksums (recipient command)
+        run: cd dist && sha256sum -c localcrab-plugin-*.RELEASE.SHA256SUMS
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-plugin-release-candidate
+          path: |
+            dist/localcrab-plugin-*.tar.gz
+            dist/localcrab-plugin-*.COMPATIBILITY.md
+            dist/localcrab-plugin.SHA256SUMS
+            dist/localcrab-plugin-*.RELEASE.SHA256SUMS
 
   wheel-install:
     runs-on: ubuntu-latest

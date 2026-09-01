@@ -51,42 +51,12 @@ STORAGE_MODE=local LOCAL_DATA_DIR=<DATA> LOCALCRAB_ENV_FILE=<DATA>/localcrab.env
 
 ## Compatibility matrix
 
-행은 확인 대상 클라이언트, 열은 지원 축이다.
-
-| | 설치 방식 | stdio | streamable-http | MCP protocol | auth | PLUGIN_ROOT/PLUGIN_DATA |
-|---|---|---|---|---|---|---|
-| **OpenClaw** (2026.8.1 이상) | 로컬 디렉터리 install, Agent Plugins 번들 네이티브 감지(`Bundle format: agent (Agent Plugins)`). 2026.7.x 이하는 Agent Plugins 감지 이전이라 `claude` 로 오분류되어 skills 만 매핑된다(실측) | 지원(공식 문서 근거) | 공식 문서상 프로토콜 자체는 지원되나 이 패키지는 stdio entry 만 출하(아래 사유 참고) | legacy initialize echo(2024-11-05/2025-03-26). 이슈 #136 에서 2026-07-28 협상 방식 전환 예정 | stdio=local principal(#145 근거), http=per-user bearer(패키지 비포함 — 오퍼레이터 문서) | 지원(공식) — 상태 디렉터리 아래 영속 per-plugin 디렉터리를 만들고 args/env/cwd 에 단일 패스로 치환 |
-| **Claude Code** | 1.0.0 매니페스트 네이티브 비호환 — 수동 매핑 필요(아래) | 자체 포맷(`.mcp.json`)으로 재작성해야 동작 | 자체 포맷으로 재작성해야 동작 | 해당 없음(독립 클라이언트 구현) | 해당 없음(이 이슈 범위 밖) | 미지원 — 자체 `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` |
-| **레퍼런스 클라이언트(스모크)** | 해당 없음 — CI 전용 로더(`tools/refclient.py`) | 지원(테스트 대상 경로) | 미구현(entry 를 출하하지 않으므로 대상 아님) | legacy initialize echo(스모크 기준) | 해당 없음(principal 개념 없음) | 지원(테스트가 tmp 경로로 직접 치환) |
-
-근거: OpenClaw 는 공식 문서(docs.openclaw.ai/plugins/bundles)가 로컬 디렉터리
-install, `Bundle format: agent (Agent Plugins)` 감지, stdio MCP 서버 기동,
-`PLUGIN_ROOT`/`PLUGIN_DATA` env 계약과 placeholder 확장을 명시한다. Claude Code
-는 자체 포맷(`.claude-plugin/plugin.json`, `${CLAUDE_PLUGIN_ROOT}`)만 읽으므로
-1.0.0 매니페스트를 그대로 이해하지 못한다.
-
-### Claude Code 수동 매핑
-
-Claude Code 로 이식하려면 아래를 손으로 옮겨 적어야 한다(자동 변환 어댑터는
-이 이슈의 비범위 — client extension 승격 금지에 저촉되지 않는 외부 도구로만
-후속 검토):
-
-| Agent Plugins 1.0.0 | Claude Code |
-|---|---|
-| 루트 `plugin.json` | `.claude-plugin/plugin.json` |
-| `mcp.json` | `.mcp.json` |
-| `${PLUGIN_ROOT}` | `${CLAUDE_PLUGIN_ROOT}` |
-| `${PLUGIN_DATA}` | `${CLAUDE_PLUGIN_DATA}` |
-
-### Streamable HTTP entry 를 출하하지 않는 이유
-
-`mcp.json` 에는 stdio entry 만 있다. HTTP entry 를 넣으려면 운영 endpoint
-(host:port)와 인증 토큰이 필요한데 둘 다 오퍼레이터 고유값이라 portable 패키지
-계약에 담을 수 없다 — 스펙상 non-loopback endpoint 는 HTTPS 와 authorization
-을 요구하며, 이는 패키지가 미리 알 수 없는 값이다. 원격 접근 설정은 저장소
-README와 `docs/mcp-client-auth.md` 의 오퍼레이터 절차로 남긴다. legacy `sse`
-transport 는 채택하지 않는다 — 1.0.0 표준은 streamable-http 를 정본으로 두고
-`sse` 는 레거시 호환용이라 신규 패키지에 넣을 이유가 없다.
+정본은 [`docs/agent-plugin-compatibility.md`](./agent-plugin-compatibility.md)
+로 이동했다. 클라이언트별 설치 방식·stdio/streamable-http·MCP protocol·auth·
+PLUGIN_ROOT/PLUGIN_DATA 지원 매트릭스와 근거, Claude Code 수동 매핑, Streamable
+HTTP entry 를 출하하지 않는 사유는 그 문서를 본다. 릴리스 세트에 동봉되는
+`localcrab-plugin-<v>.COMPATIBILITY.md` 는 이 정본 문서에서 생성된다(아래
+`## 릴리스 산출물과 검증` 참고).
 
 ## 환경 변수
 
@@ -179,6 +149,52 @@ CI 게이트는 항상 레퍼런스 클라이언트 스모크다(`tests/test_age
 비용 발생은 하지 않는다), 도달한 단까지만 **부분 충족**으로 명시하고 어느
 단에서 멈췄는지를 보고에 남긴다. 실측 도달 여부와 타임스탬프는 이 문서가
 아니라 PR·이슈 보고에 남긴다 — 이 문서에는 절차와 판정 기준만 둔다.
+
+## 릴리스 산출물과 검증
+
+빌드는 `dist/`(out_dir) 아래 릴리스 세트를 만든다:
+
+```
+dist/
+├── localcrab-plugin/                          # 스테이징 디렉터리 -- 로컬 편의 산출물, 릴리스 첨부 대상 아님
+├── localcrab-plugin.SHA256SUMS                # 패키지 파일별 해시(사이드카)
+├── localcrab-plugin-<v>.tar.gz                # 릴리스 아카이브(결정론, top prefix localcrab-plugin/)
+├── localcrab-plugin-<v>.COMPATIBILITY.md      # compat report -- docs/agent-plugin-compatibility.md 에서 생성
+└── localcrab-plugin-<v>.RELEASE.SHA256SUMS    # 릴리스 세트 해시(tar.gz, COMPATIBILITY.md, 패키지 SHA256SUMS 3항목)
+```
+
+`<v>` 는 pyproject `[project].version`. `localcrab-plugin/` 스테이징 디렉터리는
+파일을 직접 들여다보기 위한 로컬 편의 산출물이며 GitHub Release 첨부 대상이
+아니다 — 첨부하는 것은 위 4개 파일(staged 디렉터리 제외)뿐이다.
+
+### 수령자 검증
+
+```bash
+sha256sum -c localcrab-plugin-<v>.RELEASE.SHA256SUMS
+python scripts/build_agent_plugin.py --verify --out dist
+```
+
+앞 명령은 릴리스 세트 3파일의 해시를 다운로드본과 대사한다. 뒤 명령은 그에
+더해 아카이브 멤버와 패키지 사이드카를 상호 대사해 세트 내부 일관성까지
+확인한다.
+
+### 재현성 성질과 범위
+
+동일 POSIX 도구체계(같은 CPython 계열 + 번들 zlib)와 LF checkout 에서 빌드하면
+tar.gz·COMPATIBILITY.md·RELEASE.SHA256SUMS 는 바이트 단위로 동일하다. zlib
+구현이 다른 환경 사이에서 gz 바이트가 동일함은 주장하지 않는다 — 권위 해시는
+항상 릴리스를 실제로 빌드한 산출값이다.
+
+재현 확인 명령:
+
+```bash
+python scripts/build_agent_plugin.py --out /tmp/repro-a
+python scripts/build_agent_plugin.py --out /tmp/repro-b
+sha256sum /tmp/repro-a/localcrab-plugin-*.tar.gz /tmp/repro-b/localcrab-plugin-*.tar.gz
+```
+
+운영 정책(공표 위치, 진본성 경계, 수동 릴리스 절차)은
+[`docs/agent-plugin-release-policy.md`](./agent-plugin-release-policy.md) 참고.
 
 ## 비범위
 
