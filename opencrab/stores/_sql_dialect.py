@@ -130,7 +130,7 @@ class SqlDialect:
         this fragment puts the clock in the statement, which is what a SET
         clause needs when there is no Python-side value to bind (e.g. an
         upsert whose ``updated_at`` must follow the row's DDL DEFAULT
-        format). Also used for DDL ``DEFAULT`` clauses.
+        format).
         """
         return "datetime('now')" if self.name == "sqlite" else "NOW()"
 
@@ -272,13 +272,15 @@ class SqlDialect:
 
         ``placeholder`` IS AN ARGUMENT, not hardcoded to ``":packs"``,
         because bind style varies by CALL SITE, not by dialect: some call
-        sites bind NAMED (``:name``) throughout, while one that executes
-        raw ``sqlite3`` uses POSITIONAL (``?``) placeholders with a
-        ``params: list`` -- and mixing qmark and named placeholders in one
-        SQLite statement raises ``sqlite3.ProgrammingError``. A hardcoded
-        ``:packs`` would compile fine here in isolation and only break at
-        the SQL-execution boundary of that one caller, far from this
-        function -- so the placeholder token is threaded through instead.
+        sites bind NAMED (``:name``) throughout, while others bind
+        POSITIONAL (``?``) with a ``params: list`` -- and mixing qmark and
+        named placeholders in one SQLite statement raises
+        ``sqlite3.ProgrammingError``. (The split is the bind style the call
+        site chose, not the driver it reaches: named binding also runs
+        against a raw ``sqlite3`` connection.) A hardcoded ``:packs`` would
+        compile fine here in isolation and only break at the SQL-execution
+        boundary of such a positional call site, far from this function --
+        so the placeholder token is threaded through instead.
 
         Returns ``(sql_fragment, value_transform)``. ``value_transform``
         is what the caller must apply to its Python ``list[str]`` BEFORE
