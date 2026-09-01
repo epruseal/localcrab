@@ -28,7 +28,6 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -46,12 +45,6 @@ from tools.openclaw_e2e import (  # noqa: E402  (sys.path 삽입 후 의도된 �
     verify_evidence,
     write_recorder_shim,
 )
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def run_env(home: Path, tmpdir: Path, path_dirs: list[str]) -> dict:
@@ -167,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     plugin_data.mkdir(parents=True, exist_ok=True)
 
     with DeterministicProvider(nonce, provider_log) as provider:
-        port = provider.start(free_port())
+        # 포트를 미리 잡아 두고 넘기지 않는다. 소켓을 닫은 뒤 provider 가 bind 하기
+        # 전에 다른 프로세스가 그 포트를 채가면 "address already in use" 로 죽는다
+        # (병렬 실행에서 실제로 열리는 창이다). 0 을 넘겨 커널이 할당과 bind 를
+        # 원자적으로 하게 하고, 실제 bind 된 포트를 돌려받아 쓴다.
+        port = provider.start(0)
         write_client_config(home, port)
 
         # 사전 조회를 여기서 하면 안 된다. 조회 자체가 스토어를 부트스트랩해버려서

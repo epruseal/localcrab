@@ -26,6 +26,7 @@ if str(_TOOLS_PARENT) not in sys.path:
     sys.path.insert(0, str(_TOOLS_PARENT))
 
 from tools.openclaw_e2e import (  # noqa: E402  (sys.path 삽입 후 의도된 임포트 순서)
+    MODEL_ID,
     MUTATING_TOOL,
     PROBE_TOOL,
     match_tool,
@@ -395,6 +396,25 @@ def test_recorder_shim_source_is_syntactically_valid(tmp_path):
 
     write_recorder_shim(tmp_path / "shim", "/opt/somewhere/opencrab", tmp_path / "rec")
     py_compile.compile(str(tmp_path / "shim" / "opencrab_recorder.py"), doraise=True)
+
+
+def test_provider_start_binds_and_reports_its_own_port(tmp_path):
+    """포트 할당과 bind 가 원자적이어야 한다.
+
+    미리 잡은 포트를 넘기면 소켓을 닫은 뒤 bind 하기 전 창에서 다른 프로세스가
+    그 포트를 채갈 수 있다. 병렬 실행에서 실제로 열리는 창이다.
+    """
+    import json
+    import urllib.request
+
+    from tools.openclaw_e2e import DeterministicProvider
+
+    with DeterministicProvider(FIXTURE_NONCE, tmp_path / "provider.jsonl") as provider:
+        port = provider.start(0)
+        assert isinstance(port, int) and port > 0, port
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=30) as resp:
+            body = json.load(resp)
+    assert [m["id"] for m in body["data"]] == [MODEL_ID]
 
 
 def test_check_persisted_respects_its_timeout(tmp_path):
