@@ -79,10 +79,14 @@ __all__ = [
 # same secret.
 _NO_STORE = {"Cache-Control": "no-store"}
 
-# #136: HTTP status for JSON-RPC error codes on MODERN single requests only
-# (legacy responses keep the pre-#136 blanket 200). Spec MUSTs: unknown RPC
-# method -> 404; version/header/meta faults -> 400. -32603 stays 200 -- the
-# spec leaves it unspecified, so the deviation from today is kept minimal.
+# #136: HTTP status for JSON-RPC error codes on MODERN single requests
+# (legacy responses keep the pre-#136 blanket 200). #250: when the legacy era
+# is disabled outright (MCP_PROTOCOL_VERSIONS selects no legacy version), the
+# server is modern-only and this mapping applies to EVERY single request --
+# a legacy-shaped request's rejection is a modern transport error there, and
+# answering it 200 contradicted the documented modern mapping. Spec MUSTs:
+# unknown RPC method -> 404; version/header/meta faults -> 400. -32603 stays
+# 200 -- the spec leaves it unspecified, so the deviation is kept minimal.
 _MODERN_ERROR_STATUS = {
     -32700: 400,
     -32600: 400,
@@ -281,10 +285,18 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                     status_code=400,
                     headers=_NO_STORE,
                 )
+            # #250: whether this server serves the legacy era at all -- fixed
+            # at construction time by MCP_PROTOCOL_VERSIONS. With it off the
+            # server is modern-only, and every transport rejection below is a
+            # modern one (status mapping; batch/scalar/notification rules).
+            # With it on, all legacy behaviour is byte-for-byte unchanged.
+            legacy_enabled = bool(server._enabled_legacy)
             # JSON-RPC batch: legacy-only LocalCrab extension (#136) --
-            # anything modern-flagged in or on the array is rejected outright.
+            # anything modern-flagged in or on the array is rejected outright,
+            # and with the legacy era disabled EVERY array is, empty included
+            # (#250).
             if isinstance(body, list):
-                if _batch_is_modern(request, body):
+                if not legacy_enabled or _batch_is_modern(request, body):
                     return JSONResponse(
                         {
                             "jsonrpc": "2.0",
@@ -304,6 +316,25 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                 if not out:
                     return Response(status_code=202, headers=_NO_STORE)
                 return JSONResponse(out, headers=_NO_STORE)
+
+            # #250: a body that is neither an object nor an array is Invalid
+            # Request on a modern-only server (400 + -32600), rejected before
+            # the dict-presuming handle_request can trip over it. Legacy-
+            # enabled configurations keep their historical handling of this
+            # shape untouched.
+            if not legacy_enabled and not isinstance(body, dict):
+                return JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Request: the request body must be a JSON object",
+                        },
+                    },
+                    status_code=400,
+                    headers=_NO_STORE,
+                )
 
             # #136: a single request runs under modern transport rules when
             # its body is modern-era OR it carries a modern version header --
@@ -362,11 +393,25 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                         )
                         if call_fault is not None:
                             return Response(status_code=400, headers=_NO_STORE)
+            elif not legacy_enabled and "id" not in body:
+                # #250: a legacy-shaped NOTIFICATION on a modern-only server
+                # must not be 202-acknowledged. handle_request rightly stays
+                # silent for notifications, so the transport rejects it here
+                # with the same empty-body 400 the modern notification faults
+                # use (the error body is a spec MAY for rejected
+                # notifications). Legacy-shaped REQUESTS (id present) fall
+                # through: handle_request's legacy-disabled gate produces
+                # their error envelope, and the status mapping below applies.
+                return Response(status_code=400, headers=_NO_STORE)
             resp = server.handle_request(body)
             # Notifications (no id) get no body → 202 Accepted
             if resp is None:
                 return Response(status_code=202, headers=_NO_STORE)
-            if modern_http and "error" in resp:
+            # #136: modern requests carry the modern status mapping; #250: on
+            # a modern-only server every single request does -- the JSON-RPC
+            # error envelope is untouched either way, only the HTTP status
+            # changes.
+            if (modern_http or not legacy_enabled) and "error" in resp:
                 status = _MODERN_ERROR_STATUS.get(resp["error"]["code"], 200)
                 return JSONResponse(resp, status_code=status, headers=_NO_STORE)
             return JSONResponse(resp, headers=_NO_STORE)
