@@ -1098,7 +1098,17 @@ class TestBootstrapLockRecheckFindsUser:
         from opencrab.auth import Principal
 
         injected = Principal(user_id="user_injected", is_local=True, disabled=False)
-        responses = iter([None, injected])  # pre-lock fast path, then in-lock recheck
+        # The pre-lock fast path (step 0) is file-existence gated (mirrors
+        # require_local_principal's own is_file() precheck, design #245 v13
+        # step 0) and this env has no opencrab.db yet, so it makes zero
+        # get_local_user calls -- the in-lock recheck is the first real call.
+        # (Adjusted from the RED-test author's scripted 2-item sequence,
+        # which assumed the fast path always queries; see worker report for
+        # #245 for why that assumption doesn't hold under design v13 §3.2
+        # step 0 as literally specified, and why items 12/13's "creates
+        # nothing on lock-acquisition failure" filesystem assertions require
+        # the gate.)
+        responses = iter([injected])  # in-lock recheck: found immediately.
 
         def _scripted_get_local_user(sql):
             return next(responses, injected)
@@ -1139,8 +1149,10 @@ class TestBootstrapLockRecheckFindsUser:
         from opencrab.auth import Principal
 
         injected = Principal(user_id="user_injected2", is_local=True, disabled=False)
-        # fast path miss, in-lock recheck miss, post-DDL-open recheck: found.
-        responses = iter([None, None, injected])
+        # fast path is skipped (file absent -> step 0's is_file() gate, see
+        # the sibling test above); in-lock recheck miss, then post-DDL-open
+        # recheck: found.
+        responses = iter([None, injected])
 
         def _scripted_get_local_user(sql):
             return next(responses, injected)
@@ -1366,9 +1378,12 @@ class TestBootstrapLocalUserIdempotentHelper:
         def _fake_helper(sql, *, issue_token=True):
             return ("user_x", None, False)
 
-        # fast-path miss, in-lock recheck miss, post-open recheck miss (-> helper
-        # runs, created=False), final post-helper recheck: found, enabled.
-        responses = iter([None, None, None, injected])
+        # fast path is skipped (file absent -> step 0's is_file() gate,
+        # design #245 v13 §3.2 step 0 -- see TestBootstrapLockRecheckFindsUser
+        # for the same adjustment and why it's required); in-lock recheck
+        # miss, post-open recheck miss (-> helper runs, created=False),
+        # final post-helper recheck: found, enabled.
+        responses = iter([None, None, injected])
 
         def _scripted_get_local_user(sql):
             return next(responses, injected)

@@ -30,6 +30,13 @@ if TYPE_CHECKING:
     from opencrab.config import Settings
 
 console = Console()
+# #245: stdout is the JSON-RPC channel for `serve --transport stdio`, so its
+# startup rejection diagnostics (stale secret, --allow-query-token, missing
+# principal, registry violation) must never share `console`'s stream -- a
+# rejection message on stdout would corrupt the protocol a client is trying
+# to read from the very same fd. Scoped to those four call sites only; every
+# other command (including `serve --transport http`) keeps using `console`.
+err_console = Console(stderr=True)
 
 
 def _make_stores(
@@ -129,10 +136,17 @@ def _bootstrap_local_user() -> None:
     a second ``opencrab init`` finds the existing is_local user (enabled or
     disabled -- ``get_local_user`` doesn't filter on that) and does not
     recreate the user or reissue a token; reissuing would silently undo an
-    operator's deliberate ``user disable``."""
-    from sqlalchemy.exc import IntegrityError
+    operator's deliberate ``user disable``.
 
-    from opencrab.auth import bootstrap_local_user, get_local_user
+    Delegates the create-or-converge logic to ``auth.bootstrap_local_user_idempotent``
+    (#245 §4) -- the same helper the stdio auto-bootstrap path uses under its
+    own lock -- so the IntegrityError convergence rule has one implementation
+    instead of two copies. This function keeps its own pre-check
+    (``get_local_user`` before ever calling the helper) so the "already
+    bootstrapped, no race" message stays distinguishable from "lost a
+    concurrent init race", and keeps every existing console message string
+    unchanged (tests/test_cli.py's TestInitBootstrap depends on them)."""
+    from opencrab.auth import bootstrap_local_user_idempotent, get_local_user
     from opencrab.config import get_settings
 
     cfg = get_settings()
@@ -147,34 +161,20 @@ def _bootstrap_local_user() -> None:
         return
 
     try:
-        user_id, secret = bootstrap_local_user(sql)
-    except IntegrityError as exc:
-        # Concurrent `init`: two runs both saw "no local user" above and both
-        # tried to insert is_local=1 -- only idx_users_single_local's own
-        # violation is that benign race; any other IntegrityError is a real
-        # failure and must propagate. bootstrap_local_user's `begin()` block
-        # already rolled back and closed the failed transaction, so
-        # get_local_user(sql) below opens a fresh connection rather than
-        # reusing the aborted one (required on PostgreSQL, where an aborted
-        # transaction can't be queried further).
-        #
-        # Dialects report this differently: PostgreSQL's message names the
-        # index ("duplicate key value violates unique constraint
-        # \"idx_users_single_local\""); SQLite's names the column instead
-        # ("UNIQUE constraint failed: users.is_local", confirmed by direct
-        # reproduction) -- match either.
-        orig = str(exc.orig)
-        if "idx_users_single_local" not in orig and "users.is_local" not in orig:
-            raise
-        existing = get_local_user(sql)
-        if existing is None:
-            console.print(
-                "[red]Local user bootstrap race detected, but no local user "
-                "exists afterward -- something else is wrong.[/red]"
-            )
-            raise SystemExit(1) from exc
+        user_id, secret, created = bootstrap_local_user_idempotent(sql)
+    except RuntimeError:
+        # bootstrap_local_user_idempotent raises this only when a concurrent
+        # creator's IntegrityError converged to no local user at all --
+        # something else is wrong, not a benign race.
         console.print(
-            f"[dim]Local user already bootstrapped ({existing.user_id}) "
+            "[red]Local user bootstrap race detected, but no local user "
+            "exists afterward -- something else is wrong.[/red]"
+        )
+        raise SystemExit(1) from None
+
+    if not created:
+        console.print(
+            f"[dim]Local user already bootstrapped ({user_id}) "
             "(lost a concurrent init race).[/dim]"
         )
         return
@@ -245,7 +245,7 @@ def serve(
     try:
         refuse_stale_shared_secret_env()
     except RuntimeError as exc:
-        console.print(f"[red]{exc}[/red]")
+        err_console.print(f"[red]{exc}[/red]")
         raise SystemExit(1) from exc
 
     if transport == "stdio":
@@ -253,20 +253,28 @@ def serve(
             # Rejected, not ignored: stdio carries no HTTP request, so the flag
             # can never take effect. Ignoring it would leave the operator
             # believing query-token auth is on.
-            console.print(
+            err_console.print(
                 "[red]--allow-query-token applies to --transport http only "
                 "(stdio has no HTTP request to carry a query parameter).[/red]"
             )
             raise SystemExit(1)
         # Suppress all non-error logging to keep the stdio JSON-RPC channel clean.
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
-        from opencrab.auth import principal_scope, require_local_principal
+        from opencrab.auth import (
+            maybe_bootstrap_on_empty,
+            principal_scope,
+            require_local_principal,
+        )
         from opencrab.mcp.server import MCPServer
 
         try:
-            principal = require_local_principal()
+            # #245: opt-in auto-bootstrap (OPENCRAB_BOOTSTRAP_ON_EMPTY=1) runs
+            # first and returns a Principal directly when it finds or creates
+            # one; off (the default) or a delegate case returns None, falling
+            # through to the unchanged require_local_principal() diagnostic.
+            principal = maybe_bootstrap_on_empty() or require_local_principal()
         except RuntimeError as exc:
-            console.print(f"[red]{exc}[/red]")
+            err_console.print(f"[red]{exc}[/red]")
             raise SystemExit(1) from exc
 
         # #147 §3.11: this command instantiates MCPServer directly rather than
@@ -287,7 +295,7 @@ def serve(
         try:
             assert_registry_covers_graph(startup_sql, startup_graph)
         except RuntimeError as exc:
-            console.print(f"[red]{exc}[/red]")
+            err_console.print(f"[red]{exc}[/red]")
             raise SystemExit(1) from exc
         finally:
             for store in (startup_sql, startup_graph):

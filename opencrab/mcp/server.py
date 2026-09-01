@@ -489,6 +489,7 @@ def main() -> None:
     )
 
     from opencrab.auth import (
+        maybe_bootstrap_on_empty,
         principal_scope,
         refuse_stale_shared_secret_env,
         require_local_principal,
@@ -496,7 +497,11 @@ def main() -> None:
 
     try:
         refuse_stale_shared_secret_env()
-        principal = require_local_principal()
+        # #245: opt-in auto-bootstrap (OPENCRAB_BOOTSTRAP_ON_EMPTY=1) runs
+        # first and returns a Principal directly when it finds or creates
+        # one; off (the default) or a delegate case returns None, falling
+        # through to the unchanged require_local_principal() diagnostic.
+        principal = maybe_bootstrap_on_empty() or require_local_principal()
     except RuntimeError as exc:
         # stdout is the JSON-RPC channel -- diagnostics go to stderr only.
         print(str(exc), file=sys.stderr)
