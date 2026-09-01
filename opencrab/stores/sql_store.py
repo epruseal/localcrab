@@ -579,22 +579,30 @@ class SQLStore:
     def register_node(self, space: str, node_type: str, node_id: str) -> None:
         """Insert or update a node registry entry.
 
-        Re-registering an existing ``(space, node_id)`` is an in-place UPDATE:
-        the row keeps its ``id`` and ``created_at``, and only ``node_type`` and
-        ``updated_at`` change. The SQLite branch used to emit SQLite's REPLACE
-        conflict-resolution form, which is a DELETE-then-INSERT — it
-        reallocated the AUTOINCREMENT ``id``, re-evaluated the ``created_at``
-        DEFAULT (so "first seen at" silently became "last seen at"), and moved
-        the row to the end of the physical scan order, while the PG branch
-        preserved all three. One ``ON CONFLICT (...) DO UPDATE`` now serves
-        both dialects, which is the same contract ``_sql_dialect.py``'s
-        "ROWID STABILITY" note already fixed for the graph/doc stores
-        (issue #81).
+        Re-registering an existing ``(space, node_id)`` updates the existing
+        row rather than deleting and reinserting it: the row keeps its ``id``
+        and ``created_at``, and only ``node_type`` and ``updated_at`` change.
+        The SQLite branch used to emit SQLite's REPLACE conflict-resolution
+        form, which is a DELETE-then-INSERT — it reallocated the AUTOINCREMENT
+        ``id`` and re-evaluated the ``created_at`` DEFAULT, so "first seen at"
+        silently became "last seen at", while the PG branch preserved both.
+        One ``ON CONFLICT (...) DO UPDATE`` now serves both dialects, which is
+        the same contract ``_sql_dialect.py``'s "ROWID STABILITY" note already
+        fixed for the graph/doc stores (issue #81).
+
+        The shared contract is exactly those two columns. On SQLite the
+        rewrite additionally keeps the row's rowid (``id`` is the rowid alias
+        here), which is what that note is about; PostgreSQL gives no such
+        guarantee — an UPDATE writes a new tuple version under MVCC — and
+        nothing here asks it to.
 
         That contract is pinned two ways in
-        ``tests/test_sql_store_upsert_parity.py``: this file's source must not
-        contain the REPLACE spelling at all (hence the circumlocution above),
-        and the SQL both methods actually execute is captured and checked.
+        ``tests/test_sql_store_upsert_parity.py``: the SQL both methods
+        actually execute is captured and checked, and this file's source is
+        searched for the literal two-word spelling of SQLite's conflict-
+        resolution clause (the one named in that same note). The pin greps for
+        those two words adjacent, which is why the prose above never puts them
+        side by side.
 
         Only the "current time" fragment still comes from the dialect
         (``datetime('now')`` vs ``NOW()``); the statement itself is shared.
@@ -779,9 +787,9 @@ class SQLStore:
     ) -> None:
         """Upsert a ReBAC policy row.
 
-        Re-setting an existing ``(subject_id, permission, resource_id)`` is an
-        in-place UPDATE of ``granted``: the row keeps its ``id`` and
-        ``created_at``. Same fix and same reasoning as ``register_node`` above
+        Re-setting an existing ``(subject_id, permission, resource_id)``
+        updates the existing row's ``granted`` rather than deleting and
+        reinserting it: the row keeps its ``id`` and ``created_at``. Same fix and same reasoning as ``register_node`` above
         (issue #81) — the SQLite branch's REPLACE form destroyed both.
         ``rebac_policies`` has no ``updated_at`` column, so this statement needs
         no dialect-specific fragment at all and is shared verbatim.

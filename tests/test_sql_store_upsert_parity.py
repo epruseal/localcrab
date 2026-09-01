@@ -1,10 +1,16 @@
 """
 SQLStore 의 upsert 가 SQLite 와 PostgreSQL 에서 같은 의미를 갖는지 고정한다 (이슈 #81).
 
-``register_node`` 와 ``set_policy`` 는 같은 키로 다시 호출됐을 때 기존 행을 **제자리에서**
-갱신해야 한다. SQLite 의 ``INSERT OR REPLACE`` 는 DELETE 후 INSERT 이므로 AUTOINCREMENT
-``id`` 를 새로 할당하고 ``created_at`` DEFAULT 를 재평가하며 물리 행 위치를 옮긴다. PG 의
-``ON CONFLICT ... DO UPDATE`` 는 셋 다 보존한다. 이 파일은 양 방언이 후자로 일치함을 고정한다.
+``register_node`` 와 ``set_policy`` 는 같은 키로 다시 호출됐을 때 **삭제 후 재삽입이 아니라
+기존 행을 갱신**해야 한다. SQLite 의 ``INSERT OR REPLACE`` 는 DELETE 후 INSERT 이므로
+AUTOINCREMENT ``id`` 를 새로 할당하고 ``created_at`` DEFAULT 를 재평가한다. PG 의
+``ON CONFLICT ... DO UPDATE`` 는 둘 다 보존한다. 이 파일이 고정하는 공통 계약은 그 두 컬럼이다.
+
+SQLite 에서는 같은 재작성이 행의 rowid 도 유지한다(여기서 ``id`` 는 rowid 별칭이다). 그 안정성이
+왜 중요한지는 ``_sql_dialect.py`` 의 "ROWID STABILITY" 절과
+``test_pg_graph_doc_parity.py::TestUpsertRowidStability`` 가 그래프 스토어에 대해 서술하고
+고정한다. PostgreSQL 은 그런 보장을 주지 않는다 — UPDATE 가 MVCC 상 새 튜플 버전을 쓴다 — 그리고
+이 파일도 그것을 요구하지 않는다.
 
 같은 계약이 그래프/문서 스토어에 대해서는 ``_sql_dialect.py`` 의 "ROWID STABILITY" 절과
 ``test_pg_graph_doc_parity.py::TestUpsertRowidStability`` 로 이미 고정돼 있다. SQLStore 는 그
@@ -145,8 +151,8 @@ def _backdate_policy(store: SQLStore, sid: str, perm: str, rid: str) -> None:
 
 class TestUpsertPreservesIdentityNormal:
     def test_register_node_reregistration_preserves_id_and_created_at(self, sql_store):
-        """재등록은 제자리 UPDATE 여야 한다: id 와 created_at 은 그대로, updated_at 과
-        node_type 만 갱신된다."""
+        """재등록은 삭제 후 재삽입이 아니라 기존 행 갱신이어야 한다: id 와 created_at 은
+        그대로, updated_at 과 node_type 만 갱신된다."""
         sql_store.register_node("subject", "User", "u1")
         _backdate_node(sql_store, "subject", "u1")
         before = _node_row(sql_store, "subject", "u1")
