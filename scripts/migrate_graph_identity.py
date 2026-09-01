@@ -44,8 +44,8 @@ merge needs at least two sources; the store rejects a shorter one.  Node
 digests come from a prior dry-run receipt or from the graph inventory, and the
 store rejects a mapping whose digest no longer matches the stored row.  Read
 the digests out of a receipt rather than pasting its mappings in: a receipt
-reports each source flattened to ``node_type``, ``node_id`` and ``digest``,
-which is not the shape this file accepts.
+reports the sources of a mapping flattened to ``node_type``, ``node_id`` and
+``digest``, which is not the shape this file accepts.
 """
 
 from __future__ import annotations

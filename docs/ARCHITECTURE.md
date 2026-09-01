@@ -250,8 +250,8 @@ dry-run 매핑 파일(`--mapping-file`)은 JSON 객체이며 `mappings`와
 형제 필드 `source_digest`로 함께 적어서, `rename` 항목은 `source`와 `source_digest`를
 직접 갖고 `merge` 항목은 `sources` 리스트의 각 원소가 같은 두 필드를 갖는다.
 `property_resolutions` 항목의 `source`는 같은 2키 객체지만 digest를 요구하지 않는다.
-receipt가 보고하는 source는 세 필드를 평탄화한 별개 모양이므로 매핑 파일에 그대로 옮겨
-쓸 수 없다. 형식 전문과 예시는 `scripts/migrate_graph_identity.py`의 모듈 docstring에 있다.
+receipt가 `mapping_result`의 각 매핑 아래 보고하는 source는 세 필드를 평탄화한 별개
+모양이므로 매핑 파일에 그대로 옮겨 쓸 수 없다. 형식 전문과 예시는 `scripts/migrate_graph_identity.py`의 모듈 docstring에 있다.
 
 dry-run은 graph와 migration ledger를 변경하지 않는다. apply는 성공한 receipt를
 ledger에 한 번만 기록하며 같은 request ID의 재실행은 저장된 receipt를 그대로

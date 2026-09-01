@@ -150,6 +150,7 @@ def test_merge_mapping_file_runs_as_a_process(graph: _Graph, tmp_path: Path) -> 
     assert len(merges) == 1
     # A receipt flattens each source, so its mappings are not a mapping file:
     # pasting one back in is what issue #258 was about.
+    assert len(merges[0]["sources"]) == 2
     assert all(set(source) == {"node_type", "node_id", "digest"} for source in merges[0]["sources"])
     assert plan_out.read_bytes() == graph.plan_bytes((graph.merge(),))
 
