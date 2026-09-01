@@ -429,7 +429,10 @@ def verify_release(out_dir) -> None:
     """
     out_dir = Path(out_dir)
 
-    release_candidates = sorted(out_dir.glob("localcrab-plugin-*.RELEASE.SHA256SUMS"))
+    try:
+        release_candidates = sorted(out_dir.glob("localcrab-plugin-*.RELEASE.SHA256SUMS"))
+    except OSError as exc:
+        raise BuildError(f"out_dir 를 나열할 수 없다: {exc}") from exc
     if len(release_candidates) != 1:
         raise BuildError(
             "RELEASE.SHA256SUMS 파일이 정확히 1개여야 한다 "
@@ -443,11 +446,20 @@ def verify_release(out_dir) -> None:
         raise BuildError(f"RELEASE 파일명 형식 위반: {release_path.name}")
     version = name_match.group("version")
 
+    # RELEASE 목록 자체가 못 읽히면 이후 검증이 전부 무의미하므로(위반 목록에 누적하지
+    # 않고) 즉시 단일 오류로 종료한다 -- 위의 "정확히 1개" 전제 실패와 같은 클래스다.
+    try:
+        release_text = release_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BuildError(f"RELEASE.SHA256SUMS 를 읽을 수 없다: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise BuildError(
+            f"RELEASE.SHA256SUMS 가 UTF-8 이 아니다(손상 가능): {release_path.name}"
+        ) from exc
+
     violations: list[str] = []
 
-    release_entries, release_violations = _parse_hash_list(
-        release_path.read_text(encoding="utf-8"), reject_separators=True
-    )
+    release_entries, release_violations = _parse_hash_list(release_text, reject_separators=True)
     violations.extend(f"RELEASE: {v}" for v in release_violations)
 
     expected_names = {
@@ -471,7 +483,12 @@ def verify_release(out_dir) -> None:
         if not path.is_file():
             violations.append(f"파일 없음: {name}")
             continue
-        actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            violations.append(f"파일을 읽을 수 없다: {name}")
+            continue
+        actual_digest = hashlib.sha256(data).hexdigest()
         if actual_digest != digest:
             violations.append(f"해시 불일치: {name}")
 
@@ -481,6 +498,8 @@ def verify_release(out_dir) -> None:
         sidecar_text = sidecar_path.read_text(encoding="utf-8")
     except OSError as exc:
         violations.append(f"패키지 사이드카를 읽을 수 없다: {exc}")
+    except UnicodeDecodeError as exc:
+        violations.append(f"패키지 사이드카가 UTF-8 이 아니다(손상 가능): {exc}")
     else:
         sidecar_entries, sidecar_violations = _parse_hash_list(sidecar_text, reject_separators=False)
         violations.extend(f"사이드카: {v}" for v in sidecar_violations)
