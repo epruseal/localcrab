@@ -611,10 +611,14 @@ def test_vector_upsert_texts_is_called_exactly_once_per_source_write(stack, monk
 def test_vector_metadata_preserves_source_identity_and_carries_no_node_shape(stack):
     """설계 §9-15. `space` 하나가 아니라 `user_id`/`source_id`/`space` 가 모두
 
-    보존되고, 빌더의 노드 형상 키인 `node_id` 는 섞이지 않아야 한다. 현재
-    코드에서도 통과하므로 검출력은 `write_vector=False` → `True` 역변이로
-    증명한다(빌더의 벡터 다리는 `{pack_id, source, node_id, space}` 형상의
-    다른 메타데이터를 같은 id 에 덮어쓴다).
+    보존되고, 빌더의 노드 형상 키인 `node_id` 는 섞이지 않아야 한다.
+
+    검출력은 스탬프와 메타데이터 자체를 겨냥한 역변이로 증명된다 — `stamp` 의
+    키 집합을 줄이거나 `node_id` 를 소스 메타데이터에 넣으면 이 테스트가
+    단독으로 죽는다(적대검증자 실측). `write_vector=False` → `True` 역변이는
+    **잡지 못한다**: `hybrid.ingest` 가 뒤이어 같은 id 를 소스 메타데이터로
+    덮어써 최종 형상이 같아지기 때문이다. 그 역변이는 `upsert_texts` 호출
+    횟수 테스트와 호출자 인벤토리가 잡는다.
     """
     _write(stack, text="본문", source_id="src-vecmeta")
 

@@ -148,7 +148,11 @@ def write_source(
     """Write one source's graph node, doc row and vector under one ownership stamp.
 
     Returns a receipt shaped like the builder's: ``{"source_id", "metadata",
-    "stores": {"documents": ..., "chromadb": ...}}``. *Store* failures are
+    "stores": {...}}``. Since #74 that map carries five keys, not two:
+    ``graph``/``docs``/``sql`` come from the node write (``docs`` is the
+    doc_nodes row, NOT this module's own ``documents``, which is the
+    doc_sources row) and ``documents``/``chromadb`` from the source legs.
+    *Store* failures are
     reported in ``stores`` rather than raised, matching the #158 contract that
     callers read the receipt.
 

@@ -399,8 +399,16 @@ def edge_identity_conflict(
 def source_identity_conflict(
     docs: Any, vector: Any, *, source_id: str, pack_id: str
 ) -> str | None:
-    """The legacy (text_as_node=False) text path: doc_sources + vector, keyed
-    by source_id alone -- there is no graph node here."""
+    """The source axis of a text write: doc_sources + vector, keyed by
+    source_id alone.
+
+    Since #74 a source DOES get a graph node, but this probe deliberately
+    stays on the two source sinks: ``write_source`` runs it first and the
+    node's own axes (graph, doc_nodes, the type-agnostic id sweep) are then
+    checked by ``node_identity_conflict`` inside ``OntologyBuilder.add_node``.
+    Widening this one would duplicate that. The one gap the split leaves is
+    an id too long to be a node id -- there the node leg is skipped and only
+    these two axes run (see ``source_writer._graph_leg``)."""
     return _check_probes(pack_id, [
         (docs, "get_source", (source_id,), ("metadata", "pack_id")),
         (vector, "get_by_id", (source_id,), ("metadata", "pack_id")),

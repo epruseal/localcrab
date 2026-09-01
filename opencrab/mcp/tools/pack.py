@@ -551,10 +551,11 @@ def _ingest_into_pack(
     # write via store_write_succeeded(..., "graph"). The text_as_node=False
     # legacy branch now writes a graph node too (via write_source, #74), but
     # this gate deliberately does not look at that key (design v13 §4.9 pins
-    # today's billing meaning) -- its own signal stays
-    # store_write_succeeded(stores)
-    # with no key — positive confirmation that at least one of
-    # chromadb/documents actually came back a recognized "ok"-prefixed status
+    # today's billing meaning) -- its own signal is store_write_succeeded()
+    # against chromadb and documents BY NAME (it used to be the key-less form,
+    # which meant the same thing back when those were the only two keys in the
+    # map; see the block below the gate) — positive confirmation that at least
+    # one of the two actually came back a recognized "ok"-prefixed status
     # (see that function's docstring in builder.py for the full success-value
     # inventory this is based on, and why "unavailable" alone must not bill).
     text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
@@ -916,7 +917,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Both settings now store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead.",
+                    "description": "Both settings store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead. One exception: with false, a source_id too long to survive as a node id through a pack fork gets no node (the doc_sources row and vector are still written).",
                 },
             },
             "required": ["title"],
@@ -940,11 +941,14 @@ def pack_create(
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
     pack_id is auto-slugged from title unless explicitly provided.
-    Optional text always becomes an evidence/TextUnit graph node (#74):
+    Optional text becomes an evidence/TextUnit graph node (#74):
     text_as_node=True (default) calls the builder directly, embedding the
     node's own summary text in the vector; text_as_node=False (legacy) goes
     through write_source instead, which writes the same graph node plus a
-    doc_sources row and embeds the ORIGINAL text in the vector. The
+    doc_sources row and embeds the ORIGINAL text in the vector. That path
+    makes no node for a source_id too long to survive a pack fork's id remap
+    (the doc_sources row and vector are still written); text_as_node=True has
+    no such carve-out. The
     ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
     stays fixed at 'default'.
@@ -1451,7 +1455,7 @@ def pack_create(
                 "text_as_node": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Both settings now store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead.",
+                    "description": "Both settings store text as an evidence/TextUnit graph node. True (default) writes graph+doc_nodes+vector with the node's own text; false additionally records a doc_sources row and embeds the raw text instead. One exception: with false, a source_id too long to survive as a node id through a pack fork gets no node (the doc_sources row and vector are still written).",
                 },
                 "title": {
                     "type": "string",
@@ -1482,11 +1486,14 @@ def pack_ingest(
     Add content into an EXISTING localcrab ontology pack.
 
     Caller supplies pre-extracted nodes/edges; the server does NOT call any LLM.
-    Optional text always becomes an evidence/TextUnit graph node (#74):
+    Optional text becomes an evidence/TextUnit graph node (#74):
     text_as_node=True (default) calls the builder directly, embedding the
     node's own summary text in the vector. text_as_node=False (legacy) goes
     through write_source instead, which writes the same graph node plus a
-    doc_sources row and embeds the ORIGINAL text in the vector.
+    doc_sources row and embeds the ORIGINAL text in the vector. That path
+    makes no node for a source_id too long to survive a pack fork's id remap
+    (the doc_sources row and vector are still written); text_as_node=True has
+    no such carve-out.
     Fails if the pack does not exist — use pack_create first.
     The ``ingest`` billing event's subject is the caller's server-derived
     ``current_principal()`` (#145) -- never a client argument; tenant_id
