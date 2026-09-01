@@ -24,6 +24,7 @@ import re
 import signal
 import sys
 import tarfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -1511,6 +1512,83 @@ class TestVerifyReleaseServedBytesInstrumentation:
 
 
 # ---------------------------------------------------------------------------
+# TestSafeVersionNewlineRejection -- PR #257 리뷰 라운드 3 [G2] 대응
+# ---------------------------------------------------------------------------
+
+
+class TestSafeVersionNewlineRejection:
+    """`_safe_version` 의 `^...$` + `re.match` 는 `$` 가 말미 개행 직전 매치를 허용해
+    `"1.0\\n"` 같은 개행 포함 문자열이 통과했다(PR #257 리뷰 라운드 3 [G2], P2).
+    fix-design-v14.md -> v15.md(v15 최종, 통합 테스트 픽스처만 델타)."""
+
+    @pytest.mark.parametrize("version", ["1.0\n", "1.0\r", "1.0\r\n", "\n1.0"])
+    def test_safe_version_rejects_embedded_newlines(self, version):
+        with pytest.raises(b.BuildError):
+            b._safe_version(version)
+
+    def test_build_release_rejects_newline_version_without_publishing(self, tmp_path):
+        """v15 [H1]: pyproject 는 TOML 이스케이프(`\\\\n`)로 개행을 기록해야 한다 -- 원시
+        개행을 그대로 삽입하면 TOMLDecodeError 가 `_safe_version` 도달 전에 선행해
+        이 결함과 무관한 이유로 실패하므로, 파싱 결과가 실제 개행 문자열임을 먼저
+        전제 단언으로 못박는다."""
+        repo = _fake_repo(tmp_path, version="0.1.0")
+        pyproject_text = '[project]\nname = "opencrab"\nversion = "0.1.0\\n"\n'
+        (repo / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
+        parsed = tomllib.loads(pyproject_text)
+        assert parsed["project"]["version"] == "0.1.0\n"  # 전제: 실제 개행 문자열
+
+        manifest_path = repo / "packaging" / "agent-plugin" / "src" / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "0.1.0\n"
+        _write_json(manifest_path, manifest)
+
+        out_dir = tmp_path / "dist"
+        with pytest.raises(b.BuildError):
+            b.build_release(repo, out_dir)
+
+        # v15 [H1]: "버전 부착 산출물 게시 전" -- out_dir 에 버전 부착 파일도, 개행
+        # 포함 파일명도 존재하지 않아야 한다(격리 조립 단계에서 실패해 게시로 넘어가지
+        # 않았음을 직접 확인한다).
+        assert out_dir.exists()
+        published = list(out_dir.iterdir())
+        assert published == []
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyReleaseItemProbeErrorBoundary -- PR #257 리뷰 라운드 3 [G1] 대응
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyReleaseItemProbeErrorBoundary:
+    """RELEASE 항목 루프의 `path.is_file()` 탐침이 과장 파일명(NAME_MAX 초과) 등에서
+    OSError 를 던져 `--verify` 가 traceback 으로 종료하던 결함(PR #257 리뷰 라운드 3
+    [G1], P2). fix-design-v14.md -> v15.md(v15 [H2]: 탐침 실패 위반 문구 직접 단언)."""
+
+    @pytest.fixture
+    def release(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        b.build_release(repo, out_dir)
+        return out_dir
+
+    def test_overlong_entry_name_reported_as_violation_not_oserror(self, release):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        overlong_name = "a" * 300
+        digest = "0" * 64
+        text = (
+            release_path.read_text(encoding="utf-8").rstrip("\n")
+            + f"\n{digest}  {overlong_name}\n"
+        )
+        release_path.write_text(text, encoding="utf-8")
+
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        # v15 [H2]: 300자 항목은 "RELEASE 구성 불일치" 위반도 함께 유발하므로, 그것만으로
+        # 통과시키지 않고 탐침 실패 문구의 실재를 직접 단언한다.
+        assert "항목 경로를 탐침할 수 없다" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # TestCli
 # ---------------------------------------------------------------------------
 
@@ -1577,6 +1655,30 @@ class TestCli:
         data = bytearray(release_files[0].read_bytes())
         data[3] = 0xFF
         release_files[0].write_bytes(bytes(data))
+
+        code = cli.main(["--verify", "--out", str(out_dir)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "release verification failed" in captured.err
+
+    def test_verify_flag_overlong_entry_name_no_traceback(self, cli, tmp_path, capsys):
+        """PR #257 리뷰 라운드 3 [G1]: 과장 파일명(NAME_MAX 초과) RELEASE 항목이 CLI
+        층에서도 raw OSError traceback 이 아니라 문서화된 'release verification
+        failed' 형식 + exit 1 로 종료해야 한다(예외 전파 없음)."""
+        out_dir = tmp_path / "dist"
+        assert cli.main(["--out", str(out_dir)]) == 0
+        capsys.readouterr()
+
+        release_files = list(out_dir.glob("localcrab-plugin-*.RELEASE.SHA256SUMS"))
+        assert len(release_files) == 1
+        release_path = release_files[0]
+        overlong_name = "a" * 300
+        digest = "0" * 64
+        text = (
+            release_path.read_text(encoding="utf-8").rstrip("\n")
+            + f"\n{digest}  {overlong_name}\n"
+        )
+        release_path.write_text(text, encoding="utf-8")
 
         code = cli.main(["--verify", "--out", str(out_dir)])
         captured = capsys.readouterr()
