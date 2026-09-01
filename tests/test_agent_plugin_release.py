@@ -1029,7 +1029,15 @@ class TestVerifyReleaseBoundedResources:
     # -- [Y1] 전개 예산: 서로 다른 3가지 경로로 물리 계층에 도달함을 보인다 --
 
     def test_expansion_budget_reachable_via_normal_member_hashing(self, release, monkeypatch):
-        """정상적으로 선언된 큰 멤버를 실제로 해싱하는 도중 물리 예산이 걸린다."""
+        """[Y1]/[Z1] 이 함께 방어함을 보인다 -- 다만 이 표본은 이름과 달리 실제로
+        `_hash_chunked` 에 도달하지 않는다: 선언 크기 200,000바이트가 논리 예산
+        (32,768바이트)을 `extractfile` 호출 이전에 이미 초과시켜 [Z1] 논리 계층에서
+        걸린다(v13 [S1]/A5 LOW1 정정 -- 5차 이중검증 채널 B 실측으로 확인됨). 물리
+        계층까지 실제로 해싱을 거쳐 도달하는 표본은
+        `TestVerifyReleaseServedBytesInstrumentation.test_member_hashing_genuinely_chunked_multiple_reads`
+        를 참고할 것. 이 테스트 자체는 그대로 유지한다 -- [Z1] 이 [Y1] 물리 계층의
+        추가 소비 없이도(스파이 소비량이 낮게 유지됨) 단독으로 조기 차단함을 보이는
+        유효한 회귀다."""
         archive = release / "localcrab-plugin-1.0.0.tar.gz"
         prefix = b._ARCHIVE_PREFIX
         _write_plain_tar_gz(
@@ -1289,6 +1297,217 @@ class TestVerifyReleaseBoundedResources:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
         assert "패키지 사이드카를 읽을 수 없다" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyReleaseServedBytesInstrumentation
+# ---------------------------------------------------------------------------
+
+
+class _CountingFile:
+    """[R1]/[S1] 실제 서빙 바이트 계측 래퍼 -- read() 호출 횟수·각 요청 크기·누적
+    서빙 바이트를 기록한다. read()/read(-1) 같은 무인자·음수 요청은 크기가 아니라
+    `UNBOUNDED` 표식으로 정규화해 기록한다(v13 [S1] LOW 반영) -- 통째 읽기
+    역변이(`fileobj.read()` 1회 호출)가 우연히 작은 size 인자를 쓴 것과 섞이지
+    않도록, "제한 없는 요청이었다"는 사실 자체를 크기와 구분되는 값으로 남긴다."""
+
+    UNBOUNDED = "UNBOUNDED"
+
+    def __init__(self, fileobj, *, label: str) -> None:
+        self._fileobj = fileobj
+        self.label = label
+        self.calls = 0
+        self.request_sizes: list[int | str] = []
+        self.served_bytes = 0
+
+    def read(self, size=-1):
+        self.calls += 1
+        self.request_sizes.append(self.UNBOUNDED if (size is None or size < 0) else size)
+        chunk = self._fileobj.read(size)
+        self.served_bytes += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self._fileobj.close()
+
+    def __getattr__(self, name):
+        return getattr(self._fileobj, name)
+
+    @property
+    def bounded_max_request(self):
+        """관측된 요청 중 하나라도 UNBOUNDED 면 None(청크 규율 위반의 직접 증거) --
+        그 외에는 관측된 요청 크기 중 최댓값을 돌려준다."""
+        if self.UNBOUNDED in self.request_sizes:
+            return None
+        return max(self.request_sizes) if self.request_sizes else 0
+
+
+def _install_open_regular_spy(monkeypatch) -> list[_CountingFile]:
+    """`_open_regular` 를 spy 래핑해, 호출될 때마다 반환 파일 객체를 `_CountingFile`
+    로 감싸 호출 순서대로 누적 리스트에 남긴다(RELEASE 적재·사이드카 적재·항목 파일
+    해싱이 각각 몇 번·어떤 이름으로 열렸는지 테스트가 라벨로 식별할 수 있다).
+    `_open_regular` 자체는 monkeypatch 하지 않는다 -- 실제 반환 객체를 감쌀 뿐,
+    lstat/O_NOFOLLOW/fstat 동작은 그대로 실행된다."""
+    opened: list[_CountingFile] = []
+    original = b._open_regular
+
+    def spy(path):
+        fileobj = original(path)
+        cf = _CountingFile(fileobj, label=Path(path).name)
+        opened.append(cf)
+        return cf
+
+    monkeypatch.setattr(b, "_open_regular", spy)
+    return opened
+
+
+def _install_extractfile_spy(monkeypatch) -> list[_CountingFile]:
+    """`TarFile.extractfile` 을 spy 래핑해 **반환된 멤버 파일 객체**를 `_CountingFile`
+    로 감싼다(v13 [S1] MED 반영 -- 원시 아카이브 파일을 감싸면 해싱·파싱·물리 예산
+    소비가 뒤섞여 구분되지 않으므로, tarfile 이 멤버 단위로 슬라이스해 돌려주는 바로
+    그 객체를 계측해야 `_hash_chunked` 의 실제 판독 패턴을 볼 수 있다)."""
+    opened: list[_CountingFile] = []
+    original = tarfile.TarFile.extractfile
+
+    def spy(self, *args, **kwargs):
+        fileobj = original(self, *args, **kwargs)
+        if fileobj is None:
+            return None
+        member = args[0] if args else kwargs.get("member")
+        name = getattr(member, "name", str(member))
+        cf = _CountingFile(fileobj, label=name)
+        opened.append(cf)
+        return cf
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", spy)
+    return opened
+
+
+class TestVerifyReleaseServedBytesInstrumentation:
+    """PR #257 5차 이중검증 채널 B(MED) 대응 -- 유계 읽기 헬퍼(`_read_all_limited`/
+    `_sha256_stream`/`_hash_chunked`)를 통째 읽기로 역변이해도 걸러지지 않던 검출력
+    공백을 메운다(실측: 세 헬퍼를 전부 무제한 `read()` 로 바꿔도 기존 방호 테스트
+    10개가 `10 passed` 로 전부 통과했다 -- /home/asdf/orch-scratch/o247/adv-B5-output.txt).
+
+    원인은 두 가지였다: (1) 역할별 과대 파일 테스트가 오류 문구만 단언하고 실제
+    서빙 바이트를 재지 않았다. (2) "정상 멤버 해싱" 표본이 선언 크기만으로 [Z1]
+    논리 예산에 먼저 걸려, 실제로는 `_hash_chunked` 에 도달하지 않았다.
+
+    교정: 원시 파일이 아니라 실제 판독 경계(`_open_regular` 각 호출, `extractfile`
+    각 반환 객체)를 `_CountingFile` 로 감싸 서빙 바이트·요청 크기·호출 횟수를 직접
+    잰다 -- 헬퍼 함수 자체는 monkeypatch 하지 않는다(헬퍼 교체 오구현도 걸러야
+    하므로 실제 호출 경로를 계측 대상으로 삼는다). 설계 정본: fix-design-v13.md
+    (v12 델타, v12 는 v11 델타)."""
+
+    @pytest.fixture
+    def release(self, tmp_path):
+        repo = _fake_repo(tmp_path, version="1.0.0")
+        out_dir = tmp_path / "dist"
+        b.build_release(repo, out_dir)
+        return out_dir
+
+    # -- [R1](a) RELEASE 적재: served ≤ cap+1 --
+
+    def test_release_load_served_bytes_bounded_by_cap(self, release, monkeypatch):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        cap = 64
+        assert release_path.stat().st_size > cap, (
+            "픽스처 전제 위반: RELEASE 실제 크기가 cap 보다 커야 초과 경로를 탄다"
+        )
+        monkeypatch.setattr(b, "_MAX_SUMS_BYTES", cap)
+        opened = _install_open_regular_spy(monkeypatch)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert "RELEASE.SHA256SUMS 크기가 허용 상한을 초과했다" in str(exc_info.value)
+        release_handles = [cf for cf in opened if cf.label == release_path.name]
+        assert len(release_handles) == 1
+        assert release_handles[0].served_bytes <= cap + 1
+
+    # -- [R1](b)/[S2] 사이드카: 두 경로(항목 해싱 + 본문 적재)에서 각각 열리므로
+    #    합계가 아니라 핸들별 최댓값을 단언한다 --
+
+    def test_sidecar_load_served_bytes_bounded_per_handle(self, release, monkeypatch):
+        release_path = release / "localcrab-plugin-1.0.0.RELEASE.SHA256SUMS"
+        sidecar_path = release / "localcrab-plugin.SHA256SUMS"
+        # cap 은 RELEASE 자체보다는 커야(그래야 RELEASE 적재 단계에서 먼저 하드
+        # raise 되지 않고 사이드카 로딩까지 도달한다) 사이드카보다는 작아야(초과
+        # 경로를 실제로 탄다) 한다 -- test_sidecar_oversize_recorded_as_violation
+        # 과 동일한 격리 패턴.
+        cap = release_path.stat().st_size + 10
+        assert sidecar_path.stat().st_size > cap, (
+            "픽스처 전제 위반: 사이드카 실제 크기가 RELEASE+10 바이트보다 커야 "
+            "RELEASE 대신 사이드카만 걸리게 격리된다"
+        )
+        monkeypatch.setattr(b, "_MAX_SUMS_BYTES", cap)
+        opened = _install_open_regular_spy(monkeypatch)
+        with pytest.raises(b.BuildError):
+            b.verify_release(release)
+        sidecar_handles = [cf for cf in opened if cf.label == sidecar_path.name]
+        assert len(sidecar_handles) >= 1
+        for cf in sidecar_handles:
+            assert cf.served_bytes <= cap + 1
+
+    # -- [R1](c) 항목 파일 해싱(tar.gz/COMPATIBILITY.md): served ≤ cap+1 --
+
+    def test_item_file_hashing_served_bytes_bounded_by_cap(self, release, monkeypatch):
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        compat = release / "localcrab-plugin-1.0.0.COMPATIBILITY.md"
+        cap = archive.stat().st_size + 5000
+        compat.write_bytes(b"x" * (cap + 1000))
+        _recompute_release(release, "1.0.0")
+        monkeypatch.setattr(b, "_MAX_RELEASE_FILE_BYTES", cap)
+        opened = _install_open_regular_spy(monkeypatch)
+        with pytest.raises(b.BuildError) as exc_info:
+            b.verify_release(release)
+        assert (
+            "파일 크기가 허용 상한을 초과했다: localcrab-plugin-1.0.0.COMPATIBILITY.md"
+            in str(exc_info.value)
+        )
+        compat_handles = [cf for cf in opened if cf.label == compat.name]
+        assert len(compat_handles) == 1
+        assert compat_handles[0].served_bytes <= cap + 1
+
+    # -- [S1] 멤버 해싱 실도달: 다중 read, 각 요청 ≤ 청크 --
+
+    def test_member_hashing_genuinely_chunked_multiple_reads(self, release, monkeypatch):
+        """[S1] `_VERIFY_CHUNK_BYTES` 를 작게 고정하고, 전개 예산(32,768, 기본값) 안에
+        여유 있게 드는 멤버(10,000B)를 준비한다 -- [Z1] 논리 예산에 걸리지 않고 실제로
+        `_hash_chunked` 까지 도달하는 표본이다. `TarFile.extractfile` 반환 객체를 직접
+        계측해, 이 멤버가 정말 청크 단위로(다중 read, 각 요청 ≤ 청크) 소비되는지
+        확인한다 -- 통째 읽기 역변이(`read()` 무인자 1회)라면 calls==1 이고
+        `bounded_max_request` 가 None(UNBOUNDED) 이 되어 즉시 RED."""
+        archive = release / "localcrab-plugin-1.0.0.tar.gz"
+        sidecar_path = release / "localcrab-plugin.SHA256SUMS"
+        prefix = b._ARCHIVE_PREFIX
+        member_name = f"{prefix}mid.bin"
+        member_data = b"\x00" * 10_000
+        member_size = len(member_data)
+        _write_plain_tar_gz(archive, [(member_name, member_data)])
+        # 아카이브를 단일 멤버로 교체했으므로, 아카이브-사이드카 멤버 집합 대사가
+        # 걸리지 않도록 사이드카도 이 단일 멤버 기준으로 다시 쓴다(원래 사이드카는
+        # _fake_repo 의 실제 플러그인 파일 목록을 담고 있어 불일치가 난다).
+        _rewrite_release_file(sidecar_path, {"mid.bin": hashlib.sha256(member_data).hexdigest()})
+        _recompute_release(release, "1.0.0")
+        chunk = 1024
+        monkeypatch.setattr(b, "_VERIFY_CHUNK_BYTES", chunk)
+        opened = _install_extractfile_spy(monkeypatch)
+        b.verify_release(release)  # 예외 없어야 함(예산 안에 드는 멤버)
+        member_handles = [cf for cf in opened if cf.label == member_name]
+        assert len(member_handles) == 1
+        cf = member_handles[0]
+        expected_min_calls = -(-member_size // chunk)  # ceil(10000 / 1024) == 10
+        assert cf.calls >= expected_min_calls
+        assert cf.bounded_max_request is not None, (
+            "요청 크기가 UNBOUNDED 로 기록됨 -- 통째 읽기 역변이가 감지되어야 하는 지점"
+        )
+        assert cf.bounded_max_request <= chunk
+
+    # -- [R2]/[V2] 위협 모델 문구가 verify_release docstring 에 실재함을 단언 --
+
+    def test_verify_release_docstring_states_static_snapshot_threat_model(self):
+        doc = b.verify_release.__doc__ or ""
+        assert "정적" in doc
+        assert "스냅샷" in doc
 
 
 # ---------------------------------------------------------------------------

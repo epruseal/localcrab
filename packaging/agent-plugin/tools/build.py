@@ -125,6 +125,8 @@ def build(repo_root, out_dir) -> Path:
         sidecar_path = out_dir / "localcrab-plugin.SHA256SUMS"
         lines = []
         for rel in sorted(_relative_files(staged_root)):
+            # v13 [S3]: 자기 staged 산출물 -- SRC/STAGED_ALLOWLIST 로 크기 유계, verify 경로의
+            # 유계 읽기 규율(_open_regular/_read_all_limited 등) 비적용 사유.
             digest = hashlib.sha256((staged_root / rel).read_bytes()).hexdigest()
             lines.append(f"{digest}  {rel.as_posix()}")
         sidecar_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -277,6 +279,8 @@ def _deterministic_tar(staged_root: Path, archive_path: Path) -> None:
                 errors="strict",
             ) as tar:
                 for rel in rels:
+                    # v13 [S3]: 자기 staged 산출물 -- SRC/STAGED_ALLOWLIST 로 크기 유계, verify 경로의
+                    # 유계 읽기 규율(_open_regular/_read_all_limited 등) 비적용 사유.
                     data = (staged_root / rel).read_bytes()
                     info = tarfile.TarInfo(name=f"{_ARCHIVE_PREFIX}{rel.as_posix()}")
                     info.size = len(data)
@@ -329,6 +333,9 @@ def build_release(repo_root, out_dir) -> Path:
         sidecar_tmp = tmp_dir / "localcrab-plugin.SHA256SUMS"
 
         entries = sorted(
+            # v13 [S3]: 자기 산출물(archive_tmp/report_tmp/sidecar_tmp, 이 함수가 직전에 만든
+            # 것들) -- allowlist/직전 생성 경로로 크기 유계, verify 경로의 유계 읽기 규율
+            # 비적용 사유.
             (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
             for path in (archive_tmp, report_tmp, sidecar_tmp)
         )
