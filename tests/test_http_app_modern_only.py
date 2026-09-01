@@ -15,8 +15,8 @@ no legacy era, so its rejection of legacy-shaped or non-object traffic is a
 modern transport error and must carry the documented modern status mapping
 (validation faults 400; batch arrays and non-object bodies 400 + -32600;
 rejected notifications 400 with an empty body). The single-request JSON-RPC
-error envelopes are byte-identical to the dual configuration -- only the
-HTTP status differs.
+error envelopes are byte-identical to what the same modern-only configuration
+produced before this fix -- only the HTTP status changes.
 
 Fixtures/helpers are deliberately duplicated from tests/test_http_app_modern.py
 (same policy as that file states in its own docstring): this file owns the
@@ -40,6 +40,24 @@ MODERN_META = {
 }
 
 ALL_LEGACY = "2025-11-25,2025-06-18,2025-03-26,2024-11-05"
+
+# Exact envelope strings pinned byte-for-byte: the "envelope unchanged" claim
+# of #250 is only testable with full-dict equality (a partial-message check
+# would let id/field/message drift pass -- verification round F1).
+METADATA_REQUIRED_MSG = (
+    "Protocol version metadata is required "
+    "('io.modelcontextprotocol/protocolVersion' in params._meta); "
+    "supported: 2026-07-28"
+)
+BATCH_REJECTED_MSG = (
+    "JSON-RPC batch is a legacy-only extension; modern (2026-07-28) "
+    "requests must be sent individually"
+)
+NON_OBJECT_BODY_MSG = "Invalid Request: the request body must be a JSON object"
+
+
+def _error_envelope(req_id, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +208,12 @@ class TestModernOnlyTransportErrors:
             headers=_auth(secret),
         )
         assert resp.status_code == 400
-        error = resp.json()["error"]
-        assert error["code"] == -32602
-        assert "initialize handshake is disabled" in error["message"]
+        assert resp.json() == _error_envelope(
+            1,
+            -32602,
+            "The initialize handshake is disabled on this server; send "
+            "per-request _meta with a supported protocol version: 2026-07-28",
+        )
 
     def test_legacy_tools_list_400_envelope_unchanged(self, client_modern_only, bootstrapped):
         _, _, secret = bootstrapped
@@ -202,9 +223,7 @@ class TestModernOnlyTransportErrors:
             headers=_auth(secret),
         )
         assert resp.status_code == 400
-        error = resp.json()["error"]
-        assert error["code"] == -32602
-        assert "Protocol version metadata is required" in error["message"]
+        assert resp.json() == _error_envelope(2, -32602, METADATA_REQUIRED_MSG)
 
     def test_legacy_shaped_unknown_method_400_keeps_minus_32602(
         self, client_modern_only, bootstrapped
@@ -219,9 +238,7 @@ class TestModernOnlyTransportErrors:
             headers=_auth(secret),
         )
         assert resp.status_code == 400
-        error = resp.json()["error"]
-        assert error["code"] == -32602
-        assert "Protocol version metadata is required" in error["message"]
+        assert resp.json() == _error_envelope(3, -32602, METADATA_REQUIRED_MSG)
 
     def test_non_string_method_400_envelope_unchanged(self, client_modern_only, bootstrapped):
         _, _, secret = bootstrapped
@@ -231,9 +248,7 @@ class TestModernOnlyTransportErrors:
             headers=_auth(secret),
         )
         assert resp.status_code == 400
-        error = resp.json()["error"]
-        assert error["code"] == -32600
-        assert error["message"] == "Missing or invalid 'method'."
+        assert resp.json() == _error_envelope(4, -32600, "Missing or invalid 'method'.")
 
     @pytest.mark.parametrize(
         "batch",
@@ -255,11 +270,7 @@ class TestModernOnlyTransportErrors:
         _, _, secret = bootstrapped
         resp = client_modern_only.post("/mcp", json=batch, headers=_auth(secret))
         assert resp.status_code == 400
-        payload = resp.json()
-        assert isinstance(payload, dict)
-        assert payload["id"] is None
-        assert payload["error"]["code"] == -32600
-        assert "legacy-only extension" in payload["error"]["message"]
+        assert resp.json() == _error_envelope(None, -32600, BATCH_REJECTED_MSG)
 
     def test_legacy_shaped_notification_400_empty_body(self, client_modern_only, bootstrapped):
         """handle_request rightly stays silent for notifications, so the
@@ -289,10 +300,7 @@ class TestModernOnlyTransportErrors:
             headers={**_auth(secret), "Content-Type": "application/json"},
         )
         assert resp.status_code == 400
-        payload = resp.json()
-        assert isinstance(payload, dict)
-        assert payload["id"] is None
-        assert payload["error"]["code"] == -32600
+        assert resp.json() == _error_envelope(None, -32600, NON_OBJECT_BODY_MSG)
 
 
 # ---------------------------------------------------------------------------
