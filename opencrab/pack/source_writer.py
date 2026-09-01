@@ -25,7 +25,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
+from opencrab.common.graph_identity import (
+    GraphSchemaMigrationRequired,
+    GraphWriteUnavailable,
+)
 from opencrab.common.pack_tags import canonicalize_pack_alias
+from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
     authorize,
@@ -41,9 +46,71 @@ from opencrab.pack.write_gate import (
 # source path gets it.
 _DEFAULT_SPACE = "evidence"
 
+# The graph shape a source is materialised as (#74). Pinned rather than derived
+# from the caller's ``metadata["space"]``: ``TextUnit`` exists only in the
+# ``evidence`` space in the grammar manifest, and ``pack_ingest``'s
+# ``text_as_node=True`` branch already hardcodes exactly this pair. The vector
+# and doc rows keep whatever space the caller asked for -- that is the source's
+# own space, and it is a different axis from the node's.
+_SOURCE_NODE_SPACE = "evidence"
+_SOURCE_NODE_TYPE = "TextUnit"
+
+# Graph statuses this module assigns itself, i.e. not copied from a builder
+# receipt. ``store_write_succeeded`` recognises neither as success, which is
+# what both of them mean.
+_GRAPH_SKIPPED_FORK = "skipped (raw copy)"
+_GRAPH_SKIPPED_LONG_ID = "skipped (id exceeds the node id limit after fork remap)"
+_SKIPPED_GRAPH_FAILED = "skipped (graph write failed)"
+
 
 def _docs_available(docs: Any) -> bool:
     return bool(getattr(docs, "available", False))
+
+
+def _existing_node_rows(graph: Any, source_id: str) -> list[dict[str, Any]] | None:
+    """Every graph row for ``source_id``, or ``None`` when that cannot be told.
+
+    ``None`` is "cannot tell", NOT "no node" -- the distinction is the whole
+    point. ``get_nodes_by_id`` calls ``_require_available()`` and returns ``[]``
+    only on a genuine no-match, so an unavailable store raises rather than
+    answering. ``lookup_node_type`` and ``get_node_digest`` are both unusable
+    here for the opposite reason: the first returns ``None`` on an unavailable
+    store AND swallows transient query errors, the second returns ``None`` for a
+    row whose digest cannot be computed. Both collapse "absent" and "cannot say"
+    into one value, and treating "cannot say" as "absent" is how the carve-out
+    below would silently start writing graph-less sources again.
+
+    The ``isinstance`` check mirrors ``write_gate._check_by_id_axis``, which
+    guards the same method the same way: a double returning ``None``/``{}``/
+    ``()`` must not read as an empty result.
+    """
+    if graph is None or not getattr(graph, "available", False):
+        return None
+    method = getattr(graph, "get_nodes_by_id", None)
+    if method is None:
+        return None
+    try:
+        rows = method(source_id)
+    except Exception:  # noqa: BLE001 -- any failure means "cannot tell"
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def _node_digest(graph: Any, source_id: str) -> str | None:
+    """CAS token for an existing ``TextUnit`` row, or ``None``.
+
+    ``None`` sends ``add_node`` down its plain-insert path, where the store's
+    own digest comparison rejects a mismatch. That is the correct disposition
+    for every ``None`` case here: no row, a row of another type, a backend
+    without the method, or a read that failed.
+    """
+    getter = getattr(graph, "get_node_digest", None)
+    if getter is None:
+        return None
+    try:
+        return getter(source_id, node_type=_SOURCE_NODE_TYPE) or None
+    except Exception:  # noqa: BLE001 -- see docstring
+        return None
 
 
 def write_source(
@@ -52,6 +119,7 @@ def write_source(
     docs: Any,
     vector: Any,
     *,
+    graph: Any,
     text: str,
     source_id: str,
     metadata: Mapping[str, Any] | None = None,
@@ -59,8 +127,9 @@ def write_source(
     origin: Literal["client", "server"] = "client",
     fork_copy: bool = False,
     write_vector: bool = True,
+    write_graph: bool = True,
 ) -> dict[str, Any]:
-    """Write one source's doc row and its vector under one ownership stamp.
+    """Write one source's graph node, doc row and vector under one ownership stamp.
 
     Returns a receipt shaped like the builder's: ``{"source_id", "metadata",
     "stores": {"documents": ..., "chromadb": ...}}``. *Store* failures are
@@ -139,6 +208,26 @@ def write_source(
 
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}
 
+    # --- graph leg (#74), FIRST ---------------------------------------------
+    # The graph is the system of record for a node, exactly as
+    # `OntologyBuilder.add_node` already states for its own writes: a doc/vector
+    # row with no graph node is invisible to every graph-based read, which is
+    # the defect this leg closes. So it leads, and when it does not land the
+    # doc and vector legs do not run at all.
+    #
+    # It also has to run before the doc row for a second reason: the builder's
+    # ownership guard RAISES. Behind the doc write, a rejected node would leave
+    # a committed doc row behind a 422 -- the exact shape this module's
+    # docstring already had to walk back once for the alias check.
+    if not _graph_leg(
+        receipt, graph, docs, sql, vector,
+        text=text, source_id=source_id, meta=meta, pack_id=pack_id,
+        origin=origin, fork_copy=fork_copy, write_graph=write_graph,
+    ):
+        receipt["stores"]["documents"] = _SKIPPED_GRAPH_FAILED
+        receipt["stores"]["chromadb"] = _SKIPPED_GRAPH_FAILED
+        return receipt
+
     doc_failed = False
     if _docs_available(docs):
         try:
@@ -175,6 +264,126 @@ def write_source(
     if "vector_id" in vector_result:
         receipt["vector_id"] = vector_result["vector_id"]
     return receipt
+
+
+def _graph_leg(
+    receipt: dict[str, Any],
+    graph: Any,
+    docs: Any,
+    sql: Any,
+    vector: Any,
+    *,
+    text: str,
+    source_id: str,
+    meta: dict[str, Any],
+    pack_id: str,
+    origin: str,
+    fork_copy: bool,
+    write_graph: bool,
+) -> bool:
+    """Materialise the source as an ``evidence/TextUnit`` node.
+
+    Returns True when the doc and vector legs may proceed. That is NOT the same
+    as "a node was written": the two opt-outs below are deliberate skips, not
+    failures, and both let the source through.
+
+    Rejections raise, matching this module's existing contract and running
+    before any store is touched:
+
+    - ``ValueError`` (grammar, schema, ownership-tag, foreign identity)
+    - ``NodeIdentityConflict`` (the id is a different logical node, or a CAS
+      raced) -- REST maps it to 422 exactly as ``/api/nodes`` already does
+    - the authorization exceptions, which are NEVER absorbed: the builder
+      re-runs ``authorize``, and a registry that went down between the two
+      checks raises a bare ``RuntimeError`` from ``write_gate.authorize``.
+
+    Only ``GraphSchemaMigrationRequired`` and ``GraphWriteUnavailable`` are
+    turned into a receipt status. Catching by a wider class (``RuntimeError``,
+    ``Exception``) would swallow that registry failure and the identity
+    conflict along with it. The narrow pair is safe because neither is an
+    ancestor of ``PackNotFoundError`` (LookupError), ``PackForbiddenError``
+    (PermissionError), ``ValueError`` or ``NodeIdentityConflict`` -- it is the
+    inheritance graph that makes the boundary hold, not a claim that the set of
+    exceptions escaping ``add_node`` is finite (it is not).
+    """
+    from opencrab.ontology.builder import OntologyBuilder, store_write_succeeded
+
+    if not write_graph:
+        # `pack_fork` copies nodes itself, before the sources (its step 14 vs
+        # step 16), and with the ORIGINAL remapped properties. Writing the node
+        # again from here would overwrite that copy with a freshly built one.
+        # Recorded rather than silently omitted, mirroring `add_node`'s own
+        # `write_vector=False` wording.
+        receipt["stores"]["graph"] = _GRAPH_SKIPPED_FORK
+        return True
+
+    rows = _existing_node_rows(graph, source_id)
+
+    if len(source_id) > SOURCE_NODE_ID_BUDGET and rows == []:
+        # An id past the budget cannot survive as a node id through a fork
+        # remap, and tests/test_pack_fork.py's T77 pins that a source-only id
+        # of that length must NOT make a pack unforkable. So do not CREATE a
+        # node for it.
+        #
+        # The `rows == []` half is not decoration. The carve-out is "do not
+        # create", not "do not look": a node for a long id can already exist
+        # (pack_ingest's text_as_node=True has no length check, and a fork of a
+        # budget-length source produces one). Skipping the update there would
+        # leave the graph on the old text while the doc row moved to the new
+        # one -- the divergence this whole leg exists to prevent. `_existing_
+        # node_rows` returns None for "cannot tell", and `None == []` is False,
+        # so every uncertain answer falls through to the normal path and fails
+        # closed there.
+        receipt["stores"]["graph"] = _GRAPH_SKIPPED_LONG_ID
+        return True
+
+    node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
+    for key in ("title", "source"):
+        if meta.get(key):
+            node_props[key] = meta[key]
+
+    # Properties are REPLACED, not merged (design v13 §4.2). The node is a
+    # projection of the source, so it mirrors the latest source write: a
+    # re-ingest whose metadata has no `title` leaves a node with no `title`.
+    # Merging was tried and withdrawn -- it needs a second read for the base,
+    # and a base read separated from the CAS token read is a lost update.
+    builder = OntologyBuilder(graph, docs, sql, vec=vector)
+    try:
+        node_receipt = builder.add_node(
+            space=_SOURCE_NODE_SPACE,
+            node_type=_SOURCE_NODE_TYPE,
+            node_id=source_id,
+            properties=node_props,
+            pack_id=pack_id,
+            origin=origin,
+            fork_copy=fork_copy,
+            # The vector for this id is written once, by `hybrid.ingest` below,
+            # with the SOURCE's metadata (user_id/source_id/space). The
+            # builder's own vector leg would overwrite that same id with the
+            # node summary text and node-shaped metadata. `pack_ingest`'s
+            # text_as_node=True branch makes the mirror-image call for the same
+            # reason.
+            write_vector=False,
+            _expected_current_digest=_node_digest(graph, source_id) if rows else None,
+        )
+    except (GraphSchemaMigrationRequired, GraphWriteUnavailable) as exc:
+        # Operational failure of the system of record -- reported, not raised,
+        # so the #158 "callers read the receipt" contract keeps holding. A
+        # store that is merely legacy/partial or has lost its write capability
+        # is a deployment state, not a client error.
+        receipt["stores"]["graph"] = f"error: {exc}"
+        return False
+
+    node_stores = node_receipt.get("stores") or {}
+    for key, status in node_stores.items():
+        # The builder's vector leg is off, and its key would collide with
+        # nothing here anyway -- but reporting "skipped (raw copy)" under a
+        # name this receipt does not otherwise use would just be noise. Every
+        # other key is meaningful: `graph`, `docs` (the doc_nodes row, NOT this
+        # module's `documents`, which is the doc_sources row) and `sql`.
+        if key != "vector":
+            receipt["stores"][key] = status
+    return store_write_succeeded(node_stores, "graph")
 
 
 def _principal() -> Any:

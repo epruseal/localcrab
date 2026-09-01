@@ -76,11 +76,11 @@ def stack(tmp_path):
 
 
 def _write(stack, *, text="본문", source_id="src-1", metadata=None,
-           pack_id="pack-a", principal=ALICE, **kw) -> dict[str, Any]:
+           pack_id="pack-a", principal=ALICE, graph=None, **kw) -> dict[str, Any]:
     with principal_scope(principal):
         return write_source(
             stack["sql"], stack["hybrid"], stack["docs"], stack["vector"],
-            graph=stack["graph"],
+            graph=stack["graph"] if graph is None else graph,
             text=text, source_id=source_id, metadata=metadata, pack_id=pack_id,
             **kw,
         )
@@ -184,10 +184,15 @@ def test_a_graph_only_foreign_node_is_refused_before_any_write(stack):
     가 이미 거절하므로 검출력이 없다. 그래프에만 심는 것이 이 테스트의 요점이다.
     """
     with principal_scope(BOB):
+        # write_vector=False 로 심어야 "그래프에만 있는" 상태가 된다. 벡터까지
+        # 쓰면 기존 `source_identity_conflict` 의 벡터 축이 먼저 거절해 새
+        # 그래프 축의 검출력이 사라진다.
         stack["builder"].add_node(
             space="evidence", node_type="TextUnit", node_id="src-foreign",
             properties={"pack_id": "pack-b", "text": "남의 것"}, pack_id="pack-b",
+            write_vector=False,
         )
+    assert stack["vector"].get_by_id("src-foreign") is None, "심기 자체가 그래프 전용이어야 한다"
 
     with pytest.raises(ValueError, match="already attributed"):
         _write(stack, source_id="src-foreign")
@@ -326,10 +331,17 @@ class _NonListProbe:
 
 @pytest.mark.parametrize("bad", [None, {}, ()])
 def test_a_probe_that_cannot_say_no_does_not_trigger_the_carve_out(stack, bad):
+    """카브아웃을 타면 doc/벡터가 쓰이고 그래프는 비어 결함이 재생된다.
+
+    카브아웃을 타지 않으면 이 더블은 신원 프로브를 답하지 못하므로
+    `CONFLICT_UNVERIFIABLE` 로 fail-closed 거절된다. 어느 쪽인지가
+    `if not rows:` 구현과 `isinstance(rows, list)` 구현을 가른다.
+    """
     over = "D" * (_budget() + 1)
-    receipt = _write(stack, source_id=over, graph=_NonListProbe(bad))
-    assert "skipped (id exceeds" not in str(receipt["stores"].get("graph")), receipt["stores"]
+    with pytest.raises(ValueError, match="cannot verify"):
+        _write(stack, source_id=over, graph=_NonListProbe(bad))
     assert stack["docs"].get_source(over) is None
+    assert stack["vector"].get_by_id(over) is None
 
 
 # ---------------------------------------------------------------------------

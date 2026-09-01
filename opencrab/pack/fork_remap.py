@@ -90,6 +90,23 @@ FORK_SALT_BYTES = 6
 # 관례적으로 쓰이지 않아 재매핑된 id 와 원본 id 를 눈으로도 구분할 수 있다.
 REMAP_SEP = "~"
 
+# 레지스트리(`ontology_nodes`)의 `node_id` 열은 VARCHAR(256) 이다. 이 상수는
+# fork.py 의 노드 길이 검사와 source_writer.py 의 노드화 예산이 같은 근거를
+# 쓰도록 여기 한 곳에 둔다 — 두 곳에 256 을 따로 적으면 언젠가 갈린다.
+NODE_ID_COLUMN_LIMIT = 256
+
+# 소스를 그래프 노드로 만들 수 있는 id 길이의 상한(issue #74). fork 는 콘텐츠
+# id 에 `{REMAP_SEP}{salt}` 를 붙이므로, 지금 딱 맞는 id 도 한 번 fork 하면
+# 열을 넘긴다. 그래서 상한은 열 크기가 아니라 **재매핑 뒤에도 들어가는 크기**다.
+#
+# 이 예산을 넘는 source_id 에는 노드를 새로 만들지 않는다. source_id 는 doc
+# 스토어의 text 열과 벡터의 TEXT id 에 닿을 뿐 길이 제약이 없고(그래서
+# tests/test_pack_fork.py 의 T77 이 "장문 source-only id 를 가진 팩의 fork 는
+# 거절되면 안 된다"를 계약으로 고정한다), 무조건 노드로 만들면 그 계약이
+# 깨진다. 상수 대신 `remap_id` 의 실제 형상에서 파생시켜, 재매핑 모양이 바뀌면
+# 이 경계도 함께 움직이게 한다.
+SOURCE_NODE_ID_BUDGET = NODE_ID_COLUMN_LIMIT - len(REMAP_SEP) - FORK_SALT_BYTES * 2
+
 # 규칙 3 의 순회 도메인(정본). node/edge properties, doc 소스 행, 벡터 metadata
 # 전부에서 같은 다섯 키만 본다 — 이 밖의 키(`parent_id` 등)는 설계상 보장 범위
 # 밖이고 unverified 로만 집계된다(§4-A "보장 범위의 명시적 한계").

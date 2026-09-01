@@ -570,12 +570,19 @@ def ingest_text(
             with principal_scope(auth.principal):
                 receipt = write_source(
                     ctx.sql, ctx.hybrid, ctx.docs, ctx.vector,
+                    graph=ctx.graph,
                     text=payload.text, source_id=source_id,
                     metadata=metadata, pack_id=target_pack_id,
                 )
-        except ValueError as exc:
+        except (ValueError, NodeIdentityConflict) as exc:
             # Ownership-tag invariant violation (#171) — a client error, not a 500.
             # Same disposition the node/edge endpoints already give ValueError.
+            #
+            # NodeIdentityConflict joined this catch with #74: the source is now
+            # materialised as a graph node, so the same id-already-taken
+            # rejection /api/nodes has always mapped to 422 is reachable here
+            # too. It is a RuntimeError subclass, so without this it would be a
+            # 500 for what is squarely a client error.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         # Adapter: keep the pre-#148 envelope (source_id/stores/vector_id at

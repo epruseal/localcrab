@@ -528,6 +528,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
                     pass
                 receipt = write_source(
                     stores.sql, hybrid, mongo, chroma,
+                    graph=neo4j,
                     text=text, source_id=source_id,
                     metadata=meta, pack_id=target_pack_id,
                 )

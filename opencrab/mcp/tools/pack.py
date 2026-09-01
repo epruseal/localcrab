@@ -239,6 +239,11 @@ def _ingest_into_pack(
         When False, the legacy path is used: vector-only embedding via
         ``hybrid.ingest`` + doc_sources record via ``mongo.upsert_source``.
     """
+    from opencrab.common.graph_identity import (
+        GraphSchemaMigrationRequired,
+        GraphWriteUnavailable,
+        NodeIdentityConflict,
+    )
     from opencrab.grammar.validator import validate_edge, validate_node
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
@@ -475,14 +480,52 @@ def _ingest_into_pack(
             else:
                 from opencrab.pack.source_writer import write_source
 
-                write_result = write_source(
-                    ctx["sql"], ctx["hybrid"], ctx["mongo"], ctx["chroma"],
-                    text=text, source_id=source_id,
-                    metadata=meta, pack_id=pack_id,
-                )
-                stores.update(write_result.get("stores", {}))
+                # #74: only these four become a response. NOT `except
+                # Exception` like the evidence branch above -- write_source now
+                # runs the builder, which re-runs `authorize`, and a registry
+                # that went down between the two checks raises a bare
+                # RuntimeError. Absorbing that into `node_errors` would report
+                # an authorization failure as a partial success. Anything
+                # outside this tuple propagates to the dispatcher on purpose.
+                #
+                # The two graph types are defensive only: write_source turns
+                # them into a `stores["graph"]` failure itself, so in the normal
+                # flow they never arrive here.
+                try:
+                    write_result = write_source(
+                        ctx["sql"], ctx["hybrid"], ctx["mongo"], ctx["chroma"],
+                        graph=ctx["neo4j"],
+                        text=text, source_id=source_id,
+                        metadata=meta, pack_id=pack_id,
+                    )
+                except (
+                    ValueError,
+                    NodeIdentityConflict,
+                    GraphSchemaMigrationRequired,
+                    GraphWriteUnavailable,
+                ) as exc:
+                    node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
+                else:
+                    stores.update(write_result.get("stores", {}))
 
-                text_ingested = True
+                    # #74: the legacy branch now materialises the same node the
+                    # text_as_node=True branch does, so the response must stop
+                    # reporting zero. Gated on POSITIVE graph confirmation --
+                    # `store_write_failures` treats neither the long-id
+                    # carve-out's "skipped (...)" nor a missing key as a
+                    # failure, so a negative-list check alone would count a node
+                    # that was never written. The second half mirrors the
+                    # evidence branch's own "no store failed" rule so the two
+                    # `added_nodes` contributions in one response mean the same
+                    # thing.
+                    write_stores = write_result.get("stores") or {}
+                    if store_write_succeeded(write_stores, "graph") and not (
+                        store_write_failures(write_stores)
+                    ):
+                        evidence_node = source_id
+                        added_nodes += 1
+
+                    text_ingested = True
 
     # #66 codex re-review, findings [4]/[6]: the billing gate must be
     # provably driven by store_write_succeeded() ALONE, not by
@@ -498,7 +541,18 @@ def _ingest_into_pack(
     # (see that function's docstring in builder.py for the full success-value
     # inventory this is based on, and why "unavailable" alone must not bill).
     text_stores_failed = bool(store_write_failures(stores))  # for `status` below only
-    legacy_text_landed = text_ingested and not text_as_node and store_write_succeeded(stores)
+    # #74 pins the two keys this check has always actually seen. Before the
+    # graph leg existed, `stores` on this branch held exactly `documents` and
+    # `chromadb`, so the key-less form and this one are the SAME predicate
+    # today -- the change preserves the gate rather than altering it. Written
+    # out because the graph leg now merges `graph`/`docs`/`sql` into the same
+    # map, and a key-less "any store came back ok" would start billing a call
+    # whose doc_sources row failed but whose graph node landed. Money gates do
+    # not get to change as a side effect.
+    legacy_text_landed = text_ingested and not text_as_node and (
+        store_write_succeeded(stores, "documents")
+        or store_write_succeeded(stores, "chromadb")
+    )
     wrote_anything = billable_write or legacy_text_landed
     if wrote_anything:
         billing_result = ctx["billing"].on_ingest(tenant_id, subject_id, source_id or pack_id)
