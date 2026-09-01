@@ -32,7 +32,7 @@ def schema_pack_list() -> dict[str, Any]:
 @tool(
     "schema_pack_install",
     {
-        "description": "Install a domain schema pack by generating type YAML files in schemas/types/.",
+        "description": "Install a domain schema pack by generating type YAML files in schemas/types/. The pack name must be a single path component; anything else reads as pack not found.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -55,6 +55,10 @@ def schema_pack_install(name: str) -> dict[str, Any]:
 
     Existing user-customised schemas are NOT overwritten.
 
+    Returns ``{"error": ...}`` without writing anything when *name* is not a
+    single path component, or when the pack manifest declares a type name
+    that is not one (#109) -- see ``opencrab.schemas.pack_registry``.
+
     Parameters
     ----------
     name:
@@ -68,7 +72,7 @@ def schema_pack_install(name: str) -> dict[str, Any]:
 @tool(
     "schema_pack_uninstall",
     {
-        "description": "Remove auto-generated type schemas for a pack. User-customised schemas are kept unless force=true.",
+        "description": "Remove auto-generated type schemas for a pack. User-customised schemas are kept unless force=true. Nothing outside schemas/types/ is ever removed, and force=true does not change that.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -88,6 +92,12 @@ def schema_pack_uninstall(name: str, force: bool = False) -> dict[str, Any]:
     Remove auto-generated type schemas for a pack.
 
     User-customised schemas (no pack: header) are kept unless force=True.
+
+    Removal never leaves the type directory (#109): an unsafe pack name reads
+    as not found, a manifest with an unsafe type name is refused whole
+    without deleting anything, and a path that cannot be shown to resolve
+    inside the type directory is kept rather than removed -- ``force=True``
+    overrides the user-customised check, not the containment one.
     """
     from opencrab.schemas.pack_registry import uninstall_pack
 

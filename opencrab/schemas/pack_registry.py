@@ -12,6 +12,17 @@ Pack lifecycle:
   get_pack(name)         — load pack manifest
   install_pack(name)     — generate type schemas from pack manifest
   uninstall_pack(name)   — remove generated type schemas (with safety check)
+
+Naming contract (#109). A pack name, and every type name in a manifest,
+must be a single path component -- no path separators (either flavour),
+not "." or "..", not absolute, no NUL. Names are joined onto a directory
+to form a file path, and ``pathlib``'s ``/`` neither resolves ``..`` nor
+rejects an absolute right-hand operand, so an unchecked name addresses a
+file outside the directory it was supposed to name. An unsafe pack name
+reads as "pack not found"; a manifest carrying an unsafe type name is
+refused whole, before anything is created or deleted. See
+``opencrab.schemas.loader.safe_schema_name`` and ``resolves_inside`` for
+the two checks and for what they deliberately do not defend against.
 """
 
 from __future__ import annotations
