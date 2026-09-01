@@ -159,7 +159,9 @@ def verify_evidence(
     # 파싱 결과가 아니라 **원문 유무**로 판정한다. 파싱된 프레임으로 판정하면
     # 잘린 비 JSON 바이트만 남은 캡처가 프레임 0건이 되어 "기록기 없음" 으로
     # 새어 나간다. 어느 방향이든 바이트가 있으면 기록기가 개입한 것이다.
-    boundary_recorded = bool(client_to_server.strip()) or bool(server_to_client.strip())
+    # strip() 을 쓰면 공백·개행만 기록된 캡처가 다시 "기록기 없음" 으로 샌다.
+    # 바이트가 하나라도 있으면 기록기가 개입한 것이다.
+    boundary_recorded = bool(client_to_server) or bool(server_to_client)
 
     # --- provider 측: 드라이버가 난수를 인자로 실어 보냈는가 ---
     provider_events = []

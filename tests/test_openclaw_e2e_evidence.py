@@ -235,11 +235,15 @@ def test_receipt_binding_does_not_collapse_when_both_ids_are_absent():
     assert "provider_received_nonce_result" in _failed(verdict)
 
 
-@pytest.mark.parametrize("garbage", ["truncated-non-json", "{partial", "\x00\x01"])
+@pytest.mark.parametrize(
+    "garbage",
+    ["truncated-non-json", "{partial", "\x00\x01", " ", "\n\n", "\t"],
+)
 def test_unparseable_boundary_bytes_still_count_as_recorded(garbage):
     """파싱되지 않는 바이트만 남은 캡처도 "기록기 없음" 으로 강등되지 않는다.
 
-    프레임 수로 판정하면 잘린 캡처가 프레임 0건이 되어 새어 나간다.
+    프레임 수로 판정하면 잘린 캡처가 프레임 0건이 되어 새어 나간다. 공백만 남은
+    캡처도 마찬가지다 -- `strip()` 을 끼우면 그 경로가 다시 열린다.
     """
     data = _load() | {"client_to_server": "", "server_to_client": garbage, "expect_boundary": False}
     verdict = verify_evidence(**data)
