@@ -131,13 +131,26 @@ def verify_evidence(
     client_to_server: str,
     server_to_client: str,
     provider_log: str,
+    expect_boundary: bool = True,
 ) -> Verdict:
     """네 산출물을 대사해 난수가 경계를 실제로 건넜는지 판정한다.
 
     `client_to_server`/`server_to_client` 는 경계 기록기가 남긴 원문이고,
-    `provider_log` 는 드라이버가 남긴 JSONL 이다. 기록기가 없던 실행에서는
-    앞의 둘이 빈 문자열이며, 그 경우 경계 관련 검사는 건너뛴다 -- 대신
-    `check_persisted()` 의 부작용 확인이 인과를 담당한다.
+    `provider_log` 는 드라이버가 남긴 JSONL 이다.
+
+    `expect_boundary` 는 **호출자가 기록기를 태웠는지**를 말한다. 이 값을 받지
+    않으면 판정이 fail-open 이 된다: 기록기를 태웠는데 PATH 해석이 어긋나 아무
+    바이트도 안 잡힌 실행과, 애초에 기록기를 뺀 실행이 구별되지 않아 전자가
+    조용히 통과한다. 태웠다고 말했는데 원문이 없으면 실패다.
+
+    두 모드는 증명하는 것이 다르며 서로를 대체하지 않는다.
+
+    - 기록기 활성: 클라이언트가 실제 `tools/call` 프레임을 보냈음을 보인다.
+    - 기록기 비활성(`expect_boundary=False`): 기동 경로에 하네스 코드가 없는
+      상태에서 부작용이 생겼음을 보인다. 클라이언트가 상태를 바꿨다는 것까지만
+      증명하고, 그 수단이 MCP 였다는 것은 증명하지 않는다 -- 클라이언트가 MCP
+      아닌 경로로 같은 스토어를 바꿨을 가능성이 남는다. 그 가능성은 기록기
+      활성 실행이 닫는다. **두 모드를 모두 돌려야 결론이 닫힌다.**
     """
     verdict = Verdict()
     outbound = _parse_frames(client_to_server)
@@ -167,6 +180,23 @@ def verify_evidence(
         f"난수를 인자로 실은 assistant tool call {len(nonce_calls)}건 (기대 1건)",
     )
 
+    # 난수가 문자열 어딘가에 있는 것만으로는 부족하다. 파싱한 인자의 노드 id 이고
+    # 그 호출이 변경 연산이어야 한다. 그래야 "정적 도구만 불렀다"가 걸러진다.
+    bound = False
+    detail = "난수를 실은 호출이 없다"
+    if len(nonce_calls) == 1:
+        call = nonce_calls[0]
+        try:
+            parsed = json.loads(call.get("args") or "{}")
+        except ValueError:
+            parsed = {}
+        name_ok = match_tool([call.get("tool") or ""], MUTATING_TOOL) is not None
+        arg_ok = parsed.get("node_id") == nonce
+        bound = name_ok and arg_ok
+        detail = (f"도구={call.get('tool')!r} (변경 연산 여부 {name_ok}), "
+                  f"파싱된 node_id 가 난수와 일치 {arg_ok}")
+    verdict.add("provider_call_is_the_mutating_tool", bound, detail)
+
     # --- provider 측: 도구 결과가 난수를 담아 되돌아왔는가 ---
     tool_msgs = []
     for e in provider_events:
@@ -179,19 +209,28 @@ def verify_evidence(
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
             tool_msgs.append(content)
+    hits = sum(1 for c in tool_msgs if nonce in c)
     verdict.add(
         "provider_received_nonce_result",
-        any(nonce in c for c in tool_msgs),
-        f"난수를 담은 role=tool 메시지 {sum(1 for c in tool_msgs if nonce in c)}건 (기대 1건 이상)",
+        hits >= 1,
+        f"난수를 담은 role=tool 메시지 {hits}건 (기대 1건 이상, 전체 {len(tool_msgs)}건)",
     )
 
     if not boundary_recorded:
         verdict.add(
-            "boundary_recorder_absent",
-            True,
-            "경계 기록기 없이 실행됐다 -- 인과는 check_persisted() 의 부작용 확인이 담당한다",
+            "boundary_recorded_as_expected",
+            not expect_boundary,
+            "기록기를 태웠다고 했는데 경계 원문이 비었다 -- 기록기가 개입하지 못했다"
+            if expect_boundary
+            else "기록기 없이 실행됐다. 이 모드는 클라이언트가 상태를 바꿨음까지만 "
+                 "보인다 -- MCP 를 썼다는 증명은 기록기 활성 실행이 담당한다",
         )
         return verdict
+    verdict.add(
+        "boundary_recorded_as_expected",
+        True,
+        f"경계 원문 {len(outbound)}프레임 관측",
+    )
 
     # --- 경계: 난수를 실은 tools/call 프레임이 실재하는가 ---
     nonce_frames = [
@@ -231,6 +270,11 @@ def verify_evidence(
         bool(called_name) and called_name in advertised,
         f"호출한 도구 {called_name!r} 가 tools/list 광고 {len(advertised)}개 안에 있는가",
     )
+    verdict.add(
+        "boundary_call_is_the_mutating_tool",
+        bool(called_name) and match_tool([called_name], MUTATING_TOOL) is not None,
+        f"경계에서 난수를 실어 부른 도구 {called_name!r} 가 변경 연산인가",
+    )
 
     return verdict
 
@@ -256,6 +300,10 @@ OUT = {record_dir!r}
 
 
 def pump(src, dst, log_path):
+    # 1바이트씩 읽는다. 프레임 경계를 몰라도 되고 버퍼링으로 순서가 뒤바뀌지
+    # 않는다는 것이 이 단순화의 값이다. 대가는 바이트 수만큼의 syscall 이며,
+    # 로컬 stdio 한 세션 규모에서는 문제되지 않는다. 처리량이 문제가 되면
+    # 프레임 경계를 보존하는 청크 단위 tee 로 올린다.
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         while True:
@@ -285,7 +333,10 @@ threads = [
 for t in threads:
     t.start()
 rc = proc.wait()
-threads[1].join(timeout=5)
+# 양방향 모두 회수한다. 서버->클라이언트만 join 하면 클라이언트->서버 말미
+# 바이트가 잘려 부분 캡처가 남는다.
+for t in threads:
+    t.join(timeout=5)
 sys.exit(rc)
 '''
 

@@ -1,18 +1,20 @@
 """#249: 실 클라이언트 종단 검증 하네스의 **증거 판정기** 회귀 테스트.
 
-하네스 전체는 실 OpenClaw 설치와 node 런타임을 요구해 CI 에서 돌지 않는다.
-그러나 판정기 `verify_evidence()` 는 순수 함수이므로, 실제 실행에서 캡처한
-픽스처를 먹여 CI 에서 회귀를 잡을 수 있다.
+하네스 전체는 실 클라이언트 설치와 node 런타임을 요구해 CI 에서 돌지 않는다.
+판정기 `verify_evidence()` 는 순수 함수이므로 CI 에서 회귀를 잡을 수 있다.
 
-`tests/fixtures/openclaw_e2e/` 의 세 파일은 실 OpenClaw 2026.8.1 실행에서
-그대로 캡처한 것이다(난수만 고정값으로 치환하고, 정적 manifest 본문과 무관한
-도구 목록은 크기를 줄였다). 판정기가 무엇을 검출하는지는 **역변이**로 증명한다:
-각 산출물에서 난수를 한 번씩 훼손하면 대응하는 검사가 반드시 실패해야 한다.
-그렇지 않으면 그 검사는 공허하다.
+`tests/fixtures/openclaw_e2e/` 의 세 파일은 실 클라이언트 실행에서 캡처한 것이며,
+적용한 편집은 같은 디렉터리의 `make_fixtures.py` 가 정본이다(난수 치환, 스토어
+신원 식별자 치환, 도구 목록 축소, 난수 없는 긴 본문 절단 -- 그 넷뿐). 이벤트
+종류와 개수, JSON-RPC id 대응, 메시지 역할 구성은 줄이지 않았다.
+
+판정기가 무엇을 검출하는지는 **역변이**로 증명한다: 각 산출물을 한 번씩 훼손하면
+대응하는 검사가 반드시 실패해야 한다. 그렇지 않으면 그 검사는 공허하다.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -24,6 +26,8 @@ if str(_TOOLS_PARENT) not in sys.path:
     sys.path.insert(0, str(_TOOLS_PARENT))
 
 from tools.openclaw_e2e import (  # noqa: E402  (sys.path 삽입 후 의도된 임포트 순서)
+    MUTATING_TOOL,
+    PROBE_TOOL,
     match_tool,
     new_nonce,
     verify_evidence,
@@ -32,6 +36,17 @@ from tools.openclaw_e2e import (  # noqa: E402  (sys.path 삽입 후 의도된 �
 
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "openclaw_e2e"
 FIXTURE_NONCE = "e2e-nonce-0000000000000000"
+
+ALL_CHECKS = [
+    "provider_issued_nonce_call",
+    "provider_call_is_the_mutating_tool",
+    "provider_received_nonce_result",
+    "boundary_recorded_as_expected",
+    "boundary_tools_call_carries_nonce",
+    "boundary_response_echoes_nonce",
+    "called_tool_was_advertised",
+    "boundary_call_is_the_mutating_tool",
+]
 
 
 def _load() -> dict:
@@ -43,37 +58,59 @@ def _load() -> dict:
     }
 
 
+def _failed(verdict) -> set[str]:
+    return {c.name for c in verdict.checks if not c.passed}
+
+
 # --------------------------------------------------------------------------
 # 정상 경로
 # --------------------------------------------------------------------------
 
 
 def test_captured_run_passes_every_check():
-    """실제 실행에서 캡처한 증거는 전량 통과해야 한다."""
     verdict = verify_evidence(**_load())
     assert verdict.passed, verdict.render()
-    names = [c.name for c in verdict.checks]
-    assert names == [
-        "provider_issued_nonce_call",
-        "provider_received_nonce_result",
-        "boundary_tools_call_carries_nonce",
-        "boundary_response_echoes_nonce",
-        "called_tool_was_advertised",
-    ]
+    assert [c.name for c in verdict.checks] == ALL_CHECKS
 
 
-def test_boundary_absent_run_still_binds_provider_side():
-    """기록기 없이 돈 실행은 경계 검사를 건너뛰되 provider 측은 그대로 판정한다."""
-    data = _load()
-    data["client_to_server"] = ""
-    data["server_to_client"] = ""
+def test_recorder_absent_mode_is_declared_not_inferred():
+    """기록기를 뺐다고 **선언한** 실행만 경계 검사를 건너뛴다."""
+    data = _load() | {"client_to_server": "", "server_to_client": "", "expect_boundary": False}
     verdict = verify_evidence(**data)
     assert verdict.passed, verdict.render()
-    assert [c.name for c in verdict.checks][-1] == "boundary_recorder_absent"
+    assert [c.name for c in verdict.checks][-1] == "boundary_recorded_as_expected"
 
 
 # --------------------------------------------------------------------------
-# 역변이 -- 판정기가 실제로 무엇을 검출하는지 증명한다
+# fail-open 회귀 -- 이 단위에서 실제로 발견된 결함
+# --------------------------------------------------------------------------
+
+
+def test_missing_boundary_when_expected_is_a_failure():
+    """기록기를 태웠다고 했는데 원문이 비면 실패다.
+
+    이것을 통과시키면 판정이 fail-open 이 된다: PATH 해석이 어긋나 기록기가
+    개입하지 못한 실행과, 애초에 기록기를 뺀 실행이 구별되지 않아 전자가 조용히
+    통과한다. 두 실행은 증명하는 것이 다르므로 같은 판정을 받아선 안 된다.
+    """
+    data = _load() | {"client_to_server": "", "server_to_client": ""}
+    verdict = verify_evidence(**data)   # expect_boundary 기본값 True
+    assert not verdict.passed, verdict.render()
+    assert "boundary_recorded_as_expected" in _failed(verdict)
+
+
+def test_partial_boundary_capture_does_not_silently_downgrade():
+    """말미가 잘린 부분 캡처도 '기록기 없음'으로 강등되지 않는다."""
+    data = _load()
+    data["client_to_server"] = "\n".join(data["client_to_server"].splitlines()[:2]) + "\n"
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_tools_call_carries_nonce" in _failed(verdict)
+    assert "boundary_recorded_as_expected" not in _failed(verdict)
+
+
+# --------------------------------------------------------------------------
+# 역변이 -- 각 검사의 검출력을 개별로 증명한다
 # --------------------------------------------------------------------------
 
 
@@ -82,45 +119,141 @@ def test_boundary_absent_run_still_binds_provider_side():
     [
         ("client_to_server", "boundary_tools_call_carries_nonce"),
         ("server_to_client", "boundary_response_echoes_nonce"),
-        ("provider_log", "provider_issued_nonce_call"),
     ],
 )
-def test_corrupting_the_nonce_fails_the_matching_check(artifact, expected_failure):
-    """한 산출물에서 난수를 훼손하면 대응하는 검사가 실패해야 한다."""
+def test_corrupting_the_nonce_fails_the_matching_boundary_check(artifact, expected_failure):
     data = _load()
     data[artifact] = data[artifact].replace(FIXTURE_NONCE, "e2e-nonce-ffffffffffffffff")
     verdict = verify_evidence(**data)
     assert not verdict.passed, f"난수를 훼손했는데도 통과했다:\n{verdict.render()}"
-    failed = {c.name for c in verdict.checks if not c.passed}
-    assert expected_failure in failed, f"기대한 검사가 실패하지 않았다: {failed}"
+    assert expected_failure in _failed(verdict)
+
+
+def test_provider_issue_check_is_detected_independently():
+    """decision 이벤트만 훼손한다 -- 수신 검사는 건드리지 않는다."""
+    data = _load()
+    out = []
+    for line in data["provider_log"].splitlines():
+        event = json.loads(line)
+        if event.get("kind") == "decision":
+            line = line.replace(FIXTURE_NONCE, "e2e-nonce-ffffffffffffffff")
+        out.append(line)
+    data["provider_log"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    failed = _failed(verdict)
+    assert "provider_issued_nonce_call" in failed
+    assert "provider_received_nonce_result" not in failed, "수신 검사가 함께 훼손됐다 -- 독립 검출이 아니다"
+
+
+def test_provider_receipt_check_is_detected_independently():
+    """role=tool 본문만 훼손한다 -- 발행 검사는 건드리지 않는다."""
+    data = _load()
+    out = []
+    for line in data["provider_log"].splitlines():
+        event = json.loads(line)
+        changed = False
+        for msg in ((event.get("payload") or {}).get("messages") or []):
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+                msg["content"] = msg["content"].replace(FIXTURE_NONCE, "e2e-nonce-ffffffffffffffff")
+                changed = True
+        out.append(json.dumps(event, ensure_ascii=False) if changed else line)
+    data["provider_log"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    failed = _failed(verdict)
+    assert "provider_received_nonce_result" in failed
+    assert "provider_issued_nonce_call" not in failed, "발행 검사가 함께 훼손됐다 -- 독립 검출이 아니다"
 
 
 def test_synthesized_result_without_a_real_call_is_rejected():
     """경계에 tools/call 이 없는데 provider 만 결과를 받은 반례를 기각한다.
 
-    이것이 이 판정기가 막아야 하는 핵심 반례다: 클라이언트가 실제 호출을 보내지
+    이것이 판정기가 막아야 하는 핵심 반례다: 클라이언트가 실제 호출을 보내지
     않고 결과를 합성해 tool 메시지에 넣는 경우.
     """
     data = _load()
     data["client_to_server"] = "\n".join(
-        line for line in data["client_to_server"].splitlines()
-        if FIXTURE_NONCE not in line
-    )
+        line for line in data["client_to_server"].splitlines() if FIXTURE_NONCE not in line
+    ) + "\n"
     verdict = verify_evidence(**data)
     assert not verdict.passed, verdict.render()
-    failed = {c.name for c in verdict.checks if not c.passed}
-    assert "boundary_tools_call_carries_nonce" in failed
+    assert "boundary_tools_call_carries_nonce" in _failed(verdict)
 
 
 def test_calling_an_unadvertised_tool_is_rejected():
-    """tools/list 로 광고되지 않은 도구를 부른 기록은 기각한다."""
     data = _load()
     data["server_to_client"] = data["server_to_client"].replace(
-        '"name": "ontology_add_node"', '"name": "ontology_add_node_DIFFERENT"'
+        f'"name": "{MUTATING_TOOL}"', f'"name": "{MUTATING_TOOL}_DIFFERENT"'
     )
     verdict = verify_evidence(**data)
     assert not verdict.passed, verdict.render()
-    assert "called_tool_was_advertised" in {c.name for c in verdict.checks if not c.passed}
+    assert "called_tool_was_advertised" in _failed(verdict)
+
+
+def test_static_tool_only_run_is_rejected():
+    """정적 무인자 도구를 난수와 함께 부른 것처럼 꾸며도 기각한다.
+
+    변경 연산이 아니면 '결과를 합성해 넣었다'는 반례가 되살아난다.
+    """
+    data = _load()
+    data["client_to_server"] = data["client_to_server"].replace(
+        f'"name":"{MUTATING_TOOL}"', f'"name":"{PROBE_TOOL}"'
+    )
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "boundary_call_is_the_mutating_tool" in _failed(verdict)
+
+
+def test_provider_call_naming_a_non_mutating_tool_is_rejected():
+    data = _load()
+    out = []
+    for line in data["provider_log"].splitlines():
+        event = json.loads(line)
+        payload = event.get("payload") or {}
+        if event.get("kind") == "decision" and FIXTURE_NONCE in (payload.get("args") or ""):
+            payload["tool"] = f"localcrab__{PROBE_TOOL}"
+        out.append(json.dumps(event, ensure_ascii=False))
+    data["provider_log"] = "\n".join(out) + "\n"
+    verdict = verify_evidence(**data)
+    assert not verdict.passed, verdict.render()
+    assert "provider_call_is_the_mutating_tool" in _failed(verdict)
+
+
+# --------------------------------------------------------------------------
+# 픽스처 신선도 -- 커밋된 하네스가 만들 수 없는 값이 박히는 것을 막는다
+# --------------------------------------------------------------------------
+
+
+def test_fixture_call_ids_match_the_committed_harness():
+    """픽스처가 현재 하네스의 산물인지 확인한다.
+
+    하네스가 바뀌었는데 픽스처가 그대로면, CI 가 보는 유일한 증거물이 실제
+    산출물과 어긋난 채 굳는다. 실제로 그 상태로 커밋된 적이 있다.
+    """
+    log = (FIXTURES / "provider.jsonl").read_text(encoding="utf-8")
+    call_ids = {
+        (json.loads(line).get("payload") or {}).get("call_id")
+        for line in log.splitlines()
+        if json.loads(line).get("kind") == "decision"
+    } - {None}
+    assert call_ids == {"call-e2e-probe", f"call-e2e-{FIXTURE_NONCE}"}, call_ids
+
+
+def test_fixture_preserves_real_event_shape():
+    """축약이 이벤트 형상까지 지우지 않았는지 확인한다."""
+    kinds = [json.loads(line)["kind"] for line in
+             (FIXTURES / "provider.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert kinds == ["request", "decision", "response"] * 3, kinds
+
+
+def test_fixture_carries_no_environment_identifiers():
+    data_files = sorted(FIXTURES.glob("*.raw")) + [FIXTURES / "provider.jsonl"]
+    assert len(data_files) == 3, [p.name for p in data_files]
+    for path in data_files:
+        text = path.read_text(encoding="utf-8")
+        assert "/home/" not in text, path.name
+        for leaked in ("rcpt_", "user_", "default-"):
+            for token in text.split(leaked)[1:]:
+                assert token.startswith("fixture"), f"{path.name}: {leaked}{token[:24]}"
 
 
 # --------------------------------------------------------------------------
@@ -129,15 +262,15 @@ def test_calling_an_unadvertised_tool_is_rejected():
 
 
 def test_match_tool_ignores_client_namespace_prefix():
-    assert match_tool(["localcrab__ontology_manifest"], "ontology_manifest") == "localcrab__ontology_manifest"
-    assert match_tool(["ontology_manifest"], "ontology_manifest") == "ontology_manifest"
+    assert match_tool([f"localcrab__{PROBE_TOOL}"], PROBE_TOOL) == f"localcrab__{PROBE_TOOL}"
+    assert match_tool([PROBE_TOOL], PROBE_TOOL) == PROBE_TOOL
 
 
 def test_match_tool_refuses_ambiguous_and_missing():
     """후보가 0개거나 2개 이상이면 고르지 않는다 -- 임의 선택은 판정을 모호하게 만든다."""
-    assert match_tool([], "ontology_manifest") is None
-    assert match_tool(["a__ontology_manifest", "b__ontology_manifest"], "ontology_manifest") is None
-    assert match_tool(["ontology_manifest_extended"], "ontology_manifest") is None
+    assert match_tool([], PROBE_TOOL) is None
+    assert match_tool([f"a__{PROBE_TOOL}", f"b__{PROBE_TOOL}"], PROBE_TOOL) is None
+    assert match_tool([f"{PROBE_TOOL}_extended"], PROBE_TOOL) is None
 
 
 def test_new_nonce_is_unique_and_node_id_safe():

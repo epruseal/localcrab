@@ -99,16 +99,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-recorder", action="store_true",
                     help="경계 기록기를 빼고 돈다. 기동 경로에 하네스 코드가 남지 않으므로 "
                          "부작용 실재가 곧 인과 증거가 된다")
-    ap.add_argument("--keep-scratch", action="store_true", help="실패 조사용으로 스크래치를 남긴다")
+    ap.add_argument("--keep-scratch", action="store_true",
+                    help="성공 시에도 증거 원문을 남긴다. 실패 시에는 항상 남는다")
     args = ap.parse_args(argv)
 
     scratch = Path(args.scratch).resolve()
+    marker = scratch / ".openclaw-e2e-scratch"
     if scratch.exists():
+        # 무조건 rmtree 하면 --scratch 오타 하나로 남의 디렉터리가 사라진다.
+        # 이 러너가 만든 것임을 마커로 확인했을 때만 지운다.
+        if not marker.exists():
+            print(f"거부: {scratch} 가 이미 있고 이 러너가 만든 것이 아니다 "
+                  f"(마커 {marker.name} 없음). 다른 경로를 주거나 직접 지워라.", file=sys.stderr)
+            return 2
         shutil.rmtree(scratch)
     home, tmpdir, shim_dir, record_dir = (scratch / n for n in ("home", "tmp", "shim", "record"))
     for d in (home, tmpdir, record_dir):
         d.mkdir(parents=True)
     scratch.chmod(0o700)
+    marker.write_text("scripts/verify_openclaw_e2e.py\n", encoding="utf-8")
+    # 스크래치 CWD -- 격리 계약이 요구한다. 저장소나 홈에서 돌리면 ambient 파일이
+    # 클라이언트·서버의 상대 경로 해석에 끼어든다.
+    cwd = tmpdir
 
     opencrab_bin = os.path.abspath(args.opencrab_bin)
     client_bin = os.path.abspath(args.client_bin)
@@ -131,11 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     # --force: ClawHub 외부 로컬 경로.  --accept-capabilities: MCP 를 선언한 번들.
     # 후자가 없으면 설치는 되지만 이후 CLI 기동 자체가 막힌다.
     subprocess.run([client_bin, "plugins", "install", "--force", "--accept-capabilities",
-                    os.path.abspath(args.plugin_dist)], env=install_env, check=True)
+                    os.path.abspath(args.plugin_dist)], env=install_env, check=True, cwd=cwd)
 
     print("2/6 발견")
     inspect = subprocess.run([client_bin, "plugins", "inspect", "localcrab"],
-                             env=install_env, check=True, capture_output=True, text=True).stdout
+                             env=install_env, check=True, capture_output=True, text=True,
+                             cwd=cwd).stdout
     for needle in ("Bundle format: agent", "mcpServers", "MCP servers:"):
         if needle not in inspect:
             print(f"FAIL: plugins inspect 출력에 {needle!r} 가 없다\n{inspect}", file=sys.stderr)
@@ -149,12 +162,16 @@ def main(argv: list[str] | None = None) -> int:
         port = provider.start(free_port())
         write_client_config(home, port)
 
-        print("3/6 사전 조회 -- 난수 노드가 아직 없어야 한다")
-        before = check_persisted(opencrab_bin, plugin_data, nonce)
-        if before.get("found"):
-            print(f"FAIL: 실행 전에 이미 존재한다: {before}", file=sys.stderr)
+        # 사전 조회를 여기서 하면 안 된다. 조회 자체가 스토어를 부트스트랩해버려서
+        # "클라이언트의 최초 stdio 기동이 프로비저닝한다"(문서 3단계)는 관측 대상을
+        # 없앤다. 대신 데이터 루트가 비었음을 확인한다 -- 스토어가 없으면 난수 노드도
+        # 있을 수 없으므로 부재 확인으로 충분하고, 자동 부트스트랩 관측은 남는다.
+        print("3/6 프로비저닝 -- 데이터 루트가 비었는지 확인하고 자동 부트스트랩을 관측한다")
+        leftover = sorted(p.name for p in plugin_data.iterdir())
+        if leftover:
+            print(f"FAIL: 데이터 루트가 비어 있지 않다: {leftover}", file=sys.stderr)
             return 1
-        print(f"     found={before.get('found')}")
+        print("     빈 데이터 루트 확인 (스토어가 없으므로 난수 노드도 없다)")
 
         run_path = list(install_path)
         if not args.no_recorder:
@@ -167,7 +184,10 @@ def main(argv: list[str] | None = None) -> int:
         print("4/6 embedded agent turn")
         proc = subprocess.run(
             [client_bin, "agent", "--local", "--json",
-             "--session-key", f"agent:main:e2e-{nonce}",
+             # 세션 키에 난수를 넣지 않는다. 클라이언트가 세션 식별자를 시스템
+             # 프롬프트에 실으므로, 난수가 도구 호출과 무관하게 provider 로그에
+             # 나타나 증거를 흐린다.
+             "--session-key", "agent:main:openclaw-e2e",
              "--model", f"vllm/{MODEL_ID}",
              "-m", "Call the LocalCrab tools as instructed."],
             env=run_env(home, tmpdir, run_path), capture_output=True, text=True, timeout=600,
@@ -178,6 +198,17 @@ def main(argv: list[str] | None = None) -> int:
             first = next((ln for ln in proc.stderr.splitlines() if "failed to start server" in ln), "")
             print(f"FAIL: MCP 서버 기동 실패\n{first}", file=sys.stderr)
             return 1
+        if proc.returncode != 0:
+            print(f"FAIL: agent turn 이 rc={proc.returncode} 로 끝났다\n"
+                  f"{proc.stderr[-2000:]}", file=sys.stderr)
+            return 1
+
+    # 문서 3단계: 수동 init 없이 클라이언트의 최초 기동만으로 스토어가 생겼는가.
+    db = plugin_data / "opencrab.db"
+    print(f"     자동 프로비저닝: {db.name} 실재={db.exists()}")
+    if not db.exists():
+        print("FAIL: 클라이언트 기동만으로 스토어가 생기지 않았다", file=sys.stderr)
+        return 1
 
     print("5/6 사후 독립 조회 -- 별도 프로세스, 같은 스토어")
     after = check_persisted(opencrab_bin, plugin_data, nonce)
@@ -195,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         client_to_server=read(record_dir / "client_to_server.raw"),
         server_to_client=read(record_dir / "server_to_client.raw"),
         provider_log=read(provider_log),
+        expect_boundary=not args.no_recorder,
     )
     print(verdict.render())
     if not verdict.passed:
@@ -202,7 +234,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n증거 원문: {scratch}")
     if not args.keep_scratch:
-        print("(--keep-scratch 를 주지 않으면 다음 실행이 이 디렉터리를 지운다)")
+        shutil.rmtree(scratch)
+        print("(스크래치를 지웠다. 원문을 남기려면 --keep-scratch)")
     return 0
 
 
