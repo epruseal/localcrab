@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from opencrab.execution import action_registry
 from opencrab.schemas import loader, pack_registry
 
 # --------------------------------------------------------------------------
@@ -81,9 +82,12 @@ def packs_env(tmp_path, monkeypatch):
     monkeypatch.setattr(pack_registry, "_TYPES_DIR", types_dir)
     monkeypatch.setattr(pack_registry, "_PACKS_DIR", packs_dir)
     monkeypatch.setattr(loader, "SCHEMAS_DIR", types_dir)
+    # Both loaders are process-global @cache; clear each side before and after.
     loader.load_type_schema.cache_clear()
+    action_registry.load_action_schema.cache_clear()
     yield tmp_path, types_dir, packs_dir
     loader.load_type_schema.cache_clear()
+    action_registry.load_action_schema.cache_clear()
 
 
 def write_manifest(packs_dir: Path, name: str, types: list[str]) -> None:
@@ -302,6 +306,76 @@ class TestUninstallMarkerRoundTrip:
         else:
             assert result["removed"] == ["Normal"]
             assert not schema.exists()
+
+
+class TestSchemaListingsOmitRefusedNames:
+    """A listing must not advertise a stem the name check will refuse.
+
+    ``list_registered_types`` and ``list_registered_actions`` glob their
+    directory and hand back the stem, and that stem goes straight back in as
+    the load argument. Advertising one the check refuses makes the listing
+    claim a schema is registered while the load returns None -- and for
+    actions that silently drops every required-parameter check, because
+    validate_action_params treats a missing schema as "unregistered, allowed".
+    """
+
+    @staticmethod
+    def _populate(directory):
+        for stem in ("Normal", "CON", "a:b"):
+            (directory / f"{stem}.yaml").write_text(
+                yaml.safe_dump({"type": stem, "properties": {}}), encoding="utf-8"
+            )
+
+    def test_type_listing_omits_refused_stems(self, packs_env, monkeypatch, tmp_path):
+        schemas = tmp_path / "sch"
+        schemas.mkdir()
+        self._populate(schemas)
+        monkeypatch.setattr(loader, "SCHEMAS_DIR", schemas)
+        loader.load_type_schema.cache_clear()
+
+        assert loader.list_registered_types() == ["Normal"]
+
+    def test_action_listing_omits_refused_stems(self, monkeypatch, tmp_path):
+        actions = tmp_path / "act"
+        actions.mkdir()
+        self._populate(actions)
+        monkeypatch.setattr(action_registry, "ACTIONS_DIR", actions)
+        action_registry.load_action_schema.cache_clear()
+        try:
+            assert action_registry.list_registered_actions() == ["Normal"]
+        finally:
+            action_registry.load_action_schema.cache_clear()
+
+    def test_every_listed_name_passes_the_name_check(self, monkeypatch, tmp_path):
+        """The contract this establishes -- deliberately not "every listed name loads".
+
+        That stronger claim is false: a safe stem holding an empty YAML is
+        listed and still loads as None. Name safety is what this pins.
+        """
+        schemas = tmp_path / "sch"
+        actions = tmp_path / "act"
+        schemas.mkdir()
+        actions.mkdir()
+        self._populate(schemas)
+        self._populate(actions)
+        monkeypatch.setattr(loader, "SCHEMAS_DIR", schemas)
+        monkeypatch.setattr(action_registry, "ACTIONS_DIR", actions)
+        loader.load_type_schema.cache_clear()
+        action_registry.load_action_schema.cache_clear()
+        try:
+            listed = loader.list_registered_types() + action_registry.list_registered_actions()
+            assert listed, "expected the fixture to leave something listed"
+            assert [n for n in listed if not loader.safe_schema_name(n)] == []
+        finally:
+            loader.load_type_schema.cache_clear()
+            action_registry.load_action_schema.cache_clear()
+
+    def test_the_repositorys_own_schemas_all_survive_the_filter(self):
+        """Nothing shipped is dropped. Compared against the glob, not a list."""
+        on_disk = sorted(p.stem for p in loader.SCHEMAS_DIR.glob("*.yaml"))
+        assert loader.list_registered_types() == on_disk
+        actions_on_disk = sorted(p.stem for p in action_registry.ACTIONS_DIR.glob("*.yaml"))
+        assert action_registry.list_registered_actions() == actions_on_disk
 
 
 class TestListingAndLookupAgree:
