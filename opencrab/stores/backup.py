@@ -124,6 +124,32 @@ class BackupDurabilityError(BackupError):
         self.set_dir = set_dir
 
 
+class _CallbackError(Exception):
+    """Carrier for an exception raised by a CALLER-supplied callback.
+
+    ``on_event`` (and the private ``_on_step``) run inside the error boundary
+    that turns this module's own failures into ``BackupError``. A callback's
+    failure is not a backup failure -- the CLI's ``print`` raising
+    ``BrokenPipeError`` after the set was published must not be reported as
+    "the backup failed" -- so it is carried past the boundary and re-raised
+    unchanged there.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__(str(exc))
+        self.exc = exc
+
+
+def _guard_callback(fn: Callable[..., None]) -> Callable[..., None]:
+    def guarded(*args: Any, **kwargs: Any) -> None:
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:  # not BaseException: KeyboardInterrupt stays itself
+            raise _CallbackError(exc) from exc
+
+    return guarded
+
+
 @dataclass(frozen=True)
 class BackupTarget:
     """One artifact that can live under the local data directory.
@@ -311,53 +337,66 @@ def backup_sqlite(
         # A NaN or infinite deadline can never expire; refuse it before the
         # destination exists rather than wait forever on a busy source.
         raise ValueError(f"deadline must be finite, got {deadline!r}")
+    on_step = _guard_callback(_on_step) if _on_step is not None else None
+    # ONE error boundary for the whole copy. Everything below -- the
+    # exclusive create, opening the source (which fails with
+    # OperationalError when the path is a directory or not writable), the
+    # copy itself and the final copymode -- reports as BackupError. The
+    # deadline (TimeoutError) and the observer's own exception pass through.
     try:
         os.close(os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        # timeout=0 so a contended source returns SQLITE_BUSY to us
+        # IMMEDIATELY. The default 5s busy timeout would be spent inside a
+        # single sqlite3_backup_step(), and the progress callback -- the only
+        # place the deadline can be enforced -- runs between steps, so a 0.2s
+        # deadline measured 5.06s. With timeout=0 the same case measures
+        # 0.20s. The waiting is done by the callback below, which is
+        # deadline-aware.
+        src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
+        try:
+            dst_conn = sqlite3.connect(str(dst))
+            try:
+
+                def progress(status: int, remaining: int, total: int) -> None:
+                    remaining_budget = deadline - time.monotonic()
+                    if remaining_budget <= 0:
+                        raise TimeoutError(
+                            f"backup of {src} exceeded its deadline with {remaining} page(s) left"
+                        )
+                    if on_step is not None:
+                        on_step(status, remaining, total)
+                    if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                        # Compute the remaining budget ONCE and only sleep on
+                        # a positive value: recomputing here could go negative
+                        # between the two reads and make sleep() raise
+                        # ValueError.
+                        time.sleep(min(0.05, remaining_budget))
+
+                src_conn.backup(dst_conn, pages=pages, progress=progress, sleep=0)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        # Same access as the source, no wider and no narrower: an operator
+        # whose backups are read by another account configured that on the
+        # source.
+        shutil.copymode(src, dst)
+    except _CallbackError as cf:
+        raise cf.exc
+    except TimeoutError:
+        raise
     except FileExistsError as exc:
         raise BackupError(
             f"backup destination already exists, refusing to overwrite: {dst}"
         ) from exc
-    # timeout=0 so a contended source returns SQLITE_BUSY to us IMMEDIATELY.
-    # The default 5s busy timeout would be spent inside a single
-    # sqlite3_backup_step(), and the progress callback -- the only place the
-    # deadline can be enforced -- runs between steps, so a 0.2s deadline
-    # measured 5.06s. With timeout=0 the same case measures 0.20s. The
-    # waiting is done by the callback below, which is deadline-aware.
-    src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
-    try:
-        dst_conn = sqlite3.connect(str(dst))
-        try:
-
-            def progress(status: int, remaining: int, total: int) -> None:
-                remaining_budget = deadline - time.monotonic()
-                if remaining_budget <= 0:
-                    raise TimeoutError(
-                        f"backup of {src} exceeded its deadline with {remaining} page(s) left"
-                    )
-                if _on_step is not None:
-                    _on_step(status, remaining, total)
-                if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                    # Compute the remaining budget ONCE and only sleep on a
-                    # positive value: recomputing here could go negative
-                    # between the two reads and make sleep() raise ValueError.
-                    time.sleep(min(0.05, remaining_budget))
-
-            src_conn.backup(dst_conn, pages=pages, progress=progress, sleep=0)
-        finally:
-            dst_conn.close()
-    except sqlite3.DatabaseError as exc:
-        # No copy2 fallback. DatabaseError also covers corruption, locking and
-        # I/O errors, and a raw byte copy reported as a backup is precisely
-        # the "believed to have a backup" harm #128 is about.
+    except (sqlite3.Error, OSError) as exc:
+        # No copy2 fallback. This also covers corruption, locking and I/O
+        # errors, and a raw byte copy reported as a backup is precisely the
+        # "believed to have a backup" harm #128 is about.
         raise BackupError(
             f"{src} could not be copied with SQLite's online backup API ({exc}). "
             "It is not a usable SQLite database; refusing to report a raw copy as a backup."
         ) from exc
-    finally:
-        src_conn.close()
-    # Same access as the source, no wider and no narrower: an operator whose
-    # backups are read by another account configured that on the source.
-    shutil.copymode(src, dst)
 
 
 def verify_sqlite(path: Path) -> None:
@@ -379,7 +418,10 @@ def verify_sqlite(path: Path) -> None:
             result = conn.execute("PRAGMA integrity_check").fetchone()
         finally:
             conn.close()
-    except sqlite3.DatabaseError as exc:
+    except (sqlite3.Error, OSError) as exc:
+        # sqlite3.Error, not DatabaseError: InterfaceError is outside it, and
+        # _rw_uri's resolve() can raise OSError. "Verified" must never be
+        # answered with a foreign exception type.
         raise BackupError(f"backup {path} does not open as a SQLite database: {exc}") from exc
     if not result or result[0] != "ok":
         raise BackupError(f"backup {path} failed integrity_check: {result}")
@@ -608,104 +650,158 @@ def backup_data_dir(
     if not data_dir.is_dir():
         raise BackupError(f"data directory does not exist: {data_dir}")
 
-    targets = local_data_dir_inventory(settings)
+    say = _guard_callback(say)
+    published: Path | None = None
+    # ONE error boundary from here to the end. This module's own failures
+    # (sqlite3, os, shutil, pathlib) become BackupError; BackupError and
+    # TimeoutError pass through unchanged; a caller-supplied callback's
+    # failure is re-raised as itself.
+    try:
+        targets = local_data_dir_inventory(settings)
 
-    # A destination inside a directory-kind source would put staging in a tree
-    # this run is about to copy, and copytree would recurse into its own output.
-    dest_resolved = dest.resolve() if dest.exists() else dest.parent.resolve() / dest.name
-    for t in targets:
-        if t.kind not in ("directory", "opaque"):
-            continue
-        src = _source_for(t, data_dir)
-        if not src.is_dir():
-            continue
-        src_resolved = src.resolve()
-        if dest_resolved == src_resolved or dest_resolved.is_relative_to(src_resolved):
+        # A destination inside a directory-kind source would put staging in a tree
+        # this run is about to copy, and copytree would recurse into its own output.
+        dest_resolved = dest.resolve() if dest.exists() else dest.parent.resolve() / dest.name
+        for t in targets:
+            if t.kind not in ("directory", "opaque"):
+                continue
+            src = _source_for(t, data_dir)
+            if not src.is_dir():
+                continue
+            src_resolved = src.resolve()
+            if dest_resolved == src_resolved or dest_resolved.is_relative_to(src_resolved):
+                raise BackupError(
+                    f"destination {dest} is inside the directory source {src}; "
+                    "the backup would copy its own staging directory"
+                )
+
+        if dest.is_symlink():
+            raise BackupError(f"destination is a symlink, refusing to use it: {dest}")
+        if not dest.is_dir():
+            raise BackupError(f"destination directory does not exist: {dest}")
+        # The destination is NOT containment-checked beyond the symlink refusal
+        # above. It is the location the operator chose, and reaching it through a
+        # symlinked ancestor (a backup volume mounted that way) is a normal
+        # layout, not an attack. Containment is enforced where it means
+        # something: INSIDE the set, against the staging root this run created.
+
+        if not _directory_fsync_supported(dest):
             raise BackupError(
-                f"destination {dest} is inside the directory source {src}; "
-                "the backup would copy its own staging directory"
+                f"cannot fsync a directory under {dest} on this filesystem, so a published "
+                "backup set could not be made durable. Refusing to write a backup this "
+                "module cannot stand behind."
             )
 
-    if dest.is_symlink():
-        raise BackupError(f"destination is a symlink, refusing to use it: {dest}")
-    if not dest.is_dir():
-        raise BackupError(f"destination directory does not exist: {dest}")
-    # The destination is NOT containment-checked beyond the symlink refusal
-    # above. It is the location the operator chose, and reaching it through a
-    # symlinked ancestor (a backup volume mounted that way) is a normal
-    # layout, not an attack. Containment is enforced where it means
-    # something: INSIDE the set, against the staging root this run created.
+        leftovers = _leftover_stagings(dest)
+        for p in leftovers:
+            # Another run's interrupted staging. Reported, never deleted: it is
+            # not this run's to remove, and destroying someone else's partial
+            # backup is worse than leaving a directory behind.
+            say(f"! leftover staging from an interrupted backup, check and remove manually: {p}")
 
-    if not _directory_fsync_supported(dest):
-        raise BackupError(
-            f"cannot fsync a directory under {dest} on this filesystem, so a published "
-            "backup set could not be made durable. Refusing to write a backup this "
-            "module cannot stand behind."
-        )
+        set_id = _new_set_id()
+        staging = dest / f"{_STAGING_PREFIX}{set_id}"
+        final = dest / f"{_SET_PREFIX}{set_id}"
 
-    leftovers = _leftover_stagings(dest)
-    for p in leftovers:
-        # Another run's interrupted staging. Reported, never deleted: it is
-        # not this run's to remove, and destroying someone else's partial
-        # backup is worse than leaving a directory behind.
-        say(f"! leftover staging from an interrupted backup, check and remove manually: {p}")
+        if final.exists() or final.is_symlink():
+            raise BackupError(f"backup set already exists, refusing to overwrite: {final}")
 
-    set_id = _new_set_id()
-    staging = dest / f"{_STAGING_PREFIX}{set_id}"
-    final = dest / f"{_SET_PREFIX}{set_id}"
+        with write_lock(str(data_dir), timeout=timeout):
+            # Exclusive create. Not makedirs(exist_ok=True): a pre-planted
+            # directory or symlink here would be written through, and every
+            # temporary artifact below relies on this directory being ours.
+            # Owner-only while the set is being written; it takes the data
+            # directory's own mode right before publication, so the set is
+            # exactly as reachable as the data it snapshots.
+            os.mkdir(staging, 0o700)
+            try:
+                outcome = _run_targets(targets, data_dir, staging, final, say, timeout)
+                shutil.copymode(data_dir, staging)
+                _fsync_tree(staging)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
 
-    if final.exists() or final.is_symlink():
-        raise BackupError(f"backup set already exists, refusing to overwrite: {final}")
+            _publish(staging, final)
+        published = final
 
-    with write_lock(str(data_dir), timeout=timeout):
-        # Exclusive create. Not makedirs(exist_ok=True): a pre-planted
-        # directory or symlink here would be written through, and every
-        # temporary artifact below relies on this directory being ours.
-        # Owner-only while the set is being written; it takes the data
-        # directory's own mode right before publication, so the set is
-        # exactly as reachable as the data it snapshots.
-        os.mkdir(staging, 0o700)
+        # Rewrite the recorded destinations from staging to the published set.
+        for entry in outcome.entries:
+            if entry.destination is not None:
+                entry.destination = final / entry.destination.relative_to(staging)
+        outcome.set_dir = final
+        outcome.leftover_stagings = leftovers
+
         try:
-            outcome = _run_targets(targets, data_dir, staging, final, say, timeout)
-            shutil.copymode(data_dir, staging)
-            _fsync_tree(staging)
-        except BaseException:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
+            _fsync_path(dest)
+        except OSError as exc:
+            # The rename already happened, so the set IS visible. Removing it
+            # would throw away a backup that is very probably intact; the honest
+            # outcome is "published, durability unknown" and a failing exit.
+            raise BackupDurabilityError(
+                f"backup set {final} was published but the destination directory could not be "
+                f"flushed ({exc}); its durability across a power loss is unknown",
+                final,
+            ) from exc
 
-        _publish(staging, final)
-
-    # Rewrite the recorded destinations from staging to the published set.
-    for entry in outcome.entries:
-        if entry.destination is not None:
-            entry.destination = final / entry.destination.relative_to(staging)
-    outcome.set_dir = final
-    outcome.leftover_stagings = leftovers
-
-    try:
-        _fsync_path(dest)
-    except OSError as exc:
-        # The rename already happened, so the set IS visible. Removing it
-        # would throw away a backup that is very probably intact; the honest
-        # outcome is "published, durability unknown" and a failing exit.
-        raise BackupDurabilityError(
-            f"backup set {final} was published but the destination directory could not be "
-            f"flushed ({exc}); its durability across a power loss is unknown",
-            final,
-        ) from exc
-
-    counts = outcome.counts()
-    say(
-        "backup set "
-        f"{final.name}: "
-        + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    )
-    say(
-        "guarantee: per-file transactional consistency for SQLite targets. "
-        "Files are NOT aligned to one point in time -- write.lock narrows that window "
-        "only for writers that honour it (see issue #141)."
-    )
+        counts = outcome.counts()
+        say(
+            "backup set "
+            f"{final.name}: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        )
+        say(
+            "guarantee: per-file transactional consistency for SQLite targets. "
+            "Files are NOT aligned to one point in time -- write.lock narrows that window "
+            "only for writers that honour it (see issue #141)."
+        )
+    except _CallbackError as cf:
+        raise cf.exc
+    except (BackupError, TimeoutError):
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise BackupError(_describe_failure(data_dir, final, published, exc)) from exc
     return outcome
+
+
+def _describe_failure(data_dir: Path, final: Path, published: Path | None, exc: BaseException) -> str:
+    """Say what is known about the set after a failure, by looking, not assuming.
+
+    A failed ``os.rename`` does not prove nothing was published: on a network
+    filesystem the server can apply the rename and the client still receive
+    an error. So the set directory is probed here instead of trusting the
+    ``published`` flag alone.
+    """
+    if published is not None:
+        return f"backup set {published} was published, but a later step failed ({exc})"
+    state = _set_state(final)
+    if state == "unknown":
+        return (
+            f"backup of {data_dir} failed ({exc}); whether a set was published "
+            "could not be determined"
+        )
+    if state == "present":
+        return (
+            f"the publishing rename of {final} reported an error ({exc}) but the set "
+            "directory exists; its state is unknown, treat it as unverified"
+        )
+    return f"backup of {data_dir} failed and no set was published ({exc})"
+
+
+def _set_state(final: Path) -> Literal["present", "absent", "unknown"]:
+    """Whether the set directory exists, without hiding a failed lookup.
+
+    ``Path.is_dir()`` swallows OSError and answers False, so a permission
+    error on the destination would read as "no set was published". ``stat``
+    raises, and only FileNotFoundError means absent.
+    """
+    try:
+        final.stat()
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
 
 
 def _run_targets(
@@ -947,6 +1043,10 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except (BackupError, TimeoutError, OSError) as exc:
+        # OSError here is NOT from the backup: backup_data_dir converts its
+        # own OS failures to BackupError. It is from the print callback this
+        # CLI passed in (a closed stdout raises BrokenPipeError), which the
+        # boundary deliberately re-raises unchanged.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     # skipped/unverified/excluded are the declared contract, not failures:

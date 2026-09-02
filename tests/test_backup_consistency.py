@@ -971,8 +971,11 @@ class TestPathHandling:
         """A pre-planted staging path must never be written through."""
         monkeypatch.setattr(bk, "_new_set_id", lambda: "FIXED")
         (populated_dir / ".backup-staging.FIXED").mkdir()
-        with pytest.raises(FileExistsError):
+        # FileExistsError from the exclusive mkdir, surfaced as BackupError by
+        # the error boundary and chained as its cause.
+        with pytest.raises(bk.BackupError, match="no set was published") as excinfo:
             bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert isinstance(excinfo.value.__cause__, FileExistsError)
         assert _published_sets(populated_dir) == []
 
     def test_existing_set_directory_is_not_overwritten(
@@ -1042,7 +1045,9 @@ class TestAtomicity:
             raise OSError("induced fsync failure")
 
         monkeypatch.setattr(bk, "_fsync_path", bad_fsync)
-        with pytest.raises(OSError):
+        # Surfaces as BackupError: the error boundary converts this module's
+        # own OS failures (see TestErrorBoundary).
+        with pytest.raises(bk.BackupError):
             bk.backup_data_dir(populated_dir, settings=_Settings())
         assert _published_sets(populated_dir) == []
 
@@ -1113,7 +1118,7 @@ class TestAtomicity:
             raise OSError("induced rename failure")
 
         monkeypatch.setattr(bk, "_publish", failing_publish)
-        with pytest.raises(OSError):
+        with pytest.raises(bk.BackupError, match="no set was published"):
             bk.backup_data_dir(populated_dir, settings=_Settings())
 
         assert _published_sets(populated_dir) == []
@@ -1496,3 +1501,189 @@ class TestModePreservation:
         bk.backup_data_dir(populated_dir, settings=_Settings())
         assert seen == [0o700], seen
         assert _mode(_set_dir(populated_dir)) == 0o750
+
+
+# ---------------------------------------------------------------------------
+# Error boundary: everything below backup_data_dir surfaces as BackupError
+# ---------------------------------------------------------------------------
+
+
+class TestErrorBoundary:
+    """``backup_data_dir`` raises BackupError or TimeoutError, nothing else.
+
+    Every external call (sqlite3, os, shutil, pathlib) can raise its own
+    exception type. Converting them at ONE boundary is what lets the CLI
+    print a diagnostic instead of a traceback, and lets callers catch a
+    single type without knowing which library failed.
+    """
+
+    def test_source_that_is_a_directory_is_a_backup_error(self, populated_dir: Path) -> None:
+        """Exists, but cannot be opened read-write: previously OperationalError leaked."""
+        (populated_dir / "graph.db").unlink()
+        (populated_dir / "graph.db").mkdir()
+        with pytest.raises(bk.BackupError, match="graph.db"):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    def test_source_without_write_permission_is_a_backup_error(self, tmp_path: Path) -> None:
+        d = tmp_path / "data"
+        d.mkdir()
+        _make_db(d / "graph.db", rows=3)
+        # Mode 0: the file exists but cannot be opened at all. (A merely
+        # read-only 0400 file is NOT a failure: SQLite falls back to a
+        # read-only open and the backup of a clean database still succeeds.)
+        # write.lock and staging must still be creatable, so the data dir
+        # itself stays writable.
+        os.chmod(d / "graph.db", 0)
+        try:
+            with pytest.raises(bk.BackupError, match="graph.db"):
+                bk.backup_data_dir(d, settings=_Settings())
+            assert _published_sets(d) == []
+            assert _stagings(d) == []
+        finally:
+            os.chmod(d / "graph.db", 0o600)
+
+    def test_backup_sqlite_keeps_its_contract_when_the_source_cannot_be_opened(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "src.db"
+        src.mkdir()
+        dst = tmp_path / "dst.db"
+        with pytest.raises(bk.BackupError, match="could not be copied"):
+            bk.backup_sqlite(src, dst, deadline=time.monotonic() + 30)
+
+    def test_backup_sqlite_wraps_an_os_error_after_the_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The clause is (sqlite3.Error, OSError), not just DatabaseError."""
+        src = tmp_path / "src.db"
+        _make_db(src)
+        dst = tmp_path / "dst.db"
+
+        def bad_copymode(a, b):  # type: ignore[no-untyped-def]
+            raise PermissionError("induced")
+
+        monkeypatch.setattr(bk.shutil, "copymode", bad_copymode)
+        with pytest.raises(bk.BackupError, match="could not be copied"):
+            bk.backup_sqlite(src, dst, deadline=time.monotonic() + 30)
+
+    def test_os_error_inside_the_run_becomes_backup_error(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def bad_fsync(path):  # type: ignore[no-untyped-def]
+            raise OSError(5, "induced I/O error")
+
+        monkeypatch.setattr(bk, "_fsync_path", bad_fsync)
+        with pytest.raises(bk.BackupError, match="no set was published") as excinfo:
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert isinstance(excinfo.value.__cause__, OSError), "the original error must be chained"
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    def test_timeout_error_passes_the_boundary_unchanged(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TimeoutError is an OSError subclass; it must NOT be converted."""
+
+        def timed_out(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise TimeoutError("induced deadline")
+
+        monkeypatch.setattr(bk, "_run_targets", timed_out)
+        with pytest.raises(TimeoutError):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert _stagings(populated_dir) == []
+
+    def test_cli_reports_an_unopenable_source_without_a_traceback(
+        self, populated_dir: Path
+    ) -> None:
+        (populated_dir / "graph.db").unlink()
+        (populated_dir / "graph.db").mkdir()
+        proc = _run_cli("--data-dir", str(populated_dir), data_dir=populated_dir)
+        assert proc.returncode == 1
+        assert "ERROR:" in proc.stderr
+        assert "Traceback" not in proc.stderr, proc.stderr
+        assert _published_sets(populated_dir) == []
+
+    def test_on_event_exception_propagates_unchanged_before_publish(
+        self, populated_dir: Path
+    ) -> None:
+        """The callback is the CALLER's code; its failure is not a backup failure."""
+
+        def broken(_msg: str) -> None:
+            raise BrokenPipeError("induced: stdout closed")
+
+        with pytest.raises(BrokenPipeError):
+            bk.backup_data_dir(populated_dir, settings=_Settings(), on_event=broken)
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    def test_on_event_exception_propagates_unchanged_after_publish(
+        self, populated_dir: Path
+    ) -> None:
+        def broken_summary(msg: str) -> None:
+            if msg.startswith("backup set "):
+                raise BrokenPipeError("induced: stdout closed")
+
+        with pytest.raises(BrokenPipeError):
+            bk.backup_data_dir(populated_dir, settings=_Settings(), on_event=broken_summary)
+        assert len(_published_sets(populated_dir)) == 1, "the set was already published"
+        assert _stagings(populated_dir) == []
+
+    def test_publish_error_after_the_rename_took_effect_is_reported_as_unknown_state(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed rename does not prove nothing was published (network filesystems)."""
+
+        def rename_then_fail(staging, final):  # type: ignore[no-untyped-def]
+            os.rename(str(staging), str(final))
+            raise OSError(5, "induced: error reported after the rename was applied")
+
+        monkeypatch.setattr(bk, "_publish", rename_then_fail)
+        with pytest.raises(bk.BackupError, match="state is unknown"):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        sets = _published_sets(populated_dir)
+        assert len(sets) == 1, "the set that exists must not be deleted or denied"
+        assert (sets[0] / "graph.db").is_file()
+        assert _stagings(populated_dir) == []
+
+    def test_verify_sqlite_wraps_every_sqlite_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db = tmp_path / "x.db"
+        _make_db(db)
+
+        def interface_error(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise sqlite3.InterfaceError("induced")
+
+        monkeypatch.setattr(bk.sqlite3, "connect", interface_error)
+        with pytest.raises(bk.BackupError, match="does not open"):
+            bk.verify_sqlite(db)
+
+    def test_set_state_distinguishes_absent_from_unreadable(self, tmp_path: Path) -> None:
+        assert bk._set_state(tmp_path / "missing") == "absent"
+        (tmp_path / "here").mkdir()
+        assert bk._set_state(tmp_path / "here") == "present"
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory permissions")
+        closed = tmp_path / "closed"
+        closed.mkdir()
+        (closed / "set").mkdir()
+        os.chmod(closed, 0)
+        try:
+            # is_dir() would swallow the PermissionError and answer "absent".
+            assert bk._set_state(closed / "set") == "unknown"
+        finally:
+            os.chmod(closed, 0o700)
+
+    def test_publish_error_with_an_unreadable_set_is_reported_as_undetermined(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def failing_publish(staging, final):  # type: ignore[no-untyped-def]
+            raise OSError(5, "induced rename failure")
+
+        monkeypatch.setattr(bk, "_publish", failing_publish)
+        monkeypatch.setattr(bk, "_set_state", lambda final: "unknown")
+        with pytest.raises(bk.BackupError, match="could not be determined"):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
