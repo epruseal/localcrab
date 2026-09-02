@@ -616,6 +616,29 @@ class TestPathHandling:
         assert parked.is_file(), "an external vector source must be parked, not dropped"
         assert _integrity(parked) == "ok"
 
+    def test_vector_file_configured_inside_a_directory_store_fails_loudly(
+        self, tmp_path: Path
+    ) -> None:
+        """A pathological config must fail with a message that names the cause.
+
+        VECTOR_DB_FILE pointing inside a directory store lands where that
+        store's copytree already wrote. Aborting is right -- the alternative
+        is overwriting part of a copied store -- but the operator needs to be
+        told which target is misconfigured, not just shown a path collision.
+        """
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "chroma").mkdir()
+        _make_db(d / "chroma" / "vectors.db", rows=2)
+
+        with pytest.raises(bk.BackupError) as excinfo:
+            bk.backup_data_dir(d, settings=_Settings(vector_db_file="chroma/vectors.db"))
+        message = str(excinfo.value)
+        assert "chroma/vectors.db" in message
+        assert "another store" in message or "another target" in message, message
+        assert _published_sets(d) == []
+        assert _stagings(d) == []
+
     def test_symlinked_destination_itself_is_refused(self, tmp_path: Path) -> None:
         d = tmp_path / "data"
         d.mkdir()

@@ -674,10 +674,19 @@ def _run_targets(
             continue
 
         destination = _destination_for(target, source, data_dir, staging)
-        _require_contained(destination.parent if destination.parent != staging else staging, staging)
+        _require_contained(destination.parent, staging)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
-            raise BackupError(f"backup target already exists in the set: {destination}")
+            # Reachable for a pathological configuration: a relative
+            # VECTOR_DB_FILE pointing INSIDE a directory store (say
+            # "chroma/vectors.db") lands where that store's copytree already
+            # wrote. Name the configuration rather than leaving the operator
+            # with a bare path collision.
+            raise BackupError(
+                f"backup target already exists in the set: {destination}. "
+                f"Target {target.label!r} resolves to a path another target already "
+                f"wrote; check whether it is configured inside another store's directory."
+            )
 
         if target.kind == "sqlite":
             deadline = time.monotonic() + timeout

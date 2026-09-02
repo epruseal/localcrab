@@ -29,7 +29,7 @@ opencrab extract 같은 별도 CLI 커맨드 전용 이름이 여기 해당한�
 from __future__ import annotations
 
 ENV_CONTRACT: dict[str, str] = {
-    # --- opencrab/config.py Settings alias (33) ---
+    # --- opencrab/config.py Settings alias ---
     "STORAGE_MODE": "설정 소스 선택",
     "LOCAL_DATA_DIR": "상태 위치",
     "NEO4J_URI": "외부 전송 결정",
@@ -73,7 +73,7 @@ ENV_CONTRACT: dict[str, str] = {
     "MCP_PROTOCOL_VERSIONS": "튜너블",
     "MCP_ALLOWED_ORIGINS": "튜너블",
     "LOG_LEVEL": "튜너블",
-    # --- 직접 읽기 (alias 밖, opencrab/·apps/ AST 스캔 실측, 12종) ---
+    # --- 직접 읽기 (alias 밖, opencrab/·apps/ AST 스캔으로 발견) ---
     # opencrab extract CLI 커맨드 전용(cli.py:584,614). opencrab serve 의 도구
     # 실행 경로(opencrab/mcp/**)는 이 커맨드 함수를 호출하지 않는다.
     "ANTHROPIC_API_KEY": "외부 전송 결정, serve 비도달",
@@ -103,7 +103,7 @@ ENV_CONTRACT: dict[str, str] = {
     # `grep -rln "stores[.]backup" opencrab/mcp opencrab/services opencrab/ontology`
     # 무매치).
     "OPENCRAB_BACKUP_LOCK_TIMEOUT": "튜너블, serve 비도달",
-    # --- 간접 접근(auth.py 튜플 순회, AST 정적 해석 불가 -- INDIRECT_ENV_ACCESS 참조, 3종) ---
+    # --- 간접 접근(auth.py 튜플 순회, AST 정적 해석 불가 -- INDIRECT_ENV_ACCESS 참조) ---
     "OPENCRAB_API_KEY": "기동 거부",
     "LOCALCRAB_MCP_TOKEN": "기동 거부",
     "LOCALCRAB_MCP_TOKEN_FILE": "기동 거부",
