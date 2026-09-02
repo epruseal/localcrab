@@ -1590,13 +1590,27 @@ class _SqlGraphStoreBase(abc.ABC):
             raise GraphMigrationConflict("migration plan collision results changed")
         if canonical_json_bytes(plan.dedup_results) != canonical_json_bytes(expected_deduplications):
             raise GraphMigrationConflict("migration plan deduplication results changed")
-        for key, value in target_edges.items():
-            spec = next(
-                item.to_dict() for item in plan.canonical_mappings
-                if item.get("kind") == "edge"
-                and tuple(item.get("target", {}).get(field) for field in ("from_id", "relation", "to_id")) == key
-                and item.get("digest") == value[2]
+        # Index the edge mappings by their target identity.  A linear scan per
+        # target edge makes this check quadratic, which costs hours on a graph
+        # with hundreds of thousands of edges.  ``setdefault`` keeps the first
+        # match so the lookup returns what the previous scan returned.
+        edge_specs_by_target: dict[tuple[Any, ...], FrozenDict] = {}
+        for item in plan.canonical_mappings:
+            if item.get("kind") != "edge":
+                continue
+            item_target = item.get("target", {})
+            edge_specs_by_target.setdefault(
+                (
+                    item_target.get("from_id"), item_target.get("relation"),
+                    item_target.get("to_id"), item.get("digest"),
+                ),
+                item,
             )
+        for key, value in target_edges.items():
+            indexed = edge_specs_by_target.get((key[0], key[1], key[2], value[2]))
+            if indexed is None:
+                raise GraphMigrationConflict("migration plan edge target is unknown")
+            spec = indexed.to_dict()
             if spec.get("result", "retained") == "deduplicated" and key not in retained_edge_specs:
                 raise GraphMigrationConflict("migration plan deduplication has no retained edge")
         for key, (from_type, to_type, _digest) in target_edges.items():
