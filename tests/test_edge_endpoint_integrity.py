@@ -43,6 +43,7 @@ removes BOTH endpoints still passes with AND in place of OR.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -257,9 +258,12 @@ class TestBatchWriterRefuses:
         assert _edge_count(seeded) == 0
 
     def test_one_bad_row_rejects_the_whole_batch(self, seeded):
-        """Endpoint validation runs to completion BEFORE the insert loop, so
-        the good rows in this batch are never written either. This is a
-        pre-validation refusal, not a rollback after partial writes."""
+        """All-or-none: one bad row and the good rows are not written either.
+
+        That is the property a caller can rely on, and the one this assertion
+        actually distinguishes. WHETHER the implementation refuses before the
+        first insert or rolls back after is not observable from here (both
+        leave zero rows), so it is not claimed as contract."""
         seeded.store.upsert_node("Person", "carol", {"name": "carol"}, "subject")
         before = _edge_count(seeded)
         with pytest.raises(ValueError, match="edge endpoint does not exist"):
@@ -358,6 +362,37 @@ class TestPartialSchema:
         seeded.drop("graph_nodes")
         assert seeded.store.count_dangling_edges() == 0
 
+    def test_missing_endpoint_column_counts_every_edge(self, backend):
+        """Column-level damage, not table-level: ``graph_edges`` is there but
+        has lost ``to_type``, so no edge's endpoint snapshot can resolve. The
+        conservative answer is "all of them", and it must be an answer rather
+        than a raw driver error.
+
+        The damaged table is REBUILT rather than altered: ``ALTER TABLE ...
+        DROP COLUMN`` needs SQLite 3.35+, and this project supports 3.24+
+        (see the runtime note in pyproject.toml). CREATE/INSERT is core
+        syntax on every supported version.
+        """
+        if backend.name != "local":
+            pytest.skip("column-level damage is exercised on the SQLite leg; "
+                        "the PG 42703 classification is pinned by the unit tests below")
+        backend.store.upsert_node("Person", "alice", {}, "subject")
+        backend.store.upsert_node("Person", "bob", {}, "subject")
+        backend.raw("DROP TABLE graph_edges")
+        backend.raw(
+            "CREATE TABLE graph_edges ("
+            " from_type TEXT NOT NULL, from_id TEXT NOT NULL, relation TEXT NOT NULL,"
+            " to_id TEXT NOT NULL, properties TEXT NOT NULL DEFAULT '{}',"
+            " PRIMARY KEY (from_id, relation, to_id))"
+        )
+        for relation in ("knows", "saw"):
+            backend.raw(
+                "INSERT INTO graph_edges (from_type, from_id, relation, to_id, properties)"
+                " VALUES (?,?,?,?,?)",
+                ("Person", "alice", relation, "bob", "{}"),
+            )
+        assert backend.store.count_dangling_edges() == 2
+
 
 # --------------------------------------------------------------------------
 # Error classification. A dropped table must degrade to a count; anything
@@ -455,3 +490,156 @@ def test_pg_type_mismatched_columns_raise_rather_than_counting_everything():
         with engine.begin() as conn:
             conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# The migration cutover is the fourth edge writer, and the only one that
+# inserts endpoint type snapshots WITHOUT consulting graph_nodes -- it trusts
+# the validated plan instead. So the plan validation has to do the checking,
+# and it has to check the edge's recorded endpoint types against the TARGET
+# NODE's own type, not against another field of the same edge spec.
+# --------------------------------------------------------------------------
+
+
+def _tampered_plan(plan_bytes: bytes, *, bogus_type: str = "GhostType") -> bytes:
+    """Rewrite one retained edge's ``from_type`` and re-seal the plan.
+
+    Every integrity field a tamperer can recompute IS recomputed here, because
+    every one of them is derived from the plan's own bytes rather than from a
+    secret: the edge's digest (covers from_type), the mapping fingerprint
+    (covers all canonical_mappings, and the validator recomputes it from those
+    same mappings), and the planned-edge fingerprint (covers the digests). The
+    canonical_mappings list is re-sorted the way the planner sorts it, so the
+    result is byte-shaped exactly like a genuine plan.
+
+    What remains wrong is only the thing this test is about: the edge now
+    claims an endpoint type that no node in the plan actually has. Nothing
+    inside the plan is inconsistent with anything else inside the plan --
+    which is precisely why the check has to reach the target NODE's type.
+    """
+    import hashlib
+    import json
+
+    from opencrab.common.graph_identity import canonical_edge_digest, canonical_json_bytes
+
+    payload = json.loads(plan_bytes)
+    mappings = payload["canonical_mappings"]
+    edge_index = next(
+        index for index, item in enumerate(mappings)
+        if item.get("kind") == "edge" and item.get("result", "retained") == "retained"
+    )
+    edge = mappings[edge_index]
+    target = dict(edge["target"])
+    target["from_type"] = bogus_type
+    digest = canonical_edge_digest(
+        target["from_id"], target["relation"], target["to_id"],
+        target["from_type"], target["to_type"], edge["properties"],
+    )
+    mappings[edge_index] = {**edge, "target": target, "digest": digest}
+    mappings.sort(key=canonical_json_bytes)
+
+    payload["mapping_fingerprint"] = hashlib.sha256(
+        b"opencrab.issue80.mapping.v1\0" + canonical_json_bytes(mappings)
+    ).hexdigest()
+    retained = sorted(
+        [item["target"]["from_id"], item["target"]["relation"], item["target"]["to_id"], item["digest"]]
+        for item in mappings
+        if item.get("kind") == "edge" and item.get("result", "retained") == "retained"
+    )
+    payload["planned_target_edge_fingerprint"] = hashlib.sha256(
+        b"opencrab.issue80.planned-edges.v1\0" + canonical_json_bytes(retained)
+    ).hexdigest()
+    return canonical_json_bytes(payload)
+
+
+def _legacy_two_node_fixture():
+    """One edge between two distinctly-named nodes.
+
+    Deliberately NOT the duplicate-id merge fixture: there, the two source
+    edges collapse onto one target key, so changing one spec's digest trips
+    the dedup consistency check before anything endpoint-related is reached.
+    A plan with a single retained edge isolates the endpoint-type question.
+    """
+    from tests.issue80_migration import FixtureHandle
+
+    fixture = FixtureHandle.create()
+    fixture.create_legacy()
+    fixture.seed(
+        nodes=(("Person", "alice", None, {"name": "a"}), ("Person", "bob", None, {"name": "b"})),
+        edges=(("Person", "alice", "knows", "Person", "bob", {"weight": 1}),),
+    )
+    return fixture
+
+
+class TestMigrationPlanEndpointTypes:
+    def test_a_valid_plan_still_applies(self, tmp_path):
+        """Guard against the check rejecting legitimate plans: the planner
+        derives every edge's target types from the mapped node's own type
+        (``source_to_target[...]["node_type"]``), so a plan it produced must
+        pass unchanged and rebuild a graph with zero dangling edges."""
+        from opencrab.common.graph_identity import ApplyMigrationRequest, DryRunMigrationRequest, plan_sha256
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        fixture = _legacy_two_node_fixture()
+        store = LocalGraphStore(str(fixture.db_path))
+        try:
+            inventory = store.inspect_graph_identity()
+            dry = store.migrate_graph_identity(DryRunMigrationRequest(inventory.source_fingerprint, mappings=()))
+            artifact = tmp_path / "backup.db"
+            artifact.write_bytes(fixture.db_path.read_bytes())
+            receipt = store.migrate_graph_identity(ApplyMigrationRequest(
+                request_id="issue84-valid",
+                expected_source_fingerprint=dry.source_fingerprint,
+                plan_bytes=dry.plan_bytes,
+                plan_sha256=plan_sha256(dry.plan_bytes),
+                backup_path=artifact,
+                backup_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            ))
+            assert receipt.phase == "apply"
+            assert store.count_dangling_edges() == 0
+        finally:
+            store.close()
+            fixture.close()
+
+    def test_a_plan_claiming_the_wrong_endpoint_type_is_rejected(self, tmp_path):
+        """The migration cutover is the one edge writer that does NOT consult
+        ``graph_nodes`` -- it trusts the validated plan and inserts the type
+        snapshots verbatim. So the plan validation has to compare each edge's
+        recorded endpoint types against the TARGET NODE's own type.
+
+        Measured before the check existed: this tampered plan was accepted and
+        cutover wrote ``('GhostType', 'alice', 'knows', 'Person', 'bob')``,
+        after which ``count_dangling_edges()`` reported 1 -- a type-drifted
+        endpoint in a freshly rebuilt graph."""
+        from opencrab.common.graph_identity import (
+            ApplyMigrationRequest,
+            DryRunMigrationRequest,
+            GraphMigrationConflict,
+            plan_sha256,
+        )
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from tests.issue80_migration import graph_snapshot
+
+        fixture = _legacy_two_node_fixture()
+        store = LocalGraphStore(str(fixture.db_path))
+        try:
+            inventory = store.inspect_graph_identity()
+            dry = store.migrate_graph_identity(DryRunMigrationRequest(inventory.source_fingerprint, mappings=()))
+            artifact = tmp_path / "backup.db"
+            artifact.write_bytes(fixture.db_path.read_bytes())
+            tampered = _tampered_plan(dry.plan_bytes)
+            assert tampered != dry.plan_bytes, "tamper helper did not change the plan"
+            before = graph_snapshot(fixture.db_path)
+            with pytest.raises(GraphMigrationConflict, match="endpoint type"):
+                store.migrate_graph_identity(ApplyMigrationRequest(
+                    request_id="issue84-tampered",
+                    expected_source_fingerprint=dry.source_fingerprint,
+                    plan_bytes=tampered,
+                    plan_sha256=plan_sha256(tampered),
+                    backup_path=artifact,
+                    backup_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                ))
+            assert graph_snapshot(fixture.db_path) == before, "cutover ran despite the conflict"
+        finally:
+            store.close()
+            fixture.close()

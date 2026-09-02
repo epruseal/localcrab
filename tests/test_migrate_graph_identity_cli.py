@@ -323,3 +323,28 @@ def test_rename_source_digest_key_absence_is_a_value_error(tmp_path: Path) -> No
     path = _write(tmp_path, {"mappings": [item]})
     with pytest.raises(ValueError, match=_DIGEST):
         cli._mapping_file(path)
+
+
+def test_dry_run_reports_the_dangling_edge_count_on_stderr(graph: _Graph, tmp_path: Path) -> None:
+    """Issue #84: the store can now count edges whose endpoint snapshot does
+    not resolve, and this dry-run is the one operator entry point that already
+    inspects a LIVE store's graph identity -- so it is where the number
+    belongs.
+
+    It goes to stderr on purpose. stdout is a parsed contract (every other
+    test here does ``json.loads(proc.stdout)``), and stderr is only ever read
+    as a failure message, so adding a line there breaks no existing caller.
+    """
+    mapping = _write(tmp_path, {"mappings": [graph.merge_json()]})
+    proc = subprocess.run(
+        [
+            sys.executable, str(SCRIPTS_DIR / "migrate_graph_identity.py"),
+            "--db-path", str(graph.db_path),
+            "--mapping-file", str(mapping),
+        ],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "dangling_edges" in proc.stderr, proc.stderr
+    # The stdout contract is untouched: still exactly one receipt object.
+    assert json.loads(proc.stdout)["phase"] == "dry_run"
