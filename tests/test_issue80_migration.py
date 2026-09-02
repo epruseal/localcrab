@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -273,7 +274,7 @@ def test_sqlite_apply_cas_cutover_and_reopen_readback(tmp_path: Path) -> None:
         fixture.close()
 
 
-def test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen(tmp_path: Path) -> None:
+def test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fixture, store = _seed_duplicate_fixture()
     artifact = tmp_path / "issue80-trigger-backup.bin"
     artifact.write_bytes(b"operator backup\n")
@@ -315,8 +316,22 @@ def test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen(t
         assert replay.target_fingerprint_after == committed[7]
         assert replay.edge_loss == committed[8]
         assert replay.property_loss == committed[9]
-        assert replay.canonical_bytes == bytes(committed[10])
-        assert replay.receipt_sha256 == receipt_sha256(bytes(committed[10]))
+        # The ledger stores the canonical receipt zlib-compressed; the
+        # invariant under test is that the replay equals the stored receipt.
+        stored_receipt = store._decode_ledger_receipt(committed[10])
+        assert bytes(committed[10]).startswith(b"zlib\0")
+        # A truncated or extended stored value must not decode to a receipt.
+        with pytest.raises(GraphMigrationConflict, match="ledger receipt is malformed"):
+            store._decode_ledger_receipt(bytes(committed[10]) + b"garbage")
+        with pytest.raises(GraphMigrationConflict, match="ledger receipt is malformed"):
+            store._decode_ledger_receipt(bytes(committed[10])[:-8])
+        # A high-ratio stream must hit the size bound, not exhaust memory.
+        bomb = b"zlib\0" + zlib.compress(b"\0" * (4 * 1024 * 1024))
+        monkeypatch.setattr(type(store), "_LEDGER_RECEIPT_MAX_BYTES", 1024 * 1024)
+        with pytest.raises(GraphMigrationConflict, match="ledger receipt is malformed"):
+            store._decode_ledger_receipt(bomb)
+        assert replay.canonical_bytes == stored_receipt
+        assert replay.receipt_sha256 == receipt_sha256(stored_receipt)
         with sqlite3.connect(fixture.db_path) as conn:
             assert conn.execute("SELECT count(*) FROM graph_migration_receipts").fetchone()[0] == 1
         post = store.upsert_node("Person", "post-replay", {"name": "ok"})
