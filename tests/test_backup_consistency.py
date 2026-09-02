@@ -17,10 +17,12 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -1277,3 +1279,102 @@ class TestSqliteVec:
             assert out.execute("SELECT count(*) FROM v").fetchone()[0] == 1
         finally:
             out.close()
+
+
+# ---------------------------------------------------------------------------
+# 3-x  Access mode of the artifacts (automated review P1 on PR #278)
+# ---------------------------------------------------------------------------
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@pytest.fixture
+def permissive_umask() -> Iterator[None]:
+    """Pin umask 022 so a restrictive source is the ONLY thing keeping the copy
+    restrictive. Restored afterwards so no other test inherits it."""
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+class TestModePreservation:
+    """A backup must not be more readable than the data it copies.
+
+    ``sqlite3.connect()`` creates a missing destination with SQLite's default
+    0644 (minus umask); the ``copy2`` path this module replaced preserved the
+    source mode. Without these tests a 0600 ``opencrab.db`` came out 0644 in a
+    set written to a shared ``--to`` directory.
+    """
+
+    def test_restricted_sqlite_source_mode_is_preserved(
+        self, populated_dir: Path, permissive_umask: None
+    ) -> None:
+        os.chmod(populated_dir / "opencrab.db", 0o600)
+        os.chmod(populated_dir / "graph.db", 0o640)
+        bk.backup_data_dir(populated_dir, settings=_Settings())
+        s = _set_dir(populated_dir)
+        assert _mode(s / "opencrab.db") == 0o600
+        assert _mode(s / "graph.db") == 0o640
+        # A source that IS world-readable stays that way: the policy is
+        # "same as the source", not "always private".
+        assert _mode(s / "doc_store.db") == _mode(populated_dir / "doc_store.db")
+
+    def test_symlink_alias_slot_carries_the_target_file_mode(
+        self, populated_dir: Path, permissive_umask: None
+    ) -> None:
+        os.chmod(populated_dir / "graph.db", 0o600)
+        (populated_dir / "alias.db").symlink_to("graph.db")
+        bk.backup_data_dir(populated_dir, settings=_Settings(vector_db_file="alias.db"))
+        s = _set_dir(populated_dir)
+        # The alias slot holds an independent copy of the SAME data, so
+        # it gets the mode of the file it copied, not of the link.
+        assert (s / "alias.db").is_file() and not (s / "alias.db").is_symlink()
+        assert _mode(s / "alias.db") == 0o600
+
+    def test_destination_is_owner_only_during_the_copy(
+        self, tmp_path: Path, permissive_umask: None
+    ) -> None:
+        src = tmp_path / "src.db"
+        _make_db(src, rows=200)
+        os.chmod(src, 0o600)
+        dst = tmp_path / "dst.db"
+        observed: list[int] = []
+
+        def on_step(status: int, remaining: int, total: int) -> None:
+            observed.append(_mode(dst))
+            journal = tmp_path / "dst.db-journal"
+            if journal.exists():
+                observed.append(_mode(journal))
+
+        bk.backup_sqlite(src, dst, deadline=time.monotonic() + 30, pages=1, _on_step=on_step)
+        assert observed, "the observer never ran, so the test proved nothing"
+        assert set(observed) == {0o600}, observed
+        assert _mode(dst) == 0o600
+
+    def test_existing_destination_is_refused(self, tmp_path: Path) -> None:
+        src = tmp_path / "src.db"
+        _make_db(src)
+        dst = tmp_path / "dst.db"
+        dst.write_bytes(b"")
+        with pytest.raises(bk.BackupError, match="already exists"):
+            bk.backup_sqlite(src, dst, deadline=time.monotonic() + 30)
+
+    def test_staging_is_owner_only_while_running_and_set_matches_data_dir(
+        self, populated_dir: Path, permissive_umask: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        os.chmod(populated_dir, 0o750)
+        seen: list[int] = []
+        real = bk._run_targets
+
+        def spy(targets, data_dir, staging, final, say, timeout):  # type: ignore[no-untyped-def]
+            seen.append(_mode(staging))
+            return real(targets, data_dir, staging, final, say, timeout)
+
+        monkeypatch.setattr(bk, "_run_targets", spy)
+        bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert seen == [0o700], seen
+        assert _mode(_set_dir(populated_dir)) == 0o750

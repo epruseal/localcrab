@@ -55,6 +55,14 @@ leaves a half-set under names that claim success.
 The fsync steps are not optional. A directory rename is atomic in the namespace
 only; without flushing the data first, a power loss can leave the set present
 but its files empty.
+
+ACCESS MODE
+-----------
+Every artifact in the set carries the access mode of its source: SQLite copies
+get the source file's mode (``backup_sqlite``), directory and opaque copies
+keep it through ``copy2``/``copytree``, and the set directory gets the data
+directory's mode at publication. While the set is being written, the staging
+directory and each SQLite copy are readable by the owner only.
 """
 
 from __future__ import annotations
@@ -288,7 +296,22 @@ def backup_sqlite(
 
     ``_on_step`` is a private test observer, not API. The deadline is checked
     before it runs so a test cannot mask a timeout.
+
+    Access mode: the destination is created exclusively as ``0600`` BEFORE
+    SQLite opens it, and receives the source file's mode once the copy is
+    complete. Left to ``sqlite3.connect()`` a new file gets SQLite's default
+    ``0644`` minus umask, so a ``0600`` source came out world-readable in a
+    set written to a shared directory -- a regression from the ``copy2`` path
+    this replaced, which preserved the mode. During the copy the file (and
+    the transient ``-journal`` SQLite derives from it) is readable by the
+    owner only.
     """
+    try:
+        os.close(os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError as exc:
+        raise BackupError(
+            f"backup destination already exists, refusing to overwrite: {dst}"
+        ) from exc
     # timeout=0 so a contended source returns SQLITE_BUSY to us IMMEDIATELY.
     # The default 5s busy timeout would be spent inside a single
     # sqlite3_backup_step(), and the progress callback -- the only place the
@@ -327,6 +350,9 @@ def backup_sqlite(
         ) from exc
     finally:
         src_conn.close()
+    # Same access as the source, no wider and no narrower: an operator whose
+    # backups are read by another account configured that on the source.
+    shutil.copymode(src, dst)
 
 
 def verify_sqlite(path: Path) -> None:
@@ -606,9 +632,13 @@ def backup_data_dir(
         # Exclusive create. Not makedirs(exist_ok=True): a pre-planted
         # directory or symlink here would be written through, and every
         # temporary artifact below relies on this directory being ours.
-        os.mkdir(staging)
+        # Owner-only while the set is being written; it takes the data
+        # directory's own mode right before publication, so the set is
+        # exactly as reachable as the data it snapshots.
+        os.mkdir(staging, 0o700)
         try:
             outcome = _run_targets(targets, data_dir, staging, final, say, timeout)
+            shutil.copymode(data_dir, staging)
             _fsync_tree(staging)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
