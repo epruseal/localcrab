@@ -315,8 +315,12 @@ def test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen(t
         assert replay.target_fingerprint_after == committed[7]
         assert replay.edge_loss == committed[8]
         assert replay.property_loss == committed[9]
-        assert replay.canonical_bytes == bytes(committed[10])
-        assert replay.receipt_sha256 == receipt_sha256(bytes(committed[10]))
+        # The ledger stores the canonical receipt zlib-compressed; the
+        # invariant under test is that the replay equals the stored receipt.
+        stored_receipt = store._decode_ledger_receipt(committed[10])
+        assert bytes(committed[10]).startswith(b"zlib\0")
+        assert replay.canonical_bytes == stored_receipt
+        assert replay.receipt_sha256 == receipt_sha256(stored_receipt)
         with sqlite3.connect(fixture.db_path) as conn:
             assert conn.execute("SELECT count(*) FROM graph_migration_receipts").fetchone()[0] == 1
         post = store.upsert_node("Person", "post-replay", {"name": "ok"})

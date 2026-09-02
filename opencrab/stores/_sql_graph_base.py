@@ -108,6 +108,7 @@ import logging
 import os
 import re
 import threading
+import zlib
 from collections import deque
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
@@ -1706,11 +1707,35 @@ class _SqlGraphStoreBase(abc.ABC):
             return None
 
     @staticmethod
+    def _encode_ledger_receipt(canonical: bytes) -> bytes:
+        """Compress the canonical receipt bytes for the ledger row.
+
+        The receipt embeds the full mapping result, so its size scales with
+        the graph. A 918,518-mapping plan makes ~1.4 GB of canonical JSON,
+        which passes SQLITE_MAX_LENGTH (a 1e9 compile-time hard cap that
+        ``setlimit`` cannot raise) and fails the ledger INSERT after the
+        cutover work is already done. The canonical JSON is repetitive, so
+        zlib keeps the row far under the cap. The prefix keeps raw legacy
+        rows readable.
+        """
+        return b"zlib\0" + zlib.compress(bytes(canonical), 6)
+
+    @staticmethod
+    def _decode_ledger_receipt(stored: Any) -> bytes:
+        raw = bytes(stored)
+        if raw.startswith(b"zlib\0"):
+            try:
+                return zlib.decompress(raw[5:])
+            except zlib.error as exc:
+                raise GraphMigrationConflict("migration ledger receipt is malformed") from exc
+        return raw
+
+    @staticmethod
     def _receipt_from_ledger(row: Any) -> MigrationReceipt:
         try:
             if len(row) != 11:
                 raise GraphMigrationConflict("migration ledger row is malformed")
-            raw = bytes(row[-1])
+            raw = _SqlGraphStoreBase._decode_ledger_receipt(row[-1])
             value = json.loads(raw.decode("utf-8"))
             required = {
                 "request_id", "phase", "request_digest", "source_fingerprint",
@@ -1966,7 +1991,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 inventory=inventory, plan=plan, plan_bytes=supplied_plan,
                 target_before=before, target_after=after,
             )
-            tx.execute(f"INSERT INTO {self._ledger_table()} (request_id,phase,request_digest,source_fingerprint,mapping_fingerprint,plan_sha256,target_fingerprint_before,target_fingerprint_after,edge_loss,property_loss,receipt_bytes,created_at) VALUES (:request_id,:phase,:request_digest,:source_fingerprint,:mapping_fingerprint,:plan_sha256,:target_before,:target_after,:edge_loss,:property_loss,:receipt_bytes,:created_at)", {"request_id": request.request_id, "phase": "apply", "request_digest": request_digest, "source_fingerprint": inventory.source_fingerprint, "mapping_fingerprint": plan.mapping_fingerprint, "plan_sha256": plan_sha256(supplied_plan), "target_before": before, "target_after": after, "edge_loss": plan.edge_loss, "property_loss": plan.property_loss, "receipt_bytes": receipt.canonical_bytes, "created_at": self._dialect.bind_value_for_timestamp(datetime.now(UTC))})
+            tx.execute(f"INSERT INTO {self._ledger_table()} (request_id,phase,request_digest,source_fingerprint,mapping_fingerprint,plan_sha256,target_fingerprint_before,target_fingerprint_after,edge_loss,property_loss,receipt_bytes,created_at) VALUES (:request_id,:phase,:request_digest,:source_fingerprint,:mapping_fingerprint,:plan_sha256,:target_before,:target_after,:edge_loss,:property_loss,:receipt_bytes,:created_at)", {"request_id": request.request_id, "phase": "apply", "request_digest": request_digest, "source_fingerprint": inventory.source_fingerprint, "mapping_fingerprint": plan.mapping_fingerprint, "plan_sha256": plan_sha256(supplied_plan), "target_before": before, "target_after": after, "edge_loss": plan.edge_loss, "property_loss": plan.property_loss, "receipt_bytes": self._encode_ledger_receipt(receipt.canonical_bytes), "created_at": self._dialect.bind_value_for_timestamp(datetime.now(UTC))})
             return receipt
 
         receipt = self._run_graph_tx(body, exclusive=self._dialect.name == "sqlite")
