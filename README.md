@@ -425,7 +425,7 @@ STORAGE_MODE=docker opencrab serve
 >
 > ```python
 > from opencrab.stores.sql_store import SQLStore
-> store = SQLStore("sqlite:////path/to/opencrab.db")
+> store = SQLStore("sqlite:///opencrab.db")   # 실제 DB 파일 경로로 바꾼다
 > print(store.list_invalid_policies())   # [] 이면 오염 행 없음
 > store._engine.dispose()
 > ```
