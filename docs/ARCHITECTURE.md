@@ -461,7 +461,7 @@ export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/loca
 **3. 스토어 백업**
 
 살아 있는 SQLite 파일을 `shutil.copy2`로 그대로 복사하면 트랜잭션 중간의
-상태가 찍혀 나올 수 있어 일관된 스냅숏이 아니다(issue #128). 대상 파일
+상태가 찍혀 나올 수 있어 일관된 스냅샷이 아니다(issue #128). 대상 파일
 목록도 여기 문서에 다시 나열하지 않는다. 코드의 목록과 문서의 목록이
 따로 관리되다 어긋난 탓에 `vectors.db`가 백업에서 통째로 빠졌던 적이
 있기 때문이다(issue #123). 그래서 백업은 `opencrab/stores/backup.py`가
