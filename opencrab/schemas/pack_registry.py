@@ -210,6 +210,20 @@ def list_packs() -> list[dict[str, Any]]:
                         path.name, data["name"],
                     )
                     continue
+                # #109: the declared name being safe is not enough. install
+                # vets the WHOLE type list and refuses the manifest outright if
+                # any entry is unsafe, so advertising it would offer a pack that
+                # can never be taken. Deliberately the same _unsafe_names the
+                # install preflight calls -- one predicate, so the listing and
+                # the install cannot drift apart.
+                rejected_types = _unsafe_names(data.get("types", []) or [])
+                if rejected_types:
+                    logger.warning(
+                        "Skipping pack manifest %s: unsafe type name(s) %r, so "
+                        "install would refuse the whole manifest.",
+                        path.name, rejected_types,
+                    )
+                    continue
                 packs.append({
                     "name": data["name"],
                     "version": data.get("version", "unknown"),
