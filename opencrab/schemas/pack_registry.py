@@ -214,8 +214,7 @@ def list_packs() -> list[dict[str, Any]]:
                 # vets the WHOLE type list and refuses the manifest outright if
                 # any entry is unsafe, so advertising it would offer a pack that
                 # can never be taken. Deliberately the same _unsafe_names the
-                # install preflight calls -- one predicate, so the listing and
-                # the install cannot drift apart.
+                # install preflight calls, so both judge a name by one rule.
                 rejected_types = _unsafe_names(data.get("types", []) or [])
                 if rejected_types:
                     logger.warning(

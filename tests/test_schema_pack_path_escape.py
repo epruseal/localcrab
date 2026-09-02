@@ -442,16 +442,36 @@ class TestListingAndLookupAgree:
 
         assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
 
+    def test_a_bad_type_past_the_tenth_is_still_refused(self, packs_env):
+        """The regression that was actually observed, pinned by a fixture.
+
+        An earlier version of the spy below compared the argument's contents
+        against a five-type manifest, and a check of only types[:10] passed it
+        while an eleven-type manifest with the offender last really did get
+        listed. Ten safe names ahead of one unsafe name pins that directly.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "late", [f"Safe{i}" for i in range(10)] + ["../escape"])
+
+        assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
+
     def test_the_whole_type_list_is_vetted_not_a_slice_of_it(self, packs_env, monkeypatch):
         """Pin that the listing hands _unsafe_names the parsed list ITSELF.
 
-        Fixtures cannot pin this: for any fixture of n types, the slice
-        types[:n] passes. Neither can comparing the argument's CONTENTS -- an
-        earlier version of this test did, with a five-type manifest, and
-        types[:10] sailed through it while an eleven-type manifest really did
-        regress. Identity is what is slice-proof: every slice builds a new
-        list, so requiring the argument to BE the parsed object rules them all
-        out at once, whatever their length.
+        Two things are pinned, and the spy records both at call time:
+
+        - identity: the argument IS the parsed list object. Every copy and
+          slice builds a new object, so any check that passes a copied or
+          sliced list fails this, whatever its length;
+        - a snapshot of the contents: the object still equals what was
+          declared when the check runs, so an in-place edit of the list is
+          caught up to the length of this fixture.
+
+        What this does not pin: an in-place cut past this fixture's length
+        (del types[10:]) leaves a five-type list intact and passes here. No
+        single finite fixture pins every in-place cut at every position; the
+        eleven-type regression above pins the one that was observed.
         """
         tmp_root, types_dir, packs_dir = packs_env
         declared = ["A", "B", "C", "D", "E"]
@@ -469,7 +489,7 @@ class TestListingAndLookupAgree:
         real_unsafe_names = pack_registry._unsafe_names
 
         def spy(names):
-            seen.append(names)
+            seen.append((names, list(names)))
             return real_unsafe_names(names)
 
         monkeypatch.setattr(yaml, "safe_load", capture)
@@ -477,8 +497,11 @@ class TestListingAndLookupAgree:
         pack_registry.list_packs()
 
         assert parsed and parsed[-1]["types"] == declared, parsed
-        assert any(arg is parsed[-1]["types"] for arg in seen), (
-            "the type list was copied or sliced before being vetted; "
+        assert any(
+            arg is parsed[-1]["types"] and snapshot == declared
+            for arg, snapshot in seen
+        ), (
+            "the type list was copied, sliced or edited before being vetted; "
             f"got {seen!r} for {parsed[-1]['types']!r}"
         )
 
