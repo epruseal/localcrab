@@ -45,8 +45,10 @@ def _is_reserved_filename(name: str) -> bool:
     excludes them here, and ``safe_schema_name`` rejects them separately.
     """
     if name[-1:] in (".", " "):
-        # Windows strips trailing dots and spaces, so "Foo." and "Foo" would
-        # be the same file: two type declarations colliding into one.
+        # Trailing dots and spaces are reserved on Windows. Note this is a
+        # property of the FILENAME: callers here append a ".yaml" suffix, so
+        # "Foo." becomes "Foo..yaml", which does NOT end in a dot. See
+        # safe_schema_name for why it is still refused as a logical name.
         return name not in (".", "..")
     if _RESERVED_CHARS.intersection(name):
         return True
@@ -79,8 +81,7 @@ def safe_schema_name(name: Any) -> bool:
 
     Both path flavours are consulted so that ``a\\b`` -- a perfectly legal
     single filename on POSIX -- is rejected too, and ``_is_reserved_filename``
-    adds the rest of the Windows rules (reserved characters, DOS device names
-    such as ``CON``, trailing dots and spaces). This is deliberate rather than
+    adds the rest of the Windows rules. This is deliberate rather than
     incidental: the files these names produce are written into the repository
     tree (``opencrab/schemas/types/``) and get checked out on other platforms,
     where a backslash or a drive prefix separates components and ``CON.yaml``
@@ -88,6 +89,20 @@ def safe_schema_name(name: Any) -> bool:
     component that denotes a file on either platform, and ``a\\b``, ``a:b``
     and ``CON`` are rejected even on Linux. No shipped pack uses such a name;
     a pack that did would now get a clear refusal.
+
+    The rules are applied to the LOGICAL name, not to ``name + ".yaml"``.
+    That distinction only matters for the trailing dot/space rule, and it
+    makes this check STRICTER than the filename strictly requires: ``Foo.``
+    becomes ``Foo..yaml``, which is a perfectly good filename. Refusing it
+    anyway is a conservative choice, not an accident. A pack NAME ending in a
+    dot or space does not survive its own round trip today: ``uninstall_pack``
+    recognises a generated file by the raw substring ``pack: <name>``, and
+    PyYAML quotes such a value (``pack: 'Foo '``), so the substring never
+    matches and a plain uninstall silently keeps the files it created. One
+    predicate serves both type names and pack names, so both are refused
+    until that marker check compares the parsed value instead of a substring
+    -- tracked as follow-up work, deliberately not bundled into a path-escape
+    fix because it changes what the DELETE path considers its own.
 
     What this does NOT promise: that two accepted names are distinct files.
     A case-insensitive filesystem still collapses ``Foo`` and ``foo``, which

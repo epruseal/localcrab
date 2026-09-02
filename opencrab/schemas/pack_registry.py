@@ -22,9 +22,10 @@ file outside the directory it was supposed to name. An unsafe pack name
 reads as "pack not found"; a manifest carrying an unsafe type name is
 refused whole, before anything is created or deleted. A name is unsafe if
 it carries a separator (either flavour), is "." or "..", is absolute, or
-is reserved as a filename by Windows -- a reserved character, a DOS device
-name such as CON, or a trailing dot or space. See
-``opencrab.schemas.loader.safe_schema_name``.
+is reserved as a filename by Windows -- a reserved character or a DOS device
+name such as CON. A trailing dot or space is refused too, which is stricter
+than the resulting ``.yaml`` filename needs; ``safe_schema_name`` documents
+why that one is deliberate.
 
 Symlink policy (#109), which is NOT the same in both directions:
 

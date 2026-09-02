@@ -105,7 +105,9 @@ UNSAFE_NAMES = [
     # DOS device names -- on Windows these address a device, not a file here
     "CON", "con", "NUL", "COM1", "AUX.foo", "CONIN$", "CONOUT$", "COM\xb9", "LPT\xb3",
     "CON .txt",
-    # trailing dot/space: Windows strips these, so two type names collide
+    # Trailing dot/space. Refused on the LOGICAL name, which is stricter than
+    # the "<name>.yaml" filename needs -- see safe_schema_name for why that is
+    # deliberate (a pack name like this does not survive its own uninstall).
     "Foo.", "Foo ",
 ]
 
