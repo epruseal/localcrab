@@ -170,13 +170,18 @@ _TABLES_SQL_SQLITE = [
         simulated_at TEXT DEFAULT (datetime('now'))
     )
     """,
+    # granted gets the same value-domain CHECK as users/packs below (#152).
+    # Only a table created by this DDL has it: CREATE TABLE IF NOT EXISTS
+    # leaves a pre-#152 table untouched, and SQLite has no ADD CONSTRAINT.
+    # The read path is fail-closed for that case (see _decode_granted);
+    # the table-rebuild migration for existing databases is a follow-up.
     """
     CREATE TABLE IF NOT EXISTS rebac_policies (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         subject_id   TEXT NOT NULL,
         permission   TEXT NOT NULL,
         resource_id  TEXT NOT NULL,
-        granted      INTEGER NOT NULL DEFAULT 1,
+        granted      INTEGER NOT NULL DEFAULT 1 CHECK (granted IN (0, 1)),
         created_at   TEXT DEFAULT (datetime('now')),
         UNIQUE (subject_id, permission, resource_id)
     )
@@ -234,6 +239,70 @@ _TABLES_SQL_SQLITE = [
     "CREATE INDEX IF NOT EXISTS idx_packs_owner ON packs (owner_id)",
     "CREATE INDEX IF NOT EXISTS idx_packs_visibility ON packs (visibility)",
 ]
+
+
+# ---------------------------------------------------------------------------
+# rebac_policies.granted value domain (#152)
+# ---------------------------------------------------------------------------
+#
+# PostgreSQL stores `granted` as BOOLEAN, so the type constrains the domain.
+# SQLite has no BOOLEAN: the column is INTEGER, and a pre-#152 table has no
+# CHECK, so a row can hold 2, -1, 1.5 or 'yes'. The old read path used
+# bool(), which turned every such value into a grant (fail-open). One
+# predicate below decides validity for the write path, the read path and the
+# diagnostic, so the three layers cannot drift apart.
+
+
+def _is_valid_granted(value: Any) -> bool:
+    """True only for ``bool`` or an exact ``int`` 0/1.
+
+    ``bool`` is checked first because it subclasses ``int``. The second branch
+    uses ``type(value) is int`` on purpose: ``1.0 == 1`` and ``Decimal(1) == 1``
+    are true, so an equality test would let a REAL or a Decimal through.
+    """
+    if isinstance(value, bool):
+        return True
+    return type(value) is int and value in (0, 1)
+
+
+def _coerce_granted_input(value: Any) -> bool:
+    """Normalize a ``set_policy`` argument to ``bool`` or raise ``ValueError``.
+
+    Rejecting here, before SQLAlchemy binds the value, gives SQLite and
+    PostgreSQL the same behaviour: PostgreSQL already refused a non-boolean at
+    the database (with a driver error), SQLite silently stored it.
+    """
+    if not _is_valid_granted(value):
+        raise ValueError(
+            "rebac_policies.granted must be True, False, 0 or 1; "
+            f"got {type(value).__name__}"
+        )
+    return bool(value)
+
+
+def _decode_granted(
+    raw: Any, *, subject_id: str, permission: str, resource_id: str
+) -> bool:
+    """Interpret a stored ``granted`` value, fail-closed.
+
+    A valid value maps to its ``bool``. Anything else is treated as an explicit
+    DENY and logged. It is ``False`` rather than ``None`` because
+    ``ReBACEngine.check`` reads ``None`` as "no policy" and falls through to the
+    graph traversal, which may grant. A corrupted row must not widen access.
+    The warning names the row so an operator can find it; see
+    ``SQLStore.list_invalid_policies`` for the rows that were never looked up.
+    """
+    if _is_valid_granted(raw):
+        return bool(raw)
+    logger.warning(
+        "rebac_policies.granted holds a non-boolean value (%s) for "
+        "subject=%s permission=%s resource=%s; treating as DENY (#152)",
+        type(raw).__name__,
+        subject_id,
+        permission,
+        resource_id,
+    )
+    return False
 
 
 class SQLStore:
@@ -796,8 +865,13 @@ class SQLStore:
 
         Assumes the ``UNIQUE (subject_id, permission, resource_id)`` constraint
         from this store's own DDL; see ``register_node``.
+
+        ``granted`` must be ``True``, ``False`` or an exact ``int`` 0/1 (#152).
+        Any other value raises ``ValueError`` before the statement runs, so
+        nothing is written and an existing row keeps its value.
         """
         self._require_available()
+        granted_value = _coerce_granted_input(granted)
 
         from sqlalchemy import text
 
@@ -814,7 +888,7 @@ class SQLStore:
                     "sid": subject_id,
                     "perm": permission,
                     "rid": resource_id,
-                    "granted": granted,
+                    "granted": granted_value,
                 },
             )
 
@@ -825,6 +899,9 @@ class SQLStore:
         Look up a stored ReBAC policy.
 
         Returns True/False if a policy exists, None if no policy row found.
+        A stored value that is not exactly 0/1 (possible in a pre-#152 SQLite
+        table) is returned as ``False`` and logged, never as ``True`` or
+        ``None``; see ``_decode_granted``.
         """
         self._require_available()
 
@@ -841,10 +918,16 @@ class SQLStore:
             ).fetchone()
         if row is None:
             return None
-        return bool(row[0])
+        return _decode_granted(
+            row[0], subject_id=subject_id, permission=permission, resource_id=resource_id
+        )
 
     def list_policies(self, subject_id: str) -> list[dict[str, Any]]:
-        """List all policies for a given subject."""
+        """List all policies for a given subject.
+
+        ``granted`` is decoded fail-closed like ``check_policy``: a row whose
+        stored value is not exactly 0/1 is reported as ``False`` and logged.
+        """
         self._require_available()
 
         from sqlalchemy import text
@@ -860,10 +943,44 @@ class SQLStore:
                 "subject_id": r[0],
                 "permission": r[1],
                 "resource_id": r[2],
-                "granted": bool(r[3]),
+                "granted": _decode_granted(
+                    r[3], subject_id=r[0], permission=r[1], resource_id=r[2]
+                ),
                 "created_at": str(r[4]),
             }
             for r in rows
+        ]
+
+    def list_invalid_policies(self) -> list[dict[str, Any]]:
+        """Diagnostic: rows whose ``granted`` is not exactly 0/1 (#152).
+
+        The fail-closed read path only logs the rows it is asked about. This
+        scans every row so an operator can find the ones that were never
+        looked up. ``granted`` is the raw stored value and ``granted_type`` its
+        Python type name; the value is not normalized.
+
+        On PostgreSQL the column is BOOLEAN under this store's DDL, so the
+        result is empty unless the schema was changed outside this store.
+        Full table scan, diagnostic use only; no index helps because SQLite
+        cannot express "not a boolean" in a dialect-neutral WHERE clause.
+        """
+        self._require_available()
+
+        from sqlalchemy import text
+
+        sql = text("SELECT subject_id, permission, resource_id, granted FROM rebac_policies")
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        return [
+            {
+                "subject_id": r[0],
+                "permission": r[1],
+                "resource_id": r[2],
+                "granted": r[3],
+                "granted_type": type(r[3]).__name__,
+            }
+            for r in rows
+            if not _is_valid_granted(r[3])
         ]
 
     # ------------------------------------------------------------------
