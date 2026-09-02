@@ -197,6 +197,19 @@ def list_packs() -> list[dict[str, Any]]:
             with open(path, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             if data and "name" in data:
+                # #109: never advertise a name that get_pack will refuse. The
+                # listing is what a client picks from and feeds back in, so
+                # offering a refused name produces "Pack 'X' not found.
+                # Available: ['X']" and an option that can never be taken.
+                # The DECLARED name is checked, not the filename, because the
+                # declared name is the value that goes back out to the client.
+                if not safe_schema_name(data["name"]):
+                    logger.warning(
+                        "Skipping pack manifest %s: its declared name %r is not a "
+                        "safe path component, so it could never be installed.",
+                        path.name, data["name"],
+                    )
+                    continue
                 packs.append({
                     "name": data["name"],
                     "version": data.get("version", "unknown"),
