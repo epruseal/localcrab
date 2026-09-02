@@ -32,7 +32,6 @@ from opencrab.stores.sql_store import SQLStore
 
 logger = logging.getLogger(__name__)
 
-# Relations in the subject→resource space that map to permissions
 # Reasons for the fail-closed SQL branches of ``ReBACEngine.check`` (#78).
 # Tests assert these strings in full, so callers can tell a store failure
 # from the ordinary "no policy, no edge" default deny.
@@ -44,6 +43,7 @@ _SQL_NON_BOOLEAN_REASON = (
     "default deny applied (fail-closed)."
 )
 
+# Relations in the subject→resource space that map to permissions
 _PERMISSION_RELATIONS: dict[str, list[str]] = {
     "view": ["can_view", "can_edit", "can_approve", "owns", "manages"],
     "edit": ["can_edit", "can_approve", "owns", "manages"],
