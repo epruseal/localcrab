@@ -8,8 +8,16 @@ THREAD SAFETY: a threading.Lock serialises all write operations (the
 read-modify-write of _load/_save). Reads take no lock and stay safe
 because _save writes to a temp file and os.replace()s it atomically, so a
 concurrent reader always sees either the whole old file or the whole new
-file — never a partially written one; _load also tolerates a corrupt file
-by returning {}.
+file — never a partially written one.
+
+CORRUPTION CONTRACT: _load fails closed on a corrupt collection file. A
+collection file is corrupt when it cannot be decoded as UTF-8, when its
+content does not parse as JSON, or when the parsed value is not a JSON
+object. _load raises CorruptCollectionError in each of these cases. A
+missing file is not corrupt; _load returns {} for it, the same as before.
+Every write reads the collection with _load before it writes, inside the
+lock. A corrupt file therefore blocks the write and stays on disk,
+unmodified, for the operator to inspect or repair.
 """
 
 from __future__ import annotations
@@ -22,6 +30,27 @@ from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class CorruptCollectionError(RuntimeError):
+    """A collection file (``<collection>.json``) failed to load: it is not
+    valid UTF-8, it is not valid JSON, or its top-level value is not a JSON
+    object. ``_load`` raises this instead of returning ``{}`` (issue #209):
+    the old fallback hid the corruption from every reader and let the next
+    write silently replace the file, destroying the original bytes.
+
+    Attributes:
+        collection: the collection name (e.g. ``"nodes"``), not the path.
+        path: the collection file's on-disk path.
+    """
+
+    def __init__(self, collection: str, path: str, reason: str) -> None:
+        self.collection = collection
+        self.path = path
+        super().__init__(
+            f"corrupt collection file '{collection}' ({path}): {reason}; "
+            "not overwritten; inspect, repair or remove the file"
+        )
 
 
 class LocalDocStore:
@@ -53,11 +82,23 @@ class LocalDocStore:
         if not os.path.exists(path):
             return {}
         try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            logger.warning("Corrupt %s.json, resetting: %s", collection, exc)
-            return {}
+            with open(path, "rb") as f:
+                raw = f.read()
+            text = raw.decode("utf-8")
+            data = json.loads(text)
+        except UnicodeDecodeError as exc:
+            reason = f"invalid UTF-8: {exc}"
+            logger.error("Corrupt %s.json: %s", collection, reason)
+            raise CorruptCollectionError(collection, path, reason) from exc
+        except json.JSONDecodeError as exc:
+            reason = f"invalid JSON: {exc}"
+            logger.error("Corrupt %s.json: %s", collection, reason)
+            raise CorruptCollectionError(collection, path, reason) from exc
+        if not isinstance(data, dict):
+            reason = f"top-level value is {type(data).__name__}, not an object"
+            logger.error("Corrupt %s.json: %s", collection, reason)
+            raise CorruptCollectionError(collection, path, reason)
+        return data
 
     def _save(self, collection: str, data: dict[str, Any]) -> None:
         """Atomic write: serialize to tmp file then rename to avoid corruption."""
