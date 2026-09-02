@@ -441,26 +441,44 @@ class TestListingAndLookupAgree:
         assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
 
     def test_the_whole_type_list_is_vetted_not_a_slice_of_it(self, packs_env, monkeypatch):
-        """Pin that the listing hands _unsafe_names the entire list.
+        """Pin that the listing hands _unsafe_names the parsed list ITSELF.
 
-        Fixtures alone cannot do this: for any finite set of them, some longer
-        slice (types[:n]) still passes. Asserting on the argument closes every
-        slice variant at once.
+        Fixtures cannot pin this: for any fixture of n types, the slice
+        types[:n] passes. Neither can comparing the argument's CONTENTS -- an
+        earlier version of this test did, with a five-type manifest, and
+        types[:10] sailed through it while an eleven-type manifest really did
+        regress. Identity is what is slice-proof: every slice builds a new
+        list, so requiring the argument to BE the parsed object rules them all
+        out at once, whatever their length.
         """
         tmp_root, types_dir, packs_dir = packs_env
         declared = ["A", "B", "C", "D", "E"]
         write_manifest(packs_dir, "wide", declared)
-        seen: list[list] = []
-        real = pack_registry._unsafe_names
+
+        parsed: list = []
+        real_safe_load = yaml.safe_load
+
+        def capture(stream):
+            data = real_safe_load(stream)
+            parsed.append(data)
+            return data
+
+        seen: list = []
+        real_unsafe_names = pack_registry._unsafe_names
 
         def spy(names):
-            seen.append(list(names))
-            return real(names)
+            seen.append(names)
+            return real_unsafe_names(names)
 
+        monkeypatch.setattr(yaml, "safe_load", capture)
         monkeypatch.setattr(pack_registry, "_unsafe_names", spy)
         pack_registry.list_packs()
 
-        assert declared in seen, seen
+        assert parsed and parsed[-1]["types"] == declared, parsed
+        assert any(arg is parsed[-1]["types"] for arg in seen), (
+            "the type list was copied or sliced before being vetted; "
+            f"got {seen!r} for {parsed[-1]['types']!r}"
+        )
 
     def test_a_refused_manifest_is_named_in_the_warning(self, packs_env, caplog):
         """Hiding it from the listing must not hide WHY -- the log carries both.
