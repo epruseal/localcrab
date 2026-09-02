@@ -424,6 +424,88 @@ class TestListingAndLookupAgree:
 
         assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
 
+    def test_listing_omits_a_pack_whose_type_names_install_would_refuse(self, packs_env):
+        """A safe pack name is not enough -- install refuses the whole manifest.
+
+        Four manifests put the offending type at a different index so that a
+        partial check (first element, last element, either end) fails, and the
+        spy below closes the remaining slice variants outright.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "bad", ["../escape"])
+        write_manifest(packs_dir, "mixed_first", ["../escape", "Normal"])
+        write_manifest(packs_dir, "mixed_mid", ["Normal", "Safe", "../escape", "Other"])
+        write_manifest(packs_dir, "mixed_last", ["Normal", "../escape"])
+
+        assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
+
+    def test_the_whole_type_list_is_vetted_not_a_slice_of_it(self, packs_env, monkeypatch):
+        """Pin that the listing hands _unsafe_names the entire list.
+
+        Fixtures alone cannot do this: for any finite set of them, some longer
+        slice (types[:n]) still passes. Asserting on the argument closes every
+        slice variant at once.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        declared = ["A", "B", "C", "D", "E"]
+        write_manifest(packs_dir, "wide", declared)
+        seen: list[list] = []
+        real = pack_registry._unsafe_names
+
+        def spy(names):
+            seen.append(list(names))
+            return real(names)
+
+        monkeypatch.setattr(pack_registry, "_unsafe_names", spy)
+        pack_registry.list_packs()
+
+        assert declared in seen, seen
+
+    def test_a_refused_manifest_is_named_in_the_warning(self, packs_env, caplog):
+        """Hiding it from the listing must not hide WHY -- the log carries both.
+
+        Checked per record, not against the whole caplog text: the filename and
+        the offending type names have to travel together to be useful.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "bad", ["../escape"])
+
+        with caplog.at_level("WARNING"):
+            pack_registry.list_packs()
+
+        assert any(
+            "bad.yaml" in r.getMessage() and "../escape" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_hidden_pack_can_still_be_asked_about_directly(self, packs_env):
+        """Omitted from the listing, but a direct install still explains itself."""
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "bad", ["../escape"])
+
+        result = pack_registry.install_pack("bad")
+
+        assert "error" in result and "../escape" in result["error"], result
+
+    def test_every_listed_pack_installs_without_an_error(self, packs_env):
+        """Holds for this fixture, and is not claimed beyond it.
+
+        A manifest whose declared name differs from its filename still lists
+        under one name and resolves under another; that predates this branch
+        and is out of scope, so the assertion stays scoped to what is set up
+        here rather than being stated as a general law.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "bad", ["../escape"])
+        write_manifest(packs_dir, "CON", ["Normal"])
+
+        listed = [p["name"] for p in pack_registry.list_packs()]
+        assert listed, "expected the fixture to leave something listed"
+        for name in listed:
+            assert "error" not in pack_registry.install_pack(name), name
+
     def test_a_safely_named_pack_is_still_listed_and_loadable(self, packs_env):
         tmp_root, types_dir, packs_dir = packs_env
         write_manifest(packs_dir, "ok", ["Normal"])
