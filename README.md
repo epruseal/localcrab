@@ -420,6 +420,15 @@ STORAGE_MODE=docker opencrab serve
 > ```
 >
 > **로컬 모드 ReBAC 제약**: 그래프 권한 탐색이 Python BFS(`find_neighbors()`)로 동작합니다. 직접 및 전이적(member_of/manages → permission) 경로는 완전 지원. depth 2 초과 복잡한 다중 홉 패턴은 미지원.
+>
+> **정책 값 불변식 (fail-closed)**: `rebac_policies.granted` 는 SQLite 에서 INTEGER 로 저장됩니다. 저장값이 정확히 0/1 이 아닌 행(예: 직접 SQL 로 넣은 2)은 `check_policy`/`list_policies` 가 **deny** 로 해석하고 경고 로그를 남깁니다. 이전에는 이런 값이 허용으로 해석됐고, 그 동작 변경은 의도된 것입니다. `set_policy` 는 `True`/`False`/0/1 이외 입력을 `ValueError` 로 거부합니다. 새로 만드는 SQLite 테이블에는 `CHECK (granted IN (0, 1))` 가 있지만 이미 있는 테이블에는 소급되지 않습니다. 기존 DB 에서 오염 행을 찾으려면 아래 진단 API 를 쓰십시오(CLI 명령이 아니라 Python 메서드이며, 전량 스캔이라 진단 용도로만 쓰십시오).
+>
+> ```python
+> from opencrab.stores.sql_store import SQLStore
+> store = SQLStore("sqlite:///opencrab.db")   # 실제 DB 파일 경로로 바꾼다
+> print(store.list_invalid_policies())   # [] 이면 오염 행 없음
+> store._engine.dispose()
+> ```
 
 ### Docker → Local 모드 마이그레이션
 
