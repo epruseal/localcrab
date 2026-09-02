@@ -15,7 +15,10 @@ and therefore also catches a write that lands on a link's target.
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
+import random
+import string
 from pathlib import Path
 
 import pytest
@@ -94,7 +97,29 @@ def write_manifest(packs_dir: Path, name: str, types: list[str]) -> None:
 
 
 # Names that must never reach the filesystem as a path component.
-UNSAFE_NAMES = ["../escape", "a/b", "a\\b", "", ".", "..", "a\x00b", "a:b", "C:evil"]
+UNSAFE_NAMES = [
+    # separators, relative and absolute forms
+    "../escape", "a/b", "a\\b", "", ".", "..", "C:evil",
+    # Windows-reserved characters (":" also makes an alternate data stream)
+    "a:b", "a?b", "a*b", 'a"b', "a<b", "a>b", "a|b", "a\x00b", "a\x01b",
+    # DOS device names -- on Windows these address a device, not a file here
+    "CON", "con", "NUL", "COM1", "AUX.foo", "CONIN$", "CONOUT$", "COM\xb9", "LPT\xb3",
+    "CON .txt",
+    # trailing dot/space: Windows strips these, so two type names collide
+    "Foo.", "Foo ",
+]
+
+# Written out independently of the implementation on purpose: an equality
+# assertion against these catches ANY single addition to or deletion from the
+# module's own sets, including entries that some other check happens to cover.
+EXPECTED_RESERVED_CHARS = frozenset(
+    {chr(i) for i in range(32)} | {'"', "*", ":", "<", ">", "?", "|", "/", "\\"}
+)
+EXPECTED_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{c}" for c in "123456789\xb9\xb2\xb3"}
+    | {f"LPT{c}" for c in "123456789\xb9\xb2\xb3"}
+)
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +280,26 @@ class TestPackNameCannotEscapePacksDir:
         assert not (types_dir / "FromOutside.yaml").exists()
         assert_outside_unchanged(before, snapshot(tmp_root), "types")
 
+    def test_reserved_pack_name_is_refused_even_though_the_manifest_exists(self, packs_env):
+        """A real CON.yaml manifest, so only the name check can be what refuses it.
+
+        Without this, dropping the name check from ``get_pack`` survives: the
+        only other pack-name case points outside, which fails on absence too.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "CON", ["Normal"])
+        assert (packs_dir / "CON.yaml").is_file()
+        before = snapshot(tmp_root)
+
+        assert pack_registry.get_pack("CON") is None
+        install = pack_registry.install_pack("CON")
+        uninstall = pack_registry.uninstall_pack("CON", force=True)
+
+        assert "error" in install and "not found" in install["error"].lower(), install
+        assert "error" in uninstall and "not found" in uninstall["error"].lower(), uninstall
+        assert not (types_dir / "Normal.yaml").exists()
+        assert_outside_unchanged(before, snapshot(tmp_root), "types")
+
     def test_uninstall_pack_refuses_an_escaping_pack_name(self, outside_pack):
         tmp_root, types_dir, packs_dir, outside = outside_pack
         before = snapshot(tmp_root)
@@ -375,10 +420,72 @@ class TestSafeSchemaName:
     def test_rejects(self, bad):
         assert loader.safe_schema_name(bad) is False
 
-    @pytest.mark.parametrize("good", ["Normal", "한글타입", "Disease", "with space", "a-b_c.d", "х"])
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "Normal", "한글타입", "Disease", "with space", "a-b_c.d", "х",
+            # near-misses for the reserved-name set: matched exactly, never by prefix
+            "Console", "Contract", "Nullable", "Auxiliary", "Printer",
+            "COM0", "COM10", "LPT0", "LPT10",
+            # DEL is NOT rejected: it is not in the Windows reserved set this
+            # mirrors, and rejecting it would be a separate policy with no
+            # rationale in this change. Pinned so the choice stays deliberate.
+            "a\x7fb",
+        ],
+    )
     def test_accepts(self, good):
         assert loader.safe_schema_name(good) is True
 
     def test_rejects_non_strings(self):
         assert loader.safe_schema_name(None) is False
         assert loader.safe_schema_name(3) is False
+
+
+class TestReservedFilenameRules:
+    """Deterministic coverage of the reserved sets, run on every Python.
+
+    The CPython parity test below skips on 3.11, which is the required CI, and
+    a random sample would not reliably kill the deletion of one entry. These
+    assertions target ``_is_reserved_filename`` directly rather than
+    ``safe_schema_name`` because ":", "/" and "\\" would still be refused by
+    the PurePath comparison, so a deletion of those from the character set
+    would otherwise survive.
+    """
+
+    def test_reserved_character_set_matches_expected_exactly(self):
+        assert loader._RESERVED_CHARS == EXPECTED_RESERVED_CHARS
+
+    def test_reserved_name_set_matches_expected_exactly(self):
+        assert loader._RESERVED_NAMES == EXPECTED_RESERVED_NAMES
+
+    @pytest.mark.parametrize("ch", sorted(EXPECTED_RESERVED_CHARS))
+    def test_every_reserved_character_is_refused(self, ch):
+        assert loader._is_reserved_filename(f"a{ch}b") is True
+
+    @pytest.mark.parametrize("reserved", sorted(EXPECTED_RESERVED_NAMES))
+    def test_every_reserved_device_name_is_refused(self, reserved):
+        for variant in (reserved, reserved.lower(), f"{reserved}.yaml", f"{reserved} .txt"):
+            assert loader._is_reserved_filename(variant) is True, variant
+        assert loader.safe_schema_name(reserved) is False
+
+    def test_dot_and_dotdot_are_not_treated_as_reserved_filenames(self):
+        """CPython excludes them here; safe_schema_name rejects them separately."""
+        assert loader._is_reserved_filename(".") is False
+        assert loader._is_reserved_filename("..") is False
+        assert loader.safe_schema_name(".") is False
+        assert loader.safe_schema_name("..") is False
+
+    @pytest.mark.skipif(
+        not hasattr(ntpath, "_isreservedname"),
+        reason="ntpath._isreservedname is 3.13+; the deterministic tests above cover 3.11",
+    )
+    def test_matches_cpython_isreservedname(self):
+        """Warn if the vendored copy drifts from the definition it was taken from."""
+        rng = random.Random(20260902)
+        alphabet = string.ascii_letters + "0123456789 ._$" + '"*:<>?|/\\' + "\x00\x01\x1f\x7f¹²³"
+        cases = list(UNSAFE_NAMES) + ["Normal", "한글타입", "COM0", "LPT10", "nul .txt", "prn.a.b"]
+        cases += ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 8))) for _ in range(2000)]
+        mismatched = [
+            c for c in cases if c and loader._is_reserved_filename(c) != ntpath._isreservedname(c)
+        ]
+        assert mismatched == []
