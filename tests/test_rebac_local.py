@@ -7,11 +7,21 @@ decisions without relying on run_cypher() (which is a no-op in local mode).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from opencrab.ontology.rebac import ReBACEngine
+import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+
+from opencrab.ontology.rebac import (
+    _SQL_LOOKUP_FAILED_REASON,
+    _SQL_NON_BOOLEAN_REASON,
+    ReBACEngine,
+)
 from opencrab.stores.local_graph_store import LocalGraphStore
+from opencrab.stores.sql_store import SQLStore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -188,3 +198,208 @@ class TestPermissionValidation:
 
         assert decision.granted is False
         assert "Invalid" in decision.reason or decision.reason  # some error message present
+
+
+# ---------------------------------------------------------------------------
+# SQL store failure tests (issue #78)
+# ---------------------------------------------------------------------------
+#
+# ``check()`` must be a fail-closed authorization boundary. The graph path
+# already swallows store errors; the SQL policy lookup did not, so a DB
+# outage propagated as an exception. These tests fix three contracts:
+#
+# 1. any exception from the SQL availability check or ``check_policy`` yields
+#    a DENY decision with the dedicated reason and one WARNING that names the
+#    exception type but never its text (the text can carry a DSN);
+# 2. the graph is not consulted after a SQL failure, because an explicit DENY
+#    row that could not be read must not be overridden by a graph GRANT;
+# 3. a ``check_policy`` return outside ``bool | None`` is DENY, not "no policy".
+
+
+class _RaisingAvailable:
+    """SQL stub whose ``available`` property itself raises."""
+
+    @property
+    def available(self) -> bool:
+        raise RuntimeError("SECRET-DSN-MARKER available probe failed")
+
+    def check_policy(self, *args: object) -> bool | None:  # pragma: no cover
+        raise AssertionError("check_policy must not be reached")
+
+
+def _grant_graph(tmp_path: Path) -> LocalGraphStore:
+    """Graph with a direct owns edge: GRANT when SQL says 'no policy'."""
+    store = _make_store(tmp_path)
+    store.upsert_node("User", "u1", {"name": "U"})
+    store.upsert_node("Resource", "r1", {"name": "R"})
+    store.upsert_edge("User", "u1", "owns", "Resource", "r1")
+    return store
+
+
+def _spy_graph(store: LocalGraphStore) -> MagicMock:
+    spy = MagicMock(wraps=store)
+    spy.available = True
+    return spy
+
+
+def _failing_sql(exc: Exception) -> MagicMock:
+    stub = MagicMock()
+    stub.available = True
+    stub.check_policy.side_effect = exc
+    return stub
+
+
+def _rebac_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "opencrab.ontology.rebac" and r.levelno == logging.WARNING
+    ]
+
+
+class TestSQLStoreFailure:
+    def test_sql_lookup_exception_returns_deny_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        engine = ReBACEngine(
+            neo4j=_make_store(tmp_path), sql=_failing_sql(RuntimeError("connection closed"))
+        )
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_LOOKUP_FAILED_REASON
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        for needle in ("RuntimeError", "subject=u1", "permission=view", "resource=r1"):
+            assert needle in msg, msg
+
+    def test_sql_lookup_exception_with_real_sqlite_store(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sql = SQLStore(f"sqlite:///{tmp_path / 'policies.db'}")
+        with sql._engine.begin() as conn:
+            conn.execute(text("DROP TABLE rebac_policies"))
+        # Fixture preconditions: the store still reports available, and the
+        # lookup itself now raises a real driver error.
+        assert sql.available is True
+        with pytest.raises(OperationalError):
+            sql.check_policy("u1", "view", "r1")
+
+        engine = ReBACEngine(neo4j=_make_store(tmp_path), sql=sql)
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_LOOKUP_FAILED_REASON
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        assert "OperationalError" in warnings[0].getMessage()
+
+    def test_sql_lookup_exception_does_not_fall_through_to_graph(
+        self, tmp_path: Path
+    ) -> None:
+        graph = _grant_graph(tmp_path)
+        # Control: with SQL saying "no policy" the graph grants.
+        ok_sql = MagicMock()
+        ok_sql.available = True
+        ok_sql.check_policy.return_value = None
+        assert ReBACEngine(neo4j=graph, sql=ok_sql).check("u1", "view", "r1").granted is True
+
+        spy = _spy_graph(graph)
+        engine = ReBACEngine(neo4j=spy, sql=_failing_sql(RuntimeError("db down")))
+        decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_LOOKUP_FAILED_REASON
+        spy.find_neighbors.assert_not_called()
+
+    def test_sql_lookup_exception_message_is_not_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        exc = RuntimeError("SECRET-DSN-MARKER postgresql://user:pw@host/db")
+        engine = ReBACEngine(neo4j=_make_store(tmp_path), sql=_failing_sql(exc))
+        with caplog.at_level(logging.DEBUG, logger="opencrab.ontology.rebac"):
+            engine.check("u1", "view", "r1")
+
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        assert "SECRET-DSN-MARKER" not in warnings[0].getMessage()
+        assert "RuntimeError" in warnings[0].getMessage()
+        # The full traceback stays reachable for operators at DEBUG only.
+        debug = [
+            r
+            for r in caplog.records
+            if r.name == "opencrab.ontology.rebac" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info and r.exc_info[1] is exc for r in debug)
+
+    def test_sql_available_exception_returns_deny(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        spy = _spy_graph(_grant_graph(tmp_path))
+        engine = ReBACEngine(neo4j=spy, sql=_RaisingAvailable())
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_LOOKUP_FAILED_REASON
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        assert "SECRET-DSN-MARKER" not in warnings[0].getMessage()
+        spy.find_neighbors.assert_not_called()
+
+    @pytest.mark.parametrize("value", [1, 0, "yes", object()], ids=["int1", "int0", "str", "obj"])
+    def test_sql_non_boolean_policy_value_denies_without_graph(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, value: object
+    ) -> None:
+        graph = _grant_graph(tmp_path)
+        ok_sql = MagicMock()
+        ok_sql.available = True
+        ok_sql.check_policy.return_value = None
+        assert ReBACEngine(neo4j=graph, sql=ok_sql).check("u1", "view", "r1").granted is True
+
+        spy = _spy_graph(graph)
+        bad_sql = MagicMock()
+        bad_sql.available = True
+        bad_sql.check_policy.return_value = value
+        engine = ReBACEngine(neo4j=spy, sql=bad_sql)
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_NON_BOOLEAN_REASON
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        assert type(value).__name__ in warnings[0].getMessage()
+        spy.find_neighbors.assert_not_called()
+
+    def test_graph_exception_still_denies(self, tmp_path: Path) -> None:
+        graph = MagicMock()
+        graph.available = True
+        graph.find_neighbors.side_effect = RuntimeError("graph down")
+        engine = ReBACEngine(neo4j=graph, sql=_make_sql_stub())
+
+        decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert "Default deny" in decision.reason
+
+    @pytest.mark.parametrize(
+        ("stored", "granted", "reason_fragment"),
+        [(True, True, "Explicit GRANT"), (False, False, "Explicit DENY")],
+        ids=["grant", "deny"],
+    )
+    def test_explicit_policy_paths_unchanged(
+        self, tmp_path: Path, stored: bool, granted: bool, reason_fragment: str
+    ) -> None:
+        sql = MagicMock()
+        sql.available = True
+        sql.check_policy.return_value = stored
+        engine = ReBACEngine(neo4j=_make_store(tmp_path), sql=sql)
+
+        decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is granted
+        assert reason_fragment in decision.reason
