@@ -20,6 +20,41 @@ logger = logging.getLogger(__name__)
 SCHEMAS_DIR = Path(__file__).parent / "types"
 
 
+# Mirrors CPython's ntpath._reserved_chars / _reserved_names / _isreservedname
+# (see the "Naming Files, Paths, and Namespaces" rules they cite). Vendored
+# rather than called: ntpath.isreserved is 3.13+ and this project supports
+# 3.11, and isreserved() takes a whole path (it runs splitroot and splits on
+# separators) while what is needed here is the single-component predicate.
+# tests/test_schema_pack_path_escape.py pins both sets by exact equality and
+# compares against ntpath._isreservedname where that exists, so a drift from
+# the original shows up as a failure rather than as silent divergence.
+_RESERVED_CHARS = frozenset(
+    {chr(i) for i in range(32)} | {'"', "*", ":", "<", ">", "?", "|", "/", "\\"}
+)
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{c}" for c in "123456789\xb9\xb2\xb3"}
+    | {f"LPT{c}" for c in "123456789\xb9\xb2\xb3"}
+)
+
+
+def _is_reserved_filename(name: str) -> bool:
+    """Return True if *name* is reserved as a filename by Windows.
+
+    Note this says nothing about ``.`` and ``..`` -- CPython's original
+    excludes them here, and ``safe_schema_name`` rejects them separately.
+    """
+    if name[-1:] in (".", " "):
+        # Windows strips trailing dots and spaces, so "Foo." and "Foo" would
+        # be the same file: two type declarations colliding into one.
+        return name not in (".", "..")
+    if _RESERVED_CHARS.intersection(name):
+        return True
+    # A DOS device name is reserved with any extension and with trailing
+    # spaces before it ("nul", "NUL.yaml", "nul .txt" all address the device).
+    return name.partition(".")[0].rstrip(" ").upper() in _RESERVED_NAMES
+
+
 def safe_schema_name(name: Any) -> bool:
     """Return True if *name* is safe to use as a single path component (#109).
 
@@ -31,7 +66,8 @@ def safe_schema_name(name: Any) -> bool:
 
     This is a deny-list, not a character allow-list: unicode type names work
     today (a pack may legitimately declare a Korean type) and an allow-list
-    would break them. Only what an escape actually needs is rejected.
+    would break them. Only what stops the name from denoting an ordinary file
+    inside the directory is rejected.
 
     ``.`` and ``..`` are named explicitly rather than left to the
     ``PurePath.name`` comparison below: ``PurePosixPath(".").name`` is ``""``
@@ -42,18 +78,30 @@ def safe_schema_name(name: Any) -> bool:
     check. A future suffix-less caller would escape.
 
     Both path flavours are consulted so that ``a\\b`` -- a perfectly legal
-    single filename on POSIX -- is rejected too. This is deliberate rather
-    than incidental: the files these names produce are written into the
-    repository tree (``opencrab/schemas/types/``) and get checked out on
-    other platforms, where a backslash or a drive prefix would separate
-    components. Names must be portable path components, so ``a\\b`` and
-    ``a:b`` are rejected even on Linux. No shipped pack uses such a name.
+    single filename on POSIX -- is rejected too, and ``_is_reserved_filename``
+    adds the rest of the Windows rules (reserved characters, DOS device names
+    such as ``CON``, trailing dots and spaces). This is deliberate rather than
+    incidental: the files these names produce are written into the repository
+    tree (``opencrab/schemas/types/``) and get checked out on other platforms,
+    where a backslash or a drive prefix separates components and ``CON.yaml``
+    addresses a device rather than a file. So the name must be a path
+    component that denotes a file on either platform, and ``a\\b``, ``a:b``
+    and ``CON`` are rejected even on Linux. No shipped pack uses such a name;
+    a pack that did would now get a clear refusal.
+
+    What this does NOT promise: that two accepted names are distinct files.
+    A case-insensitive filesystem still collapses ``Foo`` and ``foo``, which
+    is a separate concern and not checked here.
+
+    Not promised either: that an accepted name always reaches the filesystem
+    successfully. A very long name still raises ``OSError`` from the write --
+    a crash, not an escape, and the same before this check existed.
     """
     if not isinstance(name, str) or not name:
         return False
-    if "\x00" in name:
-        return False
     if name in (".", ".."):
+        return False
+    if _is_reserved_filename(name):
         return False
     return PurePosixPath(name).name == name and PureWindowsPath(name).name == name
 
@@ -74,15 +122,23 @@ def resolves_inside(path: Path, directory: Path) -> bool:
     ``FileNotFoundError`` rather than creating anything), so the stricter
     comparison states the actual invariant.
 
-    Deliberately NOT applied on read paths. There, the only way in is name
-    injection, which ``safe_schema_name`` already stops, and rejecting
-    symlinks would diverge from ``pack_registry.list_packs``, which globs the
-    directory and follows links -- a symlinked pack would be listed but then
-    report "not found" on install.
+    Deliberately NOT applied on read paths. There, the only way UNTRUSTED
+    INPUT gets in is name injection, which ``safe_schema_name`` already stops.
+    A symlink planted in the directory is a different thing: planting it needs
+    write access to that directory, which is outside this check's threat
+    model, and refusing it would diverge from ``pack_registry.list_packs``,
+    which globs the directory and follows links -- a symlinked pack would be
+    listed and then report "not found" on install. Following such a link on a
+    read is therefore a supported, deliberate behaviour, pinned by a test.
 
-    Resolution failures (a symlink loop, a permission error mid-path) count
-    as "not inside": the check refuses rather than propagating, since Python
-    versions differ in whether ``resolve()`` raises on a loop at all.
+    What "refuses" means here, precisely: this returns False when ``resolve()``
+    raises, and when the resolved parent differs from the resolved directory.
+    It does NOT catch every resolution failure -- ``resolve()`` runs with
+    ``strict=False``, and on Python 3.13 a symlink loop resolves to itself
+    rather than raising, so a loop inside the directory compares equal and
+    passes. That is not an escape; the write simply fails later with
+    ``OSError``. The exception branch stays because Python versions differ in
+    whether a loop raises at all.
     """
     try:
         return path.resolve().parent == directory.resolve()
@@ -108,7 +164,8 @@ def load_yaml_schema(directory: Path, name: str) -> dict[str, Any] | None:
     if not safe_schema_name(name):
         logger.warning(
             "Refusing to load schema for %r: not a safe path component "
-            "(no separators, no '.'/'..', not absolute).",
+            "(no separators, not '.'/'..', not absolute, not reserved as a "
+            "filename by Windows).",
             name,
         )
         return None

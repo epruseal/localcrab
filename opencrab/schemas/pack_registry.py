@@ -20,9 +20,27 @@ to form a file path, and ``pathlib``'s ``/`` neither resolves ``..`` nor
 rejects an absolute right-hand operand, so an unchecked name addresses a
 file outside the directory it was supposed to name. An unsafe pack name
 reads as "pack not found"; a manifest carrying an unsafe type name is
-refused whole, before anything is created or deleted. See
-``opencrab.schemas.loader.safe_schema_name`` and ``resolves_inside`` for
-the two checks and for what they deliberately do not defend against.
+refused whole, before anything is created or deleted. A name is unsafe if
+it carries a separator (either flavour), is "." or "..", is absolute, or
+is reserved as a filename by Windows -- a reserved character, a DOS device
+name such as CON, or a trailing dot or space. See
+``opencrab.schemas.loader.safe_schema_name``.
+
+Symlink policy (#109), which is NOT the same in both directions:
+
+- Reading a pack manifest from the pack directory FOLLOWS symlinks. This
+  matches ``list_packs``, which globs that directory and follows links, so
+  a symlinked pack is listed and installable rather than listed and then
+  "not found". Planting such a link needs write access to that directory,
+  which is outside this module's threat model -- what it defends against is
+  an unsafe NAME, not an already-modified directory.
+- Writing and deleting a type schema refuses a path that resolves outside
+  the type directory (``loader.resolves_inside``). A link that resolves to
+  another direct child inside it still passes, and the write then follows
+  it like any other file operation; ``unlink`` removes the link itself,
+  though the generated-header read just before it follows the link. The
+  delete path never reaches the check for a dangling link, because
+  ``exists()`` is false and the type is skipped first.
 """
 
 from __future__ import annotations
@@ -162,7 +180,9 @@ def _unsafe_names_error(pack_name: str, rejected: list[Any]) -> dict[str, str]:
         "error": (
             f"Pack '{pack_name}' manifest has unsafe type name(s): {rejected!r}. "
             "A type name must be a single path component: no path separators, "
-            "not '.' or '..', not absolute, no NUL."
+            "not '.' or '..', not absolute, and not reserved as a filename by "
+            "Windows (no control or reserved characters, no DOS device name "
+            "such as CON, no trailing dot or space)."
         )
     }
 
@@ -194,7 +214,8 @@ def get_pack(name: str) -> dict[str, Any] | None:
     if not safe_schema_name(name):
         logger.warning(
             "Refusing to load pack %r: the pack name is not a safe path "
-            "component (no separators, no '.'/'..', not absolute).",
+            "component (no separators, not '.'/'..', not absolute, not "
+            "reserved as a filename by Windows).",
             name,
         )
         return None

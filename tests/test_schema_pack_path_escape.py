@@ -394,9 +394,13 @@ class TestReadPathsStillFollowSymlinks:
     def test_get_pack_loads_a_manifest_that_is_a_symlink_to_outside(self, packs_env):
         """Reads keep following symlinks, matching ``list_packs``'s glob.
 
-        Blocking this would make a symlinked pack visible to the list tool but
-        "not found" to install -- an inconsistency with no gain against name
-        injection, which layer 1 already stops.
+        A deliberate decision, kept after adversarial review raised it:
+        blocking this would make a symlinked pack visible to the list tool but
+        "not found" to install, an inconsistency with no gain against name
+        injection -- which the name check already stops. Planting the link
+        needs write access to the pack directory, which is a different threat
+        from an unsafe name. Pinned here so a later change to that policy has
+        to be a deliberate one.
         """
         tmp_root, types_dir, packs_dir = packs_env
         elsewhere = tmp_root / "elsewhere"
