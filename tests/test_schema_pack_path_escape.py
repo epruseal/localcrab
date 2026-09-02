@@ -427,9 +427,11 @@ class TestListingAndLookupAgree:
     def test_listing_omits_a_pack_whose_type_names_install_would_refuse(self, packs_env):
         """A safe pack name is not enough -- install refuses the whole manifest.
 
-        Four manifests put the offending type at a different index so that a
-        partial check (first element, last element, either end) fails, and the
-        spy below closes the remaining slice variants outright.
+        Four manifests spread the offending type across three indices -- 0
+        (bad and mixed_first), 1 (mixed_last) and 2 (mixed_mid) -- so that a
+        check of only the first element, only the last, or only both ends
+        fails. Slices longer than the fixtures are closed by the identity spy
+        below, not by these.
         """
         tmp_root, types_dir, packs_dir = packs_env
         write_manifest(packs_dir, "ok", ["Normal"])
