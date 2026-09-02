@@ -18,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 from opencrab.ontology.rebac import (
     _SQL_LOOKUP_FAILED_REASON,
     _SQL_NON_BOOLEAN_REASON,
+    _SQL_UNAVAILABLE_REASON,
     ReBACEngine,
 )
 from opencrab.stores.local_graph_store import LocalGraphStore
@@ -32,9 +33,16 @@ def _make_store(tmp_path: Path) -> LocalGraphStore:
 
 
 def _make_sql_stub() -> MagicMock:
-    """Return a SQL store stub that is unavailable (skips SQL policy checks)."""
+    """Return an available SQL store stub with no policy rows.
+
+    ``check_policy`` returns ``None`` ("no row"), which is the only state
+    that lets ``check()`` fall through to the graph. An unavailable store is
+    a connection failure and is DENY (#78), so it cannot stand in for
+    "no SQL policy" here.
+    """
     stub = MagicMock()
-    stub.available = False
+    stub.available = True
+    stub.check_policy.return_value = None
     return stub
 
 
@@ -213,7 +221,10 @@ class TestPermissionValidation:
 #    exception type but never its text (the text can carry a DSN);
 # 2. the graph is not consulted after a SQL failure, because an explicit DENY
 #    row that could not be read must not be overridden by a graph GRANT;
-# 3. a ``check_policy`` return outside ``bool | None`` is DENY, not "no policy".
+# 3. a ``check_policy`` return outside ``bool | None`` is DENY, not "no policy";
+# 4. a store that reports ``available=False`` is DENY too. The factory always
+#    builds a SQLStore, and ``available`` only turns False when ``_connect``
+#    caught a connection error, so "unavailable" is an outage, not a mode.
 
 
 class _RaisingAvailable:
@@ -373,6 +384,48 @@ class TestSQLStoreFailure:
         warnings = _rebac_warnings(caplog)
         assert len(warnings) == 1
         assert type(value).__name__ in warnings[0].getMessage()
+        spy.find_neighbors.assert_not_called()
+
+    def test_sql_unavailable_returns_deny_without_graph(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        graph = _grant_graph(tmp_path)
+        # Control: an available store with no policy row lets the graph grant.
+        assert ReBACEngine(neo4j=graph, sql=_make_sql_stub()).check("u1", "view", "r1").granted is True
+
+        spy = _spy_graph(graph)
+        down = MagicMock()
+        down.available = False
+        engine = ReBACEngine(neo4j=spy, sql=down)
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_UNAVAILABLE_REASON
+        warnings = _rebac_warnings(caplog)
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        for needle in ("unavailable", "subject=u1", "permission=view", "resource=r1"):
+            assert needle in msg, msg
+        down.check_policy.assert_not_called()
+        spy.find_neighbors.assert_not_called()
+
+    def test_sql_unavailable_with_real_store(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A SQLite URL under a directory that does not exist makes _connect
+        # fail; SQLStore swallows that and reports available=False.
+        sql = SQLStore(f"sqlite:///{tmp_path / 'missing-dir' / 'policies.db'}")
+        assert sql.available is False
+
+        spy = _spy_graph(_grant_graph(tmp_path))
+        engine = ReBACEngine(neo4j=spy, sql=sql)
+        with caplog.at_level(logging.WARNING, logger="opencrab.ontology.rebac"):
+            decision = engine.check("u1", "view", "r1")
+
+        assert decision.granted is False
+        assert decision.reason == _SQL_UNAVAILABLE_REASON
+        assert len(_rebac_warnings(caplog)) == 1
         spy.find_neighbors.assert_not_called()
 
     def test_graph_exception_still_denies(self, tmp_path: Path) -> None:
