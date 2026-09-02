@@ -647,16 +647,21 @@ def backup_data_dir(
     say = on_event or (lambda _msg: None)
     timeout = _resolve_timeout(lock_timeout)
 
-    if not data_dir.is_dir():
-        raise BackupError(f"data directory does not exist: {data_dir}")
-
     say = _guard_callback(say)
+    # Bound BEFORE the boundary: the handler describes the failure in terms
+    # of these, and a failure can happen before the set is even named.
+    final: Path | None = None
     published: Path | None = None
     # ONE error boundary from here to the end. This module's own failures
     # (sqlite3, os, shutil, pathlib) become BackupError; BackupError and
     # TimeoutError pass through unchanged; a caller-supplied callback's
-    # failure is re-raised as itself.
+    # failure is re-raised as itself. Preconditions, not converted: the
+    # caller's path and settings objects behave like plain ones (__fspath__,
+    # attribute access), and the package is installed intact.
     try:
+        if not data_dir.is_dir():
+            raise BackupError(f"data directory does not exist: {data_dir}")
+
         targets = local_data_dir_inventory(settings)
 
         # A destination inside a directory-kind source would put staging in a tree
@@ -764,7 +769,9 @@ def backup_data_dir(
     return outcome
 
 
-def _describe_failure(data_dir: Path, final: Path, published: Path | None, exc: BaseException) -> str:
+def _describe_failure(
+    data_dir: Path, final: Path | None, published: Path | None, exc: BaseException
+) -> str:
     """Say what is known about the set after a failure, by looking, not assuming.
 
     A failed ``os.rename`` does not prove nothing was published: on a network
@@ -774,6 +781,9 @@ def _describe_failure(data_dir: Path, final: Path, published: Path | None, exc: 
     """
     if published is not None:
         return f"backup set {published} was published, but a later step failed ({exc})"
+    if final is None:
+        # Failed before the set was even named: nothing can exist.
+        return f"backup of {data_dir} failed and no set was published ({exc})"
     state = _set_state(final)
     if state == "unknown":
         return (
@@ -791,9 +801,11 @@ def _describe_failure(data_dir: Path, final: Path, published: Path | None, exc: 
 def _set_state(final: Path) -> Literal["present", "absent", "unknown"]:
     """Whether the set directory exists, without hiding a failed lookup.
 
-    ``Path.is_dir()`` swallows OSError and answers False, so a permission
-    error on the destination would read as "no set was published". ``stat``
-    raises, and only FileNotFoundError means absent.
+    A True/False lookup such as ``Path.is_dir()`` folds "missing" and,
+    depending on the Python version, some lookup errors into False, and
+    could turn a permission problem on the destination into "no set was
+    published". ``stat`` makes the three cases explicit: only
+    FileNotFoundError means absent, any other OSError means unknown.
     """
     try:
         final.stat()
@@ -1038,20 +1050,54 @@ def _main(argv: list[str] | None = None) -> int:
         data_dir = settings.local_data_dir
 
     try:
-        backup_data_dir(data_dir, args.to, settings=settings, on_event=lambda m: print(m))
+        # flush=True so a closed stdout fails HERE, inside the callback, not
+        # silently at interpreter exit with a bare exit code.
+        backup_data_dir(
+            data_dir, args.to, settings=settings, on_event=lambda m: print(m, flush=True)
+        )
     except BackupDurabilityError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except (BackupError, TimeoutError, OSError) as exc:
-        # OSError here is NOT from the backup: backup_data_dir converts its
-        # own OS failures to BackupError. It is from the print callback this
-        # CLI passed in (a closed stdout raises BrokenPipeError), which the
-        # boundary deliberately re-raises unchanged.
+    except (BackupError, TimeoutError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # NOT from the backup: backup_data_dir converts its own OS failures
+        # to BackupError. This is the print callback above (a closed stdout
+        # raises BrokenPipeError), which the boundary re-raises unchanged.
+        # The set may already be published; say so rather than guess.
+        _detach_stdout()
+        print(
+            f"ERROR: output failed ({exc}); the backup may have run to completion, "
+            "check the destination for a published set",
+            file=sys.stderr,
+        )
         return 1
     # skipped/unverified/excluded are the declared contract, not failures:
     # the summary names them and the run succeeds.
+    try:
+        sys.stdout.flush()
+    except OSError as exc:
+        _detach_stdout()
+        print(f"ERROR: output failed after the backup ran ({exc})", file=sys.stderr)
+        return 1
     return 0
+
+
+def _detach_stdout() -> None:
+    """Point stdout at /dev/null after a write failure.
+
+    A BrokenPipeError leaves unflushed data in the buffer; the interpreter
+    flushes again at exit, fails again, and turns the exit code into 120.
+    Replacing the descriptor (the Python docs' recipe) makes that final
+    flush succeed so the exit code we return is the one the user sees.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via subprocess in tests

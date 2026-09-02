@@ -1672,7 +1672,8 @@ class TestErrorBoundary:
         (closed / "set").mkdir()
         os.chmod(closed, 0)
         try:
-            # is_dir() would swallow the PermissionError and answer "absent".
+            # A lookup that only knows True/False cannot tell "absent" from
+            # "could not look": stat makes the third case explicit.
             assert bk._set_state(closed / "set") == "unknown"
         finally:
             os.chmod(closed, 0o700)
@@ -1687,3 +1688,71 @@ class TestErrorBoundary:
         monkeypatch.setattr(bk, "_set_state", lambda final: "unknown")
         with pytest.raises(bk.BackupError, match="could not be determined"):
             bk.backup_data_dir(populated_dir, settings=_Settings())
+
+    def test_os_error_before_the_set_is_named_is_a_backup_error(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failures BEFORE the set id exists must not trip over an unbound name."""
+
+        def unreadable(dest):  # type: ignore[no-untyped-def]
+            raise PermissionError(13, "induced: destination not searchable")
+
+        monkeypatch.setattr(bk, "_leftover_stagings", unreadable)
+        with pytest.raises(bk.BackupError, match="no set was published") as excinfo:
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert _published_sets(populated_dir) == []
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_destination_under_an_unsearchable_parent_is_a_backup_error(
+        self, populated_dir: Path, tmp_path: Path
+    ) -> None:
+        parent = tmp_path / "closed"
+        parent.mkdir()
+        dest = parent / "dest"
+        dest.mkdir()
+        os.chmod(parent, 0o600)
+        try:
+            with pytest.raises(bk.BackupError) as excinfo:
+                bk.backup_data_dir(populated_dir, dest, settings=_Settings())
+            assert isinstance(excinfo.value.__cause__, PermissionError)
+        finally:
+            os.chmod(parent, 0o700)
+        assert _published_sets(populated_dir) == []
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unsearchable_data_dir_is_a_backup_error(self, tmp_path: Path) -> None:
+        parent = tmp_path / "closed"
+        parent.mkdir()
+        (parent / "data").mkdir()
+        os.chmod(parent, 0o600)
+        try:
+            with pytest.raises(bk.BackupError) as excinfo:
+                bk.backup_data_dir(parent / "data", settings=_Settings())
+            assert isinstance(excinfo.value.__cause__, PermissionError)
+        finally:
+            os.chmod(parent, 0o700)
+
+    def test_cli_with_closed_stdout_reports_error_without_traceback(
+        self, populated_dir: Path
+    ) -> None:
+        """A closed pipe must end with ERROR: and rc 1, not an exit-time flush crash."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        env = dict(os.environ)
+        env["VECTOR_DB_FILE"] = "vectors.db"
+        env["LOCAL_DATA_DIR"] = str(populated_dir)
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [sys.executable, "-m", "opencrab.stores.backup", "--data-dir", str(populated_dir)],
+                stdout=write_end,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(Path(bk.__file__).parents[2]),
+                env=env,
+            )
+        finally:
+            os.close(write_end)
+        assert proc.returncode == 1, proc.stderr
+        assert "ERROR:" in proc.stderr
+        assert "Traceback" not in proc.stderr, proc.stderr
