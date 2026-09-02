@@ -94,15 +94,27 @@ def safe_schema_name(name: Any) -> bool:
     That distinction only matters for the trailing dot/space rule, and it
     makes this check STRICTER than the filename strictly requires: ``Foo.``
     becomes ``Foo..yaml``, which is a perfectly good filename. Refusing it
-    anyway is a conservative choice, not an accident. A pack NAME ending in a
-    dot or space does not survive its own round trip today: ``uninstall_pack``
-    recognises a generated file by the raw substring ``pack: <name>``, and
-    PyYAML quotes such a value (``pack: 'Foo '``), so the substring never
-    matches and a plain uninstall silently keeps the files it created. One
-    predicate serves both type names and pack names, so both are refused
-    until that marker check compares the parsed value instead of a substring
-    -- tracked as follow-up work, deliberately not bundled into a path-escape
-    fix because it changes what the DELETE path considers its own.
+    anyway is a conservative choice, not an accident:
+
+    - Every trailing dot/space name other than ``.`` and ``..`` is refused
+      because the mirrored Windows rule treats it as reserved. (``.`` and
+      ``..`` are excluded from that rule -- CPython excludes them and so does
+      this copy -- and are refused by the separate check above.) This is the
+      reason that applies to all of them.
+    - Some of them ALSO break their own round trip as a pack name.
+      ``uninstall_pack`` recognises a generated file by the raw substring
+      ``pack: <name>``, and PyYAML quotes a value it cannot leave bare, so
+      ``pack: 'Foo '`` and ``pack: '...'`` never match the substring and a
+      plain uninstall silently keeps the files install created. This depends
+      on whether PyYAML quotes the value, NOT on which character the name
+      ends with: ``Foo.`` is emitted bare and does round-trip. Pinned by a
+      characterisation test.
+
+    One predicate serves both type names and pack names, so both are refused.
+    Relaxing the rule means first fixing that marker check to compare the
+    parsed value instead of a substring -- tracked as follow-up work,
+    deliberately not bundled into a path-escape fix because it changes what
+    the DELETE path considers its own.
 
     What this does NOT promise: that two accepted names are distinct files.
     A case-insensitive filesystem still collapses ``Foo`` and ``foo``, which

@@ -107,7 +107,8 @@ UNSAFE_NAMES = [
     "CON .txt",
     # Trailing dot/space. Refused on the LOGICAL name, which is stricter than
     # the "<name>.yaml" filename needs -- see safe_schema_name for why that is
-    # deliberate (a pack name like this does not survive its own uninstall).
+    # deliberate. TestUninstallMarkerRoundTrip below pins the secondary reason
+    # and shows it does NOT apply uniformly: "Foo." round-trips, "Foo " does not.
     "Foo.", "Foo ",
 ]
 
@@ -257,6 +258,50 @@ class TestUninstallRejectsEscapingTypeNames:
 # --------------------------------------------------------------------------
 # 4. the pack name itself is a path component too
 # --------------------------------------------------------------------------
+
+
+class TestUninstallMarkerRoundTrip:
+    """Characterisation of today's generated-file marker, not a wish about it.
+
+    ``safe_schema_name``'s docstring gives, as a secondary reason for refusing
+    trailing dot/space names, that some of them break their own uninstall:
+    the marker is the raw substring ``pack: <name>`` and PyYAML quotes a value
+    it cannot leave bare. These cases pin that claim -- including the case
+    where it does NOT hold -- so the docstring cannot quietly go stale. When
+    the marker is changed to compare the parsed value, these fail and the
+    docstring has to be revisited with them.
+
+    The name guard is bypassed on purpose: these names cannot reach
+    install_pack otherwise, and the point is to characterise what would
+    happen if they did.
+    """
+
+    @pytest.mark.parametrize(
+        ("pack_name", "quoted_by_yaml"),
+        [("Foo.", False), ("Foo ", True), ("...", True)],
+    )
+    def test_marker_matches_only_when_yaml_leaves_the_value_bare(
+        self, packs_env, monkeypatch, pack_name, quoted_by_yaml
+    ):
+        tmp_root, types_dir, packs_dir = packs_env
+        monkeypatch.setattr(pack_registry, "safe_schema_name", lambda _name: True)
+        write_manifest(packs_dir, pack_name, ["Normal"])
+
+        assert pack_registry.install_pack(pack_name)["created"] == ["Normal"]
+        schema = types_dir / "Normal.yaml"
+        content = schema.read_text(encoding="utf-8")
+        assert (f"pack: '{pack_name}'" in content) is quoted_by_yaml, content
+        assert (f"pack: {pack_name}" in content) is not quoted_by_yaml, content
+
+        result = pack_registry.uninstall_pack(pack_name)
+
+        if quoted_by_yaml:
+            assert result["removed"] == []
+            assert result["kept_user_customised"] == ["Normal"]
+            assert schema.exists(), "quoted marker: the file install created survives"
+        else:
+            assert result["removed"] == ["Normal"]
+            assert not schema.exists()
 
 
 class TestListingAndLookupAgree:
