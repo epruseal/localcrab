@@ -269,14 +269,22 @@ def backup_sqlite(
 
     ``sleep=0`` is passed and the waiting is done inside the callback instead:
     the built-in sleep happens AFTER the callback returns, so leaving it at
-    the default would overshoot the deadline by up to one sleep interval. A
-    single ``backup_step()`` or filesystem write still cannot be interrupted,
-    so the real bound is "deadline plus one step".
+    the default would overshoot the deadline by up to one sleep interval. The
+    source connection is opened with ``timeout=0`` for the same reason -- see
+    there. A single ``backup_step()`` or filesystem write still cannot be
+    interrupted, so the real bound is "deadline plus one step", and both
+    settings exist to keep that step short.
 
     ``_on_step`` is a private test observer, not API. The deadline is checked
     before it runs so a test cannot mask a timeout.
     """
-    src_conn = sqlite3.connect(_rw_uri(src), uri=True)
+    # timeout=0 so a contended source returns SQLITE_BUSY to us IMMEDIATELY.
+    # The default 5s busy timeout would be spent inside a single
+    # sqlite3_backup_step(), and the progress callback -- the only place the
+    # deadline can be enforced -- runs between steps, so a 0.2s deadline
+    # measured 5.06s. With timeout=0 the same case measures 0.20s. The
+    # waiting is done by the callback below, which is deadline-aware.
+    src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
     try:
         dst_conn = sqlite3.connect(str(dst))
         try:
@@ -412,19 +420,27 @@ def _new_set_id() -> str:
     return f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.{secrets.token_hex(3)}"
 
 
-def _require_contained(path: Path, parent: Path) -> None:
-    """Refuse a path that is a symlink or resolves outside ``parent``.
+def _require_contained(path: Path, root: Path) -> None:
+    """Refuse a path that is a symlink or resolves outside ``root``.
 
     Keeps the #212 containment invariant: a dangling symlink makes
-    ``exists()`` false while ``sqlite3.connect()`` still follows it. Resolving
-    catches an escaping ANCESTOR directory too, not just the leaf.
+    ``exists()`` false while ``sqlite3.connect()`` still follows it.
+
+    Resolving also catches an escaping ANCESTOR directory, but ONLY when
+    ``root`` is supplied independently of ``path``. Deriving the root from
+    the path being checked -- ``_require_contained(p, p.parent)`` -- makes
+    this function a tautology, because an ancestor symlink moves both sides
+    equally; it would then catch nothing but a symlinked leaf. Always pass a
+    root that is fixed by the caller, as ``_run_targets`` does with the
+    staging directory.
     """
     if path.is_symlink():
         raise BackupError(f"backup path is a symlink, refusing to use it: {path}")
     resolved = path.resolve()
-    if not (resolved == parent.resolve() or resolved.is_relative_to(parent.resolve())):
+    root_resolved = root.resolve()
+    if not (resolved == root_resolved or resolved.is_relative_to(root_resolved)):
         raise BackupError(
-            f"backup path escapes its destination: {path} -> {resolved} is outside {parent}"
+            f"backup path escapes its destination: {path} -> {resolved} is outside {root}"
         )
 
 
@@ -455,18 +471,23 @@ def _source_for(target: BackupTarget, data_dir: Path) -> Path:
 def _destination_for(target: BackupTarget, source: Path, data_dir: Path, staging: Path) -> Path:
     """Where ``source`` lands inside the staging set.
 
-    An out-of-tree source (an absolute ``VECTOR_DB_FILE``, or one reached via
-    ``..``) is parked in a subdirectory rather than renamed with a prefix: a
-    prefix can push an already-long basename past NAME_MAX, and a bare
-    basename could collide with a core file's destination.
+    Keyed on the target's CONFIGURED location, not on where the source
+    resolves. A target whose location is an ordinary relative name has a
+    natural slot in the set and keeps it even when the data directory holds a
+    symlink there: an operator who moved ``docs/`` to another volume still
+    wants it restored to ``docs/``, and parking it elsewhere would quietly
+    change where a restore puts it.
+
+    Only a location with no natural slot -- an absolute ``VECTOR_DB_FILE``, or
+    one reached through ``..`` -- is parked in a subdirectory. It is parked
+    rather than renamed with a prefix because a prefix can push an
+    already-long basename past NAME_MAX, and a bare basename could collide
+    with a core file's destination.
     """
-    try:
-        inside = source.resolve().is_relative_to(data_dir.resolve())
-    except (OSError, ValueError):
-        inside = False
-    if inside:
-        return staging / source.resolve().relative_to(data_dir.resolve())
-    return staging / _EXTERNAL_DIR / source.name
+    location = Path(target.location)
+    if location.is_absolute() or ".." in location.parts:
+        return staging / _EXTERNAL_DIR / source.name
+    return staging / location
 
 
 def _leftover_stagings(dest_dir: Path) -> list[Path]:
@@ -491,6 +512,17 @@ def backup_data_dir(
 
     Guarantee: per-file transactional consistency for every SQLite target.
     NOT a cross-file point-in-time snapshot; see the module docstring.
+
+    Trust boundary: ``dest_dir`` is the location the CALLER chose and is not
+    containment-checked (a symlinked ancestor is a normal backup-volume
+    layout). Everything written INSIDE the set is contained against the
+    staging directory this run exclusively created.
+
+    One artifact can outlive a failure: if the publishing ``os.rename``
+    itself fails, the fsynced staging directory stays. That is deliberate --
+    its ``.backup-staging.`` name cannot be mistaken for a finished backup,
+    its contents are intact and worth diagnosing, and the next run reports it
+    rather than deleting someone else's data.
     """
     from opencrab.locking import write_lock
 
@@ -524,7 +556,11 @@ def backup_data_dir(
         raise BackupError(f"destination is a symlink, refusing to use it: {dest}")
     if not dest.is_dir():
         raise BackupError(f"destination directory does not exist: {dest}")
-    _require_contained(dest, dest.parent)
+    # The destination is NOT containment-checked beyond the symlink refusal
+    # above. It is the location the operator chose, and reaching it through a
+    # symlinked ancestor (a backup volume mounted that way) is a normal
+    # layout, not an attack. Containment is enforced where it means
+    # something: INSIDE the set, against the staging root this run created.
 
     if not _directory_fsync_supported(dest):
         raise BackupError(
@@ -652,7 +688,7 @@ def _run_targets(
         elif target.kind == "directory":
             _copy_directory(source, destination)
             status = "unverified"
-            note = _directory_note(target, destination)
+            note = _directory_note(target, destination, source)
         else:  # opaque
             if source.is_dir():
                 _copy_directory(source, destination)
@@ -683,7 +719,7 @@ def _copy_directory(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True)
 
 
-def _directory_note(target: BackupTarget, destination: Path) -> str:
+def _directory_note(target: BackupTarget, destination: Path, source: Path) -> str:
     note = (
         "directory copy: consistent only if nothing wrote to it during the run "
         "(chroma.lock is a shared lock with the offline batch loader, see issue #140)"
@@ -696,6 +732,16 @@ def _directory_note(target: BackupTarget, destination: Path) -> str:
             note += "HNSW index and segment files agree with it"
         except BackupError as exc:
             note += f"; WARNING its chroma.sqlite3 failed integrity_check: {exc}"
+    if source.is_symlink():
+        # Links found INSIDE a directory store are preserved as links, but the
+        # store's own top-level link is followed: an operator who relocated
+        # the store to another volume wants its contents, and a backup holding
+        # only a link would be useless. Announce the asymmetry rather than
+        # leaving it for someone to discover during a restore.
+        note += (
+            f"; NOTE this target is itself a symlink and was followed to "
+            f"{source.resolve()} (links found inside it are preserved as links)"
+        )
     return note
 
 
@@ -721,7 +767,11 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--to",
         default=None,
-        help="where to create the backup set (default: alongside the data itself)",
+        help=(
+            "where to create the backup set (default: alongside the data itself). "
+            "This is taken as the location you chose: it is not containment-checked, "
+            "so a symlinked ancestor is followed."
+        ),
     )
     parser.add_argument(
         "--list",

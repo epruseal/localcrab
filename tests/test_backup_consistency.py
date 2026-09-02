@@ -14,6 +14,7 @@ a raw copy and an online ``.backup()`` is caused by the missing journal.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -319,11 +320,18 @@ class TestConcurrentWrite:
             finally:
                 probe.close()
 
+            budget = 1.0
             started = time.monotonic()
             with pytest.raises(TimeoutError):
-                bk.backup_sqlite(src, dst, deadline=time.monotonic() + 1.0)
+                bk.backup_sqlite(src, dst, deadline=time.monotonic() + budget)
             elapsed = time.monotonic() - started
-            assert elapsed < 20, f"backup did not honour its deadline (took {elapsed:.1f}s)"
+            # budget + 2s, not a loose ceiling: the source connection's default
+            # 5s busy timeout used to swallow the deadline entirely (a 0.2s
+            # deadline measured 5.06s). A 20s tolerance would not have caught
+            # that, so it would not catch it coming back.
+            assert elapsed < budget + 2, (
+                f"backup did not honour its deadline (budget {budget}s, took {elapsed:.2f}s)"
+            )
         finally:
             holder.close()
 
@@ -354,24 +362,59 @@ class TestInventory:
         labels = {t.label for t in bk.local_data_dir_inventory(_Settings())}
         assert {"opencrab.db", "graph.db", "doc_store.db", "billing.db"} <= labels
 
+    @staticmethod
+    def _data_dir_artifacts(source: str) -> set[str]:
+        """Store filenames joined onto LOCAL_DATA_DIR in ``source``.
+
+        A HEURISTIC, not a proof. It covers the three idioms factory.py
+        actually uses -- ``os.path.join(..., "x.db")``, ``Path(...) / "x.db"``
+        and ``.joinpath("x.db")``. A name reached through a constant, string
+        concatenation or another indirection would slip past it. Closing that
+        needs real static analysis, which is out of scope here; the guard is
+        worth having anyway because it catches the ordinary way a new store
+        gets added, which is how vectors.db went missing (#123).
+        """
+        import re
+
+        found = set(re.findall(r"local_data_dir[,)]\s*[\"']([^\"']+)[\"']", source))
+        found |= set(re.findall(r"local_data_dir\)?\s*/\s*[\"']([^\"']+)[\"']", source))
+        found |= set(re.findall(r"local_data_dir\)?\s*\.joinpath\(\s*[\"']([^\"']+)[\"']", source))
+        return found
+
     def test_inventory_covers_every_factory_data_dir_artifact(self) -> None:
         """Guard against #123 recurring: a new store must update the inventory.
 
         ``factory.py`` is the single place that joins a store file onto
         LOCAL_DATA_DIR. Every name it joins there must appear in the
-        inventory, or a future store silently drops out of the backup the
-        way ``vectors.db`` did.
+        inventory, or a future store silently drops out of the backup the way
+        ``vectors.db`` did.
         """
-        import re
-
         factory_src = Path(bk.__file__).with_name("factory.py").read_text(encoding="utf-8")
-        joined = set(re.findall(r"local_data_dir[,)]\s*[\"']([^\"']+)[\"']", factory_src))
-        joined |= set(re.findall(r"local_data_dir\)\s*/\s*[\"']([^\"']+)[\"']", factory_src))
+        joined = self._data_dir_artifacts(factory_src)
         assert joined, "could not extract any data-dir artifact from factory.py"
 
         known = {t.label for t in bk.local_data_dir_inventory(_Settings())}
         missing = joined - known
-        assert not missing, f"factory.py writes these under LOCAL_DATA_DIR but the inventory omits them: {sorted(missing)}"
+        assert not missing, (
+            f"factory.py writes these under LOCAL_DATA_DIR but the inventory omits them: "
+            f"{sorted(missing)}"
+        )
+
+    def test_artifact_extractor_catches_each_supported_idiom(self) -> None:
+        """The guard above is only worth having if it actually detects a new store.
+
+        Feeds the extractor a factory-shaped source for each idiom in use. An
+        extractor that quietly matched nothing would make the guard above pass
+        forever.
+        """
+        for idiom in (
+            'db_path = os.path.join(settings.local_data_dir, "future.db")',
+            'db_path = Path(settings.local_data_dir) / "future.db"',
+            'db_path = Path(settings.local_data_dir).joinpath("future.db")',
+        ):
+            assert "future.db" in self._data_dir_artifacts(idiom), idiom
+            known = {t.label for t in bk.local_data_dir_inventory(_Settings())}
+            assert "future.db" not in known
 
     def test_renamed_vector_file_is_followed_and_default_still_covered(self) -> None:
         targets = bk.local_data_dir_inventory(_Settings(vector_db_file="renamed.db"))
@@ -505,7 +548,15 @@ class TestPublishedSet:
         bk.backup_data_dir(populated_dir, settings=_Settings())
         copied = _set_dir(populated_dir) / "docs" / "link"
         assert copied.is_symlink(), "symlink was followed; external content was pulled in"
-        assert not (copied / "secret.txt").is_file() or copied.is_symlink()
+        # The link's TARGET must not have been copied into the set. Checked by
+        # walking the set without following links, so the assertion cannot be
+        # satisfied by the link merely resolving.
+        names = {
+            f
+            for _root, _dirs, files in os.walk(_set_dir(populated_dir), followlinks=False)
+            for f in files
+        }
+        assert "secret.txt" not in names, "the symlink's target content was copied into the set"
 
     def test_graph_kuzu_handled_as_file_and_as_directory(self, tmp_path: Path) -> None:
         as_file = tmp_path / "f"
@@ -565,18 +616,63 @@ class TestPathHandling:
         assert parked.is_file(), "an external vector source must be parked, not dropped"
         assert _integrity(parked) == "ok"
 
-    def test_symlinked_set_destination_is_refused(self, tmp_path: Path) -> None:
+    def test_symlinked_destination_itself_is_refused(self, tmp_path: Path) -> None:
         d = tmp_path / "data"
         d.mkdir()
         _make_db(d / "graph.db", rows=2)
         outside = tmp_path / "outside"
         outside.mkdir()
-        # Force the containment check to see an escaping destination.
+
         with pytest.raises(bk.BackupError):
-            bk.backup_data_dir(d, dest_dir=d / "escape", settings=_Settings())
+            bk.backup_data_dir(d, dest_dir=d / "missing", settings=_Settings())
+
         (d / "escape").symlink_to(outside)
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(d, dest_dir=d / "escape", settings=_Settings())
+
+    def test_destination_via_a_symlinked_ancestor_is_deliberately_allowed(
+        self, tmp_path: Path
+    ) -> None:
+        """The destination is the operator's chosen location, not a threat.
+
+        Reaching it through a symlinked ancestor is a normal layout (a backup
+        volume mounted that way), so it is followed on purpose. This test
+        exists so the behaviour is a documented decision rather than a silent
+        one: containment is enforced INSIDE the set, not on where the operator
+        pointed the tool. See test_target_inside_the_set_cannot_escape.
+        """
+        d = tmp_path / "data"
+        d.mkdir()
+        _make_db(d / "graph.db", rows=2)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (d / "volume").symlink_to(outside)
+        (outside / "sub").mkdir()
+
+        outcome = bk.backup_data_dir(d, dest_dir=d / "volume" / "sub", settings=_Settings())
+        assert outcome.set_dir.resolve().is_relative_to(outside.resolve())
+        assert (outcome.set_dir / "graph.db").is_file()
+
+    def test_target_inside_the_set_cannot_escape(self, tmp_path: Path) -> None:
+        """The #212 invariant, checked against a root fixed by the caller.
+
+        _require_contained is only meaningful when its root does not come
+        from the path being checked. Here the staging root is fixed, so a
+        destination resolving outside it must be refused.
+        """
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        bk._require_contained(staging / "inside", staging)  # contained: no raise
+
+        (staging / "escape").symlink_to(outside)
+        with pytest.raises(bk.BackupError):
+            bk._require_contained(staging / "escape", staging)
+        # An escaping ANCESTOR is caught too, because the root is independent.
+        with pytest.raises(bk.BackupError):
+            bk._require_contained(staging / "escape" / "deeper", staging)
 
     def test_destination_inside_a_directory_source_is_refused(self, populated_dir: Path) -> None:
         """Staging inside chroma/ would make copytree recurse into itself."""
@@ -718,6 +814,51 @@ class TestAtomicity:
             "the destination parent was not fsynced after the rename"
         )
 
+    def test_publish_rename_failure_leaves_staging_and_no_set(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Documented behaviour, now pinned.
+
+        If the publishing rename itself fails, the staging directory survives
+        on purpose: its name cannot be mistaken for a finished backup, its
+        contents are intact and worth diagnosing, and the next run reports it.
+        What must NOT survive is a published set.
+        """
+
+        def failing_publish(staging, final):  # type: ignore[no-untyped-def]
+            raise OSError("induced rename failure")
+
+        monkeypatch.setattr(bk, "_publish", failing_publish)
+        with pytest.raises(OSError):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+
+        assert _published_sets(populated_dir) == []
+        leftovers = _stagings(populated_dir)
+        assert len(leftovers) == 1, f"staging should survive a failed publish, found {leftovers}"
+        assert (leftovers[0] / "graph.db").is_file(), "the surviving staging should be intact"
+
+    def test_directory_target_that_is_itself_a_symlink_is_announced(
+        self, tmp_path: Path
+    ) -> None:
+        """Links inside a directory store are preserved; the store's own link is followed.
+
+        That asymmetry is deliberate, so it has to be visible in the report
+        rather than discovered during a restore.
+        """
+        d = tmp_path / "data"
+        d.mkdir()
+        real_docs = tmp_path / "elsewhere_docs"
+        real_docs.mkdir()
+        (real_docs / "nodes.json").write_text("{}", encoding="utf-8")
+        (d / "docs").symlink_to(real_docs)
+
+        outcome = bk.backup_data_dir(d, settings=_Settings())
+        entry = next(e for e in outcome.entries if e.label == "docs")
+        assert "symlink" in entry.note and str(real_docs) in entry.note, entry.note
+        # It keeps its natural slot in the set: a restore must put it back at
+        # docs/, not somewhere derived from where the operator moved it to.
+        assert (outcome.set_dir / "docs" / "nodes.json").is_file()
+
     def test_leftover_staging_is_reported_and_not_deleted(
         self, populated_dir: Path
     ) -> None:
@@ -813,25 +954,36 @@ class TestLocking:
 # ---------------------------------------------------------------------------
 
 
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_cli(*args: str, data_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Run the CLI hermetically.
+
+    LOCAL_DATA_DIR and VECTOR_DB_FILE are pinned in the child's environment:
+    the inventory reads vector_db_file from real settings, so without this a
+    developer's ambient configuration could change what the test observes.
+    """
+    env = dict(os.environ)
+    env["VECTOR_DB_FILE"] = "vectors.db"
+    if data_dir is not None:
+        env["LOCAL_DATA_DIR"] = str(data_dir)
     return subprocess.run(  # noqa: S603
         [sys.executable, "-m", "opencrab.stores.backup", *args],
         capture_output=True,
         text=True,
         cwd=str(Path(bk.__file__).parents[2]),
+        env=env,
     )
 
 
 class TestCli:
     def test_list_writes_nothing(self, populated_dir: Path) -> None:
-        proc = _run_cli("--data-dir", str(populated_dir), "--list")
+        proc = _run_cli("--data-dir", str(populated_dir), "--list", data_dir=populated_dir)
         assert proc.returncode == 0, proc.stderr
         assert "vectors.db" in proc.stdout
         assert _published_sets(populated_dir) == []
         assert _stagings(populated_dir) == []
 
     def test_default_run_publishes_a_set(self, populated_dir: Path) -> None:
-        proc = _run_cli("--data-dir", str(populated_dir))
+        proc = _run_cli("--data-dir", str(populated_dir), data_dir=populated_dir)
         assert proc.returncode == 0, proc.stderr + proc.stdout
         s = _set_dir(populated_dir)
         assert (s / "vectors.db").is_file()
@@ -839,14 +991,14 @@ class TestCli:
     def test_to_places_the_set_elsewhere(self, populated_dir: Path, tmp_path: Path) -> None:
         dest = tmp_path / "backups"
         dest.mkdir()
-        proc = _run_cli("--data-dir", str(populated_dir), "--to", str(dest))
+        proc = _run_cli("--data-dir", str(populated_dir), "--to", str(dest), data_dir=populated_dir)
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert (_set_dir(dest) / "graph.db").is_file()
         assert _published_sets(populated_dir) == []
 
     def test_failure_exits_non_zero(self, populated_dir: Path) -> None:
         (populated_dir / "graph.db").write_bytes(b"not a database")
-        proc = _run_cli("--data-dir", str(populated_dir))
+        proc = _run_cli("--data-dir", str(populated_dir), data_dir=populated_dir)
         assert proc.returncode != 0
         assert _published_sets(populated_dir) == []
 
@@ -855,7 +1007,7 @@ class TestCli:
     ) -> None:
         """Those three are the declared contract, not failures."""
         (populated_dir / "billing.db").unlink()  # -> skipped
-        proc = _run_cli("--data-dir", str(populated_dir))
+        proc = _run_cli("--data-dir", str(populated_dir), data_dir=populated_dir)
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert "skipped" in proc.stdout
         assert "unverified" in proc.stdout
