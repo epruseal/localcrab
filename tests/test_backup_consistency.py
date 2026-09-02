@@ -230,6 +230,62 @@ class TestHotJournal:
 # ---------------------------------------------------------------------------
 
 
+class TestVerifySqlite:
+    """verify_sqlite is the guarantee this change advertises, so pin it directly.
+
+    Every other test reached it indirectly or injected a fake failure, which
+    meant replacing the whole function body with `return` left the suite
+    green. A backup is only "verified" because this function refuses bad
+    input, so that refusal needs a test of its own.
+    """
+
+    def test_accepts_a_sound_database(self, tmp_path: Path) -> None:
+        db = tmp_path / "sound.db"
+        _make_db(db, rows=3)
+        bk.verify_sqlite(db)  # must not raise
+
+    def test_rejects_a_file_that_is_not_a_database(self, tmp_path: Path) -> None:
+        bogus = tmp_path / "bogus.db"
+        bogus.write_bytes(b"this is not a sqlite database at all")
+        with pytest.raises(bk.BackupError):
+            bk.verify_sqlite(bogus)
+
+    def test_rejects_a_corrupted_database(self, tmp_path: Path) -> None:
+        """Structurally damaged, not merely foreign: integrity_check must catch it."""
+        db = tmp_path / "corrupt.db"
+        # Large enough that the table spans many pages, so overwriting the
+        # middle of the file is certain to land on pages actually in use.
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            conn.executemany(
+                "INSERT INTO t (id, v) VALUES (?, ?)",
+                [(i, "x" * 400) for i in range(2000)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert _integrity(db) == "ok", "fixture precondition: the database starts sound"
+
+        data = bytearray(db.read_bytes())
+        # Everything from a quarter in to three quarters through, leaving the
+        # header intact so the file still opens as a database.
+        data[len(data) // 4 : len(data) * 3 // 4] = b"\xde\xad\xbe\xef" * (
+            (len(data) * 3 // 4 - len(data) // 4) // 4
+        )
+        db.write_bytes(bytes(data))
+
+        with pytest.raises(bk.BackupError) as excinfo:
+            bk.verify_sqlite(db)
+        message = str(excinfo.value)
+        assert "integrity_check" in message or "does not open" in message, message
+
+    def test_rejects_a_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(bk.BackupError):
+            bk.verify_sqlite(tmp_path / "absent.db")
+
+
 class TestConcurrentWrite:
     def test_snapshot_is_transactionally_consistent(self, tmp_path: Path) -> None:
         """A commit landing mid-backup must not tear the snapshot.

@@ -333,9 +333,17 @@ def verify_sqlite(path: Path) -> None:
     """Reopen a backup and require ``PRAGMA integrity_check`` to say ``ok``.
 
     "Backed up" is not a claim worth making until the copy has been opened.
+
+    Opened through a ``mode=rw`` URI for the same reason the source is (see
+    ``_rw_uri``): ``sqlite3.connect(path)`` CREATES an empty database when the
+    file is absent, and an empty database passes ``integrity_check``. That
+    would let a missing backup verify successfully, which is the exact shape
+    of failure this whole module exists to prevent.
     """
+    if not path.is_file():
+        raise BackupError(f"backup {path} does not exist, so it cannot be verified")
     try:
-        conn = sqlite3.connect(str(path))
+        conn = sqlite3.connect(_rw_uri(path), uri=True)
         try:
             result = conn.execute("PRAGMA integrity_check").fetchone()
         finally:
@@ -801,17 +809,13 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = None
-    data_dir = args.data_dir
-    if data_dir is None:
-        from opencrab.config import get_settings
-
-        settings = get_settings()
-        data_dir = settings.local_data_dir
 
     if args.list:
-        # Inside the same error handling as a real run: with G2 the inventory
-        # can now fail, and an operator asking what would be backed up should
-        # get the reason, not a traceback.
+        # Handled BEFORE resolving the data directory: listing the targets
+        # does not need one, and resolving it would call get_settings()
+        # outside the error handling below, so a malformed configuration
+        # printed a traceback instead of the reason. local_data_dir_inventory
+        # raises BackupError for that case on its own.
         try:
             targets = local_data_dir_inventory(settings)
         except BackupError as exc:
@@ -820,6 +824,21 @@ def _main(argv: list[str] | None = None) -> int:
         for t in targets:
             print(f"{t.kind:10} {t.label:24} {t.reason}")
         return 0
+
+    data_dir = args.data_dir
+    if data_dir is None:
+        try:
+            from opencrab.config import get_settings
+
+            settings = get_settings()
+        except Exception as exc:
+            print(
+                f"ERROR: cannot read the configuration to locate the data directory ({exc}). "
+                "Pass --data-dir explicitly, or fix the configuration.",
+                file=sys.stderr,
+            )
+            return 1
+        data_dir = settings.local_data_dir
 
     try:
         backup_data_dir(data_dir, args.to, settings=settings, on_event=lambda m: print(m))
