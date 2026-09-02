@@ -509,6 +509,11 @@ def _resolve_timeout(explicit: float | None) -> float:
     same. An unparsable value is refused rather than replaced by the
     default: silently running with a budget the operator did not set is
     the same class of failure as silently dropping a configured target.
+
+    The same number is also the per-file copy budget in ``_run_targets``,
+    so ``0`` is accepted ("do not wait for the lock") and then every copy
+    expires before its first page with ``TimeoutError``. That is the
+    documented deadline behaviour, not a boundary rejection.
     """
     if explicit is not None:
         origin, candidate = "lock_timeout", explicit
