@@ -486,25 +486,29 @@ class TestCorruptCollection:
 
     # -- real OntologyBuilder callers -----------------------------------
 
-    def test_real_builder_corrupt_nodes_json_receipt_error(self, tmp_path):
+    def test_real_builder_corrupt_nodes_json_blocks_add_node_entirely(self, tmp_path):
+        """Corrupt ``nodes.json`` is caught earlier than the design's receipt
+        row expected: ``node_identity_conflict``
+        (``opencrab/pack/write_gate.py``) probes ``docs.get_node_doc`` BEFORE
+        the builder creates any receipt or attempts a graph/sql/vector
+        write. ``_check_probes`` there treats any probe exception as
+        "cannot verify" (fail-closed) and ``add_node`` raises ``ValueError``
+        -- so a corrupt ``nodes.json`` blocks the whole node write, not just
+        the doc leg (stronger than the ``stores["docs"] = "error: ..."``
+        partial-receipt shape the ``audit_log.json`` case below produces)."""
         from opencrab.auth import Principal, principal_scope
-        from opencrab.ontology.builder import store_write_succeeded_for
 
         builder, doc = self._builder(tmp_path)
         corrupt = self._write(doc, "nodes", self.GARBAGE_MIDDLE)
         with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
-            receipt = builder.add_node(
-                space="subject",
-                node_type="User",
-                node_id="u1",
-                properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
-                pack_id="pack-1",
-            )
-        stores = receipt["stores"]
-        assert stores["docs"].startswith("error: ")
-        assert "corrupt collection file 'nodes'" in stores["docs"]
-        assert stores["graph"] == "ok"
-        assert store_write_succeeded_for(stores, "node") is True
+            with pytest.raises(ValueError, match="cannot verify existing ownership"):
+                builder.add_node(
+                    space="subject",
+                    node_type="User",
+                    node_id="u1",
+                    properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+                    pack_id="pack-1",
+                )
         assert self._read(doc, "nodes") == corrupt
 
     def test_real_builder_corrupt_audit_log_receipt_error_node_still_written(self, tmp_path):
