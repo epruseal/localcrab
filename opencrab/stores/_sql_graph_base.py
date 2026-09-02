@@ -1720,23 +1720,39 @@ class _SqlGraphStoreBase(abc.ABC):
         """
         return b"zlib\0" + zlib.compress(bytes(canonical), 6)
 
-    @staticmethod
-    def _decode_ledger_receipt(stored: Any) -> bytes:
+    # Upper bound for one decompressed ledger receipt. A receipt scales
+    # with the graph (a 918,518-mapping plan makes ~1.4 GB), so the bound
+    # must stay far above legitimate sizes while it stops a crafted
+    # high-ratio stream from exhausting memory before validation runs.
+    _LEDGER_RECEIPT_MAX_BYTES = 8 * 1024**3
+
+    @classmethod
+    def _decode_ledger_receipt(cls, stored: Any) -> bytes:
         raw = bytes(stored)
         if raw.startswith(b"zlib\0"):
             # ``zlib.decompress`` ignores bytes after the first complete
-            # stream, so ``encoded + garbage`` would pass. Require a fully
-            # consumed stream so every stored byte stays authenticated by
-            # the canonicality check on the decoded receipt.
+            # stream, so ``encoded + garbage`` would pass. Decode
+            # incrementally with an explicit size bound, then require a
+            # fully consumed stream, so a crafted stream can neither
+            # smuggle trailing bytes nor expand past the bound.
+            limit = cls._LEDGER_RECEIPT_MAX_BYTES
             decompressor = zlib.decompressobj()
+            decoded = bytearray()
+            data = raw[5:]
             try:
-                decoded = decompressor.decompress(raw[5:])
+                while True:
+                    decoded += decompressor.decompress(data, 8 * 1024 * 1024)
+                    if len(decoded) > limit:
+                        raise GraphMigrationConflict("migration ledger receipt is malformed")
+                    data = decompressor.unconsumed_tail
+                    if not data:
+                        break
                 decoded += decompressor.flush()
             except zlib.error as exc:
                 raise GraphMigrationConflict("migration ledger receipt is malformed") from exc
-            if not decompressor.eof or decompressor.unused_data:
+            if len(decoded) > limit or not decompressor.eof or decompressor.unused_data:
                 raise GraphMigrationConflict("migration ledger receipt is malformed")
-            return decoded
+            return bytes(decoded)
         return raw
 
     @staticmethod
