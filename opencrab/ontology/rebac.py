@@ -11,6 +11,15 @@ Decision logic (in order of priority):
   3. Direct graph edge from subject to resource matching the permission → grant.
   4. Transitive membership path (subject ∈ team/org that has permission) → grant.
   5. Default → deny.
+
+Failure contract (#78): ``check()`` is a fail-closed boundary. If the SQL
+store reports ``available=False`` (its connection failed at start-up), if
+the policy lookup raises, or if it returns a value outside ``bool | None``,
+the decision is DENY and the graph is not consulted, because an explicit
+DENY row that could not be read must not be overridden by a graph GRANT.
+Only a successful lookup with no row (``None``) reaches the graph. The
+WARNING names the exception type and the three identifiers only; the full
+traceback is logged at DEBUG.
 """
 
 from __future__ import annotations
@@ -24,6 +33,20 @@ from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
 
 logger = logging.getLogger(__name__)
+
+# Reasons for the fail-closed SQL branches of ``ReBACEngine.check`` (#78).
+# Tests assert these strings in full, so callers can tell a store failure
+# from the ordinary "no policy, no edge" default deny.
+_SQL_LOOKUP_FAILED_REASON = (
+    "SQL policy lookup failed; default deny applied (fail-closed)."
+)
+_SQL_NON_BOOLEAN_REASON = (
+    "SQL policy lookup returned a non-boolean value; "
+    "default deny applied (fail-closed)."
+)
+_SQL_UNAVAILABLE_REASON = (
+    "SQL policy store unavailable; default deny applied (fail-closed)."
+)
 
 # Relations in the subject→resource space that map to permissions
 _PERMISSION_RELATIONS: dict[str, list[str]] = {
@@ -86,6 +109,11 @@ class ReBACEngine:
         Returns
         -------
         AccessDecision
+            ``granted=False`` with ``_SQL_UNAVAILABLE_REASON`` if the SQL
+            store reports unavailable, with ``_SQL_LOOKUP_FAILED_REASON`` if
+            it raised, or with ``_SQL_NON_BOOLEAN_REASON`` if it returned a
+            value outside ``bool | None``. None of these consults the graph.
+            This method does not raise for store failures.
         """
         # Validate permission label
         perm_result = validate_rebac_permission(permission)
@@ -98,25 +126,85 @@ class ReBACEngine:
                 resource_id=resource_id,
             )
 
-        # 1. Check explicit SQL policy (DENY wins)
-        if self._sql.available:
-            stored = self._sql.check_policy(subject_id, permission, resource_id)
-            if stored is False:
+        # 1. Check explicit SQL policy (DENY wins). The availability probe
+        # and the lookup share one guard: any failure here is DENY without a
+        # graph fall-through, because a DENY row we could not read must not
+        # be overridden by a graph GRANT (#78). The graph path can only
+        # grant, so its own errors stay in _graph_check.
+        try:
+            if not self._sql.available:
+                # SQLStore reports unavailable only after _connect caught a
+                # connection error, and the factory always builds a
+                # SQLStore, so this is an outage, not a graph-only mode.
+                logger.warning(
+                    "ReBAC SQL policy store unavailable for subject=%s "
+                    "permission=%s resource=%s; treating as DENY (#78)",
+                    subject_id,
+                    permission,
+                    resource_id,
+                )
                 return AccessDecision(
                     granted=False,
-                    reason="Explicit DENY policy in rebac_policies table.",
+                    reason=_SQL_UNAVAILABLE_REASON,
                     subject_id=subject_id,
                     permission=permission,
                     resource_id=resource_id,
                 )
-            if stored is True:
-                return AccessDecision(
-                    granted=True,
-                    reason="Explicit GRANT policy in rebac_policies table.",
-                    subject_id=subject_id,
-                    permission=permission,
-                    resource_id=resource_id,
-                )
+            stored = self._sql.check_policy(subject_id, permission, resource_id)
+        except Exception as exc:
+            logger.warning(
+                "ReBAC SQL policy lookup failed (%s) for subject=%s "
+                "permission=%s resource=%s; treating as DENY (#78)",
+                type(exc).__name__,
+                subject_id,
+                permission,
+                resource_id,
+            )
+            # The exception text can carry a DSN or a server message, so it
+            # is kept out of the WARNING and only reachable at DEBUG.
+            logger.debug("ReBAC SQL policy lookup traceback", exc_info=exc)
+            return AccessDecision(
+                granted=False,
+                reason=_SQL_LOOKUP_FAILED_REASON,
+                subject_id=subject_id,
+                permission=permission,
+                resource_id=resource_id,
+            )
+
+        if stored is True:
+            return AccessDecision(
+                granted=True,
+                reason="Explicit GRANT policy in rebac_policies table.",
+                subject_id=subject_id,
+                permission=permission,
+                resource_id=resource_id,
+            )
+        if stored is False:
+            return AccessDecision(
+                granted=False,
+                reason="Explicit DENY policy in rebac_policies table.",
+                subject_id=subject_id,
+                permission=permission,
+                resource_id=resource_id,
+            )
+        if stored is not None:
+            # Contract violation (SQLStore returns bool | None since #152).
+            # "No policy" would let the graph grant, so this is DENY.
+            logger.warning(
+                "ReBAC SQL policy lookup returned a non-boolean (%s) for "
+                "subject=%s permission=%s resource=%s; treating as DENY (#78)",
+                type(stored).__name__,
+                subject_id,
+                permission,
+                resource_id,
+            )
+            return AccessDecision(
+                granted=False,
+                reason=_SQL_NON_BOOLEAN_REASON,
+                subject_id=subject_id,
+                permission=permission,
+                resource_id=resource_id,
+            )
 
         # 2. Graph traversal check
         if self._neo4j.available:
