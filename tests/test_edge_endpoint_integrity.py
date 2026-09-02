@@ -22,8 +22,10 @@ least observable. Every "raw INSERT" below stands in for that path.
 
 CONTRACT PINNED HERE (deliberately asymmetric, see _graph_protocol.py):
   - single ``upsert_edge``  -> returns False, writes nothing
-  - batch  ``upsert_edges_batch`` -> raises ValueError before any insert,
-    so a batch that mixes good rows with one bad row writes NONE of them
+  - batch  ``upsert_edges_batch`` -> raises ValueError, and a batch mixing
+    good rows with one bad row writes NONE of them (all-or-none; whether the
+    implementation refuses before the first insert or rolls back after is
+    not observable from a test, so it is not claimed here)
 
 DETECTION POWER
 ---------------

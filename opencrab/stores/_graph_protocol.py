@@ -230,9 +230,9 @@ class GraphStore(Protocol):
         which raises instead: a single call has one outcome the caller is
         already branching on, while a batch has to say WHICH row was bad, and
         a lower count would not distinguish "all written" from "some skipped"
-        for those two backends. Neo4j and Kùzu batch differently -- see that
-        method's own note; this is a Local/PG rationale, not a cross-backend
-        rule.
+        for those two backends. Neo4j batches differently and Kùzu rejects
+        the call outright -- see that method's own note; this is a Local/PG
+        rationale, not a cross-backend rule.
         """
         ...
 
@@ -711,8 +711,11 @@ class GraphStoreExtended(Protocol):
         Each item: ``{"node_type": str, "node_id": str,
         "properties": dict, "space_id": str | None}``. Faster than N calls
         to ``upsert_node`` (single transaction/commit for the whole batch on
-        Local/PG; Kuzu's port is currently a per-item loop calling
-        ``upsert_node`` — same result, no batching speedup yet).
+        Local/PG; Neo4j loops per item). Kùzu has no implementation of this
+        method at all -- the production facade raises
+        ``GraphWriteCapabilityUnavailable`` on the name, same as every other
+        write (this docstring previously described a Kùzu per-item loop that
+        does not exist).
         """
         ...
 
@@ -721,8 +724,8 @@ class GraphStoreExtended(Protocol):
 
         Each item: ``{"from_type": str, "from_id": str, "relation": str,
         "to_type": str, "to_id": str, "properties": dict | None}``. On
-        Local/PG this is ``len(edges)`` (or 0 for empty input); Kuzu's port
-        loops calling ``upsert_edge`` per item and only counts the ones that
+        Local/PG this is ``len(edges)`` (or 0 for empty input); Neo4j loops
+        calling ``upsert_edge`` per item and counts only the ones that
         returned True.
 
         ENDPOINT HANDLING DIFFERS BY BACKEND, so all four are stated here:
@@ -734,10 +737,17 @@ class GraphStoreExtended(Protocol):
           either wrote them all or raised.
         - Neo4j loops calling its own ``upsert_edge`` and counts only the
           items that returned True, so a bad endpoint lowers the count
-          instead of raising. Kùzu's port does the same.
+          instead of raising.
+        - Kùzu never gets as far as an endpoint. The production facade
+          classifies this name as a write and raises
+          ``GraphWriteCapabilityUnavailable`` before looking at the list, so
+          no item is processed and no count is returned at all -- not even
+          for an empty batch. There is no Kùzu batch implementation to
+          describe; ``KuzuGraphStore`` does not define this method and its
+          constructor is capability-negative.
 
         Contrast ``upsert_edge``, which reports the same condition as False
-        on every backend (see its note above).
+        on Local/PG and Neo4j (see its note above); Kùzu raises there too.
         """
         ...
 

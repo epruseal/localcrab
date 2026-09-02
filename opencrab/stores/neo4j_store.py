@@ -1861,8 +1861,14 @@ class Neo4jStore:
     def upsert_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
         """Bulk upsert; returns the count of edges that upserted successfully.
 
-        Per-item loop calling ``upsert_edge`` — mirrors
-        ``KuzuGraphStore.upsert_edges_batch``.
+        Per-item loop calling ``upsert_edge``, so an item whose endpoints
+        do not resolve lowers the count instead of raising (the Local/PG
+        batch raises -- see ``GraphStoreExtended.upsert_edges_batch``).
+
+        This used to say it mirrored ``KuzuGraphStore.upsert_edges_batch``.
+        That method does not exist: ``KuzuGraphStore``'s constructor is
+        capability-negative and the production facade raises on this name
+        before it looks at the list.
         """
         self._require_schema_ready()
         if not edges:
