@@ -7,6 +7,7 @@ LocalSQLDocStore 미구현 시 해당 테스트는 skip 처리.
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -306,48 +307,135 @@ class TestMigrateVectors:
 # ---------------------------------------------------------------------------
 
 class TestBackupLocalData:
-    def test_backup_creates_bak_files(self, tmp_path: Path) -> None:
-        """기존 파일/디렉토리가 있을 때 .bak.{timestamp} 백업 생성."""
-        # graph.db 생성
-        graph_db = tmp_path / "graph.db"
-        graph_db.write_text("fake db")
-        # chroma/ 디렉토리 생성
+    """backup_local_data 의 계약 (issues #128, #123).
+
+    산출물 배치가 항목별 ``graph.db.bak.{ts}`` 에서 세트 디렉터리
+    ``backup.{ts}.{난수}/graph.db`` 로 바뀌었다. 세트 전체를 rename 한 번으로
+    공개해야 부분 공개된 백업이 남지 않기 때문이다. 반환 계약
+    ``{원본경로: 백업경로}`` 는 그대로다.
+
+    일관성·완전성 자체의 회귀 테스트는 tests/test_backup_consistency.py 에
+    있다. 여기서는 스크립트가 그 모듈에 제대로 위임하는지만 본다.
+    """
+
+    @staticmethod
+    def _make_db(path: Path, marker: str) -> None:
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute("CREATE TABLE t (v TEXT)")
+            conn.execute("INSERT INTO t VALUES (?)", (marker,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _set_dir(root: Path) -> Path:
+        sets = [p for p in root.iterdir() if p.is_dir() and p.name.startswith("backup.")]
+        assert len(sets) == 1, f"expected exactly one backup set, found {sets}"
+        return sets[0]
+
+    def test_backup_creates_a_set_with_files_and_directories(self, tmp_path: Path) -> None:
+        """존재하는 파일과 디렉터리가 하나의 백업 세트에 담긴다."""
+        self._make_db(tmp_path / "graph.db", "graph-marker")
         chroma_dir = tmp_path / "chroma"
         chroma_dir.mkdir()
         (chroma_dir / "index.bin").write_text("vec")
 
+        backed_up = mig.backup_local_data(str(tmp_path))
+
+        s = self._set_dir(tmp_path)
+        assert (s / "graph.db").is_file()
+        assert (s / "chroma" / "index.bin").read_text() == "vec"
+
+        conn = sqlite3.connect(str(s / "graph.db"))
+        try:
+            assert conn.execute("SELECT v FROM t").fetchone()[0] == "graph-marker"
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            conn.close()
+
+        assert backed_up[str(tmp_path / "graph.db")] == str(s / "graph.db")
+
+    def test_backup_works_when_the_data_root_is_a_symlink(self, tmp_path: Path) -> None:
+        """LOCAL_DATA_DIR 이 심링크인 배치에서도 백업이 된다(회귀 고정)."""
+        real = tmp_path / "real"
+        real.mkdir()
+        self._make_db(real / "graph.db", "graph-marker")
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        backed_up = mig.backup_local_data(str(link))
+
+        s = self._set_dir(real)
+        assert (s / "graph.db").is_file()
+        assert backed_up[str(link / "graph.db")] == str(s / "graph.db")
+
+    def test_backup_includes_the_vector_store(self, tmp_path: Path) -> None:
+        """#123: vectors.db 가 백업 대상에서 빠져 있었다."""
+        self._make_db(tmp_path / "vectors.db", "vector-marker")
         mig.backup_local_data(str(tmp_path))
-
-        # graph.db 백업 확인
-        bak_files = list(tmp_path.glob("graph.db.bak.*"))
-        assert len(bak_files) == 1
-        assert bak_files[0].read_text() == "fake db"
-
-        # chroma 백업 디렉토리 확인
-        bak_dirs = list(tmp_path.glob("chroma.bak.*"))
-        assert len(bak_dirs) == 1
-        assert (bak_dirs[0] / "index.bin").exists()
+        assert (self._set_dir(tmp_path) / "vectors.db").is_file()
 
     def test_backup_skips_missing_files(self, tmp_path: Path) -> None:
-        """없는 파일은 조용히 스킵 (예외 없음)."""
-        # tmp_path 비어 있음
+        """없는 파일은 조용히 스킵한다 (예외 없음)."""
         backed_up = mig.backup_local_data(str(tmp_path))
-        # 백업 없음 (경고만)
         assert backed_up == {}
 
-    def test_backup_creates_timestamped_name(self, tmp_path: Path) -> None:
-        """백업 파일명에 타임스탬프 포함."""
-        graph_db = tmp_path / "graph.db"
-        graph_db.write_text("x")
+    def test_set_name_carries_a_timestamp_and_a_unique_suffix(self, tmp_path: Path) -> None:
+        """세트 이름은 ``backup.{YYYYMMDD_HHMMSS}.{난수 hex}`` 다.
 
+        난수 접미사가 있어야 같은 초에 두 번 실행해도 충돌하지 않고,
+        사전 검사와 rename 사이의 경쟁 창도 실질적으로 닫힌다.
+        """
+        self._make_db(tmp_path / "graph.db", "x")
         mig.backup_local_data(str(tmp_path))
-        bak_files = list(tmp_path.glob("graph.db.bak.*"))
-        assert len(bak_files) == 1
-        # 타임스탬프 형식: YYYYMMDD_HHMMSS
-        bak_name = bak_files[0].name
-        suffix = bak_name.replace("graph.db.bak.", "")
-        assert len(suffix) == 15  # 20240101_120000
-        assert "_" in suffix
+
+        name = self._set_dir(tmp_path).name
+        assert name.startswith("backup.")
+        ts, _, suffix = name[len("backup."):].partition(".")
+        assert len(ts) == 15 and "_" in ts, ts  # 20240101_120000
+        assert len(suffix) == 6 and suffix, suffix
+
+    def test_no_wal_or_shm_sidecars_in_the_set(self, tmp_path: Path) -> None:
+        """온라인 백업 목적지는 동반 파일 없이 단독으로 열린다.
+
+        WAL 연결을 백업 동안 열어 둔다. 마지막 연결을 닫으면 체크포인트가
+        일어나 사이드카가 사라지므로, 닫은 뒤 백업하면 애초에 제외할
+        사이드카가 없어 아무것도 증명하지 못한다. 아래 전제 단언이 그
+        상황을 조용히 통과시키지 않고 드러낸다.
+        """
+        conn = sqlite3.connect(str(tmp_path / "graph.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (v TEXT)")
+            conn.execute("INSERT INTO t VALUES ('x')")
+            conn.commit()
+            assert (tmp_path / "graph.db-wal").is_file(), (
+                "전제 조건 실패: -wal 이 없어 이 테스트는 아무것도 증명하지 못한다"
+            )
+
+            mig.backup_local_data(str(tmp_path))
+        finally:
+            conn.close()
+
+        s = self._set_dir(tmp_path)
+        assert not list(s.glob("*-wal"))
+        assert not list(s.glob("*-shm"))
+        # WAL 을 통과해 읽으므로 사이드카 없이도 내용이 온전해야 한다.
+        copied = sqlite3.connect(str(s / "graph.db"))
+        try:
+            assert copied.execute("SELECT v FROM t").fetchone()[0] == "x"
+        finally:
+            copied.close()
+
+    def test_a_corrupt_store_file_aborts_the_backup(self, tmp_path: Path) -> None:
+        """#128: raw 사본을 백업이라 보고하지 않고 중단한다."""
+        from opencrab.stores.backup import BackupError
+
+        (tmp_path / "graph.db").write_text("not a sqlite database")
+        with pytest.raises(BackupError):
+            mig.backup_local_data(str(tmp_path))
+        assert [p for p in tmp_path.iterdir() if p.name.startswith("backup.")] == []
 
 
 # ---------------------------------------------------------------------------

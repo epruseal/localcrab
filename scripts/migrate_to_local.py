@@ -24,7 +24,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import sys
 from datetime import UTC, datetime
@@ -277,59 +276,36 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def backup_local_data(local_data_dir: str) -> dict[str, str]:
     """
-    목적: 기존 로컬 파일을 덮어쓰기 전에 타임스탬프 접미사 백업 파일로 복사한다.
-    소스 → 대상:
-      graph.db      → graph.db.bak.{ts}
-      doc_store.db  → doc_store.db.bak.{ts}  (있으면)
-      chroma/       → chroma.bak.{ts}/        (있으면)
-      opencrab.db   → opencrab.db.bak.{ts}    (있으면)
-      billing.db    → billing.db.bak.{ts}     (있으면 — issue #105: billing_events
-                                                 는 opencrab.db 가 아닌 이 파일에 있다)
-    주의: shutil.copy2/copytree 사용. 없으면 경고만 출력하고 스킵.
-    반환: {원본경로: 백업경로} (백업된 항목만)
+    목적: 기존 로컬 데이터를 덮어쓰기 전에 일관된 백업 세트 하나로 복사한다.
+
+    산출물: ``<local_data_dir>/backup.{타임스탬프}.{난수}/`` 안에 각 파일이
+    원래 이름 그대로 들어간다. 예를 들어 그래프는
+    ``backup.20260902_101500.a1b2c3/graph.db`` 다. 항목별 ``.bak.{ts}`` 이름을
+    쓰지 않는 이유는 세트 전체를 rename 한 번으로 공개하기 위해서다. 그래야
+    어느 시점에 죽든 세트가 통째로 있거나 아예 없다.
+
+    대상 목록의 정본은 ``opencrab.stores.backup.local_data_dir_inventory`` 다.
+    여기에 다시 적지 않는다. 목록을 코드와 문서가 각각 하드코딩한 것이
+    ``vectors.db`` 가 백업에서 빠진 원인이었다(issue #123).
+
+    SQLite 파일은 온라인 백업 API 로 복사하고 사본을 다시 열어
+    ``PRAGMA integrity_check`` 를 통과시킨 뒤에야 성공으로 보고한다
+    (issue #128). ``shutil.copy2`` 는 실행 중 DB 에 대해 일관 사본을 만들지
+    못한다. 보장 범위는 **파일별 트랜잭션 일관성**이며 파일 간 시점 정렬은
+    아니다. 자세한 근거와 한계는 ``opencrab/stores/backup.py`` 의 모듈
+    docstring 에 있다.
+
+    잠금: ``backup_data_dir`` 이 ``write.lock`` 을 직접 잡는다. 호출자가 밖에서
+    또 잡을 필요가 없고, 잡아도 재진입이라 안전하다.
+
+    반환: {원본경로: 백업경로} (실제로 복사된 항목만)
     """
     console.rule("[bold blue]Step 1 — 기존 로컬 데이터 백업")
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    backed_up: dict[str, str] = {}
 
-    targets = [
-        ("graph.db",     "file"),
-        ("doc_store.db", "file"),
-        ("chroma",       "dir"),
-        ("opencrab.db",  "file"),
-        # issue #105: billing_events moved out of opencrab.db into its own
-        # file so it stops contending with write.lock'd writers for
-        # opencrab.db's SQLite file lock. It must be backed up separately or
-        # a split that was meant to prevent billing data loss would cause a
-        # bigger one (unbacked-up billing history).
-        ("billing.db",   "file"),
-    ]
+    from opencrab.stores.backup import backup_data_dir
 
-    for name, kind in targets:
-        src = os.path.join(local_data_dir, name)
-        if kind == "file":
-            bak_name = f"{name}.bak.{ts}"
-        else:
-            bak_name = f"{name}.bak.{ts}"
-        dst = os.path.join(local_data_dir, bak_name)
-
-        if kind == "file" and os.path.isfile(src):
-            shutil.copy2(src, dst)
-            # WAL 모드에서 생성되는 -wal, -shm 파일도 함께 백업
-            for suffix in ["-wal", "-shm"]:
-                extra_src = src + suffix
-                if os.path.isfile(extra_src):
-                    shutil.copy2(extra_src, dst + suffix)
-            console.print(f"  [green]백업[/green] {name} → {bak_name}")
-            backed_up[src] = dst
-        elif kind == "dir" and os.path.isdir(src):
-            shutil.copytree(src, dst)
-            console.print(f"  [green]백업[/green] {name}/ → {bak_name}/")
-            backed_up[src] = dst
-        else:
-            console.print(f"  [yellow]없음, 스킵[/yellow] {name}")
-
-    return backed_up
+    outcome = backup_data_dir(local_data_dir, on_event=lambda msg: console.print(f"  {msg}"))
+    return outcome.copied
 
 
 # ---------------------------------------------------------------------------
@@ -1022,8 +998,10 @@ def _run(args: argparse.Namespace) -> int:
         )
 
     # Step 1 — 백업
-    with file_lock("write.lock", local_data_dir):
-        backup_local_data(local_data_dir)
+    # write.lock 은 backup_data_dir 이 직접 잡는다(issue #128). 여기서 감싸던
+    # 예전 획득에는 타임아웃이 없어, 다른 프로세스가 락을 쥐고 있으면
+    # 마이그레이션이 무기한 멈췄다.
+    backup_local_data(local_data_dir)
 
     report: dict[str, Any] = {
         "started_at": datetime.now(UTC).isoformat(),

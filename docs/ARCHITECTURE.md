@@ -419,7 +419,8 @@ uv run python scripts/migrate_to_local.py --skip-vectors --skip-sql
 
 6단계 파이프라인:
 1. Pre-flight: 소스 서비스 연결 + 데이터 규모 확인 (READ ONLY)
-2. Backup: 기존 로컬 DB 파일 타임스탬프 접미사 백업 (`graph.db.bak.YYYYMMDD_HHMMSS`)
+2. Backup: 기존 로컬 스토어를 `opencrab/stores/backup.py`의 백업 세트로 보존
+   (`backup.{timestamp}.{hex}/`, 원본 파일명 그대로 담김, 단일 원자적 rename으로 발행)
 3. Graph: Neo4j → LocalGraphStore (SKIP/LIMIT 페이징, `upsert_nodes_batch`)
 4. Docs: MongoDB → LocalSQLDocStore (nodes / sources / audit_log)
 5. Vectors: HTTP Chroma → PersistentClient (임베딩 재계산 없이 원본 복사)
@@ -439,14 +440,17 @@ export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/loca
 ```
 <LOCAL_DATA_DIR>/
   graph.db          # LocalGraphStore (SQLite)
-  graph.db-wal      # WAL 파일 — 백업 시 반드시 포함
-  graph.db-shm      # 공유 메모리 파일 — 백업 시 반드시 포함
+  graph.db-wal      # WAL 파일 (온라인 백업 API가 이 파일을 통과해 읽으므로 별도 복사는 하지 않는다)
+  graph.db-shm      # 공유 메모리 파일 (재구축 가능한 임시 파일이라 마찬가지로 복사하지 않는다)
   doc_store.db      # LocalSQLDocStore (SQLite)
-  chroma/           # Chroma PersistentClient
+  vectors.db        # SqliteVecStore 기본 벡터 스토어 (SQLite)
+  chroma/           # ChromaStore PersistentClient 디렉터리 (옵션 벡터 백엔드)
+  docs/             # LocalDocStore JSON 폴백 디렉터리
   opencrab.db       # SQLStore (SQLite) — ontology_nodes/edges, impact_records,
                      # lever_simulations, rebac_policies
   billing.db        # billing_events 전용 (issue #105부터 opencrab.db 분리 —
                      # write.lock 쓰기와 SQLite 파일 잠금이 경합하지 않도록)
+  packs/            # 외부에서 채워 넣는 팩 스테이징 콘텐츠 (백업 대상에서 제외)
 ```
 
 > **issue #105 이전 설치라면 `opencrab.db`에도 `billing_events` 테이블이 남아
@@ -461,21 +465,68 @@ export LOCAL_DATA_DIR=/your/data/dir   # 기본: ~/.openclaw/workspace/data/loca
 > `billing.db`에 `INSERT OR IGNORE`하면 된다 — 사람이 직접 실행하는 단발성
 > 작업이므로 기동 경로의 크래시 복구·동시성 설계가 필요 없다.
 
-**3. 수동 백업**
+**3. 스토어 백업**
 
-WAL 모드 사용 시 `.db`만 복사하면 체크포인트되지 않은 WAL 데이터가 누락된다.
-세 파일을 함께 복사해야 한다.
+살아 있는 SQLite 파일을 `shutil.copy2`로 그대로 복사하면 트랜잭션 중간의
+상태가 찍혀 나올 수 있어 일관된 스냅샷이 아니다(issue #128). 대상 파일
+목록도 여기 문서에 다시 나열하지 않는다. 코드의 목록과 문서의 목록이
+따로 관리되다 어긋난 탓에 `vectors.db`가 백업에서 통째로 빠졌던 적이
+있기 때문이다(issue #123). 그래서 백업은 `opencrab/stores/backup.py`가
+가진 단일 정본 목록을 그대로 실행하는 CLI로 수행한다.
 
 ```bash
-cp graph.db graph.db-wal graph.db-shm /backup/path/
-cp doc_store.db /backup/path/
-cp opencrab.db /backup/path/
-cp billing.db /backup/path/
-cp -r chroma/ /backup/path/chroma/
+python -m opencrab.stores.backup --list                     # 정본 대상 목록 출력
+python -m opencrab.stores.backup --to /backup/path          # 백업 세트 생성
 ```
 
-> `migrate_to_local.py`의 backup 단계는 `-wal`, `-shm` 파일과 `billing.db`를
-> 자동으로 함께 복사한다.
+`--data-dir`를 생략하면 설정의 `LOCAL_DATA_DIR`을 쓴다. `--to`를 생략하면
+데이터 디렉토리 자신을 백업 목적지로 삼는다. 백업 결과는 원본 파일명을
+그대로 담은 하나의 세트 디렉터리(`backup.{timestamp}.{hex}/`, 예:
+`backup.20260902_101500.a1b2c3/graph.db`)로 발행된다. 발행은 단일 원자적
+rename으로 끝나므로 세트는 완전히 있거나 아예 없는 두 상태만 가능하다.
+
+SQLite 대상은 `sqlite3.Connection.backup()` 온라인 백업 API로 복사된다.
+복사본을 다시 열어 `PRAGMA integrity_check`를 통과해야 성공으로
+보고된다. 이 보장은 **파일 하나 단위의 트랜잭션 일관성**이며 여러 파일이
+같은 시점을 함께 가리킨다는 뜻은 아니다. 실행 전체를 감싸는 프로세스 간
+`write.lock`이 그 어긋남의 폭을 줄여 주지만 이 락을 지키는 writer에
+한해서다. `billing.db`는 issue #105에 따라 애초에 이 락 밖에서 쓰인다.
+락 소유권 맵에도 issue #141이 지적한 구멍이 남아 있다.
+
+`-wal`/`-shm` 사이드카 파일은 더 이상 함께 복사하지 않는다. 온라인 백업
+API가 WAL을 통과해 읽어 사이드카 없이 독립적으로 열리는 파일을 만들어
+내므로, 이제는 사이드카를 따로 복사하는 쪽이 잘못이다.
+
+`chroma/`, `docs/`처럼 디렉터리로 존재하는 대상은 심볼릭 링크를 두 가지로
+나누어 다룬다. 스토어 디렉터리 **안에서 발견된** 링크는 따라가지 않고 링크
+그 자체로 보존하므로 그 링크가 가리키는 내용은 백업에 담기지 않는다. 반면
+스토어 디렉터리 **자신이** 링크인 경우에는 따라가서 실제 내용을 담는다.
+스토어를 다른 볼륨으로 옮겨 둔 배치에서 링크만 담은 백업은 쓸모가 없기
+때문이다. 이 경우 링크를 따라갔다는 사실과 해석된 경로를 실행할 때 함께
+보고한다.
+
+`packs/`는 백업 대상에서 의도적으로 제외된다. 외부에서 채워 넣는 팩
+스테이징 콘텐츠라 이 저장소의 어떤 코드도 쓰지 않고 마이그레이션도
+덮어쓰지 않기 때문이다. 그 제외 사실은 실행할 때 화면에 안내되며 운영자가
+별도로 보관해야 한다.
+
+`--to`로 지정한 목적지는 운영자가 고른 위치로 취급한다. 목적지 자신이
+심볼릭 링크면 거부하지만, 그 상위 경로가 링크인 경우는 따라간다. 백업
+볼륨을 링크로 걸어 두는 배치가 정상이기 때문이다. 격납 검사는 목적지가
+아니라 백업 세트 **안쪽**에 걸린다.
+
+백업 목적지에 `.backup-staging.*`로 시작하는 디렉터리가 남아 있으면
+이전 실행이 중단됐다는 뜻이다. 백업 도중 발생한 보통의 오류는 스테이징을
+지우고 끝나므로 이 디렉터리를 남기지 않는다. 남는 경우는 프로세스가
+강제 종료되거나 전원이 끊겼을 때, 그리고 발행 `rename` 자체가 실패했을
+때다. 이름만으로 완료된
+백업과 구분되고 그 시점 내용은 온전하므로 이 도구는 자동으로 지우지 않고
+보고만 한다. 크기를 확인한 뒤 직접 지워야 한다.
+
+복원할 때는 먼저 관련 프로세스를 멈춘 뒤 복원 위치에 남아 있는
+`-wal`/`-shm` 파일을 지우고 나서 백업 파일을 그 자리에 놓아야 한다. 새
+백업은 사이드카를 만들지 않으므로 지우지 않은 옛 사이드카가 새 `.db`
+파일보다 우선 적용될 수 있다.
 
 **4. 검증**
 

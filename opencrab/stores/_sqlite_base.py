@@ -84,7 +84,9 @@ class _SqliteConnMixin:
 
         WAL: reader-writer를 격리해 쓰기 중에도 읽기를 허용. synchronous=NORMAL은
         WAL 체크포인트 시에만 fsync해 처리량을 높인다(단일 머신/NVMe에서 수용 가능).
-        WAL은 DB 파일에 영속 설정되며 <db>-wal/<db>-shm가 생기므로 백업 시 함께 복사.
+        WAL은 DB 파일에 영속 설정되며 그 결과로 <db>-wal/<db>-shm가 함께 생긴다.
+        백업 경로는 온라인 백업 API로 WAL을 통과해 읽으므로 이 사이드카 파일들을
+        백업에 함께 복사해서는 안 된다. 자세한 내용은 opencrab/stores/backup.py 참고.
         """
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row

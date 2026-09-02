@@ -29,7 +29,7 @@ opencrab extract 같은 별도 CLI 커맨드 전용 이름이 여기 해당한�
 from __future__ import annotations
 
 ENV_CONTRACT: dict[str, str] = {
-    # --- opencrab/config.py Settings alias (33) ---
+    # --- opencrab/config.py Settings alias ---
     "STORAGE_MODE": "설정 소스 선택",
     "LOCAL_DATA_DIR": "상태 위치",
     "NEO4J_URI": "외부 전송 결정",
@@ -73,7 +73,7 @@ ENV_CONTRACT: dict[str, str] = {
     "MCP_PROTOCOL_VERSIONS": "튜너블",
     "MCP_ALLOWED_ORIGINS": "튜너블",
     "LOG_LEVEL": "튜너블",
-    # --- 직접 읽기 (alias 밖, opencrab/·apps/ AST 스캔 실측, 12종) ---
+    # --- 직접 읽기 (alias 밖, opencrab/·apps/ AST 스캔으로 발견) ---
     # opencrab extract CLI 커맨드 전용(cli.py:584,614). opencrab serve 의 도구
     # 실행 경로(opencrab/mcp/**)는 이 커맨드 함수를 호출하지 않는다.
     "ANTHROPIC_API_KEY": "외부 전송 결정, serve 비도달",
@@ -97,7 +97,13 @@ ENV_CONTRACT: dict[str, str] = {
     # 는 opencrab.pack.build 를 임포트하지 않는다(위 재현 명령으로 확인).
     "PACK_OUT_ROOT": "튜너블, serve 비도달",
     "PACK_LIB_STRICT": "튜너블, serve 비도달",
-    # --- 간접 접근(auth.py 튜플 순회, AST 정적 해석 불가 -- INDIRECT_ENV_ACCESS 참조, 3종) ---
+    # #128: 백업이 write.lock 과 경합 소스를 기다리는 상한(초). 값은 대기 시간만
+    # 바꾸고 외부 전송 대상이나 상태 위치를 바꾸지 않는다. opencrab/stores/backup.py
+    # 에서만 읽히고 그 모듈은 serve 경로가 임포트하지 않는다(재현:
+    # `grep -rln "stores[.]backup" opencrab/mcp opencrab/services opencrab/ontology`
+    # 무매치).
+    "OPENCRAB_BACKUP_LOCK_TIMEOUT": "튜너블, serve 비도달",
+    # --- 간접 접근(auth.py 튜플 순회, AST 정적 해석 불가 -- INDIRECT_ENV_ACCESS 참조) ---
     "OPENCRAB_API_KEY": "기동 거부",
     "LOCALCRAB_MCP_TOKEN": "기동 거부",
     "LOCALCRAB_MCP_TOKEN_FILE": "기동 거부",
