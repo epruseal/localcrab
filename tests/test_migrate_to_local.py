@@ -356,6 +356,20 @@ class TestBackupLocalData:
 
         assert backed_up[str(tmp_path / "graph.db")] == str(s / "graph.db")
 
+    def test_backup_works_when_the_data_root_is_a_symlink(self, tmp_path: Path) -> None:
+        """LOCAL_DATA_DIR 이 심링크인 배치에서도 백업이 된다(회귀 고정)."""
+        real = tmp_path / "real"
+        real.mkdir()
+        self._make_db(real / "graph.db", "graph-marker")
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        backed_up = mig.backup_local_data(str(link))
+
+        s = self._set_dir(real)
+        assert (s / "graph.db").is_file()
+        assert backed_up[str(link / "graph.db")] == str(s / "graph.db")
+
     def test_backup_includes_the_vector_store(self, tmp_path: Path) -> None:
         """#123: vectors.db 가 백업 대상에서 빠져 있었다."""
         self._make_db(tmp_path / "vectors.db", "vector-marker")

@@ -673,7 +673,12 @@ def backup_data_dir(
     from opencrab.locking import write_lock
 
     data_dir = Path(data_dir)
-    dest = Path(dest_dir) if dest_dir is not None else data_dir
+    # The implicit destination is the data directory's REAL path: a data
+    # root that is itself a symlink is a normal layout, and the symlink
+    # refusal below is for a destination the operator pointed at explicitly.
+    # Refusing the implicit one blocked every backup on such a layout,
+    # including the migration script, which never passes a destination.
+    dest = Path(dest_dir) if dest_dir is not None else data_dir.resolve()
     say = on_event or (lambda _msg: None)
     timeout = _resolve_timeout(lock_timeout)
 

@@ -876,6 +876,57 @@ class TestPathHandling:
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(d, dest_dir=d / "escape", settings=_Settings())
 
+    def test_symlinked_data_root_with_implicit_destination_is_backed_up(
+        self, tmp_path: Path
+    ) -> None:
+        """LOCAL_DATA_DIR itself being a symlink is a normal layout.
+
+        The migration script calls backup_data_dir(local_data_dir) with no
+        destination; refusing the implicit destination because the data root
+        is a link blocked every backup on such a layout, which the copy2 code
+        this module replaced handled fine.
+        """
+        real = tmp_path / "real"
+        real.mkdir()
+        _make_db(real / "graph.db", rows=3)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        outcome = bk.backup_data_dir(link, settings=_Settings())
+        assert outcome.set_dir.is_relative_to(real.resolve())
+        s = _set_dir(real)
+        assert _rows(s / "graph.db") == _rows(real / "graph.db")
+        assert outcome.copied[str(link / "graph.db")] == str(s / "graph.db")
+
+    def test_symlinked_data_root_with_explicit_symlink_destination_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        real = tmp_path / "real"
+        real.mkdir()
+        _make_db(real / "graph.db", rows=3)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        with pytest.raises(bk.BackupError, match="symlink"):
+            bk.backup_data_dir(link, dest_dir=link, settings=_Settings())
+        assert _published_sets(real) == []
+
+    def test_symlinked_data_root_cannot_write_outside_the_set(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        (real / "docs").mkdir(parents=True)
+        _make_db(real / "graph.db", rows=3)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("must not be copied", encoding="utf-8")
+        (real / "docs" / "link").symlink_to(outside)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        bk.backup_data_dir(link, settings=_Settings())
+        s = _set_dir(real)
+        assert (s / "docs" / "link").is_symlink()
+        names = {f for _r, _d, files in os.walk(s, followlinks=False) for f in files}
+        assert "secret.txt" not in names
+
     def test_destination_via_a_symlinked_ancestor_is_deliberately_allowed(
         self, tmp_path: Path
     ) -> None:
