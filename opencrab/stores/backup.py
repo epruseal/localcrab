@@ -1076,7 +1076,10 @@ def _main(argv: list[str] | None = None) -> int:
     # skipped/unverified/excluded are the declared contract, not failures:
     # the summary names them and the run succeeds.
     try:
-        sys.stdout.flush()
+        # sys.stdout is None when fd 1 was closed outright (``>&-``); print()
+        # was a no-op all along and there is nothing to flush.
+        if sys.stdout is not None:
+            sys.stdout.flush()
     except OSError as exc:
         _detach_stdout()
         print(f"ERROR: output failed after the backup ran ({exc})", file=sys.stderr)
@@ -1092,6 +1095,8 @@ def _detach_stdout() -> None:
     Replacing the descriptor (the Python docs' recipe) makes that final
     flush succeed so the exit code we return is the one the user sees.
     """
+    if sys.stdout is None:
+        return
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())

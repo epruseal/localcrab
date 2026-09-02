@@ -1756,3 +1756,24 @@ class TestErrorBoundary:
         assert proc.returncode == 1, proc.stderr
         assert "ERROR:" in proc.stderr
         assert "Traceback" not in proc.stderr, proc.stderr
+
+    def test_cli_with_fd1_closed_entirely_still_succeeds(self, populated_dir: Path) -> None:
+        """No stdout at all (``>&-``): Python sets sys.stdout to None.
+
+        print() is then a no-op, so the run must simply succeed; the exit
+        flush must not trip over the missing stream.
+        """
+        env = dict(os.environ)
+        env["VECTOR_DB_FILE"] = "vectors.db"
+        env["LOCAL_DATA_DIR"] = str(populated_dir)
+        proc = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "opencrab.stores.backup", "--data-dir", str(populated_dir)],
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(Path(bk.__file__).parents[2]),
+            env=env,
+            preexec_fn=lambda: os.close(1),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "Traceback" not in proc.stderr, proc.stderr
+        assert len(_published_sets(populated_dir)) == 1
