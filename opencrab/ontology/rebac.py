@@ -13,9 +13,11 @@ Decision logic (in order of priority):
   5. Default → deny.
 
 Failure contract (#78): ``check()`` is a fail-closed boundary. If the SQL
-policy lookup raises, or returns a value outside ``bool | None``, the
-decision is DENY and the graph is not consulted, because an explicit DENY
-row that could not be read must not be overridden by a graph GRANT. The
+store reports ``available=False`` (its connection failed at start-up), if
+the policy lookup raises, or if it returns a value outside ``bool | None``,
+the decision is DENY and the graph is not consulted, because an explicit
+DENY row that could not be read must not be overridden by a graph GRANT.
+Only a successful lookup with no row (``None``) reaches the graph. The
 WARNING names the exception type and the three identifiers only; the full
 traceback is logged at DEBUG.
 """
@@ -41,6 +43,9 @@ _SQL_LOOKUP_FAILED_REASON = (
 _SQL_NON_BOOLEAN_REASON = (
     "SQL policy lookup returned a non-boolean value; "
     "default deny applied (fail-closed)."
+)
+_SQL_UNAVAILABLE_REASON = (
+    "SQL policy store unavailable; default deny applied (fail-closed)."
 )
 
 # Relations in the subject→resource space that map to permissions
@@ -104,9 +109,10 @@ class ReBACEngine:
         Returns
         -------
         AccessDecision
-            ``granted=False`` with ``_SQL_LOOKUP_FAILED_REASON`` if the SQL
-            store raised, or with ``_SQL_NON_BOOLEAN_REASON`` if it returned
-            a value outside ``bool | None``. Neither case consults the graph.
+            ``granted=False`` with ``_SQL_UNAVAILABLE_REASON`` if the SQL
+            store reports unavailable, with ``_SQL_LOOKUP_FAILED_REASON`` if
+            it raised, or with ``_SQL_NON_BOOLEAN_REASON`` if it returned a
+            value outside ``bool | None``. None of these consults the graph.
             This method does not raise for store failures.
         """
         # Validate permission label
@@ -126,12 +132,25 @@ class ReBACEngine:
         # be overridden by a graph GRANT (#78). The graph path can only
         # grant, so its own errors stay in _graph_check.
         try:
-            sql_available = self._sql.available
-            stored = (
-                self._sql.check_policy(subject_id, permission, resource_id)
-                if sql_available
-                else None
-            )
+            if not self._sql.available:
+                # SQLStore reports unavailable only after _connect caught a
+                # connection error, and the factory always builds a
+                # SQLStore, so this is an outage, not a graph-only mode.
+                logger.warning(
+                    "ReBAC SQL policy store unavailable for subject=%s "
+                    "permission=%s resource=%s; treating as DENY (#78)",
+                    subject_id,
+                    permission,
+                    resource_id,
+                )
+                return AccessDecision(
+                    granted=False,
+                    reason=_SQL_UNAVAILABLE_REASON,
+                    subject_id=subject_id,
+                    permission=permission,
+                    resource_id=resource_id,
+                )
+            stored = self._sql.check_policy(subject_id, permission, resource_id)
         except Exception as exc:
             logger.warning(
                 "ReBAC SQL policy lookup failed (%s) for subject=%s "
