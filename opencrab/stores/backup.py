@@ -213,8 +213,19 @@ def local_data_dir_inventory(settings: Any | None = None) -> list[BackupTarget]:
             from opencrab.config import get_settings
 
             settings = get_settings()
-        except Exception:  # pragma: no cover - config import is not required here
-            settings = None
+        except Exception as exc:
+            # Fail closed. Falling back to the fixed list here would drop a
+            # renamed VECTOR_DB_FILE and still report a complete backup --
+            # which is exactly the harm #123 describes. This module already
+            # refuses to fall back to a raw copy when the online backup
+            # fails, for the same reason: never present an incomplete backup
+            # as a finished one.
+            raise BackupError(
+                f"cannot read the configuration to determine the backup targets ({exc}). "
+                "Refusing to continue: the configured vector database filename is unknown, "
+                "so a renamed VECTOR_DB_FILE would be silently left out of the backup. "
+                "Fix the configuration, or call this API with an explicit settings object."
+            ) from exc
 
     vector_file = getattr(settings, "vector_db_file", None)
     if isinstance(vector_file, str) and vector_file and vector_file not in known:
@@ -798,7 +809,15 @@ def _main(argv: list[str] | None = None) -> int:
         data_dir = settings.local_data_dir
 
     if args.list:
-        for t in local_data_dir_inventory(settings):
+        # Inside the same error handling as a real run: with G2 the inventory
+        # can now fail, and an operator asking what would be backed up should
+        # get the reason, not a traceback.
+        try:
+            targets = local_data_dir_inventory(settings)
+        except BackupError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        for t in targets:
             print(f"{t.kind:10} {t.label:24} {t.reason}")
         return 0
 

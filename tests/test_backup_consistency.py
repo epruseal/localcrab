@@ -422,6 +422,36 @@ class TestInventory:
         assert "renamed.db" in labels, "VECTOR_DB_FILE rename is not followed"
         assert "vectors.db" in labels, "settings must only ADD targets, never remove them"
 
+    def test_unreadable_configuration_fails_instead_of_dropping_targets(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A settings failure must not silently shrink the backup.
+
+        Swallowing it and continuing with the fixed list would omit a renamed
+        VECTOR_DB_FILE while still reporting success, which is issue #123's
+        failure mode reintroduced from the inside.
+        """
+        import opencrab.config as config
+
+        def boom() -> object:
+            raise ValueError("induced configuration error")
+
+        monkeypatch.setattr(config, "get_settings", boom)
+
+        d = tmp_path / "data"
+        d.mkdir()
+        _make_db(d / "graph.db", rows=2)
+
+        with pytest.raises(bk.BackupError) as excinfo:
+            bk.local_data_dir_inventory()
+        message = str(excinfo.value)
+        assert "induced configuration error" in message
+        assert "vector" in message.lower(), "the message must name what would go missing"
+
+        with pytest.raises(bk.BackupError):
+            bk.backup_data_dir(d)
+        assert _published_sets(d) == [], "a set was published despite an unusable inventory"
+
     def test_kinds_are_declared(self) -> None:
         kinds = {t.label: t.kind for t in bk.local_data_dir_inventory(_Settings())}
         assert kinds["opencrab.db"] == "sqlite"
@@ -503,13 +533,35 @@ class TestPublishedSet:
         assert expected <= set(verified), f"not verified: {expected - set(verified)}"
 
     def test_no_wal_or_shm_sidecars_are_written(self, populated_dir: Path) -> None:
-        """.backup() destinations are standalone; sidecars would mislead."""
+        """.backup() destinations are standalone; sidecars would mislead.
+
+        The WAL connection is held OPEN across the backup on purpose. Closing
+        the last connection checkpoints and removes the sidecars, so a test
+        that backs up afterwards proves nothing: there would be no -wal to
+        exclude. The precondition below fails loudly if the sidecar is absent.
+        """
         (populated_dir / "graph.db").unlink()
         _make_db(populated_dir / "graph.db", rows=4, wal=True)
-        bk.backup_data_dir(populated_dir, settings=_Settings())
+
+        holder = sqlite3.connect(str(populated_dir / "graph.db"))
+        try:
+            holder.execute("PRAGMA journal_mode=WAL")
+            holder.execute("INSERT INTO t (id, v) VALUES (99, 'uncheckpointed')")
+            holder.commit()
+            assert (populated_dir / "graph.db-wal").is_file(), (
+                "fixture precondition: no -wal exists, so this test would prove nothing"
+            )
+
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        finally:
+            holder.close()
+
         s = _set_dir(populated_dir)
-        assert not list(s.glob("*-wal"))
-        assert not list(s.glob("*-shm"))
+        assert not list(s.glob("*-wal")), "a -wal sidecar was copied into the set"
+        assert not list(s.glob("*-shm")), "a -shm sidecar was copied into the set"
+        # The copy must still be complete: .backup() reads through the WAL, so
+        # the uncheckpointed row has to be present without its sidecar.
+        assert (99, "uncheckpointed") in _rows(s / "graph.db")
 
     def test_missing_targets_are_skipped_not_fatal(self, tmp_path: Path) -> None:
         d = tmp_path / "empty"
@@ -675,6 +727,44 @@ class TestPathHandling:
         outcome = bk.backup_data_dir(d, dest_dir=d / "volume" / "sub", settings=_Settings())
         assert outcome.set_dir.resolve().is_relative_to(outside.resolve())
         assert (outcome.set_dir / "graph.db").is_file()
+
+    def test_a_relative_symlink_inside_a_store_cannot_write_outside_the_set(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end containment, which the unit test below does NOT cover.
+
+        test_target_inside_the_set_cannot_escape calls _require_contained
+        directly with the right arguments, so it stays green even if the CALL
+        SITE in _run_targets passes the wrong root. That mutation is not
+        theoretical: a relative symlink resolves differently from the staging
+        tree than from the data directory, so it lets a backup publish
+        successfully while writing a file OUTSIDE the set.
+
+        docs/link -> ../../foo escapes the data directory once copytree has
+        preserved it inside staging, and routing VECTOR_DB_FILE through that
+        link aims a destination at it.
+        """
+        d = tmp_path / "data"
+        (d / "docs").mkdir(parents=True)
+        (d / "docs" / "link").symlink_to(Path("..") / ".." / "foo")
+        escape_target = tmp_path / "foo" / "sub"
+        escape_target.mkdir(parents=True)
+        _make_db(escape_target / "x.db", rows=2)
+        assert (d / "docs" / "link" / "sub" / "x.db").is_file(), (
+            "fixture precondition: the escaping source must be reachable through the link"
+        )
+
+        with pytest.raises(bk.BackupError):
+            bk.backup_data_dir(d, settings=_Settings(vector_db_file="docs/link/sub/x.db"))
+
+        assert _published_sets(d) == []
+        # The assertion that matters. Checking only that it raised would pass
+        # for an unrelated reason; what must be true is that nothing was
+        # written through the link to a path outside the backup set.
+        assert not (escape_target / "backup").exists()
+        assert sorted(p.name for p in escape_target.iterdir()) == ["x.db"], (
+            "the backup wrote through the symlink to a path outside the set"
+        )
 
     def test_target_inside_the_set_cannot_escape(self, tmp_path: Path) -> None:
         """The #212 invariant, checked against a root fixed by the caller.

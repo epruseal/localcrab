@@ -383,20 +383,36 @@ class TestBackupLocalData:
         assert len(suffix) == 6 and suffix, suffix
 
     def test_no_wal_or_shm_sidecars_in_the_set(self, tmp_path: Path) -> None:
-        """온라인 백업 목적지는 동반 파일 없이 단독으로 열린다."""
+        """온라인 백업 목적지는 동반 파일 없이 단독으로 열린다.
+
+        WAL 연결을 백업 동안 열어 둔다. 마지막 연결을 닫으면 체크포인트가
+        일어나 사이드카가 사라지므로, 닫은 뒤 백업하면 애초에 제외할
+        사이드카가 없어 아무것도 증명하지 못한다. 아래 전제 단언이 그
+        상황을 조용히 통과시키지 않고 드러낸다.
+        """
         conn = sqlite3.connect(str(tmp_path / "graph.db"))
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("CREATE TABLE t (v TEXT)")
             conn.execute("INSERT INTO t VALUES ('x')")
             conn.commit()
+            assert (tmp_path / "graph.db-wal").is_file(), (
+                "전제 조건 실패: -wal 이 없어 이 테스트는 아무것도 증명하지 못한다"
+            )
+
+            mig.backup_local_data(str(tmp_path))
         finally:
             conn.close()
 
-        mig.backup_local_data(str(tmp_path))
         s = self._set_dir(tmp_path)
         assert not list(s.glob("*-wal"))
         assert not list(s.glob("*-shm"))
+        # WAL 을 통과해 읽으므로 사이드카 없이도 내용이 온전해야 한다.
+        copied = sqlite3.connect(str(s / "graph.db"))
+        try:
+            assert copied.execute("SELECT v FROM t").fetchone()[0] == "x"
+        finally:
+            copied.close()
 
     def test_a_corrupt_store_file_aborts_the_backup(self, tmp_path: Path) -> None:
         """#128: raw 사본을 백업이라 보고하지 않고 중단한다."""
