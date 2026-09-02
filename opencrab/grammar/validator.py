@@ -60,11 +60,13 @@ def _is_nullable(spec: dict[str, Any]) -> bool:
 
     ``required`` decides whether the KEY must be present. ``nullable`` decides
     whether the VALUE may be ``None``. When a spec does not declare
-    ``nullable`` it is derived as ``not required``: every hand-written schema
-    in opencrab/schemas/types/ declares it explicitly and follows exactly that
-    pairing, and the schemas that pack_registry generates omit the key with
-    that same meaning documented (see ``_build_type_schema``). So the
-    derivation changes no schema's declared meaning (#49, #106).
+    ``nullable`` it is derived as ``not required``. An explicit declaration
+    always wins over that derivation: the hand-written schemas in
+    opencrab/schemas/types/ declare it on every property, mostly as that
+    pairing but also as ``required: false, nullable: false`` (an enum field
+    with a ``default``). The schemas that pack_registry generates omit the
+    key with the derived meaning documented (see ``_build_type_schema``).
+    So the derivation changes no schema's declared meaning (#49, #106).
     """
     return bool(spec.get("nullable", not spec.get("required", False)))
 
