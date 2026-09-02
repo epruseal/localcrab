@@ -81,11 +81,11 @@ class LocalDocStore:
         path = self._collection_path(collection)
         if not os.path.exists(path):
             return {}
+        # Decode through the text wrapper so only the str is alive while
+        # json parses (a bytes buffer plus a str would double the peak).
         try:
-            with open(path, "rb") as f:
-                raw = f.read()
-            text = raw.decode("utf-8")
-            data = json.loads(text)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
         except UnicodeDecodeError as exc:
             reason = f"invalid UTF-8: {exc}"
             logger.error("Corrupt %s.json: %s", collection, reason)
