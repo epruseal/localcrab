@@ -390,8 +390,9 @@ class TestColumnResolution:
 class TestValueConversion:
     @pytest.mark.parametrize("bad", [2, -1, 7])
     def test_corrupt_boolean_is_refused_not_coerced(self, bad: int) -> None:
-        """rebac_policies.granted has no CHECK constraint, so a real database
-        can hold this today; the previous bool() call turned it into True."""
+        """A SQLite rebac_policies table created before #152 has no CHECK on
+        granted, so a real database can hold this today; the previous bool()
+        call turned it into True."""
         with pytest.raises(mt.MigrationError) as excinfo:
             mt.to_pg_bool(bad, table="rebac_policies", column="granted", key="s,p,r")
         assert str(bad) in str(excinfo.value)
@@ -669,11 +670,24 @@ class TestForwardAgainstPostgres:
     ) -> None:
         """The corruption sits in the last table copied, with rows in every
         earlier one: without a scan that precedes the first write, the auth
-        tables would already be committed when it is found."""
+        tables would already be committed when it is found.
+
+        The current SQLite DDL has a CHECK on ``granted`` (#152), so the table
+        is rebuilt without it -- the shape of a database created before that
+        CHECK, which is the only place such a row can exist."""
         db = str(tmp_path / "opencrab.db")
         _sqlite_source(db)
         _seed_auth_rows(db)
         with sqlite3.connect(db) as conn:
+            conn.execute("DROP TABLE rebac_policies")
+            conn.execute(
+                "CREATE TABLE rebac_policies ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "subject_id TEXT NOT NULL, permission TEXT NOT NULL, "
+                "resource_id TEXT NOT NULL, granted INTEGER NOT NULL DEFAULT 1, "
+                "created_at TEXT DEFAULT (datetime('now')), "
+                "UNIQUE (subject_id, permission, resource_id))"
+            )
             conn.execute(
                 "INSERT INTO rebac_policies (subject_id, permission, resource_id, granted, "
                 "created_at) VALUES ('s', 'p', 'r', 2, '2026-04-01 00:00:00')"
