@@ -645,6 +645,49 @@ class TestPublishedSet:
         assert by_label["docs"].status == "unverified"
         assert by_label["opencrab.db"].status == "verified"
 
+    def test_a_corrupt_chroma_catalog_aborts_the_backup(self, tmp_path: Path) -> None:
+        """Known-bad is not the same as not-fully-verified.
+
+        A failing integrity_check on the copied catalog is positive evidence
+        the copy is unusable. Publishing it as a success let the migration
+        overwrite the live store next, leaving the operator with a backup
+        already known to be broken.
+        """
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        _make_db(d / "graph.db", rows=3)
+        (d / "chroma" / "chroma.sqlite3").write_bytes(b"this is not a sqlite database")
+        (d / "chroma" / "index.bin").write_bytes(b"vec")
+
+        with pytest.raises(bk.BackupError) as excinfo:
+            bk.backup_data_dir(d, settings=_Settings())
+        assert "chroma" in str(excinfo.value)
+        assert _published_sets(d) == [], "a set was published despite a known-bad catalog"
+        assert _stagings(d) == []
+
+    def test_a_sound_chroma_catalog_is_unverified_not_failed(self, tmp_path: Path) -> None:
+        """Passing the catalog check still does not prove the segments agree."""
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        _make_db(d / "chroma" / "chroma.sqlite3", rows=2)
+        (d / "chroma" / "index.bin").write_bytes(b"vec")
+
+        outcome = bk.backup_data_dir(d, settings=_Settings())
+        entry = next(e for e in outcome.entries if e.label == "chroma")
+        assert entry.status == "unverified"
+        assert "does not prove" in entry.note
+
+    def test_a_chroma_directory_without_a_catalog_still_passes(self, tmp_path: Path) -> None:
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        (d / "chroma" / "index.bin").write_bytes(b"vec")
+
+        outcome = bk.backup_data_dir(d, settings=_Settings())
+        entry = next(e for e in outcome.entries if e.label == "chroma")
+        assert entry.status == "unverified"
+        assert "no chroma.sqlite3" in entry.note
+        assert (_set_dir(d) / "chroma" / "index.bin").is_file()
+
     def test_directory_symlinks_are_preserved_not_followed(
         self, populated_dir: Path, tmp_path: Path
     ) -> None:
@@ -704,13 +747,32 @@ class TestPathHandling:
         # One source, one destination -- not a collision, not a double copy.
         assert list(outcome.copied) == [str(d / "graph.db")]
 
-    def test_symlinked_vector_alias_is_deduped_by_resolved_path(self, tmp_path: Path) -> None:
+    def test_symlinked_alias_keeps_its_own_restore_path(self, tmp_path: Path) -> None:
+        """An aliased target still needs its own slot in the set.
+
+        Deduping on the resolved source alone left only graph.db in the set,
+        so restoring into an empty data directory produced no alias.db and
+        the vector store could not reopen -- while the backup reported
+        success. Two different destinations do not collide, so there is
+        nothing to dedupe; the cost is copying the same bytes twice.
+        """
         d = tmp_path / "data"
         d.mkdir()
         _make_db(d / "graph.db", rows=3)
         (d / "alias.db").symlink_to(d / "graph.db")
+
         outcome = bk.backup_data_dir(d, settings=_Settings(vector_db_file="alias.db"))
-        assert len(outcome.copied) == 1, f"aliased source copied twice: {outcome.copied}"
+        s = _set_dir(d)
+
+        assert (s / "graph.db").is_file()
+        assert (s / "alias.db").is_file(), (
+            "the configured alias path is missing, so this set cannot be restored"
+        )
+        # Both are real, independently openable copies, not links.
+        assert not (s / "alias.db").is_symlink()
+        assert _rows(s / "alias.db") == _rows(s / "graph.db")
+        assert _integrity(s / "alias.db") == "ok"
+        assert set(outcome.copied) == {str(d / "graph.db"), str(d / "alias.db")}
 
     def test_absolute_vector_path_is_parked_inside_the_set(self, tmp_path: Path) -> None:
         d = tmp_path / "data"

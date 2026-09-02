@@ -658,7 +658,13 @@ def _run_targets(
     timeout: float,
 ) -> BackupOutcome:
     outcome = BackupOutcome(set_dir=final)
-    seen_sources: dict[Path, Path] = {}
+    # Keyed on (resolved source, destination), NOT the source alone. Deduping
+    # by source discarded an aliased target's own slot: with
+    # VECTOR_DB_FILE=alias.db symlinked to graph.db the set held only
+    # graph.db, so restoring into an empty directory left no alias.db and the
+    # vector store could not reopen -- while the backup reported success.
+    # Two destinations do not collide, so there is nothing to dedupe.
+    seen_sources: dict[tuple[Path, Path], Path] = {}
 
     for target in targets:
         source = _source_for(target, data_dir)
@@ -678,21 +684,21 @@ def _run_targets(
             continue
 
         resolved = source.resolve()
-        if resolved in seen_sources:
-            # The same underlying file reached by two names (VECTOR_DB_FILE
-            # pointing at a core file, or a symlink alias). Copying it twice
-            # would also collide on the destination.
+        destination = _destination_for(target, source, data_dir, staging)
+        if (resolved, destination) in seen_sources:
+            # The same file AND the same slot, e.g. VECTOR_DB_FILE naming a
+            # core file outright. Copying again would collide on the
+            # destination and add nothing.
             outcome.entries.append(
                 BackupEntry(
                     target.label,
                     "skipped",
-                    note=f"same file as an earlier target, already backed up to "
-                    f"{seen_sources[resolved].name}",
+                    note=f"same file and same slot as an earlier target, already backed up to "
+                    f"{seen_sources[(resolved, destination)].name}",
                 )
             )
             continue
 
-        destination = _destination_for(target, source, data_dir, staging)
         _require_contained(destination.parent, staging)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
@@ -727,7 +733,7 @@ def _run_targets(
                 "byte-wise copy: not a SQLite database, so this is not a consistent snapshot"
             )
 
-        seen_sources[resolved] = destination
+        seen_sources[(resolved, destination)] = destination
         outcome.entries.append(
             BackupEntry(target.label, status, source=source, destination=destination, note=note)
         )
@@ -743,23 +749,45 @@ def _copy_directory(source: Path, destination: Path) -> None:
     outside the data directory into the backup. Preserving the link is the
     faithful snapshot; the link's TARGET content is not backed up, which the
     docs say out loud.
+
+    A copied chroma catalog that FAILS ``integrity_check`` aborts the whole
+    backup. "Could not fully verify" and "known to be bad" are different
+    facts: a passing catalog still proves nothing about the HNSW index and
+    segment files, which is why the entry stays ``unverified``, but a failing
+    one is positive evidence that the copy is unusable. Publishing that as a
+    success let the migration overwrite the live store next, leaving the
+    operator holding a backup already known to be broken.
     """
     shutil.copytree(source, destination, symlinks=True)
+    catalog = destination / "chroma.sqlite3"
+    if catalog.is_file():
+        try:
+            verify_sqlite(catalog)
+        except BackupError as exc:
+            raise BackupError(
+                f"the copied chroma catalog at {catalog} is not usable ({exc}). "
+                "Refusing to publish a backup whose vector catalog is already known bad."
+            ) from exc
 
 
 def _directory_note(target: BackupTarget, destination: Path, source: Path) -> str:
+    """Describe the copy. Verification already happened in ``_copy_directory``.
+
+    Kept description-only on purpose: when this function both verified and
+    described, a failed catalog check turned into a warning inside a string
+    and the backup was published anyway.
+    """
     note = (
         "directory copy: consistent only if nothing wrote to it during the run "
         "(chroma.lock is a shared lock with the offline batch loader, see issue #140)"
     )
     inner = destination / "chroma.sqlite3"
     if inner.is_file():
-        try:
-            verify_sqlite(inner)
-            note += "; its chroma.sqlite3 passes integrity_check, which does not prove the "
-            note += "HNSW index and segment files agree with it"
-        except BackupError as exc:
-            note += f"; WARNING its chroma.sqlite3 failed integrity_check: {exc}"
+        # Reaching here means it already passed; a failure aborted the run.
+        note += "; its chroma.sqlite3 passes integrity_check, which does not prove the "
+        note += "HNSW index and segment files agree with it"
+    else:
+        note += "; it holds no chroma.sqlite3 catalog to check"
     if source.is_symlink():
         # Links found INSIDE a directory store are preserved as links, but the
         # store's own top-level link is followed: an operator who relocated
