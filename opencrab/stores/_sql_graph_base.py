@@ -1724,10 +1724,19 @@ class _SqlGraphStoreBase(abc.ABC):
     def _decode_ledger_receipt(stored: Any) -> bytes:
         raw = bytes(stored)
         if raw.startswith(b"zlib\0"):
+            # ``zlib.decompress`` ignores bytes after the first complete
+            # stream, so ``encoded + garbage`` would pass. Require a fully
+            # consumed stream so every stored byte stays authenticated by
+            # the canonicality check on the decoded receipt.
+            decompressor = zlib.decompressobj()
             try:
-                return zlib.decompress(raw[5:])
+                decoded = decompressor.decompress(raw[5:])
+                decoded += decompressor.flush()
             except zlib.error as exc:
                 raise GraphMigrationConflict("migration ledger receipt is malformed") from exc
+            if not decompressor.eof or decompressor.unused_data:
+                raise GraphMigrationConflict("migration ledger receipt is malformed")
+            return decoded
         return raw
 
     @staticmethod

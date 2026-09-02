@@ -319,6 +319,11 @@ def test_sqlite_trigger_rollback_and_unknown_commit_recover_after_close_reopen(t
         # invariant under test is that the replay equals the stored receipt.
         stored_receipt = store._decode_ledger_receipt(committed[10])
         assert bytes(committed[10]).startswith(b"zlib\0")
+        # A truncated or extended stored value must not decode to a receipt.
+        with pytest.raises(GraphMigrationConflict, match="ledger receipt is malformed"):
+            store._decode_ledger_receipt(bytes(committed[10]) + b"garbage")
+        with pytest.raises(GraphMigrationConflict, match="ledger receipt is malformed"):
+            store._decode_ledger_receipt(bytes(committed[10])[:-8])
         assert replay.canonical_bytes == stored_receipt
         assert replay.receipt_sha256 == receipt_sha256(stored_receipt)
         with sqlite3.connect(fixture.db_path) as conn:
