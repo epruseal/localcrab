@@ -497,7 +497,7 @@ class TestCorruptCollection:
                 space="subject",
                 node_type="User",
                 node_id="u1",
-                properties={"name": "Alice"},
+                properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
                 pack_id="pack-1",
             )
         stores = receipt["stores"]
@@ -518,7 +518,7 @@ class TestCorruptCollection:
                 space="subject",
                 node_type="User",
                 node_id="u2",
-                properties={"name": "Bob"},
+                properties={"name": "Bob", "email": "bob@example.com", "role": "admin"},
                 pack_id="pack-1",
             )
         stores = receipt["stores"]
