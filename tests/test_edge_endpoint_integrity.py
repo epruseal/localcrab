@@ -577,7 +577,11 @@ class TestMigrationPlanEndpointTypes:
         derives every edge's target types from the mapped node's own type
         (``source_to_target[...]["node_type"]``), so a plan it produced must
         pass unchanged and rebuild a graph with zero dangling edges."""
-        from opencrab.common.graph_identity import ApplyMigrationRequest, DryRunMigrationRequest, plan_sha256
+        from opencrab.common.graph_identity import (
+            ApplyMigrationRequest,
+            DryRunMigrationRequest,
+            plan_sha256,
+        )
         from opencrab.stores.local_graph_store import LocalGraphStore
 
         fixture = _legacy_two_node_fixture()

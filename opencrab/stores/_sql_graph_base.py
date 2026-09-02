@@ -1354,6 +1354,12 @@ class _SqlGraphStoreBase(abc.ABC):
         }
         source_seen: set[LegacyNodeKey] = set()
         target_nodes: dict[str, str] = {}
+        # Endpoint types the plan claims its target NODES have. Kept
+        # separate from ``target_nodes`` because that dict's contents feed
+        # ``planned_target_node_fingerprint`` verbatim -- changing its
+        # values would invalidate every plan ever produced. This one is
+        # validation-only and never reaches the wire format.
+        target_node_types: dict[str, str] = {}
         target_edges: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         retained_edge_specs: dict[tuple[str, str, str], dict[str, Any]] = {}
         seen_edges: set[tuple[LegacyNodeKey, str, LegacyNodeKey]] = set()
@@ -1540,6 +1546,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 if target_id in target_nodes:
                     raise GraphMigrationConflict("migration plan target node collision")
                 target_nodes[target_id] = digest
+                target_node_types[target_id] = target["node_type"]
             elif spec.get("kind") == "edge":
                 source = spec.get("source", {})
                 from_value = source.get("from", {})
@@ -1631,6 +1638,15 @@ class _SqlGraphStoreBase(abc.ABC):
             node_to = target_nodes.get(key[2])
             if node_from is None or node_to is None:
                 raise GraphMigrationConflict("migration plan edge endpoint is missing")
+            # The cutover inserts these type snapshots verbatim, without ever
+            # reading graph_nodes -- it is the one edge writer that trusts the
+            # plan instead of the table. So the comparison has to reach the
+            # target NODE's own type. The check just below compares the edge
+            # against another field of the same edge spec, which a tampered
+            # plan satisfies by construction; this one cannot be satisfied
+            # without also changing the node the edge points at.
+            if target_node_types.get(key[0]) != from_type or target_node_types.get(key[2]) != to_type:
+                raise GraphMigrationConflict("migration plan edge endpoint type does not match its node")
             edge_spec = retained_edge_specs.get(key)
             if edge_spec is not None and (
                 edge_spec["target"]["from_type"] != from_type
@@ -2709,9 +2725,18 @@ class _SqlGraphStoreBase(abc.ABC):
     def count_dangling_edges(self) -> int:
         """Edges whose endpoint snapshot does not resolve to a node row.
 
-        Counts exactly what the write guards reject: an endpoint id with no
-        ``graph_nodes`` row, OR a row whose ``node_type`` differs from the
-        type the edge recorded. One invariant, one number.
+        On the canonical schema this counts exactly what the write guards
+        reject: an endpoint id with no ``graph_nodes`` row, OR a row whose
+        ``node_type`` differs from the type the edge recorded. One invariant,
+        one number.
+
+        The two sets can diverge on a LEGACY schema, whose node key is
+        ``(node_type, node_id)`` -- one id may have rows of several types, and
+        ``upsert_edge`` collapses its endpoint lookup into a dict keyed by id
+        while this predicate asks whether ANY row matches. That divergence is
+        inert: a legacy schema rejects every write with
+        ``GraphSchemaMigrationRequired``, so there are no guard decisions to
+        disagree with.
 
         WHY THIS EXISTS (issue #84). Every edge writer here checks its
         endpoints inside the mutation transaction, and ``delete_node`` clears

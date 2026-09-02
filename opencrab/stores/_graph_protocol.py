@@ -55,11 +55,15 @@ not that the operation is supported:
     export_edges          yes     yes     yes     yes
     upsert_nodes_batch    yes     yes     yes     yes
     upsert_edges_batch    yes     yes     yes     yes
-    count_dangling_edges  yes     yes     no      no
+    count_dangling_edges  yes     yes     yes     no
 
-``count_dangling_edges`` (issue #84) is the second row that is genuinely
-"no" outside the SQL backends, and like ``search_nodes`` it is deliberately
-not declared as a Protocol member. It counts edges whose endpoint snapshot
+``count_dangling_edges`` (issue #84) is the second row marked "no" for
+Neo4j, and like ``search_nodes`` it is deliberately not declared as a
+Protocol member. Its Kùzu cell reads "yes" for the same reason every other
+Kùzu cell does -- the unavailable facade's blanket ``__getattr__`` makes the
+call shape reachable and then raises ``GraphReadCapabilityUnavailable``, so
+"yes" here means reachable, not supported (the rule stated above the
+table). Neo4j is a real "no": no implementation and no shim. It counts edges whose endpoint snapshot
 resolves to no node row -- a state only the SQL schema permits, because it
 declares no foreign key. Neo4j cannot hold a relationship without both
 endpoints, and its ``_initialise_schema_state`` already walks every
@@ -222,11 +226,13 @@ class GraphStore(Protocol):
         SQL writers report that refusal as **False**, and write nothing.
         The Kùzu facade is capability-negative.
 
-        Note the deliberate asymmetry with ``upsert_edges_batch``, which
-        raises instead: a single call has one outcome the caller is already
-        branching on, while a batch has to say WHICH row was bad, and
-        silently returning a lower count would let a partial write pass for
-        a whole one.
+        Note the deliberate asymmetry with ``upsert_edges_batch`` ON LOCAL/PG,
+        which raises instead: a single call has one outcome the caller is
+        already branching on, while a batch has to say WHICH row was bad, and
+        a lower count would not distinguish "all written" from "some skipped"
+        for those two backends. Neo4j and Kùzu batch differently -- see that
+        method's own note; this is a Local/PG rationale, not a cross-backend
+        rule.
         """
         ...
 
@@ -719,13 +725,19 @@ class GraphStoreExtended(Protocol):
         loops calling ``upsert_edge`` per item and only counts the ones that
         returned True.
 
-        Local/PG validate EVERY item's endpoints (existence and node_type)
-        in one pass BEFORE the insert loop starts, and raise ``ValueError``
-        on the first offender. So a batch mixing good rows with one bad row
-        writes none of them -- a pre-validation refusal, not a rollback after
-        partial writes. That is why the count can be ``len(edges)``: the call
-        either wrote them all or raised. Contrast ``upsert_edge``, which
-        reports the same condition as False (see its note above).
+        ENDPOINT HANDLING DIFFERS BY BACKEND, so all four are stated here:
+
+        - Local/PG validate every item's endpoints (existence and node_type)
+          and raise ``ValueError`` naming the offending id. The batch is
+          all-or-none: one bad row and none of the good ones are written
+          either. That is why the count can be ``len(edges)`` -- the call
+          either wrote them all or raised.
+        - Neo4j loops calling its own ``upsert_edge`` and counts only the
+          items that returned True, so a bad endpoint lowers the count
+          instead of raising. Kùzu's port does the same.
+
+        Contrast ``upsert_edge``, which reports the same condition as False
+        on every backend (see its note above).
         """
         ...
 
