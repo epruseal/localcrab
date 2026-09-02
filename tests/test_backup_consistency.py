@@ -1502,6 +1502,99 @@ class TestModePreservation:
         assert seen == [0o700], seen
         assert _mode(_set_dir(populated_dir)) == 0o750
 
+    def test_nested_vector_parent_keeps_the_source_directory_mode(
+        self, populated_dir: Path, permissive_umask: None
+    ) -> None:
+        """A 0700 parent guarding a 0644 database must stay 0700 in the set."""
+        private = populated_dir / "private"
+        private.mkdir()
+        _make_db(private / "vectors.db", rows=2)
+        os.chmod(private / "vectors.db", 0o644)
+        os.chmod(private, 0o700)
+        bk.backup_data_dir(populated_dir, settings=_Settings(vector_db_file="private/vectors.db"))
+        s = _set_dir(populated_dir)
+        assert _mode(s / "private") == 0o700
+        assert _mode(s / "private" / "vectors.db") == 0o644
+
+    def test_nested_parent_is_not_narrower_than_the_source(self, populated_dir: Path) -> None:
+        """Policy is "same as the source", not "always private"."""
+        old = os.umask(0o077)
+        try:
+            shared = populated_dir / "shared"
+            shared.mkdir()
+            _make_db(shared / "vectors.db", rows=2)
+            os.chmod(shared, 0o755)
+            bk.backup_data_dir(
+                populated_dir, settings=_Settings(vector_db_file="shared/vectors.db")
+            )
+            assert _mode(_set_dir(populated_dir) / "shared") == 0o755
+        finally:
+            os.umask(old)
+
+    def test_two_level_parents_each_keep_their_own_mode(
+        self, populated_dir: Path, permissive_umask: None
+    ) -> None:
+        a = populated_dir / "a"
+        b = a / "b"
+        b.mkdir(parents=True)
+        _make_db(b / "vectors.db", rows=2)
+        os.chmod(b, 0o700)
+        os.chmod(a, 0o750)
+        bk.backup_data_dir(populated_dir, settings=_Settings(vector_db_file="a/b/vectors.db"))
+        s = _set_dir(populated_dir)
+        assert _mode(s / "a") == 0o750
+        assert _mode(s / "a" / "b") == 0o700
+
+    def test_external_vector_parent_is_owner_only(
+        self, populated_dir: Path, tmp_path: Path, permissive_umask: None
+    ) -> None:
+        """No source directory corresponds to external-vector/, so it stays 0700."""
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        _make_db(outside / "vec.db", rows=2)
+        bk.backup_data_dir(populated_dir, settings=_Settings(vector_db_file=str(outside / "vec.db")))
+        s = _set_dir(populated_dir)
+        assert (s / bk._EXTERNAL_DIR / "vec.db").is_file()
+        assert _mode(s / bk._EXTERNAL_DIR) == 0o700
+
+    def test_new_parent_is_owner_only_until_its_mode_is_copied(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Observed at the moment copymode runs: the fresh directory is 0700."""
+        old = os.umask(0o022)
+        try:
+            shared = populated_dir / "shared"
+            shared.mkdir()
+            _make_db(shared / "vectors.db", rows=2)
+            os.chmod(shared, 0o755)
+            seen: list[tuple[str, int]] = []
+            real = bk.shutil.copymode
+
+            def spy(src, dst, **kw):  # type: ignore[no-untyped-def]
+                if Path(dst).is_dir() and Path(dst).name == "shared":
+                    seen.append((Path(dst).name, _mode(Path(dst))))
+                return real(src, dst, **kw)
+
+            monkeypatch.setattr(bk.shutil, "copymode", spy)
+            bk.backup_data_dir(
+                populated_dir, settings=_Settings(vector_db_file="shared/vectors.db")
+            )
+            assert seen == [("shared", 0o700)], seen
+            assert _mode(_set_dir(populated_dir) / "shared") == 0o755
+        finally:
+            os.umask(old)
+
+    def test_copied_directory_store_keeps_inner_directory_modes(
+        self, populated_dir: Path, permissive_umask: None
+    ) -> None:
+        """Control group: copytree already preserves directory modes; pin it."""
+        seg = populated_dir / "chroma" / "segments"
+        seg.mkdir()
+        (seg / "x.bin").write_bytes(b"v")
+        os.chmod(seg, 0o700)
+        bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert _mode(_set_dir(populated_dir) / "chroma" / "segments") == 0o700
+
 
 # ---------------------------------------------------------------------------
 # Error boundary: everything below backup_data_dir surfaces as BackupError

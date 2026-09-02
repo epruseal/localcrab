@@ -60,9 +60,12 @@ ACCESS MODE
 -----------
 Every artifact in the set carries the access mode of its source: SQLite copies
 get the source file's mode (``backup_sqlite``), directory and opaque copies
-keep it through ``copy2``/``copytree``, and the set directory gets the data
-directory's mode at publication. While the set is being written, the staging
-directory and each SQLite copy are readable by the owner only.
+keep it through ``copy2``/``copytree``, every directory this module creates
+inside the set gets the mode of its counterpart under the data directory
+(``0700`` when there is none, as for the parked ``external-vector/``), and
+the set directory gets the data directory's mode at publication. While the
+set is being written, the staging directory, every new directory and each
+SQLite copy are readable by the owner only.
 """
 
 from __future__ import annotations
@@ -606,6 +609,33 @@ def _destination_for(target: BackupTarget, source: Path, data_dir: Path, staging
     return staging / location
 
 
+def _make_parents(parent: Path, staging: Path, data_dir: Path, target: BackupTarget) -> None:
+    """Create the missing directories between ``staging`` and ``parent``.
+
+    Each one is created ``0700`` and then given the mode of the directory it
+    corresponds to under the data directory, so a ``0700`` parent guarding a
+    ``0644`` database stays ``0700`` in the set. ``Path.mkdir(parents=True)``
+    used the process umask instead and turned that parent into ``0755``.
+    The parked ``external-vector/`` directory has no source counterpart and
+    stays ``0700``. Directories that already exist -- another target's
+    ``copytree`` output, whose modes ``copystat`` already preserved -- are
+    left alone.
+    """
+    location = Path(target.location)
+    has_source_tree = not (location.is_absolute() or ".." in location.parts)
+    relative = parent.relative_to(staging)
+    current = staging
+    for part in relative.parts:
+        current = current / part
+        if current.is_dir():
+            continue
+        os.mkdir(current, 0o700)
+        if has_source_tree:
+            counterpart = data_dir / current.relative_to(staging)
+            if counterpart.is_dir():
+                shutil.copymode(counterpart, current)
+
+
 def _leftover_stagings(dest_dir: Path) -> list[Path]:
     if not dest_dir.is_dir():
         return []
@@ -867,7 +897,7 @@ def _run_targets(
             continue
 
         _require_contained(destination.parent, staging)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        _make_parents(destination.parent, staging, data_dir, target)
         if destination.exists() or destination.is_symlink():
             # Reachable for a pathological configuration: a relative
             # VECTOR_DB_FILE pointing INSIDE a directory store (say
