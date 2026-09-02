@@ -95,15 +95,16 @@ def _build_type_schema(
     are still enforced.
 
     No property here ever gets a ``nullable`` key, manifest-defined or
-    extra. It is not read anywhere in this repo (validate_node_properties
-    only looks at ``required``/``default``/``enum``/``type`` -- confirmed by
-    reading the function; tracked as issue #106), and it duplicated
-    ``required`` (required -> non-nullable, optional -> nullable) instead of
-    being derived from it. That duplication is exactly what regressed when a
+    extra. grammar.validator.validate_node_properties derives an absent
+    ``nullable`` from ``required`` (required -> non-nullable, optional ->
+    nullable; see ``_is_nullable`` there, #49/#106), which is exactly the
+    meaning these generated schemas intend, so writing the key would only
+    duplicate ``required``. That duplication is exactly what regressed when a
     manifest-optional field got promoted to required by *extra_required*
     below: the promotion flipped ``required`` but not the already-written
     ``nullable``, producing a self-contradictory required-and-nullable
-    schema. One key can't disagree with itself.
+    schema. One key can't disagree with itself. A hand-written schema that
+    needs the other pairing declares ``nullable`` explicitly and wins.
     """
     type_specs = pack.get("type_specs", {}) or {}
     spec = type_specs.get(node_type, {}) or {}

@@ -55,6 +55,20 @@ def _value_matches_type(value: Any, type_name: str) -> bool:
         return False
     return isinstance(value, py_type)
 
+def _is_nullable(spec: dict[str, Any]) -> bool:
+    """True if a property spec allows an explicit ``None`` value.
+
+    ``required`` decides whether the KEY must be present. ``nullable`` decides
+    whether the VALUE may be ``None``. When a spec does not declare
+    ``nullable`` it is derived as ``not required``: every hand-written schema
+    in opencrab/schemas/types/ declares it explicitly and follows exactly that
+    pairing, and the schemas that pack_registry generates omit the key with
+    that same meaning documented (see ``_build_type_schema``). So the
+    derivation changes no schema's declared meaning (#49, #106).
+    """
+    return bool(spec.get("nullable", not spec.get("required", False)))
+
+
 # Map (from_space, to_space) -> set[relation]
 _EDGE_RELATION_MAP: dict[tuple[str, str], set[str]] = {}
 for _edge in META_EDGES:
@@ -233,6 +247,13 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
     If no schema exists for the node_type, the check always passes
     (schema is optional — not all types need a registered schema).
 
+    Per property the checks are: ``required`` (the key must be present unless
+    the spec has a ``default``), ``nullable`` (an explicit ``None`` is
+    rejected unless the spec allows it, see ``_is_nullable``), ``enum`` and
+    ``type`` (both skipped for a permitted ``None``). Errors keep their
+    historical order: missing keys in schema order, then null and enum errors
+    in input order, then type errors in input order.
+
     Parameters
     ----------
     node_type:
@@ -256,18 +277,28 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
     schema_props: dict[str, Any] = schema.get("properties", {})
     errors: list[str] = []
 
-    # Required field check
+    # Required field check: key presence only. An explicit None is judged by
+    # the nullable check below, not here.
     for field, spec in schema_props.items():
         if spec.get("required", False) and "default" not in spec:
             if field not in properties:
                 errors.append(f"Required field '{field}' is missing.")
 
-    # Enum value check
+    # Null and enum value check. An explicit None on a non-nullable field is
+    # exactly one error for that field; the enum and type checks below do not
+    # add to it. A None on a nullable field skips both checks (#49, #106).
     for field, value in properties.items():
         if field in schema_props:
             spec = schema_props[field]
+            if value is None:
+                if not _is_nullable(spec):
+                    errors.append(
+                        f"Field '{field}' must not be null "
+                        "(schema declares nullable: false)."
+                    )
+                continue
             allowed = spec.get("enum")
-            if allowed is not None and value is not None and value not in allowed:
+            if allowed is not None and value not in allowed:
                 errors.append(
                     f"Field '{field}' must be one of {allowed}, got '{value}'."
                 )

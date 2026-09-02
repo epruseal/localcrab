@@ -66,10 +66,10 @@ def test_install_pack_generates_validator_compatible_schema(tmp_pack_env):
     assert "properties" in data
     assert data["properties"]["name"]["required"] is True
     assert data["properties"]["description"]["required"] is False
-    # codex review round 3 (issue #106): `nullable` is never read by the
-    # validator and duplicated `required`, which is exactly what regressed
-    # (required-promotion flipped `required` but not a separately-tracked
-    # `nullable`). Generated properties must not carry it at all.
+    # codex review round 3 (issue #106): `nullable` duplicated `required`,
+    # which is exactly what regressed (required-promotion flipped `required`
+    # but not a separately-tracked `nullable`). Generated properties must not
+    # carry it at all; the validator derives it from `required` (#49).
     assert "nullable" not in data["properties"]["name"]
     assert "nullable" not in data["properties"]["description"]
 
@@ -267,7 +267,8 @@ def test_install_pack_promoted_optional_field_has_no_nullable(tmp_pack_env):
     field -- a self-contradiction, and a regression from the pre-#38
     behaviour where a required field was always non-nullable. Since
     `nullable` is gone entirely now, the promoted field is just
-    required=True with no nullable key to contradict it.
+    required=True with no nullable key to contradict it, and the validator
+    derives non-nullable from required=True (#49).
     """
     types_dir = tmp_pack_env
     legacy = {
