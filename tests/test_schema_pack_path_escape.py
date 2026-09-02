@@ -259,6 +259,69 @@ class TestUninstallRejectsEscapingTypeNames:
 # --------------------------------------------------------------------------
 
 
+class TestListingAndLookupAgree:
+    """list_packs must not advertise a pack that the name check will refuse.
+
+    Otherwise install reports the self-contradictory
+    "Pack 'CON' not found. Available: ['CON']" and a client can keep picking
+    a pack that can never be installed. This is the same consistency rule
+    that keeps symlink-following on reads.
+    """
+
+    def test_listing_omits_a_pack_whose_name_the_guard_refuses(self, packs_env):
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "CON", ["Normal"])
+
+        assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
+
+    def test_available_list_does_not_offer_a_refused_name(self, packs_env):
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "CON", ["Normal"])
+
+        result = pack_registry.install_pack("CON")
+
+        assert "error" in result, result
+        # The head of the message names the pack the caller asked for; it is
+        # the "Available:" list that must not offer it back.
+        available = result["error"].split("Available:", 1)[1]
+        assert "CON" not in available, result["error"]
+
+    def test_the_declared_name_is_what_is_checked_not_the_filename(self, packs_env):
+        """A safe filename with a refused name inside must still be omitted.
+
+        Without this, an implementation that checks ``path.stem`` passes the
+        other tests while leaving the contradiction in place.
+        """
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        (packs_dir / "safe-file.yaml").write_text(
+            yaml.safe_dump(
+                {"name": "CON", "version": "1.0.0", "spaces": ["concept"], "types": ["Normal"]}
+            ),
+            encoding="utf-8",
+        )
+
+        assert [p["name"] for p in pack_registry.list_packs()] == ["ok"]
+
+    def test_a_safely_named_pack_is_still_listed_and_loadable(self, packs_env):
+        tmp_root, types_dir, packs_dir = packs_env
+        write_manifest(packs_dir, "ok", ["Normal"])
+        write_manifest(packs_dir, "CON", ["Normal"])
+
+        assert pack_registry.get_pack("ok") is not None
+        assert pack_registry.install_pack("ok")["created"] == ["Normal"]
+
+    def test_bundled_packs_are_all_still_listed(self):
+        """The real pack directory, unfiltered by the new skip."""
+        assert sorted(p["name"] for p in pack_registry.list_packs()) == [
+            "biomedical",
+            "legal",
+            "saas",
+        ]
+
+
 class TestPackNameCannotEscapePacksDir:
     @pytest.fixture
     def outside_pack(self, packs_env):
