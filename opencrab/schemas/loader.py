@@ -233,7 +233,13 @@ def list_registered_types() -> list[str]:
     """Return a list of all node types that have a registered YAML schema."""
     if not SCHEMAS_DIR.exists():
         return []
-    return sorted(p.stem for p in SCHEMAS_DIR.glob("*.yaml"))
+    # #109: a stem this listing hands out goes straight back in as the load
+    # argument, so advertising one that safe_schema_name refuses would claim a
+    # schema is registered while the load returns None. Here the STEM is what
+    # is checked, unlike pack_registry.list_packs, which advertises (and so
+    # checks) the manifest's declared name. Same rule either way: check what
+    # is advertised.
+    return sorted(p.stem for p in SCHEMAS_DIR.glob("*.yaml") if safe_schema_name(p.stem))
 
 
 def reload_schema(node_type: str) -> dict[str, Any] | None:

@@ -11,7 +11,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-from opencrab.schemas.loader import load_yaml_schema
+from opencrab.schemas.loader import load_yaml_schema, safe_schema_name
 
 ACTIONS_DIR = Path(__file__).parent.parent / "schemas" / "actions"
 
@@ -42,7 +42,11 @@ def list_registered_actions() -> list[str]:
     """Return all action names that have a registered YAML schema."""
     if not ACTIONS_DIR.exists():
         return []
-    return sorted(p.stem for p in ACTIONS_DIR.glob("*.yaml"))
+    # #109, mirroring schemas.loader.list_registered_types: never advertise a
+    # stem the name check refuses. It matters more here -- validate_action_params
+    # reads a missing schema as "unregistered, allowed", so an advertised but
+    # unloadable action would have its required-parameter checks silently skipped.
+    return sorted(p.stem for p in ACTIONS_DIR.glob("*.yaml") if safe_schema_name(p.stem))
 
 
 def validate_action_params(
