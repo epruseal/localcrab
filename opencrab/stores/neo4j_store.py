@@ -1823,10 +1823,13 @@ class Neo4jStore:
     def upsert_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[NodeWriteReceipt, ...]:
         """Bulk upsert; returns the count processed.
 
-        Per-item loop calling ``upsert_node`` — same approach
-        ``KuzuGraphStore.upsert_nodes_batch`` uses, since a node's label is
-        fixed at Cypher-compile time and a single ``UNWIND`` can't vary the
-        label across a mixed-node_type batch without APOC.
+        Per-item loop calling ``upsert_node``: a node's label is fixed at
+        Cypher-compile time, so a single ``UNWIND`` cannot vary the label
+        across a mixed-node_type batch without APOC.
+
+        This used to cite ``KuzuGraphStore.upsert_nodes_batch`` as taking the
+        same approach. That method does not exist -- see the sibling note on
+        ``upsert_edges_batch``.
         """
         self._require_schema_ready()
         if not nodes:
@@ -1861,8 +1864,15 @@ class Neo4jStore:
     def upsert_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
         """Bulk upsert; returns the count of edges that upserted successfully.
 
-        Per-item loop calling ``upsert_edge`` — mirrors
-        ``KuzuGraphStore.upsert_edges_batch``.
+        Per-item loop calling ``upsert_edge``, so an item whose endpoints
+        do not resolve lowers the count instead of raising (the Local/PG
+        batch raises -- see ``GraphStoreExtended.upsert_edges_batch``).
+
+        This used to say it mirrored ``KuzuGraphStore.upsert_edges_batch``.
+        That method does not exist: ``KuzuGraphStore`` defines only
+        ``get_node`` and ``run_cypher``, its constructor is
+        capability-negative, and the production facade raises on every write
+        name before it looks at the arguments.
         """
         self._require_schema_ready()
         if not edges:

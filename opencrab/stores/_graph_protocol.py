@@ -55,8 +55,25 @@ not that the operation is supported:
     export_edges          yes     yes     yes     yes
     upsert_nodes_batch    yes     yes     yes     yes
     upsert_edges_batch    yes     yes     yes     yes
+    count_dangling_edges  yes     yes     yes     no
 
-``search_nodes`` (issue #86) is the one row above that is genuinely "no" for
+``count_dangling_edges`` (issue #84) is the second row marked "no" for
+Neo4j, and like ``search_nodes`` it is deliberately not declared as a
+Protocol member. Its Kùzu cell reads "yes" for the same reason every other
+Kùzu cell does -- the unavailable facade's blanket ``__getattr__`` makes the
+call shape reachable and then raises ``GraphReadCapabilityUnavailable``, so
+"yes" here means reachable, not supported (the rule stated above the
+table). Neo4j is a real "no": no implementation and no shim. It counts edges whose endpoint snapshot
+resolves to no node row -- a state only the SQL schema permits, because it
+declares no foreign key. Neo4j cannot hold a relationship without both
+endpoints, and its ``_initialise_schema_state`` already walks every
+OpenCrab-owned relationship and classifies label/type drift as
+partial_or_unknown, which gates writes; the SQL classifiers only inspect DDL
+and column metadata, never rows, so the SQL backends had no equivalent
+signal at all. A Neo4j-side drift diagnostic is tracked separately rather
+than stubbed here -- a constant would be a claim this code cannot make.
+
+``search_nodes`` (issue #86) is the other row above that is genuinely "no" for
 Neo4j, not stale -- ``HybridQuery.keyword_search`` never needed a
 Neo4jStore.search_nodes because its Cypher ``CONTAINS`` branch already
 pushes the same keyword/space predicate straight into Cypher without going
@@ -201,9 +218,21 @@ class GraphStore(Protocol):
         """Create or update a directed (from)->(to) edge; True on success.
 
         Raises an availability or identity exception when unsupported.
-        Endpoints must already exist. Neo4j reports a missing endpoint as
-        False; qualified SQL writers reject missing endpoints before insertion.
+
+        Endpoints must already exist, and must already carry the node_type
+        this call names -- an id that resolves to a row of a DIFFERENT type
+        is refused just like a missing one, since the edge's endpoint
+        snapshot would not resolve either way. Both Neo4j and the qualified
+        SQL writers report that refusal as **False**, and write nothing.
         The Kùzu facade is capability-negative.
+
+        Note the deliberate asymmetry with ``upsert_edges_batch`` ON LOCAL/PG,
+        which raises instead: a single call has one outcome the caller is
+        already branching on, while a batch has to say WHICH row was bad, and
+        a lower count would not distinguish "all written" from "some skipped"
+        for those two backends. Neo4j batches differently and Kùzu rejects
+        the call outright -- see that method's own note; this is a Local/PG
+        rationale, not a cross-backend rule.
         """
         ...
 
@@ -682,8 +711,11 @@ class GraphStoreExtended(Protocol):
         Each item: ``{"node_type": str, "node_id": str,
         "properties": dict, "space_id": str | None}``. Faster than N calls
         to ``upsert_node`` (single transaction/commit for the whole batch on
-        Local/PG; Kuzu's port is currently a per-item loop calling
-        ``upsert_node`` — same result, no batching speedup yet).
+        Local/PG; Neo4j loops per item). Kùzu has no implementation of this
+        method at all -- the production facade raises
+        ``GraphWriteCapabilityUnavailable`` on the name, same as every other
+        write (this docstring previously described a Kùzu per-item loop that
+        does not exist).
         """
         ...
 
@@ -692,10 +724,30 @@ class GraphStoreExtended(Protocol):
 
         Each item: ``{"from_type": str, "from_id": str, "relation": str,
         "to_type": str, "to_id": str, "properties": dict | None}``. On
-        Local/PG this is ``len(edges)`` (or 0 for empty input) since every
-        row in one executemany/INSERT batch is assumed to succeed; Kuzu's
-        port loops calling ``upsert_edge`` per item and only counts the
-        ones that returned True.
+        Local/PG this is ``len(edges)`` (or 0 for empty input); Neo4j loops
+        calling ``upsert_edge`` per item and counts only the ones that
+        returned True.
+
+        ENDPOINT HANDLING DIFFERS BY BACKEND, so all four are stated here:
+
+        - Local/PG validate every item's endpoints (existence and node_type)
+          and raise ``ValueError`` naming the offending id. The batch is
+          all-or-none: one bad row and none of the good ones are written
+          either. That is why the count can be ``len(edges)`` -- the call
+          either wrote them all or raised.
+        - Neo4j loops calling its own ``upsert_edge`` and counts only the
+          items that returned True, so a bad endpoint lowers the count
+          instead of raising.
+        - Kùzu never gets as far as an endpoint. The production facade
+          classifies this name as a write and raises
+          ``GraphWriteCapabilityUnavailable`` before looking at the list, so
+          no item is processed and no count is returned at all -- not even
+          for an empty batch. There is no Kùzu batch implementation to
+          describe; ``KuzuGraphStore`` does not define this method and its
+          constructor is capability-negative.
+
+        Contrast ``upsert_edge``, which reports the same condition as False
+        on Local/PG and Neo4j (see its note above); Kùzu raises there too.
         """
         ...
 

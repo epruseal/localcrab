@@ -178,6 +178,33 @@ logger = logging.getLogger(__name__)
 # for doc_nodes/doc_sources/audit_log, already shipped in Stage 6a.
 # ---------------------------------------------------------------------------
 
+# SQLSTATEs for "the object this statement names is not there": undefined_table
+# and undefined_column. Used by ``count_dangling_edges`` to tell a damaged
+# schema apart from a genuine query error.
+_MISSING_OBJECT_SQLSTATES = frozenset({"42P01", "42703"})
+_SQLITE_MISSING_OBJECT = re.compile(r"no such (?:table|column)", re.I)
+
+
+def _is_missing_object_error(exc: BaseException) -> bool:
+    """True only for "that table/column does not exist".
+
+    Deliberately NOT a substring match on ``does not exist``: PostgreSQL
+    phrases a type-mismatched comparison as ``operator does not exist:
+    integer = text`` (SQLSTATE 42883), and swallowing that as "table missing"
+    would make ``count_dangling_edges`` fall through to a bare edge count and
+    confidently report every edge as dangling while the node table sits there
+    intact. A wrong number is worse than a raised error, so the check is on
+    the error code: psycopg2 exposes it as ``pgcode``, psycopg3 as
+    ``sqlstate``. SQLite carries no code, but it has no "does not exist"
+    phrasing either -- ``no such table``/``no such column`` is unambiguous.
+    """
+    orig = getattr(exc, "orig", exc)
+    code = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
+    if code is not None:
+        return str(code) in _MISSING_OBJECT_SQLSTATES
+    return bool(_SQLITE_MISSING_OBJECT.search(str(exc)))
+
+
 GRAPH_STORE_SCHEMA = SchemaSpec(
     tables=(
         TableSpec(
@@ -1327,6 +1354,12 @@ class _SqlGraphStoreBase(abc.ABC):
         }
         source_seen: set[LegacyNodeKey] = set()
         target_nodes: dict[str, str] = {}
+        # Endpoint types the plan claims its target NODES have. Kept
+        # separate from ``target_nodes`` because that dict's contents feed
+        # ``planned_target_node_fingerprint`` verbatim -- changing its
+        # values would invalidate every plan ever produced. This one is
+        # validation-only and never reaches the wire format.
+        target_node_types: dict[str, str] = {}
         target_edges: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         retained_edge_specs: dict[tuple[str, str, str], dict[str, Any]] = {}
         seen_edges: set[tuple[LegacyNodeKey, str, LegacyNodeKey]] = set()
@@ -1513,6 +1546,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 if target_id in target_nodes:
                     raise GraphMigrationConflict("migration plan target node collision")
                 target_nodes[target_id] = digest
+                target_node_types[target_id] = target["node_type"]
             elif spec.get("kind") == "edge":
                 source = spec.get("source", {})
                 from_value = source.get("from", {})
@@ -1604,6 +1638,15 @@ class _SqlGraphStoreBase(abc.ABC):
             node_to = target_nodes.get(key[2])
             if node_from is None or node_to is None:
                 raise GraphMigrationConflict("migration plan edge endpoint is missing")
+            # The cutover inserts these type snapshots verbatim, without ever
+            # reading graph_nodes -- it is the one edge writer that trusts the
+            # plan instead of the table. So the comparison has to reach the
+            # target NODE's own type. The check just below compares the edge
+            # against another field of the same edge spec, which a tampered
+            # plan satisfies by construction; this one cannot be satisfied
+            # without also changing the node the edge points at.
+            if target_node_types.get(key[0]) != from_type or target_node_types.get(key[2]) != to_type:
+                raise GraphMigrationConflict("migration plan edge endpoint type does not match its node")
             edge_spec = retained_edge_specs.get(key)
             if edge_spec is not None and (
                 edge_spec["target"]["from_type"] != from_type
@@ -2677,6 +2720,76 @@ class _SqlGraphStoreBase(abc.ABC):
             row = self._fetch_one(f"SELECT COUNT(*) FROM {table} WHERE node_type=:nt", {"nt": node_type})  # noqa: S608
         else:
             row = self._fetch_one(f"SELECT COUNT(*) FROM {table}", {})  # noqa: S608
+        return int(row[0]) if row else 0
+
+    def count_dangling_edges(self) -> int:
+        """Edges whose endpoint snapshot does not resolve to a node row.
+
+        On the canonical schema this counts exactly what the write guards
+        reject: an endpoint id with no ``graph_nodes`` row, OR a row whose
+        ``node_type`` differs from the type the edge recorded. One invariant,
+        one number.
+
+        The two sets can diverge on a LEGACY schema, whose node key is
+        ``(node_type, node_id)`` -- one id may have rows of several types, and
+        ``upsert_edge`` collapses its endpoint lookup into a dict keyed by id
+        while this predicate asks whether ANY row matches. That divergence is
+        inert: a legacy schema rejects every write with
+        ``GraphSchemaMigrationRequired``, so there are no guard decisions to
+        disagree with.
+
+        WHY THIS EXISTS (issue #84). Every edge writer here checks its
+        endpoints inside the mutation transaction, and ``delete_node`` clears
+        incident edges in the same transaction -- so no store API path
+        produces a dangling row. But ``GRAPH_STORE_SCHEMA`` declares no
+        foreign key, so the DATABASE does not enforce it: a raw SQL script
+        against the file still can, and nothing could report it afterwards.
+        This is that report. (A FK was evaluated and deferred: the schema
+        classifiers treat any FK on these two tables as a non-canonical
+        schema and refuse writes, ``SchemaSpec`` cannot express one, and
+        SQLite cannot add one without rebuilding the table -- a schema
+        generation/migration unit of its own.)
+
+        SQL-backends only, and deliberately not on the GraphStore Protocol
+        (same call as ``search_nodes`` -- see its note there). Neo4j cannot
+        hold a relationship without both endpoints, and its own
+        ``_initialise_schema_state`` already walks every OpenCrab-owned
+        relationship and classifies label/type drift as partial_or_unknown,
+        which gates writes. The SQL classifiers only read DDL and column
+        metadata, never rows -- that asymmetry is the gap this closes.
+
+        A damaged schema still answers rather than raising a driver error:
+        ``inspect_graph_identity`` already takes that stance ("expose the
+        rows that still exist so the operator can see recovery residue"),
+        and a diagnostic is most needed exactly when the schema is damaged.
+        No ``graph_edges`` -> 0; no ``graph_nodes`` -> every edge, since no
+        endpoint can resolve. Only missing-object errors degrade (see
+        ``_is_missing_object_error``); everything else reaches the caller.
+
+        The fallback is a SEPARATE ``_fetch_one`` call on purpose. On
+        PostgreSQL a failed statement poisons its transaction, so a retry
+        sharing that transaction would fail too; ``PGGraphStore._fetch_one``
+        opens its own connection context per call, which is what makes the
+        sequence work.
+        """
+        self._require_available()
+        nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
+        sql = (
+            f"SELECT COUNT(*) FROM {edges} e"  # noqa: S608
+            f" WHERE NOT EXISTS (SELECT 1 FROM {nodes} n WHERE n.node_type=e.from_type AND n.node_id=e.from_id)"
+            f"    OR NOT EXISTS (SELECT 1 FROM {nodes} n WHERE n.node_type=e.to_type AND n.node_id=e.to_id)"
+        )
+        try:
+            row = self._fetch_one(sql, {})
+        except Exception as exc:
+            if not _is_missing_object_error(exc):
+                raise
+            try:
+                row = self._fetch_one(f"SELECT COUNT(*) FROM {edges}", {})  # noqa: S608
+            except Exception as edges_exc:
+                if not _is_missing_object_error(edges_exc):
+                    raise
+                return 0
         return int(row[0]) if row else 0
 
     # ------------------------------------------------------------------

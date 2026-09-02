@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +179,28 @@ def _mapping_file(path: Path) -> tuple[tuple[ExplicitRename | ExplicitMerge, ...
     return tuple(mappings), tuple(resolutions)
 
 
+def _report_dangling_edges(store: Any) -> None:
+    """Report edges whose endpoint snapshot resolves to no node row (#84).
+
+    This dry-run is the only operator entry point that inspects a LIVE
+    store's graph identity, so it is where the count belongs. The schema
+    declares no foreign key, so such rows can be seeded by any raw SQL path
+    and nothing else reports them.
+
+    stderr, not stdout: stdout carries the receipt JSON that callers parse.
+    Non-fatal: a diagnostic must not abort a migration dry-run, and reporting
+    the failure text rather than a substitute number keeps it from inventing
+    an answer.
+    """
+    counter = getattr(store, "count_dangling_edges", None)
+    if counter is None:
+        return
+    try:
+        print(f"# dangling_edges={counter()}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
+        print(f"# dangling_edges=unavailable ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
 def _store(args: argparse.Namespace) -> Any:
     if args.backend == "local":
         from opencrab.stores.local_graph_store import LocalGraphStore
@@ -239,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
         else:
             inventory = store.inspect_graph_identity()
+            _report_dangling_edges(store)
             source_fingerprint = args.source_fingerprint or inventory.source_fingerprint
             mappings, resolutions = _mapping_file(args.mapping_file) if args.mapping_file else ((), ())
             receipt = store.migrate_graph_identity(DryRunMigrationRequest(
