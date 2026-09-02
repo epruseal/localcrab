@@ -68,6 +68,7 @@ directory and each SQLite copy are readable by the owner only.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import secrets
 import shutil
@@ -306,6 +307,10 @@ def backup_sqlite(
     the transient ``-journal`` SQLite derives from it) is readable by the
     owner only.
     """
+    if not math.isfinite(deadline):
+        # A NaN or infinite deadline can never expire; refuse it before the
+        # destination exists rather than wait forever on a busy source.
+        raise ValueError(f"deadline must be finite, got {deadline!r}")
     try:
         os.close(os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     except FileExistsError as exc:
@@ -495,15 +500,34 @@ def _require_contained(path: Path, root: Path) -> None:
 
 
 def _resolve_timeout(explicit: float | None) -> float:
+    """The lock and per-file budget in seconds: finite and not negative.
+
+    Checked here, at the input boundary, because nothing downstream can
+    cope with anything else: a NaN deadline makes ``remaining_budget <= 0``
+    false forever, so a busy source would be retried without end -- the
+    exact contention this budget exists to bound -- and ``inf`` does the
+    same. An unparsable value is refused rather than replaced by the
+    default: silently running with a budget the operator did not set is
+    the same class of failure as silently dropping a configured target.
+    """
     if explicit is not None:
-        return explicit
-    raw = os.environ.get(_TIMEOUT_ENV)
-    if raw:
-        try:
-            return float(raw)
-        except ValueError:
-            pass
-    return DEFAULT_LOCK_TIMEOUT
+        origin, candidate = "lock_timeout", explicit
+    else:
+        raw = os.environ.get(_TIMEOUT_ENV)
+        if not raw:
+            return DEFAULT_LOCK_TIMEOUT
+        origin, candidate = _TIMEOUT_ENV, raw
+    try:
+        value = float(candidate)
+    except (TypeError, ValueError) as exc:
+        raise BackupError(
+            f"{origin} must be a number of seconds, got {candidate!r}"
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise BackupError(
+            f"{origin} must be a finite, non-negative number of seconds, got {candidate!r}"
+        )
+    return value
 
 
 def _source_for(target: BackupTarget, data_dir: Path) -> Path:

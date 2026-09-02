@@ -1181,6 +1181,73 @@ class TestLocking:
             proc.kill()
             proc.wait(timeout=10)
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0, "6O"])
+    def test_non_finite_or_negative_timeout_argument_is_rejected_before_any_work(
+        self, populated_dir: Path, bad: object
+    ) -> None:
+        """A NaN budget never expires: ``remaining <= 0`` is false forever, so a
+        busy source would be retried without end. Refuse it at the boundary."""
+        with pytest.raises(bk.BackupError, match="lock_timeout"):
+            bk.backup_data_dir(
+                populated_dir,
+                settings=_Settings(),
+                lock_timeout=bad,  # type: ignore[arg-type]
+            )
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-1", "6O"])
+    def test_bad_timeout_environment_value_is_rejected_not_defaulted(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv(bk._TIMEOUT_ENV, raw)
+        with pytest.raises(bk.BackupError, match=bk._TIMEOUT_ENV):
+            bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    def test_bad_timeout_is_rejected_before_the_lock_is_taken(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty staging and no set do not prove the lock was never entered."""
+        import opencrab.locking as locking
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise AssertionError("write_lock was entered with an invalid timeout")
+
+        monkeypatch.setattr(locking, "write_lock", refuse)
+        with pytest.raises(bk.BackupError, match="lock_timeout"):
+            bk.backup_data_dir(populated_dir, settings=_Settings(), lock_timeout=float("nan"))
+
+    def test_finite_positive_timeouts_are_accepted_from_both_sources(
+        self, populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control group for the rejections above."""
+        bk.backup_data_dir(populated_dir, settings=_Settings(), lock_timeout=5.0)
+        monkeypatch.setenv(bk._TIMEOUT_ENV, "5")
+        bk.backup_data_dir(populated_dir, settings=_Settings())
+        assert len(_published_sets(populated_dir)) == 2
+
+    def test_zero_timeout_passes_the_boundary_and_expires_as_a_budget(
+        self, populated_dir: Path
+    ) -> None:
+        """0 is a legal value ("do not wait"), not invalid input. The same
+        number is also the per-file copy budget, which then expires before
+        the first page: that is the documented deadline behaviour, not a
+        boundary rejection, so it surfaces as TimeoutError."""
+        with pytest.raises(TimeoutError):
+            bk.backup_data_dir(populated_dir, settings=_Settings(), lock_timeout=0.0)
+        assert _published_sets(populated_dir) == []
+        assert _stagings(populated_dir) == []
+
+    def test_backup_sqlite_refuses_a_non_finite_deadline(self, tmp_path: Path) -> None:
+        src = tmp_path / "src.db"
+        _make_db(src)
+        dst = tmp_path / "dst.db"
+        with pytest.raises(ValueError, match="deadline"):
+            bk.backup_sqlite(src, dst, deadline=float("nan"))
+        assert not dst.exists()
+
 
 # ---------------------------------------------------------------------------
 # CLI
