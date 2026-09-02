@@ -14,7 +14,6 @@ a raw copy and an online ``.backup()`` is caused by the missing journal.
 
 from __future__ import annotations
 
-import os
 import shutil
 import sqlite3
 import subprocess
@@ -100,24 +99,42 @@ _CRASHER = textwrap.dedent(
     conn = sqlite3.connect(db, isolation_level=None)
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA cache_spill=ON")
-    conn.execute("PRAGMA cache_size=1")
+    # A tiny page cache (16 KiB in the negative form) forces dirty pages out
+    # of memory and into the database file before any commit.
+    conn.execute("PRAGMA cache_size=-16")
     conn.execute("BEGIN IMMEDIATE")
-    blob = "x" * 4096
-    for i in range(1000, 1400):
-        conn.execute("INSERT INTO t (id, v) VALUES (?, ?)", (i, blob))
-    # Dirty pages have spilled into the main database file by now; the
-    # transaction is NOT committed. Die without unwinding so the rollback
-    # journal is left behind as a *hot* journal (no owning connection).
+    # An UPDATE, not an INSERT. Inserted rows land on NEW pages past the old
+    # end of file, and SQLite simply ignores pages beyond the header's page
+    # count -- a journal-less copy of that still reads as the committed state,
+    # which would make this whole test prove nothing. An UPDATE overwrites
+    # EXISTING pages, so the pre-image survives only in the rollback journal.
+    conn.execute("UPDATE t SET v = 'UNCOMMITTED-' || v")
+    # Die without unwinding: the rollback journal is left behind with no
+    # owning connection, which is what makes it a *hot* journal.
     os._exit(1)
     """
 )
+
+#: Big enough that the UPDATE above cannot fit in the page cache and must
+#: spill into the database file.
+_HOT_JOURNAL_ROWS = 4000
 
 
 @pytest.fixture
 def hot_journal_db(tmp_path: Path) -> tuple[Path, list[tuple[int, str]]]:
     """A database with a real hot rollback journal, plus its committed rows."""
     db = tmp_path / "hot.db"
-    _make_db(db, rows=5)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        conn.executemany(
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            [(i, "committed-" + "y" * 2000) for i in range(_HOT_JOURNAL_ROWS)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
     committed = _rows(db)
     assert _integrity(db) == "ok", "fixture precondition: baseline database is sound"
 
@@ -133,40 +150,51 @@ def hot_journal_db(tmp_path: Path) -> tuple[Path, list[tuple[int, str]]]:
     return db, committed
 
 
+def _uncommitted_rows(path: Path) -> int:
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute("SELECT count(*) FROM t WHERE v LIKE 'UNCOMMITTED-%'").fetchone()[0]
+    finally:
+        conn.close()
+
+
 class TestHotJournal:
-    def test_raw_copy_without_journal_loses_the_committed_state(
+    def test_raw_copy_without_journal_keeps_uncommitted_data(
         self, hot_journal_db: tuple[Path, list[tuple[int, str]]], tmp_path: Path
     ) -> None:
-        """Control group: the difference is caused by the missing journal.
+        """Control group: the damage is caused by not copying the journal.
 
-        Both copies are taken BEFORE anything opens the source read-write --
-        that open is what makes SQLite recover the journal, which would
-        destroy the very state under test.
+        Two copies differing ONLY in whether the rollback journal came along.
+        Both are taken BEFORE anything opens the source read-write, because
+        that open is what makes SQLite recover the journal and would destroy
+        the state under test.
+
+        Note what the bad copy looks like: it passes ``integrity_check``. The
+        structure is fine; the CONTENTS are a transaction that was never
+        committed. That is issue #128's "believed to have a backup" precisely
+        -- nothing warns you until you restore it.
         """
         db, committed = hot_journal_db
+        journal = db.with_name("hot.db-journal")
 
         raw_only = tmp_path / "raw_only.db"
         shutil.copy2(db, raw_only)
 
         raw_with_journal = tmp_path / "raw_with_journal.db"
         shutil.copy2(db, raw_with_journal)
-        shutil.copy2(db.with_name("hot.db-journal"), raw_with_journal.with_name(
-            "raw_with_journal.db-journal"
-        ))
+        shutil.copy2(journal, raw_with_journal.with_name("raw_with_journal.db-journal"))
 
         # With the journal, SQLite rolls back and the copy IS the committed state.
+        assert _uncommitted_rows(raw_with_journal) == 0
         assert _rows(raw_with_journal) == committed
 
-        # Without it, the copy is not the committed state. This is exactly what
-        # shutil.copy2 of a live database produces, and it is issue #128.
-        try:
-            observed = _rows(raw_only)
-        except sqlite3.DatabaseError:
-            observed = None
-        assert observed != committed, (
-            "fixture precondition failed: the uncommitted transaction did not "
-            "spill into the database file, so this test would prove nothing"
+        # Without it -- which is exactly what shutil.copy2 of a live database
+        # produced before this fix -- uncommitted rows survive into the backup.
+        assert _uncommitted_rows(raw_only) > 0, (
+            "fixture precondition failed: the uncommitted UPDATE did not spill "
+            "into the database file, so this test would prove nothing"
         )
+        assert _rows(raw_only) != committed
 
     def test_read_only_connection_cannot_recover_a_hot_journal(
         self, hot_journal_db: tuple[Path, list[tuple[int, str]]]
@@ -192,6 +220,7 @@ class TestHotJournal:
         bk.verify_sqlite(dst)
 
         assert _integrity(dst) == "ok"
+        assert _uncommitted_rows(dst) == 0, "the backup kept a transaction that never committed"
         assert _rows(dst) == committed
 
 
@@ -263,13 +292,13 @@ class TestConcurrentWrite:
         _make_db(src, rows=200)
         dst = tmp_path / "dst.db"
 
-        class Boom(RuntimeError):
+        class ObserverError(RuntimeError):
             pass
 
         def observer(status: int, remaining: int, total: int) -> None:
-            raise Boom("stop")
+            raise ObserverError("stop")
 
-        with pytest.raises(Boom):
+        with pytest.raises(ObserverError):
             bk.backup_sqlite(src, dst, deadline=time.monotonic() + 30, pages=1, _on_step=observer)
 
     def test_backup_deadline_is_enforced_under_a_write_lock(self, tmp_path: Path) -> None:
@@ -306,9 +335,20 @@ class TestConcurrentWrite:
 
 class TestInventory:
     def test_vector_db_is_a_target(self) -> None:
-        """#123: vectors.db was missing from the backup list entirely."""
-        labels = {t.label for t in bk.local_data_dir_inventory(_Settings())}
+        """#123: vectors.db was missing from the backup list entirely.
+
+        Asserted against a settings object that names NO vector file, so the
+        default target has to come from the fixed inventory itself. Checking
+        it with the usual _Settings() would pass even if the fixed list lost
+        the entry, because the settings path would silently re-add it.
+        """
+
+        class _NoVectorSettings:
+            local_data_dir = ""
+
+        labels = {t.label for t in bk.local_data_dir_inventory(_NoVectorSettings())}
         assert "vectors.db" in labels
+        assert {t.label for t in bk.local_data_dir_inventory(_Settings())} >= labels
 
     def test_core_stores_are_targets(self) -> None:
         labels = {t.label for t in bk.local_data_dir_inventory(_Settings())}
@@ -421,6 +461,7 @@ class TestPublishedSet:
 
     def test_no_wal_or_shm_sidecars_are_written(self, populated_dir: Path) -> None:
         """.backup() destinations are standalone; sidecars would mislead."""
+        (populated_dir / "graph.db").unlink()
         _make_db(populated_dir / "graph.db", rows=4, wal=True)
         bk.backup_data_dir(populated_dir, settings=_Settings())
         s = _set_dir(populated_dir)
