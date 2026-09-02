@@ -807,7 +807,9 @@ def _copy_directory(source: Path, destination: Path) -> None:
     ``copytree``'s default follows links, which would pull content from
     outside the data directory into the backup. Preserving the link is the
     faithful snapshot; the link's TARGET content is not backed up, which the
-    docs say out loud.
+    docs say out loud. The same rule applies to the catalog check below: a
+    linked ``chroma.sqlite3`` is preserved and not verified, so nothing
+    outside the set is read or written.
 
     A copied chroma catalog that FAILS ``integrity_check`` aborts the whole
     backup. "Could not fully verify" and "known to be bad" are different
@@ -819,6 +821,13 @@ def _copy_directory(source: Path, destination: Path) -> None:
     """
     shutil.copytree(source, destination, symlinks=True)
     catalog = destination / "chroma.sqlite3"
+    # A catalog that is itself a preserved link is NOT verified: ``is_file()``
+    # follows links, and ``verify_sqlite`` opens its target read-write, so
+    # the check would read (and, with a hot journal, WRITE) something outside
+    # the set -- and abort the backup when the target is missing or not
+    # SQLite, contradicting "preserve internal links, never follow them".
+    if catalog.is_symlink():
+        return
     if catalog.is_file():
         try:
             verify_sqlite(catalog)
@@ -841,7 +850,12 @@ def _directory_note(target: BackupTarget, destination: Path, source: Path) -> st
         "(chroma.lock is a shared lock with the offline batch loader, see issue #140)"
     )
     inner = destination / "chroma.sqlite3"
-    if inner.is_file():
+    if inner.is_symlink():
+        note += (
+            "; its chroma.sqlite3 is a preserved symlink and was NOT verified "
+            "(the link target was not followed or verified)"
+        )
+    elif inner.is_file():
         # Reaching here means it already passed; a failure aborted the run.
         note += "; its chroma.sqlite3 passes integrity_check, which does not prove the "
         note += "HNSW index and segment files agree with it"

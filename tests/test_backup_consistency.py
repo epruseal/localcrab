@@ -690,6 +690,57 @@ class TestPublishedSet:
         assert "no chroma.sqlite3" in entry.note
         assert (_set_dir(d) / "chroma" / "index.bin").is_file()
 
+    def test_a_symlinked_chroma_catalog_is_preserved_and_not_verified(
+        self, tmp_path: Path
+    ) -> None:
+        """The directory policy is "preserve internal links, never follow them".
+
+        Verifying THROUGH the preserved link read something outside the set:
+        a missing or non-SQLite target aborted the whole backup, and a target
+        with a hot journal was recovered (written) by the read-write open.
+        """
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        _make_db(d / "graph.db", rows=3)
+        outside = tmp_path / "outside-catalog"
+        outside.write_bytes(b"this is not a sqlite database")
+        (d / "chroma" / "chroma.sqlite3").symlink_to(outside)
+        (d / "chroma" / "index.bin").write_bytes(b"vec")
+
+        outcome = bk.backup_data_dir(d, settings=_Settings())
+        entry = next(e for e in outcome.entries if e.label == "chroma")
+        assert entry.status == "unverified"
+        assert "preserved symlink" in entry.note and "NOT verified" in entry.note
+        copied = _set_dir(d) / "chroma" / "chroma.sqlite3"
+        assert copied.is_symlink(), "the catalog link was followed instead of preserved"
+
+    def test_a_symlinked_catalog_target_is_left_untouched(
+        self, hot_journal_db: tuple[Path, list[tuple[int, str]]], tmp_path: Path
+    ) -> None:
+        """Opening the target read-write would recover its hot journal."""
+        target, _ = hot_journal_db
+        journal = target.with_name("hot.db-journal")
+        before = (target.stat().st_size, target.stat().st_mtime_ns, journal.stat().st_size)
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        (d / "chroma" / "chroma.sqlite3").symlink_to(target)
+
+        bk.backup_data_dir(d, settings=_Settings())
+        assert journal.is_file(), "the link target's hot journal was recovered by the backup"
+        assert (target.stat().st_size, target.stat().st_mtime_ns, journal.stat().st_size) == before
+
+    def test_a_dangling_symlinked_catalog_does_not_abort(self, tmp_path: Path) -> None:
+        d = tmp_path / "data"
+        (d / "chroma").mkdir(parents=True)
+        (d / "chroma" / "chroma.sqlite3").symlink_to(tmp_path / "nowhere.sqlite3")
+
+        outcome = bk.backup_data_dir(d, settings=_Settings())
+        entry = next(e for e in outcome.entries if e.label == "chroma")
+        assert entry.status == "unverified"
+        assert "preserved symlink" in entry.note
+        assert "no chroma.sqlite3" not in entry.note
+        assert (_set_dir(d) / "chroma" / "chroma.sqlite3").is_symlink()
+
     def test_directory_symlinks_are_preserved_not_followed(
         self, populated_dir: Path, tmp_path: Path
     ) -> None:
