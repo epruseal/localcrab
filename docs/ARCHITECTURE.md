@@ -329,6 +329,12 @@ def run_cypher(self, cypher: str, params=None) -> list[dict]:
 `query.py`의 policy-aware 필터링이 여전히 호출하는 내부 엔진 `ReBACEngine.check()`
 기준으로 갱신했다.)
 
+`ReBACEngine.check()` 의 실패 계약(#78): SQL 정책 조회가 예외를 내거나 `bool | None`
+밖 값을 돌려주면 그래프 탐색 없이 deny 를 돌려주고 예외를 전파하지 않는다. 읽지 못한
+명시 DENY 행을 그래프 GRANT 가 덮어쓰지 않게 하기 위해서다. WARNING 은 예외 타입명과
+식별자만 담고 원문은 DEBUG 에만 남긴다. 그래프 경로는 종전대로 예외를 삼키고 DEBUG 로
+남긴다. 재현: `pytest tests/test_rebac_local.py -k TestSQLStoreFailure`.
+
 당시 코드베이스 전반에는 `isinstance(graph, (LocalGraphStore, KuzuGraphStore))` 분기가
 존재한다(`ontology/query.py`, `ontology/impact.py`, `pack/neo4j_export.py`,
 `mcp/tools.py`) — `kuzu` 모드 도입 시 이 분기에서 `LocalGraphStore`를

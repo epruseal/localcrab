@@ -429,6 +429,8 @@ STORAGE_MODE=docker opencrab serve
 > print(store.list_invalid_policies())   # [] 이면 오염 행 없음
 > store._engine.dispose()
 > ```
+>
+> **정책 스토어 장애 시 동작 (fail-closed, #78)**: `ReBACEngine.check()` 는 SQL 정책 조회가 예외를 내면 예외를 전파하지 않고 **deny** 를 돌려줍니다. 이때 그래프 탐색을 타지 않습니다. 읽지 못한 명시 DENY 행을 그래프 GRANT 가 덮어쓰면 안 되기 때문입니다. 그래서 SQL 장애 중에는 그래프 관계만으로 허용되던 주체도 거부됩니다. 이는 권한 확대가 아니라 의도된 가용성 손실입니다. `check_policy` 가 `True`/`False`/`None` 밖 값을 돌려줄 때도 같은 이유로 deny 입니다. 결정의 `reason` 이 "SQL policy lookup failed" 또는 "returned a non-boolean value" 로 시작하므로 기본 deny 와 구분됩니다. 로거 `opencrab.ontology.rebac` 의 WARNING 은 예외 타입명과 subject/permission/resource 만 담고 예외 원문은 담지 않습니다(원문에 DSN 이나 서버 메시지가 섞일 수 있음). 전체 트레이스백은 같은 로거의 DEBUG 에만 남으니 DEBUG 를 켠 로그는 그만큼 민감하게 다루십시오. 장애가 대량 거부로 보이면 이 WARNING 을 먼저 찾으십시오. 재현: `pytest tests/test_rebac_local.py -k TestSQLStoreFailure`.
 
 ### Docker → Local 모드 마이그레이션
 
