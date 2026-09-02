@@ -1210,6 +1210,9 @@ class TestPinRemovalIsNeutralAcrossSinks:
         def _broken_upsert_node(*a, **kw):
             raise RuntimeError("주입된 그래프 쓰기 실패")
         monkeypatch.setattr(graph, "upsert_node", _broken_upsert_node)
+        # 값이 바뀐 라이브 행은 CAS 경로(reclassify_node)로 간다 — 그 경로의
+        # 실패도 같은 주입으로 덮는다.
+        monkeypatch.setattr(graph, "reclassify_node", _broken_upsert_node)
 
         # 이번 증분: n1 은 값이 바뀌어 재저장을 시도하지만 실패한다. n2 는 파일에서
         # 아예 빠졌다 — n1 의 실패와 무관한 stale 후보다.

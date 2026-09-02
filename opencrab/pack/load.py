@@ -1317,14 +1317,24 @@ def load_nodes_incremental(
         stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
         try:
+            # Qualified graph identity makes ``upsert_node`` a
+            # create-or-verify write: an existing row with a different
+            # digest is rejected. Every update of a live row therefore
+            # needs the CAS digest — a property-only change included, not
+            # only a type change. Passing it only for type changes made
+            # every property drift fail with ``node identity conflict``
+            # (2026-09-02, 10,134 nodes on one pack). A store without
+            # ``get_node_digest`` keeps the legacy upsert path.
             expected_current_digest = None
-            if stale_typed is not None:
+            if live is not None:
                 get_digest = getattr(graph, "get_node_digest", None)
-                if not callable(get_digest):
-                    raise RuntimeError("graph store cannot CAS-reclassify a node")
-                expected_current_digest = get_digest(node_id, node_type=live[0])
-                if not expected_current_digest:
-                    raise RuntimeError(f"current node digest unavailable: {node_id}")
+                if callable(get_digest):
+                    expected_current_digest = get_digest(node_id, node_type=live[0]) or None
+                if stale_typed is not None:
+                    if not callable(get_digest):
+                        raise RuntimeError("graph store cannot CAS-reclassify a node")
+                    if not expected_current_digest:
+                        raise RuntimeError(f"current node digest unavailable: {node_id}")
             res = builder.add_node(space, node_type, node_id, properties=props,
                                      pack_id=pack_name, origin="server",
                                      _expected_current_digest=expected_current_digest)
