@@ -1,0 +1,441 @@
+"""chroma.lock ownership: every local PersistentClient owner is excluded (#140).
+
+Before this change only the MCP tool layer took ``chroma.lock``, so the REST
+app, the CLI, and the migration scripts opened a second ``PersistentClient`` on
+the same persist directory with no exclusion at all. Ownership now sits on the
+``ChromaStore`` local-mode instance, so every entry point that goes through the
+factory is covered automatically.
+
+Every test here uses ``tmp_path``; nothing touches a real data directory.
+
+Reverse-mutation note (which tests are RED against the pre-fix code):
+  RED  : test_live_store_blocks_exclusive_claim
+         test_second_instance_keeps_lock_after_first_closes
+         test_exclusive_holder_refuses_new_store
+         test_failed_init_does_not_leak_the_lock
+         test_partial_client_is_torn_down_before_the_lock_is_released
+         test_client_creation_failure_releases_lock
+         test_factory_locks_beside_the_data_dir
+         test_symlinked_data_dir_shares_one_lock
+         test_symlinked_persist_dir_agrees_with_the_migration_lock
+         test_lock_is_released_even_when_client_close_raises
+  GREEN both ways (release-regression guards, not RED tests):
+         test_closed_store_releases_the_lock
+         test_sqlite_vec_backend_takes_no_chroma_lock
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+import pytest
+
+from opencrab.locking import acquire_file_lock, chroma_lock_dir, release_file_lock
+
+# An exclusive claimant standing in for the offline pack loader or a migration.
+# Run in a CHILD process on purpose: flock is scoped to the open file
+# description, so an in-process probe would not model a separate owner.
+_PROBE = r"""
+import sys
+from opencrab.locking import acquire_file_lock, release_file_lock
+try:
+    fh = acquire_file_lock("chroma.lock", sys.argv[1], shared=False, timeout=1.0)
+except TimeoutError:
+    print("REFUSED")
+else:
+    release_file_lock(fh)
+    print("GRANTED")
+"""
+
+
+def exclusive_probe(lock_dir: str) -> str:
+    """Return GRANTED or REFUSED for an exclusive chroma.lock claim."""
+    out = subprocess.run(
+        [sys.executable, "-c", _PROBE, lock_dir],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    result = (out.stdout or "").strip()
+    assert result in ("GRANTED", "REFUSED"), f"probe failed: {out.stdout}{out.stderr}"
+    return result
+
+
+@pytest.fixture
+def chroma_cls():
+    pytest.importorskip("chromadb")
+    from opencrab.stores.chroma_store import ChromaStore
+
+    return ChromaStore
+
+
+def make_store(chroma_cls, persist_path: str, name: str = "lockcheck", **kw):
+    from _vec_helpers import MockEF
+
+    return chroma_cls(
+        host="localhost",
+        port=8000,
+        collection_name=name,
+        local_mode=True,
+        local_path=persist_path,
+        embedding_function=MockEF(16),
+        **kw,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exclusion in both directions
+# ---------------------------------------------------------------------------
+
+
+class TestChromaLockExclusion:
+    def test_live_store_blocks_exclusive_claim(self, chroma_cls, tmp_path):
+        """정상: 살아 있는 로컬 스토어가 배타 요구자를 막는다.
+
+        수정 전에는 배타 획득이 그냥 성공했다. MCP 밖의 소유자가 잠금을 잡지
+        않아 살아 있는 클라이언트가 배타 요구자에게 보이지 않았기 때문이다."""
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+        assert store.available
+        try:
+            assert exclusive_probe(data_dir) == "REFUSED"
+        finally:
+            store.close()
+
+    def test_closed_store_releases_the_lock(self, chroma_cls, tmp_path):
+        """정상: close() 뒤에는 배타 획득이 성공한다.
+
+        수정 전 코드에서도 통과한다(그때는 잠금을 아예 안 잡았으므로). RED
+        테스트가 아니라 해제 회귀 방지용이며, 위 테스트와 짝일 때만 의미가 있다."""
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+        store.close()
+        assert exclusive_probe(data_dir) == "GRANTED"
+
+    def test_second_instance_keeps_lock_after_first_closes(self, chroma_cls, tmp_path):
+        """정상: 잠금 소유가 인스턴스별이다 — 프로세스 내 다중 인스턴스.
+
+        A 와 B 를 같은 경로에 연다. 둘 다 동작해야 하고(POSIX 공유 잠금은 서로
+        막지 않는다), A 를 닫아도 B 가 자기 핸들을 들고 있으므로 배타 획득은
+        여전히 거부되어야 한다. 전역 핸들 하나를 재바인딩하는 구현이나 두 번째
+        인스턴스가 잠금을 안 잡는 구현은 이 순서를 통과하지 못한다."""
+        data_dir = str(tmp_path)
+        persist = os.path.join(data_dir, "chroma")
+        a = make_store(chroma_cls, persist, "inst_a")
+        b = make_store(chroma_cls, persist, "inst_b")
+        try:
+            assert a.available and b.available, "동일 경로 다중 인스턴스가 서로를 막았다"
+            assert exclusive_probe(data_dir) == "REFUSED"
+            a.close()
+            assert exclusive_probe(data_dir) == "REFUSED", "B 의 잠금이 A 와 함께 풀렸다"
+        finally:
+            b.close()
+        assert exclusive_probe(data_dir) == "GRANTED"
+
+    def test_exclusive_holder_refuses_new_store(self, chroma_cls, tmp_path):
+        """에러: 배타 잠금이 잡힌 동안 스토어 생성이 타임아웃으로 거부된다.
+
+        핵심은 이 타임아웃이 available=False 로 삼켜지지 않는다는 점이다.
+        삼켜지면 잠금이 풀린 뒤에도 벡터 계층이 프로세스 수명 동안 불능으로
+        남는다. 잠금 해제 뒤 새 인스턴스가 정상 동작하는 것까지 확인한다."""
+        from opencrab.stores.chroma_store import ChromaLockTimeoutError
+
+        data_dir = str(tmp_path)
+        persist = os.path.join(data_dir, "chroma")
+        fh = acquire_file_lock("chroma.lock", data_dir, shared=False, timeout=5.0)
+        try:
+            with pytest.raises(ChromaLockTimeoutError) as caught:
+                make_store(chroma_cls, persist, lock_timeout=0.5)
+            assert isinstance(caught.value, TimeoutError)
+            assert "chroma.lock" in str(caught.value)
+        finally:
+            release_file_lock(fh)
+
+        recovered = make_store(chroma_cls, persist, lock_timeout=5.0)
+        try:
+            assert recovered.available, "잠금이 풀린 뒤에도 벡터 계층이 불능이다"
+        finally:
+            recovered.close()
+
+    def test_sqlite_vec_backend_takes_no_chroma_lock(self, tmp_path, monkeypatch):
+        """비회귀: sqlite-vec 백엔드는 chroma.lock 을 잡지 않는다.
+
+        sqlite-vec 은 SQLite WAL 규율을 쓰므로 chroma 의 flock 계층을 잡으면
+        무의미한 보유가 된다."""
+        pytest.importorskip("sqlite_vec")
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_vector_store
+
+        data_dir = str(tmp_path)
+        monkeypatch.setenv("LOCAL_DATA_DIR", data_dir)
+        cfg = Settings(
+            LOCAL_DATA_DIR=data_dir,
+            VECTOR_BACKEND="sqlite-vec",
+            EMBEDDING_BACKEND="openai",
+        )
+        store = make_vector_store(cfg)
+        try:
+            assert exclusive_probe(data_dir) == "GRANTED"
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+
+# ---------------------------------------------------------------------------
+# Failure paths must not strand the lock or a live client
+# ---------------------------------------------------------------------------
+
+
+class TestChromaLockFailurePaths:
+    def test_client_creation_failure_releases_lock(self, chroma_cls, tmp_path, monkeypatch):
+        """에러: PersistentClient 생성 자체가 실패하면 잠금을 푼다.
+
+        부분 클라이언트가 없는 경우다. 실패한 인스턴스를 계속 보존한 채로
+        확인해야 한다 — 버리면 참조 계수가 대신 정리해 공허해진다."""
+        import chromadb
+
+        monkeypatch.setattr(
+            chromadb,
+            "PersistentClient",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+        assert store.available is False
+        assert store._lock_fh is None
+        assert exclusive_probe(data_dir) == "GRANTED"
+        del store
+
+    def test_partial_client_is_torn_down_before_the_lock_is_released(
+        self, chroma_cls, tmp_path, monkeypatch
+    ):
+        """에러: 컬렉션 생성이 실패하면 부분 클라이언트를 헐고 잠금을 푼다.
+
+        배타 획득 성공만 단언하면, 살아 있는 클라이언트를 그대로 둔 채 잠금만
+        푸는 구현이 통과한다. 그래서 클라이언트의 close() 호출과 참조 비움을
+        함께 단언한다."""
+        import chromadb
+
+        closed: list[bool] = []
+
+        class PartialClient:
+            def get_or_create_collection(self, *a, **k):
+                raise RuntimeError("collection boom")
+
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(chromadb, "PersistentClient", lambda *a, **k: PartialClient())
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+        assert store.available is False
+        assert closed == [True], "부분 클라이언트가 닫히지 않았다"
+        assert store._client is None and store._collection is None
+        assert store._lock_fh is None
+        assert exclusive_probe(data_dir) == "GRANTED"
+        del store
+
+    def test_lock_is_released_even_when_client_close_raises(self, chroma_cls, tmp_path):
+        """에러: 클라이언트 종료가 예외를 던져도 잠금은 풀린다.
+
+        해제를 종료 호출 뒤에 그냥 붙인 구현은 실패한다. 해제가 finally 에 있어야
+        한다. 예외 자체는 그대로 전파된다."""
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+
+        class Exploding:
+            def close(self):
+                raise RuntimeError("native close failed")
+
+        store._client = Exploding()
+        with pytest.raises(RuntimeError, match="native close failed"):
+            store.close()
+        assert exclusive_probe(data_dir) == "GRANTED"
+
+    def test_failed_init_does_not_leak_the_lock(self, tmp_path, monkeypatch):
+        """엣지: 컨텍스트 초기화가 벡터 뒤에서 실패해도 잠금이 쌓이지 않는다.
+
+        배타 획득과 /proc/self/fd 만 보면 공허하게 통과한다 — 실패한
+        _build_context() 의 지역 변수가 풀리는 순간 참조 계수가 정리해버리기
+        때문이다. 그래서 팩토리 반환값을 테스트가 직접 붙들고 close() 호출
+        여부를 기록해 단언한다. 반복 호출은 1회로는 누수가 드러나지 않기
+        때문이다."""
+        pytest.importorskip("chromadb")
+        import opencrab.mcp.tools as tools_mod
+        from opencrab.stores import factory as factory_mod
+
+        data_dir = str(tmp_path)
+        monkeypatch.setenv("LOCAL_DATA_DIR", data_dir)
+        monkeypatch.setenv("VECTOR_BACKEND", "chroma")
+        monkeypatch.setattr(tools_mod, "_context", {})
+
+        kept: list = []
+        real_make_vector = factory_mod.make_vector_store
+
+        def spy_vector(cfg):
+            store = real_make_vector(cfg)
+            kept.append(store)
+            store._close_calls = 0
+            real_close = store.close
+
+            def counting_close():
+                store._close_calls += 1
+                return real_close()
+
+            store.close = counting_close
+            return store
+
+        monkeypatch.setattr(factory_mod, "make_vector_store", spy_vector)
+        monkeypatch.setattr(
+            factory_mod,
+            "make_doc_store",
+            lambda cfg: (_ for _ in ()).throw(RuntimeError("doc store boom")),
+        )
+
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="doc store boom"):
+                tools_mod._get_context()
+
+        assert len(kept) == 3, "매 시도가 새 벡터 스토어를 만들지 않았다"
+        assert [s._close_calls for s in kept] == [1, 1, 1], (
+            "초기화 실패 경로가 이미 만든 벡터 스토어를 명시적으로 닫지 않았다"
+        )
+        # kept still holds every store, so refcounting has released nothing.
+        assert exclusive_probe(data_dir) == "GRANTED"
+
+
+# ---------------------------------------------------------------------------
+# One lock file, whoever derives it
+# ---------------------------------------------------------------------------
+
+
+class TestChromaLockPath:
+    def test_factory_locks_beside_the_data_dir(self, tmp_path, monkeypatch):
+        """규약 고정: 팩토리가 만든 스토어의 잠금 파일이 <data_dir>/chroma.lock.
+
+        외부 오프라인 로더가 배타 잠금을 잡는 자리와 같아야 한다. 어긋나면
+        배제가 조용히 성립하지 않는다."""
+        pytest.importorskip("chromadb")
+        from opencrab.config import Settings
+        from opencrab.stores.factory import make_vector_store
+
+        data_dir = str(tmp_path)
+        monkeypatch.setenv("LOCAL_DATA_DIR", data_dir)
+        cfg = Settings(LOCAL_DATA_DIR=data_dir, VECTOR_BACKEND="chroma")
+        store = make_vector_store(cfg)
+        try:
+            assert store.available
+            assert exclusive_probe(data_dir) == "REFUSED"
+            assert os.path.exists(os.path.join(data_dir, "chroma.lock"))
+        finally:
+            store.close()
+
+    def test_symlinked_data_dir_shares_one_lock(self, chroma_cls, tmp_path):
+        """엣지: 데이터 디렉터리를 별칭으로 지나도 같은 잠금 파일을 잡는다.
+
+        별칭으로 연 인스턴스만 남긴 뒤 실경로 기준으로 확인해야 한다. 둘 다
+        살려 두면 실경로 인스턴스 하나만으로 배타 획득이 막혀, 별칭 인스턴스가
+        엉뚱한 잠금 파일을 잡아도 통과한다."""
+        real = tmp_path / "realdata"
+        real.mkdir()
+        alias = tmp_path / "aliasdata"
+        alias.symlink_to(real)
+
+        via_real = make_store(chroma_cls, str(real / "chroma"), "via_real")
+        via_alias = make_store(chroma_cls, str(alias / "chroma"), "via_alias")
+        try:
+            via_real.close()
+            assert exclusive_probe(str(real)) == "REFUSED", (
+                "별칭으로 연 인스턴스가 실경로와 다른 잠금 파일을 잡았다"
+            )
+        finally:
+            via_alias.close()
+        assert exclusive_probe(str(real)) == "GRANTED"
+
+    def test_symlinked_persist_dir_agrees_with_the_migration_lock(self, chroma_cls, tmp_path):
+        """엣지: persist 디렉터리가 심볼릭 링크여도 마이그레이션과 같은 잠금이다.
+
+        마이그레이션과 외부 로더는 <local_data_dir>/chroma.lock 을 잡는다.
+        persist 경로 자체를 realpath 로 풀어 파생하면 링크 대상 옆에 잠금이
+        생겨 배제가 갈라진다. 별칭 통합만 확인하고 이 대조를 빠뜨리면 깨진
+        채로 통과한다."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        persist = data_dir / "chroma"
+        persist.symlink_to(elsewhere)
+
+        assert chroma_lock_dir(str(persist)) == str(data_dir)
+
+        store = make_store(chroma_cls, str(persist))
+        try:
+            assert exclusive_probe(str(data_dir)) == "REFUSED", (
+                "스토어가 마이그레이션이 쓰는 잠금 파일과 다른 곳을 잡았다"
+            )
+        finally:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI surface
+# ---------------------------------------------------------------------------
+
+
+class TestCliLockTimeoutShape:
+    def test_make_stores_reports_a_lock_timeout_as_an_operator_error(
+        self, tmp_path, monkeypatch
+    ):
+        """정상: CLI 가 traceback 대신 운영자용 메시지와 종료 코드 1 을 낸다.
+
+        벡터 스토어 생성은 각 명령의 except RuntimeError 블록 밖에 있으므로
+        변환은 _make_stores() 안에서 일어나야 한다."""
+        pytest.importorskip("chromadb")
+        from opencrab import cli as cli_mod
+        from opencrab.config import Settings
+
+        data_dir = str(tmp_path)
+        monkeypatch.setenv("LOCAL_DATA_DIR", data_dir)
+        monkeypatch.setenv("CHROMA_LOCK_TIMEOUT", "0.5")
+        cfg = Settings(
+            LOCAL_DATA_DIR=data_dir, VECTOR_BACKEND="chroma", CHROMA_LOCK_TIMEOUT=0.5
+        )
+
+        fh = acquire_file_lock("chroma.lock", data_dir, shared=False, timeout=5.0)
+        try:
+            with pytest.raises(SystemExit) as caught:
+                cli_mod._make_stores(cfg, vector=True)
+            assert caught.value.code == 1
+        finally:
+            release_file_lock(fh)
+
+    def test_make_stores_closes_earlier_stores_when_a_later_one_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """엣지: 뒤쪽 팩토리가 실패하면 앞서 연 스토어를 닫는다.
+
+        실패 원자성이 없으면 벡터 생성이 실패할 때 앞서 연 graph 가 열린 채
+        남는다."""
+        from opencrab import cli as cli_mod
+        from opencrab.config import Settings
+        from opencrab.stores import factory as factory_mod
+
+        closed: list[str] = []
+
+        class FakeGraph:
+            def close(self):
+                closed.append("graph")
+
+        monkeypatch.setattr(factory_mod, "make_graph_store", lambda cfg: FakeGraph())
+        monkeypatch.setattr(
+            factory_mod,
+            "make_vector_store",
+            lambda cfg: (_ for _ in ()).throw(RuntimeError("vector boom")),
+        )
+        cfg = Settings(LOCAL_DATA_DIR=str(tmp_path))
+        with pytest.raises(RuntimeError, match="vector boom"):
+            cli_mod._make_stores(cfg, graph=True, vector=True)
+        assert closed == ["graph"], "앞서 연 스토어가 닫히지 않았다"
