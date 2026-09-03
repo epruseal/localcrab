@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import struct
 import threading
 import time
@@ -100,6 +101,9 @@ from opencrab.stores._vector_base import (
     embed_and_validate,
     generate_add_ids,
     generate_upsert_ids,
+    reject_batch_pack_conflicts,
+    reject_foreign_slot_writes,
+    slot_owner,
     validate_import_records,
     validate_lengths,
 )
@@ -372,7 +376,7 @@ class SqliteVecStore(_SqliteConnMixin):
         if self._has_bit_column:
             return (
                 _id,
-                str(meta.get("pack_id", "")),
+                slot_owner(meta),
                 self._serialize(vec),
                 _sign_bits(vec),
                 text,
@@ -380,7 +384,7 @@ class SqliteVecStore(_SqliteConnMixin):
             )
         return (
             _id,
-            str(meta.get("pack_id", "")),
+            slot_owner(meta),
             self._serialize(vec),
             text,
             json.dumps(meta),
@@ -421,7 +425,25 @@ class SqliteVecStore(_SqliteConnMixin):
         ids: list[str] | None = None,
     ) -> list[str]:
         """Upsert (content-deterministic IDs when omitted). vec0 has no UPSERT
-        for virtual tables, so this is DELETE-then-INSERT per id."""
+        for virtual tables, so this is DELETE-then-INSERT per id.
+
+        OWNERSHIP [#197]: an owned slot may only be rewritten by its owner.
+        Two layers enforce that, and they are not redundant.
+
+        Layer 1 is the pre-check (``reject_batch_pack_conflicts`` plus
+        ``reject_foreign_slot_writes``). It judges the whole batch before any
+        of it is applied and produces the error the caller sees.
+
+        Layer 2 is the DELETE's own ``pack_id`` predicate. It closes the window
+        between the pre-check's SELECT and the write: this transaction is
+        DEFERRED, so another process can commit into that slot in between, and
+        a foreign row that arrives then survives the DELETE and makes the
+        INSERT fail on the primary key. That failure is inside ``_tx()``, so
+        the whole batch rolls back rather than half-landing. Measured: the
+        conditional DELETE reports rowcount 0 against a foreign owner and the
+        INSERT then raises ``UNIQUE constraint failed``, while the same pack's
+        DELETE reports 1.
+        """
         self._require_available()
         if not texts:
             return []
@@ -429,15 +451,81 @@ class SqliteVecStore(_SqliteConnMixin):
             ids = generate_upsert_ids(texts)
         metadatas = default_metadatas(texts, metadatas)
         validate_lengths(texts, metadatas, ids)
+        reject_batch_pack_conflicts(ids, metadatas)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
-                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
+                incoming = slot_owner(meta)
+                conn.execute(
+                    # `IS NULL` 을 먼저 본다: SQL 에서 `NULL = ''` 은 거짓이 아니라
+                    # NULL 이므로, 그것을 안 보면 저장된 값이 NULL 인 행에서 술어가
+                    # NULL 로 평가돼 DELETE 가 아무것도 지우지 않고 뒤이은 INSERT 가
+                    # 기본키 충돌로 실패한다. 층 1 은 `slot_owner` 를 거쳐 None 과
+                    # 빈 문자열과 부재를 한 상태로 접어 그 행을 미소유로 읽으므로,
+                    # 술어를 맞추지 않으면 두 층의 판정이 갈린다. 이 컬럼은 vec0
+                    # 파티션 키이고 NOT NULL 이 아니라 외부 기록에 NULL 이 들어올 수
+                    # 있다. pgvector 의 같은 술어와 같은 이유다.
+                    f"DELETE FROM {self._table} WHERE node_id = ? "  # noqa: S608
+                    "AND (pack_id IS NULL OR pack_id = '' OR pack_id = ?)",
+                    (_id, incoming),
+                )
+                try:
+                    conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
+                except sqlite3.Error as exc:
+                    # 층 2 가 걸렸을 때 pgvector 와 같은 타입과 같은 문구를 낸다. 소유자를
+                    # 다시 읽어 남의 팩일 때만 바꿔 던지고, 아니면 원래 예외를 그대로
+                    # 올린다 -- 디스크 오류나 스키마 문제를 소유권 오류로 가리지
+                    # 않는다. 어느 쪽이든 `_tx()` 가 배치 전체를 롤백한다.
+                    #
+                    # 재조회는 오류 메시지를 좋게 만드는 보조 수단일 뿐이다. 그것이
+                    # 실패했다고 호출자가 보는 실패의 정체가 바뀌면 안 되므로, 그
+                    # 경우에는 최초 예외 객체를 그대로 올린다(`from None` 으로 재조회
+                    # 예외를 원인으로 달지 않는다 -- 그것은 진단을 흐린다).
+                    #
+                    # 포착 범위를 `sqlite3.Error` 가 아니라 `Exception` 으로 둔다.
+                    # 좁히면 드라이버 밖 예외가 최초 원인을 다시 가린다. 보조 수단이
+                    # 어떻게 실패하든 결과는 하나여야 한다: 최초 원인을 그대로 올린다.
+                    try:
+                        owner = self._slot_owners(conn, [_id]).get(_id) or ""
+                    except Exception:  # noqa: BLE001 -- 위 주석의 이유로 전 범위
+                        logger.warning(
+                            "SqliteVecStore: 소유자 재조회 실패(%s) — 최초 예외를 그대로 "
+                            "올린다", _id, exc_info=True,
+                        )
+                        raise exc from None
+                    if owner and owner != incoming:
+                        # 남의 팩 id 를 메시지에 담지 않는다. 이 텍스트는 쓰기
+                        # 영수증에 그대로 실려 나가므로, 담으면 충돌하는 node_id 로
+                        # 써 보는 것만으로 남의 팩 이름을 알아낼 수 있다
+                        # (`pack/write_gate.py` 의 `identity_reject_message` 가 graph
+                        # 층에 세운 같은 불변식).
+                        raise ValueError(
+                            "upsert_texts: refusing to take over a slot already "
+                            f"attributed to a different pack ({_id!r}); the row "
+                            "changed attribution between the ownership check and "
+                            "this write"
+                        ) from exc
+                    raise
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
+
+    def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
+        """``node_id`` -> owning ``pack_id`` for the ids that already have a row.
+
+        One array-bound query, not one bind per id: a batch is caller-sized and
+        can exceed SQLite's variable limit (the same reason
+        ``_sql_dialect.in_string_array`` exists). Ids with no row are simply
+        absent from the result, which is what the gate reads as "new slot".
+        """
+        id_frag, id_transform = SQLITE.in_string_array("node_id", "?")
+        rows = conn.execute(
+            f"SELECT node_id, pack_id FROM {self._table} WHERE {id_frag}",  # noqa: S608
+            [id_transform(list(ids))],
+        ).fetchall()
+        return {row["node_id"]: row["pack_id"] for row in rows}
 
     def delete(self, ids: list[str]) -> None:
         self._require_available()

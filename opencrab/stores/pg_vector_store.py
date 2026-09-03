@@ -72,6 +72,9 @@ from opencrab.stores._vector_base import (
     embed_and_validate,
     generate_add_ids,
     generate_upsert_ids,
+    reject_batch_pack_conflicts,
+    reject_foreign_slot_writes,
+    slot_owner,
     validate_import_records,
     validate_lengths,
 )
@@ -302,7 +305,7 @@ class PgVectorStore:
                     sql,
                     {
                         "node_id": _id,
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
                         "metadata": json.dumps(meta),
@@ -318,7 +321,27 @@ class PgVectorStore:
     ) -> list[str]:
         """업서트(콘텐츠 결정적 ID, 생략 시) — ``INSERT ... ON CONFLICT (node_id)
         DO UPDATE``로 원자적 갱신(vec0의 DELETE-then-INSERT와 달리 PG는 네이티브
-        UPSERT를 지원)."""
+        UPSERT를 지원).
+
+        소유권 [#197]: 소유된 슬롯은 그 소유자만 다시 쓴다. 두 층이 강제한다.
+
+        층 1 은 선검사다. 배치 전체를 적용 전에 판정하고 호출자가 보는 오류를
+        만든다. 층 2 는 ``DO UPDATE`` 자신의 ``WHERE`` 술어다. 선검사의 SELECT 는
+        기본 READ COMMITTED 에서 잠금 없이 읽으므로 그 뒤 다른 트랜잭션이 슬롯
+        소유자를 바꿀 수 있다. ``ON CONFLICT`` 는 충돌 행을 잠근 채 술어를
+        평가하므로 그 창이 닫힌다. 술어가 거짓이면 그 문장의 ``rowcount`` 가 0 이
+        되고, 여기서 그것을 위반으로 읽어 예외를 낸다. 실측(PostgreSQL 16.14,
+        psycopg2): 신규 삽입, 같은 팩 갱신, 미소유 슬롯 인수는 전부 1 이고 교차
+        팩 시도만 0 이다 — 0 은 소유권 위반 말고 다른 원인으로 나오지 않는다.
+
+        술어가 `IS NULL` 을 먼저 보는 이유: `pack_id` 컬럼은 NOT NULL 이 아니고, SQL
+        에서 `NULL = ''` 은 거짓이 아니라 NULL 이다. 그것을 안 보면 저장된 값이
+        NULL 인 행에서 술어 전체가 NULL 로 평가돼 갱신이 안 되고, 층 1 이 같은 행을
+        미소유로 읽어 통과시킨 것과 판정이 갈린다(층 1 은 `slot_owner` 를 거쳐
+        None 과 빈 문자열과 부재를 한 상태로 접는다). 이 저장소의 쓰기 경로는 전부
+        빈 문자열을 넣으므로 NULL 행은 외부 기록에만 생기지만, 두 층이 갈리는 것
+        자체가 계약 결함이라 술어 쪽을 층 1 에 맞춘다.
+        """
         self._require_available()
         if not texts:
             return []
@@ -326,6 +349,7 @@ class PgVectorStore:
             ids = generate_upsert_ids(texts)
         metadatas = default_metadatas(texts, metadatas)
         validate_lengths(texts, metadatas, ids)
+        reject_batch_pack_conflicts(ids, metadatas)
         vectors = self._embed(texts)
 
         from sqlalchemy import text
@@ -335,21 +359,51 @@ class PgVectorStore:
             "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb) "
             "ON CONFLICT (node_id) DO UPDATE SET "
             "pack_id = EXCLUDED.pack_id, embedding = EXCLUDED.embedding, "
-            "document = EXCLUDED.document, metadata = EXCLUDED.metadata"
+            "document = EXCLUDED.document, metadata = EXCLUDED.metadata "
+            f"WHERE {self._table}.pack_id IS NULL "
+            f"OR {self._table}.pack_id = '' "
+            f"OR {self._table}.pack_id = EXCLUDED.pack_id"
         )
         with self._engine.begin() as conn:
+            reject_foreign_slot_writes(ids, metadatas, self._slot_owners(conn, ids))
             for _id, txt, meta, vec in zip(ids, texts, metadatas, vectors):
-                conn.execute(
+                result = conn.execute(
                     sql,
                     {
                         "node_id": _id,
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
                         "metadata": json.dumps(meta),
                     },
                 )
+                if result.rowcount == 0:
+                    # 층 2. 선검사를 지나친 경쟁만 여기 온다 — 같은 예외 형태로
+                    # 감싸 호출자가 층을 구분하지 않게 한다. 이 예외는
+                    # `engine.begin()` 안이라 배치 전체를 롤백시킨다.
+                    raise ValueError(
+                        "upsert_texts: refusing to take over a slot already "
+                        f"attributed to a different pack ({_id!r}); the row "
+                        "changed attribution between the ownership check and "
+                        "this write"
+                    )
         return ids
+
+    def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
+        """``node_id`` -> 그 슬롯을 소유한 ``pack_id``. 행이 있는 id 만 담는다.
+
+        바인드 하나로 배열을 넘긴다(``_sql_dialect.in_string_array``). 배치 크기는
+        호출자가 정하므로 id 당 바인드 하나로 펼치면 상한에 걸린다. 행이 없는 id 는
+        결과에 없고, 게이트는 그 부재를 "새 슬롯" 으로 읽는다.
+        """
+        from sqlalchemy import text
+
+        frag, transform = POSTGRES.in_string_array("node_id", ":slot_ids")
+        rows = conn.execute(
+            text(f"SELECT node_id, pack_id FROM {self._table} WHERE {frag}"),  # noqa: S608
+            {"slot_ids": transform(list(ids))},
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def delete(self, ids: list[str]) -> None:
         self._require_available()
@@ -526,7 +580,7 @@ class PgVectorStore:
                     sql,
                     {
                         "node_id": record["id"],
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(record["embedding"]),
                         "document": record["document"],
                         "metadata": json.dumps(meta),

@@ -445,10 +445,16 @@ def _reject(message: str, *, hint: str | None = None) -> _RejectedError:
 def _declared_limit_reject(detail: str, *, remedy: str = "rename/remove the conflicting id") -> _RejectedError:
     """A #197-declared-limit preflight rejection (design §12-3): every shape
     this covers is one the store itself already accepts on a normal write
-    path -- it is only FORKING that cannot be made safe for it yet, because
+    path -- it is only FORKING that cannot be made safe for it, because
     identity is not pack-scoped (#197) and the copy would either collide
     with the destination anchor or lose data non-deterministically. Says so
     explicitly rather than reading like the source data itself is broken.
+
+    The message names #197 as WHERE the identity-scope limit is described, not
+    as something to wait for, and it does not state that issue's status --
+    code cannot know it. Slot identity is ``node_id`` alone and forking has to
+    remap ids; the only thing that clears this rejection is fixing the source
+    data, so that is the only remedy the message offers.
 
     ``remedy`` names the action that actually clears the rejection. It
     defaults to the identity-collision wording every caller but one wants;
@@ -457,9 +463,9 @@ def _declared_limit_reject(detail: str, *, remedy: str = "rename/remove the conf
     that does not exist.
     """
     return _reject(
-        f"{detail}; this shape is supported by the store but cannot be "
-        "forked until issue #197 (identity is not pack-scoped) is resolved "
-        f"-- fix the source data ({remedy}) or wait for #197",
+        f"{detail}; this shape is supported by the store but cannot be forked: "
+        "vector slot identity is not pack-scoped (see #197) -- fix the source "
+        f"data ({remedy})",
     )
 
 
@@ -467,7 +473,7 @@ def _store_contract_violation_reject(detail: str) -> _RejectedError:
     """A preflight rejection for a shape that should be UNREACHABLE via the
     store's own write path (design §12-11 contract 5) -- unlike
     ``_declared_limit_reject``, this is NOT "supported by the store but not
-    yet forkable pending #197"; it is a sign the store itself violated its
+    forkable while identity is not pack-scoped"; it is a sign the store violated its
     own contract (e.g. a duplicate primary key the doc store's schema should
     already have prevented from ever being written). Wording says so
     explicitly rather than reading like an ordinary #197 declared limit.
@@ -660,8 +666,9 @@ def _fork_pack_inner(
             # Decided BEFORE the anchor branch below on purpose: a row whose
             # type cannot be determined cannot be judged "is this the anchor"
             # either. Deliberately NOT `_declared_limit_reject` -- that helper
-            # is for shapes #197 resolves and prescribes "rename the colliding
-            # id", neither of which applies to a multi-label node.
+            # is for shapes the #197 identity-scope limit covers and it
+            # prescribes "rename the colliding id", neither of which applies
+            # to a multi-label node.
             raise _reject(
                 f"node {node_id!r} carries more than one domain label "
                 f"({', '.join(repr(name) for name in domain)}); the fork cannot "

@@ -56,6 +56,7 @@ def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -
     import sqlite_vec
 
     from opencrab.locking import close_quietly
+    from opencrab.stores._vector_base import slot_owner
     from opencrab.stores.chroma_store import _sanitize_metadata
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
@@ -127,7 +128,11 @@ def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -
                 rows.append(
                     (
                         _id,
-                        str(clean.get("pack_id", "")),
+                        # `slot_owner` 로 정규화한다(#197). 소유 태그를 읽는 쪽이 그
+                        # 함수이므로 쓰는 쪽도 같아야 한다. `str(x.get(k, ""))` 는 정제가
+                        # 접지 못한 falsy 비문자열(0, False)을 "0"/"False" 로 저장하는데,
+                        # 읽는 쪽은 그것을 미소유로 접어 두 축이 갈린다.
+                        slot_owner(clean),
                         sqlite_vec.serialize_float32(list(emb)),
                         doc or "",
                         json.dumps(clean),
