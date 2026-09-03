@@ -16,8 +16,9 @@ query a live server via tools/list or the ``tool_search`` tool (#135).
 ── R9 패키지 분해 완료 (Stage 10 — 물리 분할 컷오버) ─────────────────────────
 핸들러 본체는 이제 이 파일이 아니라 graph.py / query.py / pack.py / schema.py /
 harness.py / catalog.py 서브모듈에 물리적으로 산다. 이 파일(``__init__.py``)은
-공유 플러밍(``_get_context`` / ``_context`` 딕셔너리 / ``_clean_str`` /
-``_clean_meta`` / 락 헬퍼 / ``WRITE_TOOLS`` / BillingHooks 배선)만 소유하고,
+공유 플러밍(``_get_context`` / ``_context`` 딕셔너리와 그 초기화 락 /
+``_clean_str`` / ``_clean_meta`` / 락 헬퍼 / ``WRITE_TOOLS`` / BillingHooks
+배선)만 소유하고,
 서브모듈 임포트로 ``@tool`` 데코레이터를 실행시켜 등록을 트리거한 뒤, 모든
 공개·과거-임포트 가능 이름을 재노출한다.
 
@@ -34,6 +35,13 @@ Mock)을 읽으므로 패치가 그대로 유효하다. 49개의 기존 ``_get_c
 ``content_pack_list`` 패치 8개(tests/test_mcp.py ×2, tests/
 test_tools_handlers_direct.py ×6) 모두 이 방식으로 무변경 유지된다(직접
 재현·확인함).
+
+**컨텍스트 초기화 직렬화(#192)**: ``_get_context`` 는 최초 호출에서만 스토어를
+만들고, 그 초기화를 모듈 레벨 ``_context_init_lock`` 으로 직렬화한다. 락이 없으면
+두 스레드가 동시에 최초 호출할 때 각자 팩토리를 실행해 같은 백엔드를 가리키는
+인스턴스가 2벌 생기고, 어댑터의 인스턴스 레벨 락이 그 둘 사이에서는 아무것도
+직렬화하지 못한다. 프로세스 **간** 초기화 경합은 여기 소관이 아니라
+``write.lock`` / ``chroma.lock`` 소관이다(#140, #141).
 
 **TOOLS 등록 순서**: 골든 스냅샷(tests/test_tool_registry_contract.py) 순서는
 그래프→쿼리→그래프→쿼리→팩→스키마→팩→하네스로 모듈 경계를 넘나들며
