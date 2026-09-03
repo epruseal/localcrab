@@ -18,33 +18,54 @@ DESIGN CHOICE (plain functions, not a base class): the three stores keep
     plain functions keep each store's adopter change to "call this instead of
     inlining it," which is the mechanical-dedup goal.
 
-CONTRACT — slot identity is node_id alone (last-writer-wins across packs):
-    All three stores key their vector row/record by ``node_id`` — none of
-    ``add_texts``/``upsert_texts`` qualifies that key by ``pack_id``. When two
-    packs produce the same ``node_id`` (shared evidence/chunk id), the second
-    writer's ``upsert_texts`` silently takes over the slot: vec0's
-    ``upsert_texts`` does ``DELETE FROM {table} WHERE node_id = ?`` with no
-    pack predicate (any pack's row at that id is deleted) then re-INSERTs the
-    caller's pack/document/embedding/metadata; pgvector's ``upsert_texts`` does
-    ``INSERT ... ON CONFLICT (node_id) DO UPDATE SET pack_id = EXCLUDED.pack_id,
-    embedding = EXCLUDED.embedding, document = EXCLUDED.document, metadata =
-    EXCLUDED.metadata`` (every column overwritten); Chroma's ``upsert_texts``
-    deletes the existing record and re-adds it (see the full-replace contract
-    below), so it too lands the whole slot on the caller's values.
+CONTRACT — an owned slot may only be rewritten by its owner [#197]:
+    All three stores key their vector row/record by ``node_id``, and that key
+    is NOT qualified by ``pack_id``. Two packs can therefore produce the same
+    ``node_id`` (a shared evidence/chunk id) and land on one slot. Until #197
+    the second writer silently won it: vec0's ``upsert_texts`` deleted by
+    ``node_id`` with no pack predicate then re-INSERTed the caller's row;
+    pgvector's ``ON CONFLICT (node_id) DO UPDATE`` overwrote every column
+    including ``pack_id``; Chroma's replaced the record outright. The first
+    pack's document and embedding were gone, and a query scoped to that pack
+    returned nothing — measured on all three backends.
 
-    The upshot: going through ``upsert_texts`` never leaves a **partially**
-    contaminated row (mixed pack A/B fields) — whichever caller writes last
-    owns the whole slot. What it does NOT provide is pack-qualified identity:
-    nothing stops a second pack from taking over a slot a first pack already
-    owns, because there is no per-pack namespacing of ``node_id`` at this
-    layer. Metadata-only update paths (``opencrab/pack/load.py:_vec_meta_update``)
-    must not bypass this — they check the existing row's ``pack_id`` before
-    patching only the metadata column/field, and fall back to
-    ``upsert_texts`` (full-slot rewrite) on any mismatch, so the only surface
-    that could otherwise partially contaminate a foreign pack's row (edit
-    metadata in place while document/embedding/pack_id stay foreign) is
-    closed. See ``_vec_meta_update``'s docstring for the exact reasoning and
-    the open follow-up (pack-qualified slot identity, localcrab#172/#182).
+    ``upsert_texts`` now REFUSES such a write. Per id: no existing row -> pass;
+    existing row unowned (``pack_id`` empty, absent, or None) -> pass, because
+    backfill and migration take those over on purpose; existing owner equals
+    the incoming pack -> pass, the ordinary re-ingest; otherwise -> ValueError,
+    the incoming pack being unowned included. One batch that names two
+    different packs for one id is refused as well, before the store is read:
+    on an empty slot both records look new, and write order must not be what
+    decides the owner. The whole batch is judged before any of it is applied,
+    so a rejected batch leaves no partial write. See ``slot_owner``,
+    ``reject_batch_pack_conflicts`` and ``reject_foreign_slot_writes``.
+
+    ENFORCEMENT IS TWO LAYERS, and they are not redundant. The pre-check above
+    judges the batch and produces the caller's error. On top of it the SQL
+    backends put the ownership predicate in the write statement itself — vec0
+    deletes only its own or an unowned row (a foreign row survives and the
+    following INSERT fails on the primary key), pgvector guards its
+    ``DO UPDATE`` with a ``WHERE`` on the stored ``pack_id`` and reads
+    ``rowcount == 0`` as the violation. That layer closes the window between
+    the pre-check's unlocked SELECT and the write, in which another process
+    can change the slot's owner; both raise inside a transaction, so the batch
+    rolls back. Chroma has no equivalent: no conditional write, no
+    transaction, and its cross-process lock is shared and MCP-only (#140), so
+    there the pre-check plus the store's in-process lock is the whole of it.
+    Cross-process serialisation was never offered at this layer and still is
+    not — that stays the caller's ``opencrab/locking.py`` write.lock
+    discipline, as ``chroma_store.upsert_texts`` documents at length.
+
+    WHAT THIS DOES NOT COVER. Writes only. ``delete(ids)`` still removes any
+    pack's row at a given id; scoping deletion is a separate axis.
+    ``add_texts`` is not gated either — its ids are time-salted, and the SQL
+    backends already reject a duplicate primary key. A slot that a foreign
+    pack took over BEFORE this gate existed is not healed by it; the gate only
+    stops new ones. Metadata-only update paths
+    (``opencrab/pack/load.py:_vec_meta_update``) do not bypass any of this:
+    they check the existing row's ``pack_id`` before patching the metadata
+    column and fall back to ``upsert_texts`` on a mismatch, which now refuses
+    rather than rewriting the slot. See ``docs/vector-backends.md`` §8.2.
 
 CONTRACT — ``upsert_texts(texts, metadatas, ids)`` full-replace semantics
     [#175]: for an id that already exists, the store MUST replace the
@@ -87,8 +108,11 @@ CONTRACT -- pack-scoped raw vector export/import [#200]
 
     - **ADD semantics, never upsert.** Slot identity is ``node_id`` alone and
       global (see the CONTRACT above), so an upsert-flavoured import would
-      silently take over a slot another pack already owns. An id that already
-      exists therefore RAISES. The exception type is each backend's own --
+      aim at a slot another pack may already own. An id that already
+      exists therefore RAISES -- unconditionally, which is STRICTER than the
+      write gate above: that one lets a pack rewrite its own slot, while an
+      import that lands on ANY existing id is a fork with unmapped ids and is
+      refused whoever owns it. The exception type is each backend's own --
       sqlite-vec ``OperationalError`` (UNIQUE), pgvector ``IntegrityError``,
       chroma ``ValueError`` from this layer's own pre-check, because chroma's
       ``add()`` on an existing id is a SILENT no-op (measured on 1.5.9) and

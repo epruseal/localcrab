@@ -494,22 +494,60 @@ record = {"id": str, "embedding": list[float],
 재현: `tests/test_vector_raw_contract.py::TestRoundTrip::test_embedding_survives_the_round_trip`
 (`sqlite-vec` 축은 확장 모듈이 없으면 skip 된다 — 아래 8.5).
 
-### 8.2 정체성 제약 — `node_id` 단독 전역 유일 (#197 정합)
+### 8.2 정체성 제약 — 슬롯 키는 `node_id` 단독, 소유는 `pack_id` 가 지킨다 (#197)
 
-슬롯 키는 `node_id` 하나이고 **팩으로 한정되지 않는다.**
+슬롯 키는 `node_id` 하나이고 **팩으로 한정되지 않는다.** 그래서 서로 다른 팩이 같은 `node_id` 를
+낼 수 있다. #197 이전에는 마지막에 쓴 팩이 그 슬롯을 통째로 가져갔고, 먼저 쓴 팩의 문서와
+임베딩이 조용히 사라졌으며 그 팩으로 스코프한 질의가 0건이 됐다. 세 백엔드 전부 같은 결과였다.
 
-| 백엔드 | 다른 팩에 같은 `node_id` 를 add | 동작 |
+**`upsert_texts` 는 이제 그런 쓰기를 거부한다.** 계약은 한 문장이다: **소유된 슬롯은 그 소유자만
+다시 쓴다.**
+
+| 기존 행의 `pack_id` | 들어오는 meta 의 `pack_id` | 판정 |
 |---|---|---|
-| `sqlite-vec` | vec0 TEXT PRIMARY KEY | 거부(`UNIQUE constraint failed`) |
-| `pgvector` | PK | 거부(`UniqueViolation`) |
-| `chroma` | — | **거부하지 않는다. 조용히 무시된다** — 기존 레코드가 이긴다 |
+| 행 없음 | 무엇이든 | 통과(신규 슬롯) |
+| 비어 있음(`""`·부재·`None`) | 무엇이든 | 통과(미소유 슬롯 인수 — 백필·마이그레이션이 쓰는 경로) |
+| 비어 있지 않음, 같음 | 같음 | 통과(자기 팩 재적재) |
+| 비어 있지 않음 | 다름(빈 값 포함) | **거부(`ValueError`)** |
 
-chroma 만 fail-open 이라 `ChromaStore.import_vectors` 가 **스토어 안에서** 중복을 선검사해
-거부한다. 그래서 "이미 있는 id 는 예외"는 세 백엔드에서 모두 성립한다. **예외 타입은 통일하지
-않는다**(각 백엔드의 것이 그대로 올라온다) — 호출자는 타입으로 분기하지 말고 "예외 = 이 배치
-실패"로 다루고 보상한다.
+한 배치가 같은 id 를 서로 다른 팩으로 두 번 담아도 거부한다. 빈 슬롯에서는 두 레코드가 모두
+"행 없음" 으로 읽히므로, 쓰기 순서가 소유자를 정하게 두지 않는다. 배치는 적용 전에 통째로
+판정되므로 거부된 배치는 부분 적용을 남기지 않는다.
 
-**따라서 fork 는 id 재매핑이 필수다.** 근본 해소는 #197(pack-qualified identity)이다.
+**강제는 두 층이다.** 선검사가 배치를 판정하고 호출자가 보는 오류를 만든다. 그 위에 SQL 두
+백엔드는 쓰기문 자신에 소유권 술어를 둔다. vec0 은 자기 행이나 미소유 행만 지우고(남의 행이
+살아남아 뒤이은 INSERT 가 기본키 충돌로 실패한다), pgvector 는 `DO UPDATE` 에 저장된 `pack_id`
+술어를 걸고 `rowcount == 0` 을 위반으로 읽는다. 이 층은 선검사의 잠금 없는 SELECT 와 쓰기 사이에
+다른 프로세스가 소유자를 바꾸는 창을 닫으며, 둘 다 트랜잭션 안이라 배치가 롤백된다. chroma 는
+조건부 쓰기도 트랜잭션도 없고 프로세스 간 잠금이 공유 락이며 MCP 전용이라(#140) 선검사와
+프로세스 내 락까지가 한계다. 프로세스 간 직렬화는 종전에도 이 계층이 제공하지 않았고 지금도
+호출자의 `write.lock` 규율이다.
+
+**계약 밖**: 쓰기만 규율한다. `delete(ids)` 는 여전히 팩을 가리지 않고 그 id 의 행을 지운다.
+`add_texts` 도 게이트를 걸지 않는다(시간 소금 id 이고 SQL 두 백엔드가 중복 기본키를 이미 거부한다).
+게이트 도입 이전에 이미 넘어간 슬롯은 치유하지 않는다.
+
+한 배치 안의 **같은 팩** 중복 id 는 이 이슈와 무관해 백엔드별 현행 동작을 그대로 둔다.
+
+| 백엔드 | 같은 팩 중복 id 한 배치 | 다른 팩에 같은 `node_id` 를 add |
+|---|---|---|
+| `sqlite-vec` | 통과, 마지막 값이 남는다 | 거부(`UNIQUE constraint failed`) |
+| `pgvector` | 통과, 마지막 값이 남는다 | 거부(`UniqueViolation`) |
+| `chroma` | 거부(`DuplicateIDError`) | **거부하지 않는다. 조용히 무시된다** — 기존 레코드가 이긴다 |
+
+`add` 축에서 chroma 만 fail-open 이라 `ChromaStore.import_vectors` 가 **스토어 안에서** 중복을
+선검사해 거부한다. 그래서 "이미 있는 id 는 예외"는 세 백엔드에서 모두 성립한다. **예외 타입은
+통일하지 않는다**(각 백엔드의 것이 그대로 올라온다) — 호출자는 타입으로 분기하지 말고 "예외 =
+이 배치 실패"로 다루고 보상한다. 쓰기 게이트가 내는 `ValueError` 는 이 계층 자신의 판정이라
+예외지만, 호출자 규칙은 같다.
+
+`import_vectors` 는 쓰기 게이트보다 **엄격하다**. 게이트는 팩이 자기 슬롯을 다시 쓰는 것을
+허용하지만, import 는 이미 있는 id 를 소유자와 무관하게 거부한다. **따라서 fork 는 id 재매핑이
+필수다.**
+
+재현: `pytest tests/test_vector_slot_ownership.py`,
+`pytest tests/test_store_concurrency.py -k SlotOwnership`,
+`pytest tests/test_pack_load.py -k SlotOwnershipThroughTheRealStores`
 
 ### 8.3 호출자가 재작성해야 하는 것
 
