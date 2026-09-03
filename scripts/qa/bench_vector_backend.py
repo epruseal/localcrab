@@ -496,6 +496,8 @@ def main() -> int:
             f"pack_id TEXT partition key, embedding float[{DIM}] distance_metric=cosine)"
         )
 
+        from opencrab.stores._vector_base import slot_owner
+
         # stream + insert + reservoir-sample query vectors
         q_ids: list[str] = []
         q_vecs: list[bytes] = []
@@ -516,7 +518,10 @@ def main() -> int:
             for _id, emb, meta in zip(ids, embs, metas):
                 vec = list(emb)
                 rows.append(
-                    (_id, str((meta or {}).get("pack_id", "")),
+                    # `slot_owner` 로 정규화한다. `str(x.get(k, ""))` 는 키가 있고
+                    # 값이 None 일 때 리터럴 "None" 을 만들고, 그 값은 소유 게이트에서
+                    # 미소유로도 소유로도 읽히지 않는다(#197).
+                    (_id, slot_owner(meta),
                      sqlite_vec.serialize_float32(vec))
                 )
                 # reservoir sample

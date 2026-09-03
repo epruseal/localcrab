@@ -560,21 +560,20 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
     `WHERE node_id = ?` 는 **남의 행의 metadata 만** 갈아치우고 성공을
     반환한다 — 남의 `pack_id`·`document`·`embedding` 은 그대로인 채(부분
     오염) 호출자는 doc 기준을 전진시킨다. False 로 물러나면 호출자가
-    `upsert_texts` 재임베딩으로 우회하고, 그 우회는 아래 **"last-writer-wins
-    슬롯 정체성"** 계약에 따라 슬롯 전체를 현재 팩 값으로 일관되게 넘긴다.
+    `upsert_texts` 재임베딩으로 우회하고, **그 우회는 이제 거부된다**(아래).
 
-    **"last-writer-wins 슬롯 정체성" (닫지 않은 경계, `_vector_base.py`
-    모듈 docstring 의 CONTRACT 절 참고)**: 이 함수의 pack 스코프는 **메타
-    전용 fast-path 의 부분 오염만** 막는다. vector 계층의 슬롯 정체성 자체는
-    **`node_id` 단독**이라(pack-qualified 가 아니다), False 이후 호출자의
-    `upsert_texts`(vec0 `DELETE WHERE node_id`=전 팩, pgvector
-    `ON CONFLICT(node_id)`=pack_id 덮음, chroma 동일 id upsert)는 그 슬롯을
-    **누가 마지막에 썼든** 그 팩 값으로 통째로 재작성한다 — 부분 오염은
-    아니지만(관찰 가능한 모든 축이 현재 팩과 일관된다), pack-qualified 슬롯
-    정체성 재설계 없이는 "슬롯 자체를 남의 팩이 차지하는 것"은 막지 못한다.
-    후속 이슈: "vector 슬롯 정체성이 node_id 단독이라 팩 간 공유 id 는
-    last-writer-wins — pack-qualified 정체성 필요 여부"(localcrab, m4 의
-    vector_ambiguous·#182 상호 참조).
+    **[#197] 우회 뒤에 무슨 일이 벌어지는가**: 이 함수의 pack 스코프는 **메타
+    전용 fast-path 의 부분 오염만** 막는다. 슬롯 자체를 남의 팩이 차지하는 것은
+    벡터 스토어의 쓰기 게이트가 막는다(`_vector_base.py` 모듈 docstring 의
+    소유권 CONTRACT). 종전에는 False 이후의 `upsert_texts` 가 슬롯을 통째로
+    현재 팩 값으로 재작성했고, 부분 오염은 아니었지만 먼저 쓴 팩의 문서와
+    임베딩이 사라졌다. 이제 그 호출이 `ValueError` 를 낸다.
+
+    호출자에게 그것은 청크 실패다. `load_chunks`/`load_chunks_incremental` 의
+    배치 `flush` 가 예외를 잡아 건별 재시도로 분해하고, 건별로도 실패하면 `err`
+    을 올리고 경고를 남긴다. doc 기준선이 전진하지 않으므로 다음 증분이
+    재시도하고, 충돌이 그대로면 계속 실패한다. 그것이 받아들이는 결과다.
+    시끄러운 실패가 조용한 소실보다 낫다.
 
     **chroma 분기의 한계(2026-08-13 실측 근거)**: chromadb 1.5.7 의 `update`/`upsert`
     는 메타를 **병합**하고(겹치는 키만 갱신, 그 외 키는 존속) `delete`+`add` 만
