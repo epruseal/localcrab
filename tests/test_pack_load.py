@@ -2101,8 +2101,20 @@ class _FakeChromaVec:
         `.upsert()` 로 넘긴다. `load_chunks_incremental` 의 재임베딩 폴백 경로가
         이 메서드를 통해서만 벡터스토어에 닿으므로, R1 통합 게이트(⑫⑭)가 이 메서드를
         거친다."""
+        from opencrab.stores._vector_base import (
+            reject_batch_pack_conflicts,
+            reject_foreign_slot_writes,
+        )
+        ids = list(ids) if ids is not None else []
+        metas = list(metadatas) if metadatas is not None else [{}] * len(ids)
+        reject_batch_pack_conflicts(ids, metas)
+        reject_foreign_slot_writes(
+            ids, metas,
+            {i: (self._collection.metas.get(i) or {}).get("pack_id")
+             for i in ids if i in self._collection.metas},
+        )
         self._collection.upsert(ids=ids, documents=list(texts), metadatas=metadatas)
-        return list(ids) if ids is not None else []
+        return list(ids)
 
 
 class TestChromaBackendBranches:
@@ -3317,9 +3329,24 @@ class _SqlAlchemyVecLike:
         import json as _json
 
         from sqlalchemy import text
+
+        from opencrab.stores._vector_base import (
+            reject_batch_pack_conflicts,
+            reject_foreign_slot_writes,
+        )
         ids = list(ids or [])
         texts = list(texts)
         metadatas = list(metadatas) if metadatas is not None else [{}] * len(texts)
+        reject_batch_pack_conflicts(ids, metadatas)
+        owners = {}
+        with self._engine.connect() as conn:
+            for _id in ids:
+                row = conn.execute(
+                    text(f"SELECT pack_id FROM {self._table} WHERE node_id = :i"),
+                    {"i": _id}).fetchone()
+                if row is not None:
+                    owners[_id] = row[0]
+        reject_foreign_slot_writes(ids, metadatas, owners)
         with self._engine.begin() as conn:
             for _id, txt, meta in zip(ids, texts, metadatas):
                 conn.execute(text(
@@ -3437,15 +3464,31 @@ class _SqlVecMetaLike:
     def upsert_texts(self, texts, metadatas=None, ids=None):
         """실 `SqliteVecStore.upsert_texts`(vec0)의 DELETE-then-INSERT 계약을
         흉내낸다 — vec0 는 네이티브 UPSERT 가 없어 id 별 DELETE 뒤 INSERT 다.
-        **DELETE 는 `node_id` 술어뿐, pack 무관**이다(실 스토어와 동일 — `_vector_base.py`
-        모듈 docstring 의 CONTRACT 절, "last-writer-wins 슬롯 정체성" 참고) — 남의
-        팩 행이라도 지우고 현재 팩 값으로 새로 짓는다. `load_chunks_incremental`
+        **DELETE 는 소유 팩으로 한정된다**(실 스토어와 동일 — `_vector_base.py`
+        모듈 docstring 의 소유권 CONTRACT, #197) — 남의 팩 행은 지우지 못한다.
+        `load_chunks_incremental`
         의 재임베딩 폴백이 실제로 부르는 메서드라 이 더블에도 있어야 그 경로가
-        지나간다(#172 V1 게이트: fast-path False 이후의 실제 호출자 경로)."""
+        지나간다(#172 V1 게이트: fast-path False 이후의 실제 호출자 경로).
+
+        소유권 게이트를 더블에도 두는 이유: 이 더블이 실 스토어보다 관대하면 여기
+        걸린 테스트가 **실 스토어에서 이미 사라진 계약을 계속 통과시킨다.**"""
         import json as _json
+
+        from opencrab.stores._vector_base import (
+            reject_batch_pack_conflicts,
+            reject_foreign_slot_writes,
+        )
         ids = list(ids or [])
         texts = list(texts)
         metadatas = list(metadatas) if metadatas is not None else [{}] * len(texts)
+        reject_batch_pack_conflicts(ids, metadatas)
+        owners = {}
+        for _id in ids:
+            row = self._conn.execute(
+                f"SELECT pack_id FROM {self._table} WHERE node_id = ?", (_id,)).fetchone()
+            if row is not None:
+                owners[_id] = row[0]
+        reject_foreign_slot_writes(ids, metadatas, owners)
         for _id, txt, meta in zip(ids, texts, metadatas):
             self._conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
             self._conn.execute(
@@ -3461,10 +3504,17 @@ class TestVecMetaUpdatePackScope:
 
     V1: 공유 node_id 를 다른 팩이 먼저 차지한 상태에서 fast-path 는 **False** 로
     물러나야 하고(부분 오염 금지), 그 이후 **실제 호출자 경로**(`load_chunks_incremental`
-    의 재임베딩 폴백 → `upsert_texts`)까지 실행하면 슬롯이 "현재 팩의 완전한
-    행"(pack_id/document/metadata 전부 현재 팩 값)으로 넘어가야 한다 — fast-path
-    단독 검사만으로는 공허하다(codex 재리뷰 지적, `_vec_meta_update` docstring의
-    "last-writer-wins 슬롯 정체성" 절 참고).
+    의 재임베딩 폴백 → `upsert_texts`)까지 실행하면 그 폴백이 **거부되고 남의 팩
+    행이 무손상으로 남아야** 한다 — fast-path 단독 검사만으로는 공허하다(codex
+    재리뷰 지적).
+
+    **[#197] 이 클래스의 V1 계약은 뒤집혔다.** 종전에는 폴백이 슬롯을 "현재 팩의
+    완전한 행"으로 넘겨받는 것이 옳은 결과였고 `err == 0` 을 요구했다. 그것이
+    바로 #197 이 결함으로 부른 동작이다 — 먼저 쓴 팩의 문서와 임베딩이 조용히
+    사라졌다. 이제 벡터 스토어가 남의 팩 슬롯으로 가는 쓰기를 거부하므로, 그
+    청크는 실패로 세어지고(`err`) doc 기준선이 전진하지 않아 다음 증분이
+    재시도한다. 재시도도 같은 이유로 계속 실패한다. 그것이 받아들이는 결과다:
+    시끄러운 실패가 조용한 소실보다 낫다.
     V2: 자기 팩 소유 행은 종전대로 메타만 갱신되고 True.
     """
 
@@ -3481,7 +3531,12 @@ class TestVecMetaUpdatePackScope:
         assert vec.row("c1") == ("pack-a", "본문A", a_meta), (
             "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
 
-    def test_sql_vec0_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
+    def test_sql_vec0_cross_pack_full_caller_path_is_rejected_and_keeps_the_owners_row(self, pack_sql):
+        """[#197] 남의 팩 슬롯으로 가는 재임베딩 폴백은 거부되고, 그 청크는
+        실패로 세어진다. 남의 행은 무손상이다.
+
+        종전 이름은 `..._ends_with_a_complete_pack_b_row` 였고 `err == 0` 과
+        슬롯이 팩 B 로 넘어가는 것을 요구했다. 그 요구가 #197 의 결함이다."""
         vec = _SqlVecMetaLike()
         vec.seed("c1", "pack-a", "본문", {"pack_id": "pack-a", "document_id": "docA"})
 
@@ -3500,14 +3555,12 @@ class TestVecMetaUpdatePackScope:
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
-        assert err == 0
-        assert (c_txt, c_meta) == (1, 0), (
-            "cross-pack fast-path 는 False 여야 하고 재임베딩(txt) 경로로 우회해야 한다 "
-            f"(실제 c_txt={c_txt} c_meta={c_meta})")
-        got = vec.row("c1")
-        new_b_meta = transform_chunk_meta("pack-b", new_row)
-        assert got == ("pack-b", "본문", new_b_meta), (
-            f"최종 상태가 '팩 B 의 완전한 행'이 아니다(부분 오염): {got}")
+        assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
+        assert (c_txt, c_meta) == (0, 0), (
+            "거부된 청크가 진전으로 세어졌다 "
+            f"(c_txt={c_txt} c_meta={c_meta})")
+        assert vec.row("c1") == ("pack-a", "본문", {"pack_id": "pack-a", "document_id": "docA"}), (
+            f"팩 A 의 행이 건드려졌다: {vec.row('c1')}")
 
     def test_sql_vec0_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
         vec = _SqlVecMetaLike()
@@ -3539,10 +3592,16 @@ class TestVecMetaUpdatePackScope:
         assert vec.full_row("c1") == ("pack-a", "본문A", a_meta), (
             "fast-path False 인데도 남의 행이 건드려졌다 — 부분 오염")
 
-    def test_pgvector_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
+    def test_pgvector_cross_pack_full_caller_path_is_rejected_and_keeps_the_owners_row(self, pack_sql):
+        """[#197] 남의 팩 슬롯으로 가는 재임베딩 폴백은 거부되고, 그 청크는
+        실패로 세어진다. 남의 행은 무손상이다.
+
+        종전 이름은 `..._ends_with_a_complete_pack_b_row` 였고 `err == 0` 과
+        슬롯이 팩 B 로 넘어가는 것을 요구했다. 그 요구가 #197 의 결함이다."""
         vec = _SqlAlchemyVecLike()
         vec.seed("pack-a", ["c1"])
         vec.set_meta("c1", {"pack_id": "pack-a", "document_id": "docA"})
+        before = vec.full_row("c1")
 
         # `document_id` 대신 `tag` 로 메타를 갈린다(위 sql(vec0) 케이스의 주석 참고).
         old_row = _chunk_row("c1", "본문", tag="B-old")
@@ -3557,12 +3616,11 @@ class TestVecMetaUpdatePackScope:
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
-        assert err == 0
-        assert (c_txt, c_meta) == (1, 0)
-        got = vec.full_row("c1")
-        new_b_meta = transform_chunk_meta("pack-b", new_row)
-        assert got == ("pack-b", "본문", new_b_meta), (
-            f"최종 상태가 '팩 B 의 완전한 행'이 아니다(부분 오염): {got}")
+        assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
+        assert (c_txt, c_meta) == (0, 0), (
+            f"거부된 청크가 진전으로 세어졌다 (c_txt={c_txt} c_meta={c_meta})")
+        assert vec.full_row("c1") == before, (
+            f"팩 A 의 행이 건드려졌다: {vec.full_row('c1')} (전: {before})")
 
     def test_pgvector_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
         from sqlalchemy import text as _sa_text
@@ -3596,10 +3654,17 @@ class TestVecMetaUpdatePackScope:
             "fast-path False 인데도 남의 행 메타가 건드려졌다 — 부분 오염")
         assert vec._collection.documents["c1"] == "본문A"
 
-    def test_chroma_cross_pack_full_caller_path_ends_with_a_complete_pack_b_row(self, pack_sql):
+    def test_chroma_cross_pack_full_caller_path_is_rejected_and_keeps_the_owners_row(self, pack_sql):
+        """[#197] 남의 팩 슬롯으로 가는 재임베딩 폴백은 거부되고, 그 청크는
+        실패로 세어진다. 남의 행은 무손상이다.
+
+        종전 이름은 `..._ends_with_a_complete_pack_b_row` 였고 `err == 0` 과
+        슬롯이 팩 B 로 넘어가는 것을 요구했다. 그 요구가 #197 의 결함이다."""
         vec = _FakeChromaVec({})
         vec._collection.seed("c1", pack_id="pack-a", embedding=[0.1, 0.2], document="본문",
                               metadata={"pack_id": "pack-a", "document_id": "docA"})
+        before_meta = dict(vec._collection.metas["c1"])
+        before_doc = vec._collection.documents["c1"]
 
         # `document_id` 대신 `tag` 로 메타를 갈린다(위 sql(vec0) 케이스의 주석 참고).
         old_row = _chunk_row("c1", "본문", tag="B-old")
@@ -3614,13 +3679,13 @@ class TestVecMetaUpdatePackScope:
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
         c_new, c_txt, c_meta, c_same, err, _bypack = stats
 
-        assert err == 0
-        assert (c_txt, c_meta) == (1, 0)
-        new_b_meta = transform_chunk_meta("pack-b", new_row)
-        assert vec._collection.metas["c1"] == new_b_meta, (
-            f"최종 메타가 팩 B 완전한 값이 아니다: {vec._collection.metas.get('c1')}")
-        assert vec._collection.documents["c1"] == "본문", (
-            "최종 document 가 팩 B 값이 아니다")
+        assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
+        assert (c_txt, c_meta) == (0, 0), (
+            f"거부된 청크가 진전으로 세어졌다 (c_txt={c_txt} c_meta={c_meta})")
+        assert vec._collection.metas["c1"] == before_meta, (
+            f"팩 A 의 메타가 건드려졌다: {vec._collection.metas.get('c1')}")
+        assert vec._collection.documents["c1"] == before_doc, (
+            "팩 A 의 document 가 건드려졌다")
 
     def test_chroma_same_pack_meta_only_update_is_true_and_touches_only_metadata(self):
         vec = _FakeChromaVec({})
@@ -4591,3 +4656,68 @@ class TestLoaderReplaysServerStampedIdentity:
         assert row["owner_id"] == _LIVE_TEST_USER, (
             "the importing principal must own the reloaded row, not the dump's author"
         )
+
+
+class TestSlotOwnershipThroughTheRealStores:
+    """[#197] 더블이 아니라 실 스토어를 태워 교차 팩 청크의 결과를 고정한다.
+
+    바로 위 `TestVecMetaUpdatePackScope` 는 세 백엔드 형태를 더블로 태운다.
+    더블만으로 계약을 고정하면 더블과 실 스토어가 갈라져도 아무도 모르므로,
+    같은 시나리오를 실 `SqliteVecStore` 와 실 `ChromaStore` 로도 한 번 태운다.
+    """
+
+    @pytest.fixture(params=["sqlite-vec", "chroma"])
+    def real_vec(self, request, tmp_path):
+        import sys
+
+        sys.path.insert(0, str(pathlib.Path(__file__).parent))
+        from _vec_helpers import build_vector_store
+
+        store = build_vector_store(request.param, tmp_path / "realvec")
+        assert store.available
+        yield store
+        if hasattr(store, "close"):
+            store.close()
+
+    def test_cross_pack_chunk_is_counted_as_an_error_and_the_owner_survives(
+        self, real_vec, pack_sql
+    ):
+        """오류: 팩 A 가 가진 청크 id 를 팩 B 가 적재하면 err 로 세어지고
+        팩 A 의 벡터가 그대로 남는다.
+
+        종전에는 이 경로가 조용히 성공해 팩 A 의 문서와 임베딩이 사라졌다.
+        """
+        real_vec.upsert_texts(
+            texts=["팩 A 의 본문"],
+            metadatas=[{"pack_id": "pack-a", "document_id": "docA"}],
+            ids=["c1"],
+        )
+
+        new_row = _chunk_row("c1", "팩 B 의 본문", tag="B")
+        chunks_file = _write_jsonl_chunks_tmp([new_row])
+
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-b", chunks_file, real_vec, _NullDocs(), {}, sql=pack_sql)
+        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+
+        assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
+        assert c_new == 0, f"거부된 청크가 신규로 세어졌다 (c_new={c_new})"
+
+        hit = real_vec.get_by_id("c1")
+        assert hit["metadata"]["pack_id"] == "pack-a", "슬롯이 팩 B 로 넘어갔다"
+        assert hit["document"] == "팩 A 의 본문", "팩 A 의 문서가 바뀌었다"
+
+    def test_same_pack_chunk_still_loads(self, real_vec, pack_sql):
+        """정상: 자기 팩 청크 적재는 게이트에 걸리지 않는다(비회귀)."""
+        chunks_file = _write_jsonl_chunks_tmp([_chunk_row("c9", "팩 B 의 본문", tag="B")])
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            stats = pack_load.load_chunks_incremental(
+                "pack-b", chunks_file, real_vec, _NullDocs(), {}, sql=pack_sql)
+        c_new, _c_txt, _c_meta, _c_same, err, _bypack = stats
+
+        assert err == 0, f"정상 적재가 실패했다 (err={err})"
+        assert c_new == 1
+        assert real_vec.get_by_id("c9")["metadata"]["pack_id"] == "pack-b"

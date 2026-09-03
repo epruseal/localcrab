@@ -743,3 +743,82 @@ class TestMultiStoreFanout:
         assert errors == [], f"다중 스토어 fan-out 에러: {errors}"
         assert graph_store.count_nodes("T") == N * M
         assert sql_doc_store.collection_stats()["nodes"] == N * M
+
+
+# ---------------------------------------------------------------------------
+# [#197] 슬롯 소유권 — 빈 슬롯 하나를 두고 팩들이 실제로 경합한다
+# ---------------------------------------------------------------------------
+
+
+class TestPgVectorSlotOwnershipUnderContention:
+    """소유권 게이트가 실경합에서도 슬롯 하나에 소유자 하나만 남긴다.
+
+    순차 테스트(`tests/test_vector_slot_ownership.py`)는 선검사와 쓰기문 술어를
+    각각 확인한다. 그러나 술어가 존재하는 이유는 **선검사의 SELECT 와 쓰기 사이에
+    다른 트랜잭션이 끼어드는 창**이고, 그 창은 겹쳐 실행해야만 열린다. 스레드마다
+    풀에서 별도 커넥션을 받으므로 여기서는 진짜 동시 트랜잭션이 된다.
+    """
+
+    def test_racing_packs_leave_exactly_one_owner_and_a_consistent_row(
+        self, pg_vector_store
+    ):
+        """정상: 여러 팩이 같은 빈 슬롯에 동시에 써도 승자는 하나다.
+
+        패자는 전부 ValueError 로 떨어지고, 남은 행은 승자 팩의 문서와 소유
+        태그가 짝을 이룬다. 한 팩의 문서에 다른 팩의 소유 태그가 붙는 섞인
+        상태가 나오면 이 단언이 깨진다.
+        """
+        N = 8
+
+        def worker(tid: int) -> None:
+            pg_vector_store.upsert_texts(
+                texts=[f"pack{tid} 의 문서"],
+                metadatas=[{"pack_id": f"pack{tid}"}],
+                ids=["contested"],
+            )
+
+        errors = run_threads(worker, N)
+
+        assert len(errors) == N - 1, (
+            f"승자가 하나가 아니다 — 실패 {len(errors)}건, 기대 {N - 1}건: {errors}")
+        assert all(isinstance(exc, ValueError) for exc in errors), (
+            f"소유권 거부가 아닌 예외가 섞였다: {[type(e).__name__ for e in errors]}")
+
+        hit = pg_vector_store.get_by_id("contested")
+        assert hit is not None, "경합 끝에 슬롯이 사라졌다"
+        owner = hit["metadata"]["pack_id"]
+        assert hit["document"] == f"{owner} 의 문서", (
+            f"문서와 소유 태그가 어긋났다 — owner={owner!r} document={hit['document']!r}")
+        assert pg_vector_store.count() == 1
+
+    def test_the_write_statement_alone_survives_the_race(
+        self, pg_vector_store, monkeypatch
+    ):
+        """핵심: 선검사를 끈 채 경합해도 승자는 여전히 하나다.
+
+        선검사가 살아 있으면 대부분의 패자가 그 단계에서 걸러져 쓰기문 술어가
+        경합을 실제로 겪지 않는다. 여기서는 선검사를 통과만 시켜, `ON CONFLICT`
+        의 소유권 술어 하나로 경합이 판정되는지 본다. 이 테스트가 통과하려면
+        술어가 충돌 행을 잠근 채 평가돼야 한다.
+        """
+        monkeypatch.setattr(
+            "opencrab.stores.pg_vector_store.reject_foreign_slot_writes",
+            lambda *a, **k: None,
+        )
+        N = 8
+
+        def worker(tid: int) -> None:
+            pg_vector_store.upsert_texts(
+                texts=[f"pack{tid} 의 문서"],
+                metadatas=[{"pack_id": f"pack{tid}"}],
+                ids=["contested"],
+            )
+
+        errors = run_threads(worker, N)
+
+        assert len(errors) == N - 1, (
+            f"쓰기문 술어만으로 승자가 하나가 되지 않았다 — 실패 {len(errors)}건: {errors}")
+        hit = pg_vector_store.get_by_id("contested")
+        owner = hit["metadata"]["pack_id"]
+        assert hit["document"] == f"{owner} 의 문서"
+        assert pg_vector_store.count() == 1

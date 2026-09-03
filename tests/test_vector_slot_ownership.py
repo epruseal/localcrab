@@ -189,3 +189,78 @@ class TestBatchBehaviour:
             call()
             assert store.get_by_id("dup")["document"] == "둘째 값"
             assert store.count() == 1
+
+
+# ---------------------------------------------------------------------------
+# 엣지 — 층 2 (쓰기문 자신의 강제)
+# ---------------------------------------------------------------------------
+
+
+SQL_BACKENDS = ["sqlite-vec", "pg"]
+
+
+@pytest.fixture(params=SQL_BACKENDS)
+def sql_store(request, tmp_path):
+    """SQL 두 백엔드만. chroma 는 층 2 를 가질 수 없어 이 축에서 제외한다 —
+    조건부 쓰기도 트랜잭션도 없고 프로세스 간 잠금은 MCP 전용 공유 락이다."""
+    s = build_vector_store(request.param, tmp_path)
+    assert s.available
+    s.backend_name = request.param
+    yield s
+    if request.param == "pg":
+        try:
+            from sqlalchemy import text
+
+            with s._engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {s._table}"))
+        except Exception:
+            pass
+    if hasattr(s, "close"):
+        s.close()
+
+
+class TestWriteStatementEnforcesOwnershipOnItsOwn:
+    """선검사를 무력화해도 쓰기문 자신이 교차 팩 인수를 거부한다.
+
+    이 축이 없으면 층 2 는 선검사에 가려 한 번도 실행되지 않고, 그래서
+    누가 지워도 아무 테스트가 깨지지 않는다. 층 2 가 존재하는 이유는
+    선검사의 SELECT 와 쓰기 사이에 다른 프로세스가 슬롯 소유자를 바꿀 수
+    있기 때문이며, 그 창은 선검사만으로 닫히지 않는다.
+    """
+
+    def test_foreign_write_still_fails_with_the_pre_check_disabled(
+        self, sql_store, monkeypatch
+    ):
+        sql_store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
+
+        module = type(sql_store).__module__
+        monkeypatch.setattr(
+            f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
+
+        with pytest.raises(Exception) as excinfo:
+            sql_store.upsert_texts(
+                texts=["팩 B 침범"], metadatas=[{"pack_id": "B"}], ids=["s"])
+        assert type(excinfo.value) is not AssertionError
+
+        hit = sql_store.get_by_id("s")
+        assert hit["metadata"]["pack_id"] == "A", "층 2 가 없어 슬롯이 넘어갔다"
+        assert hit["document"] == "팩 A 원본"
+
+    def test_the_rejected_batch_rolls_back_whole_with_the_pre_check_disabled(
+        self, sql_store, monkeypatch
+    ):
+        """층 2 가 걸린 배치는 그 배치의 다른 건도 남기지 않는다(트랜잭션 롤백)."""
+        sql_store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
+
+        module = type(sql_store).__module__
+        monkeypatch.setattr(
+            f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
+
+        with pytest.raises(Exception):
+            sql_store.upsert_texts(
+                texts=["B 하나", "B 침범"],
+                metadatas=[{"pack_id": "B"}, {"pack_id": "B"}],
+                ids=["b1", "s"],
+            )
+        assert sql_store.get_by_id("b1") is None, "롤백되지 않고 같은 배치의 다른 건이 남았다"
+        assert sql_store.get_by_id("s")["metadata"]["pack_id"] == "A"
