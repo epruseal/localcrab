@@ -494,7 +494,7 @@ record = {"id": str, "embedding": list[float],
 재현: `tests/test_vector_raw_contract.py::TestRoundTrip::test_embedding_survives_the_round_trip`
 (`sqlite-vec` 축은 확장 모듈이 없으면 skip 된다 — 아래 8.5).
 
-### 8.2 정체성 제약 — 슬롯 키는 `node_id` 단독, 소유는 `pack_id` 가 지킨다 (#197)
+### 8.2 정체성 제약: 슬롯 키는 `node_id` 단독, 소유는 `pack_id` 가 지킨다 (#197)
 
 슬롯 키는 `node_id` 하나이고 **팩으로 한정되지 않는다.** 그래서 서로 다른 팩이 같은 `node_id` 를
 낼 수 있다. #197 이전에는 마지막에 쓴 팩이 그 슬롯을 통째로 가져갔고, 먼저 쓴 팩의 문서와
@@ -506,7 +506,7 @@ record = {"id": str, "embedding": list[float],
 | 기존 행의 `pack_id` | 들어오는 meta 의 `pack_id` | 판정 |
 |---|---|---|
 | 행 없음 | 무엇이든 | 통과(신규 슬롯) |
-| 비어 있음(`""`·부재·`None`) | 무엇이든 | 통과(미소유 슬롯 인수 — 백필·마이그레이션이 쓰는 경로) |
+| 비어 있음(`""`, 부재, `None`) | 무엇이든 | 통과(미소유 슬롯 인수. 백필과 마이그레이션이 쓰는 경로) |
 | 비어 있지 않음, 같음 | 같음 | 통과(자기 팩 재적재) |
 | 비어 있지 않음 | 다름(빈 값 포함) | **거부(`ValueError`)** |
 
@@ -534,7 +534,7 @@ record = {"id": str, "embedding": list[float],
 프로세스 내 락까지가 한계다. 프로세스 간 직렬화는 종전에도 이 계층이 제공하지 않았고 지금도
 호출자의 `write.lock` 규율이다.
 
-**업그레이드 단서 — 레거시 `'None'` 소유 태그 행 (pgvector)**. 이 게이트 이전의 pgvector writer 는
+**업그레이드 단서: 레거시 `'None'` 소유 태그 행 (pgvector)**. 이 게이트 이전의 pgvector writer 는
 `metadata["pack_id"]` 가 `None` 일 때 소유 컬럼에 리터럴 문자열 `'None'` 을 넣었다.
 `str(meta.get("pack_id", ""))` 는 키가 **있고** 값이 `None` 일 때 기본값을 쓰지 않기 때문이다.
 
@@ -549,7 +549,7 @@ sqlite-vec 은 `''` 을 저장했다). chroma 는 소유 전용 컬럼이 없다
 vec0 에 대한 사실 하나만 덧붙인다. 이 저장소의 writer 가 그 값을 만들지는 않지만, 외부에서 그
 테이블에 직접 넣은 행이 있다면 `pack_id` 가 partition key 라 `UPDATE` 로는 고칠 수 없다
 (`UPDATE on partition key columns are not supported yet.`). 그런 행을 만난 운영자는 그 제약을
-알고 대응해야 한다. 이 문서는 그 절차를 규정하지 않는다 — 이 저장소가 만들지 않는 상태이기 때문이다.
+알고 대응해야 한다. 이 문서는 그 절차를 규정하지 않는다. 이 저장소가 만들지 않는 상태이기 때문이다.
 
 이 값을 만들 수 있었던 경로는 좁다. 팩 적재와 노드 쓰기는 항상 문자열을 넣으므로, 호출자가
 `pack_id` 를 명시적으로 `null` 로 준 적재에서만 생긴다.
@@ -592,11 +592,11 @@ UPDATE <vector_table> SET pack_id = '' WHERE pack_id = 'None' AND metadata->>'pa
 |---|---|---|
 | `sqlite-vec` | 통과, 마지막 값이 남는다 | 거부(`UNIQUE constraint failed`) |
 | `pgvector` | 통과, 마지막 값이 남는다 | 거부(`UniqueViolation`) |
-| `chroma` | 거부(`DuplicateIDError`) | **거부하지 않는다. 조용히 무시된다** — 기존 레코드가 이긴다 |
+| `chroma` | 거부(`DuplicateIDError`) | **거부하지 않는다. 조용히 무시된다.** 기존 레코드가 이긴다 |
 
 `add` 축에서 chroma 만 fail-open 이라 `ChromaStore.import_vectors` 가 **스토어 안에서** 중복을
 선검사해 거부한다. 그래서 "이미 있는 id 는 예외"는 세 백엔드에서 모두 성립한다. **예외 타입은
-통일하지 않는다**(각 백엔드의 것이 그대로 올라온다) — 호출자는 타입으로 분기하지 말고 "예외 =
+통일하지 않는다**(각 백엔드의 것이 그대로 올라온다). 호출자는 타입으로 분기하지 말고 "예외 =
 이 배치 실패"로 다루고 보상한다. 쓰기 게이트가 내는 `ValueError` 는 이 계층 자신의 판정이라
 예외지만, 호출자 규칙은 같다.
 
