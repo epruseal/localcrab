@@ -332,6 +332,14 @@ class PgVectorStore:
         되고, 여기서 그것을 위반으로 읽어 예외를 낸다. 실측(PostgreSQL 16.14,
         psycopg2): 신규 삽입, 같은 팩 갱신, 미소유 슬롯 인수는 전부 1 이고 교차
         팩 시도만 0 이다 — 0 은 소유권 위반 말고 다른 원인으로 나오지 않는다.
+
+        술어가 `IS NULL` 을 먼저 보는 이유: `pack_id` 컬럼은 NOT NULL 이 아니고, SQL
+        에서 `NULL = ''` 은 거짓이 아니라 NULL 이다. 그것을 안 보면 저장된 값이
+        NULL 인 행에서 술어 전체가 NULL 로 평가돼 갱신이 안 되고, 층 1 이 같은 행을
+        미소유로 읽어 통과시킨 것과 판정이 갈린다(층 1 은 `slot_owner` 를 거쳐
+        None 과 빈 문자열과 부재를 한 상태로 접는다). 이 저장소의 쓰기 경로는 전부
+        빈 문자열을 넣으므로 NULL 행은 외부 기록에만 생기지만, 두 층이 갈리는 것
+        자체가 계약 결함이라 술어 쪽을 층 1 에 맞춘다.
         """
         self._require_available()
         if not texts:
@@ -351,7 +359,8 @@ class PgVectorStore:
             "ON CONFLICT (node_id) DO UPDATE SET "
             "pack_id = EXCLUDED.pack_id, embedding = EXCLUDED.embedding, "
             "document = EXCLUDED.document, metadata = EXCLUDED.metadata "
-            f"WHERE {self._table}.pack_id = '' "
+            f"WHERE {self._table}.pack_id IS NULL "
+            f"OR {self._table}.pack_id = '' "
             f"OR {self._table}.pack_id = EXCLUDED.pack_id"
         )
         with self._engine.begin() as conn:

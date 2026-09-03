@@ -818,6 +818,9 @@ class TestPgVectorSlotOwnershipUnderContention:
 
         assert len(errors) == N - 1, (
             f"쓰기문 술어만으로 승자가 하나가 되지 않았다 — 실패 {len(errors)}건: {errors}")
+        assert all(isinstance(exc, ValueError) for exc in errors), (
+            "소유권 거부가 아닌 예외가 섞였다 — 연결 오류 일곱 건과 성공 하나로도 "
+            f"건수 단언은 통과한다: {[type(e).__name__ for e in errors]}")
         hit = pg_vector_store.get_by_id("contested")
         owner = hit["metadata"]["pack_id"]
         assert hit["document"] == f"{owner} 의 문서"

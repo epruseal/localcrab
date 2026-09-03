@@ -183,8 +183,9 @@ class TestBatchBehaviour:
         if store.backend_name == "chroma":
             with pytest.raises(Exception) as excinfo:
                 call()
-            assert "ValueError" != type(excinfo.value).__name__ or "pack" not in str(
-                excinfo.value), "같은 팩 중복에 소유권 게이트가 잘못 걸렸다"
+            assert type(excinfo.value).__name__ == "DuplicateIDError", (
+                "chroma 의 중복 id 거부가 아닌 예외가 났다: "
+                f"{type(excinfo.value).__name__}: {excinfo.value}")
         else:
             call()
             assert store.get_by_id("dup")["document"] == "둘째 값"
@@ -226,6 +227,10 @@ class TestWriteStatementEnforcesOwnershipOnItsOwn:
     누가 지워도 아무 테스트가 깨지지 않는다. 층 2 가 존재하는 이유는
     선검사의 SELECT 와 쓰기 사이에 다른 프로세스가 슬롯 소유자를 바꿀 수
     있기 때문이며, 그 창은 선검사만으로 닫히지 않는다.
+
+    예외 타입을 `ValueError` 로 좁혀 건다. 두 SQL 백엔드가 층 2 에서 같은 형태를
+    내므로(vec0 은 기본키 충돌을 소유자 재조회 뒤 바꿔 던진다) 백엔드별로 느슨하게
+    둘 이유가 없다. `Exception` 으로 열어 두면 소유권과 무관한 크래시도 통과한다.
     """
 
     def test_foreign_write_still_fails_with_the_pre_check_disabled(
@@ -237,10 +242,9 @@ class TestWriteStatementEnforcesOwnershipOnItsOwn:
         monkeypatch.setattr(
             f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
 
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(ValueError, match="pack"):
             sql_store.upsert_texts(
                 texts=["팩 B 침범"], metadatas=[{"pack_id": "B"}], ids=["s"])
-        assert type(excinfo.value) is not AssertionError
 
         hit = sql_store.get_by_id("s")
         assert hit["metadata"]["pack_id"] == "A", "층 2 가 없어 슬롯이 넘어갔다"
@@ -256,7 +260,7 @@ class TestWriteStatementEnforcesOwnershipOnItsOwn:
         monkeypatch.setattr(
             f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="pack"):
             sql_store.upsert_texts(
                 texts=["B 하나", "B 침범"],
                 metadatas=[{"pack_id": "B"}, {"pack_id": "B"}],
@@ -264,3 +268,47 @@ class TestWriteStatementEnforcesOwnershipOnItsOwn:
             )
         assert sql_store.get_by_id("b1") is None, "롤백되지 않고 같은 배치의 다른 건이 남았다"
         assert sql_store.get_by_id("s")["metadata"]["pack_id"] == "A"
+
+
+# ---------------------------------------------------------------------------
+# 엣지 — 저장된 pack_id 가 NULL 인 행 (pgvector 전용)
+# ---------------------------------------------------------------------------
+
+
+class TestNullPackIdIsUnowned:
+    """저장된 `pack_id` 가 `NULL` 인 행도 미소유로 읽어야 한다.
+
+    두 층이 이 행을 다르게 읽으면 계약이 갈린다. 층 1 은 `slot_owner` 를 거쳐
+    `None` 과 빈 문자열과 부재를 한 상태로 접어 통과시키는데, SQL 에서 `NULL = ''`
+    은 거짓이 아니라 `NULL` 이라 층 2 의 술어는 갱신을 막는다. `pack_id` 컬럼이
+    NOT NULL 이 아니므로 외부에서 쓴 행에 이 값이 들어올 수 있다.
+    """
+
+    def test_a_pack_can_claim_a_row_whose_stored_pack_id_is_null(self, tmp_path):
+        from sqlalchemy import text
+
+        store = build_vector_store("pg", tmp_path)
+        assert store.available
+        try:
+            store.upsert_texts(texts=["미소유"], metadatas=[{"pack_id": ""}], ids=["n1"])
+            with store._engine.begin() as conn:
+                conn.execute(
+                    text(f"UPDATE {store._table} SET pack_id = NULL WHERE node_id = 'n1'"))
+                stored = conn.execute(
+                    text(f"SELECT pack_id FROM {store._table} WHERE node_id = 'n1'")
+                ).scalar()
+            assert stored is None, f"NULL 로 만들지 못했다: {stored!r}"
+
+            store.upsert_texts(texts=["이제 A 소유"], metadatas=[{"pack_id": "A"}], ids=["n1"])
+
+            hit = store.get_by_id("n1")
+            assert hit["metadata"]["pack_id"] == "A"
+            assert hit["document"] == "이제 A 소유"
+        finally:
+            try:
+                with store._engine.begin() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {store._table}"))
+            except Exception:
+                pass
+            if hasattr(store, "close"):
+                store.close()

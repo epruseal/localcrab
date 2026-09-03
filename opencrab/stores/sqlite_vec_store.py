@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import struct
 import threading
 import time
@@ -456,12 +457,28 @@ class SqliteVecStore(_SqliteConnMixin):
         with self._tx() as conn:
             reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
+                incoming = str(meta.get("pack_id", ""))
                 conn.execute(
                     f"DELETE FROM {self._table} "  # noqa: S608
                     "WHERE node_id = ? AND (pack_id = '' OR pack_id = ?)",
-                    (_id, str(meta.get("pack_id", ""))),
+                    (_id, incoming),
                 )
-                conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
+                try:
+                    conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
+                except sqlite3.Error as exc:
+                    # 층 2 가 걸렸을 때 pgvector 와 같은 예외 형태를 낸다. 소유자를
+                    # 다시 읽어 남의 팩일 때만 바꿔 던지고, 아니면 원래 예외를 그대로
+                    # 올린다 -- 디스크 오류나 스키마 문제를 소유권 오류로 가리지
+                    # 않는다. 어느 쪽이든 `_tx()` 가 배치 전체를 롤백한다.
+                    owner = self._slot_owners(conn, [_id]).get(_id) or ""
+                    if owner and owner != incoming:
+                        raise ValueError(
+                            "upsert_texts: refusing to take over a slot owned by "
+                            f"another pack ({_id!r} is owned by pack {owner!r}); the "
+                            "row changed owner between the ownership check and this "
+                            "write"
+                        ) from exc
+                    raise
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
 

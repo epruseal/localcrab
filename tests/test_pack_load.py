@@ -3464,14 +3464,20 @@ class _SqlVecMetaLike:
     def upsert_texts(self, texts, metadatas=None, ids=None):
         """실 `SqliteVecStore.upsert_texts`(vec0)의 DELETE-then-INSERT 계약을
         흉내낸다 — vec0 는 네이티브 UPSERT 가 없어 id 별 DELETE 뒤 INSERT 다.
-        **DELETE 는 소유 팩으로 한정된다**(실 스토어와 동일 — `_vector_base.py`
-        모듈 docstring 의 소유권 CONTRACT, #197) — 남의 팩 행은 지우지 못한다.
         `load_chunks_incremental`
         의 재임베딩 폴백이 실제로 부르는 메서드라 이 더블에도 있어야 그 경로가
         지나간다(#172 V1 게이트: fast-path False 이후의 실제 호출자 경로).
 
-        소유권 게이트를 더블에도 두는 이유: 이 더블이 실 스토어보다 관대하면 여기
-        걸린 테스트가 **실 스토어에서 이미 사라진 계약을 계속 통과시킨다.**"""
+        **소유권(#197)은 층 1(선검사)만 흉내낸다.** 실 스토어의 층 2(vec0 의 조건부
+        DELETE 와 뒤따르는 기본키 충돌)는 흉내내지 않는다 — 아래 DELETE 는 그대로
+        `node_id` 술어뿐이다. 선검사가 DELETE 전에 예외를 내므로 **소유권 축의
+        관측 동작은 실 스토어와 같고**, 이 더블에 걸린 테스트는 그 계약을 그대로
+        고정한다. 층 2 는 실 스토어를 쓰는 테스트가 덮는다
+        (`tests/test_vector_slot_ownership.py`). 여기에 SQL 을 복제하면 그 복제가
+        갈라지는 것이 더블의 본래 위험이다.
+
+        게이트를 더블에 두는 이유: 더블이 실 스토어보다 관대하면 여기 걸린 테스트가
+        **실 스토어에서 이미 사라진 계약을 계속 통과시킨다.**"""
         import json as _json
 
         from opencrab.stores._vector_base import (
