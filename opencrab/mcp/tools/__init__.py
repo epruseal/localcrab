@@ -491,7 +491,8 @@ dispatch_tool = _registry_dispatch_tool
 # lock on a dedicated write.lock file — entirely separate from chroma.lock
 # (LOCK_SH), which is now held for the lifetime of each local ChromaStore
 # instance (#140, see opencrab/stores/chroma_store.py) and guards against the
-# offline batch loader's LOCK_EX. Reads take no lock. NOTE: lockless concurrent reads across processes
+# exclusive claimants: the offline batch loader and both migration scripts.
+# Reads take no lock. NOTE: lockless concurrent reads across processes
 # is THIS layer's design assumption, NOT a chromadb guarantee — chromadb
 # officially treats multi-process PersistentClient sharing as unsupported.
 # write.lock serialises the one hazard the docs name explicitly (concurrent

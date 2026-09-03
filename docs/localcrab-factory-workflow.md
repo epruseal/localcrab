@@ -296,7 +296,7 @@ ResilientEF = [OpenAIEF(primary_1), OpenAIEF(primary_2), ...] + LlamaCppEF(fallb
 - `run_ingest_workflow.py`는 subprocess 오케스트레이터라 스토어를 직접 다루지 않는다.
   하위 `load_local_packs.py`가 `EMBEDDING_BACKEND` env를 따라가므로 자동 KURE 사용.
 - **backfill/적재 중 게이트웨이 중단 여부는 `VECTOR_BACKEND`에 따라 다르다:**
-  - `chroma`: PersistentClient 단일 프로세스 제약(`chroma.lock` LOCK_EX) → 오프라인 로더 `--fresh` 시 게이트웨이 중단 필요.
+  - `chroma`: PersistentClient 단일 프로세스 제약(`chroma.lock` LOCK_EX) → 오프라인 로더 `--fresh` 시 게이트웨이 중단 필요. #140 이후 잠금을 잡는 주체가 `ChromaStore` 인스턴스라 게이트웨이만으로는 부족하다. REST 앱과 벡터를 쓰는 CLI 명령도 함께 멈춰야 한다.
   - **`sqlite-vec`**: 벡터가 SQLite WAL이라 **적재 중 게이트웨이 중단 불필요** — 로더 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. graph/doc/sql은 이미 WAL이므로 sqlite-vec 사용 시 4스토어 전부 무중단 적재 가능. 설계: `docs/pgvector-migration-plan.md §9`.
   - **`pgvector`(`STORAGE_MODE=pg`)**: PostgreSQL MVCC(스냅샷 격리)라 **리더가 라이터를 막지 않는 진짜 다중 라이터** — sqlite-vec의 단일 라이터 직렬화보다 상위 동시성이며, MCP 서버와 백그라운드 로더가 락 충돌 없이 동시에 읽고 쓸 수 있어 적재 중 게이트웨이 중단이 불필요하다. 설계: `docs/pgvector-migration-plan.md §9`.
 

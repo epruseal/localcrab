@@ -435,9 +435,10 @@ class ChromaStore:
           verify at the call site rather than a property of this store — an
           enumeration here goes stale the moment a new writer lands, and one
           already has. ``chroma.lock`` is no substitute either: it is a SHARED
-          lock, so every holder of it coexists with every other (issue #140
-          moved that lock to this store's lifetime, so it is no longer
-          MCP-only -- but a shared lock still serialises nothing).
+          lock, and the shared claim this store takes coexists with every
+          other shared claim (issue #140 moved that lock to this store's
+          lifetime, so it is no longer MCP-only -- but a shared claim still
+          serialises nothing against another shared claim).
         - The collection handle. Only the lock is shared between instances;
           each keeps its own handle, so a ``reset_collection()`` on one
           instance leaves another's handle pointing at the deleted collection

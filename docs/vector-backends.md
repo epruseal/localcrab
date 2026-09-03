@@ -184,7 +184,7 @@ opencrab serve
   - 성숙도가 sqlite-vec보다 높음(오래된 프로덕션 사용 이력).
 - **단점**
   - `PersistentClient`는 **동일 persist 경로에 대한 다중 프로세스 동시 쓰기를 지원하지
-    않는다** — 로컬 모드에서 오프라인 대량 재적재 시 MCP 서버 중지가 필요(`chroma.lock`
+    않는다** — 로컬 모드에서 오프라인 대량 재적재 시 로컬 chroma 를 연 프로세스를 모두 중지해야 한다. MCP 서버뿐 아니라 REST 앱과 벡터를 쓰는 CLI 명령도 포함된다(#140 이후 `chroma.lock` 을 잡는 주체가 `ChromaStore` 인스턴스이기 때문이다)(`chroma.lock`
     배타 락으로 방어).
   - HNSW는 근사 검색이라 recall이 sqlite-vec의 exact 검색보다 낮을 수 있다
     (실측 recall@10 vs sqlite-vec 0.925).
