@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import threading
 from collections.abc import Iterator
@@ -15,6 +16,8 @@ if os.name == "nt":
 else:
     import fcntl
 
+
+logger = logging.getLogger(__name__)
 
 _process_locks: dict[str, threading.RLock] = {}
 _process_locks_guard = threading.Lock()
@@ -30,6 +33,39 @@ def lock_data_dir() -> str:
         data_dir = get_settings().local_data_dir
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
+
+
+def close_quietly(obj: object, what: str, *, log: object = None, reraise: bool = False) -> None:
+    """Close ``obj`` if it has a ``close``, without pinning it in this frame.
+
+    Exists so callers never write ``close = getattr(obj, "close", None)``
+    themselves (#140). A bound method keeps its object alive, so that local
+    holds the object for as long as its frame does -- and on an exception the
+    traceback holds the frame. A resource meant to die before a lock is
+    released then outlives it. Here the reference dies with this frame instead,
+    and the ``finally`` clears both names even when the exception is re-raised,
+    so this helper's own frame never becomes the new anchor.
+
+    ``reraise`` selects the caller's error contract, which is not uniform:
+    the migration scripts swallow a failing close and carry on, while
+    ``ChromaStore.close`` propagates it (a caller asked for the close and is
+    entitled to learn it failed). ``log`` takes a logger; without one the
+    message goes to this module's logger.
+    """
+    if obj is None:
+        return
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:  # noqa: BLE001 - the policy is the caller's
+        if reraise:
+            raise
+        (log or logger).warning("%s close failed: %s", what, exc)
+    finally:
+        close = None
+        obj = None
 
 
 def chroma_lock_dir(local_path: str) -> str:

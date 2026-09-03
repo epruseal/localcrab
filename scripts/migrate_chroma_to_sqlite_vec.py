@@ -26,26 +26,6 @@ import os
 import time
 
 
-def _close_quietly(obj, what: str) -> None:
-    """Call ``obj.close()`` if it has one, reporting but not raising on failure.
-
-    Deliberately its own function. Writing ``close = getattr(obj, "close", None)``
-    inline would leave a BOUND METHOD in the caller's frame, and a bound method
-    keeps its object alive. On the exception path the traceback holds that frame,
-    so the client would survive every ``del`` the caller performs. Here the bound
-    method dies with this frame when the call returns.
-    """
-    if obj is None:
-        return
-    close = getattr(obj, "close", None)
-    if not callable(close):
-        return
-    try:
-        close()
-    except Exception as exc:  # noqa: BLE001 - cleanup must not mask the real error
-        print(f"! {what} close failed: {exc}")
-
-
 def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -> int:
     """Copy one local Chroma collection into a vec0 table. Caller holds chroma.lock.
 
@@ -70,11 +50,12 @@ def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -
     still release. Holding the lock instead would need process-lifetime handle
     ownership, which issue #140 measured and rejected: it turns a bounded stall
     into a lock nothing ever reclaims. Chroma resources can then outlive the
-    lock. ChromaStore.close() follows the same rule.
+    lock. ChromaStore.close() and _migrate_vectors_locked follow the same rule.
     """
     import chromadb
     import sqlite_vec
 
+    from opencrab.locking import close_quietly
     from opencrab.stores.chroma_store import _sanitize_metadata
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
@@ -109,7 +90,7 @@ def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -
                         return 2
                 finally:
                     # count() can raise; without this the probe stayed open.
-                    _close_quietly(probe, "probe store")
+                    close_quietly(probe, "probe store")
                     probe = None
             except Exception:
                 pass
@@ -177,10 +158,10 @@ def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -
         print("RESULT:", "PASS" if ok else "FAIL (count mismatch)")
         return 0 if ok else 4
     finally:
-        # Independent cleanup per resource (inside _close_quietly): one failing
+        # Independent cleanup per resource (inside close_quietly): one failing
         # close must not skip the rest, or the invariant breaks again.
-        _close_quietly(store, "sqlite-vec store")
-        _close_quietly(client, "chroma client")
+        close_quietly(store, "sqlite-vec store")
+        close_quietly(client, "chroma client")
         # Drop this frame's own references. `col` matters as much as `client`:
         # chromadb's Collection stores the client on `self._client`, so leaving
         # `col` bound keeps the client alive in a traceback-held frame.

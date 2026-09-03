@@ -495,15 +495,21 @@ def _migrate_vectors_locked(
     stores") and would have to cope with handlers that decide at runtime, so
     it is reported as a follow-up candidate rather than bolted on here.
 
-    Lock SCOPE covers the client's whole lifetime, not just the copy loop. The
-    PersistentClient is created and dropped inside the ``with``, so the lock is
-    never held while no client exists and -- the case that matters -- no client
-    ever outlives the lock. The lock is EXCLUSIVE because this is a bulk load:
-    it must exclude the shared holders (MCP, REST, CLI) entirely, not join them.
+    Lock SCOPE covers the client, not just the copy loop: the PersistentClient
+    is created and torn down inside the ``with``, so the lock is never held
+    while no client exists. What is guaranteed on the way out is that an
+    explicit close is ATTEMPTED before the lock is released -- not that the
+    client is definitely gone. If that close raises, chroma resources can still
+    outlive the lock; holding it instead would need process-lifetime handle
+    ownership, which #140 measured and rejected. Same wording, same rule, as
+    ChromaStore.close() and _copy_chroma_to_vec0.
+
+    The lock is EXCLUSIVE because this is a bulk load: it must exclude the
+    shared holders (MCP, REST, CLI) entirely, not join them.
     """
     import chromadb  # type: ignore[import]
 
-    from opencrab.locking import chroma_lock_dir
+    from opencrab.locking import chroma_lock_dir, close_quietly
 
     chroma_local_path = os.path.join(local_data_dir, "chroma")
     os.makedirs(chroma_local_path, exist_ok=True)
@@ -523,13 +529,12 @@ def _migrate_vectors_locked(
                     http_client, local_chroma, collection, batch_size, logger
                 )
         finally:
-            close = getattr(local_chroma, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("local chroma close failed: %s", exc)
-            del local_chroma
+            # close_quietly, not an inline getattr: a bound method left in this
+            # frame would keep the client alive, and on an exception the
+            # traceback keeps this frame -- so the client would outlive the
+            # lock released just below.
+            close_quietly(local_chroma, "local chroma", log=logger)
+            local_chroma = None
 
 
 def migrate_vectors(

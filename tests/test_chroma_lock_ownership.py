@@ -702,10 +702,21 @@ class TestTargetMigrationTearsDownBeforeRelease:
             def close(self):
                 events.append("client_closed")
 
+        def _raising_close():
+            """Plain function, NOT a bound method.
+
+            A bound ``close`` would put ``self`` in the raising frame, and
+            anything that retains that exception (pytest's log capture, for
+            one) then keeps the client alive no matter how well the code under
+            test clears its own references. The defect being tested is about
+            the CALLER's frame, so the injected failure must not add an anchor
+            of its own."""
+            events.append("client_closed")
+            raise RuntimeError("native close failed")
+
         class FakeClientRaises(FakeClientBase):
-            def close(self):
-                events.append("client_closed")
-                raise RuntimeError("native close failed")
+            def __init__(self):
+                self.close = _raising_close
 
         cls = {
             "absent": FakeClientAbsent,
@@ -781,3 +792,190 @@ class TestTargetMigrationTearsDownBeforeRelease:
         assert client_refs[0]() is None, (
             "예외 traceback 이 프레임을 붙든 채 클라이언트가 살아 있다"
         )
+
+
+def _raising_close_fn():
+    """Module-level so the raising frame carries no ``self`` (see below)."""
+    raise RuntimeError("native close failed")
+
+
+def _raising_get_collection(*_a, **_k):
+    """Same reason as above: no ``self`` in the frame that raises."""
+    raise RuntimeError("collection boom")
+
+
+class TestNoFramePinsTheClientAtReleaseTime:
+    """No cleanup site may leave the chroma client anchored in its own frame.
+
+    Writing ``close = getattr(client, "close", None)`` puts a BOUND METHOD in
+    the frame, and a bound method keeps its object alive. The frame survives
+    exactly when it matters: a traceback holds it while an error propagates,
+    and it is still live at the moment the lock is released. The client then
+    outlives the lock the whole design exists to pair it with (#140).
+
+    None of these tests keeps a strong reference to a fake client -- that would
+    stop ``weakref.finalize`` from running and fail a correct implementation.
+    Only ids, counts and weakrefs are recorded. For the same reason every
+    injected failure is a plain function, never a bound method: a raising bound
+    method anchors the client through its own frame, which would fail a correct
+    implementation for a reason that has nothing to do with the code under test.
+    """
+
+    def test_chroma_store_close_does_not_pin_the_client(self, chroma_cls, tmp_path):
+        """정상: close() 뒤 잠금을 푸는 시점에 클라이언트가 이미 사라져 있다.
+
+        여기서 가짜의 close 는 예외를 던지지 않는 **바인드 메서드**여야 한다.
+        평범한 함수로 두면 인라인 `close = getattr(...)` 이 남겨도 아무것도
+        붙들지 않아 결함이 관측되지 않는다. 그리고 관측 시점을 traceback 이
+        아니라 해제 순간으로 잡아야 한다 — close 가 던지지 않으므로 붙들
+        traceback 이 없고, 대신 그 순간 close() 프레임이 아직 살아 있다.
+
+        예외를 던지는 경우의 잠금 해제는
+        test_lock_is_released_even_when_client_close_raises 가 따로 본다."""
+        import gc
+        import weakref
+
+        data_dir = str(tmp_path)
+        store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+
+        class Quiet:
+            def close(self):  # bound method on purpose
+                pass
+
+        fake = Quiet()
+        ref = weakref.ref(fake)
+        store._client = fake
+        del fake
+
+        observed: list[bool] = []
+        real_release = type(store)._release_local_lock
+
+        def spy_release(self):
+            # close()'s own frame is still alive here. An inline
+            # `close = getattr(client, "close", None)` is a bound method that
+            # keeps the client alive right at this moment.
+            gc.collect()
+            observed.append(ref() is None)
+            return real_release(self)
+
+        store._release_local_lock = spy_release.__get__(store, type(store))
+        store.close()
+
+        assert observed == [True], (
+            "잠금을 푸는 시점에 close() 프레임이 여전히 클라이언트를 붙들고 있다"
+        )
+
+    def test_connect_failure_does_not_pin_the_client_at_release(
+        self, chroma_cls, tmp_path, monkeypatch
+    ):
+        """엣지: 연결 실패 정리도 잠금 해제 시점에 클라이언트를 붙들지 않는다.
+
+        _connect 는 예외를 안에서 삼키므로 밖으로 나가는 traceback 이 없다.
+        그래서 관측 시점을 해제 순간으로 옮긴다 — 그 순간 _connect 프레임은
+        아직 살아 있으므로, 인라인 바인드 메서드가 있으면 여기서 잡힌다."""
+        import gc
+        import weakref
+
+        import chromadb
+
+        made = {"clients": 0}
+        refs: list = []
+        observed: list[bool] = []
+
+        class FakeClient:
+            def __init__(self):
+                # Both plain functions, not bound methods: the raising frame
+                # must not carry `self`, or the test's own injection anchors
+                # the client and a correct implementation looks broken.
+                self.close = lambda: None
+                self.get_or_create_collection = _raising_get_collection
+
+        def fake_persistent_client(*a, **k):
+            client = FakeClient()
+            made["clients"] += 1
+            refs.append(weakref.ref(client))
+            return client
+
+        monkeypatch.setattr(chromadb, "PersistentClient", fake_persistent_client)
+
+        real_release = chroma_cls._release_local_lock
+
+        def spy_release(self):
+            # The _connect frame is still alive right here. If it still names
+            # the client, this is where an inline bound method shows up.
+            gc.collect()
+            observed.append(refs[0]() is None)
+            return real_release(self)
+
+        monkeypatch.setattr(chroma_cls, "_release_local_lock", spy_release)
+
+        store = make_store(chroma_cls, os.path.join(str(tmp_path), "chroma"))
+        assert store.available is False
+        assert made["clients"] == 1, "가짜 클라이언트가 만들어지지 않았다"
+        assert observed == [True], (
+            "잠금을 푸는 시점에 _connect 프레임이 여전히 클라이언트를 붙들고 있다"
+        )
+
+    def test_migrate_to_local_does_not_pin_the_client(self, tmp_path, monkeypatch):
+        """에러: 벡터 마이그레이션 실패도 클라이언트를 프레임에 남기지 않는다."""
+        import gc
+        import logging as _logging
+        import sys as _sys
+        import weakref
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        scripts_dir = os.path.join(repo, "scripts")
+        if scripts_dir not in _sys.path:
+            _sys.path.insert(0, scripts_dir)
+        mtl = pytest.importorskip("migrate_to_local")
+        chromadb = pytest.importorskip("chromadb")
+
+        made = {"clients": 0}
+        client_ids: list[int] = []
+        refs: list = []
+
+        class FakeClient:
+            # Bound method on purpose: an inline
+            # `close = getattr(local_chroma, "close", None)` must have
+            # something to pin, or the defect is unobservable.
+            def close(self):
+                pass
+
+        def fake_persistent_client(*a, **k):
+            client = FakeClient()
+            made["clients"] += 1
+            client_ids.append(id(client))
+            refs.append(weakref.ref(client))
+            return client
+
+        monkeypatch.setattr(chromadb, "PersistentClient", fake_persistent_client)
+
+        def boom(http_client, local_chroma, *a, **k):
+            # Drop this stand-in's own references BEFORE raising: otherwise its
+            # frame anchors the client and the check below means nothing.
+            del http_client, local_chroma
+            raise RuntimeError("migrate boom")
+
+        monkeypatch.setattr(mtl, "migrate_vectors", boom)
+
+        caught = None
+        try:
+            mtl._migrate_vectors_locked(
+                None, str(tmp_path), "coll", 10, _logging.getLogger(__name__)
+            )
+        except RuntimeError as exc:
+            caught = exc
+
+        assert caught is not None and caught.__traceback__ is not None
+        assert made["clients"] == 1, "가짜 클라이언트가 만들어지지 않았다"
+
+        gc.collect()
+        tb = caught.__traceback__
+        while tb is not None:
+            for name, value in tb.tb_frame.f_locals.items():
+                assert id(value) not in client_ids, (
+                    f"traceback 프레임 {tb.tb_frame.f_code.co_name} 이 "
+                    f"클라이언트를 {name} 으로 붙들고 있다"
+                )
+            tb = tb.tb_next
+        assert refs[0]() is None, "잠금이 풀린 뒤에도 클라이언트가 살아 있다"

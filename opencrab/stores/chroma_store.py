@@ -13,6 +13,7 @@ import os
 import threading
 from typing import Any
 
+from opencrab.locking import close_quietly
 from opencrab.stores._vector_base import (
     generate_add_ids,
     generate_upsert_ids,
@@ -204,17 +205,11 @@ class ChromaStore:
                 client, self._client = self._client, None
                 self._collection = None
                 try:
-                    if client is not None:
-                        close = getattr(client, "close", None)
-                        if callable(close):
-                            close()
-                except Exception as close_exc:  # noqa: BLE001
-                    logger.warning(
-                        "ChromaDB client close failed during init cleanup: %s",
-                        close_exc,
-                    )
+                    close_quietly(client, "ChromaDB client (init cleanup)", log=logger)
                 finally:
-                    del client
+                    # Clear this frame's own reference before the lock goes:
+                    # the frame is still alive at release time.
+                    client = None
                     self._release_local_lock()
 
     @property
@@ -232,23 +227,27 @@ class ChromaStore:
     def close(self) -> None:
         """Release the Chroma client, its native handles, and chroma.lock.
 
-        The lock release sits in a ``finally`` because the client's own
-        ``close()`` can raise: appending the release after it would skip the
-        release exactly when a caller most needs it. The lock's lifetime tracks
-        this object's lifetime (#140) -- a failing client close does not keep
-        the object alive, so nothing is gained by holding the lock past here.
+        The client's ``close()`` is PROPAGATED: a caller that asked to close is
+        entitled to learn it failed. The lock release sits in a ``finally`` so
+        that propagation cannot skip it.
+
+        LIMIT (#140): releasing on a failed close means chroma resources can
+        outlive the lock. Holding it instead would need process-lifetime handle
+        ownership, which #140 measured and rejected -- it converts a bounded
+        stall into a lock nothing ever reclaims, the failure mode the issue
+        calls strictly worse. So the guarantee here is "an explicit close is
+        attempted before the lock is released", not "the client is gone".
+        ``close_quietly`` keeps the client out of this frame so a propagating
+        error does not pin it via the traceback.
         """
         client = self._client
         self._client = None
         self._collection = None
         self._available = False
         try:
-            if client is not None:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
+            close_quietly(client, "ChromaDB client", log=logger, reraise=True)
         finally:
-            del client
+            client = None
             self._release_local_lock()
 
     def _collection_handle(self) -> Any:
