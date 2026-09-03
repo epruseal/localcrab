@@ -265,6 +265,17 @@ class ChromaStore:
         entitled to learn it failed. The lock release sits in a ``finally`` so
         that propagation cannot skip it.
 
+        VERSION DEPENDENCE: the release is only as good as the client's
+        ``close()``. On the chromadb this repository resolves to, that call
+        decrements ``SharedSystemClient``'s refcount and stops the native
+        System on the last holder -- measured: the shared-system table returns
+        to its prior size after close. The declared floor (``chromadb>=0.5``)
+        is old enough to predate that method, and there ``close_quietly`` is a
+        no-op, so the store falls back to refcount and process exit. That is
+        the pre-#140 behaviour rather than a regression -- nothing closed the
+        client at all before -- but it is why the guarantee below is worded as
+        an ATTEMPT.
+
         LIMIT (#140): releasing on a failed close means chroma resources can
         outlive the lock. Holding it instead would need process-lifetime handle
         ownership, which #140 measured and rejected -- it converts a bounded
