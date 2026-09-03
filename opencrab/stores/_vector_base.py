@@ -236,22 +236,30 @@ def reject_batch_pack_conflicts(
     last write, chroma refuses the batch). Whose slot it becomes is not a
     decision to leave to write order.
 
-    A duplicate id whose records name the SAME pack is NOT rejected here. It
-    is not a cross-pack conflict, and each backend's existing behaviour for it
-    is left exactly as it was -- see ``docs/vector-backends.md`` for that
-    divergence and the follow-up that may unify it.
+    UNOWNED TAKES PART IN THIS COMPARISON. An id claimed once by a pack and
+    once with no pack is a conflict too, even though one side names no pack.
+    Skipping the unowned side made acceptance depend on record ORDER and on
+    the backend: on an empty SQL store ``[unowned, A]`` went through and left A
+    owning the slot, while ``[A, unowned]`` reached the write guard and rolled
+    the batch back, and chroma refused both orderings inside its own ``get()``.
+    Order is exactly what this rule exists to keep out of the decision.
+
+    A duplicate id whose records name the SAME state is NOT rejected here --
+    two claims of pack A, or two claims of no pack. That is not a cross-pack
+    conflict, and each backend's existing behaviour for it is left exactly as
+    it was; see ``docs/vector-backends.md`` for that divergence and the
+    follow-up that may unify it.
     """
     owners: dict[str, str] = {}
     for doc_id, metadata in zip(ids, metadatas):
         owner = slot_owner(metadata)
-        if not owner:
-            continue
         previous = owners.setdefault(doc_id, owner)
         if previous != owner:
             raise ValueError(
                 f"upsert_texts: id {doc_id!r} appears twice in one batch under "
-                f"different packs ({previous!r} and {owner!r}); one batch cannot "
-                "decide which pack owns a slot -- split it per pack"
+                f"different packs ({previous or '<unowned>'!r} and "
+                f"{owner or '<unowned>'!r}); one batch cannot decide which pack "
+                "owns a slot -- split it per pack"
             )
 
 

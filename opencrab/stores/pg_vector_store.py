@@ -74,6 +74,7 @@ from opencrab.stores._vector_base import (
     generate_upsert_ids,
     reject_batch_pack_conflicts,
     reject_foreign_slot_writes,
+    slot_owner,
     validate_import_records,
     validate_lengths,
 )
@@ -304,7 +305,7 @@ class PgVectorStore:
                     sql,
                     {
                         "node_id": _id,
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
                         "metadata": json.dumps(meta),
@@ -370,7 +371,7 @@ class PgVectorStore:
                     sql,
                     {
                         "node_id": _id,
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
                         "metadata": json.dumps(meta),
@@ -578,7 +579,7 @@ class PgVectorStore:
                     sql,
                     {
                         "node_id": record["id"],
-                        "pack_id": str(meta.get("pack_id", "")),
+                        "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(record["embedding"]),
                         "document": record["document"],
                         "metadata": json.dumps(meta),

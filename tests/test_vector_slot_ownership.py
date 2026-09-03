@@ -168,6 +168,43 @@ class TestBatchBehaviour:
             )
         assert store.get_by_id("contested") is None, "거부된 배치가 행을 남겼다"
 
+    def test_owned_and_unowned_claims_on_one_id_are_rejected_in_either_order(self, store):
+        """엣지: 미소유도 하나의 상태로 판정에 참여한다.
+
+        한 배치가 같은 id 를 팩 A 로 한 번, 소유 없이 한 번 주장하면 거부한다.
+        미소유를 판정에서 빼면 받아들임이 **레코드 순서와 백엔드에 따라 갈렸다** —
+        빈 SQL 스토어에서 [미소유, A] 는 통과해 A 가 슬롯을 가져갔고 [A, 미소유] 는
+        쓰기 게이트까지 가서 배치가 롤백됐으며, chroma 는 두 순서 다 자기 get 에서
+        거부했다. 순서가 소유자를 정하게 두지 않는 것이 이 규칙의 목적이다.
+        """
+        for metas in ([{"pack_id": ""}, {"pack_id": "A"}],
+                      [{"pack_id": "A"}, {"pack_id": ""}]):
+            with pytest.raises(ValueError, match="different packs"):
+                store.upsert_texts(
+                    texts=["첫", "둘"], metadatas=metas, ids=["contested", "contested"])
+            assert store.get_by_id("contested") is None, (
+                f"거부된 배치가 행을 남겼다 (metas={metas})")
+
+    def test_two_unowned_claims_on_one_id_are_not_a_conflict(self, store):
+        """엣지: 미소유끼리의 중복은 같은 값이라 충돌이 아니다.
+
+        새 규칙은 서로 다른 소유 상태만 막는다. 같은 상태의 중복은 이 이슈와
+        무관하므로 백엔드별 현행 동작을 그대로 둔다(같은 팩 중복과 같은 판단).
+        """
+        call = lambda: store.upsert_texts(  # noqa: E731
+            texts=["첫", "둘"],
+            metadatas=[{"space": "s"}, {"space": "s"}],
+            ids=["dup2", "dup2"],
+        )
+        if store.backend_name == "chroma":
+            with pytest.raises(Exception) as excinfo:
+                call()
+            assert type(excinfo.value).__name__ == "DuplicateIDError", (
+                f"소유권 게이트가 잘못 걸렸다: {type(excinfo.value).__name__}: {excinfo.value}")
+        else:
+            call()
+            assert store.get_by_id("dup2")["document"] == "둘"
+
     def test_same_pack_duplicate_id_keeps_each_backends_existing_behaviour(self, store):
         """엣지: 같은 팩의 중복 id 에는 새 규칙을 걸지 않는다.
 
@@ -339,6 +376,56 @@ class TestNullPackIdIsUnowned:
         finally:
             if hasattr(store, "close"):
                 store.close()
+
+
+class TestNonePackIdIsStoredAsUnowned:
+    """`pack_id` 가 `None` 인 메타는 미소유로 **저장**돼야 한다.
+
+    `str(meta.get("pack_id", ""))` 는 키가 있고 값이 `None` 일 때 기본값을 쓰지
+    않아 리터럴 `"None"` 을 만든다. 선검사는 `slot_owner` 로 그 메타를 미소유로
+    읽으므로, 저장값이 `"None"` 이면 **같은 메타의 재적재가 거부된다** — 자기 팩
+    재적재가 실패하는 정상 경로 파손이다. 소유 태그를 쓰는 자리도 읽는 자리와
+    같은 `slot_owner` 를 거쳐야 한다.
+    """
+
+    @pytest.fixture(params=["sqlite-vec", "pg"])
+    def sql_store(self, request, tmp_path):
+        s = build_vector_store(request.param, tmp_path)
+        assert s.available
+        s.backend_name = request.param
+        yield s
+        if request.param == "pg":
+            try:
+                from sqlalchemy import text
+
+                with s._engine.begin() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {s._table}"))
+            except Exception:
+                pass
+        if hasattr(s, "close"):
+            s.close()
+
+    def _stored_owner(self, store):
+        if store.backend_name == "pg":
+            from sqlalchemy import text
+
+            with store._engine.connect() as conn:
+                return conn.execute(
+                    text(f"SELECT pack_id FROM {store._table} WHERE node_id = 'n'")
+                ).scalar()
+        return store._conn.execute(
+            f"SELECT pack_id FROM {store._table} WHERE node_id = 'n'").fetchone()[0]
+
+    def test_a_none_pack_id_is_persisted_as_the_unowned_value(self, sql_store):
+        sql_store.upsert_texts(texts=["값"], metadatas=[{"pack_id": None}], ids=["n"])
+        assert self._stored_owner(sql_store) == "", (
+            f"미소유가 아닌 값으로 저장됐다: {self._stored_owner(sql_store)!r}")
+
+    def test_re_ingesting_the_same_none_metadata_is_not_rejected(self, sql_store):
+        """정상 경로 파손의 실체: 같은 메타로 다시 적재하면 통과해야 한다."""
+        sql_store.upsert_texts(texts=["값"], metadatas=[{"pack_id": None}], ids=["n"])
+        sql_store.upsert_texts(texts=["값 v2"], metadatas=[{"pack_id": None}], ids=["n"])
+        assert sql_store.get_by_id("n")["document"] == "값 v2"
 
 
 class TestTheOriginalErrorSurvivesAFailedOwnerLookup:

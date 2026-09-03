@@ -103,6 +103,7 @@ from opencrab.stores._vector_base import (
     generate_upsert_ids,
     reject_batch_pack_conflicts,
     reject_foreign_slot_writes,
+    slot_owner,
     validate_import_records,
     validate_lengths,
 )
@@ -375,7 +376,7 @@ class SqliteVecStore(_SqliteConnMixin):
         if self._has_bit_column:
             return (
                 _id,
-                str(meta.get("pack_id", "")),
+                slot_owner(meta),
                 self._serialize(vec),
                 _sign_bits(vec),
                 text,
@@ -383,7 +384,7 @@ class SqliteVecStore(_SqliteConnMixin):
             )
         return (
             _id,
-            str(meta.get("pack_id", "")),
+            slot_owner(meta),
             self._serialize(vec),
             text,
             json.dumps(meta),
@@ -457,7 +458,7 @@ class SqliteVecStore(_SqliteConnMixin):
         with self._tx() as conn:
             reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                incoming = str(meta.get("pack_id", ""))
+                incoming = slot_owner(meta)
                 conn.execute(
                     # `IS NULL` 을 먼저 본다: SQL 에서 `NULL = ''` 은 거짓이 아니라
                     # NULL 이므로, 그것을 안 보면 저장된 값이 NULL 인 행에서 술어가
