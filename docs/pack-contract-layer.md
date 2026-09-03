@@ -130,6 +130,25 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
 - **증분 대조는 `pack` 을 무시한다**(`load.INCREMENTAL_IGNORED_KEYS`, 노드축·청크축 둘 다).
   빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로 잡히는데, neo4j 의 upsert 는
   전달된 키만 SET 하므로 재기록해도 사라지지 않아 그 재기록이 영구히 반복된다.
+- **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
+  파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
+  전량 치환하므로 **그 다음 런은 same 으로 복귀한다.** 전량 chg 를 한 번 보는 것 자체는
+  결함이 아니라 로더가 파일 상태로 되돌리는 중이라는 뜻이다. 결함은 그 다음 런도 전량
+  chg 일 때다 — 증분 모드가 매 런 전량 재임베딩으로 퇴화한다. 확인 방법은 같은 입력으로
+  증분을 한 번 더 돌려 same 이 복귀하는지 보는 것이다. 회귀 고정은
+  `tests/test_pack_load.py` 의 `test_live_property_drift_converges_in_one_run` 이다.
+
+  이 수렴 문장은 **그래프 노드 properties 축에만** 걸고 **그래프 CAS 쓰기와 doc 쓰기가
+  성공했음을 전제**로 한다. doc 쓰기가 계속 실패하면 그래프 properties 가 수렴해도
+  `doc_row_missing` 검사가 매 런 chg 를 만드는데, 그것은 doc 행 회수 축의 증상이지
+  properties 드리프트의 재발이 아니다(그 축은 `test_pack_load_r12_selfheal_gates.py`).
+  등록부·벡터 쓰기 실패도 같은 이유로 이 문장의 대상이 아니다. "전체 적재 상태가 한 런에
+  수렴한다"로 읽으면 안 된다.
+
+  **이 수렴은 CAS 갱신이 properties 를 전량 치환한다는 데 기댄다.** SQL 백엔드는 properties
+  열을 통째로 쓴다. neo4j 는 사전 검사를 라이브 속성 재계산으로 하고 실제 쓰기는 저장된
+  `node_digest` 속성으로 CAS 를 걸어 **출처가 둘**이다. 두 값이 갈리면 갱신이 0행을 잡아
+  드리프트가 해소되지 않는다. 그 축은 #298 이 추적한다.
 - **라이브 잔여분은 청소하지 않는다.** 읽는 코드가 없어 무해하다. 확인하고 싶으면
   실행 중인 백엔드에 대해 읽기 전용으로 센다(아래는 로컬 SQLite 예시 — 다른 백엔드·다른
   축은 같은 형태로 각자 질의해야 한다):
