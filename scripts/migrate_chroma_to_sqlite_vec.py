@@ -194,12 +194,19 @@ def main() -> int:
     # migration that takes the lock exclusively.
     from opencrab.locking import chroma_lock_dir, chroma_lock_held
 
-    # Bounded like the sibling migration (#140): this shared request still
-    # blocks behind an exclusive loader or migration, and an unbounded wait
-    # there is a hang with nothing to tell the operator what holds it.
-    # COMPATIBILITY: a holder that steps aside after the bound now fails here
-    # instead of eventually being waited out.
-    with chroma_lock_held(chroma_lock_dir(chroma_path), shared=True):
+    # EXCLUSIVE, not shared (#140). A shared claim looks right for a reader,
+    # but a live chroma-backed server also holds this lock shared for its whole
+    # lifetime while it keeps serving WRITES under write.lock. Joining it would
+    # let this copy run against a moving source: _copy_chroma_to_vec0 snapshots
+    # count() and then pages by offset without write.lock, so an ingest or a
+    # delete in flight silently drops records or mixes two points in time. The
+    # script's stated precondition is an offline run; an exclusive claim makes
+    # the lock enforce it instead of leaving it to the operator to remember.
+    #
+    # Bounded, and the message says what to stop.
+    # COMPATIBILITY: this now refuses while a server is up, where it used to
+    # proceed. That proceeding could produce a quietly wrong target.
+    with chroma_lock_held(chroma_lock_dir(chroma_path), shared=False):
         return _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path)
 
 

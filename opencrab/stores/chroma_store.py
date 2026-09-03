@@ -132,7 +132,11 @@ class ChromaStore:
         The acquisition sits OUTSIDE ``_connect``'s ``except Exception`` on
         purpose; see ChromaLockTimeoutError.
         """
-        from opencrab.locking import acquire_chroma_lock, chroma_lock_dir
+        from opencrab.locking import (
+            acquire_chroma_lock,
+            chroma_lock_busy_message,
+            chroma_lock_dir,
+        )
 
         timeout = self._lock_timeout
         if timeout is None:
@@ -146,11 +150,15 @@ class ChromaStore:
                 "chroma.lock", lock_dir, timeout=timeout
             )
         except TimeoutError as exc:
+            # Shared message with the migrations: it must NOT claim the blocker
+            # is an exclusive holder. On Windows every logical shared request is
+            # an exclusive byte-range lock, so an ordinary chroma-backed server
+            # can be what blocks this -- and naming the wrong holder type sends
+            # the operator to the wrong process.
             raise ChromaLockTimeoutError(
-                f"timed out after {timeout}s waiting for the shared lock on "
-                f"{os.path.join(lock_dir, 'chroma.lock')}. Another process holds "
-                "it exclusively (an offline pack load or a migration). Stop that "
-                "process or wait for it to finish, then retry."
+                chroma_lock_busy_message(
+                    os.path.join(lock_dir, "chroma.lock"), timeout
+                )
             ) from exc
 
     def _release_local_lock(self, *, initialisation_failed: bool = False) -> None:

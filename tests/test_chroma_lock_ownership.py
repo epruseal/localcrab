@@ -172,7 +172,14 @@ class TestChromaLockExclusion:
             with pytest.raises(ChromaLockTimeoutError) as caught:
                 make_store(chroma_cls, persist, lock_timeout=0.5)
             assert isinstance(caught.value, TimeoutError)
-            assert "chroma.lock" in str(caught.value)
+            # Exact equality with the shared builder, not a keyword search:
+            # the previous wording also contained "shared" and "exclusively",
+            # so a substring check would pass the message this replaced.
+            from opencrab.locking import _lock_path, chroma_lock_busy_message
+
+            assert str(caught.value) == chroma_lock_busy_message(
+                _lock_path("chroma.lock", data_dir), 0.5
+            ), f"공용 문구와 다르다: {caught.value}"
         finally:
             release_file_lock(fh)
 
@@ -1444,6 +1451,92 @@ class TestOuterChromaLockWaitIsBounded:
                 f"공유·배타 두 가능성을 함께 안내하지 않는다: {msg}"
             )
             assert "Stop that process" in msg, f"조치가 없다: {msg}"
+        finally:
+            stop.set()
+            holder.join(30)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(10)
+
+
+_EXCLUSIVE_PROBE = r"""
+import os, sys
+sys.path.insert(0, sys.argv[1])
+os.environ["LOCAL_DATA_DIR"] = sys.argv[3]
+import opencrab.locking as lk
+lk.chroma_lock_wait_timeout = lambda: 1.0
+sys.path.insert(0, sys.argv[2])
+import migrate_chroma_to_sqlite_vec as m
+
+# Drive the script's OWN entry point, so the assertion is about what the
+# script asks for and not about a hand-rolled call that could diverge.
+sys.argv = ["migrate_chroma_to_sqlite_vec", "--dry-run"]
+try:
+    rc = m.main()
+except TimeoutError as exc:
+    print("TIMEOUT:" + str(exc))
+except Exception as exc:
+    print("OTHER:" + type(exc).__name__ + ":" + str(exc))
+else:
+    print("COMPLETED:" + str(rc))
+"""
+
+
+class TestTargetMigrationClaimsExclusively:
+    """chroma -> vec0 migration must exclude a live server, not join it (#140).
+
+    A shared claim reads as correct for a reader, but a live chroma-backed
+    server holds this lock shared for its whole lifetime while still serving
+    writes under write.lock. The copy snapshots count() and pages by offset
+    without write.lock, so joining a shared holder lets an in-flight ingest or
+    delete drop records or mix two points in time.
+    """
+
+    def test_shared_holder_blocks_the_migration(self, tmp_path):
+        import multiprocessing
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = str(tmp_path)
+        (tmp_path / "chroma").mkdir()
+
+        ready = multiprocessing.Event()
+        stop = multiprocessing.Event()
+
+        def hold_shared(data_dir: str, ready, stop) -> None:
+            from opencrab.locking import acquire_file_lock, release_file_lock
+
+            fh = acquire_file_lock("chroma.lock", data_dir, shared=True)
+            ready.set()
+            stop.wait(120)
+            release_file_lock(fh)
+
+        holder = multiprocessing.Process(
+            target=hold_shared, args=(data_dir, ready, stop)
+        )
+        holder.start()
+        try:
+            assert ready.wait(30), "공유 보유자가 기동하지 않았다"
+            out = subprocess.run(
+                [
+                    sys.executable, "-c", _EXCLUSIVE_PROBE,
+                    repo, os.path.join(repo, "scripts"), data_dir,
+                ],
+                capture_output=True, text=True, cwd=repo, timeout=60,
+            )
+            # The script prints banner lines before the lock, so read the
+            # marker line rather than the whole stream.
+            lines = [ln for ln in (out.stdout or "").splitlines() if ln.strip()]
+            marked = [ln for ln in lines if ln.startswith(("TIMEOUT:", "OTHER:", "COMPLETED:"))]
+            assert marked, f"프로브가 결과를 내지 않았다: {out.stdout!r} {out.stderr[-400:]}"
+            result = marked[-1]
+            # The failure must come from the LOCK, not from an earlier step
+            # (this path imports sqlite_vec and builds settings first). The
+            # TIMEOUT marker and the shared message text separate the two.
+            assert result.startswith("TIMEOUT:"), (
+                f"잠금에서 거부되지 않았다: {result!r} {out.stderr[-400:]}"
+            )
+            assert "holds chroma.lock" in result, f"잠금 메시지가 아니다: {result}"
+            assert holder.is_alive(), "보유자가 먼저 죽어서 끝난 것이다"
         finally:
             stop.set()
             holder.join(30)
