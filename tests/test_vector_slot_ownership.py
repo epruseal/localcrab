@@ -738,7 +738,7 @@ class TestRejectionMessagesDoNotNameTheOtherPack:
             monkey = pytest.MonkeyPatch()
             try:
                 monkey.setattr(f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
-                with pytest.raises(Exception) as excinfo:
+                with pytest.raises(ValueError) as excinfo:
                     store.upsert_texts(
                         texts=["침범"], metadatas=[{"pack_id": "intruder"}], ids=["s"])
             finally:
@@ -757,6 +757,47 @@ class TestRejectionMessagesDoNotNameTheOtherPack:
                     pass
             if hasattr(store, "close"):
                 store.close()
+
+    def test_both_sql_backends_word_the_layer_two_rejection_identically(self, tmp_path):
+        """두 SQL 백엔드의 층 2 문구가 서로 같다.
+
+        "소유자 이름이 없다" 만 걸면 두 백엔드가 서로 다른 말을 해도 통과한다.
+        실제로 한쪽 문구만 바꾸고 다른 쪽을 두어 갈라진 적이 있다. 같은 자리에서
+        같은 말을 하는 것 자체를 걸어 그 갈라짐이 다시 조용히 생기지 않게 한다.
+        """
+        messages = {}
+        for backend in ("sqlite-vec", "pg"):
+            store = build_vector_store(backend, tmp_path / backend)
+            assert store.available
+            try:
+                store.upsert_texts(texts=["소유자"], metadatas=[{"pack_id": "owner"}], ids=["s"])
+                module = type(store).__module__
+                monkey = pytest.MonkeyPatch()
+                try:
+                    monkey.setattr(
+                        f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
+                    with pytest.raises(ValueError) as excinfo:
+                        store.upsert_texts(
+                            texts=["침범"], metadatas=[{"pack_id": "intruder"}], ids=["s"])
+                finally:
+                    monkey.undo()
+                messages[backend] = str(excinfo.value)
+            finally:
+                if backend == "pg":
+                    try:
+                        from sqlalchemy import text
+
+                        with store._engine.begin() as conn:
+                            conn.execute(text(f"DROP TABLE IF EXISTS {store._table}"))
+                    except Exception:
+                        pass
+                if hasattr(store, "close"):
+                    store.close()
+
+        assert messages["sqlite-vec"] == messages["pg"], (
+            "두 SQL 백엔드의 층 2 문구가 갈렸다:\n"
+            f"  sqlite-vec: {messages['sqlite-vec']}\n"
+            f"  pg        : {messages['pg']}")
 
     def test_a_batch_internal_conflict_may_name_both_since_the_caller_supplied_them(
         self, store
