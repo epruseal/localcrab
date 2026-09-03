@@ -644,3 +644,140 @@ class TestRestContextFailureAtomicity:
         with pytest.raises(RuntimeError, match="doc boom"):
             api_main._build_context()
         assert closed == ["vector", "graph"], f"정리 순서가 다르다: {closed}"
+
+
+class TestTargetMigrationTearsDownBeforeRelease:
+    """migrate_chroma_to_sqlite_vec must not leave a client outliving the lock.
+
+    Two ways it could, and the test has to rule out both. Reference counting is
+    not enough because chromadb's client has no ``__del__``, so an explicit
+    ``close()`` is required even on the plain early returns. And on the
+    exception path the traceback keeps the function's frame alive, so the frame
+    must clear its own names -- ``col`` included, because a Collection holds the
+    client on ``self._client``.
+
+    The test never keeps a strong reference to a fake client: doing so would
+    stop ``weakref.finalize`` from ever running and fail a correct
+    implementation. Only ids, counts and weakrefs are recorded.
+    """
+
+    @pytest.mark.parametrize("close_mode", ["absent", "present", "raises"])
+    def test_client_is_closed_and_dropped_before_return(
+        self, close_mode, tmp_path, monkeypatch
+    ):
+        import gc
+        import sys as _sys
+        import weakref
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        scripts_dir = os.path.join(repo, "scripts")
+        if scripts_dir not in _sys.path:
+            _sys.path.insert(0, scripts_dir)
+        mod = pytest.importorskip("migrate_chroma_to_sqlite_vec")
+        chromadb = pytest.importorskip("chromadb")
+
+        events: list[str] = []
+        made = {"clients": 0, "collections": 0}
+        client_ids: list[int] = []
+        client_refs: list = []
+
+        class FakeCollection:
+            """Holds the client, exactly as chromadb's Collection does."""
+
+            def __init__(self, client):
+                self._client = client
+                made["collections"] += 1
+
+            def count(self):
+                return 3
+
+        class FakeClientBase:
+            def get_collection(self, name):
+                return FakeCollection(self)
+
+        class FakeClientAbsent(FakeClientBase):
+            pass
+
+        class FakeClientPresent(FakeClientBase):
+            def close(self):
+                events.append("client_closed")
+
+        class FakeClientRaises(FakeClientBase):
+            def close(self):
+                events.append("client_closed")
+                raise RuntimeError("native close failed")
+
+        cls = {
+            "absent": FakeClientAbsent,
+            "present": FakeClientPresent,
+            "raises": FakeClientRaises,
+        }[close_mode]
+
+        def fake_persistent_client(*a, **k):
+            client = cls()
+            made["clients"] += 1
+            client_ids.append(id(client))
+            client_refs.append(weakref.ref(client))
+            weakref.finalize(client, events.append, "client_finalized")
+            return client
+
+        monkeypatch.setattr(chromadb, "PersistentClient", fake_persistent_client)
+
+        # Fail AFTER the collection is in hand, at a point whose frame does not
+        # reference the collection or the client. A failure raised inside a
+        # collection method would pin the client through that frame's `self`,
+        # so even a correct implementation would look broken.
+        from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+        def boom(self):
+            raise RuntimeError("reset boom")
+
+        monkeypatch.setattr(SqliteVecStore, "reset_collection", boom, raising=True)
+
+        class Args:
+            dry_run = False
+            force = True
+            batch = 10
+
+        from opencrab.config import Settings
+
+        settings = Settings(LOCAL_DATA_DIR=str(tmp_path), EMBED_DIM=8)
+        db_path = str(tmp_path / "vectors.db")
+
+        caught = None
+        try:
+            mod._copy_chroma_to_vec0(
+                Args(), settings, "irrelevant", db_path, str(tmp_path / "chroma")
+            )
+        except Exception as exc:  # noqa: BLE001
+            caught = exc
+
+        # Still holding the traceback: that is the condition this defect needs.
+        assert caught is not None, "예외 경로에 들어가지 않았다"
+        assert caught.__traceback__ is not None
+
+        # Non-vacuity: the client and the collection really were created, so a
+        # dead weakref means teardown, not absence.
+        assert made["clients"] == 1, f"가짜 클라이언트가 만들어지지 않았다: {made}"
+        assert made["collections"] == 1, f"가짜 컬렉션이 만들어지지 않았다: {made}"
+
+        if close_mode in ("present", "raises"):
+            assert "client_closed" in events, (
+                "명시적 close() 가 호출되지 않았다 — 참조 계수만으로는 chroma 공유 "
+                "System 자원이 반환되지 않는다"
+            )
+
+        gc.collect()
+
+        # No frame in the traceback may still name the client.
+        tb = caught.__traceback__
+        while tb is not None:
+            for name, value in tb.tb_frame.f_locals.items():
+                assert id(value) not in client_ids, (
+                    f"traceback 프레임이 클라이언트를 붙들고 있다: {name}"
+                )
+            tb = tb.tb_next
+
+        assert client_refs[0]() is None, (
+            "예외 traceback 이 프레임을 붙든 채 클라이언트가 살아 있다"
+        )
