@@ -7,6 +7,9 @@ the same functional contract.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import time
 
 import pytest
@@ -318,19 +321,6 @@ class TestEdgeCases:
         assert doc is not None
         assert doc["node_id"] == "a::b::c"
 
-    def test_corrupt_json_returns_empty(self, tmp_path):
-        """Corrupt JSON file is handled gracefully by returning an empty dict."""
-        from opencrab.stores.local_doc_store import LocalDocStore
-
-        s = LocalDocStore(str(tmp_path / "corrupt"))
-        # Write corrupt JSON to the nodes file.
-        nodes_path = s._collection_path("nodes")
-        with open(nodes_path, "w") as f:
-            f.write("{bad json}")
-        # _load should catch JSONDecodeError and return {} → get_node_doc = None
-        result = s.get_node_doc("s1", "n1")
-        assert result is None
-
     def test_source_text_truncated_at_4096(self, store):
         """LocalDocStore truncates source text to 4096 chars on upsert."""
         long_text = "x" * 10_000
@@ -342,3 +332,322 @@ class TestEdgeCases:
         """_safe_str converts non-str values to str."""
         result = store._safe_str(42)
         assert result == "42"
+
+
+# ---------------------------------------------------------------------------
+# Corrupt collection file contract (issue #209)
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptCollection:
+    """``_load`` fails closed on a corrupt collection file: it raises
+    ``CorruptCollectionError`` and never overwrites the file. Replaces the
+    old ``test_corrupt_json_returns_empty`` (pinned the ``{}``-fallback bug
+    that let the first write after corruption silently destroy the file)."""
+
+    GARBAGE_MIDDLE = b'{"a": {"b": 1}, XXXX not json XXXX "c": 2}'
+
+    def _seeded(self, tmp_path, *, n=3):
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        s = LocalDocStore(str(tmp_path / "docs"))
+        for i in range(n):
+            s.upsert_node_doc("s1", "T", f"n{i}", {"i": i})
+        return s
+
+    def _builder(self, tmp_path):
+        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.local_doc_store import LocalDocStore
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.sql_store import SQLStore
+
+        graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+        doc = LocalDocStore(data_dir=str(tmp_path / "docs"))
+        sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
+        create_pack(sql, "actor-1", "pack-1")
+        return OntologyBuilder(graph, doc, sql), doc
+
+    @staticmethod
+    def _write(store, collection: str, content: bytes) -> bytes:
+        with open(store._collection_path(collection), "wb") as f:
+            f.write(content)
+        return content
+
+    @staticmethod
+    def _read(store, collection: str) -> bytes:
+        with open(store._collection_path(collection), "rb") as f:
+            return f.read()
+
+    # -- control ----------------------------------------------------------
+
+    def test_control_uncorrupted_file_reads_and_writes_normally(self, tmp_path):
+        s = self._seeded(tmp_path)
+        assert len(s.list_nodes(limit=100)) == 3
+        s.upsert_node_doc("s1", "T", "n3", {"i": 3})
+        assert len(s.list_nodes(limit=100)) == 4
+
+    # -- garbage in middle: nodes -------------------------------------------
+
+    def test_garbage_middle_nodes_reads_raise(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.get_node_doc("s1", "n0")
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+        with pytest.raises(CorruptCollectionError):
+            s.collection_stats()
+
+    def test_garbage_middle_nodes_writes_raise_and_bytes_unchanged(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.upsert_node_doc("s1", "T", "n9", {})
+        assert self._read(s, "nodes") == corrupt
+        with pytest.raises(CorruptCollectionError):
+            s.delete_node_doc("s1", "n0")
+        assert self._read(s, "nodes") == corrupt
+
+    def test_garbage_middle_nodes_sibling_collections_unaffected(self, tmp_path):
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        s.upsert_source("src1", "text", {})
+        s.log_event("ev", None, {})
+        assert s.get_source("src1") is not None
+        assert len(s.list_sources(limit=100)) == 1
+        assert len(s.get_audit_log(limit=100)) == 1
+        after = self._read(s, "nodes")
+        assert after == corrupt
+        assert os.path.getsize(s._collection_path("nodes")) == len(corrupt)
+        assert hashlib.sha256(after).hexdigest() == hashlib.sha256(corrupt).hexdigest()
+
+    # -- garbage in middle: sources ------------------------------------------
+
+    def test_garbage_middle_sources_reads_and_writes_raise(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "sources", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.get_source("x")
+        with pytest.raises(CorruptCollectionError):
+            s.list_sources(limit=100)
+        with pytest.raises(CorruptCollectionError):
+            s.upsert_source("x", "text", {})
+        assert self._read(s, "sources") == corrupt
+
+    def test_garbage_middle_sources_sibling_writes_succeed_bytes_unchanged(self, tmp_path):
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "sources", self.GARBAGE_MIDDLE)
+        s.upsert_node_doc("s1", "T", "n9", {})
+        s.log_event("ev", None, {})
+        assert self._read(s, "sources") == corrupt
+
+    def test_garbage_middle_sources_collection_stats_raises(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "sources", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.collection_stats()
+
+    # -- garbage in middle: audit_log ----------------------------------------
+
+    def test_garbage_middle_audit_log_reads_and_writes_raise(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "audit_log", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.get_audit_log(limit=100)
+        with pytest.raises(CorruptCollectionError):
+            s.log_event("ev", None, {})
+        assert self._read(s, "audit_log") == corrupt
+
+    def test_garbage_middle_audit_log_sibling_writes_succeed_bytes_unchanged(self, tmp_path):
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "audit_log", self.GARBAGE_MIDDLE)
+        s.upsert_node_doc("s1", "T", "n9", {})
+        s.upsert_source("src1", "text", {})
+        assert self._read(s, "audit_log") == corrupt
+
+    def test_garbage_middle_audit_log_collection_stats_raises(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "audit_log", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError):
+            s.collection_stats()
+
+    # -- real OntologyBuilder callers -----------------------------------
+
+    def test_real_builder_corrupt_nodes_json_blocks_add_node_entirely(self, tmp_path):
+        """Corrupt ``nodes.json`` is caught earlier than the design's receipt
+        row expected: ``node_identity_conflict``
+        (``opencrab/pack/write_gate.py``) probes ``docs.get_node_doc`` BEFORE
+        the builder creates any receipt or attempts a graph/sql/vector
+        write. ``_check_probes`` there treats any probe exception as
+        "cannot verify" (fail-closed) and ``add_node`` raises ``ValueError``
+        -- so a corrupt ``nodes.json`` blocks the whole node write, not just
+        the doc leg (stronger than the ``stores["docs"] = "error: ..."``
+        partial-receipt shape the ``audit_log.json`` case below produces)."""
+        from opencrab.auth import Principal, principal_scope
+
+        builder, doc = self._builder(tmp_path)
+        corrupt = self._write(doc, "nodes", self.GARBAGE_MIDDLE)
+        with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            with pytest.raises(ValueError, match="cannot verify existing ownership"):
+                builder.add_node(
+                    space="subject",
+                    node_type="User",
+                    node_id="u1",
+                    properties={"name": "Alice", "email": "alice@example.com", "role": "admin"},
+                    pack_id="pack-1",
+                )
+        assert self._read(doc, "nodes") == corrupt
+
+    def test_real_builder_corrupt_audit_log_receipt_error_node_still_written(self, tmp_path):
+        from opencrab.auth import Principal, principal_scope
+        from opencrab.ontology.builder import store_write_succeeded_for
+
+        builder, doc = self._builder(tmp_path)
+        corrupt = self._write(doc, "audit_log", self.GARBAGE_MIDDLE)
+        with principal_scope(Principal(user_id="actor-1", is_local=True, disabled=False)):
+            receipt = builder.add_node(
+                space="subject",
+                node_type="User",
+                node_id="u2",
+                properties={"name": "Bob", "email": "bob@example.com", "role": "admin"},
+                pack_id="pack-1",
+            )
+        stores = receipt["stores"]
+        assert stores["docs"].startswith("error: ")
+        assert "corrupt collection file 'audit_log'" in stores["docs"]
+        assert stores["graph"] == "ok"
+        assert store_write_succeeded_for(stores, "node") is True
+        assert doc.get_node_doc("subject", "u2") is not None
+        assert self._read(doc, "audit_log") == corrupt
+
+    # -- logging contract ---------------------------------------------------
+
+    def test_caplog_exactly_one_error_record_no_resetting_warning(self, tmp_path, caplog):
+        import logging
+
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        with caplog.at_level(logging.DEBUG, logger="opencrab.stores.local_doc_store"):
+            with pytest.raises(CorruptCollectionError):
+                s.get_node_doc("s1", "n0")
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert "nodes" in error_records[0].getMessage()
+        resetting_records = [
+            r for r in caplog.records if "resetting" in r.getMessage().lower()
+        ]
+        assert resetting_records == []
+
+    # -- truncated tail / empty / blank / invalid utf-8 ----------------------
+
+    def test_truncated_tail_raises_bytes_unchanged(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        full = self._read(s, "nodes")
+        truncated = full[: len(full) // 2]
+        self._write(s, "nodes", truncated)
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+        with pytest.raises(CorruptCollectionError):
+            s.upsert_node_doc("s1", "T", "n9", {})
+        assert self._read(s, "nodes") == truncated
+
+    def test_empty_file_raises(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", b"")
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+
+    def test_blank_lines_only_raises(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", b"\n\n   \n\t\n")
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+
+    def test_invalid_utf8_raises(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", b"\xff\xfe{")
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+
+    # -- top-level value is not a dict ---------------------------------------
+
+    @pytest.mark.parametrize("value", [[], None, "s", 1, True])
+    def test_top_level_not_dict_raises_bytes_unchanged(self, tmp_path, value):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        corrupt = self._write(s, "nodes", json.dumps(value).encode("utf-8"))
+        with pytest.raises(CorruptCollectionError):
+            s.list_nodes(limit=100)
+        with pytest.raises(CorruptCollectionError):
+            s.upsert_node_doc("s1", "T", "n9", {})
+        assert self._read(s, "nodes") == corrupt
+
+    # -- limit=0 short-circuit is unchanged -----------------------------
+
+    def test_limit_zero_short_circuits_even_when_corrupt(self, tmp_path):
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        assert s.list_nodes(limit=0) == []
+        self._write(s, "sources", self.GARBAGE_MIDDLE)
+        assert s.list_sources(limit=0) == []
+        self._write(s, "audit_log", self.GARBAGE_MIDDLE)
+        assert s.get_audit_log(limit=0) == []
+
+    # -- missing file is still a fresh store, not corrupt --------------------
+
+    def test_missing_file_returns_empty_not_raise(self, tmp_path):
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        s = LocalDocStore(str(tmp_path / "fresh"))
+        assert s.list_nodes(limit=100) == []
+        assert s.get_node_doc("s1", "n1") is None
+
+    # -- exception shape ------------------------------------------------
+
+    def test_exception_attributes_collection_and_path(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "sources", self.GARBAGE_MIDDLE)
+        with pytest.raises(CorruptCollectionError) as excinfo:
+            s.get_source("x")
+        exc = excinfo.value
+        assert exc.collection == "sources"
+        assert exc.path == s._collection_path("sources")
+        assert str(exc).startswith("corrupt collection file 'sources'")
+
+    # -- no partial write artifact --------------------------------------
+
+    def test_tmp_sibling_not_created_on_failed_write(self, tmp_path):
+        from opencrab.stores.local_doc_store import CorruptCollectionError
+
+        s = self._seeded(tmp_path)
+        self._write(s, "nodes", self.GARBAGE_MIDDLE)
+        tmp_sibling = s._collection_path("nodes") + ".tmp"
+        with pytest.raises(CorruptCollectionError):
+            s.upsert_node_doc("s1", "T", "n9", {})
+        assert not os.path.exists(tmp_sibling)
