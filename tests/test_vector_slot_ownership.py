@@ -665,3 +665,10 @@ class TestMigrationScriptNormalisesTheOwnershipTag:
             assert isinstance(expr.func, ast.Name) and expr.func.id == "slot_owner", (
                 "소유 태그가 공유 정규화를 거치지 않는다: "
                 f"{ast.unparse(expr)}")
+            # 인수까지 본다. 호출 이름만 보면 `slot_owner({})` 처럼 정제한 메타를
+            # 넘기지 않는 형태가 통과한다.
+            assert len(expr.args) == 1 and not expr.keywords, (
+                f"소유 태그 정규화의 인수 모양이 다르다: {ast.unparse(expr)}")
+            assert isinstance(expr.args[0], ast.Name) and expr.args[0].id == "clean", (
+                "정제한 메타가 아니라 다른 것을 정규화한다: "
+                f"{ast.unparse(expr)}")
