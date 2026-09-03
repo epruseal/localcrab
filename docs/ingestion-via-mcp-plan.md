@@ -48,7 +48,7 @@ VECTOR_BACKEND 명시됨?
 2. **원자적 purge-replace가 지금 MCP에 없다.** `pack_ingest`는 있지만 팩 삭제(purge)는 MCP write 도구로 노출돼 있지 않다 — 백엔드와 무관하게 필요한 갭.
 3. **chroma 경로(docker 모드)에는 여전히 구조적으로 필요.** chroma를 쓰는 한 "쓰기 프로세스는 MCP 하나뿐"이라는 구조가 유일한 해法이다.
 
-반대로 **`_write_lock()`(write.lock)은 현재 백엔드에 관계없이 모든 write 도구에 무조건 적용된다**(`dispatch_tool`, `opencrab/mcp/tools.py` — `WRITE_TOOLS`에 속하면 `_write_lock()`으로 직렬화). `chroma.lock`은 이미 `vector_backend_resolved`로 조건부화됐지만, `write.lock` 직렬화는 아직 그 선례를 따르지 않았다 — pg 모드에서는 스토어가 MVCC로 진짜 동시 라이터를 지원함에도 MCP 계층에서 인위적으로 한 번에 하나만 쓰게 된다. 이는 본 계획의 결함이 아니라 **향후 최적화 여지**로 기록해 둔다(§6 단점).
+반대로 **`_write_lock()`(write.lock)은 현재 백엔드에 관계없이 모든 write 도구에 무조건 적용된다**(`dispatch_tool`, `opencrab/mcp/tools.py` — `WRITE_TOOLS`에 속하면 `_write_lock()`으로 직렬화). `chroma.lock`은 이제 chroma 클라이언트를 여는 주체가 곧 잡는 주체이므로 백엔드 분기 자체가 필요없지만(#140), `write.lock` 직렬화는 여전히 백엔드 무관하게 걸린다 — pg 모드에서는 스토어가 MVCC로 진짜 동시 라이터를 지원함에도 MCP 계층에서 인위적으로 한 번에 하나만 쓰게 된다. 이는 본 계획의 결함이 아니라 **향후 최적화 여지**로 기록해 둔다(§6 단점).
 
 ---
 
@@ -109,7 +109,7 @@ VECTOR_BACKEND 명시됨?
 **로더 측 변경 (개념)**
 - 현재 `OntologyBuilder` 직접 호출 지점(노드 `load_nodes`, 엣지 `load_edges`, 청크 `load_chunks`)을 MCP 클라이언트 호출로 치환하는 어댑터를 둔다. **임베딩은 서버측에서 계산되므로 로더는 텍스트만 전송**한다(chroma/sqlite-vec 모두 동일 — 앱측 임베딩 후 저장이라는 계약은 `sqlite_vec_store.py`가 chroma의 openai 경로를 그대로 따른다).
 - **`id_map`은 로더가 입력 파일에서 직접 구축한다.** `load_nodes`가 이미 입력 row의 space/node_type을 정규화해 `id_map[node_id]=(space, node_type)`를 만들고(`load_local_packs.py:420`) 엣지 적재 시 조회한다(`456-464`). 즉 **서버 응답에 의존할 필요가 없다** — MCP 모드에서도 같은 입력 기반 맵을 유지하면 된다.
-- `chroma.lock(LOCK_EX)` 획득 로직은 MCP 모드에서 **건너뛴다**(로더가 chroma를 직접 만지지 않으므로). 참고: 현행 로더는 백엔드 무관 무조건 flock하지만, sqlite-vec/pg에서는 MCP 서버가 SH를 잡지 않아(`tools.py` 조건부 획득) 충돌이 발생하지 않는다 — 조건부 스킵은 MCP 서버 쪽(§1.2) 이야기다.
+- `chroma.lock(LOCK_EX)` 획득 로직은 MCP 모드에서 **건너뛴다**(로더가 chroma를 직접 만지지 않으므로). 참고: 현행 로더는 백엔드 무관 무조건 flock하지만, sqlite-vec/pg에서는 `ChromaStore` 자체가 만들어지지 않아 아무도 SH를 잡지 않으므로(#140) 충돌이 발생하지 않는다.
 
 ---
 
@@ -218,7 +218,7 @@ VECTOR_BACKEND 명시됨?
 - **purge 후 재적재 정합성:** 직접 모드 `--fresh` 결과와 MCP `pack_purge`+ingest 결과의 노드/엣지/청크 수·샘플이 일치하는지 비교.
 - **응답 부분실패 검출:** content wrapper(`{"content":[{"text":…}]}`) 파싱 후 `error`/`node_errors`/`edge_errors`를 로더가 검출·재시도하는지 확인(HTTP 200이어도 본문 error 가능).
 - **대량 적재 처리량:** 적응형 배치(큰 배치) vs 고정 256, JSON-RPC 배치 배열 유무별 적재 시간 측정. 다수 팩 동시 로드 시나리오에서 직접 모드 대비 회귀 폭 기록.
-- **락 안전:** chroma 백엔드일 때 MCP 모드 적재 중 `chroma.lock(LOCK_EX)`를 잡지 않음을 확인(로더가 chroma 미접근). sqlite-vec/pg 백엔드일 때는 MCP 서버가 SH를 잡지 않으므로(`vector_backend_resolved != "chroma"` — MCP 측 조건부 획득) 로더의 무조건 flock과 충돌하지 않음을 확인.
+- **락 안전:** chroma 백엔드일 때 MCP 모드 적재 중 `chroma.lock(LOCK_EX)`를 잡지 않음을 확인(로더가 chroma 미접근). sqlite-vec/pg 백엔드일 때는 `ChromaStore` 자체가 만들어지지 않아 아무도 SH를 잡지 않으므로(#140) 로더의 무조건 flock과 충돌하지 않음을 확인.
 - **백업 복구 리허설:** §5 단계 0 백업본으로 복원 시 적재 전 상태로 되돌아가는지 1회 확인.
 
 ---

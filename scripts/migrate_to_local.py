@@ -477,10 +477,23 @@ def _migrate_vectors_locked(
 
     Two things this function exists to guarantee (issue #140).
 
-    Lock ORDER is chroma.lock outside, write.lock inside. A live MCP server
-    holds chroma.lock (shared) for its whole lifetime and then takes write.lock
-    per write tool; taking these two in the opposite order here would close a
-    cycle and deadlock both sides.
+    Lock ORDER is chroma.lock outside, write.lock inside. That is the global
+    rule, because a live MCP server holds chroma.lock (shared) for its whole
+    lifetime and takes write.lock per write tool -- any path using both must
+    therefore take chroma.lock first.
+
+    One path in the repository inverts it, and it is bounded rather than
+    removed. ``dispatch_tool`` runs a write handler inside write.lock, and if
+    the MCP context has not been built yet, the handler's first
+    ``_get_context()`` builds a ChromaStore -- taking chroma.lock while
+    write.lock is held. That inversion cannot deadlock: the shared side gives
+    up after CHROMA_LOCK_TIMEOUT, raises, and drops write.lock. The write.lock
+    acquisition below is therefore given a finite timeout too, so neither side
+    can wait forever: worst case both fail with a clear error instead of one
+    hanging. Removing the inversion structurally needs a context-need axis the
+    registry does not have (``writes`` means "needs write.lock", not "needs
+    stores") and would have to cope with handlers that decide at runtime, so
+    it is tracked separately rather than bolted on here.
 
     Lock SCOPE covers the client's whole lifetime, not just the copy loop. The
     PersistentClient is created and dropped inside the ``with``, so the lock is
@@ -495,10 +508,17 @@ def _migrate_vectors_locked(
     chroma_local_path = os.path.join(local_data_dir, "chroma")
     os.makedirs(chroma_local_path, exist_ok=True)
 
+    # Wait longer than the counterparty can hold write.lock while it is itself
+    # blocked on chroma.lock (CHROMA_LOCK_TIMEOUT), plus headroom, so a normal
+    # hand-off is not mistaken for a stuck peer.
+    from opencrab.config import get_settings
+
+    write_timeout = get_settings().chroma_lock_timeout + 60.0
+
     with file_lock("chroma.lock", chroma_lock_dir(chroma_local_path)):
         local_chroma = chromadb.PersistentClient(path=chroma_local_path)
         try:
-            with file_lock("write.lock", local_data_dir):
+            with file_lock("write.lock", local_data_dir, timeout=write_timeout):
                 return migrate_vectors(
                     http_client, local_chroma, collection, batch_size, logger
                 )

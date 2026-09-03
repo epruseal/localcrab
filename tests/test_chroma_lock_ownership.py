@@ -439,3 +439,183 @@ class TestCliLockTimeoutShape:
         with pytest.raises(RuntimeError, match="vector boom"):
             cli_mod._make_stores(cfg, graph=True, vector=True)
         assert closed == ["graph"], "앞서 연 스토어가 닫히지 않았다"
+
+
+# ---------------------------------------------------------------------------
+# Lock ordering
+# ---------------------------------------------------------------------------
+
+
+_WRITE_PROBE = r"""
+import sys
+from opencrab.locking import acquire_file_lock, release_file_lock
+try:
+    fh = acquire_file_lock("write.lock", sys.argv[1], shared=False, timeout=1.0)
+except TimeoutError:
+    print("REFUSED")
+else:
+    release_file_lock(fh)
+    print("GRANTED")
+"""
+
+
+def write_lock_probe(lock_dir: str) -> str:
+    """Return GRANTED or REFUSED for an exclusive write.lock claim."""
+    out = subprocess.run(
+        [sys.executable, "-c", _WRITE_PROBE, lock_dir],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    result = (out.stdout or "").strip()
+    assert result in ("GRANTED", "REFUSED"), f"probe failed: {out.stdout}{out.stderr}"
+    return result
+
+
+class TestLockOrderInversionIsBounded:
+    """The global order is chroma.lock before write.lock (#140).
+
+    dispatch_tool inverts it on exactly one path: the first write tool call
+    builds the MCP context inside write.lock, and building it takes
+    chroma.lock. Removing that inversion structurally needs a context-need axis
+    the registry does not have, so it is BOUNDED instead: both sides use a
+    finite wait, so the inversion resolves with a clear error rather than
+    hanging. This pins that bound.
+    """
+
+    def test_inverted_order_times_out_and_frees_the_peer(self, chroma_cls, tmp_path):
+        import multiprocessing
+        import time
+
+        from opencrab.locking import file_lock
+        from opencrab.stores.chroma_store import ChromaLockTimeoutError
+
+        data_dir = str(tmp_path)
+        persist = os.path.join(data_dir, "chroma")
+
+        # A migration standing in as the exclusive chroma.lock holder, in a
+        # separate process so its flock is genuinely another owner.
+        ready = multiprocessing.Event()
+        stop = multiprocessing.Event()
+
+        def hold_exclusive(data_dir: str, ready, stop) -> None:
+            from opencrab.locking import acquire_file_lock, release_file_lock
+
+            fh = acquire_file_lock("chroma.lock", data_dir, shared=False)
+            ready.set()
+            stop.wait(60)
+            release_file_lock(fh)
+
+        holder = multiprocessing.Process(
+            target=hold_exclusive, args=(data_dir, ready, stop)
+        )
+        holder.start()
+        try:
+            assert ready.wait(30), "배타 보유자가 기동하지 않았다"
+
+            acquired_calls: list[str] = []
+            real_acquire = chroma_cls._acquire_local_lock
+
+            def spy(self):
+                # Non-vacuity: record that we really are inside the inverted
+                # window -- this process holds write.lock at this moment.
+                acquired_calls.append(write_lock_probe(data_dir))
+                return real_acquire(self)
+
+            chroma_cls._acquire_local_lock = spy
+            try:
+                started = time.monotonic()
+                # The inversion: write.lock first, then a chroma client.
+                with file_lock("write.lock", data_dir):
+                    with pytest.raises(ChromaLockTimeoutError):
+                        make_store(chroma_cls, persist, lock_timeout=1.0)
+                elapsed = time.monotonic() - started
+            finally:
+                chroma_cls._acquire_local_lock = real_acquire
+
+            # Non-vacuity: the acquisition really ran, and it ran while this
+            # process held write.lock. Without these the test would pass even
+            # if nothing had been attempted.
+            assert acquired_calls == ["REFUSED"], (
+                f"역전 상황에 실제로 들어가지 않았다: {acquired_calls}"
+            )
+            assert holder.is_alive(), "배타 보유자가 도중에 죽었다"
+            # Bounded, not hanging.
+            assert elapsed < 30, f"유한 시간에 끝나지 않았다: {elapsed}s"
+            # And the peer can now proceed: write.lock was given back.
+            assert write_lock_probe(data_dir) == "GRANTED"
+        finally:
+            stop.set()
+            holder.join(30)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(10)
+
+    def test_migration_bounds_its_write_lock_wait(self):
+        """마이그레이션의 write.lock 획득이 무한 대기가 아니다.
+
+        위 테스트는 공유 쪽 상한만 본다. 배타 쪽 상한은 인자로만 드러나므로
+        여기서 따로 고정한다. timeout 인자가 빠지면 상대가 풀릴 때까지
+        무기한 매달린다."""
+        import ast
+
+        # Parsed from source rather than imported: the script pulls sibling
+        # modules that are not importable as a package from the test session.
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tree = ast.parse(
+            open(
+                os.path.join(repo, "scripts", "migrate_to_local.py"), encoding="utf-8"
+            ).read()
+        )
+        target = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_migrate_vectors_locked"
+        ]
+        assert len(target) == 1, "_migrate_vectors_locked 를 찾지 못했다"
+        write_lock_calls = [
+            node
+            for node in ast.walk(target[0])
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "file_lock"
+            and node.args
+            and getattr(node.args[0], "value", None) == "write.lock"
+        ]
+        assert len(write_lock_calls) == 1, "write.lock 획득 지점을 찾지 못했다"
+        assert any(kw.arg == "timeout" for kw in write_lock_calls[0].keywords), (
+            "마이그레이션의 write.lock 획득에 timeout 이 없다 — 무한 대기"
+        )
+
+
+class TestRestContextFailureAtomicity:
+    def test_rest_build_context_closes_earlier_stores(self, tmp_path, monkeypatch):
+        """엣지: REST 컨텍스트 빌더도 뒤쪽 팩토리 실패 시 앞을 닫는다.
+
+        MCP 와 CLI 는 각자 고정돼 있는데 REST 만 없었다."""
+        pytest.importorskip("fastapi")
+        import apps.api.main as api_main
+
+        closed: list[str] = []
+
+        class Fake:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            def close(self) -> None:
+                closed.append(self._name)
+
+            def ensure_constraints(self) -> None:
+                pass
+
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(api_main, "make_graph_store", lambda s: Fake("graph"))
+        monkeypatch.setattr(api_main, "make_vector_store", lambda s: Fake("vector"))
+        monkeypatch.setattr(
+            api_main,
+            "make_doc_store",
+            lambda s: (_ for _ in ()).throw(RuntimeError("doc boom")),
+        )
+        with pytest.raises(RuntimeError, match="doc boom"):
+            api_main._build_context()
+        assert closed == ["vector", "graph"], f"정리 순서가 다르다: {closed}"

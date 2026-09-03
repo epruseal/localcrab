@@ -115,7 +115,20 @@ def _lock_data_dir() -> str:
 
 @contextmanager
 def _write_lock():
-    """Hold an exclusive cross-process lock for the duration of a write tool."""
+    """Hold an exclusive cross-process lock for the duration of a write tool.
+
+    LOCK ORDER (#140): chroma.lock comes before write.lock anywhere both are
+    taken, because a chroma-backed server holds chroma.lock for its whole
+    lifetime and takes write.lock repeatedly inside it.
+
+    dispatch_tool inverts that on one path: the FIRST write tool call builds
+    the context inside this lock, and building it takes chroma.lock. The
+    inversion is bounded, not removed -- the chroma side times out
+    (CHROMA_LOCK_TIMEOUT) and releases this lock, and the migration's own
+    write.lock wait is bounded too, so neither side hangs. See
+    scripts/migrate_to_local.py:_migrate_vectors_locked for why removing it
+    structurally is tracked separately.
+    """
     with file_lock("write.lock", _lock_data_dir()):
         yield
 
