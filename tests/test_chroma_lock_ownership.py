@@ -1436,7 +1436,10 @@ class TestOuterChromaLockWaitIsBounded:
             msg = result[len("TIMEOUT:"):]
             # Item by item. A vague "has guidance" check would pass a message
             # that names the wrong kind of holder.
-            assert "chroma.lock" in msg, f"잠금 경로가 없다: {msg}"
+            # The ACTUAL directory, not the literal "chroma.lock": the fixed
+            # sentence already contains that word, so matching it would pass a
+            # message that dropped the path entirely.
+            assert data_dir in msg, f"잠금 파일의 실제 경로가 없다: {msg}"
             assert "shared" in msg and "exclusiv" in msg, (
                 f"공유·배타 두 가능성을 함께 안내하지 않는다: {msg}"
             )
