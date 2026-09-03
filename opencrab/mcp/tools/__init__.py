@@ -50,6 +50,7 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -173,12 +174,68 @@ def _current_read_scope(ctx: dict[str, Any]) -> frozenset[str]:
 
 _context: dict[str, Any] = {}
 
+# Serialises the *initialisation* of _context (#192). Without it, two threads
+# making the very first call both pass the `if _context:` check and each run
+# every store factory, leaving the process with two store instances per
+# backend. Each adapter's instance-level lock is per instance, so duplicated
+# instances serialise nothing against each other -- which is the root cause
+# the chroma-specific collection-key lock (#186) was defending a symptom of.
+#
+# Scope: threads within one process. Cross-process initialisation is a
+# separate concern owned by write.lock / chroma.lock (#140, #141).
+_context_init_lock = threading.Lock()
+
+# Ident of the thread currently running the initialisation body, or None.
+# Purely a re-entry tripwire: no factory calls back into _get_context() today
+# (verified across opencrab/), but a plain Lock would turn a future re-entry
+# into a silent deadlock, and an RLock would let the re-entrant call run the
+# factories a second time -- recreating the very duplication this fix exists
+# to remove. Failing fast is the only option that stays diagnosable.
+_context_init_thread: int | None = None
+
 
 def _get_context() -> dict[str, Any]:
-    """Lazily initialise LocalCrab stores and engines using the local factory."""
-    global _context
+    """Lazily initialise LocalCrab stores and engines using the local factory.
+
+    Initialisation is serialised so that concurrent first callers share one
+    set of store instances (#192). The fast path below reads ``_context``
+    without the lock; that is safe under CPython, where a global read and a
+    global rebinding each execute atomically under the GIL, and the fully
+    built dictionary is published in a single assignment at the end (never
+    filled in place, which would expose a half-populated mapping to a
+    lock-free reader). On a free-threading build the fast path would have to
+    move inside the lock.
+    """
+    global _context, _context_init_thread
     if _context:
         return _context
+
+    if _context_init_thread == threading.get_ident():
+        raise RuntimeError(
+            "reentrant _get_context() call: a store factory called back into "
+            "the context initialiser, which cannot complete while it is still "
+            "running. Break the cycle in the factory."
+        )
+
+    with _context_init_lock:
+        # Another thread may have finished initialising while this one waited.
+        if _context:
+            return _context
+        _context_init_thread = threading.get_ident()
+        try:
+            return _build_context()
+        finally:
+            _context_init_thread = None
+
+
+def _build_context() -> dict[str, Any]:
+    """Build and publish the store/engine context. Callers hold the init lock.
+
+    Split out only so the initialisation body keeps its original indentation
+    and stays readable; it is not a separate entry point. On failure nothing
+    is published, so the next _get_context() call retries from scratch.
+    """
+    global _context
 
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
