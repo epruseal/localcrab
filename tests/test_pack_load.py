@@ -399,6 +399,68 @@ class TestLoadNodesIncremental:
             "pack-1", f, builder, {}, {}, graph, docs, {})
         assert (n_new, n_chg, n_same) == (1, 0, 0)
 
+    def test_live_property_drift_converges_in_one_run(self, live, tmp_path):
+        """**#279 회귀.** 라이브 properties 드리프트는 **한 런에 해소**된다.
+
+        라이브 행이 파일에 없는 키를 갖고 있으면 그 런은 전량 chg 다. 그 자체는
+        정상이다 — 로더가 파일 상태로 되돌리는 중이다. 결함은 그 다음 런이 또
+        chg 일 때다. 그러면 증분 모드가 매 런 전량 재임베딩으로 퇴화한다.
+
+        #279 는 그 전량 chg 를 digest 계산식 드리프트로 지목했는데 판정 경로는
+        digest 를 보지 않는다(`live[0] == node_type and live_props == props`).
+        실제 원인은 properties 드리프트였고, #277 이전에는 property-only 갱신이
+        CAS digest 없이 거부돼(`node identity conflict`) 드리프트가 영영 해소되지
+        않았다. #277 이 모든 갱신에 CAS digest 를 넘기면서 그 쓰기가 성공하게 됐고,
+        CAS 갱신 경로가 properties 를 전량 치환하므로 다음 런이 same 으로 복귀한다.
+
+        **런마다 몫이 다르다.** 1차는 드리프트한 행을 회수한다 — #277 을 되돌린
+        변이는 여기서 err 로 갈린다(실측). **불변식이 판정되는 자리는 2차다.**
+        properties 를 전량 치환하지 않는 쓰기 경로로 회귀하면 1차는 chg 로 멀쩡히
+        통과하고 2차에서 다시 chg 가 나온다 — 그것이 이슈가 보고한 증상이다.
+        `same` 분기는 그래프에 쓰지 않으므로(doc 축 정리만 한다) 그 한 번의 same 이
+        곧 고정점 확인이다. 3차는 **독립 검출 대상이 없는 반복**이다. 지워도 불변식은
+        그대로 잡힌다. 남긴 이유는 비용이 0이고 수렴 뒤에도 같은 결과가 나온다는 것을
+        읽는 사람이 눈으로 보기 때문이지, 새로 잡아내는 변이가 있어서가 아니다.
+
+        이 검사가 거는 축은 **그래프 노드 properties** 하나다. doc 행 유실 회수는
+        `test_pack_load_r12_selfheal_gates.py` 가 따로 걸고, neo4j 의 CAS 두 출처
+        (사전 검사는 재계산, 쓰기는 저장 `node_digest` 속성)는 이 픽스처로 재현되지
+        않아 #298 이 따로 추적한다.
+        """
+        builder, graph, docs = live
+        rows = [_node(id=f"n{i}", 발행연도="2026") for i in range(1, 4)]
+        f = _write_jsonl(tmp_path / "nodes.jsonl", rows)
+        pack_load.load_nodes("pack-1", f, builder, {})
+
+        # 구 로더가 남긴 잔재를 모사한다: **라이브 행에만** 파일에 없는 키를 심는다.
+        # 손으로 지어낸 live_nodes 를 넘기지 않고 실제 스토어를 드리프트시킨다 —
+        # 수렴은 스토어의 쓰기 경로가 properties 를 전량 치환하는지에 달려 있어서,
+        # 그 쓰기를 통과시키지 않으면 검사할 대상 자체가 없다.
+        seeded = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        assert set(seeded) == {"n1", "n2", "n3"}, f"사전 조건: 3행 적재 (실제 {sorted(seeded)})"
+        for node_id, (node_type, space, props) in seeded.items():
+            drifted = dict(props)
+            drifted["legacy_only_key"] = "구 로더 잔재"
+            digest = graph.get_node_digest(node_id, node_type=node_type)
+            graph.update_node(node_id, digest, node_type, drifted, space)
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])[:5]
+
+        assert _run() == (0, 3, 0, 0, 0), "드리프트한 행이 chg 로 회수되지 않았다"
+        assert _run() == (0, 0, 3, 0, 0), (
+            "2차 런이 same 으로 수렴하지 않았다 — 증분이 매 런 전량 재임베딩으로 퇴화한다(#279)")
+        assert _run() == (0, 0, 3, 0, 0), (
+            "3차 런이 2차와 다른 결과를 냈다 — 판정이 결정적이지 않다"
+            "(이 단언은 새 변이를 잡으라고 있는 것이 아니다, docstring 참고)")
+
+        left = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        assert all("legacy_only_key" not in props for _t, _s, props in left.values()), (
+            "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
+
 
 class TestLoadEdges:
     def _map(self):
