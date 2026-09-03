@@ -386,6 +386,13 @@ class TestNonePackIdIsStoredAsUnowned:
     읽으므로, 저장값이 `"None"` 이면 **같은 메타의 재적재가 거부된다** — 자기 팩
     재적재가 실패하는 정상 경로 파손이다. 소유 태그를 쓰는 자리도 읽는 자리와
     같은 `slot_owner` 를 거쳐야 한다.
+
+    **파손이 관측된 것은 pgvector 한 곳이다.** sqlite-vec 은 삽입 전에
+    `_sanitize_metadata` 가 `None` 을 빈 문자열로 접어 우연히 무사했다. 그래서
+    저장 정규화를 되돌려도 이 클래스의 sqlite-vec 파라미터는 RED 가 되지 않는다.
+    그 축을 남기는 것은 버그를 재기 위해서가 아니라 **계약을 걸기 위해서**다:
+    정제 단계가 어떻게 바뀌든 저장된 소유 태그는 미소유여야 한다. 이 파일의 다른
+    계약 테스트가 백엔드를 파라미터로 도는 것과 같은 방식이다.
     """
 
     @pytest.fixture(params=["sqlite-vec", "pg"])
@@ -581,3 +588,52 @@ class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
         finally:
             if hasattr(store, "close"):
                 store.close()
+
+
+# ---------------------------------------------------------------------------
+# 엣지 — 이관 스크립트도 같은 정규화를 쓴다
+# ---------------------------------------------------------------------------
+
+
+class TestMigrationScriptNormalisesTheOwnershipTag:
+    """chroma 에서 sqlite-vec 으로 옮기는 스크립트가 소유 태그를 정규화한다.
+
+    그 스크립트는 소유 컬럼을 컬럼으로 복사하지 않고 **메타에서 값을 꺼내 새
+    컬럼을 만든다.** 그래서 스토어와 같은 정규화를 거쳐야 한다. `_sanitize_metadata`
+    가 `None` 은 접지만 `0` 과 `False` 는 그대로 두므로, `str()` 을 쓰면 그것들이
+    `"0"` 과 `"False"` 로 저장된다. 읽는 쪽 `slot_owner` 는 셋 다 미소유로 접으므로
+    이관 직후 그 행의 재적재가 거부된다.
+
+    소유 컬럼을 컬럼으로 복사하는 다른 이관 스크립트 둘은 대상이 아니다. 그쪽은
+    원본 보존이 목적이고 dict 정규화가 개입할 자리가 없다.
+    """
+
+    def test_falsy_ownership_tags_all_land_as_unowned(self):
+        """정상: `None` 과 `0` 과 `False` 가 전부 미소유 컬럼값이 된다."""
+        from opencrab.stores._vector_base import slot_owner
+        from opencrab.stores.chroma_store import _sanitize_metadata
+
+        for raw in ({"pack_id": None}, {"pack_id": 0}, {"pack_id": False}, {}):
+            clean = _sanitize_metadata(dict(raw))
+            assert slot_owner(clean) == "", (
+                f"{raw} 가 미소유로 저장되지 않는다: {slot_owner(clean)!r}")
+
+    def test_a_real_pack_name_survives(self):
+        """정상: 실제 팩 이름은 그대로 남는다(정규화가 소유를 지우지 않는다)."""
+        from opencrab.stores._vector_base import slot_owner
+        from opencrab.stores.chroma_store import _sanitize_metadata
+
+        assert slot_owner(_sanitize_metadata({"pack_id": "pack-a"})) == "pack-a"
+
+    def test_the_script_uses_the_shared_normaliser(self):
+        """이 축은 소스 대조다. 스크립트가 `str(...get("pack_id"...))` 로 돌아가면
+        위 두 단언은 여전히 통과하므로(그 함수들을 직접 부르니까) 실제 호출 지점을
+        본다. 스크립트를 돌리려면 실 chroma 컬렉션이 필요해 여기서 태우지 않는다."""
+        import pathlib as _pathlib
+
+        source = _pathlib.Path(__file__).resolve().parents[1] / (
+            "scripts/migrate_chroma_to_sqlite_vec.py")
+        text = source.read_text(encoding="utf-8")
+        assert "slot_owner(clean)" in text, "이관 스크립트가 공유 정규화를 쓰지 않는다"
+        assert 'str(clean.get("pack_id"' not in text, (
+            "이관 스크립트에 정규화를 거치지 않는 소유 태그 저장이 남았다")

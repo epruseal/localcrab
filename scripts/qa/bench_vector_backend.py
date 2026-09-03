@@ -496,6 +496,8 @@ def main() -> int:
             f"pack_id TEXT partition key, embedding float[{DIM}] distance_metric=cosine)"
         )
 
+        from opencrab.stores._vector_base import slot_owner
+
         # stream + insert + reservoir-sample query vectors
         q_ids: list[str] = []
         q_vecs: list[bytes] = []
@@ -512,8 +514,6 @@ def main() -> int:
             metas = got["metadatas"] or [{} for _ in ids]
             if not ids:
                 break
-            from opencrab.stores._vector_base import slot_owner
-
             rows = []
             for _id, emb, meta in zip(ids, embs, metas):
                 vec = list(emb)

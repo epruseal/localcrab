@@ -33,11 +33,13 @@ CONTRACT — an owned slot may only be rewritten by its owner [#197]:
     existing row unowned (``pack_id`` empty, absent, or None) -> pass, because
     backfill and migration take those over on purpose; existing owner equals
     the incoming pack -> pass, the ordinary re-ingest; otherwise -> ValueError,
-    the incoming pack being unowned included. One batch that names two
-    different packs for one id is refused as well, before the store is read:
-    on an empty slot both records look new, and write order must not be what
-    decides the owner. The whole batch is judged before any of it is applied,
-    so a rejected batch leaves no partial write. See ``slot_owner``,
+    the incoming pack being unowned included. One batch that claims two
+    different OWNERSHIP STATES for one id is refused as well, before the store
+    is read -- unowned is one of those states, so a pack and a no-pack record
+    fighting over one id is a conflict just as two packs are. On an empty slot
+    every record looks new, and neither write order nor the backend must be
+    what decides the owner. The whole batch is judged before any of it is
+    applied, so a rejected batch leaves no partial write. See ``slot_owner``,
     ``reject_batch_pack_conflicts`` and ``reject_foreign_slot_writes``.
 
     ENFORCEMENT IS TWO LAYERS, and they are not redundant. The pre-check above
@@ -216,6 +218,16 @@ def slot_owner(metadata: Mapping[str, Any] | None) -> str:
     state -- ``builder.py`` writes ``str(props.get("pack_id") or "")`` for a
     node with no pack, and the SQL stores put that empty string in the
     ``pack_id`` column -- so the gate must not tell them apart.
+
+    Any other falsy value (``0``, ``False``) collapses to unowned as well,
+    because of the ``or ""``. That is deliberate and it matches the graph
+    side's own ``str(props.get("pack_id") or "")``. It is safe here for one
+    reason: this is the single function BOTH the reader and the writer of the
+    ownership tag go through, so the two can never disagree about a value.
+    Note the ``metadata`` JSON keeps whatever the caller passed, so a caller
+    that puts ``0`` there leaves a column and a JSON field that read
+    differently -- ``pack_id`` names a pack, and no producer in this codebase
+    writes a number into it.
     """
     if not metadata:
         return ""
