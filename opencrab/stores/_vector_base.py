@@ -63,14 +63,21 @@ CONTRACT — an owned slot may only be rewritten by its owner [#197]:
     ``add_texts`` is not gated either — its ids are time-salted, and the SQL
     backends already reject a duplicate primary key. A slot that a foreign
     pack took over BEFORE this gate existed is not healed by it; the gate only
-    stops new ones. The same applies to one specific legacy shape: a pgvector
-    row whose owner column holds the literal ``'None'`` because the pre-gate
-    writer ran ``str(None)`` on a ``pack_id`` of ``None``. That row reads as
-    owned by a pack named ``None`` here, so re-ingesting the same metadata is
-    refused. This layer deliberately does NOT special-case that string -- a
-    pack really named ``None`` would lose its ownership if it did. See
-    ``docs/vector-backends.md`` for the query that finds those rows and the
-    statement that repairs them. Metadata-only update paths
+    stops new ones. The same applies to one specific legacy shape: a row in
+    EITHER SQL backend whose owner column holds the literal ``'None'``,
+    because the pre-gate writer ran ``str(meta.get("pack_id", ""))`` over a
+    ``pack_id`` that was present and ``None``. That row reads as owned by a
+    pack named ``None`` here, so re-ingesting the same metadata is refused.
+
+    This layer does not fold that string to unowned on its own. Not because it
+    could not tell the two apart -- the stored ``metadata``'s ``pack_id`` being
+    SQL NULL separates a legacy row from a pack genuinely named ``None``, and
+    the repair in ``docs/vector-backends.md`` uses exactly that. It is because
+    reading that second column on every write would put a one-off legacy shape
+    into the permanent contract, and because rewriting stored rows is a data
+    change an operator decides. So the gate reads the stored value as it
+    stands, and the docs carry the query that finds those rows plus the repair
+    for each backend. Metadata-only update paths
     (``opencrab/pack/load.py:_vec_meta_update``) do not bypass any of this:
     they check the existing row's ``pack_id`` before patching the metadata
     column and fall back to ``upsert_texts`` on a mismatch, which now refuses

@@ -534,30 +534,57 @@ record = {"id": str, "embedding": list[float],
 프로세스 내 락까지가 한계다. 프로세스 간 직렬화는 종전에도 이 계층이 제공하지 않았고 지금도
 호출자의 `write.lock` 규율이다.
 
-**업그레이드 단서 — 레거시 pgvector 행의 `'None'` 소유 태그**. 이 게이트 이전의 pgvector writer 는
-`metadata["pack_id"]` 가 `None` 일 때 소유 컬럼에 리터럴 문자열 `'None'` 을 넣었다(`str(None)`).
+**업그레이드 단서 — 레거시 `'None'` 소유 태그 행 (SQL 두 백엔드 공통)**. 이 게이트 이전의 SQL
+writer 는 `metadata["pack_id"]` 가 `None` 일 때 소유 컬럼에 리터럴 문자열 `'None'` 을 넣었다
+(`str(None)`). `str(meta.get("pack_id", ""))` 는 키가 **있고** 값이 `None` 일 때 기본값을 쓰지
+않기 때문이다. `sqlite_vec_store` 와 `pg_vector_store` 가 같은 식을 썼으므로 **두 백엔드 모두**
+그런 행을 가질 수 있다. chroma 는 소유 전용 컬럼이 없어 이 형태가 생기지 않는다.
+
 그 행은 의도상 미소유인데 게이트는 `None` 이라는 이름의 팩이 소유한 것으로 읽는다. 그래서 **같은
 메타로 다시 적재하면 거부된다.** 새 정규화는 앞으로 쓰는 값만 고치고 이미 저장된 값은 건드리지 않는다.
 
 이 값을 만들 수 있었던 경로는 좁다. 팩 적재와 노드 쓰기는 항상 문자열을 넣으므로, 호출자가
-`pack_id` 를 명시적으로 `null` 로 준 적재에서만 생긴다. 그런 행이 있는지 확인하고 고치는 것은
-운영자의 판단이다. 이 계층은 `'None'` 을 미소유로 해석하지 않는다 — 그렇게 하면 실제로 `None`
-이라는 이름을 쓰는 팩의 소유가 사라진다.
+`pack_id` 를 명시적으로 `null` 로 준 적재에서만 생긴다.
 
-확인:
+**왜 게이트가 이 행을 알아서 접지 않는가.** 접을 수 없어서가 아니다. 아래 수리 문장이 쓰는
+판별자(`metadata` 의 `pack_id` 가 SQL NULL 인가)가 레거시 행과 실제 `None` 이름 팩의 행을
+무손실로 가른다. 그것을 게이트에 넣지 않은 이유는 둘이다. 첫째, 그러면 모든 쓰기의 소유자 조회가
+컬럼 하나를 더 읽어야 하고, 일회성 레거시 형태가 영구 계약에 박힌다. 둘째, 저장된 행을 고치는
+것은 데이터 변경이라 운영자가 판단할 일이다. 그래서 게이트는 저장된 값을 곧이곧대로 읽고,
+수리 수단만 아래에 둔다.
+
+기본 테이블명은 pgvector 가 `opencrab_vectors_kure`, sqlite-vec 이 `vectors_kure` 다. 배포가
+바꿨으면 그 이름으로 읽는다.
+
+확인 (두 백엔드 공통):
 
 ```sql
 SELECT count(*) FROM <vector_table> WHERE pack_id = 'None';
 ```
 
-고치기(운영자가 판단해 실행한다. 실행 전 백업하라):
+**pgvector 수리** (운영자가 판단해 실행한다. 실행 전 백업하라):
 
 ```sql
 UPDATE <vector_table> SET pack_id = '' WHERE pack_id = 'None' AND metadata->>'pack_id' IS NULL;
 ```
 
 `metadata->>'pack_id' IS NULL` 조건이 실제로 `None` 이라는 이름을 쓰는 팩의 행을 지켜 준다.
-그 팩의 행은 메타에도 문자열 `"None"` 이 들어 있어 이 조건에 걸리지 않는다.
+그 팩의 행은 메타에도 문자열 `"None"` 이 들어 있어 이 조건에 걸리지 않는다. 메타에 `pack_id`
+키 자체가 없는 행도 함께 고치는데, 그 형태는 옛 writer 가 키 부재를 `''` 로 만들었으므로 생산
+경로에서 나오지 않는다.
+
+**sqlite-vec 수리**. `pack_id` 가 vec0 의 partition key 라 `UPDATE` 가 통하지 않는다
+(`UPDATE on partition key columns are not supported yet.`). 대상 행을 읽어 두고 지운 뒤 소유
+태그만 빈 문자열로 바꿔 다시 넣어야 한다. 임베딩과 문서와 메타는 그대로 옮긴다.
+
+```sql
+-- 대상 확인
+SELECT node_id FROM <vector_table>
+ WHERE pack_id = 'None' AND json_extract(metadata, '$.pack_id') IS NULL;
+```
+
+그 node_id 들을 읽어 `DELETE` 뒤 같은 값으로 `INSERT` 하되 `pack_id` 만 `''` 로 넣는다. 벡터
+컬럼을 그대로 옮겨야 하므로 SQL 한 줄로 끝나지 않는다.
 
 **계약 밖**: 쓰기만 규율한다. `delete(ids)` 는 여전히 팩을 가리지 않고 그 id 의 행을 지운다.
 `add_texts` 도 게이트를 걸지 않는다(시간 소금 id 이고 SQL 두 백엔드가 중복 기본키를 이미 거부한다).
