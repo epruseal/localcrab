@@ -358,12 +358,6 @@ class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
         try:
             store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
 
-            # 선검사를 통과시켜 층 2 까지 내려보낸다.
-            monkey = pytest.MonkeyPatch()
-            monkey.setattr(
-                "opencrab.stores.sqlite_vec_store.reject_foreign_slot_writes",
-                lambda *a, **k: None)
-
             # 첫 호출(선검사 인자 구성)은 통과시키고 그 뒤 재조회만 실패시킨다.
             real = store._slot_owners
             calls = {"n": 0}
@@ -374,8 +368,15 @@ class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
                     return real(conn, ids)
                 raise sqlite3.OperationalError("재조회 자체가 실패했다")
 
-            monkey.setattr(store, "_slot_owners", flaky)
+            # `undo()` 를 첫 setattr 직후부터 감싼다. 두 setattr 사이에서 예외가
+            # 나면 선검사 무력화가 같은 프로세스의 뒤 테스트로 새어 나가 그것들을
+            # 거짓 green 으로 만든다.
+            monkey = pytest.MonkeyPatch()
             try:
+                monkey.setattr(
+                    "opencrab.stores.sqlite_vec_store.reject_foreign_slot_writes",
+                    lambda *a, **k: None)
+                monkey.setattr(store, "_slot_owners", flaky)
                 with pytest.raises(sqlite3.Error) as excinfo:
                     store.upsert_texts(
                         texts=["팩 B 침범"], metadatas=[{"pack_id": "B"}], ids=["s"])
@@ -393,6 +394,58 @@ class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
             hit = store.get_by_id("s")
             assert hit["metadata"]["pack_id"] == "A", "롤백되지 않고 슬롯이 넘어갔다"
             assert hit["document"] == "팩 A 원본"
+        finally:
+            if hasattr(store, "close"):
+                store.close()
+
+    def test_the_propagated_exception_is_the_original_object(self, tmp_path):
+        """같은 메시지의 새 예외가 아니라 **최초 예외 객체 그 자체**가 올라온다.
+
+        메시지와 `__cause__` 만 보면 구현이 같은 문구로 새 예외를 지어도 통과한다.
+        정체성까지 봐야 `raise exc from None` 이 지켜지는 것을 고정한다. 그래서
+        최초 실패를 우리가 만든 표식 객체로 주입한다.
+        """
+        import sqlite3
+
+        store = build_vector_store("sqlite-vec", tmp_path)
+        assert store.available
+        try:
+            store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
+
+            sentinel = sqlite3.OperationalError("최초 원인 표식")
+
+            def boom(*_a, **_k):
+                raise sentinel
+
+            # 첫 호출은 선검사가 쓰는 것이라 통과시켜야 한다. 그것까지 실패시키면
+            # 층 2 의 가드에 닿기 전에 선검사 줄에서 죽어 이 테스트가 다른 것을
+            # 재는 것이 된다.
+            real = store._slot_owners
+            calls = {"n": 0}
+
+            def flaky(conn, ids):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real(conn, ids)
+                raise sqlite3.OperationalError("재조회 자체가 실패했다")
+
+            monkey = pytest.MonkeyPatch()
+            try:
+                # `_insert_params` 는 `conn.execute` 의 인자라 try 블록 안에서
+                # 평가된다. 여기서 던지면 층 2 의 가드 경로를 그대로 탄다.
+                monkey.setattr(store, "_insert_params", boom)
+                monkey.setattr(store, "_slot_owners", flaky)
+                with pytest.raises(sqlite3.Error) as excinfo:
+                    store.upsert_texts(
+                        texts=["팩 A 갱신"], metadatas=[{"pack_id": "A"}], ids=["s"])
+            finally:
+                monkey.undo()
+
+            assert excinfo.value is sentinel, (
+                "최초 예외 객체가 아니라 다른 객체가 올라왔다: "
+                f"{type(excinfo.value).__name__}: {excinfo.value}")
+            assert excinfo.value.__cause__ is None
+            assert calls["n"] >= 2, "층 2 의 재조회 가드를 타지 않았다"
         finally:
             if hasattr(store, "close"):
                 store.close()

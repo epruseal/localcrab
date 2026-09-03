@@ -483,9 +483,13 @@ class SqliteVecStore(_SqliteConnMixin):
                     # 실패했다고 호출자가 보는 실패의 정체가 바뀌면 안 되므로, 그
                     # 경우에는 최초 예외 객체를 그대로 올린다(`from None` 으로 재조회
                     # 예외를 원인으로 달지 않는다 -- 그것은 진단을 흐린다).
+                    #
+                    # 포착 범위를 `sqlite3.Error` 가 아니라 `Exception` 으로 둔다.
+                    # 좁히면 드라이버 밖 예외가 최초 원인을 다시 가린다. 보조 수단이
+                    # 어떻게 실패하든 결과는 하나여야 한다: 최초 원인을 그대로 올린다.
                     try:
                         owner = self._slot_owners(conn, [_id]).get(_id) or ""
-                    except sqlite3.Error:
+                    except Exception:  # noqa: BLE001 -- 아래 주석의 이유로 전 범위
                         logger.warning(
                             "SqliteVecStore: 소유자 재조회 실패(%s) — 최초 예외를 그대로 "
                             "올린다", _id, exc_info=True,
