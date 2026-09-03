@@ -625,15 +625,43 @@ class TestMigrationScriptNormalisesTheOwnershipTag:
 
         assert slot_owner(_sanitize_metadata({"pack_id": "pack-a"})) == "pack-a"
 
-    def test_the_script_uses_the_shared_normaliser(self):
-        """이 축은 소스 대조다. 스크립트가 `str(...get("pack_id"...))` 로 돌아가면
-        위 두 단언은 여전히 통과하므로(그 함수들을 직접 부르니까) 실제 호출 지점을
-        본다. 스크립트를 돌리려면 실 chroma 컬렉션이 필요해 여기서 태우지 않는다."""
+    def test_the_script_binds_the_owner_column_through_the_shared_normaliser(self):
+        """실제 삽입 표현식을 **AST 로** 대조한다.
+
+        위 두 축은 공유 함수를 직접 부르므로 스크립트가 `str(...)` 로 돌아가도
+        통과한다. 실 호출 지점을 봐야 한다. 문자열 검색은 주석에도 걸리고 같은
+        뜻의 다른 표기를 놓치므로 구문 트리를 본다 — 이 저장소가
+        `TestVecBackendKindsCoverage` 에서 이미 쓰는 기법이다.
+
+        스크립트를 실제로 태우지 않는 이유: `main()` 이 인자 파싱과 실 chroma
+        컬렉션 연결과 스토어 생성을 한 함수에 묶고 있어, 행 생성부만 떼려면
+        이 이슈의 범위 밖 리팩터가 필요하다.
+        """
+        import ast
         import pathlib as _pathlib
 
         source = _pathlib.Path(__file__).resolve().parents[1] / (
             "scripts/migrate_chroma_to_sqlite_vec.py")
-        text = source.read_text(encoding="utf-8")
-        assert "slot_owner(clean)" in text, "이관 스크립트가 공유 정규화를 쓰지 않는다"
-        assert 'str(clean.get("pack_id"' not in text, (
-            "이관 스크립트에 정규화를 거치지 않는 소유 태그 저장이 남았다")
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+
+        # `rows.append((_id, <소유 태그>, ...))` 의 두 번째 원소를 찾는다.
+        owner_exprs = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "append"):
+                continue
+            if not (isinstance(func.value, ast.Name) and func.value.id == "rows"):
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Tuple) and len(arg.elts) >= 2:
+                    owner_exprs.append(arg.elts[1])
+
+        assert owner_exprs, "이관 스크립트에서 행 생성 지점을 찾지 못했다"
+        for expr in owner_exprs:
+            assert isinstance(expr, ast.Call), (
+                f"소유 태그 자리가 호출이 아니다: {ast.dump(expr)[:120]}")
+            assert isinstance(expr.func, ast.Name) and expr.func.id == "slot_owner", (
+                "소유 태그가 공유 정규화를 거치지 않는다: "
+                f"{ast.unparse(expr)}")
