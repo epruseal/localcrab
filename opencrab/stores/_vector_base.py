@@ -330,23 +330,29 @@ def reject_foreign_slot_writes(
     This gate governs WRITES ONLY. ``delete(ids)`` still removes any pack's row
     at a given id; scoping deletion is a separate axis (see
     ``docs/vector-backends.md``).
+
+    THE MESSAGE NEVER NAMES THE OTHER PACK. ``opencrab/pack/write_gate.py``'s
+    ``identity_reject_message`` states that invariant for the graph layer
+    (localcrab#143 invariant 7) and it holds just as much here: the raised text
+    is preserved verbatim in write receipts (``OntologyBuilder.add_node`` puts
+    it in ``stores["vector"]``), so naming the owner would let one caller learn
+    another pack's id just by writing to a colliding node_id. The caller gets
+    back what it submitted -- the offending ids and how many there were --
+    which is everything it needs to fix its own batch.
     """
     conflicts: list[str] = []
     for doc_id, metadata in zip(ids, metadatas):
         current = str(existing_owners.get(doc_id) or "")
         if not current:
             continue
-        incoming = slot_owner(metadata)
-        if current != incoming:
-            conflicts.append(
-                f"{doc_id!r} is owned by pack {current!r}, "
-                f"write claims {incoming or '<unowned>'!r}"
-            )
+        if current != slot_owner(metadata):
+            conflicts.append(repr(doc_id))
     if conflicts:
         raise ValueError(
-            "upsert_texts: refusing to take over a slot owned by another pack "
-            f"({len(conflicts)} of {len(ids)}): " + "; ".join(conflicts[:5])
-            + ("; ..." if len(conflicts) > 5 else "")
+            "upsert_texts: refusing to take over a slot already attributed to "
+            f"a different pack ({len(conflicts)} of {len(ids)}): "
+            + ", ".join(conflicts[:5])
+            + (", ..." if len(conflicts) > 5 else "")
         )
 
 

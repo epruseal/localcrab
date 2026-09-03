@@ -497,11 +497,16 @@ class SqliteVecStore(_SqliteConnMixin):
                         )
                         raise exc from None
                     if owner and owner != incoming:
+                        # 남의 팩 id 를 메시지에 담지 않는다. 이 텍스트는 쓰기
+                        # 영수증에 그대로 실려 나가므로, 담으면 충돌하는 node_id 로
+                        # 써 보는 것만으로 남의 팩 이름을 알아낼 수 있다
+                        # (`pack/write_gate.py` 의 `identity_reject_message` 가 graph
+                        # 층에 세운 같은 불변식).
                         raise ValueError(
-                            "upsert_texts: refusing to take over a slot owned by "
-                            f"another pack ({_id!r} is owned by pack {owner!r}); the "
-                            "row changed owner between the ownership check and this "
-                            "write"
+                            "upsert_texts: refusing to take over a slot already "
+                            f"attributed to a different pack ({_id!r}); the row "
+                            "changed attribution between the ownership check and "
+                            "this write"
                         ) from exc
                     raise
         self._ann_cache = None  # in-process write → invalidate ANN cache

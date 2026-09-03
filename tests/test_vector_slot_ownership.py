@@ -672,3 +672,95 @@ class TestMigrationScriptNormalisesTheOwnershipTag:
             assert isinstance(expr.args[0], ast.Name) and expr.args[0].id == "clean", (
                 "정제한 메타가 아니라 다른 것을 정규화한다: "
                 f"{ast.unparse(expr)}")
+
+
+# ---------------------------------------------------------------------------
+# 오류 — 거부 메시지가 남의 팩 이름을 흘리지 않는다
+# ---------------------------------------------------------------------------
+
+
+class TestRejectionMessagesDoNotNameTheOtherPack:
+    """거부 텍스트에 소유 팩의 id 가 들어가면 안 된다.
+
+    `opencrab/pack/write_gate.py` 의 `identity_reject_message` 가 graph 층에 세운
+    불변식(localcrab#143 불변식 7)이 여기에도 그대로 걸린다. 이 텍스트는 쓰기
+    영수증에 원문 그대로 실려 나간다 — `OntologyBuilder.add_node` 가 예외를 잡아
+    `stores["vector"]` 에 문자열로 넣는다. 담으면 충돌하는 node_id 로 써 보는 것만
+    으로 남의 팩 이름을 알아낼 수 있다.
+
+    호출자가 되받는 것은 자기가 낸 것뿐이다: 걸린 id 와 그 개수. 자기 배치를
+    고치는 데 필요한 전부다.
+    """
+
+    @pytest.fixture(params=BACKENDS)
+    def store(self, request, tmp_path):
+        s = build_vector_store(request.param, tmp_path)
+        assert s.available
+        s.backend_name = request.param
+        yield s
+        if request.param == "pg":
+            try:
+                from sqlalchemy import text
+
+                with s._engine.begin() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {s._table}"))
+            except Exception:
+                pass
+        if hasattr(s, "close"):
+            s.close()
+
+    def test_the_existing_owner_is_not_named(self, store):
+        secret = "a-private-pack-name-4f21"
+        store.upsert_texts(texts=["소유자 문서"], metadatas=[{"pack_id": secret}], ids=["s"])
+
+        with pytest.raises(ValueError) as excinfo:
+            store.upsert_texts(
+                texts=["침범"], metadatas=[{"pack_id": "intruder"}], ids=["s"])
+
+        message = str(excinfo.value)
+        assert secret not in message, f"소유 팩 이름이 메시지에 샜다: {message}"
+        assert "'s'" in message, f"호출자가 낸 id 가 메시지에 없다: {message}"
+
+    def test_the_layer_two_message_does_not_name_the_owner_either(self, tmp_path):
+        """선검사를 지나친 경쟁에서 나오는 메시지도 같은 규율을 지킨다."""
+        store = build_vector_store("sqlite-vec", tmp_path)
+        assert store.available
+        try:
+            secret = "a-private-pack-name-9c30"
+            store.upsert_texts(texts=["소유자"], metadatas=[{"pack_id": secret}], ids=["s"])
+
+            monkey = pytest.MonkeyPatch()
+            try:
+                monkey.setattr(
+                    "opencrab.stores.sqlite_vec_store.reject_foreign_slot_writes",
+                    lambda *a, **k: None)
+                with pytest.raises(ValueError) as excinfo:
+                    store.upsert_texts(
+                        texts=["침범"], metadatas=[{"pack_id": "intruder"}], ids=["s"])
+            finally:
+                monkey.undo()
+
+            assert secret not in str(excinfo.value), (
+                f"층 2 메시지에 소유 팩 이름이 샜다: {excinfo.value}")
+        finally:
+            if hasattr(store, "close"):
+                store.close()
+
+    def test_a_batch_internal_conflict_may_name_both_since_the_caller_supplied_them(
+        self, store
+    ):
+        """대조군: 한 배치 안의 충돌은 두 이름을 적어도 된다.
+
+        그 둘은 호출자가 방금 자기 손으로 넘긴 값이라 새로 드러나는 것이 없다.
+        이 축이 있어야 위 두 단언이 "모든 메시지에서 이름을 지웠다" 가 아니라
+        "저장소에서 읽은 이름만 지웠다" 를 재는 것이 된다.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            store.upsert_texts(
+                texts=["A", "B"],
+                metadatas=[{"pack_id": "mine-a"}, {"pack_id": "mine-b"}],
+                ids=["dup3", "dup3"],
+            )
+        message = str(excinfo.value)
+        assert "mine-a" in message and "mine-b" in message, (
+            f"호출자가 낸 두 값이 메시지에 없다: {message}")
