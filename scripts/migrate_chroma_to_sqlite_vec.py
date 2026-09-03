@@ -189,9 +189,6 @@ def main() -> int:
     print(f"# target vec0   : {db_path} (table '{settings.vector_collection}', dim {settings.embed_dim})")
 
     # #140: hold chroma.lock for as long as the PersistentClient below lives.
-    # SHARED, not exclusive: this reads Chroma and writes vec0, so it may run
-    # alongside other readers but must be excluded by a bulk loader or a
-    # migration that takes the lock exclusively.
     from opencrab.locking import chroma_lock_dir, chroma_lock_held
 
     # EXCLUSIVE, not shared (#140). A shared claim looks right for a reader,
@@ -204,8 +201,11 @@ def main() -> int:
     # the lock enforce it instead of leaving it to the operator to remember.
     #
     # Bounded, and the message says what to stop.
-    # COMPATIBILITY: this now refuses while a server is up, where it used to
-    # proceed. That proceeding could produce a quietly wrong target.
+    # COMPATIBILITY, both directions: this now refuses while a server is up,
+    # where it used to proceed -- and that proceeding could produce a quietly
+    # wrong target. The reverse also holds: while this runs, a new ChromaStore
+    # anywhere is refused after CHROMA_LOCK_TIMEOUT. Both follow from the
+    # script's offline-run precondition, which the lock now enforces.
     with chroma_lock_held(chroma_lock_dir(chroma_path), shared=False):
         return _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path)
 
