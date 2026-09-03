@@ -413,10 +413,14 @@ class TestLoadNodesIncremental:
         않았다. #277 이 모든 갱신에 CAS digest 를 넘기면서 그 쓰기가 성공하게 됐고,
         CAS 갱신 경로가 properties 를 전량 치환하므로 다음 런이 same 으로 복귀한다.
 
-        **런 하나만 보면 불변식이 안 잡힌다.** 1차만 보면 "회수를 시도했다"까지만
-        확인된다. #277 을 되돌린 변이는 1차에서 err 로 갈리지만(실측), properties 를
-        전량 치환하지 않는 쓰기 경로로 회귀하면 1차는 chg 로 멀쩡히 통과하고 2차부터
-        갈린다 — 그것이 이슈가 보고한 증상이다. 그래서 세 번 돌린다.
+        **런마다 몫이 다르다.** 1차는 드리프트한 행을 회수한다 — #277 을 되돌린
+        변이는 여기서 err 로 갈린다(실측). **불변식이 판정되는 자리는 2차다.**
+        properties 를 전량 치환하지 않는 쓰기 경로로 회귀하면 1차는 chg 로 멀쩡히
+        통과하고 2차에서 다시 chg 가 나온다 — 그것이 이슈가 보고한 증상이다.
+        `same` 분기는 그래프에 쓰지 않으므로(doc 축 정리만 한다) 그 한 번의 same 이
+        곧 고정점 확인이다. 3차는 **독립 검출 대상이 없는 반복**이다. 지워도 불변식은
+        그대로 잡힌다. 남긴 이유는 비용이 0이고 수렴 뒤에도 같은 결과가 나온다는 것을
+        읽는 사람이 눈으로 보기 때문이지, 새로 잡아내는 변이가 있어서가 아니다.
 
         이 검사가 거는 축은 **그래프 노드 properties** 하나다. doc 행 유실 회수는
         `test_pack_load_r12_selfheal_gates.py` 가 따로 걸고, neo4j 의 CAS 두 출처
@@ -449,7 +453,9 @@ class TestLoadNodesIncremental:
         assert _run() == (0, 3, 0, 0, 0), "드리프트한 행이 chg 로 회수되지 않았다"
         assert _run() == (0, 0, 3, 0, 0), (
             "2차 런이 same 으로 수렴하지 않았다 — 증분이 매 런 전량 재임베딩으로 퇴화한다(#279)")
-        assert _run() == (0, 0, 3, 0, 0), "3차 런이 same 을 유지하지 않았다"
+        assert _run() == (0, 0, 3, 0, 0), (
+            "3차 런이 2차와 다른 결과를 냈다 — 판정이 결정적이지 않다"
+            "(이 단언은 새 변이를 잡으라고 있는 것이 아니다, docstring 참고)")
 
         left = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
         assert all("legacy_only_key" not in props for _t, _s, props in left.values()), (
