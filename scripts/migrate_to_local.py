@@ -478,9 +478,10 @@ def _migrate_vectors_locked(
     Two things this function exists to guarantee (issue #140).
 
     Lock ORDER is chroma.lock outside, write.lock inside. That is the global
-    rule, because a live MCP server holds chroma.lock (shared) for its whole
-    lifetime and takes write.lock per write tool -- any path using both must
-    therefore take chroma.lock first.
+    rule, because any live owner of a local chroma client -- MCP, REST or CLI
+    since #140 moved the lock to the store's lifetime -- holds chroma.lock
+    (shared) for its whole lifetime and takes write.lock per write. Any path
+    using both must therefore take chroma.lock first.
 
     One path in the repository inverts it, and it is bounded rather than
     removed. ``dispatch_tool`` runs a write handler inside write.lock, and if
