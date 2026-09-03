@@ -8,20 +8,14 @@ factory is covered automatically.
 
 Every test here uses ``tmp_path``; nothing touches a real data directory.
 
-Reverse-mutation note (which tests are RED against the pre-fix code):
-  RED  : test_live_store_blocks_exclusive_claim
-         test_second_instance_keeps_lock_after_first_closes
-         test_exclusive_holder_refuses_new_store
-         test_failed_init_does_not_leak_the_lock
-         test_partial_client_is_torn_down_before_the_lock_is_released
-         test_client_creation_failure_releases_lock
-         test_factory_locks_beside_the_data_dir
-         test_symlinked_data_dir_shares_one_lock
-         test_symlinked_persist_dir_agrees_with_the_migration_lock
-         test_lock_is_released_even_when_client_close_raises
-  GREEN both ways (release-regression guards, not RED tests):
-         test_closed_store_releases_the_lock
-         test_sqlite_vec_backend_takes_no_chroma_lock
+Reverse mutation: the authority is the measurement, not a list. Revert the
+behaviour a test names and run this file -- every test here is written so that
+reverting its target makes it fail. An enumeration of RED tests lived in this
+docstring and went stale three times as tests were added, so it is gone.
+Tests whose status is easy to misread carry an explicit "RED" or "RED 아님"
+note in their own docstring; the two guards that pass against the pre-fix code
+either way say so, because pairing them with a RED test is the only thing that
+makes them meaningful.
 """
 
 from __future__ import annotations
@@ -130,8 +124,8 @@ class TestChromaLockExclusion:
     def test_closed_store_releases_the_lock(self, chroma_cls, tmp_path):
         """정상: close() 뒤에는 배타 획득이 성공한다.
 
-        수정 전 코드에서도 통과한다(그때는 잠금을 아예 안 잡았으므로). RED
-        테스트가 아니라 해제 회귀 방지용이며, 위 테스트와 짝일 때만 의미가 있다."""
+        RED 아님. 수정 전 코드에서도 통과한다(그때는 잠금을 아예 안 잡았으므로).
+        해제 회귀 방지용이며 위 테스트와 짝일 때만 의미가 있다."""
         data_dir = str(tmp_path)
         store = make_store(chroma_cls, os.path.join(data_dir, "chroma"))
         store.close()
@@ -192,8 +186,8 @@ class TestChromaLockExclusion:
     def test_sqlite_vec_backend_takes_no_chroma_lock(self, tmp_path, monkeypatch):
         """비회귀: sqlite-vec 백엔드는 chroma.lock 을 잡지 않는다.
 
-        sqlite-vec 은 SQLite WAL 규율을 쓰므로 chroma 의 flock 계층을 잡으면
-        무의미한 보유가 된다."""
+        RED 아님. sqlite-vec 은 SQLite WAL 규율을 쓰므로 chroma 의 flock 계층을
+        잡으면 무의미한 보유가 된다."""
         pytest.importorskip("sqlite_vec")
         from opencrab.config import Settings
         from opencrab.stores.factory import make_vector_store
@@ -514,6 +508,7 @@ class TestLockOrderInversionIsBounded:
     """
 
     def test_inverted_order_times_out_and_frees_the_peer(self, chroma_cls, tmp_path):
+        """RED: 상한 없이는 이 역전이 무한 대기가 된다."""
         import multiprocessing
         import time
 
@@ -694,6 +689,7 @@ class TestTargetMigrationTearsDownBeforeRelease:
     def test_client_is_closed_and_dropped_before_return(
         self, close_mode, tmp_path, monkeypatch
     ):
+        """RED: 명시적 종료와 프레임 참조 해제가 없으면 클라이언트가 잠금보다 오래 산다."""
         import gc
         import sys as _sys
         import weakref
@@ -1029,6 +1025,7 @@ class TestWindowsProcessWideRegistration:
         return str(d)
 
     def test_second_request_for_one_path_does_not_acquire(self, tmp_path):
+        """RED(Windows 분기): 등록이 없으면 두 번째 인스턴스가 자기 자신을 기다린다."""
         from opencrab.locking import acquire_chroma_lock, release_chroma_lock
 
         d = self._acquire(tmp_path)
@@ -1044,6 +1041,7 @@ class TestWindowsProcessWideRegistration:
             )
 
     def test_distinct_paths_each_acquire(self, tmp_path):
+        """RED 아님: 서로 다른 경로가 합쳐지지 않는지 보는 대조군이다."""
         from opencrab.locking import acquire_chroma_lock, release_chroma_lock
 
         a = self._acquire(tmp_path, "a")
@@ -1124,6 +1122,7 @@ class TestWindowsProcessWideRegistration:
             assert o2 is False
 
     def test_concurrent_first_requests_acquire_once(self, tmp_path):
+        """RED(Windows 분기): 판정과 획득과 등록이 원자적이지 않으면 여럿이 잡는다."""
         from opencrab.locking import acquire_chroma_lock, release_chroma_lock
 
         d = self._acquire(tmp_path)
@@ -1148,6 +1147,7 @@ class TestWindowsProcessWideRegistration:
             )
 
     def test_owner_init_failure_releases_so_next_request_retries(self, tmp_path):
+        """RED(Windows 분기): 실패한 소유자가 등록을 남기면 재시도가 영원히 막힌다."""
         from opencrab.locking import acquire_chroma_lock, release_chroma_lock
 
         d = self._acquire(tmp_path)
@@ -1403,6 +1403,7 @@ class TestOuterChromaLockWaitIsBounded:
     """
 
     def test_outer_wait_times_out_with_an_actionable_message(self, tmp_path):
+        """RED: 바깥 획득에 상한이 없으면 이 호출이 끝나지 않는다."""
         import multiprocessing
 
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1493,6 +1494,7 @@ class TestTargetMigrationClaimsExclusively:
     """
 
     def test_shared_holder_blocks_the_migration(self, tmp_path):
+        """RED: 공유로 잡으면 살아 있는 서버와 공존해 거부되지 않는다."""
         import multiprocessing
 
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1559,6 +1561,7 @@ class TestInterruptedInitReleasesTheLock:
     def test_base_exception_during_init_releases_the_lock(
         self, exc_type, chroma_cls, tmp_path, monkeypatch
     ):
+        """RED: BaseException 정리가 없으면 중단된 초기화가 잠금을 남긴다."""
         import chromadb
 
         data_dir = str(tmp_path)
