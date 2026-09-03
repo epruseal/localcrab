@@ -450,13 +450,11 @@ def _declared_limit_reject(detail: str, *, remedy: str = "rename/remove the conf
     with the destination anchor or lose data non-deterministically. Says so
     explicitly rather than reading like the source data itself is broken.
 
-    The message names #197 as WHERE the identity-scope decision is recorded,
-    not as something to wait for. #197 closed by gating cross-pack writes at
-    the store rather than by making identity pack-scoped, so slot identity is
-    still ``node_id`` alone and forking still has to remap ids. Telling a
-    caller to "wait for #197" would send them after a resolution that is not
-    coming; the only thing that clears this rejection is fixing the source
-    data.
+    The message names #197 as WHERE the identity-scope limit is described, not
+    as something to wait for, and it does not state that issue's status --
+    code cannot know it. Slot identity is ``node_id`` alone and forking has to
+    remap ids; the only thing that clears this rejection is fixing the source
+    data, so that is the only remedy the message offers.
 
     ``remedy`` names the action that actually clears the rejection. It
     defaults to the identity-collision wording every caller but one wants;
@@ -466,8 +464,8 @@ def _declared_limit_reject(detail: str, *, remedy: str = "rename/remove the conf
     """
     return _reject(
         f"{detail}; this shape is supported by the store but cannot be forked: "
-        "vector slot identity is not pack-scoped (#197 closed without changing "
-        f"that) -- fix the source data ({remedy})",
+        "vector slot identity is not pack-scoped (see #197) -- fix the source "
+        f"data ({remedy})",
     )
 
 

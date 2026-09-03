@@ -280,11 +280,24 @@ class TestNullPackIdIsUnowned:
 
     두 층이 이 행을 다르게 읽으면 계약이 갈린다. 층 1 은 `slot_owner` 를 거쳐
     `None` 과 빈 문자열과 부재를 한 상태로 접어 통과시키는데, SQL 에서 `NULL = ''`
-    은 거짓이 아니라 `NULL` 이라 층 2 의 술어는 갱신을 막는다. `pack_id` 컬럼이
-    NOT NULL 이 아니므로 외부에서 쓴 행에 이 값이 들어올 수 있다.
+    은 거짓이 아니라 `NULL` 이라 소유권 술어가 NULL 로 평가돼 갱신을 막는다.
+    `pack_id` 는 두 SQL 백엔드에서 NOT NULL 이 아니므로 외부에서 쓴 행에 이 값이
+    들어올 수 있다.
+
+    NULL 행을 만드는 방법이 백엔드마다 다르다. pgvector 는 보통의 컬럼이라 UPDATE
+    로 만들고, sqlite-vec 은 그 컬럼이 vec0 파티션 키라 UPDATE 가 막히므로
+    (`UPDATE on partition key columns are not supported yet.`) 직접 INSERT 로
+    만든다. 어느 쪽이든 외부 기록이 남길 수 있는 상태를 그대로 재현한다.
     """
 
-    def test_a_pack_can_claim_a_row_whose_stored_pack_id_is_null(self, tmp_path):
+    def _assert_pack_can_claim(self, store) -> None:
+        store.upsert_texts(texts=["이제 A 소유"], metadatas=[{"pack_id": "A"}], ids=["n1"])
+        hit = store.get_by_id("n1")
+        assert hit["metadata"]["pack_id"] == "A", (
+            f"NULL 소유 태그 행을 인수하지 못했다: {hit['metadata'].get('pack_id')!r}")
+        assert hit["document"] == "이제 A 소유"
+
+    def test_pgvector_pack_can_claim_a_row_whose_stored_pack_id_is_null(self, tmp_path):
         from sqlalchemy import text
 
         store = build_vector_store("pg", tmp_path)
@@ -298,17 +311,88 @@ class TestNullPackIdIsUnowned:
                     text(f"SELECT pack_id FROM {store._table} WHERE node_id = 'n1'")
                 ).scalar()
             assert stored is None, f"NULL 로 만들지 못했다: {stored!r}"
-
-            store.upsert_texts(texts=["이제 A 소유"], metadatas=[{"pack_id": "A"}], ids=["n1"])
-
-            hit = store.get_by_id("n1")
-            assert hit["metadata"]["pack_id"] == "A"
-            assert hit["document"] == "이제 A 소유"
+            self._assert_pack_can_claim(store)
         finally:
             try:
                 with store._engine.begin() as conn:
                     conn.execute(text(f"DROP TABLE IF EXISTS {store._table}"))
             except Exception:
                 pass
+            if hasattr(store, "close"):
+                store.close()
+
+    def test_sqlite_vec_pack_can_claim_a_row_whose_stored_pack_id_is_null(self, tmp_path):
+        store = build_vector_store("sqlite-vec", tmp_path)
+        assert store.available
+        try:
+            # 파티션 키는 UPDATE 가 막히므로 NULL 을 직접 INSERT 한다.
+            vec = store._embed(["미소유"])[0]
+            params = list(store._insert_params("n1", "미소유", {"pack_id": ""}, vec))
+            params[1] = None
+            with store._tx() as conn:
+                conn.execute(store._insert_sql(), tuple(params))
+                stored = conn.execute(
+                    f"SELECT pack_id FROM {store._table} WHERE node_id = 'n1'"
+                ).fetchone()[0]
+            assert stored is None, f"NULL 로 만들지 못했다: {stored!r}"
+            self._assert_pack_can_claim(store)
+        finally:
+            if hasattr(store, "close"):
+                store.close()
+
+
+class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
+    """소유자 재조회가 실패해도 호출자가 받는 예외는 최초 원인 그대로다.
+
+    층 2 가 걸렸을 때 sqlite-vec 은 소유자를 다시 읽어 오류 메시지를 좋게 만든다.
+    그 재조회는 **보조 수단**이므로, 그것이 실패했다고 호출자가 보는 실패의 정체가
+    바뀌면 안 된다. 바뀌면 진짜 원인(디스크 오류, 스키마 문제)이 재조회 오류에
+    가려진다.
+    """
+
+    def test_a_failing_owner_lookup_does_not_replace_the_insert_error(self, tmp_path):
+        import sqlite3
+
+        store = build_vector_store("sqlite-vec", tmp_path)
+        assert store.available
+        try:
+            store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
+
+            # 선검사를 통과시켜 층 2 까지 내려보낸다.
+            monkey = pytest.MonkeyPatch()
+            monkey.setattr(
+                "opencrab.stores.sqlite_vec_store.reject_foreign_slot_writes",
+                lambda *a, **k: None)
+
+            # 첫 호출(선검사 인자 구성)은 통과시키고 그 뒤 재조회만 실패시킨다.
+            real = store._slot_owners
+            calls = {"n": 0}
+
+            def flaky(conn, ids):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real(conn, ids)
+                raise sqlite3.OperationalError("재조회 자체가 실패했다")
+
+            monkey.setattr(store, "_slot_owners", flaky)
+            try:
+                with pytest.raises(sqlite3.Error) as excinfo:
+                    store.upsert_texts(
+                        texts=["팩 B 침범"], metadatas=[{"pack_id": "B"}], ids=["s"])
+            finally:
+                monkey.undo()
+
+            assert calls["n"] >= 2, "재조회 경로를 타지 않았다"
+            assert "재조회 자체가 실패했다" not in str(excinfo.value), (
+                f"재조회 오류가 최초 원인을 가렸다: {excinfo.value}")
+            assert "UNIQUE" in str(excinfo.value), (
+                f"최초 원인(기본키 충돌)이 아니다: {type(excinfo.value).__name__}: {excinfo.value}")
+            assert excinfo.value.__cause__ is None, (
+                "재조회 오류가 __cause__ 로 달렸다 — 진단을 흐린다")
+
+            hit = store.get_by_id("s")
+            assert hit["metadata"]["pack_id"] == "A", "롤백되지 않고 슬롯이 넘어갔다"
+            assert hit["document"] == "팩 A 원본"
+        finally:
             if hasattr(store, "close"):
                 store.close()

@@ -459,8 +459,16 @@ class SqliteVecStore(_SqliteConnMixin):
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 incoming = str(meta.get("pack_id", ""))
                 conn.execute(
-                    f"DELETE FROM {self._table} "  # noqa: S608
-                    "WHERE node_id = ? AND (pack_id = '' OR pack_id = ?)",
+                    # `IS NULL` 을 먼저 본다: SQL 에서 `NULL = ''` 은 거짓이 아니라
+                    # NULL 이므로, 그것을 안 보면 저장된 값이 NULL 인 행에서 술어가
+                    # NULL 로 평가돼 DELETE 가 아무것도 지우지 않고 뒤이은 INSERT 가
+                    # 기본키 충돌로 실패한다. 층 1 은 `slot_owner` 를 거쳐 None 과
+                    # 빈 문자열과 부재를 한 상태로 접어 그 행을 미소유로 읽으므로,
+                    # 술어를 맞추지 않으면 두 층의 판정이 갈린다. 이 컬럼은 vec0
+                    # 파티션 키이고 NOT NULL 이 아니라 외부 기록에 NULL 이 들어올 수
+                    # 있다. pgvector 의 같은 술어와 같은 이유다.
+                    f"DELETE FROM {self._table} WHERE node_id = ? "  # noqa: S608
+                    "AND (pack_id IS NULL OR pack_id = '' OR pack_id = ?)",
                     (_id, incoming),
                 )
                 try:
@@ -470,7 +478,19 @@ class SqliteVecStore(_SqliteConnMixin):
                     # 다시 읽어 남의 팩일 때만 바꿔 던지고, 아니면 원래 예외를 그대로
                     # 올린다 -- 디스크 오류나 스키마 문제를 소유권 오류로 가리지
                     # 않는다. 어느 쪽이든 `_tx()` 가 배치 전체를 롤백한다.
-                    owner = self._slot_owners(conn, [_id]).get(_id) or ""
+                    #
+                    # 재조회는 오류 메시지를 좋게 만드는 보조 수단일 뿐이다. 그것이
+                    # 실패했다고 호출자가 보는 실패의 정체가 바뀌면 안 되므로, 그
+                    # 경우에는 최초 예외 객체를 그대로 올린다(`from None` 으로 재조회
+                    # 예외를 원인으로 달지 않는다 -- 그것은 진단을 흐린다).
+                    try:
+                        owner = self._slot_owners(conn, [_id]).get(_id) or ""
+                    except sqlite3.Error:
+                        logger.warning(
+                            "SqliteVecStore: 소유자 재조회 실패(%s) — 최초 예외를 그대로 "
+                            "올린다", _id, exc_info=True,
+                        )
+                        raise exc from None
                     if owner and owner != incoming:
                         raise ValueError(
                             "upsert_texts: refusing to take over a slot owned by "
