@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -57,6 +58,18 @@ class _SqliteConnMixin:
     _conns_lock: threading.Lock
     _all_conns: list[Any]
     _lock: threading.Lock
+
+    # 이슈 #94: SQLite 의 자동 체크포인트(PASSIVE)는 임계를 넘긴 커밋마다 다시
+    # 시도되지만, 성공해도 WAL 파일을 0으로 되감지(TRUNCATE) 않는다 — 프레임
+    # 위치만 재사용할 뿐 파일 크기는 유지된다. 이 저장소 어디에도 명시적
+    # wal_checkpoint 호출이 없어, 장기 실행 프로세스는 WAL 이 한 번 임계를
+    # 넘기면 프로세스가 살아있는 한(정확히는 마지막 커넥션이 닫힐 때까지)
+    # 절대 줄어들지 않는다. 4MiB 는 SQLite 기본 페이지 크기(4096B) 기준
+    # `wal_autocheckpoint` 기본값 1000페이지의 근사치다 — WAL 헤더/프레임
+    # 오버헤드 때문에 정확한 페이지 수 일치는 아니며, 그 근방에서 보수적으로
+    # (약간 이르게) 발동하는 근사치로 의도했다. 인스턴스 속성으로 오버라이드
+    # 가능하도록 클래스 상수로 둔다(테스트에서 monkeypatch).
+    _WAL_CHECKPOINT_THRESHOLD_BYTES: int = 4 * 1024 * 1024
 
     def _init_conn_state(self, db_path: str) -> None:
         """스레드-로컬 커넥션 + 쓰기 직렬화 락 초기화. __init__에서 1회 호출."""
@@ -127,6 +140,12 @@ class _SqliteConnMixin:
         rollback() 자체가 실패할 가능성(디스크 오류 등)은 별개로 대비한다: 그 경우도
         try/except로 감싸 로그만 남기고 원래 예외를 그대로 재던진다 — rollback 실패로
         원래 예외가 가려지면 호출자는 배치가 왜 실패했는지 영영 알 수 없게 된다.
+
+        commit 성공 뒤, 위 try/except BaseException 블록을 완전히 벗어난 자리에서
+        ``_checkpoint_if_wal_large()`` 를 호출한다(이슈 #94). 그 자리를 고른 이유는
+        구조적이다: 블록 안에 두면 체크포인트 보조 로직이 던지는 어떤 예외든
+        ``except BaseException`` 이 가로채 이미 성공한 commit 에 대해 잘못된
+        rollback 을 시도하고, 호출자에게는 쓰기 자체가 실패한 것처럼 보인다.
         """
         with self._lock:
             conn = self._conn
@@ -152,6 +171,120 @@ class _SqliteConnMixin:
                         type(self).__name__, rollback_exc,
                     )
                 raise
+            self._checkpoint_if_wal_large(conn)
+
+    def _exec(self, conn: sqlite3.Connection, sql: str) -> sqlite3.Cursor:
+        """``conn.execute(sql)`` 의 얇은 위임.
+
+        체크포인트 보조 로직(``_checkpoint_if_wal_large``/``_restore_busy_timeout``)
+        만 이 메서드를 거친다. ``sqlite3.Connection`` 은 C 로 구현된 불변
+        타입이라 인스턴스·클래스 양쪽 모두 속성 재대입이 막혀 있어(런타임에
+        따라 다르며, CPython 3.13 기준 클래스 속성도 재대입 불가) 테스트가
+        실행 실패나 busy/인터럽트를 직접 주입할 자리가 없다. 이 메서드는
+        일반 커밋 경로(``_tx()`` 본문)에는 쓰지 않는다 — 그쪽은 이 문제와
+        무관하다.
+        """
+        return conn.execute(sql)
+
+    def _checkpoint_if_wal_large(self, conn: sqlite3.Connection) -> None:
+        """WAL 사이드카가 임계를 넘겼으면 명시적 TRUNCATE 체크포인트를 시도한다
+        (이슈 #94, WAL 체크포인트 정책 부재).
+
+        호출 위치가 중요하다: ``_tx()`` 의 ``try/except BaseException`` 블록을
+        완전히 벗어난 뒤(즉 commit 이 이미 성공한 뒤)에만 불린다. 이 함수 안에서
+        나는 어떤 예외든 그 블록 밖에 있으므로 ``except BaseException`` 의
+        rollback 분기를 절대 타지 않는다 — 이미 확정된 커밋이 체크포인트발
+        예외로 실패인 것처럼 보이는 오탐을 구조적으로 없앤다.
+
+        매 커밋마다 무조건 불리지만 비용은 낮다: 임계 미만이면 `os.stat` 1회로
+        끝난다(카운터 방식이 필요했던 이유인 "매 커밋마다 무거운 PRAGMA 를
+        물지 않기"를 이 사전 검사가 대신한다).
+        """
+        try:
+            wal_size = os.path.getsize(f"{self._db_path}-wal")
+        except OSError:
+            # WAL 사이드카가 아직 없는 초기 상태 등 — 방금 성공한 커밋을
+            # 실패로 보이게 해서는 안 되므로 조용히 반환한다.
+            return
+        if wal_size < self._WAL_CHECKPOINT_THRESHOLD_BYTES:
+            return
+
+        try:
+            old_timeout = self._exec(conn, "PRAGMA busy_timeout").fetchone()[0]
+            # 열린 리더가 있으면 체크포인트 호출 자체가 이 커넥션의 busy_timeout
+            # 만큼(기본 5000ms) 멈춘다 — 그동안 낮춰 즉시 busy 여부만 받는다.
+            self._exec(conn, "PRAGMA busy_timeout=0")
+        except Exception as exc:
+            logger.debug(
+                "%s._checkpoint_if_wal_large: busy_timeout probe failed, skipping: %s",
+                type(self).__name__, exc,
+            )
+            return
+
+        try:
+            row = self._exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if row and row[0]:
+                # busy=1: 다른 커넥션이 실제 열린 스냅샷을 쥐고 있다 — WAL 의
+                # 근본 제약이지 이 정책의 결함이 아니다. 다음 커밋에서 재시도.
+                logger.debug(
+                    "%s._checkpoint_if_wal_large: checkpoint busy, will retry on next commit",
+                    type(self).__name__,
+                )
+        except Exception as exc:
+            # 체크포인트는 성능 최적화이지 쓰기 계약의 일부가 아니다 — 어떤
+            # 실행 실패도 커밋의 성공 여부에 영향을 주지 않는다.
+            logger.debug(
+                "%s._checkpoint_if_wal_large: checkpoint execution failed: %s",
+                type(self).__name__, exc,
+            )
+        finally:
+            self._restore_busy_timeout(conn, old_timeout)
+
+    def _restore_busy_timeout(self, conn: sqlite3.Connection, old_timeout: int) -> None:
+        """체크포인트 시도 동안 낮춘 busy_timeout 을 원래 값으로 되돌린다.
+
+        ``except BaseException`` 으로 감싼다(``Exception`` 이 아니라): 복원
+        PRAGMA 자체가 실패하면(예: 몽키패치, 극히 드문 이상) 그 커넥션의
+        busy_timeout 이 0인 채로 남아 이후 이 스레드의 일반 쓰기가 동시성
+        재시도 여유(교차 프로세스 쓰기 포함, SqliteVecStore 의 계약)를 조용히
+        잃는다 — "다음 쓰기에서 정상 오류로 드러난다"는 전제는 성립하지
+        않는다(복원 실패가 커넥션 손상을 보장하지 않으므로). 그래서 예외
+        종류와 무관하게 먼저 커넥션을 폐기·재생성 대상으로 만든 뒤, 삼켜도
+        되는 ``Exception`` 이면 경고만 남기고 반환하고, 인터럽트 계열의
+        순수 ``BaseException`` 이면 정리를 마친 뒤 그대로 재던진다(삼키지
+        않는다는 ``_tx()`` 의 기존 불변식과 같은 원칙).
+        """
+        try:
+            self._exec(conn, f"PRAGMA busy_timeout={int(old_timeout)}")
+        except BaseException as exc:
+            self._discard_conn(conn)
+            if isinstance(exc, Exception):
+                logger.warning(
+                    "%s._restore_busy_timeout: restore failed, discarded connection: %s",
+                    type(self).__name__, exc,
+                )
+                return
+            raise
+
+    def _discard_conn(self, conn: sqlite3.Connection) -> None:
+        """오염된(busy_timeout 복원 실패) 스레드-로컬 커넥션을 폐기한다.
+
+        다음에 같은 스레드가 ``self._conn`` 에 접근하면 ``_new_conn()`` 이 새
+        커넥션을 만들며, 그 경로가 ``_configure_connection()``(SqliteVecStore
+        의 busy_timeout=5000 포함)과 sqlite3 기본 타임아웃을 다시 정상
+        적용하므로 계약이 그 시점에 회복된다. ``_all_conns`` 목록 변경은
+        ``_new_conn()``/``close()`` 와 같은 ``_conns_lock`` 으로 보호한다 —
+        쓰기 직렬화 락(``self._lock``)과는 별개의 불변식이다.
+        """
+        try:
+            conn.close()
+        except Exception as exc:
+            logger.debug("%s._discard_conn: close error: %s", type(self).__name__, exc)
+        if getattr(self._local, "conn", None) is conn:
+            self._local.conn = None
+        with self._conns_lock:
+            if conn in self._all_conns:
+                self._all_conns.remove(conn)
 
     def close(self) -> None:
         with self._conns_lock:

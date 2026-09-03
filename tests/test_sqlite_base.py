@@ -236,22 +236,29 @@ class TestWalCheckpoint:
         return os.path.getsize(path) if os.path.exists(path) else 0
 
     def _boom_on(self, match: str, exc: BaseException):
-        orig = sqlite3.Connection.execute
+        # sqlite3.Connection 은 CPython 3.13 기준 인스턴스·클래스 속성
+        # 재대입을 모두 거부하는 불변 타입이라(``TypeError: cannot set
+        # 'execute' attribute of immutable type``) conn.execute 자체는
+        # monkeypatch 할 수 없다. 체크포인트 보조 로직만 거치는
+        # ``_SqliteConnMixin._exec`` 시임을 대신 패치한다 — 일반 커밋 경로
+        # (``_tx()`` 본문의 conn.execute 호출)는 이 시임을 거치지 않으므로
+        # 영향받지 않는다.
+        orig = _FakeStore._exec
 
-        def wrapper(self_conn, sql, *args, **kwargs):
+        def wrapper(self_store, conn, sql, *args, **kwargs):
             if match in sql:
                 raise exc
-            return orig(self_conn, sql, *args, **kwargs)
+            return orig(self_store, conn, sql, *args, **kwargs)
 
         return wrapper
 
     def _spy_on(self, match: str, calls: list):
-        orig = sqlite3.Connection.execute
+        orig = _FakeStore._exec
 
-        def wrapper(self_conn, sql, *args, **kwargs):
+        def wrapper(self_store, conn, sql, *args, **kwargs):
             if match in sql:
                 calls.append(sql)
-            return orig(self_conn, sql, *args, **kwargs)
+            return orig(self_store, conn, sql, *args, **kwargs)
 
         return wrapper
 
@@ -269,7 +276,7 @@ class TestWalCheckpoint:
         store = _FakeStore(str(tmp_path / "a.db"))
         self._make_table(store)
         calls: list = []
-        monkeypatch.setattr(sqlite3.Connection, "execute", self._spy_on("wal_checkpoint", calls))
+        monkeypatch.setattr(_FakeStore, "_exec", self._spy_on("wal_checkpoint", calls))
         with store._tx() as conn:
             conn.execute("INSERT INTO t (v) VALUES ('x')")
         assert calls == []
@@ -358,7 +365,7 @@ class TestWalCheckpoint:
         monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
         self._make_table(store)
         monkeypatch.setattr(
-            sqlite3.Connection, "execute",
+            _FakeStore, "_exec",
             self._boom_on("wal_checkpoint", sqlite3.OperationalError("boom")),
         )
         with store._tx() as conn:
@@ -371,7 +378,7 @@ class TestWalCheckpoint:
         monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
         self._make_table(store)
         monkeypatch.setattr(
-            sqlite3.Connection, "execute",
+            _FakeStore, "_exec",
             self._boom_on("wal_checkpoint", KeyboardInterrupt()),
         )
         with pytest.raises(KeyboardInterrupt):
@@ -394,7 +401,7 @@ class TestWalCheckpoint:
         old_conn = store._conn
         original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
         monkeypatch.setattr(
-            sqlite3.Connection, "execute",
+            _FakeStore, "_exec",
             self._boom_on(f"busy_timeout={original}", ValueError("restore boom")),
         )
         import logging
@@ -422,7 +429,7 @@ class TestWalCheckpoint:
         old_conn = store._conn
         original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
         monkeypatch.setattr(
-            sqlite3.Connection, "execute",
+            _FakeStore, "_exec",
             self._boom_on(f"busy_timeout={original}", KeyboardInterrupt()),
         )
         with pytest.raises(KeyboardInterrupt):
@@ -453,7 +460,7 @@ class TestWalCheckpoint:
         old_conn = store._conn
         original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
         monkeypatch.setattr(
-            sqlite3.Connection, "execute",
+            _FakeStore, "_exec",
             self._boom_on(f"busy_timeout={original}", ValueError("restore boom")),
         )
 
@@ -464,7 +471,6 @@ class TestWalCheckpoint:
             local_store_conns = []
             while not stop.is_set():
                 try:
-                    t = threading.local()
                     conn = store._new_conn()
                     local_store_conns.append(conn)
                 except Exception as exc:  # pragma: no cover - failure path
