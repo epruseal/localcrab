@@ -30,7 +30,7 @@ VECTOR_BACKEND 명시됨?
 
 | 백엔드 | 적재 중 서빙 | 메커니즘 | 비고 |
 |---|---|---|---|
-| `chroma` | **불가** (MCP 중지 필요) | `PersistentClient`는 동일 persist 경로에 다중 프로세스 동시 쓰기 미지원 → `chroma.lock(LOCK_EX)` | 이제 **조건부** — `opencrab/mcp/tools.py`의 `_get_context()`가 `if cfg.vector_backend_resolved == "chroma": _acquire_chroma_shared_lock()`으로 chroma 사용 시에만 락을 잡는다. docker 모드·레거시 롤백 한정 |
+| `chroma` | **불가** (MCP 중지 필요) | `PersistentClient`는 동일 persist 경로에 다중 프로세스 동시 쓰기 미지원 → `chroma.lock(LOCK_EX)` | 이제 로컬 chroma `PersistentClient` 를 여는 **모든** 소유자가 락을 잡는다 — `ChromaStore` 로컬 모드 인스턴스가 자기 수명 동안 보유하므로(#140) MCP·REST·CLI·마이그레이션이 함께 배제된다. docker 모드·레거시 롤백 한정 |
 | `sqlite-vec` | **가능** (무중단) | graph/doc/sql과 동일한 SQLite **WAL** 규율. 리더는 락 없이 동시 진행, 라이터는 `busy_timeout(5s)`로 직렬화(`sqlite_vec_store.py` `_new_conn`) | **로컬 모드 신규 기본값**. 라이터는 여전히 **직렬화**(동시에 하나) — MVCC 아님 |
 | `pgvector`(`STORAGE_MODE=pg`) | **가능** (진짜 다중 라이터) | PostgreSQL **MVCC** — 리더가 라이터를 막지 않고, 라이터끼리도 행 단위로만 경합 | `opencrab/stores/factory.py`가 graph/doc/sql/vector 4스토어 전부 `PGGraphStore`/`PgDocStore`/`SQLStore`/`PgVectorStore`로 PG에 통합 배치. `EMBEDDING_BACKEND=openai`(KURE) 필수 |
 
@@ -58,7 +58,7 @@ VECTOR_BACKEND 명시됨?
 
 | # | 경로 | 적재 방식 | 본 계획 범위 |
 |---|---|---|---|
-| ① | `load_local_packs.py` (외부 ops 스크립트, `~/opencrab-dump/scripts/ops/`) | 로컬 스토어 **직접** 적재(`make_*_store`+`OntologyBuilder`) + `--fresh` 삭제(`delete_pack`). 로더는 백엔드 무관 **무조건** `chroma.lock(LOCK_EX)`을 flock한다 — 다만 sqlite-vec/pg 백엔드에서는 MCP 서버가 이 락의 SH를 잡지 않으므로(`tools.py`의 조건부 획득) EX 획득이 항상 즉시 성공해 **결과적으로 MCP 중지가 불필요**하다. chroma 백엔드일 때만 EX 실패 → MCP 중지 안내 경로가 발동한다 | **MCP 모드 전환 대상** |
+| ① | `load_local_packs.py` (외부 ops 스크립트, `~/opencrab-dump/scripts/ops/`) | 로컬 스토어 **직접** 적재(`make_*_store`+`OntologyBuilder`) + `--fresh` 삭제(`delete_pack`). 로더는 백엔드 무관 **무조건** `chroma.lock(LOCK_EX)`을 flock한다 — 다만 sqlite-vec/pg 백엔드에서는 `ChromaStore` 자체가 만들어지지 않아 아무도 이 락의 SH를 잡지 않으므로 EX 획득이 항상 즉시 성공해 **결과적으로 MCP 중지가 불필요**하다. chroma 백엔드일 때만 EX 실패 → MCP 중지 안내 경로가 발동한다 | **MCP 모드 전환 대상** |
 | ② | 대화 reingest hook — `hooks/claude/localcrab-session-end.sh` + `hooks/claude/localcrab-lib.sh` | **이미 MCP `pack_ingest` 경유**(append-only, purge 없음). `lc_call`이 `initialize`→`tools/call` 핸드셰이크 + 3회 재시도 + outbox 재시도 큐 구현 | **호환성 회귀 검증 대상** (신규 도구가 기존 `pack_ingest` 동작을 깨지 않는지) |
 | ③ | `load_to_localcrab.py` | Neo4j(STORAGE_MODE=docker) 벌크 적재. ①과 노드/엣지/청크 패스 **중복(복붙)** | **비목표**(별도 토폴로지, 영향분석만) |
 | 보조 | `backfill_kure.py`(vector/doc upsert만), `dump_*conversations.py` 3종(jsonl 변환 전단계, 스토어 미접근) | — | **비목표** |
@@ -254,5 +254,5 @@ VECTOR_BACKEND 명시됨?
 - 적재 직전 `LOCAL_DATA_DIR/chroma.lock`에 `fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)`를 잡았다(라인 586-589). 선점 실패 시 즉시 종료하며, 안내 메시지가 **MCP 서버 중지를 요구**했다(라인 591-598): `systemctl --user stop localcrab-gateway` → 적재 → `systemctl --user start localcrab-gateway`.
 - 이 배타 락이 필요했던 이유는 ChromaDB 제약 때문이다: `PersistentClient`는 **동일 persist 경로에 대한 다중 프로세스 동시 쓰기를 지원하지 않는다**(출처: Chroma Cookbook — System Constraints, "Chroma is not process-safe for concurrent writers sharing the same local persistence path." <https://cookbook.chromadb.dev/core/system_constraints/>). 단, **프로세스 내부 멀티스레드는 안전하다**("Chroma is thread-safe").
 - MCP 서버 측은 이 제약을 락으로 방어했다(`opencrab/mcp/tools.py`): `_acquire_chroma_shared_lock()`가 서버 수명 동안 `chroma.lock`에 `LOCK_SH`를 보유 → 로더의 `LOCK_EX`와 상호 배제. uvicorn은 `workers=1`로 기동(`opencrab/cli.py`, 주석: 원래 "the chroma PersistentClient is single-process only") → chroma를 만지는 프로세스는 MCP 단일 인스턴스뿐. 여러 MCP 인스턴스(예: 인증/비인증 HTTP) 간 쓰기는 `_write_lock()`이 `write.lock`의 `LOCK_EX`로 직렬화. write 도구 집합은 `WRITE_TOOLS`: `ontology_add_node`, `ontology_add_edge`, `pack_create`, `pack_ingest`, `schema_pack_install`, `schema_pack_uninstall`, `harness_promotion_apply`.
-- **이후 변화:** `_acquire_chroma_shared_lock()` 호출은 이제 `vector_backend_resolved == "chroma"`일 때만 실행되도록 조건부화됐고(`opencrab/mcp/tools.py` `_get_context()`), `cli.py`의 `workers=1` 주석도 "sqlite-vec(WAL) 하에서는 다중 워커가 기술적으로 가능하나 1을 유지" 식으로 갱신됐다. `write.lock` 직렬화 자체는 아직 백엔드 무관하게 남아 있다(§1.3).
+- **이후 변화:** `_acquire_chroma_shared_lock()` 호출은 이제 `vector_backend_resolved == "chroma"`일 때만 실행되도록 조건부화됐고(`opencrab/mcp/tools.py` `_get_context()`), `cli.py`의 `workers=1` 주석도 "sqlite-vec(WAL) 하에서는 다중 워커가 기술적으로 가능하나 1을 유지" 식으로 갱신됐다. `write.lock` 직렬화 자체는 아직 백엔드 무관하게 남아 있다(§1.3). 이후 #140 이 그 조건부 획득마저 걷어냈다 — 잠금 소유가 MCP 도구 계층에서 `ChromaStore` 로컬 모드 인스턴스 수명으로 옮겨가, chroma 를 여는 주체가 곧 잠금을 잡는 주체가 됐다. 조건 분기가 필요없어진 이유는 chroma 백엔드가 아니면 `ChromaStore` 자체가 만들어지지 않기 때문이다.
 - 이 락 문제를 **완전히** 해소한 것은 결국 스토어 계층의 재설계였다(sqlite-vec의 WAL 통일, pg의 MVCC) — MCP 라우팅은 chroma 시대엔 유일한 해法이었지만, 지금은 §1.3에 정리한 대로 보조적 이유로 유효성이 이동했다.

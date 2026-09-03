@@ -466,6 +466,52 @@ def migrate_docs(
 # Step 4 — 벡터 마이그레이션 (HTTP Chroma → local Chroma)
 # ---------------------------------------------------------------------------
 
+def _migrate_vectors_locked(
+    http_client: Any,
+    local_data_dir: str,
+    collection: str,
+    batch_size: int,
+    logger: Any,
+) -> dict[str, int]:
+    """Run the local-Chroma vector migration under chroma.lock, then write.lock.
+
+    Two things this function exists to guarantee (issue #140).
+
+    Lock ORDER is chroma.lock outside, write.lock inside. A live MCP server
+    holds chroma.lock (shared) for its whole lifetime and then takes write.lock
+    per write tool; taking these two in the opposite order here would close a
+    cycle and deadlock both sides.
+
+    Lock SCOPE covers the client's whole lifetime, not just the copy loop. The
+    PersistentClient is created and dropped inside the ``with``, so the lock is
+    never held while no client exists and -- the case that matters -- no client
+    ever outlives the lock. The lock is EXCLUSIVE because this is a bulk load:
+    it must exclude the shared holders (MCP, REST, CLI) entirely, not join them.
+    """
+    import chromadb  # type: ignore[import]
+
+    from opencrab.locking import chroma_lock_dir
+
+    chroma_local_path = os.path.join(local_data_dir, "chroma")
+    os.makedirs(chroma_local_path, exist_ok=True)
+
+    with file_lock("chroma.lock", chroma_lock_dir(chroma_local_path)):
+        local_chroma = chromadb.PersistentClient(path=chroma_local_path)
+        try:
+            with file_lock("write.lock", local_data_dir):
+                return migrate_vectors(
+                    http_client, local_chroma, collection, batch_size, logger
+                )
+        finally:
+            close = getattr(local_chroma, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("local chroma close failed: %s", exc)
+            del local_chroma
+
+
 def migrate_vectors(
     http_client: Any,
     local_client: Any,
@@ -1059,18 +1105,13 @@ def _run(args: argparse.Namespace) -> int:
     # Step 4 — 벡터 마이그레이션
     if not args.skip_vectors:
         console.rule("[bold blue]Step 4 — 벡터 마이그레이션 (HTTP Chroma → local Chroma)")
-        import chromadb  # type: ignore[import]
-        chroma_local_path = os.path.join(local_data_dir, "chroma")
-        os.makedirs(chroma_local_path, exist_ok=True)
-        local_chroma = chromadb.PersistentClient(path=chroma_local_path)
-        with file_lock("write.lock", local_data_dir):
-            vectors_result = migrate_vectors(
-                preflight_result["chroma_http"],
-                local_chroma,
-                args.chroma_collection,
-                args.batch_size,
-                logger,
-            )
+        vectors_result = _migrate_vectors_locked(
+            preflight_result["chroma_http"],
+            local_data_dir,
+            args.chroma_collection,
+            args.batch_size,
+            logger,
+        )
         report["results"]["vectors"] = vectors_result
         console.print(f"  [green]완료[/green] vectors={vectors_result['vectors']:,}")
     else:

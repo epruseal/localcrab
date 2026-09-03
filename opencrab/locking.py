@@ -32,6 +32,32 @@ def lock_data_dir() -> str:
     return data_dir
 
 
+def chroma_lock_dir(local_path: str) -> str:
+    """Return the directory holding ``chroma.lock`` for a local chroma persist path.
+
+    Every owner of a local chroma ``PersistentClient`` must agree on one lock
+    file or the exclusion does not hold -- which is exactly the defect issue
+    #140 exists to fix, so the derivation lives here rather than being
+    reassembled at each call site.
+
+    The convention it encodes: the factory
+    (``opencrab/stores/factory.py:make_vector_store``) and both migration
+    scripts build the persist path as ``<local_data_dir>/chroma``, so the
+    parent of the persist path IS the data directory that already holds
+    ``write.lock``. The offline batch loader takes its exclusive lock on that
+    same ``<local_data_dir>/chroma.lock``.
+
+    Only ``abspath`` is applied, deliberately. ``_lock_path`` below already
+    resolves the finished lock-file path with ``realpath``, which unifies two
+    processes reaching one data directory through different symlink aliases.
+    Resolving the persist path itself instead would BREAK the agreement when
+    ``<local_data_dir>/chroma`` is a symlink pointing elsewhere: the store
+    would lock beside the link target while the migrations lock in
+    ``local_data_dir``. Measured both ways; see tests for the pinned cases.
+    """
+    return os.path.dirname(os.path.abspath(local_path))
+
+
 def _lock_path(filename: str, data_dir: str | None) -> str:
     path = os.path.realpath(os.path.abspath(os.path.join(data_dir or lock_data_dir(), filename)))
     os.makedirs(os.path.dirname(path), exist_ok=True)

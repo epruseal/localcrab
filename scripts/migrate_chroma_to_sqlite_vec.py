@@ -26,28 +26,19 @@ import os
 import time
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--batch", type=int, default=2000)
-    ap.add_argument("--force", action="store_true", help="overwrite existing vectors.db")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -> int:
+    """Copy one local Chroma collection into a vec0 table. Caller holds chroma.lock.
 
-    import sqlite_vec  # noqa: F401 - ensures extension is importable
+    Split out of main() so the caller can hold ``chroma.lock`` across the whole
+    lifetime of the PersistentClient this opens (issue #140). The several early
+    returns below are exactly why: a lock acquired inline in main() would be
+    released on some paths and not others.
+    """
+    import chromadb
+    import sqlite_vec
 
-    from opencrab.config import get_settings
     from opencrab.stores.chroma_store import _sanitize_metadata
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
-
-    settings = get_settings()
-    src_collection = settings.embed_collection  # opencrab_vectors_kure
-    db_path = os.path.join(settings.local_data_dir, settings.vector_db_file)
-    chroma_path = os.path.join(settings.local_data_dir, "chroma")
-
-    print(f"# source chroma : {chroma_path} / collection '{src_collection}'")
-    print(f"# target vec0   : {db_path} (table '{settings.vector_collection}', dim {settings.embed_dim})")
-
-    import chromadb
 
     client = chromadb.PersistentClient(path=chroma_path)
     col = client.get_collection(src_collection)
@@ -138,6 +129,35 @@ def main() -> int:
     store.close()
     print("RESULT:", "PASS" if ok else "FAIL (count mismatch)")
     return 0 if ok else 4
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--batch", type=int, default=2000)
+    ap.add_argument("--force", action="store_true", help="overwrite existing vectors.db")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    import sqlite_vec  # noqa: F401 - ensures extension is importable
+
+    from opencrab.config import get_settings
+
+    settings = get_settings()
+    src_collection = settings.embed_collection  # opencrab_vectors_kure
+    db_path = os.path.join(settings.local_data_dir, settings.vector_db_file)
+    chroma_path = os.path.join(settings.local_data_dir, "chroma")
+
+    print(f"# source chroma : {chroma_path} / collection '{src_collection}'")
+    print(f"# target vec0   : {db_path} (table '{settings.vector_collection}', dim {settings.embed_dim})")
+
+    # #140: hold chroma.lock for as long as the PersistentClient below lives.
+    # SHARED, not exclusive: this reads Chroma and writes vec0, so it may run
+    # alongside other readers but must be excluded by a bulk loader or a
+    # migration that takes the lock exclusively.
+    from opencrab.locking import chroma_lock_dir, file_lock
+
+    with file_lock("chroma.lock", chroma_lock_dir(chroma_path), shared=True):
+        return _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,21 @@ from opencrab.stores._vector_base import (
 
 logger = logging.getLogger(__name__)
 
+
+class ChromaLockTimeoutError(TimeoutError):
+    """Raised when a local ChromaStore cannot take the shared ``chroma.lock``.
+
+    Deliberately NOT swallowed into ``available=False`` by ``_connect``: a
+    timeout means another process holds the lock right now, which is a
+    transient, actionable startup condition, not a permanently broken vector
+    layer. Degrading it would leave the layer dead for the rest of the process
+    lifetime even after the lock is released (issue #140).
+
+    Subclasses ``TimeoutError`` because that is what ``opencrab.locking``
+    raises for the same condition.
+    """
+
+
 _COLLECTION_LOCKS: dict[str, threading.Lock] = {}
 _COLLECTION_LOCKS_GUARD = threading.Lock()
 
@@ -55,6 +70,9 @@ class ChromaStore:
         local_mode: bool = False,
         local_path: str = "./opencrab_data/chroma",
         embedding_function: Any = None,
+        lock_timeout: float | None = None,
+        # lock_timeout: chroma.lock 공유 잠금 획득 대기 상한(초). None 이면
+        # 설정값(CHROMA_LOCK_TIMEOUT)을 쓴다. local_mode 에서만 의미가 있다.
         # embedding_function: ChromaDB EmbeddingFunction 인스턴스.
         # None 이면 ChromaDB 기본 EF(all-MiniLM-L6-v2 ONNX, 384d) 사용 — 기존 동작.
         # ResilientEmbeddingFunction(KURE-v1) 을 주입하면 KURE 로 전환.
@@ -69,6 +87,12 @@ class ChromaStore:
         self._client: Any = None
         self._collection: Any = None
         self._available = False
+        # Shared chroma.lock handle, held for as long as this instance owns a
+        # local PersistentClient (#140). None in HttpClient mode: chroma's
+        # single-process constraint applies to the persist directory, not to a
+        # server. See _acquire_local_lock for why this is per-instance.
+        self._lock_fh: Any = None
+        self._lock_timeout = lock_timeout
         # Chroma 자체는 개별 호출 단위로만 스레드 안전하다(공식 System Constraints).
         # 이 락의 용도는 두 가지다. (1) 앱 레벨 공유 상태인 self._collection 핸들 교체
         # (reset_collection)를 원자화하고 읽기/쓰기가 교체 도중의 핸들을 보지 않도록
@@ -85,7 +109,62 @@ class ChromaStore:
     # Connection
     # ------------------------------------------------------------------
 
+    def _acquire_local_lock(self) -> None:
+        """Take the shared ``chroma.lock`` covering this instance's persist path.
+
+        Ownership sits on the INSTANCE, not on a module global and not on a
+        refcount (#140). Three properties follow, and each one answers a
+        requirement the issue spelled out:
+
+        * ``acquire_file_lock`` opens the file afresh, and POSIX ``flock`` is
+          scoped to the open file description, so several shared holders in one
+          process never block each other. That is what lets a REST app which
+          embeds the MCP router open more than one local client.
+        * No refcount is involved, so no failure path can forget to decrement
+          one and wedge an exclusive migration until the process exits.
+        * The handle dies with the instance, so an owner dropped without an
+          explicit ``close()`` still releases the lock through CPython
+          refcounting -- the same property #70 measured on the previous
+          module-global design, preserved rather than regressed.
+
+        The acquisition sits OUTSIDE ``_connect``'s ``except Exception`` on
+        purpose; see ChromaLockTimeoutError.
+        """
+        from opencrab.locking import acquire_file_lock, chroma_lock_dir
+
+        timeout = self._lock_timeout
+        if timeout is None:
+            from opencrab.config import get_settings
+
+            timeout = get_settings().chroma_lock_timeout
+
+        lock_dir = chroma_lock_dir(self._local_path)
+        try:
+            self._lock_fh = acquire_file_lock(
+                "chroma.lock", lock_dir, shared=True, timeout=timeout
+            )
+        except TimeoutError as exc:
+            raise ChromaLockTimeoutError(
+                f"timed out after {timeout}s waiting for the shared lock on "
+                f"{os.path.join(lock_dir, 'chroma.lock')}. Another process holds "
+                "it exclusively (an offline pack load or a migration). Stop that "
+                "process or wait for it to finish, then retry."
+            ) from exc
+
+    def _release_local_lock(self) -> None:
+        """Release this instance's chroma.lock handle, if it holds one."""
+        from opencrab.locking import release_file_lock
+
+        fh, self._lock_fh = self._lock_fh, None
+        if fh is not None:
+            release_file_lock(fh)
+
     def _connect(self) -> None:
+        # Before the try: a lock timeout must propagate as a startup error
+        # instead of being degraded to available=False with no way back.
+        if self._local_mode:
+            self._acquire_local_lock()
+
         try:
             import chromadb  # type: ignore[import]
 
@@ -115,6 +194,28 @@ class ChromaStore:
                     "ChromaDB unavailable (%s:%s): %s", self._host, self._port, exc
                 )
             self._available = False
+            # A PersistentClient built before the failing step is still live and
+            # still owns the persist directory, so tear it down BEFORE dropping
+            # the lock. Releasing first would leave an exclusive migration free
+            # to run against a client that is very much still there -- the
+            # defect this whole change exists to remove, recreated on the
+            # failure path.
+            if self._local_mode:
+                client, self._client = self._client, None
+                self._collection = None
+                try:
+                    if client is not None:
+                        close = getattr(client, "close", None)
+                        if callable(close):
+                            close()
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.warning(
+                        "ChromaDB client close failed during init cleanup: %s",
+                        close_exc,
+                    )
+                finally:
+                    del client
+                    self._release_local_lock()
 
     @property
     def available(self) -> bool:
@@ -129,15 +230,26 @@ class ChromaStore:
             return False
 
     def close(self) -> None:
-        """Release the Chroma client and its native database handles."""
+        """Release the Chroma client, its native handles, and chroma.lock.
+
+        The lock release sits in a ``finally`` because the client's own
+        ``close()`` can raise: appending the release after it would skip the
+        release exactly when a caller most needs it. The lock's lifetime tracks
+        this object's lifetime (#140) -- a failing client close does not keep
+        the object alive, so nothing is gained by holding the lock past here.
+        """
         client = self._client
         self._client = None
         self._collection = None
         self._available = False
-        if client is not None:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+        try:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            del client
+            self._release_local_lock()
 
     def _collection_handle(self) -> Any:
         """Return the current collection handle, snapshotted under the lock so a

@@ -350,10 +350,32 @@ def _meter_call(ctx: ApiContext, auth: AuthContext, endpoint: str) -> None:
 
 def _build_context() -> ApiContext:
     settings = get_settings()
-    graph = make_graph_store(settings)
-    vector = make_vector_store(settings)
-    docs = make_doc_store(settings)
-    sql = make_sql_store(settings)
+
+    # #140: build into a list so a factory raising part-way through can close
+    # what already exists. A local ChromaStore now owns an OS-level chroma.lock
+    # handle for its lifetime, so a half-built context that is simply dropped
+    # would be leaving that release to refcounting.
+    built: list[Any] = []
+
+    def _make(factory: Any, *args: Any) -> Any:
+        store = factory(*args)
+        built.append(store)
+        return store
+
+    try:
+        graph = _make(make_graph_store, settings)
+        vector = _make(make_vector_store, settings)
+        docs = _make(make_doc_store, settings)
+        sql = _make(make_sql_store, settings)
+    except BaseException:
+        for store in reversed(built):
+            close = getattr(store, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Failed to close a store during cleanup: %s", exc)
+        raise
 
     try:
         graph.ensure_constraints()
@@ -391,12 +413,16 @@ async def lifespan(app: FastAPI) -> Any:
 
     refuse_stale_shared_secret_env()
     app.state.context = _build_context()
-    # #147: the registry/graph reconciliation guard needs a live sql + graph
-    # store, so it cannot run before _build_context() the way
-    # refuse_stale_shared_secret_env() does -- there is nothing to check
-    # against yet at that point.
-    assert_registry_covers_graph(app.state.context.sql, app.state.context.graph)
+    # The try starts at the context assignment, not after the guard below.
+    # #140: the guard can refuse startup, and a refusal outside the try left a
+    # fully built context -- including a ChromaStore holding chroma.lock --
+    # open for the life of the process.
     try:
+        # #147: the registry/graph reconciliation guard needs a live sql + graph
+        # store, so it cannot run before _build_context() the way
+        # refuse_stale_shared_secret_env() does -- there is nothing to check
+        # against yet at that point.
+        assert_registry_covers_graph(app.state.context.sql, app.state.context.graph)
         yield
     finally:
         _close_context(getattr(app.state, "context", None))

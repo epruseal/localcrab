@@ -59,6 +59,7 @@ def _make_stores(
     ``export-neo4j-pack`` that never touches vectors. Callers request only
     the stores they use; unrequested attributes are ``None``.
     """
+    from opencrab.stores.chroma_store import ChromaLockTimeoutError
     from opencrab.stores.factory import (
         make_doc_store,
         make_graph_store,
@@ -66,12 +67,45 @@ def _make_stores(
         make_vector_store,
     )
 
-    return SimpleNamespace(
-        graph=make_graph_store(cfg) if graph else None,
-        vector=make_vector_store(cfg) if vector else None,
-        doc=make_doc_store(cfg) if doc else None,
-        sql=make_sql_store(cfg) if sql else None,
+    # #140: construction is failure-atomic. A local ChromaStore holds an
+    # OS-level chroma.lock for its lifetime, so a partly built namespace that
+    # is abandoned mid-construction must not leave stores open. Build in order,
+    # and close what exists if a later factory raises.
+    built: list[Any] = []
+    requested = (
+        (graph, make_graph_store),
+        (vector, make_vector_store),
+        (doc, make_doc_store),
+        (sql, make_sql_store),
     )
+    made: list[Any] = []
+    try:
+        for wanted, factory in requested:
+            if not wanted:
+                made.append(None)
+                continue
+            store = factory(cfg)
+            built.append(store)
+            made.append(store)
+    except BaseException as exc:
+        for store in reversed(built):
+            close = getattr(store, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001, S110 - the original error wins
+                    pass
+        if isinstance(exc, ChromaLockTimeoutError):
+            # Same operator-facing shape the rest of this module uses for a
+            # deployment problem: an actionable message and exit 1, not a
+            # traceback. The vector-store call sits outside every command's
+            # `except RuntimeError` block, so the translation belongs here --
+            # one place that all vector-using commands pass through.
+            err_console.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
+        raise
+
+    return SimpleNamespace(graph=made[0], vector=made[1], doc=made[2], sql=made[3])
 
 
 # ---------------------------------------------------------------------------

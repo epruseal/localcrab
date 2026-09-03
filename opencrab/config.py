@@ -185,6 +185,12 @@ class Settings(BaseSettings):
     # 느린 원격 네트워크나 대형 배치 요청이라면 OPENAI_TIMEOUT 환경변수로 늘릴 것.
     openai_timeout: float = Field(default=8.0, alias="OPENAI_TIMEOUT")
 
+    # chroma.lock 공유 잠금 획득 대기 상한(초). 로컬 chroma PersistentClient 를
+    # 여는 모든 진입점이 이 잠금을 잡으므로(#140), 배타 적재나 마이그레이션이
+    # 잠금을 쥔 동안 기동하면 여기까지 기다린 뒤 ChromaLockTimeoutError 로
+    # 거부한다. 무한 대기를 기본으로 두면 정체가 진단 불가능한 hang 이 된다.
+    chroma_lock_timeout: float = Field(default=30.0, alias="CHROMA_LOCK_TIMEOUT")
+
     # openai 백엔드 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
     # 차원 비호환 문제를 방지한다. 롤백 시 기존 컬렉션은 보존됨.
     embed_collection: str = Field(

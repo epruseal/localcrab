@@ -36,6 +36,12 @@ Mock)을 읽으므로 패치가 그대로 유효하다. 49개의 기존 ``_get_c
 test_tools_handlers_direct.py ×6) 모두 이 방식으로 무변경 유지된다(직접
 재현·확인함).
 
+**chroma.lock 소유(#140)**: 이 계층은 더 이상 ``chroma.lock`` 을 잡지 않는다.
+잡는 주체가 MCP 하나뿐이면 REST·CLI·마이그레이션이 같은 persist 경로를 잠금 없이
+열어 배제가 성립하지 않았다. 이제 로컬 모드 ``ChromaStore`` 인스턴스가 자기 수명
+동안 자기 핸들로 보유하므로, ``make_vector_store`` 를 지나는 모든 진입점이 자동으로
+편입된다.
+
 **컨텍스트 초기화 직렬화(#192)**: ``_get_context`` 는 최초 호출에서만 스토어를
 만들고, 그 초기화를 모듈 레벨 ``_context_init_lock`` 으로 직렬화한다. 락이 없으면
 두 스레드가 동시에 최초 호출할 때 각자 팩토리를 실행해 같은 백엔드를 가리키는
@@ -58,12 +64,13 @@ canonicalize_*(2), promotion_*(4), billing_*(2) — 실사용 이력 0 / MCP
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from opencrab.locking import acquire_file_lock, file_lock, lock_data_dir
+from opencrab.locking import file_lock, lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import AccessTier as AccessTier
@@ -72,13 +79,18 @@ from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
 from ._registry import tools_for_principal as tools_for_principal
 
+logger = logging.getLogger(__name__)
+
 # chroma PersistentClient는 chromadb 공식상 단일 프로세스 전용이다("not process-safe for
 # concurrent writers sharing the same local persistence path"; thread-safe도 단일 프로세스 내에서만
-# 보증). 즉 여러 serve가 같은 persist 경로를 공유하는 것은 공식 미지원이며, 아래 chroma.lock/
+# 보증). 즉 여러 serve가 같은 persist 경로를 공유하는 것은 공식 미지원이며, chroma.lock/
 # write.lock 은 그 위에 opencrab이 직접 얹은 커스텀 안전층이다(공식 보증 아님). 정공법은 단일
 # `chroma run` 서버 + HttpClient. 출처: cookbook.chromadb.dev/core/{system_constraints,clients}.
-# 공유 락(LOCK_SH)을 서버 수명 동안 보유 → load_local_packs.py의 배타 락(LOCK_EX)과 상호 배제.
-_chroma_lock_fh = None
+#
+# #140: chroma.lock 의 공유 락(LOCK_SH)은 더 이상 이 계층이 잡지 않는다. 잡는 주체가 MCP
+# 하나뿐이면 REST·CLI·마이그레이션이 같은 persist 경로를 잠금 없이 열어 배제가 성립하지
+# 않았다. 이제 ChromaStore 가 로컬 모드 인스턴스 수명 동안 자기 핸들로 보유하므로,
+# make_vector_store 를 지나는 모든 진입점이 자동으로 편입된다.
 
 
 def _lock_data_dir() -> str:
@@ -94,28 +106,6 @@ def _lock_data_dir() -> str:
     FileNotFoundError로 죽는 것을 방지).
     """
     return lock_data_dir()
-
-
-def _acquire_chroma_shared_lock() -> None:
-    """Hold a shared lock on chroma.lock for the server's lifetime.
-
-    ``shared=True`` is a real ``LOCK_SH`` on POSIX, letting several local
-    chroma-backed processes hold it concurrently, but ``opencrab.locking``
-    emulates it as an exclusive byte-range lock on Windows (msvcrt has no
-    reader/writer lock), so two local chroma processes on Windows would
-    block each other rather than share (issue #140).
-
-    Only MCP takes this lock. The REST app and the migration script open
-    local chroma clients without it, so the exclusion it is meant to
-    provide does not actually hold -- also issue #140, which is where the
-    ownership redesign belongs. This function deliberately keeps ``main``'s
-    semantics (one module-global handle, rebound per call) rather than
-    refcounting: #70 measured the rebinding design and found it does NOT
-    leak on CPython, and a refcount that fails to decrement on the context
-    initialisation failure path would be strictly worse.
-    """
-    global _chroma_lock_fh
-    _chroma_lock_fh = acquire_file_lock("chroma.lock", _lock_data_dir(), shared=True)
 
 
 # WRITE_TOOLS (names of tools that mutate the stores) is computed further down,
@@ -218,6 +208,24 @@ _context_init_lock = threading.Lock()
 _context_init_owner: threading.Thread | None = None
 
 
+def _close_all(stores: list[Any]) -> None:
+    """Close every store that was built, newest first, swallowing close errors.
+
+    Used only on the initialisation failure path: the caller is already
+    unwinding an exception that describes what actually went wrong, so a
+    secondary failure while tidying up must not replace it.
+    """
+    for store in reversed(stores):
+        close = getattr(store, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to close %s during context cleanup: %s",
+                           type(store).__name__, exc)
+
+
 def _get_context() -> dict[str, Any]:
     """Lazily initialise LocalCrab stores and engines using the local factory.
 
@@ -294,19 +302,28 @@ def _build_context() -> dict[str, Any]:
 
     cfg = get_settings()
 
-    # chroma.lock (LOCK_SH) only coordinates with the offline chroma batch loader;
-    # skip it when the vector backend isn't chroma (sqlite-vec uses SQLite WAL, not
-    # chroma's flock layer, so the shared lock would be a pointless hold).
-    # vector_backend_resolved (not the raw vector_backend field) — VECTOR_BACKEND
-    # is now unset by default and resolves conditionally (config.py), so a raw
-    # comparison would miss the chroma case whenever it's the resolved default.
-    if cfg.vector_backend_resolved == "chroma":
-        _acquire_chroma_shared_lock()
+    # #140: the stores are built into a list first so a factory that raises
+    # part-way through can close the ones already built. Previously a failure
+    # after make_vector_store() dropped a live ChromaStore on the floor, and
+    # with the chroma.lock handle now living on that instance, dropping it
+    # silently would rely on refcounting to release an OS lock. Closing is
+    # explicit instead.
+    built: list[Any] = []
 
-    graph = make_graph_store(cfg)
-    vector = make_vector_store(cfg)
-    docs = make_doc_store(cfg)
-    sql = make_sql_store(cfg)
+    def _make(factory: Callable[..., Any], *args: Any) -> Any:
+        store = factory(*args)
+        built.append(store)
+        return store
+
+    try:
+        graph = _make(make_graph_store, cfg)
+        vector = _make(make_vector_store, cfg)
+        docs = _make(make_doc_store, cfg)
+        sql = _make(make_sql_store, cfg)
+        billing_sql = _make(make_billing_sql_store, cfg, sql)
+    except BaseException:
+        _close_all(built)
+        raise
 
     builder = OntologyBuilder(graph, docs, sql, vec=vector)
     rebac = ReBACEngine(graph, sql)
@@ -323,7 +340,7 @@ def _build_context() -> dict[str, Any]:
     # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
     # module docstring (including "NO AUTOMATIC MIGRATION") for why.
     from opencrab.billing.hooks import BillingHooks
-    billing = BillingHooks(make_billing_sql_store(cfg, sql))
+    billing = BillingHooks(billing_sql)
 
     _context = {
         "neo4j": graph,
@@ -384,7 +401,6 @@ __all__ = [
     "WRITE_TOOLS",
     "_NINE_SPACE_HINT",
     "_TOOL_FUNCTIONS",
-    "_acquire_chroma_shared_lock",
     "_clean_meta",
     "_clean_str",
     "_context",
@@ -441,9 +457,10 @@ dispatch_tool = _registry_dispatch_tool
 # stays out of this set. When several MCP server processes run against the
 # same data dir (e.g. the unauthenticated + authenticated HTTP instances), their
 # writes must be serialised. dispatch_tool's write.lock is a *per-write* exclusive
-# lock on a dedicated write.lock file — entirely separate from the lifetime-held
-# chroma.lock (LOCK_SH) above, which only guards against the offline batch loader
-# (LOCK_EX). Reads take no lock. NOTE: lockless concurrent reads across processes
+# lock on a dedicated write.lock file — entirely separate from chroma.lock
+# (LOCK_SH), which is now held for the lifetime of each local ChromaStore
+# instance (#140, see opencrab/stores/chroma_store.py) and guards against the
+# offline batch loader's LOCK_EX. Reads take no lock. NOTE: lockless concurrent reads across processes
 # is THIS layer's design assumption, NOT a chromadb guarantee — chromadb
 # officially treats multi-process PersistentClient sharing as unsupported.
 # write.lock serialises the one hazard the docs name explicitly (concurrent
