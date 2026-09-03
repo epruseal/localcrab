@@ -63,11 +63,14 @@ CONTRACT — an owned slot may only be rewritten by its owner [#197]:
     ``add_texts`` is not gated either — its ids are time-salted, and the SQL
     backends already reject a duplicate primary key. A slot that a foreign
     pack took over BEFORE this gate existed is not healed by it; the gate only
-    stops new ones. The same applies to one specific legacy shape: a row in
-    EITHER SQL backend whose owner column holds the literal ``'None'``,
-    because the pre-gate writer ran ``str(meta.get("pack_id", ""))`` over a
-    ``pack_id`` that was present and ``None``. That row reads as owned by a
-    pack named ``None`` here, so re-ingesting the same metadata is refused.
+    stops new ones. The same applies to one specific legacy shape: a pgvector
+    row whose owner column holds the literal ``'None'``, because the pre-gate
+    writer ran ``str(meta.get("pack_id", ""))`` over a ``pack_id`` that was
+    present and ``None``. That row reads as owned by a pack named ``None``
+    here, so re-ingesting the same metadata is refused. sqlite-vec ran the
+    same expression but sanitises the metadata first, which folds ``None`` to
+    ``""`` before the insert, so the shape does not arise there; chroma has no
+    owner column at all.
 
     This layer does not fold that string to unowned on its own. Not because it
     could not tell the two apart -- the stored ``metadata``'s ``pack_id`` being
