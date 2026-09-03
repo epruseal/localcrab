@@ -240,8 +240,13 @@ def test_failed_initialisation_releases_the_lock_and_retries(isolated_context, m
     assert attempts["n"] == 2
 
 
-def test_reentrant_initialisation_fails_fast(isolated_context, monkeypatch):
-    """A factory that calls back into _get_context() raises instead of deadlocking."""
+def test_same_thread_reentrant_initialisation_fails_fast(isolated_context, monkeypatch):
+    """A factory re-entering _get_context() on its own thread raises, not deadlocks.
+
+    Only same-thread re-entry is detectable here. A factory that delegates to a
+    child thread and waits for it still deadlocks, by design -- see the
+    ``_context_init_owner`` comment in the module under test.
+    """
     recorder = _FactoryRecorder()
     _install_factories(monkeypatch, recorder)
     monkeypatch.setattr(factory_mod, "make_graph_store", lambda cfg: tools_mod._get_context())
@@ -251,3 +256,41 @@ def test_reentrant_initialisation_fails_fast(isolated_context, monkeypatch):
     assert isinstance(error, RuntimeError), f"expected RuntimeError, got {error!r}"
     assert "reentrant" in str(error).lower()
     assert tools_mod._context == {}
+    assert tools_mod._context_init_owner is None
+
+
+def test_build_context_refuses_a_caller_without_the_lock(isolated_context, monkeypatch):
+    """_build_context() is internal: calling it directly must not rerun the factories."""
+    recorder = _FactoryRecorder()
+    _install_factories(monkeypatch, recorder)
+
+    with pytest.raises(RuntimeError, match="without holding the context"):
+        tools_mod._build_context()
+
+    assert recorder.call_count == 0
+    assert tools_mod._context == {}
+
+    # The refusal is about the lock, not about the function being broken.
+    assert set(tools_mod._get_context()) == _CONTEXT_KEYS
+    assert recorder.call_count == 1
+
+
+def test_ownership_marker_is_cleared_after_a_failed_initialisation(
+    isolated_context, monkeypatch
+):
+    """A failed build leaves no owner behind for a later thread to impersonate."""
+    recorder = _FactoryRecorder()
+    _install_factories(monkeypatch, recorder)
+
+    def exploding(cfg):  # noqa: ARG001 - factory signature
+        raise RuntimeError("factory down")
+
+    monkeypatch.setattr(factory_mod, "make_graph_store", exploding)
+
+    with pytest.raises(RuntimeError, match="factory down"):
+        tools_mod._get_context()
+
+    assert tools_mod._context_init_owner is None
+    # A stale marker would let this bypass the ownership check.
+    with pytest.raises(RuntimeError, match="without holding the context"):
+        tools_mod._build_context()

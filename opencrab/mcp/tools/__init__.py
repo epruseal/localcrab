@@ -193,13 +193,29 @@ _context: dict[str, Any] = {}
 # separate concern owned by write.lock / chroma.lock (#140, #141).
 _context_init_lock = threading.Lock()
 
-# Ident of the thread currently running the initialisation body, or None.
-# Purely a re-entry tripwire: no factory calls back into _get_context() today
+# The thread currently running the initialisation body, or None. Only ever
+# set while _context_init_lock is held, so "this marker is me" is equivalent
+# to "I hold the lock" -- which is what lets _build_context() below refuse a
+# caller that bypassed the lock.
+#
+# It holds the Thread object rather than its ident because the OS reuses a
+# finished thread's ident, and a reused ident would let an unrelated thread
+# read as the owner. Object identity never collides that way.
+#
+# As a re-entry tripwire it catches SAME-THREAD re-entry only: a factory that
+# calls back into _get_context() on its own thread. No factory does that today
 # (verified across opencrab/), but a plain Lock would turn a future re-entry
 # into a silent deadlock, and an RLock would let the re-entrant call run the
 # factories a second time -- recreating the very duplication this fix exists
 # to remove. Failing fast is the only option that stays diagnosable.
-_context_init_thread: int | None = None
+#
+# LIMIT: a factory that hands the work to a CHILD thread and waits for it
+# still deadlocks. The child has a different identity, so it passes the guard
+# and then parks on the lock the parent is holding while it waits. Detecting
+# that needs initialisation ownership tracked per logical task rather than per
+# thread, which is far more machinery than this defect warrants. Such a
+# factory must be fixed on the factory side.
+_context_init_owner: threading.Thread | None = None
 
 
 def _get_context() -> dict[str, Any]:
@@ -214,36 +230,54 @@ def _get_context() -> dict[str, Any]:
     lock-free reader). On a free-threading build the fast path would have to
     move inside the lock.
     """
-    global _context, _context_init_thread
+    global _context, _context_init_owner
     if _context:
         return _context
 
-    if _context_init_thread == threading.get_ident():
+    if _context_init_owner is threading.current_thread():
         raise RuntimeError(
             "reentrant _get_context() call: a store factory called back into "
-            "the context initialiser, which cannot complete while it is still "
-            "running. Break the cycle in the factory."
+            "the context initialiser on the same thread, which cannot complete "
+            "while it is still running. Break the cycle in the factory."
         )
 
     with _context_init_lock:
         # Another thread may have finished initialising while this one waited.
         if _context:
             return _context
-        _context_init_thread = threading.get_ident()
         try:
+            # Claimed inside the try, so that an exception raised between the
+            # claim and the body -- an asynchronous KeyboardInterrupt, say --
+            # still clears the marker. A stale marker would let a later thread
+            # that reuses this one's identity walk straight past
+            # _build_context()'s ownership check.
+            _context_init_owner = threading.current_thread()
             return _build_context()
         finally:
-            _context_init_thread = None
+            _context_init_owner = None
 
 
 def _build_context() -> dict[str, Any]:
-    """Build and publish the store/engine context. Callers hold the init lock.
+    """Build and publish the store/engine context. The caller holds the lock.
 
     Split out only so the initialisation body keeps its original indentation
     and stays readable; it is not a separate entry point. On failure nothing
     is published, so the next _get_context() call retries from scratch.
+
+    "Not a separate entry point" is enforced rather than merely documented:
+    calling this directly would run every factory again and overwrite
+    ``_context``, re-creating the duplication #192 exists to remove. Since the
+    ownership marker is only ever set while the lock is held, requiring it to
+    name this thread is the same as requiring the lock.
     """
     global _context
+
+    if _context_init_owner is not threading.current_thread():
+        raise RuntimeError(
+            "_build_context() called without holding the context "
+            "initialisation lock. It is internal to _get_context(); call that "
+            "instead."
+        )
 
     from opencrab.config import get_settings
     from opencrab.ontology.builder import OntologyBuilder
