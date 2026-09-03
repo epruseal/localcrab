@@ -127,7 +127,7 @@ def _write_lock():
     (CHROMA_LOCK_TIMEOUT) and releases this lock, and the migration's own
     write.lock wait is bounded too, so neither side hangs. See
     scripts/migrate_to_local.py:_migrate_vectors_locked for why removing it
-    structurally is tracked separately.
+    structurally is a follow-up rather than part of this change.
     """
     with file_lock("write.lock", _lock_data_dir()):
         yield

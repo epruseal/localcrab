@@ -493,7 +493,7 @@ def _migrate_vectors_locked(
     hanging. Removing the inversion structurally needs a context-need axis the
     registry does not have (``writes`` means "needs write.lock", not "needs
     stores") and would have to cope with handlers that decide at runtime, so
-    it is tracked separately rather than bolted on here.
+    it is reported as a follow-up candidate rather than bolted on here.
 
     Lock SCOPE covers the client's whole lifetime, not just the copy loop. The
     PersistentClient is created and dropped inside the ``with``, so the lock is

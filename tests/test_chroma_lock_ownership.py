@@ -26,6 +26,7 @@ Reverse-mutation note (which tests are RED against the pre-fix code):
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -551,41 +552,65 @@ class TestLockOrderInversionIsBounded:
                 holder.terminate()
                 holder.join(10)
 
-    def test_migration_bounds_its_write_lock_wait(self):
+    def test_migration_bounds_its_write_lock_wait(self, tmp_path, monkeypatch):
         """마이그레이션의 write.lock 획득이 무한 대기가 아니다.
 
-        위 테스트는 공유 쪽 상한만 본다. 배타 쪽 상한은 인자로만 드러나므로
-        여기서 따로 고정한다. timeout 인자가 빠지면 상대가 풀릴 때까지
-        무기한 매달린다."""
-        import ast
+        위 테스트는 공유 쪽 상한만 본다. 배타 쪽 상한은 여기서 고정한다.
+        상한이 없으면 상대가 풀릴 때까지 무기한 매달린다.
 
-        # Parsed from source rather than imported: the script pulls sibling
-        # modules that are not importable as a package from the test session.
+        소스를 파싱하지 않고 실제로 호출한다. timeout 인자의 존재만 확인하면
+        ``timeout=None`` 이 통과하는데 그것이 바로 무한 대기다."""
+        import multiprocessing
+        import sys as _sys
+        import time
+
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        tree = ast.parse(
-            open(
-                os.path.join(repo, "scripts", "migrate_to_local.py"), encoding="utf-8"
-            ).read()
-        )
-        target = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_migrate_vectors_locked"
-        ]
-        assert len(target) == 1, "_migrate_vectors_locked 를 찾지 못했다"
-        write_lock_calls = [
-            node
-            for node in ast.walk(target[0])
-            if isinstance(node, ast.Call)
-            and getattr(node.func, "id", None) == "file_lock"
-            and node.args
-            and getattr(node.args[0], "value", None) == "write.lock"
-        ]
-        assert len(write_lock_calls) == 1, "write.lock 획득 지점을 찾지 못했다"
-        assert any(kw.arg == "timeout" for kw in write_lock_calls[0].keywords), (
-            "마이그레이션의 write.lock 획득에 timeout 이 없다 — 무한 대기"
-        )
+        scripts_dir = os.path.join(repo, "scripts")
+        if scripts_dir not in _sys.path:
+            _sys.path.insert(0, scripts_dir)
+        migrate_to_local = pytest.importorskip("migrate_to_local")
+
+        data_dir = str(tmp_path)
+        # Shrink the derived bound (chroma_lock_timeout + 60) to something a
+        # test can wait for, without hard-coding the derivation here.
+        monkeypatch.setenv("CHROMA_LOCK_TIMEOUT", "-58")
+        from opencrab.config import get_settings
+
+        get_settings.cache_clear()
+        try:
+            ready = multiprocessing.Event()
+            stop = multiprocessing.Event()
+
+            def hold_write(data_dir: str, ready, stop) -> None:
+                from opencrab.locking import acquire_file_lock, release_file_lock
+
+                fh = acquire_file_lock("write.lock", data_dir, shared=False)
+                ready.set()
+                stop.wait(60)
+                release_file_lock(fh)
+
+            holder = multiprocessing.Process(
+                target=hold_write, args=(data_dir, ready, stop)
+            )
+            holder.start()
+            try:
+                assert ready.wait(30), "write.lock 보유자가 기동하지 않았다"
+                started = time.monotonic()
+                with pytest.raises(TimeoutError):
+                    migrate_to_local._migrate_vectors_locked(
+                        None, data_dir, "irrelevant", 1, logging.getLogger(__name__)
+                    )
+                elapsed = time.monotonic() - started
+                assert elapsed < 30, f"상한이 걸리지 않았다: {elapsed}s"
+                assert holder.is_alive(), "보유자가 도중에 죽어 대기가 끝난 것이다"
+            finally:
+                stop.set()
+                holder.join(30)
+                if holder.is_alive():
+                    holder.terminate()
+                    holder.join(10)
+        finally:
+            get_settings.cache_clear()
 
 
 class TestRestContextFailureAtomicity:
