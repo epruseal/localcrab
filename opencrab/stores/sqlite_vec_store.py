@@ -489,7 +489,7 @@ class SqliteVecStore(_SqliteConnMixin):
                     # 어떻게 실패하든 결과는 하나여야 한다: 최초 원인을 그대로 올린다.
                     try:
                         owner = self._slot_owners(conn, [_id]).get(_id) or ""
-                    except Exception:  # noqa: BLE001 -- 아래 주석의 이유로 전 범위
+                    except Exception:  # noqa: BLE001 -- 위 주석의 이유로 전 범위
                         logger.warning(
                             "SqliteVecStore: 소유자 재조회 실패(%s) — 최초 예외를 그대로 "
                             "올린다", _id, exc_info=True,

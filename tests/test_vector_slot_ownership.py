@@ -449,3 +449,48 @@ class TestTheOriginalErrorSurvivesAFailedOwnerLookup:
         finally:
             if hasattr(store, "close"):
                 store.close()
+
+    def test_a_non_sqlite_lookup_failure_also_leaves_the_original_error(self, tmp_path):
+        """가드의 포착 범위가 드라이버 예외에 갇히지 않는다.
+
+        재조회가 `sqlite3.Error` 밖의 예외를 던져도 최초 원인이 그대로 올라와야
+        한다. 범위를 `sqlite3.Error` 로 좁히면 이 축이 RED 가 된다 — 그 좁힘이
+        조용히 돌아오는 것을 막는 자리다.
+        """
+        import sqlite3
+
+        store = build_vector_store("sqlite-vec", tmp_path)
+        assert store.available
+        try:
+            store.upsert_texts(texts=["팩 A 원본"], metadatas=[{"pack_id": "A"}], ids=["s"])
+
+            sentinel = sqlite3.OperationalError("최초 원인 표식")
+            real = store._slot_owners
+            calls = {"n": 0}
+
+            def boom(*_a, **_k):
+                raise sentinel
+
+            def flaky(conn, ids):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real(conn, ids)
+                raise RuntimeError("드라이버 밖 재조회 실패")
+
+            monkey = pytest.MonkeyPatch()
+            try:
+                monkey.setattr(store, "_insert_params", boom)
+                monkey.setattr(store, "_slot_owners", flaky)
+                with pytest.raises(sqlite3.Error) as excinfo:
+                    store.upsert_texts(
+                        texts=["팩 A 갱신"], metadatas=[{"pack_id": "A"}], ids=["s"])
+            finally:
+                monkey.undo()
+
+            assert excinfo.value is sentinel, (
+                "드라이버 밖 재조회 실패가 최초 원인을 가렸다: "
+                f"{type(excinfo.value).__name__}: {excinfo.value}")
+            assert calls["n"] >= 2, "층 2 의 재조회 가드를 타지 않았다"
+        finally:
+            if hasattr(store, "close"):
+                store.close()
