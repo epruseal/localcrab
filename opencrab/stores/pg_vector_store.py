@@ -382,9 +382,10 @@ class PgVectorStore:
                     # 감싸 호출자가 층을 구분하지 않게 한다. 이 예외는
                     # `engine.begin()` 안이라 배치 전체를 롤백시킨다.
                     raise ValueError(
-                        "upsert_texts: refusing to take over a slot owned by "
-                        f"another pack ({_id!r}); the row changed owner between "
-                        "the ownership check and this write"
+                        "upsert_texts: refusing to take over a slot already "
+                        f"attributed to a different pack ({_id!r}); the row "
+                        "changed attribution between the ownership check and "
+                        "this write"
                     )
         return ids
 

@@ -475,7 +475,7 @@ class SqliteVecStore(_SqliteConnMixin):
                 try:
                     conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
                 except sqlite3.Error as exc:
-                    # 층 2 가 걸렸을 때 pgvector 와 같은 예외 형태를 낸다. 소유자를
+                    # 층 2 가 걸렸을 때 pgvector 와 같은 타입과 같은 문구를 낸다. 소유자를
                     # 다시 읽어 남의 팩일 때만 바꿔 던지고, 아니면 원래 예외를 그대로
                     # 올린다 -- 디스크 오류나 스키마 문제를 소유권 오류로 가리지
                     # 않는다. 어느 쪽이든 `_tx()` 가 배치 전체를 롤백한다.

@@ -721,20 +721,24 @@ class TestRejectionMessagesDoNotNameTheOtherPack:
         assert secret not in message, f"소유 팩 이름이 메시지에 샜다: {message}"
         assert "'s'" in message, f"호출자가 낸 id 가 메시지에 없다: {message}"
 
-    def test_the_layer_two_message_does_not_name_the_owner_either(self, tmp_path):
-        """선검사를 지나친 경쟁에서 나오는 메시지도 같은 규율을 지킨다."""
-        store = build_vector_store("sqlite-vec", tmp_path)
+    @pytest.mark.parametrize("backend", ["sqlite-vec", "pg"])
+    def test_the_layer_two_message_does_not_name_the_owner_either(self, backend, tmp_path):
+        """선검사를 지나친 경쟁에서 나오는 메시지도 같은 규율을 지킨다.
+
+        SQL 두 백엔드 모두 층 2 를 가지므로 둘 다 건다. 한쪽만 덮으면 다른 쪽이
+        조용히 갈라진다.
+        """
+        store = build_vector_store(backend, tmp_path)
         assert store.available
         try:
             secret = "a-private-pack-name-9c30"
             store.upsert_texts(texts=["소유자"], metadatas=[{"pack_id": secret}], ids=["s"])
 
+            module = type(store).__module__
             monkey = pytest.MonkeyPatch()
             try:
-                monkey.setattr(
-                    "opencrab.stores.sqlite_vec_store.reject_foreign_slot_writes",
-                    lambda *a, **k: None)
-                with pytest.raises(ValueError) as excinfo:
+                monkey.setattr(f"{module}.reject_foreign_slot_writes", lambda *a, **k: None)
+                with pytest.raises(Exception) as excinfo:
                     store.upsert_texts(
                         texts=["침범"], metadatas=[{"pack_id": "intruder"}], ids=["s"])
             finally:
@@ -743,6 +747,14 @@ class TestRejectionMessagesDoNotNameTheOtherPack:
             assert secret not in str(excinfo.value), (
                 f"층 2 메시지에 소유 팩 이름이 샜다: {excinfo.value}")
         finally:
+            if backend == "pg":
+                try:
+                    from sqlalchemy import text
+
+                    with store._engine.begin() as conn:
+                        conn.execute(text(f"DROP TABLE IF EXISTS {store._table}"))
+                except Exception:
+                    pass
             if hasattr(store, "close"):
                 store.close()
 
