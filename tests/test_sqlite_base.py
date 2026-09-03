@@ -7,8 +7,10 @@ store's DDL/business logic.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -208,3 +210,344 @@ class TestEdge:
         t.join()
 
         assert result[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# WAL checkpoint policy (issue #94)
+# ---------------------------------------------------------------------------
+
+
+class TestWalCheckpoint:
+    """``_checkpoint_if_wal_large`` — explicit WAL TRUNCATE checkpoint policy.
+
+    SQLite's own auto-checkpoint (PASSIVE) reruns on every over-threshold commit
+    but never truncates the WAL file even when it fully succeeds — the file only
+    shrinks when the last connection closes. These tests pin the explicit-TRUNCATE
+    behavior this mixin adds on top of it, and the busy/timeout/exception-isolation
+    contracts it must uphold while doing so.
+    """
+
+    def _make_table(self, store: _FakeStore) -> None:
+        store._conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        store._conn.commit()
+
+    def _wal_size(self, store: _FakeStore) -> int:
+        path = store._db_path + "-wal"
+        return os.path.getsize(path) if os.path.exists(path) else 0
+
+    def _boom_on(self, match: str, exc: BaseException):
+        # sqlite3.Connection 은 CPython 3.13 기준 인스턴스·클래스 속성
+        # 재대입을 모두 거부하는 불변 타입이라(``TypeError: cannot set
+        # 'execute' attribute of immutable type``) conn.execute 자체는
+        # monkeypatch 할 수 없다. 체크포인트 보조 로직만 거치는
+        # ``_SqliteConnMixin._exec`` 시임을 대신 패치한다 — 일반 커밋 경로
+        # (``_tx()`` 본문의 conn.execute 호출)는 이 시임을 거치지 않으므로
+        # 영향받지 않는다.
+        orig = _FakeStore._exec
+
+        def wrapper(self_store, conn, sql, *args, **kwargs):
+            if match in sql:
+                raise exc
+            return orig(self_store, conn, sql, *args, **kwargs)
+
+        return wrapper
+
+    def _spy_on(self, match: str, calls: list):
+        orig = _FakeStore._exec
+
+        def wrapper(self_store, conn, sql, *args, **kwargs):
+            if match in sql:
+                calls.append(sql)
+            return orig(self_store, conn, sql, *args, **kwargs)
+
+        return wrapper
+
+    # -- 정상 --------------------------------------------------------------
+
+    def test_checkpoint_truncates_wal_once_threshold_crossed(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert self._wal_size(store) == 0
+
+    def test_below_threshold_no_checkpoint_attempted(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        self._make_table(store)
+        calls: list = []
+        monkeypatch.setattr(_FakeStore, "_exec", self._spy_on("wal_checkpoint", calls))
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert calls == []
+
+    def test_single_large_transaction_crosses_threshold_at_once(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        with store._tx() as conn:
+            for i in range(50):
+                conn.execute("INSERT INTO t (v) VALUES (?)", (str(i),))
+        assert self._wal_size(store) == 0
+
+    def test_busy_timeout_restored_after_normal_checkpoint(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        original = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == original
+
+    # -- 오류/엣지 (busy) ----------------------------------------------------
+
+    def test_busy_blocker_does_not_fail_commit_and_retries_after_release(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        blocker = sqlite3.connect(store._db_path)
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT count(*) FROM t").fetchall()
+
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]  # commit itself did not fail despite busy checkpoint
+        assert self._wal_size(store) > 0  # blocked reader prevented the truncate
+
+        blocker.rollback()
+        blocker.close()
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('y')")
+        assert self._wal_size(store) == 0  # next commit retries and succeeds
+
+    def test_busy_timeout_restored_after_busy_checkpoint(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        original = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        blocker = sqlite3.connect(store._db_path)
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT count(*) FROM t").fetchall()
+
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == original
+
+        blocker.rollback()
+        blocker.close()
+
+    def test_busy_checkpoint_returns_quickly_not_after_default_timeout(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        blocker = sqlite3.connect(store._db_path)
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT count(*) FROM t").fetchall()
+
+        t0 = time.time()
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        dt = time.time() - t0
+
+        blocker.rollback()
+        blocker.close()
+        assert dt < 1.0  # busy_timeout=0 during the attempt avoids the ~5s stall
+
+    # -- 엣지 (WAL 사이드카 부재/체크포인트 실행 실패) ------------------------
+
+    def test_no_wal_sidecar_yet_returns_quietly(self, tmp_path):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        store._checkpoint_if_wal_large(store._conn)  # must not raise
+
+    def test_wal_size_probe_non_oserror_does_not_flip_commit_to_failure(self, tmp_path, monkeypatch):
+        """Regression: an earlier revision only caught ``OSError`` around the
+        WAL-size probe (``os.path.getsize``). Any other ``Exception`` there
+        (e.g. from a monkeypatched/broken filesystem shim) propagated straight
+        out of ``_tx()`` — since the checkpoint call sits outside ``_tx()``'s
+        own try/except, that exception was not caught anywhere, and a caller
+        would see the already-committed write reported as a failure. Fixed by
+        widening the probe's except clause to ``Exception``.
+        """
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(os.path, "getsize", lambda path: (_ for _ in ()).throw(ValueError("probe boom")))
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        monkeypatch.undo()
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+
+    def test_checkpoint_baseexception_never_calls_tx_rollback(self, tmp_path, monkeypatch):
+        """Direct behavioral check for the design's core structural invariant:
+        ``_checkpoint_if_wal_large()`` sits outside ``_tx()``'s
+        ``try/except BaseException`` block. If it were moved back inside, a
+        checkpoint-raised ``BaseException`` would trigger a spurious
+        ``conn.rollback()`` call on an already-committed transaction. This
+        spies on ``rollback()`` itself via a connection factory (the class-
+        level monkeypatch used elsewhere targets ``_exec()``, which does not
+        cover ``_tx()``'s own ``conn.rollback()`` call) rather than only
+        inferring non-invocation from unaffected data state.
+        """
+        rollback_calls: list = []
+
+        class _SpyConn(sqlite3.Connection):
+            def rollback(self, *args, **kwargs):
+                rollback_calls.append(1)
+                return super().rollback(*args, **kwargs)
+
+        orig_connect = sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            kwargs["factory"] = _SpyConn
+            return orig_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", spy_connect)
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on("wal_checkpoint", KeyboardInterrupt()),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert rollback_calls == []
+
+    def test_checkpoint_exec_failure_does_not_flip_commit_to_failure(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on("wal_checkpoint", sqlite3.OperationalError("boom")),
+        )
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+
+    def test_checkpoint_exec_baseexception_does_not_trigger_tx_rollback(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on("wal_checkpoint", KeyboardInterrupt()),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        # commit already succeeded before the checkpoint call raised — data persisted,
+        # and _tx()'s except BaseException/rollback branch must not have run.
+        monkeypatch.undo()
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+
+    # -- 엣지 (busy_timeout 복원 실패 → 커넥션 폐기·재생성) -------------------
+
+    def test_restore_failure_discards_connection_and_recreates_with_default_timeout(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        old_conn = store._conn
+        original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on(f"busy_timeout={original}", ValueError("restore boom")),
+        )
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="opencrab.stores._sqlite_base"):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        # write itself still succeeded
+        monkeypatch.undo()
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+        # the poisoned connection was discarded — a fresh one was created, with
+        # the default busy_timeout restored (not left at 0)
+        new_conn = store._conn
+        assert new_conn is not old_conn
+        assert new_conn.execute("PRAGMA busy_timeout").fetchone()[0] == original
+        assert old_conn not in store._all_conns
+        # the restore failure was logged loudly (warning), not lost in debug noise
+        assert any(rec.levelno == logging.WARNING for rec in caplog.records)
+
+    def test_restore_baseexception_discards_connection_then_reraises(self, tmp_path, monkeypatch):
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        old_conn = store._conn
+        original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on(f"busy_timeout={original}", KeyboardInterrupt()),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        monkeypatch.undo()
+        # cleanup ran before the interrupt propagated: the poisoned connection is gone
+        assert old_conn not in store._all_conns
+        # data from the already-committed write survived
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+        # the thread's next connection has a normal (non-zero) busy_timeout
+        assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == original
+
+    def test_all_conns_removal_survives_concurrent_new_conn(self, tmp_path, monkeypatch):
+        """The design's earlier revision wrongly proposed guarding ``_all_conns``
+        removal with ``self._lock`` (the write-serializing lock); the real
+        invariant, enforced by ``_new_conn``/``close()``, is ``self._conns_lock``.
+        A concurrent ``_new_conn()`` (from another thread reading in parallel)
+        must never see a torn/corrupted ``_all_conns`` list while the discard
+        path removes the poisoned connection — this would surface as a
+        ``ValueError`` from ``list.remove`` racing a concurrent ``append``, or a
+        duplicate/missing entry, if the discard path used the wrong lock.
+        """
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        old_conn = store._conn
+        original = old_conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on(f"busy_timeout={original}", ValueError("restore boom")),
+        )
+
+        errors: list = []
+        stop = threading.Event()
+
+        def other_thread_new_conns():
+            local_store_conns = []
+            while not stop.is_set():
+                try:
+                    conn = store._new_conn()
+                    local_store_conns.append(conn)
+                except Exception as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+            for conn in local_store_conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=other_thread_new_conns)
+        t.start()
+        try:
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        finally:
+            stop.set()
+            t.join()
+        monkeypatch.undo()
+
+        assert errors == []
+        assert old_conn not in store._all_conns
+        # no duplicate entries — a torn list from a lock mismatch could double-add
+        assert len(store._all_conns) == len(set(id(c) for c in store._all_conns))
