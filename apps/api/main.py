@@ -22,7 +22,7 @@ from opencrab.auth import Principal
 from opencrab.common.graph_identity import NodeIdentityConflict
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
-from opencrab.locking import write_lock
+from opencrab.locking import close_quietly, write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
@@ -367,30 +367,29 @@ def _build_context() -> ApiContext:
         vector = _make(make_vector_store, settings)
         docs = _make(make_doc_store, settings)
         sql = _make(make_sql_store, settings)
+        # The boundary runs to the ApiContext return, not just to the last
+        # factory (#140). Engine construction can raise -- an invalid tunable
+        # parsed inside HybridQuery, say -- and stopping the boundary earlier
+        # left four open stores, the vector one holding chroma.lock, for the
+        # traceback to carry off.
+        try:
+            graph.ensure_constraints()
+        except Exception as exc:
+            logger.debug("Skipping graph constraint bootstrap: %s", exc)
+
+        return ApiContext(
+            settings=settings,
+            graph=graph,
+            vector=vector,
+            docs=docs,
+            sql=sql,
+            hybrid=HybridQuery(vector, graph),
+            impact=ImpactEngine(graph, sql),
+        )
     except BaseException:
         for store in reversed(built):
-            close = getattr(store, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Failed to close a store during cleanup: %s", exc)
+            close_quietly(store, f"{type(store).__name__} (context cleanup)", log=logger)
         raise
-
-    try:
-        graph.ensure_constraints()
-    except Exception as exc:
-        logger.debug("Skipping graph constraint bootstrap: %s", exc)
-
-    return ApiContext(
-        settings=settings,
-        graph=graph,
-        vector=vector,
-        docs=docs,
-        sql=sql,
-        hybrid=HybridQuery(vector, graph),
-        impact=ImpactEngine(graph, sql),
-    )
 
 
 def _close_context(ctx: ApiContext | None) -> None:

@@ -204,6 +204,10 @@ def make_vector_store(settings: Settings) -> Any:
             local_mode=settings.is_local,
             local_path=chroma_path,
             embedding_function=ef,
+            # #140: pass the caller's setting through. Without it ChromaStore
+            # falls back to the lru_cached global get_settings(), so a caller
+            # that built its own Settings waits the process default instead.
+            lock_timeout=settings.chroma_lock_timeout,
         )
 
     # 기존 경로: EMBEDDING_BACKEND=local 또는 미설정
@@ -214,6 +218,7 @@ def make_vector_store(settings: Settings) -> Any:
         collection_name=settings.chroma_collection,
         local_mode=settings.is_local,
         local_path=chroma_path,
+        lock_timeout=settings.chroma_lock_timeout,  # see the branch above (#140)
     )
 
 

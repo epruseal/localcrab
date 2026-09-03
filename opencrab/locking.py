@@ -68,6 +68,128 @@ def close_quietly(obj: object, what: str, *, log: object = None, reraise: bool =
         obj = None
 
 
+# --- chroma.lock process-wide ownership on Windows (#140) -------------------
+#
+# POSIX needs none of this: LOCK_SH is a real shared lock, so several
+# ChromaStore instances in one process hold it side by side and each releases
+# its own handle. Windows has no reader/writer lock, so `_acquire` emulates a
+# shared request as an EXCLUSIVE byte-range lock -- and a second local
+# ChromaStore for the same path then waits on the first one in its OWN process
+# until it times out. The combined REST + MCP app hits exactly that: REST
+# startup builds one vector store, and the first store-using /mcp call lazily
+# builds another.
+#
+# So on Windows the lock is taken ONCE per persist path per process and kept
+# until the process exits. No refcount: nothing counts down, so no failure path
+# can forget to, which is the trap issue #140 calls strictly worse than the
+# defect it would fix.
+#
+# NOT VERIFIED ON WINDOWS. There is no Windows runner here, so the registry
+# algorithm below is tested by injecting the platform decision, and the msvcrt
+# behaviour itself is not exercised.
+_chroma_registry: dict[str, BinaryIO] = {}
+_chroma_registry_guard = threading.Lock()
+_chroma_init_locks: dict[str, threading.RLock] = {}
+
+
+@contextmanager
+def chroma_init_guard(lock_path: str, *, windows: bool | None = None) -> Iterator[None]:
+    """Serialise chroma client initialisation per path (Windows only).
+
+    Covers acquisition AND the client init that follows, not just acquisition.
+    Guarding only the acquisition leaves this interleaving: A registers, A is
+    still initialising, B sees the registration and initialises with no lock at
+    all, B succeeds, A then fails and retracts -- leaving B's live client
+    unprotected. Holding the guard until A has succeeded or failed means B
+    always reads a settled result.
+
+    Re-entrant because the failure path releases under the same guard.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        yield
+        return
+    with _chroma_registry_guard:
+        guard = _chroma_init_locks.setdefault(lock_path, threading.RLock())
+    with guard:
+        yield
+
+
+def acquire_chroma_lock(
+    filename: str,
+    data_dir: str,
+    *,
+    timeout: float | None = None,
+    windows: bool | None = None,
+) -> tuple[BinaryIO | None, bool]:
+    """Acquire the shared chroma lock. Returns ``(handle, owns_registration)``.
+
+    POSIX returns a fresh handle every time and ``False``: ownership is
+    per instance and there is no registry.
+
+    Windows registers the first handle for a path and returns ``True`` to that
+    caller only. Later callers get ``(None, False)`` -- they neither hold nor
+    may retract anything. That ownership flag matters: without it a LATER
+    instance whose init fails would tear down the registration the FIRST one is
+    still relying on.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    path = _lock_path(filename, data_dir)
+    if not windows:
+        return acquire_file_lock(filename, data_dir, shared=True, timeout=timeout), False
+    with _chroma_registry_guard:
+        if path in _chroma_registry:
+            return None, False
+    handle = acquire_file_lock(filename, data_dir, shared=True, timeout=timeout)
+    with _chroma_registry_guard:
+        existing = _chroma_registry.get(path)
+        if existing is not None:
+            release_file_lock(handle)
+            return None, False
+        _chroma_registry[path] = handle
+    return handle, True
+
+
+def release_chroma_lock(
+    handle: BinaryIO | None,
+    filename: str,
+    data_dir: str,
+    *,
+    owns_registration: bool = False,
+    initialisation_failed: bool = False,
+    windows: bool | None = None,
+) -> None:
+    """Release a handle from :func:`acquire_chroma_lock`.
+
+    POSIX releases every time -- the handle's lifetime is the instance's.
+
+    Windows keeps a SUCCESSFUL registration for the life of the process and
+    retracts it only when the owner's initialisation failed. If a plain
+    ``close()`` retracted it, then A registering, B skipping and A closing
+    first would strip the exclusion out from under a still-live B. The cost is
+    that a Windows process holds the lock until it exits, so running the
+    offline loader there means stopping the server -- which is that workflow's
+    documented procedure anyway.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        if handle is not None:
+            release_file_lock(handle)
+        return
+    if not (owns_registration and initialisation_failed):
+        return
+    path = _lock_path(filename, data_dir)
+    with _chroma_registry_guard:
+        registered = _chroma_registry.get(path)
+        if registered is not handle:
+            return
+        del _chroma_registry[path]
+    release_file_lock(handle)
+
+
 def chroma_lock_dir(local_path: str) -> str:
     """Return the directory holding ``chroma.lock`` for a local chroma persist path.
 

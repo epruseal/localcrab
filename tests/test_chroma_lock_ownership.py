@@ -30,10 +30,31 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
 from opencrab.locking import acquire_file_lock, chroma_lock_dir, release_file_lock
+
+
+def run_threads(target, n, timeout=30.0):
+    errors = []
+    lk = threading.Lock()
+
+    def wrap(tid):
+        try:
+            target(tid)
+        except Exception as exc:  # noqa: BLE001
+            with lk:
+                errors.append(exc)
+
+    ts = [threading.Thread(target=wrap, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout)
+    assert not [t for t in ts if t.is_alive()], "데드락 의심"
+    return errors
 
 # An exclusive claimant standing in for the offline pack loader or a migration.
 # Run in a CHILD process on purpose: flock is scoped to the open file
@@ -850,13 +871,13 @@ class TestNoFramePinsTheClientAtReleaseTime:
         observed: list[bool] = []
         real_release = type(store)._release_local_lock
 
-        def spy_release(self):
+        def spy_release(self, **kw):
             # close()'s own frame is still alive here. An inline
             # `close = getattr(client, "close", None)` is a bound method that
             # keeps the client alive right at this moment.
             gc.collect()
             observed.append(ref() is None)
-            return real_release(self)
+            return real_release(self, **kw)
 
         store._release_local_lock = spy_release.__get__(store, type(store))
         store.close()
@@ -900,12 +921,12 @@ class TestNoFramePinsTheClientAtReleaseTime:
 
         real_release = chroma_cls._release_local_lock
 
-        def spy_release(self):
+        def spy_release(self, **kw):
             # The _connect frame is still alive right here. If it still names
             # the client, this is where an inline bound method shows up.
             gc.collect()
             observed.append(refs[0]() is None)
-            return real_release(self)
+            return real_release(self, **kw)
 
         monkeypatch.setattr(chroma_cls, "_release_local_lock", spy_release)
 
@@ -979,3 +1000,320 @@ class TestNoFramePinsTheClientAtReleaseTime:
                 )
             tb = tb.tb_next
         assert refs[0]() is None, "잠금이 풀린 뒤에도 클라이언트가 살아 있다"
+
+
+class TestWindowsProcessWideRegistration:
+    """Windows takes chroma.lock once per path per process (#140).
+
+    NOT VERIFIED ON WINDOWS: there is no Windows runner here, so ``msvcrt``
+    itself is never exercised. What these tests do cover is the registration
+    algorithm, by injecting the platform decision. The reason it exists: the
+    Windows emulation makes a shared request an EXCLUSIVE byte-range lock, so a
+    second local store for the same path would wait on the first one in its own
+    process. Every assertion here checks the injected acquire's call count and
+    the handles actually retained, never just a return value -- an
+    implementation that always skips would pass a return-value-only check.
+    """
+
+    def _acquire(self, tmp_path, name="d"):
+        d = tmp_path / name
+        d.mkdir(exist_ok=True)
+        return str(d)
+
+    def test_second_request_for_one_path_does_not_acquire(self, tmp_path):
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        h1, owns1 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        h2, owns2 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        try:
+            assert h1 is not None and owns1 is True, "첫 요청이 등록을 쥐지 않았다"
+            assert h2 is None and owns2 is False, "두 번째가 또 잡았다 — 자기충돌"
+        finally:
+            release_chroma_lock(
+                h1, "chroma.lock", d, owns_registration=owns1,
+                initialisation_failed=True, windows=True,
+            )
+
+    def test_distinct_paths_each_acquire(self, tmp_path):
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        a = self._acquire(tmp_path, "a")
+        b = self._acquire(tmp_path, "b")
+        ha, oa = acquire_chroma_lock("chroma.lock", a, windows=True)
+        hb, ob = acquire_chroma_lock("chroma.lock", b, windows=True)
+        try:
+            assert ha is not None and hb is not None, "서로 다른 경로가 합쳐졌다"
+        finally:
+            for h, o, d in ((ha, oa, a), (hb, ob, b)):
+                release_chroma_lock(
+                    h, "chroma.lock", d, owns_registration=o,
+                    initialisation_failed=True, windows=True,
+                )
+
+    def test_symlink_alias_shares_one_registration(self, tmp_path):
+        """엣지: 별칭으로 지나는 두 요청이 하나의 등록으로 합쳐진다.
+
+        키를 정규화하지 않으면 별칭 둘이 별도 등록이 되어 자기충돌이 그대로
+        재발한다."""
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        real = tmp_path / "real"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real)
+
+        h1, o1 = acquire_chroma_lock("chroma.lock", str(real), windows=True)
+        h2, o2 = acquire_chroma_lock("chroma.lock", str(alias), windows=True)
+        try:
+            assert h1 is not None
+            assert h2 is None, "별칭이 별도 등록으로 판정됐다"
+        finally:
+            release_chroma_lock(
+                h1, "chroma.lock", str(real), owns_registration=o1,
+                initialisation_failed=True, windows=True,
+            )
+            assert o2 is False
+
+    def test_concurrent_first_requests_acquire_once(self, tmp_path):
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        results: list = []
+        start = threading.Barrier(4)
+
+        def worker(_tid: int) -> None:
+            start.wait(10)
+            results.append(acquire_chroma_lock("chroma.lock", d, windows=True))
+
+        errors = run_threads(worker, 4)
+        assert errors == [], f"동시 요청 오류: {errors}"
+        owners = [r for r in results if r[1]]
+        try:
+            assert len(owners) == 1, f"동시 최초 요청이 여러 번 획득했다: {len(owners)}"
+            assert sum(1 for r in results if r[0] is not None) == 1
+        finally:
+            h, o = owners[0]
+            release_chroma_lock(
+                h, "chroma.lock", d, owns_registration=o,
+                initialisation_failed=True, windows=True,
+            )
+
+    def test_owner_init_failure_releases_so_next_request_retries(self, tmp_path):
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        h1, o1 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        release_chroma_lock(
+            h1, "chroma.lock", d, owns_registration=o1,
+            initialisation_failed=True, windows=True,
+        )
+        h2, o2 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        try:
+            assert h2 is not None and o2 is True, (
+                "소유자 초기화 실패 뒤에도 등록이 남아 재시도가 막혔다"
+            )
+        finally:
+            release_chroma_lock(
+                h2, "chroma.lock", d, owns_registration=o2,
+                initialisation_failed=True, windows=True,
+            )
+
+    def test_owner_close_keeps_the_registration(self, tmp_path):
+        """수명 교차: A 를 먼저 닫아도 등록이 남는다.
+
+        지우면 B 가 살아 있는데도 프로세스 간 배제를 잃는다."""
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        h1, o1 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        h2, o2 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        assert h2 is None
+        # A closes normally (not an init failure).
+        release_chroma_lock(
+            h1, "chroma.lock", d, owns_registration=o1,
+            initialisation_failed=False, windows=True,
+        )
+        h3, o3 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        try:
+            assert h3 is None and o3 is False, (
+                "정상 close() 가 성공 등록을 지웠다 — 살아 있는 인스턴스가 잠금을 잃는다"
+            )
+        finally:
+            release_chroma_lock(
+                h1, "chroma.lock", d, owns_registration=o1,
+                initialisation_failed=True, windows=True,
+            )
+
+    def test_non_owner_failure_keeps_the_owners_registration(self, tmp_path):
+        """비소유자 실패가 남의 등록을 지우지 않는다.
+
+        소유권 조건이 없으면 B 의 초기화 실패가 A 의 등록을 철회해, 살아 있는
+        A 의 클라이언트가 잠금을 잃는다."""
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        h1, o1 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        h2, o2 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        # B fails to initialise and tries to clean up.
+        release_chroma_lock(
+            h2, "chroma.lock", d, owns_registration=o2,
+            initialisation_failed=True, windows=True,
+        )
+        h3, o3 = acquire_chroma_lock("chroma.lock", d, windows=True)
+        try:
+            assert h3 is None and o3 is False, (
+                "비소유자의 실패가 소유자의 등록을 지웠다"
+            )
+        finally:
+            release_chroma_lock(
+                h1, "chroma.lock", d, owns_registration=o1,
+                initialisation_failed=True, windows=True,
+            )
+
+    def test_posix_branch_acquires_every_time(self, tmp_path):
+        """비회귀: POSIX 는 종전대로 인스턴스별 획득·해제다."""
+        from opencrab.locking import acquire_chroma_lock, release_chroma_lock
+
+        d = self._acquire(tmp_path)
+        h1, o1 = acquire_chroma_lock("chroma.lock", d, windows=False)
+        h2, o2 = acquire_chroma_lock("chroma.lock", d, windows=False)
+        try:
+            assert h1 is not None and h2 is not None, "POSIX 가 등록으로 건너뛰었다"
+            assert o1 is False and o2 is False, "POSIX 에 등록 소유권이 생겼다"
+        finally:
+            release_chroma_lock(h1, "chroma.lock", d, windows=False)
+            release_chroma_lock(h2, "chroma.lock", d, windows=False)
+
+
+class TestFactoryPassesTheConfiguredTimeout:
+    @pytest.mark.parametrize("embedding_backend", ["local", "openai"])
+    def test_explicit_settings_timeout_reaches_the_store(
+        self, embedding_backend, tmp_path, monkeypatch
+    ):
+        """팩토리가 설정의 잠금 타임아웃을 넘긴다.
+
+        환경 변수에 다른 값을 두어 캐시된 전역 설정 폴백과 구분한다. 같은 값을
+        쓰면 폴백이 살아 있어도 통과한다. 생성 지점이 두 곳이라 임베딩 백엔드
+        두 분기를 모두 돈다."""
+        pytest.importorskip("chromadb")
+        from opencrab.config import Settings
+        from opencrab.stores import factory as factory_mod
+
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("CHROMA_LOCK_TIMEOUT", "99.0")
+        cfg = Settings(
+            LOCAL_DATA_DIR=str(tmp_path),
+            VECTOR_BACKEND="chroma",
+            EMBEDDING_BACKEND=embedding_backend,
+            CHROMA_LOCK_TIMEOUT=7.5,
+        )
+        seen: list = []
+
+        class Spy:
+            def __init__(self, *a, **kw):
+                seen.append(kw.get("lock_timeout"))
+                self.available = False
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(factory_mod, "ChromaStore", Spy, raising=False)
+        monkeypatch.setattr(
+            factory_mod, "_make_kure_embedding_function", lambda s: None
+        )
+        import opencrab.stores.chroma_store as cs_mod
+
+        monkeypatch.setattr(cs_mod, "ChromaStore", Spy)
+        factory_mod.make_vector_store(cfg)
+        assert seen == [7.5], (
+            f"팩토리가 설정값을 넘기지 않았다(환경값 99.0 폴백 의심): {seen}"
+        )
+
+
+class TestContextBoundariesCoverEngineConstruction:
+    def test_rest_closes_stores_when_context_assembly_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """REST 정리 경계가 컨텍스트 생성까지 덮는다.
+
+        마지막 실패 가능 지점인 ApiContext 생성에 주입한다. 엔진 실패만 보면
+        경계를 거기까지만 넓힌 불완전한 수정도 통과한다."""
+        pytest.importorskip("fastapi")
+        import apps.api.main as api_main
+
+        closed: list[str] = []
+
+        class Fake:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            def close(self) -> None:
+                closed.append(self._name)
+
+            def ensure_constraints(self) -> None:
+                pass
+
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        for attr, name in (
+            ("make_graph_store", "graph"),
+            ("make_vector_store", "vector"),
+            ("make_doc_store", "docs"),
+            ("make_sql_store", "sql"),
+        ):
+            monkeypatch.setattr(
+                api_main, attr, (lambda n: lambda s: Fake(n))(name)
+            )
+        monkeypatch.setattr(
+            api_main,
+            "ApiContext",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("context boom")),
+        )
+        with pytest.raises(RuntimeError, match="context boom"):
+            api_main._build_context()
+        assert closed == ["sql", "docs", "vector", "graph"], (
+            f"전량 역순 정리가 되지 않았다: {closed}"
+        )
+
+    def test_mcp_closes_stores_when_billing_hooks_fail(self, tmp_path, monkeypatch):
+        """MCP 정리 경계가 마지막 생성 지점까지 덮는다.
+
+        BillingHooks 는 컨텍스트 공개 직전의 마지막 실패 가능 지점이다. 엔진
+        실패만 보면 BillingHooks 가 경계 밖인 구현도 통과한다."""
+        import opencrab.billing.hooks as hooks_mod
+        import opencrab.mcp.tools as tools_mod
+        from opencrab.stores import factory as factory_mod
+
+        closed: list[str] = []
+
+        class Fake:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            def close(self) -> None:
+                closed.append(self._name)
+
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(tools_mod, "_context", {})
+        for attr, name in (
+            ("make_graph_store", "graph"),
+            ("make_vector_store", "vector"),
+            ("make_doc_store", "docs"),
+            ("make_sql_store", "sql"),
+        ):
+            monkeypatch.setattr(
+                factory_mod, attr, (lambda n: lambda cfg: Fake(n))(name)
+            )
+        monkeypatch.setattr(
+            factory_mod, "make_billing_sql_store", lambda cfg, sql: Fake("billing_sql")
+        )
+        monkeypatch.setattr(
+            hooks_mod,
+            "BillingHooks",
+            lambda s: (_ for _ in ()).throw(RuntimeError("billing boom")),
+        )
+        with pytest.raises(RuntimeError, match="billing boom"):
+            tools_mod._get_context()
+        assert closed == ["billing_sql", "sql", "docs", "vector", "graph"], (
+            f"전량 역순 정리가 되지 않았다: {closed}"
+        )

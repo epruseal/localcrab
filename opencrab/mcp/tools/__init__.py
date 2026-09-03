@@ -301,10 +301,6 @@ def _build_context() -> dict[str, Any]:
         )
 
     from opencrab.config import get_settings
-    from opencrab.ontology.builder import OntologyBuilder
-    from opencrab.ontology.impact import ImpactEngine
-    from opencrab.ontology.query import HybridQuery
-    from opencrab.ontology.rebac import ReBACEngine
     from opencrab.stores.factory import (
         make_billing_sql_store,
         make_doc_store,
@@ -334,9 +330,30 @@ def _build_context() -> dict[str, Any]:
         docs = _make(make_doc_store, cfg)
         sql = _make(make_sql_store, cfg)
         billing_sql = _make(make_billing_sql_store, cfg, sql)
+        return _assemble_context(graph, vector, docs, sql, billing_sql)
     except BaseException:
+        # The boundary runs to the published context, not just to the last
+        # factory (#140). Engine and BillingHooks construction can raise, and
+        # a narrower boundary left every store open -- the vector one holding
+        # chroma.lock -- with nothing to close them.
         _close_all(built)
         raise
+
+
+def _assemble_context(graph, vector, docs, sql, billing_sql) -> dict[str, Any]:
+    """Build the engines over already-created stores and publish the context.
+
+    Split out of _build_context only so the failure boundary there can wrap
+    engine construction as well as the factories (#140). Not a separate entry
+    point -- _build_context is the only caller and holds the initialisation
+    lock throughout.
+    """
+    global _context
+
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.ontology.impact import ImpactEngine
+    from opencrab.ontology.query import HybridQuery
+    from opencrab.ontology.rebac import ReBACEngine
 
     builder = OntologyBuilder(graph, docs, sql, vec=vector)
     rebac = ReBACEngine(graph, sql)
@@ -353,6 +370,7 @@ def _build_context() -> dict[str, Any]:
     # make_billing_sql_store's docstring and opencrab/billing/hooks.py's
     # module docstring (including "NO AUTOMATIC MIGRATION") for why.
     from opencrab.billing.hooks import BillingHooks
+
     billing = BillingHooks(billing_sql)
 
     _context = {

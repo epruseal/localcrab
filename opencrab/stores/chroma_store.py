@@ -93,6 +93,7 @@ class ChromaStore:
         # single-process constraint applies to the persist directory, not to a
         # server. See _acquire_local_lock for why this is per-instance.
         self._lock_fh: Any = None
+        self._owns_lock_registration = False
         self._lock_timeout = lock_timeout
         # Chroma 자체는 개별 호출 단위로만 스레드 안전하다(공식 System Constraints).
         # 이 락의 용도는 두 가지다. (1) 앱 레벨 공유 상태인 self._collection 핸들 교체
@@ -131,7 +132,7 @@ class ChromaStore:
         The acquisition sits OUTSIDE ``_connect``'s ``except Exception`` on
         purpose; see ChromaLockTimeoutError.
         """
-        from opencrab.locking import acquire_file_lock, chroma_lock_dir
+        from opencrab.locking import acquire_chroma_lock, chroma_lock_dir
 
         timeout = self._lock_timeout
         if timeout is None:
@@ -141,8 +142,8 @@ class ChromaStore:
 
         lock_dir = chroma_lock_dir(self._local_path)
         try:
-            self._lock_fh = acquire_file_lock(
-                "chroma.lock", lock_dir, shared=True, timeout=timeout
+            self._lock_fh, self._owns_lock_registration = acquire_chroma_lock(
+                "chroma.lock", lock_dir, timeout=timeout
             )
         except TimeoutError as exc:
             raise ChromaLockTimeoutError(
@@ -152,20 +153,45 @@ class ChromaStore:
                 "process or wait for it to finish, then retry."
             ) from exc
 
-    def _release_local_lock(self) -> None:
-        """Release this instance's chroma.lock handle, if it holds one."""
-        from opencrab.locking import release_file_lock
+    def _release_local_lock(self, *, initialisation_failed: bool = False) -> None:
+        """Release this instance's chroma.lock handle, if it holds one.
+
+        On Windows a successful registration is process-wide and survives this
+        call; only the owner's failed initialisation retracts it. See
+        opencrab/locking.py:release_chroma_lock.
+        """
+        from opencrab.locking import chroma_lock_dir, release_chroma_lock
 
         fh, self._lock_fh = self._lock_fh, None
-        if fh is not None:
-            release_file_lock(fh)
+        owns, self._owns_lock_registration = self._owns_lock_registration, False
+        if fh is None:
+            return
+        release_chroma_lock(
+            fh,
+            "chroma.lock",
+            chroma_lock_dir(self._local_path),
+            owns_registration=owns,
+            initialisation_failed=initialisation_failed,
+        )
 
     def _connect(self) -> None:
-        # Before the try: a lock timeout must propagate as a startup error
-        # instead of being degraded to available=False with no way back.
-        if self._local_mode:
-            self._acquire_local_lock()
+        if not self._local_mode:
+            self._connect_body()
+            return
+        from opencrab.locking import chroma_init_guard, chroma_lock_dir
 
+        # The guard spans acquisition AND the client init, so a second instance
+        # in this process never observes a half-settled registration (#140).
+        # No-op off Windows.
+        with chroma_init_guard(
+            os.path.join(chroma_lock_dir(self._local_path), "chroma.lock")
+        ):
+            # Before the try: a lock timeout must propagate as a startup error
+            # instead of being degraded to available=False with no way back.
+            self._acquire_local_lock()
+            self._connect_body()
+
+    def _connect_body(self) -> None:
         try:
             import chromadb  # type: ignore[import]
 
@@ -210,7 +236,7 @@ class ChromaStore:
                     # Clear this frame's own reference before the lock goes:
                     # the frame is still alive at release time.
                     client = None
-                    self._release_local_lock()
+                    self._release_local_lock(initialisation_failed=True)
 
     @property
     def available(self) -> bool:
