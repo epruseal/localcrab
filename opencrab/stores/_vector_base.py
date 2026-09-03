@@ -79,8 +79,8 @@ CONTRACT — an owned slot may only be rewritten by its owner [#197]:
     reading that second column on every write would put a one-off legacy shape
     into the permanent contract, and because rewriting stored rows is a data
     change an operator decides. So the gate reads the stored value as it
-    stands, and the docs carry the query that finds those rows plus the repair
-    for each backend. Metadata-only update paths
+    stands, and the docs carry the query that finds those rows plus the
+    pgvector repair -- the only backend where the shape arises. Metadata-only update paths
     (``opencrab/pack/load.py:_vec_meta_update``) do not bypass any of this:
     they check the existing row's ``pack_id`` before patching the metadata
     column and fall back to ``upsert_texts`` on a mismatch, which now refuses

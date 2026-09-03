@@ -543,9 +543,13 @@ record = {"id": str, "embedding": list[float],
 
 **다른 두 백엔드는 이 형태가 생기지 않는다.** sqlite-vec 은 같은 식을 썼지만 `_insert_params` 앞에서
 `_sanitize_metadata` 가 `None` 을 빈 문자열로 접는다(실측: 같은 입력에 pgvector 는 `'None'`,
-sqlite-vec 은 `''` 을 저장했다). chroma 는 소유 전용 컬럼이 없다. 외부 writer 가 vec0 테이블에 그
-값을 직접 넣었다면 같은 거부를 겪는데, 그 경우 `pack_id` 가 partition key 라 `UPDATE` 가 막히므로
-(`UPDATE on partition key columns are not supported yet.`) 그 행을 지우고 다시 넣어야 한다.
+sqlite-vec 은 `''` 을 저장했다). chroma 는 소유 전용 컬럼이 없다. 그래서 아래 수리는 pgvector
+하나에만 필요하다.
+
+vec0 에 대한 사실 하나만 덧붙인다. 이 저장소의 writer 가 그 값을 만들지는 않지만, 외부에서 그
+테이블에 직접 넣은 행이 있다면 `pack_id` 가 partition key 라 `UPDATE` 로는 고칠 수 없다
+(`UPDATE on partition key columns are not supported yet.`). 그런 행을 만난 운영자는 그 제약을
+알고 대응해야 한다. 이 문서는 그 절차를 규정하지 않는다 — 이 저장소가 만들지 않는 상태이기 때문이다.
 
 이 값을 만들 수 있었던 경로는 좁다. 팩 적재와 노드 쓰기는 항상 문자열을 넣으므로, 호출자가
 `pack_id` 를 명시적으로 `null` 로 준 적재에서만 생긴다.
