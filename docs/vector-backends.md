@@ -534,6 +534,31 @@ record = {"id": str, "embedding": list[float],
 프로세스 내 락까지가 한계다. 프로세스 간 직렬화는 종전에도 이 계층이 제공하지 않았고 지금도
 호출자의 `write.lock` 규율이다.
 
+**업그레이드 단서 — 레거시 pgvector 행의 `'None'` 소유 태그**. 이 게이트 이전의 pgvector writer 는
+`metadata["pack_id"]` 가 `None` 일 때 소유 컬럼에 리터럴 문자열 `'None'` 을 넣었다(`str(None)`).
+그 행은 의도상 미소유인데 게이트는 `None` 이라는 이름의 팩이 소유한 것으로 읽는다. 그래서 **같은
+메타로 다시 적재하면 거부된다.** 새 정규화는 앞으로 쓰는 값만 고치고 이미 저장된 값은 건드리지 않는다.
+
+이 값을 만들 수 있었던 경로는 좁다. 팩 적재와 노드 쓰기는 항상 문자열을 넣으므로, 호출자가
+`pack_id` 를 명시적으로 `null` 로 준 적재에서만 생긴다. 그런 행이 있는지 확인하고 고치는 것은
+운영자의 판단이다. 이 계층은 `'None'` 을 미소유로 해석하지 않는다 — 그렇게 하면 실제로 `None`
+이라는 이름을 쓰는 팩의 소유가 사라진다.
+
+확인:
+
+```sql
+SELECT count(*) FROM <vector_table> WHERE pack_id = 'None';
+```
+
+고치기(운영자가 판단해 실행한다. 실행 전 백업하라):
+
+```sql
+UPDATE <vector_table> SET pack_id = '' WHERE pack_id = 'None' AND metadata->>'pack_id' IS NULL;
+```
+
+`metadata->>'pack_id' IS NULL` 조건이 실제로 `None` 이라는 이름을 쓰는 팩의 행을 지켜 준다.
+그 팩의 행은 메타에도 문자열 `"None"` 이 들어 있어 이 조건에 걸리지 않는다.
+
 **계약 밖**: 쓰기만 규율한다. `delete(ids)` 는 여전히 팩을 가리지 않고 그 id 의 행을 지운다.
 `add_texts` 도 게이트를 걸지 않는다(시간 소금 id 이고 SQL 두 백엔드가 중복 기본키를 이미 거부한다).
 게이트 도입 이전에 이미 넘어간 슬롯은 치유하지 않는다.
