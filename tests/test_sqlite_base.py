@@ -360,6 +360,62 @@ class TestWalCheckpoint:
         store = _FakeStore(str(tmp_path / "a.db"))
         store._checkpoint_if_wal_large(store._conn)  # must not raise
 
+    def test_wal_size_probe_non_oserror_does_not_flip_commit_to_failure(self, tmp_path, monkeypatch):
+        """Regression: an earlier revision only caught ``OSError`` around the
+        WAL-size probe (``os.path.getsize``). Any other ``Exception`` there
+        (e.g. from a monkeypatched/broken filesystem shim) propagated straight
+        out of ``_tx()`` — since the checkpoint call sits outside ``_tx()``'s
+        own try/except, that exception was not caught anywhere, and a caller
+        would see the already-committed write reported as a failure. Fixed by
+        widening the probe's except clause to ``Exception``.
+        """
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(os.path, "getsize", lambda path: (_ for _ in ()).throw(ValueError("probe boom")))
+        with store._tx() as conn:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        monkeypatch.undo()
+        rows = [r[0] for r in store._conn.execute("SELECT v FROM t").fetchall()]
+        assert rows == ["x"]
+
+    def test_checkpoint_baseexception_never_calls_tx_rollback(self, tmp_path, monkeypatch):
+        """Direct behavioral check for the design's core structural invariant:
+        ``_checkpoint_if_wal_large()`` sits outside ``_tx()``'s
+        ``try/except BaseException`` block. If it were moved back inside, a
+        checkpoint-raised ``BaseException`` would trigger a spurious
+        ``conn.rollback()`` call on an already-committed transaction. This
+        spies on ``rollback()`` itself via a connection factory (the class-
+        level monkeypatch used elsewhere targets ``_exec()``, which does not
+        cover ``_tx()``'s own ``conn.rollback()`` call) rather than only
+        inferring non-invocation from unaffected data state.
+        """
+        rollback_calls: list = []
+
+        class _SpyConn(sqlite3.Connection):
+            def rollback(self, *args, **kwargs):
+                rollback_calls.append(1)
+                return super().rollback(*args, **kwargs)
+
+        orig_connect = sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            kwargs["factory"] = _SpyConn
+            return orig_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", spy_connect)
+        store = _FakeStore(str(tmp_path / "a.db"))
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        self._make_table(store)
+        monkeypatch.setattr(
+            _FakeStore, "_exec",
+            self._boom_on("wal_checkpoint", KeyboardInterrupt()),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            with store._tx() as conn:
+                conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert rollback_calls == []
+
     def test_checkpoint_exec_failure_does_not_flip_commit_to_failure(self, tmp_path, monkeypatch):
         store = _FakeStore(str(tmp_path / "a.db"))
         monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)

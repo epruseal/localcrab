@@ -202,9 +202,14 @@ class _SqliteConnMixin:
         """
         try:
             wal_size = os.path.getsize(f"{self._db_path}-wal")
-        except OSError:
-            # WAL 사이드카가 아직 없는 초기 상태 등 — 방금 성공한 커밋을
-            # 실패로 보이게 해서는 안 되므로 조용히 반환한다.
+        except Exception as exc:
+            # WAL 사이드카가 아직 없는 초기 상태(OSError)를 포함해, 이 조회
+            # 단계에서 나는 어떤 Exception 도 방금 성공한 커밋을 실패로
+            # 보이게 해서는 안 된다(받아들임 기준 4) — 조용히 반환한다.
+            logger.debug(
+                "%s._checkpoint_if_wal_large: WAL size probe failed, skipping: %s",
+                type(self).__name__, exc,
+            )
             return
         if wal_size < self._WAL_CHECKPOINT_THRESHOLD_BYTES:
             return
