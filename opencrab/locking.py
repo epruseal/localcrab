@@ -35,6 +35,67 @@ def lock_data_dir() -> str:
     return data_dir
 
 
+def chroma_lock_wait_timeout() -> float:
+    """Seconds to wait for chroma.lock before giving up with a clear error.
+
+    One derivation for every waiter (#140), so a future change cannot move one
+    site and leave another behind. It exceeds CHROMA_LOCK_TIMEOUT because a
+    peer blocked on chroma.lock while holding write.lock takes that long to
+    withdraw; waiting less would mistake a normal hand-off for a stuck peer.
+
+    Factored out as a function so tests can shorten the bound without feeding
+    the product an abnormal setting.
+    """
+    from opencrab.config import get_settings
+
+    return get_settings().chroma_lock_timeout + 60.0
+
+
+def chroma_lock_busy_message(lock_path: str, timeout: float) -> str:
+    """Operator-facing text for a chroma.lock wait that timed out.
+
+    Deliberately does NOT name the kind of holder. An exclusive claim is
+    blocked both by a server holding the lock SHARED and by another migration
+    or loader holding it EXCLUSIVE, and the lock API cannot tell them apart.
+    Asserting the first would send an operator to the wrong place in the
+    second.
+    """
+    return (
+        f"timed out after {timeout}s waiting for {lock_path}. Another process "
+        "holds chroma.lock: either a server or command has the local chroma "
+        "store open (shared), or another migration or pack load holds it "
+        "exclusively. Stop that process, then run this again."
+    )
+
+
+@contextmanager
+def chroma_lock_held(
+    data_dir: str, *, shared: bool, timeout: float | None = None
+) -> Iterator[None]:
+    """Hold chroma.lock for a block, converting an acquisition timeout.
+
+    The conversion covers ONLY the acquisition. A timeout raised by anything
+    inside the block -- write.lock, say -- keeps its own message, because
+    telling an operator to stop the chroma holder would send them to the wrong
+    process.
+    """
+    if timeout is None:
+        timeout = chroma_lock_wait_timeout()
+    path = _lock_path("chroma.lock", data_dir)
+    try:
+        cm = file_lock("chroma.lock", data_dir, shared=shared, timeout=timeout)
+        cm.__enter__()
+    except TimeoutError as exc:
+        raise TimeoutError(chroma_lock_busy_message(path, timeout)) from exc
+    try:
+        yield
+    except BaseException as exc:
+        if not cm.__exit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        cm.__exit__(None, None, None)
+
+
 def close_quietly(obj: object, what: str, *, log: object = None, reraise: bool = False) -> None:
     """Close ``obj`` if it has a ``close``, without pinning it in this frame.
 

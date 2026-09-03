@@ -517,14 +517,20 @@ def _migrate_vectors_locked(
     # Wait longer than the counterparty can hold write.lock while it is itself
     # blocked on chroma.lock (CHROMA_LOCK_TIMEOUT), plus headroom, so a normal
     # hand-off is not mistaken for a stuck peer.
-    from opencrab.config import get_settings
+    from opencrab.locking import chroma_lock_held, chroma_lock_wait_timeout
 
-    write_timeout = get_settings().chroma_lock_timeout + 60.0
-
-    with file_lock("chroma.lock", chroma_lock_dir(chroma_local_path)):
+    # Both waits are bounded (#140). Without a bound on the OUTER one, a server
+    # holding the lifetime shared lock stalls this step forever -- and by then
+    # the graph and document steps have already written, so the operator is
+    # left with a hung command and a half-migrated target and no way to tell
+    # what blocked it. COMPATIBILITY: a holder that steps aside later than the
+    # bound used to be waited out and now fails instead. That is the trade.
+    lock_wait = chroma_lock_wait_timeout()
+    with chroma_lock_held(chroma_lock_dir(chroma_local_path), shared=False,
+                          timeout=lock_wait):
         local_chroma = chromadb.PersistentClient(path=chroma_local_path)
         try:
-            with file_lock("write.lock", local_data_dir, timeout=write_timeout):
+            with file_lock("write.lock", local_data_dir, timeout=lock_wait):
                 return migrate_vectors(
                     http_client, local_chroma, collection, batch_size, logger
                 )

@@ -1362,3 +1362,88 @@ class TestContextBoundariesCoverEngineConstruction:
         assert closed == ["billing_sql", "sql", "docs", "vector", "graph"], (
             f"전량 역순 정리가 되지 않았다: {closed}"
         )
+
+
+_OUTER_WAIT_PROBE = r"""
+import sys, logging
+sys.path.insert(0, sys.argv[1])
+import opencrab.locking as lk
+lk.chroma_lock_wait_timeout = lambda: 1.0
+sys.path.insert(0, sys.argv[2])
+import migrate_to_local as mtl
+try:
+    mtl._migrate_vectors_locked(None, sys.argv[3], "c", 1, logging.getLogger("p"))
+except TimeoutError as exc:
+    print("TIMEOUT:" + str(exc))
+except Exception as exc:
+    print("OTHER:" + type(exc).__name__ + ":" + str(exc))
+else:
+    print("COMPLETED")
+"""
+
+
+class TestOuterChromaLockWaitIsBounded:
+    """The outer chroma.lock acquisition must not wait forever (#140).
+
+    A server holding the lifetime shared lock would otherwise stall the vector
+    step indefinitely -- and by then the graph and document steps have already
+    written, so the operator is left with a hung command, a half-migrated
+    target, and nothing saying what blocked it.
+
+    The call runs in a CHILD process on purpose. Removing the bound makes the
+    call itself hang, so an in-process check would never reach its assertions:
+    the test would hang instead of failing.
+    """
+
+    def test_outer_wait_times_out_with_an_actionable_message(self, tmp_path):
+        import multiprocessing
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = str(tmp_path)
+
+        ready = multiprocessing.Event()
+        stop = multiprocessing.Event()
+
+        def hold_shared(data_dir: str, ready, stop) -> None:
+            from opencrab.locking import acquire_file_lock, release_file_lock
+
+            fh = acquire_file_lock("chroma.lock", data_dir, shared=True)
+            ready.set()
+            stop.wait(120)
+            release_file_lock(fh)
+
+        holder = multiprocessing.Process(
+            target=hold_shared, args=(data_dir, ready, stop)
+        )
+        holder.start()
+        try:
+            assert ready.wait(30), "공유 잠금 보유자가 기동하지 않았다"
+            out = subprocess.run(
+                [
+                    sys.executable, "-c", _OUTER_WAIT_PROBE,
+                    repo, os.path.join(repo, "scripts"), data_dir,
+                ],
+                capture_output=True, text=True, cwd=repo, timeout=60,
+            )
+            result = (out.stdout or "").strip()
+            assert result.startswith("TIMEOUT:"), (
+                f"유한 시간에 타임아웃으로 끝나지 않았다: {result!r} {out.stderr[-400:]}"
+            )
+            # The holder must still be alive: otherwise the wait ended because
+            # the peer went away, which proves nothing about the bound.
+            assert holder.is_alive(), "보유자가 먼저 죽어서 끝난 것이다"
+
+            msg = result[len("TIMEOUT:"):]
+            # Item by item. A vague "has guidance" check would pass a message
+            # that names the wrong kind of holder.
+            assert "chroma.lock" in msg, f"잠금 경로가 없다: {msg}"
+            assert "shared" in msg and "exclusiv" in msg, (
+                f"공유·배타 두 가능성을 함께 안내하지 않는다: {msg}"
+            )
+            assert "Stop that process" in msg, f"조치가 없다: {msg}"
+        finally:
+            stop.set()
+            holder.join(30)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(10)

@@ -192,9 +192,14 @@ def main() -> int:
     # SHARED, not exclusive: this reads Chroma and writes vec0, so it may run
     # alongside other readers but must be excluded by a bulk loader or a
     # migration that takes the lock exclusively.
-    from opencrab.locking import chroma_lock_dir, file_lock
+    from opencrab.locking import chroma_lock_dir, chroma_lock_held
 
-    with file_lock("chroma.lock", chroma_lock_dir(chroma_path), shared=True):
+    # Bounded like the sibling migration (#140): this shared request still
+    # blocks behind an exclusive loader or migration, and an unbounded wait
+    # there is a hang with nothing to tell the operator what holds it.
+    # COMPATIBILITY: a holder that steps aside after the bound now fails here
+    # instead of eventually being waited out.
+    with chroma_lock_held(chroma_lock_dir(chroma_path), shared=True):
         return _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path)
 
 
