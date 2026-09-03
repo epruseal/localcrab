@@ -199,7 +199,25 @@ class ChromaStore:
             # Before the try: a lock timeout must propagate as a startup error
             # instead of being degraded to available=False with no way back.
             self._acquire_local_lock()
-            self._connect_body()
+            try:
+                self._connect_body()
+            except BaseException:
+                # BaseException, not Exception: _connect_body degrades ordinary
+                # failures to available=False and cleans up itself, but a
+                # KeyboardInterrupt or SystemExit raised inside PersistentClient
+                # construction goes straight past that handler. Without this the
+                # lock would survive an interrupted startup with no owner and no
+                # client, and the context builders above cannot release it --
+                # the store they would have closed was never returned.
+                self._available = False
+                client, self._client = self._client, None
+                self._collection = None
+                try:
+                    close_quietly(client, "ChromaDB client (interrupted init)", log=logger)
+                finally:
+                    client = None
+                    self._release_local_lock(initialisation_failed=True)
+                raise
 
     def _connect_body(self) -> None:
         try:

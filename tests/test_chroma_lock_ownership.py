@@ -1543,3 +1543,52 @@ class TestTargetMigrationClaimsExclusively:
             if holder.is_alive():
                 holder.terminate()
                 holder.join(10)
+
+
+class TestInterruptedInitReleasesTheLock:
+    """A BaseException during client construction must not strand the lock.
+
+    ``_connect_body`` degrades ordinary failures to ``available=False`` and
+    cleans up itself, but ``KeyboardInterrupt`` and ``SystemExit`` go straight
+    past its ``except Exception``. The store is never returned, so no context
+    builder can close it -- the lock would be held by nobody for the life of
+    the process.
+    """
+
+    @pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])
+    def test_base_exception_during_init_releases_the_lock(
+        self, exc_type, chroma_cls, tmp_path, monkeypatch
+    ):
+        import chromadb
+
+        data_dir = str(tmp_path)
+        assert exclusive_probe(data_dir) == "GRANTED", "시작 전에 이미 잠겨 있다"
+
+        def interrupt(*a, **k):
+            raise exc_type("interrupted during client construction")
+
+        monkeypatch.setattr(chromadb, "PersistentClient", interrupt)
+
+        # Hold the exception, and with it the traceback. That is what makes the
+        # hazard real: the half-built store is reachable from the retained
+        # frame, so refcounting does NOT collect it and release the handle for
+        # free. A supervisor that logs the interrupt keeps exactly this
+        # reference. Letting the exception go instead would make the check pass
+        # whether or not the code released anything.
+        caught = None
+        try:
+            make_store(chroma_cls, os.path.join(data_dir, "chroma"))
+        except exc_type as exc:
+            caught = exc
+        assert caught is not None, "중단 예외가 전파되지 않았다"
+        assert caught.__traceback__ is not None
+
+        # Non-vacuity: the lock file must exist, i.e. acquisition really ran
+        # before the interrupt. Without it a build that never took the lock
+        # would also probe GRANTED and pass for the wrong reason.
+        assert os.path.exists(os.path.join(data_dir, "chroma.lock")), (
+            "잠금을 잡기 전에 중단돼 이 검사가 공허하다"
+        )
+        assert exclusive_probe(data_dir) == "GRANTED", (
+            "중단된 초기화가 잠금을 남겼다 — 소유자도 클라이언트도 없다"
+        )
