@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -1051,6 +1052,46 @@ class TestWindowsProcessWideRegistration:
                     initialisation_failed=True, windows=True,
                 )
 
+    def test_symlink_alias_shares_one_init_guard(self, tmp_path):
+        """엣지: 별칭 둘이 같은 초기화 가드를 쓴다.
+
+        등록 키만 정규화하고 가드 키를 정규화하지 않으면, 두 별칭이 등록에서는
+        합쳐지지만 가드에서는 갈라져 이 가드가 막으려던 교차가 그대로 살아난다."""
+        from opencrab.locking import chroma_init_guard
+
+        real = tmp_path / "r"
+        real.mkdir()
+        alias = tmp_path / "al"
+        alias.symlink_to(real)
+
+        entered = threading.Event()
+        second_got_in = []
+
+        def hold() -> None:
+            with chroma_init_guard(str(real / "chroma.lock"), windows=True):
+                entered.set()
+                time.sleep(1.0)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        try:
+            assert entered.wait(10), "가드를 잡지 못했다"
+            got = threading.Event()
+
+            def try_alias() -> None:
+                with chroma_init_guard(str(alias / "chroma.lock"), windows=True):
+                    got.set()
+
+            t2 = threading.Thread(target=try_alias)
+            t2.start()
+            second_got_in.append(got.wait(0.3))
+            t2.join(10)
+        finally:
+            t.join(10)
+        assert second_got_in == [False], (
+            "별칭이 별도 가드를 얻어 첫 초기화 도중에 들어왔다"
+        )
+
     def test_symlink_alias_shares_one_registration(self, tmp_path):
         """엣지: 별칭으로 지나는 두 요청이 하나의 등록으로 합쳐진다.
 
@@ -1160,6 +1201,10 @@ class TestWindowsProcessWideRegistration:
             h2, "chroma.lock", d, owns_registration=o2,
             initialisation_failed=True, windows=True,
         )
+        # The flag itself, not only its downstream effect: a non-owner must be
+        # told it owns nothing. Asserting only the registry outcome leaves the
+        # ownership contract pinned by the handle-identity check alone.
+        assert o2 is False and h2 is None, "비소유자에게 소유권이 주어졌다"
         h3, o3 = acquire_chroma_lock("chroma.lock", d, windows=True)
         try:
             assert h3 is None and o3 is False, (

@@ -110,8 +110,12 @@ def chroma_init_guard(lock_path: str, *, windows: bool | None = None) -> Iterato
     if not windows:
         yield
         return
+    # Normalise the key the same way the registry does. Without this, two
+    # aliases of one directory share a registry entry but get DIFFERENT guards,
+    # which reopens the very interleaving this guard exists to close.
+    key = os.path.realpath(os.path.abspath(lock_path))
     with _chroma_registry_guard:
-        guard = _chroma_init_locks.setdefault(lock_path, threading.RLock())
+        guard = _chroma_init_locks.setdefault(key, threading.RLock())
     with guard:
         yield
 
