@@ -16,6 +16,8 @@ from typing import Any
 from opencrab.stores._vector_base import (
     generate_add_ids,
     generate_upsert_ids,
+    reject_batch_pack_conflicts,
+    reject_foreign_slot_writes,
     validate_import_records,
 )
 
@@ -337,6 +339,14 @@ class ChromaStore:
                 f"ids={len(ids)}, metadatas={len(metadatas)}"
             )
 
+        # Ownership, batch-internal half [#197]: this MUST run before the
+        # get() below, not with the existing-row half. chromadb raises
+        # DuplicateIDError on a duplicate id inside get(), so a conflict
+        # between two records for one id would never reach the gate -- and an
+        # existing-row check could not see it anyway, since on an empty slot
+        # both records read back as absent. See _vector_base.py.
+        reject_batch_pack_conflicts(ids, metadatas)
+
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
 
         # Reject empty metadata BEFORE any mutation (review P1): chromadb
@@ -387,6 +397,22 @@ class ChromaStore:
                 if uri is not None
             }
             existing_meta = dict(zip(existing["ids"], existing["metadatas"]))
+
+            # Ownership, existing-row half [#197]: an owned slot may only be
+            # rewritten by its owner. This costs no extra read -- the get()
+            # above already carries the metadata, because the rollback
+            # snapshot needs it. Raising here happens before any mutation, so
+            # a rejected batch leaves nothing behind; that matters more on
+            # this backend than on the SQL two, which have a transaction to
+            # roll back. This store has no layer-2 equivalent (no conditional
+            # write, no transaction), so a cross-process race remains the
+            # caller's write.lock discipline -- the same boundary this method
+            # already documents below.
+            reject_foreign_slot_writes(
+                ids,
+                clean_meta,
+                {doc_id: (meta or {}).get("pack_id") for doc_id, meta in existing_meta.items()},
+            )
 
             def _is_atomic(pos: int) -> bool:
                 doc_id = ids[pos]

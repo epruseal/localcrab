@@ -141,7 +141,7 @@ import logging
 import math
 import struct
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from opencrab.common.pack_tags import LEGACY_PACK_ALIAS_KEY, strip_retired_keys
@@ -182,6 +182,111 @@ def validate_lengths(
     """
     if len(ids) != len(texts) or len(metadatas) != len(texts):
         raise ValueError("texts, metadatas, and ids must have the same length.")
+
+
+def slot_owner(metadata: Mapping[str, Any] | None) -> str:
+    """The pack that a metadata dict claims, normalised to a plain ``str``.
+
+    ``""`` means UNOWNED. Three shapes collapse to it: the key is absent, its
+    value is ``None``, and its value is the empty string. They are the same
+    state -- ``builder.py`` writes ``str(props.get("pack_id") or "")`` for a
+    node with no pack, and the SQL stores put that empty string in the
+    ``pack_id`` column -- so the gate must not tell them apart.
+    """
+    if not metadata:
+        return ""
+    return str(metadata.get("pack_id") or "")
+
+
+def reject_batch_pack_conflicts(
+    ids: Sequence[str], metadatas: Sequence[Mapping[str, Any]]
+) -> None:
+    """Raise when one batch has an id claimed by two different packs [#197].
+
+    This runs BEFORE the store is read, not only before it is written, for two
+    reasons. Chroma raises ``DuplicateIDError`` on a duplicate id inside the
+    ``get()`` this layer uses to look owners up, so a later check would never
+    see the conflict; and an existing-row check cannot see it anyway -- on an
+    empty slot both records read back as "no row" and both would pass, leaving
+    the backend to pick the winner (measured: sqlite-vec and pgvector keep the
+    last write, chroma refuses the batch). Whose slot it becomes is not a
+    decision to leave to write order.
+
+    A duplicate id whose records name the SAME pack is NOT rejected here. It
+    is not a cross-pack conflict, and each backend's existing behaviour for it
+    is left exactly as it was -- see ``docs/vector-backends.md`` for that
+    divergence and the follow-up that may unify it.
+    """
+    owners: dict[str, str] = {}
+    for doc_id, metadata in zip(ids, metadatas):
+        owner = slot_owner(metadata)
+        if not owner:
+            continue
+        previous = owners.setdefault(doc_id, owner)
+        if previous != owner:
+            raise ValueError(
+                f"upsert_texts: id {doc_id!r} appears twice in one batch under "
+                f"different packs ({previous!r} and {owner!r}); one batch cannot "
+                "decide which pack owns a slot -- split it per pack"
+            )
+
+
+def reject_foreign_slot_writes(
+    ids: Sequence[str],
+    metadatas: Sequence[Mapping[str, Any]],
+    existing_owners: Mapping[str, str | None],
+) -> None:
+    """Raise when a batch would take over a slot another pack already owns [#197].
+
+    THE RULE, in one sentence: an owned slot may only be rewritten by its
+    owner. Spelled out per id:
+
+    - no existing row                      -> pass (a brand-new slot)
+    - existing row is UNOWNED (``""``)     -> pass (backfill and migration
+      take over these on purpose; ``scripts/migrate_pack_ownership.py``'s
+      ``_backfill_vector`` writes ONLY rows whose ``pack_id`` is falsy)
+    - existing owner == incoming pack      -> pass (a pack re-ingesting itself)
+    - existing owner != incoming pack      -> RAISE, the incoming pack being
+      unowned included
+
+    WHY IT EXISTS: slot identity here is ``node_id`` alone and is not
+    qualified by pack. Without this gate the second writer silently owned the
+    whole slot and the first pack's document and embedding were gone -- a
+    pack-scoped query for the first pack then returned nothing (measured on
+    all three backends, localcrab#197).
+
+    ``existing_owners`` maps id -> the pack that currently holds that slot, for
+    the ids that exist; an id absent from the mapping has no row. Each store
+    builds it from whatever it already reads: chroma from the ``get()`` its
+    rollback snapshot needs anyway (so the gate costs it no extra read), the
+    SQL stores from one ``SELECT node_id, pack_id``.
+
+    The whole batch is judged before any of it is applied, so a rejected batch
+    never leaves a partial write behind -- the same rule
+    ``validate_import_records`` states, and it matters most on chroma, which
+    has no transaction to roll back.
+
+    This gate governs WRITES ONLY. ``delete(ids)`` still removes any pack's row
+    at a given id; scoping deletion is a separate axis (see
+    ``docs/vector-backends.md``).
+    """
+    conflicts: list[str] = []
+    for doc_id, metadata in zip(ids, metadatas):
+        current = str(existing_owners.get(doc_id) or "")
+        if not current:
+            continue
+        incoming = slot_owner(metadata)
+        if current != incoming:
+            conflicts.append(
+                f"{doc_id!r} is owned by pack {current!r}, "
+                f"write claims {incoming or '<unowned>'!r}"
+            )
+    if conflicts:
+        raise ValueError(
+            "upsert_texts: refusing to take over a slot owned by another pack "
+            f"({len(conflicts)} of {len(ids)}): " + "; ".join(conflicts[:5])
+            + ("; ..." if len(conflicts) > 5 else "")
+        )
 
 
 def embed_and_validate(

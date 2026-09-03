@@ -100,6 +100,8 @@ from opencrab.stores._vector_base import (
     embed_and_validate,
     generate_add_ids,
     generate_upsert_ids,
+    reject_batch_pack_conflicts,
+    reject_foreign_slot_writes,
     validate_import_records,
     validate_lengths,
 )
@@ -421,7 +423,25 @@ class SqliteVecStore(_SqliteConnMixin):
         ids: list[str] | None = None,
     ) -> list[str]:
         """Upsert (content-deterministic IDs when omitted). vec0 has no UPSERT
-        for virtual tables, so this is DELETE-then-INSERT per id."""
+        for virtual tables, so this is DELETE-then-INSERT per id.
+
+        OWNERSHIP [#197]: an owned slot may only be rewritten by its owner.
+        Two layers enforce that, and they are not redundant.
+
+        Layer 1 is the pre-check (``reject_batch_pack_conflicts`` plus
+        ``reject_foreign_slot_writes``). It judges the whole batch before any
+        of it is applied and produces the error the caller sees.
+
+        Layer 2 is the DELETE's own ``pack_id`` predicate. It closes the window
+        between the pre-check's SELECT and the write: this transaction is
+        DEFERRED, so another process can commit into that slot in between, and
+        a foreign row that arrives then survives the DELETE and makes the
+        INSERT fail on the primary key. That failure is inside ``_tx()``, so
+        the whole batch rolls back rather than half-landing. Measured: the
+        conditional DELETE reports rowcount 0 against a foreign owner and the
+        INSERT then raises ``UNIQUE constraint failed``, while the same pack's
+        DELETE reports 1.
+        """
         self._require_available()
         if not texts:
             return []
@@ -429,15 +449,36 @@ class SqliteVecStore(_SqliteConnMixin):
             ids = generate_upsert_ids(texts)
         metadatas = default_metadatas(texts, metadatas)
         validate_lengths(texts, metadatas, ids)
+        reject_batch_pack_conflicts(ids, metadatas)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
-                conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
+                conn.execute(
+                    f"DELETE FROM {self._table} "  # noqa: S608
+                    "WHERE node_id = ? AND (pack_id = '' OR pack_id = ?)",
+                    (_id, str(meta.get("pack_id", ""))),
+                )
                 conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
         return ids
+
+    def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
+        """``node_id`` -> owning ``pack_id`` for the ids that already have a row.
+
+        One array-bound query, not one bind per id: a batch is caller-sized and
+        can exceed SQLite's variable limit (the same reason
+        ``_sql_dialect.in_string_array`` exists). Ids with no row are simply
+        absent from the result, which is what the gate reads as "new slot".
+        """
+        id_frag, id_transform = SQLITE.in_string_array("node_id", "?")
+        rows = conn.execute(
+            f"SELECT node_id, pack_id FROM {self._table} WHERE {id_frag}",  # noqa: S608
+            [id_transform(list(ids))],
+        ).fetchall()
+        return {row["node_id"]: row["pack_id"] for row in rows}
 
     def delete(self, ids: list[str]) -> None:
         self._require_available()
