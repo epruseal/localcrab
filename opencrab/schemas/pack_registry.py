@@ -113,11 +113,28 @@ def _build_type_schema(
     required_fields = list(spec.get("required") or ["name"])
     optional_fields = list(spec.get("optional") or ["description", "status"])
 
+    # #107: a manifest can (by author mistake) list the same field in both
+    # `required` and `optional`. Surface it -- required still wins below,
+    # but a pack author should know their manifest contradicts itself.
+    overlap = sorted(set(required_fields) & set(optional_fields))
+    if overlap:
+        logger.warning(
+            "Pack '%s': type '%s' manifest lists %r in both required and "
+            "optional -- required wins.",
+            pack.get("name"), node_type, overlap,
+        )
+
     properties: dict[str, Any] = {}
     for field_name in required_fields:
         properties[field_name] = {"type": "string", "required": True}
     for field_name in optional_fields:
-        properties[field_name] = {"type": "string", "required": False}
+        # #107: without this guard, a field declared in both `required` and
+        # `optional` had its required-ness silently dropped -- this loop
+        # unconditionally overwrote whatever the required-fields loop above
+        # just wrote. The extra_required/extra_optional handling below
+        # already guards the same way; the manifest's own lists didn't.
+        if field_name not in properties:
+            properties[field_name] = {"type": "string", "required": False}
 
     for field_name in extra_required or []:
         if field_name in properties:
@@ -287,6 +304,34 @@ def install_pack(name: str) -> dict[str, Any]:
     entirely or demoted to ``optional``) is reported in
     ``revived_manifest_fields``, again decided before the write.
 
+    A CURRENT-shape file (already has ``properties``) carrying this tool's
+    generation header is also inspected, not skipped outright (#107, PR #336
+    review): if a field the CURRENT manifest lists in *both* ``required``
+    and ``optional`` is on disk as ``required: false`` -- exactly what a
+    schema generated before the #107 fix looks like -- that field alone is
+    flipped back to ``true`` and reported in ``revived_manifest_fields``,
+    same as a migrated legacy stub. The repair is deliberately limited to
+    that required/optional-overlap fingerprint: a manifest-required field
+    that was never also optional could not have been produced by the
+    overlap bug, so leaving it ``required: false`` is instead a deliberate
+    operator edit, not a stale bug, and is not touched. Anything else about
+    the file (other fields, their values) is left untouched too. A
+    current-shape file without the header, with a non-mapping body or
+    ``properties``, or with no such stale field, is left alone and counted
+    as ``skipped``, same as before.
+
+    Known limitation (#107, PR #336 review, round 3): the fingerprint is the
+    CURRENT manifest's required/optional overlap, not the overlap that held
+    when the on-disk file was generated. If a later pack version fixes its
+    own manifest by dropping the field from ``optional`` (so the overlap no
+    longer exists), a stale ``required: false`` left over from the old,
+    still-overlapping manifest is no longer recognized and stays unrepaired.
+    Closing that gap needs a per-file record of which manifest version (or
+    fingerprint) generated it, which no migration path in this function
+    tracks today (the legacy ``extra_required``/``extra_optional`` path has
+    the same current-manifest-only limitation). Left as a follow-up rather
+    than added here.
+
     Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
@@ -336,7 +381,104 @@ def install_pack(name: str) -> dict[str, Any]:
                 skipped.append(node_type)
                 continue
             if not _is_legacy_shape(existing):
-                skipped.append(node_type)
+                if not isinstance(existing, dict) or not _has_generation_marker(existing_content, name):
+                    # Same safety bar as the legacy-shape path below: don't
+                    # touch a file we can't prove we generated. A generation
+                    # header on non-mapping YAML (hand-edited or corrupted
+                    # after install) fails `_is_legacy_shape` too (#107
+                    # review round 2: it must not crash trying to `.get()`
+                    # off a list/scalar), so it lands here as an ordinary
+                    # skip rather than an AttributeError.
+                    skipped.append(node_type)
+                    continue
+                existing_properties = existing.get("properties")
+                if not isinstance(existing_properties, dict):
+                    skipped.append(node_type)
+                    continue
+                # #107 (PR #336 review rounds 5 and 6): a YAML anchor can
+                # alias `properties` itself onto another key (e.g.
+                # `saved_properties: &props {...}`, `properties: *props`),
+                # or alias one property spec onto another (`name: &spec
+                # {...}`, `description: *spec`) -- either way,
+                # yaml.safe_load hands back the SAME dict object for both
+                # sides of the alias. Mutating any of it in place, at any
+                # depth, would leak the repair into whatever else shares
+                # that object. A single `copy.deepcopy` is NOT enough here:
+                # deepcopy's memo preserves internal aliasing on purpose
+                # (two keys that pointed at the same object before the copy
+                # still point at the same, newly-copied object after it),
+                # so it detaches this dict from anything OUTSIDE it (round
+                # 6's `saved_properties`/`properties` sharing) but does
+                # nothing for sharing BETWEEN its own values (round 5's
+                # `name`/`description` sharing). Give every dict-valued
+                # entry its own fresh shallow copy instead -- this detaches
+                # the container from outside sharing (round 6) and gives
+                # each property spec its own object regardless of any
+                # aliasing it had before the copy (round 5), in one pass.
+                existing_properties = {
+                    key: (dict(value) if isinstance(value, dict) else value)
+                    for key, value in existing_properties.items()
+                }
+                manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
+                manifest_required = manifest_spec.get("required") or ["name"]
+                manifest_optional = manifest_spec.get("optional") or ["description", "status"]
+                # #107 (PR #336 review round 2): only a field the CURRENT
+                # manifest lists in both `required` and `optional` can be
+                # the overlap bug's stale output -- a manifest-required
+                # field that was never also optional could not have been
+                # written `required: false` by that bug, so restoring it
+                # would instead reverse a deliberate operator edit
+                # (current-shape files were never touched before this
+                # branch existed). Repair is limited to that fingerprint.
+                overlap = set(manifest_required) & set(manifest_optional)
+                # #107 (PR #336 review): a schema generated before this fix
+                # can already have such an overlapping field written to disk
+                # as `required: false` -- exactly the bug this issue closes.
+                # Without this branch, a bare reinstall never reaches the
+                # fixed _build_type_schema for an already current-shape
+                # file, so that stale False would persist forever. Only a
+                # field that is provably this tool's own dict-shaped
+                # property gets flipped -- anything else (a field missing
+                # entirely, or one the user customised) is left alone, same
+                # as extra_required/extra_optional below.
+                stale_required = [
+                    f
+                    for f in manifest_required
+                    if f in overlap
+                    and isinstance(existing_properties.get(f), dict)
+                    and existing_properties[f].get("required") is False
+                ]
+                if not stale_required:
+                    skipped.append(node_type)
+                    continue
+                for f in stale_required:
+                    # Each entry in existing_properties already got its own
+                    # fresh copy above, so this write can't leak into any
+                    # structure the original file's YAML anchors shared it
+                    # with.
+                    existing_properties[f]["required"] = True
+                schema = dict(existing)
+                schema["properties"] = existing_properties
+                # #107 (PR #336 review round 4): this is a surgical, one-field
+                # repair, not a regeneration -- `schema` keeps every other key
+                # from `existing` untouched, including its own `version`. The
+                # header comment must say the same version, not the current
+                # pack's, or the file ends up claiming (in its header) to be
+                # fully generated by a newer pack version while every field
+                # except the repaired one still comes from the old one.
+                repair_header = _TYPE_TEMPLATE_HEADER.format(
+                    pack_name=pack["name"],
+                    pack_version=existing.get("version", pack.get("version", "1.0.0")),
+                )
+                content = repair_header + yaml.safe_dump(schema, sort_keys=False, allow_unicode=True)
+                path.write_text(content, encoding="utf-8")
+                migrated.append(node_type)
+                revived_manifest_fields[node_type] = {"required": stale_required, "optional": []}
+                logger.warning(
+                    "Pack '%s': repaired stale required=False on manifest-required "
+                    "field(s) %r for %s (schema generated before the #107 fix)",
+                    name, stale_required, node_type,
+                )
                 continue
             if not _has_generation_marker(existing_content, name):
                 logger.warning(
@@ -372,8 +514,17 @@ def install_pack(name: str) -> dict[str, Any]:
             # silent about it either. The optional side is informational
             # only (no enforcement consequence either way).
             revived_required = [f for f in manifest_required if f not in old_required]
+            # #107: manifest_required and manifest_optional can themselves
+            # overlap. Without excluding revived_required here, a field
+            # missing from the old file would land in BOTH lists below --
+            # revived_manifest_fields would then claim the same field is
+            # simultaneously revived-required and revived-optional, the
+            # same self-contradiction PR #104's review already closed
+            # between preserved_extra_fields and revived_manifest_fields.
             revived_optional = [
-                f for f in manifest_optional if f not in old_required and f not in old_optional
+                f
+                for f in manifest_optional
+                if f not in old_required and f not in old_optional and f not in revived_required
             ]
 
             schema = _build_type_schema(
