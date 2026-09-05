@@ -797,11 +797,11 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     회수 경로가 없다" 문단 참고, 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로 함께
     지워진다). 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
     `pack_id` 가 없어 판정 불가 — "팩 소속"의 유일한 정본 키가 `pack_id` 자체다,
-    `docs/pack-contract-layer.md` 105-119행).
+    `docs/pack-contract-layer.md` 의 "`pack` 은 폐기됐다" 절 참고).
 
-    **`pack` 은 뺀다.** `docs/pack-contract-layer.md:128` 이 이미 "`pack` 만 있고
-    `pack_id` 가 없는 행은 무해하다(읽는 코드가 0곳)"고 판정한 별개의 키다 — 이 진단과
-    섞으면 이미 판정된 무해 잔여가 새 결함처럼 보인다.
+    **`pack` 은 뺀다.** `docs/pack-contract-layer.md` 의 "`pack` 만 있고 `pack_id` 가
+    없는 행은 보존한다" 문단이 이미 그 행을 "무해하다(읽는 코드가 0곳)"고 판정한 별개의
+    키다 — 이 진단과 섞으면 이미 판정된 무해 잔여가 새 결함처럼 보인다.
 
     **`graph_edges` 는 독립 회수 경로가 없다** — `delete_pack` 은 `graph_edges` 를
     직접 조회/삭제하지 않고 `graph.delete_node()` 의 cascade 로만 지운다. 그 cascade는
