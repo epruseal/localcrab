@@ -164,12 +164,14 @@ def test_lookup_node_type_raises_when_unavailable():
         store.lookup_node_type("p1")
 
 
-@pytest.mark.parametrize("exc_type", [KeyError, TypeError, AttributeError, ValueError])
+@pytest.mark.parametrize(
+    "exc_type", [KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError]
+)
 def test_lookup_node_type_propagates_programming_errors(exc_type):
     # _fetch_one is implemented differently per backend (local_graph_store.py
     # vs pg_graph_store.py, #162 v3 codex review) -- an adapter mistype or
     # signature drift there must surface as itself, not be disguised as
-    # "store unavailable".
+    # "store unavailable" (full denylist coverage round 5).
     store = _store()
 
     def _boom(sql, params):

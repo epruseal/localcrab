@@ -346,17 +346,18 @@ def _ingest_into_pack(
             validate_edge(item_from_space, item_to_space, item_relation).raise_if_invalid()
 
             # Endpoint types are resolved the same way builder.add_edge
-            # resolves them (graph.lookup_node_type). A `None` result is
-            # ambiguous -- it means either "node doesn't exist" or "the
-            # lookup query itself failed" (Neo4jStore.lookup_node_type
-            # swallows transient query errors and returns None either way).
-            # Those two cases cannot be told apart from here, and treating
-            # an unresolvable endpoint as "no conflict, skip the probe" is
-            # unsafe: if the underlying error is transient and clears
-            # before builder.add_edge runs its own lookup, the endpoints
-            # resolve there and the write proceeds with no pack_id check at
-            # all. So an unresolvable endpoint fails closed (rejected) here,
-            # exactly like the other "cannot verify" cases in _foreign_pack.
+            # resolves them (graph.lookup_node_type). A `None` result means
+            # the node genuinely does not exist -- since #162,
+            # lookup_node_type no longer returns None for "the lookup query
+            # itself failed"; it raises GraphReadCapabilityUnavailable
+            # instead, which this loop's own `except Exception` below
+            # catches and reports through edge_errors, failing this edge
+            # closed exactly like the other "cannot verify" cases in
+            # _foreign_pack. Treating an unresolvable endpoint as "no
+            # conflict, skip the probe" would be unsafe regardless: if the
+            # underlying fault cleared before builder.add_edge ran its own
+            # lookup, the write would proceed there with no pack_id check
+            # at all.
             graph_store = ctx.get("neo4j")
             lookup = getattr(graph_store, "lookup_node_type", None) if graph_store is not None else None
             from_type = lookup(item_from_id) if lookup is not None else None

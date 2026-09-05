@@ -89,12 +89,15 @@ def _existing_node_rows(graph: Any, source_id: str) -> list[dict[str, Any]] | No
     ``None`` is "cannot tell", NOT "no node" -- the distinction is the whole
     point. ``get_nodes_by_id`` calls ``_require_available()`` and returns ``[]``
     only on a genuine no-match, so an unavailable store raises rather than
-    answering. ``lookup_node_type`` and ``get_node_digest`` are both unusable
-    here for the opposite reason: the first returns ``None`` on an unavailable
-    store AND swallows transient query errors, the second returns ``None`` for a
-    row whose digest cannot be computed. Both collapse "absent" and "cannot say"
-    into one value, and treating "cannot say" as "absent" is how the carve-out
-    below would silently start writing graph-less sources again.
+    answering. ``get_node_digest`` is unusable here for a related reason: it
+    returns ``None`` both for a genuinely absent row and for one whose digest
+    cannot be computed, collapsing "absent" and "cannot say" into one value
+    -- treating "cannot say" as "absent" is how the carve-out below would
+    silently start writing graph-less sources again. (``lookup_node_type``
+    no longer has this problem since #162 -- it raises
+    ``GraphReadCapabilityUnavailable`` for "cannot say" instead of returning
+    ``None`` -- but it answers a different question, node type, not row
+    existence, so it still would not fit here.)
 
     The ``isinstance`` check mirrors ``write_gate._check_by_id_axis``, which
     guards the same method the same way: a double returning ``None``/``{}``/

@@ -127,9 +127,11 @@ class GraphStore(Protocol):
 
         Methods below raise RuntimeError (via each backend's
         ``_require_available``) when called while ``available`` is False,
-        except where individually noted otherwise (``ping``,
-        ``lookup_node_type``, ``ensure_constraints`` degrade instead of
-        raising).
+        except where individually noted otherwise. ``ping`` and
+        ``ensure_constraints`` degrade instead of raising; ``lookup_node_type``
+        instead raises ``GraphReadCapabilityUnavailable`` (a RuntimeError
+        subclass, #162) rather than degrading to ``None`` -- see its own
+        docstring below for the full present/absent/unavailable contract.
         """
         ...
 

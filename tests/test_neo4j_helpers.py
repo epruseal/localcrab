@@ -227,13 +227,16 @@ class TestNeo4jStoreNormal:
         with pytest.raises(GraphReadCapabilityUnavailable):
             store.lookup_node_type("weird")
 
-    @pytest.mark.parametrize("exc_type", [KeyError, TypeError, AttributeError, ValueError])
+    @pytest.mark.parametrize(
+        "exc_type", [KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError]
+    )
     def test_lookup_node_type_propagates_programming_errors(self, exc_type):
         # KeyError: RETURN ... AS lbl renamed but the read site not updated.
-        # TypeError/AttributeError/ValueError: adapter or driver misuse.
-        # None of these are "store unavailable" -- they must surface as
-        # themselves so a bug is visible instead of disguised (#162 codex
-        # review round 3/4).
+        # TypeError/AttributeError/IndexError/ValueError/AssertionError:
+        # adapter or driver misuse. None of these are "store unavailable" --
+        # they must surface as themselves so a bug is visible instead of
+        # disguised (#162 codex review round 3/4, full denylist coverage
+        # round 5).
         store, _driver, mock_session = _make_connected_store()
         mock_session.run.side_effect = exc_type("boom")
 
