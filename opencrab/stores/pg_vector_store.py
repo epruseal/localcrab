@@ -292,6 +292,10 @@ class PgVectorStore:
             ids = generate_add_ids(texts)
         metadatas = default_metadatas(texts, metadatas)
         validate_lengths(texts, metadatas, ids)
+        # 배치 전체를 먼저 직렬화해 비유한 metadata 를 여기서 거부한다(issue #82
+        # 리뷰 후속) — 임베딩 호출은 되돌릴 수 없는 비용(외부 서비스 호출)일 수
+        # 있으므로, 그 비용을 치르기 전에 배치 전체가 저장 가능한지 판정한다.
+        serialized_metadata = [dump_props(meta) for meta in metadatas]
         vectors = self._embed(texts)
 
         from sqlalchemy import text
@@ -301,7 +305,9 @@ class PgVectorStore:
             "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb)"
         )
         with self._engine.begin() as conn:
-            for _id, txt, meta, vec in zip(ids, texts, metadatas, vectors):
+            for _id, txt, meta, vec, meta_json in zip(
+                ids, texts, metadatas, vectors, serialized_metadata
+            ):
                 conn.execute(
                     sql,
                     {
@@ -309,7 +315,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
-                        "metadata": dump_props(meta),
+                        "metadata": meta_json,
                     },
                 )
         return ids
@@ -351,6 +357,10 @@ class PgVectorStore:
         metadatas = default_metadatas(texts, metadatas)
         validate_lengths(texts, metadatas, ids)
         reject_batch_pack_conflicts(ids, metadatas)
+        # 배치 전체를 먼저 직렬화한다(issue #82 리뷰 후속) — 그래야 이 뒤의
+        # 임베딩 호출과 소유권 확인 SELECT(둘 다 되돌릴 수 없거나 비용이 드는
+        # 작업)가 저장 불가능한 배치에 대해 헛수고로 실행되지 않는다.
+        serialized_metadata = [dump_props(meta) for meta in metadatas]
         vectors = self._embed(texts)
 
         from sqlalchemy import text
@@ -367,7 +377,9 @@ class PgVectorStore:
         )
         with self._engine.begin() as conn:
             reject_foreign_slot_writes(ids, metadatas, self._slot_owners(conn, ids))
-            for _id, txt, meta, vec in zip(ids, texts, metadatas, vectors):
+            for _id, txt, meta, vec, meta_json in zip(
+                ids, texts, metadatas, vectors, serialized_metadata
+            ):
                 result = conn.execute(
                     sql,
                     {
@@ -375,7 +387,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
-                        "metadata": dump_props(meta),
+                        "metadata": meta_json,
                     },
                 )
                 if result.rowcount == 0:
@@ -568,6 +580,12 @@ class PgVectorStore:
         clean = validate_import_records(records, pack_id=pack_id, dim=self._dim)
         if not clean:
             return []
+        # 트랜잭션을 열기 전에 배치 전체를 직렬화한다(issue #82 리뷰 후속) —
+        # `validate_import_records` 는 metadata 값을 검사하지 않으므로(모듈
+        # docstring), 이 직렬화가 비유한값을 잡는 첫 지점이다. 여기서 미리
+        # 하지 않으면 앞선 레코드가 이미 INSERT 된 뒤에야 뒤쪽 레코드에서
+        # 예외가 나고(롤백되어 손상은 없지만 헛수고인 왕복이 남는다).
+        serialized_metadata = [dump_props(record["metadata"]) for record in clean]
         from sqlalchemy import text
 
         sql = text(
@@ -575,7 +593,7 @@ class PgVectorStore:
             "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb)"
         )
         with self._engine.begin() as conn:
-            for record in clean:
+            for record, meta_json in zip(clean, serialized_metadata):
                 meta = record["metadata"]
                 conn.execute(
                     sql,
@@ -584,7 +602,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(record["embedding"]),
                         "document": record["document"],
-                        "metadata": dump_props(meta),
+                        "metadata": meta_json,
                     },
                 )
         return [record["id"] for record in clean]
