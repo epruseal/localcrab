@@ -82,10 +82,13 @@ def chroma_lock_held(
     if timeout is None:
         timeout = chroma_lock_wait_timeout()
     path = _lock_path("chroma.lock", data_dir)
-    # ExitStack rather than __enter__/__exit__ by hand: the stack owns the lock
-    # the instant it is entered, so there is no statement between "acquired"
-    # and "registered for release" where an asynchronous KeyboardInterrupt
-    # could land and strand it. Hand-rolled enter/exit always leaves that gap.
+    # ExitStack rather than __enter__/__exit__ by hand. It does NOT make
+    # acquisition and cleanup registration atomic -- enter_context() calls
+    # __enter__ and only then pushes the exit callback, so the same
+    # interrupt window survives one level down. Nothing in Python closes it.
+    # What this buys is that the release is arranged by the stdlib on every
+    # reachable path, including BaseException and generator finalisation,
+    # instead of by three hand-written branches that must each stay correct.
     with ExitStack() as stack:
         try:
             stack.enter_context(

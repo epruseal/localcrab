@@ -200,6 +200,10 @@ class ChromaStore:
             # asynchronous KeyboardInterrupt landing between the acquisition
             # returning and this try being entered would strand the lock -- the
             # same hazard the handler below exists for, one statement earlier.
+            # This closes the window at THIS level. A narrower one remains
+            # inside _acquire_local_lock, between the OS acquisition and the
+            # assignment that records the handle; Python offers no way to make
+            # those two atomic, so it is bounded rather than removed.
             # A lock timeout still propagates rather than degrading to
             # available=False: the handler re-raises, and its cleanup is a
             # no-op when there is no handle and no client yet.

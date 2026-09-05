@@ -67,6 +67,33 @@ else:
 """
 
 
+
+def _hold_chroma_lock(data_dir: str, ready, stop, shared: bool) -> None:
+    """Hold chroma.lock in a child process until told to stop.
+
+    Module scope, not a closure, because multiprocessing pickles the target on
+    every start method except fork. macOS defaults to spawn and Python 3.14
+    moves Linux to forkserver, both inside this project's ``requires-python``,
+    and a local function raises PicklingError there.
+    """
+    from opencrab.locking import acquire_file_lock, release_file_lock
+
+    fh = acquire_file_lock("chroma.lock", data_dir, shared=shared)
+    ready.set()
+    stop.wait(120)
+    release_file_lock(fh)
+
+
+def _hold_write_lock(data_dir: str, ready, stop) -> None:
+    """Hold write.lock in a child process. Module scope for the reason above."""
+    from opencrab.locking import acquire_file_lock, release_file_lock
+
+    fh = acquire_file_lock("write.lock", data_dir, shared=False)
+    ready.set()
+    stop.wait(120)
+    release_file_lock(fh)
+
+
 def exclusive_probe(lock_dir: str) -> str:
     """Return GRANTED or REFUSED for an exclusive chroma.lock claim."""
     out = subprocess.run(
@@ -523,16 +550,9 @@ class TestLockOrderInversionIsBounded:
         ready = multiprocessing.Event()
         stop = multiprocessing.Event()
 
-        def hold_exclusive(data_dir: str, ready, stop) -> None:
-            from opencrab.locking import acquire_file_lock, release_file_lock
-
-            fh = acquire_file_lock("chroma.lock", data_dir, shared=False)
-            ready.set()
-            stop.wait(60)
-            release_file_lock(fh)
 
         holder = multiprocessing.Process(
-            target=hold_exclusive, args=(data_dir, ready, stop)
+            target=_hold_chroma_lock, args=(data_dir, ready, stop, False)
         )
         holder.start()
         try:
@@ -605,16 +625,9 @@ class TestLockOrderInversionIsBounded:
             ready = multiprocessing.Event()
             stop = multiprocessing.Event()
 
-            def hold_write(data_dir: str, ready, stop) -> None:
-                from opencrab.locking import acquire_file_lock, release_file_lock
-
-                fh = acquire_file_lock("write.lock", data_dir, shared=False)
-                ready.set()
-                stop.wait(60)
-                release_file_lock(fh)
 
             holder = multiprocessing.Process(
-                target=hold_write, args=(data_dir, ready, stop)
+                target=_hold_write_lock, args=(data_dir, ready, stop)
             )
             holder.start()
             try:
@@ -1412,16 +1425,9 @@ class TestOuterChromaLockWaitIsBounded:
         ready = multiprocessing.Event()
         stop = multiprocessing.Event()
 
-        def hold_shared(data_dir: str, ready, stop) -> None:
-            from opencrab.locking import acquire_file_lock, release_file_lock
-
-            fh = acquire_file_lock("chroma.lock", data_dir, shared=True)
-            ready.set()
-            stop.wait(120)
-            release_file_lock(fh)
 
         holder = multiprocessing.Process(
-            target=hold_shared, args=(data_dir, ready, stop)
+            target=_hold_chroma_lock, args=(data_dir, ready, stop, True)
         )
         holder.start()
         try:
@@ -1504,16 +1510,9 @@ class TestTargetMigrationClaimsExclusively:
         ready = multiprocessing.Event()
         stop = multiprocessing.Event()
 
-        def hold_shared(data_dir: str, ready, stop) -> None:
-            from opencrab.locking import acquire_file_lock, release_file_lock
-
-            fh = acquire_file_lock("chroma.lock", data_dir, shared=True)
-            ready.set()
-            stop.wait(120)
-            release_file_lock(fh)
 
         holder = multiprocessing.Process(
-            target=hold_shared, args=(data_dir, ready, stop)
+            target=_hold_chroma_lock, args=(data_dir, ready, stop, True)
         )
         holder.start()
         try:
