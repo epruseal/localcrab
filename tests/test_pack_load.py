@@ -2252,6 +2252,33 @@ class TestFallbackTagWithoutPackIdCounts:
         got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
         assert got == {"graph_nodes": 1, "graph_edges": 0, "doc_nodes": 1}
 
+    def test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate(
+            self, live):
+        """`graph_edges` 에 "독립 회수 경로가 없다"(함수 docstring)는 말은 "회수 술어가
+        직접 안 걸린다"는 뜻이지 "행이 절대 안 지워진다"는 뜻이 아니다 — `source_id`
+        만으로 태그된 엣지라도 **양 끝 노드가 `pack_id` 로 회수되면** `graph.delete_node()`
+        의 cascade 로 함께 지워진다. 위 생존 테스트(양 끝 노드가 어느 팩에도 안 걸린
+        경우)와 이 테스트(양 끝 노드가 `target` 소유인 경우)를 나란히 두어 "함수가 세는
+        전역 잔여"와 "회수 부작용으로 우연히 사라지는 행"을 구분한다(localcrab #164
+        코드 리뷰 지적, codex NONCE O164-IMPL-A7K3Q9)."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "owned1", {"pack_id": "target"})
+        self._seed_graph_node(graph, "owned2", {"pack_id": "target"})
+        self._seed_graph_edge(graph, "owned1", "owned2", {"source_id": "target"})
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+
+        left_edge = graph._conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE from_id=? AND to_id=?",
+            ("owned1", "owned2")).fetchone()[0]
+        assert left_edge == 0, (
+            "pack_id 소유 노드에 붙은 source_id-only 엣지가 노드 cascade 뒤에도 남았다"
+            " — cascade 가 더는 그 엣지에 안 닿는다는 뜻이라 위 docstring 전제가 깨진다")
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got["graph_edges"] == 0, (
+            "cascade 로 이미 지워진 엣지가 fallback 카운트에도 잡혔다 — 존재하지 않는 행을 셌다")
+
 
 class TestFallbackTagPostgresDialect:
     """`fallback_tag_without_pack_id_counts()` 의 SQL 조각이 PG 방언에서

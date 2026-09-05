@@ -788,8 +788,9 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     **전역**(팩 비한정) 카운트, `graph_nodes`/`graph_edges`/`doc_nodes` 세 축.
 
     이 세 축에서 `source`/`source_id`는 소유 키가 아니다 — `transform_node` 가 입력의
-    외래 `source`/`source_id`를 properties 에 그대로 보존하고(`delete_pack` 802-811행
-    주석 참고), 그래서 이 두 키는 회수(`delete_pack`, `pack_id` 단일 소유 키)에서도
+    외래 `source`/`source_id`를 properties 에 그대로 보존하고(`delete_pack` 안 회수
+    술어를 `pack_id` 단일 키로 좁힌 이유를 남긴 주석, 이 파일에서 "소유 키가 아니다"로
+    검색), 그래서 이 두 키는 회수(`delete_pack`, `pack_id` 단일 소유 키)에서도
     대사(`pack_live_counts`/`live_pack_state`, 역시 `pack_id` 단일 키)에서도 소유 판정에
     안 쓰인다. 이 함수가 세는 행은 그래서 **어느 팩 스코프 연산으로도 도달하지 않는다** —
     그 사실만 알려준다. 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
@@ -801,9 +802,12 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     섞으면 이미 판정된 무해 잔여가 새 결함처럼 보인다.
 
     **`graph_edges` 는 독립 회수 경로가 없다** — `delete_pack` 은 `graph_edges` 를
-    직접 조회/삭제하지 않고 `graph.delete_node()` 의 cascade 로만 지운다. 이 카운트는
-    대사(`pack_live_counts`/`live_pack_state`) 기준 가시성만 말한다 — 캐스케이드로
-    우연히 지워질지는 이 함수의 범위 밖이다.
+    직접 조회/삭제하지 않고 `graph.delete_node()` 의 cascade 로만 지운다. 그 cascade는
+    **엣지 자신의 태그와 무관하게** 걸린다 — 양 끝 노드 중 하나가 `pack_id` 로 회수되면
+    `source`/`source_id`-only 로만 태그된 엣지도 함께 사라진다(양 끝 노드가 어느 팩에도
+    안 걸릴 때만 이 함수가 세는 잔여로 남는다, 회귀 고정:
+    `TestFallbackTagWithoutPackIdCounts.test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`).
+    이 카운트는 대사(`pack_live_counts`/`live_pack_state`) 기준 가시성만 말한다.
 
     `pack_id` 부재 판정은 `_doc_owner_pred` 와 같은 정의(`json_truthy_text(...) IS NULL`,
     :150-153 근처)를 재사용한다 — falsy 값(`""`/`false`/`0`)도 "없음"으로 본다.
