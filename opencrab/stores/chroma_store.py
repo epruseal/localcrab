@@ -9,6 +9,7 @@ LocalCrab factory always selects persistent local mode.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from typing import Any
@@ -1029,9 +1030,19 @@ def _assert_landed(
 
 
 def _sanitize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
-    """Convert metadata values to ChromaDB-compatible types."""
+    """Convert metadata values to ChromaDB-compatible types.
+
+    Rejects non-finite floats (NaN/Infinity) outright instead of passing them
+    through: both ``chroma_store.py`` and ``sqlite_vec_store.py`` route their
+    writes through this one function, so a ``ValueError`` here closes the gap
+    for both backends at once (localcrab#82's vector-store sibling of the
+    doc-store finding -- see ``opencrab.stores._json.dump_props`` for the
+    SQL-JSON-column choke point used by the doc/graph/PG-vector stores).
+    """
     clean: dict[str, Any] = {}
     for k, v in meta.items():
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError(f"metadata[{k!r}] must be a finite number, got {v!r}")
         if isinstance(v, (str, int, float, bool)):
             clean[k] = v
         elif v is None:

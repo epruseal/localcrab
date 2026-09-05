@@ -537,6 +537,34 @@ class TestAuditLog:
 
 
 # ---------------------------------------------------------------------------
+# issue #82: json.dumps(...) without allow_nan=False let NaN/Infinity reach
+# the properties/metadata/details columns unguarded, where SQLite's
+# json_extract() family treats the row as malformed JSON. Every write method
+# on this store must reject a non-finite float before anything is written.
+# ---------------------------------------------------------------------------
+
+
+class TestNonFiniteJsonRejection:
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_upsert_node_doc_rejects_non_finite(self, store, bad_value):
+        with pytest.raises(ValueError):
+            store.upsert_node_doc("s1", "T", "n1", {"score": bad_value})
+        assert store.get_node_doc("s1", "n1") is None
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_upsert_source_rejects_non_finite(self, store, bad_value):
+        with pytest.raises(ValueError):
+            store.upsert_source("src1", "text", {"score": bad_value})
+        assert store.get_source("src1") is None
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_log_event_rejects_non_finite(self, store, bad_value):
+        with pytest.raises(ValueError):
+            store.log_event("create", "u1", {"score": bad_value})
+        assert store.get_audit_log(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
 # collection_stats
 # ---------------------------------------------------------------------------
 

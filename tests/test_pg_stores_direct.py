@@ -394,3 +394,86 @@ class TestPgDocKoreanKeywordSearch:
         finally:
             store.close()
             _drop_schema(pg_engine, schema)
+
+
+# ---------------------------------------------------------------------------
+# issue #82: NaN/Infinity in properties/metadata reached PostgreSQL's
+# ::jsonb CAST unguarded, surfacing as a raw psycopg2.errors.
+# InvalidTextRepresentation at INSERT time instead of a clean ValueError at
+# the Python API boundary. Every write method on PgDocStore/PgVectorStore
+# must reject a non-finite float before issuing SQL.
+# ---------------------------------------------------------------------------
+
+
+class TestPgNonFiniteJsonRejection:
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_doc_store_upsert_node_doc_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_nf1"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            with pytest.raises(ValueError):
+                store.upsert_node_doc("s1", "T", "n1", {"score": bad_value})
+            assert store.get_node_doc("s1", "n1") is None
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_doc_store_upsert_source_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_nf2"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            with pytest.raises(ValueError):
+                store.upsert_source("src1", "text", {"score": bad_value})
+            assert store.get_source("src1") is None
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_doc_store_log_event_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_nf3"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            with pytest.raises(ValueError):
+                store.log_event("create", "u1", {"score": bad_value})
+            assert store.get_audit_log(limit=10) == []
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_vector_store_add_texts_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        table = f"t{uuid.uuid4().hex[:8]}_nfadd"
+        store = PgVectorStore(pg_engine, embedding_function=_fake_embed(4), dim=4, collection_name=table)
+        try:
+            with pytest.raises(ValueError):
+                store.add_texts(["hello"], metadatas=[{"score": bad_value}], ids=["v1"])
+        finally:
+            with pg_engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_vector_store_upsert_texts_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        table = f"t{uuid.uuid4().hex[:8]}_nfups"
+        store = PgVectorStore(pg_engine, embedding_function=_fake_embed(4), dim=4, collection_name=table)
+        try:
+            with pytest.raises(ValueError):
+                store.upsert_texts(["hello"], metadatas=[{"score": bad_value}], ids=["v1"])
+        finally:
+            with pg_engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_vector_store_import_vectors_rejects_non_finite(self, pg_engine, bad_value) -> None:
+        table = f"t{uuid.uuid4().hex[:8]}_nfimp"
+        store = PgVectorStore(pg_engine, embedding_function=_fake_embed(4), dim=4, collection_name=table)
+        try:
+            with pytest.raises(ValueError):
+                store.import_vectors(
+                    [{"id": "v1", "document": "doc", "metadata": {"score": bad_value}, "embedding": [0.1, 0.2, 0.3, 0.4]}],
+                    pack_id="packA",
+                )
+        finally:
+            with pg_engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
