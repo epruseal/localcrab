@@ -2490,6 +2490,31 @@ class TestSlugLengthBoundaries:
         assert get_pack(stack["sql"], new_over) is None
 
 
+class TestExplicitNewPackIdFormatRejection:
+    """명시적 ``new_pack_id`` 는 길이뿐 아니라 형식(문자 집합)도 검증된다
+    (#180). 이전에는 길이만 걸렸고 ``/``, 공백, 비ASCII 같은 형식 위반은
+    그대로 통과해 등록부/그래프 앵커에 도달했다."""
+
+    def test_malformed_new_pack_id_is_rejected(self, stack):
+        src = _seed_pack(
+            stack, ALICE, "src-t180fork", node_count=1, with_edge=False, with_source=False,
+        )
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id="dst/evil")
+        assert "error" in out, out
+        assert "invalid pack_id" in out["error"]
+        assert get_pack(stack["sql"], "dst/evil") is None
+
+    def test_over_budget_rejection_message_still_says_budget(self, stack):
+        """공유 함수로 교체된 뒤에도 T26/T50b 가 고정한 "budget" 문구는
+        그대로 나와야 한다(#180 design v2 §2, ``over_length_noun="budget"``)."""
+        src = _seed_pack(
+            stack, ALICE, "src-t180budget", node_count=1, with_edge=False, with_source=False,
+        )
+        new_over = "z" * (_PACK_ID_BUDGET + 1)
+        out = _fork(stack, principal=ALICE, src_pack_id=src, new_pack_id=new_over)
+        assert "error" in out and "budget" in out["error"], out
+
+
 # ---------------------------------------------------------------------------
 # T37 -- repair_incomplete_packs must never auto-promote a stale `creating`
 # row reserved by pack_fork, even with a real anchor already present.

@@ -999,9 +999,34 @@ def pack_create(
     principal = current_principal()
     tenant_id = "default"
     subject_id = principal.user_id
+    explicit_pack_id = pack_id is not None
+    if explicit_pack_id and not pack_id:
+        # #180 후속: 빈 문자열은 "생략"이 아니라 "명시적으로 무효한 값"이다
+        # (design-v1.md 는 `is not None` 을 명시 기준으로 뒀고, 형제 진입점
+        # `fork_pack` 의 `new_pack_id=""` 도 같은 방식으로 즉시 거부한다).
+        # 이 가드가 없으면 아래 슬러그 파생이 조용히 자동 슬러그로 넘어가면서
+        # `explicit_pack_id=True` 와 모순돼, 자동 생성된 한글 슬러그가 아래의
+        # 명시적-pack_id 전용 형식 검증에 잘못 걸린다.
+        return {
+            "error": "pack_id was supplied as an empty string; omit the "
+            "parameter to auto-generate one from title"
+        }
     slug = _clean_str(pack_id) if pack_id else _slugify(title)
     if not slug:
         return {"error": "Could not derive a valid pack_id from title."}
+    if explicit_pack_id:
+        # #180: format/length validation for a CALLER-SUPPLIED pack_id, run
+        # before any registry lookup (below) so a rejection never confirms
+        # or denies whether that exact slug is already taken (요구 2, 존재
+        # 비노출). The auto-slugged path (pack_id omitted) is NOT validated
+        # here -- its `allow_hangul=True` mismatch with PACK_ID_RE is a
+        # separate, already-known defect (issue backlog candidate), out of
+        # this issue's "명시적 pack_id" scope.
+        from opencrab.pack.ownership import PACK_ID_BUDGET, validate_pack_id_format
+
+        reason = validate_pack_id_format(slug, max_len=PACK_ID_BUDGET)
+        if reason is not None:
+            return {"error": reason}
 
     ctx = _get_context()
     graph = ctx["neo4j"]

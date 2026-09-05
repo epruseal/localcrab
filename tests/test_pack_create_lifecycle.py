@@ -706,3 +706,105 @@ class TestFailureResponseNamesTheRetainedPack:
         assert "error" not in result, result
         assert result["pack_id"] == "landed-pack"
         assert get_pack(sql, "landed-pack")["status"] == PACK_STATUS_READY
+
+
+# ---------------------------------------------------------------------------
+# explicit pack_id 형식/길이 검증 (#180)
+# ---------------------------------------------------------------------------
+class TestExplicitPackIdFormatValidation:
+    """명시적 ``pack_id`` 는 등록부/그래프 앵커에 닿기 전에
+    ``validate_pack_id_format`` 을 지난다 (#180). 자동 슬러그
+    (``pack_id`` 생략) 경로는 이 검증 대상이 아니다(design §17 -- 범위는
+    "명시적 pack_id" 로 한정)."""
+
+    def test_malformed_explicit_pack_id_is_rejected(self, sql):
+        ctx = _base_ctx(sql)
+        result = _create(ctx, title="Coffee", pack_id="coffee/shop")
+
+        assert "error" in result, result
+        assert "invalid pack_id" in result["error"]
+        assert get_pack(sql, "coffee/shop") is None
+        assert get_pack(sql, "coffee") is None
+
+    def test_over_budget_explicit_pack_id_is_rejected(self, sql):
+        from opencrab.pack.ownership import PACK_ID_BUDGET
+
+        too_long = "a" * (PACK_ID_BUDGET + 1)
+        ctx = _base_ctx(sql)
+        result = _create(ctx, title="Coffee", pack_id=too_long)
+
+        assert "error" in result, result
+        assert f"{PACK_ID_BUDGET}-character" in result["error"]
+        assert get_pack(sql, too_long) is None
+
+    def test_rejection_happens_before_any_registry_lookup(self, sql):
+        """요구 2(존재 비노출): 형식 판정은 순수 문자열 연산이라 어떤
+        레지스트리 조회보다도 먼저 실패한다 -- ``begin_pack_creation``/
+        ``get_pack`` 이 단 한 번도 호출되지 않았음을 spy 로 확인한다."""
+        import opencrab.pack.ownership as ownership_mod
+
+        ctx = _base_ctx(sql)
+        with (
+            patch.object(
+                ownership_mod, "begin_pack_creation", wraps=ownership_mod.begin_pack_creation
+            ) as spy_begin,
+            patch.object(ownership_mod, "get_pack", wraps=ownership_mod.get_pack) as spy_get,
+        ):
+            result = _create(ctx, title="Coffee", pack_id="coffee/shop")
+
+        assert "error" in result, result
+        spy_begin.assert_not_called()
+        spy_get.assert_not_called()
+
+    def test_rejection_shape_is_identical_regardless_of_prior_occupancy(self, sql):
+        """이미 타인이 같은 malformed 이름을 등록해 뒀다고 가정할 수 없는
+        경우(형식 위반 자체가 등록 불가라 실제로 선점될 수 없음)에도, 존재
+        여부와 무관하게 같은 모양의 에러가 와야 한다 -- 형식 판정이 존재
+        조회보다 먼저 실행된다는 요구 2를 다른 각도에서 고정한다."""
+        ctx = _base_ctx(sql)
+        result_a = _create(ctx, title="Coffee", pack_id="coffee/shop")
+        result_b = _create(_base_ctx(sql), title="Coffee", pack_id="coffee/shop")
+
+        assert result_a.keys() == result_b.keys() == {"error"}
+        assert result_a["error"] == result_b["error"]
+
+    def test_valid_explicit_pack_id_is_unaffected(self, sql):
+        ctx = _base_ctx(sql)
+        result = _create(ctx, title="Coffee", pack_id="coffee-shop")
+
+        assert "error" not in result, result
+        assert result["pack_id"] == "coffee-shop"
+
+    def test_explicit_empty_string_pack_id_is_rejected_before_slug_derivation(self, sql):
+        """``pack_id=""`` 는 "생략" 이 아니라 "명시적으로 무효한 값" 이다
+        (형제 진입점 ``fork_pack`` 의 ``new_pack_id=""`` 과 같은 관례). 이
+        가드가 없으면 슬러그가 조용히 자동 생성돼(한글 제목이면 한글 슬러그)
+        위 형식 검증에 걸리는 내부 모순이 생긴다 -- 그 모순 자체가 회귀
+        대상이므로, 등록부 조회가 단 한 번도 실행되지 않았음을 spy 로
+        고정한다."""
+        import opencrab.pack.ownership as ownership_mod
+
+        ctx = _base_ctx(sql)
+        with (
+            patch.object(
+                ownership_mod, "begin_pack_creation", wraps=ownership_mod.begin_pack_creation
+            ) as spy_begin,
+            patch.object(ownership_mod, "get_pack", wraps=ownership_mod.get_pack) as spy_get,
+        ):
+            result = _create(ctx, title="커피숍", pack_id="")
+
+        assert "error" in result, result
+        assert "empty string" in result["error"]
+        spy_begin.assert_not_called()
+        spy_get.assert_not_called()
+
+    def test_omitted_pack_id_still_auto_slugs_hangul_title(self, sql):
+        """``pack_id`` 생략(``None``)은 여전히 자동 슬러그 경로다 -- 위
+        빈 문자열 거부가 이 경로까지 잠식하지 않았음을 확인한다(한글 제목의
+        자동 슬러그 허용은 이 이슈의 범위 밖 기존 동작이며, 이 테스트는 그
+        기존 동작이 그대로 보존됨을 고정한다)."""
+        ctx = _base_ctx(sql)
+        result = _create(ctx, title="커피숍")
+
+        assert "error" not in result, result
+        assert "커피숍" in result["pack_id"]

@@ -27,14 +27,19 @@ pack's anchor node is in the graph".
 
 from __future__ import annotations
 
+import re
 import secrets
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
+
+from opencrab.pack.fork_remap import NODE_ID_COLUMN_LIMIT
 
 if TYPE_CHECKING:
     from opencrab.auth import Principal
 
 VISIBILITIES = ("private", "public-read", "public-fork")
+
+PACK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Registry lifecycle states (#170, design v4 §3.2). ``ready`` is the
 # absorbing state: nothing transitions out of it, and nothing transitions
@@ -59,6 +64,45 @@ def anchor_node_id(pack_id: str) -> str:
     작업이 같은 것을 보게 하려고 여기에 둔다.
     """
     return f"dataset:{pack_id}"
+
+
+# pack_id 길이 예산 (#180, fork.py 의 기존 파생을 그대로 옮긴 것 -- 이 모듈이
+# 이미 `anchor_node_id` 를 소유하므로 앵커 접두사 길이의 자연스러운 소유자다).
+# 그래프 앵커 노드 id(`anchor_node_id(pack_id)`)가 `NODE_ID_COLUMN_LIMIT`
+# 컬럼에 들어가야 하고, `_negotiate_pack_id` 의 랜덤 충돌 접미사
+# (`-` + 8자리 16진수)까지 감안한, 단순 `len<=256` 보다 더 정확한 상한이다.
+PACK_ID_COLUMN_LIMIT = NODE_ID_COLUMN_LIMIT
+_PACK_ID_COLLISION_SUFFIX_LEN = 9  # "-" + 8자리 16진수, _negotiate_pack_id 재시도 접미사와 동일
+_ANCHOR_PREFIX_LEN = len(anchor_node_id(""))
+PACK_ID_BUDGET = PACK_ID_COLUMN_LIMIT - _PACK_ID_COLLISION_SUFFIX_LEN - _ANCHOR_PREFIX_LEN
+
+
+def validate_pack_id_format(
+    pack_id: str, *, max_len: int, over_length_noun: str = "limit"
+) -> str | None:
+    """explicit pack_id 형식/길이 판정 (#180). None=유효, str=거부 사유.
+
+    호출자는 반드시 이 함수를 어떤 레지스트리 조회(get_pack/begin_pack_creation)
+    보다도 먼저 호출한다 -- 형식 판정이 순수 문자열 연산이라 존재 여부를 조회하지
+    않고 끝나므로, 거부 응답이 "이 pack_id 를 이미 누가 쓰고 있는지" 를 드러내지
+    않는다. 문자 집합은 ``opencrab.pack.assembler.assemble_pack_v1`` 이 쓰는
+    것과 동일한 객체(``PACK_ID_RE``)이며 첫 글자 alnum 필수 + '.', '_', '-' 만
+    허용한다 -- '/' 를 비롯한 모든 경로 세그먼트 위험 문자를 원천 배제한다(#149의
+    REST pack_id 경로변수 후속).
+
+    ``over_length_noun`` 은 길이 초과 메시지의 마지막 단어만 바꾼다 -- 호출자별로
+    이미 고정된 문구(예: fork.py 의 "...character budget")를 보존하기 위함이며,
+    검증 로직 자체는 호출자와 무관하게 동일하다.
+    """
+    if not PACK_ID_RE.fullmatch(pack_id) or ".." in pack_id:
+        return (
+            f"invalid pack_id: {pack_id!r} (expected ASCII letters, digits, "
+            "'.', '_', '-' only, starting with a letter or digit)"
+        )
+    if len(pack_id) > max_len:
+        return f"pack_id exceeds the {max_len}-character {over_length_noun}"
+    return None
+
 
 # #148: default-pack id prefix + random suffix, mirroring create_pack's
 # collision-suffix shape -- never `default-{user_id}` (that string-convention
