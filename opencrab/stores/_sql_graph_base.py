@@ -125,6 +125,7 @@ from opencrab.common.graph_identity import (
     FrozenDict,
     GraphInventory,
     GraphMigrationConflict,
+    GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     LegacyEdgeRow,
     LegacyNodeKey,
@@ -617,17 +618,47 @@ class _SqlGraphStoreBase(abc.ABC):
         return _merge_space(_as_dict(row[0]), row[1]) if row else None
 
     def lookup_node_type(self, node_id: str) -> str | None:
-        """No ``_require_available()`` — mirrors both existing stores, which
-        return ``None`` on an unavailable store instead of raising (used as a
-        best-effort probe by OntologyBuilder)."""
-        # Schema classification gates mutations, not this read probe. A
-        # legacy database is intentionally left inspectable so an operator
-        # can discover the endpoint type before planning its migration.
+        """Resolve a node_id's type: present (str), absent (None), or raise.
+
+        Three-state contract (#162, mirrors Neo4jStore.lookup_node_type):
+        present/absent both come from a normal query outcome and are not
+        raised -- a legacy database is intentionally left inspectable so an
+        operator can discover the endpoint type before planning its
+        migration, which is why this does not gate on schema classification
+        the way write paths do. ``unavailable`` (store down, or a matched
+        row with a null/empty ``node_type`` -- a data-integrity fault, not
+        "not found") raises ``GraphReadCapabilityUnavailable`` so callers do
+        not silently fall back to a default type when the real answer is
+        unknown.
+        """
         if not getattr(self, "_available", False):
-            return None
-        sql = f"SELECT node_type FROM {self._table('graph_nodes')} WHERE node_id=:node_id LIMIT 1"
-        row = self._fetch_one(sql, {"node_id": node_id})
-        return row[0] if row else None
+            raise GraphReadCapabilityUnavailable(
+                f"lookup_node_type: store is not available (node_id={node_id!r})"
+            )
+        try:
+            sql = f"SELECT node_type FROM {self._table('graph_nodes')} WHERE node_id=:node_id LIMIT 1"
+            row = self._fetch_one(sql, {"node_id": node_id})
+            if row is None:
+                return None
+            node_type = row[0]
+            if not node_type:
+                raise GraphReadCapabilityUnavailable(
+                    f"lookup_node_type: matched node {node_id!r} has no node_type"
+                )
+            return node_type
+        except (KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError):
+            # Programming errors (adapter mistyped, _fetch_one signature
+            # drift across LocalGraphStore/PGGraphStore, etc.) -- not a
+            # query-failure signal. Let these propagate as-is instead of
+            # being disguised as "store unavailable" (#162 codex/critic
+            # review).
+            raise
+        except GraphReadCapabilityUnavailable:
+            raise
+        except Exception as exc:
+            raise GraphReadCapabilityUnavailable(
+                f"lookup_node_type failed for {node_id!r}"
+            ) from exc
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """True iff the node itself was deleted (unified B2 contract); the

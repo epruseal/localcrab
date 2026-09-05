@@ -186,11 +186,25 @@ class GraphStore(Protocol):
         ...
 
     def lookup_node_type(self, node_id: str) -> str | None:
-        """Best-effort node_type resolution by id alone; None if not found.
+        """Resolve a node_id's type by id alone. Three-state contract (#162):
 
-        SQL and Neo4j implementations are best-effort and return None when
-        unavailable. The Kùzu facade raises a read-capability exception until
-        qualification, so callers must treat that mode as disabled.
+        - present: the node exists; its type is returned.
+        - absent: no node matches ``node_id`` -- returns ``None``. A
+          legitimate query outcome, not a fault; callers may refuse a write
+          that references it (missing endpoint) without treating the store
+          as down.
+        - unavailable: the store cannot answer at all (down, or a matched
+          row came back with a null/malformed type) -- raises
+          ``GraphReadCapabilityUnavailable``. Callers must not fall back to
+          a default/guessed type on this path; #162 was exactly a caller
+          (``OntologyBuilder.add_edge``) collapsing "absent" and
+          "unavailable" into the same ``None`` and writing a wrong-typed
+          edge as a result.
+
+        All four backends implement this contract identically, including
+        the Kùzu facade, which raises unconditionally until its
+        transaction/CAS qualification is complete (it has no "present" or
+        "absent" case yet).
         """
         ...
 

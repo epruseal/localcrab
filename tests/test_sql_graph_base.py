@@ -16,7 +16,11 @@ from typing import Any
 
 import pytest
 
-from opencrab.common.graph_identity import EdgeIdentityConflict, NodeIdentityConflict
+from opencrab.common.graph_identity import (
+    EdgeIdentityConflict,
+    GraphReadCapabilityUnavailable,
+    NodeIdentityConflict,
+)
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, _SqlGraphStoreBase
 
@@ -135,10 +139,58 @@ def test_lookup_node_type():
     assert store.lookup_node_type("nope") is None
 
 
-def test_lookup_node_type_returns_none_when_unavailable():
+def test_lookup_node_type_malformed_raises():
+    # A row matched but node_type came back empty -- a data-integrity fault,
+    # not "not found" (#162). The column is NOT NULL, so an empty string is
+    # the reachable malformed shape; write it directly since upsert_node's
+    # own validation would refuse it through the normal API.
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    store._conn.execute("UPDATE graph_nodes SET node_type = '' WHERE node_id = :id", {"id": "p1"})
+    store._conn.commit()
+
+    with pytest.raises(GraphReadCapabilityUnavailable):
+        store.lookup_node_type("p1")
+
+
+def test_lookup_node_type_raises_when_unavailable():
+    # #162: an unavailable store cannot tell "node absent" from "store
+    # down" -- it must raise instead of degrading to None, so
+    # OntologyBuilder.add_edge can refuse the write instead of guessing a
+    # default type.
     store = _store()
     store._available = False
-    assert store.lookup_node_type("p1") is None
+    with pytest.raises(GraphReadCapabilityUnavailable):
+        store.lookup_node_type("p1")
+
+
+@pytest.mark.parametrize("exc_type", [KeyError, TypeError, AttributeError, ValueError])
+def test_lookup_node_type_propagates_programming_errors(exc_type):
+    # _fetch_one is implemented differently per backend (local_graph_store.py
+    # vs pg_graph_store.py, #162 v3 codex review) -- an adapter mistype or
+    # signature drift there must surface as itself, not be disguised as
+    # "store unavailable".
+    store = _store()
+
+    def _boom(sql, params):
+        raise exc_type("boom")
+
+    store._fetch_one = _boom
+    with pytest.raises(exc_type):
+        store.lookup_node_type("p1")
+
+
+def test_lookup_node_type_wraps_other_errors_with_cause():
+    store = _store()
+    original = sqlite3.OperationalError("database is locked")
+
+    def _boom(sql, params):
+        raise original
+
+    store._fetch_one = _boom
+    with pytest.raises(GraphReadCapabilityUnavailable) as excinfo:
+        store.lookup_node_type("p1")
+    assert excinfo.value.__cause__ is original
 
 
 def test_delete_node_matches_type_and_id_pair():

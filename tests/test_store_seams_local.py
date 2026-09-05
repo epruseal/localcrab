@@ -119,11 +119,17 @@ class TestError:
         with pytest.raises(RuntimeError, match="^LocalSQLDocStore is not available.$"):
             getattr(doc_store, method)(*args)
 
-    def test_graph_store_lookup_node_type_soft_guard_returns_none(self, graph_store):
-        """lookup_node_type() is the one graph method that does NOT raise —
-        it returns None so OntologyBuilder callers can fall back gracefully."""
+    def test_graph_store_lookup_node_type_raises_when_unavailable(self, graph_store):
+        """#162: lookup_node_type() must NOT return None for "store is
+        down" -- None is reserved for "node genuinely absent". An
+        unavailable store cannot tell the two apart, so it raises
+        GraphReadCapabilityUnavailable instead (fail-closed for callers
+        that used to fall back to a guessed default type)."""
+        from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+
         graph_store._available = False
-        assert graph_store.lookup_node_type("n1") is None
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            graph_store.lookup_node_type("n1")
 
     def test_doc_store_keyword_search_soft_guard_returns_empty(self, doc_store):
         """keyword_search() returns [] rather than raising when unavailable

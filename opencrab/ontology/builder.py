@@ -18,6 +18,7 @@ from typing import Any
 
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
+    GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
     NodeIdentityConflict,
@@ -527,40 +528,58 @@ class OntologyBuilder:
         # opencrab/stores/_graph_protocol.py), so local mode no longer flattens
         # edge labels to a per-space default.
         #
-        # A None lookup means the endpoint node does not exist. Falling back to
-        # the space default here used to write a *wrong-typed* row: the SQL
-        # backends' upsert_edge is a plain INSERT with no endpoint check, while
-        # Neo4jStore.upsert_edge uses MATCH and writes nothing. Because
-        # graph_edges' primary key includes from_type/to_type, such a row could
-        # not be corrected by re-running the ingest -- it stayed as a permanent
-        # dangling edge typed as the space's first node type (resource ->
-        # Project, subject -> User).
+        # lookup_node_type has a three-state contract (#162): it returns the
+        # type when the endpoint exists, None when it genuinely does not
+        # (a legitimate "no match" this function already handles below), and
+        # raises GraphReadCapabilityUnavailable when it cannot tell the
+        # difference (store down, or a matched row with a malformed type).
+        # That third case used to come back as a bare None too, which this
+        # function could not distinguish from "absent" -- it wrote the edge
+        # against a guessed per-space default type instead of refusing the
+        # write. Because graph_edges' primary key includes from_type/to_type,
+        # such a row could not be corrected by re-running the ingest -- it
+        # stayed as a permanent dangling edge typed as the space's first node
+        # type (resource -> Project, subject -> User). Both endpoints are now
+        # checked, and a missing one yields the same "no match" contract
+        # Neo4j already had; an unavailable one refuses the whole write
+        # (below), never a guessed type.
         #
-        # Both endpoints are now checked, and a missing one yields the same
-        # "no match" contract Neo4j already had.
-        #
-        # The check only runs when the graph store is available and implements
-        # lookup_node_type: an unavailable store cannot tell "node absent" from
-        # "store down", and it writes nothing anyway, so no wrong-typed row can
-        # be created. In that case the space default is kept as before.
+        # getattr stays a soft check even though the Protocol declares this
+        # method on all four backends: Protocol is structurally checked only
+        # via isinstance, which nothing in this codebase does, so a test
+        # double or a future backend that omits lookup_node_type would
+        # otherwise die with a bare AttributeError instead of the same
+        # fail-closed "graph unavailable" response every other gap here
+        # produces.
         lookup = (
             getattr(self._neo4j, "lookup_node_type", None) if self._neo4j is not None else None
         )
-        if lookup is not None and self._neo4j is not None and self._neo4j.available:
+        if lookup is None or not callable(lookup):
+            output["stores"] = {
+                "graph": "unavailable (lookup_node_type not implemented)",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+            }
+            return output
+        try:
             from_type = lookup(from_id)
             to_type = lookup(to_id)
-            missing = [
-                f"{space}/{nid}"
-                for space, nid, ntype in (
-                    (from_space, from_id, from_type),
-                    (to_space, to_id, to_type),
-                )
-                if ntype is None
-            ]
-        else:
-            from_type = _space_to_default_type(from_space)
-            to_type = _space_to_default_type(to_space)
-            missing = []
+        except GraphReadCapabilityUnavailable as exc:
+            output["stores"] = {
+                "graph": f"unavailable (endpoint type lookup failed: {exc})",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+            }
+            return output
+        missing = [
+            f"{space}/{nid}"
+            for space, nid, ntype in (
+                (from_space, from_id, from_type),
+                (to_space, to_id, to_type),
+            )
+            if ntype is None
+        ]
+
 
         # #148: an edge may not straddle packs. export_edges_scoped needs BOTH
         # endpoints in scope, so a cross-pack edge is a row its own pack's
@@ -896,11 +915,3 @@ def store_write_succeeded_for(stores: Any, kind: str) -> bool:
         return False
     return all(store_write_succeeded(stores, key) for key in required)
 
-
-def _space_to_default_type(space_id: str) -> str:
-    """Return a default node type label for a space when the real type is unknown."""
-    from opencrab.grammar.manifest import SPACES
-
-    spec = SPACES.get(space_id, {})
-    types = spec.get("node_types", [])
-    return types[0] if types else space_id.capitalize()

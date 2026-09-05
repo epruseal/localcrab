@@ -646,14 +646,26 @@ class Neo4jStore:
             return self._clean_node_properties(record["props"], node_id, node_type) if record else None
 
     def lookup_node_type(self, node_id: str) -> str | None:
-        """Return the first label for a node_id, or None if not found.
+        """Resolve a node_id's type: present (str), absent (None), or raise.
 
-        Used by OntologyBuilder to resolve real node types when writing edges,
-        so that edges preserve typed labels instead of falling back to a single
-        per-space default.
+        Used by OntologyBuilder to resolve real node types when writing
+        edges, so that edges preserve typed labels instead of falling back
+        to a single per-space default (#162). Three-state contract:
+        - present: a matching node was found and its type is returned.
+        - absent: no node matched ``node_id`` -- ``result.single()`` itself
+          returns ``None``, not a record. This is a legitimate "not found",
+          not a fault, so ``add_edge`` may still refuse the write (missing
+          endpoint) without treating the store as unavailable.
+        - unavailable: the store cannot answer the query at all (down, or a
+          matched row came back malformed -- ``n.node_type`` stored as null
+          is a data-integrity fault, not "not found"). Raises
+          ``GraphReadCapabilityUnavailable`` so callers do not silently
+          write against a default type when the real answer is unknown.
         """
         if not self._available:
-            return None
+            raise GraphReadCapabilityUnavailable(
+                f"lookup_node_type: Neo4j store is not available (node_id={node_id!r})"
+            )
         try:
             with self._session() as session:
                 result = session.run(
@@ -661,9 +673,27 @@ class Neo4jStore:
                     id=node_id,
                 )
                 record = result.single()
-                return record["lbl"] if record and record["lbl"] else None
-        except Exception:
-            return None
+                if record is None:
+                    return None
+                label = record["lbl"]
+                if not label:
+                    raise GraphReadCapabilityUnavailable(
+                        f"lookup_node_type: matched node {node_id!r} has no node_type"
+                    )
+                return label
+        except (KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError):
+            # Programming errors (alias renamed under RETURN ... AS lbl,
+            # adapter mistyped, etc.) -- not a query-failure signal. Let
+            # these propagate as-is so a bug surfaces as itself instead of
+            # being disguised as "store unavailable" (#162 codex/critic
+            # review).
+            raise
+        except GraphReadCapabilityUnavailable:
+            raise
+        except Exception as exc:
+            raise GraphReadCapabilityUnavailable(
+                f"lookup_node_type failed for {node_id!r}"
+            ) from exc
 
     def delete_node(self, node_type: str, node_id: str) -> bool:
         """Delete a node and all its relationships."""
