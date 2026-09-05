@@ -2154,8 +2154,10 @@ class TestFallbackTagWithoutPackIdCounts:
     """`fallback_tag_without_pack_id_counts()` — `pack_id` 없이 `source`/`source_id`
     로만 태그된 행의 전역(팩 비한정) 카운트(localcrab #164). 회수(`delete_pack`)와
     대사(`live_pack_state`) 어느 쪽도 이 태그 자체로는 안 걸리는 사각지대의 존재만
-    잰다(단 `graph_edges` 는 예외 — 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로
-    함께 지워진다, 아래 `test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`
+    잰다(단 `graph_edges` 와 `doc_nodes` 는 예외 — 양 끝/짝 노드가 `pack_id` 로
+    회수되면 그 cascade 나 node_id 키 삭제로 함께 지워진다, 아래
+    `test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`
+    와 `test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate`
     참고).
     """
 
@@ -2281,6 +2283,33 @@ class TestFallbackTagWithoutPackIdCounts:
         got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
         assert got["graph_edges"] == 0, (
             "cascade 로 이미 지워진 엣지가 fallback 카운트에도 잡혔다 — 존재하지 않는 행을 셌다")
+
+    def test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate(
+            self, live):
+        """`doc_nodes` 에도 `graph_edges` 와 같은 구멍이 있다(localcrab #164, PR #330
+        코드 리뷰 지적) — `delete_pack` 은 `pack_id` 로 고른 각 graph 노드의 `node_id`
+        로 `docs.delete_node_doc(space, node_id)` 를 그 doc_nodes 행 자신의 태그와
+        무관하게 호출한다. `source_id` 만으로 태그된 doc_nodes 트윈이라도 같은
+        `node_id` 의 graph 노드가 `pack_id` 로 회수되면 함께 지워진다 — 회수 전에는
+        이 함수가 "전역 잔여"로 세지만, 회수 시점에 이미 함께 사라질 행이라 과대추정이다."""
+        _builder, graph, docs = live
+        # properties.space 를 doc_nodes 시드의 기본 space("resource")와 맞춘다 —
+        # delete_pack 이 docs.delete_node_doc 에 넘기는 space 는 properties.space
+        # (COALESCE 기본값 'concept')지 graph_nodes.space_id 컬럼이 아니다.
+        self._seed_graph_node(graph, "n1", {"pack_id": "target", "space": "resource"})
+        self._seed_doc_node(docs, "n1", {"source_id": "target"})
+
+        before = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert before["doc_nodes"] == 1, (
+            "source_id-only doc_nodes 트윈이 회수 전에는 사각지대로 잡혀야 한다")
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+
+        left_doc = docs._conn.execute(
+            "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("n1",)).fetchone()[0]
+        assert left_doc == 0, (
+            "pack_id 소유 graph 노드의 doc_nodes 트윈이 delete_pack 뒤에도 남았다"
+            " — node_id 키 삭제가 더는 그 트윈에 안 닿는다는 뜻이라 이 테스트 전제가 깨진다")
 
 
 class TestFallbackTagPostgresDialect:

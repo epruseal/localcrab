@@ -793,9 +793,10 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     검색), 그래서 이 두 키는 회수(`delete_pack`, `pack_id` 단일 소유 키)에서도
     대사(`pack_live_counts`/`live_pack_state`, 역시 `pack_id` 단일 키)에서도 소유 판정에
     안 쓰인다. 이 함수가 세는 행은 그래서 **회수/대사 술어가 직접 조회하지는 않는다** —
-    그 사실만 알려준다(단 `graph_edges` 는 예외가 있다 — 아래 "`graph_edges` 는 독립
-    회수 경로가 없다" 문단 참고, 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로 함께
-    지워진다). 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
+    그 사실만 알려준다(단 `graph_edges` 와 `doc_nodes` 는 예외가 있다 — 아래
+    "`graph_edges` 는 독립 회수 경로가 없다"와 "`doc_nodes` 트윈도 간접 회수된다" 두
+    문단 참고, 양 끝/짝 노드가 `pack_id` 로 회수되면 그 cascade 나 node_id 키 삭제로
+    함께 지워진다). 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
     `pack_id` 가 없어 판정 불가 — "팩 소속"의 유일한 정본 키가 `pack_id` 자체다,
     `docs/pack-contract-layer.md` 의 "`pack` 은 폐기됐다" 절 참고).
 
@@ -810,6 +811,15 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     안 걸릴 때만 이 함수가 세는 잔여로 남는다, 회귀 고정:
     `TestFallbackTagWithoutPackIdCounts.test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`).
     이 카운트는 대사(`pack_live_counts`/`live_pack_state`) 기준 가시성만 말한다.
+
+    **`doc_nodes` 트윈도 간접 회수된다** — `delete_pack` 은 `pack_id` 로 고른 각
+    graph 노드의 `node_id` 로 `docs.delete_node_doc(space, node_id)` 를 **그
+    doc_nodes 행 자신의 태그와 무관하게** 호출한다. `source`/`source_id`-only 로만
+    태그된 doc_nodes 트윈이라도 같은 `node_id` 의 graph 노드가 `pack_id` 로 회수되면
+    함께 지워진다(회귀 고정:
+    `TestFallbackTagWithoutPackIdCounts.test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate`).
+    이 함수는 이 짝짓기를 조회하지 않으므로, 회수 시점에 이미 함께 사라질 행도 "전역
+    잔여"로 셀 수 있다 — 그 과대추정 폭은 정책 결정(#325) 없이는 줄이지 않는다.
 
     `pack_id` 부재 판정은 `_doc_owner_pred` 와 같은 정의(`json_truthy_text(...) IS NULL`,
     `_doc_owner_pred` docstring의 "pack_id 없음" 판정 문단 참고)를 재사용한다 —
