@@ -191,6 +191,14 @@ class Settings(BaseSettings):
     # 거부한다. 무한 대기를 기본으로 두면 정체가 진단 불가능한 hang 이 된다.
     chroma_lock_timeout: float = Field(default=30.0, alias="CHROMA_LOCK_TIMEOUT")
 
+    # 이름 있는 파일락(write.lock 포함) 획득 대기 상한(초), 호출자가 timeout 을
+    # 안 정했을 때의 기본값. #69: fcntl.flock(LOCK_EX) 가 인자 없이 걸리면
+    # 느리거나 죽은 보유자 하나가 모든 후속 쓰기 호출을 영구 정지시켰다.
+    # 이 값은 락 획득 대기 시간의 상한일 뿐 보유 시간의 상한이 아니다.
+    # 정상적인 쓰기 도구 한 번(임베딩 호출 포함)이 앞선 보유자로 인해
+    # 대기할 수 있는 시간을 넉넉히 잡도록 chroma_lock 기본(30s)보다 크게 둔다.
+    write_lock_timeout: float = Field(default=120.0, alias="WRITE_LOCK_TIMEOUT")
+
     # openai 백엔드 전용 Chroma 컬렉션명. minilm("opencrab_vectors")와 분리해
     # 차원 비호환 문제를 방지한다. 롤백 시 기존 컬렉션은 보존됨.
     embed_collection: str = Field(
