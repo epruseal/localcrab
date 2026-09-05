@@ -320,6 +320,18 @@ def install_pack(name: str) -> dict[str, Any]:
     ``properties``, or with no such stale field, is left alone and counted
     as ``skipped``, same as before.
 
+    Known limitation (#107, PR #336 review, round 3): the fingerprint is the
+    CURRENT manifest's required/optional overlap, not the overlap that held
+    when the on-disk file was generated. If a later pack version fixes its
+    own manifest by dropping the field from ``optional`` (so the overlap no
+    longer exists), a stale ``required: false`` left over from the old,
+    still-overlapping manifest is no longer recognized and stays unrepaired.
+    Closing that gap needs a per-file record of which manifest version (or
+    fingerprint) generated it, which no migration path in this function
+    tracks today (the legacy ``extra_required``/``extra_optional`` path has
+    the same current-manifest-only limitation). Left as a follow-up rather
+    than added here.
+
     Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
