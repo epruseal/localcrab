@@ -187,6 +187,41 @@ class TestVectorStoreContract:
 
 
 # ---------------------------------------------------------------------------
+# issue #82: json.dumps(...)/metadata sanitization without a finiteness check
+# let NaN/Infinity metadata values reach storage unguarded (chroma_store.py's
+# _sanitize_metadata, shared by sqlite-vec, and pg_vector_store.py's own
+# json.dumps calls). All three backends must reject a non-finite float
+# identically, before anything is written.
+# ---------------------------------------------------------------------------
+
+
+class TestNonFiniteMetadataRejection:
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_add_texts_rejects_non_finite(self, store, bad_value):
+        with pytest.raises(ValueError):
+            store.add_texts(texts=["hello"], metadatas=[{"score": bad_value}], ids=["v1"])
+        assert store.get_by_id("v1") is None
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_upsert_texts_rejects_non_finite(self, store, bad_value):
+        with pytest.raises(ValueError):
+            store.upsert_texts(texts=["hello"], metadatas=[{"score": bad_value}], ids=["v1"])
+        assert store.get_by_id("v1") is None
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_import_vectors_rejects_non_finite(self, store, bad_value):
+        record = {
+            "id": "v1",
+            "document": "hello",
+            "metadata": {"score": bad_value},
+            "embedding": [0.1] * 32,
+        }
+        with pytest.raises(ValueError):
+            store.import_vectors([record], pack_id="packA")
+        assert store.get_by_id("v1") is None
+
+
+# ---------------------------------------------------------------------------
 # [#175 v2] Chroma-only: ids that already carry a chromadb ``uri`` are routed
 # through native upsert() (merge) instead of delete()+add() (replace) — see
 # ChromaStore.upsert_texts docstring. Real chromadb only (no mocks/doubles):
