@@ -812,7 +812,8 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     이 카운트는 대사(`pack_live_counts`/`live_pack_state`) 기준 가시성만 말한다.
 
     `pack_id` 부재 판정은 `_doc_owner_pred` 와 같은 정의(`json_truthy_text(...) IS NULL`,
-    :150-153 근처)를 재사용한다 — falsy 값(`""`/`false`/`0`)도 "없음"으로 본다.
+    `_doc_owner_pred` docstring의 "pack_id 없음" 판정 문단 참고)를 재사용한다 —
+    falsy 값(`""`/`false`/`0`)도 "없음"으로 본다.
 
     실제로 이 카운트가 0 이 아니면 후속 결정(생산자 `pack_id` 필수화 vs 주기적 sweep)이
     필요하다 — 그 결정과 구현은 이 함수의 범위 밖이다(추적: localcrab #325).
@@ -1158,9 +1159,12 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     # doc_node_spaces (F4-b): 노드축 **대사(reconcile)** 술어(pack_id 단일 키) —
     # 위 nodes 조회와 동일한 폭이다. 이 폭은 회수(delete_pack, 역시 pack_id 단일
     # 키)와 이미 같다(F6/G6) — 둘 다 4키 시절은 지났다. 남는 사각지대는 `pack_id`
-    # 자체가 없고 `source`/`source_id` 로만 태그된 행이며, 그 행은 회수에도 대사에도
-    # 안 걸린다 — `fallback_tag_without_pack_id_counts()` 가 그 존재만 전역으로
-    # 탐지한다(localcrab #164).
+    # 자체가 없고 `source`/`source_id` 로만 태그된 행이며, 그 행은 회수/대사
+    # 술어가 직접 조회하지는 않는다(단 `graph_edges` 는 예외 — 양 끝 노드가
+    # `pack_id` 로 회수되면 그 cascade 로 함께 지워진다,
+    # `fallback_tag_without_pack_id_counts()` docstring의 "graph_edges 는 독립
+    # 회수 경로가 없다" 문단 참고) — `fallback_tag_without_pack_id_counts()` 가
+    # 그 존재만 전역으로 탐지한다(localcrab #164).
     dn_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
     anchor_sql = build_anchor_sql(docs._dialect)
     doc_node_spaces: dict[str, set[str]] = {}
