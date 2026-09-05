@@ -1405,7 +1405,8 @@ def test_cli_ingest_reports_fail_and_zero_successes_when_graph_write_is_rejected
     src.write_text("CLI 본문", encoding="utf-8")
 
     result = CliRunner().invoke(_cli_main, ["ingest", str(src)])
-    assert result.exit_code == 0, result.output
+    # #189: 그래프 쓰기 거부로 파일이 FAIL 로 집계되므로 exit code 는 3 이어야 한다.
+    assert result.exit_code == 3, result.output
     assert "Ingested 0/1 files." in result.output, result.output
     assert "FAIL" in result.output, result.output
 

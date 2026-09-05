@@ -167,7 +167,8 @@ class TestCliExtractReceiptPath:
         """#1 — node/edge 둘 다 실패 영수증. 양쪽 문구를 정확히 단언한다(부분
         문자열 "1 not stored" 하나만으로는 반대쪽 배선 누락을 못 잡기 때문)."""
         result = _invoke_extract(cli_env, runner, add_node=FAIL_RECEIPT, add_edge=FAIL_RECEIPT)
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "Done with store failures" in result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (1 not stored)" in result.output
@@ -175,7 +176,8 @@ class TestCliExtractReceiptPath:
     def test_node_only_failure_reports_asymmetric_counts(self, bootstrapped, cli_env, runner):
         """#1-node"""
         result = _invoke_extract(cli_env, runner, add_node=FAIL_RECEIPT, add_edge=OK_RECEIPT)
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
 
@@ -184,7 +186,8 @@ class TestCliExtractReceiptPath:
         result = _invoke_extract(
             cli_env, runner, add_node=OK_RECEIPT, add_edge=FAIL_RECEIPT_UNAVAILABLE
         )
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (0 not stored)" in result.output
         assert "edges=1 attempted (1 not stored)" in result.output
 
@@ -192,7 +195,8 @@ class TestCliExtractReceiptPath:
         """#6b (cli 슬라이스) — stores 가 truthy non-dict("oops")여도 예외 없이
         실패로 계상되어야 한다."""
         result = _invoke_extract(cli_env, runner, add_node=MALFORMED_RECEIPT, add_edge=OK_RECEIPT)
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
         assert "Done with store failures" in result.output
@@ -215,7 +219,8 @@ class TestCliExtractExceptionPath:
         result = _invoke_extract(
             cli_env, runner, add_node=RuntimeError("node boom"), add_edge=OK_RECEIPT
         )
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
 
@@ -224,7 +229,8 @@ class TestCliExtractExceptionPath:
         result = _invoke_extract(
             cli_env, runner, add_node=OK_RECEIPT, add_edge=RuntimeError("edge boom")
         )
-        assert result.exit_code == 0, result.output
+        # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
+        assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (0 not stored)" in result.output
         assert "edges=1 attempted (1 not stored)" in result.output
 
