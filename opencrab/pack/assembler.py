@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import tempfile
 import zipfile
@@ -12,8 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from opencrab.common.hashing import file_sha256
-
-_PACK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+from opencrab.pack.ownership import PACK_ID_RE as _PACK_ID_RE
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

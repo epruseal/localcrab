@@ -96,7 +96,6 @@ from opencrab.auth import Principal
 from opencrab.common.pack_tags import canonicalize_pack_alias, strip_retired_keys
 from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 from opencrab.pack.fork_remap import (
-    NODE_ID_COLUMN_LIMIT,
     REFERENCE_KEYS,
     build_mapping,
     new_salt,
@@ -105,6 +104,8 @@ from opencrab.pack.fork_remap import (
     remap_vector_metadata,
     surviving_source_ids,
 )
+from opencrab.pack.ownership import PACK_ID_BUDGET as _PACK_ID_BUDGET
+from opencrab.pack.ownership import PACK_ID_COLUMN_LIMIT as _PACK_ID_COLUMN_LIMIT
 from opencrab.pack.ownership import (
     anchor_node_id,
     begin_pack_creation,
@@ -112,6 +113,7 @@ from opencrab.pack.ownership import (
     get_pack,
     mark_pack_partial,
     mark_pack_ready,
+    validate_pack_id_format,
 )
 from opencrab.pack.source_writer import write_source
 from opencrab.pack.write_gate import (
@@ -156,14 +158,10 @@ FORK_MAX_LOSS_RATIO = 0.10
 #     string would silently disagree the day the convention changes. No test
 #     can kill a mutation back to the literal 8 -- the two are equal under
 #     today's convention -- which is a property of deriving, not a gap.
-# 정본은 fork_remap 에 있다(issue #74). source_writer 의 노드화 예산이 같은
-# 근거를 써야 해서 옮겼고, 이름은 이 모듈의 기존 참조를 위해 유지한다.
-_PACK_ID_COLUMN_LIMIT = NODE_ID_COLUMN_LIMIT
-_PACK_ID_COLLISION_SUFFIX_LEN = 9
-_ANCHOR_PREFIX_LEN = len(anchor_node_id(""))
-_PACK_ID_BUDGET = (
-    _PACK_ID_COLUMN_LIMIT - _PACK_ID_COLLISION_SUFFIX_LEN - _ANCHOR_PREFIX_LEN
-)
+# 정본은 이제 ownership.py 에 있다(#180 -- pack.py 가 상수 하나만 얻으려고
+# fork.py 전체를 지연 임포트하는 결합을 없애려고 옮겼다). 이름(``_PACK_ID_BUDGET``/
+# ``_PACK_ID_COLUMN_LIMIT``)은 이 모듈의 기존 참조와 tests/test_pack_fork.py:58
+# 의 임포트를 위해 `as` 별칭으로 그대로 재수출한다 -- 값도 이름도 바뀌지 않는다.
 _DEFAULT_SLUG_SUFFIX = "-fork"
 
 
@@ -1178,10 +1176,17 @@ def _fork_pack_inner(
                 "instead"
             )
         requested_slug = new_pack_id
-        if len(requested_slug) > _PACK_ID_BUDGET:
-            raise _reject(
-                f"new_pack_id exceeds the {_PACK_ID_BUDGET}-character budget"
-            )
+        # #180: format (character-set) validation, not just length -- shared
+        # with pack_create via ownership.validate_pack_id_format so the two
+        # entry points reject the same slugs. `over_length_noun="budget"`
+        # preserves the exact "...character budget" wording T26/T50b pin
+        # (tests/test_pack_fork.py:2405,2489); the message text and the
+        # length check itself are otherwise unchanged from before this fix.
+        reason = validate_pack_id_format(
+            requested_slug, max_len=_PACK_ID_BUDGET, over_length_noun="budget"
+        )
+        if reason is not None:
+            raise _reject(reason)
     else:
         requested_slug = f"{src_pack_id}{_DEFAULT_SLUG_SUFFIX}"
         if len(requested_slug) > _PACK_ID_BUDGET:
