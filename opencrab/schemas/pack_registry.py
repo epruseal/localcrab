@@ -65,19 +65,41 @@ _TYPE_TEMPLATE_HEADER = """\
 
 
 def _warn_on_manifest_overlap(
-    pack: dict[str, Any], node_type: str, required_fields: list[str], optional_fields: list[str]
+    pack: dict[str, Any],
+    node_type: str,
+    required_fields: list[str],
+    optional_fields: list[str],
+    *,
+    regenerated: bool = True,
 ) -> None:
     """#107: warn when a manifest lists the same field in both `required`
     and `optional` for a type. Called both when the schema is actually
     (re)generated and, from ``install_pack``, when an existing current-shape
     schema is left untouched -- the manifest contradiction is the pack
     author's mistake either way, not something reinstall silently hides.
+
+    *regenerated* must be False for the untouched-file call site (review
+    round 10, #107): "required wins" is only true the moment the schema is
+    (re)built. An existing current-shape file that install_pack skips over
+    keeps whatever `required` value it already has -- claiming "required
+    wins" there would tell an operator validation now enforces the manifest
+    when it does not, until the file is actually regenerated.
     """
     overlap = sorted(set(required_fields) & set(optional_fields))
-    if overlap:
+    if not overlap:
+        return
+    if regenerated:
         logger.warning(
             "Pack '%s': type '%s' manifest lists %r in both required and "
             "optional -- required wins.",
+            pack.get("name"), node_type, overlap,
+        )
+    else:
+        logger.warning(
+            "Pack '%s': type '%s' manifest lists %r in both required and "
+            "optional, but the existing schema file is left unchanged -- "
+            "it keeps whatever required value it already has; required "
+            "only wins if this type's schema is regenerated.",
             pack.get("name"), node_type, overlap,
         )
 
@@ -374,6 +396,7 @@ def install_pack(name: str) -> dict[str, Any]:
                     pack, node_type,
                     manifest_spec.get("required") or ["name"],
                     manifest_spec.get("optional") or ["description", "status"],
+                    regenerated=False,
                 )
                 skipped.append(node_type)
                 continue
