@@ -353,7 +353,47 @@ def install_pack(name: str) -> dict[str, Any]:
                 skipped.append(node_type)
                 continue
             if not _is_legacy_shape(existing):
-                skipped.append(node_type)
+                if not _has_generation_marker(existing_content, name):
+                    # Same safety bar as the legacy-shape path below: don't
+                    # touch a file we can't prove we generated.
+                    skipped.append(node_type)
+                    continue
+                manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
+                manifest_required = manifest_spec.get("required") or ["name"]
+                existing_properties = existing.get("properties") or {}
+                # #107 (PR #336 review): a schema generated before this fix
+                # can already have a manifest-required field written to disk
+                # as `required: false` -- exactly the bug this issue closes.
+                # Without this branch, a bare reinstall never reaches the
+                # fixed _build_type_schema for an already current-shape
+                # file, so that stale False would persist forever. Only a
+                # field the manifest itself requires, and that is provably
+                # this tool's own dict-shaped property, gets flipped --
+                # anything else (a field missing entirely, or one the user
+                # customised) is left alone, same as extra_required/
+                # extra_optional below.
+                stale_required = [
+                    f
+                    for f in manifest_required
+                    if isinstance(existing_properties.get(f), dict)
+                    and existing_properties[f].get("required") is False
+                ]
+                if not stale_required:
+                    skipped.append(node_type)
+                    continue
+                for f in stale_required:
+                    existing_properties[f]["required"] = True
+                schema = dict(existing)
+                schema["properties"] = existing_properties
+                content = header + yaml.safe_dump(schema, sort_keys=False, allow_unicode=True)
+                path.write_text(content, encoding="utf-8")
+                migrated.append(node_type)
+                revived_manifest_fields[node_type] = {"required": stale_required, "optional": []}
+                logger.warning(
+                    "Pack '%s': repaired stale required=False on manifest-required "
+                    "field(s) %r for %s (schema generated before the #107 fix)",
+                    name, node_type, stale_required,
+                )
                 continue
             if not _has_generation_marker(existing_content, name):
                 logger.warning(
