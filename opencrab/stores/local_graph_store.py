@@ -86,18 +86,23 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         conn.create_function("lower", 1, lambda s: None if s is None else str(s).lower())
 
     def _init_db(self) -> None:
+        # issue #141 항목 2: 분류(_classify_schema)와 DDL 실행 사이에 다른
+        # 프로세스가 끼어들면 "fresh" 로 오판한 채 CREATE TABLE 을 겹쳐 실행할
+        # 수 있다 — 분류부터 최종 가용성 판정까지 통째로 write.lock 안에서
+        # 돈다(재진입 가능하므로 이미 락을 쥔 진입점 안에서도 안전).
         try:
-            conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma 적용
-            state = self._classify_schema(conn)
-            if state == "fresh":
-                with self._tx(immediate=True) as tx_conn:
-                    for ddl in SQLITE.render_ddl(GRAPH_STORE_SCHEMA):
-                        tx_conn.execute(ddl)
+            with self._bootstrap_lock():
+                conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma 적용
                 state = self._classify_schema(conn)
-            self._schema_state = "target" if state == "target" else ("legacy_migration_required" if state == "legacy" else "partial_or_unknown")
-            # A connected legacy/partial database remains readable. Mutation
-            # methods use the separate schema gate in the shared base.
-            self._available = state in {"target", "legacy", "partial"}
+                if state == "fresh":
+                    with self._tx(immediate=True) as tx_conn:
+                        for ddl in SQLITE.render_ddl(GRAPH_STORE_SCHEMA):
+                            tx_conn.execute(ddl)
+                    state = self._classify_schema(conn)
+                self._schema_state = "target" if state == "target" else ("legacy_migration_required" if state == "legacy" else "partial_or_unknown")
+                # A connected legacy/partial database remains readable. Mutation
+                # methods use the separate schema gate in the shared base.
+                self._available = state in {"target", "legacy", "partial"}
             logger.info("LocalGraphStore initialised at %s", self._db_path)
         except Exception as exc:
             self._schema_state = "partial_or_unknown"

@@ -108,9 +108,15 @@ class IdentityEngine:
     # ------------------------------------------------------------------
 
     def _ensure_tables(self) -> None:
+        # issue #141 항목 6: 생산 코드에 현재 호출자가 없다고 확인했지만(grep
+        # 전수 검색), execution/_sql.py::ensure_tables 와 같은 결함 클래스라
+        # 같은 변경에서 함께 닫는다.
         from sqlalchemy import text
+
+        from opencrab.stores.sql_store import write_lock_for_store
+
         tables = _TABLES_SQLITE if self._sql._is_sqlite else _TABLES_PG
-        with self._sql._engine.begin() as conn:
+        with write_lock_for_store(self._sql), self._sql._engine.begin() as conn:
             for ddl in tables:
                 conn.execute(text(ddl))
 

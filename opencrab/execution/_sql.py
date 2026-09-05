@@ -53,10 +53,18 @@ def ensure_tables(
     the store's backend and executes it. Callers that need to swallow
     setup failures (e.g. BillingHooks, which is fire-and-forget) wrap this
     call in their own try/except -- this function itself always raises.
+
+    issue #141 항목 6: 이 함수가 workflow.py/approvals.py/billing/hooks.py/
+    auth.py/pack/ownership.py 다섯 호출자가 공유하는 유일한 DDL 실행 지점이다
+    — write.lock 없이 *sql_store*._engine에 직접 DDL을 실행했다. 여기 한
+    곳만 잠그면 다섯 호출자 전부가 보호된다(opencrab.stores.sql_store 의
+    write_lock_for_store와 같은 헬퍼: SQLite 전용, PG는 no-op).
     """
     from sqlalchemy import text
 
+    from opencrab.stores.sql_store import write_lock_for_store
+
     ddl = ddl_sqlite if sql_store._is_sqlite else ddl_pg
-    with sql_store._engine.begin() as conn:
+    with write_lock_for_store(sql_store), sql_store._engine.begin() as conn:
         for stmt in ddl:
             conn.execute(text(stmt))

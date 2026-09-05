@@ -16,6 +16,24 @@ docker 모드 → local 모드 마이그레이션 스크립트.
 실행 예시:
   uv run python scripts/migrate_to_local.py --dry-run
   uv run python scripts/migrate_to_local.py --batch-size 1000 --local-data-dir /data/localcrab
+
+issue #141 항목 3 (write.lock 소유권 지도): 아래 Step 2/3/4/5 는 단계마다
+각자 write.lock 을 따로 잡는다 -- 전체를 하나의 락으로 묶지 않는다. Step 5
+(``_migrate_vectors_locked``) 는 chroma.lock 을 exclusive 로 바깥에 두고
+write.lock 을 그 안에 두는 순서(#140/#320 정본)를 지킨다; Step 2~5 전체를
+하나의 write.lock 으로 묶으면 그 write.lock 이 Step 5 에서는 chroma.lock
+보다 바깥에서 이미 쥐어진 상태가 되어 정본 순서를 뒤집는다. 대안으로
+chroma.lock 을 Step 2~5 전체 바깥에 exclusive 로 두르는 구조적 재구성도
+안전하지만(설계 검증에서 확인), ``_migrate_vectors_locked`` 가 이미 세밀히
+맞춘 유한 타임아웃과 부분 클라이언트 정리 로직(#140/#320)까지 손대야 해
+이 이슈의 비례적 범위를 넘는다고 판단해 채택하지 않는다.
+
+**잔존 위험**: 이 스크립트는 운영 서비스가 마이그레이션 동안 정지돼 있다고
+전제한다(그렇지 않다는 코드상 강제는 없다). 그 전제가 깨지면 -- 즉 다른
+프로세스가 실제로 살아 write.lock 을 다투면 -- 단계와 단계 사이(예: Step 2
+종료 후 Step 3 시작 전)에는 어느 write.lock 도 걸려 있지 않으므로 그 writer
+가 끼어들 수 있다. 이 문서화는 그 틈을 없애지 않는다 -- 운영 절차(서비스
+정지)로 옮겨 적을 뿐이다.
 """
 
 from __future__ import annotations
