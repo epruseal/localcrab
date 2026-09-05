@@ -178,6 +178,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드)[^media] |
 | `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드[^media] |
 | `opencrab export-neo4j-pack` | 그래프 스냅샷을 OpenCrab Pack v1 JSONL로 내보내기 |
+
+`ingest`/`extract`의 종료 코드 계약(#189): `0`은 전 파일 성공, `3`은 파일 1건 이상 실패(부분 실패, 성공한 파일은 그대로 반영), `1`은 예상 밖 예외로 인한 비정상 종료다. (Click 자체가 잘못된 호출에 `2`를 이미 예약해 쓰므로 부분 실패에는 다른 코드를 쓴다.)
 | `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 |
 | `opencrab packs list` | 적재된 팩 목록 |
 | `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
