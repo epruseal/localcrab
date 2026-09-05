@@ -70,7 +70,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from opencrab.locking import file_lock, lock_data_dir
+from opencrab.locking import lock_data_dir
 
 from ._registry import _REGISTRY, build_tools
 from ._registry import AccessTier as AccessTier
@@ -128,8 +128,16 @@ def _write_lock():
     write.lock wait is bounded too, so neither side hangs. See
     scripts/migrate_to_local.py:_migrate_vectors_locked for why removing it
     structurally is a follow-up rather than part of this change.
+
+    Goes through ``opencrab.locking.write_lock`` rather than calling
+    ``file_lock`` directly (#69): a bare ``file_lock("write.lock", ...)``
+    with no timeout let one slow or crashed write-tool call block every
+    other write tool call forever. ``write_lock`` bounds the wait by
+    default and raises a clear error naming write.lock when it gives up.
     """
-    with file_lock("write.lock", _lock_data_dir()):
+    from opencrab.locking import write_lock
+
+    with write_lock(_lock_data_dir()):
         yield
 
 

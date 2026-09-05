@@ -49,6 +49,10 @@ ENV_CONTRACT: dict[str, str] = {
     "EMBED_DIM": "튜너블",
     "OPENAI_TIMEOUT": "튜너블",
     "CHROMA_LOCK_TIMEOUT": "튜너블",
+    # #69: file_lock()/acquire_file_lock() 의 timeout 생략 기본값. write.lock
+    # 을 포함해 opencrab/mcp/tools 의 모든 쓰기 도구가 거치는 _write_lock() 이
+    # 이 경로를 타므로 serve 도달 경로다.
+    "WRITE_LOCK_TIMEOUT": "튜너블",
     "EMBED_COLLECTION": "튜너블",
     "LOCAL_GGUF_PATH": "상태 위치",
     "VECTOR_BACKEND": "설정 소스 선택",

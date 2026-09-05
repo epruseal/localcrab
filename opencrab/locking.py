@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import math
 import os
 import threading
 from collections.abc import Iterator
@@ -49,6 +50,65 @@ def chroma_lock_wait_timeout() -> float:
     from opencrab.config import get_settings
 
     return get_settings().chroma_lock_timeout + 60.0
+
+
+def default_lock_wait_timeout() -> float:
+    """Seconds to wait for a named file lock when the caller omits ``timeout``.
+
+    One derivation for every ``file_lock``/``acquire_file_lock`` caller that
+    does not choose its own bound (#69) -- write.lock among them, but also
+    the per-store ``<name>.db.lock`` files. Before this, an omitted timeout
+    meant ``fcntl.flock(LOCK_EX)`` with no bound at all, so one slow or
+    crashed holder could stall every other acquirer of that lock forever.
+
+    Validated the same way an explicit timeout is (see ``_resolve_timeout``)
+    so a poisoned ``WRITE_LOCK_TIMEOUT`` (NaN, inf, negative) cannot recreate
+    the unbounded wait through the *default* path instead of an explicit one
+    (#291, found reviewing this same defect class).
+    """
+    from opencrab.config import get_settings
+
+    value = get_settings().write_lock_timeout
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"WRITE_LOCK_TIMEOUT must be a finite, non-negative number of seconds, got {value!r}"
+        )
+    return value
+
+
+def _resolve_timeout(timeout: float | None) -> float:
+    """Fill in the default wait bound, or validate a caller-supplied one (#69, #291).
+
+    ``None`` no longer means "wait forever" -- it means "use
+    ``default_lock_wait_timeout()``". ``file_lock`` and ``acquire_file_lock``
+    are the only two places a raw ``timeout`` argument becomes a lock
+    acquisition, so resolving it here is the one place that covers every
+    caller, including ones that bypass ``write_lock()`` and call
+    ``file_lock`` directly.
+
+    NaN and +inf are rejected even when the caller supplies them: both defeat
+    the ``remaining <= 0`` deadline check the same way an absent timeout
+    does, just as a value instead of an omission (#291). A negative value
+    could satisfy that check immediately, but that would hide a caller bug
+    behind lock behaviour indistinguishable from "no wait", so it is
+    rejected too rather than silently treated as zero.
+    """
+    if timeout is None:
+        return default_lock_wait_timeout()
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(
+            f"lock timeout must be a finite, non-negative number of seconds, got {timeout!r}"
+        )
+    return timeout
+
+
+def write_lock_busy_message(lock_path: str, timeout: float) -> str:
+    """Operator-facing text for a write.lock acquisition that timed out."""
+    return (
+        f"timed out after {timeout}s waiting for {lock_path}. Another process "
+        "holds write.lock while writing to the local stores. Wait for it to "
+        "finish, or stop it if it is stuck, then run this again."
+    )
 
 
 def chroma_lock_busy_message(lock_path: str, timeout: float) -> str:
@@ -370,13 +430,17 @@ def file_lock(
 
     The lock is re-entrant within a thread, so low-level writers and their
     endpoint/script callers can share one ownership boundary safely.
+
+    ``timeout`` is resolved through ``_resolve_timeout`` before either the
+    in-process ``threading.RLock`` or the OS-level flock is touched (#69),
+    so an omitted timeout bounds BOTH waits instead of leaving one of them
+    unbounded.
     """
+    timeout = _resolve_timeout(timeout)
     path = _lock_path(filename, data_dir)
     process_lock = _process_lock(path)
-    deadline = None if timeout is None else monotonic() + max(timeout, 0)
-    if deadline is None:
-        process_lock.acquire()
-    elif not process_lock.acquire(timeout=max(0, deadline - monotonic())):
+    deadline = monotonic() + max(timeout, 0)
+    if not process_lock.acquire(timeout=max(0, deadline - monotonic())):
         raise TimeoutError("timed out waiting for in-process file lock")
     try:
         held = getattr(_held, "locks", None)
@@ -402,8 +466,7 @@ def file_lock(
         # of them still releases ``process_lock`` via the outer finally.
         fh = _open_lock(path)
         try:
-            remaining = None if deadline is None else max(0, deadline - monotonic())
-            _acquire(fh, shared=shared, timeout=remaining)
+            _acquire(fh, shared=shared, timeout=max(0, deadline - monotonic()))
         except BaseException:
             fh.close()
             raise
@@ -427,7 +490,13 @@ def acquire_file_lock(
     shared: bool = False,
     timeout: float | None = None,
 ) -> BinaryIO:
-    """Acquire a lock and return its open handle for lifetime-scoped use."""
+    """Acquire a lock and return its open handle for lifetime-scoped use.
+
+    ``timeout`` is resolved through ``_resolve_timeout`` (#69): an omitted
+    timeout now bounds the wait instead of blocking on ``fcntl.flock``
+    forever.
+    """
+    timeout = _resolve_timeout(timeout)
     fh = _open_lock(_lock_path(filename, data_dir))
     try:
         _acquire(fh, shared=shared, timeout=timeout)
@@ -447,6 +516,24 @@ def release_file_lock(fh: BinaryIO) -> None:
 
 @contextmanager
 def write_lock(data_dir: str | None = None, *, timeout: float | None = None) -> Iterator[None]:
-    """Serialise writes that share the local stores."""
-    with file_lock("write.lock", data_dir, timeout=timeout):
+    """Serialise writes that share the local stores.
+
+    An omitted ``timeout`` gets ``default_lock_wait_timeout()`` from
+    ``file_lock`` (#69) -- it used to mean an unbounded wait. A caller that
+    already computed its own bound (the backup module, a migration composing
+    it with a chroma.lock wait) passes it explicitly and keeps that value.
+
+    The ``TimeoutError`` -> :func:`write_lock_busy_message` conversion below
+    covers ONLY the acquisition, the same restriction ``chroma_lock_held``
+    documents for chroma.lock: a ``TimeoutError`` raised by the protected
+    block itself must keep its own message, or an unrelated failure would be
+    misreported as "another process holds write.lock".
+    """
+    path = _lock_path("write.lock", data_dir or lock_data_dir())
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(file_lock("write.lock", data_dir, timeout=timeout))
+        except TimeoutError as exc:
+            resolved = timeout if timeout is not None else default_lock_wait_timeout()
+            raise TimeoutError(write_lock_busy_message(path, resolved)) from exc
         yield
