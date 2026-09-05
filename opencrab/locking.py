@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from time import monotonic, sleep
 from typing import BinaryIO
 
@@ -82,18 +82,18 @@ def chroma_lock_held(
     if timeout is None:
         timeout = chroma_lock_wait_timeout()
     path = _lock_path("chroma.lock", data_dir)
-    try:
-        cm = file_lock("chroma.lock", data_dir, shared=shared, timeout=timeout)
-        cm.__enter__()
-    except TimeoutError as exc:
-        raise TimeoutError(chroma_lock_busy_message(path, timeout)) from exc
-    try:
+    # ExitStack rather than __enter__/__exit__ by hand: the stack owns the lock
+    # the instant it is entered, so there is no statement between "acquired"
+    # and "registered for release" where an asynchronous KeyboardInterrupt
+    # could land and strand it. Hand-rolled enter/exit always leaves that gap.
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                file_lock("chroma.lock", data_dir, shared=shared, timeout=timeout)
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(chroma_lock_busy_message(path, timeout)) from exc
         yield
-    except BaseException as exc:
-        if not cm.__exit__(type(exc), exc, exc.__traceback__):
-            raise
-    else:
-        cm.__exit__(None, None, None)
 
 
 def close_quietly(obj: object, what: str, *, log: object = None, reraise: bool = False) -> None:

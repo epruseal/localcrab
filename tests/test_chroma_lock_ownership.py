@@ -1595,3 +1595,39 @@ class TestInterruptedInitReleasesTheLock:
         assert exclusive_probe(data_dir) == "GRANTED", (
             "중단된 초기화가 잠금을 남겼다 — 소유자도 클라이언트도 없다"
         )
+
+
+class TestLockOwnershipHasNoAcquisitionGap:
+    """Acquiring and registering-for-release must not be separate statements.
+
+    The interrupted-init handler covers a failure INSIDE the client build. Its
+    sibling is one statement earlier: if the acquisition returns and an
+    asynchronous KeyboardInterrupt lands between that and the guarding block,
+    the lock is held with nothing arranged to release it. ``_connect`` now
+    acquires inside the try that owns the cleanup.
+
+    That window is NOT reachable from a test -- delivering an interrupt between
+    two specific bytecodes is not something a test can force -- so nothing here
+    pins it. What is pinned is the risk the move introduces: the handler now
+    sees the acquisition's own timeout, and swallowing it would undo this
+    issue's requirement that a lock timeout never degrades to available=False.
+    """
+
+    def test_timeout_still_propagates_from_inside_the_guard(
+        self, chroma_cls, tmp_path
+    ):
+        """RED 아님: 획득을 try 안으로 옮겨도 타임아웃 계약이 유지되는지 보는 대조군.
+
+        핸들러가 BaseException 을 잡으므로 타임아웃을 삼킬 위험이 생긴다. 그것이
+        available=False 강등으로 바뀌면 이 이슈의 요구사항 3이 깨진다."""
+        from opencrab.stores.chroma_store import ChromaLockTimeoutError
+
+        data_dir = str(tmp_path)
+        fh = acquire_file_lock("chroma.lock", data_dir, shared=False, timeout=5.0)
+        try:
+            with pytest.raises(ChromaLockTimeoutError):
+                make_store(chroma_cls, os.path.join(data_dir, "chroma"), lock_timeout=0.4)
+        finally:
+            release_file_lock(fh)
+        # And the failed attempt left nothing behind.
+        assert exclusive_probe(data_dir) == "GRANTED"

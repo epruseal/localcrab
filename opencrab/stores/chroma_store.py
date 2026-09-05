@@ -196,10 +196,15 @@ class ChromaStore:
         with chroma_init_guard(
             os.path.join(chroma_lock_dir(self._local_path), "chroma.lock")
         ):
-            # Before the try: a lock timeout must propagate as a startup error
-            # instead of being degraded to available=False with no way back.
-            self._acquire_local_lock()
+            # The acquisition sits INSIDE the try, not before it. Outside, an
+            # asynchronous KeyboardInterrupt landing between the acquisition
+            # returning and this try being entered would strand the lock -- the
+            # same hazard the handler below exists for, one statement earlier.
+            # A lock timeout still propagates rather than degrading to
+            # available=False: the handler re-raises, and its cleanup is a
+            # no-op when there is no handle and no client yet.
             try:
+                self._acquire_local_lock()
                 self._connect_body()
             except BaseException:
                 # BaseException, not Exception: _connect_body degrades ordinary
