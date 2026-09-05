@@ -113,11 +113,28 @@ def _build_type_schema(
     required_fields = list(spec.get("required") or ["name"])
     optional_fields = list(spec.get("optional") or ["description", "status"])
 
+    # #107: a manifest can (by author mistake) list the same field in both
+    # `required` and `optional`. Surface it -- required still wins below,
+    # but a pack author should know their manifest contradicts itself.
+    overlap = sorted(set(required_fields) & set(optional_fields))
+    if overlap:
+        logger.warning(
+            "Pack '%s': type '%s' manifest lists %r in both required and "
+            "optional -- required wins.",
+            pack.get("name"), node_type, overlap,
+        )
+
     properties: dict[str, Any] = {}
     for field_name in required_fields:
         properties[field_name] = {"type": "string", "required": True}
     for field_name in optional_fields:
-        properties[field_name] = {"type": "string", "required": False}
+        # #107: without this guard, a field declared in both `required` and
+        # `optional` had its required-ness silently dropped -- this loop
+        # unconditionally overwrote whatever the required-fields loop above
+        # just wrote. The extra_required/extra_optional handling below
+        # already guards the same way; the manifest's own lists didn't.
+        if field_name not in properties:
+            properties[field_name] = {"type": "string", "required": False}
 
     for field_name in extra_required or []:
         if field_name in properties:
@@ -372,8 +389,17 @@ def install_pack(name: str) -> dict[str, Any]:
             # silent about it either. The optional side is informational
             # only (no enforcement consequence either way).
             revived_required = [f for f in manifest_required if f not in old_required]
+            # #107: manifest_required and manifest_optional can themselves
+            # overlap. Without excluding revived_required here, a field
+            # missing from the old file would land in BOTH lists below --
+            # revived_manifest_fields would then claim the same field is
+            # simultaneously revived-required and revived-optional, the
+            # same self-contradiction PR #104's review already closed
+            # between preserved_extra_fields and revived_manifest_fields.
             revived_optional = [
-                f for f in manifest_optional if f not in old_required and f not in old_optional
+                f
+                for f in manifest_optional
+                if f not in old_required and f not in old_optional and f not in revived_required
             ]
 
             schema = _build_type_schema(
