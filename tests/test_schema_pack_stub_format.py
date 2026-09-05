@@ -547,7 +547,21 @@ def test_install_pack_warns_on_overlap_even_when_existing_schema_is_current_shap
     after = (types_dir / "Widget.yaml").read_text(encoding="utf-8")
     assert after == before  # skip means skip -- no rewrite, current-shape or not
 
-    assert any(
-        "name" in rec.message and "required" in rec.message and "optional" in rec.message
+    # #107 (review round 10): this skip path never rewrites the file, so
+    # "required wins" is a false claim here -- the field keeps whatever
+    # required value the existing file already has. The warning must say
+    # so, not the regenerated-path wording that implies enforcement changed.
+    matching = [
+        rec.message
         for rec in caplog.records
+        if "name" in rec.message and "required" in rec.message and "optional" in rec.message
+    ]
+    assert matching, "expected an overlap warning"
+    assert not any("optional -- required wins" in msg for msg in matching), (
+        f"skip-path warning must not unconditionally claim required wins "
+        f"(file is unchanged): {matching}"
+    )
+    assert any("unchanged" in msg and "regenerat" in msg for msg in matching), (
+        f"skip-path warning should say the existing file is left unchanged "
+        f"and required only wins once the schema is regenerated: {matching}"
     )
