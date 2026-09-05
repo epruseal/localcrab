@@ -33,6 +33,7 @@ from opencrab.pack.ownership import (
     readable_pack_ids,
     set_visibility,
 )
+from tests._pack_fixtures import ensure_test_user
 
 
 @pytest.fixture
@@ -232,28 +233,33 @@ class TestInsertPackClassification:
         assert _insert_pack(sql, "dup", alice, None, None, None) is True
         assert _insert_pack(sql, "dup", alice, None, None, None) is False
 
+    def test_e2c_fk_enforced_by_default_no_manual_pragma_needed(self, sql):
+        """#181: SQLStore itself must turn FK enforcement on for every SQLite
+        connection it opens -- a caller should not have to opt in manually
+        the way test_e2b above does. Before #181, SQLite's default
+        ``foreign_keys=OFF`` meant this INSERT would succeed silently and
+        this test would fail (RED)."""
+        from sqlalchemy.exc import IntegrityError
+
+        with pytest.raises(IntegrityError):
+            create_pack(sql, "no-such-user-at-all-181", "orphan-pack-181")
+        assert get_pack(sql, "orphan-pack-181") is None
+
     def test_e2b_fk_violation_reraises_without_any_retry(self, sql, monkeypatch):
         """E2b: a real FK-shaped IntegrityError (owner_id referencing a
-        nonexistent user, with the SQLite connection's FK pragma turned on
-        for this test's engine only) must propagate out of create_pack
-        rather than being swallowed as "slug taken" -- and create_pack must
-        not have retried at all (a mutant that classifies FK errors as
-        conflicts would otherwise silently exhaust every retry attempt and
-        raise a misleading RuntimeError instead of the real IntegrityError)."""
-        from sqlalchemy import text
+        nonexistent user) must propagate out of create_pack rather than
+        being swallowed as "slug taken" -- and create_pack must not have
+        retried at all (a mutant that classifies FK errors as conflicts
+        would otherwise silently exhaust every retry attempt and raise a
+        misleading RuntimeError instead of the real IntegrityError).
+
+        Before #181 this test had to turn the connection's FK pragma on
+        itself (SQLite defaults it OFF per connection); ``SQLStore`` now
+        does that globally (see ``test_e2c`` above), so this test only
+        needs to cover the retry-classification contract."""
         from sqlalchemy.exc import IntegrityError
 
         import opencrab.pack.ownership as registry_mod
-
-        # sql's engine uses SQLAlchemy's SingletonThreadPool for
-        # sqlite:///:memory: (one physical connection per thread, reused
-        # across every .connect()/.begin() call) -- setting the pragma once
-        # here persists for every later connection this test's thread makes,
-        # unlike a real multi-connection SQLite pool where it would need to
-        # be set per-connection (e.g. via a "connect" event).
-        with sql._engine.connect() as conn:
-            conn.execute(text("PRAGMA foreign_keys=ON"))
-            conn.commit()
 
         calls: list[str] = []
         real_insert = registry_mod._insert_pack
@@ -464,6 +470,8 @@ class TestPackCreateCollision:
         pack exists."""
         from opencrab.mcp.tools import pack_create
 
+        ensure_test_user(sql, "alice")
+        ensure_test_user(sql, "bob")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(sql)
             with principal_scope(Principal(user_id="alice", is_local=True, disabled=False)):
@@ -489,6 +497,7 @@ class TestPackPublish:
     def test_owner_can_publish(self, sql):
         from opencrab.mcp.tools import dispatch_tool
 
+        ensure_test_user(sql, "alice")
         create_pack(sql, "alice", "alice-pack")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(sql)
@@ -502,6 +511,7 @@ class TestPackPublish:
     def test_non_owner_publish_rejected(self, sql):
         from opencrab.mcp.tools import dispatch_tool
 
+        ensure_test_user(sql, "alice")
         create_pack(sql, "alice", "alice-pack")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(sql)
@@ -527,6 +537,7 @@ class TestPackPublish:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.mcp.tools._registry import _REGISTRY
 
+        ensure_test_user(sql, "alice")
         create_pack(sql, "alice", "alice-pack")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(sql)
@@ -566,6 +577,7 @@ class TestPackPublish:
     def test_invalid_visibility_rejected(self, sql):
         from opencrab.mcp.tools import dispatch_tool
 
+        ensure_test_user(sql, "alice")
         create_pack(sql, "alice", "alice-pack")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(sql)

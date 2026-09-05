@@ -369,6 +369,9 @@ class TestDefaultPackOwnerMismatch:
         _seed_graph(env)
         _seed_doc(env)
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
 
         before_packs = _packs_snapshot(sql)
@@ -393,6 +396,9 @@ class TestDefaultPackOwnerMismatch:
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
 
         assert migrate.main([]) == 1
@@ -406,6 +412,9 @@ class TestDefaultPackOwnerMismatch:
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, migrate.DEFAULT_PACK_ID, "someone-else-owner", None, None, None)
 
         assert migrate.main(["--apply", "--skip-backup"]) == 1
@@ -461,7 +470,9 @@ class TestForeignOwnedPackOverlap:
         "legacy content silently reassigned to a squatter" scenario."""
         from opencrab.pack.ownership import _insert_pack
         from opencrab.stores.local_graph_store import LocalGraphStore
+        from tests._pack_fixtures import ensure_test_user
 
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, "foreign-pack", "someone-else-owner", None, None, None)
         store = LocalGraphStore(str(env / "graph.db"))
         try:
@@ -2188,6 +2199,9 @@ class TestDocDerivedPackIdRegistration:
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, "pack-foreign-doc", "someone-else-owner", None, None, None)
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
@@ -2238,6 +2252,9 @@ class TestDocDerivedPackIdRegistration:
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else-owner")
         assert _insert_pack(sql, "pack-foreign-doc-2", "someone-else-owner", None, None, None)
 
         docs = LocalSQLDocStore(str(env / "doc_store.db"))
@@ -2444,6 +2461,9 @@ class TestRoundFiveReviewConformance:
         finally:
             graph.close()
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone-else")
         create_pack(sql, "someone-else", "squatted", title="Not yours")
 
         rc = migrate.main([])

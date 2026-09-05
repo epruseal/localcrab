@@ -459,6 +459,9 @@ class TestLocalGraphStore:
         # current_principal() (assert_writable) -- a principal must be bound
         # and the target pack_id must exist in the packs registry first.
         principal = Principal(user_id="test-user", is_local=True, disabled=False)
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, principal.user_id)
         create_pack(sql, principal.user_id, "pack-1")
         with principal_scope(principal):
             builder.add_node(
@@ -518,6 +521,10 @@ class TestBuilderSubjectIdAudit:
         sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
         # Each principal below needs its own owned pack to write into
         # (add_node/add_edge authorize via assert_writable, #148).
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "actor-1")
+        ensure_test_user(sql, "actor-2")
         create_pack(sql, "actor-1", "pack-1")
         create_pack(sql, "actor-2", "pack-2")
         return OntologyBuilder(graph, doc, sql), doc

@@ -631,6 +631,9 @@ def test_pack_create_anchor_identity_conflict_compensates_registry(graph):
     before = graph.get_node("Dataset", "dataset:anchor-pack")
 
     sql = SQLStore("sqlite:///:memory:")
+    from tests._pack_fixtures import ensure_test_user
+
+    ensure_test_user(sql, "test-user")
     ctx = _ctx(graph, sql=sql)
     with patch("opencrab.mcp.tools._get_context", return_value=ctx):
         result = pack_create(title="Anchor Pack", pack_id="anchor-pack")

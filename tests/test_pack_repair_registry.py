@@ -921,6 +921,9 @@ class TestCLIRepairRegistry:
         from opencrab.stores.factory import make_sql_store
 
         sql = make_sql_store(get_settings())
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "someone")
         pid = begin_pack_creation(sql, "someone", "cli-untouched")
 
         result = runner.invoke(main, ["packs", "repair-registry", "--older-than", "0"])

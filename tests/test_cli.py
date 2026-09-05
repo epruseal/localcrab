@@ -1038,9 +1038,11 @@ class TestPacksCommandsAreScoped:
         from opencrab.config import get_settings
         from opencrab.pack.ownership import create_pack
         from opencrab.stores.factory import make_sql_store
+        from tests._pack_fixtures import ensure_test_user
 
         sql = make_sql_store(get_settings())
         create_pack(sql, bootstrapped, "mine", title="mine")
+        ensure_test_user(sql, "user_someone_else")
         create_pack(sql, "user_someone_else", "theirs", title="theirs")
         self._manifest(cli_env, "mine")
         self._manifest(cli_env, "theirs")

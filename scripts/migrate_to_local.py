@@ -778,6 +778,12 @@ def migrate_sql(
     sq_engine = create_engine(
         f"sqlite:///{sqlite_path}", hide_parameters=True, connect_args={"timeout": 5.0}
     )
+    # #181: 이 엔진은 SQLStore._connect() 를 거치지 않는 별도 SQLite 엔진이라
+    # (#151 7-4 가 SQLStore._engine 에 대한 외부 의존을 끊은 결과) 그 커넥션
+    # 이벤트를 공유하지 않는다 -- 여기서도 명시적으로 걸어야 packs.owner_id
+    # FK 가 이 쓰기 경로에서도 강제된다.
+    from opencrab.stores.sql_store import enable_sqlite_fk
+    enable_sqlite_fk(sq_engine)
 
     # 복사 전에 검사한다. 다 쓴 뒤에 중단하면 종료 코드만 바뀌고 타깃은 이미 오염된다.
     check_reverse_preflight(

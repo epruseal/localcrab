@@ -96,8 +96,10 @@ def _writable_ctx(pack_id, owner="test-user", **overrides):
     ``packs`` table now, not a mocked ``content_pack_list()``."""
     from opencrab.pack.ownership import create_pack as _register_pack
     from opencrab.stores.sql_store import SQLStore
+    from tests._pack_fixtures import ensure_test_user
 
     sql = SQLStore("sqlite:///:memory:")
+    ensure_test_user(sql, owner)
     _register_pack(sql, owner, pack_id)
     overrides.setdefault("sql", sql)
     return _base_ctx(**overrides)
@@ -818,6 +820,8 @@ class TestPackCreate:
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -856,6 +860,8 @@ class TestPackCreate:
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "actor-1")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -883,6 +889,8 @@ class TestPackCreate:
         builder = MagicMock()
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -906,6 +914,9 @@ class TestPackCreate:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
+        ensure_test_user(sql, "someone-else")
         _register_pack(sql, "someone-else", "existing-pack", title="Existing")
 
         builder = MagicMock()
@@ -935,6 +946,8 @@ class TestPackCreate:
         builder = MagicMock()
         builder.add_node.side_effect = RuntimeError("graph down")
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -961,6 +974,8 @@ class TestPackCreate:
             "stores": {"graph": "error: disk I/O", "docs": "ok", "sql": "ok"}
         }
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -986,6 +1001,8 @@ class TestPackCreate:
             "stores": {"graph": "unavailable", "docs": "ok", "sql": "ok"}
         }
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1015,6 +1032,8 @@ class TestPackCreate:
             "stores": {"graph": "ok", "docs": "error: mongo down", "sql": "ok"}
         }
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1036,6 +1055,8 @@ class TestPackCreate:
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         hybrid = MagicMock()
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1072,6 +1093,8 @@ class TestPackCreate:
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "u1")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1095,6 +1118,8 @@ class TestPackCreate:
         builder.add_node.return_value = {"stores": {"graph": "ok"}}
         billing = MagicMock()
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1128,6 +1153,8 @@ class TestPackCreate:
         builder = MagicMock()
         billing = MagicMock()
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1195,8 +1222,14 @@ class TestPackCreatePostWriterFailureDemotion:
 
     def _sql(self):
         from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
 
-        return SQLStore("sqlite:///:memory:")
+        sql = SQLStore("sqlite:///:memory:")
+        # #181: FK enforcement now requires a real users row for whatever
+        # principal pack_create ends up creating a pack for -- the module's
+        # bind_test_principal fixture binds "test-user" by default.
+        ensure_test_user(sql, "test-user")
+        return sql
 
     def test_a1_anchor_exception_demotes_registry_row_to_partial(self):
         from opencrab.pack.ownership import PACK_STATUS_PARTIAL, get_pack
@@ -1326,10 +1359,13 @@ class TestPackCreatePostWriterFailureDemotion:
 
         from opencrab.auth import Principal, principal_scope
         from opencrab.pack.ownership import PACK_STATUS_PARTIAL, PACK_STATUS_READY, get_pack
+        from tests._pack_fixtures import ensure_test_user
 
         # Order 1: Alice succeeds first, then Bob's attempt (suffixed slug,
         # since "shared-pack" is already taken) fails & demotes.
         sql = self._sql()
+        ensure_test_user(sql, "alice")
+        ensure_test_user(sql, "bob")
         good_builder = MagicMock()
         good_builder.add_node.return_value = {"stores": {"graph": "ok"}}
         with (
@@ -1373,6 +1409,8 @@ class TestPackCreatePostWriterFailureDemotion:
         # prior collision, holds "shared-pack" itself -- demoted to
         # 'partial' but NOT deleted, so it keeps occupying the slug.
         sql2 = self._sql()
+        ensure_test_user(sql2, "alice")
+        ensure_test_user(sql2, "bob")
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1630,13 +1668,17 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"sql": "ok"}}
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             # #148: harness_promotion_apply now resolves/authorizes a
             # pack_id (assert_writable) before writing -- needs a real
             # SQLStore so resolve_write_pack's ensure_default_pack call
             # actually creates and owns a pack for the bound principal
             # instead of hitting a MagicMock's opaque comparisons.
-            mock_ctx.return_value = _base_ctx(builder=builder, sql=SQLStore("sqlite:///:memory:"))
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             result = harness_promotion_apply(package, dry_run=False)
         assert result["package_id"] == "pkg-1"
         assert result["dry_run"] is False
@@ -1662,10 +1704,12 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "u1")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(
-                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
-            )
+            mock_ctx.return_value = _base_ctx(builder=builder, billing=billing, sql=sql)
             with principal_scope(Principal(user_id="u1", is_local=True, disabled=False)):
                 harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         billing.on_harness_apply.assert_called_once_with("default", "u1", "pkg-1", 1)
@@ -1698,6 +1742,8 @@ class TestHarnessPromotionApply:
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "actor-1")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             actor = Principal(user_id="actor-1", is_local=True, disabled=False)
@@ -1729,6 +1775,8 @@ class TestHarnessPromotionApply:
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             harness_promotion_apply(package, dry_run=False)
@@ -1746,9 +1794,13 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"sql": "ok"}}
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(
-                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+                builder=builder, billing=billing, sql=sql
             )
             result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
@@ -1766,9 +1818,13 @@ class TestHarnessPromotionApply:
         billing = MagicMock()
         builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
         billing.on_harness_apply.return_value = {"ok": False, "error": "database is locked"}
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(
-                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+                builder=builder, billing=billing, sql=sql
             )
             with caplog.at_level(logging.WARNING):
                 result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
@@ -1796,9 +1852,13 @@ class TestHarnessPromotionApply:
         builder.add_node.return_value = {
             "receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "error: disk down"}
         }
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(
-                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+                builder=builder, billing=billing, sql=sql
             )
             result = harness_promotion_apply(_VALID_PACKAGE, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
@@ -1820,9 +1880,13 @@ class TestHarnessPromotionApply:
             {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}},
             {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "error: disk down"}},
         ]
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(
-                builder=builder, billing=billing, sql=SQLStore("sqlite:///:memory:")
+                builder=builder, billing=billing, sql=sql
             )
             result = harness_promotion_apply(package, dry_run=False)
         assert len(result["node_receipts"]) == 2
@@ -1841,8 +1905,12 @@ class TestHarnessPromotionApply:
         builder = MagicMock()
         builder.add_node.side_effect = RuntimeError("node write failed")
         builder.add_edge.side_effect = RuntimeError("edge write failed")
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(builder=builder, sql=SQLStore("sqlite:///:memory:"))
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             result = harness_promotion_apply(package, dry_run=False)
         assert result["node_receipts"] == []
         assert result["edge_receipts"] == []
@@ -1903,10 +1971,13 @@ class TestHarnessPromotionApply:
 
     def test_edge_empty_package_apply(self):
         from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
 
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         empty = {"package_id": "pkg-e", "mission_id": "mis-e", "run_id": "run-e"}
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
-            mock_ctx.return_value = _base_ctx(sql=SQLStore("sqlite:///:memory:"))
+            mock_ctx.return_value = _base_ctx(sql=sql)
             result = harness_promotion_apply(empty, dry_run=False)
         assert result["node_receipts"] == []
         assert result["edge_receipts"] == []

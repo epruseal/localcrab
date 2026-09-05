@@ -86,6 +86,12 @@ class TestEmptyArgumentsDispatch:
 class TestErrorEnvelopeContract:
     def _ctx_with_builder_raising(self, exc: Exception) -> dict:
         from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        def _sql_with_test_user():
+            store = SQLStore("sqlite:///:memory:")
+            ensure_test_user(store, "test-user")
+            return store
 
         builder = MagicMock()
         builder.add_node.side_effect = exc
@@ -100,7 +106,9 @@ class TestErrorEnvelopeContract:
             # #148: the handler resolves a pack_id (resolve_write_pack) from
             # ctx["sql"] before ever calling the (mocked) builder -- needs a
             # real SQLStore, not a MagicMock, so ensure_default_pack succeeds.
-            "sql": SQLStore("sqlite:///:memory:"),
+            # #181: FK enforcement now requires the default-pack owner
+            # ("test-user", bound by bind_test_principal) to exist first.
+            "sql": _sql_with_test_user(),
         }
 
     def test_add_node_generic_exception_caught_internally(self):
@@ -184,6 +192,9 @@ class TestOntologyGetNodeLocalBackend:
         # unreachable. "pack-a" owned by test-user keeps the fixture data
         # below readable under the new scoped lookup.
         store = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(store, "test-user")
         create_pack(store, "test-user", "pack-a")
         return store
 
@@ -245,6 +256,9 @@ class TestOntologyListNodesLocalBackend:
         # bound principal in either case, or it is structurally unreadable
         # regardless of what the test seeded.
         store = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(store, "test-user")
         create_pack(store, "test-user", "pack-a")
         return store
 
@@ -391,6 +405,9 @@ class TestOntologyListEdgesLocalBackend:
         # ontology_list_nodes does; "pack-a" owned by test-user keeps this
         # class's fixture data visible under export_edges_scoped.
         store = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(store, "test-user")
         create_pack(store, "test-user", "pack-a")
         return store
 
@@ -480,6 +497,9 @@ class TestOntologyListEdgesNeo4jWideShapeContract:
         ]
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "test-user")
         create_pack(sql, "test-user", "pack-a")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = {"neo4j": graph, "sql": sql}

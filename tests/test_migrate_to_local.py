@@ -664,3 +664,67 @@ class TestMigrateSQL:
         node2 = result2["tables"]["ontology_nodes"]
         assert node2["copied"] == node2["source"]
         assert node2["target"] == node1["target"]
+
+    def test_migrate_sql_orphan_owner_pack_row_is_skipped_not_silently_copied(
+        self, tmp_path: Path
+    ) -> None:
+        """#181: migrate_sql 의 ``sq_engine`` 도 ``enable_sqlite_fk`` 를 거쳐야
+        한다 -- SQLStore._connect() 를 거치지 않는 별도 엔진이기 때문이다
+        (design.md §2). 소스(PostgreSQL 역할의 SQLite in-memory 엔진)에
+        ``users`` 테이블 없이 존재하지 않는 owner_id 를 가리키는 ``packs`` 행
+        하나만 두면, FK 가 강제되는 타깃에서 그 INSERT 는 IntegrityError 로
+        거부되어야 한다. migrate_sql 의 행 단위 쓰기 루프(scripts/migrate_to_local.py
+        의 ``failed_rows`` 카운터)는 이미 모든 예외를 잡아 계속 진행하도록
+        설계돼 있으므로(설계 6절 -- IntegrityError 재전파가 아니라 스킵+카운트가
+        이 경로의 올바른 기대 동작), 이 행은 조용히 성공하지도, 전체 마이그레이션을
+        중단시키지도 않고 ``failed_rows`` 하나로 집계돼야 한다.
+        """
+        import logging
+
+        import sqlalchemy
+        from sqlalchemy import create_engine, text
+
+        src_engine = create_engine("sqlite:///:memory:")
+        with src_engine.begin() as conn:
+            # 의도적으로 users 테이블은 만들지 않는다 -- owner_id 'nobody' 는
+            # 타깃 SQLite 의 users 에도 결코 존재할 수 없다.
+            conn.execute(text("""
+                CREATE TABLE packs (
+                    pack_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    visibility TEXT,
+                    title TEXT,
+                    description TEXT,
+                    forked_from TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """))
+            conn.execute(text(
+                "INSERT INTO packs(pack_id, owner_id, visibility) "
+                "VALUES('orphan-pack', 'nobody', 'private')"
+            ))
+        dst_path = str(tmp_path / "orphan_owner.db")
+
+        real_create_engine = sqlalchemy.create_engine
+
+        def _patched_create_engine(url, **kw):
+            if "postgresql" in str(url):
+                return src_engine
+            return real_create_engine(url, **kw)
+
+        with patch("sqlalchemy.create_engine", side_effect=_patched_create_engine):
+            result = mig.migrate_sql("postgresql://x/x", dst_path, logging.getLogger())
+
+        node = result["tables"]["packs"]
+        # 조용히 성공(copied>=1)하지도, 마이그레이션 전체가 죽지도 않았다 --
+        # 행 단위로 스킵되고 실패로 집계됐다.
+        assert node["copied"] == 0
+        assert node["failed_rows"] == 1
+
+        # 타깃에도 실제로 그 행이 없다 -- "카운트만 실패고 실제로는 들어갔다"
+        # 류의 불일치가 아니다.
+        eng = create_engine(f"sqlite:///{dst_path}")
+        with eng.connect() as conn:
+            row = conn.execute(text("SELECT COUNT(*) FROM packs")).fetchone()
+        assert row[0] == 0
