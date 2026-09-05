@@ -306,13 +306,19 @@ def install_pack(name: str) -> dict[str, Any]:
 
     A CURRENT-shape file (already has ``properties``) carrying this tool's
     generation header is also inspected, not skipped outright (#107, PR #336
-    review): if any manifest-required field is on disk as ``required:
-    false`` -- exactly what a schema generated before the #107 fix looks
-    like -- that field alone is flipped back to ``true`` and reported in
-    ``revived_manifest_fields``, same as a migrated legacy stub. Anything
-    else about the file (other fields, their values) is left untouched. A
-    current-shape file without the header, or with no such stale field, is
-    left alone and counted as ``skipped``, same as before.
+    review): if a field the CURRENT manifest lists in *both* ``required``
+    and ``optional`` is on disk as ``required: false`` -- exactly what a
+    schema generated before the #107 fix looks like -- that field alone is
+    flipped back to ``true`` and reported in ``revived_manifest_fields``,
+    same as a migrated legacy stub. The repair is deliberately limited to
+    that required/optional-overlap fingerprint: a manifest-required field
+    that was never also optional could not have been produced by the
+    overlap bug, so leaving it ``required: false`` is instead a deliberate
+    operator edit, not a stale bug, and is not touched. Anything else about
+    the file (other fields, their values) is left untouched too. A
+    current-shape file without the header, with a non-mapping body or
+    ``properties``, or with no such stale field, is left alone and counted
+    as ``skipped``, same as before.
 
     Returns a result dict with created/migrated/skipped counts.
     """
@@ -363,29 +369,47 @@ def install_pack(name: str) -> dict[str, Any]:
                 skipped.append(node_type)
                 continue
             if not _is_legacy_shape(existing):
-                if not _has_generation_marker(existing_content, name):
+                if not isinstance(existing, dict) or not _has_generation_marker(existing_content, name):
                     # Same safety bar as the legacy-shape path below: don't
-                    # touch a file we can't prove we generated.
+                    # touch a file we can't prove we generated. A generation
+                    # header on non-mapping YAML (hand-edited or corrupted
+                    # after install) fails `_is_legacy_shape` too (#107
+                    # review round 2: it must not crash trying to `.get()`
+                    # off a list/scalar), so it lands here as an ordinary
+                    # skip rather than an AttributeError.
+                    skipped.append(node_type)
+                    continue
+                existing_properties = existing.get("properties")
+                if not isinstance(existing_properties, dict):
                     skipped.append(node_type)
                     continue
                 manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
                 manifest_required = manifest_spec.get("required") or ["name"]
-                existing_properties = existing.get("properties") or {}
+                manifest_optional = manifest_spec.get("optional") or ["description", "status"]
+                # #107 (PR #336 review round 2): only a field the CURRENT
+                # manifest lists in both `required` and `optional` can be
+                # the overlap bug's stale output -- a manifest-required
+                # field that was never also optional could not have been
+                # written `required: false` by that bug, so restoring it
+                # would instead reverse a deliberate operator edit
+                # (current-shape files were never touched before this
+                # branch existed). Repair is limited to that fingerprint.
+                overlap = set(manifest_required) & set(manifest_optional)
                 # #107 (PR #336 review): a schema generated before this fix
-                # can already have a manifest-required field written to disk
+                # can already have such an overlapping field written to disk
                 # as `required: false` -- exactly the bug this issue closes.
                 # Without this branch, a bare reinstall never reaches the
                 # fixed _build_type_schema for an already current-shape
                 # file, so that stale False would persist forever. Only a
-                # field the manifest itself requires, and that is provably
-                # this tool's own dict-shaped property, gets flipped --
-                # anything else (a field missing entirely, or one the user
-                # customised) is left alone, same as extra_required/
-                # extra_optional below.
+                # field that is provably this tool's own dict-shaped
+                # property gets flipped -- anything else (a field missing
+                # entirely, or one the user customised) is left alone, same
+                # as extra_required/extra_optional below.
                 stale_required = [
                     f
                     for f in manifest_required
-                    if isinstance(existing_properties.get(f), dict)
+                    if f in overlap
+                    and isinstance(existing_properties.get(f), dict)
                     and existing_properties[f].get("required") is False
                 ]
                 if not stale_required:
