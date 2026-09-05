@@ -655,10 +655,11 @@ graph/doc 쪽을 그대로 두면 다음 적재에서 임포트한 벡터가 전
   초 단위다. `upsert_texts` 가 세운 기존 패턴의 연장이고 정확성 문제는 아니지만, fork 를 서빙
   중에 돌리면 검색 지연으로 보인다.
 - **metadata 값은 그대로 보존되지 않는다.** `_sanitize_metadata` 가 비스칼라를 `str()` 로
-  바꾸고, NaN/Inf 값은 키째 사라지며, 매우 큰 int 는 float 로 강등된다. 전부 `add_texts` 의
-  기존 관례와 같고 export→import 경로에서는 도달하지 않는다(export 값은 이미 chroma 가 저장한
-  것이다). 반면 `pgvector` 는 중첩 metadata 를 jsonb 로 그대로 보존하므로, 계약은 **metadata
-  값 타입을 좁히지 않는다**(좁히면 그런 pg 팩의 fork 가 막힌다).
+  바꾸고, 매우 큰 int 는 float 로 강등된다. NaN/Inf 값은 더 이상 조용히 사라지지 않고
+  `ValueError` 로 즉시 거부한다(localcrab#82 — 이전에는 키째 사라져 손실이 안 보였다). 나머지는
+  전부 `add_texts` 의 기존 관례와 같고 export→import 경로에서는 도달하지 않는다(export 값은
+  이미 chroma 가 저장한 것이다). 반면 `pgvector` 는 중첩 metadata 를 jsonb 로 그대로
+  보존하므로, 계약은 **metadata 값 타입을 좁히지 않는다**(좁히면 그런 pg 팩의 fork 가 막힌다).
 
 ### 8.5 검증 실행
 
