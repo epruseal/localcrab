@@ -782,6 +782,12 @@ class TestToolDispatch:
             assert result["found"] is True
             assert result["node_id"] == "dataset:test"
             assert "node" in result
+            # #55: "properties" is a new field alongside the pre-existing
+            # "node" key (added, not a replacement -- "node" stays for
+            # backward compat), and both point at the SAME object.
+            assert result["properties"] is result["node"]
+            assert result["node_type"] == "Dataset"
+            assert result["space"] == "resource"
 
     def test_ontology_get_node_not_found(self):
         """ontology_get_node returns found=False when node does not exist."""

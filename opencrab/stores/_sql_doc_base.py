@@ -307,10 +307,15 @@ class _SqlDocStoreBase(abc.ABC):
         self, pack_ids: list[str], space: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Authorization-scoped counterpart to ``list_nodes`` (issue #147
-        §3.5) -- ``ontology_list_nodes``'s pack-UNSPECIFIED branch (the only
-        production caller this exists for, see §3.5's 7-caller table for
-        why ``list_nodes`` itself stays untouched: its other 6 callers are
-        BM25/index-build paths, not user-response paths).
+        §3.5) -- built for ``ontology_list_nodes``'s pack-UNSPECIFIED branch
+        (see §3.5's 7-caller table for why ``list_nodes`` itself stays
+        untouched: its other 6 callers are BM25/index-build paths, not
+        user-response paths). Issue #55 switched that branch to the graph
+        store instead (so the two node-lookup MCP tools stop disagreeing on
+        which store answers), which leaves this method with no in-repo
+        caller -- kept as part of this store's own scoped-read API, not
+        removed, since #55's scope is the MCP tool layer, not this store's
+        surface.
 
         Same ``ORDER BY updated_at DESC, space, node_id`` tie-breaker as
         ``list_nodes`` (issue #63 -- unordered ``LIMIT`` has no

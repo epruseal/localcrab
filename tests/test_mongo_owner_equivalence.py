@@ -1,8 +1,13 @@
 """Cross-backend equivalence for the pack-ownership predicates (issue #222).
 
 WHY THIS FILE EXISTS. `MongoStore.list_nodes_scoped` and
-`list_sources_scoped` decide which rows belong to a pack: the first is
-`ontology_list_nodes`' read scope, the second is `pack_fork`'s copy range.
+`list_sources_scoped` decide which rows belong to a pack: the second is
+`pack_fork`'s copy range. `list_nodes_scoped` served `ontology_list_nodes`'
+pack_id-omitted read scope before issue #55 switched that tool to the graph
+store exclusively; this file still pins `list_nodes_scoped`'s own
+authorization-scoped read contract, now exercised only directly (no
+production caller left, see that method's own docstring), not through the
+MCP tool.
 Their SQL twins (`_SqlDocStoreBase`, `_doc_owner_pred_scoped`) decide the
 same thing. Before this file the only mongo coverage asserted the SHAPE of
 the query document, so a backend could answer "this row is yours" where SQL
@@ -499,11 +504,15 @@ class TestKnownContractGap:
     THIS IS THE INTENDED STATE, NOT A LATENT BUG (issue #222 shipped it
     deliberately; issue #226 owns the resolution). Deciding the canon for
     non-string ``pack_id`` -- and enforcing it at write time, without which
-    the shape simply comes back -- is #226's scope, and unifying the SQL side
-    would SHRINK what ``ontology_list_nodes`` returns on the primary backend,
-    which needs its own regression argument. Until then these assertions are
-    the baseline: whatever #226 changes shows up here as a diff instead of a
-    silent behaviour shift.
+    the shape simply comes back -- is #226's scope. The "unifying the SQL
+    side would shrink what a caller sees" concern this paragraph used to
+    raise about ``ontology_list_nodes`` no longer applies: issue #55 moved
+    that tool off ``list_nodes_scoped`` entirely (no in-repo caller left,
+    see this file's module docstring and the method's own docstring), so
+    these assertions now pin ``list_nodes_scoped``'s own contract for its
+    own sake, not because an MCP tool's response depends on it. Until #226
+    lands, these assertions are the baseline: whatever it changes shows up
+    here as a diff instead of a silent behaviour shift.
     """
 
     NON_STRING_SHAPES = [

@@ -77,16 +77,23 @@ def _scalar_string_in(values: list[str]) -> dict[str, Any]:
     states, and the one ``scripts/migrate_pack_ownership.py``'s
     ``_classify_pack_id`` enforces by classifying such values ``malformed``.
 
-    CONSEQUENCE, ACCEPTED: ``ontology_list_nodes`` can answer differently on
-    a mongo deployment than on a SQL one, for a node whose ``pack_id`` is
-    stored as a non-string. The direction is UNDER-inclusion -- mongo sees
-    less, never more -- so it is fail-closed and cannot move data across a
-    pack boundary, which is the invariant #222 exists to protect. Issue #226
-    decides the canon (string-only everywhere, or promote non-strings) and
-    adds the write-time enforcement that would stop such values being stored
-    at all. ``tests/test_mongo_owner_equivalence.py``'s
+    CONSEQUENCE, ACCEPTED: ``list_nodes_scoped`` itself can answer
+    differently on a mongo deployment than on a SQL one, for a node whose
+    ``pack_id`` is stored as a non-string. The direction is UNDER-inclusion
+    -- mongo sees less, never more -- so it is fail-closed and cannot move
+    data across a pack boundary, which is the invariant #222 exists to
+    protect. Issue #226 decides the canon (string-only everywhere, or
+    promote non-strings) and adds the write-time enforcement that would
+    stop such values being stored at all. ``tests/test_mongo_owner_equivalence.py``'s
     ``TestKnownContractGap`` pins the current difference class by class so
     #226 can see in a diff exactly what it changes.
+
+    (Issue #55: ``ontology_list_nodes`` used to be the one caller of this
+    method -- via its pack-unspecified branch -- so this consequence used
+    to be user-visible through that tool. #55 switched that branch to the
+    graph store, so ``list_nodes_scoped`` has no in-repo caller left; the
+    contract documented here is now this method's own, not something an
+    MCP tool currently exercises.)
     """
     return {"$in": list(values), "$type": "string", "$not": _array()}
 
@@ -287,9 +294,11 @@ class MongoStore:
         matched a row whose ``properties.pack_id`` was an ARRAY containing a
         scoped id, and a row whose whole ``properties`` was an array of
         embedded documents -- SQL excludes both, so the same data landed in
-        different scopes depending on the backend. This is a READ scope
-        (``ontology_list_nodes``'s pack-unspecified branch), so the leak was
-        cross-pack visibility, not only a fork range issue. See
+        different scopes depending on the backend. This was a READ scope
+        used by ``ontology_list_nodes``'s pack-unspecified branch before
+        issue #55 (that branch now reads the graph store instead, see this
+        method's own docstring), so the leak this closed was cross-pack
+        visibility through that tool, not only a fork range issue. See
         ``_scalar_string_in``/``_non_array`` for the shared exclusion and for
         the documented contract on non-string pack_ids.
 

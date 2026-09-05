@@ -196,6 +196,14 @@ class TestOntologyGetNodeLocalBackend:
         assert result["node_id"] == "u1"
         assert result["node"]["node_type"] == "User"
         assert result["node"]["name"] == "Ada"
+        # #55: "properties" is the same object as "node" (backward-compat
+        # addition, not a replacement) -- both keys must agree on every
+        # field, and ontology_get_node's own node_type/space top-level
+        # fields must mirror what ontology_list_nodes exposes for the same
+        # node so the two tools stop disagreeing on shape.
+        assert result["properties"] is result["node"]
+        assert result["node_type"] == "User"
+        assert result["space"] == ""
 
     def test_nonexistent_id_returns_found_false_not_error(self, graph, sql):
         """Symmetric contract for the singular getter: a missing node is a
@@ -230,12 +238,12 @@ class TestOntologyListNodesLocalBackend:
     @pytest.fixture
     def sql(self):
         # #147: ontology_list_nodes derives its read scope from ctx["sql"] +
-        # current_principal() ("test-user", via bind_test_principal). Both
-        # the pack_id-given branch (export_nodes_scoped/count_exported_nodes_scoped)
-        # and the pack_id-omitted branch (mongo.list_nodes_scoped) now
-        # require the fixture data's pack_id to be owned by (or public to)
-        # the bound principal, or it is structurally unreadable regardless
-        # of what the test seeded.
+        # current_principal() ("test-user", via bind_test_principal). As of
+        # #55 both the pack_id-given and pack_id-omitted branches read the
+        # graph store (export_nodes_scoped/count_exported_nodes_scoped), so
+        # the fixture data's pack_id must be owned by (or public to) the
+        # bound principal in either case, or it is structurally unreadable
+        # regardless of what the test seeded.
         store = SQLStore("sqlite:///:memory:")
         create_pack(store, "test-user", "pack-a")
         return store
@@ -250,20 +258,69 @@ class TestOntologyListNodesLocalBackend:
         assert result["nodes"][0]["node_id"] == "lev-1"
         assert result["pack_id_filter"] == "pack-a"
 
-    def test_no_pack_id_falls_back_to_doc_store(self, graph, docs, sql):
-        # #147: no pack_id argument means "everything test-user can read",
-        # not "everything in the store" -- list_nodes_scoped excludes rows
-        # with no pack_id (#143 invariant 5), so both docs need one, owned
-        # by the bound principal, to still be visible under the new scoped
-        # lookup. This still exercises what the test's name asserts (the
-        # doc store, not the graph store, answers the no-pack_id case).
-        docs.upsert_node_doc("subject", "User", "u1", {"name": "Ada", "pack_id": "pack-a"})
-        docs.upsert_node_doc("subject", "User", "u2", {"name": "Bob", "pack_id": "pack-a"})
+    def test_no_pack_id_reads_graph_store(self, graph, docs, sql):
+        # #55: before this fix, omitting pack_id switched ontology_list_nodes
+        # to a SEPARATE doc-store read path (mongo.list_nodes_scoped) --
+        # disagreeing with ontology_get_node, which always reads the graph
+        # store, on whether a graph-only node exists at all. Now both the
+        # pack_id-given and pack_id-omitted branches read the same graph
+        # store, so a doc-store-only row (seeded below but never asserted
+        # visible) is correctly invisible here, and a graph-store row is.
+        graph.upsert_node("User", "u1", {"name": "Ada", "pack_id": "pack-a"})
+        graph.upsert_node("User", "u2", {"name": "Bob", "pack_id": "pack-a"})
+        docs.upsert_node_doc("subject", "User", "doc-only", {"name": "Carol", "pack_id": "pack-a"})
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = {"neo4j": graph, "mongo": docs, "sql": sql}
             result = ontology_list_nodes()
         assert result["total"] == 2
         assert result["pack_id_filter"] is None
+        assert {n["node_id"] for n in result["nodes"]} == {"u1", "u2"}
+
+    def test_get_node_and_list_nodes_agree_on_graph_only_node(self, graph, docs, sql):
+        # #55 main reproduction: a node that exists ONLY in the graph store
+        # (never written to the doc store) must be visible through BOTH
+        # ontology_get_node (always read the graph store) and
+        # ontology_list_nodes with no pack_id (before #55: read the doc
+        # store instead, so this node was invisible there -- "found" via one
+        # tool, absent via the other, for the identical node_id).
+        graph.upsert_node("User", "graph-only", {"name": "Dana", "pack_id": "pack-a"})
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs, "sql": sql}
+            listed = ontology_list_nodes()
+            got = ontology_get_node("graph-only")
+        assert got["found"] is True
+        assert any(n["node_id"] == "graph-only" for n in listed["nodes"])
+
+    def test_get_node_and_list_nodes_shapes_agree(self, graph, docs, sql):
+        # #55: both tools now expose the same node_id/node_type/space/
+        # properties fields for the same node, whether reached via
+        # ontology_get_node or ontology_list_nodes's pack_id-omitted branch.
+        # A non-empty space_id (not just the "" default) so this actually
+        # exercises _merge_space's fold-in on both read paths, rather than
+        # two empty strings trivially agreeing.
+        graph.upsert_node("User", "shape-1", {"name": "Eve", "pack_id": "pack-a"}, space_id="resource")
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs, "sql": sql}
+            listed = ontology_list_nodes()
+            got = ontology_get_node("shape-1")
+        entry = next(n for n in listed["nodes"] if n["node_id"] == "shape-1")
+        assert entry["node_type"] == got["node_type"] == "User"
+        assert entry["space"] == got["space"] == "resource"
+        assert entry["properties"]["name"] == got["properties"]["name"] == "Eve"
+
+    def test_no_pack_id_passes_full_scope_to_graph_store(self, graph, docs, sql):
+        # #55 acceptance criterion: the pack_id-omitted branch must pass the
+        # caller's FULL readable scope to the graph store, not just an
+        # arbitrary single pack -- mirroring what narrow(scope, None) already
+        # computed before this fix (the scope-omitted case is identical
+        # regardless of which store answers it, #147).
+        create_pack(sql, "test-user", "pack-b")
+        graph.upsert_node("User", "a1", {"pack_id": "pack-a"})
+        graph.upsert_node("User", "b1", {"pack_id": "pack-b"})
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs, "sql": sql}
+            result = ontology_list_nodes()
+        assert {n["node_id"] for n in result["nodes"]} == {"a1", "b1"}
 
     def test_empty_listing_returns_empty_not_error(self, graph, docs, sql):
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
