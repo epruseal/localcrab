@@ -176,7 +176,11 @@ SELECT COUNT(*) FROM graph_nodes
   이 DELETE 를 안 넓히면 그 엣지가 **매 증분마다 stale 로 뽑혀 0행을 지운다** —
   조용한 과다계상이 조용한 영구 무동작이 된다. 두 술어는 **짝**이다.
 
-`pack_id` 없이 폴백 키로만 태그된 행은 증분이 걷지 못한다. 그 축은 localcrab #164 가 다룬다.
+`pack_id` 없이 `source`/`source_id` 로만 태그된 `graph_nodes`/`graph_edges`/`doc_nodes`
+행은 회수에도 증분 대사에도 안 걸린다(`pack`-only 잔여는 128행 판정대로 무해, 이 사각지대와
+안 섞인다). `load.fallback_tag_without_pack_id_counts()` 가 그 존재를 전역(팩 비한정)으로
+탐지한다(localcrab #164) — 실제로 그런 행이 나오면 어떻게 닫을지(생산자 `pack_id` 필수화
+vs 주기적 sweep)는 localcrab #325 가 다룬다.
 
 ### 2. `pack_live_counts()` 는 `int | None` 을 돌려준다
 
