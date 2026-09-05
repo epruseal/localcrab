@@ -16,7 +16,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def write_lock_for_store(sql_store: Any) -> contextlib.AbstractContextManager[None]:
+def write_lock_for_store(
+    sql_store: Any, *, own_file: bool = False
+) -> contextlib.AbstractContextManager[None]:
     """``write_lock()`` scoped to *sql_store*'s on-disk SQLite file (issue #141).
 
     ``SQLStore._connect()`` and ``opencrab.execution._sql.ensure_tables()``
@@ -34,6 +36,17 @@ def write_lock_for_store(sql_store: Any) -> contextlib.AbstractContextManager[No
     ``sqlite+pysqlite://``, a query string, or a relative path correctly —
     not just the exact ``sqlite:///<dir>/opencrab.db`` shape
     ``Settings.sqlite_url`` happens to produce today.
+
+    ``own_file=True`` locks a name derived from *sql_store*'s own db
+    filename (e.g. ``billing.db.lock``) instead of the shared
+    ``write.lock`` (issue #141, codex PR review on #323). ``billing.db``
+    sits in the same ``local_data_dir`` as ``opencrab.db`` (see
+    ``make_billing_sql_store``), so a directory-scoped ``write.lock`` would
+    make ``BillingHooks``' schema bootstrap wait behind ordinary ontology
+    writes — precisely the whole-file-lock contention issue #105 split
+    ``billing.db`` out to avoid. A file-named lock still serialises two
+    processes racing the same billing.db CREATE TABLE, without coupling to
+    write.lock's holders.
     """
     if not getattr(sql_store, "_is_sqlite", False):
         return contextlib.nullcontext()
@@ -42,9 +55,14 @@ def write_lock_for_store(sql_store: Any) -> contextlib.AbstractContextManager[No
     db_path = make_url(sql_store._url).database
     if not db_path or db_path == ":memory:":
         return contextlib.nullcontext()
+    directory = os.path.dirname(os.path.abspath(db_path))
+    if own_file:
+        from opencrab.locking import file_lock
+
+        return file_lock(f"{os.path.basename(db_path)}.lock", directory)
     from opencrab.locking import write_lock
 
-    return write_lock(os.path.dirname(os.path.abspath(db_path)))
+    return write_lock(directory)
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy table declarations (metadata-only, not using ORM declarative)

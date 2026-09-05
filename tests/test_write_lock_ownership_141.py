@@ -96,6 +96,55 @@ def test_local_sql_doc_store_init_waits_for_write_lock(tmp_path: Path) -> None:
     assert not error, error
 
 
+def test_local_sql_doc_store_fts5_backfill_runs_inside_write_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """회귀(양쪽 최종검증, codex + fable verifier, 2026-09-05): 락 획득
+    실패를 잡으려던 리팩터가 FTS5 백필 ``_tx()`` 블록을 ``_bootstrap_lock()``
+    바깥으로 함께 빼내, 항목 2 가 막으려던 프로세스 간 TOCTOU 를 그 백필
+    경로에서만 되살렸다. ``n_fts == 0 and n_src > 0`` 인 백필이 실제로
+    실행되는 순간 이 스레드가 write.lock 을 쥐고 있는지를
+    ``opencrab.locking._held.locks`` 로 직접 관찰해 재발을 잡는다."""
+    import contextlib
+    import os
+    import sqlite3
+
+    import opencrab.locking as locking_mod
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    db_path = tmp_path / "doc_store.db"
+    seed = LocalSQLDocStore(str(db_path))
+    assert seed.available and seed.supports_keyword
+    seed.upsert_source("s1", "hello world", {})
+
+    # FTS 그림자 테이블만 비워 둔다(예: 과거 FTS5 미가용 빌드에서 넘어온
+    # doc_sources 잔존 행) -- 다음 생성 시 n_fts == 0 and n_src > 0 인 백필
+    # 분기를 강제로 태운다.
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM doc_sources_fts")
+    conn.commit()
+    conn.close()
+
+    observed: dict[str, bool] = {}
+    real_tx = LocalSQLDocStore._tx
+
+    @contextlib.contextmanager
+    def _tracking_tx(self, *a, **kw):
+        with real_tx(self, *a, **kw) as tx_conn:
+            data_dir = os.path.dirname(os.path.abspath(self._db_path))
+            lock_path = locking_mod._lock_path("write.lock", data_dir)
+            held = getattr(locking_mod._held, "locks", None)
+            observed["write_lock_held_during_fts5_backfill"] = bool(held and lock_path in held)
+            yield tx_conn
+
+    monkeypatch.setattr(LocalSQLDocStore, "_tx", _tracking_tx)
+    store = LocalSQLDocStore(str(db_path))
+    assert store.available
+    assert observed.get("write_lock_held_during_fts5_backfill") is True, (
+        "FTS5 백필이 write.lock 없이 돌았다 -- 항목 2 의 TOCTOU 보호가 되돌아갔다"
+    )
+
+
 def test_sqlite_vec_store_init_waits_for_write_lock(tmp_path: Path) -> None:
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
@@ -193,6 +242,87 @@ def test_ensure_tables_waits_for_write_lock(tmp_path: Path) -> None:
         t, done, error = _assert_blocks_then_completes(lambda: ensure_tables(store, ddl, ddl))
         holder.release.set()
         t.join(timeout=5)
+    assert done.is_set()
+    assert not error, error
+
+
+def test_ensure_tables_own_file_lock_does_not_wait_for_write_lock(tmp_path: Path) -> None:
+    """codex PR #323 리뷰(R3): billing.db 는 opencrab.db 와 같은 디렉터리에
+    있다. own_file_lock=True(BillingHooks 경로)는 디렉터리 공유 write.lock
+    이 아니라 자신의 db 파일에 스코프된 락을 써야 하므로, 그 디렉터리의
+    write.lock 이 이미 잡혀 있어도 즉시 끝나야 한다(#105 의 격리 보존)."""
+    from opencrab.execution._sql import ensure_tables
+    from opencrab.stores.sql_store import SQLStore
+
+    db_path = tmp_path / "billing.db"
+    store = SQLStore(url=f"sqlite:///{db_path}", create_tables=False)
+    assert store.available
+    ddl = ["CREATE TABLE IF NOT EXISTS _t141_billing_probe (id INTEGER PRIMARY KEY)"]
+    with _LockHolder(str(tmp_path)):
+        done = threading.Event()
+        error: list[BaseException] = []
+
+        def runner() -> None:
+            try:
+                ensure_tables(store, ddl, ddl, own_file_lock=True)
+            except BaseException as exc:  # noqa: BLE001
+                error.append(exc)
+            finally:
+                done.set()
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join(timeout=3)
+        assert done.is_set(), (
+            "own_file_lock=True 가 디렉터리 공유 write.lock 을 여전히 기다렸다"
+            " -- billing.db 격리가 되돌아갔다"
+        )
+    assert not error, error
+
+
+def test_ensure_tables_own_file_lock_serializes_same_file(tmp_path: Path) -> None:
+    """own_file_lock=True 가 write.lock 과 분리됐어도, 같은 db 파일을 놓고
+    경합하는 두 호출은 여전히 직렬화돼야 한다(항목 6 의 원래 경합 방지 의도
+    보존 -- 두 프로세스가 같은 billing.db 에 동시에 CREATE TABLE 하는 상황)."""
+    from opencrab.execution._sql import ensure_tables
+    from opencrab.locking import file_lock
+    from opencrab.stores.sql_store import SQLStore
+
+    db_path = tmp_path / "billing.db"
+    store = SQLStore(url=f"sqlite:///{db_path}", create_tables=False)
+    assert store.available
+    ddl = ["CREATE TABLE IF NOT EXISTS _t141_billing_probe (id INTEGER PRIMARY KEY)"]
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_own_file_lock() -> None:
+        with file_lock(f"{db_path.name}.lock", str(tmp_path)):
+            holding.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_own_file_lock, daemon=True)
+    holder.start()
+    assert holding.wait(timeout=5), "락 보유 스레드가 파일 스코프 락을 못 잡았다"
+
+    done = threading.Event()
+    error: list[BaseException] = []
+
+    def runner() -> None:
+        try:
+            ensure_tables(store, ddl, ddl, own_file_lock=True)
+        except BaseException as exc:  # noqa: BLE001
+            error.append(exc)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=0.3)
+    assert not done.is_set(), "같은 db 파일을 놓고 경합하는데도 대기하지 않고 끝났다"
+    release.set()
+    t.join(timeout=5)
+    holder.join(timeout=5)
     assert done.is_set()
     assert not error, error
 
