@@ -171,8 +171,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab user add\|list\|disable\|enable` | 사용자 관리 |
 | `opencrab token issue\|list\|revoke` | 사용자별 토큰 관리 (평문은 발급 시 1회만 출력) |
 | `opencrab status` | 모든 스토어 연결 상태 확인 |
-| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`) |
-| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`) |
+| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
+| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`). 파일 1건 이상 실패 시 종료 코드 3 |
 | `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--pack-id`, `--json-output`) |
 | `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
 | `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드)[^media] |
