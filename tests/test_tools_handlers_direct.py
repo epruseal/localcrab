@@ -275,6 +275,18 @@ class TestStoreWriteFailures:
             "graph: no match (missing node: a, b)"
         ]
 
+    def test_error_graph_unavailable_decorated_is_a_failure(self):
+        """#162 codex review: add_edge's endpoint-lookup-refused-write status
+        is decorated ("unavailable (endpoint type lookup failed: ...)" /
+        "unavailable (lookup_node_type not implemented)"), not the bare
+        "unavailable" this function used to require an exact match on --
+        a decorated form must count as a failure too, or a caller like
+        pack/load.py::load_edges silently counts the refused write as ok."""
+        status = "unavailable (endpoint type lookup failed: boom)"
+        assert store_write_failures({"graph": status, "docs": "ok"}) == [f"graph: {status}"]
+        status2 = "unavailable (lookup_node_type not implemented)"
+        assert store_write_failures({"graph": status2}) == [f"graph: {status2}"]
+
 
 class TestStoreWriteSucceeded:
     """#66 codex re-review (4th round), finding [2]: pins the exact success

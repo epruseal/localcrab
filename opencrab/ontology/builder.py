@@ -702,7 +702,14 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
     stores went through. That combination is rare in a real deployment
     (graph is always configured), but the contract of this function is
     "did the write actually happen", so an unavailable graph store must
-    count as a failure too.
+    count as a failure too. This matches both the bare ``"unavailable"``
+    status and the decorated ``"unavailable (...)"`` shapes ``add_edge``
+    assigns when the endpoint-type lookup itself cannot answer (#162:
+    ``"unavailable (lookup_node_type not implemented)"``, ``"unavailable
+    (endpoint type lookup failed: ...)"``) -- a codex review on #162's PR
+    caught the exact-match version of this check missing those decorated
+    forms, which let ``pack/load.py::load_edges`` count a refused edge
+    write as ``ok``.
 
     Callers that only check ``add_node``/``add_edge`` for a raised exception
     (see the module docstring: individual store failures are swallowed and
@@ -727,7 +734,7 @@ def store_write_failures(stores: dict[str, Any]) -> list[str]:
             continue
         if status.startswith("error:") or status.startswith("no match"):
             failures.append(f"{store}: {status}")
-        elif store == "graph" and status == "unavailable":
+        elif store == "graph" and (status == "unavailable" or status.startswith("unavailable (")):
             failures.append(f"{store}: {status}")
     return failures
 

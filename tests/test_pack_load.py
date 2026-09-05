@@ -262,6 +262,39 @@ class TestCustomPropertiesSurvive:
         assert set(state["chunks"]) == {"c1"}, (
             "청크가 pack_id 로 안 찾아진다 — metadata 가 라이브에 도달하지 못했다")
 
+    def test_edge_lookup_unavailable_counts_as_err_not_ok(self, live, tmp_path):
+        """#162 codex review: add_edge refuses the write with a DECORATED
+        "unavailable (...)" graph status when an endpoint's lookup_node_type
+        raises GraphReadCapabilityUnavailable. Before the store_write_failures()
+        fix, this decorated form did not match its exact-match "unavailable"
+        check, so this loop's `fails` list came back empty and the refused
+        write was counted as `ok` instead of `err` -- the write silently
+        never happened while load_edges reported success."""
+        from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+
+        builder, graph, docs = live
+        nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
+        id_map: dict = {}
+        pack_load.load_nodes("pack-1", nf, builder, id_map)
+
+        real_lookup = graph.lookup_node_type
+
+        def _flaky_lookup(node_id):
+            if node_id == "n1":
+                raise GraphReadCapabilityUnavailable(f"simulated read fault for {node_id!r}")
+            return real_lookup(node_id)
+
+        graph.lookup_node_type = _flaky_lookup
+
+        ef = _write_jsonl(tmp_path / "edges.jsonl",
+                          [{"id": "e1", "source_id": "n1", "target_id": "n2", "label": "CITES"}])
+        ok, skip, err = pack_load.load_edges("pack-1", ef, builder, id_map)
+        assert (ok, skip, err) == (0, 0, 1), (
+            f"조회 불가로 거부된 엣지 쓰기가 ok 로 오집계됐다: ok={ok} skip={skip} err={err}")
+        row = graph._conn.execute(
+            "SELECT 1 FROM graph_edges WHERE from_id = ?", ("n1",)).fetchone()
+        assert row is None, "쓰기가 거부됐는데 그래프에 행이 남았다"
+
     def test_edge_keeps_the_original_label_after_normalisation(self, live, tmp_path):
         """정규화가 라벨을 바꿔도 **원본은 `source_label` 로 남아야** 한다.
 
