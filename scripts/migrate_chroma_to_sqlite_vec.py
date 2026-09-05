@@ -26,6 +26,154 @@ import os
 import time
 
 
+def _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path) -> int:
+    """Copy one local Chroma collection into a vec0 table. Caller holds chroma.lock.
+
+    Split out of main() so the caller can hold ``chroma.lock`` across the whole
+    lifetime of the PersistentClient this opens (issue #140). The several early
+    returns below are exactly why: a lock acquired inline in main() would be
+    released on some paths and not others.
+
+    Every path tears the client down BEFORE returning, so the caller's lock is
+    never released while a client is still open. Reference counting alone covers
+    neither half of that:
+
+    * chromadb's client has no ``__del__``, so dropping the last reference does
+      not decrement the shared ``System`` refcount. Even the plain early returns
+      leaked without an explicit ``close()``.
+    * on the exception path the traceback keeps this frame alive, so the local
+      names must be cleared too -- ``col`` included, since a Collection holds the
+      client on ``self._client``.
+
+    LIMIT: the invariant is "an explicit close is ATTEMPTED before the lock is
+    released", not "the client is definitely gone". If ``close()`` raises we
+    still release. Holding the lock instead would need process-lifetime handle
+    ownership, which issue #140 measured and rejected: it turns a bounded stall
+    into a lock nothing ever reclaims. Chroma resources can then outlive the
+    lock. ChromaStore.close() and _migrate_vectors_locked follow the same rule.
+    """
+    import chromadb
+    import sqlite_vec
+
+    from opencrab.locking import close_quietly
+    from opencrab.stores._vector_base import slot_owner
+    from opencrab.stores.chroma_store import _sanitize_metadata
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    # Bound before the try so the finally never meets an unset name: any of the
+    # three creations below can raise.
+    client = None
+    col = None
+    store = None
+    try:
+        client = chromadb.PersistentClient(path=chroma_path)
+        col = client.get_collection(src_collection)
+        total = col.count()
+        print(f"# chroma vectors: {total}")
+
+        if args.dry_run:
+            print("# dry-run: no writes. (would create/populate vec0 above)")
+            return 0
+
+        if os.path.exists(db_path) and not args.force:
+            # allow empty file; refuse if it already holds rows
+            probe = None
+            try:
+                probe = SqliteVecStore(
+                    db_path=db_path,
+                    embedding_function=lambda x: [],  # unused (no writes here)
+                    dim=settings.embed_dim,
+                    collection_name=settings.vector_collection,
+                )
+                try:
+                    if probe.count() > 0:
+                        print(f"! {db_path} already has {probe.count()} rows. Use --force to overwrite.")
+                        return 2
+                finally:
+                    # count() can raise; without this the probe stayed open.
+                    close_quietly(probe, "probe store")
+                    probe = None
+            except Exception:
+                pass
+
+        # Real store creates the exact vec0 schema. EF is required by ctor but unused
+        # here (we raw-insert vectors copied from Chroma, never re-embed).
+        store = SqliteVecStore(
+            db_path=db_path,
+            embedding_function=lambda x: [],
+            dim=settings.embed_dim,
+            collection_name=settings.vector_collection,
+        )
+        if not store.available:
+            print("! SqliteVecStore init failed")
+            return 3
+        store.reset_collection()  # start clean
+        tbl = store._table
+
+        t0 = time.perf_counter()
+        off = 0
+        inserted = 0
+        while off < total:
+            lim = min(args.batch, total - off)
+            got = col.get(limit=lim, offset=off, include=["embeddings", "documents", "metadatas"])
+            ids = got["ids"]
+            embs = got["embeddings"]
+            docs = got["documents"] or ["" for _ in ids]
+            metas = got["metadatas"] or [{} for _ in ids]
+            if not ids:
+                break
+            rows = []
+            for _id, emb, doc, meta in zip(ids, embs, docs, metas):
+                clean = _sanitize_metadata(meta or {})
+                rows.append(
+                    (
+                        _id,
+                        # `slot_owner` 로 정규화한다(#197). 소유 태그를 읽는 쪽이 그
+                        # 함수이므로 쓰는 쪽도 같아야 한다. `str(x.get(k, ""))` 는 정제가
+                        # 접지 못한 falsy 비문자열(0, False)을 "0"/"False" 로 저장하는데,
+                        # 읽는 쪽은 그것을 미소유로 접어 두 축이 갈린다.
+                        slot_owner(clean),
+                        sqlite_vec.serialize_float32(list(emb)),
+                        doc or "",
+                        json.dumps(clean),
+                    )
+                )
+            with store._lock:
+                store._conn.executemany(
+                    f"INSERT INTO {tbl}(node_id, pack_id, embedding, document, metadata)"
+                    " VALUES (?,?,?,?,?)",
+                    rows,
+                )
+                store._conn.commit()
+            inserted += len(rows)
+            off += lim
+            if off % 20000 == 0 or off >= total:
+                print(f"#   migrated {off}/{total} ({time.perf_counter()-t0:.0f}s)")
+
+        final = store.count()
+        print(f"# done: inserted {inserted}, vec0 count {final} (chroma {total}) in {time.perf_counter()-t0:.1f}s")
+        ok = final == total
+        if ok:
+            # spot check
+            sample = col.get(limit=1, include=["metadatas"])
+            if sample["ids"]:
+                sid = sample["ids"][0]
+                hit = store.get_by_id(sid)
+                print(f"# spot get_by_id({sid}): {'OK' if hit else 'MISSING'}")
+        print("RESULT:", "PASS" if ok else "FAIL (count mismatch)")
+        return 0 if ok else 4
+    finally:
+        # Independent cleanup per resource (inside close_quietly): one failing
+        # close must not skip the rest, or the invariant breaks again.
+        close_quietly(store, "sqlite-vec store")
+        close_quietly(client, "chroma client")
+        # Drop this frame's own references. `col` matters as much as `client`:
+        # chromadb's Collection stores the client on `self._client`, so leaving
+        # `col` bound keeps the client alive in a traceback-held frame.
+        store = col = client = None
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=2000)
@@ -36,9 +184,6 @@ def main() -> int:
     import sqlite_vec  # noqa: F401 - ensures extension is importable
 
     from opencrab.config import get_settings
-    from opencrab.stores._vector_base import slot_owner
-    from opencrab.stores.chroma_store import _sanitize_metadata
-    from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
     settings = get_settings()
     src_collection = settings.embed_collection  # opencrab_vectors_kure
@@ -48,101 +193,26 @@ def main() -> int:
     print(f"# source chroma : {chroma_path} / collection '{src_collection}'")
     print(f"# target vec0   : {db_path} (table '{settings.vector_collection}', dim {settings.embed_dim})")
 
-    import chromadb
+    # #140: hold chroma.lock for as long as the PersistentClient below lives.
+    from opencrab.locking import chroma_lock_dir, chroma_lock_held
 
-    client = chromadb.PersistentClient(path=chroma_path)
-    col = client.get_collection(src_collection)
-    total = col.count()
-    print(f"# chroma vectors: {total}")
-
-    if args.dry_run:
-        print("# dry-run: no writes. (would create/populate vec0 above)")
-        return 0
-
-    if os.path.exists(db_path) and not args.force:
-        # allow empty file; refuse if it already holds rows
-        try:
-            probe = SqliteVecStore(
-                db_path=db_path,
-                embedding_function=lambda x: [],  # unused (no writes here)
-                dim=settings.embed_dim,
-                collection_name=settings.vector_collection,
-            )
-            if probe.count() > 0:
-                print(f"! {db_path} already has {probe.count()} rows. Use --force to overwrite.")
-                probe.close()
-                return 2
-            probe.close()
-        except Exception:
-            pass
-
-    # Real store creates the exact vec0 schema. EF is required by ctor but unused
-    # here (we raw-insert vectors copied from Chroma, never re-embed).
-    store = SqliteVecStore(
-        db_path=db_path,
-        embedding_function=lambda x: [],
-        dim=settings.embed_dim,
-        collection_name=settings.vector_collection,
-    )
-    if not store.available:
-        print("! SqliteVecStore init failed")
-        return 3
-    store.reset_collection()  # start clean
-    tbl = store._table
-
-    t0 = time.perf_counter()
-    off = 0
-    inserted = 0
-    while off < total:
-        lim = min(args.batch, total - off)
-        got = col.get(limit=lim, offset=off, include=["embeddings", "documents", "metadatas"])
-        ids = got["ids"]
-        embs = got["embeddings"]
-        docs = got["documents"] or ["" for _ in ids]
-        metas = got["metadatas"] or [{} for _ in ids]
-        if not ids:
-            break
-        rows = []
-        for _id, emb, doc, meta in zip(ids, embs, docs, metas):
-            clean = _sanitize_metadata(meta or {})
-            rows.append(
-                (
-                    _id,
-                    # `slot_owner` 로 정규화한다(#197). 소유 태그를 읽는 쪽이 그
-                    # 함수이므로 쓰는 쪽도 같아야 한다. `str(x.get(k, ""))` 는 정제가
-                    # 접지 못한 falsy 비문자열(0, False)을 "0"/"False" 로 저장하는데,
-                    # 읽는 쪽은 그것을 미소유로 접어 두 축이 갈린다.
-                    slot_owner(clean),
-                    sqlite_vec.serialize_float32(list(emb)),
-                    doc or "",
-                    json.dumps(clean),
-                )
-            )
-        with store._lock:
-            store._conn.executemany(
-                f"INSERT INTO {tbl}(node_id, pack_id, embedding, document, metadata)"
-                " VALUES (?,?,?,?,?)",
-                rows,
-            )
-            store._conn.commit()
-        inserted += len(rows)
-        off += lim
-        if off % 20000 == 0 or off >= total:
-            print(f"#   migrated {off}/{total} ({time.perf_counter()-t0:.0f}s)")
-
-    final = store.count()
-    print(f"# done: inserted {inserted}, vec0 count {final} (chroma {total}) in {time.perf_counter()-t0:.1f}s")
-    ok = final == total
-    if ok:
-        # spot check
-        sample = col.get(limit=1, include=["metadatas"])
-        if sample["ids"]:
-            sid = sample["ids"][0]
-            hit = store.get_by_id(sid)
-            print(f"# spot get_by_id({sid}): {'OK' if hit else 'MISSING'}")
-    store.close()
-    print("RESULT:", "PASS" if ok else "FAIL (count mismatch)")
-    return 0 if ok else 4
+    # EXCLUSIVE, not shared (#140). A shared claim looks right for a reader,
+    # but a live chroma-backed server also holds this lock shared for its whole
+    # lifetime while it keeps serving WRITES under write.lock. Joining it would
+    # let this copy run against a moving source: _copy_chroma_to_vec0 snapshots
+    # count() and then pages by offset without write.lock, so an ingest or a
+    # delete in flight silently drops records or mixes two points in time. The
+    # script's stated precondition is an offline run; an exclusive claim makes
+    # the lock enforce it instead of leaving it to the operator to remember.
+    #
+    # Bounded, and the message says what to stop.
+    # COMPATIBILITY, both directions: this now refuses while a server is up,
+    # where it used to proceed -- and that proceeding could produce a quietly
+    # wrong target. The reverse also holds: while this runs, a new ChromaStore
+    # anywhere is refused after CHROMA_LOCK_TIMEOUT. Both follow from the
+    # script's offline-run precondition, which the lock now enforces.
+    with chroma_lock_held(chroma_lock_dir(chroma_path), shared=False):
+        return _copy_chroma_to_vec0(args, settings, src_collection, db_path, chroma_path)
 
 
 if __name__ == "__main__":

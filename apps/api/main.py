@@ -22,7 +22,7 @@ from opencrab.auth import Principal
 from opencrab.common.graph_identity import NodeIdentityConflict
 from opencrab.config import get_settings
 from opencrab.grammar.validator import describe_grammar
-from opencrab.locking import write_lock
+from opencrab.locking import close_quietly, write_lock
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
@@ -350,25 +350,46 @@ def _meter_call(ctx: ApiContext, auth: AuthContext, endpoint: str) -> None:
 
 def _build_context() -> ApiContext:
     settings = get_settings()
-    graph = make_graph_store(settings)
-    vector = make_vector_store(settings)
-    docs = make_doc_store(settings)
-    sql = make_sql_store(settings)
+
+    # #140: build into a list so a factory raising part-way through can close
+    # what already exists. A local ChromaStore now owns an OS-level chroma.lock
+    # handle for its lifetime, so a half-built context that is simply dropped
+    # would be leaving that release to refcounting.
+    built: list[Any] = []
+
+    def _make(factory: Any, *args: Any) -> Any:
+        store = factory(*args)
+        built.append(store)
+        return store
 
     try:
-        graph.ensure_constraints()
-    except Exception as exc:
-        logger.debug("Skipping graph constraint bootstrap: %s", exc)
+        graph = _make(make_graph_store, settings)
+        vector = _make(make_vector_store, settings)
+        docs = _make(make_doc_store, settings)
+        sql = _make(make_sql_store, settings)
+        # The boundary runs to the ApiContext return, not just to the last
+        # factory (#140). Engine construction can raise -- an invalid tunable
+        # parsed inside HybridQuery, say -- and stopping the boundary earlier
+        # left four open stores, the vector one holding chroma.lock, for the
+        # traceback to carry off.
+        try:
+            graph.ensure_constraints()
+        except Exception as exc:
+            logger.debug("Skipping graph constraint bootstrap: %s", exc)
 
-    return ApiContext(
-        settings=settings,
-        graph=graph,
-        vector=vector,
-        docs=docs,
-        sql=sql,
-        hybrid=HybridQuery(vector, graph),
-        impact=ImpactEngine(graph, sql),
-    )
+        return ApiContext(
+            settings=settings,
+            graph=graph,
+            vector=vector,
+            docs=docs,
+            sql=sql,
+            hybrid=HybridQuery(vector, graph),
+            impact=ImpactEngine(graph, sql),
+        )
+    except BaseException:
+        for store in reversed(built):
+            close_quietly(store, f"{type(store).__name__} (context cleanup)", log=logger)
+        raise
 
 
 def _close_context(ctx: ApiContext | None) -> None:
@@ -390,13 +411,20 @@ async def lifespan(app: FastAPI) -> Any:
     from opencrab.mcp.http_app import refuse_stale_shared_secret_env
 
     refuse_stale_shared_secret_env()
-    app.state.context = _build_context()
-    # #147: the registry/graph reconciliation guard needs a live sql + graph
-    # store, so it cannot run before _build_context() the way
-    # refuse_stale_shared_secret_env() does -- there is nothing to check
-    # against yet at that point.
-    assert_registry_covers_graph(app.state.context.sql, app.state.context.graph)
+    # The assignment itself is INSIDE the try, not before it. Two hazards, one
+    # boundary (#140). The guard below can refuse startup, and a refusal
+    # outside the try left a fully built context -- a ChromaStore holding
+    # chroma.lock among it -- open for the life of the process. And an
+    # asynchronous interrupt landing between the assignment and the try would
+    # do the same. _close_context reads through getattr, so it copes with the
+    # attribute never having been set.
     try:
+        app.state.context = _build_context()
+        # #147: the registry/graph reconciliation guard needs a live sql + graph
+        # store, so it cannot run before _build_context() the way
+        # refuse_stale_shared_secret_env() does -- there is nothing to check
+        # against yet at that point.
+        assert_registry_covers_graph(app.state.context.sql, app.state.context.graph)
         yield
     finally:
         _close_context(getattr(app.state, "context", None))

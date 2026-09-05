@@ -43,7 +43,6 @@ def isolated_context(tmp_path, monkeypatch):
     config_mod.get_settings.cache_clear()
     # The chroma shared flock is a cross-process concern (#140/#141) and not
     # what this module measures.
-    monkeypatch.setattr(tools_mod, "_acquire_chroma_shared_lock", lambda: None)
     tools_mod._context.clear()
     try:
         yield

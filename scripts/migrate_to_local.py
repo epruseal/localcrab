@@ -466,6 +466,90 @@ def migrate_docs(
 # Step 4 — 벡터 마이그레이션 (HTTP Chroma → local Chroma)
 # ---------------------------------------------------------------------------
 
+def _migrate_vectors_locked(
+    http_client: Any,
+    local_data_dir: str,
+    collection: str,
+    batch_size: int,
+    logger: Any,
+) -> dict[str, int]:
+    """Run the local-Chroma vector migration under chroma.lock, then write.lock.
+
+    Two things this function exists to guarantee (issue #140).
+
+    Lock ORDER is chroma.lock outside, write.lock inside. That is the global
+    rule, because any live owner of a local chroma client -- MCP, REST or CLI
+    since #140 moved the lock to the store's lifetime -- holds chroma.lock
+    (shared) for its whole lifetime and takes write.lock per write. Any path
+    using both must therefore take chroma.lock first.
+
+    One path in the repository inverts it, and it is bounded rather than
+    removed. ``dispatch_tool`` runs a write handler inside write.lock, and if
+    the MCP context has not been built yet, the handler's first
+    ``_get_context()`` builds a ChromaStore -- taking chroma.lock while
+    write.lock is held. That inversion cannot deadlock: the shared side gives
+    up after CHROMA_LOCK_TIMEOUT, raises, and drops write.lock. The write.lock
+    acquisition below is therefore given a finite timeout too, so neither side
+    can wait forever: worst case both fail with a clear error instead of one
+    hanging. Removing the inversion structurally needs a context-need axis the
+    registry does not have (``writes`` means "needs write.lock", not "needs
+    stores") and would have to cope with handlers that decide at runtime, so
+    it is reported as a follow-up candidate rather than bolted on here.
+
+    Lock SCOPE covers the client, not just the copy loop: the PersistentClient
+    is created and torn down inside the ``with``, so the lock is never held
+    while no client exists. What is guaranteed on the way out is that an
+    explicit close is ATTEMPTED before the lock is released -- not that the
+    client is definitely gone. If that close raises, chroma resources can still
+    outlive the lock; holding it instead would need process-lifetime handle
+    ownership, which #140 measured and rejected. Same wording, same rule, as
+    ChromaStore.close() and _copy_chroma_to_vec0.
+
+    The lock is EXCLUSIVE because this is a bulk load: it must exclude the
+    shared holders (MCP, REST, CLI) entirely, not join them.
+    """
+    import chromadb  # type: ignore[import]
+
+    from opencrab.locking import chroma_lock_dir, close_quietly
+
+    chroma_local_path = os.path.join(local_data_dir, "chroma")
+    os.makedirs(chroma_local_path, exist_ok=True)
+
+    # Wait longer than the counterparty can hold write.lock while it is itself
+    # blocked on chroma.lock (CHROMA_LOCK_TIMEOUT), plus headroom, so a normal
+    # hand-off is not mistaken for a stuck peer.
+    from opencrab.locking import chroma_lock_held, chroma_lock_wait_timeout
+
+    # Both waits are bounded (#140). Without a bound on the OUTER one, a server
+    # holding the lifetime shared lock stalls this step forever -- and by then
+    # the graph and document steps have already written, so the operator is
+    # left with a hung command and a half-migrated target and no way to tell
+    # what blocked it. COMPATIBILITY: a holder that steps aside later than the
+    # bound used to be waited out and now fails instead. That is the trade.
+    lock_wait = chroma_lock_wait_timeout()
+    with chroma_lock_held(chroma_lock_dir(chroma_local_path), shared=False,
+                          timeout=lock_wait):
+        # Prebound and constructed INSIDE the try, as _copy_chroma_to_vec0
+        # does. Building it on the line above would leave an interrupt window
+        # in which the client exists and the finally that tears it down has not
+        # been entered, so the outer lock could be released with that client
+        # still live -- defeating the exclusion this helper exists for.
+        local_chroma = None
+        try:
+            local_chroma = chromadb.PersistentClient(path=chroma_local_path)
+            with file_lock("write.lock", local_data_dir, timeout=lock_wait):
+                return migrate_vectors(
+                    http_client, local_chroma, collection, batch_size, logger
+                )
+        finally:
+            # close_quietly, not an inline getattr: a bound method left in this
+            # frame would keep the client alive, and on an exception the
+            # traceback keeps this frame -- so the client would outlive the
+            # lock released just below.
+            close_quietly(local_chroma, "local chroma", log=logger)
+            local_chroma = None
+
+
 def migrate_vectors(
     http_client: Any,
     local_client: Any,
@@ -1059,18 +1143,13 @@ def _run(args: argparse.Namespace) -> int:
     # Step 4 — 벡터 마이그레이션
     if not args.skip_vectors:
         console.rule("[bold blue]Step 4 — 벡터 마이그레이션 (HTTP Chroma → local Chroma)")
-        import chromadb  # type: ignore[import]
-        chroma_local_path = os.path.join(local_data_dir, "chroma")
-        os.makedirs(chroma_local_path, exist_ok=True)
-        local_chroma = chromadb.PersistentClient(path=chroma_local_path)
-        with file_lock("write.lock", local_data_dir):
-            vectors_result = migrate_vectors(
-                preflight_result["chroma_http"],
-                local_chroma,
-                args.chroma_collection,
-                args.batch_size,
-                logger,
-            )
+        vectors_result = _migrate_vectors_locked(
+            preflight_result["chroma_http"],
+            local_data_dir,
+            args.chroma_collection,
+            args.batch_size,
+            logger,
+        )
         report["results"]["vectors"] = vectors_result
         console.print(f"  [green]완료[/green] vectors={vectors_result['vectors']:,}")
     else:

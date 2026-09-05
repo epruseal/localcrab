@@ -343,7 +343,7 @@ export EMBEDDING_BACKEND=openai VECTOR_BACKEND=sqlite-vec
 opencrab serve
 ```
 
-> **무중단 적재(sqlite-vec)**: chroma의 `chroma.lock(LOCK_EX)` 제약이 사라져 **적재 시 게이트웨이/서비스를 중단할 필요가 없다.** 벡터를 포함한 4스토어가 모두 SQLite WAL이라 로더/reingest 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. (chroma 백엔드에서는 기존대로 오프라인 `--fresh` 적재 시 중단 필요.)
+> **무중단 적재(sqlite-vec)**: chroma의 `chroma.lock(LOCK_EX)` 제약이 사라져 **적재 시 게이트웨이/서비스를 중단할 필요가 없다.** 벡터를 포함한 4스토어가 모두 SQLite WAL이라 로더/reingest 쓰기와 serve 읽기가 동시 진행되고, 라이터는 `write.lock`/SQLite `busy_timeout(5s)`로 직렬화된다. (chroma 백엔드에서는 기존대로 오프라인 `--fresh` 적재 시 중단 필요. #140 이후 로컬 chroma 를 연 프로세스를 모두 멈춰야 한다 — MCP 서버, REST 앱, 벡터를 쓰는 CLI 명령.)
 
 **롤백**: `VECTOR_BACKEND=chroma` 명시 → Chroma 스택으로 즉시 복귀(비파괴, Chroma 보존).
 

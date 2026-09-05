@@ -48,6 +48,7 @@ ENV_CONTRACT: dict[str, str] = {
     "OPENAI_API_KEY": "외부 전송 결정",
     "EMBED_DIM": "튜너블",
     "OPENAI_TIMEOUT": "튜너블",
+    "CHROMA_LOCK_TIMEOUT": "튜너블",
     "EMBED_COLLECTION": "튜너블",
     "LOCAL_GGUF_PATH": "상태 위치",
     "VECTOR_BACKEND": "설정 소스 선택",
