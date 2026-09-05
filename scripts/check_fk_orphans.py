@@ -47,7 +47,12 @@ def main() -> int:
     db_path = sys.argv[1]
     try:
         violations = check(db_path)
-    except sqlite3.OperationalError as exc:
+    except sqlite3.DatabaseError as exc:
+        # sqlite3.OperationalError (경로 오류, 권한 부족 등) 는 이 클래스의
+        # 하위 클래스라 그대로 잡힌다. 손상되었거나 SQLite 형식이 아닌
+        # 파일은 OperationalError 가 아니라 이 기반 클래스로 직접 올라오므로
+        # (실측: "file is not a database"), 좁게 잡으면 그 경우가 여기를
+        # 빠져나가 진단 오류(2) 대신 되잡히지 않은 예외로 죽는다.
         print(f"cannot open {db_path!r} read-only: {exc}", file=sys.stderr)
         return 2
 
