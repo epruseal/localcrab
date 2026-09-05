@@ -64,6 +64,24 @@ _TYPE_TEMPLATE_HEADER = """\
 """
 
 
+def _warn_on_manifest_overlap(
+    pack: dict[str, Any], node_type: str, required_fields: list[str], optional_fields: list[str]
+) -> None:
+    """#107: warn when a manifest lists the same field in both `required`
+    and `optional` for a type. Called both when the schema is actually
+    (re)generated and, from ``install_pack``, when an existing current-shape
+    schema is left untouched -- the manifest contradiction is the pack
+    author's mistake either way, not something reinstall silently hides.
+    """
+    overlap = sorted(set(required_fields) & set(optional_fields))
+    if overlap:
+        logger.warning(
+            "Pack '%s': type '%s' manifest lists %r in both required and "
+            "optional -- required wins.",
+            pack.get("name"), node_type, overlap,
+        )
+
+
 def _build_type_schema(
     pack: dict[str, Any],
     node_type: str,
@@ -116,13 +134,7 @@ def _build_type_schema(
     # #107: a manifest can (by author mistake) list the same field in both
     # `required` and `optional`. Surface it -- required still wins below,
     # but a pack author should know their manifest contradicts itself.
-    overlap = sorted(set(required_fields) & set(optional_fields))
-    if overlap:
-        logger.warning(
-            "Pack '%s': type '%s' manifest lists %r in both required and "
-            "optional -- required wins.",
-            pack.get("name"), node_type, overlap,
-        )
+    _warn_on_manifest_overlap(pack, node_type, required_fields, optional_fields)
 
     properties: dict[str, Any] = {}
     for field_name in required_fields:
@@ -353,6 +365,16 @@ def install_pack(name: str) -> dict[str, Any]:
                 skipped.append(node_type)
                 continue
             if not _is_legacy_shape(existing):
+                # #107: this schema is already current-shape, so it is left
+                # untouched below -- but a manifest self-overlap is still
+                # worth a warning even when reinstall never regenerates the
+                # file (the manifest itself is what's wrong, not this file).
+                manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
+                _warn_on_manifest_overlap(
+                    pack, node_type,
+                    manifest_spec.get("required") or ["name"],
+                    manifest_spec.get("optional") or ["description", "status"],
+                )
                 skipped.append(node_type)
                 continue
             if not _has_generation_marker(existing_content, name):
