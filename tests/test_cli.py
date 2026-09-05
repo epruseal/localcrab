@@ -487,6 +487,67 @@ class TestIngest:
         assert result.exit_code == 0
         assert "pack=demo-pack" in result.output
 
+    # --- Error (#189) ---
+    def test_ingest_partial_failure_exits_nonzero_and_keeps_successful_file(
+        self, bootstrapped, cli_env, runner, mock_vector_store
+    ):
+        """#189: one file failing to read must not leave the process exit
+        code at 0 -- a caller checking only the exit code has no way to see
+        that "Ingested 1/2 files." meant a real failure. The file that DID
+        succeed must still land (a partial failure must not be treated as
+        a reason to also discard what already worked)."""
+        (cli_env / "ok.txt").write_text("good content")
+        (cli_env / "bad.txt").write_text("unreadable content")
+
+        real_read_text = Path.read_text
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self.name == "bad.txt":
+                raise OSError("simulated read failure")
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", flaky_read_text):
+            result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+
+        assert result.exit_code != 0
+        assert "Ingested 1/2 files." in result.output
+        assert "FAIL" in result.output
+        # #194: +1 for auto-created anchor on first ingest into default pack
+        assert mock_vector_store.count() == 2
+
+    def test_ingest_write_source_failure_exits_nonzero(
+        self, bootstrapped, cli_env, runner, mock_vector_store
+    ):
+        """#189 sibling path: write_source reporting a failed receipt (#158
+        contract -- failures are reported, not raised) must also surface as
+        a non-zero exit, the same as an exception raised directly in the
+        loop."""
+        (cli_env / "doc.txt").write_text("content")
+
+        with patch(
+            "opencrab.pack.source_writer.write_source",
+            return_value={"stores": {"documents": "error: simulated", "chromadb": "ok"}},
+        ):
+            result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+
+        assert result.exit_code != 0
+        assert "Ingested 0/1 files." in result.output
+
+    # --- Edge (#189) ---
+    def test_ingest_empty_files_only_still_exits_zero(
+        self, bootstrapped, cli_env, runner, mock_vector_store
+    ):
+        """Regression guard: an empty file is silently skipped (not a
+        failure) since before #189 -- the exit-code fix must not reclassify
+        that skip as a failure. Only the `except` branch may raise the
+        process's exit code."""
+        (cli_env / "empty.txt").write_text("")
+
+        result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+
+        assert result.exit_code == 0
+        assert "Ingested 0/1 files." in result.output
+
 
 # ---------------------------------------------------------------------------
 # query
@@ -895,6 +956,86 @@ class TestExtract:
         assert "Traceback" not in result.output
         assert "ANTHROPIC_API_KEY" in result.output
 
+    def test_extract_per_file_exception_exits_nonzero_and_keeps_other_file(
+        self, bootstrapped, cli_env, runner
+    ):
+        """#189: extract_from_file raising for one file must not leave the
+        process exit code at 0. The other file's extraction must still be
+        written (a partial failure keeps the partial success)."""
+        (cli_env / "ok.md").write_text("Alex owns the demo project.")
+        (cli_env / "bad.md").write_text("unparseable content")
+
+        fake_extractor = MagicMock()
+
+        def flaky_extract(path):
+            if Path(path).name == "bad.md":
+                raise RuntimeError("simulated extraction failure")
+            return _make_extraction_result(str(path))
+
+        fake_extractor.extract_from_file.side_effect = flaky_extract
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ):
+            result = runner.invoke(
+                main, ["extract", str(cli_env), "--api-key", "test-key"]
+            )
+
+        assert result.exit_code != 0
+        assert "FAIL: simulated extraction failure" in result.output
+
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(db_path=str(cli_env / "graph.db"))
+        assert graph.get_node("Agent", "alex_agent") is not None
+        graph.close()
+
+    def test_extract_result_errors_field_exits_nonzero_without_exception(
+        self, bootstrapped, cli_env, runner
+    ):
+        """#189: a result carrying ``errors`` (no exception raised -- the
+        extractor's own partial-failure signal, distinct from the
+        exception path above) must also flip the exit code."""
+        (cli_env / "doc.md").write_text("content")
+
+        fake_extractor = MagicMock()
+
+        def result_with_errors(path):
+            result = _make_extraction_result(str(path))
+            result.errors.append("simulated extraction warning")
+            return result
+
+        fake_extractor.extract_from_file.side_effect = result_with_errors
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ):
+            result = runner.invoke(
+                main, ["extract", str(cli_env), "--api-key", "test-key"]
+            )
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "warn=1" in result.output
+
+    def test_extract_dry_run_extraction_failure_exits_nonzero(
+        self, cli_env, runner
+    ):
+        """--dry-run writes nothing, so store-write failure counters stay at
+        0, but an extraction failure alone must still flip the exit code."""
+        (cli_env / "bad.md").write_text("unparseable content")
+
+        fake_extractor = MagicMock()
+        fake_extractor.extract_from_file.side_effect = RuntimeError("simulated")
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ):
+            result = runner.invoke(
+                main,
+                ["extract", str(cli_env), "--api-key", "test-key", "--dry-run"],
+            )
+
+        assert result.exit_code != 0
+        assert "(dry-run)" in result.output
+
     # --- Edge ---
     def test_extract_single_file_path_is_accepted(self, bootstrapped, cli_env, runner):
         f = cli_env / "solo.md"
@@ -912,6 +1053,63 @@ class TestExtract:
         assert result.exit_code == 0
         assert result.exception is None
         assert "nodes=2 edges=1" in result.output
+
+    def test_extract_node_write_failure_exits_nonzero(
+        self, bootstrapped, cli_env, runner
+    ):
+        """#189 sibling-path guard: a node write failure (exception raised
+        by `builder.add_node`, distinct from an edge write failure below)
+        must flip the exit code on its own."""
+        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+
+        fake_extractor = MagicMock()
+        fake_extractor.extract_from_file.side_effect = (
+            lambda path: _make_extraction_result(str(path))
+        )
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ), patch(
+            "opencrab.ontology.builder.OntologyBuilder.add_node",
+            side_effect=RuntimeError("simulated node write failure"),
+        ):
+            result = runner.invoke(
+                main, ["extract", str(cli_env), "--api-key", "test-key"]
+            )
+
+        assert result.exit_code != 0
+        assert "not stored" in result.output or "simulated node write failure" in result.output
+
+    def test_extract_edge_write_failure_exits_nonzero(
+        self, bootstrapped, cli_env, runner
+    ):
+        """#189 sibling-path guard: an edge write failure alone (nodes land
+        fine) must also flip the exit code -- a mutation that wires only
+        `total_node_write_failures` into the exit check would pass the node
+        test above but miss this one."""
+        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+
+        fake_extractor = MagicMock()
+        fake_extractor.extract_from_file.side_effect = (
+            lambda path: _make_extraction_result(str(path))
+        )
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ), patch(
+            "opencrab.ontology.builder.OntologyBuilder.add_edge",
+            side_effect=RuntimeError("simulated edge write failure"),
+        ):
+            result = runner.invoke(
+                main, ["extract", str(cli_env), "--api-key", "test-key"]
+            )
+
+        assert result.exit_code != 0
+
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        graph = LocalGraphStore(db_path=str(cli_env / "graph.db"))
+        # Nodes must still have landed -- only the edge write failed.
+        assert graph.get_node("Agent", "alex_agent") is not None
+        graph.close()
 
 
 # ---------------------------------------------------------------------------
