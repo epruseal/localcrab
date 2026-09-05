@@ -72,6 +72,7 @@ def apply_promotion_package(
     try:
         from opencrab.auth import current_principal
         from opencrab.config import Settings
+        from opencrab.locking import write_lock
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.pack.ownership import resolve_write_pack
         from opencrab.stores.factory import (
@@ -118,67 +119,72 @@ def apply_promotion_package(
             "dry_run": True,
         }
 
-    # Live write
-    graph = make_graph_store(settings)
-    docs = make_doc_store(settings)
-    sql = make_sql_store(settings)
-    builder = OntologyBuilder(neo4j=graph, mongo=docs, sql=sql)
+    # Live write. issue #141 항목 1: 스토어 생성부터 노드/엣지 쓰기까지
+    # write.lock 으로 감싼다 — 이전에는 이 함수가 write.lock 을 전혀 잡지
+    # 않아 harness_promotion_apply(MCP 트윈, 같은 잠금을 쥔다)와 동시에
+    # 돌면 그래프/문서/SQL 스토어에 레이스가 났다. billing 이벤트 기록은
+    # 별도 파일(billing.db)이라 락 바깥에 그대로 둔다.
+    with write_lock(settings.local_data_dir):
+        graph = make_graph_store(settings)
+        docs = make_doc_store(settings)
+        sql = make_sql_store(settings)
+        builder = OntologyBuilder(neo4j=graph, mongo=docs, sql=sql)
 
-    # #148: builder.add_node/add_edge require a bound principal (they call
-    # current_principal() internally) and a pack_id.
-    #
-    # This function does NOT bind one itself. Picking require_local_principal()
-    # here would be fail-open on identity: any caller that forgets to bind --
-    # a server surface where the principal differs per request, say -- would
-    # not fail, it would silently attribute the writes to the LOCAL user
-    # instead of the requester. Binding is the entry point's job (the
-    # crabharness CLI does it); a library call refuses instead.
-    principal = current_principal()
-    target_pack_id = resolve_write_pack(sql, principal, pack_id)
+        # #148: builder.add_node/add_edge require a bound principal (they call
+        # current_principal() internally) and a pack_id.
+        #
+        # This function does NOT bind one itself. Picking require_local_principal()
+        # here would be fail-open on identity: any caller that forgets to bind --
+        # a server surface where the principal differs per request, say -- would
+        # not fail, it would silently attribute the writes to the LOCAL user
+        # instead of the requester. Binding is the entry point's job (the
+        # crabharness CLI does it); a library call refuses instead.
+        principal = current_principal()
+        target_pack_id = resolve_write_pack(sql, principal, pack_id)
 
-    for node in package.nodes:
-        try:
-            result = builder.add_node(
-                space=node.space,
-                node_type=node.node_type,
-                node_id=node.node_id,
-                properties=node.properties or {},
-                pack_id=target_pack_id,
-            )
-            node_receipts.append({
-                "node_id": node.node_id,
-                "space": node.space,
-                "node_type": node.node_type,
-                "receipt_id": result.get("receipt_id"),
-                "receipt_ts": result.get("receipt_ts"),
-                "stores": result.get("stores"),
-            })
-        except Exception as exc:
-            errors.append({"node_id": node.node_id, "error": str(exc)})
+        for node in package.nodes:
+            try:
+                result = builder.add_node(
+                    space=node.space,
+                    node_type=node.node_type,
+                    node_id=node.node_id,
+                    properties=node.properties or {},
+                    pack_id=target_pack_id,
+                )
+                node_receipts.append({
+                    "node_id": node.node_id,
+                    "space": node.space,
+                    "node_type": node.node_type,
+                    "receipt_id": result.get("receipt_id"),
+                    "receipt_ts": result.get("receipt_ts"),
+                    "stores": result.get("stores"),
+                })
+            except Exception as exc:
+                errors.append({"node_id": node.node_id, "error": str(exc)})
 
-    for edge in package.edges:
-        try:
-            result = builder.add_edge(
-                from_space=edge.from_space,
-                from_id=edge.from_id,
-                relation=edge.relation,
-                to_space=edge.to_space,
-                to_id=edge.to_id,
-                pack_id=target_pack_id,
-            )
-            edge_receipts.append({
-                "from_id": edge.from_id,
-                "relation": edge.relation,
-                "to_id": edge.to_id,
-                "receipt_id": result.get("receipt_id"),
-                "receipt_ts": result.get("receipt_ts"),
-                "stores": result.get("stores"),
-            })
-        except Exception as exc:
-            errors.append({
-                "edge": f"{edge.from_id} -[{edge.relation}]-> {edge.to_id}",
-                "error": str(exc),
-            })
+        for edge in package.edges:
+            try:
+                result = builder.add_edge(
+                    from_space=edge.from_space,
+                    from_id=edge.from_id,
+                    relation=edge.relation,
+                    to_space=edge.to_space,
+                    to_id=edge.to_id,
+                    pack_id=target_pack_id,
+                )
+                edge_receipts.append({
+                    "from_id": edge.from_id,
+                    "relation": edge.relation,
+                    "to_id": edge.to_id,
+                    "receipt_id": result.get("receipt_id"),
+                    "receipt_ts": result.get("receipt_ts"),
+                    "stores": result.get("stores"),
+                })
+            except Exception as exc:
+                errors.append({
+                    "edge": f"{edge.from_id} -[{edge.relation}]-> {edge.to_id}",
+                    "error": str(exc),
+                })
 
     # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
     # module docstring) — bill it the same way harness_promotion_apply (the

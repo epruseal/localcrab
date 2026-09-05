@@ -162,7 +162,11 @@ class BillingHooks:
 
     def _ensure_tables(self) -> None:
         try:
-            ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG)
+            # issue #141 R3 (codex PR #323 리뷰): billing.db 는 opencrab.db
+            # 와 같은 디렉터리에 있으므로 기본 write.lock 을 쓰면 #105 가
+            # 분리한 격리(온톨로지 쓰기 뒤 대기 없음)가 되돌아간다.
+            # own_file_lock=True 로 이 db 파일에만 스코프된 락을 쓴다.
+            ensure_tables(self._sql, _TABLES_SQLITE, _TABLES_PG, own_file_lock=True)
             self.tables_ready = True
         except Exception as exc:
             logger.warning("BillingHooks table creation failed: %s", exc)

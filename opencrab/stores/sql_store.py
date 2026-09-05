@@ -8,10 +8,61 @@ Falls back to SQLite for development if Postgres is unavailable.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def write_lock_for_store(
+    sql_store: Any, *, own_file: bool = False
+) -> contextlib.AbstractContextManager[None]:
+    """``write_lock()`` scoped to *sql_store*'s on-disk SQLite file (issue #141).
+
+    ``SQLStore._connect()`` and ``opencrab.execution._sql.ensure_tables()``
+    both run schema-bootstrap DDL against a SQLAlchemy engine — before this
+    fix, neither held ``write.lock``, so a migration script or a second
+    process racing the same ``opencrab.db`` file could hit CREATE TABLE
+    mid-flight. Both call through this one helper so they get the same
+    protection from a single choke point.
+
+    A no-op (``contextlib.nullcontext()``) for a PostgreSQL backend (a
+    separate live service with its own concurrency control, out of
+    write.lock's local-file scope) or an in-memory SQLite database (no file
+    another process could race). Uses ``sqlalchemy.engine.url.make_url``
+    rather than manual string-slicing so it also handles
+    ``sqlite+pysqlite://``, a query string, or a relative path correctly —
+    not just the exact ``sqlite:///<dir>/opencrab.db`` shape
+    ``Settings.sqlite_url`` happens to produce today.
+
+    ``own_file=True`` locks a name derived from *sql_store*'s own db
+    filename (e.g. ``billing.db.lock``) instead of the shared
+    ``write.lock`` (issue #141, codex PR review on #323). ``billing.db``
+    sits in the same ``local_data_dir`` as ``opencrab.db`` (see
+    ``make_billing_sql_store``), so a directory-scoped ``write.lock`` would
+    make ``BillingHooks``' schema bootstrap wait behind ordinary ontology
+    writes — precisely the whole-file-lock contention issue #105 split
+    ``billing.db`` out to avoid. A file-named lock still serialises two
+    processes racing the same billing.db CREATE TABLE, without coupling to
+    write.lock's holders.
+    """
+    if not getattr(sql_store, "_is_sqlite", False):
+        return contextlib.nullcontext()
+    from sqlalchemy.engine import make_url
+
+    db_path = make_url(sql_store._url).database
+    if not db_path or db_path == ":memory:":
+        return contextlib.nullcontext()
+    directory = os.path.dirname(os.path.abspath(db_path))
+    if own_file:
+        from opencrab.locking import file_lock
+
+        return file_lock(f"{os.path.basename(db_path)}.lock", directory)
+    from opencrab.locking import write_lock
+
+    return write_lock(directory)
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy table declarations (metadata-only, not using ORM declarative)
@@ -363,10 +414,28 @@ class SQLStore:
             self._available = True
             logger.info("SQL store connected (%s)", self._url.split("@")[-1])
             if self._create_tables_on_connect:
-                self._create_tables()
+                # issue #141 항목 2: 부트스트랩 DDL을 write.lock 으로 감싼다
+                # (SQLite 전용, PG/in-memory 는 write_lock_for_store 가 no-op).
+                with write_lock_for_store(self):
+                    self._create_tables()
         except Exception as exc:
             logger.warning("SQL store unavailable: %s", exc)
             self._available = False
+
+    def close(self) -> None:
+        """Dispose the underlying SQLAlchemy engine's connection pool.
+
+        issue #141 항목 5: ``scripts/migrate_pack_ownership.py`` 는 ``sql``
+        을 (graph/docs/vector 와 달리) 어떤 종료 경로에서도 닫지 않았다.
+        ``opencrab.locking.close_quietly`` 는 대상에 ``close`` 가 없으면
+        그냥 지나치므로(no-op), 그 finally 블록이 실제로 무엇을 닫으려면
+        ``SQLStore`` 자신에 ``close`` 가 있어야 한다 -- 이 메서드가 그
+        빠진 반쪽이다. SQLite 로컬 파일이면 커넥션 풀이 열어 둔 파일
+        핸들을 반환하고, PostgreSQL 이면 풀의 소켓 연결을 반환한다.
+        """
+        if self._engine is not None:
+            self._engine.dispose()
+        self._available = False
 
     def _create_tables(self) -> None:
         """Create all tables if they do not exist."""

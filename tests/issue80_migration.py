@@ -166,6 +166,16 @@ class FixtureHandle:
         return self.db_path
 
     def close(self) -> None:
+        """Release the fixture's files and remove its directory.
+
+        전제(codex 설계검증, issue #141): 이 정리는 "다른 프로세스가 이
+        디렉터리의 write.lock 을 쥐고 있지 않다"는 것을 스스로 증명하지
+        않는다. 이 메서드를 부르는 모든 기존 경로가 같은 스레드/프로세스
+        안에서 스토어를 먼저 닫은 뒤(close()) 동기적으로 이 메서드를
+        호출한다는 호출 관례에 기대어서만 안전하다. 이 관례를 벗어난 새
+        사용(다른 프로세스/스레드가 같은 디렉터리에 동시 접근)에는 이
+        보장이 미치지 않는다.
+        """
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
             if path.exists():
@@ -173,6 +183,13 @@ class FixtureHandle:
         marker = self.root / ".issue80-fixture"
         if marker.exists():
             marker.unlink()
+        # issue #141 항목 2(회귀 게이트에서 발견): 이 root 아래 SQLite 스토어를
+        # 열면 부트스트랩이 write.lock 을 만든다. flock 파일은 설계상 삭제하지
+        # 않으므로(opencrab.locking) 남아 있는 게 정상이고, 지우지 않으면
+        # rmdir 이 "Directory not empty" 로 깨진다.
+        lock_path = self.root / "write.lock"
+        if lock_path.exists():
+            lock_path.unlink()
         self.root.rmdir()
 
     def __enter__(self) -> FixtureHandle:

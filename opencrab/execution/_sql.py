@@ -44,6 +44,8 @@ def ensure_tables(
     sql_store: Any,
     ddl_sqlite: Sequence[str],
     ddl_pg: Sequence[str],
+    *,
+    own_file_lock: bool = False,
 ) -> None:
     """Run *ddl_sqlite* or *ddl_pg* (whichever matches *sql_store*'s dialect)
     inside one transaction, in order.
@@ -53,10 +55,25 @@ def ensure_tables(
     the store's backend and executes it. Callers that need to swallow
     setup failures (e.g. BillingHooks, which is fire-and-forget) wrap this
     call in their own try/except -- this function itself always raises.
+
+    issue #141 항목 6: 이 함수가 workflow.py/approvals.py/billing/hooks.py
+    가 공유하는 DDL 실행 지점이다 — write.lock 없이 *sql_store*._engine에
+    직접 DDL을 실행했다. 여기 한 곳만 잠그면 그 호출자들이 보호된다
+    (opencrab.stores.sql_store의 write_lock_for_store와 같은 헬퍼: SQLite
+    전용, PG는 no-op).
+
+    ``own_file_lock=True``(codex PR #323 리뷰, R3): billing.db 는 opencrab.db
+    와 같은 local_data_dir 에 있어 기본(디렉터리 공유) write.lock 을 쓰면
+    BillingHooks 부트스트랩이 무관한 온톨로지 쓰기 뒤에서 대기하게 된다 —
+    #105 가 분리한 격리를 되돌린다. BillingHooks._ensure_tables() 는 이
+    플래그로 자신의 db 파일에만 스코프된 락을 쓴다.
     """
     from sqlalchemy import text
 
+    from opencrab.stores.sql_store import write_lock_for_store
+
     ddl = ddl_sqlite if sql_store._is_sqlite else ddl_pg
-    with sql_store._engine.begin() as conn:
+    lock_ctx = write_lock_for_store(sql_store, own_file=own_file_lock)
+    with lock_ctx, sql_store._engine.begin() as conn:
         for stmt in ddl:
             conn.execute(text(stmt))

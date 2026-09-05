@@ -1972,310 +1972,345 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    sql = make_sql_store(settings)
-    if not sql.available:
-        print("ERROR: SQL store unavailable -- run 'opencrab init' first.", file=sys.stderr)
-        return 2
-    owner_id = _bootstrap_owner_id(sql)
-    print(f"Bootstrap owner: {owner_id}")
+    # issue #141 항목 5: sql 는 이 아래 어떤 조기 반환·예외 경로에서도
+    # 닫히지 않았다(graph/docs/vector 는 #140 에서 이미 finally 로
+    # 닫힌다). 생성부터 마지막 반환까지 하나의 바깥 try/finally 로 감싸
+    # 모든 종료 경로에서 close_quietly 가 실행되게 한다.
+    from opencrab.locking import close_quietly
 
-    # Built INSIDE the try that closes them (#140). The vector store may be a
-    # local ChromaStore, which holds chroma.lock for its lifetime; created
-    # above the boundary, a failure between here and the try left that lock
-    # held by a store nothing would close.
-    graph = docs = vector = None
-
-    # {stage_name: {"outcome": ..., "reason": ...}} -- populated as each
-    # stage below runs, printed in full in the Summary regardless of where
-    # a failure stops the sequence.
-    stage_outcomes: dict[str, dict[str, str]] = {}
-
+    sql = None
     try:
-        graph = make_graph_store(settings)
-        docs = make_doc_store(settings)
-        vector = make_vector_store(settings)
-        print("\n1) Ensuring the default (catch-all) pack is registered...")
-        default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
+        sql = make_sql_store(settings)
+        if not sql.available:
+            print("ERROR: SQL store unavailable -- run 'opencrab init' first.", file=sys.stderr)
+            return 2
+        owner_id = _bootstrap_owner_id(sql)
+        print(f"Bootstrap owner: {owner_id}")
 
-        print("\n2) Backfilling graph rows with no pack_id...")
-        # dict.fromkeys: dedupe while keeping order. The qualified graph
-        # schema already enforces one row per node_id; this also keeps a
-        # legacy/corrupt source from generating duplicate vector probes.
-        node_ids_needing_check = list(dict.fromkeys(_graph_missing_node_ids(graph)))
-        local_db_path = _local_graph_db_path(settings)
-        # Predicted BEFORE the backfill writes anything -- resolve_row_pack_id
-        # applied to each node's pre-backfill state (#146 M P1-1).
-        node_pack_map, ambiguous_nodes = (
-            _predict_node_pack_map(local_db_path, node_ids_needing_check, default_pack_id)
-            if local_db_path is not None
-            else ({}, {})
-        )
-        graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
-        if args.apply and local_db_path is not None:
-            # Ground truth AFTER the write -- verifies the prediction above
-            # actually matches what backfill_pack_ids wrote, and is what
-            # vector backfill (step 5) uses from here on: real measurement
-            # beats prediction whenever both exist.
-            actual_pack_map, actual_ambiguous = _read_actual_node_pack_ids(
-                local_db_path, node_ids_needing_check
-            )
-            diverged = {
-                nid
-                for nid in set(node_pack_map) | set(actual_pack_map)
-                if node_pack_map.get(nid) != actual_pack_map.get(nid)
-            }
-            if diverged:
-                print(
-                    f"  WARNING: predicted vs actual pack_id diverged for "
-                    f"{len(diverged)} node(s) -- resolve_row_pack_id/"
-                    f"backfill_pack_ids contract mismatch: {sorted(diverged)}"
-                )
-            if set(ambiguous_nodes) != set(actual_ambiguous):
-                print(
-                    f"  WARNING: predicted vs actual AMBIGUOUS sets diverged "
-                    f"(predicted {sorted(ambiguous_nodes)}, actual "
-                    f"{sorted(actual_ambiguous)})"
-                )
-            node_pack_map, ambiguous_nodes = actual_pack_map, actual_ambiguous
-        for nid, packs in sorted(ambiguous_nodes.items()):
-            print(
-                f"  WARNING: node_id {nid!r} maps to CONFLICTING pack_ids "
-                f"{packs} across its graph rows -- the vector store's "
-                f"identity is node_id alone, so no single value is correct; "
-                f"excluded from vector backfill (vector_ambiguous)."
-            )
-        graph_outcome, graph_reason = _stage_outcome(
-            graph_stats,
-            ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
-        )
-        # Row-level skips (non-dict JSON properties etc. -- rows
-        # backfill_pack_ids could NOT attribute) leave pack_id-less rows
-        # behind, which violates invariant 5 exactly like a whole-stage
-        # skip does.  Demote the stage so it gates the exit code; always
-        # surface the counts in the summary.
-        rows_skipped = int(graph_stats.get("nodes_skipped") or 0) + int(
-            graph_stats.get("edges_skipped") or 0
-        )
-        if rows_skipped and graph_outcome != "skipped":
-            graph_outcome = "skipped"
-            graph_reason = (
-                f"{rows_skipped} row(s) left unattributed "
-                f"(nodes_skipped={graph_stats.get('nodes_skipped') or 0}, "
-                f"edges_skipped={graph_stats.get('edges_skipped') or 0}) -- "
-                f"was: {graph_reason}"
-            )
-        stage_outcomes["graph_backfill"] = {"outcome": graph_outcome, "reason": graph_reason}
+        # Built INSIDE the try that closes them (#140). The vector store may be a
+        # local ChromaStore, which holds chroma.lock for its lifetime; created
+        # above the boundary, a failure between here and the try left that lock
+        # held by a store nothing would close.
+        graph = docs = vector = None
 
-        print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
-        registry_stats = _register_graph_packs(
-            sql,
-            graph,
-            owner_id,
-            args.apply,
-            node_pack_map=node_pack_map,
-            ambiguous_nodes=ambiguous_nodes,
-            accept_foreign_owned_packs=args.accept_foreign_owned_packs,
-        )
-        graph_available_for_enum = getattr(graph, "available", False)
-        # `default` can legitimately appear among the GRAPH candidates too --
-        # a packless graph row makes step 2 predict `default` for it, and in a
-        # dry-run step 1 has not actually inserted the row yet, so step 3 still
-        # sees it as unregistered. Adding that to `default_pending` would count
-        # the one `default` row twice, making the dry-run report a bigger total
-        # than the --apply run (where step 1's real insert removes it from the
-        # graph candidates). Count DISTINCT rows: `default_pending` owns the
-        # `default` row, so drop it from the graph side. (PR #177 review round 5.)
-        graph_candidates = set(registry_stats.get("candidates") or ()) - {default_pack_id}
-        registry_pending = default_pending + len(graph_candidates)
-        if not graph_available_for_enum:
-            # Unconditional: registering the default pack is NOT the same
-            # thing as having enumerated the graph's pack_ids.  (An earlier
-            # version reported "applied" here whenever default_pending was
-            # set, which let a fresh registry + unavailable-wrapper run
-            # exit 0 with the graph's packs never registered.)
-            registry_outcome, registry_reason = (
-                "skipped",
-                "graph unavailable -- pack_id enumeration skipped (default-pack registration still ran)",
-            )
-        elif not registry_stats.get("edges_enumerable", True):
-            registry_outcome, registry_reason = (
-                "skipped",
-                "graph_edges could not be scanned for pack_id on this backend "
-                "(no _table/_fetch_all -- e.g. Kuzu/Neo4j, #182 scope) -- an "
-                "edge-only pack_id may exist unregistered",
-            )
-        elif registry_pending == 0:
-            registry_outcome, registry_reason = "clean", "nothing to do"
-        else:
-            registry_outcome, registry_reason = "applied", f"{registry_pending} row(s) needed registering"
+        # {stage_name: {"outcome": ..., "reason": ...}} -- populated as each
+        # stage below runs, printed in full in the Summary regardless of where
+        # a failure stops the sequence.
+        stage_outcomes: dict[str, dict[str, str]] = {}
 
-        # 3.5) R5-B (PR #177 review round 5 P1): register every DOC-derived
-        # pack_id too -- BEFORE step 4 writes a single doc row -- so a
-        # pack_id step 4's OWN self-path-inference (or graph-twin lookup, or
-        # a value an interrupted prior run already stamped) would assign,
-        # but that has NO graph content of its own (invisible to step 3's
-        # graph-only enumeration above), still gets a registry row before
-        # any content is attributed to it. See _register_doc_packs'
-        # docstring. Folded into "registry_enumeration" rather than a new
-        # stage (module docstring SAFETY documents exactly four stages) --
-        # this is the SAME responsibility ("has every real pack_id reached
-        # the registry") executed in two passes over two provenances.
-        print("\n3.5) Registering document-derived pack_ids (preflight before doc backfill writes)...")
         try:
-            doc_registry_stats = _register_doc_packs(
-                sql,
-                docs,
-                graph,
-                owner_id,
-                default_pack_id,
-                args.apply,
-                args.accept_foreign_owned_packs,
-                already_planned_pack_ids={default_pack_id, *registry_stats.get("candidates", ())},
-            )
-        except Exception as exc:
-            # Defensive, and deliberately so: today the
-            # stage_outcomes["registry_enumeration"] assignment happens BELOW
-            # this block, so the outer handler's setdefault would already
-            # record "failed" on its own. Writing it explicitly here keeps
-            # that true if the assignment is ever moved back above step 3.5
-            # (where it lived before this step existed) -- at which point
-            # setdefault would silently preserve step 3's "clean"/"applied"
-            # and hide this failure. The reason string below is also more
-            # specific than the outer handler's bare str(exc).
-            stage_outcomes["registry_enumeration"] = {
-                "outcome": "failed",
-                "reason": f"document-derived pack_id registration (step 3.5) failed: {exc}",
-            }
-            raise
+            # issue #141 항목 4: 이 전체 시퀀스(스토어 생성 + 5단계 백필)가
+            # write.lock 을 전혀 잡지 않아 다른 프로세스와 동시에 돌면 그래프/
+            # 문서/SQL 파일에 레이스가 났다. --apply 가 아니면(드라이런) 각
+            # 스테이지 함수가 실제 쓰기를 내지 않으므로 잠그지 않는다 --
+            # 다만 스토어 생성 자체의 스키마 부트스트랩 DDL은 드라이런에서도
+            # 이미 opencrab.stores._sqlite_base._SqliteConnMixin._bootstrap_lock
+            # 이 보호한다(항목 2 수정).
+            #
+            # 독립 검증(codex + fable verifier, 2026-09-05)에서 이전 버전은
+            # make_vector_store(settings) 를 write_lock 블록 "안"에서 호출해,
+            # 로컬 chroma 백엔드일 때 write.lock(바깥)/chroma.lock(안쪽) 이 되어
+            # #140/#320 이 정한 chroma.lock(바깥)/write.lock(안쪽) 순서를
+            # 뒤집었다(주석은 반대로 적혀 있었으나 실제 들여쓰기가 그랬다).
+            # 세 스토어 생성을 write_lock 진입보다 먼저(이 블록 밖)로 옮겨
+            # 순서를 바로잡는다 -- ChromaStore 생성자가 그 자신의 수명 동안
+            # chroma.lock 을 쥐고 반환된 뒤에야 write_lock 에 들어간다. 생성
+            # 실패 시에도 이미 바깥 try(#140)가 graph/docs/vector 를 finally
+            # 에서 닫으므로 정리 보장은 그대로다.
+            graph = make_graph_store(settings)
+            docs = make_doc_store(settings)
+            vector = make_vector_store(settings)
 
-        doc_unregistered = int(doc_registry_stats.get("unregistered") or 0)
-        if registry_outcome == "skipped":
-            # A graph-side scope gap (unavailable graph/edges) is unrelated
-            # to doc-derived registration progress -- stays authoritative
-            # regardless of what step 3.5 just did.
-            pass
-        else:
-            graph_registry_pending = registry_pending
-            registry_pending += doc_unregistered
-            if registry_pending == 0:
-                registry_outcome, registry_reason = "clean", "nothing to do"
-            else:
-                registry_outcome, registry_reason = (
-                    "applied",
-                    f"{registry_pending} row(s) needed registering "
-                    f"(default+graph-derived={graph_registry_pending}, "
-                    f"doc-derived={doc_unregistered})",
+            from contextlib import nullcontext
+
+            from opencrab.locking import write_lock
+
+            _lock_ctx = write_lock(settings.local_data_dir) if args.apply else nullcontext()
+            with _lock_ctx:
+                print("\n1) Ensuring the default (catch-all) pack is registered...")
+                default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
+
+                print("\n2) Backfilling graph rows with no pack_id...")
+                # dict.fromkeys: dedupe while keeping order. The qualified graph
+                # schema already enforces one row per node_id; this also keeps a
+                # legacy/corrupt source from generating duplicate vector probes.
+                node_ids_needing_check = list(dict.fromkeys(_graph_missing_node_ids(graph)))
+                local_db_path = _local_graph_db_path(settings)
+                # Predicted BEFORE the backfill writes anything -- resolve_row_pack_id
+                # applied to each node's pre-backfill state (#146 M P1-1).
+                node_pack_map, ambiguous_nodes = (
+                    _predict_node_pack_map(local_db_path, node_ids_needing_check, default_pack_id)
+                    if local_db_path is not None
+                    else ({}, {})
+                )
+                graph_stats = _backfill_graph(settings, default_pack_id, args.apply)
+                if args.apply and local_db_path is not None:
+                    # Ground truth AFTER the write -- verifies the prediction above
+                    # actually matches what backfill_pack_ids wrote, and is what
+                    # vector backfill (step 5) uses from here on: real measurement
+                    # beats prediction whenever both exist.
+                    actual_pack_map, actual_ambiguous = _read_actual_node_pack_ids(
+                        local_db_path, node_ids_needing_check
+                    )
+                    diverged = {
+                        nid
+                        for nid in set(node_pack_map) | set(actual_pack_map)
+                        if node_pack_map.get(nid) != actual_pack_map.get(nid)
+                    }
+                    if diverged:
+                        print(
+                            f"  WARNING: predicted vs actual pack_id diverged for "
+                            f"{len(diverged)} node(s) -- resolve_row_pack_id/"
+                            f"backfill_pack_ids contract mismatch: {sorted(diverged)}"
+                        )
+                    if set(ambiguous_nodes) != set(actual_ambiguous):
+                        print(
+                            f"  WARNING: predicted vs actual AMBIGUOUS sets diverged "
+                            f"(predicted {sorted(ambiguous_nodes)}, actual "
+                            f"{sorted(actual_ambiguous)})"
+                        )
+                    node_pack_map, ambiguous_nodes = actual_pack_map, actual_ambiguous
+                for nid, packs in sorted(ambiguous_nodes.items()):
+                    print(
+                        f"  WARNING: node_id {nid!r} maps to CONFLICTING pack_ids "
+                        f"{packs} across its graph rows -- the vector store's "
+                        f"identity is node_id alone, so no single value is correct; "
+                        f"excluded from vector backfill (vector_ambiguous)."
+                    )
+                graph_outcome, graph_reason = _stage_outcome(
+                    graph_stats,
+                    ("nodes_inferred", "nodes_assumed", "edges_inferred", "edges_assumed"),
+                )
+                # Row-level skips (non-dict JSON properties etc. -- rows
+                # backfill_pack_ids could NOT attribute) leave pack_id-less rows
+                # behind, which violates invariant 5 exactly like a whole-stage
+                # skip does.  Demote the stage so it gates the exit code; always
+                # surface the counts in the summary.
+                rows_skipped = int(graph_stats.get("nodes_skipped") or 0) + int(
+                    graph_stats.get("edges_skipped") or 0
+                )
+                if rows_skipped and graph_outcome != "skipped":
+                    graph_outcome = "skipped"
+                    graph_reason = (
+                        f"{rows_skipped} row(s) left unattributed "
+                        f"(nodes_skipped={graph_stats.get('nodes_skipped') or 0}, "
+                        f"edges_skipped={graph_stats.get('edges_skipped') or 0}) -- "
+                        f"was: {graph_reason}"
+                    )
+                stage_outcomes["graph_backfill"] = {"outcome": graph_outcome, "reason": graph_reason}
+
+                print("\n3) Registering graph pack_ids (including any this step's inference just found)...")
+                registry_stats = _register_graph_packs(
+                    sql,
+                    graph,
+                    owner_id,
+                    args.apply,
+                    node_pack_map=node_pack_map,
+                    ambiguous_nodes=ambiguous_nodes,
+                    accept_foreign_owned_packs=args.accept_foreign_owned_packs,
+                )
+                graph_available_for_enum = getattr(graph, "available", False)
+                # `default` can legitimately appear among the GRAPH candidates too --
+                # a packless graph row makes step 2 predict `default` for it, and in a
+                # dry-run step 1 has not actually inserted the row yet, so step 3 still
+                # sees it as unregistered. Adding that to `default_pending` would count
+                # the one `default` row twice, making the dry-run report a bigger total
+                # than the --apply run (where step 1's real insert removes it from the
+                # graph candidates). Count DISTINCT rows: `default_pending` owns the
+                # `default` row, so drop it from the graph side. (PR #177 review round 5.)
+                graph_candidates = set(registry_stats.get("candidates") or ()) - {default_pack_id}
+                registry_pending = default_pending + len(graph_candidates)
+                if not graph_available_for_enum:
+                    # Unconditional: registering the default pack is NOT the same
+                    # thing as having enumerated the graph's pack_ids.  (An earlier
+                    # version reported "applied" here whenever default_pending was
+                    # set, which let a fresh registry + unavailable-wrapper run
+                    # exit 0 with the graph's packs never registered.)
+                    registry_outcome, registry_reason = (
+                        "skipped",
+                        "graph unavailable -- pack_id enumeration skipped (default-pack registration still ran)",
+                    )
+                elif not registry_stats.get("edges_enumerable", True):
+                    registry_outcome, registry_reason = (
+                        "skipped",
+                        "graph_edges could not be scanned for pack_id on this backend "
+                        "(no _table/_fetch_all -- e.g. Kuzu/Neo4j, #182 scope) -- an "
+                        "edge-only pack_id may exist unregistered",
+                    )
+                elif registry_pending == 0:
+                    registry_outcome, registry_reason = "clean", "nothing to do"
+                else:
+                    registry_outcome, registry_reason = "applied", f"{registry_pending} row(s) needed registering"
+
+                # 3.5) R5-B (PR #177 review round 5 P1): register every DOC-derived
+                # pack_id too -- BEFORE step 4 writes a single doc row -- so a
+                # pack_id step 4's OWN self-path-inference (or graph-twin lookup, or
+                # a value an interrupted prior run already stamped) would assign,
+                # but that has NO graph content of its own (invisible to step 3's
+                # graph-only enumeration above), still gets a registry row before
+                # any content is attributed to it. See _register_doc_packs'
+                # docstring. Folded into "registry_enumeration" rather than a new
+                # stage (module docstring SAFETY documents exactly four stages) --
+                # this is the SAME responsibility ("has every real pack_id reached
+                # the registry") executed in two passes over two provenances.
+                print("\n3.5) Registering document-derived pack_ids (preflight before doc backfill writes)...")
+                try:
+                    doc_registry_stats = _register_doc_packs(
+                        sql,
+                        docs,
+                        graph,
+                        owner_id,
+                        default_pack_id,
+                        args.apply,
+                        args.accept_foreign_owned_packs,
+                        already_planned_pack_ids={default_pack_id, *registry_stats.get("candidates", ())},
+                    )
+                except Exception as exc:
+                    # Defensive, and deliberately so: today the
+                    # stage_outcomes["registry_enumeration"] assignment happens BELOW
+                    # this block, so the outer handler's setdefault would already
+                    # record "failed" on its own. Writing it explicitly here keeps
+                    # that true if the assignment is ever moved back above step 3.5
+                    # (where it lived before this step existed) -- at which point
+                    # setdefault would silently preserve step 3's "clean"/"applied"
+                    # and hide this failure. The reason string below is also more
+                    # specific than the outer handler's bare str(exc).
+                    stage_outcomes["registry_enumeration"] = {
+                        "outcome": "failed",
+                        "reason": f"document-derived pack_id registration (step 3.5) failed: {exc}",
+                    }
+                    raise
+
+                doc_unregistered = int(doc_registry_stats.get("unregistered") or 0)
+                if registry_outcome == "skipped":
+                    # A graph-side scope gap (unavailable graph/edges) is unrelated
+                    # to doc-derived registration progress -- stays authoritative
+                    # regardless of what step 3.5 just did.
+                    pass
+                else:
+                    graph_registry_pending = registry_pending
+                    registry_pending += doc_unregistered
+                    if registry_pending == 0:
+                        registry_outcome, registry_reason = "clean", "nothing to do"
+                    else:
+                        registry_outcome, registry_reason = (
+                            "applied",
+                            f"{registry_pending} row(s) needed registering "
+                            f"(default+graph-derived={graph_registry_pending}, "
+                            f"doc-derived={doc_unregistered})",
+                        )
+
+                # PR #177 review round 6 P1: a malformed document-derived pack_id
+                # value (present, truthy, but not a non-empty string -- e.g.
+                # {"pack_id": 12345}) is excluded from registration by step 3.5
+                # above (see _register_doc_packs) and is NEVER backfilled by step 4
+                # either (_missing_and_set_sql's predicate only matches NULL/''), so
+                # no stage's own outcome computation would otherwise notice it --
+                # the run would exit 0 while that row still points at no registry
+                # entry, which is exactly the invariant-5 violation this whole
+                # exit-code discipline exists to catch. Demote registry_enumeration
+                # here, AFTER its own outcome is fully computed above, so this
+                # demotion always wins over a later "clean"/"applied" recomputation.
+                malformed_excluded = int(doc_registry_stats.get("malformed_excluded") or 0)
+                if malformed_excluded:
+                    malformed_reason = (
+                        f"{malformed_excluded} document-derived pack_id value(s) "
+                        "were malformed (present but not a non-empty string) and "
+                        "excluded from registration -- the row(s) they came from "
+                        "still point at no registry entry and were left unchanged "
+                        "by step 4 (an operator must resolve them manually; this "
+                        "migration never guesses a malformed pack_id's correct "
+                        "value)"
+                    )
+                    if registry_outcome == "skipped":
+                        # Don't clobber a more specific existing skip reason (graph
+                        # unavailable, edges not enumerable) -- append instead.
+                        registry_reason = f"{registry_reason}; also: {malformed_reason}"
+                    else:
+                        registry_outcome, registry_reason = "skipped", malformed_reason
+                stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
+
+                print("\n4) Backfilling doc rows with no pack_id...")
+                doc_stats = _backfill_doc(docs, graph, default_pack_id, args.apply)
+                stage_outcomes["docs_backfill"] = dict(
+                    zip(("outcome", "reason"), _docs_stage_outcome(doc_stats), strict=True)
                 )
 
-        # PR #177 review round 6 P1: a malformed document-derived pack_id
-        # value (present, truthy, but not a non-empty string -- e.g.
-        # {"pack_id": 12345}) is excluded from registration by step 3.5
-        # above (see _register_doc_packs) and is NEVER backfilled by step 4
-        # either (_missing_and_set_sql's predicate only matches NULL/''), so
-        # no stage's own outcome computation would otherwise notice it --
-        # the run would exit 0 while that row still points at no registry
-        # entry, which is exactly the invariant-5 violation this whole
-        # exit-code discipline exists to catch. Demote registry_enumeration
-        # here, AFTER its own outcome is fully computed above, so this
-        # demotion always wins over a later "clean"/"applied" recomputation.
-        malformed_excluded = int(doc_registry_stats.get("malformed_excluded") or 0)
-        if malformed_excluded:
-            malformed_reason = (
-                f"{malformed_excluded} document-derived pack_id value(s) "
-                "were malformed (present but not a non-empty string) and "
-                "excluded from registration -- the row(s) they came from "
-                "still point at no registry entry and were left unchanged "
-                "by step 4 (an operator must resolve them manually; this "
-                "migration never guesses a malformed pack_id's correct "
-                "value)"
-            )
-            if registry_outcome == "skipped":
-                # Don't clobber a more specific existing skip reason (graph
-                # unavailable, edges not enumerable) -- append instead.
-                registry_reason = f"{registry_reason}; also: {malformed_reason}"
-            else:
-                registry_outcome, registry_reason = "skipped", malformed_reason
-        stage_outcomes["registry_enumeration"] = {"outcome": registry_outcome, "reason": registry_reason}
+                print("\n5) Backfilling vector rows with no pack_id (best-effort)...")
+                vector_in_scope = (
+                    hasattr(vector, "get_by_id")
+                    and hasattr(vector, "upsert_texts")
+                    and getattr(vector, "available", False)
+                )
+                vector_stats = _backfill_vector(vector, node_ids_needing_check, node_pack_map, args.apply)
+                vector_stats["ambiguous"] = len(ambiguous_nodes)
+                if ambiguous_nodes:
+                    print(f"  vector_ambiguous={len(ambiguous_nodes)} (see WARNINGs above)")
+                if not vector_in_scope:
+                    vector_outcome, vector_reason = (
+                        "skipped",
+                        "vector store unavailable or missing get_by_id/upsert_texts (best-effort only, see module docstring SCOPE)",
+                    )
+                else:
+                    vector_outcome, vector_reason = _stage_outcome(vector_stats, ("missing",))
+                stage_outcomes["vector_backfill"] = {"outcome": vector_outcome, "reason": vector_reason}
+        except Exception as exc:
+            # Whichever named stage above didn't get an entry yet is the one
+            # that failed -- fill it in explicitly rather than leaving it
+            # implicit, so the summary always accounts for all four stages.
+            for name in ("graph_backfill", "registry_enumeration", "docs_backfill", "vector_backfill"):
+                stage_outcomes.setdefault(name, {"outcome": "failed", "reason": str(exc)})
+            print(f"\n! stage failed: {exc}", file=sys.stderr)
+            print("\nSummary (incomplete -- a stage failed, later stages did not run):")
+            for name, info in stage_outcomes.items():
+                print(f"  {name}: {info['outcome']} ({info['reason']})")
+            return 1
+        finally:
+            # #140: the vector store may be a local ChromaStore holding
+            # chroma.lock for its lifetime. Nothing below this point uses the
+            # stores, so closing here is the last moment that is still inside the
+            # boundary which the creations sit in.
+            from opencrab.locking import close_quietly
 
-        print("\n4) Backfilling doc rows with no pack_id...")
-        doc_stats = _backfill_doc(docs, graph, default_pack_id, args.apply)
-        stage_outcomes["docs_backfill"] = dict(
-            zip(("outcome", "reason"), _docs_stage_outcome(doc_stats), strict=True)
-        )
+            for _store, _what in (
+                (vector, "vector store"),
+                (docs, "doc store"),
+                (graph, "graph store"),
+            ):
+                close_quietly(_store, _what)
 
-        print("\n5) Backfilling vector rows with no pack_id (best-effort)...")
-        vector_in_scope = (
-            hasattr(vector, "get_by_id")
-            and hasattr(vector, "upsert_texts")
-            and getattr(vector, "available", False)
-        )
-        vector_stats = _backfill_vector(vector, node_ids_needing_check, node_pack_map, args.apply)
-        vector_stats["ambiguous"] = len(ambiguous_nodes)
-        if ambiguous_nodes:
-            print(f"  vector_ambiguous={len(ambiguous_nodes)} (see WARNINGs above)")
-        if not vector_in_scope:
-            vector_outcome, vector_reason = (
-                "skipped",
-                "vector store unavailable or missing get_by_id/upsert_texts (best-effort only, see module docstring SCOPE)",
-            )
-        else:
-            vector_outcome, vector_reason = _stage_outcome(vector_stats, ("missing",))
-        stage_outcomes["vector_backfill"] = {"outcome": vector_outcome, "reason": vector_reason}
-    except Exception as exc:
-        # Whichever named stage above didn't get an entry yet is the one
-        # that failed -- fill it in explicitly rather than leaving it
-        # implicit, so the summary always accounts for all four stages.
-        for name in ("graph_backfill", "registry_enumeration", "docs_backfill", "vector_backfill"):
-            stage_outcomes.setdefault(name, {"outcome": "failed", "reason": str(exc)})
-        print(f"\n! stage failed: {exc}", file=sys.stderr)
-        print("\nSummary (incomplete -- a stage failed, later stages did not run):")
+        print("\nSummary:")
         for name, info in stage_outcomes.items():
             print(f"  {name}: {info['outcome']} ({info['reason']})")
-        return 1
+        if not args.apply:
+            print("\nDry-run. Re-run with --apply (and --backup-to/--skip-backup) to perform writes.")
+
+        # graph_backfill, docs_backfill AND registry_enumeration gate the exit
+        # code -- stages whose SCOPE limits mean #147's read-path scoping would
+        # be built on incompletely-inspected (or never-registered) data.
+        # registry_enumeration gates in its own right: its skip is NOT always
+        # accompanied by a graph_backfill skip -- a readable graph.db with an
+        # unavailable graph *wrapper* backfills "clean" while enumeration is
+        # skipped, leaving the graph's packs unregistered.  vector_backfill
+        # alone stays out: it is documented as best-effort FOREVER (module
+        # docstring SCOPE) regardless of store availability -- it was never a
+        # completeness guarantee, so its skip doesn't gate deployment.
+        gating = {
+            stage_outcomes[n]["outcome"]
+            for n in ("graph_backfill", "docs_backfill", "registry_enumeration")
+        }
+        if "skipped" in gating:
+            print(
+                "\n! graph_backfill, docs_backfill and/or registry_enumeration "
+                "was skipped (out of scope) -- exit code 3. #147 must not "
+                "deploy against a code-3 run: some backend's data was never "
+                "even inspected or registered.",
+                file=sys.stderr,
+            )
+            return 3
+        return 0
     finally:
-        # #140: the vector store may be a local ChromaStore holding
-        # chroma.lock for its lifetime. Nothing below this point uses the
-        # stores, so closing here is the last moment that is still inside the
-        # boundary which the creations sit in.
-        from opencrab.locking import close_quietly
-
-        for _store, _what in (
-            (vector, "vector store"),
-            (docs, "doc store"),
-            (graph, "graph store"),
-        ):
-            close_quietly(_store, _what)
-
-    print("\nSummary:")
-    for name, info in stage_outcomes.items():
-        print(f"  {name}: {info['outcome']} ({info['reason']})")
-    if not args.apply:
-        print("\nDry-run. Re-run with --apply (and --backup-to/--skip-backup) to perform writes.")
-
-    # graph_backfill, docs_backfill AND registry_enumeration gate the exit
-    # code -- stages whose SCOPE limits mean #147's read-path scoping would
-    # be built on incompletely-inspected (or never-registered) data.
-    # registry_enumeration gates in its own right: its skip is NOT always
-    # accompanied by a graph_backfill skip -- a readable graph.db with an
-    # unavailable graph *wrapper* backfills "clean" while enumeration is
-    # skipped, leaving the graph's packs unregistered.  vector_backfill
-    # alone stays out: it is documented as best-effort FOREVER (module
-    # docstring SCOPE) regardless of store availability -- it was never a
-    # completeness guarantee, so its skip doesn't gate deployment.
-    gating = {
-        stage_outcomes[n]["outcome"]
-        for n in ("graph_backfill", "docs_backfill", "registry_enumeration")
-    }
-    if "skipped" in gating:
-        print(
-            "\n! graph_backfill, docs_backfill and/or registry_enumeration "
-            "was skipped (out of scope) -- exit code 3. #147 must not "
-            "deploy against a code-3 run: some backend's data was never "
-            "even inspected or registered.",
-            file=sys.stderr,
-        )
-        return 3
-    return 0
+        close_quietly(sql, "sql store")
 
 
 if __name__ == "__main__":

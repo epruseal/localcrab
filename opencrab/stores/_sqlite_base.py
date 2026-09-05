@@ -300,6 +300,26 @@ class _SqliteConnMixin:
                     logger.debug("%s.close: connection close error: %s", type(self).__name__, exc)
             self._all_conns.clear()
 
+    @contextlib.contextmanager
+    def _bootstrap_lock(self) -> Iterator[None]:
+        """스키마 부트스트랩(DDL)을 이 스토어 파일이 있는 디렉터리의
+        write.lock 으로 감싼다(issue #141 항목 2).
+
+        스토어 생성자는 Settings 객체가 아니라 파일 경로(``self._db_path``)만
+        알므로, 잠금 디렉터리도 프로세스 기본 데이터 디렉터리가 아니라 그
+        파일 자신의 부모 디렉터리에서 구한다 — 마이그레이션 스크립트와
+        테스트는 흔히 프로세스 기본과 다른 데이터 디렉터리를 대상으로 돈다.
+        ``write_lock`` 은 스레드·경로 기준으로 재진입 가능하므로(``opencrab
+        .locking.file_lock``), 이미 같은 디렉터리의 write.lock 을 쥔 진입점
+        (``ingest``/``extract`` 등) 안에서 스토어가 생성돼도 추가 대기 없이
+        곧바로 진행된다.
+        """
+        from opencrab.locking import write_lock
+
+        data_dir = os.path.dirname(os.path.abspath(self._db_path))
+        with write_lock(data_dir):
+            yield
+
     def _require_available(self) -> None:
         if not getattr(self, "_available", False):
             raise RuntimeError(f"{type(self).__name__} is not available.")

@@ -98,52 +98,69 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         # _available=False 로 남고 이후 모든 쓰기는 _require_available()에서 막혀
         # _tx()까지 도달하지 못하므로, 여기서 미완료로 남는 부분 실행분이 나중
         # 커밋에 묻어 들어갈 경로 자체가 없다(#79 재검증에서 확인된 구분점).
+        # issue #141 항목 2: 핵심 DDL과 FTS5 백필 전체를 write.lock 으로
+        # 감싼다 — 재진입 가능하므로 이미 락을 쥔 진입점 안에서도 안전.
+        #
+        # codex 리뷰(PR #323, 회귀 게이트에서 발견): _bootstrap_lock() 자체의
+        # 획득 실패(예: 존재하지 않는 부모 디렉터리에서 락 파일 경로를 만들려다
+        # 나는 OSError)를 이 바깥 try 하나로 잡는다 — 안쪽 두 try(핵심 DDL,
+        # FTS5)는 각자 자기 예외를 이미 삼키므로 이 바깥 except 에는 락 획득
+        # 실패만 걸린다. FTS5 블록은 (양쪽 검증자가 지적한 대로) 반드시
+        # with 본문 "안"에 있어야 한다 — 밖으로 나가면 백필 INSERT 가
+        # write.lock 없이 돌아 항목2 가 막으려던 프로세스 간 TOCTOU 가
+        # 되돌아온다.
         try:
-            conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma
-            cur = conn.cursor()
-            for ddl in SQLITE.render_ddl(DOC_STORE_SCHEMA):
-                cur.execute(ddl)
-            conn.commit()
-            self._available = True
-            logger.info("LocalSQLDocStore initialised at %s", self._db_path)
+            with self._bootstrap_lock():
+                try:
+                    conn = self._conn  # 이 스레드 커넥션 생성 + WAL pragma
+                    cur = conn.cursor()
+                    for ddl in SQLITE.render_ddl(DOC_STORE_SCHEMA):
+                        cur.execute(ddl)
+                    conn.commit()
+                    self._available = True
+                    logger.info("LocalSQLDocStore initialised at %s", self._db_path)
+                except Exception as exc:
+                    logger.warning("LocalSQLDocStore init failed: %s", exc)
+                    self._available = False
+                    return
+                # FTS5 키워드 색인(선택) — 빌드에 FTS5 모듈이 없으면 graceful 비활성.
+                # 본문(doc_sources.text)을 한+영 unicode61 토크나이저로 색인 → 약어·표준번호·영어
+                # 다중어 질의 정확매칭(하이브리드 키워드 레그). 미가용 시 supports_keyword=False.
+                #
+                # 핵심 DDL과 달리 이 블록은 실패해도 store가 available인 채로 남는다
+                # (_fts_ok=False일 뿐) — 즉 이후 정상 _tx() 쓰기가 실제로 일어난다.
+                # CREATE VIRTUAL TABLE 자체는 DDL이라 파이썬 sqlite3의 암묵적 BEGIN 대상이
+                # 아니라 즉시 개별 커밋되며(IF NOT EXISTS라 멱등이므로 무해), 여기서 막는
+                # 대상은 그다음 백필 INSERT(DML)다: 그 INSERT가 실패하면 sqlite3는 그
+                # 문장이 시작한 트랜잭션을 커밋도 롤백도 하지 않은 채 커넥션에 열어 두고,
+                # _tx() 없이 그냥 삼키면 그 열린 트랜잭션이 바로 다음 정상 쓰기의 commit()에
+                # 얹혀 확정된다 — 이 이슈가 말하는 결함 그대로. _tx()는 실패 즉시
+                # rollback()을 호출해 그 열린 트랜잭션을 정리한다.
+                try:
+                    with self._tx() as tx_conn:
+                        cur = tx_conn.cursor()
+                        cur.execute(
+                            "CREATE VIRTUAL TABLE IF NOT EXISTS doc_sources_fts USING fts5("
+                            "source_id UNINDEXED, text, "
+                            "tokenize='unicode61 remove_diacritics 0')"
+                        )
+                        # 최초 1회 마이그레이션(idempotent): FTS 비었고 본문이 있으면 일괄 색인.
+                        n_fts = cur.execute("SELECT count(*) FROM doc_sources_fts").fetchone()[0]
+                        n_src = cur.execute("SELECT count(*) FROM doc_sources").fetchone()[0]
+                        if n_fts == 0 and n_src > 0:
+                            cur.execute(
+                                "INSERT INTO doc_sources_fts(source_id, text) "
+                                "SELECT source_id, text FROM doc_sources"
+                            )
+                            logger.info("doc_sources_fts migrated %d rows", n_src)
+                    self._fts_ok = True
+                except Exception as exc:
+                    logger.warning("FTS5 keyword index unavailable (graceful): %s", exc)
+                    self._fts_ok = False
         except Exception as exc:
-            logger.warning("LocalSQLDocStore init failed: %s", exc)
+            logger.warning("LocalSQLDocStore bootstrap lock failed: %s", exc)
             self._available = False
             return
-        # FTS5 키워드 색인(선택) — 빌드에 FTS5 모듈이 없으면 graceful 비활성.
-        # 본문(doc_sources.text)을 한+영 unicode61 토크나이저로 색인 → 약어·표준번호·영어
-        # 다중어 질의 정확매칭(하이브리드 키워드 레그). 미가용 시 supports_keyword=False.
-        #
-        # 핵심 DDL과 달리 이 블록은 실패해도 store가 available인 채로 남는다
-        # (_fts_ok=False일 뿐) — 즉 이후 정상 _tx() 쓰기가 실제로 일어난다.
-        # CREATE VIRTUAL TABLE 자체는 DDL이라 파이썬 sqlite3의 암묵적 BEGIN 대상이
-        # 아니라 즉시 개별 커밋되며(IF NOT EXISTS라 멱등이므로 무해), 여기서 막는
-        # 대상은 그다음 백필 INSERT(DML)다: 그 INSERT가 실패하면 sqlite3는 그
-        # 문장이 시작한 트랜잭션을 커밋도 롤백도 하지 않은 채 커넥션에 열어 두고,
-        # _tx() 없이 그냥 삼키면 그 열린 트랜잭션이 바로 다음 정상 쓰기의 commit()에
-        # 얹혀 확정된다 — 이 이슈가 말하는 결함 그대로. _tx()는 실패 즉시
-        # rollback()을 호출해 그 열린 트랜잭션을 정리한다.
-        try:
-            with self._tx() as tx_conn:
-                cur = tx_conn.cursor()
-                cur.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS doc_sources_fts USING fts5("
-                    "source_id UNINDEXED, text, "
-                    "tokenize='unicode61 remove_diacritics 0')"
-                )
-                # 최초 1회 마이그레이션(idempotent): FTS 비었고 본문이 있으면 일괄 색인.
-                n_fts = cur.execute("SELECT count(*) FROM doc_sources_fts").fetchone()[0]
-                n_src = cur.execute("SELECT count(*) FROM doc_sources").fetchone()[0]
-                if n_fts == 0 and n_src > 0:
-                    cur.execute(
-                        "INSERT INTO doc_sources_fts(source_id, text) "
-                        "SELECT source_id, text FROM doc_sources"
-                    )
-                    logger.info("doc_sources_fts migrated %d rows", n_src)
-            self._fts_ok = True
-        except Exception as exc:
-            logger.warning("FTS5 keyword index unavailable (graceful): %s", exc)
-            self._fts_ok = False
 
     # ------------------------------------------------------------------
     # Availability / lifecycle

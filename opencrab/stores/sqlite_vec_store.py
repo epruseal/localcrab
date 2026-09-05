@@ -292,31 +292,34 @@ class SqliteVecStore(_SqliteConnMixin):
         return "embedding_bit" in cols
 
     def _init_db(self) -> None:
+        # issue #141 항목 2: CREATE TABLE 을 write.lock 으로 감싼다(재진입
+        # 가능하므로 이미 락을 쥔 진입점 안에서도 안전).
         try:
             import os
 
             parent = os.path.dirname(self._db_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            conn = self._conn
-            # New/empty DBs get the bit column at CREATE when ann=binary; an
-            # EXISTING float-only table is left untouched (IF NOT EXISTS) — vec0
-            # cannot ALTER TABLE ADD COLUMN, so pre-existing DBs are upgraded by
-            # scripts/migrate_add_binary_quantization.py (rebuild pattern).
-            conn.execute(self._create_table_sql(with_bit=(self._ann == "binary")))
-            conn.commit()
-            # Gate the write path on the ACTUAL schema, not the config flag:
-            # once embedding_bit exists vec0 rejects INSERTs without it, and a
-            # never-migrated DB must keep the original INSERT byte-for-byte.
-            self._has_bit_column = self._detect_bit_column(conn)
-            if self._ann == "binary" and not self._has_bit_column:
-                logger.warning(
-                    "SqliteVecStore: ann='binary' requested but table '%s' has "
-                    "no embedding_bit column — falling back to exact search. "
-                    "Run scripts/migrate_add_binary_quantization.py to backfill.",
-                    self._table,
-                )
-            self._available = True
+            with self._bootstrap_lock():
+                conn = self._conn
+                # New/empty DBs get the bit column at CREATE when ann=binary; an
+                # EXISTING float-only table is left untouched (IF NOT EXISTS) — vec0
+                # cannot ALTER TABLE ADD COLUMN, so pre-existing DBs are upgraded by
+                # scripts/migrate_add_binary_quantization.py (rebuild pattern).
+                conn.execute(self._create_table_sql(with_bit=(self._ann == "binary")))
+                conn.commit()
+                # Gate the write path on the ACTUAL schema, not the config flag:
+                # once embedding_bit exists vec0 rejects INSERTs without it, and a
+                # never-migrated DB must keep the original INSERT byte-for-byte.
+                self._has_bit_column = self._detect_bit_column(conn)
+                if self._ann == "binary" and not self._has_bit_column:
+                    logger.warning(
+                        "SqliteVecStore: ann='binary' requested but table '%s' has "
+                        "no embedding_bit column — falling back to exact search. "
+                        "Run scripts/migrate_add_binary_quantization.py to backfill.",
+                        self._table,
+                    )
+                self._available = True
             logger.info(
                 "SqliteVecStore initialised at %s (table=%s, dim=%d, ann=%s, "
                 "bit_column=%s)",
