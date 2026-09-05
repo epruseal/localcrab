@@ -178,9 +178,13 @@ SELECT COUNT(*) FROM graph_nodes
 
 `pack_id` 없이 `source`/`source_id` 로만 태그된 `graph_nodes`/`graph_edges`/`doc_nodes`
 행은 회수 술어와 증분 대사 술어 어느 쪽에도 직접 안 걸린다(`pack`-only 잔여는 위 "`pack`
-만 있고..." 판정대로 무해, 이 사각지대와 안 섞인다). **단 `graph_edges` 는 예외가 있다**
-— 그런 엣지도 양 끝 노드 중 하나가 `pack_id` 로 회수되면 `graph.delete_node()` 의
-cascade 로 함께 지워진다(엣지 자신의 태그와 무관). 이 문단이 말하는 "안 걸린다"는 양 끝
+만 있고..." 판정대로 무해, 이 사각지대와 안 섞인다). **단 `graph_edges` 와 `doc_nodes` 는
+예외가 있다** — 그런 엣지도 양 끝 노드 중 하나가 `pack_id` 로 회수되면 `graph.delete_node()`
+의 cascade 로 함께 지워진다(엣지 자신의 태그와 무관). `doc_nodes` 트윈도 마찬가지다 —
+`delete_pack` 은 `pack_id` 로 고른 각 graph 노드의 `node_id` 로
+`docs.delete_node_doc(space, node_id)` 를 그 doc_nodes 행 자신의 태그와 무관하게
+호출하므로, `source`/`source_id`-only 로만 태그된 doc_nodes 트윈도 같은 node_id 의 graph
+노드가 `pack_id` 로 회수되면 함께 지워진다. 이 문단이 말하는 "안 걸린다"는 양 끝/짝
 노드가 어느 팩에도 안 걸린 경우다. `load.fallback_tag_without_pack_id_counts()` 가 그
 잔여의 존재를 전역(팩 비한정)으로 탐지한다(localcrab #164) — 실제로 그런 행이 나오면
 어떻게 닫을지(생산자 `pack_id` 필수화 vs 주기적 sweep), 그리고 이 함수를 실제 진단

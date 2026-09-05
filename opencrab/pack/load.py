@@ -1170,11 +1170,14 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     # 위 nodes 조회와 동일한 폭이다. 이 폭은 회수(delete_pack, 역시 pack_id 단일
     # 키)와 이미 같다(F6/G6) — 둘 다 4키 시절은 지났다. 남는 사각지대는 `pack_id`
     # 자체가 없고 `source`/`source_id` 로만 태그된 행이며, 그 행은 회수/대사
-    # 술어가 직접 조회하지는 않는다(단 `graph_edges` 는 예외 — 양 끝 노드가
-    # `pack_id` 로 회수되면 그 cascade 로 함께 지워진다,
+    # 술어가 직접 조회하지는 않는다(단 `graph_edges` 와 `doc_nodes` 는 예외 —
+    # `graph_edges` 는 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로, 이
+    # `doc_nodes` 축 자신도 짝 graph 노드가 `pack_id` 로 회수되면 `delete_pack`
+    # 이 그 node_id 로 부르는 `docs.delete_node_doc()` 로 함께 지워진다,
     # `fallback_tag_without_pack_id_counts()` docstring의 "graph_edges 는 독립
-    # 회수 경로가 없다" 문단 참고) — `fallback_tag_without_pack_id_counts()` 가
-    # 그 존재만 전역으로 탐지한다(localcrab #164).
+    # 회수 경로가 없다"와 "doc_nodes 트윈도 간접 회수된다" 두 문단 참고) —
+    # `fallback_tag_without_pack_id_counts()` 가 그 존재만 전역으로 탐지한다
+    # (localcrab #164).
     dn_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
     anchor_sql = build_anchor_sql(docs._dialect)
     doc_node_spaces: dict[str, set[str]] = {}

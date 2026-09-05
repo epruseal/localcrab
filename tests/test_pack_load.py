@@ -2311,6 +2311,11 @@ class TestFallbackTagWithoutPackIdCounts:
             "pack_id 소유 graph 노드의 doc_nodes 트윈이 delete_pack 뒤에도 남았다"
             " — node_id 키 삭제가 더는 그 트윈에 안 닿는다는 뜻이라 이 테스트 전제가 깨진다")
 
+        after = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert after["doc_nodes"] == 0, (
+            "delete_pack 으로 이미 지워진 doc_nodes 트윈이 fallback 카운트에도 잡혔다"
+            " — 존재하지 않는 행을 셌다")
+
 
 class TestFallbackTagPostgresDialect:
     """`fallback_tag_without_pack_id_counts()` 의 SQL 조각이 PG 방언에서
