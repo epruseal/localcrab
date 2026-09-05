@@ -529,8 +529,14 @@ def _migrate_vectors_locked(
     lock_wait = chroma_lock_wait_timeout()
     with chroma_lock_held(chroma_lock_dir(chroma_local_path), shared=False,
                           timeout=lock_wait):
-        local_chroma = chromadb.PersistentClient(path=chroma_local_path)
+        # Prebound and constructed INSIDE the try, as _copy_chroma_to_vec0
+        # does. Building it on the line above would leave an interrupt window
+        # in which the client exists and the finally that tears it down has not
+        # been entered, so the outer lock could be released with that client
+        # still live -- defeating the exclusion this helper exists for.
+        local_chroma = None
         try:
+            local_chroma = chromadb.PersistentClient(path=chroma_local_path)
             with file_lock("write.lock", local_data_dir, timeout=lock_wait):
                 return migrate_vectors(
                     http_client, local_chroma, collection, batch_size, logger

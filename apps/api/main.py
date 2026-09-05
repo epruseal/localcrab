@@ -411,12 +411,15 @@ async def lifespan(app: FastAPI) -> Any:
     from opencrab.mcp.http_app import refuse_stale_shared_secret_env
 
     refuse_stale_shared_secret_env()
-    app.state.context = _build_context()
-    # The try starts at the context assignment, not after the guard below.
-    # #140: the guard can refuse startup, and a refusal outside the try left a
-    # fully built context -- including a ChromaStore holding chroma.lock --
-    # open for the life of the process.
+    # The assignment itself is INSIDE the try, not before it. Two hazards, one
+    # boundary (#140). The guard below can refuse startup, and a refusal
+    # outside the try left a fully built context -- a ChromaStore holding
+    # chroma.lock among it -- open for the life of the process. And an
+    # asynchronous interrupt landing between the assignment and the try would
+    # do the same. _close_context reads through getattr, so it copes with the
+    # attribute never having been set.
     try:
+        app.state.context = _build_context()
         # #147: the registry/graph reconciliation guard needs a live sql + graph
         # store, so it cannot run before _build_context() the way
         # refuse_stale_shared_secret_env() does -- there is nothing to check
