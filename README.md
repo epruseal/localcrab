@@ -171,8 +171,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab user add\|list\|disable\|enable` | 사용자 관리 |
 | `opencrab token issue\|list\|revoke` | 사용자별 토큰 관리 (평문은 발급 시 1회만 출력) |
 | `opencrab status` | 모든 스토어 연결 상태 확인 |
-| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`) |
-| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`) |
+| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`, `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
+| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--dry-run`, `--api-key`). 파일 1건 이상 실패 시 종료 코드 3 |
 | `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--pack-id`, `--json-output`) |
 | `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
 | `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드)[^media] |
@@ -185,6 +185,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
 | `opencrab packs repair-registry` | 생성이 끝나지 않은 팩 등록부 행을 판정·해소 (`--older-than`, `--promote`, `--apply`)[^repair] |
 | `opencrab packs repair-anchors` | `ready` 팩이 잃어버린 graph 앵커를 다시 만듦 (`--pack-id`, `--apply`)[^anchors] |
+
+`ingest`/`extract`의 종료 코드 계약(#189): `0`은 실패한 파일이 없음(빈 파일 스킵 포함, 처리 대상 파일이 0건인 경우도 포함), `3`은 파일 1건 이상 실패(부분 실패, 성공한 파일은 그대로 반영), `1`은 API 키 누락·로컬 사용자 미부트스트랩 같은 사전 조건 실패나 예상 밖 예외로 인한 비정상 종료다. (Click 자체가 잘못된 호출에 `2`를 이미 예약해 쓰므로 부분 실패에는 다른 코드를 쓴다.)
 
 [^repair]: 등록부 행과 팩 콘텐츠는 한 트랜잭션이 아니라, 그 사이에서 프로세스가 죽으면 `ready` 에 도달하지 못한 행이 남습니다. 이 명령은 graph 앵커를 실제로 조회해 판정합니다: 앵커가 있으면 `ready` 로 승격하고, 앵커가 없음이 확인되면 `partial` 로 강등하며, 스토어를 조회할 수 없으면 아무것도 하지 않습니다. **어떤 경우에도 등록부 행을 지우지 않습니다** — 콘텐츠가 실제로 안착한 팩의 행을 지우면 `assert_registry_covers_graph` 가 다음 기동을 거부하기 때문입니다. `--apply` 없이는 계획만 출력합니다. `partial` 행은 자동으로 손대지 않고, 운영자가 `--promote <pack_id> --apply` 로 지목해야 승격하며 이때도 graph 앵커가 확인될 때만 승격합니다.
 

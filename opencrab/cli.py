@@ -42,6 +42,23 @@ console = Console()
 # other command keep using `console`.
 err_console = Console(stderr=True)
 
+# #189: `extract`/`ingest` each process a batch of files and previously
+# reported per-file failures only in the summary line, never in the process
+# exit code -- a caller checking only the exit code saw success even when
+# every file failed. Click's own UsageError (missing argument, nonexistent
+# path) already reserves exit code 2, so a partial-failure signal reuses
+# that code and a caller could no longer tell "bad invocation" from "some
+# files failed" -- this uses 3 instead, kept in one place so a new failure
+# axis in either command only has to wire into this same check.
+EXIT_PARTIAL_FAILURE = 3
+
+
+def _exit_if_partial_failure(has_failures: bool) -> None:
+    """Shared exit point for `extract`/`ingest`: raise once here rather than
+    duplicating the SystemExit at the end of both commands."""
+    if has_failures:
+        raise SystemExit(EXIT_PARTIAL_FAILURE)
+
 
 def _make_stores(
     cfg: Settings,
@@ -530,6 +547,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     console.print(f"[cyan]Ingesting {len(files)} file(s)...[/cyan]")
 
     ok_count = 0
+    fail_count = 0
     for file in files:
         try:
             text = file.read_text(encoding="utf-8", errors="ignore")
@@ -618,9 +636,13 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             ok_count += 1
             console.print(f"  [green]OK[/green] {file.name} ({len(text)} chars) pack={target_pack_id}")
         except Exception as exc:
+            fail_count += 1
             console.print(f"  [red]FAIL[/red] {file.name}: {exc}")
 
     console.print(f"\n[bold green]Ingested {ok_count}/{len(files)} files.[/bold green]")
+    # #189: an empty file is skipped above (neither ok_count nor fail_count),
+    # not a failure -- only this except-branch counter may flip the exit code.
+    _exit_if_partial_failure(fail_count > 0)
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +808,14 @@ def extract(
             f"errors={total_errors}",
             soft_wrap=True,
         )
+
+    # #189: extraction failures (exceptions and `ExtractionResult.errors`,
+    # both folded into total_errors) and store-write failures each mean at
+    # least one file did not fully make it into the graph -- any of them
+    # must flip the exit code.
+    _exit_if_partial_failure(
+        bool(total_errors or total_node_write_failures or total_edge_write_failures)
+    )
 
 
 # ---------------------------------------------------------------------------
