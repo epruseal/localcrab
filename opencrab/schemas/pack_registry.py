@@ -428,6 +428,15 @@ def install_pack(name: str) -> dict[str, Any]:
                     skipped.append(node_type)
                     continue
                 for f in stale_required:
+                    # #107 (PR #336 review round 5): a hand-editable YAML
+                    # anchor/alias pair (`name: &spec {...}`, `description:
+                    # *spec`) makes yaml.safe_load hand back the SAME dict
+                    # object for both properties. Mutating it in place would
+                    # flip the aliased property's `required` too, breaking
+                    # the "only the stale field changes" guarantee this
+                    # branch relies on. Copy first so each property is its
+                    # own object before any write.
+                    existing_properties[f] = dict(existing_properties[f])
                     existing_properties[f]["required"] = True
                 schema = dict(existing)
                 schema["properties"] = existing_properties
