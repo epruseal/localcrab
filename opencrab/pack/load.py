@@ -98,6 +98,20 @@ INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
 # `build_anchor_sql(SQLITE)`/`build_count_sql(SQLITE)` 산출물에서 기계 파생된다.
 
 
+def _json_string_present(dialect: SqlDialect, col: str, key: str) -> str:
+    """`col->key` 가 **JSON 문자열 타입으로 존재하는가**(값 비교 없음).
+
+    `_json_str_eq` 의 타입 체크 조각과 같은 리터럴을 내지만 계약이 다르다 — 값이 아니라
+    "이 키가 문자열로 있다/없다"만 묻는다(localcrab #164,
+    `fallback_tag_without_pack_id_counts` 가 이 존재 판정만 쓴다 — 특정 팩 이름과
+    비교하지 않으므로 `_json_str_eq` 의 `:param` 바인드가 필요 없다). `_json_str_eq` 는
+    이 함수 위에 "존재 AND 값 일치"로 재구성돼 리터럴이 두 벌로 갈리지 않는다.
+    """
+    if dialect.name == "sqlite":
+        return f"json_type({col}, '$.{key}') = 'text'"
+    return f"jsonb_typeof({col}->'{key}') = 'string'"
+
+
 def _json_str_eq(dialect: SqlDialect, col: str, key: str, param: str) -> str:
     """JSON 필드의 **문자열 스칼라 전용** 등가 비교 — `col->key == :param`.
 
@@ -109,10 +123,10 @@ def _json_str_eq(dialect: SqlDialect, col: str, key: str, param: str) -> str:
     param 과 같다"만 참으로 본다. 비문자열 `pack_id`(정의된 비지원, docstring)는
     이 술어 아래서는 항상 거짓이다.
     """
+    present = _json_string_present(dialect, col, key)
     if dialect.name == "sqlite":
-        return (f"json_type({col}, '$.{key}') = 'text' AND "
-                f"json_extract({col}, '$.{key}') = :{param}")
-    return f"jsonb_typeof({col}->'{key}') = 'string' AND {col}->>'{key}' = :{param}"
+        return f"{present} AND json_extract({col}, '$.{key}') = :{param}"
+    return f"{present} AND {col}->>'{key}' = :{param}"
 
 
 def _doc_owner_pred(dialect: SqlDialect) -> str:
@@ -769,6 +783,77 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
     return {"nodes": g, "edges": e, "docs": d, "vectors": v}
 
 
+def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
+    """`pack_id` 가 없고 `source`/`source_id` 중 하나로만 태그된 행 수(localcrab #164) —
+    **전역**(팩 비한정) 카운트, `graph_nodes`/`graph_edges`/`doc_nodes` 세 축.
+
+    이 세 축에서 `source`/`source_id`는 소유 키가 아니다 — `transform_node` 가 입력의
+    외래 `source`/`source_id`를 properties 에 그대로 보존하고(`delete_pack` 안 회수
+    술어를 `pack_id` 단일 키로 좁힌 이유를 남긴 주석, 이 파일에서 "소유 키가 아니다"로
+    검색), 그래서 이 두 키는 회수(`delete_pack`, `pack_id` 단일 소유 키)에서도
+    대사(`pack_live_counts`/`live_pack_state`, 역시 `pack_id` 단일 키)에서도 소유 판정에
+    안 쓰인다. 이 함수가 세는 행은 그래서 **회수/대사 술어가 직접 조회하지는 않는다** —
+    그 사실만 알려준다(단 `graph_edges` 와 `doc_nodes` 는 예외가 있다 — 아래
+    "`graph_edges` 는 독립 회수 경로가 없다"와 "`doc_nodes` 트윈도 간접 회수된다" 두
+    문단 참고, 양 끝/짝 노드가 `pack_id` 로 회수되면 그 cascade 나 node_id 키 삭제로
+    함께 지워진다). 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
+    `pack_id` 가 없어 판정 불가 — "팩 소속"의 유일한 정본 키가 `pack_id` 자체다,
+    `docs/pack-contract-layer.md` 의 "`pack` 은 폐기됐다" 절 참고).
+
+    **`pack` 은 뺀다.** `docs/pack-contract-layer.md` 의 "`pack` 만 있고 `pack_id` 가
+    없는 행은 보존한다" 문단이 이미 그 행을 "무해하다(읽는 코드가 0곳)"고 판정한 별개의
+    키다 — 이 진단과 섞으면 이미 판정된 무해 잔여가 새 결함처럼 보인다.
+
+    **`graph_edges` 는 독립 회수 경로가 없다** — `delete_pack` 은 `graph_edges` 를
+    직접 조회/삭제하지 않고 `graph.delete_node()` 의 cascade 로만 지운다. 그 cascade는
+    **엣지 자신의 태그와 무관하게** 걸린다 — 양 끝 노드 중 하나가 `pack_id` 로 회수되면
+    `source`/`source_id`-only 로만 태그된 엣지도 함께 사라진다(양 끝 노드가 어느 팩에도
+    안 걸릴 때만 이 함수가 세는 잔여로 남는다, 회귀 고정:
+    `TestFallbackTagWithoutPackIdCounts.test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`).
+    이 카운트는 대사(`pack_live_counts`/`live_pack_state`) 기준 가시성만 말한다.
+
+    **`doc_nodes` 트윈도 간접 회수된다** — `delete_pack` 은 `pack_id` 로 고른 각
+    graph 노드의 `node_id` 로 `docs.delete_node_doc(space, node_id)` 를 **그
+    doc_nodes 행 자신의 태그와 무관하게** 호출한다. `source`/`source_id`-only 로만
+    태그된 doc_nodes 트윈이라도 같은 `node_id` 의 graph 노드가 `pack_id` 로 회수되면
+    함께 지워진다(회귀 고정:
+    `TestFallbackTagWithoutPackIdCounts.test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate`).
+    이 함수는 이 짝짓기를 조회하지 않으므로, 회수 시점에 이미 함께 사라질 행도 "전역
+    잔여"로 셀 수 있다 — 그 과대추정 폭은 정책 결정(#325) 없이는 줄이지 않는다.
+
+    `pack_id` 부재 판정은 `_doc_owner_pred` 와 같은 정의(`json_truthy_text(...) IS NULL`,
+    `_doc_owner_pred` docstring의 "pack_id 없음" 판정 문단 참고)를 재사용한다 —
+    falsy 값(`""`/`false`/`0`)도 "없음"으로 본다.
+
+    실제로 이 카운트가 0 이 아니면 후속 결정(생산자 `pack_id` 필수화 vs 주기적 sweep)이
+    필요하다 — 그 결정과 구현은 이 함수의 범위 밖이다(추적: localcrab #325).
+    """
+    _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
+    _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
+
+    def _fallback_pred(dialect: SqlDialect, col: str) -> str:
+        pack_absent = f"{dialect.json_truthy_text(col, 'pack_id')} IS NULL"
+        source_present = _json_string_present(dialect, col, "source")
+        source_id_present = _json_string_present(dialect, col, "source_id")
+        return f"({pack_absent}) AND (({source_present}) OR ({source_id_present}))"
+
+    n_pred = _fallback_pred(graph._dialect, "properties")
+    graph_nodes = graph._fetch_one(
+        f"SELECT COUNT(*) FROM {graph._table('graph_nodes')} WHERE {n_pred}", {})[0]
+
+    e_pred = _fallback_pred(graph._dialect, "properties")
+    graph_edges = graph._fetch_one(
+        f"SELECT COUNT(*) FROM {graph._table('graph_edges')} WHERE {e_pred}", {})[0]
+
+    dn_pred = _fallback_pred(docs._dialect, "properties")
+    doc_nodes = docs._row_get(
+        docs._fetch_one(
+            f"SELECT COUNT(*) AS n FROM {docs._table('doc_nodes')} WHERE {dn_pred}", {}),
+        "n")
+
+    return {"graph_nodes": graph_nodes, "graph_edges": graph_edges, "doc_nodes": doc_nodes}
+
+
 def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]:
     """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)
 
@@ -1082,8 +1167,17 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         vec_ids = set()
 
     # doc_node_spaces (F4-b): 노드축 **대사(reconcile)** 술어(pack_id 단일 키) —
-    # 위 nodes 조회와 동일한 폭이다. 회수(4키) 술어를 쓰면 `pack` 으로만 태그된
-    # 행의 doc 은 지워지고 graph 는 남아 새 비대칭이 생긴다.
+    # 위 nodes 조회와 동일한 폭이다. 이 폭은 회수(delete_pack, 역시 pack_id 단일
+    # 키)와 이미 같다(F6/G6) — 둘 다 4키 시절은 지났다. 남는 사각지대는 `pack_id`
+    # 자체가 없고 `source`/`source_id` 로만 태그된 행이며, 그 행은 회수/대사
+    # 술어가 직접 조회하지는 않는다(단 `graph_edges` 와 `doc_nodes` 는 예외 —
+    # `graph_edges` 는 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로, 이
+    # `doc_nodes` 축 자신도 짝 graph 노드가 `pack_id` 로 회수되면 `delete_pack`
+    # 이 그 node_id 로 부르는 `docs.delete_node_doc()` 로 함께 지워진다,
+    # `fallback_tag_without_pack_id_counts()` docstring의 "graph_edges 는 독립
+    # 회수 경로가 없다"와 "doc_nodes 트윈도 간접 회수된다" 두 문단 참고) —
+    # `fallback_tag_without_pack_id_counts()` 가 그 존재만 전역으로 탐지한다
+    # (localcrab #164).
     dn_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
     anchor_sql = build_anchor_sql(docs._dialect)
     doc_node_spaces: dict[str, set[str]] = {}
