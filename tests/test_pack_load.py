@@ -165,6 +165,9 @@ def pack_sql(tmp_path):
     같은 `tmp_path` 를 공유해야 하므로 별개 인스턴스면 안 된다).
     """
     sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+    from tests._pack_fixtures import ensure_test_user
+
+    ensure_test_user(sql, _LIVE_TEST_USER)
     for pack_id in _LIVE_TEST_PACKS:
         create_pack(sql, _LIVE_TEST_USER, pack_id)
     return sql

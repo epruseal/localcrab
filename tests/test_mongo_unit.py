@@ -441,8 +441,10 @@ def _make_builder(mongo: MagicMock) -> tuple:
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.pack.ownership import create_pack
     from opencrab.stores.sql_store import SQLStore
+    from tests._pack_fixtures import ensure_test_user
 
     sql = SQLStore("sqlite:///:memory:")
+    ensure_test_user(sql, "test-user")
     pack_id = create_pack(sql, "test-user", "mongo-audit-test-pack")
     builder = OntologyBuilder(neo4j=_AvailableGraphStub(), mongo=mongo, sql=sql)
     return builder, pack_id

@@ -49,7 +49,9 @@ def pack_id(sql):
     # The pack must be registered and owned by the bound principal
     # ("test-user") before any write here reaches the endpoint guard.
     from opencrab.pack.ownership import create_pack
+    from tests._pack_fixtures import ensure_test_user
 
+    ensure_test_user(sql, "test-user")
     return create_pack(sql, "test-user", "guard-test-pack")
 
 

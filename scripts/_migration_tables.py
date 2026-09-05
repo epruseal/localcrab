@@ -81,7 +81,9 @@ class SqlTableSpec:
 
 
 # Ordered: `users` first because api_tokens.user_id and packs.owner_id reference
-# it (PostgreSQL enforces those FKs; SQLite does not enable foreign_keys).
+# it. Both PostgreSQL and SQLite enforce these FKs now (#181: migrate_to_local.py
+# turns PRAGMA foreign_keys=ON on its SQLite write engine too), so an orphan
+# owner_id row here is rejected on insert, not silently accepted.
 SQL_TABLE_SPECS: tuple[SqlTableSpec, ...] = (
     SqlTableSpec(
         "users",

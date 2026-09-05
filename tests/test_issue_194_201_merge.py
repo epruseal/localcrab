@@ -429,8 +429,10 @@ def test_pack_ingest_rebuilds_a_forked_anchor_with_its_provenance(bind_test_prin
 
     from opencrab.mcp.tools.pack import pack_ingest
     from opencrab.stores.sql_store import SQLStore
+    from tests._pack_fixtures import ensure_test_user
 
     sql = SQLStore("sqlite:///:memory:")
+    ensure_test_user(sql, "test-user")
     create_pack(sql, "test-user", "upstream")
     pack_id = create_pack(sql, "test-user", "mine", forked_from="upstream")
 

@@ -94,6 +94,9 @@ class TestToolDispatch:
 
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             builder.add_node.side_effect = ValueError("Unknown space 'badspace'.")
@@ -104,7 +107,7 @@ class TestToolDispatch:
                 "hybrid": MagicMock(),
                 "mongo": MagicMock(),
                 "billing": MagicMock(),
-                "sql": SQLStore("sqlite:///:memory:"),
+                "sql": sql,
             }
 
             result = dispatch_tool("ontology_add_node", {
@@ -117,6 +120,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -127,7 +133,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             result = dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -164,6 +170,8 @@ class TestToolDispatch:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "actor-1")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -206,6 +214,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -215,7 +226,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             result = dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -232,6 +243,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -239,7 +253,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             dispatch_tool("ontology_add_node", {
                 "space": "subject", "node_type": "User", "node_id": "u1",
@@ -253,6 +267,8 @@ class TestToolDispatch:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -313,6 +329,8 @@ class TestToolDispatch:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "actor-1")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -357,6 +375,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -364,7 +385,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -383,6 +404,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -391,7 +415,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             with caplog.at_level(logging.WARNING):
                 result = dispatch_tool("ontology_add_edge", {
@@ -410,6 +434,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -417,7 +444,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -437,6 +464,9 @@ class TestToolDispatch:
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
 
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -447,7 +477,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -463,7 +493,10 @@ class TestToolDispatch:
         pack_create's own graph-is-system-of-record split."""
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
 
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             billing = MagicMock()
@@ -474,7 +507,7 @@ class TestToolDispatch:
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": billing, "sql": SQLStore("sqlite:///:memory:"),
+                "billing": billing, "sql": sql,
             }
             dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -486,14 +519,17 @@ class TestToolDispatch:
     def test_ontology_add_edge_invalid_relation(self):
         from opencrab.mcp.tools import dispatch_tool
         from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
 
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             builder = MagicMock()
             builder.add_edge.side_effect = ValueError("Relation 'mentions' is not valid")
             mock_ctx.return_value = {
                 "builder": builder, "rebac": MagicMock(),
                 "impact": MagicMock(), "hybrid": MagicMock(), "mongo": MagicMock(),
-                "billing": MagicMock(), "sql": SQLStore("sqlite:///:memory:"),
+                "billing": MagicMock(), "sql": sql,
             }
             result = dispatch_tool("ontology_add_edge", {
                 "from_space": "subject", "from_id": "u1",
@@ -612,6 +648,8 @@ class TestToolDispatch:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         _register_pack(sql, "test-user", "test-pack")
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
@@ -706,6 +744,8 @@ class TestToolDispatch:
         from opencrab.stores.sql_store import SQLStore
 
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         _register_pack(sql, "test-user", "test-pack")
 
         graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
@@ -821,6 +861,8 @@ class TestToolDispatch:
             # assert_called_once_with 의 space=None 이 그 계약을 검증한다).
             # total 은 별도로 count_exported_nodes_scoped 에서 온다.
             sql = SQLStore("sqlite:///:memory:")
+            from tests._pack_fixtures import ensure_test_user
+            ensure_test_user(sql, "test-user")
             create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
             graph.count_exported_nodes_scoped.return_value = 2
@@ -854,6 +896,8 @@ class TestToolDispatch:
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             sql = SQLStore("sqlite:///:memory:")
+            from tests._pack_fixtures import ensure_test_user
+            ensure_test_user(sql, "test-user")
             create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
             graph.count_exported_nodes_scoped.return_value = 1
@@ -889,6 +933,8 @@ class TestToolDispatch:
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             sql = SQLStore("sqlite:///:memory:")
+            from tests._pack_fixtures import ensure_test_user
+            ensure_test_user(sql, "test-user")
             create_pack(sql, "test-user", "pack-a")
             graph = MagicMock()
             # count_exported_nodes_scoped (no LIMIT) sees the true total;
@@ -919,6 +965,8 @@ class TestToolDispatch:
 
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             sql = SQLStore("sqlite:///:memory:")
+            from tests._pack_fixtures import ensure_test_user
+            ensure_test_user(sql, "test-user")
             create_pack(sql, "test-user", "test-pack")
             graph = MagicMock()
             graph.export_edges_scoped.return_value = [
@@ -1076,7 +1124,9 @@ class TestOntologyBuilder:
         # see the module-level bind_test_principal usefixtures mark) before
         # any write reaches grammar validation.
         from opencrab.pack.ownership import create_pack
+        from tests._pack_fixtures import ensure_test_user
 
+        ensure_test_user(sql, "test-user")
         return create_pack(sql, "test-user", "builder-test-pack")
 
     def test_add_node_valid(self, builder, pack_id):
@@ -1145,6 +1195,8 @@ class TestReBACEngine:
 
         neo4j = Neo4jStore("bolt://invalid:7687", "neo4j", "pw")
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         return ReBACEngine(neo4j, sql)
 
     def test_check_denied_when_no_policy_no_graph(self, engine):
@@ -1191,6 +1243,8 @@ class TestImpactEngine:
 
         neo4j = Neo4jStore("bolt://invalid:7687", "neo4j", "pw")
         sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
         return ImpactEngine(neo4j, sql)
 
     # #147: pack_ids is now a required keyword-only argument on both

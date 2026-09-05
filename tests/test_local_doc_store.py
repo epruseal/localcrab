@@ -365,6 +365,9 @@ class TestCorruptCollection:
         graph = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
         doc = LocalDocStore(data_dir=str(tmp_path / "docs"))
         sql = SQLStore(url=f"sqlite:///{tmp_path / 'registry.db'}")
+        from tests._pack_fixtures import ensure_test_user
+
+        ensure_test_user(sql, "actor-1")
         create_pack(sql, "actor-1", "pack-1")
         return OntologyBuilder(graph, doc, sql), doc
 

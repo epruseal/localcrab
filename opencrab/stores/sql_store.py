@@ -16,6 +16,32 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def enable_sqlite_fk(engine: Any) -> None:
+    """Make *engine* turn on ``PRAGMA foreign_keys=ON`` for every new SQLite
+    DBAPI connection it opens (#181).
+
+    SQLite defaults foreign-key enforcement to OFF per connection -- it is
+    not a database-level setting, so declaring ``REFERENCES`` in DDL (see
+    ``_TABLES_SQL_SQLITE`` below: ``api_tokens.user_id``, ``packs.owner_id``)
+    does nothing on its own unless something sets this pragma on every
+    connection the pool hands out. ``SQLStore._connect()`` calls this on its
+    own engine, but it is exported here (rather than kept private) because
+    at least one caller opens a SECOND, independent SQLite engine that does
+    not go through ``SQLStore`` at all:
+    ``scripts/migrate_to_local.py::migrate_sql()`` builds a ``SQLStore`` only
+    to bootstrap the schema, then writes through its own ``sq_engine``
+    (#151 7-4 deliberately cut that function's access to
+    ``SQLStore._engine``, so it cannot simply reuse this class's connect
+    event) -- that caller must call this function on its own engine too, or
+    its writes stay unenforced.
+    """
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_fk(dbapi_conn: Any, _record: Any) -> None:
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+
 def write_lock_for_store(
     sql_store: Any, *, own_file: bool = False
 ) -> contextlib.AbstractContextManager[None]:
@@ -407,6 +433,9 @@ class SQLStore:
 
             self._engine = create_engine(self._url, connect_args=connect_args)
             self._text = text
+
+            if self._is_sqlite:
+                enable_sqlite_fk(self._engine)
 
             with self._engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
