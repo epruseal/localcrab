@@ -395,6 +395,30 @@ def install_pack(name: str) -> dict[str, Any]:
                 if not isinstance(existing_properties, dict):
                     skipped.append(node_type)
                     continue
+                # #107 (PR #336 review rounds 5 and 6): a YAML anchor can
+                # alias `properties` itself onto another key (e.g.
+                # `saved_properties: &props {...}`, `properties: *props`),
+                # or alias one property spec onto another (`name: &spec
+                # {...}`, `description: *spec`) -- either way,
+                # yaml.safe_load hands back the SAME dict object for both
+                # sides of the alias. Mutating any of it in place, at any
+                # depth, would leak the repair into whatever else shares
+                # that object. A single `copy.deepcopy` is NOT enough here:
+                # deepcopy's memo preserves internal aliasing on purpose
+                # (two keys that pointed at the same object before the copy
+                # still point at the same, newly-copied object after it),
+                # so it detaches this dict from anything OUTSIDE it (round
+                # 6's `saved_properties`/`properties` sharing) but does
+                # nothing for sharing BETWEEN its own values (round 5's
+                # `name`/`description` sharing). Give every dict-valued
+                # entry its own fresh shallow copy instead -- this detaches
+                # the container from outside sharing (round 6) and gives
+                # each property spec its own object regardless of any
+                # aliasing it had before the copy (round 5), in one pass.
+                existing_properties = {
+                    key: (dict(value) if isinstance(value, dict) else value)
+                    for key, value in existing_properties.items()
+                }
                 manifest_spec = (pack.get("type_specs", {}) or {}).get(node_type, {}) or {}
                 manifest_required = manifest_spec.get("required") or ["name"]
                 manifest_optional = manifest_spec.get("optional") or ["description", "status"]
@@ -428,15 +452,10 @@ def install_pack(name: str) -> dict[str, Any]:
                     skipped.append(node_type)
                     continue
                 for f in stale_required:
-                    # #107 (PR #336 review round 5): a hand-editable YAML
-                    # anchor/alias pair (`name: &spec {...}`, `description:
-                    # *spec`) makes yaml.safe_load hand back the SAME dict
-                    # object for both properties. Mutating it in place would
-                    # flip the aliased property's `required` too, breaking
-                    # the "only the stale field changes" guarantee this
-                    # branch relies on. Copy first so each property is its
-                    # own object before any write.
-                    existing_properties[f] = dict(existing_properties[f])
+                    # Each entry in existing_properties already got its own
+                    # fresh copy above, so this write can't leak into any
+                    # structure the original file's YAML anchors shared it
+                    # with.
                     existing_properties[f]["required"] = True
                 schema = dict(existing)
                 schema["properties"] = existing_properties
