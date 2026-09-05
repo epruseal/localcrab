@@ -363,6 +363,43 @@ def _vec_backend(vec):
 _VEC_BACKEND_KINDS = ("sql", "chroma", "sqlalchemy")
 
 
+def _safe_type_name(obj) -> str:
+    """`type(obj).__name__` 을 안전하게 얻는다. 두 실패 모두 고정 문자열로
+    떨어진다: 접근 자체가 던지는 경우(적대적 메타클래스의 `__getattribute__`),
+    그리고 접근은 성공하지만 **`str` 이 아닌 값**을 돌려주는 경우(같은
+    메타클래스가 `__name__` 을 문자열이 아닌 다른 적대적 객체로 위장하는
+    경우 — 이 값을 그대로 돌리면 나중에 그 값을 다시 포맷하는 자리에서
+    같은 소실이 재발한다, 적대 검증 지적 #1).
+    """
+    try:
+        name = type(obj).__name__
+    except Exception:
+        return "<식별불가>"
+    return name if type(name) is str else "<식별불가>"
+
+
+def _safe_str(obj) -> str:
+    """`str(obj)` 를 안전하게 얻는다. `%s` 포맷과 같은 의미(`str()`)를 유지한다
+    — 여기서 `repr()` 로 바꾸면 정상 경로의 기존 로그 문구가 바뀐다(적대 검증
+    지적 #2: 예외 메시지가 "message" 에서 "RuntimeError('message')" 형태로
+    달라져 이 변경이 "로그 인자 표현만 바꾼다"는 전제와 어긋난다).
+
+    실패(예외, 또는 `str` 이 아닌 반환값) 시 타입명으로 대체한다. 로그 인자로
+    원시 객체를 그대로 넘기면 포맷 **단계**(핸들러 emit 시점의 `msg % args`)
+    에서 그 객체의 `__str__`이 돌고, 거기서 예외가 나면 `logging` 이 레코드를
+    통째로 버려 경고 자체가 사라진다(#165 이 다른 자리에서 고친 것과 같은
+    클래스). 이 함수는 인자 **평가** 시점에 미리 안전한 문자열로 바꿔 그
+    실패를 여기서 흡수한다.
+    """
+    try:
+        s = str(obj)
+    except Exception:
+        s = None
+    if type(s) is not str:
+        return f"<{_safe_type_name(obj)} (str 실패)>"
+    return s
+
+
 def _confirmed_rowcount(rc) -> int | None:
     """드라이버가 **실제로 센 삭제 행 수**일 때만 그 값, 아니면 `None`(미확인).
 
@@ -1071,9 +1108,9 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
                 # 0건 삭제가 확인된 사실이다. `None`(모른다)과 섞지 않는다.)
                 log.warning(
                     "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
-                    "수동 정리가 필요하다", type(vec).__name__, pack_name)
+                    "수동 정리가 필요하다", _safe_type_name(vec), pack_name)
         except Exception as e:
-            log.warning("벡터 delete 오류(%s): %s", pack_name, e)
+            log.warning("벡터 delete 오류(%s): %s", pack_name, _safe_str(e))
 
     # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
     # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로
