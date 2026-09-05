@@ -145,6 +145,7 @@ from opencrab.common.graph_identity import (
     canonical_plan_bytes,
     canonical_receipt_bytes,
     decode_raw_properties,
+    is_valid_node_type_label,
     normalize_edge_properties,
     parse_properties_object,
     plan_sha256,
@@ -626,10 +627,13 @@ class _SqlGraphStoreBase(abc.ABC):
         operator can discover the endpoint type before planning its
         migration, which is why this does not gate on schema classification
         the way write paths do. ``unavailable`` (store down, or a matched
-        row with a null/empty ``node_type`` -- a data-integrity fault, not
-        "not found") raises ``GraphReadCapabilityUnavailable`` so callers do
-        not silently fall back to a default type when the real answer is
-        unknown.
+        row with a null/empty ``node_type``, or one that is not a legal
+        label per ``is_valid_node_type_label`` (an int, a string with
+        illegal characters, #162 codex review round 2) -- a data-integrity
+        fault, not "not found") raises ``GraphReadCapabilityUnavailable``
+        so callers do not silently fall back to a default type when the
+        real answer is unknown, or forward a malformed value to a caller
+        that trusts the ``str | None`` contract.
         """
         if not getattr(self, "_available", False):
             raise GraphReadCapabilityUnavailable(
@@ -641,9 +645,10 @@ class _SqlGraphStoreBase(abc.ABC):
             if row is None:
                 return None
             node_type = row[0]
-            if not node_type:
+            if not is_valid_node_type_label(node_type):
                 raise GraphReadCapabilityUnavailable(
-                    f"lookup_node_type: matched node {node_id!r} has no node_type"
+                    f"lookup_node_type: matched node {node_id!r} has an invalid "
+                    f"node_type: {node_type!r}"
                 )
             return node_type
         except (KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError):

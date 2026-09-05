@@ -153,6 +153,27 @@ def test_lookup_node_type_malformed_raises():
         store.lookup_node_type("p1")
 
 
+@pytest.mark.parametrize("bad_label", ["has space", "1leadingdigit", "kebab-case"])
+def test_lookup_node_type_truthy_but_invalid_label_raises(bad_label):
+    # A row matched with a NON-empty node_type that is still not a legal
+    # label -- the column disallows NULL and upsert_node's own validation
+    # would refuse this shape through the normal API, so it is written
+    # directly. The bare "not node_type" check (#162 v1/v2) let this pass
+    # through as if it were a real type, and OntologyBuilder.add_edge would
+    # forward it to get_node/upsert_edge, which raise a raw
+    # TypeError/ValueError there instead of the intended fail-closed
+    # graph-unavailable receipt (#162 codex review round 6).
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    store._conn.execute(
+        "UPDATE graph_nodes SET node_type = :nt WHERE node_id = :id", {"nt": bad_label, "id": "p1"}
+    )
+    store._conn.commit()
+
+    with pytest.raises(GraphReadCapabilityUnavailable):
+        store.lookup_node_type("p1")
+
+
 def test_lookup_node_type_raises_when_unavailable():
     # #162: an unavailable store cannot tell "node absent" from "store
     # down" -- it must raise instead of degrading to None, so

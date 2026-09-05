@@ -33,6 +33,7 @@ from opencrab.common.graph_identity import (
     canonical_edge_digest,
     canonical_json_bytes,
     canonical_node_digest,
+    is_valid_node_type_label,
     normalize_edge_properties,
     parse_properties_object,
     prepare_node,
@@ -657,10 +658,14 @@ class Neo4jStore:
           not a fault, so ``add_edge`` may still refuse the write (missing
           endpoint) without treating the store as unavailable.
         - unavailable: the store cannot answer the query at all (down, or a
-          matched row came back malformed -- ``n.node_type`` stored as null
-          is a data-integrity fault, not "not found"). Raises
-          ``GraphReadCapabilityUnavailable`` so callers do not silently
-          write against a default type when the real answer is unknown.
+          matched row came back malformed -- ``n.node_type`` stored as null,
+          empty, or a value that is not a legal label per
+          ``is_valid_node_type_label`` (an int, a string with illegal
+          characters, #162 codex review round 2) -- is a data-integrity
+          fault, not "not found"). Raises ``GraphReadCapabilityUnavailable``
+          so callers do not silently write against a default type when the
+          real answer is unknown, or forward a malformed value to a caller
+          that trusts the ``str | None`` contract.
         """
         if not self._available:
             raise GraphReadCapabilityUnavailable(
@@ -676,9 +681,10 @@ class Neo4jStore:
                 if record is None:
                     return None
                 label = record["lbl"]
-                if not label:
+                if not is_valid_node_type_label(label):
                     raise GraphReadCapabilityUnavailable(
-                        f"lookup_node_type: matched node {node_id!r} has no node_type"
+                        f"lookup_node_type: matched node {node_id!r} has an invalid "
+                        f"node_type: {label!r}"
                     )
                 return label
         except (KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError):

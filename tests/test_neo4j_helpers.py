@@ -227,6 +227,21 @@ class TestNeo4jStoreNormal:
         with pytest.raises(GraphReadCapabilityUnavailable):
             store.lookup_node_type("weird")
 
+    @pytest.mark.parametrize("bad_label", [42, "has space", "1leadingdigit", "kebab-case"])
+    def test_lookup_node_type_truthy_but_invalid_label_raises(self, bad_label):
+        # A row matched with a NON-empty node_type that is still not a
+        # legal label -- an int, or a string with illegal characters. The
+        # bare "not label" check (#162 v1/v2) let this pass through as if
+        # it were a real type, and OntologyBuilder.add_edge would forward
+        # it to get_node/upsert_edge, which raise a raw TypeError/ValueError
+        # there instead of the intended fail-closed graph-unavailable
+        # receipt (#162 codex review round 6).
+        store, _driver, mock_session = _make_connected_store()
+        mock_session.run.return_value.single.return_value = {"lbl": bad_label}
+
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.lookup_node_type("weird")
+
     @pytest.mark.parametrize(
         "exc_type", [KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError]
     )
