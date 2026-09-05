@@ -2150,6 +2150,189 @@ class _FakeChromaVec:
         return list(ids)
 
 
+class TestFallbackTagWithoutPackIdCounts:
+    """`fallback_tag_without_pack_id_counts()` — `pack_id` 없이 `source`/`source_id`
+    로만 태그된 행의 전역(팩 비한정) 카운트(localcrab #164). 회수(`delete_pack`)와
+    대사(`live_pack_state`) 어느 쪽도 이 태그 자체로는 안 걸리는 사각지대의 존재만
+    잰다(단 `graph_edges` 와 `doc_nodes` 는 예외 — 양 끝/짝 노드가 `pack_id` 로
+    회수되면 그 cascade 나 node_id 키 삭제로 함께 지워진다, 아래
+    `test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`
+    와 `test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate`
+    참고).
+    """
+
+    def _seed_graph_node(self, graph, node_id, properties, node_type="Document",
+                          space_id="resource"):
+        graph._conn.execute(
+            "INSERT INTO graph_nodes(node_type,node_id,space_id,properties) VALUES(?,?,?,?)",
+            (node_type, node_id, space_id, json.dumps(properties)))
+        graph._conn.commit()
+
+    def _seed_graph_edge(self, graph, from_id, to_id, properties, relation="CITES",
+                         from_type="Document", to_type="Document"):
+        graph._conn.execute(
+            "INSERT INTO graph_edges(from_type,from_id,relation,to_type,to_id,properties)"
+            " VALUES(?,?,?,?,?,?)",
+            (from_type, from_id, relation, to_type, to_id, json.dumps(properties)))
+        graph._conn.commit()
+
+    def _seed_doc_node(self, docs, node_id, properties, space="resource"):
+        cols = {r[1]: r for r in docs._conn.execute("PRAGMA table_info(doc_nodes)")}
+        vals = {"space": space, "node_id": node_id, "properties": json.dumps(properties)}
+        for name, info in cols.items():
+            if name in vals or info[4] is not None:
+                continue
+            if info[3]:
+                vals[name] = "1970-01-01T00:00:00Z" if "at" in name else ""
+        docs._conn.execute(
+            f"INSERT INTO doc_nodes ({','.join(vals)}) "
+            f"VALUES ({','.join('?' * len(vals))})", tuple(vals.values()))
+        docs._conn.commit()
+
+    def test_source_id_only_row_is_counted_on_all_three_axes(self, live):
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "n1", {"source_id": "somewhere"})
+        self._seed_graph_edge(graph, "n1", "n1", {"source_id": "somewhere"})
+        self._seed_doc_node(docs, "n1", {"source_id": "somewhere"})
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got == {"graph_nodes": 1, "graph_edges": 1, "doc_nodes": 1}
+
+    def test_pack_id_only_row_is_not_counted(self, live):
+        """정상 행(음성 대조) — `pack_id` 만 있고 폴백 태그가 없으면 0이어야 한다."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "n1", {"pack_id": "own-pack"})
+        self._seed_graph_edge(graph, "n1", "n1", {"pack_id": "own-pack"})
+        self._seed_doc_node(docs, "n1", {"pack_id": "own-pack"})
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got == {"graph_nodes": 0, "graph_edges": 0, "doc_nodes": 0}
+
+    def test_pack_only_row_is_not_counted(self, live):
+        """`pack` 만 있고 `pack_id`/`source`/`source_id` 가 없는 행(음성 대조) — 이미
+        `docs/pack-contract-layer.md:128` 이 무해 판정한 잔여라 여기 섞이면 안 된다."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "n1", {"pack": "stale-alias"})
+        self._seed_graph_edge(graph, "n1", "n1", {"pack": "stale-alias"})
+        self._seed_doc_node(docs, "n1", {"pack": "stale-alias"})
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got == {"graph_nodes": 0, "graph_edges": 0, "doc_nodes": 0}
+
+    def test_pack_id_and_foreign_source_id_both_present_is_not_counted(self, live):
+        """`pack_id` 부재 AND 폴백 태그 존재의 **AND 쪽**을 고정한다 — `pack_id` 가
+        있으면 `source_id` 가 같이 있어도 세면 안 된다."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "n1", {"pack_id": "own-pack", "source_id": "foreign"})
+        self._seed_graph_edge(graph, "n1", "n1",
+                               {"pack_id": "own-pack", "source_id": "foreign"})
+        self._seed_doc_node(docs, "n1", {"pack_id": "own-pack", "source_id": "foreign"})
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got == {"graph_nodes": 0, "graph_edges": 0, "doc_nodes": 0}
+
+    def test_after_delete_pack_and_live_pack_state_the_row_survives_and_is_still_counted(
+            self, live):
+        """회수(`delete_pack`)와 대사(`live_pack_state`)를 `source_id` 값으로 불러도
+        행이 안 지워지고 대사 결과에도 안 잡혀야 한다 — 두 관측이 함께 있어야 "저장소엔
+        남지만 대사엔 안 보인다"가 성립한다(한쪽만 있으면 삭제와 구분이 안 된다)."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "n1", {"source_id": "target"})
+        self._seed_doc_node(docs, "n1", {"source_id": "target"})
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+        state = pack_load.live_pack_state("target", graph, docs, _NoVec())
+        assert "n1" not in state["nodes"], (
+            "source_id 만으로 태그된 행이 대사(live_pack_state)에 target 소유로 잡혔다")
+        assert "n1" not in state["doc_node_spaces"], (
+            "source_id 만으로 태그된 doc_nodes 행이 대사에 target 소유로 잡혔다")
+
+        left_node = graph._conn.execute(
+            "SELECT COUNT(*) FROM graph_nodes WHERE node_id=?", ("n1",)).fetchone()[0]
+        left_doc = docs._conn.execute(
+            "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("n1",)).fetchone()[0]
+        assert left_node == 1, "source_id 만으로 태그된 graph_nodes 행이 회수 후 사라졌다"
+        assert left_doc == 1, "source_id 만으로 태그된 doc_nodes 행이 회수 후 사라졌다"
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got == {"graph_nodes": 1, "graph_edges": 0, "doc_nodes": 1}
+
+    def test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate(
+            self, live):
+        """`graph_edges` 에 "독립 회수 경로가 없다"(함수 docstring)는 말은 "회수 술어가
+        직접 안 걸린다"는 뜻이지 "행이 절대 안 지워진다"는 뜻이 아니다 — `source_id`
+        만으로 태그된 엣지라도 **양 끝 노드가 `pack_id` 로 회수되면** `graph.delete_node()`
+        의 cascade 로 함께 지워진다. 위 생존 테스트(양 끝 노드가 어느 팩에도 안 걸린
+        경우)와 이 테스트(양 끝 노드가 `target` 소유인 경우)를 나란히 두어 "함수가 세는
+        전역 잔여"와 "회수 부작용으로 우연히 사라지는 행"을 구분한다(localcrab #164
+        코드 리뷰 지적, codex NONCE O164-IMPL-A7K3Q9)."""
+        _builder, graph, docs = live
+        self._seed_graph_node(graph, "owned1", {"pack_id": "target"})
+        self._seed_graph_node(graph, "owned2", {"pack_id": "target"})
+        self._seed_graph_edge(graph, "owned1", "owned2", {"source_id": "target"})
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+
+        left_edge = graph._conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE from_id=? AND to_id=?",
+            ("owned1", "owned2")).fetchone()[0]
+        assert left_edge == 0, (
+            "pack_id 소유 노드에 붙은 source_id-only 엣지가 노드 cascade 뒤에도 남았다"
+            " — cascade 가 더는 그 엣지에 안 닿는다는 뜻이라 위 docstring 전제가 깨진다")
+
+        got = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert got["graph_edges"] == 0, (
+            "cascade 로 이미 지워진 엣지가 fallback 카운트에도 잡혔다 — 존재하지 않는 행을 셌다")
+
+    def test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate(
+            self, live):
+        """`doc_nodes` 에도 `graph_edges` 와 같은 구멍이 있다(localcrab #164, PR #330
+        코드 리뷰 지적) — `delete_pack` 은 `pack_id` 로 고른 각 graph 노드의 `node_id`
+        로 `docs.delete_node_doc(space, node_id)` 를 그 doc_nodes 행 자신의 태그와
+        무관하게 호출한다. `source_id` 만으로 태그된 doc_nodes 트윈이라도 같은
+        `node_id` 의 graph 노드가 `pack_id` 로 회수되면 함께 지워진다 — 회수 전에는
+        이 함수가 "전역 잔여"로 세지만, 회수 시점에 이미 함께 사라질 행이라 과대추정이다."""
+        _builder, graph, docs = live
+        # properties.space 를 doc_nodes 시드의 기본 space("resource")와 맞춘다 —
+        # delete_pack 이 docs.delete_node_doc 에 넘기는 space 는 properties.space
+        # (COALESCE 기본값 'concept')지 graph_nodes.space_id 컬럼이 아니다.
+        self._seed_graph_node(graph, "n1", {"pack_id": "target", "space": "resource"})
+        self._seed_doc_node(docs, "n1", {"source_id": "target"})
+
+        before = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert before["doc_nodes"] == 1, (
+            "source_id-only doc_nodes 트윈이 회수 전에는 사각지대로 잡혀야 한다")
+
+        pack_load.delete_pack("target", graph, docs, _NoVec())
+
+        left_doc = docs._conn.execute(
+            "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("n1",)).fetchone()[0]
+        assert left_doc == 0, (
+            "pack_id 소유 graph 노드의 doc_nodes 트윈이 delete_pack 뒤에도 남았다"
+            " — node_id 키 삭제가 더는 그 트윈에 안 닿는다는 뜻이라 이 테스트 전제가 깨진다")
+
+        after = pack_load.fallback_tag_without_pack_id_counts(graph, docs)
+        assert after["doc_nodes"] == 0, (
+            "delete_pack 으로 이미 지워진 doc_nodes 트윈이 fallback 카운트에도 잡혔다"
+            " — 존재하지 않는 행을 셌다")
+
+
+class TestFallbackTagPostgresDialect:
+    """`fallback_tag_without_pack_id_counts()` 의 SQL 조각이 PG 방언에서
+    `jsonb_typeof`/`->>'`, sqlite 방언에서 `json_type`/`json_extract` 를 내는지
+    문자열만 비교한다(접속 없음) — `TestSqlalchemyMetaUpdateSql` 류 기존 관례와 같다."""
+
+    def test_json_string_present_uses_the_stores_jsonb_cast_convention_on_postgres(self):
+        from opencrab.stores._sql_dialect import POSTGRES, SQLITE
+        pg_sql = pack_load._json_string_present(POSTGRES, "properties", "source_id")
+        assert "jsonb_typeof" in pg_sql
+        assert "properties->'source_id'" in pg_sql
+
+        sqlite_sql = pack_load._json_string_present(SQLITE, "properties", "source_id")
+        assert "json_type" in sqlite_sql
+        assert "jsonb_typeof" not in sqlite_sql
+
+
 class TestChromaBackendBranches:
     """`_vec_backend()` 가 `"chroma"` 로 인식하는 형태(F5-1) — 4자리 전부를 태운다."""
 
