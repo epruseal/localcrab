@@ -373,19 +373,38 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     # free to drift into a distinguishable one.
     if result is None:
         return {"found": False, "node_id": node_id}
-    return {"found": True, "node_id": node_id, "node": result}
+    # #55: same normalised fields ontology_list_nodes exposes (node_type/space/
+    # properties), added alongside the pre-existing "node" key rather than
+    # replacing it -- "node" is part of this tool's public MCP contract and at
+    # least one existing test pins its exact shape (tests/test_mcp.py,
+    # tests/test_mcp_dispatch_extended.py), so removing it would be a breaking
+    # change for any external caller reading it. "properties" and "node" are
+    # the same object (no copy), so a caller reading either sees identical
+    # data.
+    node_type = result.get("node_type", "")
+    n_space = result.get("space", "")
+    return {
+        "found": True,
+        "node_id": node_id,
+        "node_type": node_type,
+        "space": n_space,
+        "node": result,
+        "properties": result,
+    }
 
 
 @tool(
     "ontology_list_nodes",
     {
         "description": (
-            "List nodes, optionally filtered by space and/or pack_id. Without pack_id, lists "
-            "from the doc store. With pack_id, lists from the graph store, and `total` in the "
-            "response is the TRUE count of all matching nodes -- it is NOT capped by `limit` "
-            "and can be larger than the number of `nodes` actually returned; if `total` "
-            "exceeds len(nodes), the page was truncated and a larger `limit` will return more. "
-            "Useful for inspecting a pack's contents after ingest."
+            "List nodes, optionally filtered by space and/or pack_id. Always lists from the "
+            "graph store, whether or not pack_id is given (issue #55: this used to fall back "
+            "to a separate doc store without pack_id, which could disagree with "
+            "ontology_get_node -- both now read the same store). `total` in the response is "
+            "the TRUE count of all matching nodes -- it is NOT capped by `limit` and can be "
+            "larger than the number of `nodes` actually returned; if `total` exceeds "
+            "len(nodes), the page was truncated and a larger `limit` will return more. Row "
+            "order is not guaranteed. Useful for inspecting a pack's contents after ingest."
         ),
         "inputSchema": {
             "type": "object",
@@ -395,14 +414,13 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Maximum number of `nodes` rows returned (default 100). WITH pack_id: "
-                        "does NOT cap `total`, which is the full match count regardless of "
-                        "`limit`. WITHOUT pack_id: `total` is the doc-store page size, i.e. it "
-                        "IS capped at `limit` (total == len(nodes) always in that case). "
-                        "0 or negative values are not an error -- they return an empty `nodes` "
-                        "page (issue #120). This server does not validate `limit` against this "
-                        "schema before calling the handler, so a negative value is never "
-                        "rejected outright; it is simply defined to mean 'no rows'."
+                        "Maximum number of `nodes` rows returned (default 100). Does NOT cap "
+                        "`total`, which is the full match count regardless of `limit`, whether "
+                        "or not pack_id is given. 0 or negative values are not an error -- they "
+                        "return an empty `nodes` page (issue #120). This server does not "
+                        "validate `limit` against this schema before calling the handler, so a "
+                        "negative value is never rejected outright; it is simply defined to "
+                        "mean 'no rows'."
                     ),
                     "default": 100,
                 },
@@ -422,15 +440,35 @@ def ontology_list_nodes(
 
     #147: every branch is pack-scoped now, and the calls below are the
     ``*_scoped`` variants -- ``count_exported_nodes_scoped`` /
-    ``export_nodes_scoped`` (graph) and ``list_nodes_scoped`` (doc store).
-    They take the caller's readable pack set and match on ``pack_id``
-    ALONE; the older ``export_nodes``/``count_exported_nodes`` also matched
-    ``source``/``source_id``, which are caller-written and therefore
-    unusable for an access decision (#143).
+    ``export_nodes_scoped``. They take the caller's readable pack set and
+    match on ``pack_id`` ALONE; the older ``export_nodes``/
+    ``count_exported_nodes`` also matched ``source``/``source_id``, which
+    are caller-written and therefore unusable for an access decision (#143).
 
-    WITH pack_id: this calls (in this order, matching the code below) the
-    graph store's count_exported_nodes_scoped(pack_ids, space=..., no LIMIT)
-    first for ``total``, THEN export_nodes_scoped(pack_ids, space=..., limit=...)
+    #55: pack_id given or not, this always queries the graph store now.
+    Before this fix, omitting ``pack_id`` fell back to the doc store
+    (``ctx["mongo"].list_nodes_scoped``) instead -- a different store than
+    ``ontology_get_node`` ever reads, so the two tools could disagree on
+    whether a given node_id exists at all, and the doc-store branch
+    returned raw, un-normalised rows while the pack_id branch returned the
+    ``{node_id, node_type, space, properties}`` shape below. Both problems
+    share one cause (two different stores answering two nominally
+    equivalent reads) and one fix (one store, one code path). The graph
+    store is the canonical choice: ``ontology_get_node`` already only reads
+    it, and it already has the scoped single-node AND scoped-list read
+    paths this tool needs (``get_node_by_id_scoped``,
+    ``export_nodes_scoped``, ``count_exported_nodes_scoped``) -- making the
+    doc store canonical instead would mean building an equivalent scoped
+    single-node lookup for it first. The data itself can still disagree
+    between stores (a node written to the doc store but never reaching the
+    graph store, or vice versa) -- that is a separate, out-of-scope defect
+    in how writes reach each store, not a defect in these two read tools;
+    after this fix a node either shows up in both tools or neither, instead
+    of splitting.
+
+    This calls (in this order, matching the code below)
+    ``count_exported_nodes_scoped(pack_ids, space=..., no LIMIT)`` first for
+    ``total``, THEN ``export_nodes_scoped(pack_ids, space=..., limit=...)``
     for the displayed page. All three concrete backends (SQL-backed
     local/pg, Kuzu, Neo4j) push ``space`` (and, for SQL/Neo4j, ``pack_id``
     too) into their native query ahead of ``limit`` — see each backend's
@@ -442,40 +480,21 @@ def ontology_list_nodes(
     pushdown fix, which is the actual bug #54 reported (a caller cannot
     tell "5 of 5 matches" from "5 of 3000 matches, truncated" from the row
     count alone) — count_exported_nodes runs the identical filter with no
-    LIMIT so ``total`` is the true match count.
+    LIMIT so ``total`` is the true match count. This is now also true
+    without ``pack_id`` -- before #55, that branch's ``total`` was
+    ``len(nodes)`` (doc-store page size, capped at ``limit``), a narrower
+    version of the same #54 bug in a different subsystem. Row order is not
+    guaranteed by either code path: ``export_nodes_scoped`` makes no
+    ordering promise on any backend. (The old doc-store branch happened to
+    be ordered on the SQL-backed doc stores -- ``_sql_doc_base.py``'s
+    ``list_nodes_scoped`` runs ``ORDER BY updated_at DESC, space, node_id``
+    -- but not on MongoStore, whose ``list_nodes_scoped`` never sorts. That
+    was never a documented contract of this tool, so losing it here is not
+    a breaking change, just a fact worth recording for anyone who observed
+    it.)
 
-    WITHOUT pack_id: falls back to the doc store's list_nodes, and ``total``
-    IS ``len(nodes)`` — i.e. IS capped at ``limit``, same failure mode #54
-    reported, just in a different subsystem (doc store, not graph store).
-    Judged and left unfixed here (audit finding, MCP-visibility round):
-    structurally this is NOT impossible to fix the same way — the SQL-backed
-    doc stores (LocalSQLDocStore/PgDocStore, both opencrab/stores/
-    _sql_doc_base.py) could grow a real ``COUNT(*) WHERE space=...``
-    sibling to ``list_nodes``, mirroring count_exported_nodes exactly, and
-    MongoStore (docker mode) has ``count_documents()`` for the same
-    purpose. It is left out of this fix because it is a different
-    subsystem than #54's named scope (graph.py's pack_id+space path +
-    _sql_graph_base.py's export_nodes), touching three more backend files
-    with their own test suites — a same-sized second effort, not a small
-    extension of this one. Tracked as a follow-up, not silently accepted:
-    the MCP ``description`` and ``limit`` parameter description (the part
-    of this contract an MCP client actually sees -- this docstring is
-    developer-only and never reaches a client) both say plainly that
-    ``total`` is limit-capped in the no-pack_id case, so no caller is told
-    a false "always accurate" guarantee in the meantime.
-
-    ``limit <= 0`` (issue #120 follow-up): both branches return ``[]`` (and
-    doc-store's ``total`` is then ``0`` too, since it's ``len(nodes)`` in
-    that branch) -- the WITH-pack_id and WITHOUT-pack_id paths agree here
-    even though they disagree on ``total`` semantics above. This wasn't
-    true for every doc-store backend when the WITH-pack_id side of this
-    contract first landed: MongoStore's ``list_nodes`` passed ``limit``
-    straight to pymongo's ``Cursor.limit()``, where ``0`` means "no limit"
-    (the opposite of this contract) -- same footgun class as SQLite mapping
-    a bound ``LIMIT -1`` to "no limit" in ``_sql_doc_base.py``, just
-    triggered by a different value. All three doc-store backends
-    (LocalSQLDocStore/PgDocStore via ``_sql_doc_base.py``, MongoStore) now
-    guard ``limit <= 0`` before querying, matching the graph store side.
+    ``limit <= 0`` (issue #120): returns ``[]`` (and ``total`` is then
+    ``0`` too, via the same guard in ``count_exported_nodes_scoped``).
 
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/
@@ -506,47 +525,35 @@ def ontology_list_nodes(
     scope = _current_read_scope(ctx)
     effective, _ = narrow(scope, [pack_id] if pack_id else None)
 
+    graph_store = ctx["neo4j"]
+    # True match count, independent of `limit` (issue #54's core
+    # requirement -- see this function's docstring).
+    total = graph_store.count_exported_nodes_scoped(effective, space=cleaned_space)
+    # Graph store: indexed/native pack_id + space filter → correct rows
+    # before limit (all three backends implement the same contract, see
+    # _graph_protocol.py#export_nodes).
+    raw = graph_store.export_nodes_scoped(effective, limit=limit, space=cleaned_space)
+    # export_nodes returns [{"props": dict, "labels": [str]}, ...]
+    # normalise to a stable shape. The space check below is now redundant
+    # with the backend's own filter (kept as cheap defense-in-depth, same
+    # spirit as _expand()'s redundant pack_set check in
+    # _sql_graph_base.py) rather than load-bearing.
     nodes: list[dict[str, Any]] = []
-    total = 0
-
-    if pack_id:
-        graph_store = ctx["neo4j"]
-        # True match count, independent of `limit` (issue #54's core
-        # requirement -- see this function's docstring).
-        total = graph_store.count_exported_nodes_scoped(effective, space=cleaned_space)
-        # Graph store: indexed/native pack_id + space filter → correct rows
-        # before limit (all three backends implement the same contract, see
-        # _graph_protocol.py#export_nodes).
-        raw = graph_store.export_nodes_scoped(effective, limit=limit, space=cleaned_space)
-        # export_nodes returns [{"props": dict, "labels": [str]}, ...]
-        # normalise to same shape as doc store list_nodes. The space check
-        # below is now redundant with the backend's own filter (kept as
-        # cheap defense-in-depth, same spirit as _expand()'s redundant
-        # pack_set check in _sql_graph_base.py) rather than load-bearing.
-        for item in raw:
-            props = item.get("props") or {}
-            labels = item.get("labels") or []
-            domains = domain_labels(labels)
-            node_type = props.get("node_type") or (domains[0] if len(domains) == 1 else "")
-            n_id = props.get("node_id") or props.get("id", "")
-            n_space = props.get("space_id") or props.get("space", "")
-            if cleaned_space and n_space != cleaned_space:
-                continue
-            nodes.append({
-                "node_id": n_id,
-                "node_type": node_type,
-                "space": n_space,
-                "properties": props,
-            })
-    else:
-        # Doc store fallback (no pack_id named). #147: still scoped -- the
-        # doc store gets the readable set explicitly rather than the
-        # unfiltered list_nodes it used to call. Data source is unchanged on
-        # purpose: switching this branch to the graph store would also change
-        # which rows and which `total` semantics callers see, and that is not
-        # what this issue is for.
-        nodes = ctx["mongo"].list_nodes_scoped(effective, space=cleaned_space, limit=limit)
-        total = len(nodes)
+    for item in raw:
+        props = item.get("props") or {}
+        labels = item.get("labels") or []
+        domains = domain_labels(labels)
+        node_type = props.get("node_type") or (domains[0] if len(domains) == 1 else "")
+        n_id = props.get("node_id") or props.get("id", "")
+        n_space = props.get("space_id") or props.get("space", "")
+        if cleaned_space and n_space != cleaned_space:
+            continue
+        nodes.append({
+            "node_id": n_id,
+            "node_type": node_type,
+            "space": n_space,
+            "properties": props,
+        })
 
     return {
         "nodes": nodes,

@@ -98,10 +98,12 @@ def users(sql):
 def _node(graph, docs, pack_id: str, node_id: str, *, extra: dict[str, Any] | None = None):
     """Write one node into BOTH stores, tagged with pack_id.
 
-    Both, because the read paths disagree about which store answers:
-    ``ontology_list_nodes`` uses the graph store when a pack is named and
-    the doc store when one is not, so a fixture that only populated one of
-    them would leave half the entry points untested.
+    Both, so this fixture also exercises the doc store's own doc_sources/FTS
+    leg (populated below) alongside the graph store. As of issue #55, both
+    ``ontology_get_node`` and every branch of ``ontology_list_nodes`` read
+    the graph store exclusively for node lookups -- the doc store copy
+    written here is for the FTS/BM25-adjacent assertions elsewhere in this
+    module, not because the node-lookup tools still fall back to it.
     """
     props = {"pack_id": pack_id, "node_id": node_id, "title": f"title of {node_id}"}
     props.update(extra or {})
