@@ -204,154 +204,171 @@ def seed(pack_id: str | None = None) -> None:
     cfg = get_settings()
 
     # Init stores via factory to respect STORAGE_MODE
-    neo4j = make_graph_store(cfg)
-    chroma = make_vector_store(cfg)
-    mongo = make_doc_store(cfg)
-    sql = make_sql_store(cfg)
+    # Built inside a boundary that closes them (#140). The vector store may be
+    # a local ChromaStore holding chroma.lock for its lifetime, so a failure
+    # anywhere below must not leave it open with nothing to close it. This is
+    # a short-lived script and process exit would eventually reclaim the lock,
+    # but relying on that is exactly the gap this issue closes elsewhere.
+    neo4j = chroma = mongo = sql = None
+    try:
+        neo4j = make_graph_store(cfg)
+        chroma = make_vector_store(cfg)
+        mongo = make_doc_store(cfg)
+        sql = make_sql_store(cfg)
 
-    # Print store status
-    store_table = Table(title="Store Status", show_header=True)
-    store_table.add_column("Store")
-    store_table.add_column("Status")
-    for name, store in [("Neo4j", neo4j), ("ChromaDB", chroma), ("MongoDB", mongo), ("PostgreSQL", sql)]:
-        status = "[green]CONNECTED[/green]" if store.available else "[red]UNAVAILABLE[/red]"
-        store_table.add_row(name, status)
-    console.print(store_table)
+        # Print store status
+        store_table = Table(title="Store Status", show_header=True)
+        store_table.add_column("Store")
+        store_table.add_column("Status")
+        for name, store in [("Neo4j", neo4j), ("ChromaDB", chroma), ("MongoDB", mongo), ("PostgreSQL", sql)]:
+            status = "[green]CONNECTED[/green]" if store.available else "[red]UNAVAILABLE[/red]"
+            store_table.add_row(name, status)
+        console.print(store_table)
 
-    if not any([neo4j.available, chroma.available, mongo.available, sql.available]):
-        console.print("\n[red]All stores unavailable. Start services with: docker-compose up -d[/red]")
-        return
+        if not any([neo4j.available, chroma.available, mongo.available, sql.available]):
+            console.print("\n[red]All stores unavailable. Start services with: docker-compose up -d[/red]")
+            return
 
-    builder = OntologyBuilder(neo4j, mongo, sql)
-    rebac = ReBACEngine(neo4j, sql)
-    hybrid = HybridQuery(chroma, neo4j)
+        builder = OntologyBuilder(neo4j, mongo, sql)
+        rebac = ReBACEngine(neo4j, sql)
+        hybrid = HybridQuery(chroma, neo4j)
 
-    # #148: builder.add_node/add_edge now require a bound principal + pack_id.
-    # This script is a standalone entry point, so bind the local user here
-    # (same as opencrab.cli's write paths) rather than assume one is already bound.
-    principal = require_local_principal()
-    target_pack_id = resolve_write_pack(sql, principal, pack_id)
+        # #148: builder.add_node/add_edge now require a bound principal + pack_id.
+        # This script is a standalone entry point, so bind the local user here
+        # (same as opencrab.cli's write paths) rather than assume one is already bound.
+        principal = require_local_principal()
+        target_pack_id = resolve_write_pack(sql, principal, pack_id)
 
-    # Ensure constraints
-    if neo4j.available:
-        with write_lock(cfg.local_data_dir):
-            neo4j.ensure_constraints()
-        console.print("[dim]Neo4j constraints ensured.[/dim]")
+        # Ensure constraints
+        if neo4j.available:
+            with write_lock(cfg.local_data_dir):
+                neo4j.ensure_constraints()
+            console.print("[dim]Neo4j constraints ensured.[/dim]")
 
-    # --- Seed nodes ---
-    console.print(f"\n[bold]Seeding {len(NODES)} nodes...[/bold]")
-    node_ok = 0
-    node_fail = 0
-    with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        task = progress.add_task("Adding nodes...", total=len(NODES))
-        for space, node_type, node_id, props in NODES:
-            try:
-                with write_lock(cfg.local_data_dir):
-                    result = builder.add_node(space, node_type, node_id, props, pack_id=target_pack_id)
-                stores = result.get("stores") if isinstance(result, dict) else None
-                if not isinstance(stores, dict):
-                    stores = {}
-                if store_write_succeeded_for(stores, "node"):
-                    node_ok += 1
-                else:
-                    detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
-                    console.print(f"  [red]FAIL[/red] {node_id}: {detail}")
+        # --- Seed nodes ---
+        console.print(f"\n[bold]Seeding {len(NODES)} nodes...[/bold]")
+        node_ok = 0
+        node_fail = 0
+        with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("Adding nodes...", total=len(NODES))
+            for space, node_type, node_id, props in NODES:
+                try:
+                    with write_lock(cfg.local_data_dir):
+                        result = builder.add_node(space, node_type, node_id, props, pack_id=target_pack_id)
+                    stores = result.get("stores") if isinstance(result, dict) else None
+                    if not isinstance(stores, dict):
+                        stores = {}
+                    if store_write_succeeded_for(stores, "node"):
+                        node_ok += 1
+                    else:
+                        detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                        console.print(f"  [red]FAIL[/red] {node_id}: {detail}")
+                        node_fail += 1
+                except Exception as exc:
+                    console.print(f"  [red]FAIL[/red] {node_id}: {exc}")
                     node_fail += 1
-            except Exception as exc:
-                console.print(f"  [red]FAIL[/red] {node_id}: {exc}")
-                node_fail += 1
-            progress.advance(task)
+                progress.advance(task)
 
-    console.print(f"  Nodes: [green]{node_ok} ok[/green], [red]{node_fail} failed[/red]")
+        console.print(f"  Nodes: [green]{node_ok} ok[/green], [red]{node_fail} failed[/red]")
 
-    # --- Seed edges ---
-    console.print(f"\n[bold]Seeding {len(EDGES)} edges...[/bold]")
-    edge_ok = 0
-    edge_fail = 0
-    with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        task = progress.add_task("Adding edges...", total=len(EDGES))
-        for from_space, from_id, relation, to_space, to_id in EDGES:
+        # --- Seed edges ---
+        console.print(f"\n[bold]Seeding {len(EDGES)} edges...[/bold]")
+        edge_ok = 0
+        edge_fail = 0
+        with principal_scope(principal), Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            task = progress.add_task("Adding edges...", total=len(EDGES))
+            for from_space, from_id, relation, to_space, to_id in EDGES:
+                try:
+                    with write_lock(cfg.local_data_dir):
+                        result = builder.add_edge(from_space, from_id, relation, to_space, to_id, pack_id=target_pack_id)
+                    stores = result.get("stores") if isinstance(result, dict) else None
+                    if not isinstance(stores, dict):
+                        stores = {}
+                    if store_write_succeeded_for(stores, "edge"):
+                        edge_ok += 1
+                    else:
+                        detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
+                        console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {detail}")
+                        edge_fail += 1
+                except Exception as exc:
+                    console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {exc}")
+                    edge_fail += 1
+                progress.advance(task)
+
+        console.print(f"  Edges: [green]{edge_ok} ok[/green], [red]{edge_fail} failed[/red]")
+
+        # --- Seed ReBAC policies ---
+        console.print("\n[bold]Seeding ReBAC policies...[/bold]")
+        if sql.available:
             try:
                 with write_lock(cfg.local_data_dir):
-                    result = builder.add_edge(from_space, from_id, relation, to_space, to_id, pack_id=target_pack_id)
-                stores = result.get("stores") if isinstance(result, dict) else None
-                if not isinstance(stores, dict):
-                    stores = {}
-                if store_write_succeeded_for(stores, "edge"):
-                    edge_ok += 1
-                else:
-                    detail = "; ".join(store_write_failures(stores)) or "no store confirmed the write"
-                    console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {detail}")
-                    edge_fail += 1
+                    rebac.grant("user-alice", "view",    "ds-events")
+                    rebac.grant("user-alice", "edit",    "doc-spec")
+                    rebac.grant("user-bob",   "admin",   "proj-analytics")
+                    rebac.grant("team-data",  "view",    "ds-events")
+                    rebac.deny("agent-rag",   "edit",    "ds-events")
+                console.print("  [green]5 policies seeded.[/green]")
             except Exception as exc:
-                console.print(f"  [red]FAIL[/red] {from_id}-[{relation}]->{to_id}: {exc}")
-                edge_fail += 1
-            progress.advance(task)
+                console.print(f"  [red]Policy seed failed: {exc}[/red]")
+        else:
+            console.print("  [yellow]PostgreSQL unavailable, skipping ReBAC seed.[/yellow]")
 
-    console.print(f"  Edges: [green]{edge_ok} ok[/green], [red]{edge_fail} failed[/red]")
+        # --- Ingest text documents ---
+        console.print(f"\n[bold]Ingesting {len(INGEST_TEXTS)} text documents...[/bold]")
+        ingest_ok = 0
+        for text, source_id, meta in INGEST_TEXTS:
+            try:
+                with write_lock(cfg.local_data_dir):
+                    hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+                    if mongo.available:
+                        mongo.upsert_source(source_id, text, meta)
+                ingest_ok += 1
+                console.print(f"  [green]OK[/green] {source_id} ({len(text)} chars)")
+            except Exception as exc:
+                console.print(f"  [red]FAIL[/red] {source_id}: {exc}")
 
-    # --- Seed ReBAC policies ---
-    console.print("\n[bold]Seeding ReBAC policies...[/bold]")
-    if sql.available:
-        try:
-            with write_lock(cfg.local_data_dir):
-                rebac.grant("user-alice", "view",    "ds-events")
-                rebac.grant("user-alice", "edit",    "doc-spec")
-                rebac.grant("user-bob",   "admin",   "proj-analytics")
-                rebac.grant("team-data",  "view",    "ds-events")
-                rebac.deny("agent-rag",   "edit",    "ds-events")
-            console.print("  [green]5 policies seeded.[/green]")
-        except Exception as exc:
-            console.print(f"  [red]Policy seed failed: {exc}[/red]")
-    else:
-        console.print("  [yellow]PostgreSQL unavailable, skipping ReBAC seed.[/yellow]")
+        console.print(f"  Ingested: [green]{ingest_ok}/{len(INGEST_TEXTS)}[/green]")
 
-    # --- Ingest text documents ---
-    console.print(f"\n[bold]Ingesting {len(INGEST_TEXTS)} text documents...[/bold]")
-    ingest_ok = 0
-    for text, source_id, meta in INGEST_TEXTS:
-        try:
-            with write_lock(cfg.local_data_dir):
-                hybrid.ingest(text=text, source_id=source_id, metadata=meta)
-                if mongo.available:
-                    mongo.upsert_source(source_id, text, meta)
-            ingest_ok += 1
-            console.print(f"  [green]OK[/green] {source_id} ({len(text)} chars)")
-        except Exception as exc:
-            console.print(f"  [red]FAIL[/red] {source_id}: {exc}")
+        # --- Summary ---
+        console.print("\n[bold green]Seed complete![/bold green]")
+        if sql.available:
+            counts = sql.table_counts()
+            summary = Table(title="PostgreSQL Table Counts")
+            summary.add_column("Table")
+            summary.add_column("Rows", justify="right")
+            for table, count in counts.items():
+                summary.add_row(table, str(count))
+            console.print(summary)
 
-    console.print(f"  Ingested: [green]{ingest_ok}/{len(INGEST_TEXTS)}[/green]")
+        if mongo.available:
+            mongo_counts = mongo.collection_stats()
+            console.print(
+                f"\n[bold]MongoDB:[/bold] "
+                f"nodes={mongo_counts.get('nodes', 0)}, "
+                f"sources={mongo_counts.get('sources', 0)}, "
+                f"audit_log={mongo_counts.get('audit_log', 0)}"
+            )
 
-    # --- Summary ---
-    console.print("\n[bold green]Seed complete![/bold green]")
-    if sql.available:
-        counts = sql.table_counts()
-        summary = Table(title="PostgreSQL Table Counts")
-        summary.add_column("Table")
-        summary.add_column("Rows", justify="right")
-        for table, count in counts.items():
-            summary.add_row(table, str(count))
-        console.print(summary)
+        if neo4j.available:
+            total_nodes = neo4j.count_nodes()
+            console.print(f"[bold]Neo4j:[/bold] {total_nodes} nodes")
 
-    if mongo.available:
-        mongo_counts = mongo.collection_stats()
+        if chroma.available:
+            console.print(f"[bold]ChromaDB:[/bold] {chroma.count()} vectors")
+
         console.print(
-            f"\n[bold]MongoDB:[/bold] "
-            f"nodes={mongo_counts.get('nodes', 0)}, "
-            f"sources={mongo_counts.get('sources', 0)}, "
-            f"audit_log={mongo_counts.get('audit_log', 0)}"
+            "\n[dim]Run 'opencrab query \"system performance\"' to test the ontology.[/dim]"
         )
+    finally:
+        from opencrab.locking import close_quietly
 
-    if neo4j.available:
-        total_nodes = neo4j.count_nodes()
-        console.print(f"[bold]Neo4j:[/bold] {total_nodes} nodes")
-
-    if chroma.available:
-        console.print(f"[bold]ChromaDB:[/bold] {chroma.count()} vectors")
-
-    console.print(
-        "\n[dim]Run 'opencrab query \"system performance\"' to test the ontology.[/dim]"
-    )
+        for _store, _what in (
+            (chroma, "vector store"),
+            (mongo, "doc store"),
+            (neo4j, "graph store"),
+            (sql, "sql store"),
+        ):
+            close_quietly(_store, _what)
 
 
 if __name__ == "__main__":

@@ -1979,9 +1979,11 @@ def main(argv: list[str] | None = None) -> int:
     owner_id = _bootstrap_owner_id(sql)
     print(f"Bootstrap owner: {owner_id}")
 
-    graph = make_graph_store(settings)
-    docs = make_doc_store(settings)
-    vector = make_vector_store(settings)
+    # Built INSIDE the try that closes them (#140). The vector store may be a
+    # local ChromaStore, which holds chroma.lock for its lifetime; created
+    # above the boundary, a failure between here and the try left that lock
+    # held by a store nothing would close.
+    graph = docs = vector = None
 
     # {stage_name: {"outcome": ..., "reason": ...}} -- populated as each
     # stage below runs, printed in full in the Summary regardless of where
@@ -1989,6 +1991,9 @@ def main(argv: list[str] | None = None) -> int:
     stage_outcomes: dict[str, dict[str, str]] = {}
 
     try:
+        graph = make_graph_store(settings)
+        docs = make_doc_store(settings)
+        vector = make_vector_store(settings)
         print("\n1) Ensuring the default (catch-all) pack is registered...")
         default_pack_id, default_pending = _ensure_default_pack(sql, owner_id, args.apply)
 
@@ -2227,6 +2232,19 @@ def main(argv: list[str] | None = None) -> int:
         for name, info in stage_outcomes.items():
             print(f"  {name}: {info['outcome']} ({info['reason']})")
         return 1
+    finally:
+        # #140: the vector store may be a local ChromaStore holding
+        # chroma.lock for its lifetime. Nothing below this point uses the
+        # stores, so closing here is the last moment that is still inside the
+        # boundary which the creations sit in.
+        from opencrab.locking import close_quietly
+
+        for _store, _what in (
+            (vector, "vector store"),
+            (docs, "doc store"),
+            (graph, "graph store"),
+        ):
+            close_quietly(_store, _what)
 
     print("\nSummary:")
     for name, info in stage_outcomes.items():
