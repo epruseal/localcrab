@@ -614,8 +614,14 @@ def test_install_pack_warns_on_repairing_stale_current_shape_schema(tmp_path, mo
 
     with caplog.at_level("WARNING"):
         pack_registry.install_pack("overlappack")
+    # Field list and type name must not swap places in the formatted
+    # message (codex review, PR #336 round 2: a %r/%s argument-order bug
+    # produced "field(s) 'Widget' for ['name']" -- type and field list
+    # transposed -- and this assertion's earlier form, checking only that
+    # both substrings appeared anywhere, did not catch it).
     assert any(
-        "name" in rec.message and "repaired" in rec.message.lower() for rec in caplog.records
+        "repaired" in rec.message.lower() and "['name'] for Widget" in rec.message
+        for rec in caplog.records
     )
 
 

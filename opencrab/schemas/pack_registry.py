@@ -304,6 +304,16 @@ def install_pack(name: str) -> dict[str, Any]:
     entirely or demoted to ``optional``) is reported in
     ``revived_manifest_fields``, again decided before the write.
 
+    A CURRENT-shape file (already has ``properties``) carrying this tool's
+    generation header is also inspected, not skipped outright (#107, PR #336
+    review): if any manifest-required field is on disk as ``required:
+    false`` -- exactly what a schema generated before the #107 fix looks
+    like -- that field alone is flipped back to ``true`` and reported in
+    ``revived_manifest_fields``, same as a migrated legacy stub. Anything
+    else about the file (other fields, their values) is left untouched. A
+    current-shape file without the header, or with no such stale field, is
+    left alone and counted as ``skipped``, same as before.
+
     Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
@@ -392,7 +402,7 @@ def install_pack(name: str) -> dict[str, Any]:
                 logger.warning(
                     "Pack '%s': repaired stale required=False on manifest-required "
                     "field(s) %r for %s (schema generated before the #107 fix)",
-                    name, node_type, stale_required,
+                    name, stale_required, node_type,
                 )
                 continue
             if not _has_generation_marker(existing_content, name):
