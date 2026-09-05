@@ -56,9 +56,14 @@ class TestNeo4jGuardContracts:
         """Different pattern (log + return) — must stay untouched by the dedup."""
         self._store().ensure_constraints()
 
-    def test_lookup_node_type_returns_none_without_raising(self):
-        """Different pattern (soft None) — must stay untouched by the dedup."""
-        assert self._store().lookup_node_type("u1") is None
+    def test_lookup_node_type_raises_when_unavailable(self):
+        """#162: same fail-closed contract as LocalGraphStore -- an
+        unavailable Neo4j store cannot tell "absent" from "down", so it
+        raises GraphReadCapabilityUnavailable rather than returning None."""
+        from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            self._store().lookup_node_type("u1")
 
 
 class TestMongoGuardContracts:

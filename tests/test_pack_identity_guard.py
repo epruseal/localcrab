@@ -227,6 +227,52 @@ def test_foreign_edge_identity_rejected(graph):
 
 
 # ---------------------------------------------------------------------------
+# 7b. #162: an endpoint's lookup_node_type call itself cannot answer
+#     (GraphReadCapabilityUnavailable, distinct from "node absent") -- the
+#     edge must be refused and that refusal must reach the caller as an
+#     edge_errors entry / status="partial", not just a log line. This pins
+#     the team-lead's merge condition: #41(A-4)'s store_write_failures()
+#     aggregation is never even reached here, because this module's own
+#     pre-add_edge endpoint probe (the `lookup(item_from_id)` call above)
+#     raises before `builder.add_edge` is called, and that raise is caught
+#     by this loop's bare `except Exception` and appended to edge_errors
+#     directly -- so the report is confirmed for this call path.
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_lookup_unavailable_is_reported_not_silently_dropped(graph):
+    from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+
+    graph.upsert_node("Entity", "a", {"pack_id": "my-pack"})
+    graph.upsert_node("Entity", "b", {"pack_id": "my-pack"})
+    real_lookup = graph.lookup_node_type
+
+    def _flaky_lookup(node_id):
+        if node_id == "a":
+            raise GraphReadCapabilityUnavailable(f"simulated read fault for {node_id!r}")
+        return real_lookup(node_id)
+
+    graph.lookup_node_type = _flaky_lookup
+
+    ctx = _ctx(graph)
+    with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        result = _ingest_into_pack(
+            "my-pack",
+            edges=[{
+                "from_space": "concept", "from_id": "a", "relation": "related_to",
+                "to_space": "concept", "to_id": "b",
+            }],
+        )
+
+    assert result["status"] == "partial"
+    assert result["added_edges"] == 0
+    assert len(result["edge_errors"]) == 1
+    assert "simulated read fault" in result["edge_errors"][0]
+    ctx["builder"].add_edge.assert_not_called()
+    assert graph.get_edge("Entity", "a", "related_to", "Entity", "b") is None
+
+
+# ---------------------------------------------------------------------------
 # 8. source_id targets a foreign evidence/TextUnit node -> rejected,
 #    stores["evidence_node"] carries the same message.
 # ---------------------------------------------------------------------------

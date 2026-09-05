@@ -17,7 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from opencrab.common.graph_identity import canonical_edge_digest, canonical_node_digest
+from opencrab.common.graph_identity import (
+    GraphReadCapabilityUnavailable,
+    canonical_edge_digest,
+    canonical_node_digest,
+)
 from opencrab.stores.neo4j_store import Neo4jStore
 
 
@@ -204,10 +208,64 @@ class TestNeo4jStoreNormal:
         assert store.lookup_node_type("u1") == "User"
 
     def test_lookup_node_type_none_when_not_found(self):
+        # A genuine "no match": real Neo4j's single() returns None itself
+        # when MATCH finds nothing -- it never hands back a record whose
+        # field is None (that shape is the malformed case below, #162 v3
+        # codex review: this fixture used to simulate the wrong thing).
+        store, _driver, mock_session = _make_connected_store()
+        mock_session.run.return_value.single.return_value = None
+
+        assert store.lookup_node_type("missing") is None
+
+    def test_lookup_node_type_malformed_raises(self):
+        # A row matched but its node_type came back null/empty -- a
+        # data-integrity fault, not "not found". Must not be confused with
+        # the absent case above (#162).
         store, _driver, mock_session = _make_connected_store()
         mock_session.run.return_value.single.return_value = {"lbl": None}
 
-        assert store.lookup_node_type("missing") is None
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.lookup_node_type("weird")
+
+    @pytest.mark.parametrize("bad_label", [42, "has space", "1leadingdigit", "kebab-case"])
+    def test_lookup_node_type_truthy_but_invalid_label_raises(self, bad_label):
+        # A row matched with a NON-empty node_type that is still not a
+        # legal label -- an int, or a string with illegal characters. The
+        # bare "not label" check (#162 v1/v2) let this pass through as if
+        # it were a real type, and OntologyBuilder.add_edge would forward
+        # it to get_node/upsert_edge, which raise a raw TypeError/ValueError
+        # there instead of the intended fail-closed graph-unavailable
+        # receipt (#162 codex review round 6).
+        store, _driver, mock_session = _make_connected_store()
+        mock_session.run.return_value.single.return_value = {"lbl": bad_label}
+
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.lookup_node_type("weird")
+
+    @pytest.mark.parametrize(
+        "exc_type", [KeyError, TypeError, AttributeError, IndexError, ValueError, AssertionError]
+    )
+    def test_lookup_node_type_propagates_programming_errors(self, exc_type):
+        # KeyError: RETURN ... AS lbl renamed but the read site not updated.
+        # TypeError/AttributeError/IndexError/ValueError/AssertionError:
+        # adapter or driver misuse. None of these are "store unavailable" --
+        # they must surface as themselves so a bug is visible instead of
+        # disguised (#162 codex review round 3/4, full denylist coverage
+        # round 5).
+        store, _driver, mock_session = _make_connected_store()
+        mock_session.run.side_effect = exc_type("boom")
+
+        with pytest.raises(exc_type):
+            store.lookup_node_type("u1")
+
+    def test_lookup_node_type_wraps_other_errors_with_cause(self):
+        store, _driver, mock_session = _make_connected_store()
+        original = RuntimeError("driver connection reset")
+        mock_session.run.side_effect = original
+
+        with pytest.raises(GraphReadCapabilityUnavailable) as excinfo:
+            store.lookup_node_type("u1")
+        assert excinfo.value.__cause__ is original
 
     def test_delete_node_true_when_count_positive(self):
         store, _driver, mock_session = _make_connected_store()
@@ -407,11 +465,14 @@ class TestNeo4jStoreErrors:
         with pytest.raises(RuntimeError, match="not available"):
             call(store)
 
-    def test_lookup_node_type_returns_none_when_unavailable(self):
-        # Deliberately lenient: used as a best-effort resolution helper by
-        # OntologyBuilder, so it degrades to None instead of raising.
+    def test_lookup_node_type_raises_when_unavailable(self):
+        # #162: an unavailable store cannot tell "node absent" from "store
+        # down" -- it must raise instead of degrading to None, so
+        # OntologyBuilder.add_edge can refuse the write instead of guessing
+        # a default type.
         store = _make_unavailable_store()
-        assert store.lookup_node_type("u1") is None
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            store.lookup_node_type("u1")
 
     def test_ensure_constraints_warns_and_returns_when_unavailable(self):
         # Deliberately lenient bootstrap operation: warns instead of raising.

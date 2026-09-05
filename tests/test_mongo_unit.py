@@ -393,10 +393,17 @@ class _AvailableGraphStub:
     add_edge/add_node's #148-point-6 "graph unavailable -> refuse the whole
     write" early exit does not fire before the mongo-specific branch under
     test in this class ever runs. Deliberately has no upsert_node/
-    upsert_edge/lookup_node_type methods: the resulting AttributeError is
-    caught by add_node/add_edge's own try/except and reported as
-    "graph": "error: ..." -- irrelevant to what this class is testing (the
-    docs/mongo marker)."""
+    upsert_edge methods: the resulting AttributeError is caught by
+    add_node/add_edge's own try/except and reported as "graph": "error: ..."
+    -- irrelevant to what this class is testing (the docs/mongo marker).
+
+    #162: ``lookup_node_type`` IS implemented here (returning a fixed type
+    for any id), unlike the other write methods above. Since that fix,
+    add_edge treats a missing/unavailable ``lookup_node_type`` as "cannot
+    resolve either endpoint's type -> refuse the whole write", which would
+    short-circuit before ever reaching the mongo branch this class tests --
+    the same #148-point-6 early exit this stub exists to dodge.
+    """
 
     # #148: the identity guard probes these before any write. A stub that
     # lacks them is "cannot verify", which is fail-closed and refuses the
@@ -411,6 +418,8 @@ class _AvailableGraphStub:
     def get_edge(self, *args):  # noqa: ARG002
         return None
 
+    def lookup_node_type(self, node_id):  # noqa: ARG002
+        return "StubType"
 
     available = True
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 
+from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
@@ -138,6 +139,52 @@ def test_guard_is_inert_when_store_unavailable(tmp_path, sql, pack_id):
     result = b.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
 
     assert result["stores"]["graph"] == "unavailable"
+    assert result["stores"]["sql"] == "skipped (graph unavailable)"
+    assert "missing_nodes" not in result
+    docs.close()
+
+
+def test_endpoint_lookup_unavailable_refuses_write_end_to_end(tmp_path, sql, pack_id):
+    """#162: the store is *available* but a single lookup_node_type call
+    cannot answer (GraphReadCapabilityUnavailable) -- add_edge must refuse
+    the whole write, not fall back to a guessed per-space default type.
+    """
+
+    class FlakyLookupGraph:
+        available = True
+
+        def lookup_node_type(self, node_id: str) -> str | None:
+            raise GraphReadCapabilityUnavailable(f"simulated read fault for {node_id!r}")
+
+    docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    b = OntologyBuilder(FlakyLookupGraph(), docs, sql)
+
+    result = b.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
+
+    assert result["stores"]["graph"].startswith("unavailable")
+    assert result["stores"]["sql"] == "skipped (graph unavailable)"
+    assert "missing_nodes" not in result
+    docs.close()
+
+
+def test_missing_lookup_node_type_method_refuses_write(tmp_path, sql, pack_id):
+    """#162 v2/v3: Python's ``Protocol`` is structural and unchecked at
+    runtime here (no ``isinstance`` gate) -- a double or a future backend
+    that simply omits ``lookup_node_type`` must degrade to the same
+    fail-closed response as an unavailable store, not crash with a bare
+    ``AttributeError``.
+    """
+
+    class NoLookupGraph:
+        available = True
+        # Deliberately no lookup_node_type attribute at all.
+
+    docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    b = OntologyBuilder(NoLookupGraph(), docs, sql)
+
+    result = b.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
+
+    assert result["stores"]["graph"] == "unavailable (lookup_node_type not implemented)"
     assert result["stores"]["sql"] == "skipped (graph unavailable)"
     assert "missing_nodes" not in result
     docs.close()

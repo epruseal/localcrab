@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,30 @@ class GraphWriteCapabilityUnavailable(GraphWriteUnavailable):
 
 class GraphReadCapabilityUnavailable(RuntimeError):  # noqa: N818 - public domain exception name
     """The backend has no qualified read capability."""
+
+
+_NODE_TYPE_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_valid_node_type_label(value: Any) -> bool:
+    """True iff ``value`` is a syntactically legal node-type label.
+
+    A legal label is a non-empty string of letters, digits, and
+    underscores, starting with a letter or underscore -- the same shape
+    ``Neo4jStore._label`` already enforces before interpolating a label
+    into Cypher. ``lookup_node_type()`` (#162, codex review round 2) uses
+    this to catch a truthy-but-malformed stored ``node_type`` (an int, or
+    a string containing spaces or punctuation) before it reaches a caller
+    that trusts the declared ``str | None`` contract -- such a value is a
+    data-integrity fault, not a legitimate type, and must raise
+    ``GraphReadCapabilityUnavailable`` rather than propagate as itself and
+    later blow up as a raw ``TypeError``/``ValueError`` somewhere
+    downstream (``OntologyBuilder.add_edge`` -> ``get_node``/
+    ``upsert_edge``), which would surface to a REST caller as a
+    misleading client-side error instead of the intended graph-unavailable
+    receipt.
+    """
+    return isinstance(value, str) and bool(_NODE_TYPE_LABEL_RE.fullmatch(value))
 
 
 class GraphQueryWriteRejected(GraphWriteUnavailable):
