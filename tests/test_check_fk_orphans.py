@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -101,3 +102,28 @@ def test_corrupt_non_sqlite_file_is_diagnostic_error(
     monkeypatch.setattr(sys, "argv", ["check_fk_orphans.py", str(corrupt)])
 
     assert cli.main() == 2
+
+
+def test_path_containing_uri_metacharacter_is_still_opened_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """경로에 ``?`` 가 있으면 percent-encode 없이는 SQLite 가 그 뒤를 쿼리
+    파라미터로 파싱해 엉뚱한 파일을 열고 ``mode=ro`` 인식도 깨진다(리뷰 지적,
+    PR #337). 이 테스트는 그 경로를 진짜로 만들어 정확한 파일이 읽기 전용으로
+    열리고, 위반이 실제 내용대로 보고되는지 확인한다."""
+    db_path = tmp_path / "real?name.db"
+    _make_orphaned_db(db_path)
+
+    violations = cli.check(str(db_path))
+    assert len(violations) == 1
+
+    # 읽기 전용 커넥션이라는 사실도 같이 확인한다 -- URI 파싱이 깨지면
+    # mode=ro 자체가 인식되지 않아 이 커넥션으로 쓰기가 통과해 버린다.
+    encoded = urllib.parse.quote(str(db_path.resolve()))
+    conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("CREATE TABLE should_not_write (x int)")
+            conn.commit()
+    finally:
+        conn.close()

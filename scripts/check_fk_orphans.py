@@ -21,13 +21,21 @@ foreign_keys=ON`` 을 전역으로 걸기 전에, 이미 들어간 데이터가 
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
+import urllib.parse
 
 
 def check(db_path: str) -> list[tuple]:
     """``db_path`` 의 FK 위반 행을 전부 반환한다. 읽기 전용 커넥션만 연다."""
-    uri = f"file:{db_path}?mode=ro"
+    # ``db_path`` 에 URI 메타문자(``?``, ``#`` 등)가 있으면 percent-encode 없이는
+    # SQLite 가 그 뒤를 쿼리 파라미터로 파싱해 완전히 다른 파일을 연다(리뷰
+    # 지적, PR #337 -- 실측: "real?name.db" 를 그대로 붙이면 "real" 이 열리고
+    # mode=ro 인식도 깨져 쓰기까지 통과했다). 절대 경로로 정규화한 뒤
+    # percent-encode 해서 경로 구분자(``/``)만 그대로 두고 나머지를 이스케이프한다.
+    encoded = urllib.parse.quote(os.path.abspath(db_path))
+    uri = f"file:{encoded}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
         # PRAGMA foreign_key_check 는 이 커넥션의 foreign_keys 설정과
