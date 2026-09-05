@@ -228,8 +228,10 @@ def _owned_sql(*pack_ids):
     always-empty scope."""
     from opencrab.pack.ownership import create_pack
     from opencrab.stores.sql_store import SQLStore
+    from tests._pack_fixtures import ensure_test_user
 
     sql = SQLStore("sqlite:///:memory:")
+    ensure_test_user(sql, "test-user")
     for pack_id in pack_ids:
         create_pack(sql, "test-user", pack_id)
     return sql

@@ -26,7 +26,11 @@ pytestmark = pytest.mark.usefixtures("bind_test_principal")
 
 @pytest.fixture
 def sql():
+    from tests._pack_fixtures import ensure_test_user
+
     store = SQLStore("sqlite:///:memory:")
+    ensure_test_user(store, "test-user")
+    ensure_test_user(store, "someone-else")
     create_pack(store, "test-user", "claude", title="Claude")
     return store
 

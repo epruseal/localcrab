@@ -887,7 +887,15 @@ class TestReverseAgainstPostgres:
         """The old return value counted inserts, so a row rejected by the target
         looked identical to a re-run that had nothing to do. A pre-created table
         with a CHECK makes one row fail; SQLStore's CREATE IF NOT EXISTS leaves
-        that table in place."""
+        that table in place.
+
+        #181 enables ``PRAGMA foreign_keys`` on this reverse-migration write
+        engine too. ``u-local`` is the owner of ``api_tokens.t-bare`` and
+        ``packs.p-bare`` (see ``_seed_auth_rows``), so once its own row is
+        rejected by the CHECK, those two dependent rows are correctly rejected
+        as well -- inserting them would have left orphans in ``back_db``, the
+        exact defect #181 closes. The mismatch list below reflects that
+        cascade instead of just the directly-rejected ``users`` row."""
         import logging
 
         src_db = str(tmp_path / "source.db")
@@ -908,7 +916,7 @@ class TestReverseAgainstPostgres:
         result = rev.migrate_sql(pg_schema_dsn, back_db, logging.getLogger(__name__))
         stats = result["tables"]["users"]
         assert stats["target"] < stats["source"]
-        assert rev._row_preservation_mismatches(result) == ["users"]
+        assert rev._row_preservation_mismatches(result) == ["users", "api_tokens", "packs"]
 
     def test_rerun_preserves_rows_without_recopying(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_schema_dsn: str

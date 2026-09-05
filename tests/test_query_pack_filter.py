@@ -293,7 +293,10 @@ def test_51_builder_writes_space_into_vector_metadata() -> None:
     graph.get_node.return_value = None
     graph.get_nodes_by_id.return_value = []
     docs = MagicMock(available=False)
+    from tests._pack_fixtures import ensure_test_user
+
     sql = SQLStore("sqlite:///:memory:")
+    ensure_test_user(sql, "test-user")
     pack_id = create_pack(sql, "test-user", "pack-a")
     builder = OntologyBuilder(graph, docs, sql, vec=vec)
 

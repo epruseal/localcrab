@@ -18,9 +18,10 @@ satisfy -- it raises ``TypeError`` on the comparison), and
 ``opencrab/mcp/tools/pack.py``'s module docstring for why a submodule-level
 patch would not be observed). Principals are literal ``Principal(user_id=...)``
 values, same as ``test_packs_registry.py``'s ``TestPackCreateCollision``/
-``TestPackPublish`` sections -- SQLite's FK enforcement is off by default, so
-``packs.owner_id`` does not need a matching real ``users`` row for these
-tests.
+``TestPackPublish`` sections. SQLite enforces ``packs.owner_id`` FK now
+(#181), so the ``sql`` fixture below plants each literal owner this file
+uses ("alice", "mallory", "someone-else") as a ``users`` row via
+``tests._pack_fixtures.ensure_test_user``.
 """
 
 from __future__ import annotations
@@ -43,8 +44,18 @@ from opencrab.pack.read_scope import assert_registry_covers_graph
 @pytest.fixture
 def sql():
     from opencrab.stores.sql_store import SQLStore
+    from tests._pack_fixtures import ensure_test_user
 
-    return SQLStore("sqlite:///:memory:")
+    store = SQLStore("sqlite:///:memory:")
+    ensure_test_user(store, "alice")
+    # "mallory" is this file's stand-in for a second, adversarial owner
+    # (see _steal_owner and the *_squat_then_* helpers below) -- plant it
+    # here too so every test gets it for free, the same as "alice".
+    ensure_test_user(store, "mallory")
+    # "someone-else" is a third literal owner used by the retained-pack
+    # tests below (begin_pack_creation(sql, "someone-else", ...)).
+    ensure_test_user(store, "someone-else")
+    return store
 
 
 def _base_ctx(sql, **overrides):
