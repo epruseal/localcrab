@@ -163,6 +163,7 @@ from opencrab.stores._graph_common import (
     _space_passes,
     _validate_search_fields,
 )
+from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
 logger = logging.getLogger(__name__)
@@ -578,7 +579,7 @@ class _SqlGraphStoreBase(abc.ABC):
         insert_sql = self._dialect.insert(
             table, ["node_type", "node_id", "space_id", "properties"], json_columns=["properties"]
         ) + "\nON CONFLICT (node_id) DO NOTHING"
-        params = {"node_type": node_type, "node_id": node_id, "space_id": space_id, "properties": json.dumps(props, ensure_ascii=False)}
+        params = {"node_type": node_type, "node_id": node_id, "space_id": space_id, "properties": dump_props(props, ensure_ascii=False)}
 
         def body(tx: GraphTx) -> dict[str, Any] | NodeWriteReceipt:
             self._lock_graph_rows(tx, (node_id,))
@@ -714,7 +715,7 @@ class _SqlGraphStoreBase(abc.ABC):
         digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
         nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
         insert_sql = self._dialect.insert(edges, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (from_id, relation, to_id) DO NOTHING"
-        params = {"from_type": from_type, "from_id": from_id, "relation": relation, "to_type": to_type, "to_id": to_id, "properties": json.dumps(props, ensure_ascii=False)}
+        params = {"from_type": from_type, "from_id": from_id, "relation": relation, "to_type": to_type, "to_id": to_id, "properties": dump_props(props, ensure_ascii=False)}
         def body(tx: GraphTx) -> bool | EdgeWriteReceipt:
             self._lock_graph_rows(tx, (from_id, to_id), ((from_id, relation, to_id),))
             endpoint_rows = tx.fetchall(f"SELECT node_id, node_type FROM {nodes} WHERE node_id IN (:fid, :tid)", {"fid": from_id, "tid": to_id})
@@ -1928,10 +1929,10 @@ class _SqlGraphStoreBase(abc.ABC):
         ]
         for spec in nodes:
             target = spec["target"]
-            tx.execute("INSERT INTO issue80_stage_nodes (node_id,node_type,space_id,properties) VALUES (:node_id,:node_type,:space_id,:properties)", {"node_id": target["node_id"], "node_type": target["node_type"], "space_id": target.get("space_id"), "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+            tx.execute("INSERT INTO issue80_stage_nodes (node_id,node_type,space_id,properties) VALUES (:node_id,:node_type,:space_id,:properties)", {"node_id": target["node_id"], "node_type": target["node_type"], "space_id": target.get("space_id"), "properties": dump_props(spec["properties"], ensure_ascii=False)})
         for spec in edges:
             target = spec["target"]
-            tx.execute("INSERT INTO issue80_stage_edges (from_id,relation,to_id,from_type,to_type,properties) VALUES (:from_id,:relation,:to_id,:from_type,:to_type,:properties)", {"from_id": target["from_id"], "relation": target["relation"], "to_id": target["to_id"], "from_type": target["from_type"], "to_type": target["to_type"], "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+            tx.execute("INSERT INTO issue80_stage_edges (from_id,relation,to_id,from_type,to_type,properties) VALUES (:from_id,:relation,:to_id,:from_type,:to_type,:properties)", {"from_id": target["from_id"], "relation": target["relation"], "to_id": target["to_id"], "from_type": target["from_type"], "to_type": target["to_type"], "properties": dump_props(spec["properties"], ensure_ascii=False)})
         nodes_table = self._table("graph_nodes")
         edges_table = self._table("graph_edges")
         tx.execute(f"DROP TABLE IF EXISTS {edges_table}")
@@ -1944,10 +1945,10 @@ class _SqlGraphStoreBase(abc.ABC):
         insert_edge = self._dialect.insert(edges_table, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"])
         for spec in nodes:
             target = spec["target"]
-            tx.execute(insert_node, {"node_type": target["node_type"], "node_id": target["node_id"], "space_id": target.get("space_id"), "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+            tx.execute(insert_node, {"node_type": target["node_type"], "node_id": target["node_id"], "space_id": target.get("space_id"), "properties": dump_props(spec["properties"], ensure_ascii=False)})
         for spec in edges:
             target = spec["target"]
-            tx.execute(insert_edge, {"from_type": target["from_type"], "from_id": target["from_id"], "relation": target["relation"], "to_type": target["to_type"], "to_id": target["to_id"], "properties": json.dumps(spec["properties"], ensure_ascii=False)})
+            tx.execute(insert_edge, {"from_type": target["from_type"], "from_id": target["from_id"], "relation": target["relation"], "to_type": target["to_type"], "to_id": target["to_id"], "properties": dump_props(spec["properties"], ensure_ascii=False)})
         tx.execute("DROP TABLE issue80_stage_edges")
         tx.execute("DROP TABLE issue80_stage_nodes")
 
@@ -2355,9 +2356,9 @@ class _SqlGraphStoreBase(abc.ABC):
             for kind, key, before_digest, operation, current, after_props, _snapshot in pending:
                 if operation == "assigned":
                     if kind == "node":
-                        result = tx.execute(f"UPDATE {nodes} SET properties=:props WHERE node_id=:nid", {"props": json.dumps(after_props, ensure_ascii=False), "nid": key})
+                        result = tx.execute(f"UPDATE {nodes} SET properties=:props WHERE node_id=:nid", {"props": dump_props(after_props, ensure_ascii=False), "nid": key})
                     else:
-                        result = tx.execute(f"UPDATE {edges} SET properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"props": json.dumps(after_props, ensure_ascii=False), "fid": key[0], "rel": key[1], "tid": key[2]})
+                        result = tx.execute(f"UPDATE {edges} SET properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"props": dump_props(after_props, ensure_ascii=False), "fid": key[0], "rel": key[1], "tid": key[2]})
                     if tx.rowcount(result) != 1:
                         raise RuntimeError("graph pack provenance rowcount mismatch")
                 # Re-read the changed row through the same transaction and
@@ -2420,7 +2421,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 except (TypeError, ValueError) as exc:
                     raise GraphMigrationConflict("incident edge properties are malformed") from exc
                 edge_updates.append((from_id, relation, to_id, next_from_type, next_to_type, edge_digest))
-            result = tx.execute(f"UPDATE {nodes} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": new_type, "sid": space_id, "props": json.dumps(props, ensure_ascii=False), "nid": node_id})
+            result = tx.execute(f"UPDATE {nodes} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": new_type, "sid": space_id, "props": dump_props(props, ensure_ascii=False), "nid": node_id})
             if tx.rowcount(result) != 1:
                 raise NodeIdentityConflict(f"stale node update: {node_id}")
             # Type snapshots are compatibility fields and must follow the node.
@@ -2493,7 +2494,7 @@ class _SqlGraphStoreBase(abc.ABC):
             current_digest = canonical_edge_digest(from_id, relation, to_id, row[0], row[1], current)
             if current_digest != expected_current_digest:
                 raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
-            result = tx.execute(f"UPDATE {edges} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": from_type, "tt": to_type, "props": json.dumps(props, ensure_ascii=False), "fid": from_id, "rel": relation, "tid": to_id})
+            result = tx.execute(f"UPDATE {edges} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": from_type, "tt": to_type, "props": dump_props(props, ensure_ascii=False), "fid": from_id, "rel": relation, "tid": to_id})
             if tx.rowcount(result) != 1:
                 raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
             if return_receipt:
@@ -3715,7 +3716,7 @@ class _SqlGraphStoreBase(abc.ABC):
             for nt, nid, props, sid, _digest in prepared:
                 operation = "idempotent" if nid in rows else "created"
                 if nid not in rows:
-                    result = tx.execute(insert_sql, {"node_type": nt, "node_id": nid, "space_id": sid, "properties": json.dumps(props, ensure_ascii=False)})
+                    result = tx.execute(insert_sql, {"node_type": nt, "node_id": nid, "space_id": sid, "properties": dump_props(props, ensure_ascii=False)})
                     if tx.rowcount(result) == 0:
                         operation = "idempotent"
                     row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {table} WHERE node_id=:nid", {"nid": nid})
@@ -3778,7 +3779,7 @@ class _SqlGraphStoreBase(abc.ABC):
                     raise NodeIdentityConflict(f"stale node update: {nid}")
             receipts = []
             for nid, _expected, nt, props, sid, digest in prepared:
-                result = tx.execute(f"UPDATE {nodes_table} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": nt, "sid": sid, "props": json.dumps(props, ensure_ascii=False), "nid": nid})
+                result = tx.execute(f"UPDATE {nodes_table} SET node_type=:nt, space_id=:sid, properties=:props WHERE node_id=:nid", {"nt": nt, "sid": sid, "props": dump_props(props, ensure_ascii=False), "nid": nid})
                 if tx.rowcount(result) != 1:
                     raise NodeIdentityConflict(f"stale node update: {nid}")
                 tx.execute(f"UPDATE {edges_table} SET from_type=:nt WHERE from_id=:nid", {"nt": nt, "nid": nid})
@@ -3831,7 +3832,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
                 operation = "idempotent" if row else "created"
                 if row is None:
-                    result = tx.execute(insert_sql, {"from_type": ft, "from_id": fid, "relation": rel, "to_type": tt, "to_id": tid, "properties": json.dumps(props, ensure_ascii=False)})
+                    result = tx.execute(insert_sql, {"from_type": ft, "from_id": fid, "relation": rel, "to_type": tt, "to_id": tid, "properties": dump_props(props, ensure_ascii=False)})
                     operation = "created" if tx.rowcount(result) else "idempotent"
                     row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
                 if row is None:
@@ -3880,7 +3881,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 if current.get("pack_id") != owner or canonical_edge_digest(fid, rel, tid, row[0], row[1], current) != expected:
                     raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
                 digest = canonical_edge_digest(fid, rel, tid, ft, tt, props)
-                result = tx.execute(f"UPDATE {table} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": ft, "tt": tt, "props": json.dumps(props, ensure_ascii=False), "fid": fid, "rel": rel, "tid": tid})
+                result = tx.execute(f"UPDATE {table} SET from_type=:ft, to_type=:tt, properties=:props WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"ft": ft, "tt": tt, "props": dump_props(props, ensure_ascii=False), "fid": fid, "rel": rel, "tid": tid})
                 if tx.rowcount(result) != 1:
                     raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
                 if return_receipt:

@@ -55,13 +55,13 @@ Covered here: the 13 methods' SQL text and dict-shaping logic.
 from __future__ import annotations
 
 import abc
-import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from opencrab.stores._graph_common import _as_dict
+from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ class _SqlDocStoreBase(abc.ABC):
                 "space": space,
                 "node_id": node_id,
                 "node_type": node_type,
-                "properties": json.dumps(properties),
+                "properties": dump_props(properties),
                 "updated_at": self._dialect.bind_value_for_timestamp(now),
             },
         )
@@ -405,7 +405,7 @@ class _SqlDocStoreBase(abc.ABC):
             {
                 "source_id": source_id,
                 "text": text,
-                "metadata": json.dumps(metadata),
+                "metadata": dump_props(metadata),
                 "ingested_at": self._dialect.bind_value_for_timestamp(now),
             },
         )
@@ -507,7 +507,7 @@ class _SqlDocStoreBase(abc.ABC):
                 "event_id": event_id,
                 "event_type": event_type,
                 "subject_id": subject_id,
-                "details": json.dumps(details),
+                "details": dump_props(details),
                 "timestamp": self._dialect.bind_value_for_timestamp(now),
             },
         )

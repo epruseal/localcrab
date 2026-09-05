@@ -66,6 +66,7 @@ from collections.abc import Callable
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
+from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._vector_base import (
     default_metadatas,
@@ -308,7 +309,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
-                        "metadata": json.dumps(meta),
+                        "metadata": dump_props(meta),
                     },
                 )
         return ids
@@ -374,7 +375,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(vec),
                         "document": txt,
-                        "metadata": json.dumps(meta),
+                        "metadata": dump_props(meta),
                     },
                 )
                 if result.rowcount == 0:
@@ -583,7 +584,7 @@ class PgVectorStore:
                         "pack_id": slot_owner(meta),
                         "embedding": _to_pgvector_literal(record["embedding"]),
                         "document": record["document"],
-                        "metadata": json.dumps(meta),
+                        "metadata": dump_props(meta),
                     },
                 )
         return [record["id"] for record in clean]

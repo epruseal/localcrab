@@ -49,6 +49,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -247,7 +248,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 {
                     "source_id": source_id,
                     "text": text,
-                    "metadata": json.dumps(metadata),
+                    "metadata": dump_props(metadata),
                     "ingested_at": self._dialect.bind_value_for_timestamp(now),
                 },
             )
