@@ -96,8 +96,16 @@ def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
     if new_text and new_text not in old_text:
         existing["text"] = f"{old_text}\n{new_text}".strip()[:4000]
 
+    # #57: leg 병합 순서(vector < bm25 < fts < graph)는 값의 신뢰도와 무관하다.
+    # 무조건 update() 하면 후순위 leg 의 falsy 값(빈 문자열, None 등)이 앞선
+    # leg 의 truthy 값을 지워 버린다(예: graph leg 의 pack_id="" 가 vector leg 의
+    # 유효한 pack_id 를 덮음). 새 값이 falsy 하고 기존 값이 이미 truthy 하면
+    # 채택하지 않는다. 그 외(새 값이 truthy 하거나, 기존 값이 falsy 하거나
+    # 키가 부재한 경우)는 기존 동작대로 후순위 leg 값을 채택한다.
     metadata = dict(existing.get("metadata") or {})
-    metadata.update(item.get("metadata") or {})
+    for key, value in (item.get("metadata") or {}).items():
+        if value or not metadata.get(key):
+            metadata[key] = value
     existing["metadata"] = metadata
 
     if not existing.get("graph_context") and item.get("graph_context"):
