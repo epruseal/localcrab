@@ -2153,7 +2153,10 @@ class _FakeChromaVec:
 class TestFallbackTagWithoutPackIdCounts:
     """`fallback_tag_without_pack_id_counts()` — `pack_id` 없이 `source`/`source_id`
     로만 태그된 행의 전역(팩 비한정) 카운트(localcrab #164). 회수(`delete_pack`)와
-    대사(`live_pack_state`) 어느 쪽도 안 걸리는 사각지대의 존재만 잰다.
+    대사(`live_pack_state`) 어느 쪽도 이 태그 자체로는 안 걸리는 사각지대의 존재만
+    잰다(단 `graph_edges` 는 예외 — 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로
+    함께 지워진다, 아래 `test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate`
+    참고).
     """
 
     def _seed_graph_node(self, graph, node_id, properties, node_type="Document",

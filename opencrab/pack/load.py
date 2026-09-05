@@ -792,8 +792,10 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     술어를 `pack_id` 단일 키로 좁힌 이유를 남긴 주석, 이 파일에서 "소유 키가 아니다"로
     검색), 그래서 이 두 키는 회수(`delete_pack`, `pack_id` 단일 소유 키)에서도
     대사(`pack_live_counts`/`live_pack_state`, 역시 `pack_id` 단일 키)에서도 소유 판정에
-    안 쓰인다. 이 함수가 세는 행은 그래서 **어느 팩 스코프 연산으로도 도달하지 않는다** —
-    그 사실만 알려준다. 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
+    안 쓰인다. 이 함수가 세는 행은 그래서 **회수/대사 술어가 직접 조회하지는 않는다** —
+    그 사실만 알려준다(단 `graph_edges` 는 예외가 있다 — 아래 "`graph_edges` 는 독립
+    회수 경로가 없다" 문단 참고, 양 끝 노드가 `pack_id` 로 회수되면 그 cascade 로 함께
+    지워진다). 결함인지, 그 행이 어느 팩 소속이었는지는 판정하지 않는다(애초에
     `pack_id` 가 없어 판정 불가 — "팩 소속"의 유일한 정본 키가 `pack_id` 자체다,
     `docs/pack-contract-layer.md` 105-119행).
 
