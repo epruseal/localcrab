@@ -566,23 +566,28 @@ vec0 에 대한 사실 하나만 덧붙인다. 이 저장소의 writer 가 그 �
 
 기본 테이블명은 pgvector 가 `opencrab_vectors_kure` 다. 배포가 바꿨으면 그 이름으로 읽는다.
 
-확인:
+**수리 도구 (#306)**: `scripts/repair_pgvector_legacy_none_owner.py` 가 이 절이 예전에
+운영자 판단에 맡기던 수동 SQL을 대신한다. 기본은 dry-run 이고, 탐지 조건은
+`pack_id = 'None'` 과 `metadata` 의 `pack_id` 키가 실제로 SQL/JSON null 인 조건을 함께
+요구해 `None` 이라는 이름을 쓰는 진짜 팩의 행을 위양성 없이 지켜 준다. 실제 쓰기는
+`--apply` 가 있어야 하고, 그 경우 반드시 백업(`--backup-to <path>`, 또는 명시적
+`--skip-backup`)을 선행하며 백업 게시가 성공한 뒤에만 DB를 커밋한다. `--rollback-from`
+으로 되돌릴 수 있으나, PostgreSQL `xmin`(트랜잭션 id) 지문 대조에 기대므로 트랜잭션 id
+순환/`VACUUM FREEZE` 앞에서는 오래된 백업의 롤백을 보장하지 않는다(스크립트가 실행
+시점마다 이 한계를 stderr 로도 경고한다). 사용법과 종료 코드는 스크립트 docstring
+(`--help`)이 정본이다.
 
-```sql
-SELECT count(*) FROM <vector_table> WHERE pack_id = 'None';
+```
+python scripts/repair_pgvector_legacy_none_owner.py --pg-url <dsn>                     # 확인만(dry-run)
+python scripts/repair_pgvector_legacy_none_owner.py --pg-url <dsn> \
+    --apply --backup-to /path/to/backup.json                                          # 실제 수리
 ```
 
-수리 (운영자가 판단해 실행한다. 실행 전 백업하라):
-
-```sql
-UPDATE <vector_table> SET pack_id = '' WHERE pack_id = 'None' AND metadata->>'pack_id' IS NULL;
-```
-
-`metadata->>'pack_id' IS NULL` 조건이 실제로 `None` 이라는 이름을 쓰는 팩의 행을 지켜 준다.
-그 팩의 행은 메타에도 문자열 `"None"` 이 들어 있어 이 조건에 걸리지 않는다. 실측으로 확인했다:
-두 행을 나란히 두고 이 문장을 돌리면 레거시 행 하나만 고쳐지고, 수리 뒤 두 행 모두 자기 재적재가
-통과한다. 메타에 `pack_id` 키 자체가 없는 행도 함께 고치는데, 그 형태는 옛 writer 가 키 부재를
-`''` 로 만들었으므로 생산 경로에서 나오지 않는다.
+각주: 이 절이 예전에 실었던 수동 확인/수리 SQL(`WHERE pack_id = 'None'` 탐지,
+`UPDATE ... SET pack_id = ''` 수리)은 위 스크립트의 실제 구현으로 대체됐다. 스크립트가
+같은 판별자를 원자적 트랜잭션과 백업/롤백 안전장치를 갖춰 실행한다. `tests/
+test_repair_pgvector_legacy_none_owner.py` 가 탐지 정확도(위양성 0), 적용, dry-run,
+백업 게이트, 롤백 왕복을 실 PostgreSQL 인스턴스로 검증한다.
 
 **거부 메시지는 남의 팩 이름을 담지 않는다.** 그 텍스트는 쓰기 영수증에 원문 그대로 실려 나가므로
 (`OntologyBuilder.add_node` 가 예외를 잡아 벡터 스토어 상태 문자열에 넣는다), 소유자를 적으면
