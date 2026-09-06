@@ -329,6 +329,23 @@ class TestExportEdgesLimitContract:
         assert store.export_edges(limit=-1) == []
         assert calls == []
 
+    def test_the_spy_is_not_a_dead_mock_a_real_call_does_query(self, backend, monkeypatch):
+        """Negative control for the two tests above: with a positive
+        limit, the same ``_fetch_all`` spy DOES observe a call -- proving
+        it actually intercepts, rather than being wired to something that
+        never fires either way."""
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        store.export_edges(limit=20)
+        assert calls != []
+
 
 # ---------------------------------------------------------------------------
 # issue #131: find_by_relations had the same missing-guard defect as
@@ -382,6 +399,23 @@ class TestFindByRelationsLimitContract:
 
         assert store.find_by_relations("lv1", ["raises"], "out", -1) == []
         assert calls == []
+
+    def test_the_spy_is_not_a_dead_mock_a_real_call_does_query(self, backend, monkeypatch):
+        """Negative control for the two tests above: with a positive
+        limit, the same ``_fetch_all`` spy DOES observe a call -- proving
+        it actually intercepts, rather than being wired to something that
+        never fires either way."""
+        _name, store = backend
+        store.upsert_node("Lever", "lv1", {})
+        store.upsert_node("Outcome", "o1", {})
+        store.upsert_edge("Lever", "lv1", "raises", "Outcome", "o1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        store.find_by_relations("lv1", ["raises"], "out", 20)
+        assert calls != []
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +723,27 @@ class TestExtendedMethodsNeo4jEdge:
 
         assert store.find_by_relations("lv1", ["raises"], "out", -1) == []
         mock_session.run.assert_not_called()
+
+    def test_export_edges_the_spy_is_not_a_dead_mock_a_real_call_does_query(self):
+        """Negative control for the two export_edges tests above: with a
+        positive limit, the same mocked ``session.run`` DOES get called --
+        proving the mock actually intercepts, rather than being wired to
+        something that never fires either way."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+        mock_session.run.reset_mock()
+
+        store.export_edges(limit=20)
+        mock_session.run.assert_called()
+
+    def test_find_by_relations_the_spy_is_not_a_dead_mock_a_real_call_does_query(self):
+        """Negative control for the two find_by_relations tests above."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.return_value = []
+        mock_session.run.reset_mock()
+
+        store.find_by_relations("lv1", ["raises"], "out", 20)
+        mock_session.run.assert_called()
 
     def test_upsert_nodes_batch_empty_list_returns_zero(self):
         store, _driver, mock_session = _make_connected_neo4j()
