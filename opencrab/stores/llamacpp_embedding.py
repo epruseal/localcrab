@@ -24,6 +24,7 @@
 """
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,15 @@ class LlamaCppEmbeddingFunction:
         self._n_threads = n_threads
         self._n_ctx = n_ctx
         self._llm: Any = None  # lazy load — 폴백 최초 호출 시 로드
+        # #302: 동시에 첫 호출한 두 스레드가 둘 다 로드를 실행해 Llama
+        # 인스턴스가 두 개 만들어지는 것을 막는 인스턴스 레벨 락. 소유권
+        # 마커는 opencrab/mcp/tools/__init__.py 의 _context_init_owner
+        # (#192)와 같은 이유로 Thread 객체 자체를 담는다 — OS 가 종료된
+        # 스레드의 ident 를 재사용하면 무관한 스레드가 소유자로 오인될 수
+        # 있어서다. 같은 스레드의 재진입은 plain Lock 이면 영구 데드락이
+        # 되므로 이 마커로 즉시 RuntimeError 를 낸다.
+        self._llm_lock = threading.Lock()
+        self._llm_init_owner: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # ChromaDB EmbeddingFunction 프로토콜
@@ -101,31 +111,66 @@ class LlamaCppEmbeddingFunction:
     def _get_llm(self) -> Any:
         """최초 폴백 호출 시 모델 로드(lazy). 이후 캐시.
 
+        직렬화(#302): REST API 앱의 요청 핸들러는 스레드풀로 디스패치되므로
+        (FastAPI 의 plain ``def`` 라우트, ``run_in_threadpool``), 공유
+        임베딩 함수 인스턴스 하나에 여러 요청 스레드가 동시에 첫 호출을
+        할 수 있다. 락 없이는 둘 다 ``if self._llm is None`` 을 통과해
+        모델을 두 번 로드한다(GGUF 로드는 초 단위로 느려 창이 넓다).
+        아래 빠른 읽기는 락 없이 수행한다 — CPython 에서 전역 필드 읽기와
+        마지막의 단일 대입은 각각 GIL 아래 원자적이고, 완성된 객체를
+        한 번에 배정하므로(부분 완성 상태를 락 없는 읽기에 노출하지
+        않는다) 안전하다.
+
+        재진입 가드: 같은 스레드가 로드 도중 자기 자신을 통해
+        ``_get_llm()`` 을 다시 부르면(오늘 그런 호출자는 없다) plain
+        ``Lock`` 은 영구 데드락이 된다. 소유권 마커로 그 경우를 즉시
+        ``RuntimeError`` 로 실패시킨다 — ``opencrab/mcp/tools/__init__.py``
+        의 ``_context_init_owner``(#192)와 동일한 패턴과 동일한 제약:
+        같은 스레드의 재진입만 잡고, 자식 스레드에 위임하고 기다리는
+        경우는 여전히 데드락이다(이 클래스에는 그런 호출자가 없다).
+
         GGUF 파일이 없으면 huggingface_hub 로 자동 다운로드를 시도한다.
         다운로드 실패 시 안내 메시지와 함께 RuntimeError 를 발생시킨다.
         """
-        if self._llm is None:
-            import os
-            # ── GGUF 파일 존재 확인 / 자동 다운로드 ──────────────────────
-            if not self._gguf_path or not os.path.exists(self._gguf_path):
-                self._gguf_path = _ensure_local_gguf(self._gguf_path)
+        if self._llm is not None:
+            return self._llm
 
-            try:
-                from llama_cpp import Llama  # type: ignore[import]
-            except ImportError as exc:
-                raise RuntimeError(
-                    "llama-cpp-python 이 설치되지 않았습니다. "
-                    "pip install llama-cpp-python 으로 설치하세요."
-                ) from exc
-            logger.info("로컬 GGUF 로드 중: %s", self._gguf_path)
-            self._llm = Llama(
-                model_path=self._gguf_path,
-                embedding=True,
-                n_ctx=self._n_ctx,
-                n_threads=self._n_threads,
-                verbose=False,
+        if self._llm_init_owner is threading.current_thread():
+            raise RuntimeError(
+                "reentrant _get_llm() call: something called back into the "
+                "embedding model initialiser on the same thread while it was "
+                "still loading. Break the cycle in the caller."
             )
-            logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
+
+        with self._llm_lock:
+            if self._llm is not None:
+                return self._llm
+            try:
+                self._llm_init_owner = threading.current_thread()
+                import os
+                # ── GGUF 파일 존재 확인 / 자동 다운로드 ──────────────────
+                if not self._gguf_path or not os.path.exists(self._gguf_path):
+                    self._gguf_path = _ensure_local_gguf(self._gguf_path)
+
+                try:
+                    from llama_cpp import Llama  # type: ignore[import]
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "llama-cpp-python 이 설치되지 않았습니다. "
+                        "pip install llama-cpp-python 으로 설치하세요."
+                    ) from exc
+                logger.info("로컬 GGUF 로드 중: %s", self._gguf_path)
+                llm = Llama(
+                    model_path=self._gguf_path,
+                    embedding=True,
+                    n_ctx=self._n_ctx,
+                    n_threads=self._n_threads,
+                    verbose=False,
+                )
+                logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
+                self._llm = llm
+            finally:
+                self._llm_init_owner = None
         return self._llm
 
 

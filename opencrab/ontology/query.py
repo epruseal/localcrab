@@ -276,6 +276,67 @@ class _Bm25CacheWorker:
         self._stop = threading.Event()      # shutdown signal
         self._epoch = 0                      # generation counter (coalescing)
         self.thread: threading.Thread | None = None
+        # #302: guards the COLD BUILD itself (not scheduling state like
+        # ``_lock`` above). Without it, the query thread's own synchronous
+        # cold-start build (HybridQuery._bm25_search()) and this worker's
+        # first ``_rebuild_loop()`` wake can both observe ``self.cache is
+        # None`` and both call BM25Index.build() concurrently -- doubling the
+        # (possibly large) build cost and racing to publish ``self.cache``.
+        self._cold_build_lock = threading.Lock()
+
+    def ensure_built(self, doc_store: Any) -> Any:
+        """Build the cache exactly once, however many callers race to do it.
+
+        Both cold-build call sites go through here instead of building
+        inline (#302): ``HybridQuery._bm25_search()``'s synchronous cold
+        path, and this worker's own ``_rebuild_loop()`` on its first wake.
+        Without a shared lock between those two call sites, a query thread
+        and the background worker's first cycle can both pass their own
+        ``cache is None`` check and both build -- see the comment on
+        ``_cold_build_lock`` above. Double-checked locking mirrors
+        ``_get_context()``'s pattern (#192): the fast unlocked read is safe
+        under CPython (a global-field read and the final rebind are each
+        atomic under the GIL), and the second check after acquiring the lock
+        catches the case where the other racing caller already finished.
+
+        The fingerprint probe below must swallow-and-return-``None`` on any
+        exception, exactly like ``HybridQuery._bm25_probe_fingerprint()`` --
+        a probe failure (the store not yet holding a table, a transient
+        query error) must not block the cold build, since
+        ``BM25Index.build(nodes, fingerprint=None)`` already knows how to
+        fill it in from ``nodes`` itself. ``list_nodes()`` stays OUTSIDE this
+        try: it supplies the rows to index, so its failure must propagate to
+        the caller (``_bm25_search()``'s own outer try, or
+        ``_rebuild_loop()``'s), not be swallowed here -- swallowing it would
+        report a phantom empty index instead of the real error.
+        """
+        if self.cache is not None:
+            return self.cache
+        with self._cold_build_lock:
+            if self.cache is not None:
+                return self.cache
+            BM25Index = _get_bm25()  # noqa: N806
+
+            fp: tuple[int, str] | None
+            try:
+                probe = getattr(doc_store, "bm25_fingerprint", None)
+                if probe is not None:
+                    fp = probe(limit=_BM25_NODE_LIMIT)
+                else:
+                    from opencrab.ontology.bm25 import compute_fingerprint
+                    fp = compute_fingerprint(
+                        doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+                    )
+            except Exception as exc:
+                logger.debug("BM25 fingerprint probe failed (cold build): %s", exc)
+                fp = None
+
+            nodes = doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+            self.cache = BM25Index.build(nodes, fingerprint=fp)
+            self.cache_size = len(nodes)
+            self.dirty = False
+            logger.debug("BM25 index cold-built (%d nodes)", self.cache_size)
+        return self.cache
 
     def invalidate(self) -> None:
         """Mark the index stale and schedule a debounced background rebuild.
@@ -321,6 +382,18 @@ class _Bm25CacheWorker:
             build_epoch = self._epoch
             try:
                 ds = self._doc_store_getter()
+                if self.cache is None:
+                    # First mover on this worker's own wake: route through
+                    # ensure_built() (#302) so a query thread racing this
+                    # same cold build (HybridQuery._bm25_search()) cannot
+                    # build a second, independent BM25Index concurrently.
+                    # Whichever of the two gets the lock first wins; the
+                    # loser's ensure_built() call returns the winner's cache
+                    # immediately. The probe/compare/build sequence below
+                    # still runs unconditionally afterward -- a deliberate,
+                    # cold-start-only redundant probe+list_nodes pass, not a
+                    # second build (the fingerprint will already match).
+                    self.ensure_built(ds)
                 # Fingerprint FIRST, nodes SECOND (#63 follow-up): a write
                 # landing between the two calls must make the recorded
                 # fingerprint OLDER than the nodes we index, not newer. Newer
@@ -698,23 +771,16 @@ class HybridQuery:
         if not pack_ids:
             return []
         try:
-            BM25Index = _get_bm25()  # noqa: N806
-
             if self._bm25_cache is None:
-                # Cold start: nothing to serve yet, so build synchronously once.
-                # Fingerprint FIRST, nodes SECOND (#63 follow-up) — see the
-                # matching comment in _Bm25CacheWorker._rebuild_loop for why
-                # this order (not the reverse) is the safe one: a write
-                # landing in between must make the fingerprint stale relative
-                # to the nodes, never the other way round, or that write is
-                # never picked up. None (probe failed) falls back to
-                # compute_fingerprint(nodes) inside BM25Index.build().
-                fp = self._bm25_probe_fingerprint()
-                nodes = self._doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
-                self._bm25_cache = BM25Index.build(nodes, fingerprint=fp)
-                self._bm25_cache_size = len(nodes)
-                self._bm25_dirty = False
-                logger.debug("BM25 index cold-built (%d nodes)", self._bm25_cache_size)
+                # Cold start: nothing to serve yet, build once. Routed through
+                # _Bm25CacheWorker.ensure_built() (#302) instead of building
+                # inline here, so this query thread and the background
+                # worker's own first _rebuild_loop() wake cannot both pass
+                # this same ``is None`` check and both build a duplicate
+                # BM25Index -- see ensure_built()'s docstring for the full
+                # race and the fingerprint-probe exception-handling contract
+                # it must match (_bm25_probe_fingerprint()).
+                self._bm25.ensure_built(self._doc_store)
             else:
                 # Cheap staleness probe — detects out-of-band writes without a
                 # full 50k list_nodes scan. Falls back to the heavy fingerprint
