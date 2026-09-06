@@ -369,6 +369,29 @@ class TestOntologyListNodesLocalBackend:
         assert len(result["nodes"]) == 2
         assert result["total"] == 5
 
+    def test_no_pack_id_limit_boundary_caps_rows_but_not_total(self, graph, docs, sql):
+        """issue #112: pack_id 없이 호출해도 total 은 count_exported_nodes_scoped
+        (LIMIT 없음)에서 오므로 export_nodes_scoped(limit=...) 의 페이지 크기에
+        잘리지 않는다. #55(PR #316) 가 pack_id-없음 분기의 doc store 폴백을
+        없애고 이 코드 경로를 pack_id 유무와 무관하게 그래프 스토어로 통일하면서
+        이미 고쳐졌다 -- 이 테스트는 그 상태를 회귀로부터 고정한다.
+
+        graph 뿐 아니라 docs(real LocalSQLDocStore)에도 같은 5건을 심어 둔다:
+        pack_id-없음 분기를 #55 이전 형태(``mongo.list_nodes_scoped`` 로 되돌리고
+        ``total = len(nodes)`` 로 계산)로 역변이했을 때, doc store 에도 매칭
+        데이터가 있어야 그 경로가 실제로 #112 형태(문서 스토어 페이지 길이가
+        total)로 실패한다. doc store 를 비워 두면 역변이가 빈 스토어를 읽어
+        total=len(nodes)=0 이 되어버려, 이 테스트가 실제 결함이 아니라 스토어
+        전환 자체를 검출하는 것이 되어 버린다."""
+        for i in range(5):
+            graph.upsert_node("Lever", f"lev-{i}", {"pack_id": "pack-a"})
+            docs.upsert_node_doc("subject", "Lever", f"lev-{i}", {"pack_id": "pack-a"})
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = {"neo4j": graph, "mongo": docs, "sql": sql}
+            result = ontology_list_nodes(limit=2)  # pack_id 없음
+        assert len(result["nodes"]) == 2
+        assert result["total"] == 5
+
     def test_space_mismatch_no_longer_desyncs_total_from_nodes(self, graph, docs, sql):
         """Issue #118: upsert_node used to store space_id (column) and
         properties["space"] (JSON) independently. count_exported_nodes
