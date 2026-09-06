@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 운영 환경파일의 표준 위치. systemd 유닛의 EnvironmentFile 과 같은 파일을 가리킨다.
@@ -56,6 +56,28 @@ def _default_local_data_dir() -> str:
     HOME 이 바뀌면(테스트의 monkeypatch 등) 다음 Settings() 호출부터 즉시 반영된다.
     """
     return str(Path.home() / ".local" / "share" / "localcrab")
+
+
+def expand_user_path(value: str) -> str:
+    """경로 문자열의 선행 "~"/"~user" 를 홈 디렉터리로 펼친다.
+
+    ``pathlib.Path(value).expanduser()`` 대신 ``os.path.expanduser`` 를 쓴다.
+    전자는 빈 문자열에 ``PosixPath('.')`` 를 돌려줘 "미설정" 센티널(예:
+    ``local_gguf_path`` 의 "자동 다운로드" 의미)을 ``.`` 로 오염시키지만,
+    후자는 빈 문자열을 그대로 ``""`` 로 둔다(#67).
+    """
+    return os.path.expanduser(value) if value else value
+
+
+# LOCAL_DATA_DIR/LOCAL_GGUF_PATH 처럼 사용자가 파일시스템 경로를 직접 입력하는
+# 필드 이름 목록. 새 path 성격 필드가 생기면 여기에 이름만 추가하면
+# _expand_path_fields validator 가 자동으로 적용된다(개별 validator 반복 없음).
+#
+# 제외: opencrab/pack/live_data.py::require_live_data() 가 읽는 LOCAL_DATA_DIR
+# 원시 문자열은 그 함수 자신의 불변식(어떤 정규화도 금지, expanduser 포함)에
+# 따라 이 목록과 무관하게 별도로 취급된다 — 이 필드 목록은 Settings 모델 값에만
+# 적용되고 그 함수는 os.environ 을 직접 읽으므로 서로 간섭하지 않는다.
+_PATH_LIKE_FIELDS = ("local_data_dir", "local_gguf_path")
 
 
 class Settings(BaseSettings):
@@ -210,6 +232,17 @@ class Settings(BaseSettings):
     # 미설정 시 _ensure_local_gguf() 가 자동 다운로드(KURE-v1-Q8_0, ~635MB).
     # 다른 모델을 쓰려면 LOCAL_GGUF_PATH 로 직접 경로 지정.
     local_gguf_path: str = Field(default="", alias="LOCAL_GGUF_PATH")
+
+    @field_validator(*_PATH_LIKE_FIELDS, mode="after")
+    @classmethod
+    def _expand_path_fields(cls, v: str) -> str:
+        """#67: "~"/"~user" 로 시작하는 값을 홈 디렉터리 절대경로로 펼친다.
+
+        절대/상대(물결 없음) 경로는 변화 없이 통과한다. 빈 문자열
+        센티널(local_gguf_path 의 "자동 다운로드")도 그대로 보존된다
+        (expand_user_path 참고).
+        """
+        return expand_user_path(v)
 
     # ------------------------------------------------------------------
     # 벡터 스토어 백엔드 (VECTOR_BACKEND 환경변수) — 임베딩 백엔드와 독립 축.

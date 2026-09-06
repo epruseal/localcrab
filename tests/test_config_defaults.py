@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,70 @@ def test_local_data_dir_default_factory_reevaluates_per_instance(monkeypatch, tm
     assert settings_a.local_data_dir.startswith(str(home_a))
     assert settings_b.local_data_dir.startswith(str(home_b))
     assert settings_a.local_data_dir != settings_b.local_data_dir
+
+
+# ---------------------------------------------------------------------------
+# #67: LOCAL_DATA_DIR/LOCAL_GGUF_PATH 에 "~" 를 지정해도 홈 디렉터리로 펼쳐져야
+# 한다. Settings 가 이 값을 리터럴 "~..." 문자열 그대로 반환하면, 이 값을 그대로
+# os.makedirs 에 넘기는 소비자(예: opencrab.locking.lock_data_dir())가 CWD 밑에
+# 문자 그대로 "~" 디렉터리를 만든다.
+# ---------------------------------------------------------------------------
+
+
+def test_local_data_dir_env_override_expands_tilde(monkeypatch, tmp_path):
+    """LOCAL_DATA_DIR="~/sub" + HOME=tmp_path 이면 HOME 하위 절대경로로 펼쳐져야 한다."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~/sub")
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_data_dir == str(tmp_path / "sub")
+    assert "~" not in settings.local_data_dir
+
+
+def test_local_data_dir_env_override_bare_tilde_equals_home(monkeypatch, tmp_path):
+    """LOCAL_DATA_DIR="~" 단독이면 HOME 그 자체와 같아야 한다."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~")
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_data_dir == str(tmp_path)
+
+
+def test_local_data_dir_env_override_unknown_user_tilde_left_literal(monkeypatch, tmp_path):
+    """"~nouser/x" 처럼 stdlib 이 풀 수 없는 사용자명은 크래시 없이 리터럴로
+    남아야 한다(회귀 아님 — os.path.expanduser 자체의 계약을 문서화)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~nouserxyz123/x")
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_data_dir == "~nouserxyz123/x"
+
+
+def test_local_data_dir_env_override_absolute_path_unaffected(monkeypatch, tmp_path):
+    """물결 없는 절대경로는 그대로 통과해야 한다(회귀 가드)."""
+    override = str(tmp_path / "explicit-dir")
+    monkeypatch.setenv("LOCAL_DATA_DIR", override)
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_data_dir == override
+
+
+def test_local_data_dir_env_override_relative_path_unaffected(monkeypatch, tmp_path):
+    """물결 없는 상대경로도 그대로 통과해야 한다(회귀 가드)."""
+    monkeypatch.setenv("LOCAL_DATA_DIR", "relative/sub/dir")
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_data_dir == "relative/sub/dir"
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +185,37 @@ def test_ensure_local_gguf_respects_explicit_requested_path(tmp_path):
     result = _ensure_local_gguf(str(gguf_file))
 
     assert result == str(gguf_file)
+
+
+# ---------------------------------------------------------------------------
+# #67: config.Settings.local_gguf_path 도 local_data_dir 과 같은 클래스(같은
+# 필드 선언 없음, 같은 Settings)의 결함이다 — "~" 지정 시 리터럴 그대로
+# _ensure_local_gguf() 에 넘어간다.
+# ---------------------------------------------------------------------------
+
+
+def test_local_gguf_path_env_override_expands_tilde(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCAL_GGUF_PATH", "~/models/x.gguf")
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_gguf_path == str(tmp_path / "models" / "x.gguf")
+    assert "~" not in settings.local_gguf_path
+
+
+def test_local_gguf_path_default_empty_string_not_corrupted(monkeypatch, tmp_path):
+    """미설정(빈 문자열 센티널, "자동 다운로드" 의미)은 그대로 "" 여야 한다.
+    ``Path("").expanduser()`` 는 ``"."`` 를 반환해 이 센티널을 오염시키므로,
+    구현이 ``os.path.expanduser`` 를 쓰는지(빈 문자열은 그대로 두는지)를
+    검증하는 회귀 가드다."""
+    monkeypatch.delenv("LOCAL_GGUF_PATH", raising=False)
+    from opencrab.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_gguf_path == ""
 
 
 # ---------------------------------------------------------------------------
@@ -188,3 +284,67 @@ def test_lock_data_dir_env_change_reflected_without_stale_cache(monkeypatch, tmp
     assert Path(dir_b).is_dir()
     if hasattr(get_settings, "cache_clear"):
         get_settings.cache_clear()
+
+
+def test_lock_data_dir_expands_tilde_and_does_not_create_literal_tilde_dir(
+    monkeypatch, tmp_path
+):
+    """#67 재현: LOCAL_DATA_DIR="~/sub" 를 os.environ.get() 직독 분기가 그대로
+    os.makedirs 에 넘기면 CWD 밑에 문자 그대로 "~" 디렉터리가 생긴다. HOME 과
+    CWD 를 서로 다른 격리 디렉터리로 분리해, 결과가 HOME 하위에 생기고 CWD 에는
+    아무 "~" 디렉터리도 남지 않아야 함을 단언한다."""
+    home_dir = tmp_path / "home"
+    cwd_dir = tmp_path / "cwd"
+    home_dir.mkdir()
+    cwd_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~/sub")
+    monkeypatch.chdir(cwd_dir)
+    from opencrab.mcp import tools
+
+    result_dir = tools._lock_data_dir()
+
+    expected = str(home_dir / "sub")
+    assert result_dir == expected
+    assert Path(expected).is_dir()
+    assert not (cwd_dir / "~").exists()
+
+
+def test_lock_data_dir_rewrites_env_so_require_live_data_agrees_with_write_target(
+    monkeypatch, tmp_path
+):
+    """리뷰 지적(#67 PR): 구버전 버그가 남긴 문자 그대로의 "~/sub" 디렉터리가 CWD 밑에
+    이미 있는 상태에서 LOCAL_DATA_DIR="~/sub" 를 다시 설정하면, _lock_data_dir() 가
+    펼친 실제 쓰기 대상(HOME 하위)과 opencrab.pack.live_data.require_live_data() 가
+    검사하는 원시 문자열이 서로 다른 경로를 가리키게 된다 — 가드는 스테일 리터럴
+    디렉터리를 보고 통과하지만 실제 쓰기는 다른 곳으로 간다. _lock_data_dir() 는
+    펼친 값을 os.environ 에 되써서, require_live_data() 가 스스로는 아무 것도
+    바꾸지 않으면서도 실제 쓰기 대상과 같은 경로를 보게 해야 한다."""
+    home_dir = tmp_path / "home"
+    cwd_dir = tmp_path / "cwd"
+    home_dir.mkdir()
+    cwd_dir.mkdir()
+    stale_literal_tilde_dir = cwd_dir / "~" / "sub"
+    stale_literal_tilde_dir.mkdir(parents=True)  # 구버전 버그가 남긴 스테일 디렉터리 재현
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~/sub")
+    monkeypatch.chdir(cwd_dir)
+    from opencrab.mcp import tools
+    from opencrab.pack.live_data import require_live_data
+
+    expected = str(home_dir / "sub")
+    result_dir = tools._lock_data_dir()
+    assert result_dir == expected
+
+    # 픽스처 의도 명시: 스테일 리터럴 경로와 펼친 실제 쓰기 경로는 서로 다른 곳이다
+    # (그래서 가드가 둘 중 어느 쪽을 보는지가 실제로 문제된다).
+    assert str(stale_literal_tilde_dir) != expected
+
+    # 핵심 단언: 환경변수 자체가 펼친 값으로 되써져 있어야 한다. 수정 전에는 원시
+    # "~/sub" 그대로 남아, require_live_data() 가 스테일 리터럴 디렉터리를 보고
+    # 우연히 통과한다(그 사이 실제 쓰기는 expected 로 감).
+    assert os.environ["LOCAL_DATA_DIR"] == expected
+
+    # require_live_data() 자신은 한 글자도 안 바뀌었다 — 그런데도 지금은 실제 쓰기
+    # 대상(expected)과 같은 경로를 보고 정상 통과해야 한다(SystemExit 없음).
+    require_live_data("test")

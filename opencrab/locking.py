@@ -28,7 +28,29 @@ _held = threading.local()
 def lock_data_dir() -> str:
     """Return and create the data directory used by the shared locks."""
     data_dir = os.environ.get("LOCAL_DATA_DIR")
-    if not data_dir:
+    if data_dir:
+        from opencrab.config import expand_user_path
+
+        # #67: os.environ.get() 직독 분기는 Settings 의 field_validator 를 거치지
+        # 않으므로, "~"/"~user" 를 여기서 직접 펼치지 않으면 os.makedirs 가 CWD
+        # 밑에 문자 그대로 "~" 디렉터리를 만든다. get_settings() 를 우회하는
+        # 기존 계약(테스트의 monkeypatch 즉시 반영, lru_cache stale 회피)은
+        # 그대로 유지한다 — get_settings() 는 호출하지 않는다.
+        data_dir = expand_user_path(data_dir)
+
+        # #67 PR 리뷰 지적: 펼친 값을 환경변수에 되쓰지 않으면,
+        # opencrab.pack.live_data.require_live_data() 는 여전히 원시(물결 붙은)
+        # 문자열을 그대로 검사한다(그 함수는 "값을 어떤 방식으로도 변형하지
+        # 않는다"는 동결 불변식이 있어 손대지 못한다). 구버전 버그가 CWD 밑에
+        # 남긴 문자 그대로의 "~/..." 디렉터리가 있으면, 가드는 그 스테일
+        # 디렉터리를 보고 통과하지만 실제 쓰기는 여기서 만든 HOME 하위 디렉터리로
+        # 간다 — 가드와 실제 쓰기 대상이 갈라진다. lock_data_dir() 은 모든 MCP
+        # 쓰기 도구에서 require_live_data() 보다 먼저 실행되는 유일한 공유
+        # 지점이므로(_write_lock() 이 write_lock(_lock_data_dir()) 형태로
+        # 인자를 먼저 평가), 여기서 환경변수를 펼친 값으로 되써 두면 이후 모든
+        # 원시 직독 지점이 같은 경로를 보게 된다.
+        os.environ["LOCAL_DATA_DIR"] = data_dir
+    else:
         from opencrab.config import get_settings
 
         data_dir = get_settings().local_data_dir
