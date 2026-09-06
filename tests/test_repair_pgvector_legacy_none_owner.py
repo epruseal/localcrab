@@ -27,9 +27,8 @@ import time
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
-
 from _vec_helpers import build_vector_store
+from sqlalchemy import text
 
 # scripts/ is not a package (tests/test_migrate_pack_ownership.py's identical
 # pattern) -- import it directly off sys.path instead.
@@ -37,7 +36,6 @@ SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import repair_pgvector_legacy_none_owner as repair  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 픽스처 / 헬퍼
