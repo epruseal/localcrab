@@ -785,25 +785,31 @@ def test_uninstall_pack_force_with_duplicate_type_name_removes_once(tmp_path, mo
 
 
 def test_uninstall_pack_removed_and_kept_sum_to_deduped_type_count(tmp_path, monkeypatch):
-    """#108 invariant, uninstall side: `Widget` is generated (removed) and
-    `Gadget` is user-customised (kept), with `Widget` repeated in the
-    manifest -- `len(removed) + len(kept_user_customised)` must equal the
-    number of DISTINCT types whose file existed (2), not the raw manifest
-    length (3).
+    """#108 invariant, uninstall side, mixed removed+kept: `Widget` is
+    generated (removed) and `Gadget` is user-customised (kept), with
+    `Gadget` -- the type that survives -- repeated in the manifest.
+
+    The duplicate must land on the KEPT type, not the removed one: once a
+    type is removed its file no longer exists, so a second visit hits the
+    loop's `if not path.exists(): continue` guard and is a no-op with or
+    without dedup. A duplicated kept type has no such guard -- pre-fix,
+    each visit re-evaluates the still-present file and appends it to
+    `kept_user_customised` again, so only this arrangement actually
+    discriminates the fix.
     """
     generated = "pack: duppack\nnode_type: Widget\n"
     custom = "custom: true\n"
     types_dir = _write_duplicate_types_pack(
         tmp_path,
         monkeypatch,
-        types=["Widget", "Gadget", "Widget"],
+        types=["Widget", "Gadget", "Gadget"],
         existing_files={"Widget.yaml": generated, "Gadget.yaml": custom},
     )
 
     result = pack_registry.uninstall_pack("duppack")
 
-    assert sorted(result["removed"]) == ["Widget"]
-    assert sorted(result["kept_user_customised"]) == ["Gadget"]
+    assert result["removed"] == ["Widget"]
+    assert result["kept_user_customised"] == ["Gadget"]
     assert len(result["removed"]) + len(result["kept_user_customised"]) == 2
     assert not (types_dir / "Widget.yaml").exists()
     assert (types_dir / "Gadget.yaml").exists()
