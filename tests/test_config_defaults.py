@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -307,3 +308,43 @@ def test_lock_data_dir_expands_tilde_and_does_not_create_literal_tilde_dir(
     assert result_dir == expected
     assert Path(expected).is_dir()
     assert not (cwd_dir / "~").exists()
+
+
+def test_lock_data_dir_rewrites_env_so_require_live_data_agrees_with_write_target(
+    monkeypatch, tmp_path
+):
+    """리뷰 지적(#67 PR): 구버전 버그가 남긴 문자 그대로의 "~/sub" 디렉터리가 CWD 밑에
+    이미 있는 상태에서 LOCAL_DATA_DIR="~/sub" 를 다시 설정하면, _lock_data_dir() 가
+    펼친 실제 쓰기 대상(HOME 하위)과 opencrab.pack.live_data.require_live_data() 가
+    검사하는 원시 문자열이 서로 다른 경로를 가리키게 된다 — 가드는 스테일 리터럴
+    디렉터리를 보고 통과하지만 실제 쓰기는 다른 곳으로 간다. _lock_data_dir() 는
+    펼친 값을 os.environ 에 되써서, require_live_data() 가 스스로는 아무 것도
+    바꾸지 않으면서도 실제 쓰기 대상과 같은 경로를 보게 해야 한다."""
+    home_dir = tmp_path / "home"
+    cwd_dir = tmp_path / "cwd"
+    home_dir.mkdir()
+    cwd_dir.mkdir()
+    stale_literal_tilde_dir = cwd_dir / "~" / "sub"
+    stale_literal_tilde_dir.mkdir(parents=True)  # 구버전 버그가 남긴 스테일 디렉터리 재현
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("LOCAL_DATA_DIR", "~/sub")
+    monkeypatch.chdir(cwd_dir)
+    from opencrab.mcp import tools
+    from opencrab.pack.live_data import require_live_data
+
+    expected = str(home_dir / "sub")
+    result_dir = tools._lock_data_dir()
+    assert result_dir == expected
+
+    # 픽스처 의도 명시: 스테일 리터럴 경로와 펼친 실제 쓰기 경로는 서로 다른 곳이다
+    # (그래서 가드가 둘 중 어느 쪽을 보는지가 실제로 문제된다).
+    assert str(stale_literal_tilde_dir) != expected
+
+    # 핵심 단언: 환경변수 자체가 펼친 값으로 되써져 있어야 한다. 수정 전에는 원시
+    # "~/sub" 그대로 남아, require_live_data() 가 스테일 리터럴 디렉터리를 보고
+    # 우연히 통과한다(그 사이 실제 쓰기는 expected 로 감).
+    assert os.environ["LOCAL_DATA_DIR"] == expected
+
+    # require_live_data() 자신은 한 글자도 안 바뀌었다 — 그런데도 지금은 실제 쓰기
+    # 대상(expected)과 같은 경로를 보고 정상 통과해야 한다(SystemExit 없음).
+    require_live_data("test")
