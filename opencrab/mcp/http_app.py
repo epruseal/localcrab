@@ -190,6 +190,22 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     # must not be able to make the server do work on an anonymous caller's
     # behalf. This reads users/api_tokens and nothing else, and never runs DDL:
     # a database that does not exist yet cannot hold a valid token anyway.
+    #
+    # #302 reachability note: `_auth_store()` below has the same
+    # check-then-act shape as the embedding/BM25 sites this issue fixes (read
+    # `auth_sql`, maybe build+append), but it deliberately carries NO lock.
+    # `mcp_post()` is an `async def` route, and every step from `_check()`
+    # through `_auth_store()` runs with no `await` in between -- FastAPI never
+    # offloads an `async def` handler to the threadpool, so one event-loop
+    # thread runs that whole chain to completion before it can switch to
+    # another request. There is no OS-thread interleaving inside it today.
+    # This is a structural judgment, not an absence of observed incidents.
+    # It stops holding the moment either changes: an `await` appears anywhere
+    # between `_check()`'s entry and `auth_sql.append(store)`, or this route
+    # (or `_auth_store()` itself) is ever called from a `def` handler or an
+    # `asyncio.to_thread`/threadpool offload -- either would let two real OS
+    # threads race this closure's `auth_sql` list. If that happens, this site
+    # needs the same instance-level lock the embedding and BM25 sites got.
     auth_sql: list[Any] = []
 
     def _auth_store() -> Any | None:
