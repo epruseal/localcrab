@@ -869,8 +869,18 @@ class SQLStore:
                 return int(row[0]) if row else -1
 
     def get_impacts(self, node_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Retrieve recent impact records for a node."""
+        """Retrieve recent impact records for a node.
+
+        ``limit <= 0`` (issue #139): returns ``[]`` immediately, without
+        issuing a query -- same contract as ``opencrab.stores._graph_protocol``'s
+        ``export_nodes`` (issue #120), extended here even though this method
+        sits outside the graph/doc surface that module enumerates (its
+        docstring lists this method under COVERED explicitly for that
+        reason).
+        """
         self._require_available()
+        if limit <= 0:
+            return []
 
         import json
 

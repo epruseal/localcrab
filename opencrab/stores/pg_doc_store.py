@@ -212,7 +212,9 @@ class PgDocStore(_SqlDocStoreBase):
         matched every filter.
 
         ``pack_ids`` has NO DEFAULT -- empty ``pack_ids`` returns ``[]``
-        WITHOUT querying. ``include_unpackaged`` is ACCEPTED but IGNORED:
+        WITHOUT querying. ``limit <= 0`` (issue #139, same contract as
+        ``_graph_protocol.py``'s ``export_nodes``, issue #120): returns
+        ``[]`` WITHOUT querying. ``include_unpackaged`` is ACCEPTED but IGNORED:
         ``json_truthy_text`` returns SQL NULL for a missing/falsy pack_id,
         and NULL never satisfies ``= ANY(...)`` membership -- there is no
         "OR pack_id IS NULL" branch to gate (same reasoning as
@@ -227,7 +229,7 @@ class PgDocStore(_SqlDocStoreBase):
         real query error now propagates."""
         if not self._available or not self._kw_ok:
             return []
-        if not pack_ids:
+        if not pack_ids or limit <= 0:
             return []
 
         toks = re.findall(r"\w+", query or "", flags=re.UNICODE)
@@ -247,10 +249,6 @@ class PgDocStore(_SqlDocStoreBase):
         pack_expr = self._dialect.json_truthy_text("metadata", "pack_id")
         pack_frag, transform = self._dialect.in_string_array(pack_expr, ":packs")
         pack_params = {"packs": transform(sorted(set(pack_ids)))}
-        # avoid binding a non-positive LIMIT (PG errors on a negative LIMIT
-        # literal; see _graph_protocol.py's export_nodes docstring for the
-        # cross-dialect version of this same footgun)
-        lim = max(1, limit)
 
         with self._conn() as conn:
             if short_token:
@@ -258,7 +256,7 @@ class PgDocStore(_SqlDocStoreBase):
                 params: dict[str, Any] = {
                     f"t{i}": f"%{t}%" for i, t in enumerate(toks)
                 }
-                params.update({"qraw": query, "lim": lim, **space_params, **pack_params})
+                params.update({"qraw": query, "lim": limit, **space_params, **pack_params})
                 rows = conn.execute(
                     self._text(
                         f"""
@@ -283,7 +281,7 @@ class PgDocStore(_SqlDocStoreBase):
                         LIMIT :lim
                         """
                     ),
-                    {"q": query, "lim": lim, **space_params, **pack_params},
+                    {"q": query, "lim": limit, **space_params, **pack_params},
                 ).fetchall()
 
         out: list[dict[str, Any]] = []

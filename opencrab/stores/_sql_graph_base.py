@@ -3367,7 +3367,7 @@ class _SqlGraphStoreBase(abc.ABC):
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         self._require_available()
-        if not relations:
+        if not relations or limit <= 0:
             return []
         table = self._table("graph_edges")
         placeholders, rel_params = self._in_placeholders(relations, "rel")
@@ -3631,6 +3631,8 @@ class _SqlGraphStoreBase(abc.ABC):
         limit: int = 1_000_000,
     ) -> list[dict[str, Any]]:
         self._require_available()
+        if limit <= 0:
+            return []
         nodes = self._table("graph_nodes")
         edges = self._table("graph_edges")
         # a.space_id / b.space_id are selected for the same reason as in
