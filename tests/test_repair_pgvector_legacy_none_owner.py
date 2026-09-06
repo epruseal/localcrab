@@ -323,6 +323,44 @@ class TestRollback:
         assert hit["metadata"]["pack_id"] == "real_pack", "롤백이 정당한 신규 소유권을 덮어썼다"
 
 
+class TestRollbackWarningBannerPrecedesTheDestructiveCall:
+    """xmin 한계 경고는 문서/docstring 뿐 아니라 실행 시 stderr 로도 나가야 하고,
+    그 출력은 실제 롤백(파괴적 동작)보다 반드시 먼저 일어나야 한다(팀리드 지적,
+    #306 라운드4). ``repair.rollback`` 을 스파이로 감싸 호출 시점에 stderr 를
+    선점 확인함으로써 순서를 실증한다."""
+
+    def test_warning_appears_on_stderr_before_rollback_is_called(
+        self, pg_store, tmp_path, capsys, monkeypatch
+    ):
+        _seed_and_contaminate(pg_store, "legacy")
+        backup_path = tmp_path / "backup.json"
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+
+        calls = []
+        real_rollback = repair.rollback
+
+        def spy_rollback(engine, table, snapshot):
+            # main()이 여기 도달하기 전에 이미 경고를 stderr 에 썼어야 한다.
+            captured = capsys.readouterr()
+            assert "WARNING" in captured.err and "xmin" in captured.err, (
+                "롤백 실행 전에 stderr 경고 배너가 없었다"
+            )
+            calls.append("warned_before_rollback")
+            return real_rollback(engine, table, snapshot)
+
+        monkeypatch.setattr(repair, "rollback", spy_rollback)
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--rollback-from", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_OK
+        assert calls == ["warned_before_rollback"], "rollback()이 호출되지 않았다"
+
+
 class TestBackupSignatureAndSnapshotIntegrity:
     def test_signature_mismatch_is_rejected_and_nothing_changes(self, pg_store, tmp_path):
         backup_path = tmp_path / "backup.json"
