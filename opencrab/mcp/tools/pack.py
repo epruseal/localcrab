@@ -17,6 +17,7 @@ import hashlib
 import logging
 from typing import Any
 
+from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
 from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.common.text import slugify
 from opencrab.pack.write_gate import (
@@ -26,7 +27,7 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
 )
 
-from ._registry import AccessTier, tool
+from ._registry import AccessTier, safe_tool_error, tool
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +298,18 @@ def _ingest_into_pack(
             # is what stops an unvalidated label from being interpolated.
             # validate_node is a pure membership test against the 9-space
             # manifest, so builder.add_node re-running it costs nothing.
-            validate_node(item_space, item_node_type).raise_if_invalid()
+            try:
+                validate_node(item_space, item_node_type).raise_if_invalid()
+            except ValueError as exc:
+                # #168: narrow catch around this ONE call only -- its
+                # message is built entirely from a static allowed-types list
+                # plus the caller's own supplied (invalid) node_type, never
+                # backend or filesystem detail. Kept unchanged per design's
+                # narrow-catch principle; this is a pre-existing, reviewed
+                # caller-facing message, not the broad `except Exception`
+                # below that this fix targets.
+                node_errors.append(f"{item_node_id}: {exc}")
+                continue
             reason = _node_probe_conflict(
                 ctx, item_space, item_node_type, item_node_id, pack_id
             )
@@ -330,7 +342,7 @@ def _ingest_into_pack(
             if store_write_succeeded(node_stores or {}, "graph"):
                 billable_write = True
         except Exception as exc:
-            node_errors.append(f"{item.get('node_id', '?')}: {exc}")
+            node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
 
     for item in edges or []:
         try:
@@ -343,25 +355,41 @@ def _ingest_into_pack(
             # `relation` to graph.get_edge, and Neo4jStore.get_edge
             # interpolates it into Cypher (-[r:{relation}]->), so it must
             # clear the whitelist before any store sees it.
-            validate_edge(item_from_space, item_to_space, item_relation).raise_if_invalid()
+            try:
+                validate_edge(item_from_space, item_to_space, item_relation).raise_if_invalid()
+            except ValueError as exc:
+                # #168: narrow catch, same rationale as the node loop's
+                # equivalent -- the grammar validator's own message, built
+                # from a static allowed-relations list plus the caller's own
+                # supplied value.
+                edge_errors.append(f"{item_from_id}->{item_to_id}: {exc}")
+                continue
 
             # Endpoint types are resolved the same way builder.add_edge
             # resolves them (graph.lookup_node_type). A `None` result means
             # the node genuinely does not exist -- since #162,
             # lookup_node_type no longer returns None for "the lookup query
             # itself failed"; it raises GraphReadCapabilityUnavailable
-            # instead, which this loop's own `except Exception` below
-            # catches and reports through edge_errors, failing this edge
-            # closed exactly like the other "cannot verify" cases in
-            # _foreign_pack. Treating an unresolvable endpoint as "no
+            # instead, which this loop's own narrow `except
+            # GraphReadCapabilityUnavailable` below catches and reports
+            # through edge_errors (#168: narrowed from a bare `except
+            # Exception` -- this exception class's message never embeds
+            # backend/driver text, only the node_id/node_type the caller
+            # already supplied or owns, so it keeps its own message), failing
+            # this edge closed exactly like the other "cannot verify" cases
+            # in _foreign_pack. Treating an unresolvable endpoint as "no
             # conflict, skip the probe" would be unsafe regardless: if the
             # underlying fault cleared before builder.add_edge ran its own
             # lookup, the write would proceed there with no pack_id check
             # at all.
             graph_store = ctx.get("neo4j")
             lookup = getattr(graph_store, "lookup_node_type", None) if graph_store is not None else None
-            from_type = lookup(item_from_id) if lookup is not None else None
-            to_type = lookup(item_to_id) if lookup is not None else None
+            try:
+                from_type = lookup(item_from_id) if lookup is not None else None
+                to_type = lookup(item_to_id) if lookup is not None else None
+            except GraphReadCapabilityUnavailable as exc:
+                edge_errors.append(f"{item_from_id}->{item_to_id}: {exc}")
+                continue
             if from_type is None or to_type is None:
                 edge_errors.append(
                     _identity_reject_message(
@@ -407,7 +435,8 @@ def _ingest_into_pack(
                 billable_write = True
         except Exception as exc:
             edge_errors.append(
-                f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: {exc}"
+                f"{item.get('from_id', '?')}→{item.get('to_id', '?')}: "
+                f"{safe_tool_error('_ingest_into_pack', exc)}"
             )
 
     text_ingested = False
@@ -481,8 +510,13 @@ def _ingest_into_pack(
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
             except Exception as exc:
-                node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
-                stores["evidence_node"] = f"error: {exc}"
+                node_errors.append(f"{source_id} (evidence/TextUnit): {safe_tool_error('_ingest_into_pack', exc)}")
+                # Same shape as builder.py's _safe_store_status(exc) -- the
+                # exception's type name only, never str(exc) -- kept inline
+                # here (not imported) since this is the only pack.py site
+                # writing a `stores[...]` marker from a caught exception
+                # rather than from a builder.add_node/add_edge return value.
+                stores["evidence_node"] = f"error: {type(exc).__name__}"
             text_ingested = True
         else:
             # Legacy path: through the write_source chokepoint (#148/#74),
@@ -1065,7 +1099,14 @@ def pack_create(
             description=_clean_str(description or ""),
         )
     except Exception as exc:
-        return {"error": f"pack registration failed: {exc}"}
+        # #168: str(exc) here would put backend registry text straight into
+        # an MCP response (same pattern pack/fork.py's begin_pack_creation
+        # call closes). Full detail stays on the operator log.
+        logger.error(
+            "pack_create: begin_pack_creation failed for pack_id=%s: %s",
+            slug, exc, exc_info=True,
+        )
+        return {"error": f"pack registration failed ({type(exc).__name__})"}
 
     anchor_id = anchor_node_id(slug)
 
@@ -1130,6 +1171,16 @@ def pack_create(
         )
     except Exception as exc:
         anchor_exc = exc
+        # #168: `anchor_exc` also drives `graph_landed`'s value below, so
+        # this branch keeps storing the exception object itself rather than
+        # a pre-formatted string. The caller-facing text is built from it
+        # further down (see the `write_detail` assignment) via the type
+        # name only -- never str(exc). Full detail goes to the operator log
+        # here, at the point it is caught.
+        logger.error(
+            "pack_create: anchor node write raised for pack_id=%s: %s",
+            slug, exc, exc_info=True,
+        )
 
     # ------------------------------------------------------------------
     # PAST THIS POINT, NOTHING IN THIS FUNCTION DELETES THE REGISTRY ROW
@@ -1164,7 +1215,9 @@ def pack_create(
     graph_landed = anchor_exc is None and store_write_succeeded(anchor_stores or {}, "graph")
 
     if anchor_exc is not None:
-        write_detail = f"anchor node write raised: {anchor_exc}"
+        # #168: the exception was already logged in full at the except site
+        # above -- this caller-facing text carries only the type name.
+        write_detail = f"anchor node write raised ({type(anchor_exc).__name__})"
     else:
         graph_failures = [
             f for f in store_write_failures(anchor_stores or {}) if f.startswith("graph:")
@@ -1245,9 +1298,16 @@ def pack_create(
         try:
             row = get_pack(ctx["sql"], slug)
         except Exception as exc:
+            # #168: str(exc) here would put a registry-read backend error
+            # straight into an MCP response. Full detail on the operator log.
+            logger.error(
+                "pack_create: get_pack failed while reconciling pack_id=%s "
+                "after an anchor write: %s", slug, exc, exc_info=True,
+            )
             return _pack_error(
                 ctx, slug, subject_id,
-                f"could not reconcile pack '{slug}' after anchor write: {exc}",
+                f"could not reconcile pack '{slug}' after anchor write "
+                f"({type(exc).__name__})",
             )
 
         if row is None:
@@ -1724,7 +1784,7 @@ def pack_publish(pack_id: str, visibility: str) -> dict[str, Any]:
             ),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"pack_publish failed: {exc}"}
+        return {"error": safe_tool_error("pack_publish", exc)}
 
     return {"status": "ok", "pack_id": pack["pack_id"], "visibility": pack["visibility"]}
 

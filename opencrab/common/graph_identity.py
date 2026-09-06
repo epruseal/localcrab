@@ -40,6 +40,31 @@ class GraphReadCapabilityUnavailable(RuntimeError):  # noqa: N818 - public domai
     """The backend has no qualified read capability."""
 
 
+class GraphPropertyValidationError(ValueError):  # noqa: N818 - public domain exception name
+    """A graph node/edge property or identity field fails this module's own
+    shape/identity validation (reserved key, non-JSON value, empty identity
+    field, a lone UTF-16 surrogate, and similar) -- see this module's
+    docstring: "no database code", so every raise site in this module is the
+    codebase's own data-shape check, never backend or wire-protocol text.
+    This holds whether the checked value came straight from a caller or was
+    read back from a backend for a digest/receipt comparison (this module
+    does not distinguish the two, and its message never repeats the
+    offending value).
+
+    #168 (Fix G) narrows ``OntologyBuilder.add_node``/``add_edge``'s
+    Neo4j-write except-tuple to re-raise exactly this type (not bare
+    ``ValueError``), so a validation failure keeps stopping the whole
+    write and surfacing its own safe, fixed-string message -- the same
+    contract ``opencrab/pack/load.py``'s ``except ValueError: skip`` and
+    ``opencrab/mcp/tools/graph.py``'s ``except ValueError: valid=False``
+    already depend on. An unrelated bare ``ValueError`` that the installed
+    Neo4j driver's own PackStream decoder can raise (see Fix G's
+    docstring in ``opencrab/ontology/builder.py``) is NOT this type, so it
+    still falls through to the generic per-store failure path instead of
+    being conflated with a validation rejection.
+    """
+
+
 _NODE_TYPE_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -84,7 +109,7 @@ class FrozenDict(Mapping[str, Any]):
     def __init__(self, values: Mapping[str, Any] | None = None) -> None:
         source = {} if values is None else dict(values)
         if any(not isinstance(key, str) for key in source):
-            raise ValueError("graph properties object keys must be strings")
+            raise GraphPropertyValidationError("graph properties object keys must be strings")
         self._data = {key: freeze_json(value) for key, value in source.items()}
         self._items = tuple(sorted(self._data.items(), key=lambda item: item[0]))
         self._hash = hash(self._items)
@@ -122,7 +147,7 @@ def freeze_json(value: Any) -> FrozenValue:
         return FrozenDict(value)
     if isinstance(value, (list, tuple)):
         return tuple(freeze_json(item) for item in value)
-    raise ValueError("graph properties must contain JSON values")
+    raise GraphPropertyValidationError("graph properties must contain JSON values")
 
 
 def thaw_json(value: Any) -> Any:
@@ -138,7 +163,7 @@ def thaw_json(value: Any) -> Any:
 
 def _check_string(value: Any, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str) or (not allow_empty and not value):
-        raise ValueError("graph identity fields must be non-empty strings")
+        raise GraphPropertyValidationError("graph identity fields must be non-empty strings")
     return value
 
 
@@ -152,17 +177,20 @@ def _validate_json(value: Any, *, _seen: set[int] | None = None) -> None:
     """
     if value is None or isinstance(value, (bool, str, int)):
         if isinstance(value, str):
-            value.encode("utf-8")  # rejects lone surrogates
+            try:
+                value.encode("utf-8")  # rejects lone surrogates
+            except UnicodeError as exc:
+                raise GraphPropertyValidationError("graph properties must not contain lone surrogate code points") from exc
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError("graph properties must contain finite JSON values")
+            raise GraphPropertyValidationError("graph properties must contain finite JSON values")
         return
     if isinstance(value, FrozenDict) or isinstance(value, Mapping) or isinstance(value, (list, tuple)):
         seen = _seen if _seen is not None else set()
         marker = id(value)
         if marker in seen:
-            raise ValueError("graph properties must not contain cycles")
+            raise GraphPropertyValidationError("graph properties must not contain cycles")
         seen.add(marker)
         try:
             if isinstance(value, (list, tuple)):
@@ -171,13 +199,18 @@ def _validate_json(value: Any, *, _seen: set[int] | None = None) -> None:
             else:
                 for key, item in value.items():
                     if not isinstance(key, str):
-                        raise ValueError("graph properties object keys must be strings")
-                    key.encode("utf-8")
+                        raise GraphPropertyValidationError("graph properties object keys must be strings")
+                    try:
+                        key.encode("utf-8")  # rejects lone surrogates
+                    except UnicodeError as exc:
+                        raise GraphPropertyValidationError(
+                            "graph properties object keys must not contain lone surrogate code points"
+                        ) from exc
                     _validate_json(item, _seen=seen)
         finally:
             seen.remove(marker)
         return
-    raise ValueError("graph properties must contain JSON values")
+    raise GraphPropertyValidationError("graph properties must contain JSON values")
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -204,28 +237,28 @@ def parse_properties_object(value: Any) -> dict[str, Any]:
         try:
             value = bytes(value).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError("malformed graph properties") from exc
+            raise GraphPropertyValidationError("malformed graph properties") from exc
     if isinstance(value, Mapping):
         obj = thaw_json(value)
         _validate_json(obj)
         return obj
     if not isinstance(value, str) or not value:
-        raise ValueError("malformed graph properties")
+        raise GraphPropertyValidationError("malformed graph properties")
 
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for key, item in items:
             if key in out:
-                raise ValueError("duplicate graph property")
+                raise GraphPropertyValidationError("duplicate graph property")
             out[key] = item
         return out
 
     try:
         parsed = json.loads(value, object_pairs_hook=pairs)
     except (TypeError, ValueError, UnicodeError) as exc:
-        raise ValueError("malformed graph properties") from exc
+        raise GraphPropertyValidationError("malformed graph properties") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("malformed graph properties")
+        raise GraphPropertyValidationError("malformed graph properties")
     _validate_json(parsed)
     return parsed
 
@@ -233,19 +266,19 @@ def parse_properties_object(value: Any) -> dict[str, Any]:
 def normalize_node_properties(node_id: str, properties: dict[str, Any]) -> dict[str, Any]:
     node_id = _check_string(node_id)
     if not isinstance(properties, dict):
-        raise ValueError("malformed graph node properties")
+        raise GraphPropertyValidationError("malformed graph node properties")
     # ``node_id`` was historically copied into the JSON properties by graph
     # callers.  It is now the dedicated global key, but accepting an equal
     # legacy copy preserves those callers and does not create an ambiguity.
     # A disagreeing copy is still rejected before any database access.
     if "node_id" in properties and properties["node_id"] != node_id:
-        raise ValueError("reserved graph property")
+        raise GraphPropertyValidationError("reserved graph property")
     reserved = {"node_type", "node_digest", "space_id"}
     if reserved.intersection(properties):
-        raise ValueError("reserved graph property")
+        raise GraphPropertyValidationError("reserved graph property")
     supplied = properties.get("id")
     if "id" in properties and supplied != node_id:
-        raise ValueError("reserved graph property")
+        raise GraphPropertyValidationError("reserved graph property")
     out = dict(properties)
     out["id"] = node_id
     _validate_json(out)
@@ -256,10 +289,10 @@ def normalize_space(space_id: Any, properties: dict[str, Any]) -> tuple[str | No
     if space_id is not None and (not isinstance(space_id, str) or not space_id):
         # Existing callers use None for absent space; all other values are
         # malformed rather than silently changing the digest.
-        raise ValueError("graph identity fields must be non-empty strings")
+        raise GraphPropertyValidationError("graph identity fields must be non-empty strings")
     prop_space = properties.get("space")
     if prop_space is not None and not isinstance(prop_space, str):
-        raise ValueError("reserved graph property")
+        raise GraphPropertyValidationError("reserved graph property")
     effective = space_id if space_id is not None else (prop_space or None)
     out = dict(properties)
     if effective is None:
@@ -293,17 +326,17 @@ def normalize_edge_properties(from_id: str, relation: str, to_id: str, propertie
     if properties is None:
         properties = {}
     if not isinstance(properties, dict):
-        raise ValueError("malformed graph edge properties")
+        raise GraphPropertyValidationError("malformed graph edge properties")
     out = dict(properties)
     for key, expected in (("from_id", from_id), ("relation", relation), ("to_id", to_id)):
         if key in out and out[key] != expected:
-            raise ValueError("reserved graph property")
+            raise GraphPropertyValidationError("reserved graph property")
         out[key] = expected
     for key in ("edge_key", "from_type", "to_type", "edge_digest"):
         if key in out:
-            raise ValueError("reserved graph property")
+            raise GraphPropertyValidationError("reserved graph property")
     if "pack_id" in out and out["pack_id"] is not None and (not isinstance(out["pack_id"], str) or not out["pack_id"]):
-        raise ValueError("malformed graph edge owner")
+        raise GraphPropertyValidationError("malformed graph edge owner")
     _validate_json(out)
     return out
 
@@ -319,7 +352,7 @@ def canonical_edge_digest(from_id: str, relation: str, to_id: str, from_type: st
 def validate_digest(value: str, *, edge: bool = False) -> str:
     import re
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
-        raise ValueError("malformed edge digest" if edge else "malformed node digest")
+        raise GraphPropertyValidationError("malformed edge digest" if edge else "malformed node digest")
     return value
 
 
@@ -335,7 +368,7 @@ class NodeWriteReceipt:
     def __post_init__(self) -> None:
         frozen = freeze_json(self.properties)
         if not isinstance(frozen, FrozenDict):
-            raise ValueError("graph receipt properties must be an object")
+            raise GraphPropertyValidationError("graph receipt properties must be an object")
         object.__setattr__(self, "properties", frozen)
 
 
@@ -353,7 +386,7 @@ class EdgeWriteReceipt:
     def __post_init__(self) -> None:
         frozen = freeze_json(self.properties)
         if not isinstance(frozen, FrozenDict):
-            raise ValueError("graph receipt properties must be an object")
+            raise GraphPropertyValidationError("graph receipt properties must be an object")
         object.__setattr__(self, "properties", frozen)
 
 
@@ -598,7 +631,7 @@ def decode_raw_properties(value: Any, *, jsonb: bool = False) -> tuple[bytes | F
             out: dict[str, Any] = {}
             for key, item in items:
                 if key in out:
-                    raise ValueError("duplicate graph property")
+                    raise GraphPropertyValidationError("duplicate graph property")
                 out[key] = item
             return out
 

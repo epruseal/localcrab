@@ -18,6 +18,7 @@ from typing import Any
 
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
+    GraphPropertyValidationError,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
@@ -42,6 +43,22 @@ from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_store_status(exc: Exception) -> str:
+    """Per-store write-failure marker for the `stores` receipt map.
+
+    Never embeds `str(exc)` -- only the exception's type name, a static
+    Python identifier, never backend/driver text, a path, or an object
+    repr. Keeps the literal `"error: "` prefix (colon included) the OLD
+    `f"error: {exc}"` shape used: `store_write_failures()` (this module)
+    detects a per-store failure via `status.startswith("error:")`, and
+    changing that prefix would silently stop this new failure shape from
+    being recognized there. The existing `logger.warning(...)` call
+    immediately above each call site (unchanged by this fix) keeps the
+    full exception detail on the operator-only log channel.
+    """
+    return f"error: {type(exc).__name__}"
 
 
 class OntologyBuilder:
@@ -340,15 +357,21 @@ class OntologyBuilder:
                     )
                 output["stores"]["graph"] = "ok"
                 output["node_data"] = node_props
-            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable, ValueError):
+            except (
+                NodeIdentityConflict,
+                EdgeIdentityConflict,
+                GraphSchemaMigrationRequired,
+                GraphWriteUnavailable,
+                GraphPropertyValidationError,
+            ):
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)
                 logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
-                output["stores"]["graph"] = f"error: {exc}"
+                output["stores"]["graph"] = _safe_store_status(exc)
             except Exception as exc:
                 logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
-                output["stores"]["graph"] = f"error: {exc}"
+                output["stores"]["graph"] = _safe_store_status(exc)
         else:
             output["stores"]["graph"] = "unavailable"
 
@@ -370,7 +393,7 @@ class OntologyBuilder:
                 )
             except Exception as exc:
                 logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
-                output["stores"]["docs"] = f"error: {exc}"
+                output["stores"]["docs"] = _safe_store_status(exc)
         else:
             output["stores"]["docs"] = "unavailable"
 
@@ -381,7 +404,7 @@ class OntologyBuilder:
                 output["stores"]["sql"] = "ok"
             except Exception as exc:
                 logger.warning("SQL node registry write failed for %s: %s", node_id, exc)
-                output["stores"]["sql"] = f"error: {exc}"
+                output["stores"]["sql"] = _safe_store_status(exc)
         else:
             output["stores"]["sql"] = "unavailable"
 
@@ -419,7 +442,7 @@ class OntologyBuilder:
                     output["stores"]["vector"] = "skipped (no text)"
             except Exception as exc:
                 logger.warning("Chroma node write failed for %s: %s", node_id, exc)
-                output["stores"]["vector"] = f"error: {exc}"
+                output["stores"]["vector"] = _safe_store_status(exc)
         else:
             output["stores"]["vector"] = "unavailable"
 
@@ -571,6 +594,28 @@ class OntologyBuilder:
                 "sql": "skipped (graph unavailable)",
             }
             return output
+        except Exception as exc:
+            # #168: `lookup_node_type`'s three-state contract (#162) only
+            # documents `GraphReadCapabilityUnavailable` as its "cannot tell"
+            # case -- an untyped exception (a driver-internal error, a
+            # malformed row a backend didn't wrap) is not one of the three
+            # documented states, and letting it propagate raw would put
+            # backend/driver text straight into an MCP response. Full detail
+            # goes to the operator log; the caller gets only the same
+            # curated `GraphReadCapabilityUnavailable` shape this function
+            # already uses for its documented "cannot tell" case.
+            logger.error(
+                "lookup_node_type raised an undocumented exception type "
+                "resolving an edge endpoint: %s: %s", type(exc).__name__, exc,
+                exc_info=True,
+            )
+            output["stores"] = {
+                "graph": "unavailable (endpoint type lookup failed: "
+                "lookup_node_type: unexpected failure resolving endpoint type)",
+                "docs": "skipped (graph unavailable)",
+                "sql": "skipped (graph unavailable)",
+            }
+            return output
         missing = [
             f"{space}/{nid}"
             for space, nid, ntype in (
@@ -627,15 +672,21 @@ class OntologyBuilder:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
-            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable, ValueError):
+            except (
+                NodeIdentityConflict,
+                EdgeIdentityConflict,
+                GraphSchemaMigrationRequired,
+                GraphWriteUnavailable,
+                GraphPropertyValidationError,
+            ):
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)
                 logger.warning("Neo4j edge write failed: %s", exc)
-                output["stores"]["graph"] = f"error: {exc}"
+                output["stores"]["graph"] = _safe_store_status(exc)
             except Exception as exc:
                 logger.warning("Neo4j edge write failed: %s", exc)
-                output["stores"]["graph"] = f"error: {exc}"
+                output["stores"]["graph"] = _safe_store_status(exc)
         else:
             output["stores"]["graph"] = "unavailable"
 
@@ -650,7 +701,7 @@ class OntologyBuilder:
                 output["stores"]["sql"] = "ok"
             except Exception as exc:
                 logger.warning("SQL edge registry failed: %s", exc)
-                output["stores"]["sql"] = f"error: {exc}"
+                output["stores"]["sql"] = _safe_store_status(exc)
         else:
             output["stores"]["sql"] = "unavailable"
 
@@ -675,7 +726,7 @@ class OntologyBuilder:
                 output["stores"]["docs"] = "audited"
             except Exception as exc:
                 logger.warning("MongoDB audit log write failed: %s", exc)
-                output["stores"]["docs"] = f"error: {exc}"
+                output["stores"]["docs"] = _safe_store_status(exc)
         else:
             output["stores"]["docs"] = "unavailable"
 

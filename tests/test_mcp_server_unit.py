@@ -80,7 +80,12 @@ class TestHandleRequestError:
     def test_tools_call_tool_exception_is_caught_and_returned_as_error_content(self, server):
         """A tool raising a plain Exception must NOT surface as a JSON-RPC
         error response — server.py:202-204 catches it and returns a normal
-        success envelope whose content encodes {"error": str(exc)}."""
+        success envelope whose content encodes {"error": safe_tool_error(...)}.
+
+        #168: the caller-facing text is built from the tool name and the
+        exception's type name only, never `str(exc)` -- a backend error
+        message like "boom" must not reach the response verbatim.
+        """
         with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
             mock_dispatch.side_effect = ValueError("boom")
             response = server.handle_request(
@@ -91,7 +96,7 @@ class TestHandleRequestError:
         import json
 
         payload = json.loads(response["result"]["content"][0]["text"])
-        assert payload == {"error": "boom"}
+        assert payload == {"error": "bad_tool failed (ValueError)"}
 
     def test_unknown_method_returns_method_not_found(self, server):
         response = server.handle_request({"jsonrpc": "2.0", "id": 9, "method": "totally/unknown"})
@@ -115,7 +120,19 @@ class TestHandleRequestError:
         """A KeyError raised by a tool's OWN logic (e.g. a dict lookup bug,
         not an unknown-tool lookup) must not be conflated with
         UnknownToolError — it should land in the generic error-content
-        envelope like any other tool exception, not as a JSON-RPC error."""
+        envelope like any other tool exception, not as a JSON-RPC error.
+
+        KeyError is ALSO a LookupError subclass, same as the bare
+        LookupError current_principal() raises for an unbound principal
+        (#168) -- so this is the regression check that the two do not get
+        conflated with EACH OTHER either: this KeyError must not be
+        re-raised into `handle_request`'s outer `except KeyError`
+        (METHOD_NOT_FOUND) branch, only a truly unregistered method name may
+        land there.
+
+        #168: the message itself is now the exception's type name only,
+        never str(exc) -- the tool's own dict-key text must not reach the
+        response verbatim."""
         with patch("opencrab.mcp.server.dispatch_tool") as mock_dispatch:
             mock_dispatch.side_effect = KeyError("some_unrelated_dict_key")
             response = server.handle_request(
@@ -126,7 +143,7 @@ class TestHandleRequestError:
         import json
 
         payload = json.loads(response["result"]["content"][0]["text"])
-        assert "some_unrelated_dict_key" in payload["error"]
+        assert payload == {"error": "flaky_tool failed (KeyError)"}
 
     def test_tools_call_missing_name_returns_invalid_params(self, server):
         response = server.handle_request(

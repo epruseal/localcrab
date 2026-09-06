@@ -486,7 +486,9 @@ class TestOntologyBuilderMongoAuditContract:
 
         result = builder.add_edge("subject", "u1", "owns", "resource", "p1", pack_id=pack_id)
 
-        assert result["stores"]["docs"] == "error: insert failed"
+        # #168: the caller-facing marker now carries only the exception's
+        # type name, never the raw backend message ("insert failed").
+        assert result["stores"]["docs"] == "error: RuntimeError"
 
     def test_add_edge_docs_marker_unavailable_when_mongo_unavailable(self):
         mongo = MagicMock(available=False)

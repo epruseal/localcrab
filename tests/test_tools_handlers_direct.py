@@ -483,7 +483,10 @@ class TestIngestIntoPack:
                 ],
             )
         assert result["added_nodes"] == 1
-        assert result["node_errors"] == ["e2: bad node"]
+        # #168: the caller-facing text is built from the tool name and the
+        # exception's type name only, never str(exc) -- "bad node" (the
+        # backend message) must not reach the response verbatim.
+        assert result["node_errors"] == ["e2: _ingest_into_pack failed (RuntimeError)"]
 
     def test_error_edge_write_failure_recorded_with_arrow_format(self):
         builder = MagicMock()
@@ -498,7 +501,8 @@ class TestIngestIntoPack:
                 }],
             )
         assert result["added_edges"] == 0
-        assert result["edge_errors"] == ["a1→a2: bad edge"]
+        # #168: same safe-shape rule as the node loop above.
+        assert result["edge_errors"] == ["a1→a2: _ingest_into_pack failed (RuntimeError)"]
 
     def test_error_evidence_node_failure_still_marks_text_ingested(self):
         """A failed evidence/TextUnit write is recorded in node_errors and
@@ -514,8 +518,12 @@ class TestIngestIntoPack:
             )
         assert result["text_ingested"] is True
         assert result["evidence_node"] is None
-        assert result["node_errors"] == ["src-1 (evidence/TextUnit): vector store down"]
-        assert result["stores"]["evidence_node"] == "error: vector store down"
+        # #168: the exception's type name only, never str(exc) -- "vector
+        # store down" (the backend message) must not reach the response.
+        assert result["node_errors"] == [
+            "src-1 (evidence/TextUnit): _ingest_into_pack failed (RuntimeError)"
+        ]
+        assert result["stores"]["evidence_node"] == "error: RuntimeError"
 
     def test_error_legacy_path_hybrid_ingest_failure_recorded(self, tmp_path):
         """text_as_node=False legacy path (now routed through
@@ -600,7 +608,10 @@ class TestIngestIntoPack:
                     )
         finally:
             graph.close()
-        assert result["stores"]["documents"] == "error: mongo down"
+        # #168: source_writer.py's doc-store catch now records only the
+        # exception's type name, never str(exc) -- "mongo down" (the
+        # backend message) must not reach the response.
+        assert result["stores"]["documents"] == "error: RuntimeError"
 
     def test_error_legacy_path_both_stores_unavailable_does_not_bill(self, tmp_path):
         """#66 codex re-review (3rd round): the legacy text_as_node=False
@@ -958,7 +969,7 @@ class TestPackCreate:
         # #170 review: a failure that RETAINS the registry row must name it,
         # since slug negotiation can have suffixed the requested id.
         assert set(result) == {"error", "pack_id", "registry_status"}
-        assert "anchor node write raised: graph down" in result["error"]
+        assert "anchor node write raised (RuntimeError)" in result["error"]
         assert "marked partial, not deleted" in result["error"]
 
     def test_error_anchor_node_store_failure_without_raising(self):
@@ -1247,7 +1258,7 @@ class TestPackCreatePostWriterFailureDemotion:
         # #170 review: a failure that RETAINS the registry row must name it,
         # since slug negotiation can have suffixed the requested id.
         assert set(result) == {"error", "pack_id", "registry_status"}
-        assert "anchor node write raised: graph down" in result["error"]
+        assert "anchor node write raised (RuntimeError)" in result["error"]
         assert "marked partial, not deleted" in result["error"]
         row = get_pack(sql, "broken-pack")
         assert row is not None
@@ -1476,7 +1487,7 @@ class TestPackCreatePostWriterFailureDemotion:
         # #170 review: a failure that RETAINS the registry row must name it,
         # since slug negotiation can have suffixed the requested id.
         assert set(result) == {"error", "pack_id", "registry_status"}
-        assert "anchor node write raised: graph down" in result["error"]
+        assert "anchor node write raised (RuntimeError)" in result["error"]
         assert any(
             "could not demote" in rec.message and "broken-pack" in rec.message
             for rec in caplog.records
@@ -1914,9 +1925,12 @@ class TestHarnessPromotionApply:
             result = harness_promotion_apply(package, dry_run=False)
         assert result["node_receipts"] == []
         assert result["edge_receipts"] == []
+        # #168: safe_tool_error(...) shape -- the exception's type name
+        # only, never str(exc) ("node write failed"/"edge write failed",
+        # the backend messages, must not reach the response).
         assert result["errors"] == [
-            {"node_id": "ds1", "error": "node write failed"},
-            {"edge": "ds1-[related_to]->ds2", "error": "edge write failed"},
+            {"node_id": "ds1", "error": "harness_promotion_apply failed (RuntimeError)"},
+            {"edge": "ds1-[related_to]->ds2", "error": "harness_promotion_apply failed (RuntimeError)"},
         ]
         assert result["summary"] == {"nodes_written": 0, "edges_written": 0, "errors": 2}
 
@@ -1967,7 +1981,11 @@ class TestHarnessPromotionApply:
     def test_error_malformed_package_returns_validation_message(self):
         result = harness_promotion_apply({"not": "a valid package"})
         assert "error" in result
-        assert "Invalid PromotionPackage" in result["error"]
+        # #168: the caller-facing text is built from the tool name and the
+        # exception's type name only, never str(exc) -- pydantic's own
+        # validation-error text (field names, input values) must not reach
+        # the response verbatim.
+        assert result["error"] == "harness_promotion_apply failed (ValidationError)"
 
     def test_edge_empty_package_apply(self):
         from opencrab.stores.sql_store import SQLStore

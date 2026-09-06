@@ -114,7 +114,12 @@ class TestErrorEnvelopeContract:
     def test_add_node_generic_exception_caught_internally(self):
         """ontology_add_node catches broadly and returns {"error": ...}
         directly from dispatch_tool — no "valid" key for non-ValueError
-        (that key is only added on the ValueError branch)."""
+        (that key is only added on the ValueError branch).
+
+        #168: the caller-facing text is built from the tool name and the
+        exception's type name only, never str(exc) -- a backend error
+        message like "store write failed" must not reach the response.
+        """
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = self._ctx_with_builder_raising(
                 RuntimeError("store write failed")
@@ -123,9 +128,10 @@ class TestErrorEnvelopeContract:
                 "ontology_add_node",
                 {"space": "subject", "node_type": "User", "node_id": "u1"},
             )
-        assert result == {"error": "store write failed"}
+        assert result == {"error": "ontology_add_node failed (RuntimeError)"}
 
     def test_add_edge_generic_exception_caught_internally(self):
+        """#168: same safe-shape rule as ontology_add_node above."""
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = self._ctx_with_builder_raising(
                 RuntimeError("edge write failed")
@@ -137,7 +143,7 @@ class TestErrorEnvelopeContract:
                     "to_space": "resource", "to_id": "r1",
                 },
             )
-        assert result == {"error": "edge write failed"}
+        assert result == {"error": "ontology_add_edge failed (RuntimeError)"}
 
     def test_get_node_exception_propagates_and_is_wrapped_at_mcp_boundary(self):
         """ontology_get_node has no internal try/except — an exception from
@@ -168,7 +174,13 @@ class TestErrorEnvelopeContract:
 
         assert "error" not in response  # JSON-RPC level: succeeded
         content_text = response["result"]["content"][0]["text"]
-        assert json.loads(content_text) == {"error": "db connection lost"}
+        # #168: _handle_tools_call's boundary catch now uses
+        # safe_tool_error(name, exc) -- the tool name and the exception's
+        # type name only, never str(exc) ("db connection lost", the
+        # backend message).
+        assert json.loads(content_text) == {
+            "error": "ontology_get_node failed (RuntimeError)"
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -430,9 +442,14 @@ class TestOntologyListEdgesLocalBackend:
     def test_export_edges_failure_without_run_cypher_reports_real_error(self):
         """Regression test for the fixed bug: when export_edges_scoped()
         raises and the backend offers no run_cypher fallback (local/Kuzu-
-        only), the real exception message must surface — previously it was
+        only), a real, non-misleading error must surface — previously it was
         discarded in favour of the misleading generic "graph store
-        unavailable"."""
+        unavailable".
+
+        #168: "real" no longer means str(exc) verbatim -- the tool name and
+        the exception's type name only, never the backend's own message
+        ("disk I/O error" here), which could carry driver/path detail.
+        """
         graph = MagicMock()
         graph.export_edges_scoped.side_effect = RuntimeError("disk I/O error")
         del graph.run_cypher
@@ -445,7 +462,9 @@ class TestOntologyListEdgesLocalBackend:
             result = ontology_list_edges()
 
         assert result == {
-            "edges": [], "total": 0, "error": "disk I/O error", "pack_id_filter": None,
+            "edges": [], "total": 0,
+            "error": "ontology_list_edges failed (RuntimeError)",
+            "pack_id_filter": None,
         }
 
     # #147 INTENTIONALLY FLIPPED PIN (see DESIGN.md §3.7 -- listed in the PR
@@ -525,7 +544,10 @@ class TestOntologyListEdgesNeo4jWideShapeContract:
         DIFFERENT edge shape as if it were a success instead of surfacing
         the real failure. Now that export_edges() is Neo4j's own native
         method (not a Local/Kuzu-only capability), an exception from it is
-        always the real error — there is no more capability to fall back to."""
+        always the real error — there is no more capability to fall back to.
+
+        #168: the error value itself is now safe_tool_error(...)'s shape,
+        never str(exc) verbatim."""
         graph = MagicMock()
         graph.export_edges_scoped.side_effect = RuntimeError("neo4j session closed")
 
@@ -537,6 +559,8 @@ class TestOntologyListEdgesNeo4jWideShapeContract:
             result = ontology_list_edges()
 
         assert result == {
-            "edges": [], "total": 0, "error": "neo4j session closed", "pack_id_filter": None,
+            "edges": [], "total": 0,
+            "error": "ontology_list_edges failed (RuntimeError)",
+            "pack_id_filter": None,
         }
         graph.run_cypher.assert_not_called()

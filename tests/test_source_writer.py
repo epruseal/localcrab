@@ -315,7 +315,10 @@ def test_vector_exception_stays_in_the_receipt(sql):
 
     docs = _Docs()
     receipt = _write(sql, docs=docs, hybrid=Boom())
-    assert receipt["stores"]["chromadb"] == "error: embed failed"
+    # #168: the receipt's stores map flows straight into an MCP response --
+    # only the exception's type name is recorded, never str(exc) ("embed
+    # failed", the backend message).
+    assert receipt["stores"]["chromadb"] == "error: RuntimeError"
     assert docs.calls, "the doc row stands; only the vector leg failed"
 
 

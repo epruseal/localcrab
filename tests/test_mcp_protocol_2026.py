@@ -153,7 +153,12 @@ class TestHandleRequestNormal:
             )
         result = response["result"]
         assert result["isError"] is True
-        assert "boom" in result["content"][0]["text"]
+        # #168: the message carries the tool name and the exception's type
+        # name only, never str(exc) -- "boom" (the backend message) must
+        # not reach the response verbatim.
+        import json
+
+        assert json.loads(result["content"][0]["text"]) == {"error": "t1 failed (ValueError)"}
 
     def test_legacy_initialize_echoes_requested_protocol_version(self, server):
         response = server.handle_request(
@@ -257,6 +262,32 @@ class TestHandleRequestError:
         error = response["error"]
         assert error["code"] == INVALID_PARAMS
         assert "ghost" in error["message"]
+
+    def test_modern_tools_call_incidental_keyerror_is_not_misreported(self, server):
+        """#168: same regression as the legacy contract in
+        test_mcp_server_unit.py -- KeyError is ALSO a LookupError subclass,
+        same as the bare LookupError current_principal() raises for an
+        unbound principal. A KeyError from a tool's own logic must land in
+        the generic error-content result, not be conflated with the
+        unbound-principal JSON-RPC INTERNAL_ERROR branch, and its message
+        must carry only the exception's type name, never str(exc)."""
+        with patch(
+            "opencrab.mcp.server.dispatch_tool",
+            side_effect=KeyError("some_unrelated_dict_key"),
+        ):
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "tools/call",
+                    "params": {"name": "flaky_tool", "arguments": {}, "_meta": MODERN_META},
+                }
+            )
+        assert "error" not in response
+        import json
+
+        content = response["result"]["content"][0]["text"]
+        assert json.loads(content) == {"error": "flaky_tool failed (KeyError)"}
 
     def test_legacy_initialize_unknown_version_negotiates_latest_legacy(self, server):
         response = server.handle_request(

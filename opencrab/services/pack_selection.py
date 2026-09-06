@@ -35,7 +35,10 @@ PACK_IDS_OUT_OF_SCOPE = "pack_ids_out_of_scope"
 @dataclass(frozen=True)
 class PackWarning:
     code: str
-    detail: str = ""  # e.g. the exception message for AUTO_PACK_FAILED
+    # #168: for AUTO_PACK_FAILED this is the exception's TYPE NAME only
+    # (e.g. "OSError"), never str(exc) -- it reaches the caller directly
+    # via mcp_warning_text/cli_warning_text.
+    detail: str = ""
 
 
 @dataclass
@@ -113,8 +116,13 @@ def resolve_packs(
         except Exception as exc:  # noqa: BLE001 — degrade gracefully (MCP) or re-raise (CLI)
             if raise_on_error:
                 raise
-            logger.warning("auto_pack selection failed: %s", exc)
-            warnings.append(PackWarning(AUTO_PACK_FAILED, str(exc)))
+            # #168: this is a broad `except Exception` around
+            # load_pack_registry (a real filesystem manifest scan) and
+            # choose_packs -- the exception message must not reach the
+            # caller-facing MCP warning. Full detail goes to the operator
+            # log; the warning gets only the exception's type name.
+            logger.error("auto_pack selection failed: %s", exc, exc_info=True)
+            warnings.append(PackWarning(AUTO_PACK_FAILED, type(exc).__name__))
             candidates = []
             failed = True
         if candidates:

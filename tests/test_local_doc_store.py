@@ -530,7 +530,10 @@ class TestCorruptCollection:
             )
         stores = receipt["stores"]
         assert stores["docs"].startswith("error: ")
-        assert "corrupt collection file 'audit_log'" in stores["docs"]
+        # #168: the receipt carries the exception's type name only, never
+        # str(exc) -- "audit_log" (the corrupt collection's name) and its
+        # filesystem path must not reach this response verbatim.
+        assert stores["docs"] == "error: CorruptCollectionError"
         assert stores["graph"] == "ok"
         assert store_write_succeeded_for(stores, "node") is True
         assert doc.get_node_doc("subject", "u2") is not None

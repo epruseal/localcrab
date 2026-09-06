@@ -286,6 +286,45 @@ _FORBIDDEN_ARGS = ("tenant_id", "subject_id")
 _reserved_identity_violations = boundary_identity_violations
 
 
+def safe_tool_error(source: str, exc: Exception) -> str:
+    """Caller-facing message for an exception a broad `except` caught.
+
+    #168: a broad ``except Exception: ... str(exc)`` (or a narrower type
+    whose message was never author-reviewed, e.g. ``current_principal()``'s
+    bare ``LookupError``) can put backend errors, filesystem paths, or
+    internal object reprs straight into a response an authenticated remote
+    caller reads. The one thing always safe to return is built from ONLY
+    ``source`` (a tool name or dispatch method name, already known to the
+    caller who made the request) and ``type(exc).__name__`` (a static
+    Python identifier this codebase defines or imports, never user data) --
+    never ``str(exc)`` or ``repr(exc)``.
+
+    Full detail (`str(exc)`, traceback) goes to the operator-only log
+    channel, not the response. This is a log-sink trust boundary: whatever
+    consumes ``logger``'s output for this process must not itself be a
+    remote-readable channel, same as any other server error log.
+
+    Never itself raises: exc's own __str__ (invoked by the %-formatting
+    below) or the logging pipeline could misbehave on a malformed
+    exception object, and a safe-response helper must not let that break
+    the response it exists to produce. The safe return string is built
+    FIRST, from `source`/`type(exc).__name__` alone -- neither can raise --
+    so its value never depends on whether logging succeeds. BOTH log
+    attempts below are then individually swallowed; a failure in either one
+    degrades this call to "no operator log line" but never to "no
+    response" or "unsafe response".
+    """
+    safe_message = f"{source} failed ({type(exc).__name__})"
+    try:
+        logger.error("%s failed: %s: %s", source, type(exc).__name__, exc, exc_info=True)
+    except Exception:  # noqa: BLE001
+        try:
+            logger.error("%s failed: %s (unloggable exception detail)", source, type(exc).__name__)
+        except Exception:  # noqa: BLE001
+            pass
+    return safe_message
+
+
 def _envelope(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap `fn` so any exception becomes ``{"error": str(exc)}`` exactly once.
 

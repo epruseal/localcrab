@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._registry import AccessTier, tool
+from ._registry import AccessTier, safe_tool_error, tool
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,7 @@ def ontology_query(
         return response
     except Exception as exc:
         logger.error("ontology_query failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": safe_tool_error("ontology_query", exc)}
 
 
 @tool(
@@ -301,7 +301,7 @@ def ontology_impact(
         return result.to_dict()
     except Exception as exc:
         logger.error("ontology_impact failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": safe_tool_error("ontology_impact", exc)}
 
 
 @tool(
@@ -364,4 +364,4 @@ def ontology_lever_simulate(
         return {"error": str(exc)}
     except Exception as exc:
         logger.error("ontology_lever_simulate failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": safe_tool_error("ontology_lever_simulate", exc)}

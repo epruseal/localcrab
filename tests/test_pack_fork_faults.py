@@ -1166,8 +1166,12 @@ def test_t70_demote_residual_computation_raises_still_returns_wellformed_partial
     out = _fork(stack, principal=ALICE, src_pack_id=src)
     assert out["status"] == "partial", out
     assert out["skipped"]["sources_without_vectors"] == [], out["skipped"]
+    # #168: the recorded entry carries the exception's type name only,
+    # never str(exc) -- "injected T70 surviving_source_ids failure" (the
+    # backend message) must not reach the response verbatim.
     assert any(
-        "injected T70 surviving_source_ids failure" in e for e in out["errors"]["sources"]
+        "sources_without_vectors computation failed" in e and "RuntimeError" in e
+        for e in out["errors"]["sources"]
     ), out["errors"]
     assert out["registry_status_observed"] == "partial", out
     assert out["registry_transition_confirmed"] is True, out

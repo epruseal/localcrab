@@ -24,7 +24,14 @@ from typing import Any
 from opencrab.auth import current_principal
 from opencrab.config import get_settings
 from opencrab.mcp import protocol
-from opencrab.mcp.tools import UnknownToolError, dispatch_tool, tools_for_principal
+from opencrab.mcp.protocol import ProtocolValidationError
+from opencrab.mcp.tools import (
+    ForbiddenArgumentError,
+    UnknownToolError,
+    dispatch_tool,
+    safe_tool_error,
+    tools_for_principal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,15 +174,26 @@ class MCPServer:
                 logger.debug("Ignoring notification for unknown method '%s'", method)
                 return None
             return self._error_response(req_id, METHOD_NOT_FOUND, str(exc))
-        except TypeError as exc:
+        except ProtocolValidationError as exc:
             if is_notification:
                 return None
             return self._error_response(req_id, INVALID_PARAMS, f"Invalid params: {exc}")
+        except LookupError as exc:
+            # #168: an unbound principal (no anonymous fallback, #143) must
+            # produce the SAME error shape here as it does in
+            # `_handle_tools_call` -- a fixed source token ("mcp", not the
+            # per-request method name) so both tools/list and tools/call
+            # yield byte-for-byte identical caller-facing text, never the
+            # bare ContextVar repr `str(exc)` would otherwise expose.
+            logger.exception("Unbound principal handling method '%s'", method)
+            if is_notification:
+                return None
+            return self._error_response(req_id, INTERNAL_ERROR, safe_tool_error("mcp", exc))
         except Exception as exc:
             logger.exception("Internal error handling method '%s': %s", method, exc)
             if is_notification:
                 return None
-            return self._error_response(req_id, INTERNAL_ERROR, str(exc))
+            return self._error_response(req_id, INTERNAL_ERROR, safe_tool_error(method, exc))
 
         # Notifications never get a response, even on success
         if is_notification:
@@ -239,15 +257,23 @@ class MCPServer:
             if is_notification:
                 return None
             return self._error_response(req_id, METHOD_NOT_FOUND, str(exc))
-        except TypeError as exc:
+        except ProtocolValidationError as exc:
             if is_notification:
                 return None
             return self._error_response(req_id, INVALID_PARAMS, f"Invalid params: {exc}")
+        except LookupError as exc:
+            # #168: same fixed-source shape as `handle_request`'s LookupError
+            # branch, so an unbound principal answers identically whichever
+            # era or method (tools/list vs tools/call) hit it.
+            logger.exception("Unbound principal handling modern method '%s'", method)
+            if is_notification:
+                return None
+            return self._error_response(req_id, INTERNAL_ERROR, safe_tool_error("mcp", exc))
         except Exception as exc:
             logger.exception("Internal error handling modern method '%s': %s", method, exc)
             if is_notification:
                 return None
-            return self._error_response(req_id, INTERNAL_ERROR, str(exc))
+            return self._error_response(req_id, INTERNAL_ERROR, safe_tool_error(method, exc))
 
         if is_notification:
             return None
@@ -301,7 +327,7 @@ class MCPServer:
         so any presented cursor is invalid (-32602 via TypeError).
         """
         if params.get("cursor") is not None:
-            raise TypeError(
+            raise ProtocolValidationError(
                 "unknown cursor: this server returns the complete tool list in a single page"
             )
         return {
@@ -324,16 +350,41 @@ class MCPServer:
         # which lives in _handle_tools_call, never in the validator.
         fault = protocol.validate_tools_call_params(params)
         if fault is not None:
-            raise TypeError(fault.message)
+            raise ProtocolValidationError(fault.message)
         name = params["name"]
         arguments = params.get("arguments") or {}
         try:
             result = dispatch_tool(name, arguments)
         except UnknownToolError:
             raise
+        except ForbiddenArgumentError as exc:
+            # #168: a narrow catch of dispatch_tool's own curated exception
+            # type (see its docstring) -- its message names only the
+            # CLIENT'S OWN rejected argument (e.g. "subject_id"), never a
+            # backend value, a path, or an internal repr. Kept unchanged
+            # per design's principle that a narrow catch of a specific,
+            # already-reviewed exception type may keep its own message.
+            result = {"error": str(exc)}
+        except LookupError as exc:
+            if type(exc) is LookupError:
+                # #168: an unbound principal (a BARE LookupError, from
+                # current_principal()'s ContextVar.get()) must produce the
+                # SAME error shape (and the SAME JSON-RPC error envelope) as
+                # tools/list -- never the 200-success `{"error": ...}` shape
+                # below. Re-raise so `_handle_modern`'s dedicated
+                # `except LookupError` branch (fixed source token "mcp")
+                # handles it, instead of this call site's own
+                # `except Exception` wrapping it into a false-success result.
+                raise
+            # A LookupError SUBCLASS (e.g. KeyError) raised by a tool's own
+            # logic is a tool bug, not an unbound principal -- it belongs in
+            # the generic tool-error envelope below, same as
+            # `_handle_tools_call`'s equivalent branch.
+            logger.warning("Tool '%s' raised: %s", name, exc)
+            result = {"error": safe_tool_error(name, exc)}
         except Exception as exc:
             logger.warning("Tool '%s' raised: %s", name, exc)
-            result = {"error": str(exc)}
+            result = {"error": safe_tool_error(name, exc)}
         # isError covers BOTH error channels the handlers use: raising, and
         # returning a top-level {"error": ...} dict without raising (e.g.
         # graph-handler validation failures) -- issue #136 design §4.2.7.
@@ -428,7 +479,7 @@ class MCPServer:
         # flagging the shared validator keeps opencrab/mcp/protocol.py the
         # single strict source for the modern era.
         if not isinstance(params, dict):
-            raise TypeError("params must be an object in tools/call.")
+            raise ProtocolValidationError("params must be an object in tools/call.")
         if (
             "arguments" in params
             and not isinstance(params["arguments"], dict)
@@ -437,9 +488,10 @@ class MCPServer:
             params = {**params, "arguments": {}}
         fault = protocol.validate_tools_call_params(params)
         if fault is not None:
-            # TypeError keeps handle_request's historical -32602 mapping and
-            # its single "Invalid params: " prefix, same as _modern_tools_call.
-            raise TypeError(fault.message)
+            # ProtocolValidationError keeps handle_request's historical
+            # -32602 mapping and its single "Invalid params: " prefix, same
+            # as _modern_tools_call.
+            raise ProtocolValidationError(fault.message)
 
         name = params["name"]
         arguments = params.get("arguments") or {}
@@ -453,9 +505,33 @@ class MCPServer:
             # the generic envelope below instead of being misreported as
             # "method not found".
             raise
+        except ForbiddenArgumentError as exc:
+            # #168: same rationale as `_modern_tools_call`'s equivalent
+            # catch -- a narrow catch of dispatch_tool's own curated
+            # exception type, whose message names only the client's own
+            # rejected argument. Kept unchanged.
+            result = {"error": str(exc)}
+        except LookupError as exc:
+            if type(exc) is LookupError:
+                # #168: same rationale as `_modern_tools_call` -- let an
+                # unbound principal (a BARE LookupError, from
+                # current_principal()'s ContextVar.get()) reach
+                # `handle_request`'s dedicated `except LookupError` branch
+                # (fixed source token "mcp") instead of this call site's own
+                # `except Exception` turning it into a false JSON-RPC
+                # *success* envelope with the raw ContextVar repr inside.
+                raise
+            # A LookupError SUBCLASS (e.g. KeyError) raised by a tool's own
+            # logic is a different problem: a tool bug, not an unbound
+            # principal. Re-raising it would let it fall through
+            # `_dispatch`'s outer `except KeyError` and be misreported as
+            # JSON-RPC METHOD_NOT_FOUND. It belongs in the same generic
+            # tool-error envelope as any other tool exception.
+            logger.warning("Tool '%s' raised: %s", name, exc)
+            result = {"error": safe_tool_error(name, exc)}
         except Exception as exc:
             logger.warning("Tool '%s' raised: %s", name, exc)
-            result = {"error": str(exc)}
+            result = {"error": safe_tool_error(name, exc)}
 
         # MCP content format: wrap result in a content list
         # Use ensure_ascii=True to avoid invalid Unicode surrogates (e.g. from
