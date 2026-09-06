@@ -1064,8 +1064,14 @@ class HybridQuery:
             result["stores"]["chromadb"] = f"ok (id={ids[0]})"
             result["vector_id"] = ids[0]
         except Exception as exc:
-            logger.warning("Ingest to ChromaDB failed: %s", exc)
-            result["stores"]["chromadb"] = f"error: {exc}"
+            # #168: this receipt's stores map flows straight into an MCP
+            # response (pack.py's legacy ingest path, via write_source) --
+            # str(exc) here would put a ChromaDB backend's own error text
+            # there. Full detail goes to the operator log; the caller gets
+            # only the exception's type name, same shape as
+            # source_writer.py's doc-store/vector-store catches.
+            logger.warning("Ingest to ChromaDB failed: %s", exc, exc_info=True)
+            result["stores"]["chromadb"] = f"error: {type(exc).__name__}"
 
         # Doc-store mutations happen outside ingest() today, but vector
         # additions still warrant a BM25 rebuild on the next query because

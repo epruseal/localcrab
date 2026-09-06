@@ -579,7 +579,9 @@ class TestResolvePacksErrorPolicy:
         assert sel.effective_pack_ids == []
         assert sel.selected_packs == []
         assert [w.code for w in sel.warnings] == [AUTO_PACK_FAILED]
-        assert sel.warnings[0].detail == "kaboom"
+        # #168: detail is the exception's type name only, never str(exc) --
+        # "kaboom" (the backend message) must not reach the caller verbatim.
+        assert sel.warnings[0].detail == "RuntimeError"
 
     def test_auto_pack_failure_raises(self, monkeypatch):
         from opencrab.services.pack_selection import resolve_packs

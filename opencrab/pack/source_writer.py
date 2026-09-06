@@ -38,6 +38,7 @@ raising.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -55,6 +56,8 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
     stamp,
 )
+
+logger = logging.getLogger(__name__)
 
 # Sources carry no space of their own, and the FTS space filter drops anything
 # without one. Only the pack ingest path used to fill this in, so REST-ingested
@@ -276,7 +279,15 @@ def write_source(
             created = docs.upsert_source(source_id, text, meta)
             receipt["stores"]["documents"] = f"ok (id={created or source_id})"
         except Exception as exc:  # noqa: BLE001 -- reported, not raised (#158)
-            receipt["stores"]["documents"] = f"error: {exc}"
+            # #168: this receipt's stores map flows straight into an MCP
+            # response (pack.py's legacy ingest path) -- str(exc) here would
+            # put a doc-store backend's own error text there. Full detail
+            # goes to the operator log; the caller gets only the type name.
+            logger.warning(
+                "doc-store upsert_source failed for source_id=%s: %s",
+                source_id, exc, exc_info=True,
+            )
+            receipt["stores"]["documents"] = f"error: {type(exc).__name__}"
             doc_failed = True
     else:
         receipt["stores"]["documents"] = "unavailable"
@@ -300,7 +311,12 @@ def write_source(
     try:
         vector_result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
     except Exception as exc:  # noqa: BLE001 -- store failure, reported (#158)
-        receipt["stores"]["chromadb"] = f"error: {exc}"
+        # #168: same rationale as the doc-store catch above.
+        logger.warning(
+            "vector store ingest failed for source_id=%s: %s",
+            source_id, exc, exc_info=True,
+        )
+        receipt["stores"]["chromadb"] = f"error: {type(exc).__name__}"
         return receipt
     receipt["stores"].update(vector_result.get("stores") or {})
     if "vector_id" in vector_result:
