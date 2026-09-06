@@ -115,7 +115,10 @@ fingerprint를 확인하던 비용이 쿼리 hot path에 실려 있었다(코퍼
   없이 doc_nodes에 쓴 out-of-band 변경을 이 probe가 잡아 백그라운드 재빌드를
   스케줄한다. `LIMIT N`은 `_BM25_NODE_LIMIT`과 일치시켜, 코퍼스가 N을 넘어도 count가
   `BM25Index`(N개만 색인)와 어긋나지 않게 한다.
-- 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐.
+- 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐. 이 콜드 빌드는 질의 스레드의
+  `_bm25_search()`와 백그라운드 워커의 `_rebuild_loop()` 첫 깨어남이라는 두
+  호출부를 갖는데, 둘 다 `_Bm25CacheWorker.ensure_built()`를 거쳐 전용 락으로
+  직렬화된다(#302) — 어느 한쪽만 실제로 빌드하고 나머지는 그 결과를 재사용한다.
 
 ```python
 # opencrab/ontology/query.py
