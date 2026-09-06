@@ -1423,7 +1423,7 @@ class Neo4jStore:
         single relation type.
         """
         self._require_available()
-        if not relations:
+        if not relations or limit <= 0:
             return []
         rel_pattern = "|".join(self._label(relation) for relation in relations)
         arrow = {
@@ -1646,6 +1646,8 @@ class Neo4jStore:
         ``pack_id``/``source``/``source_id``, or the edge's own).
         """
         self._require_available()
+        if limit <= 0:
+            return []
         node_filter = (
             "($pack_id IS NULL OR a.pack_id = $pack_id OR a.source = $pack_id OR a.source_id = $pack_id) "
             "OR ($pack_id IS NULL OR b.pack_id = $pack_id OR b.source = $pack_id OR b.source_id = $pack_id) "

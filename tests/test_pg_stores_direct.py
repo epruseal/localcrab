@@ -396,6 +396,114 @@ class TestPgDocKoreanKeywordSearch:
             _drop_schema(pg_engine, schema)
 
 
+class TestPgDocKeywordSearchLimitContract:
+    """issue #139: ``PgDocStore.keyword_search``'s ``limit <= 0 -> []``
+    guard, same contract as ``_graph_protocol.py``'s ``export_nodes``
+    (issue #120). Instrumented via SQLAlchemy's ``before_cursor_execute``
+    engine event (precedent: ``test_sql_store_upsert_parity.py``'s
+    ``test_executed_sql_uses_on_conflict_do_update``) rather than
+    monkeypatching a connection method directly -- unlike the SQLite leg
+    (``test_local_sql_doc_store.py``'s ``TestKeywordSearchLimitContract``,
+    which spies on ``_new_conn`` because ``sqlite3.Connection`` is an
+    immutable C type), ``PgDocStore`` shares one long-lived SQLAlchemy
+    ``Engine`` (``store._engine is pg_engine``, per this file's own
+    ``PgDocStore(pg_engine, schema=schema)`` construction), so the event
+    fires for every statement any connection checked out of that engine
+    executes -- the natural interception point for this store shape."""
+
+    def test_limit_zero_returns_empty_list(self, pg_engine) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_klz"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            store.upsert_source("s1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
+            assert store.keyword_search("인공지능", pack_ids=["p"], limit=0) == []
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    def test_negative_limit_returns_empty_list(self, pg_engine) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_kln"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            store.upsert_source("s1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
+            assert store.keyword_search("인공지능", pack_ids=["p"], limit=-1) == []
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    def test_limit_zero_never_issues_a_query(self, pg_engine) -> None:
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_klq0"
+        store = PgDocStore(pg_engine, schema=schema)
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        try:
+            store.upsert_source("s1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
+            captured.clear()
+            event.listen(pg_engine, "before_cursor_execute", _capture)
+            try:
+                assert store.keyword_search("인공지능", pack_ids=["p"], limit=0) == []
+            finally:
+                event.remove(pg_engine, "before_cursor_execute", _capture)
+            assert captured == [], f"limit=0 인데도 쿼리가 발행됐다: {captured}"
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    def test_negative_limit_never_issues_a_query(self, pg_engine) -> None:
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_klqn"
+        store = PgDocStore(pg_engine, schema=schema)
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        try:
+            store.upsert_source("s1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
+            captured.clear()
+            event.listen(pg_engine, "before_cursor_execute", _capture)
+            try:
+                assert store.keyword_search("인공지능", pack_ids=["p"], limit=-1) == []
+            finally:
+                event.remove(pg_engine, "before_cursor_execute", _capture)
+            assert captured == [], f"limit=-1 인데도 쿼리가 발행됐다: {captured}"
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+    def test_the_spy_is_not_a_dead_mock_a_real_call_does_issue_a_query(self, pg_engine) -> None:
+        """음성 대조군: 위 두 무쿼리 단언이 항상 통과하는 죽은 스파이가 아님을
+        증명한다 -- 같은 스파이가 유효한 양의 limit 호출에서는 실제로 발화한다."""
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_klok"
+        store = PgDocStore(pg_engine, schema=schema)
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        try:
+            store.upsert_source("s1", "인공지능 연구", {"node_id": "d1", "pack_id": "p"})
+            captured.clear()
+            event.listen(pg_engine, "before_cursor_execute", _capture)
+            try:
+                hits = store.keyword_search("인공지능", pack_ids=["p"], limit=10)
+            finally:
+                event.remove(pg_engine, "before_cursor_execute", _capture)
+            assert {h["source_id"] for h in hits} == {"s1"}
+            assert captured != [], "양의 limit 호출인데도 스파이가 한 번도 안 울렸다"
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+
 # ---------------------------------------------------------------------------
 # issue #82: NaN/Infinity in properties/metadata reached PostgreSQL's
 # ::jsonb CAST unguarded, surfacing as a raw psycopg2.errors.

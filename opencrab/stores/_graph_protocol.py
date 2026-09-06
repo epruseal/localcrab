@@ -628,9 +628,18 @@ class GraphStoreExtended(Protocol):
             row here.
         The ``limit <= 0 -> []`` contract is pinned on exactly the methods
         enumerated below, no more, no less --
-          - ``GraphStoreExtended.export_nodes`` on all 4 graph stores:
-            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared),
-            ``KuzuGraphStore``, ``Neo4jStore``.
+          - ``GraphStoreExtended.export_nodes`` -- implemented (and the
+            ``limit <= 0 -> []`` guard actually runs) on
+            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared)
+            and ``Neo4jStore``. Kuzu is NOT a third implementation here
+            despite the GAP TABLE's "yes" for this row: that "yes" means
+            only that ``KuzuUnavailableGraphStore.__getattr__`` (the class
+            the factory actually returns, per the caveat above the GAP
+            TABLE) makes the call shape reachable and raises a capability
+            exception before any guard logic runs; ``KuzuGraphStore``
+            itself cannot even be instantiated (its ``__init__`` raises
+            unconditionally). Neither class defines ``export_nodes``, so
+            there is no guard to place and none is claimed here.
           - ``list_nodes`` / ``list_sources`` / ``get_audit_log`` on all 4
             doc stores: ``_sql_doc_base.py`` (LocalSQLDocStore + PgDocStore,
             shared), ``MongoStore``, and ``LocalDocStore`` (the legacy
@@ -644,32 +653,59 @@ class GraphStoreExtended(Protocol):
             this is the one covered method that is not "all 4". Guarded by
             issue #86, not by #120, but it is the same contract and belongs
             in this enumeration so the list stays exhaustive.
+          - ``find_by_relations`` / ``export_edges`` (issue #131) -- same
+            two real implementations as ``export_nodes`` above:
+            ``_sql_graph_base.py`` (LocalGraphStore + PGGraphStore, shared)
+            and ``Neo4jStore``. Kuzu excluded for the identical reason:
+            neither method is defined on either Kuzu class, so the
+            unavailable facade's ``__getattr__`` intercepts before any
+            guard could run.
+          - ``keyword_search`` (issue #139) on the 2 doc stores that
+            implement it, separately (NOT shared via ``_sql_doc_base.py``):
+            ``local_sql_doc_store.py`` and ``pg_doc_store.py``.
+            ``MongoStore`` and ``LocalDocStore`` have no ``keyword_search``.
+          - ``sql_store.py``'s ``get_impacts`` (issue #139) -- a single
+            shared Local/PG class outside the graph/doc protocol surface
+            this module otherwise enumerates (it belongs to a different
+            subsystem: impact records, ReBAC policy assignments, lever
+            simulations, per that module's own docstring). Included here
+            as COVERED, not because this issue redefines that module's
+            domain, but because #139 explicitly names this method as a
+            target for the same ``limit <= 0 -> []`` contract.
+          - Five scope-authorized variants that already carry this exact
+            guard, unrelated to this round's changes: ``export_nodes_scoped``,
+            ``export_edges_scoped``, ``find_by_relations_scoped``
+            (``_sql_graph_base.py`` shared base and ``Neo4jStore``, all
+            three), and ``list_nodes_scoped`` / ``list_sources_scoped``
+            (``_sql_doc_base.py`` shared base and ``mongo_store.py``, both).
+            Listed here for completeness of the enumeration; no code
+            change accompanies this bullet.
         Explicitly NOT covered, left as pre-existing/tracked-separately
         gaps rather than silently absorbed into this contract:
-          - other ``limit``-accepting GRAPH-store methods --
-            ``find_neighbors``, ``find_by_relations`` and ``export_edges``
-            (issue #131).
-          - other ``limit``-accepting DOC-store methods --
-            ``keyword_search``, implemented separately (NOT shared via
-            ``_sql_doc_base.py``) in ``local_sql_doc_store.py`` and
-            ``pg_doc_store.py``; ``MongoStore`` and ``LocalDocStore`` have
-            none. Both implementations overfetch
-            ``max(1, limit) * 5`` rows and then append BEFORE testing
-            ``len(out) >= limit``, so ``limit <= 0`` yields 1 row rather
-            than 0 -- the same append-before-check shape as the Kuzu bug
-            #120 fixed, tracked separately. And ``bm25_fingerprint`` on
-            ``_sql_doc_base.py`` (no graph store implements it), which
-            accepts a ``limit`` but never applies it: it is a whole-table
-            ``COUNT(*)`` staleness probe and a capped count would pin
-            forever once the corpus exceeds the cap (#63) -- so a
-            ``limit <= 0 -> []`` guard there would be a regression, not a
-            fix. See its own docstring.
-          - ``sql_store.py``'s ``get_impacts``, the only limit-accepting
-            method outside the graph/doc surface. It binds a negative
-            ``limit`` straight into ``LIMIT :limit`` (unbounded on SQLite),
-            but belongs to a different subsystem per that module's own
-            docstring: "impact records, ReBAC policy assignments, lever
-            simulations".
+          - ``find_neighbors`` on both graph backends. Neither backend
+            satisfies both halves of the contract (result AND
+            no-query-when-guarded): Neo4j's ``find_neighbors`` has no BFS
+            loop at all -- it always issues one Cypher query regardless of
+            ``limit`` (``limit=0`` still queries, just returns 0 rows
+            because Cypher's own ``LIMIT 0`` is valid; ``limit=-1`` is a
+            negative ``LIMIT`` parameter, which Neo4j rejects with a
+            runtime error, not a wrong result). The SQL backends' BFS loop
+            boundary (``while level and len(results) < limit``) does yield
+            ``[]`` for ``limit <= 0`` when neither ``pack_ids`` nor
+            ``spaces`` is passed, but when a non-empty ``pack_ids`` or
+            ``spaces`` argument IS passed, ``_fetch_node_props_by_id`` is
+            already called once before the loop starts -- so the
+            no-query half of the contract still fails whenever a scope
+            argument is non-empty. Tracked as a separate issue (#347)
+            rather than folded into #131/#139's narrower scope; no
+            production code or regression test for ``find_neighbors``
+            changes in this PR.
+          - ``bm25_fingerprint`` on ``_sql_doc_base.py`` (no graph store
+            implements it), which accepts a ``limit`` but never applies
+            it: it is a whole-table ``COUNT(*)`` staleness probe and a
+            capped count would pin forever once the corpus exceeds the cap
+            (#63) -- so a ``limit <= 0 -> []`` guard there would be a
+            regression, not a fix. See its own docstring.
         NOT in the domain at all, so not an exclusion: the vector stores.
         ``ChromaStore``, ``PgVectorStore`` and ``SqliteVecStore`` have no
         ``limit`` parameter anywhere -- they bound top-k with ``n_results``.

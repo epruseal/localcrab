@@ -305,7 +305,12 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
 
         ``pack_ids`` has NO DEFAULT (every authorized caller must supply a
         concrete scope) -- empty ``pack_ids`` returns ``[]`` WITHOUT
-        querying, never "everything". ``include_unpackaged`` is ACCEPTED but
+        querying, never "everything". ``limit <= 0`` (issue #139, same
+        contract as ``_graph_protocol.py``'s ``export_nodes``, issue #120):
+        returns ``[]`` WITHOUT querying, checked ahead of the ``self._conn``
+        access below so a fresh worker thread's first call does not trigger
+        ``_new_conn()``'s ``PRAGMA`` side effects before the guard fires.
+        ``include_unpackaged`` is ACCEPTED but
         IGNORED under this predicate: ``json_truthy_text`` returns SQL NULL
         for a missing/falsy pack_id, and NULL never satisfies ``IN``
         membership on any dialect -- there is no "OR pack_id IS NULL" branch
@@ -328,9 +333,11 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         results, unnoticed" swallow issue #147 §3.4(c) closes for the
         vector/graph legs.
         """
-        if not self._available or not self._fts_ok or not self._conn:
+        if not self._available or not self._fts_ok:
             return []
-        if not pack_ids:
+        if not pack_ids or limit <= 0:
+            return []
+        if not self._conn:
             return []
         import re
 
@@ -349,7 +356,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         pack_frag, transform = self._dialect.in_string_array(pack_expr, "?")
         where_sql += f" AND {pack_frag}"
         params.append(transform(sorted(set(pack_ids))))
-        params.append(max(1, limit))  # avoid binding a non-positive LIMIT
+        params.append(limit)  # limit<=0 already guarded above; always positive here
         rows = self._conn.execute(
             "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
             "bm25(doc_sources_fts) AS rank "

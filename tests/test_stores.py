@@ -220,6 +220,74 @@ class TestSQLStoreUnit:
         assert records[0]["change_type"] == "update"
         assert records[0]["impact"]["triggered"][0]["id"] == "I1"
 
+    def test_get_impacts_limit_zero_returns_empty_list(self, sql_store):
+        """issue #139: 같은 계약을 ``_graph_protocol.py``의 ``export_nodes``
+        (issue #120)에서 그래프/문서 표면 밖의 ``get_impacts``로 확장한다."""
+        sql_store.save_impact("node-001", "update", {"triggered": []})
+        assert sql_store.get_impacts("node-001", limit=0) == []
+
+    def test_get_impacts_negative_limit_returns_empty_list(self, sql_store):
+        sql_store.save_impact("node-001", "update", {"triggered": []})
+        assert sql_store.get_impacts("node-001", limit=-1) == []
+
+    def test_get_impacts_limit_zero_never_issues_a_query(self, sql_store):
+        """``before_cursor_execute`` 계측 (precedent:
+        ``test_sql_store_upsert_parity.py``의
+        ``test_executed_sql_uses_on_conflict_do_update``) -- 결과 단언만으로는
+        확인 안 되는 절반 계약, 즉 가드가 통과가 아니라 쿼리 자체를 막는지를
+        직접 확인한다."""
+        from sqlalchemy import event
+
+        sql_store.save_impact("node-001", "update", {"triggered": []})
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        event.listen(sql_store._engine, "before_cursor_execute", _capture)
+        try:
+            assert sql_store.get_impacts("node-001", limit=0) == []
+        finally:
+            event.remove(sql_store._engine, "before_cursor_execute", _capture)
+        assert captured == [], f"limit=0 인데도 쿼리가 발행됐다: {captured}"
+
+    def test_get_impacts_negative_limit_never_issues_a_query(self, sql_store):
+        from sqlalchemy import event
+
+        sql_store.save_impact("node-001", "update", {"triggered": []})
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        event.listen(sql_store._engine, "before_cursor_execute", _capture)
+        try:
+            assert sql_store.get_impacts("node-001", limit=-1) == []
+        finally:
+            event.remove(sql_store._engine, "before_cursor_execute", _capture)
+        assert captured == [], f"limit=-1 인데도 쿼리가 발행됐다: {captured}"
+
+    def test_get_impacts_spy_is_not_a_dead_mock_a_real_call_does_issue_a_query(
+        self, sql_store
+    ):
+        """음성 대조군: 위 두 무쿼리 단언이 항상 통과하는 죽은 스파이가 아님을
+        증명한다 -- 같은 스파이가 유효한 양의 limit 호출에서는 실제로 발화한다."""
+        from sqlalchemy import event
+
+        sql_store.save_impact("node-001", "update", {"triggered": []})
+        captured: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
+            captured.append(statement)
+
+        event.listen(sql_store._engine, "before_cursor_execute", _capture)
+        try:
+            records = sql_store.get_impacts("node-001", limit=20)
+        finally:
+            event.remove(sql_store._engine, "before_cursor_execute", _capture)
+        assert len(records) == 1
+        assert captured != [], "양의 limit 호출인데도 스파이가 한 번도 안 울렸다"
+
     def test_save_simulation(self, sql_store):
         results = {"lever_id": "lever-001", "predicted_outcome_changes": []}
         row_id = sql_store.save_simulation("lever-001", "raises", 0.8, results)
