@@ -18,6 +18,7 @@ from typing import Any
 
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
+    GraphPropertyValidationError,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
@@ -356,7 +357,13 @@ class OntologyBuilder:
                     )
                 output["stores"]["graph"] = "ok"
                 output["node_data"] = node_props
-            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable):
+            except (
+                NodeIdentityConflict,
+                EdgeIdentityConflict,
+                GraphSchemaMigrationRequired,
+                GraphWriteUnavailable,
+                GraphPropertyValidationError,
+            ):
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)
@@ -665,7 +672,13 @@ class OntologyBuilder:
             try:
                 ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
                 output["stores"]["graph"] = "ok" if ok else "no match"
-            except (NodeIdentityConflict, EdgeIdentityConflict, GraphSchemaMigrationRequired, GraphWriteUnavailable):
+            except (
+                NodeIdentityConflict,
+                EdgeIdentityConflict,
+                GraphSchemaMigrationRequired,
+                GraphWriteUnavailable,
+                GraphPropertyValidationError,
+            ):
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)

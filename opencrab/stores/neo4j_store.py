@@ -22,6 +22,7 @@ from opencrab.common.graph_identity import (
     DryRunMigrationRequest,
     EdgeIdentityConflict,
     EdgeWriteReceipt,
+    GraphPropertyValidationError,
     GraphQueryWriteRejected,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
@@ -387,11 +388,11 @@ class Neo4jStore:
     def _clean_node_properties(raw: Any, node_id: str, node_type: str | None = None) -> dict[str, Any]:
         original = parse_properties_object({} if raw is None else raw)
         if "id" in original and original["id"] != node_id:
-            raise ValueError("reserved graph property")
+            raise GraphPropertyValidationError("reserved graph property")
         if "node_id" in original and original["node_id"] != node_id:
-            raise ValueError("reserved graph property")
+            raise GraphPropertyValidationError("reserved graph property")
         if node_type is not None and "node_type" in original and original["node_type"] != node_type:
-            raise ValueError("reserved graph property")
+            raise GraphPropertyValidationError("reserved graph property")
         props = original
         props.pop("node_id", None)
         props.pop("node_digest", None)
@@ -448,7 +449,7 @@ class Neo4jStore:
     @staticmethod
     def _label(node_type: str) -> str:
         if not isinstance(node_type, str) or not _IDENT_RE.fullmatch(node_type):
-            raise ValueError("graph identity fields must be non-empty strings")
+            raise GraphPropertyValidationError("graph identity fields must be non-empty strings")
         return node_type
 
     @staticmethod
