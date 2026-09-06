@@ -2527,6 +2527,63 @@ def _vec_line(capsys):
     return m.group("backend"), m.group("count")
 
 
+class TestSafeLogFormatHelpers:
+    """이슈 #196 — `_safe_type_name`/`_safe_str` 단위 테스트. 정상·오류·엣지 3종."""
+
+    def test_normal_path_matches_existing_wording(self):
+        """정상 — 기존 `%s`(=`str()`)와 동치, `_safe_type_name`은 인스턴스의 타입명.
+
+        `_safe_type_name(int)`는 `type(int).__name__ == "type"`이 정답이라 여기서는
+        쓰지 않는다 — 인스턴스로 확인한다.
+        """
+        assert pack_load._safe_str(RuntimeError("x")) == "x"
+        assert pack_load._safe_type_name(1) == "int"
+
+    def test_hostile_str_only_object_falls_back_without_raising(self):
+        """오류 — `__str__`만 던지는 객체 → 예외 없이 타입명을 포함한 대체 문자열."""
+        class _HostileStr:
+            def __str__(self):
+                raise RuntimeError("hostile __str__")
+
+        out = pack_load._safe_str(_HostileStr())
+        assert "_HostileStr" in out, f"타입명이 대체 문자열에 없다: {out!r}"
+
+    def test_name_access_raising_metaclass_falls_back_to_placeholder(self):
+        """오류 — `__name__` 접근 자체가 예외를 던지는 메타클래스 → "<식별불가>"."""
+        class _EvilName(type):
+            @property
+            def __name__(cls):
+                raise RuntimeError("hostile __name__ access")
+
+        class _Victim(metaclass=_EvilName):
+            pass
+
+        assert pack_load._safe_type_name(_Victim()) == "<식별불가>"
+
+    def test_name_returns_non_str_hostile_object_is_not_leaked(self):
+        """엣지 — `__name__` 접근은 성공하지만 반환값이 `str`이 아닌 적대적 객체이고
+        그 객체의 `__str__`도 던지는 경우 → 그대로 반환하지 않고 "<식별불가>"로 떨어진다
+        (적대 검증 지적 #1 — 이 값을 그대로 돌리면 나중에 재포맷 자리에서 소실이 재발한다).
+        """
+        class _HostileNameValue:
+            def __str__(self):
+                raise RuntimeError("hostile __str__ on fake name")
+
+        class _EvilName(type):
+            @property
+            def __name__(cls):
+                return _HostileNameValue()
+
+        class _Victim(metaclass=_EvilName):
+            pass
+
+        victim = _Victim()
+        assert pack_load._safe_type_name(victim) == "<식별불가>"
+        # `_safe_str` 도 같은 객체에 대해 예외 없이 대체 문자열을 낸다.
+        out = pack_load._safe_str(victim)
+        assert "str 실패" in out or "<" in out, f"대체 문자열 형태가 아니다: {out!r}"
+
+
 class TestDeletePackVectorCountIsConfirmedNotRequested:
     """`delete_pack` 의 벡터 삭제 카운트는 **확인된 수**여야 한다 (#165).
 
@@ -3127,6 +3184,93 @@ class TestDeletePackSummaryNamesTheActualBackend:
             rendered.append(r.getMessage())        # 실제 렌더링까지 해본다
         assert any(needle in m for m in rendered), (
             f"사유 로그가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
+
+    def test_unsupported_backend_name_access_raising_is_absorbed(self, live, caplog):
+        """G33 — 미지원 백엔드(`available=True`, kind 판별 불가) + `__name__` 접근
+        자체가 예외를 던지는 메타클래스. 수정 전: 그 예외가 바깥 `except`로 흘러가
+        "미지원 백엔드" 경고 대신 "벡터 delete 오류"로 뒤바뀐다(G30과 같은 연쇄).
+        수정 후: `_safe_type_name`이 흡수해 "미지원 백엔드" 경고가 그 자리에서
+        정상 발생한다.
+        """
+        class _EvilName(type):
+            @property
+            def __name__(cls):
+                raise RuntimeError("hostile __name__ access")
+
+        class _UnsupportedVec(metaclass=_EvilName):
+            available = True
+
+        _builder, graph, docs = live
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack(
+                "pack-a", graph, docs, _UnsupportedVec())
+
+        assert chunk_vec_del == 0, "미지원 백엔드는 0건 삭제로 흡수된다"
+        rendered = [r.getMessage() for r in caplog.records]
+        assert any("미지원 백엔드" in m for m in rendered), (
+            f"미지원 백엔드 경고가 다른 경고로 뒤바뀌었다 — 남은 기록: {rendered}")
+
+    def test_unsupported_backend_non_str_name_does_not_lose_the_record(self, live, caplog):
+        """G33b — 위와 같되 `__name__`이 예외 없이 **str 아닌 적대적 객체**(그 객체의
+        `__str__`도 던짐)를 돌려주는 변형. 수정 전: `type(vec).__name__` 평가는
+        성공하지만 그 반환값이 로그 인자로 들어가 포맷 단계(`msg % args`)에서 실패해
+        레코드 자체가 사라진다. 수정 후: `_safe_type_name`이 타입 검사로 걸러내
+        "<식별불가>"로 대체돼 레코드가 정상 렌더링된다.
+        """
+        class _HostileNameValue:
+            def __str__(self):
+                raise RuntimeError("hostile __str__ on fake name")
+
+        class _EvilName(type):
+            @property
+            def __name__(cls):
+                return _HostileNameValue()
+
+        class _UnsupportedVec(metaclass=_EvilName):
+            available = True
+
+        _builder, graph, docs = live
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack(
+                "pack-a", graph, docs, _UnsupportedVec())
+
+        assert chunk_vec_del == 0, "미지원 백엔드는 0건 삭제로 흡수된다"
+        rendered = []
+        for r in caplog.records:
+            rendered.append(r.getMessage())        # 실제 렌더링까지 해본다 — 여기서
+            # `type(vec).__name__`을 그대로 넘겼다면 이 호출 자체가 터진다.
+        assert any("미지원 백엔드" in m for m in rendered), (
+            f"경고 레코드가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
+
+    def test_outer_exception_hostile_str_does_not_lose_the_record(self, live, caplog):
+        """G34 — `_conn` 판별 프로퍼티가 `__str__`/`__repr__` 모두 던지는 예외
+        인스턴스를 던지는 vec. 바깥 `except Exception as e:`가 그 예외를 원시로
+        포맷하면(수정 전) 포맷 단계에서 실패해 "벡터 delete 오류" 경고 레코드
+        자체가 사라진다. 수정 후: `_safe_str`이 흡수해 경고가 정상 렌더링된다.
+        """
+        class _HostileError(RuntimeError):
+            def __str__(self):
+                raise RuntimeError("hostile __str__ on exception")
+
+            def __repr__(self):
+                raise RuntimeError("hostile __repr__ on exception")
+
+        class _ExplodingHostileVec:
+            available = True
+
+            @property
+            def _conn(self):
+                raise _HostileError("simulated discrimination failure")
+
+        _builder, graph, docs = live
+        with caplog.at_level(logging.WARNING):
+            _n, _c, chunk_vec_del = pack_load.delete_pack(
+                "pack-a", graph, docs, _ExplodingHostileVec())
+
+        assert chunk_vec_del == 0, "판별 실패는 현행대로 흡수 + 0건이다"
+        rendered = [r.getMessage() for r in caplog.records]  # 실제 렌더링까지 해본다
+        assert any("벡터 delete 오류" in m for m in rendered), (
+            f"오류 경고 레코드가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
 
     def test_discrimination_failure_is_absorbed_and_labelled(self, live, capsys):
         """G23 — 판별 자체가 예외여도 밖으로 안 새고, 표기는 판별 결과를 따른다."""
