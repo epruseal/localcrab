@@ -791,8 +791,20 @@ class HybridQuery:
         """
         Remove results the subject cannot view.
 
-        Uses ReBAC 'view' permission check. Nodes with no registered policy
-        are passed through (open by default).
+        Uses ReBAC 'view' permission check. A result with no node ID is not
+        policy-checked and always passes through (pre-existing, out of
+        scope for #288 -- see test_item_without_node_id_passes_through).
+        For a result with a node ID, a denial drops it, and so does a
+        policy evaluation that raises: only an explicit grant
+        (``decision.granted is True``) passes it through.
+
+        Failure contract (#288): policy evaluation -- the rebac.check()
+        call and reading its decision -- is a fail-closed boundary here,
+        matching ReBACEngine.check's own contract (#78). If it raises, the
+        result is dropped like an explicit deny. The WARNING names the
+        exception type and the subject/permission/resource identifiers
+        only; the full traceback is logged at DEBUG, because the exception
+        text can carry a DSN or a server message.
         """
         filtered = []
         for item in results:
@@ -806,15 +818,24 @@ class HybridQuery:
                     permission="view",
                     resource_id=nid,
                 )
-                if decision.granted:
-                    filtered.append(item)
-                else:
-                    logger.debug(
-                        "Policy filter: %s denied view on %s", subject_id, nid
-                    )
-            except Exception:
-                # No policy registered = pass through
+                granted = decision.granted is True
+            except Exception as exc:
+                logger.warning(
+                    "Policy filter: policy evaluation failed with %s for "
+                    "subject=%s permission=view resource=%s; default deny "
+                    "applied (fail-closed).",
+                    type(exc).__name__, subject_id, nid,
+                )
+                logger.debug(
+                    "Policy filter policy evaluation traceback", exc_info=exc
+                )
+                continue
+            if granted:
                 filtered.append(item)
+            else:
+                logger.debug(
+                    "Policy filter: %s denied view on %s", subject_id, nid
+                )
         return filtered
 
     def _vector_search(

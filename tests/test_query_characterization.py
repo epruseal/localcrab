@@ -19,10 +19,13 @@ so no daemon thread outlives its test.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from opencrab.ontology.query import (
     HybridQuery,
@@ -393,12 +396,82 @@ class TestPolicyFilter:
         filtered = hybrid._policy_filter(results, "user1")
         assert [r["node_id"] for r in filtered] == ["n1"]
 
-    def test_no_policy_registered_passes_through(self) -> None:
+    def test_rebac_check_exception_denies_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#288: a rebac.check() failure must deny, not pass through.
+
+        The old characterization test modeled a raising check() as "no
+        policy registered" and asserted pass-through -- that is the bug
+        this issue fixes, not a contract. This test mixes a raising item
+        with a granted and a denied item so it also proves an exception
+        on one item does not abort the rest of the list (regression
+        surfaced during design review of #288: an earlier draft narrowed
+        the try to just the check() call and left decision.granted
+        access outside it, which let a malformed decision's
+        AttributeError escape and abort the whole filter).
+        """
         hybrid = _inert_hybrid()
         hybrid._rebac = MagicMock()
-        hybrid._rebac.check = MagicMock(side_effect=RuntimeError("no policy"))
+        exc = RuntimeError("no policy")
+
+        def _check(subject_id: str, permission: str, resource_id: str):
+            if resource_id == "n_exc":
+                raise exc
+            return SimpleNamespace(granted=(resource_id == "n1"))
+
+        hybrid._rebac.check = MagicMock(side_effect=_check)
+        results = [{"node_id": "n_exc"}, {"node_id": "n1"}, {"node_id": "n2"}]
+
+        with caplog.at_level(logging.DEBUG, logger="opencrab.ontology.query"):
+            filtered = hybrid._policy_filter(results, "user1")
+
+        # n_exc dropped (fail-closed), n1 kept (granted), n2 dropped (denied,
+        # unrelated to the exception path) -- processing continues past the
+        # exception instead of aborting.
+        assert [r["node_id"] for r in filtered] == ["n1"]
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == "opencrab.ontology.query" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        for needle in ("RuntimeError", "subject=user1", "permission=view", "resource=n_exc"):
+            assert needle in msg, msg
+        assert "no policy" not in msg  # exception text must not leak to WARNING
+
+        debug_with_tb = [
+            r for r in caplog.records
+            if r.name == "opencrab.ontology.query" and r.exc_info
+        ]
+        assert any(r.exc_info[1] is exc for r in debug_with_tb)
+
+    def test_malformed_decision_denies_without_aborting(self) -> None:
+        """#288 design review finding: a decision object missing .granted
+        must be denied and isolated to its own item, not propagate an
+        AttributeError that aborts the rest of the filter."""
+        hybrid = _inert_hybrid()
+        hybrid._rebac = MagicMock()
+
+        def _check(subject_id: str, permission: str, resource_id: str):
+            if resource_id == "n_bad":
+                return object()  # no .granted attribute
+            return SimpleNamespace(granted=(resource_id == "n1"))
+
+        hybrid._rebac.check = MagicMock(side_effect=_check)
+        results = [{"node_id": "n_bad"}, {"node_id": "n1"}]
+        filtered = hybrid._policy_filter(results, "user1")
+        assert [r["node_id"] for r in filtered] == ["n1"]
+
+    def test_non_bool_truthy_granted_denies(self) -> None:
+        """#288 design review finding: granted must be compared with
+        `is True`, not truthiness, so a non-bool truthy value denies."""
+        hybrid = _inert_hybrid()
+        hybrid._rebac = MagicMock()
+        hybrid._rebac.check = MagicMock(return_value=SimpleNamespace(granted="yes"))
         results = [{"node_id": "n1"}]
-        assert hybrid._policy_filter(results, "user1") == results
+        assert hybrid._policy_filter(results, "user1") == []
 
 
 # ---------------------------------------------------------------------------
