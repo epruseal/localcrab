@@ -275,6 +275,116 @@ class TestExportNodesLimitContract:
 
 
 # ---------------------------------------------------------------------------
+# issue #131: export_edges' guard was MISSING entirely on the SQL shared
+# base and on Neo4jStore before this round (unlike export_nodes, which #120
+# already fixed). Both now check ``limit <= 0`` immediately after
+# ``self._require_available()``, before any table/SQL construction --
+# mirrors ``export_edges_scoped``'s pre-existing, already-correct guard
+# placement. ``_fetch_all`` is monkeypatched (same pattern as
+# ``test_doc_sources_scoped.py``) to prove no query is issued, not merely
+# that the result happens to be empty.
+# ---------------------------------------------------------------------------
+
+
+class TestExportEdgesLimitContract:
+    def test_limit_zero_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+
+        assert store.export_edges(limit=0) == []
+
+    def test_negative_limit_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+
+        assert store.export_edges(limit=-1) == []
+
+    def test_limit_zero_returns_empty_list_without_querying(self, backend, monkeypatch):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.export_edges(limit=0) == []
+        assert calls == []
+
+    def test_negative_limit_returns_empty_list_without_querying(self, backend, monkeypatch):
+        _name, store = backend
+        store.upsert_node("Doc", "a0", {})
+        store.upsert_node("Doc", "a1", {})
+        store.upsert_edge("Doc", "a0", "rel", "Doc", "a1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.export_edges(limit=-1) == []
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# issue #131: find_by_relations had the same missing-guard defect as
+# export_edges above. Spying on ``_fetch_all`` alone is sufficient even
+# though ``find_by_relations`` also calls ``get_node`` (which uses
+# ``_fetch_one``, not ``_fetch_all``) per matched row: if ``_fetch_all``
+# returns 0 calls, no relation rows exist to iterate, so ``get_node`` /
+# ``_fetch_one`` cannot execute either.
+# ---------------------------------------------------------------------------
+
+
+class TestFindByRelationsLimitContract:
+    def test_limit_zero_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Lever", "lv1", {})
+        store.upsert_node("Outcome", "o1", {})
+        store.upsert_edge("Lever", "lv1", "raises", "Outcome", "o1", {})
+
+        assert store.find_by_relations("lv1", ["raises"], "out", 0) == []
+
+    def test_negative_limit_returns_empty_list(self, backend):
+        _name, store = backend
+        store.upsert_node("Lever", "lv1", {})
+        store.upsert_node("Outcome", "o1", {})
+        store.upsert_edge("Lever", "lv1", "raises", "Outcome", "o1", {})
+
+        assert store.find_by_relations("lv1", ["raises"], "out", -1) == []
+
+    def test_limit_zero_returns_empty_list_without_querying(self, backend, monkeypatch):
+        _name, store = backend
+        store.upsert_node("Lever", "lv1", {})
+        store.upsert_node("Outcome", "o1", {})
+        store.upsert_edge("Lever", "lv1", "raises", "Outcome", "o1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.find_by_relations("lv1", ["raises"], "out", 0) == []
+        assert calls == []
+
+    def test_negative_limit_returns_empty_list_without_querying(self, backend, monkeypatch):
+        _name, store = backend
+        store.upsert_node("Lever", "lv1", {})
+        store.upsert_node("Outcome", "o1", {})
+        store.upsert_edge("Lever", "lv1", "raises", "Outcome", "o1", {})
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.find_by_relations("lv1", ["raises"], "out", -1) == []
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # Normal — Neo4j's 7 newly-implemented extended methods (mocked session)
 # ---------------------------------------------------------------------------
 
@@ -545,6 +655,39 @@ class TestExtendedMethodsNeo4jEdge:
         mock_session.run.reset_mock()
 
         assert store.export_nodes(limit=-1) == []
+        mock_session.run.assert_not_called()
+
+    def test_export_edges_limit_zero_returns_empty_list_without_querying(self):
+        """issue #131: export_edges had no ``limit <= 0`` guard at all on
+        Neo4jStore before this round -- same "no query issued" proof as
+        export_nodes above, since Neo4j's LIMIT is a raw Cypher literal."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_edges(limit=0) == []
+        mock_session.run.assert_not_called()
+
+    def test_export_edges_negative_limit_returns_empty_list_without_querying(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.export_edges(limit=-1) == []
+        mock_session.run.assert_not_called()
+
+    def test_find_by_relations_limit_zero_returns_empty_list_without_querying(self):
+        """issue #131: find_by_relations had no ``limit <= 0`` guard at all
+        on Neo4jStore before this round."""
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.find_by_relations("lv1", ["raises"], "out", 0) == []
+        mock_session.run.assert_not_called()
+
+    def test_find_by_relations_negative_limit_returns_empty_list_without_querying(self):
+        store, _driver, mock_session = _make_connected_neo4j()
+        mock_session.run.reset_mock()
+
+        assert store.find_by_relations("lv1", ["raises"], "out", -1) == []
         mock_session.run.assert_not_called()
 
     def test_upsert_nodes_batch_empty_list_returns_zero(self):

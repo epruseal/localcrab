@@ -357,6 +357,88 @@ class TestSource:
         assert store.list_sources(limit=-1) == []
 
 
+# ---------------------------------------------------------------------------
+# issue #139: keyword_search's guard-ORDER defect. The old single guard line
+# (``if not self._available or not self._fts_ok or not self._conn: return
+# []``) evaluated ``self._conn`` -- which lazily creates a fresh thread's
+# connection via ``_new_conn()`` (WAL/synchronous PRAGMAs) -- BEFORE the
+# ``pack_ids``/``limit`` check that is supposed to guarantee no query is
+# issued at all. The fix splits the guard into three sequential lines, with
+# ``pack_ids``/``limit`` checked ahead of the ``self._conn`` access.
+#
+# ``sqlite3.Connection`` is an immutable C type (can't monkeypatch its
+# ``execute`` -- see ``_FTSFailProxy``'s docstring below and
+# ``_sqlite_base.py``'s ``_exec`` docstring for the same limitation), so
+# these tests instead spy on ``_new_conn()`` itself -- the method whose
+# PRAGMA side effects are the thing the guard-order fix must prevent from
+# running at all on a fresh thread. Setting ``store._local.conn = None``
+# reproduces "fresh thread, no connection yet" on the current thread without
+# needing an actual ``threading.Thread``.
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordSearchLimitContract:
+    def test_limit_zero_returns_empty_list(self, store):
+        store.upsert_source("s0", "keyword text", {"pack_id": "packA"})
+        assert store.keyword_search("keyword", pack_ids=["packA"], limit=0) == []
+
+    def test_negative_limit_returns_empty_list(self, store):
+        store.upsert_source("s0", "keyword text", {"pack_id": "packA"})
+        assert store.keyword_search("keyword", pack_ids=["packA"], limit=-1) == []
+
+    def test_empty_pack_ids_returns_empty_list(self, store):
+        store.upsert_source("s0", "keyword text", {"pack_id": "packA"})
+        assert store.keyword_search("keyword", pack_ids=[], limit=20) == []
+
+    def test_limit_zero_on_a_fresh_thread_never_creates_a_connection(self, store, monkeypatch):
+        """The instrumentation itself, not a formality: this is the sole
+        proof that the guard-order fix actually prevents ``_new_conn()``
+        from running on a fresh thread's first call -- if the guard were
+        reordered back after the ``self._conn`` access, this test would
+        catch it (verified by mutation: temporarily reverting the guard
+        order makes ``new_conn_calls`` go from 0 to 1)."""
+        new_conn_calls = []
+        real_new_conn = store._new_conn
+        monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+        store._local.conn = None  # simulate a fresh thread: no connection yet
+
+        assert store.keyword_search("keyword", pack_ids=["packA"], limit=0) == []
+        assert new_conn_calls == []
+
+    def test_negative_limit_on_a_fresh_thread_never_creates_a_connection(self, store, monkeypatch):
+        new_conn_calls = []
+        real_new_conn = store._new_conn
+        monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+        store._local.conn = None
+
+        assert store.keyword_search("keyword", pack_ids=["packA"], limit=-1) == []
+        assert new_conn_calls == []
+
+    def test_empty_pack_ids_on_a_fresh_thread_never_creates_a_connection(self, store, monkeypatch):
+        new_conn_calls = []
+        real_new_conn = store._new_conn
+        monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+        store._local.conn = None
+
+        assert store.keyword_search("keyword", pack_ids=[], limit=20) == []
+        assert new_conn_calls == []
+
+    def test_the_spy_is_not_a_dead_mock_a_real_call_does_create_a_connection(self, store, monkeypatch):
+        """Negative control for the three tests above: with a valid,
+        non-empty ``pack_ids`` and a positive ``limit`` on a fresh thread,
+        the same spy DOES observe a ``_new_conn()`` call -- proving the spy
+        actually intercepts, rather than being wired to something that never
+        fires either way."""
+        store.upsert_source("s0", "keyword text", {"pack_id": "packA"})
+        new_conn_calls = []
+        real_new_conn = store._new_conn
+        monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+        store._local.conn = None
+
+        store.keyword_search("keyword", pack_ids=["packA"], limit=20)
+        assert new_conn_calls == [1]
+
+
 class _FTSFailProxy:
     """sqlite3.Connection is an immutable C type (can't monkeypatch its
     execute directly), so this thin proxy stands in for the thread-local

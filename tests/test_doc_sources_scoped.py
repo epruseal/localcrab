@@ -192,6 +192,11 @@ class TestListSourcesScopedMongo:
         assert store.list_sources_scoped([PACK_A], limit=0) == []
         collection.find.assert_not_called()
 
+    def test_negative_limit_never_queries(self):
+        store, collection = self._store([])
+        assert store.list_sources_scoped([PACK_A], limit=-1) == []
+        collection.find.assert_not_called()
+
     def test_unavailable_store_raises(self):
         from opencrab.stores.mongo_store import MongoStore
 
@@ -199,3 +204,107 @@ class TestListSourcesScopedMongo:
         store._available = False
         with pytest.raises(RuntimeError, match="not available"):
             store.list_sources_scoped([PACK_A], limit=10)
+
+
+# ---------------------------------------------------------------------------
+# list_nodes_scoped (issue #139 round: pre-existing gap-fill, not a new
+# guard -- `_sql_doc_base.py`'s `list_nodes_scoped` has carried its
+# `not pack_ids or limit <= 0 -> []` guard since the #120 follow-up, but no
+# test in this repo exercised it before now. Local-only: no PG fixture
+# exists anywhere in this file (see the module docstring's own SQL fixture,
+# which is `tmp_path`-based), so even the pre-existing
+# `TestListSourcesScopedSql` class above has never run its PG leg either --
+# this is a pre-existing gap, not one this PR introduces, and PG-fixture
+# creation for this file is out of this PR's narrow scope.
+# ---------------------------------------------------------------------------
+
+
+def _node(store, node_id: str, pack_id: str, space: str = "default") -> None:
+    store.upsert_node_doc(space, "Doc", node_id, {"pack_id": pack_id})
+
+
+class TestListNodesScopedSql:
+    def test_returns_only_nodes_for_the_requested_packs(self, store):
+        _node(store, "a1", PACK_A)
+        _node(store, "a2", PACK_A)
+        _node(store, "b1", PACK_B)
+
+        got_a = {n["node_id"] for n in store.list_nodes_scoped([PACK_A], limit=100)}
+        assert got_a == {"a1", "a2"}
+
+        got_both = {
+            n["node_id"] for n in store.list_nodes_scoped([PACK_A, PACK_B], limit=100)
+        }
+        assert got_both == {"a1", "a2", "b1"}
+
+    def test_empty_pack_ids_returns_empty_without_querying(self, store, monkeypatch):
+        _node(store, "a1", PACK_A)
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.list_nodes_scoped([], limit=100) == []
+        assert calls == []
+
+    def test_limit_zero_or_negative_returns_empty_without_querying(self, store, monkeypatch):
+        _node(store, "a1", PACK_A)
+        calls = []
+        monkeypatch.setattr(
+            store, "_fetch_all", lambda sql, params: calls.append((sql, params)) or []
+        )
+
+        assert store.list_nodes_scoped([PACK_A], limit=0) == []
+        assert store.list_nodes_scoped([PACK_A], limit=-1) == []
+        assert calls == []
+
+    def test_unavailable_store_raises(self, tmp_path):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        s = LocalSQLDocStore(str(tmp_path / "dead3.db"))
+        s._available = False
+        with pytest.raises(RuntimeError, match="not available"):
+            s.list_nodes_scoped([PACK_A], limit=100)
+
+
+class TestListNodesScopedMongo:
+    """Same collection-double approach as `TestListSourcesScopedMongo` above
+    and as `test_read_scope_isolation.py::TestMongoDocStoreScoping` (that
+    class already pins the pack-filter query shape for `list_nodes_scoped`;
+    this class only adds the `limit <= 0` no-query coverage that neither
+    file had before now)."""
+
+    def _store(self, rows):
+        from opencrab.stores.mongo_store import MongoStore
+
+        store = MongoStore.__new__(MongoStore)
+        store._available = True
+        cursor = MagicMock()
+        cursor.limit.return_value = rows
+        collection = MagicMock()
+        collection.find.return_value = cursor
+        store._db = {"nodes": collection}
+        return store, collection
+
+    def test_empty_scope_never_queries(self):
+        store, collection = self._store([])
+        assert store.list_nodes_scoped([], limit=10) == []
+        collection.find.assert_not_called()
+
+    def test_limit_zero_never_queries(self):
+        store, collection = self._store([])
+        assert store.list_nodes_scoped([PACK_A], limit=0) == []
+        collection.find.assert_not_called()
+
+    def test_negative_limit_never_queries(self):
+        store, collection = self._store([])
+        assert store.list_nodes_scoped([PACK_A], limit=-1) == []
+        collection.find.assert_not_called()
+
+    def test_unavailable_store_raises(self):
+        from opencrab.stores.mongo_store import MongoStore
+
+        store = MongoStore.__new__(MongoStore)
+        store._available = False
+        with pytest.raises(RuntimeError, match="not available"):
+            store.list_nodes_scoped([PACK_A], limit=10)
