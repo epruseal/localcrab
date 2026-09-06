@@ -77,6 +77,7 @@ from ._registry import AccessTier as AccessTier
 from ._registry import ForbiddenArgumentError as ForbiddenArgumentError
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
+from ._registry import safe_tool_error as safe_tool_error
 from ._registry import tools_for_principal as tools_for_principal
 
 logger = logging.getLogger(__name__)

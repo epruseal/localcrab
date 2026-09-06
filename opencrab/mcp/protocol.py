@@ -66,6 +66,23 @@ class ProtocolFault:
     data: dict[str, Any] | None = None
 
 
+class ProtocolValidationError(TypeError):
+    """A ``TypeError`` whose message this codebase authored itself.
+
+    #168: ``opencrab/mcp/server.py`` maps a bare ``TypeError`` to a
+    JSON-RPC -32602 response carrying ``str(exc)`` verbatim -- safe ONLY
+    when the raise site is one of this module's own validators (a fixed
+    string, or a ``ProtocolFault.message`` this codebase built), never a
+    ``TypeError`` an unrelated bug happens to raise with an object repr or
+    other internal detail in its args. Raising THIS subclass (never a bare
+    ``TypeError``) at every protocol-validation call site lets the server's
+    exception handling tell the two apart: a caught ``ProtocolValidationError``
+    keeps the historical -32602 mapping and exact message text, while any
+    other ``TypeError`` falls through to the generic handler and gets
+    ``safe_tool_error()``'s treatment instead of its own ``str(exc)``.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Configured version gates
 # ---------------------------------------------------------------------------

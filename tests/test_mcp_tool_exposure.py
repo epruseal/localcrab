@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from opencrab.auth import Principal, current_principal, principal_scope
-from opencrab.mcp.server import MCPServer
+from opencrab.mcp.server import INTERNAL_ERROR, MCPServer
 from opencrab.mcp.tools import (
     ForbiddenArgumentError,
     UnknownToolError,
@@ -339,25 +339,29 @@ class TestFourDispatchStatesExactCodesAndBodies:
         """No principal_scope() open at all -- current_principal() raises a
         bare LookupError (#150 v3 D4: dispatch_tool now resolves the
         principal before anything else, so this fires before the name is
-        even looked up). ``_handle_tools_call`` re-raises ONLY
-        UnknownToolError specially (see its docstring) -- any other
-        exception, LookupError included, falls into the SAME generic
-        tool-exception envelope every other handler-level failure gets:
-        HTTP-level JSON-RPC success (no top-level "error"), with
-        ``{"error": str(exc)}`` inside ``result.content``. This is
-        unchanged, pre-existing ``_handle_tools_call`` behavior -- #150 v3
-        touched dispatch_tool's internal ordering, not this catch-all.
-        Contrast tools/list, which has no such catch-all and DOES surface
-        an unbound principal as INTERNAL_ERROR (see
-        TestMCPServerToolsListScoping.test_tools_list_with_no_bound_principal_fails_closed
-        above) -- the two methods are not symmetric here, and only
-        tools/list's asymmetry is INTERNAL_ERROR."""
-        import json
+        even looked up).
 
+        #168: before this fix, ``_handle_tools_call``'s dispatch_tool catch
+        absorbed this LookupError into the SAME generic tool-exception
+        envelope every other handler-level failure gets -- a JSON-RPC
+        SUCCESS response (no top-level "error") whose `result.content`
+        secretly encoded a failure, while ``tools/list`` (no such catch-all)
+        surfaced the identical unbound-principal state as a proper
+        JSON-RPC INTERNAL_ERROR. That asymmetry is what this issue closes:
+        an explicit `except LookupError: raise` now sits in
+        ``_handle_tools_call``'s (and ``_modern_tools_call``'s) inner
+        dispatch_tool try/except, so the LookupError escapes to the outer
+        handler instead of being wrapped into a false 200-success envelope.
+        The outer handler's own `except LookupError` then returns the SAME
+        JSON-RPC INTERNAL_ERROR shape ``tools/list`` already used, with
+        message exactly ``safe_tool_error("mcp", exc)`` ==
+        ``"mcp failed (LookupError)"`` -- matching
+        TestMCPServerToolsListScoping.test_tools_list_with_no_bound_principal_fails_closed
+        exactly. The two methods are symmetric now."""
         response = self._call(server, "ontology_manifest")
-        assert "error" not in response
-        content = json.loads(response["result"]["content"][0]["text"])
-        assert "error" in content
+        assert response["error"]["code"] == INTERNAL_ERROR
+        assert response["error"]["message"] == "mcp failed (LookupError)"
+        assert "result" not in response
 
     def test_unbound_principal_beats_name_lookup_for_an_unregistered_name(self):
         """#150 v3 D4, the distinguishing case: dispatch_tool resolves the
