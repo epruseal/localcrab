@@ -493,8 +493,10 @@ def ontology_list_nodes(
     a breaking change, just a fact worth recording for anyone who observed
     it.)
 
-    ``limit <= 0`` (issue #120): returns ``[]`` (and ``total`` is then
-    ``0`` too, via the same guard in ``count_exported_nodes_scoped``).
+    ``limit <= 0`` (issue #120): ``export_nodes_scoped`` returns ``[]`` for
+    the page, but ``total`` is UNAFFECTED -- ``count_exported_nodes_scoped``
+    takes no ``limit`` argument at all, so it still reports the true match
+    count even when the caller asked for zero rows back.
 
     SNAPSHOT CONSISTENCY (audit finding #54-[6]): count_exported_nodes and
     export_nodes are two separate queries, not wrapped in one transaction/
