@@ -4,8 +4,10 @@
 트랜잭션이 없다). 중간에 죽으면 부분 삭제가 남는데, 그 상태를 "이전 중단의 잔재" 로
 식별해 완주하거나 명시 중단할 계약이 없었다 — 이 파일이 그 계약을 고정한다.
 
-설계 원문은 스크래치(`design-v5.md`, 5라운드 codex 검증 대상)에 있고, 팀리드가 직접
-재정한 두 핵심 결정은 다음과 같다(이 파일 전체가 그 결정을 전제한다):
+설계 원문은 스크래치(`design-v5.md`, 5라운드 codex 검증 대상)에 있다. 5라운드 검증이
+"팩 동일성의 PK 기반 자동 재개 증명"(v5 §3)을 반례로 깨자, 팀리드가 재정으로 그
+자동 재개 자체를 이번 범위에서 들어냈다 — **모든 재개는 운영자의 명시 확인을
+요구한다.** 이 파일은 그 재정을 그대로 고정한다:
 
   1. 크래시를 가로지르는 **정확한 누적 삭제 건수 복원은 요구하지 않는다.** 재개
      실행은 이번 실행에서 확인한 건수만 내고, 이전 중단 실행의 건수는 "알 수 없음"
@@ -14,10 +16,19 @@
      그것을 "이미 실행됨" 의 근거로 쓰지 않는다 — graph 삭제 루프가 노드별 예외를
      삼키고 진행하므로, 크래시 없이 정상 종료해도 일부만 지워진 채 `count` 가
      채워질 수 있기 때문이다(§8-4/§9(b)).
-  3. 팩 동일성 확인은 `packs` 레지스트리 행의 **PK 기반 생존**을 안전 증명으로
-     쓴다(§3) — `created_at` 같은 초 단위 약한 신호에 기대지 않는다. 저널 생성
-     시점에 행이 있었고 재개 시점에도 그대로 있으면 자동 재개, 그렇지 않으면(행이
-     없었거나/사라졌거나/식별 불가) 명시 중단한다.
+  3. **기본 동작은 탐지와 보고다.** 저널이 있으면 재실행은 부분 완료 상태를
+     읽어서 보고하고 멈춘다 — 스토어를 전혀 건드리지 않는다(`DeletePackJournalPending`).
+     보고에는 축별 done/pending 상태, 지금 살아 있는 라이브 카운트
+     (`pack_live_counts` 재사용), 그리고 "저널 생성 이후 새 콘텐츠가 들어왔을 수
+     있고 재개는 그것도 지운다" 는 창(window) 경고가 담긴다.
+  4. **명시 플래그(`resume=True`)가 있을 때만 완주한다.** 운영자가 위 보고를 보고
+     결정한다.
+  5. **명시 플래그가 있어도 거부하는 경우를 둔다.** `sql` 이 주어졌고 저널 생성
+     시점에 레지스트리 행의 `created_at` 스냅샷을 남겼다면, 재개 시점에 그 행이
+     사라졌거나 `created_at` 이 다르면 `DeletePackJournalConflict` 로 거부한다 —
+     일치는 "같은 팩임의 증명" 이 못 되므로(SQLite `datetime('now')` 초 단위 충돌,
+     5라운드 실측) 통과 조건으로만 쓰고, 불일치만 확실한 부정 신호로 차단에 쓴다.
+     저널 생성 시점에 비교 근거가 없었으면(`sql` 미제공 등) 이 검사는 건너뛴다.
 
 **이 커밋은 RED 전용이다.** 아래가 요구하는 `opencrab.pack.delete_journal` 모듈은
 아직 없다 — 그래서 이 파일은 수집(collection) 단계에서부터 실패한다. 이것이 이번
@@ -27,7 +38,7 @@
 ## GREEN 이 만족해야 할 계약 (이 파일이 강제)
 
 - ``opencrab.pack.delete_journal`` 모듈 신설. 최소 표면:
-  - ``JOURNAL_SCHEMA``(정수), 예외 ``DeletePackJournalUnverifiable``,
+  - ``JOURNAL_SCHEMA``(정수), 예외 ``DeletePackJournalPending``,
     ``DeletePackJournalConflict``, ``DeletePackJournalCorrupt``.
   - ``journal_path(data_dir, pack_name) -> Path`` — 파일명은 ``pack_name`` 을
     안전하게(해시로) 인코딩한다(팩 이름에 유니코드/구분자가 와도 안전해야 한다).
@@ -39,15 +50,28 @@
   - ``save_journal(data_dir, pack_name, payload) -> None`` — 임시파일 + fsync +
     ``os.replace`` 원자적 교체(선례: opencrab-dump #9 rename 저널과 동형).
   - ``clear_journal(data_dir, pack_name) -> None``.
-- ``delete_pack(pack_name, graph, docs, vec, *, sql=None)`` — 새 키워드 인자
-  ``sql``(``load_chunks`` 의 기존 ``sql=`` 관례와 동형). 함수 전체를
-  ``file_lock(delete_journal.lock_filename(pack_name))`` 로 감싼다.
-- 각 축(`doc.node_twin_loop`, `doc.doc_node_extra`/`doc_sources`, `graph.graph_nodes`,
-  `vectors`)은 단일 원자적 쓰기로 ``{done, count/clean}`` 을 저널에 남기고, `done`
-  하나로만 재실행 여부를 정한다.
-- `sql` 이 주어지고 저널이 새로 만들어질 때 ``get_pack(sql, pack_name)`` 으로 팩
-  동일성 스냅샷을 남기고, 기존 저널을 만나 재개할 때 다시 조회해 그 스냅샷과 대조한다
-  (§3 4가지 경로 — 아래 ``TestPackIdentityResumeSafety`` 가 전부 고정한다).
+- ``delete_pack(pack_name, graph, docs, vec, *, sql=None, resume=False,
+  lock_timeout=None)`` — 새 키워드 인자. ``sql`` 은 ``load_chunks`` 의 기존
+  ``sql=`` 관례와 동형. 함수 전체를
+  ``file_lock(delete_journal.lock_filename(pack_name), timeout=lock_timeout)`` 로
+  감싼다.
+- 축(`node_twin_loop`, `doc_node_extra_and_sources`, `graph_nodes`, `vectors`)은
+  단일 원자적 쓰기로 ``{done, count/clean}`` 을 저널에 남기고, `done` 하나로만
+  재실행 여부를 정한다. `node_twin_loop` 개별 노드의 `docs.delete_node_doc` 실패는
+  기존처럼 삼키되(관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로
+  `done=False` 를 고정한다(로컬 지적 7) — `node_twin_loop.done` 이 아니면
+  `graph_nodes` 축에 진입하지 않는다(doc→graph 게이팅, v3/v4 carry-forward).
+- 벡터 축은 세 갈래다(로컬 지적 4): 애초에 벡터 스토어가 백엔드 모양조차 없으면
+  (`_NoVec` 류) 구조적 미지원으로 즉시 `done=True`; 백엔드 모양은 있는데
+  `available=False`(연결·초기화 실패)면 재시도로 나을 수 있으므로 `done=False`;
+  조회/삭제를 실제로 시도했는데 판독 불가면 "이번 조회 실패"로 `done=False`.
+- 기본 호출(저널이 있고 `resume` 미지정)은 `DeletePackJournalPending` 을 던지고
+  스토어를 전혀 건드리지 않는다. 메시지에는 축별 상태, `pack_live_counts` 라이브
+  카운트, 창 경고, `resume=True` 안내가 담긴다.
+- `resume=True` 이고 `sql` 이 주어졌으며 저널에 팩 동일성 스냅샷(`created_at`)이
+  있으면, 현재 `get_pack(sql, pack_name)` 과 대조해 행 소멸이나 `created_at` 불일치
+  시 `DeletePackJournalConflict` 를 던지고 무쓰기다. 스냅샷이 없으면(비교 근거 없음)
+  검사를 건너뛰고 완주한다.
 """
 from __future__ import annotations
 
@@ -116,6 +140,21 @@ def _live_node_ids(graph, node_ids: list[str]) -> set[str]:
     return {nid for nid in node_ids if graph.get_node("Document", nid) is not None}
 
 
+class _ChromaShapedButUnavailable:
+    """`_collection` 을 가진(chroma 모양) 벡터 스토어지만 `available=False` —
+    로컬 지적 4가 겨냥한 "연결·초기화 실패" 를 흉내낸다. `_NoVec`(그런 속성이
+    애초에 없다, 구조적 미지원)과는 다른 부류다 — 이쪽은 재시도하면 나을 수
+    있는 상태라 즉시 done으로 확정하면 안 된다."""
+
+    available = False
+
+    def __init__(self):
+        self._collection = _FakeChromaCollection({})
+
+    def delete(self, ids):  # pragma: no cover -- available=False라 호출 안 됨
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1. 저널 원자성 — 쓰기 도중 죽어도 부분 기록을 읽고 잘못 판단하지 않는다.
 # ---------------------------------------------------------------------------
@@ -178,63 +217,86 @@ class TestJournalAtomicity:
 
 
 # ---------------------------------------------------------------------------
-# 2. 명시 중단 경로 = dry-run(무쓰기) — 이 부류에서 가장 위험한 회귀.
+# 2. 기본 재실행 = 탐지와 보고(무쓰기). 완주는 resume=True 가 있어야만.
 # ---------------------------------------------------------------------------
 
-class TestExplicitAbortWritesNothing:
-    def test_unregistered_pack_journal_on_resume_always_aborts_and_touches_no_row(
+class TestDefaultResumeRequiresExplicitConfirmation:
+    def test_existing_journal_without_resume_flag_reports_status_live_counts_and_window_warning_then_writes_nothing(
         self, live, tmp_path
     ):
-        """§3/§8-9(d): 저널 생성 시 레지스트리 행이 없었다(`registered=False`) —
-        증명 수단 자체가 없으므로, 재개 시 행이 그 뒤 생겼든 안 생겼든 항상 명시
-        중단이고, 이번 호출은 스토어를 **전혀** 건드리지 않는다.
+        """[리드 재정 1/2/4] 저널이 있으면 재실행 기본값은 **탐지와 보고**뿐이다.
+        축별 done/pending 상태, 지금 살아 있는 행 수(`pack_live_counts` 재사용),
+        그리고 "재개는 저널 생성 이후 새 콘텐츠도 지운다" 는 창 경고까지 메시지에
+        담겨야 하고, 이번 호출은 스토어를 전혀 건드리지 않는다.
 
-        역변이: 재개 경로가 저장소 축 실행 루프를 먼저 돌고 나서야 동일성을 검사하면,
-        중단 예외는 그대로 던져지지만 이미 일부 축이 지워진 뒤라 이 테스트의 "행
-        불변" 단언이 잡는다.
+        역변이: 기본 호출이 저장소 축 실행 루프를 먼저 돌고 나서야 저널 존재를
+        검사하면, 예외 자체는 그대로 던져지지만 이미 일부 축이 다시 지워진 뒤라
+        아래 "무쓰기" 단언들이 잡는다. 메시지 내용 단언들은 보고 내용이 개별로
+        빠지는 회귀(축 상태 누락, 라이브 카운트 누락, 창 경고 누락)를 각각 잡는다.
         """
         graph, docs = live
-        node_ids = ["u1", "u2"]
-        _seed_pack(graph, docs, tmp_path, "unreg-pack", node_ids)
+        node_ids = ["e1", "e2", "e3"]
+        _seed_pack(graph, docs, tmp_path, "explicit-pack", node_ids)
 
-        # 1회차: sql 없이 호출 — pack_identity.registered=False 로 저널만 남기고
-        # doc 축에서 예외로 죽었다고 가정(실제 크래시 대신 몽키패치로 doc 축 실패
-        # 유도 — 이 클래스의 관심사는 "재개 시 중단" 이지 doc 실패 자체가 아니다).
-        import opencrab.stores.local_sql_doc_store as doc_mod
-        real_delete = doc_mod.LocalSQLDocStore.delete_node_doc
+        real_delete_node = graph.delete_node
 
-        def _fail_once(self, space, node_id):
-            raise RuntimeError("시뮬레이션된 doc 축 실패")
+        def _fail_for_e2(node_type, node_id):
+            if node_id == "e2":
+                raise RuntimeError("시뮬레이션된 노드 삭제 실패")
+            return real_delete_node(node_type, node_id)
 
         import unittest.mock as mock
-        with mock.patch.object(doc_mod.LocalSQLDocStore, "delete_node_doc", _fail_once):
-            with pytest.raises(Exception):  # noqa: PT011 -- doc 축 예외가 밖으로 새는지는 별개 테스트의 관심사
-                pack_load.delete_pack("unreg-pack", graph, docs, _NoVec(), sql=None)
+        with mock.patch.object(graph, "delete_node", side_effect=_fail_for_e2):
+            pack_load.delete_pack("explicit-pack", graph, docs, _NoVec())  # 1회차: graph 축 부분 실패
 
         before = _live_node_ids(graph, node_ids)
+        assert before == {"e2"}
+        live_counts = pack_load.pack_live_counts("explicit-pack", graph, docs, _NoVec())
 
-        # 이제 팩을 등록한다(운영자가 뒤늦게 sql 을 넘겨 재개를 시도하는 상황).
-        pack_sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
-        ensure_test_user(pack_sql, _OWNER)
-        create_pack(pack_sql, _OWNER, "unreg-pack")
+        doc_calls: list[str] = []
+        real_delete_node_doc = docs.delete_node_doc
 
-        with pytest.raises(delete_journal.DeletePackJournalUnverifiable):
-            pack_load.delete_pack("unreg-pack", graph, docs, _NoVec(), sql=pack_sql)
+        def _counted_doc(space, node_id):
+            doc_calls.append(node_id)
+            return real_delete_node_doc(space, node_id)
 
+        graph_calls: list[str] = []
+
+        def _counted_graph(node_type, node_id):
+            graph_calls.append(node_id)
+            return real_delete_node(node_type, node_id)
+
+        with mock.patch.object(docs, "delete_node_doc", side_effect=_counted_doc), \
+             mock.patch.object(graph, "delete_node", side_effect=_counted_graph):
+            with pytest.raises(delete_journal.DeletePackJournalPending) as exc_info:
+                pack_load.delete_pack("explicit-pack", graph, docs, _NoVec())
+
+        assert doc_calls == [] and graph_calls == [], (
+            "resume 플래그 없이 호출했는데 스토어 축이 실행됐다 — 기본은 무쓰기 보고여야 한다"
+        )
         after = _live_node_ids(graph, node_ids)
         assert after == before, (
-            f"증명 수단 없는 저널의 재개 중단인데 행이 바뀌었다: before={before} after={after}"
+            f"기본(무플래그) 재실행인데 저장소 상태가 바뀌었다: before={before} after={after}"
         )
 
-    def test_registry_row_vanished_between_journal_creation_and_resume_aborts_and_touches_no_row(
+        msg = str(exc_info.value)
+        assert "graph_nodes: 대기" in msg, f"미완료 축 표시가 메시지에 없다: {msg!r}"
+        assert "doc_node_extra_and_sources: 완료" in msg, f"완료 축 표시가 메시지에 없다: {msg!r}"
+        for key, val in live_counts.items():
+            shown = val if val is not None else "미확인"
+            assert f"{key}={shown}" in msg, f"라이브 카운트 {key}={shown} 가 메시지에 없다: {msg!r}"
+        assert "새 콘텐츠가 추가" in msg, f"창 경고가 메시지에 없다: {msg!r}"
+        assert "resume=True" in msg, f"완주 방법(resume=True) 안내가 메시지에 없다: {msg!r}"
+
+    def test_resume_flag_with_vanished_registry_row_still_refuses_and_writes_nothing(
         self, live, tmp_path
     ):
-        """§3/§8-9(b): 저널 생성 시 행이 있었는데 재개 시 사라졌다 — PK 슬롯 이상
-        신호다. `DeletePackJournalConflict`, 스토어 무변형.
+        """[리드 재정 5] 저널 생성 시점엔 레지스트리 행이 있었는데 재개 시점에
+        사라졌다 — `resume=True` 를 줘도 확실한 부정 신호이므로 거부한다.
 
-        역변이: 재개가 "행이 사라졌으면 그냥 등록 안 된 것과 같다" 고 `registered=
-        False` 취급해 조용히 진행하면, 사라짐이라는 더 강한 이상 신호를 삼킨다 —
-        이 테스트가 그 구분을 강제한다(예외 타입까지 구분해서 확인).
+        역변이: `resume=True` 를 "행 존재 검사를 생략해도 된다" 로 구현하면, 이
+        테스트의 `DeletePackJournalConflict` 단언이 잡는다(스토어 무변형까지
+        같이 확인한다).
         """
         graph, docs = live
         node_ids = ["v1", "v2"]
@@ -245,27 +307,120 @@ class TestExplicitAbortWritesNothing:
         create_pack(pack_sql, _OWNER, "vanish-pack")
         assert get_pack(pack_sql, "vanish-pack") is not None
 
-        import opencrab.stores.local_sql_doc_store as doc_mod
         import unittest.mock as mock
+        real_delete_node = graph.delete_node
 
-        def _fail_once(self, space, node_id):
-            raise RuntimeError("시뮬레이션된 doc 축 실패")
+        def _fail_for_v2(node_type, node_id):
+            if node_id == "v2":
+                raise RuntimeError("시뮬레이션된 노드 삭제 실패")
+            return real_delete_node(node_type, node_id)
 
-        with mock.patch.object(doc_mod.LocalSQLDocStore, "delete_node_doc", _fail_once):
-            with pytest.raises(Exception):  # noqa: PT011
-                pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql)
+        with mock.patch.object(graph, "delete_node", side_effect=_fail_for_v2):
+            pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql)  # 저널에 동일성 스냅샷 기록
 
-        # 슬롯 소멸을 흉내낸다 — 오늘 코드에서 유일한 삭제 경로(only_status 없이 강제)
+        # 슬롯 소멸을 흉내낸다 — 오늘 코드에서 유일한 삭제 경로(only_status 없이 강제).
         delete_pack_row(pack_sql, "vanish-pack", _OWNER)
         assert get_pack(pack_sql, "vanish-pack") is None
 
         before = _live_node_ids(graph, node_ids)
         with pytest.raises(delete_journal.DeletePackJournalConflict):
-            pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql)
+            pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
         after = _live_node_ids(graph, node_ids)
         assert after == before, (
-            f"레지스트리 행 소멸 중단인데 행이 바뀌었다: before={before} after={after}"
+            f"레지스트리 행 소멸인데 resume=True 에도 행이 바뀌었다: before={before} after={after}"
         )
+
+    def test_resume_flag_with_differing_created_at_still_refuses_and_writes_nothing(
+        self, live, tmp_path
+    ):
+        """[리드 재정 5] `created_at` 이 다르면 확실히 다른 팩이다 — 5라운드
+        codex 가 실측한 SQLite `datetime('now')` 초 단위 충돌(같은 초에 옛 행을
+        지우고 새 행을 심어도 `created_at` 이 같아질 수 있음)의 반대쪽, "달라진"
+        경우를 직접 저널에 주입해 결정적으로 고정한다.
+
+        역변이: 재개가 `created_at` 대조를 건너뛰고 행 존재 여부만 보면, 행은
+        여전히 존재하므로(값만 다르다) 이 테스트가 잡는다.
+        """
+        graph, docs = live
+        node_ids = ["m1"]
+        _seed_pack(graph, docs, tmp_path, "mismatch-pack", node_ids)
+
+        pack_sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+        ensure_test_user(pack_sql, _OWNER)
+        create_pack(pack_sql, _OWNER, "mismatch-pack")
+        assert get_pack(pack_sql, "mismatch-pack") is not None
+
+        delete_journal.save_journal(tmp_path, "mismatch-pack", {
+            "schema": delete_journal.JOURNAL_SCHEMA,
+            "pack_identity": {"created_at": "1999-01-01 00:00:00"},  # 지금 행과 절대 안 같다
+            "axes": {"graph_nodes": {"done": False, "count": 0}},
+        })
+
+        before = _live_node_ids(graph, node_ids)
+        with pytest.raises(delete_journal.DeletePackJournalConflict):
+            pack_load.delete_pack("mismatch-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
+        after = _live_node_ids(graph, node_ids)
+        assert after == before, (
+            f"created_at 불일치인데 resume=True 에도 행이 바뀌었다: before={before} after={after}"
+        )
+
+    def test_resume_flag_with_matching_identity_completes(self, live, tmp_path):
+        """일치는 증명은 아니지만(SQLite 초 단위 충돌 가능) 통과 조건으로는 쓴다
+        (리드 재정 5 — "불일치만 확실한 부정 신호"). 일치하면 `resume=True` 가
+        완주한다.
+
+        역변이: 일치하는데도 항상 거부하면(과잉 방어), 이 테스트가 실패한다 —
+        운영자가 명시 확인했는데도 완주가 불가능해지는 회귀다.
+        """
+        graph, docs = live
+        node_ids = ["k1"]
+        _seed_pack(graph, docs, tmp_path, "match-pack", node_ids)
+
+        pack_sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+        ensure_test_user(pack_sql, _OWNER)
+        create_pack(pack_sql, _OWNER, "match-pack")
+        real_row = get_pack(pack_sql, "match-pack")
+        assert real_row is not None
+
+        delete_journal.save_journal(tmp_path, "match-pack", {
+            "schema": delete_journal.JOURNAL_SCHEMA,
+            "pack_identity": {"created_at": real_row["created_at"]},
+            "axes": {
+                "node_twin_loop": {"done": True, "clean": True},
+                "doc_node_extra_and_sources": {"done": True, "count": 0},
+                "graph_nodes": {"done": False, "count": 0},
+                "vectors": {"done": True, "clean": True, "count": 0},
+            },
+        })
+
+        pack_load.delete_pack("match-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
+        assert _live_node_ids(graph, node_ids) == set()
+
+    def test_resume_flag_without_sql_skips_identity_check_and_completes(self, live, tmp_path):
+        """저널 생성 시점에 `sql` 이 안 주어졌으면 비교 근거 자체가 없다 — 없는
+        근거로 거부하지 않는다. `resume=True` 만으로 `done=False` 축을 완주한다.
+
+        역변이: `sql` 부재를 "동일성 불확실 = 항상 거부" 로 구현하면, `sql` 을
+        아예 안 쓰는 기존 다수 호출부(§ 하위호환 클래스 참고)의 재개 경로가
+        전부 막힌다 — 이 테스트가 그 과잉 차단을 잡는다.
+        """
+        graph, docs = live
+        node_ids = ["n1", "n2"]
+        _seed_pack(graph, docs, tmp_path, "nosql-pack", node_ids)
+
+        import unittest.mock as mock
+        real_delete_node = graph.delete_node
+
+        def _fail_for_n2(node_type, node_id):
+            if node_id == "n2":
+                raise RuntimeError("시뮬레이션된 노드 삭제 실패")
+            return real_delete_node(node_type, node_id)
+
+        with mock.patch.object(graph, "delete_node", side_effect=_fail_for_n2):
+            pack_load.delete_pack("nosql-pack", graph, docs, _NoVec())  # sql 없이 1회차
+
+        pack_load.delete_pack("nosql-pack", graph, docs, _NoVec(), resume=True)
+        assert _live_node_ids(graph, node_ids) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -308,15 +463,15 @@ class TestDoneFlagAloneGatesReexecution:
         )
         assert graph.get_node("Document", "p2") is not None, "p2는 여전히 남아 있어야 한다"
 
-        # 재실행 — 이번엔 실패 없이(정상 delete_node) 남은 p2까지 마저 지운다.
-        pack_load.delete_pack("partial-pack", graph, docs, _NoVec())
+        # 재실행 — 명시 플래그로 남은 p2까지 마저 지운다(기본 호출은 이제 무쓰기 보고다).
+        pack_load.delete_pack("partial-pack", graph, docs, _NoVec(), resume=True)
         journal2 = delete_journal.load_journal(tmp_path, "partial-pack")
         assert journal2["axes"]["graph_nodes"]["done"] is True
         assert _live_node_ids(graph, node_ids) == set(), "재실행 뒤에도 p2가 남아 있다"
 
 
 # ---------------------------------------------------------------------------
-# 4. 벡터 미확인 상태 — 조회 실패는 done으로 승격되지 않는다.
+# 4. 벡터 축 세 갈래 — 구조적 미지원 vs 연결·초기화 실패 vs 이번 조회 실패.
 # ---------------------------------------------------------------------------
 
 class TestVectorUnconfirmedNeverBecomesDone:
@@ -345,20 +500,20 @@ class TestVectorUnconfirmedNeverBecomesDone:
             f"조회 실패(count=0)가 done=True로 잘못 승격됐다: {vaxis!r}"
         )
 
-        # 복구된 뒤(malformed 없이) 재실행하면 실제로 지워지고 done=True로 수렴한다.
+        # 복구된 뒤(malformed 없이) resume=True로 재실행하면 실제로 지워지고 done=True로 수렴한다.
         vec2 = _FakeChromaVec({"a1": "vecpack", "a2": "vecpack"})
-        pack_load.delete_pack("vecpack", graph, docs, vec2)
+        pack_load.delete_pack("vecpack", graph, docs, vec2, resume=True)
         journal2 = delete_journal.load_journal(tmp_path, "vecpack")
         assert journal2["axes"]["vectors"]["done"] is True
         assert vec2._collection.delete_calls, "복구 후 재실행에서 실제 삭제가 안 일어났다"
 
     def test_structurally_unsupported_backend_is_done_immediately(self, live, tmp_path):
-        """대조군 — `vec.available=False` 는 "카운트 미지원" 이지 "조회 실패" 가
-        아니다. 대기할 것이 없으므로 즉시 done=True(#165 기존 계약과 동형).
+        """대조군 — `_NoVec` 은 백엔드 모양 자체가 없다(구조적 미지원). 대기할
+        것이 없으므로 즉시 done=True(#165 기존 계약과 동형).
 
-        역변이: 미지원 백엔드도 vectors 축을 영원히 pending 으로 남기면(위 테스트가
-        요구한 "미확인은 done 아님" 을 과잉 적용하면) 이 테스트가 잡는다 — 재개할
-        것이 없는 축까지 재실행 대상으로 취급하는 것도 결함이다.
+        역변이: 미지원 백엔드도 vectors 축을 영원히 pending 으로 남기면(아래
+        테스트가 요구한 "미확인은 done 아님" 을 과잉 적용하면) 이 테스트가 잡는다
+        — 재개할 것이 없는 축까지 재실행 대상으로 취급하는 것도 결함이다.
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "novec-pack", ["z1"])
@@ -366,9 +521,87 @@ class TestVectorUnconfirmedNeverBecomesDone:
         journal = delete_journal.load_journal(tmp_path, "novec-pack")
         assert journal["axes"]["vectors"] == {"done": True, "clean": True, "count": 0}
 
+    def test_connection_failure_shaped_backend_stays_not_done(self, live, tmp_path):
+        """[로컬 지적 4] `_collection` 을 가진 chroma 모양 객체지만
+        `available=False` 인 경우는 "구조적 미지원" 이 아니라 "연결·초기화 실패"
+        다 — 재시도하면 나을 수 있으므로 즉시 done 을 확정하면 안 된다. `_NoVec`
+        (백엔드 모양 자체가 없음)과 이 경우를 코드가 구분해야 한다.
+
+        역변이: `available` 하나만 보고 축을 즉시 done=True 로 확정하면(백엔드
+        모양을 보지 않으면), 이 테스트가 잡는다 — chroma 모양이 있는데도
+        미지원과 똑같이 취급해 재시도 기회를 영구히 없앤 것이다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecfail-pack", ["w1"])
+        vec = _ChromaShapedButUnavailable()
+        pack_load.delete_pack("vecfail-pack", graph, docs, vec)
+        journal = delete_journal.load_journal(tmp_path, "vecfail-pack")
+        assert journal["axes"]["vectors"]["done"] is False, (
+            f"연결 실패(모양은 chroma)인데 done=True로 잘못 확정됐다: {journal['axes']['vectors']!r}"
+        )
+
+        # 연결이 복구된 뒤 resume=True로 재실행하면 실제로 확인되고 done=True로 수렴한다.
+        vec2 = _FakeChromaVec({"w1": "vecfail-pack"})
+        pack_load.delete_pack("vecfail-pack", graph, docs, vec2, resume=True)
+        journal2 = delete_journal.load_journal(tmp_path, "vecfail-pack")
+        assert journal2["axes"]["vectors"]["done"] is True
+
 
 # ---------------------------------------------------------------------------
-# 5. 여러 중단 지점 — 첫 축(doc) 직후, 두 번째 축(graph) 직후는 실 SIGKILL.
+# 5. 로컬 지적 7 — doc 축(node_twin_loop) sticky 실패 플래그 + doc→graph 게이팅.
+# ---------------------------------------------------------------------------
+
+class TestDocAxisStickyFailureFlag:
+    def test_doc_delete_failure_leaves_node_twin_loop_not_done_and_gates_graph_axis(
+        self, live, tmp_path
+    ):
+        """[로컬 지적 7] `node_twin_loop` 의 개별 `docs.delete_node_doc()` 실패는
+        기존처럼 삼키고 계속 진행하되(관용 계약 불변), 하나라도 삼켰으면 sticky
+        플래그로 `done=False` 를 고정해야 한다 — "루프가 예외 없이 끝났다" 만으로
+        `done` 을 정하면 개별 예외는 항상 삼켜지므로 그 조건이 거의 항상 참이 돼
+        결함을 못 잡는다. 부수로 doc→graph 게이팅(node_twin_loop이 done 이
+        아니면 graph 축 진입 안 함, v3/v4 carry-forward)도 같이 고정한다.
+
+        역변이: sticky 플래그 없이 "루프가 예외 없이 끝났다" 만으로 done을
+        정하면, 이 테스트의 `done is False` 단언이 잡는다. 게이팅이 빠지면
+        "graph 축 무변형" 단언이 잡는다(개별 노드 실패를 무시하고 graph 축까지
+        같이 밀어붙이는 회귀).
+        """
+        graph, docs = live
+        node_ids = ["d1", "d2", "d3"]
+        _seed_pack(graph, docs, tmp_path, "docfail-pack", node_ids)
+
+        real_delete_node_doc = docs.delete_node_doc
+
+        def _fail_for_d2(space, node_id):
+            if node_id == "d2":
+                raise RuntimeError("시뮬레이션된 doc 축 실패")
+            return real_delete_node_doc(space, node_id)
+
+        import unittest.mock as mock
+        with mock.patch.object(docs, "delete_node_doc", side_effect=_fail_for_d2):
+            pack_load.delete_pack("docfail-pack", graph, docs, _NoVec())  # 예외 없이 정상 반환(기존 관용 계약)
+
+        journal = delete_journal.load_journal(tmp_path, "docfail-pack")
+        axis = journal["axes"]["node_twin_loop"]
+        assert axis["done"] is False, (
+            f"doc 축에서 개별 예외를 삼켰는데(d2 실패) done=True로 잘못 기록됐다: {axis!r}"
+        )
+        assert _live_node_ids(graph, node_ids) == set(node_ids), (
+            "node_twin_loop이 done이 아닌데 graph 축이 진입해 노드를 지웠다 — doc→graph 게이팅 위반"
+        )
+        assert journal["axes"]["graph_nodes"].get("done") is not True
+
+        pack_load.delete_pack("docfail-pack", graph, docs, _NoVec(), resume=True)
+        journal2 = delete_journal.load_journal(tmp_path, "docfail-pack")
+        assert journal2["axes"]["node_twin_loop"]["done"] is True
+        assert journal2["axes"]["graph_nodes"]["done"] is True
+        assert _live_node_ids(graph, node_ids) == set()
+
+
+# ---------------------------------------------------------------------------
+# 6. 여러 중단 지점 — 첫 축(doc) 직후, 두 번째 축(graph) 직후는 실 SIGKILL.
+#    두 지점 모두: 재실행(무플래그) → 보고만 하고 멈춘다 → resume=True → 완주.
 # ---------------------------------------------------------------------------
 
 def _run_kill_script(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
@@ -389,17 +622,19 @@ def _run_kill_script(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
 
 
 class TestMultipleCrashPoints:
-    def test_sigkill_right_after_doc_axis_commits_then_resume_finishes_graph_and_vectors(
+    def test_sigkill_right_after_doc_axis_commits_reports_then_completes_only_with_resume_flag(
         self, tmp_path, monkeypatch
     ):
-        """1번째 훅 위치: doc 축의 마지막 커밋 직후·단일 원자적 쓰기 이전에 실
-        SIGKILL. 재개가 doc을 재확인(멱등, 이미 지워진 그대로)하고 graph·vectors를
-        마저 끝낸다.
+        """1번째 훅 위치: doc 축(node_twin_loop + doc_node_extra_and_sources)의
+        마지막 커밋 직후·graph 축 진입 이전에 실 SIGKILL. [리드 재정의 핵심 계약]
+        재개는 두 단계다 — 플래그 없이 재실행하면 보고만 하고 멈추며(무쓰기),
+        `resume=True` 를 줘야만 graph·vectors를 마저 끝낸다.
 
         역변이: 크래시 훅을 없애 doc 축 커밋과 저널 갱신을 분리하지 않으면(둘을
         하나의 "죽지 않는" 단계로 합치면) 이 크래시 지점 자체가 재현 불가능해져
         테스트가 무의미하게 항상 통과한다 — 그래서 killed(`returncode < 0`)를
-        먼저 확인한다.
+        먼저 확인한다. 1단계(무플래그) 단언이 없으면 자동 재개가 되살아나도 이
+        테스트가 못 잡는다 — 그래서 무쓰기 확인을 2단계보다 먼저 둔다.
         """
         monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
         proc = _run_kill_script(tmp_path, """
@@ -452,10 +687,24 @@ class TestMultipleCrashPoints:
         try:
             journal_before = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_before is not None, "죽은 실행이 저널 자체를 안 남겼다"
+            assert journal_before["axes"]["node_twin_loop"]["done"] is True
             assert journal_before["axes"]["doc_node_extra_and_sources"]["done"] is True
             assert journal_before["axes"]["graph_nodes"].get("done") is not True
 
-            _n, _c, _v = pack_load.delete_pack("crash-pack", graph, docs, _NoVec())
+            # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, 무쓰기.
+            with pytest.raises(delete_journal.DeletePackJournalPending):
+                pack_load.delete_pack("crash-pack", graph, docs, _NoVec())
+            journal_still = delete_journal.load_journal(tmp_path, "crash-pack")
+            assert journal_still == journal_before, (
+                "플래그 없는 재실행인데 저널이 바뀌었다 — 무쓰기 계약 위반"
+            )
+            assert graph.get_node("Document", "k1") is not None, (
+                "graph 축이 아직 안 끝났어야 하는데 플래그 없이 지워졌다"
+            )
+            assert graph.get_node("Document", "k2") is not None
+
+            # 2단계: 명시 플래그로 완주.
+            _n, _c, _v = pack_load.delete_pack("crash-pack", graph, docs, _NoVec(), resume=True)
             journal_after = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_after["axes"]["graph_nodes"]["done"] is True
             assert journal_after["axes"]["vectors"]["done"] is True
@@ -465,18 +714,19 @@ class TestMultipleCrashPoints:
             graph.close()
             docs.close()
 
-    def test_sigkill_right_after_graph_axis_commits_then_resume_finishes_vectors_only(
+    def test_sigkill_right_after_graph_axis_commits_reports_then_completes_only_with_resume_flag(
         self, tmp_path, monkeypatch
     ):
-        """2번째 훅 위치: graph 축 완료 직후. 재개가 doc·graph를 신뢰하고(둘 다
-        이미 done=True) vectors만 실행한다 — doc/graph를 다시 실행하지 않는다는
-        점에서 위 테스트와 검증 축이 다르다(이 테스트는 "이미 done인 축은 건드리지
-        않는다"를 고정한다).
+        """2번째 훅 위치: graph 축 완료 직후. [리드 재정의 핵심 계약] 무플래그
+        재실행은 보고만 하고 멈추며(doc 축은 다시 불리지 않는다 — 이미 done),
+        `resume=True` 를 줘야만 vectors만 마저 실행한다 — doc/graph를 다시
+        실행하지 않는다는 점에서 위 테스트와 검증 축이 다르다(이 테스트는
+        "이미 done인 축은 건드리지 않는다"를 두 단계 모두에서 고정한다).
 
-        역변이: 재개가 이미 done인 축까지 무조건 다시 도는(멱등성에 기대 "그냥 다
-        재실행"으로 단순화한) 구현이면, 이 테스트 자체는 최종 상태로는 못 잡을 수
-        있다(멱등이라 결과가 같다) — 그래서 doc 축 실행 카운터를 몽키패치로 세어
-        "재개 시 doc 축 함수가 다시 불리지 않았다"를 직접 확인한다.
+        역변이: 재개가 이미 done인 축까지 무조건 다시 도는(멱등성에 기대 "그냥
+        다 재실행"으로 단순화한) 구현이면, 최종 상태로는 못 잡을 수 있다(멱등이라
+        결과가 같다) — 그래서 doc 축 실행 카운터를 몽키패치로 세어 "무플래그
+        단계·resume 단계 모두에서 doc 축 함수가 안 불렸다"를 직접 확인한다.
         """
         monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
         proc = _run_kill_script(tmp_path, """
@@ -525,18 +775,25 @@ class TestMultipleCrashPoints:
         docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
         try:
             import unittest.mock as mock
-            doc_calls = []
+            doc_calls: list[str] = []
             real_delete_node_doc = docs.delete_node_doc
 
             def _counted(space, node_id):
                 doc_calls.append(node_id)
                 return real_delete_node_doc(space, node_id)
 
+            # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, doc 축 재실행 없음.
             with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
-                pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec())
+                with pytest.raises(delete_journal.DeletePackJournalPending):
+                    pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec())
+            assert doc_calls == [], f"플래그 없는 재실행인데 doc 축이 실행됐다: {doc_calls}"
+
+            # 2단계: 명시 플래그로 완주 — 그래도 doc 축은 이미 done이라 재실행 안 됨.
+            with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
+                pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec(), resume=True)
 
             assert doc_calls == [], (
-                f"doc 축이 이미 done인데도 재개가 다시 실행했다: {doc_calls}"
+                f"doc 축이 이미 done인데도 resume=True 재개가 다시 실행했다: {doc_calls}"
             )
             journal = delete_journal.load_journal(tmp_path, "crash-pack-2")
             assert journal["axes"]["vectors"]["done"] is True
@@ -546,7 +803,7 @@ class TestMultipleCrashPoints:
 
 
 # ---------------------------------------------------------------------------
-# 6. 요약 표시 — 재개 실행의 확인 건수와 "이전 부분 실행 불명" 마킹.
+# 7. 요약 표시 — 재개 실행의 확인 건수와 "이전 부분 실행 불명" 마킹.
 # ---------------------------------------------------------------------------
 
 class TestResumeSummaryText:
@@ -577,7 +834,7 @@ class TestResumeSummaryText:
             pack_load.delete_pack("summary-pack", graph, docs, _NoVec())
         capsys.readouterr()  # 1회차 출력은 버린다 — 이 테스트는 재개 호출의 출력만 본다
 
-        pack_load.delete_pack("summary-pack", graph, docs, _NoVec())
+        pack_load.delete_pack("summary-pack", graph, docs, _NoVec(), resume=True)
         out = capsys.readouterr().out
 
         assert "재개" in out, f"재개 표시가 요약에 없다: {out!r}"
@@ -585,7 +842,7 @@ class TestResumeSummaryText:
 
 
 # ---------------------------------------------------------------------------
-# 7. 락 경합 — holder가 쥔 채 contender의 타임아웃/비차단 실패를 직접 관측.
+# 8. 락 경합 — holder가 쥔 채 contender의 타임아웃/비차단 실패를 직접 관측.
 #    (locking.py:465 process-internal RLock, locking.py:489 OS-level flock)
 # ---------------------------------------------------------------------------
 
