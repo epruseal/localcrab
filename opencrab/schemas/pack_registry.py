@@ -240,6 +240,46 @@ def _unsafe_names_error(pack_name: str, rejected: list[Any]) -> dict[str, str]:
     }
 
 
+def _dedup_types(types: list[str]) -> list[str]:
+    """Return *types* with duplicates removed, first occurrence kept.
+
+    Callers must call this only AFTER ``_unsafe_names`` has passed the same
+    list with no rejections. That precondition is what makes ``dict.
+    fromkeys`` safe here: ``safe_schema_name``'s leading ``isinstance``
+    check means every entry left in *types* at that point is a hashable
+    ``str``, so this never receives an unhashable value.
+    """
+    return list(dict.fromkeys(types))
+
+
+def _warn_on_duplicate_types(pack: dict[str, Any], types: list[str]) -> None:
+    """#108: warn when a pack manifest lists the same type name more than
+    once. install_pack/uninstall_pack iterate ``types`` once per entry, so a
+    repeated name used to make a single type land in two of created/
+    migrated/skipped (or removed/kept_user_customised) across separate
+    iterations, and inflated total_types past the number of distinct types
+    actually processed -- the three counts stopped being mutually exclusive.
+    Deduping the list fixes that; this warns so a pack author who listed a
+    type twice is told about the mistake, the same way
+    ``_warn_on_manifest_overlap`` (#107) surfaces a manifest contradiction
+    rather than silently resolving it.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for t in types:
+        if t in seen and t not in duplicates:
+            duplicates.append(t)
+        seen.add(t)
+    if duplicates:
+        # Neutral wording ("processed", not "installed") on purpose: this
+        # helper is shared by uninstall_pack, where "installed" would
+        # misdescribe a removal.
+        logger.warning(
+            "Pack '%s': manifest lists duplicate type name(s) %r; each is processed once.",
+            pack.get("name"), duplicates,
+        )
+
+
 def list_packs() -> list[dict[str, Any]]:
     """Return metadata for all available schema packs."""
     packs = []
@@ -338,6 +378,15 @@ def install_pack(name: str) -> dict[str, Any]:
     entirely or demoted to ``optional``) is reported in
     ``revived_manifest_fields``, again decided before the write.
 
+    A type name listed more than once in the manifest (#108) is processed
+    once: the duplicate is dropped before the create/migrate/skip loop
+    runs, and a warning names the repeated type(s). Without this, a
+    repeated name made the loop visit the same type twice, and the two
+    visits always disagreed about its on-disk state (the first visit had
+    just written or migrated it), landing that one type in two of
+    created/migrated/skipped at once. ``total_types`` counts the deduped
+    list, so created+migrated+skipped always sums to it.
+
     Returns a result dict with created/migrated/skipped counts.
     """
     pack = get_pack(name)
@@ -348,10 +397,16 @@ def install_pack(name: str) -> dict[str, Any]:
 
     # #109: vet EVERY type name before touching the filesystem -- ahead of the
     # mkdir, so "nothing was written" is literally true on refusal.
-    rejected = _unsafe_names(pack.get("types", []) or [])
+    raw_types = pack.get("types", []) or []
+    rejected = _unsafe_names(raw_types)
     if rejected:
         logger.warning("Pack '%s': refusing to install, unsafe type name(s) %r", name, rejected)
         return _unsafe_names_error(name, rejected)
+
+    # #108: dedup only runs once every entry has passed _unsafe_names, so
+    # every entry here is a hashable str -- see _dedup_types' docstring.
+    _warn_on_duplicate_types(pack, raw_types)
+    types = _dedup_types(raw_types)
 
     _TYPES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -361,7 +416,7 @@ def install_pack(name: str) -> dict[str, Any]:
     preserved_extra_fields: dict[str, dict[str, list[str]]] = {}
     revived_manifest_fields: dict[str, dict[str, list[str]]] = {}
 
-    for node_type in pack.get("types", []):
+    for node_type in types:
         path = _TYPES_DIR / f"{node_type}.yaml"
         # #109 residual guard: the name is safe, but the entry itself can be a
         # symlink pointing out of the directory. A DANGLING outward link reads
@@ -493,7 +548,10 @@ def install_pack(name: str) -> dict[str, Any]:
         "skipped": skipped,
         "preserved_extra_fields": preserved_extra_fields,
         "revived_manifest_fields": revived_manifest_fields,
-        "total_types": len(pack.get("types", [])),
+        # #108: len(types), not len(raw_types) -- a manifest listing the same
+        # type twice must not inflate this past the distinct types actually
+        # processed, or created+migrated+skipped no longer sums to it.
+        "total_types": len(types),
     }
 
 
@@ -504,6 +562,13 @@ def uninstall_pack(name: str, force: bool = False) -> dict[str, Any]:
     Only removes schemas that have `pack: <name>` in their YAML header
     (i.e. were auto-generated). User-customised schemas are kept unless
     force=True.
+
+    A type name listed more than once in the manifest (#108) is processed
+    once, the same way install_pack dedupes it: without this, a repeated
+    name made the loop visit the same file twice, once after the first
+    visit had already removed or kept it, so ``removed``/
+    ``kept_user_customised`` could double-count one type or disagree about
+    which of the two lists it belonged in.
     """
     pack = get_pack(name)
     if not pack:
@@ -512,15 +577,21 @@ def uninstall_pack(name: str, force: bool = False) -> dict[str, Any]:
     # #109: the delete path is the dangerous one -- vet every type name up
     # front and refuse the whole uninstall rather than removing some files and
     # then hitting a bad name.
-    rejected = _unsafe_names(pack.get("types", []) or [])
+    raw_types = pack.get("types", []) or []
+    rejected = _unsafe_names(raw_types)
     if rejected:
         logger.warning("Pack '%s': refusing to uninstall, unsafe type name(s) %r", name, rejected)
         return _unsafe_names_error(name, rejected)
 
+    # #108: same dedup as install_pack, so removed/kept_user_customised stay
+    # mutually exclusive and don't double-count a type listed twice.
+    _warn_on_duplicate_types(pack, raw_types)
+    types = _dedup_types(raw_types)
+
     removed = []
     kept = []
 
-    for node_type in pack.get("types", []):
+    for node_type in types:
         path = _TYPES_DIR / f"{node_type}.yaml"
         if not path.exists():
             continue
