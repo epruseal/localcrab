@@ -28,7 +28,16 @@ _held = threading.local()
 def lock_data_dir() -> str:
     """Return and create the data directory used by the shared locks."""
     data_dir = os.environ.get("LOCAL_DATA_DIR")
-    if not data_dir:
+    if data_dir:
+        from opencrab.config import expand_user_path
+
+        # #67: os.environ.get() 직독 분기는 Settings 의 field_validator 를 거치지
+        # 않으므로, "~"/"~user" 를 여기서 직접 펼치지 않으면 os.makedirs 가 CWD
+        # 밑에 문자 그대로 "~" 디렉터리를 만든다. get_settings() 를 우회하는
+        # 기존 계약(테스트의 monkeypatch 즉시 반영, lru_cache stale 회피)은
+        # 그대로 유지한다 — get_settings() 는 호출하지 않는다.
+        data_dir = expand_user_path(data_dir)
+    else:
         from opencrab.config import get_settings
 
         data_dir = get_settings().local_data_dir
