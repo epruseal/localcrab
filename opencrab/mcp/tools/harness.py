@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._registry import AccessTier, tool
+from ._registry import AccessTier, safe_tool_error, tool
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ def harness_promotion_apply(
     try:
         promo = PromotionPackage.model_validate(package)
     except Exception as exc:
-        return {"error": f"Invalid PromotionPackage: {exc}"}
+        return {"error": safe_tool_error("harness_promotion_apply", exc)}
 
     node_receipts: list[dict[str, Any]] = []
     edge_receipts: list[dict[str, Any]] = []
@@ -175,7 +175,7 @@ def harness_promotion_apply(
                 "stores": result.get("stores"),
             })
         except Exception as exc:
-            errors.append({"node_id": node.node_id, "error": str(exc)})
+            errors.append({"node_id": node.node_id, "error": safe_tool_error("harness_promotion_apply", exc)})
 
     for edge in promo.edges:
         try:
@@ -198,7 +198,7 @@ def harness_promotion_apply(
         except Exception as exc:
             errors.append({
                 "edge": f"{edge.from_id}-[{edge.relation}]->{edge.to_id}",
-                "error": str(exc),
+                "error": safe_tool_error("harness_promotion_apply", exc),
             })
 
     # #66 hardening: builder.add_node() never raises for a per-store failure

@@ -1147,9 +1147,19 @@ def _fork_pack_inner(
             # this refuses the WHOLE preflight rather than reporting a
             # partial loss. Pre-reservation: zero registry rows, zero graph
             # anchors (same guarantee as every other §5-1 rejection).
+            #
+            # #168: this is a broad `except Exception`, not a narrow catch of
+            # one already-reviewed type -- str(exc) here would put whatever
+            # `validate_import_records` (or anything it calls) attaches to
+            # its message straight into the pack_fork response. Full detail
+            # goes to the operator log; the caller gets only the type name.
+            logger.error(
+                "pack_fork: vector batch decomposition failed re-validation "
+                "for src_pack_id=%s: %s", src_pack_id, exc, exc_info=True,
+            )
             raise _reject(
-                f"internal error: vector batch decomposition failed "
-                f"re-validation: {exc}"
+                "internal error: vector batch decomposition failed "
+                f"re-validation ({type(exc).__name__})"
             ) from exc
 
     # ---------------- §5-1 step 8: pack_id / slug length budget ----------------
@@ -1239,7 +1249,15 @@ def _fork_pack_inner(
             title=fork_title, description=fork_description, forked_from=src_pack_id,
         )
     except Exception as exc:
-        raise _reject(f"pack registration failed: {exc}") from exc
+        # #168: this is the same "pack registration failed" leak pattern
+        # pack.py's pack_create closes -- str(exc) here would put backend
+        # registry text straight into an MCP response. Full detail stays on
+        # the operator log; the caller gets only the exception's type name.
+        logger.error(
+            "pack_fork: begin_pack_creation failed for requested_slug=%s: %s",
+            requested_slug, exc, exc_info=True,
+        )
+        raise _reject(f"pack registration failed ({type(exc).__name__})") from exc
 
     def _compensate_reservation(reason: str) -> _RejectedError:
         """Confirmed (never assumed) compensating delete of the just-reserved
@@ -1381,7 +1399,19 @@ def _fork_pack_inner(
     except _RejectedError:
         raise
     except Exception as exc:
-        raise _compensate_reservation(f"pre-write check failed: {exc!r}") from exc
+        # #168: a broad `except Exception` around the pre-write identity
+        # checks -- `{exc!r}` here would put whatever those checks' own
+        # inputs or a library exception attaches to its repr straight into
+        # the pack_fork response via `_compensate_reservation`/`_reject`.
+        # Full detail goes to the operator log; the caller gets only the
+        # type name.
+        logger.error(
+            "pack_fork: pre-write check raised for pack_id=%s: %s",
+            dst, exc, exc_info=True,
+        )
+        raise _compensate_reservation(
+            f"pre-write check failed ({type(exc).__name__})"
+        ) from exc
 
     # =====================================================================
     # §5-3 writes (steps 13-17) -- NOTHING past this point deletes the
@@ -1475,10 +1505,21 @@ def _fork_pack_inner(
             )
             demote_source_errors = source_errors
         except Exception as exc:
+            # #168: a broad `except Exception` around an internal
+            # residual-list computation -- repr(exc) here would put
+            # whatever this computation's own inputs or a library
+            # exception attaches to its message straight into the
+            # pack_fork response's "errors"."sources" field. Full detail
+            # goes to the operator log; the caller gets only the type name.
+            logger.error(
+                "pack_fork: sources_without_vectors computation failed for "
+                "pack_id=%s: %s", dst, exc, exc_info=True,
+            )
             sources_without_vectors = []
             demote_source_errors = [
                 *source_errors,
-                f"sources_without_vectors computation failed, reported as empty: {exc!r}",
+                f"sources_without_vectors computation failed, reported as "
+                f"empty ({type(exc).__name__})",
             ]
 
         return {
@@ -1649,7 +1690,16 @@ def _fork_pack_inner(
             try:
                 landed_ids = vector.import_vectors(records, pack_id=dst)
             except Exception as exc:
-                tier2_failure = f"vector import failed: {exc}"
+                # #168: a real backend vector-store write call -- str(exc)
+                # here would put whatever the store attaches to its message
+                # straight into the pack_fork response via `_demote()`. Full
+                # detail goes to the operator log; the caller gets only the
+                # type name.
+                logger.error(
+                    "pack_fork: vector import failed for dst pack_id=%s: %s",
+                    dst, exc, exc_info=True,
+                )
+                tier2_failure = f"vector import failed ({type(exc).__name__})"
             else:
                 landed_set = set(landed_ids or [])
                 missing = [r["id"] for r in records if r["id"] not in landed_set]
@@ -1694,7 +1744,16 @@ def _fork_pack_inner(
     except _RejectedError:
         raise
     except Exception as exc:
-        return _demote(f"write phase raised: {exc!r}")
+        # #168: a broad `except Exception` wrapping the entire write span
+        # (steps 13-18) -- repr(exc) here would put a backend's own error
+        # text straight into the pack_fork response via `_demote()`. Full
+        # detail goes to the operator log; the caller gets only the type
+        # name.
+        logger.error(
+            "pack_fork: write phase raised for pack_id=%s: %s",
+            dst, exc, exc_info=True,
+        )
+        return _demote(f"write phase raised ({type(exc).__name__})")
 
     # =====================================================================
     # R3 -- steps 18b-20: the verdict span. `mark_pack_ready` returning
@@ -1790,7 +1849,15 @@ def _fork_pack_inner(
     except _RejectedError:
         raise
     except Exception as exc:
-        return _demote(f"verdict phase raised: {exc!r}")
+        # #168: same rationale as the write phase's equivalent catch --
+        # repr(exc) here would put a backend's own error text straight
+        # into the pack_fork response via `_demote()`. Full detail goes to
+        # the operator log; the caller gets only the type name.
+        logger.error(
+            "pack_fork: verdict phase raised for pack_id=%s: %s",
+            dst, exc, exc_info=True,
+        )
+        return _demote(f"verdict phase raised ({type(exc).__name__})")
 
 
 def _vector_record_invalid(record: dict[str, Any], *, pack_id: str, allow_uris: bool) -> str | None:
@@ -1856,7 +1923,27 @@ def _vector_record_invalid(record: dict[str, Any], *, pack_id: str, allow_uris: 
     try:
         validate_import_records([record], pack_id=pack_id, allow_uris=allow_uris)
     except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+        # Narrow catch of four already-reviewed, per-record-data-shape
+        # exception types (see docstring above) -- str(exc) here is the
+        # SAME shape as pack.py's other curated-exception-type sites: kept
+        # unchanged per design's principle that a narrow catch of a
+        # specific, already-reviewed exception type may keep its own
+        # message.
         return str(exc)
     except Exception as exc:
-        raise _reject(f"internal error: vector record validation raised {exc!r}") from exc
+        # #168: unlike the narrow catch above, this is a broad
+        # `except Exception` -- it means the validator or the environment
+        # itself is breaking, not a per-record data defect (see docstring).
+        # repr(exc) here would put whatever that failure attaches to its
+        # message into the _reject() response the caller receives
+        # directly. Full detail goes to the operator log; the caller gets
+        # only the type name.
+        logger.error(
+            "pack_fork: vector record validation raised unexpectedly for "
+            "pack_id=%s: %s", pack_id, exc, exc_info=True,
+        )
+        raise _reject(
+            f"internal error: vector record validation raised "
+            f"({type(exc).__name__})"
+        ) from exc
     return None

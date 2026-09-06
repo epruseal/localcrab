@@ -19,7 +19,7 @@ from typing import Any
 
 from opencrab.common.graph_identity import NodeIdentityConflict
 
-from ._registry import AccessTier, tool
+from ._registry import AccessTier, safe_tool_error, tool
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,7 @@ def ontology_add_node(
         }
     except Exception as exc:
         logger.error("ontology_add_node failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": safe_tool_error("ontology_add_node", exc)}
 
 
 @tool(
@@ -324,7 +324,7 @@ def ontology_add_edge(
         }
     except Exception as exc:
         logger.error("ontology_add_edge failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": safe_tool_error("ontology_add_edge", exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -633,4 +633,8 @@ def ontology_list_edges(
         # generic "unavailable" message, which would otherwise mask an
         # operational error as if the store didn't exist at all.
         logger.warning("export_edges_scoped failed: %s", exc)
-        return {"edges": [], "total": 0, "error": str(exc), "pack_id_filter": pack_id}
+        return {
+            "edges": [], "total": 0,
+            "error": safe_tool_error("ontology_list_edges", exc),
+            "pack_id_filter": pack_id,
+        }
