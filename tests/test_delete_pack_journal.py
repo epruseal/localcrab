@@ -1093,6 +1093,53 @@ class TestDoneJournalDriftRecheck:
             f"스킵했다: {journal2['axes']['vectors']!r}"
         )
 
+    def test_new_graph_node_added_after_completion_is_swept_on_resume(
+        self, live, tmp_path
+    ):
+        """[재리뷰 P1, id 3947844473; 상위 원지적 id 3946096629]
+        `node_twin_loop`/`graph_nodes` 축이 이미 `done=True`로 완료된 뒤, 같은
+        팩 이름으로 새 그래프 노드가 유입되면(재적재 등) `resume=True` 재실행이
+        그 신규 노드와 doc 트윈을 실제로 지워야 한다. `doc_node_extra_and_
+        sources`/`vectors` 축은 이미 이 드리프트 재검사를 갖췄지만
+        `node_twin_loop`/`graph_nodes` 축은 `rows`(공용 조회, 매 호출
+        재실행됨)를 게이팅에 반영하지 않아 done 플래그만 보고 신규 노드를
+        조용히 건너뛰었다 — 이 설계는 `review-fix-design-v2.md`가 이미
+        제시하고 codex가 AGREE했으나 구현 커밋(`2999bd8`)에서 빠졌다.
+
+        역변이: 두 게이트의 `or rows` 항을 빼면(`if not
+        _axis_done("node_twin_loop"):`, `if _axis_done("node_twin_loop") and
+        not _axis_done("graph_nodes"):`로 되돌리면) 이 테스트가 잡는다 —
+        완료 이후 유입된 노드 m2가 재개에서 안 지워지고 그대로 남는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "graphdrift-pack", ["m1"])
+        n1, *_ = pack_load.delete_pack("graphdrift-pack", graph, docs, _NoVec())
+        assert n1 == 1
+        journal = delete_journal.load_journal(tmp_path, "graphdrift-pack")
+        assert journal["axes"]["node_twin_loop"]["done"] is True
+        assert journal["axes"]["graph_nodes"]["done"] is True
+        assert graph.get_node("Document", "m1") is None
+
+        # 완료 이후 유입을 흉내낸다 — 같은 팩에 새 노드 m2 를 재적재한다.
+        _seed_pack(graph, docs, tmp_path, "graphdrift-pack", ["m2"])
+        assert graph.get_node("Document", "m2") is not None
+        assert docs.get_node_doc("resource", "m2") is not None
+
+        n2, *_ = pack_load.delete_pack(
+            "graphdrift-pack", graph, docs, _NoVec(), resume=True)
+        assert n2 == 1, (
+            f"완료 이후 유입된 노드 하나만 이번 실행 확인 건수여야 한다(실제 {n2})"
+        )
+        assert graph.get_node("Document", "m2") is None, (
+            "완료 이후 유입된 그래프 노드 m2 가 재개에서 안 지워졌다"
+        )
+        assert docs.get_node_doc("resource", "m2") is None, (
+            "완료 이후 유입된 노드의 doc 트윈이 재개에서 안 지워졌다"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "graphdrift-pack")
+        assert journal2["axes"]["node_twin_loop"]["done"] is True
+        assert journal2["axes"]["graph_nodes"]["done"] is True
+
 
 # ---------------------------------------------------------------------------
 # 5. 로컬 지적 7 — doc 축(node_twin_loop) sticky 실패 플래그 + doc→graph 게이팅.
