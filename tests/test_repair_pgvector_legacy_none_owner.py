@@ -782,6 +782,41 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_missing_rows_key_is_rejected(self, tmp_path):
+        """새 컨텍스트 독립 검증자(round 6)가 실측 지적한 결함: ``rows`` 키가
+        아예 없는 스냅샷은 ``snapshot.get("rows", [])``가 빈 리스트로 조용히
+        받아들여 ``load_snapshot``은 통과하지만, ``rollback()``은
+        ``snapshot["rows"]``를 직접 인덱싱해 서명만 맞으면 나중에
+        ``KeyError``를 새어보낸다. 로드 시점에 키 존재 자체를 요구한다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps({"table": "t", "database": "d"}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_non_string_node_id_is_rejected(self, tmp_path):
+        """같은 라운드가 실측 재현한 결함: ``node_id``가 문자열이 아닌
+        해시 불가 타입(리스트/객체)이면 존재 검사는 통과하고
+        ``set(node_ids)``에서 ``TypeError: unhashable type``이 새어나갔다.
+        ``node_id``는 항상 문자열이라는 불변식을 로드 시점에 강제한다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "table": "t",
+                    "database": "d",
+                    "rows": [{"node_id": ["a", "b"], "xmin": "1"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드
