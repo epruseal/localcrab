@@ -49,8 +49,9 @@ SAFETY (Autonomy Contract 매핑):
     넘기는 호출자들)는 query에 비밀을 담지 않지만, ``--pg-url``로 임의 DSN을
     주는 것 자체는 코드로 막혀 있지 않다. query에 비밀을 담은 DSN을 쓰는
     운영자는 이 출력이 그 비밀까지 가려주지 않는다는 점을 알아야 한다.
-  - 스냅샷은 ``table``/``database``/``host``/``port`` 네 값 전부가 현재 대상과
-    일치할 때만 유효하다(``validate_snapshot_signature``). 대상 서버를 하나로
+  - 스냅샷은 ``table``/``database``/``host``/``port``/``schema`` 다섯 값 전부가
+    현재 대상과 일치할 때만 유효하다(``validate_snapshot_signature``). 대상
+    서버를 하나로
     특정할 수 없는 ``--pg-url``(다중 호스트, PostgreSQL ``service`` 설정,
     소켓-경유-쿼리스트링 등 -- ``target_identity_reason`` 참고)이면 ``--apply``
     자체를 거부한다(코드 3, DB 쓰기 0건). ``--skip-backup``을 명시했을 때만
@@ -399,7 +400,19 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     바꿔치기됐다는 뜻) 안전하게 그 엔트리를 지우고 예외를 낸다. 창을 없애진
     못해도, 바꿔치기된 내용을 성공으로 착각해 조용히 게시하는 일은 없다.
     ``os.link``로 만드는 최종 파일은 이 임시 파일과 같은 inode를 공유하므로
-    ``0o600`` 모드를 그대로 물려받는다."""
+    ``0o600`` 모드를 그대로 물려받는다.
+
+    게시(``os.link``, inode 대사) 뒤에는 부모 디렉터리를 열어 ``fsync``해
+    디렉터리 엔트리 자체의 내구성을 확보한다. 이 단계가 실패하면(디렉터리
+    fsync를 거부하는 파일시스템, 쓰기 권한은 있어도 읽기 권한이 없는
+    디렉터리 등) 호출자(``repair()``)는 DB 트랜잭션을 롤백하지만, 그 시점에
+    ``backup_to``는 이미 게시돼 있다(이중 적대검증, 코덱스 리뷰의 실측
+    재현). ``os.link``의 배타성 때문에 그 경로는 이후 재시도에서 항상
+    ``FileExistsError``로 막히므로, 실제로는 커밋되지 않은 수리를 커밋된
+    것처럼 보이게 하는 낡은 스냅샷이 그 경로를 영구히 점유한다. 그래서 이
+    fsync 단계가 실패하면 방금 게시한 ``backup_to``를 지운 뒤 원래 예외를
+    다시 낸다: 예외가 새는 모든 경로에서 "아무것도 게시되지 않았다"는
+    불변식을 지켜, 재시도가 항상 깨끗한 상태에서 시작하게 한다."""
     tmp = f"{backup_to}.tmp-{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -427,11 +440,18 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
     dir_path = os.path.dirname(os.path.abspath(backup_to)) or "."
-    dir_fd = os.open(dir_path, os.O_RDONLY)
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        try:
+            os.unlink(backup_to)
+        except OSError:
+            pass
+        raise
 
 
 def load_snapshot(path: str) -> dict[str, Any]:
@@ -496,31 +516,46 @@ def validate_snapshot_signature(
     database: str,
     host: str | None,
     port: int | None,
+    schema: str | None,
 ) -> None:
-    """table/database/host/port 4가지 모두 일치해야 통과한다.
+    """table/database/host/port/schema 5가지 모두 일치해야 통과한다.
 
     포트는 현재 값만 생략-포트를 5432로 정규화한다(``port is None`` 검사,
     ``port or 5432``가 아님: 0 같은 값을 진실성으로 밀어 넣지 않는다). 스냅샷
-    쪽 ``port``/``host``에는 기본값을 주지 않는다 -- 정상 경로로 만든 스냅샷은
-    항상 구체적인 host/port를 갖고 있으므로, 키가 없는 스냅샷(손상·수기
-    조작·구버전)은 ``None``이 되어 어떤 현재 값과도 일치할 수 없다. 즉
-    ``None == None`` 우연 통과가 구조적으로 없다.
+    쪽 ``port``/``host``/``schema``에는 기본값을 주지 않는다 -- 정상 경로로
+    만든 스냅샷은 항상 구체적인 host/port/schema를 갖고 있으므로, 키가 없는
+    스냅샷(손상, 수기 조작, 구버전)은 ``None``이 되어 어떤 현재 값과도 일치할
+    수 없다. 즉 ``None == None`` 우연 통과가 구조적으로 없다.
+
+    ``schema``는 ``target_identity_reason``이 막는 host/port/database 결속과는
+    다른 층위다: ``ALTER ROLE ... SET search_path`` / ``ALTER DATABASE ... SET
+    search_path``는 서버 쪽 영구 설정이라 DSN이나 환경변수 어디에도 나타나지
+    않는다(이중 적대검증, 코덱스 리뷰의 실측 재현). 수리와 롤백 사이에 이
+    서버 쪽 설정이 바뀌면, table/database/host/port가 전부 일치해도 실제로는
+    다른 스키마의 동명 테이블에 적용될 수 있다. 그래서 이 서명은 접속 시점의
+    ``current_schema()`` 실제 값(호출자가 연결에서 직접 조회해 넘긴다)을
+    별도로 기록하고 대조한다 -- DSN을 파싱해서는 얻을 수 없는 값이기 때문에
+    ``target_identity_reason``이 아니라 여기서 다룬다.
     """
     norm_port = 5432 if port is None else port
     snap_host = snapshot.get("host")
     snap_port = snapshot.get("port")
+    snap_schema = snapshot.get("schema")
     if (
         snapshot.get("table") != table
         or snapshot.get("database") != database
         or not snap_host
         or snap_host != host
         or snap_port != norm_port
+        or not snap_schema
+        or snap_schema != schema
     ):
         raise SnapshotError(
             "backup signature mismatch: snapshot is for "
             f"table={snapshot.get('table')!r} database={snapshot.get('database')!r} "
-            f"host={snap_host!r} port={snap_port!r}, but current target is "
-            f"table={table!r} database={database!r} host={host!r} port={norm_port!r}"
+            f"host={snap_host!r} port={snap_port!r} schema={snap_schema!r}, but "
+            f"current target is table={table!r} database={database!r} host={host!r} "
+            f"port={norm_port!r} schema={schema!r}"
         )
 
 
@@ -567,6 +602,7 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                 if reason:
                     raise SnapshotError(f"cannot create a rollback-safe snapshot: {reason}")
                 database = conn.execute(text("SELECT current_database()")).scalar()
+                schema = conn.execute(text("SELECT current_schema()")).scalar()
                 host = engine.url.host
                 port = engine.url.port if engine.url.port is not None else 5432
                 snapshot = {
@@ -574,6 +610,7 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                     "database": database,
                     "host": host,
                     "port": port,
+                    "schema": schema,
                     "rows": result_rows,
                 }
                 write_backup_atomic(backup_to, snapshot)
@@ -695,8 +732,9 @@ def main(argv: list[str] | None = None) -> int:
 
         with engine.connect() as conn:
             database = conn.execute(text("SELECT current_database()")).scalar()
+            schema = conn.execute(text("SELECT current_schema()")).scalar()
         try:
-            validate_snapshot_signature(snapshot, table, database, host, port)
+            validate_snapshot_signature(snapshot, table, database, host, port, schema)
         except SnapshotError as exc:
             print(f"! {exc}")
             return EXIT_BACKUP

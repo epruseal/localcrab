@@ -555,6 +555,38 @@ class TestBackupTempFileCreatedSecurely:
         )
 
 
+class TestBackupDirFsyncFailureDoesNotLeaveAStaleBackup:
+    def test_dir_fsync_failure_unpublishes_the_backup(self, tmp_path, monkeypatch):
+        """새 컨텍스트 검증자가 실측 재현한 결함: 게시(``os.link``, inode 대사)
+        뒤 부모 디렉터리 ``fsync``가 실패하면(디렉터리 fsync를 거부하는
+        파일시스템 등) 그 시점에 ``backup_to``는 이미 게시돼 있다. 호출자
+        (``repair()``)는 이 예외를 받아 DB 트랜잭션을 롤백하지만, ``os.link``의
+        배타성 때문에 이후 재시도는 항상 ``FileExistsError``로 막혀, 실제로는
+        커밋되지 않은 수리를 커밋된 것처럼 보이게 하는 낡은 스냅샷이 그 경로를
+        영구히 점유한다. fsync 실패 시 방금 게시한 ``backup_to``를 지워야
+        재시도가 깨끗한 상태에서 시작할 수 있다."""
+        backup_to = tmp_path / "backup.json"
+        real_fsync = os.fsync
+        call_count = {"n": 0}
+
+        def fsync_fails_on_the_directory_call(fd):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                real_fsync(fd)  # 임시 파일 fsync(첫 호출)는 그대로 통과시킨다
+                return
+            raise OSError("simulated: filesystem rejects directory fsync")
+
+        monkeypatch.setattr(os, "fsync", fsync_fails_on_the_directory_call)
+
+        with pytest.raises(OSError, match="simulated"):
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
+
+        assert not backup_to.exists(), (
+            "디렉터리 fsync 실패 이후에도 게시된 백업 파일이 남아, 이후 재시도가 "
+            "FileExistsError로 영구히 막힌다"
+        )
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
@@ -796,13 +828,38 @@ class TestBackupSignatureAndSnapshotIntegrity:
         assert code == repair.EXIT_BACKUP
         assert _all_rows(pg_store) == before
 
+    def test_schema_mismatch_is_rejected_and_nothing_changes(self, pg_store, tmp_path):
+        """새 컨텍스트 검증자가 실측 재현한 결함: ``ALTER ROLE ... SET
+        search_path``/``ALTER DATABASE ... SET search_path``처럼 서버 쪽에서
+        영구히 설정되는 스키마는 table/database/host/port 어느 것도 바꾸지
+        않으면서 실제로 적용되는 릴레이션을 바꿀 수 있다. 백업 시점 스키마와
+        롤백 시점 스키마가 다르면 다른 필드가 전부 일치해도 거부돼야 한다."""
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        before = _all_rows(pg_store)
+
+        tampered = json.loads(backup_path.read_text(encoding="utf-8"))
+        tampered["schema"] = "some_other_schema"
+        backup_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--rollback-from", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_BACKUP
+        assert _all_rows(pg_store) == before
+
     def test_missing_host_key_in_snapshot_is_rejected(self):
         """``host``키가 아예 없는 스냅샷(구버전/손상/수기 조작)은 ``None``이
         되어 어떤 현재 host와도 일치하지 않아야 한다(우연 통과 금지)."""
         with pytest.raises(repair.SnapshotError):
             repair.validate_snapshot_signature(
-                {"table": "t", "database": "d", "port": 5432},
-                table="t", database="d", host="localhost", port=5432,
+                {"table": "t", "database": "d", "port": 5432, "schema": "public"},
+                table="t", database="d", host="localhost", port=5432, schema="public",
             )
 
     def test_missing_port_key_in_snapshot_is_rejected(self):
@@ -810,17 +867,41 @@ class TestBackupSignatureAndSnapshotIntegrity:
         5432로 정규화한 값이라 ``None != 5432``로 항상 거부돼야 한다."""
         with pytest.raises(repair.SnapshotError):
             repair.validate_snapshot_signature(
-                {"table": "t", "database": "d", "host": "localhost"},
-                table="t", database="d", host="localhost", port=None,
+                {"table": "t", "database": "d", "host": "localhost", "schema": "public"},
+                table="t", database="d", host="localhost", port=None, schema="public",
             )
 
     def test_omitted_port_and_explicit_5432_are_compatible(self):
         """스냅샷에 명시적으로 적힌 5432와, 현재 DSN에서 포트를 생략해
         ``None``으로 넘어온 값(5432로 정규화)은 서로 호환돼야 한다."""
         repair.validate_snapshot_signature(
-            {"table": "t", "database": "d", "host": "localhost", "port": 5432},
-            table="t", database="d", host="localhost", port=None,
+            {"table": "t", "database": "d", "host": "localhost", "port": 5432, "schema": "public"},
+            table="t", database="d", host="localhost", port=None, schema="public",
         )
+
+    def test_missing_schema_key_in_snapshot_is_rejected(self):
+        """``schema``키가 없는 스냅샷(구버전/손상/수기 조작)은 ``None``이
+        되어 어떤 현재 schema와도 일치하지 않아야 한다(우연 통과 금지). 새
+        컨텍스트 검증자가 실측 재현한 결함: ``ALTER ROLE ... SET search_path``
+        /``ALTER DATABASE ... SET search_path``는 서버 쪽 영구 설정이라
+        table/database/host/port가 전부 일치해도 실제 스키마가 달라질 수
+        있다."""
+        with pytest.raises(repair.SnapshotError):
+            repair.validate_snapshot_signature(
+                {"table": "t", "database": "d", "host": "localhost", "port": 5432},
+                table="t", database="d", host="localhost", port=5432, schema="public",
+            )
+
+    def test_schema_mismatch_is_rejected(self):
+        """table/database/host/port가 전부 일치해도 schema가 다르면 거부한다."""
+        with pytest.raises(repair.SnapshotError, match="schema"):
+            repair.validate_snapshot_signature(
+                {
+                    "table": "t", "database": "d", "host": "localhost",
+                    "port": 5432, "schema": "legacy_schema",
+                },
+                table="t", database="d", host="localhost", port=5432, schema="public",
+            )
 
     def test_duplicate_node_id_in_snapshot_is_rejected(self, tmp_path):
         backup_path = tmp_path / "backup.json"
