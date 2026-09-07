@@ -57,6 +57,32 @@ SAFETY (Autonomy Contract 매핑):
     자체를 거부한다(코드 3, DB 쓰기 0건). ``--skip-backup``을 명시했을 때만
     같은 사유를 정보성으로 출력하고 스냅샷 없이 수리를 진행한다(운영자가
     직접 롤백을 포기한 경로이므로).
+  - **알려진 한계 (대상 서버 식별)**: ``target_identity_reason``과
+    ``_resolve_table_schema``가 보는 근거는 DSN 문자열과 프로세스 환경
+    (``PGHOSTADDR``/``PGSERVICE``/``PGSERVICEFILE``/``PGPORT`` 등)뿐이다.
+    이 모듈의 ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
+    ``Engine``을 ``repair()``/``rollback()``에 넘기면(``rollback()``은
+    ``main()``을 거치지 않고 직접 호출될 수도 있다 -- 테스트가 그렇게
+    쓴다), 실제 연결이 어느 서버로 가는지는 이 판정 범위 밖이라 보장하지
+    못한다. 근본 해법은 연결 뒤 서버 자신에게 물어(``current_database()``,
+    ``inet_server_addr()``, ``inet_server_port()``,
+    ``pg_postmaster_start_time()``) 그 값을 스냅샷 서명으로 쓰는 것이며,
+    이 PR은 그 서버-질의 결속을 구현하지 않았다.
+  - **알려진 한계 (스냅샷 모양 검증)**: ``load_snapshot()``의 입력 검증은
+    지금까지 실측된 손상/조작 형태(비객체 최상위, 비배열 ``rows``, 누락/
+    비문자열 ``node_id``/``xmin``, 중복 ``node_id``, 비UTF-8, 과대 정수,
+    깊은 재귀 등)를 하나씩 열거해 막는다. 이 열거에 없는 새로운 손상
+    형태는 여전히 처리되지 않은 예외로 새어나갈 수 있다. 근본 해법은
+    스키마 하나로 필수 키/타입/버전을 한 번에 검증하는 것이며, 이 PR은
+    그 스키마 계층을 도입하지 않았다.
+  - **알려진 한계 (백업 게시 경합 방어의 범위)**: ``write_backup_atomic``의
+    TOCTOU 방어(``O_EXCL``/``O_NOFOLLOW`` 임시 파일 생성, inode 대사)는
+    그 디렉터리에 **쓰기 권한이 없는** 로컬 관찰자의 심볼릭 링크 선점/
+    바꿔치기만 막는다. 그 디렉터리에 쓸 수 있는 주체(같은 사용자로 도는
+    다른 프로세스, 또는 같은 파일시스템 권한을 공유하는 다른 계정)는 이
+    방어의 대상이 아니다 -- 다만 그런 주체는 이미 이 스크립트가 쓰는
+    PostgreSQL 자격증명에도 접근할 개연성이 높으므로, 백업을 무력화하기
+    보다 DB를 직접 고치는 쪽이 더 쉬운 공격면이다.
 
 ROLLBACK (``--rollback-from <snapshot.json>``, ``--apply`` 필요):
   스냅샷이 기록한 각 행에 대해 PostgreSQL 시스템 컬럼 ``xmin``(그 행을 마지막으로
@@ -73,8 +99,8 @@ ROLLBACK (``--rollback-from <snapshot.json>``, ``--apply`` 필요):
   ``--rollback-from``은 안전하다고 보장하지 않는다**. 이 한계는 실행 시점마다
   stderr 경고로도 출력된다(문서/docstring만 읽지 않는 운영자도 보게 하기 위함).
 
-  백업 서명(``table``/``database``/``host``/``port``)이 현재 대상과 다르면
-  즉시 거부한다(코드 4). 대상 서버를 하나로 특정할 수 없는 ``--pg-url``이면
+  백업 서명(``table``/``database``/``host``/``port``/``schema``)이 현재
+  대상과 다르면 즉시 거부한다(코드 4). 대상 서버를 하나로 특정할 수 없는 ``--pg-url``이면
   서명 자체가 엉뚱한 서버와 비교될 수 있으므로 스냅샷을 읽기도 전에 거부한다
   (코드 3). ``--apply`` 수리 경로와 달리 ``--rollback-from``에는
   ``--skip-backup`` 같은 탈출구가 없다: 롤백은 스냅샷의 서버 결속 자체가
