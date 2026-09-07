@@ -570,12 +570,14 @@ vec0 에 대한 사실 하나만 덧붙인다. 이 저장소의 writer 가 그 �
 운영자 판단에 맡기던 수동 SQL을 대신한다. 기본은 dry-run 이고, 탐지 조건은
 `pack_id = 'None'` 과 `metadata` 의 `pack_id` 키가 실제로 SQL/JSON null 인 조건을 함께
 요구해 `None` 이라는 이름을 쓰는 진짜 팩의 행을 위양성 없이 지켜 준다. 실제 쓰기는
-`--apply` 가 있어야 하고, 그 경우 반드시 백업(`--backup-to <path>`, 또는 명시적
-`--skip-backup`)을 선행하며 백업 게시가 성공한 뒤에만 DB를 커밋한다. `--rollback-from`
+`--apply` 가 있어야 한다. 백업 경로를 `--backup-to <path>` 로 주면 그 게시가 성공한
+뒤에만 DB 를 커밋하고(게시 실패는 트랜잭션 전체를 되돌린다), 백업을 명시적으로
+생략하려면(`--skip-backup`) 이 게이트 없이 바로 커밋한다. `--rollback-from`
 으로 되돌릴 수 있으나, PostgreSQL `xmin`(트랜잭션 id) 지문 대조에 기대므로 트랜잭션 id
 순환/`VACUUM FREEZE` 앞에서는 오래된 백업의 롤백을 보장하지 않는다(스크립트가 실행
-시점마다 이 한계를 stderr 로도 경고한다). 사용법과 종료 코드는 스크립트 docstring
-(`--help`)이 정본이다.
+시점마다 이 한계를 stderr 로도 경고한다). 사용법은 `--help` 로 확인하고, 종료 코드를
+포함한 전체 동작은 스크립트 상단 docstring 이 정본이다(`--help` 는 그 docstring 첫
+줄만 설명으로 보여 준다).
 
 ```
 python scripts/repair_pgvector_legacy_none_owner.py --pg-url <dsn>                     # 확인만(dry-run)
@@ -584,10 +586,14 @@ python scripts/repair_pgvector_legacy_none_owner.py --pg-url <dsn> \
 ```
 
 각주: 이 절이 예전에 실었던 수동 확인/수리 SQL(`WHERE pack_id = 'None'` 탐지,
-`UPDATE ... SET pack_id = ''` 수리)은 위 스크립트의 실제 구현으로 대체됐다. 스크립트가
-같은 판별자를 원자적 트랜잭션과 백업/롤백 안전장치를 갖춰 실행한다. `tests/
-test_repair_pgvector_legacy_none_owner.py` 가 탐지 정확도(위양성 0), 적용, dry-run,
-백업 게이트, 롤백 왕복을 실 PostgreSQL 인스턴스로 검증한다.
+`UPDATE ... SET pack_id = ''` 수리)은 위 스크립트의 실제 구현으로 대체됐다. 옛 SQL의
+`metadata->>'pack_id' IS NULL` 은 값이 JSON null 인 행뿐 아니라 `pack_id` 키 자체가
+없는 행도 함께 골랐다. 스크립트는 `metadata @> '{"pack_id": null}'::jsonb` 로 조건을
+좁혀 키가 실제로 있고 값이 null 인 행만 잡는다(생산 경로는 키 부재 행을 만들지 않으므로
+실질적 수리 대상은 같다). 스크립트는 이 좁힌 조건을 원자적 트랜잭션과 백업/롤백
+안전장치를 갖춰 실행한다. `tests/test_repair_pgvector_legacy_none_owner.py` 가 탐지
+정확도(위양성 0), 적용, dry-run, 백업 게이트, 롤백 왕복을 실 PostgreSQL 인스턴스로
+검증한다.
 
 **거부 메시지는 남의 팩 이름을 담지 않는다.** 그 텍스트는 쓰기 영수증에 원문 그대로 실려 나가므로
 (`OntologyBuilder.add_node` 가 예외를 잡아 벡터 스토어 상태 문자열에 넣는다), 소유자를 적으면
