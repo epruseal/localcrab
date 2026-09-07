@@ -185,6 +185,34 @@ class _ChromaShapedButUnavailable:
         pass
 
 
+class _AvailableRaisesOnSecondRead:
+    """`available` 이 두 번째 접근에서 예외를 던지는 shaped(chroma 모양)
+    벡터스토어 더블 — [리뷰 P2] `delete_pack` 이 드리프트 탐침에서 한 번,
+    `_delete_pack_vectors` 내부에서 다시 한 번 `available` 을 읽던 이중 읽기를
+    고정한다. `_collection` 속성을 둬 `_vec_shape()` 가 `"chroma"` 를 반환하게
+    한다 — 이것이 없으면 드리프트 탐침의 `and` 단락평가로 첫 읽기 자체가
+    스킵돼 구 코드에서도 헬퍼 내부가 첫 접근이 되어 이 RED가 성립하지 않는다
+    (설계검증 1라운드 DISAGREE 로 확인된 함정 — 반드시 shaped 로 잡혀야 한다).
+    수정된 코드에서는 두 번째 읽기 자체가 사라져 실제 chroma 삭제 경로까지
+    진행하므로, `_collection` 은 진짜 조회·삭제를 흉내내는 `_FakeChromaCollection`
+    이어야 한다(빈 `object()` 로는 `col.get`/`col.delete` 가 `AttributeError` 로
+    막혀 결과를 오염시킨다)."""
+
+    def __init__(self):
+        self._reads = 0
+        self._collection = _FakeChromaCollection({})
+
+    @property
+    def available(self):
+        self._reads += 1
+        if self._reads >= 2:
+            raise RuntimeError("second read of available exploded")
+        return True
+
+    def delete(self, ids):  # pragma: no cover -- vec 자신이 아니라 `_collection` 이 지운다
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1. 저널 원자성 — 쓰기 도중 죽어도 부분 기록을 읽고 잘못 판단하지 않는다.
 # ---------------------------------------------------------------------------
@@ -950,6 +978,35 @@ class TestDoneJournalDriftRecheck:
         )
         journal = delete_journal.load_journal(tmp_path, "vecnodrift-pack")
         assert journal["axes"]["vectors"]["done"] is True
+
+    def test_available_is_read_exactly_once_per_delete_pack_call(
+        self, live, tmp_path
+    ):
+        """[리뷰 P2] `delete_pack` 은 shaped 벡터스토어의 `available` 을 호출당
+        정확히 한 번만 읽어야 한다. 위 드리프트 탐침이 한 번 읽고
+        `_delete_pack_vectors` 가 내부에서 다시 읽으면, 상태를 가진 property 의
+        두 번째 접근이 던지는 예외가 vectors 축이 저널에 기록되기 전에
+        `delete_pack` 밖으로 새 나간다 — 앞 세 축(node_twin_loop/
+        doc_node_extra_and_sources/graph_nodes)은 이미 커밋됐어도 vectors 축
+        자체는 시도됐다는 기록조차 없이 유실된다.
+
+        역변이: `_delete_pack_vectors` 가 caller 가 넘긴 값 대신
+        `vec.available` 을 다시 읽거나, 드리프트 탐침이 값을 캐시하지 않고
+        매번 `getattr` 하면 이 테스트가 잡는다 — 두 번째 읽기에서 예외가 나
+        vectors 축이 커밋 전에 유실된다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecdoubleread-pack", ["k1"])
+        vec = _AvailableRaisesOnSecondRead()
+        pack_load.delete_pack("vecdoubleread-pack", graph, docs, vec)
+        assert vec._reads == 1, (
+            f"available 을 {vec._reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
+        )
+        journal = delete_journal.load_journal(tmp_path, "vecdoubleread-pack")
+        assert journal["axes"]["vectors"]["done"] is True, (
+            "available 이중 읽기로 vectors 축이 저널에 기록되지 못했다: "
+            f"{journal['axes']['vectors']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
