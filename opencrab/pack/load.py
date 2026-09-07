@@ -914,13 +914,18 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     return {"graph_nodes": graph_nodes, "graph_edges": graph_edges, "doc_nodes": doc_nodes}
 
 
-def _delete_pack_vectors(pack_name: str, vec) -> tuple[int | None, str | None, bool, bool]:
-    """벡터 축 하나를 실행하고 `(chunk_vec_del, kind, vec_confirmed, vec_available)` 를 돌려준다.
+def _delete_pack_vectors(
+    pack_name: str, vec, vec_available: bool
+) -> tuple[int | None, str | None, bool]:
+    """벡터 축 하나를 실행하고 `(chunk_vec_del, kind, vec_confirmed)` 를 돌려준다.
 
-    `vec_available` 은 요약 표시(`kind or ("미지원" if vec_available else "미가용")`,
-    #165/#172 기존 계약)를 위해 캐시된 값을 그대로 돌려준다 — 호출자가 표시 문구를
-    만들려고 `vec.available` 을 다시 읽으면(적대 검증 실증) 상태를 가진 property 가
-    그 세 번째 접근에서 던지는 예외가 이 함수의 `try` 밖으로 샌다.
+    `vec_available` 은 **호출자가 이미 읽어 캐시한 값을 그대로 받는다** — 이
+    함수 안에서 `vec.available` 을 다시 읽지 않는다(#327 리뷰 P2 실증: 호출자의
+    드리프트 탐침이 먼저 한 번 읽고 이 함수가 내부에서 또 읽으면, 상태를 가진
+    property 의 두 번째 접근이 던지는 예외가 vectors 축이 저널에 커밋되기
+    **전에** `delete_pack` 밖으로 새 나간다 — 앞선 세 축은 이미 커밋됐어도
+    vectors 축 자체는 시도됐다는 기록조차 없이 유실된다). `available` 은
+    `delete_pack` 호출당 정확히 한 곳(드리프트 탐침)에서만 읽는다.
 
     `chunk_vec_del`(#165 확인-건수 규율, R1/R2 는 아래 본문 참고)과 `vec_confirmed`
     (#327 재개 저널의 `done`/`clean` 판정 근거)는 **서로 다른 축**이다. 섞으면 안
@@ -944,11 +949,6 @@ def _delete_pack_vectors(pack_name: str, vec) -> tuple[int | None, str | None, b
     kind = None
     chroma_unreadable = ""
     vec_confirmed = True
-    # `available` 을 캐시해 아래 요약이 **다시 읽지 않게** 한다(적대 검증 실증 —
-    # 상태를 가진 property 가 나중 접근에서 던지면 밖으로 예외가 샌다). 이 한 줄
-    # 뒤로 `try` 밖에서 도는 사용자 코드는 없다(`_vec_backend`/`_vec_shape` 안의
-    # 접근은 각자의 `try` 가 흡수한다).
-    vec_available = bool(vec.available)
     if not vec_available:
         try:
             has_shape = _vec_shape(vec)[0] is not None
@@ -960,12 +960,16 @@ def _delete_pack_vectors(pack_name: str, vec) -> tuple[int | None, str | None, b
                 "벡터 백엔드 연결 미가용(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
                 _safe_type_name(vec), pack_name)
         # has_shape=False면 갈래 1 — vec_confirmed=True 유지(대기할 것이 없다).
-        return chunk_vec_del, kind, vec_confirmed, vec_available
+        return chunk_vec_del, kind, vec_confirmed
 
     try:
-        # `_vec_backend` 호출은 이 `try` 안에 둔다 — 밖으로 올리면 판별 자체의
-        # 예외가 흡수되지 않고 밖으로 터져 기존 계약이 바뀐다.
-        kind, handle, table = _vec_backend(vec)
+        # 이 지점은 `vec_available` 이 이미 참으로 확인된 뒤에만 도달한다(위
+        # 조기 반환 참고) — `_vec_backend(vec)` 를 부르면 그 함수 자신이
+        # `available` 게이트를 다시 읽어(#327 리뷰 P2) 이 함수를 호출당 정확히
+        # 한 번 읽기 계약 밖으로 밀어낸다. 같은 모양 판별을 게이트 없이 주는
+        # `_vec_shape(vec)` 를 대신 부른다 — `available` 이 이미 참이므로
+        # `_vec_backend` 의 게이트를 통과했을 때와 결과가 같다.
+        kind, handle, table = _vec_shape(vec)
         if kind == "sql":
             chunk_vec_del = None                                   # R1
             cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
@@ -1043,7 +1047,7 @@ def _delete_pack_vectors(pack_name: str, vec) -> tuple[int | None, str | None, b
         vec_confirmed = False   # 예외로 중단됐으니 축 완료로 볼 수 없다.
         log.warning("벡터 delete 오류(%s): %s", pack_name, _safe_str(e))
 
-    return chunk_vec_del, kind, vec_confirmed, vec_available
+    return chunk_vec_del, kind, vec_confirmed
 
 
 _DELETE_JOURNAL_AXES = ("node_twin_loop", "doc_node_extra_and_sources", "graph_nodes", "vectors")
@@ -1250,11 +1254,23 @@ def delete_pack(
         # 보수적으로 재시도 대상에 넣는다. 잔여 한계: available 인 채로 완료된
         # 축에 사후 드리프트(신규 벡터)가 생겨도 이 수정은 잡지 않는다 — 기존
         # 무조회 계약을 우선한 의도적 범위 축소다(설계 v3 addendum, 재판정 AGREE).
+        #
+        # `available` 은 여기서 **호출당 정확히 한 번만** 읽어 캐시한다(#327
+        # 리뷰 P2 실증 — 상태를 가진 property 가 여기서 한 번, 아래
+        # `_delete_pack_vectors` 내부에서 다시 한 번 읽히면, 두 번째 접근이
+        # 던지는 예외가 vectors 축이 저널에 커밋되기 전에 `delete_pack` 밖으로
+        # 새 나간다. 앞선 세 축은 이미 커밋됐어도 vectors 축 자체는 시도됐다는
+        # 기록조차 없이 유실된다). 캐시한 값을 `_delete_pack_vectors` 에 그대로
+        # 넘기고, 그 함수는 더 이상 `vec.available` 을 읽지 않는다.
+        try:
+            vec_available = bool(vec.available)
+        except Exception:
+            vec_available = False
         try:
             _vec_shape_kind = _vec_shape(vec)[0]
         except Exception:
             _vec_shape_kind = None
-        vectors_drift = _vec_shape_kind is not None and not getattr(vec, "available", False)
+        vectors_drift = _vec_shape_kind is not None and not vec_available
 
         # ── 1. node_twin_loop: doc 트윈 삭제. 개별 노드 실패는 삼키고 계속 진행하되
         # (기존 관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로 done=False 를
@@ -1373,7 +1389,9 @@ def delete_pack(
         # ── 4. vectors: 독립(ungated) — 세 갈래(구조적 미지원/연결 실패/조회 실패) ──
         if not _axis_done("vectors") or vectors_drift:
             vec_skipped = False
-            chunk_vec_del, kind, vec_confirmed, vec_available = _delete_pack_vectors(pack_name, vec)
+            chunk_vec_del, kind, vec_confirmed = _delete_pack_vectors(
+                pack_name, vec, vec_available
+            )
             _commit_axis(
                 "vectors",
                 {"done": vec_confirmed, "clean": vec_confirmed, "count": chunk_vec_del},
