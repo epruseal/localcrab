@@ -121,6 +121,26 @@ def _check_ident(name: str, label: str) -> None:
         raise ValueError(f"Unsafe {label}: {name!r}")
 
 
+def _is_db_safe_text(value: str) -> bool:
+    """psycopg2 가 텍스트 바인드 파라미터로 받아들일 수 있는 문자열인지 본다.
+
+    JSON 문자열 이스케이프(``\\ud800`` 같은 짝 없는 서로게이트)는
+    ``json.load()`` 자체는 오류 없이 통과시키지만, 그 결과 ``str`` 은
+    ``encode()`` 가능한 코덱이 하나도 없어 psycopg2 바인드 시점에
+    ``UnicodeEncodeError`` 를 낸다. NUL 문자(``\\u0000``)도 PostgreSQL
+    ``text`` 컬럼이 담을 수 없어 psycopg2 가 클라이언트 측에서
+    ``ValueError`` 를 낸다. 둘 다 이 도구 자신이 DB 에서 읽어 쓰는 값
+    (``node_id``, ``xmin::text``)에는 나타나지 않으므로, 나타나면 수기
+    조작이나 손상된 스냅샷으로 보고 여기서 미리 거부한다."""
+    if "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _as_dict_metadata(value: Any) -> dict[str, Any]:
     """JSONB 값을 dict로 정규화(드라이버가 str/dict 어느 쪽을 주든 안전)."""
     if isinstance(value, dict):
@@ -395,10 +415,12 @@ def load_snapshot(path: str) -> dict[str, Any]:
             not isinstance(row, dict)
             or not isinstance(row.get("node_id"), str)
             or not isinstance(row.get("xmin"), str)
+            or not _is_db_safe_text(row["node_id"])
+            or not _is_db_safe_text(row["xmin"])
         ):
             raise SnapshotError(
-                f"backup snapshot has a row missing a string 'node_id' or "
-                f"string 'xmin': {path}"
+                f"backup snapshot has a row with a missing, non-string, or "
+                f"unencodable 'node_id'/'xmin': {path}"
             )
         node_ids.append(row["node_id"])
     if len(node_ids) != len(set(node_ids)):

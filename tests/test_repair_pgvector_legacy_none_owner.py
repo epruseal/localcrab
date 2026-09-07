@@ -896,6 +896,37 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_lone_surrogate_in_node_id_is_rejected(self, tmp_path):
+        """새 컨텍스트 독립 검증자(round 9)가 실측 재현한 형제 결함:
+        ``\\ud800``처럼 짝 없는 서로게이트 코드포인트는 ``json.load()``가
+        오류 없이 파싱해 어떤 코덱으로도 인코딩할 수 없는 ``str``을 만든다.
+        ``isinstance(..., str)`` 검사는 통과하지만, ``rollback()``이 그
+        값을 psycopg2 바인드 파라미터로 넘기는 시점에 ``UnicodeEncodeError``
+        가 새어나갔다(``main()``의 ``--rollback-from`` 분기는 이 예외를
+        잡지 않는다)."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_bytes(
+            b'{"table":"t","database":"d","rows":[{"node_id":"n\\ud800","xmin":"1"}]}'
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_nul_character_in_xmin_is_rejected(self, tmp_path):
+        """같은 라운드가 실측 재현한 변형: ``xmin`` 값에 NUL 문자
+        (``\\u0000``)가 섞이면 PostgreSQL ``text``가 담을 수 없는 값이라
+        psycopg2가 클라이언트 측에서 ``ValueError: A string literal
+        cannot contain NUL (0x00) characters.``를 낸다. 이 도구가 스스로
+        쓰는 ``xmin``은 DB에서 읽은 순수 숫자 문자열뿐이므로(``_repair_sql``
+        의 ``xmin::text``), 이 형태는 수기 조작·손상 스냅샷에서만 나온다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_bytes(
+            b'{"table":"t","database":"d","rows":[{"node_id":"n","xmin":"1\\u0000"}]}'
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드
