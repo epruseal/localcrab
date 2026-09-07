@@ -355,14 +355,18 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
 def load_snapshot(path: str) -> dict[str, Any]:
     """유효한 JSON이라도 모양이 다르면(수기 조작, 손상, 구버전) 여기서
     ``SnapshotError``로 거부한다. 그러지 않으면 최상위가 객체가 아니거나,
-    ``rows`` 키가 아예 없거나 배열이 아니거나, 행에 ``node_id``/``xmin``이
-    없거나, ``node_id``가 문자열이 아닌 해시 불가 타입(리스트/객체)일 때
-    ``AttributeError``/``TypeError``/``KeyError``가 그대로 새어나가, 문서화된
-    백업-검증 종료 코드(4) 대신 처리되지 않은 트레이스백이 된다. ``rows``
-    키의 부재까지 여기서 거부하는 이유는 ``snapshot.get("rows", [])``로
-    조용히 빈 리스트를 대입하면 이 함수는 통과하지만 ``rollback()``이
+    ``rows`` 키가 아예 없거나 배열이 아니거나, 행에 문자열 ``node_id``나
+    문자열 ``xmin``이 없을 때 ``AttributeError``/``TypeError``/``KeyError``/
+    ``psycopg2.ProgrammingError``가 그대로 새어나가, 문서화된 백업-검증
+    종료 코드(4) 대신 처리되지 않은 트레이스백이 된다. ``rows`` 키의
+    부재까지 여기서 거부하는 이유는 ``snapshot.get("rows", [])``로 조용히
+    빈 리스트를 대입하면 이 함수는 통과하지만 ``rollback()``이
     ``snapshot["rows"]``를 직접 인덱싱해 서명만 맞으면 그때 가서 같은 방식으로
-    새어나가기 때문이다. ``xmin``도 같은 이유로 여기서 미리 확인한다.
+    새어나가기 때문이다. ``node_id``와 ``xmin``을 문자열로 강제하는 이유도
+    같다: 이 도구가 스스로 쓰는 값은 항상 문자열이므로(``_repair_sql``의
+    ``xmin::text``), 리스트/객체 같은 값은 ``set(node_ids)``에서
+    해시 불가 ``TypeError``를, psycopg2 바인드 시점에는
+    ``ProgrammingError: can't adapt type``을 낸다.
     파일 자체가 비UTF-8 바이트를 담고 있거나(수기 조작, 부분 기록, 비트
     부패) 멀티바이트 문자 중간에서 잘려 있으면 ``open()``이나 ``json.load()``가
     ``UnicodeDecodeError``를 낸다. 이 예외는 ``UnicodeError``/``ValueError``의
@@ -384,11 +388,11 @@ def load_snapshot(path: str) -> dict[str, Any]:
         if (
             not isinstance(row, dict)
             or not isinstance(row.get("node_id"), str)
-            or "xmin" not in row
+            or not isinstance(row.get("xmin"), str)
         ):
             raise SnapshotError(
                 f"backup snapshot has a row missing a string 'node_id' or "
-                f"missing 'xmin': {path}"
+                f"string 'xmin': {path}"
             )
         node_ids.append(row["node_id"])
     if len(node_ids) != len(set(node_ids)):

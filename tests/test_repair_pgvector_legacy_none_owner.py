@@ -844,6 +844,28 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_non_string_xmin_is_rejected(self, tmp_path):
+        """외부 채널(round 7)이 실측 재현한 형제 결함: ``xmin``이 문자열이
+        아닌 타입(리스트/객체)이면 ``"xmin" not in row`` 검사는 통과하고,
+        ``rollback()``이 그 값을 바인드 파라미터로 psycopg2에 넘기는 시점에야
+        ``ProgrammingError: can't adapt type 'dict'``가 새어나갔다. 이
+        도구가 스스로 쓰는 ``xmin``은 항상 ``xmin::text``로 캐스팅된 문자열
+        이므로(``_repair_sql``), 로드 시점에 같은 불변식을 강제한다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "table": "t",
+                    "database": "d",
+                    "rows": [{"node_id": "x", "xmin": {"invalid": "object"}}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드
