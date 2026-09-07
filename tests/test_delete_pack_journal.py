@@ -563,6 +563,47 @@ class TestDefaultResumeRequiresExplicitConfirmation:
         assert "새 콘텐츠가 추가" in msg, f"창 경고가 메시지에 없다: {msg!r}"
         assert "resume=True" in msg, f"완주 방법(resume=True) 안내가 메시지에 없다: {msg!r}"
 
+    def test_pending_message_raises_the_documented_exception_even_when_live_count_query_fails(
+        self, live, tmp_path
+    ):
+        """[codex PR 리뷰 P2, 2026-09-07] 저널이 있고 `resume=False` 면
+        `DeletePackJournalPending` 을 항상 던지는 것이 문서화된 계약이다.
+        안내 문구를 짓는 `_delete_pack_pending_message` 가
+        `pack_live_counts()` 를 무방비로 부르면, 벡터스토어 접근 자체가
+        실패할 때(연결 끊김 등 `available` 읽기 실패) 그 예외가 대신 새
+        나가 호출자가 문서화된 예외 대신 raw 벡터스토어 예외를 받는다 —
+        `resume=True` 안내를 영영 못 받는다.
+
+        역변이: `_delete_pack_pending_message` 의 `pack_live_counts()`
+        호출을 감싼 `try/except` 를 지우면(무방비 호출로 되돌리면) 이
+        테스트가 `DeletePackJournalPending` 대신 `RuntimeError` 가 새 나가는
+        것을 잡는다.
+        """
+        graph, docs = live
+        node_ids = ["r1", "r2"]
+        _seed_pack(graph, docs, tmp_path, "vecpendingfail-pack", node_ids)
+
+        real_delete_node = graph.delete_node
+
+        def _fail_for_r2(node_type, node_id):
+            if node_id == "r2":
+                raise RuntimeError("시뮬레이션된 노드 삭제 실패")
+            return real_delete_node(node_type, node_id)
+
+        import unittest.mock as mock
+        with mock.patch.object(graph, "delete_node", side_effect=_fail_for_r2):
+            pack_load.delete_pack(  # 1회차: graph 축 부분 실패로 저널만 남긴다
+                "vecpendingfail-pack", graph, docs, _NoVec())
+
+        vec = _AvailableRaisesAlways()
+        with pytest.raises(delete_journal.DeletePackJournalPending) as exc_info:
+            pack_load.delete_pack("vecpendingfail-pack", graph, docs, vec)
+
+        assert "미확인" in str(exc_info.value), (
+            "available 읽기 실패로 벡터 카운트를 못 냈는데 안내 문구에 "
+            f"'미확인' 표시가 없다: {exc_info.value!r}"
+        )
+
     def test_resume_flag_with_vanished_registry_row_still_refuses_and_writes_nothing(
         self, live, tmp_path
     ):
@@ -1091,6 +1132,49 @@ class TestDoneJournalDriftRecheck:
         assert "g1" not in post, f"재유입된 벡터 g1 이 재개 뒤에도 실제로 남아 있다: {post!r}"
         journal = delete_journal.load_journal(tmp_path, "vecnodrift-pack")
         assert journal["axes"]["vectors"]["done"] is True
+
+    def test_malformed_chroma_peek_response_is_treated_as_unconfirmed_not_empty(
+        self, live, tmp_path
+    ):
+        """[codex PR 리뷰 P1, 2026-09-07] peek 이 chroma 조회 응답을 판독할
+        수 없으면(malformed, 예: `"ids"` 키 없는 dict) 이를 "확인된 0건"과
+        뭉개면 안 된다 — #165 `_id_set()` 이 이미 세운 "판독 불가 vs 확인된
+        빈 결과" 구분을 이 새 peek 경로도 지켜야 한다.
+
+        이미 done=True·available=True 로 완료된 vectors 축을 재개할 때,
+        완료 이후 재유입된 벡터(q1)가 실제로 있는데도 peek 의 첫 조회가
+        malformed 응답을 받으면, 그것을 "재유입 없음"(확인됨)으로 오인해
+        q1 을 영원히 안 지우면 안 된다 — 확인 불가로 보고 재시도해야
+        결국 지워진다.
+
+        역변이: `_live_vec_ids` 의 chroma 분기에서 `strict=True` 를
+        무시하고 `got.get("ids", [])` 로 되돌리면(malformed 응답을 여전히
+        빈 리스트로 접으면) peek 이 예외 없이 `vectors_drift=False` 로
+        스킵해, 재유입된 q1 이 재개 뒤에도 실제로 살아남는다 — 이 테스트가
+        그것을 잡는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecmalformedpeek-pack", ["q1"])
+        vec1 = _FakeChromaVec({"q1": "vecmalformedpeek-pack"})
+        pack_load.delete_pack("vecmalformedpeek-pack", graph, docs, vec1)
+        journal = delete_journal.load_journal(tmp_path, "vecmalformedpeek-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+        # 재유입 — 완료 이후 같은 pack_id 로 q1 이 다시 존재.
+        vec2 = _FakeChromaVec({"q1": "vecmalformedpeek-pack"})
+        # peek 의 첫 where= 조회(순번 1)만 malformed 응답("ids" 키 없음)으로
+        # 오염시킨다 — 재시도 안의 두 번째 조회(순번 2)는 정상 응답이다.
+        vec2._collection.malformed_get_wheres = {1: {}}
+        pack_load.delete_pack(
+            "vecmalformedpeek-pack", graph, docs, vec2, resume=True)
+
+        post = pack_load._live_vec_ids(vec2, "vecmalformedpeek-pack")
+        assert "q1" not in post, (
+            "peek 의 malformed 응답을 '재유입 없음'으로 오인해 재유입된 q1 "
+            f"이 재개 뒤에도 실제로 남아 있다: {post!r}"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "vecmalformedpeek-pack")
+        assert journal2["axes"]["vectors"]["done"] is True
 
     def test_peek_does_not_reread_available_when_rechecking_a_done_axis(
         self, live, tmp_path
