@@ -195,7 +195,26 @@ def connect(pg_url: str) -> Any:
     return create_engine(pg_url, pool_pre_ping=True, hide_parameters=True)
 
 
-_AMBIGUOUS_TARGET_QUERY_KEYS = frozenset({"host", "port", "service", "hostaddr"})
+_SAFE_TARGET_QUERY_KEYS = frozenset(
+    {
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslcrl",
+        "sslpassword",
+        "connect_timeout",
+        "application_name",
+        "fallback_application_name",
+        "options",
+        "keepalives",
+        "keepalives_idle",
+        "keepalives_interval",
+        "keepalives_count",
+        "client_encoding",
+        "tcp_user_timeout",
+    }
+)
 
 
 def target_identity_reason(engine: Any) -> str | None:
@@ -213,6 +232,15 @@ def target_identity_reason(engine: Any) -> str | None:
     실제 연결은 h1과 h2 가운데 그때그때 다른 서버로 갈 수 있어 스냅샷을 한
     서버에 결속할 수 없다. PostgreSQL service 설정, 소켓-경유-쿼리스트링
     형태도 authority만으로는 검출되지 않으므로 query 키 자체를 함께 거부한다.
+    ``host``/``port``/``service``/``hostaddr`` 이름만 나열하는 블록리스트로는
+    부족하다: psycopg2는 query의 ``dsn`` 키를 conninfo 문자열로 병합하는데,
+    그 문자열 안의 ``hostaddr``/``host``/``service``는 kwargs에 같은 키가
+    없는 한 그대로 살아남아 authority와 무관하게 실제 연결 대상을 정한다
+    (실측: authority host가 존재하지 않는 이름이어도
+    ``?dsn=hostaddr%3D...``가 실제 서버로 연결을 성공시킨다). 드라이버마다
+    이런 캐리어 키(예: psycopg3의 ``conninfo``)가 더 있을 수 있으므로,
+    위험 키만 나열하는 대신 알려진 안전 키(``_SAFE_TARGET_QUERY_KEYS``)만
+    허용하는 화이트리스트로 이 범주 전체를 막는다.
 
     DSN 문자열만으로는 부족하다: ``PGHOSTADDR``/``PGSERVICE``/``PGSERVICEFILE``
     환경변수는 DSN이 그 값을 직접 주지 않는 한 실제 연결 시점에 적용돼,
@@ -237,12 +265,14 @@ def target_identity_reason(engine: Any) -> str | None:
             "libpq may connect to any one of them, so a rollback-safe "
             "snapshot cannot be bound to a single server for this target"
         )
-    blocked = _AMBIGUOUS_TARGET_QUERY_KEYS & set(engine.url.query)
-    if blocked:
+    unsafe = set(engine.url.query) - _SAFE_TARGET_QUERY_KEYS
+    if unsafe:
         return (
-            f"--pg-url query string sets {sorted(blocked)}, which can override "
-            "the authority host/port at connect time; a rollback-safe snapshot "
-            "cannot be bound to one server for this target"
+            f"--pg-url query string sets {sorted(unsafe)}, which is not a "
+            "known-safe parameter and may override the connect-time target "
+            "(e.g. psycopg2's 'dsn' key merges host/hostaddr/service into "
+            "the connection regardless of the authority); a rollback-safe "
+            "snapshot cannot be bound to one server for this target"
         )
     env_blocked = sorted(
         key for key in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE") if os.environ.get(key)

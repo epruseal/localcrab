@@ -415,6 +415,40 @@ class TestTargetIdentityRejectsAmbiguousEnvironment:
         assert repair.target_identity_reason(engine) is None
 
 
+class TestTargetIdentityRejectsUnknownQueryKeys:
+    """이중 적대검증(4라운드, 새 컨텍스트 검증자)이 실측 재현한 실결함:
+    psycopg2는 query 문자열의 ``dsn`` 키를 conninfo 문자열로 병합하고, 그
+    문자열 안의 ``hostaddr``/``host``/``service``는 kwargs에 같은 키가 없는
+    한 그대로 살아남아 authority와 무관하게 실제 연결 대상을 정한다.
+    ``host``/``port``/``service``/``hostaddr`` 이름만 나열하는 블록리스트로는
+    이런 드라이버별 캐리어 키를 계속 놓칠 수 있으므로, 알려진 안전 키만
+    허용하는 화이트리스트로 이 범주 전체를 막는다."""
+
+    def test_psycopg2_dsn_carrier_key_is_rejected(self):
+        engine = repair.connect(
+            "postgresql://u:p@localhost/db?dsn=hostaddr%3D127.0.0.1"
+        )
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "dsn" in reason
+
+    def test_unrecognized_query_key_is_rejected_even_if_not_a_known_carrier(self):
+        engine = repair.connect(
+            "postgresql://u:p@localhost/db?some_future_driver_option=x"
+        )
+
+        assert repair.target_identity_reason(engine) is not None
+
+    def test_known_safe_query_keys_are_still_harmless(self):
+        engine = repair.connect(
+            "postgresql://u:p@localhost/db?sslmode=require&connect_timeout=5"
+        )
+
+        assert repair.target_identity_reason(engine) is None
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
