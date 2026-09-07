@@ -805,6 +805,29 @@ class _SqlShapedButConnNone:
         pass
 
 
+class _AvailableRaisesAlways:
+    """`available` 이 매 접근마다 예외를 던지고 모양도 없는(`_conn`/
+    `_collection`/`_engine` 어느 것도 없어 `_vec_shape` 가 `None` 을 반환하는)
+    벡터스토어 더블 — [리뷰 P2-2] `available` 읽기 자체가 실패하는데 모양
+    판별도 함께 실패하면(반쯤 초기화된 상태), 이를 "정상적으로 available=False
+    라고 확인했다"와 뭉개 "구조적 미지원"(갈래 1, done=True 영구 확정)으로
+    오분류하면 안 된다 — 가용성을 몰라서 실패한 것과 확실히 벡터스토어가
+    없는 것은 다르다(#165 R1/R2 확인-건수 규율, `review-fix-design-v2.md`
+    지적 1 이 세운 "구조적 미지원"과 "확인 불가"의 구분을 `available` 값
+    자체에도 적용한다)."""
+
+    def __init__(self):
+        self.reads = 0
+
+    @property
+    def available(self):
+        self.reads += 1
+        raise RuntimeError("available read failed")
+
+    def delete(self, ids):  # pragma: no cover -- 갈래 판정에서 걸려 호출 안 됨
+        pass
+
+
 class TestDoneJournalDriftRecheck:
     def test_shaped_but_engine_none_backend_stays_not_done(self, live, tmp_path):
         """[리뷰 지적 2, `_vec_shape` 값 기준 → hasattr 기준 재작성] `_engine`
@@ -1006,6 +1029,68 @@ class TestDoneJournalDriftRecheck:
         assert journal["axes"]["vectors"]["done"] is True, (
             "available 이중 읽기로 vectors 축이 저널에 기록되지 못했다: "
             f"{journal['axes']['vectors']!r}"
+        )
+
+    def test_available_read_failure_with_no_shape_does_not_confirm_done(
+        self, live, tmp_path
+    ):
+        """[리뷰 P2-2] `available` 읽기 자체가 예외로 실패하고 `_vec_shape` 도
+        모양을 못 잡으면(반쯤 초기화된 벡터스토어), 이를 "정상적으로
+        available=False 라고 확인했다"와 뭉개 "구조적 미지원"(갈래 1)으로
+        즉시 done=True 확정하면 안 된다 — 가용성을 몰라서 실패한 것과 확실히
+        벡터스토어가 없는 것은 다르다. 재시도 대상(done=False)으로 남겨야
+        재개 시 다시 시도할 기회가 보존된다.
+
+        역변이: `vec_available` 을 `bool | None` 대신 `bool` 로 되돌려(즉
+        읽기 실패를 정상 False 와 뭉개면) 이 테스트가 잡는다 — 모양이 없다는
+        이유만으로 갈래 1 로 떨어져 done=True 로 잘못 확정된다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecreadfail-pack", ["m1"])
+        vec = _AvailableRaisesAlways()
+        pack_load.delete_pack("vecreadfail-pack", graph, docs, vec)
+        assert vec.reads == 1, (
+            f"available 을 {vec.reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
+        )
+        journal = delete_journal.load_journal(tmp_path, "vecreadfail-pack")
+        assert journal["axes"]["vectors"]["done"] is False, (
+            "available 읽기 실패(+모양도 없음)를 구조적 미지원으로 오분류해 "
+            f"done=True 로 확정했다: {journal['axes']['vectors']!r}"
+        )
+
+    def test_available_read_failure_rechecks_previously_done_vectors_axis(
+        self, live, tmp_path
+    ):
+        """[리뷰 P2-2, 설계검증 r1 DISAGREE 반영] vectors 축이 이미
+        done=True 로 완료된 뒤, 재개 호출에서 `available` 읽기 자체가
+        예외로 실패하면(모양도 함께 못 잡는 상태) done=True 저널을 그대로
+        스킵하지 않고 축을 다시 시도해 done=False 로 되돌려야 한다.
+        `vectors_drift` 식에 `vec_available is None` 항이 없으면
+        `_axis_done("vectors")` 가 참이라 재확인 자체가 안 일어나 잘못된
+        done=True 가 영구 고착된다(r1 설계가 이 시나리오를 놓쳐 DISAGREE를
+        받았다).
+
+        역변이: `vectors_drift` 식에서 `vec_available is None` 항을 빼면 이
+        테스트가 잡는다 — 재개 호출이 축을 재시도하지 않아 done=True 가
+        그대로 남는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecreadfailresume-pack", ["n1"])
+        vec1 = _FakeChromaVec({"n1": "vecreadfailresume-pack"})
+        pack_load.delete_pack("vecreadfailresume-pack", graph, docs, vec1)
+        journal = delete_journal.load_journal(tmp_path, "vecreadfailresume-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+        vec2 = _AvailableRaisesAlways()
+        pack_load.delete_pack(
+            "vecreadfailresume-pack", graph, docs, vec2, resume=True)
+        assert vec2.reads == 1, (
+            f"available 을 {vec2.reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "vecreadfailresume-pack")
+        assert journal2["axes"]["vectors"]["done"] is False, (
+            "available 읽기 실패로 재확인이 필요한데 done=True 저널을 그대로 "
+            f"스킵했다: {journal2['axes']['vectors']!r}"
         )
 
 
