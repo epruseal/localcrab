@@ -551,7 +551,7 @@ def _chroma_locked_handle(vec, fallback):
 
 
 def _live_vec_ids(
-    vec, pack_name: str, *, backend: tuple | None = None
+    vec, pack_name: str, *, backend: tuple | None = None, strict: bool = False
 ) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
@@ -571,6 +571,19 @@ def _live_vec_ids(
     동작을 포함해 **전혀 바뀌지 않는다**. `delete_pack` 의 드리프트 재확인
     경로만 캐시된 값을 넘겨 "호출당 정확히 한 번" 규율(#327 리뷰 P2)을
     지킨다.
+
+    `strict=True` 는 `delete_pack` 의 peek 경로만 쓴다(#327 codex 리뷰
+    P1, 2026-09-07). chroma 분기가 기본으로 쓰는 `got.get("ids", [])` 는
+    `"ids"` 키가 없는 malformed 응답을 조용히 빈 리스트로 접어 "확인된
+    0건"과 구분 못 한다 — 완료된 축을 재확인하는 peek 에서 이걸 놓치면
+    재유입된 벡터가 영원히 삭제를 피한다. `strict=True` 면 삭제 경로가
+    이미 쓰는 `_id_set()`(#165)으로 판독해, 판독 불가면 예외를 던져
+    호출자(`delete_pack` peek)의 기존 `try/except` 가 "확인 불가 →
+    재시도"로 다루게 한다. 두 기존 호출자는 `strict` 를 생략해(기본값
+    `False`) 동작이 전혀 안 바뀐다 — 그 두 호출자에 `_id_set()` 을 적용하지
+    않기로 한 범위 밖 결정(GREEN 커밋 38ec2b8 참고, `load_chunks_incremental`
+    의 1회성 증분 스캔에서 malformed 응답이 복구를 영구히 건너뛰는 역행
+    회귀 위험)은 그대로 유지한다.
 
     **한계**: 공유-id 팩(evidence 노드 id == 청크 id)에서는 노드 벡터와 청크
     벡터가 같은 슬롯(`pack_id` 컬럼의 같은 `node_id`)을 쓴다 — 이 함수는 그
@@ -592,7 +605,16 @@ def _live_vec_ids(
         # 팩인 벡터 행(레거시 source 만 이 팩명과 같은 행)이 고아 후보에 섞여
         # 지워진다. F6 가 SQL 쪽에서 닫은 것과 같은 교차팩 삭제 경로다.
         got = handle.get(where={"pack_id": pack_name})
-        vec_ids.update(got.get("ids", []))
+        if strict:
+            ids = _id_set(got)
+            if ids is None:
+                raise RuntimeError(
+                    f"chroma 조회 응답을 id 집합으로 읽을 수 없다(팩 {pack_name}) "
+                    "— 확인 불가, 재시도 대상으로 남긴다"
+                )
+            vec_ids.update(ids)
+        else:
+            vec_ids.update(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
         with handle.connect() as _c:
@@ -1099,7 +1121,15 @@ def _delete_pack_pending_message(pack_name: str, journal: dict, graph, docs, vec
         f"{axis}: {'완료' if info.get('done') else '대기'}"
         for axis, info in journal["axes"].items()
     )
-    live_counts = pack_live_counts(pack_name, graph, docs, vec)
+    try:
+        live_counts = pack_live_counts(pack_name, graph, docs, vec)
+    except Exception:
+        log.warning(
+            "팩 '%s' 의 대기 저널 안내에 필요한 라이브 카운트 조회가 실패했다 — "
+            "값을 미확인으로 남기고 DeletePackJournalPending 은 그대로 던진다",
+            pack_name,
+        )
+        live_counts = {"nodes": None, "edges": None, "docs": None, "vectors": None}
     count_line = ", ".join(
         f"{key}={val if val is not None else '미확인'}" for key, val in live_counts.items()
     )
@@ -1366,6 +1396,7 @@ def delete_pack(
                 live_ids = _live_vec_ids(
                     vec, pack_name,
                     backend=(_vec_shape_kind, _vec_shape_handle, _vec_shape_table),
+                    strict=True,
                 )
             except Exception:
                 vectors_drift = True
