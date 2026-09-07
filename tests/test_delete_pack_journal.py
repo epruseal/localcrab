@@ -1046,6 +1046,12 @@ class TestResumeSummaryText:
 
         assert "재개" in out, f"재개 표시가 요약에 없다: {out!r}"
         assert "알 수 없" in out, f"이전 중단분 불명 표시가 요약에 없다: {out!r}"
+        # vectors 축은 1회차에서 이미 done(구조적 미지원, `_NoVec`)이라 2회차(재개)는
+        # 축 스킵 분기를 탄다 — 그 분기의 `vec_available` 기본값(`True`)이 여기서
+        # "미지원"으로 정확히 드러나는지 고정한다(mutation testing 대상, #327 로컬
+        # 지적: 저널이 kind/vec_available 을 저장하지 않아 스킵 분기는 원래 갈래를
+        # 복원 못 하고 기본값에 의존한다).
+        assert "미지원" in out, f"재개 실행의 벡터 축 표시가 미지원이 아니다: {out!r}"
 
 
 # ---------------------------------------------------------------------------
