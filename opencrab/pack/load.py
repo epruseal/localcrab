@@ -915,7 +915,7 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
 
 
 def _delete_pack_vectors(
-    pack_name: str, vec, vec_available: bool
+    pack_name: str, vec, vec_available: bool | None
 ) -> tuple[int | None, str | None, bool]:
     """벡터 축 하나를 실행하고 `(chunk_vec_del, kind, vec_confirmed)` 를 돌려준다.
 
@@ -927,13 +927,25 @@ def _delete_pack_vectors(
     vectors 축 자체는 시도됐다는 기록조차 없이 유실된다). `available` 은
     `delete_pack` 호출당 정확히 한 곳(드리프트 탐침)에서만 읽는다.
 
+    `vec_available` 은 `bool | None` 이다(#327 리뷰 P2-2). `None` 은 그 한 번의
+    `available` 읽기 자체가 예외로 실패했다는 뜻으로, `False`(읽기는 성공했고
+    백엔드가 스스로 미가용이라고 답했다)와 구분한다. 이 구분은 새 계약이 아니라
+    이 PR 이 이미 세운 "구조적 미지원"과 "확인 불가"의 구분(#165 R1/R2 확인-건수
+    규율, `지적 1: 드리프트 감지` 의 v2 — 구조적 미지원과 확인 불가를 분리)을
+    `available` 값 자체에 한 자리 더 적용한 것이다: 읽기 실패는 "확인 불가"이지
+    "구조적으로 없다"가 아니므로, 아래 갈래 1(구조적 미지원)로 흘려보내면 안
+    된다.
+
     `chunk_vec_del`(#165 확인-건수 규율, R1/R2 는 아래 본문 참고)과 `vec_confirmed`
     (#327 재개 저널의 `done`/`clean` 판정 근거)는 **서로 다른 축**이다. 섞으면 안
     되는 이유: `chunk_vec_del` 은 "몇 건 지웠는지"만 말하고, chroma 조회가 아예
     안 읽혀 삭제를 시도조차 안 했을 때도 참인 값 `0`(0건 삭제가 확인된 사실)을
     낸다 — 그 `0` 을 "축 완료"로 오인하면 다시 조회하면 나을 상황을 영구 방치한다.
 
-    **세 갈래(#327 로컬 지적 4)**:
+    **네 갈래(#327 로컬 지적 4, P2-2 로 갈래 0 추가)**:
+      0. `available` 읽기 자체가 실패했다(`vec_available is None`) → 가용성을
+         몰라서 실패한 것이지 확실히 벡터스토어가 없는 것이 아니므로, 모양
+         판별 결과와 무관하게 무조건 `vec_confirmed=False`(재시도 대상).
       1. 백엔드 모양 자체가 없다(`_vec_shape` 가 `None`, 예: `_NoVec`) → 구조적
          미지원 — 대기할 것이 없으므로 즉시 `vec_confirmed=True`(#165 기존 계약과
          동형, `chunk_vec_del=0`).
@@ -949,6 +961,12 @@ def _delete_pack_vectors(
     kind = None
     chroma_unreadable = ""
     vec_confirmed = True
+    if vec_available is None:
+        vec_confirmed = False            # 갈래 0 — 가용성 확인 자체가 실패, 재시도 대상
+        log.warning(
+            "벡터 백엔드 가용성 확인 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+            _safe_type_name(vec), pack_name)
+        return chunk_vec_del, kind, vec_confirmed
     if not vec_available:
         try:
             has_shape = _vec_shape(vec)[0] is not None
@@ -1265,12 +1283,23 @@ def delete_pack(
         try:
             vec_available = bool(vec.available)
         except Exception:
-            vec_available = False
+            # [#327 리뷰 P2-2] 읽기 자체가 실패했다는 사실을 "정상적으로
+            # available=False 라고 확인했다"와 뭉개면 안 된다 — 이 PR 이 이미
+            # 세운 "구조적 미지원 vs 확인 불가" 구분(#165 R1/R2)을 이 값에도
+            # 적용해 `None` sentinel 로 구분한다. `_delete_pack_vectors` 는
+            # `None` 을 무조건 재시도 대상(갈래 0)으로 다룬다.
+            vec_available = None
         try:
             _vec_shape_kind = _vec_shape(vec)[0]
         except Exception:
             _vec_shape_kind = None
-        vectors_drift = _vec_shape_kind is not None and not vec_available
+        # `vec_available is None`(읽기 자체가 실패)이면 모양 판별 결과와
+        # 무관하게 무조건 드리프트로 잡는다 — 그래야 이미 done=True 로 확정된
+        # 축도 재개 호출에서 다시 시도된다(설계검증 r1 DISAGREE: 이 항이
+        # 없으면 `_vec_shape_kind is None` 인 조합에서 아래 식 전체가 `False`가
+        # 되어 재확인 자체가 일어나지 않는다).
+        vectors_drift = vec_available is None or (
+            _vec_shape_kind is not None and vec_available is False)
 
         # ── 1. node_twin_loop: doc 트윈 삭제. 개별 노드 실패는 삼키고 계속 진행하되
         # (기존 관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로 done=False 를
