@@ -226,7 +226,6 @@ _SAFE_TARGET_QUERY_KEYS = frozenset(
         "connect_timeout",
         "application_name",
         "fallback_application_name",
-        "options",
         "keepalives",
         "keepalives_idle",
         "keepalives_interval",
@@ -270,6 +269,18 @@ def target_identity_reason(engine: Any) -> str | None:
     이 값들은 프로세스 환경이라 DSN을 아무리 명확히 적어도 스냅샷 기록
     (``engine.url.host``/``port``)과 실제 접속 서버가 갈라질 수 있으므로,
     query 키와 같은 이유로 함께 거부한다.
+
+    host/port가 확정돼도 부족한 경우가 하나 더 있다: ``options`` query 키
+    (그리고 이를 DSN 없이 대신하는 ``PGOPTIONS`` 환경변수)는 libpq에
+    ``-c search_path=other_schema`` 같은 접속 시점 GUC를 전달해 같은 호스트/
+    포트/데이터베이스 안에서도 실제로 쓰는 스키마를 바꿀 수 있다. 스냅샷
+    서명은 table/database/host/port만 기록하고 스키마는 기록하지 않으므로,
+    수리와 롤백이 서로 다른 ``options``/``PGOPTIONS``로 다른 스키마를
+    가리키면 서명은 그대로 일치해 통과하면서도 실제로는 의도한 것과 다른
+    릴레이션에 적용된다(이중 적대검증, 코덱스 리뷰의 실측 재현). ``options``는
+    임의의 GUC를 실을 수 있는 자유 형식 문자열이라 ``search_path``만 골라
+    걸러내는 파싱은 새로운 우회 형태를 계속 놓칠 위험이 있으므로, 이 도구는
+    ``options``/``PGOPTIONS`` 자체를 아예 허용하지 않는다.
     ``main()``과 ``repair()``가 이 판정을 공유해 CLI 경로와 직접 호출 경로가
     어긋나지 않게 한다.
     """
@@ -295,7 +306,9 @@ def target_identity_reason(engine: Any) -> str | None:
             "snapshot cannot be bound to one server for this target"
         )
     env_blocked = sorted(
-        key for key in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE") if os.environ.get(key)
+        key
+        for key in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE", "PGOPTIONS")
+        if os.environ.get(key)
     )
     if env_blocked:
         return (

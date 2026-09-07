@@ -449,6 +449,36 @@ class TestTargetIdentityRejectsUnknownQueryKeys:
         assert repair.target_identity_reason(engine) is None
 
 
+class TestTargetIdentityRejectsSchemaBindingEscapeHatches:
+    """이중 적대검증(코덱스 리뷰)이 실측 재현한 실결함: ``options`` query 키는
+    이전까지 ``_SAFE_TARGET_QUERY_KEYS``에 안전 키로 올라 있었지만,
+    ``options=-c search_path=other_schema``처럼 접속 시점 스키마를 바꿀 수
+    있다. 스냅샷 서명은 table/database/host/port만 기록하고 스키마는 기록하지
+    않으므로, 수리와 롤백이 ``options``로 서로 다른 스키마를 가리키면
+    서명은 그대로 일치해 통과하면서도 실제로는 의도한 것과 다른 릴레이션에
+    적용된다. ``PGOPTIONS`` 환경변수도 DSN이 옵션을 생략했을 때 같은 방식으로
+    적용되므로 같은 이유로 거부한다."""
+
+    def test_options_query_key_is_rejected(self):
+        engine = repair.connect(
+            "postgresql://u:p@localhost/db?options=-c%20search_path%3Dother"
+        )
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "options" in reason
+
+    def test_pgoptions_env_var_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PGOPTIONS", "-c search_path=other")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "PGOPTIONS" in reason
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
