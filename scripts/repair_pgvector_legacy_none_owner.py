@@ -206,9 +206,13 @@ def target_identity_reason(engine: Any) -> str | None:
     문자열에 ``host``/``port``/``service``/``hostaddr``가 있으면 그 값으로
     실제 연결 대상을 덮어쓴다(authority의 host는 무시됨). 예:
     ``postgresql://u:p@localhost/db?host=h2,h3`` 는 ``engine.url.host``가
-    ``'localhost'``로 무해해 보이지만 실제 연결은 ``h2,h3``로 간다. 다중
-    호스트·PostgreSQL service 설정·소켓-경유-쿼리스트링 형태는 이런 식으로
-    authority만으로는 검출되지 않으므로 query 키 자체를 함께 거부한다.
+    ``'localhost'``로 무해해 보이지만 실제 연결은 ``h2,h3``로 간다. 또한
+    authority 자체에 콤마로 구분한 다중 호스트(``postgresql://u:p@h1,h2/db``,
+    libpq의 다중-호스트/failover 문법)를 적어도 ``engine.url.host``가
+    ``'h1,h2'``라는 비어 있지 않은 문자열이 되어 위 빈 값 검사를 통과하지만,
+    실제 연결은 h1과 h2 가운데 그때그때 다른 서버로 갈 수 있어 스냅샷을 한
+    서버에 결속할 수 없다. PostgreSQL service 설정, 소켓-경유-쿼리스트링
+    형태도 authority만으로는 검출되지 않으므로 query 키 자체를 함께 거부한다.
     ``main()``과 ``repair()``가 이 판정을 공유해 CLI 경로와 직접 호출 경로가
     어긋나지 않게 한다.
     """
@@ -217,6 +221,12 @@ def target_identity_reason(engine: Any) -> str | None:
             "cannot resolve a single host for this --pg-url (empty/ambiguous "
             "host: multi-host authority, PostgreSQL service config, or "
             "Unix-socket-via-query-parameter forms are not supported)"
+        )
+    if "," in engine.url.host:
+        return (
+            f"--pg-url authority names multiple hosts ({engine.url.host!r}); "
+            "libpq may connect to any one of them, so a rollback-safe "
+            "snapshot cannot be bound to a single server for this target"
         )
     blocked = _AMBIGUOUS_TARGET_QUERY_KEYS & set(engine.url.query)
     if blocked:

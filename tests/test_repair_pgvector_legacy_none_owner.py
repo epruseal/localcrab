@@ -336,6 +336,24 @@ class TestRollbackIsRefusedWhenTargetIdentityIsAmbiguous:
         assert _all_rows(pg_store) == before, "대상 서버를 특정할 수 없는데 롤백이 실행됐다"
 
 
+class TestTargetIdentityRejectsMultiHostAuthority:
+    """이중 적대검증(외부 CLI 채널)이 새로 발견한 실결함: 콤마로 구분한 다중
+    호스트 authority(``postgresql://u:p@h1,h2/db``, libpq의 다중-호스트/failover
+    문법)는 ``engine.url.host``가 ``'h1,h2'``라는 비어 있지 않은 문자열이 되어
+    빈 host 검사를 통과했지만, 실제 연결은 h1/h2 가운데 그때그때 다른 서버로
+    갈 수 있어 스냅샷을 한 서버에 결속할 수 없다. 이 DSN은 실제로 연결하지
+    않으므로(``connect()``는 지연 연결) 실 PostgreSQL 없이도 이 테스트를 돌릴
+    수 있다."""
+
+    def test_comma_separated_host_authority_is_rejected(self):
+        engine = repair.connect("postgresql://u:p@host-a,host-b/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "host-a,host-b" in reason
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
