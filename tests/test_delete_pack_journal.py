@@ -733,6 +733,142 @@ class TestVectorUnconfirmedNeverBecomesDone:
 
 
 # ---------------------------------------------------------------------------
+# 4-2. PR #360 리뷰 지적 1+2 — done 저널의 사후 드리프트를 무조건 신뢰하지 않는다.
+# ---------------------------------------------------------------------------
+
+class _SqlalchemyShapedButEngineNone:
+    """`_engine` 속성은 있으나 값이 `None`(연결 실패)인 sqlalchemy 모양 벡터
+    스토어 — PR #360 리뷰 지적 2의 정확한 재현(`PgVectorStore(_engine=None)`)이다.
+    `_vec_shape` 가 값 기준(`getattr(...) is not None`)으로 모양을 판정하면 이
+    객체는 "모양 없음"(구조적 미지원, `_NoVec` 과 동류)으로 오분류돼 vectors
+    축이 즉시 done=True 로 확정된다 — hasattr 기준으로 바뀌어야 "모양은 있는데
+    지금 비어 있다"(연결 실패)로 옳게 분류된다."""
+
+    available = False
+    _engine = None
+
+    def delete(self, ids):  # pragma: no cover -- available=False라 호출 안 됨
+        pass
+
+
+class TestDoneJournalDriftRecheck:
+    def test_shaped_but_engine_none_backend_stays_not_done(self, live, tmp_path):
+        """[리뷰 지적 2, `_vec_shape` 값 기준 → hasattr 기준 재작성] `_engine`
+        속성이 존재하지만 값이 `None`(연결 실패)인 sqlalchemy 모양 벡터스토어는
+        "구조적 미지원"이 아니라 "연결 실패"로 분류돼 vectors 축이 즉시
+        done=True 로 확정되면 안 된다.
+
+        역변이: `_vec_shape` 를 값 기준(`getattr(vec, "_engine", None) is not
+        None`)으로 되돌리면 이 테스트가 잡는다 — `_engine=None` 이 구조적
+        미지원으로 오분류돼 vectors 축이 즉시 done=True 로 확정된다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecenginenone-pack", ["h1"])
+        vec = _SqlalchemyShapedButEngineNone()
+        pack_load.delete_pack("vecenginenone-pack", graph, docs, vec)
+        journal = delete_journal.load_journal(tmp_path, "vecenginenone-pack")
+        assert journal["axes"]["vectors"]["done"] is False, (
+            "_engine=None(연결 실패, sqlalchemy 모양)인데 done=True로 잘못 "
+            f"확정됐다: {journal['axes']['vectors']!r}"
+        )
+
+    def test_orphan_doc_nodes_added_after_completion_are_swept_on_resume(
+        self, live, tmp_path
+    ):
+        """[리뷰 지적 1] `doc_node_extra_and_sources` 축이 이미 done=True 로
+        완료된 뒤, 같은 팩 이름으로 태그된 고아 doc_nodes 행이 **새로** 생기면
+        (완료 이후 유입 — 백필, 재수집 등) `resume=True` 재실행이 그 행을 실제로
+        지워야 한다. `done` 플래그를 영구 신뢰하면 이 새 행은 영원히 스킵된다.
+
+        역변이: `live_docs`/`doc_nodes_live` 드리프트 신호를 게이팅에서 빼면(즉
+        `if not _axis_done("doc_node_extra_and_sources"):` 로만 판정하면) 이
+        테스트가 잡는다 — done=True 저널을 그대로 신뢰해 새 고아 행을 지우지 않는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "docdrift-pack", ["e1"])
+        n1, *_ = pack_load.delete_pack("docdrift-pack", graph, docs, _NoVec())
+        assert n1 == 1
+        journal = delete_journal.load_journal(tmp_path, "docdrift-pack")
+        assert journal["axes"]["doc_node_extra_and_sources"]["done"] is True
+
+        # 완료 이후 유입을 흉내낸다 — 같은 pack_id 로 태그된 고아 doc_nodes 행을
+        # 그래프 트윈 없이 직접 심는다(`test_pack_load.py` 의 "보강 경로" 검사와
+        # 동일한 방식 — 스키마를 읽어 NOT NULL 컬럼을 채운다).
+        cols = {r[1]: r for r in docs._conn.execute("PRAGMA table_info(doc_nodes)")}
+        vals = {"space": "resource", "node_id": "orphan-drift-1",
+                "properties": json.dumps({"pack_id": "docdrift-pack"})}
+        for name, info in cols.items():
+            if name in vals or info[4] is not None:      # 이미 채웠거나 기본값 있음
+                continue
+            if info[3]:                                   # NOT NULL
+                vals[name] = "1970-01-01T00:00:00Z" if "at" in name else ""
+        docs._conn.execute(
+            f"INSERT INTO doc_nodes ({','.join(vals)}) "
+            f"VALUES ({','.join('?' * len(vals))})", tuple(vals.values()))
+        docs._conn.commit()
+
+        n2, *_ = pack_load.delete_pack(
+            "docdrift-pack", graph, docs, _NoVec(), resume=True)
+        assert n2 == 1, (
+            f"완료 이후 유입된 고아 doc_nodes 행이 재개에서 안 지워졌다 (실제 {n2})"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "docdrift-pack")
+        assert journal2["axes"]["doc_node_extra_and_sources"]["done"] is True
+
+    def test_done_vectors_axis_rechecked_when_backend_becomes_unavailable(
+        self, live, tmp_path
+    ):
+        """[리뷰 지적 1+2] vectors 축이 `available=True` 백엔드로 이미
+        done=True 완료된 뒤, 같은 팩을 (모양은 chroma 지만) `available=False`
+        백엔드로 재개하면 done=True 저널을 그대로 스킵하지 않고 축을 다시
+        시도해 `done=False` 로 되돌려야 한다 — "확인 불가" 상태를 "확인 완료"
+        로 영원히 보고하면 안 된다.
+
+        역변이: `vectors_drift` 게이팅을 되돌리면(`if not _axis_done("vectors"):`
+        로만 판정하면) 이 테스트가 잡는다 — done=True 저널을 그대로 스킵한다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecdrift-pack", ["f1"])
+        vec1 = _FakeChromaVec({"f1": "vecdrift-pack"})
+        pack_load.delete_pack("vecdrift-pack", graph, docs, vec1)
+        journal = delete_journal.load_journal(tmp_path, "vecdrift-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+        vec2 = _ChromaShapedButUnavailable()
+        pack_load.delete_pack("vecdrift-pack", graph, docs, vec2, resume=True)
+        journal2 = delete_journal.load_journal(tmp_path, "vecdrift-pack")
+        assert journal2["axes"]["vectors"]["done"] is False, (
+            "백엔드가 unavailable 로 바뀌었는데 done=True 저널을 그대로 스킵했다: "
+            f"{journal2['axes']['vectors']!r}"
+        )
+
+    def test_available_vectors_axis_skip_still_does_not_requery_backend(
+        self, live, tmp_path
+    ):
+        """[v3 설계 트레이드오프 확인] `available=True` 인 채로 완료된 vectors
+        축은 사후 드리프트가 있어도 재조회하지 않는다 — 기존 계약
+        (`TestResumeSkipDoesNotReuseCountInReturnValue`)이 잠근 "이미 완료·
+        available 한 벡터스토어는 매 재개마다 재조회하지 않는다" 를 이번에
+        추가한 드리프트 신호가 깨지 않았음을 확인하는 회귀 대조군이다.
+
+        역변이: `vectors_drift` 가 `available=True` 를 무시하고 무조건 쿼리를
+        내게 고치면 이 테스트가 잡는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecnodrift-pack", ["g1"])
+        vec1 = _FakeChromaVec({"g1": "vecnodrift-pack"})
+        pack_load.delete_pack("vecnodrift-pack", graph, docs, vec1)
+
+        vec2 = _FakeChromaVec({"g1": "vecnodrift-pack"})  # available=True, 내용도 있음
+        pack_load.delete_pack("vecnodrift-pack", graph, docs, vec2, resume=True)
+        assert not vec2._collection.get_where_calls, (
+            "이미 done 이고 available 인 vectors 축인데 재개 호출이 벡터스토어를 재조회했다"
+        )
+        journal = delete_journal.load_journal(tmp_path, "vecnodrift-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+
+# ---------------------------------------------------------------------------
 # 5. 로컬 지적 7 — doc 축(node_twin_loop) sticky 실패 플래그 + doc→graph 게이팅.
 # ---------------------------------------------------------------------------
 
