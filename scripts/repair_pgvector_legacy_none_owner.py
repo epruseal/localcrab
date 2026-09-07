@@ -213,6 +213,15 @@ def target_identity_reason(engine: Any) -> str | None:
     실제 연결은 h1과 h2 가운데 그때그때 다른 서버로 갈 수 있어 스냅샷을 한
     서버에 결속할 수 없다. PostgreSQL service 설정, 소켓-경유-쿼리스트링
     형태도 authority만으로는 검출되지 않으므로 query 키 자체를 함께 거부한다.
+
+    DSN 문자열만으로는 부족하다: ``PGHOSTADDR``/``PGSERVICE``/``PGSERVICEFILE``
+    환경변수는 DSN이 그 값을 직접 주지 않는 한 실제 연결 시점에 적용돼,
+    DSN의 host와 무관한 주소로 연결을 보낼 수 있다(실측: DSN host가
+    존재하지 않는 이름이어도 ``PGHOSTADDR``가 설정돼 있으면 그 주소로 연결에
+    성공한다). ``PGPORT``도 DSN이 포트를 생략했을 때만 같은 방식으로 적용된다.
+    이 값들은 프로세스 환경이라 DSN을 아무리 명확히 적어도 스냅샷 기록
+    (``engine.url.host``/``port``)과 실제 접속 서버가 갈라질 수 있으므로,
+    query 키와 같은 이유로 함께 거부한다.
     ``main()``과 ``repair()``가 이 판정을 공유해 CLI 경로와 직접 호출 경로가
     어긋나지 않게 한다.
     """
@@ -234,6 +243,21 @@ def target_identity_reason(engine: Any) -> str | None:
             f"--pg-url query string sets {sorted(blocked)}, which can override "
             "the authority host/port at connect time; a rollback-safe snapshot "
             "cannot be bound to one server for this target"
+        )
+    env_blocked = sorted(
+        key for key in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE") if os.environ.get(key)
+    )
+    if env_blocked:
+        return (
+            f"environment variable(s) {env_blocked} are set, which can override "
+            "the connection target at connect time regardless of --pg-url; a "
+            "rollback-safe snapshot cannot be bound to one server for this target"
+        )
+    if engine.url.port is None and os.environ.get("PGPORT"):
+        return (
+            "--pg-url omits an explicit port and the PGPORT environment "
+            "variable is set, which can override the connect-time port; a "
+            "rollback-safe snapshot cannot be bound to one server for this target"
         )
     return None
 

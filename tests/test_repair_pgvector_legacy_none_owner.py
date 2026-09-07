@@ -354,6 +354,67 @@ class TestTargetIdentityRejectsMultiHostAuthority:
         assert "host-a,host-b" in reason
 
 
+class TestTargetIdentityRejectsAmbiguousEnvironment:
+    """이중 적대검증(3라운드, 새 컨텍스트 검증자)이 실측 재현한 실결함: DSN이
+    host를 확정적으로 적어도 ``PGHOSTADDR``/``PGSERVICE``/``PGSERVICEFILE``
+    환경변수가 설정돼 있으면 실제 연결은 DSN과 무관한 서버로 갈 수 있다.
+    존재하지 않는 host 이름을 DSN에 적고 ``PGHOSTADDR``를 실 테스트 서버
+    주소로 설정했더니 연결이 실제로 성공했다(직접 재현, 이 테스트 자체는
+    연결하지 않으므로 실 PostgreSQL 없이도 돌릴 수 있다). ``PGPORT``도 DSN이
+    포트를 생략했을 때만 같은 방식으로 적용된다. ``PGHOST``는 DSN이 host를
+    이미 준 경우 무해하므로(libpq는 명시적 conninfo 값을 환경보다 우선한다)
+    거부 대상에 넣지 않는다 -- 그 경우는 host 자체가 비어 있을 때만 걸리는
+    빈 host 검사(위)로 이미 충분하다."""
+
+    def test_pghostaddr_env_var_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PGHOSTADDR", "192.0.2.1")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "PGHOSTADDR" in reason
+
+    def test_pgservice_env_var_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PGSERVICE", "some-service")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "PGSERVICE" in reason
+
+    def test_pgservicefile_env_var_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PGSERVICEFILE", "/nonexistent/service.conf")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "PGSERVICEFILE" in reason
+
+    def test_pgport_env_var_is_rejected_when_dsn_omits_port(self, monkeypatch):
+        monkeypatch.setenv("PGPORT", "1")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        reason = repair.target_identity_reason(engine)
+
+        assert reason is not None
+        assert "PGPORT" in reason
+
+    def test_pgport_env_var_is_harmless_when_dsn_states_port_explicitly(self, monkeypatch):
+        monkeypatch.setenv("PGPORT", "1")
+        engine = repair.connect("postgresql://u:p@localhost:5432/db")
+
+        assert repair.target_identity_reason(engine) is None
+
+    def test_pghost_env_var_alone_is_harmless_when_dsn_states_host(self, monkeypatch):
+        monkeypatch.setenv("PGHOST", "some-other-host")
+        engine = repair.connect("postgresql://u:p@localhost/db")
+
+        assert repair.target_identity_reason(engine) is None
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
