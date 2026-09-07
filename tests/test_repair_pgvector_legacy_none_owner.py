@@ -686,6 +686,99 @@ class TestBackupFailureRollsBackTheWholeTransaction:
         assert _all_rows(pg_store) == before, "백업 실패에도 DB 트랜잭션이 커밋됐다"
 
 
+class TestCommitFailureAfterBackupPublishDoesNotLeaveAStaleBackup:
+    """새 컨텍스트 검증자가 실측 재현한 결함: ``write_backup_atomic``이 이미
+    성공한 뒤(백업 파일 게시 완료) ``trans.commit()``이 실패하면, DB는
+    롤백되는데 백업 파일은 그대로 남아 커밋되지 않은 수리를 가리킨다. 이후
+    ``--apply`` 재시도는 그 파일이 이미 있다는 이유로 ``FileExistsError``에
+    영구히 막힌다."""
+
+    @staticmethod
+    def _patch_commit(monkeypatch, wrapper_cls):
+        from sqlalchemy.engine import Connection
+
+        real_begin = Connection.begin
+
+        def fake_begin(self):
+            return wrapper_cls(real_begin(self))
+
+        monkeypatch.setattr(Connection, "begin", fake_begin)
+        return real_begin
+
+    def test_definite_commit_failure_removes_the_stray_backup(
+        self, pg_store, tmp_path, monkeypatch
+    ):
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        before = _all_rows(pg_store)
+
+        class _CommitFails:
+            def __init__(self, real_trans):
+                self._real = real_trans
+
+            def commit(self):
+                raise RuntimeError("simulated: commit rejected by server")
+
+            def rollback(self):
+                return self._real.rollback()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        from sqlalchemy.engine import Connection
+
+        real_begin = self._patch_commit(monkeypatch, _CommitFails)
+        try:
+            with pytest.raises(RuntimeError, match="simulated"):
+                repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        finally:
+            monkeypatch.setattr(Connection, "begin", real_begin)
+
+        assert not backup_path.exists(), (
+            "확정 실패한 커밋 뒤에도 게시된 백업 파일이 남아, 커밋되지 않은 수리를 "
+            "가리키는 채로 이후 --apply 재시도를 영구히 막는다"
+        )
+        assert _all_rows(pg_store) == before
+
+    def test_indeterminate_connection_loss_during_commit_keeps_the_backup(
+        self, pg_store, tmp_path, monkeypatch
+    ):
+        """연결 유실로 커밋이 실패하면 서버가 실제로 커밋했는지 알 수 없다.
+        이 경우 함부로 백업을 지우면 실제로는 성공한 수리의 유일한 복구
+        수단을 잃을 수 있으므로, 애매한 경우에는 백업을 남겨 둔다."""
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+
+        class _CommitFailsIndeterminate:
+            def __init__(self, real_trans):
+                self._real = real_trans
+
+            def commit(self):
+                exc = RuntimeError("simulated: connection lost during commit")
+                exc.connection_invalidated = True
+                raise exc
+
+            def rollback(self):
+                return self._real.rollback()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        from sqlalchemy.engine import Connection
+
+        real_begin = self._patch_commit(monkeypatch, _CommitFailsIndeterminate)
+        try:
+            with pytest.raises(RuntimeError, match="simulated"):
+                repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        finally:
+            monkeypatch.setattr(Connection, "begin", real_begin)
+
+        assert backup_path.exists(), (
+            "커밋 결과가 불명확한(연결 유실) 실패에서는 백업을 지우면 안 된다 -- "
+            "서버에서 실제로 커밋됐을 수 있는 유일한 복구 수단을 잃는다"
+        )
+
+
 class TestCountMismatchAborts:
     def test_repair_raises_and_rolls_back_on_precount_disagreement(self, pg_store, monkeypatch):
         pg_store.upsert_texts(texts=["정상"], metadatas=[{"pack_id": "A"}], ids=["owned"])
@@ -818,6 +911,76 @@ class TestRollbackWarningBannerPrecedesTheDestructiveCall:
 
         assert code == repair.EXIT_OK
         assert calls == ["warned_before_rollback"], "rollback()이 호출되지 않았다"
+
+
+class TestRollbackValidatesIdentityOnTheSameConnectionItExecutesOn:
+    """새 컨텍스트 검증자가 실측 재현한 결함: 예전에는 서명 검사(연결 1)와
+    실제 롤백 실행(연결 2)이 서로 다른 연결에서 일어나, 그 사이 창에서 풀이
+    재연결되거나 대상 테이블이 교체돼도 검사와 실행이 서로 다른 대상을 보게
+    할 수 있었다. 이제는 ``rollback()`` 하나가 같은 연결/트랜잭션 안에서
+    ``LOCK TABLE``로 먼저 잠그고, 그 잠금 아래서 서명을 검사한 뒤 실제 행을
+    갱신한다."""
+
+    def test_rollback_rejects_a_host_mismatched_snapshot_before_touching_any_row(
+        self, pg_store, tmp_path
+    ):
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        snapshot = repair.load_snapshot(str(backup_path))
+        snapshot["host"] = "not-the-real-host.invalid"
+        before = _all_rows(pg_store)
+
+        with pytest.raises(repair.SnapshotError):
+            repair.rollback(pg_store._engine, pg_store._table, snapshot)
+
+        assert _all_rows(pg_store) == before, (
+            "서명이 불일치하는 스냅샷인데도 일부 행이 갱신됐다 -- 검사가 실제 "
+            "실행과 같은 트랜잭션 안에서 행 갱신보다 먼저 일어나지 않았다"
+        )
+
+    def test_a_concurrent_exclusive_lock_is_blocked_while_rollback_is_in_flight(
+        self, pg_store, tmp_path, monkeypatch
+    ):
+        """롤백이 실제 행을 갱신하는 도중(이미 서명 검사를 통과해 LOCK TABLE을
+        쥔 시점)에는, 다른 연결이 같은 테이블에 배타적 잠금을 즉시 얻지
+        못해야 한다. ``_rollback_row_sql``을 스파이로 감싸 그 시점을
+        결정적으로 붙잡는다."""
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        snapshot = repair.load_snapshot(str(backup_path))
+
+        engine = pg_store._engine
+        table = pg_store._table
+        probe: dict[str, object] = {}
+        real_rollback_row_sql = repair._rollback_row_sql
+
+        def spy_sql(t):
+            if "checked" not in probe:
+                probe["checked"] = True
+                other = engine.connect()
+                try:
+                    other.execute(text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE NOWAIT"))
+                    probe["acquired"] = True
+                except Exception:
+                    probe["acquired"] = False
+                finally:
+                    other.rollback()
+                    other.close()
+            return real_rollback_row_sql(t)
+
+        monkeypatch.setattr(repair, "_rollback_row_sql", spy_sql)
+        try:
+            repair.rollback(engine, table, snapshot)
+        finally:
+            monkeypatch.setattr(repair, "_rollback_row_sql", real_rollback_row_sql)
+
+        assert probe.get("checked") is True, "스파이가 호출되지 않았다"
+        assert probe.get("acquired") is False, (
+            "롤백이 행을 갱신하는 도중에도 다른 연결이 같은 테이블에 배타적 "
+            "잠금을 즉시 얻을 수 있었다 -- ACCESS SHARE 잠금이 걸려 있지 않다"
+        )
 
 
 class TestBackupSignatureAndSnapshotIntegrity:

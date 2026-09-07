@@ -621,9 +621,19 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
     대상 행이 있는 한 백업 게시 성공이 커밋의 전제조건이고, backup_to가
     있어도 대상 행이 0건이면 애초에 백업할 내용도 없다. backup_to가 없는
     (--skip-backup) 경로는 이 전제 자체가 걸리지 않는다.
+
+    반대 방향("백업 게시 + DB 커밋 실패")도 처리한다(이중 적대검증, 코덱스
+    리뷰의 실측 재현): 백업이 이미 게시된 뒤 ``trans.commit()``이 확정적으로
+    실패하면(제약 위반 등, 서버가 트랜잭션을 abort 했다고 보장되는 경우) 그
+    백업 파일을 지운다 -- 안 지우면 커밋되지 않은 수리를 가리키는 파일이
+    남아 이후 재시도를 ``FileExistsError``로 영구히 막는다. 다만 실패가
+    연결 유실(``connection_invalidated``)로 인한 것이면 서버가 실제로
+    커밋했는지 알 수 없으므로, 그때는 백업을 지우지 않고 그대로 둔다 --
+    함부로 지우면 실제로는 성공한 수리의 유일한 복구 수단을 잃을 수 있다.
     """
     from sqlalchemy import text
 
+    backup_published = False
     with engine.connect() as conn:
         trans = conn.begin()
         try:
@@ -663,9 +673,15 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                     "rows": result_rows,
                 }
                 write_backup_atomic(backup_to, snapshot)
+                backup_published = True
             trans.commit()
-        except Exception:
+        except Exception as exc:
             trans.rollback()
+            if backup_published and not getattr(exc, "connection_invalidated", False):
+                try:
+                    os.unlink(backup_to)
+                except OSError:
+                    pass
             raise
     return result_rows
 
@@ -681,13 +697,28 @@ ROLLBACK_STATUS_DELETED = "skipped_deleted"
 
 def rollback(engine: Any, table: str, snapshot: dict[str, Any]) -> dict[str, str]:
     """스냅샷의 각 행을 ``xmin`` 지문이 일치할 때만 되돌린다. 불일치/삭제된 행은
-    조용히 건너뛰지 않고 상태를 개별 보고한다(호출자가 부분 처리를 확인하도록)."""
+    조용히 건너뛰지 않고 상태를 개별 보고한다(호출자가 부분 처리를 확인하도록).
+
+    서명 검사(database/schema 대사)와 실제 롤백 실행을 같은 연결의 같은
+    트랜잭션 안에서 수행한다(이중 적대검증, 코덱스 리뷰의 실측 재현: 이전에는
+    검사에 쓴 연결을 닫고 별도 연결로 롤백을 실행해, 그 사이 창에서 커넥션
+    풀이 재연결되거나 대상 테이블이 교체돼도 검사와 실행이 서로 다른 대상을
+    볼 수 있었다). 트랜잭션의 첫 문장으로 대상 테이블에 ACCESS SHARE 잠금을
+    걸어, 검사 시점부터 커밋까지 그 이름이 가리키는 릴레이션이 바뀌지
+    못하게 막는다(``LOCK TABLE``도 ``_repair_sql``과 같은 비한정 이름을 써서
+    같은 ``search_path`` 해석 규칙을 그대로 따른다)."""
     from sqlalchemy import text
 
     statuses: dict[str, str] = {}
     with engine.connect() as conn:
         trans = conn.begin()
         try:
+            conn.execute(text(f"LOCK TABLE {table} IN ACCESS SHARE MODE"))
+            database = conn.execute(text("SELECT current_database()")).scalar()
+            schema = _resolve_table_schema(conn, table)
+            host = engine.url.host
+            port = engine.url.port if engine.url.port is not None else 5432
+            validate_snapshot_signature(snapshot, table, database, host, port, schema)
             for row in snapshot["rows"]:
                 node_id = row["node_id"]
                 res = conn.execute(
@@ -755,8 +786,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"! could not connect: {exc}")
         return EXIT_PRECONDITION
 
-    host = engine.url.host
-    port = engine.url.port if engine.url.port is not None else 5432
     identity_reason = target_identity_reason(engine)
 
     if args.rollback_from:
@@ -777,16 +806,6 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError, SnapshotError) as exc:
             print(f"! could not load snapshot: {exc}")
             return EXIT_BACKUP
-        from sqlalchemy import text
-
-        with engine.connect() as conn:
-            database = conn.execute(text("SELECT current_database()")).scalar()
-            schema = _resolve_table_schema(conn, table)
-        try:
-            validate_snapshot_signature(snapshot, table, database, host, port, schema)
-        except SnapshotError as exc:
-            print(f"! {exc}")
-            return EXIT_BACKUP
 
         print(
             "! WARNING: rollback matches rows via PostgreSQL 'xmin', which "
@@ -797,7 +816,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-        statuses = rollback(engine, table, snapshot)
+        # 서명 검사(database/schema 대사)는 rollback() 안에서, 실제 롤백을
+        # 실행하는 것과 같은 연결/트랜잭션으로 수행한다(이중 적대검증, 코덱스
+        # 리뷰의 실측 재현: 검사와 실행이 서로 다른 연결이면 그 사이 창에서
+        # 풀 재연결이나 대상 교체가 검사를 무의미하게 만들 수 있었다).
+        try:
+            statuses = rollback(engine, table, snapshot)
+        except SnapshotError as exc:
+            print(f"! {exc}")
+            return EXIT_BACKUP
         done = sum(1 for s in statuses.values() if s == ROLLBACK_STATUS_DONE)
         total = len(statuses)
         for node_id, status in statuses.items():
