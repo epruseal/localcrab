@@ -59,11 +59,18 @@ SAFETY (Autonomy Contract 매핑):
     직접 롤백을 포기한 경로이므로).
   - **알려진 한계 (대상 서버 식별)**: ``target_identity_reason``이 보는
     근거는 DSN 문자열과 프로세스 환경(``PGHOSTADDR``/``PGSERVICE``/
-    ``PGSERVICEFILE``/``PGPORT`` 등)뿐이다. 이 식별 검사는 ``main()``이
-    수행한다. ``rollback()``이나 ``repair()``를 라이브러리로 직접
-    호출하면(테스트가 실제로 이렇게 호출한다) 그 검사를 거치지 않는다.
-    이 모듈의 ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
-    ``Engine``을 넘기는 경로도 마찬가지로 이 판정 범위 밖이다. 또한 이
+    ``PGSERVICEFILE``/``PGPORT`` 등)뿐이다. 이 검사를 조건 없이 수행하는
+    것은 ``main()``뿐이다(``--rollback-from`` 분기에 들어가기 전 1회).
+    ``repair()``는 ``backup_to``와 처리된 행이 모두 있을 때만 이 검사를
+    스스로 수행한다. 라이브러리로 직접 호출해도 이 조건이 성립하면 검사를
+    거친다. 다만 ``backup_to``가 없거나(``--skip-backup``) 처리 대상 행이
+    0건이면 ``repair()``는 이 검사를 건너뛴다. ``rollback()``은 반대로 어떤
+    호출 경로에서도 이 검사를 스스로 수행하지 않는다: CLI에서 오는
+    ``--rollback-from``만 ``main()``의 사전 검사를 거치고, 테스트처럼
+    ``rollback()``을 라이브러리로 직접 호출하면(``main()``을 거치지 않으므로)
+    이 식별 검사 자체가 없다. 이 모듈의 ``connect()``를 거치지 않고
+    ``connect_args``로 직접 만든 ``Engine``을 넘기는 경로도 마찬가지로 이
+    판정 범위 밖이다. 또한 이
     검사는 DSN의 호스트 이름이 안정적으로 같은 서버를 가리킨다고
     가정한다. DNS나 프록시가 같은 이름을 다른 서버로 돌리면 검사는
     통과하지만 실제 대상은 달라진다. (``_resolve_table_schema``는
