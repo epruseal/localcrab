@@ -57,10 +57,13 @@ SAFETY (Autonomy Contract 매핑):
     자체를 거부한다(코드 3, DB 쓰기 0건). ``--skip-backup``을 명시했을 때만
     같은 사유를 정보성으로 출력하고 스냅샷 없이 수리를 진행한다(운영자가
     직접 롤백을 포기한 경로이므로).
-  - **알려진 한계 (대상 서버 식별)**: ``target_identity_reason``과
-    ``_resolve_table_schema``가 보는 근거는 DSN 문자열과 프로세스 환경
-    (``PGHOSTADDR``/``PGSERVICE``/``PGSERVICEFILE``/``PGPORT`` 등)뿐이다.
-    이 모듈의 ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
+  - **알려진 한계 (대상 서버 식별)**: ``target_identity_reason``이 보는
+    근거는 DSN 문자열과 프로세스 환경(``PGHOSTADDR``/``PGSERVICE``/
+    ``PGSERVICEFILE``/``PGPORT`` 등)뿐이다(``_resolve_table_schema``는
+    이와 달리 이미 맺어진 연결 위에서 ``pg_namespace``/``pg_class``/
+    ``to_regclass()``를 직접 질의하므로 DSN/환경 근거에 의존하지 않지만,
+    그 연결 자체가 의도한 서버로 갔는지는 판정하지 않는다). 이 모듈의
+    ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
     ``Engine``을 ``repair()``/``rollback()``에 넘기면(``rollback()``은
     ``main()``을 거치지 않고 직접 호출될 수도 있다 -- 테스트가 그렇게
     쓴다), 실제 연결이 어느 서버로 가는지는 이 판정 범위 밖이라 보장하지
@@ -324,13 +327,13 @@ def target_identity_reason(engine: Any) -> str | None:
     (그리고 이를 DSN 없이 대신하는 ``PGOPTIONS`` 환경변수)는 libpq에
     ``-c search_path=other_schema`` 같은 접속 시점 GUC를 전달해 같은 호스트/
     포트/데이터베이스 안에서도 실제로 쓰는 스키마를 바꿀 수 있다. 스냅샷
-    서명은 table/database/host/port만 기록하고 스키마는 기록하지 않으므로,
-    수리와 롤백이 서로 다른 ``options``/``PGOPTIONS``로 다른 스키마를
-    가리키면 서명은 그대로 일치해 통과하면서도 실제로는 의도한 것과 다른
-    릴레이션에 적용된다(이중 적대검증, 코덱스 리뷰의 실측 재현). ``options``는
-    임의의 GUC를 실을 수 있는 자유 형식 문자열이라 ``search_path``만 골라
-    걸러내는 파싱은 새로운 우회 형태를 계속 놓칠 위험이 있으므로, 이 도구는
-    ``options``/``PGOPTIONS`` 자체를 아예 허용하지 않는다.
+    서명은 지금은 schema도 함께 기록해 대조하지만(``validate_snapshot_signature``),
+    그 대조에만 기대면 수리와 롤백 시점의 스키마가 우연히 같아 서명은
+    통과하되 둘 다 의도와 다른 릴레이션을 가리키는 경우까지는 못 막는다.
+    ``options``는 임의의 GUC를 실을 수 있는 자유 형식 문자열이라
+    ``search_path``만 골라 걸러내는 파싱은 새로운 우회 형태를 계속 놓칠
+    위험이 있으므로, 이 도구는 서명 대조와 별개로 ``options``/``PGOPTIONS``
+    자체를 접속 인자로 아예 허용하지 않는다.
     ``main()``과 ``repair()``가 이 판정을 공유해 CLI 경로와 직접 호출 경로가
     어긋나지 않게 한다.
     """
