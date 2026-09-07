@@ -817,6 +817,33 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_non_utf8_snapshot_bytes_are_rejected(self, tmp_path):
+        """새 컨텍스트 독립 검증자(round 7)가 실측 재현한 형제 결함:
+        스냅샷 파일에 비UTF-8 바이트가 섞이면(수기 조작, 부분 기록,
+        비트 부패) ``open(path, encoding="utf-8")``이 ``UnicodeDecodeError``를
+        낸다. 이 예외는 ``UnicodeError``/``ValueError``의 하위형이라
+        ``main()``이 잡는 ``(OSError, json.JSONDecodeError, SnapshotError)``
+        어디에도 걸리지 않고 그대로 새어나간다. ``load_snapshot``의 계약은
+        "손상된 스냅샷은 종료 코드 4"이므로 여기서 미리 막는다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_bytes(b'{"table":"t","database":"d","rows":[]\xff}')
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_truncated_multibyte_snapshot_is_rejected(self, tmp_path):
+        """같은 형제 결함의 변형: 멀티바이트 문자 중간에서 파일이 잘리면
+        (기록 도중 중단 등) 같은 ``UnicodeDecodeError``가 새어나간다.
+        ``json.dumps(..., ensure_ascii=False)``로 "가"를 원시 UTF-8
+        3바이트로 인코딩한 뒤 마지막 1바이트를 잘라 그 시퀀스를 미완성으로
+        만든다(``write_backup_atomic``도 ``ensure_ascii=False``로 쓴다)."""
+        backup_path = tmp_path / "backup.json"
+        payload = '{"table":"t","database":"d","rows":[],"note":"가'.encode()
+        backup_path.write_bytes(payload[:-1])
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드

@@ -362,9 +362,17 @@ def load_snapshot(path: str) -> dict[str, Any]:
     키의 부재까지 여기서 거부하는 이유는 ``snapshot.get("rows", [])``로
     조용히 빈 리스트를 대입하면 이 함수는 통과하지만 ``rollback()``이
     ``snapshot["rows"]``를 직접 인덱싱해 서명만 맞으면 그때 가서 같은 방식으로
-    새어나가기 때문이다. ``xmin``도 같은 이유로 여기서 미리 확인한다."""
-    with open(path, encoding="utf-8") as fh:
-        snapshot = json.load(fh)
+    새어나가기 때문이다. ``xmin``도 같은 이유로 여기서 미리 확인한다.
+    파일 자체가 비UTF-8 바이트를 담고 있거나(수기 조작, 부분 기록, 비트
+    부패) 멀티바이트 문자 중간에서 잘려 있으면 ``open()``이나 ``json.load()``가
+    ``UnicodeDecodeError``를 낸다. 이 예외는 ``UnicodeError``/``ValueError``의
+    하위형이라 호출부가 잡는 ``(OSError, json.JSONDecodeError, SnapshotError)``
+    어느 것에도 걸리지 않고 새어나가므로 여기서도 같은 방식으로 변환한다."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+    except UnicodeDecodeError as exc:
+        raise SnapshotError(f"backup snapshot is not valid UTF-8: {path}: {exc}") from None
     if not isinstance(snapshot, dict):
         raise SnapshotError(f"backup snapshot is not a JSON object: {path}")
     if "rows" not in snapshot or not isinstance(snapshot["rows"], list):
