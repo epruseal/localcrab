@@ -353,9 +353,27 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
 
 
 def load_snapshot(path: str) -> dict[str, Any]:
+    """유효한 JSON이라도 모양이 다르면(수기 조작, 손상, 구버전) 여기서
+    ``SnapshotError``로 거부한다. 그러지 않으면 최상위가 객체가 아니거나
+    ``rows``가 배열이 아니거나 행에 ``node_id``/``xmin``이 없을 때
+    ``AttributeError``/``TypeError``/``KeyError``가 그대로 새어나가, 문서화된
+    백업-검증 종료 코드(4) 대신 처리되지 않은 트레이스백이 된다. ``xmin``까지
+    여기서 확인하는 이유는 ``rollback()``이 그 키를 실제 롤백 시점에야
+    읽어, 검증 없이는 그때 가서 같은 방식으로 새어나가기 때문이다."""
     with open(path, encoding="utf-8") as fh:
         snapshot = json.load(fh)
-    node_ids = [r["node_id"] for r in snapshot.get("rows", [])]
+    if not isinstance(snapshot, dict):
+        raise SnapshotError(f"backup snapshot is not a JSON object: {path}")
+    rows = snapshot.get("rows", [])
+    if not isinstance(rows, list):
+        raise SnapshotError(f"backup snapshot 'rows' is not a JSON array: {path}")
+    node_ids = []
+    for row in rows:
+        if not isinstance(row, dict) or "node_id" not in row or "xmin" not in row:
+            raise SnapshotError(
+                f"backup snapshot has a row missing 'node_id' or 'xmin': {path}"
+            )
+        node_ids.append(row["node_id"])
     if len(node_ids) != len(set(node_ids)):
         raise SnapshotError(f"backup snapshot has duplicate node_id entries: {path}")
     return snapshot

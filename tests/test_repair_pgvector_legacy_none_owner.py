@@ -735,6 +735,53 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_non_object_top_level_snapshot_is_rejected(self, tmp_path):
+        """이중 적대검증에서 codex 채널이 실측 지적한 결함: 유효한 JSON이지만
+        최상위가 객체가 아니면(예: 배열) ``AttributeError``가 그대로 새어나가
+        문서화된 백업-검증 종료 코드(4) 대신 처리되지 않은 트레이스백이 됐다.
+        ``SnapshotError``로 변환해 기존 예외 계약 안에 넣는다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_non_list_rows_snapshot_is_rejected(self, tmp_path):
+        """``rows``가 리스트가 아니면(예: 문자열) 반복 시 각 문자를 순회하며
+        ``TypeError``가 새어나갔다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps({"table": "t", "database": "d", "rows": "not-a-list"}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_row_missing_node_id_is_rejected(self, tmp_path):
+        """행에 ``node_id``가 없으면 ``KeyError``가 새어나갔다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps({"table": "t", "database": "d", "rows": [{"xmin": "1"}]}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_row_missing_xmin_is_rejected(self, tmp_path):
+        """``node_id``는 있어도 ``xmin``이 없으면 ``load_snapshot`` 통과 뒤
+        ``rollback()``이 실제 롤백 시도 중에야 ``KeyError``를 내 처리되지 않은
+        트레이스백이 됐다. 로드 시점에 미리 걸러 exit code 4로 통일한다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_text(
+            json.dumps({"table": "t", "database": "d", "rows": [{"node_id": "x"}]}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드
