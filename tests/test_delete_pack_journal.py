@@ -83,19 +83,18 @@ from pathlib import Path
 
 import pytest
 
+from opencrab.pack import delete_journal  # noqa: F401 -- 아직 없다. RED.
 from opencrab.pack import load as pack_load
-from opencrab.pack import delete_journal          # noqa: F401 -- 아직 없다. RED.
 from opencrab.pack.ownership import create_pack, delete_pack_row, get_pack
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
-
 from tests._pack_fixtures import ensure_test_user
 from tests.test_pack_load import (  # noqa: F401 -- 기존 픽스처·더블 재사용
     _FakeChromaCollection,
     _FakeChromaVec,
-    _NoVec,
     _node,
+    _NoVec,
     _write_jsonl,
 )
 
@@ -124,15 +123,32 @@ def live(tmp_path, monkeypatch, pack_sql):
 
 def _seed_pack(graph, docs, tmp_path, pack_name: str, node_ids: list[str]):
     """`pack_name` 소유 노드 `node_ids` 를 그래프에 심는다(`OntologyBuilder` 없이
-    `pack_load.load_nodes` 를 그대로 쓴다 — `test_pack_load.py` 와 동일 경로)."""
+    `pack_load.load_nodes` 를 그대로 쓴다 — `test_pack_load.py` 와 동일 경로).
+
+    `OntologyBuilder.add_node` 는 `write_gate.authorize` 를 무조건 거친다 — 레지스트리가
+    닿지 않거나(`sql=None`) 이 pack_id 가 아직 등록 안 됐으면 fail-closed 로 거부한다
+    (`opencrab/pack/write_gate.py::authorize`). 그래서 여기서 직접 등록한다. `pack_sql`
+    픽스처를 받지 않는 이유: 대다수 테스트가 이미 `_seed_pack` 뒤에 자기 몫의
+    `SQLStore(f"sqlite:///{{tmp_path / 'opencrab.db'}}")` 를 열어 동일성 스냅샷용
+    `create_pack`/`get_pack` 을 부른다 — 여기서 만드는 등록은 같은 파일의 같은 행을
+    가리키므로 `get_pack` 이 없을 때만 만들어 그 뒤의 `create_pack` 재시도가
+    "이미 있음" 으로 걸려 랜덤 접미 슬러그를 만들지 않게 한다."""
     from opencrab.auth import Principal, principal_scope
     from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.ownership import create_pack as _create_pack
+    from opencrab.pack.ownership import get_pack as _get_pack
+    from opencrab.stores.sql_store import SQLStore
+
+    pack_sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+    ensure_test_user(pack_sql, _OWNER)
+    if _get_pack(pack_sql, pack_name) is None:
+        _create_pack(pack_sql, _OWNER, pack_name)
 
     rows = [_node(id=nid, pack_id=pack_name) for nid in node_ids]
     f = _write_jsonl(tmp_path / f"{pack_name}-nodes.jsonl", rows)
     principal = Principal(user_id=_OWNER, is_local=True, disabled=False)
     with principal_scope(principal):
-        builder = OntologyBuilder(graph, docs, None)
+        builder = OntologyBuilder(graph, docs, pack_sql)
         pack_load.load_nodes(pack_name, f, builder, {})
 
 
@@ -637,18 +653,29 @@ class TestMultipleCrashPoints:
         테스트가 못 잡는다 — 그래서 무쓰기 확인을 2단계보다 먼저 둔다.
         """
         monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
-        proc = _run_kill_script(tmp_path, """
+        proc = _run_kill_script(tmp_path, f"""
             from opencrab.auth import Principal, principal_scope
             from opencrab.ontology.builder import OntologyBuilder
             from opencrab.pack import load as pack_load
+            from opencrab.pack.ownership import get_pack, create_pack
             from opencrab.stores.local_graph_store import LocalGraphStore
             from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+            from opencrab.stores.sql_store import SQLStore
 
             graph = LocalGraphStore(os.path.join({str(tmp_path)!r}, "graph.db"))
             docs = LocalSQLDocStore(os.path.join({str(tmp_path)!r}, "doc.db"))
+            pack_sql = SQLStore("sqlite:///" + os.path.join({str(tmp_path)!r}, "opencrab.db"))
+            from sqlalchemy import text as _sa_text
+            with pack_sql._engine.begin() as _conn:
+                _conn.execute(_sa_text(
+                    "INSERT INTO users (user_id, display_name, is_local) "
+                    "VALUES (:uid, :uid, 0) ON CONFLICT (user_id) DO NOTHING"
+                ), {{"uid": "crash-user"}})
+            if get_pack(pack_sql, "crash-pack") is None:
+                create_pack(pack_sql, "crash-user", "crash-pack")
             principal = Principal(user_id="crash-user", is_local=True, disabled=False)
             with principal_scope(principal):
-                builder = OntologyBuilder(graph, docs, None)
+                builder = OntologyBuilder(graph, docs, pack_sql)
                 import json
                 p = os.path.join({str(tmp_path)!r}, "nodes.jsonl")
                 with open(p, "w", encoding="utf-8") as fh:
@@ -729,18 +756,29 @@ class TestMultipleCrashPoints:
         단계·resume 단계 모두에서 doc 축 함수가 안 불렸다"를 직접 확인한다.
         """
         monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
-        proc = _run_kill_script(tmp_path, """
+        proc = _run_kill_script(tmp_path, f"""
             from opencrab.auth import Principal, principal_scope
             from opencrab.ontology.builder import OntologyBuilder
             from opencrab.pack import load as pack_load
+            from opencrab.pack.ownership import get_pack, create_pack
             from opencrab.stores.local_graph_store import LocalGraphStore
             from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+            from opencrab.stores.sql_store import SQLStore
 
             graph = LocalGraphStore(os.path.join({str(tmp_path)!r}, "graph.db"))
             docs = LocalSQLDocStore(os.path.join({str(tmp_path)!r}, "doc.db"))
+            pack_sql = SQLStore("sqlite:///" + os.path.join({str(tmp_path)!r}, "opencrab.db"))
+            from sqlalchemy import text as _sa_text
+            with pack_sql._engine.begin() as _conn:
+                _conn.execute(_sa_text(
+                    "INSERT INTO users (user_id, display_name, is_local) "
+                    "VALUES (:uid, :uid, 0) ON CONFLICT (user_id) DO NOTHING"
+                ), {{"uid": "crash-user"}})
+            if get_pack(pack_sql, "crash-pack-2") is None:
+                create_pack(pack_sql, "crash-user", "crash-pack-2")
             principal = Principal(user_id="crash-user", is_local=True, disabled=False)
             with principal_scope(principal):
-                builder = OntologyBuilder(graph, docs, None)
+                builder = OntologyBuilder(graph, docs, pack_sql)
                 import json
                 p = os.path.join({str(tmp_path)!r}, "nodes.jsonl")
                 with open(p, "w", encoding="utf-8") as fh:
@@ -888,6 +926,11 @@ class TestLockContentionIsReallyObserved:
         으로 감싼다는 것 자체를 확인한다(위 테스트는 락 메커니즘만, 이 테스트는
         `delete_pack`이 그 메커니즘을 실제로 쓰는지).
 
+        holder 는 반드시 **다른 스레드**에서 쥐어야 한다 — `locking.file_lock` 이
+        내부적으로 `threading.RLock` 을 쓰므로(같은 락 이름에 재진입 허용, 위
+        `test_two_threads_contend...` 참고) 같은 스레드에서 다시 잡으면 즉시
+        통과해 버려 대기 자체가 재현되지 않는다.
+
         역변이: `delete_pack`이 아예 락을 안 잡으면, holder가 쥔 동안 호출한
         `delete_pack`이 타임아웃 없이 그냥 통과해 버린다 — 이 테스트가 그것을 잡는다.
         """
@@ -896,9 +939,23 @@ class TestLockContentionIsReallyObserved:
         from opencrab import locking
 
         filename = delete_journal.lock_filename("busy-pack")
-        with locking.file_lock(filename, str(tmp_path)):
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        def _hold():
+            with locking.file_lock(filename, str(tmp_path)):
+                holder_ready.set()
+                release_holder.wait(timeout=10)
+
+        t = threading.Thread(target=_hold)
+        t.start()
+        try:
+            assert holder_ready.wait(timeout=5), "holder가 락을 못 잡았다"
             with pytest.raises(TimeoutError):
                 pack_load.delete_pack("busy-pack", graph, docs, _NoVec(), lock_timeout=0.2)
+        finally:
+            release_holder.set()
+            t.join(timeout=10)
 
     def test_os_level_file_lock_contention_across_processes(self, tmp_path, monkeypatch):
         """§8-7(c): 별도 프로세스가 `locking.py:489` 의 `_acquire()` 수준에서 OS
