@@ -35,12 +35,19 @@
 영구 신뢰하면 완료 이후 새로 들어온 콘텐츠나 연결이 복구된 벡터스토어를 영원히
 건너뛴다는 결함이 리뷰에서 나왔다. `TestDoneJournalDriftRecheck` 가 그 수정을
 고정한다: `doc_node_extra_and_sources` 축은 매 호출 라이브 카운트(고아 `doc_nodes`
-포함)를 다시 재고, `done=True` 라도 남은 게 있으면 재시도하고, `vectors` 축은 내용을
-재조회하지 않고 모양(`_vec_shape`)과 `available` 속성만으로 "확인 불가"(연결 실패
-등)를 재시도 대상으로 남긴다. `available=True` 인 채로 완료된 vectors 축의 사후
-드리프트는 범위 밖이다 — 이미 완료·available 한 벡터스토어는 매 재개마다
-재조회하지 않는다는 기존 계약(`TestResumeSkipDoesNotReuseCountInReturnValue`)을
-우선했다.
+포함)를 다시 재고, `done=True` 라도 남은 게 있으면 재시도하고, `vectors` 축은
+모양(`_vec_shape`)과 `available` 속성으로 "확인 불가"(연결 실패 등)를 재시도
+대상으로 남긴다.
+
+**재리뷰 P1 — vectors 축도 완료 후 재유입을 재확인한다.** 위 문단이 v3
+addendum 에서 도입한 "이미 완료·available 한 벡터스토어는 매 재개마다
+재조회하지 않는다"는 성능 트레이드오프(`TestResumeSkipDoesNotReuseCountInReturnValue`
+가 당시 고정)는 이후 리뷰에서 완전 삭제 계약을 깨뜨린다는 것이 드러나 파기했다.
+`done=True`·`available=True`·모양 인식됨 조합도 이제 `_live_vec_ids` 로 라이브
+ID 존재를 한 번 더 확인해, 완료 이후 재유입된 벡터가 있으면 재시도 대상으로
+되돌린다 — 다른 세 축과 대칭이다. `TestDoneJournalDriftRecheck::
+test_available_vectors_axis_requeries_and_reopens_on_live_drift` 가 이 뒤집힌
+계약을 고정한다.
 
 **이 커밋은 RED 전용이다.** 아래가 요구하는 `opencrab.pack.delete_journal` 모듈은
 아직 없다 — 그래서 이 파일은 수집(collection) 단계에서부터 실패한다. 이것이 이번
@@ -210,6 +217,25 @@ class _AvailableRaisesOnSecondRead:
         return True
 
     def delete(self, ids):  # pragma: no cover -- vec 자신이 아니라 `_collection` 이 지운다
+        pass
+
+
+class _ShapeProbeHostile:
+    """`available` 읽기는 성공하지만(`False`) 모양 판별(`_vec_shape`) 자체가
+    예외로 실패하는 벡터스토어 더블 — [#327 P2 / 재리뷰 지적 2] "모양 판별
+    실패"를 "모양이 없다"(구조적 미지원, 갈래 1)와 뭉개면 재시도 기회가
+    영구히 사라진다. `_conn` 을 예외를 던지는 property 로 둬 `_vec_shape` 의
+    `hasattr(vec, "_conn")` 호출 자체가 전파시키는 예외를 재현한다 — 파이썬
+    3 의 `hasattr` 은 `AttributeError` 만 삼키고 그 밖의 예외는 그대로
+    새어 나간다."""
+
+    available = False
+
+    @property
+    def _conn(self):
+        raise RuntimeError("shape probe hostile: _conn access failed")
+
+    def delete(self, ids):  # pragma: no cover -- 갈래 판정에서 걸려 호출 안 됨
         pass
 
 
@@ -771,6 +797,30 @@ class TestVectorUnconfirmedNeverBecomesDone:
         journal2 = delete_journal.load_journal(tmp_path, "vecfail-pack")
         assert journal2["axes"]["vectors"]["done"] is True
 
+    def test_shape_probe_exception_marks_unconfirmed_not_structural(
+        self, live, tmp_path
+    ):
+        """[#327 P2] `available=False` 이고 모양 판별(`_vec_shape`) 자체가
+        예외로 실패하면, `_delete_pack_vectors` 는 이를 "모양이 없다"(구조적
+        미지원, 갈래 1 → 즉시 done=True)와 뭉개면 안 된다 — 모양 판별이
+        실패한 것이지 모양이 없다고 확인된 것이 아니다. 재시도 대상
+        (done=False)으로 남겨야 한다.
+
+        역변이: `_delete_pack_vectors` 의 `_vec_shape` 예외 처리를
+        `has_shape = False` 로 뭉개면(P2 수정 전 상태), 이 테스트가 잡는다
+        — 모양 판별 실패가 구조적 미지원(갈래 1)으로 오분류돼 done=True 로
+        영구 확정된다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "shapehostile-pack", ["x1"])
+        vec = _ShapeProbeHostile()
+        pack_load.delete_pack("shapehostile-pack", graph, docs, vec)
+        journal = delete_journal.load_journal(tmp_path, "shapehostile-pack")
+        assert journal["axes"]["vectors"]["done"] is False, (
+            "모양 판별 실패(available=False)를 구조적 미지원으로 오분류해 "
+            f"done=True 로 확정했다: {journal['axes']['vectors']!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4-2. PR #360 리뷰 지적 1+2 — done 저널의 사후 드리프트를 무조건 신뢰하지 않는다.
@@ -977,28 +1027,44 @@ class TestDoneJournalDriftRecheck:
             f"{journal2['axes']['vectors']!r}"
         )
 
-    def test_available_vectors_axis_skip_still_does_not_requery_backend(
+    def test_available_vectors_axis_requeries_and_reopens_on_live_drift(
         self, live, tmp_path
     ):
-        """[v3 설계 트레이드오프 확인] `available=True` 인 채로 완료된 vectors
-        축은 사후 드리프트가 있어도 재조회하지 않는다 — 기존 계약
-        (`TestResumeSkipDoesNotReuseCountInReturnValue`)이 잠근 "이미 완료·
-        available 한 벡터스토어는 매 재개마다 재조회하지 않는다" 를 이번에
-        추가한 드리프트 신호가 깨지 않았음을 확인하는 회귀 대조군이다.
+        """[재리뷰 P1, id 3948759915] `available=True` 인 채로 완료된 vectors
+        축도, 완료 이후 이 팩에 재유입된 라이브 벡터가 있으면 재개 호출이
+        그것을 잡아 실제로 지워야 한다.
 
-        역변이: `vectors_drift` 가 `available=True` 를 무시하고 무조건 쿼리를
-        내게 고치면 이 테스트가 잡는다.
+        이 테스트는 이전 버전(`test_available_vectors_axis_skip_still_does_
+        not_requery_backend`)의 기대를 뒤집는다. 이전 테스트는 v3 addendum
+        에서 무조회 성능 성질을 지키려고 도입했고 당시 검증을 통과했다.
+        이후 리뷰에서 그 교환이 완전 삭제 계약을 깨뜨린다는 것이 드러났다.
+        완료된 축이 재조회하지 않으면 크래시와 재개 사이에 재유입된 벡터가
+        삭제를 피한다. 계약을 우선해 기대를 뒤집는다.
+
+        역변이: peek 블록 전체를 지우면(v3 로 회귀) `get_where_calls` 가
+        비어 실패한다.
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecnodrift-pack", ["g1"])
         vec1 = _FakeChromaVec({"g1": "vecnodrift-pack"})
         pack_load.delete_pack("vecnodrift-pack", graph, docs, vec1)
 
-        vec2 = _FakeChromaVec({"g1": "vecnodrift-pack"})  # available=True, 내용도 있음
+        # 완료 이후 재유입을 흉내낸다 — 새 핸들에 같은 pack_id 로 라이브
+        # 벡터가 다시 존재하는 상태를 만든다(동시 writer 나 부분 복원 등).
+        vec2 = _FakeChromaVec({"g1": "vecnodrift-pack"})  # available=True, 재유입된 내용
         pack_load.delete_pack("vecnodrift-pack", graph, docs, vec2, resume=True)
-        assert not vec2._collection.get_where_calls, (
-            "이미 done 이고 available 인 vectors 축인데 재개 호출이 벡터스토어를 재조회했다"
+        assert vec2._collection.get_where_calls, (
+            "이미 done 이고 available 인 vectors 축인데 재유입 벡터를 peek 하지 않았다"
         )
+        assert vec2._collection.delete_calls and "g1" in vec2._collection.delete_calls[0], (
+            f"재유입된 라이브 벡터 g1 을 실제로 삭제하지 않았다: {vec2._collection.delete_calls!r}"
+        )
+        # `delete_calls` 는 삭제를 시도했다는 기록일 뿐 실제 부재의 증거가
+        # 아니다(더블에는 `lossy_delete_ids` 처럼 호출은 기록되지만 상태가
+        # 안 바뀌는 결함 주입 축도 있다) — `_live_vec_ids` 로 독립 재조회해
+        # 실제로 사라졌음을 직접 확인한다(설계검증 v5 DISAGREE 반영).
+        post = pack_load._live_vec_ids(vec2, "vecnodrift-pack")
+        assert "g1" not in post, f"재유입된 벡터 g1 이 재개 뒤에도 실제로 남아 있다: {post!r}"
         journal = delete_journal.load_journal(tmp_path, "vecnodrift-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
@@ -1090,6 +1156,43 @@ class TestDoneJournalDriftRecheck:
         journal2 = delete_journal.load_journal(tmp_path, "vecreadfailresume-pack")
         assert journal2["axes"]["vectors"]["done"] is False, (
             "available 읽기 실패로 재확인이 필요한데 done=True 저널을 그대로 "
+            f"스킵했다: {journal2['axes']['vectors']!r}"
+        )
+
+    def test_shape_probe_exception_at_drift_computation_forces_retry(
+        self, live, tmp_path
+    ):
+        """[#327 재리뷰 지적 2, 호출자 레벨 보강] vectors 축이 이미 done=True
+        로 완료된 뒤, 재개 호출에서 `available` 읽기는 성공하지만(`False`)
+        모양 판별(`_vec_shape`) 자체가 예외로 실패하면, `delete_pack` 의
+        드리프트 탐침이 이를 "모양이 없다"(`_vec_shape_kind = None`)와 뭉개
+        `vectors_drift` 판정을 통째로 건너뛰면 안 된다 — done=True 저널을
+        그대로 스킵하지 않고 축을 다시 시도해 done=False 로 되돌려야 한다.
+
+        `test_available_read_failure_rechecks_previously_done_vectors_axis`
+        와 다른 축을 지킨다: 그 테스트는 `available` 읽기 자체의 실패
+        (`vec_available is None`)를 지키고, 이 테스트는 `available` 읽기는
+        성공하는데 **모양 판별**이 실패하는 축(`_vec_shape_probe_failed`)을
+        지킨다 — 두 실패는 `delete_pack` 안에서 서로 다른 예외 처리 블록이다.
+
+        역변이: 호출자의 `_vec_shape` 예외 처리에서 `_vec_shape_probe_failed`
+        항을 빼고 `_vec_shape_kind = None` 으로만 뭉개면 이 테스트가 잡는다
+        — `vectors_drift` 가 `False` 로 계산돼 `_axis_done("vectors")` 만으로
+        스킵 분기를 타고, done=True 저널이 그대로 남는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "shapehostileresume-pack", ["o1"])
+        vec1 = _FakeChromaVec({"o1": "shapehostileresume-pack"})
+        pack_load.delete_pack("shapehostileresume-pack", graph, docs, vec1)
+        journal = delete_journal.load_journal(tmp_path, "shapehostileresume-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+        vec2 = _ShapeProbeHostile()
+        pack_load.delete_pack(
+            "shapehostileresume-pack", graph, docs, vec2, resume=True)
+        journal2 = delete_journal.load_journal(tmp_path, "shapehostileresume-pack")
+        assert journal2["axes"]["vectors"]["done"] is False, (
+            "모양 판별 실패로 재확인이 필요한데 done=True 저널을 그대로 "
             f"스킵했다: {journal2['axes']['vectors']!r}"
         )
 
@@ -1503,18 +1606,24 @@ class TestResumeSkipDoesNotReuseCountInReturnValue:
         self, live, tmp_path, capsys
     ):
         """1회차가 chroma 모양 벡터스토어로 2건을 확인·삭제해 `vectors` 축에
-        `done=True, count=2`가 남는다. 2회차 `resume=True`는 이미 done인
-        `vectors`를 스킵 분기(`else: chunk_vec_del = ...`)로 탄다. 그 분기는
-        벡터스토어에 어떤 파괴적 호출도 하지 않으므로 반환값은 `0`이어야
-        하고(§ docstring `int | None` 계약: `0`="이번 호출은 시도 안 함"),
-        표시는 과거 백엔드를 추측하지 않는 중립 라벨("이전 완료")이어야 한다.
+        `done=True, count=2`가 남는다. 2회차 `resume=True`는 라이브 벡터
+        재유입 여부를 peek 으로 한 번 확인하지만(#327 재리뷰 P1), 이 팩에는
+        재유입이 없으므로(빈 백엔드) peek 이 드리프트를 확정하지 않고 그대로
+        스킵 분기(`else: chunk_vec_del = ...`)를 탄다. peek 은 조회일 뿐
+        파괴적 호출이 아니므로 `delete_calls` 는 비어 있어야 하고, 반환값은
+        `0`이어야 하며(§ docstring `int | None` 계약: `0`="이번 호출은 시도
+        안 함"), 표시는 과거 백엔드를 추측하지 않는 중립 라벨("이전 완료")
+        이어야 한다.
 
-        2회차에 넘기는 `_FakeChromaVec({})`은 실제로 호출되지 않아야 한다 —
-        축이 이미 done이라 `_delete_pack_vectors` 자체를 안 부른다.
-
-        역변이: `chunk_vec_del = axes["vectors"].get("count")`를 되살리면 첫
-        단언이, `vec_skipped` 분기를 제거해 `vec_available=True` 기본값으로
+        역변이 1: `chunk_vec_del = axes["vectors"].get("count")`를 되살리면
+        첫 단언이 잡는다.
+        역변이 2: `vec_skipped` 분기를 제거해 `vec_available=True` 기본값으로
         되돌리면 마지막 단언("미지원" not in out)이 잡는다.
+        역변이 3(peek 의 `bool()` vs `is not None`): peek 을
+        `vectors_drift = live_ids is not None` 으로 바꾸면 `set() is not
+        None = True` 가 강제 드리프트를 만들어 `_delete_pack_vectors` 가
+        재진입해 `get_where_calls` 가 2회로 늘어 아래 "정확히 1회" 단언이
+        깨진다.
         """
         graph, docs = live
         vec = _FakeChromaVec({"v1": "vectorskip-pack", "v2": "vectorskip-pack"})
@@ -1524,14 +1633,19 @@ class TestResumeSkipDoesNotReuseCountInReturnValue:
         journal = delete_journal.load_journal(tmp_path, "vectorskip-pack")
         assert journal["axes"]["vectors"] == {"done": True, "clean": True, "count": 2}
 
-        vec2 = _FakeChromaVec({})
+        vec2 = _FakeChromaVec({})  # available=True, 열거는 되지만 결과 0건(재유입 없음)
         _node_del, _chunk_sql_del, chunk_vec_del = pack_load.delete_pack(
             "vectorskip-pack", graph, docs, vec2, resume=True
         )
         out = capsys.readouterr().out
 
-        assert not vec2._collection.get_where_calls, (
-            "이미 done인 vectors 축인데 재개 호출이 벡터스토어를 다시 조회했다"
+        assert vec2._collection.get_where_calls == [({"pack_id": "vectorskip-pack"}, None)], (
+            "재유입 존재 확인(peek)이 정확히 1회 실행되지 않았다: "
+            f"{vec2._collection.get_where_calls!r}"
+        )
+        assert not vec2._collection.delete_calls, (
+            "재유입이 없는데(빈 백엔드) 삭제를 시도했다: "
+            f"{vec2._collection.delete_calls!r}"
         )
         assert chunk_vec_del == 0, (
             f"과거 vectors count(2)가 재개 반환값에 섞였다: chunk_vec_del={chunk_vec_del!r}"
