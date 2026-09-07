@@ -763,6 +763,20 @@ class _SqlalchemyShapedButEngineNone:
         pass
 
 
+class _SqlShapedButConnNone:
+    """`_conn` 속성은 있으나 값이 `None`(연결 실패)인 sql 모양 벡터스토어 —
+    `_vec_shape`가 sqlalchemy(`_engine`) 분기와 별개로 판정하는 sql(`_conn`/
+    `conn`) 분기의 역변이 검출력을 고정한다. `_SqlalchemyShapedButEngineNone`
+    은 `_engine` 분기만 지키므로 `_conn`/`conn` hasattr 재작성이 홀로 원복돼도
+    잡히지 않는 잔여 사각을 닫는다."""
+
+    available = False
+    _conn = None
+
+    def delete(self, ids):  # pragma: no cover -- available=False라 호출 안 됨
+        pass
+
+
 class TestDoneJournalDriftRecheck:
     def test_shaped_but_engine_none_backend_stays_not_done(self, live, tmp_path):
         """[리뷰 지적 2, `_vec_shape` 값 기준 → hasattr 기준 재작성] `_engine`
@@ -781,6 +795,28 @@ class TestDoneJournalDriftRecheck:
         journal = delete_journal.load_journal(tmp_path, "vecenginenone-pack")
         assert journal["axes"]["vectors"]["done"] is False, (
             "_engine=None(연결 실패, sqlalchemy 모양)인데 done=True로 잘못 "
+            f"확정됐다: {journal['axes']['vectors']!r}"
+        )
+
+    def test_shaped_but_conn_none_backend_stays_not_done(self, live, tmp_path):
+        """[리뷰 지적 2 잔여 사각 보강] `_conn` 속성이 존재하지만 값이 `None`
+        (연결 실패)인 sql 모양 벡터스토어도, sqlalchemy 모양과 마찬가지로
+        "구조적 미지원"이 아니라 "연결 실패"로 분류돼 vectors 축이 즉시
+        done=True 로 확정되면 안 된다.
+
+        역변이: `_vec_shape` 의 `_conn`/`conn` hasattr 분기만 값 기준
+        (`getattr(vec, "_conn", None) or getattr(vec, "conn", None)` 을 진위
+        판정에 씀)으로 되돌리면 이 테스트가 잡는다 — `_engine=None` 케이스를
+        지키는 `test_shaped_but_engine_none_backend_stays_not_done` 은 sql
+        분기가 홀로 원복돼도 잡지 못한다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecconnnone-pack", ["i1"])
+        vec = _SqlShapedButConnNone()
+        pack_load.delete_pack("vecconnnone-pack", graph, docs, vec)
+        journal = delete_journal.load_journal(tmp_path, "vecconnnone-pack")
+        assert journal["axes"]["vectors"]["done"] is False, (
+            "_conn=None(연결 실패, sql 모양)인데 done=True로 잘못 "
             f"확정됐다: {journal['axes']['vectors']!r}"
         )
 
@@ -825,6 +861,42 @@ class TestDoneJournalDriftRecheck:
             f"완료 이후 유입된 고아 doc_nodes 행이 재개에서 안 지워졌다 (실제 {n2})"
         )
         journal2 = delete_journal.load_journal(tmp_path, "docdrift-pack")
+        assert journal2["axes"]["doc_node_extra_and_sources"]["done"] is True
+
+    def test_doc_sources_only_drift_without_doc_nodes_is_swept_on_resume(
+        self, live, tmp_path
+    ):
+        """[리뷰 지적 1 잔여 사각 보강] `live_docs`(doc_sources 드리프트)만
+        단독으로도 축을 재시도시켜야 한다 — 위 고아 doc_nodes 테스트는
+        `doc_nodes_live` 만 채우므로, 게이트의 `live_docs` 항이 단독으로는
+        아무것도 못 잡아도 그 테스트는 여전히 통과한다(두 신호가 OR 로 묶여
+        있어 하나만 있어도 게이트가 참이 되기 때문). 이 테스트는 doc_nodes
+        드리프트 없이 doc_sources(청크) 드리프트만 만들어 `live_docs` 항
+        자신의 검출력을 고정한다.
+
+        역변이: 게이트에서 `live_docs` 항만 빼면(`doc_nodes_live` 는 남기고)
+        이 테스트가 잡는다 — 새로 유입된 doc_sources 행이 재개에서 안 지워진다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "docsrcdrift-pack", ["j1"])
+        n1, *_ = pack_load.delete_pack("docsrcdrift-pack", graph, docs, _NoVec())
+        assert n1 == 1
+        journal = delete_journal.load_journal(tmp_path, "docsrcdrift-pack")
+        assert journal["axes"]["doc_node_extra_and_sources"]["done"] is True
+
+        # 완료 이후 유입을 흉내낸다 — doc_nodes 는 건드리지 않고 doc_sources
+        # (청크) 행만 같은 pack_id 로 직접 upsert 한다.
+        docs.upsert_source(
+            "orphan-chunk-1", "post-completion chunk",
+            {"pack_id": "docsrcdrift-pack"},
+        )
+
+        n2, *_ = pack_load.delete_pack(
+            "docsrcdrift-pack", graph, docs, _NoVec(), resume=True)
+        assert docs.get_source("orphan-chunk-1") is None, (
+            "완료 이후 유입된 doc_sources 행이 재개에서 안 지워졌다"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "docsrcdrift-pack")
         assert journal2["axes"]["doc_node_extra_and_sources"]["done"] is True
 
     def test_done_vectors_axis_rechecked_when_backend_becomes_unavailable(
