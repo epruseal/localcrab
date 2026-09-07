@@ -68,6 +68,7 @@ from opencrab.pack.normalize import (
 from opencrab.pack.ownership import get_pack
 from opencrab.pack.write_gate import authorize
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect
+from opencrab.stores._vector_base import slot_owner
 
 # 로거 이름은 `__name__` 이다. 이관 전에는 호출자 스크립트 파일명으로 고정돼 있었는데
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
@@ -2255,18 +2256,41 @@ def load_chunks_incremental(
     batch_size: int = 256,
     *,
     sql,
-) -> tuple[int, int, int, int, int, set]:
+    recover_vectors: bool = False,
+) -> tuple[int, int, int, int, int, set, int]:
     """청크 증분 적재. 텍스트 불변·메타만 변경된 행은 임베딩 없이 upsert_source만 호출.
 
-    반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids)
+    반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered)
 
     `sql` 과 인가 계약은 `load_chunks` 와 같다(#205) — 키워드 전용 필수 인자,
     호출당 1회 소유자 검사, 첫 쓰기 이전 거부. 그쪽 docstring 이 정본이다.
+
+    `recover_vectors`(#332, 기본 `False`): R1(아래)의 존재 확인은 `_live_vec_ids`
+    가 이 팩의 벡터 ID를 **열거**할 수 있는 백엔드에서만 동작한다. 열거를
+    지원하지 않는 백엔드(`_live_vec_ids` 가 `None`)에서는 종전에 그 검사 자체를
+    skip 하고 텍스트·메타 동일 청크를 바로 `c_same` 처리했다 — 그 백엔드에서
+    벡터만 유실돼도 텍스트·메타가 계속 같으므로 매 증분이 다시 `c_same` 으로
+    떨어져 **영구히 회수되지 않는다**. `recover_vectors=True` 이고 `vec` 이
+    `get_by_id(doc_id) -> dict | None` 콜러블을 노출하면(3 백엔드 전부 이미
+    구현) 그런 청크마다 `chunk_id` 단건 조회로 존재를 확인해, 없거나 다른 팩
+    소유면 재임베딩 경로로 보낸다. 단건 조회는 배치 열거보다 훨씬 비싸므로
+    옵트인으로 게이트한다.
+
+    `recover_vectors=False`(기본)일 때의 카운트 산출 알고리즘(어떤 청크가
+    new/txt/meta/same 어느 쪽으로 세어지는가)은 이 옵션 도입 이전과 동일하다 —
+    신규 회수 분기는 `recover_vectors=True` 일 때만 도달한다. 그러나 **반환값의
+    튜플 계약**(길이 6→7)은 `recover_vectors` 값과 무관하게 이 변경으로 깨진다.
+    기존 6-값 위치 언패킹 호출부는 전부 `ValueError: too many values to unpack
+    (expected 6)` 로 즉시 실패한다 — 조용한 오염보다 시끄러운 실패가 낫다는 이
+    함수의 기존 설계 철학과 같다. 이 저장소 안 호출부는 전부 갱신했다. 저장소
+    밖 소비자는 이 PR 이 통제할 수 없는 별도 업그레이드가 필요하다(breaking
+    change).
     """
     require_live_data("load_chunks_incremental")
     principal = _require_bound_principal()
     authorize(sql, principal, pack_name)
     c_new = c_txt = c_meta = c_same = err = 0
+    vec_unrecovered = 0  # #332: 열거 불가 백엔드에서 존재를 확인 못 한 c_same 후보 수
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     bypack_ids: set[str] = set()
     b_texts: list[str]  = []
@@ -2279,6 +2303,17 @@ def load_chunks_incremental(
     # 경우 txt 경로로 재임베딩시킨다 — 1회 계산, None 이면(벡터 축 없는 배포)
     # 검사 전체를 skip 한다(현행 동작 보존).
     vec_set = _live_vec_ids(vec, pack_name)
+
+    # #332: vec_set 이 None(열거 불가)이어도 백엔드가 단건 조회를 지원하면
+    # recover_vectors=True 로 그 수단을 켠다. `_vec_backend` 와 같은 이유로
+    # 호출당 1회만 판정한다. `available` 을 확인 안 하면 "확인 안 됨"(백엔드
+    # 비활성)을 "확인된 부재"로 격상시킬 위험이 있다(`_live_vec_ids` else 분기와
+    # 같은 구분).
+    vec_get_by_id = None
+    if recover_vectors and getattr(vec, "available", False):
+        _cand = getattr(vec, "get_by_id", None)
+        if callable(_cand):
+            vec_get_by_id = _cand
 
     def flush_single(sid: str, txt: str, meta: dict, kind: str) -> None:
         """청크 1건 upsert(재임베딩). doc 쓰기까지 성공해야 kind 에 따라
@@ -2387,6 +2422,42 @@ def load_chunks_incremental(
                 b_metas.append(meta)
                 b_kinds.append("txt")
                 log.warning("벡터 유실 회수(%s) %s", pack_name, chunk_id[:8])
+            elif vec_set is None and vec_get_by_id is not None:
+                # #332: 열거 불가 백엔드지만 단건 조회는 지원하고
+                # recover_vectors=True 다 — chunk_id 하나로 존재를 확인한다.
+                try:
+                    hit = vec_get_by_id(chunk_id)
+                except Exception as exc:
+                    vec_unrecovered += 1
+                    c_same += 1
+                    log.warning(
+                        "청크 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
+                        pack_name, chunk_id[:8], exc)
+                else:
+                    # get_by_id 는 pack_id 로 좁히지 않는다(3 백엔드 공통, node_id
+                    # 단일 키 조회) — 슬롯을 다른 팩이 차지했으면 "존재"로 오판해
+                    # 이 팩의 유실을 가린다(공유-id 팩 구성, `_live_vec_ids`
+                    # docstring "한계" 절과 같은 슬롯 충돌 축). `slot_owner()`
+                    # (쓰기 게이트가 쓰는 것과 동일 함수)로 소유자를 대조해야
+                    # 진짜 존재 판정이다. 소유자가 다르거나(또는 unowned) 슬롯이
+                    # 아예 없으면 회수 경로로 보낸다 — 진짜 슬롯 충돌이면 기존
+                    # 쓰기 게이트가 그 자리에서 거부해 `err` 로 드러난다(신설
+                    # 로직이 아니라 flush/flush_single 의 기존 예외 처리가 흡수).
+                    owner = slot_owner(hit.get("metadata") if hit else None)
+                    if hit is None or owner != pack_name:
+                        b_ids.append(chunk_id)
+                        b_texts.append(row["text"])
+                        b_metas.append(meta)
+                        b_kinds.append("txt")
+                        log.warning(
+                            "벡터 유실 회수(단건조회, %s) %s", pack_name, chunk_id[:8])
+                    else:
+                        c_same += 1
+            elif vec_set is None:
+                # 열거 불가 + (opt-out 이거나 단건 조회 수단이 없다) — 확인 자체를
+                # 못 했다. 종전과 같이 same 처리하되 미확인 건수로 명시한다.
+                vec_unrecovered += 1
+                c_same += 1
             else:
                 c_same += 1
 
@@ -2394,7 +2465,24 @@ def load_chunks_incremental(
                 flush()
 
     flush()
-    return c_new, c_txt, c_meta, c_same, err, bypack_ids
+    if vec_unrecovered:
+        # #332: 실행당 1회, 세 원인 중 무엇으로 미확인이 남았는지 정확히
+        # 구분한다 — 안내 문구가 실제 원인과 어긋나면(예: 옵트아웃인데 "조회
+        # 오류" 라고 말하면) 소비자가 잘못된 조치를 취한다.
+        if not recover_vectors:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): 열거 불가 백엔드에서 %d건 확인 못 함 — "
+                "recover_vectors=True 로 단건 조회 회수를 켤 수 있다",
+                pack_name, vec_unrecovered)
+        elif vec_get_by_id is None:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): %d건 — 단건 조회를 지원하지 않거나 "
+                "백엔드가 비활성이다", pack_name, vec_unrecovered)
+        else:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): %d건 — 단건 조회 오류로 확인하지 못했다",
+                pack_name, vec_unrecovered)
+    return c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered
 
 
 def incremental_finalize(

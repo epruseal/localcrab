@@ -124,7 +124,7 @@ class TestVectorOnlyLossRecovery:
 
         # 벡터축 전체 유실 재현(부분 복원·백엔드 삭제) — doc 은 그대로.
         vec1 = _EnumerableVec("pack-1")
-        c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec1, docs, live_chunks, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 1, 0, 0, 0), (
             f"벡터 유실이 same 으로 방치됐다: new={c_new} txt={c_txt} meta={c_meta} same={c_same}")
@@ -133,7 +133,7 @@ class TestVectorOnlyLossRecovery:
 
         # 2회차: 이제 벡터가 있으니 same 으로 수렴한다.
         live_chunks2 = _live_chunks_from_docs(docs)
-        c_new2, c_txt2, c_meta2, c_same2, err2, _ids2 = pack_load.load_chunks_incremental(
+        c_new2, c_txt2, c_meta2, c_same2, err2, _ids2, _vu2 = pack_load.load_chunks_incremental(
             "pack-1", f, vec1, docs, live_chunks2, sql=pack_sql)
         assert (c_new2, c_txt2, c_meta2, c_same2, err2) == (0, 0, 0, 1, 0), (
             f"2회차가 same 으로 수렴하지 않았다: {(c_new2, c_txt2, c_meta2, c_same2, err2)}")
@@ -149,7 +149,7 @@ class TestVectorOnlyLossRecovery:
         live_chunks = _live_chunks_from_docs(docs)
 
         vec2 = _RecordingVec()
-        c_new, c_txt, c_meta, c_same, err, _ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec2, docs, live_chunks, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0)
         assert vec2.calls == [], "vec 미가용인데 재임베딩을 호출했다"
@@ -166,7 +166,7 @@ class TestVectorOnlyLossRecovery:
 
         f2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk_row("c1", "본문", 쪽="99")])
         vec = _EnumerableVec("pack-1")  # 인식되는 백엔드이지만 벡터는 부재
-        c_new, c_txt, c_meta, c_same, err, _ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
         assert (c_txt, c_meta, c_same) == (1, 0, 0), (
             f"벡터 부재에서 메타 경로가 txt 로 안 우회했다(기존 자가치유 회귀): "
@@ -186,7 +186,7 @@ class TestVectorOnlyLossRecovery:
 
         vec1 = _EnumerableVec("pack-1")  # 벡터 유실 재현(빈 스토어)
         monkeypatch.setattr(pack_load, "_live_vec_ids", lambda vec, pack: None)
-        _n, c_txt, _m, c_same, _e, _ids = pack_load.load_chunks_incremental(
+        _n, c_txt, _m, c_same, _e, _ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec1, docs, live_chunks, sql=pack_sql)
         assert (c_txt, c_same) == (0, 1), (
             "검사가 무력화된 변형에서도 same 이 아니면 이 테스트가 회귀를 못 잡는다")

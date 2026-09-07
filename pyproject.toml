@@ -145,6 +145,7 @@ ignore = ["E501"]
 "tests/test_pack_load_r11_pg_gates.py" = ["F811"]
 "tests/test_pack_load_r12_selfheal_gates.py" = ["F811"]
 "tests/test_pack_load_r13_owner_pred_gates.py" = ["F811"]
+"tests/test_pack_load_r14_unenumerable_vec_gates.py" = ["F811"]
 "tests/test_vector_store_parity.py" = ["N806"]
 "scripts/qa/bench_vector_backend.py" = ["N806"]
 
