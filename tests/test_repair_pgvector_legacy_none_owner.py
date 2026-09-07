@@ -103,6 +103,22 @@ def _pg_url() -> str:
     return os.environ["OPENCRAB_PG_TEST_URL"]
 
 
+def _dsn_with_ambiguous_query_host() -> str:
+    """실제로는 연결에 성공하지만 ``target_identity_reason``이 대상 서버를
+    하나로 특정할 수 없다고 판단해야 하는 DSN을 만든다.
+
+    ``OPENCRAB_PG_TEST_URL``에 ``?host=localhost``(이미 쿼리가 있으면
+    ``&host=localhost``)를 덧붙인다. authority의 host는 그대로 있어 연결은
+    실제 테스트 DB로 정상적으로 이어지지만(-- 엑조틱한 유닉스 소켓이나
+    다중 호스트 클러스터 없이도 실제 연결 성공 케이스를 재현할 수 있다),
+    쿼리 문자열의 ``host`` 키가 authority를 덮어쓸 수 있는 형태이므로
+    ``target_identity_reason``은 이를 거부해야 한다(codex r7 지적의 실측
+    재현: authority만 보면 안전해 보이지만 실제로는 아닌 DSN)."""
+    base = _pg_url()
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}host=localhost"
+
+
 # ---------------------------------------------------------------------------
 # 핵심 acceptance criteria: 복구 전 거부 -> 복구 후 재적재 성공
 # ---------------------------------------------------------------------------
@@ -207,6 +223,92 @@ class TestApplyRequiresBackupOrExplicitSkip:
 
         assert code == repair.EXIT_BACKUP
         assert _all_rows(pg_store) == before
+
+
+# ---------------------------------------------------------------------------
+# 대상 서버 식별 불가 시 fail-closed (#306 r7) -- 세 분기를 각각 고정
+# ---------------------------------------------------------------------------
+
+
+class TestApplyIsRefusedWhenTargetIdentityIsAmbiguous:
+    """분기 1 (팀리드 지적, 가장 중요): ``--apply``, ``--skip-backup`` 없음,
+    대상 서버 식별 불가 -> ``EXIT_PRECONDITION``이고 DB 쓰기가 0건이어야 한다.
+    이 체크가 사라지면 롤백 없는 수리가 조용히 통과한다."""
+
+    def test_apply_without_skip_backup_is_refused_and_db_is_untouched(
+        self, pg_store, tmp_path
+    ):
+        _seed_and_contaminate(pg_store, "legacy")
+        before = _all_rows(pg_store)
+        backup_path = tmp_path / "backup.json"
+
+        code = repair.main(
+            [
+                "--pg-url", _dsn_with_ambiguous_query_host(), "--table", pg_store._table,
+                "--apply", "--backup-to", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_PRECONDITION
+        assert not backup_path.exists()
+        assert _all_rows(pg_store) == before, "대상 서버를 특정할 수 없는데 DB가 바뀌었다"
+
+
+class TestApplyProceedsWithoutSnapshotWhenSkipBackupIsExplicit:
+    """분기 2: ``--apply --skip-backup``, 대상 서버 식별 불가 -> 수리는
+    진행되고 그 사유가 CLI 출력에 나타나야 한다(운영자가 직접 롤백을
+    포기한 경로이므로 조용히 진행해서는 안 되고 반드시 알려야 한다)."""
+
+    def test_apply_with_skip_backup_proceeds_and_prints_the_reason(self, pg_store, capsys):
+        _seed_and_contaminate(pg_store, "legacy")
+
+        code = repair.main(
+            [
+                "--pg-url", _dsn_with_ambiguous_query_host(), "--table", pg_store._table,
+                "--apply", "--skip-backup",
+            ]
+        )
+
+        assert code == repair.EXIT_OK
+        out = capsys.readouterr().out
+        assert "query string sets" in out, "사유가 CLI 출력에 나타나지 않았다"
+        legacy = next(row for row in _all_rows(pg_store) if row[0] == "legacy")
+        assert legacy[1] == "", "--skip-backup 경로인데 실제로 수리가 진행되지 않았다"
+
+
+class TestRepairDirectCallDefendsAgainstAmbiguousTarget:
+    """분기 3: ``main()``을 거치지 않고 ``repair()``를 직접 호출해도(예: 다른
+    스크립트가 이 모듈을 라이브러리로 쓰는 경우) 대상 서버 식별 불가 시
+    내부 방어 체크가 걸려야 한다. ``main()``의 fail-closed 게이트가 유일한
+    방어선이면 안 된다 -- codex r7이 지적한 "두 호출 경로가 어긋난다" 구조적
+    간극을 막는다."""
+
+    def test_repair_called_directly_with_backup_to_raises_and_db_is_untouched(
+        self, pg_store, tmp_path
+    ):
+        _seed_and_contaminate(pg_store, "legacy")
+        backup_path = tmp_path / "backup.json"
+        engine = repair.connect(_dsn_with_ambiguous_query_host())
+        before = _all_rows(pg_store)
+
+        with pytest.raises(repair.SnapshotError):
+            repair.repair(engine, pg_store._table, backup_to=str(backup_path))
+
+        assert not backup_path.exists()
+        assert _all_rows(pg_store) == before, "예외가 났는데 DB가 바뀌었다(롤백 실패)"
+
+    def test_repair_called_directly_without_backup_to_is_unaffected(self, pg_store):
+        """``backup_to=None``(=``--skip-backup``에 대응)이면 식별 게이트
+        자체가 걸리지 않고 수리가 정상 진행된다 -- 이 게이트는 백업을
+        만들어야 할 때만 발동해야 한다."""
+        _seed_and_contaminate(pg_store, "legacy")
+        engine = repair.connect(_dsn_with_ambiguous_query_host())
+
+        rows = repair.repair(engine, pg_store._table, backup_to=None)
+
+        assert len(rows) == 1
+        legacy = next(row for row in _all_rows(pg_store) if row[0] == "legacy")
+        assert legacy[1] == ""
 
 
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
@@ -410,6 +512,72 @@ class TestBackupSignatureAndSnapshotIntegrity:
         assert code == repair.EXIT_BACKUP
         assert _all_rows(pg_store) == before
 
+    def test_host_mismatch_is_rejected_and_nothing_changes(self, pg_store, tmp_path):
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        before = _all_rows(pg_store)
+
+        tampered = json.loads(backup_path.read_text(encoding="utf-8"))
+        tampered["host"] = "some-other-host.invalid"
+        backup_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--rollback-from", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_BACKUP
+        assert _all_rows(pg_store) == before
+
+    def test_port_mismatch_is_rejected_and_nothing_changes(self, pg_store, tmp_path):
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        before = _all_rows(pg_store)
+
+        tampered = json.loads(backup_path.read_text(encoding="utf-8"))
+        tampered["port"] = 1
+        backup_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--rollback-from", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_BACKUP
+        assert _all_rows(pg_store) == before
+
+    def test_missing_host_key_in_snapshot_is_rejected(self):
+        """``host``키가 아예 없는 스냅샷(구버전/손상/수기 조작)은 ``None``이
+        되어 어떤 현재 host와도 일치하지 않아야 한다(우연 통과 금지)."""
+        with pytest.raises(repair.SnapshotError):
+            repair.validate_snapshot_signature(
+                {"table": "t", "database": "d", "port": 5432},
+                table="t", database="d", host="localhost", port=5432,
+            )
+
+    def test_missing_port_key_in_snapshot_is_rejected(self):
+        """``port``키가 없으면 스냅샷 쪽은 ``None``, 현재 값은 포트 생략을
+        5432로 정규화한 값이라 ``None != 5432``로 항상 거부돼야 한다."""
+        with pytest.raises(repair.SnapshotError):
+            repair.validate_snapshot_signature(
+                {"table": "t", "database": "d", "host": "localhost"},
+                table="t", database="d", host="localhost", port=None,
+            )
+
+    def test_omitted_port_and_explicit_5432_are_compatible(self):
+        """스냅샷에 명시적으로 적힌 5432와, 현재 DSN에서 포트를 생략해
+        ``None``으로 넘어온 값(5432로 정규화)은 서로 호환돼야 한다."""
+        repair.validate_snapshot_signature(
+            {"table": "t", "database": "d", "host": "localhost", "port": 5432},
+            table="t", database="d", host="localhost", port=None,
+        )
+
     def test_duplicate_node_id_in_snapshot_is_rejected(self, tmp_path):
         backup_path = tmp_path / "backup.json"
         backup_path.write_text(
@@ -440,13 +608,21 @@ class TestCliExitCodeMatrix:
         code = repair.main(["--pg-url", "postgresql://x", "--table", "bad-table; drop"])
         assert code == repair.EXIT_USAGE
 
-    def test_connection_failure_is_reported_as_precondition_failure(self):
+    def test_connection_failure_is_reported_as_precondition_failure(self, capsys):
         code = repair.main(
             [
                 "--pg-url", "postgresql://nouser:nopass@127.0.0.1:1/doesnotexist",
                 "--table", "vtest",
             ]
         )
+        assert code == repair.EXIT_PRECONDITION
+        captured = capsys.readouterr()
+        assert "nopass" not in captured.out, "authority 비밀번호가 stdout에 그대로 새어나왔다"
+        assert "nopass" not in captured.err, "authority 비밀번호가 stderr에 그대로 새어나왔다"
+        assert "***" in captured.out, "마스킹된 자리표시자가 출력에 없다"
+
+    def test_unparseable_pg_url_prints_placeholder_without_crashing(self):
+        code = repair.main(["--pg-url", "not-a-valid-dsn ::: %%%", "--table", "vtest"])
         assert code == repair.EXIT_PRECONDITION
 
     def test_rollback_without_apply_is_rejected(self, pg_store, tmp_path):

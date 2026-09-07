@@ -41,6 +41,21 @@ SAFETY (Autonomy Contract 매핑):
     재실행해도 안전하게 0건 처리된다.
   - 라이브 데이터에는 실행하지 않는다. 검증은 격리된 개발/테스트 인스턴스에서만
     한다.
+  - ``--pg-url``(또는 ``POSTGRES_URL``)을 출력할 때 authority 구역의 비밀번호는
+    ``***``로 가린다(``sqlalchemy.engine.url.make_url(...).render_as_string(
+    hide_password=True)``). **알려진 한계**: 이 마스킹은 DSN의 query 문자열
+    파라미터(예: ``?sslpassword=...``)까지는 가리지 않는다. 이 저장소의 실제
+    DSN 관례(``opencrab/config.py``의 ``postgres_url`` 기본값과 그 값을 그대로
+    넘기는 호출자들)는 query에 비밀을 담지 않지만, ``--pg-url``로 임의 DSN을
+    주는 것 자체는 코드로 막혀 있지 않다. query에 비밀을 담은 DSN을 쓰는
+    운영자는 이 출력이 그 비밀까지 가려주지 않는다는 점을 알아야 한다.
+  - 스냅샷은 ``table``/``database``/``host``/``port`` 네 값 전부가 현재 대상과
+    일치할 때만 유효하다(``validate_snapshot_signature``). 대상 서버를 하나로
+    특정할 수 없는 ``--pg-url``(다중 호스트, PostgreSQL ``service`` 설정,
+    소켓-경유-쿼리스트링 등 -- ``target_identity_reason`` 참고)이면 ``--apply``
+    자체를 거부한다(코드 3, DB 쓰기 0건). ``--skip-backup``을 명시했을 때만
+    같은 사유를 정보성으로 출력하고 스냅샷 없이 수리를 진행한다(운영자가
+    직접 롤백을 포기한 경로이므로).
 
 ROLLBACK (``--rollback-from <snapshot.json>``, ``--apply`` 필요):
   스냅샷이 기록한 각 행에 대해 PostgreSQL 시스템 컬럼 ``xmin``(그 행을 마지막으로
@@ -57,7 +72,8 @@ ROLLBACK (``--rollback-from <snapshot.json>``, ``--apply`` 필요):
   ``--rollback-from``은 안전하다고 보장하지 않는다**. 이 한계는 실행 시점마다
   stderr 경고로도 출력된다(문서/docstring만 읽지 않는 운영자도 보게 하기 위함).
 
-  백업 서명(``table``/``database``)이 현재 대상과 다르면 즉시 거부한다(코드 4).
+  백업 서명(``table``/``database``/``host``/``port``)이 현재 대상과 다르면
+  즉시 거부한다(코드 4).
 
 EXIT CODES:
   0 성공, 2 사용법/안전 게이트 실패, 3 연결/사전조건 실패, 4 백업 검증 실패,
@@ -175,6 +191,39 @@ def connect(pg_url: str) -> Any:
     return create_engine(pg_url, pool_pre_ping=True, hide_parameters=True)
 
 
+_AMBIGUOUS_TARGET_QUERY_KEYS = frozenset({"host", "port", "service", "hostaddr"})
+
+
+def target_identity_reason(engine: Any) -> str | None:
+    """스냅샷을 특정 서버 하나에 안전하게 결속할 수 없으면 그 사유 문자열을,
+    결속할 수 있으면 ``None``을 반환한다.
+
+    ``engine.url.host``만 보면 안 된다: SQLAlchemy/libpq는 DSN의 query
+    문자열에 ``host``/``port``/``service``/``hostaddr``가 있으면 그 값으로
+    실제 연결 대상을 덮어쓴다(authority의 host는 무시됨). 예:
+    ``postgresql://u:p@localhost/db?host=h2,h3`` 는 ``engine.url.host``가
+    ``'localhost'``로 무해해 보이지만 실제 연결은 ``h2,h3``로 간다. 다중
+    호스트·PostgreSQL service 설정·소켓-경유-쿼리스트링 형태는 이런 식으로
+    authority만으로는 검출되지 않으므로 query 키 자체를 함께 거부한다.
+    ``main()``과 ``repair()``가 이 판정을 공유해 CLI 경로와 직접 호출 경로가
+    어긋나지 않게 한다.
+    """
+    if not engine.url.host:
+        return (
+            "cannot resolve a single host for this --pg-url (empty/ambiguous "
+            "host: multi-host authority, PostgreSQL service config, or "
+            "Unix-socket-via-query-parameter forms are not supported)"
+        )
+    blocked = _AMBIGUOUS_TARGET_QUERY_KEYS & set(engine.url.query)
+    if blocked:
+        return (
+            f"--pg-url query string sets {sorted(blocked)}, which can override "
+            "the authority host/port at connect time; a rollback-safe snapshot "
+            "cannot be bound to one server for this target"
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 탐지 / 감사 (읽기 전용)
 # ---------------------------------------------------------------------------
@@ -244,12 +293,37 @@ def load_snapshot(path: str) -> dict[str, Any]:
     return snapshot
 
 
-def validate_snapshot_signature(snapshot: dict[str, Any], table: str, database: str) -> None:
-    if snapshot.get("table") != table or snapshot.get("database") != database:
+def validate_snapshot_signature(
+    snapshot: dict[str, Any],
+    table: str,
+    database: str,
+    host: str | None,
+    port: int | None,
+) -> None:
+    """table/database/host/port 4가지 모두 일치해야 통과한다.
+
+    포트는 현재 값만 생략-포트를 5432로 정규화한다(``port is None`` 검사,
+    ``port or 5432``가 아님: 0 같은 값을 진실성으로 밀어 넣지 않는다). 스냅샷
+    쪽 ``port``/``host``에는 기본값을 주지 않는다 -- 정상 경로로 만든 스냅샷은
+    항상 구체적인 host/port를 갖고 있으므로, 키가 없는 스냅샷(손상·수기
+    조작·구버전)은 ``None``이 되어 어떤 현재 값과도 일치할 수 없다. 즉
+    ``None == None`` 우연 통과가 구조적으로 없다.
+    """
+    norm_port = 5432 if port is None else port
+    snap_host = snapshot.get("host")
+    snap_port = snapshot.get("port")
+    if (
+        snapshot.get("table") != table
+        or snapshot.get("database") != database
+        or not snap_host
+        or snap_host != host
+        or snap_port != norm_port
+    ):
         raise SnapshotError(
             "backup signature mismatch: snapshot is for "
-            f"table={snapshot.get('table')!r} database={snapshot.get('database')!r}, "
-            f"but current target is table={table!r} database={database!r}"
+            f"table={snapshot.get('table')!r} database={snapshot.get('database')!r} "
+            f"host={snap_host!r} port={snap_port!r}, but current target is "
+            f"table={table!r} database={database!r} host={host!r} port={norm_port!r}"
         )
 
 
@@ -292,8 +366,19 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                 for r in rows
             ]
             if backup_to and result_rows:
+                reason = target_identity_reason(engine)
+                if reason:
+                    raise SnapshotError(f"cannot create a rollback-safe snapshot: {reason}")
                 database = conn.execute(text("SELECT current_database()")).scalar()
-                snapshot = {"table": table, "database": database, "rows": result_rows}
+                host = engine.url.host
+                port = engine.url.port if engine.url.port is not None else 5432
+                snapshot = {
+                    "table": table,
+                    "database": database,
+                    "host": host,
+                    "port": port,
+                    "rows": result_rows,
+                }
                 write_backup_atomic(backup_to, snapshot)
             trans.commit()
         except Exception:
@@ -370,7 +455,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"! {exc}")
         return EXIT_USAGE
 
-    print(f"# pg-url : {pg_url}")
+    try:
+        from sqlalchemy.engine import make_url
+
+        display_url = make_url(pg_url).render_as_string(hide_password=True)
+    except Exception:
+        display_url = "<unparseable --pg-url>"
+    print(f"# pg-url : {display_url}")
     print(f"# table  : {table}")
 
     try:
@@ -380,6 +471,10 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"! could not connect: {exc}")
         return EXIT_PRECONDITION
+
+    host = engine.url.host
+    port = engine.url.port if engine.url.port is not None else 5432
+    identity_reason = target_identity_reason(engine)
 
     if args.rollback_from:
         if not args.apply:
@@ -395,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         with engine.connect() as conn:
             database = conn.execute(text("SELECT current_database()")).scalar()
         try:
-            validate_snapshot_signature(snapshot, table, database)
+            validate_snapshot_signature(snapshot, table, database, host, port)
         except SnapshotError as exc:
             print(f"! {exc}")
             return EXIT_BACKUP
@@ -446,6 +541,16 @@ def main(argv: list[str] | None = None) -> int:
         print("! --apply requires --backup-to <path> (or explicit --skip-backup).")
         return EXIT_USAGE
 
+    if identity_reason:
+        print(f"! {identity_reason}")
+        if not args.skip_backup:
+            print(
+                "! refusing --apply: a rollback-safe snapshot cannot be created "
+                "for this target (pass --skip-backup to proceed without one)."
+            )
+            return EXIT_PRECONDITION
+        print("! proceeding without a snapshot: --skip-backup was given explicitly.")
+
     try:
         result_rows = repair(engine, table, args.backup_to)
     except CountMismatchError as exc:
@@ -453,6 +558,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_COUNT_MISMATCH
     except (OSError, FileExistsError) as exc:
         print(f"! backup write failed, repair rolled back: {exc}")
+        return EXIT_BACKUP
+    except SnapshotError as exc:
+        print(f"! {exc}")
         return EXIT_BACKUP
 
     print(f"# repaired {len(result_rows)} row(s).")
