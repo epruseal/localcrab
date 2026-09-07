@@ -239,6 +239,30 @@ class _ShapeProbeHostile:
         pass
 
 
+class _AvailableCountingChromaVec:
+    """`available` 을 읽을 때마다 세되 예외는 던지지 않는 chroma 모양 더블 —
+    [검증 라운드 M4] `test_available_vectors_axis_requeries_and_reopens_
+    on_live_drift` 는 peek 이 실제로 라이브 벡터를 지우는지만 보고, peek 이
+    `_live_vec_ids` 에 캐시한 `backend=` 를 넘겨 `available` 재읽기를
+    실제로 피하는지는 안 본다 — `_FakeChromaVec.available` 이 예외 없는
+    상수라 두 번 읽어도 관측되지 않기 때문이다. 이 더블은 그 재읽기 자체를
+    직접 센다(예외로 터뜨리는 `_AvailableRaisesOnSecondRead` 와 달리, 두
+    번째 읽기가 있어도 `delete_pack` 자체는 끝까지 정상 진행시켜 "저널
+    상태는 정상인데 사실은 두 번 읽었다"는 조용한 회귀까지 잡는다)."""
+
+    def __init__(self, rows):
+        self.reads = 0
+        self._collection = _FakeChromaCollection(rows)
+
+    @property
+    def available(self):
+        self.reads += 1
+        return True
+
+    def delete(self, ids):  # pragma: no cover -- `_collection` 이 지운다
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1. 저널 원자성 — 쓰기 도중 죽어도 부분 기록을 읽고 잘못 판단하지 않는다.
 # ---------------------------------------------------------------------------
@@ -1067,6 +1091,45 @@ class TestDoneJournalDriftRecheck:
         assert "g1" not in post, f"재유입된 벡터 g1 이 재개 뒤에도 실제로 남아 있다: {post!r}"
         journal = delete_journal.load_journal(tmp_path, "vecnodrift-pack")
         assert journal["axes"]["vectors"]["done"] is True
+
+    def test_peek_does_not_reread_available_when_rechecking_a_done_axis(
+        self, live, tmp_path
+    ):
+        """[검증 라운드 M4] 이미 done=True·available=True 인 vectors 축을
+        재개 호출이 peek 할 때도 `available` 은 드리프트 탐침이 최초에
+        읽은 한 번으로 끝나야 한다 — #327 리뷰 P2 "호출당 정확히 한 번"
+        계약은 최초 실행뿐 아니라 peek 재확인 경로에도 그대로 적용된다.
+
+        위 `test_available_vectors_axis_requeries_and_reopens_on_live_drift`
+        는 peek 이 실제로 라이브 벡터를 지우는지만 확인하고, peek 이
+        `_live_vec_ids` 를 부를 때 캐시한 `backend=` 를 실제로 쓰는지는
+        확인하지 않는다 — `_FakeChromaVec.available` 이 그냥 상수라 두 번
+        읽어도 예외가 안 나 관측되지 않기 때문이다. 여기서는 `available`
+        을 읽을 때마다 세는 더블로 그 재읽기 자체를 직접 잰다.
+
+        역변이: `delete_pack` 의 peek 호출에서 `backend=(kind, handle,
+        table)` 인자를 빼면(`_live_vec_ids(vec, pack_name)` 로 되돌리면)
+        `_live_vec_ids` 내부가 `_vec_backend(vec)` 를 다시 불러 `available`
+        을 한 번 더 읽는다 — 이 테스트가 `reads == 2` 로 잡는다.
+        """
+        graph, docs = live
+        _seed_pack(graph, docs, tmp_path, "vecpeekreread-pack", ["p1"])
+        vec1 = _AvailableCountingChromaVec({"p1": "vecpeekreread-pack"})
+        pack_load.delete_pack("vecpeekreread-pack", graph, docs, vec1)
+        journal = delete_journal.load_journal(tmp_path, "vecpeekreread-pack")
+        assert journal["axes"]["vectors"]["done"] is True
+
+        # 재유입 없음 — 완료된 팩에 남은 라이브 벡터가 없는 정상 상태.
+        vec2 = _AvailableCountingChromaVec({})
+        pack_load.delete_pack(
+            "vecpeekreread-pack", graph, docs, vec2, resume=True)
+        assert vec2.reads == 1, (
+            f"peek 재확인 경로에서 available 을 {vec2.reads}번 읽었다 — "
+            "드리프트 탐침의 최초 1회로 끝나야 한다(캐시한 backend 를 "
+            "peek 이 재사용하지 않고 다시 조회했다는 뜻)"
+        )
+        journal2 = delete_journal.load_journal(tmp_path, "vecpeekreread-pack")
+        assert journal2["axes"]["vectors"]["done"] is True
 
     def test_available_is_read_exactly_once_per_delete_pack_call(
         self, live, tmp_path
