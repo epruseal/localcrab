@@ -1683,3 +1683,79 @@ class TestBackwardCompatibilityWithoutSql:
         node_del, chunk_sql_del, chunk_vec_del = result
         assert node_del == 1
         assert chunk_vec_del == 0
+
+
+# ---------------------------------------------------------------------------
+# #327 재리뷰 P1(id 3948310372) — Windows 에서 디렉터리 fsync 가 PermissionError
+# 를 낸다. 저널 파일 자체(os.replace)는 이미 안전하게 교체된 뒤라, 이 예외가
+# 그대로 새면 delete_pack 전체가 저널을 남긴 채 죽고 이후 재실행이 "미완료"로
+# 오판한다.
+# ---------------------------------------------------------------------------
+
+class _WindowsLikeOS:
+    """실제 `os` 모듈에 위임하되 `name` 만 `"nt"` 로 보고하고, 디렉터리 대상
+    `os.open()` 호출에는 실제 Windows 가 내는 `PermissionError` 를 흉내낸다.
+
+    `delete_journal` 모듈 안의 `os` 참조만 이 프록시로 치환해 플랫폼 흉내를
+    `save_journal` 호출 하나로 한정한다 — 전역 `os.name` 을 직접 바꾸면
+    `pathlib.Path()` 가 이 프로세스(POSIX)에서도 진짜 `WindowsPath` 를 구성해
+    `journal_path()` 의 경로 결합 자체가 `UnsupportedOperation` 으로 깨진다
+    (codex `gpt-6-astra` 검증 로그로 실측 확인, 전역 패치안은 폐기).
+    """
+
+    def __init__(self, real_os):
+        self._real = real_os
+
+    @property
+    def name(self):
+        return "nt"
+
+    def open(self, path, flags, *args, **kwargs):
+        if flags == self._real.O_RDONLY and self._real.path.isdir(path):
+            raise PermissionError(
+                "[WinError 5] Access is denied "
+                "(simulated: Windows 는 디렉터리를 os.open() 으로 열 수 없다)"
+            )
+        return self._real.open(path, flags, *args, **kwargs)
+
+    def __getattr__(self, attr):
+        return getattr(self._real, attr)
+
+
+class TestSaveJournalWindowsDirFsyncSkip:
+    """`save_journal` 이 원자적 교체 뒤 durability 를 위해 부모 디렉터리를
+    `os.open(..., os.O_RDONLY)` 로 열어 `fsync` 하는데, Windows 는 디렉터리를
+    그렇게 열 수 없다. `os.name == "nt"` 일 때는 이 단계를 건너뛰어야 한다."""
+
+    def test_directory_open_permission_error_on_windows_does_not_raise(
+        self, tmp_path, monkeypatch
+    ):
+        """역변이: `if os.name == "nt": return` 분기를 지우면 이 테스트가
+        `PermissionError` 로 실패한다(RED, stash 로 실측 확인)."""
+        monkeypatch.setattr(delete_journal, "os", _WindowsLikeOS(os))
+        payload = {"schema": delete_journal.JOURNAL_SCHEMA, "marker": "win-pack"}
+
+        delete_journal.save_journal(tmp_path, "win-pack", payload)  # 예외 없이 끝나야 한다
+
+        # load_journal 은 pathlib 만 쓰고 os.* 를 호출하지 않으므로 프록시가
+        # 걸린 채로 읽어도 실제 파일을 그대로 본다 — 디렉터리 fsync 만
+        # 건너뛰었을 뿐 저널 내용 자체는 정상 기록됐음을 확인한다.
+        journal = delete_journal.load_journal(tmp_path, "win-pack")
+        assert journal == payload
+
+    def test_posix_path_still_fsyncs_the_directory(self, tmp_path, monkeypatch):
+        """Windows 분기가 POSIX(`os.name == "posix"`) 흐름을 건드리지 않았는지
+        직접 확인한다 — 조건 없이 걸리는 얼리 리턴으로 잘못 고치면 이 테스트가
+        디렉터리 fsync 호출 누락을 잡는다."""
+        calls = []
+        real_fsync = os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(delete_journal.os, "fsync", spy_fsync)
+        delete_journal.save_journal(
+            tmp_path, "posix-pack", {"schema": delete_journal.JOURNAL_SCHEMA}
+        )
+        assert len(calls) == 2  # 파일 fsync 1회 + 디렉터리 fsync 1회
