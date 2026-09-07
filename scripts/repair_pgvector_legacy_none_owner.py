@@ -59,15 +59,18 @@ SAFETY (Autonomy Contract 매핑):
     직접 롤백을 포기한 경로이므로).
   - **알려진 한계 (대상 서버 식별)**: ``target_identity_reason``이 보는
     근거는 DSN 문자열과 프로세스 환경(``PGHOSTADDR``/``PGSERVICE``/
-    ``PGSERVICEFILE``/``PGPORT`` 등)뿐이다(``_resolve_table_schema``는
+    ``PGSERVICEFILE``/``PGPORT`` 등)뿐이다. 이 식별 검사는 ``main()``이
+    수행한다. ``rollback()``이나 ``repair()``를 라이브러리로 직접
+    호출하면(테스트가 실제로 이렇게 호출한다) 그 검사를 거치지 않는다.
+    이 모듈의 ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
+    ``Engine``을 넘기는 경로도 마찬가지로 이 판정 범위 밖이다. 또한 이
+    검사는 DSN의 호스트 이름이 안정적으로 같은 서버를 가리킨다고
+    가정한다. DNS나 프록시가 같은 이름을 다른 서버로 돌리면 검사는
+    통과하지만 실제 대상은 달라진다. (``_resolve_table_schema``는
     이와 달리 이미 맺어진 연결 위에서 ``pg_namespace``/``pg_class``/
-    ``to_regclass()``를 직접 질의하므로 DSN/환경 근거에 의존하지 않지만,
-    그 연결 자체가 의도한 서버로 갔는지는 판정하지 않는다). 이 모듈의
-    ``connect()``를 거치지 않고 ``connect_args``로 직접 만든
-    ``Engine``을 ``repair()``/``rollback()``에 넘기면(``rollback()``은
-    ``main()``을 거치지 않고 직접 호출될 수도 있다 -- 테스트가 그렇게
-    쓴다), 실제 연결이 어느 서버로 가는지는 이 판정 범위 밖이라 보장하지
-    못한다. 근본 해법은 연결 뒤 서버 자신에게 물어(``current_database()``,
+    ``to_regclass()``를 직접 질의하므로 DSN/환경 근거에 의존하지
+    않지만, 그 연결 자체가 의도한 서버로 갔는지는 판정하지 않는다.)
+    근본 해법은 연결 뒤 서버 자신에게 물어(``current_database()``,
     ``inet_server_addr()``, ``inet_server_port()``,
     ``pg_postmaster_start_time()``) 그 값을 스냅샷 서명으로 쓰는 것이며,
     이 PR은 그 서버-질의 결속을 구현하지 않았다.
