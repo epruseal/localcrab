@@ -1298,8 +1298,10 @@ def delete_pack(
                     graph_deleted += 1
             node_del += graph_deleted
             _commit_axis("graph_nodes", {"done": not any_graph_failed, "count": graph_deleted})
-        elif _axis_done("graph_nodes"):
-            node_del += axes["graph_nodes"].get("count", 0)
+        # elif _axis_done("graph_nodes"): 이미 done 인 축은 이번 호출에서 아무
+        # 노드도 지우지 않았으므로 node_del 에 아무것도 더하지 않는다 — 저널의
+        # 과거 count 를 이번 실행 확인 건수로 재사용하면 "재개 실행은 이번 실행
+        # 확인 건수만 낸다"(§1) 계약을 어긴다(#327 로컬 지적, codex 1라운드 반례).
         # node_twin_loop 이 done 이 아니면 graph_nodes 진입 없이 그냥 지나간다 —
         # 남은 노드는 다음 resume=True 실행이 처리한다. 저널 생성 시점에 이미 4축
         # 전부 자리표시자(`{"done": False}`)로 채워 놓았으므로(위 journal 초기화 참고)
@@ -1307,21 +1309,22 @@ def delete_pack(
 
         # ── 4. vectors: 독립(ungated) — 세 갈래(구조적 미지원/연결 실패/조회 실패) ──
         if not _axis_done("vectors"):
+            vec_skipped = False
             chunk_vec_del, kind, vec_confirmed, vec_available = _delete_pack_vectors(pack_name, vec)
             _commit_axis(
                 "vectors",
                 {"done": vec_confirmed, "clean": vec_confirmed, "count": chunk_vec_del},
             )
         else:
-            chunk_vec_del = axes["vectors"].get("count")
-            kind = None
-            # 저널은 `kind`/`vec_available` 을 저장하지 않는다(축 항목 형태는
-            # {done, clean, count} 뿐) — 이미 done 인 축은 다시 조회하지 않으므로
-            # 원래 갈래를 복원할 수 없다. `True` 를 기본값으로 둬 표시가 "미지원"
-            # 쪽(구조적 미지원, 갈래 1)으로 기운다 — "미가용"(재시도 대상, 갈래 2)은
-            # 정의상 `vec_confirmed=False` 라 애초에 done 이 되지 않으므로 이 분기에
-            # 오지 않는다. 어느 테스트도 이 분기의 표시 문구를 단언하지 않는다.
-            vec_available = True
+            # 이미 done 인 축은 벡터스토어에 어떤 파괴적 호출도 하지 않으므로 이번
+            # 실행의 확인 건수는 0이다(과거 count 를 재사용하면 §1 계약 위반,
+            # #327 로컬 지적). 저널은 `kind`/`vec_available` 을 저장하지 않으므로
+            # (축 항목 형태는 {done, clean, count} 뿐) 원래 갈래를 복원할 수 없다 —
+            # 추측 대신 `vec_skipped` 로 중립 라벨("이전 완료")을 낸다(아래
+            # `vec_backend` 조립 참고). `kind`/`vec_available` 자체는 이 분기에서
+            # 더 이상 만들지 않는다.
+            vec_skipped = True
+            chunk_vec_del = 0
 
         # 저널은 여기서 자동으로 치우지 않는다. `clear_journal` 자신의 docstring이
         # 명시하듯 "호출자가 부른다" — 이 함수가 그 호출자가 되어 완료 직후 스스로
@@ -1334,7 +1337,7 @@ def delete_pack(
         # `sqlalchemy` 는 `_engine` 을 노출하는 아무 스토어나 잡으므로 sqlite-vec/pgvector
         # 로 옮겨 적는 순간 거짓이 될 수 있고, `_VEC_BACKEND_KINDS` 주석이 경고하는
         # "kind 를 분기하는 소비자"가 하나 더 느는 것이다.
-        vec_backend = kind or ("미지원" if vec_available else "미가용")
+        vec_backend = "이전 완료" if vec_skipped else (kind or ("미지원" if vec_available else "미가용"))
         vec_shown = chunk_vec_del if chunk_vec_del is not None else "미확인"
         resume_tag = "(재개) " if resumed else ""
         prior_unknown = " 이전 부분 실행이 있었으며 그 건수는 알 수 없음." if resumed else ""
