@@ -30,6 +30,18 @@
      5라운드 실측) 통과 증거로 쓰지 않고, 불일치만 확실한 부정 신호로 차단에 쓴다.
      저널 생성 시점에 비교 근거가 없었으면(`sql` 미제공 등) 이 검사는 건너뛴다.
 
+**PR #360 리뷰 후속(지적 1/2) — done 축도 무조건 스킵하지 않는다.** 위 4번의
+"명시 플래그가 있을 때만 완주한다"는 재정은 그대로다. 다만 `done=True` 저널을
+영구 신뢰하면 완료 이후 새로 들어온 콘텐츠나 연결이 복구된 벡터스토어를 영원히
+건너뛴다는 결함이 리뷰에서 나왔다. `TestDoneJournalDriftRecheck` 가 그 수정을
+고정한다: `doc_node_extra_and_sources` 축은 매 호출 라이브 카운트(고아 `doc_nodes`
+포함)를 다시 재고, `done=True` 라도 남은 게 있으면 재시도하고, `vectors` 축은 내용을
+재조회하지 않고 모양(`_vec_shape`)과 `available` 속성만으로 "확인 불가"(연결 실패
+등)를 재시도 대상으로 남긴다. `available=True` 인 채로 완료된 vectors 축의 사후
+드리프트는 범위 밖이다 — 이미 완료·available 한 벡터스토어는 매 재개마다
+재조회하지 않는다는 기존 계약(`TestResumeSkipDoesNotReuseCountInReturnValue`)을
+우선했다.
+
 **이 커밋은 RED 전용이다.** 아래가 요구하는 `opencrab.pack.delete_journal` 모듈은
 아직 없다 — 그래서 이 파일은 수집(collection) 단계에서부터 실패한다. 이것이 이번
 커밋이 고정하려는 RED 상태다. GREEN 커밋이 그 모듈과 `delete_pack` 의 확장을 더해야

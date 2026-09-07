@@ -340,14 +340,18 @@ def _vec_shape(vec):
     `(None, None, None)` 로 뭉개진다(#327 로컬 지적 4). `delete_pack` 의 재개 저널이
     이 둘을 구분해야 하므로, 모양 판별만 하는 이 함수를 게이트 앞에 따로 둔다.
     """
-    conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
-    if conn is not None:
+    # 존재 여부(hasattr)로만 모양을 정한다 — 값(`is not None`)으로 재기 시작하면
+    # "모양은 있는데 지금 값이 비어 있다"(연결 실패로 `_engine=None`이 된
+    # `PgVectorStore` 등)가 다시 "모양이 아예 없다"로 뭉개진다(PR #360 리뷰 지적 2,
+    # `_conn`/`conn`/`_engine`이 있는데 값이 falsy/None인 백엔드가 구조적 미지원으로
+    # 오분류돼 재개 저널이 `vectors` 축을 즉시 done=True로 확정해 버렸다).
+    if hasattr(vec, "_conn") or hasattr(vec, "conn"):
+        conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
         return ("sql", conn, getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure"))
     if hasattr(vec, "_collection"):
         return ("chroma", vec._collection, None)
-    engine = getattr(vec, "_engine", None)
-    if engine is not None:
-        return ("sqlalchemy", engine, getattr(vec, "_table", None) or "vectors")
+    if hasattr(vec, "_engine"):
+        return ("sqlalchemy", getattr(vec, "_engine", None), getattr(vec, "_table", None) or "vectors")
     return (None, None, None)
 
 
@@ -1101,6 +1105,17 @@ def delete_pack(
     graph 삭제가 먼저 나가면 doc 없이 고아가 될 수 있다) — `vectors` 는 독립이라
     이 게이팅과 무관하게 실행된다.
 
+    **완료(`done=True`) 축도 무조건 스킵하지는 않는다(PR #360 리뷰 지적 1/2).**
+    `done` 플래그를 영구 신뢰하면, 완료 이후 새로 들어온 `doc_nodes`/`doc_sources`
+    행이나 연결이 복구된 벡터스토어의 잔존 벡터를 영원히 건너뛴다. 그래서 매 호출
+    "무해한 읽기"로 `doc_node_extra_and_sources`(고아 `doc_nodes` 포함) 축의 라이브
+    카운트를 다시 재고, 하나라도 남아 있으면 `done=True` 라도 축을 재시도한다.
+    `vectors` 축은 내용을 재조회하지 않는다 — `_vec_shape()`(모양)와 `available`
+    (속성)만으로 "모양은 있는데 지금 `available` 이 아니다"(연결 실패 등, 리뷰
+    지적 2)를 잡아 재시도 대상으로 남긴다. `available=True` 인 채로 완료된 vectors
+    축의 사후 드리프트(신규 벡터)는 이 수정의 범위 밖이다 — 이미 완료·available 한
+    벡터스토어는 매 재개마다 재조회하지 않는다는 기존 계약을 우선했다.
+
     저널이 있으면 기본은 **탐지·보고뿐**이다(`DeletePackJournalPending`, 무쓰기).
     `resume=True` 를 명시해야 완주한다. `sql` 이 주어졌고 저널 생성 시점에 팩 동일성
     스냅샷(레지스트리 행의 `created_at`)을 남겼다면, 재개 시점에 그 행이 사라졌거나
@@ -1193,6 +1208,54 @@ def delete_pack(
             {"pack": pack_name},
         )
 
+        # ── 드리프트 감지용 라이브 카운트(PR #360 리뷰 지적 1) ──
+        #
+        # done=True 저널을 무조건 신뢰하면, 완료 이후 새로 들어온 doc_nodes/
+        # doc_sources 행이나 연결이 복구된 벡터스토어의 잔존 벡터를 영원히
+        # 건너뛰고 "재개 완료"만 보고한다. 아래 값들은 축이 이미 done 이라도
+        # 매 호출 다시 구해 "done 인데 실제로 남아 있다"를 잡는다 — 위 `rows`
+        # 와 같은 "무해한 읽기" 관례를 따른다.
+        #
+        # doc_node_extra_and_sources 축은 doc_sources 뿐 아니라 고아 doc_nodes 도
+        # 지운다(아래 축 2 본문). `pack_live_counts()["docs"]` 는 doc_sources 만
+        # 세므로 doc_nodes 만의 드리프트는 그 값으로는 안 보인다(설계검증 v1
+        # 반례 B) — 축 2 본문과 동일한 술어로 doc_nodes 를 따로 센다.
+        live_docs = docs._row_get(
+            docs._fetch_one(
+                build_count_sql(docs._dialect, doc_table=docs._table)["docs"],
+                {"pack": pack_name},
+            ),
+            "n",
+        )
+        doc_nodes_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+        doc_nodes_live = docs._row_get(
+            docs._fetch_one(
+                f"SELECT COUNT(*) AS n FROM {docs._table('doc_nodes')} WHERE {doc_nodes_pred}",
+                {"pack": pack_name},
+            ),
+            "n",
+        )
+
+        # vectors 축은 라이브 카운트로 판단하지 않는다. `available=True`(이미
+        # 성공적으로 완료됐고 지금도 연결된) 백엔드를 여기서 재조회하면
+        # "이미 done 인 vectors 축은 벡터스토어를 다시 건드리지 않는다"는 기존
+        # 계약(`TestResumeSkipDoesNotReuseCountInReturnValue::
+        # test_vectors_skip_branch_does_not_reuse_prior_count_or_backend_label`)을
+        # 깬다 — `pack_live_counts()` 의 vectors 분기는 `available=True` 면 실제
+        # 조회(`get(where=...)` 등)를 실행하므로 이 목적에 못 쓴다(설계검증 v3
+        # 1라운드 반례). 대신 모양(`_vec_shape`, 속성 검사뿐)과 `available`
+        # (평범한 속성 읽기 — `PgVectorStore.available` 은 저장된 `_available` 값만
+        # 반환하고 재연결을 시도하지 않는다)만으로 판단한다: 모양은 있는데 지금
+        # available 이 아니면(연결 실패 등, 리뷰 지적 2) "확인 불가"로 보고
+        # 보수적으로 재시도 대상에 넣는다. 잔여 한계: available 인 채로 완료된
+        # 축에 사후 드리프트(신규 벡터)가 생겨도 이 수정은 잡지 않는다 — 기존
+        # 무조회 계약을 우선한 의도적 범위 축소다(설계 v3 addendum, 재판정 AGREE).
+        try:
+            _vec_shape_kind = _vec_shape(vec)[0]
+        except Exception:
+            _vec_shape_kind = None
+        vectors_drift = _vec_shape_kind is not None and not getattr(vec, "available", False)
+
         # ── 1. node_twin_loop: doc 트윈 삭제. 개별 노드 실패는 삼키고 계속 진행하되
         # (기존 관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로 done=False 를
         # 고정한다(#327 로컬 지적 7) — "예외 없이 루프가 끝났다"만으로 done 을
@@ -1214,7 +1277,7 @@ def delete_pack(
         # (청크) + FTS. node_twin_loop 의 done 여부와 무관하게(게이팅 없음, 리드
         # 재정의 실행 순서) 항상 시도한다 — 이 축 자신은 `done` 하나로만 재실행을
         # 막는다.
-        if not _axis_done("doc_node_extra_and_sources"):
+        if not _axis_done("doc_node_extra_and_sources") or live_docs or doc_nodes_live:
             # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
             # 위 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
             # source/source_id/pack 제외 근거를 그대로 적용한다).
@@ -1308,7 +1371,7 @@ def delete_pack(
         # 여기서 다시 쓰지 않아도 `journal["axes"]["graph_nodes"]` 구독은 안전하다.
 
         # ── 4. vectors: 독립(ungated) — 세 갈래(구조적 미지원/연결 실패/조회 실패) ──
-        if not _axis_done("vectors"):
+        if not _axis_done("vectors") or vectors_drift:
             vec_skipped = False
             chunk_vec_del, kind, vec_confirmed, vec_available = _delete_pack_vectors(pack_name, vec)
             _commit_axis(
