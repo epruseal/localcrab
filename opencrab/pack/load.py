@@ -550,7 +550,9 @@ def _chroma_locked_handle(vec, fallback):
             yield getattr(vec, "_collection", fallback)
 
 
-def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
+def _live_vec_ids(
+    vec, pack_name: str, *, backend: tuple | None = None
+) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
     (kind `None`, `available=True`)를 "가용하지만 벡터 0건"과 구분 못 하고,
@@ -562,13 +564,21 @@ def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     `live_pack_state` 와 `load_chunks_incremental` 이 이 헬퍼 하나를 공유한다
     (사본 금지 — 갈리면 한쪽만 고쳐진다, `_vec_backend` 자신의 교훈과 동일).
 
+    `backend` 를 생략하면 이 함수가 직접 `_vec_backend(vec)` 를 불러
+    `vec.available` 을 다시 읽는다. 기존 두 호출자(`live_pack_state`,
+    `load_chunks_incremental`)는 인자 없이 그대로 호출한다 — 이 함수 자체가
+    `kind` 인식 불가 분기에서 로그용으로 `available` 을 한 번 더 읽는 기존
+    동작을 포함해 **전혀 바뀌지 않는다**. `delete_pack` 의 드리프트 재확인
+    경로만 캐시된 값을 넘겨 "호출당 정확히 한 번" 규율(#327 리뷰 P2)을
+    지킨다.
+
     **한계**: 공유-id 팩(evidence 노드 id == 청크 id)에서는 노드 벡터와 청크
     벡터가 같은 슬롯(`pack_id` 컬럼의 같은 `node_id`)을 쓴다 — 이 함수는 그
     슬롯 충돌 자체를 고치지 않는다(기존 한계, `load.py` 상단 주석 참고).
     이 함수는 **존재 검사**만 한다: 슬롯이 있으면(누가 채웠든) 존재로 본다.
     """
     vec_ids: set[str] = set()
-    kind, handle, table = _vec_backend(vec)
+    kind, handle, table = backend if backend is not None else _vec_backend(vec)
     if kind == "sql":
         for (node_id,) in handle.execute(
             f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
@@ -971,7 +981,15 @@ def _delete_pack_vectors(
         try:
             has_shape = _vec_shape(vec)[0] is not None
         except Exception:
-            has_shape = False           # 모양 판별 자체가 적대적이면 미지원과 동일 취급
+            # [#327 리뷰 P2] 모양 판별 자체가 실패했다는 사실을 "모양이 없다"
+            # (구조적 미지원, 갈래 1)와 뭉개면 안 된다 — 위 `vec_available is
+            # None` 과 같은 "구조적 미지원 vs 확인 불가" 구분을 여기도 적용한다.
+            # 뭉개서 `has_shape = False` 로 두면 done=True 로 즉시 확정돼
+            # 재시도 기회가 영구히 사라진다.
+            log.warning(
+                "벡터 백엔드 모양 판별 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+                _safe_type_name(vec), pack_name)
+            return chunk_vec_del, kind, False
         if has_shape:
             vec_confirmed = False        # 갈래 2 — 연결·초기화 실패, 재시도 대상
             log.warning(
@@ -1132,11 +1150,16 @@ def delete_pack(
     행이나 연결이 복구된 벡터스토어의 잔존 벡터를 영원히 건너뛴다. 그래서 매 호출
     "무해한 읽기"로 `doc_node_extra_and_sources`(고아 `doc_nodes` 포함) 축의 라이브
     카운트를 다시 재고, 하나라도 남아 있으면 `done=True` 라도 축을 재시도한다.
-    `vectors` 축은 내용을 재조회하지 않는다 — `_vec_shape()`(모양)와 `available`
-    (속성)만으로 "모양은 있는데 지금 `available` 이 아니다"(연결 실패 등, 리뷰
-    지적 2)를 잡아 재시도 대상으로 남긴다. `available=True` 인 채로 완료된 vectors
-    축의 사후 드리프트(신규 벡터)는 이 수정의 범위 밖이다 — 이미 완료·available 한
-    벡터스토어는 매 재개마다 재조회하지 않는다는 기존 계약을 우선했다.
+    `vectors` 축은 `_vec_shape()`(모양)와 `available`(속성)로 "모양은 있는데
+    지금 `available` 이 아니다"(연결 실패 등, 리뷰 지적 2)를 잡아 재시도
+    대상으로 남긴다. **더해서 `done=True`·`available=True` 인 축도 라이브
+    ID 존재 검사(`_live_vec_ids`)를 한 번 더 실행해, 완료 이후 이 팩에
+    재유입된 벡터가 있으면 재진입한다(#327 재리뷰 P1)** — 다른 세 축과
+    대칭이다. 이 존재 검사 자체가 실패하면(핸들 접근 예외 등) "확인 불가"로
+    보고 재시도 대상에 남긴다 — 조회를 아예 안 하는 경우는 없다. v3
+    addendum 이 도입했던 "이미 완료·available 한 벡터스토어는 매 재개마다
+    재조회하지 않는다"는 성능 트레이드오프는 파기했다 — 그 교환이 완전
+    삭제 계약을 깨뜨린다는 것이 이후 리뷰에서 드러났다.
 
     저널이 있으면 기본은 **탐지·보고뿐**이다(`DeletePackJournalPending`, 무쓰기).
     `resume=True` 를 명시해야 완주한다. `sql` 이 주어졌고 저널 생성 시점에 팩 동일성
@@ -1258,20 +1281,22 @@ def delete_pack(
             "n",
         )
 
-        # vectors 축은 라이브 카운트로 판단하지 않는다. `available=True`(이미
-        # 성공적으로 완료됐고 지금도 연결된) 백엔드를 여기서 재조회하면
-        # "이미 done 인 vectors 축은 벡터스토어를 다시 건드리지 않는다"는 기존
-        # 계약(`TestResumeSkipDoesNotReuseCountInReturnValue::
-        # test_vectors_skip_branch_does_not_reuse_prior_count_or_backend_label`)을
-        # 깬다 — `pack_live_counts()` 의 vectors 분기는 `available=True` 면 실제
-        # 조회(`get(where=...)` 등)를 실행하므로 이 목적에 못 쓴다(설계검증 v3
-        # 1라운드 반례). 대신 모양(`_vec_shape`, 속성 검사뿐)과 `available`
-        # (평범한 속성 읽기 — `PgVectorStore.available` 은 저장된 `_available` 값만
-        # 반환하고 재연결을 시도하지 않는다)만으로 판단한다: 모양은 있는데 지금
-        # available 이 아니면(연결 실패 등, 리뷰 지적 2) "확인 불가"로 보고
-        # 보수적으로 재시도 대상에 넣는다. 잔여 한계: available 인 채로 완료된
-        # 축에 사후 드리프트(신규 벡터)가 생겨도 이 수정은 잡지 않는다 — 기존
-        # 무조회 계약을 우선한 의도적 범위 축소다(설계 v3 addendum, 재판정 AGREE).
+        # vectors 축의 완료 판정은 `available`/`_vec_shape` 만으로 끝나지
+        # 않는다. `done=True`·`available=True`·모양 인식됨 조합이면, 아래에서
+        # 뽑은 값을 그대로 캐시로 넘겨(추가 `.available` 읽기 없이)
+        # `_live_vec_ids` 로 라이브 ID 전량을 한 번 더 조회한다(peek 블록,
+        # 아래) — 완료 이후 이 팩에 재유입된 벡터가 있으면 재시도 대상으로
+        # 되돌리기 위해서다(#327 재리뷰 P1). `pack_live_counts()` 의 vectors
+        # 분기가 이미 `available=True` 면 실제 조회를 하고 있으므로(설계검증
+        # v3 1라운드 반례), 여기서도 같은 조회를 한 번 더 하는 것은 새 원칙이
+        # 아니라 다른 세 축·다른 함수와의 비대칭을 없애는 것이다. 조회 자체가
+        # 실패하면(핸들 접근 예외 등) "확인 불가"로 보고 보수적으로 재시도
+        # 대상에 넣는다 — 이 파일 전역의 "구조적 미지원 vs 확인 불가" 구분
+        # (#165 R1/R2, #327 리뷰 P2)과 동형이다. v3 addendum 이 도입했던
+        # "이미 완료·available 한 벡터스토어는 매 재개마다 재조회하지 않는다"
+        # 는 성능 트레이드오프는 파기했다 — 그 교환이 완전 삭제 계약을
+        # 깨뜨린다는 것이 이후 리뷰에서 드러났다(재리뷰 P1, 설계검증
+        # v4/v5 DISAGREE 를 받아들인다).
         #
         # `available` 은 여기서 **호출당 정확히 한 번만** 읽어 캐시한다(#327
         # 리뷰 P2 실증 — 상태를 가진 property 가 여기서 한 번, 아래
@@ -1279,7 +1304,9 @@ def delete_pack(
         # 던지는 예외가 vectors 축이 저널에 커밋되기 전에 `delete_pack` 밖으로
         # 새 나간다. 앞선 세 축은 이미 커밋됐어도 vectors 축 자체는 시도됐다는
         # 기록조차 없이 유실된다). 캐시한 값을 `_delete_pack_vectors` 에 그대로
-        # 넘기고, 그 함수는 더 이상 `vec.available` 을 읽지 않는다.
+        # 넘기고, 그 함수는 더 이상 `vec.available` 을 읽지 않는다. 아래 peek
+        # 블록도 같은 이유로 캐시된 모양(`backend=`)을 넘겨 `_live_vec_ids` 가
+        # `.available` 을 다시 읽지 않게 한다.
         try:
             vec_available = bool(vec.available)
         except Exception:
@@ -1290,16 +1317,69 @@ def delete_pack(
             # `None` 을 무조건 재시도 대상(갈래 0)으로 다룬다.
             vec_available = None
         try:
-            _vec_shape_kind = _vec_shape(vec)[0]
+            _vec_shape_kind, _vec_shape_handle, _vec_shape_table = _vec_shape(vec)
+            _vec_shape_probe_failed = False
         except Exception:
-            _vec_shape_kind = None
-        # `vec_available is None`(읽기 자체가 실패)이면 모양 판별 결과와
-        # 무관하게 무조건 드리프트로 잡는다 — 그래야 이미 done=True 로 확정된
-        # 축도 재개 호출에서 다시 시도된다(설계검증 r1 DISAGREE: 이 항이
-        # 없으면 `_vec_shape_kind is None` 인 조합에서 아래 식 전체가 `False`가
-        # 되어 재확인 자체가 일어나지 않는다).
-        vectors_drift = vec_available is None or (
-            _vec_shape_kind is not None and vec_available is False)
+            # 모양 판별 자체가 실패했다 — "모양이 없다"(구조적 미지원)가 아니라
+            # "확인 못 함"이다(#327 P2 가 세운 구분을 이 호출자 쪽 같은 값에
+            # 적용, 재리뷰 지적 2 / 전수 스윕이 독립 확인). 뭉개서
+            # `_vec_shape_kind = None` 으로만 두면 done=True+available=False
+            # 조합에서 드리프트 판정 자체가 통째로 스킵된다.
+            _vec_shape_kind = _vec_shape_handle = _vec_shape_table = None
+            _vec_shape_probe_failed = True
+        # `vec_available is None`(읽기 자체가 실패)이거나 모양 판별 자체가
+        # 실패했으면 모양 판별 결과와 무관하게 무조건 드리프트로 잡는다 —
+        # 그래야 이미 done=True 로 확정된 축도 재개 호출에서 다시 시도된다
+        # (설계검증 r1 DISAGREE: `vec_available is None` 항이 없으면
+        # `_vec_shape_kind is None` 인 조합에서 아래 식 전체가 `False`가 되어
+        # 재확인 자체가 일어나지 않는다).
+        vectors_drift = (
+            vec_available is None
+            or _vec_shape_probe_failed
+            or (_vec_shape_kind is not None and vec_available is False)
+        )
+
+        if (
+            not vectors_drift
+            and vec_available
+            and _vec_shape_kind is not None
+            and _axis_done("vectors")
+        ):
+            # 이미 done=True·available=True 인 vectors 축도, 완료 이후
+            # 재유입된 라이브 벡터가 있으면 재진입한다(#327 재리뷰 P1) —
+            # doc_node_extra_and_sources/node_twin_loop/graph_nodes 축과 동일한
+            # "done 이어도 무해한 존재 확인으로 드리프트를 재검사" 패턴을
+            # vectors 축에도 맞춘다.
+            #
+            # `backend=` 로 이미 위에서 뽑은 모양(kind/handle/table)을 그대로
+            # 넘긴다 — `_live_vec_ids` 가 기본 경로(`_vec_backend(vec)`)로 가면
+            # `vec.available` 을 다시 읽어 호출당 정확히 한 번 규율(#327 P2)을
+            # 어긴다. `_vec_shape_kind is not None` 을 이미 위에서 확인했으므로
+            # 이 튜플은 `_vec_backend` 가 `available=True` 일 때 내는 것과
+            # 같다.
+            #
+            # 조회 자체가 실패하면(핸들 접근 예외 등) "확인 불가"다 — 이 파일
+            # 전역에서 "재시도 대상"으로 통일한 것과 동형이다(갈래 0, P2, 위
+            # 호출자 보강). 강제 재시도는 `delete_pack` 안에 루프를 만들지
+            # 않는다 — 재개는 호출자가 명시적으로 다시 부른다.
+            try:
+                live_ids = _live_vec_ids(
+                    vec, pack_name,
+                    backend=(_vec_shape_kind, _vec_shape_handle, _vec_shape_table),
+                )
+            except Exception:
+                vectors_drift = True
+                log.warning(
+                    "라이브 벡터 존재 확인 실패(%s) — 팩 %s 의 vectors 축을 "
+                    "재시도 대상으로 남긴다", _safe_type_name(vec), pack_name)
+            else:
+                # `live_ids is None` — `_live_vec_ids` 자신이 구조적으로 열거를
+                # 지원 안 하는 kind 라고 판정한 것(이미 위에서 확인한 shape 와
+                # 같은 근거, 새 정보 아님) → 강제 재시도 없이 기존 done 유지.
+                # 빈 집합이면 실제로 열거해 라이브 벡터가 없음을 **확인**한
+                # 것이므로 `False` 가 맞다 — `None`(모른다)과 `set()`(0 이라고
+                # 확인함)을 섞지 않는다.
+                vectors_drift = bool(live_ids)
 
         # ── 1. node_twin_loop: doc 트윈 삭제. 개별 노드 실패는 삼키고 계속 진행하되
         # (기존 관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로 done=False 를
