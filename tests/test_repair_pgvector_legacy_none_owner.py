@@ -311,6 +311,31 @@ class TestRepairDirectCallDefendsAgainstAmbiguousTarget:
         assert legacy[1] == ""
 
 
+class TestRollbackIsRefusedWhenTargetIdentityIsAmbiguous:
+    """분기 4 (이중 적대검증에서 두 채널이 독립적으로 발견한 실결함): ``main()``의
+    ``--rollback-from`` 경로는 ``identity_reason``을 계산만 하고 쓰지 않았다.
+    대상 서버를 하나로 특정할 수 없으면 서명 검사 자체가 엉뚱한 서버의 host/port
+    와 비교하게 되므로, 스냅샷을 읽기 전에 거부해야 한다. ``--rollback-from``에는
+    ``--apply``의 ``--skip-backup``에 대응하는 탈출구가 없다 -- 롤백은 결속이
+    선택 사항이 아니다."""
+
+    def test_rollback_is_refused_and_db_is_untouched(self, pg_store, tmp_path):
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+        repair.repair(pg_store._engine, pg_store._table, backup_to=str(backup_path))
+        before = _all_rows(pg_store)
+
+        code = repair.main(
+            [
+                "--pg-url", _dsn_with_ambiguous_query_host(), "--table", pg_store._table,
+                "--apply", "--rollback-from", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_PRECONDITION
+        assert _all_rows(pg_store) == before, "대상 서버를 특정할 수 없는데 롤백이 실행됐다"
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을

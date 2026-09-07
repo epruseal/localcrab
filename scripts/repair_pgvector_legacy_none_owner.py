@@ -73,7 +73,11 @@ ROLLBACK (``--rollback-from <snapshot.json>``, ``--apply`` 필요):
   stderr 경고로도 출력된다(문서/docstring만 읽지 않는 운영자도 보게 하기 위함).
 
   백업 서명(``table``/``database``/``host``/``port``)이 현재 대상과 다르면
-  즉시 거부한다(코드 4).
+  즉시 거부한다(코드 4). 대상 서버를 하나로 특정할 수 없는 ``--pg-url``이면
+  서명 자체가 엉뚱한 서버와 비교될 수 있으므로 스냅샷을 읽기도 전에 거부한다
+  (코드 3). ``--apply`` 수리 경로와 달리 ``--rollback-from``에는
+  ``--skip-backup`` 같은 탈출구가 없다: 롤백은 스냅샷의 서버 결속 자체가
+  전제이므로 이 결속은 선택 사항이 아니다.
 
 EXIT CODES:
   0 성공, 2 사용법/안전 게이트 실패, 3 연결/사전조건 실패, 4 백업 검증 실패,
@@ -480,6 +484,15 @@ def main(argv: list[str] | None = None) -> int:
         if not args.apply:
             print("! --rollback-from requires --apply.")
             return EXIT_USAGE
+        if identity_reason:
+            print(f"! {identity_reason}")
+            print(
+                "! refusing --rollback-from: a snapshot cannot be safely bound "
+                "to this target, so its signature check would compare against "
+                "the wrong server (no --skip-backup escape for rollback: the "
+                "binding is not optional here)."
+            )
+            return EXIT_PRECONDITION
         try:
             snapshot = load_snapshot(args.rollback_from)
         except (OSError, json.JSONDecodeError, SnapshotError) as exc:
