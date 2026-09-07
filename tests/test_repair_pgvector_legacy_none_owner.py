@@ -846,6 +846,32 @@ class TestRollback:
         assert rows["a"] == "new", "재생성된 행이 롤백으로 조용히 덮어써졌다"
         assert rows["b"] == "None"
 
+    def test_row_updated_in_place_keeps_pack_id_but_changes_xmin_and_is_skipped(
+        self, pg_store, tmp_path
+    ):
+        """리드 지적(#306, codex 재검증 4라운드): 위 두 xmin 테스트는 재생성/
+        소유권-이전 행의 ``pack_id``도 함께 바꾼다. ``_rollback_row_sql``의
+        ``pack_id = ''`` 조건만으로 이미 그 행이 걸러지므로, SQL에서 xmin
+        비교를 지워도 그 두 테스트는 여전히 통과한다(역변이로 실측 확인,
+        PR 본문 참고). 이 테스트는 ``pack_id``를 ``''``로 그대로 둔 채
+        xmin만 바꿔, xmin 비교 자체가 차단의 유일한 근거임을 독립적으로
+        고정한다."""
+        backup_path = self._repair_and_snapshot(pg_store, tmp_path, ["a"])
+        with pg_store._engine.begin() as conn:
+            # pack_id는 그대로 ''로 두고 같은 행을 한 번 더 갱신해 xmin만
+            # 바꾼다(PostgreSQL은 값이 그대로여도 UPDATE마다 새 튜플 버전을
+            # 만들어 xmin을 올린다).
+            conn.execute(
+                text(f"UPDATE {pg_store._table} SET pack_id = pack_id WHERE node_id = 'a'")
+            )
+
+        snapshot = repair.load_snapshot(str(backup_path))
+        statuses = repair.rollback(pg_store._engine, pg_store._table, snapshot)
+
+        assert statuses["a"] == repair.ROLLBACK_STATUS_XMIN_MISMATCH
+        rows = {row[0]: row[1] for row in _all_rows(pg_store)}
+        assert rows["a"] == "", "pack_id가 그대로인 행에 xmin 불일치로도 롤백이 적용됐다"
+
     def test_cli_reports_a_partial_rollback_as_exit_code_5(self, pg_store, tmp_path):
         backup_path = self._repair_and_snapshot(pg_store, tmp_path, ["a", "b"])
         with pg_store._engine.begin() as conn:
