@@ -866,6 +866,36 @@ class TestBackupSignatureAndSnapshotIntegrity:
         with pytest.raises(repair.SnapshotError):
             repair.load_snapshot(str(backup_path))
 
+    def test_deeply_nested_snapshot_is_rejected(self, tmp_path):
+        """새 컨텍스트 독립 검증자(round 8)가 실측 재현한 형제 결함:
+        중첩 깊이가 충분히 큰 JSON 배열(수기 조작이나 손상으로만 나올 수
+        있는 형태, 이 도구 자신의 ``write_backup_atomic``은 이런 깊이의
+        파일을 만들지 않는다)을 ``json.load()``가 파싱하다 파이썬 재귀
+        한계에 걸려 ``RecursionError``를 낸다. 이 예외는 ``Exception``의
+        직계 하위형(``ValueError``가 아니다)이라 어떤 catch 튜플에도
+        안 걸리고 새어나갔다."""
+        backup_path = tmp_path / "backup.json"
+        depth = 20000
+        backup_path.write_bytes(b"[" * depth + b'"x"' + b"]" * depth)
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
+    def test_oversized_integer_literal_snapshot_is_rejected(self, tmp_path):
+        """같은 라운드가 실측 재현한 변형: 5000자리(파이썬 기본 상한
+        4300자리 초과)짜리 정수 리터럴이 어디에든 있으면 ``json.load()``의
+        내부 ``int()`` 변환이 ``ValueError: Exceeds the limit ... for
+        integer string conversion``을 낸다. ``json.JSONDecodeError``는
+        ``ValueError``의 하위형이지만 그 역은 성립하지 않으므로, 이
+        ``ValueError``는 ``main()``의 ``(OSError, json.JSONDecodeError,
+        SnapshotError)`` 어디에도 걸리지 않고 새어나갔다. 파일 크기
+        5킬로바이트 남짓으로 자원 병리형 입력도 아니다."""
+        backup_path = tmp_path / "backup.json"
+        backup_path.write_bytes(b'{"rows": [], "port": ' + b"9" * 5000 + b"}")
+
+        with pytest.raises(repair.SnapshotError):
+            repair.load_snapshot(str(backup_path))
+
 
 # ---------------------------------------------------------------------------
 # CLI 종료 코드

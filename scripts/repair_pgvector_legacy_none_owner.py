@@ -371,12 +371,18 @@ def load_snapshot(path: str) -> dict[str, Any]:
     부패) 멀티바이트 문자 중간에서 잘려 있으면 ``open()``이나 ``json.load()``가
     ``UnicodeDecodeError``를 낸다. 이 예외는 ``UnicodeError``/``ValueError``의
     하위형이라 호출부가 잡는 ``(OSError, json.JSONDecodeError, SnapshotError)``
-    어느 것에도 걸리지 않고 새어나가므로 여기서도 같은 방식으로 변환한다."""
+    어느 것에도 걸리지 않고 새어나가므로 여기서도 같은 방식으로 변환한다.
+    같은 이유로 ``json.load()``가 낼 수 있는 다른 두 예외도 여기서 막는다:
+    중첩 깊이가 큰 배열/객체는 파이썬 재귀 한계에 걸려 ``RecursionError``
+    (``Exception``의 직계 하위형, ``ValueError``가 아니다)를, 자릿수가 큰
+    정수 리터럴은 ``sys.set_int_max_str_digits`` 상한에 걸려 ``ValueError``를
+    낸다. 이 도구 자신의 ``write_backup_atomic``은 이런 형태의 파일을
+    만들지 않으므로, 두 경로 다 수기 조작이나 손상 스냅샷에서만 열린다."""
     try:
         with open(path, encoding="utf-8") as fh:
             snapshot = json.load(fh)
-    except UnicodeDecodeError as exc:
-        raise SnapshotError(f"backup snapshot is not valid UTF-8: {path}: {exc}") from None
+    except (UnicodeDecodeError, RecursionError, ValueError) as exc:
+        raise SnapshotError(f"backup snapshot could not be parsed: {path}: {exc}") from None
     if not isinstance(snapshot, dict):
         raise SnapshotError(f"backup snapshot is not a JSON object: {path}")
     if "rows" not in snapshot or not isinstance(snapshot["rows"], list):
