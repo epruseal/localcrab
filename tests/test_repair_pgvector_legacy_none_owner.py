@@ -209,6 +209,34 @@ class TestApplyRequiresBackupOrExplicitSkip:
         assert _all_rows(pg_store) == before
 
 
+class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
+    """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
+    지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
+    있다고 주장하는 셈이라 운영자를 오도한다."""
+
+    def test_apply_with_zero_target_rows_does_not_claim_a_backup_file(
+        self, pg_store, tmp_path, capsys
+    ):
+        pg_store.upsert_texts(
+            texts=["오염되지 않은 정상 행"], metadatas=[{"space": "s"}], ids=["clean0"]
+        )
+        backup_path = tmp_path / "backup.json"
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--backup-to", str(backup_path),
+            ]
+        )
+
+        assert code == repair.EXIT_OK
+        assert not backup_path.exists(), "0건인데 백업 파일이 실제로 생겼다"
+        out = capsys.readouterr().out
+        assert "backup written" not in out, (
+            "0건이라 파일이 없는데 CLI가 backup written 을 출력했다"
+        )
+
+
 class TestBackupFailureRollsBackTheWholeTransaction:
     def test_backup_write_failure_leaves_the_db_unchanged(self, pg_store, tmp_path, monkeypatch):
         _seed_and_contaminate(pg_store, "legacy")

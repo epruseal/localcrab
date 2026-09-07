@@ -456,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BACKUP
 
     print(f"# repaired {len(result_rows)} row(s).")
-    if args.backup_to:
+    if args.backup_to and result_rows:
         print(f"# backup written -> {args.backup_to}")
     print("RESULT: PASS")
     return EXIT_OK
