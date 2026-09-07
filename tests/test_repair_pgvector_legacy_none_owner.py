@@ -5,7 +5,7 @@
 적었다. 그 코드는 이미 고쳐졌지만(``test_vector_slot_ownership.py::
 TestNonePackIdIsStoredAsUnowned`` 참고), **그 버그가 과거에 써놓은 행**은 여전히
 남아 있어 정당한 소유자의 재적재를 막는다. 이 모듈은 그 잔존 데이터를 복구하는
-스크립트를 검증한다 — 현재 스토어/게이트 코드 자체에는 결함이 없다.
+스크립트를 검증한다. 현재 스토어/게이트 코드 자체에는 결함이 없다.
 
 ``pg`` 백엔드 전용이다(sqlite-vec/chroma는 이 오염 형태가 구조적으로 없다, 설계
 §2.1). ``tests/_vec_helpers.py::build_vector_store("pg", ...)``를 재사용해 실 PG
