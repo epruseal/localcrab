@@ -266,9 +266,10 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
     트랜잭션은 호출자가 예외를 받아 롤백) -> (backup_to가 있고 대상 행이 있으면)
     백업 파일을 원자적으로 게시(실패 시 예외, 트랜잭션 롤백) -> 커밋.
 
-    즉 "DB 커밋 + 백업 유실" 조합이 구조적으로 불가능하다: 대상 행이 있는 한
-    백업 게시 성공이 커밋의 전제조건이고, 대상 행이 0건이면 애초에 백업할
-    내용도 없다.
+    즉 "DB 커밋 + 백업 유실" 조합이 구조적으로 불가능하다: backup_to가 있고
+    대상 행이 있는 한 백업 게시 성공이 커밋의 전제조건이고, backup_to가
+    있어도 대상 행이 0건이면 애초에 백업할 내용도 없다. backup_to가 없는
+    (--skip-backup) 경로는 이 전제 자체가 걸리지 않는다.
     """
     from sqlalchemy import text
 
