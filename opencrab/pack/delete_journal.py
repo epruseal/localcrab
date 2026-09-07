@@ -110,6 +110,16 @@ def save_journal(data_dir: str | os.PathLike[str], pack_name: str, payload: dict
         os.replace(tmp_path, path)
     finally:
         tmp_path.unlink(missing_ok=True)  # replace 성공 뒤엔 이미 없어 무해한 no-op
+    if os.name == "nt":
+        # Windows 는 디렉터리를 os.open() 으로 열 수 없다(PermissionError) —
+        # 이 시점에 파일 내용은 위 os.fsync(fh.fileno())로 이미 디스크에
+        # 내려갔고 os.replace() 도 끝났으므로 저널 자체는 안전하다. 다만
+        # "교체됐다"는 디렉터리 메타데이터 자체의 durability(크래시 시 되돌아가지
+        # 않는다는 보장)는 POSIX 전용 계약이라 Windows 에서는 이 단계를
+        # 건너뛴다 — 그만큼 durability 보장은 약해진다(#327 재리뷰 P1,
+        # id 3948310372). Windows 지원 여부 자체는 #322 에서 미정이며,
+        # 지원이 결정되면 이 자리도 종단 검증 대상이다.
+        return
     dir_fd = os.open(str(path.parent), os.O_RDONLY)
     try:
         os.fsync(dir_fd)
