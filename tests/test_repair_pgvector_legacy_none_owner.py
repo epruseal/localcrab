@@ -225,6 +225,29 @@ class TestApplyRequiresBackupOrExplicitSkip:
         assert code == repair.EXIT_BACKUP
         assert _all_rows(pg_store) == before
 
+    def test_backup_to_together_with_skip_backup_is_rejected(self, pg_store, tmp_path):
+        """새 컨텍스트 검증자가 실측 재현한 결함: ``--backup-to``와
+        ``--skip-backup``을 함께 주면 ``repair()``가 여전히
+        ``args.backup_to``를 받아 백업을 쓰려 하므로, 대상 식별이 모호할 때는
+        "스냅샷 없이 진행한다"는 출력과 달리 실제로는 거부되고, 식별이
+        멀쩡할 때는 명시한 ``--skip-backup``이 무시된 채 백업이 그대로
+        만들어진다. 둘 다 사용자가 고른 동작과 실제 동작이 어긋나므로,
+        상호 배타로 미리 거부해야 한다."""
+        _seed_and_contaminate(pg_store, "legacy")
+        before = _all_rows(pg_store)
+        backup_path = tmp_path / "backup.json"
+
+        code = repair.main(
+            [
+                "--pg-url", _pg_url(), "--table", pg_store._table,
+                "--apply", "--backup-to", str(backup_path), "--skip-backup",
+            ]
+        )
+
+        assert code == repair.EXIT_USAGE
+        assert not backup_path.exists()
+        assert _all_rows(pg_store) == before
+
 
 # ---------------------------------------------------------------------------
 # 대상 서버 식별 불가 시 fail-closed (#306 r7) -- 세 분기를 각각 고정
@@ -587,6 +610,36 @@ class TestBackupDirFsyncFailureDoesNotLeaveAStaleBackup:
         )
 
 
+class TestBackupTmpCleanupFailureAfterPublishDoesNotLeaveAStaleBackup:
+    def test_tmp_unlink_failure_after_publish_unpublishes_the_backup(
+        self, tmp_path, monkeypatch
+    ):
+        """새 컨텍스트 검증자가 실측 재현한 결함: 게시(``os.link``, inode 대사)
+        직후 임시 파일 ``tmp``를 지우는 정리(``finally``)가 실패해도(디렉터리가
+        그 사이 읽기 전용이 되는 등) 그 시점에 ``backup_to``는 이미 게시돼
+        있다. 이전 라운드에서 고친 디렉터리 fsync 실패와 같은 종류의 문제가
+        게시 직후 다른 단계(tmp 정리)에서도 그대로 남아 있었다. 정리 실패
+        시에도 방금 게시한 ``backup_to``를 지워야 재시도가 깨끗한 상태에서
+        시작할 수 있다."""
+        backup_to = tmp_path / "backup.json"
+        real_unlink = os.unlink
+
+        def unlink_fails_only_for_the_tmp_file(path, *args, **kwargs):
+            if ".tmp-" in str(path):
+                raise OSError("simulated: cannot remove temp file")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", unlink_fails_only_for_the_tmp_file)
+
+        with pytest.raises(OSError, match="simulated"):
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
+
+        assert not backup_to.exists(), (
+            "tmp 파일 정리 실패 이후에도 게시된 백업 파일이 남아, 이후 재시도가 "
+            "FileExistsError로 영구히 막힌다"
+        )
+
+
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:
     """대상 행이 0건이면 ``repair()``는 백업 파일을 만들지 않는다(#306 검증자
     지적). CLI가 이 경우에도 "backup written"을 출력하면 실제로 없는 파일을
@@ -852,6 +905,66 @@ class TestBackupSignatureAndSnapshotIntegrity:
 
         assert code == repair.EXIT_BACKUP
         assert _all_rows(pg_store) == before
+
+    def test_recorded_schema_is_the_one_that_actually_owns_the_table(
+        self, pg_store, tmp_path
+    ):
+        """새 컨텍스트 검증자가 실측 재현한 결함: ``current_schema()``는
+        ``search_path``의 첫 스키마를 그대로 돌려줄 뿐이다. ``search_path``가
+        테이블이 없는 스키마로 시작하면 ``current_schema()``는 그 빈 스키마를
+        돌려주는데, 실제 수리 SQL(비한정 ``FROM {table}``)은 ``search_path``를
+        따라 뒤 순번의 진짜 스키마를 찾아간다. 기록되는 스키마가 이 실제
+        대상과 달라지면 서명 검사 자체가 무의미해진다."""
+        engine = pg_store._engine
+        table = pg_store._table
+        with engine.begin() as conn:
+            conn.execute(text("CREATE SCHEMA IF NOT EXISTS zz_empty_first_306"))
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SET search_path TO zz_empty_first_306, public"))
+                resolved = repair._resolve_table_schema(conn, table)
+            assert resolved == "public", (
+                "search_path 의 빈 첫 스키마가 아니라, 테이블이 실제로 있는 "
+                "스키마를 돌려줘야 한다"
+            )
+        finally:
+            with engine.begin() as conn:
+                conn.execute(text("DROP SCHEMA IF EXISTS zz_empty_first_306 CASCADE"))
+
+    def test_repair_records_the_schema_that_actually_owns_the_table(
+        self, pg_store, tmp_path
+    ):
+        """위 테스트가 헬퍼 자체를 직접 확인한다면, 이 테스트는 ``repair()``의
+        실제 호출부가 그 헬퍼를 정말로 쓰는지 확인한다(호출부가 다시
+        ``current_schema()``로 되돌아가도 헬퍼 단독 테스트는 여전히
+        통과하므로, 이 통합 테스트가 없으면 그 회귀를 못 잡는다)."""
+        from sqlalchemy import event
+
+        engine = pg_store._engine
+        table = pg_store._table
+        backup_path = tmp_path / "backup.json"
+        _seed_and_contaminate(pg_store, "legacy")
+
+        with engine.begin() as conn:
+            conn.execute(text("CREATE SCHEMA IF NOT EXISTS zz_empty_first_306b"))
+
+        def _set_search_path(dbapi_conn, _record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("SET search_path TO zz_empty_first_306b, public")
+            cursor.close()
+
+        event.listen(engine, "connect", _set_search_path)
+        engine.dispose()  # 풀에 남은 기존 연결이 재사용되지 않게 강제로 비운다
+        try:
+            repair.repair(engine, table, backup_to=str(backup_path))
+            snapshot = json.loads(backup_path.read_text(encoding="utf-8"))
+            assert snapshot["schema"] == "public", (
+                "search_path 의 빈 첫 스키마가 아니라 테이블이 실제로 있는 "
+                "스키마를 기록해야 한다"
+            )
+        finally:
+            event.remove(engine, "connect", _set_search_path)
+            engine.dispose()
 
     def test_missing_host_key_in_snapshot_is_rejected(self):
         """``host``키가 아예 없는 스냅샷(구버전/손상/수기 조작)은 ``None``이

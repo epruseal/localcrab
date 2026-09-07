@@ -149,6 +149,29 @@ def _as_dict_metadata(value: Any) -> dict[str, Any]:
     return json.loads(value) if value else {}
 
 
+def _resolve_table_schema(conn: Any, table: str) -> str | None:
+    """``table``이 현재 ``search_path``에서 실제로 가리키는 릴레이션의
+    스키마를 구한다.
+
+    ``current_schema()``는 ``search_path``의 첫 스키마를 그대로 돌려줄 뿐,
+    그 스키마에 ``table``이 없고 뒤 순번 스키마에만 있으면 틀린 값을 준다
+    (이중 적대검증, 코덱스 리뷰의 실측 재현). ``to_regclass``는
+    ``_repair_sql``의 비한정 ``FROM {table}``과 똑같은 ``search_path``
+    해석 규칙으로 릴레이션을 찾으므로, 실제로 수리/롤백이 건드리는
+    테이블과 항상 같은 스키마를 돌려준다. 그 이름의 릴레이션이 없으면
+    ``None``을 돌려준다."""
+    from sqlalchemy import text
+
+    return conn.execute(
+        text(
+            "SELECT n.nspname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.oid = to_regclass(:tbl)"
+        ),
+        {"tbl": table},
+    ).scalar()
+
+
 # ---------------------------------------------------------------------------
 # SQL (테이블명은 IDENT_RE로 검증된 값만 f-string 보간한다)
 # ---------------------------------------------------------------------------
@@ -402,6 +425,16 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     ``os.link``로 만드는 최종 파일은 이 임시 파일과 같은 inode를 공유하므로
     ``0o600`` 모드를 그대로 물려받는다.
 
+    게시(``os.link``, inode 대사)가 성공한 뒤 곧바로 임시 파일 ``tmp``를
+    지우는 정리(``finally``)가 남아 있다. 이 정리가 실패하면(디렉터리가
+    그 사이 읽기 전용이 되는 등, 이중 적대검증의 실측 재현) ``backup_to``는
+    이미 게시된 채로 그 예외가 새어 나가, 호출자가 DB 트랜잭션을
+    롤백하면서도 낡은 스냅샷이 그 경로를 영구히 점유하는 같은 문제가
+    난다. 그래서 게시가 실제로 끝났음을 표시하는 플래그(``published``)를
+    두고, 그 이후 정리 실패에서만 방금 게시한 ``backup_to``를 지운 뒤
+    원래 예외를 다시 낸다(``tmp``가 애초에 없어 나는 ``FileNotFoundError``는
+    정상 종료로 보아 그대로 무시한다).
+
     게시(``os.link``, inode 대사) 뒤에는 부모 디렉터리를 열어 ``fsync``해
     디렉터리 엔트리 자체의 내구성을 확보한다. 이 단계가 실패하면(디렉터리
     fsync를 거부하는 파일시스템, 쓰기 권한은 있어도 읽기 권한이 없는
@@ -415,6 +448,7 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     불변식을 지켜, 재시도가 항상 깨끗한 상태에서 시작하게 한다."""
     tmp = f"{backup_to}.tmp-{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    published = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as fh:
             json.dump(snapshot, fh, ensure_ascii=False, indent=2)
@@ -425,20 +459,28 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
             os.link(tmp, backup_to)
         except FileExistsError:
             raise FileExistsError(f"backup target already exists: {backup_to}") from None
-        published = os.stat(backup_to, follow_symlinks=False)
-        if (published.st_dev, published.st_ino) != (written.st_dev, written.st_ino):
+        published_stat = os.stat(backup_to, follow_symlinks=False)
+        if (published_stat.st_dev, published_stat.st_ino) != (written.st_dev, written.st_ino):
             os.unlink(backup_to)
             raise OSError(
                 f"backup publish race detected: {tmp!r} was replaced before it "
                 f"could be linked to {backup_to!r}; refusing to trust the "
                 "published content"
             )
+        published = True
     finally:
         os.close(fd)
         try:
             os.unlink(tmp)
         except FileNotFoundError:
             pass
+        except OSError:
+            if published:
+                try:
+                    os.unlink(backup_to)
+                except OSError:
+                    pass
+            raise
     dir_path = os.path.dirname(os.path.abspath(backup_to)) or "."
     try:
         dir_fd = os.open(dir_path, os.O_RDONLY)
@@ -532,9 +574,12 @@ def validate_snapshot_signature(
     search_path``는 서버 쪽 영구 설정이라 DSN이나 환경변수 어디에도 나타나지
     않는다(이중 적대검증, 코덱스 리뷰의 실측 재현). 수리와 롤백 사이에 이
     서버 쪽 설정이 바뀌면, table/database/host/port가 전부 일치해도 실제로는
-    다른 스키마의 동명 테이블에 적용될 수 있다. 그래서 이 서명은 접속 시점의
-    ``current_schema()`` 실제 값(호출자가 연결에서 직접 조회해 넘긴다)을
-    별도로 기록하고 대조한다 -- DSN을 파싱해서는 얻을 수 없는 값이기 때문에
+    다른 스키마의 동명 테이블에 적용될 수 있다. 그래서 이 서명은 실제
+    대상 테이블이 속한 스키마(호출자가 ``_resolve_table_schema``로 연결에서
+    직접 조회해 넘긴다)를 별도로 기록하고 대조한다 -- ``current_schema()``의
+    첫 매치가 아니라 ``to_regclass``로 ``_repair_sql``과 같은 ``search_path``
+    해석 규칙을 써서 실제로 수리/롤백이 건드리는 릴레이션의 스키마를
+    구하며, DSN을 파싱해서는 얻을 수 없는 값이기 때문에
     ``target_identity_reason``이 아니라 여기서 다룬다.
     """
     norm_port = 5432 if port is None else port
@@ -602,7 +647,11 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                 if reason:
                     raise SnapshotError(f"cannot create a rollback-safe snapshot: {reason}")
                 database = conn.execute(text("SELECT current_database()")).scalar()
-                schema = conn.execute(text("SELECT current_schema()")).scalar()
+                schema = _resolve_table_schema(conn, table)
+                if schema is None:
+                    raise SnapshotError(
+                        f"cannot resolve schema for table {table!r} via to_regclass"
+                    )
                 host = engine.url.host
                 port = engine.url.port if engine.url.port is not None else 5432
                 snapshot = {
@@ -732,7 +781,7 @@ def main(argv: list[str] | None = None) -> int:
 
         with engine.connect() as conn:
             database = conn.execute(text("SELECT current_database()")).scalar()
-            schema = conn.execute(text("SELECT current_schema()")).scalar()
+            schema = _resolve_table_schema(conn, table)
         try:
             validate_snapshot_signature(snapshot, table, database, host, port, schema)
         except SnapshotError as exc:
@@ -780,6 +829,10 @@ def main(argv: list[str] | None = None) -> int:
         print("# dry-run: no writes.")
         print("RESULT: PASS (dry-run)")
         return EXIT_OK
+
+    if args.backup_to and args.skip_backup:
+        print("! --backup-to and --skip-backup are mutually exclusive.")
+        return EXIT_USAGE
 
     if not args.backup_to and not args.skip_backup:
         print("! --apply requires --backup-to <path> (or explicit --skip-backup).")
