@@ -368,29 +368,64 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     보장한다(``os.replace``는 무조건 덮어써 이 성질을 주지 못한다).
 
     임시 파일 자체는 ``os.open()``을 ``O_CREAT | O_EXCL | O_NOFOLLOW``로
-    호출해 만든다(이중 적대검증, 코덱스 리뷰의 실측 재현). 임시 파일 경로
-    (``<backup>.tmp-<pid>``)는 pid로만 예측 가능하므로, 다른 사용자가 쓸 수
-    있는 디렉터리라면 그 경로에 미리 심볼릭 링크를 심어 둘 수 있다. 평범한
-    ``open(tmp, "w")``는 그 링크를 그대로 따라가 링크가 가리키는 파일을 이
-    도구의 권한으로 잘라낸다(TOCTOU). ``O_EXCL``은 그 경로에 이미 무엇이
+    호출해 만든다. 임시 파일 경로(``<backup>.tmp-<pid>``)는 pid로만 예측
+    가능하므로, 다른 사용자가 쓸 수 있는 디렉터리라면 그 경로에 미리
+    심볼릭 링크를 심어 둘 수 있다. ``O_EXCL``은 그 경로에 이미 무엇이
     있으면(파일이든 링크든) 생성 자체를 거부하고, ``O_NOFOLLOW``는 그 사이
     심긴 링크를 따라가지 않는다. 모드도 ``umask``에 맡기지 않고 ``0o600``으로
     못박는다: 스냅샷은 영향받는 모든 행의 ``node_id``와 원본 메타데이터를
     담으므로, 공유 디렉터리에서 흔한 ``umask 022``(결과 0644)로는 다른 로컬
-    사용자가 그 내용을 읽을 수 있다. ``os.link``로 만드는 최종 파일은 이
-    임시 파일과 같은 inode를 공유하므로 이 모드를 그대로 물려받는다."""
+    사용자가 그 내용을 읽을 수 있다.
+
+    ``os.open``이 지키는 것은 생성되는 그 순간뿐이다(이중 적대검증, 코덱스
+    리뷰의 실측 재현). ``json.dump``/``fsync``가 끝나고 ``os.link``가
+    실행되기까지의 창에서, unlink 권한이 있는 다른 사용자가 ``tmp`` 경로의
+    파일을 지우고 자기 파일이나 심볼릭 링크로 바꿔치기하면, 경로만 보고
+    거는 ``os.link(tmp, backup_to)``는 바꿔치기된 대상을 그대로 최종
+    백업으로 게시한다(``os.link``는 기본 ``follow_symlinks=True``라 소스가
+    심볼릭 링크면 그 대상을 따라간다).
+
+    경로 대신 이미 연 fd 자체를 거는 ``os.link(f"/proc/self/fd/{fd}",
+    backup_to)``(리눅스 매직 심볼릭 링크를 통한 게시)를 먼저 시도했으나,
+    procfs와 대상이 같은 ext4 디바이스에 있는데도 ``EXDEV``로 실패함을
+    실측 확인했다(``O_TMPFILE``로도 동일). 이 기법은 이식성이 없어 쓰지
+    않는다. 대신 경로 기반 ``os.link`` 뒤 **실패 시 닫힘(fail-closed)**
+    검증을 건다: ``os.link`` 직전 ``fd``에서 ``os.fstat``으로 우리가 실제로
+    쓴 inode(``st_dev``, ``st_ino``)를 기록해 두고, 게시된 ``backup_to``를
+    ``follow_symlinks=False``로 다시 ``os.stat``해 같은 inode인지 대사한다.
+    ``os.link``는 대상이 없을 때만 새 디렉터리 엔트리를 만드는 원자적
+    syscall이므로, 이 지점에 도달했다는 것은 그 엔트리가 바로 우리 호출이
+    막 만든 것이라는 뜻이다 -- 따라서 불일치가 나오면(``tmp``가 그 사이
+    바꿔치기됐다는 뜻) 안전하게 그 엔트리를 지우고 예외를 낸다. 창을 없애진
+    못해도, 바꿔치기된 내용을 성공으로 착각해 조용히 게시하는 일은 없다.
+    ``os.link``로 만드는 최종 파일은 이 임시 파일과 같은 inode를 공유하므로
+    ``0o600`` 모드를 그대로 물려받는다."""
     tmp = f"{backup_to}.tmp-{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, ensure_ascii=False, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
     try:
-        os.link(tmp, backup_to)
-    except FileExistsError:
-        raise FileExistsError(f"backup target already exists: {backup_to}") from None
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as fh:
+            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fd)
+        written = os.fstat(fd)
+        try:
+            os.link(tmp, backup_to)
+        except FileExistsError:
+            raise FileExistsError(f"backup target already exists: {backup_to}") from None
+        published = os.stat(backup_to, follow_symlinks=False)
+        if (published.st_dev, published.st_ino) != (written.st_dev, written.st_ino):
+            os.unlink(backup_to)
+            raise OSError(
+                f"backup publish race detected: {tmp!r} was replaced before it "
+                f"could be linked to {backup_to!r}; refusing to trust the "
+                "published content"
+            )
     finally:
-        os.unlink(tmp)
+        os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
     dir_path = os.path.dirname(os.path.abspath(backup_to)) or "."
     dir_fd = os.open(dir_path, os.O_RDONLY)
     try:
