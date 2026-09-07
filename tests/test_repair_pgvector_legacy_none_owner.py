@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import threading
 import time
@@ -477,6 +478,42 @@ class TestTargetIdentityRejectsSchemaBindingEscapeHatches:
 
         assert reason is not None
         assert "PGOPTIONS" in reason
+
+
+class TestBackupTempFileCreatedSecurely:
+    """이중 적대검증(코덱스 리뷰)이 실측 재현한 실결함: ``write_backup_atomic``의
+    임시 파일 경로(``<backup>.tmp-<pid>``)는 pid로만 예측 가능하다. 다른
+    사용자가 쓸 수 있는 디렉터리라면 그 경로에 미리 심볼릭 링크를 심어 둘 수
+    있고, 평범한 ``open(tmp, "w")``는 그 링크를 그대로 따라가 링크가 가리키는
+    파일을 이 도구의 권한으로 잘라낸다(TOCTOU). 또한 하드링크로 게시되는
+    최종 백업 파일은 호출자의 umask를 그대로 물려받아, 흔한 ``umask 022``
+    에서는 다른 로컬 사용자가 읽을 수 있는 0644가 된다 -- 스냅샷은 영향받는
+    모든 행의 node_id와 원본 메타데이터를 담으므로 정보 노출이다."""
+
+    def test_preexisting_symlink_at_tmp_path_is_not_followed(self, tmp_path):
+        backup_to = tmp_path / "backup.json"
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch me")
+        tmp_link = tmp_path / f"backup.json.tmp-{os.getpid()}"
+        tmp_link.symlink_to(victim)
+
+        with pytest.raises(OSError):
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
+
+        assert victim.read_text() == "do not touch me", (
+            "임시 파일 생성이 미리 심긴 심볼릭 링크를 따라가 대상 파일을 덮어썼다"
+        )
+
+    def test_backup_file_is_created_with_owner_only_permissions(self, tmp_path):
+        backup_to = tmp_path / "backup.json"
+        old_umask = os.umask(0o022)
+        try:
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
+        finally:
+            os.umask(old_umask)
+
+        mode = stat.S_IMODE(os.stat(backup_to).st_mode)
+        assert mode == 0o600, f"백업 파일이 소유자 전용 권한이 아니다: {oct(mode)}"
 
 
 class TestCliMessageMatchesWhatActuallyHappenedOnZeroRows:

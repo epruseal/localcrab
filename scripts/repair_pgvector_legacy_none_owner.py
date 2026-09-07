@@ -365,9 +365,23 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     """임시 파일에 쓰고 fsync한 뒤 ``os.link()``로 배타 생성, 부모 디렉터리를
     fsync한다. ``os.link``는 대상이 이미 있으면 ``FileExistsError``를 내는
     원자적 단일 syscall이라 "존재하면 실패, 없으면 원자 생성"을 정확히
-    보장한다(``os.replace``는 무조건 덮어써 이 성질을 주지 못한다)."""
+    보장한다(``os.replace``는 무조건 덮어써 이 성질을 주지 못한다).
+
+    임시 파일 자체는 ``os.open()``을 ``O_CREAT | O_EXCL | O_NOFOLLOW``로
+    호출해 만든다(이중 적대검증, 코덱스 리뷰의 실측 재현). 임시 파일 경로
+    (``<backup>.tmp-<pid>``)는 pid로만 예측 가능하므로, 다른 사용자가 쓸 수
+    있는 디렉터리라면 그 경로에 미리 심볼릭 링크를 심어 둘 수 있다. 평범한
+    ``open(tmp, "w")``는 그 링크를 그대로 따라가 링크가 가리키는 파일을 이
+    도구의 권한으로 잘라낸다(TOCTOU). ``O_EXCL``은 그 경로에 이미 무엇이
+    있으면(파일이든 링크든) 생성 자체를 거부하고, ``O_NOFOLLOW``는 그 사이
+    심긴 링크를 따라가지 않는다. 모드도 ``umask``에 맡기지 않고 ``0o600``으로
+    못박는다: 스냅샷은 영향받는 모든 행의 ``node_id``와 원본 메타데이터를
+    담으므로, 공유 디렉터리에서 흔한 ``umask 022``(결과 0644)로는 다른 로컬
+    사용자가 그 내용을 읽을 수 있다. ``os.link``로 만드는 최종 파일은 이
+    임시 파일과 같은 inode를 공유하므로 이 모드를 그대로 물려받는다."""
     tmp = f"{backup_to}.tmp-{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, ensure_ascii=False, indent=2)
         fh.flush()
         os.fsync(fh.fileno())
