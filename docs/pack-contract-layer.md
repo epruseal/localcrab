@@ -288,8 +288,8 @@ docstring 이 "호출자가 부른다"고 명시하며, 완료 직후 축 상태
 대한 크로스 진입점 저널 펜스, 그리고 저널 생성 시점 이후 팩이 지워졌다 같은 이름으로
 재생성되는 경우의 세대(generation) 토큰 구분 — 둘 다 후속 이슈로 남는다.
 
-재현: `tests/test_delete_pack_journal.py`(19건, 크래시 시점 3종: doc 축 커밋 직후·
-graph 축 커밋 직후·저널 쓰기 도중 SIGKILL).
+재현: `tests/test_delete_pack_journal.py` 전량 통과(크래시 시점 3종: doc 축 커밋 직후·
+graph 축 커밋 직후·저널 쓰기 도중 SIGKILL) — `pytest tests/test_delete_pack_journal.py -q`.
 
 ### 왜 "세는 집합"과 "지키는 집합"이 다른가
 

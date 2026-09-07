@@ -75,6 +75,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -83,7 +85,7 @@ from pathlib import Path
 
 import pytest
 
-from opencrab.pack import delete_journal  # noqa: F401 -- 아직 없다. RED.
+from opencrab.pack import delete_journal
 from opencrab.pack import load as pack_load
 from opencrab.pack.ownership import create_pack, delete_pack_row, get_pack
 from opencrab.stores.local_graph_store import LocalGraphStore
@@ -230,6 +232,173 @@ class TestJournalAtomicity:
 
         with pytest.raises(delete_journal.DeletePackJournalCorrupt):
             delete_journal.load_journal(tmp_path, "pack-torn")
+
+    def test_schema_mismatch_is_corrupt_not_a_parse_success(self, tmp_path):
+        """파일이 유효한 JSON 이라도 스키마가 없거나 다르면(#327 이전 형식 잔존,
+        또는 미래의 새 스키마 저널을 구 버전이 잘못 읽는 경우) `DeletePackJournalCorrupt`
+        다 — 위 테스트는 파싱 자체가 실패하는 경로만 잡고, 이 경로는 파싱은
+        성공했는데 내용이 저널이 아닌 경우를 잡는다(같은 함수의 다른 raise 지점).
+
+        역변이(mutation testing 실증, #327): `not isinstance(payload, dict) or
+        payload.get("schema") != JOURNAL_SCHEMA` 검사 자체를 지우거나 `or` 를
+        `and` 로 바꿔도 이 테스트 전에는 아무 테스트도 안 죽었다 — 스키마 검사가
+        전혀 실행되지 않아도 스위트가 통과했다는 뜻이다.
+        """
+        path = delete_journal.journal_path(tmp_path, "pack-badschema")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 999, "axes": {}}), encoding="utf-8")
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "pack-badschema")
+
+        path2 = delete_journal.journal_path(tmp_path, "pack-notadict")
+        path2.write_text(json.dumps(["schema", 1]), encoding="utf-8")
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "pack-notadict")
+
+    def test_clear_journal_actually_removes_the_file_and_is_idempotent(self, tmp_path):
+        """`clear_journal` 은 "호출자가 부른다"(자기 docstring)는 유지보수 동작이다
+        — 아무 테스트도 이 함수를 직접 부르지 않았다(mutation testing 실증, #327):
+        본문을 통째로 지워도, `unlink(missing_ok=True)` 를 `missing_ok=False` 로
+        바꿔도 스위트가 그대로 통과했다.
+
+        두 가지를 확인한다: (1) 저널이 있으면 지운 뒤 `load_journal` 이 `None` 을
+        돌려준다, (2) 이미 없는 상태에서 다시 불러도 예외 없이 조용히 넘어간다
+        (`missing_ok=True` 계약 — 유지보수 스크립트가 두 번 불러도 안전해야 한다).
+        """
+        delete_journal.save_journal(
+            tmp_path, "pack-clear",
+            {"schema": delete_journal.JOURNAL_SCHEMA, "axes": {"vectors": {"done": True}}},
+        )
+        assert delete_journal.load_journal(tmp_path, "pack-clear") is not None
+
+        delete_journal.clear_journal(tmp_path, "pack-clear")
+        assert delete_journal.load_journal(tmp_path, "pack-clear") is None
+
+        delete_journal.clear_journal(tmp_path, "pack-clear")  # 이미 없음 — 조용히 통과
+
+    def test_slug_derived_paths_differ_by_pack_name_and_have_a_stable_format(self, tmp_path):
+        """`_slug` 가 팩 이름마다 다른 파일을 내야 서로 다른 팩의 저널·락이 한
+        파일로 뭉개지지 않는다(mutation testing 실증, #327): `_slug` 의 `return`
+        문을 통째로 지워(`None` 반환) 모든 팩 이름이 같은 파일 `"None.json"` 으로
+        수렴해도, 어느 테스트도 서로 다른 두 팩 이름으로 경로를 비교하지 않아
+        살아남았다.
+
+        길이·문자 집합(32자리 16진수)도 여기서 고정한다 — `[:32]` 슬라이스 경계가
+        딴 값으로 바뀌어도 잡을 테스트가 이거 하나뿐이었다.
+        """
+        import re
+
+        path_a = delete_journal.journal_path(tmp_path, "pack-alpha")
+        path_b = delete_journal.journal_path(tmp_path, "pack-beta")
+        assert path_a != path_b, "서로 다른 팩 이름이 같은 저널 경로로 뭉개졌다"
+
+        lock_a = delete_journal.lock_filename("pack-alpha")
+        lock_b = delete_journal.lock_filename("pack-beta")
+        assert lock_a != lock_b, "서로 다른 팩 이름이 같은 락 파일명으로 뭉개졌다"
+
+        assert re.fullmatch(r"delete-pack-[0-9a-f]{32}\.lock", lock_a), lock_a
+        assert re.fullmatch(r"[0-9a-f]{32}\.json", path_a.name), path_a.name
+
+    def test_journal_path_lives_under_its_own_subdirectory(self, tmp_path):
+        """저널이 `data_dir` 바로 밑이 아니라 `delete-pack-journals/` 서브디렉터리에
+        있어야 다른 용도로 쓰는 `data_dir` 최상위 파일들과 안 섞인다
+        (mutation testing 실증, #327): 그 서브디렉터리 이름이 빈 문자열로 바뀌어도
+        (`Path.__truediv__` 가 빈 문자열 세그먼트를 조용히 무시해 `data_dir` 바로
+        밑으로 떨어진다) 어느 테스트도 실제 파일 위치를 확인하지 않아 살아남았다.
+        """
+        path = delete_journal.journal_path(tmp_path, "pack-loc")
+        assert path.parent.name == "delete-pack-journals", path
+        assert path.parent.parent == tmp_path, path
+
+    def test_save_journal_creates_missing_parent_directories(self, tmp_path):
+        """`data_dir` 자신도 아직 없는 다단계 경로에서 첫 저널을 쓸 수 있어야 한다
+        (mutation testing 실증, #327): `path.parent.mkdir(parents=True, ...)` 의
+        `parents=True` 가 `False` 로 바뀌어도, 이 스위트의 다른 모든 테스트는
+        `tmp_path` 가 이미 있는 픽스처를 쓰므로(한 단계만 만들면 돼 `parents` 값이
+        상관없다) 아무도 못 잡았다. 두 단계 이상 없는 경로로만 이 차이가 드러난다.
+        """
+        deep_dir = tmp_path / "not-yet-created" / "nested"
+        assert not deep_dir.exists()
+        delete_journal.save_journal(
+            deep_dir, "pack-deep",
+            {"schema": delete_journal.JOURNAL_SCHEMA, "axes": {"vectors": {"done": True}}},
+        )
+        assert delete_journal.load_journal(deep_dir, "pack-deep") is not None
+
+    def test_save_journal_closes_the_directory_fsync_file_descriptor(self, tmp_path, monkeypatch):
+        """디렉터리 fsync 뒤 그 fd 를 닫아야 한다 — 안 닫으면 `save_journal` 을 반복
+        호출하는(모든 `delete_pack` 실행마다) 장수 프로세스가 fd 를 조금씩 새 문다
+        (mutation testing 실증, #327): 이 fd 를 여는/닫는 `try/finally` 블록 전체를
+        지워도 — fsync 만 사라지는 게 아니라 `os.close(dir_fd)` 호출 자체가 같이
+        사라진다 — 정상 경로 테스트는 전부 그대로 통과했다(내용 왕복만 보고 fd 정리는
+        아무도 안 봤다).
+        """
+        import os
+
+        real_close = os.close
+        closed: list[int] = []
+
+        def _spy_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(os, "close", _spy_close)
+        delete_journal.save_journal(
+            tmp_path, "pack-fdspy",
+            {"schema": delete_journal.JOURNAL_SCHEMA, "axes": {"vectors": {"done": True}}},
+        )
+        assert closed, "save_journal 이 디렉터리 fsync 용 fd 를 열고 안 닫았다"
+
+    def test_journal_schema_version_is_1_and_pinned(self, tmp_path):
+        """저널 스키마 버전은 1로 고정된다 — 디스크에 남은 이전 실행의 저널과 호환이
+        끊기면 안 되므로 이 상수는 실수로 바뀌면 안 된다(mutation testing 실증,
+        #327): `JOURNAL_SCHEMA` 상수 자체를 다른 값으로 바꿔도, 그 상수를 참조해
+        쓰고 같은 상수를 참조해 읽는 왕복 테스트는 자체 일관이라 못 잡는다.
+        여기서는 상수를 거치지 않고 리터럴 `1` 을 파일에 직접 써서 확인한다.
+        """
+        path = delete_journal.journal_path(tmp_path, "pack-schemapin")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "axes": {}}), encoding="utf-8")
+        assert delete_journal.load_journal(tmp_path, "pack-schemapin") == {
+            "schema": 1, "axes": {},
+        }
+
+    def test_save_journal_writes_the_tmp_file_with_0o666_permission_bits(self, tmp_path):
+        """임시 파일 생성 모드가 0o666(움계수만 걸린다)이어야 다른 소유자 프로세스도
+        정리·재읽기를 할 수 있다(mutation testing 실증, #327): 438(0o666) 이
+        439(0o667, 실행 비트 하나 추가) 로 바뀌어도 왕복 테스트는 여전히 통과해
+        아무도 못 잡았다. 움계수를 0 으로 고정해 마스킹 없이 실제 생성 모드를 본다.
+        """
+        import stat
+
+        old_umask = os.umask(0)
+        try:
+            delete_journal.save_journal(
+                tmp_path, "pack-perm",
+                {"schema": delete_journal.JOURNAL_SCHEMA, "axes": {"vectors": {"done": True}}},
+            )
+        finally:
+            os.umask(old_umask)
+        path = delete_journal.journal_path(tmp_path, "pack-perm")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o666, oct(mode)
+
+    def test_save_journal_preserves_non_ascii_content_unescaped(self, tmp_path):
+        """`ensure_ascii=False` 라 한글 등 비-ASCII 값이 `\\uXXXX` 이스케이프 없이
+        원문 그대로 저장돼야 사람이 저널 파일을 직접 열어 읽을 수 있다(mutation
+        testing 실증, #327): `ensure_ascii=False` 가 `True` 로 바뀌거나, `ensure_ascii`
+        와 `indent` 키워드 이름이 서로 바뀌어(그 결과 `ensure_ascii` 자리에 정수 `2`
+        가 들어가 참으로 평가된다) 실질적으로 이스케이프가 켜져도, 내용만 왕복
+        확인하는(파싱된 값만 비교하는) 테스트는 이스케이프 여부를 안 봐서 못 잡았다.
+        """
+        delete_journal.save_journal(
+            tmp_path, "pack-비ascii",
+            {"schema": delete_journal.JOURNAL_SCHEMA, "axes": {"note": "한글 팩 이름"}},
+        )
+        path = delete_journal.journal_path(tmp_path, "pack-비ascii")
+        raw = path.read_text(encoding="utf-8")
+        assert "한글 팩 이름" in raw, raw
+        assert "\\u" not in raw, raw
 
 
 # ---------------------------------------------------------------------------
