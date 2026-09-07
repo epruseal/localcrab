@@ -382,7 +382,7 @@ class TestOwnerHappyPathRegression:
             }
             stats = pack_load.load_chunks_incremental(
                 "authz-pack", f, vec, docs, live_chunks, sql=sql)
-        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+        c_new, c_txt, c_meta, c_same, err, _bypack, _vu = stats
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
             "동일 청크 재적재가 same 으로 수렴하지 않았다")
 

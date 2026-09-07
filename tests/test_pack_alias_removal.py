@@ -374,7 +374,7 @@ def test_t7b_live_alias_does_not_make_every_chunk_meta_changed(live, tmp_path):
     # 접근하고, "pack-1" 을 실제로 소유하는 principal 을 등록해 묶는다.
     principal = _owned_principal(builder._sql, "pack-1")
     with principal_scope(principal):
-        c_new, c_txt, c_meta, c_same, err, _ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, _NoVec(), docs, live_chunks, sql=builder._sql)
     assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
         "폐기 별칭 하나 때문에 청크가 meta 갱신 경로로 흘렀다")

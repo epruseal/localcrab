@@ -788,7 +788,7 @@ class TestChunksIncremental:
             "SELECT source_id, text, metadata FROM doc_sources")}
 
         vec2 = _RecordingVec()
-        c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec2, docs, live_chunks, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 1, 0), (
             f"동일 청크가 same 이 아니다: new={c_new} txt={c_txt} meta={c_meta} same={c_same}")
@@ -805,7 +805,7 @@ class TestChunksIncremental:
 
         f2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문")])
         vec = _RecordingVec()
-        _n, c_txt, _m, c_same, _e, _i = pack_load.load_chunks_incremental(
+        _n, c_txt, _m, c_same, _e, _i, _vu = pack_load.load_chunks_incremental(
             "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
         assert (c_txt, c_same) == (1, 0), f"텍스트 변경이 txt 로 안 세어졌다 ({c_txt},{c_same})"
         assert vec.ids == ["c1"], "텍스트가 바뀌었는데 재임베딩하지 않았다"
@@ -828,7 +828,7 @@ class TestChunksIncremental:
                           [{"id": "c1", "document_id": "n1", "text": "본문",
                             "metadata": {"쪽": "99"}}])
         vec = _RecordingVec()
-        _n, _t, c_meta, c_same, _e, _i = pack_load.load_chunks_incremental(
+        _n, _t, c_meta, c_same, _e, _i, _vu = pack_load.load_chunks_incremental(
             "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
         assert (c_meta, c_same) == (1, 0), f"메타 변경이 meta 로 안 세어졌다 ({c_meta},{c_same})"
         assert vec.calls == [], "메타만 바뀌었는데 재임베딩했다"
@@ -1391,7 +1391,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         # 이번 증분: c1 은 텍스트가 바뀌어 재임베딩을 시도하지만 실패한다. c2 는
         # 파일에서 아예 빠졌다 — c1 의 실패와 무관한 stale 후보다.
         cf2 = _write_jsonl(tmp_path / "c2.jsonl", [_chunk(1, "바뀐 본문1")])
-        c_new, c_txt, c_meta, c_same, err, bypack_ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, bypack_ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", cf2, _VecFailsOn("c1"), docs, live_chunks, sql=pack_sql)
         assert err == 1, f"저장 실패가 err 로 안 잡혔다: c_txt={c_txt} err={err}"
         assert bypack_ids == {"c1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
@@ -3390,7 +3390,7 @@ class TestVecMetaUpdateChromaReplace:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+        c_new, c_txt, c_meta, c_same, err, bypack_ids, _vu = stats
 
         assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
         assert c_txt == 1, "재임베딩(텍스트) 경로로 카운트돼야 한다"
@@ -3458,7 +3458,7 @@ class TestVecMetaUpdateChromaReplace:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+        c_new, c_txt, c_meta, c_same, err, bypack_ids, _vu = stats
 
         assert err == 0
         assert c_txt == 1, "add 실패 → 재임베딩 경로로 떨어져야 한다"
@@ -3506,7 +3506,7 @@ class TestVecMetaUpdateChromaReplace:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+        c_new, c_txt, c_meta, c_same, err, bypack_ids, _vu = stats
 
         assert err == 0
         assert c_txt == 1
@@ -3598,7 +3598,7 @@ class TestVecMetaUpdateChromaUriRealBackend:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-1", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, bypack_ids = stats
+        c_new, c_txt, c_meta, c_same, err, bypack_ids, _vu = stats
 
         assert err == 0, "재임베딩 우회 경로에서 오류가 났다"
         assert c_txt == 1, "재임베딩(텍스트) 경로로 카운트돼야 한다"
@@ -3922,7 +3922,7 @@ class TestVecMetaUpdatePackScope:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+        c_new, c_txt, c_meta, c_same, err, _bypack, _vu = stats
 
         assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
         assert (c_txt, c_meta) == (0, 0), (
@@ -3983,7 +3983,7 @@ class TestVecMetaUpdatePackScope:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+        c_new, c_txt, c_meta, c_same, err, _bypack, _vu = stats
 
         assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
         assert (c_txt, c_meta) == (0, 0), (
@@ -4046,7 +4046,7 @@ class TestVecMetaUpdatePackScope:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-b", chunks_file, vec, _NullDocs(), live_chunks, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+        c_new, c_txt, c_meta, c_same, err, _bypack, _vu = stats
 
         assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
         assert (c_txt, c_meta) == (0, 0), (
@@ -4357,7 +4357,7 @@ class TestVectorMetadataFollowsDocMetadata:
         pack_load.load_chunks("p", self._pack(tmp_path, "doc-A"), vec, docs, sql=pack_sql)
         state = pack_load.live_pack_state("p", graph, docs, _NoVec())
 
-        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _, _vu = pack_load.load_chunks_incremental(
             "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"], sql=pack_sql)
         assert (c_meta, c_txt, c_same) == (1, 0, 0), (
             f"메타만 바뀐 청크가 meta 로 안 세어졌다 ({c_meta},{c_txt},{c_same})")
@@ -4373,7 +4373,7 @@ class TestVectorMetadataFollowsDocMetadata:
         state = pack_load.live_pack_state("p", graph, docs, _NoVec())
         before = len(vec.ids)
 
-        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _, _vu = pack_load.load_chunks_incremental(
             "p", self._pack(tmp_path, "doc-B"), vec, docs, state["chunks"], sql=pack_sql)
         assert c_meta == 0 and c_txt == 1, (
             f"미지원 백엔드인데 meta 로 세었다 ({c_meta},{c_txt}) — 벡터가 옛 메타로 남는다")
@@ -4421,7 +4421,7 @@ class TestFailedVectorMetaUpdateDoesNotMoveTheDocBaseline:
         f2 = _write_jsonl(tmp_path / "c2.jsonl",
                           [{"id": "c1", "text": "고정된 본문", "document_id": "doc-B", "source": "p"}])
         broken = _VecMetaAlwaysFailsAndReembedAlsoFails()
-        c_new, c_txt, c_meta, c_same, err, _ = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, _, _vu = pack_load.load_chunks_incremental(
             "p", f2, broken, docs, state["chunks"], sql=pack_sql)
         assert err == 1 and c_meta == 0, (
             f"벡터가 완전히 죽었는데 성공으로 세었다 (c_meta={c_meta} err={err})")
@@ -4437,7 +4437,7 @@ class TestFailedVectorMetaUpdateDoesNotMoveTheDocBaseline:
         # (= c_same 이 아니어야 한다). 이번엔 정상 벡터로 재시도해 실제로 복구되는지도 본다.
         state2 = pack_load.live_pack_state("p", graph, docs, _NoVec())
         working_vec = _RecordingVec()
-        c_new2, c_txt2, c_meta2, c_same2, err2, _ = pack_load.load_chunks_incremental(
+        c_new2, c_txt2, c_meta2, c_same2, err2, _, _vu2 = pack_load.load_chunks_incremental(
             "p", f2, working_vec, docs, state2["chunks"], sql=pack_sql)
         assert c_same2 == 0, (
             "doc 기준이 안 옮겨갔어야 하는데 다음 증분이 same 으로 판정했다 — 영구 불일치")
@@ -5075,7 +5075,7 @@ class TestSlotOwnershipThroughTheRealStores:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-b", chunks_file, real_vec, _NullDocs(), {}, sql=pack_sql)
-        c_new, c_txt, c_meta, c_same, err, _bypack = stats
+        c_new, c_txt, c_meta, c_same, err, _bypack, _vu = stats
 
         assert err == 1, f"교차 팩 청크가 실패로 세어지지 않았다 (err={err})"
         assert c_new == 0, f"거부된 청크가 신규로 세어졌다 (c_new={c_new})"
@@ -5091,7 +5091,7 @@ class TestSlotOwnershipThroughTheRealStores:
         with principal_scope(principal):
             stats = pack_load.load_chunks_incremental(
                 "pack-b", chunks_file, real_vec, _NullDocs(), {}, sql=pack_sql)
-        c_new, _c_txt, _c_meta, _c_same, err, _bypack = stats
+        c_new, _c_txt, _c_meta, _c_same, err, _bypack, _vu = stats
 
         assert err == 0, f"정상 적재가 실패했다 (err={err})"
         assert c_new == 1

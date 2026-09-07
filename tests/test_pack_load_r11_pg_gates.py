@@ -194,7 +194,7 @@ class TestP2DocWriteFailurePropagates:
             docs, "upsert_source",
             lambda sid, txt, meta: (_ for _ in ()).throw(RuntimeError("boom")))
 
-        c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec, docs, {}, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 0, 2), (
             c_new, c_txt, c_meta, c_same, err)
@@ -210,7 +210,7 @@ class TestP2DocWriteFailurePropagates:
             docs, "upsert_source",
             lambda sid, txt, meta: (_ for _ in ()).throw(RuntimeError("boom")))
 
-        c_new, c_txt, c_meta, c_same, err, ids = pack_load.load_chunks_incremental(
+        c_new, c_txt, c_meta, c_same, err, ids, _vu = pack_load.load_chunks_incremental(
             "pack-1", f, vec, docs, {}, sql=pack_sql)
         assert (c_new, c_txt, c_meta, c_same, err) == (0, 0, 0, 0, 2), (
             c_new, c_txt, c_meta, c_same, err)
