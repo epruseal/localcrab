@@ -27,9 +27,10 @@ SAFETY (Autonomy Contract 매핑):
     (``pg_dump`` 전체 스냅샷은 이 좁은 단일 컬럼 복구에 과도하다).
   - 백업 파일은 임시 파일에 완전히 쓰고 fsync한 뒤 ``os.link()``로 최종 경로에
     배타 생성(이미 있으면 실패, 덮어쓰지 않음)하고, 성공 후 부모 디렉터리를
-    fsync한다. DB 트랜잭션은 이 게시가 전부 성공한 뒤에만 COMMIT한다 — 백업
-    실패는 트랜잭션 전체를 ROLLBACK시킨다(코드 4). "DB는 바뀌었는데 백업이
-    없는" 상태가 구조적으로 불가능하다.
+    fsync한다. 대상 행이 있으면 DB 트랜잭션은 이 게시가 전부 성공한 뒤에만
+    COMMIT한다. 백업 실패는 트랜잭션 전체를 ROLLBACK시킨다(코드 4). 대상 행이
+    0건이면 백업할 내용이 없으므로 파일을 만들지 않고 그대로 COMMIT한다. 두
+    경우 모두 "DB는 바뀌었는데 백업이 없는" 상태가 구조적으로 불가능하다.
   - 탐지-백업-UPDATE는 단일 SQL 문(``WITH ... FOR UPDATE ... UPDATE ... RETURNING``)
     으로 원자화한다 — 별도 SELECT 후 조건부 UPDATE 방식의 TOCTOU 경합이 없다.
   - 실행 전 예상 건수와 실제 rowcount가 다르면 트랜잭션을 중단한다(코드 5).
@@ -259,11 +260,12 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
 
     순서: 트랜잭션 시작 -> 예상 건수 계산(잠금 없음) -> 원자 CTE 실행(FOR UPDATE
     + UPDATE + RETURNING, 한 문장) -> rowcount 대사(불일치 시 CountMismatchError,
-    트랜잭션은 호출자가 예외를 받아 롤백) -> (backup_to가 있으면) 백업 파일을
-    원자적으로 게시(실패 시 예외, 트랜잭션 롤백) -> 커밋.
+    트랜잭션은 호출자가 예외를 받아 롤백) -> (backup_to가 있고 대상 행이 있으면)
+    백업 파일을 원자적으로 게시(실패 시 예외, 트랜잭션 롤백) -> 커밋.
 
-    즉 "DB 커밋 + 백업 유실" 조합이 구조적으로 불가능하다: 백업 게시 성공이
-    커밋의 전제조건이다.
+    즉 "DB 커밋 + 백업 유실" 조합이 구조적으로 불가능하다: 대상 행이 있는 한
+    백업 게시 성공이 커밋의 전제조건이고, 대상 행이 0건이면 애초에 백업할
+    내용도 없다.
     """
     from sqlalchemy import text
 
