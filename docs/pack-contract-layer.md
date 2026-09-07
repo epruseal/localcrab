@@ -20,6 +20,7 @@
 | `normalize.py` | 순수 정규화 함수 — 라벨·공간 해석(`resolve_node_space_type`, `resolve_edge`), grammar 판정(`fits`류) | 부작용 없음(스토어 쓰기·env·파일 I/O 없음). 적재 경로·grammar 게이트·리포트가 **같은 함수**를 호출해야 판정이 갈라지지 않는다 |
 | `build.py` | 생산자 헬퍼 — `Pack(slug, title)` 클래스. uid 네임스페이싱, evidence/청크 생성, 빌드타임 검증 | `schema.py`/`jsonl_io.py` 계약대로 쓰는 쪽이며 집합·표를 재선언하지 않는다 |
 | `load.py` | 적재기 — 3-jsonl을 그래프/문서/SQL/벡터 4스토어에 반영 | 쓰기 함수는 각자 `live_data.require_live_data()`를 호출한다(진입점 한 곳에서만 부르면 진입점을 우회하는 직접 호출 경로에서 가드가 빠진다) |
+| `delete_journal.py` | `delete_pack`의 크로스 스토어 부분 삭제 재개 저널(#327) — 저널 원자적 읽기/쓰기·예외 타입 정본 | 저널 자체를 정리(`clear_journal`)하는 결정은 안 한다 — "호출자가 부른다"(자기 docstring), `delete_pack`은 완료해도 스스로 안 지운다 |
 | `live_data.py` | 쓰기 경로 공통 가드 — 대상 데이터 디렉터리가 실재하는지 확인 | 값을 어떤 방식으로도 정규화(expanduser 등)하지 않는다 — 정규화는 항상 수용 집합을 넓히고, 넓어진 만큼이 엉뚱한 저장소로 잘못 쓸 위험이다 |
 | `gates/` | 구조 품질 게이트 3종 — `dangling.py`(참조 무결성 + evidence/chunk 대사), `grammar_fit.py`(적재 시 grammar로 튕길 엣지 사전 예측), `score.py`(100점 루브릭 채점 `grade_pack`) | **판정만 하고 출력하지 않는다** — 형식·argv·종료코드는 호출자 CLI 몫. 팩 종류별 도메인 지식(어느 팩이 어떤 출처를 가져야 하는가 등)은 여기 두지 않는다 — 그러면 패키지가 특정 팩 컬렉션을 알게 되어 단방향 의존이 깨진다 |
 | `cloud.py` | 3-jsonl → `opencrab-cloud-pack-v1` ZIP (OpenCrab Cloud 업로드용) | `assembler.py`와는 **다른 산출물** — 아래 참조 |
@@ -246,6 +247,49 @@ URI가 붙은 레코드(`uris` API로 만들어진 레코드 — 이 시스템�
 
 재현: `tests/test_pack_load.py`의 `TestVecMetaUpdateChromaReplace`(결함주입
 `_FakeChromaCollection`으로 get/delete/add 각 실패 축과 후검증 축을 개별로 확인).
+
+### 6. `delete_pack` 은 재개 저널로 부분 삭제 상태를 식별한다(#327)
+
+`delete_pack` 은 graph·doc·vector 스토어를 **따로** 커밋한다 — 크로스 스토어 단일
+트랜잭션이 없다. 중간에 죽으면 일부 축만 지워진 채 남는데, `opencrab/pack/delete_journal.py`
+가 그 상태를 원자적 파일(임시파일 + fsync + `os.replace`, `opencrab-dump` #61 rename
+저널과 동형)로 기록하고 다음 실행이 읽어 판단하게 한다.
+
+**계약은 명시-확인 전용이다. 자동 재개는 없다.**
+
+1. 재실행이 기존 저널을 보면 **기본은 탐지·보고뿐**이다 — 어느 스토어도 건드리지
+   않고 `DeletePackJournalPending` 을 던진다. 예외 메시지에 축별 done/pending 상태,
+   라이브 카운트, 창(window) 경고(저널 생성 이후 새 콘텐츠가 들어왔을 수 있고 재개는
+   그것도 지운다)를 담는다.
+2. 운영자가 그 보고를 보고 `resume=True` 를 명시해야만 완주한다.
+3. `resume=True` 라도 팩 동일성 부정 신호(저널 생성 시점 스냅샷 대비 `created_at`
+   불일치 또는 레지스트리 행 소멸)가 있으면 `DeletePackJournalConflict` 로 거부한다.
+   일치는 증명이 아니므로 통과 증거로 쓰지 않고, 불일치만 확실한 부정 신호로 차단에
+   쓴다.
+4. 저널이 찢어져 파싱할 수 없으면 "없음"으로 접지 않고 `DeletePackJournalCorrupt` 를
+   던진다.
+
+축 값의 재실행 여부는 **`done` 플래그로만** 판정한다 — `count`/`clean` 이 채워져
+있어도 그것을 "이미 실행됨"의 근거로 쓰지 않는다. 그래프·doc 삭제 루프는 개별 노드
+실패를 삼키고 계속 진행하는 축이라, 정상 종료해도 `count>0` 인 채로 일부만 지워졌을
+수 있기 때문이다(`any_doc_failed`/`any_graph_failed` sticky 플래그가 그 실패를
+`done=False` 로 승격한다).
+
+벡터 축은 세 갈래로 갈린다 — `_delete_pack_vectors()` docstring 참고: 백엔드 모양
+자체가 없으면(구조적 미지원) 즉시 `done=True`, 모양은 있는데 `available=False`면
+(연결·초기화 실패) 재시도 대상으로 `done=False`, `available=True`면 기존 kind 기반
+삭제를 실행하고 확인 결과로 `done` 을 정한다.
+
+완료된 저널은 `delete_pack` 이 스스로 지우지 않는다 — `clear_journal()` 자신의
+docstring 이 "호출자가 부른다"고 명시하며, 완료 직후 축 상태를 다시 확인하려는
+호출자(테스트 포함)가 `load_journal` 의 `None` 을 만나면 안 되기 때문이다.
+
+이 계약이 다루지 않는 것: `delete_pack` 이 아닌 다른 8개 진입점(잔여 쓰기 경로)에
+대한 크로스 진입점 저널 펜스, 그리고 저널 생성 시점 이후 팩이 지워졌다 같은 이름으로
+재생성되는 경우의 세대(generation) 토큰 구분 — 둘 다 후속 이슈로 남는다.
+
+재현: `tests/test_delete_pack_journal.py` 전량 통과(크래시 시점 3종: doc 축 커밋 직후·
+graph 축 커밋 직후·저널 쓰기 도중 SIGKILL) — `pytest tests/test_delete_pack_journal.py -q`.
 
 ### 왜 "세는 집합"과 "지키는 집합"이 다른가
 

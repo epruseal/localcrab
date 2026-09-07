@@ -55,7 +55,9 @@ from pathlib import Path
 
 from opencrab.common.graph_identity import GraphMigrationConflict
 from opencrab.common.pack_tags import RETIRED_KEYS, apply_pack_tag, strip_retired_keys
+from opencrab.locking import file_lock, lock_data_dir
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
+from opencrab.pack import delete_journal
 from opencrab.pack.jsonl_io import iter_jsonl
 from opencrab.pack.live_data import require_live_data
 from opencrab.pack.normalize import (
@@ -63,6 +65,7 @@ from opencrab.pack.normalize import (
     transform_chunk_meta,
     transform_node,
 )
+from opencrab.pack.ownership import get_pack
 from opencrab.pack.write_gate import authorize
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect
 
@@ -326,6 +329,32 @@ for _axis, _sql in _COUNT_SQL_NAMED.items():
 del _axis, _sql, _COUNT_SQL_NAMED
 
 
+def _vec_shape(vec):
+    """벡터 스토어 객체가 **어떤 백엔드 모양을 갖고 있는가** — `available` 을 보지 않는다.
+
+    반환은 `_vec_backend()` 와 같은 3튜플이되, `available=False` 인 객체도 모양이
+    있으면 `None` 이 아닌 kind 를 돌려준다. `_vec_backend()` 의 `available` 게이트를
+    그대로 두면 "벡터 스토어를 아예 안 준 경우"(`_NoVec` — `_conn`/`_collection`/
+    `_engine` 어느 것도 없다, 구조적 미지원)와 "벡터 스토어는 있는데 연결·초기화가
+    실패한 경우"(모양은 있는데 `available=False`, 재시도하면 나을 수 있다)가 똑같이
+    `(None, None, None)` 로 뭉개진다(#327 로컬 지적 4). `delete_pack` 의 재개 저널이
+    이 둘을 구분해야 하므로, 모양 판별만 하는 이 함수를 게이트 앞에 따로 둔다.
+    """
+    # 존재 여부(hasattr)로만 모양을 정한다 — 값(`is not None`)으로 재기 시작하면
+    # "모양은 있는데 지금 값이 비어 있다"(연결 실패로 `_engine=None`이 된
+    # `PgVectorStore` 등)가 다시 "모양이 아예 없다"로 뭉개진다(PR #360 리뷰 지적 2,
+    # `_conn`/`conn`/`_engine`이 있는데 값이 falsy/None인 백엔드가 구조적 미지원으로
+    # 오분류돼 재개 저널이 `vectors` 축을 즉시 done=True로 확정해 버렸다).
+    if hasattr(vec, "_conn") or hasattr(vec, "conn"):
+        conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
+        return ("sql", conn, getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure"))
+    if hasattr(vec, "_collection"):
+        return ("chroma", vec._collection, None)
+    if hasattr(vec, "_engine"):
+        return ("sqlalchemy", getattr(vec, "_engine", None), getattr(vec, "_table", None) or "vectors")
+    return (None, None, None)
+
+
 def _vec_backend(vec):
     """벡터 스토어가 **팩 단위 연산을 어떤 방식으로 지원하는가**.
 
@@ -340,18 +369,12 @@ def _vec_backend(vec):
 
     같은 열거를 두 곳에 두면 한쪽만 고쳐진다. 판별을 여기 하나로 두고,
     **지원하지 않는 백엔드는 `None` 으로 명시**해 호출자가 조용히 0 을 내지 않게 한다.
+
+    `available` 게이트는 여기서만 건다 — 모양 판별 자체는 `_vec_shape()` 가 한다.
     """
     if not getattr(vec, "available", False):
         return (None, None, None)
-    conn = getattr(vec, "_conn", None) or getattr(vec, "conn", None)
-    if conn is not None:
-        return ("sql", conn, getattr(vec, "_table", None) or getattr(vec, "table_name", "vectors_kure"))
-    if hasattr(vec, "_collection"):
-        return ("chroma", vec._collection, None)
-    engine = getattr(vec, "_engine", None)
-    if engine is not None:
-        return ("sqlalchemy", engine, getattr(vec, "_table", None) or "vectors")
-    return (None, None, None)
+    return _vec_shape(vec)
 
 
 # `_vec_backend()`가 실제로 내는 kind 전체(`None` 제외) — 새 백엔드가 추가되면
@@ -527,7 +550,9 @@ def _chroma_locked_handle(vec, fallback):
             yield getattr(vec, "_collection", fallback)
 
 
-def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
+def _live_vec_ids(
+    vec, pack_name: str, *, backend: tuple | None = None, strict: bool = False
+) -> set[str] | None:
     """이 팩의 라이브 벡터 ID 전량. 가용성 판정은 `_vec_backend()` 의 **kind**
     기준이다 — `vec.available` 만 보면 "가용하지만 열거를 지원 안 하는 백엔드"
     (kind `None`, `available=True`)를 "가용하지만 벡터 0건"과 구분 못 하고,
@@ -539,13 +564,34 @@ def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
     `live_pack_state` 와 `load_chunks_incremental` 이 이 헬퍼 하나를 공유한다
     (사본 금지 — 갈리면 한쪽만 고쳐진다, `_vec_backend` 자신의 교훈과 동일).
 
+    `backend` 를 생략하면 이 함수가 직접 `_vec_backend(vec)` 를 불러
+    `vec.available` 을 다시 읽는다. 기존 두 호출자(`live_pack_state`,
+    `load_chunks_incremental`)는 인자 없이 그대로 호출한다 — 이 함수 자체가
+    `kind` 인식 불가 분기에서 로그용으로 `available` 을 한 번 더 읽는 기존
+    동작을 포함해 **전혀 바뀌지 않는다**. `delete_pack` 의 드리프트 재확인
+    경로만 캐시된 값을 넘겨 "호출당 정확히 한 번" 규율(#327 리뷰 P2)을
+    지킨다.
+
+    `strict=True` 는 `delete_pack` 의 peek 경로만 쓴다(#327 codex 리뷰
+    P1, 2026-09-07). chroma 분기가 기본으로 쓰는 `got.get("ids", [])` 는
+    `"ids"` 키가 없는 malformed 응답을 조용히 빈 리스트로 접어 "확인된
+    0건"과 구분 못 한다 — 완료된 축을 재확인하는 peek 에서 이걸 놓치면
+    재유입된 벡터가 영원히 삭제를 피한다. `strict=True` 면 삭제 경로가
+    이미 쓰는 `_id_set()`(#165)으로 판독해, 판독 불가면 예외를 던져
+    호출자(`delete_pack` peek)의 기존 `try/except` 가 "확인 불가 →
+    재시도"로 다루게 한다. 두 기존 호출자는 `strict` 를 생략해(기본값
+    `False`) 동작이 전혀 안 바뀐다 — 그 두 호출자에 `_id_set()` 을 적용하지
+    않기로 한 범위 밖 결정(GREEN 커밋 38ec2b8 참고, `load_chunks_incremental`
+    의 1회성 증분 스캔에서 malformed 응답이 복구를 영구히 건너뛰는 역행
+    회귀 위험)은 그대로 유지한다.
+
     **한계**: 공유-id 팩(evidence 노드 id == 청크 id)에서는 노드 벡터와 청크
     벡터가 같은 슬롯(`pack_id` 컬럼의 같은 `node_id`)을 쓴다 — 이 함수는 그
     슬롯 충돌 자체를 고치지 않는다(기존 한계, `load.py` 상단 주석 참고).
     이 함수는 **존재 검사**만 한다: 슬롯이 있으면(누가 채웠든) 존재로 본다.
     """
     vec_ids: set[str] = set()
-    kind, handle, table = _vec_backend(vec)
+    kind, handle, table = backend if backend is not None else _vec_backend(vec)
     if kind == "sql":
         for (node_id,) in handle.execute(
             f"SELECT node_id FROM {table} WHERE pack_id = ?", (pack_name,)
@@ -559,7 +605,16 @@ def _live_vec_ids(vec, pack_name: str) -> set[str] | None:
         # 팩인 벡터 행(레거시 source 만 이 팩명과 같은 행)이 고아 후보에 섞여
         # 지워진다. F6 가 SQL 쪽에서 닫은 것과 같은 교차팩 삭제 경로다.
         got = handle.get(where={"pack_id": pack_name})
-        vec_ids.update(got.get("ids", []))
+        if strict:
+            ids = _id_set(got)
+            if ids is None:
+                raise RuntimeError(
+                    f"chroma 조회 응답을 id 집합으로 읽을 수 없다(팩 {pack_name}) "
+                    "— 확인 불가, 재시도 대상으로 남긴다"
+                )
+            vec_ids.update(ids)
+        else:
+            vec_ids.update(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
         with handle.connect() as _c:
@@ -891,7 +946,211 @@ def fallback_tag_without_pack_id_counts(graph, docs) -> dict[str, int]:
     return {"graph_nodes": graph_nodes, "graph_edges": graph_edges, "doc_nodes": doc_nodes}
 
 
-def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]:
+def _delete_pack_vectors(
+    pack_name: str, vec, vec_available: bool | None
+) -> tuple[int | None, str | None, bool]:
+    """벡터 축 하나를 실행하고 `(chunk_vec_del, kind, vec_confirmed)` 를 돌려준다.
+
+    `vec_available` 은 **호출자가 이미 읽어 캐시한 값을 그대로 받는다** — 이
+    함수 안에서 `vec.available` 을 다시 읽지 않는다(#327 리뷰 P2 실증: 호출자의
+    드리프트 탐침이 먼저 한 번 읽고 이 함수가 내부에서 또 읽으면, 상태를 가진
+    property 의 두 번째 접근이 던지는 예외가 vectors 축이 저널에 커밋되기
+    **전에** `delete_pack` 밖으로 새 나간다 — 앞선 세 축은 이미 커밋됐어도
+    vectors 축 자체는 시도됐다는 기록조차 없이 유실된다). `available` 은
+    `delete_pack` 호출당 정확히 한 곳(드리프트 탐침)에서만 읽는다.
+
+    `vec_available` 은 `bool | None` 이다(#327 리뷰 P2-2). `None` 은 그 한 번의
+    `available` 읽기 자체가 예외로 실패했다는 뜻으로, `False`(읽기는 성공했고
+    백엔드가 스스로 미가용이라고 답했다)와 구분한다. 이 구분은 새 계약이 아니라
+    이 PR 이 이미 세운 "구조적 미지원"과 "확인 불가"의 구분(#165 R1/R2 확인-건수
+    규율, `지적 1: 드리프트 감지` 의 v2 — 구조적 미지원과 확인 불가를 분리)을
+    `available` 값 자체에 한 자리 더 적용한 것이다: 읽기 실패는 "확인 불가"이지
+    "구조적으로 없다"가 아니므로, 아래 갈래 1(구조적 미지원)로 흘려보내면 안
+    된다.
+
+    `chunk_vec_del`(#165 확인-건수 규율, R1/R2 는 아래 본문 참고)과 `vec_confirmed`
+    (#327 재개 저널의 `done`/`clean` 판정 근거)는 **서로 다른 축**이다. 섞으면 안
+    되는 이유: `chunk_vec_del` 은 "몇 건 지웠는지"만 말하고, chroma 조회가 아예
+    안 읽혀 삭제를 시도조차 안 했을 때도 참인 값 `0`(0건 삭제가 확인된 사실)을
+    낸다 — 그 `0` 을 "축 완료"로 오인하면 다시 조회하면 나을 상황을 영구 방치한다.
+
+    **네 갈래(#327 로컬 지적 4, P2-2 로 갈래 0 추가)**:
+      0. `available` 읽기 자체가 실패했다(`vec_available is None`) → 가용성을
+         몰라서 실패한 것이지 확실히 벡터스토어가 없는 것이 아니므로, 모양
+         판별 결과와 무관하게 무조건 `vec_confirmed=False`(재시도 대상).
+      1. 백엔드 모양 자체가 없다(`_vec_shape` 가 `None`, 예: `_NoVec`) → 구조적
+         미지원 — 대기할 것이 없으므로 즉시 `vec_confirmed=True`(#165 기존 계약과
+         동형, `chunk_vec_del=0`).
+      2. 백엔드 모양은 있는데 `available=False`(연결·초기화 실패, 예: 방금 생성된
+         `ChromaStore` 가 아직 클라이언트를 못 열었다) → 재시도하면 나을 수 있는
+         상태이므로 `vec_confirmed=False` 로 남긴다 — 즉시 done 을 확정하면 재시도
+         기회가 영구히 사라진다.
+      3. `available=True` → 기존 kind 기반 삭제를 그대로 실행한다. 조회·삭제 도중
+         "확인 불가"(rowcount 미확인, chroma 재조회 판독 불가) 신호가 하나라도
+         뜨면 `vec_confirmed=False`.
+    """
+    chunk_vec_del: int | None = 0
+    kind = None
+    chroma_unreadable = ""
+    vec_confirmed = True
+    if vec_available is None:
+        vec_confirmed = False            # 갈래 0 — 가용성 확인 자체가 실패, 재시도 대상
+        log.warning(
+            "벡터 백엔드 가용성 확인 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+            _safe_type_name(vec), pack_name)
+        return chunk_vec_del, kind, vec_confirmed
+    if not vec_available:
+        try:
+            has_shape = _vec_shape(vec)[0] is not None
+        except Exception:
+            # [#327 리뷰 P2] 모양 판별 자체가 실패했다는 사실을 "모양이 없다"
+            # (구조적 미지원, 갈래 1)와 뭉개면 안 된다 — 위 `vec_available is
+            # None` 과 같은 "구조적 미지원 vs 확인 불가" 구분을 여기도 적용한다.
+            # 뭉개서 `has_shape = False` 로 두면 done=True 로 즉시 확정돼
+            # 재시도 기회가 영구히 사라진다.
+            log.warning(
+                "벡터 백엔드 모양 판별 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+                _safe_type_name(vec), pack_name)
+            return chunk_vec_del, kind, False
+        if has_shape:
+            vec_confirmed = False        # 갈래 2 — 연결·초기화 실패, 재시도 대상
+            log.warning(
+                "벡터 백엔드 연결 미가용(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+                _safe_type_name(vec), pack_name)
+        # has_shape=False면 갈래 1 — vec_confirmed=True 유지(대기할 것이 없다).
+        return chunk_vec_del, kind, vec_confirmed
+
+    try:
+        # 이 지점은 `vec_available` 이 이미 참으로 확인된 뒤에만 도달한다(위
+        # 조기 반환 참고) — `_vec_backend(vec)` 를 부르면 그 함수 자신이
+        # `available` 게이트를 다시 읽어(#327 리뷰 P2) 이 함수를 호출당 정확히
+        # 한 번 읽기 계약 밖으로 밀어낸다. 같은 모양 판별을 게이트 없이 주는
+        # `_vec_shape(vec)` 를 대신 부른다 — `available` 이 이미 참이므로
+        # `_vec_backend` 의 게이트를 통과했을 때와 결과가 같다.
+        kind, handle, table = _vec_shape(vec)
+        if kind == "sql":
+            chunk_vec_del = None                                   # R1
+            cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
+            rc = cur.rowcount                     # 담아만 둔다 — 아직 발행 안 한다
+            handle.commit()
+            chunk_vec_del = _confirmed_rowcount(rc)                # R2
+            if chunk_vec_del is None:
+                vec_confirmed = False
+                # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
+                # 어느 백엔드가 무엇을 안 세어줬는지 알 수 없다.
+                log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
+                            kind, pack_name, _rowcount_reason(rc))
+        elif kind == "chroma":
+            # 회수 술어 — pack_id 단일 소유 키(F6, graph_nodes 조회 주석의 근거와
+            # 동일: source 는 소유 키가 아니다).
+            with _chroma_locked_handle(vec, handle) as col:
+                requested = _id_set(col.get(where={"pack_id": pack_name}))
+                if requested is None:
+                    # 지울 대상을 모른다 — 삭제하지 않는다. 카운트는 0(0건 삭제가 참).
+                    chroma_unreadable = "삭제 대상을 모른다 — 삭제를 시도하지 않았다"
+                    vec_confirmed = False
+                elif requested:
+                    chunk_vec_del = None                           # R1
+                    col.delete(ids=list(requested))
+                    # Chroma 의 delete 는 삭제 건수를 알려주지 않는다. 1.5.9 의
+                    # `DeleteResult` 는 `{'deleted': N}` 을 내지만 그 N 은 **요청
+                    # 수**다(부재 id 3개를 지워도 3을 보고한다, 실측). 재조회만이
+                    # 확인 수단이다 — 같은 술어로 다시 읽어 생존자를 센다.
+                    # `include=[]` 로 id 만 받는다(대형 팩에서 문서·메타를 한 번
+                    # 더 끌어오지 않는다). 교집합을 쓰는 이유: 삭제와 재조회 사이에
+                    # 같은 pack_id 로 들어온 **새** 레코드는 우리가 요청한 것이
+                    # 아니므로 생존자로 세면 안 된다.
+                    survivors = _id_set(
+                        col.get(where={"pack_id": pack_name}, include=[]))
+                    if survivors is None:
+                        # 카운트는 이미 None(R1). 요약의 "미확인"만으로는 원인을
+                        # 못 찾으므로 사유를 남긴다 — 삭제는 실제로 날아갔다.
+                        chroma_unreadable = "삭제 후 재조회를 판독할 수 없다 — 삭제 수 미확인"
+                        vec_confirmed = False
+                    else:
+                        chunk_vec_del = len(requested) - len(requested & survivors)  # R2
+            if chroma_unreadable:
+                # 락은 위 `with` 가 이미 풀었다 — 락을 쥔 채 로깅하지 않으면서도
+                # 인자 평가가 `try` 안이라, 적대적 `vec` 이 여기서 던져도 흡수된다.
+                # **진단 객체는 포맷하지 않는다**: 인자 평가가 안전해도(`type()` 은
+                # 타입 슬롯 읽기라 가로챌 수 없다) 포맷 단계가 메타클래스 `__str__`
+                # 을 돌리고, 거기서 터지면 `logging` 이 레코드를 버려 사유가 통째로
+                # 사라진다(적대 검증 실증). `kind` 는 `_vec_backend` 가 내는 리터럴,
+                # 뒤는 우리가 쓴 문자열이다.
+                log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
+                            kind, pack_name, chroma_unreadable)
+        elif kind == "sqlalchemy":
+            from sqlalchemy import text as _sa_text
+            chunk_vec_del = None                                   # R1
+            with handle.begin() as _c:
+                rc = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
+                                {"p": pack_name}).rowcount
+            chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
+            if chunk_vec_del is None:
+                vec_confirmed = False
+                log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
+                            kind, pack_name, _rowcount_reason(rc))
+        else:
+            # **조용히 0 을 내지 않는다.** `available=True` 인데도 인식 가능한 모양이
+            # 없는 백엔드 — 벡터가 그대로 남는데 삭제가 "성공"으로 보고되면 다음
+            # 적재가 고아 임베딩 위에 쌓인다. (여기서 카운트가 `0` 인 것은 맞다 —
+            # 삭제를 **시도하지 않았으므로** 0건 삭제가 확인된 사실이다. `None`
+            # (모른다)과 섞지 않는다.) `vec_confirmed` 는 그대로 `True` 로 둔다 —
+            # 연결은 됐는데 모양이 없는 것은 재시도로 나아질 여지가 없는 구조적
+            # 제약이라 갈래 1 과 같은 부류다.
+            log.warning(
+                "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
+                "수동 정리가 필요하다", _safe_type_name(vec), pack_name)
+    except Exception as e:
+        vec_confirmed = False   # 예외로 중단됐으니 축 완료로 볼 수 없다.
+        log.warning("벡터 delete 오류(%s): %s", pack_name, _safe_str(e))
+
+    return chunk_vec_del, kind, vec_confirmed
+
+
+_DELETE_JOURNAL_AXES = ("node_twin_loop", "doc_node_extra_and_sources", "graph_nodes", "vectors")
+
+
+def _delete_pack_pending_message(pack_name: str, journal: dict, graph, docs, vec) -> str:
+    """`DeletePackJournalPending` 메시지 — 축 상태·라이브 카운트·창 경고·완주 안내.
+
+    형식은 GREEN 구현과 이 문자열을 검사하는 테스트가 함께 참조하는 정본이다
+    (`tests/test_delete_pack_journal.py::TestDefaultResumeRequiresExplicitConfirmation`).
+    """
+    axis_line = "; ".join(
+        f"{axis}: {'완료' if info.get('done') else '대기'}"
+        for axis, info in journal["axes"].items()
+    )
+    try:
+        live_counts = pack_live_counts(pack_name, graph, docs, vec)
+    except Exception:
+        log.warning(
+            "팩 '%s' 의 대기 저널 안내에 필요한 라이브 카운트 조회가 실패했다 — "
+            "값을 미확인으로 남기고 DeletePackJournalPending 은 그대로 던진다",
+            pack_name,
+        )
+        live_counts = {"nodes": None, "edges": None, "docs": None, "vectors": None}
+    count_line = ", ".join(
+        f"{key}={val if val is not None else '미확인'}" for key, val in live_counts.items()
+    )
+    return (
+        f"팩 '{pack_name}' 에 이전 delete_pack 실행의 저널이 남아 있다(중간에 멈췄다). "
+        f"축 상태: {axis_line}. 지금 라이브 카운트: {count_line}. 저널 생성 이후 이 팩에 "
+        "새 콘텐츠가 추가됐을 수 있고, 재개는 그것도 함께 지운다. 검토한 뒤 완주하려면 "
+        "delete_pack(..., resume=True) 로 다시 실행해라."
+    )
+
+
+def delete_pack(
+    pack_name: str,
+    graph,
+    docs,
+    vec,
+    *,
+    sql=None,
+    resume: bool = False,
+    lock_timeout: float | None = None,
+) -> tuple[int, int, int | None]:
     """기존 팩 노드·엣지(cascade)·청크를 삭제. 반환: (node_del, chunk_sql_del, chunk_vec_del)
 
     **`chunk_vec_del` 은 `int | None` 이다.** `0` 은 "0건 지웠다"(대상이 없었거나 삭제를
@@ -906,226 +1165,427 @@ def delete_pack(pack_name: str, graph, docs, vec) -> tuple[int, int, int | None]
     과대, 우리가 지운 id 를 되살리면 과소). 프로세스 **안**의 `ChromaStore` writer 와의
     창은 `_chroma_locked_handle` 이 닫고, 프로세스 **간** 창은 호출자가 flock 으로
     막는다(ops 로더의 `chroma.lock`).
+
+    **재개 저널(#327).** 이 함수 전체를
+    `file_lock(delete_journal.lock_filename(pack_name))` 로 감싼다. 4축(`node_twin_loop`
+    → `doc_node_extra_and_sources` → `graph_nodes` → `vectors`) 각각을 `{done, ...}`
+    으로 저널에 원자 기록하고, `done` 하나로만 재실행 여부를 정한다(`count`/`clean` 이
+    있어도 그것만으로 건너뛰지 않는다). `node_twin_loop` 이 `done` 이 아니면
+    `graph_nodes` 축에 진입하지 않는다(doc 트윈 삭제가 개별 실패를 삼키고 진행하므로
+    graph 삭제가 먼저 나가면 doc 없이 고아가 될 수 있다) — `vectors` 는 독립이라
+    이 게이팅과 무관하게 실행된다.
+
+    **완료(`done=True`) 축도 무조건 스킵하지는 않는다(PR #360 리뷰 지적 1/2).**
+    `done` 플래그를 영구 신뢰하면, 완료 이후 새로 들어온 `doc_nodes`/`doc_sources`
+    행이나 연결이 복구된 벡터스토어의 잔존 벡터를 영원히 건너뛴다. 그래서 매 호출
+    "무해한 읽기"로 `doc_node_extra_and_sources`(고아 `doc_nodes` 포함) 축의 라이브
+    카운트를 다시 재고, 하나라도 남아 있으면 `done=True` 라도 축을 재시도한다.
+    `vectors` 축은 `_vec_shape()`(모양)와 `available`(속성)로 "모양은 있는데
+    지금 `available` 이 아니다"(연결 실패 등, 리뷰 지적 2)를 잡아 재시도
+    대상으로 남긴다. **더해서 `done=True`·`available=True` 인 축도 라이브
+    ID 존재 검사(`_live_vec_ids`)를 한 번 더 실행해, 완료 이후 이 팩에
+    재유입된 벡터가 있으면 재진입한다(#327 재리뷰 P1)** — 다른 세 축과
+    대칭이다. 이 존재 검사 자체가 실패하면(핸들 접근 예외 등) "확인 불가"로
+    보고 재시도 대상에 남긴다 — 조회를 아예 안 하는 경우는 없다. v3
+    addendum 이 도입했던 "이미 완료·available 한 벡터스토어는 매 재개마다
+    재조회하지 않는다"는 성능 트레이드오프는 파기했다 — 그 교환이 완전
+    삭제 계약을 깨뜨린다는 것이 이후 리뷰에서 드러났다.
+
+    저널이 있으면 기본은 **탐지·보고뿐**이다(`DeletePackJournalPending`, 무쓰기).
+    `resume=True` 를 명시해야 완주한다. `sql` 이 주어졌고 저널 생성 시점에 팩 동일성
+    스냅샷(레지스트리 행의 `created_at`)을 남겼다면, 재개 시점에 그 행이 사라졌거나
+    `created_at` 이 다르면(부정 신호) `resume=True` 라도 `DeletePackJournalConflict`
+    로 거부한다. 자동 재개는 없다 — 모든 재개는 운영자의 명시 확인을 요구한다.
     """
     require_live_data("delete_pack")
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
-    node_del = 0
 
-    # ── graph_nodes: pack_id == pack_name 인 노드 조회 ──────────────────
-    #
-    # **레거시 `source` 폴백은 정확일치여야 한다.** `LIKE '%{pack}%'` 였을 때
-    # 한 팩 이름이 다른 팩 이름의 **부분 문자열**이면 경계를 넘었다 — `pack-a` 를
-    # 지우면 `pack_id` 가 `pack-a-v2` 인 노드까지 삭제되고 엣지가 cascade 로 따라간다
-    # (재현: 그 노드의 레거시 `source` 가 "pack-a-legacy-dump" 이면 걸린다, 2026-08-11).
-    # **삭제는 되돌릴 수 없다** — 경계 판정을 문자열 포함으로 하면 안 되는 자리다.
-    #
-    # **회수(reclaim) 술어를 `pack_id` 단일 소유 키로 좁힌다.** 한동안 `source`/
-    # `source_id`/`pack` 까지 OR 로 넓게 봤는데, 그 세 키는 이 노드의 **소유**를
-    # 말하지 않는다.
-    #   - `source`/`source_id`: `transform_node` 가 입력의 외래 `source`/`source_id`
-    #     를 properties 에 **보존**한다(`normalize.py:297-301` 이 NODE_STRUCT_KEYS
-    #     밖 키를 그대로 병합). 그것을 회수 키로 두면 `pack_id` 가 다른 팩인 행이
-    #     엉뚱한 `delete_pack('A')` 호출에 걸린다 — 소유 키가 아니다.
-    #   - `pack`: 생산자가 `pack` 을 `pack_id` 와 **같은 값으로만** 쓴다
-    #     (`normalize.py:308-309`). 넓혀도 회수 범위가 한 행도 안 늘고, rename 이
-    #     `pack` 을 갱신 안 해 생기는 stale alias 를 오히려 회수 술어가 보게 만든다.
-    # 대사(reconcile) 술어(COUNT_SQL·live_pack_state)와 폭이 다른 것은 의도다 —
-    # `docs/pack-contract-layer.md` 의 회수/대사 분리 서술과 일치시킨다.
-    space_expr = graph._dialect.json_get("properties", "space")
-    node_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
-    rows = graph._fetch_all(
-        f"""
-        SELECT node_type, node_id, COALESCE({space_expr}, 'concept') AS space
-        FROM {graph._table('graph_nodes')}
-        WHERE {node_pack_pred}
-        """,
-        {"pack": pack_name},
-    )
+    with file_lock(delete_journal.lock_filename(pack_name), timeout=lock_timeout):
+        data_dir = lock_data_dir()
+        journal = delete_journal.load_journal(data_dir, pack_name)
+        existed_before = journal is not None
 
-    for node_type, node_id, space in rows:
-        # delete_node: 노드 + 관련 엣지 cascade. bool을 돌려준다(_sql_graph_base.py
-        # 4백엔드 통일 계약, "Returns True iff the node itself was deleted") —
-        # 그 값을 보고서만 node_del을 센다. cascade로 함께 지워지는 엣지 수는
-        # 이 반환값에 없으므로 여기서 세지 않는다(엣지는 별도 축).
-        try:
-            deleted = graph.delete_node(node_type, node_id)
-        except Exception as exc:
-            deleted = False
-            log.warning("노드 삭제 오류(%s) %s/%s: %s", pack_name, node_type, node_id, exc)
-        # doc_nodes 삭제
-        try:
-            docs.delete_node_doc(space, node_id)
-        except Exception:
-            pass
-        if deleted:
-            node_del += 1
+        current_identity = None
+        if sql is not None:
+            row = get_pack(sql, pack_name)
+            current_identity = {"created_at": row["created_at"]} if row else None
 
-    # ── doc_nodes: graph 트윈 없이 남은 pack_id 앵커 노드 직접 정리 ───────
-    # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
-    # 위 graph_nodes 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
-    # source/source_id/pack 제외 근거를 그대로 적용한다).
-    # 조회 후 행별 삭제 대신 **집합 단위 DELETE 1문장** — 삭제 집합이 바로 위
-    # graph_nodes 조회와 동일한 술어(`$.pack_id`)이므로 rowcount 가 행별 삭제
-    # 총합과 등가다(게이트 ⑪, 실측 대조로 확인). 조회를 유지할 이유가 없다.
-    dn_pack_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
-    doc_node_extra_del = docs._exec_write(
-        f"DELETE FROM {docs._table('doc_nodes')} WHERE {dn_pack_pred}",
-        {"pack": pack_name},
-    )
-    node_del += doc_node_extra_del
+        if journal is not None:
+            if not resume:
+                raise delete_journal.DeletePackJournalPending(
+                    _delete_pack_pending_message(pack_name, journal, graph, docs, vec)
+                )
+            snapshot = journal.get("pack_identity")
+            if snapshot is not None and (
+                current_identity is None
+                or current_identity["created_at"] != snapshot["created_at"]
+            ):
+                raise delete_journal.DeletePackJournalConflict(
+                    f"팩 '{pack_name}' 의 동일성이 저널 생성 시점과 다르다(레지스트리 행이 "
+                    "사라졌거나 created_at 이 다르다). 저널을 어떻게 처리할지 확인한 뒤 "
+                    "다시 실행해라."
+                )
+        else:
+            journal = {
+                "schema": delete_journal.JOURNAL_SCHEMA,
+                "pack_identity": current_identity,
+                # 4축 모두 자리표시자로 미리 채운다 — 그래야 이후 어느 축이든 실제로
+                # 실행되기 전에 죽어도(예: node_twin_loop 커밋 직후 SIGKILL) 재조회가
+                # `journal["axes"]["graph_nodes"]` 구독에서 KeyError 를 만나지 않는다.
+                # done 은 항상 False 로 시작하고, 실제 커밋(`_commit_axis`)이 전체
+                # 항목을 덮어써 최종 값을 결정한다.
+                "axes": {name: {"done": False} for name in _DELETE_JOURNAL_AXES},
+            }
+            delete_journal.save_journal(data_dir, pack_name, journal)
 
-    # ── doc_sources (청크): metadata.pack_id == pack_name 이 소유 정본이고,
-    # metadata.source 는 pack_id 가 없을 때만 폴백으로 본다(레거시 source-만
-    # 문서 지원). 무조건 OR 이면 혼합 태그 문서(pack_id="B", source="A")가
-    # A 삭제에 함께 지워진다(r13 #142 재리뷰) — `_doc_owner_pred` 참고.
-    src_pred = _doc_owner_pred(docs._dialect)
-    src_rows = docs._fetch_all(
-        f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
-        {"pack": pack_name},
-    )
-    src_ids = [docs._row_get(r, "source_id") for r in src_rows]
+        resumed = existed_before   # 저널이 이번 호출 전부터 있었으면 이전 부분 실행이 있었다
+        axes = journal["axes"]
 
-    doc_sources_table = docs._table("doc_sources")
-    chunk_sql_del = 0
-    fts_del = 0
-    for batch in _batched(src_ids):
-        placeholders, in_params = _in_names("sid", batch)
-        if not placeholders:                          # 도달 불가(위 주석) — 방어
-            continue
-        chunk_sql_del += docs._exec_write(
-            f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
-            in_params,
+        def _axis_done(name: str) -> bool:
+            return axes.get(name, {}).get("done") is True
+
+        def _commit_axis(name: str, entry: dict) -> None:
+            axes[name] = entry
+            delete_journal.save_journal(data_dir, pack_name, journal)
+
+        # ── graph_nodes/node_twin_loop 공용 조회: pack_id == pack_name 인 노드 ──
+        #
+        # **레거시 `source` 폴백은 정확일치여야 한다.** `LIKE '%{pack}%'` 였을 때
+        # 한 팩 이름이 다른 팩 이름의 **부분 문자열**이면 경계를 넘었다 — `pack-a` 를
+        # 지우면 `pack_id` 가 `pack-a-v2` 인 노드까지 삭제되고 엣지가 cascade 로 따라간다
+        # (재현: 그 노드의 레거시 `source` 가 "pack-a-legacy-dump" 이면 걸린다, 2026-08-11).
+        # **삭제는 되돌릴 수 없다** — 경계 판정을 문자열 포함으로 하면 안 되는 자리다.
+        #
+        # **회수(reclaim) 술어를 `pack_id` 단일 소유 키로 좁힌다.** 한동안 `source`/
+        # `source_id`/`pack` 까지 OR 로 넓게 봤는데, 그 세 키는 이 노드의 **소유**를
+        # 말하지 않는다.
+        #   - `source`/`source_id`: `transform_node` 가 입력의 외래 `source`/`source_id`
+        #     를 properties 에 **보존**한다(`normalize.py:297-301` 이 NODE_STRUCT_KEYS
+        #     밖 키를 그대로 병합). 그것을 회수 키로 두면 `pack_id` 가 다른 팩인 행이
+        #     엉뚱한 `delete_pack('A')` 호출에 걸린다 — 소유 키가 아니다.
+        #   - `pack`: 생산자가 `pack` 을 `pack_id` 와 **같은 값으로만** 쓴다
+        #     (`normalize.py:308-309`). 넓혀도 회수 범위가 한 행도 안 늘고, rename 이
+        #     `pack` 을 갱신 안 해 생기는 stale alias 를 오히려 회수 술어가 보게 만든다.
+        # 대사(reconcile) 술어(COUNT_SQL·live_pack_state)와 폭이 다른 것은 의도다 —
+        # `docs/pack-contract-layer.md` 의 회수/대사 분리 서술과 일치시킨다.
+        #
+        # 매 호출마다 다시 조회한다(축이 이미 done 이라 안 쓰여도 무해한 읽기다) —
+        # 재개 실행에서는 이전 실행이 이미 지운 행이 빠진 채로 돌아온다.
+        space_expr = graph._dialect.json_get("properties", "space")
+        node_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
+        rows = graph._fetch_all(
+            f"""
+            SELECT node_type, node_id, COALESCE({space_expr}, 'concept') AS space
+            FROM {graph._table('graph_nodes')}
+            WHERE {node_pack_pred}
+            """,
+            {"pack": pack_name},
         )
-        # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨).
-        # [Δ r11 P1] sqlite 전용 방언 게이트만 신설 — 순서(doc_sources 삭제 뒤
-        # FTS 삭제)와 삭제 실패의 warning-삼킴은 **현행 그대로 유지**한다(FTS-first
-        # 로 뒤집지 않는다). 근거: 고아 FTS 행은 `keyword_search`(doc_sources
-        # 와 INNER JOIN, local_sql_doc_store.py:293)에서 안 보여 무해하고, 같은
-        # source_id 가 재적재되면 `upsert_source` 의 DELETE+INSERT 가 자가
-        # 치유한다(v6 검수 실측: orphan 상태 검색 결과 미포함·재업서트 후 fts
-        # 행 1). 전량 회수는 재실행으로 안 되고(별건, 대사 스윕 필요) —
-        # `_init_db` 의 n_fts==0 백필 가드(local_sql_doc_store.py:131)가 이
-        # 고아를 건드리는 유일한 비-JOIN 소비처다(그 가드는 "FTS 가 통째로
-        # 비어 있을 때"만 발동하므로 부분 고아는 못 건드린다).
-        if docs._dialect.name == "sqlite":
+
+        # ── 드리프트 감지용 라이브 카운트(PR #360 리뷰 지적 1) ──
+        #
+        # done=True 저널을 무조건 신뢰하면, 완료 이후 새로 들어온 doc_nodes/
+        # doc_sources 행이나 연결이 복구된 벡터스토어의 잔존 벡터를 영원히
+        # 건너뛰고 "재개 완료"만 보고한다. 아래 값들은 축이 이미 done 이라도
+        # 매 호출 다시 구해 "done 인데 실제로 남아 있다"를 잡는다 — 위 `rows`
+        # 와 같은 "무해한 읽기" 관례를 따른다.
+        #
+        # doc_node_extra_and_sources 축은 doc_sources 뿐 아니라 고아 doc_nodes 도
+        # 지운다(아래 축 2 본문). `pack_live_counts()["docs"]` 는 doc_sources 만
+        # 세므로 doc_nodes 만의 드리프트는 그 값으로는 안 보인다(설계검증 v1
+        # 반례 B) — 축 2 본문과 동일한 술어로 doc_nodes 를 따로 센다.
+        live_docs = docs._row_get(
+            docs._fetch_one(
+                build_count_sql(docs._dialect, doc_table=docs._table)["docs"],
+                {"pack": pack_name},
+            ),
+            "n",
+        )
+        doc_nodes_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+        doc_nodes_live = docs._row_get(
+            docs._fetch_one(
+                f"SELECT COUNT(*) AS n FROM {docs._table('doc_nodes')} WHERE {doc_nodes_pred}",
+                {"pack": pack_name},
+            ),
+            "n",
+        )
+
+        # vectors 축의 완료 판정은 `available`/`_vec_shape` 만으로 끝나지
+        # 않는다. `done=True`·`available=True`·모양 인식됨 조합이면, 아래에서
+        # 뽑은 값을 그대로 캐시로 넘겨(추가 `.available` 읽기 없이)
+        # `_live_vec_ids` 로 라이브 ID 전량을 한 번 더 조회한다(peek 블록,
+        # 아래) — 완료 이후 이 팩에 재유입된 벡터가 있으면 재시도 대상으로
+        # 되돌리기 위해서다(#327 재리뷰 P1). `pack_live_counts()` 의 vectors
+        # 분기가 이미 `available=True` 면 실제 조회를 하고 있으므로(설계검증
+        # v3 1라운드 반례), 여기서도 같은 조회를 한 번 더 하는 것은 새 원칙이
+        # 아니라 다른 세 축·다른 함수와의 비대칭을 없애는 것이다. 조회 자체가
+        # 실패하면(핸들 접근 예외 등) "확인 불가"로 보고 보수적으로 재시도
+        # 대상에 넣는다 — 이 파일 전역의 "구조적 미지원 vs 확인 불가" 구분
+        # (#165 R1/R2, #327 리뷰 P2)과 동형이다. v3 addendum 이 도입했던
+        # "이미 완료·available 한 벡터스토어는 매 재개마다 재조회하지 않는다"
+        # 는 성능 트레이드오프는 파기했다 — 그 교환이 완전 삭제 계약을
+        # 깨뜨린다는 것이 이후 리뷰에서 드러났다(재리뷰 P1, 설계검증
+        # v4/v5 DISAGREE 를 받아들인다).
+        #
+        # `available` 은 여기서 **호출당 정확히 한 번만** 읽어 캐시한다(#327
+        # 리뷰 P2 실증 — 상태를 가진 property 가 여기서 한 번, 아래
+        # `_delete_pack_vectors` 내부에서 다시 한 번 읽히면, 두 번째 접근이
+        # 던지는 예외가 vectors 축이 저널에 커밋되기 전에 `delete_pack` 밖으로
+        # 새 나간다. 앞선 세 축은 이미 커밋됐어도 vectors 축 자체는 시도됐다는
+        # 기록조차 없이 유실된다). 캐시한 값을 `_delete_pack_vectors` 에 그대로
+        # 넘기고, 그 함수는 더 이상 `vec.available` 을 읽지 않는다. 아래 peek
+        # 블록도 같은 이유로 캐시된 모양(`backend=`)을 넘겨 `_live_vec_ids` 가
+        # `.available` 을 다시 읽지 않게 한다.
+        try:
+            vec_available = bool(vec.available)
+        except Exception:
+            # [#327 리뷰 P2-2] 읽기 자체가 실패했다는 사실을 "정상적으로
+            # available=False 라고 확인했다"와 뭉개면 안 된다 — 이 PR 이 이미
+            # 세운 "구조적 미지원 vs 확인 불가" 구분(#165 R1/R2)을 이 값에도
+            # 적용해 `None` sentinel 로 구분한다. `_delete_pack_vectors` 는
+            # `None` 을 무조건 재시도 대상(갈래 0)으로 다룬다.
+            vec_available = None
+        try:
+            _vec_shape_kind, _vec_shape_handle, _vec_shape_table = _vec_shape(vec)
+            _vec_shape_probe_failed = False
+        except Exception:
+            # 모양 판별 자체가 실패했다 — "모양이 없다"(구조적 미지원)가 아니라
+            # "확인 못 함"이다(#327 P2 가 세운 구분을 이 호출자 쪽 같은 값에
+            # 적용, 재리뷰 지적 2 / 전수 스윕이 독립 확인). 뭉개서
+            # `_vec_shape_kind = None` 으로만 두면 done=True+available=False
+            # 조합에서 드리프트 판정 자체가 통째로 스킵된다.
+            _vec_shape_kind = _vec_shape_handle = _vec_shape_table = None
+            _vec_shape_probe_failed = True
+        # `vec_available is None`(읽기 자체가 실패)이거나 모양 판별 자체가
+        # 실패했으면 모양 판별 결과와 무관하게 무조건 드리프트로 잡는다 —
+        # 그래야 이미 done=True 로 확정된 축도 재개 호출에서 다시 시도된다
+        # (설계검증 r1 DISAGREE: `vec_available is None` 항이 없으면
+        # `_vec_shape_kind is None` 인 조합에서 아래 식 전체가 `False`가 되어
+        # 재확인 자체가 일어나지 않는다).
+        vectors_drift = (
+            vec_available is None
+            or _vec_shape_probe_failed
+            or (_vec_shape_kind is not None and vec_available is False)
+        )
+
+        if (
+            not vectors_drift
+            and vec_available
+            and _vec_shape_kind is not None
+            and _axis_done("vectors")
+        ):
+            # 이미 done=True·available=True 인 vectors 축도, 완료 이후
+            # 재유입된 라이브 벡터가 있으면 재진입한다(#327 재리뷰 P1) —
+            # doc_node_extra_and_sources/node_twin_loop/graph_nodes 축과 동일한
+            # "done 이어도 무해한 존재 확인으로 드리프트를 재검사" 패턴을
+            # vectors 축에도 맞춘다.
+            #
+            # `backend=` 로 이미 위에서 뽑은 모양(kind/handle/table)을 그대로
+            # 넘긴다 — `_live_vec_ids` 가 기본 경로(`_vec_backend(vec)`)로 가면
+            # `vec.available` 을 다시 읽어 호출당 정확히 한 번 규율(#327 P2)을
+            # 어긴다. `_vec_shape_kind is not None` 을 이미 위에서 확인했으므로
+            # 이 튜플은 `_vec_backend` 가 `available=True` 일 때 내는 것과
+            # 같다.
+            #
+            # 조회 자체가 실패하면(핸들 접근 예외 등) "확인 불가"다 — 이 파일
+            # 전역에서 "재시도 대상"으로 통일한 것과 동형이다(갈래 0, P2, 위
+            # 호출자 보강). 강제 재시도는 `delete_pack` 안에 루프를 만들지
+            # 않는다 — 재개는 호출자가 명시적으로 다시 부른다.
             try:
-                fts_del += docs._exec_write(
-                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
+                live_ids = _live_vec_ids(
+                    vec, pack_name,
+                    backend=(_vec_shape_kind, _vec_shape_handle, _vec_shape_table),
+                    strict=True,
+                )
+            except Exception:
+                vectors_drift = True
+                log.warning(
+                    "라이브 벡터 존재 확인 실패(%s) — 팩 %s 의 vectors 축을 "
+                    "재시도 대상으로 남긴다", _safe_type_name(vec), pack_name)
+            else:
+                # `live_ids is None` — `_live_vec_ids` 자신이 구조적으로 열거를
+                # 지원 안 하는 kind 라고 판정한 것(이미 위에서 확인한 shape 와
+                # 같은 근거, 새 정보 아님) → 강제 재시도 없이 기존 done 유지.
+                # 빈 집합이면 실제로 열거해 라이브 벡터가 없음을 **확인**한
+                # 것이므로 `False` 가 맞다 — `None`(모른다)과 `set()`(0 이라고
+                # 확인함)을 섞지 않는다.
+                vectors_drift = bool(live_ids)
+
+        # ── 1. node_twin_loop: doc 트윈 삭제. 개별 노드 실패는 삼키고 계속 진행하되
+        # (기존 관용 계약 불변), 하나라도 삼켰으면 sticky 플래그로 done=False 를
+        # 고정한다(#327 로컬 지적 7) — "예외 없이 루프가 끝났다"만으로 done 을
+        # 정하면 개별 예외가 항상 삼켜지므로 그 조건이 거의 항상 참이 돼 결함을
+        # 못 잡는다.
+        # `or rows`: 축이 이미 done 이어도 `rows`(위 공용 조회)에 신규 노드가
+        # 있으면 재진입한다 — 같은 팩이 재적재돼 그래프 노드가 새로 생긴 뒤
+        # 재개(resume=True) 호출이 done 플래그만 보고 조용히 건너뛰면 그 신규
+        # 노드의 doc 트윈이 영원히 안 지워진다(#327 재리뷰 P1, id 3947844473;
+        # 상위 원지적 id 3946096629). doc_node_extra_and_sources/vectors 축과
+        # 같은 드리프트 재검사 패턴이다. `docs.delete_node_doc` 은 이미 지워진
+        # 대상에 멱등하므로 이미 처리된 노드를 다시 순회해도 무해하다. 이
+        # 조건은 review-fix-design-v2.md 가 이미 제시하고 codex 가 AGREE 한
+        # 설계 그대로다 — 구현 커밋(`2999bd8`)에서 누락됐던 것을 채운다.
+        if not _axis_done("node_twin_loop") or rows:
+            any_doc_failed = False
+            for _node_type, node_id, space in rows:
+                try:
+                    docs.delete_node_doc(space, node_id)
+                except Exception:
+                    any_doc_failed = True
+            _commit_axis(
+                "node_twin_loop",
+                {"done": not any_doc_failed, "clean": not any_doc_failed},
+            )
+
+        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 벌크 삭제 + doc_sources
+        # (청크) + FTS. node_twin_loop 의 done 여부와 무관하게(게이팅 없음, 리드
+        # 재정의 실행 순서) 항상 시도한다 — 이 축 자신은 `done` 하나로만 재실행을
+        # 막는다.
+        if not _axis_done("doc_node_extra_and_sources") or live_docs or doc_nodes_live:
+            # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
+            # 위 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
+            # source/source_id/pack 제외 근거를 그대로 적용한다).
+            # 조회 후 행별 삭제 대신 **집합 단위 DELETE 1문장** — 삭제 집합이 바로 위
+            # graph_nodes 조회와 동일한 술어(`$.pack_id`)이므로 rowcount 가 행별 삭제
+            # 총합과 등가다(게이트 ⑪, 실측 대조로 확인). 조회를 유지할 이유가 없다.
+            dn_pack_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+            doc_node_extra_del = docs._exec_write(
+                f"DELETE FROM {docs._table('doc_nodes')} WHERE {dn_pack_pred}",
+                {"pack": pack_name},
+            )
+
+            # metadata.pack_id == pack_name 이 소유 정본이고, metadata.source 는
+            # pack_id 가 없을 때만 폴백으로 본다(레거시 source-만 문서 지원).
+            # 무조건 OR 이면 혼합 태그 문서(pack_id="B", source="A")가 A 삭제에
+            # 함께 지워진다(r13 #142 재리뷰) — `_doc_owner_pred` 참고.
+            src_pred = _doc_owner_pred(docs._dialect)
+            src_rows = docs._fetch_all(
+                f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
+                {"pack": pack_name},
+            )
+            src_ids = [docs._row_get(r, "source_id") for r in src_rows]
+
+            doc_sources_table = docs._table("doc_sources")
+            chunk_sql_del = 0
+            fts_del = 0
+            for batch in _batched(src_ids):
+                placeholders, in_params = _in_names("sid", batch)
+                if not placeholders:                          # 도달 불가(위 주석) — 방어
+                    continue
+                chunk_sql_del += docs._exec_write(
+                    f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
                     in_params,
                 )
-            except Exception as exc:
-                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+                # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨).
+                # [Δ r11 P1] sqlite 전용 방언 게이트만 신설 — 순서(doc_sources 삭제 뒤
+                # FTS 삭제)와 삭제 실패의 warning-삼킴은 **현행 그대로 유지**한다(FTS-first
+                # 로 뒤집지 않는다). 근거: 고아 FTS 행은 `keyword_search`(doc_sources
+                # 와 INNER JOIN, local_sql_doc_store.py:293)에서 안 보여 무해하고, 같은
+                # source_id 가 재적재되면 `upsert_source` 의 DELETE+INSERT 가 자가
+                # 치유한다(v6 검수 실측: orphan 상태 검색 결과 미포함·재업서트 후 fts
+                # 행 1). 전량 회수는 재실행으로 안 되고(별건, 대사 스윕 필요) —
+                # `_init_db` 의 n_fts==0 백필 가드(local_sql_doc_store.py:131)가 이
+                # 고아를 건드리는 유일한 비-JOIN 소비처다(그 가드는 "FTS 가 통째로
+                # 비어 있을 때"만 발동하므로 부분 고아는 못 건드린다).
+                if docs._dialect.name == "sqlite":
+                    try:
+                        fts_del += docs._exec_write(
+                            f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
+                            in_params,
+                        )
+                    except Exception as exc:
+                        log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+            _commit_axis(
+                "doc_node_extra_and_sources",
+                {"done": True, "count": doc_node_extra_del + chunk_sql_del},
+            )
+        else:
+            doc_node_extra_del = 0
+            chunk_sql_del = 0
+            fts_del = 0
 
-    # ── 벡터 삭제: SqliteVecStore(KURE, pack_id 컬럼) 우선, Chroma(_collection) 폴백 ──
-    #
-    # **카운트 규율(#165)**: `chunk_vec_del` 은 `int | None` 이고 `None` 은 "몇 개가
-    # 지워졌는지 확인할 수 없다"다(`pack_live_counts` 의 `vectors` 와 같은 어휘).
-    # 두 규칙으로 "확인 안 한 수를 카운트로 내지 않는다"를 지킨다.
-    #   R1. 각 분기에서 **첫 파괴적 호출 직전에** `None` 으로 떨어뜨린다.
-    #   R2. 숫자 발행은 그 백엔드의 쓰기가 **완결된 뒤**(commit·컨텍스트 종료 뒤)에만.
-    # 그래서 아래 `except` 는 카운트를 손대지 않아도 된다 — 쓰기 도중 예외로 빠져나오면
-    # 값은 이미 `None` 이다. 어느 예외가 어느 값으로 가는지를 핸들러에서 판독하려
-    # 들면 다음 사람이 못 읽는다.
-    chunk_vec_del: int | None = 0
-    kind = None                      # 판별 실패해도 아래 요약이 읽을 수 있게 선초기화
-    chroma_unreadable = ""           # 락 안에서는 사유만, 로깅은 락을 푼 뒤
-    # `available` 을 캐시해 아래 요약이 **다시 읽지 않게** 한다. 요약은 `try` 밖이라,
-    # 상태를 가진 property 가 나중 접근에서 던지면 `delete_pack` 밖으로 예외가 샌다 —
-    # 종전엔 없던 탈출 경로다(적대 검증 실증). **정확한 `bool` 로 변환해** 캐시하는
-    # 것이 요점이다 — 원시 객체를 담아 두면 `if` 와 요약이 각각 `__bool__` 을 불러
-    # 두 번째 호출이 `try` 밖에서 터진다. 이 한 줄 뒤로 `try` 밖에서 도는 사용자
-    # 코드는 없다(`_vec_backend` 안의 접근은 `try` 가 흡수한다).
-    vec_available = bool(vec.available)
-    if vec_available:
-        try:
-            # `_vec_backend` 호출은 이 `try` 안에 둔다 — 밖으로 올리면 판별 자체의
-            # 예외가 흡수되지 않고 `delete_pack` 밖으로 터져 기존 계약이 바뀐다.
-            kind, handle, table = _vec_backend(vec)
-            if kind == "sql":
-                chunk_vec_del = None                                   # R1
-                cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
-                rc = cur.rowcount                     # 담아만 둔다 — 아직 발행 안 한다
-                handle.commit()
-                chunk_vec_del = _confirmed_rowcount(rc)                # R2
-                if chunk_vec_del is None:
-                    # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
-                    # 어느 백엔드가 무엇을 안 세어줬는지 알 수 없다.
-                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
-                                kind, pack_name, _rowcount_reason(rc))
-            elif kind == "chroma":
-                # 회수 술어 — pack_id 단일 소유 키(F6, 위 graph_nodes 조회 주석의
-                # 근거와 동일: source 는 소유 키가 아니다).
-                with _chroma_locked_handle(vec, handle) as col:
-                    requested = _id_set(col.get(where={"pack_id": pack_name}))
-                    if requested is None:
-                        # 지울 대상을 모른다 — 삭제하지 않는다. 카운트는 0(0건 삭제가 참).
-                        chroma_unreadable = "삭제 대상을 모른다 — 삭제를 시도하지 않았다"
-                    elif requested:
-                        chunk_vec_del = None                           # R1
-                        col.delete(ids=list(requested))
-                        # Chroma 의 delete 는 삭제 건수를 알려주지 않는다. 1.5.9 의
-                        # `DeleteResult` 는 `{'deleted': N}` 을 내지만 그 N 은 **요청
-                        # 수**다(부재 id 3개를 지워도 3을 보고한다, 실측). 재조회만이
-                        # 확인 수단이다 — 같은 술어로 다시 읽어 생존자를 센다.
-                        # `include=[]` 로 id 만 받는다(대형 팩에서 문서·메타를 한 번
-                        # 더 끌어오지 않는다). 교집합을 쓰는 이유: 삭제와 재조회 사이에
-                        # 같은 pack_id 로 들어온 **새** 레코드는 우리가 요청한 것이
-                        # 아니므로 생존자로 세면 안 된다.
-                        survivors = _id_set(
-                            col.get(where={"pack_id": pack_name}, include=[]))
-                        if survivors is None:
-                            # 카운트는 이미 None(R1). 요약의 "미확인"만으로는 원인을
-                            # 못 찾으므로 사유를 남긴다 — 삭제는 실제로 날아갔다.
-                            chroma_unreadable = "삭제 후 재조회를 판독할 수 없다 — 삭제 수 미확인"
-                        else:
-                            chunk_vec_del = len(requested) - len(requested & survivors)  # R2
-                if chroma_unreadable:
-                    # 락은 위 `with` 가 이미 풀었다 — 락을 쥔 채 로깅하지 않으면서도
-                    # 인자 평가가 `try` 안이라, 적대적 `vec` 이 여기서 던져도 흡수된다.
-                    # **진단 객체는 포맷하지 않는다**: 인자 평가가 안전해도(`type()` 은
-                    # 타입 슬롯 읽기라 가로챌 수 없다) 포맷 단계가 메타클래스 `__str__`
-                    # 을 돌리고, 거기서 터지면 `logging` 이 레코드를 버려 사유가 통째로
-                    # 사라진다(적대 검증 실증). `kind` 는 `_vec_backend` 가 내는 리터럴,
-                    # 뒤는 우리가 쓴 문자열이다. (`pack_name` 은 이 함수의 기존 로그·요약이
-                    # 이미 포맷하는 값 — 이 변경이 새로 만든 노출이 아니다.)
-                    log.warning("벡터 조회 응답을 id 집합으로 읽을 수 없다(%s, 팩 %s): %s",
-                                kind, pack_name, chroma_unreadable)
-            elif kind == "sqlalchemy":
-                from sqlalchemy import text as _sa_text
-                chunk_vec_del = None                                   # R1
-                with handle.begin() as _c:
-                    rc = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
-                                    {"p": pack_name}).rowcount
-                chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
-                if chunk_vec_del is None:
-                    log.warning("벡터 삭제 수 미확인(%s, 팩 %s): 드라이버 rowcount %s",
-                                kind, pack_name, _rowcount_reason(rc))
-            else:
-                # **조용히 0 을 내지 않는다.** 지원 안 되는 백엔드면 벡터가 그대로 남는데
-                # 삭제가 "성공"으로 보고되면 다음 적재가 고아 임베딩 위에 쌓인다.
-                # (여기서 카운트가 `0` 인 것은 맞다 — 삭제를 **시도하지 않았으므로**
-                # 0건 삭제가 확인된 사실이다. `None`(모른다)과 섞지 않는다.)
-                log.warning(
-                    "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
-                    "수동 정리가 필요하다", _safe_type_name(vec), pack_name)
-        except Exception as e:
-            log.warning("벡터 delete 오류(%s): %s", pack_name, _safe_str(e))
+        # ── 3. 게이팅: node_twin_loop 이 done 이어야만 graph_nodes 축에 진입한다 ──
+        # `or rows`: 위 node_twin_loop 축과 동일한 이유(#327 재리뷰 P1, id
+        # 3947844473) — 신규 노드가 있으면 graph_nodes 축이 이미 done 이어도
+        # 재진입해 삭제를 시도한다. 정상 가용 상태에서 이미 지워진 노드에 대한
+        # `graph.delete_node` 는 예외 없이 False 를 반환하므로 재순회는
+        # 무해하다(백엔드 연결 장애 자체는 이 전제의 범위 밖이며 capability
+        # 예외로 별도 처리된다). review-fix-design-v2.md 가 이미 제시하고
+        # codex 가 AGREE 한 설계 그대로이며, 구현 커밋(`2999bd8`)에서
+        # 누락됐던 것을 채운다.
+        node_del = doc_node_extra_del
+        if _axis_done("node_twin_loop") and (not _axis_done("graph_nodes") or rows):
+            any_graph_failed = False
+            graph_deleted = 0
+            for node_type, node_id, _space in rows:
+                # delete_node: 노드 + 관련 엣지 cascade. bool을 돌려준다
+                # (_sql_graph_base.py 4백엔드 통일 계약, "Returns True iff the node
+                # itself was deleted") — 그 값을 보고서만 센다. cascade로 함께
+                # 지워지는 엣지 수는 이 반환값에 없으므로 여기서 세지 않는다
+                # (엣지는 별도 축).
+                try:
+                    deleted = graph.delete_node(node_type, node_id)
+                except Exception as exc:
+                    deleted = False
+                    any_graph_failed = True
+                    log.warning("노드 삭제 오류(%s) %s/%s: %s", pack_name, node_type, node_id, exc)
+                if deleted:
+                    graph_deleted += 1
+            node_del += graph_deleted
+            _commit_axis("graph_nodes", {"done": not any_graph_failed, "count": graph_deleted})
+        # elif _axis_done("graph_nodes"): 이미 done 인 축은 이번 호출에서 아무
+        # 노드도 지우지 않았으므로 node_del 에 아무것도 더하지 않는다 — 저널의
+        # 과거 count 를 이번 실행 확인 건수로 재사용하면 "재개 실행은 이번 실행
+        # 확인 건수만 낸다"(§1) 계약을 어긴다(#327 로컬 지적, codex 1라운드 반례).
+        # node_twin_loop 이 done 이 아니면 graph_nodes 진입 없이 그냥 지나간다 —
+        # 남은 노드는 다음 resume=True 실행이 처리한다. 저널 생성 시점에 이미 4축
+        # 전부 자리표시자(`{"done": False}`)로 채워 놓았으므로(위 journal 초기화 참고)
+        # 여기서 다시 쓰지 않아도 `journal["axes"]["graph_nodes"]` 구독은 안전하다.
 
-    # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
-    # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로
-    # 쓰고 표시명 매핑표를 만들지 않는다: `sql` 은 `_conn` 을 노출하는 아무 스토어나,
-    # `sqlalchemy` 는 `_engine` 을 노출하는 아무 스토어나 잡으므로 sqlite-vec/pgvector
-    # 로 옮겨 적는 순간 거짓이 될 수 있고, `_VEC_BACKEND_KINDS` 주석이 경고하는
-    # "kind 를 분기하는 소비자"가 하나 더 느는 것이다.
-    vec_backend = kind or ("미지원" if vec_available else "미가용")
-    vec_shown = chunk_vec_del if chunk_vec_del is not None else "미확인"
-    print(
-        f"  [{pack_name}] 삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
-        f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터({vec_backend}) {vec_shown}개",
-        flush=True,
-    )
-    return node_del, chunk_sql_del, chunk_vec_del
+        # ── 4. vectors: 독립(ungated) — 세 갈래(구조적 미지원/연결 실패/조회 실패) ──
+        if not _axis_done("vectors") or vectors_drift:
+            vec_skipped = False
+            chunk_vec_del, kind, vec_confirmed = _delete_pack_vectors(
+                pack_name, vec, vec_available
+            )
+            _commit_axis(
+                "vectors",
+                {"done": vec_confirmed, "clean": vec_confirmed, "count": chunk_vec_del},
+            )
+        else:
+            # 이미 done 인 축은 벡터스토어에 어떤 파괴적 호출도 하지 않으므로 이번
+            # 실행의 확인 건수는 0이다(과거 count 를 재사용하면 §1 계약 위반,
+            # #327 로컬 지적). 저널은 `kind`/`vec_available` 을 저장하지 않으므로
+            # (축 항목 형태는 {done, clean, count} 뿐) 원래 갈래를 복원할 수 없다 —
+            # 추측 대신 `vec_skipped` 로 중립 라벨("이전 완료")을 낸다(아래
+            # `vec_backend` 조립 참고). `kind`/`vec_available` 자체는 이 분기에서
+            # 더 이상 만들지 않는다.
+            vec_skipped = True
+            chunk_vec_del = 0
+
+        # 저널은 여기서 자동으로 치우지 않는다. `clear_journal` 자신의 docstring이
+        # 명시하듯 "호출자가 부른다" — 이 함수가 그 호출자가 되어 완료 직후 스스로
+        # 지우면, 완료 직후 저널을 다시 읽어 축 상태를 확인하려는 코드(테스트 포함)가
+        # `load_journal` 의 `None` 을 만난다. 저널 정리는 별도 유지보수 동작으로 남긴다.
+
+        # 백엔드 이름은 `_vec_backend` 판별 결과에서 가져온다 — 종전엔 "sqlite-vec" 고정
+        # 문자열이라 chroma·pgvector 로 돌아도 sqlite-vec 라고 찍혔다(#165). kind 를 그대로
+        # 쓰고 표시명 매핑표를 만들지 않는다: `sql` 은 `_conn` 을 노출하는 아무 스토어나,
+        # `sqlalchemy` 는 `_engine` 을 노출하는 아무 스토어나 잡으므로 sqlite-vec/pgvector
+        # 로 옮겨 적는 순간 거짓이 될 수 있고, `_VEC_BACKEND_KINDS` 주석이 경고하는
+        # "kind 를 분기하는 소비자"가 하나 더 느는 것이다.
+        vec_backend = "이전 완료" if vec_skipped else (kind or ("미지원" if vec_available else "미가용"))
+        vec_shown = chunk_vec_del if chunk_vec_del is not None else "미확인"
+        resume_tag = "(재개) " if resumed else ""
+        prior_unknown = " 이전 부분 실행이 있었으며 그 건수는 알 수 없음." if resumed else ""
+        print(
+            f"  [{pack_name}] {resume_tag}삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
+            f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터({vec_backend}) {vec_shown}개."
+            f"{prior_unknown}",
+            flush=True,
+        )
+        return node_del, chunk_sql_del, chunk_vec_del
 
 
 def live_pack_state(pack_name: str, graph, docs, vec) -> dict:

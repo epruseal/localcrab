@@ -4106,12 +4106,18 @@ class TestVecBackendKindsCoverage:
         return literals
 
     def test_vec_backend_kinds_constant_matches_actual_return_literals(self):
-        """`_VEC_BACKEND_KINDS` 가 `_vec_backend()` 의 실제 반환 리터럴과 어긋나면
-        (새 kind 추가를 상수에 반영 안 함) 아래 대사 자체가 무의미해진다."""
+        """`_VEC_BACKEND_KINDS` 가 `_vec_shape()` 의 실제 반환 리터럴과 어긋나면
+        (새 kind 추가를 상수에 반영 안 함) 아래 대사 자체가 무의미해진다.
+
+        (#327) 모양 판별 리터럴은 `_vec_shape()` 에 있다 — `_vec_backend()` 는
+        `available` 게이트만 걸고 그 뒤는 `_vec_shape()` 에 위임한다(재개 저널이
+        "구조적 미지원"과 "연결 실패"를 구분해야 해서 게이트 앞 모양 판별만 하는
+        함수를 따로 뒀다, 로컬 지적 4). 리터럴은 옮겨졌을 뿐 두 곳에 안 늘었다.
+        """
         src = inspect.getsource(pack_load)
         tree = ast.parse(src)
         fn = next(n for n in ast.walk(tree)
-                   if isinstance(n, ast.FunctionDef) and n.name == "_vec_backend")
+                   if isinstance(n, ast.FunctionDef) and n.name == "_vec_shape")
         returned: set = set()
         for n in ast.walk(fn):
             if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple):
@@ -4119,11 +4125,11 @@ class TestVecBackendKindsCoverage:
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     returned.add(first.value)
         assert returned == set(pack_load._VEC_BACKEND_KINDS), (
-            f"_VEC_BACKEND_KINDS {pack_load._VEC_BACKEND_KINDS} 가 _vec_backend() 의 "
+            f"_VEC_BACKEND_KINDS {pack_load._VEC_BACKEND_KINDS} 가 _vec_shape() 의 "
             f"실제 반환 kind {returned} 와 다르다")
 
     @pytest.mark.parametrize("func_name", [
-        "_live_vec_ids", "pack_live_counts", "delete_pack", "_vec_meta_update",
+        "_live_vec_ids", "pack_live_counts", "_delete_pack_vectors", "_vec_meta_update",
     ])
     def test_every_vec_backend_kind_is_branched_on(self, func_name):
         backend_kinds = set(pack_load._VEC_BACKEND_KINDS)
