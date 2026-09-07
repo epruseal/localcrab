@@ -1047,11 +1047,88 @@ class TestResumeSummaryText:
         assert "재개" in out, f"재개 표시가 요약에 없다: {out!r}"
         assert "알 수 없" in out, f"이전 중단분 불명 표시가 요약에 없다: {out!r}"
         # vectors 축은 1회차에서 이미 done(구조적 미지원, `_NoVec`)이라 2회차(재개)는
-        # 축 스킵 분기를 탄다 — 그 분기의 `vec_available` 기본값(`True`)이 여기서
-        # "미지원"으로 정확히 드러나는지 고정한다(mutation testing 대상, #327 로컬
-        # 지적: 저널이 kind/vec_available 을 저장하지 않아 스킵 분기는 원래 갈래를
-        # 복원 못 하고 기본값에 의존한다).
-        assert "미지원" in out, f"재개 실행의 벡터 축 표시가 미지원이 아니다: {out!r}"
+        # 축 스킵 분기를 탄다 — 저널이 kind/vec_available 을 저장하지 않으므로 원래
+        # 갈래를 추측하지 않고 중립 라벨("이전 완료")을 낸다(#327 로컬 지적).
+        assert "이전 완료" in out, f"스킵된 vectors 축 표시가 중립 라벨이 아니다: {out!r}"
+
+
+# ---------------------------------------------------------------------------
+# 7-보충. 스킵된 축(graph_nodes/vectors)이 이전 실행의 count 를 이번 호출
+#         반환값에 재합산하지 않는다 — "재개 실행은 이번 실행 확인 건수만
+#         낸다"(§1) 를 반환값 자체로 고정한다(요약 문자열이 아니라).
+# ---------------------------------------------------------------------------
+
+class TestResumeSkipDoesNotReuseCountInReturnValue:
+    def test_graph_nodes_skip_branch_does_not_add_prior_count_to_node_del(
+        self, live, tmp_path
+    ):
+        """1회차가 노드 3개를 정상 완료시키면 `graph_nodes` 축에 `done=True,
+        count=3`이 남는다. `delete_pack`은 완료 저널을 스스로 지우지 않으므로
+        2회차 `resume=True`는 이미 done인 `graph_nodes`를 스킵 분기(`elif
+        _axis_done("graph_nodes")`)로 탄다. 그 분기는 이번 실행에서 아무
+        노드도 지우지 않았으므로 반환값의 `node_del`은 0이어야 한다.
+
+        역변이: `elif _axis_done("graph_nodes"): node_del +=
+        axes["graph_nodes"].get("count", 0)` 를 되살리면 `node_del`이 3이
+        되어 이 단언이 잡는다.
+        """
+        graph, docs = live
+        node_ids = ["g1", "g2", "g3"]
+        _seed_pack(graph, docs, tmp_path, "graphskip-pack", node_ids)
+
+        node_del, _chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
+            "graphskip-pack", graph, docs, _NoVec()
+        )
+        assert node_del == 3
+        journal = delete_journal.load_journal(tmp_path, "graphskip-pack")
+        assert journal["axes"]["graph_nodes"] == {"done": True, "count": 3}
+
+        node_del2, _chunk_sql_del2, _chunk_vec_del2 = pack_load.delete_pack(
+            "graphskip-pack", graph, docs, _NoVec(), resume=True
+        )
+        assert node_del2 == 0, (
+            f"과거 graph_nodes count(3)가 재개 반환값에 섞였다: node_del={node_del2!r}"
+        )
+
+    def test_vectors_skip_branch_does_not_reuse_prior_count_or_backend_label(
+        self, live, tmp_path, capsys
+    ):
+        """1회차가 chroma 모양 벡터스토어로 2건을 확인·삭제해 `vectors` 축에
+        `done=True, count=2`가 남는다. 2회차 `resume=True`는 이미 done인
+        `vectors`를 스킵 분기(`else: chunk_vec_del = ...`)로 탄다. 그 분기는
+        벡터스토어에 어떤 파괴적 호출도 하지 않으므로 반환값은 `0`이어야
+        하고(§ docstring `int | None` 계약: `0`="이번 호출은 시도 안 함"),
+        표시는 과거 백엔드를 추측하지 않는 중립 라벨("이전 완료")이어야 한다.
+
+        2회차에 넘기는 `_FakeChromaVec({})`은 실제로 호출되지 않아야 한다 —
+        축이 이미 done이라 `_delete_pack_vectors` 자체를 안 부른다.
+
+        역변이: `chunk_vec_del = axes["vectors"].get("count")`를 되살리면 첫
+        단언이, `vec_skipped` 분기를 제거해 `vec_available=True` 기본값으로
+        되돌리면 마지막 단언("미지원" not in out)이 잡는다.
+        """
+        graph, docs = live
+        vec = _FakeChromaVec({"v1": "vectorskip-pack", "v2": "vectorskip-pack"})
+
+        pack_load.delete_pack("vectorskip-pack", graph, docs, vec)
+        capsys.readouterr()  # 1회차 출력은 버린다 — 2회차(재개) 출력만 본다
+        journal = delete_journal.load_journal(tmp_path, "vectorskip-pack")
+        assert journal["axes"]["vectors"] == {"done": True, "clean": True, "count": 2}
+
+        vec2 = _FakeChromaVec({})
+        _node_del, _chunk_sql_del, chunk_vec_del = pack_load.delete_pack(
+            "vectorskip-pack", graph, docs, vec2, resume=True
+        )
+        out = capsys.readouterr().out
+
+        assert not vec2._collection.get_where_calls, (
+            "이미 done인 vectors 축인데 재개 호출이 벡터스토어를 다시 조회했다"
+        )
+        assert chunk_vec_del == 0, (
+            f"과거 vectors count(2)가 재개 반환값에 섞였다: chunk_vec_del={chunk_vec_del!r}"
+        )
+        assert "이전 완료" in out, f"스킵된 vectors 축 표시가 중립 라벨이 아니다: {out!r}"
+        assert "미지원" not in out, f"가용했던 백엔드가 미지원으로 오표시됐다: {out!r}"
 
 
 # ---------------------------------------------------------------------------
