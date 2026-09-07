@@ -1306,7 +1306,16 @@ def delete_pack(
         # 고정한다(#327 로컬 지적 7) — "예외 없이 루프가 끝났다"만으로 done 을
         # 정하면 개별 예외가 항상 삼켜지므로 그 조건이 거의 항상 참이 돼 결함을
         # 못 잡는다.
-        if not _axis_done("node_twin_loop"):
+        # `or rows`: 축이 이미 done 이어도 `rows`(위 공용 조회)에 신규 노드가
+        # 있으면 재진입한다 — 같은 팩이 재적재돼 그래프 노드가 새로 생긴 뒤
+        # 재개(resume=True) 호출이 done 플래그만 보고 조용히 건너뛰면 그 신규
+        # 노드의 doc 트윈이 영원히 안 지워진다(#327 재리뷰 P1, id 3947844473;
+        # 상위 원지적 id 3946096629). doc_node_extra_and_sources/vectors 축과
+        # 같은 드리프트 재검사 패턴이다. `docs.delete_node_doc` 은 이미 지워진
+        # 대상에 멱등하므로 이미 처리된 노드를 다시 순회해도 무해하다. 이
+        # 조건은 review-fix-design-v2.md 가 이미 제시하고 codex 가 AGREE 한
+        # 설계 그대로다 — 구현 커밋(`2999bd8`)에서 누락됐던 것을 채운다.
+        if not _axis_done("node_twin_loop") or rows:
             any_doc_failed = False
             for _node_type, node_id, space in rows:
                 try:
@@ -1386,8 +1395,16 @@ def delete_pack(
             fts_del = 0
 
         # ── 3. 게이팅: node_twin_loop 이 done 이어야만 graph_nodes 축에 진입한다 ──
+        # `or rows`: 위 node_twin_loop 축과 동일한 이유(#327 재리뷰 P1, id
+        # 3947844473) — 신규 노드가 있으면 graph_nodes 축이 이미 done 이어도
+        # 재진입해 삭제를 시도한다. 정상 가용 상태에서 이미 지워진 노드에 대한
+        # `graph.delete_node` 는 예외 없이 False 를 반환하므로 재순회는
+        # 무해하다(백엔드 연결 장애 자체는 이 전제의 범위 밖이며 capability
+        # 예외로 별도 처리된다). review-fix-design-v2.md 가 이미 제시하고
+        # codex 가 AGREE 한 설계 그대로이며, 구현 커밋(`2999bd8`)에서
+        # 누락됐던 것을 채운다.
         node_del = doc_node_extra_del
-        if _axis_done("node_twin_loop") and not _axis_done("graph_nodes"):
+        if _axis_done("node_twin_loop") and (not _axis_done("graph_nodes") or rows):
             any_graph_failed = False
             graph_deleted = 0
             for node_type, node_id, _space in rows:
