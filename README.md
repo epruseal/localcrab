@@ -491,6 +491,11 @@ make format        # black + isort 포매팅
 make coverage      # 커버리지 리포트
 ```
 
+게이트를 실제로 재현하려면 위 `make` 축약이 아니라
+[`docs/gate-recipes.md`](docs/gate-recipes.md)의 원시 명령을 쓴다. 설치 확인,
+import 경로 확인, 린트 범위 차이, 필수 환경변수, 회귀 대사 판정 절차가 전부
+그 문서에 있다.
+
 통합 테스트 (Neo4j·MongoDB·Chroma 도커 필요):
 
 ```bash
@@ -499,19 +504,10 @@ OPENCRAB_INTEGRATION=1 pytest tests/ -v
 
 ### PG 파리티 테스트
 
-`STORAGE_MODE=pg` (PGGraphStore/PgDocStore) 골든 파리티 테스트는 별도의 로컬
-PostgreSQL 인스턴스가 필요하며, `OPENCRAB_PG_TEST_URL` 미설정 시 자동으로
-skip됩니다. 실제 데이터 손상을 막기 위해 DB명이 `_test`로 끝나지 않으면
-tripwire 테스트가 실패합니다 — 반드시 전용 테스트 DB를 사용하세요.
-
-```bash
-docker compose up -d postgres         # pgvector/pgvector:pg16 기동
-docker exec opencrab-postgres createdb -U opencrab opencrab_test  # 최초 1회
-make test-pg                          # OPENCRAB_PG_TEST_URL 자동 설정 후 실행
-```
-
-CI(`.github/workflows/ci.yml`)는 동일한 구성을 postgres 서비스 컨테이너로
-띄워 매 PR마다 실행합니다.
+`STORAGE_MODE=pg` (PGGraphStore/PgDocStore) 골든 파리티 테스트는 `OPENCRAB_PG_TEST_URL`
+로 접속하는 전용 PostgreSQL 인스턴스가 필요하며, 미설정 시 자동으로
+skip됩니다. 상세 설정과 tripwire 동작은
+[`docs/gate-recipes.md`](docs/gate-recipes.md) 4번, 6번 절을 참고하세요.
 
 ---
 
