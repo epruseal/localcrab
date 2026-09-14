@@ -341,6 +341,26 @@ def test_acquire_records_holder_on_immediate_blocking_branch(tmp_path):
     assert "purpose" not in record
 
 
+def test_acquire_immediate_blocking_branch_shared_does_not_record(tmp_path):
+    """정상(1b의 shared 변형, 14절 c1의 유일한 검출 경로): `_acquire()`의 즉시
+    블로킹 분기(timeout=None)도, 공유 획득에서는 레코드를 쓰면 안 된다. 두
+    반환점의 `if not shared:` 가드는 서로 다른 두 줄이므로(v6 라운드 1 지적),
+    폴링 분기를 보는 테스트 3과는 별개로 이 분기 전용 검출 경로가 필요하다."""
+    from opencrab.locking import _acquire, _open_lock, _release, _lock_path
+
+    lock_path = _lock_path("chroma.lock", str(tmp_path))
+    sentinel = b"untouched-bytes"
+    with open(lock_path, "wb") as f:
+        f.write(sentinel)
+    fh = _open_lock(lock_path)
+    try:
+        _acquire(fh, shared=True, timeout=None)
+    finally:
+        _release(fh)
+        fh.close()
+    assert open(lock_path, "rb").read() == sentinel
+
+
 def test_shared_acquisition_never_records_holder(tmp_path):
     """정상(3): shared=True 획득은 레코드를 남기지 않는다 -- 여러 리더가 동시에
     쥘 수 있어 "단일 보유자"라는 전제 자체가 성립하지 않는다(#140)."""
