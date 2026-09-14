@@ -92,13 +92,17 @@ log = logging.getLogger(__name__)
 # ── id : Q1=Yes(중첩 properties.id 로), Q2=No(#379 이전) ──
 # `absorb_legacy_top_level`(opencrab/pack/schema.py) 은 최상위 stray 키만
 # NODE_STRUCT_KEYS 기준으로 거른다 — 중첩 `properties.id` 는 그대로 남는다.
-# #379 이전에는 이 비교 지점이 신원 검증을 호출하지 않아, 값이 다른 중첩
-# id 가 도달하면 `same` 으로 오판할 여지가 있었다(#358 이전부터 있던 기존
-# 동작). #379 부터는 비교 직전에 `graph_identity.prepare_node` 를 원본
-# props 에 통과시킨다. `normalize_node_properties` 가 이 비교 지점이
-# 정규화한 `props` 에 `id` 를 node_id 로 항상 채워 넣으므로("id"가 원본
-# 파일에 없어도), 라이브 쪽에서만 빼면 파일 쪽에만 이 키가 구조적으로
-# 남아 값이 같아도 매번 chg 로 어긋난다. 그래서 이제는 양쪽에서 같이
+# #379 이전에는 파일 쪽 필터가 "id" 를 빼지 않아, 중첩 id 를 실은 파일
+# 행은 값이 일치하든 불일치하든 항상 이 키 하나 때문에 라이브 쪽(항상
+# "id" 없음)과 키 집합이 달라 매번 chg 로 떨어졌다. 그래서 값이 다른
+# 중첩 id 가 same 으로 잘못 통과하는 사례는 없었다. 다만 값이 일치하는
+# 중첩 id 도 구분 없이 매번 chg 로 재기록됐다(비용 문제, 오판 문제가
+# 아니다). #379 부터는 비교 직전에 `graph_identity.prepare_node` 를 원본
+# props 에 통과시킨다. `normalize_node_properties` 는 이 비교 지점이
+# 정규화한 `props` 에 `id` 를 node_id 로 **항상** 채워 넣으므로(원본
+# 파일에 중첩 id 가 전혀 없던 행도 포함해서), 이 주입을 라이브 쪽에서만
+# 빼면 이제는 모든 행이(중첩 id 유무와 무관하게) 파일 쪽에만 이 키가
+# 구조적으로 남아 매번 chg 로 어긋난다. 그래서 이제는 양쪽에서 같이
 # 뺀다(아래 `FILE_SIDE_IGNORED_KEYS`).
 #
 # ── space : Q1=Yes(중첩 properties.space 로, #125, #358), Q2=No ──
@@ -1961,23 +1965,31 @@ def load_nodes_incremental(
 
             is_same = False
             if cmp_ok:
-                # id/space 는 `prepare_node` 가 `cmp_props` 에 항상 채워
-                # 넣는다. `normalize_node_properties` 가 "id" 를 node_id
-                # 로 강제하고 불일치는 여기서 이미 거부하며(중첩
-                # properties.id 불일치 방어), `normalize_space` 가 "space"
-                # 를 effective 값으로 채운다. 이 두 값의 동일성은 아래 딕셔너리
-                # 비교가 아니라 `live[0]==cmp_node_type`/`live[1]==cmp_space`
-                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 기존
-                # `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 로 뺀다
-                # (안 빼면 `live[2]` 가 "id"/"space" 를 구조적으로 안 담는
-                # 라이브 스냅샷과 매번 chg 로 어긋난다, T7 회귀 실측). 이
-                # 정규화 이전에는 파일 쪽에서 "id" 를 빼지 않아도 됐지만(파일
-                # 원본 props 에 "id" 가 없으면 라이브와 저절로 키 집합이
-                # 맞았다), `prepare_node` 가 "id" 를 항상 주입하므로 이제는
-                # 파일 쪽도 반드시 빼야 한다(위 상수 주석, #379). `owner_id`
-                # 는 `prepare_node` 가 값을 손대지 않으므로 이 정규화가 강제
-                # 하는 대칭 삭제 사유가 없고, 기존 설계(위 상수 주석, #358)가
-                # 정한 대로 라이브 쪽에서만 빠진다(#378 관찰 유지).
+                # `normalize_node_properties` 가 "id" 를 node_id 로
+                # **항상** 채워 넣는다(원본에 없어도). 불일치는 여기서 이미
+                # 거부하므로(중첩 properties.id 불일치 방어), 통과한 시점의
+                # "id" 는 무조건 node_id 와 같다. "space" 는 다르다:
+                # `normalize_space` 는 effective 값이 있으면 "space" 를 그
+                # 값으로 채우지만 없으면(top-level space=None 이고 중첩
+                # properties.space 도 없으면) 아예 키를 지운다(조건부
+                # 주입/제거, prepare_node 직접 호출로 실측). 이 두 값의
+                # 동일성은 아래 딕셔너리 비교가 아니라
+                # `live[0]==cmp_node_type`/`live[1]==cmp_space` 로 이미
+                # 따로 검사하므로, 딕셔너리 비교에서는 기존
+                # `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 로
+                # 뺀다(안 빼면 `live[2]` 가 이 두 키를 구조적으로 안 담는
+                # 라이브 스냅샷과 매번 chg 로 어긋난다,
+                # test_identical_row_is_skipped_without_touching_any_store /
+                # test_live_property_drift_converges_in_one_run /
+                # test_file_side_store_injected_key_converges_after_first_run
+                # 로 검출력 확인). 이 정규화 이전에는 파일 쪽에서 "id" 를
+                # 빼지 않아도 됐지만(파일 원본 props 에 "id" 가 없으면
+                # 라이브와 저절로 키 집합이 맞았다), `prepare_node` 가 "id"
+                # 를 항상 주입하므로 이제는 파일 쪽도 반드시 빼야 한다(위
+                # 상수 주석, #379). `owner_id` 는 `prepare_node` 가 값을
+                # 손대지 않으므로 이 정규화가 강제하는 대칭 삭제 사유가
+                # 없고, 기존 설계(위 상수 주석, #358)가 정한 대로 라이브
+                # 쪽에서만 빠진다(#378 관찰 유지).
                 file_cmp = {k: v for k, v in cmp_props.items()
                             if k not in FILE_SIDE_IGNORED_KEYS}
                 live_cmp = {k: v for k, v in live[2].items()
