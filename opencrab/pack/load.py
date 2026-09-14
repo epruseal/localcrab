@@ -74,15 +74,33 @@ from opencrab.stores._vector_base import slot_owner
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
 
-# 스토어가 저장하면서 **자기가 채워 넣는** 키. 증분 비교에서 빼야 한다 —
-# 넣지 않으면 by-pack 원본과 라이브가 영원히 다르게 보여 **매 증분마다 전량 재적재**된다.
+# 증분 비교에서 빼야 하는 키. 셋이 같은 이유로 빠지지는 않는다 —
+# 빼지 않으면 by-pack 원본과 라이브가 영원히 다르게 보여 **매 증분마다 전량 재적재**된다.
 #
-# 한동안 `id` 하나만 뺐는데, 상류가 `space_id`/`properties[space]` 우선순위를 통합하면서
-# `space` 도 주입하게 됐고(#125) 그 순간 동일한 행이 전부 chg 로 판정됐다.
-# 이름을 하나 더 적는 대신 "스토어가 넣는 것"이라는 축으로 묶는다.
-# `owner_id` joined the set in #148: the write gate stamps the principal onto
-# every node's properties, so it is present on live rows and absent from the
-# source dump -- the same shape `space` had in #125.
+# `id`·`owner_id` 는 이름대로 스토어가 라이브 쪽에만 채워 넣는다(파일 덤프에는 없다).
+# `id` 는 `normalize_node_properties`(opencrab/common/graph_identity.py) 가 항상
+# 주입하고, `owner_id` 는 #148 에서 합류했다 — write gate 가 principal 을 스탬프한다
+# (opencrab/pack/write_gate.py).
+#
+# `space` 는 축이 다르다. **양쪽에 다 있다** — 다만 출처가 갈린다. 라이브 쪽은
+# `graph_identity.normalize_space` 가 로더의 space_id 인자로 무조건 덮어써 항상
+# 신뢰할 수 있는 값이고(실측: LocalGraphStore/PGGraphStore 원시 properties 컬럼에
+# `space` 키가 항상 존재, 2026-09-14), 파일 쪽은 레거시 중첩 `properties.space` 가
+# 그대로 흘러든 값이다(#125, #358) — 같은 노드에서 두 값이 실제로 갈릴 수 있다.
+# 값이 같든 다르든, **필터를 한쪽에서만 걸면 그 쪽에서만 키가 사라져 나머지가
+# 전부 같아도 딕셔너리 비교가 깨진다** — #358 의 근본원인이 이것이다.
+#
+# `_merge_space`(opencrab/stores/_graph_common.py) 의 docstring 은 "SQL 백엔드는
+# id 만 주입하고 space 는 호출자가 넣었을 때만 properties 에 실린다"고 적는데,
+# 이는 `normalize_space` 도입 이전 서술로 보이며 위 실측과 어긋난다 — #372 로 그
+# 어긋남을 추적한다(이 파일의 수정 범위 밖).
+#
+# 세 키를 하나의 상수로 묶은 이유는 "스토어가 주입한다"는 단일 축이 아니라
+# "증분 비교가 신뢰할 수 없는 값/존재 여부를 갖는다"는 더 넓은 축이다. 이름은
+# `STORE_INJECTED_KEYS` 로 남긴다 — `id`·`owner_id` 두 항목이 이름대로고, 세
+# 항목뿐인 집합을 위해 더 넓은 이름으로 바꾸면 오히려 무엇이 왜 빠지는지가
+# 흐려진다. 새 항목을 추가할 때는 이 주석의 구분(스토어 전용 주입 vs. 양쪽
+# 존재하되 출처가 갈리는 값)부터 판정해라.
 STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
 
 # 증분 비교에서 빼는 키 = 스토어가 넣는 것 + `#159` 가 폐기한 것(`pack`).
@@ -1864,14 +1882,19 @@ def load_nodes_incremental(
 
         live = live_nodes.get(node_id)
         if live is not None:
-            # **스토어가 주입하는 키는 비교에서 뺀다.** 한동안 `id` 하나만 뺐는데,
-            # upstream 이 `space_id`/`properties[space]` 우선순위를 통합하면서
-            # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
-            # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
-            # "스토어가 넣는 것"이라는 축으로 묶는다.
+            # **양쪽에서 같은 키를 뺀다(#358).** `INCREMENTAL_IGNORED_KEYS` 의
+            # 정의(위 STORE_INJECTED_KEYS 주석)가 설명하듯, 이 키들은 한쪽에만
+            # 있거나(`id`·`owner_id`) 양쪽에 다 있어도 출처가 갈려 값이 다를 수
+            # 있다(`space`). 어느 경우든 한쪽에서만 걸러내면 그 쪽에서만 키가
+            # 사라져 나머지 값이 전부 같아도 딕셔너리 비교가 깨진다 — 파일 쪽이
+            # 레거시 중첩 `properties.space` 를 갖고 오는 노드가 매 증분 전량
+            # chg 로 고정되는 것이 그 증상이다. 비교에만 쓰는 사본이므로 저장
+            # 시 넘기는 `props` 자체는 아래에서 그대로(필터 없이) 쓴다.
             live_props = {k: v for k, v in live[2].items()
                           if k not in INCREMENTAL_IGNORED_KEYS}
-            if live[0] == node_type and live_props == props:
+            file_props = {k: v for k, v in props.items()
+                          if k not in INCREMENTAL_IGNORED_KEYS}
+            if live[0] == node_type and live_props == file_props:
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                 # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
                 # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
