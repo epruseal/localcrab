@@ -61,7 +61,7 @@ opencrab 미설치 시스템 python도) 통과해버리는 자기충족 오류�
 ## 3. 린트
 
 ```bash
-ruff check .
+<워크트리>/.venv/bin/ruff check .
 ```
 
 `make lint`(`ruff check opencrab tests`)와 다른 점은 `pyproject.toml`의
@@ -72,8 +72,8 @@ ruff check .
 확인한다:
 
 ```bash
-diff <(ruff check --show-files . 2>&1 | sort) \
-     <(ruff check --show-files opencrab tests 2>&1 | sort)
+diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
+     <(<워크트리>/.venv/bin/ruff check --show-files opencrab tests 2>&1 | sort)
 ```
 
 (위반 건수를 세는 `cut -d: -f1` 방식은 위반이 0건이면 아무 경로도 안
@@ -83,7 +83,7 @@ diff <(ruff check --show-files . 2>&1 | sort) \
 ## 4. 전체 스위트 실행과 필수 환경변수
 
 ```bash
-pytest tests/ -v
+<워크트리>/.venv/bin/pytest tests/ -v
 ```
 
 - `OPENCRAB_PG_TEST_URL`: PG 파리티 테스트 게이트. DB명이 `_test`로 끝나야
@@ -129,14 +129,14 @@ pytest tests/ -v
 적지 않는다(다음 커밋에 바뀐다).
 
 - **PG 파리티 테스트**: `OPENCRAB_PG_TEST_URL` 미설정 시 자동 skip.
-  재현: `pytest tests/ -v -k pg` (env 미설정 상태).
+  재현: `<워크트리>/.venv/bin/pytest tests/ -v -k pg` (env 미설정 상태).
 - **에이전트 플러그인 스모크 테스트**: `OPENCRAB_SMOKE_BIN_DIR`도
   `shutil.which("opencrab")`도 못 찾으면 실패(스킵 아님). 재현:
-  `pytest tests/test_agent_plugin_smoke.py -v` (PATH에서 `opencrab`
-  실행파일을 뺀 상태).
+  `<워크트리>/.venv/bin/pytest tests/test_agent_plugin_smoke.py -v`
+  (PATH에서 `opencrab` 실행파일을 뺀 상태).
 - **통합 테스트(Neo4j, MongoDB, Chroma)**: `OPENCRAB_INTEGRATION=1` 미설정
-  시 스킵. 재현: `OPENCRAB_INTEGRATION=1 pytest tests/ -v` (해당 서비스가
-  로컬에 없는 상태에서 실행하면 접속 실패로 드러난다).
+  시 스킵. 재현: `OPENCRAB_INTEGRATION=1 <워크트리>/.venv/bin/pytest tests/ -v`
+  (해당 서비스가 로컬에 없는 상태에서 실행하면 접속 실패로 드러난다).
 
 ## 6. 회귀 대사
 
@@ -586,6 +586,14 @@ diff해야 한다(지금 스크립트는 실패/에러 id만 출력한다). 이 
 비교가 잡고, 삭제와 추가의 net-zero 교체는 #383이 잡는다. 둘은
 커버리지 회귀라는 같은 결함의 두 면이다.
 
+`skipped=` 총량 비교로도 못 잡는 경우가 하나 더 남는다. 이미 skip이던
+테스트가 새로 통과하고 동시에 통과하던 다른 테스트가 새로 skip이나
+xfail로 바뀌면, 양쪽 다 `tests=`와 `skipped=` 총량이 그대로라 diff가
+"동일"을 낸다(실패/에러 id 집합도 안 바뀐다). 이것도 통과 테스트의
+net-zero 교체와 같은 커버리지 회귀 계열이고, id 집합이 아니라 개별
+testcase의 id와 상태(pass/skip/xfail/fail)를 함께 diff해야 닫힌다.
+이 노출은 코드로 닫지 않고 문서화만 한다. 리드 재정 대기 중이다.
+
 이 5단계는 방어가 서로 겹친다. 예를 들어 3번이 없어 xml 부재 상태로
 4번에 넘어가도 xml 파싱 자체가 예외로 죽고, 1번이 종료 코드를 기록하지
 않은 상태로 남아도 2번이 그 미기록 상태를 미완주로 막는다. 한 단계만
@@ -610,8 +618,8 @@ diff해야 한다(지금 스크립트는 실패/에러 id만 출력한다). 이 
 실행이 통과해야 한다):
 
 ```bash
-python scripts/qa/mutate_module.py <리포루트> --all [결과.json]
-python scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
+<워크트리>/.venv/bin/python scripts/qa/mutate_module.py <리포루트> --all [결과.json]
+<워크트리>/.venv/bin/python scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
 ```
 
 반드시 클론/워크트리 위에서 실행한다(대상 파일을 직접 변형했다가
