@@ -10,7 +10,7 @@ import os
 import threading
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from time import monotonic, sleep
 from typing import BinaryIO
 
@@ -482,7 +482,7 @@ def _record_holder(fh: BinaryIO) -> None:
     try:
         record: dict[str, object] = {
             "pid": os.getpid(),
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
         }
         purpose = getattr(_held, "pending_purpose", None)
         if purpose:

@@ -324,7 +324,7 @@ def test_acquire_records_holder_on_immediate_blocking_branch(tmp_path):
     """정상(1b): `_acquire()`의 즉시 블로킹 분기(timeout=None)는 공개 진입점으로
     도달 불가능하므로(둘 다 `_resolve_timeout()`이 항상 구체 float를 만들어
     넘긴다), `_acquire()`를 직접 불러 이 분기를 강제로 태운다(v6 라운드 1 지적)."""
-    from opencrab.locking import _acquire, _open_lock, _release, _lock_path
+    from opencrab.locking import _acquire, _lock_path, _open_lock, _release
 
     lock_path = _lock_path("write.lock", str(tmp_path))
     fh = _open_lock(lock_path)
@@ -346,7 +346,7 @@ def test_acquire_immediate_blocking_branch_shared_does_not_record(tmp_path):
     블로킹 분기(timeout=None)도, 공유 획득에서는 레코드를 쓰면 안 된다. 두
     반환점의 `if not shared:` 가드는 서로 다른 두 줄이므로(v6 라운드 1 지적),
     폴링 분기를 보는 테스트 3과는 별개로 이 분기 전용 검출 경로가 필요하다."""
-    from opencrab.locking import _acquire, _open_lock, _release, _lock_path
+    from opencrab.locking import _acquire, _lock_path, _open_lock, _release
 
     lock_path = _lock_path("chroma.lock", str(tmp_path))
     sentinel = b"untouched-bytes"
