@@ -319,7 +319,14 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    0이 아니면(배너 줄이 한 줄이라도 있으면) 미완주로 보고 diff를 내지
    않고 원인부터 조사한다. 0이면 5번으로 넘어간다. 이 배너는 그 두
    세션 플래그를 세우는 경로에서만 나오므로, 5번은 이 배너를 거치지
-   않는 경로까지 마저 걸러낸다.
+   않는 경로까지 마저 걸러낸다. 이 grep도 로그 전체를 대상으로 하므로
+   실패한 테스트의 캡처 표준출력이 `!`로 시작하는 줄을 내면(예: 테스트가
+   `print("!!! ...")`를 실행) 오탐한다(실측: 그런 테스트 하나로
+   `grep -c '^!'`가 1이 나오지만 실제 조기 종료는 없었다). 이 오탐은
+   방향이 한쪽으로만 간다: 진짜 배너는 이 grep이 로그 전체를 보는 한
+   반드시 걸리므로(놓치는 방향의 반례는 없다) 최악의 결과가 완주를
+   미완주로 잘못 보고 원인을 조사하는 것에서 그친다. 조사해서 캡처
+   출력이 원인임을 확인했으면 5번으로 넘어간다.
 5. 완주 여부를 옵션 목록이 아니라 pytest 자신이 보고하는 두 숫자의
    대사로 확인한다. 로그 앞부분의 `collected N item(s)`(`-k`/`-m`으로
    디셀렉트하면 `collected N items / M deselected / K selected`로
@@ -369,11 +376,17 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    예처럼)는 이 반례에 해당하지 않는다. `.+`가 상태명 앞에서 멈추려면
    사유 안에 `PASSED`/`FAILED`/`ERROR`/`SKIPPED`/`XFAIL`/`XPASS`/`RERUN`
    가운데 하나가 그대로 나와야 하기 때문이다. 이 저장소의 스킵/xfail
-   호출 인자를 전수로 확인한 결과(`grep -rnP
-   'pytest\.(mark\.)?(skip|xfail|importorskip)\(' tests/ | grep -wE
-   'PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN'`, 매치 0건) 상태명을
-   포함한 사유가 없어 지금은 발동하지 않는다. 새 사유 문자열을 추가할
-   때 이 일곱 상태명을 그대로 쓰지 않는다.
+   호출을 확인한 결과 상태명을 포함한 사유가 없어 지금은 발동하지
+   않는다. 호출이 한 줄에 있는 경우는 `grep -rnP
+   'pytest\.(mark\.)?(skip|skipif|xfail|importorskip)\(' tests/ | grep -wE
+   'PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN'`(매치 0건)로, 사유가
+   다음 줄로 넘어가는 여러 줄 호출은 같은 명령에 `-A5`를 붙여(매치 0건)
+   확인했다. `skipif`를 빠뜨리면 `pytest.mark.skipif(`가 안 걸리는
+   실측 반례가 있어(이 저장소에 14건) 패턴에 `skipif`를 넣었다. 이
+   grep은 이 저장소 소스의 정적 텍스트만 보므로, 문자열을 실행 시점에
+   조립하는 사유(예: 변수 보간 결과 자체가 상태명이 되는 경우)는 범위
+   밖이다. 새 사유 문자열을 추가할 때 이 일곱 상태명을 그대로 쓰지
+   않는다.
    같은 테스트 id가 setup/call/teardown 단계별로 따로 리포트를 내도
    (예: teardown 에러가 나면 같은 id로 `PASSED` 줄과 `ERROR` 줄이 각각
    찍힌다) 이 방식은 id 단위로 중복 제거하므로 한 번만 센다. 요약줄
@@ -393,9 +406,27 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    조사한다. 둘이 같으면 4번에서 배너가 없었다는 전제 아래 완주로 본다.
 6. 완주가 확인되면 로그의 `FAILED`/`ERROR` 줄 id를 정렬된 집합으로
    (없으면 빈 집합으로) 뽑아 양쪽 다 항상 base와 diff한다(빈 집합끼리도
-   diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 이때
-   요약줄의 `failed`/`error` 수와 로그의 `^FAILED `/`^ERROR ` 줄 수를
-   각각 대사한다. 요약줄이 `N failed`(N>0)를 보고하는데 `^FAILED `로
+   diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 추출과
+   대사는 로그 전체가 아니라 `short test summary info` 절만 대상으로
+   한다(그 절 헤더부터 로그 끝까지):
+   ```bash
+   awk '/^=+ short test summary info =+$/{f=1} f' /tmp/<워크트리 식별자>-run.log \
+     | grep -oP '^(FAILED|ERROR) \K\S+' | sort -u
+   ```
+   pytest는 이 절에 실패/에러 테스트마다 `FAILED <id> - <사유>` 또는
+   `ERROR <id> - <사유>` 한 줄을 별도 `-r` 옵션 없이도 기본값으로 낸다(이
+   워크트리 pytest로 확인한 계약값). 로그 전체를 대상으로 하면 5번과
+   같은 종류의 오염이 생긴다: 실패한 테스트의 캡처 표준출력이나 캡처
+   로그가 `FAILED `/`ERROR `로 시작하는 줄을 그대로 내면(전자는 테스트
+   코드의 `print`, 후자는 `logging.getLogger(...).error(...)`처럼
+   ERROR 레벨 로그 호출이 원인이다) 그 줄이 진짜 id처럼 집합에
+   섞인다(실측: 표준출력에 `FAILED fake/test_ghost.py::test_ghost -
+   bogus`를 찍고 실패하는 테스트와 `.error("db connect failed")`를 호출하고
+   실패하는 테스트를 포함한 세션에서, 로그 전체 대상 `^FAILED `/`^ERROR `
+   개수는 각각 2인데 요약줄은 `1 failed, ... 1 error`다. `short test
+   summary info` 절로 좁히면 각각 1로 요약줄과 일치한다). 요약줄의
+   `failed`/`error` 수와 이 절 안의 `^FAILED `/`^ERROR ` 줄 수도 같은
+   범위로 대사한다. 요약줄이 `N failed`(N>0)를 보고하는데 `^FAILED `로
    시작하는 줄이 하나도 없거나, `M error`(M>0)를 보고하는데 `^ERROR `로
    시작하는 줄이 하나도 없으면 리포트 옵션(`-r` 계열, `--no-summary`)이
    깨져 있다는 뜻이므로 diff를 신뢰하지 말고 옵션부터 고친다. "리포트
