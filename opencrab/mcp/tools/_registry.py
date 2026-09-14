@@ -459,6 +459,6 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     # Step 4: execute.
     with principal_scope(principal):
         if spec.writes:
-            with _write_lock():
+            with _write_lock(purpose=f"mcp tool: {name}"):
                 return spec.fn(**arguments)
         return spec.fn(**arguments)

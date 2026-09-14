@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import math
 import os
 import threading
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 from time import monotonic, sleep
 from typing import BinaryIO
 
@@ -124,13 +126,74 @@ def _resolve_timeout(timeout: float | None) -> float:
     return timeout
 
 
+def _read_holder_record(lock_path: str) -> dict[str, object] | None:
+    """Best-effort read of the diagnostic holder record left at *lock_path*.
+
+    Reads WITHOUT taking the lock. By the time this is called, the caller has
+    already given up waiting -- waiting on the lock again here would revive
+    the very wait this function exists to explain. Because it reads without
+    the lock, it can observe another process's write from ``_record_holder()``
+    mid-flight (a torn write). That is treated exactly like corrupt JSON
+    below: this function's contract is to absorb every kind of failure, not
+    to distinguish between them.
+
+    Returns ``None`` if the file is missing, empty, unreadable, not valid
+    JSON, or parses to something other than a JSON object. A diagnostic read
+    must never replace a lock-wait timeout with a new exception. Both failure
+    paths log (at ``debug``, since a record-not-found state is often just "no
+    exclusive holder yet", not an anomaly) but guard the logging call itself
+    the same way ``safe_tool_error()`` does
+    (``opencrab/mcp/tools/_registry.py``), so a failure in logging cannot
+    propagate either.
+    """
+    try:
+        with open(lock_path, "rb") as fh:
+            data = fh.read()
+        record = json.loads(data)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, must not replace the timeout
+        try:
+            logger.debug("failed to read lock holder record from %s: %s", lock_path, exc)
+        except Exception:  # noqa: BLE001 - a logging failure must not block either
+            pass
+        return None
+    if not isinstance(record, dict):
+        try:
+            logger.debug("lock holder record at %s is not a JSON object: %r", lock_path, record)
+        except Exception:  # noqa: BLE001 - a logging failure must not block either
+            pass
+        return None
+    return record
+
+
 def write_lock_busy_message(lock_path: str, timeout: float) -> str:
-    """Operator-facing text for a write.lock acquisition that timed out."""
-    return (
+    """Operator-facing text for a write.lock acquisition that timed out.
+
+    Appends pid/start time/purpose when a readable holder record exists
+    (#352). The record is diagnostic: it may be absent, stale, or from a
+    process that has since exited. That does not change the fact this
+    message reports: the acquisition timed out.
+    """
+    base = (
         f"timed out after {timeout}s waiting for {lock_path}. Another process "
         "holds write.lock while writing to the local stores. Wait for it to "
         "finish, or stop it if it is stuck, then run this again."
     )
+    record = _read_holder_record(lock_path)
+    if record is None:
+        return base + " Holder: unknown (no readable record)."
+    parts = []
+    pid = record.get("pid")
+    started_at = record.get("started_at")
+    purpose = record.get("purpose")
+    if isinstance(pid, int):
+        parts.append(f"pid={pid}")
+    if isinstance(started_at, str):
+        parts.append(f"started_at={started_at}")
+    if isinstance(purpose, str):
+        parts.append(f"purpose={purpose}")
+    if not parts:
+        return base + " Holder: unknown (record present but unrecognized)."
+    return base + " Holder: " + ", ".join(parts) + "."
 
 
 def chroma_lock_busy_message(lock_path: str, timeout: float) -> str:
@@ -387,17 +450,74 @@ def _open_lock(path: str) -> BinaryIO:
         return os.fdopen(fd, "r+b")
 
 
+def _record_holder(fh: BinaryIO) -> None:
+    """Write a diagnostic holder record into the just-acquired exclusive lock file *fh*.
+
+    Best-effort (#352). Any failure of this function is swallowed and logged,
+    because a failure writing this diagnostic record must not fail the
+    acquisition it is meant to describe.
+
+    Call this ONLY for an exclusive (non-shared) acquisition, and ONLY right
+    after ``fcntl.flock`` succeeds. The caller at this point IS the actual
+    flock holder, so the record's ownership claim needs no separate proof
+    (such as checking whether a recorded pid is still alive).
+
+    Not cleared on release. The next exclusive holder simply overwrites it.
+    Clearing it on release would reopen a window where "no holder" and "record
+    not read yet" are indistinguishable, and closing that window would need
+    wrapping the clear itself in a lock -- which returns to the same kind of
+    atomicity problem the old sidecar file had.
+
+    Uses ``os.pwrite``/``os.ftruncate`` on the raw fd instead of ``fh.write()``/
+    ``fh.truncate()``/``fh.flush()``. ``fh`` is a buffered ``r+b`` file object
+    (see ``_open_lock``): if ``fh.write()`` succeeds but a later
+    ``fh.truncate()`` or ``fh.flush()`` fails (for example, disk full), the
+    ``try/except`` below would swallow that exception, but dirty data stays in
+    Python's internal buffer. That data then resurfaces as the SAME exception
+    later, uncaught, when ``file_lock()``'s cleanup calls ``fh.close()`` --
+    corrupting an otherwise clean exit from an already-finished protected
+    block. Raw ``os.pwrite``/``os.ftruncate`` bypass that buffer entirely, so a
+    failure there cannot leave dirty state behind in ``fh``.
+    """
+    try:
+        record: dict[str, object] = {
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        purpose = getattr(_held, "pending_purpose", None)
+        if purpose:
+            record["purpose"] = purpose
+        data = json.dumps(record).encode("utf-8")
+        fd = fh.fileno()
+        os.pwrite(fd, data, 0)
+        os.ftruncate(fd, len(data))
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, must not block acquisition
+        try:
+            logger.warning("failed to write lock holder record: %s", exc)
+        except Exception:  # noqa: BLE001 - a logging failure must not block acquisition either
+            pass
+
+
 def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
+    # Only exclusive acquisitions write a holder record. chroma.lock is held
+    # SHARED by several readers at once (#140); recording on a shared
+    # acquisition would let the last reader to enter overwrite an earlier
+    # reader's record with a value that does not mean "holder" at all, since
+    # there is no single holder to name.
     if os.name != "nt":
         operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         if timeout is None:
             fcntl.flock(fh, operation)
+            if not shared:
+                _record_holder(fh)
             return
 
         deadline = monotonic() + timeout
         while True:
             try:
                 fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                if not shared:
+                    _record_holder(fh)
                 return
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
@@ -537,7 +657,9 @@ def release_file_lock(fh: BinaryIO) -> None:
 
 
 @contextmanager
-def write_lock(data_dir: str | None = None, *, timeout: float | None = None) -> Iterator[None]:
+def write_lock(
+    data_dir: str | None = None, *, timeout: float | None = None, purpose: str | None = None
+) -> Iterator[None]:
     """Serialise writes that share the local stores.
 
     An omitted ``timeout`` gets ``default_lock_wait_timeout()`` from
@@ -550,12 +672,26 @@ def write_lock(data_dir: str | None = None, *, timeout: float | None = None) -> 
     documents for chroma.lock: a ``TimeoutError`` raised by the protected
     block itself must keep its own message, or an unrelated failure would be
     misreported as "another process holds write.lock".
+
+    ``purpose`` (#352) is carried only into the diagnostic holder record.
+    ``file_lock``'s signature is frozen (three other call sites depend on its
+    exact shape), so it cannot be passed through that. Instead it travels
+    through the thread-local ``_held.pending_purpose`` down to ``_acquire``.
+    That value is set right before the ``file_lock()`` call and cleared the
+    moment that call returns -- on success OR on ``TimeoutError`` -- rather
+    than after the whole protected block (past ``yield``): leaving it set
+    that long would let it leak into an unrelated lock (a per-store
+    ``write_lock()``, say) acquired later on the same thread inside this
+    block.
     """
     path = _lock_path("write.lock", data_dir or lock_data_dir())
     with ExitStack() as stack:
+        _held.pending_purpose = purpose
         try:
             stack.enter_context(file_lock("write.lock", data_dir, timeout=timeout))
         except TimeoutError as exc:
             resolved = timeout if timeout is not None else default_lock_wait_timeout()
             raise TimeoutError(write_lock_busy_message(path, resolved)) from exc
+        finally:
+            _held.pending_purpose = None
         yield
