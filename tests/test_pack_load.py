@@ -661,6 +661,50 @@ class TestLoadNodesIncremental:
         assert doc["properties"]["owner_id"] == _LIVE_TEST_USER, (
             "재기록이 일어났는데도 문서 sink 의 owner_id 가 낡은 값에 머물러 있다")
 
+    def test_doc_missing_owner_id_key_is_treated_as_stale_not_converged(
+        self, live, tmp_path
+    ):
+        """**#358 재리뷰 P1 회귀(codex review 5193878249).** 문서 sink 행이
+        존재하되 `properties` 에 `owner_id` 키 자체가 없으면(레거시·부분
+        이관 잔재), `doc_owner_ids.get(...)` 는 `None` 을 반환한다. 이전
+        비교식 `not in (None, principal.user_id)` 는 이 `None` 을 수렴으로
+        오판해 재스탬프를 영구히 건너뛰었다 — 그래프 쪽 비교
+        (`live[2].get("owner_id") != principal.user_id`)는 같은 키 부재를
+        `None != user_id` 로 재스탬프 대상에 넣는데 문서 쪽만 반대로
+        행동한 비대칭 결함이었다.
+
+        문서 sink 를 직접 드리프트시켜(write_gate 미경유) `owner_id` 키
+        자체를 지운다 — 인접 owner_id 값-불일치 테스트와 같은 기법이다.
+        """
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", owner_id=_LIVE_TEST_USER)])
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
+
+        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+        row = graph.get_node("Document", "n1")
+        assert row["owner_id"] == _LIVE_TEST_USER, "사전 조건: 그래프 owner_id 는 이미 현재 principal 이다"
+
+        doc = docs.get_node_doc("resource", "n1")
+        assert doc is not None, "사전 조건: 1차 런이 문서 sink 행을 남겼다"
+        drifted_props = dict(doc["properties"])
+        del drifted_props["owner_id"]
+        docs.upsert_node_doc("resource", "Document", "n1", drifted_props)
+        doc = docs.get_node_doc("resource", "n1")
+        assert "owner_id" not in doc["properties"], (
+            "사전 조건: 문서 sink 에서 owner_id 키 자체가 사라졌다")
+
+        assert _run() == (0, 1, 0, 0, 0), (
+            "문서 sink 에 owner_id 키가 아예 없는 행을 수렴으로 오판하면 "
+            "그 키가 영구히 복구되지 않는다(#358 재리뷰 P1)")
+        doc = docs.get_node_doc("resource", "n1")
+        assert doc["properties"]["owner_id"] == _LIVE_TEST_USER, (
+            "재기록이 일어났는데도 문서 sink 에 owner_id 키가 채워지지 않았다")
+
 
 class TestLoadEdges:
     def _map(self):

@@ -1977,14 +1977,30 @@ def load_nodes_incremental(
             # principal 로 스탬프됐어도 문서 sink 가 지난 부분 실패의 잔재로
             # 낡은 owner_id 를 그대로 담고 있을 수 있다. 조회 키는 이 노드의
             # **목표(이번 파일이 배정하는) space** 다 — 무관한 다른 space 의
-            # 문서 행이 섞여 들지 않는다. `None`(그 space 에 문서 행이 없거나
-            # 행은 있어도 owner_id 를 안 실은 경우)은 재스탬프 대상이 아니다 —
-            # 문서 행 부재 자체는 `doc_row_missing` 이 별도로 다룬다.
+            # 문서 행이 섞여 들지 않는다.
+            # `!=`(그래프 쪽 비교와 같은 형태, #358 재리뷰 P1 재수정): 문서
+            # 행이 그 space 에 아예 없는 경우와, 행은 있는데 `owner_id` 키
+            # 자체가 없는 경우가 둘 다 `.get(...)` 에서 `None` 으로 접힌다.
+            # 이전 버전은 `not in (None, principal.user_id)` 로 `None` 을
+            # 예외 처리해 두 경우 다 재스탬프 대상에서 뺐다 — 그래프 쪽은
+            # 키 부재를 `None != user_id` 로 재스탬프 대상에 넣는데 문서
+            # 쪽만 반대로 행동한 비대칭 결함이었다(codex 재리뷰,
+            # review 5193878249). **단, 이 동치는 일반 노드에 한정한다.**
+            # 일반 노드는 문서 행이 애초에 없는 경우 `!=` 로 바꿔도 outer
+            # if 가 False 로 떨어져 chg 로 낙하할 뿐이고 `doc_row_missing`
+            # 분기(그 안에서만 도달하는 로깅)는 단순히 안 거친다 — 최종
+            # 판정(chg)은 이전과 같다. 앵커는 다르다: `doc_row_missing` 이
+            # 앵커를 애초에 검사 대상에서 뺀다(아래 완전성 표) — 이전
+            # 버전은 그래서 앵커의 문서 행 부재를 same 으로 남겼다. 이번
+            # `!=` 수정은 앵커라도 owner_id 가 파일에 있고 문서 쪽 조회가
+            # None 이면 그 자리에서 outer if 를 False 로 떨어뜨려 chg 로
+            # 보낸다 — 앵커는 same 에서 chg 로 판정이 바뀐다(회수 방향
+            # 개선이라 안전하다).
             owner_id_needs_restamp = (
                 "owner_id" in props
                 and (
                     live[2].get("owner_id") != principal.user_id
-                    or doc_owner_ids.get((node_id, space)) not in (None, principal.user_id)
+                    or doc_owner_ids.get((node_id, space)) != principal.user_id
                 )
             )
             # live[1] == space(#358 재리뷰 P1-A): 그래프의 실제 space_id 컬럼과
@@ -1995,6 +2011,35 @@ def load_nodes_incremental(
             # 컬럼을 안 보면 same 으로 오판돼 그래프가 잘못된 space 에 영구히
             # 남는다. `live[1]` 이 None(레거시 미기록)이면 이 비교가 항상
             # 불일치라 chg 로 낙하한다 — 회수(backfill) 방향이라 안전하다.
+            #
+            # 싱크 완전성 표(#358 재리뷰, 리드 요청) — `add_node`
+            # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
+            # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
+            # 잡는지 전수 정리한다. 설계 근거:
+            # /home/asdf/orch-scratch/o358/design-r7-doc-owner-missing-key.md
+            #
+            # | 저장소                          | same 뒤 어긋날 수 있는가 | 잡는 조건                                    |
+            # |----------------------------------|--------------------------|-----------------------------------------------|
+            # | graph(노드+인접 edge 타입 스냅샷) | 그렇다(그래프 쓰기 실패) | live_props==file_props, live[1]==space(P1-A). edge 타입 스냅샷은 노드 갱신과 같은 트랜잭션(_sql_graph_base.py, neo4j_store.py)이라 독립 축이 아니다 |
+            # | docs(행 존재, 일반 노드)          | 그렇다                   | doc_row_missing(R2)                            |
+            # | docs(행 존재/공간 잔재, 앵커)     | **그렇다(의도적 미검사, 이번 라운드가 만든 gap 아님)** | 없음 — F4-b 가 doc_node_spaces 조회에서 앵커를 빼고, R2 가 doc_row_missing 에도 같은 제외를 걸어 그 오탐(앵커마다 매 런 행 부재로 오판)을 막았다. owner_id 재스탬프는 별도 조회(doc_owner_ids, 앵커 제외 없음)라 이 제외의 영향을 안 받는다 |
+            # | docs(공간 잔재, 일반 노드)        | 그렇다                   | _cleanup_stale_doc_spaces(F4-c)                |
+            # | docs.properties.owner_id          | 그렇다                   | doc_owner_ids OR-조건(P1-B, 이번 라운드 `!=` 로 재수정) |
+            # | docs.node_type                    | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음 — 문서 upsert 가 자기 node_type 컬럼도 쓰지만 이 비교는 그래프의 node_type 만 본다. owner_id 와 구조가 같은 gap 이나 #358 이 지목한 두 키(space/owner_id)에 안 든다. 별도 이슈 후보 |
+            # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음 — 일반 필드 전체의 그래프-문서 수렴 재설계는 별도 이슈 후보 |
+            # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음 — MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. 별도 이슈 후보 |
+            # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음 — node_identity_conflict 도 이 registry 를 안 본다. 별도 이슈 후보 |
+            # | vector(노드 임베딩)               | **그렇다, 이 PR 은 안 잡는다** | 없음 — load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴이 청크에는 있지만 노드에는 아직 없다. 별도 이슈 후보 |
+            #
+            # 표가 드러내는 것: docs.node_type, docs.properties.<그 외 필드>,
+            # docs(audit_log), sql(registry), vector(노드) 다섯 축은 이 PR 이
+            # 못 닫는다 — "add_node 가 여러 저장소에 나눠 쓰고 부분 실패가
+            # 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space/owner_id
+            # 대칭 필터)의 범위를 넘는다. 리드에 별도 이슈 후보로 보고한다.
+            # docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과 성격이 다르다 —
+            # 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
+            # R2(`1f97bb3`)가 이미 받아들인 기존 경계이므로 별도 이슈
+            # 후보로 묶지 않는다.
             if (live[0] == node_type and live_props == file_props
                     and live[1] == space
                     and not owner_id_needs_restamp):
