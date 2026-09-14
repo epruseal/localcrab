@@ -150,6 +150,16 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   등록부·벡터 쓰기 실패도 같은 이유로 이 문장의 대상이 아니다. "전체 적재 상태가 한 런에
   수렴한다"로 읽으면 안 된다.
 
+  그 재발은 관측 가능하다(#301). `load_nodes_incremental` 이 `doc_row_missing` 발동
+  횟수를 지역 카운터로 세어, 그 값이 0 보다 크면 루프 종료 직후 집계 `log.warning`
+  한 줄을 낸다. 이 값이 런마다 0 으로 안 떨어지면 doc 쓰기가 지속 실패 중이라는
+  뜻이다. 이 신호는 `doc_row_missing` 판정 자체(이번 런 시작 시점에 doc 스토어를
+  직접 읽은 사실)에서 나오고, `add_node` 가 반환하는 `res["stores"]["docs"]` 상태
+  문자열에는 기대지 않는다. 그 문자열은 문서 upsert 성공 뒤 같은 try 블록의
+  audit_log 실패(`MongoDB.log_event`)가 덮어써 오염될 수 있다(#375). 그래서 doc
+  자체는 잘 써졌는데 audit_log 만 실패한 경우를 이 신호는 "doc 쓰기 실패"로
+  오집계하지 않는다.
+
   **이 수렴은 CAS 갱신이 properties 를 전량 치환한다는 데 기댄다.** SQL 백엔드는 properties
   열을 통째로 쓴다. neo4j 는 사전 검사를 라이브 속성 재계산으로 하고 실제 쓰기는 저장된
   `node_digest` 속성으로 CAS 를 걸어 **출처가 둘**이다. 두 값이 갈리면 갱신이 0행을 잡아

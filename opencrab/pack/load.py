@@ -1873,9 +1873,20 @@ def load_nodes_incremental(
     다르다.
 
     반환: (n_new, n_chg, n_same, skip, err, bypack_ids)
+
+    #301: 이 함수는 doc 행 유실 회수(R2, 아래 `doc_row_missing`) 발동 횟수를
+    지역 카운터 `n_doc_recovered` 로 세지만 반환값에는 안 싣는다. 이 함수를
+    호출하는 프로덕션 코드가 없고(테스트만 이 6-tuple 을 언패킹한다) 반환
+    계약을 넓히면 그 콜사이트가 전부 바뀐다. 대신 진행 print 줄과 루프 종료
+    직후의 집계 `log.warning` 으로만 나간다. 이 카운터는 `add_node` 의
+    `res["stores"]["docs"]` 상태 문자열을 안 본다. 그 문자열은 #375(문서
+    upsert 성공 뒤 같은 try 블록의 audit_log 실패가 성공한 쓰기를 에러로
+    덮어쓴다)로 오염될 수 있다. `doc_row_missing` 은 이번 런 **시작 시점**의
+    `live_pack_state` 스냅샷에서 나온 사실이라 그 오염 경로에 안 걸린다.
     """
     require_live_data("load_nodes_incremental")
     n_new = n_chg = n_same = skip = err = 0
+    n_doc_recovered = 0
     bypack_ids: set[str] = set()
     # R3(#142 재리뷰): 파일이 확정한 노드별 최종 타입 — 루프 말미의 구 타입
     # 행 스윕이 대조 기준으로 쓴다. same-continue **앞**에서 수집해야 same
@@ -1962,6 +1973,9 @@ def load_nodes_incremental(
             # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과
             # 성격이 다르다. 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
             # R2(`1f97bb3`)가 이미 받아들인 기존 설계 경계이므로 이슈로 묶지 않는다.
+            # docs(행 존재, 일반 노드) 행의 재발 여부는 이 함수의 `n_doc_recovered`
+            # 집계 경고로 관측한다(#301). doc 쓰기가 지속 실패 중이면 이 값이
+            # 매 런 0 아래로 안 떨어진다.
             if (live[0] == node_type and live_props == file_props
                     and live[1] == space):
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
@@ -1982,9 +1996,10 @@ def load_nodes_incremental(
                     _cleanup_stale_doc_spaces(node_id, space)
                     done = n_new + n_chg + n_same + skip + err
                     if done % 500 == 0:
-                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered})", flush=True)
                     continue
                 log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
+                n_doc_recovered += 1  # #301: 집계. 매 런 0 이 아니면 doc 쓰기가 지속 실패 중이란 신호
                 # same 으로 안 잡고 아래 chg 경로로 낙하한다 — live[0]==node_type
                 # 이므로 stale_typed 는 자연히 None(구 타입 삭제 로직 미개입).
 
@@ -2075,7 +2090,16 @@ def load_nodes_incremental(
 
         done = n_new + n_chg + n_same + skip + err
         if done % 500 == 0:
-            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err})", flush=True)
+            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered})", flush=True)
+
+    # #301: doc 행 유실 회수(R2) 누적 집계. 매 런 0 이 아니면 doc 쓰기가
+    # 지속 실패 중이라는 신호다. R3 구 타입 스윕(아래)은 별개 축이라 이
+    # 집계 앞에서 낸다.
+    if n_doc_recovered:
+        log.warning(
+            "%s 증분 doc 행 유실 회수 누적 %d건(전체 chg=%d), 매 런 "
+            "반복되면 doc 쓰기가 지속 실패 중이라는 뜻이다(#301)",
+            pack_name, n_doc_recovered, n_chg)
 
     # ── R3(#142 재리뷰): 구 타입 행 구조적 회수(매 런) ──────────────────────
     # 위 저장-후-삭제 순서 안에서 `graph.delete_node` 가 실패하면(경합·스토어

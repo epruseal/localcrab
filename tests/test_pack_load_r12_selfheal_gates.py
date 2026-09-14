@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 
 from opencrab.pack import load as pack_load
@@ -230,6 +231,58 @@ class TestDocRowLossRecovery:
             "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
         assert (n_new2, n_chg2, n_same2, skip2, err2) == (0, 0, 1, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: {(n_new2, n_chg2, n_same2, skip2, err2)}")
+
+    def test_doc_recovery_emits_an_aggregate_warning_once(self, live, tmp_path, caplog):
+        """#301: doc 행 유실 회수가 발동하면 집계 경고가 뜨고, 다음 런이
+        same 으로 수렴하면 그 경고가 사라진다(1회성 유실, #279 형과 대조)."""
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", f, builder, {})
+        docs._conn.execute(
+            "DELETE FROM doc_nodes WHERE space=? AND node_id=?", ("resource", "n1"))
+        docs._conn.commit()
+
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        with caplog.at_level(logging.WARNING):
+            pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+        assert sum("유실 회수 누적" in r.getMessage() for r in caplog.records) == 1, (
+            "1회차는 유실 회수 누적 경고가 정확히 1번 떠야 한다")
+
+        caplog.clear()
+        state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        with caplog.at_level(logging.WARNING):
+            pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
+        assert not any("유실 회수 누적" in r.getMessage() for r in caplog.records), (
+            "2회차는 same 으로 수렴했으니 유실 회수 누적 경고가 없어야 한다"
+        )
+
+    def test_persistent_doc_write_failure_keeps_the_warning_recurring(
+            self, live, tmp_path, caplog):
+        """#301 본 시나리오: doc 쓰기가 매 런 계속 실패하면(행이 매번 없다)
+        회수 경로가 매 런 재발동하고, 집계 경고도 매 런 다시 떠야 한다
+        (#279 류 1회성 전이라면 2회차에 사라져야 하는데 여기서는 안
+        사라진다는 것이 대조점이다)."""
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", f, builder, {})
+
+        for _round in range(3):
+            docs._conn.execute(
+                "DELETE FROM doc_nodes WHERE space=? AND node_id=?", ("resource", "n1"))
+            docs._conn.commit()
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+                    "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                    state["doc_node_spaces"])
+            assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
+                f"매 회차 doc 행 유실이 chg 로 회수돼야 한다: {(n_new, n_chg, n_same, skip, err)}")
+            assert any("유실 회수 누적" in r.getMessage() for r in caplog.records), (
+                f"{_round + 1}회차에서 지속 유실 집계 경고가 안 떴다"
+            )
 
     def test_anchor_node_is_not_reloaded_when_doc_node_spaces_lacks_it(
             self, live, tmp_path):
