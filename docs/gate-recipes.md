@@ -126,13 +126,21 @@ pytest tests/ -v
   둔다:
 
   ```bash
+  set -o pipefail
   PYTEST_ADDOPTS= OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
   OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
   <워크트리>/.venv/bin/python -m pytest tests/ -v \
     --basetemp=/tmp/<워크트리 식별자>-basetemp \
     2>&1 | tee /tmp/<워크트리 식별자>-run.log
-  echo "EXIT:${PIPESTATUS[0]}"
+  echo "EXIT:$?"
   ```
+
+  종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
+  1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
+  `pipefail`은 bash와 zsh 양쪽에서 동일한 문법으로 동작해, 실행 셸이
+  둘 중 무엇이든 같은 명령이 재현된다(`tee`는 통상 0으로 종료하므로
+  `pipefail` 아래에서 `$?`는 파이프 왼쪽인 `pytest`의 종료 코드를 그대로
+  낸다).
 
   `OPENCRAB_SMOKE_BIN_DIR`은 "워크트리 경로만 바꾼다"는 위 규칙의 유일한
   예외다 — 값이 각 워크트리 자신의 `.venv/bin`이어야 하므로 base 실행과
