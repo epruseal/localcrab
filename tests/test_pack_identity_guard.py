@@ -822,7 +822,11 @@ def test_dispatch_tool_holds_the_write_lock_around_pack_ingest():
     state = {"depth": 0, "seen_inside": None}
 
     @contextmanager
-    def _spy_lock():
+    def _spy_lock(*args, **kwargs):
+        # dispatch_tool now calls _write_lock(purpose=...) (#352). This spy
+        # only pins that the lock is held around the handler call -- not
+        # what purpose string dispatch_tool passes -- so it accepts and
+        # ignores any arguments rather than pinning that unrelated detail.
         state["depth"] += 1
         try:
             yield
