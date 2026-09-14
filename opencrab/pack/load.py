@@ -53,7 +53,11 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-from opencrab.common.graph_identity import GraphMigrationConflict
+from opencrab.common.graph_identity import (
+    GraphMigrationConflict,
+    GraphPropertyValidationError,
+    prepare_node,
+)
 from opencrab.common.pack_tags import RETIRED_KEYS, apply_pack_tag, strip_retired_keys
 from opencrab.locking import file_lock, lock_data_dir
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
@@ -1924,60 +1928,84 @@ def load_nodes_incremental(
 
         live = live_nodes.get(node_id)
         if live is not None:
-            # **id/space/owner_id/pack 은 라이브 쪽에서만 뺀다, space 만 파일
-            # 쪽에서도 뺀다(#358).** `INCREMENTAL_IGNORED_KEYS`/
-            # `FILE_SIDE_IGNORED_KEYS` 의 정의(위 주석)가 설명하듯, space 는
-            # 양쪽에 다 나타날 수 있어 한쪽에서만 걸러내면 그 쪽에서만 키가
-            # 사라져 나머지 값이 전부 같아도 딕셔너리 비교가 깨진다. 파일
-            # 쪽이 레거시 중첩 `properties.space` 를 갖고 오는 노드가 매
-            # 증분 전량 chg 로 고정되는 것이 그 증상이다. 비교에만 쓰는
-            # 사본이므로 저장 시 넘기는 `props` 자체는 아래에서 그대로
-            # (필터 없이) 쓴다.
-            live_props = {k: v for k, v in live[2].items()
-                          if k not in INCREMENTAL_IGNORED_KEYS}
-            file_props = {k: v for k, v in props.items()
-                          if k not in FILE_SIDE_IGNORED_KEYS}
-            # live[1] == space(#358 재리뷰 P1-A): 그래프의 실제 space_id 컬럼과
-            # 이번 파일이 배정하는 목표 space 를 same 판정이 비교한다. 레거시
-            # 중첩 `properties.space` 를 실은 행의 space 전용 갱신이 그래프
-            # 쓰기 실패로 반쯤만 반영된 상태에서, `FILE_SIDE_IGNORED_KEYS` 가
-            # `space` 를 파일 쪽 properties 비교에서 빼는 이번 대칭화 때문에 이
-            # 컬럼을 안 보면 same 으로 오판돼 그래프가 잘못된 space 에 영구히
-            # 남는다. `live[1]` 이 None(레거시 미기록)이면 이 비교가 항상
-            # 불일치라 chg 로 낙하한다 — 회수(backfill) 방향이라 안전하다.
-            #
-            # 싱크 완전성 표(#358 재리뷰, 리드 요청) — `add_node`
-            # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
-            # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
-            # 잡는지 전수 정리한다. 설계 근거:
-            # /home/asdf/orch-scratch/o358/design-r7-doc-owner-missing-key.md
-            #
-            # | 저장소                          | same 뒤 어긋날 수 있는가 | 잡는 조건                                    |
-            # |----------------------------------|--------------------------|-----------------------------------------------|
-            # | graph(노드+인접 edge 타입 스냅샷) | 그렇다(그래프 쓰기 실패) | live_props==file_props, live[1]==space(P1-A). edge 타입 스냅샷은 노드 갱신과 같은 트랜잭션(_sql_graph_base.py, neo4j_store.py)이라 독립 축이 아니다 |
-            # | docs(행 존재, 일반 노드)          | 그렇다                   | doc_row_missing(R2)                            |
-            # | docs(행 존재/공간 잔재, 앵커)     | **그렇다(의도적 미검사, 이번 라운드가 만든 gap 아님)** | 없음. F4-b 가 doc_node_spaces 조회에서 앵커를 빼고, R2 가 doc_row_missing 에도 같은 제외를 걸어 그 오탐(앵커마다 매 런 행 부재로 오판)을 막았다 |
-            # | docs(공간 잔재, 일반 노드)        | 그렇다                   | _cleanup_stale_doc_spaces(F4-c)                |
-            # | docs.properties.owner_id          | **그렇다, 이 PR 은 안 잡는다(범위 좁힘, 위 상수 주석 참고)** | 없음. owner_id 는 스키마 정의가 없는 순수 시스템 스탬프 필드라 실 데이터에 파일 쪽 owner_id 가 실리지 않는다(2026-09-14 실측: grammar/schema 전역에 owner_id 필드 정의 0건). 안 실리면 재스탬프가 영영 안 되고, 실리면 매 런 전량 재기록이 된다. 양방향으로 어긋난 계약이라 #378 로 이관 |
-            # | docs.node_type                    | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. 문서 upsert 가 자기 node_type 컬럼도 쓰지만 이 비교는 그래프의 node_type 만 본다. same 판정이 문서 sink 자신의 값을 보지 않는 것과 같은 기전이라 #374 로 이관 |
-            # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음. 위 node_type 과 같은 기전(same 판정이 문서 sink 자신의 값을 안 본다)이라 #374 로 이관한다. codex 재리뷰(2026-09-14)가 지목한 부분 기록 잔존(원본이 properties.space 를 실은 채 다른 속성만 바뀌고 upsert_node_doc 실패)도 이 축이다. space 대칭 필터 이전에는 이 행들이 매 런 chg 로 강제돼 부분 기록 어긋남이 우연히 자가 치유됐다. 이 PR 이 그 우연한 치유를 없앤다 |
-            # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
-            # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
-            # | vector(노드 임베딩)               | **그렇다, 이 PR 은 안 잡는다** | 없음. load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴이 청크에는 있지만 노드에는 아직 없다. #377 로 이관 |
-            #
-            # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
-            # #374(same 판정이 문서 sink 자신의 값을 보지 않는다), docs(audit_log)
-            # 는 #375, sql(registry)는 #376, vector(노드)는 #377, owner_id 는
-            # #378 로 각각 이관했다. "add_node 가 여러 저장소에 나눠 쓰고 부분
-            # 실패가 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space 대칭
-            # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과
-            # 성격이 다르다. 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
-            # R2(`1f97bb3`)가 이미 받아들인 기존 설계 경계이므로 이슈로 묶지 않는다.
-            # docs(행 존재, 일반 노드) 행의 재발 여부는 이 함수의 `n_doc_recovered`
-            # 집계 경고로 관측한다(#301). doc 쓰기가 지속 실패 중이면 이 값이
-            # 매 런 0 아래로 안 떨어진다.
-            if (live[0] == node_type and live_props == file_props
-                    and live[1] == space):
+            # #379: same 판정 전에 `prepare_node()`(add_node 가 쓰는 것과
+            # 같은 정규화/검증 함수)를 raw `props` 에 통과시킨다. 필터로
+            # 키를 빼서 비교하기 전에 값 자체를 검증해, 필터가 불량 값을
+            # 함께 지워 same 으로 오판하는 부류(중첩 properties.space 타입
+            # 오류, 중첩 properties.id 불일치 등)를 필터 키 구성과 무관하게
+            # 막는다. 실패하면 cmp_ok=False, 이 행은 same 후보에서 빠지고
+            # raw space/props 를 그대로 쓴 기존 쓰기 시도 경로(아래)로 간다.
+            # 그 경로가 어떤 카운터(skip/chg/err)로 떨어지는지는 이 비교
+            # 단계가 정하지 않는다(설계 문서 첫 줄의 비약속 참고).
+            try:
+                cmp_node_type, cmp_props, cmp_space, _cmp_digest = prepare_node(
+                    node_type, node_id, props, space_id=space,
+                )
+            except (GraphPropertyValidationError, ValueError):
+                cmp_ok = False
+            else:
+                cmp_ok = True
+                # #301 등 이 행의 나머지 처리(doc 대사, 구 타입 스윕, 쓰기
+                # 시도)가 정규화된 space 와 정합하도록 raw 값을 대신한다.
+                # 재대입을 생략하면 top-level space=None + 중첩
+                # properties.space="concept" 조합에서 doc 정리가 raw
+                # None 을 보고 실제로 존재하는 doc space 를 전부 고아로
+                # 오판해 지운다.
+                space = cmp_space
+
+            is_same = False
+            if cmp_ok:
+                # id/space 는 `prepare_node` 가 `cmp_props` 에 항상 채워
+                # 넣는다. `normalize_node_properties` 가 "id" 를 node_id
+                # 로 강제하고 불일치는 여기서 이미 거부하며(중첩
+                # properties.id 불일치 방어), `normalize_space` 가 "space"
+                # 를 effective 값으로 채운다. 이 두 값의 동일성은 아래 딕셔너리
+                # 비교가 아니라 `live[0]==cmp_node_type`/`live[1]==cmp_space`
+                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 여기서 뺀다
+                # (안 빼면 `live[2]` 가 "id"/"space" 를 구조적으로 안 담는
+                # 라이브 스냅샷과 매번 chg 로 어긋난다, T7 회귀 실측). `owner_id`
+                # 는 `prepare_node` 가 손대지 않는 별도 스탬프 필드라 계속
+                # 뺀다(#378 로 이관, 위 상수 주석 참고). `RETIRED_KEYS` 도
+                # 계속 뺀다(도달 경로 없음, 이 이슈 범위 밖의 별도 정리 비용).
+                _cmp_drop = ("id", "space", "owner_id", *RETIRED_KEYS)
+                file_cmp = {k: v for k, v in cmp_props.items()
+                            if k not in _cmp_drop}
+                live_cmp = {k: v for k, v in live[2].items()
+                            if k not in _cmp_drop}
+                # 싱크 완전성 표(#358 재리뷰, 리드 요청). `add_node`
+                # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
+                # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
+                # 잡는지 전수 정리한다. 설계 근거:
+                # /home/asdf/orch-scratch/o358/design-r7-doc-owner-missing-key.md
+                #
+                # | 저장소                          | same 뒤 어긋날 수 있는가 | 잡는 조건                                    |
+                # |----------------------------------|--------------------------|-----------------------------------------------|
+                # | graph(노드+인접 edge 타입 스냅샷) | 그렇다(그래프 쓰기 실패) | file_cmp==live_cmp, live[1]==cmp_space(P1-A, #379 재검토). edge 타입 스냅샷은 노드 갱신과 같은 트랜잭션(_sql_graph_base.py, neo4j_store.py)이라 독립 축이 아니다 |
+                # | docs(행 존재, 일반 노드)          | 그렇다                   | doc_row_missing(R2)                            |
+                # | docs(행 존재/공간 잔재, 앵커)     | **그렇다(의도적 미검사, 이번 라운드가 만든 gap 아님)** | 없음. F4-b 가 doc_node_spaces 조회에서 앵커를 빼고, R2 가 doc_row_missing 에도 같은 제외를 걸어 그 오탐(앵커마다 매 런 행 부재로 오판)을 막았다 |
+                # | docs(공간 잔재, 일반 노드)        | 그렇다                   | _cleanup_stale_doc_spaces(F4-c)                |
+                # | docs.properties.owner_id          | **그렇다, 이 PR 은 안 잡는다(범위 좁힘, 위 상수 주석 참고)** | 없음. owner_id 는 스키마 정의가 없는 순수 시스템 스탬프 필드라 실 데이터에 파일 쪽 owner_id 가 실리지 않는다(2026-09-14 실측: grammar/schema 전역에 owner_id 필드 정의 0건). 안 실리면 재스탬프가 영영 안 되고, 실리면 매 런 전량 재기록이 된다. 양방향으로 어긋난 계약이라 #378 로 이관 |
+                # | docs.node_type                    | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. 문서 upsert 가 자기 node_type 컬럼도 쓰지만 이 비교는 그래프의 node_type 만 본다. same 판정이 문서 sink 자신의 값을 보지 않는 것과 같은 기전이라 #374 로 이관 |
+                # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음. 위 node_type 과 같은 기전(same 판정이 문서 sink 자신의 값을 안 본다)이라 #374 로 이관한다. codex 재리뷰(2026-09-14)가 지목한 부분 기록 잔존(원본이 properties.space 를 실은 채 다른 속성만 바뀌고 upsert_node_doc 실패)도 이 축이다. space 대칭 필터 이전에는 이 행들이 매 런 chg 로 강제돼 부분 기록 어긋남이 우연히 자가 치유됐다. 이 PR 이 그 우연한 치유를 없앤다 |
+                # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
+                # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
+                # | vector(노드 임베딩)               | **그렇다, 이 PR 은 안 잡는다** | 없음. load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴이 청크에는 있지만 노드에는 아직 없다. #377 로 이관 |
+                #
+                # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
+                # #374(same 판정이 문서 sink 자신의 값을 보지 않는다), docs(audit_log)
+                # 는 #375, sql(registry)는 #376, vector(노드)는 #377, owner_id 는
+                # #378 로 각각 이관했다. "add_node 가 여러 저장소에 나눠 쓰고 부분
+                # 실패가 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space 대칭
+                # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과
+                # 성격이 다르다. 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
+                # R2(`1f97bb3`)가 이미 받아들인 기존 설계 경계이므로 이슈로 묶지 않는다.
+                # docs(행 존재, 일반 노드) 행의 재발 여부는 이 함수의 `n_doc_recovered`
+                # 집계 경고로 관측한다(#301). doc 쓰기가 지속 실패 중이면 이 값이
+                # 매 런 0 아래로 안 떨어진다.
+                is_same = (live[0] == cmp_node_type and file_cmp == live_cmp
+                           and live[1] == cmp_space)
+
+            if is_same:
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                 # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
                 # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
