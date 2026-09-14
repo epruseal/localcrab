@@ -622,8 +622,8 @@ id 집합도 양쪽 다 `{test_a, test_b}`로 같다). 전량 id 집합 diff만�
 실행이 통과해야 한다):
 
 ```bash
-"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py <리포루트> --all [결과.json]
-"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
+"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py "<리포루트>" --all ["<결과.json>"]
+"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py "<리포루트>" <모듈> <테스트>[,<테스트>...] ["<결과.json>"]
 ```
 
 반드시 클론/워크트리 위에서 실행한다(대상 파일을 직접 변형했다가
