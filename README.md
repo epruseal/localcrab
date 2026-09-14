@@ -507,7 +507,7 @@ OPENCRAB_INTEGRATION=1 pytest tests/ -v
 `STORAGE_MODE=pg` (PGGraphStore/PgDocStore) 골든 파리티 테스트는 `OPENCRAB_PG_TEST_URL`
 로 접속하는 전용 PostgreSQL 인스턴스가 필요하며, 미설정 시 자동으로
 skip됩니다. 상세 설정과 tripwire 동작은
-[`docs/gate-recipes.md`](docs/gate-recipes.md) 4번·6번 절을 참고하세요.
+[`docs/gate-recipes.md`](docs/gate-recipes.md) 4번, 6번 절을 참고하세요.
 
 ---
 
