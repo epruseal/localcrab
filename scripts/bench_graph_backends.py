@@ -59,7 +59,8 @@ OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"
 def load_nodes(n: int) -> list[dict]:
     """nodes.jsonl 에서 앞 n 개를 읽어 반환."""
     nodes = []
-    with open(NODES_JSONL, encoding="utf-8") as f:
+    # newline="\n": 레코드 경계를 LF 하나로 고정한다(#382, import_pack_graph_to_neo4j.py 참고).
+    with open(NODES_JSONL, encoding="utf-8", newline="\n") as f:
         for i, line in enumerate(f):
             if i >= n:
                 break
@@ -70,7 +71,7 @@ def load_nodes(n: int) -> list[dict]:
 def load_edges(node_ids: set[str]) -> list[dict]:
     """양 끝점이 node_ids 에 속하는 엣지만 반환."""
     edges = []
-    with open(EDGES_JSONL, encoding="utf-8") as f:
+    with open(EDGES_JSONL, encoding="utf-8", newline="\n") as f:
         for line in f:
             e = json.loads(line)
             if e.get("from_id") in node_ids and e.get("to_id") in node_ids:

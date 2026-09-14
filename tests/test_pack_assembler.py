@@ -1,11 +1,12 @@
 import json
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from opencrab.pack import assemble_pack_v1
-from opencrab.pack.assembler import _quality_report
+from opencrab.pack.assembler import _quality_report, _read_jsonl, _write_jsonl
 
 
 def test_assemble_pack_v1_from_neo4j_ingest(tmp_path: Path):
@@ -156,3 +157,48 @@ def test_quality_report_no_longer_emits_hardcoded_placeholder_metrics():
     report = _quality_report([], [], [])
     for key in ("parsing_completeness", "ocr_completeness", "clip_coverage", "chunk_coverage", "multihop_path_coverage"):
         assert key not in report["summary"]
+
+
+# --- #382: _read_jsonl/_write_jsonl 은 레코드 경계를 LF 하나로만 인식한다 ---
+
+
+def test_read_jsonl_structural_cr_is_not_a_record_boundary(tmp_path: Path):
+    """JSON 문자열 값 안의 구조적 CR 은 레코드 경계가 아니다.
+
+    수정 전에는 `path.read_text(encoding="utf-8").splitlines()`가 CR 을 줄 경계로
+    삼아 레코드를 조용히 둘로 쪼갰다(#382)."""
+    p = tmp_path / "rows.jsonl"
+    with p.open("w", encoding="utf-8", newline="") as f:
+        f.write('{"a":\r1}\n{"b":2}\n')
+    assert _read_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+
+def test_read_jsonl_unicode_line_separator_in_string_value_is_not_a_record_boundary(tmp_path: Path):
+    """U+2028(LINE SEPARATOR)이 JSON 문자열 값 안에 리터럴로 있어도 레코드를 쪼개지 않는다.
+
+    `str.splitlines()`는 U+2028 도 줄 경계로 잡는다. `ensure_ascii=False`로 직렬화해야
+    이스케이프 시퀀스가 아니라 리터럴 문자로 남는다(#382)."""
+    p = tmp_path / "rows.jsonl"
+    row = json.dumps({"id": "n1", "note": "a b"}, ensure_ascii=False)
+    assert "\\u2028" not in row, "ensure_ascii=False 인데도 이스케이프됐다면 테스트 전제가 깨진다"
+    p.write_text(row + "\n" + json.dumps({"id": "n2"}) + "\n", encoding="utf-8", newline="")
+    assert _read_jsonl(p) == [{"id": "n1", "note": "a b"}, {"id": "n2"}]
+
+
+def test_read_jsonl_unicode_paragraph_separator_in_string_value_is_not_a_record_boundary(tmp_path: Path):
+    """U+2029(PARAGRAPH SEPARATOR)도 U+2028과 독립으로 고정한다(둘 중 하나만 고치는
+    변형 구현이 나오면 이 케이스만 걸릴 수 있어 별도 테스트로 둔다, #382)."""
+    p = tmp_path / "rows.jsonl"
+    row = json.dumps({"id": "n1", "note": "a b"}, ensure_ascii=False)
+    assert "\\u2029" not in row, "ensure_ascii=False 인데도 이스케이프됐다면 테스트 전제가 깨진다"
+    p.write_text(row + "\n" + json.dumps({"id": "n2"}) + "\n", encoding="utf-8", newline="")
+    assert _read_jsonl(p) == [{"id": "n1", "note": "a b"}, {"id": "n2"}]
+
+
+def test_write_jsonl_uses_lf_newline_argument(tmp_path: Path):
+    """`os.linesep == "\\n"` 인 Linux 에서는 바이트 비교로 역변이를 검출할 수 없다.
+    `Path.write_text` 호출 인자에 `newline="\\n"`이 실제로 전달되는지 직접 확인한다."""
+    p = tmp_path / "rows.jsonl"
+    with patch("pathlib.Path.write_text", autospec=True) as mock_write_text:
+        _write_jsonl(p, [{"id": "n1"}])
+    assert mock_write_text.call_args.kwargs.get("newline") == "\n"

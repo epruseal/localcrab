@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -468,3 +469,78 @@ def test_recorder_shim_bakes_paths_as_constants(tmp_path):
     assert str(tmp_path / "rec") in source
     assert "os.environ[" not in source
     assert "environ.get" not in source
+
+
+# --------------------------------------------------------------------------
+# #382: provider_log 파싱은 레코드 경계를 LF 하나로만 인식한다
+# --------------------------------------------------------------------------
+
+
+def _mutating_decision_line_index(provider_log: str) -> int:
+    lines = provider_log.split("\n")
+    return next(
+        i for i, ln in enumerate(lines)
+        if FIXTURE_NONCE in ln and '"type": "tool_call"' in ln
+    )
+
+
+def test_structural_cr_in_provider_log_line_is_not_a_record_boundary():
+    """decision 이벤트 줄의 콜론 뒤 구조적 CR 은 레코드 경계가 아니다.
+
+    JSON 은 토큰 사이 공백으로 스페이스/탭/LF/CR 을 모두 허용한다.
+    `splitlines()`를 쓰면 이 CR 을 줄 경계로 잡아 이 줄을 조용히 둘로 쪼개고,
+    쪼개진 두 조각 모두 `json.loads`에 실패해 이 레코드가 사라진다(#382)."""
+    data = _load()
+    lines = data["provider_log"].split("\n")
+    idx = _mutating_decision_line_index(data["provider_log"])
+    lines[idx] = lines[idx].replace('"ts":', '"ts":\r', 1)
+    data["provider_log"] = "\n".join(lines)
+
+    verdict = verify_evidence(**data)
+    assert verdict.passed, verdict.render()
+
+
+def test_unicode_line_separator_in_provider_log_line_is_not_a_record_boundary():
+    """U+2028(LINE SEPARATOR)이 decision 이벤트 줄의 JSON 문자열 값 안에 리터럴로
+    있어도 레코드 경계가 아니다.
+
+    `str.splitlines()`는 U+2028 도 줄 경계로 잡는다. JSON 의 토큰 사이 공백으로
+    유효한 문자는 스페이스/탭/LF/CR 뿐이라 U+2028을 구조적 위치(토큰 사이)에
+    두면 수정 전후 모두 `json.loads`가 실패해 프레임 0건이 되고, 이 테스트는
+    아무 회귀도 검출하지 못한다(3라운드 codex 실측). 그래서 문자열 값 내부에
+    둔다: 수정 전(`splitlines()`) 이 줄이 사라져 실패하고, 수정 후
+    (`split("\\n")`) 정상 인식된다."""
+    data = _load()
+    lines = data["provider_log"].split("\n")
+    idx = _mutating_decision_line_index(data["provider_log"])
+    obj = json.loads(lines[idx])
+    obj["payload"]["decoy"] = "left right"
+    mutated = json.dumps(obj, ensure_ascii=False)
+    assert " " in mutated, "리터럴 U+2028 이 이스케이프됐다면 테스트 전제가 깨진다"
+    lines[idx] = mutated
+    data["provider_log"] = "\n".join(lines)
+
+    verdict = verify_evidence(**data)
+    assert verdict.passed, verdict.render()
+
+
+def test_verify_openclaw_e2e_read_preserves_crlf_without_pretranslation(tmp_path):
+    """승격된 `scripts/verify_openclaw_e2e.py`의 top-level `read()`는 CRLF 를
+    사전 번역하지 않는다.
+
+    기본 텍스트모드의 universal-newlines 번역은 파일을 여는 시점에 이미 CRLF 를
+    LF 로 합쳐, 하류 `_parse_frames`/`verify_evidence` 가 CR 을 볼 기회 자체를
+    없앤다(#382). `newline=""` 로 열어야 원문이 그대로 남는다. 파일이 없을 때
+    빈 문자열을 돌려주는 폴백도 함께 확인한다."""
+    spec = importlib.util.spec_from_file_location(
+        "verify_openclaw_e2e_char", REPO_ROOT / "scripts" / "verify_openclaw_e2e.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    p = tmp_path / "log.raw"
+    p.write_bytes(b'{"a":1}\r\n{"b":2}\r\n')
+
+    assert module.read(p) == '{"a":1}\r\n{"b":2}\r\n'
+    assert module.read(tmp_path / "missing.raw") == ""

@@ -140,8 +140,12 @@ def jsonl_exists(path: Path | str) -> bool:
 
 
 def count_jsonl(path: Path | str) -> int:
-    """전 shard 라인수 합 (wc -l 동등, 스트리밍)."""
-    return sum(sum(1 for _ in open(p, encoding="utf-8")) for p in shard_paths(path))
+    """전 shard 라인수 합 (wc -l 동등, 스트리밍).
+
+    `newline="\\n"` 로 열어 레코드 경계를 LF 하나로 고정한다. 기본값(`newline=None`)의
+    universal-newlines 번역은 홑 CR 도 줄 경계로 삼아, JSON 문자열 값 안에 구조적으로
+    유효한 CR 이 있으면 그 레코드를 조용히 둘로 쪼갠다(#382)."""
+    return sum(sum(1 for _ in open(p, encoding="utf-8", newline="\n")) for p in shard_paths(path))
 
 
 def logical_sha256(path: Path | str) -> str:
@@ -158,12 +162,14 @@ def logical_sha256(path: Path | str) -> str:
 
 
 def iter_jsonl_lines(path: Path | str, missing_ok: bool = False) -> Iterator[str]:
-    """파싱 없는 raw 라인 스트림(개행 제거, 빈 줄 포함) — 자체 파싱/오류집계 소비자용."""
+    """파싱 없는 raw 라인 스트림(개행 제거, 빈 줄 포함): 자체 파싱/오류집계 소비자용.
+
+    `newline="\\n"` 로 열어 레코드 경계를 LF 하나로 고정한다(#382, count_jsonl 참고)."""
     paths = shard_paths(path)
     if not paths and not missing_ok:
         raise FileNotFoundError(f"jsonl 없음(단일/분할 모두): {path}")
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with open(p, encoding="utf-8", newline="\n") as f:
             for line in f:
                 yield line.rstrip("\n")
 
@@ -193,7 +199,9 @@ class ShardedAppender:
         self.current = paths[-1] if paths else self.logical
         self.size = self.current.stat().st_size if self.current.exists() else 0
         self.logical.parent.mkdir(parents=True, exist_ok=True)
-        self._f = open(self.current, "a", encoding="utf-8")
+        # newline="\n": 쓰기 계약을 읽기 계약(count_jsonl/iter_jsonl_lines)과 대칭으로
+        # 만든다. Linux(os.linesep == "\n")에서는 바이트 출력을 바꾸지 않는다(#382).
+        self._f = open(self.current, "a", encoding="utf-8", newline="\n")
 
     def _rollover(self):
         # close() 를 지워도 결과는 같다(2026-08-05 측정: 20KB 버퍼 잔류 상태에서도 첫 shard
@@ -209,7 +217,7 @@ class ShardedAppender:
         # `chunks.v1.03` 이 되고 rsplit(".", 2)[1] 은 'v1' 을 집어 int() 에서 터진다.
         idx = int(self.current.stem.rsplit(".", 1)[1]) + 1
         self.current = _shard_path(self.logical, idx)
-        self._f = open(self.current, "a", encoding="utf-8")
+        self._f = open(self.current, "a", encoding="utf-8", newline="\n")
         self.size = 0
 
     def write_line(self, line: str):
@@ -260,7 +268,7 @@ def write_jsonl_sharded(path: Path | str, records, limit: int = None) -> list[Pa
 
     def _open(p: Path):
         nonlocal f
-        f = open(p, "w", encoding="utf-8")
+        f = open(p, "w", encoding="utf-8", newline="\n")
         written.append(p)
 
     _open(cur)

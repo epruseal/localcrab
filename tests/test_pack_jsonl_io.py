@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -246,6 +247,84 @@ class TestReadAndLoudFail:
         names = [s.name for s in shard_paths(p)]
         assert names == sorted(names)
         assert len(names) > 9, "두 자리 정렬 문제를 드러내려면 10개 이상 필요"
+
+    # -- #382: 레코드 경계는 LF 하나만이다 (홑 CR/CRLF 를 경계로 오인하지 않는다) --
+
+    def test_structural_cr_inside_one_record_is_not_a_record_boundary(self, p):
+        """JSON 문자열 값 안의 구조적 CR 은 레코드 경계가 아니다.
+
+        수정 전에는 기본 텍스트모드가 CR 을 줄 경계로 삼아 `{"a":` 가 불완전한
+        JSON 조각으로 잘려 `json.JSONDecodeError` 가 났다(#382).
+        """
+        p.write_text('{"a":\r1}\n{"b":2}\n', encoding="utf-8", newline="")
+        assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
+
+    def test_iter_jsonl_lines_preserves_lone_cr_as_content(self, p):
+        p.write_text('{"a":\r1}\n{"b":2}\n', encoding="utf-8", newline="")
+        lines = list(iter_jsonl_lines(p))
+        assert lines == ['{"a":\r1}', '{"b":2}']
+
+    def test_count_jsonl_does_not_split_on_lone_cr(self, p):
+        """count_jsonl 은 iter_jsonl_lines 를 쓰지 않는 독립 구현이라 별도 확인이 필요하다."""
+        p.write_text('{"a":\r1}\n{"b":2}\n', encoding="utf-8", newline="")
+        assert count_jsonl(p) == 2
+
+    def test_crlf_file_reads_correct_record_count(self, p):
+        """대조군: CRLF 는 수정 전에도 우연히 통과하지만 회귀 방지로 고정해 둔다."""
+        p.write_text('{"a":1}\r\n{"b":2}\r\n', encoding="utf-8", newline="")
+        assert count_jsonl(p) == 2
+        assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
+
+
+class TestWriteOpenUsesLfNewlineArgument:
+    """쓰기 쪽 `newline="\\n"` 은 Linux 에서 바이트 출력을 바꾸지 않아(os.linesep == "\\n")
+    바이트 비교로는 역변이를 검출할 수 없다. `open` 호출 인자를 직접 확인한다."""
+
+    def test_sharded_appender_init_open_uses_lf_newline_argument(self, tmp_path):
+        target = tmp_path / "chunks.jsonl"
+        real_open = open
+
+        def _spy(*args, **kwargs):
+            return real_open(*args, **kwargs)
+
+        with patch("opencrab.pack.jsonl_io.open", side_effect=_spy) as mock_open:
+            appender = ShardedAppender(target)
+            appender.close()
+        assert any(
+            call.args[:1] == (target,) and call.kwargs.get("newline") == "\n"
+            for call in mock_open.call_args_list
+        ), mock_open.call_args_list
+
+    def test_sharded_appender_rollover_open_uses_lf_newline_argument(self, tmp_path):
+        target = tmp_path / "chunks.jsonl"
+        appender = ShardedAppender(target, limit=1)
+        appender.write_line('{"id":0}')  # size>0 이 되어야 다음 write 가 롤오버한다
+        real_open = open
+
+        def _spy(*args, **kwargs):
+            return real_open(*args, **kwargs)
+
+        with patch("opencrab.pack.jsonl_io.open", side_effect=_spy) as mock_open:
+            appender.write_line('{"id":1}')  # 롤오버를 트리거
+        appender.close()
+        assert any(
+            call.kwargs.get("newline") == "\n"
+            for call in mock_open.call_args_list
+        ), mock_open.call_args_list
+
+    def test_write_jsonl_sharded_open_uses_lf_newline_argument(self, tmp_path):
+        target = tmp_path / "chunks.jsonl"
+        real_open = open
+
+        def _spy(*args, **kwargs):
+            return real_open(*args, **kwargs)
+
+        with patch("opencrab.pack.jsonl_io.open", side_effect=_spy) as mock_open:
+            write_jsonl_sharded(target, [rec(0)])
+        assert any(
+            call.kwargs.get("newline") == "\n"
+            for call in mock_open.call_args_list
+        ), mock_open.call_args_list
 
 
 # ---------------------------------------------------------------------------

@@ -114,7 +114,10 @@ def _parse_frames(raw: str) -> list[dict]:
     기록기가 바이트 tee 라 부분 프레임이 남을 수 있으므로 관대하게 읽는다.
     """
     frames = []
-    for line in raw.splitlines():
+    # split("\n"): 레코드 경계를 LF 하나로 고정한다. splitlines() 는 VT/FF/FS/GS/RS/
+    # NEL/U+2028/U+2029 까지 경계로 잡아, JSON 문자열 값 안에 유효하게 나타날 수 있는
+    # 이 문자들이 있으면 프레임을 조용히 쪼갠다(#382).
+    for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -165,7 +168,8 @@ def verify_evidence(
 
     # --- provider 측: 드라이버가 난수를 인자로 실어 보냈는가 ---
     provider_events = []
-    for line in provider_log.splitlines():
+    # split("\n"): _parse_frames 와 동일한 근거로 레코드 경계를 LF 하나로 고정한다(#382).
+    for line in provider_log.split("\n"):
         line = line.strip()
         if not line:
             continue

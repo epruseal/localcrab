@@ -62,6 +62,22 @@ def run_env(home: Path, tmpdir: Path, path_dirs: list[str]) -> dict:
     }
 
 
+def read(p: Path, *, errors: str = "replace") -> str:
+    """파일을 번역 없이 통째로 읽는다. 파일이 없으면 빈 문자열.
+
+    `newline=""` 로 열어 CR/CRLF 를 원문 그대로 보존한다(기본 텍스트모드의
+    universal-newlines 번역은 열기 시점에 이미 CR 을 LF 로 합쳐, 하류
+    `_parse_frames`/`verify_evidence` 가 CR 을 볼 기회 자체를 없앤다, #382).
+    `Path.read_text(newline=...)` 는 Python 3.13 부터라 이 저장소의 최소 버전(3.11)
+    에서 못 쓴다(open(newline="") + read() 로 대체). `newline=""` 는 `.read()` 로
+    전체를 한 번에 읽을 때만 번역 없음을 보장하므로(줄 단위 반복에는 적용되지
+    않는다), 반드시 이 형태를 유지한다."""
+    if not p.exists():
+        return ""
+    with p.open(encoding="utf-8", newline="", errors=errors) as f:
+        return f.read()
+
+
 def write_client_config(home: Path, port: int) -> Path:
     """설치가 기록한 `plugins.entries` 를 보존한 채 provider 설정만 병합한다."""
     cfg_path = home / ".openclaw" / "openclaw.json"
@@ -233,9 +249,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("6/6 증거 판정")
-    def read(p: Path) -> str:
-        return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
-
     verdict = verify_evidence(
         nonce=nonce,
         client_to_server=read(record_dir / "client_to_server.raw"),
