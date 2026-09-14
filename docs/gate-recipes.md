@@ -264,6 +264,25 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
 차단하므로, 텍스트 grep 기반 판정에 필요했던 오염 회피용 플래그
 (`--force-short-summary` 등)는 더 필요 없다.
 
+이 문장은 통과/실패 판정과 개수 산출이 캡처 표준출력에 물들지
+않는다는 뜻이지, 로그를 전혀 읽지 않는다는 뜻은 아니다. 아래 4번은
+개수 자기 정합성을 확인하려고 로그의 `collected N items` 줄 하나를
+정규식으로 읽는다. 이 줄은 `system-out`에 담기는 캡처 표준출력이
+아니라 pytest 자신이 세션 시작 단계에서 표준출력에 직접 찍는
+배너이므로 위 오염 경로(테스트 코드가 캡처 표준출력에 위장 문자열을
+찍는 경로)에는 걸리지 않는다. 다만 `pytest_report_header` 훅으로
+임의 플러그인이 실제 수집 전에 같은 형태의 문자열을 먼저 찍을 수
+있고, 스크립트의 정규식은 첫 매치를 쓴다. 위조된 숫자가 이후 중단
+(`pytest.exit` 등)이 남긴 xml `tests` 값과 우연히 맞아떨어지면 4번이
+미완주를 완주로 오판정할 수 있다(실측: `pytest_report_header`가
+`collected 2 items`를 먼저 찍고 실제 수집은 4건인 상태에서 도중
+`pytest.exit(returncode=1)`로 중단하면 `VERDICT:COMPLETE tests=2
+failed_or_error=0`이 나온다). 이 저장소의 `conftest.py`들은
+`pytest_report_header`를 쓰지 않는다(재현 시점 실측:
+`grep -rln 'pytest_report_header' $(find . -name conftest.py)`가 빈
+결과). 단일 실행만 보는 4번에는 이 경로가 열려 있지만, 5번의 회귀
+diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
+
 ### 판정 절차
 
 1. 각 실행의 `BLOCK_EXIT` 값(재현 명령 맨 끝의 `echo "BLOCK_EXIT:$?"`가
@@ -400,6 +419,33 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
    이 저장소의 현재 `tests/`에는 두 패턴 다 실재하지 않는다(이번 실행
    로그가 `collected 6629 items`뿐이고 다른 형태가 없다).
 
+   위 두 경우는 단독으로는 안전한 방향(거짓 INCOMPLETE)이다. 하지만
+   세션 도중 `pytest.exit(...)`로 강제 중단되는 경우(위 3번이 참고한
+   PG tripwire 경로)와 겹치면 방향이 뒤집힐 수 있다. 중단은 xml
+   `tests`를 실제보다 적게 만들고, 위 두 경우는 `collected` 값을
+   실제보다 적게 만들거나 xml `tests`를 실제보다 많게 만든다. 두
+   어긋남이 우연히 상쇄되면 `tests == expected`가 성립해 미완주
+   실행이 `VERDICT:COMPLETE`로 나온다(실측: 모듈 하나를
+   `allow_module_level=True`로 건너뛰고 다른 지점에서
+   `pytest.exit(returncode=1)`로 중단시키면 계획된 테스트 전부가
+   실행되지 않았는데도 `VERDICT:COMPLETE tests=2 failed_or_error=0`이
+   나온다). 이 조합은 4번의 개수 대사 하나로는 못 잡는다. 다만 5번의
+   회귀 diff에서 base와 `tests=` 총량을 비교하면 그 감소가 이번
+   실행에서만 나고 base에는 없으므로 걸릴 여지가 있다: 단일 실행만
+   보는 4번은 못 잡고, base 대비 diff인 5번에서만 걸릴 수 있다는
+   뜻이다. 이런 조합은 흔치 않지만 우연한 상쇄가 가능하다는 사실
+   자체가 4번 단독의 보장 범위를 좁힌다.
+
+   네 번째로, 테스트 파일이나 디렉터리 이름에 대괄호 `[`가 있으면
+   pytest 자신의 `mangle_test_address`가 그 위치에서 먼저 잘라 정상
+   실행된 테스트인데도 `classname=""`로 xml에 남는다. 이 형태는 4번의
+   수집 에러 검사(`classname==""`이면 수집 에러로 판단)에 걸려, 실제로는
+   정상 실행되고 실패한 테스트를 수집 에러로 오분류해
+   `VERDICT:INCOMPLETE reason=collection-error`를 낸다(실측: 디렉터리
+   이름이 `case[1]`인 경로에 테스트를 두면 재현된다). 이 역시 안전한
+   방향(거짓 INCOMPLETE)이며, 사유 문자열이 원인을 오도할 뿐 판정을
+   뒤집지는 않는다.
+
    `reverse_id`는 `classname`(점으로 이어진 모듈/클래스 경로)을 뒤에서부터
    줄여가며 "이 접두어 + `.py`가 실제 파일로 존재하는가"를 검사하는
    후보를 전부 모은다. 후보가 정확히 하나면 그것을 모듈 경로로, 나머지를
@@ -444,6 +490,43 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
    parametrize id에 제어 문자가 들어가는 경우는 실무에서 사실상
    나타나지 않는다.
 
+   같은 공백이 디렉터리 이름에 마침표가 있을 때도 있다. 예를 들어
+   `tests/v1.2/test_dotdir.py`처럼 디렉터리 이름(`v1.2`) 자체에
+   마침표가 있으면, 파이썬 모듈 이름 제약은 파일명에는 걸려도
+   `__init__.py` 없는 디렉터리 이름에는 걸리지 않아 이 저장소가 쓰는
+   기본 수집 방식(`pyproject.toml`의 `addopts`에 `--import-mode`
+   미지정, pytest 기본값 `prepend`)에서 이 파일이 정상 수집되고
+   실행된다. 그러면 `reverse_id`가 실제로 불리는데, 후보 생성 루프는
+   "/"로만 분절하므로 `tests/v1/2/test_dotdir.py` 같은 존재하지 않는
+   조합만 시도해 후보 0건으로 `ValueError`를 던진다(실측:
+   `ValueError: no module path for classname='tests.v1.2.test_dotdir'
+   name='test_fail'`). 조용한 오매치는 아니지만 판정이 완결되지
+   않는다. `tests/a.b/test_real.py`와 그 나이브 분절 경로에 실재하는
+   `tests/a/b/test_real.py`가 동시에 있으면 후보가 정확히 하나(틀린
+   쪽)로 잡혀 조용히 틀린 id를 반환할 수도 있으나, 이 조합은 pytest가
+   두 실경로를 함께 수집해야 성립한다. 이 저장소가 쓰는 기본
+   `prepend` 수집 방식은 같은 basename(`test_real`)을 가리키는 두
+   실경로가 있으면 그 자체로 수집 오류를 내므로, 조용히 틀린 id를
+   반환하는 쪽은 `--import-mode=importlib`를 켜야만 성립하고 이
+   저장소의 현재 설정에서는 도달 불가하다.
+
+   pytest는 `record_xml_attribute`나 `record_testsuite_property` 같은
+   내장 fixture로 테스트 코드 스스로 xml의 `classname`/`name` 속성을
+   덮어쓰게 허용한다. 이 값이 실제 수집 경로와 다르지만 우연히 실재하는
+   모듈 경로 하나와 일치하면 `reverse_id`는 후보가 정확히 하나이므로
+   의심 없이 그 후보를 반환한다. 반환된 id는 문법적으로 멀쩡하지만
+   실제로 실패한 테스트와 다른 테스트를 가리킨다(실측:
+   `record_xml_attribute("classname", "tests.test_decoy")`로 덮어쓴
+   테스트가 실패하면 `reverse_id`는 `tests/test_decoy.py::test_decoy`를
+   돌려주고, 실제로 실패한 파일은 `tests/test_real.py`다). 이 값은
+   xml에 쓰이는 시점에 이미 테스트 코드가 바꿔 놓은 뒤라
+   `reverse_id` 코드로는 원본과 구분할 방법이 없다. 위 XML 이스케이프
+   공백과 같은 이유로 코드로 닫지 않고 노출로만 남긴다. 이 저장소의
+   `tests/`는 `record_xml_attribute`도 `record_testsuite_property`도
+   쓰지 않는다(재현 시점 실측:
+   `grep -rn 'record_xml_attribute\|record_testsuite_property' tests/`가
+   빈 결과).
+
    `VERDICT:UNTRUSTED`는 추출 개수와 `testsuite`의 `failures`+`errors`
    합이 어긋난다는 뜻이다(자기 점검). 이 경우도 diff를 신뢰하지 말고
    원인부터 조사한다.
@@ -468,6 +551,16 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
 deselect 조건, 리네임에 따른 재수집 실패 등). 그 감소가 PR 본문에
 의도로 명시돼 있지 않으면 회귀로 판단한다. `tests`가 base보다 큰
 경우(새 테스트 추가)는 정상 증가이므로 조사 대상이 아니다.
+
+`tests=` 비교로도 못 잡는 경우가 남는다. 통과하던 테스트 N개를
+지우거나 deselect하면서 같은 수의 새 테스트를 추가하면, 새 테스트가
+통과하는 한 실패/에러 id 집합도 `tests=` 총량도 그대로 같아 diff가
+"동일"을 낸다(실측: 통과 테스트 1개를 지우고 이름만 다른 통과 테스트
+1개를 더하면 두 실행 다 `VERDICT:COMPLETE tests=2 failed_or_error=0`
+이고 id 집합도 총량도 같다). 이 잔여 공백을 완전히 닫으려면 실패/에러
+id뿐 아니라 xml에 있는 testcase 전량의 id 집합을 base와 작업 양쪽에서
+뽑아 diff해야 한다(지금 스크립트는 실패/에러 id만 출력한다). 지금은
+그 전량 diff를 절차에 넣지 않고 알려진 잔여 공백으로만 남긴다.
 
 이 5단계는 방어가 서로 겹친다. 예를 들어 3번이 없어 xml 부재 상태로
 4번에 넘어가도 xml 파싱 자체가 예외로 죽고, 1번이 종료 코드를 기록하지
