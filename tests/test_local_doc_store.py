@@ -497,7 +497,7 @@ class TestCorruptCollection:
         write. ``_check_probes`` there treats any probe exception as
         "cannot verify" (fail-closed) and ``add_node`` raises ``ValueError``
         -- so a corrupt ``nodes.json`` blocks the whole node write, not just
-        the doc leg (stronger than the ``stores["docs"] = "error: ..."``
+        the doc leg (stronger than the ``stores["audit"] = "error: ..."``
         partial-receipt shape the ``audit_log.json`` case below produces)."""
         from opencrab.auth import Principal, principal_scope
 
@@ -515,6 +515,12 @@ class TestCorruptCollection:
         assert self._read(doc, "nodes") == corrupt
 
     def test_real_builder_corrupt_audit_log_receipt_error_node_still_written(self, tmp_path):
+        # #375: only the audit_log collection is corrupt here, not the
+        # nodes collection -- the doc-row write itself succeeds. Before
+        # this fix, the shared try block let the log_event failure
+        # overwrite "docs" to "error: ...", hiding the fact that the node
+        # was actually written. Now "docs" reports the write that actually
+        # happened, and "audit" carries the log_event failure separately.
         from opencrab.auth import Principal, principal_scope
         from opencrab.ontology.builder import store_write_succeeded_for
 
@@ -529,11 +535,11 @@ class TestCorruptCollection:
                 pack_id="pack-1",
             )
         stores = receipt["stores"]
-        assert stores["docs"].startswith("error: ")
+        assert stores["docs"].startswith("ok (")
         # #168: the receipt carries the exception's type name only, never
         # str(exc) -- "audit_log" (the corrupt collection's name) and its
         # filesystem path must not reach this response verbatim.
-        assert stores["docs"] == "error: CorruptCollectionError"
+        assert stores["audit"] == "error: CorruptCollectionError"
         assert stores["graph"] == "ok"
         assert store_write_succeeded_for(stores, "node") is True
         assert doc.get_node_doc("subject", "u2") is not None

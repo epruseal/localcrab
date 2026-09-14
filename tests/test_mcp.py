@@ -1146,6 +1146,7 @@ class TestOntologyBuilder:
             "docs": "skipped (graph unavailable)",
             "sql": "skipped (graph unavailable)",
             "vector": "skipped (graph unavailable)",
+            "audit": "skipped (graph unavailable)",
         }
 
     def test_add_node_invalid_space(self, builder, pack_id):

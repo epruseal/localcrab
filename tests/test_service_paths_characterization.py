@@ -785,11 +785,14 @@ class TestNodeEdgeWriteMCP:
         assert result["node_type"] == "User"
         # §1.3 수렴: builder 는 멀티스토어 결과를 역할 기반 키(graph/docs/sql/vector)로
         # 보고한다(이전의 백엔드 제품명 neo4j/mongodb/postgres/chroma 대신).
-        assert set(result["stores"].keys()) == {"graph", "docs", "sql", "vector"}
+        assert set(result["stores"].keys()) == {"graph", "docs", "sql", "vector", "audit"}
         assert result["stores"]["graph"] == "ok"
         assert result["stores"]["sql"] == "ok"
         assert result["stores"]["docs"].startswith("ok")
         assert result["stores"]["vector"] == "ok"
+        # #375: log_event success is reported under its own key, separate
+        # from the doc-row write's "docs" status.
+        assert result["stores"]["audit"] == "ok"
         # receipt_id/receipt_ts 는 비결정적 — 존재/타입만.
         assert isinstance(result["receipt_id"], str)
         assert isinstance(result["receipt_ts"], str)
@@ -885,10 +888,13 @@ class TestNodeEdgeWriteHTTP:
         expected_user_id, _secret = local_principal
         assert body["properties"]["owner_id"] == expected_user_id
         # §1.3 수렴: HTTP/MCP 모두 역할 기반 stores 키(graph/docs/sql/vector).
-        assert set(body["stores"].keys()) == {"graph", "docs", "sql", "vector"}
+        assert set(body["stores"].keys()) == {"graph", "docs", "sql", "vector", "audit"}
         assert body["stores"]["graph"] == "ok"
         assert body["stores"]["docs"].startswith("ok")
         assert body["stores"]["sql"] == "ok"
+        # #375: log_event success is reported under its own key, separate
+        # from the doc-row write's "docs" status.
+        assert body["stores"]["audit"] == "ok"
         # §1.6 수렴: HTTP 응답에도 receipt 가 생긴다.
         assert isinstance(body["receipt_id"], str)
         assert isinstance(body["receipt_ts"], str)

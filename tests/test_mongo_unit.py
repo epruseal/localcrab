@@ -342,6 +342,18 @@ class TestMongoStoreEdgeCases:
 
         assert store.upsert_node_doc("sp", "T", "n1", {}) == ""
 
+    def test_upsert_node_doc_returns_empty_string_when_id_lookup_raises(self):
+        # #375, same class of bug as builder.py's mongo block: the $set
+        # write in update_one already landed (no exception, upserted_id is
+        # falsy). The find_one below is only a best-effort lookup for an id
+        # to decorate the return value with. If it raises, that must not
+        # turn the write we already completed into a reported failure.
+        store, _client, mock_db = _make_connected_store()
+        mock_db["nodes"].update_one.return_value = MagicMock(upserted_id=None)
+        mock_db["nodes"].find_one.side_effect = RuntimeError("connection reset")
+
+        assert store.upsert_node_doc("sp", "T", "n1", {}) == ""
+
     def test_upsert_node_doc_no_owner_mirror_when_owner_id_absent(self):
         store, _client, mock_db = _make_connected_store()
         mock_db["nodes"].update_one.return_value = MagicMock(upserted_id="x")
@@ -502,7 +514,9 @@ class TestOntologyBuilderMongoAuditContract:
     def test_add_node_docs_marker_symmetric_success_case(self):
         # Symmetric normal-path check: add_node's mongo block (already
         # try/except-protected) continues to report "ok (id=<mongo_id>)"
-        # now that log_event returns a str instead of None.
+        # now that log_event returns a str instead of None. #375: also
+        # pins that a fully successful write now gets its own "audit": "ok"
+        # marker, separate from "docs".
         mongo = MagicMock(available=True)
         # #148: the identity guard probes the doc slot; a bare MagicMock
         # answers with another MagicMock, which is fail-closed.
@@ -518,4 +532,47 @@ class TestOntologyBuilderMongoAuditContract:
         )
 
         assert result["stores"]["docs"] == "ok (id=node-doc-1)"
+        assert result["stores"]["audit"] == "ok"
         mongo.log_event.assert_called_once()
+
+    def test_add_node_audit_marker_is_error_when_log_event_raises_after_doc_write_succeeds(self):
+        # #375 RED before the fix: a log_event-only failure used to
+        # overwrite the already-successful doc write's status to "error",
+        # corrupting downstream err aggregation and same/chg convergence
+        # judgments that read stores["docs"]. The doc write itself must
+        # keep reporting success; only "audit" carries the failure.
+        mongo = MagicMock(available=True)
+        mongo.get_node_doc.return_value = None
+        mongo.upsert_node_doc.return_value = "node-doc-2"
+        mongo.log_event.side_effect = RuntimeError("audit_log insert failed")
+        builder, pack_id = _make_builder(mongo)
+
+        result = builder.add_node(
+            "subject", "User", "u2",
+            {"name": "Bob", "email": "b@ex.com", "role": "admin"},
+            pack_id=pack_id,
+        )
+
+        assert result["stores"]["docs"] == "ok (id=node-doc-2)"
+        assert result["stores"]["audit"] == "error: RuntimeError"
+
+    def test_add_node_audit_marker_skipped_when_doc_write_itself_fails(self):
+        # #375, control-flow-unchanged half of the fix (§3-1): when the doc
+        # write itself fails, log_event must still not be attempted (same
+        # behavior as before this fix), and "audit" must not silently read
+        # as "unavailable" or "ok" -- it gets its own skip marker distinct
+        # from a genuine audit failure.
+        mongo = MagicMock(available=True)
+        mongo.get_node_doc.return_value = None
+        mongo.upsert_node_doc.side_effect = RuntimeError("nodes collection write failed")
+        builder, pack_id = _make_builder(mongo)
+
+        result = builder.add_node(
+            "subject", "User", "u3",
+            {"name": "Carol", "email": "c@ex.com", "role": "admin"},
+            pack_id=pack_id,
+        )
+
+        assert result["stores"]["docs"] == "error: RuntimeError"
+        assert result["stores"]["audit"] == "skipped (doc write failed)"
+        mongo.log_event.assert_not_called()

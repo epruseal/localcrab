@@ -289,6 +289,17 @@ class TestStoreWriteFailures:
         status2 = "unavailable (lookup_node_type not implemented)"
         assert store_write_failures({"graph": status2}) == [f"graph: {status2}"]
 
+    def test_error_audit_only_failure_is_a_failure(self):
+        """#375 requirement 3's policy: an audit-log-only failure still
+        counts as a load failure. This function scans every key generically
+        (no per-key allowlist except the graph special case above), so the
+        new "audit" key from add_node's split needs no code change here to
+        be picked up -- this pins that the generic scan actually covers it,
+        even though doc write and graph both succeeded."""
+        assert store_write_failures(
+            {"graph": "ok", "docs": "ok (id=n1)", "audit": "error: RuntimeError"}
+        ) == ["audit: error: RuntimeError"]
+
 
 class TestStoreWriteSucceeded:
     """#66 codex re-review (4th round), finding [2]: pins the exact success
@@ -655,6 +666,7 @@ class TestIngestIntoPack:
         assert result["stores"] == {
             "graph": "ok", "docs": "unavailable", "sql": "ok",
             "chromadb": "unavailable", "documents": "unavailable",
+            "audit": "unavailable",
         }
         assert result["text_ingested"] is True  # the attempt was made
         billing.on_ingest.assert_not_called()  # but nothing billable landed

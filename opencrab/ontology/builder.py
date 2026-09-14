@@ -329,6 +329,7 @@ class OntologyBuilder:
                 "docs": "skipped (graph unavailable)",
                 "sql": "skipped (graph unavailable)",
                 "vector": "skipped (graph unavailable)",
+                "audit": "skipped (graph unavailable)",
             }
             return output
 
@@ -376,9 +377,23 @@ class OntologyBuilder:
             output["stores"]["graph"] = "unavailable"
 
         # --- MongoDB write ---
+        # #375: the doc-row write (upsert_node_doc) and the audit log write
+        # (log_event) used to share this one try block, so a log_event-only
+        # failure overwrote an already-successful doc write's status to
+        # "error" -- corrupting stores["docs"] for every downstream reader
+        # (store_write_failures(), load.py's n_new/n_chg and stale-row
+        # cleanup gating, pack.py's added_nodes/partial). The nested
+        # try/except/else below keeps the exact control flow this code had
+        # before (log_event is still attempted only when upsert_node_doc
+        # succeeds) and only splits which store the failure attaches to.
         if self._mongo is not None and self._mongo.available:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
+            except Exception as exc:
+                logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
+                output["stores"]["docs"] = _safe_store_status(exc)
+                output["stores"]["audit"] = "skipped (doc write failed)"
+            else:
                 # store_write_succeeded() (below in this module) only
                 # recognizes exactly "ok" or the "ok (...)" shape (status ==
                 # "ok" or status.startswith("ok (")) as success — keep the
@@ -386,16 +401,19 @@ class OntologyBuilder:
                 # format ever changes, or this status silently stops being
                 # billed.
                 output["stores"]["docs"] = f"ok (id={mongo_id})"
-                self._mongo.log_event(
-                    "node_upsert",
-                    subject_id=principal.user_id,
-                    details={"space": space, "node_type": node_type, "node_id": node_id},
-                )
-            except Exception as exc:
-                logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
-                output["stores"]["docs"] = _safe_store_status(exc)
+                try:
+                    self._mongo.log_event(
+                        "node_upsert",
+                        subject_id=principal.user_id,
+                        details={"space": space, "node_type": node_type, "node_id": node_id},
+                    )
+                    output["stores"]["audit"] = "ok"
+                except Exception as exc:
+                    logger.warning("MongoDB audit log write failed for %s: %s", node_id, exc)
+                    output["stores"]["audit"] = _safe_store_status(exc)
         else:
             output["stores"]["docs"] = "unavailable"
+            output["stores"]["audit"] = "unavailable"
 
         # --- PostgreSQL registry write ---
         if self._sql is not None and self._sql.available:
