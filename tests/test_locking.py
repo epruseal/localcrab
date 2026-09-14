@@ -665,6 +665,35 @@ def test_open_lock_rejects_symlink_when_o_nofollow_is_unavailable(tmp_path, monk
     assert target.read_text() == "보호해야 할 원본 내용"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="os.mkfifo는 POSIX 전용이다")
+def test_write_lock_busy_message_does_not_block_on_a_fifo_lock_path(tmp_path):
+    """보안(PR #384 리뷰 5라운드): 타임아웃 뒤 진단용으로 보유자 레코드를
+    읽는 `_read_holder_record()`는 그 시점에는 `_open_lock()`의 보호를
+    이미 벗어난 경로를 연다. "write.lock" 자리가 FIFO로 바뀌어 있으면,
+    이 읽기가 반대편 writer가 열릴 때까지 무한정 블록해 "타임아웃을 새
+    예외로 바꾸지 않는다"는 이 함수 자신의 계약을 어길 수 있었다.
+
+    `signal.alarm()`을 안전망으로 두어, 회귀가 있으면(고쳐지기 전 코드로
+    돌아가면) 무한 대기 대신 여기서 명확히 실패하게 한다."""
+    import signal
+
+    def _on_alarm(signum, frame):
+        raise TimeoutError("write_lock_busy_message()가 FIFO에서 멈춘 것으로 보인다")
+
+    lock_path = tmp_path / "write.lock"
+    os.mkfifo(str(lock_path))
+
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(10)
+    try:
+        message = write_lock_busy_message(str(lock_path), 1.0)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    assert "Holder: unknown (no readable record)." in message
+
+
 def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
     """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
     tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가

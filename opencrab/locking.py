@@ -161,10 +161,30 @@ def _read_holder_record(lock_path: str) -> dict[str, object] | None:
     anomaly) but guard the logging call itself the same way
     ``safe_tool_error()`` does (``opencrab/mcp/tools/_registry.py``), so a
     failure in logging cannot propagate either.
+
+    By the time this runs, the caller has already given up waiting, so
+    *lock_path* is no longer protected by anything the way an in-progress
+    acquisition is -- the same substituted-path precondition the write-side
+    symlink and hard-link defenses on ``_open_lock`` above answer for
+    (#352 review, PR #384 round 5). Left as a plain ``open()``, a lock path
+    swapped for a FIFO would block this read until a writer opens the other
+    end, turning a best-effort diagnostic into an unbounded hang right where
+    its own contract promises the opposite. ``O_NONBLOCK`` (regular files
+    are unaffected by it) plus the ``S_ISREG`` check below close that off;
+    the ``O_NOFOLLOW``/``islink`` guard mirrors ``_open_lock``'s symlink
+    defense for the same reason.
     """
     try:
-        with open(lock_path, "rb") as fh:
-            data = fh.read(_MAX_HOLDER_RECORD_BYTES + 1)
+        if not _HAS_O_NOFOLLOW and os.path.islink(lock_path):
+            raise OSError(errno.ELOOP, "lock path is a symlink", lock_path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(lock_path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EPERM, "lock path is not a regular file", lock_path)
+            data = os.read(fd, _MAX_HOLDER_RECORD_BYTES + 1)
+        finally:
+            os.close(fd)
         if len(data) > _MAX_HOLDER_RECORD_BYTES:
             try:
                 logger.debug(
