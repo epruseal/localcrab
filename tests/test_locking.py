@@ -665,6 +665,22 @@ def test_open_lock_rejects_symlink_when_o_nofollow_is_unavailable(tmp_path, monk
     assert target.read_text() == "보호해야 할 원본 내용"
 
 
+def _call_write_lock_busy_message(lock_path: str, result_queue) -> None:
+    """회귀(FIFO 무한 대기)용 자식 프로세스 본체. 모듈 스코프인 이유는
+    `_hold_write_lock_report_pid`와 같다: fork가 아닌 시작 방식에서
+    로컬 함수는 피클링에 실패한다.
+
+    별도 프로세스로 호출하는 이유: `_read_holder_record()`의 넓은
+    `except Exception`이 SIGALRM 핸들러가 던지는 예외까지 삼켜 버려,
+    같은 프로세스 안에서 `signal.alarm()`으로 재현을 시도하면 회귀가
+    있어도 그 예외가 함수 안에서 조용히 흡수되고 "정상적으로 빨리
+    끝난 것"과 구분이 안 된다(실측으로 확인됨). 진짜 별도 프로세스면
+    이 문제가 없다: 블록되면 그 프로세스 자체가 살아남아 있다."""
+    from opencrab.locking import write_lock_busy_message
+
+    result_queue.put(write_lock_busy_message(lock_path, 1.0))
+
+
 @pytest.mark.skipif(os.name == "nt", reason="os.mkfifo는 POSIX 전용이다")
 def test_write_lock_busy_message_does_not_block_on_a_fifo_lock_path(tmp_path):
     """보안(PR #384 리뷰 5라운드): 타임아웃 뒤 진단용으로 보유자 레코드를
@@ -673,23 +689,32 @@ def test_write_lock_busy_message_does_not_block_on_a_fifo_lock_path(tmp_path):
     이 읽기가 반대편 writer가 열릴 때까지 무한정 블록해 "타임아웃을 새
     예외로 바꾸지 않는다"는 이 함수 자신의 계약을 어길 수 있었다.
 
-    `signal.alarm()`을 안전망으로 두어, 회귀가 있으면(고쳐지기 전 코드로
-    돌아가면) 무한 대기 대신 여기서 명확히 실패하게 한다."""
-    import signal
-
-    def _on_alarm(signum, frame):
-        raise TimeoutError("write_lock_busy_message()가 FIFO에서 멈춘 것으로 보인다")
+    진짜 별도 OS 프로세스에서 호출해 join(10)으로 시간을 가둔다. 회귀가
+    있으면 그 프로세스가 10초 뒤에도 살아 있는 것으로 드러난다(같은
+    프로세스 안에서 `signal.alarm()`을 쓰면 안 되는 이유는
+    `_call_write_lock_busy_message`의 설명을 본다)."""
+    import multiprocessing
 
     lock_path = tmp_path / "write.lock"
     os.mkfifo(str(lock_path))
 
-    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
-    signal.alarm(10)
+    result_queue = multiprocessing.Queue()
+    child = multiprocessing.Process(
+        target=_call_write_lock_busy_message, args=(str(lock_path), result_queue)
+    )
+    child.start()
     try:
-        message = write_lock_busy_message(str(lock_path), 1.0)
+        child.join(10)
+        blocked = child.is_alive()
+        if blocked:
+            child.terminate()
+            child.join(5)
+        assert not blocked, "write_lock_busy_message()가 FIFO에서 멈춰 10초 안에 끝나지 않았다"
+        message = result_queue.get(timeout=5)
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
 
     assert "Holder: unknown (no readable record)." in message
 
