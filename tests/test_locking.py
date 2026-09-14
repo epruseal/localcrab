@@ -598,7 +598,13 @@ def test_write_lock_timeout_names_the_real_holder_pid_across_processes(tmp_path)
     핸드셰이크(Event)로 "자식이 이미 락을 잡았다"를 확인한 뒤에만 부모가
     시도한다(v6 라운드 1 지적: 타이밍만 믿으면 거짓 성공이 날 수 있다). 자식
     회수는 `finally`에 둔다(라운드 2 지적: 끝에서만 회수하면 중간 단언 실패
-    시 자식이 남는다). 전체를 signal.alarm() 안전망으로 감싼다."""
+    시 자식이 남는다). 전체를 signal.alarm() 안전망으로 감싼다.
+
+    알람은 회수 단계에 들어가기 전에 해제한다(적대검증 라운드 2 지적: 회수
+    구간에서도 알람이 살아 있으면 `child.join(10)` 도중 알람이 울려
+    TimeoutError가 끼어들고, 뒤이은 terminate()/join()/생존 확인을 건너뛴 채
+    자식이 회수되지 않고 남는다). 회수 자체는 join(10)과 join(5)로 이미
+    시간이 갇혀 있으므로 알람 없이도 무한 대기하지 않는다."""
     import multiprocessing
     import signal
 
@@ -624,6 +630,10 @@ def test_write_lock_timeout_names_the_real_holder_pid_across_processes(tmp_path)
             assert f"pid={child_pid}" in str(exc_info.value)
             assert child_pid == child.pid
         finally:
+            # 회수 구간은 알람의 보호 대상이 아니다 -- join(10)/join(5) 자체가
+            # 이미 시간이 갇혀 있다. 여기서 먼저 해제해야 회수 도중 알람이
+            # 울려 terminate()/join()/생존 확인을 건너뛰는 경로가 없어진다.
+            signal.alarm(0)
             stop.set()
             child.join(10)
             if child.is_alive():
