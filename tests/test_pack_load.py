@@ -497,6 +497,35 @@ class TestLoadNodesIncremental:
         assert all("legacy_only_key" not in props for _t, _s, props in left.values()), (
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
+    def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path):
+        """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
+
+        파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
+        생산자가 흔히 쓰는 형태), `absorb_legacy_top_level` 이 그 중첩 값을
+        최상위 `space` 보다 우선해 최종 `props` 에 남긴다. 그런데 판정식은
+        `live_props == props` 로 파일 쪽 `props` 를 거르지 않은 채 그대로 쓴다.
+        라이브 쪽에는 스토어가 `space` 를 주입하고 그 값을 필터로 걸러내므로,
+        같은 키 하나가 파일 쪽에만 살아남아 두 딕셔너리가 영원히 다르게 남는다.
+
+        1차는 신규 적재라 `new` 가 정상이다. **불변식이 판정되는 자리는 2차다** —
+        같은 파일을 다시 돌렸을 때 라이브와 파일이 실제로는 동일한 노드인데도
+        `chg` 로 잡히면 증분이 이 노드에서 매 런 전량 재기록으로 퇴화한다.
+        """
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "nodes.jsonl",
+                          [_node(id="n1", properties={"space": "concept"})])
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])[:5]
+
+        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+        assert _run() == (0, 0, 1, 0, 0), (
+            "2차 런이 same 으로 수렴하지 않았다 — 파일 쪽 properties.space 가 "
+            "INCREMENTAL_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
+
 
 class TestLoadEdges:
     def _map(self):
