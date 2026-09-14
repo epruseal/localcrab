@@ -81,7 +81,18 @@ pytest tests/ -v
 - `OPENCRAB_PG_TEST_URL`: PG 파리티 테스트 게이트. DB명이 `_test`로 끝나야
   한다(아니면 세션 전체가 tripwire로 중단된다 — 6번 참고). 값의 예시는
   `Makefile`의 `test-pg` 타깃이 정본이다(이 문서에 리터럴 값을 다시 적지
-  않는다).
+  않는다). 로컬에 전용 PostgreSQL이 아직 없으면 먼저 준비한다(서비스
+  이름·컨테이너 이름·DB 준비 명령은 `docker-compose.yml`과 `Makefile`이
+  고정한 계약값이라 안 썩는다):
+
+  ```bash
+  docker compose up -d postgres
+  docker exec opencrab-postgres createdb -U opencrab opencrab_test  # 최초 1회
+  make test-pg  # 위 환경변수를 자동 설정하고 실행(6번의 재현 명령을 직접 써도 된다)
+  ```
+
+  CI(`.github/workflows/ci.yml`)도 같은 구성을 서비스 컨테이너로 띄운다(7번
+  대응표 참고).
 - `OPENCRAB_SMOKE_BIN_DIR`: 에이전트 플러그인 스모크 테스트의 PATH
   오버라이드. 미설정 시 `shutil.which("opencrab")`으로 폴백하며, 폴백도
   실패하면 스킵이 아니라 실패로 처리된다(의도된 설계 — `sys.executable`로
@@ -121,19 +132,33 @@ pytest tests/ -v
   는 이 저장소에 없으므로 전체 스위트 대사로 갈음한다.
 
   재현 명령은 아래 한 줄이며, base 실행과 작업 실행은 이 줄에서 `<워크트리>`
-  자리(파이썬 인터프리터 경로 1곳, 임시 경로·로그 파일명의 식별자 1곳)만
-  각자의 워크트리 경로로 바꿔 쓴다. 그 외 자리는 글자 그대로 동일하게
-  둔다:
+  자리(cd 대상 경로, 파이썬 인터프리터 경로, 임시 경로·로그 파일명의
+  식별자 — 전부 같은 워크트리를 가리키는 동일 값)만 각자의 워크트리
+  경로로 바꿔 쓴다. 그 외 자리는 글자 그대로 동일하게 둔다:
 
   ```bash
+  cd <워크트리>
   set -o pipefail
   PYTEST_ADDOPTS= OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
   OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
   <워크트리>/.venv/bin/python -m pytest tests/ -v \
     --basetemp=/tmp/<워크트리 식별자>-basetemp \
     2>&1 | tee /tmp/<워크트리 식별자>-run.log
-  echo "EXIT:$?"
+  echo "EXIT:$?" | tee -a /tmp/<워크트리 식별자>-run.log
   ```
+
+  종료 코드를 같은 로그 파일에 `-a`(append)로 이어 적는 이유는 판정
+  절차 1번("각 실행의 종료 코드를 기록한다")이 나중에 로그만 보고도
+  재확인 가능해야 하기 때문이다 — 터미널에만 찍히고 로그에 안 남으면
+  그 순간 지나간 값은 다시 볼 수 없다.
+
+  맨 앞의 `cd <워크트리>`는 생략할 수 없다: `tests/`는 cwd 기준 상대
+  경로이고, `python -m pytest`는 cwd를 `sys.path[0]`에 넣으므로 소스
+  트리까지 cwd를 따라간다. 2번 절과 반대로 여기서는 cwd가 대상
+  워크트리 자신이어야 그 워크트리의 테스트와 소스를 본다. `cd`가
+  실패하거나 엉뚱한 디렉터리에 머무르면 `tests/`를 못 찾아 pytest가
+  사용법 오류(4)나 미수집(5)으로 끝나며, 이는 아래 판정 절차 2번이 이미
+  미완주로 잡는다.
 
   종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
   1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
@@ -194,6 +219,17 @@ pytest tests/ -v
    경로는 이 저장소에 `pytest.exit` 호출 하나뿐인 PG tripwire뿐이며,
    그 경로는 이미 3번에서 먼저 걸린다 — `git grep -n "pytest.exit"`로
    호출부가 하나인지 그때그때 확인한다.) `N`과 합이 같으면 완주다.
+
+   **알려진 예외(완주인데도 합이 `N`보다 큰 경우)**: teardown 단계에서
+   에러가 나면 같은 테스트가 `passed`와 `error` 양쪽에 한 번씩 잡혀
+   합이 `N`을 넘을 수 있다(pytest의 report 단위 집계이지 테스트 단위
+   집계가 아니라서다 — 실측: 테스트 1개짜리 세션에서 teardown만
+   실패시키면 `collected 1 item` 대 `1 passed, 1 error`로 합 2가
+   나온다). 이 방향(합 > `N`)이 나오면 조기 종료가 아니라 teardown
+   에러부터 의심한다 — 로그의 `ERROR at teardown of` 줄 수만큼 초과분을
+   설명할 수 있으면 완주로 판정하고, 설명이 안 되는 초과분이 남으면
+   원인부터 조사한다. 반대 방향(합 < `N`)은 이 예외의 대상이 아니며
+   그대로 미완주로 본다.
 5. 완주가 확인되면 로그의 `FAILED`/`ERROR` 줄 id를 정렬된 집합으로
    (없으면 빈 집합으로) 뽑아 양쪽 다 항상 base와 diff한다(빈 집합끼리도
    diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 이때
