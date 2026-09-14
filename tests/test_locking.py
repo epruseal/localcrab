@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -636,6 +637,60 @@ def test_write_lock_refuses_a_hardlinked_lock_path(tmp_path):
             pass
 
     assert target.read_text() == "보호해야 할 원본 내용"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="os.mkfifo는 POSIX 전용이다")
+def test_open_lock_rejects_a_fifo_lock_path(tmp_path):
+    """보안(이중 적대검증 놓침 q): "write.lock" 자리가 FIFO면 거부한다.
+
+    `_open_lock`의 `st_nlink != 1` 검사는 FIFO를 잡지 못한다(FIFO의
+    st_nlink는 1이다). 그 자리를 잡는 것은 이어지는
+    `stat.S_ISREG(st.st_mode)` 검사뿐이다. 이 검사를 지운 변이체는 대신
+    `os.fdopen(fd, "r+b")`가 FIFO를 논블로킹 없이 열자마자 던지는
+    `io.UnsupportedOperation: ... not seekable`로 우연히 예외가 난다.
+    `io.UnsupportedOperation`은 `OSError`의 서브클래스라 심볼릭 링크/
+    하드링크 테스트처럼 `pytest.raises(OSError)`만 걸면 두 실패를
+    구분하지 못한다. 그래서 `errno`까지 특정해 원 코드의 의도된 EPERM
+    거부만 통과시킨다(`io.UnsupportedOperation`의 `errno`는 `None`이다).
+    """
+    import opencrab.locking as locking_module
+
+    lock_path = tmp_path / "write.lock"
+    os.mkfifo(str(lock_path))
+
+    with pytest.raises(OSError) as exc_info:
+        locking_module._open_lock(str(lock_path))
+
+    assert exc_info.value.errno == errno.EPERM
+    assert "not a dedicated regular file" in str(exc_info.value)
+
+
+def test_record_holder_write_failure_does_not_block_acquisition(tmp_path, monkeypatch, caplog):
+    """불변식(design-v8.md 3절, 이중 적대검증 놓침 e): 보유자 레코드를
+    쓰다 실패해도 잠금 획득 자체는 막히지 않는다.
+
+    `_record_holder()`는 `os.lseek`/`os.write`/`os.ftruncate`를 원시 fd에
+    호출하고 그 블록 전체를 `except Exception`으로 감싸 흡수하며 경고를
+    남긴다. 이 감싸기를 지운 변이체에서는 `os.write` 실패가 `_acquire()`를
+    빠져나가 `with file_lock(...)` 진입 자체가 실패한다. `os.write`만
+    실패시켜도 두 경로를 가른다(같은 `try` 블록 안이므로 `os.lseek`나
+    `os.ftruncate`를 막아도 동일한 효과이지만, 실제 디스크 풀 같은 실패가
+    드러나는 지점은 데이터 쓰기다).
+    """
+    import opencrab.locking as locking_module
+
+    def _raise(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(locking_module.os, "write", _raise)
+
+    entered = False
+    with caplog.at_level("WARNING"):
+        with file_lock("write.lock", str(tmp_path), timeout=1.0):
+            entered = True
+
+    assert entered, "레코드 쓰기 실패가 획득 자체를 막으면 안 된다"
+    assert any("failed to write lock holder record" in r.message for r in caplog.records)
 
 
 def test_open_lock_rejects_symlink_when_o_nofollow_is_unavailable(tmp_path, monkeypatch):
