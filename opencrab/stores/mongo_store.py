@@ -239,10 +239,22 @@ class MongoStore:
         )
         if result.upserted_id:
             return str(result.upserted_id)
-        # Return existing doc id
-        existing = self._db["nodes"].find_one(
-            {"space": space, "node_id": node_id}, {"_id": 1}
-        )
+        # The $set write above already landed (update_one returned without
+        # raising). The find_one below is a best-effort lookup for an id to
+        # decorate the caller's status string with, nothing more. If it
+        # raises, that must not turn the write we already completed into a
+        # reported failure (#375's class of bug: an id-lookup error masking
+        # a successful write).
+        try:
+            existing = self._db["nodes"].find_one(
+                {"space": space, "node_id": node_id}, {"_id": 1}
+            )
+        except Exception as exc:
+            logger.warning(
+                "upsert_node_doc: id lookup failed after a successful write "
+                "for %s/%s: %s", space, node_id, exc,
+            )
+            return ""
         return str(existing["_id"]) if existing else ""
 
     def get_node_doc(self, space: str, node_id: str) -> dict[str, Any] | None:

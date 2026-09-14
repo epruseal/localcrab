@@ -655,6 +655,7 @@ class TestIngestIntoPack:
         assert result["stores"] == {
             "graph": "ok", "docs": "unavailable", "sql": "ok",
             "chromadb": "unavailable", "documents": "unavailable",
+            "audit": "unavailable",
         }
         assert result["text_ingested"] is True  # the attempt was made
         billing.on_ingest.assert_not_called()  # but nothing billable landed
