@@ -604,9 +604,11 @@ class TestLoadNodesIncremental:
             "전체 적재라면 거부될 값이 증분에서만 통과한다(#379)")
 
     def test_nested_space_nan_is_not_same(self, live, tmp_path):
-        """**#379.** 중첩 `properties.space` 가 NaN 이어도 같은 부류다. 정수와는
-        다른 파이썬 타입(`float`)이 같은 문자열 타입 검사 분기를 타는지 별도
-        독립 조건으로 확인한다.
+        """**#379.** 중첩 `properties.space` 가 NaN 이어도 같은 부류다. NaN 은
+        `normalize_space` 의 문자열 타입 검사가 아니라, 그보다 먼저 실행되는
+        `normalize_node_properties` 내부 `_validate_json` 의 유한값 검사에서
+        거부된다(정수 `12345` 를 거부하는 코드 경로와 다르다). 이 값도
+        same 으로 통과하지 않는지 별도 독립 조건으로 확인한다.
         """
         builder, graph, docs = live
 
