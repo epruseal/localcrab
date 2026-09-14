@@ -115,7 +115,7 @@ def _lock_data_dir() -> str:
 
 
 @contextmanager
-def _write_lock():
+def _write_lock(purpose: str | None = None):
     """Hold an exclusive cross-process lock for the duration of a write tool.
 
     LOCK ORDER (#140): chroma.lock comes before write.lock anywhere both are
@@ -135,10 +135,15 @@ def _write_lock():
     with no timeout let one slow or crashed write-tool call block every
     other write tool call forever. ``write_lock`` bounds the wait by
     default and raises a clear error naming write.lock when it gives up.
+
+    ``purpose`` (#352) is diagnostic only. It ends up in the holder record
+    written into write.lock, and from there into a timeout error's message
+    for the next waiter. Omit it and the record still carries pid and
+    acquisition time, just no purpose text.
     """
     from opencrab.locking import write_lock
 
-    with write_lock(_lock_data_dir()):
+    with write_lock(_lock_data_dir(), purpose=purpose):
         yield
 
 

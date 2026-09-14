@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import math
 import os
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
 from time import monotonic, sleep
 from typing import BinaryIO
 
@@ -124,13 +127,119 @@ def _resolve_timeout(timeout: float | None) -> float:
     return timeout
 
 
+#: Upper bound on how much of write.lock this reads back (#352 review).
+#: A real holder record is a few hundred bytes of JSON. A file past this size
+#: is corrupt, foreign, or from a mixed-version deployment -- not a record
+#: this code can trust -- so it is treated as unreadable rather than fully
+#: read into memory. Without this bound, an oversized write.lock would make
+#: a best-effort diagnostic read allocate unbounded memory or run long,
+#: right when it must stay cheap: this call happens only after the caller
+#: already gave up waiting on the lock.
+_MAX_HOLDER_RECORD_BYTES = 65536
+
+
+def _read_holder_record(lock_path: str) -> dict[str, object] | None:
+    """Best-effort read of the diagnostic holder record left at *lock_path*.
+
+    Reads WITHOUT taking the lock. By the time this is called, the caller has
+    already given up waiting -- waiting on the lock again here would revive
+    the very wait this function exists to explain. Because it reads without
+    the lock, it can observe another process's write from ``_record_holder()``
+    mid-flight (a torn write). That is treated exactly like corrupt JSON
+    below: this function's contract is to absorb every kind of failure, not
+    to distinguish between them.
+
+    Reads at most ``_MAX_HOLDER_RECORD_BYTES`` bytes. A file that has more
+    left unread past that bound is treated as unreadable, the same as
+    corrupt JSON -- see ``_MAX_HOLDER_RECORD_BYTES`` for why.
+
+    Returns ``None`` if the file is missing, empty, unreadable, oversized,
+    not valid JSON, or parses to something other than a JSON object. A
+    diagnostic read must never replace a lock-wait timeout with a new
+    exception. All of these failure paths log (at ``debug``, since a
+    record-not-found state is often just "no exclusive holder yet", not an
+    anomaly) but guard the logging call itself the same way
+    ``safe_tool_error()`` does (``opencrab/mcp/tools/_registry.py``), so a
+    failure in logging cannot propagate either.
+
+    By the time this runs, the caller has already given up waiting, so
+    *lock_path* is no longer protected by anything the way an in-progress
+    acquisition is -- the same substituted-path precondition the write-side
+    symlink and hard-link defenses on ``_open_lock`` above answer for
+    (#352 review, PR #384 round 5). Left as a plain ``open()``, a lock path
+    swapped for a FIFO would block this read until a writer opens the other
+    end, turning a best-effort diagnostic into an unbounded hang right where
+    its own contract promises the opposite. ``O_NONBLOCK`` (regular files
+    are unaffected by it) plus the ``S_ISREG`` check below close that off;
+    the ``O_NOFOLLOW``/``islink`` guard mirrors ``_open_lock``'s symlink
+    defense for the same reason.
+    """
+    try:
+        if not _HAS_O_NOFOLLOW and os.path.islink(lock_path):
+            raise OSError(errno.ELOOP, "lock path is a symlink", lock_path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(lock_path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EPERM, "lock path is not a regular file", lock_path)
+            data = os.read(fd, _MAX_HOLDER_RECORD_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(data) > _MAX_HOLDER_RECORD_BYTES:
+            try:
+                logger.debug(
+                    "lock holder record at %s exceeds %d bytes; treating as unreadable",
+                    lock_path,
+                    _MAX_HOLDER_RECORD_BYTES,
+                )
+            except Exception:  # noqa: BLE001 - a logging failure must not block either
+                pass
+            return None
+        record = json.loads(data)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, must not replace the timeout
+        try:
+            logger.debug("failed to read lock holder record from %s: %s", lock_path, exc)
+        except Exception:  # noqa: BLE001 - a logging failure must not block either
+            pass
+        return None
+    if not isinstance(record, dict):
+        try:
+            logger.debug("lock holder record at %s is not a JSON object: %r", lock_path, record)
+        except Exception:  # noqa: BLE001 - a logging failure must not block either
+            pass
+        return None
+    return record
+
+
 def write_lock_busy_message(lock_path: str, timeout: float) -> str:
-    """Operator-facing text for a write.lock acquisition that timed out."""
-    return (
+    """Operator-facing text for a write.lock acquisition that timed out.
+
+    Appends pid/start time/purpose when a readable holder record exists
+    (#352). The record is diagnostic: it may be absent, stale, or from a
+    process that has since exited. That does not change the fact this
+    message reports: the acquisition timed out.
+    """
+    base = (
         f"timed out after {timeout}s waiting for {lock_path}. Another process "
         "holds write.lock while writing to the local stores. Wait for it to "
         "finish, or stop it if it is stuck, then run this again."
     )
+    record = _read_holder_record(lock_path)
+    if record is None:
+        return base + " Holder: unknown (no readable record)."
+    parts = []
+    pid = record.get("pid")
+    started_at = record.get("started_at")
+    purpose = record.get("purpose")
+    if isinstance(pid, int):
+        parts.append(f"pid={pid}")
+    if isinstance(started_at, str):
+        parts.append(f"started_at={started_at}")
+    if isinstance(purpose, str):
+        parts.append(f"purpose={purpose}")
+    if not parts:
+        return base + " Holder: unknown (record present but unrecognized)."
+    return base + " Holder: " + ", ".join(parts) + "."
 
 
 def chroma_lock_busy_message(lock_path: str, timeout: float) -> str:
@@ -367,9 +476,24 @@ def chroma_lock_dir(local_path: str) -> str:
 
 
 def _lock_path(filename: str, data_dir: str | None) -> str:
-    path = os.path.realpath(os.path.abspath(os.path.join(data_dir or lock_data_dir(), filename)))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    return path
+    # Only the DIRECTORY is resolved with realpath, not the final `filename`
+    # component (#352 review, PR #384). Resolving the directory unifies two
+    # processes that reach one data directory through different symlink
+    # aliases -- see test_file_lock_creates_explicit_dir_and_normalizes_symlinks.
+    # Resolving the filename component too would instead follow a symlink
+    # planted AT the lock path itself (e.g. "write.lock" -> some unrelated
+    # file the service account can write) to whatever it points at. Locking
+    # that target was already possible before #352 and was harmless because
+    # nothing wrote through it; #352 added a diagnostic holder record that
+    # `_open_lock`/`_record_holder` now write into the opened handle, which
+    # turns that old symlink alias into a write-and-truncate primitive on an
+    # attacker-chosen file. Keeping the filename component literal, plus the
+    # `O_NOFOLLOW` open below, closes that off at the one place every lock
+    # acquisition (write.lock, chroma.lock, any `file_lock`/
+    # `acquire_file_lock` caller) passes through.
+    directory = os.path.realpath(os.path.abspath(data_dir or lock_data_dir()))
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, filename)
 
 
 def _process_lock(path: str) -> threading.RLock:
@@ -377,27 +501,122 @@ def _process_lock(path: str) -> threading.RLock:
         return _process_locks.setdefault(path, threading.RLock())
 
 
+#: O_NOFOLLOW rejects opening *path* if its final component is a symlink,
+#: atomically -- no separate lstat-then-open check that a symlink swap could
+#: race (#352 review, PR #384). Not defined on Windows. An earlier version of
+#: this comment argued Windows carries no equivalent risk because creating a
+#: reparse point needs privilege; PR #384 review round 4 corrected that --
+#: Developer Mode (or an account with the relevant privilege) lets an
+#: unprivileged process create one, so the symlink attack `_lock_path`'s
+#: docstring above describes still applies there. ``_open_lock`` below adds
+#: an ``os.path.islink`` pre-check for that platform: not atomic, so a
+#: symlink swap between the check and the open can still win the race, but
+#: it is the best available without a win32 ``CreateFile`` call that opens
+#: with ``FILE_FLAG_OPEN_REPARSE_POINT`` -- upgrade path if this ever gets a
+#: Windows test runner to verify it against.
+_HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
+_OPEN_LOCK_FLAGS = os.O_RDWR | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+
+
 def _open_lock(path: str) -> BinaryIO:
+    if not _HAS_O_NOFOLLOW and os.path.islink(path):
+        raise OSError(errno.ELOOP, "lock path is a symlink", path)
     try:
-        return open(path, "r+b")
+        fd = os.open(path, _OPEN_LOCK_FLAGS)
     except FileNotFoundError:
         # O_CREAT without O_TRUNC keeps concurrent first-open calls from
         # clobbering the lock file before either process acquires it.
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
-        return os.fdopen(fd, "r+b")
+        fd = os.open(path, _OPEN_LOCK_FLAGS | os.O_CREAT, 0o666)
+    try:
+        # A hard link is a second name for the same inode, so O_NOFOLLOW
+        # does not catch it (it never involves a symlink): opening
+        # "write.lock" this way still opens the SAME data as the file
+        # sharing that inode. #352's _record_holder() then writes and
+        # truncates through it. Requiring nlink == 1 rejects that alias
+        # (#352 review, PR #384 round 4), and requiring a regular file
+        # rejects handing a FIFO, device, or other special file to the raw
+        # lseek/write/ftruncate calls in _record_holder().
+        st = os.fstat(fd)
+        if st.st_nlink != 1 or not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EPERM, "lock path is not a dedicated regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "r+b")
+
+
+def _record_holder(fh: BinaryIO) -> None:
+    """Write a diagnostic holder record into the just-acquired exclusive lock file *fh*.
+
+    Best-effort (#352). Any failure of this function is swallowed and logged,
+    because a failure writing this diagnostic record must not fail the
+    acquisition it is meant to describe.
+
+    Call this ONLY for an exclusive (non-shared) acquisition, and ONLY right
+    after ``fcntl.flock`` succeeds. The caller at this point IS the actual
+    flock holder, so the record's ownership claim needs no separate proof
+    (such as checking whether a recorded pid is still alive).
+
+    Not cleared on release. The next exclusive holder simply overwrites it.
+    Clearing it on release would reopen a window where "no holder" and "record
+    not read yet" are indistinguishable, and closing that window would need
+    wrapping the clear itself in a lock -- which returns to the same kind of
+    atomicity problem the old sidecar file had.
+
+    Uses ``os.lseek``/``os.write``/``os.ftruncate`` on the raw fd instead of
+    ``fh.write()``/``fh.truncate()``/``fh.flush()``. ``fh`` is a buffered
+    ``r+b`` file object (see ``_open_lock``): if ``fh.write()`` succeeds but a
+    later ``fh.truncate()`` or ``fh.flush()`` fails (for example, disk full),
+    the ``try/except`` below would swallow that exception, but dirty data
+    stays in Python's internal buffer. That data then resurfaces as the SAME
+    exception later, uncaught, when ``file_lock()``'s cleanup calls
+    ``fh.close()`` -- corrupting an otherwise clean exit from an
+    already-finished protected block. The raw fd calls bypass that buffer
+    entirely, so a failure there cannot leave dirty state behind in ``fh``.
+    ``os.pwrite`` is not available on Windows, so this uses the portable
+    ``lseek`` + ``write`` pair instead; nothing downstream of this call reads
+    the fd's position, so moving it is harmless on either platform.
+    """
+    try:
+        record: dict[str, object] = {
+            "pid": os.getpid(),
+            "started_at": datetime.now(UTC).isoformat(),
+        }
+        purpose = getattr(_held, "pending_purpose", None)
+        if purpose:
+            record["purpose"] = purpose
+        data = json.dumps(record).encode("utf-8")
+        fd = fh.fileno()
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, data)
+        os.ftruncate(fd, len(data))
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, must not block acquisition
+        try:
+            logger.warning("failed to write lock holder record: %s", exc)
+        except Exception:  # noqa: BLE001 - a logging failure must not block acquisition either
+            pass
 
 
 def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
+    # Only exclusive acquisitions write a holder record. chroma.lock is held
+    # SHARED by several readers at once (#140); recording on a shared
+    # acquisition would let the last reader to enter overwrite an earlier
+    # reader's record with a value that does not mean "holder" at all, since
+    # there is no single holder to name.
     if os.name != "nt":
         operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         if timeout is None:
             fcntl.flock(fh, operation)
+            if not shared:
+                _record_holder(fh)
             return
 
         deadline = monotonic() + timeout
         while True:
             try:
                 fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                if not shared:
+                    _record_holder(fh)
                 return
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
@@ -419,6 +638,8 @@ def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
     while True:
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            if not shared:
+                _record_holder(fh)
             return
         except OSError as exc:
             if deadline is None:
@@ -537,7 +758,9 @@ def release_file_lock(fh: BinaryIO) -> None:
 
 
 @contextmanager
-def write_lock(data_dir: str | None = None, *, timeout: float | None = None) -> Iterator[None]:
+def write_lock(
+    data_dir: str | None = None, *, timeout: float | None = None, purpose: str | None = None
+) -> Iterator[None]:
     """Serialise writes that share the local stores.
 
     An omitted ``timeout`` gets ``default_lock_wait_timeout()`` from
@@ -550,12 +773,26 @@ def write_lock(data_dir: str | None = None, *, timeout: float | None = None) -> 
     documents for chroma.lock: a ``TimeoutError`` raised by the protected
     block itself must keep its own message, or an unrelated failure would be
     misreported as "another process holds write.lock".
+
+    ``purpose`` (#352) is carried only into the diagnostic holder record.
+    ``file_lock``'s signature is frozen (three other call sites depend on its
+    exact shape), so it cannot be passed through that. Instead it travels
+    through the thread-local ``_held.pending_purpose`` down to ``_acquire``.
+    That value is set right before the ``file_lock()`` call and cleared the
+    moment that call returns -- on success OR on ``TimeoutError`` -- rather
+    than after the whole protected block (past ``yield``): leaving it set
+    that long would let it leak into an unrelated lock (a per-store
+    ``write_lock()``, say) acquired later on the same thread inside this
+    block.
     """
     path = _lock_path("write.lock", data_dir or lock_data_dir())
     with ExitStack() as stack:
+        _held.pending_purpose = purpose
         try:
             stack.enter_context(file_lock("write.lock", data_dir, timeout=timeout))
         except TimeoutError as exc:
             resolved = timeout if timeout is not None else default_lock_wait_timeout()
             raise TimeoutError(write_lock_busy_message(path, resolved)) from exc
+        finally:
+            _held.pending_purpose = None
         yield

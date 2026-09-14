@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import os
 import subprocess
 import sys
@@ -10,7 +12,7 @@ import time
 
 import pytest
 
-from opencrab.locking import acquire_file_lock, file_lock, write_lock
+from opencrab.locking import acquire_file_lock, file_lock, write_lock, write_lock_busy_message
 
 
 def test_file_lock_is_reentrant(tmp_path):
@@ -292,3 +294,553 @@ def test_mcp_write_lock_uses_shared_default_timeout(tmp_path, short_write_lock_t
                 pass
         elapsed = time.monotonic() - started
         assert elapsed < 5, f"_write_lock() 이 무제한으로 대기했다: {elapsed}s"
+
+
+# ---------------------------------------------------------------------------
+# issue #352: write.lock 파일에 보유자 레코드(pid/획득 시각/purpose)를 남긴다.
+# 레코드는 진단용이다 -- flock 의미론은 바뀌지 않고, 레코드 읽기/쓰기의 어떤
+# 실패도 획득과 해제를 막지 않는다(design-v8.md 0절 불변식).
+# ---------------------------------------------------------------------------
+
+
+def _read_raw_record(lock_path: str) -> dict:
+    """테스트 전용: 락을 잡지 않고 락 파일 바이트를 그대로 JSON으로 읽는다."""
+    with open(lock_path, "rb") as fh:
+        return json.loads(fh.read())
+
+
+def test_acquire_records_holder_on_polling_branch(tmp_path):
+    """정상(1a): 공개 경로(file_lock, 폴링 분기)로 배타 획득하면 pid/시각이 남는다."""
+    lock_path = str(tmp_path / "write.lock")
+    with file_lock("write.lock", str(tmp_path), shared=False, timeout=1.0):
+        record = _read_raw_record(lock_path)
+    assert record["pid"] == os.getpid()
+    from datetime import datetime
+
+    datetime.fromisoformat(record["started_at"])  # 파싱되면 통과
+    assert "purpose" not in record
+
+
+def test_acquire_records_holder_on_immediate_blocking_branch(tmp_path):
+    """정상(1b): `_acquire()`의 즉시 블로킹 분기(timeout=None)는 공개 진입점으로
+    도달 불가능하므로(둘 다 `_resolve_timeout()`이 항상 구체 float를 만들어
+    넘긴다), `_acquire()`를 직접 불러 이 분기를 강제로 태운다(v6 라운드 1 지적)."""
+    from opencrab.locking import _acquire, _lock_path, _open_lock, _release
+
+    lock_path = _lock_path("write.lock", str(tmp_path))
+    fh = _open_lock(lock_path)
+    try:
+        _acquire(fh, shared=False, timeout=None)
+        record = _read_raw_record(lock_path)
+    finally:
+        _release(fh)
+        fh.close()
+    assert record["pid"] == os.getpid()
+    from datetime import datetime
+
+    datetime.fromisoformat(record["started_at"])
+    assert "purpose" not in record
+
+
+def test_acquire_immediate_blocking_branch_shared_does_not_record(tmp_path):
+    """정상(1b의 shared 변형, 14절 c1의 유일한 검출 경로): `_acquire()`의 즉시
+    블로킹 분기(timeout=None)도, 공유 획득에서는 레코드를 쓰면 안 된다. 두
+    반환점의 `if not shared:` 가드는 서로 다른 두 줄이므로(v6 라운드 1 지적),
+    폴링 분기를 보는 테스트 3과는 별개로 이 분기 전용 검출 경로가 필요하다."""
+    from opencrab.locking import _acquire, _lock_path, _open_lock, _release
+
+    lock_path = _lock_path("chroma.lock", str(tmp_path))
+    sentinel = b"untouched-bytes"
+    with open(lock_path, "wb") as f:
+        f.write(sentinel)
+    fh = _open_lock(lock_path)
+    try:
+        _acquire(fh, shared=True, timeout=None)
+    finally:
+        _release(fh)
+        fh.close()
+    assert open(lock_path, "rb").read() == sentinel
+
+
+def test_shared_acquisition_never_records_holder(tmp_path):
+    """정상(3): shared=True 획득은 레코드를 남기지 않는다 -- 여러 리더가 동시에
+    쥘 수 있어 "단일 보유자"라는 전제 자체가 성립하지 않는다(#140)."""
+    lock_path = tmp_path / "chroma.lock"
+    sentinel = b"untouched-bytes"
+    lock_path.write_bytes(sentinel)
+    for _ in range(3):
+        with file_lock("chroma.lock", str(tmp_path), shared=True, timeout=1.0):
+            pass
+    assert lock_path.read_bytes() == sentinel
+
+
+def test_write_lock_purpose_lands_in_the_record(tmp_path):
+    """정상(2a): write_lock(purpose=...)로 감싼 구간에서 레코드에 purpose가 있다."""
+    lock_path = str(tmp_path / "write.lock")
+    with write_lock(str(tmp_path), purpose="mcp tool: pack_ingest"):
+        record = _read_raw_record(lock_path)
+    assert record["purpose"] == "mcp tool: pack_ingest"
+
+
+def test_dispatch_tool_write_purpose_reaches_the_record(tmp_path, monkeypatch, bind_test_principal):
+    """정상(2b): `dispatch_tool()`을 실제로 통과시켜 purpose가
+    `f"mcp tool: {name}"`으로 락 파일까지 이어짐을 증명한다 -- `_write_lock()`이나
+    `write_lock()`을 대신 호출하는 우회 없이, 실제 도구 호출부 한 줄까지 확인한다."""
+    import contextvars
+    import dataclasses
+
+    from opencrab.mcp.tools import dispatch_tool
+    from opencrab.mcp.tools._registry import _REGISTRY
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    lock_path = str(tmp_path / "write.lock")
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocking_write_tool(**kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        return {"ok": True}
+
+    name = "ontology_add_node"
+    original = _REGISTRY[name]
+    _REGISTRY[name] = dataclasses.replace(original, fn=_blocking_write_tool)
+    try:
+        # threading.Thread starts with a FRESH contextvars.Context -- the
+        # principal bound (via principal_scope, a ContextVar) by the
+        # bind_test_principal fixture in THIS (main) thread would not be
+        # visible to dispatch_tool() running on a plain new thread. Copy the
+        # current context explicitly so the worker sees the same principal.
+        ctx = contextvars.copy_context()
+        worker = threading.Thread(target=ctx.run, args=(dispatch_tool, name, {}))
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "쓰기 도구 본문에 들어가지 않았다"
+            record = _read_raw_record(lock_path)
+            assert record["purpose"] == f"mcp tool: {name}"
+        finally:
+            release.set()
+            worker.join(timeout=5)
+    finally:
+        _REGISTRY[name] = original
+
+
+def test_record_survives_release(tmp_path):
+    """정상(4): release 이후에도 방금 쓴 레코드는 지워지지 않는다."""
+    lock_path = str(tmp_path / "write.lock")
+    with write_lock(str(tmp_path)):
+        pass
+    record = _read_raw_record(lock_path)
+    assert record["pid"] == os.getpid()
+
+
+def test_record_write_leaves_no_trailing_bytes(tmp_path):
+    """엣지(5): purpose 있는(긴) 레코드 뒤에 purpose 없는(짧은) 레코드를 다시 쓰면
+    결과 바이트가 새 레코드의 json.dumps()와 정확히 같다 -- ftruncate 누락은
+    이전 레코드의 꼬리를 남긴다."""
+    lock_path = tmp_path / "write.lock"
+    with write_lock(str(tmp_path), purpose="a very long purpose string, much longer than the next"):
+        pass
+    with write_lock(str(tmp_path)):
+        pass
+    raw = lock_path.read_bytes()
+    record = json.loads(raw)
+    assert raw == json.dumps(record).encode("utf-8")
+    assert "purpose" not in record
+
+
+def test_write_lock_purpose_does_not_leak_across_success(tmp_path):
+    """정상(g1): purpose 있는 write_lock() 이 성공적으로 끝난 직후, purpose 없이
+    다른 배타 락을 잡아도 이전 purpose가 섞여 들어가지 않는다.
+
+    두 번째 획득은 `write_lock()`이 아니라 `file_lock()`을 직접 쓴다.
+    `write_lock()`은 자기 호출마다 진입 즉시 `_held.pending_purpose = purpose`로
+    스스로 재설정하므로, 두 번째 획득도 `write_lock()`을 쓰면 첫 번째 호출이
+    정리를 했는지와 무관하게 항상 통과해 이 테스트가 아무것도 검출하지 못한다
+    (실측: `finally` 절 전체를 지운 되돌림에도 이 구조로는 통과했다 -- 14절
+    g의 실제 검출력 확인 과정에서 드러난 결함, design-v8.md 원안을 수정)."""
+    with write_lock(str(tmp_path), purpose="leaked-purpose-g1"):
+        pass
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_path = str(other_dir / "write.lock")
+    with file_lock("write.lock", str(other_dir), shared=False, timeout=1.0):
+        pass
+    record = _read_raw_record(other_path)
+    assert "purpose" not in record
+
+
+def test_write_lock_purpose_does_not_leak_across_timeout(tmp_path):
+    """정상(g2): purpose 있는 write_lock() 이 TimeoutError로 끝난 직후, purpose
+    없이 다른 배타 락을 잡아도 이전 purpose가 섞여 들어가지 않는다.
+
+    g1과 마찬가지로 두 번째 획득은 `file_lock()`을 직접 쓴다(위 g1 docstring
+    참조). g1만으로는 `finally`가 아니라 `try` 블록의 성공 분기에만 clear를
+    넣은 미묘하게 다른 오구현(성공 시엔 지우지만 TimeoutError 시엔 안 지움)을
+    놓친다 -- g1은 통과시키고 g2만 실패시키는 그 오구현을 이 테스트가 가른다
+    (design-v8.md 14절 g2, 라운드 2 지적)."""
+    with _Holder("write.lock", str(tmp_path)):
+        with pytest.raises(TimeoutError):
+            with write_lock(str(tmp_path), timeout=0.05, purpose="leaked-purpose-g2"):
+                pass
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_path = str(other_dir / "write.lock")
+    with file_lock("write.lock", str(other_dir), shared=False, timeout=1.0):
+        pass
+    record = _read_raw_record(other_path)
+    assert "purpose" not in record
+
+
+def test_dispatch_timeout_error_excludes_holder_info_at_modern_boundary(
+    tmp_path, monkeypatch, bind_test_principal, short_write_lock_timeout, caplog
+):
+    """정상(6a): `_modern_tools_call()`을 통해 실제로 write.lock 타임아웃을
+    유발하면 응답 봉투에는 pid/시작 시각/purpose가 없다. `dispatch_tool()` 자체는
+    `{"error": ...}` 봉투를 만들지 않으므로(그 봉투는 server.py의 두 핸들러가
+    각자 만든다, v6 라운드 1 지적), 실제 반환 구조인
+    `{"content": [{"type": "text", "text": "<JSON 문자열>"}], ...}`를
+    `content[0]["text"]`부터 재파싱해서 확인한다(라운드 2 지적: 실측으로 확인된
+    실제 구조). 같은 정보가 `logger.warning`쪽에는 있음을 함께 확인해, 경계가
+    "차단"이 아니라 "분리"임을 증명한다."""
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    from opencrab.mcp.server import MCPServer
+
+    server = MCPServer()
+    with _Holder("write.lock", str(tmp_path)):
+        with caplog.at_level("WARNING"):
+            response = server._modern_tools_call({"name": "ontology_add_node", "arguments": {}})
+    text = response["content"][0]["text"]
+    assert json.loads(text) == {"error": "ontology_add_node failed (TimeoutError)"}
+    assert "pid=" not in text
+    warning_text = " ".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert "pid=" in warning_text
+
+
+def test_dispatch_timeout_error_excludes_holder_info_at_legacy_boundary(
+    tmp_path, monkeypatch, bind_test_principal, short_write_lock_timeout, caplog
+):
+    """정상(6b): `_handle_tools_call()`(레거시)을 통해 같은 확인을 반복한다.
+    같은 JSON 재파싱 경로를 쓰되, 검증 대상 핸들러가 다르다(v6 라운드 1 지적)."""
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    from opencrab.mcp.server import MCPServer
+
+    server = MCPServer()
+    with _Holder("write.lock", str(tmp_path)):
+        with caplog.at_level("WARNING"):
+            response = server._handle_tools_call({"name": "ontology_add_node", "arguments": {}})
+    text = response["content"][0]["text"]
+    assert json.loads(text) == {"error": "ontology_add_node failed (TimeoutError)"}
+    assert "pid=" not in text
+    warning_text = " ".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert "pid=" in warning_text
+
+
+def test_busy_message_reports_truncated_record_as_unknown(tmp_path, caplog):
+    """엣지(7): 락 파일에 잘린 JSON이 있어도 예외 없이 "Holder: unknown" 계열
+    문구가 반환되고, `_read_holder_record()`가 남긴 debug 로그가 잡힌다."""
+    lock_path = tmp_path / "write.lock"
+    lock_path.write_bytes(b'{"pid": 123, "started')
+    with caplog.at_level("DEBUG", logger="opencrab.locking"):
+        message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "Holder: unknown" in message
+    assert any("failed to read lock holder record" in r.message for r in caplog.records)
+
+
+def test_busy_message_reports_non_dict_record_as_no_readable_record(tmp_path):
+    """엣지(h2 보조): dict가 아닌 유효 JSON(`[]`)은 "no readable record" 이지
+    "record present but unrecognized" 가 아니다 -- 후자는 record가 dict인데
+    인식 필드가 하나도 없을 때(예: `{}`)만 나온다(라운드 2 지적, v7 초판 정정)."""
+    lock_path = tmp_path / "write.lock"
+    lock_path.write_bytes(b"[]")
+    message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "Holder: unknown (no readable record)." in message
+
+    lock_path.write_bytes(b"{}")
+    message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "Holder: unknown (record present but unrecognized)." in message
+
+
+def test_busy_message_reports_full_holder_record(tmp_path):
+    """정상(6 보강): 레코드에 pid/started_at/purpose가 모두 있으면 안내
+    메시지에 세 필드가 전부 그 이름으로 나타난다. 6a/6b는 응답 봉투에서
+    "pid=" 유무만 보고 "started_at="/"purpose=" 는 보지 않으므로(적대검증
+    지적), 세 필드 전부의 등장을 이 테스트가 따로 못박는다."""
+    lock_path = tmp_path / "write.lock"
+    lock_path.write_bytes(
+        json.dumps(
+            {"pid": 4242, "started_at": "2026-01-01T00:00:00+00:00", "purpose": "mcp tool: pack_ingest"}
+        ).encode("utf-8")
+    )
+    message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "pid=4242" in message
+    assert "started_at=2026-01-01T00:00:00+00:00" in message
+    assert "purpose=mcp tool: pack_ingest" in message
+
+
+def test_busy_message_treats_oversized_record_as_unreadable(tmp_path, caplog):
+    """엣지(PR #384 리뷰): write.lock이 정상 레코드 크기를 크게 넘으면(혼합
+    버전 배포에서 남은 손상 파일 등) 전체를 메모리에 읽어들이지 않고 바로
+    "unknown"으로 처리한다. `_MAX_HOLDER_RECORD_BYTES`를 살짝 넘는 크기로
+    확인한다 -- 실제 배포에서 문제가 되는 크기(수 GB)까지 만들 필요는 없다."""
+    from opencrab.locking import _MAX_HOLDER_RECORD_BYTES
+
+    lock_path = tmp_path / "write.lock"
+    oversized = b'{"purpose": "' + b"x" * (_MAX_HOLDER_RECORD_BYTES + 1) + b'"}'
+    lock_path.write_bytes(oversized)
+    with caplog.at_level("DEBUG", logger="opencrab.locking"):
+        message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "Holder: unknown" in message
+    assert any("exceeds" in r.message for r in caplog.records)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink 생성에 권한이 필요해 공격 전제가 다르다")
+def test_write_lock_refuses_a_symlinked_lock_path(tmp_path):
+    """보안(PR #384 리뷰): "write.lock" 자리가 다른 파일을 가리키는 심볼릭
+    링크면, 그 대상을 대신 잠그고 진단 레코드를 덮어쓰는 대신 거부한다.
+
+    #352 이전에는 이 자리를 잠그기만 했으므로(쓰기 없음) 이런 심볼릭
+    링크가 있어도 대상 파일 내용은 안전했다. #352가 잠금 획득 직후 보유자
+    레코드를 그 핸들에 기록하고 자르기 시작하면서, 그 자리가 쓰기 권한이
+    있는 임의 파일을 가리키는 심볼릭 링크라면 그 파일을 덮어쓰고 잘라내는
+    수단이 됐다. `_lock_path`가 디렉터리만 realpath로 풀고 파일명은 그대로
+    두며, `_open_lock`이 `O_NOFOLLOW`로 여는 것이 이 테스트가 확인하는
+    방어다.
+    """
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    (tmp_path / "write.lock").symlink_to(target)
+
+    with pytest.raises(OSError):
+        with file_lock("write.lock", str(tmp_path), timeout=1):
+            pass
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="하드링크 생성 조건이 플랫폼마다 다르다")
+def test_write_lock_refuses_a_hardlinked_lock_path(tmp_path):
+    """보안(PR #384 리뷰 4라운드): "write.lock" 자리가 다른 파일과 같은
+    inode를 공유하는 하드링크면 그 파일을 대신 잠그고 보유자 레코드로
+    덮어쓰는 대신 거부한다. 심볼릭 링크와 달리 하드링크는 `O_NOFOLLOW`로
+    막히지 않는다(심볼릭 링크가 아니라 같은 데이터를 가리키는 두 번째
+    이름일 뿐이다). `_open_lock`의 `st_nlink == 1` 확인이 이 테스트가
+    검증하는 방어다.
+    """
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    os.link(str(target), str(tmp_path / "write.lock"))
+
+    with pytest.raises(OSError):
+        with file_lock("write.lock", str(tmp_path), timeout=1):
+            pass
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="os.mkfifo는 POSIX 전용이다")
+def test_open_lock_rejects_a_fifo_lock_path(tmp_path):
+    """보안(이중 적대검증 놓침 q): "write.lock" 자리가 FIFO면 거부한다.
+
+    `_open_lock`의 `st_nlink != 1` 검사는 FIFO를 잡지 못한다(FIFO의
+    st_nlink는 1이다). 그 자리를 잡는 것은 이어지는
+    `stat.S_ISREG(st.st_mode)` 검사뿐이다. 이 검사를 지운 변이체는 대신
+    `os.fdopen(fd, "r+b")`가 FIFO를 논블로킹 없이 열자마자 던지는
+    `io.UnsupportedOperation: ... not seekable`로 우연히 예외가 난다.
+    `io.UnsupportedOperation`은 `OSError`의 서브클래스라 심볼릭 링크/
+    하드링크 테스트처럼 `pytest.raises(OSError)`만 걸면 두 실패를
+    구분하지 못한다. 그래서 `errno`까지 특정해 원 코드의 의도된 EPERM
+    거부만 통과시킨다(`io.UnsupportedOperation`의 `errno`는 `None`이다).
+    """
+    import opencrab.locking as locking_module
+
+    lock_path = tmp_path / "write.lock"
+    os.mkfifo(str(lock_path))
+
+    with pytest.raises(OSError) as exc_info:
+        locking_module._open_lock(str(lock_path))
+
+    assert exc_info.value.errno == errno.EPERM
+    assert "not a dedicated regular file" in str(exc_info.value)
+
+
+def test_record_holder_write_failure_does_not_block_acquisition(tmp_path, monkeypatch, caplog):
+    """불변식(design-v8.md 3절, 이중 적대검증 놓침 e): 보유자 레코드를
+    쓰다 실패해도 잠금 획득 자체는 막히지 않는다.
+
+    `_record_holder()`는 `os.lseek`/`os.write`/`os.ftruncate`를 원시 fd에
+    호출하고 그 블록 전체를 `except Exception`으로 감싸 흡수하며 경고를
+    남긴다. 이 감싸기를 지운 변이체에서는 `os.write` 실패가 `_acquire()`를
+    빠져나가 `with file_lock(...)` 진입 자체가 실패한다. `os.write`만
+    실패시켜도 두 경로를 가른다(같은 `try` 블록 안이므로 `os.lseek`나
+    `os.ftruncate`를 막아도 동일한 효과이지만, 실제 디스크 풀 같은 실패가
+    드러나는 지점은 데이터 쓰기다).
+    """
+    import opencrab.locking as locking_module
+
+    def _raise(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(locking_module.os, "write", _raise)
+
+    entered = False
+    with caplog.at_level("WARNING"):
+        with file_lock("write.lock", str(tmp_path), timeout=1.0):
+            entered = True
+
+    assert entered, "레코드 쓰기 실패가 획득 자체를 막으면 안 된다"
+    assert any("failed to write lock holder record" in r.message for r in caplog.records)
+
+
+def test_open_lock_rejects_symlink_when_o_nofollow_is_unavailable(tmp_path, monkeypatch):
+    """보안(PR #384 리뷰 4라운드): `O_NOFOLLOW`가 없는 플랫폼(Windows)에서도
+    "write.lock" 자리가 심볼릭 링크면 열기 전에 거부한다.
+
+    이 저장소에는 Windows 실행기가 없다. `_HAS_O_NOFOLLOW`와
+    `_OPEN_LOCK_FLAGS`를 patch해 이 POSIX 머신에서도 O_NOFOLLOW가 없는
+    척 만들어, 실제 `os.open()` 호출에서 심볼릭 링크를 따라가지 않게
+    막는 것이 (POSIX 자체의 O_NOFOLLOW가 아니라) 이 사전 검사 하나뿐임을
+    실제로 밟아 확인한다. 실행 자체는 여전히 이 플랫폼에서 하므로, 검증은
+    코드 읽기가 아니라 이 테스트의 통과 여부다.
+    """
+    import opencrab.locking as locking_module
+
+    monkeypatch.setattr(locking_module, "_HAS_O_NOFOLLOW", False)
+    monkeypatch.setattr(locking_module, "_OPEN_LOCK_FLAGS", os.O_RDWR)
+
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    lock_path = tmp_path / "write.lock"
+    lock_path.symlink_to(target)
+
+    with pytest.raises(OSError):
+        locking_module._open_lock(str(lock_path))
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
+def _call_write_lock_busy_message(lock_path: str, result_queue) -> None:
+    """회귀(FIFO 무한 대기)용 자식 프로세스 본체. 모듈 스코프인 이유는
+    `_hold_write_lock_report_pid`와 같다: fork가 아닌 시작 방식에서
+    로컬 함수는 피클링에 실패한다.
+
+    별도 프로세스로 호출하는 이유: `_read_holder_record()`의 넓은
+    `except Exception`이 SIGALRM 핸들러가 던지는 예외까지 삼켜 버려,
+    같은 프로세스 안에서 `signal.alarm()`으로 재현을 시도하면 회귀가
+    있어도 그 예외가 함수 안에서 조용히 흡수되고 "정상적으로 빨리
+    끝난 것"과 구분이 안 된다(실측으로 확인됨). 진짜 별도 프로세스면
+    이 문제가 없다: 블록되면 그 프로세스 자체가 살아남아 있다."""
+    from opencrab.locking import write_lock_busy_message
+
+    result_queue.put(write_lock_busy_message(lock_path, 1.0))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="os.mkfifo는 POSIX 전용이다")
+def test_write_lock_busy_message_does_not_block_on_a_fifo_lock_path(tmp_path):
+    """보안(PR #384 리뷰 5라운드): 타임아웃 뒤 진단용으로 보유자 레코드를
+    읽는 `_read_holder_record()`는 그 시점에는 `_open_lock()`의 보호를
+    이미 벗어난 경로를 연다. "write.lock" 자리가 FIFO로 바뀌어 있으면,
+    이 읽기가 반대편 writer가 열릴 때까지 무한정 블록해 "타임아웃을 새
+    예외로 바꾸지 않는다"는 이 함수 자신의 계약을 어길 수 있었다.
+
+    진짜 별도 OS 프로세스에서 호출해 join(10)으로 시간을 가둔다. 회귀가
+    있으면 그 프로세스가 10초 뒤에도 살아 있는 것으로 드러난다(같은
+    프로세스 안에서 `signal.alarm()`을 쓰면 안 되는 이유는
+    `_call_write_lock_busy_message`의 설명을 본다)."""
+    import multiprocessing
+
+    lock_path = tmp_path / "write.lock"
+    os.mkfifo(str(lock_path))
+
+    result_queue = multiprocessing.Queue()
+    child = multiprocessing.Process(
+        target=_call_write_lock_busy_message, args=(str(lock_path), result_queue)
+    )
+    child.start()
+    try:
+        child.join(10)
+        blocked = child.is_alive()
+        if blocked:
+            child.terminate()
+            child.join(5)
+        assert not blocked, "write_lock_busy_message()가 FIFO에서 멈춰 10초 안에 끝나지 않았다"
+        message = result_queue.get(timeout=5)
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+
+    assert "Holder: unknown (no readable record)." in message
+
+
+def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
+    """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
+    tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가
+    아닌 시작 방식에서 로컬 함수는 피클링에 실패한다."""
+    from opencrab.locking import write_lock
+
+    with write_lock(data_dir):
+        pid_queue.put(os.getpid())
+        ready.set()
+        stop.wait(30)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX multiprocessing + flock 경합")
+def test_write_lock_timeout_names_the_real_holder_pid_across_processes(tmp_path):
+    """회귀(요구사항 3): 진짜 별도 OS 프로세스가 write.lock을 쥔 상태에서 타임아웃
+    나면, 에러 메시지의 pid가 그 자식 프로세스의 실제 pid와 같다.
+
+    핸드셰이크(Event)로 "자식이 이미 락을 잡았다"를 확인한 뒤에만 부모가
+    시도한다(v6 라운드 1 지적: 타이밍만 믿으면 거짓 성공이 날 수 있다). 자식
+    회수는 `finally`에 둔다(라운드 2 지적: 끝에서만 회수하면 중간 단언 실패
+    시 자식이 남는다). 전체를 signal.alarm() 안전망으로 감싼다.
+
+    알람은 회수 단계에 들어가기 전에 해제한다(적대검증 라운드 2 지적: 회수
+    구간에서도 알람이 살아 있으면 `child.join(10)` 도중 알람이 울려
+    TimeoutError가 끼어들고, 뒤이은 terminate()/join()/생존 확인을 건너뛴 채
+    자식이 회수되지 않고 남는다). 회수 자체는 join(10)과 join(5)로 이미
+    시간이 갇혀 있으므로 알람 없이도 무한 대기하지 않는다."""
+    import multiprocessing
+    import signal
+
+    def _on_alarm(signum, frame):
+        raise TimeoutError("자식 프로세스 핸드셰이크 또는 write_lock() 시도가 멈춘 것으로 보인다")
+
+    ready = multiprocessing.Event()
+    stop = multiprocessing.Event()
+    pid_queue = multiprocessing.Queue()
+    child = multiprocessing.Process(
+        target=_hold_write_lock_report_pid, args=(str(tmp_path), ready, stop, pid_queue)
+    )
+    child.start()
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(30)
+    try:
+        try:
+            assert ready.wait(20), "자식이 write.lock을 잡았다는 신호가 오지 않았다"
+            child_pid = pid_queue.get(timeout=10)
+            with pytest.raises(TimeoutError) as exc_info:
+                with write_lock(str(tmp_path), timeout=1.0):
+                    pass
+            assert f"pid={child_pid}" in str(exc_info.value)
+            assert child_pid == child.pid
+        finally:
+            # 회수 구간은 알람의 보호 대상이 아니다 -- join(10)/join(5) 자체가
+            # 이미 시간이 갇혀 있다. 여기서 먼저 해제해야 회수 도중 알람이
+            # 울려 terminate()/join()/생존 확인을 건너뛰는 경로가 없어진다.
+            signal.alarm(0)
+            stop.set()
+            child.join(10)
+            if child.is_alive():
+                child.terminate()
+                child.join(5)
+            # 회수 자체가 끝났다는 확인(적대검증 지적): join()만으로는 자식이
+            # 여전히 살아 있는데도 그냥 지나칠 수 있다. terminate()/join()은
+            # 정상 OS 동작에서 예외를 던지지 않으므로 이 확인 자체를 감싸는
+            # 중첩 try는 두지 않는다 -- 지나친 방어는 이 회귀 테스트의 본래
+            # 목적(회수가 finally에 있다는 것)을 흐린다.
+            assert not child.is_alive(), "자식 프로세스가 회수되지 않고 남았다"
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
