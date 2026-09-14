@@ -451,13 +451,20 @@ def test_record_write_leaves_no_trailing_bytes(tmp_path):
 
 def test_write_lock_purpose_does_not_leak_across_success(tmp_path):
     """정상(g1): purpose 있는 write_lock() 이 성공적으로 끝난 직후, purpose 없이
-    다른 배타 락을 잡아도 이전 purpose가 섞여 들어가지 않는다."""
+    다른 배타 락을 잡아도 이전 purpose가 섞여 들어가지 않는다.
+
+    두 번째 획득은 `write_lock()`이 아니라 `file_lock()`을 직접 쓴다.
+    `write_lock()`은 자기 호출마다 진입 즉시 `_held.pending_purpose = purpose`로
+    스스로 재설정하므로, 두 번째 획득도 `write_lock()`을 쓰면 첫 번째 호출이
+    정리를 했는지와 무관하게 항상 통과해 이 테스트가 아무것도 검출하지 못한다
+    (실측: `finally` 절 전체를 지운 되돌림에도 이 구조로는 통과했다 -- 14절
+    g의 실제 검출력 확인 과정에서 드러난 결함, design-v8.md 원안을 수정)."""
     with write_lock(str(tmp_path), purpose="leaked-purpose-g1"):
         pass
     other_dir = tmp_path / "other"
     other_dir.mkdir()
     other_path = str(other_dir / "write.lock")
-    with write_lock(str(other_dir)):
+    with file_lock("write.lock", str(other_dir), shared=False, timeout=1.0):
         pass
     record = _read_raw_record(other_path)
     assert "purpose" not in record
@@ -467,8 +474,9 @@ def test_write_lock_purpose_does_not_leak_across_timeout(tmp_path):
     """정상(g2): purpose 있는 write_lock() 이 TimeoutError로 끝난 직후, purpose
     없이 다른 배타 락을 잡아도 이전 purpose가 섞여 들어가지 않는다.
 
-    g1만으로는 `finally`가 아니라 `try` 블록의 성공 분기에만 clear를 넣은
-    미묘하게 다른 오구현(성공 시엔 지우지만 TimeoutError 시엔 안 지움)을
+    g1과 마찬가지로 두 번째 획득은 `file_lock()`을 직접 쓴다(위 g1 docstring
+    참조). g1만으로는 `finally`가 아니라 `try` 블록의 성공 분기에만 clear를
+    넣은 미묘하게 다른 오구현(성공 시엔 지우지만 TimeoutError 시엔 안 지움)을
     놓친다 -- g1은 통과시키고 g2만 실패시키는 그 오구현을 이 테스트가 가른다
     (design-v8.md 14절 g2, 라운드 2 지적)."""
     with _Holder("write.lock", str(tmp_path)):
@@ -478,7 +486,7 @@ def test_write_lock_purpose_does_not_leak_across_timeout(tmp_path):
     other_dir = tmp_path / "other"
     other_dir.mkdir()
     other_path = str(other_dir / "write.lock")
-    with write_lock(str(other_dir)):
+    with file_lock("write.lock", str(other_dir), shared=False, timeout=1.0):
         pass
     record = _read_raw_record(other_path)
     assert "purpose" not in record
