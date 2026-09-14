@@ -315,14 +315,24 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
 5. 완주 여부를 옵션 목록이 아니라 pytest 자신이 보고하는 두 숫자의
    대사로 확인한다. 로그 앞부분의 `collected N item(s)`(`-k`/`-m`으로
    디셀렉트하면 `collected N items / M deselected / K selected`로
-   찍히고 `N`은 디셀렉트 전 전체 수다. 이 재현 명령은 `-k`/`-m`을 쓰지
-   않으므로 `M`은 항상 0이지만, 변형 명령이 그 옵션을 추가하면 아래
-   비교에서 `N`에서 `M`을 뺀 값을 쓴다)의 `N`과, `-v` 진행 줄에서 실제로
-   결과가 찍힌 테스트 id를 중복 제거한 고유 개수를 비교한다:
+   찍히고 `N`은 디셀렉트 전 전체 수다. `-k`/`-m`은 재현 명령뿐 아니라
+   `pyproject.toml`의 `addopts`에서도 올 수 있다. 이 저장소의
+   `pyproject.toml` `addopts`(`-v --tb=short`)에는 지금 `-k`/`-m`이 없고
+   재현 명령도 넘기지 않으므로 지금은 `M`이 항상 0이지만, `addopts`나
+   변형 명령에 그 옵션이 들어가면 `M`이 0이 아닐 수 있다. 그런 경우도
+   아래 비교에서 `N`에서 `M`을 뺀 값을 쓴다)의 `N`과, `-v` 진행 줄에서
+   실제로 결과가 찍힌 테스트 id를 중복 제거한 고유 개수를 비교한다:
    ```bash
-   grep -oP '.+(?=\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN)\s+\[\s*\d+%\]$)' \
+   grep -oP '.+(?=\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN)(?:\s+\([^)]*\))?\s+\[\s*\d+%\]$)' \
      /tmp/<워크트리 식별자>-run.log | sort -u | wc -l
    ```
+   `SKIPPED`/`XFAIL`/`XPASS`는 진행 줄에 사유가 괄호로 덧붙을 때가 있어
+   (예: `SKIPPED (skip reason)`) 정규식이 그 괄호를 상태명과 `[NN%]`
+   사이의 선택 요소로 허용한다. 이 괄호를 못 받으면 그 줄 전체가
+   추출에서 빠져 고유 개수가 실제보다 작게 나와, 정상 완주를 미완주로
+   오판정한다(실측: 사유가 붙는 테스트 3개를 포함해 4개를 완주시키면
+   `collected 4`인데 괄호를 못 받는 정규식으로는 고유 개수가 1로
+   나온다).
    같은 테스트 id가 setup/call/teardown 단계별로 따로 리포트를 내도
    (예: teardown 에러가 나면 같은 id로 `PASSED` 줄과 `ERROR` 줄이 각각
    찍힌다) 이 방식은 id 단위로 중복 제거하므로 한 번만 센다. 요약줄
