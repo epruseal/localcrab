@@ -1961,17 +1961,24 @@ def load_nodes_incremental(
                 # properties.id 불일치 방어), `normalize_space` 가 "space"
                 # 를 effective 값으로 채운다. 이 두 값의 동일성은 아래 딕셔너리
                 # 비교가 아니라 `live[0]==cmp_node_type`/`live[1]==cmp_space`
-                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 여기서 뺀다
+                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 양쪽에서 뺀다
                 # (안 빼면 `live[2]` 가 "id"/"space" 를 구조적으로 안 담는
                 # 라이브 스냅샷과 매번 chg 로 어긋난다, T7 회귀 실측). `owner_id`
-                # 는 `prepare_node` 가 손대지 않는 별도 스탬프 필드라 계속
-                # 뺀다(#378 로 이관, 위 상수 주석 참고). `RETIRED_KEYS` 도
-                # 계속 뺀다(도달 경로 없음, 이 이슈 범위 밖의 별도 정리 비용).
-                _cmp_drop = ("id", "space", "owner_id", *RETIRED_KEYS)
+                # 는 `prepare_node` 가 값을 손대지 않으므로 이 정규화가 강제하는
+                # 대칭 삭제 사유가 없다. 기존 설계(위 상수 주석, #358)는
+                # owner_id 를 **라이브 쪽에서만** 빼, 파일이 owner_id 를
+                # 실으면 값이 같아도 키 집합이 어긋나 항상 chg 로 재기록되게
+                # 했다(#378 관찰). 여기서 양쪽 다 빼면 그 비대칭이 사라져
+                # 파일 쪽 owner_id 불일치가 same 으로 통과하는 새 결함이
+                # 생긴다(이중검증에서 실측). 그 비대칭을 그대로 지키려고
+                # drop 집합을 파일/라이브 쪽으로 분리한다. `RETIRED_KEYS` 는
+                # 도달 경로가 없어 양쪽 어느 쪽에 둬도 동작 차이가 없지만
+                # 기존 상수와 대칭인 이름으로 양쪽에 남긴다.
+                _cmp_drop_common = ("id", "space", *RETIRED_KEYS)
                 file_cmp = {k: v for k, v in cmp_props.items()
-                            if k not in _cmp_drop}
+                            if k not in _cmp_drop_common}
                 live_cmp = {k: v for k, v in live[2].items()
-                            if k not in _cmp_drop}
+                            if k not in (*_cmp_drop_common, "owner_id")}
                 # 싱크 완전성 표(#358 재리뷰, 리드 요청). `add_node`
                 # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
                 # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이

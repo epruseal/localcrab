@@ -652,6 +652,39 @@ class TestLoadNodesIncremental:
         n_same = _run(f2)[2]
         assert n_same == 0, "중첩 properties.id 불일치가 same 으로 통과했다(#379)"
 
+    def test_file_side_owner_id_mismatch_is_not_same(self, live, tmp_path):
+        """**#379 회귀(이중검증에서 발견).** `owner_id` 는 `prepare_node` 가
+        값을 손대지 않는 별도 스탬프 필드다. 기존 설계(위 상수 주석, #358)는
+        `owner_id` 를 **라이브 쪽에서만** 필터에서 빼, 파일이 유효한 값의
+        중첩 `properties.owner_id` 를 실으면 값이 뭐든 키 집합 자체가 달라
+        항상 `chg` 로 재기록되게 했다(#378 관찰). `prepare_node` 도입으로
+        비교 딕셔너리를 만들 때 이 비대칭을 실수로 없애면, 파일 쪽
+        `owner_id` 값이 라이브와 달라도 same 으로 통과해 재스탬프가 영영
+        일어나지 않는 결함이 생긴다. 이 값은 유효한 문자열이라 `prepare_node`
+        검증 자체는 통과하므로, 검증 거부가 아니라 비교 단계의 비대칭
+        유지만 이 테스트의 대상이다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept",
+                                  properties={"owner_id": "other-owner"})])
+        n_new, n_chg, n_same, _skip, _err = _run(f2)[:5]
+        assert (n_new, n_same) == (0, 0), (
+            "파일 쪽 중첩 properties.owner_id 불일치가 same 으로 통과했다"
+            "(#379, owner_id 라이브측 전용 필터 비대칭 회귀)")
+        assert n_chg == 1, "owner_id 불일치는 chg 로 재기록돼야 한다(#358 비대칭 유지)"
+
     def test_codex_r6_counterexample_is_not_same(self, live, tmp_path):
         """**#379, codex 설계검증 6라운드 반례.** 최상위 `space=None` + 중첩
         `properties.space="concept"` + `owner_id=NaN` 세 조건이 겹쳐도 `same`
