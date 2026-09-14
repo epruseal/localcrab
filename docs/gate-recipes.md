@@ -145,7 +145,7 @@ pytest tests/ -v
   (
     cd <워크트리> || exit 17
     set -o pipefail
-    PYTEST_ADDOPTS= OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
+    PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
     OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
     <워크트리>/.venv/bin/python -m pytest tests/ -v \
       --basetemp=/tmp/<워크트리 식별자>-basetemp \
@@ -180,12 +180,22 @@ pytest tests/ -v
   실패해도 이전 cwd에 우연히 `tests/`가 있으면 pytest는 그 디렉터리를
   대상으로 사용법 오류나 미수집 없이 "정상 종료"해 버릴 수 있다(다른
   워크트리를 잘못 대사하는 것). 그래서 `cd` 자체의 성패를 pytest의
-  종료 코드에 얹지 않고 `|| exit 17`로 즉시, pytest의 0~5 계약 밖 값으로
-  분리해서 낸다. 이 전체를 서브셸 `( ... )`로 감싸는 이유는 그래야
-  `exit 17`이 그 서브셸만 끝내고 호출한 셸 자체를 종료시키지 않기
-  때문이다. `BLOCK_EXIT`가 17이면 `cd` 실패이니 pytest는 아예 실행되지
-  않은 것이고, 그 밖의 값이면 위 판정 절차 1~2번이 다루는 pytest 자신의
-  종료 코드다.
+  종료 코드에 얹지 않고 `|| exit 17`로 즉시, pytest의 0~6 계약 값과
+  겹치지 않는 값으로 분리해서 낸다. 17은 이 문서가 고른 임의 sentinel이지
+  pytest `ExitCode` 계약이 정한 값이 아니다: pytest는 플러그인이
+  `pytest.exit(msg, returncode=N)`으로 임의 정수를 낼 수 있게
+  열어 둬서(`_pytest/outcomes.py`의 `Exit`), 이론상 어떤 정수 sentinel도
+  다른 플러그인의 값과 겹칠 가능성 자체를 원천 차단하지는 못한다. 다만
+  이 저장소 자체 코드에는(`.venv`의 pytest 자체 제외) `returncode=17`이나
+  `sys.exit(17)` 호출이 전수 grep으로 0건이라 지금은 이 워크트리에서
+  충돌이 없다. 구조적으로도 한 번 더 갈린다: `cd`가 실패하면 `exit 17`이
+  그 뒤의 `set -o pipefail`도 pytest 파이프라인도 전혀 실행하지 않으므로
+  로그 파일에 `collected` 줄도 `EXIT:` 줄도 전혀 안 남는다. 반대로
+  pytest가 정말 17을 낸 경우라면(이 저장소에선 없지만) 로그에 `collected`
+  줄이 있을 것이다. 즉 `BLOCK_EXIT:17`이면서 로그에 `collected` 줄이
+  없으면 `cd` 실패로, 있으면 pytest 자신이 낸 값으로 갈라 읽는다. 이
+  전체를 서브셸 `( ... )`로 감싸는 이유는 그래야 `exit 17`이 그 서브셸만
+  끝내고 호출한 셸 자체를 종료시키지 않기 때문이다.
 
   종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
   1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
@@ -209,8 +219,15 @@ pytest tests/ -v
 
 두 실행 모두 `PYTEST_ADDOPTS=`를 빈 값으로 명시 설정하고(환경에 숨은
 옵션이 몰래 주입되는 경로를 미리 닫는다) `-x`/`--maxfail`/`--collect-only`
-를 쓰지 않는다. 이 세 조건은 재현 명령의 고정 형태이지 판정 근거가
-아니다. **이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
+를 쓰지 않는다. `PY_COLORS=0`도 명시 설정한다: 배너 줄은 pytest가 비 tty로
+출력을 리다이렉트할 때는 원래 무색이지만, 실행 환경의 셸이 `PY_COLORS=1`을
+이미 export해 두면 ANSI 색상 코드가 `!` 앞에 붙어(`\x1b[31m!!!!...`)
+아래 판정 절차 4번의 `grep -c '^!'`가 0을 내는 실측 반례가 있다(같은
+테스트를 `PY_COLORS=1`로 강제해 배너가 있는데도 grep이 0을 내는 것과
+`PY_COLORS=0`으로 강제해 다시 1을 내는 것 모두 확인했다). `PY_COLORS=0`을
+env에 고정하면 주변 환경이 무엇이든 무색 출력이 보장된다. 이 세 조건과
+`PY_COLORS=0`은 재현 명령의 고정 형태이지 판정 근거가 아니다.
+**이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
 `addopts`, `-p` 플러그인, 상위 `conftest.py` 등 같은 일을 하는 경로가 더
 있을 수 있고, 전부 나열하는 쪽으로는 닫히지 않는다. 그래서 판정은 아래
 처럼 **검출**로 한다: 어느 경로로 조기 종료되든 pytest는 자기 실행
@@ -225,14 +242,23 @@ pytest tests/ -v
 
 1. 각 실행의 `BLOCK_EXIT` 값(재현 명령 맨 끝의 `echo "BLOCK_EXIT:$?"`가
    낸 값)을 기록한다.
-2. `BLOCK_EXIT`가 17이면 `cd`가 실패해 pytest가 아예 실행되지 않은
-   것이다. pytest 자신의 0~5 종료 코드 계약과 겹치지 않는 값이라 이
-   경로만으로 곧바로 식별된다. 그 자체로 미완주이며 diff를 내지 않고
-   워크트리 경로부터 고친다. 17이 아니면 그 값은 pytest 자신의 종료
-   코드다. 0(전부 통과) 또는 1(실패 있음, 또는 tripwire 중단)이 아니면
+2. `BLOCK_EXIT`가 17이고 로그에 `collected` 줄이 없으면 `cd`가 실패해
+   pytest가 아예 실행되지 않은 것이다. 17은 이 문서가 고른 sentinel이지
+   pytest `ExitCode` 계약값이 아니다(근거는 위 6절 "17로 즉시" 문단
+   참고). 그 자체로 미완주이며 diff를 내지 않고 워크트리 경로부터
+   고친다. `BLOCK_EXIT`가 17이 아니거나, 17이면서 로그에 `collected`
+   줄이 있으면 그 값은 pytest 자신의 종료 코드다. 0(전부 통과) 또는
+   1(실패 있음, 또는 tripwire 중단)이 아니면
    역시 그 자체로 미완주다. pytest의 종료 코드 계약상 2는 실행
    중단(예: `KeyboardInterrupt`), 3은 내부 오류, 4는 사용법 오류, 5는
-   미수집이며, 어느 쪽이든 diff를 내지 않고 원인부터 조사한다.
+   미수집, 6은 `--max-warnings` 초과다(`_pytest/config/__init__.py`의
+   `ExitCode` 열거값 전량, 이 워크트리가 설치한 pytest 9.1.1 소스로
+   확인했다). 6번은 `--max-warnings`를 실제로 넘겨야만 나오는데
+   `pyproject.toml`과 `Makefile` 어디에도 그 플래그가 없고 위 재현
+   명령도 넘기지 않으므로 이 고정 재현 명령으로는 도달할 수 없다. 그래도
+   나열은 계약 전량을 적어 사용자가 임의로 `--max-warnings`를 끼워 넣는
+   변형 명령을 쓸 때 6이 뜻하는 바를 바로 찾게 한다. 어느 코드든 diff를
+   내지 않고 원인부터 조사한다.
 3. `BLOCK_EXIT`가 1이면 PG tripwire(`tests/conftest.py`)는 DB명이 `_test`로
    안 끝나면 `pytest.exit(...)`로 세션 전체를 즉시 중단하며 이때도 종료
    코드가 1이다. 로그에 고정 마커 `[PG tripwire]`(tripwire가 내는 메시지
