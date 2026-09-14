@@ -74,23 +74,72 @@ from opencrab.stores._vector_base import slot_owner
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
 
-# 스토어가 저장하면서 **자기가 채워 넣는** 키. 증분 비교에서 빼야 한다 —
-# 넣지 않으면 by-pack 원본과 라이브가 영원히 다르게 보여 **매 증분마다 전량 재적재**된다.
+# 증분 비교의 키 제외는 두 질문으로 판정한다.
 #
-# 한동안 `id` 하나만 뺐는데, 상류가 `space_id`/`properties[space]` 우선순위를 통합하면서
-# `space` 도 주입하게 됐고(#125) 그 순간 동일한 행이 전부 chg 로 판정됐다.
-# 이름을 하나 더 적는 대신 "스토어가 넣는 것"이라는 축으로 묶는다.
-# `owner_id` joined the set in #148: the write gate stamps the principal onto
-# every node's properties, so it is present on live rows and absent from the
-# source dump -- the same shape `space` had in #125.
-STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
-
-# 증분 비교에서 빼는 키 = 스토어가 넣는 것 + `#159` 가 폐기한 것(`pack`).
-# 폐기 키를 빼지 않으면 그 키를 가진 라이브 행이 **매 증분 전량 chg** 로 잡힌다.
+#   Q1. 파일 쪽 props 가 이 키를 정당한 값으로 실어 올 수 있는가?
+#   Q2. 값이 다를 때 재기록(add_node 호출)이 일어나야 하는가?
+#
+# Q1=No 인 키(라이브 쪽에만 있다)는 **라이브 쪽에서만** 빼면 된다. 파일
+# 쪽 props 에는 애초에 그 키가 없으므로 양쪽 다 "키 없음"으로 일치한다.
+# Q1=Yes 인 키(양쪽에 다 나타날 수 있다)는 **양쪽에서 같이** 빼야 한다.
+# 한쪽에서만 걸러내면 그 쪽에서만 키가 사라져 나머지 값이 전부 같아도
+# 딕셔너리 비교가 깨진다. #358 의 근본원인이 이것이다(space, 아래 참고).
+#
+# ── id : Q1=Yes(중첩 properties.id 로), Q2=No ──
+# `absorb_legacy_top_level`(opencrab/pack/schema.py) 은 최상위 stray 키만
+# NODE_STRUCT_KEYS 기준으로 거른다 — 중첩 `properties.id` 는 그대로 남는다.
+# 이 비교 지점 자체는 신원 검증을 호출하지 않으므로, 값이 다른 중첩 id 가
+# 이론적으로 도달하면 `same` 으로 오판할 여지가 남는다. 이 gap 은 #358
+# 이전부터 있던 기존 동작이며 이 수정이 새로 만들거나 넓히지 않는다 — 별도
+# 이슈로 추적할 후보이지 이 수정의 범위는 아니다. 라이브 쪽에서만 뺀다.
+#
+# ── space : Q1=Yes(중첩 properties.space 로, #125, #358), Q2=No ──
+# 라이브 쪽 값은 `graph_identity.normalize_space` 가 항상 덮어써 신뢰할 수
+# 있는 단일 진실이다(실측: LocalGraphStore/PGGraphStore 원시 properties 컬럼에
+# `space` 키가 항상 존재, 2026-09-14). 파일 값이 달라도 재기록으로 바꿀
+# 이유가 없다. 레거시 생산자가 실제로 중첩 `properties.space` 를 실어 보낸
+# 사례가 있으므로(#125, #358 원 보고) 양쪽에서 같이 뺀다.
+#
+# `_merge_space`(opencrab/stores/_graph_common.py) 의 docstring 은 "SQL 백엔드는
+# id 만 주입하고 space 는 호출자가 넣었을 때만 properties 에 실린다"고 적는데,
+# 이는 `normalize_space` 도입 이전 서술로 보이며 위 실측과 어긋난다 — #372 로 그
+# 어긋남을 추적한다(이 파일의 수정 범위 밖).
+#
+# ── owner_id : Q1 이론상 Yes, 이 PR 은 Q1=No 로 취급(범위 좁힘) ──
+# `absorb_legacy_top_level` 이 거르는 `NODE_STRUCT_KEYS` 목록에 owner_id 가
+# 없으므로 파일이 최상위나 중첩 properties 로 owner_id 를 실으면 이론적으로
+# space 와 같은 형태의 대칭 결함이 재현될 수 있다. 그런데 실측(전체 grammar·
+# schema 정의, 2026-09-14): 어떤 노드 타입도 owner_id 를 스키마 필드로
+# 선언하지 않는다. `write_gate.py` 의 `NODE_STAMPED = ("pack_id", "owner_id")`
+# 가 유일한 실체이고, 실제로 owner_id 를 싣는 파일 행은 없다(순수 시스템
+# 스탬프 값). #358 이 보고한 증상은 space 만이며, owner_id 를 실은 파일이
+# 실 데이터에 없으므로 이 PR 은 owner_id 를 **라이브 쪽에서만** 뺀다(#148
+# 이래 동작, main 과 동일). principal 교체 시의 재스탬프(값이 다를 때 Q2=Yes
+# 로 재기록을 강제하는 것)는 #358 의 space 버그와 무관한 별개 개선이고,
+# 그 재스탬프 로직 자체가 리뷰 4 회 연속으로 결함을 낸 축이었다. 별도
+# 이슈로 리드에 접수했다(이 파일의 수정 범위 밖).
+#
+# ── pack (RETIRED_KEYS) : Q1≈No, Q2=No ──
+# `apply_pack_tag`(opencrab/common/pack_tags.py) 가 파일 쪽 원시 pack 값을
+# 항상 버리고 pack_id 로 대체하므로 파일 쪽 props 에 남을 경로가 없다.
+# `canonicalize_pack_alias` 와 `pack_provenance.py` 의 마이그레이션 코드가
+# 이 키의 존재를 별칭 검증·정리 목적으로 읽지만, 그 경로는 증분 same/chg
+# 비교와 무관하다 — 이 비교가 값을 다르게 봐서 재기록해야 할 소비자는
+# 없다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로 잡힌다.
 # 재기록으로 지워지지도 않는다 — neo4j 의 upsert 는 전달된 키만 SET 하므로
-# `pack` 없는 dict 를 써도 기존 속성이 남고, 그래서 그 재기록이 영구히 반복된다.
-# 남아 있어도 읽는 코드가 0곳이라 무해하다(`common/pack_tags.py` 참고).
+# `pack` 없는 dict 를 써도 기존 속성이 남고, 그래서 그 재기록이 영구히
+# 반복된다. 라이브 쪽에서만 뺀다.
+#
+# 새 키를 추가할 때는 위 두 질문부터 답하고, Q1=Yes 면 space 처럼 양쪽에서
+# 같이 빼라.
+STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
 INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
+
+# 파일 쪽에서만 추가로 빼는 키(#358). Q1=Yes 라서 양쪽 다 빼야 하는 것 중
+# 라이브 쪽은 위 `INCREMENTAL_IGNORED_KEYS` 가 이미 포함한다(space). RETIRED_KEYS
+# 는 위 설명대로 파일 쪽에 실릴 경로가 없어 넣어도 동작에 차이가 없지만,
+# `INCREMENTAL_IGNORED_KEYS` 와 대칭인 이름으로 남겨 둔다.
+FILE_SIDE_IGNORED_KEYS = frozenset({"space"}) | RETIRED_KEYS
 
 
 # ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
@@ -1864,14 +1913,57 @@ def load_nodes_incremental(
 
         live = live_nodes.get(node_id)
         if live is not None:
-            # **스토어가 주입하는 키는 비교에서 뺀다.** 한동안 `id` 하나만 뺐는데,
-            # upstream 이 `space_id`/`properties[space]` 우선순위를 통합하면서
-            # `space` 도 주입하게 됐고(#125), 그 순간 **동일한 행이 전부 chg 로
-            # 판정돼 매 증분마다 전량 재적재**된다. 이름을 하나 더 적는 대신
-            # "스토어가 넣는 것"이라는 축으로 묶는다.
+            # **id/space/owner_id/pack 은 라이브 쪽에서만 뺀다, space 만 파일
+            # 쪽에서도 뺀다(#358).** `INCREMENTAL_IGNORED_KEYS`/
+            # `FILE_SIDE_IGNORED_KEYS` 의 정의(위 주석)가 설명하듯, space 는
+            # 양쪽에 다 나타날 수 있어 한쪽에서만 걸러내면 그 쪽에서만 키가
+            # 사라져 나머지 값이 전부 같아도 딕셔너리 비교가 깨진다. 파일
+            # 쪽이 레거시 중첩 `properties.space` 를 갖고 오는 노드가 매
+            # 증분 전량 chg 로 고정되는 것이 그 증상이다. 비교에만 쓰는
+            # 사본이므로 저장 시 넘기는 `props` 자체는 아래에서 그대로
+            # (필터 없이) 쓴다.
             live_props = {k: v for k, v in live[2].items()
                           if k not in INCREMENTAL_IGNORED_KEYS}
-            if live[0] == node_type and live_props == props:
+            file_props = {k: v for k, v in props.items()
+                          if k not in FILE_SIDE_IGNORED_KEYS}
+            # live[1] == space(#358 재리뷰 P1-A): 그래프의 실제 space_id 컬럼과
+            # 이번 파일이 배정하는 목표 space 를 same 판정이 비교한다. 레거시
+            # 중첩 `properties.space` 를 실은 행의 space 전용 갱신이 그래프
+            # 쓰기 실패로 반쯤만 반영된 상태에서, `FILE_SIDE_IGNORED_KEYS` 가
+            # `space` 를 파일 쪽 properties 비교에서 빼는 이번 대칭화 때문에 이
+            # 컬럼을 안 보면 same 으로 오판돼 그래프가 잘못된 space 에 영구히
+            # 남는다. `live[1]` 이 None(레거시 미기록)이면 이 비교가 항상
+            # 불일치라 chg 로 낙하한다 — 회수(backfill) 방향이라 안전하다.
+            #
+            # 싱크 완전성 표(#358 재리뷰, 리드 요청) — `add_node`
+            # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
+            # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
+            # 잡는지 전수 정리한다. 설계 근거:
+            # /home/asdf/orch-scratch/o358/design-r7-doc-owner-missing-key.md
+            #
+            # | 저장소                          | same 뒤 어긋날 수 있는가 | 잡는 조건                                    |
+            # |----------------------------------|--------------------------|-----------------------------------------------|
+            # | graph(노드+인접 edge 타입 스냅샷) | 그렇다(그래프 쓰기 실패) | live_props==file_props, live[1]==space(P1-A). edge 타입 스냅샷은 노드 갱신과 같은 트랜잭션(_sql_graph_base.py, neo4j_store.py)이라 독립 축이 아니다 |
+            # | docs(행 존재, 일반 노드)          | 그렇다                   | doc_row_missing(R2)                            |
+            # | docs(행 존재/공간 잔재, 앵커)     | **그렇다(의도적 미검사, 이번 라운드가 만든 gap 아님)** | 없음. F4-b 가 doc_node_spaces 조회에서 앵커를 빼고, R2 가 doc_row_missing 에도 같은 제외를 걸어 그 오탐(앵커마다 매 런 행 부재로 오판)을 막았다 |
+            # | docs(공간 잔재, 일반 노드)        | 그렇다                   | _cleanup_stale_doc_spaces(F4-c)                |
+            # | docs.properties.owner_id          | **그렇다, 이 PR 은 안 잡는다(범위 좁힘, 위 상수 주석 참고)** | 없음. owner_id 는 스키마 정의가 없는 순수 시스템 스탬프 필드라 실 데이터에 파일 쪽 owner_id 가 실리지 않는다(2026-09-14 실측: grammar/schema 전역에 owner_id 필드 정의 0건). 안 실리면 재스탬프가 영영 안 되고, 실리면 매 런 전량 재기록이 된다. 양방향으로 어긋난 계약이라 #378 로 이관 |
+            # | docs.node_type                    | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. 문서 upsert 가 자기 node_type 컬럼도 쓰지만 이 비교는 그래프의 node_type 만 본다. same 판정이 문서 sink 자신의 값을 보지 않는 것과 같은 기전이라 #374 로 이관 |
+            # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음. 위 node_type 과 같은 기전(same 판정이 문서 sink 자신의 값을 안 본다)이라 #374 로 이관한다. codex 재리뷰(2026-09-14)가 지목한 부분 기록 잔존(원본이 properties.space 를 실은 채 다른 속성만 바뀌고 upsert_node_doc 실패)도 이 축이다. space 대칭 필터 이전에는 이 행들이 매 런 chg 로 강제돼 부분 기록 어긋남이 우연히 자가 치유됐다. 이 PR 이 그 우연한 치유를 없앤다 |
+            # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
+            # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
+            # | vector(노드 임베딩)               | **그렇다, 이 PR 은 안 잡는다** | 없음. load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴이 청크에는 있지만 노드에는 아직 없다. #377 로 이관 |
+            #
+            # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
+            # #374(same 판정이 문서 sink 자신의 값을 보지 않는다), docs(audit_log)
+            # 는 #375, sql(registry)는 #376, vector(노드)는 #377, owner_id 는
+            # #378 로 각각 이관했다. "add_node 가 여러 저장소에 나눠 쓰고 부분
+            # 실패가 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space 대칭
+            # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과
+            # 성격이 다르다. 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
+            # R2(`1f97bb3`)가 이미 받아들인 기존 설계 경계이므로 이슈로 묶지 않는다.
+            if (live[0] == node_type and live_props == file_props
+                    and live[1] == space):
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                 # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
                 # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미

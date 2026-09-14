@@ -497,7 +497,80 @@ class TestLoadNodesIncremental:
         assert all("legacy_only_key" not in props for _t, _s, props in left.values()), (
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
+    def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path):
+        """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
 
+        파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
+        생산자가 흔히 쓰는 형태), `absorb_legacy_top_level` 의 stray 판정은
+        `space` 를 건드리지 않는다. `space` 는 `NODE_STRUCT_KEYS` 소속이라
+        stray 후보에서 애초에 빠지고, 중첩 값은 별도 merge 없이 그대로 흘러
+        최종 `props` 에 남는다. 그런데 판정식은 `live_props == props` 로
+        파일 쪽 `props` 를 거르지 않은 채 그대로 쓴다. 라이브 쪽에는 스토어가
+        `space` 를 주입하고 그 값을 필터로 걸러내므로, 같은 키 하나가 파일
+        쪽에만 살아남아 두 딕셔너리가 영원히 다르게 남는다.
+
+        1차는 신규 적재라 `new` 가 정상이다. **불변식이 판정되는 자리는 2차다.**
+        같은 파일을 다시 돌렸을 때 라이브와 파일이 실제로는 동일한 노드인데도
+        `chg` 로 잡히면 증분이 이 노드에서 매 런 전량 재기록으로 퇴화한다.
+        """
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "nodes.jsonl",
+                          [_node(id="n1", properties={"space": "concept"})])
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])[:5]
+
+        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+        assert _run() == (0, 0, 1, 0, 0), (
+            "2차 런이 same 으로 수렴하지 않았다 — 파일 쪽 properties.space 가 "
+            "FILE_SIDE_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
+
+    def test_stale_live_space_column_is_corrected_even_when_properties_match(
+        self, live, tmp_path
+    ):
+        """**#358 재리뷰 P1-A 회귀.** same 판정은 properties 뿐 아니라 그래프의
+        실제 `space_id` 컬럼(`live[1]`)도 목표 space 와 맞는지 봐야 한다.
+
+        `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 가 `space` 를 양쪽
+        properties 비교에서 뺀다(파일 쪽 레거시 중첩 `properties.space`
+        대칭화, #358). 그런데 그 필터를 걸고 나면 properties 만으로는 space
+        불일치를 볼 방법이 없어진다. 레거시 중첩-space 이관 행이 그래프의
+        실제 `space_id` 는 구 space 에 남긴 채 절반만 반영돼도, properties
+        가 우연히 같으면 `same` 으로 잡혀 잘못된 space 에 영구히 머문다.
+        파일은 최상위 `space` 만 실은 평범한 행이다. 중첩 형태가 아니어도
+        컬럼 자체가 드리프트하면 같은 결함이 재현된다.
+
+        라이브 행을 직접 드리프트시킨다(write_gate 를 거치지 않고 그래프의
+        space_id 컬럼만 바꿔 과거의 부분 실패 잔재를 모사한다).
+        """
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", space="resource")])
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])[:5]
+
+        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        seeded = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        node_type, space, props = seeded["n1"]
+        digest = graph.get_node_digest("n1", node_type=node_type)
+        graph.update_node("n1", digest, node_type, props, "concept")
+
+        drifted = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        assert drifted["n1"][1] == "concept", "사전 조건: space_id 드리프트가 실제로 적용됐다"
+
+        assert _run() == (0, 1, 0, 0, 0), (
+            "그래프의 실제 space_id 가 목표 space 와 다른데 chg 로 안 잡히면 "
+            "레거시 중첩-space 행이 잘못된 space 에 영구히 남는다(#358 재리뷰 P1-A)")
+        after = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        assert after["n1"][1] == "resource", (
+            "재기록이 일어났는데도 space_id 가 드리프트한 값에 머물러 있다")
 class TestLoadEdges:
     def _map(self):
         return {"n1": ("resource", "Document"), "n2": ("resource", "Document")}
@@ -4547,7 +4620,8 @@ class TestDocSpaceResidueCleanup:
 
         # 같은 파일을 다시 적재 — 노드 자체는 안 바뀌었으므로 same 경로를 타야 한다.
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", nf, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", nf, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"])
         assert n_same == 1, f"전제 위반 — same 경로가 아니다: new={n_new} chg={n_chg} same={n_same}"
 
         left_spaces = {r[0] for r in docs._conn.execute(
@@ -4624,7 +4698,8 @@ class TestDocSpaceResidueCleanup:
         nf2 = _write_jsonl(tmp_path / "n2.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", nf2, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
@@ -4658,7 +4733,8 @@ class TestDocSpaceResidueCleanup:
                            [_node(id="n1", node_type="File", space="resource",
                                   properties={"버전": "2"})])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", nf2, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
