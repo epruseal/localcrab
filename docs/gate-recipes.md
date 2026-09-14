@@ -143,6 +143,7 @@ pytest tests/ -v
 
   ```bash
   (
+    rm -f /tmp/<워크트리 식별자>-run.log
     cd <워크트리> || exit 17
     set -o pipefail
     PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
@@ -170,8 +171,10 @@ pytest tests/ -v
   재확인 가능해야 하기 때문이다. 터미널에만 찍히고 로그에 안 남으면
   그 순간 지나간 값은 다시 볼 수 없다(`BLOCK_EXIT` 자체는 로그가 아니라
   터미널에만 남지만, `cd`가 성공한 한 그 값은 로그 마지막 줄의
-  `EXIT:$code`와 같으므로 로그만으로도 재확인된다. 둘이 다르면
-  `BLOCK_EXIT`가 17인 `cd` 실패 경로다).
+  `EXIT:$code`와 같으므로 로그만으로도 재확인된다. `cd`가 실패하면
+  서브셸 맨 앞의 `rm -f`가 이미 지워 둔 로그 파일 자체가 생기지 않으므로
+  비교할 `EXIT:` 줄도 없다. 이 부재 자체가 `BLOCK_EXIT`가 17인 `cd` 실패
+  경로라는 신호다. 자세한 근거는 아래 `cd` 실패 처리 문단을 참고한다).
 
   맨 앞의 `cd <워크트리>`는 생략할 수 없다: `tests/`는 cwd 기준 상대
   경로이고, `python -m pytest`는 cwd를 `sys.path[0]`에 넣으므로 소스
@@ -188,14 +191,28 @@ pytest tests/ -v
   다른 플러그인의 값과 겹칠 가능성 자체를 원천 차단하지는 못한다. 다만
   이 저장소 자체 코드에는(`.venv`의 pytest 자체 제외) `returncode=17`이나
   `sys.exit(17)` 호출이 전수 grep으로 0건이라 지금은 이 워크트리에서
-  충돌이 없다. 구조적으로도 한 번 더 갈린다: `cd`가 실패하면 `exit 17`이
-  그 뒤의 `set -o pipefail`도 pytest 파이프라인도 전혀 실행하지 않으므로
-  로그 파일에 `collected` 줄도 `EXIT:` 줄도 전혀 안 남는다. 반대로
-  pytest가 정말 17을 낸 경우라면(이 저장소에선 없지만) 로그에 `collected`
-  줄이 있을 것이다. 즉 `BLOCK_EXIT:17`이면서 로그에 `collected` 줄이
-  없으면 `cd` 실패로, 있으면 pytest 자신이 낸 값으로 갈라 읽는다. 이
-  전체를 서브셸 `( ... )`로 감싸는 이유는 그래야 `exit 17`이 그 서브셸만
-  끝내고 호출한 셸 자체를 종료시키지 않기 때문이다.
+  충돌이 없다. 다만 이 grep은 이 순간의 관측일 뿐 미래의 모든 충돌
+  가능성을 증명하지 않는다.
+
+  `collected N items` 줄의 유무로 `cd` 실패와 pytest 자신의 17을
+  가르는 방법은 성립하지 않는다: 어떤 conftest나 플러그인이 수집이
+  끝나기 전(`pytest_sessionstart` 등)에 `pytest.exit(msg,
+  returncode=17)`을 부르면 pytest는 `collected` 줄을 한 번도 찍지
+  않고 종료 코드 17로 끝난다(적대검증에서 이 경로를 실측으로
+  재현했다). 그래서 서브셸 맨 앞에 `rm -f
+  /tmp/<워크트리 식별자>-run.log`를 둔다: 이전 실행의 로그가 남아
+  있으면 `cd`가 실패해 이번 파이프라인이 전혀 안 돌았는데도 지난
+  실행의 `collected` 줄이 로그에 그대로 남아 오판정을 낳기 때문이다.
+  로그를 미리 지워 두면 판별 기준은 `collected` 줄이 아니라 **로그
+  파일 자체의 존재**로 단순해진다: `cd`가 실패하면 `exit 17`이 그 뒤의
+  `set -o pipefail`도 `tee`도 전혀 실행하지 않으므로 로그 파일이 아예
+  생기지 않는다. 반대로 `cd`가 성공해 파이프라인이 한 번이라도
+  시작되면 `tee`가 파일을 열어 만들어 두므로, pytest가 그 안에서 얼마나
+  일찍 `pytest.exit`으로 끝나든 로그 파일 자체는 존재한다(내용이
+  비어 있거나 짧을 수는 있다). 즉 `BLOCK_EXIT`가 17이면서 로그 파일이
+  없으면 `cd` 실패이고, 파일이 있으면(비어 있어도) pytest 자신이 낸
+  값이다. 이 전체를 서브셸 `( ... )`로 감싸는 이유는 그래야 `exit 17`이
+  그 서브셸만 끝내고 호출한 셸 자체를 종료시키지 않기 때문이다.
 
   종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
   1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
@@ -225,8 +242,14 @@ pytest tests/ -v
 아래 판정 절차 4번의 `grep -c '^!'`가 0을 내는 실측 반례가 있다(같은
 테스트를 `PY_COLORS=1`로 강제해 배너가 있는데도 grep이 0을 내는 것과
 `PY_COLORS=0`으로 강제해 다시 1을 내는 것 모두 확인했다). `PY_COLORS=0`을
-env에 고정하면 주변 환경이 무엇이든 무색 출력이 보장된다. 이 세 조건과
-`PY_COLORS=0`은 재현 명령의 고정 형태이지 판정 근거가 아니다.
+env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `--color`를
+따로 넘기지 않는 한) 무색 출력이 보장된다. `--color=yes`/`--color=no`를
+나중에 CLI 인자로 붙이면 `PY_COLORS` 값과 무관하게 그 인자가 이긴다
+(`_pytest/config/__init__.py`가 `TerminalWriter` 생성 뒤 `hasmarkup`을
+`config.option.color`로 덮어쓴다). 이 문서의 고정 명령 자체는 `--color`를
+쓰지 않으므로 해당하지 않는다. 다만 변형 명령에 `--color`를 끼워 넣으면
+이 보장이 깨진다. 이 세 조건과 `PY_COLORS=0`은 재현 명령의 고정 형태이지
+판정 근거가 아니다.
 **이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
 `addopts`, `-p` 플러그인, 상위 `conftest.py` 등 같은 일을 하는 경로가 더
 있을 수 있고, 전부 나열하는 쪽으로는 닫히지 않는다. 그래서 판정은 아래
@@ -242,23 +265,27 @@ env에 고정하면 주변 환경이 무엇이든 무색 출력이 보장된다.
 
 1. 각 실행의 `BLOCK_EXIT` 값(재현 명령 맨 끝의 `echo "BLOCK_EXIT:$?"`가
    낸 값)을 기록한다.
-2. `BLOCK_EXIT`가 17이고 로그에 `collected` 줄이 없으면 `cd`가 실패해
-   pytest가 아예 실행되지 않은 것이다. 17은 이 문서가 고른 sentinel이지
+2. `BLOCK_EXIT`가 17이고 로그 파일(`/tmp/<워크트리 식별자>-run.log`)
+   자체가 없으면 `cd`가 실패해 pytest가 아예 실행되지 않은 것이다(서브셸
+   맨 앞의 `rm -f`가 매번 로그를 비우므로 이 파일 부재는 이번 실행이
+   `tee`까지 한 번도 못 갔다는 뜻이다). 17은 이 문서가 고른 sentinel이지
    pytest `ExitCode` 계약값이 아니다(근거는 위 6절 "17로 즉시" 문단
    참고). 그 자체로 미완주이며 diff를 내지 않고 워크트리 경로부터
-   고친다. `BLOCK_EXIT`가 17이 아니거나, 17이면서 로그에 `collected`
-   줄이 있으면 그 값은 pytest 자신의 종료 코드다. 0(전부 통과) 또는
-   1(실패 있음, 또는 tripwire 중단)이 아니면
+   고친다. `BLOCK_EXIT`가 17이 아니거나, 17이면서 로그 파일이 있으면
+   (내용이 비어 있어도) 그 값은 pytest 자신의 종료 코드다. 0(전부 통과)
+   또는 1(실패 있음, 또는 tripwire 중단)이 아니면
    역시 그 자체로 미완주다. pytest의 종료 코드 계약상 2는 실행
    중단(예: `KeyboardInterrupt`), 3은 내부 오류, 4는 사용법 오류, 5는
-   미수집, 6은 `--max-warnings` 초과다(`_pytest/config/__init__.py`의
-   `ExitCode` 열거값 전량, 이 워크트리가 설치한 pytest 9.1.1 소스로
-   확인했다). 6번은 `--max-warnings`를 실제로 넘겨야만 나오는데
-   `pyproject.toml`과 `Makefile` 어디에도 그 플래그가 없고 위 재현
-   명령도 넘기지 않으므로 이 고정 재현 명령으로는 도달할 수 없다. 그래도
-   나열은 계약 전량을 적어 사용자가 임의로 `--max-warnings`를 끼워 넣는
-   변형 명령을 쓸 때 6이 뜻하는 바를 바로 찾게 한다. 어느 코드든 diff를
-   내지 않고 원인부터 조사한다.
+   미수집, 6은 경고 수 초과다(`_pytest/config/__init__.py`의 `ExitCode`
+   열거값 전량, 이 워크트리가 설치한 pytest 9.1.1 소스로 확인했다). 6번은
+   CLI `--max-warnings`나 이와 동등한 `pytest.ini`/`pyproject.toml`의
+   `max_warnings` 설정을 실제로 넘겨야만 나오는데(`_pytest/terminal.py`의
+   `_get_max_warnings`가 이 둘을 이 순서로 본다) 둘 다 이 저장소의
+   `pyproject.toml`과 `Makefile`에 없고 위 재현 명령도 넘기지 않으므로
+   이 고정 재현 명령으로는 도달할 수 없다. 그래도 나열은 계약 전량을
+   적어 사용자가 임의로 `--max-warnings`를 끼워 넣는 변형 명령을 쓸 때
+   6이 뜻하는 바를 바로 찾게 한다. 어느 코드든 diff를 내지 않고
+   원인부터 조사한다.
 3. `BLOCK_EXIT`가 1이면 PG tripwire(`tests/conftest.py`)는 DB명이 `_test`로
    안 끝나면 `pytest.exit(...)`로 세션 전체를 즉시 중단하며 이때도 종료
    코드가 1이다. 로그에 고정 마커 `[PG tripwire]`(tripwire가 내는 메시지
