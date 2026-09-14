@@ -40,14 +40,14 @@ python3 -m venv .venv
 ## 2. import 경로 확인
 
 ```bash
-cd /tmp && <워크트리>/.venv/bin/python -c "import os, opencrab; print(os.path.realpath(opencrab.__file__))"
+cd /tmp && "<워크트리>/.venv/bin/python" -c "import os, opencrab; print(os.path.realpath(opencrab.__file__))"
 ```
 
 cwd에 `opencrab/`이 없는 중립 디렉터리(예: `/tmp`)에서 대상 워크트리 venv의
 python으로 실행하고, 출력 경로가 그 워크트리를 가리키는지 확인한다. 활성화
 없이 venv 인터프리터 경로를 직접 지정하는 이유는 활성화에 기대면 다른 셸에서
 잘못된 venv가 이미 활성 상태일 때 그 사실이 드러나지 않기 때문이다. 같은
-위치에서 `<워크트리>/.venv/bin/python -P`(Python 3.11+, safe-path)로도 동일
+위치에서 `"<워크트리>/.venv/bin/python" -P`(Python 3.11+, safe-path)로도 동일
 확인이 가능하다.
 
 **대상 워크트리 자신의 cwd에서 실행하면 안 되는 이유**: `python -c`는
@@ -61,7 +61,7 @@ opencrab 미설치 시스템 python도) 통과해버리는 자기충족 오류�
 ## 3. 린트
 
 ```bash
-<워크트리>/.venv/bin/ruff check .
+"<워크트리>/.venv/bin/ruff" check .
 ```
 
 `make lint`(`ruff check opencrab tests`)와 다른 점은 `pyproject.toml`의
@@ -72,8 +72,8 @@ opencrab 미설치 시스템 python도) 통과해버리는 자기충족 오류�
 확인한다:
 
 ```bash
-diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
-     <(<워크트리>/.venv/bin/ruff check --show-files opencrab tests 2>&1 | sort)
+diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
+     <("<워크트리>/.venv/bin/ruff" check --show-files opencrab tests 2>&1 | sort)
 ```
 
 (위반 건수를 세는 `cut -d: -f1` 방식은 위반이 0건이면 아무 경로도 안
@@ -83,7 +83,7 @@ diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
 ## 4. 전체 스위트 실행과 필수 환경변수
 
 ```bash
-<워크트리>/.venv/bin/pytest tests/ -v
+"<워크트리>/.venv/bin/pytest" tests/ -v
 ```
 
 - `OPENCRAB_PG_TEST_URL`: PG 파리티 테스트 게이트. DB명이 `_test`로 끝나야
@@ -129,13 +129,13 @@ diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
 적지 않는다(다음 커밋에 바뀐다).
 
 - **PG 파리티 테스트**: `OPENCRAB_PG_TEST_URL` 미설정 시 자동 skip.
-  재현: `<워크트리>/.venv/bin/pytest tests/ -v -k pg` (env 미설정 상태).
+  재현: `"<워크트리>/.venv/bin/pytest" tests/ -v -k pg` (env 미설정 상태).
 - **에이전트 플러그인 스모크 테스트**: `OPENCRAB_SMOKE_BIN_DIR`도
   `shutil.which("opencrab")`도 못 찾으면 실패(스킵 아님). 재현:
-  `<워크트리>/.venv/bin/pytest tests/test_agent_plugin_smoke.py -v`
+  `"<워크트리>/.venv/bin/pytest" tests/test_agent_plugin_smoke.py -v`
   (PATH에서 `opencrab` 실행파일을 뺀 상태).
 - **통합 테스트(Neo4j, MongoDB, Chroma)**: `OPENCRAB_INTEGRATION=1` 미설정
-  시 스킵. 재현: `OPENCRAB_INTEGRATION=1 <워크트리>/.venv/bin/pytest tests/ -v`
+  시 스킵. 재현: `OPENCRAB_INTEGRATION=1 "<워크트리>/.venv/bin/pytest" tests/ -v`
   (해당 서비스가 로컬에 없는 상태에서 실행하면 접속 실패로 드러난다).
 
 ## 6. 회귀 대사
@@ -154,11 +154,11 @@ diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
   ```bash
   (
     rm -f /tmp/<워크트리 식별자>-run.log /tmp/<워크트리 식별자>-run.xml
-    cd <워크트리> || exit 17
+    cd "<워크트리>" || exit 17
     set -o pipefail
     PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
-    OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
-    <워크트리>/.venv/bin/python -m pytest tests/ \
+    OPENCRAB_SMOKE_BIN_DIR="<워크트리>/.venv/bin" \
+    "<워크트리>/.venv/bin/python" -m pytest tests/ \
       --basetemp=/tmp/<워크트리 식별자>-basetemp \
       --junit-xml=/tmp/<워크트리 식별자>-run.xml \
       2>&1 | tee /tmp/<워크트리 식별자>-run.log
@@ -187,7 +187,7 @@ diff <(<워크트리>/.venv/bin/ruff check --show-files . 2>&1 | sort) \
   비교할 `EXIT:` 줄도 없다. 이 부재 자체가 `BLOCK_EXIT`가 17인 `cd` 실패
   경로라는 신호다. 자세한 근거는 아래 `cd` 실패 처리 문단을 참고한다).
 
-  맨 앞의 `cd <워크트리>`는 생략할 수 없다: `tests/`는 cwd 기준 상대
+  맨 앞의 `cd "<워크트리>"`는 생략할 수 없다: `tests/`는 cwd 기준 상대
   경로이고, `python -m pytest`는 cwd를 `sys.path[0]`에 넣으므로 소스
   트리까지 cwd를 따라간다. 2번 절과 반대로 여기서는 cwd가 대상
   워크트리 자신이어야 그 워크트리의 테스트와 소스를 본다. `cd`가
@@ -326,7 +326,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
 4. xml 파일이 있으면 아래 스크립트로 완주 여부와 실패/에러 id 집합을
    함께 얻는다. `<워크트리>`는 재현 명령과 같은 워크트리 경로다:
    ```bash
-   python3 - /tmp/<워크트리 식별자>-run.log /tmp/<워크트리 식별자>-run.xml <워크트리> <<'PYEOF'
+   python3 - "/tmp/<워크트리 식별자>-run.log" "/tmp/<워크트리 식별자>-run.xml" "<워크트리>" <<'PYEOF'
    import re
    import sys
    import xml.etree.ElementTree as ET
@@ -622,8 +622,8 @@ id 집합도 양쪽 다 `{test_a, test_b}`로 같다). 전량 id 집합 diff만�
 실행이 통과해야 한다):
 
 ```bash
-<워크트리>/.venv/bin/python scripts/qa/mutate_module.py <리포루트> --all [결과.json]
-<워크트리>/.venv/bin/python scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
+"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py <리포루트> --all [결과.json]
+"<워크트리>/.venv/bin/python" scripts/qa/mutate_module.py <리포루트> <모듈> <테스트>[,<테스트>...] [결과.json]
 ```
 
 반드시 클론/워크트리 위에서 실행한다(대상 파일을 직접 변형했다가
