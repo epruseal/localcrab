@@ -711,6 +711,43 @@ class TestLoadNodesIncremental:
         assert n_same == 0, (
             "space=null + 중첩 concept + owner_id NaN 조합이 same 으로 통과했다(#379)")
 
+    def test_normalized_space_reassignment_avoids_false_doc_row_missing(
+            self, live, tmp_path, caplog):
+        """**#379 설계 3장 후반부 약속.** `prepare_node` 검증에 성공하면 이후
+        처리(`#301` 이 보는 "현재 행의 space")가 참조하는 지역 변수를
+        정규화된 `space` 로 재대입해야 한다. 이 파일의 최상위 `space` 는
+        `None` 이고 중첩 `properties.space` 만 `"concept"` 를 실어, 두 값이
+        정규화 전에는 다르다(`prepare_node` 가 성공적으로 `"concept"` 로
+        합친다). 재대입을 빼면 이 함수가 doc 조회에 원본 `None` 을 써
+        실재하는 `concept/n1` doc 행을 유실로 오판해 `#301` 의
+        `doc_row_missing` 회수 카운터가 거짓으로 올라가고 skip 으로
+        떨어진다. 이 값은 owner_id 를 싣지 않아 `prepare_node` 검증 자체는
+        통과하므로, 검증 거부가 아니라 재대입 유무만 이 테스트의 대상이다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space=None,
+                                  properties={"space": "concept"})])
+        with caplog.at_level(logging.WARNING):
+            n_new, n_chg, n_same, skip, err, _bypack_ids = _run(f2)
+        assert (n_new, n_chg, skip, err) == (0, 0, 0, 0), (
+            "정규화 후 같은 노드는 same 이어야 한다"
+            f"(n_new={n_new} n_chg={n_chg} skip={skip} err={err})")
+        assert n_same == 1, "최상위/중첩 space 표현만 다르고 정규화 값은 같으면 same 이어야 한다"
+        assert not any("doc 행 유실 회수" in r.getMessage() for r in caplog.records), (
+            "space 재대입 누락으로 존재하는 doc 행을 유실로 오판했다(#301 오경보, #379)")
+
 
 class TestLoadEdges:
     def _map(self):
