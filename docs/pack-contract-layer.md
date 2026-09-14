@@ -143,6 +143,12 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   적재라면 거부될 값이 증분에서만 통과하는 부류를 필터 키 구성과 무관하게 막는다.
   `prepare_node` 검증에 실패하면 그 행은 `same` 후보에서 빠진다. 이 검증이 비교
   단계 이후 쓰기 시도가 어느 카운터(skip/chg/err)로 떨어지는지는 정하지 않는다.
+  `prepare_node` 가 반환한 `props` 는 원본에 없어도 `id` 를 항상 채워 넣으므로,
+  `FILE_SIDE_IGNORED_KEYS` 도 #379 부터 `id` 를 포함한다(안 빼면 파일 쪽에만 이
+  키가 구조적으로 남아 값이 같아도 매번 chg 로 어긋난다). `owner_id` 는
+  `prepare_node` 가 값을 손대지 않으므로 대칭화 대상이 아니며, 기존 설계대로
+  `INCREMENTAL_IGNORED_KEYS`(라이브 쪽)에만 남는다: 파일이 owner_id 를 실으면
+  값과 무관하게 항상 chg 로 재기록된다(#378).
 - **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
   파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
   전량 치환하므로 **그 다음 런은 same 으로 복귀한다.** 전량 chg 를 한 번 보는 것 자체는
