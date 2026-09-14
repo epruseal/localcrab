@@ -135,17 +135,22 @@ class Pack:
         raw, rel = label, label
         if ss and tt:
             allowed = _ALLOWED.get((ss, tt))
-            if allowed and label.lower() in allowed:
-                rel = label.lower()
-            elif (ss, tt) in _KEEP:
+            if (ss, tt) in _KEEP:
                 rel = _KEEP[(ss, tt)]                       # 로더가 reverse 처리 (claim에서 evidence로)
             else:
-                # #387: 적재기와 같은 판정 함수(resolve_edge)로 매핑을 거친 뒤 허용 집합을
-                # 본다. 매핑이 이미 정합으로 보는 라벨을 대표 관계로 오판해 치환하지 않기
-                # 위함이다(매니페스트 전수 대사 14건, 예: lever->outcome AFFECTS는 raises가
-                # 아니라 optimizes가 맞다). traceability 원천은 evidence/resource로 반전하지
-                # 않는다(trace_guard: 채점기의 정방향 근거 연결 계산 보호, 아래 역방향 폴백의
-                # 가드와 동일 조건이라 이 반전도 그 가드에 걸린다).
+                # #387 v2: 정합 첫 시험을 적재기와 같은 판정 함수(resolve_edge) 하나로
+                # 수렴시킨다. v1은 이 분기 앞에 `label.lower() in allowed` 직접-일치를 별도
+                # 분기로 두었다: 원본 라벨이 그 공간쌍의 다른 허용 관계명과 우연히 소문자로
+                # 겹치면 매핑표를 아예 거치지 않는 결함이 있었다(매니페스트 전수 대사 17건 중
+                # 3건, 예: concept->concept DEPENDS_ON은 매핑표가 related_to를 지시하지만
+                # 직접-일치가 먼저 걸리면 depends_on이 그대로 쓰였다). resolve_edge는 매핑표에
+                # 없는 라벨을 label.lower()로 반전 없이 폴백하므로(정본: normalize.py), 직접
+                # 일치 분기를 별도로 둘 필요가 없다: 이 함수 하나로 완전히 흡수된다. matching
+                # 라벨이 이 공간쌍에서 무효면 그대로 아래 FIX 폴백 사슬로 떨어진다(매니페스트
+                # 전수 대사 14건, 예: lever->outcome AFFECTS는 raises가 아니라 optimizes가
+                # 맞다). traceability 원천은 evidence/resource로 반전하지 않는다(trace_guard:
+                # 채점기의 정방향 근거 연결 계산 보호, 아래 역방향 폴백의 가드와 동일 조건이라
+                # 이 반전도 그 가드에 걸린다).
                 m_ss, m_rel, m_tt, m_rev = resolve_edge(raw, ss, tt)
                 m_allowed = _ALLOWED.get((m_ss, m_tt))
                 trace_guard = ss in _TRACE_SRC and tt in ('evidence', 'resource')

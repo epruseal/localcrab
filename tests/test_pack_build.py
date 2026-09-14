@@ -212,9 +212,13 @@ class TestEdge:
 class TestEdgeUsesLoaderMappingBeforeFix:
     """#387: 적재기(resolve_edge)가 이미 정합으로 보는 라벨을 `Pack.edge()`가
 
-    대표 관계(FIX)로 오판해 치환하지 않는지 검증한다. 첫 시험이 `label.lower() in
-    allowed`뿐이면 적재기가 다르게 매핑하는 라벨을 놓친다. 아래 14건은 매니페스트
-    전수 대사(설계 2절)로 확정한 실제 반례다.
+    대표 관계(FIX)로 오판해 치환하지 않는지 검증한다. 아래 17건은 매니페스트 전수
+    대사(설계 2절)로 확정한 실제 반례다. 앞 14건(부류 A)은 라벨이 그 공간쌍의 허용
+    관계 어디와도 직접 일치하지 않던 자리고, 뒤 3건(부류 B)은 라벨의 소문자형이
+    같은 공간쌍의 **다른** 허용 관계와 우연히 일치해 구 버전(v1)의 직접일치 우선
+    분기가 매핑표 대신 그 우연한 일치를 골랐던 자리다. 이 파라미터화 시험은 각 행을
+    이름으로 읽을 수 있게 남긴 것이고, 실제 회귀 검출은 아래
+    `test_full_sweep_matches_loader_resolution`가 5,103개 조합 전수로 담당한다.
     """
 
     MANIFEST_AUDIT_ROWS = [
@@ -232,6 +236,9 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         ("policy", "resource", "CONSTRAINS", "restricts", False),
         ("resource", "evidence", "CITES", "derived_from", False),
         ("resource", "evidence", "SUPPORTS", "derived_from", False),
+        ("concept", "concept", "DEPENDS_ON", "related_to", False),
+        ("lever", "outcome", "STABILIZES", "optimizes", False),
+        ("policy", "evidence", "SUPPORTS", "cites", False),
     ]
 
     @pytest.mark.parametrize(
@@ -279,6 +286,82 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         pack.edge("c", "r", "COMPLIES_WITH")
         assert pack.edges == []
         assert sum(pack._eskip.values()) == 1
+
+    def test_full_sweep_matches_loader_resolution(self, pack):
+        """설계 5절 받아들임 기준: `Pack.edge()`가 63개 라벨 x 81개 공간쌍 = 5,103개
+
+        조합 전수에서 내는 최종 결과(관계, 방향, 또는 skip)가, 이 시험이 `resolve_edge`
+        와 `ALLOWED`/`FIX`/`KEEP`/`TRACE_SRC` 표만으로 이 파일 안에서 독립으로 다시
+        계산한 5단계 오라클과 정확히 일치해야 한다. 오라클은 `Pack.edge()`의 내부
+        분기를 재사용하지 않는다. 불일치 목록이 끝에 비어 있는지 한 번만 단언한다.
+        """
+        from opencrab.pack.normalize import LABEL_SPACE_OVERRIDE, REL_MAP, resolve_edge
+        from opencrab.pack.schema import ALLOWED, FIX, KEEP, TRACE_SRC
+
+        labels = sorted(set(REL_MAP.keys()) | {k[0] for k in LABEL_SPACE_OVERRIDE})
+        mismatches = []
+        for src_space in ALL_SPACES:
+            for tgt_space in ALL_SPACES:
+                for label in labels:
+                    sid = f"s_{src_space}_{tgt_space}_{label}"
+                    tid = f"t_{src_space}_{tgt_space}_{label}"
+                    pack.node(sid, "S", SPACE_DEFAULT_TYPE[src_space], src_space)
+                    pack.node(tid, "T", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
+                    before = len(pack.edges)
+                    skipped_before = sum(pack._eskip.values())
+
+                    pack.edge(sid, tid, label)
+
+                    after = len(pack.edges)
+                    skipped_after = sum(pack._eskip.values())
+
+                    allowed = ALLOWED.get((src_space, tgt_space))
+                    if (src_space, tgt_space) in KEEP:
+                        expect = (KEEP[(src_space, tgt_space)], sid, tid)
+                    else:
+                        m_ss, m_rel, m_tt, m_rev = resolve_edge(label, src_space, tgt_space)
+                        m_allowed = ALLOWED.get((m_ss, m_tt))
+                        trace_guard = (
+                            src_space in TRACE_SRC and tgt_space in ("evidence", "resource")
+                        )
+                        if m_allowed and m_rel in m_allowed and not (m_rev and trace_guard):
+                            expect = (m_rel, tid, sid) if m_rev else (m_rel, sid, tid)
+                        elif allowed:
+                            expect = (
+                                FIX.get((src_space, tgt_space)) or sorted(allowed)[0],
+                                sid, tid,
+                            )
+                        elif ALLOWED.get((tgt_space, src_space)) and not trace_guard:
+                            expect = (
+                                FIX.get((tgt_space, src_space))
+                                or sorted(ALLOWED[(tgt_space, src_space)])[0],
+                                tid, sid,
+                            )
+                        else:
+                            expect = None
+
+                    if expect is None:
+                        ok = after == before and skipped_after == skipped_before + 1
+                        if not ok:
+                            mismatches.append(
+                                (src_space, tgt_space, label, "expected skip",
+                                 pack.edges[-1] if after > before else None))
+                        continue
+
+                    exp_rel, exp_src, exp_tgt = expect
+                    if after != before + 1:
+                        mismatches.append(
+                            (src_space, tgt_space, label,
+                             "expected exactly one new edge", after - before))
+                        continue
+                    e = pack.edges[-1]
+                    got = (e["label"], e["source_id"], e["target_id"])
+                    if got != (exp_rel, exp_src, exp_tgt):
+                        mismatches.append(
+                            (src_space, tgt_space, label, "mismatch",
+                             (exp_rel, exp_src, exp_tgt), got))
+
+        assert mismatches == []
 
 
 class TestFixIsTheRepresentativeNotTheAlphabeticalFirst:
