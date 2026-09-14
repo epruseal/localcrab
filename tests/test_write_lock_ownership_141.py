@@ -210,6 +210,40 @@ def test_write_lock_for_store_is_noop_for_postgres_and_memory() -> None:
     assert isinstance(write_lock_for_store(mem), contextlib.nullcontext)
 
 
+def test_write_lock_for_store_is_noop_for_magicmock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #329: MagicMock 이 스토어인 척 통과해도 CWD 에 아무것도 쓰지
+    않는다.
+
+    unittest.mock.MagicMock 은 getattr(mock, "_is_sqlite", False) 를
+    truthy 한 MagicMock 으로, mock._url 도 자동 생성된 MagicMock 으로
+    돌려준다. 이전 코드는 그 MagicMock 을 make_url() 에 그대로 넘겼고,
+    os.fspath() 의 기본 __fspath__ 폴백이 "MagicMock/<mock repr>/<id>"
+    형태의 문자열을 만들어 os.path.abspath() 가 이를 CWD 기준 실경로로
+    바꿔치기했다. own_file=False(write_lock, 공유 write.lock)와
+    own_file=True(file_lock, 이슈에서 실제 관측된
+    billing._url.database/<id>.lock 경로) 두 분기 모두 nullcontext 를
+    돌려주고, 반환된 컨텍스트에 실제로 진입해도 MagicMock/ 디렉터리가
+    생기지 않아야 한다.
+    """
+    import contextlib
+    from unittest.mock import MagicMock
+
+    from opencrab.stores.sql_store import write_lock_for_store
+
+    monkeypatch.chdir(tmp_path)
+    mock_store = MagicMock(name="billing")
+
+    for own_file in (False, True):
+        ctx = write_lock_for_store(mock_store, own_file=own_file)
+        assert isinstance(ctx, contextlib.nullcontext)
+        with ctx:
+            pass
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_write_lock_for_store_parses_sqlalchemy_url_variants(tmp_path: Path) -> None:
     """removeprefix 수동 파싱이 아니라 make_url 을 쓰므로 쿼리스트링이 붙은
     URL 도 올바른 파일 경로를 뽑아낸다(설계 검증 R1 지적 반영)."""
