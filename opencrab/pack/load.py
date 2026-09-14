@@ -1958,9 +1958,18 @@ def load_nodes_incremental(
                 # #301 등 이 행의 나머지 처리(doc 대사, 구 타입 스윕, 쓰기
                 # 시도)가 정규화된 space 와 정합하도록 raw 값을 대신한다.
                 # 재대입을 생략하면 top-level space=None + 중첩
-                # properties.space="concept" 조합에서 doc 정리가 raw
-                # None 을 보고 실제로 존재하는 doc space 를 전부 고아로
-                # 오판해 지운다.
+                # properties.space="concept" 조합에서 `is_same`(아래) 은
+                # `cmp_space` 를 직접 봐 그대로 참이지만, same 경로 안의
+                # `doc_row_missing` 판정(아래)은 이 지역 `space`(raw
+                # None)를 써 실제로 존재하는 doc space 를 유실로
+                # 오판한다(#301 오경보). doc_row_missing 이 참이면 same
+                # 경로의 doc 정리(`_cleanup_stale_doc_spaces`)는 건너뛰고
+                # 대신 chg 경로로 낙하해 raw space=None 으로 쓰기를
+                # 시도하며, 그 쓰기는 문법 검증에서 거부돼 skip 으로
+                # 떨어진다(실측:
+                # test_normalized_space_reassignment_avoids_false_doc_row_missing,
+                # tests/test_pack_load.py). doc 행이 실제로 지워지는 것은
+                # 아니다.
                 space = cmp_space
 
             is_same = False
