@@ -418,9 +418,12 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    (없으면 빈 집합으로) 뽑아 양쪽 다 항상 base와 diff한다(빈 집합끼리도
    diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 추출과
    대사는 로그 전체가 아니라 `short test summary info` 절만 대상으로
-   한다(그 절 헤더부터 로그 끝까지):
+   한다(그 절의 마지막 헤더부터 로그 끝까지. 마지막인 이유는 아래에
+   적는다):
    ```bash
-   awk '/^=+ short test summary info =+$/{f=1} f' /tmp/<워크트리 식별자>-run.log \
+   tac /tmp/<워크트리 식별자>-run.log \
+     | awk '{print} /^=+ short test summary info =+$/{exit}' \
+     | tac \
      | grep -oP '^(FAILED|ERROR) \K\S+' | sort -u
    ```
    pytest는 이 절에 실패/에러 테스트마다 `FAILED <id> - <사유>` 또는
@@ -434,7 +437,22 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    bogus`를 찍고 실패하는 테스트와 `.error("db connect failed")`를 호출하고
    실패하는 테스트를 포함한 세션에서, 로그 전체 대상 `^FAILED `/`^ERROR `
    개수는 각각 2인데 요약줄은 `1 failed, ... 1 error`다. `short test
-   summary info` 절로 좁히면 각각 1로 요약줄과 일치한다). 요약줄의
+   summary info` 절로 좁히면 각각 1로 요약줄과 일치한다). 절 헤더
+   자체도 캡처 출력이 흉내낼 수 있다: 실패한 테스트가 표준출력에
+   `== short test summary info ==` 같은 줄을 그대로 내면 첫 매치부터
+   잡는 방식은 그 위장 헤더에서 열려, 그 뒤에 낀 다른 캡처 출력 속
+   `FAILED`/`ERROR` 줄까지 집합에 섞인다(실측: 그런 위장 헤더와 가짜
+   `FAILED fake/test_ghost.py::test_ghost - bogus`를 표준출력에 찍고
+   실패하는 테스트 하나와 별도로 실패하는 테스트 하나를 포함한
+   세션에서, 첫 매치 기준 추출은 `fake/test_ghost.py::test_ghost`를
+   포함해 고유 id 3개를 내지만 요약줄은 `2 failed`다). 진짜 헤더는
+   `pytest_terminal_summary`가 세션 끝에 한 번만 내므로(`_pytest/
+   terminal.py`의 `summary_failures`/`summary_errors`가 캡처 출력을
+   먼저 찍고 `short_test_summary()`가 마지막에 그 절을 낸다, 이
+   워크트리 pytest 9.1.1 소스로 확인한 계약값) 로그에서 이 헤더와
+   일치하는 마지막 줄이 항상 진짜 절이다. 위 명령이 `tac`으로 뒤집어
+   맨 끝에서부터 찾아 그 마지막 매치에서 멈추는 이유가 이것이다.
+   요약줄의
    `failed`/`error` 수와 이 절 안의 `^FAILED `/`^ERROR ` 줄 수도 같은
    범위로 대사한다. 요약줄이 `N failed`(N>0)를 보고하는데 `^FAILED `로
    시작하는 줄이 하나도 없거나, `M error`(M>0)를 보고하는데 `^ERROR `로
