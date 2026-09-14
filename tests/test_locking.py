@@ -618,6 +618,53 @@ def test_write_lock_refuses_a_symlinked_lock_path(tmp_path):
     assert target.read_text() == "보호해야 할 원본 내용"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="하드링크 생성 조건이 플랫폼마다 다르다")
+def test_write_lock_refuses_a_hardlinked_lock_path(tmp_path):
+    """보안(PR #384 리뷰 4라운드): "write.lock" 자리가 다른 파일과 같은
+    inode를 공유하는 하드링크면 그 파일을 대신 잠그고 보유자 레코드로
+    덮어쓰는 대신 거부한다. 심볼릭 링크와 달리 하드링크는 `O_NOFOLLOW`로
+    막히지 않는다(심볼릭 링크가 아니라 같은 데이터를 가리키는 두 번째
+    이름일 뿐이다). `_open_lock`의 `st_nlink == 1` 확인이 이 테스트가
+    검증하는 방어다.
+    """
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    os.link(str(target), str(tmp_path / "write.lock"))
+
+    with pytest.raises(OSError):
+        with file_lock("write.lock", str(tmp_path), timeout=1):
+            pass
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
+def test_open_lock_rejects_symlink_when_o_nofollow_is_unavailable(tmp_path, monkeypatch):
+    """보안(PR #384 리뷰 4라운드): `O_NOFOLLOW`가 없는 플랫폼(Windows)에서도
+    "write.lock" 자리가 심볼릭 링크면 열기 전에 거부한다.
+
+    이 저장소에는 Windows 실행기가 없다. `_HAS_O_NOFOLLOW`와
+    `_OPEN_LOCK_FLAGS`를 patch해 이 POSIX 머신에서도 O_NOFOLLOW가 없는
+    척 만들어, 실제 `os.open()` 호출에서 심볼릭 링크를 따라가지 않게
+    막는 것이 (POSIX 자체의 O_NOFOLLOW가 아니라) 이 사전 검사 하나뿐임을
+    실제로 밟아 확인한다. 실행 자체는 여전히 이 플랫폼에서 하므로, 검증은
+    코드 읽기가 아니라 이 테스트의 통과 여부다.
+    """
+    import opencrab.locking as locking_module
+
+    monkeypatch.setattr(locking_module, "_HAS_O_NOFOLLOW", False)
+    monkeypatch.setattr(locking_module, "_OPEN_LOCK_FLAGS", os.O_RDWR)
+
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    lock_path = tmp_path / "write.lock"
+    lock_path.symlink_to(target)
+
+    with pytest.raises(OSError):
+        locking_module._open_lock(str(lock_path))
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
 def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
     """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
     tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -482,20 +483,45 @@ def _process_lock(path: str) -> threading.RLock:
 
 #: O_NOFOLLOW rejects opening *path* if its final component is a symlink,
 #: atomically -- no separate lstat-then-open check that a symlink swap could
-#: race (#352 review, PR #384). Not defined on Windows, where a lock path's
-#: final component being a foreign symlink is not the same live risk: an
-#: unprivileged account cannot normally create NTFS reparse points, so the
-#: attack `_lock_path`'s docstring above describes does not carry over.
-_OPEN_LOCK_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+#: race (#352 review, PR #384). Not defined on Windows. An earlier version of
+#: this comment argued Windows carries no equivalent risk because creating a
+#: reparse point needs privilege; PR #384 review round 4 corrected that --
+#: Developer Mode (or an account with the relevant privilege) lets an
+#: unprivileged process create one, so the symlink attack `_lock_path`'s
+#: docstring above describes still applies there. ``_open_lock`` below adds
+#: an ``os.path.islink`` pre-check for that platform: not atomic, so a
+#: symlink swap between the check and the open can still win the race, but
+#: it is the best available without a win32 ``CreateFile`` call that opens
+#: with ``FILE_FLAG_OPEN_REPARSE_POINT`` -- upgrade path if this ever gets a
+#: Windows test runner to verify it against.
+_HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
+_OPEN_LOCK_FLAGS = os.O_RDWR | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
 
 
 def _open_lock(path: str) -> BinaryIO:
+    if not _HAS_O_NOFOLLOW and os.path.islink(path):
+        raise OSError(errno.ELOOP, "lock path is a symlink", path)
     try:
         fd = os.open(path, _OPEN_LOCK_FLAGS)
     except FileNotFoundError:
         # O_CREAT without O_TRUNC keeps concurrent first-open calls from
         # clobbering the lock file before either process acquires it.
         fd = os.open(path, _OPEN_LOCK_FLAGS | os.O_CREAT, 0o666)
+    try:
+        # A hard link is a second name for the same inode, so O_NOFOLLOW
+        # does not catch it (it never involves a symlink): opening
+        # "write.lock" this way still opens the SAME data as the file
+        # sharing that inode. #352's _record_holder() then writes and
+        # truncates through it. Requiring nlink == 1 rejects that alias
+        # (#352 review, PR #384 round 4), and requiring a regular file
+        # rejects handing a FIFO, device, or other special file to the raw
+        # lseek/write/ftruncate calls in _record_holder().
+        st = os.fstat(fd)
+        if st.st_nlink != 1 or not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EPERM, "lock path is not a dedicated regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
     return os.fdopen(fd, "r+b")
 
 
