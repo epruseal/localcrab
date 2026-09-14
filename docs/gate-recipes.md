@@ -40,12 +40,15 @@ python3 -m venv .venv
 ## 2. import 경로 확인
 
 ```bash
-cd /tmp && python -c "import os, opencrab; print(os.path.realpath(opencrab.__file__))"
+cd /tmp && <워크트리>/.venv/bin/python -c "import os, opencrab; print(os.path.realpath(opencrab.__file__))"
 ```
 
 cwd에 `opencrab/`이 없는 중립 디렉터리(예: `/tmp`)에서 대상 워크트리 venv의
-python으로 실행하고, 출력 경로가 그 워크트리를 가리키는지 확인한다. 같은
-위치에서 `python -P`(Python 3.11+, safe-path)로도 동일 확인이 가능하다.
+python으로 실행하고, 출력 경로가 그 워크트리를 가리키는지 확인한다. 활성화
+없이 venv 인터프리터 경로를 직접 지정하는 이유는 활성화에 기대면 다른 셸에서
+잘못된 venv가 이미 활성 상태일 때 그 사실이 드러나지 않기 때문이다. 같은
+위치에서 `<워크트리>/.venv/bin/python -P`(Python 3.11+, safe-path)로도 동일
+확인이 가능하다.
 
 **대상 워크트리 자신의 cwd에서 실행하면 안 되는 이유**: `python -c`는
 `sys.path[0]`에 cwd를 먼저 넣는다. 그 cwd 자체에 `opencrab/` 소스 디렉터리가
@@ -277,7 +280,7 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
 미완주를 완주로 오판정할 수 있다(실측: `pytest_report_header`가
 `collected 2 items`를 먼저 찍고 실제 수집은 4건인 상태에서 도중
 `pytest.exit(returncode=1)`로 중단하면 `VERDICT:COMPLETE tests=2
-failed_or_error=0`이 나온다). 이 저장소의 `conftest.py`들은
+skipped=0 failed_or_error=0`이 나온다). 이 저장소의 `conftest.py`들은
 `pytest_report_header`를 쓰지 않는다(재현 시점 실측:
 `grep -rln 'pytest_report_header' $(find . -name conftest.py)`가 빈
 결과). 단일 실행만 보는 4번에는 이 경로가 열려 있지만, 5번의 회귀
@@ -346,6 +349,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    tests = int(suite.get("tests"))
    failures = int(suite.get("failures"))
    errors = int(suite.get("errors"))
+   skipped = int(suite.get("skipped"))
 
    # 수집 단계 에러는 classname=""로 들어가고, 개수 우연 일치로
    # 완주를 가장할 수 있으므로(예: 실제 테스트 1개 + 깨진 모듈 1개면
@@ -399,7 +403,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
        )
        sys.exit(1)
 
-   print(f"VERDICT:COMPLETE tests={tests} failed_or_error={len(ids)}")
+   print(f"VERDICT:COMPLETE tests={tests} skipped={skipped} failed_or_error={len(ids)}")
    for i in sorted(set(ids)):
        print(f"ID:{i}")
    PYEOF
@@ -428,8 +432,9 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    실행이 `VERDICT:COMPLETE`로 나온다(실측: 모듈 하나를
    `allow_module_level=True`로 건너뛰고 다른 지점에서
    `pytest.exit(returncode=1)`로 중단시키면 계획된 테스트 전부가
-   실행되지 않았는데도 `VERDICT:COMPLETE tests=2 failed_or_error=0`이
-   나온다). 이 조합은 4번의 개수 대사 하나로는 못 잡는다. 다만 5번의
+   실행되지 않았는데도 `VERDICT:COMPLETE tests=2 skipped=0
+   failed_or_error=0`이 나온다). 이 조합은 4번의 개수 대사 하나로는
+   못 잡는다. 다만 5번의
    회귀 diff에서 base와 `tests=` 총량을 비교하면 그 감소가 이번
    실행에서만 나고 base에는 없으므로 걸릴 여지가 있다: 단일 실행만
    보는 4번은 못 잡고, base 대비 diff인 5번에서만 걸릴 수 있다는
@@ -552,15 +557,29 @@ deselect 조건, 리네임에 따른 재수집 실패 등). 그 감소가 PR 본
 의도로 명시돼 있지 않으면 회귀로 판단한다. `tests`가 base보다 큰
 경우(새 테스트 추가)는 정상 증가이므로 조사 대상이 아니다.
 
-`tests=` 비교로도 못 잡는 경우가 남는다. 통과하던 테스트 N개를
-지우거나 deselect하면서 같은 수의 새 테스트를 추가하면, 새 테스트가
-통과하는 한 실패/에러 id 집합도 `tests=` 총량도 그대로 같아 diff가
-"동일"을 낸다(실측: 통과 테스트 1개를 지우고 이름만 다른 통과 테스트
-1개를 더하면 두 실행 다 `VERDICT:COMPLETE tests=2 failed_or_error=0`
-이고 id 집합도 총량도 같다). 이 잔여 공백을 완전히 닫으려면 실패/에러
-id뿐 아니라 xml에 있는 testcase 전량의 id 집합을 base와 작업 양쪽에서
-뽑아 diff해야 한다(지금 스크립트는 실패/에러 id만 출력한다). 지금은
-그 전량 diff를 절차에 넣지 않고 알려진 잔여 공백으로만 남긴다.
+`tests=` 비교만으로도 못 잡는 경우가 있다. 통과하던 테스트를
+`pytest.mark.skip`이나 `xfail`로 바꾸면 그 테스트는 계속 `testsuite`에
+남고 `failure`나 `error` 자식도 없어 `ID:` 집합에 안 잡히며, xml의
+`tests` 속성은 통과, skip, 실패, 에러를 모두 더한 값이라 pass가 skip으로
+바뀌어도 총량이 그대로다(실측: 테스트 2개짜리 모듈에서 하나를
+`@pytest.mark.skip`로 바꾸면 base와 work 둘 다
+`tests="2"`이고 `skipped`만 `0`에서 `1`로 바뀐다). 그래서 `VERDICT:COMPLETE`
+줄에 `skipped=`도 함께 찍어 base와 작업 양쪽에서 비교한다. 작업 쪽
+`skipped`가 base보다 크면 새로 skip 처리된 테스트가 있다는 뜻이니
+원인을 조사하고, PR 본문에 의도로 명시돼 있지 않으면 회귀로
+판단한다. `skipped`가 base보다 작은 경우(기존 skip이 다시 실행됨)는
+정상 감소이므로 조사 대상이 아니다.
+
+`tests=`와 `skipped=` 비교로도 못 잡는 경우가 남는다. 통과하던 테스트
+N개를 지우거나 deselect하면서 같은 수의 새 테스트를 추가하면, 새
+테스트가 통과하는 한 실패/에러 id 집합도 `tests=`도 `skipped=`도
+그대로 같아 diff가 "동일"을 낸다(실측: 통과 테스트 1개를 지우고
+이름만 다른 통과 테스트 1개를 더하면 두 실행 다
+`VERDICT:COMPLETE tests=2 skipped=0 failed_or_error=0`이고 id 집합도
+총량도 같다). 이 잔여 공백을 완전히 닫으려면 실패/에러 id뿐 아니라
+xml에 있는 testcase 전량의 id 집합을 base와 작업 양쪽에서 뽑아
+diff해야 한다(지금 스크립트는 실패/에러 id만 출력한다). 지금은 그
+전량 diff를 절차에 넣지 않고 알려진 잔여 공백으로만 남긴다.
 
 이 5단계는 방어가 서로 겹친다. 예를 들어 3번이 없어 xml 부재 상태로
 4번에 넘어가도 xml 파싱 자체가 예외로 죽고, 1번이 종료 코드를 기록하지
