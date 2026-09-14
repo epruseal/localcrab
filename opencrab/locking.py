@@ -468,16 +468,19 @@ def _record_holder(fh: BinaryIO) -> None:
     wrapping the clear itself in a lock -- which returns to the same kind of
     atomicity problem the old sidecar file had.
 
-    Uses ``os.pwrite``/``os.ftruncate`` on the raw fd instead of ``fh.write()``/
-    ``fh.truncate()``/``fh.flush()``. ``fh`` is a buffered ``r+b`` file object
-    (see ``_open_lock``): if ``fh.write()`` succeeds but a later
-    ``fh.truncate()`` or ``fh.flush()`` fails (for example, disk full), the
-    ``try/except`` below would swallow that exception, but dirty data stays in
-    Python's internal buffer. That data then resurfaces as the SAME exception
-    later, uncaught, when ``file_lock()``'s cleanup calls ``fh.close()`` --
-    corrupting an otherwise clean exit from an already-finished protected
-    block. Raw ``os.pwrite``/``os.ftruncate`` bypass that buffer entirely, so a
-    failure there cannot leave dirty state behind in ``fh``.
+    Uses ``os.lseek``/``os.write``/``os.ftruncate`` on the raw fd instead of
+    ``fh.write()``/``fh.truncate()``/``fh.flush()``. ``fh`` is a buffered
+    ``r+b`` file object (see ``_open_lock``): if ``fh.write()`` succeeds but a
+    later ``fh.truncate()`` or ``fh.flush()`` fails (for example, disk full),
+    the ``try/except`` below would swallow that exception, but dirty data
+    stays in Python's internal buffer. That data then resurfaces as the SAME
+    exception later, uncaught, when ``file_lock()``'s cleanup calls
+    ``fh.close()`` -- corrupting an otherwise clean exit from an
+    already-finished protected block. The raw fd calls bypass that buffer
+    entirely, so a failure there cannot leave dirty state behind in ``fh``.
+    ``os.pwrite`` is not available on Windows, so this uses the portable
+    ``lseek`` + ``write`` pair instead; nothing downstream of this call reads
+    the fd's position, so moving it is harmless on either platform.
     """
     try:
         record: dict[str, object] = {
@@ -489,7 +492,8 @@ def _record_holder(fh: BinaryIO) -> None:
             record["purpose"] = purpose
         data = json.dumps(record).encode("utf-8")
         fd = fh.fileno()
-        os.pwrite(fd, data, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, data)
         os.ftruncate(fd, len(data))
     except Exception as exc:  # noqa: BLE001 - diagnostic only, must not block acquisition
         try:
@@ -539,6 +543,8 @@ def _acquire(fh: BinaryIO, *, shared: bool, timeout: float | None) -> None:
     while True:
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            if not shared:
+                _record_holder(fh)
             return
         except OSError as exc:
             if deadline is None:
