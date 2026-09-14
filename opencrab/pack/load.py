@@ -89,13 +89,17 @@ log = logging.getLogger(__name__)
 # 한쪽에서만 걸러내면 그 쪽에서만 키가 사라져 나머지 값이 전부 같아도
 # 딕셔너리 비교가 깨진다. #358 의 근본원인이 이것이다(space, 아래 참고).
 #
-# ── id : Q1=Yes(중첩 properties.id 로), Q2=No ──
+# ── id : Q1=Yes(중첩 properties.id 로), Q2=No(#379 이전) ──
 # `absorb_legacy_top_level`(opencrab/pack/schema.py) 은 최상위 stray 키만
 # NODE_STRUCT_KEYS 기준으로 거른다 — 중첩 `properties.id` 는 그대로 남는다.
-# 이 비교 지점 자체는 신원 검증을 호출하지 않으므로, 값이 다른 중첩 id 가
-# 이론적으로 도달하면 `same` 으로 오판할 여지가 남는다. 이 gap 은 #358
-# 이전부터 있던 기존 동작이며 이 수정이 새로 만들거나 넓히지 않는다 — 별도
-# 이슈로 추적할 후보이지 이 수정의 범위는 아니다. 라이브 쪽에서만 뺀다.
+# #379 이전에는 이 비교 지점이 신원 검증을 호출하지 않아, 값이 다른 중첩
+# id 가 도달하면 `same` 으로 오판할 여지가 있었다(#358 이전부터 있던 기존
+# 동작). #379 부터는 비교 직전에 `graph_identity.prepare_node` 를 원본
+# props 에 통과시킨다. `normalize_node_properties` 가 이 비교 지점이
+# 정규화한 `props` 에 `id` 를 node_id 로 항상 채워 넣으므로("id"가 원본
+# 파일에 없어도), 라이브 쪽에서만 빼면 파일 쪽에만 이 키가 구조적으로
+# 남아 값이 같아도 매번 chg 로 어긋난다. 그래서 이제는 양쪽에서 같이
+# 뺀다(아래 `FILE_SIDE_IGNORED_KEYS`).
 #
 # ── space : Q1=Yes(중첩 properties.space 로, #125, #358), Q2=No ──
 # 라이브 쪽 값은 `graph_identity.normalize_space` 가 항상 덮어써 신뢰할 수
@@ -139,11 +143,13 @@ log = logging.getLogger(__name__)
 STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
 INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
 
-# 파일 쪽에서만 추가로 빼는 키(#358). Q1=Yes 라서 양쪽 다 빼야 하는 것 중
-# 라이브 쪽은 위 `INCREMENTAL_IGNORED_KEYS` 가 이미 포함한다(space). RETIRED_KEYS
-# 는 위 설명대로 파일 쪽에 실릴 경로가 없어 넣어도 동작에 차이가 없지만,
+# 파일 쪽에서만 추가로 빼는 키(#358, #379). Q1=Yes 라서 양쪽 다 빼야 하는
+# space/id 를 담는다. `owner_id` 는 넣지 않는다. `prepare_node` 가 값을
+# 손대지 않아 대칭화가 강제되지 않고, 위 owner_id 주석대로 파일이 owner_id
+# 를 실으면 값과 무관하게 항상 chg 로 재기록돼야 한다(#378). RETIRED_KEYS 는
+# 위 설명대로 파일 쪽에 실릴 경로가 없어 넣어도 동작에 차이가 없지만,
 # `INCREMENTAL_IGNORED_KEYS` 와 대칭인 이름으로 남겨 둔다.
-FILE_SIDE_IGNORED_KEYS = frozenset({"space"}) | RETIRED_KEYS
+FILE_SIDE_IGNORED_KEYS = frozenset({"space", "id"}) | RETIRED_KEYS
 
 
 # ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
@@ -1961,24 +1967,21 @@ def load_nodes_incremental(
                 # properties.id 불일치 방어), `normalize_space` 가 "space"
                 # 를 effective 값으로 채운다. 이 두 값의 동일성은 아래 딕셔너리
                 # 비교가 아니라 `live[0]==cmp_node_type`/`live[1]==cmp_space`
-                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 양쪽에서 뺀다
+                # 로 이미 따로 검사하므로, 딕셔너리 비교에서는 기존
+                # `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 로 뺀다
                 # (안 빼면 `live[2]` 가 "id"/"space" 를 구조적으로 안 담는
-                # 라이브 스냅샷과 매번 chg 로 어긋난다, T7 회귀 실측). `owner_id`
-                # 는 `prepare_node` 가 값을 손대지 않으므로 이 정규화가 강제하는
-                # 대칭 삭제 사유가 없다. 기존 설계(위 상수 주석, #358)는
-                # owner_id 를 **라이브 쪽에서만** 빼, 파일이 owner_id 를
-                # 실으면 값이 같아도 키 집합이 어긋나 항상 chg 로 재기록되게
-                # 했다(#378 관찰). 여기서 양쪽 다 빼면 그 비대칭이 사라져
-                # 파일 쪽 owner_id 불일치가 same 으로 통과하는 새 결함이
-                # 생긴다(이중검증에서 실측). 그 비대칭을 그대로 지키려고
-                # drop 집합을 파일/라이브 쪽으로 분리한다. `RETIRED_KEYS` 는
-                # 도달 경로가 없어 양쪽 어느 쪽에 둬도 동작 차이가 없지만
-                # 기존 상수와 대칭인 이름으로 양쪽에 남긴다.
-                _cmp_drop_common = ("id", "space", *RETIRED_KEYS)
+                # 라이브 스냅샷과 매번 chg 로 어긋난다, T7 회귀 실측). 이
+                # 정규화 이전에는 파일 쪽에서 "id" 를 빼지 않아도 됐지만(파일
+                # 원본 props 에 "id" 가 없으면 라이브와 저절로 키 집합이
+                # 맞았다), `prepare_node` 가 "id" 를 항상 주입하므로 이제는
+                # 파일 쪽도 반드시 빼야 한다(위 상수 주석, #379). `owner_id`
+                # 는 `prepare_node` 가 값을 손대지 않으므로 이 정규화가 강제
+                # 하는 대칭 삭제 사유가 없고, 기존 설계(위 상수 주석, #358)가
+                # 정한 대로 라이브 쪽에서만 빠진다(#378 관찰 유지).
                 file_cmp = {k: v for k, v in cmp_props.items()
-                            if k not in _cmp_drop_common}
+                            if k not in FILE_SIDE_IGNORED_KEYS}
                 live_cmp = {k: v for k, v in live[2].items()
-                            if k not in (*_cmp_drop_common, "owner_id")}
+                            if k not in INCREMENTAL_IGNORED_KEYS}
                 # 싱크 완전성 표(#358 재리뷰, 리드 요청). `add_node`
                 # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
                 # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
