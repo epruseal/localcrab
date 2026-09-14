@@ -421,6 +421,29 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
    그 부분집합끼리의 diff가 거짓으로 "같음"을 낼 수 있다. 모호한 매치도
    같은 이유로 조용히 하나를 골라잡지 않고 죽인다.
 
+   `reverse_id`의 후보 생성은 `classname`을 "/"로만 분절해 접두어를
+   만든다. 파일명 자체에 마침표가 들어간 모듈(예: `tests/test_a.b.py`)은
+   이 분절 방식으로는 후보로 잡히지 않는다. 이 공백은 `reverse_id`까지
+   도달하지 못한다: 파이썬 모듈 이름에는 마침표가 들어갈 수 없어
+   pytest가 그런 파일을 import 단계에서 수집하지 못하고,
+   `classname=""`인 수집 에러 항목으로만 남는다(실측: `test_a.b.py`
+   하나만 두고 pytest를 돌리면 `ERROR test_a.b.py` /
+   `Interrupted: 1 error during collection`로 죽는다). 이 항목은 4번의
+   수집 에러 검사가 먼저 걸러 `VERDICT:INCOMPLETE`를 내므로,
+   `reverse_id`가 조용히 틀린 경로를 반환하는 경로는 pytest 자신의
+   수집 계약상 도달 불가다.
+
+   pytest의 JUnit XML 작성기(`_pytest/junitxml.py`의 `bin_xml_escape`)는
+   `name`/`classname` 속성에 XML로 안전하지 않은 문자(예: 제어문자
+   `\x07`)가 있으면 `#x07` 같은 리터럴 텍스트로 바꿔 쓴다. `reverse_id`는
+   이렇게 이스케이프된 텍스트에서 원래 raw node id를 되돌리지 못한다.
+   이 정보는 xml에 쓰이는 시점에 이미 사라져 `reverse_id` 쪽 코드를
+   고쳐도 복구할 수 없고, `--collect-only`로 다시 수집해야만
+   되돌아오는데 그러면 이 판정 절차가 xml만으로 완결된다는 전제가
+   무너진다. 이 경로는 코드로 닫지 않고 노출로만 남긴다. 테스트나
+   parametrize id에 제어 문자가 들어가는 경우는 실무에서 사실상
+   나타나지 않는다.
+
    `VERDICT:UNTRUSTED`는 추출 개수와 `testsuite`의 `failures`+`errors`
    합이 어긋난다는 뜻이다(자기 점검). 이 경우도 diff를 신뢰하지 말고
    원인부터 조사한다.
