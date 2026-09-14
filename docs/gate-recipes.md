@@ -281,12 +281,30 @@ verbosity로 막아 둔 것과 같은 종류의 미트리밍이 다시 열린다
 포함한 세션에서, `CI=1`이면 이 절단이 실제로 일어나 위장 id
 `tests/test_fake.py::test_fake` 하나만 나오고 나머지 진짜 실패 id는
 전부 사라진다. `--force-short-summary`를 더하면 같은 세션에서 사유가
-첫 줄로 잘려 위장 헤더/위장 줄 자체가 로그에 나타나지 않고, 진짜 실패
-id 전부가 정상 추출된다). `--force-short-summary`는
-`config.option.force_short_summary`를 세워 이 조건의 else 분기(항상
-`_format_trimmed`로 첫 줄만 남기는 분기)로 강제하므로, `CI`나
-`BUILD_NUMBER`가 실행 환경에 설정돼 있어도 사유는 항상 한 줄로 잘린다.
-이 세 조건과 `PY_COLORS=0`은 재현 명령의 고정 형태이지
+첫 줄로 잘려 `short test summary info` 절 안에는 위장 헤더/위장 줄이
+독립된 줄로 나타나지 않고, 그 절에서 뽑는 진짜 실패 id 전부가 정상
+추출된다). `--force-short-summary`는 `config.option.force_short_summary`를
+세워 이 조건의 else 분기(항상 `_format_trimmed`로 첫 줄만 남기는
+분기)로 강제하므로, `CI`나 `BUILD_NUMBER`가 실행 환경에 설정돼 있어도
+`short test summary info` 절의 사유는 항상 한 줄로 잘린다. `FAILURES`
+절(`--tb=short`가 찍는 트레이스백)에는 이 사유 문자열이 여전히 `E   `로
+시작하는 줄로 그대로 남는다(실측: 위 재현에서 `E   == short test
+summary info ==`처럼 앞에 `E   `가 붙어 나온다). 6절 6번의 id 추출은
+`^=+ short test summary info =+$`처럼 줄 시작을 고정해 앵커링하므로 이
+`E   ` 접두 줄은 애초에 매치 대상이 아니고, `--force-short-summary`가
+막는 것은 `short test summary info` 절 자체에 위장 줄이 새로 생기는
+경로 하나다. 이 방어는 `FAILED`/`ERROR`의 reprcrash 메시지 경로에만
+걸린다. `show_xfailed`/`show_xpassed`(`_pytest/terminal.py`의 xfailed/
+xpassed 요약)는 `rep.wasxfail`을 `_format_trimmed`를 거치지 않고 그대로
+줄에 붙이므로 `--force-short-summary`와 무관하게 같은 종류의 주입에
+열려 있다. 다만 이 절은 `-r` 기본값(`fE`, `_pytest/terminal.py:77`)에는
+`x`/`X`가 없어 `-rx`/`-ra`/`-rA`를 명령에 추가하지 않는 한 애초에
+출력되지 않고, 이 저장소는 `xfail` 마커 자체를 쓰지 않는다(실측:
+`grep -rnP 'pytest\.(mark\.)?(xfail)\(' tests/`, 매치 0건). 고정 명령에
+`-rx` 계열을 새로 추가하거나 이 저장소에 `xfail` 마커를 새로 들이면
+이 경계 밖의 주입 경로가 열리므로 그때는 이 문단의 보장이 적용되지
+않는다.
+이 네 조건과 `PY_COLORS=0`은 재현 명령의 고정 형태이지
 판정 근거가 아니다.
 **이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
 `addopts`, `-p` 플러그인, 상위 `conftest.py` 등 같은 일을 하는 경로가 더
@@ -354,15 +372,22 @@ id 전부가 정상 추출된다). `--force-short-summary`는
    `write_sep("!", ...)`로 마커 메시지를 낸다(이 워크트리 pytest 9.1.1
    소스로 확인한 계약값). 이 출력 경로는 `Exit` 예외가 세션 밖으로
    전파되기만 하면 다른 테스트가 먼저 몇 개 돌았는지와 무관하게 항상
-   실행되므로, 진짜로 중단되면 마커는 항상 로그에 남는다. 이 워크트리의
-   `tests/conftest.py`와 설치된 플러그인(`pytest-asyncio`, `pytest-cov`,
-   `anyio`)을 grep으로 확인한 결과 `pytest_keyboard_interrupt`나
-   `pytest_unconfigure` 훅을 재정의한 곳은 없다(실측: 매치 0건). 이
-   구성이 유지되는 한 놓치는 방향의 반례는 없다. 다만 이 두 훅 가운데
-   하나를 재정의하고 그 안에서 예외를 던지는 플러그인이 앞으로
-   추가되면 pluggy의 훅 호출 루프가 그 지점에서 끊겨 마커 출력이
-   가려질 수 있다(이 저장소의 현재 훅 구성에서는 발동하지 않는
-   이론상의 위험이다). 최악의 결과는 원인을
+   실행된다. 다만 이 두 훅에는 pytest 자신에도 이미 여러 구현이 걸려
+   있다(`_pytest/capture.py`의 `pytest_keyboard_interrupt`,
+   `_pytest/logging.py`와 `_pytest/unraisableexception.py`의
+   `pytest_unconfigure`). pluggy는 한 훅에 걸린 구현을 등록 순서와
+   `tryfirst`/`trylast`가 정한 차례로 부르고, 그 가운데 하나가 예외를
+   던지면 그 뒤 구현은 불리지 않는다. 이 문서는 "재정의한 곳이 없으니
+   반례가 없다"고 증명하지 않는다: 이 워크트리의 `tests/conftest.py`와
+   설치된 플러그인(`pytest-asyncio`, `pytest-cov`, `anyio`)을 grep으로
+   확인한 결과 이 저장소가 직접 추가한 재정의는 없고(실측: 매치 0건),
+   실제로 이 fixture를 발동시켜 재현한 결과 이 워크트리의 실제 플러그인
+   구성에서 마커가 로그에 남았다(재현: 세션 범위 autouse fixture에서
+   `pytest.exit("[PG tripwire] ...")`를 던지는 최소 예제를 이 워크트리
+   `.venv`의 pytest로 실행, `grep -c '^!'`가 1). 이 관측은 이 실행
+   경로에서 앞선 훅 구현들이 예외를 던지지 않았다는 사실만 보여줄 뿐,
+   모든 훅 조합에서 마커가 항상 남는다는 증명은 아니다. 마커가 안
+   보이면 최악의 결과는 원인을
    잘못 짚어 DB명을 조사하는 데서 그친다. 조사해서 캡처 출력이 원인임을
    확인했으면 4번으로 넘어간다.
 4. 마커가 없으면(`BLOCK_EXIT`가 0이거나, 1이면서 마커 없음) 조기 종료 배너를
