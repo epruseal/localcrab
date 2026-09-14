@@ -30,6 +30,7 @@ from tools.openclaw_e2e import (  # noqa: E402  (sys.path 삽입 후 의도된 �
     MODEL_ID,
     MUTATING_TOOL,
     PROBE_TOOL,
+    _parse_frames,
     match_tool,
     new_nonce,
     verify_evidence,
@@ -544,3 +545,27 @@ def test_verify_openclaw_e2e_read_preserves_crlf_without_pretranslation(tmp_path
 
     assert module.read(p) == '{"a":1}\r\n{"b":2}\r\n'
     assert module.read(tmp_path / "missing.raw") == ""
+
+
+def test_parse_frames_structural_cr_is_not_a_frame_boundary():
+    """`_parse_frames`를 직접 호출해 콜론 뒤 구조적 CR 이 프레임 경계가 아님을
+    확인한다(design-v4.md 역변이 절, `_parse_frames`의 outbound 경계 사양).
+
+    `client_to_server` 픽스처의 `tools/call` 프레임 하나에서 `"method":` 콜론
+    바로 뒤에 CR 을 삽입한다. CR 은 JSON 토큰 사이 공백으로 유효하므로 이
+    프레임은 CR 삽입 전과 동일하게 파싱돼야 한다. `split("\n")`을
+    `splitlines()`로 되돌리면 이 삽입 지점에서 프레임이 둘로 쪼개져
+    `json.loads`가 양쪽 모두에서 실패하고 이 프레임이 사라진다."""
+    raw = _load()["client_to_server"]
+    baseline = _parse_frames(raw)
+
+    lines = raw.split("\n")
+    idx = next(i for i, ln in enumerate(lines) if FIXTURE_NONCE in ln)
+    assert '"method":' in lines[idx]
+    lines[idx] = lines[idx].replace('"method":', '"method":\r', 1)
+    mutated_raw = "\n".join(lines)
+
+    frames = _parse_frames(mutated_raw)
+
+    assert len(frames) == len(baseline)
+    assert frames == baseline
