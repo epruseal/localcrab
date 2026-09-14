@@ -135,6 +135,14 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   라이브 쪽 meta 에서 뺀다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로
   잡히는데, neo4j 의 upsert 는 전달된 키만 SET 하므로 재기록해도 사라지지 않아 그
   재기록이 영구히 반복된다.
+- **노드축 증분 대조는 필터를 걸기 전에 `prepare_node` 로 원본 `props` 를 먼저
+  검증한다(#379).** `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 필터는 값을
+  검증하지 않고 키만 뺀다. 필터만으로 비교하면 불량 값(중첩 `properties.space` 타입
+  오류, 중첩 `properties.id` 불일치 등)이 필터에 걸러진 뒤 같은 노드로 오인돼 `same`
+  으로 통과할 수 있다. `add_node` 가 쓰는 정규화/검증 함수를 그대로 재사용해, 전체
+  적재라면 거부될 값이 증분에서만 통과하는 부류를 필터 키 구성과 무관하게 막는다.
+  `prepare_node` 검증에 실패하면 그 행은 `same` 후보에서 빠진다. 이 검증이 비교
+  단계 이후 쓰기 시도가 어느 카운터(skip/chg/err)로 떨어지는지는 정하지 않는다.
 - **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
   파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
   전량 치환하므로 **그 다음 런은 same 으로 복귀한다.** 전량 chg 를 한 번 보는 것 자체는
