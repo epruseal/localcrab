@@ -561,6 +561,23 @@ def test_busy_message_reports_non_dict_record_as_no_readable_record(tmp_path):
     assert "Holder: unknown (record present but unrecognized)." in message
 
 
+def test_busy_message_reports_full_holder_record(tmp_path):
+    """정상(6 보강): 레코드에 pid/started_at/purpose가 모두 있으면 안내
+    메시지에 세 필드가 전부 그 이름으로 나타난다. 6a/6b는 응답 봉투에서
+    "pid=" 유무만 보고 "started_at="/"purpose=" 는 보지 않으므로(적대검증
+    지적), 세 필드 전부의 등장을 이 테스트가 따로 못박는다."""
+    lock_path = tmp_path / "write.lock"
+    lock_path.write_bytes(
+        json.dumps(
+            {"pid": 4242, "started_at": "2026-01-01T00:00:00+00:00", "purpose": "mcp tool: pack_ingest"}
+        ).encode("utf-8")
+    )
+    message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "pid=4242" in message
+    assert "started_at=2026-01-01T00:00:00+00:00" in message
+    assert "purpose=mcp tool: pack_ingest" in message
+
+
 def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
     """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
     tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가
@@ -612,6 +629,12 @@ def test_write_lock_timeout_names_the_real_holder_pid_across_processes(tmp_path)
             if child.is_alive():
                 child.terminate()
                 child.join(5)
+            # 회수 자체가 끝났다는 확인(적대검증 지적): join()만으로는 자식이
+            # 여전히 살아 있는데도 그냥 지나칠 수 있다. terminate()/join()은
+            # 정상 OS 동작에서 예외를 던지지 않으므로 이 확인 자체를 감싸는
+            # 중첩 try는 두지 않는다 -- 지나친 방어는 이 회귀 테스트의 본래
+            # 목적(회수가 finally에 있다는 것)을 흐린다.
+            assert not child.is_alive(), "자식 프로세스가 회수되지 않고 남았다"
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
