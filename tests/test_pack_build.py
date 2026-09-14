@@ -209,6 +209,78 @@ class TestEdge:
         assert pack.edges[0]["label"] == "whatever"
 
 
+class TestEdgeUsesLoaderMappingBeforeFix:
+    """#387: 적재기(resolve_edge)가 이미 정합으로 보는 라벨을 `Pack.edge()`가
+
+    대표 관계(FIX)로 오판해 치환하지 않는지 검증한다. 첫 시험이 `label.lower() in
+    allowed`뿐이면 적재기가 다르게 매핑하는 라벨을 놓친다. 아래 14건은 매니페스트
+    전수 대사(설계 2절)로 확정한 실제 반례다.
+    """
+
+    MANIFEST_AUDIT_ROWS = [
+        ("lever", "outcome", "AFFECTS", "optimizes", False),
+        ("concept", "concept", "HAS_ASSEMBLY", "part_of", True),
+        ("concept", "concept", "HAS_PART", "part_of", True),
+        ("concept", "concept", "INSTANCE_OF", "subclass_of", False),
+        ("concept", "concept", "USED_IN_MODEL", "part_of", False),
+        ("concept", "evidence", "SHOWN_IN", "mentions", True),
+        ("concept", "resource", "CONSTRAINS", "governs", False),
+        ("concept", "resource", "ORGANIZES", "governs", False),
+        ("concept", "resource", "REQUIRES_APPROVAL", "governs", False),
+        ("concept", "resource", "SHOWN_IN", "mentions", True),
+        ("evidence", "concept", "CONTAINS_TURN", "describes", False),
+        ("policy", "resource", "CONSTRAINS", "restricts", False),
+        ("resource", "evidence", "CITES", "derived_from", False),
+        ("resource", "evidence", "SUPPORTS", "derived_from", False),
+    ]
+
+    @pytest.mark.parametrize(
+        "src_space,tgt_space,label,loader_rel,reversed_", MANIFEST_AUDIT_ROWS)
+    def test_mapped_label_uses_loader_relation_not_fix(
+            self, pack, src_space, tgt_space, label, loader_rel, reversed_):
+        pack.node("s", "S", SPACE_DEFAULT_TYPE[src_space], src_space)
+        pack.node("t", "T", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
+        pack.edge("s", "t", label)
+        e = pack.edges[0]
+        assert e["label"] == loader_rel
+        if reversed_:
+            assert (e["source_id"], e["target_id"]) == ("t", "s")
+        else:
+            assert (e["source_id"], e["target_id"]) == ("s", "t")
+
+    def test_mapped_label_with_invalid_normalized_relation_falls_back_to_fix(self, pack):
+        """`HAS_PART`는 매핑표에 있지만 `lever->outcome`에서 `resolve_edge`가 내는
+
+        `(outcome, part_of, lever, 반전)`은 `outcome->lever`가 `ALLOWED`에 없어 무효다.
+        이럴 때는 기존 `_FIX` 폴백 사슬로 떨어져 `lever->outcome`의 대표값 `raises`가
+        된다(매핑표에 없는 라벨만 `_FIX`로 간다는 설명은 틀렸다는 3절 정정을 고정한다).
+
+        구버전과 신버전이 이 입력에서 같은 결과를 내므로, 신규 분기 삭제 역변이로는
+        이 테스트가 실패하지 않는다: 회귀 검출용이 아니라 폴백 경로 특성화 고정이다.
+        """
+        pack.node("lv", "L", "Lever", "lever")
+        pack.node("o", "O", "Outcome", "outcome")
+        pack.edge("lv", "o", "HAS_PART")
+        e = pack.edges[0]
+        assert e["label"] == "raises"
+        assert (e["source_id"], e["target_id"]) == ("lv", "o")
+
+    def test_trace_src_guard_skips_loader_reversal_into_evidence_or_resource(self, pack):
+        """`claim->resource COMPLIES_WITH`는 실제 `LABEL_SPACE_OVERRIDE` 항목이다.
+
+        `resolve_edge`는 `(resource, states, claim, 반전)`을 반환해 형식상 유효하지만,
+        traceability 원천(`claim`)이 `resource`로 반전하는 것은 채점기의 정방향 근거
+        연결 계산을 보호하는 기존 가드에 걸려 skip된다(구버전도 같다: 설계 "약속하지
+        않는 것" 절 참조). 몽키패치가 아니라 실제 매핑표 항목으로 검증해, 매핑표가
+        바뀌어도 이 테스트가 살아있는 회귀 가드로 남게 한다.
+        """
+        pack.node("c", "C", "Claim", "claim")
+        pack.node("r", "R", "Resource", "resource")
+        pack.edge("c", "r", "COMPLIES_WITH")
+        assert pack.edges == []
+        assert sum(pack._eskip.values()) == 1
+
+
 class TestFixIsTheRepresentativeNotTheAlphabeticalFirst:
     """정합 불가 라벨의 대체값은 **FIX 표의 대표값**이지 사전순 첫 원소가 아니다.
 

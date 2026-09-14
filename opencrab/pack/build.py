@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from opencrab.pack.jsonl_io import write_jsonl_sharded
+from opencrab.pack.normalize import resolve_edge
 from opencrab.pack.schema import (
     ALL_SPACES,
     ALLOWED,
@@ -121,8 +122,11 @@ class Pack:
 
     def edge(self, src, tgt, label, props=None):
         """grammar(localcrab manifest) 정합 자동화:
+        적재기와 같은 판정 함수(resolve_edge, opencrab.pack.normalize)로 매핑을 먼저 본다.
+        매핑이 이미 정합으로 보는 라벨을 대표 관계로 오판해 치환하지 않기 위함이다(#387).
         공간쌍에 맞는 relation으로 치환(원본은 source_label 보존), 방향이 맞으면 reverse,
-        정합 불가 공간쌍은 드롭(_eskip 기록). traceability(claim/lever/outcome/policy→evidence)는 정방향 유지."""
+        정합 불가 공간쌍은 드롭(_eskip 기록). traceability(claim/lever/outcome/policy가 evidence로
+        향할 때)는 정방향 유지."""
         ss, tt = self._space.get(src), self._space.get(tgt)
         # traceability(claim/lever/outcome/policy)가 resource를 가리키면 그 resource의 evidence로 리타겟
         if ss in _TRACE_SRC and tt == 'resource' and self._ev_of.get(tgt):
@@ -134,24 +138,43 @@ class Pack:
             if allowed and label.lower() in allowed:
                 rel = label.lower()
             elif (ss, tt) in _KEEP:
-                rel = _KEEP[(ss, tt)]                       # 로더가 reverse 처리 (claim→evidence)
-            elif allowed:
-                # `or` 오른쪽(사전순 첫 원소)은 **현재 도달 불가**다 — FIX 가 ALLOWED 38 쌍을
-                # 전부 덮고 falsy 값도 없다(2026-08-05 표 대사). 그래도 남겨 둔다: FIX 에
-                # 구멍이 생기면 조용히 KeyError 로 죽는 대신 사전순 대표값으로 버틴다.
-                # 주의 — FIX 값과 사전순 첫 원소는 12/38 쌍에서 **다르고** 그중엔 의미가
-                # 정반대인 것도 있다(lever->outcome: raises vs lowers).
-                rel = _FIX.get((ss, tt)) or sorted(allowed)[0]
-            # 이 가드에서 **현재 실효인 것은 'resource' 뿐**이다(2026-08-05 표 대사:
-            # traceability x evidence 로 이 분기에 닿는 공간쌍이 0개다. claim->evidence 는
-            # KEEP 이 먼저 잡고, 나머지는 정방향 grammar 가 있다). 'evidence' 는 방어적
-            # 여분이며 grammar 가 바뀌면 실효가 된다 — 그래서 지우지 않는다.
-            elif _ALLOWED.get((tt, ss)) and not (ss in _TRACE_SRC and tt in ('evidence', 'resource')):
-                src, tgt, ss, tt = tgt, src, tt, ss          # 공간쌍 없음 → 방향 반전(traceability는 정방향 유지)
-                rel = _FIX.get((ss, tt)) or sorted(_ALLOWED[(ss, tt)])[0]
+                rel = _KEEP[(ss, tt)]                       # 로더가 reverse 처리 (claim에서 evidence로)
             else:
-                self._eskip[(raw, ss, tt)] += 1              # 정합 불가 → 드롭
-                return
+                # #387: 적재기와 같은 판정 함수(resolve_edge)로 매핑을 거친 뒤 허용 집합을
+                # 본다. 매핑이 이미 정합으로 보는 라벨을 대표 관계로 오판해 치환하지 않기
+                # 위함이다(매니페스트 전수 대사 14건, 예: lever->outcome AFFECTS는 raises가
+                # 아니라 optimizes가 맞다). traceability 원천은 evidence/resource로 반전하지
+                # 않는다(trace_guard: 채점기의 정방향 근거 연결 계산 보호, 아래 역방향 폴백의
+                # 가드와 동일 조건이라 이 반전도 그 가드에 걸린다).
+                m_ss, m_rel, m_tt, m_rev = resolve_edge(raw, ss, tt)
+                m_allowed = _ALLOWED.get((m_ss, m_tt))
+                trace_guard = ss in _TRACE_SRC and tt in ('evidence', 'resource')
+                if m_allowed and m_rel in m_allowed and not (m_rev and trace_guard):
+                    if m_rev:
+                        src, tgt = tgt, src
+                    ss, tt = m_ss, m_tt
+                    rel = m_rel
+                elif allowed:
+                    # `or` 오른쪽(사전순 첫 원소)은 **현재 도달 불가**다: FIX 가 ALLOWED 38 쌍을
+                    # 전부 덮고 falsy 값도 없다(2026-08-05 표 대사). 그래도 남겨 둔다: FIX 에
+                    # 구멍이 생기면 조용히 KeyError 로 죽는 대신 사전순 대표값으로 버틴다.
+                    # 주의: FIX 값과 사전순 첫 원소는 12/38 쌍에서 **다르고** 그중엔 의미가
+                    # 정반대인 것도 있다(lever->outcome: raises vs lowers). 매핑표에 있는
+                    # 라벨도 resolve_edge 결과가 이 공간쌍에 무효면 여기로 떨어진다(#387,
+                    # 예: HAS_PART를 lever->outcome에 걸면 resolve_edge는 outcome->lever
+                    # part_of를 내지만 그 공간쌍이 ALLOWED에 없어 여기서 lever->outcome의
+                    # 대표값 raises로 낙착한다: 구버전과 결과가 같다).
+                    rel = _FIX.get((ss, tt)) or sorted(allowed)[0]
+                # 이 가드에서 **현재 실효인 것은 'resource' 뿐**이다(2026-08-05 표 대사:
+                # traceability x evidence 로 이 분기에 닿는 공간쌍이 0개다. claim->evidence 는
+                # KEEP 이 먼저 잡고, 나머지는 정방향 grammar 가 있다). 'evidence' 는 방어적
+                # 여분이며 grammar 가 바뀌면 실효가 된다. 그래서 지우지 않는다.
+                elif _ALLOWED.get((tt, ss)) and not trace_guard:
+                    src, tgt, ss, tt = tgt, src, tt, ss          # 공간쌍 없음: 방향 반전(traceability는 정방향 유지)
+                    rel = _FIX.get((ss, tt)) or sorted(_ALLOWED[(ss, tt)])[0]
+                else:
+                    self._eskip[(raw, ss, tt)] += 1              # 정합 불가: 드롭
+                    return
         k = f'{src}|{rel}|{tgt}'
         if k in self._ek:
             return
