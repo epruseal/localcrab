@@ -73,13 +73,30 @@ def write_lock_for_store(
     ``billing.db`` out to avoid. A file-named lock still serialises two
     processes racing the same billing.db CREATE TABLE, without coupling to
     write.lock's holders.
+
+    Requires a genuine ``str`` for ``sql_store._url`` and for the parsed
+    database path (issue #329). A test double that only fakes
+    ``_is_sqlite`` (e.g. a bare ``unittest.mock.MagicMock``) auto-vivifies
+    every other attribute it is asked for, including ``_url``. Python's
+    ``os.fspath()`` gives ``MagicMock`` a default ``__fspath__`` that
+    stringifies into a path-shaped string such as
+    ``MagicMock/billing._url.database/<id>``, so without this guard
+    ``os.path.abspath()`` below turns that into a real absolute path and
+    ``write_lock()``/``file_lock()`` create a stray directory (and a lock
+    file inside it) under the current working directory. A real
+    ``SQLStore`` always stores a plain ``str`` in ``_url`` and
+    ``sqlalchemy.engine.make_url().database`` is always ``str | None``, so
+    this guard changes nothing for real stores.
     """
     if not getattr(sql_store, "_is_sqlite", False):
         return contextlib.nullcontext()
+    url = getattr(sql_store, "_url", None)
+    if not isinstance(url, str):
+        return contextlib.nullcontext()
     from sqlalchemy.engine import make_url
 
-    db_path = make_url(sql_store._url).database
-    if not db_path or db_path == ":memory:":
+    db_path = make_url(url).database
+    if not isinstance(db_path, str) or not db_path or db_path == ":memory:":
         return contextlib.nullcontext()
     directory = os.path.dirname(os.path.abspath(db_path))
     if own_file:
