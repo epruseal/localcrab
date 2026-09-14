@@ -128,9 +128,13 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   근거는 `opencrab/pack/fork.py` 모듈 docstring 의 "RETIRED ALIASES" 절에 있다.
 - **`pack` 만 있고 `pack_id` 가 없는 행은 보존한다.** 모순이 아니고, 임의 속성을 그대로
   저장한다는 진입점 계약을 깰 이유가 없다. 읽는 코드가 0곳이라 무해하다.
-- **증분 대조는 `pack` 을 무시한다**(`load.INCREMENTAL_IGNORED_KEYS`, 노드축·청크축 둘 다).
-  빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로 잡히는데, neo4j 의 upsert 는
-  전달된 키만 SET 하므로 재기록해도 사라지지 않아 그 재기록이 영구히 반복된다.
+- **증분 대조는 `pack` 을 무시한다.** 노드축은 `load.INCREMENTAL_IGNORED_KEYS`(라이브 쪽)와
+  `load.FILE_SIDE_IGNORED_KEYS`(파일 쪽)로 뺀다. 두 상수 모두 `RETIRED_KEYS` 를 포함한다.
+  청크축은 이 두 상수를 쓰지 않는다. `transform_chunk_meta` 가 파일 쪽 meta 를 만들 때
+  `apply_pack_tag` 로 그 자리에서 별칭을 버리고, 비교 직전에는 `strip_retired_keys` 로
+  라이브 쪽 meta 에서 뺀다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로
+  잡히는데, neo4j 의 upsert 는 전달된 키만 SET 하므로 재기록해도 사라지지 않아 그
+  재기록이 영구히 반복된다.
 - **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
   파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
   전량 치환하므로 **그 다음 런은 same 으로 복귀한다.** 전량 chg 를 한 번 보는 것 자체는
