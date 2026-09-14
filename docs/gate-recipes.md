@@ -86,10 +86,15 @@ pytest tests/ -v
   고정한 계약값이라 안 썩는다):
 
   ```bash
-  docker compose up -d postgres
+  docker compose up -d --wait postgres  # healthcheck(pg_isready) 통과까지 대기
   docker exec opencrab-postgres createdb -U opencrab opencrab_test  # 최초 1회
   make test-pg  # 위 환경변수를 자동 설정하고 실행(6번의 재현 명령을 직접 써도 된다)
   ```
+
+  `--wait`이 없으면 컨테이너가 뜨자마자 `createdb`가 실행돼 PostgreSQL이
+  아직 연결을 받지 않는 시점과 경합할 수 있다. `docker-compose.yml`의
+  `postgres` 서비스가 이미 `pg_isready` 기반 `healthcheck`를 선언해
+  뒀으므로(`start_period: 15s`), `--wait`으로 그 신호를 그대로 쓴다.
 
   CI(`.github/workflows/ci.yml`)도 같은 구성을 서비스 컨테이너로 띄운다(7번
   대응표 참고).
@@ -133,32 +138,54 @@ pytest tests/ -v
 
   재현 명령은 아래 한 줄이며, base 실행과 작업 실행은 이 줄에서 `<워크트리>`
   자리(cd 대상 경로, 파이썬 인터프리터 경로, 임시 경로·로그 파일명의
-  식별자 — 전부 같은 워크트리를 가리키는 동일 값)만 각자의 워크트리
+  식별자: 전부 같은 워크트리를 가리키는 동일 값)만 각자의 워크트리
   경로로 바꿔 쓴다. 그 외 자리는 글자 그대로 동일하게 둔다:
 
   ```bash
-  cd <워크트리>
-  set -o pipefail
-  PYTEST_ADDOPTS= OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
-  OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
-  <워크트리>/.venv/bin/python -m pytest tests/ -v \
-    --basetemp=/tmp/<워크트리 식별자>-basetemp \
-    2>&1 | tee /tmp/<워크트리 식별자>-run.log
-  echo "EXIT:$?" | tee -a /tmp/<워크트리 식별자>-run.log
+  (
+    cd <워크트리> || exit 17
+    set -o pipefail
+    PYTEST_ADDOPTS= OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
+    OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
+    <워크트리>/.venv/bin/python -m pytest tests/ -v \
+      --basetemp=/tmp/<워크트리 식별자>-basetemp \
+      2>&1 | tee /tmp/<워크트리 식별자>-run.log
+    code=$?
+    echo "EXIT:$code" | tee -a /tmp/<워크트리 식별자>-run.log
+    exit "$code"
+  )
+  echo "BLOCK_EXIT:$?"
   ```
 
+  서브셸 마지막 줄을 `exit "$code"`로 맺는 이유는, 그 앞의
+  `echo ... | tee -a ...` 파이프라인 자체는 (`echo`와 `tee` 둘 다
+  보통 성공하므로) `set -o pipefail` 아래에서도 항상 0으로 끝나기
+  때문이다. 그 값을 그대로 서브셸의 종료 코드로 흘려보내면 pytest의
+  실제 종료 코드가 사라지고 `BLOCK_EXIT`가 늘 0으로 나온다. 그래서
+  파이프 실행 직후 `code=$?`로 pytest의 종료 코드를 먼저 변수에
+  붙잡아 두고, 로그에 적은 뒤 그 값으로 명시적으로 `exit`한다.
+
   종료 코드를 같은 로그 파일에 `-a`(append)로 이어 적는 이유는 판정
-  절차 1번("각 실행의 종료 코드를 기록한다")이 나중에 로그만 보고도
-  재확인 가능해야 하기 때문이다 — 터미널에만 찍히고 로그에 안 남으면
-  그 순간 지나간 값은 다시 볼 수 없다.
+  절차 1번("각 실행의 `BLOCK_EXIT` 값을 기록한다")이 나중에 로그만 보고도
+  재확인 가능해야 하기 때문이다. 터미널에만 찍히고 로그에 안 남으면
+  그 순간 지나간 값은 다시 볼 수 없다(`BLOCK_EXIT` 자체는 로그가 아니라
+  터미널에만 남지만, `cd`가 성공한 한 그 값은 로그 마지막 줄의
+  `EXIT:$code`와 같으므로 로그만으로도 재확인된다. 둘이 다르면
+  `BLOCK_EXIT`가 17인 `cd` 실패 경로다).
 
   맨 앞의 `cd <워크트리>`는 생략할 수 없다: `tests/`는 cwd 기준 상대
   경로이고, `python -m pytest`는 cwd를 `sys.path[0]`에 넣으므로 소스
   트리까지 cwd를 따라간다. 2번 절과 반대로 여기서는 cwd가 대상
   워크트리 자신이어야 그 워크트리의 테스트와 소스를 본다. `cd`가
-  실패하거나 엉뚱한 디렉터리에 머무르면 `tests/`를 못 찾아 pytest가
-  사용법 오류(4)나 미수집(5)으로 끝나며, 이는 아래 판정 절차 2번이 이미
-  미완주로 잡는다.
+  실패해도 이전 cwd에 우연히 `tests/`가 있으면 pytest는 그 디렉터리를
+  대상으로 사용법 오류나 미수집 없이 "정상 종료"해 버릴 수 있다(다른
+  워크트리를 잘못 대사하는 것). 그래서 `cd` 자체의 성패를 pytest의
+  종료 코드에 얹지 않고 `|| exit 17`로 즉시, pytest의 0~5 계약 밖 값으로
+  분리해서 낸다. 이 전체를 서브셸 `( ... )`로 감싸는 이유는 그래야
+  `exit 17`이 그 서브셸만 끝내고 호출한 셸 자체를 종료시키지 않기
+  때문이다. `BLOCK_EXIT`가 17이면 `cd` 실패이니 pytest는 아예 실행되지
+  않은 것이고, 그 밖의 값이면 위 판정 절차 1~2번이 다루는 pytest 자신의
+  종료 코드다.
 
   종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
   1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
@@ -186,17 +213,27 @@ pytest tests/ -v
 아니다. **이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
 `addopts`, `-p` 플러그인, 상위 `conftest.py` 등 같은 일을 하는 경로가 더
 있을 수 있고, 전부 나열하는 쪽으로는 닫히지 않는다. 그래서 판정은 아래
-처럼 **검출**로 한다: 어느 경로로 조기 종료되든 pytest가 자기 실행
-조건을 스스로 보고하는 두 숫자(수집 수·처리 수)가 어긋난다.
+처럼 **검출**로 한다: 어느 경로로 조기 종료되든 pytest는 자기 실행
+조건을 스스로 두 가지로 보고한다. 하나는 `session.shouldfail`/
+`shouldstop`이 켜질 때 무조건 찍는 `!` 배너 줄이고, 다른 하나는 수집
+수·처리 수 두 숫자다. 배너 하나만으로 못 거르는 조기 종료는 없지만
+(코드가 그 두 세션 플래그 경로에서 예외 없이 배너를 낸다), 반대로 두
+숫자의 어긋남만으로는 배너가 없는 조기 종료(예: 그 두 플래그를 전혀
+거치지 않는 별도 경로)를 놓칠 여지가 있어 두 검출을 같이 쓴다.
 
 ### 판정 절차
 
-1. 각 실행의 종료 코드를 기록한다.
-2. 종료 코드가 0(전부 통과) 또는 1(실패 있음, 또는 tripwire 중단)이
-   아니면 그 자체로 미완주다 — pytest의 종료 코드 계약상 2는 실행
+1. 각 실행의 `BLOCK_EXIT` 값(재현 명령 맨 끝의 `echo "BLOCK_EXIT:$?"`가
+   낸 값)을 기록한다.
+2. `BLOCK_EXIT`가 17이면 `cd`가 실패해 pytest가 아예 실행되지 않은
+   것이다. pytest 자신의 0~5 종료 코드 계약과 겹치지 않는 값이라 이
+   경로만으로 곧바로 식별된다. 그 자체로 미완주이며 diff를 내지 않고
+   워크트리 경로부터 고친다. 17이 아니면 그 값은 pytest 자신의 종료
+   코드다. 0(전부 통과) 또는 1(실패 있음, 또는 tripwire 중단)이 아니면
+   역시 그 자체로 미완주다. pytest의 종료 코드 계약상 2는 실행
    중단(예: `KeyboardInterrupt`), 3은 내부 오류, 4는 사용법 오류, 5는
    미수집이며, 어느 쪽이든 diff를 내지 않고 원인부터 조사한다.
-3. 종료 코드가 1이면 PG tripwire(`tests/conftest.py`)는 DB명이 `_test`로
+3. `BLOCK_EXIT`가 1이면 PG tripwire(`tests/conftest.py`)는 DB명이 `_test`로
    안 끝나면 `pytest.exit(...)`로 세션 전체를 즉시 중단하며 이때도 종료
    코드가 1이다. 로그에 고정 마커 `[PG tripwire]`(tripwire가 내는 메시지
    앞부분, 코드가 문자 그대로 보장하는 계약값이라 안 썩는다)가 있는지
@@ -205,32 +242,50 @@ pytest tests/ -v
    grep -n '\[PG tripwire\]' /tmp/<워크트리 식별자>-run.log
    ```
    있으면 diff를 내지 않고 원인(DB명 오설정)부터 고친다.
-4. 마커가 없으면(종료 코드 0이거나, 1이면서 마커 없음) 완주 여부를
-   옵션 목록이 아니라 pytest 자신이 보고하는 두 숫자의 대사로 확인한다.
-   로그 앞부분의 `collected N item(s)`의 `N`과, 로그의 마지막 줄(정상
-   완주 시 pytest가 매번 내는 요약줄, 예: `1 failed, 3 passed in
-   0.02s`)에 나오는 카테고리별 수의 합을 비교한다. 합산 대상은
-   `_pytest.terminal.KNOWN_TYPES`에서 `warnings`와 `subtests *`를 뺀
-   나머지: `failed`, `passed`, `skipped`, `deselected`, `xfailed`,
-   `xpassed`, `error`(둘 다 코드가 고정한 목록이라 안 썩는다). `N`과
-   합이 다르면(예: `-x`/`--maxfail`/`PYTEST_ADDOPTS` 주입으로 조기
-   종료됐지만 겉보기엔 정상 종료된 실행) 완주가 아니므로 diff하지 않고
-   원인부터 조사한다. (로그 마지막 줄이 그 요약줄이라는 전제가 깨지는
-   경로는 이 저장소에 `pytest.exit` 호출 하나뿐인 PG tripwire뿐이며,
-   그 경로는 이미 3번에서 먼저 걸린다 — `git grep -n "pytest.exit"`로
-   호출부가 하나인지 그때그때 확인한다.) `N`과 합이 같으면 완주다.
+4. 마커가 없으면(`BLOCK_EXIT`가 0이거나, 1이면서 마커 없음) 조기 종료 배너를
+   grep한다. pytest는 `session.shouldfail`/`session.shouldstop`이
+   켜지면(`-x`/`--maxfail`뿐 아니라 이 두 세션 플래그를 세우는 임의
+   플러그인이 전부 해당한다) 종료 시 `!`로 시작하는 배너 줄을 반드시
+   낸다(`_pytest/terminal.py`의 `write_sep("!", ...)` 호출부, 이
+   워크트리가 설치한 pytest 9.1.1 소스로 확인한 계약값. `KeyboardInterrupt`
+   전용 경로는 별도이며 여기 대상이 아니다):
+   ```bash
+   grep -c '^!' /tmp/<워크트리 식별자>-run.log
+   ```
+   이 단계는 다음 5번의 산술 대사보다 먼저, 그리고 그 대사와 별개로
+   확인해야 한다. teardown 에러가 조기 종료 지점의 테스트에 걸리면
+   초과분과 미실행분이 우연히 상쇄해 `collected N`과 요약줄 카테고리
+   합이 같아 보일 수 있다(실측: 테스트 2개 중 1번째만 teardown이
+   실패하는 픽스처를 걸고 `-x`로 실행하면 2번째 테스트가 전혀 안
+   돌았는데도 `collected 2 items` 대 `1 passed, 1 error`로 합이 2가
+   나와, 5번의 산술만으로는 완주로 오판정한다). 0이 아니면(배너 줄이
+   한 줄이라도 있으면) 산술 결과와 무관하게 미완주로 보고 diff를 내지
+   않고 원인부터 조사한다. 0이면 5번으로 넘어간다.
+5. 완주 여부를 옵션 목록이 아니라 pytest 자신이 보고하는 두 숫자의
+   대사로 확인한다. 로그 앞부분의 `collected N item(s)`의 `N`과, 로그의
+   마지막에서 두 번째 줄(맨 마지막 줄은 위 재현 명령이 덧붙인
+   `EXIT:...` 줄이므로, 정상 완주 시 pytest가 매번 내는 요약줄은 그
+   바로 앞줄이다. 예: `1 failed, 3 passed in 0.02s`)에 나오는 카테고리별
+   수의 합을 비교한다. 합산 대상은 `_pytest.terminal.KNOWN_TYPES`에서
+   `warnings`와 `subtests *`를 뺀 나머지: `failed`, `passed`, `skipped`,
+   `deselected`, `xfailed`, `xpassed`, `error`(둘 다 코드가 고정한
+   목록이라 안 썩는다). `N`과 합이 다르면(예: `-x`/`--maxfail`/
+   `PYTEST_ADDOPTS` 주입으로 조기 종료됐지만 겉보기엔 정상 종료된 실행)
+   완주가 아니므로 diff하지 않고 원인부터 조사한다. `N`과 합이 같으면
+   4번에서 배너가 없었다는 전제 아래 완주로 본다(배너 유무를 먼저
+   확인하는 이유가 바로 이 산술만으로는 못 거르는 경우가 있어서다).
 
    **알려진 예외(완주인데도 합이 `N`보다 큰 경우)**: teardown 단계에서
    에러가 나면 같은 테스트가 `passed`와 `error` 양쪽에 한 번씩 잡혀
    합이 `N`을 넘을 수 있다(pytest의 report 단위 집계이지 테스트 단위
-   집계가 아니라서다 — 실측: 테스트 1개짜리 세션에서 teardown만
+   집계가 아니라서다. 실측: 테스트 1개짜리 세션에서 teardown만
    실패시키면 `collected 1 item` 대 `1 passed, 1 error`로 합 2가
-   나온다). 이 방향(합 > `N`)이 나오면 조기 종료가 아니라 teardown
-   에러부터 의심한다 — 로그의 `ERROR at teardown of` 줄 수만큼 초과분을
-   설명할 수 있으면 완주로 판정하고, 설명이 안 되는 초과분이 남으면
-   원인부터 조사한다. 반대 방향(합 < `N`)은 이 예외의 대상이 아니며
-   그대로 미완주로 본다.
-5. 완주가 확인되면 로그의 `FAILED`/`ERROR` 줄 id를 정렬된 집합으로
+   나온다). 이 방향(합 > `N`)이 나오면(그리고 4번에서 배너가 없었다면)
+   조기 종료가 아니라 teardown 에러부터 의심한다. 로그의
+   `ERROR at teardown of` 줄 수만큼 초과분을 설명할 수 있으면 완주로
+   판정하고, 설명이 안 되는 초과분이 남으면 원인부터 조사한다. 반대
+   방향(합 < `N`)은 이 예외의 대상이 아니며 그대로 미완주로 본다.
+6. 완주가 확인되면 로그의 `FAILED`/`ERROR` 줄 id를 정렬된 집합으로
    (없으면 빈 집합으로) 뽑아 양쪽 다 항상 base와 diff한다(빈 집합끼리도
    diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 이때
    요약줄이 `N failed`(N>0)를 보고하는데 로그에 `^FAILED `로 시작하는
@@ -238,7 +293,7 @@ pytest tests/ -v
    있다는 뜻이므로 diff를 신뢰하지 말고 옵션부터 고친다 — "리포트
    옵션을 기본값으로 고정했다"는 서술이 아니라 로그에 실제로 `FAILED`
    줄이 나온 것 자체가 그 고정이 걸렸다는 증거다.
-6. 수집 단계 에러(`ERROR collecting`)는 0.
+7. 수집 단계 에러(`ERROR collecting`)는 0.
 
 `--basetemp`은 pytest가 그 디렉터리를 비우는 파괴적 동작이며, 그 시점은
 세션 시작이 아니라 세션 중 `TempPathFactory.getbasetemp()` 최초 호출(첫
