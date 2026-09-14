@@ -137,10 +137,13 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   재기록이 영구히 반복된다.
 - **노드축 증분 대조는 필터를 걸기 전에 `prepare_node` 로 원본 `props` 를 먼저
   검증한다(#379).** `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 필터는 값을
-  검증하지 않고 키만 뺀다. 필터만으로 비교하면 불량 값(중첩 `properties.space` 타입
-  오류, 중첩 `properties.id` 불일치 등)이 필터에 걸러진 뒤 같은 노드로 오인돼 `same`
-  으로 통과할 수 있다. `add_node` 가 쓰는 정규화/검증 함수를 그대로 재사용해, 전체
-  적재라면 거부될 값이 증분에서만 통과하는 부류를 필터 키 구성과 무관하게 막는다.
+  검증하지 않고 키만 뺀다. 어떤 필터 키 구성에서도 `prepare_node` 검증 단계 없이
+  필터만으로 비교하면 불량 값(중첩 `properties.space` 타입 오류, 중첩
+  `properties.id` 불일치 등)이 필터에 걸러진 뒤 같은 노드로 오인돼 `same` 으로
+  통과할 수 있다(실제로 base 커밋의 필터 구성에서는 `id` 불일치가 우연한 키 집합
+  불일치로 이미 chg 로 걸러졌으나, space 타입 오류는 실제로 통과했다: #379 재현).
+  `add_node` 가 쓰는 정규화/검증 함수를 그대로 재사용해, 전체 적재라면 거부될 값이
+  증분에서만 통과하는 부류를 필터 키 구성과 무관하게 막는다.
   `prepare_node` 검증에 실패하면 그 행은 `same` 후보에서 빠진다. 이 검증이 비교
   단계 이후 쓰기 시도가 어느 카운터(skip/chg/err)로 떨어지는지는 정하지 않는다.
   `prepare_node` 가 반환한 `props` 는 원본에 없어도 `id` 를 항상 채워 넣으므로,
