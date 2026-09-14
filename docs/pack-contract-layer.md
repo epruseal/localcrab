@@ -198,7 +198,7 @@ SELECT COUNT(*) FROM graph_nodes
 다른 사실이라 섞으면 안 된다 — 종전에는 둘 다 `0` 이라 Chroma·pgvector 에서 **항상 결손처럼
 보였다**. 호출자는 **산술 전에 `None` 을 걸러라.** 그냥 빼면 `TypeError` 다.
 
-### 3. `load_nodes_incremental(..., doc_node_spaces=, doc_owner_ids=)` 는 둘 다 **필수**다
+### 3. `load_nodes_incremental(..., doc_node_spaces=)` 는 **필수**다
 
 `live_pack_state` 가 돌려주는 `{node_id: {space, ...}}` 를 `doc_node_spaces` 로 그대로
 넘겨라. 기본값을 두지 않은 것이 의도다 — 기본값이 있으면 안 넘긴 호출자에서 doc 잔재
@@ -214,14 +214,11 @@ SELECT COUNT(*) FROM graph_nodes
 
 빈 dict 는 유효한 입력이다(대사할 doc 행이 없다는 사실). `None` 과 다르다.
 
-**`doc_owner_ids`(#358 재리뷰 P1-B)도 같은 이유로 필수다.** `live_pack_state` 가 돌려주는
-`{(node_id, space): owner_id 또는 None}` 을 그대로 넘겨라. 이 인자가 닫는 것은 **문서
-sink 의 owner_id staleness** 다 — 그래프 쓰기는 성공하고 뒤이은 문서 쓰기가 실패하면
-그래프는 현재 principal 로 재스탬프됐어도 문서 쪽 `properties.owner_id` 는 낡은 값을 그대로
-담은 채 남는다. 다음 실행이 그래프 쪽만 보고 `same` 을 내리면 문서 쪽 owner_id 는 영영
-회수되지 않는다. 키가 `(node_id, space)` 튜플인 이유는 문서 스토어 기본키가
-`(space, node_id)` 라 같은 node_id 가 여러 space 에 행을 가질 수 있어서다 — bare node_id 로
-모으면 무관한 space 의 값이 목표 space 의 값을 덮어쓸 수 있다.
+`owner_id` 는 이 인자들의 대상이 아니다. 증분 대조에서 라이브 쪽에서만 빼는
+`INCREMENTAL_IGNORED_KEYS`(`opencrab/pack/load.py`) 의 원소이고, 어떤 노드 타입도
+`owner_id` 를 스키마 필드로 선언하지 않는다(순수 시스템 스탬프 값, `write_gate.py` 의
+`NODE_STAMPED`). 증분 재적재가 origin=server 의 owner_id 재스탬프 계약을 실제로
+만족하는지는 이 계약과 무관한 별도 결함이며 #378 로 이관했다.
 
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 

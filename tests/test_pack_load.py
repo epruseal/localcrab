@@ -388,8 +388,7 @@ class TestLoadNodesIncremental:
         # 오판하게 만들어 same 이 chg 로 흘러 이 테스트 자체가 R2 검사를
         # 못 지나간다(위 docstring 의 "라이브를 실제로 읽는다" 원칙과 같은 이유).
         n_new, n_chg, n_same, skip, err, ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"],
-            state["doc_owner_ids"])
+            "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             "라이브와 동일한 행이 same 으로 판정되지 않았다 — 매 증분마다 전량 재적재된다")
         assert ids == {"n1"}
@@ -399,7 +398,7 @@ class TestLoadNodesIncremental:
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", 발행연도="2027")])
         live_nodes = {"n1": ("Document", "resource", {"발행연도": "2026", "pack_id": "pack-1"})}
         n_new, n_chg, n_same, skip, err, _ = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, {}, {})
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {})
         assert (n_new, n_chg, n_same) == (0, 1, 0)
 
     def test_node_type_change_removes_the_old_row(self, live, tmp_path):
@@ -422,7 +421,7 @@ class TestLoadNodesIncremental:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         _n, n_chg, _s, _sk, _e, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {}, {})
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert n_chg == 1, "타입 변경이 chg 로 세어지지 않았다"
         assert graph.get_node("Concept", "n1") is not None, "새 타입 행이 없다"
@@ -433,7 +432,7 @@ class TestLoadNodesIncremental:
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
         n_new, n_chg, n_same, _, _, _ = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, {}, graph, docs, {}, {})
+            "pack-1", f, builder, {}, {}, graph, docs, {})
         assert (n_new, n_chg, n_same) == (1, 0, 0)
 
     def test_live_property_drift_converges_in_one_run(self, live, tmp_path):
@@ -485,7 +484,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
+                state["doc_node_spaces"])[:5]
 
         assert _run() == (0, 3, 0, 0, 0), "드리프트한 행이 chg 로 회수되지 않았다"
         assert _run() == (0, 0, 3, 0, 0), (
@@ -499,7 +498,7 @@ class TestLoadNodesIncremental:
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
     def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path):
-        """**#358 회귀.** `BOTH_SIDES_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
+        """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
 
         파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
         생산자가 흔히 쓰는 형태), `absorb_legacy_top_level` 이 그 중첩 값을
@@ -520,57 +519,12 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
+                state["doc_node_spaces"])[:5]
 
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
         assert _run() == (0, 0, 1, 0, 0), (
             "2차 런이 same 으로 수렴하지 않았다 — 파일 쪽 properties.space 가 "
-            "BOTH_SIDES_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
-
-    def test_stale_live_owner_id_is_restamped_when_file_carries_the_key(
-        self, live, tmp_path
-    ):
-        """**#358 재리뷰 회귀.** `owner_id` 는 값 비교가 아니라 "라이브의 현재
-        owner_id 가 이미 현재 principal 인가"로 판정해야 한다.
-
-        `write_gate.stamp()` 는 `add_node` 가 실제로 호출될 때만 실행된다.
-        일반 same/chg 비교가 `owner_id` 를 양쪽에서 제외한 채로만 판정하면,
-        구 로더 잔재나 principal 교체 이력 때문에 라이브가 낡은 owner_id 를
-        갖고 있어도 다른 값이 전부 같으면 `same` 으로 잡혀 재스탬프가 영영
-        일어나지 않는다. 라이브 행을 직접 드리프트시켜(인접
-        `test_a_drifted_row_converges...` 와 같은 기법 — write_gate 를 거치지
-        않고 properties 를 직접 써서 과거 로더가 남긴 잔재를 모사한다) 낡은
-        owner_id 가 남은 상태를 만든 뒤, 파일이 owner_id 키를 실은 채로
-        재적재되면 `chg` 로 잡혀 현재 principal 로 재스탬프돼야 한다.
-        """
-        builder, graph, docs = live
-        f = _write_jsonl(tmp_path / "nodes.jsonl",
-                          [_node(id="n1", owner_id="owner_from_a_past_life")])
-
-        def _run():
-            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-            return pack_load.load_nodes_incremental(
-                "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
-
-        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
-        row = graph.get_node("Document", "n1")
-        assert row["owner_id"] == _LIVE_TEST_USER, "1차 스탬프는 현재 principal 이어야 한다"
-
-        seeded = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
-        node_type, space, props = seeded["n1"]
-        drifted = dict(props)
-        drifted["owner_id"] = "owner_from_a_past_life"
-        digest = graph.get_node_digest("n1", node_type=node_type)
-        graph.update_node("n1", digest, node_type, drifted, space)
-        row = graph.get_node("Document", "n1")
-        assert row["owner_id"] == "owner_from_a_past_life", "사전 조건: 드리프트가 실제로 적용됐다"
-
-        assert _run() == (0, 1, 0, 0, 0), (
-            "라이브 owner_id 가 낡았는데 chg 로 안 잡히면 재스탬프가 누락된다(#358 재리뷰)")
-        row = graph.get_node("Document", "n1")
-        assert row["owner_id"] == _LIVE_TEST_USER, (
-            "재기록이 일어났는데도 owner_id 가 낡은 값에 머물러 있다")
+            "FILE_SIDE_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
 
     def test_stale_live_space_column_is_corrected_even_when_properties_match(
         self, live, tmp_path
@@ -578,18 +532,17 @@ class TestLoadNodesIncremental:
         """**#358 재리뷰 P1-A 회귀.** same 판정은 properties 뿐 아니라 그래프의
         실제 `space_id` 컬럼(`live[1]`)도 목표 space 와 맞는지 봐야 한다.
 
-        `BOTH_SIDES_IGNORED_KEYS` 가 `space` 를 양쪽 properties 비교에서 뺀다
-        (파일 쪽 레거시 중첩 `properties.space` 대칭화, #358). 그런데 그
-        필터를 걸고 나면 properties 만으로는 space 불일치를 볼 방법이
-        없어진다 — 레거시 중첩-space 이관 행이 그래프의 실제 `space_id` 는
-        구 space 에 남긴 채 절반만 반영돼도, properties 가 우연히 같으면
-        `same` 으로 잡혀 잘못된 space 에 영구히 머문다. 파일은 최상위
-        `space` 만 실은 평범한 행이다 — 중첩 형태가 아니어도 컬럼 자체가
-        드리프트하면 같은 결함이 재현된다.
+        `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 가 `space` 를 양쪽
+        properties 비교에서 뺀다(파일 쪽 레거시 중첩 `properties.space`
+        대칭화, #358). 그런데 그 필터를 걸고 나면 properties 만으로는 space
+        불일치를 볼 방법이 없어진다. 레거시 중첩-space 이관 행이 그래프의
+        실제 `space_id` 는 구 space 에 남긴 채 절반만 반영돼도, properties
+        가 우연히 같으면 `same` 으로 잡혀 잘못된 space 에 영구히 머문다.
+        파일은 최상위 `space` 만 실은 평범한 행이다. 중첩 형태가 아니어도
+        컬럼 자체가 드리프트하면 같은 결함이 재현된다.
 
-        라이브 행을 직접 드리프트시킨다(인접 owner_id 테스트와 같은 기법 —
-        write_gate 를 거치지 않고 그래프의 space_id 컬럼만 바꿔 과거의
-        부분 실패 잔재를 모사한다).
+        라이브 행을 직접 드리프트시킨다(write_gate 를 거치지 않고 그래프의
+        space_id 컬럼만 바꿔 과거의 부분 실패 잔재를 모사한다).
         """
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", space="resource")])
@@ -598,7 +551,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
+                state["doc_node_spaces"])[:5]
 
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
 
@@ -616,96 +569,6 @@ class TestLoadNodesIncremental:
         after = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
         assert after["n1"][1] == "resource", (
             "재기록이 일어났는데도 space_id 가 드리프트한 값에 머물러 있다")
-
-    def test_stale_doc_owner_id_is_corrected_even_when_graph_owner_id_matches(
-        self, live, tmp_path
-    ):
-        """**#358 재리뷰 P1-B 회귀.** `owner_id_needs_restamp` 는 그래프 sink 만
-        보고 문서 sink 의 거울상 `properties.owner_id` 는 안 봐서는 안 된다.
-
-        그래프 쓰기는 성공하고 뒤이은 문서 쓰기가 실패하면, 다음 대상 principal
-        재스탬프 판정에서 그래프는 이미 현재 principal 인데 문서 sink 만 낡은
-        owner_id 를 그대로 담은 채 남는다. 그 경우도 chg 로 잡혀 문서 sink 가
-        회수돼야 한다.
-
-        문서 sink 를 `docs.upsert_node_doc` 으로 직접 드리프트시킨다(write_gate
-        를 거치지 않고 지난 부분 실패의 잔재를 모사한다 — 인접 그래프 쪽
-        owner_id 테스트와 같은 기법을 문서 sink 에 옮긴 것이다).
-        """
-        builder, graph, docs = live
-        f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", owner_id=_LIVE_TEST_USER)])
-
-        def _run():
-            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-            return pack_load.load_nodes_incremental(
-                "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
-
-        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
-        row = graph.get_node("Document", "n1")
-        assert row["owner_id"] == _LIVE_TEST_USER, "사전 조건: 그래프 owner_id 는 이미 현재 principal 이다"
-
-        doc = docs.get_node_doc("resource", "n1")
-        assert doc is not None, "사전 조건: 1차 런이 문서 sink 행을 남겼다"
-        drifted_props = dict(doc["properties"])
-        drifted_props["owner_id"] = "owner_from_a_past_life"
-        docs.upsert_node_doc("resource", "Document", "n1", drifted_props)
-        doc = docs.get_node_doc("resource", "n1")
-        assert doc["properties"]["owner_id"] == "owner_from_a_past_life", (
-            "사전 조건: 문서 sink 드리프트가 실제로 적용됐다")
-
-        assert _run() == (0, 1, 0, 0, 0), (
-            "그래프 owner_id 는 맞는데 문서 sink 만 낡았어도 chg 로 안 잡히면 "
-            "문서 sink 의 owner_id staleness 가 영구히 남는다(#358 재리뷰 P1-B)")
-        doc = docs.get_node_doc("resource", "n1")
-        assert doc["properties"]["owner_id"] == _LIVE_TEST_USER, (
-            "재기록이 일어났는데도 문서 sink 의 owner_id 가 낡은 값에 머물러 있다")
-
-    def test_doc_missing_owner_id_key_is_treated_as_stale_not_converged(
-        self, live, tmp_path
-    ):
-        """**#358 재리뷰 P1 회귀(codex review 5193878249).** 문서 sink 행이
-        존재하되 `properties` 에 `owner_id` 키 자체가 없으면(레거시·부분
-        이관 잔재), `doc_owner_ids.get(...)` 는 `None` 을 반환한다. 이전
-        비교식 `not in (None, principal.user_id)` 는 이 `None` 을 수렴으로
-        오판해 재스탬프를 영구히 건너뛰었다 — 그래프 쪽 비교
-        (`live[2].get("owner_id") != principal.user_id`)는 같은 키 부재를
-        `None != user_id` 로 재스탬프 대상에 넣는데 문서 쪽만 반대로
-        행동한 비대칭 결함이었다.
-
-        문서 sink 를 직접 드리프트시켜(write_gate 미경유) `owner_id` 키
-        자체를 지운다 — 인접 owner_id 값-불일치 테스트와 같은 기법이다.
-        """
-        builder, graph, docs = live
-        f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", owner_id=_LIVE_TEST_USER)])
-
-        def _run():
-            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-            return pack_load.load_nodes_incremental(
-                "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"], state["doc_owner_ids"])[:5]
-
-        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
-        row = graph.get_node("Document", "n1")
-        assert row["owner_id"] == _LIVE_TEST_USER, "사전 조건: 그래프 owner_id 는 이미 현재 principal 이다"
-
-        doc = docs.get_node_doc("resource", "n1")
-        assert doc is not None, "사전 조건: 1차 런이 문서 sink 행을 남겼다"
-        drifted_props = dict(doc["properties"])
-        del drifted_props["owner_id"]
-        docs.upsert_node_doc("resource", "Document", "n1", drifted_props)
-        doc = docs.get_node_doc("resource", "n1")
-        assert "owner_id" not in doc["properties"], (
-            "사전 조건: 문서 sink 에서 owner_id 키 자체가 사라졌다")
-
-        assert _run() == (0, 1, 0, 0, 0), (
-            "문서 sink 에 owner_id 키가 아예 없는 행을 수렴으로 오판하면 "
-            "그 키가 영구히 복구되지 않는다(#358 재리뷰 P1)")
-        doc = docs.get_node_doc("resource", "n1")
-        assert doc["properties"]["owner_id"] == _LIVE_TEST_USER, (
-            "재기록이 일어났는데도 문서 sink 에 owner_id 키가 채워지지 않았다")
-
-
 class TestLoadEdges:
     def _map(self):
         return {"n1": ("resource", "Document"), "n2": ("resource", "Document")}
@@ -1524,7 +1387,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         # 아예 빠졌다 — n1 의 실패와 무관한 stale 후보다.
         f2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="n1", 발행연도="2027")])
         n_new, n_chg, n_same, skip, err, bypack_ids = pack_load.load_nodes_incremental(
-            "pack-1", f2, builder, {}, state["nodes"], graph, docs, {}, {})
+            "pack-1", f2, builder, {}, state["nodes"], graph, docs, {})
         assert err == 1, f"저장 실패가 err 로 안 잡혔다: n_new={n_new} n_chg={n_chg} err={err}"
         assert bypack_ids == {"n1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
 
@@ -4723,7 +4586,7 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {}, {})
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert err == 1, (
             f"저장 실패가 err 로 안 잡혔다 (n_new={n_new} n_chg={n_chg} err={err})")
@@ -4756,7 +4619,7 @@ class TestDocSpaceResidueCleanup:
         # 같은 파일을 다시 적재 — 노드 자체는 안 바뀌었으므로 same 경로를 타야 한다.
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
             "pack-1", nf, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"], state["doc_owner_ids"])
+            state["doc_node_spaces"])
         assert n_same == 1, f"전제 위반 — same 경로가 아니다: new={n_new} chg={n_chg} same={n_same}"
 
         left_spaces = {r[0] for r in docs._conn.execute(
@@ -4834,7 +4697,7 @@ class TestDocSpaceResidueCleanup:
                            [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"], state["doc_owner_ids"])
+            state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
@@ -4869,7 +4732,7 @@ class TestDocSpaceResidueCleanup:
                                   properties={"버전": "2"})])
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"], state["doc_owner_ids"])
+            state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
@@ -5068,14 +4931,6 @@ class TestDocAxisDenominatorAndMutationGuards:
         assert params["doc_node_spaces"].default is inspect.Parameter.empty, (
             "doc_node_spaces 에 기본값이 생겼다 — 필수 인자 계약이 깨졌다")
 
-    def test_load_nodes_incremental_doc_owner_ids_has_no_default(self):
-        """`doc_owner_ids` 도 `doc_node_spaces` 와 같은 이유로 필수 인자다
-        (#358 재리뷰 P1-B) — 기본값이 생기면 문서 sink 의 owner_id staleness
-        검사가 호출자가 안 넘겨도 예외 없이 조용히 꺼진다."""
-        params = inspect.signature(pack_load.load_nodes_incremental).parameters
-        assert params["doc_owner_ids"].default is inspect.Parameter.empty, (
-            "doc_owner_ids 에 기본값이 생겼다 — 필수 인자 계약이 깨졌다")
-
     def test_doc_node_spaces_reconcile_predicate_is_pack_id_only_not_four_key(
             self, live, tmp_path):
         """`live_pack_state` 의 doc_node_spaces 대사(reconcile) 술어는 `pack_id`
@@ -5193,7 +5048,7 @@ class TestLoadLogsInsteadOfSwallowing:
                            [_node(id="n1", node_type="Concept", space="concept")])
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
             n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-                "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {}, {})
+                "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {})
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
         assert any("주입된 doc 삭제 실패" in r.getMessage() for r in caplog.records), (
