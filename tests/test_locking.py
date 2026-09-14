@@ -578,6 +578,22 @@ def test_busy_message_reports_full_holder_record(tmp_path):
     assert "purpose=mcp tool: pack_ingest" in message
 
 
+def test_busy_message_treats_oversized_record_as_unreadable(tmp_path, caplog):
+    """엣지(PR #384 리뷰): write.lock이 정상 레코드 크기를 크게 넘으면(혼합
+    버전 배포에서 남은 손상 파일 등) 전체를 메모리에 읽어들이지 않고 바로
+    "unknown"으로 처리한다. `_MAX_HOLDER_RECORD_BYTES`를 살짝 넘는 크기로
+    확인한다 -- 실제 배포에서 문제가 되는 크기(수 GB)까지 만들 필요는 없다."""
+    from opencrab.locking import _MAX_HOLDER_RECORD_BYTES
+
+    lock_path = tmp_path / "write.lock"
+    oversized = b'{"purpose": "' + b"x" * (_MAX_HOLDER_RECORD_BYTES + 1) + b'"}'
+    lock_path.write_bytes(oversized)
+    with caplog.at_level("DEBUG", logger="opencrab.locking"):
+        message = write_lock_busy_message(str(lock_path), 1.0)
+    assert "Holder: unknown" in message
+    assert any("exceeds" in r.message for r in caplog.records)
+
+
 def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
     """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
     tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가

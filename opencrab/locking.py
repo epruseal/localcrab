@@ -126,6 +126,17 @@ def _resolve_timeout(timeout: float | None) -> float:
     return timeout
 
 
+#: Upper bound on how much of write.lock this reads back (#352 review).
+#: A real holder record is a few hundred bytes of JSON. A file past this size
+#: is corrupt, foreign, or from a mixed-version deployment -- not a record
+#: this code can trust -- so it is treated as unreadable rather than fully
+#: read into memory. Without this bound, an oversized write.lock would make
+#: a best-effort diagnostic read allocate unbounded memory or run long,
+#: right when it must stay cheap: this call happens only after the caller
+#: already gave up waiting on the lock.
+_MAX_HOLDER_RECORD_BYTES = 65536
+
+
 def _read_holder_record(lock_path: str) -> dict[str, object] | None:
     """Best-effort read of the diagnostic holder record left at *lock_path*.
 
@@ -137,18 +148,32 @@ def _read_holder_record(lock_path: str) -> dict[str, object] | None:
     below: this function's contract is to absorb every kind of failure, not
     to distinguish between them.
 
-    Returns ``None`` if the file is missing, empty, unreadable, not valid
-    JSON, or parses to something other than a JSON object. A diagnostic read
-    must never replace a lock-wait timeout with a new exception. Both failure
-    paths log (at ``debug``, since a record-not-found state is often just "no
-    exclusive holder yet", not an anomaly) but guard the logging call itself
-    the same way ``safe_tool_error()`` does
-    (``opencrab/mcp/tools/_registry.py``), so a failure in logging cannot
-    propagate either.
+    Reads at most ``_MAX_HOLDER_RECORD_BYTES`` bytes. A file that has more
+    left unread past that bound is treated as unreadable, the same as
+    corrupt JSON -- see ``_MAX_HOLDER_RECORD_BYTES`` for why.
+
+    Returns ``None`` if the file is missing, empty, unreadable, oversized,
+    not valid JSON, or parses to something other than a JSON object. A
+    diagnostic read must never replace a lock-wait timeout with a new
+    exception. All of these failure paths log (at ``debug``, since a
+    record-not-found state is often just "no exclusive holder yet", not an
+    anomaly) but guard the logging call itself the same way
+    ``safe_tool_error()`` does (``opencrab/mcp/tools/_registry.py``), so a
+    failure in logging cannot propagate either.
     """
     try:
         with open(lock_path, "rb") as fh:
-            data = fh.read()
+            data = fh.read(_MAX_HOLDER_RECORD_BYTES + 1)
+        if len(data) > _MAX_HOLDER_RECORD_BYTES:
+            try:
+                logger.debug(
+                    "lock holder record at %s exceeds %d bytes; treating as unreadable",
+                    lock_path,
+                    _MAX_HOLDER_RECORD_BYTES,
+                )
+            except Exception:  # noqa: BLE001 - a logging failure must not block either
+                pass
+            return None
         record = json.loads(data)
     except Exception as exc:  # noqa: BLE001 - diagnostic only, must not replace the timeout
         try:
