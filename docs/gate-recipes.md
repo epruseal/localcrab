@@ -310,10 +310,22 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    `[PG tripwire]` 문자열을 그대로 내면(예: 테스트가
    `print("[PG tripwire] ...")`를 실행) 오탐한다(실측: 그런 테스트
    하나로 이 grep이 매치를 내지만 실제 tripwire 중단은 없었다). 이
-   오탐도 방향이 한쪽으로만 간다: 이 fixture는 세션 범위
-   `autouse=True`라 첫 테스트 실행 전 가장 먼저 돌고, 진짜로 중단시키면
-   세션이 그 자리에서 끝나 어떤 테스트도 결과를 내지 않으므로 마커는
-   항상 로그에 남는다(놓치는 방향의 반례는 없다). 최악의 결과는 원인을
+   오탐도 방향이 한쪽으로만 간다. 이 fixture가 세션 범위
+   `autouse=True`라도 다른 세션 범위 autouse fixture보다 먼저 돈다는
+   보장은 없고(`_pytest/skipping.py:247-255`의 `tryfirst=True`
+   skip/xfail 훅은 fixture 설정보다도 먼저 돌아, 이 fixture가 돌기 전에
+   다른 테스트가 SKIPPED 결과를 이미 냈을 수도 있다), 마커가 항상
+   남는 이유는 실행 순서가 아니다. `pytest.exit()`가 던지는 `Exit`
+   예외는 `_pytest/main.py:336-344`에서 `KeyboardInterrupt`와 같은
+   경로로 잡혀 `pytest_keyboard_interrupt` 훅을 부르고, 같은 함수의
+   `finally` 블록(359-372행)이 세션이 끝날 때 항상 도는
+   `config._ensure_unconfigure()`를 호출하며, 그 훅을 받는
+   `_pytest/terminal.py:1011-1023`의 `_report_keyboardinterrupt`가 이때
+   `write_sep("!", ...)`로 마커 메시지를 낸다(이 워크트리 pytest 9.1.1
+   소스로 확인한 계약값). 이 출력 경로는 `Exit` 예외가 세션 밖으로
+   전파되기만 하면 다른 테스트가 먼저 몇 개 돌았는지와 무관하게 항상
+   실행되므로, 진짜로 중단되면 마커는 항상 로그에 남는다(놓치는
+   방향의 반례는 없다). 최악의 결과는 원인을
    잘못 짚어 DB명을 조사하는 데서 그친다. 조사해서 캡처 출력이 원인임을
    확인했으면 4번으로 넘어간다.
 4. 마커가 없으면(`BLOCK_EXIT`가 0이거나, 1이면서 마커 없음) 조기 종료 배너를
@@ -424,7 +436,7 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    tac /tmp/<워크트리 식별자>-run.log \
      | awk '{print} /^=+ short test summary info =+$/{exit}' \
      | tac \
-     | grep -oP '^(FAILED|ERROR) \K\S+' | sort -u
+     | grep -oP '^(FAILED|ERROR) \K.+?(?= - |$)' | sort -u
    ```
    pytest는 이 절에 실패/에러 테스트마다 `FAILED <id> - <사유>` 또는
    `ERROR <id> - <사유>` 한 줄을 별도 `-r` 옵션 없이도 기본값으로 낸다(이
@@ -452,6 +464,27 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    워크트리 pytest 9.1.1 소스로 확인한 계약값) 로그에서 이 헤더와
    일치하는 마지막 줄이 항상 진짜 절이다. 위 명령이 `tac`으로 뒤집어
    맨 끝에서부터 찾아 그 마지막 매치에서 멈추는 이유가 이것이다.
+   id 추출은 `\K\S+`가 아니라 `\K.+?(?= - |$)`를 쓴다. pytest는 `FAILED
+   <id> - <사유>` 줄에서 사유가 있으면 ` - `로 id와 사유를 잇고, 사유가
+   없으면 `FAILED <id>`만 낸다(`_pytest/terminal.py`의
+   `_get_line_with_reprcrash_message`, 이 워크트리 pytest 9.1.1 소스로
+   확인한 계약값). id 자체에 매개변수화 값이 그대로 들어가는데(예: 매개변수가
+   문자열이면 공백도 그대로 남는다), `\S+`는 첫 공백에서 끊는다(실측:
+   이 저장소의 `tests/test_vector_raw_contract.py`에 실제로 있는 id
+   `test_a_bad_batch_is_refused_without_touching_the_store[chroma-not-a-sequence-records must be a sequence]`
+   처럼 공백이 있는 id가 있고, 서로 다른 두 id `test_x[a b]`와
+   `test_x[a c]`를 만들어 실행하면
+   `\S+`는 둘 다 `test_x[a`로 잘라 하나로 뭉갠다. 실패 건수가 같으면
+   앞서 나온 개수 대사도 통과하므로 base와 작업 브랜치 사이에 어느
+   매개변수 값이 실패하는지 바뀌어도 diff가 놓칠 수 있다). `.+?(?= -
+   |$)`는 첫 ` - ` 앞까지 또는 사유가 없으면 줄 끝까지를 최소
+   매칭으로 가져와 이 절단을 없앤다(같은 반례로 재실측: id가 온전히
+   갈라져 나온다). id 자체가 ` - `를 그대로 포함하면(매개변수 값에
+   공백을 낀 하이픈이 들어가는 경우) 이 정규식도 그 앞에서 끊어 여전히
+   틀린다. 이 저장소의 현재 수집 결과(`pytest --collect-only -q`,
+   6629건)에는 대괄호 안에 ` - `를 포함한 id가 없다(실측: 0건). 새
+   매개변수 값에 공백을 낀 하이픈을 넣으면 이 경계가 다시 깨지므로
+   그런 값은 피한다.
    요약줄의
    `failed`/`error` 수와 이 절 안의 `^FAILED `/`^ERROR ` 줄 수도 같은
    범위로 대사한다. 요약줄이 `N failed`(N>0)를 보고하는데 `^FAILED `로
