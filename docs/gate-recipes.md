@@ -22,9 +22,14 @@
 
 ## 1. 설치와 사전 확인
 
+워크트리마다 독립된 가상환경을 먼저 만든다. 6번의 재현 명령이
+`<워크트리>/.venv/bin/python`을 직접 지정하므로, 이 자리를 건너뛰면 그
+경로가 없거나 현재 활성 인터프리터에 잘못 설치된다:
+
 ```bash
-pip install -e ".[dev,pg]"
-python -c "import opencrab, sqlite_vec, chromadb, pytest"
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev,pg]"
+.venv/bin/python -c "import opencrab, sqlite_vec, chromadb, pytest"
 ```
 
 `opencrab`은 이 저장소 자신이고, `sqlite_vec`와 `chromadb`는 `pyproject.toml`의
@@ -139,7 +144,9 @@ pytest tests/ -v
   재현 명령은 아래 한 줄이며, base 실행과 작업 실행은 이 줄에서 `<워크트리>`
   자리(cd 대상 경로, 파이썬 인터프리터 경로, 임시 경로, 로그 파일명의
   식별자: 전부 같은 워크트리를 가리키는 동일 값)만 각자의 워크트리
-  경로로 바꿔 쓴다. 그 외 자리는 글자 그대로 동일하게 둔다:
+  경로로 바꿔 쓴다. `<Makefile test-pg 타깃의 값>`도 실행 전에 `Makefile`의
+  `test-pg` 타깃에서 실제 URL 값을 확인해 치환한다(두 실행 모두 같은
+  값을 쓴다: 아래 참고). 그 외 자리는 글자 그대로 동일하게 둔다:
 
   ```bash
   (
@@ -281,9 +288,12 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
    죽은 것이다(세그폴트, OOM-kill, 강제종료 등). 서브셸 맨 앞의
    `rm -f`가 매번 xml도 비우므로 이 부재는 이번 실행이 남긴 것이다.
    그 자체로 미완주이며 diff를 내지 않고 원인부터 조사한다. 참고로
-   `pytest.exit(...)`로 세션이 강제 중단되는 경우(PG tripwire 포함)는
-   xml 자체는 만들어진다(`tests="0"`인 빈 testsuite로). 이 경로는
-   여기서 걸리지 않고 4번의 개수 대사에서 걸린다. 로그에 고정 마커
+   `pytest.exit(...)`로 세션이 강제 중단되는 경우 가운데 수집이 이미
+   끝난 뒤(PG tripwire처럼 세션 스코프 fixture에서 부르는 경우)는 xml
+   자체는 만들어진다(`tests="0"`인 빈 testsuite로). 이 경로는 여기서
+   걸리지 않고 4번의 개수 대사에서 걸린다. 반대로 수집이 끝나기 전
+   (`pytest_sessionstart` 등, 위 6절 참고)에 부르면 `pytest_sessionfinish`
+   자체가 안 돌아 xml이 없으므로 이 3번에서 걸린다. 로그에 고정 마커
    `[PG tripwire]`(tripwire가 내는 메시지 앞부분)가 있는지 grep해 두면
    원인 조사가 빠르지만, 이 grep은 캡처 표준출력이 같은 문자열을 찍는
    경우 오탐하므로(테스트 코드가 `print("[PG tripwire] ...")`를
@@ -375,6 +385,21 @@ ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의
        print(f"ID:{i}")
    PYEOF
    ```
+   4번의 개수 대사(`collected` 파싱값과 xml `tests` 속성 비교)는 완주한
+   실행을 미완주로 오판정할 수 있는 알려진 경우가 둘 있다. 하나는 실행
+   자체가 실패했는데 뒤이은 teardown도 에러가 나는 경우로, JUnit XML
+   플러그인이 같은 id로 testcase를 하나 더 기록해 xml `tests` 값이
+   `collected`보다 커진다(pytest 9.1.1의 이중 계산 보정은 통과+teardown
+   에러 조합에만 걸리고 실패+teardown 에러 조합에는 걸리지 않는다).
+   다른 하나는 `pytest.skip(allow_module_level=True)`로 모듈 전체를
+   수집 단계에서 건너뛰는 경우로, 로그의 `collected N items` 줄은 이
+   개수를 세지 않지만 xml에는 그만큼 testcase가 늘어난다. 두 경우
+   모두 실제로는 완주한 실행을 `count-mismatch`로 잘못 판정한다.
+   위험한 방향(거짓 COMPLETE)이 아니라 안전한 방향(거짓 INCOMPLETE)이라
+   판정을 뒤집지는 않지만, 사람이 헛짚어 원인을 찾는 시간을 쓰게 만든다.
+   이 저장소의 현재 `tests/`에는 두 패턴 다 실재하지 않는다(이번 실행
+   로그가 `collected 6629 items`뿐이고 다른 형태가 없다).
+
    `reverse_id`는 `classname`(점으로 이어진 모듈/클래스 경로)을 뒤에서부터
    줄여가며 "이 접두어 + `.py`가 실제 파일로 존재하는가"를 검사하는
    후보를 전부 모은다. 후보가 정확히 하나면 그것을 모듈 경로로, 나머지를
