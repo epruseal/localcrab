@@ -594,6 +594,30 @@ def test_busy_message_treats_oversized_record_as_unreadable(tmp_path, caplog):
     assert any("exceeds" in r.message for r in caplog.records)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink 생성에 권한이 필요해 공격 전제가 다르다")
+def test_write_lock_refuses_a_symlinked_lock_path(tmp_path):
+    """보안(PR #384 리뷰): "write.lock" 자리가 다른 파일을 가리키는 심볼릭
+    링크면, 그 대상을 대신 잠그고 진단 레코드를 덮어쓰는 대신 거부한다.
+
+    #352 이전에는 이 자리를 잠그기만 했으므로(쓰기 없음) 이런 심볼릭
+    링크가 있어도 대상 파일 내용은 안전했다. #352가 잠금 획득 직후 보유자
+    레코드를 그 핸들에 기록하고 자르기 시작하면서, 그 자리가 쓰기 권한이
+    있는 임의 파일을 가리키는 심볼릭 링크라면 그 파일을 덮어쓰고 잘라내는
+    수단이 됐다. `_lock_path`가 디렉터리만 realpath로 풀고 파일명은 그대로
+    두며, `_open_lock`이 `O_NOFOLLOW`로 여는 것이 이 테스트가 확인하는
+    방어다.
+    """
+    target = tmp_path / "target.txt"
+    target.write_text("보호해야 할 원본 내용")
+    (tmp_path / "write.lock").symlink_to(target)
+
+    with pytest.raises(OSError):
+        with file_lock("write.lock", str(tmp_path), timeout=1):
+            pass
+
+    assert target.read_text() == "보호해야 할 원본 내용"
+
+
 def _hold_write_lock_report_pid(data_dir: str, ready, stop, pid_queue) -> None:
     """회귀(8)용 자식 프로세스 본체. 모듈 스코프인 이유는
     tests/test_chroma_lock_ownership.py의 `_hold_chroma_lock`과 같다: fork가

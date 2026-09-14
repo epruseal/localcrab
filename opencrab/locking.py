@@ -455,9 +455,24 @@ def chroma_lock_dir(local_path: str) -> str:
 
 
 def _lock_path(filename: str, data_dir: str | None) -> str:
-    path = os.path.realpath(os.path.abspath(os.path.join(data_dir or lock_data_dir(), filename)))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    return path
+    # Only the DIRECTORY is resolved with realpath, not the final `filename`
+    # component (#352 review, PR #384). Resolving the directory unifies two
+    # processes that reach one data directory through different symlink
+    # aliases -- see test_file_lock_creates_explicit_dir_and_normalizes_symlinks.
+    # Resolving the filename component too would instead follow a symlink
+    # planted AT the lock path itself (e.g. "write.lock" -> some unrelated
+    # file the service account can write) to whatever it points at. Locking
+    # that target was already possible before #352 and was harmless because
+    # nothing wrote through it; #352 added a diagnostic holder record that
+    # `_open_lock`/`_record_holder` now write into the opened handle, which
+    # turns that old symlink alias into a write-and-truncate primitive on an
+    # attacker-chosen file. Keeping the filename component literal, plus the
+    # `O_NOFOLLOW` open below, closes that off at the one place every lock
+    # acquisition (write.lock, chroma.lock, any `file_lock`/
+    # `acquire_file_lock` caller) passes through.
+    directory = os.path.realpath(os.path.abspath(data_dir or lock_data_dir()))
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, filename)
 
 
 def _process_lock(path: str) -> threading.RLock:
@@ -465,14 +480,23 @@ def _process_lock(path: str) -> threading.RLock:
         return _process_locks.setdefault(path, threading.RLock())
 
 
+#: O_NOFOLLOW rejects opening *path* if its final component is a symlink,
+#: atomically -- no separate lstat-then-open check that a symlink swap could
+#: race (#352 review, PR #384). Not defined on Windows, where a lock path's
+#: final component being a foreign symlink is not the same live risk: an
+#: unprivileged account cannot normally create NTFS reparse points, so the
+#: attack `_lock_path`'s docstring above describes does not carry over.
+_OPEN_LOCK_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+
+
 def _open_lock(path: str) -> BinaryIO:
     try:
-        return open(path, "r+b")
+        fd = os.open(path, _OPEN_LOCK_FLAGS)
     except FileNotFoundError:
         # O_CREAT without O_TRUNC keeps concurrent first-open calls from
         # clobbering the lock file before either process acquires it.
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
-        return os.fdopen(fd, "r+b")
+        fd = os.open(path, _OPEN_LOCK_FLAGS | os.O_CREAT, 0o666)
+    return os.fdopen(fd, "r+b")
 
 
 def _record_holder(fh: BinaryIO) -> None:
