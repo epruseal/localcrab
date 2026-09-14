@@ -148,7 +148,7 @@ pytest tests/ -v
     set -o pipefail
     PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
     OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
-    <워크트리>/.venv/bin/python -m pytest tests/ -v \
+    <워크트리>/.venv/bin/python -m pytest tests/ \
       --basetemp=/tmp/<워크트리 식별자>-basetemp \
       2>&1 | tee /tmp/<워크트리 식별자>-run.log
     code=$?
@@ -236,7 +236,15 @@ pytest tests/ -v
 
 두 실행 모두 `PYTEST_ADDOPTS=`를 빈 값으로 명시 설정하고(환경에 숨은
 옵션이 몰래 주입되는 경로를 미리 닫는다) `-x`/`--maxfail`/`--collect-only`
-를 쓰지 않는다. `PY_COLORS=0`도 명시 설정한다: 배너 줄은 pytest가 비 tty로
+를 쓰지 않는다. CLI에 `-v`도 따로 붙이지 않는다: `pyproject.toml`의
+`addopts`가 이미 `-v`를 싣고 있어(4번 참고) CLI `-v`를 더하면 verbosity가
+2로 올라간다. 이 저장소가 설치한 pytest 9.1.1(`_pytest/terminal.py`)은
+verbosity 2에서 사유를 폭에 맞춰 자르지 않고 그대로 붙이므로, 사유가
+길면 진행 줄이 한 줄로 안 끝나거나 상태명 자리부터 깨진다(실측: 이
+저장소의 실제 스킵 사유와 긴 nodeid로 재현하면 `collected 3`인데 아래
+정규식의 고유 개수가 2로 나온다). CLI `-v` 없이 `addopts`의 `-v`만
+남기면 verbosity가 1로 고정돼 사유가 폭에 맞게 트리밍되거나(너무 길면
+통째로 생략되거나) 하며 항상 한 줄로 끝난다. `PY_COLORS=0`도 명시 설정한다: 배너 줄은 pytest가 비 tty로
 출력을 리다이렉트할 때는 원래 무색이지만, 실행 환경의 셸이 `PY_COLORS=1`을
 이미 export해 두면 ANSI 색상 코드가 `!` 앞에 붙어(`\x1b[31m!!!!...`)
 아래 판정 절차 4번의 `grep -c '^!'`가 0을 내는 실측 반례가 있다(같은
@@ -321,10 +329,27 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    재현 명령도 넘기지 않으므로 지금은 `M`이 항상 0이지만, `addopts`나
    변형 명령에 그 옵션이 들어가면 `M`이 0이 아닐 수 있다. 그런 경우도
    아래 비교에서 `N`에서 `M`을 뺀 값을 쓴다)의 `N`과, `-v` 진행 줄에서
-   실제로 결과가 찍힌 테스트 id를 중복 제거한 고유 개수를 비교한다:
+   실제로 결과가 찍힌 테스트 id를 중복 제거한 고유 개수를 비교한다.
+   추출은 로그 전체가 아니라 진행 줄 구간만 대상으로 한다(`collecting`
+   줄부터 그 다음에 나오는 첫 `===` 구분선 직전까지). FAILURES/ERRORS/
+   warnings summary/short test summary info 절은 전부 이 구분선 뒤에
+   나오므로, 구간을 여기서 끊으면 그 절 안의 캡처 출력(테스트가
+   `print`로 낸 stdout/stderr)이 섞이지 않는다. 로그 전체를 대상으로
+   grep하면 실패한 테스트가 캡처 출력으로 진행 줄과 같은 형태의 문자열을
+   낼 때(예: 테스트 코드가 `print("noise PASSED [100%]")`를 실행하고
+   실패) 그 문자열이 진행 줄처럼 잘못 추출된다(실측: 정상 테스트 1개와
+   위 문자열을 출력하고 실패하는 테스트 1개로 `collected 2 item`인
+   세션에서, 로그 전체를 grep하면 고유 id가 `noise`까지 3개로 잡혀
+   정상 완주를 미완주로 오판정한다. 구간을 끊으면 2개로 정확히 나온다).
+   이 오탐은 반대 방향으로도 갈 수 있다: 배너 없이 조기 종료된 세션에서
+   그런 캡처 출력이 하나 섞이면 부족분과 우연히 상쇄해 미완주를 완주로
+   오판정할 수 있다(뒤에 나오는 카테고리 합 상쇄 반례와 같은 종류의
+   위험이다). 진행 줄 자체가 `=`로 시작하는 테스트 id는 나오지 않으므로
+   이 구간 절단이 진행 줄을 잘라내는 경우는 없다.
    ```bash
-   grep -oP '.+(?=\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN)(?:\s+\(.*\))?\s+\[\s*\d+%\]$)' \
-     /tmp/<워크트리 식별자>-run.log | sort -u | wc -l
+   awk '/^collecting /{f=1} f && /^=+ /{exit} f' /tmp/<워크트리 식별자>-run.log \
+     | grep -oP '.+(?=\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN)(?:\s+\(.*\))?\s+\[\s*\d+%\]$)' \
+     | sort -u | wc -l
    ```
    `SKIPPED`/`XFAIL`/`XPASS`는 진행 줄에 사유가 괄호로 덧붙을 때가 있어
    (예: `SKIPPED (skip reason)`) 정규식이 그 괄호를 상태명과 `[NN%]`
@@ -340,11 +365,15 @@ env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `-
    바꾸면 6이 나온다). 사유 문자열이 다른 진행 줄을 그대로 흉내내는
    극단적인 경우(예: 사유가 `x) PASSED (y`처럼 상태명과 괄호를 포함해
    `.+`가 뒤쪽 상태명을 대신 골라 id를 잘못 자르는 경우)는 이 정규식이
-   구분하지 못한다. 이 저장소의 스킵/xfail 사유 문자열을 전수로 확인한
-   결과(`grep -rnoP 'reason\s*=\s*["\047][^"\047]*["\047]' tests/`)
-   괄호나 상태명을 포함한 사유가 없어 지금은 발동하지 않는다. 새 사유
-   문자열을 추가할 때 상태명(`PASSED`/`FAILED`/`ERROR`/`SKIPPED`/
-   `XFAIL`/`XPASS`/`RERUN`)과 괄호를 함께 쓰지 않는다.
+   구분하지 못한다. 괄호만 있고 상태명은 없는 사유(바로 위 ChromaDB
+   예처럼)는 이 반례에 해당하지 않는다. `.+`가 상태명 앞에서 멈추려면
+   사유 안에 `PASSED`/`FAILED`/`ERROR`/`SKIPPED`/`XFAIL`/`XPASS`/`RERUN`
+   가운데 하나가 그대로 나와야 하기 때문이다. 이 저장소의 스킵/xfail
+   호출 인자를 전수로 확인한 결과(`grep -rnP
+   'pytest\.(mark\.)?(skip|xfail|importorskip)\(' tests/ | grep -wE
+   'PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN'`, 매치 0건) 상태명을
+   포함한 사유가 없어 지금은 발동하지 않는다. 새 사유 문자열을 추가할
+   때 이 일곱 상태명을 그대로 쓰지 않는다.
    같은 테스트 id가 setup/call/teardown 단계별로 따로 리포트를 내도
    (예: teardown 에러가 나면 같은 id로 `PASSED` 줄과 `ERROR` 줄이 각각
    찍힌다) 이 방식은 id 단위로 중복 제거하므로 한 번만 센다. 요약줄
