@@ -234,7 +234,10 @@ class TestDocRowLossRecovery:
 
     def test_doc_recovery_emits_an_aggregate_warning_once(self, live, tmp_path, caplog):
         """#301: doc 행 유실 회수가 발동하면 집계 경고가 뜨고, 다음 런이
-        same 으로 수렴하면 그 경고가 사라진다(1회성 유실, #279 형과 대조)."""
+        same 으로 수렴하면 그 경고가 사라진다(1회성 유실, #279 형과 대조).
+        경고는 정확히 1번 뜨고, 그 안의 건수 필드는 실제 발동 횟수(1)와
+        같아야 한다(집계 건수를 무조건 0으로 박아도 통과하는 빈 검사를
+        막는다, codex 이중검증 재정)."""
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
         pack_load.load_nodes("pack-1", f, builder, {})
@@ -246,8 +249,11 @@ class TestDocRowLossRecovery:
         with caplog.at_level(logging.WARNING):
             pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
-        assert sum("유실 회수 누적" in r.getMessage() for r in caplog.records) == 1, (
+        aggregate = [r for r in caplog.records if "유실 회수 누적" in r.getMessage()]
+        assert len(aggregate) == 1, (
             "1회차는 유실 회수 누적 경고가 정확히 1번 떠야 한다")
+        assert "누적 1건" in aggregate[0].getMessage(), (
+            f"경고의 건수 필드가 실제 발동 횟수(1)와 달랐다: {aggregate[0].getMessage()}")
 
         caplog.clear()
         state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
@@ -263,14 +269,19 @@ class TestDocRowLossRecovery:
         """#301 본 시나리오: doc 쓰기가 매 런 계속 실패하면(행이 매번 없다)
         회수 경로가 매 런 재발동하고, 집계 경고도 매 런 다시 떠야 한다
         (#279 류 1회성 전이라면 2회차에 사라져야 하는데 여기서는 안
-        사라진다는 것이 대조점이다)."""
+        사라진다는 것이 대조점이다). 노드를 둘 써서 매 회차 회수 발동이
+        정확히 2건임을, 그리고 경고가 노드마다가 아니라 런당 정확히
+        1번(집계 블록이 루프 밖에 있다는 것)임을 함께 고정한다(codex
+        이중검증 재정. 집계 블록이 루프 안으로 옮겨져도 통과하는 빈
+        검사를 막는다)."""
         builder, graph, docs = live
-        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
         pack_load.load_nodes("pack-1", f, builder, {})
 
         for _round in range(3):
             docs._conn.execute(
-                "DELETE FROM doc_nodes WHERE space=? AND node_id=?", ("resource", "n1"))
+                "DELETE FROM doc_nodes WHERE space=? AND node_id IN (?, ?)",
+                ("resource", "n1", "n2"))
             docs._conn.commit()
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             caplog.clear()
@@ -278,11 +289,15 @@ class TestDocRowLossRecovery:
                 n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
                     "pack-1", f, builder, {}, state["nodes"], graph, docs,
                     state["doc_node_spaces"])
-            assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
-                f"매 회차 doc 행 유실이 chg 로 회수돼야 한다: {(n_new, n_chg, n_same, skip, err)}")
-            assert any("유실 회수 누적" in r.getMessage() for r in caplog.records), (
-                f"{_round + 1}회차에서 지속 유실 집계 경고가 안 떴다"
-            )
+            assert (n_new, n_chg, n_same, skip, err) == (0, 2, 0, 0, 0), (
+                f"매 회차 doc 행 유실 둘 다 chg 로 회수돼야 한다: {(n_new, n_chg, n_same, skip, err)}")
+            aggregate = [r for r in caplog.records if "유실 회수 누적" in r.getMessage()]
+            assert len(aggregate) == 1, (
+                f"{_round + 1}회차에서 집계 경고가 노드마다가 아니라 런당 정확히 "
+                f"1번 떠야 한다: {len(aggregate)}번 떴다")
+            assert "누적 2건" in aggregate[0].getMessage(), (
+                f"{_round + 1}회차 경고의 건수 필드가 실제 발동 횟수(2)와 달랐다: "
+                f"{aggregate[0].getMessage()}")
 
     def test_anchor_node_is_not_reloaded_when_doc_node_spaces_lacks_it(
             self, live, tmp_path):
