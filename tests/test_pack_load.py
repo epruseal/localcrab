@@ -498,7 +498,7 @@ class TestLoadNodesIncremental:
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
     def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path):
-        """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
+        """**#358 회귀.** `BOTH_SIDES_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
 
         파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
         생산자가 흔히 쓰는 형태), `absorb_legacy_top_level` 이 그 중첩 값을
@@ -524,7 +524,52 @@ class TestLoadNodesIncremental:
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
         assert _run() == (0, 0, 1, 0, 0), (
             "2차 런이 same 으로 수렴하지 않았다 — 파일 쪽 properties.space 가 "
-            "INCREMENTAL_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
+            "BOTH_SIDES_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
+
+    def test_stale_live_owner_id_is_restamped_when_file_carries_the_key(
+        self, live, tmp_path
+    ):
+        """**#358 재리뷰 회귀.** `owner_id` 는 값 비교가 아니라 "라이브의 현재
+        owner_id 가 이미 현재 principal 인가"로 판정해야 한다.
+
+        `write_gate.stamp()` 는 `add_node` 가 실제로 호출될 때만 실행된다.
+        일반 same/chg 비교가 `owner_id` 를 양쪽에서 제외한 채로만 판정하면,
+        구 로더 잔재나 principal 교체 이력 때문에 라이브가 낡은 owner_id 를
+        갖고 있어도 다른 값이 전부 같으면 `same` 으로 잡혀 재스탬프가 영영
+        일어나지 않는다. 라이브 행을 직접 드리프트시켜(인접
+        `test_a_drifted_row_converges...` 와 같은 기법 — write_gate 를 거치지
+        않고 properties 를 직접 써서 과거 로더가 남긴 잔재를 모사한다) 낡은
+        owner_id 가 남은 상태를 만든 뒤, 파일이 owner_id 키를 실은 채로
+        재적재되면 `chg` 로 잡혀 현재 principal 로 재스탬프돼야 한다.
+        """
+        builder, graph, docs = live
+        f = _write_jsonl(tmp_path / "nodes.jsonl",
+                          [_node(id="n1", owner_id="owner_from_a_past_life")])
+
+        def _run():
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])[:5]
+
+        assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+        row = graph.get_node("Document", "n1")
+        assert row["owner_id"] == _LIVE_TEST_USER, "1차 스탬프는 현재 principal 이어야 한다"
+
+        seeded = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
+        node_type, space, props = seeded["n1"]
+        drifted = dict(props)
+        drifted["owner_id"] = "owner_from_a_past_life"
+        digest = graph.get_node_digest("n1", node_type=node_type)
+        graph.update_node("n1", digest, node_type, drifted, space)
+        row = graph.get_node("Document", "n1")
+        assert row["owner_id"] == "owner_from_a_past_life", "사전 조건: 드리프트가 실제로 적용됐다"
+
+        assert _run() == (0, 1, 0, 0, 0), (
+            "라이브 owner_id 가 낡았는데 chg 로 안 잡히면 재스탬프가 누락된다(#358 재리뷰)")
+        row = graph.get_node("Document", "n1")
+        assert row["owner_id"] == _LIVE_TEST_USER, (
+            "재기록이 일어났는데도 owner_id 가 낡은 값에 머물러 있다")
 
 
 class TestLoadEdges:

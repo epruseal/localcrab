@@ -74,41 +74,69 @@ from opencrab.stores._vector_base import slot_owner
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
 
-# 증분 비교에서 빼야 하는 키. 셋이 같은 이유로 빠지지는 않는다 —
-# 빼지 않으면 by-pack 원본과 라이브가 영원히 다르게 보여 **매 증분마다 전량 재적재**된다.
+# 증분 비교에서 양쪽 모두 빼는 키들. 판정은 아래 두 질문에서 나온다.
 #
-# `id`·`owner_id` 는 이름대로 스토어가 라이브 쪽에만 채워 넣는다(파일 덤프에는 없다).
-# `id` 는 `normalize_node_properties`(opencrab/common/graph_identity.py) 가 항상
-# 주입하고, `owner_id` 는 #148 에서 합류했다 — write gate 가 principal 을 스탬프한다
-# (opencrab/pack/write_gate.py).
+#   Q1. 파일 쪽 props 가 이 키를 정당한 값으로 실어 올 수 있는가?
+#   Q2. 값이 다를 때 재기록(add_node 호출)이 일어나야 하는가?
 #
-# `space` 는 축이 다르다. **양쪽에 다 있다** — 다만 출처가 갈린다. 라이브 쪽은
-# `graph_identity.normalize_space` 가 로더의 space_id 인자로 무조건 덮어써 항상
-# 신뢰할 수 있는 값이고(실측: LocalGraphStore/PGGraphStore 원시 properties 컬럼에
-# `space` 키가 항상 존재, 2026-09-14), 파일 쪽은 레거시 중첩 `properties.space` 가
-# 그대로 흘러든 값이다(#125, #358) — 같은 노드에서 두 값이 실제로 갈릴 수 있다.
-# 값이 같든 다르든, **필터를 한쪽에서만 걸면 그 쪽에서만 키가 사라져 나머지가
-# 전부 같아도 딕셔너리 비교가 깨진다** — #358 의 근본원인이 이것이다.
+# id / space / pack 세 키는 Q2=No 다. owner_id 만 Q2=Yes 인데, "빼지 않는다"로
+# 처리할 수 없다 — 대부분의 파일 행은 owner_id 를 아예 갖고 있지 않은데(store
+# 만 stamp 로 주입하므로) 라이브 쪽엔 항상 있다. 그냥 비교하면 키 유무 차이
+# 하나로 모든 노드가 매 런 chg 로 퇴화한다(#358 이전 상태로 역행). 그래서
+# owner_id 도 일반 비교에서는 뺀 뒤, 별도로 "파일이 이 키를 실었는데 라이브가
+# 이미 현재 principal 이 아니다"라는 조건만 따로 검사해 그 경우에만 재기록을
+# 강제한다(`owner_id_needs_restamp`, 아래 비교 지점 참고). 비교 대상은 파일
+# 값도 라이브의 기존 값도 아니라 **현재 principal** 이다 — write_gate.stamp() 가
+# origin="server" 에서 실제로 쓰는 값이 그것이기 때문이다. 파일 값 자체는
+# 절대 저장되지 않으므로 비교 대상으로 쓰지 않는다 — 오직 "이 행이 신원
+# 정보를 실어 나른다"는 신호로만 쓴다.
+#
+# 파일에 owner_id 가 아예 없는데 라이브만 낡은 값을 가진 경우는 **감지
+# 불가능해서가 아니라 의도적으로 범위를 좁혀서** 다루지 않는다. 비교
+# 지점에는 라이브의 현재 owner_id 와 현재 principal 이 둘 다 이미 있어
+# 감지 자체는 가능하다. 다만 그 신호만으로 매 런 강제 재기록을 걸면 파일
+# 내용과 무관하게 "라이브 owner_id != 현재 principal" 인 모든 노드가 매
+# 증분마다 재기록 대상이 된다 — 이 PR 이 고치는 "파일이 실제로 신원 정보를
+# 싣고 있는데 무시된다"는 결함보다 훨씬 넓은 변경이다. 그런 전면 감사가
+# 필요하면 증분 로더가 아니라 별도 점검 경로로 푼다.
+#
+# ── id : Q1=Yes(중첩 properties.id 로), Q2=No ──
+# `absorb_legacy_top_level`(opencrab/pack/schema.py) 은 최상위 stray 키만
+# NODE_STRUCT_KEYS 기준으로 거른다 — 중첩 `properties.id` 는 그대로 남는다.
+# 이 비교 지점 자체는 신원 검증을 호출하지 않으므로, 값이 다른 중첩 id 가
+# 이론적으로 도달하면 `same` 으로 오판할 여지가 남는다. 이 gap 은 #358
+# 이전부터 있던 기존 동작이며 이 수정이 새로 만들거나 넓히지 않는다 — 별도
+# 이슈로 추적할 후보이지 이 수정의 범위는 아니다.
+#
+# ── space : Q1=Yes(중첩 properties.space 로, #125, #358), Q2=No ──
+# 라이브 쪽 값은 `graph_identity.normalize_space` 가 항상 덮어써 신뢰할 수
+# 있는 단일 진실이다(실측: LocalGraphStore/PGGraphStore 원시 properties 컬럼에
+# `space` 키가 항상 존재, 2026-09-14). 파일 값이 달라도 재기록으로 바꿀
+# 이유가 없다. 값이 같든 다르든, 필터를 한쪽에서만 걸면 그 쪽에서만 키가
+# 사라져 나머지가 전부 같아도 딕셔너리 비교가 깨진다 — #358 의 근본원인이
+# 이것이다.
 #
 # `_merge_space`(opencrab/stores/_graph_common.py) 의 docstring 은 "SQL 백엔드는
 # id 만 주입하고 space 는 호출자가 넣었을 때만 properties 에 실린다"고 적는데,
 # 이는 `normalize_space` 도입 이전 서술로 보이며 위 실측과 어긋난다 — #372 로 그
 # 어긋남을 추적한다(이 파일의 수정 범위 밖).
 #
-# 세 키를 하나의 상수로 묶은 이유는 "스토어가 주입한다"는 단일 축이 아니라
-# "증분 비교가 신뢰할 수 없는 값/존재 여부를 갖는다"는 더 넓은 축이다. 이름은
-# `STORE_INJECTED_KEYS` 로 남긴다 — `id`·`owner_id` 두 항목이 이름대로고, 세
-# 항목뿐인 집합을 위해 더 넓은 이름으로 바꾸면 오히려 무엇이 왜 빠지는지가
-# 흐려진다. 새 항목을 추가할 때는 이 주석의 구분(스토어 전용 주입 vs. 양쪽
-# 존재하되 출처가 갈리는 값)부터 판정해라.
-STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
-
-# 증분 비교에서 빼는 키 = 스토어가 넣는 것 + `#159` 가 폐기한 것(`pack`).
-# 폐기 키를 빼지 않으면 그 키를 가진 라이브 행이 **매 증분 전량 chg** 로 잡힌다.
+# ── owner_id : Q1=Yes, Q2=Yes(비교 대상은 현재 principal, 위 설명 참고) ──
+#
+# ── pack (RETIRED_KEYS) : Q1≈No, Q2=No ──
+# `apply_pack_tag`(opencrab/common/pack_tags.py) 가 파일 쪽 원시 pack 값을
+# 항상 버리고 pack_id 로 대체하므로 파일 쪽 props 에 남을 경로가 없다.
+# `canonicalize_pack_alias` 와 `pack_provenance.py` 의 마이그레이션 코드가
+# 이 키의 존재를 별칭 검증·정리 목적으로 읽지만, 그 경로는 증분 same/chg
+# 비교와 무관하다 — 이 비교가 값을 다르게 봐서 재기록해야 할 소비자는
+# 없다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로 잡힌다.
 # 재기록으로 지워지지도 않는다 — neo4j 의 upsert 는 전달된 키만 SET 하므로
-# `pack` 없는 dict 를 써도 기존 속성이 남고, 그래서 그 재기록이 영구히 반복된다.
-# 남아 있어도 읽는 코드가 0곳이라 무해하다(`common/pack_tags.py` 참고).
-INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
+# `pack` 없는 dict 를 써도 기존 속성이 남고, 그래서 그 재기록이 영구히
+# 반복된다.
+#
+# 새 키를 추가할 때는 위 두 질문부터 답하고, Q2=Yes 면 owner_id 처럼 비교
+# 대상이 무엇인지부터 정하고 나서 넣어라.
+BOTH_SIDES_IGNORED_KEYS = frozenset({"id", "space", "owner_id"}) | RETIRED_KEYS
 
 
 # ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
@@ -1873,7 +1901,7 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
-    _require_bound_principal()
+    principal = _require_bound_principal()
     for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
         space, node_type, node_id, props = transform_node(pack_name, row)
         id_map[node_id] = (space, node_type)
@@ -1882,19 +1910,34 @@ def load_nodes_incremental(
 
         live = live_nodes.get(node_id)
         if live is not None:
-            # **양쪽에서 같은 키를 뺀다(#358).** `INCREMENTAL_IGNORED_KEYS` 의
-            # 정의(위 STORE_INJECTED_KEYS 주석)가 설명하듯, 이 키들은 한쪽에만
-            # 있거나(`id`·`owner_id`) 양쪽에 다 있어도 출처가 갈려 값이 다를 수
-            # 있다(`space`). 어느 경우든 한쪽에서만 걸러내면 그 쪽에서만 키가
-            # 사라져 나머지 값이 전부 같아도 딕셔너리 비교가 깨진다 — 파일 쪽이
-            # 레거시 중첩 `properties.space` 를 갖고 오는 노드가 매 증분 전량
-            # chg 로 고정되는 것이 그 증상이다. 비교에만 쓰는 사본이므로 저장
-            # 시 넘기는 `props` 자체는 아래에서 그대로(필터 없이) 쓴다.
+            # **양쪽에서 같은 키를 뺀다(#358).** `BOTH_SIDES_IGNORED_KEYS` 의
+            # 정의(위 주석)가 설명하듯, 이 키들은 한쪽에만 있거나(`id`) 양쪽에
+            # 다 있어도 출처가 갈려 값이 다를 수 있다(`space`). 어느 경우든
+            # 한쪽에서만 걸러내면 그 쪽에서만 키가 사라져 나머지 값이 전부
+            # 같아도 딕셔너리 비교가 깨진다 — 파일 쪽이 레거시 중첩
+            # `properties.space` 를 갖고 오는 노드가 매 증분 전량 chg 로
+            # 고정되는 것이 그 증상이다. 비교에만 쓰는 사본이므로 저장 시
+            # 넘기는 `props` 자체는 아래에서 그대로(필터 없이) 쓴다.
             live_props = {k: v for k, v in live[2].items()
-                          if k not in INCREMENTAL_IGNORED_KEYS}
+                          if k not in BOTH_SIDES_IGNORED_KEYS}
             file_props = {k: v for k, v in props.items()
-                          if k not in INCREMENTAL_IGNORED_KEYS}
-            if live[0] == node_type and live_props == file_props:
+                          if k not in BOTH_SIDES_IGNORED_KEYS}
+            # owner_id 는 일반 비교에서 빠지지만 별도로 검사한다(#358 재리뷰).
+            # write_gate.stamp() 는 origin="server" 에서 파일 값도 라이브의
+            # 기존 값도 아니라 **현재 principal** 을 쓴다. 그런데 stamp() 는
+            # add_node 가 실제로 호출될 때만 실행되므로, 일반 비교가 same 을
+            # 내면 라이브의 낡은 owner_id 가 재스탬프 없이 영구히 남는다 —
+            # `TestLoaderReplaysServerStampedIdentity` 가 `load_nodes`(최초
+            # 적재)만 exercise 하고 이 증분 비교 경로는 거치지 않아 놓친
+            # 결함이다. "owner_id in props" 는 파일이 신원 정보를 실제로
+            # 실었다는 신호로만 쓴다 — 파일에 이 키가 없는 행까지 매 런
+            # 강제 재기록하지는 않는다(위 상수 주석에 정책 근거 설명).
+            owner_id_needs_restamp = (
+                "owner_id" in props
+                and live[2].get("owner_id") != principal.user_id
+            )
+            if (live[0] == node_type and live_props == file_props
+                    and not owner_id_needs_restamp):
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                 # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만
                 # 실패한 잔재(그 실패는 err 로 잡혔지만 graph 기준선은 이미
