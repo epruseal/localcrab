@@ -143,14 +143,14 @@ pytest tests/ -v
 
   ```bash
   (
-    rm -f /tmp/<워크트리 식별자>-run.log
+    rm -f /tmp/<워크트리 식별자>-run.log /tmp/<워크트리 식별자>-run.xml
     cd <워크트리> || exit 17
     set -o pipefail
     PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
     OPENCRAB_SMOKE_BIN_DIR=<워크트리>/.venv/bin \
     <워크트리>/.venv/bin/python -m pytest tests/ \
       --basetemp=/tmp/<워크트리 식별자>-basetemp \
-      --force-short-summary \
+      --junit-xml=/tmp/<워크트리 식별자>-run.xml \
       2>&1 | tee /tmp/<워크트리 식별자>-run.log
     code=$?
     echo "EXIT:$code" | tee -a /tmp/<워크트리 식별자>-run.log
@@ -200,20 +200,22 @@ pytest tests/ -v
   끝나기 전(`pytest_sessionstart` 등)에 `pytest.exit(msg,
   returncode=17)`을 부르면 pytest는 `collected` 줄을 한 번도 찍지
   않고 종료 코드 17로 끝난다(적대검증에서 이 경로를 실측으로
-  재현했다). 그래서 서브셸 맨 앞에 `rm -f
-  /tmp/<워크트리 식별자>-run.log`를 둔다: 이전 실행의 로그가 남아
-  있으면 `cd`가 실패해 이번 파이프라인이 전혀 안 돌았는데도 지난
-  실행의 `collected` 줄이 로그에 그대로 남아 오판정을 낳기 때문이다.
-  로그를 미리 지워 두면 판별 기준은 `collected` 줄이 아니라 **로그
-  파일 자체의 존재**로 단순해진다: `cd`가 실패하면 `exit 17`이 그 뒤의
-  `set -o pipefail`도 `tee`도 전혀 실행하지 않으므로 로그 파일이 아예
-  생기지 않는다. 반대로 `cd`가 성공해 파이프라인이 한 번이라도
-  시작되면 `tee`가 파일을 열어 만들어 두므로, pytest가 그 안에서 얼마나
-  일찍 `pytest.exit`으로 끝나든 로그 파일 자체는 존재한다(내용이
-  비어 있거나 짧을 수는 있다). 즉 `BLOCK_EXIT`가 17이면서 로그 파일이
-  없으면 `cd` 실패이고, 파일이 있으면(비어 있어도) pytest 자신이 낸
-  값이다. 이 전체를 서브셸 `( ... )`로 감싸는 이유는 그래야 `exit 17`이
-  그 서브셸만 끝내고 호출한 셸 자체를 종료시키지 않기 때문이다.
+  재현했다). 그래서 서브셸 맨 앞에 `rm -f /tmp/<워크트리 식별자>-run.log
+  /tmp/<워크트리 식별자>-run.xml`을 둔다: 이전 실행의 로그나 xml이 남아
+  있으면 `cd`가 실패해 이번 파이프라인이 전혀 안 돌았는데도 지난 실행의
+  산출물이 그대로 남아 오판정을 낳기 때문이다(xml이 남으면 아래 판정
+  절차 3번의 파일 존재 판정이 이번 실행이 아니라 지난 실행의 결과를
+  보고 통과시킨다). 로그를 미리 지워 두면 `cd` 실패 판별 기준은
+  **로그 파일 자체의 존재**로 단순해진다: `cd`가 실패하면 `exit 17`이
+  그 뒤의 `set -o pipefail`도 `tee`도 전혀 실행하지 않으므로 로그
+  파일이 아예 생기지 않는다. 반대로 `cd`가 성공해 파이프라인이 한
+  번이라도 시작되면 `tee`가 파일을 열어 만들어 두므로, pytest가 그
+  안에서 얼마나 일찍 `pytest.exit`으로 끝나든 로그 파일 자체는
+  존재한다(내용이 비어 있거나 짧을 수는 있다). 즉 `BLOCK_EXIT`가
+  17이면서 로그 파일이 없으면 `cd` 실패이고, 파일이 있으면(비어
+  있어도) pytest 자신이 낸 값이다. 이 전체를 서브셸 `( ... )`로 감싸는
+  이유는 그래야 `exit 17`이 그 서브셸만 끝내고 호출한 셸 자체를
+  종료시키지 않기 때문이다.
 
   종료 코드는 `${PIPESTATUS[0]}`(bash 전용 배열, zsh에는 없다 — zsh는
   1-시작 소문자 `$pipestatus`를 쓴다)이 아니라 `set -o pipefail`로 잡는다.
@@ -238,87 +240,22 @@ pytest tests/ -v
 두 실행 모두 `PYTEST_ADDOPTS=`를 빈 값으로 명시 설정하고(환경에 숨은
 옵션이 몰래 주입되는 경로를 미리 닫는다) `-x`/`--maxfail`/`--collect-only`
 를 쓰지 않는다. CLI에 `-v`도 따로 붙이지 않는다: `pyproject.toml`의
-`addopts`가 이미 `-v`를 싣고 있어(4번 참고) CLI `-v`를 더하면 verbosity가
-2로 올라간다. 이 저장소가 설치한 pytest 9.1.1(`_pytest/terminal.py`)은
-verbosity 2에서 사유를 폭에 맞춰 자르지 않고 그대로 붙이므로, 사유가
-길면 진행 줄이 한 줄로 안 끝나거나 상태명 자리부터 깨진다(실측: 이
-저장소의 실제 스킵 사유와 긴 nodeid로 재현하면 `collected 3`인데 아래
-정규식의 고유 개수가 2로 나온다). CLI `-v` 없이 `addopts`의 `-v`만
-남기면 verbosity가 1로 고정돼 사유가 폭에 맞게 트리밍되거나(너무 길면
-통째로 생략되거나) 하며 항상 한 줄로 끝난다. `PY_COLORS=0`도 명시 설정한다: 배너 줄은 pytest가 비 tty로
-출력을 리다이렉트할 때는 원래 무색이지만, 실행 환경의 셸이 `PY_COLORS=1`을
-이미 export해 두면 ANSI 색상 코드가 `!` 앞에 붙어(`\x1b[31m!!!!...`)
-아래 판정 절차 4번의 `grep -c '^!'`가 0을 내는 실측 반례가 있다(같은
-테스트를 `PY_COLORS=1`로 강제해 배너가 있는데도 grep이 0을 내는 것과
-`PY_COLORS=0`으로 강제해 다시 1을 내는 것 모두 확인했다). `PY_COLORS=0`을
-env에 고정하면 이 재현 명령이 서술하는 범위 안에서는(즉 `--color`를
-따로 넘기지 않는 한) 무색 출력이 보장된다. `--color=yes`/`--color=no`를
-나중에 CLI 인자로 붙이면 `PY_COLORS` 값과 무관하게 그 인자가 이긴다
-(`_pytest/config/__init__.py`가 `TerminalWriter` 생성 뒤 `hasmarkup`을
-`config.option.color`로 덮어쓴다). 이 문서의 고정 명령 자체는 `--color`를
-쓰지 않으므로 해당하지 않는다. 다만 변형 명령에 `--color`를 끼워 넣으면
-이 보장이 깨진다. `--force-short-summary`도 명시 붙인다:
-`_pytest/terminal.py:1565-1573`의 사유 트리밍 조건은
-`config.option.verbose >= 2` 말고도 `running_on_ci()`(같은 파일이
-불러오는 `_pytest/compat.py:310-315`, `CI`나 `BUILD_NUMBER` 환경변수가
-비어 있지 않으면 참)를 or로 함께 본다. 위 문단은 이 조건의 앞쪽
-절(verbosity)만 막았을 뿐 뒤쪽 절(CI 환경변수)은 그대로 열려 있었다.
-CI 환경변수는 GitHub Actions를 비롯한 대다수 CI가 기본으로 설정하므로,
-같은 재현 명령을 CI 안에서 그대로 돌리면 이 문서의 고정 명령이
-verbosity로 막아 둔 것과 같은 종류의 미트리밍이 다시 열린다(실측:
-`CI=1`로 이 재현 명령을 돌리면 verbosity 1이어도 사유가 줄바꿈을 포함해
-그대로 붙는다). 이 미트리밍은 6절 6번의 `short test summary info` 절
-추출과 상호작용해 더 심각해진다: `_format_trimmed`(같은 파일
-1517-1529행)는 첫 줄만 남기고 자르지만, 이 조건에서는 그 함수 자체를
-안 거치고 원문 그대로 붙으므로 사유에 줄바꿈이 있으면 그 뒤가 로그의
-새 줄로 이어진다. 사유 문자열이 `== short test summary info ==`와
-`FAILED <가짜 id> - <가짜 사유>`를 그대로 포함하면(예: 실패 메시지 자체가
-그 문자열을 담은 경우) 이 두 줄이 진짜 `short test summary info` 절
-"안에", 진짜 헤더보다 뒤에 나온다. 6절 6번의 `tac` 기반 마지막 매치
-추출은 이 위장 헤더를 진짜보다 나중 매치로 보고 거기서 멈춰, 그 앞의
-진짜 실패 id를 전부 버리고 위장 id만 뽑는다(실측: `pytest.fail(...)`로
-그 문자열을 그대로 낸 테스트 1개와 별도로 실패하는 테스트 여러 개를
-포함한 세션에서, `CI=1`이면 이 절단이 실제로 일어나 위장 id
-`tests/test_fake.py::test_fake` 하나만 나오고 나머지 진짜 실패 id는
-전부 사라진다. `--force-short-summary`를 더하면 같은 세션에서 사유가
-첫 줄로 잘려 `short test summary info` 절 안에는 위장 헤더/위장 줄이
-독립된 줄로 나타나지 않고, 그 절에서 뽑는 진짜 실패 id 전부가 정상
-추출된다). `--force-short-summary`는 `config.option.force_short_summary`를
-세워 이 조건의 else 분기(항상 `_format_trimmed`로 첫 줄만 남기는
-분기)로 강제하므로, `CI`나 `BUILD_NUMBER`가 실행 환경에 설정돼 있어도
-`short test summary info` 절의 사유는 항상 한 줄로 잘린다. `FAILURES`
-절(`--tb=short`가 찍는 트레이스백)에는 이 사유 문자열이 여전히 `E   `로
-시작하는 줄로 그대로 남는다(실측: 위 재현에서 `E   == short test
-summary info ==`처럼 앞에 `E   `가 붙어 나온다). 6절 6번의 id 추출은
-`^=+ short test summary info =+$`처럼 줄 시작을 고정해 앵커링하므로 이
-`E   ` 접두 줄은 애초에 매치 대상이 아니고, `--force-short-summary`가
-막는 것은 `short test summary info` 절 자체에 위장 줄이 새로 생기는
-경로 하나다. 이 방어는 `FAILED`/`ERROR`의 reprcrash 메시지 경로에만
-걸린다. `show_xfailed`/`show_xpassed`(`_pytest/terminal.py`의 xfailed/
-xpassed 요약)는 `rep.wasxfail`을 `_format_trimmed`를 거치지 않고 그대로
-줄에 붙이므로 `--force-short-summary`와 무관하게 같은 종류의 주입에
-열려 있다. 다만 이 절은 `-r` 기본값(`fE`, `_pytest/terminal.py:77`)에는
-`x`/`X`가 없어 `-rx`/`-ra`/`-rA`를 명령에 추가하지 않는 한 애초에
-출력되지 않고, 이 저장소는 `xfail` 마커 자체를 쓰지 않는다(실측:
-`grep -rnP 'pytest\.(mark\.)?(xfail)\(' tests/`, 매치 0건). 고정 명령에
-`-rx` 계열을 새로 추가하거나 이 저장소에 `xfail` 마커를 새로 들이면
-이 경계 밖의 주입 경로가 열리므로 그때는 이 문단의 보장이 적용되지
-않는다.
-이 네 조건과 `PY_COLORS=0`은 재현 명령의 고정 형태이지
-판정 근거가 아니다.
-**이것만으로 완주를 보장하지 않는다** — `pyproject.toml`의
-`addopts`, `-p` 플러그인, 상위 `conftest.py` 등 같은 일을 하는 경로가 더
-있을 수 있고, 전부 나열하는 쪽으로는 닫히지 않는다. 그래서 판정은 아래
-처럼 **검출**로 한다: 어느 경로로 조기 종료되든 pytest는 자기 실행
-조건을 스스로 두 가지로 보고한다. 하나는 `session.shouldfail`/
-`shouldstop`이 켜질 때 무조건 찍는 `!` 배너 줄이고, 다른 하나는 수집
-수·처리 수 두 숫자다. 이 둘은 서로 다른 조기 종료 경로를 담당한다.
-`session.shouldfail`/`shouldstop`이 켜지는 경로(`-x`/`--maxfail`을
-포함해 그 두 세션 플래그를 세우는 임의 플러그인)라면 코드가 예외 없이
-배너를 내므로 배너 검출만으로 충분히 걸러진다. 반대로 그 두 플래그를
-전혀 거치지 않는 별도 경로로 조기 종료되면 배너가 안 찍히므로, 그런
-경로는 수집 수·처리 수 두 숫자의 어긋남으로만 걸러진다. 두 경로의
-담당 범위가 서로 달라 배너 검출과 숫자 대사를 같이 쓴다.
+`addopts`가 이미 `-v`를 싣고 있어(4번 참고) 중복이다. `PY_COLORS=0`도
+명시 설정해 로그를 무색으로 고정한다(사람이 로그를 눈으로 읽을 때
+ANSI 코드에 방해받지 않게 하는 목적일 뿐, 아래 판정 절차의 어느
+단계도 이 값에 의존하지 않는다).
+
+이 세 조건은 재현 명령의 고정 형태이지 판정 근거가 아니다. 아래 판정
+절차는 로그의 진행 줄이나 배너 문자열을 grep하지 않고 `--junit-xml`이
+낸 구조화 출력을 읽는다. JUnit XML은 각 `testcase`의 캡처 표준출력을
+`system-out` 요소 안에 별도로 담고, 통과/실패 판정은 `failure`/`error`
+자식 요소의 유무로, 개수는 `testsuite`의 `tests`/`failures`/`errors`
+속성으로 낸다. 실패한 테스트가 캡처 표준출력에 어떤 문자열을 찍어도
+(진행 줄 흉내, 배너 흉내, 요약절 헤더 흉내 전부 포함) 그 문자열은
+`system-out` 안에만 담기고 개수, `classname`, `name`, `failure`/`error`
+속성에는 구조적으로 섞이지 않는다. 이 분리가 캡처 출력 오염을 원천
+차단하므로, 텍스트 grep 기반 판정에 필요했던 오염 회피용 플래그
+(`--force-short-summary` 등)는 더 필요 없다.
 
 ### 판정 절차
 
@@ -332,231 +269,133 @@ xpassed 요약)는 `rep.wasxfail`을 `_format_trimmed`를 거치지 않고 그�
    참고). 그 자체로 미완주이며 diff를 내지 않고 워크트리 경로부터
    고친다. `BLOCK_EXIT`가 17이 아니거나, 17이면서 로그 파일이 있으면
    (내용이 비어 있어도) 그 값은 pytest 자신의 종료 코드다. 0(전부 통과)
-   또는 1(실패 있음, 또는 tripwire 중단)이 아니면
-   역시 그 자체로 미완주다. pytest의 종료 코드 계약상 2는 실행
-   중단(예: `KeyboardInterrupt`), 3은 내부 오류, 4는 사용법 오류, 5는
-   미수집, 6은 경고 수 초과다(`_pytest/config/__init__.py`의 `ExitCode`
-   열거값 전량, 이 워크트리가 설치한 pytest 9.1.1 소스로 확인했다). 6번은
-   CLI `--max-warnings`나 이와 동등한 `pytest.ini`/`pyproject.toml`의
-   `max_warnings` 설정을 실제로 넘겨야만 나오는데(`_pytest/terminal.py`의
-   `_get_max_warnings`가 이 둘을 이 순서로 본다) 둘 다 이 저장소의
-   `pyproject.toml`과 `Makefile`에 없고 위 재현 명령도 넘기지 않으므로
-   이 고정 재현 명령으로는 도달할 수 없다. 그래도 나열은 계약 전량을
-   적어 사용자가 임의로 `--max-warnings`를 끼워 넣는 변형 명령을 쓸 때
-   6이 뜻하는 바를 바로 찾게 한다. 어느 코드든 diff를 내지 않고
-   원인부터 조사한다.
-3. `BLOCK_EXIT`가 1이면 PG tripwire(`tests/conftest.py`)는 DB명이 `_test`로
-   안 끝나면 `pytest.exit(...)`로 세션 전체를 즉시 중단하며 이때도 종료
-   코드가 1이다. 로그에 고정 마커 `[PG tripwire]`(tripwire가 내는 메시지
-   앞부분, 코드가 문자 그대로 보장하는 계약값이라 안 썩는다)가 있는지
-   먼저 grep한다(로그 파일명은 위 재현 명령의 `tee` 대상):
+   또는 1(실패 있음, 또는 tripwire 중단)이 아니면 역시 그 자체로
+   미완주다. pytest의 종료 코드 계약상 2는 실행 중단(예:
+   `KeyboardInterrupt`), 3은 내부 오류, 4는 사용법 오류, 5는 미수집,
+   6은 경고 수 초과다(`_pytest/config/__init__.py`의 `ExitCode` 열거값
+   전량, 이 워크트리가 설치한 pytest 9.1.1 소스로 확인했다). 어느
+   코드든 diff를 내지 않고 원인부터 조사한다.
+3. `BLOCK_EXIT`가 17이 아니고 로그 파일도 있는데 xml 파일
+   (`/tmp/<워크트리 식별자>-run.xml`)이 없으면, pytest가
+   `pytest_sessionfinish` 훅(JUnit XML을 실제로 쓰는 지점)까지 못 가고
+   죽은 것이다(세그폴트, OOM-kill, 강제종료 등). 서브셸 맨 앞의
+   `rm -f`가 매번 xml도 비우므로 이 부재는 이번 실행이 남긴 것이다.
+   그 자체로 미완주이며 diff를 내지 않고 원인부터 조사한다. 참고로
+   `pytest.exit(...)`로 세션이 강제 중단되는 경우(PG tripwire 포함)는
+   xml 자체는 만들어진다(`tests="0"`인 빈 testsuite로). 이 경로는
+   여기서 걸리지 않고 4번의 개수 대사에서 걸린다. 로그에 고정 마커
+   `[PG tripwire]`(tripwire가 내는 메시지 앞부분)가 있는지 grep해 두면
+   원인 조사가 빠르지만, 이 grep은 캡처 표준출력이 같은 문자열을 찍는
+   경우 오탐하므로(테스트 코드가 `print("[PG tripwire] ...")`를
+   실행하는 경우) 사람이 원인을 좁히는 참고용일 뿐 판정 근거가 아니다:
    ```bash
    grep -n '\[PG tripwire\]' /tmp/<워크트리 식별자>-run.log
    ```
-   있으면 diff를 내지 않고 원인(DB명 오설정)부터 고친다. 이 grep도 로그
-   전체를 대상으로 하므로 실패한 테스트의 캡처 표준출력이
-   `[PG tripwire]` 문자열을 그대로 내면(예: 테스트가
-   `print("[PG tripwire] ...")`를 실행) 오탐한다(실측: 그런 테스트
-   하나로 이 grep이 매치를 내지만 실제 tripwire 중단은 없었다). 이
-   오탐도 방향이 한쪽으로만 간다. 이 fixture가 세션 범위
-   `autouse=True`라도 다른 세션 범위 autouse fixture보다 먼저 돈다는
-   보장은 없고(`_pytest/skipping.py:247-255`의 `tryfirst=True`
-   skip/xfail 훅은 fixture 설정보다도 먼저 돌아, 이 fixture가 돌기 전에
-   다른 테스트가 SKIPPED 결과를 이미 냈을 수도 있다), 마커가 항상
-   남는 이유는 실행 순서가 아니다. `pytest.exit()`가 던지는 `Exit`
-   예외는 `_pytest/main.py:336-344`에서 `KeyboardInterrupt`와 같은
-   경로로 잡혀 `pytest_keyboard_interrupt` 훅을 부르고, 같은 함수의
-   `finally` 블록(359-372행)이 세션이 끝날 때 항상 도는
-   `config._ensure_unconfigure()`를 호출하며, 그 훅을 받는
-   `_pytest/terminal.py:1011-1023`의 `_report_keyboardinterrupt`가 이때
-   `write_sep("!", ...)`로 마커 메시지를 낸다(이 워크트리 pytest 9.1.1
-   소스로 확인한 계약값). 이 출력 경로는 `Exit` 예외가 세션 밖으로
-   전파되기만 하면 다른 테스트가 먼저 몇 개 돌았는지와 무관하게 항상
-   실행된다. 다만 이 두 훅에는 pytest 자신에도 이미 여러 구현이 걸려
-   있다(`_pytest/capture.py`의 `pytest_keyboard_interrupt`,
-   `_pytest/logging.py`와 `_pytest/unraisableexception.py`의
-   `pytest_unconfigure`). pluggy는 한 훅에 걸린 구현을 등록 순서와
-   `tryfirst`/`trylast`가 정한 차례로 부르고, 그 가운데 하나가 예외를
-   던지면 그 뒤 구현은 불리지 않는다. 이 문서는 "재정의한 곳이 없으니
-   반례가 없다"고 증명하지 않는다: 이 워크트리의 `tests/conftest.py`와
-   설치된 플러그인(`pytest-asyncio`, `pytest-cov`, `anyio`)을 grep으로
-   확인한 결과 이 저장소가 직접 추가한 재정의는 없고(실측: 매치 0건),
-   실제로 이 fixture를 발동시켜 재현한 결과 이 워크트리의 실제 플러그인
-   구성에서 마커가 로그에 남았다(재현: 세션 범위 autouse fixture에서
-   `pytest.exit("[PG tripwire] ...")`를 던지는 최소 예제를 이 워크트리
-   `.venv`의 pytest로 실행, `grep -c '^!'`가 1). 이 관측은 이 실행
-   경로에서 앞선 훅 구현들이 예외를 던지지 않았다는 사실만 보여줄 뿐,
-   모든 훅 조합에서 마커가 항상 남는다는 증명은 아니다. 마커가 안
-   보이면 최악의 결과는 원인을
-   잘못 짚어 DB명을 조사하는 데서 그친다. 조사해서 캡처 출력이 원인임을
-   확인했으면 4번으로 넘어간다.
-4. 마커가 없으면(`BLOCK_EXIT`가 0이거나, 1이면서 마커 없음) 조기 종료 배너를
-   grep한다. pytest는 `session.shouldfail`/`session.shouldstop`이
-   켜지면(`-x`/`--maxfail`뿐 아니라 이 두 세션 플래그를 세우는 임의
-   플러그인이 전부 해당한다) 종료 시 `!`로 시작하는 배너 줄을 반드시
-   낸다(`_pytest/terminal.py`의 `write_sep("!", ...)` 호출부, 이
-   워크트리가 설치한 pytest 9.1.1 소스로 확인한 계약값. `KeyboardInterrupt`
-   전용 경로는 별도이며 여기 대상이 아니다):
+4. xml 파일이 있으면 아래 스크립트로 완주 여부와 실패/에러 id 집합을
+   함께 얻는다. `<워크트리>`는 재현 명령과 같은 워크트리 경로다:
    ```bash
-   grep -c '^!' /tmp/<워크트리 식별자>-run.log
+   python3 - /tmp/<워크트리 식별자>-run.log /tmp/<워크트리 식별자>-run.xml <워크트리> <<'PYEOF'
+   import re
+   import sys
+   import xml.etree.ElementTree as ET
+   from pathlib import Path
+
+   log_path, xml_path, repo_root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+
+   log_text = Path(log_path).read_text(errors="replace")
+   m = re.search(
+       r"collected (\d+) items?(?: / (\d+) deselected)?",
+       log_text,
+   )
+   if not m:
+       print("VERDICT:UNTRUSTED reason=no-collected-line")
+       sys.exit(1)
+   collected, deselected = int(m.group(1)), int(m.group(2) or 0)
+   expected = collected - deselected
+
+   suite = ET.parse(xml_path).getroot().find("testsuite")
+   tests = int(suite.get("tests"))
+   failures = int(suite.get("failures"))
+   errors = int(suite.get("errors"))
+
+   # 수집 단계 에러는 classname=""로 들어가고, 개수 우연 일치로
+   # 완주를 가장할 수 있으므로(예: 실제 테스트 1개 + 깨진 모듈 1개면
+   # collected=1, tests=1로 우연히 같아진다) 개수 비교보다 먼저,
+   # 무조건 검사한다.
+   collection_errors = [
+       tc for tc in suite.findall("testcase")
+       if tc.get("classname") == ""
+       and (tc.find("failure") is not None or tc.find("error") is not None)
+   ]
+   if collection_errors:
+       print(f"VERDICT:INCOMPLETE reason=collection-error count={len(collection_errors)}")
+       sys.exit(1)
+
+   if tests != expected:
+       print(f"VERDICT:INCOMPLETE reason=count-mismatch collected={expected} xml_tests={tests}")
+       sys.exit(1)
+
+   def reverse_id(classname, name):
+       # 수집 단계 에러 전용 형태(classname=="")는 위에서 이미 걸러졌으므로
+       # 여기서는 정상 실행 testcase만 온다.
+       segs = classname.split(".")
+       for k in range(len(segs), 0, -1):
+           module = "/".join(segs[:k]) + ".py"
+           if (repo_root / module).is_file():
+               chain = segs[k:]
+               return "::".join([module] + chain + [name])
+       raise ValueError(f"no module path for classname={classname!r} name={name!r}")
+
+   ids = []
+   for tc in suite.findall("testcase"):
+       bad = tc.find("failure")
+       if bad is None:
+           bad = tc.find("error")
+       if bad is None:
+           continue
+       ids.append(reverse_id(tc.get("classname"), tc.get("name")))
+
+   if len(ids) != failures + errors:
+       print(
+           f"VERDICT:UNTRUSTED reason=id-count-mismatch "
+           f"extracted={len(ids)} failures={failures} errors={errors}"
+       )
+       sys.exit(1)
+
+   print(f"VERDICT:COMPLETE tests={tests} failed_or_error={len(ids)}")
+   for i in sorted(set(ids)):
+       print(f"ID:{i}")
+   PYEOF
    ```
-   0이 아니면(배너 줄이 한 줄이라도 있으면) 미완주로 보고 diff를 내지
-   않고 원인부터 조사한다. 0이면 5번으로 넘어간다. 이 배너는 그 두
-   세션 플래그를 세우는 경로에서만 나오므로, 5번은 이 배너를 거치지
-   않는 경로까지 마저 걸러낸다. 이 grep도 로그 전체를 대상으로 하므로
-   실패한 테스트의 캡처 표준출력이 `!`로 시작하는 줄을 내면(예: 테스트가
-   `print("!!! ...")`를 실행) 오탐한다(실측: 그런 테스트 하나로
-   `grep -c '^!'`가 1이 나오지만 실제 조기 종료는 없었다). 이 오탐은
-   방향이 한쪽으로만 간다: 진짜 배너는 이 grep이 로그 전체를 보는 한
-   반드시 걸리므로(놓치는 방향의 반례는 없다) 최악의 결과가 완주를
-   미완주로 잘못 보고 원인을 조사하는 것에서 그친다. 조사해서 캡처
-   출력이 원인임을 확인했으면 5번으로 넘어간다.
-5. 완주 여부를 옵션 목록이 아니라 pytest 자신이 보고하는 두 숫자의
-   대사로 확인한다. 로그 앞부분의 `collected N item(s)`(`-k`/`-m`으로
-   디셀렉트하면 `collected N items / M deselected / K selected`로
-   찍히고 `N`은 디셀렉트 전 전체 수다. `-k`/`-m`은 재현 명령뿐 아니라
-   `pyproject.toml`의 `addopts`에서도 올 수 있다. 이 저장소의
-   `pyproject.toml` `addopts`(`-v --tb=short`)에는 지금 `-k`/`-m`이 없고
-   재현 명령도 넘기지 않으므로 지금은 `M`이 항상 0이지만, `addopts`나
-   변형 명령에 그 옵션이 들어가면 `M`이 0이 아닐 수 있다. 그런 경우도
-   아래 비교에서 `N`에서 `M`을 뺀 값을 쓴다)의 `N`과, `-v` 진행 줄에서
-   실제로 결과가 찍힌 테스트 id를 중복 제거한 고유 개수를 비교한다.
-   추출은 로그 전체가 아니라 진행 줄 구간만 대상으로 한다(`collecting`
-   줄부터 그 다음에 나오는 첫 `===` 구분선 직전까지). FAILURES/ERRORS/
-   warnings summary/short test summary info 절은 전부 이 구분선 뒤에
-   나오므로, 구간을 여기서 끊으면 그 절 안의 캡처 출력(테스트가
-   `print`로 낸 stdout/stderr)이 섞이지 않는다. 로그 전체를 대상으로
-   grep하면 실패한 테스트가 캡처 출력으로 진행 줄과 같은 형태의 문자열을
-   낼 때(예: 테스트 코드가 `print("noise PASSED [100%]")`를 실행하고
-   실패) 그 문자열이 진행 줄처럼 잘못 추출된다(실측: 정상 테스트 1개와
-   위 문자열을 출력하고 실패하는 테스트 1개로 `collected 2 item`인
-   세션에서, 로그 전체를 grep하면 고유 id가 `noise`까지 3개로 잡혀
-   정상 완주를 미완주로 오판정한다. 구간을 끊으면 2개로 정확히 나온다).
-   이 오탐은 반대 방향으로도 갈 수 있다: 배너 없이 조기 종료된 세션에서
-   그런 캡처 출력이 하나 섞이면 부족분과 우연히 상쇄해 미완주를 완주로
-   오판정할 수 있다(뒤에 나오는 카테고리 합 상쇄 반례와 같은 종류의
-   위험이다). 진행 줄 자체가 `=`로 시작하는 테스트 id는 나오지 않으므로
-   이 구간 절단이 진행 줄을 잘라내는 경우는 없다.
-   ```bash
-   awk '/^collecting /{f=1} f && /^=+ /{exit} f' /tmp/<워크트리 식별자>-run.log \
-     | grep -oP '.+(?=\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN)(?:\s+\(.*\))?\s+\[\s*\d+%\]$)' \
-     | sort -u | wc -l
-   ```
-   `SKIPPED`/`XFAIL`/`XPASS`는 진행 줄에 사유가 괄호로 덧붙을 때가 있어
-   (예: `SKIPPED (skip reason)`) 정규식이 그 괄호를 상태명과 `[NN%]`
-   사이의 선택 요소로 허용한다. 이 괄호를 못 받으면 그 줄 전체가
-   추출에서 빠져 고유 개수가 실제보다 작게 나와, 정상 완주를 미완주로
-   오판정한다(실측: 사유가 붙는 테스트 3개를 포함해 4개를 완주시키면
-   `collected 4`인데 괄호를 못 받는 정규식으로는 고유 개수가 1로
-   나온다). 사유 문자열 자체에 괄호가 중첩될 수도 있어(예: `SKIPPED
-   (ChromaDB가 이 환경에서 초기화되지 않음(임베딩 모델 미가용 등))`)
-   괄호 안을 `[^)]`로 제한하지 않고 `.*`로 열어 뒤의 `[NN%]$` 고정
-   앵커까지 탐욕적으로 매칭하게 한다(실측: `[^)]*`로는 중첩 괄호가 있는
-   이 줄이 추출에서 빠져 `collected 6`에 고유 개수 5가 나오고, `.*`로
-   바꾸면 6이 나온다). 사유 문자열이 다른 진행 줄을 그대로 흉내내는
-   극단적인 경우(예: 사유가 `x) PASSED (y`처럼 상태명과 괄호를 포함해
-   `.+`가 뒤쪽 상태명을 대신 골라 id를 잘못 자르는 경우)는 이 정규식이
-   구분하지 못한다. 괄호만 있고 상태명은 없는 사유(바로 위 ChromaDB
-   예처럼)는 이 반례에 해당하지 않는다. `.+`가 상태명 앞에서 멈추려면
-   사유 안에 `PASSED`/`FAILED`/`ERROR`/`SKIPPED`/`XFAIL`/`XPASS`/`RERUN`
-   가운데 하나가 그대로 나와야 하기 때문이다. 이 저장소의 스킵/xfail
-   호출을 확인한 결과 상태명을 포함한 사유가 없어 지금은 발동하지
-   않는다. 호출이 한 줄에 있는 경우는 `grep -rnP
-   'pytest\.(mark\.)?(skip|skipif|xfail|importorskip)\(' tests/ | grep -wE
-   'PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|RERUN'`(매치 0건)로, 사유가
-   다음 줄로 넘어가는 여러 줄 호출은 같은 명령에 `-A5`를 붙여(매치 0건)
-   확인했다. `skipif`를 빠뜨리면 `pytest.mark.skipif(`가 안 걸리는
-   실측 반례가 있어(이 저장소에 14건) 패턴에 `skipif`를 넣었다. 이
-   grep은 이 저장소 소스의 정적 텍스트만 보므로, 문자열을 실행 시점에
-   조립하는 사유(예: 변수 보간 결과 자체가 상태명이 되는 경우)는 범위
-   밖이다. 새 사유 문자열을 추가할 때 이 일곱 상태명을 그대로 쓰지
-   않는다.
-   같은 테스트 id가 setup/call/teardown 단계별로 따로 리포트를 내도
-   (예: teardown 에러가 나면 같은 id로 `PASSED` 줄과 `ERROR` 줄이 각각
-   찍힌다) 이 방식은 id 단위로 중복 제거하므로 한 번만 센다. 요약줄
-   카테고리 합을 안 쓰는 이유가 이것이다: 카테고리 합은 리포트 단위라
-   이런 중복을 그대로 더해 부풀리고(실측: 테스트 1개짜리 세션에서
-   teardown만 실패시키면 `collected 1 item` 대 `1 passed, 1 error`로
-   합이 2가 나온다), 그 부풀림이 다른 자리의 미실행 하나와 우연히
-   상쇄하면 조기 종료를 놓친다(실측: 세션 플래그를 세우지 않는 커스텀
-   `pytest_runtestloop`로 테스트 2개 중 1개만 돌리고 그 1개의 teardown을
-   실패시키면 `collected 2 items` 대 카테고리 합 `1 passed, 1 error`=2로
-   숫자가 맞아떨어져, 배너도 없고 산술도 맞는데 두 번째 테스트는 전혀
-   안 돈 채로 완주 판정이 나온다). 고유 id 개수는 같은 id의 중복
-   리포트를 늘리지 않고 한 번으로만 세므로 이 상쇄가 생기지 않는다.
-   `N`에서 `M`을 뺀 값(디셀렉트가 없으면 `N` 그대로)과 고유 id 개수가
-   다르면(예: `-x`/`--maxfail`/`PYTEST_ADDOPTS` 주입으로 조기 종료됐지만
-   겉보기엔 정상 종료된 실행) 완주가 아니므로 diff하지 않고 원인부터
-   조사한다. 둘이 같으면 4번에서 배너가 없었다는 전제 아래 완주로 본다.
-6. 완주가 확인되면 로그의 `FAILED`/`ERROR` 줄 id를 정렬된 집합으로
-   (없으면 빈 집합으로) 뽑아 양쪽 다 항상 base와 diff한다(빈 집합끼리도
-   diff 대상이다 — "전부 통과"를 diff 생략 사유로 쓰지 않는다). 추출과
-   대사는 로그 전체가 아니라 `short test summary info` 절만 대상으로
-   한다(그 절의 마지막 헤더부터 로그 끝까지. 마지막인 이유는 아래에
-   적는다):
-   ```bash
-   tac /tmp/<워크트리 식별자>-run.log \
-     | awk '{print} /^=+ short test summary info =+$/{exit}' \
-     | tac \
-     | grep -oP '^(FAILED|ERROR) \K.+?(?= - |$)' | sort -u
-   ```
-   pytest는 이 절에 실패/에러 테스트마다 `FAILED <id> - <사유>` 또는
-   `ERROR <id> - <사유>` 한 줄을 별도 `-r` 옵션 없이도 기본값으로 낸다(이
-   워크트리 pytest로 확인한 계약값). 로그 전체를 대상으로 하면 5번과
-   같은 종류의 오염이 생긴다: 실패한 테스트의 캡처 표준출력이나 캡처
-   로그가 `FAILED `/`ERROR `로 시작하는 줄을 그대로 내면(전자는 테스트
-   코드의 `print`, 후자는 `logging.getLogger(...).error(...)`처럼
-   ERROR 레벨 로그 호출이 원인이다) 그 줄이 진짜 id처럼 집합에
-   섞인다(실측: 표준출력에 `FAILED fake/test_ghost.py::test_ghost -
-   bogus`를 찍고 실패하는 테스트와 `.error("db connect failed")`를 호출하고
-   실패하는 테스트를 포함한 세션에서, 로그 전체 대상 `^FAILED `/`^ERROR `
-   개수는 각각 2인데 요약줄은 `1 failed, ... 1 error`다. `short test
-   summary info` 절로 좁히면 각각 1로 요약줄과 일치한다). 절 헤더
-   자체도 캡처 출력이 흉내낼 수 있다: 실패한 테스트가 표준출력에
-   `== short test summary info ==` 같은 줄을 그대로 내면 첫 매치부터
-   잡는 방식은 그 위장 헤더에서 열려, 그 뒤에 낀 다른 캡처 출력 속
-   `FAILED`/`ERROR` 줄까지 집합에 섞인다(실측: 그런 위장 헤더와 가짜
-   `FAILED fake/test_ghost.py::test_ghost - bogus`를 표준출력에 찍고
-   실패하는 테스트 하나와 별도로 실패하는 테스트 하나를 포함한
-   세션에서, 첫 매치 기준 추출은 `fake/test_ghost.py::test_ghost`를
-   포함해 고유 id 3개를 내지만 요약줄은 `2 failed`다). 진짜 헤더는
-   `pytest_terminal_summary`가 세션 끝에 한 번만 내므로(`_pytest/
-   terminal.py`의 `summary_failures`/`summary_errors`가 캡처 출력을
-   먼저 찍고 `short_test_summary()`가 마지막에 그 절을 낸다, 이
-   워크트리 pytest 9.1.1 소스로 확인한 계약값) 로그에서 이 헤더와
-   일치하는 마지막 줄이 항상 진짜 절이다. 위 명령이 `tac`으로 뒤집어
-   맨 끝에서부터 찾아 그 마지막 매치에서 멈추는 이유가 이것이다.
-   id 추출은 `\K\S+`가 아니라 `\K.+?(?= - |$)`를 쓴다. pytest는 `FAILED
-   <id> - <사유>` 줄에서 사유가 있으면 ` - `로 id와 사유를 잇고, 사유가
-   없으면 `FAILED <id>`만 낸다(`_pytest/terminal.py`의
-   `_get_line_with_reprcrash_message`, 이 워크트리 pytest 9.1.1 소스로
-   확인한 계약값). id 자체에 매개변수화 값이 그대로 들어가는데(예: 매개변수가
-   문자열이면 공백도 그대로 남는다), `\S+`는 첫 공백에서 끊는다(실측:
-   이 저장소의 `tests/test_vector_raw_contract.py`에 실제로 있는 id
-   `test_a_bad_batch_is_refused_without_touching_the_store[chroma-not-a-sequence-records must be a sequence]`
-   처럼 공백이 있는 id가 있고, 서로 다른 두 id `test_x[a b]`와
-   `test_x[a c]`를 만들어 실행하면
-   `\S+`는 둘 다 `test_x[a`로 잘라 하나로 뭉갠다. 실패 건수가 같으면
-   앞서 나온 개수 대사도 통과하므로 base와 작업 브랜치 사이에 어느
-   매개변수 값이 실패하는지 바뀌어도 diff가 놓칠 수 있다). `.+?(?= -
-   |$)`는 첫 ` - ` 앞까지 또는 사유가 없으면 줄 끝까지를 최소
-   매칭으로 가져와 이 절단을 없앤다(같은 반례로 재실측: id가 온전히
-   갈라져 나온다). id 자체가 ` - `를 그대로 포함하면(매개변수 값에
-   공백을 낀 하이픈이 들어가는 경우) 이 정규식도 그 앞에서 끊어 여전히
-   틀린다. 이 저장소를 `pytest --collect-only -q`로 재수집한 결과에는
-   대괄호 안에 ` - `를 포함한 id가 없다(실측: 0건. 총 수집 건수는 매
-   커밋 바뀌므로 이 문서에는 박지 않고, 재현 시점에 위 명령으로 직접
-   구한다). 새 매개변수 값에 공백을 낀 하이픈을 넣으면 이 경계가 다시
-   깨지므로 그런 값은 피한다.
-   요약줄의
-   `failed`/`error` 수와 이 절 안의 `^FAILED `/`^ERROR ` 줄 수도 같은
-   범위로 대사한다. 요약줄이 `N failed`(N>0)를 보고하는데 `^FAILED `로
-   시작하는 줄이 하나도 없거나, `M error`(M>0)를 보고하는데 `^ERROR `로
-   시작하는 줄이 하나도 없으면 리포트 옵션(`-r` 계열, `--no-summary`)이
-   깨져 있다는 뜻이므로 diff를 신뢰하지 말고 옵션부터 고친다. "리포트
-   옵션을 기본값으로 고정했다"는 서술이 아니라 로그에 실제로 그 줄들이
-   나온 것 자체가 그 고정이 걸렸다는 증거다.
-7. 수집 단계 에러(`ERROR collecting`)는 0.
+   `reverse_id`는 `classname`(점으로 이어진 모듈/클래스 경로)을 뒤에서부터
+   줄여가며 "이 접두어 + `.py`가 실제 파일로 존재하는가"를 검사해, 가장
+   긴 매치를 모듈 경로로, 나머지를 클래스 체인으로 가른다. 이
+   저장소의 `tests/` 전량(클래스 기반과 일반 함수 전부 포함)을 pytest
+   자신의 `mangle_test_address`(`_pytest/junitxml.py`) 순변환과 대사해
+   왕복 검증했고 불일치 0건이다(재현 시점의 실제 건수는
+   `pytest --collect-only -q -o addopts=""`로 다시 구한다. 이 숫자는
+   커밋마다 바뀌므로 이 문서에는 박지 않는다). 어떤 접두어도 파일로
+   존재하지 않으면(예: `pytest_internalerror`가 내는
+   `classname="pytest", name="internal"`처럼 이 규칙이 예상하지 않은
+   형태) `reverse_id`는 `ValueError`를 던지고 스크립트가 그 트레이스백과
+   함께 비정상 종료한다. id를 조용히 건너뛰지 않는다: 조용히 건너뛰면
+   실패/에러 id 집합이 부분집합이 되고, 그 부분집합끼리의 diff가
+   거짓으로 "같음"을 낼 수 있다.
+
+   `VERDICT:UNTRUSTED`는 추출 개수와 `testsuite`의 `failures`+`errors`
+   합이 어긋난다는 뜻이다(자기 점검). 이 경우도 diff를 신뢰하지 말고
+   원인부터 조사한다.
+
+   이 스크립트는 표준 라이브러리만 쓰고 이 문서 안에서만 쓴다. 반복해서
+   쓰는 일이 생기면 `scripts/qa/`로 옮겨 두는 것이 다음 단계다(지금은
+   문서 변경만으로 이 저장소의 판정 절차를 완결하기 위해 인라인으로
+   둔다. 인라인 상태는 CI가 검사하지 않으므로 저장소 코드가 바뀌면
+   내용이 썩을 수 있다는 점에 주의한다).
+5. `VERDICT:COMPLETE`가 나오면 그 뒤에 출력된 `ID:` 줄들을 정렬된
+   집합으로(없으면 빈 집합으로) 뽑아 양쪽(base와 작업) 다 항상 diff한다
+   (빈 집합끼리도 diff 대상이다: "전부 통과"를 diff 생략 사유로 쓰지
+   않는다). `VERDICT:INCOMPLETE`나 `VERDICT:UNTRUSTED`가 나오면 diff를
+   내지 않고 원인부터 조사한다.
 
 `--basetemp`은 pytest가 그 디렉터리를 비우는 파괴적 동작이며, 그 시점은
 세션 시작이 아니라 세션 중 `TempPathFactory.getbasetemp()` 최초 호출(첫
