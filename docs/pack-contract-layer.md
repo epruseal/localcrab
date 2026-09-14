@@ -198,11 +198,11 @@ SELECT COUNT(*) FROM graph_nodes
 다른 사실이라 섞으면 안 된다 — 종전에는 둘 다 `0` 이라 Chroma·pgvector 에서 **항상 결손처럼
 보였다**. 호출자는 **산술 전에 `None` 을 걸러라.** 그냥 빼면 `TypeError` 다.
 
-### 3. `load_nodes_incremental(..., doc_node_spaces=)` 는 **필수**다
+### 3. `load_nodes_incremental(..., doc_node_spaces=, doc_owner_ids=)` 는 둘 다 **필수**다
 
-`live_pack_state` 가 돌려주는 `{node_id: {space, ...}}` 를 그대로 넘겨라. 기본값을 두지 않은
-것이 의도다 — 기본값이 있으면 안 넘긴 호출자에서 doc 잔재 정리가 **조용히 꺼지고** 그 사실이
-어디에도 안 남는다.
+`live_pack_state` 가 돌려주는 `{node_id: {space, ...}}` 를 `doc_node_spaces` 로 그대로
+넘겨라. 기본값을 두지 않은 것이 의도다 — 기본값이 있으면 안 넘긴 호출자에서 doc 잔재
+정리가 **조용히 꺼지고** 그 사실이 어디에도 안 남는다.
 
 이 인자가 닫는 것은 **타입 변경 잔재**다. 노드 타입이 바뀌면 새 타입 행이 저장된 뒤 구 행을
 지우는데, graph 는 지워지고 doc 이 남으면 다음 실행의 `live` 조회가 새 타입만 보고 `same` 으로
@@ -213,6 +213,15 @@ SELECT COUNT(*) FROM graph_nodes
 타입 변경 잔재는 정의상 입력에 있는 노드의 것이므로 이 자리에서만 걷힌다.
 
 빈 dict 는 유효한 입력이다(대사할 doc 행이 없다는 사실). `None` 과 다르다.
+
+**`doc_owner_ids`(#358 재리뷰 P1-B)도 같은 이유로 필수다.** `live_pack_state` 가 돌려주는
+`{(node_id, space): owner_id 또는 None}` 을 그대로 넘겨라. 이 인자가 닫는 것은 **문서
+sink 의 owner_id staleness** 다 — 그래프 쓰기는 성공하고 뒤이은 문서 쓰기가 실패하면
+그래프는 현재 principal 로 재스탬프됐어도 문서 쪽 `properties.owner_id` 는 낡은 값을 그대로
+담은 채 남는다. 다음 실행이 그래프 쪽만 보고 `same` 을 내리면 문서 쪽 owner_id 는 영영
+회수되지 않는다. 키가 `(node_id, space)` 튜플인 이유는 문서 스토어 기본키가
+`(space, node_id)` 라 같은 node_id 가 여러 space 에 행을 가질 수 있어서다 — bare node_id 로
+모으면 무관한 space 의 값이 목표 space 의 값을 덮어쓸 수 있다.
 
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 

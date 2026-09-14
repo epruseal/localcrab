@@ -217,7 +217,7 @@ class TestDocRowLossRecovery:
         assert "n1" not in state["doc_node_spaces"], "전제: doc 행이 사라져야 한다"
 
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], state["doc_owner_ids"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             f"doc 행 유실이 same 으로 방치됐다: new={n_new} chg={n_chg} same={n_same}")
         assert docs._conn.execute(
@@ -227,7 +227,7 @@ class TestDocRowLossRecovery:
         # 2회차: doc 행이 이제 존재하니 same 으로 수렴한다.
         state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         n_new2, n_chg2, n_same2, skip2, err2, _ids2 = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
+            "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"], state2["doc_owner_ids"])
         assert (n_new2, n_chg2, n_same2, skip2, err2) == (0, 0, 1, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: {(n_new2, n_chg2, n_same2, skip2, err2)}")
 
@@ -246,7 +246,7 @@ class TestDocRowLossRecovery:
             "전제: F4-b 가 앵커를 doc_node_spaces 에서 뺀다")
 
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], state["doc_owner_ids"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             f"앵커 노드가 doc_node_spaces 부재로 오탐 재적재됐다: "
             f"new={n_new} chg={n_chg} same={n_same}")
@@ -271,7 +271,7 @@ class TestDocRowLossRecovery:
         # (실코드 조건 `not _is_anchor_node(...) and ...` 의 첫 항을 죽인다).
         monkeypatch.setattr(pack_load, "_is_anchor_node", lambda *a, **kw: True)
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], state["doc_owner_ids"])
         monkeypatch.setattr(pack_load, "_is_anchor_node", orig)
 
         assert (n_chg, n_same) == (0, 1), (
@@ -331,7 +331,7 @@ class TestTypeReclassification:
         )
         result = pack_load.load_nodes_incremental(
             "pack-1", new_file, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"],
+            state["doc_node_spaces"], state["doc_owner_ids"],
         )
 
         assert result[:5] == (0, 1, 0, 0, 0)

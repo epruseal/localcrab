@@ -1648,6 +1648,11 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         쿼리들은 각자 `docs._fetch_all` 로 독립 호출한다(PG 는 매 호출이 단명
         커넥션 — sqlite 처럼 하나의 커넥션을 계속 쥐고 있지 않는다). 앵커는
         뺀다 — 앵커는 삭제 후보가 아니므로 대사 대상도 아니다.
+      doc_owner_ids: {(node_id, space): owner_id 또는 None} — 문서 sink 의
+        owner_id 대사용(#358 재리뷰 P1-B). doc_node_spaces 와 별도의 쿼리다 —
+        앵커를 빼지 않는다(앵커도 owner_id staleness 후보다). 키가 space 를
+        포함한 튜플인 이유는 문서 스토어 기본키가 (space, node_id) 라 같은
+        node_id 가 여러 space 에 행을 가질 수 있기 때문이다.
     """
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
@@ -1738,9 +1743,36 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
         space = docs._row_get(row, "space")
         doc_node_spaces.setdefault(node_id, set()).add(space)
 
+    # doc_owner_ids(#358 재리뷰 P1-B): 문서 sink 에 실제로 실린 owner_id 대사용.
+    # **별도의 두 번째 bulk SELECT** 다 — 위 doc_node_spaces 조회를 재사용하지
+    # 않는다. 그 조회는 `AND NOT {anchor_sql}` 로 앵커 문서를 뺀다(F4-b, 삭제·
+    # space 대사 대상에서 앵커를 제외하는 목적). 앵커 문서도 owner_id 를 가질
+    # 수 있고 낡은 채로 남을 수 있는데, 같은 제외를 얹으면 앵커의 owner_id
+    # staleness 는 doc_row_missing(둘 다 앵커를 뺀다) 과 이중으로 못 잡아
+    # 영원히 감지되지 않는다. 팩당 쿼리 하나 추가이므로 N+1 은 아니다.
+    #
+    # 키는 `node_id` 단독이 아니라 `(node_id, space)` 튜플이다 — 문서 스토어의
+    # 기본키가 `(space, node_id)`(`_sql_doc_base.py`)라 같은 node_id 가 여러
+    # space 에 문서 행을 가질 수 있다(예: 지난 space 이전이 미완료로 남긴
+    # 잔재). 정렬 없는 SELECT를 bare node_id 로만 모으면 나중에 반환된 무관한
+    # space 의 행이 목표 space 의 값을 덮어써 오판을 만든다.
+    doc_owner_ids: dict[tuple[str, str], str | None] = {}
+    for row in docs._fetch_all(
+        f"""
+        SELECT node_id, space, properties
+        FROM {docs._table('doc_nodes')}
+        WHERE {dn_pred}
+        """,
+        {"pack": pack_name},
+    ):
+        node_id = docs._row_get(row, "node_id")
+        doc_space = docs._row_get(row, "space")
+        properties = _as_json_dict(docs._row_get(row, "properties"))
+        doc_owner_ids[(node_id, doc_space)] = properties.get("owner_id")
+
     return {
         "nodes": nodes, "chunks": chunks, "edges": edges, "vec_ids": vec_ids,
-        "doc_node_spaces": doc_node_spaces,
+        "doc_node_spaces": doc_node_spaces, "doc_owner_ids": doc_owner_ids,
     }
 
 
@@ -1852,6 +1884,7 @@ def load_nodes_incremental(
     graph,
     docs,
     doc_node_spaces: dict[str, set[str]],
+    doc_owner_ids: dict[tuple[str, str], str | None],
 ) -> tuple[int, int, int, int, int, set]:
     """노드 증분 적재. 라이브와 동일한 행은 완전 스킵(어떤 스토어도 미접촉).
 
@@ -1868,6 +1901,14 @@ def load_nodes_incremental(
     — 그게 정확히 F4-c 의 몫이다. 조용히 꺼지면 타입 변경 잔재가 영영 안 걷힌다.
     빈 dict(`{}`)는 유효하다 — "대사할 doc 행이 없다"는 사실이고, 없는 것과는
     다르다.
+
+    `doc_owner_ids`는 `live_pack_state` 의 반환이다(#358 재리뷰 P1-B) —
+    `doc_node_spaces` 와 같은 이유로 **필수 인자**다. 그래프 쓰기는 성공하고
+    뒤이은 문서 쓰기가 실패하면(개별 실패는 `OntologyBuilder.add_node` 의
+    영수증으로 이미 관측된다) 그래프는 현재 principal 로 재스탬프됐어도 문서
+    sink 의 `properties.owner_id` 는 낡은 값을 그대로 담은 채 남는다. 이 값이
+    없으면 그 staleness 를 판정할 근거가 없어 same 판정이 그 노드를 영구히
+    통과시킨다.
 
     반환: (n_new, n_chg, n_same, skip, err, bypack_ids)
     """
@@ -1932,11 +1973,30 @@ def load_nodes_incremental(
             # 결함이다. "owner_id in props" 는 파일이 신원 정보를 실제로
             # 실었다는 신호로만 쓴다 — 파일에 이 키가 없는 행까지 매 런
             # 강제 재기록하지는 않는다(위 상수 주석에 정책 근거 설명).
+            # doc_owner_ids 쪽 OR-조건(#358 재리뷰 P1-B): 그래프는 이미 현재
+            # principal 로 스탬프됐어도 문서 sink 가 지난 부분 실패의 잔재로
+            # 낡은 owner_id 를 그대로 담고 있을 수 있다. 조회 키는 이 노드의
+            # **목표(이번 파일이 배정하는) space** 다 — 무관한 다른 space 의
+            # 문서 행이 섞여 들지 않는다. `None`(그 space 에 문서 행이 없거나
+            # 행은 있어도 owner_id 를 안 실은 경우)은 재스탬프 대상이 아니다 —
+            # 문서 행 부재 자체는 `doc_row_missing` 이 별도로 다룬다.
             owner_id_needs_restamp = (
                 "owner_id" in props
-                and live[2].get("owner_id") != principal.user_id
+                and (
+                    live[2].get("owner_id") != principal.user_id
+                    or doc_owner_ids.get((node_id, space)) not in (None, principal.user_id)
+                )
             )
+            # live[1] == space(#358 재리뷰 P1-A): 그래프의 실제 space_id 컬럼과
+            # 이번 파일이 배정하는 목표 space 를 same 판정이 비교한다. 레거시
+            # 중첩 `properties.space` 를 실은 행의 space 전용 갱신이 그래프
+            # 쓰기 실패로 반쯤만 반영된 상태에서, `BOTH_SIDES_IGNORED_KEYS` 가
+            # `space` 를 양쪽 properties 비교에서 빼는 이번 대칭화 때문에 이
+            # 컬럼을 안 보면 same 으로 오판돼 그래프가 잘못된 space 에 영구히
+            # 남는다. `live[1]` 이 None(레거시 미기록)이면 이 비교가 항상
+            # 불일치라 chg 로 낙하한다 — 회수(backfill) 방향이라 안전하다.
             if (live[0] == node_type and live_props == file_props
+                    and live[1] == space
                     and not owner_id_needs_restamp):
                 # R2(#142 재리뷰): graph 는 same 이어도 이번 space 의 doc 행이
                 # 없을 수 있다 — 지난 런의 add_node 가 graph 는 쓰고 doc 만

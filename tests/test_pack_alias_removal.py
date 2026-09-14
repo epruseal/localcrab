@@ -355,7 +355,7 @@ def test_t7_live_alias_does_not_make_every_node_changed(live, tmp_path):
 
     with principal_scope(principal):
         n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, {"n1": {"resource"}})
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {"n1": {"resource"}}, {})
     assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
         "폐기 별칭 하나 때문에 동일한 행이 chg 로 잡혔다 — 매 증분 전량 재기록된다")
 
