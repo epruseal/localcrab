@@ -364,6 +364,35 @@ class TestDocParity:
             assert store.get_node_doc("s1", "newnode") is None
             assert store.delete_node_doc("s1", "newnode") is False
 
+    def test_iter_node_identities_parity(self, doc_pair):
+        """issue #317: keyset-pagination generator (SQLite) vs the same SQL
+        text over a SQLAlchemy engine (PG) must enumerate the identical
+        identity set, unbounded and with no duplicates, for both a small
+        ``batch_size`` (forces multiple pages) and the ``space`` filter."""
+        local, pg = doc_pair
+        for store in (local, pg):
+            all_ids = list(store.iter_node_identities(batch_size=7))
+            assert len(all_ids) == len(set(all_ids)), "duplicate rows across pages"
+            scoped_ids = list(store.iter_node_identities(space="s1", batch_size=13))
+            assert all(space == "s1" for space, _, _ in scoped_ids)
+        local_ids = sorted(local.iter_node_identities(batch_size=7))
+        pg_ids = sorted(pg.iter_node_identities(batch_size=7))
+        assert local_ids == pg_ids
+
+    def test_create_node_doc_if_absent_parity(self, doc_pair):
+        local, pg = doc_pair
+        for store in (local, pg):
+            result1 = store.create_node_doc_if_absent("s1", "Doc", "cndia_new", {"x": 1})
+            assert result1 == "created"
+            assert store.get_node_doc("s1", "cndia_new")["properties"] == {"x": 1}
+            # An existing row must not be overwritten, matching upsert_node()'s
+            # insert-then-check graph-side contract (5-2절).
+            result2 = store.create_node_doc_if_absent(
+                "s1", "Doc", "cndia_new", {"x": "SHOULD_NOT_APPEAR"}
+            )
+            assert result2 == "exists"
+            assert store.get_node_doc("s1", "cndia_new")["properties"] == {"x": 1}
+
     def test_bm25_fingerprint_count_matches(self, doc_pair):
         local, pg = doc_pair
         local_count, _ = local.bm25_fingerprint()

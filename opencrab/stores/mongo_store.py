@@ -8,8 +8,9 @@ audit logs. Uses pymongo with a connection pool.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,57 @@ class MongoStore:
             {"space": space, "node_id": node_id}, {"_id": 0}
         )
         return dict(doc) if doc else None
+
+    def create_node_doc_if_absent(
+        self, space: str, node_type: str, node_id: str, properties: dict[str, Any]
+    ) -> Literal["created", "exists"]:
+        """Insert-if-absent counterpart to ``upsert_node_doc`` (issue #317
+        5-2절): graph-only backfill must not overwrite a row another process
+        wrote between diagnosis and this call, which is what ``upsert_node_doc``
+        (an unconditional ``$set``) would do. The unique index on
+        ``(space, node_id)`` (see ``_ensure_indexes``) turns a plain
+        ``insert_one`` into an atomic insert-if-absent: a concurrent winner
+        raises ``DuplicateKeyError``, which this method reports as
+        ``"exists"`` rather than a write failure.
+        """
+        self._require_available()
+        doc: dict[str, Any] = {
+            "space": space,
+            "node_type": node_type,
+            "node_id": node_id,
+            "properties": properties,
+            "created_at": datetime.now(tz=UTC),
+            "updated_at": datetime.now(tz=UTC),
+        }
+        owner_id = properties.get("owner_id") if isinstance(properties, dict) else None
+        if owner_id is not None:
+            doc["owner_id"] = owner_id
+        from pymongo.errors import DuplicateKeyError  # type: ignore[import]
+
+        try:
+            self._db["nodes"].insert_one(doc)
+        except DuplicateKeyError:
+            return "exists"
+        return "created"
+
+    def iter_node_identities(
+        self, space: str | None = None, batch_size: int = 5000
+    ) -> Iterator[tuple[str, str, str]]:
+        """Stream ``(space, node_id, node_type)`` for every node document,
+        unbounded (issue #317 3절/6절). pymongo's ``find()`` cursor is
+        already server-side lazy and batched -- simply not calling
+        ``.limit()`` gives streaming behaviour for free, so no manual
+        pagination is written here (see the SQL sibling in
+        ``_sql_doc_base.py`` for why that backend needs one)."""
+        self._require_available()
+        query: dict[str, Any] = {}
+        if space:
+            query["space"] = space
+        cursor = self._db["nodes"].find(
+            query, {"_id": 0, "space": 1, "node_id": 1, "node_type": 1}
+        ).batch_size(max(batch_size, 1))
+        for doc in cursor:
+            yield (doc.get("space", ""), doc["node_id"], doc.get("node_type", ""))
 
     def list_nodes(
         self, space: str | None = None, limit: int = 100
