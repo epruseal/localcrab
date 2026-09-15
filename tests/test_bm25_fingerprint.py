@@ -342,3 +342,103 @@ def test_t8_coalesces_burst_invalidations() -> None:
         assert doc_store.list_nodes.call_count <= 3
     finally:
         hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# #398 (BM25 global index cap excludes whole packs) -- small-scale repro.
+#
+# This is a diagnostic fixture, not a fix: #397's auto_pack candidate-pool
+# correction (SQL packs as the candidate source) does not close #398, since
+# a pack can be correctly scoped and still score zero BM25 hits if its docs
+# were already pushed out of the GLOBAL cap window before pack_ids filtering
+# ever runs (list_nodes() orders by updated_at DESC across ALL packs, with
+# no per-pack floor). #397 measured this live as 0/2798 hits for an
+# "acupoint-medical" pack query. The two tests below reproduce the same
+# shape at a 20-row scale, borrowing the cap-injection pattern from
+# test_t8_no_rebuild_scheduled_when_over_cap_and_unchanged above.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_packs_ordered(ds, *, old_count: int, new_count: int) -> None:
+    """``old_count`` nodes in ``old-pack`` (oldest updated_at, pushed out of
+    a small cap first) followed by ``new_count`` nodes in ``new-pack``
+    (newest updated_at, always inside the cap). Old-pack text is "acupoint
+    meridian" and new-pack text is "widget catalog" so a query can target
+    one pack's content without the other's matching by accident."""
+    for i in range(old_count):
+        ds.upsert_node_doc(
+            "s1", "T", f"old{i}", {"name": "acupoint meridian", "pack_id": "old-pack"}
+        )
+        ds._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?",
+            (f"2026-01-01T00:00:{i:02d}", f"old{i}"),
+        )
+    for i in range(new_count):
+        ds.upsert_node_doc(
+            "s1", "T", f"new{i}", {"name": "widget catalog", "pack_id": "new-pack"}
+        )
+        ds._conn.execute(
+            "UPDATE doc_nodes SET updated_at=? WHERE node_id=?",
+            (f"2026-01-02T00:00:{i:02d}", f"new{i}"),
+        )
+    ds._conn.commit()
+
+
+def test_398_capped_global_index_excludes_a_correctly_scoped_pack(tmp_path, monkeypatch) -> None:
+    """#398 diagnostic, NOT fixed by this PR: old-pack is correctly named in
+    pack_ids (so #397's scoping fix has already done its job), but every one
+    of its 10 rows falls outside a cap of 10 that keeps only the 10 newest
+    rows across BOTH packs. The BM25 leg still returns zero hits for
+    old-pack's own content -- the root cause is the global (not per-pack)
+    cap, tracked separately as #398 and left unfixed here (design doc s.7).
+    """
+    from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    _seed_two_packs_ordered(ds, old_count=10, new_count=10)
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 10)  # cap < corpus (20)
+
+    hybrid = _hybrid(ds)
+    try:
+        hits = hybrid._bm25_search(
+            "acupoint", spaces=None, limit=25, pack_ids=["old-pack"]
+        )
+        assert hits == [], (
+            "#398 not yet fixed: old-pack's rows are all outside the global "
+            "cap window, so a correctly scoped query still finds nothing"
+        )
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_reproduction_fixture_confirms_hits_once_the_cap_is_lifted(
+    tmp_path, monkeypatch
+) -> None:
+    """Reusable acceptance check for whoever fixes #398: the SAME fixture as
+    above, with the cap raised to cover the whole corpus, must recover
+    old-pack's hits. This documents the fixture as a valid reproduction of
+    the bug (it is the cap, not the query or the pack scoping, that hides
+    the rows) and gives #398's fix a concrete "before/after" pair to check
+    against."""
+    from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    _seed_two_packs_ordered(ds, old_count=10, new_count=10)
+
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 50)  # cap >= corpus (20)
+
+    hybrid = _hybrid(ds)
+    try:
+        hits = hybrid._bm25_search(
+            "acupoint", spaces=None, limit=25, pack_ids=["old-pack"]
+        )
+        assert {h["node_id"] for h in hits} == {f"old{i}" for i in range(10)}
+    finally:
+        hybrid.shutdown_bm25()
