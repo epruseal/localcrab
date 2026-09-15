@@ -35,6 +35,7 @@ WATCHED_METHODS = frozenset({
     "register_node",
     "register_edge",
     "migrate_graph_identity",
+    "create_node_doc_if_absent",
 })
 
 SCANNED_ROOTS = ("opencrab", "apps", "scripts", "crabharness")
@@ -86,6 +87,15 @@ ALLOWED: dict[tuple[str, str], str] = {
     ),
     ("scripts/migrate_pack_ownership.py", "_backfill_vector"): (
         "migration tool, --apply gated"
+    ),
+    ("scripts/reconcile_doc_graph_nodes.py", "_promote_one"): (
+        "reconciliation tool (#317); --apply --promote-doc-only gated, and "
+        "prepare_node() validates the row immediately before this call"
+    ),
+    ("scripts/reconcile_doc_graph_nodes.py", "_backfill_one"): (
+        "reconciliation tool (#317); --apply gated, and the call is an "
+        "additive insert-if-absent (SQL: ON CONFLICT DO NOTHING; Mongo: "
+        "unique-index insert) that never overwrites an existing doc row"
     ),
     ("scripts/bench_graph_backends.py", "ingest_to_store"): "developer benchmark",
     ("scripts/seed_ontology.py", "seed"): "operator seeding tool, binds a principal",
