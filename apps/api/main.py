@@ -660,6 +660,8 @@ def query_ontology(
         ctx.settings.local_data_dir,
         scope=scope,
         raise_on_error=False,
+        sql=ctx.sql,
+        principal=auth.principal,
     )
 
     outcome = ctx.hybrid.query(
