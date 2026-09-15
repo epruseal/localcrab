@@ -778,3 +778,48 @@ def test_migrate_preflight_neo4j_driver_args():
     # 핵심: Neo4j driver 에 전달된 인자만 박제 (auth 튜플, 옵션 없음).
     assert capture["uri"] == "bolt://mig:7687"
     assert capture["kwargs"] == {"auth": ("mu", "mp")}
+
+
+# ---------------------------------------------------------------------------
+# #382: import 스크립트와 bench 스크립트의 줄 단위 JSONL 읽기는 레코드 경계를
+#       LF 하나로만 인식한다.
+# ---------------------------------------------------------------------------
+
+
+def test_import_script_iter_jsonl_preserves_lone_cr(tmp_path):
+    """import_pack_graph_to_neo4j.iter_jsonl 은 구조적 CR 을 레코드 경계로 삼지
+    않는다(#382)."""
+    p = tmp_path / "rows.jsonl"
+    with p.open("w", encoding="utf-8", newline="") as f:
+        f.write('{"id":\r"n1"}\n{"id":"n2"}\n')
+
+    assert list(_imp_pkg.iter_jsonl(p)) == [{"id": "n1"}, {"id": "n2"}]
+
+
+_bench_pkg = _load_module_from_path("bench_pkg_char", "scripts/bench_graph_backends.py")
+
+
+def test_bench_load_nodes_preserves_lone_cr(tmp_path, monkeypatch):
+    """bench_graph_backends.load_nodes 는 구조적 CR 을 레코드 경계로 삼지
+    않는다(#382)."""
+    nodes_path = tmp_path / "nodes.jsonl"
+    with nodes_path.open("w", encoding="utf-8", newline="") as f:
+        f.write('{"id":\r"n1"}\n{"id":"n2"}\n')
+    monkeypatch.setattr(_bench_pkg, "NODES_JSONL", nodes_path)
+
+    nodes = _bench_pkg.load_nodes(10)
+
+    assert nodes == [{"id": "n1"}, {"id": "n2"}]
+
+
+def test_bench_load_edges_preserves_lone_cr(tmp_path, monkeypatch):
+    """bench_graph_backends.load_edges 는 구조적 CR 을 레코드 경계로 삼지
+    않는다(#382)."""
+    edges_path = tmp_path / "edges.jsonl"
+    with edges_path.open("w", encoding="utf-8", newline="") as f:
+        f.write('{"from_id":\r"n1","to_id":"n2"}\n')
+    monkeypatch.setattr(_bench_pkg, "EDGES_JSONL", edges_path)
+
+    edges = _bench_pkg.load_edges({"n1", "n2"})
+
+    assert edges == [{"from_id": "n1", "to_id": "n2"}]

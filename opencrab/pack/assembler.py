@@ -18,7 +18,16 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # newline="" 로 열어 번역 없이 통째로 읽은 뒤 split("\n") 으로 LF 만 경계로 삼는다.
+    # splitlines() 는 VT/FF/FS/GS/RS/NEL/U+2028/U+2029 까지 줄 경계로 잡는다. 이 가운데
+    # NEL/U+2028/U+2029 는 이스케이프 없이 JSON 문자열 값 안에 나타날 수 있어, splitlines()
+    # 를 쓰면 그 값 안의 문자가 레코드를 조용히 쪼갠다. VT/FF/FS/GS/RS 는 JSON 문법
+    # 어디에도 유효하지 않지만 splitlines() 는 이들도 여전히 경계로 잡는다(#382).
+    # Path.read_text(newline=...) 는 3.13 부터라 이 저장소의 최소 버전(3.11)에서
+    # 못 쓴다(open(newline="") + read() 로 대체).
+    with path.open(encoding="utf-8", newline="") as f:
+        text = f.read()
+    for line in text.split("\n"):
         if line.strip():
             rows.append(json.loads(line))
     return rows
@@ -31,7 +40,12 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in rows), encoding="utf-8")
+    # newline="\n": 읽기 계약(_read_jsonl)과 대칭인 플랫폼 무관 쓰기 계약(#382).
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in rows),
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 
