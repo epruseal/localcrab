@@ -1201,10 +1201,11 @@ def packs_list() -> None:
     from opencrab.ontology.pack_registry import load_pack_registry
     from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
 
-    # #147: the same on-disk manifest registry is already filtered by scope
-    # for auto_pack candidate selection (pack_selection.resolve_packs) --
-    # leaving this command unfiltered would be self-contradictory (a pack
-    # this command would refuse to auto-select is still listed here with its
+    # #147: auto_pack candidate selection (pack_selection.resolve_packs)
+    # already filters by scope, sourcing its candidates from the SQL packs
+    # table (#397) with the on-disk manifest only enriching fields -- leaving
+    # this command unfiltered would be self-contradictory (a pack this
+    # command would refuse to auto-select is still listed here with its
     # title, node/edge counts and path exposed) and, per invariant 7, would
     # leak the existence of someone else's private pack.
     try:

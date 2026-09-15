@@ -1,8 +1,11 @@
 """Shared pack-selection logic for the MCP and CLI query paths.
 
 Both ``ontology_query`` (MCP) and the ``query`` CLI command derive the effective
-pack filter from the same ``choose_packs`` + ``load_pack_registry`` logic.
-Previously each re-implemented the ~5 lines around it with its own warning
+pack filter from the same ``resolve_packs`` logic. Auto_pack's candidate pool
+is the SQL ``packs`` table (``list_packs_for``, #397); ``load_pack_registry``
+(the on-disk manifest scan) only enriches fields that have no SQL equivalent
+(``source_label``/``keywords``/``tags``) via ``build_candidate_registry``.
+Previously each caller re-implemented the ~5 lines around it with its own warning
 wording, delivery channel (MCP appends to a ``pack_filter.warnings`` list; CLI
 echoes to stderr) and error policy (MCP swallows exceptions and degrades; CLI
 lets them propagate).
