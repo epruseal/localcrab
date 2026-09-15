@@ -317,6 +317,32 @@ class TestDocOnlyPromotion:
         assert results[0].outcome == "skipped_conflict"
         assert results[0].reason == "concurrent_graph_write"
 
+    def test_property_change_between_diagnosis_and_apply_does_not_crash_tool(self, graph_store, doc_store):
+        """결함1 회귀: 진단 통과 후 적용 직전에 문서 속성이 예약키로 바뀌면
+        _promote_one() 의 prepare_node() 재호출이 예외를 전파하지 않고
+        skipped_rejected 로 격리돼야 하고, 이어지는 다른 행은 계속 승격돼야
+        한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        doc_store.upsert_node_doc("space-a", "Concept", "d2", {"y": 2})
+
+        report = recon.diagnose(graph_store, doc_store)
+        rows_by_id = {row.node_id: row for row in report.doc_only}
+        assert rows_by_id["d1"].healable is True
+        assert rows_by_id["d2"].healable is True
+
+        # 진단 통과 후, 적용 직전에 다른 프로세스가 d1 의 문서 속성을 예약키로
+        # 덮어썼다고 가정한다.
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"id": "MISMATCHED_ID"})
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=True)
+
+        results_by_id = {r.node_id: r for r in results}
+        assert results_by_id["d1"].outcome == "skipped_rejected"
+        assert results_by_id["d1"].reason.startswith(recon.REASON_PROMOTION_REJECTED_AT_APPLY)
+        assert graph_store.get_node("Concept", "d1") is None
+        assert results_by_id["d2"].outcome == "healed"
+        assert graph_store.get_node("Concept", "d2") is not None
+
 
 # ---------------------------------------------------------------------------
 # schema_state / 백엔드 거부 (3절/5-3절)
@@ -341,7 +367,7 @@ class TestSchemaStateRejection:
 
     def test_fresh_schema_state_rejects_apply_via_main(self, doc_store, monkeypatch):
         fake_graph = _FakeGraphStore(schema_state="fresh")
-        monkeypatch.setattr(recon, "_build_stores", lambda args: (fake_graph, doc_store, "local"))
+        monkeypatch.setattr(recon, "_build_stores", lambda args: (fake_graph, doc_store, "local", "/unused"))
 
         exit_code = recon.main(["--local-data-dir", "/unused", "--apply", "--skip-backup"])
         assert exit_code == recon.EXIT_REJECTED
@@ -423,6 +449,23 @@ class TestMainCli:
         )
         assert exit_code == recon.EXIT_USAGE
 
+    def test_apply_backup_resolves_local_data_dir_when_flag_omitted(self, tmp_path, monkeypatch):
+        """결함2 회귀: --local-data-dir 를 생략하고 LOCAL_DATA_DIR 환경변수로만
+        데이터 디렉터리를 지정해도, 백업이 그 해석된 경로를 받아야 한다(원시
+        --local-data-dir 인자를 그대로 넘기면 None 이라 TypeError 로 죽는다)."""
+        data_dir = self._make_target_dirs(tmp_path)
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(data_dir))
+        backup_dest = tmp_path / "backup-dest"
+        backup_dest.mkdir()
+
+        exit_code = recon.main(
+            ["--apply", "--backup-to", str(backup_dest), "--record-to", str(tmp_path / "run.jsonl")]
+        )
+
+        assert exit_code == recon.EXIT_OK
+        assert backup_dest.exists()
+        assert any(backup_dest.iterdir()), "백업 대상 디렉터리에 산출물이 남아야 한다"
+
     def test_apply_writes_execution_record_with_correct_directions(self, tmp_path, capsys):
         data_dir = self._make_target_dirs(tmp_path)
         record_path = tmp_path / "run.jsonl"
@@ -474,6 +517,37 @@ class TestMainCli:
 
         doc = LocalSQLDocStore(str(data_dir / "doc_store.db")).get_node_doc("space-a", "g1")
         assert doc is not None, "기록 파일 실패 전에 이미 끝난 스토어 쓰기가 롤백되면 안 된다"
+
+
+class TestFormatReportHealSummary:
+    def test_skipped_outcomes_get_distinct_labels_and_per_row_reasons(self):
+        """결함3 회귀: skipped_rejected 가 기존 건너뜀(이미 존재/동시 충돌)
+        한 줄 합계에 말없이 섞이지 않고, outcome 별로 개별 라벨과 사유가
+        보여야 한다."""
+        report = recon.DiagnosisReport(schema_state="target")
+        heal_results = [
+            recon.HealResult("g1", "space-a", "backfill", "healed"),
+            recon.HealResult("d1", "space-a", "promotion", "healed"),
+            recon.HealResult("g2", "space-a", "backfill", "skipped_exists"),
+            recon.HealResult("d2", "space-a", "promotion", "skipped_conflict", "concurrent_graph_write"),
+            recon.HealResult(
+                "d3",
+                "space-a",
+                "promotion",
+                "skipped_rejected",
+                f"{recon.REASON_PROMOTION_REJECTED_AT_APPLY}: ValueError: reserved graph property",
+            ),
+        ]
+
+        out = recon.format_report(report, heal_results=heal_results)
+
+        assert "건너뜀(이미 존재/동시 충돌)" not in out
+        assert "건너뜀(이미 존재): 1건" in out
+        assert "건너뜀(동시 충돌): 1건" in out
+        assert "건너뜀(적용 거부): 1건" in out
+        assert "node_id=d3" in out
+        assert "outcome=skipped_rejected" in out
+        assert recon.REASON_PROMOTION_REJECTED_AT_APPLY in out
 
 
 # ---------------------------------------------------------------------------
