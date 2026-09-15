@@ -108,6 +108,80 @@ class TestNodeDoc:
 
 
 # ---------------------------------------------------------------------------
+# create_node_doc_if_absent (issue #317)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateNodeDocIfAbsent:
+    def test_creates_when_absent(self, store):
+        result = store.create_node_doc_if_absent("s1", "Person", "alice", {"name": "Alice"})
+        assert result == "created"
+        doc = store.get_node_doc("s1", "alice")
+        assert doc["node_type"] == "Person"
+        assert doc["properties"] == {"name": "Alice"}
+
+    def test_reports_exists_and_does_not_overwrite(self, store):
+        store.upsert_node_doc("s1", "Person", "alice", {"name": "Alice"})
+        result = store.create_node_doc_if_absent("s1", "Person", "alice", {"name": "SHOULD_NOT_LAND"})
+        assert result == "exists"
+        doc = store.get_node_doc("s1", "alice")
+        assert doc["properties"] == {"name": "Alice"}
+
+    def test_same_node_id_different_space_is_independent(self, store):
+        store.upsert_node_doc("s1", "Person", "alice", {"name": "s1 alice"})
+        result = store.create_node_doc_if_absent("s2", "Person", "alice", {"name": "s2 alice"})
+        assert result == "created"
+        assert store.get_node_doc("s1", "alice")["properties"] == {"name": "s1 alice"}
+        assert store.get_node_doc("s2", "alice")["properties"] == {"name": "s2 alice"}
+
+
+# ---------------------------------------------------------------------------
+# iter_node_identities (issue #317)
+# ---------------------------------------------------------------------------
+
+
+class TestIterNodeIdentities:
+    def test_yields_all_identity_triples(self, store):
+        store.upsert_node_doc("s1", "Person", "alice", {"name": "Alice"})
+        store.upsert_node_doc("s1", "Person", "bob", {"name": "Bob"})
+        store.upsert_node_doc("s2", "Concept", "c1", {})
+        result = sorted(store.iter_node_identities())
+        assert result == [
+            ("s1", "alice", "Person"),
+            ("s1", "bob", "Person"),
+            ("s2", "c1", "Concept"),
+        ]
+
+    def test_streams_across_multiple_pages_without_duplicates_or_gaps(self, store):
+        """batch_size smaller than the row count forces keyset pagination
+        (issue #317 6절): this proves the loop advances past the last page's
+        final key instead of re-fetching the same page forever or skipping a
+        row at a page boundary."""
+        for i in range(23):
+            store.upsert_node_doc("s1", "T", f"n{i:03d}", {"i": i})
+        result = list(store.iter_node_identities(batch_size=5))
+        node_ids = [node_id for _space, node_id, _type in result]
+        assert len(node_ids) == 23
+        assert len(set(node_ids)) == 23
+        assert sorted(node_ids) == [f"n{i:03d}" for i in range(23)]
+
+    def test_filters_by_space(self, store):
+        store.upsert_node_doc("s1", "T", "a", {})
+        store.upsert_node_doc("s2", "T", "b", {})
+        result = list(store.iter_node_identities(space="s1"))
+        assert result == [("s1", "a", "T")]
+
+    def test_empty_store_yields_nothing(self, store):
+        assert list(store.iter_node_identities()) == []
+
+    def test_batch_size_zero_or_negative_yields_nothing(self, store):
+        store.upsert_node_doc("s1", "T", "a", {})
+        assert list(store.iter_node_identities(batch_size=0)) == []
+        assert list(store.iter_node_identities(batch_size=-1)) == []
+
+
+
+# ---------------------------------------------------------------------------
 # list_nodes
 # ---------------------------------------------------------------------------
 
@@ -757,6 +831,14 @@ class TestUnavailableStore:
     def test_get_node_doc_raises(self, dead_store):
         with pytest.raises(RuntimeError, match="not available"):
             dead_store.get_node_doc("s", "n")
+
+    def test_create_node_doc_if_absent_raises(self, dead_store):
+        with pytest.raises(RuntimeError, match="not available"):
+            dead_store.create_node_doc_if_absent("s", "T", "n", {})
+
+    def test_iter_node_identities_raises(self, dead_store):
+        with pytest.raises(RuntimeError, match="not available"):
+            list(dead_store.iter_node_identities())
 
     def test_list_nodes_raises(self, dead_store):
         with pytest.raises(RuntimeError, match="not available"):
