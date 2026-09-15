@@ -114,6 +114,88 @@ class TestMongoStoreNormal:
 
         assert store.get_node_doc("s", "missing") is None
 
+    def test_create_node_doc_if_absent_inserts_and_reports_created(self):
+        store, _client, mock_db = _make_connected_store()
+
+        result = store.create_node_doc_if_absent("s", "T", "n1", {"a": 1})
+
+        assert result == "created"
+        mock_db["nodes"].insert_one.assert_called_once()
+        (doc,), _kwargs = mock_db["nodes"].insert_one.call_args
+        assert doc["space"] == "s"
+        assert doc["node_id"] == "n1"
+        assert doc["node_type"] == "T"
+        assert doc["properties"] == {"a": 1}
+
+    def test_create_node_doc_if_absent_mirrors_owner_id_to_top_level(self):
+        store, _client, mock_db = _make_connected_store()
+
+        store.create_node_doc_if_absent("s", "User", "u1", {"owner_id": "owner-1"})
+
+        (doc,), _kwargs = mock_db["nodes"].insert_one.call_args
+        assert doc["owner_id"] == "owner-1"
+
+    def test_create_node_doc_if_absent_reports_exists_on_duplicate_key(self):
+        """issue #317 5-2절: a concurrent writer winning the unique index on
+        (space, node_id) must be reported as "exists", not raised, and must
+        NOT retry with an overwrite -- that is exactly the race this method
+        exists to avoid (unlike upsert_node_doc's unconditional $set)."""
+        from pymongo.errors import DuplicateKeyError
+
+        store, _client, mock_db = _make_connected_store()
+        mock_db["nodes"].insert_one.side_effect = DuplicateKeyError("E11000 duplicate key")
+
+        result = store.create_node_doc_if_absent("s", "T", "n1", {"a": "SHOULD_NOT_MATTER"})
+
+        assert result == "exists"
+        mock_db["nodes"].insert_one.assert_called_once()
+
+    def test_iter_node_identities_yields_triples_from_cursor(self):
+        store, _client, mock_db = _make_connected_store()
+        cursor = mock_db["nodes"].find.return_value
+        cursor.batch_size.return_value = [
+            {"space": "s1", "node_id": "a", "node_type": "T"},
+            {"space": "s1", "node_id": "b", "node_type": "T"},
+        ]
+
+        result = list(store.iter_node_identities())
+
+        assert result == [("s1", "a", "T"), ("s1", "b", "T")]
+        mock_db["nodes"].find.assert_called_once_with(
+            {}, {"_id": 0, "space": 1, "node_id": 1, "node_type": 1}
+        )
+
+    def test_iter_node_identities_filters_by_space(self):
+        store, _client, mock_db = _make_connected_store()
+        cursor = mock_db["nodes"].find.return_value
+        cursor.batch_size.return_value = []
+
+        list(store.iter_node_identities(space="s1"))
+
+        mock_db["nodes"].find.assert_called_once_with(
+            {"space": "s1"}, {"_id": 0, "space": 1, "node_id": 1, "node_type": 1}
+        )
+
+    def test_iter_node_identities_never_calls_limit(self):
+        """Unlike list_nodes, this must stream the full collection -- calling
+        .limit() here would silently reintroduce a cap (issue #317 6절)."""
+        store, _client, mock_db = _make_connected_store()
+        cursor = mock_db["nodes"].find.return_value
+        cursor.batch_size.return_value = []
+
+        list(store.iter_node_identities())
+
+        cursor.limit.assert_not_called()
+
+    def test_iter_node_identities_missing_node_type_defaults_empty_string(self):
+        store, _client, mock_db = _make_connected_store()
+        cursor = mock_db["nodes"].find.return_value
+        cursor.batch_size.return_value = [{"space": "s1", "node_id": "a"}]
+
+        result = list(store.iter_node_identities())
+
+        assert result == [("s1", "a", "")]
+
     def test_list_nodes_filters_by_space_when_given(self):
         store, _client, mock_db = _make_connected_store()
         cursor = mock_db["nodes"].find.return_value
@@ -286,6 +368,8 @@ class TestMongoStoreUnavailableContract:
         [
             lambda s: s.upsert_node_doc("sp", "T", "n1", {}),
             lambda s: s.get_node_doc("sp", "n1"),
+            lambda s: s.create_node_doc_if_absent("sp", "T", "n1", {}),
+            lambda s: list(s.iter_node_identities()),
             lambda s: s.list_nodes(),
             lambda s: s.delete_node_doc("sp", "n1"),
             lambda s: s.upsert_source("src1", "text", {}),

@@ -56,9 +56,9 @@ from __future__ import annotations
 
 import abc
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from opencrab.stores._graph_common import _as_dict
 from opencrab.stores._json import dump_props
@@ -270,6 +270,96 @@ class _SqlDocStoreBase(abc.ABC):
         if row is None:
             return None
         return self._row_to_node(row)
+
+    def create_node_doc_if_absent(
+        self, space: str, node_type: str, node_id: str, properties: dict[str, Any]
+    ) -> Literal["created", "exists"]:
+        """Insert-if-absent counterpart to ``upsert_node_doc`` (issue #317
+        5-2절): ``upsert_node_doc`` is an unconditional ``DO UPDATE``, which
+        is the right contract for a caller that owns the row's content, but
+        wrong for graph-only backfill -- if another process wrote this row
+        between diagnosis and this call, ``upsert_node_doc`` would silently
+        overwrite it with the (possibly stale) properties this call was
+        reconstructing from the graph side. ``ON CONFLICT (space, node_id)
+        DO NOTHING`` plus a rowcount check tells the caller which happened,
+        mirroring ``_sql_graph_base.py::upsert_node``'s own insert-then-check
+        pattern for the same identity-race reason.
+        """
+        self._require_available()
+        now = datetime.now(UTC)
+        sql = self._dialect.insert(
+            self._table("doc_nodes"),
+            ["space", "node_id", "node_type", "properties", "updated_at"],
+            json_columns=["properties"],
+        ) + "\nON CONFLICT (space, node_id) DO NOTHING"
+        rowcount = self._exec_write(
+            sql,
+            {
+                "space": space,
+                "node_id": node_id,
+                "node_type": node_type,
+                "properties": dump_props(properties),
+                "updated_at": self._dialect.bind_value_for_timestamp(now),
+            },
+        )
+        return "created" if rowcount else "exists"
+
+    def iter_node_identities(
+        self, space: str | None = None, batch_size: int = 5000
+    ) -> Iterator[tuple[str, str, str]]:
+        """Stream ``(space, node_id, node_type)`` for every row, unbounded
+        (issue #317 3절/6절) -- a purpose-built, narrow-contract sibling of
+        ``_sql_graph_base.py::export_nodes``, not a reuse of that name: that
+        method is a capped (``limit=500_000`` default), fully-materializing
+        ``list[dict]`` of full rows for display/API callers, while
+        reconciliation needs only identity triples, streamed, with no cap,
+        so that a corpus larger than the cap is not silently truncated and
+        large ``properties`` blobs are never loaded into memory at all.
+
+        Implemented as keyset pagination over the ``(space, node_id)``
+        primary key, since ``_fetch_all`` always fully materializes its
+        result and this base has no server-side-cursor hook -- row-value
+        comparison (``WHERE (space, node_id) > (:last_space, :last_node_id)``)
+        is supported by both dialects (SQLite since 3.24, already assumed
+        elsewhere in this file's ``ON CONFLICT ... DO UPDATE`` upsert; see
+        ``_sql_dialect.py``'s "ROWID STABILITY" note).
+        """
+        self._require_available()
+        if batch_size <= 0:
+            return
+        table = self._table("doc_nodes")
+        last_space = ""
+        last_node_id = ""
+        while True:
+            if space:
+                sql = (
+                    f"SELECT space, node_id, node_type FROM {table}"
+                    f" WHERE space=:space AND (space, node_id) > (:last_space, :last_node_id)"
+                    f" ORDER BY space, node_id LIMIT :batch"
+                )
+                params = {
+                    "space": space,
+                    "last_space": last_space,
+                    "last_node_id": last_node_id,
+                    "batch": batch_size,
+                }
+            else:
+                sql = (
+                    f"SELECT space, node_id, node_type FROM {table}"
+                    f" WHERE (space, node_id) > (:last_space, :last_node_id)"
+                    f" ORDER BY space, node_id LIMIT :batch"
+                )
+                params = {"last_space": last_space, "last_node_id": last_node_id, "batch": batch_size}
+            rows = self._fetch_all(sql, params)
+            if not rows:
+                return
+            for row in rows:
+                row_space = self._row_get(row, "space")
+                row_node_id = self._row_get(row, "node_id")
+                row_node_type = self._row_get(row, "node_type")
+                yield (row_space, row_node_id, row_node_type)
+            last_space = self._row_get(rows[-1], "space")
+            last_node_id = self._row_get(rows[-1], "node_id")
 
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         """``limit <= 0`` (issue #120 follow-up): returns ``[]`` without
