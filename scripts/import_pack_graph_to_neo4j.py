@@ -40,8 +40,9 @@ VALID_REL_TYPES = {"CONTAINS", "SUPPORTS"}
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     # newline="\n": 레코드 경계를 LF 하나로 고정한다. 기본값의 universal-newlines
-    # 번역은 홑 CR 도 줄 경계로 삼아, JSON 문자열 값 안에 구조적으로 유효한 CR 이
-    # 있으면 그 레코드를 조용히 쪼갠다(#382).
+    # 번역은 홑 CR 도 줄 경계로 삼는다. CR 은 이스케이프 없이는 JSON 문자열 값 안에
+    # 못 쓰지만, 토큰 사이 공백으로는 유효하다. 콜론이나 쉼표 뒤처럼 토큰 사이에
+    # CR 이 있으면 그 레코드를 조용히 쪼갠다(#382).
     with path.open(encoding="utf-8", newline="\n") as handle:
         for line in handle:
             if line.strip():

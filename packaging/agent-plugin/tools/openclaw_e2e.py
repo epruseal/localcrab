@@ -115,8 +115,10 @@ def _parse_frames(raw: str) -> list[dict]:
     """
     frames = []
     # split("\n"): 레코드 경계를 LF 하나로 고정한다. splitlines() 는 VT/FF/FS/GS/RS/
-    # NEL/U+2028/U+2029 까지 경계로 잡아, JSON 문자열 값 안에 유효하게 나타날 수 있는
-    # 이 문자들이 있으면 프레임을 조용히 쪼갠다(#382).
+    # NEL/U+2028/U+2029 까지 줄 경계로 잡는다. 이 가운데 NEL/U+2028/U+2029 는 이스케이프
+    # 없이 JSON 문자열 값 안에 나타날 수 있어, splitlines() 를 쓰면 그 값 안의 문자가
+    # 프레임을 조용히 쪼갠다. VT/FF/FS/GS/RS 는 JSON 문법 어디에도 유효하지 않지만
+    # splitlines() 는 이들도 여전히 경계로 잡는다(#382).
     for line in raw.split("\n"):
         line = line.strip()
         if not line:

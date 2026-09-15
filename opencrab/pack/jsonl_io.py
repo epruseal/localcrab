@@ -143,8 +143,9 @@ def count_jsonl(path: Path | str) -> int:
     """전 shard 라인수 합 (wc -l 동등, 스트리밍).
 
     `newline="\\n"` 로 열어 레코드 경계를 LF 하나로 고정한다. 기본값(`newline=None`)의
-    universal-newlines 번역은 홑 CR 도 줄 경계로 삼아, JSON 문자열 값 안에 구조적으로
-    유효한 CR 이 있으면 그 레코드를 조용히 둘로 쪼갠다(#382)."""
+    universal-newlines 번역은 홑 CR 도 줄 경계로 삼는다. CR 은 이스케이프 없이는
+    JSON 문자열 값 안에 못 쓰지만, 토큰 사이 공백으로는 유효하다. 콜론이나 쉼표
+    뒤처럼 토큰 사이에 CR 이 있으면 그 레코드를 조용히 둘로 쪼갠다(#382)."""
     return sum(sum(1 for _ in open(p, encoding="utf-8", newline="\n")) for p in shard_paths(path))
 
 

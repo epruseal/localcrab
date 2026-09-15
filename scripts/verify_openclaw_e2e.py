@@ -69,9 +69,10 @@ def read(p: Path, *, errors: str = "replace") -> str:
     universal-newlines 번역은 열기 시점에 이미 CR 을 LF 로 합쳐, 하류
     `_parse_frames`/`verify_evidence` 가 CR 을 볼 기회 자체를 없앤다, #382).
     `Path.read_text(newline=...)` 는 Python 3.13 부터라 이 저장소의 최소 버전(3.11)
-    에서 못 쓴다(open(newline="") + read() 로 대체). `newline=""` 는 `.read()` 로
-    전체를 한 번에 읽을 때만 번역 없음을 보장하므로(줄 단위 반복에는 적용되지
-    않는다), 반드시 이 형태를 유지한다."""
+    에서 못 쓴다(open(newline="") + read() 로 대체). `newline=""` 는 문자 번역만
+    막는다. 줄 단위로 반복하면 CR 은 번역되지 않은 채로도 여전히 줄 경계로
+    인식돼 나뉜다. 이 함수처럼 `.read()` 로 전체를 한 번에 읽어야 그 경계
+    인식 자체가 일어나지 않으므로, 반드시 이 형태를 유지한다."""
     if not p.exists():
         return ""
     with p.open(encoding="utf-8", newline="", errors=errors) as f:
