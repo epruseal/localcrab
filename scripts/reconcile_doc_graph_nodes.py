@@ -113,6 +113,7 @@ REASON_NORMALIZATION_ISSUE = "normalization_issue"
 REASON_NODE_TYPE_MISSING = "node_type_missing_or_non_string"
 REASON_PACK_ID_NON_STRING = "pack_id_non_string"
 REASON_PROMOTION_REJECTED = "promotion_rejected"
+REASON_PROMOTION_REJECTED_AT_APPLY = "promotion_rejected_at_apply"
 REASON_DUP_SPACE_NO_GRAPH = "duplicate_space_no_graph_match"
 
 
@@ -154,7 +155,7 @@ class HealResult:
     node_id: str
     space: str | None
     direction: Literal["backfill", "promotion"]
-    outcome: Literal["healed", "skipped_exists", "skipped_conflict"]
+    outcome: Literal["healed", "skipped_exists", "skipped_conflict", "skipped_rejected"]
     reason: str | None = None
 
 
@@ -348,11 +349,23 @@ def _backfill_one(doc_store: Any, row: GraphOnlyRow) -> HealResult:
 
 
 def _promote_one(graph_store: Any, doc_store: Any, row: DocOnlyRow) -> HealResult:
+    """문서 전용 노드를 그래프로 승격한다.
+
+    진단 시점에 이미 ``prepare_node()``로 승격 가능 여부를 확인했더라도,
+    진단과 적용 사이에 문서 속성이 바뀌면 이 재호출이 새로 예외를 던질 수
+    있다(쟁점1과 같은 근거를 적용 지점에도 적용한다). 이 예외를 넓게 잡지
+    않으면 한 행의 검증 실패가 나머지 행 전체 처리를 막고 도구를 비정상
+    종료시킨다.
+    """
     doc_full = doc_store.get_node_doc(row.space, row.node_id)
     properties = doc_full["properties"] if doc_full is not None else {}
-    node_type, props, effective_space, _digest = prepare_node(
-        node_type=row.node_type, node_id=row.node_id, properties=properties, space_id=row.space
-    )
+    try:
+        node_type, props, effective_space, _digest = prepare_node(
+            node_type=row.node_type, node_id=row.node_id, properties=properties, space_id=row.space
+        )
+    except Exception as exc:  # noqa: BLE001 - 쟁점1과 같은 근거를 적용 지점에도 적용한다.
+        reason = f"{REASON_PROMOTION_REJECTED_AT_APPLY}: {type(exc).__name__}: {exc}"
+        return HealResult(row.node_id, row.space, "promotion", "skipped_rejected", reason)
     try:
         graph_store.upsert_node(node_type, row.node_id, props, effective_space)
     except NodeIdentityConflict:
@@ -430,11 +443,18 @@ def format_report(report: DiagnosisReport, heal_results: list[HealResult] | None
     if heal_results is not None:
         healed_backfill = sum(1 for r in heal_results if r.direction == "backfill" and r.outcome == "healed")
         healed_promotion = sum(1 for r in heal_results if r.direction == "promotion" and r.outcome == "healed")
-        skipped = sum(1 for r in heal_results if r.outcome != "healed")
+        skipped_exists = sum(1 for r in heal_results if r.outcome == "skipped_exists")
+        skipped_conflict = sum(1 for r in heal_results if r.outcome == "skipped_conflict")
+        skipped_rejected = sum(1 for r in heal_results if r.outcome == "skipped_rejected")
         lines.append("=== 적용 결과 ===")
         lines.append(f"역채움됨: {healed_backfill}건")
         lines.append(f"승격됨: {healed_promotion}건")
-        lines.append(f"건너뜀(이미 존재/동시 충돌): {skipped}건")
+        lines.append(f"건너뜀(이미 존재): {skipped_exists}건")
+        lines.append(f"건너뜀(동시 충돌): {skipped_conflict}건")
+        lines.append(f"건너뜀(적용 거부): {skipped_rejected}건")
+        for r in heal_results:
+            if r.outcome != "healed":
+                lines.append(f"  [{r.direction}] node_id={r.node_id} space={r.space} outcome={r.outcome} reason={r.reason}")
 
     lines.append("=== 상세 ===")
     for row in report.doc_only:
@@ -468,7 +488,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_stores(args: argparse.Namespace) -> tuple[Any, Any, str]:
+def _build_stores(args: argparse.Namespace) -> tuple[Any, Any, str, str]:
     from opencrab.config import Settings
     from opencrab.stores.factory import make_doc_store, make_graph_store
 
@@ -479,7 +499,7 @@ def _build_stores(args: argparse.Namespace) -> tuple[Any, Any, str]:
     if args.pg_url:
         kwargs["POSTGRES_URL"] = args.pg_url
     settings = Settings(**kwargs)
-    return make_graph_store(settings), make_doc_store(settings), storage_mode
+    return make_graph_store(settings), make_doc_store(settings), storage_mode, settings.local_data_dir
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -489,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         print("--apply 는 --backup-to 또는 --skip-backup 을 요구한다.", file=sys.stderr)
         return EXIT_USAGE
 
-    graph_store, doc_store, storage_mode = _build_stores(args)
+    graph_store, doc_store, storage_mode, local_data_dir = _build_stores(args)
 
     if storage_mode == "pg" and args.backup_to and not args.skip_backup:
         print(
@@ -525,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from opencrab.stores.backup import backup_data_dir
 
-            backup_data_dir(args.local_data_dir, dest_dir=args.backup_to)
+            backup_data_dir(local_data_dir, dest_dir=args.backup_to)
         except BackupError as exc:
             print(f"백업 실패, 어떤 쓰기도 하지 않았다: {exc}", file=sys.stderr)
             return EXIT_BACKUP
