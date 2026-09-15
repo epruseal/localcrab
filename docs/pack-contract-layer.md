@@ -135,6 +135,23 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   라이브 쪽 meta 에서 뺀다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로
   잡히는데, neo4j 의 upsert 는 전달된 키만 SET 하므로 재기록해도 사라지지 않아 그
   재기록이 영구히 반복된다.
+- **노드축 증분 대조는 필터를 걸기 전에 `prepare_node` 로 원본 `props` 를 먼저
+  검증한다(#379).** `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 필터는 값을
+  검증하지 않고 키만 뺀다. 어떤 필터 키 구성에서도 `prepare_node` 검증 단계 없이
+  필터만으로 비교하면 불량 값(중첩 `properties.space` 타입 오류, 중첩
+  `properties.id` 불일치 등)이 필터에 걸러진 뒤 같은 노드로 오인돼 `same` 으로
+  통과할 수 있다(실제로 base 커밋의 필터 구성에서는 `id` 불일치가 우연한 키 집합
+  불일치로 이미 chg 로 걸러졌으나, space 타입 오류는 실제로 통과했다: #379 재현).
+  `add_node` 가 쓰는 정규화/검증 함수를 그대로 재사용해, 전체 적재라면 거부될 값이
+  증분에서만 통과하는 부류를 필터 키 구성과 무관하게 막는다.
+  `prepare_node` 검증에 실패하면 그 행은 `same` 후보에서 빠진다. 이 검증이 비교
+  단계 이후 쓰기 시도가 어느 카운터(skip/chg/err)로 떨어지는지는 정하지 않는다.
+  `prepare_node` 가 반환한 `props` 는 원본에 없어도 `id` 를 항상 채워 넣으므로,
+  `FILE_SIDE_IGNORED_KEYS` 도 #379 부터 `id` 를 포함한다(안 빼면 파일 쪽에만 이
+  키가 구조적으로 남아 값이 같아도 매번 chg 로 어긋난다). `owner_id` 는
+  `prepare_node` 가 값을 손대지 않으므로 대칭화 대상이 아니며, 기존 설계대로
+  `INCREMENTAL_IGNORED_KEYS`(라이브 쪽)에만 남는다: 파일이 owner_id 를 실으면
+  값과 무관하게 항상 chg 로 재기록된다(#378).
 - **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
   파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
   전량 치환하므로 **그 다음 런은 same 으로 복귀한다.** 전량 chg 를 한 번 보는 것 자체는

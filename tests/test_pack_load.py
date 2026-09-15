@@ -571,6 +571,186 @@ class TestLoadNodesIncremental:
         after = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
         assert after["n1"][1] == "resource", (
             "재기록이 일어났는데도 space_id 가 드리프트한 값에 머물러 있다")
+
+    def test_nested_space_type_error_is_not_same(self, live, tmp_path):
+        """**#379.** 중첩 `properties.space` 가 문자열이 아니면(정수 등) 이 값이
+        `same` 판정으로 넘어가면 안 된다. `INCREMENTAL_IGNORED_KEYS`/
+        `FILE_SIDE_IGNORED_KEYS` 가 `space` 키를 비교에서 빼는 필터라서, 필터가
+        걸리기 **전에** `prepare_node` 로 값 자체를 검증하지 않으면 이 불량
+        값이 비교에서 통째로 사라져 같은 노드로 오인된다. 전체 적재라면
+        `prepare_node` 가 즉시 거부하는 값이다.
+
+        이 검사는 `same` 이 아님만 본다. 비교 단계 거부 뒤 쓰기 시도가
+        skip/chg/err 어느 카운터로 떨어지는지는 이 설계가 약속하지 않는다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept",
+                                  properties={"space": 12345})])
+        n_same = _run(f2)[2]
+        assert n_same == 0, (
+            "중첩 properties.space 타입 오류가 same 으로 통과했다. "
+            "전체 적재라면 거부될 값이 증분에서만 통과한다(#379)")
+
+    def test_nested_space_nan_is_not_same(self, live, tmp_path):
+        """**#379.** 중첩 `properties.space` 가 NaN 이어도 같은 부류다. NaN 은
+        `normalize_space` 의 문자열 타입 검사가 아니라, 그보다 먼저 실행되는
+        `normalize_node_properties` 내부 `_validate_json` 의 유한값 검사에서
+        거부된다(정수 `12345` 를 거부하는 코드 경로와 다르다). 이 값도
+        same 으로 통과하지 않는지 별도 독립 조건으로 확인한다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept",
+                                  properties={"space": float("nan")})])
+        n_same = _run(f2)[2]
+        assert n_same == 0, "중첩 properties.space 의 NaN 값이 same 으로 통과했다(#379)"
+
+    def test_nested_id_mismatch_is_not_same_regardless_of_filter_config(self, live, tmp_path):
+        """**#379.** 중첩 `properties.id` 가 노드 id 와 다르면 거부돼야 한다.
+
+        이 검출은 `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 가 "id" 를
+        얼마나 넓게 거르는지에 기대지 않는다. `prepare_node` 자신의
+        `normalize_node_properties` 가 필터 실행 전에 이 불일치를 거부하므로,
+        필터 키 구성을 바꿔도(#379 설계가 닫는 부류) 이 검출은 유지된다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept",
+                                  properties={"id": "OTHER_ID"})])
+        n_same = _run(f2)[2]
+        assert n_same == 0, "중첩 properties.id 불일치가 same 으로 통과했다(#379)"
+
+    def test_file_side_owner_id_mismatch_is_not_same(self, live, tmp_path):
+        """**#379 회귀(이중검증에서 발견).** `owner_id` 는 `prepare_node` 가
+        값을 손대지 않는 별도 스탬프 필드다. 기존 설계(위 상수 주석, #358)는
+        `owner_id` 를 **라이브 쪽에서만** 필터에서 빼, 파일이 유효한 값의
+        중첩 `properties.owner_id` 를 실으면 값이 뭐든 키 집합 자체가 달라
+        항상 `chg` 로 재기록되게 했다(#378 관찰). `prepare_node` 도입으로
+        비교 딕셔너리를 만들 때 이 비대칭을 실수로 없애면, 파일 쪽
+        `owner_id` 값이 라이브와 달라도 same 으로 통과해 재스탬프가 영영
+        일어나지 않는 결함이 생긴다. 이 값은 유효한 문자열이라 `prepare_node`
+        검증 자체는 통과하므로, 검증 거부가 아니라 비교 단계의 비대칭
+        유지만 이 테스트의 대상이다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept",
+                                  properties={"owner_id": "other-owner"})])
+        n_new, n_chg, n_same, _skip, _err = _run(f2)[:5]
+        assert (n_new, n_same) == (0, 0), (
+            "파일 쪽 중첩 properties.owner_id 불일치가 same 으로 통과했다"
+            "(#379, owner_id 라이브측 전용 필터 비대칭 회귀)")
+        assert n_chg == 1, "owner_id 불일치는 chg 로 재기록돼야 한다(#358 비대칭 유지)"
+
+    def test_codex_r6_counterexample_is_not_same(self, live, tmp_path):
+        """**#379, codex 설계검증 6라운드 반례.** 최상위 `space=None` + 중첩
+        `properties.space="concept"` + `owner_id=NaN` 세 조건이 겹쳐도 `same`
+        으로 넘어가면 안 된다. `owner_id` 는 `prepare_node` 가 손대지 않는
+        별도 스탬프 필드라(#378 로 이관) 이 검사는 그 값이 어떤 경로로
+        재기록되는지 따지지 않는다. same 이 아니라는 사실만 본다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space=None,
+                                  properties={"space": "concept", "owner_id": float("nan")})])
+        n_same = _run(f2)[2]
+        assert n_same == 0, (
+            "space=null + 중첩 concept + owner_id NaN 조합이 same 으로 통과했다(#379)")
+
+    def test_normalized_space_reassignment_avoids_false_doc_row_missing(
+            self, live, tmp_path, caplog):
+        """**#379 설계 3장 후반부 약속.** `prepare_node` 검증에 성공하면 이후
+        처리(`#301` 이 보는 "현재 행의 space")가 참조하는 지역 변수를
+        정규화된 `space` 로 재대입해야 한다. 이 파일의 최상위 `space` 는
+        `None` 이고 중첩 `properties.space` 만 `"concept"` 를 실어, 두 값이
+        정규화 전에는 다르다(`prepare_node` 가 성공적으로 `"concept"` 로
+        합친다). 재대입을 빼면 이 함수가 doc 조회에 원본 `None` 을 써
+        실재하는 `concept/n1` doc 행을 유실로 오판해 `#301` 의
+        `doc_row_missing` 회수 카운터가 거짓으로 올라가고 skip 으로
+        떨어진다. 이 값은 owner_id 를 싣지 않아 `prepare_node` 검증 자체는
+        통과하므로, 검증 거부가 아니라 재대입 유무만 이 테스트의 대상이다.
+        """
+        builder, graph, docs = live
+
+        def _run(f):
+            state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+            return pack_load.load_nodes_incremental(
+                "pack-1", f, builder, {}, state["nodes"], graph, docs,
+                state["doc_node_spaces"])
+
+        f1 = _write_jsonl(tmp_path / "n1.jsonl",
+                           [_node(id="n1", node_type="Concept", space="concept")])
+        assert _run(f1)[:5] == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
+
+        f2 = _write_jsonl(tmp_path / "n2.jsonl",
+                           [_node(id="n1", node_type="Concept", space=None,
+                                  properties={"space": "concept"})])
+        with caplog.at_level(logging.WARNING):
+            n_new, n_chg, n_same, skip, err, _bypack_ids = _run(f2)
+        assert (n_new, n_chg, skip, err) == (0, 0, 0, 0), (
+            "정규화 후 같은 노드는 same 이어야 한다"
+            f"(n_new={n_new} n_chg={n_chg} skip={skip} err={err})")
+        assert n_same == 1, "최상위/중첩 space 표현만 다르고 정규화 값은 같으면 same 이어야 한다"
+        assert not any("doc 행 유실 회수" in r.getMessage() for r in caplog.records), (
+            "space 재대입 누락으로 존재하는 doc 행을 유실로 오판했다(#301 오경보, #379)")
+
+
 class TestLoadEdges:
     def _map(self):
         return {"n1": ("resource", "Document"), "n2": ("resource", "Document")}
