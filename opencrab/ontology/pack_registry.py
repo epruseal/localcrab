@@ -7,6 +7,7 @@ Public API:
     get_pack(local_data_dir, pack_id)
     choose_packs(question, packs, min_score=...)
     score_pack(question, pack)
+    build_candidate_registry(sql_rows, fs_packs)
 
 Auto-pack scoring is deterministic and keyword-based (no LLM). The first
 implementation returns only the top-1 candidate above ``min_score``; multi-
@@ -307,6 +308,50 @@ def choose_packs(
             scored.append((pack, score, matched))
     scored.sort(key=lambda item: item[1], reverse=True)
     return scored[: max(1, limit)]
+
+
+def build_candidate_registry(
+    sql_rows: list[dict[str, Any]], fs_packs: list[PackInfo]
+) -> list[PackInfo]:
+    """Merge SQL ``packs`` rows with filesystem manifest data into ``PackInfo``.
+
+    #397: the SQL rows define the candidate scope. A pack_id that exists
+    only in a filesystem manifest, with no matching SQL row, does not enter
+    the returned list -- the SQL ``packs`` table is the read-scope authority
+    (#143), so admitting a manifest-only pack here would open a path around
+    that scope. ``title``/``description`` come from the SQL row when it has
+    a non-empty value; the manifest fills them only when the SQL row does
+    not, since ``pack_publish`` keeps the SQL row current while the
+    manifest is a load-time snapshot. Every other field
+    (``source_label``, ``source_url``, ``keywords``, ``tags``, ``counts``,
+    ``path``, ``manifest_path``) is manifest-only data with no SQL
+    equivalent, so it is copied over whenever a manifest for the same
+    pack_id exists and left at the ``PackInfo`` default otherwise.
+    """
+    fs_by_id = {p.pack_id: p for p in fs_packs}
+    registry: list[PackInfo] = []
+    for row in sql_rows:
+        pack_id = row["pack_id"]
+        fs = fs_by_id.get(pack_id)
+        title = row.get("title") or (fs.title if fs else "") or ""
+        description = row.get("description") or (fs.description if fs else "") or ""
+        registry.append(
+            PackInfo(
+                pack_id=pack_id,
+                title=title,
+                description=description,
+                version=fs.version if fs else "",
+                source_label=fs.source_label if fs else None,
+                source_url=fs.source_url if fs else None,
+                path=fs.path if fs else Path(),
+                manifest_path=fs.manifest_path if fs else Path(),
+                counts=dict(fs.counts) if fs else {},
+                keywords=list(fs.keywords) if fs else [],
+                tags=list(fs.tags) if fs else [],
+                raw=dict(fs.raw) if fs else {},
+            )
+        )
+    return registry
 
 
 # ---------------------------------------------------------------------------

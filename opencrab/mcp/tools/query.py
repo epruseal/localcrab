@@ -165,6 +165,8 @@ def ontology_query(
         cfg.local_data_dir,
         scope=scope,
         raise_on_error=False,
+        sql=ctx["sql"],
+        principal=principal,
     )
     effective_pack_ids = selection.effective_pack_ids
     selected_packs = selection.selected_packs

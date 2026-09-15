@@ -32,7 +32,6 @@ is exactly the bug #147 had to fix.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1097,81 +1096,113 @@ class TestSearchNodesScoping:
 
 
 class TestPackSelectionScoping:
-    def _registry_dir(self, tmp_path, pack_id: str) -> str:
-        """A manifest on disk for a pack the caller does NOT own.
+    """#397: auto_pack's candidate source moved from a filesystem manifest
+    scan to ``list_packs_for`` (the SQL ``packs`` table) -- these tests now
+    build real SQL rows via ``create_pack`` instead of writing a
+    manifest.json nobody's SQL row backs. The scope-before-scoring
+    invariant from #147 (a pack the caller cannot read never becomes a
+    candidate, however well it matches) is unchanged; only the source of
+    the candidates moved.
+    """
 
-        ``load_pack_registry`` scans the data directory with no notion of
-        ownership, which is why auto_pack has to intersect before scoring.
-        """
-        d = tmp_path / "packs" / pack_id / "stage"
-        d.mkdir(parents=True)
-        (d / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "pack_id": pack_id,
-                    "title": "quantum widget research",
-                    "description": "quantum widget research",
-                    "version": "1",
-                }
-            ),
-            encoding="utf-8",
-        )
-        return str(tmp_path)
-
-    def test_auto_pack_will_not_select_a_pack_outside_the_scope(self, tmp_path):
+    def test_auto_pack_will_not_select_a_pack_outside_the_scope(self, sql, users):
+        from opencrab.pack.ownership import create_pack
         from opencrab.services.pack_selection import resolve_packs
 
-        data_dir = self._registry_dir(tmp_path, PACK_B)
+        alice = users["alice"]
+        # A second bob-owned pack, titled so it would win auto_pack scoring
+        # outright if scoping were not applied before scoring.
+        bob_match = create_pack(
+            sql, users["bob"].user_id,
+            "pack-b-match",
+            title="quantum widget research",
+            description="quantum widget research",
+        )
+
         sel = resolve_packs(
             "quantum widget research",
             None,
             True,
             False,
-            data_dir,
+            "/nonexistent-local-data-dir",
             scope=frozenset({PACK_A}),
             raise_on_error=False,
+            sql=sql,
+            principal=alice,
         )
-        assert sel.selected_packs == []
+        assert all(p["pack_id"] != bob_match for p in sel.selected_packs)
+        assert bob_match not in sel.effective_pack_ids
+
+    def test_sql_registered_pack_with_no_manifest_is_a_valid_candidate(self, sql, users):
+        """The #397 root cause, made positive: a pack that exists only as a
+        SQL row (no manifest.json anywhere -- the 185-of-186 case from the
+        2026-09-15 measurement) must still be selectable by auto_pack."""
+        from opencrab.services.pack_selection import resolve_packs
+
+        alice = users["alice"]
+        sel = resolve_packs(
+            "Alice private",
+            None,
+            True,
+            False,
+            "/nonexistent-local-data-dir",
+            scope=frozenset({PACK_A, PACK_PUBLIC}),
+            raise_on_error=False,
+            sql=sql,
+            principal=alice,
+        )
+        assert sel.selected_packs and sel.selected_packs[0]["pack_id"] == PACK_A
         assert sel.effective_pack_ids == [PACK_A]
 
-    def test_requested_out_of_scope_pack_does_not_fall_back_to_auto_pack(self, tmp_path):
+    def test_requested_out_of_scope_pack_does_not_fall_back_to_auto_pack(self, sql, users):
         """Naming an unreadable pack must not silently answer from another one."""
         from opencrab.services.pack_selection import PACK_IDS_OUT_OF_SCOPE, resolve_packs
 
-        data_dir = self._registry_dir(tmp_path, PACK_A)
+        alice = users["alice"]
         sel = resolve_packs(
             "quantum widget research",
             [PACK_B],
             True,
             False,
-            data_dir,
+            "/nonexistent-local-data-dir",
             scope=frozenset({PACK_A}),
             raise_on_error=False,
+            sql=sql,
+            principal=alice,
         )
         assert sel.effective_pack_ids == []
         assert sel.selected_packs == []
         assert PACK_IDS_OUT_OF_SCOPE in [w.code for w in sel.warnings]
 
-    def test_out_of_scope_and_nonexistent_produce_the_same_warning(self, tmp_path):
+    def test_out_of_scope_and_nonexistent_produce_the_same_warning(self, sql, users):
         from opencrab.services.pack_selection import resolve_packs
 
-        kw = {"scope": frozenset({PACK_A}), "raise_on_error": False}
-        foreign = resolve_packs("q", [PACK_B], False, False, str(tmp_path), **kw)
-        absent = resolve_packs("q", ["never-created"], False, False, str(tmp_path), **kw)
+        alice = users["alice"]
+        kw = {
+            "scope": frozenset({PACK_A}),
+            "raise_on_error": False,
+            "sql": sql,
+            "principal": alice,
+        }
+        foreign = resolve_packs("q", [PACK_B], False, False, "/nonexistent", **kw)
+        absent = resolve_packs("q", ["never-created"], False, False, "/nonexistent", **kw)
         assert [w.code for w in foreign.warnings] == [w.code for w in absent.warnings]
         assert foreign.effective_pack_ids == absent.effective_pack_ids == []
 
-    def test_include_unpackaged_is_not_honoured(self, tmp_path):
+    def test_include_unpackaged_is_not_honoured(self, sql, users):
         from opencrab.services.pack_selection import INCLUDE_UNPACKAGED_NOOP, resolve_packs
 
+        alice = users["alice"]
         sel = resolve_packs(
             "q",
             [PACK_A],
             False,
             True,
-            str(tmp_path),
+            "/nonexistent-local-data-dir",
             scope=frozenset({PACK_A}),
             raise_on_error=False,
+            sql=sql,
+            principal=alice,
         )
         assert sel.include_unpackaged_effective is False
         assert INCLUDE_UNPACKAGED_NOOP in [w.code for w in sel.warnings]

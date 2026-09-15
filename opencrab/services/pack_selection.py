@@ -1,8 +1,11 @@
 """Shared pack-selection logic for the MCP and CLI query paths.
 
 Both ``ontology_query`` (MCP) and the ``query`` CLI command derive the effective
-pack filter from the same ``choose_packs`` + ``load_pack_registry`` logic.
-Previously each re-implemented the ~5 lines around it with its own warning
+pack filter from the same ``resolve_packs`` logic. Auto_pack's candidate pool
+is the SQL ``packs`` table (``list_packs_for``, #397); ``load_pack_registry``
+(the on-disk manifest scan) only enriches fields that have no SQL equivalent
+(``source_label``/``keywords``/``tags``) via ``build_candidate_registry``.
+Previously each caller re-implemented the ~5 lines around it with its own warning
 wording, delivery channel (MCP appends to a ``pack_filter.warnings`` list; CLI
 echoes to stderr) and error policy (MCP swallows exceptions and degrades; CLI
 lets them propagate).
@@ -68,6 +71,8 @@ def resolve_packs(
     *,
     scope: frozenset[str],
     raise_on_error: bool,
+    sql: Any,
+    principal: Any,
 ) -> PackSelection:
     """Resolve the effective pack filter shared by the MCP/REST/CLI query paths.
 
@@ -81,8 +86,24 @@ def resolve_packs(
     ``raise_on_error=False`` reproduces the MCP behaviour (auto_pack failures are
     swallowed and reported as an ``AUTO_PACK_FAILED`` warning); ``True``
     reproduces the CLI behaviour (the exception propagates).
+
+    ``sql``/``principal`` are REQUIRED keyword arguments (#397). auto_pack's
+    candidate pool used to come only from ``load_pack_registry`` -- a
+    filesystem manifest scan that, on the 2026-09-15 measurement, covered 1
+    of 186 SQL-registered packs. The other 185 have no manifest and were
+    therefore invisible to auto_pack no matter how well they matched the
+    question. ``sql``/``principal`` let this function query
+    ``opencrab.pack.ownership.list_packs_for`` -- the SQL ``packs`` table,
+    the same read-scope authority ``scope`` itself is derived from -- as the
+    primary candidate source, with the filesystem manifest kept only as a
+    field-enrichment layer (see ``build_candidate_registry``).
     """
-    from opencrab.ontology.pack_registry import choose_packs, load_pack_registry
+    from opencrab.ontology.pack_registry import (
+        build_candidate_registry,
+        choose_packs,
+        load_pack_registry,
+    )
+    from opencrab.pack.ownership import list_packs_for
     from opencrab.pack.read_scope import narrow
 
     # Whether the CALLER named packs, kept separate from what survived the
@@ -106,25 +127,56 @@ def resolve_packs(
     if auto_pack:
         failed = False
         try:
-            registry = load_pack_registry(local_data_dir)
-            # #147: filter candidates BEFORE scoring, not after. load_pack_registry
-            # scans every manifest on disk regardless of ownership, so scoring
-            # first would let someone else's pack win and leave the caller with
-            # nothing -- even when a pack they can read also matched.
-            registry = [p for p in registry if p.pack_id in scope]
-            candidates = choose_packs(question, registry, limit=1)
+            sql_rows = list_packs_for(sql, principal)
+            # #397/#147: the SQL candidate pool also passes through the
+            # scope intersection, even though list_packs_for and
+            # readable_pack_ids share the same WHERE predicate. They are
+            # separate queries, so the underlying rows can change between
+            # the two calls, and ``scope`` handed to this function can be
+            # narrower than the principal's full readable set (a caller
+            # higher up the stack may have already narrowed it). Skipping
+            # the intersection here would let auto_pack silently ignore
+            # that narrower boundary.
+            sql_rows = [r for r in sql_rows if r["pack_id"] in scope]
         except Exception as exc:  # noqa: BLE001 — degrade gracefully (MCP) or re-raise (CLI)
             if raise_on_error:
                 raise
-            # #168: this is a broad `except Exception` around
-            # load_pack_registry (a real filesystem manifest scan) and
-            # choose_packs -- the exception message must not reach the
-            # caller-facing MCP warning. Full detail goes to the operator
-            # log; the warning gets only the exception's type name.
-            logger.error("auto_pack selection failed: %s", exc, exc_info=True)
+            logger.error("auto_pack SQL candidate lookup failed: %s", exc, exc_info=True)
             warnings.append(PackWarning(AUTO_PACK_FAILED, type(exc).__name__))
             candidates = []
             failed = True
+        else:
+            try:
+                fs_packs = load_pack_registry(local_data_dir)
+            except Exception as exc:  # noqa: BLE001 — manifest enrichment is best-effort
+                # A broken/unreadable manifest scan must not block SQL-only
+                # candidates: the manifest is enrichment data, not the
+                # candidate source (#397). Continue with an empty
+                # enrichment layer instead of failing auto_pack outright.
+                logger.error(
+                    "auto_pack manifest enrichment failed: %s", exc, exc_info=True
+                )
+                fs_packs = []
+            try:
+                registry = build_candidate_registry(sql_rows, fs_packs)
+                candidates = choose_packs(question, registry, limit=1)
+                failed = False
+            except Exception as exc:  # noqa: BLE001 — degrade gracefully (MCP) or re-raise (CLI)
+                # build_candidate_registry/choose_packs is the candidate
+                # selection step itself. If it fails, auto_pack still
+                # produced no candidate even though the SQL lookup
+                # succeeded, so this maps to the same policy as a SQL
+                # lookup failure -- leaving this try out would let this
+                # step's exception fall through both except clauses
+                # uncaught.
+                if raise_on_error:
+                    raise
+                logger.error(
+                    "auto_pack candidate selection failed: %s", exc, exc_info=True
+                )
+                warnings.append(PackWarning(AUTO_PACK_FAILED, type(exc).__name__))
+                candidates = []
+                failed = True
         if candidates:
             pack, score, matched = candidates[0]
             effective = [pack.pack_id]

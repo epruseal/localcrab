@@ -29,6 +29,7 @@ import pytest
 
 from opencrab.ontology.query import (
     HybridQuery,
+    QueryResult,
     _ordered_unique,
     _profile_for_query,
     _property_text,
@@ -675,6 +676,100 @@ class TestQueryOrchestrationBranches:
             use_rerank=False, use_bm25=False, use_fts=False
         )
         assert [r.node_id for r in results] == ["n1"]
+
+    # #397/#61: per-leg max-score normalization for the use_rerank=False
+    # merge. Each leg's raw score comes from a different scale (vector
+    # similarity is ~0-1, BM25 is unbounded and commonly tens or hundreds),
+    # so sorting the concatenated legs by raw score lets whichever leg's
+    # native scale happens to run larger dominate the merge regardless of
+    # relevance. These two tests use the SAME single-item-per-leg shape on
+    # purpose (see the design doc's s.6 "leg 정규화 테스트"/"동점 규칙 고정
+    # 테스트" pair): normalizing every leg's top item to 1.0 means the top
+    # items across non-empty legs always tie, and the deterministic
+    # leg-merge-order tie-break (vector first) is what actually settles the
+    # winner -- not a judgment about which leg's content is more relevant.
+    # Swapping which leg holds the "relevant" text between the two tests is
+    # what makes that split explicit.
+
+    def test_leg_normalization_prevents_raw_scale_domination(self) -> None:
+        """Without normalization, BM25's naturally larger raw score (50.0)
+        would rank its irrelevant hit above the vector leg's relevant hit
+        (raw 0.1) by raw-score sort alone. #61's per-leg normalization maps
+        the top of each leg to 1.0 instead, so the two top items tie and the
+        vector-first tie-break puts the relevant hit at rank 1."""
+        hybrid = HybridQuery(MagicMock(available=False), MagicMock(available=False))
+        hybrid._doc_store = MagicMock()
+        hybrid._vector_search = MagicMock(return_value=[
+            QueryResult(source="vector", node_id="n_relevant", score=0.1, text="관련 문서"),
+        ])
+        hybrid._bm25_search = MagicMock(return_value=[
+            {"source": "bm25", "node_id": "n_irrelevant", "score": 50.0,
+             "text": "무관 문서", "metadata": {}},
+        ])
+        results = hybrid.query("q", pack_ids=["pack-a"], use_rerank=False, use_fts=False)
+        assert results[0].node_id == "n_relevant"
+
+    def test_tie_break_uses_leg_merge_order_not_content_relevance(self) -> None:
+        """Mirror of the test above: the relevant hit now sits in the BM25
+        leg and the irrelevant one in the vector leg. Per-leg normalization
+        still ties both tops at 1.0, and the tie-break still resolves by
+        leg-merge order (vector first) -- so rank 1 is the IRRELEVANT vector
+        hit here. This pins the s.3.2 promise that (b)/#61 aligns leg SCALE
+        only; it does not judge relevance. A result change here means the
+        tie-break rule itself changed."""
+        hybrid = HybridQuery(MagicMock(available=False), MagicMock(available=False))
+        hybrid._doc_store = MagicMock()
+        hybrid._vector_search = MagicMock(return_value=[
+            QueryResult(source="vector", node_id="n_vector_irrelevant", score=0.05, text="무관 문서"),
+        ])
+        hybrid._bm25_search = MagicMock(return_value=[
+            {"source": "bm25", "node_id": "n_bm25_relevant", "score": 80.0,
+             "text": "관련 문서", "metadata": {}},
+        ])
+        results = hybrid.query("q", pack_ids=["pack-a"], use_rerank=False, use_fts=False)
+        assert results[0].node_id == "n_vector_irrelevant"
+
+    def test_all_zero_raw_score_leg_does_not_wrongly_dominate(self) -> None:
+        """s.3.3 edge case: when every raw score in a leg is 0 (e.g. a leg
+        whose hits are all weak matches), that leg's max is also 0. The
+        merge must not divide by that zero -- every item in the all-zero leg
+        stays at a normalized 0.0, not get promoted to 1.0 by a defensive
+        "no max, so give it 1.0" mistake that would wrongly outrank a leg
+        with a genuine positive score."""
+        hybrid = HybridQuery(MagicMock(available=False), MagicMock(available=False))
+        hybrid._doc_store = MagicMock()
+        hybrid._vector_search = MagicMock(return_value=[
+            QueryResult(source="vector", node_id="n_zero", score=0.0, text="weak match"),
+        ])
+        hybrid._bm25_search = MagicMock(return_value=[
+            {"source": "bm25", "node_id": "n_positive", "score": 5.0,
+             "text": "real match", "metadata": {}},
+        ])
+        results = hybrid.query("q", pack_ids=["pack-a"], use_rerank=False, use_fts=False)
+        assert results[0].node_id == "n_positive"
+        assert results[0].score == pytest.approx(1.0)
+        zero_item = next(r for r in results if r.node_id == "n_zero")
+        assert zero_item.score == 0.0
+
+    def test_duplicate_node_id_across_legs_keeps_first_leg_value(self) -> None:
+        """s.3.3: this PR does not change the pre-existing dedup rule -- the
+        same node_id in more than one leg keeps the FIRST leg's (normalized)
+        value and drops later occurrences. Pinned here so a change to that
+        rule fails this test rather than passing silently."""
+        hybrid = HybridQuery(MagicMock(available=False), MagicMock(available=False))
+        hybrid._doc_store = MagicMock()
+        hybrid._vector_search = MagicMock(return_value=[
+            QueryResult(source="vector", node_id="dup", score=0.2, text="vector version"),
+        ])
+        hybrid._bm25_search = MagicMock(return_value=[
+            {"source": "bm25", "node_id": "dup", "score": 999.0,
+             "text": "bm25 version", "metadata": {}},
+        ])
+        results = hybrid.query("q", pack_ids=["pack-a"], use_rerank=False, use_fts=False)
+        assert len(results) == 1
+        assert results[0].text == "vector version"
+        # normalized against the vector leg's own max (0.2), not bm25's raw scale
+        assert results[0].score == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

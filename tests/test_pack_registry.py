@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from opencrab.ontology.pack_registry import (
+    build_candidate_registry,
     choose_packs,
     get_pack,
     load_pack_registry,
@@ -113,3 +114,89 @@ def test_t2_env_min_score_default(monkeypatch, tmp_path: Path, env_value, expect
     candidates = choose_packs("tiny", registry, limit=1)
     # The "tiny" pack scores 100 + 50 (pack_id + title), well above either threshold.
     assert candidates and candidates[0][1] >= expected_min
+
+
+# ---------------------------------------------------------------------------
+# #397: build_candidate_registry -- SQL rows are the candidate scope,
+# manifests only enrich fields.
+# ---------------------------------------------------------------------------
+
+
+def test_build_candidate_registry_excludes_manifest_only_packs(tmp_path: Path) -> None:
+    """A pack_id with a manifest but no SQL row must not enter the registry.
+
+    The SQL packs table is the read-scope authority (#143); admitting a
+    manifest-only pack here would open a path around that scope.
+    """
+    _write_manifest(tmp_path, "manifest-only", {
+        "pack_id": "manifest-only",
+        "title": "manifest only pack",
+    })
+    fs_packs = load_pack_registry(tmp_path)
+    registry = build_candidate_registry([], fs_packs)
+    assert registry == []
+
+
+def test_build_candidate_registry_sql_row_with_no_manifest_still_becomes_a_candidate(
+    tmp_path: Path,
+) -> None:
+    """The 185-of-186 case: a SQL-registered pack with no manifest at all
+    must still be scoreable -- this is the #397 root-cause fix itself."""
+    sql_rows = [{"pack_id": "sql-only", "title": "quantum widget research", "description": ""}]
+    registry = build_candidate_registry(sql_rows, [])
+    assert len(registry) == 1
+    assert registry[0].pack_id == "sql-only"
+    assert registry[0].title == "quantum widget research"
+    candidates = choose_packs("quantum widget research", registry, limit=1)
+    assert candidates and candidates[0][0].pack_id == "sql-only"
+
+
+def test_build_candidate_registry_sql_title_wins_over_manifest(tmp_path: Path) -> None:
+    """pack_publish keeps the SQL row current; the manifest is a load-time
+    snapshot. A non-empty SQL title/description must win."""
+    _write_manifest(tmp_path, "dual", {
+        "pack_id": "dual",
+        "title": "stale manifest title",
+        "description": "stale manifest description",
+    })
+    fs_packs = load_pack_registry(tmp_path)
+    sql_rows = [{"pack_id": "dual", "title": "fresh sql title", "description": "fresh sql description"}]
+    registry = build_candidate_registry(sql_rows, fs_packs)
+    assert len(registry) == 1
+    assert registry[0].title == "fresh sql title"
+    assert registry[0].description == "fresh sql description"
+
+
+def test_build_candidate_registry_manifest_fills_empty_sql_title(tmp_path: Path) -> None:
+    """When the SQL row's title/description is empty, the manifest value
+    fills it instead of leaving the candidate untitled."""
+    _write_manifest(tmp_path, "dual", {
+        "pack_id": "dual",
+        "title": "manifest title",
+        "description": "manifest description",
+    })
+    fs_packs = load_pack_registry(tmp_path)
+    sql_rows = [{"pack_id": "dual", "title": "", "description": None}]
+    registry = build_candidate_registry(sql_rows, fs_packs)
+    assert len(registry) == 1
+    assert registry[0].title == "manifest title"
+    assert registry[0].description == "manifest description"
+
+
+def test_build_candidate_registry_enriches_manifest_only_fields(tmp_path: Path) -> None:
+    """source_label/keywords/tags have no SQL equivalent -- they must be
+    carried over from the manifest whenever one exists for the pack_id."""
+    _write_manifest(tmp_path, "dual", {
+        "pack_id": "dual",
+        "title": "manifest title",
+        "source": {"label": "arxiv"},
+        "keywords": ["kw1", "kw2"],
+        "tags": ["tag1"],
+    })
+    fs_packs = load_pack_registry(tmp_path)
+    sql_rows = [{"pack_id": "dual", "title": "sql title", "description": ""}]
+    registry = build_candidate_registry(sql_rows, fs_packs)
+    assert len(registry) == 1
+    assert registry[0].source_label == "arxiv"
+    assert registry[0].keywords == ["kw1", "kw2"]
+    assert registry[0].tags == ["tag1"]
