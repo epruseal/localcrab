@@ -209,6 +209,38 @@ def _whole_tokens(text: str) -> set[str]:
     return {m for m in _WHOLE_TOKEN_RE.findall(text) if m not in _STOPWORDS}
 
 
+def _phrase_at_boundary(phrase: str, text: str) -> bool:
+    """#400 제목 보너스 전용: 경계 조건을 더한 원문 substring 판정.
+
+    #400 이전 코드는 ``title in question`` 그대로 substring 으로 판정했다.
+    순서에는 민감하지만, 짧은 title 이 더 긴 낱말 안에 경계 없이 박혀 있어도
+    (질의 "혈자리" 안의 title "자리") 보너스가 열리는 결함이 있었다. #400은
+    이를 막으려 whole-token *부분집합* 비교로 바꿨는데, 부분집합 비교는
+    순서를 보지 않는다 -- 같은 낱말을 다른 순서로 쓴 두 title
+    ("man bites dog"와 "dog bites man")이 같은 토큰 집합이 되어 같은
+    보너스로 동점 처리되고, 안정 정렬 + 상위 1건 반환 조합에서 정확한
+    title 이 순서만 다른 title 에 밀려 탈락한다(회귀).
+
+    substring 판정으로 되돌려 순서 민감성을 복원하되, 매치 앞뒤 문자(있는
+    경우)가 whole-token 문자 클래스(``_WHOLE_TOKEN_RE``, #400 게이트가 이미
+    쓰는 것과 동일)를 벗어나야 한다는 경계 조건을 더해 기존 fragment 차단을
+    유지한다.
+    """
+    if not phrase:
+        return False
+    start = 0
+    while True:
+        idx = text.find(phrase, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not _WHOLE_TOKEN_RE.match(text[idx - 1])
+        end = idx + len(phrase)
+        after_ok = end == len(text) or not _WHOLE_TOKEN_RE.match(text[end])
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
+
 def _resolve_aliases(question_tokens: set[str]) -> set[str]:
     expanded = set(question_tokens)
     for canonical, variants in _ALIASES.items():
@@ -282,8 +314,8 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
         score += 100.0
         matched.append(f"pack_id:{pack.pack_id}")
 
-    title_whole = _whole_tokens(pack.title)
-    if title_whole and title_whole <= q_whole:
+    title_lower = pack.title.lower()
+    if title_lower and _phrase_at_boundary(title_lower, q_lower):
         score += 50.0
         matched.append("title")
 

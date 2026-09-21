@@ -215,6 +215,40 @@ def test_t400_hyphenated_pack_id_bonus_via_whole_token_subset() -> None:
     assert not any(m.startswith("pack_id:") for m in matched2)
 
 
+def test_t400_title_bonus_is_order_sensitive() -> None:
+    """대체 리뷰 차단 지적(PR #405) 반례. 제목 보너스가 문자열 포함 판정에서
+    whole-token 부분집합 비교로 바뀌면서, 낱말 구성은 같고 순서만 다른
+    제목이 정확히 일치하는 제목과 같은 +50 보너스를 받아 동점이 됐다.
+    안정 정렬 + 기본 limit=1 때문에 나중 후보(정확한 제목)가 탈락한다.
+    `_phrase_at_boundary`로 substring 판정을 복원해 순서를 구분한다."""
+    exact = PackInfo(pack_id="p2", title="dog bites man")
+    reordered = PackInfo(pack_id="p1", title="man bites dog")
+
+    score_exact, matched_exact = score_pack("dog bites man", exact)
+    score_reordered, matched_reordered = score_pack("dog bites man", reordered)
+
+    assert "title" in matched_exact
+    assert "title" not in matched_reordered
+    assert score_exact == 65.0
+    assert score_reordered == 15.0
+
+    chosen = choose_packs("dog bites man", [reordered, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["p2"]
+
+
+def test_t400_title_bonus_rejects_fragment_without_boundary() -> None:
+    """`_phrase_at_boundary`가 지키는 원래 결함(#400)도 함께 고정한다. 짧은
+    title이 질의의 더 긴 낱말 안에 경계 없이 박혀 있으면(질의 "혈자리" 안의
+    title "자리") +50 제목 보너스는 열리면 안 된다. 게이트는 pack_id
+    리터럴 일치로 열리고, 조각 겹침에서 나오는 +5 fragment 보너스는 별개
+    메커니즘이라 그대로 남는다."""
+    pack = PackInfo(pack_id="혈자리", title="자리")
+    score, matched = score_pack("혈자리", pack)
+    assert "title" not in matched
+    assert score == 105.0
+    assert matched == ["pack_id:혈자리", "자리"]
+
+
 # ---------------------------------------------------------------------------
 # #400 §4: _choose_by_content -- BM25/FTS 콘텐츠 폴백. score_pack()의 게이트가
 # 전부 닫혔을 때(title/description/keywords/tags 어디에도 리터럴이 없을 때)만
