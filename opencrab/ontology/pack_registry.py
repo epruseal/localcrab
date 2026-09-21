@@ -209,6 +209,13 @@ def _whole_tokens(text: str) -> set[str]:
     return {m for m in _WHOLE_TOKEN_RE.findall(text) if m not in _STOPWORDS}
 
 
+def _ordered_whole_tokens(text: str) -> list[str]:
+    """`_whole_tokens()`의 순서 보존 버전. `_phrase_tokens_in_order()`의
+    연속 부분열 비교에 쓴다 -- 집합은 순서를 버리므로 이 비교에는 못 쓴다."""
+    text = (text or "").lower()
+    return [m for m in _WHOLE_TOKEN_RE.findall(text) if m not in _STOPWORDS]
+
+
 def _phrase_at_boundary(phrase: str, text: str) -> bool:
     """#400 제목 보너스 전용: 경계 조건을 더한 원문 substring 판정.
 
@@ -239,6 +246,52 @@ def _phrase_at_boundary(phrase: str, text: str) -> bool:
         if before_ok and after_ok:
             return True
         start = idx + 1
+
+
+def _alias_equivalent(a: str, b: str) -> bool:
+    """`_phrase_tokens_in_order()` 전용: 두 whole-token이 같거나 같은
+    `_ALIASES` 그룹의 변형이면 동치로 본다. 별도 별칭 표를 새로 두지 않고
+    기존 `_ALIASES`를 그대로 재사용해 "같은 개념, 두 정의" 드리프트를
+    피한다."""
+    if a == b:
+        return True
+    for variants in _ALIASES.values():
+        lowered = {v.lower() for v in variants}
+        if a in lowered and b in lowered:
+            return True
+    return False
+
+
+def _phrase_tokens_in_order(phrase_tokens: list[str], question_tokens: list[str]) -> bool:
+    """pack_id/source_label 보너스 전용: 순서를 지키는 연속 부분열 비교.
+
+    title 보너스는 `_phrase_at_boundary()`로 원문 substring을 그대로 쓴다 --
+    title은 질의와 같은 자연어 문자열이라 구분자가 같다는 전제가 성립한다.
+    pack_id는 다르다. #400은 pack_id 보너스를 whole-token *부분집합* 비교로
+    바꿔 "acupoint-medical" 같은 하이픈 식별자가 "acupoint medical" 같은
+    공백 질의와도 만나게 했다(의도적 개선, `test_t400_hyphenated_pack_id
+    _bonus_via_whole_token_subset`가 고정). 그런데 부분집합 비교는 순서를
+    보지 않아 "dog-bites-man"과 "man-bites-dog"가 같은 토큰 집합이 되고,
+    안정 정렬 + 기본 limit=1 때문에 순서만 다른 pack_id가 정확한 pack_id를
+    밀어낸다(대체 리뷰 PR #405 반례).
+
+    구분자 관용은 그대로 지키면서 순서만 구분하려면 원문 substring이 아니라
+    whole-token *순서열*을 비교해야 한다 -- `_WHOLE_TOKEN_RE`가 토큰 경계를
+    이미 정하므로 하이픈이든 공백이든 같은 토큰열이 나온다. 부분집합이 아니라
+    질의 토큰열 안에 pack 토큰열이 "연속"으로 나타나는지를 본다. 위치별
+    비교에는 `_alias_equivalent()`를 써서 기존 별칭 매치 능력도 유지한다.
+    """
+    n = len(phrase_tokens)
+    m = len(question_tokens)
+    if n == 0 or n > m:
+        return False
+    for start in range(m - n + 1):
+        if all(
+            _alias_equivalent(question_tokens[start + i], phrase_tokens[i])
+            for i in range(n)
+        ):
+            return True
+    return False
 
 
 def _resolve_aliases(question_tokens: set[str]) -> set[str]:
@@ -309,8 +362,14 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
     matched: list[str] = []
     score = 0.0
 
-    pack_id_whole = _whole_tokens(pack.pack_id)
-    if pack_id_whole and pack_id_whole <= q_whole:
+    # pack_id/source_label 보너스는 순서 보존 연속 부분열 비교를 쓴다(대체
+    # 리뷰 PR #405 반례: whole-token 부분집합 비교는 순서를 무시해 순서만
+    # 다른 pack_id/source_label 이 정답과 동점이 된다). 질의 쪽 순서열은
+    # 한 번만 뽑아 두 보너스에서 재사용한다.
+    q_whole_seq = _ordered_whole_tokens(question)
+
+    pack_id_seq = _ordered_whole_tokens(pack.pack_id)
+    if pack_id_seq and _phrase_tokens_in_order(pack_id_seq, q_whole_seq):
         score += 100.0
         matched.append(f"pack_id:{pack.pack_id}")
 
@@ -320,8 +379,8 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
         matched.append("title")
 
     if pack.source_label:
-        source_whole = _whole_tokens(pack.source_label)
-        if source_whole and source_whole <= q_whole:
+        source_seq = _ordered_whole_tokens(pack.source_label)
+        if source_seq and _phrase_tokens_in_order(source_seq, q_whole_seq):
             score += 30.0
             matched.append(f"source:{pack.source_label}")
 

@@ -249,6 +249,45 @@ def test_t400_title_bonus_rejects_fragment_without_boundary() -> None:
     assert matched == ["pack_id:혈자리", "자리"]
 
 
+def test_t400_pack_id_bonus_is_order_sensitive() -> None:
+    """대체 리뷰 차단 지적(PR #405, review-cli-d611860). pack_id 보너스가
+    whole-token 부분집합 비교라 낱말 구성은 같고 순서만 다른 pack_id가
+    정확한 pack_id와 동점(+100)이 됐다. 안정 정렬 + 기본 limit=1 때문에
+    나중 후보(정확한 pack_id)가 탈락한다. title과 달리 pack_id는 구분자
+    관용(하이픈 vs 공백, `test_t400_hyphenated_pack_id_bonus_via_whole_
+    token_subset`)을 지켜야 하므로 `_phrase_at_boundary`가 아니라
+    `_phrase_tokens_in_order`(순서 보존 연속 부분열 비교)로 고친다."""
+    exact = PackInfo(pack_id="dog-bites-man")
+    reordered = PackInfo(pack_id="man-bites-dog")
+
+    score_exact, matched_exact = score_pack("dog-bites-man", exact)
+    score_reordered, matched_reordered = score_pack("dog-bites-man", reordered)
+
+    assert any(m.startswith("pack_id:") for m in matched_exact)
+    assert not any(m.startswith("pack_id:") for m in matched_reordered)
+    assert score_exact == 100.0
+    assert score_reordered == 0.0
+
+    chosen = choose_packs("dog-bites-man", [reordered, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["dog-bites-man"]
+
+
+def test_t400_source_label_bonus_is_order_sensitive() -> None:
+    """같은 반례를 source_label(+30 보너스)에도 적용한다. 대체 리뷰가 같은
+    지적 항목 안에서 함께 지목했다(pack_registry.py의 source_label 보너스도
+    pack_id와 동일한 `X_whole <= q_whole` 부분집합 패턴이었다)."""
+    reordered = PackInfo(pack_id="p1", source_label="man bites dog")
+    exact = PackInfo(pack_id="p2", source_label="dog bites man")
+
+    score_reordered, matched_reordered = score_pack("dog bites man", reordered)
+    score_exact, matched_exact = score_pack("dog bites man", exact)
+
+    assert not any(m.startswith("source:") for m in matched_reordered)
+    assert any(m.startswith("source:") for m in matched_exact)
+    assert score_reordered == 0.0
+    assert score_exact == 30.0
+
+
 # ---------------------------------------------------------------------------
 # #400 §4: _choose_by_content -- BM25/FTS 콘텐츠 폴백. score_pack()의 게이트가
 # 전부 닫혔을 때(title/description/keywords/tags 어디에도 리터럴이 없을 때)만
