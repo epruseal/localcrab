@@ -167,6 +167,8 @@ def ontology_query(
         raise_on_error=False,
         sql=ctx["sql"],
         principal=principal,
+        hybrid=ctx["hybrid"],
+        spaces=spaces,
     )
     effective_pack_ids = selection.effective_pack_ids
     selected_packs = selection.selected_packs

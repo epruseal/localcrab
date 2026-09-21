@@ -73,6 +73,8 @@ def resolve_packs(
     raise_on_error: bool,
     sql: Any,
     principal: Any,
+    hybrid: Any = None,
+    spaces: list[str] | None = None,
 ) -> PackSelection:
     """Resolve the effective pack filter shared by the MCP/REST/CLI query paths.
 
@@ -97,8 +99,18 @@ def resolve_packs(
     the same read-scope authority ``scope`` itself is derived from -- as the
     primary candidate source, with the filesystem manifest kept only as a
     field-enrichment layer (see ``build_candidate_registry``).
+
+    ``hybrid``/``spaces`` (#400) are OPTIONAL. When ``choose_packs`` (the
+    title/description/keyword/tag literal-token gate) finds nothing, and a
+    ``hybrid`` was supplied, auto_pack probes each candidate pack's actual
+    node content (BM25 + FTS) for the question's literal tokens before
+    giving up -- a pack whose title says nothing about a proper noun the
+    question uses can still be selected if its own data contains that noun.
+    Passing ``hybrid=None`` (the default) skips this fallback entirely and
+    reproduces the pre-#400 behaviour exactly.
     """
     from opencrab.ontology.pack_registry import (
+        _choose_by_content,
         build_candidate_registry,
         choose_packs,
         load_pack_registry,
@@ -160,6 +172,22 @@ def resolve_packs(
             try:
                 registry = build_candidate_registry(sql_rows, fs_packs)
                 candidates = choose_packs(question, registry, limit=1)
+                if not candidates and hybrid is not None:
+                    # #400 §4/§5: the literal-token gate found nothing in
+                    # any pack's title/description/keywords/tags -- probe
+                    # each candidate pack's actual node content (BM25+FTS)
+                    # before giving up. Only runs when choose_packs already
+                    # came back empty, so it can never displace a lexical
+                    # match (#400's stated non-goal: no score comparison
+                    # across the two mechanisms).
+                    candidates, truncated_packs = _choose_by_content(
+                        question, registry, hybrid, spaces
+                    )
+                    if truncated_packs:
+                        logger.info(
+                            "auto_pack content fallback: probe limit reached for %s",
+                            truncated_packs,
+                        )
                 failed = False
             except Exception as exc:  # noqa: BLE001 — degrade gracefully (MCP) or re-raise (CLI)
                 # build_candidate_registry/choose_packs is the candidate

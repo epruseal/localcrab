@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from opencrab.ontology.pack_registry import (
+    _STOPWORDS,
+    PER_PACK_PROBE_LIMIT,
+    PackInfo,
+    _choose_by_content,
     build_candidate_registry,
     choose_packs,
     get_pack,
     load_pack_registry,
+    score_pack,
 )
 
 
@@ -114,6 +120,427 @@ def test_t2_env_min_score_default(monkeypatch, tmp_path: Path, env_value, expect
     candidates = choose_packs("tiny", registry, limit=1)
     # The "tiny" pack scores 100 + 50 (pack_id + title), well above either threshold.
     assert candidates and candidates[0][1] >= expected_min
+
+
+# ---------------------------------------------------------------------------
+# #400: score_pack의 whole-토큰 게이트. 질의는 whole 토큰(공백/구두점 경계)
+# 으로만 판정하고, fragment(n-gram 조각)는 판정 통과 뒤 순위에만 쓴다. 팩
+# 쪽 게이트 집합은 기존 _tokens()(fragment 포함)와 신규 _whole_tokens()
+# (길이 무관)의 합집합이다. design 문서:
+# /home/asdf/orch-scratch/o400/design-v5-full.md §4.1/§6/§10.
+# ---------------------------------------------------------------------------
+
+
+def test_t400_single_char_literal_match_no_regression() -> None:
+    """title="혈" + 질의 "혈" -- 라운드5 필수조건2. 팩 쪽 게이트가
+    길이 2 미만을 버리는 기존 _tokens()만 썼다면 이 리터럴 매치가 막힌다."""
+    pack = PackInfo(pack_id="p3", title="혈")
+    assert score_pack("혈", pack) == (50.0, ["title"])
+
+
+def test_t400_particle_only_gate_overlap_is_rejected() -> None:
+    """라운드5 차단 지적(codex FAIL) 그대로: 게이트 교집합이 조사 "는"
+    하나뿐이면 무관 팩을 fragment 점수로 선택해선 안 된다. _STOPWORDS에
+    "는"류 단음절 조사가 빠지면 이 assertion이 RED로 되돌아간다."""
+    pack = PackInfo(
+        pack_id="fixture", title="자리 는", description="자리", keywords=["자리"],
+    )
+    assert score_pack("혈자리 는", pack) == (0.0, [])
+    assert choose_packs("혈자리 는", [pack]) == []
+
+
+def test_t400_script_boundary_fragment_is_not_a_whole_token() -> None:
+    """라운드4 반례a의 실제 검출 케이스(설계 §7 테스트2c). ASCII/숫자와
+    한글이 구분자 없이 붙은 질의("x자리"/"혈1자리")는 하나의 whole
+    토큰이라 "자리" 단독 팩과 겹치면 안 된다. _WORD_RE/_HANGUL_RE를 따로
+    findall하던 구현으로 되돌리면 "x"+"자리"로 잘못 쪼개져 63.0으로 뚫린다."""
+    pack = PackInfo(pack_id="p2", title="자리", description="자리", keywords=["자리"])
+    assert score_pack("x자리", pack) == (0.0, [])
+    assert score_pack("혈1자리", pack) == (0.0, [])
+
+
+def test_t400_fragment_only_overlap_without_space_is_rejected() -> None:
+    """설계 §7 테스트2/4(거부 절반). "혈자리"(공백 없음)는 하나의 whole
+    토큰이므로 "자리"만 가진 팩과 fragment로만 겹쳐도 게이트가 안 열린다."""
+    pack = PackInfo(pack_id="p2", title="자리", description="자리", keywords=["자리"])
+    assert score_pack("혈자리", pack) == (0.0, [])
+
+
+def test_t400_whole_word_query_matches_exact_field_value() -> None:
+    """설계 §7 테스트4(선택 절반, v3의 오분류를 v4에서 정정). 질의 "자리"는
+    팩이 실제로 가진 낱말이므로 정상 선택 대상이고 회귀시켜선 안 된다."""
+    pack = PackInfo(pack_id="p2", title="자리", description="자리", keywords=["자리"])
+    assert score_pack("자리", pack) == (63.0, ["title", "자리"])
+
+
+def test_t400_space_separated_query_opens_gate_via_pack_side_fragment() -> None:
+    """설계 §7 테스트2b(정정). "자리"가 "별자리" 안에만 내장된 무관 팩에
+    질의 "혈 자리"(공백 있음)는 게이트는 열리되(의도된 비대칭) 기본
+    임계값(10.0) 아래라 선택은 안 되고, 임계값을 낮추면 선택된다. "무조건
+    미선택"은 아니다(라운드4 반례c)."""
+    pack = PackInfo(
+        pack_id="stargazing", title="별자리 관측", description="밤하늘 별자리 사진",
+        keywords=["별자리"],
+    )
+    assert score_pack("혈 자리", pack) == (8.0, ["자리"])
+    assert choose_packs("혈 자리", [pack]) == []
+    assert choose_packs("혈 자리", [pack], min_score=5) == [(pack, 8.0, ["자리"])]
+    # 공백 없는 질의는 하나의 whole 토큰이라 이 fragment 겹침 경로 자체가 안 열린다.
+    assert score_pack("혈자리", pack) == (0.0, [])
+
+
+def test_t400_compound_word_pack_title_matches_spaced_query_unchanged() -> None:
+    """설계 §7 테스트3. 붙여쓴 title과 필드에 나뉜 값 둘 다 기존 점수
+    그대로 통과해야 한다(무회귀)."""
+    concatenated = PackInfo(pack_id="p5", title="직업분포")
+    assert score_pack("직업 분포", concatenated) == (10.0, ["분포", "직업"])
+
+    split_fields = PackInfo(
+        pack_id="p6", title="직업 안내", description="분포 자료", keywords=["직업"],
+    )
+    assert score_pack("직업 분포", split_fields) == (13.0, ["직업", "분포"])
+
+
+def test_t400_hyphenated_pack_id_bonus_via_whole_token_subset() -> None:
+    """설계 §7 테스트13. pack_id의 whole 토큰이 질의의 whole 토큰 부분집합이면
+    구분자(하이픈 vs 공백)가 달라도 +100 보너스가 붙는다(개선, 기존은 원문
+    그대로 일치해야 붙었음). 부분 단어만 쓴 질의는 보너스가 안 붙는다."""
+    pack = PackInfo(pack_id="acupoint-medical", title="Acupoint Medical Atlas")
+    score, matched = score_pack("acupoint medical", pack)
+    assert score == 110.0
+    assert "pack_id:acupoint-medical" in matched
+
+    score2, matched2 = score_pack("acupoint", pack)
+    assert score2 == 5.0
+    assert not any(m.startswith("pack_id:") for m in matched2)
+
+
+def test_t400_title_bonus_is_order_sensitive() -> None:
+    """대체 리뷰 차단 지적(PR #405) 반례. 제목 보너스가 문자열 포함 판정에서
+    whole-token 부분집합 비교로 바뀌면서, 낱말 구성은 같고 순서만 다른
+    제목이 정확히 일치하는 제목과 같은 +50 보너스를 받아 동점이 됐다.
+    안정 정렬 + 기본 limit=1 때문에 나중 후보(정확한 제목)가 탈락한다.
+    `_phrase_at_boundary`로 substring 판정을 복원해 순서를 구분한다."""
+    exact = PackInfo(pack_id="p2", title="dog bites man")
+    reordered = PackInfo(pack_id="p1", title="man bites dog")
+
+    score_exact, matched_exact = score_pack("dog bites man", exact)
+    score_reordered, matched_reordered = score_pack("dog bites man", reordered)
+
+    assert "title" in matched_exact
+    assert "title" not in matched_reordered
+    assert score_exact == 65.0
+    assert score_reordered == 15.0
+
+    chosen = choose_packs("dog bites man", [reordered, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["p2"]
+
+
+def test_t400_title_bonus_rejects_fragment_without_boundary() -> None:
+    """`_phrase_at_boundary`가 지키는 원래 결함(#400)도 함께 고정한다. 짧은
+    title이 질의의 더 긴 낱말 안에 경계 없이 박혀 있으면(질의 "혈자리" 안의
+    title "자리") +50 제목 보너스는 열리면 안 된다. 게이트는 pack_id
+    리터럴 일치로 열리고, 조각 겹침에서 나오는 +5 fragment 보너스는 별개
+    메커니즘이라 그대로 남는다."""
+    pack = PackInfo(pack_id="혈자리", title="자리")
+    score, matched = score_pack("혈자리", pack)
+    assert "title" not in matched
+    assert score == 105.0
+    assert matched == ["pack_id:혈자리", "자리"]
+
+
+def test_t400_pack_id_bonus_is_order_sensitive() -> None:
+    """대체 리뷰 차단 지적(PR #405, review-cli-d611860). pack_id 보너스가
+    whole-token 부분집합 비교라 낱말 구성은 같고 순서만 다른 pack_id가
+    정확한 pack_id와 동점(+100)이 됐다. 안정 정렬 + 기본 limit=1 때문에
+    나중 후보(정확한 pack_id)가 탈락한다. title과 달리 pack_id는 구분자
+    관용(하이픈 vs 공백, `test_t400_hyphenated_pack_id_bonus_via_whole_
+    token_subset`)을 지켜야 하므로 `_phrase_at_boundary`가 아니라
+    `_phrase_tokens_in_order`(순서 보존 연속 부분열 비교)로 고친다."""
+    exact = PackInfo(pack_id="dog-bites-man")
+    reordered = PackInfo(pack_id="man-bites-dog")
+
+    score_exact, matched_exact = score_pack("dog-bites-man", exact)
+    score_reordered, matched_reordered = score_pack("dog-bites-man", reordered)
+
+    assert any(m.startswith("pack_id:") for m in matched_exact)
+    assert not any(m.startswith("pack_id:") for m in matched_reordered)
+    assert score_exact == 100.0
+    assert score_reordered == 0.0
+
+    chosen = choose_packs("dog-bites-man", [reordered, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["dog-bites-man"]
+
+
+def test_t400_source_label_bonus_is_order_sensitive() -> None:
+    """같은 반례를 source_label(+30 보너스)에도 적용한다. 대체 리뷰가 같은
+    지적 항목 안에서 함께 지목했다(pack_registry.py의 source_label 보너스도
+    pack_id와 동일한 `X_whole <= q_whole` 부분집합 패턴이었다)."""
+    reordered = PackInfo(pack_id="p1", source_label="man bites dog")
+    exact = PackInfo(pack_id="p2", source_label="dog bites man")
+
+    score_reordered, matched_reordered = score_pack("dog bites man", reordered)
+    score_exact, matched_exact = score_pack("dog bites man", exact)
+
+    assert not any(m.startswith("source:") for m in matched_reordered)
+    assert any(m.startswith("source:") for m in matched_exact)
+    assert score_reordered == 0.0
+    assert score_exact == 30.0
+
+
+def test_t400_pack_id_bonus_alias_equivalence_still_order_sensitive() -> None:
+    """리드 지적(PR #405): `_alias_equivalent`가 위치별 비교에 들어가도
+    순서 보존을 우회하면 안 된다. 별칭이 섞인 두 토큰이 순서만 바뀌면
+    여전히 매치가 거부돼야 한다. 질의는 `_ALIASES["nemotron"]`의 별칭
+    "nvidia"를 쓴다: 정답은 별칭을 거쳐도 원래 순서(nemotron, persona)와
+    같아 매치되고, 순서를 뒤집은 pack_id는 같은 별칭 조합이라도 매치되지
+    않아야 한다."""
+    exact = PackInfo(pack_id="nemotron-persona")
+    permuted = PackInfo(pack_id="persona-nemotron")
+
+    query = "nvidia persona pack"
+
+    score_exact, matched_exact = score_pack(query, exact)
+    score_permuted, matched_permuted = score_pack(query, permuted)
+
+    assert any(m.startswith("pack_id:") for m in matched_exact)
+    assert not any(m.startswith("pack_id:") for m in matched_permuted)
+    assert score_exact > score_permuted
+
+    chosen = choose_packs(query, [permuted, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["nemotron-persona"]
+
+
+# ---------------------------------------------------------------------------
+# #400 §4: _choose_by_content -- BM25/FTS 콘텐츠 폴백. score_pack()의 게이트가
+# 전부 닫혔을 때(title/description/keywords/tags 어디에도 리터럴이 없을 때)만
+# 쓰는 마지막 안전망. 실제 HybridQuery 대신 pack_id별 히트를 미리 준비해 두는
+# 가짜 객체로 격리 시험한다.
+# ---------------------------------------------------------------------------
+
+
+class _FakeHybrid:
+    """``hybrid._bm25_search``/``_fts_search``만 흉내 낸다. 호출 인자(질의,
+    spaces, limit, pack_ids)를 그대로 기록해 배선(§7 항목10) 확인에 쓴다."""
+
+    def __init__(
+        self,
+        bm25_by_pack: dict[str, list[dict]] | None = None,
+        fts_by_pack: dict[str, list[dict]] | None = None,
+    ) -> None:
+        self.bm25_by_pack = bm25_by_pack or {}
+        self.fts_by_pack = fts_by_pack or {}
+        self.bm25_calls: list[tuple] = []
+        self.fts_calls: list[tuple] = []
+
+    def _bm25_search(self, question, spaces, limit, *, pack_ids):
+        self.bm25_calls.append((question, spaces, limit, tuple(pack_ids)))
+        pid = pack_ids[0]
+        return list(self.bm25_by_pack.get(pid, []))
+
+    def _fts_search(self, question, spaces, limit, *, pack_ids):
+        self.fts_calls.append((question, spaces, limit, tuple(pack_ids)))
+        pid = pack_ids[0]
+        return list(self.fts_by_pack.get(pid, []))
+
+
+def test_t400_content_fallback_selects_pack_by_literal_body_text() -> None:
+    """설계 §7 항목1. title/description엔 없는 고유명사가 doc 본문에만
+    whole 토큰으로 있으면 콘텐츠 폴백이 그 팩을 고른다."""
+    pack = PackInfo(pack_id="misc-pack", title="기타 자료", description="분류 없음")
+    hybrid = _FakeHybrid(
+        bm25_by_pack={"misc-pack": [{"pack_id": "misc-pack", "text": "네오다임 합금 규격", "score": 3.5}]},
+    )
+    candidates, truncated = _choose_by_content("네오다임", [pack], hybrid, spaces=None)
+    assert truncated == []
+    assert len(candidates) == 1
+    got_pack, score, matched = candidates[0]
+    assert got_pack.pack_id == "misc-pack"
+    assert matched == ["네오다임"]
+    assert score == 10.0  # 기본 OPENCRAB_AUTO_PACK_MIN_SCORE -- 실제 BM25 점수가 아니라 문턱값 자체
+
+
+def test_t400_content_fallback_rejects_fragment_only_body_hit() -> None:
+    """§4.3. 원문 재검증은 substring 스캔이 아니라 whole-토큰 집합 비교다 --
+    "art"가 "cartography" 안에서 우연히 잡히는 것과 같은 모양의 오탐을 막는다."""
+    pack = PackInfo(pack_id="geo-pack", title="지도", description="지도 제작")
+    hybrid = _FakeHybrid(
+        bm25_by_pack={"geo-pack": [{"pack_id": "geo-pack", "text": "cartography basics", "score": 9.0}]},
+    )
+    candidates, _ = _choose_by_content("art", [pack], hybrid, spaces=None)
+    assert candidates == []
+
+
+def test_t400_content_fallback_fts_only_pack_is_selected() -> None:
+    """설계 §7 항목5. doc_nodes(BM25)엔 없고 doc_sources(FTS)에만 원문이 있는
+    팩도 콘텐츠 폴백으로 정상 선택된다."""
+    pack = PackInfo(pack_id="fts-pack", title="본문 전용", description="")
+    hybrid = _FakeHybrid(
+        fts_by_pack={"fts-pack": [{"metadata": {"pack_id": "fts-pack"}, "text": "표준번호 KS123", "score": 2.0}]},
+    )
+    candidates, _ = _choose_by_content("KS123", [pack], hybrid, spaces=None)
+    assert len(candidates) == 1
+    assert candidates[0][0].pack_id == "fts-pack"
+    assert candidates[0][2] == ["ks123"]
+
+
+def test_t400_content_fallback_small_pack_hit_not_shadowed_by_large_pack() -> None:
+    """설계 §7 항목6. 팩별 개별 조회이므로 큰 팩의 히트 수가 많아도 작은 팩의
+    (매치 없는) 히트가 작은 팩의 조회 자체를 가리지 않는다."""
+    big = PackInfo(pack_id="big-pack", title="대형", description="")
+    small = PackInfo(pack_id="small-pack", title="소형", description="")
+    hybrid = _FakeHybrid(
+        bm25_by_pack={
+            "big-pack": [{"pack_id": "big-pack", "text": "무관 본문", "score": 1.0}],
+            "small-pack": [{"pack_id": "small-pack", "text": "고유토큰123 매치", "score": 1.0}],
+        },
+    )
+    candidates, _ = _choose_by_content("고유토큰123", [big, small], hybrid, spaces=None)
+    assert len(candidates) == 1
+    assert candidates[0][0].pack_id == "small-pack"
+
+
+def test_t400_content_fallback_not_invoked_when_lexical_gate_already_selected() -> None:
+    """설계 §7 항목7 (회귀 대조군). choose_packs가 이미 후보를 낸 경우
+    resolve_packs 수준에서는 콘텐츠 폴백을 아예 부르지 않는다 -- 이 테스트는
+    _choose_by_content 자체가 아니라 그 전제(폴백은 lexical이 빈 리스트일
+    때만 실행)를 score_pack을 통해 재확인한다."""
+    pack = PackInfo(pack_id="p2", title="자리", description="자리", keywords=["자리"])
+    assert choose_packs("자리", [pack]) != []  # lexical 경로가 이미 후보를 낸다 -- 폴백 불필요 조건
+
+
+def test_t400_content_fallback_truncation_is_observed() -> None:
+    """설계 §7 항목9. 팩 하나의 히트 수가 PER_PACK_PROBE_LIMIT에 닿으면
+    truncated_packs에 나타난다 -- 선택 결과 자체에는 영향 없음."""
+    hits = [{"pack_id": "cap-pack", "text": f"항목{i} 고유토큰", "score": 1.0} for i in range(PER_PACK_PROBE_LIMIT)]
+    pack = PackInfo(pack_id="cap-pack", title="", description="")
+    hybrid = _FakeHybrid(bm25_by_pack={"cap-pack": hits})
+    candidates, truncated = _choose_by_content("고유토큰", [pack], hybrid, spaces=None)
+    assert truncated == ["cap-pack"]
+    assert len(candidates) == 1
+
+
+def test_t400_content_fallback_forwards_spaces_to_both_legs() -> None:
+    """설계 §7 항목10. spaces 인자가 BM25/FTS 양쪽 조회 호출에 그대로 전달된다."""
+    pack = PackInfo(pack_id="p1", title="", description="")
+    hybrid = _FakeHybrid()
+    _choose_by_content("무관질의", [pack], hybrid, spaces=["space-a"])
+    assert hybrid.bm25_calls[0][1] == ["space-a"]
+    assert hybrid.fts_calls[0][1] == ["space-a"]
+
+
+def test_t400_content_fallback_spaces_actually_exclude_out_of_space_hits() -> None:
+    """설계 §7 항목10 두 번째 층위. 앞 테스트는 spaces 인자가 mock 호출에
+    그대로 전달되는지(배선)만 봤다 -- 이 테스트는 spaces를 실제로 반영하는
+    하이브리드를 흉내 내, 요청 space 밖의 히트가 선택에서 실제로 배제되는지
+    확인한다. out-space 팩이 더 높은 점수(5.0 > 1.0)를 갖고 있어도 space
+    필터가 없으면 잘못 선택될 것이므로, 이 테스트는 필터가 실제로 걸렸을
+    때만 통과한다."""
+
+    class _SpaceFilteringHybrid:
+        def __init__(self, hits_by_pack: dict[str, list[tuple[str, dict]]]) -> None:
+            self._hits_by_pack = hits_by_pack
+
+        def _bm25_search(self, question, spaces, limit, *, pack_ids):
+            pid = pack_ids[0]
+            return [
+                hit
+                for space, hit in self._hits_by_pack.get(pid, [])
+                if spaces is None or space in spaces
+            ]
+
+        def _fts_search(self, question, spaces, limit, *, pack_ids):
+            return []
+
+    in_space = PackInfo(pack_id="in-space", title="", description="")
+    out_space = PackInfo(pack_id="out-space", title="", description="")
+    hybrid = _SpaceFilteringHybrid(
+        {
+            "in-space": [("space-a", {"pack_id": "in-space", "text": "고유토큰123", "score": 1.0})],
+            "out-space": [("space-b", {"pack_id": "out-space", "text": "고유토큰123", "score": 5.0})],
+        }
+    )
+    candidates, _ = _choose_by_content("고유토큰123", [in_space, out_space], hybrid, spaces=["space-a"])
+    assert len(candidates) == 1
+    assert candidates[0][0].pack_id == "in-space"
+
+
+def test_t400_content_fallback_tiebreak_prefers_higher_summed_score() -> None:
+    """설계 §7 항목11. 매치된 고유 토큰 수가 같으면(둘 다 1개) 누적 BM25/FTS
+    점수 합이 더 큰 팩이 선택된다."""
+    low = PackInfo(pack_id="low-pack", title="", description="")
+    high = PackInfo(pack_id="high-pack", title="", description="")
+    hybrid = _FakeHybrid(
+        bm25_by_pack={
+            "low-pack": [{"pack_id": "low-pack", "text": "고유토큰", "score": 1.0}],
+            "high-pack": [{"pack_id": "high-pack", "text": "고유토큰", "score": 9.0}],
+        },
+    )
+    candidates, _ = _choose_by_content("고유토큰", [low, high], hybrid, spaces=None)
+    assert len(candidates) == 1
+    assert candidates[0][0].pack_id == "high-pack"
+
+
+def test_t400_content_fallback_reported_score_follows_min_score_override() -> None:
+    """설계 §7 항목12. OPENCRAB_AUTO_PACK_MIN_SCORE를 바꾸면(여기서는
+    min_score 인자로) 콘텐츠 폴백이 보고하는 점수도 그 값을 따른다 --
+    실제 BM25 점수가 아니라 문턱값 자체이기 때문이다(§4.4)."""
+    pack = PackInfo(pack_id="p1", title="", description="")
+    hybrid = _FakeHybrid(bm25_by_pack={"p1": [{"pack_id": "p1", "text": "고유토큰", "score": 1.0}]})
+    candidates, _ = _choose_by_content("고유토큰", [pack], hybrid, spaces=None, min_score=42.0)
+    assert candidates[0][1] == 42.0
+
+
+_OLD_WORD_RE = re.compile(r"[a-z0-9]+")
+_OLD_HANGUL_RE = re.compile(r"[가-힣]+")
+
+
+def _old_whole_tokens(text: str) -> set[str]:
+    """설계 §7 항목14 대조군. 수정A(공백/구두점 경계 whole-token) 이전에
+    쓰던, 스크립트별로 분리된 findall 토크나이저를 흉내 낸다."""
+    text = (text or "").lower()
+    tokens: set[str] = set()
+    for rx in (_OLD_WORD_RE, _OLD_HANGUL_RE):
+        tokens.update(rx.findall(text))
+    return {t for t in tokens if t not in _STOPWORDS}
+
+
+def test_t400_live_pack_mixed_script_titles_unaffected_by_whole_token_merge(monkeypatch) -> None:
+    """설계 §7 항목14 (특성화만, 결함 검출용이 아님). 라이브 팩 4건 가운데
+    혼합 문자(한글/숫자/영문, 괄호)가 섞인 실제 제목/설명 3건에 대해, 수정A가
+    도입한 whole-token 경계 방식과 그 이전 방식(스크립트별 분리 findall)의
+    score_pack 결과가 같은지 확인한다. 다르면 수정A가 이 라이브 팩들의 점수를
+    바꿨다는 뜻이므로 회귀다."""
+    packs = [
+        PackInfo(
+            pack_id="brain-science",
+            title="뇌과학 9도메인 근거기반 팩",
+            description=(
+                "신경과학 9대 도메인 PubMed/PMC 원문 + MMP 권위 공공보고서"
+                "(WHO·NIH) + Apple Vision OCR — score≥90"
+            ),
+        ),
+        PackInfo(
+            pack_id="acupoint-medical",
+            title="경혈 의학 팩 (임상·생태·근골 3렌즈)",
+            description=(
+                "WHO 표준 361 정경혈+8맥교회+경외기혈 408혈. "
+                "경락-장부-오행·근육/신경/자침/주치/특정혈/금기"
+            ),
+        ),
+        PackInfo(
+            pack_id="명문장1007",
+            title="명문장 1007선",
+            description="세계·한국 명문장 전건(이형 포함 1007)",
+        ),
+    ]
+    queries = ("뇌과학", "도메인", "명문장", "경혈", "렌즈")
+    from opencrab.ontology import pack_registry as pr
+
+    baseline = {(p.pack_id, q): score_pack(q, p) for p in packs for q in queries}
+    monkeypatch.setattr(pr, "_whole_tokens", _old_whole_tokens)
+    reverted = {(p.pack_id, q): score_pack(q, p) for p in packs for q in queries}
+    assert baseline == reverted
 
 
 # ---------------------------------------------------------------------------
