@@ -751,6 +751,46 @@ class TestMainCli:
         assert backup_dest.exists()
         assert any(backup_dest.iterdir()), "백업 대상 디렉터리에 산출물이 남아야 한다"
 
+    def test_apply_recheck_never_calls_the_full_inventory_method(self, tmp_path, monkeypatch):
+        """5-3절의 apply 직전 재확인은 graph_schema_state() 만 써야 한다(#404).
+        inspect_graph_identity() 로 되돌아가면 diagnose() 때와 마찬가지로
+        같은 schema_state 값을 내므로 결과만 보는 테스트로는 검출할 수
+        없다(회귀 재발 지점은 사후 기억이 아니라 이 테스트가 잡는다)."""
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        data_dir = self._make_target_dirs(tmp_path)
+
+        inspect_calls: list[Any] = []
+        schema_state_calls: list[Any] = []
+        original_inspect = LocalGraphStore.inspect_graph_identity
+        original_schema_state = LocalGraphStore.graph_schema_state
+
+        def counting_inspect(self, *a, **kw):
+            inspect_calls.append(1)
+            return original_inspect(self, *a, **kw)
+
+        def counting_schema_state(self, *a, **kw):
+            schema_state_calls.append(1)
+            return original_schema_state(self, *a, **kw)
+
+        monkeypatch.setattr(LocalGraphStore, "inspect_graph_identity", counting_inspect)
+        monkeypatch.setattr(LocalGraphStore, "graph_schema_state", counting_schema_state)
+
+        exit_code = recon.main(
+            [
+                "--local-data-dir",
+                str(data_dir),
+                "--apply",
+                "--skip-backup",
+                "--record-to",
+                str(tmp_path / "run.jsonl"),
+            ]
+        )
+        assert exit_code == recon.EXIT_OK
+        assert inspect_calls == []
+        # diagnose() 에서 한 번, apply 직전 재확인에서 한 번, 합쳐 최소 2번.
+        assert len(schema_state_calls) >= 2
+
     def test_apply_writes_execution_record_with_correct_directions(self, tmp_path, capsys):
         data_dir = self._make_target_dirs(tmp_path)
         record_path = tmp_path / "run.jsonl"
