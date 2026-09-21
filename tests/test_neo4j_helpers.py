@@ -724,3 +724,28 @@ class TestScopedRelationLookup:
         queries = [c[0][0] for c in session.run.call_args_list]
         assert any("MATCH (n:OpenCrabNode)" in q and "n.pack_id" in q for q in queries)
         assert any("-[r]->" in q and "r.pack_id" in q for q in queries)
+
+
+class TestGraphIdentityInventoryUnavailable:
+    """graph_schema_state()/iter_graph_node_identities()/
+    get_node_identity_by_id() (#404) must reject the same way
+    inspect_graph_identity() already does -- no live driver/session needed
+    since none of these four touch ``self``, so no connected store is built."""
+
+    def test_graph_schema_state_rejects(self) -> None:
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            Neo4jStore.graph_schema_state(None)
+
+    def test_iter_graph_node_identities_rejects(self) -> None:
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            Neo4jStore.iter_graph_node_identities(None)
+
+    def test_get_node_identity_by_id_rejects(self) -> None:
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            Neo4jStore.get_node_identity_by_id(None, "n")
+
+    def test_inspect_graph_identity_rejects_for_parity(self) -> None:
+        # Not new to #404, but establishes the baseline the three new
+        # methods above are held to the same standard as.
+        with pytest.raises(GraphReadCapabilityUnavailable):
+            Neo4jStore.inspect_graph_identity(None)

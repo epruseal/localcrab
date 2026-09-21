@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,7 +22,13 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import reconcile_doc_graph_nodes as recon  # noqa: E402
 
-from opencrab.common.graph_identity import GraphReadCapabilityUnavailable  # noqa: E402
+from opencrab.common.graph_identity import (  # noqa: E402
+    FrozenDict,
+    GraphReadCapabilityUnavailable,
+    LegacyNodeKey,
+    LegacyNodeRow,
+    PropertyNormalizationIssue,
+)
 
 # ---------------------------------------------------------------------------
 # 픽스처
@@ -63,12 +70,21 @@ class _FakeGraphStore:
     def inspect_graph_identity(self):
         return _FakeInventory(self._schema_state)
 
+    def graph_schema_state(self):
+        return self._schema_state
+
+    def iter_graph_node_identities(self, batch_size: int = 5000):
+        return iter(())
+
     def upsert_node(self, node_type, node_id, properties, space_id):
         self.upsert_calls.append((node_type, node_id, properties, space_id))
 
 
 class _RejectingGraphStore:
     def inspect_graph_identity(self):
+        raise GraphReadCapabilityUnavailable("Neo4j/Kuzu 는 이 진단을 지원하지 않는다")
+
+    def graph_schema_state(self):
         raise GraphReadCapabilityUnavailable("Neo4j/Kuzu 는 이 진단을 지원하지 않는다")
 
 
@@ -253,6 +269,115 @@ class TestGraphOnlyBackfill:
         assert results[0].outcome == "skipped_exists"
         doc = doc_store.get_node_doc("space-a", "g1")
         assert doc["properties"]["label"] == "CONCURRENT_WRITE"
+
+    def test_backfill_skips_when_source_vanished_at_apply(self, graph_store, doc_store):
+        """#404: _backfill_one() 이 apply 직전 get_node_identity_by_id() 로
+        다시 조회한다 -- 진단 이후 그래프 쪽에서 삭제됐으면 되살리지 않고
+        건너뛴다."""
+        graph_store.upsert_node("Concept", "g1", {"label": "x"}, "space-a")
+        report = recon.diagnose(graph_store, doc_store)
+
+        graph_store.delete_node("Concept", "g1")
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=False)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_BACKFILL_VANISHED_AT_APPLY
+        assert doc_store.get_node_doc("space-a", "g1") is None
+
+    def test_backfill_skips_when_apply_time_refetch_finds_property_error(self, graph_store, doc_store):
+        """진단 시점에는 정상이던 노드의 properties 가 apply 시점 재조회에서
+        malformed 로 나오면(동시 오염), 진단 시점 스냅샷을 신뢰하지 않고
+        건너뛴다."""
+        graph_store.upsert_node("Concept", "g1", {"label": "x"}, "space-a")
+        report = recon.diagnose(graph_store, doc_store)
+
+        # idx_nodes_pack 은 json_extract() 표현식 인덱스라 malformed 텍스트로
+        # 갱신하려면 먼저 인덱스를 지워야 한다(test_sql_graph_base.py 의
+        # 같은 우회와 동일한 이유).
+        graph_store._conn.execute("DROP INDEX idx_nodes_pack")
+        graph_store._conn.execute(
+            "UPDATE graph_nodes SET properties = 'not json' WHERE node_id = 'g1'"
+        )
+        graph_store._conn.commit()
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=False)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_BACKFILL_REJECTED_AT_APPLY
+        assert doc_store.get_node_doc("space-a", "g1") is None
+
+    def test_backfill_skips_when_identity_changed_at_apply(self, graph_store, doc_store):
+        """진단 이후 같은 node_id 가 삭제되고 다른 space/type 으로
+        재생성됐으면, node_id 재조회가 "같은 노드"를 가리킨다고 가정하지
+        않고 건너뛴다 (PK 유일성과 시간에 걸친 동일성의 혼동 방지)."""
+        graph_store.upsert_node("Concept", "g1", {"label": "x"}, "space-a")
+        report = recon.diagnose(graph_store, doc_store)
+
+        graph_store.delete_node("Concept", "g1")
+        graph_store.upsert_node("Document", "g1", {"label": "y"}, "space-b")
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=False)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_BACKFILL_IDENTITY_CHANGED_AT_APPLY
+        # additive-only 보장: 재생성된 노드의 문서도 만들어지지 않아야 한다.
+        assert doc_store.get_node_doc("space-a", "g1") is None
+        assert doc_store.get_node_doc("space-b", "g1") is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_heavy_fields (3절, #404)
+# ---------------------------------------------------------------------------
+
+
+class TestStripHeavyFields:
+    def _full_row(self, **overrides: Any) -> LegacyNodeRow:
+        defaults: dict[str, Any] = dict(
+            key=LegacyNodeKey("Concept", "g1"),
+            space_id="space-a",
+            pack_id="pack-x",
+            raw_properties=b'{"a": 1}',
+            normalized_properties=FrozenDict({"a": 1}),
+            property_error=None,
+            normalization_issues=(),
+            digest="deadbeef",
+        )
+        defaults.update(overrides)
+        return LegacyNodeRow(**defaults)
+
+    def test_strips_raw_and_normalized_and_digest(self):
+        stripped = recon._strip_heavy_fields(self._full_row())
+
+        assert stripped.raw_properties is None
+        assert stripped.normalized_properties is None
+        assert stripped.digest == ""
+        assert stripped.key == LegacyNodeKey("Concept", "g1")
+        assert stripped.space_id == "space-a"
+
+    def test_keeps_normalization_issue_count_but_empties_raw_values(self):
+        issue = PropertyNormalizationIssue(
+            "node", "Concept:g1", "space_id", FrozenDict({"space": "elsewhere"}), "reserved_value_conflict"
+        )
+        stripped = recon._strip_heavy_fields(self._full_row(normalization_issues=(issue,)))
+
+        assert len(stripped.normalization_issues) == 1
+        assert stripped.normalization_issues[0].raw_values == FrozenDict({})
+        assert stripped.normalization_issues[0].reason == "reserved_value_conflict"
+
+    def test_string_and_none_pack_id_are_left_untouched(self):
+        assert recon._strip_heavy_fields(self._full_row(pack_id="pack-x")).pack_id == "pack-x"
+        assert recon._strip_heavy_fields(self._full_row(pack_id=None)).pack_id is None
+
+    def test_non_string_pack_id_replaced_with_type_named_placeholder(self):
+        stripped = recon._strip_heavy_fields(self._full_row(pack_id={"nested": "blob"}))
+        assert stripped.pack_id == "<non_string_pack_id:dict>"
+
+        stripped_list = recon._strip_heavy_fields(self._full_row(pack_id=[1, 2, 3]))
+        assert stripped_list.pack_id == "<non_string_pack_id:list>"
 
 
 # ---------------------------------------------------------------------------

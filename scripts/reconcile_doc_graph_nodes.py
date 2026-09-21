@@ -61,15 +61,18 @@ LocalSQLDocStore.__init__ 은 doc_sources_fts 색인 백필(doc_nodes/graph_node
 경우든 doc_nodes/graph_nodes 에 어떤 쓰기도 하지 않는다(진단 실행, --apply
 없이).
 
-## 알려진 한계 (3절, 투명 공개, 이 이슈의 수정 대상이 아님)
+## 그래프 쪽 진단의 메모리 사용 (3절, #404)
 
-그래프 쪽 진단은 기존 inspect_graph_identity() 를 그대로 쓴다. 이 메서드는
-graph_nodes/graph_edges 전 테이블을 LIMIT 없이 한 번에 메모리에 올리는 기존
-계약(마이그레이션 계획 수립 등 다른 호출자가 이미 쓴다)을 그대로 물려받는다.
-그래프 쪽 노드 수가 매우 크면 이 진단 단계에서 그래프 쪽 메모리 사용량이
-커질 수 있다. 문서 쪽은 iter_node_identities() 로 이 문제를 해소하지만,
-그래프 쪽 해소는 이 공유 마이그레이션 인프라를 바꾸는 별도 작업이 필요하므로
-범위 밖이다.
+그래프 쪽 진단은 이제 inspect_graph_identity() 를 쓰지 않는다(#404 이전에는
+이 메서드가 graph_nodes/graph_edges 전 테이블을 LIMIT 없이 한 번에 메모리에
+올렸고, 실제 규모(노드 369,377건/엣지 813,733건)에서 OOM kill을 냈다).
+graph_store.iter_graph_node_identities() 로 graph_nodes 만 배치 페이지네이션
+스트리밍하고, 배치 크기를 넘는 원시 행을 동시에 들고 있지 않는다. 문서 쪽의
+iter_node_identities() 와 짝을 이루는 방식이다. 다만 이 도구 자체는 여전히
+전체 node_id 집합을 딕셔너리(graph_by_id/doc_by_id)에 담아 두 스토어를
+대사한다: 노드 수에 비례하는 메모리 사용 자체가 없어진 것은 아니고, 노드당
+보관 데이터를 원시+정규화 속성 사본 없는 경량 형태로 줄인 것이다. 수백만
+노드 규모의 완전한 O(1) 스트리밍 대사는 이 수정의 범위 밖이다.
 
 EXIT CODES:
     0 성공(치유 불가/건너뜀 행이 있어도 도구 자체는 정상 종료), 2 사용법 오류,
@@ -92,13 +95,15 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
 from opencrab.common.graph_identity import (
+    FrozenDict,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
+    LegacyNodeRow,
     NodeIdentityConflict,
     prepare_node,
     thaw_json,
@@ -121,6 +126,9 @@ REASON_PROMOTION_REJECTED_AT_APPLY = "promotion_rejected_at_apply"
 REASON_DUP_SPACE_NO_GRAPH = "duplicate_space_no_graph_match"
 REASON_PROMOTION_VANISHED_AT_APPLY = "promotion_source_vanished_at_apply"
 REASON_DUP_SPACE_AT_APPLY = "promotion_duplicate_space_at_apply"
+REASON_BACKFILL_VANISHED_AT_APPLY = "backfill_source_vanished_at_apply"
+REASON_BACKFILL_REJECTED_AT_APPLY = "backfill_source_rejected_at_apply"
+REASON_BACKFILL_IDENTITY_CHANGED_AT_APPLY = "backfill_identity_changed_at_apply"
 
 
 @dataclass
@@ -131,12 +139,13 @@ class GraphOnlyRow:
     pack_id: str | None
     healable: bool
     reason: str | None = None
-    raw_row: Any = None
-    """진단 시점에 이미 읽어 둔 ``LegacyNodeRow``. 치유는 이 값의
-    ``normalized_properties`` 를 그대로 쓰고(4-1절), 별도로 다시 조회하지
-    않는다(6절, "치유 대상 소수 행에 대해서만 기존 단건 조회 메서드를
-    그대로 쓴다" -- 그래프 쪽은 이미 진단이 들고 있는 이 값 자체가 그
-    단건 조회에 해당한다)."""
+    """역채움은 이제 apply 시점에 그래프를 다시 조회한다(#404). 진단
+    시점 스냅샷을 들고 있지 않는다. 이전(#317) 설계는 진단이 이미 읽어
+    둔 ``LegacyNodeRow`` 를 ``raw_row`` 필드에 그대로 보관해 치유
+    시점까지 재사용했지만, #404가 그래프 쪽 진단을 배치 스트리밍으로
+    바꾸면서 healable 행의 무거운 정규화 속성 사본을 apply 시점까지
+    계속 붙들고 있을 근거가 사라졌다. 대신 ``_backfill_one()`` 이
+    ``get_node_identity_by_id()`` 로 단건 재조회한다(4절)."""
 
 
 @dataclass
@@ -189,6 +198,44 @@ class ReconciliationRejectedError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _strip_heavy_fields(full_row: LegacyNodeRow) -> LegacyNodeRow:
+    """LegacyNodeRow에서 분류에 쓰지 않는 무거운 필드를 벗겨낸다(#404).
+
+    diagnose()는 진단이 끝날 때까지 그래프 쪽 노드 전체를 딕셔너리에
+    담아 둔다. raw_properties/normalized_properties/digest는 분류에
+    쓰이지 않으므로 즉시 None/빈 문자열로 비운다. normalization_issues는
+    "존재 유무"만 _classify_graph_only()가 쓰지만, 튜플 자체를 비우면
+    그 정보(유무)까지 잃으므로 튜플 길이는 남기고 각 항목의 raw_values만
+    빈 FrozenDict로 비운다: raw_values는 malformed 원본 값을 그대로
+    담을 수 있어, 벗기지 않으면 노드 수만큼 그 원본 값이 진단 종료까지
+    누적된다.
+
+    pack_id도 같은 이유로 검사한다. _node_inventory_row()
+    (_sql_graph_base.py)는 pack_id 필드값을 문자열인지 검증하기 전에
+    이미 LegacyNodeRow.pack_id에 대입한다: pack_id가 큰 dict/list 같은
+    비문자열 blob이면 그 원본 값 전체가 이 필드에 그대로 남는다
+    (normalization_issues 존재 여부로 "비문자열이라 치유 불가"라는
+    판정 자체는 이미 남으므로 원본 값을 보존할 필요가 없다). None이거나
+    str이면 그대로 두고, 그 외 타입이면 타입 이름만 남긴 짧은 문자열로
+    바꾼다.
+    """
+    stripped_issues = tuple(
+        replace(issue, raw_values=FrozenDict({}))
+        for issue in full_row.normalization_issues
+    )
+    pack_id = full_row.pack_id
+    if pack_id is not None and not isinstance(pack_id, str):
+        pack_id = f"<non_string_pack_id:{type(pack_id).__name__}>"
+    return replace(
+        full_row,
+        pack_id=pack_id,
+        raw_properties=None,
+        normalized_properties=None,
+        digest="",
+        normalization_issues=stripped_issues,
+    )
+
+
 def diagnose(graph_store: Any, doc_store: Any) -> DiagnosisReport:
     """두 스토어의 노드 키 집합을 대사해 :class:`DiagnosisReport` 를 만든다.
 
@@ -196,16 +243,24 @@ def diagnose(graph_store: Any, doc_store: Any) -> DiagnosisReport:
     가능 여부(4-2절)까지 여기서 미리 판정하는 이유는, --apply 없이도
     "치유 불가" 건수가 정확해야 한다는 이 도구의 존재 이유(2-4절, 3절)
     때문이다.
+
+    그래프 쪽은 inspect_graph_identity()(노드+엣지 전량을 원시+정규화+
+    지문 세 겹으로 적재)가 아니라 graph_schema_state()와
+    iter_graph_node_identities()를 쓴다(#404). 이 도구는 엣지를 전혀
+    참조하지 않고, 노드 쪽도 분류에 쓰는 경량 필드만 있으면 되므로
+    전량 인벤토리가 애초에 필요 없었다.
     """
-    inventory = graph_store.inspect_graph_identity()
-    schema_state = inventory.schema_state
+    schema_state = graph_store.graph_schema_state()
     if schema_state in ("legacy", "partial"):
         raise ReconciliationRejectedError(
             f"schema_state={schema_state!r} 에서는 node_id 전역 유일성 전제가 "
             "성립하지 않을 수 있어 재조정을 거부한다."
         )
 
-    graph_by_id: dict[str, Any] = {row.key.node_id: row for row in inventory.nodes}
+    graph_by_id: dict[str, LegacyNodeRow] = {}
+    for full_row in graph_store.iter_graph_node_identities():
+        graph_by_id[full_row.key.node_id] = _strip_heavy_fields(full_row)
+        del full_row  # for 루프 변수가 마지막 행을 계속 붙들지 않게 한다
 
     doc_by_id: dict[str, list[tuple[str, str]]] = {}
     for space, node_id, node_type in doc_store.iter_node_identities():
@@ -233,7 +288,7 @@ def _classify_graph_only(node_id: str, graph_row: Any, report: DiagnosisReport) 
     if graph_row.property_error is not None:
         report.graph_only.append(
             GraphOnlyRow(
-                node_id, graph_row.key.node_type, graph_row.space_id, pack_id, False, REASON_PROPERTY_ERROR, graph_row
+                node_id, graph_row.key.node_type, graph_row.space_id, pack_id, False, REASON_PROPERTY_ERROR
             )
         )
         return
@@ -246,17 +301,16 @@ def _classify_graph_only(node_id: str, graph_row: Any, report: DiagnosisReport) 
                 pack_id,
                 False,
                 REASON_NORMALIZATION_ISSUE,
-                graph_row,
             )
         )
         return
     if graph_row.space_id is None:
         report.graph_only.append(
-            GraphOnlyRow(node_id, graph_row.key.node_type, None, pack_id, False, REASON_SPACE_ID_NONE, graph_row)
+            GraphOnlyRow(node_id, graph_row.key.node_type, None, pack_id, False, REASON_SPACE_ID_NONE)
         )
         return
     report.graph_only.append(
-        GraphOnlyRow(node_id, graph_row.key.node_type, graph_row.space_id, pack_id, True, None, graph_row)
+        GraphOnlyRow(node_id, graph_row.key.node_type, graph_row.space_id, pack_id, True, None)
     )
 
 
@@ -337,28 +391,51 @@ def heal(
     """
     results: list[HealResult] = []
     for row in report.graph_only_healable():
-        results.append(_backfill_one(doc_store, row))
+        results.append(_backfill_one(graph_store, doc_store, row))
     if promote_doc_only:
         for row in report.doc_only_healable():
             results.append(_promote_one(graph_store, doc_store, row))
     return results
 
 
-def _backfill_one(doc_store: Any, row: GraphOnlyRow) -> HealResult:
-    """그래프 전용 노드를 문서 스토어에 역채움한다 (4-1절).
+def _backfill_one(graph_store: Any, doc_store: Any, row: GraphOnlyRow) -> HealResult:
+    """그래프 전용 노드를 문서 스토어에 역채움한다 (4-1절, #404 이후).
 
-    진단 단계가 이미 읽어 둔 ``LegacyNodeRow.normalized_properties`` 를 그대로
-    쓰고 그래프를 다시 조회하지 않는다(6절, 기존 단건 조회 재사용). 쟁점2:
-    ``normalized_properties`` 는 중첩 값을 ``FrozenDict``/``tuple`` 로 얼려
-    담으므로 ``dict()`` 얕은 변환이 아니라 ``thaw_json()`` 으로 재귀 복원한다.
+    진단 시점 스냅샷을 쓰지 않고 apply 직전 get_node_identity_by_id()로
+    그래프를 다시 조회한다 -- _promote_one()이 문서 전용 쪽에 이미 적용한
+    것과 대칭인 패턴이다(#317 원 설계는 "역채움은 그래프를 다시 조회하지
+    않는다"였다. #404가 그래프 쪽 진단을 스트리밍으로 바꾸면서 healable
+    행의 무거운 속성 사본을 apply 시점까지 붙들고 있을 근거가 없어졌으므로
+    의도적으로 이탈한다).
+
+    node_id 단일 재조회는 "지금 이 node_id를 가진 행은 최대 하나"만
+    보장하고, "진단 시점과 같은 노드"까지는 보장하지 않는다: 진단 이후
+    그 node_id가 삭제되고 다른 space/type으로 재생성됐을 수 있다. 그래서
+    space_id와 node_type을 진단 시점 값과 대조해, 둘 중 하나라도 다르면
+    정체성이 바뀐 것으로 보고 거부한다. _promote_one()이 문서 쪽에서
+    space 불일치를 거부하는 것과 대칭인 검사다.
     """
-    props = thaw_json(row.raw_row.normalized_properties)
-    if row.pack_id is not None:
-        props["pack_id"] = row.pack_id
-    outcome = doc_store.create_node_doc_if_absent(row.space_id, row.node_type, row.node_id, props)
+    current = graph_store.get_node_identity_by_id(row.node_id)
+    if current is None:
+        return HealResult(
+            row.node_id, row.space_id, "backfill", "skipped_rejected", REASON_BACKFILL_VANISHED_AT_APPLY
+        )
+    if current.property_error is not None or current.normalization_issues or current.space_id is None:
+        return HealResult(
+            row.node_id, current.space_id, "backfill", "skipped_rejected", REASON_BACKFILL_REJECTED_AT_APPLY
+        )
+    if current.space_id != row.space_id or current.key.node_type != row.node_type:
+        return HealResult(
+            row.node_id, current.space_id, "backfill", "skipped_rejected", REASON_BACKFILL_IDENTITY_CHANGED_AT_APPLY
+        )
+
+    props = thaw_json(current.normalized_properties)
+    if current.pack_id is not None:
+        props["pack_id"] = current.pack_id
+    outcome = doc_store.create_node_doc_if_absent(current.space_id, current.key.node_type, row.node_id, props)
     if outcome == "created":
-        return HealResult(row.node_id, row.space_id, "backfill", "healed")
-    return HealResult(row.node_id, row.space_id, "backfill", "skipped_exists")
+        return HealResult(row.node_id, current.space_id, "backfill", "healed")
+    return HealResult(row.node_id, current.space_id, "backfill", "skipped_exists")
 
 
 def _promote_one(graph_store: Any, doc_store: Any, row: DocOnlyRow) -> HealResult:
@@ -604,14 +681,17 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_BACKUP
 
     # 5-3절: --apply 직전 schema_state 를 다시 확인한다(진단과 적용 사이의
-    # 변경을 잡기 위함, "다시 확인" 이 요구하는 신선한 재조회).
+    # 변경을 잡기 위함, "다시 확인" 이 요구하는 신선한 재조회). .schema_state
+    # 하나만 쓰므로 전량 인벤토리(inspect_graph_identity())가 아니라
+    # graph_schema_state()를 쓴다(#404) -- 이 재확인 단계도 그래프 노드
+    # 수와 무관해진다.
     try:
-        recheck = graph_store.inspect_graph_identity()
+        recheck_state = graph_store.graph_schema_state()
     except GraphReadCapabilityUnavailable as exc:
         print(f"이 백엔드는 재조정을 지원하지 않는다: {exc}", file=sys.stderr)
         return EXIT_REJECTED
-    if recheck.schema_state != "target":
-        print(f"schema_state={recheck.schema_state!r} 에서는 적용할 수 없다.", file=sys.stderr)
+    if recheck_state != "target":
+        print(f"schema_state={recheck_state!r} 에서는 적용할 수 없다.", file=sys.stderr)
         return EXIT_REJECTED
 
     record_path = Path(args.record_to) if args.record_to else Path(f"reconcile_run_{int(time.time())}.jsonl")
@@ -620,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     heal_results: list[HealResult] = []
     try:
         for row in report.graph_only_healable():
-            result = _backfill_one(doc_store, row)
+            result = _backfill_one(graph_store, doc_store, row)
             heal_results.append(result)
             try:
                 writer.append(result)

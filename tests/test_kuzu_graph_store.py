@@ -51,6 +51,24 @@ def test_kuzu_public_mutations_fail_closed() -> None:
         raise AssertionError("Kùzu mutation did not fail closed")
 
 
+def test_kuzu_new_graph_identity_read_methods_fail_closed() -> None:
+    """#404 adds three read methods alongside inspect_graph_identity() --
+    they must fail the same way (__getattr__ routes any name not in
+    _WRITE_NAMES to GraphReadCapabilityUnavailable), not silently succeed
+    or crash with an unrelated AttributeError."""
+    store = KuzuUnavailableGraphStore()
+    for call in (
+        lambda: store.graph_schema_state(),
+        lambda: list(store.iter_graph_node_identities()),
+        lambda: store.get_node_identity_by_id("n"),
+    ):
+        try:
+            call()
+        except GraphReadCapabilityUnavailable:
+            continue
+        raise AssertionError("Kùzu #404 identity read method unexpectedly enabled")
+
+
 def test_kuzu_query_guard_distinguishes_read_and_write() -> None:
     store = KuzuUnavailableGraphStore()
     try:
