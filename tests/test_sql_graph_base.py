@@ -869,6 +869,32 @@ def test_iter_graph_node_identities_batch_size_non_positive_returns_empty():
     assert list(store.iter_graph_node_identities(batch_size=-1)) == []
 
 
+def test_iter_graph_node_identities_pages_via_multiple_fetch_calls():
+    # Correctness alone (the boundary test below) can't distinguish paged
+    # fetches from one unbounded fetchall that happens to return the right
+    # rows -- count the underlying _fetch_all calls directly to prove this
+    # is actually keyset pagination, not a single full-table read.
+    store = _store()
+    for i in range(5):
+        store.upsert_node("Person", f"n{i}", {})
+
+    calls: list[Any] = []
+    original = store._fetch_all
+
+    def counting_fetch_all(sql: str, params: dict[str, Any]) -> list[tuple]:
+        calls.append(params.get("batch"))
+        return original(sql, params)
+
+    store._fetch_all = counting_fetch_all  # type: ignore[method-assign]
+
+    list(store.iter_graph_node_identities(batch_size=2))
+
+    # 5 rows at batch_size=2: pages of 2, 2, 1, then an empty terminating
+    # fetch -- 4 calls. A single unbounded fetch would show only 2 (one
+    # full read, one empty confirmation).
+    assert len(calls) >= 3
+
+
 def test_iter_graph_node_identities_streams_across_batch_boundaries():
     store = _store()
     ids = [f"n{i:02d}" for i in range(7)]
