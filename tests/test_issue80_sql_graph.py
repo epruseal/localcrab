@@ -44,6 +44,7 @@ from tests.issue80_migration import FixtureHandle
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 import migrate_sqlite_to_pg as fwd  # noqa: E402
+import reconcile_doc_graph_nodes as recon  # noqa: E402
 
 
 def _expect(exc_type: type[BaseException], callback: Callable[[], Any]) -> None:
@@ -343,6 +344,60 @@ def test_pg_runtime_provenance_cas() -> None:
         receipt = store.backfill_pack_provenance([record])
         assert receipt.target_fingerprint_before == target
         assert store.get_node("Entity", "pg-prov")["pack_id"] == "issue80-pack"
+
+
+def test_pg_runtime_jsonb_string_scalar_property_is_rejected_not_reparsed() -> None:
+    """Issue #317, issue80 dual-verification round-1 counterexample 2.
+
+    A live PG JSONB column can hold a string scalar whose text happens to
+    look like a JSON object (e.g. corruption, or a legacy write path that
+    stored the properties document twice-encoded).  ``decode_raw_properties``
+    must reject that value on sight -- the fact that ``json.loads()`` would
+    parse it successfully is not evidence that the column ever held an
+    object, and the pre-fix code treated a successful re-parse as proof of
+    validity.  This exercises the real driver round-trip that the unit-level
+    test (``tests/test_issue80_migration.py``) cannot: psycopg already
+    decodes JSONB before ``_node_inventory_row``/``_edge_inventory_row`` ever
+    see the value, so only a live PG connection proves what actually arrives
+    at that boundary.
+    """
+    with _pg_runtime() as store:
+        store.upsert_node("Person", "pg-scalar-node", {"name": "ok"})
+        store.upsert_edge("Person", "pg-scalar-node", "knows", "Person", "pg-scalar-node", {"weight": 1})
+        nodes_table = store._table("graph_nodes")
+        edges_table = store._table("graph_edges")
+        with store._conn(write=True) as conn:
+            conn.execute(
+                store._text(f"UPDATE {nodes_table} SET properties = CAST(:val AS JSONB) WHERE node_id = :nid"),
+                {"val": '"{}"', "nid": "pg-scalar-node"},
+            )
+            conn.execute(
+                store._text(
+                    f"UPDATE {edges_table} SET properties = CAST(:val AS JSONB) "
+                    "WHERE from_id = :nid AND relation = :rel AND to_id = :nid"
+                ),
+                {"val": '"{}"', "nid": "pg-scalar-node", "rel": "knows"},
+            )
+
+        inventory = store.inspect_graph_identity()
+        node_row = next(row for row in inventory.nodes if row.key.node_id == "pg-scalar-node")
+        assert node_row.raw_properties == "{}"
+        assert node_row.property_error == "jsonb_non_object_scalar"
+        assert node_row.digest == ""
+
+        edge_row = next(
+            row for row in inventory.edges
+            if row.from_key.node_id == "pg-scalar-node" and row.relation == "knows"
+        )
+        assert edge_row.raw_properties == "{}"
+        assert edge_row.property_error == "jsonb_non_object_scalar"
+        assert edge_row.digest == ""
+
+        report = recon.DiagnosisReport(schema_state=inventory.schema_state)
+        recon._classify_graph_only("pg-scalar-node", node_row, report)
+        classified = report.graph_only[0]
+        assert classified.healable is False
+        assert classified.reason == recon.REASON_PROPERTY_ERROR
 
 
 @dataclass(frozen=True)

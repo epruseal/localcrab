@@ -379,6 +379,17 @@ def _promote_one(graph_store: Any, doc_store: Any, row: DocOnlyRow) -> HealResul
     (쟁점1과 같은 근거를 적용 지점에도 적용한다). 이 예외를 넓게 잡지
     않으면 한 행의 검증 실패가 나머지 행 전체 처리를 막고 도구를 비정상
     종료시킨다.
+
+    ``outcome == "healed"`` 가 실제로 보장하는 것 (#317 이중검증 1라운드
+    반례 1, `upsert_node()`/`_as_dict()` 재해석 문제는 이 PR 범위 밖이며
+    `#402` 로 이관한다):
+
+    - 보장: 승격 경로가 예외 없이 끝났고, 그 시점에 해당 노드가 그래프
+      스토어에 존재한다.
+    - 보장하지 않음: 실제로 행을 썼는지(``upsert_node()`` 는 동일
+      digest 의 기존 행이 있으면 INSERT 도 UPDATE 도 실행하지 않고
+      ``operation="idempotent"`` 를 반환할 수 있다). 그 행이 정상 형태로
+      저장돼 있는지. 기존 행이 있었다면 이번 실행이 그것을 갱신했는지.
     """
     current_rows = doc_store.get_node_docs_by_id(row.node_id)
     if len(current_rows) > 1:
