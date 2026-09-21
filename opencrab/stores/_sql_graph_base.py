@@ -1105,6 +1105,15 @@ class _SqlGraphStoreBase(abc.ABC):
         값이다)이 ``WHERE node_id > ''``에 걸려 첫 페이지에서 조용히
         빠지고, 그 결과 진단 전체에서 누락된다(#404 설계검증 1라운드에서
         지적된 결함). None sentinel과 조건 분기로 이를 막는다.
+
+        커서 전진 보장: node_id가 PRIMARY KEY라 NULL이 아니고 전역 유일하다.
+        첫 페이지 이후 질의는 ``node_id > :last_id``로 엄격 부등호를 쓰고
+        ``next_last_id``는 그 조건을 통과한 행에서만 나오므로, 페이지가
+        비어 있지 않은 한 ``next_last_id``는 이전 ``last_id``보다 반드시
+        커진다. 페이지가 비면 즉시 반환한다. 그래서 이 루프는 무한히
+        멈추지 않을 수 없다(node_id="" 행이 있어도 None sentinel 덕에
+        첫 페이지 판별과 헷갈리지 않는다 -- 변이 테스트에서 sentinel을
+        빈 문자열로 되돌리면 바로 이 경로가 무한 루프로 재현됐다).
         """
         self._require_available()
         if batch_size <= 0:
