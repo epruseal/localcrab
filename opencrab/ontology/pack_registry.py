@@ -366,6 +366,18 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
     # 리뷰 PR #405 반례: whole-token 부분집합 비교는 순서를 무시해 순서만
     # 다른 pack_id/source_label 이 정답과 동점이 된다). 질의 쪽 순서열은
     # 한 번만 뽑아 두 보너스에서 재사용한다.
+    #
+    # title은 이 방식을 쓰지 않고 아래처럼 _phrase_at_boundary(원문
+    # substring + 경계 조건)를 그대로 쓴다. pack_id/source_label은 식별자
+    # 성격의 문자열이라 하이픈/공백/밑줄 같은 구분자가 값 자체의 의미를
+    # 바꾸지 않는다(같은 대상을 어떻게 표기하느냐의 차이일 뿐이다). title은
+    # manifest 저자가 쓴 자연어 문장이라 구분자(공백, 구두점)가 문장의
+    # 읽는 방식과 뜻을 이룬다. 그래서 pack_id/source_label은 구분자를
+    # 정규화하는 토큰 비교가 맞고, title은 원문 그대로의 substring 비교가
+    # 맞다. 순서 보존 여부와 구분자 관용 여부는 서로 다른 축이라(#400
+    # 원본 결함은 순서 축, 하이픈-공백 관용은 별개로 이미 받아들여진
+    # 기능) 세 보너스가 서로 다른 두 방식을 쓰는 것은 통일해야 할 불일치가
+    # 아니다.
     q_whole_seq = _ordered_whole_tokens(question)
 
     pack_id_seq = _ordered_whole_tokens(pack.pack_id)

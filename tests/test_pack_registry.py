@@ -288,6 +288,29 @@ def test_t400_source_label_bonus_is_order_sensitive() -> None:
     assert score_exact == 30.0
 
 
+def test_t400_pack_id_bonus_alias_equivalence_still_order_sensitive() -> None:
+    """리드 지적(PR #405): `_alias_equivalent`가 위치별 비교에 들어가도
+    순서 보존을 우회하면 안 된다. 별칭이 섞인 두 토큰이 순서만 바뀌면
+    여전히 매치가 거부돼야 한다. 질의는 `_ALIASES["nemotron"]`의 별칭
+    "nvidia"를 쓴다: 정답은 별칭을 거쳐도 원래 순서(nemotron, persona)와
+    같아 매치되고, 순서를 뒤집은 pack_id는 같은 별칭 조합이라도 매치되지
+    않아야 한다."""
+    exact = PackInfo(pack_id="nemotron-persona")
+    permuted = PackInfo(pack_id="persona-nemotron")
+
+    query = "nvidia persona pack"
+
+    score_exact, matched_exact = score_pack(query, exact)
+    score_permuted, matched_permuted = score_pack(query, permuted)
+
+    assert any(m.startswith("pack_id:") for m in matched_exact)
+    assert not any(m.startswith("pack_id:") for m in matched_permuted)
+    assert score_exact > score_permuted
+
+    chosen = choose_packs(query, [permuted, exact])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["nemotron-persona"]
+
+
 # ---------------------------------------------------------------------------
 # #400 §4: _choose_by_content -- BM25/FTS 콘텐츠 폴백. score_pack()의 게이트가
 # 전부 닫혔을 때(title/description/keywords/tags 어디에도 리터럴이 없을 때)만
