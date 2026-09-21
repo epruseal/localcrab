@@ -917,6 +917,8 @@ def query(
         raise_on_error=True,
         sql=sql,
         principal=principal,
+        hybrid=hybrid,
+        spaces=space_filter,
     )
     effective_pack_ids = selection.effective_pack_ids
     selected_packs = selection.selected_packs

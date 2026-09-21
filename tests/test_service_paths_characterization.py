@@ -641,6 +641,61 @@ class TestResolvePacksErrorPolicy:
         assert [w.code for w in sel.warnings] == [PACK_IDS_OVERRIDE_AUTO]
 
 
+class TestResolvePacksContentFallback:
+    """#400 §5 배선: choose_packs(제목/설명/키워드/태그 리터럴 게이트)가 빈
+    리스트를 낸 뒤에만, ``hybrid``가 주어졌을 때 resolve_packs가 콘텐츠
+    폴백(_choose_by_content)으로 넘어간다. 단위 시험은
+    tests/test_pack_registry.py의 test_t400_content_fallback_* 가 맡고,
+    여기서는 그 폴백이 resolve_packs 배선을 실제로 타는지만 확인한다."""
+
+    def test_content_fallback_selects_pack_the_lexical_gate_missed(self, monkeypatch):
+        from opencrab.services.pack_selection import AUTO_PACK_BELOW_THRESHOLD, resolve_packs
+
+        # title/description 어디에도 질의 토큰이 없다 -- choose_packs는 반드시 빈 리스트.
+        monkeypatch.setattr(
+            "opencrab.pack.ownership.list_packs_for",
+            lambda sql, principal: [
+                {"pack_id": "pack-a", "title": "기타 자료", "description": "분류 없음"}
+            ],
+        )
+
+        class _FakeHybrid:
+            def _bm25_search(self, question, spaces, limit, *, pack_ids):
+                return [{"pack_id": pack_ids[0], "text": "네오다임 합금 규격", "score": 3.5}]
+
+            def _fts_search(self, question, spaces, limit, *, pack_ids):
+                return []
+
+        sel = resolve_packs(
+            "네오다임", None, True, False, "/tmp",
+            scope=frozenset({"pack-a"}), raise_on_error=False,
+            sql=MagicMock(), principal=MagicMock(),
+            hybrid=_FakeHybrid(), spaces=None,
+        )
+        assert AUTO_PACK_BELOW_THRESHOLD not in [w.code for w in sel.warnings]
+        assert sel.selected_packs and sel.selected_packs[0]["pack_id"] == "pack-a"
+        assert sel.effective_pack_ids == ["pack-a"]
+
+    def test_no_hybrid_skips_fallback_and_reports_below_threshold(self, monkeypatch):
+        """hybrid=None(기본값)이면 콘텐츠 폴백을 아예 타지 않는다 -- #400
+        이전과 동일하게 AUTO_PACK_BELOW_THRESHOLD로 저조 처리."""
+        from opencrab.services.pack_selection import AUTO_PACK_BELOW_THRESHOLD, resolve_packs
+
+        monkeypatch.setattr(
+            "opencrab.pack.ownership.list_packs_for",
+            lambda sql, principal: [
+                {"pack_id": "pack-a", "title": "기타 자료", "description": "분류 없음"}
+            ],
+        )
+        sel = resolve_packs(
+            "네오다임", None, True, False, "/tmp",
+            scope=frozenset({"pack-a"}), raise_on_error=False,
+            sql=MagicMock(), principal=MagicMock(),
+        )
+        assert sel.selected_packs == []
+        assert [w.code for w in sel.warnings] == [AUTO_PACK_BELOW_THRESHOLD]
+
+
 # ===========================================================================
 # 2. Query response envelope (per-interface shape)
 # ===========================================================================

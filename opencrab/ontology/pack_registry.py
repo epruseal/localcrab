@@ -175,6 +175,7 @@ _STOPWORDS = {
     "and", "or", "the", "a", "an", "to", "of", "in", "for", "with",
     "from", "by", "on", "at", "is", "are", "was", "were", "be", "as",
     "이", "그", "저", "것", "수", "을", "를", "에", "의", "도",
+    "는", "은", "가", "과", "와", "로", "만",
 }
 
 
@@ -196,11 +197,36 @@ def _tokens(text: str) -> set[str]:
     return tokens
 
 
+# #400: 게이트 전용 whole-token 토크나이저. 공백/구두점 경계로만 나뉜 낱말이며
+# _tokens() 와 달리 n-gram fragment 를 만들지 않고 길이 하한도 두지 않는다.
+# 스크립트 종류(ASCII/한글) 전환은 경계로 보지 않는다 — "k2관세" 같은 혼용
+# 토큰을 하나로 유지해 fragment 매치를 게이트에서 배제한다.
+_WHOLE_TOKEN_RE = re.compile(r"[A-Za-z0-9가-힣]+")
+
+
+def _whole_tokens(text: str) -> set[str]:
+    text = (text or "").lower()
+    return {m for m in _WHOLE_TOKEN_RE.findall(text) if m not in _STOPWORDS}
+
+
 def _resolve_aliases(question_tokens: set[str]) -> set[str]:
     expanded = set(question_tokens)
     for canonical, variants in _ALIASES.items():
         for variant in variants:
             if variant.lower() in question_tokens:
+                expanded.add(canonical)
+                expanded.update(v.lower() for v in variants)
+                break
+    return expanded
+
+
+def _resolve_aliases_whole(whole_tokens: set[str]) -> set[str]:
+    """게이트 전용 별칭 확장. _resolve_aliases() 와 동일한 로직을 whole-token
+    집합에 적용한다 (fragment 오염 없는 별칭 매치)."""
+    expanded = set(whole_tokens)
+    for canonical, variants in _ALIASES.items():
+        for variant in variants:
+            if variant.lower() in whole_tokens:
                 expanded.add(canonical)
                 expanded.update(v.lower() for v in variants)
                 break
@@ -220,25 +246,50 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
     if not q_lower:
         return 0.0, []
 
+    # #400: 게이트 — 질의의 whole 토큰이 팩 어딘가에 리터럴로 존재하는가.
+    # pack_id/title/description/source_label 네 필드는 기존 _tokens()
+    # (fragment 포함)와 신규 _whole_tokens()(길이 무관)의 합집합을 쓴다 —
+    # _tokens()만으로는 1글자 리터럴 매치가 막히고, _whole_tokens()만으로는
+    # "직업분포" 같은 붙여쓴 복합어가 "직업 분포" 공백 질의와 게이트에서 못
+    # 만난다. keywords/tags 는 원래부터 자유 텍스트가 아니라 태그이므로
+    # 토큰화하지 않고 원문을 소문자로만 바꿔 그대로 쓴다(변경 없음).
+    q_whole = _resolve_aliases_whole(_whole_tokens(question))
+
+    pack_tokens_all = (
+        _tokens(pack.pack_id) | _whole_tokens(pack.pack_id)
+        | _tokens(pack.title) | _whole_tokens(pack.title)
+        | _tokens(pack.description) | _whole_tokens(pack.description)
+        | {k.lower() for k in pack.keywords}
+        | {t.lower() for t in pack.tags}
+        | (
+            (_tokens(pack.source_label) | _whole_tokens(pack.source_label))
+            if pack.source_label
+            else set()
+        )
+    )
+    gate_open = bool(q_whole & pack_tokens_all)
+    if not gate_open:
+        return 0.0, []
+
     q_tokens = _tokens(question)
     q_aliases = _resolve_aliases(q_tokens)
 
     matched: list[str] = []
     score = 0.0
 
-    pack_id_lower = pack.pack_id.lower()
-    if pack_id_lower and pack_id_lower in q_lower:
+    pack_id_whole = _whole_tokens(pack.pack_id)
+    if pack_id_whole and pack_id_whole <= q_whole:
         score += 100.0
         matched.append(f"pack_id:{pack.pack_id}")
 
-    title_lower = pack.title.lower()
-    if title_lower and title_lower in q_lower:
+    title_whole = _whole_tokens(pack.title)
+    if title_whole and title_whole <= q_whole:
         score += 50.0
         matched.append("title")
 
     if pack.source_label:
-        source_lower = pack.source_label.lower()
-        if source_lower and source_lower in q_lower:
+        source_whole = _whole_tokens(pack.source_label)
+        if source_whole and source_whole <= q_whole:
             score += 30.0
             matched.append(f"source:{pack.source_label}")
 
@@ -267,8 +318,10 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
         matched.extend(sorted(overlap_tags))
 
     # Korean alias bonus: any explicit alias hit adds +20 once.
+    # #400: 질의 쪽 판정을 substring(q_lower) 에서 whole-token 멤버십(q_whole)
+    # 으로 바꿔 fragment 우연 일치로 보너스가 열리지 않게 한다.
     for canonical, variants in _ALIASES.items():
-        if any(v.lower() in q_lower for v in variants) and any(
+        if any(v.lower() in q_whole for v in variants) and any(
             v.lower() in (pack.title + " " + pack.description + " " + pack.pack_id).lower()
             for v in variants
         ):
@@ -308,6 +361,96 @@ def choose_packs(
             scored.append((pack, score, matched))
     scored.sort(key=lambda item: item[1], reverse=True)
     return scored[: max(1, limit)]
+
+
+# ---------------------------------------------------------------------------
+# #400 §4: BM25/FTS 콘텐츠 폴백 — score_pack()의 게이트가 전부 닫혔을 때(질의의
+# whole 토큰이 pack_id/title/description/keywords/tags/source_label 어디에도
+# 없을 때)만 쓰는 마지막 안전망. 팩이 title/description에 없는 고유명사·코드도
+# 실제로 가진 노드 본문(text)에는 있을 수 있으므로, 팩별로 BM25/FTS를 probe해
+# 원문과 질의의 whole 토큰 집합이 겹치는 팩을 고른다.
+# ---------------------------------------------------------------------------
+
+PER_PACK_PROBE_LIMIT = 50
+
+
+def _accumulate(
+    question: str,
+    pid: str,
+    bm25_hits: list[dict[str, Any]],
+    fts_hits: list[dict[str, Any]],
+    pack_hits: dict[str, set[str]],
+    pack_hit_scores: dict[str, float],
+) -> None:
+    """``bm25_hits``/``fts_hits`` (원시 결과) 가운데 실제로 ``pid`` 팩에
+    속하고 원문(text)이 질의의 whole 토큰과 겹치는 것만 누적한다.
+
+    substring 스캔이 아니라 토큰 집합 대 토큰 집합 비교다 -- "art"가
+    "cartography" 안에서 우연히 잡히는 것과 같은 모양의 오탐을 막는다
+    (§4.3). BM25 히트는 top-level ``pack_id``, FTS 히트는
+    ``metadata.pack_id``에 소속 팩이 실려 온다.
+    """
+    q_whole = _resolve_aliases_whole(_whole_tokens(question))
+    for hit in (*bm25_hits, *fts_hits):
+        hit_pid = hit.get("pack_id") or (hit.get("metadata") or {}).get("pack_id")
+        text = hit.get("text") or ""
+        if hit_pid != pid or not text:
+            continue
+        hit_whole = _whole_tokens(text)
+        matched = q_whole & hit_whole
+        if not matched:
+            continue
+        pack_hits.setdefault(pid, set()).update(matched)
+        pack_hit_scores[pid] = pack_hit_scores.get(pid, 0.0) + float(hit.get("score") or 0.0)
+
+
+def _choose_by_content(
+    question: str,
+    registry: list[PackInfo],
+    hybrid: Any,
+    spaces: list[str] | None,
+    min_score: float | None = None,
+) -> tuple[list[tuple[PackInfo, float, list[str]]], list[str]]:
+    """``choose_packs``가 빈 리스트를 낸 뒤에만 호출되는 콘텐츠 폴백.
+
+    팩별로 개별 조회한다(§4.2) -- 전역 한 번 조회는 작은 팩의 히트가 큰
+    팩에 밀려 사라지는 문제(§7 항목6)가 있다. 반환값은
+    ``(candidates, truncated_packs)``: ``truncated_packs``는 히트 수가
+    ``PER_PACK_PROBE_LIMIT``에 닿아 그 팩의 실제 매치가 더 있을 수 있음을
+    관측용으로 알리는 목록이다(§7 항목9, 선택 결과 자체에는 영향 없음).
+
+    선택 기준은 (겹친 고유 토큰 수, 누적 BM25/FTS 점수, pack_id) 내림차순 --
+    더 많은 서로 다른 질의어를 커버하는 팩을 우선하고, 동점이면 결정론적으로
+    pack_id로 가른다(§7 항목11). 반환 점수는 실제 BM25 점수가 아니라 문턱값
+    그 자체다(§4.4) -- score_pack()의 가산 점수와 척도가 달라 비교 불가능
+    하므로, "문턱을 넘었다"는 사실만 표현한다(§7 항목12: 문턱을 바꾸면 이
+    보고 점수도 그 값을 따른다).
+    """
+    if not registry or hybrid is None:
+        return [], []
+    threshold = _env_min_score() if min_score is None else float(min_score)
+
+    pack_hits: dict[str, set[str]] = {}
+    pack_hit_scores: dict[str, float] = {}
+    truncated_packs: list[str] = []
+    for pid in (p.pack_id for p in registry):
+        bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+            question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+        )
+        fts_hits = hybrid._fts_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+            question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+        )
+        if len(bm25_hits) >= PER_PACK_PROBE_LIMIT or len(fts_hits) >= PER_PACK_PROBE_LIMIT:
+            truncated_packs.append(pid)
+        _accumulate(question, pid, bm25_hits, fts_hits, pack_hits, pack_hit_scores)
+
+    if not pack_hits:
+        return [], truncated_packs
+
+    best_pid = max(pack_hits, key=lambda k: (len(pack_hits[k]), pack_hit_scores.get(k, 0.0), k))
+    pack = next(p for p in registry if p.pack_id == best_pid)
+    matched_tokens = sorted(pack_hits[best_pid])
+    return [(pack, threshold, matched_tokens)], truncated_packs
 
 
 def build_candidate_registry(
