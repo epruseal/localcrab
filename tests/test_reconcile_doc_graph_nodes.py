@@ -628,6 +628,39 @@ class TestSchemaStateRejection:
         with pytest.raises(GraphReadCapabilityUnavailable):
             recon.diagnose(_RejectingGraphStore(), doc_store)
 
+    def test_diagnose_never_calls_the_full_inventory_method(self, graph_store, doc_store):
+        """diagnose()는 스트리밍 경로(graph_schema_state()/
+        iter_graph_node_identities())만 써야 한다(#404). inspect_graph_identity()는
+        노드와 엣지 전량을 원시+정규화+지문 세 겹으로 한 번에 메모리에 올려
+        실사용 규모에서 OOM을 낸 바로 그 메서드이므로, diagnose()가 다시 그
+        경로로 되돌아가면 이 테스트가 잡아야 한다(정상 분류 결과만 보는
+        테스트로는 이 회귀를 검출할 수 없다: 두 경로 모두 같은 노드 집합을
+        반환하기 때문이다)."""
+        graph_store.upsert_node("Concept", "n1", {"label": "x"}, "space-a")
+        doc_store.upsert_node_doc("space-a", "Concept", "n1", {"label": "x"})
+
+        inspect_calls: list[Any] = []
+        schema_state_calls: list[Any] = []
+        iter_calls: list[Any] = []
+        original_inspect = graph_store.inspect_graph_identity
+        original_schema_state = graph_store.graph_schema_state
+        original_iter = graph_store.iter_graph_node_identities
+        graph_store.inspect_graph_identity = lambda *a, **kw: (
+            inspect_calls.append(1) or original_inspect(*a, **kw)
+        )
+        graph_store.graph_schema_state = lambda *a, **kw: (
+            schema_state_calls.append(1) or original_schema_state(*a, **kw)
+        )
+        graph_store.iter_graph_node_identities = lambda *a, **kw: (
+            iter_calls.append(1) or original_iter(*a, **kw)
+        )
+
+        recon.diagnose(graph_store, doc_store)
+
+        assert inspect_calls == []
+        assert len(schema_state_calls) >= 1
+        assert len(iter_calls) >= 1
+
 
 # ---------------------------------------------------------------------------
 # CLI / main() (5-4절 백업, 5-5절 실행 기록, 5-6절 출력)
