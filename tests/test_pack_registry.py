@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from opencrab.ontology.pack_registry import (
+    _STOPWORDS,
     PER_PACK_PROBE_LIMIT,
     PackInfo,
     _choose_by_content,
@@ -331,6 +333,42 @@ def test_t400_content_fallback_forwards_spaces_to_both_legs() -> None:
     assert hybrid.fts_calls[0][1] == ["space-a"]
 
 
+def test_t400_content_fallback_spaces_actually_exclude_out_of_space_hits() -> None:
+    """설계 §7 항목10 두 번째 층위. 앞 테스트는 spaces 인자가 mock 호출에
+    그대로 전달되는지(배선)만 봤다 -- 이 테스트는 spaces를 실제로 반영하는
+    하이브리드를 흉내 내, 요청 space 밖의 히트가 선택에서 실제로 배제되는지
+    확인한다. out-space 팩이 더 높은 점수(5.0 > 1.0)를 갖고 있어도 space
+    필터가 없으면 잘못 선택될 것이므로, 이 테스트는 필터가 실제로 걸렸을
+    때만 통과한다."""
+
+    class _SpaceFilteringHybrid:
+        def __init__(self, hits_by_pack: dict[str, list[tuple[str, dict]]]) -> None:
+            self._hits_by_pack = hits_by_pack
+
+        def _bm25_search(self, question, spaces, limit, *, pack_ids):
+            pid = pack_ids[0]
+            return [
+                hit
+                for space, hit in self._hits_by_pack.get(pid, [])
+                if spaces is None or space in spaces
+            ]
+
+        def _fts_search(self, question, spaces, limit, *, pack_ids):
+            return []
+
+    in_space = PackInfo(pack_id="in-space", title="", description="")
+    out_space = PackInfo(pack_id="out-space", title="", description="")
+    hybrid = _SpaceFilteringHybrid(
+        {
+            "in-space": [("space-a", {"pack_id": "in-space", "text": "고유토큰123", "score": 1.0})],
+            "out-space": [("space-b", {"pack_id": "out-space", "text": "고유토큰123", "score": 5.0})],
+        }
+    )
+    candidates, _ = _choose_by_content("고유토큰123", [in_space, out_space], hybrid, spaces=["space-a"])
+    assert len(candidates) == 1
+    assert candidates[0][0].pack_id == "in-space"
+
+
 def test_t400_content_fallback_tiebreak_prefers_higher_summed_score() -> None:
     """설계 §7 항목11. 매치된 고유 토큰 수가 같으면(둘 다 1개) 누적 BM25/FTS
     점수 합이 더 큰 팩이 선택된다."""
@@ -355,6 +393,58 @@ def test_t400_content_fallback_reported_score_follows_min_score_override() -> No
     hybrid = _FakeHybrid(bm25_by_pack={"p1": [{"pack_id": "p1", "text": "고유토큰", "score": 1.0}]})
     candidates, _ = _choose_by_content("고유토큰", [pack], hybrid, spaces=None, min_score=42.0)
     assert candidates[0][1] == 42.0
+
+
+_OLD_WORD_RE = re.compile(r"[a-z0-9]+")
+_OLD_HANGUL_RE = re.compile(r"[가-힣]+")
+
+
+def _old_whole_tokens(text: str) -> set[str]:
+    """설계 §7 항목14 대조군. 수정A(공백/구두점 경계 whole-token) 이전에
+    쓰던, 스크립트별로 분리된 findall 토크나이저를 흉내 낸다."""
+    text = (text or "").lower()
+    tokens: set[str] = set()
+    for rx in (_OLD_WORD_RE, _OLD_HANGUL_RE):
+        tokens.update(rx.findall(text))
+    return {t for t in tokens if t not in _STOPWORDS}
+
+
+def test_t400_live_pack_mixed_script_titles_unaffected_by_whole_token_merge(monkeypatch) -> None:
+    """설계 §7 항목14 (특성화만, 결함 검출용이 아님). 라이브 팩 4건 가운데
+    혼합 문자(한글/숫자/영문, 괄호)가 섞인 실제 제목/설명 3건에 대해, 수정A가
+    도입한 whole-token 경계 방식과 그 이전 방식(스크립트별 분리 findall)의
+    score_pack 결과가 같은지 확인한다. 다르면 수정A가 이 라이브 팩들의 점수를
+    바꿨다는 뜻이므로 회귀다."""
+    packs = [
+        PackInfo(
+            pack_id="brain-science",
+            title="뇌과학 9도메인 근거기반 팩",
+            description=(
+                "신경과학 9대 도메인 PubMed/PMC 원문 + MMP 권위 공공보고서"
+                "(WHO·NIH) + Apple Vision OCR — score≥90"
+            ),
+        ),
+        PackInfo(
+            pack_id="acupoint-medical",
+            title="경혈 의학 팩 (임상·생태·근골 3렌즈)",
+            description=(
+                "WHO 표준 361 정경혈+8맥교회+경외기혈 408혈. "
+                "경락-장부-오행·근육/신경/자침/주치/특정혈/금기"
+            ),
+        ),
+        PackInfo(
+            pack_id="명문장1007",
+            title="명문장 1007선",
+            description="세계·한국 명문장 전건(이형 포함 1007)",
+        ),
+    ]
+    queries = ("뇌과학", "도메인", "명문장", "경혈", "렌즈")
+    from opencrab.ontology import pack_registry as pr
+
+    baseline = {(p.pack_id, q): score_pack(q, p) for p in packs for q in queries}
+    monkeypatch.setattr(pr, "_whole_tokens", _old_whole_tokens)
+    reverted = {(p.pack_id, q): score_pack(q, p) for p in packs for q in queries}
+    assert baseline == reverted
 
 
 # ---------------------------------------------------------------------------

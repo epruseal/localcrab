@@ -695,6 +695,40 @@ class TestResolvePacksContentFallback:
         assert sel.selected_packs == []
         assert [w.code for w in sel.warnings] == [AUTO_PACK_BELOW_THRESHOLD]
 
+    def test_hybrid_not_probed_when_lexical_gate_already_selected(self, monkeypatch):
+        """설계 §7 항목7 (회귀 대조군). hybrid가 주어져도 choose_packs가 이미
+        후보를 냈으면 resolve_packs는 콘텐츠 폴백을 아예 부르지 않는다 --
+        hybrid mock이 호출됐는지 자체를 assert한다(코드 대조가 아니라
+        resolve_packs 배선을 직접 관측)."""
+        from opencrab.services.pack_selection import resolve_packs
+
+        # title에 질의 토큰이 그대로 있다 -- choose_packs가 반드시 후보를 낸다.
+        monkeypatch.setattr(
+            "opencrab.pack.ownership.list_packs_for",
+            lambda sql, principal: [
+                {"pack_id": "pack-a", "title": "네오다임 합금 규격", "description": ""}
+            ],
+        )
+
+        class _PoisonHybrid:
+            """호출되면 즉시 실패한다 -- 폴백이 잘못 실행되면 이 테스트가 그
+            자리에서 AssertionError로 잡아낸다."""
+
+            def _bm25_search(self, question, spaces, limit, *, pack_ids):
+                raise AssertionError("lexical 게이트가 이미 후보를 냈는데 콘텐츠 폴백이 호출됐다")
+
+            def _fts_search(self, question, spaces, limit, *, pack_ids):
+                raise AssertionError("lexical 게이트가 이미 후보를 냈는데 콘텐츠 폴백이 호출됐다")
+
+        sel = resolve_packs(
+            "네오다임", None, True, False, "/tmp",
+            scope=frozenset({"pack-a"}), raise_on_error=False,
+            sql=MagicMock(), principal=MagicMock(),
+            hybrid=_PoisonHybrid(), spaces=None,
+        )
+        assert sel.selected_packs and sel.selected_packs[0]["pack_id"] == "pack-a"
+        assert sel.effective_pack_ids == ["pack-a"]
+
 
 # ===========================================================================
 # 2. Query response envelope (per-interface shape)
