@@ -108,6 +108,66 @@ class TestNodeDoc:
 
 
 # ---------------------------------------------------------------------------
+# get_node_docs_by_id (issue #317, 승격 적용 시점 재확인)
+# ---------------------------------------------------------------------------
+
+
+class TestGetNodeDocsById:
+    def test_returns_empty_list_for_missing_node_id(self, store):
+        assert store.get_node_docs_by_id("nonexistent") == []
+
+    def test_returns_single_row(self, store):
+        store.upsert_node_doc("space_a", "Concept", "c1", {"title": "Foo"})
+        rows = store.get_node_docs_by_id("c1")
+        assert len(rows) == 1
+        assert rows[0]["space"] == "space_a"
+        assert rows[0]["node_type"] == "Concept"
+        assert rows[0]["properties"] == {"title": "Foo"}
+
+    def test_returns_all_rows_across_spaces(self, store):
+        store.upsert_node_doc("space_a", "Concept", "shared", {"x": 1})
+        store.upsert_node_doc("space_b", "Concept", "shared", {"x": 2})
+        rows = store.get_node_docs_by_id("shared")
+        spaces = {row["space"] for row in rows}
+        assert spaces == {"space_a", "space_b"}
+
+    def test_non_dict_properties_preserved_not_coerced_to_empty_dict(self, store):
+        """#317 이중검증 2라운드 FAIL 반영: _row_to_node()/_as_dict() 를
+        재사용하면 비딕셔너리 원시값이 조용히 {} 로 치환된다. 저수준 SQL
+        로 properties 컬럼에 JSON 리스트 문자열을 직접 넣어, 이 메서드가
+        그 값을 파싱된 리스트 그대로(딕셔너리로 치환하지 않고) 돌려줌을
+        확인한다."""
+        store.upsert_node_doc("s1", "T", "n1", {"placeholder": True})
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "[1, 2]", "space": "s1", "node_id": "n1"},
+        )
+
+        rows = store.get_node_docs_by_id("n1")
+
+        assert len(rows) == 1
+        assert rows[0]["properties"] == [1, 2]
+        assert rows[0]["properties"] != {}
+
+    def test_malformed_json_preserved_as_raw_string_not_coerced(self, store):
+        """같은 반례의 다른 모양: JSON 파싱 자체가 실패하는 값(닫히지 않은
+        중괄호)도 {} 로 치환하지 않고 원본 문자열 그대로 돌려준다."""
+        store.upsert_node_doc("s1", "T", "n1", {"placeholder": True})
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "{not valid json", "space": "s1", "node_id": "n1"},
+        )
+
+        rows = store.get_node_docs_by_id("n1")
+
+        assert len(rows) == 1
+        assert rows[0]["properties"] == "{not valid json"
+        assert rows[0]["properties"] != {}
+
+
+# ---------------------------------------------------------------------------
 # create_node_doc_if_absent (issue #317)
 # ---------------------------------------------------------------------------
 

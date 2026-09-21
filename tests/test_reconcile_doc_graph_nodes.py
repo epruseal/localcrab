@@ -343,6 +343,87 @@ class TestDocOnlyPromotion:
         assert results_by_id["d2"].outcome == "healed"
         assert graph_store.get_node("Concept", "d2") is not None
 
+    def test_apply_time_source_deleted_is_not_promoted_as_empty_node(self, graph_store, doc_store):
+        """#317 이중검증 지적1 회귀: 진단 통과 후 적용 직전에 원본 문서가
+        삭제되면, 재확인 없이 진단 값을 신뢰하던 옛 코드는 properties 를
+        {} 로 치환해 삭제된 문서를 빈 속성 그래프 노드로 되살렸다. 이
+        도구의 약속("어느 방향도 삭제하지 않는다")을 어기므로, 재확인이
+        0건을 감지해 승격을 건너뛰고 그래프에 아무것도 만들지 않아야
+        한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        report = recon.diagnose(graph_store, doc_store)
+        assert report.doc_only[0].healable is True
+
+        doc_store.delete_node_doc("space-a", "d1")
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=True)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_PROMOTION_VANISHED_AT_APPLY
+        assert graph_store.get_node("Concept", "d1") is None
+
+    def test_apply_time_new_duplicate_space_prevents_promotion(self, graph_store, doc_store):
+        """#317 이중검증 지적2 회귀: 진단 이후 같은 node_id 가 다른 space
+        에도 새로 생기면, 어느 space 를 승격해야 하는지 판단할 근거가
+        없다(진단의 정체성 충돌 분류와 같은 이유). 재확인이 다건을
+        감지해 어느 space 로도 승격하지 않아야 한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        report = recon.diagnose(graph_store, doc_store)
+        assert report.doc_only[0].healable is True
+
+        doc_store.upsert_node_doc("space-b", "Concept", "d1", {"x": 2})
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=True)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_DUP_SPACE_AT_APPLY
+        assert graph_store.get_node("Concept", "d1") is None
+
+    def test_apply_time_pack_id_becomes_non_string_is_rejected(self, graph_store, doc_store):
+        """전수 감사로 찾은 세 번째 사례: 진단 시점에는 pack_id 가
+        문자열이었어도 적용 직전에 비문자열로 바뀌면, 재확인이 읽은
+        현재 값에 대해 diagnosis 와 같은 pack_id 게이트를 다시 거쳐야
+        한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"pack_id": "p1"})
+        report = recon.diagnose(graph_store, doc_store)
+        assert report.doc_only[0].healable is True
+
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"pack_id": 12345})
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=True)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason == recon.REASON_PACK_ID_NON_STRING
+        assert graph_store.get_node("Concept", "d1") is None
+
+    def test_apply_time_non_dict_properties_is_rejected_not_promoted_empty(self, graph_store, doc_store):
+        """#317 이중검증 1/2라운드 FAIL 을 함께 고정하는 회귀 테스트: 원본
+        문서는 여전히 존재하지만 properties 컬럼 자체가 비딕셔너리 값(예:
+        리스트)으로 오염된 경우, 재확인이 그 값을 {} 로 치환하지 않고
+        원형 그대로 prepare_node() 에 넘겨 그 함수의 비딕셔너리 거부에
+        맡겨야 한다. LocalSQLDocStore 는 properties 를 JSON TEXT 컬럼에
+        저장하므로, 저수준 SQL 로 그 컬럼에 JSON 리스트 문자열을 직접
+        써 넣어 "정상 배관을 거치지 않은 오염"을 재현한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        report = recon.diagnose(graph_store, doc_store)
+        assert report.doc_only[0].healable is True
+
+        doc_store._exec_write(
+            f"UPDATE {doc_store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "[1, 2]", "space": "space-a", "node_id": "d1"},
+        )
+
+        results = recon.heal(graph_store, doc_store, report, promote_doc_only=True)
+
+        assert len(results) == 1
+        assert results[0].outcome == "skipped_rejected"
+        assert results[0].reason.startswith(recon.REASON_PROMOTION_REJECTED_AT_APPLY)
+        assert graph_store.get_node("Concept", "d1") is None
+
 
 # ---------------------------------------------------------------------------
 # schema_state / 백엔드 거부 (3절/5-3절)

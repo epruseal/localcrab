@@ -114,6 +114,25 @@ class TestMongoStoreNormal:
 
         assert store.get_node_doc("s", "missing") is None
 
+    def test_get_node_docs_by_id_queries_by_node_id_only(self):
+        store, _client, mock_db = _make_connected_store()
+        mock_db["nodes"].find.return_value = [
+            {"space": "s1", "node_id": "shared", "node_type": "T", "properties": {"x": 1}},
+            {"space": "s2", "node_id": "shared", "node_type": "T", "properties": {"x": 2}},
+        ]
+
+        result = store.get_node_docs_by_id("shared")
+
+        assert len(result) == 2
+        assert {row["space"] for row in result} == {"s1", "s2"}
+        mock_db["nodes"].find.assert_called_once_with({"node_id": "shared"}, {"_id": 0})
+
+    def test_get_node_docs_by_id_returns_empty_list_when_missing(self):
+        store, _client, mock_db = _make_connected_store()
+        mock_db["nodes"].find.return_value = []
+
+        assert store.get_node_docs_by_id("missing") == []
+
     def test_create_node_doc_if_absent_inserts_and_reports_created(self):
         store, _client, mock_db = _make_connected_store()
 

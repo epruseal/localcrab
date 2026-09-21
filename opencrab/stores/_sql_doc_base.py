@@ -55,6 +55,7 @@ Covered here: the 13 methods' SQL text and dict-shaping logic.
 from __future__ import annotations
 
 import abc
+import json
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -270,6 +271,61 @@ class _SqlDocStoreBase(abc.ABC):
         if row is None:
             return None
         return self._row_to_node(row)
+
+    def get_node_docs_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """``node_id`` 하나에 대해 현재 ``doc_nodes``에 존재하는 모든 (space)
+        행을 전부 반환한다 (#317 승격 적용 시점 재확인 -- 진단과 적용 사이의
+        원본 소실/space 중복을 한 조회로 함께 감지한다). ``node_id`` 단독
+        인덱스가 없어 전 테이블 스캔이다 -- 이 도구가 실제로 승격을 시도하는
+        행(이상 사례로 이미 걸러진 소수)에만 호출되므로 이 비용을 받아들인다
+        (모듈의 "알려진 한계" 절과 같은 결의, 대량 상시 배치 승격에는
+        재사용하지 않는다). 0건/1건/다건 모두 있는 그대로(빈 리스트 포함)
+        반환하고 예외로 신호하지 않는다.
+
+        ``_row_to_node()``(따라서 ``_as_dict()``)를 재사용하지 않는다.
+        ``_as_dict()``는 비딕셔너리/파싱 실패 JSON을 조용히 ``{}``로
+        치환하는데, 그 치환이 이 호출자(``_promote_one()``)가 값을 보기
+        전에 일어나면 원본이 오염된 경우를 빈 속성 승격으로 위장시킨다
+        (issue #402, 이 헬퍼 자체는 범위 밖). 대신 ``_decode_properties_raw()``
+        로 이 메서드 전용의 좁은 계약을 쓴다.
+        """
+        self._require_available()
+        sql = (
+            f"SELECT space, node_id, node_type, properties, updated_at"
+            f" FROM {self._table('doc_nodes')} WHERE node_id=:node_id"
+        )
+        rows = self._fetch_all(sql, {"node_id": node_id})
+        return [
+            {
+                "space": self._row_get(row, "space"),
+                "node_id": self._row_get(row, "node_id"),
+                "node_type": self._row_get(row, "node_type"),
+                "properties": self._decode_properties_raw(self._row_get(row, "properties")),
+                "updated_at": _ts_str(self._row_get(row, "updated_at")),
+            }
+            for row in rows
+        ]
+
+    def _decode_properties_raw(self, value: Any) -> Any:
+        """``properties`` 컬럼의 원시값을 방언별 실제 인코딩에 맞게 디코드한다.
+
+        SQLite는 JSON 컬럼을 raw TEXT로 저장/반환하므로 문자열이면
+        ``json.loads()``를 시도한다. PG(psycopg2/SQLAlchemy)는 JSONB
+        컬럼을 드라이버가 이미 디코드해 반환하므로 절대 다시 파싱하지
+        않는다 -- 디코드된 값이 우연히 파이썬 문자열이어도(``properties``
+        컬럼이 JSON 문자열 스칼라로 오염된 경우) 그 값을 다시 파싱하면
+        원래 비딕셔너리였던 오염값을 딕셔너리로 되돌려 하위 검증을
+        우회시킨다(#317 이중검증 3라운드 지적). "문자열이냐"는 방언을
+        구분하지 못하는 값-모양 휴리스틱이므로, 이 클래스가 이미 아는
+        방언 정보(``self._dialect.name``, 이 파일 158행과 같은 관용구)로
+        분기한다.
+        """
+        if self._dialect.name == "sqlite" and isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                return value
+        return value
 
     def create_node_doc_if_absent(
         self, space: str, node_type: str, node_id: str, properties: dict[str, Any]

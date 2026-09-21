@@ -46,7 +46,11 @@ NOTHING)를 쓴다: upsert_node_doc() 은 무조건 덮어쓰기라서, 진단 �
 잃을 수 있다. 문서 전용 승격은 그래프 쪽 upsert_node() 의 기존 삽입-후-무시
 계약을 그대로 쓴다(이미 이 계약을 쓰므로 추가 작업이 필요 없다). 두 방향
 모두 진단 시점과 적용 시점 사이의 변경을 덮어쓰지 않고 "동시 변경으로
-건너뜀"으로 보고한다.
+건너뜀"으로 보고한다. 문서 전용 승격은 적용 직전 현재 상태를
+(``get_node_docs_by_id()``로) 다시 조회해 원본 소실(진단 이후 삭제)과 신규
+공간 중복(진단 이후 다른 space에 같은 node_id 추가)을 함께 감지하고
+건너뛴다 -- 재확인 없이 진단 시점 값을 그대로 신뢰하면 삭제된 문서가 빈
+속성 그래프 노드로 되살아날 수 있다(#317 이중검증 지적).
 
 ## FTS 백필과 무변경 약속의 정확한 범위 (5-1절, 쟁점3)
 
@@ -115,6 +119,8 @@ REASON_PACK_ID_NON_STRING = "pack_id_non_string"
 REASON_PROMOTION_REJECTED = "promotion_rejected"
 REASON_PROMOTION_REJECTED_AT_APPLY = "promotion_rejected_at_apply"
 REASON_DUP_SPACE_NO_GRAPH = "duplicate_space_no_graph_match"
+REASON_PROMOTION_VANISHED_AT_APPLY = "promotion_source_vanished_at_apply"
+REASON_DUP_SPACE_AT_APPLY = "promotion_duplicate_space_at_apply"
 
 
 @dataclass
@@ -351,17 +357,46 @@ def _backfill_one(doc_store: Any, row: GraphOnlyRow) -> HealResult:
 def _promote_one(graph_store: Any, doc_store: Any, row: DocOnlyRow) -> HealResult:
     """문서 전용 노드를 그래프로 승격한다.
 
-    진단 시점에 이미 ``prepare_node()``로 승격 가능 여부를 확인했더라도,
-    진단과 적용 사이에 문서 속성이 바뀌면 이 재호출이 새로 예외를 던질 수
-    있다(쟁점1과 같은 근거를 적용 지점에도 적용한다). 이 예외를 넓게 잡지
+    진단과 적용 사이의 경합 창에서 문서 쪽 상태가 바뀔 수 있으므로, 쓰기
+    직전 ``get_node_docs_by_id()``로 현재 상태를 다시 확인한다(#317
+    이중검증 지적 두 건, "적용 시점 재확인 누락"이 근본원인이다):
+
+    - 원본 문서가 진단 이후 삭제됐으면(0건) 승격을 건너뛴다. 이 재확인이
+      없으면 ``get_node_doc()``이 ``None``을 돌려주고 그 값을 ``{}``로
+      치환해, 이미 삭제된 문서를 빈 속성 그래프 노드로 되살린다 -- 이
+      도구의 약속("어느 방향도 삭제하지 않는다")을 정면으로 어긴다.
+    - 같은 ``node_id``가 다른 space에 새로 중복 생성됐으면(다건) 어느
+      space를 승격해야 하는지 판단할 근거가 없으므로(진단의 정체성 충돌
+      분류와 같은 이유) 건너뛴다.
+    - 재확인으로 얻은 행이 정확히 한 건이고 space가 진단 시점과 같을
+      때만 그 행의 ``properties``를 그대로(비딕셔너리로 치환하지 않고)
+      ``prepare_node()``에 넘긴다. 값 자체가 오염돼 있어도(비딕셔너리,
+      ``pack_id`` 비문자열 등) 이 함수가 대신 판단하지 않고
+      ``prepare_node()``의 기존 검증(및 아래 ``except Exception``
+      경로)에 맡긴다.
+
+    ``prepare_node()`` 재호출이 새로 예외를 던질 수 있는 것도 여전하다
+    (쟁점1과 같은 근거를 적용 지점에도 적용한다). 이 예외를 넓게 잡지
     않으면 한 행의 검증 실패가 나머지 행 전체 처리를 막고 도구를 비정상
     종료시킨다.
     """
-    doc_full = doc_store.get_node_doc(row.space, row.node_id)
-    properties = doc_full["properties"] if doc_full is not None else {}
+    current_rows = doc_store.get_node_docs_by_id(row.node_id)
+    if len(current_rows) > 1:
+        return HealResult(row.node_id, row.space, "promotion", "skipped_rejected", REASON_DUP_SPACE_AT_APPLY)
+    if len(current_rows) != 1 or current_rows[0]["space"] != row.space:
+        return HealResult(
+            row.node_id, row.space, "promotion", "skipped_rejected", REASON_PROMOTION_VANISHED_AT_APPLY
+        )
+
+    current = current_rows[0]
+    properties = current["properties"]
+    pack_id = properties.get("pack_id") if isinstance(properties, dict) else None
+    if isinstance(properties, dict) and "pack_id" in properties and pack_id is not None and not isinstance(pack_id, str):
+        return HealResult(row.node_id, row.space, "promotion", "skipped_rejected", REASON_PACK_ID_NON_STRING)
+
     try:
         node_type, props, effective_space, _digest = prepare_node(
-            node_type=row.node_type, node_id=row.node_id, properties=properties, space_id=row.space
+            node_type=current["node_type"], node_id=row.node_id, properties=properties, space_id=row.space
         )
     except Exception as exc:  # noqa: BLE001 - 쟁점1과 같은 근거를 적용 지점에도 적용한다.
         reason = f"{REASON_PROMOTION_REJECTED_AT_APPLY}: {type(exc).__name__}: {exc}"

@@ -267,6 +267,25 @@ class MongoStore:
         )
         return dict(doc) if doc else None
 
+    def get_node_docs_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """``node_id`` 하나에 대해 현재 존재하는 모든 (space) 문서를 전부
+        반환한다 (#317 승격 적용 시점 재확인 -- 진단과 적용 사이의 원본
+        소실/space 중복을 한 조회로 함께 감지한다). ``(space, node_id)``
+        복합 유니크 인덱스가 ``node_id`` 단독 프리픽스로 맞지 않아
+        컬렉션 스캔이다 -- 이 도구가 실제로 승격을 시도하는 행(이상
+        사례로 이미 걸러진 소수)에만 호출되므로 이 비용을 받아들인다.
+        0건/1건/다건 모두 있는 그대로(빈 리스트 포함) 반환한다.
+
+        SQL 백엔드(``_sql_doc_base.py``)와 달리 방언별 재디코드가 필요
+        없다 -- Mongo는 ``properties``를 BSON 문서로 직접 저장하므로
+        JSON 문자열 인코딩/디코딩 계층 자체가 없고, 따라서 SQL 쪽
+        `_row_to_node()`/`_as_dict()`가 겪는 "비딕셔너리를 `{}`로 치환"
+        문제도 원천적으로 발생하지 않는다.
+        """
+        self._require_available()
+        docs = self._db["nodes"].find({"node_id": node_id}, {"_id": 0})
+        return [dict(doc) for doc in docs]
+
     def create_node_doc_if_absent(
         self, space: str, node_type: str, node_id: str, properties: dict[str, Any]
     ) -> Literal["created", "exists"]:
