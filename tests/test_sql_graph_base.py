@@ -831,3 +831,143 @@ def test_export_nodes_space_mismatch_reports_the_requested_space_not_the_stale_j
 
     assert total == len(page) == 4
     assert all(r["props"]["space"] == "target" for r in page)
+
+
+# ---------------------------------------------------------------------------
+# graph_schema_state / iter_graph_node_identities / get_node_identity_by_id (#404)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_schema_state_matches_schema_kind():
+    store = _store()
+    assert store.graph_schema_state() == store._schema_kind()
+    store._schema_state = "target"
+    assert store.graph_schema_state() == "target"
+
+
+def test_graph_schema_state_raises_when_unavailable():
+    store = _store()
+    store._available = False
+    with pytest.raises(RuntimeError):
+        store.graph_schema_state()
+
+
+def test_iter_graph_node_identities_returns_empty_for_fresh_schema():
+    # "unconfigured" maps to schema_kind "fresh" -- the short-circuit must
+    # fire before any SELECT against graph_nodes runs (the table exists in
+    # this double, but a real fresh store may not have it yet).
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    store._schema_state = "unconfigured"
+    assert list(store.iter_graph_node_identities()) == []
+
+
+def test_iter_graph_node_identities_batch_size_non_positive_returns_empty():
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    assert list(store.iter_graph_node_identities(batch_size=0)) == []
+    assert list(store.iter_graph_node_identities(batch_size=-1)) == []
+
+
+def test_iter_graph_node_identities_pages_via_multiple_fetch_calls():
+    # Correctness alone (the boundary test below) can't distinguish paged
+    # fetches from one unbounded fetchall that happens to return the right
+    # rows -- count the underlying _fetch_all calls directly to prove this
+    # is actually keyset pagination, not a single full-table read.
+    store = _store()
+    for i in range(5):
+        store.upsert_node("Person", f"n{i}", {})
+
+    calls: list[Any] = []
+    original = store._fetch_all
+
+    def counting_fetch_all(sql: str, params: dict[str, Any]) -> list[tuple]:
+        calls.append(params.get("batch"))
+        return original(sql, params)
+
+    store._fetch_all = counting_fetch_all  # type: ignore[method-assign]
+
+    list(store.iter_graph_node_identities(batch_size=2))
+
+    # 5 rows at batch_size=2: pages of 2, 2, 1, then an empty terminating
+    # fetch -- 4 calls. A single unbounded fetch would show only 2 (one
+    # full read, one empty confirmation).
+    assert len(calls) >= 3
+
+
+def test_iter_graph_node_identities_streams_across_batch_boundaries():
+    store = _store()
+    ids = [f"n{i:02d}" for i in range(7)]
+    for node_id in ids:
+        store.upsert_node("Person", node_id, {"name": node_id})
+
+    # batch_size smaller than the row count forces at least three pages.
+    streamed = list(store.iter_graph_node_identities(batch_size=2))
+
+    assert sorted(row.key.node_id for row in streamed) == sorted(ids)
+    assert len(streamed) == len(ids)
+    # Parity with a full scan: same key set, same normalized properties.
+    full = store.inspect_graph_identity()
+    assert {row.key for row in streamed} == {row.key for row in full.nodes}
+
+
+def test_iter_graph_node_identities_does_not_drop_empty_string_node_id():
+    # node_id="" is not blocked by the schema; the None-sentinel pagination
+    # design must not silently skip it as an empty-string sentinel would
+    # (#404 design-verification round 1 finding).
+    store = _store()
+    store._conn.execute(
+        "INSERT INTO graph_nodes (node_type, node_id, space_id, properties) VALUES (?, ?, ?, ?)",
+        ("Person", "", "space-a", "{}"),
+    )
+    store.upsert_node("Person", "p1", {})
+    store._conn.commit()
+
+    node_ids = {row.key.node_id for row in store.iter_graph_node_identities(batch_size=1)}
+
+    assert node_ids == {"", "p1"}
+
+
+def test_get_node_identity_by_id_missing_returns_none():
+    store = _store()
+    assert store.get_node_identity_by_id("nope") is None
+
+
+def test_get_node_identity_by_id_matches_normal_row_shape():
+    store = _store()
+    store.upsert_node("Person", "p1", {"name": "Alice", "pack_id": "pack-x"}, space_id="space-a")
+
+    row = store.get_node_identity_by_id("p1")
+
+    assert row.key.node_type == "Person"
+    assert row.key.node_id == "p1"
+    assert row.space_id == "space-a"
+    assert row.pack_id == "pack-x"
+    assert row.property_error is None
+    assert dict(row.normalized_properties) == {"name": "Alice"}
+
+
+def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
+    # get_node()/get_node_by_id() go through _as_dict() and silently coerce
+    # malformed properties to {} (#402-class bug). get_node_identity_by_id()
+    # must not: it reuses _node_inventory_row(), the same decode path
+    # diagnose() relies on to reject a node as healable.
+    store = _store()
+    store.upsert_node("Person", "p1", {"name": "Alice"})
+    # idx_nodes_pack is a json_extract() expression index: SQLite recomputes
+    # it on every UPDATE to properties and refuses non-JSON text outright,
+    # so the index must be dropped first to reach the malformed-data path
+    # decode_raw_properties()/get_node_identity_by_id() exist to handle.
+    store._conn.execute("DROP INDEX idx_nodes_pack")
+    store._conn.execute(
+        "UPDATE graph_nodes SET properties = 'not json' WHERE node_id = :id", {"id": "p1"}
+    )
+    store._conn.commit()
+
+    row = store.get_node_identity_by_id("p1")
+    assert row.property_error == "malformed_json"
+
+    # Contrast: the pre-existing accessors coerce silently instead of
+    # surfacing the corruption.
+    assert store.get_node("Person", "p1") == {}
+    assert store.get_node_by_id("p1")["node_type"] == "Person"

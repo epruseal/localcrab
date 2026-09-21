@@ -110,7 +110,7 @@ import re
 import threading
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1071,6 +1071,97 @@ class _SqlGraphStoreBase(abc.ABC):
                 raise
             edge_rows = []
         return self._inventory_from_rows(kind, node_rows, edge_rows)
+
+    def graph_schema_state(self) -> str:
+        """진단이 스키마 상태만 알면 될 때 전량 인벤토리 없이 쓰는 얇은 공개
+        래퍼(#404). ``_require_available()``로 스토어 가용성만 검사하고,
+        ``_schema_kind()``는 그 다음 DB 조회 없이 즉시 값을 준다. 다른 공개
+        메서드 전부(``inspect_graph_identity()`` 포함)가 최상단에서
+        ``_require_available()``을 부르는 것과 같은 규칙을 이 메서드에도
+        맞춘다: 스토어가 unavailable일 때 이 메서드만 조용히 값을 내는
+        비일관성을 두지 않는다."""
+        self._require_available()
+        return self._schema_kind()
+
+    def iter_graph_node_identities(self, batch_size: int = 5000) -> Iterator[LegacyNodeRow]:
+        """그래프 쪽 노드를 node_id 키셋 페이지네이션으로 스트리밍한다(#404).
+
+        _sql_doc_base.py::iter_node_identities()의 그래프 쪽 짝이다.
+        inspect_graph_identity()는 노드와 엣지 전량을 한 번에 fetchall()하고
+        원시+정규화 속성을 모두 보존한 뒤, 쓰이지도 않는 지문(fingerprint)
+        계산을 위해 세 번째 사본까지 만든다(마이그레이션 계획에는 필요하지만
+        재조정 진단에는 전혀 쓰이지 않는다). 이 메서드는 graph_nodes 테이블만
+        읽고, 배치당 최대 batch_size 행만 한 번에 메모리에 올리며, 디코딩은
+        기존 _node_inventory_row()를 그대로 재사용해 진단부와 마이그레이션
+        계획부가 서로 다른 두 개의 분류 규칙을 갖는 일을 막는다.
+
+        node_id가 graph_nodes의 PRIMARY KEY이므로(전역 유일성 전제는 diagnose()의
+        legacy/partial 거부 사유와 같다) 단일 컬럼 키셋 페이지네이션으로
+        충분하다. schema_state가 "fresh"면 즉시 끝낸다(테이블이 없을 수
+        있다).
+
+        첫 페이지는 last_id 부재를 나타내는 별도 문장으로 조회한다. 빈
+        문자열을 초기 sentinel로 쓰면 node_id="" 인 행(스키마가 막지 않는
+        값이다)이 ``WHERE node_id > ''``에 걸려 첫 페이지에서 조용히
+        빠지고, 그 결과 진단 전체에서 누락된다(#404 설계검증 1라운드에서
+        지적된 결함). None sentinel과 조건 분기로 이를 막는다.
+
+        커서 전진 보장: node_id가 PRIMARY KEY라 NULL이 아니고 전역 유일하다.
+        첫 페이지 이후 질의는 ``node_id > :last_id``로 엄격 부등호를 쓰고
+        ``next_last_id``는 그 조건을 통과한 행에서만 나오므로, 페이지가
+        비어 있지 않은 한 ``next_last_id``는 이전 ``last_id``보다 반드시
+        커진다. 페이지가 비면 즉시 반환한다. 그래서 이 루프는 무한히
+        멈추지 않을 수 없다(node_id="" 행이 있어도 None sentinel 덕에
+        첫 페이지 판별과 헷갈리지 않는다 -- 변이 테스트에서 sentinel을
+        빈 문자열로 되돌리면 바로 이 경로가 무한 루프로 재현됐다).
+        """
+        self._require_available()
+        if batch_size <= 0:
+            return
+        if self._schema_kind() == "fresh":
+            return
+        table = self._table("graph_nodes")
+        last_id: str | None = None
+        while True:
+            if last_id is None:
+                sql = (
+                    f"SELECT node_type, node_id, space_id, properties FROM {table}"
+                    " ORDER BY node_id LIMIT :batch"
+                )
+                params: dict[str, Any] = {"batch": batch_size}
+            else:
+                sql = (
+                    f"SELECT node_type, node_id, space_id, properties FROM {table}"
+                    " WHERE node_id > :last_id ORDER BY node_id LIMIT :batch"
+                )
+                params = {"last_id": last_id, "batch": batch_size}
+            rows = self._fetch_all(sql, params)
+            if not rows:
+                return
+            next_last_id = rows[-1][1]
+            for row in rows:
+                yield self._node_inventory_row(row)
+            del row  # 루프 변수가 이전 배치의 마지막 원시 행을 붙들지 않게 한다
+            rows = None  # 다음 페이지를 fetch하기 전에 이전 페이지 참조를 끊는다
+            last_id = next_last_id
+
+    def get_node_identity_by_id(self, node_id: str) -> LegacyNodeRow | None:
+        """단건 재조회를 위한, get_node()/get_node_by_id()와 다른 안전한
+        경로(#404). 저 둘은 _as_dict()를 거쳐 malformed properties를 조용히
+        {}로 치환한다(#402급 결함). 역채움이 "이 노드는 healable하다"는
+        판단을 다시 내려야 하는 재조회 지점에서 그 치환은 진단을 오염시킨다.
+        _node_inventory_row()를 그대로 재사용해 진단과 같은 규칙으로 같은
+        property_error/normalization_issues를 얻는다.
+        """
+        self._require_available()
+        sql = (
+            f"SELECT node_type, node_id, space_id, properties FROM {self._table('graph_nodes')}"
+            " WHERE node_id=:nid LIMIT 1"
+        )
+        row = self._fetch_one(sql, {"nid": node_id})
+        if row is None:
+            return None
+        return self._node_inventory_row(row)
 
     @staticmethod
     def _mapping_sources(action: ExplicitRename | ExplicitMerge) -> tuple[tuple[LegacyNodeKey, str], ...]:

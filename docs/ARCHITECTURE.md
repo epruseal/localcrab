@@ -726,7 +726,7 @@ make_vector_store(settings)
 
 ---
 
-## 9. 그래프/문서 노드 키 집합 정합성 (#317)
+## 9. 그래프/문서 노드 키 집합 정합성 (#317, #404)
 
 #55(PR #316)는 `ontology_get_node`/`ontology_list_nodes` 읽기를 그래프 스토어
 하나로 좁혔다. 그러나 두 스토어에 각각 쓰기가 걸리는 한 키 집합이 어긋날 여지는
@@ -734,7 +734,17 @@ make_vector_store(settings)
 잔여물이다. 어느 노드가 어느 스토어에만 있는지는 `scripts/reconcile_doc_graph_nodes.py`가
 진단한다.
 
-**진단**: 두 스토어의 노드 키 집합을 대사해 그래프 전용, 문서 전용, 양쪽에
+**진단(그래프 쪽 읽기 경로, #404)**: 그래프 쪽은 `inspect_graph_identity()`
+(노드와 엣지 전량을 원시+정규화+지문 세 겹으로 한 번에 적재하는, 마이그레이션
+계획용 전량 인벤토리)를 쓰지 않는다. 대신 `graph_schema_state()`로 스키마
+상태만 얇게 확인하고, `iter_graph_node_identities()`로 `node_id` 키셋
+페이지네이션을 통해 그래프 노드를 배치 단위로 스트리밍한다(`LegacyNodeRow`에서
+분류에 안 쓰는 원시 속성, 정규화 속성, 지문은 즉시 벗겨낸다). 이 진단 도구는 엣지를
+전혀 읽지 않고 노드도 분류용 경량 필드만 있으면 되므로, 그래프 노드 수와
+무관하게 메모리 사용량이 배치 크기로 유계다(#404: 이전에는 실제 규모에서
+전량 인벤토리 방식이 커널에 종료되는 OOM을 냈다).
+
+**진단(분류)**: 두 스토어의 노드 키 집합을 대사해 그래프 전용, 문서 전용, 양쪽에
 있으나 타입이 어긋난 정체성 충돌, 같은 노드가 여러 스페이스에 중복된 경우를
 전부 분류해 보고한다. 기본은 dry-run이고 아무것도 쓰지 않는다. 그래프 전용
 노드의 `properties` 컬럼 값 자체가 해석 불가능하면(`property_error`가
@@ -757,6 +767,14 @@ make_vector_store(settings)
 다시 거친다. 진단과 적용 사이에 문서 속성이 바뀌어 이 재검증이 새로 실패해도
 그 노드만 건너뛰고 사유를 남기며, 나머지 노드의 처리와 도구 종료에는 영향을
 주지 않는다.
+
+역채움 방향도 같은 이유로 적용 직전 재확인을 거친다(#404). #317 원 설계는
+진단 시점 스냅샷을 그대로 썼지만, 진단이 스트리밍으로 바뀌면서 healable 행의
+무거운 속성 사본을 적용 시점까지 붙들고 있을 근거가 사라졌다. 대신
+`get_node_identity_by_id()`로 그래프 쪽을 단건 재조회해, 원본 소실(적용 전
+그래프 노드 삭제), 재조회 자체의 거부(malformed `properties`, 정규화 이슈,
+space 없음), 정체성 변경(적용 전 같은 `node_id`가 다른 space나 type으로
+재생성)을 각각 감지하고 사유와 함께 건너뛴다.
 
 승격 결과 `outcome == "healed"`가 보장하는 것은 "승격 경로가 예외 없이
 끝났고, 그 시점에 해당 노드가 그래프 스토어에 존재한다"는 사실뿐이다.
@@ -784,5 +802,11 @@ python scripts/reconcile_doc_graph_nodes.py --apply --backup-to /path/to/backup 
 
 `tests/test_reconcile_doc_graph_nodes.py`가 분류 전수성(대조군 무변경, 그래프
 전용 전수 보고), `thaw_json()` 기반 속성 복원, 승격 거부 사유, 스키마 상태 거부,
-백업 게이트, 실행 기록 크래시 안전성, 완전 치유 뒤 두 스토어 키 집합 동등을
+백업 게이트, 실행 기록 크래시 안전성, 완전 치유 뒤 두 스토어 키 집합 동등,
+그리고 진단과 apply 직전 재확인 둘 다가 전량 인벤토리 경로(`inspect_graph_identity()`)를
+쓰지 않고 스트리밍 경로만 쓴다는 것을 검증한다(#404). `tests/test_sql_graph_base.py`가
+`iter_graph_node_identities()`의 배치 경계 스트리밍, `node_id=""` 노드 누락
+방지, 실제 페이지 단위 fetch 수행(단일 무제한 fetch로의 회귀 방지)을,
+`tests/test_kuzu_graph_store.py`/`tests/test_neo4j_helpers.py`가 새 읽기
+메서드 3종의 백엔드별 거부 동작을 `inspect_graph_identity()`와 동일하게
 검증한다.

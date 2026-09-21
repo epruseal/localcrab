@@ -934,6 +934,24 @@ class Neo4jStore:
             "graph identity migration inventory is unavailable for Neo4j"
         )
 
+    def graph_schema_state(self):
+        """Reject the #404 schema-state probe until a Neo4j qualification exists."""
+        raise GraphReadCapabilityUnavailable(
+            "graph identity migration inventory is unavailable for Neo4j"
+        )
+
+    def iter_graph_node_identities(self, batch_size: int = 5000):
+        """Reject the #404 streaming node-identity iterator until a Neo4j qualification exists."""
+        raise GraphReadCapabilityUnavailable(
+            "graph identity migration inventory is unavailable for Neo4j"
+        )
+
+    def get_node_identity_by_id(self, node_id: str):
+        """Reject the #404 single-node identity re-fetch until a Neo4j qualification exists."""
+        raise GraphReadCapabilityUnavailable(
+            "graph identity migration inventory is unavailable for Neo4j"
+        )
+
     def migrate_graph_identity(
         self,
         request: DryRunMigrationRequest | ApplyMigrationRequest,

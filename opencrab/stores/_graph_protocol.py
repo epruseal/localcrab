@@ -104,6 +104,7 @@ now that method presence is at parity).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from opencrab.common.graph_identity import (
@@ -111,6 +112,7 @@ from opencrab.common.graph_identity import (
     DryRunMigrationRequest,
     EdgeWriteReceipt,
     GraphInventory,
+    LegacyNodeRow,
     MigrationReceipt,
     NodeWriteReceipt,
     ProvenanceBatchReceipt,
@@ -304,6 +306,18 @@ class GraphStore(Protocol):
 
     def inspect_graph_identity(self) -> GraphInventory:
         """Return every typed legacy row and its source fingerprint read-only."""
+        ...
+
+    def graph_schema_state(self) -> str:
+        """Return the graph schema state without loading any node/edge rows (#404)."""
+        ...
+
+    def iter_graph_node_identities(self, batch_size: int = 5000) -> Iterator[LegacyNodeRow]:
+        """Stream graph node identities via node_id keyset pagination (#404)."""
+        ...
+
+    def get_node_identity_by_id(self, node_id: str) -> LegacyNodeRow | None:
+        """Re-fetch one graph node's identity row without the get_node()/get_node_by_id() ``_as_dict()`` coercion (#404)."""
         ...
 
     def migrate_graph_identity(
