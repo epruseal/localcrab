@@ -559,7 +559,12 @@ class TestPackSelectionCLI:
 class TestResolvePacksErrorPolicy:
     """공통 서비스 resolve_packs 의 예외 정책 분기 박제:
     MCP(raise_on_error=False) 는 graceful degrade(AUTO_PACK_FAILED 경고),
-    CLI(raise_on_error=True) 는 예외 전파."""
+    CLI(raise_on_error=True) 는 예외 전파.
+
+    #397: auto_pack 의 후보 소스가 SQL list_packs_for 로 바뀌면서, 이
+    클래스가 주입하던 실패 지점도 (구 후보 소스였던) load_pack_registry 에서
+    list_packs_for 로 옮긴다. sql/principal 은 list_packs_for 가
+    monkeypatch 로 완전히 대체되므로 자리만 채우는 MagicMock 이다."""
 
     @staticmethod
     def _boom(*_a, **_k):
@@ -568,11 +573,11 @@ class TestResolvePacksErrorPolicy:
     def test_auto_pack_failure_graceful(self, monkeypatch):
         from opencrab.services.pack_selection import AUTO_PACK_FAILED, resolve_packs
 
-        monkeypatch.setattr(
-            "opencrab.ontology.pack_registry.load_pack_registry", self._boom
-        )
+        monkeypatch.setattr("opencrab.pack.ownership.list_packs_for", self._boom)
         sel = resolve_packs(
-            "q", None, True, False, "/tmp", scope=frozenset(), raise_on_error=False
+            "q", None, True, False, "/tmp",
+            scope=frozenset(), raise_on_error=False,
+            sql=MagicMock(), principal=MagicMock(),
         )
         # #147: effective_pack_ids is never None -- no requested pack_ids
         # resolves to the caller's (here empty) readable scope, a concrete list.
@@ -586,27 +591,50 @@ class TestResolvePacksErrorPolicy:
     def test_auto_pack_failure_raises(self, monkeypatch):
         from opencrab.services.pack_selection import resolve_packs
 
+        monkeypatch.setattr("opencrab.pack.ownership.list_packs_for", self._boom)
+        with pytest.raises(RuntimeError):
+            resolve_packs(
+                "q", None, True, False, "/tmp",
+                scope=frozenset(), raise_on_error=True,
+                sql=MagicMock(), principal=MagicMock(),
+            )
+
+    def test_manifest_only_failure_does_not_block_sql_candidates(self, monkeypatch):
+        """#397: 매니페스트(파일시스템) 스캔 단독 실패는 SQL 후보를 막지
+        않는다. SQL 조회는 성공하는데 load_pack_registry 만 실패하면,
+        AUTO_PACK_FAILED 경고 없이 SQL-only 후보로 계속 진행해야 한다."""
+        from opencrab.services.pack_selection import AUTO_PACK_FAILED, resolve_packs
+
+        monkeypatch.setattr(
+            "opencrab.pack.ownership.list_packs_for",
+            lambda sql, principal: [
+                {"pack_id": "pack-a", "title": "quantum widget research", "description": ""}
+            ],
+        )
         monkeypatch.setattr(
             "opencrab.ontology.pack_registry.load_pack_registry", self._boom
         )
-        with pytest.raises(RuntimeError):
-            resolve_packs(
-                "q", None, True, False, "/tmp", scope=frozenset(), raise_on_error=True
-            )
+        sel = resolve_packs(
+            "quantum widget research", None, True, False, "/tmp",
+            scope=frozenset({"pack-a"}), raise_on_error=False,
+            sql=MagicMock(), principal=MagicMock(),
+        )
+        assert AUTO_PACK_FAILED not in [w.code for w in sel.warnings]
+        assert sel.selected_packs and sel.selected_packs[0]["pack_id"] == "pack-a"
+        assert sel.effective_pack_ids == ["pack-a"]
 
     def test_pack_ids_override_does_not_touch_registry(self, monkeypatch):
         # pack_ids 가 있으면 auto_pack 은 무력화되어 registry 를 건드리지 않는다
         # (override 경고만 — 예외 함수가 호출되면 안 됨).
         from opencrab.services.pack_selection import PACK_IDS_OVERRIDE_AUTO, resolve_packs
 
-        monkeypatch.setattr(
-            "opencrab.ontology.pack_registry.load_pack_registry", self._boom
-        )
+        monkeypatch.setattr("opencrab.pack.ownership.list_packs_for", self._boom)
         # scope must include "pack-a" or narrow() drops it and adds an extra
         # PACK_IDS_OUT_OF_SCOPE warning this test isn't about.
         sel = resolve_packs(
             "q", ["pack-a"], True, False, "/tmp",
             scope=frozenset({"pack-a"}), raise_on_error=True,
+            sql=MagicMock(), principal=MagicMock(),
         )
         assert sel.effective_pack_ids == ["pack-a"]
         assert sel.auto_pack_active is False

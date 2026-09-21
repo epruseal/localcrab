@@ -72,6 +72,12 @@ class QueryResult:
     text: str | None
     metadata: dict[str, Any] = field(default_factory=dict)
     graph_context: dict[str, Any] | None = None
+    # #61: the pre-normalization score as the store returned it, kept so a
+    # caller comparing results from different query() calls (rerank on vs.
+    # off) can tell a normalized 0.0-1.0 score from a leg's native scale.
+    # None for a reranked result -- the reranker does not preserve a single
+    # per-leg raw score once it has cross-encoded every candidate together.
+    raw_score: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +87,7 @@ class QueryResult:
             "text": self.text,
             "metadata": self.metadata,
             "graph_context": self.graph_context,
+            "raw_score": self.raw_score,
         }
 
 
@@ -672,14 +679,38 @@ class HybridQuery:
             reranker = _get_reranker()()
             merged = reranker.rerank(question, result_lists, top_k=profile.rerank_limit)
         else:
-            # Flat merge without reranking
+            # Flat merge without reranking. #61: each leg's raw score comes
+            # from a different scale (vector similarity, BM25, FTS5 rank,
+            # graph edge weight), so sorting the concatenated lists by raw
+            # score lets whichever leg happens to produce the largest raw
+            # numbers dominate the merge regardless of relevance.
+            #
+            # This normalization promises leg-to-leg SCALE alignment only.
+            # It does not promise relevance: which document ends up
+            # relevant is decided upstream, by which packs even entered the
+            # candidate pool (#397's auto_pack fix), not by this merge step.
+            # Making that split explicit turns two merge-order effects into
+            # deterministic rules instead of incidental behaviour:
+            # (1) When two or more legs each contribute a top item that
+            #     normalizes to 1.0, the tie is broken by leg-merge order
+            #     (the list above: vector, bm25, fts, graph -- vector
+            #     wins). This is a stated rule, not a side effect, and is
+            #     pinned by a dedicated test (see #397 design doc s.6).
+            # (2) When the same node_id appears in more than one leg, only
+            #     the first leg's (normalized) score is kept and later
+            #     occurrences are dropped. This dedup rule predates this
+            #     change and is unchanged here.
             seen: set[str | None] = set()
             merged = []
             for lst in result_lists:
+                leg_max = max((item.get("score") or 0.0) for item in lst) if lst else 0.0
                 for item in lst:
-                    if item.get("node_id") not in seen:
-                        seen.add(item.get("node_id"))
-                        merged.append(item)
+                    if item.get("node_id") in seen:
+                        continue
+                    seen.add(item.get("node_id"))
+                    item["raw_score"] = item.get("score", 0.0)
+                    item["score"] = (item["raw_score"] / leg_max) if leg_max > 0 else 0.0
+                    merged.append(item)
             merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
         # --- Stage 5: Policy-aware filter ---
@@ -705,6 +736,10 @@ class HybridQuery:
                 text=item.get("text"),
                 metadata=metadata,
                 graph_context=item.get("graph_context"),
+                # #61: only the flat-merge branch sets "raw_score" on the
+                # item dict. A reranked item has no single per-leg raw
+                # score, so this is None for use_rerank=True results.
+                raw_score=item.get("raw_score"),
             ))
         return QueryOutcome(results=results, warnings=warnings)
 
