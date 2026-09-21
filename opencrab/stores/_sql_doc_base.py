@@ -344,8 +344,10 @@ class _SqlDocStoreBase(abc.ABC):
         키 거부를 건다(그래프 쪽 ``parse_properties_object()``와 같은
         원칙, 대체 리뷰 BLOCKING). 기본 ``json.loads()``는 중복 키를
         조용히 마지막 값으로 덮어써 실제 컬럼 값과 다른 딕셔너리를
-        반환하므로, 정상 배관을 거치지 않은 오염을 승격/역채움 양쪽에서
-        은폐한다. 중복 키를 감지하면 기존 ``except`` 절이 흡수하도록
+        반환하므로, 정상 배관을 거치지 않은 오염을 문서 진단과 승격
+        양쪽에서 은폐한다("역채움"은 그래프 전용 경로(``_backfill_one()``)의
+        용어이며 이 메서드와는 무관하다, #317 이중검증 3라운드 지적).
+        중복 키를 감지하면 기존 ``except`` 절이 흡수하도록
         ``ValueError``를 내 원본 raw 문자열을 그대로 반환한다 -- 이
         메서드는 "절대 raise하지 않는다"는 계약을 유지하고, non-dict
         판정은 호출자의 ``prepare_node()``/``normalize_node_properties()``
