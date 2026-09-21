@@ -24,6 +24,7 @@ from opencrab.common.graph_identity import (
     GraphSchemaMigrationRequired,
     LegacyNodeKey,
     PropertyResolution,
+    decode_raw_properties,
     receipt_sha256,
 )
 from opencrab.stores.local_graph_store import LocalGraphStore
@@ -145,6 +146,57 @@ def test_sqlite_malformed_properties_are_lossless_and_rejected_before_dml() -> N
     finally:
         store.close()
         fixture.close()
+
+
+def test_decode_raw_properties_rejects_pg_jsonb_string_scalar_without_reparsing() -> None:
+    """Issue #317, issue80 dual-verification round-1 counterexample 2.
+
+    A ``jsonb=True`` string arriving at ``decode_raw_properties()`` never was
+    a JSONB object/array as far as the psycopg driver is concerned -- the
+    driver already decodes those to ``dict``/``list``.  The old logic
+    re-parsed the string with ``json.loads()`` and treated a successful parse
+    as proof of validity, so a driver-decoded string like ``'{}'`` was
+    silently accepted as an empty properties object.  These assertions pin
+    the *correct* (post-fix) values; against the pre-fix code (``65dd312``)
+    the first assertion fails (RED), which is the detection-power evidence
+    codex's design validation required.
+    """
+    # A string that happens to be valid JSON object syntax must still be
+    # rejected -- reparsing success is not proof this column held an object.
+    raw, decoded, error = decode_raw_properties("{}", jsonb=True)
+    assert raw == "{}"
+    assert decoded is None
+    assert error == "jsonb_non_object_scalar"
+
+    # A plain (non-JSON-looking) string scalar was already rejected before
+    # this fix -- unaffected control, confirms no regression.
+    _, decoded, error = decode_raw_properties('"plain scalar"', jsonb=True)
+    assert decoded is None
+    assert error == "jsonb_non_object_scalar"
+
+    # An array-shaped string: assertion A (rejection) holds both before and
+    # after the fix; assertion B (the exact error value) only holds after --
+    # the old logic classified this as "jsonb_non_object_array", the new
+    # logic reports "jsonb_non_object_scalar" for every rejected string.
+    # The two are kept separate so a mutation test does not conflate
+    # "still rejected" with "rejected with the same reason".
+    _, decoded, error = decode_raw_properties("[1,2,3]", jsonb=True)
+    assert decoded is None  # assertion A: still rejected either way
+    assert error == "jsonb_non_object_scalar"  # assertion B: new value
+
+    # Non-string input is untouched by this branch.
+    _, decoded, error = decode_raw_properties({"x": 1}, jsonb=True)
+    assert decoded == {"x": 1}
+    assert error is None
+
+    # jsonb=False (SQLite dialect) keeps taking the untouched string branch:
+    # a string scalar there is still parsed, since SQLite never pre-decodes,
+    # and a non-object result fails closed with the pre-existing literal
+    # ("malformed_json", the same value asserted by the sibling SQLite test
+    # test_sqlite_malformed_properties_are_lossless_and_rejected_before_dml).
+    _, decoded, error = decode_raw_properties('"plain scalar"', jsonb=False)
+    assert decoded is None
+    assert error == "malformed_json"
 
 
 def test_sqlite_property_resolution_is_fail_closed_and_valid_plan_has_no_loss() -> None:

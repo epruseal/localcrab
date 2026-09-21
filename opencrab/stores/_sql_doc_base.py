@@ -55,10 +55,11 @@ Covered here: the 13 methods' SQL text and dict-shaping logic.
 from __future__ import annotations
 
 import abc
+import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from opencrab.stores._graph_common import _as_dict
 from opencrab.stores._json import dump_props
@@ -119,6 +120,26 @@ DOC_STORE_SCHEMA = SchemaSpec(
         IndexSpec("idx_audit_ts", "audit_log", "timestamp DESC"),
     ),
 )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads(..., object_pairs_hook=...)`` 훅: 중복 키를 감지하면
+    거부한다.
+
+    그래프 쪽 ``graph_identity.parse_properties_object()``의 같은 이름
+    지역 함수와 같은 원칙이다(#317 대체 리뷰 BLOCKING). 기본
+    ``json.loads()``는 중복 키를 조용히 마지막 값으로 덮어써, properties
+    컬럼이 정상 배관을 거치지 않고 오염된 경우(예: 저수준 SQL 직접
+    UPDATE) 실제 저장값과 다른 딕셔너리를 반환한다. 이 훅은 호출자
+    (``_decode_properties_raw()``)의 기존 ``except (TypeError, ValueError)``
+    절이 흡수하도록 ``ValueError``만 낸다.
+    """
+    out: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key in properties column: {key!r}")
+        out[key] = item
+    return out
 
 
 def _ts_str(value: Any) -> str:
@@ -270,6 +291,164 @@ class _SqlDocStoreBase(abc.ABC):
         if row is None:
             return None
         return self._row_to_node(row)
+
+    def get_node_docs_by_id(self, node_id: str) -> list[dict[str, Any]]:
+        """``node_id`` 하나에 대해 현재 ``doc_nodes``에 존재하는 모든 (space)
+        행을 전부 반환한다 (#317 승격 적용 시점 재확인 -- 진단과 적용 사이의
+        원본 소실/space 중복을 한 조회로 함께 감지한다). ``node_id`` 단독
+        인덱스가 없어 전 테이블 스캔이다 -- 이 도구가 실제로 승격을 시도하는
+        행(이상 사례로 이미 걸러진 소수)에만 호출되므로 이 비용을 받아들인다
+        (모듈의 "알려진 한계" 절과 같은 결의, 대량 상시 배치 승격에는
+        재사용하지 않는다). 0건/1건/다건 모두 있는 그대로(빈 리스트 포함)
+        반환하고 예외로 신호하지 않는다.
+
+        ``_row_to_node()``(따라서 ``_as_dict()``)를 재사용하지 않는다.
+        ``_as_dict()``는 비딕셔너리/파싱 실패 JSON을 조용히 ``{}``로
+        치환하는데, 그 치환이 이 호출자(``_promote_one()``)가 값을 보기
+        전에 일어나면 원본이 오염된 경우를 빈 속성 승격으로 위장시킨다
+        (issue #402, 이 헬퍼 자체는 범위 밖). 대신 ``_decode_properties_raw()``
+        로 이 메서드 전용의 좁은 계약을 쓴다.
+        """
+        self._require_available()
+        sql = (
+            f"SELECT space, node_id, node_type, properties, updated_at"
+            f" FROM {self._table('doc_nodes')} WHERE node_id=:node_id"
+        )
+        rows = self._fetch_all(sql, {"node_id": node_id})
+        return [
+            {
+                "space": self._row_get(row, "space"),
+                "node_id": self._row_get(row, "node_id"),
+                "node_type": self._row_get(row, "node_type"),
+                "properties": self._decode_properties_raw(self._row_get(row, "properties")),
+                "updated_at": _ts_str(self._row_get(row, "updated_at")),
+            }
+            for row in rows
+        ]
+
+    def _decode_properties_raw(self, value: Any) -> Any:
+        """``properties`` 컬럼의 원시값을 방언별 실제 인코딩에 맞게 디코드한다.
+
+        SQLite는 JSON 컬럼을 raw TEXT로 저장/반환하므로 문자열이면
+        ``json.loads()``를 시도한다. PG(psycopg2/SQLAlchemy)는 JSONB
+        컬럼을 드라이버가 이미 디코드해 반환하므로 절대 다시 파싱하지
+        않는다 -- 디코드된 값이 우연히 파이썬 문자열이어도(``properties``
+        컬럼이 JSON 문자열 스칼라로 오염된 경우) 그 값을 다시 파싱하면
+        원래 비딕셔너리였던 오염값을 딕셔너리로 되돌려 하위 검증을
+        우회시킨다(#317 이중검증 3라운드 지적). "문자열이냐"는 방언을
+        구분하지 못하는 값-모양 휴리스틱이므로, 이 클래스가 이미 아는
+        방언 정보(``self._dialect.name``, 이 파일 158행과 같은 관용구)로
+        분기한다.
+
+        SQLite 경로의 ``json.loads()``에는 ``object_pairs_hook``으로 중복
+        키 거부를 건다(그래프 쪽 ``parse_properties_object()``와 같은
+        원칙, 대체 리뷰 BLOCKING). 기본 ``json.loads()``는 중복 키를
+        조용히 마지막 값으로 덮어써 실제 컬럼 값과 다른 딕셔너리를
+        반환하므로, 정상 배관을 거치지 않은 오염을 문서 진단과 승격
+        양쪽에서 은폐한다("역채움"은 그래프 전용 경로(``_backfill_one()``)의
+        용어이며 이 메서드와는 무관하다, #317 이중검증 3라운드 지적).
+        중복 키를 감지하면 기존 ``except`` 절이 흡수하도록
+        ``ValueError``를 내 원본 raw 문자열을 그대로 반환한다 -- 이
+        메서드는 "절대 raise하지 않는다"는 계약을 유지하고, non-dict
+        판정은 호출자의 ``prepare_node()``/``normalize_node_properties()``
+        비딕셔너리 거부에 맡긴다.
+        """
+        if self._dialect.name == "sqlite" and isinstance(value, str):
+            try:
+                return json.loads(value, object_pairs_hook=_reject_duplicate_json_keys)
+            except (TypeError, ValueError):
+                return value
+        return value
+
+    def create_node_doc_if_absent(
+        self, space: str, node_type: str, node_id: str, properties: dict[str, Any]
+    ) -> Literal["created", "exists"]:
+        """Insert-if-absent counterpart to ``upsert_node_doc`` (issue #317
+        5-2절): ``upsert_node_doc`` is an unconditional ``DO UPDATE``, which
+        is the right contract for a caller that owns the row's content, but
+        wrong for graph-only backfill -- if another process wrote this row
+        between diagnosis and this call, ``upsert_node_doc`` would silently
+        overwrite it with the (possibly stale) properties this call was
+        reconstructing from the graph side. ``ON CONFLICT (space, node_id)
+        DO NOTHING`` plus a rowcount check tells the caller which happened,
+        mirroring ``_sql_graph_base.py::upsert_node``'s own insert-then-check
+        pattern for the same identity-race reason.
+        """
+        self._require_available()
+        now = datetime.now(UTC)
+        sql = self._dialect.insert(
+            self._table("doc_nodes"),
+            ["space", "node_id", "node_type", "properties", "updated_at"],
+            json_columns=["properties"],
+        ) + "\nON CONFLICT (space, node_id) DO NOTHING"
+        rowcount = self._exec_write(
+            sql,
+            {
+                "space": space,
+                "node_id": node_id,
+                "node_type": node_type,
+                "properties": dump_props(properties),
+                "updated_at": self._dialect.bind_value_for_timestamp(now),
+            },
+        )
+        return "created" if rowcount else "exists"
+
+    def iter_node_identities(
+        self, space: str | None = None, batch_size: int = 5000
+    ) -> Iterator[tuple[str, str, str]]:
+        """Stream ``(space, node_id, node_type)`` for every row, unbounded
+        (issue #317 3절/6절) -- a purpose-built, narrow-contract sibling of
+        ``_sql_graph_base.py::export_nodes``, not a reuse of that name: that
+        method is a capped (``limit=500_000`` default), fully-materializing
+        ``list[dict]`` of full rows for display/API callers, while
+        reconciliation needs only identity triples, streamed, with no cap,
+        so that a corpus larger than the cap is not silently truncated and
+        large ``properties`` blobs are never loaded into memory at all.
+
+        Implemented as keyset pagination over the ``(space, node_id)``
+        primary key, since ``_fetch_all`` always fully materializes its
+        result and this base has no server-side-cursor hook -- row-value
+        comparison (``WHERE (space, node_id) > (:last_space, :last_node_id)``)
+        is supported by both dialects (SQLite since 3.24, already assumed
+        elsewhere in this file's ``ON CONFLICT ... DO UPDATE`` upsert; see
+        ``_sql_dialect.py``'s "ROWID STABILITY" note).
+        """
+        self._require_available()
+        if batch_size <= 0:
+            return
+        table = self._table("doc_nodes")
+        last_space = ""
+        last_node_id = ""
+        while True:
+            if space:
+                sql = (
+                    f"SELECT space, node_id, node_type FROM {table}"
+                    f" WHERE space=:space AND (space, node_id) > (:last_space, :last_node_id)"
+                    f" ORDER BY space, node_id LIMIT :batch"
+                )
+                params = {
+                    "space": space,
+                    "last_space": last_space,
+                    "last_node_id": last_node_id,
+                    "batch": batch_size,
+                }
+            else:
+                sql = (
+                    f"SELECT space, node_id, node_type FROM {table}"
+                    f" WHERE (space, node_id) > (:last_space, :last_node_id)"
+                    f" ORDER BY space, node_id LIMIT :batch"
+                )
+                params = {"last_space": last_space, "last_node_id": last_node_id, "batch": batch_size}
+            rows = self._fetch_all(sql, params)
+            if not rows:
+                return
+            for row in rows:
+                row_space = self._row_get(row, "space")
+                row_node_id = self._row_get(row, "node_id")
+                row_node_type = self._row_get(row, "node_type")
+                yield (row_space, row_node_id, row_node_type)
+            last_space = self._row_get(rows[-1], "space")
+            last_node_id = self._row_get(rows[-1], "node_id")
 
     def list_nodes(self, space: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         """``limit <= 0`` (issue #120 follow-up): returns ``[]`` without

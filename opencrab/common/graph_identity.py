@@ -622,36 +622,16 @@ def decode_raw_properties(value: Any, *, jsonb: bool = False) -> tuple[bytes | F
             return raw, None, "malformed_json"
         return raw, FrozenDict(parsed), None
     if isinstance(value, str) and jsonb:
-        # psycopg drivers normally decode JSONB before returning it: an object
-        # is a mapping, an array is a list, and a JSON string scalar is a
-        # plain Python str.  Do not mistake that scalar for malformed JSON.
-        raw = value.encode("utf-8", errors="surrogatepass")
-
-        def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
-            out: dict[str, Any] = {}
-            for key, item in items:
-                if key in out:
-                    raise GraphPropertyValidationError("duplicate graph property")
-                out[key] = item
-            return out
-
-        try:
-            parsed = json.loads(value, object_pairs_hook=pairs)
-        except (TypeError, ValueError, UnicodeError) as exc:
-            # A driver-level raw object/array that is not valid JSON is
-            # malformed data.  A normal unquoted string is the JSONB scalar
-            # representation returned by the driver and remains observable as
-            # such in the inventory.
-            if value.lstrip().startswith(("{", "[")):
-                reason = "duplicate_object_key" if "duplicate" in str(exc) else "malformed_json"
-            else:
-                return value, None, "jsonb_non_object_scalar"
-            return raw, None, reason
-        if isinstance(parsed, dict):
-            return raw, FrozenDict(parsed), None
-        if isinstance(parsed, list):
-            return freeze_json(parsed), None, "jsonb_non_object_array"
-        return freeze_json(parsed), None, "jsonb_non_object_scalar"
+        # psycopg drivers decode JSONB before returning it: an object becomes a
+        # mapping and an array becomes a list at the Python level already.  Any
+        # string arriving here therefore never was a JSONB object/array as far
+        # as the driver is concerned -- it is either a JSON string scalar the
+        # column legitimately stored, or a corrupted column value that merely
+        # happens to look like JSON.  Do not re-parse it to decide which: a
+        # successful parse only proves the text is syntactically valid JSON, not
+        # that this column ever held an object.  Report it as a non-object
+        # scalar either way and let the caller reject it.
+        return value, None, "jsonb_non_object_scalar"
     if isinstance(value, str):
         raw = value.encode("utf-8", errors="surrogatepass")
         try:

@@ -364,6 +364,72 @@ class TestDocParity:
             assert store.get_node_doc("s1", "newnode") is None
             assert store.delete_node_doc("s1", "newnode") is False
 
+    def test_iter_node_identities_parity(self, doc_pair):
+        """issue #317: keyset-pagination generator (SQLite) vs the same SQL
+        text over a SQLAlchemy engine (PG) must enumerate the identical
+        identity set, unbounded and with no duplicates, for both a small
+        ``batch_size`` (forces multiple pages) and the ``space`` filter."""
+        local, pg = doc_pair
+        for store in (local, pg):
+            all_ids = list(store.iter_node_identities(batch_size=7))
+            assert len(all_ids) == len(set(all_ids)), "duplicate rows across pages"
+            scoped_ids = list(store.iter_node_identities(space="s1", batch_size=13))
+            assert all(space == "s1" for space, _, _ in scoped_ids)
+        local_ids = sorted(local.iter_node_identities(batch_size=7))
+        pg_ids = sorted(pg.iter_node_identities(batch_size=7))
+        assert local_ids == pg_ids
+
+    def test_get_node_docs_by_id_parity(self, doc_pair):
+        """issue #317 승격 적용 시점 재확인: 0건/1건/다건(다른 space에
+        같은 node_id) 조회가 두 백엔드에서 같은 결과를 낸다."""
+        local, pg = doc_pair
+        for store in (local, pg):
+            assert store.get_node_docs_by_id("gndbi_missing") == []
+            store.upsert_node_doc("s1", "Doc", "gndbi_one", {"x": 1})
+            rows = store.get_node_docs_by_id("gndbi_one")
+            assert len(rows) == 1
+            assert rows[0]["space"] == "s1"
+            assert rows[0]["properties"] == {"x": 1}
+            store.upsert_node_doc("s2", "Doc", "gndbi_one", {"x": 2})
+            rows = store.get_node_docs_by_id("gndbi_one")
+            assert {row["space"] for row in rows} == {"s1", "s2"}
+
+    def test_get_node_docs_by_id_pg_string_scalar_not_reparsed(self, doc_pair):
+        """설계 검증 3라운드 FAIL 반영: properties 컬럼이 JSON 문자열
+        스칼라(디코드하면 파이썬 문자열이 되는 값)로 오염되면, PG는 그
+        값을 다시 파싱하지 않고 문자열 그대로 돌려줘야 한다(드라이버가
+        이미 디코드했으므로) -- 두 번 파싱하면 오염된 문자열이 딕셔너리
+        {} 로 되돌아가 하위 검증을 우회한다. SQLite는 raw TEXT 컬럼이므로
+        한 번만 파싱해 같은 결과(딕셔너리가 아닌 문자열 '{}')에 도달하되,
+        그 경로는 다르다(SQLite: 파싱, PG: 무파싱)."""
+        local, pg = doc_pair
+        for store in (local, pg):
+            store.upsert_node_doc("s1", "Doc", "gndbi_scalar", {"placeholder": True})
+            (properties_expr,) = store._dialect._value_exprs(["properties"], ["properties"])
+            store._exec_write(
+                f"UPDATE {store._table('doc_nodes')} SET properties={properties_expr}"
+                " WHERE space=:space AND node_id=:node_id",
+                {"properties": '"{}"', "space": "s1", "node_id": "gndbi_scalar"},
+            )
+            rows = store.get_node_docs_by_id("gndbi_scalar")
+            assert len(rows) == 1
+            assert rows[0]["properties"] == "{}"
+            assert rows[0]["properties"] != {}
+
+    def test_create_node_doc_if_absent_parity(self, doc_pair):
+        local, pg = doc_pair
+        for store in (local, pg):
+            result1 = store.create_node_doc_if_absent("s1", "Doc", "cndia_new", {"x": 1})
+            assert result1 == "created"
+            assert store.get_node_doc("s1", "cndia_new")["properties"] == {"x": 1}
+            # An existing row must not be overwritten, matching upsert_node()'s
+            # insert-then-check graph-side contract (5-2절).
+            result2 = store.create_node_doc_if_absent(
+                "s1", "Doc", "cndia_new", {"x": "SHOULD_NOT_APPEAR"}
+            )
+            assert result2 == "exists"
+            assert store.get_node_doc("s1", "cndia_new")["properties"] == {"x": 1}
+
     def test_bm25_fingerprint_count_matches(self, doc_pair):
         local, pg = doc_pair
         local_count, _ = local.bm25_fingerprint()
