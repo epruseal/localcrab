@@ -273,8 +273,15 @@ def _classify_doc_only(
         report.doc_only.append(DocOnlyRow(node_id, node_type, space, False, REASON_NODE_TYPE_MISSING))
         return
 
-    doc_full = doc_store.get_node_doc(space, node_id)
-    properties = doc_full["properties"] if doc_full is not None else {}
+    # get_node_doc() 이 아니라 get_node_docs_by_id() 를 쓴다: 전자는
+    # _row_to_node()/_as_dict() 를 거쳐 비딕셔너리/파싱 실패 properties 를
+    # 조용히 {} 로 치환하므로, properties 컬럼이 오염된 경우 진단이 빈
+    # 속성 승격 가능(healable=True)으로 잘못 보고한다. get_node_docs_by_id()
+    # 는 이미 적용 시점 재확인(_promote_one())이 같은 이유로 쓰는 헬퍼이며
+    # 원본 값을 그대로 반환한다(#402, 대체 리뷰 BLOCKING). 진단과 적용이
+    # 같은 조회를 쓰게 맞춰 조회 경로 불일치를 없앤다.
+    current_rows = [row for row in doc_store.get_node_docs_by_id(node_id) if row["space"] == space]
+    properties = current_rows[0]["properties"] if len(current_rows) == 1 else {}
     pack_id = properties.get("pack_id") if isinstance(properties, dict) else None
     if isinstance(properties, dict) and "pack_id" in properties and pack_id is not None and not isinstance(pack_id, str):
         report.doc_only.append(DocOnlyRow(node_id, node_type, space, False, REASON_PACK_ID_NON_STRING))

@@ -122,6 +122,26 @@ DOC_STORE_SCHEMA = SchemaSpec(
 )
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads(..., object_pairs_hook=...)`` 훅: 중복 키를 감지하면
+    거부한다.
+
+    그래프 쪽 ``graph_identity.parse_properties_object()``의 같은 이름
+    지역 함수와 같은 원칙이다(#317 대체 리뷰 BLOCKING). 기본
+    ``json.loads()``는 중복 키를 조용히 마지막 값으로 덮어써, properties
+    컬럼이 정상 배관을 거치지 않고 오염된 경우(예: 저수준 SQL 직접
+    UPDATE) 실제 저장값과 다른 딕셔너리를 반환한다. 이 훅은 호출자
+    (``_decode_properties_raw()``)의 기존 ``except (TypeError, ValueError)``
+    절이 흡수하도록 ``ValueError``만 낸다.
+    """
+    out: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key in properties column: {key!r}")
+        out[key] = item
+    return out
+
+
 def _ts_str(value: Any) -> str:
     """Duplicate of pg_doc_store._ts_str (duck-typed: works for the ISO
     string SQLite already stores as well as the datetime object PG returns).
@@ -319,10 +339,21 @@ class _SqlDocStoreBase(abc.ABC):
         구분하지 못하는 값-모양 휴리스틱이므로, 이 클래스가 이미 아는
         방언 정보(``self._dialect.name``, 이 파일 158행과 같은 관용구)로
         분기한다.
+
+        SQLite 경로의 ``json.loads()``에는 ``object_pairs_hook``으로 중복
+        키 거부를 건다(그래프 쪽 ``parse_properties_object()``와 같은
+        원칙, 대체 리뷰 BLOCKING). 기본 ``json.loads()``는 중복 키를
+        조용히 마지막 값으로 덮어써 실제 컬럼 값과 다른 딕셔너리를
+        반환하므로, 정상 배관을 거치지 않은 오염을 승격/역채움 양쪽에서
+        은폐한다. 중복 키를 감지하면 기존 ``except`` 절이 흡수하도록
+        ``ValueError``를 내 원본 raw 문자열을 그대로 반환한다 -- 이
+        메서드는 "절대 raise하지 않는다"는 계약을 유지하고, non-dict
+        판정은 호출자의 ``prepare_node()``/``normalize_node_properties()``
+        비딕셔너리 거부에 맡긴다.
         """
         if self._dialect.name == "sqlite" and isinstance(value, str):
             try:
-                return json.loads(value)
+                return json.loads(value, object_pairs_hook=_reject_duplicate_json_keys)
             except (TypeError, ValueError):
                 return value
         return value

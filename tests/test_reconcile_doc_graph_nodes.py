@@ -149,6 +149,52 @@ class TestDiagnoseClassification:
         assert len(report.conflicts) == 1
         assert report.conflicts[0].reason == "space_mismatch"
 
+    def test_diagnose_time_non_dict_properties_is_rejected_not_healable_true(self, graph_store, doc_store):
+        """대체 리뷰(BLOCKING) 지적: ``_classify_doc_only`` 가
+        ``get_node_doc()`` 을 거치면 ``_row_to_node()``/``_as_dict()`` 가
+        비딕셔너리 값을 조용히 ``{}`` 로 치환한다. 그 빈 딕셔너리는
+        ``prepare_node()`` 를 그대로 통과해 진단이 ``healable=True`` 를
+        잘못 보고한다. ``get_node_docs_by_id()`` (적용 시점 재확인이 이미
+        쓰는 헬퍼, #402) 로 바꾸면 원본 리스트 값을 그대로 ``prepare_node()``
+        에 넘겨 정상적으로 거부돼야 한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        doc_store._exec_write(
+            f"UPDATE {doc_store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "[1, 2]", "space": "space-a", "node_id": "d1"},
+        )
+
+        report = recon.diagnose(graph_store, doc_store)
+
+        assert len(report.doc_only) == 1
+        row = report.doc_only[0]
+        assert row.healable is False
+        assert row.reason.startswith(f"{recon.REASON_PROMOTION_REJECTED}:")
+
+    def test_diagnose_time_duplicate_json_keys_do_not_silently_collapse_to_last_value(
+        self, graph_store, doc_store
+    ):
+        """대체 리뷰(BLOCKING) 지적: SQLite ``properties`` 컬럼이 중복 키를
+        가진 JSON 문자열로 오염돼 있으면(정상 배관을 거치지 않은 쓰기),
+        ``json.loads()`` 기본 동작이 중복 키를 조용히 마지막 값으로
+        덮어써 실제 저장값과 다른 딕셔너리를 진단에 넘긴다. 그래프 쪽
+        ``parse_properties_object()`` 와 같은 원칙으로, 중복 키를 감지하면
+        원본 raw 문자열을 그대로 반환해 ``prepare_node()`` 의 비딕셔너리
+        거부에 판정을 맡겨야 한다."""
+        doc_store.upsert_node_doc("space-a", "Concept", "d1", {"x": 1})
+        doc_store._exec_write(
+            f"UPDATE {doc_store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": '{"label": "wrong", "x": 1, "label": "right"}', "space": "space-a", "node_id": "d1"},
+        )
+
+        report = recon.diagnose(graph_store, doc_store)
+
+        assert len(report.doc_only) == 1
+        row = report.doc_only[0]
+        assert row.healable is False
+        assert row.reason.startswith(f"{recon.REASON_PROMOTION_REJECTED}:")
+
 
 # ---------------------------------------------------------------------------
 # 그래프 전용 역채움 (4-1절, 쟁점2 thaw_json)
