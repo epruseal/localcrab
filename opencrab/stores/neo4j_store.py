@@ -1628,6 +1628,24 @@ class Neo4jStore:
                 for record in result
             ]
 
+    def count_exported_edges_scoped(self, pack_ids: list[str]) -> int:
+        """Exact ``count(r)`` counterpart to ``export_edges_scoped``, same
+        AND predicate, unbounded by any LIMIT. Empty ``pack_ids`` -> ``0``
+        without querying."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        cypher = """
+            MATCH (a:OpenCrabNode)-[r]->(b:OpenCrabNode)
+            WHERE a.pack_id IN $pack_ids AND b.pack_id IN $pack_ids
+              AND (r.pack_id IS NULL OR r.pack_id IN $pack_ids)
+            RETURN count(r) AS total
+        """
+        with self._session() as session:
+            result = session.run(cypher, pack_ids=list(pack_ids))
+            record = result.single()
+            return int(record["total"]) if record else 0
+
     def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
         """Pack predicate pushed into the Cypher WHERE ahead of ``LIMIT
         1`` -- unlike Kuzu's version of this method, Neo4j's native

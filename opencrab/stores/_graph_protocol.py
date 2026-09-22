@@ -890,6 +890,19 @@ class GraphStoreExtended(Protocol):
         """
         ...
 
+    def count_exported_edges_scoped(self, pack_ids: list[str]) -> int:
+        """Exact ``COUNT`` counterpart to ``export_edges_scoped``, same AND
+        predicate (both endpoints' ``pack_id`` in ``pack_ids``, AND the
+        edge's own ``pack_id`` -- if any -- also in ``pack_ids``), unbounded
+        by any LIMIT (#54's reasoning, applied to the scoped edge predicate;
+        added for #407's per-pack edge-residue diagnostic, which needs a
+        count, not a page of full edge rows). Empty ``pack_ids`` -> ``0``
+        without querying. Declared on Local/PG/Neo4j only, same as
+        ``export_edges_scoped`` -- Kuzu has neither ``export_edges`` nor
+        ``export_edges_scoped``, so there is no edge-export predicate here
+        to count."""
+        ...
+
     def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
         """Type-agnostic, SCOPE-FILTERED node lookup -- ``get_node_by_id``,
         but with the pack predicate applied BEFORE any row-limiting

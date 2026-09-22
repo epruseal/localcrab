@@ -214,6 +214,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | | `pack_ingest` | 기존 팩에 노드·엣지·텍스트 추가 |
 | | `pack_publish` | 팩 가시성 설정 (소유자 전용: private / public-read / public-fork) |
 | | `pack_fork` | 공개-fork 팩의 노드·엣지·소스·벡터를 재임베딩 없이 새 팩으로 복사 |
+| | `pack_diagnose_residue` | 읽기 전용 진단: `content_pack_list`의 `node_count=0`이 데이터 유실 잔재인지 무해한 등록부 흔적인지 그래프·문서·벡터 5축을 세어 4분류로 판정 (#407) |
 | **스키마 팩** | `schema_pack_list` | 사용 가능한 스키마 팩 목록 (설치 여부) |
 | | `schema_pack_install` | 도메인 스키마 팩 설치 |
 | | `schema_pack_uninstall` | 스키마 팩 제거 |

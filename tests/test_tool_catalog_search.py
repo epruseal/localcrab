@@ -40,6 +40,7 @@ _PACK_QUERY_EXPECTED = [
     "pack_ingest",
     "pack_publish",
     "pack_fork",
+    "pack_diagnose_residue",
     "ontology_list_nodes",
     "ontology_list_edges",
     "harness_promotion_apply",

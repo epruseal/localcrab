@@ -535,6 +535,29 @@ class _SqlDocStoreBase(abc.ABC):
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
+    def count_nodes_scoped(self, pack_ids: list[str], space: str | None = None) -> int:
+        """Exact ``COUNT(*)`` counterpart to ``list_nodes_scoped``, same
+        ``properties.pack_id``-only predicate (no ``source``/``source_id``
+        fallback -- that fallback belongs only to ``_doc_owner_pred``'s
+        doc_sources rule, never to ``doc_nodes``), unbounded by any LIMIT
+        (added for #407's per-pack doc_nodes-residue diagnostic, which needs
+        a count, not a page of rows). Empty ``pack_ids`` -> ``0`` without
+        querying."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        table = self._table("doc_nodes")
+        pid_expr = self._dialect.json_truthy_text("properties", "pack_id")
+        pack_frag, transform = self._dialect.in_string_array(pid_expr, ":sc_packs")
+        where_parts = [pack_frag]
+        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
+        if space:
+            where_parts.append("space=:space")
+            params["space"] = space
+        sql = f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where_parts)}"  # noqa: S608
+        row = self._fetch_one(sql, params)
+        return int(row[0]) if row else 0
+
     def bm25_fingerprint(self, limit: int = 50000) -> tuple[int, str]:
         """Cheap ``(COUNT(*), MAX(updated_at))`` staleness probe over the WHOLE
         ``doc_nodes`` table — deliberately independent of ``limit`` (#63).
@@ -664,6 +687,25 @@ class _SqlDocStoreBase(abc.ABC):
         )
         rows = self._fetch_all(sql, params)
         return [self._row_to_source(r) for r in rows]
+
+    def count_sources_scoped(self, pack_ids: list[str]) -> int:
+        """Exact ``COUNT(*)`` counterpart to ``list_sources_scoped``, same
+        ``_doc_owner_pred_scoped`` predicate (pack_id-priority, source
+        fallback only when pack_id is absent), unbounded by any LIMIT
+        (added for #407's per-pack doc_sources-residue diagnostic, which
+        needs a count, not a page of rows). Empty ``pack_ids`` -> ``0``
+        without querying. FAIL-CLOSED ON UNAVAILABLE, same reasoning as
+        ``list_sources_scoped``: raises rather than returning ``0``, so an
+        outage is never mistaken for a genuinely-empty pack."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        table = self._table("doc_sources")
+        pred, transform = _doc_owner_pred_scoped(self._dialect, ":sc_packs")
+        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
+        sql = f"SELECT COUNT(*) FROM {table} WHERE {pred}"  # noqa: S608
+        row = self._fetch_one(sql, params)
+        return int(row[0]) if row else 0
 
     # ------------------------------------------------------------------
     # Audit log
