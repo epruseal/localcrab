@@ -149,8 +149,21 @@ def vectors_axis(vec: Any, pack_id: str, cap: int = FORK_MAX_VECTORS) -> dict[st
     (added for #407, generalizes ``fork.py``'s private
     ``_count_pack_vectors`` for this public reuse). Reuses ``fork.py``'s
     own preflight cap (``FORK_MAX_VECTORS``) as the default bound so this
-    diagnostic never materializes more ids than a fork already would."""
-    state, count = count_pack_vectors_bounded(vec, pack_id, cap)
+    diagnostic never materializes more ids than a fork already would.
+
+    ``count_pack_vectors_bounded`` only fails closed to ``("unknown",
+    None)`` for an unrecognized/absent backend -- a live backend that
+    raises mid-query (connection dropped during ``execute()``/``get()``/
+    ``connect()``) propagates that exception, because its other caller
+    (``fork.py``'s preflight) wants a hard failure there, not a silent
+    unknown. This axis wrapper wants the opposite (never crash the
+    diagnostic; report ``unknown`` like every other axis function here
+    does), so the catch lives here rather than in the shared counter."""
+    try:
+        state, count = count_pack_vectors_bounded(vec, pack_id, cap)
+    except Exception as exc:  # noqa: BLE001 -- unavailable/connection failure -> unknown, never 0
+        logger.debug("vectors_axis(%s): count failed: %s", pack_id, exc)
+        return _axis("unknown", None)
     return _axis(state, count)
 
 

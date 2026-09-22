@@ -17,6 +17,8 @@ alone (rather than on registry-not-ready grounds).
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from opencrab.pack.diagnostics import (
@@ -141,6 +143,34 @@ class TestVectorsAxis:
         monkeypatch.setattr(diag, "count_pack_vectors_bounded", _fake)
         vectors_axis(object(), PACK)
         assert seen["cap"] == FORK_MAX_VECTORS
+
+    def test_live_chroma_get_failure_is_unknown_not_zero(self):
+        """The diagnostic adapter owns observation failure conversion.
+
+        This double follows the initialized Chroma backend shape used by
+        ``_vec_backend``. It reaches the real ``.get()`` call, unlike a
+        helper mock, then fails as a dropped backend connection would.
+        """
+        collection = MagicMock()
+        collection.get.side_effect = RuntimeError("chroma connection lost")
+
+        class _ChromaVec:
+            available = True
+            _collection = collection
+
+        assert vectors_axis(_ChromaVec(), PACK) == {"state": "unknown", "count": None}
+
+    def test_live_chroma_get_failure_keeps_diagnosis_incomplete(self):
+        collection = MagicMock()
+        collection.get.side_effect = RuntimeError("chroma connection lost")
+
+        class _ChromaVec:
+            available = True
+            _collection = collection
+
+        result = diagnose_pack(PACK, graph=_Returns(0), docs=_Returns(0), vec=_ChromaVec())
+        assert result["axes"]["vectors"] == {"state": "unknown", "count": None}
+        assert result["classification"] == "incomplete_observation"
 
 
 # ---------------------------------------------------------------------------

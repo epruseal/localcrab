@@ -1150,6 +1150,26 @@ class TestVectorPrecountMemoryBound:
             "counter, not a full export_pack_vectors() read"
         )
 
+    def test_vector_count_backend_failure_propagates_from_preflight(self, stack, monkeypatch):
+        """Fork preflight must not reclassify a failed vector read as empty.
+
+        Residue diagnostics convert the same backend error to ``unknown``.
+        Forking must instead propagate it before the destination reservation.
+        """
+        from unittest.mock import MagicMock
+
+        src = _seed_pack(
+            stack, ALICE, "src-vector-count-failure", node_count=1,
+            with_edge=False, with_source=False,
+        )
+        collection = MagicMock()
+        collection.get.side_effect = RuntimeError("chroma connection lost")
+        monkeypatch.setattr(stack["vector"], "_collection_handle", lambda: collection)
+
+        with pytest.raises(RuntimeError, match="chroma connection lost"):
+            _fork(stack, principal=ALICE, src_pack_id=src)
+        assert get_pack(stack["sql"], f"{src}-fork") is None
+
 
 # ---------------------------------------------------------------------------
 # T11 / T27 -- fail-closed store-availability refusals (never a

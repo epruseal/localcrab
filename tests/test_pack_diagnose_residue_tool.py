@@ -215,3 +215,26 @@ class TestEndToEndResponseShape:
         assert result["classification"] == "incomplete_observation"
         assert result["axes"]["doc_nodes"] == {"state": "unknown", "count": None}
 
+    def test_live_vector_get_failure_returns_incomplete_observation(self, sql):
+        """An initialized vector backend can fail after authorization.
+
+        The real diagnostic counter reaches the Chroma-shaped collection's
+        ``.get()`` call. The tool still returns a diagnostic result instead
+        of propagating the backend exception.
+        """
+        ensure_test_user(sql, "alice")
+        create_pack(sql, "alice", "alice-pack")
+        ctx = _base_ctx(sql)
+        ctx["neo4j"].count_exported_nodes_scoped.return_value = 0
+        ctx["neo4j"].count_exported_edges_scoped.return_value = 0
+        ctx["mongo"].count_sources_scoped.return_value = 0
+        ctx["mongo"].count_nodes_scoped.return_value = 0
+        ctx["chroma"] = _FakeVec([])
+        ctx["chroma"]._collection.get.side_effect = RuntimeError("chroma connection lost")
+
+        result = _call(sql, ctx, ALICE, "alice-pack")
+
+        assert result["axes"]["vectors"] == {"state": "unknown", "count": None}
+        assert result["classification"] == "incomplete_observation"
+        ctx["chroma"]._collection.get.assert_called_once()
+

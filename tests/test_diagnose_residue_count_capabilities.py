@@ -501,3 +501,21 @@ class TestCountPackVectorsBackwardCompatWrapper:
             available = False
 
         assert _count_pack_vectors(_Unavailable(), PACK_A, cap=10) is None
+
+    def test_backend_exception_still_propagates_from_shared_counter_and_fork_wrapper(self):
+        """Fork preflight must fail on a live backend read failure.
+
+        ``vectors_axis`` converts this exception only for diagnostics. The
+        shared counter and its fork-preflight wrapper preserve the hard
+        failure so a fork cannot mistake a failed count for an empty pack.
+        """
+        from opencrab.pack.fork import _count_pack_vectors, count_pack_vectors_bounded
+
+        collection = MagicMock()
+        collection.get.side_effect = RuntimeError("chroma connection lost")
+        vec = _FakeChromaVec(collection)
+
+        with pytest.raises(RuntimeError, match="chroma connection lost"):
+            count_pack_vectors_bounded(vec, PACK_A, cap=10)
+        with pytest.raises(RuntimeError, match="chroma connection lost"):
+            _count_pack_vectors(vec, PACK_A, cap=10)
