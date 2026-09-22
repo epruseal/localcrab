@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from opencrab.ontology.bm25 import BM25Index, compute_fingerprint
-from opencrab.ontology.query import HybridQuery
+from opencrab.ontology.query import Bm25CacheState, HybridQuery
 
 
 def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
@@ -440,5 +440,178 @@ def test_398_reproduction_fixture_confirms_hits_once_the_cap_is_lifted(
             "acupoint", spaces=None, limit=25, pack_ids=["old-pack"]
         )
         assert {h["node_id"] for h in hits} == {f"old{i}" for i in range(10)}
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_capped_global_index_warns_for_missing_requested_pack(tmp_path, monkeypatch) -> None:
+    from opencrab.ontology import query as query_module
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    ds = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    if not getattr(ds, "_available", False):
+        pytest.skip("LocalSQLDocStore unavailable")
+    _seed_two_packs_ordered(ds, old_count=10, new_count=10)
+    monkeypatch.setattr(query_module, "_BM25_NODE_LIMIT", 10)
+    hybrid = _hybrid(ds)
+    try:
+        hits, warnings = hybrid._bm25_search_with_warnings(
+            "acupoint", spaces=None, limit=25, pack_ids=["old-pack"]
+        )
+        assert hits == []
+        assert any("old-pack" in warning and "missing" in warning for warning in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_legacy_build_reads_nodes_once_and_reports_unknown_total() -> None:
+    nodes = [_node("a", pack_id="A")]
+
+    class LegacyStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_nodes(self, limit):
+            self.calls += 1
+            return nodes
+
+    store = LegacyStore()
+    hybrid = _hybrid(store)
+    try:
+        _hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert store.calls == 1
+        assert hybrid._bm25.state.index._docs is nodes
+        assert hybrid._bm25.state.total_rows is None
+        assert any("total unknown" in warning for warning in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_all_covered_partial_rows_warns() -> None:
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(2, "latest"))
+    hybrid = _hybrid(doc_store)
+    try:
+        _hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert not any("missing" in warning for warning in warnings)
+        assert any("partial rows" in warning for warning in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_ready_probe_failure_keeps_state_and_its_warning() -> None:
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(2, "latest"))
+    hybrid = _hybrid(doc_store)
+    try:
+        _hits, first_warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        first_state = hybrid._bm25.state
+        doc_store.bm25_fingerprint.side_effect = RuntimeError("probe failed")
+        _hits, second_warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert hybrid._bm25.state is first_state
+        assert second_warnings == first_warnings
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_same_fingerprint_keeps_the_complete_state_reference() -> None:
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["A"])
+        first_state = hybrid._bm25.state
+        reads_after_cold_build = doc_store.list_nodes.call_count
+        hybrid.invalidate_bm25_cache()
+        assert _wait_until(lambda: hybrid._bm25_dirty is False)
+        assert hybrid._bm25.state is first_state
+        assert doc_store.list_nodes.call_count == reads_after_cold_build
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_ready_worker_probe_failure_preserves_the_published_state() -> None:
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["A"])
+        first_state = hybrid._bm25.state
+        doc_store.bm25_fingerprint.side_effect = RuntimeError("probe failed")
+        hybrid.invalidate_bm25_cache()
+        assert _wait_until(lambda: hybrid._bm25_dirty is False)
+        assert hybrid._bm25.state is first_state
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_search_keeps_hits_and_warnings_from_one_state(monkeypatch) -> None:
+    doc_store = MagicMock()
+    hybrid = _hybrid(doc_store)
+    first_index = MagicMock()
+    first_index.search = MagicMock(return_value=[{"node_id": "first"}])
+    second_index = MagicMock()
+    second_index.search = MagicMock(return_value=[{"node_id": "second"}])
+    first_state = Bm25CacheState(
+        index=first_index,
+        probe_fingerprint=(1, ""),
+        indexed_rows=1,
+        total_rows=2,
+        covered_pack_ids=frozenset({"A"}),
+        generation=1,
+    )
+    second_state = Bm25CacheState(
+        index=second_index,
+        probe_fingerprint=(2, ""),
+        indexed_rows=2,
+        total_rows=2,
+        covered_pack_ids=frozenset({"A", "B"}),
+        generation=2,
+    )
+    hybrid._bm25.state = first_state
+
+    def search_then_swap(*args, **kwargs):
+        hybrid._bm25.state = second_state
+        return [{"node_id": "first"}]
+
+    first_index.search.side_effect = search_then_swap
+    monkeypatch.setattr(hybrid._bm25, "_native_probe", lambda _store: None)
+    try:
+        hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A", "B"]
+        )
+        assert [hit["node_id"] for hit in hits] == ["first"]
+        assert any("missing" in warning and "B" in warning for warning in warnings)
+        assert any("partial rows" in warning for warning in warnings)
+        second_index.search.assert_not_called()
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_coverage_uses_strict_scope_pack_id() -> None:
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[{
+        **_node("forged", text="alpha"),
+        "source_path": "/packs/forged-pack/source.txt",
+    }])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        _hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["forged-pack"]
+        )
+        assert any("missing" in warning and "forged-pack" in warning for warning in warnings)
     finally:
         hybrid.shutdown_bm25()
