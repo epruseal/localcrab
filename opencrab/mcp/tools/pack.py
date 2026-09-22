@@ -1907,3 +1907,69 @@ def pack_fork(
         title=title,
         description=description,
     )
+
+
+@tool(
+    "pack_diagnose_residue",
+    {
+        "description": (
+            "Read-only diagnostic for one of your readable packs (issue #407). "
+            "`content_pack_list`'s node_count=0 only confirms graph nodes are "
+            "absent -- it says nothing about doc_sources, doc_nodes, or vector "
+            "residue, so a ready pack with node_count=0 could be either harmless "
+            "registry hygiene or genuine data-loss residue from a partial write. "
+            "This tool counts all five axes (graph nodes, graph edges, "
+            "doc_sources, doc_nodes, vectors) and reports one of four "
+            "classifications: not_candidate (not a residue candidate at all -- "
+            "unreadable/nonexistent/non-ready, or the graph already has nodes), "
+            "confirmed_empty (every axis confirmed zero -- hygiene, not loss, "
+            "NOT an automatic deletion candidate), content_residue (graph is "
+            "empty but another axis has confirmed data -- potential loss, cause "
+            "not attributed), or incomplete_observation (at least one axis could "
+            "not be counted, so no empty/residue verdict can be trusted yet). "
+            "Never deletes, repairs, or modifies anything."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack_id": {
+                    "type": "string",
+                    "description": "Pack to diagnose. Must be readable by you (your own pack, or a non-private one).",
+                },
+            },
+            "required": ["pack_id"],
+        },
+    },
+    order=19,
+    access=AccessTier.READ,
+)
+def pack_diagnose_residue(pack_id: str) -> dict[str, Any]:
+    """
+    Per-axis residue diagnosis for ONE readable pack (#407).
+
+    Authorization boundary (#143 invariant 7, same as ``pack_publish``/
+    ``pack_fork`` above): membership in ``readable_pack_ids`` -- ready AND
+    (owned by the caller OR not private) -- is checked FIRST, and every
+    excluded case (pack does not exist, exists but not ready/``creating``/
+    ``partial``, or exists and ready but private and owned by someone else)
+    returns the IDENTICAL ``classification="not_candidate"``/``axes=None``
+    response with ZERO backend count calls. Never ``get_pack()`` (unscoped,
+    documented as not-access-control) for this check.
+
+    See ``opencrab.pack.diagnostics`` for the full per-axis state contract
+    (``known``/``known_at_least``/``unknown``/``not_applicable``) and the
+    four-classification evidence rule.
+    """
+    from opencrab.auth import current_principal
+    from opencrab.mcp.tools import _clean_str, _get_context
+    from opencrab.pack.diagnostics import classify, diagnose_pack
+    from opencrab.pack.ownership import readable_pack_ids
+
+    ctx = _get_context()
+    principal = current_principal()
+    pack_id = _clean_str(pack_id)
+
+    if pack_id not in readable_pack_ids(ctx["sql"], principal):
+        return {"pack_id": pack_id, "classification": classify(False, {}), "axes": None}
+
+    return diagnose_pack(pack_id, graph=ctx["neo4j"], docs=ctx["mongo"], vec=ctx["chroma"])

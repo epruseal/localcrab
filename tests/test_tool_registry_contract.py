@@ -50,6 +50,7 @@ GOLDEN_TOOL_NAMES = [
     "pack_publish",
     "pack_fork",
     "tool_search",
+    "pack_diagnose_residue",
 ]
 
 

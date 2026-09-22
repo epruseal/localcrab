@@ -33,10 +33,11 @@ class TestToolDispatch:
     def test_tools_list_not_empty(self):
         from opencrab.mcp.tools import TOOLS
 
-        # 19 exposed tools: 18 as before, plus #135's tool_search.
+        # 20 exposed tools: 18 as before, plus #135's tool_search, plus
+        # #407's pack_diagnose_residue.
         # 비노출(주석처리): query_bm25, rebac, workflow×2, approval, billing×2,
         #   identity×5, canonicalize×2, promotion×4, ontology_extract, ontology_ingest
-        assert len(TOOLS) == 19
+        assert len(TOOLS) == 20
         names = [t["name"] for t in TOOLS]
         # Core exposed
         assert "ontology_manifest" in names
@@ -1031,7 +1032,7 @@ class TestMCPServer:
         assert response["id"] == 2
         assert "tools" in response["result"]
         tools = response["result"]["tools"]
-        assert len(tools) == 19  # 위 18개 + #135 tool_search
+        assert len(tools) == 20  # 위 18개 + #135 tool_search + #407 pack_diagnose_residue
 
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({

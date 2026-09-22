@@ -403,6 +403,22 @@ class MongoStore:
         cursor = self._db["nodes"].find(query, {"_id": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
 
+    def count_nodes_scoped(self, pack_ids: list[str], space: str | None = None) -> int:
+        """Exact ``count_documents`` counterpart to ``list_nodes_scoped``,
+        same scalar-string-only ``properties.pack_id`` predicate, unbounded
+        by any limit. Empty ``pack_ids`` -> ``0`` without querying."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+
+        query: dict[str, Any] = {
+            **_non_array("properties"),
+            "properties.pack_id": _scalar_string_in(list(pack_ids)),
+        }
+        if space:
+            query["space"] = space
+        return int(self._db["nodes"].count_documents(query))
+
     def delete_node_doc(self, space: str, node_id: str) -> bool:
         """Delete a node document. Returns True if deleted."""
         self._require_available()
@@ -530,6 +546,30 @@ class MongoStore:
         }
         cursor = self._db["sources"].find(query, {"_id": 0}).limit(limit)
         return [dict(doc) for doc in cursor]
+
+    def count_sources_scoped(self, pack_ids: list[str]) -> int:
+        """Exact ``count_documents`` counterpart to ``list_sources_scoped``,
+        same pack_id-priority/source-fallback query, unbounded by any
+        limit. Empty ``pack_ids`` -> ``0`` without querying. FAIL-CLOSED ON
+        UNAVAILABLE, same reasoning as ``list_sources_scoped``."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+
+        ids = list(pack_ids)
+        query: dict[str, Any] = {
+            **_non_array("metadata"),
+            "$or": [
+                {"metadata.pack_id": _scalar_string_in(ids)},
+                {
+                    "$and": [
+                        {"metadata.pack_id": _scalar_falsy()},
+                        {"metadata.source": _scalar_string_in(ids)},
+                    ]
+                },
+            ],
+        }
+        return int(self._db["sources"].count_documents(query))
 
     # ------------------------------------------------------------------
     # Audit log

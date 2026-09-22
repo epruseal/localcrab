@@ -3346,6 +3346,36 @@ class _SqlGraphStoreBase(abc.ABC):
             for r in rows
         ]
 
+    def count_exported_edges_scoped(self, pack_ids: list[str]) -> int:
+        """Exact ``COUNT(*)`` counterpart to ``export_edges_scoped``, same
+        AND predicate (both endpoints' pack_id in scope, AND the edge's own
+        pack_id -- if any -- also in scope), no LIMIT. Empty ``pack_ids`` ->
+        ``0`` without querying. Built from the same ``_scoped_node_where``
+        predicate as ``export_edges_scoped`` -- only the SELECT list and the
+        LIMIT clause differ."""
+        self._require_available()
+        if not pack_ids:
+            return 0
+        nodes = self._table("graph_nodes")
+        edges = self._table("graph_edges")
+        a_where, transform = self._scoped_node_where("a.properties", "sc_packs")
+        b_where, _ = self._scoped_node_where("b.properties", "sc_packs")
+        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+        e_membership, _ = self._dialect.in_string_array(
+            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
+        )
+        edge_cond = f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
+        sql = f"""
+            SELECT COUNT(*)
+            FROM {edges} e
+            JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
+            JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+            WHERE {a_where} AND {b_where} AND {edge_cond}
+        """  # noqa: S608
+        params = {"sc_packs": transform(sorted(set(pack_ids)))}
+        row = self._fetch_one(sql, params)
+        return int(row[0]) if row else 0
+
     def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
         """Type-agnostic, SCOPE-FILTERED node lookup (issue #147 §1.2-6b,
         §3.4(b)) -- replaces a Python post-filter over ``get_node_by_id``,

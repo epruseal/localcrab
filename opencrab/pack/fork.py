@@ -267,36 +267,46 @@ def _vec_backend(vec: Any) -> tuple[str | None, Any, str | None]:
     return (None, None, None)
 
 
-def _count_pack_vectors(vec: Any, pack_id: str, cap: int) -> int | None:
-    """``COUNT(*) WHERE pack_id = ...``, capped, in constant memory.
+def count_pack_vectors_bounded(vec: Any, pack_id: str, cap: int) -> tuple[str, int | None]:
+    """Public state+count counterpart of ``_count_pack_vectors``, added for
+    #407's read-only diagnostic tool (which needs to tell an EXACT count
+    apart from a CAPPED lower bound, not just a bare int).
 
-    Returns the count on success. Returns ``None`` when the backend is
-    unavailable or of an unrecognized shape -- fail-closed: a caller that
-    cannot count must not treat that as "zero vectors" (the same distinction
-    ``load.py``'s ``_live_vec_ids`` draws for the same reason).
+    Same backend dispatch and same ``COUNT(*)``/bounded-``get(...)`` queries
+    as ``_count_pack_vectors`` below -- this function owns the query, and
+    ``_count_pack_vectors`` is now a thin wrapper over it, so the two never
+    drift into two copies of the same SQL (the exact failure mode
+    ``pack_live_counts``'s docstring warns about elsewhere in this package).
 
-    sql/sqlalchemy: the database does the counting, so no LIMIT is needed --
-    ``COUNT(*)`` never materializes the matched rows regardless of how many
-    there are. chroma has no server-side pack-scoped COUNT; ``.get()`` is the
-    only way to learn how many ids match, so it is called with
-    ``limit=cap + 1`` (never the whole collection) and only the id list's
-    length is used -- embeddings/documents/metadatas are never requested
-    (``include=[]``).
+    Returns:
+    - ``("unknown", None)`` when the backend is unavailable or of an
+      unrecognized shape -- fail-closed: a caller that cannot count must
+      not treat that as "zero vectors" (the same distinction ``load.py``'s
+      ``_live_vec_ids`` draws for the same reason).
+    - ``("known", n)`` for an exact count: always for sql/sqlalchemy
+      (``COUNT(*)`` never materializes the matched rows, so it is never
+      capped), and for chroma when the match count is at most ``cap``.
+    - ``("known_at_least", cap + 1)`` when chroma's bounded ``.get(limit=cap
+      + 1)`` returned exactly ``cap + 1`` ids -- the true count is
+      ">= cap + 1" but unknown beyond that, so reporting it as an exact
+      ``cap + 1`` would be a false precision claim.
     """
     kind, handle, table = _vec_backend(vec)
     if kind is None:
-        return None
+        return ("unknown", None)
     if kind == "sql":
         row = handle.execute(
             f"SELECT COUNT(*) FROM {table} WHERE pack_id = ?", (pack_id,)  # noqa: S608
         ).fetchone()
-        return int(row[0]) if row else 0
+        return ("known", int(row[0]) if row else 0)
     if kind == "chroma":
         result = handle.get(where={"pack_id": pack_id}, limit=cap + 1, include=[])
         ids = result.get("ids") if isinstance(result, dict) else None
         if not isinstance(ids, list):
-            return None
-        return len(ids)
+            return ("unknown", None)
+        if len(ids) > cap:
+            return ("known_at_least", cap + 1)
+        return ("known", len(ids))
     if kind == "sqlalchemy":
         import sqlalchemy
 
@@ -305,8 +315,25 @@ def _count_pack_vectors(vec: Any, pack_id: str, cap: int) -> int | None:
                 sqlalchemy.text(f"SELECT COUNT(*) FROM {table} WHERE pack_id = :p"),  # noqa: S608
                 {"p": pack_id},
             ).fetchone()
-        return int(row[0]) if row else 0
-    return None
+        return ("known", int(row[0]) if row else 0)
+    return ("unknown", None)
+
+
+def _count_pack_vectors(vec: Any, pack_id: str, cap: int) -> int | None:
+    """``COUNT(*) WHERE pack_id = ...``, capped, in constant memory.
+
+    Returns the count on success. Returns ``None`` when the backend is
+    unavailable or of an unrecognized shape -- fail-closed: a caller that
+    cannot count must not treat that as "zero vectors" (the same distinction
+    ``load.py``'s ``_live_vec_ids`` draws for the same reason).
+
+    Delegates to ``count_pack_vectors_bounded`` (added for #407) for the
+    actual query -- this wrapper only exists so the two ``fork_pack`` call
+    sites below keep their original bare-``int | None`` contract (a plain
+    ``> FORK_MAX_VECTORS`` / ``!= 0`` check has no use for the state label).
+    """
+    _state, count = count_pack_vectors_bounded(vec, pack_id, cap)
+    return count
 
 
 # ---------------------------------------------------------------------------

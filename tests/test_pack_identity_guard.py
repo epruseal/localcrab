@@ -906,6 +906,11 @@ def test_pack_tool_strings_never_name_an_unregistered_tool():
         # anchor node while its registry row is still 'creating', not a tool
         # name. Same category as pack_registry/pack_tags above.
         "pack_anchor",
+        # pack_diagnose_residue's (#407) four classification labels, named
+        # in its tool description prose (e.g. "content_residue (potential
+        # loss...)"). A classification value, never a recovery hint pointing
+        # at a `tools/call` name -- same category as the entries above.
+        "content_residue",
     }
     assert unknown == set(), (
         f"pack.py references tool-shaped names that are not registered tools: "
