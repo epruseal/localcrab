@@ -172,6 +172,18 @@ class TestVectorsAxis:
         assert result["axes"]["vectors"] == {"state": "unknown", "count": None}
         assert result["classification"] == "incomplete_observation"
 
+    def test_live_sql_execute_failure_is_unknown_not_zero(self):
+        """The adapter also covers initialized SQL backend query failures."""
+        conn = MagicMock()
+        conn.execute.side_effect = RuntimeError("sqlite connection lost")
+
+        class _SqlVec:
+            available = True
+            _conn = conn
+            _table = "vectors_kure"
+
+        assert vectors_axis(_SqlVec(), PACK) == {"state": "unknown", "count": None}
+
 
 # ---------------------------------------------------------------------------
 # classify(): four-category partition
