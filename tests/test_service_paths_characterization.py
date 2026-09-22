@@ -702,7 +702,8 @@ class TestResolvePacksContentFallback:
         resolve_packs 배선을 직접 관측)."""
         from opencrab.services.pack_selection import resolve_packs
 
-        # title에 질의 토큰이 그대로 있다 -- choose_packs가 반드시 후보를 낸다.
+        # exact title이 질의와 같아 +50 직접 보너스로 기본 임계값을 넘긴다.
+        # 이 대조군은 fragment recall이 아니라 lexical-first 배선만 검증한다.
         monkeypatch.setattr(
             "opencrab.pack.ownership.list_packs_for",
             lambda sql, principal: [
@@ -721,7 +722,7 @@ class TestResolvePacksContentFallback:
                 raise AssertionError("lexical 게이트가 이미 후보를 냈는데 콘텐츠 폴백이 호출됐다")
 
         sel = resolve_packs(
-            "네오다임", None, True, False, "/tmp",
+            "네오다임 합금 규격", None, True, False, "/tmp",
             scope=frozenset({"pack-a"}), raise_on_error=False,
             sql=MagicMock(), principal=MagicMock(),
             hybrid=_PoisonHybrid(), spaces=None,

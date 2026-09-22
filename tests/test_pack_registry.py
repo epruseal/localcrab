@@ -124,10 +124,15 @@ def test_t2_env_min_score_default(monkeypatch, tmp_path: Path, env_value, expect
 
 # ---------------------------------------------------------------------------
 # #400: score_pack의 whole-토큰 게이트. 질의는 whole 토큰(공백/구두점 경계)
-# 으로만 판정하고, fragment(n-gram 조각)는 판정 통과 뒤 순위에만 쓴다. 팩
-# 쪽 게이트 집합은 기존 _tokens()(fragment 포함)와 신규 _whole_tokens()
-# (길이 무관)의 합집합이다. design 문서:
-# /home/asdf/orch-scratch/o400/design-v5-full.md §4.1/§6/§10.
+# 으로만 판정한다. 팩 쪽 게이트 집합은 기존 _tokens()(fragment 포함)와
+# 신규 _whole_tokens()(길이 무관)의 합집합이다.
+#
+# #406: 겹침 가점(title/description/keywords/tags) 네 곳은 길이 2 이상
+# query whole-token alias만 쓴다. query n-gram 조각과 한 글자 token은 약한
+# 가점을 열지 않는다. gate와 정확 identity bonus는 별도 정책이라 단일 글자도
+# 그대로 쓴다. #400 직후에는 이 네 곳이 fragment 포함 _tokens()를 써서
+# 게이트가 막는 종류의 질의 조각 오탐을 순위/선택 단계에서 되살렸다(반례:
+# test_t406_query_fragment_must_not_win_overlap_bonus 아래).
 # ---------------------------------------------------------------------------
 
 
@@ -240,13 +245,107 @@ def test_t400_title_bonus_rejects_fragment_without_boundary() -> None:
     """`_phrase_at_boundary`가 지키는 원래 결함(#400)도 함께 고정한다. 짧은
     title이 질의의 더 긴 낱말 안에 경계 없이 박혀 있으면(질의 "혈자리" 안의
     title "자리") +50 제목 보너스는 열리면 안 된다. 게이트는 pack_id
-    리터럴 일치로 열리고, 조각 겹침에서 나오는 +5 fragment 보너스는 별개
-    메커니즘이라 그대로 남는다."""
+    리터럴 일치로 열리고 +100이 붙는다.
+
+    #406 재정정: 이 시험은 원래 "조각 겹침에서 나오는 +5 fragment 보너스는
+    별개 메커니즘이라 그대로 남는다"(score 105.0, matched에 "자리" 포함)를
+    고정했었다. 그 판단은 겹침 가점이 이미 게이트로 걸러진 후보의 순위만
+    바꾼다는 전제 위에 있었는데, 반례("한의학 경락", 아래
+    test_t406_query_fragment_must_not_win_overlap_bonus)가 그 전제를
+    깬다 -- choose_packs는 임계값 미만을 버리고 top-1만 반환하므로 조각
+    겹침 가점이 무관한 팩을 정답 위로 올려 정답을 선택지에서 완전히
+    밀어낼 수 있다. 그래서 #406이 질의 쪽 겹침 가점 판정을 whole-token
+    기준으로 좁혔고, 이 시험의 +5 조각 가점은 사라진다."""
     pack = PackInfo(pack_id="혈자리", title="자리")
     score, matched = score_pack("혈자리", pack)
     assert "title" not in matched
-    assert score == 105.0
-    assert matched == ["pack_id:혈자리", "자리"]
+    assert score == 100.0
+    assert matched == ["pack_id:혈자리"]
+
+
+def test_t406_query_fragment_must_not_win_overlap_bonus() -> None:
+    """이슈 #406 반례 그대로. 질의 "한의학 경락"에서 whole 토큰은
+    {"한의학", "경락"}뿐이다. 정답 팩(A)은 이 두 토큰과 직접 만나고,
+    오답 팩(B)은 whole-token 접점이 "경락" 하나뿐이며 나머지 점수는
+    질의를 조각낸 "의학"/"한의"가 B의 keywords/tags와 겹쳐서 나온다.
+    조각 겹침이 살아 있으면 B(31.0)가 A(23.0)를 이겨 choose_packs가
+    A를 아예 반환하지 않는다(순위 왜곡이 아니라 #400과 같은 선택 실패).
+    수정 후에는 A가 선택되고 B는 임계값을 넘지 못한다."""
+    correct = PackInfo(
+        pack_id="tcm-meridian",
+        title="한의학 경락 사전",
+        description="경락과 혈자리 안내",
+    )
+    wrong = PackInfo(
+        pack_id="b",
+        title="의학 정보 한의 자격",
+        description="경락 마사지 업소 목록",
+        keywords=["의학", "한의"],
+        tags=["의학", "한의"],
+    )
+    score_correct, matched_correct = score_pack("한의학 경락", correct)
+    score_wrong, matched_wrong = score_pack("한의학 경락", wrong)
+
+    assert "의학" not in matched_wrong
+    assert "한의" not in matched_wrong
+    assert score_correct > score_wrong
+
+    chosen = choose_packs("한의학 경락", [wrong, correct])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["tcm-meridian"]
+
+
+def test_t406_single_char_keyword_tag_overlap_cannot_create_selection() -> None:
+    """한 글자 whole token은 gate를 열 수 있지만 overlap 가점으로 합산돼
+    무관 팩을 선택하면 안 된다. 정답 팩은 "고혈압"의 title/description/
+    keyword 가점으로 13점이다. 무관 팩은 "혈"/"맥"의 keyword/tag만
+    가진다. q_aliases가 q_whole이면 무관 팩이 18점으로 top-1을 빼앗지만,
+    길이 2 이상 q_whole만 쓰면 무관 팩은 0점이다."""
+    correct = PackInfo(
+        pack_id="hypertension-guide",
+        title="고혈압 개요",
+        description="고혈압 관리",
+        keywords=["고혈압"],
+    )
+    wrong = PackInfo(
+        pack_id="irrelevant",
+        keywords=["혈", "맥"],
+        tags=["혈", "맥"],
+    )
+    assert score_pack("고혈압 혈 맥", wrong) == (0.0, [])
+    chosen = choose_packs("고혈압 혈 맥", [correct, wrong])
+    assert [pack.pack_id for pack, _score, _matched in chosen] == ["hypertension-guide"]
+
+
+def test_t406_mixed_script_keyword_tag_overlap_is_preserved() -> None:
+    """길이 2 이상 mixed-script whole token은 약한 overlap에 남는다.
+    "k2관세"는 하나의 whole token이며 keyword +5와 tag +4를 얻는다."""
+    pack = PackInfo(pack_id="x2", keywords=["k2관세"], tags=["k2관세"])
+    assert score_pack("k2관세", pack) == (9.0, ["k2관세"])
+
+
+def test_t406_single_char_identity_bonus_is_preserved() -> None:
+    """한 글자 제외는 약한 overlap에만 적용한다. pack_id가 질의와 정확히
+    같으면 gate와 identity bonus가 계속 열려야 한다."""
+    pack = PackInfo(pack_id="x")
+    assert score_pack("x", pack) == (100.0, ["pack_id:x"])
+
+
+def test_t406_normal_whole_tokens_keep_overlap_bonus() -> None:
+    """리드가 라이브에서 확인한 "족태음비경 혈자리" 경로를 합성 팩으로
+    고정한다. 두 낱말은 _tokens()와 _whole_tokens() 모두에 있으므로
+    keyword/tag 가점 18점이 유지되고 기본 임계값을 넘는다."""
+    pack = PackInfo(
+        pack_id="acupoint-medical",
+        keywords=["족태음비경", "혈자리"],
+        tags=["족태음비경", "혈자리"],
+    )
+    assert score_pack("족태음비경 혈자리", pack) == (
+        18.0,
+        ["족태음비경", "혈자리"],
+    )
+    assert [candidate.pack_id for candidate, _score, _matched in choose_packs(
+        "족태음비경 혈자리", [pack]
+    )] == ["acupoint-medical"]
 
 
 def test_t400_pack_id_bonus_is_order_sensitive() -> None:

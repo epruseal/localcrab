@@ -294,20 +294,14 @@ def _phrase_tokens_in_order(phrase_tokens: list[str], question_tokens: list[str]
     return False
 
 
-def _resolve_aliases(question_tokens: set[str]) -> set[str]:
-    expanded = set(question_tokens)
-    for canonical, variants in _ALIASES.items():
-        for variant in variants:
-            if variant.lower() in question_tokens:
-                expanded.add(canonical)
-                expanded.update(v.lower() for v in variants)
-                break
-    return expanded
-
-
 def _resolve_aliases_whole(whole_tokens: set[str]) -> set[str]:
-    """게이트 전용 별칭 확장. _resolve_aliases() 와 동일한 로직을 whole-token
-    집합에 적용한다 (fragment 오염 없는 별칭 매치)."""
+    """whole-token 집합에 대한 별칭 확장 (fragment 오염 없는 별칭 매치).
+
+    #400은 게이트 전용으로 도입했다. #406부터는 겹침 가점(title/
+    description/keywords/tags)도 이 결과에서 길이 2 이상 token만 쓴다.
+    약한 가점은 query fragment와 한 글자 합산을 허용하지 않는다. fragment
+    포함 버전(옛 _resolve_aliases)은 #406에서 마지막 호출자를 잃어
+    삭제했다."""
     expanded = set(whole_tokens)
     for canonical, variants in _ALIASES.items():
         for variant in variants:
@@ -356,8 +350,15 @@ def score_pack(question: str, pack: PackInfo) -> tuple[float, list[str]]:
     if not gate_open:
         return 0.0, []
 
-    q_tokens = _tokens(question)
-    q_aliases = _resolve_aliases(q_tokens)
+    # #406: 약한 겹침 가점(title/description/keywords/tags) 네 곳의 질의
+    # 집합은 whole-token alias 중 길이 2 이상만 쓴다. query n-gram 조각은
+    # 애초에 q_whole에 없으므로 "한의학 경락"의 "의학"/"한의"가 무관 팩을
+    # top-1로 밀어 올리지 못한다. 한 글자 token을 이 약한 가점에 넣으면
+    # "고혈압 혈 맥"의 무관 keyword/tag 팩이 작은 token을 합산해 정답을
+    # 밀어낸다. gate와 pack_id/title/source_label의 정확 identity bonus는
+    # q_whole을 그대로 쓰므로 단일 글자 매치를 보존한다. mixed-script whole
+    # token은 길이만 충족하면 이 집합에 남는다.
+    q_aliases = {token for token in q_whole if len(token) >= 2}
 
     matched: list[str] = []
     score = 0.0
