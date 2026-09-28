@@ -375,6 +375,19 @@ def test_source_doc_probe_corrupted_row_is_unverifiable_not_silently_passed():
     assert source_identity_conflict(docs, vector, source_id="s1", pack_id="pack-a") == "unverifiable"
 
 
+def test_normal_graph_probe_then_corrupted_doc_probe_is_unverifiable():
+    """design.md #402 rev.6 §13.6 (b): a clean earlier probe in the same
+    ``_check_probes`` call must not short-circuit the loop before a later
+    probe's corruption marker is seen. The graph leg here returns a normal,
+    matching-pack row (not None, not foreign) so the loop falls through the
+    Mapping branch to the next probe -- distinct from the None-continue path
+    the other #402 tests exercise -- and only then reaches the corrupted doc
+    row."""
+    graph = _Graph(exact={"pack_id": "pack-a"})
+    docs = _Slot({"property_decode_error": True, "properties": {}})
+    assert _node_conflict(graph=graph, docs=docs) == "unverifiable"
+
+
 # ---------------------------------------------------------------------------
 # endpoint_pack_conflict (#402) -- no operational caller today, so its
 # "unverifiable" translation and its unchanged control groups get direct
