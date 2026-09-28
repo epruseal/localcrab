@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -702,5 +703,167 @@ def test_398_index_search_failure_still_returns_empty_pair() -> None:
         )
         assert hits == []
         assert warnings == []
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_probe_failure_racing_worker_publish_keeps_hits_and_warnings_from_one_state(
+    monkeypatch,
+) -> None:
+    """#398 axis B control: probe/marker computation fails inside the very
+    call that also triggers a background worker publish (S0 -> S1 -> S2).
+    The re-fetched reference (S1) must drive both the search and its
+    coverage warnings together. Mixing S1's hits with a different state's
+    coverage metadata (for example S2's) is the defect this test targets.
+    """
+    doc_store = MagicMock()
+    hybrid = _hybrid(doc_store)
+
+    s2_index = MagicMock()
+    s2_index.search = MagicMock(return_value=[{"node_id": "s2-hit"}])
+
+    def s1_search_then_second_publish(*args, **kwargs):
+        # Another worker publish (S1 -> S2) lands mid-search. Correct code
+        # already holds this call's local ``state`` variable (S1), so it is
+        # unaffected -- the mixing mutation below targets this exact spot.
+        hybrid._bm25.state = s2
+        return [{"node_id": "s1-hit"}]
+
+    s1_index = MagicMock()
+    s1_index.search = MagicMock(side_effect=s1_search_then_second_publish)
+
+    s0 = Bm25CacheState(
+        index=MagicMock(), probe_fingerprint=(0, ""), indexed_rows=1,
+        total_rows=1, covered_pack_ids=frozenset({"A"}), generation=0,
+    )
+    s1 = Bm25CacheState(
+        index=s1_index, probe_fingerprint=(1, ""), indexed_rows=1,
+        total_rows=2, covered_pack_ids=frozenset({"A"}), generation=1,
+    )
+    s2 = Bm25CacheState(
+        index=s2_index, probe_fingerprint=(2, ""), indexed_rows=2,
+        total_rows=2, covered_pack_ids=frozenset({"A", "B"}), generation=2,
+    )
+    hybrid._bm25.state = s0
+
+    def probe_fails_after_worker_publishes(*args, **kwargs):
+        hybrid._bm25.state = s1  # worker publishes S1 during the probe attempt
+        raise RuntimeError("marker boom mid-race")
+
+    monkeypatch.setattr(
+        hybrid, "_bm25_probe_fingerprint", probe_fails_after_worker_publishes
+    )
+    try:
+        hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        # This test's probe always fails, so correct code deterministically
+        # re-fetches S1 (no scheduler-luck race to arbitrate).
+        assert hits == [{"node_id": "s1-hit", "source": "bm25"}]
+        # S1: total=2, indexed=1 -> partial. S2: total=2, indexed=2 -> no
+        # partial. That sign difference is what the mixing mutation flips.
+        assert any("partial rows" in w for w in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_ready_rebuild_discards_stale_candidate_when_invalidate_wins_the_race(
+    monkeypatch,
+) -> None:
+    """#398 MMP gate (design lines 55/78): once candidate S1 is fully built,
+    if a separate invalidate() raises the epoch before the worker acquires
+    its publish lock, the worker must discard S1 and keep S0. Observation is
+    pinned to the first lock cycle to finish after release, so it stays
+    deterministic regardless of any retries that follow.
+    """
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(side_effect=[
+        (1, ""),   # cold build probe
+        (2, ""),   # rebuild loop re-probe: detects a change -> builds candidate
+    ])
+    hybrid = _hybrid(doc_store)
+    bm25 = hybrid._bm25
+    try:
+        bm25.ensure_built(doc_store)  # cold build -> S0
+        s0 = bm25.state
+
+        candidate_ready = threading.Event()
+        release_candidate = threading.Event()
+        original_make_state = bm25._make_state
+
+        def paused_make_state(observation):
+            candidate = original_make_state(observation)
+            candidate_ready.set()
+            assert release_candidate.wait(timeout=2.0), (
+                "invalidate() never signalled before candidate publish attempt"
+            )
+            return candidate
+
+        monkeypatch.setattr(bm25, "_make_state", paused_make_state)
+
+        # Pure observation wrapper around self._lock: it never holds the
+        # lock independently, it only counts release() calls. Holding this
+        # lock (as a reused cold-build-style barrier) risks deadlock across
+        # its several acquisition sites; counting releases does not.
+        release_count = {"n": 0}
+        real_lock = bm25._lock
+
+        class _CountingLock:
+            def acquire(self, *a, **kw):
+                return real_lock.acquire(*a, **kw)
+
+            def release(self):
+                real_lock.release()
+                release_count["n"] += 1
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *exc_info):
+                self.release()
+
+        bm25._lock = _CountingLock()
+
+        bm25.invalidate()  # wakes the rebuild loop through re-probe and candidate build
+        assert _wait_until(lambda: candidate_ready.is_set())
+
+        bm25.invalidate()  # this second invalidate always acquires the lock first
+        baseline = release_count["n"]
+        release_candidate.set()
+
+        # Wait only for the first lock cycle (publish-or-discard decision)
+        # after release to finish. Any retries afterward do not call
+        # _make_state again, since this test's mock only has two entries.
+        assert _wait_until(lambda: release_count["n"] > baseline)
+        assert bm25.state is s0
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_ready_rebuild_converges_when_publish_wins_the_race() -> None:
+    """#398 MMP gate (design lines 55/78/90): once candidate S1 is published
+    before any competing invalidate arrives, that invalidate must still
+    apply dirty/epoch-increment/wake so the next iteration converges to S2.
+    """
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(side_effect=[
+        [_node("a", pack_id="A")],
+        [_node("a", pack_id="A"), _node("b", pack_id="A")],
+        [_node("a", pack_id="A"), _node("b", pack_id="A"), _node("c", pack_id="A")],
+    ])
+    doc_store.bm25_fingerprint = MagicMock(side_effect=[(1, ""), (2, ""), (3, "")])
+    hybrid = _hybrid(doc_store)
+    bm25 = hybrid._bm25
+    try:
+        bm25.ensure_built(doc_store)  # S0 (1 row)
+        bm25.invalidate()
+        assert _wait_until(lambda: bm25.state.indexed_rows == 2)  # S1 published
+        assert bm25.dirty is False
+
+        bm25.invalidate()  # only called after publish is confirmed -> ordering is guaranteed
+        assert _wait_until(lambda: bm25.state.indexed_rows == 3)  # converges to S2
+        assert bm25.dirty is False
     finally:
         hybrid.shutdown_bm25()

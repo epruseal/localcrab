@@ -840,8 +840,13 @@ class HybridQuery:
             else:
                 # Local containment: a probe (native) or fallback marker
                 # (legacy) failure here must not abort the search below. On
-                # failure we skip the invalidate attempt and fall through to
-                # search the already-captured ``state`` unchanged.
+                # failure we skip only the invalidate attempt. We still capture
+                # one state reference right after this block (next line) and use
+                # that single reference for both the search and its coverage
+                # warnings. A concurrent worker publish during this attempt may
+                # make that reference newer than the one read at function entry
+                # -- harmless, since each state bundles its index and metadata
+                # atomically.
                 try:
                     current_fingerprint = self._bm25_probe_fingerprint()
                 except Exception as exc:
