@@ -275,7 +275,11 @@ def _rollback_row_sql(table: str) -> str:
 def connect(pg_url: str) -> Any:
     from sqlalchemy import create_engine
 
-    return create_engine(pg_url, pool_pre_ping=True, hide_parameters=True)
+    from opencrab.stores._pg_url import normalize_pg_url
+
+    return create_engine(
+        normalize_pg_url(pg_url), pool_pre_ping=True, hide_parameters=True
+    )
 
 
 _SAFE_TARGET_QUERY_KEYS = frozenset(

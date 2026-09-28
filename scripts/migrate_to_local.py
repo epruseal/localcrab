@@ -240,8 +240,13 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     console.print("  PostgreSQL 연결 중...", end=" ")
     try:
         from sqlalchemy import create_engine, text  # type: ignore[import]
+
+        from opencrab.stores._pg_url import normalize_pg_url
+
         pg_engine = create_engine(
-            args.pg_url, connect_args={"connect_timeout": 5}, hide_parameters=True
+            normalize_pg_url(args.pg_url),
+            connect_args={"connect_timeout": 5},
+            hide_parameters=True,
         )
         with pg_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -765,14 +770,18 @@ def migrate_sql(
     """
     from sqlalchemy import create_engine, inspect, text  # type: ignore[import]
 
-    # SQLite 스키마 초기화 (SQLStore 생성자가 처리) — 이 store 는 스키마 생성용으로만
+    from opencrab.stores._pg_url import normalize_pg_url
+
+    # SQLite 스키마 초기화 (SQLStore 생성자가 처리). 이 store 는 스키마 생성용으로만
     # 쓰고, 쓰기는 아래 별도 engine 으로 한다.
     from opencrab.stores.sql_store import SQLStore
     sql_store = SQLStore(url=f"sqlite:///{sqlite_path}")
     if not sql_store.available:
         raise mt.MigrationError(f"SQLite 초기화 실패: {sqlite_path}")
 
-    pg_engine = create_engine(pg_url, connect_args={"connect_timeout": 5}, hide_parameters=True)
+    pg_engine = create_engine(
+        normalize_pg_url(pg_url), connect_args={"connect_timeout": 5}, hide_parameters=True
+    )
     # sql_store.py 가 SQLite 커넥션에 두던 timeout 핀을 승계한다 -- write.lock 이
     # 걸린 동안 다른 프로세스의 파일 잠금 대기가 무한정 걸리지 않게 하기 위함.
     sq_engine = create_engine(

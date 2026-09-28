@@ -214,9 +214,12 @@ def _store(args: argparse.Namespace) -> Any:
         raise ValueError("--pg-url or POSTGRES_URL is required for --backend pg")
     from sqlalchemy import create_engine
 
+    from opencrab.stores._pg_url import normalize_pg_url
     from opencrab.stores.pg_graph_store import PGGraphStore
 
-    return PGGraphStore(create_engine(args.pg_url), schema=args.pg_schema)
+    return PGGraphStore(
+        create_engine(normalize_pg_url(args.pg_url)), schema=args.pg_schema
+    )
 
 
 def _json_value(value: Any) -> Any:

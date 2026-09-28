@@ -263,6 +263,8 @@ def bench_pg(args: argparse.Namespace) -> int:
     from psycopg2.extras import execute_values
     from sqlalchemy import create_engine, text
 
+    from opencrab.stores._pg_url import normalize_pg_url
+
     if not args.pg_url:
         print("! --pg-url is required for --mode pg")
         return 3
@@ -297,7 +299,7 @@ def bench_pg(args: argparse.Namespace) -> int:
     dim = len(bytes(rows[0][2])) // 4
     print(f"# dim inferred: {dim}")
 
-    engine = create_engine(args.pg_url)
+    engine = create_engine(normalize_pg_url(args.pg_url))
     try:
         with engine.begin() as c:
             c.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
