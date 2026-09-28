@@ -46,7 +46,11 @@ fingerprint-first observation은 probe 뒤 외부 write가 있을 때 P0 metadat
 
 공통 private `_bm25_search_state()`는 state를 정확히 한 번 잡고 `state.index.search()`와 coverage warning을 같은 state에서 계산해 `(hits, warnings)`를 반환한다. 새 private `_bm25_search_with_warnings()`와 기존 `_bm25_search()`는 모두 이 공통 helper만 호출한다. 전자는 tuple을 `HybridQuery.query()`에 전달하고, 후자는 hits만 반환한다. 따라서 두 public behavior가 state를 각각 읽지 않는다. `HybridQuery.query()`만 새 wrapper를 호출해 자신의 지역 `warnings`에 더한다. pack registry와 기존 fake hybrid는 기존 hit-list 반환 계약과 시그니처를 유지한다.
 
-- 요청한 pack ID가 `covered_pack_ids`에 없으면 missing warning을 추가한다.
+- `total_rows`를 모르거나 `indexed_rows < total_rows`인 스캔에서 요청한 pack
+  ID가 `covered_pack_ids`에 없으면 missing warning을 추가한다. `total_rows`를
+  알고 `indexed_rows >= total_rows`인 완전 스캔에서는 요청한 pack ID가 없어도
+  missing warning을 추가하지 않는다. 그 부재는 색인 누락이 아니라 해당 pack의
+  행이 실제로 0개라는 사실이기 때문이다.
 - `total_rows`가 알려져 있고 `indexed_rows < total_rows`이면 partial rows warning을 추가한다. 모든 요청 팩이 covered여도 이 warning을 추가한다.
 - cold probe 실패로 `total_rows`가 없으면 coverage total unknown warning을 추가한다.
 - ready probe 실패는 기존 state를 쓰므로 기존 warning을 그대로 유지한다.

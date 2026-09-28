@@ -570,8 +570,12 @@ BM25 인덱스는 최근 노드만 전역 순서로 담는다. 오래된 팩의 
 팩을 요청해도 BM25는 hit를 반환하지 않는다. `HybridQuery.query()`는 같은 cache
 세대의 관측값으로 이 상태를 경고한다.
 
-- 요청한 pack ID가 색인 세대에 없으면 `BM25 coverage missing requested pack ids`를
-  반환한다.
+- 색인 스캔이 불완전할 때(전체 행 수를 모르거나 색인 행 수가 전체 행 수보다
+  적을 때), 요청한 pack ID가 색인 세대에 없으면 `BM25 coverage missing
+  requested pack ids`를 반환한다. 스캔이 완전하면(전체 행 수를 알고 색인
+  행 수가 그 값 이상이면) 이 경고를 내지 않는다. 완전 스캔에서 요청한
+  pack ID가 없다는 것은 그 pack이 실제로 행이 0개라는 사실이지 색인 누락이
+  아니기 때문이다.
 - 색인 행 수가 native store의 전체 행 수보다 작으면 `BM25 coverage partial rows`를
   반환한다.
 - legacy store가 전체 행 수를 제공하지 않으면 `BM25 coverage total unknown`을
