@@ -1898,6 +1898,12 @@ def load_nodes_incremental(
     등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과 같은
     레지스트리 동일성 요구).
 
+    이 `authorize()`도 호출당 1회이고 대상은 `pack_name`이다. 행마다
+    인가하는 `builder.add_node()`와 달리, 벡터 접근이 걸리는 이 적재가
+    도는 동안 소유권이 바뀌는 창이 남는다. 청크 축
+    `load_chunks_incremental`과 같은 의도한 모서리다(그쪽 독스트링의
+    같은 설명 참고).
+
     `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
     노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
     남아 있는 경우 그 자리에서 Y 행을 지운다(F4-c). 한동안 기본값 `None` 으로
