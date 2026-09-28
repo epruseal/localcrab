@@ -288,7 +288,17 @@ def normalize_node_properties(node_id: str, properties: dict[str, Any]) -> dict[
     # A disagreeing copy is still rejected before any database access.
     if "node_id" in properties and properties["node_id"] != node_id:
         raise GraphPropertyValidationError("reserved graph property")
-    reserved = {"node_type", "node_digest", "space_id"}
+    # #402 finding 1: a fresh write must never define this store's synthetic
+    # decode-corruption marker key, or it would later collide with the
+    # marker a read path synthesizes for a genuinely corrupted row. Safe to
+    # add straight to this reserved set (unlike normalize_edge_properties'
+    # reserved set, which stays a plain function-call check further down in
+    # this module) because normalize_node_properties has exactly one caller
+    # in the whole codebase, prepare_node(), and prepare_node() is called
+    # only from write paths -- no read path (get_node, get_nodes_by_id)
+    # calls either function, so this never changes how an already-stored
+    # row -- old or new -- is read.
+    reserved = {"node_type", "node_digest", "space_id", "property_decode_error"}
     if reserved.intersection(properties):
         raise GraphPropertyValidationError("reserved graph property")
     supplied = properties.get("id")
@@ -334,7 +344,10 @@ def prepare_node(node_type: str, node_id: str, properties: dict[str, Any], space
     return node_type, props, effective_space, digest
 
 
-def normalize_edge_properties(from_id: str, relation: str, to_id: str, properties: dict[str, Any] | None) -> dict[str, Any]:
+def normalize_edge_properties(
+    from_id: str, relation: str, to_id: str, properties: dict[str, Any] | None,
+    *, reject_reserved_marker: bool = False,
+) -> dict[str, Any]:
     from_id = _check_string(from_id)
     relation = _check_string(relation)
     to_id = _check_string(to_id)
@@ -342,6 +355,19 @@ def normalize_edge_properties(from_id: str, relation: str, to_id: str, propertie
         properties = {}
     if not isinstance(properties, dict):
         raise GraphPropertyValidationError("malformed graph edge properties")
+    # #402 finding 1: unlike normalize_node_properties, this function is
+    # also called from read/re-validation paths (get_edge, get_edge_digest,
+    # and several digest-recompute/inventory helpers that re-normalize an
+    # already-stored row's properties for comparison). Adding the marker
+    # key straight to a reserved set here would turn reading an
+    # already-stored, pre-fix row into a new failure instead of a
+    # write-time rejection (proved by execution). So this check is opt-in,
+    # passed True only from the small number of genuine write call sites
+    # (upsert_edge, update_edge, the batch variants, and the migration
+    # write paths); every read/re-validation call site leaves this at its
+    # default False and is therefore provably unaffected.
+    if reject_reserved_marker and "property_decode_error" in properties:
+        raise GraphPropertyValidationError("reserved graph property")
     out = dict(properties)
     for key, expected in (("from_id", from_id), ("relation", relation), ("to_id", to_id)):
         if key in out and out[key] != expected:

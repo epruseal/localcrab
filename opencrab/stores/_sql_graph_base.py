@@ -688,13 +688,27 @@ class _SqlGraphStoreBase(abc.ABC):
         def body(tx: GraphTx) -> bool:
             self._lock_graph_rows(tx, (node_id,))
             incident = tx.fetchall(
-                f"SELECT from_id, relation, to_id FROM {edges} WHERE from_id=:nid OR to_id=:nid",
+                f"SELECT from_id, relation, to_id, properties FROM {edges} WHERE from_id=:nid OR to_id=:nid",
                 {"nid": node_id},
             )
             self._lock_graph_rows(tx, (), ((row[0], row[1], row[2]) for row in incident))
-            row = tx.fetchone(f"SELECT node_type FROM {nodes} WHERE node_id=:nid", {"nid": node_id})
+            row = tx.fetchone(f"SELECT node_type, properties FROM {nodes} WHERE node_id=:nid", {"nid": node_id})
             if row is None or row[0] != node_type:
                 return False
+            # #402 finding 2: verify the node's own properties and every
+            # incident edge's properties BEFORE either DELETE runs, so a
+            # corrupted node or a corrupted incident edge is never silently
+            # removed with no verification. Both checks happen inside the
+            # same managed transaction as the deletes themselves.
+            _node_props, node_corrupted = decode_properties(row[1])
+            if node_corrupted:
+                raise GraphPropertyCorruptionError(f"node properties corrupted: {node_type}/{node_id}")
+            for from_id, relation, to_id, raw_edge_props in incident:
+                _edge_props, edge_corrupted = decode_properties(raw_edge_props)
+                if edge_corrupted:
+                    raise GraphPropertyCorruptionError(
+                        f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+                    )
             result = tx.execute(f"DELETE FROM {nodes} WHERE node_id=:nid AND node_type=:nt", {"nid": node_id, "nt": node_type})
             if tx.rowcount(result) != 1:
                 raise RuntimeError("graph node delete rowcount mismatch")
@@ -721,7 +735,7 @@ class _SqlGraphStoreBase(abc.ABC):
         for value in (from_type, from_id, relation, to_type, to_id):
             if not isinstance(value, str) or not value:
                 raise ValueError("graph identity fields must be non-empty strings")
-        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        props = normalize_edge_properties(from_id, relation, to_id, properties, reject_reserved_marker=True)
         digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
         nodes, edges = self._table("graph_nodes"), self._table("graph_edges")
         insert_sql = self._dialect.insert(edges, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (from_id, relation, to_id) DO NOTHING"
@@ -1397,7 +1411,10 @@ class _SqlGraphStoreBase(abc.ABC):
             source_from = source_to_target[row.from_key]
             source_to = source_to_target[row.to_key]
             props = dict(row.normalized_properties)
-            props = normalize_edge_properties(source_from["node_id"], row.relation, source_to["node_id"], props)
+            props = normalize_edge_properties(
+                source_from["node_id"], row.relation, source_to["node_id"], props,
+                reject_reserved_marker=True,
+            )
             digest = canonical_edge_digest(
                 source_from["node_id"], row.relation, source_to["node_id"],
                 source_from["node_type"], source_to["node_type"], props,
@@ -1726,7 +1743,10 @@ class _SqlGraphStoreBase(abc.ABC):
                     or not isinstance(spec.get("properties"), dict)
                 ):
                     raise GraphMigrationConflict("migration plan edge target is malformed")
-                props = normalize_edge_properties(target["from_id"], target["relation"], target["to_id"], spec.get("properties"))
+                props = normalize_edge_properties(
+                    target["from_id"], target["relation"], target["to_id"], spec.get("properties"),
+                    reject_reserved_marker=True,
+                )
                 digest = canonical_edge_digest(target["from_id"], target["relation"], target["to_id"], target["from_type"], target["to_type"], props)
                 if digest != spec.get("digest") or thaw_json(props) != spec.get("properties"):
                     raise GraphMigrationConflict("migration plan edge payload changed")
@@ -2600,7 +2620,7 @@ class _SqlGraphStoreBase(abc.ABC):
         validate_digest(expected_current_digest, edge=True)
         if not isinstance(owner_pack_id, str) or not owner_pack_id:
             raise ValueError("graph identity fields must be non-empty strings")
-        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        props = normalize_edge_properties(from_id, relation, to_id, properties, reject_reserved_marker=True)
         if props.get("pack_id") != owner_pack_id:
             raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
         digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
@@ -2796,6 +2816,22 @@ class _SqlGraphStoreBase(abc.ABC):
                 # still caught here rather than leaking cross-space.
                 if not _space_passes(other_props, space_set):
                     continue
+            # #402 finding 4: a corrupted edge must always be excluded, not
+            # only when a pack filter is active. This check used to live
+            # inside the `if pack_set is not None:` branch below, so the
+            # default find_neighbors(..., pack_ids=None) call path returned
+            # corrupted edges as if they were normal relationships,
+            # contradicting this function's own "must always be excluded"
+            # intent. It now runs unconditionally, before any pack-specific
+            # logic, and `edge_props` remains available for the pack_set
+            # branch's own use below.
+            edge_props, edge_corrupted = decode_properties(edge_props_raw)
+            if edge_corrupted:
+                logger.warning(
+                    "skipping corrupted graph edge during BFS expansion: from_id=%s relation=%s to_id=%s",
+                    current_id if is_out else other_id, relation, other_id if is_out else current_id,
+                )
+                continue
             if pack_set is not None:
                 # Provably redundant for SCALAR pack_id values only: SQL
                 # already applied this same policy (via _pack_where /
@@ -2810,19 +2846,6 @@ class _SqlGraphStoreBase(abc.ABC):
                 # thinking it is dead code.
                 other_pass = _node_passes(other_props, pack_set, include_unpackaged)
                 if not other_pass:
-                    continue
-                edge_props, edge_corrupted = decode_properties(edge_props_raw)
-                if edge_corrupted:
-                    # #402: without this, a corrupted edge whose properties
-                    # decode to {} has no "pack_id" key, so _edge_passes falls
-                    # through to `src_passes and dst_passes` and the edge is
-                    # exposed as if it had no pack_id at all -- there is no
-                    # include_unpackaged-style opt-out for this leak, it must
-                    # always be excluded.
-                    logger.warning(
-                        "skipping corrupted graph edge during BFS expansion: from_id=%s relation=%s to_id=%s",
-                        current_id if is_out else other_id, relation, other_id if is_out else current_id,
-                    )
                     continue
                 # The `True` here says "the anchor side already passed". That
                 # holds for the anchor this call was given, but NOT for a
@@ -2952,9 +2975,22 @@ class _SqlGraphStoreBase(abc.ABC):
         self, from_id: str, to_id: str, max_depth: int = 4
     ) -> list[dict[str, Any]]:
         """BFS shortest path between two nodes (out-edges only, B1 contract:
-        ``max_depth`` is a hop bound)."""
+        ``max_depth`` is a hop bound).
+
+        #402 finding 3: corrupted data is always excluded, mirroring
+        ``_expand()``'s contract for ``find_neighbors()`` -- a corrupted
+        start node has no path from it, a corrupted edge is never
+        traversed, and a corrupted destination/intermediate node is never
+        enqueued or matched.
+        """
         self._require_available()
+        nodes = self._table("graph_nodes")
         table = self._table("graph_edges")
+        start_row = self._fetch_one(f"SELECT properties FROM {nodes} WHERE node_id=:nid", {"nid": from_id})
+        if start_row is not None:
+            _start_props, start_corrupted = decode_properties(start_row[0])
+            if start_corrupted:
+                return []
         visited: set[str] = {from_id}
         queue: deque[tuple[str, list[dict[str, Any]]]] = deque([(from_id, [])])
 
@@ -2963,15 +2999,25 @@ class _SqlGraphStoreBase(abc.ABC):
             if len(path) >= max_depth:
                 continue
 
-            sql = f"SELECT to_type, to_id, relation FROM {table} WHERE from_id=:fid"
+            sql = f"SELECT to_type, to_id, relation, properties FROM {table} WHERE from_id=:fid"
             rows = self._fetch_all(sql, {"fid": current_id})
-            for to_type, nid, rel in rows:
+            for to_type, nid, rel, raw_edge_props in rows:
+                _edge_props, edge_corrupted = decode_properties(raw_edge_props)
+                if edge_corrupted:
+                    # A corrupted edge is never traversed -- previously this
+                    # function never selected/decoded `properties` at all,
+                    # so a corrupted edge along the path was invisible to it.
+                    continue
                 try:
-                    node = self.get_node(to_type, nid) or {"id": nid}
+                    node = self.get_node(to_type, nid)
                 except GraphPropertyCorruptionError:
-                    # Pre-existing falsy-fallback behavior preserved (#402):
-                    # this is a pre-authorization graph-walk helper, not a
-                    # pack-visibility decision.
+                    # A corrupted neighbor node is never enqueued, never a
+                    # path member, and never a match -- previously this
+                    # substituted a bare {"id": nid} placeholder and kept
+                    # going, with no corruption marker anywhere in the
+                    # returned path.
+                    continue
+                if node is None:
                     node = {"id": nid}
                 new_path = path + [{"node": node, "relation": rel}]
 
@@ -4058,7 +4104,7 @@ class _SqlGraphStoreBase(abc.ABC):
             if key in seen:
                 raise ValueError(f"duplicate global graph key in batch: edge_key={key}")
             seen.add(key)
-            props = normalize_edge_properties(fid, rel, tid, item.get("properties"))
+            props = normalize_edge_properties(fid, rel, tid, item.get("properties"), reject_reserved_marker=True)
             prepared.append((ft, fid, rel, tt, tid, props, canonical_edge_digest(fid, rel, tid, ft, tt, props)))
         nodes_table, table = self._table("graph_nodes"), self._table("graph_edges")
         insert_sql = self._dialect.insert(table, ["from_type", "from_id", "relation", "to_type", "to_id", "properties"], json_columns=["properties"]) + "\nON CONFLICT (from_id, relation, to_id) DO NOTHING"
@@ -4123,7 +4169,7 @@ class _SqlGraphStoreBase(abc.ABC):
             owner = item.get("owner_pack_id")
             if not isinstance(owner, str) or not owner:
                 raise ValueError("graph identity fields must be non-empty strings")
-            props = normalize_edge_properties(*key, item.get("properties"))
+            props = normalize_edge_properties(*key, item.get("properties"), reject_reserved_marker=True)
             if props.get("pack_id") != owner:
                 raise EdgeIdentityConflict(f"stale edge update: ({key[0]}, {key[1]}, {key[2]})")
             prepared.append((item["from_type"], key[0], key[1], item["to_type"], key[2], props, item["expected_current_digest"], owner))

@@ -19,6 +19,7 @@ import pytest
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
     GraphPropertyCorruptionError,
+    GraphPropertyValidationError,
     GraphReadCapabilityUnavailable,
     NodeIdentityConflict,
 )
@@ -1127,3 +1128,256 @@ def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
     node = store.get_node_by_id("p1")
     assert node["node_type"] == "Person"
     assert node["property_decode_error"] is True
+
+
+# ---------------------------------------------------------------------------
+# #402 alternative-review findings 1-4 (PR #420): design-verification rounds
+# 1-3 plus lead arbitration (see design.md) landed on the following fixes.
+# Findings 2-4 are proven against pre-fix code in the PR description's RED
+# capture; finding 1's individual funnel tests below are the RED/GREEN
+# evidence themselves (each raised nothing pre-fix, GraphPropertyValidation
+# Error post-fix).
+# ---------------------------------------------------------------------------
+
+
+# --- finding 1: a fresh write must never define the property_decode_error
+# marker key (a synthetic flag only a bulk/multi-row read path ever
+# synthesizes for an already-corrupted row -- see decode_properties /
+# get_nodes_by_id -- never a value a normal write stores). A write that let a
+# caller set it would collide with that marker on the next bulk read.
+#
+# Scope note: the migration write paths (explicit-merge apply, migration-plan
+# apply in update_node/update_nodes_batch's incident-edge handling and the
+# dedicated migration-apply bodies) share the exact same
+# normalize_node_properties()/normalize_edge_properties() guard exercised by
+# the funnels below. They get no separate fixtures here: this file has no
+# pre-existing migration-path test infrastructure to extend (that lives in
+# tests/test_issue80_sql_graph.py, tests/test_issue80_migration.py, and
+# tests/test_migrate_graph_identity_cli.py), and a second fixture would only
+# re-exercise the identical shared branch at disproportionate setup cost.
+
+
+def test_upsert_node_rejects_property_decode_error_marker():
+    store = _store()
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_node("Person", "p1", {"property_decode_error": True})
+
+
+def test_update_node_rejects_property_decode_error_marker():
+    store = _store()
+    receipt = store.upsert_node("Person", "p1", {}, return_receipt=True)
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_node("p1", receipt.digest, "Person", {"property_decode_error": True})
+
+
+def test_upsert_nodes_batch_rejects_property_decode_error_marker():
+    store = _store()
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_nodes_batch([
+            {"node_type": "Item", "node_id": "a", "properties": {"property_decode_error": True}},
+        ])
+
+
+def test_update_nodes_batch_rejects_property_decode_error_marker():
+    store = _store()
+    receipt = store.upsert_node("Item", "a", {}, return_receipt=True)
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_nodes_batch([
+            {
+                "node_id": "a", "expected_current_digest": receipt.digest,
+                "new_type": "Item", "new_properties": {"property_decode_error": True},
+            },
+        ])
+
+
+def test_upsert_edge_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_edge("Person", "a", "knows", "Person", "b", {"property_decode_error": True})
+
+
+def test_update_edge_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "p1"})
+    store.upsert_node("Person", "b", {"pack_id": "p1"})
+    receipt = store.upsert_edge(
+        "Person", "a", "knows", "Person", "b", {"pack_id": "p1"}, return_receipt=True
+    )
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_edge(
+            "Person", "a", "knows", "Person", "b",
+            {"pack_id": "p1", "property_decode_error": True},
+            expected_current_digest=receipt.digest, owner_pack_id="p1",
+        )
+
+
+def test_upsert_edges_batch_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_edges_batch([
+            {
+                "from_type": "Person", "from_id": "a", "relation": "knows",
+                "to_type": "Person", "to_id": "b",
+                "properties": {"property_decode_error": True},
+            },
+        ])
+
+
+def test_update_edges_batch_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "p1"})
+    store.upsert_node("Person", "b", {"pack_id": "p1"})
+    receipt = store.upsert_edge(
+        "Person", "a", "knows", "Person", "b", {"pack_id": "p1"}, return_receipt=True
+    )
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_edges_batch([
+            {
+                "from_type": "Person", "from_id": "a", "relation": "knows",
+                "to_type": "Person", "to_id": "b",
+                "properties": {"pack_id": "p1", "property_decode_error": True},
+                "expected_current_digest": receipt.digest, "owner_pack_id": "p1",
+            },
+        ])
+
+
+def test_get_edge_read_path_unaffected_by_marker_guard():
+    """#402 finding 1, arbitration condition 2 (known limitation): a row that
+    stored this key as a plain property before this fix shipped -- written
+    here by direct SQL since no write path can produce it anymore -- must
+    still be readable exactly as before. get_edge()'s own re-validation call
+    to normalize_edge_properties() stays at the default
+    reject_reserved_marker=False, so it is provably unaffected by the new
+    opt-in check added only to the genuine write call sites above."""
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    store.upsert_edge("Person", "a", "knows", "Person", "b", {"pack_id": "p1"})
+    store._conn.execute(
+        "UPDATE graph_edges SET properties = :raw WHERE from_id='a' AND to_id='b'",
+        {"raw": '{"pack_id": "p1", "property_decode_error": true}'},
+    )
+    store._conn.commit()
+
+    props = store.get_edge("Person", "a", "knows", "Person", "b")
+    assert props["property_decode_error"] is True
+
+
+def test_backfill_pack_provenance_preserves_marker_key_documented_limitation():
+    """#402 arbitration ruling (design-verification round 3 -> lead decision,
+    option 2): backfill_pack_provenance() re-persists a node/edge's EXISTING
+    properties unchanged except for ownership (pack_id/pack) -- its node
+    branch never calls prepare_node()/normalize_node_properties(), and its
+    edge branch rebuilds the persisted after_props from a plain
+    dict(raw_current) copy rather than the normalized `current` value, so
+    neither branch passes through the finding-1 guard. This is an accepted,
+    documented exception, not a new collision vector: it takes no fresh
+    `properties` payload from its caller, only an ownership assignment. A
+    marker key already present on a row -- written here by direct SQL to
+    stand in for a pre-fix row -- therefore survives a backfill call
+    unchanged instead of being stripped or rejected; recovery of such a row
+    stays manual and out of this fix's scope (see issue #416)."""
+    import hashlib
+
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    store._conn.execute(
+        "UPDATE graph_nodes SET properties = :raw WHERE node_id='p1'",
+        {"raw": '{"id": "p1", "property_decode_error": true}'},
+    )
+    store._conn.commit()
+    target = store.graph_fingerprint()
+    current_digest = store.get_node_digest("p1", node_type="Person")
+    record = {
+        "kind": "node", "target_fingerprint": target,
+        "expected_current_digest": current_digest, "proposed_pack_id": "pack-x",
+        "node_id": "p1", "node_type": "Person", "reason": "inferred",
+        "dry_run_evidence_digest": hashlib.sha256(b"evidence").hexdigest(),
+        "allowed_properties_delta": {"set": {"pack_id": "pack-x"}, "remove": []},
+    }
+    store.backfill_pack_provenance([record])
+
+    row = store._conn.execute("SELECT properties FROM graph_nodes WHERE node_id='p1'").fetchone()
+    assert '"property_decode_error": true' in row[0]
+    assert '"pack_id": "pack-x"' in row[0]
+
+
+# --- finding 2: delete_node() previously selected only node_type before
+# deleting -- neither the node's own properties nor any incident edge's
+# properties were ever inspected, so a corrupted row (or an edge alongside
+# it) could be silently destroyed with no verification at all.
+
+
+def test_delete_node_raises_on_corrupted_node_properties():
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    _corrupt_node_properties(store, "p1")
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_node("Person", "p1")
+    assert store._conn.execute("SELECT 1 FROM graph_nodes WHERE node_id='p1'").fetchone() is not None
+
+
+def test_delete_node_raises_on_corrupted_incident_edge_properties():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    store.upsert_edge("Person", "a", "knows", "Person", "b")
+    _corrupt_edge_properties(store, "a", "b")
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_node("Person", "a")
+    assert store._conn.execute("SELECT 1 FROM graph_nodes WHERE node_id='a'").fetchone() is not None
+    assert store._conn.execute("SELECT 1 FROM graph_edges WHERE from_id='a'").fetchone() is not None
+
+
+# --- finding 3: find_path() never selected/decoded the start node's, an
+# intermediate node's, or an edge's properties at all -- a corrupted start
+# node was invisible to it, a corrupted intermediate node was substituted
+# with a bare {"id": nid} placeholder and the search kept going through it,
+# and a corrupted edge was traversed exactly like a normal one.
+
+
+def test_find_path_corrupted_start_node_returns_empty():
+    store = _store()
+    _make_chain(store, 2)
+    _corrupt_node_properties(store, "n0")
+    assert store.find_path("n0", "n2", max_depth=4) == []
+
+
+def test_find_path_skips_corrupted_intermediate_node():
+    store = _store()
+    _make_chain(store, 3)  # n0 -> n1 -> n2 -> n3, single path through n1
+    _corrupt_node_properties(store, "n1")
+    assert store.find_path("n0", "n3", max_depth=4) == []
+
+
+def test_find_path_skips_corrupted_edge():
+    store = _store()
+    _make_chain(store, 2)  # n0 -> n1 -> n2
+    _corrupt_edge_properties(store, "n0", "n1")
+    assert store.find_path("n0", "n2", max_depth=4) == []
+
+
+# --- finding 4: _expand()'s corrupted-edge check used to live INSIDE the
+# `if pack_set is not None:` branch, so the default
+# find_neighbors(..., pack_ids=None) call path returned a corrupted edge as
+# if it were a normal relationship. test_find_neighbors_corrupted_edge_
+# always_excluded (6c, above) only exercises the pack_ids=["p1"] path, which
+# this specific bug did NOT affect.
+
+
+def test_find_neighbors_corrupted_edge_excluded_on_default_pack_ids_none_path():
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    store.upsert_node("Item", "leaf", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_edge_properties(store, "hub", "leaf")
+
+    res = store.find_neighbors("hub", direction="out")  # pack_ids=None default
+    to_ids = {r["to_id"] for r in res}
+    assert "leaf" not in to_ids
