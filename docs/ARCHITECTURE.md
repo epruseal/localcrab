@@ -110,12 +110,10 @@ fingerprint를 확인하던 비용이 쿼리 hot path에 실려 있었다(코퍼
   호출)는 세대 카운터만 bump하고 워커를 깨운다(디바운스 `OPENCRAB_BM25_DEBOUNCE`,
   기본 1.5s — 연속 ingest를 1회로 합침). 완료되면 새 인덱스를 **원자적 참조 교체**로
   swap-in한다(단일 프로세스/GIL). 쿼리는 그동안 기존(약간 stale) 인덱스를 즉시 서빙.
-- **쿼리 hot path는 경량 fingerprint만** 확인한다 — `doc_store.bm25_fingerprint()`
-  = `SELECT COUNT(*), MAX(updated_at) FROM (SELECT … LIMIT N)`(행 파싱 없음,
-  `idx_doc_nodes_updated` 활용). 별도 프로세스(팩 적재·reingest)가 `invalidate`
-  없이 doc_nodes에 쓴 out-of-band 변경을 이 probe가 잡아 백그라운드 재빌드를
-  스케줄한다. `LIMIT N`은 `_BM25_NODE_LIMIT`과 일치시켜, 코퍼스가 N을 넘어도 count가
-  `BM25Index`(N개만 색인)와 어긋나지 않게 한다.
+- **쿼리 hot path는 경량 fingerprint만** 확인한다. `doc_store.bm25_fingerprint()`는
+  전체 `doc_nodes`의 행 수와 최신 시각을 읽고 행 본문을 파싱하지 않는다. 별도
+  프로세스가 `invalidate` 없이 doc_nodes에 쓴 out-of-band 변경도 이 probe가 잡아
+  백그라운드 재빌드를 예약한다. 전체 행 수는 BM25 cap 밖 행이 있음을 판정한다.
 - 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐. 이 콜드 빌드는 질의 스레드의
   `_bm25_search()`와 백그라운드 워커의 `_rebuild_loop()` 첫 깨어남이라는 두
   호출부를 갖는데, 둘 다 `_Bm25CacheWorker.ensure_built()`를 거쳐 전용 락으로
@@ -568,15 +566,23 @@ BM25 인덱스는 doc 스토어에서 최대 `_BM25_NODE_LIMIT`개 노드만 로
 
 ### 대규모 데이터 환경에서의 영향
 
-| 총 노드 수 | BM25 인덱싱 비율 | 비고 |
-| --- | --- | --- |
-| 43,000 (현재) | 100% | 전체 커버 |
-| 50,000 | 100% | 한계선 |
-| 430,000 (10x) | 11.6% | 88.4% 노드가 BM25 검색에서 누락 |
+BM25 인덱스는 최근 노드만 전역 순서로 담는다. 오래된 팩의 노드가 상한 밖이면 해당
+팩을 요청해도 BM25는 hit를 반환하지 않는다. `HybridQuery.query()`는 같은 cache
+세대의 관측값으로 이 상태를 경고한다.
 
-BM25 미커버 노드는 벡터 검색(Chroma)에서는 여전히 검색 가능하다. 그러나 키워드
-정밀도가 높은 쿼리에서 BM25 결과가 RRF 재랭킹에 기여하지 못해 검색 품질이 저하될
-수 있다.
+- 색인 스캔이 불완전할 때(전체 행 수를 모르거나 색인 행 수가 전체 행 수보다
+  적을 때), 요청한 pack ID가 색인 세대에 없으면 `BM25 coverage missing
+  requested pack ids`를 반환한다. 스캔이 완전하면(전체 행 수를 알고 색인
+  행 수가 그 값 이상이면) 이 경고를 내지 않는다. 완전 스캔에서 요청한
+  pack ID가 없다는 것은 그 pack이 실제로 행이 0개라는 사실이지 색인 누락이
+  아니기 때문이다.
+- 색인 행 수가 native store의 전체 행 수보다 작으면 `BM25 coverage partial rows`를
+  반환한다.
+- legacy store가 전체 행 수를 제공하지 않으면 `BM25 coverage total unknown`을
+  반환한다.
+
+MCP 응답은 기존 `spaces_filter_warnings`에 이 경고를 담는다. BM25 미커버 노드는
+벡터 검색과 FTS에서 여전히 후보가 될 수 있다.
 
 ### 조정 방법
 

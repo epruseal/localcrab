@@ -228,6 +228,37 @@ class TestBm25WorkerEdge:
 
 
 # ---------------------------------------------------------------------------
+# _bm25_cache_size — read-only forwarding property
+# ---------------------------------------------------------------------------
+
+
+class TestBm25CacheSizeReadOnly:
+    def test_assignment_fails_from_the_public_surface_not_the_worker(self) -> None:
+        """A review finding on #398 (PR #418) flagged that assigning
+        ``hybrid._bm25_cache_size`` raised AttributeError from inside the
+        private ``_Bm25CacheWorker`` helper: the forwarding setter wrote
+        ``self._bm25.cache_size``, but the worker's ``cache_size`` is a
+        getter-only property derived from the immutable ``Bm25CacheState``.
+        No in-repo or external caller ever wrote it independently of
+        ``cache`` (see the PR #418 review discussion for #398). The outer
+        setter is now removed so the property is read-only at the public
+        surface, and the resulting AttributeError names ``_bm25_cache_size``
+        instead of leaking the internal worker class.
+
+        This does not assert the full exception text: "property ... has no
+        setter" wording is not guaranteed stable across Python versions. It
+        only checks which name appears (public) and which does not
+        (internal), which stays true across versions.
+        """
+        hybrid = _inert_hybrid()
+        with pytest.raises(AttributeError) as exc_info:
+            hybrid._bm25_cache_size = 5
+        message = str(exc_info.value)
+        assert "_bm25_cache_size" in message
+        assert "_Bm25CacheWorker" not in message
+
+
+# ---------------------------------------------------------------------------
 # _bm25_probe_fingerprint — normal/error/edge
 # ---------------------------------------------------------------------------
 

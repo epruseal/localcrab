@@ -168,3 +168,16 @@ def test_t10_schema_advertises_new_parameters():
     assert "auto_pack" in props
     assert "include_unpackaged" in props
     assert "include_pack_provenance" in props
+
+
+def test_t10_ontology_query_exposes_bm25_coverage_warning():
+    from opencrab.mcp import tools
+
+    hybrid = MagicMock()
+    hybrid.query = MagicMock(return_value=QueryOutcome(results=[], warnings=["BM25 coverage total unknown"]))
+    sql = _real_sql_with_owned_pack("pack-a")
+
+    with patch.object(tools, "_get_context", return_value=_stub_context(hybrid, sql=sql)):
+        response = tools.ontology_query(question="alpha", pack_ids=["pack-a"])
+
+    assert response["spaces_filter_warnings"] == ["BM25 coverage total unknown"]

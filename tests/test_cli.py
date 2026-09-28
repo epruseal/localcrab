@@ -632,6 +632,58 @@ class TestQuery:
         assert isinstance(parsed, dict)
         assert "results" in parsed
 
+    def test_json_output_stays_pure_even_when_a_coverage_warning_fires(
+        self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch
+    ):
+        """A warning in outcome.warnings is a diagnostic for a human and is
+        routed to stderr (cli.py's query command, err=True) so a machine
+        parsing --json-output/--json-envelope's stdout never has to skip
+        over it. This pins that routing under a warning guaranteed to fire,
+        instead of relying on the coverage-warning's own trigger condition
+        (#398 narrows that condition) to happen to stay silent."""
+        from opencrab.ontology.query import HybridQuery, QueryOutcome
+
+        original_query = HybridQuery.query
+
+        def fake_query(self, *args, **kwargs):
+            outcome = original_query(self, *args, **kwargs)
+            return QueryOutcome(
+                results=outcome.results,
+                warnings=[*outcome.warnings, "BM25 coverage total unknown"],
+            )
+
+        monkeypatch.setattr(HybridQuery, "query", fake_query)
+
+        result = runner.invoke(main, ["query", "zzz no match", "--json-envelope"])
+        assert result.exit_code == 0
+        assert "warning: BM25 coverage total unknown" in result.stderr
+        envelope = json.loads(result.stdout)
+        assert envelope["total"] == 0
+
+    def test_legacy_json_output_stays_pure_even_when_a_coverage_warning_fires(
+        self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch
+    ):
+        """Same property as the envelope-mode sibling above, for the legacy
+        bare-list --json-output shape."""
+        from opencrab.ontology.query import HybridQuery, QueryOutcome
+
+        original_query = HybridQuery.query
+
+        def fake_query(self, *args, **kwargs):
+            outcome = original_query(self, *args, **kwargs)
+            return QueryOutcome(
+                results=outcome.results,
+                warnings=[*outcome.warnings, "BM25 coverage total unknown"],
+            )
+
+        monkeypatch.setattr(HybridQuery, "query", fake_query)
+
+        result = runner.invoke(main, ["query", "zzz no match", "--json-output"])
+        assert result.exit_code == 0
+        assert "warning: BM25 coverage total unknown" in result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed == []
+
 
 # ---------------------------------------------------------------------------
 # manifest
