@@ -518,11 +518,13 @@ class HybridQuery:
 
     @property
     def _bm25_cache_size(self) -> int:
+        # Read-only: cache_size is derived from the immutable Bm25CacheState
+        # (state.indexed_rows), not an independent field. No caller in this
+        # repo or its known consumers ever wrote it separately from `cache`
+        # (a setter here previously forwarded to a nonexistent worker-level
+        # setter and raised AttributeError on every assignment attempt; see
+        # PR #418 review finding).
         return self._bm25.cache_size
-
-    @_bm25_cache_size.setter
-    def _bm25_cache_size(self, value: int) -> None:
-        self._bm25.cache_size = value
 
     @property
     def _bm25_dirty(self) -> bool:
