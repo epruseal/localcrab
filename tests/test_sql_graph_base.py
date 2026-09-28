@@ -506,6 +506,104 @@ def test_find_by_relations_empty_relations_returns_empty():
     assert store.find_by_relations("a", []) == []
 
 
+# --- #402 round 6: find_by_relations() never fetched or decode-checked the
+# EDGE's own properties column at all (unlike _expand(), which always has).
+# A corrupted edge row -- e.g. a duplicate-key `properties` JSON object,
+# reachable only via direct-SQL writes since a normal upsert_edge/
+# update_edge call can never serialize one -- was returned as an ordinary
+# relationship as long as the far-side node itself decoded fine. These
+# tests reproduce that gap on each leg find_by_relations builds its own SQL
+# for (out, in), plus a "both" combination, each with a healthy-edge
+# control so the fix cannot be over-broad and start dropping normal edges.
+
+
+def test_find_by_relations_out_excludes_corrupted_edge():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")  # corrupted below
+    store.upsert_edge("Item", "a", "next", "Item", "c")  # control: stays healthy
+    _corrupt_edge_properties(store, "a", "b")
+
+    res = store.find_by_relations("a", ["next"], direction="out")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_in_excludes_corrupted_edge():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "b", "next", "Item", "a")  # corrupted below
+    store.upsert_edge("Item", "c", "next", "Item", "a")  # control: stays healthy
+    _corrupt_edge_properties(store, "b", "a")
+
+    res = store.find_by_relations("a", ["next"], direction="in")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_both_excludes_corrupted_edge_on_either_leg():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})  # out target, corrupted
+    store.upsert_node("Item", "c", {})  # out control
+    store.upsert_node("Item", "d", {})  # in source, corrupted
+    store.upsert_node("Item", "e", {})  # in control
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    store.upsert_edge("Item", "a", "next", "Item", "c")
+    store.upsert_edge("Item", "d", "next", "Item", "a")
+    store.upsert_edge("Item", "e", "next", "Item", "a")
+    _corrupt_edge_properties(store, "a", "b")
+    _corrupt_edge_properties(store, "d", "a")
+
+    res = store.find_by_relations("a", ["next"], direction="both")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c", "e"]
+
+
+# --- #402 round 6, scoped counterpart: find_by_relations_scoped()'s `leg()`
+# only decode-checked the far-side NODE (via get_node's own
+# GraphPropertyCorruptionError), never the EDGE row its own SQL selects --
+# even though that SQL already fetches e.properties for the pack-membership
+# predicate (edge_cond). A corrupted edge that both endpoints and the pack
+# scope would otherwise authorize was returned as an ordinary relationship.
+# The authorization-control-group test (an edge genuinely out of scope,
+# unrelated to corruption) lives in test_read_scope_isolation.py; this pair
+# isolates the corruption axis on its own with a single-pack scope so a
+# regression cannot hide behind an authorization-filter coincidence.
+
+
+def test_find_by_relations_scoped_excludes_corrupted_edge_out():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})  # corrupted edge target
+    store.upsert_node("Item", "c", {"pack_id": "p1"})  # control: healthy edge
+    store.upsert_edge("Item", "a", "next", "Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "next", "Item", "c", {"pack_id": "p1"})
+    _corrupt_edge_properties(store, "a", "b", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "out", 20)
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_edge_in():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})  # corrupted edge source
+    store.upsert_node("Item", "c", {"pack_id": "p1"})  # control: healthy edge
+    store.upsert_edge("Item", "b", "next", "Item", "a", {"pack_id": "p1"})
+    store.upsert_edge("Item", "c", "next", "Item", "a", {"pack_id": "p1"})
+    _corrupt_edge_properties(store, "b", "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "in", 20)
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
 # ---------------------------------------------------------------------------
 # get_node_by_id / export_nodes / export_edges / batch upserts
 # ---------------------------------------------------------------------------

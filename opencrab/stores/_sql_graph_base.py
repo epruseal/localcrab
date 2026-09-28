@@ -3599,7 +3599,7 @@ class _SqlGraphStoreBase(abc.ABC):
 
         def leg(anchor_col: str, anchor_type: str, other_col: str, other_type: str, lim: int):
             sql = (
-                f"SELECT other.node_type, other.node_id, e.relation FROM {edges} e"
+                f"SELECT other.node_type, other.node_id, e.relation, e.properties AS edge_props FROM {edges} e"
                 f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
                 f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
                 f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
@@ -3611,7 +3611,21 @@ class _SqlGraphStoreBase(abc.ABC):
                 "sc_packs": transform(sorted(set(pack_ids))),
                 **rel_params,
             }
-            for other_ntype, other_nid, relation in self._fetch_all(sql, params):
+            for other_ntype, other_nid, relation, edge_props_raw in self._fetch_all(sql, params):
+                # #402 (round 6): the edge's own properties must be decode-
+                # checked here too, matching _expand()'s "must always be
+                # excluded" contract. Without this, a corrupted edge row
+                # still passed the anchor/other/pack-membership SQL filter
+                # above and was returned as an ordinary relationship,
+                # because only the far-side NODE was ever decode-checked
+                # (via get_node below) -- never the edge itself.
+                _edge_props, edge_corrupted = decode_properties(edge_props_raw)
+                if edge_corrupted:
+                    logger.warning(
+                        "skipping corrupted graph edge during find_by_relations_scoped: node_id=%s relation=%s other_id=%s",
+                        node_id, relation, other_nid,
+                    )
+                    continue
                 try:
                     props = self.get_node(other_ntype, other_nid)
                 except GraphPropertyCorruptionError:
@@ -3650,11 +3664,24 @@ class _SqlGraphStoreBase(abc.ABC):
 
         if direction in ("out", "both"):
             sql = (
-                f"SELECT to_type, to_id, relation FROM {table}"
+                f"SELECT to_type, to_id, relation, properties AS edge_props FROM {table}"
                 f" WHERE from_id=:nid AND relation IN ({placeholders}) LIMIT :lim"
             )
             rows = self._fetch_all(sql, {"nid": node_id, "lim": limit, **rel_params})
-            for to_type, to_id, relation in rows:
+            for to_type, to_id, relation, edge_props_raw in rows:
+                # #402 (round 6): decode-check the edge itself, matching
+                # _expand()'s contract. find_by_relations (unscoped) has no
+                # edge-property SQL condition at all, and previously never
+                # fetched or checked the edge's properties column -- a
+                # corrupted edge row was returned as an ordinary
+                # relationship as long as the far-side node decoded fine.
+                _edge_props, edge_corrupted = decode_properties(edge_props_raw)
+                if edge_corrupted:
+                    logger.warning(
+                        "skipping corrupted graph edge during find_by_relations (out): node_id=%s relation=%s other_id=%s",
+                        node_id, relation, to_id,
+                    )
+                    continue
                 try:
                     props = self.get_node(to_type, to_id)
                 except GraphPropertyCorruptionError:
@@ -3671,11 +3698,20 @@ class _SqlGraphStoreBase(abc.ABC):
             remaining = limit - len(results)
             if remaining > 0:
                 sql = (
-                    f"SELECT from_type, from_id, relation FROM {table}"
+                    f"SELECT from_type, from_id, relation, properties AS edge_props FROM {table}"
                     f" WHERE to_id=:nid AND relation IN ({placeholders}) LIMIT :lim"
                 )
                 rows = self._fetch_all(sql, {"nid": node_id, "lim": remaining, **rel_params})
-                for from_type, from_id, relation in rows:
+                for from_type, from_id, relation, edge_props_raw in rows:
+                    # #402 (round 6): same edge decode-check as the "out"
+                    # leg above, see its comment.
+                    _edge_props, edge_corrupted = decode_properties(edge_props_raw)
+                    if edge_corrupted:
+                        logger.warning(
+                            "skipping corrupted graph edge during find_by_relations (in): node_id=%s relation=%s other_id=%s",
+                            node_id, relation, from_id,
+                        )
+                        continue
                     try:
                         props = self.get_node(from_type, from_id)
                     except GraphPropertyCorruptionError:
