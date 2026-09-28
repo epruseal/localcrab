@@ -604,6 +604,250 @@ def test_find_by_relations_scoped_excludes_corrupted_edge_in():
     assert ids == ["c"]
 
 
+# --- #402 round 7: find_by_relations()/find_by_relations_scoped() decode-
+# checked the EDGE (round 6, above) and the far-side node (via get_node,
+# pre-existing) but never the ANCHOR itself -- the node_id the caller
+# passed in. A corrupted anchor's relationships were returned as if the
+# anchor were healthy, unlike find_neighbors() (which already checks the
+# BFS anchor, round 4 gap 2) and get_node() (which raises for the same
+# node). Found by codex CLI during round 6's dual verification, then
+# design-verified over two rounds before this fix (design.md's round 7
+# sections). Each test pairs the corrupted anchor with a distinct healthy
+# anchor of the same shape so the fix cannot be over-broad and start
+# blocking every anchor.
+
+
+def test_find_by_relations_out_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_edge("Item", "x", "next", "Item", "y")
+
+    assert store.find_by_relations("a", ["next"], direction="out") == []
+    res = store.find_by_relations("x", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_in_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_edge("Item", "b", "next", "Item", "a")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_edge("Item", "y", "next", "Item", "x")
+
+    assert store.find_by_relations("a", ["next"], direction="in") == []
+    res = store.find_by_relations("x", ["next"], direction="in")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_both_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    store.upsert_edge("Item", "c", "next", "Item", "a")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_node("Item", "z", {})
+    store.upsert_edge("Item", "x", "next", "Item", "y")
+    store.upsert_edge("Item", "z", "next", "Item", "x")
+
+    assert store.find_by_relations("a", ["next"], direction="both") == []
+    res = store.find_by_relations("x", ["next"], direction="both")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["y", "z"]
+
+
+def test_find_by_relations_orphan_anchor_still_returns_relations():
+    """Regression control for the fix's LEFT JOIN choice (design.md round
+    7): an edge whose anchor has no matching graph_nodes row at all (never
+    upserted, or removed independently of its edges) must still return
+    normally -- only an anchor row that EXISTS but fails decode_properties
+    is newly excluded. An INNER JOIN here would silently start dropping
+    orphan-anchor edges too, a referential-integrity behavior change
+    outside this fix's scope."""
+    store = _store()
+    store.upsert_node("Item", "y", {})
+    store._conn.execute(
+        "INSERT INTO graph_edges (from_type, from_id, relation, to_type, to_id, properties)"
+        " VALUES ('Ghost', 'ghost-1', 'next', 'Item', 'y', '{}')"
+    )
+    store._conn.commit()
+
+    res = store.find_by_relations("ghost-1", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_anchor_out():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "next", "Item", "b", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    store.upsert_node("Item", "x", {"pack_id": "p1"})  # control: healthy anchor
+    store.upsert_node("Item", "y", {"pack_id": "p1"})
+    store.upsert_edge("Item", "x", "next", "Item", "y", {"pack_id": "p1"})
+
+    assert store.find_by_relations_scoped("a", ["next"], ["p1"], "out", 20) == []
+    res = store.find_by_relations_scoped("x", ["next"], ["p1"], "out", 20)
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_anchor_in():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "b", "next", "Item", "a", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    store.upsert_node("Item", "x", {"pack_id": "p1"})  # control: healthy anchor
+    store.upsert_node("Item", "y", {"pack_id": "p1"})
+    store.upsert_edge("Item", "y", "next", "Item", "x", {"pack_id": "p1"})
+
+    assert store.find_by_relations_scoped("a", ["next"], ["p1"], "in", 20) == []
+    res = store.find_by_relations_scoped("x", ["next"], ["p1"], "in", 20)
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+# --- #402 round 7, legacy composite-key homonym cross-check (codex CLI
+# BLOCKING 1 in round 7's first design-verification pass): under the
+# pre-issue80 schema, graph_nodes' PK was (node_type, node_id), so the same
+# node_id could be claimed by two different node_types at once. A
+# type-agnostic single-row anchor lookup (LIMIT 1, no ORDER BY -- like
+# _fetch_node_props_by_id(), already used elsewhere for a type-agnostic
+# anchor check) could arbitrarily pick either row, so it was rejected for
+# this fix. Both methods instead resolve each edge's anchor by the exact
+# (node_type, node_id) that specific edge itself recorded, so a healthy
+# TypeA/a and a corrupted TypeB/a are judged independently and correctly
+# even though they share the id "a". LocalGraphStore's read path remains
+# reachable against a legacy-schema database (_require_available() checks
+# only self._available, not schema state -- only the write-path guard
+# checks schema state), so this scenario is reachable in production, not
+# just in this synthetic fixture.
+#
+# The double below is intentionally NOT _SqliteGraphStoreDouble/_store():
+# that class is built from the CURRENT schema (GRAPH_STORE_SCHEMA), whose
+# graph_nodes PK is node_id alone -- a true homonym cannot exist there (see
+# test_get_nodes_by_id_returns_the_single_global_identity_row(), which
+# documents and relies on that global uniqueness). Rows are seeded with raw
+# INSERTs, not upsert_node/upsert_edge -- those assume the current
+# single-column PK's ON CONFLICT target and would not apply cleanly to the
+# composite-key table.
+
+
+def _legacy_double() -> _SqliteGraphStoreDouble:
+    store = _SqliteGraphStoreDouble.__new__(_SqliteGraphStoreDouble)
+    store._conn = sqlite3.connect(":memory:")
+    store._available = True
+    store._conn.executescript(
+        """
+        CREATE TABLE graph_nodes (
+            node_type TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            space_id TEXT,
+            properties TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (node_type, node_id)
+        );
+        CREATE TABLE graph_edges (
+            from_type TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            to_type TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            properties TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (from_type, from_id, relation, to_type, to_id)
+        );
+        """
+    )
+    store._conn.commit()
+    return store
+
+
+def _legacy_insert_node(store, node_type: str, node_id: str, raw_properties: str) -> None:
+    store._conn.execute(
+        "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES (:t, :i, :p)",
+        {"t": node_type, "i": node_id, "p": raw_properties},
+    )
+    store._conn.commit()
+
+
+def _legacy_insert_edge(
+    store,
+    from_type: str,
+    from_id: str,
+    relation: str,
+    to_type: str,
+    to_id: str,
+    raw_properties: str = "{}",
+) -> None:
+    store._conn.execute(
+        "INSERT INTO graph_edges"
+        " (from_type, from_id, relation, to_type, to_id, properties)"
+        " VALUES (:ft, :fi, :r, :tt, :ti, :p)",
+        {"ft": from_type, "fi": from_id, "r": relation, "tt": to_type, "ti": to_id, "p": raw_properties},
+    )
+    store._conn.commit()
+
+
+def test_find_by_relations_legacy_homonym_anchor_checked_by_the_edges_own_type():
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"k": "healthy"}')
+    _legacy_insert_node(store, "TypeB", "a", "[1, 2, 3]")  # corrupted, unrelated homonym
+    _legacy_insert_node(store, "Item", "b", '{"id": "b"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "b")
+
+    res = store.find_by_relations("a", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["b"]
+
+
+def test_find_by_relations_scoped_legacy_homonym_out_leg_anchor_corrupted():
+    """Scoped 'both': the out leg's anchor (TypeA/a) is corrupted while the
+    in leg's anchor (TypeB/a) stays healthy -- only reachable under the
+    legacy schema, where the two legs' anchor JOINs can resolve to
+    different physical rows sharing one node_id. The out-leg relation must
+    be dropped and the in-leg relation must survive."""
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"pack_id": "p1", "pack_id": "p1"}')  # corrupted
+    _legacy_insert_node(store, "TypeB", "a", '{"pack_id": "p1"}')  # healthy
+    _legacy_insert_node(store, "Item", "out-target", '{"pack_id": "p1", "id": "out-target"}')
+    _legacy_insert_node(store, "Item", "in-source", '{"pack_id": "p1", "id": "in-source"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "out-target", '{"pack_id": "p1"}')
+    _legacy_insert_edge(store, "Item", "in-source", "next", "TypeB", "a", '{"pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "both", 20)
+    assert [r["properties"]["id"] for r in res] == ["in-source"]
+
+
+def test_find_by_relations_scoped_legacy_homonym_in_leg_anchor_corrupted():
+    """Mirror of the above with the roles reversed: the in leg's anchor
+    (TypeB/a) is corrupted while the out leg's anchor (TypeA/a) stays
+    healthy. The in-leg relation must be dropped and the out-leg relation
+    must survive."""
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"pack_id": "p1"}')  # healthy
+    _legacy_insert_node(store, "TypeB", "a", '{"pack_id": "p1", "pack_id": "p1"}')  # corrupted
+    _legacy_insert_node(store, "Item", "out-target", '{"pack_id": "p1", "id": "out-target"}')
+    _legacy_insert_node(store, "Item", "in-source", '{"pack_id": "p1", "id": "in-source"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "out-target", '{"pack_id": "p1"}')
+    _legacy_insert_edge(store, "Item", "in-source", "next", "TypeB", "a", '{"pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "both", 20)
+    assert [r["properties"]["id"] for r in res] == ["out-target"]
+
+
 # ---------------------------------------------------------------------------
 # get_node_by_id / export_nodes / export_edges / batch upserts
 # ---------------------------------------------------------------------------

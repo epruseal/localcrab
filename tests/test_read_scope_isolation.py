@@ -720,11 +720,20 @@ class TestScopedStorePredicates:
         authorize is precisely the case an authorization-only test cannot
         distinguish from a healthy in-scope edge, so this seeds one edge of
         each kind, both anchored on the same node and both fully within
-        alice's own scope, and asserts only the corrupted one is dropped.
+        alice's own scope, and asserts only the corrupted one is dropped
+        while the healthy sibling edge still comes back (round 6 dual-
+        verification non-blocking item: this test previously had no
+        healthy-edge control, so an over-broad fix dropping every edge
+        regardless of corruption could have passed it unnoticed).
         """
         _node(graph, docs, PACK_A, "a-other")
+        _node(graph, docs, PACK_A, "a-other-healthy")
         graph.upsert_edge(
             "Document", "a-secret", "relates_to", "Document", "a-other", {"pack_id": PACK_A}
+        )
+        graph.upsert_edge(
+            "Document", "a-secret", "relates_to", "Document", "a-other-healthy",
+            {"pack_id": PACK_A},
         )
         graph._conn.execute(
             "UPDATE graph_edges SET properties = :raw"
@@ -738,10 +747,8 @@ class TestScopedStorePredicates:
         graph._conn.commit()
 
         alice_scope = sorted({PACK_A, PACK_PUBLIC})
-        assert (
-            graph.find_by_relations_scoped("a-secret", ["relates_to"], alice_scope, "out", 20)
-            == []
-        )
+        got = graph.find_by_relations_scoped("a-secret", ["relates_to"], alice_scope, "out", 20)
+        assert [r["properties"]["node_id"] for r in got] == ["a-other-healthy"]
 
     def test_edge_spanning_two_readable_packs_is_returned(self, graph, docs, seeded):
         """A cross-pack edge inside one scope must survive.

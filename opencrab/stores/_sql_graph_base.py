@@ -3599,7 +3599,8 @@ class _SqlGraphStoreBase(abc.ABC):
 
         def leg(anchor_col: str, anchor_type: str, other_col: str, other_type: str, lim: int):
             sql = (
-                f"SELECT other.node_type, other.node_id, e.relation, e.properties AS edge_props FROM {edges} e"
+                f"SELECT other.node_type, other.node_id, e.relation, e.properties AS edge_props,"
+                f" anchor.properties AS anchor_props FROM {edges} e"
                 f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
                 f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
                 f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
@@ -3611,7 +3612,7 @@ class _SqlGraphStoreBase(abc.ABC):
                 "sc_packs": transform(sorted(set(pack_ids))),
                 **rel_params,
             }
-            for other_ntype, other_nid, relation, edge_props_raw in self._fetch_all(sql, params):
+            for other_ntype, other_nid, relation, edge_props_raw, anchor_props_raw in self._fetch_all(sql, params):
                 # #402 (round 6): the edge's own properties must be decode-
                 # checked here too, matching _expand()'s "must always be
                 # excluded" contract. Without this, a corrupted edge row
@@ -3623,6 +3624,25 @@ class _SqlGraphStoreBase(abc.ABC):
                 if edge_corrupted:
                     logger.warning(
                         "skipping corrupted graph edge during find_by_relations_scoped: node_id=%s relation=%s other_id=%s",
+                        node_id, relation, other_nid,
+                    )
+                    continue
+                # #402 (round 7): the ANCHOR's own properties were never
+                # decode-checked either -- only the edge (above) and the
+                # far-side node (via get_node below). anchor_where only
+                # validates the pack_id *value* via json_get, which a
+                # duplicate-key JSON object still passes; decode_properties
+                # checks that the JSON is a well-formed object at all. The
+                # `anchor` JOIN alias is already type-precise (anchor.
+                # node_type=e.{anchor_type}), so this checks exactly the row
+                # this edge actually references -- reusing the type-agnostic
+                # _fetch_node_props_by_id() here would risk picking an
+                # unrelated same-id node under the legacy composite-key
+                # schema (node_type, node_id).
+                _anchor_props, anchor_corrupted = decode_properties(anchor_props_raw)
+                if anchor_corrupted:
+                    logger.warning(
+                        "skipping corrupted graph anchor during find_by_relations_scoped: node_id=%s relation=%s other_id=%s",
                         node_id, relation, other_nid,
                     )
                     continue
@@ -3659,16 +3679,19 @@ class _SqlGraphStoreBase(abc.ABC):
         if not relations or limit <= 0:
             return []
         table = self._table("graph_edges")
+        nodes = self._table("graph_nodes")
         placeholders, rel_params = self._in_placeholders(relations, "rel")
         results: list[dict[str, Any]] = []
 
         if direction in ("out", "both"):
             sql = (
-                f"SELECT to_type, to_id, relation, properties AS edge_props FROM {table}"
-                f" WHERE from_id=:nid AND relation IN ({placeholders}) LIMIT :lim"
+                f"SELECT e.to_type, e.to_id, e.relation, e.properties AS edge_props,"
+                f" anchor.properties AS anchor_props FROM {table} e"
+                f" LEFT JOIN {nodes} anchor ON anchor.node_type=e.from_type AND anchor.node_id=e.from_id"
+                f" WHERE e.from_id=:nid AND e.relation IN ({placeholders}) LIMIT :lim"
             )
             rows = self._fetch_all(sql, {"nid": node_id, "lim": limit, **rel_params})
-            for to_type, to_id, relation, edge_props_raw in rows:
+            for to_type, to_id, relation, edge_props_raw, anchor_props_raw in rows:
                 # #402 (round 6): decode-check the edge itself, matching
                 # _expand()'s contract. find_by_relations (unscoped) has no
                 # edge-property SQL condition at all, and previously never
@@ -3679,6 +3702,25 @@ class _SqlGraphStoreBase(abc.ABC):
                 if edge_corrupted:
                     logger.warning(
                         "skipping corrupted graph edge during find_by_relations (out): node_id=%s relation=%s other_id=%s",
+                        node_id, relation, to_id,
+                    )
+                    continue
+                # #402 (round 7): the ANCHOR itself was never decode-checked
+                # either. This method never constrains the anchor's own
+                # node_type in SQL (unlike find_by_relations_scoped), so the
+                # LEFT JOIN above resolves the anchor by the exact (type, id)
+                # this specific edge row recorded -- correct even under the
+                # legacy composite-key schema where the same node_id can be
+                # shared by nodes of different types. LEFT (not INNER) JOIN
+                # preserves the pre-existing behavior for an edge whose
+                # anchor node row does not exist at all (decode_properties
+                # (None) == ({}, False), so a missing anchor row is not
+                # treated as corrupted -- only an existing-but-malformed one
+                # is).
+                _anchor_props, anchor_corrupted = decode_properties(anchor_props_raw)
+                if anchor_corrupted:
+                    logger.warning(
+                        "skipping corrupted graph anchor during find_by_relations (out): node_id=%s relation=%s other_id=%s",
                         node_id, relation, to_id,
                     )
                     continue
@@ -3698,17 +3740,28 @@ class _SqlGraphStoreBase(abc.ABC):
             remaining = limit - len(results)
             if remaining > 0:
                 sql = (
-                    f"SELECT from_type, from_id, relation, properties AS edge_props FROM {table}"
-                    f" WHERE to_id=:nid AND relation IN ({placeholders}) LIMIT :lim"
+                    f"SELECT e.from_type, e.from_id, e.relation, e.properties AS edge_props,"
+                    f" anchor.properties AS anchor_props FROM {table} e"
+                    f" LEFT JOIN {nodes} anchor ON anchor.node_type=e.to_type AND anchor.node_id=e.to_id"
+                    f" WHERE e.to_id=:nid AND e.relation IN ({placeholders}) LIMIT :lim"
                 )
                 rows = self._fetch_all(sql, {"nid": node_id, "lim": remaining, **rel_params})
-                for from_type, from_id, relation, edge_props_raw in rows:
+                for from_type, from_id, relation, edge_props_raw, anchor_props_raw in rows:
                     # #402 (round 6): same edge decode-check as the "out"
                     # leg above, see its comment.
                     _edge_props, edge_corrupted = decode_properties(edge_props_raw)
                     if edge_corrupted:
                         logger.warning(
                             "skipping corrupted graph edge during find_by_relations (in): node_id=%s relation=%s other_id=%s",
+                            node_id, relation, from_id,
+                        )
+                        continue
+                    # #402 (round 7): same anchor decode-check as the "out"
+                    # leg above, see its comment.
+                    _anchor_props, anchor_corrupted = decode_properties(anchor_props_raw)
+                    if anchor_corrupted:
+                        logger.warning(
+                            "skipping corrupted graph anchor during find_by_relations (in): node_id=%s relation=%s other_id=%s",
                             node_id, relation, from_id,
                         )
                         continue
