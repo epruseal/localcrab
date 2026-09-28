@@ -226,7 +226,27 @@ class PgDocStore(_SqlDocStoreBase):
         (issue #147 §3.4(c)) -- it used to swallow a genuine pack-predicate/
         bind error into a silent empty search leg, the same "exception → 0
         results, unnoticed" class closed for the vector/graph legs. A
-        real query error now propagates."""
+        real query error now propagates.
+
+        #402 (design.md §2 item 33, decided against a Cluster C marking
+        branch here): a non-object ``metadata`` value can NEVER reach this
+        method's row loop. The same ``json_truthy_text(metadata,'pack_id')
+        = ANY(...)`` predicate above evaluates to SQL NULL for ANY
+        non-object JSON (array/scalar), for the same reason it does for a
+        missing/falsy ``pack_id`` -- so that row is excluded by the WHERE
+        clause itself, before ``decode_properties()`` ever sees it. This
+        held for the pre-#402 code too (``_as_dict`` sat behind the exact
+        same predicate), confirmed by running this method's own reachability
+        test against both the old and the new implementation: neither one
+        can produce a marked or leaked corrupted row through this call path.
+        ``decode_properties()`` is still used below -- it is the project's
+        one normalisation point for a JSONB column that may already be a
+        dict (psycopg2) -- but its ``corrupted`` flag is intentionally
+        discarded rather than exposed as ``property_decode_error``: adding
+        that field here would be dead code with no test able to exercise it
+        honestly. If a future change ever lets an unfiltered or
+        differently-filtered row through this loop, add the marking back
+        alongside a test that reaches it through that new path."""
         if not self._available or not self._kw_ok:
             return []
         if not pack_ids or limit <= 0:
@@ -286,7 +306,13 @@ class PgDocStore(_SqlDocStoreBase):
 
         out: list[dict[str, Any]] = []
         for source_id, text, meta_raw, rank in rows:
-            meta, corrupted = decode_properties(meta_raw)
+            # #402: decode_properties() is kept as the one normalisation
+            # point for meta_raw (a JSONB column psycopg2 may already hand
+            # back as a dict) -- but a non-object metadata value can never
+            # reach this loop (see this method's docstring), so its
+            # ``corrupted`` flag is intentionally discarded here rather than
+            # exposed as ``property_decode_error``.
+            meta, _corrupted = decode_properties(meta_raw)
             entry = {
                 "source_id": source_id,
                 "node_id": meta.get("node_id") or source_id,
@@ -294,11 +320,6 @@ class PgDocStore(_SqlDocStoreBase):
                 "metadata": meta,
                 "score": float(rank or 0.0),
             }
-            if corrupted:
-                # #402: keep the row (multi-row search response, Cluster C)
-                # instead of silently turning a corrupted metadata value into
-                # {} indistinguishable from "no metadata".
-                entry["property_decode_error"] = True
             out.append(entry)
             if len(out) >= limit:
                 break

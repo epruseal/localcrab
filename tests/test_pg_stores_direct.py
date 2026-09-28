@@ -447,19 +447,18 @@ class TestPgDocKoreanKeywordSearch:
 
 class TestPgDocKeywordSearchCorruptedMetadataReachability:
     """issue #402, design.md §2 item 33 (``pg_doc_store.py::keyword_search``,
-    Cluster C). Unlike every other Cluster C site in this issue,
-    ``keyword_search``'s ``property_decode_error`` marking on a non-object
-    ``metadata`` value (this issue's target corruption shape, design.md §12
-    -- a syntactically valid JSON array/scalar, not malformed text, which is
-    #415's separate concern) is **architecturally unreachable through the
-    public API**: the method's own docstring documents that its mandatory
-    pack-filter predicate (``json_truthy_text(metadata,'pack_id') = ANY(...)``,
-    issue #147 §3.6) evaluates to SQL NULL for a non-object ``metadata``
-    value, and NULL never satisfies ``= ANY(...)`` -- so a row whose
-    metadata decodes to ``corrupted=True`` is excluded from the result set
-    by the SQL WHERE clause itself, before Python's ``decode_properties()``
-    call (and the ``if corrupted: entry["property_decode_error"] = True``
-    marking after it) ever runs on that row.
+    Cluster C). Unlike every other Cluster C site in this issue, marking a
+    non-object ``metadata`` value with ``property_decode_error`` (this
+    issue's target corruption shape, design.md §12 -- a syntactically valid
+    JSON array/scalar, not malformed text, which is #415's separate concern)
+    is **architecturally unreachable through the public API** here: the
+    method's own docstring documents that its mandatory pack-filter
+    predicate (``json_truthy_text(metadata,'pack_id') = ANY(...)``, issue
+    #147 §3.6) evaluates to SQL NULL for a non-object ``metadata`` value,
+    and NULL never satisfies ``= ANY(...)`` -- so a row whose metadata would
+    decode to ``corrupted=True`` is excluded from the result set by the SQL
+    WHERE clause itself, before Python's ``decode_properties()`` call ever
+    sees it.
 
     This is confirmed live below (no crash, no leak -- the corrupted row is
     silently absent from a query that would otherwise match its text), not
@@ -468,7 +467,11 @@ class TestPgDocKeywordSearchCorruptedMetadataReachability:
     the exact same SQL exclusion for the exact same reason -- the bug this
     issue fixes (silent ``{}`` coercion reads as "a normal empty object")
     never had a chance to manifest through this call path either, since the
-    row carrying it never reached that Python line in old code or new."""
+    row carrying it never reached that Python line in old code or new. Per
+    that finding, ``pg_doc_store.py::keyword_search`` deliberately does NOT
+    add a ``property_decode_error`` marking branch (removed after this test
+    proved it would be dead code) -- this is now a CHARACTERISTIC test of
+    the pre-existing SQL predicate, not a #402 RED/GREEN regression test."""
 
     def test_corrupted_metadata_row_is_excluded_not_marked_or_leaked(self, pg_engine) -> None:
         schema = f"t{uuid.uuid4().hex[:12]}_kwreach"
