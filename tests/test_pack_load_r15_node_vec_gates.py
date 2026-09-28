@@ -25,8 +25,15 @@ import logging
 import pathlib
 import sys
 
+import pytest
+
+from opencrab.auth import Principal, principal_scope
+from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
+from opencrab.stores.local_graph_store import LocalGraphStore
+from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 재사용
+    _LIVE_TEST_USER,
     _node,
     _write_jsonl,
     live,
@@ -350,3 +357,115 @@ class TestNodeOptOutDefaultPreservesBehaviorButFlagsIt:
             f"{[r.getMessage() for r in caplog.records]}")
         msg = summary[0].getMessage()
         assert "recover_vectors=True 로 단건 조회 회수를 켤 수 있다" in msg, msg
+
+
+# ─────────── 게이트 ㉳c: 인가 경계, 벡터 접근은 principal 게이트 뒤 ───────────
+#
+# PR #421 인라인 리뷰(codex, P2): #377이 새로 넣은 R1 벡터 열거
+# (`_live_vec_ids`)가 `_require_bound_principal()`보다 먼저 실행됐다.
+# 미인증 호출이 principal 오류 전에 벡터 백엔드에 먼저 닿을 수 있었다.
+# 형제 축 `load_chunks_incremental`(require_live_data, principal,
+# authorize, 벡터 열거 순)과 순서를 맞춰 고친 뒤, 그 순서를 행동으로 거는
+# 게이트다. `tests/test_pack_load_chunk_authz.py::TestUnboundPrincipal`
+# (#205)과 같은 미바인딩 패턴이되, 거기 없던 벡터 열거 호출 횟수 스파이를
+# 더한다. #332가 청크 축에 `_live_vec_ids`를 넣었을 때 그 시험 파일은
+# 갱신되지 않아 이 종류의 순서 역전을 못 잡는다(청크 축 현재 순서는
+# 이미 올발라 지금 당장의 결함은 아니다. #377/#421 범위 밖, 비차단
+# 발견으로 남긴다).
+
+
+class TestNodeVecAccessGatedByPrincipal:
+    """`load_nodes_incremental`의 벡터 접근(R1 열거 + opt-in 단건 조회)은
+    `_require_bound_principal()`을 통과한 뒤에만 실행돼야 한다."""
+
+    @staticmethod
+    def _spy_live_vec_ids(monkeypatch):
+        """`pack_load._live_vec_ids` 호출 횟수만 세고 실제 함수에 위임한다.
+
+        `_EnumerableVecWithLookup`(kind=sql 인식 더블)을 그대로 태우기
+        위해 원 함수 로직은 바꾸지 않는다. 호출 여부와 횟수만 관찰 대상."""
+        calls = {"n": 0}
+        real = pack_load._live_vec_ids
+
+        def _wrapped(vec, pack_name):
+            calls["n"] += 1
+            return real(vec, pack_name)
+
+        monkeypatch.setattr(pack_load, "_live_vec_ids", _wrapped)
+        return calls
+
+    def test_unbound_principal_blocks_vector_access(self, tmp_path, monkeypatch, pack_sql):
+        """RED(수정 전): principal을 전혀 바인딩하지 않고 호출한다. 인가
+        오류 자체는 수정 전에도 나지만(§ 최종적으로 `_require_bound_principal`
+        은 결국 불린다), 그 전에 벡터 열거와 단건 조회가 이미 실행돼 버렸는지를
+        스파이 카운트로 잡는다. 이 카운트 단언이 재배치 전에는 실패한다."""
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        graph = LocalGraphStore(str(tmp_path / "graph.db"))
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        builder = OntologyBuilder(graph, docs, pack_sql)
+
+        vec0 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec0
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        id_map: dict = {}
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            ok, skip, err = pack_load.load_nodes("pack-1", f, builder, id_map)
+        assert (ok, skip, err) == (1, 0, 0), "베이스라인 적재 자체가 실패했다. 전제가 깨졌다"
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
+
+        vec1 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec1
+        enum_calls = self._spy_live_vec_ids(monkeypatch)
+        lookup_calls = {"n": 0}
+        real_get_by_id = vec1.get_by_id
+
+        def _spy_get_by_id(doc_id):
+            lookup_calls["n"] += 1
+            return real_get_by_id(doc_id)
+
+        monkeypatch.setattr(vec1, "get_by_id", _spy_get_by_id)
+
+        # principal_scope 를 전혀 열지 않는다. 로더가 스스로 principal 을
+        # 바인딩하지 않는다는 #148 의도를 그대로 따른다.
+        try:
+            with pytest.raises(RuntimeError, match="principal_scope"):
+                pack_load.load_nodes_incremental(
+                    "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+                    state["doc_node_spaces"], vec=vec1)
+
+            assert enum_calls["n"] == 0, (
+                "미바인딩 principal 인데 벡터 열거(_live_vec_ids)가 실행됐다. "
+                "인가 경계보다 먼저 벡터 백엔드에 닿았다")
+            assert lookup_calls["n"] == 0, (
+                "미바인딩 principal 인데 단건 조회(get_by_id)가 실행됐다")
+        finally:
+            graph.close()
+            docs.close()
+
+    def test_bound_principal_control_group_recovery_still_fires(
+            self, live, tmp_path, monkeypatch):
+        """대조군: principal 이 있으면 재배치 뒤에도 R1 회수가 그대로
+        동작하고, 열거는 실행당 정확히 1회다."""
+        builder, graph, docs = live
+        vec0 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec0
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        id_map: dict = {}
+        ok, skip, err = pack_load.load_nodes("pack-1", f, builder, id_map)
+        assert (ok, skip, err) == (1, 0, 0)
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
+
+        vec1 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec1
+        enum_calls = self._spy_live_vec_ids(monkeypatch)
+
+        n_new, n_chg, n_same, skip2, err2, ids, vu = pack_load.load_nodes_incremental(
+            "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+            state["doc_node_spaces"], vec=vec1)
+
+        assert enum_calls["n"] == 1, "정상 경로에서 열거가 실행당 1회가 아니다"
+        assert (n_new, n_chg, n_same, skip2, err2, vu) == (0, 1, 0, 0, 0, 0), (
+            "principal 이 있는 정상 호출에서 R1 회수가 깨졌다")
+        assert vec1.rows() == {"n1"}, "벡터가 회수되지 않았다"
+        assert ids == {"n1"}

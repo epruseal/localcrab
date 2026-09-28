@@ -1979,9 +1979,22 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
+    # PR #421 인라인 리뷰(codex, P2, 2026-09-28): 이 블록(벡터 접근)은
+    # 반드시 `_require_bound_principal()` 뒤에 와야 한다. 미바인딩
+    # principal 호출이 principal 오류보다 먼저 벡터 백엔드에 닿으면 안
+    # 된다(형제 축 load_chunks_incremental의 순서인 require_live_data,
+    # principal, authorize, 벡터 열거 순을 여기서도 지킨다).
+    # 정확한 보장은 "principal 오류가 항상 최초 오류"가 아니라 "미바인딩
+    # 호출은 벡터 접근에 도달하지 않는다"이다. require_live_data(위)가
+    # 먼저 실패하면 그 오류가 대신 난다(기존 동작, 이 수정이 바꾸지
+    # 않음). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
+    # TestNodeVecAccessGatedByPrincipal.
+    _require_bound_principal()
+
     # R1(#377, load_chunks_incremental의 #142 재리뷰 패턴 이식): 그래프/문서가
     # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
-    # recover_vectors 값과 무관하게 항상 검사한다(§5: 실행당 1회, 저렴).
+    # recover_vectors 값과 무관하게 항상 검사한다(§5: principal 검사를
+    # 통과한 실행당 1회, 저렴).
     vec_set = _live_vec_ids(vec, pack_name)
 
     # #377 v3(구현 보고 검토 뒤 리드 지시, 설계 v3 §4): `vec is None`은
@@ -2005,7 +2018,6 @@ def load_nodes_incremental(
         if callable(_cand):
             vec_get_by_id = _cand
 
-    _require_bound_principal()
     for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
         space, node_type, node_id, props = transform_node(pack_name, row)
         id_map[node_id] = (space, node_type)
