@@ -34,6 +34,8 @@ cold probe가 실패하면 nodes는 계속 읽는다. build는 fingerprint 없�
 
 Ready hot path는 state를 한 번 잡고 probe를 수행한다. probe가 성공하고 `probe_fingerprint`가 state의 fingerprint와 다르면 invalidate가 wake를 예약한다. probe가 실패하면 state를 교체하거나 metadata를 unknown으로 덮지 않는다. 그러므로 ready probe failure는 기존 search와 기존 warning을 함께 반환한다.
 
+이 hot-path probe는 native와 legacy 양쪽을 다룬다. native fingerprint를 제공하는 store는 그 값만 확인하고 nodes를 읽지 않는다. native fingerprint가 없는 legacy store는 기존 `_bm25_probe_fingerprint()`가 capped nodes에서 계산하는 fallback marker로 변경을 감지한다. 이 계산 시도는 좁은 범위에서 예외를 잡는다. 계산이 실패하면 invalidate 시도만 건너뛰고 이미 잡아 둔 state로 search와 warning을 그대로 반환한다. `state.index.search()` 자체의 실패는 이 국소 처리 대상이 아니다. 기존 바깥 catch가 여전히 `([], [])`를 반환한다.
+
 wake마다 worker는 first mover가 `ensure_built()`를 마친 뒤에도 second probe를 한다. second probe가 기존 state fingerprint와 같으면 worker는 state object 전체를 유지하고 dirty만 해제한다. worker는 nodes를 읽거나 index를 만들지 않는다.
 
 Ready S0에서 second probe가 다르면 worker는 짧은 lock 구간에서 P0 probe 이전 epoch `e0`를 기록하고 즉시 lock을 해제한다. `invalidate()`는 같은 lock 안에서 dirty 표시, epoch 증가, wake 예약을 하나의 원자 단계로 수행한다. worker는 lock 없이 native P0 probe, nodes, observation, index build 순서를 수행한다. legacy fallback은 한 번 읽은 nodes에서 observation과 index build를 함께 만든다. build 뒤 worker는 lock을 다시 얻어 현재 epoch와 `e0`를 비교하고, 같을 때만 immutable S1 state를 단일 참조로 교체한 뒤 lock을 해제한다. invalidate가 publish 비교보다 먼저 lock을 얻으면 worker는 epoch mismatch를 보고 candidate S1을 버리며 S0를 유지하고 wake를 다시 설정한다. publish가 먼저 lock을 얻으면 worker는 그 시점에 유효한 S1을 발행한다. 뒤따른 invalidate는 dirty 표시, epoch 증가, wake 예약을 적용해 S2로 수렴한다. 이 ready-state 규칙은 invalidate를 거친 내부 write가 오래된 index와 metadata를 발행하지 못하게 한다. cold S0 발행은 기존 state가 없으므로 이 규칙의 예외이며 앞 절에서 별도로 다룬다.

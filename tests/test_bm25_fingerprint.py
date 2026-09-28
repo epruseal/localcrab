@@ -615,3 +615,92 @@ def test_398_coverage_uses_strict_scope_pack_id() -> None:
         assert any("missing" in warning and "forged-pack" in warning for warning in warnings)
     finally:
         hybrid.shutdown_bm25()
+
+
+def test_398_ready_legacy_hot_path_detects_change_via_fallback_marker() -> None:
+    """#398 regression: the ready hot path for a legacy store (no
+    ``bm25_fingerprint``) must recompute the fallback marker via
+    ``_bm25_probe_fingerprint()`` on every search and invalidate on change,
+    exactly like the native path already does. Before this fix, a native
+    probe of ``None`` skipped change detection entirely and the cache never
+    noticed writes on a legacy store between searches.
+    """
+
+    class LegacyStore:
+        def __init__(self, nodes):
+            self.nodes = nodes
+
+        def list_nodes(self, limit):
+            return self.nodes
+
+    store = LegacyStore([_node("a", pack_id="A")])
+    hybrid = _hybrid(store)
+    try:
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert hybrid._bm25.state.indexed_rows == 1
+
+        store.nodes = [_node("a", pack_id="A"), _node("b", pack_id="A")]
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert _wait_until(lambda: hybrid._bm25.state.indexed_rows == 2)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_hot_path_marker_failure_preserves_hits_and_warnings(monkeypatch) -> None:
+    """#398: a probe/marker computation failure inside the ready hot path must
+    not discard an already-successful search. The change-detection attempt is
+    caught locally, the invalidate attempt is skipped, and the search below
+    still runs against the already-captured state exactly as before this
+    observability path existed.
+    """
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        hits_before, warnings_before = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert hits_before  # cold build produced a real hit to preserve
+
+        monkeypatch.setattr(
+            hybrid,
+            "_bm25_probe_fingerprint",
+            MagicMock(side_effect=RuntimeError("marker boom")),
+        )
+        hits_after, warnings_after = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert hits_after == hits_before
+        assert warnings_after == warnings_before
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_398_index_search_failure_still_returns_empty_pair() -> None:
+    """Control group for the test above: a failure inside ``index.search()``
+    itself is a different contract point than probe/marker containment. The
+    existing outer catch in ``_bm25_search_state()`` still returns ``([], [])``
+    -- this issue's local containment does not change that existing contract.
+    """
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        state = hybrid._bm25.state
+        state.index.search = MagicMock(side_effect=RuntimeError("search boom"))
+        hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert hits == []
+        assert warnings == []
+    finally:
+        hybrid.shutdown_bm25()

@@ -838,11 +838,20 @@ class HybridQuery:
             if state is None:
                 self._bm25.ensure_built(self._doc_store)
             else:
-                probe = self._bm25._native_probe(self._doc_store)
+                # Local containment: a probe (native) or fallback marker
+                # (legacy) failure here must not abort the search below. On
+                # failure we skip the invalidate attempt and fall through to
+                # search the already-captured ``state`` unchanged.
+                try:
+                    current_fingerprint = self._bm25_probe_fingerprint()
+                except Exception as exc:
+                    logger.debug(
+                        "BM25 hot-path probe/marker failed: %s", exc
+                    )
+                    current_fingerprint = None
                 if (
-                    probe is not None
-                    and not probe.failed
-                    and probe.fingerprint != state.probe_fingerprint
+                    current_fingerprint is not None
+                    and current_fingerprint != state.probe_fingerprint
                 ):
                     self.invalidate_bm25_cache()
             state = self._bm25.state
