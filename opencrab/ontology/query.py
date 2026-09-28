@@ -808,8 +808,19 @@ class HybridQuery:
         pack_ids: list[str],
     ) -> list[str]:
         warnings: list[str] = []
+        # scan_is_complete=True means covered_pack_ids is an exhaustive
+        # listing of every pack_id with any row in the whole store, so a
+        # requested but absent pack_id is a genuine zero-rows fact, not an
+        # indexing gap. This can still race: a bulk insert between the
+        # total_rows probe and the node scan can make indexed_rows>=total_rows
+        # true against a stale total, hiding a real cap truncation. The next
+        # query's fingerprint probe detects the row-count change and
+        # rebuilds, so the window is one query wide, not persistent.
+        scan_is_complete = (
+            state.total_rows is not None and state.indexed_rows >= state.total_rows
+        )
         missing = sorted(set(pack_ids) - state.covered_pack_ids)
-        if missing:
+        if missing and not scan_is_complete:
             warnings.append(
                 "BM25 coverage missing requested pack ids: " + ", ".join(missing)
             )

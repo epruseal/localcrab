@@ -466,6 +466,25 @@ def test_398_capped_global_index_warns_for_missing_requested_pack(tmp_path, monk
         hybrid.shutdown_bm25()
 
 
+def test_398_empty_store_does_not_warn_about_missing_pack() -> None:
+    """#398 CLI regression: an empty store has complete coverage (0 rows
+    total, 0 rows indexed -- nothing was left out by the cap), so a
+    requested pack_id that simply has no rows anywhere must not produce a
+    'missing requested pack ids' warning. That framing implies an indexing
+    problem; an empty pack has none."""
+    doc_store = MagicMock()
+    doc_store.list_nodes = MagicMock(return_value=[])
+    doc_store.bm25_fingerprint = MagicMock(return_value=(0, ""))
+    hybrid = _hybrid(doc_store)
+    try:
+        _hits, warnings = hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["nonexistent-pack"]
+        )
+        assert not any("missing" in warning for warning in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
 def test_398_legacy_build_reads_nodes_once_and_reports_unknown_total() -> None:
     nodes = [_node("a", pack_id="A")]
 
@@ -603,12 +622,17 @@ def test_398_search_keeps_hits_and_warnings_from_one_state(monkeypatch) -> None:
 
 
 def test_398_coverage_uses_strict_scope_pack_id() -> None:
+    # total_rows=2 vs. one returned node keeps the scan "incomplete" (#398
+    # narrows the missing-pack warning to fire only on a complete scan, see
+    # _coverage_warnings) so this fixture stays decoupled from that
+    # completeness signal and keeps testing what it is actually named for:
+    # that covered_pack_ids never treats a forged source_path as coverage.
     doc_store = MagicMock()
     doc_store.list_nodes = MagicMock(return_value=[{
         **_node("forged", text="alpha"),
         "source_path": "/packs/forged-pack/source.txt",
     }])
-    doc_store.bm25_fingerprint = MagicMock(return_value=(1, ""))
+    doc_store.bm25_fingerprint = MagicMock(return_value=(2, ""))
     hybrid = _hybrid(doc_store)
     try:
         _hits, warnings = hybrid._bm25_search_with_warnings(
