@@ -107,13 +107,23 @@ fingerprint를 확인하던 비용이 쿼리 hot path에 실려 있었다(코퍼
 부하 큼). 현재는:
 
 - **재빌드는 백그라운드 워커**가 수행한다. `invalidate_bm25_cache()`(쓰기 핸들러가
-  호출)는 세대 카운터만 bump하고 워커를 깨운다(디바운스 `OPENCRAB_BM25_DEBOUNCE`,
-  기본 1.5s — 연속 ingest를 1회로 합침). 완료되면 새 인덱스를 **원자적 참조 교체**로
-  swap-in한다(단일 프로세스/GIL). 쿼리는 그동안 기존(약간 stale) 인덱스를 즉시 서빙.
+  호출)는 세대 카운터(`_epoch`)를 bump하고 워커를 깨운다(디바운스
+  `OPENCRAB_BM25_DEBOUNCE`, 기본 1.5s — 연속 ingest를 1회로 합침). 완료되면 새
+  인덱스를 **원자적 참조 교체**로 swap-in한다(단일 프로세스/GIL). 쿼리는 그동안
+  기존(약간 stale) 인덱스를 즉시 서빙.
 - **쿼리 hot path는 경량 fingerprint만** 확인한다. `doc_store.bm25_fingerprint()`는
   전체 `doc_nodes`의 행 수와 최신 시각을 읽고 행 본문을 파싱하지 않는다. 별도
   프로세스가 `invalidate` 없이 doc_nodes에 쓴 out-of-band 변경도 이 probe가 잡아
   백그라운드 재빌드를 예약한다. 전체 행 수는 BM25 cap 밖 행이 있음을 판정한다.
+  이 hot-path 재검출은 `mark_stale()`을 호출한다(#422) — dirty 표시와 워커
+  wake만 하고 `_epoch`는 올리지 않는다. 같은 변경을 검색이 여러 번 재검출해도
+  이미 예약된 빌드가 현재 내용을 그대로 관측하므로 epoch를 다시 올릴 근거가
+  없다. `_epoch`를 올리는 쪽은 실제 store write 호출부의 `invalidate()`뿐이다
+  — write만 "이미 시작한 빌드의 관측이 이 변경을 놓쳤을 수 있다"는 근거를
+  갖기 때문이다. #422 이전에는 이 hot-path 호출도 `invalidate()`를 써서
+  epoch를 올렸는데, 빌드 주기보다 검색이 빠르게 도착하면 발행 시점 epoch
+  비교가 계속 불일치해 유효한 candidate를 무한히 버리는 livelock이 있었다
+  (`docs/issue-398-bm25-coverage.md`의 "#422 후속" 절 참고).
 - 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐. 이 콜드 빌드는 질의 스레드의
   `_bm25_search()`와 백그라운드 워커의 `_rebuild_loop()` 첫 깨어남이라는 두
   호출부를 갖는데, 둘 다 `_Bm25CacheWorker.ensure_built()`를 거쳐 전용 락으로
@@ -126,7 +136,10 @@ _BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
 # 쿼리 hot path: 경량 probe만 (불일치 시 백그라운드 재빌드 예약, stale 서빙)
 fp = self._doc_store.bm25_fingerprint(limit=_BM25_NODE_LIMIT)
 if fp != self._bm25_cache.fingerprint:
-    self.invalidate_bm25_cache()  # → 백그라운드 워커가 재빌드 후 atomic swap
+    self._bm25.mark_stale()  # → epoch는 그대로, 워커만 깨운다 (#422)
+
+# 실제 write 핸들러 (graph.py, pack.py, ingest 경로)
+ctx["hybrid"].invalidate_bm25_cache()  # → epoch를 올려 재빌드 후 atomic swap
 ```
 
 검색 품질(relevance·토크나이저·스코어링·커버리지)은 무변경 — `BM25Index.build/search`

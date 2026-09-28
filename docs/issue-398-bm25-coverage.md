@@ -32,9 +32,9 @@ cold probe가 실패하면 nodes는 계속 읽는다. build는 fingerprint 없�
 
 ### Ready probe와 rebuild
 
-Ready hot path는 state를 한 번 잡고 probe를 수행한다. probe가 성공하고 `probe_fingerprint`가 state의 fingerprint와 다르면 invalidate가 wake를 예약한다. probe가 실패하면 state를 교체하거나 metadata를 unknown으로 덮지 않는다. 그러므로 ready probe failure는 기존 search와 기존 warning을 함께 반환한다.
+Ready hot path는 state를 한 번 잡고 probe를 수행한다. probe가 성공하고 `probe_fingerprint`가 state의 fingerprint와 다르면 wake를 예약한다(#422 이전 기록: 이 자리는 원래 `invalidate()`를 호출했다. #422 후속 변경으로 이 hot-path 호출은 `mark_stale()`로 바뀌었다 — epoch는 올리지 않고 dirty 표시와 wake만 수행한다. 아래 "#422 후속: mark_stale과 invalidate 분리" 절 참고). probe가 실패하면 state를 교체하거나 metadata를 unknown으로 덮지 않는다. 그러므로 ready probe failure는 기존 search와 기존 warning을 함께 반환한다.
 
-이 hot-path probe는 native와 legacy 양쪽을 다룬다. native fingerprint를 제공하는 store는 그 값만 확인하고 nodes를 읽지 않는다. native fingerprint가 없는 legacy store는 기존 `_bm25_probe_fingerprint()`가 capped nodes에서 계산하는 fallback marker로 변경을 감지한다. 이 계산 시도는 좁은 범위에서 예외를 잡는다. 계산이 실패하면 invalidate 시도만 건너뛰고 이미 잡아 둔 state로 search와 warning을 그대로 반환한다. `state.index.search()` 자체의 실패는 이 국소 처리 대상이 아니다. 기존 바깥 catch가 여전히 `([], [])`를 반환한다.
+이 hot-path probe는 native와 legacy 양쪽을 다룬다. native fingerprint를 제공하는 store는 그 값만 확인하고 nodes를 읽지 않는다. native fingerprint가 없는 legacy store는 기존 `_bm25_probe_fingerprint()`가 capped nodes에서 계산하는 fallback marker로 변경을 감지한다. 이 계산 시도는 좁은 범위에서 예외를 잡는다. 계산이 실패하면 `mark_stale()` 시도만 건너뛰고 이미 잡아 둔 state로 search와 warning을 그대로 반환한다. `state.index.search()` 자체의 실패는 이 국소 처리 대상이 아니다. 기존 바깥 catch가 여전히 `([], [])`를 반환한다.
 
 wake마다 worker는 first mover가 `ensure_built()`를 마친 뒤에도 second probe를 한다. second probe가 기존 state fingerprint와 같으면 worker는 state object 전체를 유지하고 dirty만 해제한다. worker는 nodes를 읽거나 index를 만들지 않는다.
 
@@ -78,3 +78,16 @@ MMP는 failure와 epoch 경합을 고정한다. 성공 게이트는 cold probe f
 독립 설계 비평가는 이 문서를 source와 대조하고 첫 줄에 PASS 또는 FAIL을 쓴다. 검증자는 state identity, epoch lock, probe failure, legacy caller contract, warning generation consistency를 반박 우선으로 검사한다. 설계 검증과 구현 뒤 이중 적대 검증은 각각 최대 세 라운드다. 같은 차단이 재발하거나 세 번째 라운드가 FAIL이면 리드에게 쟁점, 양쪽 근거, 시도 결과와 추천안을 올리고 구현 또는 추가 수정을 멈춘다.
 
 각 설계 검증 요청은 이 문서와 변경 대상만 제공한다. 판정, 차단 항목, 근거, 필요한 최소 수정만 요구한다. 검증자는 새 범위나 전체 suite를 요구하지 않는다. 이 출력 예산은 검증 결과를 비교 가능한 형태로 제한한다.
+
+## #422 후속: mark_stale과 invalidate 분리
+
+위 lifecycle 절은 #398 시점의 단일 `invalidate()` 경로를 기록한다. #398 후속 회귀로, hot path 검색이 같은 staleness를 반복 재검출할 때마다 `invalidate()`가 epoch를 올렸다. 빌드 창 안에서 검색이 빌드 주기보다 빨리 도착하면 발행 시점 epoch 비교가 계속 불일치해 유효한 candidate를 무한히 버렸다(livelock).
+
+`_Bm25CacheWorker`는 이제 두 메서드를 분리한다.
+
+- `invalidate()`: 실제 store write 호출부 전용이다. dirty 표시, epoch 증가, wake 예약을 원자적으로 수행한다(변경 없음). 위 41번째 문단이 설명하는 epoch 경합 규칙은 이 메서드에 그대로 적용된다.
+- `mark_stale()`: hot-path 재검출 전용이다. dirty 표시와 wake 예약만 하고 epoch는 올리지 않는다. 이미 예약됐거나 곧 시작할 빌드가 현재 store 내용을 그대로 관측하므로, 같은 변경을 반복 재검출해도 epoch를 올릴 근거가 없다.
+
+`HybridQuery._bm25_search_state()`의 hot-path 호출부(`opencrab/ontology/query.py`)만 `invalidate_bm25_cache()`에서 `self._bm25.mark_stale()`로 바뀌었다. `opencrab/mcp/tools/graph.py`, `opencrab/mcp/tools/pack.py`, ingest 경로의 실제 write 호출부는 모두 `invalidate_bm25_cache()`(내부적으로 `invalidate()`)를 그대로 쓴다.
+
+`tests/test_bm25_fingerprint.py`의 `test_422_*` 세 시험이 이 분리를 검증한다: 빌드 도중 반복 검색이 candidate를 버리지 않는지, 빌드 도중 늦게 도착한 외부 write가 다음 주기에서 수렴하는지, 재현 조건(빌드 0.5초·검색 0.05초 간격) 아래 유한 시간 안에 발행되는지. 기존 `test_398_ready_rebuild_discards_stale_candidate_when_invalidate_wins_the_race`는 `invalidate()` 자체의 경합 규칙을 그대로 검사하며 변경하지 않았다.
